@@ -5,46 +5,46 @@ assistant that supports multiple AI backends (Anthropic, OpenAI, etc.) via the
 user's own API keys.  This provider wraps ``opencode run`` for use as a coord
 worker backend.
 
-**IMPORTANT — UNVERIFIED IMPLEMENTATION.**  ``opencode`` was not installed on
-the build machine when this provider was written.  Every assumption about the
-OpenCode CLI interface and NDJSON output shape is documented inline below.  The
-provider has been implemented defensively:
+**CORRECTED AGAINST REAL CAPTURED OUTPUT (#1704).**  #1703 ran a real
+``opencode`` 1.18.11 binary against real models (free and paid) and recorded
+every finding in ``docs/OPENCODE_VERIFICATION.md``, replacing
+``tests/fixtures/opencode_run_sample.jsonl`` with a verbatim successful
+capture and adding ``tests/fixtures/opencode_run_failure_sample.jsonl`` for a
+verbatim failing one.  This module is the follow-up correction: every
+behavioural detail below cites that document.  Two things it does **not**
+attempt (explicitly out of scope, tracked as separate issues in the
+opencode-backend epic):
 
-* :meth:`parse_log` never raises — unrecognised lines are silently skipped.
-* :meth:`result_marker` is an assumed NDJSON event type; see its docstring.
-* :meth:`build_command` uses an assumed ``opencode run BRIEFING`` invocation
-  pattern; flag names may need adjustment against a real binary.
-
-**A real-output verification pass is required before routing production
-workers through this provider.**  Run ``opencode run "say hi" > /tmp/oc.txt``
-on a machine with opencode installed, compare the actual NDJSON shape against
-:data:`RESULT_MARKER` and :func:`_update_opencode_summary`, and update both
-as needed.  See ``tests/fixtures/opencode_run_sample.jsonl`` for the assumed
-schema.
+* The concrete ``coord-<spec.type>`` opencode agent definitions
+  (``opencode.jsonc``) that ``--agent`` below references by name.  Until
+  those land, real dispatch through this provider will fail at the CLI
+  level (``--agent`` naming an agent that doesn't exist yet) — see
+  :meth:`OpenCodeProvider.build_command`.
+* Flipping ``capabilities().enforces_deny_list`` to ``True``.  OpenCode DOES
+  have a real deny-capable permission system (see the module docstring's
+  "Permissions" citation below), but proving coord's *generated* config
+  enforces it end-to-end is that same follow-up issue's job, not this one's.
 
 Differences from :class:`~.claude.ClaudeProvider`:
 
-* ``build_command()`` invokes ``opencode run BRIEFING`` (briefing on argv).
-  No ``-p``, no ``--input-format``, no stream-json flags.
+* ``build_command()`` invokes
+  ``opencode run --format json [--attach URL] [--model M] [--session S]
+  --agent NAME --auto BRIEFING``.  No ``-p``, no ``--input-format``, no
+  stream-json flags — see the method docstring for exactly why each flag is
+  there and what it replaces.
 * ``initial_input()`` returns ``b""`` — no stdin payload needed since the
-  briefing travels on argv.
-* ``capabilities()`` reports ``enforces_deny_list=False`` (SAFETY: OpenCode
-  has no equivalent to Claude's ``--allowedTools`` / ``--permission-mode`` deny
-  list, so the safety gate in :meth:`coord.agent.AgentServer.assign` will
-  refuse write-capable assignment types (``work``, ``review``,
-  ``conflict-fix``) on this provider until the wiring issue #324 verifies
-  deny-list enforcement end-to-end).
-* ``capabilities()`` reports ``billing_mode="byo_key"`` — OpenCode uses the
-  operator's own API keys; cost is not metered against Anthropic's
-  ``claude -p`` credit pool.
-* ``capabilities()`` reports ``cost_reporting=False`` — OpenCode may embed
-  usage data in its NDJSON output, but the field paths are unverified; coord
-  sets this to ``False`` until a real-run parse is confirmed.
-* ``capabilities()`` reports ``true_system_prompt=False`` — OpenCode has no
-  documented ``--system-prompt`` flag equivalent in this first pass.  The
-  ``system_prompt`` kwarg accepted by :meth:`build_command` is accepted but
-  silently ignored.  Flip to ``True`` once an OpenCode flag is identified and
-  wired in.
+  briefing travels on argv (confirmed: ``run [message..]`` is a genuine
+  positional argv message, no stdin protocol observed —
+  ``OPENCODE_VERIFICATION.md`` "Flag surface").
+* ``capabilities().enforces_deny_list=False`` — **SAFETY GATE**, see above.
+* ``capabilities().billing_mode="byo_key"`` — confirmed: OpenCode bills
+  against the operator's own configured provider credentials, not
+  Anthropic's ``claude -p`` credit pool (``OPENCODE_VERIFICATION.md``
+  "Flag surface" / "every ASSUMPTION" table).
+* ``capabilities().cost_reporting=True`` and
+  ``capabilities().true_system_prompt=True`` — both flipped from the
+  first-pass ``False`` now that real evidence backs them; see
+  :meth:`capabilities` for the citations.
 """
 
 from __future__ import annotations
@@ -63,31 +63,73 @@ if TYPE_CHECKING:
 
 #: Default binary name for the OpenCode CLI.
 #:
-#: ASSUMPTION: ``opencode`` is on PATH.  Override via
+#: Confirmed: binary name ``opencode`` is correct
+#: (``OPENCODE_VERIFICATION.md`` "Machine / version").  Override via
 #: ``ProviderDef(type="opencode", binary="/path/to/opencode")``.
 DEFAULT_OPENCODE_BINARY = "opencode"
 
 #: Sentinel string whose presence in the log signals successful completion.
 #:
-#: ASSUMPTION: OpenCode emits a ``{"type":"session.complete", ...}`` NDJSON
-#: event as the last structured output when a run finishes successfully.
-#: This mirrors the approach used by :class:`~.claude.ClaudeProvider` whose
-#: marker is the stream-json ``"type":"result"`` event.
+#: CORRECTED (#1704): there is no ``session.complete`` event — confirmed by
+#: running the *unmodified* first-pass provider against the real fixture in
+#: #1703 (it extracted nothing).  The real terminal signal for a successful
+#: run is the last ``step_finish`` event, whose nested ``part.reason`` is
+#: ``"stop"`` (as opposed to ``"tool-calls"``, which ends every intermediate
+#: turn and is followed by another ``step_start``).  See
+#: ``OPENCODE_VERIFICATION.md`` "The real terminal/completion signal".
 #:
-#: **Must be verified against real opencode output.**  If the actual
-#: completion event differs (e.g. ``"type":"session.idle"`` or a plain-text
-#: sentinel), update this constant and re-run the test suite.
-RESULT_MARKER = '"type":"session.complete"'
+#: This is a plain substring match — ``docs/OPENCODE_VERIFICATION.md``
+#: explicitly flags that as fragile against key reordering and recommends a
+#: structural check (parse the line, test ``part.reason == "stop"``)
+#: instead.  :func:`_update_opencode_summary` below *does* do the structural
+#: check for :attr:`WorkerSummary.stop_reason`; this constant is only used
+#: by the reap thread's log-tailing early-completion heuristic (see
+#: ``coord.agent._reap``), where the accepted risk is a missed/late
+#: detection (the reap loop falls back to ``proc.wait()`` returning when the
+#: process actually exits), never a wrong pass/fail verdict.
+#:
+#: A failing run has **no** terminal ``step_finish`` at all — it ends with a
+#: top-level ``error`` event instead — so this marker deliberately does not
+#: (and structurally cannot) match a failure. Failure detection is the
+#: process exit code plus :func:`_update_opencode_summary`'s handling of the
+#: ``error`` event, not this marker.
+RESULT_MARKER = '"reason":"stop"'
+
+
+def _agent_name_for_type(spec_type: str) -> str:
+    """Map ``spec.type`` to the opencode ``--agent`` name coord will pass.
+
+    Naming contract: ``coord-<spec.type>`` (e.g. ``coord-work``,
+    ``coord-plan``, ``coord-review``, ``coord-test-chat``). This mirrors the
+    existing ``spec.type``-keyed branching :class:`~.claude.ClaudeProvider`
+    uses to pick a system prompt / allowed-tools pair (see
+    ``coord/providers/claude.py::build_command``) — the same dimension
+    (assignment type) selects the opencode-side equivalent, just via a named
+    agent instead of raw flag values.
+
+    **Not yet backed by a real ``opencode.jsonc``.**  The companion
+    agent-definitions issue in the opencode-backend epic is responsible for
+    actually authoring ``coord-work`` / ``coord-plan`` / etc. agent configs
+    (deny-baseline permission blocks, real prompts). Until that lands, a
+    real ``opencode run --agent coord-<type> ...`` invocation through this
+    provider will fail at the CLI level with an unknown-agent error — this
+    is a known, named gap (not a silent one): this provider corrects the
+    *shape* of the invocation per #1703's captured evidence; wiring a real
+    agent behind that shape is deliberately out of scope for #1704 (see the
+    module docstring).
+    """
+    return f"coord-{spec_type}"
 
 
 class OpenCodeProvider(Provider):
     """Concrete provider for ``opencode run`` (OpenCode workers).
 
-    This is the **first-pass adapter** for the OpenCode backend.  It
-    implements the full :class:`~coord.providers.base.Provider` ABC so the
-    registry is complete, but several capabilities flags are set
-    conservatively pending a real-output verification run (see module
-    docstring).
+    Corrected against a real ``opencode`` 1.18.11 capture (#1703 →
+    ``docs/OPENCODE_VERIFICATION.md``).  Two things remain deliberately
+    unfinished — see the module docstring: the actual ``coord-<type>``
+    agent definitions (companion issue), and flipping
+    ``capabilities().enforces_deny_list`` (same companion issue, after
+    end-to-end enforcement is proven).
 
     Args:
         binary: Override the worker binary name/path.  ``None`` falls back to
@@ -96,7 +138,9 @@ class OpenCodeProvider(Provider):
             connects to an already-running OpenCode server instead of starting
             a new session.  Corresponds to ``ProviderDef.attach_url`` in
             ``coordinator.yml``.  ``None`` omits the flag (default headless
-            ``opencode run`` starts its own session).
+            ``opencode run`` starts its own session).  Confirmed end-to-end
+            against a real ``opencode serve`` (``OPENCODE_VERIFICATION.md``
+            "Flag surface").
         model: Fallback model id from the provider definition
             (``ProviderDef.model``) — e.g. an opencode ``provider/model``
             string such as ``"zhipuai/glm-4.6"``.  Used only when neither an
@@ -110,6 +154,14 @@ class OpenCodeProvider(Provider):
         extra_args: Additional argv entries from the provider definition
             (``ProviderDef.extra_args``).  Inserted after this method's own
             flags and before the trailing positional briefing argument.
+            **Caveat confirmed in #1703:** array-typed opencode flags (e.g.
+            ``--file``) greedily consume argv tokens the way yargs does —
+            ``opencode run --file X "message"`` fails ("File not found:
+            <message text>") because ``--file`` swallows the message. Such a
+            flag only works placed *after* the briefing. If a future
+            ``extra_args`` entry needs an array-typed flag, it cannot go
+            through this constructor as-is; this is flagged here rather than
+            silently mis-ordered.
     """
 
     def __init__(
@@ -130,77 +182,87 @@ class OpenCodeProvider(Provider):
     # ── Capabilities ──────────────────────────────────────────────────────────
 
     def capabilities(self) -> Capabilities:
-        """Conservatively declared capabilities for the OpenCode backend.
+        """Capabilities corrected against real captured evidence (#1703/#1704).
 
         Chosen values and rationale
         ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
         ``resume=True``
-            ASSUMPTION: OpenCode supports session resume via a ``--session
-            SESSION_ID`` flag.  The :meth:`build_command` implementation
-            wires this flag when ``spec.resume_session_id`` is set.  Flip to
-            ``False`` if OpenCode's headless mode has no resume concept.
+            Confirmed: ``--session <id>`` resumes a prior session (the
+            resumed run's ``sessionID`` matched exactly and the model
+            demonstrably had context of the prior turn); ``--continue``
+            resumes the most recent session the same way.  See
+            ``OPENCODE_VERIFICATION.md`` "Session id / resume".
 
         ``inject=False``
-            No mid-session stdin message injection path exists for OpenCode
-            in this first pass.  Flip to ``True`` if a future wiring issue
-            identifies a mechanism.
+            **Still unknown** — mid-session stdin message injection into an
+            already-running ``run --format json`` process was not exercised
+            in the verification pass (see "Remaining unknowns").  Stays
+            conservatively ``False`` until a future pass tests it.
 
-        ``cost_reporting=False``
-            ASSUMPTION: OpenCode may include usage data (``cost_usd``, token
-            counts) in its NDJSON output under
-            ``{"type":"session.complete","usage":{...}}``.  However, the
-            field paths are unverified against a real run.
-            :meth:`parse_log` makes a best-effort extraction attempt; this
-            flag is conservatively ``False`` so the TUI shows "n/a" rather
-            than a potentially incorrect dollar figure.  Flip to ``True``
-            once :meth:`parse_log` is confirmed against live output.
+        ``cost_reporting=True``
+            Confirmed: cost is real and present on every ``step_finish``
+            event (``part.cost``), verified non-zero across a real paid
+            model (``deepseek/deepseek-chat``, 4 steps,
+            ``0.00106932``/``0.0000449456``/``0.0000837256``/``0.0000344624``).
+            The committed fixture uses a free-tier model so its own
+            ``cost`` values are ``0`` — that's the model, not a parsing
+            gap: :func:`_update_opencode_summary` sums ``part.cost`` across
+            every ``step_finish`` event (there is no cumulative field), and
+            the free-tier fixture's sum is correctly ``0.0``.  See
+            ``OPENCODE_VERIFICATION.md`` "Token usage and cost — field
+            paths".
 
-        ``true_system_prompt=False``
-            OpenCode has no documented ``--system-prompt`` flag equivalent
-            in this first pass.  The ``system_prompt`` kwarg is accepted by
-            :meth:`build_command` but silently ignored.  Flip to ``True``
-            once an OpenCode flag is identified, wired in, and tested.
+        ``true_system_prompt=True``
+            Confirmed via the live-fetched ``https://opencode.ai/config.json``
+            schema: ``--agent <name>`` selects an agent definition whose
+            ``AgentConfig.prompt: string`` field is a genuine system-prompt
+            equivalent — not merely prepended user-message text.  See
+            ``OPENCODE_VERIFICATION.md`` "every ASSUMPTION" table.  This is
+            a capability claim (the mechanism is real), independent of
+            whether coord has actually authored the ``coord-<type>`` agent
+            files yet (see :func:`_agent_name_for_type`).
 
         ``enforces_deny_list=False``
-            **SAFETY GATE.**  coord's worker deny list (passed via
-            ``--allowedTools`` / ``--permission-mode`` for Claude) has no
-            equivalent in OpenCode's CLI.  Setting this to ``False`` means
-            :meth:`coord.agent.AgentServer.assign` will refuse write-capable
-            assignment types (``work``, ``review``, ``conflict-fix``,
-            ``smoke``) on this provider.  Only read-only types (``plan``,
-            ``refinement``, ``test-chat``, ``new-issue-chat``) may use it
-            until deny-list enforcement is wired and verified.  Do NOT flip
-            this to ``True`` without first confirming that OpenCode respects
-            the tool-restriction mechanism end-to-end.
+            **SAFETY GATE — deliberately left unchanged in this issue.**
+            OpenCode DOES have a real per-tool ``allow``/``ask``/``deny``
+            permission system with genuine bash command pattern matching —
+            empirically proven in #1703 (``OPENCODE_VERIFICATION.md``
+            "Permission enforcement — empirical evidence").  But two things
+            are still missing before coord can claim *enforcement*: (1) the
+            actual ``coord-<type>`` agent configs that encode a deny-shaped
+            baseline (companion agent-definitions issue), and (2) proof that
+            coord's generated config places the catch-all rule *first* and
+            overrides *after* it — #1703 found rule precedence is
+            **last-match-wins**, so a naively-ordered deny list silently
+            does nothing.  Until both are verified end-to-end,
+            :meth:`coord.agent.AgentServer.assign` continues to refuse
+            write-capable assignment types (``work``, ``review``,
+            ``conflict-fix``, ``smoke``) on this provider.
 
         ``billing_mode="byo_key"``
-            OpenCode uses the operator's own API keys (Anthropic, OpenAI,
-            etc.) configured in its own credentials store.  Runs are NOT
-            billed against Anthropic's ``claude -p`` credit pool, so this
-            backend is not subject to the 2026-06-15 metering change (#322).
-            ``"byo_key"`` is the correct routing signal for the Track-3
-            mitigation: the coordinator and TUI prefer a non-metered backend.
+            Confirmed: OpenCode uses the operator's own provider credentials
+            (``opencode providers login`` / ``opencode stats`` showing real
+            accumulated cost against those credentials).  Not subject to
+            the 2026-06-15 Anthropic metering change (#322).
 
         ``human_attended_only=False``
-            OpenCode's headless ``run`` mode is designed for unattended
-            automation.  No ToS compliance concern analogous to Claude's
-            interactive subscription path (#437) applies here.
+            Confirmed by inference, not a ToS determination: every capture
+            in #1703 (``run --format json``, no TTY) behaved as pure batch
+            automation — no prompts blocking on a TTY, and an ``ask``
+            permission rule with no ``--auto`` fails *closed* (auto-rejects
+            with a stderr line) rather than hanging.  See
+            ``OPENCODE_VERIFICATION.md`` "``--auto`` semantics" scenario 1.
         """
         return Capabilities(
-            # ASSUMPTION: --session flag enables resume; see build_command.
             resume=True,
-            # No mid-session injection path for OpenCode in this pass.
             inject=False,
-            # Conservatively False until parse_log is verified against live output.
-            cost_reporting=False,
-            # No --system-prompt equivalent identified yet; accepted but ignored.
-            true_system_prompt=False,
-            # SAFETY: OpenCode does not enforce coord's deny list.
+            cost_reporting=True,
+            true_system_prompt=True,
+            # SAFETY: see docstring above — real mechanism exists, coord-side
+            # enforcement is unproven until the companion issue lands.
             enforces_deny_list=False,
-            # Uses operator's own API keys — not subject to claude -p metering.
             billing_mode="byo_key",
-            # Headless run mode is automatable; no ToS gate needed.
             human_attended_only=False,
         )
 
@@ -217,32 +279,73 @@ class OpenCodeProvider(Provider):
     ) -> list[str]:
         """Build the ``opencode run`` argv for *spec*.
 
-        ASSUMPTION: OpenCode's non-interactive interface is::
+        Confirmed shape (#1703, ``OPENCODE_VERIFICATION.md`` "Flag
+        surface")::
 
-            opencode run [--model MODEL] [--session SESSION_ID] BRIEFING
+            opencode run --format json [--attach URL] [--model MODEL]
+                [--session SESSION_ID] --agent NAME --auto BRIEFING
 
-        where ``BRIEFING`` is the final positional argument containing the
-        full task description.  The briefing is passed on argv, NOT via
-        stdin, which is why :meth:`initial_input` returns ``b""``.
+        ``BRIEFING`` is the final positional argument (a real positional
+        argv message, confirmed — not a stdin protocol; see
+        :meth:`initial_input`).
 
-        Flag name assumptions (to be verified against real binary):
+        Flags, each cited against captured evidence:
 
-        * ``--model`` — select model by name or ``provider/model`` string
-          (e.g. ``"anthropic/claude-sonnet-4-5"``).  Precedence: explicit
+        * ``--format json`` — always.  Confirmed: ``--format default``
+          emits "a human-formatted TUI-style transcript, not usable by a
+          parser"; only ``json`` emits the NDJSON event stream
+          :meth:`parse_log` understands.  Without it :meth:`result_marker`
+          has nothing to match and :meth:`parse_log` extracts nothing.
+        * ``--attach <url>`` — unchanged from the first pass, confirmed
+          end-to-end against a real ``opencode serve``.
+        * ``--model <value>`` — unchanged from the first pass, confirmed
+          with two real ``provider/model`` strings.  Precedence: explicit
           *resolved_model* > ``spec.model`` > the provider definition's
           ``model`` (threaded in via ``__init__``, #1706).  Omitted when
           all three are ``None``.
-        * ``--session SESSION_ID`` — resume a prior session by ID.  Omitted
-          when ``spec.resume_session_id`` is ``None``.
+        * ``--session <id>`` — unchanged from the first pass, confirmed to
+          resume by id with matching ``sessionID`` and restored context.
+          Omitted when ``spec.resume_session_id`` is ``None``.
+        * ``--agent <name>`` — **new in #1704.**  Confirmed: ``--agent``
+          selects a named agent definition whose ``prompt``/``permission``
+          fields are a genuine system-prompt + tool-permission equivalent
+          (schema-confirmed against ``https://opencode.ai/config.json``).
+          This is why it **replaces** the ignored *system_prompt* /
+          *allowed_tools* kwargs below rather than sitting alongside them —
+          there is no opencode flag that accepts raw system-prompt text or
+          a raw tool allowlist string the way ``claude -p`` does; the unit
+          of configuration is a named agent.  The name is computed by
+          :func:`_agent_name_for_type` from ``spec.type`` — see that
+          function's docstring for the naming contract and the (explicit,
+          named) gap that the actual agent config files don't exist yet.
+        * ``--auto`` — **new in #1704, always passed.**  Confirmed:
+          ``--auto`` converts an agent's ``"ask"`` permission rules to
+          auto-approve without overriding an explicit ``"deny"`` rule
+          (``OPENCODE_VERIFICATION.md`` "``--auto`` semantics", scenarios
+          2 & 3).  coord's workers are headless/unattended by design, so
+          this flag is unconditional — the same way ``permission_mode``
+          defaults to ``"acceptEdits"`` for :class:`~.claude.ClaudeProvider`.
+          **Safety note** (see the issue and module docstring): opencode's
+          permission model is deny-*list* semantics inverted from
+          ``claude -p``'s allow-list — ``--auto`` only ever *widens* what an
+          ``"ask"`` rule would otherwise block; it can never widen past an
+          explicit ``"deny"``.  Today, with no ``coord-<type>`` agent config
+          yet authored, this is close to a no-op (opencode's built-in
+          default agent has no permission block at all — confirmed
+          allow-everything by default, ``OPENCODE_VERIFICATION.md``
+          "``--auto`` semantics" scenario 4) — it only becomes load-bearing
+          once the companion agent-definitions issue lands a deny-baseline
+          config, at which point it is exactly what keeps this provider
+          headless instead of hanging on every ``ask`` rule.
 
         Ignored kwargs
         ~~~~~~~~~~~~~~
-        *system_prompt*, *allowed_tools*, and *permission_mode* are accepted
-        (matching the Provider ABC signature) but **silently ignored**.
-        OpenCode has no direct equivalents in this first pass.
-        ``capabilities().true_system_prompt=False`` and
-        ``capabilities().enforces_deny_list=False`` advertise this to
-        callers.
+        *system_prompt* and *allowed_tools* are accepted (matching the
+        Provider ABC signature) but **silently ignored** — replaced by
+        ``--agent`` as described above.  *permission_mode* is accepted but
+        also ignored: it is a ``claude -p``-specific vocabulary
+        (``"acceptEdits"``/``"bypassPermissions"``/...) with no opencode
+        equivalent; ``--auto`` is unconditional instead of varying by value.
 
         Args:
             spec: The assignment spec being dispatched.
@@ -252,12 +355,9 @@ class OpenCodeProvider(Provider):
                 definition's ``model``; if all three are ``None``, the
                 ``--model`` flag is omitted (OpenCode picks its configured
                 default).
-            system_prompt: Accepted but **ignored** — no OpenCode equivalent
-                in this first pass.
-            allowed_tools: Accepted but **ignored** — no OpenCode equivalent
-                in this first pass.
-            permission_mode: Accepted but **ignored** — no OpenCode
-                equivalent in this first pass.
+            system_prompt: Accepted but **ignored** — see "Ignored kwargs".
+            allowed_tools: Accepted but **ignored** — see "Ignored kwargs".
+            permission_mode: Accepted but **ignored** — see "Ignored kwargs".
         """
         binary = self._binary if self._binary is not None else DEFAULT_OPENCODE_BINARY
 
@@ -270,25 +370,38 @@ class OpenCodeProvider(Provider):
         else:
             effective_model = self._model
 
-        # ASSUMPTION: subcommand is "run" for non-interactive / headless mode.
         argv: list[str] = [binary, "run"]
 
+        # Confirmed (#1703): only --format json emits a parseable NDJSON
+        # stream; --format default is a human transcript.
+        argv.extend(["--format", "json"])
+
         # When attach_url is set, connect to a running OpenCode server instead
-        # of starting a new session.  ASSUMPTION: flag is ``--attach <URL>``.
+        # of starting a new session.  Confirmed end-to-end against a real
+        # `opencode serve`.
         if self._attach_url:
             argv.extend(["--attach", self._attach_url])
 
-        # ASSUMPTION: --model flag selects the AI model by name.
+        # Confirmed: --model selects the AI model by 'provider/model' string.
         if effective_model:
             argv.extend(["--model", effective_model])
 
-        # ASSUMPTION: --session flag resumes a prior session by ID.
+        # Confirmed: --session resumes a prior session by ID.
         if spec.resume_session_id:
             argv.extend(["--session", spec.resume_session_id])
 
+        # New in #1704: --agent replaces system_prompt/allowed_tools (see
+        # docstring above and _agent_name_for_type).
+        argv.extend(["--agent", _agent_name_for_type(spec.type)])
+
+        # New in #1704: unconditional, headless-safety flag (see docstring).
+        argv.append("--auto")
+
         # #1706: provider-definition extra_args go after this method's own
         # flags but BEFORE the trailing positional briefing — OpenCode's
-        # argv parsing assumes the briefing is the last argument.
+        # argv parsing assumes the briefing is the last argument (and, per
+        # #1703, array-typed flags like --file must come AFTER it — see the
+        # __init__ docstring's caveat about extra_args).
         if self._extra_args:
             argv.extend(self._extra_args)
 
@@ -306,47 +419,61 @@ class OpenCodeProvider(Provider):
     ) -> list[str]:
         """Best-effort one-shot argv for the OpenCode backend.
 
-        LIMITATION: OpenCode has no ``--system-prompt`` flag and takes its
-        briefing as a positional argv argument rather than via stdin.  The
-        *system_prompt* and *output_format* kwargs are therefore silently
-        ignored — OpenCode will not receive the system prompt and will not
-        emit the ``{"result": ...}`` JSON shape that the brain expects.
+        LIMITATION, unchanged from the first pass and still real: OpenCode
+        takes its briefing as a positional argv argument, not via stdin
+        (confirmed, #1703), and this method's signature — inherited from the
+        :class:`~.base.Provider` ABC — does not receive the user message, so
+        it cannot be appended here either.  Callers (brain planning, the
+        dashboard assistant) pipe the user message via stdin the way they do
+        for :class:`~.claude.ClaudeProvider`; OpenCode will not see it.  Real
+        one-shot semantics (a single prompt/response round with the message
+        actually delivered) are not achievable through this ABC method for
+        this backend — callers that need that should configure a
+        :class:`~.claude.ClaudeProvider` backend instead, exactly as the
+        first-pass docstring already said.
 
-        This method returns ``[binary, "run"]`` without the user message
-        because ``oneshot_command()`` does not receive the user message as
-        an argument.  The brain's ``call_claude()`` pipes the user message
-        via stdin; OpenCode will ignore it and produce its own output
-        (which :func:`coord.brain.call_claude` returns as raw stdout after
-        the JSON-extraction fallback path).
+        What *is* corrected here (#1704): the returned argv now includes
+        ``--format json`` when *output_format* is ``"json"`` (or whatever
+        string is passed — forwarded verbatim, mirroring
+        :meth:`~.claude.ClaudeProvider.oneshot_command`'s behaviour), so at
+        least the output stream is the structured NDJSON shape
+        :meth:`parse_log` understands rather than the unparseable human
+        transcript.  This does **not** produce the ``{"result": ...}``
+        top-level shape the brain's JSON-extraction path expects — opencode
+        has no such wrapper (confirmed, #1703) — so callers still fall back
+        to raw-stdout handling for this backend, as the first-pass docstring
+        already documented.  ``--auto`` is always appended for the same
+        headless-safety reason as :meth:`build_command`.
 
-        Callers that need a fully functional one-shot path should configure
-        a :class:`~.claude.ClaudeProvider` backend instead of OpenCode.
-
-        ASSUMPTION: ``opencode run`` is the headless subcommand.  This
-        must be verified against a real ``opencode`` binary.
-
-        Note: unlike :meth:`build_command`, this does **not** thread in
-        ``self._model`` / ``self._extra_args`` / ``self._env`` (#1706) —
-        oneshot calls don't take an ``AssignmentSpec`` and sit outside the
-        assignment spawn path #1706 wires provider-definition config into.
+        *system_prompt* is still silently ignored: there is no CLI flag to
+        inject ad hoc system-prompt text, only ``--agent <name>`` selecting
+        a *pre-configured* agent (see :meth:`build_command`), and this
+        method's signature has no assignment-spec context to compute an
+        agent name from.
 
         Args:
-            system_prompt: Accepted but **ignored** — OpenCode has no
-                ``--system-prompt`` equivalent.
-            output_format: Accepted but **ignored** — OpenCode does not
-                emit ``{"result": ...}`` JSON.
+            system_prompt: Accepted but **ignored** — see above.
+            output_format: ``"json"`` (or any other string) is forwarded as
+                ``--format <value>``.  ``None`` omits the flag entirely,
+                falling back to opencode's human-transcript default —
+                matching the dashboard-assistant streaming use case the
+                same way ``output_format=None`` does for
+                :class:`~.claude.ClaudeProvider`.
         """
         binary = self._binary if self._binary is not None else DEFAULT_OPENCODE_BINARY
-        # ASSUMPTION: 'run' is the non-interactive / headless subcommand.
-        # system_prompt and output_format are silently dropped; see docstring.
-        return [binary, "run"]
+        argv = [binary, "run"]
+        if output_format is not None:
+            argv.extend(["--format", output_format])
+        argv.append("--auto")
+        return argv
 
     def initial_input(self, spec: "AssignmentSpec") -> bytes:
         """Return an empty bytes object — the briefing travels on argv.
 
-        Unlike :class:`~.claude.ClaudeProvider`, OpenCode receives its
-        briefing as the final positional argument in :meth:`build_command`
-        rather than via a stream-json user message on stdin.  Returning
+        Confirmed (#1703): ``run [message..]`` is a genuine positional argv
+        message; no stdin-delivery protocol was observed.  Unlike
+        :class:`~.claude.ClaudeProvider`, OpenCode receives its briefing as
+        the final positional argument in :meth:`build_command`.  Returning
         ``b""`` (falsy) signals to the spawn path that nothing should be
         written to the worker's stdin pipe.
         """
@@ -356,16 +483,10 @@ class OpenCodeProvider(Provider):
         return b""
 
     def result_marker(self) -> str:
-        """Return the assumed completion sentinel for OpenCode NDJSON logs.
+        """Return the completion sentinel for OpenCode NDJSON logs.
 
-        ASSUMPTION: ``opencode run`` emits a ``{"type":"session.complete",
-        ...}`` NDJSON event as its last structured output line on success.
-        This substring (``"type":"session.complete"``) is searched verbatim
-        in the log bytes by the reap thread to detect completion.
-
-        **Must be verified against real opencode output.**  See the module
-        docstring and ``tests/fixtures/opencode_run_sample.jsonl`` for the
-        assumed schema.
+        CORRECTED (#1704): see :data:`RESULT_MARKER`'s docstring for the
+        full citation and the documented substring-fragility risk.
         """
         return RESULT_MARKER
 
@@ -388,30 +509,78 @@ class OpenCodeProvider(Provider):
     ) -> WorkerSummary:
         """Parse an OpenCode NDJSON log file into a :class:`WorkerSummary`.
 
-        ASSUMPTION: ``opencode run`` emits one JSON object per line (NDJSON)
-        to stdout.  The agent writes this stream verbatim to the log file.
+        CORRECTED (#1704) against the real event schema captured in #1703
+        (``docs/OPENCODE_VERIFICATION.md`` "The real event schema" through
+        "Session id / resume").  ``opencode run --format json`` emits one
+        JSON object per line to stdout; the agent writes this stream
+        verbatim to the log file.
 
         This method is **deliberately permissive** — it silently skips any
-        line that is blank, not valid JSON, or an unrecognised event shape.
-        It NEVER raises regardless of log content.  This matches the contract
-        described in the Provider ABC and is required because:
+        line that is blank, not valid JSON, or an unrecognised event shape,
+        and it NEVER raises regardless of log content.  This is unchanged
+        from the first pass and still required: a truncated tail read
+        (``tail_bytes > 0``) can produce a leading incomplete JSON line,
+        which must be skipped, not raised.
 
-        1. The actual OpenCode output shape was not verified at implementation
-           time; real output may differ from the assumed schema.
-        2. Partial / truncated tail reads (``tail_bytes > 0``) can produce
-           a leading incomplete JSON line which must be skipped, not raised.
+        Real event shapes handled (see
+        ``tests/fixtures/opencode_run_sample.jsonl`` and
+        ``tests/fixtures/opencode_run_failure_sample.jsonl``):
 
-        Assumed event shapes parsed (see ``tests/fixtures/opencode_run_sample.jsonl``):
+        * Every event (any ``type``) carries a top-level ``sessionID``
+          string from the first line onward — confirmed, there is no
+          separate ``session.start``/``session.init`` event.  The first
+          ``sessionID`` seen sets :attr:`WorkerSummary.session_id`.
+        * ``{"type":"tool_use","part":{"tool":"...","state":{"status":...,
+          "input":{...}}}}`` — the tool name updates
+          :attr:`WorkerSummary.tools_used` /
+          :attr:`WorkerSummary.last_tool`; a ``bash`` call's
+          ``input.command`` is recorded in
+          :attr:`WorkerSummary.bash_commands`; an ``edit``/``write`` call's
+          ``input.filePath`` is recorded in
+          :attr:`WorkerSummary.files_edited` (``edit`` confirmed against the
+          real fixture; ``write`` extrapolated from the same ``filePath``
+          convention ``read``/``edit`` both use — not independently
+          confirmed, but the extraction is a no-op, never a crash, if that
+          extrapolation is wrong).  A ``state.status == "error"`` whose
+          ``state.error`` message mentions "permission" (the confirmed
+          permission-denial error shape quotes the matching rules verbatim)
+          is recorded in :attr:`WorkerSummary.permission_denials`.
+        * ``{"type":"text","part":{"text":"..."}}`` — the assistant's final
+          answer; confirmed to be the last ``text`` event before the
+          terminal ``step_finish``, so each one overwrites
+          :attr:`WorkerSummary.result_text` and the last write wins.
+        * ``{"type":"step_finish","part":{"reason":...,"tokens":{...},
+          "cost":...}}`` — one per completed turn/step.  Each occurrence
+          increments :attr:`WorkerSummary.num_turns` by one and *sums*
+          (never overwrites) ``part.cost`` into
+          :attr:`WorkerSummary.total_cost_usd` and
+          ``part.tokens.{input,output}`` /
+          ``part.tokens.cache.{write,read}`` into
+          :attr:`WorkerSummary.input_tokens` /
+          :attr:`WorkerSummary.output_tokens` /
+          :attr:`WorkerSummary.cache_creation_tokens` /
+          :attr:`WorkerSummary.cache_read_tokens` — confirmed there is
+          **no cumulative session-total field anywhere in the stream**, so
+          summing per-step is the only correct total.  ``part.reason``
+          overwrites :attr:`WorkerSummary.stop_reason` every time, so it
+          ends at whatever the *last* ``step_finish`` reported — ``"stop"``
+          for a normal completion.
+        * ``{"type":"error","error":{"name":...,"data":{"message":...}}}``
+          — a run-level failure (confirmed: the whole request/stream failed,
+          no more events follow).  Sets
+          :attr:`WorkerSummary.is_error` ``= True``,
+          :attr:`WorkerSummary.stop_reason` ``= "error"``,
+          :attr:`WorkerSummary.terminal_reason` from ``error.name``, and
+          :attr:`WorkerSummary.result_text` from ``error.data.message``
+          (the real captured message is itself a JSON string containing
+          literal escaped quotes — preserved verbatim, not stripped).
 
-        * ``{"type":"session.start","session_id":"...","model":"..."}`` —
-          sets :attr:`WorkerSummary.session_id` and
-          :attr:`WorkerSummary.model_used`.
-        * ``{"type":"message.complete","num_turns":N}`` — updates turn count.
-        * ``{"type":"session.complete","num_turns":N,"usage":{"cost_usd":X,
-          "input_tokens":N,"output_tokens":N}}`` — updates turn count and
-          (if present) cost / token counters.
-
-        All other event types are accepted and silently ignored.
+        Known, named gap: **no field in any observed event carries a model
+        identifier** (confirmed absent across every event type in both
+        fixtures and every capture in #1703's pass).
+        :attr:`WorkerSummary.model_used` is therefore never set by this
+        method and stays ``None`` — this is evidenced absence, not an
+        unexamined assumption.
 
         Args:
             log_path: Path to the worker's log file.
@@ -460,65 +629,100 @@ def _update_opencode_summary(summary: WorkerSummary, data: dict) -> None:
 
     All field accesses use ``.get()`` with defensive type checks so that
     unexpected shapes produce at most a no-op, never a ``KeyError`` /
-    ``AttributeError``.
-
-    ASSUMPTION: OpenCode NDJSON event shapes as documented in
-    ``tests/fixtures/opencode_run_sample.jsonl``.  Every extraction point
-    is marked with ``# ASSUMPTION:`` to make verification easy.
+    ``AttributeError``.  Event shapes are the real ones captured in #1703 —
+    see :meth:`OpenCodeProvider.parse_log`'s docstring for the full mapping
+    and citations.
     """
+    # Confirmed: sessionID is present on every event from line 1 onward —
+    # capture the first one seen regardless of event type.
+    if summary.session_id is None:
+        sid = data.get("sessionID")
+        if isinstance(sid, str) and sid:
+            summary.session_id = sid
+
     event_type = data.get("type")
     if not isinstance(event_type, str):
         return
 
-    # ASSUMPTION: session.start carries session_id and model.
-    if event_type == "session.start":
-        sid = data.get("session_id")
-        if isinstance(sid, str) and sid:
-            summary.session_id = sid
-        model = data.get("model")
-        if isinstance(model, str) and model and not summary.model_used:
-            summary.model_used = model
+    part = data.get("part")
+    part = part if isinstance(part, dict) else {}
+
+    if event_type == "tool_use":
+        tool = part.get("tool")
+        if isinstance(tool, str) and tool:
+            summary.tools_used.append(tool)
+            summary.last_tool = tool
+
+        state = part.get("state")
+        state = state if isinstance(state, dict) else {}
+        tool_input = state.get("input")
+        tool_input = tool_input if isinstance(tool_input, dict) else {}
+
+        if tool == "bash":
+            cmd = tool_input.get("command")
+            if isinstance(cmd, str) and cmd:
+                summary.bash_commands.append(cmd)
+        elif tool in ("edit", "write"):
+            fp = tool_input.get("filePath")
+            if isinstance(fp, str) and fp:
+                summary.files_edited.append(fp)
+
+        if state.get("status") == "error":
+            err = state.get("error")
+            if isinstance(err, str) and err and "permission" in err.lower():
+                summary.permission_denials.append(err)
         return
 
-    # ASSUMPTION: message.complete carries num_turns for the assistant turn.
-    if event_type == "message.complete":
-        turns = data.get("num_turns")
-        if isinstance(turns, int) and turns > summary.num_turns:
-            summary.num_turns = turns
-        # session_id may also appear here — capture it if not yet set.
-        if summary.session_id is None:
-            sid = data.get("session_id")
-            if isinstance(sid, str) and sid:
-                summary.session_id = sid
+    if event_type == "text":
+        text = part.get("text")
+        if isinstance(text, str):
+            summary.result_text = text
         return
 
-    # ASSUMPTION: session.complete carries num_turns, and an optional usage
-    # sub-object with cost_usd, input_tokens, output_tokens.
-    if event_type == "session.complete":
-        turns = data.get("num_turns")
-        if isinstance(turns, int) and turns > summary.num_turns:
-            summary.num_turns = turns
-        if summary.session_id is None:
-            sid = data.get("session_id")
-            if isinstance(sid, str) and sid:
-                summary.session_id = sid
+    if event_type == "step_finish":
+        reason = part.get("reason")
+        if isinstance(reason, str) and reason:
+            summary.stop_reason = reason
 
-        # ASSUMPTION: usage sub-object with cost_usd and token counts.
-        usage = data.get("usage")
-        if isinstance(usage, dict):
-            cost = usage.get("cost_usd") or usage.get("total_cost_usd")
-            if isinstance(cost, (int, float)):
-                summary.total_cost_usd = float(cost)
-            in_tok = usage.get("input_tokens")
-            if isinstance(in_tok, int) and in_tok > 0:
-                summary.input_tokens = in_tok
-            out_tok = usage.get("output_tokens")
-            if isinstance(out_tok, int) and out_tok > 0:
-                summary.output_tokens = out_tok
+        summary.num_turns += 1
 
-        # stop_reason equivalent: no standard field identified yet.
-        # ASSUMPTION: if present, carry it from a "reason" or "stop_reason" key.
-        stop = data.get("stop_reason") or data.get("reason")
-        if isinstance(stop, str) and stop:
-            summary.stop_reason = stop
+        tokens = part.get("tokens")
+        tokens = tokens if isinstance(tokens, dict) else {}
+        in_tok = tokens.get("input")
+        if isinstance(in_tok, int):
+            summary.input_tokens += in_tok
+        out_tok = tokens.get("output")
+        if isinstance(out_tok, int):
+            summary.output_tokens += out_tok
+
+        cache = tokens.get("cache")
+        cache = cache if isinstance(cache, dict) else {}
+        cache_write = cache.get("write")
+        if isinstance(cache_write, int):
+            summary.cache_creation_tokens += cache_write
+        cache_read = cache.get("read")
+        if isinstance(cache_read, int):
+            summary.cache_read_tokens += cache_read
+
+        cost = part.get("cost")
+        if isinstance(cost, (int, float)):
+            summary.total_cost_usd += float(cost)
         return
+
+    if event_type == "error":
+        summary.is_error = True
+        summary.stop_reason = "error"
+        error_obj = data.get("error")
+        error_obj = error_obj if isinstance(error_obj, dict) else {}
+        name = error_obj.get("name")
+        if isinstance(name, str) and name:
+            summary.terminal_reason = name
+        err_data = error_obj.get("data")
+        err_data = err_data if isinstance(err_data, dict) else {}
+        message = err_data.get("message")
+        if isinstance(message, str):
+            summary.result_text = message
+        return
+
+    # step_start and any other/future event type carry nothing else this
+    # method extracts — the sessionID capture above already ran.
