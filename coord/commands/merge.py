@@ -851,15 +851,20 @@ def _merge_via_daemon(svc, params: dict) -> None:
     suite on the daemon host, which is minutes-to-tens-of-minutes on its own —
     the default 900 s ceiling would abandon the client mid-suite (the daemon
     keeps going and finishes the merge, so the operator sees a timeout error
-    for a run that actually succeeded). Give that case a window comfortably
-    above :data:`coord.revalidate.DEFAULT_TIMEOUT_SECONDS`, which is the
-    ceiling the suite itself is killed at."""
-    from coord.client import post_record  # noqa: PLC0415
-    from coord.revalidate import DEFAULT_TIMEOUT_SECONDS  # noqa: PLC0415
+    for a run that actually succeeded).
 
-    timeout = 900.0
-    if params.get("revalidate"):
-        timeout = float(DEFAULT_TIMEOUT_SECONDS) + 300.0
+    #1715-review: batch revalidation's own worst case is 1 (composite) + N
+    (per-entry fallback) serial suite runs, not just one — see
+    :func:`coord.revalidate.revalidate_group`. :func:`coord.revalidate.
+    client_timeout_seconds` sizes the window off that worst case (a
+    documented ceiling on N, since the client posts before any candidate is
+    known) rather than a single :data:`coord.revalidate.
+    DEFAULT_TIMEOUT_SECONDS`, which is the ceiling ONE suite run is killed
+    at."""
+    from coord.client import post_record  # noqa: PLC0415
+    from coord.revalidate import client_timeout_seconds  # noqa: PLC0415
+
+    timeout = client_timeout_seconds(bool(params.get("revalidate")))
 
     try:
         resp = post_record(svc, "/merge", params, timeout=timeout)

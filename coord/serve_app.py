@@ -203,6 +203,16 @@ _stdio_capture_install_lock = threading.Lock()
 # lease-with-TTL (``POST /merge-lease`` / ``DELETE /merge-lease``) was named
 # as the tier:large alternative specifically to avoid this, and remains a
 # candidate follow-up if a hung merge in production makes it worth building.
+#
+# #1715-review amplification: ``coord merge --revalidate``'s batch composite
+# (``coord.revalidate.revalidate_group``) runs entirely inside this same
+# critical section. Its worst case is 1 (composite) + N (one solo re-test per
+# candidate) *serial* suite runs on a red composite — see that module's
+# docstring — so a large, red batch now holds this lock, and therefore blocks
+# every other merge in the fleet, for up to N+1 suite runs instead of one.
+# Still within the accepted trade-off above (it is the same unbounded-hold
+# hazard, just a bigger multiple of it), but worth naming explicitly since
+# it is new to #1715 rather than inherited from #1400/#1769.
 _merge_lock = threading.Lock()
 
 
