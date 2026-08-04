@@ -106,6 +106,39 @@ from coord.merge_queue import RevalidationCandidate
 # `_merge_via_daemon` sizes the thin client's HTTP timeout off this value.
 DEFAULT_TIMEOUT_SECONDS = 60 * 30
 
+# #1715-review: `revalidate_group`'s red-composite fallback is 1 (composite) +
+# N (one solo re-test per candidate) serial suite runs — see that function's
+# docstring. #1769 sized the thin client's HTTP timeout for exactly ONE run;
+# this module's own worst case is now 1 + N, and the client has to outlast it
+# or the operator sees "error: merge via daemon failed" for a batch that
+# actually finished (the daemon keeps running under `_merge_lock` regardless —
+# see `_merge_via_daemon`'s docstring).
+#
+# The client posts to ``/merge`` before any candidate is known — computing the
+# real N would mean re-implementing `merge_queue.revalidation_candidates`'s
+# whole eligibility policy (board state, CI lookups) on a thin client, which
+# is exactly what #584 routes to the daemon to avoid. So this is a documented,
+# deliberately generous ceiling rather than a measured count: comfortably
+# above the "merge queue depth (2-5)" this module's STRATEGY section cites, so
+# a real-world batch never gets close to it. A batch that somehow exceeds it
+# just gets the pre-#1715 false-negative report back — the daemon still
+# finishes the merge either way.
+MAX_REVALIDATION_BATCH = 10
+
+
+def client_timeout_seconds(revalidate: bool) -> float:
+    """HTTP timeout ``_merge_via_daemon`` should give a ``/merge`` POST.
+
+    A plain merge gets the pre-#1769 900s ceiling. A ``--revalidate`` run can
+    execute the whole suite up to ``1 + MAX_REVALIDATION_BATCH`` times (see
+    that constant) before the daemon responds, so it gets a window sized off
+    that worst case instead of a single :data:`DEFAULT_TIMEOUT_SECONDS`.
+    """
+    if not revalidate:
+        return 900.0
+    return float(DEFAULT_TIMEOUT_SECONDS) * (1 + MAX_REVALIDATION_BATCH) + 300.0
+
+
 # How much of a failing run's output to quote back. The whole point of the
 # "a failed re-test leaves the entry blocked with the failure quoted" rule is
 # that the operator can act on it without going hunting, but a full pytest
@@ -320,7 +353,7 @@ def group_candidates(
 
     Keyed by ``(repo_name, target_branch)`` — one composite can only be built
     per base, so that pair is exactly the batch boundary. Sorted so the
-    ``--dry-run` preview and the real run enumerate the batches identically.
+    ``--dry-run`` preview and the real run enumerate the batches identically.
     """
     groups: dict[tuple[str, str], list[RevalidationCandidate]] = {}
     for c in candidates:
@@ -776,6 +809,14 @@ def format_batch(batch: BatchRevalidationResult) -> list[str]:
     what merged anyway" is ordinary stdout. Keeping them separate is why the
     caller does not have to route a "PASSED alone — merging" line to stderr
     just because the composite that preceded it was red.
+
+    A per-entry (solo) failure is different: it names the actual culprit, and
+    the worktree :func:`revalidate` kept for it (per ``worktree_slug``) is the
+    one an operator would actually inspect — the composite's own kept
+    worktree is a different tree entirely. #1715-review: that pointer used to
+    be silently dropped here, even though :func:`format_failure` already knew
+    how to print it. Reuse it (skipping its leading reason line, which
+    :func:`format_batch` already renders with the branch label attached).
     """
     lines: list[str] = []
     if batch.composite.ok:
@@ -790,6 +831,7 @@ def format_batch(batch: BatchRevalidationResult) -> list[str]:
             lines.append(f"  --revalidate: {label}: PASSED alone — merging")
         else:
             lines.append(f"  --revalidate: {label}: BLOCKED — {solo.reason}")
+            lines.extend(format_failure(solo)[1:])
     if batch.culprits:
         lines.append(
             "  --revalidate: culprit(s): " + ", ".join(batch.culprits)
@@ -834,9 +876,11 @@ __all__ = [
     "KIND_SETUP",
     "KIND_SUITE",
     "KIND_TIMEOUT",
+    "MAX_REVALIDATION_BATCH",
     "NARROWABLE_KINDS",
     "BatchRevalidationResult",
     "RevalidationResult",
+    "client_timeout_seconds",
     "describe_batches",
     "describe_candidates",
     "format_batch",

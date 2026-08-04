@@ -889,6 +889,31 @@ class TestBatchAcceptance:
             "w1": mq.PENDING, "w2": mq.PENDING, "w3": mq.PENDING,
         }
 
+    def test_culprit_solo_worktree_is_surfaced_in_the_outcome_lines(
+        self, git_fleet: Path, tmp_path: Path, coord_db,
+    ) -> None:
+        """#1715-review: `solo.worktree` (kept for inspection, per
+        `revalidate()`'s contract) used to be dropped on the floor —
+        `format_failure`, which prints the "worktree kept for inspection"
+        line, only ran on the composite's own failure. An operator debugging
+        the actual culprit branch needs a pointer to ITS OWN composed
+        worktree, not just the (different) composite one."""
+        _seed_stale_entries(_FLEET)
+        cfg, counter = self._cfg_with_counter(
+            tmp_path, git_fleet, tail="; ! test -f f103.txt",
+        )
+
+        result = _invoke(["merge", "--config", str(cfg), "--revalidate"], git_fleet)
+
+        assert result.exit_code == 0, result.output
+        # The composite's own kept-for-inspection line (existing behaviour).
+        # Plus the culprit's OWN solo worktree — this is the new assertion.
+        assert result.output.count("worktree kept for inspection:") == 2, (
+            "expected one 'kept for inspection' line for the composite and "
+            f"one for the solo culprit run\n{result.output}"
+        )
+        assert "revalidate-worktrees" in result.output
+
 
 class TestSkipSmokeUnchanged:
     """#1769 acceptance: "--skip-smoke keeps working unchanged as the manual
@@ -1014,7 +1039,12 @@ class TestDaemonRoute:
 class TestThinClientTimeout:
     """A `--revalidate` run executes the whole suite on the daemon host. The
     thin client's HTTP timeout has to outlast that, or the operator sees a
-    timeout error for a merge that actually succeeded."""
+    timeout error for a merge that actually succeeded.
+
+    #1715-review: the batch cascade's worst case is 1 (composite) + N
+    (per-entry fallback) *serial* suite runs, not just one — #1769's padding
+    only covered a single run and would already be blown by a four-branch
+    red-composite fallback (5 runs, ~35-40 min against a 35 min budget)."""
 
     def test_revalidate_gets_a_longer_daemon_timeout(self) -> None:
         from coord.commands import merge as merge_mod
@@ -1032,3 +1062,19 @@ class TestThinClientTimeout:
         with patch("coord.client.post_record", side_effect=fake_post_record):
             merge_mod._merge_via_daemon(object(), {"revalidate": False})
         assert seen["timeout"] == 900.0
+
+    def test_revalidate_timeout_covers_the_documented_1_plus_n_worst_case(
+        self,
+    ) -> None:
+        """The #1715 issue's own headline scenario — a four-branch parallel
+        group whose composite goes red — falls back to 5 serial suite runs.
+        The client timeout must comfortably outlast that, and in general must
+        scale with `coord.revalidate.MAX_REVALIDATION_BATCH`, not just add a
+        flat, single-run pad on top of `DEFAULT_TIMEOUT_SECONDS`."""
+        headline_worst_case = rv.DEFAULT_TIMEOUT_SECONDS * 5
+        assert rv.client_timeout_seconds(True) > headline_worst_case
+
+        assert rv.client_timeout_seconds(True) == (
+            rv.DEFAULT_TIMEOUT_SECONDS * (1 + rv.MAX_REVALIDATION_BATCH) + 300.0
+        )
+        assert rv.client_timeout_seconds(False) == 900.0
