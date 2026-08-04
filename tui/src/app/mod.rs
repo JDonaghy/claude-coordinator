@@ -3204,6 +3204,18 @@ pub struct CoordApp {
     /// body's own), cached by `render_reports_panel` so `events.rs` can
     /// hit-test without a `Backend` handle. See `app/msv.rs`.
     reports_layout: std::cell::RefCell<MsvLayoutCache>,
+    /// #1762: which result column is sorted and in which direction, or
+    /// `None` for the daemon's own row order. Toggled by a header click
+    /// (`reports_sort_by_column`) and cleared by every run — view state
+    /// over one result set, never persisted.
+    reports_sort: Option<(usize, SortDirection)>,
+    /// #1762: the most recently painted result-`DataTable` geometry **and
+    /// the rect it was painted into**, cached so `events.rs` can route a
+    /// header click without a `Backend` handle. The rect is part of the
+    /// cache because — unlike `audit_table_layout` — this table does not
+    /// start at the main panel's origin; the section stack sits above it.
+    /// `None` whenever no table is on screen.
+    reports_table_layout: std::cell::RefCell<Option<(Rect, DataTableLayout)>>,
 
     // ── #541: global Telescope-style issue fuzzy finder ──────────────────────
     /// Active state of the issue fuzzy-finder overlay.  `None` when the
@@ -3731,6 +3743,8 @@ impl CoordApp {
             reports_text_editing: false,
             reports_result_scroll: 0,
             reports_layout: std::cell::RefCell::new(MsvLayoutCache::default()),
+            reports_sort: None,
+            reports_table_layout: std::cell::RefCell::new(None),
             // #217: resolved theme palette — computed from settings + optional
             // ~/.coord/theme.toml override file.
             active_theme: {

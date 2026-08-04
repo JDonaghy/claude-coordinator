@@ -53,7 +53,14 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 }
 
 /// Inverse of [`days_from_civil`]: days-since-epoch -> (year, month, day).
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
+///
+/// `pub(crate)` since #1762: the Reports panel needs an absolute calendar
+/// rendering for old `timestamp` cells, and this workspace has no
+/// chrono/time dependency. Hand-rolling a *second* copy of Hinnant's
+/// algorithm in `format.rs` would make three calendars in one binary
+/// (this one, `format.rs`'s, and whatever came next), so `format.rs`
+/// calls this instead — see `format::format_unix_abs`.
+pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 }.div_euclid(146_097);
     let doe = z - era * 146_097; // [0, 146096]

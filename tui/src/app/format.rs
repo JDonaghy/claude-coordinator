@@ -48,6 +48,56 @@ pub(crate) fn format_unix_time(ts: f64) -> String {
     format!("{} ago", fmt_dur(delta))
 }
 
+/// #1762: absolute UTC rendering of a unix timestamp — `YYYY-MM-DD HH:MM`.
+///
+/// The civil-calendar conversion is `usage::civil_from_days` (Howard
+/// Hinnant's algorithm), deliberately **borrowed rather than re-derived**:
+/// this workspace carries no chrono/time crate, `usage.rs` already
+/// hand-rolls the arithmetic, and a second copy here would be the third
+/// calendar in one binary.
+pub(crate) fn format_unix_abs(ts: f64) -> String {
+    const SECS_PER_DAY: f64 = 86_400.0;
+    // `.floor()`, not a truncating cast: a pre-1970 timestamp is negative
+    // and must round *down* to its day, or the date lands a day late and
+    // the seconds-into-the-day remainder goes negative.
+    let days = (ts / SECS_PER_DAY).floor();
+    let rem = (ts - days * SECS_PER_DAY).max(0.0) as u64;
+    let (y, m, d) = super::usage::civil_from_days(days as i64);
+    format!(
+        "{y:04}-{m:02}-{d:02} {h:02}:{min:02}",
+        h = (rem / 3600) % 24,
+        min = (rem % 3600) / 60
+    )
+}
+
+/// Timestamps older (or newer) than this render absolutely rather than
+/// relatively. `fmt_dur`'s largest unit is the hour, so beyond a couple of
+/// days "72h0m ago" is strictly less legible than a date — and a report
+/// window can reach back weeks.
+const RELATIVE_TIME_MAX_SECS: f64 = 48.0 * 3600.0;
+
+/// #1762: a `timestamp` cell's rendering — relative while recent
+/// (`13h ago`), absolute otherwise (`2026-07-28 14:03`).
+///
+/// A future timestamp always renders absolutely: [`format_unix_time`]
+/// clamps the delta at zero, so a clock-skewed row would otherwise claim
+/// `0s ago` no matter how far ahead it actually is.
+pub(crate) fn format_unix_smart(ts: f64) -> String {
+    if !ts.is_finite() {
+        return String::new();
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    let delta = now - ts;
+    if (0.0..RELATIVE_TIME_MAX_SECS).contains(&delta) {
+        format_unix_time(ts)
+    } else {
+        format_unix_abs(ts)
+    }
+}
+
 /// #546: format a token count with K/M suffix and one decimal place.
 ///
 /// Examples: 1500 → "1.5k", 2_300_000 → "2.3M", 800 → "800".

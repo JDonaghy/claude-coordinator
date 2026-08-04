@@ -5722,9 +5722,31 @@ impl CoordApp {
                 MsvClick::Field { section, field } => {
                     self.reports_apply_field_click(section, &field)
                 }
+                // #1762: everything below the section stack is the result
+                // table, and `Outside` is exactly "not in the stack" — so
+                // this is where a click on the result `DataTable` lands.
+                //
+                // A header click sorts by that column. It is the first
+                // `DataTableHit::Header` coord-tui acts on in the Reports
+                // panel, and only correct *here*: a `ReportResult` is a
+                // complete bounded set, where the Audit table's rows are
+                // one server-paginated page and a client-side sort of them
+                // would be a lie (see `audit.rs`'s module docs).
+                //
+                // Rows are not selectable (there is nothing to drill into
+                // yet) and the table has no footer, so every other hit is
+                // a no-op.
+                MsvClick::Outside => match self.reports_table_hit(pos) {
+                    Some(DataTableHit::Header { col }) => self.reports_sort_by_column(col),
+                    Some(DataTableHit::Row { .. })
+                    | Some(DataTableHit::HeaderDivider { .. })
+                    | Some(DataTableHit::Footer)
+                    | Some(DataTableHit::Empty)
+                    | None => false,
+                },
                 // The current sections carry no header actions; a future
                 // consumer (or a later Reports slice) routes them here.
-                MsvClick::HeaderAction { .. } | MsvClick::Inert | MsvClick::Outside => false,
+                MsvClick::HeaderAction { .. } | MsvClick::Inert => false,
             };
         }
         // #1116: Usage panel grid/drill is a `DataTable` painted straight
