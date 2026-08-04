@@ -1532,6 +1532,26 @@ def _board_response_schema(components: dict) -> dict:
             },
             "notifications": {"type": "array", "items": {"type": "object"}},
             "board_meta": {"type": "object", "additionalProperties": {"type": "string"}},
+            "board_truncated": {
+                "type": "boolean",
+                "description": (
+                    "#1791: true when coord.board_wire.bound_board_payload "
+                    "dropped terminal `assignments` rows to hold the /board "
+                    "wire under its byte budget. Additive-only — absent (not "
+                    "false) when nothing was dropped, so an old client sees "
+                    "an unchanged shape. A trimmed board is never missing "
+                    "active work; the dropped rows' full history stays on "
+                    "GET /assignment/{id}."
+                ),
+            },
+            "board_truncated_assignments": {
+                "type": "integer",
+                "description": (
+                    "#1791: how many terminal assignment rows were dropped "
+                    "by the cap above. Present only when board_truncated is "
+                    "true."
+                ),
+            },
             "audit_recent_count": {
                 "type": "integer",
                 "description": (
@@ -4012,10 +4032,15 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             except Exception:  # noqa: BLE001 — goal-header failure must not blank the board
                 projection["goal_header"] = {"available": False}
             # #1337 invariant 2: no collection endpoint returns unbounded text.
-            # Bound the per-row free-text fields LAST — the derived sections
-            # above parse full issue bodies server-side and must see them
-            # unbounded; only the wire is bounded.  Full text lives on the
-            # detail endpoints (GET /assignment/{id}, GET /issue/{r}/{n}).
+            # #1791 adds a second bound — collection CARDINALITY, not just
+            # per-row width — dropping old terminal `assignments` rows (and
+            # closed-issue bodies) past a named count/byte budget, flagged on
+            # the payload (`board_truncated`) so a client can tell it got a
+            # trimmed board. Apply LAST — the derived sections above parse
+            # full issue bodies + the full assignment history server-side and
+            # must see them unbounded; only the wire is bounded.  Full text
+            # lives on the detail endpoints (GET /assignment/{id},
+            # GET /issue/{r}/{n}).
             from coord.board_wire import bound_board_payload as _bound  # noqa: PLC0415
 
             _bound(projection)
