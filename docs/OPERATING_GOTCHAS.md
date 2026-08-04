@@ -567,3 +567,62 @@ than re-testing — so *N* queued issues can cost *N−1* human interventions
 overnight, the opposite of what a queue is for. Full reasoning and the
 smaller, partially-mitigated `#1738` sibling trap (a content-irrelevant base
 move) are in [`docs/DRIVE_QUEUE.md`](DRIVE_QUEUE.md)'s top section.
+
+## 14. Fleet `coordinator.yml` is edited in a *different repo* than the one you're reading this in — and the daemon can silently run a broken copy of it
+
+The daemon host's `~/.coord/coordinator.yml` is not a file you edit in place.
+It is a **symlink** into a separate checkout, `~/src/coord-settings`
+(`$COORD_SETTINGS_DIR` if overridden), pointing at
+`coord-settings/coord/coordinator.yml`. The loop is:
+
+```bash
+# edit + review, in the coord-settings repo — NOT this one
+vi ~/src/coord-settings/coord/coordinator.yml
+git -C ~/src/coord-settings commit -am "..." && git -C ~/src/coord-settings push
+
+# deploy, on the daemon host
+git -C ~/src/coord-settings pull
+```
+
+That's it — **no `coord-serve` restart is needed.** `_reload_config_if_stale`
+(#1081, `coord/serve_app.py`) tracks the backing file's mtime and swaps in a
+freshly-parsed `Config` the moment anything notices it changed; `GET /config`
+(what a thin client's `coord config` re-fetches into
+`~/.coord/coordinator.remote.yml` — see item 8, a *completely different*
+cache from the checkout this section is about) serves the raw bytes fresh on
+every request regardless. If you find yourself restarting the daemon after a
+`coordinator.yml` edit, that restart isn't doing anything for the config —
+check whether you actually needed item 2's session-safety dance for it.
+
+**A malformed edit is swallowed, not rejected.** If the pulled file fails to
+parse (bad YAML, a validation error), `_reload_config_if_stale` logs one
+warning and keeps serving the *last-good* `Config` for the daemon's own
+gating decisions (review/pipeline/merge-auto-drain/milestone-auto-dispatch) —
+but it still advances its mtime marker, so it will not retry the reload until
+the file changes *again*. Meanwhile `GET /config` has no such guard: it hands
+the broken bytes to every thin client that asks. The daemon and its clients
+now silently disagree about what the fleet's config is, and nothing says so
+until something downstream behaves strangely. **Validate the YAML before you
+push it.**
+
+Three narrower failure modes sit on top of "no content drift is possible
+because the symlink makes the live file the tracked file" — each invisible
+from a running fleet, each different enough to need a different fix:
+
+1. The symlink gets silently replaced by a regular file (`coord init` offers
+   to overwrite `coordinator.yml`; any `scp`/`cp`/editor write-and-rename
+   does the same) — the daemon goes back to running an untracked file with a
+   perfectly healthy-looking repo.
+2. The checkout has uncommitted changes — a direct edit to the live path
+   writes *through* the symlink into the checkout's working tree.
+3. The checkout is behind (or ahead of) `origin` — pulled-but-not-pushed, or
+   pushed-but-not-pulled.
+
+`coord diagnose --config-provenance` (#1779, `coord/fleet_config_health.py`)
+checks all three, read-only and with no network access (sync-vs-`origin` is
+read from the existing remote-tracking ref, never a fresh `fetch`). It is a
+**neutral skip**, not a warning, on every machine with no coord-settings
+checkout — which is every machine except the daemon host and the operator's
+box; the checkout is deliberately kept out of the fleet's own repo list so a
+dispatched worker can never edit the file governing its own concurrency
+limits, capability routing, and review gates.
