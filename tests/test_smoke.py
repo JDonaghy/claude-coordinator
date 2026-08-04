@@ -1545,3 +1545,262 @@ def test_dispatch_pending_smoke_calls_dispatch_smoke_for_eligible_rows(
     call_args = mock_dispatch.call_args
     assert call_args[0][0] is eligible
     assert result == [sentinel]
+
+
+# ── #1819: one branch, one Test run ─────────────────────────────────────────
+#
+# After a fix round an issue has TWO `work` rows on the SAME branch
+# (`--fix-of` reuses the branch by design). `dispatch_smoke`'s dedupe was
+# keyed to a single work row, so both rows dispatched their own Test worker —
+# two machines running the identical suite on the identical branch, racing to
+# write a verdict (observed live on #1797, 2026-08-04). Worse, the re-dispatch
+# stamped `test_state="running"` over a verdict that had already satisfied the
+# merge gate, so a verdict landing → merge enqueuing → re-dispatch clobbering
+# the gate field became a self-sustaining loop.
+
+
+def _fix_round_pair(branch: str = "issue-1-fix") -> tuple[Assignment, Assignment]:
+    """The real shape: round 1 (review=request-changes) + the fix round that
+    superseded it, both `done`, both on the SAME branch."""
+    round1 = replace(
+        _completed(branch=branch),
+        assignment_id="b8bff1ea023d",
+        dispatched_at=100.0,
+        review_verdict="request-changes",
+    )
+    round2 = replace(
+        _completed(branch=branch),
+        assignment_id="406bcf394032",
+        dispatched_at=200.0,
+        review_verdict="approve",
+    )
+    return round1, round2
+
+
+def test_dispatch_smoke_dedupes_on_the_branch_not_the_work_row(
+    gtk_and_server_config: Config,
+) -> None:
+    """#1819 criterion 1: two `work` rows on one branch produce exactly ONE
+    smoke dispatch — counted, not inferred from the absence of an error."""
+    round1, round2 = _fix_round_pair()
+    board = Board(completed=[round1, round2])
+    client = _FakeClient({"id": "smoke-1"})
+    diff = lambda repo, branch: ["src/gtk/window.c"]
+
+    dispatched = [
+        dispatch_smoke(
+            row, board, gtk_and_server_config,
+            http_client=client, diff_lookup=diff,
+        )
+        for row in (round2, round1)
+    ]
+
+    assert len([d for d in dispatched if d is not None]) == 1
+    assert len([a for a in board.active if a.type == "smoke"]) == 1
+    assert len(client.calls) == 1
+
+
+def test_dispatch_smoke_never_targets_a_superseded_work_row(
+    gtk_and_server_config: Config,
+) -> None:
+    """#1819 criterion 2: the round-1 row is superseded by the fix round on
+    the same branch, so it is never a Test dispatch target — not even with an
+    empty board.active (i.e. no in-flight smoke for the branch dedupe to
+    catch)."""
+    round1, round2 = _fix_round_pair()
+    board = Board(completed=[round1, round2])
+
+    assert dispatch_smoke(
+        round1, board, gtk_and_server_config,
+        http_client=_FakeClient({"id": "smoke-1"}),
+        diff_lookup=lambda repo, branch: ["src/gtk/window.c"],
+    ) is None
+    assert board.active == []
+    # ...and the row is left untouched: no "running" marker on a row nothing
+    # is going to run.
+    assert round1.test_state is None
+
+
+def test_dispatch_smoke_superseded_by_a_still_running_fix_round(
+    gtk_and_server_config: Config,
+) -> None:
+    """A fix round that is still RUNNING supersedes too — dispatching against
+    the row it is rewriting tests a branch that is about to change."""
+    round1, round2 = _fix_round_pair()
+    round2 = replace(round2, status="running")
+    board = Board(active=[round2], completed=[round1])
+
+    assert dispatch_smoke(
+        round1, board, gtk_and_server_config,
+        http_client=_FakeClient({"id": "smoke-1"}),
+        diff_lookup=lambda repo, branch: ["src/gtk/window.c"],
+    ) is None
+
+
+def test_dispatch_smoke_failed_later_row_does_not_supersede(
+    gtk_and_server_config: Config,
+) -> None:
+    """A `failed` fix round produced nothing — the earlier row is still the
+    branch's author and stays testable."""
+    round1, round2 = _fix_round_pair()
+    round2 = replace(round2, status="failed")
+    board = Board(completed=[round1, round2])
+
+    assert dispatch_smoke(
+        round1, board, gtk_and_server_config,
+        http_client=_FakeClient({"id": "smoke-1"}),
+        diff_lookup=lambda repo, branch: ["src/gtk/window.c"],
+    ) is not None
+
+
+def test_dispatch_smoke_still_dispatches_per_branch_for_two_branches(
+    gtk_and_server_config: Config,
+) -> None:
+    """#1819 criterion 4: the genuine multi-branch case is unaffected — two
+    different branches still get their own smokes."""
+    a = replace(
+        _completed(branch="issue-1-fix"), assignment_id="w1", dispatched_at=100.0
+    )
+    b = replace(
+        _completed(branch="issue-2-other"), assignment_id="w2", dispatched_at=110.0,
+        issue_number=288,
+    )
+    board = Board(completed=[a, b])
+    client = _FakeClient({"id": "smoke-x"})
+    diff = lambda repo, branch: ["src/gtk/window.c"]
+
+    first = dispatch_smoke(
+        a, board, gtk_and_server_config, http_client=client, diff_lookup=diff
+    )
+    second = dispatch_smoke(
+        b, board, gtk_and_server_config, http_client=client, diff_lookup=diff
+    )
+    assert first is not None and second is not None
+    assert len([x for x in board.active if x.type == "smoke"]) == 2
+
+
+def test_dispatch_pending_smoke_fix_round_shape_dispatches_once(
+    gtk_and_server_config: Config, monkeypatch,
+) -> None:
+    """#1819 criterion 5, through the bulk path the daemon actually runs.
+
+    The real shape after the re-test arm clears the stale verdict (`coord
+    diagnose --stage test --reset` NULLs `test_state` on every work row for
+    the issue): two `work` rows sharing a branch, the earlier with
+    `review_verdict=request-changes`. Before #1819 this dispatched twice.
+    """
+    monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: None)
+
+    round1, round2 = _fix_round_pair()
+    board = Board(completed=[round1, round2])
+    client = _FakeClient({"id": "smoke-1"})
+    # `dispatch_pending_smoke` has no injection seam of its own — it builds
+    # the real client, so stub the module's `httpx` handle instead.
+    monkeypatch.setattr("coord.smoke.httpx", client)
+    monkeypatch.setattr(
+        "coord.smoke._fetch_touched_files", lambda repo, branch: ["src/gtk/window.c"]
+    )
+
+    dispatched = dispatch_pending_smoke(board, gtk_and_server_config)
+
+    assert len(dispatched) == 1
+    assert len([a for a in board.active if a.type == "smoke"]) == 1
+    # The run is keyed to the CURRENT work row, not the superseded one.
+    assert dispatched[0].review_of_assignment_id == round2.assignment_id
+
+
+def test_dispatch_pending_smoke_fix_round_shape_with_running_markers(
+    gtk_and_server_config: Config, monkeypatch,
+) -> None:
+    """The exact board #1797 showed: both rows `test_state="running"`, the
+    earlier `review_verdict=request-changes`. `running` is the #1395 transient
+    marker, so the bulk scan must leave both alone rather than pile on a
+    third and fourth Test worker."""
+    monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: None)
+
+    round1, round2 = _fix_round_pair()
+    round1 = replace(round1, test_state="running")
+    round2 = replace(round2, test_state="running")
+    board = Board(completed=[round1, round2])
+
+    assert dispatch_pending_smoke(board, gtk_and_server_config) == []
+
+
+def test_dispatch_smoke_does_not_clobber_a_recorded_verdict(
+    gtk_and_server_config: Config, coord_db,
+) -> None:
+    """#1819 (loop): dispatching a fresh Test run must not, BY ITSELF,
+    un-satisfy a gate that was already satisfied.
+
+    `running` is read as "no verdict yet" by every gate (#1395), so stamping
+    it over a `passed` row retracts an answer the merge queue was already
+    acting on — the clobber that made #1797 spin.
+    """
+    from coord.state import record_dispatched_assignment, record_test_verdict
+
+    row = replace(_completed(), test_state="passed")
+    board = Board(completed=[row])
+    record_dispatched_assignment(assignment=row, repo_github="acme/api")
+    record_test_verdict(assignment_id=row.assignment_id, test_state="passed")
+
+    result = dispatch_smoke(
+        row, board, gtk_and_server_config,
+        http_client=_FakeClient({"id": "smoke-1"}),
+        diff_lookup=lambda repo, branch: ["src/gtk/window.c"],
+    )
+
+    assert result is not None          # the fresh run DID go out...
+    assert row.test_state == "passed"  # ...and the verdict survived it
+    persisted = coord_db.execute(
+        "SELECT test_state FROM assignments WHERE assignment_id=?",
+        (row.assignment_id,),
+    ).fetchone()
+    assert persisted["test_state"] == "passed"
+
+
+def test_redispatch_keeps_the_entry_mergeable(
+    gtk_and_server_config: Config,
+) -> None:
+    """#1819 (loop) criterion: verdict recorded → entry mergeable →
+    re-dispatch fires → the entry is STILL mergeable.
+
+    Asserting "exactly one dispatch happened" would pass on the old code path
+    for a single-work-row issue and still ship the loop; this asserts the
+    property the loop actually violated.
+    """
+    from coord.merge_queue import QueuedMerge, has_smoke_verdict
+
+    round1, round2 = _fix_round_pair()
+    # The verdict landed on the fix round, which is what the Test stage ran.
+    round2 = replace(round2, test_state="passed", smoke_test="pass")
+    board = Board(completed=[round1, round2])
+
+    entry = QueuedMerge(
+        assignment_id=round2.assignment_id,
+        repo_name="api",
+        repo_github="acme/api",
+        branch=round2.branch,
+        target_branch="main",
+        issue_number=round2.issue_number,
+        issue_title=round2.issue_title,
+        assignment_type="work",
+        required_gates=["smoke", "merge"],
+    )
+    assert has_smoke_verdict(entry, board)
+
+    # A re-dispatch fires (base moved, operator hit the dashboard button, ...).
+    smoke = dispatch_smoke(
+        round2, board, gtk_and_server_config,
+        http_client=_FakeClient({"id": "smoke-redispatch"}),
+        diff_lookup=lambda repo, branch: ["src/gtk/window.c"],
+    )
+    assert smoke is not None
+
+    # The gate the merge queue reads is STILL satisfied — the loop is broken.
+    assert has_smoke_verdict(entry, board)
+    # ...and a THIRD run can't pile on while that one is in flight.
+    assert dispatch_smoke(
+        round2, board, gtk_and_server_config,
+        http_client=_FakeClient({"id": "smoke-third"}),
+        diff_lookup=lambda repo, branch: ["src/gtk/window.c"],
+    ) is None

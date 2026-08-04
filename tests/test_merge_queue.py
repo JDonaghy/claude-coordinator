@@ -5972,3 +5972,179 @@ class TestStaleSmokeVerdictReporting:
         blocked = [e for e in events if e.kind == "smoke_required"]
         assert len(blocked) == 1
         assert "stale" in blocked[0].message
+
+
+def _patched_time(now: float):
+    """Freeze `coord.merge_queue`'s clock — the #1819 abandoned-marker check is
+    the module's only wall-clock-dependent gate decision."""
+    return patch("coord.merge_queue.time.time", return_value=now)
+
+
+class TestAbandonedRunningMarkerIsStaleNotMissing:
+    """#1819: a `test_state="running"` marker nobody is going to resolve.
+
+    `running` is the #1395 transient dispatch marker. If the Test worker died,
+    was reaped, or its verdict write was lost, nothing ever clears it and every
+    gate reads "no verdict recorded" forever — and `coord merge --revalidate`,
+    the ONE tool built for exactly this cascade, refuses to touch it because it
+    only ever re-tests STALE entries:
+
+        --revalidate: no entry is blocked solely on a stale test verdict —
+                      nothing to revalidate
+
+    That is the #1640 shape in its load-bearing form: the operator's escape
+    hatch is unreachable from the state that most needs it (#1797, 2026-08-04).
+    An abandoned marker is a staleness problem — re-run and re-record — so it
+    is classified as one.
+    """
+
+    @staticmethod
+    def _board(active=None, completed=None):
+        from coord.models import Board
+        return Board(active=list(active or []), completed=list(completed or []))
+
+    @staticmethod
+    def _work(aid: str = "w1", *, test_state: str | None = "running") -> Assignment:
+        return Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id=aid, type="work", status="done",
+            branch=f"worker/{aid}",
+            test_state=test_state,
+        )
+
+    @staticmethod
+    def _smoke(aid: str, of: str, *, dispatched_at: float, status: str = "running"):
+        return Assignment(
+            machine_name="m2", repo_name="api", issue_number=1,
+            issue_title="[smoke] t",
+            assignment_id=aid, type="smoke", status=status,
+            branch="worker/w1",
+            review_of_assignment_id=of,
+            dispatched_at=dispatched_at,
+        )
+
+    def test_running_marker_with_a_live_worker_is_still_missing(self) -> None:
+        """A Test run genuinely in flight must NOT be called stale — that would
+        let `--revalidate` race a worker that is about to answer.
+
+        Also covers the just-reaped case implicitly: the window is measured
+        from the newest Test worker's dispatch, so a smoke that finished
+        moments ago still buys the notify path time to land its verdict."""
+        now = 10_000.0
+        board = self._board(
+            active=[self._smoke("s1", "w1", dispatched_at=now - 60)],
+            completed=[self._work()],
+        )
+        with _patched_time(now):
+            verdict = mq.evaluate_smoke_verdict(_q("w1", target="main"), board)
+
+        assert verdict.kind == mq.SMOKE_MISSING
+
+    def test_running_marker_that_outlived_its_worker_is_stale(self) -> None:
+        """The reaped-worker case: the smoke row is gone from `board.active`
+        and older than the window, but the parent row is still pinned at
+        `running` — the verdict write was lost (or the worker died before
+        making one) and nothing will ever clear it."""
+        now = 10_000.0
+        board = self._board(
+            completed=[
+                self._work(),
+                self._smoke(
+                    "s1", "w1",
+                    dispatched_at=now - mq.RUNNING_MARKER_STALE_AFTER - 1,
+                    status="failed",
+                ),
+            ],
+        )
+        with _patched_time(now):
+            verdict = mq.evaluate_smoke_verdict(_q("w1", target="main"), board)
+
+        assert verdict.ok is False
+        assert verdict.kind == mq.SMOKE_STALE
+        assert verdict.anchor == "run"
+        assert verdict.assignment_id == "w1"
+        # The wording the stale-vs-missing predicate keys off (#1769).
+        assert mq.is_stale_smoke_reason(verdict.message)
+        assert mq.is_stale_smoke_reason(verdict.short_reason)
+        assert "no verdict recorded" not in (verdict.message or "")
+
+    def test_running_marker_older_than_the_window_is_stale_even_if_active(self) -> None:
+        """A smoke row still sitting in `board.active` long after any real run
+        could have finished is a corpse, not a worker."""
+        now = 10_000.0
+        board = self._board(
+            active=[
+                self._smoke(
+                    "s1", "w1",
+                    dispatched_at=now - mq.RUNNING_MARKER_STALE_AFTER - 1,
+                ),
+            ],
+            completed=[self._work()],
+        )
+        with _patched_time(now):
+            verdict = mq.evaluate_smoke_verdict(_q("w1", target="main"), board)
+
+        assert verdict.kind == mq.SMOKE_STALE
+        assert verdict.anchor == "run"
+
+    def test_running_marker_with_no_smoke_row_at_all_stays_missing(self) -> None:
+        """The #1395 local-driver shape (`scripts/drive-issue.sh` sets the
+        marker and runs the suite in-process) has no worker row whose age could
+        tell a live run from a dead one — keep the old classification rather
+        than risk resetting a driver mid-run."""
+        board = self._board(completed=[self._work()])
+        with _patched_time(10_000.0):
+            verdict = mq.evaluate_smoke_verdict(_q("w1", target="main"), board)
+
+        assert verdict.kind == mq.SMOKE_MISSING
+
+    def test_no_marker_at_all_is_unaffected(self) -> None:
+        board = self._board(
+            completed=[
+                self._work(test_state=None),
+                self._smoke("s1", "w1", dispatched_at=0.0, status="failed"),
+            ],
+        )
+        with _patched_time(10_000.0):
+            verdict = mq.evaluate_smoke_verdict(_q("w1", target="main"), board)
+
+        assert verdict.kind == mq.SMOKE_MISSING
+
+    def test_revalidate_can_now_reach_the_wedged_entry(self) -> None:
+        """The point of the classification: `coord merge --revalidate` — which
+        only ever considers SMOKE_STALE entries — can finally clear it."""
+        from dataclasses import dataclass as _dc, field as _f
+
+        @_dc
+        class _Pipeline:
+            default_gates: list = _f(default_factory=lambda: ["test", "merge"])
+
+            def gates_for(self, a=None):
+                return list(self.default_gates)
+
+        @_dc
+        class _Reviews:
+            enabled: bool = False
+
+        @_dc
+        class _Cfg:
+            reviews: _Reviews = _f(default_factory=_Reviews)
+            pipeline: _Pipeline = _f(default_factory=_Pipeline)
+
+        now = 10_000.0
+        board = self._board(
+            completed=[
+                self._work(),
+                self._smoke(
+                    "s1", "w1",
+                    dispatched_at=now - mq.RUNNING_MARKER_STALE_AFTER - 1,
+                    status="failed",
+                ),
+            ],
+        )
+        entry = _q("w1", target="main")
+
+        with _patched_time(now):
+            candidates = mq.revalidation_candidates([entry], board, _Cfg())
+
+        assert [c.work_assignment_id for c in candidates] == ["w1"]

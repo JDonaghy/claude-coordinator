@@ -8,8 +8,10 @@ from coord.claim import (
     Claim,
     claim_message,
     find_work_claim,
+    has_active_branch_followup,
     has_active_followup,
     has_active_work_followup,
+    superseding_work_row,
 )
 from coord.models import Assignment, Board
 
@@ -624,3 +626,115 @@ def test_has_active_work_followup_unchanged_for_ordinary_work() -> None:
     board = Board(active=[_active(issue=16, repo="api", type_="work", aid="w")])
     assert has_active_work_followup(board, repo_name="api", issue_number=16)
     assert not has_active_work_followup(board, repo_name="api", issue_number=17)
+
+
+# ── #1819: has_active_branch_followup / superseding_work_row ────────────────
+
+
+def _work_row(
+    *, aid: str, branch: str, at: float, repo: str = "api",
+    status: str = "done", type_: str = "work",
+) -> Assignment:
+    return Assignment(
+        machine_name="m", repo_name=repo, issue_number=16, issue_title="t",
+        assignment_id=aid, type=type_, status=status, branch=branch,
+        dispatched_at=at,
+    )
+
+
+def test_has_active_branch_followup_sees_a_sibling_rows_smoke() -> None:
+    """#1819: the shape the row-keyed dedupe missed — one branch, two work
+    rows (the fix-round shape), a smoke in flight for the OTHER row."""
+    board = Board(active=[
+        _active(issue=16, type_="smoke", review_of="work-1", branch="issue-16-fix"),
+    ])
+    # Row-keyed: "work-2 has no smoke" → waves a duplicate through.
+    assert not has_active_followup(
+        board, of_assignment_id="work-2", assignment_type="smoke"
+    )
+    # Branch-keyed: the branch is already being tested.
+    assert has_active_branch_followup(
+        board, repo_name="api", branch="issue-16-fix", assignment_type="smoke"
+    )
+
+
+def test_has_active_branch_followup_distinguishes_branch_repo_and_type() -> None:
+    board = Board(active=[
+        _active(issue=16, type_="smoke", review_of="work-1", branch="issue-16-fix"),
+    ])
+    assert not has_active_branch_followup(
+        board, repo_name="api", branch="issue-99-other", assignment_type="smoke"
+    )
+    assert not has_active_branch_followup(
+        board, repo_name="other-repo", branch="issue-16-fix", assignment_type="smoke"
+    )
+    assert not has_active_branch_followup(
+        board, repo_name="api", branch="issue-16-fix", assignment_type="review"
+    )
+
+
+def test_has_active_branch_followup_false_for_no_branch() -> None:
+    """A branchless row can't be deduped on a branch — allow the dispatch."""
+    board = Board(active=[
+        _active(issue=16, type_="smoke", review_of="work-1", branch="issue-16-fix"),
+    ])
+    assert not has_active_branch_followup(
+        board, repo_name="api", branch=None, assignment_type="smoke"
+    )
+
+
+def test_superseding_work_row_finds_the_later_row_on_the_same_branch() -> None:
+    old = _work_row(aid="w1", branch="issue-16-fix", at=100.0)
+    new = _work_row(aid="w2", branch="issue-16-fix", at=200.0)
+    board = Board(completed=[old, new])
+
+    assert superseding_work_row(board, old) is new
+    assert superseding_work_row(board, new) is None
+
+
+def test_superseding_work_row_ignores_other_branches_and_repos() -> None:
+    row = _work_row(aid="w1", branch="issue-16-fix", at=100.0)
+    other_branch = _work_row(aid="w2", branch="issue-17-fix", at=200.0)
+    other_repo = _work_row(aid="w3", branch="issue-16-fix", at=200.0, repo="tui")
+    board = Board(completed=[row, other_branch, other_repo])
+
+    assert superseding_work_row(board, row) is None
+
+
+def test_superseding_work_row_ignores_failed_later_rows() -> None:
+    """A failed fix round produced nothing — the earlier row still authored
+    the branch."""
+    old = _work_row(aid="w1", branch="issue-16-fix", at=100.0)
+    failed = _work_row(aid="w2", branch="issue-16-fix", at=200.0, status="failed")
+    board = Board(completed=[old, failed])
+
+    assert superseding_work_row(board, old) is None
+
+
+def test_superseding_work_row_ignores_non_work_types() -> None:
+    """The review and smoke of a branch are not its author."""
+    row = _work_row(aid="w1", branch="issue-16-fix", at=100.0)
+    review = _work_row(aid="r1", branch="issue-16-fix", at=200.0, type_="review")
+    smoke = _work_row(aid="s1", branch="issue-16-fix", at=300.0, type_="smoke")
+    board = Board(completed=[row], active=[review, smoke])
+
+    assert superseding_work_row(board, row) is None
+
+
+def test_superseding_work_row_breaks_dispatched_at_ties_deterministically() -> None:
+    """Two rows stamped in the same second must still order stably, or BOTH
+    would read as superseded (or neither) and the dedupe would flap."""
+    a = _work_row(aid="aaa", branch="issue-16-fix", at=100.0)
+    b = _work_row(aid="bbb", branch="issue-16-fix", at=100.0)
+    board = Board(completed=[a, b])
+
+    assert superseding_work_row(board, a) is b
+    assert superseding_work_row(board, b) is None
+
+
+def test_superseding_work_row_none_for_branchless_row() -> None:
+    row = _work_row(aid="w1", branch="issue-16-fix", at=100.0)
+    row.branch = None
+    board = Board(completed=[row])
+
+    assert superseding_work_row(board, row) is None
