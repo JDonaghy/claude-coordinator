@@ -85,8 +85,14 @@ def _apply_revalidation(items, board, config, gh_ops, *, dry_run: bool):
         batch = _rv.revalidate_group(group, config, echo=click.echo)
         total_runs += batch.suite_runs
         recorded_any = recorded_any or bool(batch.recorded)
+        if not batch.composite.ok:
+            # The composite's own failure report — stderr, as before.
+            for line in _rv.format_failure(batch.composite):
+                click.echo(line, err=True)
+        # What actually came of it (what merged anyway, who the culprit was)
+        # is ordinary output, even when the composite above was red.
         for line in _rv.format_batch(batch):
-            click.echo(line, err=not batch.composite.ok)
+            click.echo(line)
 
     if len(candidates) > 1:
         click.echo(
