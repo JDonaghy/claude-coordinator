@@ -26,6 +26,15 @@ Public entry points:
 - `dispatch_smoke(completed, board, config, ...)` — the full path; called
   from reconcile when a work assignment transitions to done.
 
+#1819: the unit a Test run measures is the **(branch, base)** pair, not the
+work row that asked for it. Three guards in `dispatch_smoke` follow from that
+— a branch-scoped in-flight dedupe, a supersession check that skips a work row
+a later row replaced on the same branch, and a refusal to stamp the transient
+`running` marker over a verdict that already exists. Together they are what
+stops a fix round (which reuses the branch by design, so one branch carries
+two `work` rows) from putting two machines on the identical suite and then
+looping forever as each re-dispatch retracts the verdict the last one landed.
+
 Why a separate module from `coord/review.py`: smoke tests target machine
 capabilities (GTK/terminal/CUDA), not session independence. The selection
 algorithm is different — for reviews we want a *different* machine for
@@ -626,11 +635,46 @@ def dispatch_smoke(
         return None
 
     # Dedupe: don't fire a second smoke if one's already in flight.
-    from coord.claim import has_active_followup
+    from coord.claim import (
+        has_active_branch_followup,
+        has_active_followup,
+        superseding_work_row,
+    )
 
     if has_active_followup(
         board, of_assignment_id=completed.assignment_id, assignment_type="smoke"
     ):
+        return None
+
+    # #1819: ...and don't fire one if another row on the SAME BRANCH already
+    # has one in flight. The suite measures the branch, not the row that
+    # pushed it; after a fix round (`--fix-of` reuses the branch by design)
+    # one branch carries two `work` rows, and the row-keyed dedupe above
+    # waved the sibling straight through — two machines ran the identical
+    # suite on the identical branch and raced to write the verdict (#1797).
+    if has_active_branch_followup(
+        board,
+        repo_name=completed.repo_name,
+        branch=completed.branch,
+        assignment_type="smoke",
+    ):
+        return None
+
+    # #1819: a row that a LATER work-like row superseded on the same branch is
+    # not a dispatch target at all. It did not produce the branch's current
+    # content, so testing it burns a machine on a result the later row's own
+    # dispatch already computes, and the verdict lands on a row nothing gates
+    # on. This is what keeps the round-1 row (review=request-changes, fixed by
+    # round 2) from consuming a machine every time the base moves.
+    superseded_by = superseding_work_row(board, completed)
+    if superseded_by is not None:
+        logger.debug(
+            "dispatch_smoke: skipping %s#%s row %s — superseded on branch %s "
+            "by the later work row %s (#1819).",
+            completed.repo_name, completed.issue_number,
+            completed.assignment_id, completed.branch,
+            getattr(superseded_by, "assignment_id", None),
+        )
         return None
 
     repo = config.repo(completed.repo_name)
@@ -836,7 +880,19 @@ def dispatch_smoke(
     # assignment would silently reopen the #1395 gap it was built to close:
     # `test_state` would stay NULL from dispatch until the terminal verdict
     # lands, indistinguishable from "not started yet".
-    if completed.assignment_id is not None:
+    #
+    # #1819: ...but NEVER over a terminal verdict. `running` is read as "no
+    # verdict yet" by every gate (#1395), so stamping it on a row that already
+    # says `passed`/`skipped` *un-satisfies a gate that was satisfied* — the
+    # merge entry drops out of the queue and the whole cycle restarts. That is
+    # the self-sustaining loop observed on #1797: verdict lands → merge
+    # enqueues → a re-dispatch a minute later clobbers the gate field back to
+    # `running` → the merge never fires → repeat. Dispatching a *fresh* run
+    # must never, by itself, retract the previous answer; the new verdict
+    # replaces the old one when it actually lands.
+    if completed.assignment_id is not None and completed.test_state not in (
+        "passed", "skipped", "failed",
+    ):
         from coord.state import record_test_verdict
 
         record_test_verdict(

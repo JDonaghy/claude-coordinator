@@ -139,6 +139,88 @@ def has_active_followup(
     return False
 
 
+def has_active_branch_followup(
+    board: Board,
+    *,
+    repo_name: str,
+    branch: str | None,
+    assignment_type: str,
+) -> bool:
+    """True if `board.active` already has a follow-up for this ``(repo, branch)``.
+
+    #1819: the branch-scoped peer of :func:`has_active_followup`. The unit a
+    Test-stage run actually measures is the **branch**, not the work row that
+    happened to push it — and after a fix round (``coord fix`` / ``--fix-of``
+    reuses the branch **by design**) one branch carries *two* ``work`` rows.
+    The ``of_assignment_id``-keyed dedupe asks "does *this row* already have a
+    smoke in flight?" and answers "no" for the sibling row, so both rows
+    dispatched their own Test worker: two machines running the identical suite
+    on the identical branch, racing to write a verdict (observed live on
+    #1797, 2026-08-04).
+
+    Deliberately NOT applied to reviews. A review is a judgement *of a work
+    row's contribution* — the fix round genuinely needs its own review even
+    though it shares a branch with the round it fixes — whereas a smoke run
+    on branch B is the same measurement no matter which row asked for it.
+    """
+    if not branch:
+        return False
+    for a in board.active:
+        if a.type != assignment_type:
+            continue
+        if a.repo_name == repo_name and a.branch == branch:
+            return True
+    return False
+
+
+def superseding_work_row(board: Board, assignment) -> object | None:
+    """The later work-like row on the same ``(repo, branch)``, if any (#1819).
+
+    A ``work`` row that another work-like row was dispatched *after*, on the
+    same branch, is **superseded**: the branch's current content is the later
+    row's output, so the earlier row is not a meaningful dispatch target for
+    the Test stage. Dispatching against it burns a machine re-testing a branch
+    it did not produce and lands the verdict on a row nothing gates on.
+
+    Ordering is by ``dispatched_at``, with the assignment id as a deterministic
+    tie-break so two rows stamped in the same second still order stably. A
+    ``failed`` later row does not supersede — it produced nothing, so the
+    earlier row is still the branch's author.
+
+    Returns the (newest) superseding row so callers can name it in a log line,
+    or ``None`` when *assignment* is the branch's current work row. Related but
+    distinct from #1277, which is the *display* side of the same idea.
+    """
+    from coord.models import WORK_LIKE_TYPES  # noqa: PLC0415
+
+    branch = getattr(assignment, "branch", None)
+    if not branch:
+        return None
+    aid = getattr(assignment, "assignment_id", None)
+    key = (getattr(assignment, "dispatched_at", None) or 0.0, aid or "")
+
+    best = None
+    best_key: tuple[float, str] | None = None
+    for a in list(board.active) + list(board.completed):
+        if a is assignment:
+            continue
+        if a.type not in WORK_LIKE_TYPES:
+            continue
+        if a.status == "failed":
+            continue
+        if a.repo_name != assignment.repo_name or a.branch != branch:
+            continue
+        other_aid = getattr(a, "assignment_id", None)
+        if other_aid is not None and other_aid == aid:
+            continue
+        other_key = (getattr(a, "dispatched_at", None) or 0.0, other_aid or "")
+        if other_key <= key:
+            continue
+        if best_key is None or other_key > best_key:
+            best, best_key = a, other_key
+    return best
+
+
 def has_active_work_followup(
     board: Board,
     *,

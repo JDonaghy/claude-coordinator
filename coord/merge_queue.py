@@ -879,12 +879,17 @@ class SmokeVerdictStatus:
     verdict (the #1479-specific condition — the common one on a sequential
     drain, since every merge moves the base for the next entry) and
     ``"branch"`` when the branch's own content changed since the test ran.
+
+    #1819 adds a third anchor, ``"run"``: no terminal verdict exists, but the
+    row is pinned at the transient ``test_state="running"`` marker (#1395)
+    with no Test worker left alive to resolve it. That is an *abandoned*
+    verdict, not an absent one — see :data:`RUNNING_MARKER_STALE_AFTER`.
     """
 
     ok: bool
     kind: str  # SMOKE_OK | SMOKE_MISSING | SMOKE_STALE
     assignment_id: str | None = None
-    anchor: str | None = None  # "base" | "branch" (SMOKE_STALE only)
+    anchor: str | None = None  # "base" | "branch" | "run" (SMOKE_STALE only)
     recorded_sha: str | None = None
     current_sha: str | None = None
 
@@ -897,6 +902,11 @@ class SmokeVerdictStatus:
         if self.ok:
             return None
         if self.kind == SMOKE_STALE:
+            if self.anchor == "run":
+                return (
+                    "test verdict stale (Test stage stuck at 'running' with no "
+                    "live worker)"
+                )
             noun = "base" if self.anchor == "base" else "branch"
             return (
                 f"test verdict stale (recorded against {noun} "
@@ -912,8 +922,16 @@ class SmokeVerdictStatus:
         if self.ok:
             return None
         if self.kind == SMOKE_STALE:
-            noun = "base" if self.anchor == "base" else "branch"
             aid = self.assignment_id or "<assignment>"
+            if self.anchor == "run":
+                return (
+                    "smoke test verdict is stale: the Test stage has been "
+                    "marked 'running' since before the last Test worker for "
+                    "this branch stopped, so no verdict is coming — re-verify "
+                    f"against the current base, then `coord test {aid} "
+                    "--passed`"
+                )
+            noun = "base" if self.anchor == "base" else "branch"
             return (
                 f"smoke test verdict is stale: recorded against {noun} "
                 f"{_short_sha(self.recorded_sha)}, {noun} is now "
@@ -1097,6 +1115,85 @@ def has_smoke_verdict(
     directly so they can distinguish stale from missing (#1640).
     """
     return evaluate_smoke_verdict(entry, board, gh_ops).ok
+
+
+#: #1819: how long a transient ``test_state="running"`` marker (#1395) may
+#: outlive the last Test worker on its branch before the gate calls it STALE
+#: rather than MISSING. The marker is written at dispatch and cleared when a
+#: terminal verdict lands; if the worker died, was reaped, or its verdict write
+#: was lost, nothing ever clears it and every gate reads "no verdict" forever
+#: (#1797). ``--revalidate`` — the one tool built for exactly this cascade —
+#: only ever touches STALE entries, so without this classification the
+#: operator's escape hatch is unreachable from the state that most needs it
+#: (the #1640 shape, in its load-bearing form).
+#:
+#: Generous on purpose: a real suite run is minutes, so an hour of slack still
+#: never races a live worker, and the check ALSO requires that no live Test
+#: worker for the branch remains on the board.
+RUNNING_MARKER_STALE_AFTER = 60 * 60.0
+
+
+def _abandoned_running_marker(
+    branch_work: list,
+    board,
+    now: float | None = None,
+) -> "Assignment | None":
+    """The work row wedged at ``test_state="running"`` with no live Test worker.
+
+    #1819. Returns the row whose Test stage can never resolve itself, or
+    ``None`` when the marker is absent or a run is plausibly still going.
+
+    Deliberately conservative in two ways:
+
+    * it only fires when coord itself dispatched a Test-stage assignment for
+      the branch. A ``running`` marker with **no** smoke assignment anywhere is
+      the #1395 local-driver shape (``scripts/drive-issue.sh`` sets the marker
+      and runs the suite in-process), and there is no worker row whose age
+      could tell a live run from a dead one — so that case keeps the old
+      MISSING classification rather than risk resetting a driver mid-run;
+    * the window is measured from the newest Test worker's ``dispatched_at``
+      and applies uniformly, whether that worker is still in ``board.active``
+      or already reaped. A live-and-young smoke is obviously a run in
+      progress; a *just*-reaped one still buys the notify path time to land
+      the verdict it produced, so a lost write is never confused with a slow
+      one.
+    """
+    running = [
+        a for a in branch_work if getattr(a, "test_state", None) == "running"
+    ]
+    if not running:
+        return None
+
+    now = time.time() if now is None else now
+    pool = list(getattr(board, "completed", []) or []) + list(
+        getattr(board, "active", []) or []
+    )
+    active_ids = {
+        getattr(a, "assignment_id", None)
+        for a in (getattr(board, "active", []) or [])
+    } - {None}
+    work_ids = {
+        getattr(a, "assignment_id", None) for a in branch_work
+    } - {None}
+
+    smokes = [
+        a for a in pool
+        if getattr(a, "type", None) == "smoke"
+        and getattr(a, "review_of_assignment_id", None) in work_ids
+    ]
+    if not smokes:
+        return None
+    for s in smokes:
+        if getattr(s, "assignment_id", None) not in active_ids:
+            continue  # already reaped — cannot still be running
+        if getattr(s, "status", None) in ("done", "failed", "cancelled"):
+            continue
+        if now - (getattr(s, "dispatched_at", None) or 0.0) < RUNNING_MARKER_STALE_AFTER:
+            return None  # a Test worker is plausibly still going
+    newest = max(smokes, key=lambda s: getattr(s, "dispatched_at", None) or 0.0)
+    if now - (getattr(newest, "dispatched_at", None) or 0.0) < RUNNING_MARKER_STALE_AFTER:
+        return None
+    return running[0]
 
 
 def evaluate_smoke_verdict(
@@ -1337,6 +1434,21 @@ def evaluate_smoke_verdict(
 
     if stale is not None:
         return stale
+
+    # #1819: no terminal verdict — but is it MISSING, or abandoned? A row
+    # pinned at the transient `running` marker whose Test worker is gone has a
+    # verdict that will never arrive, which is a staleness problem with a
+    # bounded automatic fix (re-run and re-record), not the #1640 "was a write
+    # lost?" question `--revalidate` deliberately refuses to paper over.
+    abandoned = _abandoned_running_marker(branch_work, board)
+    if abandoned is not None:
+        return SmokeVerdictStatus(
+            ok=False,
+            kind=SMOKE_STALE,
+            assignment_id=getattr(abandoned, "assignment_id", None),
+            anchor="run",
+        )
+
     return SmokeVerdictStatus(
         ok=False,
         kind=SMOKE_MISSING,
