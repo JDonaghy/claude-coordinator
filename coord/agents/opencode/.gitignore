@@ -1,0 +1,13 @@
+# opencode auto-bootstraps a plugin dependency (@opencode-ai/plugin) into
+# whatever directory OPENCODE_CONFIG_DIR points at — confirmed: every real
+# `opencode run`/`opencode agent list` invocation against this directory
+# (which is exactly what OpenCodeProvider.env() sets OPENCODE_CONFIG_DIR to,
+# see coord/providers/opencode.py) writes node_modules/, package.json,
+# package-lock.json, and its own bun.lock here. None of this is authored or
+# tracked by coord — it's a side effect of opencode's own plugin loading,
+# not a real project manifest, and it can be tens of MB. Same pattern as
+# coord/dashboard/webapp/.gitignore.
+node_modules
+package.json
+package-lock.json
+bun.lock

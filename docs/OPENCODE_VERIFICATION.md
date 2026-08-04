@@ -519,3 +519,73 @@ EOF
 opencode run --format json --model opencode/big-pickle --agent no-gh \
   "Run 'gh issue list' via bash." > run-denied.jsonl
 ```
+
+## Addendum (#1705): agent-file discovery, precedence, and a load-bearing PWD finding
+
+Captured against the same `opencode` 1.18.11 binary (`dellserver`... this pass
+run from a different fleet machine with the same version installed;
+`opencode --version` reconfirmed `1.18.11` before capturing). Everything
+below is a real run against the real binary, not inferred from docs — except
+the OpenRouter upstream-routing mechanism, which is explicitly flagged as
+NOT verified end-to-end (no OpenRouter credential was available on the
+capturing machine — see `coord/agents/opencode/routing.jsonc`'s header
+comment for what *was* verified: syntactic inertness against a
+non-OpenRouter model).
+
+**Markdown agent-file discovery requires an `agents/` (or singular `agent/`)
+subdirectory — a flat file is invisible.** `https://opencode.ai/docs/agents`
+documents `.opencode/agents/<name>.md` / `~/.config/opencode/agents/<name>.md`;
+this was verified to also apply to a custom `OPENCODE_CONFIG_DIR`: a file at
+`<dir>/agents/work.md` is discovered as agent `work`, but the same file at
+`<dir>/work.md` (no subdirectory) is not discovered at all (confirmed via
+`opencode agent list` showing no `work` entry). This is why
+`coord/agents/opencode/agents/work.md` has the extra `agents/` path segment.
+
+**`OPENCODE_CONFIG_DIR` outranks a same-named agent in the target
+repo/worktree's own `.opencode/agents/`.** Verified by planting a
+conflicting `.opencode/agents/work.md` (wide-open `bash`/`edit`/
+`external_directory` permissions) inside a throwaway worktree that also had
+`OPENCODE_CONFIG_DIR` pointed at coord's real `work.md`: the resolved rule
+list (`opencode agent list`) and a live `gh --version` bash call were both
+unaffected by the conflicting file — coord's deny-baseline rules still won.
+Matters because the worktree belongs to a repo coord doesn't fully control.
+
+**Load-bearing, previously-undocumented finding: opencode resolves its
+working directory from the inherited `PWD` environment variable, not the
+real process cwd.** `opencode run --help` documents a `--dir` flag ("directory
+to run in") that was not exercised in #1703's flag-surface table at all.
+Verified directly: `subprocess.Popen(argv, cwd=X, env={"PWD": stale, ...})`
+made a `bash` tool's `pwd` call print `stale`, not `X`; deleting `PWD` from
+the child env (or routing the same argv through `bash -c 'exec ...'`, which
+resets `$PWD` to the real cwd on exec) made it print `X` correctly. This is
+silently relied upon by coord's real dispatch path today, purely as a side
+effect of `coord.agent._maybe_bash_wrap`'s `bash -c 'exec ...'` wrapper
+(`bash_wrap_spawn`, default `True`) — added for the unrelated #299
+daemon-spawn-freeze mitigation, not for this reason. See
+`coord/providers/opencode.py`'s `capabilities()` docstring
+(`enforces_deny_list` note) for the full citation and why this wasn't fixed
+in `coord/providers/opencode.py` itself (the fix needs the assignment's
+worktree path, which isn't available where the fix would need to live
+without touching `coord/agent.py`, forbidden under #1705's briefing).
+
+**OpenRouter upstream-routing pin mechanism — from decompiled binary
+strings, NOT a live captured request (no OpenRouter credential available;
+see requirement 3's own text acknowledging today's fleet has none).**
+Extracting readable strings from the installed `opencode` binary
+(`strings ~/.opencode/bin/opencode`) and reading the surrounding minified
+source showed: (1) `provider.<id>.options` (a `ProviderConfig.options`
+object, schema-open beyond the documented `apiKey`/`baseURL`/`timeout`
+keys) is threaded into an AI-SDK `providerOptions.<id>` argument for every
+request resolved against that provider, model-agnostic; (2) for
+`id: "openrouter"` specifically (`npm: "@openrouter/ai-sdk-provider"`),
+that provider's own `doGenerate`/`doStream` spreads
+`providerOptions.openrouter` (minus a separately-handled `cacheControl`
+key) directly into the request body sent to OpenRouter's REST API — which
+is exactly where OpenRouter's own documented `provider: {order,
+allow_fallbacks, ...}` field lives. `coord/agents/opencode/routing.jsonc`
+sets `provider.openrouter.options.provider.allow_fallbacks = false` on
+this basis. What *was* verified end-to-end: a real `opencode run` with
+`OPENCODE_CONFIG` pointed at this file, against a non-OpenRouter model
+(`opencode/big-pickle`), completed normally with no error — the dangling
+config is inert for credentials that aren't OpenRouter, which is every
+fleet machine today.

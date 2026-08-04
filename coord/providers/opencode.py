@@ -10,20 +10,47 @@ worker backend.
 every finding in ``docs/OPENCODE_VERIFICATION.md``, replacing
 ``tests/fixtures/opencode_run_sample.jsonl`` with a verbatim successful
 capture and adding ``tests/fixtures/opencode_run_failure_sample.jsonl`` for a
-verbatim failing one.  This module is the follow-up correction: every
-behavioural detail below cites that document.  Two things it does **not**
-attempt (explicitly out of scope, tracked as separate issues in the
-opencode-backend epic):
+verbatim failing one.  This module is a follow-up correction: every
+behavioural detail below cites that document.
 
-* The concrete ``coord-<spec.type>`` opencode agent definitions
-  (``opencode.jsonc``) that ``--agent`` below references by name.  Until
-  those land, real dispatch through this provider will fail at the CLI
-  level (``--agent`` naming an agent that doesn't exist yet) — see
-  :meth:`OpenCodeProvider.build_command`.
-* Flipping ``capabilities().enforces_deny_list`` to ``True``.  OpenCode DOES
-  have a real deny-capable permission system (see the module docstring's
-  "Permissions" citation below), but proving coord's *generated* config
-  enforces it end-to-end is that same follow-up issue's job, not this one's.
+**#1705 — per-spec-type agent definitions, deny-list enforcement PROVEN.**
+#1704 left two things explicitly unfinished; both are done now:
+
+* The concrete opencode agent definitions ``--agent`` references by name now
+  exist, one committed markdown file per ``spec.type``, under
+  :data:`AGENTS_ROOT` (``coord/agents/opencode/agents/<spec.type>.md``).
+  Only ``work`` is authored so far (scope of #1705 — ``review`` and other
+  types are separate issues, see :func:`_agent_definition_path`).  Dispatching
+  an unauthored ``spec.type`` now raises :class:`OpenCodeAgentNotFoundError`
+  from :meth:`OpenCodeProvider.build_command` — a hard, named Python-side
+  error instead of a silent permissive fallback or an opaque CLI failure.
+* ``capabilities().enforces_deny_list`` is now ``True`` for the reason
+  :meth:`capabilities`'s docstring gives in full: real opencode 1.18.11 runs
+  (not argv assertions) proved a ``gh`` bash call, an edit outside the
+  worktree, and an edit under ``tests/acceptance/**`` are all genuinely
+  blocked by ``coord/agents/opencode/agents/work.md``'s permission block —
+  see the named tests in ``tests/test_providers.py``.
+
+**Agent-file discovery mechanism, empirically verified (not guessed):**
+:meth:`env` sets ``OPENCODE_CONFIG_DIR`` to :data:`AGENTS_ROOT` so opencode
+discovers ``agents/<spec.type>.md`` there.  Two things were confirmed against
+the real binary before relying on this, because both are safety-relevant:
+
+1. A *flat* ``<dir>/<name>.md`` layout (no ``agents/`` subdirectory) is
+   **silently invisible** to ``--agent`` — opencode only scans
+   ``<OPENCODE_CONFIG_DIR>/agents/*.md`` (and the singular ``agent/`` alias).
+   This is why the committed file lives at
+   ``coord/agents/opencode/agents/work.md`` rather than the flatter
+   ``coord/agents/opencode/work.md`` a first guess might reach for.
+2. ``OPENCODE_CONFIG_DIR`` outranks a *worktree-local* ``.opencode/agents/``
+   directory of the same agent name.  Verified by planting a conflicting
+   ``.opencode/agents/work.md`` (wide-open ``bash``/``edit``/
+   ``external_directory`` permissions) in a throwaway worktree and
+   confirming the resolved rule list — and a live ``gh issue list`` call —
+   were byte-for-byte unaffected.  This matters because the worktree a
+   worker runs in is checked out from a repo coord does not fully control;
+   without this precedence a target repo could ship its own permissive
+   ``work`` agent and silently shadow coord's deny-baseline one.
 
 Differences from :class:`~.claude.ClaudeProvider`:
 
@@ -36,7 +63,8 @@ Differences from :class:`~.claude.ClaudeProvider`:
   briefing travels on argv (confirmed: ``run [message..]`` is a genuine
   positional argv message, no stdin protocol observed —
   ``OPENCODE_VERIFICATION.md`` "Flag surface").
-* ``capabilities().enforces_deny_list=False`` — **SAFETY GATE**, see above.
+* ``capabilities().enforces_deny_list=True`` — see above and
+  :meth:`capabilities`.
 * ``capabilities().billing_mode="byo_key"`` — confirmed: OpenCode bills
   against the operator's own configured provider credentials, not
   Anthropic's ``claude -p`` credit pool (``OPENCODE_VERIFICATION.md``
@@ -45,6 +73,9 @@ Differences from :class:`~.claude.ClaudeProvider`:
   ``capabilities().true_system_prompt=True`` — both flipped from the
   first-pass ``False`` now that real evidence backs them; see
   :meth:`capabilities` for the citations.
+* ``env()`` always sets ``OPENCODE_CONFIG_DIR`` (agent-file discovery, see
+  above) and ``OPENCODE_CONFIG`` (the OpenRouter upstream-routing pin, see
+  ``coord/agents/opencode/routing.jsonc`` and :data:`ROUTING_PIN_PATH`).
 """
 
 from __future__ import annotations
@@ -95,41 +126,97 @@ DEFAULT_OPENCODE_BINARY = "opencode"
 #: ``error`` event, not this marker.
 RESULT_MARKER = '"reason":"stop"'
 
+#: Directory holding coord's committed opencode agent-discovery artifacts:
+#: ``agents/<spec.type>.md`` (per-spec-type agent definitions) and
+#: ``routing.jsonc`` (the OpenRouter upstream-routing pin).  Computed from
+#: this module's own file location so it resolves correctly regardless of
+#: where coord itself is installed/checked out — mirrors the pattern
+#: ``tests/fixtures/`` paths use relative to ``tests/``.
+#:
+#: **Why an env var pointing here, not a copy into the worker's worktree**
+#: (the other option the #1705 issue named): the worktree belongs to a
+#: repo coord does not fully control, and ``OPENCODE_CONFIG_DIR`` was
+#: empirically confirmed to outrank a same-named agent in that worktree's
+#: own ``.opencode/agents/`` (see the module docstring) — so pointing at
+#: this directory is both simpler (no per-dispatch file copy / no need to
+#: touch the worktree-setup code path in ``coord/agent.py``) and safer (a
+#: target repo cannot shadow it).
+AGENTS_ROOT = Path(__file__).resolve().parent.parent / "agents" / "opencode"
+
+#: The OpenRouter upstream-routing pin (#1705 added scope) — see that
+#: file's own header comment for the full mechanism citation.  Threaded
+#: onto the worker's environment as ``OPENCODE_CONFIG`` by :meth:`env`.
+ROUTING_PIN_PATH = AGENTS_ROOT / "routing.jsonc"
+
+
+class OpenCodeAgentNotFoundError(RuntimeError):
+    """Raised when no committed opencode agent definition exists for a
+    ``spec.type`` being dispatched.
+
+    #1705: dispatching an unauthored spec type must be a **hard, named
+    error**, never a silent permissive fallback (e.g. running with
+    opencode's allow-everything built-in default agent) and never a bare
+    CLI-level failure a few seconds into a worker's log that's hard to
+    triage.  Only ``work`` is authored as of #1705 — other write-capable
+    spec types (``review``, ``smoke``, ``conflict-fix``, ...) are separate,
+    deliberately un-sped-up follow-up issues (see the module docstring).
+    """
+
+    def __init__(self, spec_type: str, expected_path: Path) -> None:
+        self.spec_type = spec_type
+        self.expected_path = expected_path
+        super().__init__(
+            f"no opencode agent definition for spec.type={spec_type!r}: "
+            f"expected {expected_path} to exist. Author it under "
+            f"{AGENTS_ROOT}/agents/ before dispatching this spec type "
+            "through the opencode provider — see coord/agents/opencode/agents/work.md "
+            "for the reference shape (deny-baseline permission block + "
+            "system prompt) and #1705 for the naming/discovery contract."
+        )
+
+
+def _agent_definition_path(spec_type: str) -> Path:
+    """Return the expected committed agent-file path for *spec_type*.
+
+    Pure path computation, no filesystem access — split out from
+    :func:`_agent_name_for_type` so tests can assert on the expected path
+    independently of the existence check.
+    """
+    return AGENTS_ROOT / "agents" / f"{spec_type}.md"
+
 
 def _agent_name_for_type(spec_type: str) -> str:
     """Map ``spec.type`` to the opencode ``--agent`` name coord will pass.
 
-    Naming contract: ``coord-<spec.type>`` (e.g. ``coord-work``,
-    ``coord-plan``, ``coord-review``, ``coord-test-chat``). This mirrors the
-    existing ``spec.type``-keyed branching :class:`~.claude.ClaudeProvider`
-    uses to pick a system prompt / allowed-tools pair (see
-    ``coord/providers/claude.py::build_command``) — the same dimension
-    (assignment type) selects the opencode-side equivalent, just via a named
-    agent instead of raw flag values.
+    **Naming contract (#1705, corrected from #1704's provisional
+    ``coord-<type>`` guess): the ``--agent`` value is exactly ``spec_type``**
+    (e.g. ``"work"``), because opencode's markdown agent-discovery derives
+    the agent name from the filename minus its extension (confirmed against
+    a real opencode 1.18.11 binary: a file at ``<OPENCODE_CONFIG_DIR>/agents/
+    work.md`` is discovered as an agent literally named ``work``, not
+    ``coord-work``) — see :data:`AGENTS_ROOT` and the module docstring.
 
-    **Not yet backed by a real ``opencode.jsonc``.**  The companion
-    agent-definitions issue in the opencode-backend epic is responsible for
-    actually authoring ``coord-work`` / ``coord-plan`` / etc. agent configs
-    (deny-baseline permission blocks, real prompts). Until that lands, a
-    real ``opencode run --agent coord-<type> ...`` invocation through this
-    provider will fail at the CLI level with an unknown-agent error — this
-    is a known, named gap (not a silent one): this provider corrects the
-    *shape* of the invocation per #1703's captured evidence; wiring a real
-    agent behind that shape is deliberately out of scope for #1704 (see the
-    module docstring).
+    Raises:
+        OpenCodeAgentNotFoundError: when ``coord/agents/opencode/agents/
+            <spec_type>.md`` does not exist.  This is a **hard error**, not
+            a silent fallback — see that exception's docstring.  As of
+            #1705 only ``spec_type == "work"`` has a committed file; every
+            other spec type raises until its own follow-up issue lands one.
     """
-    return f"coord-{spec_type}"
+    path = _agent_definition_path(spec_type)
+    if not path.is_file():
+        raise OpenCodeAgentNotFoundError(spec_type, path)
+    return spec_type
 
 
 class OpenCodeProvider(Provider):
     """Concrete provider for ``opencode run`` (OpenCode workers).
 
     Corrected against a real ``opencode`` 1.18.11 capture (#1703 →
-    ``docs/OPENCODE_VERIFICATION.md``).  Two things remain deliberately
-    unfinished — see the module docstring: the actual ``coord-<type>``
-    agent definitions (companion issue), and flipping
-    ``capabilities().enforces_deny_list`` (same companion issue, after
-    end-to-end enforcement is proven).
+    ``docs/OPENCODE_VERIFICATION.md``).  #1705 finished what #1704 left
+    open: the ``work`` agent definition is authored and its deny-list
+    enforcement is proven against a real binary (see the module docstring
+    and :meth:`capabilities`); ``enforces_deny_list`` is now ``True``.
 
     Args:
         binary: Override the worker binary name/path.  ``None`` falls back to
@@ -149,8 +236,10 @@ class OpenCodeProvider(Provider):
         env: Extra environment variables from the provider definition
             (``ProviderDef.env``, already ``${VAR}``-expanded by config
             parsing) — this is how an operator points OpenCode's own
-            provider config (e.g. API keys) at a specific backend.  Returned
-            verbatim by :meth:`env`.
+            provider config (e.g. API keys) at a specific backend.  Merged
+            with the (non-overridable — see :meth:`env`)
+            ``OPENCODE_CONFIG_DIR`` / ``OPENCODE_CONFIG`` entries by
+            :meth:`env`.
         extra_args: Additional argv entries from the provider definition
             (``ProviderDef.extra_args``).  Inserted after this method's own
             flags and before the trailing positional briefing argument.
@@ -218,27 +307,82 @@ class OpenCodeProvider(Provider):
             schema: ``--agent <name>`` selects an agent definition whose
             ``AgentConfig.prompt: string`` field is a genuine system-prompt
             equivalent — not merely prepended user-message text.  See
-            ``OPENCODE_VERIFICATION.md`` "every ASSUMPTION" table.  This is
-            a capability claim (the mechanism is real), independent of
-            whether coord has actually authored the ``coord-<type>`` agent
-            files yet (see :func:`_agent_name_for_type`).
+            ``OPENCODE_VERIFICATION.md`` "every ASSUMPTION" table.  As of
+            #1705 this is no longer just a mechanism claim: ``work.md``'s
+            ``prompt`` body is what a real dispatched worker actually runs
+            under (see :func:`_agent_name_for_type`).
 
-        ``enforces_deny_list=False``
-            **SAFETY GATE — deliberately left unchanged in this issue.**
-            OpenCode DOES have a real per-tool ``allow``/``ask``/``deny``
-            permission system with genuine bash command pattern matching —
-            empirically proven in #1703 (``OPENCODE_VERIFICATION.md``
-            "Permission enforcement — empirical evidence").  But two things
-            are still missing before coord can claim *enforcement*: (1) the
-            actual ``coord-<type>`` agent configs that encode a deny-shaped
-            baseline (companion agent-definitions issue), and (2) proof that
-            coord's generated config places the catch-all rule *first* and
-            overrides *after* it — #1703 found rule precedence is
-            **last-match-wins**, so a naively-ordered deny list silently
-            does nothing.  Until both are verified end-to-end,
-            :meth:`coord.agent.AgentServer.assign` continues to refuse
-            write-capable assignment types (``work``, ``review``,
-            ``conflict-fix``, ``smoke``) on this provider.
+        ``enforces_deny_list=True``
+            **SAFETY GATE — flipped in #1705, justified by real runs, not
+            argv assertions.**  OpenCode has a real per-tool
+            ``allow``/``ask``/``deny`` permission system with genuine bash
+            command pattern matching, empirically proven in #1703
+            (``OPENCODE_VERIFICATION.md`` "Permission enforcement —
+            empirical evidence").  #1705 closed the two gaps #1704 left
+            open:
+
+            1. ``coord/agents/opencode/agents/work.md`` is a committed
+               deny-baseline agent config (catch-all rules first, specific
+               overrides after — #1703's last-match-wins ordering trap,
+               respected).
+            2. Enforcement is proven **end-to-end against the real
+               opencode 1.18.11 binary**, not asserted from argv, by named
+               tests in ``tests/test_providers.py`` that each ``opencode
+               run`` a real task through :meth:`build_command`/:meth:`env`
+               (the actual production argv/env, not a hand-rolled one) and
+               inspect the resulting NDJSON log for a genuine tool-call
+               denial: ``test_opencode_work_agent_blocks_gh_end_to_end`` (a
+               ``gh issue list`` bash call),
+               ``test_opencode_work_agent_blocks_external_directory_access_end_to_end``
+               (a read outside the worktree), and
+               ``test_opencode_work_agent_blocks_tests_acceptance_edit_end_to_end``
+               (an edit under the sealed oracle prefix) — plus a positive
+               control, ``test_opencode_work_agent_allows_normal_edit_and_git_end_to_end``,
+               confirming the deny rules don't collaterally block legitimate
+               edit/git use.  All are skipped (not failed) when the
+               ``opencode`` binary isn't on ``PATH``, matching this repo's
+               existing convention for optional real-binary tests (see
+               e.g. ``tests/test_graph_health.py``).
+
+               **Load-bearing operational finding from authoring those
+               tests, not covered by #1703's flag-surface table: opencode
+               resolves its working directory from the inherited ``PWD``
+               environment variable, not the real process cwd.** A bare
+               ``subprocess.Popen(argv, cwd=X)`` with a stale ``PWD`` (e.g.
+               copied from a long-running daemon's own environment, exactly
+               what ``coord.agent._worker_subprocess_env`` does via
+               ``dict(os.environ)``) makes every opencode tool call operate
+               against the stale directory, not ``X`` — verified directly
+               against the real binary.  Production dispatch is unaffected
+               only because ``coord.agent._maybe_bash_wrap``'s
+               ``bash -c 'exec ...'`` wrapper (``bash_wrap_spawn``, default
+               ``True``, added for the unrelated #299 daemon-spawn-freeze
+               mitigation) resets ``$PWD`` before ``exec``-ing into
+               opencode — also verified directly.  This makes opencode
+               dispatch silently depend on a flag whose docstring gives no
+               hint that opencode needs it; flagged here rather than
+               silently relied upon.  Out of scope to fix here: the fix (a
+               ``--dir`` flag or explicit ``PWD`` correction) needs either
+               the assignment's worktree path threaded into
+               :meth:`build_command` or a ``PWD`` correction at the
+               :meth:`env` call site, and both require the worktree path,
+               which :class:`~coord.agent.AssignmentSpec` does not carry —
+               only ``coord.agent.AgentServer._spawn`` (forbidden to touch
+               under #1705's briefing) knows it.  Reported to the
+               coordinator rather than worked around.
+
+            Scope stays exactly what #1705 asked for: only ``spec.type ==
+            "work"`` has a committed agent file.  Every other write-capable
+            type (``review``, ``conflict-fix``, ``smoke``, ...) still
+            cannot dispatch through this provider — not because of this
+            capability flag anymore, but because
+            :func:`_agent_name_for_type` raises
+            :class:`OpenCodeAgentNotFoundError` for any ``spec.type``
+            without a committed file, which :meth:`build_command` does not
+            catch.  ``coord.agent.AgentServer.assign``'s
+            ``WRITE_CAPABLE_SPEC_TYPES`` gate (unchanged by #1705) now
+            passes this provider through for ``work``; the per-type file
+            gap is what actually still blocks the rest, deliberately.
 
         ``billing_mode="byo_key"``
             Confirmed: OpenCode uses the operator's own provider credentials
@@ -259,9 +403,9 @@ class OpenCodeProvider(Provider):
             inject=False,
             cost_reporting=True,
             true_system_prompt=True,
-            # SAFETY: see docstring above — real mechanism exists, coord-side
-            # enforcement is unproven until the companion issue lands.
-            enforces_deny_list=False,
+            # SAFETY: flipped in #1705 — see docstring above for the named
+            # end-to-end tests this is justified by.
+            enforces_deny_list=True,
             billing_mode="byo_key",
             human_attended_only=False,
         )
@@ -306,9 +450,10 @@ class OpenCodeProvider(Provider):
         * ``--session <id>`` — unchanged from the first pass, confirmed to
           resume by id with matching ``sessionID`` and restored context.
           Omitted when ``spec.resume_session_id`` is ``None``.
-        * ``--agent <name>`` — **new in #1704.**  Confirmed: ``--agent``
-          selects a named agent definition whose ``prompt``/``permission``
-          fields are a genuine system-prompt + tool-permission equivalent
+        * ``--agent <name>`` — introduced in #1704, **now backed by a real
+          committed agent file (#1705).**  Confirmed: ``--agent`` selects a
+          named agent definition whose ``prompt``/``permission`` fields are
+          a genuine system-prompt + tool-permission equivalent
           (schema-confirmed against ``https://opencode.ai/config.json``).
           This is why it **replaces** the ignored *system_prompt* /
           *allowed_tools* kwargs below rather than sitting alongside them —
@@ -316,27 +461,30 @@ class OpenCodeProvider(Provider):
           a raw tool allowlist string the way ``claude -p`` does; the unit
           of configuration is a named agent.  The name is computed by
           :func:`_agent_name_for_type` from ``spec.type`` — see that
-          function's docstring for the naming contract and the (explicit,
-          named) gap that the actual agent config files don't exist yet.
-        * ``--auto`` — **new in #1704, always passed.**  Confirmed:
+          function's docstring for the naming contract.  **Raises
+          :class:`OpenCodeAgentNotFoundError`** (propagates out of this
+          method — callers must not treat that as "fall back to something
+          permissive") when ``spec.type`` has no committed agent file yet;
+          as of #1705 that's every type except ``"work"``.
+        * ``--auto`` — introduced in #1704, always passed.  Confirmed:
           ``--auto`` converts an agent's ``"ask"`` permission rules to
           auto-approve without overriding an explicit ``"deny"`` rule
           (``OPENCODE_VERIFICATION.md`` "``--auto`` semantics", scenarios
           2 & 3).  coord's workers are headless/unattended by design, so
           this flag is unconditional — the same way ``permission_mode``
           defaults to ``"acceptEdits"`` for :class:`~.claude.ClaudeProvider`.
-          **Safety note** (see the issue and module docstring): opencode's
-          permission model is deny-*list* semantics inverted from
-          ``claude -p``'s allow-list — ``--auto`` only ever *widens* what an
-          ``"ask"`` rule would otherwise block; it can never widen past an
-          explicit ``"deny"``.  Today, with no ``coord-<type>`` agent config
-          yet authored, this is close to a no-op (opencode's built-in
-          default agent has no permission block at all — confirmed
-          allow-everything by default, ``OPENCODE_VERIFICATION.md``
-          "``--auto`` semantics" scenario 4) — it only becomes load-bearing
-          once the companion agent-definitions issue lands a deny-baseline
-          config, at which point it is exactly what keeps this provider
-          headless instead of hanging on every ``ask`` rule.
+          **Safety note:** opencode's permission model is deny-*list*
+          semantics inverted from ``claude -p``'s allow-list — ``--auto``
+          only ever *widens* what an ``"ask"`` rule would otherwise block;
+          it can never widen past an explicit ``"deny"``.  As of #1705,
+          with ``work.md``'s deny-baseline config actually in force
+          (``bash: {"*": "deny", "git status*"/"git commit*"/"git push*"/...:
+          "allow", "gh *": "deny", ...}``), this is exactly what keeps a
+          real ``work`` dispatch headless instead of hanging on
+          ``work.md``'s narrow bash allow-list / ``external_directory: deny``
+          ``ask``-adjacent rules — see :meth:`capabilities`'s
+          ``enforces_deny_list`` note for the tests that prove the explicit
+          ``deny`` entries still hold under ``--auto``.
 
         Ignored kwargs
         ~~~~~~~~~~~~~~
@@ -491,18 +639,38 @@ class OpenCodeProvider(Provider):
         return RESULT_MARKER
 
     def env(self) -> dict[str, str]:
-        """Extra environment variables from the provider definition (#1706).
+        """Extra environment variables for the worker subprocess.
 
-        OpenCode reads its own API key configuration from its credentials
-        store (typically ``~/.config/opencode/`` or via ``OPENCODE_*``
-        environment variables) — ``ProviderDef.env`` (already
-        ``${VAR}``-expanded by config parsing) is exactly how an operator
-        points a named ``opencode`` provider definition at a specific set of
-        credentials without baking them into the machine's agent unit.
-        Returns a copy; empty dict when the provider was constructed with no
-        ``env`` (matches pre-#1706 behaviour for no-config deployments).
+        Two parts:
+
+        1. ``ProviderDef.env`` (already ``${VAR}``-expanded by config
+           parsing, #1706) — how an operator points a named ``opencode``
+           provider definition at a specific set of credentials without
+           baking them into the machine's agent unit.
+        2. **#1705, always set, not operator-overridable:**
+           ``OPENCODE_CONFIG_DIR`` (:data:`AGENTS_ROOT` — where the
+           committed per-spec-type agent files live, see the module
+           docstring for why an env var rather than a worktree file copy)
+           and ``OPENCODE_CONFIG`` (:data:`ROUTING_PIN_PATH` — the
+           OpenRouter routing pin, see ``coord/agents/opencode/routing.jsonc``).
+           These are applied **after** ``self._env`` so a
+           ``ProviderDef.env`` entry cannot accidentally (or maliciously,
+           via a compromised ``coordinator.yml`` edit that isn't the
+           security-reviewed agent-file path) shadow the deny-list
+           discovery mechanism — see :class:`OpenCodeAgentNotFoundError`'s
+           docstring for why silently losing this would be bad.  Verified
+           empirically that ``OPENCODE_CONFIG_DIR`` is inert for a provider
+           the operator hasn't configured credentials for (real opencode
+           1.18.11 run against a non-OpenRouter model with both variables
+           set completed normally) — see
+           ``test_opencode_routing_pin_inert_without_openrouter_credential_end_to_end``.
+
+        Returns a fresh dict each call.
         """
-        return dict(self._env)
+        merged = dict(self._env)
+        merged["OPENCODE_CONFIG_DIR"] = str(AGENTS_ROOT)
+        merged["OPENCODE_CONFIG"] = str(ROUTING_PIN_PATH)
+        return merged
 
     def parse_log(
         self, log_path: str | Path, tail_bytes: int = 65536
