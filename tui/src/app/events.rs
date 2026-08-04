@@ -1667,14 +1667,14 @@ impl CoordApp {
                     }
                     Key::Named(NamedKey::Enter) => {
                         // Enter: open submenu if parent, else activate leaf.
-                        self.context_menu_activate_selected();
+                        self.context_menu_activate_selected(backend);
                     }
                     Key::Named(NamedKey::Right) => {
                         // Right: open submenu parent only — no-op on leaf items.
                         // This prevents accidental dispatch of Stop/Watch/etc.
                         // when the user arrows past the submenu parents.
                         if self.context_menu_selected_has_submenu() {
-                            self.context_menu_activate_selected();
+                            self.context_menu_activate_selected(backend);
                         }
                     }
                     Key::Named(NamedKey::Left) | Key::Named(NamedKey::Escape) => {
@@ -4385,7 +4385,7 @@ impl CoordApp {
                 // #259: an open context menu intercepts all clicks next
                 // — outside the menu → dismiss; on an item → activate;
                 // anywhere else inside the menu → swallow (keep open).
-                if let Some(handled) = self.handle_context_menu_click(pos) {
+                if let Some(handled) = self.handle_context_menu_click(pos, backend) {
                     return handled;
                 }
                 // #1755 (DQ-3): the drive-queue overlay is above every panel
