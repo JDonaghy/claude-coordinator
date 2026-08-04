@@ -5319,6 +5319,13 @@ class TestStaleSmokeVerdictReporting:
         # reports as changed. None (default) means "compare unavailable" —
         # the inert-base check fails closed, same as the pre-#1738 behaviour.
         compare_files: list[str] | None = None
+        # #1778: files the branch compare (`test_base_sha`..`test_head_sha`)
+        # reports as changed — a distinct fixture from `compare_files` so a
+        # test can make the base move non-inert while the branch itself is
+        # (or vice versa). Discriminated by `head` below: the branch check
+        # always asks for `head == branch_sha`, the base-move check for
+        # whatever the current base SHA is.
+        branch_compare_files: list[str] | None = None
 
         def get_branch_sha(self, repo: str, branch: str) -> str | None:
             return self.base_sha if branch == "main" else self.branch_sha
@@ -5327,6 +5334,8 @@ class TestStaleSmokeVerdictReporting:
             return "patch-1"
 
         def get_compare_files(self, repo: str, base: str, head: str) -> list[str] | None:
+            if head == self.branch_sha:
+                return self.branch_compare_files
             return self.compare_files
 
     # ── defect 1: the message names the case ──────────────────────────────
@@ -5754,3 +5763,212 @@ class TestStaleSmokeVerdictReporting:
         planned = mq.plan(board, cfg, gh_ops=GateSnapshot())
 
         assert planned[0].status == mq.PLAN_READY
+
+    # ── #1778: an inert BRANCH must not stale on a (possibly substantive)
+    # base move — the mirror of #1738's inert-base-move rule. ──────────────
+    #
+    # `_base_move_is_inert` asks "did the base move through anything that
+    # matters"; `_branch_is_inert` asks "does the branch touch anything that
+    # matters" at all, independent of the base move's own content. Either
+    # one being true is enough to skip staling the verdict on a base move.
+
+    def test_inert_branch_survives_a_non_inert_base_move(self) -> None:
+        """#1756's shape (PR #1774): a branch whose entire diff is
+        docs/*.md/scripts content merges without revalidation even though
+        the base moved through something substantive (`coord/**`) in the
+        meantime — `deploy/**` deliberately omitted, see #1778's
+        out-of-scope note; this exercises only what's already allowlisted."""
+        board = self._board(completed=[self._tested_work()])
+        entry = _q("w1", target="main")
+        entry.target_branch_head_sha = "base-new"
+        gh = self._Gh(
+            compare_files=["coord/merge_queue.py"],  # base move: NOT inert
+            branch_compare_files=[  # branch: entirely inert (#1756 shape)
+                "CLAUDE.md",
+                "docs/AGENT_OPERATIONS.md",
+                "docs/DRIVE_QUEUE.md",
+                "docs/OPERATING_GOTCHAS.md",
+                "scripts/drive-batch.sh",
+            ],
+        )
+
+        verdict = mq.evaluate_smoke_verdict(entry, board, gh)
+
+        assert verdict.ok is True
+        assert verdict.kind == mq.SMOKE_OK
+
+    def test_branch_touching_coord_stays_stale_on_base_move(self) -> None:
+        """The whole safety story: a branch that touches `coord/**` stales
+        exactly as before a non-inert base move, regardless of #1778."""
+        board = self._board(completed=[self._tested_work()])
+        entry = _q("w1", target="main")
+        entry.target_branch_head_sha = "base-new"
+        gh = self._Gh(
+            compare_files=["coord/merge_queue.py"],
+            branch_compare_files=["coord/merge_queue.py", "docs/README.md"],
+        )
+
+        verdict = mq.evaluate_smoke_verdict(entry, board, gh)
+
+        assert verdict.ok is False
+        assert verdict.kind == mq.SMOKE_STALE
+        assert verdict.anchor == "base"
+
+    def test_branch_touching_tests_dir_stays_stale_on_base_move(self) -> None:
+        board = self._board(completed=[self._tested_work()])
+        entry = _q("w1", target="main")
+        entry.target_branch_head_sha = "base-new"
+        gh = self._Gh(
+            compare_files=["coord/merge_queue.py"],
+            branch_compare_files=["tests/test_merge_queue.py"],
+        )
+
+        verdict = mq.evaluate_smoke_verdict(entry, board, gh)
+
+        assert verdict.ok is False
+        assert verdict.kind == mq.SMOKE_STALE
+
+    def test_branch_touching_tui_stays_stale_on_base_move(self) -> None:
+        board = self._board(completed=[self._tested_work()])
+        entry = _q("w1", target="main")
+        entry.target_branch_head_sha = "base-new"
+        gh = self._Gh(
+            compare_files=["coord/merge_queue.py"],
+            branch_compare_files=["tui/app.py"],
+        )
+
+        verdict = mq.evaluate_smoke_verdict(entry, board, gh)
+
+        assert verdict.ok is False
+        assert verdict.kind == mq.SMOKE_STALE
+
+    def test_branch_touching_pyproject_stays_stale_on_base_move(self) -> None:
+        board = self._board(completed=[self._tested_work()])
+        entry = _q("w1", target="main")
+        entry.target_branch_head_sha = "base-new"
+        gh = self._Gh(
+            compare_files=["coord/merge_queue.py"],
+            branch_compare_files=["pyproject.toml"],
+        )
+
+        verdict = mq.evaluate_smoke_verdict(entry, board, gh)
+
+        assert verdict.ok is False
+        assert verdict.kind == mq.SMOKE_STALE
+
+    def test_branch_editing_the_test_runner_is_not_inert(self) -> None:
+        """The self-certification hole: a branch cannot point at the
+        `scripts/` allowlist to declare its own edit of the composed test
+        runner inert and skip its gate."""
+        board = self._board(completed=[self._tested_work()])
+        entry = _q("w1", target="main")
+        entry.target_branch_head_sha = "base-new"
+        gh = self._Gh(
+            compare_files=["coord/merge_queue.py"],
+            branch_compare_files=["scripts/coord-test-runner.sh"],
+        )
+
+        verdict = mq.evaluate_smoke_verdict(entry, board, gh)
+
+        assert verdict.ok is False
+        assert verdict.kind == mq.SMOKE_STALE
+
+    def test_base_move_editing_the_test_runner_is_not_inert(self) -> None:
+        """Same hole, base side: a base move consisting solely of an edit to
+        the composed test runner must not be treated as inert either — it IS
+        the thing the Test stage executes."""
+        board = self._board(completed=[self._tested_work()])
+        entry = _q("w1", target="main")
+        entry.target_branch_head_sha = "base-new"
+        gh = self._Gh(compare_files=["scripts/coord-test-runner.sh"])
+
+        verdict = mq.evaluate_smoke_verdict(entry, board, gh)
+
+        assert verdict.ok is False
+        assert verdict.kind == mq.SMOKE_STALE
+        assert verdict.anchor == "base"
+
+    def test_inert_branch_with_no_verdict_at_all_is_still_missing(self) -> None:
+        """#1778 refreshes an EXISTING verdict against a moved base — it must
+        never manufacture a verdict from nothing, inert branch or not."""
+        work = self._tested_work()
+        work.test_state = None
+        board = self._board(completed=[work])
+        entry = _q("w1", target="main")
+        entry.target_branch_head_sha = "base-new"
+        gh = self._Gh(
+            compare_files=["coord/merge_queue.py"],
+            branch_compare_files=["docs/README.md"],
+        )
+
+        verdict = mq.evaluate_smoke_verdict(entry, board, gh)
+
+        assert verdict.ok is False
+        assert verdict.kind == mq.SMOKE_MISSING
+
+    def test_branch_is_inert_fails_closed_without_gh_ops(self) -> None:
+        assert mq._branch_is_inert(None, "acme/api", "base-old", "branch-sha") is False
+
+    def test_branch_is_inert_fails_closed_without_repo_github(self) -> None:
+        assert mq._branch_is_inert(self._Gh(), None, "base-old", "branch-sha") is False
+
+    def test_branch_is_inert_fails_closed_on_unreadable_compare(self) -> None:
+        gh = self._Gh(branch_compare_files=None)
+        assert (
+            mq._branch_is_inert(gh, "acme/api", "base-old", "branch-sha") is False
+        )
+
+    def test_branch_is_inert_fails_closed_when_compare_raises(self) -> None:
+        class _Raising(self._Gh):
+            def get_compare_files(self, repo, base, head):
+                raise RuntimeError("gh api boom")
+
+        assert (
+            mq._branch_is_inert(_Raising(), "acme/api", "base-old", "branch-sha")
+            is False
+        )
+
+    def test_branch_is_inert_true_for_allowlisted_paths(self) -> None:
+        gh = self._Gh(branch_compare_files=["docs/README.md", "CONTRIBUTING.md"])
+        assert mq._branch_is_inert(gh, "acme/api", "base-old", "branch-sha") is True
+
+    def test_path_is_inert_denies_the_test_runner_despite_scripts_prefix(
+        self,
+    ) -> None:
+        assert mq._path_is_inert("scripts/coord-test-runner.sh") is False
+        assert mq._path_is_inert("scripts/drive-batch.sh") is True
+
+    # ── black-box: seeded board, via `process()` ────────────────────────────
+
+    def test_seeded_board_inert_branch_and_moved_base_merges(self) -> None:
+        """The positive case: an inert branch merges through `process()`
+        with no re-test dispatched, even though the base moved through
+        something substantive."""
+        cfg = self._config()
+        board = self._board(completed=[self._tested_work()])
+        items = [_q("w1", target="main", size=10)]
+        gh = self._Gh(
+            compare_files=["coord/merge_queue.py"],
+            branch_compare_files=["docs/README.md"],
+        )
+
+        events = process(items, gh, config=cfg, board=board, dry_run=True)
+
+        assert not [e for e in events if e.kind == "smoke_required"]
+
+    def test_seeded_board_same_branch_plus_coord_file_blocks(self) -> None:
+        """The negative case, which matters more: the same branch with one
+        `coord/**` file added flips straight back to blocked."""
+        cfg = self._config()
+        board = self._board(completed=[self._tested_work()])
+        items = [_q("w1", target="main", size=10)]
+        gh = self._Gh(
+            compare_files=["coord/merge_queue.py"],
+            branch_compare_files=["docs/README.md", "coord/merge_queue.py"],
+        )
+
+        events = process(items, gh, config=cfg, board=board, dry_run=True)
+
+        blocked = [e for e in events if e.kind == "smoke_required"]
+        assert len(blocked) == 1
+        assert "stale" in blocked[0].message
