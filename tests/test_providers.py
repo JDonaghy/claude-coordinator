@@ -37,10 +37,12 @@ from coord.config import (
 from coord.models import Machine
 from coord.providers import (
     build_provider,
+    build_provider_from_wire,
     describe_provider_choice,
     guard_provider_machine_capability,
     machine_supports_provider,
     machines_supporting_provider,
+    provider_def_to_wire,
     provider_type_for,
     resolve_default_provider,
     resolve_provider_name,
@@ -452,6 +454,127 @@ def test_build_provider_with_models_cfg() -> None:
     models = ModelsConfig()
     provider = build_provider("claude", defn, models)
     assert isinstance(provider, ClaudeProvider)
+
+
+# ── #1796: provider_def_to_wire / build_provider_from_wire round-trip ────────
+#
+# The coordinator-side serializer and the agent-side reconstructor a
+# config-free agent (no local providers.definitions registry — see
+# docs/EPHEMERAL_WORKERS.md) uses to build the SAME provider the coordinator
+# resolved, without needing local config at all.
+
+
+def test_provider_def_to_wire_serializes_all_fields() -> None:
+    defn = ProviderDef(
+        type="opencode",
+        binary="/opt/opencode/bin/opencode",
+        model="glm-4.6",
+        attach_url="http://localhost:1234",
+        env={"FOO": "bar"},
+        extra_args=["--verbose"],
+    )
+    wire = provider_def_to_wire(defn)
+    assert wire == {
+        "type": "opencode",
+        "binary": "/opt/opencode/bin/opencode",
+        "model": "glm-4.6",
+        "attach_url": "http://localhost:1234",
+        "env": {"FOO": "bar"},
+        "extra_args": ["--verbose"],
+    }
+
+
+def test_provider_def_to_wire_bare_definition() -> None:
+    """A bare ProviderDef(type=...) round-trips to None/empty-collection
+    wire values, not missing keys — the agent side always finds every key."""
+    wire = provider_def_to_wire(ProviderDef(type="claude"))
+    assert wire == {
+        "type": "claude",
+        "binary": None,
+        "model": None,
+        "attach_url": None,
+        "env": {},
+        "extra_args": [],
+    }
+
+
+def test_provider_def_to_wire_env_and_extra_args_are_copies() -> None:
+    """Mutating the returned dict must not mutate the source ProviderDef."""
+    defn = ProviderDef(type="claude", env={"A": "1"}, extra_args=["--x"])
+    wire = provider_def_to_wire(defn)
+    wire["env"]["A"] = "mutated"
+    wire["extra_args"].append("--y")
+    assert defn.env == {"A": "1"}
+    assert defn.extra_args == ["--x"]
+
+
+def test_build_provider_from_wire_claude_type() -> None:
+    wire = provider_def_to_wire(ProviderDef(type="claude", binary="my-claude"))
+    provider = build_provider_from_wire("claude", wire)
+    assert isinstance(provider, ClaudeProvider)
+    spec = _make_spec(type="work")
+    assert provider.build_command(spec)[0] == "my-claude"
+
+
+def test_build_provider_from_wire_opencode_type() -> None:
+    wire = provider_def_to_wire(
+        ProviderDef(type="opencode", binary="/opt/opencode/bin/opencode")
+    )
+    provider = build_provider_from_wire("oc-mid", wire)
+    assert isinstance(provider, OpenCodeProvider)
+    spec = _make_spec(type="work")
+    argv = provider.build_command(spec)
+    assert argv[0] == "/opt/opencode/bin/opencode"
+    assert argv[1] == "run"
+
+
+def test_build_provider_from_wire_threads_model_env_extra_args() -> None:
+    """#1796: the full round-trip must preserve everything build_provider()
+    threads from a local ProviderDef — env/extra_args/model must survive
+    the wire hop unchanged."""
+    defn = ProviderDef(
+        type="claude",
+        model="glm-4.6",
+        env={"FOO": "bar"},
+        extra_args=["--verbose-extra"],
+    )
+    wire = provider_def_to_wire(defn)
+    provider = build_provider_from_wire("myprovider", wire)
+    assert provider.env() == {"FOO": "bar"}
+    spec = _make_spec(type="work", model=None)
+    argv = provider.build_command(spec)
+    idx = argv.index("--model")
+    assert argv[idx + 1] == "glm-4.6"
+    assert argv[-1] == "--verbose-extra"
+
+
+def test_build_provider_from_wire_unknown_type_raises() -> None:
+    wire = {"type": "unknown-backend"}
+    with pytest.raises(ValueError, match="unknown-backend"):
+        build_provider_from_wire("x", wire)
+
+
+def test_build_provider_from_wire_missing_type_raises() -> None:
+    with pytest.raises(ValueError, match="my-provider"):
+        build_provider_from_wire("my-provider", {})
+
+
+def test_build_provider_from_wire_none_type_raises() -> None:
+    with pytest.raises(ValueError, match="my-provider"):
+        build_provider_from_wire("my-provider", {"type": None})
+
+
+def test_build_provider_from_wire_non_dict_raises() -> None:
+    with pytest.raises(ValueError, match="my-provider"):
+        build_provider_from_wire("my-provider", "not-a-dict")  # type: ignore[arg-type]
+
+
+def test_build_provider_from_wire_tolerates_missing_optional_keys() -> None:
+    """A minimal wire dict with only 'type' set must not KeyError — every
+    other field is optional (mirrors ProviderDef's own defaults)."""
+    provider = build_provider_from_wire("claude", {"type": "claude"})
+    assert isinstance(provider, ClaudeProvider)
+    assert provider.env() == {}
 
 
 # ── Registry: resolve_provider_name ──────────────────────────────────────────

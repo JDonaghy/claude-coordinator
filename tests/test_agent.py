@@ -3536,7 +3536,14 @@ class TestProviderLayerDispatch:
     def test_no_config_parity_uses_worker_command(self, tmp_path: Path) -> None:
         """When spec.provider is None, _spawn uses self.worker_command — the
         legacy path.  The argv captured at Popen time must be identical to
-        what worker_command returns (no-config parity, #324 requirement #1)."""
+        what worker_command returns (no-config parity, #324 requirement #1).
+
+        #1796 regression guard: this is the ONE case that must still take
+        the silent legacy path after #1796 — only a *named* provider that
+        cannot be resolved is now refused (see
+        TestProviderLayerDispatch.test_provider_unknown_name_refused_not_silently_legacy);
+        `spec.provider is None` itself must behave byte-identically to
+        before."""
         import coord.agent as agent_mod
 
         repo = _init_repo(tmp_path / "repo")
@@ -3672,10 +3679,21 @@ class TestProviderLayerDispatch:
         assert captured_env[0]["PWD"] == "/deliberate/override"
         server.shutdown()
 
-    def test_provider_unknown_name_falls_back_to_legacy(self, tmp_path: Path) -> None:
-        """When spec.provider names a provider NOT in the registry, _spawn uses
-        the legacy path (worker_command) — unknown providers are silently ignored
-        to avoid breaking deployments during registry propagation."""
+    def test_provider_unknown_name_refused_not_silently_legacy(
+        self, tmp_path: Path
+    ) -> None:
+        """#1796: when spec.provider names a provider NOT in the registry AND
+        the dispatch payload carries no provider_def, assign() must REFUSE
+        the assignment — never silently substitute the legacy claude path.
+
+        This is the exact bug #1796 exists to close: an explicitly requested
+        provider that can't be honoured must fail loudly, not run a
+        different backend while every surface (coordinator log, board,
+        assignment record) still reports the requested name.  Before the
+        fix this scenario silently ran `worker_command` (the legacy path) —
+        this test would have FAILED against pre-#1796 code (it asserted the
+        opposite outcome, see git history of this test).
+        """
         import coord.agent as agent_mod
 
         repo = _init_repo(tmp_path / "repo")
@@ -3694,22 +3712,103 @@ class TestProviderLayerDispatch:
             state_dir=tmp_path / "state",
             worker_command=lambda spec: legacy_argv,
             repo_paths={"api": str(repo)},
-            providers={},  # empty registry
+            providers={},  # empty registry — config-free agent shape
             bash_wrap_spawn=False,
         )
         agent_mod.subprocess.Popen = recording_popen  # type: ignore[assignment]
         try:
+            # No provider_def on the wire either — an older coordinator, or
+            # a name with no matching providers.definitions entry.
             spec = _spec(repo, provider="nonexistent-provider")
+            with pytest.raises(ValueError, match="nonexistent-provider"):
+                server.assign(spec)
+        finally:
+            agent_mod.subprocess.Popen = real_popen  # type: ignore[assignment]
+
+        # Nothing was ever spawned — the legacy binary must NEVER run in
+        # place of an unresolvable named provider.
+        assert not captured, (
+            f"an unresolvable named provider must never fall back to "
+            f"spawning the legacy path, but Popen was called with {captured!r}"
+        )
+        server.shutdown()
+
+    def test_config_free_agent_executes_opencode_via_wire_provider_def(
+        self, tmp_path: Path
+    ) -> None:
+        """#1796 acceptance: a config-free agent (empty local providers
+        registry — docs/EPHEMERAL_WORKERS.md) can execute
+        `--provider <opencode-type>` end-to-end, actually running the
+        `opencode` binary, when the dispatch payload carries `provider_def`
+        (what `coord.dispatch.dispatch` now sends — see
+        `coord.providers.provider_def_to_wire`).
+
+        Stands in for the real `opencode` binary with a stub script so the
+        test has no external dependency, mirroring
+        `test_provider_definition_env_reaches_actual_spawn_env`'s pattern for
+        the claude provider.
+        """
+        import coord.agent as agent_mod
+
+        repo = _init_repo(tmp_path / "repo")
+        stub = tmp_path / "fake-opencode.sh"
+        stub.write_text('#!/bin/sh\necho "ran: $0 $@"\n')
+        stub.chmod(0o755)
+
+        captured: list[list[str]] = []
+        real_popen = agent_mod.subprocess.Popen
+
+        def recording_popen(spawn_argv, *args, **kwargs):
+            if kwargs.get("start_new_session"):
+                captured.append(spawn_argv)
+            return real_popen(spawn_argv, *args, **kwargs)
+
+        # No `providers=` kwarg at all — config-free agent shape: an
+        # ephemeral Azure worker with no local coordinator.yml has an EMPTY
+        # local registry, exactly like the default here.
+        server = AgentServer(
+            machine_name="test",
+            repos=["api"],
+            state_dir=tmp_path / "state",
+            worker_command=lambda spec: ["/bin/sh", "-c", "echo legacy-SHOULD-NOT-RUN"],
+            repo_paths={"api": str(repo)},
+            bash_wrap_spawn=False,
+        )
+        agent_mod.subprocess.Popen = recording_popen  # type: ignore[assignment]
+        try:
+            spec = _spec(
+                repo,
+                provider="oc-mid",
+                provider_def={
+                    "type": "opencode",
+                    "binary": str(stub),
+                    "model": None,
+                    "attach_url": None,
+                    "env": {},
+                    "extra_args": [],
+                },
+            )
             a = server.assign(spec)
             final = server.wait_for(a.id, timeout=5)
         finally:
             agent_mod.subprocess.Popen = real_popen  # type: ignore[assignment]
 
-        # Worker makes no commits → advisory (#448)
-        assert final.status == ADVISORY
-        assert captured and captured[0] == legacy_argv, (
-            "unknown provider should fall back to legacy worker_command"
+        assert captured, "Popen was not called"
+        # The binary actually executed is the opencode stub, not claude.
+        assert captured[0][0] == str(stub), (
+            f"expected the wire-resolved opencode binary {str(stub)!r} to be "
+            f"the argv[0] actually executed, got {captured[0]!r}"
         )
+        assert captured[0][1] == "run", "opencode build_command must use the 'run' subcommand"
+        log = Path(final.log_path).read_text()
+        assert "legacy-SHOULD-NOT-RUN" not in log, (
+            "a resolvable named provider must never fall back to the legacy "
+            "claude path"
+        )
+        # The recorded assignment's provider name matches the binary that
+        # actually ran — never claude, never silently something else.
+        assert a.spec.provider == "oc-mid"
+        assert final.spec.provider == "oc-mid"
         server.shutdown()
 
     def test_provider_initial_input_reaches_worker_stdin(self, tmp_path: Path) -> None:
@@ -3894,19 +3993,23 @@ class TestCapabilityGates:
         assert final.status == ADVISORY
         server.shutdown()
 
-    def test_resume_gate_no_op_when_provider_not_in_registry(
+    def test_provider_not_in_registry_and_no_wire_def_refused(
         self, tmp_path: Path
     ) -> None:
-        """When spec.provider is set but not in registry, resume gate is skipped."""
+        """#1796: when spec.provider is set but neither in the local registry
+        nor resolvable from a wire-carried provider_def, assign() refuses the
+        assignment outright — it never reaches (or skips) the resume gate,
+        because there is no legacy fallback to reach it through anymore.
+
+        Supersedes the old `test_resume_gate_no_op_when_provider_not_in_registry`,
+        which asserted the opposite (silent no-gate legacy fallback) — that
+        was the #1796 bug, not a documented feature."""
         repo = _init_repo(tmp_path / "repo")
         server = _server(tmp_path, repo_path=repo)  # no providers registry
-        # Named provider but not in registry → falls back to legacy path, no gate
-        a = server.assign(
-            _spec(repo, provider="unknown", resume_session_id="ses-no-gate")
-        )
-        final = server.wait_for(a.id, timeout=5)
-        # No commits → advisory (#448)
-        assert final.status == ADVISORY
+        with pytest.raises(ValueError, match="unknown"):
+            server.assign(
+                _spec(repo, provider="unknown", resume_session_id="ses-no-gate")
+            )
         server.shutdown()
 
     def test_inject_message_refused_when_provider_inject_is_false(

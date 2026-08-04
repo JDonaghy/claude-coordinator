@@ -498,7 +498,24 @@ class AssignmentSpec:
     # are inspected by :meth:`AgentServer.assign` and the spawn is routed
     # through :meth:`AgentServer._spawn_pty` if the provider is a
     # :class:`~coord.providers.claude_pty.ClaudePtyProvider`.
+    #
+    # #1796: when ``provider`` is set but does not match a key in this
+    # agent's local ``providers`` registry — always true for a config-free
+    # agent, which has none — resolution now falls to ``provider_def``
+    # below rather than silently degrading to the legacy claude path.
     provider: str | None = None
+    # #1796: the resolved provider's definition (type/binary/model/env/
+    # extra_args), serialized by ``coord.providers.provider_def_to_wire`` and
+    # carried alongside ``provider`` so a config-free agent (no local
+    # ``providers.definitions`` to look ``provider`` up in — see
+    # docs/EPHEMERAL_WORKERS.md) can still build the right
+    # :class:`~coord.providers.base.Provider` instance, via
+    # :func:`coord.providers.build_provider_from_wire`. ``None`` when the
+    # coordinator itself had no ``ProviderDef`` for the resolved name, or
+    # when ``provider`` itself is ``None``.  See
+    # :meth:`AgentServer._resolve_provider` for the full resolution chain —
+    # this field existing does not, on its own, get honoured anywhere else.
+    provider_def: "dict[str, Any] | None" = None
 
 
 class _GitError(RuntimeError):
@@ -4953,6 +4970,95 @@ class AgentServer:
             }
         return result
 
+    def _resolve_provider(self, spec: AssignmentSpec) -> "object | None":
+        """Resolve ``spec.provider`` to a live provider instance (#1796).
+
+        Precedence:
+
+        1. ``spec.provider is None`` → returns ``None``, the legacy "no
+           provider requested" case.  Every call site treats ``None`` as
+           "run the pre-#324 default claude path" — unchanged, and the
+           ONLY case that still does so silently (no-config parity
+           requirement, #324).
+        2. ``spec.provider in self._providers`` → the locally configured
+           instance (this agent's own ``coordinator.yml`` /
+           ``providers.definitions``) wins.  Preserved from pre-#1796
+           behaviour: an agent with its own local override of a provider's
+           binary/env/extra_args should use ITS OWN definition, not the
+           coordinator's wire-carried one.
+        3. ``spec.provider_def is not None`` → build a fresh provider from
+           the wire-carried definition (#1796's fix).  This is the path a
+           config-free agent (docs/EPHEMERAL_WORKERS.md — no local
+           ``coordinator.yml``, no board service) takes for every named
+           provider, since it has no local ``providers.definitions``
+           registry to look ``spec.provider`` up in at all.
+        4. Otherwise → raise :class:`ValueError`.  Before #1796 this case
+           silently fell through to the legacy claude path — the exact bug
+           #1796 exists to close: an explicitly requested provider that
+           cannot be honoured must be refused, never silently substituted.
+           Every caller of this method is expected to let the ValueError
+           propagate as a refused assignment (``assign()``'s HTTP handler
+           turns it into a 400), not swallow it.
+
+        Returns:
+            ``None`` for the legacy no-provider case, otherwise a
+            duck-typed provider object (``build_command``/``initial_input``/
+            ``capabilities``/``env``/``result_marker``/``parse_log``).
+
+        Raises:
+            ValueError: ``spec.provider`` is set but cannot be resolved from
+                either the local registry or ``spec.provider_def``, or
+                ``spec.provider_def`` itself is malformed / names an unknown
+                provider type.
+        """
+        if spec.provider is None:
+            return None
+        if spec.provider in self._providers:
+            return self._providers[spec.provider]
+        if spec.provider_def is not None:
+            from coord.providers import build_provider_from_wire  # noqa: PLC0415
+
+            try:
+                return build_provider_from_wire(spec.provider, spec.provider_def)
+            except ValueError as e:
+                raise ValueError(
+                    f"refusing assignment: provider {spec.provider!r} could "
+                    f"not be constructed from its dispatch-payload "
+                    f"provider_def: {e}"
+                ) from e
+        raise ValueError(
+            f"refusing assignment: provider {spec.provider!r} could not be "
+            f"resolved — it is not in this agent's local providers registry "
+            f"({sorted(self._providers) if self._providers else 'none configured'}) "
+            f"and the dispatch payload carried no provider_def to construct "
+            f"it from (an older coordinator that predates #1796, or a "
+            f"provider name with no matching providers.definitions entry "
+            f"coordinator-side).  Refusing rather than silently falling "
+            f"back to the legacy claude path (#1796): the recorded "
+            f"provider must match the binary actually executed.  Configure "
+            f"this provider in this agent's own coordinator.yml, or "
+            f"redeploy a coordinator new enough to send provider_def."
+        )
+
+    def _resolve_provider_best_effort(self, spec: AssignmentSpec) -> "object | None":
+        """Non-raising variant of :meth:`_resolve_provider` for post-spawn,
+        log-parsing-only call sites (``_reap``) (#1796).
+
+        By the time ``_reap`` runs, this assignment already spawned
+        successfully — ``assign()``/``_spawn()`` already resolved the SAME
+        ``spec`` via :meth:`_resolve_provider` without raising.  A failure
+        here would only mean a redundant re-resolution went wrong for some
+        unexpected reason; #1796 mandates refusal at DISPATCH time, not a
+        crash of the best-effort reap/log-parsing path for an
+        already-running (or already-finished) worker.  Degrades to
+        ``None`` (the caller's existing "use the default claude-shaped
+        parser" fallback) on any :class:`ValueError`.
+        """
+        try:
+            return self._resolve_provider(spec)
+        except ValueError:
+            return None
+
     def assign(self, spec: AssignmentSpec) -> AgentAssignment:
         """Accept an assignment and spawn the worker. Returns immediately."""
         if self.repos and spec.repo_name not in self.repos:
@@ -4972,12 +5078,16 @@ class AgentServer:
                     f"pull_repos references repos with no repo_path on this agent: {unknown}"
                 )
 
-        # #425/#324 capability gates: only run when spec.provider names a
-        # provider in this agent's registry.  When spec.provider is None or
-        # unknown, both gates are no-ops and the default ``claude -p`` path
+        # #425/#324/#1796 capability gates: only run when spec.provider is
+        # set.  `_resolve_provider` implements the full resolution chain
+        # (local registry → wire-carried provider_def → refuse — see its
+        # docstring) and raises ValueError when spec.provider cannot be
+        # resolved at all, which propagates out of `assign()` as a refused
+        # assignment.  When spec.provider is None, resolution returns None
+        # and both gates below are no-ops, so the default ``claude -p`` path
         # runs unchanged (no-config parity requirement, #324).
-        if spec.provider is not None and spec.provider in self._providers:
-            provider_obj = self._providers[spec.provider]
+        if spec.provider is not None:
+            provider_obj = self._resolve_provider(spec)
             caps = provider_obj.capabilities()  # type: ignore[attr-defined]
 
             # Safety gate (#425): refuse write-capable assignment types on any
@@ -5189,14 +5299,21 @@ class AgentServer:
                 raise RuntimeError(
                     f"assignment {assignment_id} is {assignment.status!r}, not running"
                 )
-            # #324: capability gate — refuse injection when the provider
-            # reports capabilities().inject=False.  A provider without stdin-
-            # injection support (e.g. a PTY-only backend) must opt out here so
-            # callers get a clear error rather than silently writing bytes to an
-            # stdin pipe that the provider may not even expose.
+            # #324/#1796: capability gate — refuse injection when the
+            # provider reports capabilities().inject=False.  A provider
+            # without stdin-injection support (e.g. a PTY-only backend) must
+            # opt out here so callers get a clear error rather than silently
+            # writing bytes to a stdin pipe that the provider may not even
+            # expose.  Uses the best-effort resolver (#1796): this
+            # assignment already spawned successfully, so `assign()`/
+            # `_spawn()` already resolved this SAME spec once without
+            # raising — a resolution failure here would only be a redundant
+            # re-resolution going wrong, and must not crash message
+            # injection while holding `self._lock`.
             spec = assignment.spec
-            if spec.provider is not None and spec.provider in self._providers:
-                if not self._providers[spec.provider].capabilities().inject:
+            if spec.provider is not None:
+                _inject_provider = self._resolve_provider_best_effort(spec)
+                if _inject_provider is not None and not _inject_provider.capabilities().inject:
                     raise RuntimeError(
                         f"provider {spec.provider!r} does not support message injection "
                         f"(capabilities().inject=False)"
@@ -5977,23 +6094,28 @@ class AgentServer:
         self._persist()
 
     def _spawn(self, assignment: AgentAssignment, repo_path: Path) -> None:
-        # #324/#425: provider-layer routing.
+        # #324/#425/#1796: provider-layer routing.
         #
-        # When the assignment names a provider in this agent's registry, route
-        # through the provider seam:
+        # `_resolve_provider` reproduces the SAME resolution `assign()`
+        # already performed (without raising) before accepting this
+        # assignment: local registry first, then the wire-carried
+        # `provider_def` (#1796) for a config-free agent.  When it returns a
+        # provider object, route through the provider seam:
         #   - PTY providers → background thread via ``_spawn_pty``.
         #   - All other providers (e.g. ClaudeProvider) → ``build_command``
         #     and ``initial_input`` instead of the legacy helpers.
         #
-        # When spec.provider is None OR the name is not in the registry, the
-        # legacy code path below runs **unchanged** (byte-for-byte identical to
-        # pre-#324) so no-config deployments are not affected.
+        # ``spec.provider is None`` is the ONLY case that still runs the
+        # legacy code path below **unchanged** (byte-for-byte identical to
+        # pre-#324) — #1796 closed the other silent-fallback case (a named
+        # but unresolvable provider), which `assign()` now refuses before
+        # `_spawn` is ever reached.
         spec = assignment.spec
-        if spec.provider is not None and spec.provider in self._providers:
+        provider_obj = self._resolve_provider(spec)
+        if provider_obj is not None:
             # Deferred import keeps the cycle latent at module load time.
             from coord.providers.claude_pty import ClaudePtyProvider  # noqa: PLC0415
 
-            provider_obj = self._providers[spec.provider]
             if isinstance(provider_obj, ClaudePtyProvider):
                 # ``_spawn_pty`` polls for worker readiness for up to 5
                 # seconds before writing the briefing.  ``_spawn`` is called
@@ -6027,9 +6149,9 @@ class AgentServer:
             initial_input: bytes = provider_obj.initial_input(spec)  # type: ignore[attr-defined]
         else:
             # Legacy / no-config path — byte-identical to pre-#324.  Used
-            # whenever spec.provider is None or not in the registry so that
-            # deployments without a providers block in coordinator.yml are
-            # completely unaffected by this change.
+            # only when spec.provider is None (#1796) so that deployments
+            # without a providers block in coordinator.yml are completely
+            # unaffected by this change.
             argv = self.worker_command(assignment.spec)
             initial_input = _user_message_line(assignment.spec.briefing)
 
@@ -6072,8 +6194,8 @@ class AgentServer:
                 assignment.spec.repo_name, self.state_dir, _spawn_env
             )
         )
-        if spec.provider is not None and spec.provider in self._providers:
-            _spawn_env.update(self._providers[spec.provider].env())
+        if provider_obj is not None:
+            _spawn_env.update(provider_obj.env())
 
         try:
             proc = subprocess.Popen(
@@ -6594,19 +6716,22 @@ class AgentServer:
         log_fh,
         log_path: str,
     ) -> None:
-        # #324: Resolve the provider for this assignment so _wait_for_proc_or_result
-        # uses provider.result_marker() and the session-id parse below uses
-        # provider.parse_log().  Look up BEFORE the wait so the marker check
-        # uses the right sentinel from the start.  For ClaudeProvider these
-        # calls delegate to the same functions used previously — behavior is
-        # byte-identical; the seam is now complete for future providers.
+        # #324/#1796: Resolve the provider for this assignment so
+        # _wait_for_proc_or_result uses provider.result_marker() and the
+        # session-id parse below uses provider.parse_log().  Look up BEFORE
+        # the wait so the marker check uses the right sentinel from the
+        # start.  For ClaudeProvider these calls delegate to the same
+        # functions used previously — behavior is byte-identical; the seam
+        # is now complete for future providers.  Uses the best-effort
+        # resolver (#1796): by the time `_reap` runs, this assignment
+        # already spawned successfully via the SAME spec, so a resolution
+        # failure here degrades to the default claude-shaped marker/parser
+        # rather than raising out of the reap thread.
         with self._lock:
             _reap_start = self._assignments.get(assignment_id)
         _reap_provider = None
         if _reap_start is not None:
-            _rp_name = _reap_start.spec.provider
-            if _rp_name is not None and _rp_name in self._providers:
-                _reap_provider = self._providers[_rp_name]
+            _reap_provider = self._resolve_provider_best_effort(_reap_start.spec)
 
         # Build a log_has_result callable from the provider's result_marker.
         # When the provider's marker matches the built-in default we reuse
@@ -6904,14 +7029,14 @@ class AgentServer:
                     from coord.worker_events import is_stream_json  # noqa: PLC0415
                     lp = assignment.log_path
                     if lp and is_stream_json(lp):
-                        _parse_provider_name = assignment.spec.provider
-                        if (
-                            _parse_provider_name is not None
-                            and _parse_provider_name in self._providers
-                        ):
-                            summary = self._providers[_parse_provider_name].parse_log(
-                                lp, tail_bytes=0
-                            )
+                        # #1796: reuse `_reap_provider` — resolved once,
+                        # above, from this SAME assignment's spec (local
+                        # registry → wire-carried provider_def → best-effort
+                        # None) — instead of re-deriving it from
+                        # `self._providers` alone, which would miss a
+                        # config-free agent's wire-resolved provider.
+                        if _reap_provider is not None:
+                            summary = _reap_provider.parse_log(lp, tail_bytes=0)
                         else:
                             from coord.worker_events import parse_log  # noqa: PLC0415
                             summary = parse_log(lp, tail_bytes=0)
