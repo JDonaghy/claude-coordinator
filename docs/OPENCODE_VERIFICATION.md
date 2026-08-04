@@ -345,6 +345,151 @@ below**) or accept that progress is only visible after process exit.
   scope); the "confirmed by inference" note above should not be read as a
   legal/ToS determination.
 
+## Non-interactive credential verification (#1777)
+
+The rest of this document is #1703's pass (log/event schema). This section
+adds a second, independent verification pass for #1777 — the ephemeral-Azure
+prerequisite — answering the one question #1703 didn't touch: **can opencode
+authenticate without `opencode auth login` writing `~/.local/share/opencode/auth.json`
+interactively?** A VM that lives four hours cannot run an interactive login.
+
+Same rigor as above: verified against the **real, pinned 1.18.11 binary**
+(downloaded standalone via the official installer, `--version 1.18.11`, into
+an isolated `$HOME` so it could not read or write the operator's real
+`~/.local/share/opencode/auth.json`), not inferred from docs. Captured
+2026-08-03.
+
+### Finding: `OPENCODE_API_KEY` is a real, generic, env-var credential path
+
+Static analysis of the shipped binary (it bundles the models.dev provider
+catalog) shows every provider entry carries an `env` array naming the
+environment variable(s) that satisfy it, e.g.:
+
+```
+anthropic:{id:"anthropic",env:["ANTHROPIC_API_KEY"],npm:"@ai-sdk/anthropic",...}
+deepseek:{id:"deepseek",env:["DEEPSEEK_API_KEY"],npm:"@ai-sdk/openai-compatible",...}
+opencode:{id:"opencode",env:["OPENCODE_API_KEY"],npm:"@ai-sdk/openai-compatible",
+          api:"https://opencode.ai/zen/v1",name:"OpenCode Zen",...}
+```
+
+and a generic detection loop (not special-cased to one provider) runs at
+startup: `for(let[z,X]of Object.entries(h))for(let J of X.env)if(process.env[J])G.push({provider:X.name||z,envVar:J})`.
+This is exactly the mechanism the fleet's own fixtures already exercise —
+`opencode/big-pickle` is a model on the `opencode` (OpenCode Zen) provider,
+whose credential env var is `OPENCODE_API_KEY`.
+
+This was then confirmed **live**, not just read out of the binary:
+
+**1. `opencode providers list` (aliased `auth` — `opencode providers`'s
+`--help` shows `[aliases: auth]`, so `opencode auth list` is the identical
+command) with an isolated `$HOME` containing no `auth.json` at all, and only
+`OPENCODE_API_KEY` exported:**
+
+```
+$ HOME=/tmp/oc-pin-test OPENCODE_API_KEY=<redacted> opencode providers list
+┌  Credentials  ~/.local/share/opencode/auth.json
+│
+└  0 credentials
+
+┌  Environment
+│
+●  OpenCode Go   OPENCODE_API_KEY
+│
+●  OpenCode Zen  OPENCODE_API_KEY
+│
+└  2 environment variables
+```
+
+Zero file-backed credentials, two env-detected ones. This satisfies the
+issue's acceptance criterion literally: `opencode auth list` on a
+freshly-booted worker (no login ever run) shows a working credential.
+
+**2. A real `opencode run`, same isolated `$HOME`, same env var, no
+`auth.json` anywhere on disk before or after:**
+
+```
+$ HOME=/tmp/oc-pin-test OPENCODE_API_KEY=<redacted> \
+    opencode run --format json --model opencode/big-pickle \
+    "reply with exactly the word: pong"
+$ echo $?
+0
+```
+
+Output stream (3 lines, matching the shapes already documented above):
+
+```
+{"type":"step_start", ...}
+{"type":"text","part":{"text":"pong",...}}
+{"type":"step_finish","part":{"reason":"stop",...}}
+```
+
+`find /tmp/oc-pin-test -iname auth.json` → no matches, before or after the
+run. This is exactly the surface `OpenCodeProvider.parse_log` consumes
+post-#1704: a session, and a terminal `step_finish` with `part.reason=="stop"`
+— produced with **zero credential material ever touching disk**, which is
+precisely what "arrives at boot, not baked into the image" requires.
+
+**Conclusion: no `auth.json` is needed.** An `OPENCODE_API_KEY` environment
+variable, present in the worker process's environment at the moment `opencode
+run` executes, is sufficient — for the `opencode` (Zen) provider specifically,
+which is what the fleet already uses for `opencode/big-pickle`. (Whether the
+same env-var path is wired up for other providers, e.g. `deepseek`, is implied
+by the same generic mechanism but was not separately re-verified live here —
+out of scope for this pass, which only needed to prove *a* non-interactive
+path exists.)
+
+### Finding: the install location is fixed, and it is NOT already on a worker's PATH
+
+The official installer (`curl -fsSL https://opencode.ai/install | bash`)
+hardcodes `INSTALL_DIR=$HOME/.opencode/bin` — read from its source directly,
+2026-08-03. Neither `--binary <path>` (changes the download source, not the
+destination) nor any environment variable redirects it. `--no-modify-path`
+only skips appending to interactive shell rc files (`.bashrc`/`.zshrc`/etc.),
+which a systemd unit never sources anyway.
+
+This is the concrete reason the standing fleet needed a
+`20-opencode-path.conf` PATH drop-in for `coord-agent`: nothing else put
+`~/.opencode/bin` on that unit's `Environment=PATH=` line. `provision-worker.sh`
+avoids needing the same drop-in on ephemeral workers by symlinking
+`~/.opencode/bin/opencode` into `~/.local/bin` at provision time — a directory
+already on the `coord-agent` unit's PATH (`deploy/coord-agent.service`) because
+the Claude Code CLI install already relies on it landing there via `npm config
+set prefix ~/.local`.
+
+### What #1777 does *not* resolve
+
+The env var must still **reach** the worker process's environment at boot.
+Today only `anthropic-api-key`, `github-token` and `tailscale-oauth-secret`
+are fetched from Key Vault and exported by `coord-secrets` (cloud-init, the
+**easy-azure** repo — out of this repo's reach). `bootstrap-shared.sh` now
+prompts for a fourth secret, `opencode-api-key`, through the same `set_secret`
+helper as the other three — but nothing on the worker side consumes it yet.
+That is a **hand-off**, not a gap this issue closes: extending
+`coord-secrets`/cloud-init to also export `OPENCODE_API_KEY` needs a change in
+`easy-azure`, which this issue's worker cannot touch. See
+`docs/EPHEMERAL_WORKERS.md` for the explicit note.
+
+### How to reproduce the credential check
+
+```bash
+# Install the exact pinned version into an isolated HOME so it can't touch
+# your real ~/.local/share/opencode/auth.json.
+mkdir -p /tmp/oc-pin-test
+HOME=/tmp/oc-pin-test bash -c "$(curl -fsSL https://opencode.ai/install)" \
+    -- --version 1.18.11 --no-modify-path
+
+export OPENCODE_API_KEY=<a real OpenCode Zen key>
+HOME=/tmp/oc-pin-test /tmp/oc-pin-test/.opencode/bin/opencode providers list
+# -> "0 credentials" under Credentials, "2 environment variables" under
+#    Environment (OpenCode Go, OpenCode Zen), both keyed by OPENCODE_API_KEY
+
+mkdir -p /tmp/oc-pin-throwaway && cd /tmp/oc-pin-throwaway && git init -q
+HOME=/tmp/oc-pin-test /tmp/oc-pin-test/.opencode/bin/opencode run \
+    --format json --model opencode/big-pickle "reply with exactly: pong"
+# -> exit 0, step_start / text("pong") / step_finish(reason:"stop")
+find /tmp/oc-pin-test -iname auth.json   # -> no matches
+```
+
 ## How to reproduce
 
 ```bash

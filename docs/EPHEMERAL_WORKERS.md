@@ -41,7 +41,9 @@ worker reaching your machines.
    [`verify-github-token.sh`](../scripts/azure-workers/verify-github-token.sh)
    before it goes anywhere near Key Vault.
 5. **`bootstrap-shared.sh`** — Key Vault, the user-assigned identity that reads
-   it, the private DNS zone, and the three secrets. Prints resource IDs for
+   it, the private DNS zone, and the secrets (`anthropic-api-key`,
+   `github-token`, `tailscale-oauth-secret`, and — if this epic will dispatch
+   **opencode** workers — `opencode-api-key`). Prints resource IDs for
    `~/.coord/epic.env`.
 6. **Markers in `coordinator.yml`** on the daemon host, at the end of the
    `machines:` list:
@@ -117,6 +119,36 @@ to `$VENV/bin:/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin` — no
 `~/.cargo/bin`. Workers inherit that, so a per-user rustup install leaves
 `cargo` invisible to every dispatched task (this is #1671's root cause). The
 image installs to `/opt/rust` and symlinks into `/usr/local/bin`.
+
+**opencode needs a credential wired to a fourth Key Vault secret — and that
+wiring is not finished (#1777).** The image installs opencode
+(`scripts/azure-workers/provision-worker.sh`, pinned to the fleet's 1.18.11)
+and `bootstrap-shared.sh` now prompts for a fourth secret, `opencode-api-key`.
+Verified against the real binary (`docs/OPENCODE_VERIFICATION.md`): opencode
+authenticates non-interactively from an `OPENCODE_API_KEY` environment
+variable alone — no `auth.json`, no login step, nothing baked into the image.
+**But nothing on the worker side exports that env var yet.** `coord-secrets`
+(the systemd unit cloud-init installs at boot, sourced from the
+**easy-azure** repo's `modules/coord-worker-vm/main.bicep`) only fetches and
+exports the original three secrets today. Extending it to also export
+`OPENCODE_API_KEY` for `opencode-api-key` is a Bicep/cloud-init change in
+easy-azure, out of this repo's reach — until that lands, `opencode-api-key`
+sits in Key Vault unused and a worker dispatched with `--provider opencode`
+will fail at session start exactly like the "silent" failure mode this issue
+set out to avoid. Do the easy-azure change before relying on an opencode
+worker for real (i.e. before #1708).
+
+**`~/.opencode/bin` is not on the agent's PATH by default — provisioning
+symlinks around it instead of patching the unit.** opencode's official
+installer always drops the binary at `~/.opencode/bin/opencode`; there is no
+flag or env var that redirects it. That is why the **standing** fleet needed a
+`20-opencode-path.conf` systemd drop-in on `coord-agent` — nothing else put
+that directory on the unit's PATH. `provision-worker.sh` sidesteps the same
+problem on ephemeral images by symlinking the binary into `~/.local/bin`
+instead, which is already on `coord-agent`'s PATH (the Claude Code CLI install
+already depends on landing there). No drop-in needed for these images as a
+result — but if a future change moves the Claude CLI off `~/.local/bin`, this
+symlink stops being sufficient too; re-check both together.
 
 **`apt install gh` produces a broken image.** Ubuntu's `gh` is far below the
 `GH_PR_CHECKS_JSON_MIN_VERSION` floor (2.86.0), and the CI merge gate throws

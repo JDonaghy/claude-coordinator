@@ -113,10 +113,20 @@ set_secret() { # set_secret <name> <prompt>
     echo "  $name stored"
 }
 
-echo "Three secrets. Leave any blank to skip."
+echo "Four secrets. Leave any blank to skip."
 set_secret anthropic-api-key      "Anthropic API key (sk-ant-...)"
 set_secret github-token           "GitHub fine-grained PAT (repo contents+PR write)"
 set_secret tailscale-oauth-secret "Tailscale OAuth client secret (auth_keys scope, tag:coord-worker)"
+# Verified non-interactive: opencode reads OPENCODE_API_KEY straight from the
+# process environment for the "opencode" (Zen) provider -- no auth.json
+# needed, confirmed against the real 1.18.11 binary (docs/OPENCODE_VERIFICATION.md).
+# Only needed if this epic dispatches opencode workers -- leave blank otherwise.
+# NOTE (#1777 hand-off): this secret lands in Key Vault, but nothing on the
+# worker side pulls it into the environment yet -- coord-secrets (cloud-init,
+# easy-azure repo) fetches only the three secrets above today. Extending it
+# to also export OPENCODE_API_KEY is out of scope here (easy-azure is not in
+# this repo's tree); see docs/EPHEMERAL_WORKERS.md for the open hand-off.
+set_secret opencode-api-key       "OpenCode Zen API key (OPENCODE_API_KEY, opencode.ai/zen)"
 
 # --------------------------------------------------------------------------
 log "done — put these in epic.env"
