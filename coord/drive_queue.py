@@ -116,10 +116,12 @@ DEFAULT_MAX_ATTEMPTS = 2
 #     running entry look dead at once;
 #   * no `active_work` on the board — the drive has not dispatched yet.
 #
-# Before #1794 that fell straight through `_reconcile_running`'s four branches
-# to `retry`: on 2026-08-03 a tick 40s after a launch declared a healthy drive
-# dead, spent an attempt, and launched a SECOND `coord drive` for the same
-# issue.  The two ticks were 40s apart because `docs/DRIVE_QUEUE.md` §2's
+# Before #1794 that fell straight through all three non-death branches of
+# `_reconcile_running` into `retry`.  On 2026-08-03 a tick 40s after a launch
+# declared a healthy drive dead, spent an attempt, and launched a SECOND
+# `coord drive` for the same issue.  Left alone that walks the entry to
+# `attempts=2/2` and `blocked`, i.e. an unattended queue parks healthy work and
+# reports it as failed.  The two ticks were 40s apart because DRIVE_QUEUE.md §2's
 # install sequence is `systemctl --user enable --now …timer` immediately
 # followed by a verification `systemctl --user start …service` — i.e. the
 # documented install reliably produces the back-to-back ticks that trigger it.

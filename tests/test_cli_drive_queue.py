@@ -495,7 +495,10 @@ def test_a_still_starting_drive_is_reported_not_escalated(cli, seed, launches):
     result = cli("tick")
     assert result.exit_code == 0, result.output
     # Occupying a slot is the queue working — no queue-level alert for it.
-    assert state._get_drive_escalation_local(QUEUE_ALERT_REPO, QUEUE_ALERT_ISSUE) is None
+    queue_alert = state._get_drive_escalation_local(
+        QUEUE_ALERT_REPO, QUEUE_ALERT_ISSUE
+    )
+    assert queue_alert is None
     assert state._get_drive_escalation_local(REPO, 1762) is None
     assert "still starting" in queued(1762)["last_reason"]
 
