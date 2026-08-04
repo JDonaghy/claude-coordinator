@@ -652,16 +652,24 @@ def dispatch_entry(
             shadowed_labels=shadowed_labels,
         )
     else:
-        # #1706: resolved_model is None only when the effective provider's
-        # own `providers.definitions.<name>.model` is pinned and no label
-        # matched — state that explicitly rather than feeding `None` to
-        # describe_model_choice (which expects a str).
+        # #1706/#1798: resolved_model is None when the effective provider's
+        # own `providers.definitions.<name>.model` is pinned — state that
+        # explicitly rather than feeding `None` to describe_model_choice
+        # (which expects a str). #1798: after the precedence fix, this can
+        # now happen *with* a matched label too (the pin winning over it,
+        # not just "no label matched") — surface which label lost, same as
+        # `_dispatch_headless`'s equivalent branch in dispatch_workers.py,
+        # so `coord milestone dispatch`'s output doesn't silently omit it.
         _pinned = config.providers.definitions.get(effective_provider_name)
-        model_reason = (
-            f"{_pinned.model} (via providers.definitions[{effective_provider_name!r}].model)"
-            if _pinned is not None and _pinned.model
-            else "none (provider default; no --model support at this call site)"
-        )
+        if _pinned is not None and _pinned.model:
+            _via = f"providers.definitions[{effective_provider_name!r}].model"
+            model_reason = (
+                f"{_pinned.model} (via {_via}, overriding label {matched_label!r})"
+                if matched_label
+                else f"{_pinned.model} (via {_via})"
+            )
+        else:
+            model_reason = "none (provider default; no --model support at this call site)"
 
     proposal = Proposal(
         id=0,

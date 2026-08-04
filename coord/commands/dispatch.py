@@ -285,7 +285,9 @@ def approve(
         # Resolve model so the dispatched record and board reflect what ran.
         # #1430: coord.brain.resolve_models() already set p.model from
         # models.labels (via config.models.model_for_labels) for work
-        # proposals with a matching label, during `coord plan`.
+        # proposals with a matching label, during `coord plan`. That call
+        # sets `proposal.model` *directly* from the label match — with zero
+        # awareness of the effective provider or its pin.
         #
         # #1454: that resolution is only as fresh as the issue's labels AT
         # PLAN TIME. "Label it, then dispatch it" is the documented tier
@@ -296,25 +298,46 @@ def approve(
         # it. When there's no already-resolved model, re-check the issue's
         # CURRENT labels with a live fetch (same as `coord assign` /
         # `coord milestone dispatch` already do) before falling back.
-        plan_time_model = p.model
+        #
+        # #1798 review fix: a plan-time `p.model` used to flow straight into
+        # `dispatch()` untouched. `dispatch()` (via `resolve_dispatch_model()`)
+        # treats a non-None `proposal.model` as an *explicit* override — the
+        # branch meant for "a human was specific" — so a plan-time label
+        # match (e.g. "haiku") won over a pinned non-claude provider's own
+        # model exactly like before the #1798 precedence fix, and now trips
+        # the new `enforce_model_provider_compatibility` gate instead of
+        # just silently misdispatching. `coord approve` has no `--model`
+        # flag of its own, so there is no genuine explicit override at this
+        # call site: every non-None `p.model` reaching this loop is
+        # label-derived (from `coord.brain.resolve_models()` at plan time,
+        # or a human editing the saved proposal — either way label-shaped,
+        # not "a human was specific about --model just now"). Feed it to
+        # `resolve_dispatch_model_alias` as *label_model*, never as
+        # *explicit_model*, the same way `_dispatch_headless` and
+        # `milestone_dispatch.dispatch_entry` already do — so a provider's
+        # pin still wins over it.
         matched_label: str | None = None
         shadowed_labels: list[str] = []
-        if p.type == "work" and not p.model:
-            repo_for_model = cfg.repo(p.repo_name)
-            fresh_labels: list[str] = []
-            if repo_for_model is not None:
-                try:
-                    fresh_issue = github_ops.get_issue(repo_for_model.github, p.issue_number)
-                    fresh_labels = [
-                        lbl.get("name", "") for lbl in (fresh_issue.get("labels") or [])
-                    ]
-                except RuntimeError:
-                    fresh_labels = []  # fail open — fall back to default below
-            label_model, matched_label, shadowed_labels = cfg.models.model_for_labels_with_reason(
-                fresh_labels
-            )
-            if label_model:
-                p.model = label_model
+        label_model: str | None = None
+        used_plan_time_snapshot = False
+        if p.type == "work":
+            if p.model:
+                label_model = p.model
+                used_plan_time_snapshot = True
+            else:
+                repo_for_model = cfg.repo(p.repo_name)
+                fresh_labels: list[str] = []
+                if repo_for_model is not None:
+                    try:
+                        fresh_issue = github_ops.get_issue(repo_for_model.github, p.issue_number)
+                        fresh_labels = [
+                            lbl.get("name", "") for lbl in (fresh_issue.get("labels") or [])
+                        ]
+                    except RuntimeError:
+                        fresh_labels = []  # fail open — fall back to default below
+                label_model, matched_label, shadowed_labels = (
+                    cfg.models.model_for_labels_with_reason(fresh_labels)
+                )
         # #1707: needed regardless of whether p.model still needs resolving
         # below — also used by the "model:" echo's provider-pin branch.
         from coord.providers import resolve_provider_name  # noqa: PLC0415
@@ -325,42 +348,57 @@ def approve(
             repo_for_provider.provider if repo_for_provider is not None else None,
             cfg.providers,
         )
-        if not p.model:
-            # #1706 review fix: don't force `models.default` (a Claude
-            # model alias) onto a non-claude/claude-pty provider that pins
-            # its own `model` in `providers.definitions.<name>.model` —
-            # see `resolve_dispatch_model_alias`'s docstring. Without this,
-            # `p.model` was always truthy by the time `dispatch()` saw it,
-            # so its own (also provider-aware) fallback could never fire
-            # for a plain `coord approve`.
-            from coord.dispatch import resolve_dispatch_model_alias  # noqa: PLC0415
+        # #1706 review fix: don't force `models.default` (a Claude model
+        # alias) onto a non-claude/claude-pty provider that pins its own
+        # `model` in `providers.definitions.<name>.model` — see
+        # `resolve_dispatch_model_alias`'s docstring. #1798 review fix:
+        # unconditional now (was `if not p.model:`), so a plan-time/already-
+        # resolved `label_model` (above) is still checked against the pin
+        # instead of bypassing it — see the comment above for why trusting
+        # a pre-set `p.model` as an implicit *explicit_model* was the bug.
+        from coord.dispatch import resolve_dispatch_model_alias  # noqa: PLC0415
 
-            p.model = resolve_dispatch_model_alias(
-                explicit_model=None,
-                label_model=None,
-                config=cfg,
-                effective_provider_name=effective_provider_name,
-            )
+        p.model = resolve_dispatch_model_alias(
+            explicit_model=None,
+            label_model=label_model,
+            config=cfg,
+            effective_provider_name=effective_provider_name,
+        )
         if p.model:
             click.echo(
                 "     model: "
                 + describe_model_choice(
                     resolved_model=p.model,
-                    explicit_reason="resolved at plan time" if plan_time_model else None,
+                    explicit_reason="resolved at plan time" if used_plan_time_snapshot else None,
                     matched_label=matched_label,
                     shadowed_labels=shadowed_labels,
                 )
             )
         else:
-            # #1706: p.model is None only when the effective provider's own
+            # #1706/#1798: p.model is None when the effective provider's own
             # `providers.definitions.<name>.model` is pinned and neither an
-            # explicit/plan-time model nor a label matched.
+            # explicit/plan-time model nor a label matched — or when one DID
+            # match/was already resolved but lost to the pin. Surface which
+            # one lost explicitly, mirroring `_dispatch_headless`'s
+            # equivalent branch, instead of silently printing nothing — a
+            # namespace-mismatched label/plan-time model (a Claude alias)
+            # silently losing to a non-claude provider's pin is exactly the
+            # transparency #1798 asked for.
             _pinned = cfg.providers.definitions.get(effective_provider_name)
             if _pinned is not None and _pinned.model:
-                click.echo(
-                    f"     model: {_pinned.model} "
-                    f"(via providers.definitions[{effective_provider_name!r}].model)"
-                )
+                _via = f"providers.definitions[{effective_provider_name!r}].model"
+                if matched_label:
+                    click.echo(
+                        f"     model: {_pinned.model} (via {_via}, "
+                        f"overriding label {matched_label!r})"
+                    )
+                elif used_plan_time_snapshot and label_model:
+                    click.echo(
+                        f"     model: {_pinned.model} (via {_via}, "
+                        f"overriding plan-time model {label_model!r})"
+                    )
+                else:
+                    click.echo(f"     model: {_pinned.model} (via {_via})")
         # Resolve required_gates: fall back to config default for proposals
         # that were saved before label-based gate resolution was wired in.
         if not p.required_gates:
