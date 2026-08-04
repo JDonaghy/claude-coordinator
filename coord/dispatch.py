@@ -727,35 +727,59 @@ def dispatch(
         effective_provider_name, config,
     ):
         payload["provider"] = effective_provider_name
-        # #1796: carry the resolved provider's own definition (type/binary/
-        # model/env/extra_args) alongside its name, so a config-free agent
-        # (no local providers.definitions registry to look "provider" up
-        # in — docs/EPHEMERAL_WORKERS.md) can still construct the right
-        # Provider instance via coord.providers.build_provider_from_wire,
-        # instead of refusing the assignment for want of local config (see
-        # coord.agent.AgentServer._resolve_provider — #1796's whole point is
-        # that it refuses rather than silently degrading to the legacy
-        # claude path, so THIS is what makes a config-free dispatch of a
-        # named provider actually work end-to-end).
-        #
-        # Only sent alongside "provider" — never on its own — so this key
-        # only ever reaches an agent already new enough to know the
-        # "provider" field (#324); an agent that predates #1796 itself will
-        # still reject the payload with a 400 for the unknown
-        # "provider_def" key until it's updated (`coord agent update`) — see
-        # this issue's Deployment note.  Omitted when the coordinator's own
-        # providers.definitions has no entry for effective_provider_name (a
-        # name that only exists as providers.default with no matching
-        # definitions entry): don't fabricate one, let the agent's own
-        # "unknown provider" refusal (#1796) surface that misconfiguration,
-        # matching guard_unattended_dispatch's established posture above.
-        definition = config.providers.definitions.get(effective_provider_name)
-        if definition is not None:
-            from coord.providers import provider_def_to_wire  # noqa: PLC0415
-
-            payload["provider_def"] = provider_def_to_wire(definition)
 
     resp = httpx.post(url, json=payload, timeout=15)
+    if (
+        resp.status_code == 400
+        and "provider" in payload
+        and "provider_def" not in payload
+        and config.providers.definitions.get(effective_provider_name) is not None
+    ):
+        # #1796 fix iteration 1 (review finding, blocking): the first
+        # attempt above deliberately never carries "provider_def" — the
+        # original #1796 patch attached it unconditionally to every
+        # named-provider dispatch whenever the coordinator's own config had
+        # a matching definition, which is a strictly wider condition than
+        # "the agent actually needs it". "provider_def" is a field ONLY an
+        # agent already updated PAST this release understands —
+        # AssignmentSpec(**body) 400s on any unrecognized kwarg
+        # (coord/agent_app.py) — so an agent that already supports
+        # "provider" (#324) but hasn't yet received #1796's release would
+        # get a brand-new hard 400 on every named-provider dispatch,
+        # including ones that were already working correctly against its
+        # own local providers.definitions (coordinator.yml). That's a
+        # regression of an already-working path, not just a failure to fix
+        # the config-free case #1796 targets — see docs/EPHEMERAL_WORKERS.md
+        # and coord.agent.AgentServer._resolve_provider's docstring for what
+        # "provider_def" is actually for.
+        #
+        # So "provider_def" is attached ONLY as a one-shot retry, fired
+        # only once the agent has ALREADY refused the bare "provider"
+        # payload with a 400. That 400 can only come from one of two agent
+        # generations: (a) one old enough to predate #1796's refusal logic
+        # never 400s here at all — it either resolves the name from its own
+        # local registry (unchanged, no regression) or silently falls back
+        # to the legacy claude path (the pre-#1796 bug, unaffected either
+        # way by this change and unaffected by whether provider_def would
+        # have helped); or (b) one new enough to run #1796's
+        # `_resolve_provider` (coord/agent.py) — which means it is ALSO new
+        # enough to accept "provider_def" — could not resolve the name from
+        # its own local registry (a genuinely config-free agent, or a local
+        # registry that's missing/stale relative to the coordinator's own)
+        # and explicitly refused rather than guess. Retrying is safe to do
+        # unconditionally on any 400 here because every ValueError
+        # `AgentServer.assign` can raise is checked before it ever creates
+        # an AgentAssignment or touches git/worktree state (coord/agent.py)
+        # — so a retry can never double-spawn a worker or leak a worktree.
+        # An unrelated 400 (e.g. a bad repo_path) just fails identically on
+        # the retry too, and that message is what the caller ultimately
+        # sees via _reraise_with_body below.
+        from coord.providers import provider_def_to_wire  # noqa: PLC0415
+
+        definition = config.providers.definitions[effective_provider_name]
+        retry_payload = dict(payload, provider_def=provider_def_to_wire(definition))
+        resp = httpx.post(url, json=retry_payload, timeout=15)
+
     try:
         resp.raise_for_status()
     except httpx.HTTPStatusError as e:

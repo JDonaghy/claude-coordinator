@@ -207,23 +207,45 @@ def build_provider_from_wire(name: str, wire_def: "dict[str, Any]") -> Provider:
             :func:`provider_def_to_wire` for its shape.
 
     Raises:
-        ValueError: *wire_def* is malformed (not a dict, or missing/empty
-            ``"type"``), or names an unknown provider type — the latter
-            mirrors :func:`build_provider`'s own error for that case.
+        ValueError: *wire_def* is malformed in any way this function can
+            detect — not a dict, missing/empty ``"type"``, an ``"env"``/
+            ``"extra_args"`` whose shape can't be coerced to a dict/list
+            (e.g. a string or int — raises :class:`TypeError` from the
+            plain ``dict()``/``list()`` calls below, caught and re-raised
+            as :class:`ValueError` here) — or *wire_def* names an unknown
+            provider type — the last case mirrors :func:`build_provider`'s
+            own error for that case. Every case is a :class:`ValueError` so
+            :meth:`coord.agent.AgentServer._resolve_provider` (this
+            function's only caller) can turn ANY malformed wire payload
+            into a clean refused-assignment 400 rather than an uncaught 500
+            — the whole point of #1796 is "never silently misbehave", and a
+            raw 500 from a coordinator-generated (trusted) but malformed
+            payload would be exactly that for the operator watching it fail.
     """
     if not isinstance(wire_def, dict) or not wire_def.get("type"):
         raise ValueError(
             f"malformed provider_def for provider {name!r}: expected a dict "
             f"with a non-empty 'type' key, got {wire_def!r}"
         )
-    definition = ProviderDef(
-        type=wire_def["type"],
-        binary=wire_def.get("binary"),
-        model=wire_def.get("model"),
-        attach_url=wire_def.get("attach_url"),
-        env=dict(wire_def.get("env") or {}),
-        extra_args=list(wire_def.get("extra_args") or []),
-    )
+    try:
+        definition = ProviderDef(
+            type=wire_def["type"],
+            binary=wire_def.get("binary"),
+            model=wire_def.get("model"),
+            attach_url=wire_def.get("attach_url"),
+            env=dict(wire_def.get("env") or {}),
+            extra_args=list(wire_def.get("extra_args") or []),
+        )
+    except (TypeError, ValueError) as e:
+        # #1796 review (non-blocking): a wire "env" that isn't dict-shaped
+        # (e.g. a string or int) or an "extra_args" that isn't list-shaped
+        # raises TypeError from dict()/list() above, not ValueError — catch
+        # both here so every malformed shape becomes the same clean refusal
+        # instead of a handful of them propagating as an uncaught 500 out of
+        # AgentServer.assign() (agent_app.py only catches ValueError).
+        raise ValueError(
+            f"malformed provider_def for provider {name!r}: {e}"
+        ) from e
     return build_provider(name, definition, models_cfg=None)
 
 

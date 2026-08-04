@@ -4998,7 +4998,10 @@ class AgentServer:
            cannot be honoured must be refused, never silently substituted.
            Every caller of this method is expected to let the ValueError
            propagate as a refused assignment (``assign()``'s HTTP handler
-           turns it into a 400), not swallow it.
+           turns it into a 400), not swallow it — that ``except ValueError``
+           handler in ``agent_app.py``'s ``assign`` route already existed
+           before #1796 (e.g. for the #425/#437 capability gates below);
+           this method just reuses it, it doesn't add it.
 
         Returns:
             ``None`` for the legacy no-provider case, otherwise a
