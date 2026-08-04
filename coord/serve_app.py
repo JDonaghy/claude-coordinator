@@ -3075,6 +3075,11 @@ def _openapi_spec() -> dict:
                                         "generated_at": {"type": "number"},
                                         "window": {"type": "array", "items": {"type": "number"}},
                                         "columns": {"type": "array", "items": {"type": "string"}},
+                                        "column_meta": {
+                                            "type": "array",
+                                            "items": {"type": "object"},
+                                            "description": "#1760: additive display metadata, one entry per `columns` entry, same order. A client that ignores it gets byte-identical columns/rows.",
+                                        },
                                         "rows": {"type": "array", "items": {"type": "object"}},
                                         "notes": {"type": "array", "items": {"type": "string"}},
                                     },

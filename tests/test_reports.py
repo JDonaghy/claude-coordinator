@@ -34,6 +34,7 @@ from coord.reports import (
     ReportError,
     UnknownReportError,
     catalogue,
+    detect_prior_activity,
     fetch_audit_window,
     fold_issue_activity,
     parse_duration,
@@ -215,6 +216,101 @@ class TestFoldIssueActivity:
         assert any("carry no repo/issue" in n for n in result.notes)
         assert any("2 event(s)" in n for n in result.notes)
 
+    def test_counts_partial_defaults_to_false(self) -> None:
+        """Regression guard: with the default empty ``prior_activity``, every
+        row carries the new ``counts_partial`` key (additive) but it is
+        always False — behaviour is unchanged from before #1760."""
+        row = fold_issue_activity(
+            [_ev(10, "dispatch", "dispatched", details={"type": "work"})], WINDOW
+        ).rows[0]
+        assert row["counts_partial"] is False
+
+
+class TestPriorActivity:
+    """#1760: the caller-supplied ``prior_activity`` set is the fold's only
+    way to learn about events outside its own window.  These mirror the
+    issue's own reproduction — claude-coordinator#1629, where the original
+    dispatch predates the window but a fix-1 dispatch (and its review cycle)
+    falls inside it."""
+
+    def test_prior_activity_issue_reports_no_start_and_partial_counts(self) -> None:
+        """Acceptance criterion #1 verbatim: an in-window work dispatch is
+        present, but prior_activity says the issue really started earlier —
+        the row must not claim that in-window dispatch as the start."""
+        entries = [
+            _ev(100, "dispatch", "dispatched", repo="claude-coordinator", issue=1629,
+                details={"type": "work"}),
+            _ev(110, "review", "review_approve", repo="claude-coordinator", issue=1629),
+        ]
+        result = fold_issue_activity(
+            entries, WINDOW, prior_activity=frozenset({("claude-coordinator", 1629)})
+        )
+        row = result.rows[0]
+        assert row["started_at"] is None
+        assert row["started_before_window"] is True
+        assert row["counts_partial"] is True
+
+    def test_empty_prior_activity_is_a_no_op(self) -> None:
+        """Acceptance criterion #2: same entries, empty prior_activity (the
+        default) — behaviour is exactly what it was before #1760."""
+        entries = [
+            _ev(100, "dispatch", "dispatched", repo="claude-coordinator", issue=1629,
+                details={"type": "work"}),
+            _ev(110, "review", "review_approve", repo="claude-coordinator", issue=1629),
+        ]
+        row = fold_issue_activity(entries, WINDOW).rows[0]
+        assert row["started_at"] == T0 + 100
+        assert row["started_before_window"] is False
+        assert row["counts_partial"] is False
+
+    def test_every_in_window_dispatch_is_a_fix_when_prior_activity_is_known(self) -> None:
+        """Acceptance criterion #3: with prior_activity set, ONE in-window
+        work dispatch is already a re-dispatch (fix_iterations == 1), not
+        the "first dispatch" that the no-prior-activity fold would treat it
+        as (which would report fix_iterations == 0)."""
+        entries = [
+            _ev(100, "dispatch", "dispatched", details={"type": "work"}),
+        ]
+        row = fold_issue_activity(
+            entries, WINDOW, prior_activity=frozenset({("api", 1)})
+        ).rows[0]
+        assert row["fix_iterations"] == 1
+
+    def test_multiple_in_window_dispatches_all_count_as_fixes(self) -> None:
+        entries = [
+            _ev(100, "dispatch", "dispatched", details={"type": "work"}),
+            _ev(200, "dispatch", "dispatched", details={"type": "work"}),
+            _ev(300, "dispatch", "dispatched", details={"type": "work"}),
+        ]
+        row = fold_issue_activity(
+            entries, WINDOW, prior_activity=frozenset({("api", 1)})
+        ).rows[0]
+        assert row["fix_iterations"] == 3
+
+    def test_prior_activity_overrides_an_in_window_drive_started_too(self) -> None:
+        """Prior activity must win even when the window DOES contain a
+        drive_started event — the design says "regardless of whether an
+        in-window dispatch exists"."""
+        entries = [_ev(50, "drive", "drive_started")]
+        row = fold_issue_activity(
+            entries, WINDOW, prior_activity=frozenset({("api", 1)})
+        ).rows[0]
+        assert row["started_at"] is None
+        assert row["started_before_window"] is True
+
+    def test_prior_activity_only_applies_to_the_matching_issue(self) -> None:
+        entries = [
+            _ev(100, "dispatch", "dispatched", issue=1, details={"type": "work"}),
+            _ev(100, "dispatch", "dispatched", issue=2, details={"type": "work"}),
+        ]
+        result = fold_issue_activity(
+            entries, WINDOW, prior_activity=frozenset({("api", 1)})
+        )
+        by_issue = {r["issue"]: r for r in result.rows}
+        assert by_issue[1]["counts_partial"] is True
+        assert by_issue[2]["counts_partial"] is False
+        assert by_issue[2]["started_at"] == T0 + 100
+
 
 class TestOutcome:
     def test_merged(self) -> None:
@@ -302,6 +398,61 @@ class TestNotes:
         assert result.notes
         assert result.notes[0].startswith("TRUNCATED:")
 
+    def test_counts_partial_row_gets_a_lower_bound_note_naming_the_issue(self) -> None:
+        """Acceptance criterion: every row with counts_partial produces a
+        notes entry naming the issue and stating the counts are lower
+        bounds."""
+        entries = [
+            _ev(100, "dispatch", "dispatched", repo="claude-coordinator", issue=1629,
+                details={"type": "work"}),
+        ]
+        result = fold_issue_activity(
+            entries, WINDOW, prior_activity=frozenset({("claude-coordinator", 1629)})
+        )
+        note = next(n for n in result.notes if "claude-coordinator#1629" in n)
+        assert "lower bound" in note.lower()
+
+    def test_request_changes_with_zero_fix_iterations_is_a_contradiction(self) -> None:
+        """Acceptance criterion: a request-changes review verdict with
+        fix_iterations == 0 and counts_partial False is not reachable in a
+        correct fold — flag it rather than print it deadpan."""
+        entries = [
+            _ev(10, "review", "review_request-changes"),
+        ]
+        result = fold_issue_activity(entries, WINDOW)
+        row = result.rows[0]
+        assert row["fix_iterations"] == 0
+        assert row["counts_partial"] is False
+        note = next(n for n in result.notes if "api#1" in n)
+        assert "inconsistent" in note or "should not happen" in note
+
+    def test_request_changes_with_zero_fix_iterations_is_not_contradiction_when_partial(
+        self,
+    ) -> None:
+        """The same shape is expected (not an error) when counts_partial is
+        True — a review from before the window's known start doesn't
+        contradict a fix count the row already admits is a lower bound."""
+        entries = [
+            _ev(10, "review", "review_request-changes"),
+        ]
+        result = fold_issue_activity(
+            entries, WINDOW, prior_activity=frozenset({("api", 1)})
+        )
+        assert not any(
+            "inconsistent" in n or "should not happen" in n for n in result.notes
+        )
+
+    def test_request_changes_with_a_real_fix_iteration_is_not_flagged(self) -> None:
+        entries = [
+            _ev(10, "dispatch", "dispatched", details={"type": "work"}),
+            _ev(20, "review", "review_request-changes"),
+            _ev(30, "dispatch", "dispatched", details={"type": "work"}),
+        ]
+        result = fold_issue_activity(entries, WINDOW)
+        assert not any(
+            "inconsistent" in n or "should not happen" in n for n in result.notes
+        )
+
 
 # ── pagination ─────────────────────────────────────────────────────────────
 
@@ -387,6 +538,85 @@ class TestPagination:
             since="13h", now=WINDOW[1], fetch=source, title_lookup=lambda keys: {}
         )
         assert any(n.startswith("TRUNCATED:") for n in result.notes)
+
+
+# ── prior-activity look-back (#1760) ────────────────────────────────────────
+
+
+class _CountingIssueSource:
+    """A fake audit source keyed by ``(repo, issue)`` — records every call so
+    a test can assert the look-back issues exactly one query per issue, not
+    one per event and not an unbounded scan."""
+
+    def __init__(self, entries: list[dict]):
+        self.entries = entries
+        self.calls: list[dict] = []
+
+    def __call__(self, **kwargs):
+        self.calls.append(kwargs)
+        repo = kwargs.get("repo")
+        issue = kwargs.get("issue")
+        until = kwargs.get("until")
+        limit = kwargs.get("limit") or 500
+        matches = [
+            e
+            for e in self.entries
+            if e.get("repo") == repo
+            and e.get("issue") == issue
+            and (until is None or float(e["ts"]) <= until)
+        ]
+        matches.sort(key=lambda e: (-float(e["ts"]), -int(e["id"])))
+        return {
+            "entries": matches[:limit],
+            "has_more": len(matches) > limit,
+            "next_cursor": None,
+        }
+
+
+class TestDetectPriorActivity:
+    def test_one_query_per_issue_not_per_event(self) -> None:
+        # Four issues in the result set (the issue's own "4 issues for a 13h
+        # window" example) — the look-back must not touch each issue's
+        # events one at a time.
+        prior_entries = [
+            _ev(-100, "dispatch", "dispatched", issue=1, entry_id=901, details={"type": "work"}),
+            _ev(-90, "dispatch", "dispatched", issue=1, entry_id=902, details={"type": "work"}),
+            _ev(-50, "dispatch", "dispatched", issue=2, entry_id=903, details={"type": "work"}),
+        ]
+        source = _CountingIssueSource(prior_entries)
+        keys = [("api", 1), ("api", 2), ("api", 3), ("api", 4)]
+
+        result = detect_prior_activity(keys, until=T0, fetch=source)
+
+        assert len(source.calls) == 4
+        assert result == frozenset({("api", 1), ("api", 2)})
+
+    def test_no_prior_activity_is_empty(self) -> None:
+        source = _CountingIssueSource([])
+        assert detect_prior_activity([("api", 1)], until=T0, fetch=source) == frozenset()
+        assert len(source.calls) == 1
+
+    def test_duplicate_keys_still_issue_one_query_each(self) -> None:
+        source = _CountingIssueSource([])
+        detect_prior_activity([("api", 1), ("api", 1), ("api", 2)], until=T0, fetch=source)
+        assert len(source.calls) == 2
+
+    def test_query_is_bounded_at_the_window_start_with_limit_one(self) -> None:
+        source = _CountingIssueSource([])
+        detect_prior_activity([("api", 1)], until=T0, fetch=source)
+        call = source.calls[0]
+        assert call["until"] == T0
+        assert call["limit"] == 1
+        assert call["repo"] == "api"
+        assert call["issue"] == 1
+
+    def test_events_after_the_window_start_do_not_count_as_prior(self) -> None:
+        source = _CountingIssueSource(
+            [_ev(50, "dispatch", "dispatched", issue=1, details={"type": "work"})]
+        )
+        # The only event for issue 1 is AFTER `until` (T0), so it must not
+        # register as prior activity.
+        assert detect_prior_activity([("api", 1)], until=T0, fetch=source) == frozenset()
 
 
 # ── registry + parameter validation ────────────────────────────────────────
@@ -480,6 +710,41 @@ def _seed_known_good_window(coord_db) -> None:
     record_audit(tier="business", category="merge", event_type="merged", actor="coordinator", summary="m", repo="api", issue=1631, ts=base + 500 + 13 * 60)
 
 
+def _seed_started_before_window_case(coord_db) -> None:
+    """#1760's own reproduction, shrunk to its essential shape.
+
+    #1629: the original dispatch lands at ``T0 - 3600`` — outside a 13h
+    window (whose start IS ``T0``) but inside a 20h window (whose start is
+    ``T0 - 25200``). The request-changes review, the fix-1 dispatch, its
+    test and its approve review are all inside BOTH windows — mirroring the
+    live case where only the original dispatch predates the window, not the
+    whole review cycle around it.
+
+    #1729 is the control: its entire history is inside both windows.
+
+    #1631 is the already-covered "driver exited 1 but merged anyway"
+    anomaly — reseeded here (independent DB per test) to assert it keeps
+    firing in both windows once #1629's row stops being self-contradictory.
+    """
+    base = T0
+    # #1629 — original dispatch OUTSIDE the 13h window, inside the 20h one.
+    record_audit(tier="business", category="dispatch", event_type="dispatched", actor="drive", summary="d", repo="api", issue=1629, machine="precision", details={"type": "work"}, ts=base - 3600)
+    record_audit(tier="business", category="review", event_type="review_request-changes", actor="reviewer", summary="r", repo="api", issue=1629, ts=base + 10)
+    record_audit(tier="business", category="dispatch", event_type="dispatched", actor="drive", summary="d", repo="api", issue=1629, machine="precision", details={"type": "work"}, ts=base + 100)
+    record_audit(tier="business", category="test", event_type="test_passed", actor="drive", summary="t", repo="api", issue=1629, ts=base + 110)
+    record_audit(tier="business", category="review", event_type="review_approve", actor="reviewer", summary="r", repo="api", issue=1629, ts=base + 120)
+    # #1729 — control: entirely in-window in both cases.
+    record_audit(tier="business", category="dispatch", event_type="dispatched", actor="drive", summary="d", repo="api", issue=1729, machine="precision", details={"type": "work"}, ts=base + 200)
+    record_audit(tier="business", category="review", event_type="review_request-changes", actor="reviewer", summary="r", repo="api", issue=1729, ts=base + 210)
+    record_audit(tier="business", category="dispatch", event_type="dispatched", actor="drive", summary="d", repo="api", issue=1729, machine="precision", details={"type": "work"}, ts=base + 220)
+    record_audit(tier="business", category="test", event_type="test_passed", actor="drive", summary="t", repo="api", issue=1729, ts=base + 230)
+    record_audit(tier="business", category="review", event_type="review_approve", actor="reviewer", summary="r", repo="api", issue=1729, ts=base + 240)
+    # #1631 — driver gave up, merge landed anyway; must fire in both windows.
+    record_audit(tier="business", category="dispatch", event_type="dispatched", actor="drive", summary="d", repo="api", issue=1631, machine="dellserver", details={"type": "work"}, ts=base + 400)
+    record_audit(tier="business", category="drive", event_type="drive_exited", actor="drive", summary="x", repo="api", issue=1631, details={"exit_code": 1, "reason": "merge attempted 3 times without landing"}, ts=base + 500)
+    record_audit(tier="business", category="merge", event_type="merged", actor="coordinator", summary="m", repo="api", issue=1631, ts=base + 500 + 13 * 60)
+
+
 @pytest.fixture(autouse=True)
 def _frozen_now(monkeypatch):
     """Freeze the report engine's clock at the known-good window end so
@@ -514,7 +779,8 @@ class TestCli:
         assert result.exit_code == 0, result.output
         body = json.loads(result.output)
         assert set(body) == {
-            "report_id", "generated_at", "window", "columns", "rows", "notes"
+            "report_id", "generated_at", "window", "columns", "column_meta",
+            "rows", "notes",
         }
         assert body["report_id"] == "issue-activity"
         assert body["window"] == [WINDOW[1] - 13 * 3600, WINDOW[1]]
@@ -548,6 +814,80 @@ class TestCli:
         assert "merged" in result.output
         assert "notes" in result.output
         assert "request-changes,approve" in result.output
+
+    def test_started_before_window_across_two_windows_agrees_with_itself(
+        self, coord_db
+    ) -> None:
+        """Live acceptance criterion: at since=13h, #1629's row must no
+        longer claim a start it can't support — no start time, at least one
+        fix iteration, and a lower-bound note naming it.  At since=20h it is
+        a complete row with no such note.  #1729 (the control) and #1631
+        (the drive-exit-but-merged anomaly) are unaffected in both."""
+        _seed_started_before_window_case(coord_db)
+
+        result_13h = json.loads(
+            CliRunner()
+            .invoke(main, ["report", "run", "issue-activity", "--param", "since=13h", "--json"])
+            .output
+        )
+        result_20h = json.loads(
+            CliRunner()
+            .invoke(main, ["report", "run", "issue-activity", "--param", "since=20h", "--json"])
+            .output
+        )
+
+        row_13h = next(r for r in result_13h["rows"] if r["issue"] == 1629)
+        assert row_13h["started_at"] is None
+        assert row_13h["started_before_window"] is True
+        assert row_13h["fix_iterations"] == 1
+        assert row_13h["counts_partial"] is True
+        note_13h = next(n for n in result_13h["notes"] if "api#1629" in n)
+        assert "lower bound" in note_13h.lower()
+
+        row_20h = next(r for r in result_20h["rows"] if r["issue"] == 1629)
+        assert row_20h["started_at"] == T0 - 3600
+        assert row_20h["started_before_window"] is False
+        assert row_20h["fix_iterations"] == 1
+        assert row_20h["counts_partial"] is False
+        assert not any("api#1629" in n for n in result_20h["notes"])
+
+        # #1729 (control) — unaffected in both windows.
+        for result in (result_13h, result_20h):
+            row_1729 = next(r for r in result["rows"] if r["issue"] == 1729)
+            assert row_1729["started_before_window"] is False
+            assert row_1729["fix_iterations"] == 1
+            assert row_1729["counts_partial"] is False
+            assert not any("api#1729" in n for n in result["notes"])
+
+        # #1631's driver-exit-but-merged anomaly must still fire in both.
+        for result in (result_13h, result_20h):
+            assert any("1631" in n and "exit_code=1" in n for n in result["notes"])
+
+    def test_column_meta_is_present_and_matches_columns(self, coord_db) -> None:
+        _seed_known_good_window(coord_db)
+        result = CliRunner().invoke(
+            main, ["report", "run", "issue-activity", "--param", "since=13h", "--json"]
+        )
+        assert result.exit_code == 0, result.output
+        body = json.loads(result.output)
+
+        assert [m["id"] for m in body["column_meta"]] == body["columns"]
+
+        meta_by_id = {m["id"]: m for m in body["column_meta"]}
+        assert meta_by_id["started_at"]["kind"] == "timestamp"
+        assert meta_by_id["merged_at"]["kind"] == "timestamp"
+        assert meta_by_id["machines"]["kind"] == "list"
+        assert meta_by_id["test_verdicts"]["kind"] == "list"
+        assert meta_by_id["review_verdicts"]["kind"] == "list"
+        assert meta_by_id["fix_iterations"]["kind"] == "int"
+        assert meta_by_id["fix_iterations"]["align"] == "right"
+        assert meta_by_id["title"]["weight"] > meta_by_id["issue"]["weight"]
+
+        # Row values are unchanged: started_at is still an epoch float,
+        # machines still a list — presentation moved, data did not.
+        row = next(r for r in body["rows"] if r["issue"] == 1629)
+        assert isinstance(row["started_at"], float)
+        assert isinstance(row["machines"], list)
 
     def test_report_run_empty_window(self, coord_db) -> None:
         result = CliRunner().invoke(
@@ -692,6 +1032,31 @@ class TestDaemonEndpoints:
         assert body["report_id"] == "issue-activity"
         assert {r["issue"] for r in body["rows"]} == {1629, 1631, 1728, 1729}
         assert any("1631" in n for n in body["notes"])
+        # #1760: additive display metadata, one entry per `columns` entry.
+        assert [m["id"] for m in body["column_meta"]] == body["columns"]
+
+    def test_column_meta_is_additive_columns_and_rows_are_unchanged(
+        self, report_client: TestClient, rw_db
+    ) -> None:
+        """#1760 acceptance: a client that ignores `column_meta` entirely
+        gets the v0.4.100 `columns`/`rows` shape byte-for-byte — `columns`
+        stays a plain `list[str]`, and existing row keys keep their values."""
+        _seed_known_good_window(rw_db)
+        resp = report_client.get("/report/issue-activity", params={"since": "13h"})
+        body = resp.json()
+
+        assert body["columns"] == [
+            "repo", "issue", "title", "started_at", "machines",
+            "fix_iterations", "test_verdicts", "review_verdicts",
+            "merged_at", "drive_exit", "outcome",
+        ]
+        assert all(isinstance(c, str) for c in body["columns"])
+
+        by_issue = {r["issue"]: r for r in body["rows"]}
+        assert by_issue[1629]["started_at"] == WINDOW[0] + 100
+        assert by_issue[1629]["fix_iterations"] == 1
+        assert by_issue[1629]["review_verdicts"] == ["request-changes", "approve"]
+        assert by_issue[1728]["fix_iterations"] == 0
 
     def test_endpoint_and_cli_agree_byte_for_byte_on_the_same_window(
         self, report_client: TestClient, rw_db
@@ -835,3 +1200,58 @@ def test_report_seam_routes_to_the_daemon_when_board_service_is_set(monkeypatch)
     assert calls["catalogue_url"] == "http://d:7435"
     assert calls["report_id"] == "issue-activity"
     assert calls["params"] == {"since": "13h"}
+
+
+# ── CLI human-table rendering from column_meta (#1760) ─────────────────────
+
+
+class TestFormatCell:
+    """``<window`` means "started_before_window" — it belongs to
+    ``started_at`` alone.  A regression caught while smoke-testing #1760's
+    own fix: generalising the ``<window`` marker to every ``kind:
+    "timestamp"`` column made an unmerged, started-before-window issue's
+    empty ``merged_at`` also render as ``<window``, which reads as "this
+    merge happened before the window" — false."""
+
+    def test_window_marker_is_scoped_to_started_at(self) -> None:
+        from coord.commands.report import _format_cell
+
+        row = {
+            "started_at": None,
+            "started_before_window": True,
+            "merged_at": None,
+        }
+        started_meta = {"id": "started_at", "kind": "timestamp"}
+        merged_meta = {"id": "merged_at", "kind": "timestamp"}
+
+        assert _format_cell("started_at", row, started_meta) == "<window"
+        assert _format_cell("merged_at", row, merged_meta) == "-"
+
+    def test_render_table_never_prints_window_marker_for_merged_at(self) -> None:
+        from coord.commands.report import _render_table
+        from coord.reports import ISSUE_ACTIVITY_COLUMN_META, ISSUE_ACTIVITY_COLUMNS
+
+        result = {
+            "columns": ISSUE_ACTIVITY_COLUMNS,
+            "column_meta": [m.to_dict() for m in ISSUE_ACTIVITY_COLUMN_META],
+            "rows": [
+                {
+                    "repo": "api",
+                    "issue": 1629,
+                    "title": None,
+                    "started_at": None,
+                    "started_before_window": True,
+                    "machines": ["precision"],
+                    "fix_iterations": 1,
+                    "counts_partial": True,
+                    "test_verdicts": [],
+                    "review_verdicts": ["request-changes", "approve"],
+                    "merged_at": None,
+                    "drive_exit": None,
+                    "outcome": "stalled",
+                }
+            ],
+        }
+        lines = _render_table(result)
+        data_line = lines[1]
+        assert data_line.count("<window") == 1
