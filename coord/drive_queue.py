@@ -12,7 +12,9 @@ reason that module's docstring gives: *"every bug the bash version shipped was
 in the decision half, which is why that half is where the tests are."*  Nothing
 in this file runs a subprocess, opens a socket, touches the DB, or reads the
 clock.  ``coord/commands/drive_queue.py`` is the thin I/O shell that fetches,
-calls :func:`plan_tick`, and executes what comes back.
+calls :func:`plan_tick`, and executes what comes back.  #1794 needs wall-clock
+age, so the clock is *passed in* (``plan_tick(..., now=time.time())``) rather
+than read here — the rule is "no ambient state", not "no time".
 
 TWO RULES THIS FILE EXISTS TO ENFORCE, both learned the hard way:
 
@@ -98,6 +100,43 @@ RESUME_PROBE_TIMEOUT_SECONDS = 5.0
 # — a deferral (pre-req not satisfied yet) never touches it, and neither does
 # an unsatisfiable pre-req.
 DEFAULT_MAX_ATTEMPTS = 2
+
+# ── the startup grace window (#1794) ─────────────────────────────────────────
+#
+# A drive is NOT established the instant `coord drive --tmux` exits 0.  #1606's
+# verification proves a tmux session exists and its run log has been written
+# to; it does NOT prove the drive has registered anywhere the tick can see it.
+# Between the launch and the first dispatch there is a window in which the
+# entry has:
+#
+#   * no live session in `board.live_sessions` — that snapshot is a
+#     `tmux list-sessions` reading, and `list_drive_sessions()` returns `[]`
+#     for "tmux unavailable" / "no server running" / "the call timed out"
+#     exactly as it does for "no sessions", so one bad reading makes EVERY
+#     running entry look dead at once;
+#   * no `active_work` on the board — the drive has not dispatched yet.
+#
+# Before #1794 that fell straight through `_reconcile_running`'s four branches
+# to `retry`: on 2026-08-03 a tick 40s after a launch declared a healthy drive
+# dead, spent an attempt, and launched a SECOND `coord drive` for the same
+# issue.  The two ticks were 40s apart because `docs/DRIVE_QUEUE.md` §2's
+# install sequence is `systemctl --user enable --now …timer` immediately
+# followed by a verification `systemctl --user start …service` — i.e. the
+# documented install reliably produces the back-to-back ticks that trigger it.
+#
+# So an entry launched within this window is `starting`, not dead: it OCCUPIES
+# capacity and is never a retry candidate.  The measured startup on a loaded
+# dellserver was ~2 minutes (19:13:09 launch → 19:15:22 `drive loop started`),
+# and this is 5 — deliberately >2x that, and still well under the timer's
+# 15-minute cadence so a genuinely dead drive is only ever delayed by ONE
+# interval before the retry path sees it.
+#
+# The window is also applied to the LAUNCH decision (see `_startup_cooldown`),
+# so no code path in the tick — not a retry, not a hand-edited row — can start
+# a second `coord drive` for an issue whose last launch is this recent.
+# `coord drive`'s per-issue flock stays the last line of defence; the queue no
+# longer relies on it.
+DRIVE_STARTUP_GRACE_SECONDS = 300.0
 
 # ── the queue-level alert's synthetic escalation key ─────────────────────────
 #
@@ -409,10 +448,24 @@ def build_board_view(
 
 @dataclass(frozen=True)
 class Reconcile:
-    """The resolved outcome for one ``running`` entry."""
+    """The resolved outcome for one ``running`` entry.
+
+    ``outcome`` is one of:
+
+    * ``alive``     — a live ``coord-drive-*`` tmux session.  Occupies.
+    * ``starting``  — launched inside :data:`DRIVE_STARTUP_GRACE_SECONDS` and
+      not yet visible anywhere else (#1794).  Occupies; never a death.
+    * ``held``      — session gone but work still ACTIVE on the board (the
+      #1660 observer-deadline case).  Occupies; never a death.
+    * ``done``      — merged, or the issue closed.
+    * ``retry``     — genuinely dead: no session, no active work, and past the
+      startup grace window.  Costs one attempt.
+    * ``exhausted`` — as ``retry``, but out of attempts; pairs with a
+      :class:`Blocked`.
+    """
 
     key: str
-    outcome: str  # alive | held | done | retry | exhausted
+    outcome: str  # alive | starting | held | done | retry | exhausted
     reason: str
     occupies: bool = False
     updates: Mapping[str, Any] = field(default_factory=dict)
@@ -685,17 +738,67 @@ def _resolve_prereqs(
 # ── reconciliation ───────────────────────────────────────────────────────────
 
 
+def _startup_age(entry: QueueEntry, now: float | None) -> float | None:
+    """Seconds since *entry*'s drive was launched, or ``None`` when unknowable.
+
+    ``None`` — meaning "no startup grace applies" — for three distinct cases,
+    all of which must degrade to the pre-#1794 behaviour rather than to an
+    entry that can never be retried:
+
+    * the caller passed no clock (``now is None``): a pure-logic caller that
+      does not care about the window, e.g. a test pinning pre-req resolution;
+    * the row has no ``launched_at``: a row written before DQ-1 shipped the
+      column, or one a human flipped to ``running`` by hand;
+    * the stamp is in the FUTURE (negative age): a clock that jumped backwards
+      must not be able to pin an entry inside the grace window indefinitely.
+    """
+    if now is None or entry.launched_at is None:
+        return None
+    age = now - entry.launched_at
+    return age if age >= 0.0 else None
+
+
+def _startup_cooldown(
+    entry: QueueEntry, now: float | None, grace_seconds: float
+) -> float | None:
+    """The entry's age when it is still inside the startup window, else ``None``.
+
+    The age is returned (rather than a bare bool) so every caller can put the
+    real number in its reason string — a journal line that says "launched 41s
+    ago" is diagnosable; one that says "still starting" is not.
+    """
+    age = _startup_age(entry, now)
+    if age is None or age >= grace_seconds:
+        return None
+    return age
+
+
 def _reconcile_running(
-    entry: QueueEntry, board: BoardView, max_attempts: int
+    entry: QueueEntry,
+    board: BoardView,
+    max_attempts: int,
+    *,
+    now: float | None = None,
+    grace_seconds: float = DRIVE_STARTUP_GRACE_SECONDS,
 ) -> tuple[Reconcile, Blocked | None]:
     """Resolve one ``running`` entry against the board.
 
-    The ``held`` branch is rule 1 from this module's docstring and the reason
-    capacity is not a session count: ``coord drive`` exits ``EXIT_DEADLINE``
-    (3) when the observer's budget runs out, but the worker/test/review it was
-    watching keep running on the fleet (#1660).  Such an entry has no tmux
-    session and no merge yet — counting it as free is exactly the 2026-08-01
-    incident, where five expired drives were each stacked on top of.
+    The branch ORDER is the contract; each non-death branch exists because a
+    real incident proved the fall-through to ``retry`` was wrong:
+
+    * ``held`` is rule 1 from this module's docstring and the reason capacity
+      is not a session count: ``coord drive`` exits ``EXIT_DEADLINE`` (3) when
+      the observer's budget runs out, but the worker/test/review it was
+      watching keep running on the fleet (#1660).  Such an entry has no tmux
+      session and no merge yet — counting it as free is exactly the 2026-08-01
+      incident, where five expired drives were each stacked on top of.
+    * ``starting`` is #1794: a drive that has been launched but has not yet
+      registered a session reading OR put work on the board is not dead, it is
+      young.  See :data:`DRIVE_STARTUP_GRACE_SECONDS`.
+
+    ``retry`` is therefore reachable only when the session is absent, no work
+    is active, nothing landed, AND the launch is older than the grace window —
+    i.e. when death is the only remaining explanation.
     """
     facts = board.facts(entry.key)
 
@@ -737,12 +840,42 @@ def _reconcile_running(
             None,
         )
 
+    age = _startup_cooldown(entry, now, grace_seconds)
+    if age is not None:
+        # #1794.  Launched, but not yet visible as a session and not yet
+        # visible as work.  A tick that fires inside this window sees exactly
+        # what a dead drive looks like, so it must not be allowed to conclude
+        # anything: the entry keeps its state, keeps its attempts, and keeps
+        # its slot.
+        reason = (
+            f"drive is still starting — launched {age:.0f}s ago, inside the "
+            f"{grace_seconds:.0f}s startup grace window (#1794); "
+            f"not a death, still occupying a machine"
+        )
+        return (
+            Reconcile(
+                entry.key,
+                "starting",
+                reason,
+                occupies=True,
+                updates={"last_reason": reason},
+            ),
+            None,
+        )
+
+    # Past the grace window (or with no launch stamp to measure), with no
+    # session, no active work and nothing landed: death is the only remaining
+    # explanation.  The age is quoted so a journal reader can tell a genuine
+    # death from a grace window that was set too short.
+    since = _startup_age(entry, now)
+    launched = f", launched {since:.0f}s ago" if since is not None else ""
+
     attempts = entry.attempts + 1
     if attempts < max_attempts:
         reason = (
-            f"drive session died without landing the work "
-            f"(attempt {attempts}/{max_attempts}) — requeued at position "
-            f"{entry.position}"
+            f"drive session died without landing the work"
+            f"{launched} (attempt {attempts}/{max_attempts}) — requeued at "
+            f"position {entry.position}"
         )
         return (
             Reconcile(
@@ -761,8 +894,8 @@ def _reconcile_running(
         )
 
     reason = (
-        f"drive session died without landing the work "
-        f"{attempts}/{max_attempts} times — giving up"
+        f"drive session died without landing the work"
+        f"{launched} {attempts}/{max_attempts} times — giving up"
     )
     return (
         Reconcile(entry.key, "exhausted", reason, occupies=False),
@@ -940,6 +1073,8 @@ def plan_tick(
     *,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     probes: Mapping[str, ProbeResult] | None = None,
+    now: float | None = None,
+    grace_seconds: float = DRIVE_STARTUP_GRACE_SECONDS,
 ) -> TickPlan:
     """Decide one tick.  Pure; the caller executes the returned plan.
 
@@ -950,6 +1085,14 @@ def plan_tick(
     *probes* maps an entry key to the :class:`ProbeResult` the shell got from
     running that entry's ``resume_when`` (see :func:`pending_probe_targets`);
     an absent key simply means no probe ran.
+
+    *now* is the shell's ``time.time()``, passed in rather than read here (see
+    the module docstring).  It powers #1794's startup grace window on both
+    sides of the tick: a recently-launched entry never reconciles to ``retry``
+    (:func:`_reconcile_running`), and no entry is relaunched while its last
+    launch is still that recent (step 4 below).  ``None`` disables the window
+    entirely, which is the pre-#1794 behaviour — the production shell always
+    passes a real clock.
 
     The algorithm, from #1754, plus #1757's step 2:
 
@@ -963,10 +1106,11 @@ def plan_tick(
     3. ``free = capacity - occupied``; ``<= 0`` returns with no launch and no
        alert — being at capacity is the queue working, not a problem to
        report.
-    4. Walk ``waiting`` by ``position``, FIRST ELIGIBLE WINS: unsatisfiable
-       blocks and escalates, unsatisfied defers (position unchanged), the
-       first eligible entry is the launch.  Everything after the launch is
-       walked in REPORT-ONLY mode (``Deferral.counted=False``, no updates) so
+    4. Walk ``waiting`` by ``position``, FIRST ELIGIBLE WINS: an entry still
+       inside its startup grace window defers (#1794), unsatisfiable blocks
+       and escalates, unsatisfied defers (position unchanged), the first
+       eligible entry is the launch.  Everything after the launch is walked in
+       REPORT-ONLY mode (``Deferral.counted=False``, no updates) so
        ``--dry-run`` can explain the rest of the queue.
     5. No launch with at least one waiting entry ⇒ exactly ONE queue-level
        alert.
@@ -977,6 +1121,14 @@ def plan_tick(
     gate RELEASED in step 2 likewise falls straight through into step 4, so a
     probe that starts passing launches in the same tick rather than costing
     the queue a whole interval.
+
+    #1794 puts one bound on that same-tick relaunch, and it is the reason the
+    grace window is checked TWICE.  Step 1 can only produce a ``retry`` for an
+    entry whose launch is older than *grace_seconds*, so the relaunch is only
+    ever of a drive the tick is confident is gone; and step 4 refuses the
+    launch outright for anything launched more recently, whatever put it back
+    in ``waiting``.  Between them, no single tick can start a second ``coord
+    drive`` for an issue whose first one may still be coming up.
     """
     ordered = sorted(entries, key=lambda e: (e.position, e.key))
     states: dict[str, str] = {e.key: e.state for e in ordered}
@@ -990,7 +1142,9 @@ def plan_tick(
     for entry in ordered:
         if entry.state != STATE_RUNNING:
             continue
-        reconcile, block = _reconcile_running(entry, board, max_attempts)
+        reconcile, block = _reconcile_running(
+            entry, board, max_attempts, now=now, grace_seconds=grace_seconds
+        )
         reconciles.append(reconcile)
         if reconcile.occupies:
             occupied += 1
@@ -1042,6 +1196,25 @@ def plan_tick(
         for key in cycle:
             cycle_keys[key] = message
 
+    def _cooldown_reason(candidate: QueueEntry) -> str:
+        """#1794's launch-side guard: '' unless this entry was just launched.
+
+        A `waiting` row carrying a recent `launched_at` means SOMETHING put a
+        drive up for this issue moments ago — a retry decided on stale
+        evidence, a launch subprocess whose exit code lied, an operator's hand
+        edit.  Whatever it was, starting a second `coord drive` now is the
+        failure #1794 exists to prevent, so the entry defers and tries again
+        on the next tick, by which point the reconcile branches above have
+        real evidence to work with.
+        """
+        age = _startup_cooldown(candidate, now, grace_seconds)
+        if age is None:
+            return ""
+        return (
+            f"launched {age:.0f}s ago — inside the {grace_seconds:.0f}s startup "
+            f"grace window, so a second `coord drive` is refused (#1794)"
+        )
+
     launch: QueueEntry | None = None
     waiting = [e for e in ordered if states.get(e.key) == STATE_WAITING]
     for entry in waiting:
@@ -1050,11 +1223,28 @@ def plan_tick(
             # already won this tick, so nothing here is mutated (see
             # Deferral.counted) — this exists so `--dry-run` explains the rest
             # of the queue instead of going silent after the first line.
+            cooldown = _cooldown_reason(entry)
+            if cooldown:
+                deferrals.append(Deferral(entry.key, cooldown, counted=False))
+                continue
             verdict = _resolve_prereqs(entry, board, states, cycle_keys)
             if not verdict.satisfied:
                 deferrals.append(
                     Deferral(entry.key, verdict.reason, counted=False)
                 )
+            continue
+        cooldown = _cooldown_reason(entry)
+        if cooldown:
+            deferrals.append(
+                Deferral(
+                    entry.key,
+                    cooldown,
+                    updates={
+                        "deferrals": entry.deferrals + 1,
+                        "last_reason": cooldown,
+                    },
+                )
+            )
             continue
         verdict = _resolve_prereqs(entry, board, states, cycle_keys)
         if verdict.unsatisfiable:
@@ -1155,6 +1345,13 @@ def render_plan(plan: TickPlan, *, dry_run: bool = False) -> list[str]:
         lines.append(
             f"  no launch — HELD by the deploy gate on {plan.held.key} "
             f"(release with `coord drive-queue resume`)"
+        )
+    elif plan.capacity and plan.free_slots == 0:
+        # Naming the reason matters more here than anywhere else in this
+        # render: #1794 was diagnosed entirely from a journal, and "no launch"
+        # on its own is indistinguishable from a stalled queue.
+        lines.append(
+            f"  no launch — at capacity ({plan.occupied}/{plan.capacity} occupied)"
         )
     else:
         lines.append("  no launch")

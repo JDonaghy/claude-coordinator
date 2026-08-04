@@ -663,7 +663,9 @@ def drive_queue_tick(max_parallel: int, dry_run: bool, config_path: Path) -> Non
 
     Safe to run on any interval and from any machine that can reach the board
     daemon. A tick already in progress makes this a quiet no-op (exit 0) — a
-    slow tick must never stack.
+    slow tick must never stack, and two ticks seconds apart are safe: a drive
+    launched inside the startup grace window reconciles as `starting`
+    (occupying a slot, attempts untouched) rather than as a death (#1794).
     """
     from coord.filelock import FileLock, LockBusy, drive_queue_lock_path  # noqa: PLC0415
     from coord.state import list_drive_queue, update_drive_queue_entry  # noqa: PLC0415
@@ -714,7 +716,15 @@ def drive_queue_tick(max_parallel: int, dry_run: bool, config_path: Path) -> Non
             for target in pending:
                 probes[target.key] = _run_resume_probe(target)
 
-        plan = plan_tick(entries, board, max_parallel, probes=probes)
+        # #1794: the clock is the shell's to read, never `coord.drive_queue`'s.
+        # It powers the startup grace window on both sides of the tick — a
+        # drive launched seconds ago is `starting`, not dead, and cannot be
+        # relaunched — so a tick that fires immediately after another (which
+        # `docs/DRIVE_QUEUE.md` §2's install sequence reliably produces) sees
+        # a running entry rather than a phantom death.
+        plan = plan_tick(
+            entries, board, max_parallel, probes=probes, now=time.time()
+        )
 
         for line in render_plan(plan, dry_run=dry_run):
             click.echo(line)

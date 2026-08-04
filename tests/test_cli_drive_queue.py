@@ -20,6 +20,7 @@ CLI, so a broken flag, a bad render, or an unrouted write fails these tests.
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +29,11 @@ from click.testing import CliRunner
 
 from coord import state
 from coord.cli import main
-from coord.drive_queue import QUEUE_ALERT_ISSUE, QUEUE_ALERT_REPO
+from coord.drive_queue import (
+    DRIVE_STARTUP_GRACE_SECONDS,
+    QUEUE_ALERT_ISSUE,
+    QUEUE_ALERT_REPO,
+)
 
 REPO = "claude-coordinator"
 
@@ -437,6 +442,119 @@ def test_a_finished_drive_is_reconciled_done_and_frees_its_slot(
     assert result.exit_code == 0, result.output
     assert queued(1650)["state"] == "done"
     assert "1654" in " ".join(launches[0])
+
+
+# ── tick: the startup grace window (#1794) ───────────────────────────────────
+#
+# The `no_tmux` fixture above IS the incident's false negative: it makes
+# `list_drive_sessions()` return `[]`, exactly as the real one does for
+# "tmux unavailable" / "no server running" / "the call timed out" — and
+# exactly as it did on 2026-08-03, 40s after a healthy launch.
+
+
+def _backdate(issue: int, seconds: float) -> None:
+    """Age a queued entry's `launched_at` by *seconds*, as if time had passed."""
+    state._update_drive_queue_entry_local(
+        REPO, issue, launched_at=time.time() - seconds
+    )
+
+
+def test_back_to_back_ticks_launch_exactly_one_drive(cli, seed, launches):
+    """THE regression for #1794.
+
+    This is `docs/DRIVE_QUEUE.md` §2's install sequence in miniature:
+    `systemctl --user enable --now …timer` fires one tick, and the runbook's
+    own verification step (`systemctl --user start …service`) fires another
+    seconds later. Asserted by COUNTING launches, not by the absence of an
+    error message — the 2026-08-03 duplicate exited 0.
+    """
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762", "--machine", "dellserver")
+
+    first = cli("tick")
+    assert first.exit_code == 0, first.output
+    second = cli("tick")
+    assert second.exit_code == 0, second.output
+
+    assert len(launches) == 1, launches
+    entry = queued(1762)
+    assert entry["state"] == "running"
+    assert entry["attempts"] == 0
+    # The exact failure signature from the journal must be gone.
+    assert "died without landing the work" not in second.output
+    assert "retry" not in second.output
+    assert "starting" in second.output
+    assert "1/1 occupied" in second.output
+
+
+def test_a_still_starting_drive_is_reported_not_escalated(cli, seed, launches):
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    cli("tick")
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    # Occupying a slot is the queue working — no queue-level alert for it.
+    assert state._get_drive_escalation_local(QUEUE_ALERT_REPO, QUEUE_ALERT_ISSUE) is None
+    assert state._get_drive_escalation_local(REPO, 1762) is None
+    assert "still starting" in queued(1762)["last_reason"]
+
+
+def test_a_drive_genuinely_dead_past_the_window_still_retries(cli, seed, launches):
+    """The window delays death detection by one interval; it never removes it."""
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    cli("tick")
+    _backdate(1762, DRIVE_STARTUP_GRACE_SECONDS + 60)
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    assert "died without landing the work" in result.output
+    # It relaunches on the same tick, as it did before #1794.
+    assert len(launches) == 2, launches
+    entry = queued(1762)
+    assert entry["state"] == "running"
+    assert entry["attempts"] == 1
+
+
+def test_a_repeatedly_dead_drive_still_reaches_blocked_and_escalates(
+    cli, seed, launches
+):
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    cli("tick")
+    _backdate(1762, DRIVE_STARTUP_GRACE_SECONDS + 60)
+    cli("tick")
+    _backdate(1762, DRIVE_STARTUP_GRACE_SECONDS + 60)
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    entry = queued(1762)
+    assert entry["state"] == "blocked"
+    assert entry["attempts"] == 2
+    assert state._get_drive_escalation_local(REPO, 1762) is not None
+
+
+def test_a_requeued_entry_is_never_relaunched_inside_the_window(
+    cli, seed, launches
+):
+    """The launch-side guard, driven through the CLI.
+
+    Whatever puts a just-launched entry back in `waiting` — a stale retry, a
+    hand edit, a launch whose exit code lied — the tick must not start a
+    second `coord drive` for it. `coord drive`'s per-issue flock stays the
+    last line of defence; the queue must not need it.
+    """
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    cli("tick")
+    assert len(launches) == 1
+    state._update_drive_queue_entry_local(REPO, 1762, state="waiting")
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    assert len(launches) == 1, launches
+    assert "second `coord drive` is refused" in result.output
 
 
 # ── tick: the lock and the fail-closed board ─────────────────────────────────
