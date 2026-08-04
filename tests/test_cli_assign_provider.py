@@ -283,6 +283,13 @@ providers:
   definitions:
     opencode:
       type: opencode
+      # #1798: pin a model in opencode's own namespace. These tests are
+      # about the machine-capability gate (#1711), not model resolution —
+      # an unpinned opencode provider would otherwise fall through to
+      # models.default ("sonnet", a Claude alias) and get refused by the
+      # separate #1798 model/provider compatibility gate before reaching
+      # the assertions these tests actually care about.
+      model: opencode/big-pickle
 """
 
 

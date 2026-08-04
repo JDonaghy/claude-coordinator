@@ -1198,6 +1198,36 @@ def provider_capability(provider_type: str) -> str:
     return f"provider:{provider_type}"
 
 
+def model_plausible_for_provider_type(model: str, provider_type: str) -> bool:
+    """Namespace-shape sanity check: could *model* plausibly belong to
+    *provider_type* (#1798)?
+
+    A cheap, syntax-only heuristic — NOT a live catalog lookup (no network
+    call, no per-provider model list to keep in sync). Every model
+    identifier this coordinator actually resolves falls into one of two
+    shapes, mirroring the two namespaces ``coord.dispatch.
+    resolve_dispatch_model_alias`` already reasons about:
+
+    * Claude aliases (``sonnet``, ``opus``, ``haiku``) and exact ids
+      resolved via ``models.versions`` (``claude-sonnet-4-6``) — never
+      contain a ``/``.
+    * OpenCode Zen model strings are always ``provider/model``
+      (``opencode/glm-5.2``, ``deepseek/deepseek-chat`` — see
+      ``docs/OPENCODE_VERIFICATION.md``) — always contain a ``/``.
+
+    That's enough signal to catch #1798's actual failure mode — a Claude
+    alias handed to an opencode-type backend (or vice versa) — before a
+    dispatch spends a worktree and a network round-trip discovering the
+    backend rejects it mid-run. ``claude``/``claude-pty``
+    (:data:`IMPLICIT_PROVIDER_TYPES`) require NO ``/``; every other
+    (non-implicit) provider type requires one.
+    """
+    has_namespace = "/" in model
+    if provider_type in IMPLICIT_PROVIDER_TYPES:
+        return not has_namespace
+    return has_namespace
+
+
 # #1628: default disk mount points the health engine probes.  "/" and "/home"
 # are usually the two that matter (and were the two that mattered on
 # 2026-07-30 — elitebook's /home hit 0 bytes free); "~/.coord" is separate
