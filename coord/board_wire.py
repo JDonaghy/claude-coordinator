@@ -34,17 +34,55 @@ bounded preview can never round-trip over the full stored text via
 Enforced by tests/test_board_read_path.py — a payload-budget test fails the
 suite if a seeded board's wire exceeds its budget, so instance #4 of this
 class shows up as a red test, not a fleet incident.
+
+**#1791 (instance #4): bounding row WIDTH was not enough.** #762 added a
+day-based retention cutoff at the DAO layer (``COORD_BOARD_RETENTION_DAYS``,
+default 14 — see ``coord/dao.py``), but a normal ~2-week stretch of fleet
+throughput still produced 904 terminal (done/merged/failed/advisory)
+assignment rows inside that window — none of them "old" yet — and 904 small,
+individually-width-bounded rows landed at the same 5.30 MB payload 90 large
+ones did pre-#1337. ``bound_board_payload`` below adds the collection-
+CARDINALITY bound this class of fix has been missing: it caps the
+*count* of terminal assignment rows on the wire
+(:data:`MAX_TERMINAL_ASSIGNMENTS`) and drops the body of closed (terminal)
+issues outright, on top of the existing per-field width caps. Both cuts are
+flagged on the payload (``board_truncated`` + counts) so a client can tell
+it received a trimmed board rather than the whole history — see
+:func:`bound_board_payload`.
 """
 
 from __future__ import annotations
 
 import json
 
+from coord.dao import TERMINAL_STATUSES
+
 # Preview size for operator-facing free text.  Large enough that a short
 # review / test reason arrives whole; everything longer is a preview + flag.
 PREVIEW_CHARS = 2000
 # Hard cap for semantically-parsed documents (issue bodies, test plans).
 DOCUMENT_CHARS = 16384
+
+# #1791: how many *terminal* assignment rows the /board wire carries. This is
+# a SECOND, tighter bound than #762's day-based DAO cutoff — that cap bounds
+# board AGE, not board THROUGHPUT, so a busy fortnight still puts every one
+# of its terminal rows on the wire because none of them are "old" yet. Only
+# the most recent MAX_TERMINAL_ASSIGNMENTS terminal rows (by finished_at,
+# falling back to dispatched_at) ride the wire; active (non-terminal) rows
+# and the latest assignment of a still-open issue are NEVER subject to this
+# cap, regardless of how many terminal rows exist. Full history stays
+# reachable via GET /assignment/{id}.
+MAX_TERMINAL_ASSIGNMENTS = 200
+
+# #1791: named byte budget for the WHOLE /board payload. #1337 bounded
+# per-row WIDTH only (``BOARD payload budget`` in tests/test_board_read_path.py
+# guards that), so row CARDINALITY could still blow the same ceiling that
+# broke `coord report-result`'s 5s prefetch timeout in #1336 — exactly what
+# recurred in #1791 (5.30 MB, 904 of 906 assignment rows terminal). Enforced
+# by tests/test_board_wire.py::test_board_payload_budget_holds_at_terminal_row_scale,
+# seeded with THOUSANDS of terminal rows, so a fifth recurrence fails a
+# test, not a fleet check.
+BOARD_PAYLOAD_BYTE_BUDGET = 2_500_000
 
 # Appended to truncated *plain-text* fields so a human reading the preview
 # (TUI pane, dialog) knows it is one — machine consumers use the flags.
@@ -129,6 +167,11 @@ def _is_tracking_issue(row: dict) -> bool:
     return isinstance(labels, list) and TRACKING_ISSUE_LABEL in labels
 
 
+def _is_closed_issue(row: dict) -> bool:
+    state = row.get("state")
+    return isinstance(state, str) and state.strip().lower() == "closed"
+
+
 def bound_issue_row(row: dict) -> None:
     """Apply the wire policy to one ``/board`` issue row (mutates).
 
@@ -141,24 +184,126 @@ def bound_issue_row(row: dict) -> None:
     thin clients — a regression in exactly the failure class #1337 exists to
     close.  The exemption stays bounded in practice: an epic body is capped
     at 65,536 chars by GitHub itself and boards carry few epics (~31 today,
-    0.19 MB total).  Member (non-epic) issue bodies keep the DOCUMENT_CHARS
-    cap.
+    0.19 MB total).
+
+    **Closed (non-epic) issues drop the body entirely** (#1791): a closed
+    issue is terminal — no pipeline decision, client-side or server-side,
+    reads its body once it's closed — and #1337's DOCUMENT_CHARS cap alone
+    still left 110 closed issues carrying 0.57 MB on every /board GET. Full
+    text stays on ``GET /issue/{repo}/{number}``. Open (non-epic) issue
+    bodies — the ones ``pipeline.rs``'s ``acceptance_for_path_arg`` and
+    ``dialogs.rs`` parse client-side — keep the DOCUMENT_CHARS cap
+    unchanged.
     """
     if _is_tracking_issue(row):
+        return
+    if _is_closed_issue(row):
+        _bound_text_field(row, "body", 0)
         return
     _bound_text_field(row, "body", DOCUMENT_CHARS)
 
 
+def _open_issue_keys(issues) -> set[tuple[str, int]]:
+    """``(repo_name, number)`` of every non-closed issue in the projection."""
+    keys: set[tuple[str, int]] = set()
+    for row in issues:
+        if not isinstance(row, dict) or _is_closed_issue(row):
+            continue
+        repo_name, number = row.get("repo_name"), row.get("number")
+        if repo_name is not None and number is not None:
+            keys.add((repo_name, number))
+    return keys
+
+
+def cap_terminal_assignments(
+    assignments: list[dict], open_issue_keys: set[tuple[str, int]]
+) -> int:
+    """Cap ``assignments`` (mutated in place) to :data:`MAX_TERMINAL_ASSIGNMENTS`
+    terminal rows (#1791).  Returns the number of rows dropped.
+
+    A row is PROTECTED — never dropped, regardless of how many terminal rows
+    exist — when it is active (status not in ``TERMINAL_STATUSES``) or is
+    tied to a still-open issue.  That mirrors
+    ``coord.dao.compute_board_keep_ids``'s "latest assignment of an open
+    issue" rule, so this second, tighter cut can never undo that guarantee.
+    Among the remaining terminal rows, the most recent
+    ``MAX_TERMINAL_ASSIGNMENTS`` (by ``finished_at``, falling back to
+    ``dispatched_at``) are kept; the cut is then closed over
+    ``review_of_assignment_id`` in both directions — same closure rule as
+    ``compute_board_keep_ids`` — so an in-flight review never loses its
+    target and a kept row never loses an in-flight review.
+    """
+    original_count = len(assignments)
+    protected: list[dict] = []
+    terminal: list[dict] = []
+    for row in assignments:
+        status = (row.get("status") or "").lower()
+        key = (row.get("repo_name"), row.get("issue_number"))
+        if status not in TERMINAL_STATUSES or key in open_issue_keys:
+            protected.append(row)
+        else:
+            terminal.append(row)
+
+    if len(terminal) <= MAX_TERMINAL_ASSIGNMENTS:
+        return 0
+
+    terminal.sort(
+        key=lambda r: r.get("finished_at") or r.get("dispatched_at") or 0.0,
+        reverse=True,
+    )
+    keep_ids = {
+        r.get("assignment_id")
+        for r in protected + terminal[:MAX_TERMINAL_ASSIGNMENTS]
+        if r.get("assignment_id")
+    }
+
+    by_id = {r.get("assignment_id"): r for r in assignments if r.get("assignment_id")}
+    reviews_of: dict[str, list[str]] = {}
+    for aid, r in by_id.items():
+        tgt = r.get("review_of_assignment_id")
+        if tgt:
+            reviews_of.setdefault(tgt, []).append(aid)
+    frontier = list(keep_ids)
+    while frontier:
+        aid = frontier.pop()
+        tgt = by_id.get(aid, {}).get("review_of_assignment_id")
+        if tgt and tgt in by_id and tgt not in keep_ids:
+            keep_ids.add(tgt)
+            frontier.append(tgt)
+        for rev in reviews_of.get(aid, ()):
+            if rev not in keep_ids:
+                keep_ids.add(rev)
+                frontier.append(rev)
+
+    assignments[:] = [r for r in assignments if r.get("assignment_id") in keep_ids]
+    return original_count - len(assignments)
+
+
 def bound_board_payload(projection: dict) -> None:
-    """Bound every unbounded free-text field in a ``/board`` projection.
+    """Bound every unbounded free-text field AND the collection's row count
+    in a ``/board`` projection (#1337 bounded width; #1791 adds cardinality).
 
     Called by the daemon's board builder AFTER the derived sections
     (milestone work orders, plan roster, epic children) are computed — those
     parse full issue bodies server-side and must see them unbounded.
     """
+    issues = projection.get("issues")
+    assignments = projection.get("assignments")
+
+    dropped = 0
+    if isinstance(assignments, list) and isinstance(issues, (list, tuple)):
+        dropped = cap_terminal_assignments(assignments, _open_issue_keys(issues))
+
     for row in projection.get("assignments", ()):
         if isinstance(row, dict):
             bound_assignment_row(row)
     for row in projection.get("issues", ()):
         if isinstance(row, dict):
             bound_issue_row(row)
+
+    # #1791: truncation must be visible to clients — additive-only, same
+    # convention as the per-field ``<field>_truncated`` flags above, so a
+    # client that never received a trimmed board sees an unchanged shape.
+    if dropped:
+        projection["board_truncated"] = True
+        projection["board_truncated_assignments"] = dropped
