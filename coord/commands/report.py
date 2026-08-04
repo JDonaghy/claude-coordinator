@@ -30,6 +30,9 @@ from coord.commands._common import _CONFIG_OPTION
 
 # Row keys whose values are epoch timestamps — rendered as a relative age in
 # the human table (absolute in --json, which is the machine contract).
+# Fallback only: used when a row column is not covered by the report's
+# `column_meta` (#1760) — a report that ships full metadata never reaches
+# this.
 _TS_COLUMNS = frozenset(
     {"started_at", "merged_at", "first_event_at", "last_event_at"}
 )
@@ -39,7 +42,9 @@ _TS_COLUMNS = frozenset(
 _MAX_CELL = 44
 
 # Shorter headers for the human table only — `columns` itself is the wire
-# contract (#1741 renders against it) and is never rewritten.
+# contract (#1741 renders against it) and is never rewritten. Fallback only
+# (#1760): a report's `column_meta[].label` takes precedence when present,
+# so this list only matters for a report that ships none.
 _HEADER_ALIASES = {
     "started_at": "started",
     "merged_at": "merged",
@@ -69,21 +74,29 @@ def _truncate(s: str, width: int) -> str:
     return s if len(s) <= width else s[: max(1, width - 1)] + "…"
 
 
-def _format_cell(column: str, row: dict) -> str:
+def _format_cell(column: str, row: dict, meta: dict | None = None) -> str:
     """Render one row value for the human table.
 
-    Generic on purpose: it dispatches on the value's *shape* (timestamp
-    column, list, dict, None) rather than on ``issue-activity``'s specific
-    columns, so the second ``ReportDef`` gets a table for free.
+    Dispatches on the column's declared ``kind`` from ``column_meta``
+    (#1760) when the report supplies one — that is what lets the CLI stop
+    hardcoding per-field knowledge (``_TS_COLUMNS`` et al) and the panel and
+    the CLI format the same column the same way without drifting.  Falls
+    back to dispatching on the value's *shape* (timestamp column by name,
+    list, dict, None) when no metadata is present, so a report that ships
+    none still gets a table.
     """
     value = row.get(column)
+    kind = (meta or {}).get("kind")
+    is_timestamp = kind == "timestamp" if kind else column in _TS_COLUMNS
     if column == "started_at" and value is None and row.get("started_before_window"):
         # Not "unknown" — "began before this window". The distinction is the
-        # whole point of the started_before_window flag.
+        # whole point of the started_before_window flag. Scoped to
+        # started_at specifically: a None merged_at just means "not merged
+        # yet" and must not also read as "before window".
         return "<window"
     if value is None:
         return "-"
-    if column in _TS_COLUMNS:
+    if is_timestamp:
         return _relative_time(value)
     if isinstance(value, bool):
         return "yes" if value else "no"
@@ -100,20 +113,36 @@ def _format_cell(column: str, row: dict) -> str:
     return str(value)
 
 
+def _pad(cell: str, width: int, align: str) -> str:
+    return cell.rjust(width) if align == "right" else cell.ljust(width)
+
+
 def _render_table(result: dict) -> list[str]:
     columns = list(result.get("columns") or [])
     rows = list(result.get("rows") or [])
     if not columns or not rows:
         return []
-    headers = [_HEADER_ALIASES.get(c, c).upper() for c in columns]
-    cells = [[_truncate(_format_cell(c, r), _MAX_CELL) for c in columns] for r in rows]
+    meta_by_id = {
+        m.get("id"): m for m in (result.get("column_meta") or []) if isinstance(m, dict)
+    }
+    headers = [
+        (meta_by_id.get(c, {}).get("label") or _HEADER_ALIASES.get(c, c)).upper()
+        for c in columns
+    ]
+    aligns = [meta_by_id.get(c, {}).get("align") or "left" for c in columns]
+    cells = [
+        [_truncate(_format_cell(c, r, meta_by_id.get(c)), _MAX_CELL) for c in columns]
+        for r in rows
+    ]
     widths = [
         max(len(header), *(len(row[i]) for row in cells))
         for i, header in enumerate(headers)
     ]
     lines = ["  ".join(h.ljust(widths[i]) for i, h in enumerate(headers)).rstrip()]
     for row in cells:
-        lines.append("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)).rstrip())
+        lines.append(
+            "  ".join(_pad(cell, widths[i], aligns[i]) for i, cell in enumerate(row)).rstrip()
+        )
     return lines
 
 

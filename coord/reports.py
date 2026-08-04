@@ -45,12 +45,14 @@ __all__ = [
     "UnknownReportError",
     "ReportParam",
     "ReportDef",
+    "ColumnMeta",
     "ReportResult",
     "REPORTS",
     "catalogue",
     "resolve_params",
     "run_report",
     "fetch_audit_window",
+    "detect_prior_activity",
     "fold_issue_activity",
     "run_issue_activity",
     "parse_duration",
@@ -129,6 +131,36 @@ class ReportDef:
         }
 
 
+@dataclass(frozen=True)
+class ColumnMeta:
+    """Display metadata for one entry of ``ReportResult.columns`` (#1760).
+
+    Additive, not a retype: ``columns`` stays a bare ``list[str]`` (the
+    already-shipped #1741 panel deserialises it as ``Vec<String>`` and must
+    keep working unchanged), and row values stay raw — a ``started_at`` cell
+    is still an epoch float, a ``machines`` cell is still a list.  This is
+    only the hint a generic renderer needs to turn that raw value into a
+    reasonable cell: ``kind`` says how to format it, ``align``/``weight``
+    say how to lay out the column.  ``id`` matches the corresponding
+    ``columns[]`` entry (and order matches too), so a client can zip them.
+    """
+
+    id: str
+    label: str
+    kind: str  # "text" | "int" | "timestamp" | "list" | "enum" | "duration"
+    align: str = "left"  # "left" | "right"
+    weight: float = 1.0  # relative column width hint
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "label": self.label,
+            "kind": self.kind,
+            "align": self.align,
+            "weight": self.weight,
+        }
+
+
 @dataclass
 class ReportResult:
     """The wire contract (#1741 renders against these exact field names).
@@ -137,6 +169,9 @@ class ReportResult:
     ``rows`` may carry extra keys beyond it (``started_before_window``,
     ``last_event_at``, ...) for clients that want the detail.  ``notes``
     holds derived anomalies and caveats, rendered under the table.
+    ``column_meta`` is additive display metadata, one entry per ``columns``
+    entry in the same order (#1760) — a client that ignores it entirely
+    still gets byte-identical ``columns``/``rows``.
     """
 
     report_id: str
@@ -145,6 +180,7 @@ class ReportResult:
     columns: list[str]
     rows: list[dict]
     notes: list[str]
+    column_meta: list[ColumnMeta] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -152,6 +188,7 @@ class ReportResult:
             "generated_at": self.generated_at,
             "window": [self.window[0], self.window[1]],
             "columns": list(self.columns),
+            "column_meta": [m.to_dict() for m in self.column_meta],
             "rows": list(self.rows),
             "notes": list(self.notes),
         }
@@ -312,6 +349,23 @@ ISSUE_ACTIVITY_COLUMNS = [
     "outcome",
 ]
 
+# One entry per ISSUE_ACTIVITY_COLUMNS entry, same order (#1760) — the
+# display metadata a generic renderer (CLI table, coord-tui panel) needs to
+# format a raw row value without hardcoding per-report field knowledge.
+ISSUE_ACTIVITY_COLUMN_META = [
+    ColumnMeta(id="repo", label="Repo", kind="text"),
+    ColumnMeta(id="issue", label="Issue", kind="int", align="right"),
+    ColumnMeta(id="title", label="Title", kind="text", weight=3.0),
+    ColumnMeta(id="started_at", label="Started", kind="timestamp"),
+    ColumnMeta(id="machines", label="Machines", kind="list"),
+    ColumnMeta(id="fix_iterations", label="Fixes", kind="int", align="right"),
+    ColumnMeta(id="test_verdicts", label="Tests", kind="list"),
+    ColumnMeta(id="review_verdicts", label="Reviews", kind="list"),
+    ColumnMeta(id="merged_at", label="Merged", kind="timestamp"),
+    ColumnMeta(id="drive_exit", label="Drive Exit", kind="text"),
+    ColumnMeta(id="outcome", label="Outcome", kind="enum"),
+]
+
 _TEST_EVENTS = ("test_passed", "test_failed", "test_skipped")
 _REVIEW_EVENTS = ("review_approve", "review_request-changes")
 
@@ -332,6 +386,7 @@ def fold_issue_activity(
     titles: Mapping[tuple[str, int], str] | None = None,
     generated_at: float | None = None,
     truncated: bool = False,
+    prior_activity: frozenset[tuple[str, int]] = frozenset(),
 ) -> ReportResult:
     """Fold audit entries into one row per ``(repo, issue)``.
 
@@ -342,6 +397,19 @@ def fold_issue_activity(
     they are sorted ascending on ``(ts, id)`` here, which is what makes
     "first dispatch", "last merge" and the ordered verdict lists mean what
     they say.
+
+    ``prior_activity`` (#1760) is the one fact this pure fold cannot derive
+    for itself: the set of ``(repo, issue)`` keys that have *any* audit event
+    before the window opened, as determined by the caller's bounded
+    look-back (:func:`detect_prior_activity`).  Without it, an issue whose
+    real start predates the window but which was re-dispatched inside it
+    reads as "started here, zero fixes" — a real timestamp and a real count
+    that are both wrong, with nothing in the row saying so.  With it, that
+    row instead reports ``started_at=None``, ``started_before_window=True``
+    and ``counts_partial=True``, and every in-window work dispatch counts as
+    a fix (the issue was already running when the window opened, so each one
+    is a re-dispatch).  Default is empty, so existing callers are unaffected
+    in shape.
     """
     start, end = float(window[0]), float(window[1])
     title_map = dict(titles or {})
@@ -361,7 +429,14 @@ def fold_issue_activity(
         groups.setdefault(key, []).append(entry)
 
     rows = [
-        _fold_one_issue(repo, issue, evs, end, title_map.get((repo, issue)))
+        _fold_one_issue(
+            repo,
+            issue,
+            evs,
+            end,
+            title_map.get((repo, issue)),
+            had_prior_activity=(repo, issue) in prior_activity,
+        )
         for (repo, issue), evs in groups.items()
     ]
     # Most-recently-active first: the morning question is "what moved", and
@@ -389,6 +464,7 @@ def fold_issue_activity(
         generated_at=end if generated_at is None else float(generated_at),
         window=(start, end),
         columns=list(ISSUE_ACTIVITY_COLUMNS),
+        column_meta=list(ISSUE_ACTIVITY_COLUMN_META),
         rows=rows,
         notes=notes,
     )
@@ -400,6 +476,8 @@ def _fold_one_issue(
     events: Sequence[Mapping[str, Any]],
     window_end: float,
     title: str | None,
+    *,
+    had_prior_activity: bool = False,
 ) -> dict[str, Any]:
     started_at: float | None = None
     machines: list[str] = []
@@ -443,17 +521,29 @@ def _fold_one_issue(
                 "reason": details.get("reason") or details.get("error"),
             }
 
-    # "In-window activity, but no start event in it" — the issue began
-    # before the window opened. Reported as started_at=None + this flag
-    # rather than as a bogus start time taken from the first event we
-    # happened to see.
-    started_before_window = started_at is None
-    # Every work dispatch after the *first* one is a fix iteration. Note the
-    # fold sees only in-window events by construction, so an issue whose
-    # original dispatch predates the window and which was re-dispatched
-    # inside it reads as "started here, zero fixes". That is the honest
-    # answer available from the window; widen `since` to see the real start.
-    fix_iterations = max(0, work_dispatches - 1)
+    if had_prior_activity:
+        # The caller's look-back (#1760) found an event before the window
+        # opened — this issue was already running. Report that plainly
+        # rather than claiming a start the window cannot support: no start
+        # time, and every in-window work dispatch is a re-dispatch (not
+        # "first dispatch, zero fixes").
+        started_at = None
+        started_before_window = True
+        fix_iterations = work_dispatches
+    else:
+        # "In-window activity, but no start event in it" — the issue began
+        # before the window opened. Reported as started_at=None + this flag
+        # rather than as a bogus start time taken from the first event we
+        # happened to see.
+        started_before_window = started_at is None
+        # Every work dispatch after the *first* one is a fix iteration.
+        fix_iterations = max(0, work_dispatches - 1)
+    # counts_partial is narrower than started_before_window: the latter can
+    # also fire from the plain "no start event in this window" inference
+    # above, which doesn't know whether fix_iterations/test_verdicts are
+    # complete or merely empty. Only a confirmed look-back hit means the
+    # counts are a known lower bound.
+    counts_partial = had_prior_activity
 
     first_event_at = float(events[0].get("ts") or 0.0) if events else None
     last_event_at = float(events[-1].get("ts") or 0.0) if events else None
@@ -466,6 +556,7 @@ def _fold_one_issue(
         "started_before_window": started_before_window,
         "machines": machines,
         "fix_iterations": fix_iterations,
+        "counts_partial": counts_partial,
         "test_verdicts": test_verdicts,
         "review_verdicts": review_verdicts,
         "merged_at": merged_at,
@@ -540,6 +631,30 @@ def _derive_notes(rows: Sequence[Mapping[str, Any]]) -> list[str]:
                 f"{ident}: {row['fix_iterations']} fix iterations in this "
                 "window — the work is not converging on its own."
             )
+        if row.get("counts_partial"):
+            # #1760: this issue was already running when the window opened
+            # (the caller's look-back found an earlier event) — say so
+            # explicitly rather than let a real-looking fix_iterations/
+            # test_verdicts count pass as complete.
+            notes.append(
+                f"{ident}: started before this window — fix_iterations and "
+                "test_verdicts are lower bounds, not the full count. Widen "
+                "`since` to see the real start."
+            )
+        elif (
+            "request-changes" in (row.get("review_verdicts") or [])
+            and int(row.get("fix_iterations") or 0) == 0
+        ):
+            # #1760: a request-changes verdict implies at least one
+            # re-dispatch happened. fix_iterations=0 with counts_partial
+            # False (the elif) means the fold believes it saw the whole
+            # window's activity — this combination should not be reachable,
+            # and if it appears the row is self-contradictory.
+            notes.append(
+                f"{ident}: review verdict 'request-changes' with "
+                "fix_iterations=0 — this combination should not happen; the "
+                "row is internally inconsistent."
+            )
     return notes
 
 
@@ -581,6 +696,36 @@ def _lookup_titles(
     return out
 
 
+def detect_prior_activity(
+    keys: Iterable[tuple[str, int]],
+    *,
+    until: float,
+    fetch: Callable[..., Mapping[str, Any]],
+) -> frozenset[tuple[str, int]]:
+    """Bounded look-back (#1760): which ``(repo, issue)`` keys already have
+    at least one audit event before ``until`` (the window start)?
+
+    One query per issue in ``keys`` — not one per event, not an unbounded
+    scan.  Same query path as the window fetch (``fetch`` is the same
+    callable, real or injected), just ``until=window_start``, a per-issue
+    filter, and ``limit=1`` newest-first: the fold only needs a yes/no per
+    issue, not the events themselves.
+    """
+    prior: set[tuple[str, int]] = set()
+    for key_repo, key_issue in sorted(set(keys)):
+        page = fetch(
+            since=None,
+            until=until,
+            repo=key_repo,
+            issue=key_issue,
+            limit=1,
+            cursor=None,
+        ) or {}
+        if page.get("entries"):
+            prior.add((key_repo, key_issue))
+    return frozenset(prior)
+
+
 def run_issue_activity(
     *,
     since: str = "24h",
@@ -597,21 +742,26 @@ def run_issue_activity(
     end = parse_timestamp(until) if until else generated_at
     start = end - parse_duration(since)
 
+    fetch_fn = _default_fetch if fetch is None else fetch
+
     entries, truncated = fetch_audit_window(
-        since=start, until=end, repo=repo or None, fetch=fetch
+        since=start, until=end, repo=repo or None, fetch=fetch_fn
     )
-    lookup = _lookup_titles if title_lookup is None else title_lookup
-    titles = lookup(
+    keys = {
         (str(e["repo"]), int(e["issue"]))
         for e in entries
         if e.get("repo") and e.get("issue") is not None
-    )
+    }
+    lookup = _lookup_titles if title_lookup is None else title_lookup
+    titles = lookup(keys)
+    prior_activity = detect_prior_activity(keys, until=start, fetch=fetch_fn)
     return fold_issue_activity(
         entries,
         (start, end),
         titles=titles,
         generated_at=generated_at,
         truncated=truncated,
+        prior_activity=prior_activity,
     )
 
 
