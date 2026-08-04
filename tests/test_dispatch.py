@@ -1560,16 +1560,32 @@ class TestProviderDispatch:
 
 
 class TestProviderDefInPayload:
-    """#1796: dispatch() must carry the resolved provider's own definition
-    (type/binary/model/env/extra_args) alongside its name, so a config-free
-    agent (no local providers.definitions registry — docs/EPHEMERAL_WORKERS.md)
-    can build the provider itself instead of refusing the assignment."""
+    """#1796 fix iteration 1 (review finding, blocking): dispatch() must be
+    able to carry the resolved provider's own definition (type/binary/model/
+    env/extra_args) alongside its name, so a config-free agent (no local
+    providers.definitions registry — docs/EPHEMERAL_WORKERS.md) can build
+    the provider itself instead of refusing the assignment — but it must
+    NEVER attach 'provider_def' on the first attempt, because that field is
+    understood only by an agent already updated past #1796's own release;
+    attaching it unconditionally (the original #1796 patch) would 400 an
+    agent that already supports plain 'provider' (#324) but hasn't yet
+    received #1796, breaking already-working named-provider dispatch fleet-
+    wide for the length of a rolling update. 'provider_def' is therefore
+    sent ONLY as a one-shot retry, fired only once the agent has already
+    refused the bare 'provider' payload with a 400 — see dispatch()'s own
+    comment for the full reasoning."""
 
     @patch("coord.dispatch.httpx.post")
-    def test_provider_def_included_alongside_non_default_provider(
+    def test_provider_def_not_sent_when_first_attempt_succeeds(
         self, mock_post: MagicMock,
     ) -> None:
+        """The common/already-working case (agent resolves 'provider' from
+        its own local config, e.g. an already-configured 'oc-mid') must get
+        a payload with NO 'provider_def' at all — a single POST, never a
+        retry. This is the regression the blocking review finding flagged:
+        the original patch attached 'provider_def' here unconditionally."""
         mock_resp = MagicMock()
+        mock_resp.status_code = 202
         mock_resp.json.return_value = {"id": "abc"}
         mock_post.return_value = mock_resp
 
@@ -1600,9 +1616,70 @@ class TestProviderDefInPayload:
             issue_number=10, issue_title="Fix auth", rationale="ok",
         )
         dispatch(p, cfg)
+        assert mock_post.call_count == 1
         payload = mock_post.call_args.kwargs["json"]
         assert payload.get("provider") == "oc-mid"
-        assert payload.get("provider_def") == {
+        assert "provider_def" not in payload
+
+    @patch("coord.dispatch.httpx.post")
+    def test_provider_def_sent_on_retry_after_400_refusal(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """When the agent refuses the bare 'provider' payload with a 400
+        (a genuinely config-free agent, or one whose local registry is
+        missing/stale relative to the coordinator's own — #1796's actual
+        target case), dispatch() retries exactly once with 'provider_def'
+        attached, and the assignment succeeds via the second response.
+
+        Uses real ``httpx.Response`` objects (not bare ``MagicMock``s) so
+        ``resp.raise_for_status()`` behaves exactly like the live agent
+        server would — matching ``TestDispatchErrorSurfacing``'s existing
+        convention for status-code-driven behaviour in this file."""
+        import httpx
+
+        request = httpx.Request("POST", "http://laptop.tailnet:7433/assign")
+        refusal = httpx.Response(
+            400,
+            json={"error": "refusing assignment: provider 'oc-mid' could not be resolved"},
+            request=request,
+        )
+        success = httpx.Response(202, json={"id": "abc"}, request=request)
+        mock_post.side_effect = [refusal, success]
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api", provider="oc-mid")],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+                capabilities=["provider:opencode"],
+            )],
+            providers=ProvidersConfig(
+                default="claude",
+                definitions={
+                    "oc-mid": ProviderDef(
+                        type="opencode",
+                        binary="/opt/opencode/bin/opencode",
+                        env={"FOO": "bar"},
+                    ),
+                    "claude": ProviderDef(type="claude"),
+                },
+            ),
+        )
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=10, issue_title="Fix auth", rationale="ok",
+        )
+        result = dispatch(p, cfg)
+        assert result["id"] == "abc"
+        assert mock_post.call_count == 2
+
+        first_payload = mock_post.call_args_list[0].kwargs["json"]
+        assert first_payload.get("provider") == "oc-mid"
+        assert "provider_def" not in first_payload
+
+        second_payload = mock_post.call_args_list[1].kwargs["json"]
+        assert second_payload.get("provider") == "oc-mid"
+        assert second_payload.get("provider_def") == {
             "type": "opencode",
             "binary": "/opt/opencode/bin/opencode",
             "model": None,
@@ -1612,31 +1689,22 @@ class TestProviderDefInPayload:
         }
 
     @patch("coord.dispatch.httpx.post")
-    def test_provider_def_omitted_when_provider_field_omitted(
-        self, mock_post: MagicMock, config: Config, proposal: Proposal,
-    ) -> None:
-        """No 'provider' in the payload (vanilla default claude) → no
-        'provider_def' either — never send one without the other."""
-        mock_resp = MagicMock()
-        mock_resp.json.return_value = {"id": "abc"}
-        mock_post.return_value = mock_resp
-
-        dispatch(proposal, config)
-        payload = mock_post.call_args.kwargs["json"]
-        assert "provider" not in payload
-        assert "provider_def" not in payload
-
-    @patch("coord.dispatch.httpx.post")
-    def test_provider_def_omitted_when_no_matching_definition(
+    def test_no_retry_when_no_matching_definition_to_retry_with(
         self, mock_post: MagicMock,
     ) -> None:
         """A resolved provider name with no providers.definitions entry
-        (e.g. providers.default names something never defined) must not
-        fabricate a provider_def — 'provider' is still sent so the agent's
-        own refusal (#1796) can surface the misconfiguration."""
-        mock_resp = MagicMock()
-        mock_resp.json.return_value = {"id": "abc"}
-        mock_post.return_value = mock_resp
+        (e.g. providers.default names something never defined) has nothing
+        to retry with — dispatch() must not fabricate a provider_def, must
+        not retry at all, and must surface the agent's original refusal."""
+        import httpx
+
+        request = httpx.Request("POST", "http://laptop.tailnet:7433/assign")
+        refusal = httpx.Response(
+            400,
+            json={"error": "refusing assignment: provider 'never-defined' could not be resolved"},
+            request=request,
+        )
+        mock_post.return_value = refusal
 
         cfg = Config(
             repos=[Repo(name="api", github="acme/api")],
@@ -1656,9 +1724,28 @@ class TestProviderDefInPayload:
             id=1, machine_name="laptop", repo_name="api",
             issue_number=10, issue_title="Fix auth", rationale="ok",
         )
-        dispatch(p, cfg)
+        with pytest.raises(httpx.HTTPStatusError, match="could not be resolved"):
+            dispatch(p, cfg)
+        assert mock_post.call_count == 1
         payload = mock_post.call_args.kwargs["json"]
         assert payload.get("provider") == "never-defined"
+        assert "provider_def" not in payload
+
+    @patch("coord.dispatch.httpx.post")
+    def test_provider_def_omitted_when_provider_field_omitted(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal,
+    ) -> None:
+        """No 'provider' in the payload (vanilla default claude) → no
+        'provider_def' either, and no retry is even considered."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 202
+        mock_resp.json.return_value = {"id": "abc"}
+        mock_post.return_value = mock_resp
+
+        dispatch(proposal, config)
+        assert mock_post.call_count == 1
+        payload = mock_post.call_args.kwargs["json"]
+        assert "provider" not in payload
         assert "provider_def" not in payload
 
 

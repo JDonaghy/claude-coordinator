@@ -572,6 +572,26 @@ def test_build_provider_from_wire_tolerates_missing_optional_keys() -> None:
     assert provider.env() == {}
 
 
+def test_build_provider_from_wire_non_dict_env_raises_value_error() -> None:
+    """#1796 review (non-blocking): a malformed 'env' that isn't iterable as
+    key/value pairs (e.g. an int) makes the plain `dict(...)` call raise
+    TypeError, not ValueError — this must still surface as a clean
+    ValueError refusal (agent_app.py's `assign` route only catches
+    ValueError, so an uncaught TypeError would otherwise escape as a raw
+    500 instead of #1796's intended 400 refusal)."""
+    with pytest.raises(ValueError, match="my-provider"):
+        build_provider_from_wire("my-provider", {"type": "claude", "env": 5})
+
+
+def test_build_provider_from_wire_non_list_extra_args_raises_value_error() -> None:
+    """Same TypeError-to-ValueError hardening as the 'env' case above, for a
+    malformed 'extra_args' that isn't list-shaped (e.g. an int)."""
+    with pytest.raises(ValueError, match="my-provider"):
+        build_provider_from_wire(
+            "my-provider", {"type": "claude", "extra_args": 5}
+        )
+
+
 # ── Registry: resolve_provider_name ──────────────────────────────────────────
 
 
