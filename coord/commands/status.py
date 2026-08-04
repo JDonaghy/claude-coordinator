@@ -964,6 +964,20 @@ def _diagnose_via_daemon(svc, params: dict) -> None:
         "core.hooksPath is set so worktrees get a linked graph.  Read-only."
     ),
 )
+@click.option(
+    "--config-provenance",
+    "config_provenance_check",
+    is_flag=True,
+    help=(
+        "#1779: report whether THIS machine's live ~/.coord/coordinator.yml "
+        "is still a symlink into the coord-settings checkout (vs. having "
+        "been silently replaced by `coord init`, scp, or an editor), "
+        "whether that checkout has uncommitted changes, and whether it's "
+        "behind/ahead of origin.  Neutral skip on any machine with no "
+        "coord-settings checkout — that is normal everywhere except the "
+        "daemon host / operator box.  Read-only, no network required."
+    ),
+)
 
 
 @_CONFIG_OPTION
@@ -977,11 +991,17 @@ def diagnose(
     output_json: bool = False,
     orphan_worktrees: bool = False,
     graph_health: bool = False,
+    config_provenance_check: bool = False,
 ) -> None:
     """Per-stage doctor — diagnose, best-effort recover, optional reset."""
     # ── graphify graph freshness sweep (read-only) ───────────────────────────
     if graph_health:
         _diagnose_graph_health(config_path)
+        return
+
+    # ── #1779: fleet coordinator.yml provenance (read-only) ─────────────────
+    if config_provenance_check:
+        _diagnose_config_provenance()
         return
 
     # ── #618: --orphan-worktrees fleet sweep ─────────────────────────────────
@@ -1104,6 +1124,37 @@ def _diagnose_graph_health(config_path: Path) -> None:
     click.echo(
         f"GRAPH_HEALTH: checkouts={len(checkouts)} stale={stale_count}"
     )
+
+
+def _diagnose_config_provenance() -> None:
+    """Report whether THIS machine's live ``coordinator.yml`` is still the
+    reviewed one (#1779).
+
+    Read-only, local-machine only — same family as ``--graph`` and
+    ``--orphan-worktrees``. Neutral (not a warning) when the coord-settings
+    checkout is absent, which is the normal, correct state on every machine
+    except the daemon host and the operator box: the checkout is
+    deliberately excluded from the fleet's own repo list so a dispatched
+    worker can never edit the file governing its own concurrency limits,
+    capability routing, and review gates (see ``coord/fleet_config_health.py``
+    for the three failure modes this distinguishes).
+
+    Deliberately takes no ``config_path`` — unlike ``--graph``/
+    ``--orphan-worktrees`` this does not read ``coordinator.yml`` for a list
+    of checkouts to inspect; it inspects one fixed pair of paths
+    (``$COORD_CONFIG``/``~/.coord/coordinator.yml`` and
+    ``$COORD_SETTINGS_DIR``/``~/src/coord-settings``).
+    """
+    from coord.fleet_config_health import (  # noqa: PLC0415
+        config_provenance,
+        format_provenance_lines,
+        summary_line,
+    )
+
+    prov = config_provenance()
+    for line in format_provenance_lines(prov):
+        click.echo(f"  {line}")
+    click.echo(summary_line(prov))
 
 
 def _diagnose_orphan_worktrees(config_path: Path, *, dry_run: bool) -> None:
