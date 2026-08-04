@@ -516,7 +516,26 @@ def _fetch_board_view() -> BoardView:
 
 
 def _launch_argv(entry: QueueEntry, config_path: Path | None) -> list[str]:
-    """The ``coord drive --tmux`` argv for *entry*."""
+    """The ``coord drive --tmux`` argv for *entry*.
+
+    #1809: this is the argv the tick actually spawns as a subprocess (below,
+    in the caller). When ``coord_argv()``'s PATH-less fallback was silently
+    broken (no ``__main__`` guard on ``coord/cli.py``), that subprocess
+    exited 0 having imported the module and run nothing — BEFORE ever
+    reaching ``launch_drive_in_tmux``'s #1606 alive/log-growth verification.
+    From the tick's side that is indistinguishable from a real launch that
+    passed verification: both are "subprocess exited 0". That fully explains
+    a launch reported as a success banner while its tmux session had already
+    died — no separate bug in this module's returncode handling or in
+    ``launch_drive_in_tmux``'s growth check (both were re-verified against
+    the #1809 investigation and are correct: a non-zero exit is never
+    counted as running — see ``test_a_failed_launch_is_a_consumed_attempt_
+    not_a_running_entry`` — and the growth check does register an
+    absent-before-launch log file that then gets written to, per
+    ``test_session_dies_immediately_raises_instead_of_reporting_success``).
+    Fixing the ``__main__`` guard closes this path too, since it is the same
+    fallback the driver's own ``coord assign`` calls go through.
+    """
     from coord.drive import coord_argv  # noqa: PLC0415
 
     argv = coord_argv() + ["drive", entry.repo, str(entry.issue), "--tmux"]
