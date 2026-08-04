@@ -977,9 +977,31 @@ def is_stale_smoke_reason(reason: str | None) -> bool:
 #     or `.github/workflows/**` — stales the verdict exactly as before.
 _INERT_BASE_DIR_PREFIXES = ("docs/", "scripts/", ".github/ISSUE_TEMPLATE/")
 
+# #1778: explicit deny-list that takes precedence over
+# `_INERT_BASE_DIR_PREFIXES` — the executable test surface the Test stage
+# actually runs. `scripts/` is otherwise allowlisted wholesale, which made
+# `scripts/coord-test-runner.sh` inert by omission: a base move touching
+# only the runner didn't stale (wrong — the runner IS what the suite runs),
+# and worse, a *branch* that edits the runner could point at this same
+# allowlist to declare itself untestable and skip its own gate
+# (self-certification). An explicit deny beats trimming the allowlist
+# because the next executable script added under `scripts/` inherits the
+# safe (non-inert) default instead of silently inheriting the hole.
+_INERT_DENY_PATHS = frozenset({
+    "scripts/coord-test-runner.sh",
+})
+
 
 def _path_is_inert(path: str) -> bool:
-    """True when *path* matches the #1738 inert-base allowlist."""
+    """True when *path* matches the #1738 inert-base allowlist.
+
+    Checked on both the base-move side (:func:`_base_move_is_inert`) and the
+    branch side (:func:`_branch_is_inert`) — the deny-list in
+    `_INERT_DENY_PATHS` is consulted first so it wins over the directory
+    allowlist on either side (#1778).
+    """
+    if path in _INERT_DENY_PATHS:
+        return False
     if any(path.startswith(prefix) for prefix in _INERT_BASE_DIR_PREFIXES):
         return True
     return "/" not in path and path.endswith(".md")
@@ -1012,6 +1034,51 @@ def _base_move_is_inert(
         return False
     try:
         files = gh_ops.get_compare_files(repo_github, old_sha, new_sha)
+    except Exception:  # noqa: BLE001 — fail-safe: unknown diff is not "inert"
+        return False
+    if files is None:
+        return False
+    return all(_path_is_inert(f) for f in files)
+
+
+def _branch_is_inert(
+    gh_ops: "GhOps | None",
+    repo_github: str | None,
+    base_sha: str | None,
+    branch_sha: str | None,
+) -> bool:
+    """True when a branch's entire diff against its merge-base is provably
+    inert (#1778) — content the suite cannot see, so
+    ``suite(base + branch) ≡ suite(base)`` and re-running the suite over a
+    moved base tells you nothing about *this branch* that wasn't already
+    known.
+
+    This is the mirror of :func:`_base_move_is_inert`: that function asks
+    "did the base move through anything that matters"; this one asks "does
+    the branch touch anything that matters", independent of whether the base
+    moved at all. The two are consulted together at the base-move staling
+    check (#1479) — either one being true is enough to skip staling on a
+    base move alone. Neither check replaces the separate branch-*content*-
+    changed check (patch-id comparison) that follows: a branch that is
+    inert today and later gains a `coord/**` commit is caught by that check,
+    not this one.
+
+    Fails closed exactly like :func:`_base_move_is_inert` — returns
+    ``False`` ("not proven inert, stale as before") whenever inertness can't
+    be established: no *gh_ops*/*repo_github*, a raising compare call, or a
+    ``None`` (unreadable) result. A false "fresh" would let an untested
+    branch merge; a false "stale" only costs a redundant re-run.
+
+    Reuses :func:`_path_is_inert` for the allowlist, which is why the
+    `_INERT_DENY_PATHS` exclusion of `scripts/coord-test-runner.sh` matters
+    here specifically: without it, a branch that edits the composed test
+    runner could point at the `scripts/` allowlist and declare its own diff
+    untestable, skipping the gate it is trying to evade.
+    """
+    if gh_ops is None or not repo_github or not base_sha or not branch_sha:
+        return False
+    try:
+        files = gh_ops.get_compare_files(repo_github, base_sha, branch_sha)
     except Exception:  # noqa: BLE001 — fail-safe: unknown diff is not "inert"
         return False
     if files is None:
@@ -1184,8 +1251,24 @@ def evaluate_smoke_verdict(
             # entire diff is docs/scripts/issue-template content is provably
             # inert and does not invalidate the verdict — fall through to the
             # branch-content check below instead of staling here.
-            and not _base_move_is_inert(
-                gh_ops, repo_github, test_base_sha, current_base_sha
+            #
+            # #1778: the mirror case — the base move might be substantive,
+            # but if *this branch*'s entire diff is inert content, the suite
+            # can't tell the two SHAs apart either way. Checked against the
+            # branch as it was actually tested (test_base_sha..test_head_sha)
+            # so this doesn't depend on the branch-content check below having
+            # run yet; if the branch has since gained real content, that
+            # check still catches it independently via the patch-id compare.
+            and not (
+                _base_move_is_inert(
+                    gh_ops, repo_github, test_base_sha, current_base_sha
+                )
+                or _branch_is_inert(
+                    gh_ops,
+                    repo_github,
+                    test_base_sha,
+                    getattr(a, "test_head_sha", None),
+                )
             )
         ):
             # stale: re-verify against the new base
@@ -1529,6 +1612,10 @@ class GhOps(Protocol):
         irrelevant base move (docs/scripts/issue-template only) from one that
         could actually affect a test result, before staling an otherwise-
         fresh smoke verdict just because the merge base's SHA moved.
+
+        #1778: also used by :func:`_branch_is_inert`, the mirror check — is
+        the *branch's* own diff (not the base move) entirely inert, so a
+        base move (however substantive) doesn't need to re-verify it either.
         """
         ...
 
