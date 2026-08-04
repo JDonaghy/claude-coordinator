@@ -2288,6 +2288,14 @@ pub struct CoordApp {
     /// Opened by right-click on a Board / Pipeline sidebar row; dismissed by
     /// click-outside, Escape, or item activation.
     pending_context_menu: Option<ContextMenuState>,
+    /// #1374: text staged by `dispatch_context_menu_action`'s
+    /// `"copy-issue-number"` arm for the caller to write to the clipboard.
+    /// That fn has no `&mut dyn Backend` (most of its callers never reach
+    /// this action), so it stashes the payload here and the two direct UI
+    /// entry points (`handle_context_menu_click` / mouse,
+    /// `context_menu_activate_selected` / keyboard) flush it via
+    /// `flush_pending_clipboard_copy` right after dispatch returns.
+    pending_clipboard_copy: Option<String>,
     /// #259 / #607: cached layout stack from the last render — one entry per
     /// open menu level (root + any open submenus).  Each entry is a
     /// `(ContextMenu, ContextMenuLayout)` pair so hit-testing can walk the
@@ -3494,6 +3502,7 @@ impl CoordApp {
             pending_force_merge: None,
             pending_merge_all_ready: None,
             pending_context_menu: None,
+            pending_clipboard_copy: None,
             context_menu_layout: std::cell::RefCell::new(Vec::new()),
             fleet_health_overlay_open: false,
             drive_queue_overlay_open: false,

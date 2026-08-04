@@ -15195,7 +15195,8 @@
             Point::new(0.0, 0.0),
             board_target(None, BoardRowLifecycle::Unknown),
         );
-        let fired = app.context_menu_activate_selected();
+        let mut backend = quadraui::tui::TuiBackend::new();
+        let fired = app.context_menu_activate_selected(&mut backend);
         assert!(fired);
         // Menu dismissed after activating an item.
         assert!(app.pending_context_menu.is_none());
@@ -15941,7 +15942,8 @@
             assert!(state.submenu_path.is_empty(), "no submenu open yet");
         }
         let before_toasts = app.toasts.len();
-        let fired = app.context_menu_activate_selected();
+        let mut backend = quadraui::tui::TuiBackend::new();
+        let fired = app.context_menu_activate_selected(&mut backend);
         assert!(fired, "activate on parent must return true");
         // Menu must NOT be dismissed — submenu is now open.
         assert!(app.pending_context_menu.is_some(), "menu must stay open when submenu opens");
@@ -15965,7 +15967,8 @@
             },
         );
         // Open the submenu.
-        app.context_menu_activate_selected();
+        let mut backend = quadraui::tui::TuiBackend::new();
+        app.context_menu_activate_selected(&mut backend);
         assert!(app.pending_context_menu.as_ref().unwrap().submenu_path.len() == 1);
         // Close it.
         app.context_menu_close_submenu_or_dismiss();
@@ -16013,7 +16016,8 @@
 
         // Simulate the Right-key handler: only activate when has_submenu.
         if app.context_menu_selected_has_submenu() {
-            app.context_menu_activate_selected();
+            let mut backend = quadraui::tui::TuiBackend::new();
+            app.context_menu_activate_selected(&mut backend);
         }
 
         // The menu must still be open — Right on a leaf is a no-op.
@@ -29376,6 +29380,67 @@
             screen.contains("Chat about issue"),
             "#741: right-click on a Board row must open the context menu with \
              'Chat about issue':\n{}",
+            screen
+        );
+    }
+
+    /// #1374: "Copy issue #N" must actually write the number to the
+    /// clipboard, not just toast an apology that it isn't wired up yet.
+    /// Opens the menu via the same right-click chain as
+    /// `tuidriver_right_click_opens_board_context_menu` above, then
+    /// activates the item via the keyboard (`Down` then `Enter`) rather
+    /// than a raw mouse-coordinate click: "Chat about issue" is item 0,
+    /// "View in Pipeline" (item 1) is disabled for this fixture (no real
+    /// Pipeline linkage → `jump_board_to_pipeline` fails), and
+    /// `context_menu_move_selection` skips disabled items/separators, so
+    /// one `Down` from the initial selection lands directly on
+    /// "Copy issue #42" (item 3). Then asserts the resulting toast says
+    /// "Copied" instead of the old stub apology.
+    #[test]
+    fn tuidriver_copy_issue_number_writes_clipboard_and_toasts_copied() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let assignments = vec![make_assignment_typed("running", 42, "repo-a", Some("work"))];
+        let app = make_app_with_assignments(assignments);
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+
+        let (x, y) = driver.find("#42").or_else(|| driver.find("Issue 42")).unwrap_or_else(|| {
+            panic!(
+                "#1374: could not find board row '#42' / 'Issue 42' on initial render:\n{}",
+                driver.screen()
+            )
+        });
+
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: MouseButton::Right,
+            position: Point::new(x, y),
+            modifiers: Modifiers::default(),
+        });
+        assert!(
+            driver.screen_contains("Copy issue #42"),
+            "#1374: context menu must offer 'Copy issue #42':\n{}",
+            driver.screen()
+        );
+
+        driver.press_named(quadraui::NamedKey::Down);
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        // `driver.app()` isn't `CoordApp` (`driver_with_shell` wraps it in an
+        // opaque `ShellAdapter`, see `tuidriver_pty_panic_dialog_wins_key_
+        // priority_over_artifact_dialog` above for the same pattern) — so
+        // assert on the rendered toast text, same as every other
+        // `TuiDriver`-based test in this suite.
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Copied") && screen.contains("#42 copied to clipboard"),
+            "#1374: activating 'Copy issue #42' must toast a real confirmation:\n{}",
+            screen
+        );
+        assert!(
+            !screen.contains("not yet wired"),
+            "#1374: the stub apology must be gone:\n{}",
             screen
         );
     }

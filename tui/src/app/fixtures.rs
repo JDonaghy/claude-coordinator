@@ -119,6 +119,7 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         pending_force_merge: None,
         pending_merge_all_ready: None,
         pending_context_menu: None,
+        pending_clipboard_copy: None,
         context_menu_layout: std::cell::RefCell::new(Vec::new()),
         fleet_health_overlay_open: false,
         drive_queue_overlay_open: false,

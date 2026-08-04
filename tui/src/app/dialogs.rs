@@ -1192,7 +1192,11 @@ impl CoordApp {
     /// submenu toggled), `Some(false)` when the click landed on a non-actionable
     /// cell (separator / disabled — swallow, keep menu open), or `None` when no
     /// menu is open.  A click outside all open levels dismisses the menu.
-    pub(crate) fn handle_context_menu_click(&mut self, pos: Point) -> Option<bool> {
+    pub(crate) fn handle_context_menu_click(
+        &mut self,
+        pos: Point,
+        backend: &mut dyn Backend,
+    ) -> Option<bool> {
         if self.pending_context_menu.is_none() {
             return None;
         }
@@ -1250,6 +1254,7 @@ impl CoordApp {
                     let state = self.pending_context_menu.take()?;
                     *self.context_menu_layout.borrow_mut() = Vec::new();
                     self.dispatch_context_menu_action(&action_id, &state.target);
+                    self.flush_pending_clipboard_copy(backend);
                     return Some(true);
                 }
                 ContextMenuHit::Inert => return Some(false),
@@ -1307,7 +1312,7 @@ impl CoordApp {
     /// If the selected item is a submenu parent → open the submenu.
     /// If it's a leaf action → dispatch and dismiss the menu.
     /// No-op when no menu is open or the item is a separator.
-    pub(crate) fn context_menu_activate_selected(&mut self) -> bool {
+    pub(crate) fn context_menu_activate_selected(&mut self, backend: &mut dyn Backend) -> bool {
         let Some(ref state) = self.pending_context_menu else {
             return false;
         };
@@ -1344,7 +1349,19 @@ impl CoordApp {
         let state = self.pending_context_menu.take().unwrap();
         *self.context_menu_layout.borrow_mut() = Vec::new();
         self.dispatch_context_menu_action(&action_id, &state.target);
+        self.flush_pending_clipboard_copy(backend);
         true
+    }
+
+    /// Write out a clipboard payload staged by `dispatch_context_menu_action`
+    /// (e.g. `"copy-issue-number"`), if any. Split out so both direct UI
+    /// entry points (`handle_context_menu_click` / mouse,
+    /// `context_menu_activate_selected` / keyboard) share one flush site
+    /// rather than duplicating the `backend.services().clipboard()` call.
+    fn flush_pending_clipboard_copy(&mut self, backend: &mut dyn Backend) {
+        if let Some(text) = self.pending_clipboard_copy.take() {
+            backend.services().clipboard().write_text(&text);
+        }
     }
 
     /// Close the deepest open submenu (#607).  If no submenus are open, dismisses
@@ -5995,12 +6012,18 @@ impl CoordApp {
                         (*issue_number).max(0) as u64
                     }
                 };
+                // #1374: the actual clipboard write happens in the two
+                // direct UI callers (`handle_context_menu_click` /
+                // `context_menu_activate_selected`), which have a
+                // `&mut dyn Backend` in scope — this fn doesn't, and
+                // threading one through would cascade into every other
+                // caller (command-palette / drive dispatch and their
+                // tests) that never reaches this action. Stash the text
+                // here; the caller flushes it right after this returns.
+                self.pending_clipboard_copy = Some(num.to_string());
                 self.push_toast(
-                    "Copy",
-                    &format!(
-                        "Copy of #{} not yet wired to the clipboard — primitive smoke test only.",
-                        num,
-                    ),
+                    "Copied",
+                    &format!("#{} copied to clipboard", num),
                     ToastSeverity::Info,
                 );
                 true
