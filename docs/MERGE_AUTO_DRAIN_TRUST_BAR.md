@@ -79,7 +79,45 @@ re-hit the identical bug at $3.44. **This milestone is not done when the PRs mer
 | Daemon-side | #1482 (`_UPSERT_SQL`, `coord/state.py`), #1485 (`dispatch_review`, `coord/review.py`) | Both run inside `coord serve`. PyPI release reaching dellserver's `~/.coord-venv` **+ a `coord-serve` restart**, and per [`OPERATING_GOTCHAS.md` #2](OPERATING_GOTCHAS.md#2-restarting-the-daemon-needs-a-quiet-fleet), not while `coord sessions --remote` shows anything live | `curl http://dellserver:7433/status \| jq .version` (agent) — the daemon has no separate version endpoint, so cross-check `coord-serve`'s process start time against the venv's install timestamp |
 | Coordinator-only | everything else in the milestone | **On dellserver specifically, this is NOT "live from the editable install."** dellserver's `coord-serve` *and* its `coord` CLI both run from the same pinned, non-editable `~/.coord-venv` — deliberately, per #1418, to close the editable-drift hazard where a coord-self worker's `pip install -e .` could take the board down fleet-wide (see the `worker_permissions.deny` block on the `claude-coordinator` repo entry in `coordinator.yml`). So on this host, "coordinator-only" fixes ride the *same* release + restart path as the daemon-side row, not an instant one. (The general claim in [`AGENT_OPERATIONS.md`](AGENT_OPERATIONS.md#publishing-a-release-pypi) that coordinator-only Python is live from an editable install the moment it's on disk is true for a dev machine checked out at `~/src/claude-coordinator`; it is not true for dellserver.) | `pip show claude-coordinator` inside `~/.coord-venv` vs. the commit you need |
 
-### Status against the bar (as verified 2026-07-28)
+### Status against the bar (as verified 2026-08-04)
+
+Checked directly against the live fleet, not assumed from the milestone board.
+
+- **Conditions 1, 3 and 4 are met.** Fleet-wide version is **v0.4.104**: all three
+  agents (precision, elitebook, dellserver), the daemon's `~/.coord-venv`, the
+  sequencer's `~/.coord-cli-venv`, and the operator's editable checkout all report
+  `0.4.104`. `coord-serve` restarted 2026-08-04 20:46:22 UTC, after that install.
+  The four-lane deploy surface is green simultaneously — which had not been true at
+  any earlier point in milestone #50.
+- **Condition 3 is applied**: dellserver's `~/.coord/coordinator.yml` now carries a
+  `merge:` block with `auto_drain: false` and **`max_per_tick: 1`**, with the
+  rationale inline. The cap is live *before* the flag, which is the intended order.
+- **Milestone #50 (#1480) has zero open issues** — all 25 closed, including #1485,
+  the 2026-07-28 blocker.
+- **Condition 2 (N=10 clean manual drains) has NOT started, and its clock opens
+  now — 2026-08-04, not 2026-07-28.** This is the entry most at risk of being
+  read wrong, so the reasoning is recorded rather than the conclusion alone:
+  `coord audit --category merge --since 2026-07-28` returns 60+ merge events, which
+  superficially clears N=10 several times over. It does not count. The
+  stale-verdict work is **four arms** (#1738 drive re-test, #1769 `coord merge
+  --revalidate`, #1778 inert-branch, #1715 batch revalidation), and **all four only
+  went live together in v0.4.104, today.** A measurement on 2026-08-03 found four
+  stalls in a single session with the arms reaching exactly one of them; each of the
+  other three took a human. Those interventions are the dominant source of
+  "manual intervention" events in the 07-28 → 08-04 window, and they occurred under
+  code where at most one arm was deployed. Counting them is the same error this doc
+  already names once: they are evidence the *old* path mostly worked, not that the
+  *fixed* path does.
+
+**Verdict: the bar is not met — one condition short, and it is a waiting condition,
+not a code condition.** Nothing further needs to be built. What remains is to
+observe 10 consecutive clean manual drains under v0.4.104 and record them below.
+`coord drive-queue` (epic #1750, live and on a 15-minute timer since 2026-08-04) is
+the instrument that generates those drains without an operator sitting on them —
+note that it *generates* the drains, it does not *satisfy* the condition, since
+condition 2 counts manually-triggered `coord merge` outcomes.
+
+### Status against the bar (as verified 2026-07-28 — superseded, kept for history)
 
 Checked directly against the live fleet, not assumed from the milestone board:
 
@@ -115,13 +153,19 @@ first place.
 
 ### What closes the gap, in order
 
-1. Cut a release at or after `main`'s current HEAD (covers #1485 plus the other 18
-   commits already ahead of `v0.4.83`) — [`AGENT_OPERATIONS.md`](AGENT_OPERATIONS.md#publishing-a-release-pypi).
-2. `coord agent update --all`, then confirm `coord sessions --remote` is empty and
-   restart `coord-serve` on dellserver — [`AGENT_OPERATIONS.md`](AGENT_OPERATIONS.md#routine-upgrade-all-agents).
-3. Verify: all three agents' `/status` report the new version; daemon venv install
-   timestamp is newer than the `coord-serve` process start time.
-4. Start the N=10 manual-drain observation window: run `coord merge` as usual,
+Steps 1–3 are **done as of 2026-08-04 (v0.4.104)** — struck through rather than
+deleted, so the sequence stays readable against the changelog.
+
+1. ~~Cut a release at or after `main`'s current HEAD (covers #1485 plus the other 18
+   commits already ahead of `v0.4.83`)~~ — **done**, and superseded twice over:
+   v0.4.104 also carries all four stale-verdict arms.
+2. ~~`coord agent update --all`, then confirm `coord sessions --remote` is empty and
+   restart `coord-serve` on dellserver~~ — **done** (daemon restarted 20:46:22 UTC).
+3. ~~Verify: all three agents' `/status` report the new version; daemon venv install
+   timestamp is newer than the `coord-serve` process start time.~~ — **done**, and
+   extended to the fourth lane (`~/.coord-cli-venv`), which nothing upgrades
+   automatically and which was found three releases stale on 2026-07-29.
+4. **← you are here.** Start the N=10 manual-drain observation window: run `coord merge` as usual,
    record each outcome (clean / conflict / had-to-intervene) somewhere durable
    (this doc's changelog below, or the audit trail's own timestamps are enough to
    reconstruct it after the fact via `coord audit --category merge --since <deploy
@@ -162,3 +206,11 @@ incident this whole doc is downstream of):
 
 - 2026-07-28 — doc opened (#1491). Bar defined; verified not met (blocker: #1485
   unreleased). `auto_drain` left `false`.
+- 2026-08-04 — status re-verified against the live fleet. Conditions 1, 3 and 4 now
+  **met**: v0.4.104 live on all four deploy lanes, `coord-serve` restarted 20:46:22
+  UTC, `max_per_tick: 1` applied on dellserver. Milestone #50 closed out (25/25),
+  and all four stale-verdict arms (#1738, #1769, #1778, #1715) went live together
+  in this release. Condition 2 **starts here** — the 60+ merges already in the audit
+  log since 07-28 do **not** count toward it, because the arms whose absence caused
+  the interventions in that window were not deployed. `auto_drain` stays `false`;
+  the bar is now one *waiting* condition, not one *build* condition.
