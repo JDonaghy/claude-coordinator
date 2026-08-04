@@ -433,3 +433,49 @@ class TestApproveProviderAwareModel:
         )
         assert "zhipuai/glm-4.6" in result.output
         assert "providers.definitions" in result.output
+
+    def test_approve_pins_over_plan_time_label_model(
+        self, opencode_config_file: Path, coord_dir: Path,
+    ) -> None:
+        """#1798 review fix: `coord.brain.resolve_models()` sets
+        `proposal.model` directly from a tier-label match at `coord plan`
+        time — a Claude alias (e.g. "haiku"), with zero awareness of the
+        effective provider or its pin. That pre-set value used to flow
+        straight into `dispatch()` as an *explicit* override, winning over
+        the pinned opencode provider's own model and (after this PR's new
+        `enforce_model_provider_compatibility` gate) hard-refusing the
+        dispatch outright instead of just silently misdispatching. The
+        pin must still win."""
+        from coord.models import Proposal
+
+        state_mod.save_proposals(
+            [
+                Proposal(
+                    id=1, machine_name="laptop", repo_name="api",
+                    issue_number=10, issue_title="t", rationale="r",
+                    files_likely=["a.py"], briefing="b", type="work",
+                    model="haiku",
+                ),
+            ]
+        )
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "oc-approve-2"}
+        mock_resp.raise_for_status.return_value = None
+        with patch("coord.dispatch.httpx.post", return_value=mock_resp) as mock_post, \
+             patch("coord.github_ops.get_issue") as mock_get_issue, \
+             patch("coord.github_ops.post_issue_comment"):
+            result = CliRunner().invoke(
+                main, ["approve", "1", "--config", str(opencode_config_file)]
+            )
+        assert result.exit_code == 0, result.output
+        # No live re-fetch needed: the plan-time model is already treated
+        # as label-shaped data, not as a reason to skip resolution.
+        mock_get_issue.assert_not_called()
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["model"] is None, (
+            "expected the pinned opencode provider's own model to win over "
+            f"the plan-time label-derived 'haiku' alias; got {payload['model']!r}"
+        )
+        assert "zhipuai/glm-4.6" in result.output
+        assert "overriding plan-time model 'haiku'" in result.output

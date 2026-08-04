@@ -626,6 +626,58 @@ class TestDispatchEntry:
         assert outcome.model_reason is not None
         assert "zhipuai/glm-4.6" in outcome.model_reason
 
+    def test_opencode_pin_wins_over_matched_label_and_names_it(
+        self, coord_db,
+    ) -> None:
+        """#1798 review fix: when a tier label DOES match (unlike the sibling
+        test above, which has none) but the effective provider still pins
+        its own model, the pin must keep winning (namespace-mismatched
+        Claude alias vs. the provider's own model) — and `outcome.
+        model_reason` must name the label that lost, mirroring
+        `_dispatch_headless`'s equivalent branch in dispatch_workers.py, so
+        `coord milestone dispatch`'s output doesn't silently omit it."""
+        cfg = _config(
+            [_machine("laptop", ["api"])],
+            repos=[Repo(name="api", github="acme/api", provider="opencode")],
+        )
+        cfg.models = ModelsConfig(default="sonnet", labels={"tier:large": "opus"})
+        cfg.providers = ProvidersConfig(
+            default="claude",
+            definitions={
+                "claude": ProviderDef(type="claude"),
+                "opencode": ProviderDef(type="opencode", model="zhipuai/glm-4.6"),
+            },
+        )
+        board = Board()
+        pick = self._pick(cfg, board)
+        repo = cfg.repo("api")
+
+        proposals = []
+
+        def fake_dispatch(proposal, config):
+            proposals.append(proposal)
+            return {"id": "asn-oc-2"}
+
+        with patch(
+            "coord.github_ops.get_issue",
+            return_value={"title": "Fix X", "body": "b", "labels": [{"name": "tier:large"}]},
+        ), \
+             patch("coord.dispatch.dispatch", side_effect=fake_dispatch), \
+             patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.github_ops.check_branch_exists", return_value=False):
+            outcome = dispatch_entry(pick, repo, cfg, board, tracking_issue=100)
+
+        assert outcome.ok is True
+        assert len(proposals) == 1
+        assert proposals[0].model is None, (
+            "expected proposal.model=None so OpenCodeProvider's own "
+            f"definition.model wins over the matched 'tier:large' label; "
+            f"got {proposals[0].model!r}"
+        )
+        assert outcome.model_reason is not None
+        assert "zhipuai/glm-4.6" in outcome.model_reason
+        assert "overriding label 'tier:large'" in outcome.model_reason
+
     def test_claimed_issue_is_not_dispatched(self, coord_db) -> None:
         cfg = _config([_machine("laptop", ["api"])])
         board = Board(active=[_running("server", 762)])  # already claimed elsewhere
