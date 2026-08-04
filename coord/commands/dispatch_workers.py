@@ -4654,17 +4654,25 @@ def _dispatch_headless(
             )
         )
     else:
-        # #1706: resolved_model is None only when the effective provider's
-        # own `providers.definitions.<name>.model` is pinned and neither
-        # --model nor a label matched — state that explicitly instead of
-        # silently printing nothing, so the operator can see --model was
-        # deliberately left off the wire payload in favor of the pin.
+        # #1706/#1798: resolved_model is None when the effective provider's
+        # own `providers.definitions.<name>.model` is pinned and --model
+        # wasn't given — state that explicitly instead of silently printing
+        # nothing, so the operator can see --model was deliberately left
+        # off the wire payload in favor of the pin. #1798: this now also
+        # covers the case where a label DID match (e.g. `tier:small`) but
+        # lost to the pin — surface that explicitly too, since a
+        # namespace-mismatched label (a Claude alias) silently losing to a
+        # non-claude provider's pin is exactly the fix this issue made.
         _pinned = cfg.providers.definitions.get(effective_provider_name)
         if _pinned is not None and _pinned.model:
-            click.echo(
-                f"  model: {_pinned.model} "
-                f"(via providers.definitions[{effective_provider_name!r}].model)"
-            )
+            _via = f"providers.definitions[{effective_provider_name!r}].model"
+            if matched_label:
+                click.echo(
+                    f"  model: {_pinned.model} (via {_via}, "
+                    f"overriding label {matched_label!r})"
+                )
+            else:
+                click.echo(f"  model: {_pinned.model} (via {_via})")
 
     # #1707: mirror the --model reasoning line above — state which link of
     # the spec (--provider) → repo (Repo.provider) → providers.default chain

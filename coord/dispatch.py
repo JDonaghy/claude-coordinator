@@ -154,6 +154,54 @@ def enforce_epic_dispatch_guard(
     )
 
 
+def enforce_model_provider_compatibility(
+    *, wire_model: str | None, effective_provider_name: str, config: Config,
+) -> None:
+    """#1798: STRUCTURAL MODEL/PROVIDER GATE — refuse to dispatch a *wire_model*
+    that cannot plausibly belong to the resolved provider's backend type
+    (:func:`coord.config.model_plausible_for_provider_type`), e.g. a Claude
+    alias (``"sonnet"``) handed to an ``opencode``-type provider.
+
+    :func:`resolve_dispatch_model_alias`'s precedence fix (provider pin wins
+    over label routing) closes the common path into this failure, but
+    doesn't close every one — an operator can still pass an explicit
+    ``--model`` that mismatches the resolved provider, or configure a
+    non-claude provider with no pin at all (so a namespace-mismatched
+    *label_model* falls through unchecked). Before this gate, a mismatch
+    like that was only discovered when the backend itself rejected the
+    argument mid-run, minutes into a worker, after the assignment row
+    existed and the worktree was built — see the #1798 issue's #1708 proof
+    run, where an explicit ``--model opencode/glm-5.2`` override against a
+    silently-``claude``-falling-back agent made a masked bug visible only
+    because the mismatch was loud. Placed alongside the other structural
+    gates in :func:`dispatch` (oracle readiness, epic-target, TOS,
+    provider-availability), before any worktree/HTTP work happens.
+
+    A ``None`` *wire_model* (``--model`` omitted, provider's own default
+    applies) is always a no-op — there's nothing to validate.
+
+    Raises:
+        ValueError: When *wire_model* is set but implausible for the
+            resolved provider's type, naming both.
+    """
+    if wire_model is None:
+        return
+    from coord.providers import provider_type_for  # noqa: PLC0415
+    from coord.config import model_plausible_for_provider_type  # noqa: PLC0415
+
+    provider_type = provider_type_for(effective_provider_name, config.providers)
+    if model_plausible_for_provider_type(wire_model, provider_type):
+        return
+    raise ValueError(
+        f"refusing dispatch: model {wire_model!r} is not valid for provider "
+        f"{effective_provider_name!r} (type {provider_type!r}) — the two "
+        "belong to different model namespaces (#1798). Pass an explicit "
+        "--model in the resolved provider's own namespace, or leave "
+        "--model unset and pin providers.definitions"
+        f"[{effective_provider_name!r}].model in coordinator.yml instead."
+    )
+
+
 def _reraise_with_body(
     exc: httpx.HTTPStatusError, machine_name: str,
 ) -> httpx.HTTPStatusError:
@@ -206,9 +254,9 @@ def resolve_dispatch_model_alias(
 ) -> str | None:
     """Resolve the dispatch model *alias* (before ``models.resolve()``).
 
-    Precedence: *explicit_model* → *label_model* → the effective provider's
-    own pinned ``ProviderDef.model`` (for non-claude/claude-pty backends
-    only) → ``models.default``. The board/DB stores this alias for
+    Precedence: *explicit_model* → the effective provider's own pinned
+    ``ProviderDef.model`` (for non-claude/claude-pty backends only) →
+    *label_model* → ``models.default``. The board/DB stores this alias for
     legibility; the caller is responsible for the final
     ``config.models.resolve()`` translation to an exact model id (typically
     deferred to :func:`dispatch`/:func:`resolve_dispatch_model`, which run
@@ -216,6 +264,21 @@ def resolve_dispatch_model_alias(
     entry point that calls this function for why: re-resolving here would
     bake an exact id into ``Proposal.model``/board bookkeeping instead of
     the human-legible alias).
+
+    #1798: *label_model* comes from ``models.labels``, which maps to
+    Anthropic aliases (``tier:small -> haiku``) — a namespace that means
+    nothing to a non-claude/claude-pty backend. Letting it win over a
+    pinned non-claude provider's own ``ProviderDef.model`` (the OLD
+    precedence, `explicit_model or label_model` unconditionally) dispatched
+    e.g. ``opencode`` with ``--model sonnet``, a Claude alias the opencode
+    binary cannot serve — silently, with no validation at dispatch time.
+    Now the provider's own pin wins over label routing whenever it applies
+    (*provider_pins_model*); only an *explicit_model* — a human being
+    specific — still overrides the pin. Claude/claude-pty backends are
+    unaffected: *provider_pins_model* is always ``False`` for them (their
+    ``ProviderDef.model``, if any, is folded into ``models.default`` via a
+    different path — see :attr:`coord.config.ProviderDef.model`'s
+    docstring), so label routing there is unchanged.
 
     #1430: label routing (*label_model*) is gated to ``type="work"`` by
     every caller — plan workers are read-only/cheap and must not inherit a
@@ -226,23 +289,28 @@ def resolve_dispatch_model_alias(
     #1706 review fix: ``config.models.default`` (e.g. ``"sonnet"``) is a
     Claude model alias and means nothing to a non-Claude backend — passing
     it through as ``--model sonnet`` to ``opencode run`` (or any future
-    non-Claude provider) is nonsensical. When neither *explicit_model* nor
-    *label_model* supplied a model, and the effective provider's backend
-    *type* is NOT ``claude``/``claude-pty``, check whether that provider's
-    own ``ProviderDef.model`` (coordinator.yml ``providers.
+    non-Claude provider) is nonsensical. When *explicit_model* didn't supply
+    a model, and the effective provider's backend *type* is NOT
+    ``claude``/``claude-pty``, check whether that provider's own
+    ``ProviderDef.model`` (coordinator.yml ``providers.
     definitions.<name>.model``) is pinned; if so, return ``None`` instead
-    of ``models.default`` so the eventual wire payload omits ``--model``
-    entirely and the provider instance's own ``build_command`` falls back
-    to its ``self._model`` (threaded in from ``ProviderDef.model`` at
-    construction — see ``coord/providers/opencode.py`` and
+    of *label_model*/``models.default`` so the eventual wire payload omits
+    ``--model`` entirely and the provider instance's own ``build_command``
+    falls back to its ``self._model`` (threaded in from ``ProviderDef.model``
+    at construction — see ``coord/providers/opencode.py`` and
     ``coord/providers/claude.py``). This makes ``providers.definitions.
     <name>.model`` actually reachable for a normal ``coord assign``/``coord
     approve``/``coord milestone dispatch`` with no explicit ``--model``,
-    instead of being permanently shadowed by ``config.models.default``.
-    Explicit overrides (``--model``, label routing) still win over the
-    provider's pin, matching the precedence already implemented in each
-    provider's ``build_command``: resolved_model > spec.model >
-    definition.model.
+    instead of being permanently shadowed by ``config.models.default`` OR
+    (#1798) by a namespace-mismatched *label_model*.
+
+    Only an explicit override (``--model``) wins over the provider's pin —
+    matching the precedence already implemented in each provider's
+    ``build_command``: resolved_model > spec.model > definition.model.
+    Label routing does NOT win over the pin (#1798 fix): ``models.labels``
+    resolves to Claude aliases, which are meaningless to a pinned non-claude
+    provider, so the pin — the only value in the correct namespace — wins
+    instead.
 
     This function is called from every site that used to inline the
     ``explicit or label or config.models.default`` rule so the
@@ -285,10 +353,12 @@ def resolve_dispatch_model_alias(
         and provider_def.type not in ("claude", "claude-pty")
         and provider_def.model is not None
     )
-    if explicit_model or label_model:
-        return explicit_model or label_model
+    if explicit_model:
+        return explicit_model
     if provider_pins_model:
         return None
+    if label_model:
+        return label_model
     return config.models.default
 
 
@@ -494,11 +564,23 @@ def dispatch(
             if sealed not in files_forbidden:
                 files_forbidden.append(sealed)
 
-    # Resolve model: proposal override → models.labels (type="work" only) →
-    # provider-definition pin (non-claude/claude-pty only) → config default.
-    # See resolve_dispatch_model()'s docstring for the full precedence
-    # rationale (#1430, #1706).
+    # Resolve model: proposal override → provider-definition pin
+    # (non-claude/claude-pty only) → models.labels (type="work" only) →
+    # config default. See resolve_dispatch_model()'s docstring for the full
+    # precedence rationale (#1430, #1706, #1798).
     wire_model = resolve_dispatch_model(proposal, config, effective_provider_name)
+
+    # #1798: STRUCTURAL MODEL/PROVIDER GATE — refuse a resolved model that
+    # cannot plausibly belong to the resolved provider's backend type (e.g.
+    # a Claude alias handed to an opencode-type provider) before any
+    # worktree/HTTP work happens. See enforce_model_provider_compatibility's
+    # docstring for why this is still needed even after the precedence fix
+    # above (an explicit --model, or an unpinned non-claude provider, can
+    # still produce a mismatch).
+    enforce_model_provider_compatibility(
+        wire_model=wire_model, effective_provider_name=effective_provider_name,
+        config=config,
+    )
 
     # #255: pin the worker's branch base to the repo's configured default
     # branch.  Without this the agent fell back to a hardcoded "main", which

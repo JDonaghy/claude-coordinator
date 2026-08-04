@@ -18,9 +18,11 @@ from coord.config import (
 from coord.dispatch import (
     dispatch,
     enforce_epic_dispatch_guard,
+    enforce_model_provider_compatibility,
     enforce_oracle_readiness,
     post_briefing,
     resolve_dispatch_model,
+    resolve_dispatch_model_alias,
 )
 from coord.models import Machine, Proposal, Repo
 
@@ -827,6 +829,42 @@ class TestModelResolution:
 
         dispatch(p, cfg)
         assert mock_post.call_args.kwargs["json"]["model"] == "sonnet"
+
+    @patch("coord.dispatch.httpx.post")
+    def test_claude_type_label_routing_unchanged_with_alias_translation(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """#1798 regression test: the precedence fix (provider pin wins over
+        label routing) is scoped to non-claude/claude-pty providers only —
+        a plain claude-type dispatch's label routing, INCLUDING the
+        alias -> exact-id translation via ``models.versions``, must be
+        completely unchanged. A claude-type ``ProviderDef.model`` pin (if
+        any) never enters this precedence chain at all (see
+        ``ProviderDef.model``'s docstring) — this is the exact regression
+        risk the #1798 issue names."""
+        from coord.config import ModelsConfig
+
+        cfg = self._config_with_labels()
+        cfg.models = ModelsConfig(
+            default="sonnet",
+            labels={"tier:large": "opus"},
+            versions={"opus": "claude-opus-4-7"},
+        )
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=10, issue_title="x", rationale="", type="work",
+            issue_labels=["tier:large"],
+        )
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        dispatch(p, cfg)
+        assert mock_post.call_args.kwargs["json"]["model"] == "claude-opus-4-7", (
+            "a claude-type dispatch must still resolve tier:large -> opus -> "
+            "claude-opus-4-7 via models.labels + models.versions, unaffected "
+            "by the #1798 provider-pin precedence fix"
+        )
 
 
 class TestOracleReadinessGate:
@@ -1718,7 +1756,14 @@ class TestProviderMachineCapabilityGate:
                 capabilities=["provider:opencode"],
             )],
             providers=ProvidersConfig(
-                definitions={"opencode": ProviderDef(type="opencode")},
+                # #1798: pin a model in opencode's own namespace — this test
+                # is about the machine-capability gate, not model
+                # resolution; an unpinned opencode provider would otherwise
+                # fall through to `models.default` ("sonnet", a Claude
+                # alias) and get refused by the separate #1798 model/
+                # provider compatibility gate before reaching the capability
+                # assertion this test actually cares about.
+                definitions={"opencode": ProviderDef(type="opencode", model="opencode/big-pickle")},
             ),
         )
         p = Proposal(
@@ -1746,6 +1791,44 @@ class TestProviderAwareModelResolution:
     not silently shadow a non-Claude provider's own pinned `model`. Model
     resolution in `dispatch()` is now provider-aware: keyed off the
     effective provider's `ProviderDef.type`, not its registered name."""
+
+    def test_alias_precedence_explicit_beats_pin_beats_label_beats_default(
+        self,
+    ) -> None:
+        """#1798: pure unit-level check of `resolve_dispatch_model_alias`'s
+        full precedence ladder for a non-claude/claude-pty provider that
+        pins its own model: explicit --model > the provider's pin > label
+        routing > models.default. Isolates the precedence rule itself from
+        the HTTP dispatch plumbing exercised by the other tests here."""
+        cfg = Config(
+            repos=[], machines=[],
+            providers=ProvidersConfig(
+                definitions={
+                    "claude": ProviderDef(type="claude"),
+                    "oc-mid": ProviderDef(type="opencode", model="opencode/glm-5.2"),
+                },
+            ),
+        )
+        # explicit --model wins over everything, pin included.
+        assert resolve_dispatch_model_alias(
+            explicit_model="opencode/kimi-k3", label_model="haiku",
+            config=cfg, effective_provider_name="oc-mid",
+        ) == "opencode/kimi-k3"
+        # #1798: the provider's own pin wins over label routing.
+        assert resolve_dispatch_model_alias(
+            explicit_model=None, label_model="haiku",
+            config=cfg, effective_provider_name="oc-mid",
+        ) is None, "None signals 'omit --model', letting build_command fall back to the pin"
+        # no pin, no explicit -> label routing still applies.
+        assert resolve_dispatch_model_alias(
+            explicit_model=None, label_model="haiku",
+            config=cfg, effective_provider_name="claude",
+        ) == "haiku"
+        # nothing at all -> models.default.
+        assert resolve_dispatch_model_alias(
+            explicit_model=None, label_model=None,
+            config=cfg, effective_provider_name="claude",
+        ) == cfg.models.default
 
     @patch("coord.dispatch.httpx.post")
     def test_opencode_definition_model_wins_when_no_explicit_override(
@@ -1906,6 +1989,193 @@ class TestProviderAwareModelResolution:
         dispatch(p, cfg)
         payload = mock_post.call_args.kwargs["json"]
         assert payload["model"] == "sonnet"
+
+    def _oc_mid_config(self) -> Config:
+        """Mirrors the #1798 issue's reproduction: an opencode-type
+        provider pinned to a real OpenCode Zen model id, dispatched against
+        an issue carrying a Claude tier label."""
+        return Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+                capabilities=["provider:opencode"],
+            )],
+            providers=ProvidersConfig(
+                default="claude",
+                definitions={
+                    "claude": ProviderDef(type="claude"),
+                    "oc-mid": ProviderDef(type="opencode", model="opencode/glm-5.2"),
+                },
+            ),
+        )
+
+    @patch("coord.dispatch.httpx.post")
+    def test_tier_label_does_not_override_opencode_provider_pin(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """#1798 named acceptance test: `--provider oc-mid` on an issue
+        carrying a tier label (`tier:small` -> the Claude alias `haiku`,
+        via `models.labels`) must dispatch the PROVIDER's pinned model
+        (`opencode/glm-5.2`), not the label's — the exact reproduction from
+        the #1798 issue (`coord assign --dry-run --provider oc-mid ...`
+        against issue #1079). Fails against pre-#1798 code, which returned
+        `explicit_model or label_model` unconditionally and shipped
+        `--model haiku` to the opencode binary."""
+        from coord.config import ModelsConfig
+
+        cfg = self._oc_mid_config()
+        cfg.models = ModelsConfig(default="sonnet", labels={"tier:small": "haiku"})
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "abc"}
+        mock_post.return_value = mock_resp
+
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=1079, issue_title="x", rationale="", type="work",
+            issue_labels=["coord", "status:ready", "tier:small"],
+            provider="oc-mid",
+        )
+        dispatch(p, cfg)
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["model"] is None, (
+            "spec.model must be left unset so OpenCodeProvider.build_command "
+            "falls back to the provider definition's own pinned model "
+            f"('opencode/glm-5.2'), not the label-routed Claude alias "
+            f"'haiku'; got {payload['model']!r}"
+        )
+
+    @patch("coord.dispatch.httpx.post")
+    def test_explicit_model_wins_over_both_label_and_opencode_pin(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """#1798 named acceptance test: an explicit --model still wins over
+        BOTH the tier label AND the provider's own pin — a human being
+        specific about the model overrides every automatic routing rule."""
+        from coord.config import ModelsConfig
+
+        cfg = self._oc_mid_config()
+        cfg.models = ModelsConfig(default="sonnet", labels={"tier:small": "haiku"})
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "abc"}
+        mock_post.return_value = mock_resp
+
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=1079, issue_title="x", rationale="", type="work",
+            issue_labels=["tier:small"], provider="oc-mid",
+            model="opencode/kimi-k3",
+        )
+        dispatch(p, cfg)
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["model"] == "opencode/kimi-k3"
+
+
+class TestModelProviderCompatibilityGate:
+    """#1798 named acceptance test: refuse a model that cannot plausibly
+    belong to the resolved provider's backend type, before dispatch spends
+    a worktree/network round-trip discovering the backend rejects it. See
+    `coord.dispatch.enforce_model_provider_compatibility` and
+    `coord.config.model_plausible_for_provider_type`."""
+
+    def test_noop_when_wire_model_is_none(self) -> None:
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+            )],
+        )
+        enforce_model_provider_compatibility(
+            wire_model=None, effective_provider_name="claude", config=cfg,
+        )  # must not raise
+
+    def test_noop_for_matching_namespaces(self) -> None:
+        cfg = Config(
+            repos=[], machines=[],
+            providers=ProvidersConfig(
+                definitions={
+                    "claude": ProviderDef(type="claude"),
+                    "oc-mid": ProviderDef(type="opencode", model="opencode/glm-5.2"),
+                },
+            ),
+        )
+        enforce_model_provider_compatibility(
+            wire_model="sonnet", effective_provider_name="claude", config=cfg,
+        )
+        enforce_model_provider_compatibility(
+            wire_model="opencode/glm-5.2", effective_provider_name="oc-mid", config=cfg,
+        )
+
+    def test_claude_alias_refused_for_opencode_provider(self) -> None:
+        """A Claude alias explicitly forced onto an opencode-type provider
+        (e.g. --model haiku --provider oc-mid) is refused before dispatch,
+        naming both the model and the provider — rather than being shipped
+        to the opencode binary for it to reject mid-run."""
+        cfg = Config(
+            repos=[], machines=[],
+            providers=ProvidersConfig(
+                definitions={
+                    "claude": ProviderDef(type="claude"),
+                    "oc-mid": ProviderDef(type="opencode", model="opencode/glm-5.2"),
+                },
+            ),
+        )
+        with pytest.raises(ValueError) as exc_info:
+            enforce_model_provider_compatibility(
+                wire_model="haiku", effective_provider_name="oc-mid", config=cfg,
+            )
+        message = str(exc_info.value)
+        assert "haiku" in message
+        assert "oc-mid" in message
+
+    def test_opencode_style_model_refused_for_claude_provider(self) -> None:
+        """An opencode `provider/model`-shaped identifier explicitly forced
+        onto a claude-type provider is refused the same way, naming both."""
+        cfg = Config(
+            repos=[], machines=[],
+            providers=ProvidersConfig(
+                definitions={"claude": ProviderDef(type="claude")},
+            ),
+        )
+        with pytest.raises(ValueError) as exc_info:
+            enforce_model_provider_compatibility(
+                wire_model="opencode/glm-5.2", effective_provider_name="claude", config=cfg,
+            )
+        message = str(exc_info.value)
+        assert "opencode/glm-5.2" in message
+        assert "claude" in message
+
+    @patch("coord.dispatch.httpx.post")
+    def test_dispatch_refuses_mismatched_explicit_model_before_posting(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """End-to-end: `dispatch()` itself refuses before ever POSTing to
+        the agent server — the gate is wired into the real dispatch path,
+        not just unit-tested in isolation."""
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+                capabilities=["provider:opencode"],
+            )],
+            providers=ProvidersConfig(
+                default="claude",
+                definitions={
+                    "claude": ProviderDef(type="claude"),
+                    "oc-mid": ProviderDef(type="opencode", model="opencode/glm-5.2"),
+                },
+            ),
+        )
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=10, issue_title="x", rationale="", type="work",
+            provider="oc-mid", model="haiku",
+        )
+        with pytest.raises(ValueError, match="haiku"):
+            dispatch(p, cfg)
+        mock_post.assert_not_called()
 
 
 class TestDispatchErrorSurfacing:

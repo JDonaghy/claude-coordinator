@@ -28,7 +28,12 @@ from coord.agent import (
     AssignmentSpec,
     default_worker_command,
 )
-from coord.config import ModelsConfig, ProviderDef, ProvidersConfig
+from coord.config import (
+    ModelsConfig,
+    ProviderDef,
+    ProvidersConfig,
+    model_plausible_for_provider_type,
+)
 from coord.models import Machine
 from coord.providers import (
     build_provider,
@@ -514,6 +519,31 @@ class TestProviderTypeFor:
         handles it (mirrors guard_unattended_dispatch's posture)."""
         cfg = ProvidersConfig()
         assert provider_type_for("totally-unregistered", cfg) == "totally-unregistered"
+
+
+class TestModelPlausibleForProviderType:
+    """#1798: `model_plausible_for_provider_type` is the namespace-shape
+    sanity check `coord.dispatch.enforce_model_provider_compatibility`
+    gates dispatch on — a cheap syntax check, not a live catalog lookup."""
+
+    def test_claude_alias_plausible_for_claude(self) -> None:
+        assert model_plausible_for_provider_type("sonnet", "claude") is True
+        assert model_plausible_for_provider_type("opus", "claude-pty") is True
+
+    def test_claude_exact_id_plausible_for_claude(self) -> None:
+        assert model_plausible_for_provider_type("claude-sonnet-4-6", "claude") is True
+
+    def test_opencode_style_model_implausible_for_claude(self) -> None:
+        assert model_plausible_for_provider_type("opencode/glm-5.2", "claude") is False
+        assert model_plausible_for_provider_type("deepseek/deepseek-chat", "claude-pty") is False
+
+    def test_opencode_style_model_plausible_for_opencode(self) -> None:
+        assert model_plausible_for_provider_type("opencode/glm-5.2", "opencode") is True
+        assert model_plausible_for_provider_type("deepseek/deepseek-chat", "opencode") is True
+
+    def test_claude_alias_implausible_for_opencode(self) -> None:
+        assert model_plausible_for_provider_type("sonnet", "opencode") is False
+        assert model_plausible_for_provider_type("haiku", "opencode") is False
 
 
 class TestMachineSupportsProvider:
