@@ -36,15 +36,19 @@ def _apply_revalidation(items, board, config, gh_ops, *, dry_run: bool):
     never touched), re-tests them against the current base, and lets
     :func:`coord.merge_queue.process` re-evaluate afterwards.
 
-    Batch (#1715 option 3): candidates are grouped by ``(repo, target_branch)``
-    and each group is composed onto its current base and validated by ONE suite
-    run — which is exactly what the operator did by hand three times in the
-    2026-08-03 session that motivated this. A group whose composite fails is
-    left blocked, with the failure quoted; no verdict is written for any of its
-    entries, so a re-test that fails can never launder a merge.
+    Batch (#1715): candidates are grouped by ``(repo, target_branch)`` and each
+    group is composed onto its current base and validated by ONE suite run —
+    which is exactly what the operator did by hand three times in the
+    2026-08-03 session that motivated this. N approved branches on one base
+    cost one suite run, not N.
 
-    Under ``--dry-run`` this only *names* the candidates — no worktree, no
-    suite, no verdict write.
+    A group whose composite fails merges **nothing** on that result and marks
+    nothing failed; :func:`coord.revalidate.revalidate_group` then re-tests each
+    branch alone so the culprit is named and the innocent branches still merge.
+    A failing re-test can never launder a merge in either pass.
+
+    Under ``--dry-run`` this only *names* the batches and their members — no
+    worktree, no suite, no verdict write.
 
     Returns the board to hand to ``process()``: a freshly-loaded one when any
     verdict was actually recorded (the in-memory board predates that write and
@@ -62,33 +66,33 @@ def _apply_revalidation(items, board, config, gh_ops, *, dry_run: bool):
         )
         return board
 
+    if dry_run:
+        for line in _rv.describe_batches(candidates):
+            click.echo(line)
+        return board
+
     for line in _rv.describe_candidates(candidates):
         click.echo(line)
 
-    if dry_run:
-        click.echo(
-            f"  --revalidate: (dry run) would re-test {len(candidates)} "
-            "entry(ies) against the current base before merging"
-        )
-        return board
-
-    groups: dict[tuple[str, str], list] = {}
-    for c in candidates:
-        groups.setdefault((c.entry.repo_name, c.entry.target_branch), []).append(c)
-
     recorded_any = False
-    for (repo_name, target_branch), group in sorted(groups.items()):
+    total_runs = 0
+    groups = _rv.group_candidates(candidates)
+    for (repo_name, target_branch), group in groups:
         click.echo(
             f"  --revalidate: {repo_name} → {target_branch}: "
             f"{len(group)} entry(ies)"
         )
-        result = _rv.revalidate(group, config, echo=click.echo)
-        if result.ok:
-            recorded_any = recorded_any or bool(result.recorded)
-            click.echo(f"  --revalidate: PASSED — {result.reason}")
-        else:
-            for line in _rv.format_failure(result):
-                click.echo(line, err=True)
+        batch = _rv.revalidate_group(group, config, echo=click.echo)
+        total_runs += batch.suite_runs
+        recorded_any = recorded_any or bool(batch.recorded)
+        for line in _rv.format_batch(batch):
+            click.echo(line, err=not batch.composite.ok)
+
+    if len(candidates) > 1:
+        click.echo(
+            f"  --revalidate: {total_runs} suite run(s) for "
+            f"{len(candidates)} entry(ies)"
+        )
 
     if not recorded_any:
         return board
@@ -933,19 +937,26 @@ def _merge_via_daemon(svc, params: dict) -> None:
     "--revalidate",
     is_flag=True,
     help=(
-        "#1769: re-test entries blocked SOLELY on a stale-but-passed test "
-        "verdict against the current base, then merge them. Off by default — "
-        "`coord merge` with no flag is unchanged. Applies only to the stale "
-        "case: an entry blocked on review, CI, conflict, or a genuinely "
-        "missing verdict is left untouched. When it covers several entries "
-        "they are composed onto the current base together and validated by ONE "
-        "suite run (#1715 option 3), so a failure does not identify its "
-        "culprit — but a failure never merges anything: every entry in the "
-        "batch stays blocked with the failure quoted. Runs the repo's own "
-        "build/test commands locally, so it must run where the repo is checked "
-        "out (on a thin client it routes to the daemon host, like the rest of "
-        "`coord merge`). Distinct from --skip-smoke, which waives the gate "
-        "instead of satisfying it."
+        "#1769/#1715: re-test entries blocked SOLELY on a stale-but-passed "
+        "test verdict against the current base, then merge them. Off by "
+        "default — `coord merge` with no flag is unchanged, and the unattended "
+        "auto-drain never sets it. Applies only to the stale case: an entry "
+        "blocked on review, CI, conflict, or a genuinely missing verdict is "
+        "left untouched. "
+        "BATCH (#1715): when several entries share a base they are composed "
+        "onto it together and validated by ONE suite run, not one run each — "
+        "N approved branches cost 1 run. The honest trade: that validates the "
+        "COMPOSITE, not each branch alone. It is a re-confirmation rather than "
+        "a first proof — every member already holds its own passed verdict "
+        "from an earlier base — and the batch merges against the same base "
+        "snapshot the composite was built on. "
+        "If the composite FAILS, nothing merges and nothing is marked failed; "
+        "each branch is then re-tested alone, so the culprit is named and the "
+        "innocent branches still merge (worst case 1+N runs, typical case 1). "
+        "Runs the repo's own build/test commands locally, so it must run where "
+        "the repo is checked out (on a thin client it routes to the daemon "
+        "host, like the rest of `coord merge`). Distinct from --skip-smoke, "
+        "which waives the gate instead of satisfying it."
     ),
 )
 

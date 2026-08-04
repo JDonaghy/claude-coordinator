@@ -313,10 +313,15 @@ def _git(cwd: Path, *args: str) -> None:
 
 @pytest.fixture
 def git_fleet(tmp_path: Path):
-    """A bare 'origin' with `main` plus two feature branches that compose
+    """A bare 'origin' with `main` plus three feature branches that compose
     cleanly, and a local checkout wired to it — the real shape `revalidate()`
     operates on (throwaway worktree off the base checkout, `origin/<branch>`
-    refs)."""
+    refs).
+
+    Three branches, not two: #1715's headline acceptance is stated over a
+    THREE-entry queue ("assert the run count is 1, not 3"). Tests that only
+    need two simply queue two — an unused branch in the fleet costs nothing.
+    """
     origin = tmp_path / "origin.git"
     seed = tmp_path / "seed"
     checkout = tmp_path / "checkout"
@@ -329,7 +334,7 @@ def git_fleet(tmp_path: Path):
     _git(seed, "add", ".")
     _git(seed, "commit", "-q", "-m", "base")
 
-    for issue, aid in ((101, "w1"), (102, "w2")):
+    for issue, aid in ((101, "w1"), (102, "w2"), (103, "w3")):
         _git(seed, "checkout", "-q", "-b", f"issue-{issue}-{aid}", "main")
         (seed / f"f{issue}.txt").write_text(f"issue {issue}\n")
         _git(seed, "add", ".")
@@ -556,21 +561,24 @@ def _compare_files(repo, base, head):
     return ["coord/merge_queue.py"]
 
 
-def _seed_two_stale_entries(git_fleet: Path):
-    """Two approved, tested entries whose verdicts were both staled by a base
-    move — the #1769 headline scenario, with no live drive."""
+_FLEET = (("w1", 101), ("w2", 102), ("w3", 103))
+
+
+def _seed_stale_entries(pairs=_FLEET[:2]):
+    """N approved, tested entries whose verdicts were all staled by a base
+    move — the #1769/#1715 headline scenario, with no live drive."""
     from coord.state import save_board
 
     entries = []
     works = []
-    for aid, issue in (("w1", 101), ("w2", 102)):
+    for aid, issue in pairs:
         e = _entry(aid, issue=issue)
         e.branch_head_sha = f"branch-sha-{issue}"
         entries.append(e)
         works.append(_tested_work(aid, issue=issue))
     mq.save_queue(entries)
     save_board(Board(active=[], completed=works))
-    for aid, issue in (("w1", 101), ("w2", 102)):
+    for aid, issue in pairs:
         _stamp_anchors(
             aid,
             head_sha=f"branch-sha-{issue}",
@@ -578,6 +586,10 @@ def _seed_two_stale_entries(git_fleet: Path):
             patch_id=f"patch-{issue}",
         )
     return entries
+
+
+def _seed_two_stale_entries(git_fleet: Path):
+    return _seed_stale_entries(_FLEET[:2])
 
 
 @pytest.fixture
@@ -644,6 +656,8 @@ class TestMergeRevalidateBlackBox:
     def test_dry_run_names_both_as_candidates_without_running_anything(
         self, blackbox,
     ) -> None:
+        """#1715: "--dry-run names the batch members and states plainly that
+        one composed run will validate all of them"."""
         cfg, checkout = blackbox
         with patch("coord.revalidate.revalidate") as reval:
             result = _invoke(
@@ -653,9 +667,15 @@ class TestMergeRevalidateBlackBox:
 
         assert result.exit_code == 0, result.output
         reval.assert_not_called()
+        # Every member is named...
         assert "revalidate: api #101 (issue-101-w1" in result.output
         assert "revalidate: api #102 (issue-102-w2" in result.output
-        assert "would re-test 2 entry(ies)" in result.output
+        # ...as ONE batch, costing ONE run.
+        assert "BATCH of 2" in result.output
+        assert "ONE composed suite run (not 2)" in result.output
+        assert "2 entry(ies) in 1 batch(es) — 1 suite run(s)" in result.output
+        # The trade is stated where the operator decides, not just in --help.
+        assert "validates the COMPOSITE, not each branch alone" in result.output
         assert _states() == {"w1": mq.PENDING, "w2": mq.PENDING}
 
     def test_revalidate_drains_both(self, blackbox) -> None:
@@ -704,6 +724,170 @@ class TestMergeRevalidateBlackBox:
         reval.assert_not_called()
         assert "no entry is blocked solely on a stale test verdict" in result.output
         assert _states() == {"w1": mq.PENDING}
+
+
+class TestBatchAcceptance:
+    """#1715: the cascade half. N approved branches on one base used to cost
+    N−1 full suite runs, because the first merge staled everything behind it.
+
+    These are the issue's stated acceptance criteria, asserted on the run
+    COUNT directly — "this is the whole point and it must be asserted
+    directly, not implied by wall-clock".
+    """
+
+    @staticmethod
+    def _cfg_with_counter(tmp_path: Path, git_fleet: Path, tail: str = "") -> tuple:
+        """Config whose test_command appends one byte per invocation.
+
+        Counting invocations of the repo's real `test_command`, through the
+        real CLI, is the only measurement that actually answers "how many
+        suite runs did that cost" — a mock of `revalidate()` would move the
+        assertion above the thing under test.
+        """
+        counter = tmp_path / "suite-runs"
+        cmd = f"printf x >> {counter}" + tail
+        cfg = tmp_path / "coordinator.yml"
+        cfg.write_text(
+            CONFIG_YAML.format(repo_path=str(git_fleet)).replace(
+                'test_command: "true"', f'test_command: "{cmd}"',
+            )
+        )
+        return cfg, counter
+
+    @staticmethod
+    def _runs(counter: Path) -> int:
+        return len(counter.read_text()) if counter.exists() else 0
+
+    def test_three_stale_entries_cost_one_suite_run_and_all_merge(
+        self, git_fleet: Path, tmp_path: Path, coord_db,
+    ) -> None:
+        """THE headline criterion: "Three approved entries queued, all
+        stale-but-`passed`, base moved: `coord merge --revalidate` performs ONE
+        suite run and merges all three. Assert the run count is 1, not 3."
+        """
+        _seed_stale_entries(_FLEET)
+        cfg, counter = self._cfg_with_counter(tmp_path, git_fleet)
+
+        result = _invoke(["merge", "--config", str(cfg), "--revalidate"], git_fleet)
+
+        assert result.exit_code == 0, result.output
+        assert self._runs(counter) == 1, (
+            f"expected ONE composed suite run for three entries, got "
+            f"{self._runs(counter)} — the cascade is back\n{result.output}"
+        )
+        assert _states() == {
+            "w1": mq.MERGED, "w2": mq.MERGED, "w3": mq.MERGED,
+        }, result.output
+        assert "--revalidate: PASSED" in result.output
+        assert "1 suite run(s) for 3 entry(ies)" in result.output
+
+    def test_red_composite_merges_nothing_then_narrows_to_the_culprit(
+        self, git_fleet: Path, tmp_path: Path, coord_db,
+    ) -> None:
+        """#1715: "A red composite merges nothing, and the follow-up per-entry
+        pass identifies the actual culprit and merges the others."
+
+        The suite here fails iff issue 103's file is in the tree, so the
+        composite (which contains it) is red while 101 and 102 are green on
+        their own — one culprit, two innocents, decided by the real suite
+        rather than by a stubbed verdict.
+        """
+        _seed_stale_entries(_FLEET)
+        cfg, counter = self._cfg_with_counter(
+            tmp_path, git_fleet, tail="; ! test -f f103.txt",
+        )
+
+        result = _invoke(["merge", "--config", str(cfg), "--revalidate"], git_fleet)
+
+        assert result.exit_code == 0, result.output
+        # The composite failed → it merged nothing on its own result.
+        assert "SUITE FAILED" in result.output
+        # ...and the innocents still merged, off their own solo runs.
+        assert _states() == {
+            "w1": mq.MERGED, "w2": mq.MERGED, "w3": mq.PENDING,
+        }, result.output
+        # The culprit is NAMED, not just left blocked.
+        assert "api #103 (issue-103-w3)" in result.output
+        assert "culprit(s): api #103 (issue-103-w3)" in result.output
+        # Worst case is 1 composite + N solo, and no more.
+        assert self._runs(counter) == 4, result.output
+        # #1715 is explicit that a red composite marks nothing failed: the
+        # culprit is left PENDING and retryable, not parked in a terminal
+        # state that needs a human to unwind.
+        assert not ({mq.CONFLICT, mq.HUMAN_REQUIRED, mq.SKIPPED}
+                    & set(_states().values()))
+
+    def test_culprit_alone_blocks_only_itself_and_costs_nothing_extra(
+        self, git_fleet: Path, tmp_path: Path, coord_db,
+    ) -> None:
+        """N=1 must stay byte-identical to #1769: one run, no fallback.
+
+        With a single candidate the "composite" already IS that branch, so
+        re-running it solo would be the same run twice.
+        """
+        _seed_stale_entries((("w3", 103),))
+        cfg, counter = self._cfg_with_counter(
+            tmp_path, git_fleet, tail="; ! test -f f103.txt",
+        )
+
+        result = _invoke(["merge", "--config", str(cfg), "--revalidate"], git_fleet)
+
+        assert _states() == {"w3": mq.PENDING}, result.output
+        assert self._runs(counter) == 1, "N=1 must not re-run itself"
+        assert "re-running each branch on its own" not in result.output
+
+    def test_setup_failure_never_fans_out_into_n_identical_failures(
+        self, git_fleet: Path, tmp_path: Path, coord_db,
+    ) -> None:
+        """A common-mode failure (here: no local checkout) must not trigger the
+        per-entry pass — every solo run would hit the identical wall, turning
+        one clear error into N copies of it."""
+        _seed_stale_entries(_FLEET)
+        cfg = tmp_path / "coordinator.yml"
+        cfg.write_text(
+            CONFIG_YAML.format(repo_path=str(tmp_path / "gone"))
+        )
+
+        calls: list[int] = []
+        real = rv.revalidate
+
+        def counting(cands, *a, **kw):
+            calls.append(len(cands))
+            return real(cands, *a, **kw)
+
+        with patch("coord.revalidate.revalidate", side_effect=counting):
+            result = _invoke(
+                ["merge", "--config", str(cfg), "--revalidate"], git_fleet,
+            )
+
+        assert calls == [3], f"expected one composite attempt only, got {calls}"
+        assert "no local checkout" in result.output
+        assert _states() == {
+            "w1": mq.PENDING, "w2": mq.PENDING, "w3": mq.PENDING,
+        }
+
+    def test_dry_run_names_the_three_batch_members_and_the_single_run(
+        self, git_fleet: Path, tmp_path: Path, coord_db,
+    ) -> None:
+        """#1715: "--dry-run names the batch members and states plainly that
+        one composed run will validate all of them"."""
+        _seed_stale_entries(_FLEET)
+        cfg, counter = self._cfg_with_counter(tmp_path, git_fleet)
+
+        result = _invoke(
+            ["merge", "--config", str(cfg), "--revalidate", "--dry-run"],
+            git_fleet,
+        )
+
+        assert "revalidate: api #101 (issue-101-w1" in result.output
+        assert "revalidate: api #102 (issue-102-w2" in result.output
+        assert "revalidate: api #103 (issue-103-w3" in result.output
+        assert "BATCH of 3" in result.output
+        assert "ONE composed suite run (not 3)" in result.output
+        assert self._runs(counter) == 0, "--dry-run must run no suite at all"
+        assert _states() == {
+            "w1": mq.PENDING, "w2": mq.PENDING, "w3": mq.PENDING,
+        }
 
 
 class TestSkipSmokeUnchanged:
