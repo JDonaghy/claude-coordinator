@@ -1,0 +1,49 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  // #1705 (added scope, 2026-08-03): pin OpenRouter upstream routing so a
+  // pinned model slug (ProviderDef.model in coordinator.yml) doesn't
+  // silently get served by a different upstream host — and therefore a
+  // different quantization / context limit / tool-calling fidelity — from
+  // run to run. See coord/providers/opencode.py's module docstring for the
+  // full rationale and the evidence this mechanism is built on (decompiled
+  // strings from a real installed `opencode` 1.18.11 binary — no OpenRouter
+  // credential was available on the machine that authored this to capture
+  // a live request, so this was NOT verified end-to-end against OpenRouter
+  // itself; only that it is syntactically inert on a non-OpenRouter
+  // credential, which IS verified — see
+  // test_opencode_routing_pin_inert_without_openrouter_credential_end_to_end
+  // in tests/test_providers.py).
+  //
+  // Mechanism: `provider.<id>.options` is threaded into
+  // `providerOptions.<id>` for every request opencode resolves against
+  // that provider (regardless of which model — this file names no model
+  // slug, matching the requirement that model selection stays in
+  // ProviderDef.model). For the "openrouter" provider specifically
+  // (npm package @openrouter/ai-sdk-provider), that provider's own
+  // doGenerate/doStream spreads `providerOptions.openrouter` (minus a
+  // `cacheControl` field it handles separately) directly into the request
+  // body sent to OpenRouter's REST API — which is exactly where
+  // OpenRouter's own documented `provider: {order, allow_fallbacks, ...}`
+  // upstream-routing-preference field lives.
+  //
+  // allow_fallbacks: false is unambiguous and safe to commit unconditionally:
+  // it turns "pinned upstream unavailable" into a visible failure instead of
+  // a silent reroute to a different host — the actual acceptance criterion.
+  //
+  // `order` (naming the SPECIFIC upstream host to pin, e.g. "Fireworks") is
+  // deliberately left UNSET here. The issue that added this scope names no
+  // specific upstream to pin, and guessing one and shipping it unreviewed
+  // would defeat the "committed, reviewable artifact" property this file
+  // exists for. An operator who has chosen a specific upstream adds
+  // `"order": ["<upstream name>"]` alongside allow_fallbacks below — a
+  // one-line, reviewable PR diff, same as the rest of this file.
+  "provider": {
+    "openrouter": {
+      "options": {
+        "provider": {
+          "allow_fallbacks": false
+        }
+      }
+    }
+  }
+}
