@@ -122,6 +122,30 @@ def test_worker_env_keeps_unrelated_entries() -> None:
     assert env["EDITOR"] == "vim"
 
 
+def test_worker_env_cwd_sets_pwd() -> None:
+    """#1783: passing cwd= sets PWD to that path explicitly, regardless of
+    whatever PWD the base_env carried in from the daemon's own environment."""
+    env = _worker_subprocess_env(
+        {"PATH": "/usr/bin", "PWD": "/some/stale/daemon/cwd"},
+        prefix="/usr",
+        base_prefix="/usr",
+        cwd="/worktrees/abc123",
+    )
+    assert env["PWD"] == "/worktrees/abc123"
+
+
+def test_worker_env_no_cwd_leaves_pwd_untouched() -> None:
+    """Without an explicit cwd=, _worker_subprocess_env must not touch PWD —
+    callers that don't pass cwd (there are none left at the two spawn sites,
+    but the helper is also usable standalone) get the pre-existing value."""
+    env = _worker_subprocess_env(
+        {"PATH": "/usr/bin", "PWD": "/whatever"},
+        prefix="/usr",
+        base_prefix="/usr",
+    )
+    assert env["PWD"] == "/whatever"
+
+
 def test_health_reports_machine(tmp_path: Path) -> None:
     server = _server(tmp_path)
     h = server.health()
@@ -336,6 +360,135 @@ def test_spawn_bash_wrap_disabled_uses_bare_argv(tmp_path: Path) -> None:
     assert final.status == ADVISORY
     assert captured and captured[0] == ["/bin/sh", "-c", "echo worker-output"]
     server.shutdown()
+
+
+def test_spawn_sets_pwd_to_worktree_bash_wrap_disabled(tmp_path: Path) -> None:
+    """#1783: with bash_wrap_spawn=False, the worker's PWD env var must equal
+    its worktree path.
+
+    This is the regression the issue exists for: without bash_wrap_spawn's
+    incidental `bash -c 'exec ...'` respawn (which happens to recompute PWD
+    as a side effect of #299), nothing else corrected a stale PWD inherited
+    from the agent daemon's own environment — confinement for a provider
+    that trusts $PWD over getcwd() held only by accident. This test must
+    fail against pre-#1783 code.
+    """
+    import coord.agent as agent_mod
+
+    repo = _init_repo(tmp_path / "repo")
+    server = _server(tmp_path, repo_path=repo, bash_wrap_spawn=False)
+
+    captured_env: list[dict[str, str]] = []
+    real_popen = agent_mod.subprocess.Popen
+
+    def recording_popen(spawn_argv, *args, **kwargs):
+        if kwargs.get("start_new_session"):
+            captured_env.append(dict(kwargs.get("env") or {}))
+        return real_popen(spawn_argv, *args, **kwargs)
+
+    agent_mod.subprocess.Popen = recording_popen  # type: ignore[assignment]
+    try:
+        a = server.assign(_spec(repo))
+        final = server.wait_for(a.id)
+    finally:
+        agent_mod.subprocess.Popen = real_popen  # type: ignore[assignment]
+
+    assert final.status == ADVISORY
+    assert captured_env, "Popen was not called"
+    assert final.worktree_path is not None
+    assert captured_env[0]["PWD"] == final.worktree_path
+    server.shutdown()
+
+
+def test_spawn_sets_pwd_to_worktree_bash_wrap_enabled(tmp_path: Path) -> None:
+    """#1783: the same PWD==worktree assertion holds with bash_wrap_spawn=True
+    (the default) — no behaviour change on the default path. PWD is now set
+    explicitly rather than relying on bash recomputing it as a side effect."""
+    import coord.agent as agent_mod
+
+    repo = _init_repo(tmp_path / "repo")
+    server = _server(tmp_path, repo_path=repo, bash_wrap_spawn=True)
+
+    captured_env: list[dict[str, str]] = []
+    real_popen = agent_mod.subprocess.Popen
+
+    def recording_popen(spawn_argv, *args, **kwargs):
+        if kwargs.get("start_new_session"):
+            captured_env.append(dict(kwargs.get("env") or {}))
+        return real_popen(spawn_argv, *args, **kwargs)
+
+    agent_mod.subprocess.Popen = recording_popen  # type: ignore[assignment]
+    try:
+        a = server.assign(_spec(repo))
+        final = server.wait_for(a.id)
+    finally:
+        agent_mod.subprocess.Popen = real_popen  # type: ignore[assignment]
+
+    assert final.status == ADVISORY
+    assert captured_env, "Popen was not called"
+    assert final.worktree_path is not None
+    assert captured_env[0]["PWD"] == final.worktree_path
+    server.shutdown()
+
+
+def test_pty_spawn_sets_pwd_to_repo_path(tmp_path: Path) -> None:
+    """#1783: the PTY spawn path (_spawn_pty) gets the same explicit-PWD
+    treatment as the headless path.
+
+    Unlike headless, PTY spawns never route through bash_wrap_spawn — see
+    ``_spawn_pty``'s docstring, wrapping an interactive ``claude`` in
+    ``bash -c 'exec ...'`` breaks TTY allocation — so this path never got
+    even an *incidental* PWD correction. It needs the explicit fix on its
+    own merits, independent of any config flag.
+
+    Every spec type a ``ClaudePtyProvider`` may run under (the safety gate
+    refuses write-capable types on providers with
+    ``enforces_deny_list=False``) is also a no-worktree type, so the cwd
+    ``_spawn_pty`` receives is the shared repo checkout, not a
+    per-assignment worktree — the assertion is against that path.
+    """
+    import coord.agent as agent_mod
+    from coord.providers.claude_pty import ClaudePtyProvider
+
+    class _QuickExitPtyProvider(ClaudePtyProvider):
+        def build_command(self, spec, *, resolved_model=None, **_kwargs):
+            return ["/bin/sh", "-c", "exit 0"]
+
+        def initial_input(self, spec):
+            # Falsy → _spawn_pty skips the readiness-wait + paste dance
+            # entirely; this test only cares about the env Popen got.
+            return b""
+
+    repo = _init_repo(tmp_path / "repo")
+    captured_env: list[dict[str, str]] = []
+    real_popen = agent_mod.subprocess.Popen
+
+    def recording_popen(spawn_argv, *args, **kwargs):
+        if kwargs.get("start_new_session"):
+            captured_env.append(dict(kwargs.get("env") or {}))
+        return real_popen(spawn_argv, *args, **kwargs)
+
+    server = AgentServer(
+        machine_name="test",
+        capabilities=["python"],
+        repos=["api"],
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: ["/bin/sh", "-c", "echo unused"],
+        repo_paths={"api": str(repo)},
+        providers={"claude-pty": _QuickExitPtyProvider()},
+    )
+    agent_mod.subprocess.Popen = recording_popen  # type: ignore[assignment]
+    try:
+        spec = _spec(repo, provider="claude-pty", type="plan")
+        a = server.assign(spec)
+        final = server.wait_for(a.id, timeout=10.0)
+    finally:
+        agent_mod.subprocess.Popen = real_popen  # type: ignore[assignment]
+
+    assert captured_env, "Popen was not called"
+    assert captured_env[0]["PWD"] == str(repo)
+    server.shutdown()
+    assert final is not None  # spawned + reaped without raising
 
 
 def test_agent_server_defaults_bash_wrap_and_timeout(tmp_path: Path) -> None:
@@ -3333,6 +3486,7 @@ def _make_provider(
     inject: bool = True,
     build_argv: list[str] | None = None,
     initial_input_bytes: bytes | None = None,
+    env_overrides: dict[str, str] | None = None,
 ):
     """Create a minimal duck-typed provider object for testing.
 
@@ -3368,7 +3522,7 @@ def _make_provider(
             return '"type":"result"'
 
         def env(self):
-            return {}
+            return dict(env_overrides) if env_overrides is not None else {}
 
         def parse_log(self, log_path, tail_bytes=65536):
             pass
@@ -3478,6 +3632,44 @@ class TestProviderLayerDispatch:
         log = Path(final.log_path).read_text()
         assert "legacy-SHOULD-NOT-APPEAR" not in log
         assert "provider-path" in log
+        server.shutdown()
+
+    def test_provider_env_pwd_override_wins_over_worktree(self, tmp_path: Path) -> None:
+        """#1783: provider.env() is merged on top of the worktree PWD, so a
+        provider definition that deliberately sets PWD still overrides it."""
+        import coord.agent as agent_mod
+
+        repo = _init_repo(tmp_path / "repo")
+        fake_provider = _make_provider(env_overrides={"PWD": "/deliberate/override"})
+
+        captured_env: list[dict[str, str]] = []
+        real_popen = agent_mod.subprocess.Popen
+
+        def recording_popen(spawn_argv, *args, **kwargs):
+            if kwargs.get("start_new_session"):
+                captured_env.append(dict(kwargs.get("env") or {}))
+            return real_popen(spawn_argv, *args, **kwargs)
+
+        server = AgentServer(
+            machine_name="test",
+            repos=["api"],
+            state_dir=tmp_path / "state",
+            worker_command=lambda spec: ["/bin/sh", "-c", "echo unused"],
+            repo_paths={"api": str(repo)},
+            providers={"myprovider": fake_provider},
+            bash_wrap_spawn=False,
+        )
+        agent_mod.subprocess.Popen = recording_popen  # type: ignore[assignment]
+        try:
+            spec = _spec(repo, provider="myprovider")
+            a = server.assign(spec)
+            final = server.wait_for(a.id, timeout=5)
+        finally:
+            agent_mod.subprocess.Popen = real_popen  # type: ignore[assignment]
+
+        assert final.status == ADVISORY
+        assert captured_env, "Popen was not called"
+        assert captured_env[0]["PWD"] == "/deliberate/override"
         server.shutdown()
 
     def test_provider_unknown_name_falls_back_to_legacy(self, tmp_path: Path) -> None:
