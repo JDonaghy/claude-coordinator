@@ -30,6 +30,7 @@ from coord.agent import (
     FAILED,
     AgentServer,
     AssignmentSpec,
+    _is_auth_push_failure,
 )
 
 
@@ -37,6 +38,64 @@ def _git(cwd: Path, *args: str) -> str:
     return subprocess.run(
         ["git", *args], cwd=str(cwd), capture_output=True, text=True, check=True
     ).stdout.strip()
+
+
+class TestIsAuthPushFailure:
+    """Direct unit tests for `_is_auth_push_failure` (#1797 review nit): the
+    three FAILED-vs-non-fatal tests above only exercise it indirectly
+    through a full `AgentServer` round-trip. These pin the marker-matching
+    behaviour precisely — case sensitivity, partial matches, and the
+    false-positive risk of an unrelated network blip or "no origin"
+    message accidentally containing one of the markers.
+    """
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "remote: Invalid username or token.",
+            "remote: Password authentication is not supported for Git "
+            "operations.",
+            "fatal: Authentication failed for 'https://github.com/x/y.git/'",
+            "fatal: could not read Username for 'https://github.com': "
+            "terminal prompts disabled",
+            "fatal: could not read Password for 'https://github.com': "
+            "terminal prompts disabled",
+            "git@github.com: Permission denied (publickey).",
+        ],
+    )
+    def test_matches_known_auth_failure_shapes(self, message: str) -> None:
+        assert _is_auth_push_failure(message) is True
+
+    def test_matches_case_insensitively(self) -> None:
+        assert _is_auth_push_failure(
+            "REMOTE: INVALID USERNAME OR TOKEN."
+        ) is True
+
+    def test_matches_as_substring_within_a_larger_message(self) -> None:
+        # `_GitError`/`TimeoutExpired` messages wrap the raw git stderr with
+        # extra context (command, exit code); the marker just needs to
+        # appear somewhere in the combined text, not be the whole message.
+        assert _is_auth_push_failure(
+            "git push failed (exit 128):\n"
+            "remote: Invalid username or token.\n"
+            "fatal: unable to access 'https://github.com/x/y.git/'"
+        ) is True
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "fatal: 'origin' does not appear to be a git repository",
+            "fatal: 'origin' does not appear to be a git repository\n"
+            "fatal: Could not read from remote repository.",
+            "ssh: connect to host github.com port 22: Connection timed out",
+            "fatal: unable to access 'https://github.com/x/y.git/': "
+            "Could not resolve host: github.com",
+            "error: failed to push some refs (non-fast-forward)",
+            "",
+        ],
+    )
+    def test_does_not_match_unrelated_push_failures(self, message: str) -> None:
+        assert _is_auth_push_failure(message) is False
 
 
 @pytest.fixture

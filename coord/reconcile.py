@@ -226,8 +226,21 @@ def reconcile_completed_assignments(
         # detected from a TRUNCATED log with no terminal `result` event,
         # while an API-error is read OFF that terminal `result` event — so
         # this `or` never picks the wrong one.
+        # #1797: `push_failure_reason` is the SAME column too — stamped by
+        # `AgentServer._reap` when the reap-time safety-net push hits an
+        # auth-shaped rejection (see `_is_auth_push_failure`). It never
+        # coexists with the other two either: it is only ever set on a
+        # clean `exit_code == 0` reap, which both `usage_limit_reason` and
+        # `api_error_reason` preempt before the push-failure branch even
+        # runs (see the `elif` chain in `AgentServer._reap`). Without this,
+        # a `type="work"` auth-push failure lands FAILED with no
+        # `failure_reason` at all — invisible to `coord status`, the TUI,
+        # and drive.py, which is the exact visibility gap #1797 exists to
+        # close.
         _failure_reason = (
-            entry.get("usage_limit_reason") or entry.get("api_error_reason")
+            entry.get("usage_limit_reason")
+            or entry.get("api_error_reason")
+            or entry.get("push_failure_reason")
         )
         update_state_fn(
             assignment_id=aid,
@@ -989,9 +1002,9 @@ def describe_no_candidate_machines(
 
 
 def _record_usage_limit_reason(assignment_id: str | None, entry: dict) -> None:
-    """#1461/#1584: stamp a usage-limit-kill or terminal-API-error diagnostic
-    (whichever the agent flagged on *entry*) onto *assignment_id*'s
-    persisted ``failure_reason``.
+    """#1461/#1584/#1797: stamp a usage-limit-kill, terminal-API-error, or
+    auth-shaped-push-failure diagnostic (whichever the agent flagged on
+    *entry*) onto *assignment_id*'s persisted ``failure_reason``.
 
     Used by :func:`reconcile`'s (``coord resume``) FAILED/ADVISORY branches.
     ``reconcile_completed_assignments`` — the daemon's own passive tick and
@@ -1008,25 +1021,33 @@ def _record_usage_limit_reason(assignment_id: str | None, entry: dict) -> None:
 
     ``usage_limit_reason`` is tried first, then ``api_error_reason`` (#1584 —
     a terminal `is_error: true` result event, e.g. "529 Overloaded"; see
-    `coord.agent.AgentAssignment.api_error_reason`). The two never coexist on
-    the same entry — a usage-limit kill is detected from a truncated log with
-    no terminal `result` event, an API error is read OFF that terminal
-    `result` event — so trying one then the other never picks the wrong
-    reason.
+    `coord.agent.AgentAssignment.api_error_reason`), then
+    ``push_failure_reason`` (#1797 — an auth-shaped rejection from the
+    reap-time safety-net push; see `coord.agent._is_auth_push_failure`). The
+    three never coexist on the same entry — a usage-limit kill is detected
+    from a truncated log with no terminal `result` event, an API error is
+    read OFF that terminal `result` event, and a push failure only ever
+    surfaces on an otherwise-clean `exit_code == 0` reap that neither of the
+    other two preempted (see the `elif` chain in `AgentServer._reap`) — so
+    trying them in order never picks the wrong reason.
 
     This also normalises the row's status to ``'failed'`` (that helper's own
     behaviour) even when the agent's reap landed on ADVISORY — a usage-limit
     kill is, per #1461, the ONE terminal state known safe to re-dispatch
     unchanged, which is what `coord/drive.py`'s FAILED bucket already means;
     ADVISORY otherwise implies "needs a human look", which a kill does not.
-    (An `api_error_reason` entry is never ADVISORY — `AgentServer._reap`
-    always lands it on FAILED directly — so this normalisation is a no-op for
-    that case, not a behaviour change.)
+    (An `api_error_reason` or `push_failure_reason` entry is never ADVISORY —
+    `AgentServer._reap` always lands both directly on FAILED — so this
+    normalisation is a no-op for those cases, not a behaviour change.)
 
     Best-effort: never raises — a diagnostic write must not break a real
     status transition.
     """
-    reason = entry.get("usage_limit_reason") or entry.get("api_error_reason")
+    reason = (
+        entry.get("usage_limit_reason")
+        or entry.get("api_error_reason")
+        or entry.get("push_failure_reason")
+    )
     if not reason or not assignment_id:
         return
     try:

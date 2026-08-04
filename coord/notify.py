@@ -1903,8 +1903,12 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
         # `"running"` on its own. That is the #1598 incident: a smoke worker
         # died on a terminal API error and the issue was permanently
         # stranded with the board reporting a plausible in-progress state.
+        # #1797: `push_failure_reason` is the same column too — see the
+        # identical `or` chain in `coord.reconcile.reconcile_completed_assignments`.
         _failure_reason = (
-            entry.get("usage_limit_reason") or entry.get("api_error_reason")
+            entry.get("usage_limit_reason")
+            or entry.get("api_error_reason")
+            or entry.get("push_failure_reason")
         )
         post_failure(
             exit_code=transition.exit_code,
@@ -1948,18 +1952,26 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
             branch=entry.get("branch"),
         )
     else:
-        # #1605: carry the agent's own diagnostic (a usage-limit kill or a
-        # terminal API-error classification, both stamped by
-        # `AgentServer._reap` onto this same `/status` completed entry —
-        # see `coord.reconcile.reconcile_completed_assignments`'s identical
+        # #1605/#1797: carry the agent's own diagnostic (a usage-limit kill,
+        # a terminal API-error classification, or an auth-shaped push
+        # failure — all stamped by `AgentServer._reap` onto this same
+        # `/status` completed entry — see
+        # `coord.reconcile.reconcile_completed_assignments`'s identical
         # `or`) through to `mark_notified` so a `status='failed'` row is
-        # never left with both `failure_reason` and `exit_code` null.
+        # never left with both `failure_reason` and `exit_code` null. This
+        # is the branch a `type="work"` push-auth failure actually hits
+        # (none of the type-specific `elif`s above match "work"), so
+        # `_failure_reason` also feeds `error=` below — otherwise the
+        # posted GitHub failure comment's `error` field is blank for
+        # exactly the failure #1797 exists to surface.
         _failure_reason = (
-            entry.get("usage_limit_reason") or entry.get("api_error_reason")
+            entry.get("usage_limit_reason")
+            or entry.get("api_error_reason")
+            or entry.get("push_failure_reason")
         )
         post_failure(
             exit_code=transition.exit_code,
-            error=entry.get("error") or "",
+            error=entry.get("error") or _failure_reason or "",
             **common,
         )
         mark_notified(
