@@ -8,7 +8,9 @@ most attention here are the ones that caused real incidents:
 * capacity counted from BOARD state, so a drive whose observer hit its
   ``EXIT_DEADLINE`` (#1660) still occupies a slot (2026-08-01);
 * unsatisfiable vs merely-unsatisfied, so a pre-req that will never land
-  escalates instead of deferring forever.
+  escalates instead of deferring forever;
+* the startup grace window (#1794), so a tick firing seconds after a launch
+  cannot declare a still-starting drive dead (2026-08-03).
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ import pytest
 
 from coord.drive_queue import (
     DEFAULT_MAX_ATTEMPTS,
+    DRIVE_STARTUP_GRACE_SECONDS,
     HOLD_ARMED,
     HOLD_FIRED,
     HOLD_RELEASED,
@@ -41,6 +44,11 @@ from coord.drive_queue import (
 )
 
 REPO = "claude-coordinator"
+
+# A fixed wall clock for the #1794 startup-window tests. `plan_tick` takes
+# `now` as a parameter precisely so these need no monkeypatching and no real
+# sleeping — the module still never reads the clock itself.
+NOW = 1_800_000_000.0
 
 
 def entry(issue: int, **kw) -> QueueEntry:
@@ -396,6 +404,27 @@ def test_a_dead_drive_is_requeued_at_the_same_position_with_an_attempt_spent():
     assert "position" not in reconcile.updates
     # …and it is eligible again on this same tick.
     assert plan.launch is not None and plan.launch.issue == 1650
+    # No `launched_at` and no `now`, so #1794's startup window does not apply:
+    # a row with nothing to measure keeps the pre-#1794 behaviour exactly.
+    assert entries[0].launched_at is None
+
+
+def test_a_dead_drive_with_a_launch_stamp_still_dies_once_the_window_passes():
+    """The `launched_at` path, not just the "no stamp to measure" one."""
+    entries = [
+        entry(
+            1650,
+            position=3,
+            state=STATE_RUNNING,
+            attempts=0,
+            launched_at=NOW - DRIVE_STARTUP_GRACE_SECONDS - 1,
+        )
+    ]
+    plan = plan_tick(entries, board(), capacity=1, now=NOW)
+    assert plan.reconciles[0].outcome == "retry"
+    assert plan.reconciles[0].updates["attempts"] == 1
+    # …and the relaunch is allowed, because the window is demonstrably past.
+    assert plan.launch is not None and plan.launch.issue == 1650
 
 
 def test_a_dead_drive_out_of_attempts_blocks_and_escalates():
@@ -416,6 +445,171 @@ def test_max_attempts_is_injectable():
     assert plan.reconciles[0].outcome == "exhausted"
 
 
+# ── plan_tick: the startup grace window (#1794) ──────────────────────────────
+#
+# 2026-08-03, the first unattended run of the #1756 timer: a tick 40s after a
+# launch found no tmux session and no board work (the drive was still coming
+# up — measured 19:13:09 launch → 19:15:22 `drive loop started`), fell through
+# every branch of `_reconcile_running` to `retry`, spent an attempt, and
+# launched a SECOND `coord drive` for the same issue. The two ticks were 40s
+# apart because `docs/DRIVE_QUEUE.md` §2's install sequence fires one
+# (`enable --now`) and then its own verification step fires another.
+
+
+def running_since(issue: int, age: float, **kw) -> QueueEntry:
+    """A `running` entry launched *age* seconds before :data:`NOW`."""
+    return entry(issue, state=STATE_RUNNING, launched_at=NOW - age, **kw)
+
+
+def test_a_tick_seconds_after_the_launch_leaves_the_entry_running():
+    """THE regression for #1794 — the 40s-later tick from the incident."""
+    entries = [running_since(1762, 40.0, position=1, attempts=0)]
+    plan = plan_tick(entries, board(), capacity=1, now=NOW)
+
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "starting"
+    assert reconcile.occupies is True
+    # The three things the incident got wrong, asserted one by one.
+    assert "state" not in reconcile.updates  # stays `running`
+    assert "attempts" not in reconcile.updates  # no attempt spent
+    assert plan.launch is None  # no duplicate drive
+    assert plan.occupied == 1
+    assert "40s ago" in reconcile.reason
+
+
+def test_a_starting_drive_holds_its_slot_against_the_rest_of_the_queue():
+    entries = [
+        running_since(1762, 5.0, position=0),
+        entry(1763, position=1),
+    ]
+    plan = plan_tick(entries, board(open_=(1763,)), capacity=1, now=NOW)
+    assert plan.occupied == 1
+    assert plan.launch is None
+    # At capacity is the queue working, not a stall — no escalation.
+    assert plan.alert is None
+
+
+def test_a_starting_entry_is_never_relaunched_even_if_something_requeues_it():
+    """The launch-side half of the guard.
+
+    A `waiting` row with a fresh `launched_at` means a drive went up moments
+    ago whatever the queue state now says. Starting a second one is exactly
+    the #1794 failure, so the walk refuses it rather than leaning on `coord
+    drive`'s per-issue flock to catch it.
+    """
+    entries = [entry(1762, position=0, launched_at=NOW - 10.0, deferrals=0)]
+    plan = plan_tick(entries, board(), capacity=1, now=NOW)
+    assert plan.launch is None
+    assert [d.key for d in plan.deferrals] == [entry_key(REPO, 1762)]
+    assert "second `coord drive` is refused" in plan.deferrals[0].reason
+    assert plan.deferrals[0].updates["deferrals"] == 1
+
+
+def test_the_window_never_starves_a_later_entry_that_is_genuinely_ready():
+    """The cooldown defers ONE entry; it does not close the queue."""
+    entries = [
+        entry(1762, position=0, launched_at=NOW - 10.0),
+        entry(1763, position=1),
+    ]
+    plan = plan_tick(entries, board(), capacity=2, now=NOW)
+    assert plan.launch is not None and plan.launch.issue == 1763
+
+
+def test_a_live_session_still_wins_over_the_startup_window():
+    entries = [running_since(1762, 5.0)]
+    plan = plan_tick(entries, board(sessions=(1762,)), capacity=1, now=NOW)
+    assert plan.reconciles[0].outcome == "alive"
+
+
+def test_a_merged_issue_still_wins_over_the_startup_window():
+    entries = [running_since(1762, 5.0)]
+    plan = plan_tick(entries, board(merged=(1762,)), capacity=1, now=NOW)
+    assert plan.reconciles[0].outcome == "done"
+    assert plan.reconciles[0].updates["state"] == STATE_DONE
+
+
+def test_1660_held_is_unchanged_by_the_startup_window():
+    """#1660's `held` keeps its own branch, inside the window and outside it."""
+    for age in (5.0, DRIVE_STARTUP_GRACE_SECONDS + 60.0):
+        plan = plan_tick(
+            [running_since(1762, age)], board(active=(1762,)), capacity=1, now=NOW
+        )
+        assert plan.reconciles[0].outcome == "held", age
+        assert plan.reconciles[0].occupies is True
+        assert "state" not in plan.reconciles[0].updates
+        assert plan.launch is None
+
+
+def test_death_detection_still_reaches_blocked_at_max_attempts():
+    """The window delays a death by at most one interval; it never hides one."""
+    old = DRIVE_STARTUP_GRACE_SECONDS + 1
+    first = plan_tick(
+        [running_since(1762, old, attempts=0)], board(), capacity=1, now=NOW
+    )
+    assert first.reconciles[0].outcome == "retry"
+    assert first.reconciles[0].updates["attempts"] == 1
+
+    second = plan_tick(
+        [running_since(1762, old, attempts=DEFAULT_MAX_ATTEMPTS - 1)],
+        board(),
+        capacity=1,
+        now=NOW,
+    )
+    assert second.reconciles[0].outcome == "exhausted"
+    assert [b.key for b in second.blocked] == [entry_key(REPO, 1762)]
+    assert second.blocked[0].updates["state"] == STATE_BLOCKED
+    assert second.blocked[0].updates["attempts"] == DEFAULT_MAX_ATTEMPTS
+
+
+def test_a_row_with_no_launch_stamp_keeps_the_pre_1794_behaviour():
+    """A pre-DQ-1 row, or one a human flipped to `running` by hand."""
+    plan = plan_tick(
+        [entry(1762, state=STATE_RUNNING, launched_at=None)],
+        board(),
+        capacity=1,
+        now=NOW,
+    )
+    assert plan.reconciles[0].outcome == "retry"
+
+
+def test_a_backwards_clock_jump_cannot_pin_an_entry_in_the_window():
+    """A `launched_at` in the future must not make an entry un-retryable."""
+    plan = plan_tick(
+        [entry(1762, state=STATE_RUNNING, launched_at=NOW + 10_000.0)],
+        board(),
+        capacity=1,
+        now=NOW,
+    )
+    assert plan.reconciles[0].outcome == "retry"
+
+
+def test_omitting_the_clock_disables_the_window_entirely():
+    """`now=None` is the pure-logic caller's opt-out, not a silent grace."""
+    plan = plan_tick([running_since(1762, 5.0)], board(), capacity=1)
+    assert plan.reconciles[0].outcome == "retry"
+
+
+def test_the_grace_window_is_injectable():
+    entries = [running_since(1762, 60.0)]
+    assert (
+        plan_tick(entries, board(), capacity=1, now=NOW, grace_seconds=30.0)
+        .reconciles[0]
+        .outcome
+        == "retry"
+    )
+    assert (
+        plan_tick(entries, board(), capacity=1, now=NOW, grace_seconds=120.0)
+        .reconciles[0]
+        .outcome
+        == "starting"
+    )
+
+
+def test_the_default_window_clears_the_measured_startup_time():
+    """~2 min measured on a loaded dellserver; the default must beat it."""
+    assert DRIVE_STARTUP_GRACE_SECONDS >= 300.0
+
+
 # ── rendering ────────────────────────────────────────────────────────────────
 
 
@@ -431,6 +625,21 @@ def test_render_plan_names_the_launch_and_the_defer_reason():
     assert "would launch claude-coordinator#1654 on dellserver" in text
     assert "defer claude-coordinator#1650" in text
     assert "0/1 occupied" in text
+
+
+def test_render_plan_narrates_a_starting_drive_and_the_full_slot():
+    """#1794 was diagnosed from a journal, so the journal has to say it."""
+    entries = [
+        entry(1762, position=0, state=STATE_RUNNING, launched_at=NOW - 41.0),
+        entry(1763, position=1),
+    ]
+    text = "\n".join(
+        render_plan(plan_tick(entries, board(open_=(1763,)), capacity=1, now=NOW))
+    )
+    assert "reconcile claude-coordinator#1762: starting" in text
+    assert "startup grace window (#1794)" in text
+    assert "no launch — at capacity (1/1 occupied)" in text
+    assert "retry" not in text
 
 
 # ── plan_tick: deploy gates (#1757) ──────────────────────────────────────────

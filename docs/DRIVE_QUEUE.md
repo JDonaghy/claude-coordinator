@@ -141,6 +141,13 @@ journalctl --user -u coord-drive-queue -n 50
 systemctl --user list-timers | grep drive-queue   # next-elapse ~15min out
 ```
 
+`enable --now` fires a tick and the verification `start` above fires another
+seconds later, so this sequence deliberately produces **back-to-back ticks**
+against a non-empty queue. That is safe: a drive launched inside the startup
+grace window (5 minutes) reconciles as `starting` — occupying its slot, its
+`attempts` untouched — rather than as a death (#1794). Run `coord drive-queue
+list` after and confirm `state=running attempts=0`, not `attempts=1`.
+
 Logs live in the user journal: `journalctl --user -u coord-drive-queue -f` to
 follow live, `-n 50` for the last tick's summary. With an empty queue a tick
 logs `capacity: 0/1 occupied, 1 free` / `no launch` and exits 0 — that is the
@@ -261,12 +268,50 @@ not use `coord drive-sessions`'s count as "how much of the queue is actually
 running" — cross-check `coord drive-queue status` (which reflects board
 state) instead.
 
-## 7. #1715
+## 7. The startup window (#1794)
+
+A drive is not *established* the moment `coord drive --tmux` exits 0. #1606's
+launch verification proves a tmux session exists and has written to its run
+log; it does not prove the drive has registered anywhere the tick can see.
+For up to a couple of minutes on a loaded host the entry has **no live
+session reading** (`list_drive_sessions()` returns `[]` for "tmux
+unavailable" / "no server running" / "the call timed out" exactly as it does
+for "no sessions") and **no work on the board** (it has not dispatched yet).
+
+Before #1794 that was indistinguishable from a death, and on 2026-08-03 — the
+first unattended run of the timer — a tick 40s after a launch declared a
+healthy drive dead, spent a retry attempt, and started a second `coord drive`
+for the same issue. Left alone that walks an entry to `attempts=2/2` and
+`blocked`, i.e. an unattended queue parks healthy work and reports it failed.
+
+The tick now treats a `running` entry launched within
+`DRIVE_STARTUP_GRACE_SECONDS` (5 minutes, ~2.5x the measured startup) as
+`starting`: it occupies its slot, keeps its state, and never spends an
+attempt. The same window guards the launch decision, so no tick can start a
+second drive for an issue whose last launch is that recent — `coord drive`'s
+per-issue flock is the last line of defence, not the first.
+
+What this looks like in the journal:
+
+```
+  reconcile claude-coordinator#1762: starting — drive is still starting —
+      launched 41s ago, inside the 300s startup grace window (#1794);
+      not a death, still occupying a machine
+  no launch — at capacity (1/1 occupied)
+```
+
+Death detection is unchanged past the window: no session, no active work,
+nothing landed and a launch older than 5 minutes still reconciles to `retry`
+and then to `blocked` at `max_attempts`. The failure signature to watch for
+is `retry — drive session died without landing the work` appearing **within
+seconds** of a launch; that must never happen again.
+
+## 8. #1715
 
 See "Read this before queuing more than ~2 issues" above, at the top of this
 document.
 
-## 8. #1738
+## 9. #1738
 
 See the same section — it's the smaller, already-partially-fixed version of
 the same class of problem (a content-irrelevant base move staling a Test
