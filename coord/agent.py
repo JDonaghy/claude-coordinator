@@ -522,6 +522,45 @@ class _GitError(RuntimeError):
     pass
 
 
+# #1797: substrings git/GitHub emit for a credential/auth-shaped push
+# rejection (case-insensitive match against the combined stderr of a failed
+# `git push`). Deliberately narrow — matched only against the *reap-time*
+# safety-net push (see `_reap` below) to decide whether a push failure is
+# surfaced as its own FAILED outcome (`push_failure_reason`) or treated as
+# before (logged, non-fatal).
+#
+# The distinction matters because that push is attempted unconditionally,
+# including against repos with no `origin` configured at all — every repo
+# fixture in this test suite, and any genuinely local-only/airgapped
+# deployment (see `_commits_ahead`'s docstring). That failure mode ("fatal:
+# 'origin' does not appear to be a git repository") is expected and must
+# stay non-fatal. An auth failure against a real, configured remote — e.g.
+# the credential-helper quoting bug that motivated this constant, where
+# cloud-init baked an empty `$GH_TOKEN` into `~/.gitconfig` at image-bake
+# time instead of leaving it to expand at push time — is not: it means a
+# worker's real commits may be stuck in a worktree that never reached
+# origin, and silently landing on DONE (or the unrelated "0 commits"
+# ADVISORY) would hide exactly that.
+_AUTH_PUSH_FAILURE_MARKERS = (
+    "authentication failed",
+    "invalid username or token",
+    "password authentication is not supported",
+    "could not read username",
+    "could not read password",
+    "permission denied (publickey)",
+    "terminal prompts disabled",
+)
+
+
+def _is_auth_push_failure(message: str) -> bool:
+    """True when *message* (a failed push's error text) looks like a
+    credential/auth rejection rather than e.g. "no remote configured" or a
+    network blip. See `_AUTH_PUSH_FAILURE_MARKERS` for why this is scoped
+    narrowly rather than firing on any push failure."""
+    lowered = message.lower()
+    return any(marker in lowered for marker in _AUTH_PUSH_FAILURE_MARKERS)
+
+
 def _git(cwd: Path, *args: str, timeout: float = 15.0) -> str:
     result = subprocess.run(
         ["git", *args],
@@ -2627,6 +2666,24 @@ class AgentAssignment:
     # internally, and finished cleanly (its LAST `result` event carries no
     # `is_error`, so this never fires for it).
     api_error_reason: str | None = None
+    # #1797: set when `_reap`'s belt-and-suspenders `git push` raised an
+    # AUTH-SHAPED error (see `_is_auth_push_failure`) — captures the raw
+    # error text, e.g. "remote: Invalid username or token. Password
+    # authentication is not supported for Git operations." Only ever set
+    # alongside `status == FAILED`; `None` on every other outcome —
+    # including a push failure for an unrelated reason (no `origin`
+    # configured, network blip), which stays non-fatal exactly as before
+    # this field was introduced.
+    #
+    # Exists to keep an auth break from being silently absorbed into either
+    # DONE (worker had local commits that never reached origin) or the
+    # unrelated `zero_commit_reason` ADVISORY ("nothing to push" reads very
+    # differently from "had something to push and couldn't"). Before this
+    # field existed, a broken credential helper (#1797 — cloud-init baked an
+    # empty `$GH_TOKEN` into the git credential helper at image-bake time
+    # instead of leaving it to expand at push time) surfaced only as a line
+    # in the worker log that nothing downstream ever read.
+    push_failure_reason: str | None = None
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -6868,6 +6925,11 @@ class AgentServer:
         # assignments we read from the worktree; for legacy assignments (no
         # worktree_path) we fall back to the main repo clone.
         captured_branch: str | None = None
+        # #1797: set below iff the belt-and-suspenders push at the end of
+        # this reap raised. Declared here (not inside the `if` that attempts
+        # the push) so the status decision further down can reference it
+        # unconditionally, mirroring `_zero_commit_reason`.
+        _push_failure_reason: str | None = None
         with self._lock:
             assignment = self._assignments.get(assignment_id)
         if assignment is not None:
@@ -6907,9 +6969,25 @@ class AgentServer:
                         except OSError:
                             pass
                     except (_GitError, subprocess.TimeoutExpired) as e:
+                        # #1797: an auth-shaped failure here used to be
+                        # logged and then forgotten — nothing downstream
+                        # ever saw it, so a broken credential (e.g. an empty
+                        # credential-helper password) silently landed on
+                        # DONE whenever the worker had made real local
+                        # commits, or on the generic "0 commits" ADVISORY
+                        # whenever it hadn't — either way indistinguishable
+                        # from "nothing to push". Only auth-shaped failures
+                        # are promoted (see `_is_auth_push_failure`): this
+                        # push is attempted unconditionally, including
+                        # against repos with no `origin` at all (every test
+                        # fixture, and any local-only deployment), and that
+                        # failure mode must stay non-fatal exactly as before.
+                        _reason = str(e)
+                        if _is_auth_push_failure(_reason):
+                            _push_failure_reason = _reason
                         try:
                             with open(assignment.log_path, "a") as reopen:
-                                reopen.write(f"# reap: push failed ({e})\n")
+                                reopen.write(f"# reap: push failed ({_reason})\n")
                         except OSError:
                             pass
 
@@ -6987,6 +7065,23 @@ class AgentServer:
                         # advisory downgrade: a real error is worse than "no
                         # commits", not merely equivalent to it.
                         assignment.status = FAILED
+                    elif _push_failure_reason is not None:
+                        # #1797: the belt-and-suspenders push raised an
+                        # auth-shaped error (see `_is_auth_push_failure`).
+                        # Checked BEFORE the zero-commit advisory downgrade
+                        # and takes priority over it: a push failure is a
+                        # distinct, worse outcome than "nothing to push"
+                        # even when the worktree also happens to be 0
+                        # commits ahead (a broken credential fails the push
+                        # regardless of commit count — see the #1797
+                        # evidence, where both conditions were true at once
+                        # and the advisory message alone made the auth break
+                        # invisible). FAILED, not ADVISORY: work may exist
+                        # locally in the worktree that never reached origin
+                        # — that needs a human/retry, not a "nothing to do"
+                        # shrug.
+                        assignment.status = FAILED
+                        assignment.push_failure_reason = _push_failure_reason
                     elif _zero_commit_reason is not None:
                         # #448: clean exit but no commits → advisory, not done.
                         assignment.status = ADVISORY
