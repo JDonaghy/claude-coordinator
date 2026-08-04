@@ -24,6 +24,29 @@
 //! consolidation (#572/#573/#575) expects the same primitive. This module
 //! only supplies the sections and interprets the routed clicks.
 //!
+//! **#1762 — the result table reads `column_meta`.** #1741 shipped with
+//! every column flexing equally and every cell dumped as raw JSON, because
+//! the wire carried no display metadata: timestamps arrived as
+//! `1785780878.1551082` and lists as `["dellserver","precision"]`, and the
+//! panel had no basis for treating `title` differently from `issue`. #1760
+//! put that metadata on the wire, so cells are now formatted by their
+//! declared `kind`, columns sized by their `weight`, and a header click
+//! sorts the table.
+//!
+//! The generic-vs-hardcoded line is unchanged and load-bearing: the
+//! formatting switch is on **`kind`**, never on a column id, and every
+//! piece of metadata is optional. A daemon that sends no `column_meta`
+//! renders exactly as it did before #1762; a daemon that declares a `kind`
+//! this binary has never heard of falls back to plain stringification. Add
+//! a per-report `match` here and #1741's "adding report #2 requires zero
+//! `tui/**` changes" property dies.
+//!
+//! Sorting is client-side, which is correct *here* and would not have been
+//! for Audit: a `ReportResult` is a complete bounded set, where `/audit` is
+//! server-paginated newest-first and a client-side sort would reorder only
+//! the loaded page while presenting itself as the answer (see `audit.rs`,
+//! which defers column sort for exactly that reason).
+//!
 //! No sealed acceptance contract exists for this panel (there is no
 //! `tests/acceptance/**` slice for #1741) — the in-crate `TuiDriver` tests in
 //! `app/tests.rs` are the gate.
@@ -424,46 +447,295 @@ impl CoordApp {
 
     // ── Result table ─────────────────────────────────────────────────────
 
+    /// This column's `column_meta` entry (#1760), or `None` when the daemon
+    /// sent none — looked up **by id**, not by position.
+    ///
+    /// The wire documents that `column_meta[i]` corresponds to `columns[i]`,
+    /// so zipping would work for a well-formed payload. It is looked up by
+    /// id anyway for the same reason cells are (`reports_cell_text`): a
+    /// daemon that ships a partial, reordered, or over-long `column_meta`
+    /// must degrade to "no metadata for this column", never to *another*
+    /// column's metadata, which would silently render one column's data
+    /// under another column's rules.
+    fn reports_column_meta<'a>(
+        result: &'a ReportResult,
+        column: &str,
+    ) -> Option<&'a ReportColumnMeta> {
+        result.column_meta.iter().find(|m| m.id == column)
+    }
+
+    /// The declared `kind` for a column, or `""` when there is no metadata.
+    /// Deliberately a `&str` rather than an enum: `kind` is an **open**
+    /// vocabulary, and an unrecognised value must fall through to plain
+    /// stringification (the older/newer-daemon guard), not fail to parse.
+    fn reports_column_kind<'a>(result: &'a ReportResult, column: &str) -> &'a str {
+        Self::reports_column_meta(result, column)
+            .map(|m| m.kind.as_str())
+            .unwrap_or("")
+    }
+
+    /// Today's stringification, unchanged — the fallthrough every unknown
+    /// `kind` (and every column with no metadata at all) still lands in.
+    fn reports_plain_text(value: &serde_json::Value) -> String {
+        match value {
+            serde_json::Value::Null => String::new(),
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Bool(b) => b.to_string(),
+            serde_json::Value::Number(n) => n.to_string(),
+            other => other.to_string(),
+        }
+    }
+
+    /// What an empty `list` cell renders as. `[]` reads like a bug; a blank
+    /// cell reads like missing data. An em dash says "nothing, deliberately".
+    const REPORTS_EMPTY_LIST: &'static str = "—";
+
     /// One result cell, looked up **by column name** — the engine documents
     /// that `rows` may carry keys beyond `columns`, so positional indexing
     /// would silently mis-align the moment a report adds a detail field.
-    fn reports_cell_text(row: &serde_json::Value, column: &str) -> String {
-        match row.get(column) {
-            None | Some(serde_json::Value::Null) => String::new(),
-            Some(serde_json::Value::String(s)) => s.clone(),
-            Some(serde_json::Value::Bool(b)) => b.to_string(),
-            Some(serde_json::Value::Number(n)) => n.to_string(),
-            Some(other) => other.to_string(),
+    ///
+    /// #1762: the raw value is rendered through its column's declared
+    /// `kind` (#1760) — a `timestamp` as a readable time rather than
+    /// `1785780878.1551082`, a `list` as `dellserver, precision` rather
+    /// than `["dellserver","precision"]`.
+    ///
+    /// The switch is on **`kind`, never on column id**. That is the whole
+    /// line between this panel staying generic and it growing a per-report
+    /// `match`: #1741's "adding report #2 requires zero `tui/**` changes"
+    /// property survives only while nothing here knows that `started_at`
+    /// exists. An unrecognised `kind` falls back to `reports_plain_text`,
+    /// so a newer daemon declaring a kind this binary predates still
+    /// renders its data instead of panicking or blanking the column.
+    fn reports_cell_text(row: &serde_json::Value, column: &str, kind: &str) -> String {
+        let value = match row.get(column) {
+            None | Some(serde_json::Value::Null) => return String::new(),
+            Some(v) => v,
+        };
+        match kind {
+            // `null` already returned above, so this is a real instant.
+            // A non-numeric "timestamp" (a daemon sending ISO strings, say)
+            // falls back rather than rendering "1970-01-01".
+            "timestamp" => match value.as_f64() {
+                Some(ts) => format_unix_smart(ts),
+                None => Self::reports_plain_text(value),
+            },
+            "list" => match value.as_array() {
+                Some(items) if items.is_empty() => Self::REPORTS_EMPTY_LIST.to_string(),
+                Some(items) => items
+                    .iter()
+                    .map(Self::reports_plain_text)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                None => Self::reports_plain_text(value),
+            },
+            // `int` needs no special text — it is `align: right` that makes
+            // a numeric column readable, and that is applied in
+            // `reports_result_columns`. `enum`/`text`/unknown: as before.
+            _ => Self::reports_plain_text(value),
+        }
+    }
+
+    /// Clamp on a column's declared `weight`. The floor stops a `weight: 0`
+    /// (or a negative, or a NaN) collapsing a column to nothing; the ceiling
+    /// stops one runaway weight starving every other column. Both are
+    /// generic guards on daemon-supplied numbers, not opinions about any
+    /// particular report.
+    const REPORTS_MIN_WEIGHT: f32 = 0.5;
+    const REPORTS_MAX_WEIGHT: f32 = 8.0;
+
+    fn reports_column_weight(meta: Option<&ReportColumnMeta>) -> f32 {
+        match meta.map(|m| m.weight) {
+            Some(w) if w.is_finite() && w > 0.0 => {
+                w.clamp(Self::REPORTS_MIN_WEIGHT, Self::REPORTS_MAX_WEIGHT)
+            }
+            // No metadata, or a weight the daemon left at its serde default
+            // (0.0) / sent as junk: exactly today's equal-share behaviour.
+            _ => 1.0,
         }
     }
 
     /// Columns for the result `DataTable`, derived entirely from
-    /// `ReportResult.columns`. Every column flexes equally: the panel has no
-    /// idea what any of them mean, so it cannot pick better weights — that
-    /// is the price of not hardcoding reports, and it is the right trade.
+    /// `ReportResult.columns` plus its optional `column_meta` (#1760).
+    ///
+    /// Before #1760 the panel had no display metadata at all and every
+    /// column flexed equally — not a defect, just the only honest thing to
+    /// do with eleven names it could not interpret. The metadata is now on
+    /// the wire, so `weight` sizes the column, `align` sets its text
+    /// alignment, and `label` titles it. **Every one of those is optional**:
+    /// with `column_meta` absent this produces byte-identical `Column`s to
+    /// the pre-#1762 code, which is what keeps an older daemon working.
     fn reports_result_columns(result: &ReportResult) -> Vec<Column> {
         result
             .columns
             .iter()
-            .map(|c| Column {
-                title: c.clone(),
-                width: ColumnWidth::Flex(1.0),
-                align: ColumnAlign::Left,
+            .map(|c| {
+                let meta = Self::reports_column_meta(result, c);
+                let title = match meta.map(|m| m.label.as_str()) {
+                    Some(label) if !label.is_empty() => label.to_string(),
+                    _ => c.clone(),
+                };
+                Column {
+                    title,
+                    width: ColumnWidth::Flex(Self::reports_column_weight(meta)),
+                    align: match meta.map(|m| m.align.as_str()) {
+                        Some("right") => ColumnAlign::Right,
+                        Some("center") => ColumnAlign::Center,
+                        _ => ColumnAlign::Left,
+                    },
+                }
             })
             .collect()
     }
 
-    fn reports_result_rows(result: &ReportResult) -> Vec<DataRow> {
-        result
-            .rows
+    /// Cells per unit of column weight below which the table stops
+    /// squeezing and starts scrolling horizontally — the `min_total_width`
+    /// floor `audit.rs`'s `AUDIT_TABLE_MIN_WIDTH` (#1094) established for
+    /// the Audit table, expressed per-weight because a report's column
+    /// count is not known until the result lands.
+    ///
+    /// Scaling by *total weight* rather than column count is what makes the
+    /// floor mean the same thing for every column: at this width the
+    /// lightest column (weight 1.0) gets ~9 cells, whatever the heavier
+    /// ones are doing.
+    const REPORTS_MIN_WIDTH_PER_WEIGHT: f32 = 9.0;
+
+    /// Cap on the derived floor, so a catalogue with an absurd number of
+    /// columns produces a wide-but-navigable table rather than a viewport
+    /// showing two columns and a very long scrollbar.
+    const REPORTS_MAX_MIN_WIDTH: f32 = 240.0;
+
+    /// The `min_total_width` for this result's table, or `None` when there
+    /// are no columns to floor.
+    ///
+    /// `None` (today's value) lets `DataTable` squeeze every column to fit
+    /// the viewport, which at 80 columns leaves an eleven-column report a
+    /// few cells per column — legible for nothing. Below this floor the
+    /// primitive's horizontal scrollbar takes over instead.
+    fn reports_table_min_width(result: &ReportResult) -> Option<f32> {
+        if result.columns.is_empty() {
+            return None;
+        }
+        let total_weight: f32 = result
+            .columns
             .iter()
+            .map(|c| Self::reports_column_weight(Self::reports_column_meta(result, c)))
+            .sum();
+        Some(
+            (total_weight * Self::REPORTS_MIN_WIDTH_PER_WEIGHT).min(Self::REPORTS_MAX_MIN_WIDTH),
+        )
+    }
+
+    /// Row indices in display order under `sort`, or `0..n` when unsorted.
+    ///
+    /// A `ReportResult` is a **complete bounded set** — unlike `/audit`,
+    /// which is server-paginated newest-first and where a client-side sort
+    /// would silently reorder only the loaded page and call it the answer.
+    /// Sorting here is therefore correct, and is done client-side.
+    fn reports_row_order(
+        result: &ReportResult,
+        sort: Option<(usize, SortDirection)>,
+    ) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..result.rows.len()).collect();
+        let Some((col, dir)) = sort else {
+            return order;
+        };
+        let Some(name) = result.columns.get(col) else {
+            // A sort pinned to a column the current result doesn't have
+            // (a re-run that changed shape) degrades to unsorted.
+            return order;
+        };
+        let kind = Self::reports_column_kind(result, name);
+        // `sort_by` is stable, so rows that tie keep the daemon's own
+        // ordering — which for `issue-activity` is most-recently-active
+        // first, a meaningful secondary key the panel gets for free.
+        order.sort_by(|&a, &b| {
+            Self::reports_compare_cells(
+                result.rows[a].get(name.as_str()),
+                result.rows[b].get(name.as_str()),
+                kind,
+                dir,
+            )
+        });
+        order
+    }
+
+    /// Order two cells of the same column.
+    ///
+    /// Compares the **raw JSON**, never the formatted string: `13h ago`
+    /// versus `2026-07-28 14:03` sorts lexically into nonsense, and
+    /// `1785780878.15` versus `900.0` sorts to the wrong answer as text.
+    /// Ordering follows the declared `kind` — numeric for `int`/`timestamp`/
+    /// `duration`, length-then-text for `list`, string otherwise (including
+    /// every unknown kind).
+    ///
+    /// `null`/missing sorts **last in both directions**: reversing a sort
+    /// should surface the other end of the real data, not a block of blanks.
+    fn reports_compare_cells(
+        a: Option<&serde_json::Value>,
+        b: Option<&serde_json::Value>,
+        kind: &str,
+        dir: SortDirection,
+    ) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        let is_null = |v: &Option<&serde_json::Value>| {
+            matches!(v, None | Some(serde_json::Value::Null))
+        };
+        let (a, b) = match (is_null(&a), is_null(&b)) {
+            (true, true) => return Ordering::Equal,
+            (true, false) => return Ordering::Greater,
+            (false, true) => return Ordering::Less,
+            // Both non-null, so both unwraps are infallible.
+            (false, false) => (a.unwrap(), b.unwrap()),
+        };
+        let as_text = |v: &serde_json::Value| Self::reports_plain_text(v);
+        let joined = |items: &[serde_json::Value]| {
+            items
+                .iter()
+                .map(Self::reports_plain_text)
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let base = match kind {
+            "int" | "timestamp" | "duration" => match (a.as_f64(), b.as_f64()) {
+                (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
+                // A column declared numeric that isn't (mixed types, an
+                // ISO string): fall back rather than treating both as 0.
+                _ => as_text(a).cmp(&as_text(b)),
+            },
+            "list" => match (a.as_array(), b.as_array()) {
+                // Length first — "which issue needed the most reviews" is
+                // the question a list column is actually asked.
+                (Some(x), Some(y)) => x.len().cmp(&y.len()).then_with(|| joined(x).cmp(&joined(y))),
+                _ => as_text(a).cmp(&as_text(b)),
+            },
+            _ => as_text(a).cmp(&as_text(b)),
+        };
+        match dir {
+            SortDirection::Ascending => base,
+            SortDirection::Descending => base.reverse(),
+        }
+    }
+
+    fn reports_result_rows(result: &ReportResult, order: &[usize]) -> Vec<DataRow> {
+        // Resolve each column's kind once per table rather than once per
+        // cell — an 11-column result over a few hundred rows would otherwise
+        // do a few thousand redundant linear scans of `column_meta`.
+        let kinds: Vec<&str> = result
+            .columns
+            .iter()
+            .map(|c| Self::reports_column_kind(result, c))
+            .collect();
+        order
+            .iter()
+            .filter_map(|&i| result.rows.get(i))
             .map(|row| DataRow {
                 cells: result
                     .columns
                     .iter()
-                    .map(|c| StyledText {
+                    .zip(kinds.iter())
+                    .map(|(c, kind)| StyledText {
                         spans: vec![StyledSpan::with_fg(
-                            Self::reports_cell_text(row, c),
+                            Self::reports_cell_text(row, c, kind),
                             Color::rgb(200, 200, 200),
                         )],
                     })
@@ -494,9 +766,17 @@ impl CoordApp {
                 "  No reports available.  (the daemon's catalogue is empty)".to_string()
             };
             self.reports_layout.borrow_mut().clear();
+            *self.reports_table_layout.borrow_mut() = None;
             backend.draw_list(rect, &plain_list("reports-empty", &message, 0));
             return;
         }
+
+        // #1762: drop last frame's table geometry up front. Every path that
+        // actually paints a table re-sets it below; every path that doesn't
+        // (an error, a run in flight, a zero-row result, a result area too
+        // short to draw into) leaves it `None`, so a header click can never
+        // be routed against a table that is no longer on screen.
+        *self.reports_table_layout.borrow_mut() = None;
 
         // Carve the section stack off the top at exactly the height it
         // needs, so the remainder goes to the result. `lh` converts rows to
@@ -618,21 +898,43 @@ impl CoordApp {
                 ),
             );
         } else if table_h > 0.0 {
+            // A sort left over from a previous run whose column no longer
+            // exists is dropped rather than carried: `reports_sort` is
+            // cleared on every run (`reports_start_run`), so this only
+            // catches a result swapped in by some other path.
+            let sort = self
+                .reports_sort
+                .filter(|(col, _)| *col < result.columns.len());
             let table = DataTable {
                 id: WidgetId::new("reports-result"),
                 columns: Self::reports_result_columns(result),
-                rows: Self::reports_result_rows(result),
+                rows: Self::reports_result_rows(result, &Self::reports_row_order(result, sort)),
                 selected_idx: None,
                 scroll_offset: self.reports_result_scroll,
-                sort: None,
+                // The ▲/▼ header indicator is drawn by the primitive
+                // itself — the app only says which column and which way.
+                sort,
                 has_focus: false,
                 show_scrollbar: true,
-                min_total_width: None,
+                min_total_width: Self::reports_table_min_width(result),
+                // Horizontal scrolling is *reachable* (the floor above can
+                // make the content wider than the viewport, and the
+                // primitive then paints its h-scrollbar) but not yet
+                // *drivable* — no drag/wheel handler moves this. Held at
+                // 0.0 deliberately: `DataTableLayout::hit_test` has no
+                // concept of `h_scroll`, so a non-zero value here would
+                // shift the painted headers out from under the hit-test
+                // and route column-sort clicks to the wrong column.
                 h_scroll: 0.0,
                 column_overrides: Vec::new(),
                 footer: None,
             };
-            backend.draw_data_table(table_rect, &table, None);
+            // Cache the painted geometry *with the rect it was painted
+            // into* — unlike Audit's table this one does not start at the
+            // main panel's origin (the section stack is above it), so a
+            // bare `pos - main_b` would mis-hit-test by the stack's height.
+            let layout = backend.draw_data_table(table_rect, &table, None);
+            *self.reports_table_layout.borrow_mut() = Some((table_rect, layout));
         }
 
         if notes_h > 0.0 {
@@ -663,6 +965,54 @@ impl CoordApp {
     /// table off screen.
     const REPORTS_NOTES_MAX_ROWS: usize = 10;
 
+    // ── Result-table hit-testing and sort ────────────────────────────────
+
+    /// Hit-test a click against the last-painted result `DataTable`, or
+    /// `None` when no table is on screen. Same render-then-hit-test pattern
+    /// as `audit_table_hit`, except the cached rect carries the table's own
+    /// origin (see `render_reports_result`).
+    pub(crate) fn reports_table_hit(&self, pos: Point) -> Option<DataTableHit> {
+        let n = self.reports_result.as_ref().map(|r| r.rows.len())?;
+        let cache = self.reports_table_layout.borrow();
+        let (rect, layout) = cache.as_ref()?;
+        Some(layout.hit_test(
+            pos.x - rect.x,
+            pos.y - rect.y,
+            self.reports_result_scroll,
+            n,
+        ))
+    }
+
+    /// Click a result-table column header: `None → ▲ → ▼ → None` for that
+    /// column, switching straight to ▲ when a different column is clicked.
+    ///
+    /// The third click clearing the sort (rather than cycling back to ▲) is
+    /// what makes the daemon's own row order reachable again — for
+    /// `issue-activity` that order is "most recently active first", which
+    /// is a genuinely different answer from any column sort.
+    pub(crate) fn reports_sort_by_column(&mut self, col: usize) -> bool {
+        let columns = self
+            .reports_result
+            .as_ref()
+            .map(|r| r.columns.len())
+            .unwrap_or(0);
+        if col >= columns {
+            return false;
+        }
+        self.reports_sort = match self.reports_sort {
+            Some((c, SortDirection::Ascending)) if c == col => {
+                Some((col, SortDirection::Descending))
+            }
+            Some((c, SortDirection::Descending)) if c == col => None,
+            _ => Some((col, SortDirection::Ascending)),
+        };
+        // The row that was under the viewport means something different
+        // now, so "stay where you were" is meaningless — go to the top,
+        // which is where the answer to "sort by this" actually is.
+        self.reports_result_scroll = 0;
+        true
+    }
+
     // ── Actions ──────────────────────────────────────────────────────────
 
     /// Fire a run of `report_id` with its current parameter values. The
@@ -688,6 +1038,12 @@ impl CoordApp {
         self.reports_error = None;
         self.reports_result = None;
         self.reports_result_scroll = 0;
+        // Sort is view state over one specific result set, so it resets
+        // with that set — same posture as the panel's parameters and the
+        // Audit panel's filters, neither of which persist across restarts.
+        // Carrying a sort into a differently-shaped result would silently
+        // reorder by whatever column happened to land at that index.
+        self.reports_sort = None;
         self.reports_running = Some(def.id.clone());
         self.reports_run_rx = Some(spawn_report_run(&def.id, params));
     }

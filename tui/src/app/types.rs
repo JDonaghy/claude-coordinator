@@ -1653,12 +1653,47 @@ pub struct ReportCatalogue {
     pub reports: Vec<ReportDef>,
 }
 
+/// #1760: additive display metadata for one result column, mirroring
+/// `coord/reports.py`'s `ColumnMeta.to_dict` field-for-field.
+///
+/// **Every field is optional and every field is a hint.** The wire's
+/// `columns`/`rows` stay byte-identical whether or not `column_meta` is
+/// present, so a daemon that predates #1760 simply sends none and the panel
+/// falls back to its pre-#1762 rendering. `kind` in particular is an open
+/// vocabulary — a newer daemon may declare a kind this binary has never
+/// heard of, and the renderer must degrade to plain stringification rather
+/// than panic (see `CoordApp::reports_cell_text`).
+///
+/// `id` matches the corresponding `columns[]` entry and the order matches
+/// too, so a client can zip them — but this panel looks meta up **by `id`**,
+/// for exactly the reason cells are looked up by column name: a daemon that
+/// ships a partial or reordered `column_meta` must mis-render nothing.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub struct ReportColumnMeta {
+    #[serde(default)]
+    pub id: String,
+    /// Human-facing column title. Empty → fall back to `id`.
+    #[serde(default)]
+    pub label: String,
+    /// `"text" | "int" | "timestamp" | "list" | "enum" | "duration"`, or
+    /// anything a future daemon invents.
+    #[serde(default)]
+    pub kind: String,
+    /// `"left"` | `"right"` (anything else is treated as `"left"`).
+    #[serde(default)]
+    pub align: String,
+    /// Relative column width hint. Absent/zero/NaN → treated as 1.0.
+    #[serde(default)]
+    pub weight: f32,
+}
+
 /// The `GET /report/{id}` response — one completed run.
 ///
 /// `columns` is the ordered list of row keys worth tabulating; `rows` may
 /// carry extra keys beyond it (the engine's docstring calls this out), so
 /// cells are looked up **by column name**, never by position. `notes` holds
-/// derived anomalies and renders under the table.
+/// derived anomalies and renders under the table. `column_meta` (#1760) is
+/// per-column display metadata — see [`ReportColumnMeta`].
 #[derive(Clone, Debug, Default, serde::Deserialize)]
 pub struct ReportResult {
     #[serde(default)]
@@ -1673,6 +1708,8 @@ pub struct ReportResult {
     pub window: Vec<f64>,
     #[serde(default)]
     pub columns: Vec<String>,
+    #[serde(default)]
+    pub column_meta: Vec<ReportColumnMeta>,
     #[serde(default)]
     pub rows: Vec<serde_json::Value>,
     #[serde(default)]

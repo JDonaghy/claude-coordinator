@@ -41585,3 +41585,490 @@ Milestone tracking issue.
             FieldKind::Button
         ));
     }
+
+    // ── #1762: result-table formatting, sizing, and column sort ──────────
+    //
+    // Every test below renders through `driver_with_shell` and asserts on
+    // the *rendered grid*, because the whole issue is "the table is
+    // illegible" — a model-level assertion that `column_meta` was parsed
+    // would prove nothing about what the operator sees. Coordinates come
+    // from `driver.find()`, never hardcoded.
+
+    /// A completed run carrying #1760 `column_meta`: one column of each
+    /// kind that changes rendering (`int`, `text`, `timestamp`, `list`),
+    /// one deliberately over-weighted column, and two rows whose numeric
+    /// order is the *opposite* of their lexical order in every numeric
+    /// column — so a lexical sort can never accidentally pass.
+    ///
+    /// `ZEBRA-ROW` is first in the daemon's own order and carries the old
+    /// timestamp, the two-machine list, and `fixes: 10`; `ALPHA-ROW` is
+    /// second, recent, with an empty list and `fixes: 2`.
+    fn reports_result_json_meta() -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        format!(
+            r#"{{
+                    "report_id": "issue-activity",
+                    "generated_at": {now},
+                    "window": [{start}, {now}],
+                    "columns": ["issue", "title", "started_at", "machines", "fixes"],
+                    "column_meta": [
+                        {{"id": "issue", "label": "Issue", "kind": "int",
+                          "align": "right", "weight": 1.0}},
+                        {{"id": "title", "label": "Title", "kind": "text",
+                          "align": "left", "weight": 3.0}},
+                        {{"id": "started_at", "label": "Started", "kind": "timestamp",
+                          "align": "left", "weight": 1.0}},
+                        {{"id": "machines", "label": "Machines", "kind": "list",
+                          "align": "left", "weight": 2.5}},
+                        {{"id": "fixes", "label": "Fixes", "kind": "int",
+                          "align": "right", "weight": 1.0}}
+                    ],
+                    "rows": [
+                        {{"issue": 2, "title": "ZEBRA-ROW", "started_at": {old},
+                          "machines": ["dellserver", "precision"], "fixes": 10}},
+                        {{"issue": 10, "title": "ALPHA-ROW", "started_at": {recent},
+                          "machines": [], "fixes": 2}}
+                    ],
+                    "notes": []
+                }}"#,
+            now = now,
+            start = now - 30.0 * 86_400.0,
+            old = now - 30.0 * 86_400.0,
+            recent = now - 13.0 * 3600.0,
+        )
+    }
+
+    /// Open the Reports panel on a seeded result and render one frame.
+    fn reports_driver(
+        result_json: &str,
+        w: u16,
+        h: u16,
+    ) -> quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic> {
+        use quadraui::tui::testing::driver_with_shell;
+        let app = make_app_with_reports(
+            BoardData::default(),
+            reports_catalogue_json(),
+            Some(result_json),
+        );
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), w, h);
+        click_activity_icon(&mut driver, "▤");
+        driver.render();
+        driver
+    }
+
+    /// Longest run of consecutive ASCII digits anywhere in `screen` — the
+    /// epoch detector. `1785780878.1551082` shows up as a 10-digit run;
+    /// nothing a human-readable time renders (`13h ago`, `2026-07-05
+    /// 12:00`, an issue number, a row count) comes close.
+    fn longest_digit_run(screen: &str) -> usize {
+        let mut best = 0;
+        let mut run = 0;
+        for ch in screen.chars() {
+            if ch.is_ascii_digit() {
+                run += 1;
+                best = best.max(run);
+            } else {
+                run = 0;
+            }
+        }
+        best
+    }
+
+    /// The screen row `y` (as returned by `find`) as a `Vec<char>`, for
+    /// column-geometry assertions that need cell positions.
+    fn screen_row(screen: &str, y: f32) -> Vec<char> {
+        screen
+            .lines()
+            .nth(y as usize)
+            .map(|l| l.chars().collect())
+            .unwrap_or_default()
+    }
+
+    /// `true` when `row` carries a `YYYY-MM`-shaped run — the shape a
+    /// calendar date renders as, and nothing a relative time or an epoch
+    /// float ever produces. Only the prefix is matched, because a narrow
+    /// column ellipsises the tail.
+    fn looks_like_a_date(row: &str) -> bool {
+        let cells: Vec<char> = row.chars().collect();
+        cells.windows(8).any(|w| {
+            w[0..4].iter().all(char::is_ascii_digit)
+                && w[4] == '-'
+                && w[5..7].iter().all(char::is_ascii_digit)
+                && (w[7] == '-' || w[7] == '…')
+        })
+    }
+
+    /// Rendered width of the column whose header starts at `(x, y)`:
+    /// the distance to the `│` the TUI rasteriser paints at that column's
+    /// right edge. `None` for the last column (which has no separator) or
+    /// one scrolled off the viewport.
+    fn reports_rendered_column_width(screen: &str, x: f32, y: f32) -> Option<usize> {
+        let row = screen_row(screen, y);
+        let start = x as usize;
+        row.iter()
+            .skip(start)
+            .position(|c| *c == '│')
+            .map(|offset| offset + 1)
+    }
+
+    #[test]
+    fn reports_timestamp_column_renders_a_readable_time_not_an_epoch() {
+        let driver = reports_driver(&reports_result_json_meta(), 140, 40);
+        let screen = driver.screen();
+
+        // `13h0m ago`, not `13h ago`: the relative string comes from the
+        // existing `format_unix_time`/`fmt_dur` pair the Audit panel and the
+        // window line already use. Reusing it — rather than hand-rolling a
+        // prettier one here — is the point (#1762 forbids a third
+        // time-formatting implementation in this binary).
+        assert!(
+            screen.contains("13h0m ago"),
+            "#1762: a recent `timestamp` cell must render relatively:\n{screen}"
+        );
+        // The 30-day-old row is past the relative window, so it renders as
+        // a calendar date. Asserted structurally (a `YYYY-MM`-shaped run)
+        // rather than against a literal, since the fixture is clock-relative
+        // — and only on the prefix, because a narrow column may ellipsise
+        // the tail.
+        let (_, zebra_y) = driver.find("ZEBRA-ROW").expect("old row must render");
+        let zebra: String = screen_row(&screen, zebra_y).into_iter().collect();
+        assert!(
+            looks_like_a_date(&zebra),
+            "#1762: an old `timestamp` cell must render as a date, not a \
+                 relative string nor an epoch:\n{zebra}"
+        );
+        assert!(
+            longest_digit_run(&screen) < 9,
+            "#1762: no cell may render a raw epoch — longest digit run was \
+                 {}:\n{screen}",
+            longest_digit_run(&screen)
+        );
+    }
+
+    #[test]
+    fn reports_list_column_renders_joined_text_with_no_json_punctuation() {
+        let driver = reports_driver(&reports_result_json_meta(), 140, 40);
+        let screen = driver.screen();
+
+        assert!(
+            screen.contains("dellserver, precision"),
+            "#1762: a `list` cell must render as joined text:\n{screen}"
+        );
+        // Assert on the row itself, not the whole screen — the shell
+        // chrome legitimately draws brackets elsewhere.
+        let (_, y) = driver
+            .find("dellserver, precision")
+            .expect("list cell must render");
+        let row: String = screen_row(&screen, y).into_iter().collect();
+        for junk in ['[', ']', '"'] {
+            assert!(
+                !row.contains(junk),
+                "#1762: a rendered row must carry no JSON punctuation, found \
+                     {junk:?} in:\n{row}"
+            );
+        }
+    }
+
+    #[test]
+    fn reports_empty_list_renders_an_em_dash_not_empty_brackets() {
+        let driver = reports_driver(&reports_result_json_meta(), 140, 40);
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("[]"),
+            "#1762: an empty `list` cell must not render as `[]`:\n{screen}"
+        );
+        let (_, y) = driver.find("ALPHA-ROW").expect("empty-list row must render");
+        let row: String = screen_row(&screen, y).into_iter().collect();
+        assert!(
+            row.contains('—'),
+            "#1762: an empty `list` cell must render as an em dash — a blank \
+                 reads as missing data:\n{row}"
+        );
+    }
+
+    #[test]
+    fn reports_column_weight_sizes_the_heavier_column_wider() {
+        let driver = reports_driver(&reports_result_json_meta(), 140, 40);
+        let screen = driver.screen();
+
+        // Left-aligned header text starts exactly at its column's left
+        // edge, so consecutive header x-offsets *are* the resolved column
+        // widths. Only left-aligned headers are used, and every coordinate
+        // comes from `find`.
+        let (title_x, header_y) = driver.find("Title").expect("Title header must render");
+        let (started_x, _) = driver.find("Started").expect("Started header must render");
+        let (machines_x, _) = driver.find("Machines").expect("Machines header must render");
+        let title_w = started_x - title_x;
+        let started_w = machines_x - started_x;
+
+        assert!(
+            title_w > started_w * 2.0,
+            "#1762: `title` (weight 3.0) must be rendered far wider than \
+                 `started_at` (weight 1.0) — got {title_w} vs {started_w} \
+                 (header row {header_y}):\n{screen}"
+        );
+    }
+
+    #[test]
+    fn reports_result_without_column_meta_renders_exactly_as_before() {
+        // The older-daemon guard: #1741's own fixture carries no
+        // `column_meta` at all, and must render byte-for-byte as it did —
+        // raw column ids as headers, raw values as cells, no em dashes, no
+        // relative times invented out of an `int`.
+        let driver = reports_driver(&reports_result_json(), 140, 40);
+        let screen = driver.screen();
+        for needle in [
+            "issue",
+            "outcome",
+            "iterations",
+            "claude-coordinator#1629",
+            "claude-coordinator#1631",
+        ] {
+            assert!(
+                screen.contains(needle),
+                "#1762: a result with no `column_meta` must render {needle:?} \
+                     exactly as before:\n{screen}"
+            );
+        }
+        let (_, y) = driver.find("claude-coordinator#1629").expect("row must render");
+        let row: String = screen_row(&screen, y).into_iter().collect();
+        assert!(
+            row.contains(" 1") && !row.contains('—'),
+            "#1762: with no metadata the `iterations` cell stays a plain \
+                 number and nothing becomes an em dash:\n{row}"
+        );
+    }
+
+    #[test]
+    fn reports_unknown_column_kind_falls_back_to_stringification() {
+        // A daemon newer than this binary declaring a kind it has never
+        // heard of must still render its data.
+        let now = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        let result = format!(
+            r#"{{
+                    "report_id": "issue-activity",
+                    "generated_at": {now},
+                    "window": [{start}, {now}],
+                    "columns": ["thing"],
+                    "column_meta": [
+                        {{"id": "thing", "label": "Thing", "kind": "sparkline",
+                          "align": "diagonal", "weight": 0.0}}
+                    ],
+                    "rows": [{{"thing": "PLAIN-VALUE"}}],
+                    "notes": []
+                }}"#,
+            now = now,
+            start = now - 3600.0,
+        );
+        let driver = reports_driver(&result, 140, 40);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("PLAIN-VALUE"),
+            "#1762: an unrecognised `kind` must fall back to today's \
+                 stringification, not blank the column:\n{screen}"
+        );
+        assert!(
+            screen.contains("Thing"),
+            "#1762: …and the column must still be titled from its label:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn reports_header_click_cycles_sort_ascending_descending_off() {
+        let mut driver = reports_driver(&reports_result_json_meta(), 140, 40);
+        assert!(
+            !driver.screen().contains('▲') && !driver.screen().contains('▼'),
+            "#1762: an unsorted table must show no indicator:\n{}",
+            driver.screen()
+        );
+
+        // Click a few cells INTO the header text, never at its first cell:
+        // `DataTableLayout::hit_test` gives a ±3-cell divider grab zone
+        // priority over the header, and a column's left edge *is* the
+        // previous column's right edge. Successive clicks are 5 cells apart
+        // so the backend's double-click detector (1.5-cell radius) never
+        // folds two of them into a `DoubleClick` that never reaches the
+        // click handler.
+        //
+        // `Machines` is the target because it is left-aligned and wide: a
+        // right-aligned header shifts left by two cells the moment the
+        // ▲ suffix is appended, which would move the target out from under
+        // a fixed offset.
+        let (x, y) = driver.find("Machines").expect("Machines header must render");
+        driver.click(x + 5.0, y);
+        driver.render();
+        assert!(
+            driver.screen().contains('▲'),
+            "#1762: the first header click must sort ascending and render \
+                 ▲:\n{}",
+            driver.screen()
+        );
+
+        driver.click(x + 10.0, y);
+        driver.render();
+        assert!(
+            driver.screen().contains('▼') && !driver.screen().contains('▲'),
+            "#1762: the second click must flip to descending:\n{}",
+            driver.screen()
+        );
+
+        driver.click(x + 15.0, y);
+        driver.render();
+        assert!(
+            !driver.screen().contains('▲') && !driver.screen().contains('▼'),
+            "#1762: the third click must clear the sort, so the daemon's own \
+                 row order is reachable again:\n{}",
+            driver.screen()
+        );
+    }
+
+    #[test]
+    fn reports_int_column_sorts_numerically_not_lexically() {
+        let mut driver = reports_driver(&reports_result_json_meta(), 140, 40);
+        // Daemon order: ZEBRA (fixes 10) then ALPHA (fixes 2). A *lexical*
+        // ascending sort would leave that order untouched ("10" < "2"), so
+        // "ALPHA moved above ZEBRA" can only mean numeric ordering.
+        let (zebra_y, alpha_y) = reports_row_ys(&driver);
+        assert!(zebra_y < alpha_y, "fixture must start in daemon order");
+
+        let (x, y) = driver.find("Fixes").expect("Fixes header must render");
+        driver.click(x + 4.0, y);
+        driver.render();
+
+        let (zebra_y, alpha_y) = reports_row_ys(&driver);
+        assert!(
+            alpha_y < zebra_y,
+            "#1762: ascending an `int` column must order 2 before 10 \
+                 (numeric, not lexical) — got ALPHA at {alpha_y}, ZEBRA at \
+                 {zebra_y}:\n{}",
+            driver.screen()
+        );
+    }
+
+    #[test]
+    fn reports_timestamp_column_sorts_by_instant_not_rendered_string() {
+        let mut driver = reports_driver(&reports_result_json_meta(), 140, 40);
+        // ZEBRA is 30 days old, ALPHA is 13h old. Ascending *by instant*
+        // puts ZEBRA first. Ascending by the rendered string would put
+        // ALPHA first ("13h ago" sorts before "20xx-…"), so the two answers
+        // are distinguishable.
+        let (x, y) = driver.find("Started").expect("Started header must render");
+        driver.click(x + 4.0, y);
+        driver.render();
+
+        let (zebra_y, alpha_y) = reports_row_ys(&driver);
+        assert!(
+            zebra_y < alpha_y,
+            "#1762: ascending a `timestamp` column must order by instant, \
+                 not by the formatted string — got ZEBRA at {zebra_y}, ALPHA \
+                 at {alpha_y}:\n{}",
+            driver.screen()
+        );
+
+        // …and descending flips it, proving the direction is real and not
+        // an artefact of the daemon's own ordering. `Started` is
+        // left-aligned so its header x does not move when ▲ is appended;
+        // the second click is 3 cells clear of the first (double-click
+        // radius is 1.5) and still inside the column.
+        driver.click(x + 7.0, y);
+        driver.render();
+        let (zebra_y, alpha_y) = reports_row_ys(&driver);
+        assert!(
+            alpha_y < zebra_y,
+            "#1762: descending must put the most recent row first:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// y-offsets of the two fixture rows, by their unique title cells.
+    fn reports_row_ys<A: quadraui::AppLogic>(
+        driver: &quadraui::tui::testing::TuiDriver<A>,
+    ) -> (f32, f32) {
+        let (_, zebra) = driver
+            .find("ZEBRA-ROW")
+            .unwrap_or_else(|| panic!("ZEBRA row must render:\n{}", driver.screen()));
+        let (_, alpha) = driver
+            .find("ALPHA-ROW")
+            .unwrap_or_else(|| panic!("ALPHA row must render:\n{}", driver.screen()));
+        (zebra, alpha)
+    }
+
+    #[test]
+    fn reports_rerun_clears_the_active_sort() {
+        // Model-level, deliberately: a run in flight clears the result, so
+        // there is no table left on screen whose ▲/▼ a driver test could
+        // assert the absence of. What matters is that the *next* result
+        // cannot inherit a sort pinned to a column index that may mean
+        // something else — and that is state, not pixels.
+        let mut app = make_app_with_reports(
+            BoardData::default(),
+            reports_catalogue_json(),
+            Some(&reports_result_json_meta()),
+        );
+        assert!(app.reports_sort_by_column(4), "sorting column 4 must apply");
+        assert_eq!(app.reports_sort, Some((4, SortDirection::Ascending)));
+
+        // No board service resolves under `cfg(test)`, so this arms a run
+        // that never completes — exactly what the `r` key does.
+        app.reports_rerun_selected();
+        assert!(
+            app.reports_sort.is_none(),
+            "#1762: a re-run must clear the active sort — sort is view state \
+                 over one result set, and the next set may not even have \
+                 that column"
+        );
+    }
+
+    #[test]
+    fn reports_sort_ignores_a_column_index_the_result_does_not_have() {
+        let mut app = make_app_with_reports(
+            BoardData::default(),
+            reports_catalogue_json(),
+            Some(&reports_result_json_meta()),
+        );
+        assert!(
+            !app.reports_sort_by_column(99),
+            "#1762: a header click past the last column must be a no-op, not \
+                 a panic or a phantom sort"
+        );
+        assert!(app.reports_sort.is_none());
+    }
+
+    #[test]
+    fn reports_narrow_terminal_honours_the_min_width_floor() {
+        // At 140 columns everything fits and every header renders in full.
+        let wide = reports_driver(&reports_result_json_meta(), 140, 40).screen();
+        assert!(
+            wide.contains("Started") && wide.contains("Machines"),
+            "#1762: at a wide terminal every column header must render:\n{wide}"
+        );
+
+        // At 80 columns the main panel is far narrower than the table's
+        // floor. Without the floor all five columns would still be on
+        // screen, each squeezed to a handful of cells; with it, the columns
+        // keep the widths their weights earned and `DataTable`'s horizontal
+        // scrollbar takes over — the visible ones stay legible and the rest
+        // are scrolled to, not mangled.
+        let narrow_driver = reports_driver(&reports_result_json_meta(), 80, 40);
+        let narrow = narrow_driver.screen();
+        let (tx, ty) = narrow_driver
+            .find("Title")
+            .expect("Title header must still render at 80 columns");
+        let narrow_title_w = reports_rendered_column_width(&narrow, tx, ty)
+            .expect("Title column must still be delimited by a separator");
+        // Squeezed into the ~42-cell main panel, `title`'s 3-of-8.5 weight
+        // share would be ~15 cells. The floor gives it ~27.
+        assert!(
+            narrow_title_w >= 20,
+            "#1762: at 80 columns the table must honour its \
+                 `min_total_width` floor rather than squeezing every column \
+                 below legibility — `title` rendered {narrow_title_w} cells \
+                 wide:\n{narrow}"
+        );
+    }
