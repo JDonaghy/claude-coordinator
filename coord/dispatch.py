@@ -645,6 +645,33 @@ def dispatch(
         effective_provider_name, config,
     ):
         payload["provider"] = effective_provider_name
+        # #1796: carry the resolved provider's own definition (type/binary/
+        # model/env/extra_args) alongside its name, so a config-free agent
+        # (no local providers.definitions registry to look "provider" up
+        # in — docs/EPHEMERAL_WORKERS.md) can still construct the right
+        # Provider instance via coord.providers.build_provider_from_wire,
+        # instead of refusing the assignment for want of local config (see
+        # coord.agent.AgentServer._resolve_provider — #1796's whole point is
+        # that it refuses rather than silently degrading to the legacy
+        # claude path, so THIS is what makes a config-free dispatch of a
+        # named provider actually work end-to-end).
+        #
+        # Only sent alongside "provider" — never on its own — so this key
+        # only ever reaches an agent already new enough to know the
+        # "provider" field (#324); an agent that predates #1796 itself will
+        # still reject the payload with a 400 for the unknown
+        # "provider_def" key until it's updated (`coord agent update`) — see
+        # this issue's Deployment note.  Omitted when the coordinator's own
+        # providers.definitions has no entry for effective_provider_name (a
+        # name that only exists as providers.default with no matching
+        # definitions entry): don't fabricate one, let the agent's own
+        # "unknown provider" refusal (#1796) surface that misconfiguration,
+        # matching guard_unattended_dispatch's established posture above.
+        definition = config.providers.definitions.get(effective_provider_name)
+        if definition is not None:
+            from coord.providers import provider_def_to_wire  # noqa: PLC0415
+
+            payload["provider_def"] = provider_def_to_wire(definition)
 
     resp = httpx.post(url, json=payload, timeout=15)
     try:

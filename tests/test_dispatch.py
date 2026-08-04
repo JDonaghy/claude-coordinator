@@ -1559,6 +1559,109 @@ class TestProviderDispatch:
         assert payload.get("provider") == "spec-provider"
 
 
+class TestProviderDefInPayload:
+    """#1796: dispatch() must carry the resolved provider's own definition
+    (type/binary/model/env/extra_args) alongside its name, so a config-free
+    agent (no local providers.definitions registry — docs/EPHEMERAL_WORKERS.md)
+    can build the provider itself instead of refusing the assignment."""
+
+    @patch("coord.dispatch.httpx.post")
+    def test_provider_def_included_alongside_non_default_provider(
+        self, mock_post: MagicMock,
+    ) -> None:
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "abc"}
+        mock_post.return_value = mock_resp
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api", provider="oc-mid")],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+                # #1711's capability gate requires the machine to advertise
+                # the resolved provider's TYPE ("opencode") — unrelated to
+                # what this test targets (the wire payload), so declare it.
+                capabilities=["provider:opencode"],
+            )],
+            providers=ProvidersConfig(
+                default="claude",
+                definitions={
+                    "oc-mid": ProviderDef(
+                        type="opencode",
+                        binary="/opt/opencode/bin/opencode",
+                        env={"FOO": "bar"},
+                    ),
+                    "claude": ProviderDef(type="claude"),
+                },
+            ),
+        )
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=10, issue_title="Fix auth", rationale="ok",
+        )
+        dispatch(p, cfg)
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload.get("provider") == "oc-mid"
+        assert payload.get("provider_def") == {
+            "type": "opencode",
+            "binary": "/opt/opencode/bin/opencode",
+            "model": None,
+            "attach_url": None,
+            "env": {"FOO": "bar"},
+            "extra_args": [],
+        }
+
+    @patch("coord.dispatch.httpx.post")
+    def test_provider_def_omitted_when_provider_field_omitted(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal,
+    ) -> None:
+        """No 'provider' in the payload (vanilla default claude) → no
+        'provider_def' either — never send one without the other."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "abc"}
+        mock_post.return_value = mock_resp
+
+        dispatch(proposal, config)
+        payload = mock_post.call_args.kwargs["json"]
+        assert "provider" not in payload
+        assert "provider_def" not in payload
+
+    @patch("coord.dispatch.httpx.post")
+    def test_provider_def_omitted_when_no_matching_definition(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """A resolved provider name with no providers.definitions entry
+        (e.g. providers.default names something never defined) must not
+        fabricate a provider_def — 'provider' is still sent so the agent's
+        own refusal (#1796) can surface the misconfiguration."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "abc"}
+        mock_post.return_value = mock_resp
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+                # #1711's capability gate keys off the resolved TYPE, which
+                # falls back to the bare name for an unregistered provider
+                # (see provider_type_for) — declare it so this test reaches
+                # the wire-payload code this test actually targets instead
+                # of tripping the (correct, unrelated) capability refusal.
+                capabilities=["provider:never-defined"],
+            )],
+            providers=ProvidersConfig(default="never-defined"),
+        )
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=10, issue_title="Fix auth", rationale="ok",
+        )
+        dispatch(p, cfg)
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload.get("provider") == "never-defined"
+        assert "provider_def" not in payload
+
+
 class TestCustomizedClaudeProviderIncludedInPayload:
     """#1711 review of #324's payload-omission gap: a CUSTOMIZED `claude`
     definition (redefined binary/env/extra_args, still named "claude") must

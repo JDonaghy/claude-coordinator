@@ -20,21 +20,32 @@ Public API
     ``coord.usage``, ``coord.failure_class``, ...) can call
     ``provider.parse_log()`` instead of importing ``coord.worker_events``
     directly and assuming every worker log is claude-shaped.
+
+``provider_def_to_wire(definition) -> dict`` / ``build_provider_from_wire(name, wire_def) -> Provider``
+    #1796: the dispatch-payload counterpart to ``build_provider``.  A
+    config-free agent (no local ``coordinator.yml``, no board service —
+    docs/EPHEMERAL_WORKERS.md) has no ``providers.definitions`` registry to
+    resolve ``AssignmentSpec.provider`` against.  ``provider_def_to_wire``
+    (coordinator-side, called from ``coord/dispatch.py``) serializes the
+    resolved :class:`~coord.config.ProviderDef` into the JSON-safe dict
+    carried as ``AssignmentSpec.provider_def``; ``build_provider_from_wire``
+    (agent-side, called from ``coord.agent.AgentServer``) reconstructs the
+    same :class:`Provider` instance from it, with no local config needed.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Iterable
+from typing import TYPE_CHECKING, Any, Iterable
 
-from coord.config import IMPLICIT_PROVIDER_TYPES, provider_capability
+from coord.config import IMPLICIT_PROVIDER_TYPES, ProviderDef, provider_capability
 from coord.providers.base import Capabilities, Provider, WorkerSummary
 from coord.providers.claude import ClaudeProvider
 from coord.providers.claude_pty import ClaudePtyProvider
 from coord.providers.opencode import OpenCodeProvider
 
 if TYPE_CHECKING:
-    from coord.config import Config, ModelsConfig, ProviderDef, ProvidersConfig
+    from coord.config import Config, ModelsConfig, ProvidersConfig
     from coord.models import Machine
 
 __all__ = [
@@ -45,12 +56,14 @@ __all__ = [
     "Provider",
     "WorkerSummary",
     "build_provider",
+    "build_provider_from_wire",
     "describe_provider_choice",
     "get_provider",
     "guard_provider_machine_capability",
     "guard_unattended_dispatch",
     "machine_supports_provider",
     "machines_supporting_provider",
+    "provider_def_to_wire",
     "provider_type_for",
     "resolve_default_provider",
     "resolve_provider_name",
@@ -134,6 +147,84 @@ def build_provider(
         f"Unknown provider type {ptype!r} (provider name: {name!r}). "
         f"Supported types: ['claude', 'claude-pty', 'opencode']"
     )
+
+
+def provider_def_to_wire(definition: "ProviderDef") -> "dict[str, Any]":
+    """Serialize *definition* to the JSON-safe dict carried on the wire as
+    ``AssignmentSpec.provider_def`` (#1796).
+
+    Called from ``coord/dispatch.py`` alongside the existing ``"provider"``
+    name field, so a config-free agent (no local ``coordinator.yml``, no
+    board service — docs/EPHEMERAL_WORKERS.md) receives everything
+    :func:`build_provider` needs to construct the SAME provider instance the
+    coordinator resolved, without a local ``providers.definitions`` registry
+    to look the name up in.  See :func:`build_provider_from_wire` for the
+    agent-side reconstruction.
+
+    Args:
+        definition: The resolved :class:`~coord.config.ProviderDef`.
+
+    Returns:
+        A plain ``dict`` with JSON-safe values only (``env``/``extra_args``
+        copied, not aliased, so the caller's definition is never mutated
+        through the returned dict).
+    """
+    return {
+        "type": definition.type,
+        "binary": definition.binary,
+        "model": definition.model,
+        "attach_url": definition.attach_url,
+        "env": dict(definition.env),
+        "extra_args": list(definition.extra_args),
+    }
+
+
+def build_provider_from_wire(name: str, wire_def: "dict[str, Any]") -> Provider:
+    """Agent-side counterpart to :func:`provider_def_to_wire` (#1796).
+
+    Reconstructs the :class:`~coord.config.ProviderDef` the coordinator
+    resolved at dispatch time from the plain dict carried in
+    ``AssignmentSpec.provider_def``, then builds a live :class:`Provider` via
+    :func:`build_provider` — the SAME dispatch table used coordinator-side —
+    so a config-free agent (no local ``providers.definitions`` registry to
+    look *name* up in — docs/EPHEMERAL_WORKERS.md) gets a provider instance
+    equivalent to the one the coordinator resolved, instead of being unable
+    to honour an explicitly requested ``spec.provider`` at all.
+
+    This is the fix for #1796: before it existed, a config-free agent that
+    could not resolve ``spec.provider`` locally silently fell back to the
+    legacy ``claude -p`` spawn path with no error — an explicitly requested
+    provider (e.g. ``opencode``) never ran, and every surface (coordinator
+    log, board, assignment record) still reported the requested name.  See
+    ``coord.agent.AgentServer._resolve_provider``, which calls this function
+    and REFUSES the assignment instead when neither the local registry nor
+    ``wire_def`` can resolve the name.
+
+    Args:
+        name: The provider's logical name (``AssignmentSpec.provider``).
+            Used only for error messages, mirroring :func:`build_provider`.
+        wire_def: The dict from ``AssignmentSpec.provider_def`` — see
+            :func:`provider_def_to_wire` for its shape.
+
+    Raises:
+        ValueError: *wire_def* is malformed (not a dict, or missing/empty
+            ``"type"``), or names an unknown provider type — the latter
+            mirrors :func:`build_provider`'s own error for that case.
+    """
+    if not isinstance(wire_def, dict) or not wire_def.get("type"):
+        raise ValueError(
+            f"malformed provider_def for provider {name!r}: expected a dict "
+            f"with a non-empty 'type' key, got {wire_def!r}"
+        )
+    definition = ProviderDef(
+        type=wire_def["type"],
+        binary=wire_def.get("binary"),
+        model=wire_def.get("model"),
+        attach_url=wire_def.get("attach_url"),
+        env=dict(wire_def.get("env") or {}),
+        extra_args=list(wire_def.get("extra_args") or []),
+    )
+    return build_provider(name, definition, models_cfg=None)
 
 
 def resolve_provider_name(

@@ -494,12 +494,14 @@ def test_safety_gate_no_provider_is_a_no_op(tmp_path: Path) -> None:
     server.shutdown()
 
 
-def test_safety_gate_unknown_provider_falls_back_to_default(tmp_path: Path) -> None:
-    """spec.provider naming a key not in the registry never raises the gate.
+def test_safety_gate_unknown_provider_is_refused_not_default(tmp_path: Path) -> None:
+    """#1796: spec.provider naming a key not in the registry (and carrying
+    no wire provider_def) must REFUSE the assignment, never silently fall
+    through to ``self.worker_command`` (the legacy ``claude -p`` path).
 
-    The agent's no-config behaviour is byte-identical to today, and an
-    unknown provider name simply falls through to ``self.worker_command``
-    — which is the legacy ``claude -p`` path in production.
+    Before #1796 this fell through silently — the coordinator/board would
+    record ``provider="not-registered"`` while claude actually ran, with no
+    error anywhere.  See ``coord.agent.AgentServer._resolve_provider``.
     """
     repo = _init_repo(tmp_path / "repo")
     server = AgentServer(
@@ -517,12 +519,8 @@ def test_safety_gate_unknown_provider_falls_back_to_default(tmp_path: Path) -> N
         type="work",
         provider="not-registered",
     )
-    record = server.assign(spec)
-    final = server.wait_for(record.id, timeout=10.0)
-    # Spawn used worker_command (legacy path) — the gate never fired
-    # because the named provider wasn't in the registry.
-    # No commits → advisory (#448); "done" or "failed" also valid.
-    assert final.status in ("done", "failed", "advisory")
+    with pytest.raises(ValueError, match="not-registered"):
+        server.assign(spec)
     server.shutdown()
 
 
