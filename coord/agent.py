@@ -922,6 +922,7 @@ def _worker_subprocess_env(
     *,
     prefix: str | None = None,
     base_prefix: str | None = None,
+    cwd: "str | Path | None" = None,
 ) -> dict[str, str]:
     """Environment for worker `claude -p` subprocesses, with the agent's own
     venv removed (#402).
@@ -939,6 +940,21 @@ def _worker_subprocess_env(
     of the agent's. Only strips when the agent is actually running inside a venv
     (``prefix != base_prefix``) so a system-Python agent never loses
     ``/usr/bin`` & co.
+
+    #1783: ``base_env`` is a straight copy of the agent daemon's environment,
+    and the daemon's own ``PWD`` passes through untouched by default.
+    ``Popen(..., cwd=...)`` sets the worker's *real* cwd correctly regardless,
+    but some providers (e.g. opencode) resolve their working directory from
+    the inherited ``PWD`` env var rather than ``getcwd()`` — so a stale
+    ``PWD`` can point such a provider at the wrong checkout even though the
+    OS-level process is confined to the worktree. When *cwd* is given, we set
+    ``PWD`` to match it explicitly, so worktree confinement for those
+    providers no longer depends on the daemon's ambient ``PWD`` (or on
+    ``bash_wrap_spawn`` recomputing it as a side effect of routing through a
+    bash parent — see ``_maybe_bash_wrap``). Callers that merge
+    ``provider.env()`` on top of this result may still override ``PWD``
+    deliberately; that ordering is preserved since we only set it here, not
+    after.
     """
     env = dict(os.environ if base_env is None else base_env)
     pfx = sys.prefix if prefix is None else prefix
@@ -957,6 +973,10 @@ def _worker_subprocess_env(
 
     env.pop("VIRTUAL_ENV", None)
     env.pop("PYTHONHOME", None)
+
+    if cwd is not None:
+        env["PWD"] = str(cwd)
+
     return env
 
 
@@ -6035,7 +6055,16 @@ class AgentServer:
         # paths must stay in sync.  For the legacy / no-provider path,
         # env() is effectively {} so the result is identical to calling
         # _worker_subprocess_env() directly (no-config parity preserved).
-        _spawn_env = _worker_subprocess_env()
+        #
+        # #1783: pass `cwd=repo_path` so PWD is set to the worktree
+        # explicitly rather than inherited from the agent daemon's own
+        # environment.  Popen's `cwd=` below already confines the real
+        # process, but a provider that trusts $PWD over getcwd() (e.g.
+        # opencode) would otherwise resolve against whatever directory the
+        # daemon happened to start in — worktree confinement for those
+        # providers must not depend on `bash_wrap_spawn` recomputing PWD as
+        # a side effect (see `_maybe_bash_wrap`).
+        _spawn_env = _worker_subprocess_env(cwd=repo_path)
         # #1402: shared per-repo cargo target dir (see coord.cargo_cache).
         # Must stay in sync with the PTY path in ``_spawn_pty``.
         _spawn_env.update(
@@ -6202,7 +6231,14 @@ class AgentServer:
             # ``TERM`` may be missing in systemd-managed agent processes
             # — default to ``xterm-256color`` so the TUI renders.
             # Provider env() entries take precedence.
-            env = _worker_subprocess_env()
+            #
+            # #1783: `cwd=repo_path` sets PWD to the worktree explicitly
+            # instead of inheriting the agent daemon's own PWD.  The PTY
+            # path never routes through `_maybe_bash_wrap` (see the
+            # docstring above), so unlike the headless path it never got an
+            # incidental PWD correction — confinement here must not depend
+            # on a provider trusting $PWD over getcwd() by accident.
+            env = _worker_subprocess_env(cwd=repo_path)
             env.setdefault("TERM", "xterm-256color")
             # #1402: point cargo at this machine's shared per-repo target dir
             # so the build cache survives worktree cleanup and is reused by
