@@ -769,13 +769,19 @@ def revalidate_group(
 
 
 def format_batch(batch: BatchRevalidationResult) -> list[str]:
-    """Operator-facing summary lines for one group's revalidation (#1715)."""
+    """Operator-facing OUTCOME lines for one group's revalidation (#1715).
+
+    Deliberately excludes the composite's own failure report — that is
+    :func:`format_failure`'s job and belongs on stderr, whereas "…and here is
+    what merged anyway" is ordinary stdout. Keeping them separate is why the
+    caller does not have to route a "PASSED alone — merging" line to stderr
+    just because the composite that preceded it was red.
+    """
     lines: list[str] = []
     if batch.composite.ok:
         lines.append(f"  --revalidate: PASSED — {batch.composite.reason}")
         return lines
 
-    lines.extend(format_failure(batch.composite))
     if not batch.fell_back:
         return lines
 

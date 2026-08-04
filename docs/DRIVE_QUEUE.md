@@ -16,17 +16,51 @@ This is the operator runbook. For the implementation, see `coord/drive_queue.py`
 
 ## Read this before queuing more than ~2 issues (#1715)
 
-**Until #1715 lands, a queue longer than about two issues is not an
-unattended feature.** Every merge on a repo invalidates every *other* queued
-branch's Test verdict on that repo (the base moved), and `coord drive`'s
-current behaviour on a stale verdict is to **escalate to a human**, not to
-re-test automatically. Queue *N* independent issues against the same repo and
-merging the first one stales the other *N−1* — each of which then sits until
-someone reads the escalation and re-dispatches it by hand. In other words: **a
-queue of *N* costs *N−1* human interventions**, which defeats the entire point
-of an unattended timer.
+**A queue longer than about two issues is still not an *unattended* feature —
+but clearing it is now one command and one suite run, not *N−1* by hand.**
 
-Related, smaller version of the same class: **#1738** made the base-freshness
+Every merge on a repo invalidates every *other* queued branch's Test verdict on
+that repo (the base moved). Queue *N* independent issues against the same repo
+and merging the first one stales the other *N−1*. That is the cascade, and it
+used to cost *N−1* human interventions — which defeats the entire point of an
+unattended timer.
+
+Three arms have since landed against it:
+
+* **#1738** — `coord drive` re-dispatches the Test stage once, automatically,
+  on a STALE (not missing) verdict. Only fires while a **live drive** is
+  watching the issue. Measured 2026-08-03: reached 1 of 4 real stalls.
+* **#1769** — `coord merge --revalidate` re-tests a stale-but-`passed` entry
+  against the current base from the *merge* lane, which is where a branch with
+  no live drive actually sits.
+* **#1715** — that flag **batches**. When several queued entries share a base
+  they are composed onto it together and validated by **ONE** suite run, not
+  one each. A four-branch group costs ~7 minutes, not ~26.
+
+So the practical cost of a deep queue is now: let it run, then drain it with
+
+```bash
+coord merge --revalidate --dry-run   # names each batch and its members
+coord merge --revalidate             # one composed suite run per base, then merge
+```
+
+**What has *not* changed: none of this is automatic.** `--revalidate` is
+strictly opt-in and the unattended auto-drain passes `revalidate=False`
+permanently — starting suite runs on a timer is the shape that was gated off
+after the 2026-06-07 token-burn incident, and `merge.auto_drain` is `false` by
+design. An overnight timer with no operator still parks stale entries; the
+difference is that clearing them in the morning is one command and one suite
+run rather than *N−1* worktrees by hand.
+
+One honest caveat on the batch: a composed run validates the **composite**, not
+each branch alone. Every member already carries its own `passed` verdict from an
+earlier base, so the composite re-confirms they still hold *together* against
+the current one — a re-confirmation, not a first proof. An entry that never had
+a verdict, or that is blocked on review/CI/conflict, is never included. If the
+composite fails, **nothing merges**; each branch is then re-tested alone so the
+culprit is named and the innocent branches still go through.
+
+Related, narrower version of the same class: **#1738** made the base-freshness
 check a little smarter — a base move that only touches `docs/**`,
 `scripts/**`, `.github/ISSUE_TEMPLATE/**`, or a top-level `*.md` file is
 recognized as content-irrelevant and does **not** stale a green Test verdict.
@@ -38,10 +72,12 @@ automatically, on a STALE (not missing) verdict, bounded by the same
 genuine fixes, so a queue that keeps re-staling itself burns it fast and still
 lands on the human escalation.
 
-**Practical guidance:** keep the queue at 1–2 entries per repo until #1715
-ships. If you must queue more, prefer issues in *different* repos (a merge in
-one repo does not stale verdicts in another), or accept that you will be
-resolving `NEEDS_ATTENTION`-style escalations by hand through the night.
+**Practical guidance:** queue depth per repo is no longer bounded by the
+*arithmetic* — it is bounded by whether anyone is around to type
+`coord merge --revalidate` afterwards. For a genuinely unattended overnight
+run, still prefer 1–2 entries per repo, or issues in *different* repos (a
+merge in one repo does not stale verdicts in another). For a run you will come
+back to, queue as deep as you like: the morning drain is one command.
 
 ---
 
