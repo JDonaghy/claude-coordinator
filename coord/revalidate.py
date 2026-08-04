@@ -23,12 +23,46 @@ STRATEGY — batch composite (#1715 Option 3)
 What the operator does by hand — three times in the session above — is: make a
 worktree at the current base, compose every stale branch onto it, run the suite
 **once**, and let them all through on that single result. That is what
-:func:`revalidate` does. It validates the *composite* rather than each branch
-individually, so a failure does not identify its culprit; #1715 calls that
-trade out explicitly and accepts it for a drain the operator asked to
-revalidate, because it turns O(N) suite runs into 1. When the composite fails,
-every candidate stays blocked (see :func:`revalidate`'s contract) — a failure is
-never laundered into a merge.
+:func:`revalidate` does, and it is what removes the *cascade*: N approved
+branches against one base used to cost N−1 full suite runs, because the first
+merge staled everything behind it. One composite run costs 1.
+
+**The honest trade, stated plainly (#1715):** a composite run validates the
+*composite*, not each branch alone. A green composite does not prove each
+branch is green in isolation. That is acceptable here for one specific reason
+— every branch in the set **already carries its own ``passed`` verdict**
+against an earlier base, so the composite is re-confirming that those verdicts
+still hold *together* against the current base. It is a re-confirmation, not a
+first proof, which is exactly why :func:`coord.merge_queue.
+revalidation_candidates` refuses to include an entry that never had a verdict
+(``SMOKE_MISSING``), or one blocked on review/CI/conflict.
+
+It is also a *truer* claim than it first looks: :func:`coord.merge_queue.
+process` snapshots ``target_branch_head_sha`` **once per (repo, target_branch)
+group**, so the whole batch merges against the same base the composite was
+built on. The tree the composite validated is the tree that ends up on the
+base branch.
+
+FAILURE DOES NOT POISON THE BATCH (#1715)
+-----------------------------------------
+A red composite is the hard part: the naive version blocks all N on one
+branch's fault. :func:`revalidate_group` is the resolution — on a red
+composite it merges **nothing**, marks **nothing** failed, and falls back to
+re-running each candidate **individually** against the current base. The
+culprit is named by its own failing run; the innocent branches get a genuine
+solo verdict and still merge in the same invocation.
+
+Cost: a green composite (the overwhelmingly common case) is **one** run total.
+A red composite is 1 + N in the worst case, which is the bound #1715 specifies.
+
+Per-entry narrowing was chosen over a bisect: a bisect is only cheaper when
+there is exactly **one** culprit, degrades as soon as there are two, and its
+bookkeeping is subtle. The per-entry pass is flat O(N), identifies *every*
+culprit rather than the first, and — the part that actually matters — leaves
+each survivor with a verdict earned by a run that validated **that branch
+alone against the current base**, which is a strictly stronger claim than
+"was a member of some green subset". N here is a merge queue's depth (2–5),
+so the constant factor is not worth the ambiguity.
 
 Nothing here dispatches a worker or spends tokens: it is `git` + the repo's own
 ``build_command``/``test_command``, run locally, exactly like ``coord test``
@@ -38,11 +72,20 @@ source).
 
 BOUNDED
 -------
-One composite run per ``coord merge --revalidate`` invocation. There is no
-retry loop: a composite that fails leaves every candidate blocked with the
-failure quoted, and the operator (or the next invocation) decides. That is the
-merge lane's analogue of #1738's ``fix_rounds`` budget — a branch that cannot
-pass terminates with a clear reason rather than spinning.
+One composite run, plus at most one solo run per candidate, per ``coord merge
+--revalidate`` invocation. There is no retry loop and no second composite: a
+branch whose *solo* run fails terminates blocked with the failure quoted, and
+the operator (or the next invocation) decides. That is the merge lane's
+analogue of #1738's ``fix_rounds`` budget — a branch that cannot pass
+terminates with a clear reason rather than spinning.
+
+OPT-IN, ALWAYS
+--------------
+None of this may ever run unattended. ``merge.auto_drain`` is ``false`` by
+design after the 2026-06-07 token-burn incident, and the daemon's
+``_auto_drain_tick`` passes ``revalidate=False`` permanently. Batch
+revalidation inherits that posture wholesale: an operator asks for it, or it
+does not happen.
 """
 
 from __future__ import annotations
@@ -77,6 +120,26 @@ def _tail(text: str, limit: int = _OUTPUT_TAIL_CHARS) -> str:
     return "…(truncated)…\n" + text[-limit:]
 
 
+# Why a composite failed, which decides whether splitting it up can help.
+#
+# SETUP failures are *common-mode*: no test command, no local checkout, a
+# failed fetch, candidates spanning two bases. Every candidate would hit the
+# identical wall, so a per-entry fallback would just reproduce the same error
+# N times for nothing. COMPOSE/BUILD/SUITE/TIMEOUT are per-branch-attributable
+# — that is precisely what the fallback exists to narrow down.
+KIND_OK = "ok"
+KIND_SETUP = "setup"
+KIND_COMPOSE = "compose"
+KIND_BUILD = "build"
+KIND_SUITE = "suite"
+KIND_TIMEOUT = "timeout"
+
+#: Composite failure kinds a per-entry pass can actually narrow (#1715).
+NARROWABLE_KINDS = frozenset({
+    KIND_COMPOSE, KIND_BUILD, KIND_SUITE, KIND_TIMEOUT,
+})
+
+
 @dataclass
 class RevalidationResult:
     """Outcome of one composite revalidation run.
@@ -85,6 +148,9 @@ class RevalidationResult:
     ``passed`` verdicts were recorded for every candidate and ``process()`` may
     now find their smoke gate satisfied; ``False`` means every candidate is
     left exactly as it was — still blocked, never merged.
+
+    ``kind`` classifies a failure (#1715) so :func:`revalidate_group` can tell
+    "this branch broke it" from "nothing here could ever have run".
     """
 
     ok: bool
@@ -93,9 +159,45 @@ class RevalidationResult:
     composed: list[str] = field(default_factory=list)
     recorded: list[str] = field(default_factory=list)
     worktree: Path | None = None
+    kind: str = KIND_OK
 
     def __bool__(self) -> bool:  # pragma: no cover — convenience only
         return self.ok
+
+    @property
+    def narrowable(self) -> bool:
+        """True when re-running the candidates one at a time could help."""
+        return not self.ok and self.kind in NARROWABLE_KINDS
+
+
+@dataclass
+class BatchRevalidationResult:
+    """Outcome of one ``(repo, target_branch)`` group's revalidation (#1715).
+
+    A green composite is the whole story: ``composite.ok`` and ``per_entry``
+    empty, ``suite_runs == 1`` however many candidates there were — that count
+    is the entire point of the feature and the black-box tests assert it
+    directly.
+
+    A red composite fills ``per_entry`` with one solo result per candidate.
+    ``recorded`` then holds only the survivors' assignment ids, and
+    ``culprits`` names the branches whose own run failed.
+    """
+
+    composite: RevalidationResult
+    per_entry: list[tuple[str, RevalidationResult]] = field(default_factory=list)
+    recorded: list[str] = field(default_factory=list)
+    culprits: list[str] = field(default_factory=list)
+    suite_runs: int = 0
+
+    @property
+    def ok(self) -> bool:
+        """True when every candidate came out with a fresh verdict."""
+        return self.composite.ok
+
+    @property
+    def fell_back(self) -> bool:
+        return bool(self.per_entry)
 
 
 class _Echo:
@@ -134,18 +236,27 @@ def local_repo_dir(config, repo_name: str) -> Path | None:
     return Path(repo_path).expanduser() if repo_path else None
 
 
-def revalidation_worktree_path(repo_name: str, target_branch: str) -> Path:
+def revalidation_worktree_path(
+    repo_name: str, target_branch: str, slug: str | None = None,
+) -> Path:
     """Throwaway worktree for a composite revalidation run.
 
     Under ``~/.coord/revalidate-worktrees/`` — OUTSIDE the base checkout, for
     the #561 reason: the base checkout doubles as the live editable coordinator
     source on the daemon host, so moving its branch silently downgrades the
     running ``coord`` until somebody restores it.
+
+    *slug* (#1715) distinguishes the per-entry fallback runs from the composite
+    they follow. Without it every solo run would reuse — and therefore delete —
+    the failed composite's worktree, which :func:`format_failure` has just
+    told the operator was "kept for inspection".
     """
     from coord.state import COORD_DIR
 
-    slug = target_branch.replace("/", "-")
-    return COORD_DIR / "revalidate-worktrees" / f"{repo_name}-{slug}"
+    name = f"{repo_name}-{target_branch.replace('/', '-')}"
+    if slug:
+        name += f"--{slug.replace('/', '-')}"
+    return COORD_DIR / "revalidate-worktrees" / name
 
 
 def _run(
@@ -202,6 +313,69 @@ def describe_candidates(candidates: list[RevalidationCandidate]) -> list[str]:
     return lines
 
 
+def group_candidates(
+    candidates: list[RevalidationCandidate],
+) -> list[tuple[tuple[str, str], list[RevalidationCandidate]]]:
+    """Split *candidates* into the batches that will each cost one suite run.
+
+    Keyed by ``(repo_name, target_branch)`` — one composite can only be built
+    per base, so that pair is exactly the batch boundary. Sorted so the
+    ``--dry-run` preview and the real run enumerate the batches identically.
+    """
+    groups: dict[tuple[str, str], list[RevalidationCandidate]] = {}
+    for c in candidates:
+        groups.setdefault(
+            (c.entry.repo_name, c.entry.target_branch), [],
+        ).append(c)
+    return sorted(groups.items())
+
+
+def describe_batches(
+    candidates: list[RevalidationCandidate],
+) -> list[str]:
+    """``--dry-run`` preview: the batches, their members, and the run count.
+
+    #1715 requires the dry run to "name the batch members and state plainly
+    that one composed run will validate all of them" — an operator has to be
+    able to see, *before* committing 7 minutes, exactly which branches are
+    about to be composed together and that they cost one suite run rather
+    than one each.
+    """
+    lines: list[str] = []
+    batches = group_candidates(candidates)
+    for (repo_name, target_branch), group in batches:
+        n = len(group)
+        if n == 1:
+            lines.append(
+                f"  --revalidate: (dry run) {repo_name} → {target_branch}: "
+                "1 entry, 1 suite run against the current base:"
+            )
+        else:
+            lines.append(
+                f"  --revalidate: (dry run) {repo_name} → {target_branch}: "
+                f"BATCH of {n} — all {n} branches would be composed onto "
+                f"origin/{target_branch} together and validated by ONE "
+                f"composed suite run (not {n}):"
+            )
+        lines.extend(describe_candidates(group))
+    total = len(candidates)
+    lines.append(
+        f"  --revalidate: (dry run) {total} entry(ies) in "
+        f"{len(batches)} batch(es) — {len(batches)} suite run(s), "
+        "then merge. Nothing has been run and no verdict written."
+    )
+    if any(len(g) > 1 for _, g in batches):
+        lines.append(
+            "  --revalidate: (dry run) a composed run validates the "
+            "COMPOSITE, not each branch alone — every member already holds "
+            "its own passed verdict, so this re-confirms they still hold "
+            "together against the current base. If the composite fails, "
+            "nothing merges and each branch is then re-tested alone to find "
+            "the culprit."
+        )
+    return lines
+
+
 def revalidate(
     candidates: list[RevalidationCandidate],
     config,
@@ -209,6 +383,7 @@ def revalidate(
     echo=None,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
     runner=None,
+    worktree_slug: str | None = None,
 ) -> RevalidationResult:
     """Compose every candidate branch onto the current base, run the suite once.
 
@@ -234,6 +409,10 @@ def revalidate(
     ``runner(command: str, cwd: Path) -> subprocess.CompletedProcess``-alike
     with ``returncode`` and ``stdout``/``stderr``. Defaults to a real
     ``subprocess.run(shell=True)``.
+
+    *worktree_slug* (#1715) namespaces the throwaway worktree, so a per-entry
+    fallback run does not delete the failed composite's kept-for-inspection
+    tree.
     """
     echo = echo or _Echo()
     if not candidates:
@@ -244,6 +423,7 @@ def revalidate(
     if len(repos) != 1 or len(targets) != 1:
         return RevalidationResult(
             ok=False,
+            kind=KIND_SETUP,
             reason=(
                 "revalidation candidates span more than one "
                 f"(repo, target_branch): repos={sorted(repos)} "
@@ -251,13 +431,33 @@ def revalidate(
                 "composite that spans bases"
             ),
         )
+
+    # Every candidate must name the row whose verdict we would re-record,
+    # checked BEFORE the suite runs. Discovering this afterwards used to abort
+    # mid-write, having already recorded a fresh verdict for the candidates
+    # ahead of the bad one — a partial write that contradicts the "on any
+    # failure, no verdict is written at all" contract three paragraphs up.
+    # Failing here also saves the operator a ~7-minute suite run that could
+    # never have been banked.
+    for c in candidates:
+        if not c.work_assignment_id:
+            return RevalidationResult(
+                ok=False,
+                kind=KIND_SETUP,
+                reason=(
+                    f"{c.entry.repo_name} #{c.entry.issue_number}: the stale "
+                    "verdict names no work assignment, so no fresh verdict "
+                    "can be recorded — entry stays blocked"
+                ),
+            )
     repo_name = repos.pop()
     target_branch = targets.pop()
 
     repo_cfg = config.repo(repo_name) if config is not None else None
     if repo_cfg is None:
         return RevalidationResult(
-            ok=False, reason=f"no repo config for {repo_name!r}",
+            ok=False, kind=KIND_SETUP,
+            reason=f"no repo config for {repo_name!r}",
         )
     test_command = repo_cfg.test_command
     if not test_command:
@@ -266,6 +466,7 @@ def revalidate(
         # #1738's escalation wording goes out of its way not to invite.
         return RevalidationResult(
             ok=False,
+            kind=KIND_SETUP,
             reason=(
                 f"no test_command configured for {repo_name!r} — cannot "
                 "revalidate (recording a verdict for a suite that never ran "
@@ -277,6 +478,7 @@ def revalidate(
     if repo_dir is None or not repo_dir.exists():
         return RevalidationResult(
             ok=False,
+            kind=KIND_SETUP,
             reason=(
                 f"no local checkout for {repo_name!r} on this machine "
                 f"({repo_dir or 'no repo_path configured'}) — revalidation "
@@ -291,17 +493,20 @@ def revalidate(
         f"origin/{target_branch} and running the suite once (#1715 option 3)"
     )
 
-    wt_path = revalidation_worktree_path(repo_name, target_branch)
+    wt_path = revalidation_worktree_path(repo_name, target_branch, worktree_slug)
     _remove_worktree(repo_dir, wt_path)
     wt_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
         fetched = _run(["git", "fetch", "origin", "--prune"], cwd=repo_dir)
     except (subprocess.SubprocessError, OSError) as e:
-        return RevalidationResult(ok=False, reason=f"git fetch failed: {e}")
+        return RevalidationResult(
+            ok=False, kind=KIND_SETUP, reason=f"git fetch failed: {e}",
+        )
     if fetched.returncode != 0:
         return RevalidationResult(
-            ok=False, reason=f"git fetch failed: {fetched.stderr.strip()}",
+            ok=False, kind=KIND_SETUP,
+            reason=f"git fetch failed: {fetched.stderr.strip()}",
         )
 
     added = _run(
@@ -312,6 +517,7 @@ def revalidate(
     if added.returncode != 0:
         return RevalidationResult(
             ok=False,
+            kind=KIND_SETUP,
             reason=(
                 f"could not create the revalidation worktree at "
                 f"origin/{target_branch}: {added.stderr.strip()}"
@@ -332,6 +538,7 @@ def revalidate(
             _run(["git", "merge", "--abort"], cwd=wt_path)
             return RevalidationResult(
                 ok=False,
+                kind=KIND_COMPOSE,
                 reason=(
                     f"branch {branch!r} does not compose onto "
                     f"origin/{target_branch} (conflict) — resolve the "
@@ -353,6 +560,7 @@ def revalidate(
         except subprocess.TimeoutExpired:
             return RevalidationResult(
                 ok=False,
+                kind=KIND_TIMEOUT,
                 reason=f"revalidation build timed out after {timeout}s",
                 composed=list(composed),
                 worktree=wt_path,
@@ -360,6 +568,7 @@ def revalidate(
         if built.returncode != 0:
             return RevalidationResult(
                 ok=False,
+                kind=KIND_BUILD,
                 reason=(
                     "revalidation BUILD FAILED against the current base "
                     f"(exit {built.returncode}) — every candidate stays "
@@ -376,6 +585,7 @@ def revalidate(
     except subprocess.TimeoutExpired:
         return RevalidationResult(
             ok=False,
+            kind=KIND_TIMEOUT,
             reason=f"revalidation suite timed out after {timeout}s",
             composed=list(composed),
             worktree=wt_path,
@@ -383,6 +593,7 @@ def revalidate(
     if tested.returncode != 0:
         return RevalidationResult(
             ok=False,
+            kind=KIND_SUITE,
             reason=(
                 "revalidation SUITE FAILED against the current base "
                 f"(exit {tested.returncode}) — every candidate stays "
@@ -409,22 +620,10 @@ def revalidate(
         + f" onto origin/{target_branch}"
     )
     for c in candidates:
+        # Non-empty for every candidate: checked up front, before the suite
+        # ran, precisely so this loop cannot abort part-way through having
+        # already written some of the verdicts.
         aid = c.work_assignment_id
-        if not aid:
-            # Should not happen: SMOKE_STALE always names the row that carries
-            # the stale verdict. Fail loudly rather than merging an entry whose
-            # verdict we could not actually refresh.
-            return RevalidationResult(
-                ok=False,
-                reason=(
-                    f"{c.entry.repo_name} #{c.entry.issue_number}: the stale "
-                    "verdict names no work assignment, so no fresh verdict "
-                    "can be recorded — entry stays blocked"
-                ),
-                composed=list(composed),
-                recorded=recorded,
-                worktree=wt_path,
-            )
         record_test_verdict(assignment_id=aid, test_state="passed")
         record_test_staleness_anchor(
             assignment_id=aid,
@@ -453,6 +652,144 @@ def revalidate(
         recorded=recorded,
         worktree=None,
     )
+
+
+def _label(candidate: RevalidationCandidate) -> str:
+    e = candidate.entry
+    return f"{e.repo_name} #{e.issue_number} ({e.branch})"
+
+
+def revalidate_group(
+    candidates: list[RevalidationCandidate],
+    config,
+    *,
+    echo=None,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    runner=None,
+) -> BatchRevalidationResult:
+    """Revalidate one ``(repo, target_branch)`` group: composite, then narrow.
+
+    This is the #1715 entry point and the one ``coord merge --revalidate``
+    calls. It is a thin policy layer over :func:`revalidate`:
+
+    1. **Compose all N and run the suite once.** Green — which is the
+       overwhelmingly common case, since every candidate already holds a
+       ``passed`` verdict from an earlier base — and the group is done at a
+       cost of exactly **one** suite run, however large N was. That single
+       number is the whole feature.
+
+    2. **Red composite: merge nothing, fail nothing, narrow.** No verdict was
+       written (:func:`revalidate` is all-or-nothing), so no entry can merge
+       off the back of it, and no entry is marked failed either — a composite
+       failure is evidence about the *set*, not a verdict on any member. Each
+       candidate is then re-run **alone** against the current base. A branch
+       that passes solo earns a real verdict and merges; a branch that fails
+       solo is the culprit and stays blocked with its own failure quoted.
+
+    N = 1 never falls back: the "composite" already *was* that single branch,
+    so a second run would be the identical run twice. That keeps this path
+    byte-identical to #1769's shipped single-entry behaviour.
+
+    A composite that failed for a **common-mode** reason (no ``test_command``,
+    no local checkout, a dead ``git fetch``, candidates spanning two bases)
+    never falls back either — see :data:`NARROWABLE_KINDS`. Every solo run
+    would hit the same wall, so narrowing would turn one clear error into N
+    identical ones.
+
+    Worst case is therefore 1 + N runs, the bound #1715 specifies, and it is
+    reached only when a composite genuinely fails on a real build/test/merge
+    problem.
+    """
+    echo = echo or _Echo()
+    if not candidates:
+        return BatchRevalidationResult(
+            composite=RevalidationResult(
+                ok=True, reason="no revalidation candidates",
+            ),
+        )
+
+    composite = revalidate(
+        candidates, config, echo=echo, timeout=timeout, runner=runner,
+    )
+    # A setup refusal never reached a build/test command, so it did not cost a
+    # suite run. Everything else did (or died trying), and the operator's
+    # mental model of "how many suites did that just run" should match.
+    ran = 0 if composite.kind == KIND_SETUP else 1
+    batch = BatchRevalidationResult(
+        composite=composite,
+        recorded=list(composite.recorded),
+        suite_runs=ran,
+    )
+
+    if composite.ok or len(candidates) == 1 or not composite.narrowable:
+        return batch
+
+    echo(
+        f"  --revalidate: the composite of {len(candidates)} branches FAILED — "
+        "nothing merges on that result. Re-running each branch on its own "
+        "against the current base to find the culprit (#1715); branches that "
+        "pass alone still merge."
+    )
+
+    for c in candidates:
+        label = _label(c)
+        echo(f"  --revalidate: re-testing {label} alone")
+        solo = revalidate(
+            [c], config, echo=echo, timeout=timeout, runner=runner,
+            # Its own worktree: the failed composite's tree was just advertised
+            # as "kept for inspection", and reusing the path would delete it.
+            worktree_slug=c.work_assignment_id or c.entry.branch,
+        )
+        if solo.kind != KIND_SETUP:
+            batch.suite_runs += 1
+        batch.per_entry.append((label, solo))
+        if solo.ok:
+            batch.recorded.extend(solo.recorded)
+            echo(f"  --revalidate: {label} PASSES alone — cleared to merge")
+        else:
+            batch.culprits.append(label)
+            echo(f"  --revalidate: {label} FAILS alone — {solo.reason}")
+
+    if not batch.culprits:
+        # Every branch is green by itself, yet together they are not. That is a
+        # genuine cross-branch interaction (two branches that each compile
+        # against the old base but not against each other), and it is the one
+        # case where the per-entry pass is *less* conservative than the
+        # composite it replaced. Say so out loud rather than letting a clean
+        # per-entry sweep quietly imply the composite was a fluke.
+        echo(
+            "  --revalidate: WARNING — every branch passes alone but the "
+            "composite of all of them failed. That points at an interaction "
+            "between these branches rather than at any one of them; they are "
+            "merging on their solo verdicts. Re-run the suite on the base "
+            "afterwards."
+        )
+
+    return batch
+
+
+def format_batch(batch: BatchRevalidationResult) -> list[str]:
+    """Operator-facing summary lines for one group's revalidation (#1715)."""
+    lines: list[str] = []
+    if batch.composite.ok:
+        lines.append(f"  --revalidate: PASSED — {batch.composite.reason}")
+        return lines
+
+    lines.extend(format_failure(batch.composite))
+    if not batch.fell_back:
+        return lines
+
+    for label, solo in batch.per_entry:
+        if solo.ok:
+            lines.append(f"  --revalidate: {label}: PASSED alone — merging")
+        else:
+            lines.append(f"  --revalidate: {label}: BLOCKED — {solo.reason}")
+    if batch.culprits:
+        lines.append(
+            "  --revalidate: culprit(s): " + ", ".join(batch.culprits)
+        )
+    lines.append(f"  --revalidate: {batch.suite_runs} suite run(s) total")
+    return lines
 
 
 def _shell_runner(command: str, cwd: Path, timeout: int):
@@ -485,10 +822,22 @@ def format_failure(result: RevalidationResult) -> list[str]:
 
 __all__ = [
     "DEFAULT_TIMEOUT_SECONDS",
+    "KIND_BUILD",
+    "KIND_COMPOSE",
+    "KIND_OK",
+    "KIND_SETUP",
+    "KIND_SUITE",
+    "KIND_TIMEOUT",
+    "NARROWABLE_KINDS",
+    "BatchRevalidationResult",
     "RevalidationResult",
+    "describe_batches",
     "describe_candidates",
+    "format_batch",
     "format_failure",
+    "group_candidates",
     "local_repo_dir",
     "revalidate",
+    "revalidate_group",
     "revalidation_worktree_path",
 ]
