@@ -19,7 +19,10 @@ Three layers, deliberately separated so the interesting one is testable:
    window is covered and reports ``truncated=True`` if it genuinely could
    not finish.  Never silently drops the tail (#1742: "no silent caps").
 3. :data:`REPORTS` + :func:`run_report` — the registry and its parameter
-   validation.  One entry: ``issue-activity``.
+   validation.  Two entries: ``issue-activity`` and ``drive-queue-status``
+   (#1805) — the latter a **live snapshot** of ``drive_queue`` (no window,
+   no audit trail, no clock beyond ``generated_at``) rather than a fold over
+   history.
 
 The :class:`ReportResult` field names are the **wire contract** the coord-tui
 Reports panel (#1741) renders against, and the CLI's ``--json`` and the
@@ -55,6 +58,8 @@ __all__ = [
     "detect_prior_activity",
     "fold_issue_activity",
     "run_issue_activity",
+    "fold_drive_queue_status",
+    "run_drive_queue_status",
     "parse_duration",
 ]
 
@@ -765,6 +770,194 @@ def run_issue_activity(
     )
 
 
+# ── drive-queue-status: a live snapshot, not a fold ────────────────────────
+#
+# #1805: "what is queued, and is it moving?" without a CLI round-trip.  Unlike
+# issue-activity this is not a fold over an audit-trail window — it is a
+# point-in-time read of `drive_queue` via `coord.state.list_drive_queue`
+# (daemon-or-local already handled there), so `window` is degenerate:
+# `(generated_at, generated_at)`.  `drive_queue` has no `completed_at` and
+# `coord/drive_queue.py` emits no audit events, so there is no data source
+# for a queue *history* report — see this issue's "Out of scope".
+
+DRIVE_QUEUE_STATUS_COLUMNS = [
+    "position",
+    "repo",
+    "issue",
+    "title",
+    "state",
+    "machine",
+    "attempts",
+    "deferrals",
+    "last_reason",
+    "enqueued_at",
+    "launched_at",
+    "hold_state",
+    "after",
+]
+
+# One entry per DRIVE_QUEUE_STATUS_COLUMNS entry, same order (#1760).
+DRIVE_QUEUE_STATUS_COLUMN_META = [
+    ColumnMeta(id="position", label="Pos", kind="int", align="right"),
+    ColumnMeta(id="repo", label="Repo", kind="text"),
+    ColumnMeta(id="issue", label="Issue", kind="int", align="right"),
+    ColumnMeta(id="title", label="Title", kind="text", weight=2.0),
+    ColumnMeta(id="state", label="State", kind="enum"),
+    ColumnMeta(id="machine", label="Machine", kind="text"),
+    ColumnMeta(id="attempts", label="Attempts", kind="int", align="right"),
+    ColumnMeta(id="deferrals", label="Deferrals", kind="int", align="right"),
+    ColumnMeta(id="last_reason", label="Last Reason", kind="text", weight=3.0),
+    ColumnMeta(id="enqueued_at", label="Enqueued", kind="timestamp"),
+    ColumnMeta(id="launched_at", label="Launched", kind="timestamp"),
+    ColumnMeta(id="hold_state", label="Hold", kind="enum"),
+    ColumnMeta(id="after", label="After", kind="list"),
+]
+
+# The #1794 tell: an entry that has already burned at least one launch
+# attempt is the thing an operator most wants shouted at them.
+_RETRIED_ATTEMPTS_THRESHOLD = 1
+
+
+def fold_drive_queue_status(
+    entries: Iterable[Mapping[str, Any]],
+    generated_at: float,
+    *,
+    titles: Mapping[tuple[str, int], str] | None = None,
+    queue_escalation: Mapping[str, Any] | None = None,
+) -> ReportResult:
+    """Fold already-fetched ``drive_queue`` rows into a snapshot ``ReportResult``.
+
+    **Pure** — no DB, no daemon, no clock: ``entries`` is whatever
+    :func:`coord.state.list_drive_queue` returned (raw column names,
+    ``after_json`` already decoded to a list) and ``generated_at`` is the
+    caller's clock reading, reused verbatim for both ends of ``window`` since
+    a live snapshot has no meaningful range.
+
+    ``entries`` arrives pre-ordered (``list_drive_queue`` is
+    ``ORDER BY position, id``) — this fold does not re-sort.
+    """
+    title_map = dict(titles or {})
+    rows: list[dict[str, Any]] = []
+    for entry in entries:
+        repo = str(entry.get("repo_name") or "")
+        issue = int(entry.get("issue_number") or 0)
+        rows.append(
+            {
+                "position": int(entry.get("position") or 0),
+                "repo": repo,
+                "issue": issue,
+                "title": title_map.get((repo, issue)),
+                "state": entry.get("state") or "",
+                "machine": entry.get("machine") or "",
+                "attempts": int(entry.get("attempts") or 0),
+                "deferrals": int(entry.get("deferrals") or 0),
+                "last_reason": entry.get("last_reason") or "",
+                "enqueued_at": entry.get("enqueued_at"),
+                "launched_at": entry.get("launched_at"),
+                "hold_state": entry.get("hold_state") or "",
+                "after": list(entry.get("after_json") or []),
+                # Extra keys beyond `columns` — ReportResult's contract
+                # explicitly allows this for clients that want the detail.
+                "session_name": entry.get("session_name") or "",
+                "hold_reason": entry.get("hold_reason") or "",
+                "resume_when": entry.get("resume_when") or "",
+            }
+        )
+
+    notes: list[str] = []
+    if not rows:
+        notes.append("The drive queue is empty.")
+    else:
+        running = sum(1 for r in rows if r["state"] == "running")
+        waiting = sum(1 for r in rows if r["state"] == "waiting")
+        notes.append(
+            f"{len(rows)} entr{'y' if len(rows) == 1 else 'ies'} queued "
+            f"({running} running, {waiting} waiting)."
+        )
+        retried = [r for r in rows if r["attempts"] >= _RETRIED_ATTEMPTS_THRESHOLD]
+        if retried:
+            named = ", ".join(
+                f"{r['repo']}#{r['issue']} (attempts={r['attempts']})" for r in retried
+            )
+            notes.append(f"attempts>=1: {named}.")
+    if queue_escalation:
+        reason = queue_escalation.get("reason") or "(no reason recorded)"
+        stage = queue_escalation.get("stage") or "?"
+        notes.append(
+            f"standing queue-level escalation: stage={stage!r} — {reason}"
+        )
+
+    return ReportResult(
+        report_id="drive-queue-status",
+        generated_at=generated_at,
+        window=(generated_at, generated_at),
+        columns=list(DRIVE_QUEUE_STATUS_COLUMNS),
+        column_meta=list(DRIVE_QUEUE_STATUS_COLUMN_META),
+        rows=rows,
+        notes=notes,
+    )
+
+
+def _default_list_drive_queue(repo: str | None) -> list[dict]:
+    from coord.state import list_drive_queue  # noqa: PLC0415
+
+    return list_drive_queue(repo)
+
+
+def _default_queue_escalation() -> Mapping[str, Any] | None:
+    """The standing queue-level escalation record (#1754's synthetic key),
+    if one exists.  A plain read — never runs a tick — so it is safe to
+    surface here; best-effort, mirroring :func:`_lookup_titles`."""
+    try:
+        from coord.drive_queue import (  # noqa: PLC0415
+            QUEUE_ALERT_ISSUE,
+            QUEUE_ALERT_REPO,
+        )
+        from coord.state import get_drive_escalation  # noqa: PLC0415
+
+        return get_drive_escalation(QUEUE_ALERT_REPO, QUEUE_ALERT_ISSUE)
+    except Exception:  # noqa: BLE001 — cosmetic; never fail the report over it
+        return None
+
+
+def run_drive_queue_status(
+    *,
+    repo: str = "",
+    now: float | None = None,
+    fetch: Callable[[str | None], Sequence[Mapping[str, Any]]] | None = None,
+    title_lookup: Callable[..., Mapping[tuple[str, int], str]] | None = None,
+    escalation_lookup: Callable[[], Mapping[str, Any] | None] | None = None,
+) -> ReportResult:
+    """Fetch the live queue and fold it.  ``now``/``fetch``/``title_lookup``/
+    ``escalation_lookup`` are test seams (mirrors :func:`run_issue_activity`);
+    the report's own parameter is ``repo``.
+
+    Read-only and tick-free by construction: the only call here is
+    ``list_drive_queue`` (or the injected ``fetch``) — never ``plan_tick``.
+    """
+    generated_at = time.time() if now is None else float(now)
+    fetch_fn = _default_list_drive_queue if fetch is None else fetch
+    entries = list(fetch_fn(repo or None) or [])
+
+    keys = {
+        (str(e["repo_name"]), int(e["issue_number"]))
+        for e in entries
+        if e.get("repo_name") and e.get("issue_number") is not None
+    }
+    lookup = _lookup_titles if title_lookup is None else title_lookup
+    titles = lookup(keys)
+
+    esc_lookup = _default_queue_escalation if escalation_lookup is None else escalation_lookup
+    queue_escalation = esc_lookup()
+
+    return fold_drive_queue_status(
+        entries,
+        generated_at,
+        titles=titles,
+        queue_escalation=queue_escalation,
+    )
+
+
 # ── the catalogue ──────────────────────────────────────────────────────────
 
 SINCE_PRESETS = ("1h", "6h", "24h", "3d", "7d")
@@ -836,7 +1029,33 @@ ISSUE_ACTIVITY = ReportDef(
 )
 
 
-REPORTS: dict[str, ReportDef] = {ISSUE_ACTIVITY.id: ISSUE_ACTIVITY}
+DRIVE_QUEUE_STATUS = ReportDef(
+    id="drive-queue-status",
+    title="Drive Queue Status",
+    description=(
+        "A live snapshot of the drive queue — one row per queued entry in "
+        "run order, with its state, machine pin, attempts/deferrals and the "
+        "tick's own last_reason. A snapshot, not a history: `drive_queue` "
+        "has no `completed_at`, so this shows what is queued now, not what "
+        "the queue has processed."
+    ),
+    params=(
+        ReportParam(
+            id="repo",
+            label="Repo",
+            kind="text",
+            default="",
+            help="Restrict to one repo by name. Empty means all repos.",
+        ),
+    ),
+    run=run_drive_queue_status,
+)
+
+
+REPORTS: dict[str, ReportDef] = {
+    ISSUE_ACTIVITY.id: ISSUE_ACTIVITY,
+    DRIVE_QUEUE_STATUS.id: DRIVE_QUEUE_STATUS,
+}
 
 
 def catalogue() -> dict[str, Any]:

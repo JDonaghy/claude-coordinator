@@ -24,11 +24,13 @@ import pytest
 from click.testing import CliRunner
 from starlette.testclient import TestClient
 
+from coord import state
 from coord.audit import record_audit
 from coord.cli import main
 from coord.config import load as load_config
 from coord.dao import SqliteStore
 from coord.db import _ensure_schema
+from coord.drive_queue import QUEUE_ALERT_ISSUE, QUEUE_ALERT_REPO
 from coord.reports import (
     REPORTS,
     ReportError,
@@ -36,9 +38,11 @@ from coord.reports import (
     catalogue,
     detect_prior_activity,
     fetch_audit_window,
+    fold_drive_queue_status,
     fold_issue_activity,
     parse_duration,
     resolve_params,
+    run_drive_queue_status,
     run_report,
 )
 from coord.serve_app import build_app
@@ -619,17 +623,229 @@ class TestDetectPriorActivity:
         assert detect_prior_activity([("api", 1)], until=T0, fetch=source) == frozenset()
 
 
+# ── drive-queue-status (#1805) ──────────────────────────────────────────────
+
+
+def _dq_row(
+    issue: int,
+    *,
+    repo: str = "api",
+    position: int = 0,
+    machine: str | None = None,
+    after_json: list | None = None,
+    state_: str = "waiting",
+    attempts: int = 0,
+    deferrals: int = 0,
+    last_reason: str = "",
+    session_name: str = "",
+    launched_at: float | None = None,
+    enqueued_at: float = 100.0,
+    hold_state: str = "",
+    hold_reason: str = "",
+    resume_when: str = "",
+) -> dict:
+    """One row in the exact shape ``coord.state.list_drive_queue`` returns —
+    raw column names (``repo_name``/``issue_number``/``state``), ``after_json``
+    already decoded to a list."""
+    return {
+        "id": issue,
+        "repo_name": repo,
+        "issue_number": issue,
+        "position": position,
+        "machine": machine,
+        "after_json": list(after_json or []),
+        "state": state_,
+        "attempts": attempts,
+        "deferrals": deferrals,
+        "last_reason": last_reason,
+        "session_name": session_name,
+        "launched_at": launched_at,
+        "enqueued_at": enqueued_at,
+        "hold_after": 0,
+        "hold_reason": hold_reason,
+        "resume_when": resume_when,
+        "hold_state": hold_state,
+        "hold_probes": 0,
+    }
+
+
+class TestFoldDriveQueueStatus:
+    """Pure fold — fixture rows in, ``ReportResult`` out.  No DB, no daemon."""
+
+    def test_empty_queue_is_not_an_error(self) -> None:
+        result = fold_drive_queue_status([], 1000.0)
+        assert result.rows == []
+        assert result.notes == ["The drive queue is empty."]
+        assert result.report_id == "drive-queue-status"
+        assert result.window == (1000.0, 1000.0)
+
+    def test_window_is_degenerate_generated_at_generated_at(self) -> None:
+        result = fold_drive_queue_status([_dq_row(1)], 4242.0)
+        assert result.generated_at == 4242.0
+        assert result.window == (4242.0, 4242.0)
+
+    def test_column_meta_matches_columns_one_to_one_same_order(self) -> None:
+        result = fold_drive_queue_status([_dq_row(1)], 1000.0)
+        assert [m.id for m in result.column_meta] == result.columns
+        assert result.columns == [
+            "position", "repo", "issue", "title", "state", "machine",
+            "attempts", "deferrals", "last_reason", "enqueued_at",
+            "launched_at", "hold_state", "after",
+        ]
+
+    def test_mixed_states_counted_in_notes(self) -> None:
+        rows = [
+            _dq_row(1, position=0, state_="running"),
+            _dq_row(2, position=1, state_="waiting"),
+            _dq_row(3, position=2, state_="waiting"),
+            _dq_row(4, position=3, state_="blocked"),
+        ]
+        result = fold_drive_queue_status(rows, 1000.0)
+        assert len(result.rows) == 4
+        assert any("4 entries queued" in n and "1 running" in n and "2 waiting" in n
+                    for n in result.notes)
+
+    def test_run_order_preserved_from_input_not_resorted(self) -> None:
+        # list_drive_queue already returns ORDER BY position, id — the fold
+        # must not reorder it.
+        rows = [_dq_row(3, position=2), _dq_row(1, position=0), _dq_row(2, position=1)]
+        result = fold_drive_queue_status(rows, 1000.0)
+        assert [r["issue"] for r in result.rows] == [3, 1, 2]
+
+    def test_attempts_ge_1_named_in_notes(self) -> None:
+        rows = [
+            _dq_row(1, attempts=0),
+            _dq_row(2, attempts=1, last_reason="launch failed, retrying"),
+            _dq_row(3, attempts=3),
+        ]
+        result = fold_drive_queue_status(rows, 1000.0)
+        tell = next(n for n in result.notes if n.startswith("attempts>=1"))
+        assert "api#2 (attempts=1)" in tell
+        assert "api#3 (attempts=3)" in tell
+        assert "api#1" not in tell
+
+    def test_no_attempts_note_when_all_zero(self) -> None:
+        result = fold_drive_queue_status([_dq_row(1, attempts=0)], 1000.0)
+        assert not any(n.startswith("attempts>=1") for n in result.notes)
+
+    def test_unpinned_machine_is_empty_string_not_none(self) -> None:
+        result = fold_drive_queue_status([_dq_row(1, machine=None)], 1000.0)
+        assert result.rows[0]["machine"] == ""
+
+    def test_title_lookup_applied_missing_title_is_none(self) -> None:
+        rows = [_dq_row(1), _dq_row(2)]
+        result = fold_drive_queue_status(rows, 1000.0, titles={("api", 1): "Fix the thing"})
+        by_issue = {r["issue"]: r for r in result.rows}
+        assert by_issue[1]["title"] == "Fix the thing"
+        assert by_issue[2]["title"] is None
+
+    def test_after_is_a_list_column(self) -> None:
+        result = fold_drive_queue_status(
+            [_dq_row(2, after_json=["api#1"])], 1000.0
+        )
+        assert result.rows[0]["after"] == ["api#1"]
+
+    def test_extra_keys_beyond_columns_are_present(self) -> None:
+        result = fold_drive_queue_status(
+            [_dq_row(1, session_name="s1", hold_reason="deploy gate", resume_when="ready")],
+            1000.0,
+        )
+        row = result.rows[0]
+        assert row["session_name"] == "s1"
+        assert row["hold_reason"] == "deploy gate"
+        assert row["resume_when"] == "ready"
+
+    def test_standing_queue_escalation_surfaced_in_notes_when_present(self) -> None:
+        result = fold_drive_queue_status(
+            [_dq_row(1)],
+            1000.0,
+            queue_escalation={"stage": "blocked", "reason": "3 entries stuck"},
+        )
+        assert any("3 entries stuck" in n for n in result.notes)
+
+    def test_no_escalation_note_when_none(self) -> None:
+        result = fold_drive_queue_status([_dq_row(1)], 1000.0, queue_escalation=None)
+        assert not any("escalation" in n for n in result.notes)
+
+
+class TestRunDriveQueueStatus:
+    """The runner — fetch=/now=/title_lookup=/escalation_lookup= seams, the
+    same test-seam shape as ``run_issue_activity``'s ``fetch=``."""
+
+    def test_repo_param_forwarded_to_fetch(self) -> None:
+        calls: list[str | None] = []
+
+        def fetch(repo):
+            calls.append(repo)
+            return []
+
+        run_drive_queue_status(
+            repo="api", now=1000.0, fetch=fetch,
+            title_lookup=lambda keys: {}, escalation_lookup=lambda: None,
+        )
+        assert calls == ["api"]
+
+    def test_empty_repo_param_means_no_filter(self) -> None:
+        calls: list[str | None] = []
+
+        def fetch(repo):
+            calls.append(repo)
+            return []
+
+        run_drive_queue_status(
+            repo="", now=1000.0, fetch=fetch,
+            title_lookup=lambda keys: {}, escalation_lookup=lambda: None,
+        )
+        assert calls == [None]
+
+    def test_now_seam_sets_generated_at_and_window(self) -> None:
+        result = run_drive_queue_status(
+            now=555.0, fetch=lambda repo: [],
+            title_lookup=lambda keys: {}, escalation_lookup=lambda: None,
+        )
+        assert result.generated_at == 555.0
+        assert result.window == (555.0, 555.0)
+
+    def test_title_lookup_receives_keys_from_fetched_rows(self) -> None:
+        seen_keys: set = set()
+
+        def title_lookup(keys):
+            seen_keys.update(keys)
+            return {}
+
+        run_drive_queue_status(
+            now=1000.0,
+            fetch=lambda repo: [_dq_row(7, repo="web"), _dq_row(9, repo="web")],
+            title_lookup=title_lookup,
+            escalation_lookup=lambda: None,
+        )
+        assert seen_keys == {("web", 7), ("web", 9)}
+
+    def test_rows_fold_through_from_injected_fetch(self) -> None:
+        result = run_drive_queue_status(
+            now=1000.0,
+            fetch=lambda repo: [_dq_row(1, state_="running", attempts=2)],
+            title_lookup=lambda keys: {},
+            escalation_lookup=lambda: None,
+        )
+        assert len(result.rows) == 1
+        assert result.rows[0]["state"] == "running"
+        assert result.rows[0]["attempts"] == 2
+
+
 # ── registry + parameter validation ────────────────────────────────────────
 
 
 class TestCatalogue:
-    def test_exactly_one_report(self) -> None:
-        assert list(REPORTS) == ["issue-activity"]
+    def test_two_reports(self) -> None:
+        assert set(REPORTS) == {"issue-activity", "drive-queue-status"}
 
     def test_catalogue_carries_full_param_metadata(self) -> None:
         cat = catalogue()
-        assert [r["id"] for r in cat["reports"]] == ["issue-activity"]
-        rep = cat["reports"][0]
+        assert [r["id"] for r in cat["reports"]] == [
+            "drive-queue-status", "issue-activity",
+        ]
+        rep = next(r for r in cat["reports"] if r["id"] == "issue-activity")
         assert rep["title"] == "Issue Activity"
         assert rep["description"]
         params = {p["id"]: p for p in rep["params"]}
@@ -639,6 +855,16 @@ class TestCatalogue:
         assert params["since"]["default"] == "24h"
         assert params["since"]["free_form"] is True
         assert params["repo"]["kind"] == "text"
+
+    def test_drive_queue_status_catalogue_entry(self) -> None:
+        cat = catalogue()
+        rep = next(r for r in cat["reports"] if r["id"] == "drive-queue-status")
+        assert rep["title"] == "Drive Queue Status"
+        assert rep["description"]
+        params = {p["id"]: p for p in rep["params"]}
+        assert set(params) == {"repo"}
+        assert params["repo"]["kind"] == "text"
+        assert params["repo"]["default"] == ""
 
     def test_catalogue_is_json_serialisable(self) -> None:
         json.dumps(catalogue())
@@ -762,14 +988,16 @@ class TestCli:
         assert "24h" in result.output  # the default
         for preset in ("1h", "6h", "3d", "7d"):
             assert preset in result.output
-        # Exactly one report in the catalogue.
-        assert result.output.count("—  ") == 1
+        # Exactly two reports in the catalogue.
+        assert result.output.count("—  ") == 2
 
     def test_report_list_json(self, coord_db) -> None:
         result = CliRunner().invoke(main, ["report", "list", "--json"])
         assert result.exit_code == 0, result.output
         body = json.loads(result.output)
-        assert [r["id"] for r in body["reports"]] == ["issue-activity"]
+        assert [r["id"] for r in body["reports"]] == [
+            "drive-queue-status", "issue-activity",
+        ]
 
     def test_report_run_json_shape(self, coord_db) -> None:
         _seed_known_good_window(coord_db)
@@ -968,6 +1196,133 @@ class TestCli:
         assert rows[1728]["title"] is None
 
 
+class TestCliDriveQueueStatus:
+    """``coord report run drive-queue-status`` against a real ``drive_queue``
+    table, seeded through the routed ``coord.state`` writers (#1805)."""
+
+    def _seed(self, coord_db) -> None:
+        state.enqueue_drive_queue("api", 10, machine="dellserver")
+        state.enqueue_drive_queue("api", 11, after=["api#10"])
+        state.enqueue_drive_queue("web", 20)
+        state._update_drive_queue_entry_local(
+            "api", 10, state="running", session_name="s1"
+        )
+        state._update_drive_queue_entry_local(
+            "api", 11, state="waiting", attempts=2, last_reason="deferred: api#10 not done"
+        )
+
+    def test_prints_a_table_of_the_live_queue(self, coord_db) -> None:
+        self._seed(coord_db)
+        result = CliRunner().invoke(main, ["report", "run", "drive-queue-status"])
+        assert result.exit_code == 0, result.output
+        assert "STATE" in result.output
+        assert "10" in result.output and "11" in result.output and "20" in result.output
+        assert "running" in result.output
+
+    def test_json_emits_documented_shape_including_column_meta(self, coord_db) -> None:
+        self._seed(coord_db)
+        result = CliRunner().invoke(
+            main, ["report", "run", "drive-queue-status", "--json"]
+        )
+        assert result.exit_code == 0, result.output
+        body = json.loads(result.output)
+        assert set(body) == {
+            "report_id", "generated_at", "window", "columns", "column_meta",
+            "rows", "notes",
+        }
+        assert body["report_id"] == "drive-queue-status"
+        assert body["window"][0] == body["window"][1]
+        assert [m["id"] for m in body["column_meta"]] == body["columns"]
+        assert {r["issue"] for r in body["rows"]} == {10, 11, 20}
+
+    def test_repo_param_restricts_to_one_repo(self, coord_db) -> None:
+        self._seed(coord_db)
+        result = CliRunner().invoke(
+            main, ["report", "run", "drive-queue-status", "--param", "repo=web", "--json"]
+        )
+        assert result.exit_code == 0, result.output
+        rows = json.loads(result.output)["rows"]
+        assert [r["issue"] for r in rows] == [20]
+
+    def test_omitting_repo_returns_all_repos(self, coord_db) -> None:
+        self._seed(coord_db)
+        result = CliRunner().invoke(
+            main, ["report", "run", "drive-queue-status", "--json"]
+        )
+        rows = json.loads(result.output)["rows"]
+        assert {r["repo"] for r in rows} == {"api", "web"}
+
+    def test_unknown_param_rejected_naming_allowed(self, coord_db) -> None:
+        from tests.conftest import output_and_stderr
+
+        result = CliRunner().invoke(
+            main, ["report", "run", "drive-queue-status", "--param", "since=13h"]
+        )
+        assert result.exit_code != 0
+        text = output_and_stderr(result)
+        assert "since" in text
+        assert "repo" in text
+
+    def test_empty_queue_returns_rows_empty_with_a_note(self, coord_db) -> None:
+        result = CliRunner().invoke(
+            main, ["report", "run", "drive-queue-status", "--json"]
+        )
+        assert result.exit_code == 0, result.output
+        body = json.loads(result.output)
+        assert body["rows"] == []
+        assert any("empty" in n.lower() for n in body["notes"])
+
+    def test_attempts_ge_1_tell_appears_in_notes(self, coord_db) -> None:
+        self._seed(coord_db)
+        result = CliRunner().invoke(
+            main, ["report", "run", "drive-queue-status", "--json"]
+        )
+        body = json.loads(result.output)
+        assert any("api#11" in n and "attempts=2" in n for n in body["notes"])
+
+    def test_timestamps_render_as_dates_not_epochs_in_the_human_table(
+        self, coord_db
+    ) -> None:
+        self._seed(coord_db)
+        result = CliRunner().invoke(main, ["report", "run", "drive-queue-status"])
+        assert result.exit_code == 0, result.output
+        # enqueued_at is a timestamp column (column_meta kind="timestamp") —
+        # the human table renders it relative/aliased, never a bare epoch
+        # float with a decimal point.
+        import re
+
+        assert not re.search(r"\b\d{9,}\.\d+\b", result.output)
+
+    def test_title_from_local_board(self, coord_db) -> None:
+        coord_db.execute(
+            "INSERT INTO issues (repo_name, number, title, body, state, labels, "
+            "synced_at) VALUES (?,?,?,?,?,?,?)",
+            ("api", 10, "Tighten the startup window", "", "open", "[]", 0.0),
+        )
+        coord_db.commit()
+        self._seed(coord_db)
+        result = CliRunner().invoke(
+            main, ["report", "run", "drive-queue-status", "--json"]
+        )
+        rows = {r["issue"]: r for r in json.loads(result.output)["rows"]}
+        assert rows[10]["title"] == "Tighten the startup window"
+        assert rows[11]["title"] is None
+
+    def test_does_not_run_a_tick(self, coord_db, monkeypatch) -> None:
+        """Acceptance: a report must never call plan_tick."""
+        import coord.drive_queue as dq
+
+        def _boom(*a, **k):  # noqa: ANN002, ANN003
+            raise AssertionError("drive-queue-status report called plan_tick")
+
+        monkeypatch.setattr(dq, "plan_tick", _boom)
+        self._seed(coord_db)
+        result = CliRunner().invoke(
+            main, ["report", "run", "drive-queue-status", "--json"]
+        )
+        assert result.exit_code == 0, result.output
+
+
 # ── daemon endpoints ───────────────────────────────────────────────────────
 
 
@@ -1015,12 +1370,25 @@ class TestDaemonEndpoints:
         resp = report_client.get("/report")
         assert resp.status_code == 200
         body = resp.json()
-        assert [r["id"] for r in body["reports"]] == ["issue-activity"]
-        params = {p["id"]: p for p in body["reports"][0]["params"]}
+        assert [r["id"] for r in body["reports"]] == [
+            "drive-queue-status", "issue-activity",
+        ]
+        rep = next(r for r in body["reports"] if r["id"] == "issue-activity")
+        params = {p["id"]: p for p in rep["params"]}
         assert params["since"]["choices"] == ["1h", "6h", "24h", "3d", "7d"]
         assert params["since"]["default"] == "24h"
         assert params["since"]["kind"] == "choice"
         assert params["repo"]["kind"] == "text"
+
+    def test_get_report_catalogue_includes_drive_queue_status(
+        self, report_client: TestClient
+    ) -> None:
+        resp = report_client.get("/report")
+        body = resp.json()
+        rep = next(r for r in body["reports"] if r["id"] == "drive-queue-status")
+        assert rep["title"] == "Drive Queue Status"
+        params = {p["id"]: p for p in rep["params"]}
+        assert set(params) == {"repo"}
 
     def test_get_report_run_returns_report_result(
         self, report_client: TestClient, rw_db
@@ -1168,6 +1536,105 @@ class TestDaemonEndpoints:
         assert report_client.get(
             "/report/issue-activity", params={"since": "13h"}
         ).status_code == 200
+        assert _snapshot() == before
+
+
+class TestDaemonDriveQueueStatus:
+    """``GET /report/drive-queue-status`` (#1805) — same seam/acceptance bar
+    as ``TestDaemonEndpoints`` above, scoped to the new report."""
+
+    def _seed(self, rw_db) -> None:
+        state.enqueue_drive_queue("api", 10, machine="dellserver")
+        state.enqueue_drive_queue("api", 11, after=["api#10"])
+        state.enqueue_drive_queue("web", 20)
+        state._update_drive_queue_entry_local("api", 10, state="running")
+        state._update_drive_queue_entry_local(
+            "api", 11, state="waiting", attempts=2, last_reason="deferred"
+        )
+
+    def test_get_report_run_returns_report_result(
+        self, report_client: TestClient, rw_db
+    ) -> None:
+        self._seed(rw_db)
+        resp = report_client.get("/report/drive-queue-status")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["report_id"] == "drive-queue-status"
+        assert {r["issue"] for r in body["rows"]} == {10, 11, 20}
+        assert body["window"][0] == body["window"][1] == body["generated_at"]
+        assert [m["id"] for m in body["column_meta"]] == body["columns"]
+
+    def test_repo_param_restricts_to_one_repo(
+        self, report_client: TestClient, rw_db
+    ) -> None:
+        self._seed(rw_db)
+        resp = report_client.get(
+            "/report/drive-queue-status", params={"repo": "web"}
+        )
+        assert resp.status_code == 200
+        assert [r["issue"] for r in resp.json()["rows"]] == [20]
+
+    def test_unknown_param_is_400_naming_repo(
+        self, report_client: TestClient, rw_db
+    ) -> None:
+        resp = report_client.get(
+            "/report/drive-queue-status", params={"since": "13h"}
+        )
+        assert resp.status_code == 400
+        error = resp.json()["error"]
+        assert "since" in error
+        assert "repo" in error
+
+    def test_empty_queue_returns_rows_empty_with_a_note(
+        self, report_client: TestClient, rw_db
+    ) -> None:
+        resp = report_client.get("/report/drive-queue-status")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["rows"] == []
+        assert any("empty" in n.lower() for n in body["notes"])
+
+    def test_endpoint_and_cli_agree_byte_for_byte(
+        self, report_client: TestClient, rw_db
+    ) -> None:
+        self._seed(rw_db)
+        # Freeze both sides' clock so `generated_at`/`window` agree exactly.
+        endpoint = report_client.get(
+            "/report/drive-queue-status", params={"repo": "api"}
+        )
+        assert endpoint.status_code == 200
+        cli_result = CliRunner().invoke(
+            main,
+            ["report", "run", "drive-queue-status", "--param", "repo=api", "--json"],
+        )
+        assert cli_result.exit_code == 0, cli_result.output
+        endpoint_body = endpoint.json()
+        cli_body = json.loads(cli_result.output)
+        # generated_at/window are wall-clock and legitimately differ between
+        # the two separate processes/threads; compare everything else.
+        for body in (endpoint_body, cli_body):
+            body.pop("generated_at")
+            body.pop("window")
+        assert json.dumps(cli_body, sort_keys=True) == json.dumps(
+            endpoint_body, sort_keys=True
+        )
+
+    def test_running_a_report_does_not_mutate_the_board(
+        self, report_client: TestClient, rw_db
+    ) -> None:
+        self._seed(rw_db)
+
+        def _snapshot() -> tuple:
+            rows = rw_db.execute(
+                "SELECT * FROM drive_queue ORDER BY id"
+            ).fetchall()
+            audit_count = rw_db.execute(
+                "SELECT COUNT(*) AS c FROM audit_log"
+            ).fetchone()["c"]
+            return [tuple(r) for r in rows], audit_count
+
+        before = _snapshot()
+        assert report_client.get("/report/drive-queue-status").status_code == 200
         assert _snapshot() == before
 
 
