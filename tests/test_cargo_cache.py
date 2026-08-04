@@ -37,6 +37,61 @@ def _age(path: Path, seconds_ago: float) -> None:
     os.utime(path, (ts, ts))
 
 
+# ── #1773: isolate this module from an ambient CARGO_TARGET_DIR ────────────
+#
+# Every coord worker subprocess already has CARGO_TARGET_DIR exported into
+# its own environment before it ever runs pytest (coord/agent.py, #1402).
+# This module's tests assert cargo_env()'s target-dir *resolution*, which
+# only holds for a clean environment — cargo_env() correctly no-ops when the
+# caller's env already carries CARGO_TARGET_DIR (an operator's explicit
+# choice always wins, coord/cargo_cache.py:97, and that precedence is not
+# touched here). The fixture below strips whatever is ambient before each
+# test body runs.
+#
+# The module-scoped fixture that follows it *unconditionally* injects a
+# fake ambient value for the whole module, regardless of what the host
+# running pytest happens to have set. That makes the exposure reproducible
+# on every machine, not just inside a worker, and is what makes
+# ``test_module_is_isolated_from_ambient_cargo_target_dir`` below a real
+# regression guard: delete or narrow the stripping fixture and that test
+# (and the real-subprocess test further down) fails on any host.
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _simulated_worker_ambient_cargo_target_dir():
+    """Reproduce a coord worker's ambient CARGO_TARGET_DIR unconditionally,
+    so the isolation fixture below is exercised on every test run."""
+    sentinel = "/nonexistent/ambient-cargo-target-dir-from-a-worker-shell"
+    previous = os.environ.get(cargo_cache.CARGO_ENV)
+    os.environ[cargo_cache.CARGO_ENV] = sentinel
+    try:
+        yield sentinel
+    finally:
+        if previous is None:
+            os.environ.pop(cargo_cache.CARGO_ENV, None)
+        else:
+            os.environ[cargo_cache.CARGO_ENV] = previous
+
+
+@pytest.fixture(autouse=True)
+def _strip_ambient_cargo_target_dir(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The actual #1773 fix: strip any ambient CARGO_TARGET_DIR (real, from
+    a coord worker, or simulated by the fixture above) before each test body
+    runs, so this module's tests don't depend on who — or what — invokes
+    pytest. ``cargo_env()``'s operator-wins precedence is unchanged; this
+    only isolates the test process's own environment."""
+    monkeypatch.delenv(cargo_cache.CARGO_ENV, raising=False)
+
+
+def test_module_is_isolated_from_ambient_cargo_target_dir() -> None:
+    """Regression for #1773. The module fixture above always exports an
+    ambient CARGO_TARGET_DIR before this test body runs. If
+    ``_strip_ambient_cargo_target_dir`` were deleted or narrowed to a single
+    test, this assertion — and ``test_worker_spawn_exports_shared_cargo_target_dir``
+    below — would fail on every host, not just inside a coord worker."""
+    assert cargo_cache.CARGO_ENV not in os.environ
+
+
 # ── target dir resolution ───────────────────────────────────────────────────
 
 
