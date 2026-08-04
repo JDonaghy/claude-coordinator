@@ -165,6 +165,47 @@ class TestRun:
         assert "Coordinator: Assignment Failed" in body
         assert "bad config" in body
 
+    def test_push_failure_reason_surfaces_in_failure_comment(
+        self, coord_dir: Path, config: Config
+    ) -> None:
+        """#1797: a `type="work"` assignment killed by an auth-shaped
+        reap-time push failure hits the generic FAILED branch (none of the
+        type-specific `elif`s — plan/review/conflict-fix/smoke — match
+        "work"). Before this fix that branch only folded
+        `usage_limit_reason`/`api_error_reason` into `failure_reason`/
+        `error`, so `push_failure_reason` never reached the posted GitHub
+        comment and it read as a blank, unexplained failure. Both the
+        persisted `failure_reason` (via the notified ledger) and the
+        comment body itself must carry the auth-failure text."""
+        _record("push-fail-1")
+        agent_status = {
+            "active": [],
+            "completed": [
+                _agent_completed(
+                    "push-fail-1",
+                    "failed",
+                    error=None,
+                    push_failure_reason="remote: Invalid username or token.",
+                )
+            ],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment") as mock_post:
+            notify_mod.run(config)
+        body = mock_post.call_args.args[2]
+        assert "Coordinator: Assignment Failed" in body
+        assert "Invalid username or token" in body
+        # `mark_notified`'s `failure_reason=` write lands on the assignments
+        # table, not the notified ledger `load_notified()` returns — check
+        # the persisted column directly, matching the pattern used elsewhere
+        # in this suite (e.g. TestSmokeCompletion's `test_state` checks).
+        row = state_mod.get_connection().execute(
+            "SELECT failure_reason FROM assignments WHERE assignment_id=?",
+            ("push-fail-1",),
+        ).fetchone()
+        assert row is not None, "assignment row must exist"
+        assert row["failure_reason"] == "remote: Invalid username or token."
+
 
 # ── #448: advisory (0-commit clean exit) notify ─────────────────────────────
 

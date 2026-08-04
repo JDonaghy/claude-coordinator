@@ -218,6 +218,30 @@ def test_api_error_reason_propagated_from_agent_entry() -> None:
     assert rec.calls[0]["failure_reason"] == "529 Overloaded"
 
 
+def test_push_failure_reason_propagated_from_agent_entry() -> None:
+    """#1797: an auth-shaped reap-time push failure (AgentServer._reap stamps
+    `push_failure_reason` — see `coord.agent._is_auth_push_failure`) must be
+    forwarded to `_update_local_state` as `failure_reason` exactly like
+    `usage_limit_reason`/`api_error_reason` — this is the primary production
+    path (the daemon's passive tick) for getting the reason out of the
+    ephemeral agent-side JSON and into the persisted, drive.py-visible
+    `failure_reason` column, so `coord status`, the TUI, and GitHub failure
+    comments show the auth error instead of a bare "failed"."""
+    rec = _Recorder()
+    reconcile_completed_assignments(
+        _config(),
+        board=_board(_running("w1", atype="work")),
+        agent_status_fn=lambda host: {"completed": [
+            {
+                "id": "w1", "status": "failed",
+                "push_failure_reason": "Invalid username or token.",
+            },
+        ]},
+        update_state_fn=rec, capture_plan=False,
+    )
+    assert rec.calls[0]["failure_reason"] == "Invalid username or token."
+
+
 def test_usage_limit_reason_preferred_over_api_error_reason() -> None:
     """The two are mutually exclusive by construction (see
     `AgentServer._reap`), but if an entry somehow carried both,
