@@ -2,8 +2,40 @@
 description: coord `work` assignment worker — implements a GitHub issue in its own git worktree, commits, and pushes a branch for the coordinator to review and merge.
 mode: primary
 permission:
+  # Deny-baseline (#1705): the catch-all "*": deny must come first — opencode
+  # resolves overlapping rules last-match-wins, so a catch-all listed after a
+  # specific rule would silently swallow it (confirmed against a real
+  # opencode binary, see docs/OPENCODE_VERIFICATION.md "Rule precedence is
+  # last-match-wins, not first-match-wins"). Every allow below is a narrow,
+  # deliberate carve-out for exactly what a `work` assignment's flow needs —
+  # git only as far as branch/commit/push/inspect, plus the specific
+  # build/test toolchains this file's own instructions name below. Nothing
+  # else — no shell escape hatches (`sh -c`, `bash -c`, bare `python -c`),
+  # no network tools (`curl`, `wget`, `ssh`, `nc`) — survives to close the
+  # indirection routes (`sh -c "gh ..."`, a `subprocess.run(["gh", ...])`
+  # one-liner, a raw `curl` against the GitHub REST API) that a wide-open
+  # bash baseline would otherwise leave for reaching `gh`/GitHub even with
+  # an explicit "gh *": deny in place.
   bash:
-    "*": allow
+    "*": deny
+    "git status*": allow
+    "git diff*": allow
+    "git log*": allow
+    "git show*": allow
+    "git add*": allow
+    "git commit*": allow
+    "git checkout*": allow
+    "git branch*": allow
+    "git rev-parse*": allow
+    "git push*": allow
+    "cargo *": allow
+    "make*": allow
+    "pytest*": allow
+    "python3 -m pytest*": allow
+    "python -m pytest*": allow
+    "npm *": allow
+    "pip install*": allow
+    "pip3 install*": allow
     "gh *": deny
   edit:
     "*": allow

@@ -477,13 +477,14 @@ class OpenCodeProvider(Provider):
           semantics inverted from ``claude -p``'s allow-list — ``--auto``
           only ever *widens* what an ``"ask"`` rule would otherwise block;
           it can never widen past an explicit ``"deny"``.  As of #1705,
-          with ``work.md``'s deny-baseline config actually in force, this
-          is exactly what keeps a real ``work`` dispatch headless instead
-          of hanging on ``work.md``'s ``bash: {"*": "allow"}`` /
-          ``external_directory: deny`` ``ask``-adjacent rules — see
-          :meth:`capabilities`'s ``enforces_deny_list`` note for the tests
-          that prove the explicit ``deny`` entries still hold under
-          ``--auto``.
+          with ``work.md``'s deny-baseline config actually in force
+          (``bash: {"*": "deny", "git status*"/"git commit*"/"git push*"/...:
+          "allow", "gh *": "deny", ...}``), this is exactly what keeps a
+          real ``work`` dispatch headless instead of hanging on
+          ``work.md``'s narrow bash allow-list / ``external_directory: deny``
+          ``ask``-adjacent rules — see :meth:`capabilities`'s
+          ``enforces_deny_list`` note for the tests that prove the explicit
+          ``deny`` entries still hold under ``--auto``.
 
         Ignored kwargs
         ~~~~~~~~~~~~~~

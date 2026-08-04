@@ -56,7 +56,7 @@ include = ["coord*"]
 exclude = ["tests*"]
 
 [tool.setuptools.package-data]
-coord = ["skills/**/*", "dashboard/webapp/dist/**/*"]
+coord = ["skills/**/*", "dashboard/webapp/dist/**/*", "agents/**/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
