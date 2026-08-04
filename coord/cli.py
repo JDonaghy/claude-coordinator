@@ -409,3 +409,15 @@ main.add_command(resume_stuck)
 main.add_command(install_skills)
 main.add_command(acceptance_group)
 main.add_command(release_preflight)
+
+
+# #1809: without this guard, `python -m coord.cli <args>` just IMPORTS the
+# module — building every `click.group`/`add_command` above, then returning —
+# and exits 0 having run nothing and printed nothing. That import-only path is
+# exactly what `coord.drive.coord_argv()` falls back to whenever `coord` isn't
+# on PATH (a bare venv, a systemd user unit, a non-interactive ssh session —
+# see #402), so every subprocess the driver or the drive queue spawned on such
+# a host was a silent no-op that reported success. `python -m coord.cli
+# --version` and the fallback argv both need `main()` to actually run.
+if __name__ == "__main__":  # pragma: no cover — exercised via subprocess in tests
+    main()

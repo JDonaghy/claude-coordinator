@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -2876,3 +2877,65 @@ def test_coord_argv_falls_back_to_the_module_when_not_on_path(monkeypatch):
     monkeypatch.delenv("COORD_DRIVE_COORD_BIN", raising=False)
     monkeypatch.setattr("coord.drive.shutil.which", lambda name: None)
     assert coord_argv()[-2:] == ["-m", "coord.cli"]
+
+
+# ── #1809: the fallback must actually run, not just be shaped right ─────────
+#
+# The two tests above assert on coord_argv()'s RETURN VALUE only. Nothing
+# ever executed the argv it returns — so `coord/cli.py` shipped with no
+# `if __name__ == "__main__":` guard, meaning `python -m coord.cli <args>`
+# silently imported the module (building every click.group/add_command) and
+# exited 0 having run nothing and printed nothing. That import-only exit is
+# exactly the path `coord_argv()` falls back to whenever `coord` isn't on
+# PATH — a venv whose bin isn't exported, a systemd user unit, a
+# non-interactive ssh session (#402) — so on those hosts every `coord`
+# subprocess the driver or the drive queue spawned (`coord assign`, `coord
+# drive --tmux`, ...) was a silent no-op that reported success. Both tests
+# below run a real subprocess and assert on its OUTPUT, not just its exit
+# code, because the broken path also exits 0 — a bare `returncode == 0`
+# assertion would pass against the very bug this guards against.
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_VERSION_RE = re.compile(r"\d+\.\d+\.\d+")
+
+
+def test_python_dash_m_coord_cli_prints_version_and_exits_0():
+    """The direct acceptance check: ``python -m coord.cli --version`` must
+    actually run ``main()``, not just import the module and exit."""
+    result = subprocess.run(
+        [sys.executable, "-m", "coord.cli", "--version"],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert _VERSION_RE.search(result.stdout), (
+        f"expected a version string on stdout, got: {result.stdout!r} "
+        f"(stderr={result.stderr!r})"
+    )
+
+
+def test_coord_argv_fallback_argv_is_actually_executable(monkeypatch):
+    """The direct regression guard: with ``coord`` scrubbed from PATH (the
+    #402 scenario), the argv ``coord_argv()`` hands to every driver/queue
+    subprocess call must run a real command — invoked here exactly as
+    ``Driver``/``launch_drive_in_tmux``/the drive queue invoke it (argv +
+    extra args, no shell)."""
+    monkeypatch.delenv("COORD_DRIVE_COORD_BIN", raising=False)
+    monkeypatch.setattr("coord.drive.shutil.which", lambda name: None)
+    argv = coord_argv()
+    assert argv[-2:] == ["-m", "coord.cli"]
+
+    result = subprocess.run(
+        [*argv, "--version"],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert _VERSION_RE.search(result.stdout), (
+        f"expected a version string on stdout, got: {result.stdout!r} "
+        f"(stderr={result.stderr!r})"
+    )
