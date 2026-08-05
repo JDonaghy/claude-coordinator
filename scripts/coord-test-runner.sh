@@ -443,14 +443,28 @@ run_fallback() {
 
 # ── drive ────────────────────────────────────────────────────────────────────
 
+# A suite whose failure was already recorded in INFRA_SUITES (via
+# toolchain_missing) must NOT also land in FAILED_SUITES: the INFRA_SUITES
+# check below always runs first and exits before FAILED_SUITES is consulted,
+# so double-booking was harmless, but it left a suite name in a "these are
+# verdicts" list it never actually earned — confusing for a future reader of
+# either list on its own (#1814 review).
+mark_failed() {
+    local suite="$1" s
+    for s in ${INFRA_SUITES[@]+"${INFRA_SUITES[@]}"}; do
+        [[ "$s" == "$suite" ]] && return 0
+    done
+    FAILED_SUITES+=("$suite")
+}
+
 if [[ "$RUN_PY" -eq 1 ]]; then
-    run_python || FAILED_SUITES+=("python")
+    run_python || mark_failed python
 fi
 if [[ "$RUN_RS" -eq 1 ]]; then
-    run_rust || FAILED_SUITES+=("rust")
+    run_rust || mark_failed rust
 fi
 if [[ "$RUN_FALLBACK" -eq 1 ]]; then
-    run_fallback || FAILED_SUITES+=("fallback")
+    run_fallback || mark_failed fallback
 fi
 
 if [[ ${#FLAKES[@]} -gt 0 ]]; then

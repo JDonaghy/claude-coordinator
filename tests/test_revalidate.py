@@ -703,6 +703,25 @@ class TestIsInfrastructureFailure:
             # (an assertion message, a 404 in a log) is NOT infrastructure.
             (1, "AssertionError: expected 'widget not found' in response"),
             (2, "usage: ..."),
+            # #1814 review: this repo's OWN pytest arm now contains tests
+            # whose literal assertion text and parametrize IDs embed the
+            # markers themselves (test_coord_test_runner_toolchain.py,
+            # test_revalidate.py). If one of those specific tests ever fails
+            # for an unrelated reason, pytest's failure reporting reproduces
+            # the marker text verbatim — but never at the start of a line.
+            # A bare substring match would misclassify that genuine, unrelated
+            # Python failure as infrastructure and hide it from the operator.
+            (
+                1,
+                "FAILED tests/test_coord_test_runner_toolchain.py::test_x"
+                "[TOOLCHAIN MISSING(rust): 'cargo' not found] - AssertionError",
+            ),
+            (1, "E       assert 'RESULT: INFRA' in out"),
+            (
+                1,
+                "      TOOLCHAIN MISSING(rust) — indented, as the runner's own "
+                "`tail -n 40 ... | sed 's/^/      /'` rerun dump always is",
+            ),
         ],
     )
     def test_negative_signals(self, rc: int, output: str) -> None:
@@ -712,6 +731,25 @@ class TestIsInfrastructureFailure:
         """Only reached on a non-zero exit today, but the classifier must not
         claim a green run could not run."""
         assert rv.is_infrastructure_failure(0, "") is False
+
+    def test_marker_must_be_at_line_start(self) -> None:
+        """The runner's `say()` always emits a marker as the first characters
+        of a line it prints. A marker appearing mid-line (e.g. inside a
+        pytest assertion diff or FAILED summary) is not the runner speaking —
+        it is this repo's own test suite quoting the marker as literal text
+        (#1814 review). Only a line that genuinely starts with the marker
+        counts.
+        """
+        assert (
+            rv.is_infrastructure_failure(
+                1, "blah blah RESULT: INFRA (rust) blah"
+            )
+            is False
+        )
+        assert (
+            rv.is_infrastructure_failure(1, "RESULT: INFRA (rust) blah")
+            is True
+        )
 
     def test_infra_is_not_narrowable(self) -> None:
         assert rv.KIND_INFRA not in rv.NARROWABLE_KINDS

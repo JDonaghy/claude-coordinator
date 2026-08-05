@@ -26,12 +26,19 @@ coreutils the script itself calls, and a faithful stand-in for the daemon's
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "coord-test-runner.sh"
+
+#: Resolved against the TEST PROCESS's own (real) PATH, not the scrubbed one
+#: built below for the subprocess — bash itself isn't the thing under test.
+#: Falls back to the fleet's documented Linux location if `shutil.which` comes
+#: up empty (e.g. a minimal container without PATH set at all).
+BASH = shutil.which("bash") or "/usr/bin/bash"
 
 #: No ~/.cargo/bin, no ~/.local/bin — the shape of the daemon's PATH.
 SCRUBBED_PATH = "/usr/bin:/bin"
@@ -93,7 +100,7 @@ def _run(
     }
     env.update(env_overrides)
     return subprocess.run(
-        ["/usr/bin/bash", str(SCRIPT), str(repo), "--base-ref", "base", *extra_args],
+        [BASH, str(SCRIPT), str(repo), "--base-ref", "base", *extra_args],
         capture_output=True,
         text=True,
         timeout=60,
