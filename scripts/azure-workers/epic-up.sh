@@ -8,6 +8,53 @@
 # hold the IDs it printed.
 set -euo pipefail
 
+log() { printf '\n\033[1m=== %s ===\033[0m\n' "$*"; }
+
+# Pull one field out of a gallery image-version resource ID:
+#   /subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Compute/
+#     galleries/<gallery>/images/<imageDef>/versions/<version>
+# Pure string parsing, no az call -- kept separate from
+# report_image_provenance so it's trivially unit-testable.
+parse_image_id() {
+    local id="$1" field="$2"
+    case "$field" in
+        rg)      sed -n 's#.*/resourceGroups/\([^/]*\)/.*#\1#p' <<<"$id" ;;
+        gallery) sed -n 's#.*/galleries/\([^/]*\)/.*#\1#p' <<<"$id" ;;
+        image)   sed -n 's#.*/images/\([^/]*\)/.*#\1#p' <<<"$id" ;;
+        version) sed -n 's#.*/versions/\([^/]*\)$#\1#p' <<<"$id" ;;
+    esac
+}
+
+# #1800: name the image version and publish date being deployed from, so a
+# stale SOURCE_IMAGE_ID pin is visible at provision time instead of inferred
+# later from missing software. Warns (does not fail) when a newer version
+# exists in the gallery -- a deliberate pin is legitimate, but an accidental
+# one should be loud.
+report_image_provenance() {
+    local id="$1"
+    local ver rg gallery imgdef published newest
+    ver="$(parse_image_id "$id" version)"
+    rg="$(parse_image_id "$id" rg)"
+    gallery="$(parse_image_id "$id" gallery)"
+    imgdef="$(parse_image_id "$id" image)"
+
+    published="$(az sig image-version show --ids "$id" \
+        --query publishingProfile.publishedDate -o tsv 2>/dev/null || true)"
+    echo "  image     ${ver:-unknown} (published ${published:-unknown})"
+
+    if [[ -n "$gallery" && -n "$imgdef" ]]; then
+        newest="$(az sig image-version list -g "$rg" --gallery-name "$gallery" \
+            --gallery-image-definition "$imgdef" --query "[].name" -o tsv 2>/dev/null \
+            | sort -V | tail -1)"
+        if [[ -n "$newest" && -n "$ver" && "$newest" != "$ver" ]]; then
+            echo "  WARNING: SOURCE_IMAGE_ID pins $ver but $newest is newer in $gallery/$imgdef." >&2
+            echo "  If that's deliberate, ignore this. Otherwise fix SOURCE_IMAGE_ID in \$EPIC_ENV" >&2
+            echo "  (or re-run build-worker-image.sh without --no-update-env)." >&2
+        fi
+    fi
+}
+
+main() {
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Subscription-specific IDs live outside the repo, alongside coord's other
 # state. Override with EPIC_ENV for a second subscription.
@@ -51,7 +98,6 @@ done
 
 MACHINE="${MACHINE:-azure-epic${EPIC}}"
 RG="rg-coord-epic${EPIC}"
-log() { printf '\n\033[1m=== %s ===\033[0m\n' "$*"; }
 
 # --------------------------------------------------------------------------
 # The Bicep module ships in the easy-azure repo; these scripts ship in
@@ -78,6 +124,7 @@ else
 fi
 
 log "1/5  deploy $RG"
+report_image_provenance "$SOURCE_IMAGE_ID"
 az group create -n "$RG" -l "${LOCATION:-eastus}" -o none
 az deployment group create -g "$RG" --name "worker-${EPIC}" \
     --template-file "$TEMPLATE" \
@@ -241,9 +288,15 @@ cat <<EOF
   machine   $MACHINE
   repos     $REPOS
   egress IP $NAT_IP
+  image     $(parse_image_id "$SOURCE_IMAGE_ID" version)
   teardown  ./epic-down.sh --epic $EPIC
   state     $( ((PAUSED)) && echo "PAUSED — no work will route here until 'coord unpause $MACHINE'" || echo "active — eligible for dispatch")
 
   Cost accrues until teardown -- roughly \$0.40/hr all-in at $VM_SIZE.
 
 EOF
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
