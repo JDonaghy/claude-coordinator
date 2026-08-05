@@ -1,0 +1,269 @@
+"""Per-machine facts for two of the fleet deploy-lane checks (#1806).
+
+Root cause of #1806: `fleet_deploy_lanes`'s ``~/.coord-cli-venv`` lane and
+the whole of `fleet_tui_binary` used to be gathered by ``os.stat``-ing the
+**daemon host's** filesystem
+(``coord.health.fleet_snapshot.FleetHealthRefresher._daemon_host_facts``).
+That is correct for a fact that can only exist on the daemon process itself
+(``coord-serve``'s own venv) — it is wrong for these two, whose subject is a
+path on the **operator's** machine, which is very often a different box
+from the one running ``coord-serve``. When the two differ, the daemon was
+reporting on its own, usually-absent, copy of paths that live somewhere
+else entirely — and reporting the *opposite* of the truth (#1806's live
+example: WARN "stale" while the operator's real binary was current;
+UNKNOWN "no data" while the operator's real CLI venv was on the release
+everyone believed was live).
+
+These two **machine-scope** checks report the same two raw facts (CLI-venv
+version; tui-binary mtime vs. newest ``tui/`` source mtime) from wherever
+they actually run — every agent's own ``/health`` poll, the transport #1630
+already built for exactly this "measure locally, judge centrally" split.
+`coord.health.checks.fleet_deploy_lanes` aggregates these across every
+``ctx.fleet.machines`` entry instead of trusting a single host's local
+``os.stat`` to answer a fleet-wide question.
+
+Absence is the *common* case here — most machines in a fleet have neither
+an operator's CLI venv nor a local ``tui/`` checkout+build — so both probes
+report that plainly as ``OK`` ("not present on this machine") rather than
+``UNKNOWN``/``WARN``: a box that was never meant to have either lane must
+not read as faulty just because it doesn't.
+"""
+
+from __future__ import annotations
+
+import subprocess
+
+from coord.health.checks.agent_install import PROJECT, pip_show
+from coord.health.models import CheckResult, HealthContext, Severity
+from coord.health.registry import check
+from coord.health.units import expand, shorten_path
+
+# Same documented default locations `coord.health.fleet_snapshot` used to
+# stat on the daemon host — now stat'd wherever this check actually runs.
+# `health.cli_venv_python` / `health.tui_binary_path` / `health.tui_source_dir`
+# override these, same convention as `agent_venv_python`: None means "use the
+# documented default location", NOT "disable the lane".
+_DEFAULT_CLI_VENV_PYTHON = "~/.coord-cli-venv/bin/python3"
+_DEFAULT_TUI_BINARY = "~/.local/bin/coord-tui"
+
+# Cap on the tui/ source walk, mirroring the old daemon-side walk: the tree
+# is a few hundred .rs files, so anything past this is a misconfigured
+# `tui_source_dir` pointed at something huge, and a machine's own /health
+# tick must not spend its budget discovering that. A partial walk still
+# yields a *lower bound* on the newest mtime — it can only under-report
+# staleness, never fabricate it.
+_MAX_TUI_SOURCE_FILES = 5000
+
+
+def resolve_cli_venv_python(ctx: HealthContext):
+    """The interpreter for this machine's ``~/.coord-cli-venv``, if any."""
+    configured = getattr(ctx.thresholds, "cli_venv_python", None)
+    if configured:
+        return expand(configured, ctx.home)
+    return expand(_DEFAULT_CLI_VENV_PYTHON, ctx.home)
+
+
+def resolve_tui_binary_path(ctx: HealthContext):
+    """This machine's locally-built ``coord-tui`` binary, if any."""
+    configured = getattr(ctx.thresholds, "tui_binary_path", None)
+    if configured:
+        return expand(configured, ctx.home)
+    return expand(_DEFAULT_TUI_BINARY, ctx.home)
+
+
+def resolve_tui_source_dir(ctx: HealthContext):
+    """``<checkout>/tui/src`` for the first local checkout that has one.
+
+    Derived from ``ctx.checkouts`` (the same locally-existing checkouts
+    every other checkout-scope probe sees) rather than guessed relative to
+    the binary path — a `target/release/...` install path says nothing
+    reliable about where the sources live, and comparing against the
+    *wrong* tree would manufacture staleness rather than report it.
+    Configured `health.tui_source_dir` wins outright when set.
+    """
+    configured = getattr(ctx.thresholds, "tui_source_dir", None)
+    if configured:
+        return expand(configured, ctx.home)
+    for checkout in ctx.checkouts:
+        candidate = checkout.path / "tui" / "src"
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+def _newest_rust_source_mtime(source_dir):
+    """Newest ``*.rs`` mtime under *source_dir*, or None if there are none.
+
+    Skips ``target``/hidden directories so a ``tui_source_dir`` pointed at a
+    crate root (rather than its ``src/``) degrades to slow-but-correct
+    instead of walking a multi-GB build tree.
+    """
+    newest = 0.0
+    seen = 0
+    try:
+        if not source_dir.is_dir():
+            return None
+        stack = [source_dir]
+        while stack:
+            current = stack.pop()
+            try:
+                entries = list(current.iterdir())
+            except OSError:
+                continue
+            for entry in entries:
+                name = entry.name
+                if name.startswith(".") or name == "target":
+                    continue
+                try:
+                    if entry.is_dir():
+                        stack.append(entry)
+                        continue
+                    if not name.endswith(".rs"):
+                        continue
+                    newest = max(newest, entry.stat().st_mtime)
+                except OSError:
+                    continue
+                seen += 1
+                if seen >= _MAX_TUI_SOURCE_FILES:
+                    stack.clear()
+                    break
+    except OSError:
+        return newest or None
+    return newest or None
+
+
+@check(
+    id="cli_venv",
+    scope="machine",
+    title="cli venv",
+    order=42,
+    description=(
+        "This machine's ~/.coord-cli-venv claude-coordinator version, when "
+        "it has one — the operator's CLI venv lane of fleet_deploy_lanes (#1806)."
+    ),
+)
+def probe_cli_venv(ctx: HealthContext) -> CheckResult:
+    python = resolve_cli_venv_python(ctx)
+    if not python.exists():
+        # The overwhelming common case: most machines are workers, not the
+        # operator's own box, and never had this venv created. That is not
+        # a fault — fleet_deploy_lanes reads "no machine reports this lane"
+        # as UNKNOWN, not this machine's absence as one.
+        return CheckResult(
+            check_id="cli_venv",
+            scope="machine",
+            severity=Severity.OK,
+            headroom="not present on this machine",
+            values={"python": str(python), "present": False, "version": None},
+        )
+
+    try:
+        fields = pip_show(python)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return CheckResult(
+            check_id="cli_venv",
+            scope="machine",
+            severity=Severity.UNKNOWN,
+            headroom=f"could not run pip show ({type(exc).__name__})",
+            error=str(exc),
+            values={"python": str(python), "present": True, "version": None},
+        )
+
+    version = fields.get("Version") or None
+    if not version:
+        return CheckResult(
+            check_id="cli_venv",
+            scope="machine",
+            severity=Severity.UNKNOWN,
+            headroom=f"{PROJECT} not installed in {shorten_path(str(python), str(ctx.home))}",
+            error="pip show returned nothing",
+            values={"python": str(python), "present": True, "version": None},
+        )
+
+    return CheckResult(
+        check_id="cli_venv",
+        scope="machine",
+        severity=Severity.OK,
+        headroom=f"pypi {version}",
+        values={
+            "python": str(python),
+            "present": True,
+            "version": version,
+            "editable": bool(fields.get("Editable project location")),
+        },
+    )
+
+
+@check(
+    id="tui_binary",
+    scope="machine",
+    title="tui binary",
+    order=43,
+    description=(
+        "This machine's locally-built tui/ binary vs. the tui/ source tree "
+        "it was built from — feeds the fleet_tui_binary check (#1806)."
+    ),
+)
+def probe_tui_binary(ctx: HealthContext) -> CheckResult:
+    binary_path = resolve_tui_binary_path(ctx)
+    values: dict = {"path": str(binary_path)}
+
+    try:
+        binary_mtime = binary_path.stat().st_mtime if binary_path.exists() else None
+    except OSError:
+        binary_mtime = None
+
+    if binary_mtime is None:
+        # Most machines never built a local tui/ binary — absent, not stale.
+        return CheckResult(
+            check_id="tui_binary",
+            scope="machine",
+            severity=Severity.OK,
+            headroom="not present on this machine",
+            values={**values, "present": False},
+        )
+
+    values["present"] = True
+    values["binary_mtime"] = binary_mtime
+
+    source_dir = resolve_tui_source_dir(ctx)
+    if source_dir is None:
+        return CheckResult(
+            check_id="tui_binary",
+            scope="machine",
+            severity=Severity.OK,
+            headroom="binary present (tui/ source tree not found to compare)",
+            values=values,
+        )
+
+    values["source_dir"] = str(source_dir)
+    source_mtime = _newest_rust_source_mtime(source_dir)
+    if source_mtime is None:
+        return CheckResult(
+            check_id="tui_binary",
+            scope="machine",
+            severity=Severity.OK,
+            headroom="binary present (tui/ source tree not found to compare)",
+            values=values,
+        )
+
+    values["source_mtime"] = source_mtime
+    if source_mtime > binary_mtime:
+        stale_hours = (source_mtime - binary_mtime) / 3600.0
+        return CheckResult(
+            check_id="tui_binary",
+            scope="machine",
+            severity=Severity.WARN,
+            headroom=f"binary is {stale_hours:.1f}h older than tui/ source",
+            detail="rebuild the tui/ binary — source changed since the last local build",
+            threshold="warn when source/ is newer than the built binary",
+            values=values,
+        )
+
+    return CheckResult(
+        check_id="tui_binary",
+        scope="machine",
+        severity=Severity.OK,
+        headroom="up to date with tui/ source",
+        values=values,
+    )

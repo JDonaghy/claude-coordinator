@@ -2,11 +2,21 @@
 
 Mirrors :mod:`coord.gate_snapshot`'s shape exactly, and for the same reason:
 the ``/board`` read path must perform no per-request I/O (#1336 invariant 1).
-Polling N agents' ``/health`` endpoints, shelling out to ``pip show`` twice
-for the daemon-host deploy lanes, and cross-referencing every machine's
-``/status`` for phantom rows is all real network/subprocess work — it runs
-on the daemon's slow tick cadence (``coord.serve_app``'s
+Polling N agents' ``/health`` endpoints, shelling out to ``pip show`` once
+for the daemon's own ``coord-serve`` install, and cross-referencing every
+machine's ``/status`` for phantom rows is all real network/subprocess work —
+it runs on the daemon's slow tick cadence (``coord.serve_app``'s
 ``_health_refresh_loop``), never inline inside a ``GET /board``.
+
+**#1806: this module gathers only genuinely daemon-host-local facts.** The
+CLI-venv version and the ``tui/`` binary-vs-source staleness used to be
+``os.stat``-ed here too, which was wrong — both are facts about the
+*operator's* machine, not the daemon's, and the two are frequently different
+boxes. Those two now ride each machine's own ``/health`` poll (the
+``cli_venv``/``tui_binary`` machine-scope checks in
+:mod:`coord.health.checks.deploy_lane_facts`) and are aggregated fleet-wide
+in :mod:`coord.health.checks.fleet_deploy_lanes` from ``ctx.fleet.machines``,
+not from ``daemon_host``.
 
 **Advisory only (the hard constraint of #1630).** This module writes to
 :func:`coord.state.save_machine_health` and hands its snapshot to
@@ -49,97 +59,6 @@ STALE_AFTER_SECONDS = float(os.environ.get("COORD_HEALTH_STALE_SECS", "900"))
 # catching a pathological probe (e.g. one that dumps a huge `values` blob)
 # before it repeats that history.
 MAX_HEALTH_BLOCK_BYTES = 256 * 1024
-
-# ── daemon-host deploy-lane defaults (#1630) ─────────────────────────────────
-# `health.cli_venv_python` / `health.tui_binary_path` / `health.tui_source_dir`
-# override these; None in the config means "use the documented location", NOT
-# "disable the lane", so a stock install reports all four lanes with no config.
-# Both paths are what the install docs / README recipe actually produce:
-#   install docs:  python3 -m venv ~/.coord-cli-venv
-#   README:        cd tui && cargo build && cp target/debug/coord-tui \
-#                      ~/.local/bin/coord-tui
-_DEFAULT_CLI_VENV_PYTHON = Path(".coord-cli-venv") / "bin" / "python3"
-_DEFAULT_TUI_BINARY = Path(".local") / "bin" / "coord-tui"
-
-# Cap on the tui/ source walk. The tree is a few hundred .rs files; anything
-# past this is a misconfigured `tui_source_dir` pointed at something huge, and
-# the refresher must not spend a tick's budget discovering that. A partial walk
-# still yields a *lower bound* on the newest mtime, which can only make the
-# check under-report staleness — never fabricate it.
-_MAX_TUI_SOURCE_FILES = 5000
-
-
-def _default_tui_source_dir(config) -> Path | None:  # noqa: ANN001
-    """``<checkout>/tui/src`` for the first configured local checkout with one.
-
-    Derived from ``coordinator.yml``'s checkouts rather than guessed relative
-    to the binary: a `target/release/...` install path says nothing reliable
-    about where the sources live, and comparing against the *wrong* tree would
-    manufacture staleness rather than report it. Returns None when no local
-    checkout has a ``tui/src`` — the check then treats the binary as present
-    but uncomparable (OK), which is the honest answer.
-
-    Points at ``src/`` deliberately: rooting the walk at the crate directory
-    would sweep ``tui/target``, a multi-GB build dir, on every refresh.
-    """
-    try:
-        from coord.health.context import local_checkouts  # noqa: PLC0415
-
-        for checkout in local_checkouts(config):
-            candidate = checkout.path / "tui" / "src"
-            if candidate.is_dir():
-                return candidate
-    except Exception:  # noqa: BLE001 — a fact gatherer must never break the tick
-        return None
-    return None
-
-
-def _newest_rust_source_mtime(source_dir: Path) -> float | None:
-    """Newest ``*.rs`` mtime under *source_dir*, or None if there are none.
-
-    Skips ``target``/hidden directories so a ``tui_source_dir`` pointed at a
-    crate root (rather than its ``src/``) degrades to slow-but-correct instead
-    of walking a multi-GB build tree.
-    """
-    newest = 0.0
-    seen = 0
-    try:
-        if not source_dir.is_dir():
-            return None
-        stack = [source_dir]
-        while stack:
-            current = stack.pop()
-            try:
-                entries = list(current.iterdir())
-            except OSError:
-                continue
-            for entry in entries:
-                name = entry.name
-                if name.startswith(".") or name == "target":
-                    continue
-                try:
-                    if entry.is_dir():
-                        stack.append(entry)
-                        continue
-                    if not name.endswith(".rs"):
-                        continue
-                    newest = max(newest, entry.stat().st_mtime)
-                except OSError:
-                    continue
-                seen += 1
-                if seen >= _MAX_TUI_SOURCE_FILES:
-                    log.warning(
-                        "tui source walk hit the %d-file cap under %s — newest "
-                        "mtime is a lower bound",
-                        _MAX_TUI_SOURCE_FILES,
-                        source_dir,
-                    )
-                    stack.clear()
-                    break
-    except OSError:
-        return newest or None
-    return newest or None
-
 
 def _trim_check_result(r: dict) -> dict:
     """Drop the bytes-heavy, lowest-value fields from an OK-severity result.
@@ -452,11 +371,19 @@ class FleetHealthRefresher:
 
     @staticmethod
     def _daemon_host_facts(config) -> dict:  # noqa: ANN001
-        """Best-effort facts about the deploy lanes only the daemon host can see.
+        """Best-effort facts that are genuinely local to the daemon process.
 
-        Every lookup is individually fail-soft (a missing venv, an
-        unconfigured tui_binary_path) — this must never raise, since a
-        raise here would take the whole tick down with it.
+        #1806: this used to also gather the CLI-venv version and the tui/
+        binary-vs-source comparison here — both wrong, since the daemon host
+        is frequently not the operator's machine. Those two now come from
+        each machine's own ``/health`` poll instead (see this module's
+        docstring and :mod:`coord.health.checks.deploy_lane_facts`); only
+        ``coord-serve``'s own install — which can *only* be introspected from
+        the process running it — and the toolchain facts below (already
+        correctly fleet-wide, per #1806's own triage) stay here.
+
+        Every lookup is individually fail-soft — this must never raise, since
+        a raise here would take the whole tick down with it.
         """
         import sys  # noqa: PLC0415
 
@@ -471,57 +398,6 @@ class FleetHealthRefresher:
         except Exception:  # noqa: BLE001
             facts["coord_serve_version"] = None
             facts["coord_serve_editable"] = None
-
-        thresholds = getattr(config, "health", None)
-        cli_python_cfg = getattr(thresholds, "cli_venv_python", None)
-        cli_python = (
-            Path(cli_python_cfg).expanduser()
-            if cli_python_cfg
-            else Path.home() / _DEFAULT_CLI_VENV_PYTHON
-        )
-        try:
-            if cli_python.exists():
-                cli = pip_show(cli_python)
-                facts["cli_venv_version"] = cli.get("Version") or None
-                facts["cli_venv_editable"] = bool(cli.get("Editable project location"))
-            else:
-                facts["cli_venv_version"] = None
-                facts["cli_venv_editable"] = None
-        except Exception:  # noqa: BLE001
-            facts["cli_venv_version"] = None
-            facts["cli_venv_editable"] = None
-
-        # `health.tui_binary_path` / `health.tui_source_dir` win; otherwise the
-        # locations the README's build-and-install recipe actually produces, so
-        # the lane is live on a stock install rather than permanently UNKNOWN.
-        # Still no path-arithmetic guessing at "tui/src relative to the binary"
-        # — a `target/release/...` layout isn't guaranteed and a wrong guess
-        # would silently compare against the wrong tree; the source fallback is
-        # derived from the *configured checkouts*, which are ground truth.
-        tui_path_cfg = getattr(thresholds, "tui_binary_path", None)
-        tui_src_cfg = getattr(thresholds, "tui_source_dir", None)
-        binary_path = (
-            Path(tui_path_cfg).expanduser()
-            if tui_path_cfg
-            else Path.home() / _DEFAULT_TUI_BINARY
-        )
-        source_dir = (
-            Path(tui_src_cfg).expanduser()
-            if tui_src_cfg
-            else _default_tui_source_dir(config)
-        )
-
-        facts["tui_binary_path"] = str(binary_path)
-        facts["tui_binary_mtime"] = None
-        facts["tui_source_mtime"] = None
-        try:
-            if binary_path.exists():
-                facts["tui_binary_mtime"] = binary_path.stat().st_mtime
-        except OSError:
-            pass
-        if source_dir is not None:
-            facts["tui_source_dir"] = str(source_dir)
-            facts["tui_source_mtime"] = _newest_rust_source_mtime(source_dir)
 
         # #1629 (H-2): per-repo toolchain kinds + CI's pinned version, read
         # from whichever local checkouts exist on THIS (daemon) host — same

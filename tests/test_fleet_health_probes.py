@@ -14,18 +14,11 @@ instead of quietly never running on the daemon.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
 from coord.config import HealthConfig
-from coord.health.fleet_snapshot import (
-    FleetHealthRefresher,
-    _default_tui_source_dir,
-    _newest_rust_source_mtime,
-)
 from coord.health.models import FleetSnapshot, HealthContext, Severity
 from coord.health.registry import run_all
 
@@ -60,11 +53,44 @@ def _run(ctx: HealthContext) -> dict:
 
 
 def _agent(version: str | None, *, errored: bool = False) -> dict:
-    """A machine entry shaped like the one the refresher builds."""
+    """An ``agent_venv`` machine-scope result, shaped like the one the
+    refresher builds from a real agent's ``/health`` poll."""
     result = {"check_id": "agent_venv", "values": {"version": version}}
     if errored:
         result["error"] = "pip show exploded"
-    return {"state": "online", "checks": {"results": [result]}}
+    return result
+
+
+def _cli_venv(version: str | None = None, *, present: bool = True,
+              errored: bool = False) -> dict:
+    """A ``cli_venv`` machine-scope result (#1806) — the fact that used to
+    be wrongly gathered by stat-ing the daemon host's own filesystem."""
+    result = {"check_id": "cli_venv", "values": {"present": present, "version": version}}
+    if errored:
+        result["error"] = "pip show exploded"
+    return result
+
+
+def _tui(*, present: bool = True, binary_mtime: float | None = None,
+         source_mtime: float | None = None, errored: bool = False) -> dict:
+    """A ``tui_binary`` machine-scope result (#1806) — same story as
+    ``_cli_venv``: this used to be a single daemon-host ``os.stat``."""
+    values: dict = {"present": present, "path": "/home/x/.local/bin/coord-tui"}
+    if present:
+        values["binary_mtime"] = binary_mtime
+        if source_mtime is not None:
+            values["source_mtime"] = source_mtime
+    result = {"check_id": "tui_binary", "values": values}
+    if errored:
+        result["error"] = "stat exploded"
+    return result
+
+
+def _machine(*results: dict, state: str = "online") -> dict:
+    """A machine entry shaped like the one the refresher builds, carrying
+    whichever machine-scope check results (``_agent``/``_cli_venv``/
+    ``_tui``) this test seeds."""
+    return {"state": state, "checks": {"results": list(results)}}
 
 
 # ── every fleet probe is actually registered ─────────────────────────────────
@@ -92,19 +118,29 @@ def test_no_fleet_snapshot_means_unknown_never_ok() -> None:
 
 
 # ── fleet_deploy_lanes ───────────────────────────────────────────────────────
+#
+# #1806: the ~/.coord-cli-venv lane rides each machine's own `cli_venv`
+# machine-scope check now, never a `daemon_host["cli_venv_version"]` key —
+# see coord.health.checks.deploy_lane_facts. Every test below seeds it on a
+# `machines` entry (usually "elitebook", the operator's machine in the
+# issue's live example), never on `daemon_host`.
 
 
 def test_deploy_lanes_all_agree_is_ok() -> None:
     r = _run(
         _ctx(
-            machines={"elitebook": _agent("1.4.0"), "mini": _agent("1.4.0")},
-            daemon_host={"coord_serve_version": "1.4.0", "cli_venv_version": "1.4.0"},
+            machines={
+                "elitebook": _machine(_agent("1.4.0"), _cli_venv("1.4.0")),
+                "mini": _machine(_agent("1.4.0")),
+            },
+            daemon_host={"coord_serve_version": "1.4.0"},
         )
     )["fleet_deploy_lanes"]
     assert r.severity is Severity.OK
     assert "1.4.0" in r.headroom
     assert set(r.values["lanes"]) == {
-        "elitebook", "mini", "coord-serve (daemon host)", "~/.coord-cli-venv",
+        "elitebook", "mini", "coord-serve (daemon host)",
+        "~/.coord-cli-venv (elitebook)",
     }
 
 
@@ -113,23 +149,29 @@ def test_deploy_lanes_any_disagreement_is_crit() -> None:
     stale while everyone believed the fix was live."""
     r = _run(
         _ctx(
-            machines={"elitebook": _agent("1.4.0"), "mini": _agent("1.4.0")},
-            daemon_host={"coord_serve_version": "1.4.0", "cli_venv_version": "1.1.0"},
+            machines={
+                "elitebook": _machine(_agent("1.4.0"), _cli_venv("1.1.0")),
+                "mini": _machine(_agent("1.4.0")),
+            },
+            daemon_host={"coord_serve_version": "1.4.0"},
         )
     )["fleet_deploy_lanes"]
     assert r.severity is Severity.CRIT
     assert "2 versions" in r.headroom
     # The detail must name *which* lane is the odd one out, not just that skew
     # exists — "something is stale" is not an actionable page.
-    assert "~/.coord-cli-venv" in r.detail
+    assert "~/.coord-cli-venv (elitebook)" in r.detail
     assert "1.1.0" in r.detail
 
 
 def test_deploy_lanes_agent_skew_is_crit_too() -> None:
     r = _run(
         _ctx(
-            machines={"elitebook": _agent("1.4.0"), "mini": _agent("1.3.9")},
-            daemon_host={"coord_serve_version": "1.4.0", "cli_venv_version": "1.4.0"},
+            machines={
+                "elitebook": _machine(_agent("1.4.0"), _cli_venv("1.4.0")),
+                "mini": _machine(_agent("1.3.9")),
+            },
+            daemon_host={"coord_serve_version": "1.4.0"},
         )
     )["fleet_deploy_lanes"]
     assert r.severity is Severity.CRIT
@@ -141,8 +183,11 @@ def test_deploy_lanes_missing_lane_downgrades_agreement_to_unknown() -> None:
     a machine with no data must not read as "matches everyone else"."""
     r = _run(
         _ctx(
-            machines={"elitebook": _agent("1.4.0"), "mini": _agent(None)},
-            daemon_host={"coord_serve_version": "1.4.0", "cli_venv_version": "1.4.0"},
+            machines={
+                "elitebook": _machine(_agent("1.4.0"), _cli_venv("1.4.0")),
+                "mini": _machine(_agent(None)),
+            },
+            daemon_host={"coord_serve_version": "1.4.0"},
         )
     )["fleet_deploy_lanes"]
     assert r.severity is Severity.UNKNOWN
@@ -153,8 +198,10 @@ def test_deploy_lanes_missing_lane_downgrades_agreement_to_unknown() -> None:
 def test_deploy_lanes_errored_agent_check_is_no_data_not_a_version() -> None:
     r = _run(
         _ctx(
-            machines={"elitebook": _agent("1.4.0", errored=True)},
-            daemon_host={"coord_serve_version": "1.4.0", "cli_venv_version": "1.4.0"},
+            machines={
+                "elitebook": _machine(_agent("1.4.0", errored=True), _cli_venv("1.4.0")),
+            },
+            daemon_host={"coord_serve_version": "1.4.0"},
         )
     )["fleet_deploy_lanes"]
     assert r.severity is Severity.UNKNOWN
@@ -164,75 +211,156 @@ def test_deploy_lanes_errored_agent_check_is_no_data_not_a_version() -> None:
 def test_deploy_lanes_no_lane_has_data_is_unknown() -> None:
     r = _run(
         _ctx(
-            machines={"elitebook": _agent(None)},
-            daemon_host={"coord_serve_version": None, "cli_venv_version": None},
+            machines={"elitebook": _machine(_agent(None))},
+            daemon_host={"coord_serve_version": None},
         )
     )["fleet_deploy_lanes"]
     assert r.severity is Severity.UNKNOWN
     assert "no lane has a resolvable version" in r.headroom
+    # No machine reported a CLI venv at all — the lane is a single "no data"
+    # entry, not silently dropped from the report.
+    assert r.values["lanes"]["~/.coord-cli-venv"] is None
+
+
+def test_deploy_lanes_cli_venv_present_on_a_non_daemon_machine_is_read() -> None:
+    """#1806 acceptance: the venv lives on exactly one non-daemon machine —
+    the lane must resolve from there, named by that machine."""
+    r = _run(
+        _ctx(
+            machines={
+                "elitebook": _machine(_agent("1.4.0"), _cli_venv("1.4.0")),
+                "dellserver": _machine(_agent("1.4.0")),
+            },
+            daemon_host={"coord_serve_version": "1.4.0"},
+        )
+    )["fleet_deploy_lanes"]
+    assert r.severity is Severity.OK
+    assert r.values["lanes"]["~/.coord-cli-venv (elitebook)"] == "1.4.0"
+    assert "~/.coord-cli-venv (dellserver)" not in r.values["lanes"]
+
+
+def test_deploy_lanes_ignores_a_stray_daemon_host_cli_venv_version_key() -> None:
+    """#1806 regression: even if something still writes a stray
+    `daemon_host["cli_venv_version"]` (an old daemon build, a leftover test
+    fixture), the lane must come from the machine-scope `cli_venv` check,
+    never from that key."""
+    r = _run(
+        _ctx(
+            machines={"elitebook": _machine(_agent("1.4.0"), _cli_venv("9.9.9"))},
+            daemon_host={"coord_serve_version": "1.4.0", "cli_venv_version": "0.0.1"},
+        )
+    )["fleet_deploy_lanes"]
+    assert r.values["lanes"]["~/.coord-cli-venv (elitebook)"] == "9.9.9"
+    assert "0.0.1" not in r.values["lanes"].values()
 
 
 # ── fleet_tui_binary ─────────────────────────────────────────────────────────
+#
+# #1806: same story as the CLI-venv lane above — every fact rides a
+# `machines` entry's own `tui_binary` check now, never `daemon_host`.
 
 
 def test_tui_binary_newer_than_source_is_ok() -> None:
     r = _run(
         _ctx(
-            daemon_host={
-                "tui_binary_path": "/home/x/.local/bin/coord-tui",
-                "tui_binary_mtime": NOW,
-                "tui_source_mtime": NOW - 3600,
+            machines={
+                "elitebook": _machine(_tui(binary_mtime=NOW, source_mtime=NOW - 3600)),
             }
         )
     )["fleet_tui_binary"]
     assert r.severity is Severity.OK
     assert "up to date" in r.headroom
+    assert "elitebook" in r.headroom
 
 
 def test_tui_binary_older_than_source_is_warn_with_the_staleness_in_hours() -> None:
     r = _run(
         _ctx(
-            daemon_host={
-                "tui_binary_path": "/home/x/.local/bin/coord-tui",
-                "tui_binary_mtime": NOW - 9000,  # 2.5h before the newest source
-                "tui_source_mtime": NOW,
+            machines={
+                "elitebook": _machine(
+                    _tui(binary_mtime=NOW - 9000, source_mtime=NOW)  # 2.5h stale
+                ),
             }
         )
     )["fleet_tui_binary"]
     assert r.severity is Severity.WARN
     assert "2.5h older" in r.headroom
+    assert "elitebook" in r.headroom
     assert "rebuild" in r.detail
+    assert "elitebook" in r.detail
 
 
 def test_tui_binary_exactly_equal_mtimes_is_ok_not_warn() -> None:
     """Boundary: `cp` preserving mtime must not read as stale forever."""
     r = _run(
-        _ctx(
-            daemon_host={
-                "tui_binary_path": "/x/coord-tui",
-                "tui_binary_mtime": NOW,
-                "tui_source_mtime": NOW,
-            }
-        )
+        _ctx(machines={"elitebook": _machine(_tui(binary_mtime=NOW, source_mtime=NOW))})
     )["fleet_tui_binary"]
     assert r.severity is Severity.OK
 
 
-def test_tui_binary_missing_is_unknown_and_says_how_to_build_it() -> None:
+def test_tui_binary_no_machine_reports_one_is_unknown_and_says_how_to_build_it() -> None:
     r = _run(
-        _ctx(daemon_host={"tui_binary_path": "/home/x/.local/bin/coord-tui"})
+        _ctx(machines={"elitebook": _machine(_tui(present=False))})
     )["fleet_tui_binary"]
     assert r.severity is Severity.UNKNOWN
-    assert "no binary at /home/x/.local/bin/coord-tui" in r.headroom
+    assert "no machine reports a coord-tui binary" in r.headroom
     assert "cargo build" in r.detail
 
 
 def test_tui_binary_present_but_no_source_tree_is_ok_not_a_fabricated_verdict() -> None:
     r = _run(
-        _ctx(daemon_host={"tui_binary_path": "/x/coord-tui", "tui_binary_mtime": NOW})
+        _ctx(machines={"elitebook": _machine(_tui(binary_mtime=NOW))})
     )["fleet_tui_binary"]
     assert r.severity is Severity.OK
-    assert "not found to compare" in r.headroom
+    assert "no source tree found to compare" in r.headroom
+
+
+def test_tui_binary_operator_fresh_and_non_operator_absent_is_ok_names_no_machine() -> None:
+    """#1806 acceptance, half one: the operator's (elitebook) binary is
+    fresh; a non-operator machine (dellserver, the daemon host in the
+    issue's live example) reports no coord-tui at all. Absence on a machine
+    that was never meant to have this lane must not taint the verdict."""
+    r = _run(
+        _ctx(
+            machines={
+                "elitebook": _machine(_tui(binary_mtime=NOW, source_mtime=NOW - 3600)),
+                "dellserver": _machine(_tui(present=False)),
+            }
+        )
+    )["fleet_tui_binary"]
+    assert r.severity is Severity.OK
+    assert "dellserver" not in r.headroom
+    assert "dellserver" not in r.values.get("stale", [])
+
+
+def test_tui_binary_operator_stale_and_non_operator_fresh_is_warn_naming_the_operator() -> None:
+    """#1806 acceptance, half two: flip it — the machine that's actually
+    stale (elitebook, the operator) must be the one named in WARN, even
+    though another machine (dellserver) reports a perfectly fresh binary.
+    This is the exact symmetric failure the issue calls out: the daemon-host
+    -only version of this check could never see elitebook go stale."""
+    r = _run(
+        _ctx(
+            machines={
+                "elitebook": _machine(
+                    _tui(binary_mtime=NOW - 9000, source_mtime=NOW)  # stale
+                ),
+                "dellserver": _machine(_tui(binary_mtime=NOW, source_mtime=NOW - 3600)),
+            }
+        )
+    )["fleet_tui_binary"]
+    assert r.severity is Severity.WARN
+    assert "elitebook" in r.headroom
+    assert "dellserver" not in r.headroom
+    assert r.values["stale"] == ["elitebook"]
+
+
+def test_tui_binary_errored_machine_check_is_excluded_not_treated_as_present() -> None:
+    r = _run(
+        _ctx(machines={"elitebook": _machine(_tui(binary_mtime=NOW, errored=True))})
+    )["fleet_tui_binary"]
+    assert r.severity is Severity.UNKNOWN
+    assert "no machine reports a coord-tui binary" in r.headroom
 
 
 # ── fleet_board_latency ──────────────────────────────────────────────────────
@@ -352,127 +480,3 @@ def test_phantom_many_rows_samples_five_and_says_there_are_more() -> None:
     # consumer even though the human-facing detail samples five.
     assert len(r.values["assignment_ids"]) == 8
 
-
-# ── daemon-host fact gathering: the defaults that make the lanes live ─────────
-
-
-def test_tui_source_walk_finds_the_newest_rs_file(tmp_path: Path) -> None:
-    src = tmp_path / "tui" / "src"
-    (src / "widgets").mkdir(parents=True)
-    old = src / "main.rs"
-    old.write_text("fn main() {}")
-    os.utime(old, (NOW - 10_000, NOW - 10_000))
-    new = src / "widgets" / "board.rs"
-    new.write_text("pub struct Board;")
-    os.utime(new, (NOW, NOW))
-
-    assert _newest_rust_source_mtime(src) == pytest.approx(NOW)
-
-
-def test_tui_source_walk_skips_target_and_hidden_dirs(tmp_path: Path) -> None:
-    """A `tui_source_dir` pointed at a crate root must not let a multi-GB
-    `target/` dominate the mtime (or the walk's cost)."""
-    src = tmp_path / "tui"
-    src.mkdir()
-    real = src / "lib.rs"
-    real.write_text("")
-    os.utime(real, (NOW - 10_000, NOW - 10_000))
-    for junk_dir in ("target", ".git"):
-        d = src / junk_dir / "deep"
-        d.mkdir(parents=True)
-        junk = d / "generated.rs"
-        junk.write_text("")
-        os.utime(junk, (NOW, NOW))
-
-    assert _newest_rust_source_mtime(src) == pytest.approx(NOW - 10_000)
-
-
-def test_tui_source_walk_on_a_missing_or_empty_dir_is_none(tmp_path: Path) -> None:
-    assert _newest_rust_source_mtime(tmp_path / "nope") is None
-    (tmp_path / "empty").mkdir()
-    assert _newest_rust_source_mtime(tmp_path / "empty") is None
-
-
-def test_default_tui_source_dir_comes_from_a_configured_checkout(
-    tmp_path: Path, monkeypatch
-) -> None:
-    checkout = tmp_path / "claude-coordinator"
-    (checkout / "tui" / "src").mkdir(parents=True)
-    fake_checkout = SimpleNamespace(name="coordinator", path=checkout)
-    monkeypatch.setattr(
-        "coord.health.context.local_checkouts", lambda cfg: (fake_checkout,)
-    )
-    assert _default_tui_source_dir(object()) == checkout / "tui" / "src"
-
-
-def test_default_tui_source_dir_is_none_when_no_checkout_has_one(monkeypatch) -> None:
-    monkeypatch.setattr("coord.health.context.local_checkouts", lambda cfg: ())
-    assert _default_tui_source_dir(object()) is None
-
-
-def test_default_tui_source_dir_survives_a_broken_config(monkeypatch) -> None:
-    """A fact gatherer that raises would take the whole refresh tick down."""
-    def _boom(cfg):
-        raise RuntimeError("bad config")
-
-    monkeypatch.setattr("coord.health.context.local_checkouts", _boom)
-    assert _default_tui_source_dir(object()) is None
-
-
-def test_daemon_host_facts_resolve_the_tui_lane_with_no_config_at_all(
-    tmp_path: Path, monkeypatch
-) -> None:
-    """Regression: with no `health:` block, the tui lane must still resolve a
-    concrete path (the README's install location) rather than reporting
-    "not configured" forever."""
-    home = tmp_path / "home"
-    binary = home / ".local" / "bin" / "coord-tui"
-    binary.parent.mkdir(parents=True)
-    binary.write_text("#!/bin/sh\n")
-    os.utime(binary, (NOW - 100, NOW - 100))
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
-    monkeypatch.setattr("coord.health.context.local_checkouts", lambda cfg: ())
-
-    facts = FleetHealthRefresher._daemon_host_facts(
-        SimpleNamespace(health=HealthConfig(), machines=(), repos=())
-    )
-    assert facts["tui_binary_path"] == str(binary)
-    assert facts["tui_binary_mtime"] == pytest.approx(NOW - 100)
-
-    # ...and that fact is enough for the probe to reach a real verdict.
-    r = _run(_ctx(daemon_host=facts))["fleet_tui_binary"]
-    assert r.severity is not Severity.UNKNOWN
-
-
-def test_daemon_host_facts_honour_the_configured_overrides(
-    tmp_path: Path, monkeypatch
-) -> None:
-    binary = tmp_path / "custom" / "coord-tui"
-    binary.parent.mkdir(parents=True)
-    binary.write_text("")
-    os.utime(binary, (NOW - 5000, NOW - 5000))
-    src = tmp_path / "elsewhere" / "src"
-    src.mkdir(parents=True)
-    rs = src / "main.rs"
-    rs.write_text("")
-    os.utime(rs, (NOW, NOW))
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "home"))
-
-    cfg = SimpleNamespace(
-        health=HealthConfig(
-            tui_binary_path=str(binary),
-            tui_source_dir=str(src),
-            cli_venv_python=str(tmp_path / "no-such-venv" / "bin" / "python3"),
-        ),
-        machines=(),
-        repos=(),
-    )
-    facts = FleetHealthRefresher._daemon_host_facts(cfg)
-    assert facts["tui_binary_path"] == str(binary)
-    assert facts["tui_binary_mtime"] == pytest.approx(NOW - 5000)
-    assert facts["tui_source_mtime"] == pytest.approx(NOW)
-    # An unreachable CLI venv is "no data", not a crash and not a version.
-    assert facts["cli_venv_version"] is None
-
-    r = _run(_ctx(daemon_host=facts))["fleet_tui_binary"]
-    assert r.severity is Severity.WARN  # source is newer than the binary
