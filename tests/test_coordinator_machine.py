@@ -112,9 +112,10 @@ def test_add_without_repo_paths_is_not_dispatchable_today_script_regression(
 ) -> None:
     """Named regression proof: the pre-#1799 shape (no `repo_paths` at all,
     exactly what today's `cmd_add` emitted before this fix) fails the same
-    `repo_path()` check — i.e. this test would have failed against
-    yesterday's script and demonstrates why the fix in the test above
-    matters."""
+    `repo_path()` check. This is a static demonstration of the old shape —
+    it hand-builds the pre-fix YAML rather than invoking `cmd_add` against a
+    prior revision of the script — not a true test-over-history regression,
+    but it pins down why the fix in the test above matters."""
     cfg = tmp_path / "coordinator.yml"
     cfg.write_text(BASE_CONFIG)
     out = tmp_path / "out.yml"

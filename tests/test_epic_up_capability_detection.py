@@ -95,6 +95,73 @@ ssh() {{
 """
 
 
+def _capturing_ssh() -> str:
+    """A bash `ssh` stand-in that records its full invocation instead of
+    answering it, so the call SHAPE itself (user, host, remote command) can
+    be asserted on. The original `_fake_ssh` above matches on `*"command -v
+    opencode"*` in `"$*"` regardless of what user/host string preceded it,
+    so it would pass even for the pre-fix, wrongly-formed invocation
+    (`ssh <machine> ...` with no user) -- that gap is exactly what the #1799
+    review caught. These tests close it by inspecting the real arguments."""
+    return """
+ssh() {
+    printf 'SSH_ARGS:%s\\n' "$*"
+    return 0
+}
+"""
+
+
+def test_detect_opencode_capability_connects_as_the_given_admin_user() -> None:
+    """Must SSH as an explicit admin user, not the bare hostname -- a bare
+    `ssh <machine> ...` (the pre-fix shape) authenticates as the operator's
+    own local OS username, which has no account on the VM at all."""
+    result = _run(
+        _capturing_ssh() + "detect_opencode_capability azure-epic1799 azureuser"
+    )
+    assert result.returncode == 0, result.stderr
+    line = next(l for l in result.stdout.splitlines() if l.startswith("SSH_ARGS:"))
+    assert "azureuser@azure-epic1799" in line
+
+
+def test_detect_opencode_capability_defaults_admin_user_to_azureuser() -> None:
+    """With no explicit admin user passed, falls back to the Bicep
+    template's default adminUsername (azureuser) rather than connecting
+    with no user at all."""
+    result = _run(_capturing_ssh() + "detect_opencode_capability azure-epic1799")
+    assert result.returncode == 0, result.stderr
+    line = next(l for l in result.stdout.splitlines() if l.startswith("SSH_ARGS:"))
+    assert "azureuser@azure-epic1799" in line
+
+
+def test_detect_opencode_capability_checks_path_as_coord_via_login_shell() -> None:
+    """Even once connected as the admin user, opencode lives only on the
+    `coord` user's PATH (~coord/.local/bin, provision-worker.sh). The remote
+    command must sudo into a `coord` LOGIN shell (`bash -lc`), mirroring
+    provision-worker.sh's own `as_coord` helper -- checking `command -v
+    opencode` as the admin user itself would never see it."""
+    result = _run(
+        _capturing_ssh() + "detect_opencode_capability azure-epic1799 azureuser"
+    )
+    assert result.returncode == 0, result.stderr
+    line = next(l for l in result.stdout.splitlines() if l.startswith("SSH_ARGS:"))
+    assert "sudo -n -u coord -H bash -lc" in line
+    assert "command -v opencode" in line
+
+
+def test_detect_opencode_capability_accepts_a_brand_new_hosts_key() -> None:
+    """The very first SSH to a freshly-provisioned host has no known_hosts
+    entry -- the earlier /health poll (step 2/5) proves reachability over
+    HTTP, not SSH. Without StrictHostKeyChecking=accept-new, BatchMode's
+    inability to prompt means the connection fails closed on host-key
+    verification before authentication is even attempted."""
+    result = _run(
+        _capturing_ssh() + "detect_opencode_capability azure-epic1799 azureuser"
+    )
+    assert result.returncode == 0, result.stderr
+    line = next(l for l in result.stdout.splitlines() if l.startswith("SSH_ARGS:"))
+    assert "StrictHostKeyChecking=accept-new" in line
+
+
 def test_detect_opencode_capability_true_when_binary_present() -> None:
     result = _run(
         _fake_ssh(reachable=True, has_opencode=True)
@@ -166,7 +233,7 @@ def test_capability_detection_runs_before_registration() -> None:
     $CAPABILITIES — otherwise the detected capability never makes it into
     the generated entry."""
     text = SCRIPT.read_text()
-    detect_call_idx = text.index('if detect_opencode_capability "$MACHINE"; then')
+    detect_call_idx = text.index('if detect_opencode_capability "$MACHINE" "$ADMIN_USER"; then')
     register_idx = text.index('log "3/5  register in coordinator.yml')
     assert detect_call_idx < register_idx
 
