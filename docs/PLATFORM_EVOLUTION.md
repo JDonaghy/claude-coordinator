@@ -120,6 +120,12 @@ context digest → resumes (the existing `--fix-of`/`--rework-of`/reattach-to-br
 1. **Postgres behind the existing daemon, local on dellserver.** Migrate SQLite→PG, *no topology change*.
    Add `version`/`updated_at` columns; **no concurrency logic yet**. Safety net = existing suite + black-box
    tests. Budget for SQLite-isms (bool-as-int #546/#632, upserts, dialect). *(low-regret — do first)*
+   Sequenced as #827 → #828 → #829 under **#1825**, which also adds the phase before it (#1822, back the
+   50MB `coord.db` up — it has no automated backup today, and that risk does not depend on this migration
+   happening), a prerequisite it assumes (#1823 — `dao.py`'s write side is `NotImplementedError` stubs, so
+   "behind the DAO" describes ~6% of the write surface and the seam layer is still an open decision), and
+   the phase after it (#1824 — `coordinator.yml` is still a *file* on the daemon host, so Postgres alone
+   leaves dellserver unreplaceable).
 2. **Customer-loop spike on the now-Postgres stack.** Project/Feature model over issues; intake chat →
    milestones (reuse the refinement chat / brain, #319); design the **up-mapping status vocabulary**. Prove
    the bridge with you as both customer and engineer. **Validates the product hypothesis on cheap infra —
@@ -129,13 +135,50 @@ context digest → resumes (the existing `--fix-of`/`--rework-of`/reattach-to-br
    mutations; single merge-driver). *(the real architectural work)*
 4. **Multi-engineer:** runner enrollment, RBAC (customer/engineer/admin + ownership), AWOL handoff
    (lease expiry + auto-fetch).
-5. **Cloud hosting** (Azure PG + API; Entra managed identity → secrets out of config; private endpoint) +
-   **customer web GUI** as a first-class client.
+5. **Cloud hosting** (Azure PG + API; Entra managed identity → secrets out of config; see the networking
+   note below) + **customer web GUI** as a first-class client.
 6. **Company-deployable:** config-driven IdP (Entra External ID / arbitrary OIDC), `IForgeProvider` for
    GitLab/Bitbucket, install/upgrade story.
 
 Policy discipline throughout: **commit narrow in policy, stay general in the data model + seams** — every
 later relaxation (milestone-claiming, open pool, self-host) becomes a config/policy change, not a rewrite.
+
+### Phase-5 networking & cost — what the Azure step actually buys and costs
+
+Costed 2026-08-04 (East US pay-as-you-go, approximate — re-check the pricing calculator before committing).
+
+**A private endpoint is an option, not a requirement.** Flexible Server **VNet integration** (delegated
+subnet + private DNS zone) costs nothing and keeps the DB off the public internet; **Private Link** is the
+newer alternative at ~$7.30/mo. Earlier drafts of Phase 5 named "private endpoint" as a given — it isn't.
+
+**The unavoidable cost is reaching it, not hosting it.** The daemon is on-prem, so a VNet-integrated
+Postgres is not on the tailnet. Bridging needs a **standing Tailscale subnet router in Azure** (~$8/mo B1s)
+plus split-DNS. That router is what breaks the current *nothing standing is billed* posture — and it is a
+new single point of failure the entire board depends on, including ephemeral workers reaching the DB
+through it. Weigh that against Phase 1 running at $0.
+
+| | Standing $/mo |
+|---|---|
+| Today (SQLite on dellserver) | ~$0 (+ ~$0.35/epic) |
+| Phase 1 + continuous blob backup (#1822) | ~$0.10 |
+| Phase 1 with Postgres in a container on dellserver | ~$0.20 |
+| Phase 5: Flexible Server B1ms + 32GB + tailnet subnet router | **~$24–26** |
+| …with Private Link instead of VNet integration | +$7.30 |
+| …with zone-redundant HA | +$12–15 (doubles compute) |
+
+**Azure Container Apps was evaluated for the runner/worker role and rejected.** Consumption caps a replica
+at 4 vCPU / 8 GiB — half the CPU and a quarter the RAM of today's `D8as_v7` worker — at $0.43/hr versus
+~$0.35–0.40/hr for the VM; going bigger requires a *dedicated* workload profile, which is billed like a VM
+and does not scale to zero at all. It also conflicts with the `~/src/<repo>` worktree-base invariant and the
+golden image's warm caches (Azure Files for git + `cargo build` would not fit the ~120min budget), needs
+userspace Tailscale for *inbound* 7433, and would scale a worker away mid-run: `POST /assign` returns
+immediately while `claude -p` runs 30–120 minutes with no inbound HTTP, which an HTTP scale rule reads as
+idle. The ephemeral VM design (`epic-up.sh` / `epic-down.sh`, ~$0.35/epic, nothing standing —
+[`EPHEMERAL_WORKERS.md`](EPHEMERAL_WORKERS.md)) already *is* the scale-to-zero answer.
+
+**Phase 3 changes this calculus and the rejection should be revisited there.** The objection is against
+today's *push* model; inverting dispatch to pull/lease makes a runner generate its own traffic, which is
+exactly what a request-shaped platform needs. Re-cost ACA when the runner task exists, not before.
 
 ## Where the customer portal sits
 
