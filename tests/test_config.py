@@ -151,6 +151,132 @@ def test_machine_max_workers_rejects_zero_or_negative(tmp_path: Path) -> None:
         load(p)
 
 
+# ── #1862: per-machine quiet hours ──────────────────────────────────────────
+
+
+def test_machine_quiet_hours_parsed(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: elitebook\n    host: h\n    repos: [api]\n"
+        "    quiet_hours:\n"
+        "      start: \"23:00\"\n"
+        "      end: \"08:00\"\n"
+        "      tz: America/Chicago\n"
+        "  - name: server\n    host: h2\n    repos: [api]\n"
+    )
+    cfg = load(p)
+    by_name = {m.name: m for m in cfg.machines}
+    qh = by_name["elitebook"].quiet_hours
+    assert qh is not None
+    assert (qh.start.hour, qh.start.minute) == (23, 0)
+    assert (qh.end.hour, qh.end.minute) == (8, 0)
+    assert qh.tz == "America/Chicago"
+    # No `quiet_hours:` block at all → None, unchanged pre-#1862 behaviour.
+    assert by_name["server"].quiet_hours is None
+
+
+def test_machine_quiet_hours_requires_tz(tmp_path: Path) -> None:
+    """#1862: tz must never default silently — a naive comparison against
+    the daemon's own UTC clock fires at the wrong wall-clock hour for any
+    non-UTC operator."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+        "    quiet_hours:\n"
+        "      start: \"23:00\"\n"
+        "      end: \"08:00\"\n"
+    )
+    with pytest.raises(ConfigError, match="tz is required"):
+        load(p)
+
+
+def test_machine_quiet_hours_rejects_unknown_tz(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+        "    quiet_hours:\n"
+        "      start: \"23:00\"\n"
+        "      end: \"08:00\"\n"
+        "      tz: Not/AZone\n"
+    )
+    with pytest.raises(ConfigError, match="not a known IANA zone"):
+        load(p)
+
+
+@pytest.mark.parametrize("bad", ["25:00", "9:00", "09:60", "abc", "9am"])
+def test_machine_quiet_hours_rejects_malformed_time(tmp_path: Path, bad: str) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+        "    quiet_hours:\n"
+        f"      start: \"{bad}\"\n"
+        "      end: \"08:00\"\n"
+        "      tz: UTC\n"
+    )
+    with pytest.raises(ConfigError, match="HH:MM"):
+        load(p)
+
+
+def test_machine_quiet_hours_rejects_equal_start_end(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+        "    quiet_hours:\n"
+        "      start: \"08:00\"\n"
+        "      end: \"08:00\"\n"
+        "      tz: UTC\n"
+    )
+    with pytest.raises(ConfigError, match="start and end must differ"):
+        load(p)
+
+
+def test_machine_quiet_hours_rejects_non_mapping(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+        "    quiet_hours: \"nope\"\n"
+    )
+    with pytest.raises(ConfigError, match="quiet_hours.*must be a mapping"):
+        load(p)
+
+
+def test_machine_quiet_hours_accepts_non_wrapping_window(tmp_path: Path) -> None:
+    """13:00 -> 14:00: start < end, same-day window."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+        "    quiet_hours:\n"
+        "      start: \"13:00\"\n"
+        "      end: \"14:00\"\n"
+        "      tz: UTC\n"
+    )
+    cfg = load(p)
+    qh = cfg.machines[0].quiet_hours
+    assert qh is not None
+    assert (qh.start.hour, qh.end.hour) == (13, 14)
+
+
 def test_unknown_dependency(tmp_path: Path) -> None:
     p = tmp_path / "coordinator.yml"
     p.write_text(

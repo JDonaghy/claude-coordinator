@@ -177,9 +177,14 @@ def test_unpause_routes_to_the_daemon(monkeypatch) -> None:
     _remote(monkeypatch)
     monkeypatch.setattr(
         coord_client, "post_pause",
-        lambda svc, machine, action, **k: {"paused": [], "changed": True},
+        lambda svc, machine, action, **k: {
+            "paused": [], "changed": True, "kind": "resumed",
+            "quiet_until": None, "tz": None,
+        },
     )
-    assert machine_pause.unpause("dellserver") is True
+    outcome = machine_pause.unpause("dellserver")
+    assert outcome.changed is True
+    assert outcome.kind == "resumed"
 
 
 def test_pause_fails_loudly_when_daemon_unreachable(monkeypatch) -> None:

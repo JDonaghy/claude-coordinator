@@ -854,9 +854,11 @@ def assign(
 
     # Refuse direct assignment to a paused machine — `coord pause` exists
     # so the user can explicitly steer work away.  If they meant to dispatch
-    # anyway they should `coord unpause` first.
+    # anyway they should `coord unpause` first.  #1862: also refuses inside
+    # a machine's `quiet_hours` window, same message — `coord unpause` is
+    # the fix there too (it grants a quiet-hours override).
     from coord.machine_pause import is_paused as _is_paused
-    if _is_paused(machine):
+    if _is_paused(machine, cfg.machines):
         click.echo(
             f"error: machine {machine!r} is paused; run `coord unpause {machine}` first",
             err=True,

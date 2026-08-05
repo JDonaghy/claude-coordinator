@@ -311,7 +311,7 @@ Verdict-relay helpers: `coord report-result`, `coord set-review-findings`, `coor
 | `coord web [--host H] [--port P]` | Web dashboard + phone PWA (default 7434) |
 | `coord serve [--host H] [--port P]` | Control-center board daemon (default 7435) |
 | `coord sync [--quiet]` | Sync open issues from GitHub into the local cache |
-| `coord pause <machine>` / `coord unpause <machine>` | Stop / resume routing to a machine |
+| `coord pause <machine>` / `coord unpause <machine>` | Stop / resume routing to a machine (a machine can also declare a recurring `quiet_hours:` window in `coordinator.yml` — see below; `coord unpause` during that window grants a one-window override) |
 | `coord track\|untrack\|backlog <repo> <issue>` | Move an issue into / out of the Pipeline |
 | `coord version` | Print the version |
 
@@ -398,6 +398,10 @@ machines:
     repos: [shared-lib]
     repo_paths:
       shared-lib: ~/src/shared-lib
+    quiet_hours:                 # recurring daily no-new-dispatch window (#1862)
+      start: "23:00"             # 24h "HH:MM", in `tz` below
+      end: "08:00"                #   (start > end wraps midnight)
+      tz: America/Chicago        # REQUIRED — never defaults to the daemon's UTC clock
 
 concurrency:
   max_workers: 2

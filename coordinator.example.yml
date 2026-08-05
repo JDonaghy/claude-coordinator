@@ -70,6 +70,19 @@ machines:
       vimcode: ~/src/vimcode
       quadraui: ~/src/quadraui
       claude-coordinator: ~/src/claude-coordinator
+    # #1862: a laptop shouldn't need its operator to remember `coord pause`
+    # every night. `quiet_hours` is a RECURRING DAILY window — no new
+    # dispatch inside it, unchanged behaviour outside it. It does NOT
+    # cancel a task still running when the window opens (same as `coord
+    # pause` — see coord/machine_pause.py). `tz` is REQUIRED (never
+    # defaults to the daemon's own UTC clock) since `coord serve` typically
+    # runs on a different machine/timezone than this one.
+    # `coord unpause elitebook` during the window grants a one-night
+    # override instead of silently no-oping or re-pausing on the next poll.
+    quiet_hours:
+      start: "23:00"
+      end: "08:00"
+      tz: America/Chicago
 
   # Server — Dell server, no display (no GTK builds)
   - name: dellserver

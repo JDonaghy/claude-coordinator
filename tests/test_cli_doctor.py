@@ -279,3 +279,101 @@ def test_doctor_does_not_probe_undeclared_provider_capability(
     result = _run_doctor(valid_config_path, monkeypatch, statuses)
     assert result.exit_code == 0, result.output
     assert "opencode" not in result.output
+
+
+# ── #1862: quiet-hours starvation warning ───────────────────────────────────
+
+QUIET_ONLY_GPU_CONFIG = """
+repos:
+  - name: api
+    github: acme/api
+machines:
+  - name: quiet1
+    host: quiet1.tailnet
+    capabilities: ["gpu"]
+    repos: [api]
+    quiet_hours:
+      start: "23:00"
+      end: "08:00"
+      tz: UTC
+  - name: server
+    host: server.tailnet
+    capabilities: ["python"]
+    repos: [api]
+"""
+
+QUIET_BUT_COVERED_CONFIG = """
+repos:
+  - name: api
+    github: acme/api
+machines:
+  - name: quiet1
+    host: quiet1.tailnet
+    capabilities: ["gpu"]
+    repos: [api]
+    quiet_hours:
+      start: "23:00"
+      end: "08:00"
+      tz: UTC
+  - name: awake1
+    host: awake1.tailnet
+    capabilities: ["gpu"]
+    repos: [api]
+"""
+
+
+@pytest.fixture
+def quiet_only_gpu_config_path(tmp_path: Path) -> Path:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(QUIET_ONLY_GPU_CONFIG)
+    return p
+
+
+@pytest.fixture
+def quiet_but_covered_config_path(tmp_path: Path) -> Path:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(QUIET_BUT_COVERED_CONFIG)
+    return p
+
+
+def test_doctor_warns_when_only_quiet_hours_machines_offer_a_capability(
+    quiet_only_gpu_config_path, monkeypatch,
+) -> None:
+    """#1862 "Starvation" section: a quiet window that removes the only
+    machine with a capability would make matching work silently
+    unroutable (dispatch_smoke's #1678 failure shape) — `coord doctor`
+    must at least log it."""
+    from coord.config import load
+
+    cfg = load(quiet_only_gpu_config_path)
+    statuses = [
+        MachineStatus(
+            machine=m, state=ONLINE,
+            health=_health({"git": _ok_probe(), "gh": _ok_probe()}, m),
+        )
+        for m in cfg.machines
+    ]
+    result = _run_doctor(quiet_only_gpu_config_path, monkeypatch, statuses)
+    assert result.exit_code == 1, result.output
+    assert "capability 'gpu' is only ever offered by machine(s) with quiet_hours" in result.output
+    assert "quiet1" in result.output
+
+
+def test_doctor_does_not_warn_when_a_capability_has_an_always_awake_machine(
+    quiet_but_covered_config_path, monkeypatch,
+) -> None:
+    """Same capability, but a second machine offers it with no
+    `quiet_hours:` block — always coverable, no warning."""
+    from coord.config import load
+
+    cfg = load(quiet_but_covered_config_path)
+    statuses = [
+        MachineStatus(
+            machine=m, state=ONLINE,
+            health=_health({"git": _ok_probe(), "gh": _ok_probe()}, m),
+        )
+        for m in cfg.machines
+    ]
+    result = _run_doctor(quiet_but_covered_config_path, monkeypatch, statuses)
+    assert result.exit_code == 0, result.output
+    assert "only ever offered by machine(s) with quiet_hours" not in result.output

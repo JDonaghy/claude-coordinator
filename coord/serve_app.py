@@ -5380,9 +5380,18 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         # which is the one place that store is authoritative. This is what
         # both `coord status`/`coord pause` on a thin client AND the daemon's
         # own tick loop (`_tick_loop` → reconcile/dispatch) ultimately read.
+        #
+        # #1862: passing `config.machines` folds each machine's `quiet_hours`
+        # window into the response — this is what makes the TUI's paused
+        # indicator (`fetch_paused_machines()`, a plain HTTP GET here) reflect
+        # quiet hours with zero Rust changes: it already just checks set
+        # membership. `_refresh_config()` first so a hand-edited
+        # coordinator.yml's quiet_hours takes effect on the very next poll
+        # rather than waiting for a daemon restart.
+        _refresh_config()
         from coord.machine_pause import local_paused_set  # noqa: PLC0415
 
-        return JSONResponse({"paused": sorted(local_paused_set())})
+        return JSONResponse({"paused": sorted(local_paused_set(config.machines))})
 
     async def post_pause(request: Request) -> Response:
         # #1563: pause/unpause a machine on the daemon's local-only store —
@@ -5391,7 +5400,8 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         # local-only helpers rather than coord.machine_pause.pause()/
         # unpause() (which would re-route back out over HTTP if this daemon
         # process happened to have its own board_service configured).
-        from coord.machine_pause import local_pause, local_unpause, local_paused_set  # noqa: PLC0415
+        _refresh_config()
+        from coord.machine_pause import local_pause, local_paused_set, local_unpause_effective  # noqa: PLC0415
 
         body = await _read_json(request)
         if body is None:
@@ -5402,11 +5412,26 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             return JSONResponse({"error": "missing field: machine"}, status_code=400)
         if action == "pause":
             changed = local_pause(machine)
+            return JSONResponse(
+                {"paused": sorted(local_paused_set(config.machines)), "changed": changed}
+            )
         elif action == "unpause":
-            changed = local_unpause(machine)
+            # #1862: explicit-pause removal vs quiet-hours override vs true
+            # no-op — see coord.machine_pause.UnpauseOutcome. Without this,
+            # `coord unpause <machine>` during a quiet window would report
+            # success and change nothing (#1563's exact failure class).
+            outcome = local_unpause_effective(machine, config.machines)
+            return JSONResponse(
+                {
+                    "paused": sorted(local_paused_set(config.machines)),
+                    "changed": outcome.changed,
+                    "kind": outcome.kind,
+                    "quiet_until": outcome.quiet_until,
+                    "tz": outcome.tz,
+                }
+            )
         else:
             return JSONResponse({"error": f"unknown action: {action!r}"}, status_code=400)
-        return JSONResponse({"paused": sorted(local_paused_set()), "changed": changed})
 
     async def get_issue_comments(request: Request) -> Response:
         # #873: read an issue's captured comments (oldest-first) from the

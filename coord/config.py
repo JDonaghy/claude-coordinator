@@ -6,12 +6,14 @@ import fnmatch
 import os
 import re
 from dataclasses import dataclass, field, fields
+from datetime import time
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 
-from coord.models import Machine, Repo, WorkerPermissionsConfig
+from coord.models import Machine, QuietHours, Repo, WorkerPermissionsConfig
 
 
 DEFAULT_CONFIG_PATH = Path("coordinator.yml")
@@ -1582,6 +1584,62 @@ def _parse_worker_permissions(raw: Any, repo_index: int) -> WorkerPermissionsCon
     return WorkerPermissionsConfig(allow=allow, deny=deny)
 
 
+# #1862: 24h "HH:MM" — the only shape `quiet_hours.start`/`.end` accept.
+_HHMM_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+
+
+def _parse_hhmm(raw: Any, *, field_path: str) -> time:
+    if not isinstance(raw, str):
+        raise ConfigError(
+            f"{field_path} must be a 24h 'HH:MM' string, got {type(raw).__name__}"
+        )
+    m = _HHMM_RE.match(raw)
+    if not m:
+        raise ConfigError(f"{field_path} must be 24h 'HH:MM' (e.g. '23:00'), got {raw!r}")
+    return time(int(m.group(1)), int(m.group(2)))
+
+
+def _parse_quiet_hours(raw: Any, *, machine_index: int, machine_name: str) -> QuietHours | None:
+    """Parse ``machines[i].quiet_hours`` (#1862). ``None`` input → ``None``
+    (no window — the default, unchanged-behaviour case).
+
+    ``tz`` is REQUIRED and validated against the IANA database: `coord
+    serve` runs on UTC, so a naive time-of-day compared against the
+    daemon's own clock would silently fire hours off from what a non-UTC
+    operator wrote — a quiet-hours feature that activates early is worse
+    than none, because it silently pulls the machine out of the fleet
+    during the working day. Fail loudly here rather than default quietly.
+    """
+    if raw is None:
+        return None
+    prefix = f"machines[{machine_index}] ({machine_name!r}).quiet_hours"
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{prefix} must be a mapping")
+
+    start = _parse_hhmm(raw.get("start"), field_path=f"{prefix}.start")
+    end = _parse_hhmm(raw.get("end"), field_path=f"{prefix}.end")
+
+    tz = raw.get("tz")
+    if not tz or not isinstance(tz, str):
+        raise ConfigError(
+            f"{prefix}.tz is required (IANA zone name, e.g. 'America/Chicago') — "
+            "quiet hours never default to the daemon's own UTC clock, since that "
+            "would silently fire at the wrong local hour"
+        )
+    try:
+        ZoneInfo(tz)
+    except (ZoneInfoNotFoundError, ValueError, OSError) as e:
+        raise ConfigError(f"{prefix}.tz {tz!r} is not a known IANA zone name: {e}") from e
+
+    if start == end:
+        raise ConfigError(
+            f"{prefix}: start and end must differ ('always quiet' is ambiguous — "
+            "use `coord pause` to take a machine out of rotation indefinitely instead)"
+        )
+
+    return QuietHours(start=start, end=end, tz=tz)
+
+
 def _parse_machines(raw: Any, repos: list[Repo]) -> list[Machine]:
     if raw is None:
         raise ConfigError("Config must define 'machines'")
@@ -1640,6 +1698,10 @@ def _parse_machines(raw: Any, repos: list[Repo]) -> list[Machine]:
             if machine_max_workers < 1:
                 raise ConfigError(f"machines[{i}].max_workers must be at least 1")
 
+        quiet_hours = _parse_quiet_hours(
+            entry.get("quiet_hours"), machine_index=i, machine_name=name,
+        )
+
         machines.append(
             Machine(
                 name=name,
@@ -1648,6 +1710,7 @@ def _parse_machines(raw: Any, repos: list[Repo]) -> list[Machine]:
                 repos=machine_repos,
                 repo_paths=repo_paths,
                 max_workers=machine_max_workers,
+                quiet_hours=quiet_hours,
             )
         )
     return machines

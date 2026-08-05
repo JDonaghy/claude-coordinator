@@ -171,7 +171,7 @@ def pick_test_author_machine(
     needed. Unlike smoke, there's no "different from the worker" axis here
     — there is no single worker machine to avoid, by design.
     """
-    paused = paused_set()
+    paused = paused_set(config.machines)
     for m in config.machines:
         if not m.can_work_on(repo_name):
             continue

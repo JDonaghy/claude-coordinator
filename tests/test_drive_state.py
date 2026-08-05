@@ -583,7 +583,7 @@ def test_pick_machine_skips_machines_that_do_not_host_the_repo():
 
 
 def test_pick_machine_skips_paused_machines(monkeypatch):
-    monkeypatch.setattr("coord.machine_pause.paused_set", lambda: {"paused"})
+    monkeypatch.setattr("coord.machine_pause.paused_set", lambda *a, **k: {"paused"})
     config = make_config(
         machines=[
             Machine(name="paused", host="paused", repos=[REPO]),
