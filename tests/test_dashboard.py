@@ -1457,6 +1457,53 @@ class TestCLI:
         assert result.exit_code == 0
         assert "7434" in result.output
 
+    def test_web_help_documents_dist_override(self) -> None:
+        """#1543: --dist / $COORD_WEB_DIST must be discoverable from --help --
+        it's the seam a build hook uses to serve merged main without
+        upgrading ~/.coord-venv."""
+        from click.testing import CliRunner
+        from coord.cli import main
+        runner = CliRunner()
+        result = runner.invoke(main, ["web", "--help"])
+        assert result.exit_code == 0
+        assert "--dist" in result.output
+        assert "COORD_WEB_DIST" in result.output
+
+    def test_web_dist_flag_passed_to_build_app(self, tmp_path: Path, coord_db) -> None:
+        """`coord web --dist PATH` must thread PATH through to
+        build_app(dist_path=...) rather than being accepted and ignored."""
+        from click.testing import CliRunner
+        from coord.cli import main
+
+        config_file = tmp_path / "coordinator.yml"
+        config_file.write_text(
+            "repos:\n"
+            "  - name: api\n"
+            "    github: acme/api\n"
+            "    default_branch: main\n"
+            "machines:\n"
+            "  - name: laptop\n"
+            "    host: laptop.tailnet\n"
+            "    repos: [api]\n"
+            "    repo_paths:\n"
+            "      api: /tmp/api\n"
+        )
+
+        captured = {}
+
+        def _fake_build_app(config, *, token=None, session_attacher=None, fixture=None, dist_path=None):
+            captured["dist_path"] = dist_path
+            raise SystemExit(0)  # bail out before uvicorn.run would block
+
+        runner = CliRunner()
+        with patch("coord.dashboard.server.build_app", _fake_build_app):
+            runner.invoke(
+                main,
+                ["web", "--config", str(config_file), "--dist", "/tmp/some-dist-dir"],
+                catch_exceptions=True,
+            )
+        assert captured.get("dist_path") == Path("/tmp/some-dist-dir")
+
 
 class TestSSEEvents:
     """Tests for /events SSE endpoint (issue #214)."""
@@ -1659,3 +1706,46 @@ class TestSPAServing:
         assert r.status_code == 200
         # The legacy dashboard always contains "coord dashboard" in its markup.
         assert "coord dashboard" in r.text
+
+
+class TestDistPathOverride:
+    """#1543: `build_app(dist_path=...)` serves the webapp from an explicit
+    directory instead of the bundled `coord/dashboard/webapp/dist` — the seam
+    `coord web --dist PATH` uses to serve a checkout a build hook keeps in
+    sync with merged main, without upgrading ~/.coord-venv."""
+
+    def _make_dist(self, tmp_path: Path, index_content: str = "<html><title>coord dist override</title></html>") -> Path:
+        dist = tmp_path / "custom-dist"
+        dist.mkdir()
+        (dist / "index.html").write_text(index_content)
+        return dist
+
+    def test_dist_path_overrides_bundled_webapp_dist(self, tmp_path: Path) -> None:
+        """dist_path is honored even when the bundled WEBAPP_DIST is absent."""
+        dist = self._make_dist(tmp_path)
+        # Deliberately do NOT patch WEBAPP_DIST — proves dist_path alone drives
+        # which directory is served, independent of the module-level default.
+        client = TestClient(build_app(_config(), dist_path=dist))
+        r = client.get("/")
+        assert r.status_code == 200
+        assert "coord dist override" in r.text
+
+    def test_dist_path_assets_served(self, tmp_path: Path) -> None:
+        dist = self._make_dist(tmp_path)
+        assets = dist / "assets"
+        assets.mkdir()
+        (assets / "index.abc123.js").write_text("// bundle")
+        client = TestClient(build_app(_config(), dist_path=dist))
+        r = client.get("/assets/index.abc123.js")
+        assert r.status_code == 200
+
+    def test_dist_path_none_keeps_default_webapp_dist_behavior(self, tmp_path: Path) -> None:
+        """Omitting dist_path (the CLI default) still reads the patched module
+        global -- guards against a regression that captures WEBAPP_DIST as a
+        stale default-arg value instead of re-reading it per call."""
+        dist = self._make_dist(tmp_path, "<html><title>coord module default</title></html>")
+        with patch("coord.dashboard.server.WEBAPP_DIST", dist):
+            client = TestClient(build_app(_config()))
+            r = client.get("/")
+        assert r.status_code == 200
+        assert "coord module default" in r.text

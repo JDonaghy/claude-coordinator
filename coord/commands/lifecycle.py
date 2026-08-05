@@ -362,12 +362,31 @@ def done(config_path: Path) -> None:
         "no fleet, no network, no money. See coord/dashboard/fixture.py."
     ),
 )
+@click.option(
+    "--dist",
+    "dist_path",
+    type=click.Path(exists=False, file_okay=False, path_type=Path),
+    default=None,
+    envvar="COORD_WEB_DIST",
+    help=(
+        "#1543: serve the built React webapp from this directory instead of "
+        "the one bundled inside the installed package "
+        "(coord/dashboard/webapp/dist). Resolves flag > $COORD_WEB_DIST. "
+        "Lets a build hook keep a checkout's dist/ in sync with merged main "
+        "and have it go live here without touching ~/.coord-venv, so a "
+        "webapp change never upgrades coord-agent/coord-serve's shared "
+        "venv or needs a PyPI release. Missing/empty falls back to the "
+        "legacy single-file dashboard, same as the bundled default. See "
+        "docs/PHONE_WEBAPP.md."
+    ),
+)
 def web(
     config_path: Path,
     bind_host: str,
     bind_port: int,
     token: str | None,
     fixture_path: Path | None,
+    dist_path: Path | None,
 ) -> None:
     import uvicorn
     from coord.dashboard.server import build_app
@@ -401,8 +420,10 @@ def web(
         cfg = _load_config(config_path)
 
     token = resolve_web_token(token)
-    app = build_app(cfg, token=token, fixture=fixture)
+    app = build_app(cfg, token=token, fixture=fixture, dist_path=dist_path)
     click.echo(f"coord web: dashboard at http://{bind_host}:{bind_port}")
+    if dist_path is not None:
+        click.echo(f"  serving webapp bundle from {dist_path} (#1543)")
     if fixture is not None:
         click.echo(
             f"  fixture mode: seeded board from {fixture_path} — reads are "
