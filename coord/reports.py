@@ -39,6 +39,8 @@ report must never touch the board (this repo has a recurring
 
 from __future__ import annotations
 
+import csv
+import io
 import re
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -67,6 +69,8 @@ __all__ = [
     "fold_usage",
     "run_usage",
     "parse_duration",
+    "result_to_csv",
+    "csv_filename",
 ]
 
 
@@ -1430,6 +1434,145 @@ USAGE = ReportDef(
     ),
     run=run_usage,
 )
+
+
+# ── CSV serialisation (#1765) ──────────────────────────────────────────────
+#
+# One serializer, server-side, for every surface: `coord report run --format
+# csv`, `GET /report/{id}?format=csv`, and the coord-tui Reports panel's
+# Export action (which fetches the route rather than formatting anything
+# itself).  Doing it here is not incidental — the values on the wire are
+# **raw** (`started_at` is an epoch float, `machines` is a list), and every
+# renderer turns those into display strings (`13h ago`, `dellserver,
+# precision`).  A client-side CSV would therefore export the *formatting*,
+# not the data: an epoch would become a relative string no spreadsheet can
+# sort, and the bytes would silently depend on when Export was clicked.
+#
+# Line terminator is `\n`, not RFC 4180's `\r\n`: this is a Unix tool whose
+# output is piped and redirected, `csv.reader` accepts either, and every
+# spreadsheet we care about does too.  Fixing it (rather than taking
+# `csv.writer`'s platform-ish default) is what makes CLI and daemon bytes
+# identical.
+_CSV_LINE_TERMINATOR = "\n"
+
+
+def _csv_scalar(value: Any) -> str:
+    """One *raw* value → its CSV text.  Never a display string."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        # Before the int check — bool is an int in Python, and `true`/`false`
+        # is what every consumer of this file expects to see.
+        return "true" if value else "false"
+    return str(value)
+
+
+def _csv_cell(value: Any) -> str:
+    """One row value → one CSV field.
+
+    Composite values collapse into a single field rather than spilling into
+    extra columns: lists (``machines``, ``test_verdicts``) join with ``"; "``,
+    and dicts (``drive_exit``) render as ``key=value`` pairs joined the same
+    way.  ``drive_exit.reason`` is embedded **verbatim** — commas, quotes and
+    newlines and all — because `csv.writer` quotes and escapes it, and a
+    round-trip through `csv.reader` has to return the original text (#1631's
+    multi-line driver-exit reason is the regression fixture).  JSON-encoding
+    the dict would have escaped that newline into a literal ``\\n`` and lost
+    the round-trip.
+    """
+    if isinstance(value, (list, tuple)):
+        return "; ".join(_csv_scalar(v) for v in value)
+    if isinstance(value, Mapping):
+        return "; ".join(f"{k}={_csv_scalar(v)}" for k, v in value.items())
+    return _csv_scalar(value)
+
+
+def _csv_comment(text: str) -> list[str]:
+    """A note → its ``#``-prefixed line(s).  A note that itself spans lines
+    gets one ``#`` per physical line, so no fragment can escape into the
+    data and be parsed as a row."""
+    lines = str(text).splitlines() or [""]
+    return [f"# {line}" if line else "#" for line in lines]
+
+
+def result_to_csv(result: "ReportResult | Mapping[str, Any]") -> str:
+    """Serialise a :class:`ReportResult` (or its ``to_dict()`` form) as CSV.
+
+    Shape:
+
+    * leading ``#``-prefixed comment lines — the report id, the window, and
+      **every** ``notes`` entry.  Notes are the derived anomalies and are the
+      most valuable part of ``issue-activity``; they are not rows, and they
+      must never silently vanish, so they ride along as comments that keep
+      the file self-describing and still let it parse once ``#`` lines are
+      skipped.
+    * a header row, labelled from ``column_meta[].label`` (#1760) when
+      present and from the raw column key otherwise.
+    * one row per ``rows`` entry, raw values only.
+    * ``totals`` (#1763), when the report has one, as a final row — flagged
+      in the comments so nobody mistakes it for another data row.  Reports
+      without a meaningful sum emit no such row and are unaffected.
+    """
+    data = result.to_dict() if isinstance(result, ReportResult) else dict(result)
+
+    columns = [str(c) for c in (data.get("columns") or [])]
+    labels = {
+        str(m.get("id")): str(m.get("label") or m.get("id"))
+        for m in (data.get("column_meta") or [])
+        if isinstance(m, Mapping)
+    }
+    window = data.get("window") or [None, None]
+
+    comments: list[str] = [
+        f"# report: {data.get('report_id')}",
+        f"# window: {_iso(window[0])} to {_iso(window[1])}",
+        f"# generated: {_iso(data.get('generated_at'))}",
+    ]
+    rows = list(data.get("rows") or [])
+    comments.append(f"# rows: {len(rows)}")
+    # The export is the report's own canonical row order — never a client's
+    # transient sort (#1762), which is view state over one result set.
+    comments.append("# order: the report's canonical row order")
+    totals = data.get("totals")
+    if isinstance(totals, Mapping):
+        comments.append(
+            "# totals: the final row is the grand total, not a data row "
+            "(identity columns are blank)"
+        )
+    for note in data.get("notes") or []:
+        comments.extend(_csv_comment(note))
+
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator=_CSV_LINE_TERMINATOR)
+    writer.writerow([labels.get(c, c) for c in columns])
+    for row in rows:
+        row = row if isinstance(row, Mapping) else {}
+        writer.writerow([_csv_cell(row.get(c)) for c in columns])
+    if isinstance(totals, Mapping):
+        writer.writerow([_csv_cell(totals.get(c)) for c in columns])
+
+    header = "".join(line + _CSV_LINE_TERMINATOR for line in comments)
+    return header + buf.getvalue()
+
+
+def csv_filename(result: "ReportResult | Mapping[str, Any]") -> str:
+    """``issue-activity-20260804-1130.csv`` — the suggested download name.
+
+    Derived from the *result* (its window end), not from the wall clock, so
+    the daemon's ``Content-Disposition`` and the panel's save-dialog
+    suggestion agree for the same run.
+    """
+    data = result.to_dict() if isinstance(result, ReportResult) else dict(result)
+    window = data.get("window") or [None, None]
+    stamp_at = window[1] if window[1] is not None else data.get("generated_at")
+    try:
+        stamp = datetime.fromtimestamp(float(stamp_at), tz=timezone.utc).strftime(
+            "%Y%m%d-%H%M"
+        )
+    except (TypeError, ValueError):
+        stamp = "unknown"
+    report_id = re.sub(r"[^A-Za-z0-9._-]+", "-", str(data.get("report_id") or "report"))
+    return f"{report_id}-{stamp}.csv"
 
 
 REPORTS: dict[str, ReportDef] = {

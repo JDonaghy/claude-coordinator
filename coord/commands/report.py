@@ -8,9 +8,18 @@ trail itself.
 
 ``coord report list`` prints the catalogue with each report's parameters,
 their allowed values and their defaults.  ``coord report run <id>`` renders
-one report as a plain table plus its notes block; ``--json`` emits the
-``ReportResult`` verbatim — the same bytes the daemon's
+one report as a plain table plus its notes block; ``--format json`` emits
+the ``ReportResult`` verbatim — the same bytes the daemon's
 ``GET /report/{id}`` returns for the same window.
+
+``--format csv`` (#1765) writes the machine-readable form to stdout, so it
+pipes and redirects normally.  It calls :func:`coord.reports.result_to_csv`
+on the **raw wire result** — the same function, on the same input, that
+``GET /report/{id}?format=csv`` calls — rather than re-serialising the human
+table above.  That is deliberate and load-bearing twice over: it is why the
+CLI and the daemon emit identical bytes, and it is why ``started_at``
+exports as an epoch instead of the ``13h ago`` that ``_format_cell``
+renders.  ``--json`` survives as a hidden alias for ``--format json``.
 
 Exit codes: ``2`` for a bad request (unknown report, unknown parameter, bad
 value — the message names what was allowed), ``1`` for a read/transport
@@ -242,14 +251,31 @@ def report_list(
     "--param", "raw_params", multiple=True, metavar="KEY=VALUE",
     help="Report parameter, repeatable (e.g. --param since=13h).",
 )
-@click.option("--json", "output_json", is_flag=True, default=False, help="Output the raw ReportResult JSON.")
+@click.option(
+    "--format", "output_format",
+    type=click.Choice(["table", "json", "csv"]),
+    default="table",
+    show_default=True,
+    help="Output encoding: human table, raw ReportResult JSON, or CSV.",
+)
+@click.option(
+    "--json", "legacy_json", is_flag=True, default=False, hidden=True,
+    help="Deprecated alias for --format json.",
+)
 @_CONFIG_OPTION
 def report_run(
     report_id: str,
     raw_params: tuple[str, ...],
-    output_json: bool,
+    output_format: str,
+    legacy_json: bool,
     config_path: Path,  # noqa: ARG001 — accepted for --config-flag consistency; reports need no coordinator.yml
 ) -> None:
+    # #1765: `--json` predates `--format` and is kept as a hidden alias so
+    # existing scripts and the #1742 smoke commands keep working verbatim.
+    # Hidden, not removed: it is absent from --help (there is one documented
+    # way to ask for JSON) while still being accepted.
+    if legacy_json:
+        output_format = "json"
     from coord.state import run_report  # noqa: PLC0415
 
     params: dict[str, str] = {}
@@ -276,8 +302,22 @@ def report_run(
         click.echo(f"error: report run failed: {e}", err=True)
         raise SystemExit(1) from e
 
-    if output_json:
+    if output_format == "json":
         click.echo(_json.dumps(result, indent=2, default=str))
+        return
+
+    if output_format == "csv":
+        # #1765: the *server's* serializer, applied to the raw wire result —
+        # never a re-serialisation of the human table. That is what makes
+        # these bytes identical to `GET /report/{id}?format=csv`, and what
+        # keeps `started_at` an epoch instead of the `13h ago` this module
+        # renders two functions up.
+        from coord.reports import result_to_csv  # noqa: PLC0415
+
+        # nl=False: the serializer already terminates every line, and click
+        # would otherwise append a stray blank line that the daemon's bytes
+        # do not have.
+        click.echo(result_to_csv(result), nl=False)
         return
 
     window = result.get("window") or [None, None]
