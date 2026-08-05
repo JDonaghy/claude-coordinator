@@ -379,6 +379,21 @@ and "Rollback: one command, reachable without this issue in hand (#1560)" in
 `docs/PHONE_WEBAPP.md` for the full design rationale and a timed recovery
 drill transcript.
 
+**The rollback alone is not durable against the 1-minute build timer** —
+fixing a bad commit on `main` realistically takes longer than that, so
+without a guard the timer's very next tick would rebuild and silently
+republish the exact SHA just rolled back from. `coord-web-rollback.sh`
+writes a sentinel (`~/.coord-web-releases/.rollback-blocked-sha`) naming
+that SHA, and `coord-web-dist-build.sh` refuses to build/publish it again
+until `main` moves past it — see "The rollback is not durable against the
+1-minute build timer on its own" in `docs/PHONE_WEBAPP.md`. If you need the
+timer to simply stop running while you fix `main`, pause it directly:
+
+```bash
+systemctl --user stop coord-web-dist-build.timer
+systemctl --user start coord-web-dist-build.timer   # resume once main is fixed
+```
+
 **Service unit:** [`deploy/coord-web.service`](../deploy/coord-web.service) (full
 unit + prereqs in its header). Install + restart:
 
@@ -406,6 +421,9 @@ systemctl --user daemon-reload && systemctl --user enable --now coord-web-dist-b
 ```bash
 ssh <dellserver-tailnet-name> ~/.local/bin/coord-web-rollback.sh
 ```
+
+The script itself prints a `WARNING:` naming the sentinel it just wrote and
+the pause command above — read it before you set the phone down.
 
 ## Periodic `coord notify` (`coord-notify` timer, #1311)
 

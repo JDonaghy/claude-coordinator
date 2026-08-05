@@ -257,11 +257,61 @@ Equivalent by hand, if the script itself is ever unavailable:
 ln -sfn "$(ls -dt ~/.coord-web-releases/*/ | sed -n 2p)" ~/coord-web-dist
 ```
 
+(Skips the rollback-sentinel protection described below — prefer the script
+form when it's available.)
+
 **`coord-serve` (7435) and `coord-agent` (7433) are untouched by both the
 deploy and the revert** — neither script does anything but build/symlink
 inside `~/coord-web-dist` / `~/.coord-web-releases`; see
 `tests/test_deploy_coord_web_dist.py` and
 `tests/test_deploy_coord_web_rollback.py` for the regression guards.
+
+#### The rollback is not durable against the 1-minute build timer on its own
+
+`coord-web-dist-build.timer` fires every ~1 minute (see "Going live
+automatically" above). Fixing or reverting a bad commit on `main`
+realistically takes longer than that. So immediately after a rollback,
+`origin/main`'s tip is **still the bad SHA** — the build timer's own
+"up to date at `$NEW_SHA`" short-circuit compares against the *currently
+live* SHA (now the good one you just rolled back to), which no longer
+matches, so it does **not** fire. Left alone, the very next tick would
+rebuild that identical bad commit, run it through the identical health
+check it passed the first time (for the identical reason — a client-side-
+only JS runtime error is exactly the bug class that check cannot catch),
+and republish it live — **silently undoing the rollback about a minute
+after you performed it, with no other warning.**
+
+`coord-web-rollback.sh` closes this gap two ways:
+
+1. **It tells you, in its own output**, that the timer is about to try
+   again, and gives you the pause command if you need more than a minute:
+   ```
+   WARNING: coord-web-dist-build.timer fires again within about a minute. It will refuse to
+   auto-republish <bad-sha> (the SHA you just rolled back FROM) thanks to the sentinel
+   just written to ~/.coord-web-releases/.rollback-blocked-sha — but that protection is scoped
+   to that exact SHA: if origin/main has ALREADY moved past it with more bad commits behind it,
+   the timer will build and publish those instead, and this script cannot protect you from that.
+   Fix or revert the bad commit on main as soon as you can. If you'd rather the timer not run
+   at all until you have, pause it:
+     systemctl --user stop coord-web-dist-build.timer
+     systemctl --user start coord-web-dist-build.timer   # resume when ready
+   ```
+2. **It writes a sentinel** (`~/.coord-web-releases/.rollback-blocked-sha`)
+   naming the exact SHA you rolled back *from*. `coord-web-dist-build.sh`
+   checks that sentinel before it ever touches the build worktree or npm:
+   if `origin/main`'s tip still matches it, the build **refuses to run**
+   (exit 1, nothing rebuilt, nothing republished, `~/coord-web-dist`
+   untouched) until either `main` has moved past that SHA — in which case
+   the sentinel is cleared automatically on the next tick — or an operator
+   deliberately removes the sentinel file by hand (e.g. because the
+   rollback turns out to have been a false alarm).
+
+This is a **fail-closed guard against exactly one thing**: re-publishing
+the specific SHA just rolled back from. It does not stop the timer from
+building and publishing a *different* bad commit that lands on `main`
+afterward — pausing the timer (`systemctl --user stop
+coord-web-dist-build.timer`) is still the answer if you need `main` to
+simply stop being deployed at all while you work.
 
 #### #1560 acceptance drill: deploying a broken bundle and recovering
 
@@ -328,13 +378,117 @@ started during this drill at all — confirming (along with
 reaches for those services by construction, not merely because they
 happened not to be running.
 
-**Takeaway:** the two mechanisms cover different halves of the problem — the
-health check stops most broken deploys from ever going live at all (zero
-recovery time needed, because there was nothing to recover from); the
+> **Updated 2026-08-05 (review fix):** the Part B transcript above predates
+> the rollback-sentinel guard added below Part C. Run today, the same
+> rollback also writes `.rollback-blocked-sha` under `$RELEASES_DIR` and
+> prints a `WARNING:` block about the build timer's next tick — see Part C,
+> which exercises exactly that interaction end to end (the gap this
+> transcript itself didn't originally cover).
+
+**Part C — the interaction with the live build timer that Part B didn't
+cover, and the fix for it.** Part A and Part B each ran their script in
+isolation; neither exercised what happens when `coord-web-dist-build.timer`
+actually fires again shortly after a manual rollback while `origin/main` is
+still sitting on the bad commit — which is the realistic case, since fixing
+a bad commit on `main` takes a lot longer than the timer's ~1 minute
+cadence. This drill exercises that interaction directly, driving the real
+`deploy/coord-web-rollback.sh` and `deploy/coord-web-dist-build.sh` end to
+end against a scratch, fully-local git repo standing in for `origin/main`
+(no network, no real npm build needed — the guard below sits before either
+script ever gets there).
+
+Starting state: a bug that ships a client-side-only JS runtime error (still
+renders a valid `id="root"` SPA shell, so the fixture-based health check
+cannot catch it — the exact class of bug Part B's manual rollback exists
+for) is live at `8c42f95c...`, having gotten past the health check the same
+way Part B's `deadbeef...` release did. `origin/main`'s tip is still that
+same commit — the fix hasn't landed yet.
+
+```
+$ readlink -f $LIVE_LINK
+/…/releases/8c42f95c48e5d2652d52e27f9f22df08bd92a4f8        # the bad one, live
+
+$ time RELEASES_DIR=… LIVE_LINK=… bash deploy/coord-web-rollback.sh
+[11:32:55] rolling back: .../releases/8c42f95c... -> .../releases/f4c176b2...
+[11:32:55] done: $LIVE_LINK -> .../releases/f4c176b2... (no coord-web restart needed)
+[11:32:55] coord-serve (7435) and coord-agent (7433) were not touched by this script.
+[11:32:55] WARNING: coord-web-dist-build.timer fires again within about a minute. It will refuse to
+[11:32:55] auto-republish 8c42f95c48e5d2652d52e27f9f22df08bd92a4f8 (the SHA you just rolled back FROM) thanks to the sentinel
+[11:32:55] just written to .../releases/.rollback-blocked-sha — but that protection is scoped to that exact SHA: if
+[11:32:55] origin/main has ALREADY moved past it with more bad commits behind it, the timer will
+[11:32:55] build and publish those instead, and this script cannot protect you from that.
+[11:32:55] Fix or revert the bad commit on main as soon as you can. If you'd rather the timer not run
+[11:32:55] at all until you have, pause it:
+[11:32:55]   systemctl --user stop coord-web-dist-build.timer
+[11:32:55]   systemctl --user start coord-web-dist-build.timer   # resume when ready
+
+real    0m0.017s
+```
+
+Recovery itself: unchanged, ~17ms. Then, simulating the timer's very next
+tick with `origin/main` still unfixed (the realistic case):
+
+```
+$ time BASE_CHECKOUT=… BRANCH=main WEBAPP_CHECKOUT=… RELEASES_DIR=… LIVE_LINK=… \
+    bash deploy/coord-web-dist-build.sh
+[11:33:00] REFUSING to build/publish 8c42f95c48e5d2652d52e27f9f22df08bd92a4f8: this is the exact SHA an operator rolled back FROM
+[11:33:00] (sentinel: .../releases/.rollback-blocked-sha, written by coord-web-rollback.sh). Publishing it now would
+[11:33:00] silently undo that rollback about a minute after they performed it, with no other warning.
+[11:33:00] Fix or revert the bad commit on origin/main, or pause this timer entirely while you work on it:
+[11:33:00]   systemctl --user stop coord-web-dist-build.timer
+[11:33:00]   systemctl --user start coord-web-dist-build.timer   # resume once main is fixed
+[11:33:00] If you are certain 8c42f95c48e5d2652d52e27f9f22df08bd92a4f8 is actually fine and the rollback was a false alarm, clear the
+[11:33:00] sentinel to allow it again:
+[11:33:00]   rm .../releases/.rollback-blocked-sha
+
+$ echo $?
+1
+$ readlink -f $LIVE_LINK
+/…/releases/f4c176b2...        # STILL the good release -- the rollback held
+$ ls $WEBAPP_CHECKOUT 2>&1
+No such file or directory       # refused before ever touching the build worktree
+```
+
+**The rollback held.** Exit 1, no rebuild, no republish, `$LIVE_LINK`
+unchanged — this is the bug the review flagged, fixed: before this guard
+existed, this second command would have rebuilt `8c42f95c...` from scratch,
+passed it through the identical health check it passed the first time, and
+silently republished it, undoing the rollback above about a minute after it
+ran.
+
+Finally, once the actual fix lands on `main` (a new commit, `7d9aff55...`),
+the very next tick clears the sentinel on its own and proceeds normally:
+
+```
+$ time BASE_CHECKOUT=… BRANCH=main WEBAPP_CHECKOUT=… RELEASES_DIR=… LIVE_LINK=… \
+    bash deploy/coord-web-dist-build.sh
+[11:33:06] origin/main (7d9aff55...) has moved past the previously-blocked SHA 8c42f95c... — clearing sentinel .../releases/.rollback-blocked-sha
+[11:33:06] creating dedicated worktree at $WEBAPP_CHECKOUT
+[11:33:06] building 7d9aff55...
+... (npm ci && npm run build proceeds normally from here) ...
+
+$ ls $RELEASES_DIR/.rollback-blocked-sha
+No such file or directory       # sentinel cleared -- future ticks are unblocked
+```
+
+No operator action was needed to unblock deploys once `main` was actually
+fixed — only a bad commit sitting unfixed at the tip stays blocked.
+`tests/test_deploy_coord_web_dist.py`'s
+`test_build_script_refuses_to_republish_a_just_rolled_back_from_sha` and
+`test_build_script_clears_sentinel_once_main_moves_past_the_blocked_sha`
+are the automated regression guards for both halves of this drill.
+
+**Takeaway:** the three mechanisms cover three different failure surfaces —
+the health check stops most broken deploys from ever going live at all
+(zero recovery time needed, because there was nothing to recover from); the
 one-command rollback is the fallback for the narrower class that gets
 through anyway, and a millisecond-scale symlink swap is fast enough that
 "ssh in from a phone and run one command" is a realistic answer to "the
-dogfood loop just went down."
+dogfood loop just went down"; and the rollback-sentinel guard is what makes
+that rollback actually *stick* against a 1-minute build timer that would
+otherwise silently undo it about a minute later, for precisely the bug
+class (client-side-only JS runtime errors) the manual rollback exists to
+catch in the first place.
 
 ### Install
 
