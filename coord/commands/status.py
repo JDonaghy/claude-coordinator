@@ -123,8 +123,10 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
     # #1563: paused_set() is daemon-aware — on a thin client it fetches the
     # daemon's own `/pause` copy, so this renders the state that actually
     # governs dispatch instead of a host-local file the daemon never reads.
-    from coord.machine_pause import paused_set  # noqa: PLC0415
-    paused = paused_set()
+    # #1862: passing `cfg.machines` folds quiet-hours windows into that same
+    # set (a no-op on any machine with no `quiet_hours:` block).
+    from coord.machine_pause import describe_pause_state, paused_set  # noqa: PLC0415
+    paused = paused_set(cfg.machines)
 
     statuses = check_all(machines, timeout=timeout)
     agent_completed: dict[str, dict] = {}
@@ -180,8 +182,17 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
         # client that just ran `coord pause` needs to SEE that it took,
         # otherwise a pause that silently didn't reach the daemon looks
         # identical to one that did (the whole bug this closes).
-        if m.name in paused:
+        # #1862: a quiet-hours pause must not look identical to a hand
+        # pause — an operator debugging a stalled queue at 1AM needs to
+        # know whether the machine will wake itself up or is waiting on
+        # `coord unpause`.
+        pause_state = describe_pause_state(m, paused)
+        if pause_state is not None and pause_state.kind == "hand":
             label = f"PAUSED — {label}"
+        elif pause_state is not None and pause_state.kind == "quiet":
+            label = f"QUIET ({pause_state.detail}) — {label}"
+        elif pause_state is not None and pause_state.kind == "quiet_overridden":
+            label = f"{label}  [quiet hours overridden]"
 
         # Extract agent version from /status response (added in #104).
         agent_version: str | None = None
@@ -872,6 +883,33 @@ def doctor(config_path: Path, machine_filter: str | None, timeout: float) -> Non
             any_problem = True
             for reason in reasons:
                 click.echo(f"  ✗ capability {cap!r} claimed but unmet — {reason}")
+
+    # #1862: a quiet-hours window that removes the only machine with a
+    # capability makes matching work silently unroutable (`dispatch_smoke`
+    # already has this failure shape — #1678: it refuses to route and the
+    # Test stage retries forever with no error). Cheap heuristic, not full
+    # time-overlap math: if EVERY machine advertising a capability has some
+    # `quiet_hours` window, coverage isn't guaranteed around the clock; if
+    # at least one machine offering it has none, it's always coverable.
+    # Runs over the FULL fleet regardless of `--machine`.
+    caps_with_quiet_hours: dict[str, list[str]] = {}
+    caps_without_quiet_hours: set[str] = set()
+    for m in cfg.machines:
+        for cap in m.capabilities:
+            if m.quiet_hours is not None:
+                caps_with_quiet_hours.setdefault(cap, []).append(m.name)
+            else:
+                caps_without_quiet_hours.add(cap)
+    for cap, quiet_machine_names in sorted(caps_with_quiet_hours.items()):
+        if cap in caps_without_quiet_hours:
+            continue
+        any_problem = True
+        names = ", ".join(sorted(quiet_machine_names))
+        click.echo(
+            f"⚠ capability {cap!r} is only ever offered by machine(s) with "
+            f"quiet_hours configured ({names}) — an overlapping window "
+            "could leave it with no awake machine to route to"
+        )
 
     if any_problem:
         sys.exit(1)

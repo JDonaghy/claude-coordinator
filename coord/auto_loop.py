@@ -951,7 +951,7 @@ def _dispatch_fix(
         (m for m in config.machines if m.name == work.machine_name), None
     )
     from coord.machine_pause import paused_set
-    paused = paused_set()
+    paused = paused_set(config.machines)
     if (
         machine is None
         or not machine.can_work_on(work.repo_name)

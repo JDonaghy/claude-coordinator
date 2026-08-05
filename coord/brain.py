@@ -152,7 +152,7 @@ def build_prompt(config: Config, context: dict) -> str:
 
     lines.append("")
     from coord.machine_pause import paused_set
-    paused = paused_set()
+    paused = paused_set(config.machines)
     lines.append("## Machines")
     for machine in config.machines:
         caps = ", ".join(machine.capabilities) if machine.capabilities else "none"

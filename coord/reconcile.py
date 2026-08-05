@@ -701,7 +701,7 @@ def _reassign(
         raise UnsupportedRetryType(failed.type, failed.review_of_assignment_id)
 
     from coord.machine_pause import paused_set
-    paused = paused_set()
+    paused = paused_set(config.machines)
     running = _running_by_machine(board)
 
     # #1417: fleet-wide cap first — respected regardless of per-machine
@@ -898,7 +898,7 @@ def describe_no_candidate_machines(
     """
     from coord.machine_pause import paused_set  # noqa: PLC0415
 
-    paused = paused_set()
+    paused = paused_set(config.machines)
     now = time.time()
 
     running_by_machine = _running_by_machine(board)

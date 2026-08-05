@@ -818,7 +818,7 @@ def pick_reviewer_machine(
     Returns None when no machine can handle this repo.
     """
     from coord.machine_pause import paused_set
-    paused = paused_set()
+    paused = paused_set(config.machines)
     candidates = [
         m for m in config.machines
         if m.can_work_on(repo_name) and m.name not in paused
@@ -893,7 +893,7 @@ def _ranked_reviewer_candidates(
     """
     from coord.machine_pause import paused_set  # noqa: PLC0415
 
-    paused = paused_set()
+    paused = paused_set(config.machines)
     candidates = [
         m for m in config.machines
         if m.can_work_on(repo_name) and m.name not in paused
@@ -1710,7 +1710,7 @@ def dispatch_review(
                 completed.branch, completed.assignment_id, completed.machine_name,
             )
             from coord.machine_pause import paused_set  # noqa: PLC0415
-            paused = paused_set()
+            paused = paused_set(config.machines)
             worker_machine = next(
                 (m for m in config.machines if m.name == completed.machine_name),
                 None,

@@ -401,7 +401,7 @@ def pick_machine(payload: dict, repo: str, config: Any) -> str:
     try:
         from coord.machine_pause import paused_set  # noqa: PLC0415
 
-        paused = paused_set()
+        paused = paused_set(config.machines)
     except Exception:  # noqa: BLE001 — a missing pause file means nothing paused
         paused = set()
 

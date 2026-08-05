@@ -406,7 +406,7 @@ def pick_machine(
     from coord.machine_pause import paused_set  # noqa: PLC0415
 
     busy = {a.machine_name for a in board.active if a.status == "running"}
-    paused = paused_set()
+    paused = paused_set(config.machines)
     for m in config.machines:
         if m.name in exclude:
             continue

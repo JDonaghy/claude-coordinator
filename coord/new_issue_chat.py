@@ -38,7 +38,7 @@ def pick_new_issue_chat_machine(cfg: Config, repo: str) -> Machine | None:
     """
     from coord.machine_pause import paused_set
 
-    paused = paused_set()
+    paused = paused_set(cfg.machines)
     for m in cfg.machines:
         if (
             m.can_work_on(repo)

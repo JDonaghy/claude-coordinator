@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 # #316: pattern that distinguishes a file-path value for `new_issue_guidance`
 # from inline markdown text.  Matches paths like `docs/ISSUE_GUIDANCE.md` or
@@ -139,6 +141,74 @@ class Repo:
 
 
 @dataclass
+class QuietHours:
+    """A machine's recurring daily no-new-dispatch window (#1862).
+
+    ``start``/``end`` are wall-clock ``datetime.time`` values evaluated in
+    ``tz`` — a REQUIRED IANA zone name (see ``coord.config._parse_machines``,
+    which refuses to parse a ``quiet_hours`` block with a missing/invalid
+    ``tz`` rather than silently defaulting). `coord serve` runs on UTC; a
+    naive ``"23:00"`` compared against the daemon's own clock would fire at
+    the wrong wall-clock hour for any non-UTC operator — exactly the bug
+    this field exists to prevent.
+
+    This reuses ``coord.machine_pause``'s existing routing-pause semantics:
+    it governs the ROUTING decision for *new* dispatch only and never
+    cancels an in-flight assignment — a task still running when the window
+    opens finishes normally.
+
+    ``start == end`` is rejected at config-parse time (ambiguous — "quiet
+    all day" vs "never quiet" — rather than guessed; a machine that wants to
+    be quiet all day should just be `coord pause`d).
+    """
+
+    start: time
+    end: time
+    tz: str
+
+    def covers(self, now: datetime | None = None) -> bool:
+        """True when *now* falls inside this window, evaluated in ``tz``.
+
+        Half-open interval ``[start, end)``: the instant ``start`` is
+        covered, the instant ``end`` is not — the machine wakes up exactly
+        at ``end``, not a minute after. ``start > end`` denotes a window
+        that wraps midnight (e.g. ``23:00`` → ``08:00``).
+        """
+        moment = self._local_time(now)
+        if self.start <= self.end:
+            return self.start <= moment < self.end
+        return moment >= self.start or moment < self.end
+
+    def window_end_instant(self, now: datetime | None = None) -> datetime:
+        """The absolute UTC instant the window containing *now* ends.
+
+        Only meaningful when ``self.covers(now)`` is true — used by
+        ``coord.machine_pause`` to size a ``coord unpause`` override so it
+        expires exactly when the window would have anyway, rather than a
+        fixed duration that could outlive or undershoot it.
+        """
+        now = self._aware(now)
+        zone = ZoneInfo(self.tz)
+        local_now = now.astimezone(zone)
+        end_dt = local_now.replace(
+            hour=self.end.hour, minute=self.end.minute, second=0, microsecond=0,
+        )
+        if self.start > self.end and local_now.time() >= self.start:
+            # Wrapping window, currently in the "evening" half — the window
+            # ends tomorrow's clock time, not today's.
+            end_dt = end_dt + timedelta(days=1)
+        return end_dt.astimezone(timezone.utc)
+
+    def _local_time(self, now: datetime | None) -> time:
+        return self._aware(now).astimezone(ZoneInfo(self.tz)).time()
+
+    @staticmethod
+    def _aware(now: datetime | None) -> datetime:
+        now = now if now is not None else datetime.now(timezone.utc)
+        return now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+
+
+@dataclass
 class Machine:
     name: str
     host: str
@@ -151,6 +221,11 @@ class Machine:
     # the fleet norm (e.g. a 4-core box among 20-core desktops) so automated
     # capacity checks (`coord retry`) don't pile concurrent workers onto it.
     max_workers: int | None = None
+    # #1862: optional recurring daily no-new-dispatch window. `None` (unset,
+    # the default) means "behaves exactly as before this feature" — see
+    # `QuietHours` above. Routing consults this only through
+    # `coord.machine_pause.paused_set()`, never directly.
+    quiet_hours: QuietHours | None = None
 
     def can_work_on(self, repo_name: str) -> bool:
         return repo_name in self.repos

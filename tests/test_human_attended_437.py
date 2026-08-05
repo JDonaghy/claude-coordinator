@@ -256,6 +256,9 @@ class _StubMachine:
     # #1417: _reassign's capacity check reads Machine.max_workers — keep
     # this stub in sync with the real dataclass's optional override.
     max_workers: int | None = None
+    # #1862: paused_set() reads Machine.quiet_hours — keep this stub in
+    # sync with the real dataclass's optional field too.
+    quiet_hours: "object | None" = None
 
     def repo_path(self, name: str) -> str | None:
         return self._paths.get(name)

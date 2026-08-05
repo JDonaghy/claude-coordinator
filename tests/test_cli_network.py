@@ -60,9 +60,11 @@ class TestStatus:
         statuses[0].machine.name = "laptop"
         statuses[0].machine.host = "laptop.tailnet"
         statuses[0].machine.repos = ["api"]
+        statuses[0].machine.quiet_hours = None  # #1862: real Machine default
         statuses[1].machine.name = "server"
         statuses[1].machine.host = "server.tailnet"
         statuses[1].machine.repos = ["api"]
+        statuses[1].machine.quiet_hours = None
 
         with patch("coord.network.check_all", return_value=statuses), \
              patch("coord.network.fetch_status", return_value=network.StatusResult(data={"active": [], "completed": []})):
@@ -84,6 +86,7 @@ class TestStatus:
         statuses[0].machine.name = "laptop"
         statuses[0].machine.host = "laptop.tailnet"
         statuses[0].machine.repos = ["api"]
+        statuses[0].machine.quiet_hours = None  # #1862: real Machine default
 
         with patch("coord.network.check_all", return_value=statuses), \
              patch("coord.network.fetch_status", return_value=network.StatusResult(error="HTTP 500")):
@@ -103,6 +106,7 @@ class TestStatus:
         statuses[0].machine.name = "laptop"
         statuses[0].machine.host = "laptop.tailnet"
         statuses[0].machine.repos = ["api"]
+        statuses[0].machine.quiet_hours = None  # #1862: real Machine default
 
         with patch("coord.network.check_all", return_value=statuses), \
              patch("coord.network.fetch_status", return_value=network.StatusResult(error="timeout")):
@@ -183,6 +187,7 @@ class TestStatus:
         statuses[0].machine.name = "laptop"
         statuses[0].machine.host = "laptop.tailnet"
         statuses[0].machine.repos = ["api"]
+        statuses[0].machine.quiet_hours = None  # #1862: real Machine default
 
         with patch("coord.network.check_all", return_value=statuses), \
              patch("coord.network.fetch_status", return_value=agent_status):
@@ -208,9 +213,11 @@ class TestStatus:
         statuses[0].machine.name = "laptop"
         statuses[0].machine.host = "laptop.tailnet"
         statuses[0].machine.repos = ["api"]
+        statuses[0].machine.quiet_hours = None  # #1862: real Machine default
         statuses[1].machine.name = "server"
         statuses[1].machine.host = "server.tailnet"
         statuses[1].machine.repos = ["api"]
+        statuses[1].machine.quiet_hours = None
 
         with patch("coord.network.check_all", return_value=statuses), \
              patch("coord.network.fetch_status", return_value=network.StatusResult(data={"active": [], "completed": []})), \
@@ -250,6 +257,7 @@ class TestStatus:
         statuses[0].machine.name = "laptop"
         statuses[0].machine.host = "laptop.tailnet"
         statuses[0].machine.repos = ["api"]
+        statuses[0].machine.quiet_hours = None  # #1862: real Machine default
 
         with patch("coord.network.check_all", return_value=statuses), \
              patch("coord.network.fetch_status", return_value=agent_status):

@@ -46,7 +46,7 @@ def pick_refinement_machine(cfg: Config, repo: str) -> Machine | None:
     Returns `None` when no machine claims the repo.
     """
     from coord.machine_pause import paused_set
-    paused = paused_set()
+    paused = paused_set(cfg.machines)
     for m in cfg.machines:
         if (
             m.can_work_on(repo)

@@ -1110,7 +1110,11 @@ def pause(config_path: Path, machine: str) -> None:
 @click.command(
     help=(
         "Resume a paused machine — new assignments can be routed to it "
-        "again.  No-op if the machine wasn't paused."
+        "again.  No-op if the machine wasn't paused.\n\n"
+        "#1862: if MACHINE isn't hand-paused but IS inside its "
+        "coordinator.yml `quiet_hours` window, this overrides that window "
+        "until it ends rather than silently doing nothing (a bare re-read "
+        "would otherwise show it paused again on the very next poll)."
     ),
 )
 
@@ -1120,16 +1124,37 @@ def pause(config_path: Path, machine: str) -> None:
 def unpause(config_path: Path, machine: str) -> None:
     from coord.machine_pause import unpause as _unpause
 
+    # #1862: best-effort quiet-hours context — an unloadable/placeholder
+    # config must not block the (still fully functional) explicit-unpause
+    # path below, it only means quiet-hours overrides can't be resolved.
+    # Deliberately NOT `_load_config()`: that helper `sys.exit(2)`s on a
+    # ConfigError (a SystemExit, which a bare `except Exception:` doesn't
+    # catch) and, on a thin client, fetches the daemon's remote config over
+    # HTTP — wasted work here, since a thin client's `_unpause()` call below
+    # routes over HTTP too and never even looks at `machines`.
+    machines = None
+    try:
+        from coord.config import load as _load_yaml_config  # noqa: PLC0415
+
+        machines = _load_yaml_config(config_path).machines
+    except Exception:  # noqa: BLE001
+        pass
+
     # #1563: fail loudly, see the matching comment on pause() above.
     try:
-        changed = _unpause(machine)
+        outcome = _unpause(machine, machines)
     except Exception as e:  # noqa: BLE001
         click.echo(
             f"error: could not confirm unpause of {machine!r} with the daemon: {e}",
             err=True,
         )
         sys.exit(1)
-    if changed:
+    if outcome.kind == "resumed":
         click.echo(f"resumed: {machine}")
+    elif outcome.kind == "quiet_override":
+        click.echo(
+            f"{machine}: quiet hours overridden until {outcome.quiet_until} "
+            f"({outcome.tz}) — resumes its normal quiet schedule next window"
+        )
     else:
         click.echo(f"not paused: {machine}")
