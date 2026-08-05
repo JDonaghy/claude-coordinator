@@ -93,6 +93,21 @@ pub(crate) fn format_unix_abs(ts: f64) -> String {
     )
 }
 
+/// #1765: a unix timestamp as a filename-safe UTC stamp — `YYYYMMDD-HHMM`.
+///
+/// Deliberately the same `%Y%m%d-%H%M` the server's `coord.reports.
+/// csv_filename` produces, so the panel's save-dialog suggestion and the
+/// daemon's `Content-Disposition` name agree for the same run. Derived from
+/// [`format_unix_abs`] rather than re-deriving the calendar arithmetic —
+/// one civil-date implementation, not two.
+pub(crate) fn format_unix_stamp(ts: f64) -> String {
+    let abs = format_unix_abs(ts); // "YYYY-MM-DD HH:MM"
+    match abs.split_once(' ') {
+        Some((date, time)) => format!("{}-{}", date.replace('-', ""), time.replace(':', "")),
+        None => abs.replace('-', ""),
+    }
+}
+
 /// Timestamps older (or newer) than this render absolutely rather than
 /// relatively. `fmt_dur`'s largest unit is the hour, so beyond a couple of
 /// days "72h0m ago" is strictly less legible than a date — and a report

@@ -1172,6 +1172,49 @@ impl CoordApp {
                     }
                 }
             }
+
+            // #1765: the CSV export. Every terminal state writes a visible
+            // message into the notes area — a silent write is
+            // indistinguishable from a silent failure, and only the message
+            // carries the destination.
+            if let Some(rx) = &self.reports_export_rx {
+                match rx.try_recv() {
+                    Ok(ReportExportOutcome::Written { path, bytes }) => {
+                        // Name the row order explicitly: the export is the
+                        // report's canonical order, NOT the panel's
+                        // client-side sort (#1762), and that difference is
+                        // better said than discovered in a spreadsheet.
+                        self.reports_export_status = Some(format!(
+                            "Exported {bytes} bytes → {} (report order, not the on-screen sort)",
+                            path.display()
+                        ));
+                        self.reports_export_rx = None;
+                        needs_redraw = true;
+                    }
+                    Ok(ReportExportOutcome::NoBoardService) => {
+                        self.reports_export_status =
+                            Some("Export failed: no board service configured.".to_string());
+                        self.reports_export_rx = None;
+                        needs_redraw = true;
+                    }
+                    Ok(ReportExportOutcome::Failed(reason)) => {
+                        self.reports_export_status = Some(format!("Export failed: {reason}"));
+                        self.reports_export_rx = None;
+                        needs_redraw = true;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        // Still in flight — the notes area shows "Exporting →".
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        // The worker died without answering. Say so rather
+                        // than leaving "Exporting…" on screen forever.
+                        self.reports_export_status =
+                            Some("Export failed: the export worker stopped.".to_string());
+                        self.reports_export_rx = None;
+                        needs_redraw = true;
+                    }
+                }
+            }
         }
 
         needs_redraw

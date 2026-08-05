@@ -78,6 +78,11 @@ use quadraui::{
     // imported above (they come from the same primitive).
     FormHit, FormLayout, HeaderHit, MultiSectionView, MultiSectionViewHit,
     MultiSectionViewLayout, MsvAxis, Section, SectionBody, SectionHeader,
+    // #1765: the per-section Export action and the save dialog it opens.
+    // `HeaderAction` + `SectionHeader.actions` and
+    // `PlatformServices::show_file_save_dialog` both already existed
+    // upstream — this feature adds nothing to quadraui.
+    FileDialogOptions, HeaderAction, Icon,
     // #953: Terminal-view left-pane machine tree — the app's first direct
     // `backend.draw_tree` sidebar (bypassing `SidebarSystem`).
     SelectionMode, TreePath, TreeStyle, TreeView,
@@ -3163,6 +3168,26 @@ pub struct CoordApp {
     /// start at the main panel's origin; the section stack sits above it.
     /// `None` whenever no table is on screen.
     reports_table_layout: std::cell::RefCell<Option<(Rect, DataTableLayout)>>,
+    /// #1765: the report id whose section-header Export action was just
+    /// clicked, awaiting the save dialog.
+    ///
+    /// Mouse routing (`mouse_main_click`) has no `Backend` handle, and
+    /// `PlatformServices::show_file_save_dialog` needs one — so the click
+    /// parks the request here and `dispatch_handle` (which does have the
+    /// backend) drains it in the same turn. Same shape as
+    /// `pending_panel_switch`: a one-shot request, never a mode.
+    reports_pending_export: Option<String>,
+    /// #1765: the outcome of the last Export — the destination it was
+    /// written to, that it was cancelled, or why it failed. Rendered in the
+    /// notes area, because a silent write is indistinguishable from a
+    /// silent failure.
+    reports_export_status: Option<String>,
+    /// #1765: in-flight CSV export (fetch `?format=csv` + write), drained by
+    /// the same view-gated poll loop that drains `reports_run_rx`. A thread
+    /// rather than an inline blocking fetch: a report run can take seconds
+    /// server-side, and freezing the UI for it would be worse than the
+    /// spinner-less wait.
+    reports_export_rx: Option<std::sync::mpsc::Receiver<ReportExportOutcome>>,
 
     // ── #541: global Telescope-style issue fuzzy finder ──────────────────────
     /// Active state of the issue fuzzy-finder overlay.  `None` when the
@@ -3683,6 +3708,9 @@ impl CoordApp {
             reports_layout: std::cell::RefCell::new(MsvLayoutCache::default()),
             reports_sort: None,
             reports_table_layout: std::cell::RefCell::new(None),
+            reports_pending_export: None,
+            reports_export_status: None,
+            reports_export_rx: None,
             // #217: resolved theme palette — computed from settings + optional
             // ~/.coord/theme.toml override file.
             active_theme: {

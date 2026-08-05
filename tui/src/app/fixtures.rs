@@ -334,6 +334,9 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         reports_layout: std::cell::RefCell::new(MsvLayoutCache::default()),
         reports_sort: None,
         reports_table_layout: std::cell::RefCell::new(None),
+        reports_pending_export: None,
+        reports_export_status: None,
+        reports_export_rx: None,
         // #217: use the default dark palette for test helpers.
         active_theme: crate::settings::Theme::Dark.to_quadraui_theme(),
         // #728: default 2h window for tests (can be overridden per test).

@@ -275,6 +275,45 @@ impl CoordApp {
         })
     }
 
+    // ── #1765: the Export header action ──────────────────────────────────
+
+    /// The `HeaderAction::id` of the per-section Export button. Routed by
+    /// id, never by position, so adding a second action later can't silently
+    /// re-point this one.
+    pub(crate) const REPORTS_EXPORT_ACTION: &'static str = "export";
+
+    /// Whether `def`'s section currently has a result to export.
+    ///
+    /// The panel holds **one** result at a time (a run clears the previous
+    /// one), so this is "the last run was this report and it succeeded" —
+    /// which is exactly the condition under which exporting means anything.
+    pub(crate) fn reports_has_result(&self, report_id: &str) -> bool {
+        self.reports_result
+            .as_ref()
+            .is_some_and(|r| r.report_id == report_id)
+    }
+
+    /// The section header's Export action, enabled only when that report has
+    /// a result.
+    ///
+    /// Disabled rather than absent: quadraui renders a disabled action
+    /// dimmed and reserves no hit region for it (clicks fall through to the
+    /// title area), so an unrun report shows a visibly inert button instead
+    /// of either a confusing no-op or an affordance that pops into existence
+    /// the first time you run something.
+    fn reports_export_action(&self, def: &ReportDef) -> HeaderAction {
+        HeaderAction {
+            id: Self::REPORTS_EXPORT_ACTION.to_string(),
+            // A one-character fallback on purpose: quadraui's TUI header
+            // draws `icon.fallback` at its full width but hit-tests a fixed
+            // 2-cell region per action, so a wider glyph would paint outside
+            // the region that actually accepts the click.
+            icon: Icon::new("\u{f019}", "⤓"),
+            tooltip: Some("Export this report as CSV".to_string()),
+            enabled: self.reports_has_result(&def.id) && self.reports_running.is_none(),
+        }
+    }
+
     /// The section stack: one `Section` per catalogue entry, titled from the
     /// catalogue.
     pub(crate) fn reports_view(&self) -> MultiSectionView {
@@ -303,7 +342,7 @@ impl CoordApp {
                             def.title.as_str()
                         }),
                         badge: self.reports_badge(def),
-                        actions: Vec::new(),
+                        actions: vec![self.reports_export_action(def)],
                         show_chevron: true,
                     },
                     body: SectionBody::Form(self.reports_param_form(def, focused)),
@@ -928,10 +967,22 @@ impl CoordApp {
 
         // Notes get the bottom of the area; the table (or the empty-window
         // message) gets the rest.
-        let notes_rows = if result.notes.is_empty() {
+        //
+        // #1765: the export outcome rides in the same block, pinned above
+        // the report's own notes. It goes here rather than in a toast
+        // because it has to survive being read — a silent write and a
+        // silent failure look identical, and the destination path is the
+        // whole answer.
+        let note_lines: Vec<&str> = self
+            .reports_export_status
+            .as_deref()
+            .into_iter()
+            .chain(result.notes.iter().map(|s| s.as_str()))
+            .collect();
+        let notes_rows = if note_lines.is_empty() {
             0
         } else {
-            (result.notes.len() + 2).min(Self::REPORTS_NOTES_MAX_ROWS)
+            (note_lines.len() + 2).min(Self::REPORTS_NOTES_MAX_ROWS)
         };
         let notes_h = (notes_rows as f32 * lh).min(rect.height * 0.5);
         let table_h = (rect.height - notes_h).max(0.0);
@@ -994,8 +1045,7 @@ impl CoordApp {
         }
 
         if notes_h > 0.0 {
-            let items: Vec<ListItem> = result
-                .notes
+            let items: Vec<ListItem> = note_lines
                 .iter()
                 .map(|n| activity_item(&format!(" {n}"), Color::rgb(210, 200, 160)))
                 .collect();
@@ -1094,6 +1144,10 @@ impl CoordApp {
         self.reports_error = None;
         self.reports_result = None;
         self.reports_result_scroll = 0;
+        // #1765: the previous run's export outcome describes a file that
+        // holds the previous run's rows. Drop it with the result it belongs
+        // to rather than letting it read as a report on the new one.
+        self.reports_export_status = None;
         // Sort is view state over one specific result set, so it resets
         // with that set — same posture as the panel's parameters and the
         // Audit panel's filters, neither of which persist across restarts.
@@ -1102,6 +1156,141 @@ impl CoordApp {
         self.reports_sort = None;
         self.reports_running = Some(def.id.clone());
         self.reports_run_rx = Some(spawn_report_run(&def.id, params));
+    }
+
+    /// The `(param_id, value)` pairs to send for `def` — the operator's
+    /// edits where they exist, the catalogue's defaults elsewhere. Shared by
+    /// the run and the export so the two can never disagree about the
+    /// window they are asking for.
+    fn reports_param_pairs(&self, def: &ReportDef) -> Vec<(String, String)> {
+        def.params
+            .iter()
+            .map(|p| (p.id.clone(), self.reports_param_value(&def.id, p)))
+            .collect()
+    }
+
+    // ── #1765: export ────────────────────────────────────────────────────
+
+    /// Note the Export click for `section`, to be picked up once a `Backend`
+    /// handle is in scope.
+    ///
+    /// Mouse routing has no backend, and the save dialog needs one, so the
+    /// click parks the request and `dispatch_handle` drains it in the same
+    /// turn (see `reports_drain_pending_export`). Returns `false` — leaving
+    /// the frame unchanged — for a report with no result, which the disabled
+    /// action should already have prevented; this is the belt to that
+    /// braces, not a second policy.
+    pub(crate) fn reports_request_export(&mut self, section: usize) -> bool {
+        let Some(id) = self.reports_catalogue().get(section).map(|d| d.id.clone()) else {
+            return false;
+        };
+        if !self.reports_has_result(&id) || self.reports_running.is_some() {
+            return false;
+        }
+        self.reports_sel = section;
+        self.reports_pending_export = Some(id);
+        true
+    }
+
+    /// `issue-activity-20260804-1130.csv` — the save dialog's suggested name.
+    ///
+    /// Stamped from the *result's* window end, not the wall clock, so it
+    /// matches the `Content-Disposition` filename the daemon offers for the
+    /// same run and two exports of the same result don't get two names.
+    pub(crate) fn reports_suggested_export_name(result: &ReportResult) -> String {
+        let stamp = format_unix_stamp(result.window.get(1).copied().unwrap_or(0.0));
+        let id: String = result
+            .report_id
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        format!("{id}-{stamp}.csv")
+    }
+
+    /// Resolve what the save dialog said into a destination.
+    ///
+    /// The TUI branch is the awkward one and is deliberately explicit:
+    /// quadraui's TUI `PlatformServices::show_file_save_dialog` is a
+    /// documented no-op that always returns `None` ("apps should provide an
+    /// in-TUI picker instead"), so treating `None` as "cancelled"
+    /// everywhere would make Export permanently dead in `coord-tui` — the
+    /// one binary this panel actually ships in. Instead the TUI falls back
+    /// to the suggested filename in `$HOME`, and the caller reports the full
+    /// path, so the operator always learns where the file went. On a backend
+    /// that really can ask (GTK, macOS), `None` means the operator cancelled
+    /// and nothing is written.
+    pub(crate) fn reports_export_destination(
+        chosen: Option<std::path::PathBuf>,
+        platform: &str,
+        suggested: &str,
+    ) -> ReportExportDest {
+        if let Some(path) = chosen {
+            return ReportExportDest::Path(path);
+        }
+        if platform == "tui" {
+            return ReportExportDest::Path(home_dir().join(suggested));
+        }
+        ReportExportDest::Cancelled
+    }
+
+    /// Ask for a destination and start the export. Called from
+    /// `dispatch_handle`, the nearest point to the click that holds a
+    /// `Backend`. Returns `true` when it did anything (i.e. a redraw is due).
+    pub(crate) fn reports_drain_pending_export(&mut self, backend: &mut dyn Backend) -> bool {
+        let Some(report_id) = self.reports_pending_export.take() else {
+            return false;
+        };
+        let suggested = match self
+            .reports_result
+            .as_ref()
+            .filter(|r| r.report_id == report_id)
+        {
+            Some(result) => Self::reports_suggested_export_name(result),
+            None => {
+                // The result went away between the click and this drain (a
+                // re-run, a failure). Say so rather than exporting whatever
+                // is on screen now.
+                self.reports_export_status =
+                    Some(format!("Export: {report_id} has no result to export."));
+                return true;
+            }
+        };
+        let chosen = backend.services().show_file_save_dialog(FileDialogOptions {
+            title: Some(format!("Export {report_id} as CSV")),
+            initial_dir: None,
+            initial_filename: Some(suggested.clone()),
+            filters: vec![("CSV".to_string(), vec!["csv".to_string()])],
+        });
+        let platform = backend.services().platform_name();
+        match Self::reports_export_destination(chosen, platform, &suggested) {
+            ReportExportDest::Cancelled => {
+                // Not an error: nothing was written and nothing went wrong.
+                self.reports_export_status = Some("Export cancelled.".to_string());
+            }
+            ReportExportDest::Path(dest) => self.reports_start_export(&report_id, dest),
+        }
+        true
+    }
+
+    /// Fire the background fetch-and-write for `report_id` → `dest`.
+    pub(crate) fn reports_start_export(&mut self, report_id: &str, dest: std::path::PathBuf) {
+        let Some(def) = self
+            .reports_catalogue()
+            .iter()
+            .find(|d| d.id == report_id)
+            .cloned()
+        else {
+            return;
+        };
+        let params = self.reports_param_pairs(&def);
+        self.reports_export_status = Some(format!("Exporting → {}…", dest.display()));
+        self.reports_export_rx = Some(spawn_report_export(&def.id, params, dest));
     }
 
     /// Re-run the selected report (`r`, and the initial `Enter`).
@@ -1255,4 +1444,13 @@ impl CoordApp {
             .map(|(_, p)| p.kind != "choice" || p.choices.is_empty())
             .unwrap_or(false)
     }
+}
+
+/// #1765: where an Export should be written, once the save dialog has had
+/// its say. `Cancelled` is a *successful* no-op — nothing written, nothing
+/// reported as an error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReportExportDest {
+    Path(std::path::PathBuf),
+    Cancelled,
 }
