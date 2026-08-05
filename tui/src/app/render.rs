@@ -111,10 +111,6 @@ impl ShellApp for CoordApp {
                 SidebarView::Audit => {
                     backend.draw_list(sidebar_rect, &self.audit_sidebar());
                 }
-                // #1116: Usage sidebar — scope/group-by + Σ total.
-                SidebarView::Usage => {
-                    backend.draw_list(sidebar_rect, &self.usage_sidebar());
-                }
                 // #1741: Reports sidebar — catalogue size + last run summary.
                 SidebarView::Reports => {
                     backend.draw_list(sidebar_rect, &self.reports_sidebar());
@@ -526,11 +522,6 @@ impl ShellApp for CoordApp {
             SidebarView::Audit => {
                 self.render_audit_panel(backend, m, lh);
             }
-            // #1116: Usage panel — per-issue/repo cost/token grid, or the
-            // per-stage drill while an issue is expanded.
-            SidebarView::Usage => {
-                self.render_usage_panel(backend, m, lh);
-            }
             // #1741: Reports panel — collapsible per-report section stack,
             // with the last run's table + notes below it.
             SidebarView::Reports => {
@@ -719,10 +710,17 @@ impl ShellApp for CoordApp {
             "panel:sessions" => SidebarView::Sessions,
             // #1039: Audit panel — newest-first audit-trail list.
             "panel:audit" => SidebarView::Audit,
-            // #1116: Usage panel — per-issue/repo cost/token grid.
-            "panel:usage" => SidebarView::Usage,
             // #1741: Reports panel — catalogue-driven collapsible sections.
-            "panel:reports" => SidebarView::Reports,
+            //
+            // #1763 retired the #1116 Usage panel: its per-issue/repo
+            // cost+token rollup is now the `usage` entry in the server-side
+            // report catalogue, priced from the daemon's own `pricing:`
+            // config instead of a compiled-in snapshot. The legacy
+            // `panel:usage` id still routes here — exactly as
+            // `panel:milestones` still routes to Plans after #975 — so an
+            // operator who had that button pinned lands on the panel that
+            // subsumed it rather than on a dead view.
+            "panel:reports" | "panel:usage" => SidebarView::Reports,
             _ => return,
         };
         // #1124: the `?` help overlay / `/` command palette are scoped to

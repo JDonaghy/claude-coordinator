@@ -208,8 +208,6 @@ impl CoordApp {
             || self.pending_kill_terminal.is_some()
             || self.pending_kill_drive.is_some()
             || self.pending_kill_session.is_some()
-            || self.pending_usage_range_start.is_some()
-            || self.pending_usage_range_end.is_some()
             // #1124: Plans `?` help overlay / `/` command palette — both
             // own ALL input while open (see `events.rs`'s dispatch block).
             || self.help_overlay.is_open()
@@ -290,9 +288,7 @@ impl CoordApp {
             // MilestoneDag's "Dispatch milestone" is a keybind + context menu (#771);
             // Sessions is read-only nav/select in this slice (#1032); Audit's
             // verbs (nav/detail/refresh) are all keybinds, surfaced in the
-            // status-bar hints (#1039). Usage's verbs (scope/group-by/
-            // sort/expand) are all keybinds + header clicks, same as Audit
-            // (#1116).
+            // status-bar hints (#1039).
             SidebarView::Pipeline
             | SidebarView::Machines
             | SidebarView::Settings
@@ -307,8 +303,7 @@ impl CoordApp {
             // section's own form (collapsing a section must hide it) — a
             // panel-level toolbar button would be a second, always-visible
             // trigger with no section to bind it to.
-            | SidebarView::Reports
-            | SidebarView::Usage => return None,
+            | SidebarView::Reports => return None,
         };
 
         Some(Toolbar {

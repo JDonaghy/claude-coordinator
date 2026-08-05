@@ -48,13 +48,36 @@ pub(crate) fn format_unix_time(ts: f64) -> String {
     format!("{} ago", fmt_dur(delta))
 }
 
-/// #1762: absolute UTC rendering of a unix timestamp — `YYYY-MM-DD HH:MM`.
+/// Inverse of Howard Hinnant's `days_from_civil`: days-since-the-Unix-epoch
+/// → `(year, month, day)` in the proleptic Gregorian calendar, UTC.
+/// <http://howardhinnant.github.io/date_algorithms.html>
 ///
-/// The civil-calendar conversion is `usage::civil_from_days` (Howard
-/// Hinnant's algorithm), deliberately **borrowed rather than re-derived**:
-/// this workspace carries no chrono/time crate, `usage.rs` already
-/// hand-rolls the arithmetic, and a second copy here would be the third
-/// calendar in one binary.
+/// This workspace carries no chrono/time crate, so the one place that needs
+/// an absolute calendar rendering ([`format_unix_abs`]) has to do the
+/// arithmetic itself. It lived in `app/usage.rs` until #1763 retired that
+/// panel — the *server* now owns every calendar decision the Usage view
+/// used to make locally (Today/Week/Month boundaries are `datetime` in
+/// `coord/usage_rollup.py`), and all that survives client-side is turning
+/// one epoch float into `YYYY-MM-DD` for display.
+///
+/// `div_euclid` (not `/`) is required for the `era` step: `z` can be
+/// negative there and Rust's `/` truncates toward zero, but the algorithm
+/// needs floor division.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 }.div_euclid(146_097);
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+/// #1762: absolute UTC rendering of a unix timestamp — `YYYY-MM-DD HH:MM`.
 pub(crate) fn format_unix_abs(ts: f64) -> String {
     const SECS_PER_DAY: f64 = 86_400.0;
     // `.floor()`, not a truncating cast: a pre-1970 timestamp is negative
@@ -62,7 +85,7 @@ pub(crate) fn format_unix_abs(ts: f64) -> String {
     // the seconds-into-the-day remainder goes negative.
     let days = (ts / SECS_PER_DAY).floor();
     let rem = (ts - days * SECS_PER_DAY).max(0.0) as u64;
-    let (y, m, d) = super::usage::civil_from_days(days as i64);
+    let (y, m, d) = civil_from_days(days as i64);
     format!(
         "{y:04}-{m:02}-{d:02} {h:02}:{min:02}",
         h = (rem / 3600) % 24,
@@ -128,45 +151,33 @@ pub(crate) fn format_cost_usd(cost: f64) -> String {
     }
 }
 
-/// #1116: format an ESTIMATED worker cost in USD, visually distinct from a
-/// captured figure (`format_cost_usd`) via a `~$` prefix — matches the CLI's
-/// (#1115) `~$` convention so an interactive-heavy issue never reads as
-/// "no cost data" just because nothing was captured. Zero renders as "—"
-/// (not "~$0.00") since "no estimate" and "estimated zero" are the same
-/// thing here — unlike captured cost, there's no ambiguity to flag.
-/// Four decimal places so $0.9060 is distinguishable from $0.91 in the Usage
-/// grid (ms-37 contract Mock 2).
-pub(crate) fn format_cost_est(cost: f64) -> String {
-    if cost <= 0.0 {
-        "—".to_string()
-    } else if cost < 0.0001 {
-        "~< $0.0001".to_string()
-    } else {
-        format!("~${cost:.4}")
-    }
-}
-
-/// #1116: render a captured cost for the Usage grid/drill, where a genuine
-/// zero (no captured cost at all — e.g. an interactive-only leg) should read
-/// as "—" rather than `format_cost_usd`'s "$0.00" (which elsewhere means
-/// "captured, and it rounds to zero"). The Usage view always has cost_est
-/// as a companion column, so "—" here is unambiguous: nothing was captured.
-/// Four decimal places matches the ms-37 contract Mock 2 ($0.5000).
-pub(crate) fn format_cost_captured(cost: f64) -> String {
-    if cost <= 0.0 {
+/// #1763: render a `money`-kind report cell (per `column_meta`, #1760).
+///
+/// Four decimal places so $0.9060 is distinguishable from $0.91 — a single
+/// worker leg genuinely costs fractions of a cent, and `$0.00` would read as
+/// free. Exact zero renders as "—" rather than `$0.0000`: in the `usage`
+/// report every dollar column has a companion (captured/estimated/total), so
+/// a blank cell unambiguously means "nothing here" instead of implying a
+/// figure was computed and came out at zero.
+///
+/// This is the *generic* renderer for the `money` kind, not a Usage-specific
+/// helper: it is reached only through `reports_cell_text`'s dispatch on
+/// `kind`, so any report that declares a `money` column gets it. (It began
+/// as #1116's `format_cost_captured` for the retired Usage panel.)
+pub(crate) fn format_money(cost: f64) -> String {
+    if cost == 0.0 {
         "—".to_string()
     } else {
         format!("${cost:.4}")
     }
 }
 
-/// #1116: compact `NmSSs` duration for the Usage grid/drill (e.g.
-/// `"45m00s"`), distinct from `fmt_dur`'s coarser `"45m"`/`"1h30m"` (used
-/// elsewhere for elapsed-time display) — the Usage view sums durations
-/// across many legs, so seconds-precision avoids "0m" reading as "no data"
-/// for a short leg. `secs <= 0.0` (no duration recorded, or a still-open
-/// leg with nothing finished yet) renders as "—".
-pub(crate) fn format_duration_usage(secs: f64) -> String {
+/// #1763: render a `duration`-kind report cell as a compact `NmSSs` /
+/// `NhMMmSSs` (e.g. `"45m00s"`), distinct from `fmt_dur`'s coarser
+/// `"45m"`/`"1h30m"` used for elapsed-time display. A report duration is
+/// typically a *sum* over many legs, so seconds-precision avoids a short
+/// total reading as `"0m"` / "no data". `secs <= 0.0` renders as "—".
+pub(crate) fn format_duration_compact(secs: f64) -> String {
     if secs <= 0.0 {
         return "—".to_string();
     }

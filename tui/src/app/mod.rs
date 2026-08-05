@@ -104,7 +104,6 @@ pub(crate) mod pipeline;
 pub(crate) mod milestone_dag;
 pub(crate) mod plans;
 pub(crate) mod audit;
-pub(crate) mod usage;
 // #1741: Reports panel + the reusable `MultiSectionView` routing it is the
 // first consumer of (epic #571's panel consolidation is the next).
 pub(crate) mod msv;
@@ -831,31 +830,6 @@ pub(crate) struct PendingNewTerminal {
     /// Coordinator machine NAME the terminal will be created on.
     machine: String,
     /// Operator-typed name buffer, empty until they type something.
-    buf: String,
-}
-
-/// #1116: pending "Custom range…" dialog, step 1 of 2 — collect the start
-/// instant. Armed by `open_usage_custom_range` (`c` on the Usage panel).
-/// `buf` accumulates the typed `YYYY-MM-DD[ HH:MM]` (UTC) text; Enter
-/// parses it (`usage::parse_datetime_utc`) and, on success, clears this
-/// field and opens `pending_usage_range_end` for the end instant — on
-/// failure it closes the dialog and shows a toast (this codebase's
-/// universal dialog convention: Enter always closes, validation happens
-/// after — see the #954 name-prompt for the same shape). Esc cancels.
-#[derive(Clone, Default)]
-pub(crate) struct PendingUsageRangeStart {
-    buf: String,
-}
-
-/// #1116: pending "Custom range…" dialog, step 2 of 2 — collect the end
-/// instant now that `start` is resolved. Enter parses `buf` and, when the
-/// result is a non-empty interval (`end > start`), sets
-/// `CoordApp::usage_scope = UsageScope::Custom { start, end }`; otherwise
-/// shows a toast and cancels (same convention as step 1). Esc cancels.
-#[derive(Clone)]
-pub(crate) struct PendingUsageRangeEnd {
-    /// Resolved start instant from step 1 (Unix seconds, UTC).
-    start: f64,
     buf: String,
 }
 
@@ -3119,41 +3093,6 @@ pub struct CoordApp {
     /// — a single click starts at most one kind of drag.
     audit_scrollbar_drag: Option<AuditScrollAxis>,
 
-    // ── #1116: Usage ActivityBar panel ────────────────────────────────────────
-    /// Current time-scope selector (contract-free — no sealed acceptance
-    /// slice for this TUI view; see `app/usage.rs` module docs). Cycled by
-    /// `t`; `Custom` is set only by the "Custom range…" dialog (`c`).
-    usage_scope: UsageScope,
-    /// Current grouping dimension, toggled by `g`.
-    usage_group_by: UsageGroupBy,
-    /// Current sort metric, changed by clicking a grid header. Direction is
-    /// tracked separately so a repeat click on the same header toggles it.
-    usage_sort_key: UsageSortKey,
-    usage_sort_dir: SortDirection,
-    /// Selected row index (0-based) into the currently-rendered grid or
-    /// drill table (`usage_expanded` selects which). Clamped on navigation,
-    /// same pattern as `audit_sel`.
-    usage_sel: usize,
-    /// Vertical scroll offset for the same table `usage_sel` indexes into.
-    usage_scroll: usize,
-    /// `Some((repo, issue_number))` while the per-stage drill for that issue
-    /// is open (main panel shows the drill `DataTable` instead of the
-    /// grid); `None` shows the grid. Only reachable when
-    /// `usage_group_by == UsageGroupBy::Issue` — a `Repo`-grouped row has no
-    /// single issue to drill into in this slice.
-    usage_expanded: Option<(String, u64)>,
-    /// The most recently rendered Usage `DataTable` (grid or drill)'s
-    /// resolved layout, cached by `render_usage_panel` so mouse hit-testing
-    /// can reuse the exact geometry that was painted — same
-    /// render-then-hit-test pattern as `audit_table_layout`.
-    usage_table_layout: std::cell::RefCell<Option<DataTableLayout>>,
-    /// "Custom range…" dialog, step 1 (start instant). `None` when the
-    /// dialog isn't open.
-    pending_usage_range_start: Option<PendingUsageRangeStart>,
-    /// "Custom range…" dialog, step 2 (end instant). `None` when not on
-    /// this step.
-    pending_usage_range_end: Option<PendingUsageRangeEnd>,
-
     // ── #1741: Reports ActivityBar panel ─────────────────────────────────────
     //
     // Everything here is keyed by the *catalogue's* report ids and param ids
@@ -3724,16 +3663,6 @@ impl CoordApp {
             audit_scrollbar_drag: None,
             // #1116: Usage panel — defaults to today/by-issue/cost-total-desc,
             // nothing expanded, no custom-range dialog open.
-            usage_scope: UsageScope::Today,
-            usage_group_by: UsageGroupBy::Issue,
-            usage_sort_key: UsageSortKey::CostTotal,
-            usage_sort_dir: SortDirection::Descending,
-            usage_sel: 0,
-            usage_scroll: 0,
-            usage_expanded: None,
-            usage_table_layout: std::cell::RefCell::new(None),
-            pending_usage_range_start: None,
-            pending_usage_range_end: None,
             // #1741: Reports panel — nothing fetched yet; the first tick with
             // active_view == Reports arms the catalogue fetch (settings_ui.rs).
             reports_catalogue: None,
@@ -3903,13 +3832,6 @@ impl CoordApp {
                     icon: "§".into(),
                     tooltip: "Audit".into(),
                     title: "AUDIT".into(),
-                },
-                // #1116: Usage panel — per-issue/repo cost+token grid.
-                PanelDefinition {
-                    id: WidgetId::new("panel:usage"),
-                    icon: "$".into(),
-                    tooltip: "Usage".into(),
-                    title: "USAGE".into(),
                 },
                 // #1741: Reports panel — one collapsible section per entry in
                 // the `GET /report` catalogue (#1742). `▤` collides with none
@@ -7779,19 +7701,6 @@ impl CoordApp {
                      Tab=category ({})  f=filter  Esc=clear  q=quit ",
                     self.audit_time_range.label(),
                     self.audit_category.label(),
-                )
-            }
-        } else if self.active_view == SidebarView::Usage {
-            // #1116: grid vs drill hint sets — scope/group-by are only
-            // meaningful on the grid (the drill is scoped to one issue).
-            if self.usage_expanded.is_some() {
-                " Esc=back to grid  j/k=nav  q=quit ".to_string()
-            } else {
-                format!(
-                    " j/k=nav  Enter=expand  click header=sort  t=scope ({})  \
-                     g=group-by ({})  c=custom range  q=quit ",
-                    self.usage_scope.label(),
-                    self.usage_group_by.label(),
                 )
             }
         } else if self.active_view == SidebarView::Reports {

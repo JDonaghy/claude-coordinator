@@ -157,11 +157,6 @@ pub(crate) enum SidebarView {
     /// trail (`/audit`, #1037) with an inline entry-detail view, modeled on
     /// the Plans panel. Filters (#1040) are a follow-up.
     Audit,
-    /// #1116: Usage panel — per-issue (or per-repo) cost/token grid sourced
-    /// from the already-loaded board assignments (no new daemon
-    /// round-trip), with a scope selector (today/week/month/custom range),
-    /// group-by, and a click-to-expand per-stage drill. See `app/usage.rs`.
-    Usage,
     /// #1741: Reports panel — a `MultiSectionView` stack with one collapsible
     /// section per entry in `GET /report`'s catalogue (#1742), each section
     /// body being that report's parameter `Form` plus a `Run` button. The
@@ -185,7 +180,6 @@ impl SidebarView {
             SidebarView::Plans => "Plans",
             SidebarView::Sessions => "Sessions",
             SidebarView::Audit => "Audit",
-            SidebarView::Usage => "Usage",
             SidebarView::Reports => "Reports",
         }
     }
@@ -213,7 +207,6 @@ impl SidebarView {
             SidebarView::Plans => Some(WidgetId::new("panel:plans")),
             SidebarView::Sessions => Some(WidgetId::new("panel:sessions")),
             SidebarView::Audit => Some(WidgetId::new("panel:audit")),
-            SidebarView::Usage => Some(WidgetId::new("panel:usage")),
             SidebarView::Reports => Some(WidgetId::new("panel:reports")),
             SidebarView::MilestoneDag => None,
         }
@@ -1694,6 +1687,12 @@ pub struct ReportColumnMeta {
 /// cells are looked up **by column name**, never by position. `notes` holds
 /// derived anomalies and renders under the table. `column_meta` (#1760) is
 /// per-column display metadata — see [`ReportColumnMeta`].
+///
+/// `totals` (#1763) is an optional grand-total row keyed by the same column
+/// ids as `rows`, rendered as the table's pinned footer. Additive in both
+/// directions: a daemon that predates it sends nothing (`None`, no footer,
+/// today's rendering exactly), and a report that has no meaningful sum
+/// (`issue-activity`, `drive-queue-status`) sends `null`.
 #[derive(Clone, Debug, Default, serde::Deserialize)]
 pub struct ReportResult {
     #[serde(default)]
@@ -1714,6 +1713,11 @@ pub struct ReportResult {
     pub rows: Vec<serde_json::Value>,
     #[serde(default)]
     pub notes: Vec<String>,
+    /// Grand-total row, or `None`. Kept as a raw `Value` for the same
+    /// reason `rows` is: its keys are the report's own column ids, which
+    /// this binary must not know.
+    #[serde(default)]
+    pub totals: Option<serde_json::Value>,
 }
 
 /// #1040: time-range filter for the Audit panel, cycled forward by the `t`
@@ -1832,86 +1836,6 @@ impl AuditCategory {
             other => Some(other.label()),
         }
     }
-}
-
-/// #1116: time-scope selector for the Usage panel, cycled forward by `t`
-/// (mirrors `AuditTimeRange`'s role). `Today`/`Week`/`Month` are UTC
-/// calendar-boundary presets (this workspace has no chrono/time crate — see
-/// `app/usage.rs`'s civil-calendar helpers); `Custom` is entered via the
-/// "Custom range…" two-step dialog (`c`), not part of the `t` cycle.
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub(crate) enum UsageScope {
-    Today,
-    Week,
-    Month,
-    /// Explicit `[start, end)` UTC instants (Unix seconds), set by the
-    /// custom-range dialog. Cycling `t` from here goes back to `Today`
-    /// rather than continuing a `Today -> Week -> Month -> Custom -> ...`
-    /// loop — `Custom` is a deliberate one-off pick, not a cycle stop.
-    Custom { start: f64, end: f64 },
-}
-
-impl Default for UsageScope {
-    fn default() -> Self {
-        UsageScope::Today
-    }
-}
-
-impl UsageScope {
-    /// Cycle forward: `Today -> Week -> Month -> Today`; `Custom -> Today`.
-    pub(crate) fn cycle_next(self) -> Self {
-        match self {
-            UsageScope::Today => UsageScope::Week,
-            UsageScope::Week => UsageScope::Month,
-            UsageScope::Month => UsageScope::Today,
-            UsageScope::Custom { .. } => UsageScope::Today,
-        }
-    }
-}
-
-/// #1116: grouping dimension for the Usage grid, toggled by `g`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub(crate) enum UsageGroupBy {
-    #[default]
-    Issue,
-    Repo,
-}
-
-impl UsageGroupBy {
-    pub(crate) fn next(self) -> Self {
-        match self {
-            UsageGroupBy::Issue => UsageGroupBy::Repo,
-            UsageGroupBy::Repo => UsageGroupBy::Issue,
-        }
-    }
-
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            UsageGroupBy::Issue => "Issue",
-            UsageGroupBy::Repo => "Repo",
-        }
-    }
-}
-
-/// #1116: which metric the Usage grid is sorted by. `CostTotal` (captured +
-/// estimated) is the default — matching the CLI's (#1115) desc-by-total-cost
-/// default — and isn't tied to any single visible column (the grid shows
-/// captured cost and estimated cost as separate columns), so no header
-/// sort-arrow is shown until the operator clicks one. Clicking a header
-/// switches to that column's key (toggling direction on a repeat click of
-/// the same column) — see `usage::column_sort_key`/`usage_sort_by_column`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub(crate) enum UsageSortKey {
-    #[default]
-    CostTotal,
-    IssueNumber,
-    Repo,
-    Title,
-    Legs,
-    CostCaptured,
-    CostEst,
-    Tokens,
-    Time,
 }
 
 /// CI check status for one PR.
