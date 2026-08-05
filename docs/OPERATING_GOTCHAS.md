@@ -333,6 +333,22 @@ Two config keys are load-bearing for that, both on the **daemon host's**
   `scripts/coord-test-runner.sh`, because the repo is two codebases and a bare
   `pytest` or `cargo test` would run the wrong suite or miss half the diff.
 
+**A systemd user unit's PATH is not a login shell's (#1814).** `coord serve`
+runs as a systemd *user* unit, and `coord merge --revalidate` runs its composed
+suite inside that daemon process. systemd never sources `~/.profile`, so
+`~/.cargo/bin` is absent from the daemon's PATH — `systemctl --user
+show-environment` is the environment that matters, not what `ssh` shows you.
+Every Rust branch therefore failed revalidation with `cargo: command not found`,
+reported as a red suite. The runner now resolves cargo explicitly (PATH →
+`$CARGO_HOME/bin/cargo` → `rustup which cargo`) and, when it truly cannot find
+one, prints `TOOLCHAIN MISSING` and exits **3** — which `--revalidate` renders
+as `INFRASTRUCTURE FAILURE … the suite could not run`, never `SUITE FAILED`. If
+you see that line, the branches are unjudged, not bad: fix the daemon's
+environment and re-run. `deploy/coord-serve.service` also sets an explicit
+`Environment=PATH=` as defence in depth; that line alone is never the fix,
+because it repairs one host and leaves the next one silently broken. Sibling
+bug, same environment class, different mechanism: #1809.
+
 Note that enabling `auto_queue` also **back-fills**: any completed work row
 with no test verdict becomes eligible, so turning it on works through the
 existing backlog as capacity frees. Expect smoke assignments for issues you did
