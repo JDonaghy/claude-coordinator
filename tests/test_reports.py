@@ -837,13 +837,13 @@ class TestRunDriveQueueStatus:
 
 
 class TestCatalogue:
-    def test_two_reports(self) -> None:
-        assert set(REPORTS) == {"issue-activity", "drive-queue-status"}
+    def test_three_reports(self) -> None:
+        assert set(REPORTS) == {"issue-activity", "drive-queue-status", "usage"}
 
     def test_catalogue_carries_full_param_metadata(self) -> None:
         cat = catalogue()
         assert [r["id"] for r in cat["reports"]] == [
-            "drive-queue-status", "issue-activity",
+            "drive-queue-status", "issue-activity", "usage",
         ]
         rep = next(r for r in cat["reports"] if r["id"] == "issue-activity")
         assert rep["title"] == "Issue Activity"
@@ -988,15 +988,15 @@ class TestCli:
         assert "24h" in result.output  # the default
         for preset in ("1h", "6h", "3d", "7d"):
             assert preset in result.output
-        # Exactly two reports in the catalogue.
-        assert result.output.count("—  ") == 2
+        # Exactly three reports in the catalogue.
+        assert result.output.count("—  ") == 3
 
     def test_report_list_json(self, coord_db) -> None:
         result = CliRunner().invoke(main, ["report", "list", "--json"])
         assert result.exit_code == 0, result.output
         body = json.loads(result.output)
         assert [r["id"] for r in body["reports"]] == [
-            "drive-queue-status", "issue-activity",
+            "drive-queue-status", "issue-activity", "usage",
         ]
 
     def test_report_run_json_shape(self, coord_db) -> None:
@@ -1008,8 +1008,10 @@ class TestCli:
         body = json.loads(result.output)
         assert set(body) == {
             "report_id", "generated_at", "window", "columns", "column_meta",
-            "rows", "notes",
+            "rows", "notes", "totals",
         }
+        # #1763: additive and None for every report that has no meaningful sum.
+        assert body["totals"] is None
         assert body["report_id"] == "issue-activity"
         assert body["window"] == [WINDOW[1] - 13 * 3600, WINDOW[1]]
 
@@ -1228,8 +1230,10 @@ class TestCliDriveQueueStatus:
         body = json.loads(result.output)
         assert set(body) == {
             "report_id", "generated_at", "window", "columns", "column_meta",
-            "rows", "notes",
+            "rows", "notes", "totals",
         }
+        # #1763: additive and None for every report that has no meaningful sum.
+        assert body["totals"] is None
         assert body["report_id"] == "drive-queue-status"
         assert body["window"][0] == body["window"][1]
         assert [m["id"] for m in body["column_meta"]] == body["columns"]
@@ -1371,7 +1375,7 @@ class TestDaemonEndpoints:
         assert resp.status_code == 200
         body = resp.json()
         assert [r["id"] for r in body["reports"]] == [
-            "drive-queue-status", "issue-activity",
+            "drive-queue-status", "issue-activity", "usage",
         ]
         rep = next(r for r in body["reports"] if r["id"] == "issue-activity")
         params = {p["id"]: p for p in rep["params"]}
@@ -1722,3 +1726,420 @@ class TestFormatCell:
         lines = _render_table(result)
         data_line = lines[1]
         assert data_line.count("<window") == 1
+
+
+# ── usage (#1763) ──────────────────────────────────────────────────────────
+#
+# The panel this report replaced was a Rust port of `coord/usage_rollup.py`
+# with a *hardcoded* pricing snapshot, so an operator's `pricing:` override
+# moved `coord usage` and left the TUI showing different numbers with nothing
+# on screen saying which was right. Everything below exists to make that
+# divergence impossible to reintroduce: the figures are asserted equal to the
+# ones `coord usage --by-issue` computes over the same rows, and an overridden
+# rate is asserted to move the estimate.
+
+# A fixed window the fixtures sit inside, so nothing here needs a clock.
+_U_NOW = 1_785_000_000.0
+
+
+def _leg(
+    repo: str,
+    issue: int,
+    *,
+    title: str = "",
+    stage: str = "work",
+    model: str | None = "claude-sonnet-4-6",
+    cost_usd: float | None = None,
+    tokens_in: int = 0,
+    tokens_out: int = 0,
+    cache_read: int = 0,
+    cache_creation: int = 0,
+    dispatched_at: float | None = None,
+    finished_at: float | None = None,
+    for_issue_number: int | None = None,
+) -> dict:
+    """One board assignment row in the daemon `/board` wire shape."""
+    row = {
+        "repo_name": repo,
+        "issue_number": issue,
+        "issue_title": title,
+        "type": stage,
+        "model": model,
+        "cost_usd": cost_usd,
+        "input_tokens": tokens_in,
+        "output_tokens": tokens_out,
+        "cache_read_tokens": cache_read,
+        "cache_creation_tokens": cache_creation,
+        "dispatched_at": _U_NOW - 3600 if dispatched_at is None else dispatched_at,
+        "finished_at": _U_NOW - 1800 if finished_at is None else finished_at,
+    }
+    if for_issue_number is not None:
+        row["for_issue_number"] = for_issue_number
+    return row
+
+
+def _usage_fixture_rows() -> list[dict]:
+    return [
+        # api#7: one captured-cost leg + one estimated leg (no cost_usd).
+        _leg("api", 7, title="Do a thing", cost_usd=1.5, tokens_in=100, tokens_out=50),
+        _leg("api", 7, title="Do a thing", stage="review", model="opus",
+             tokens_in=1_000_000, tokens_out=1_000_000),
+        # api#9: estimate only.
+        _leg("api", 9, title="Another", tokens_in=2_000_000, tokens_out=100_000),
+        # web#3: a model with no pricing entry — must be flagged, never $0.
+        _leg("web", 3, title="Mystery", model="gpt-hypothetical",
+             tokens_in=500, tokens_out=500),
+    ]
+
+
+def _unbounded_window():
+    from coord.usage_rollup import TimeWindow
+
+    return TimeWindow(start=None, end=None, label="all")
+
+
+class TestUsageCatalogue:
+    def test_usage_is_in_the_catalogue_alongside_issue_activity(self) -> None:
+        ids = [r["id"] for r in catalogue()["reports"]]
+        assert "issue-activity" in ids
+        assert "usage" in ids
+
+    def test_usage_params_are_window_group_by_and_repo(self) -> None:
+        params = {p["id"]: p for p in REPORTS["usage"].to_dict()["params"]}
+        assert set(params) == {"window", "group_by", "repo"}
+        assert params["window"]["default"] == "today"
+        assert params["window"]["choices"] == ["today", "week", "month", "7d", "30d"]
+        assert params["group_by"]["default"] == "issue"
+        assert params["group_by"]["choices"] == ["issue", "repo"]
+
+    def test_bad_window_names_the_allowed_values(self) -> None:
+        with pytest.raises(ReportError) as exc:
+            resolve_params(REPORTS["usage"], {"window": "fortnight"})
+        assert "today" in str(exc.value) and "30d" in str(exc.value)
+
+    def test_bad_group_by_names_the_allowed_values(self) -> None:
+        with pytest.raises(ReportError) as exc:
+            resolve_params(REPORTS["usage"], {"group_by": "machine"})
+        assert "issue" in str(exc.value) and "repo" in str(exc.value)
+
+    def test_every_column_has_metadata_in_order(self) -> None:
+        from coord.reports import fold_usage
+
+        for group_by in ("issue", "repo"):
+            result = fold_usage(
+                _usage_fixture_rows(), _unbounded_window(), group_by=group_by
+            )
+            assert [m.id for m in result.column_meta] == result.columns
+
+
+class TestUsageMatchesCoordUsage:
+    """The load-bearing guard: the report and `coord usage --by-issue` must
+    agree, because they are the same fold over the same rows priced by the
+    same config — that is the whole reason #1763 exists."""
+
+    def test_report_figures_equal_the_coord_usage_aggregate(self) -> None:
+        from coord.config import PricingConfig
+        from coord.reports import fold_usage
+        from coord.usage import pricing_dict_from_config
+        from coord.usage_rollup import aggregate
+
+        rows = _usage_fixture_rows()
+        window = _unbounded_window()
+        pricing = PricingConfig()
+
+        # Path A — what `coord usage --by-issue` computes.
+        cli = aggregate(
+            rows, by="issue", window=window, pricing=pricing_dict_from_config(pricing)
+        )
+        # Path B — what `coord report run usage` returns.
+        report = fold_usage(rows, window, group_by="issue", pricing=pricing)
+
+        by_issue = {r["issue"]: r for r in report.rows}
+        assert len(by_issue) == len(cli["groups"])
+        for group in cli["groups"]:
+            row = by_issue[group["key"]]
+            assert row["legs"] == group["legs"]
+            assert row["tokens_in"] == group["tokens"]["input"]
+            assert row["tokens_out"] == group["tokens"]["output"]
+            assert row["cost_captured"] == pytest.approx(group["cost_captured"])
+            assert row["cost_est"] == pytest.approx(group["cost_est"])
+            assert row["cost_total"] == pytest.approx(group["cost_total"])
+
+        assert report.totals["cost_total"] == pytest.approx(cli["totals"]["cost_total"])
+        assert report.totals["legs"] == cli["totals"]["legs"]
+
+    def test_default_order_is_biggest_spend_first(self) -> None:
+        from coord.reports import fold_usage
+
+        result = fold_usage(_usage_fixture_rows(), _unbounded_window())
+        costs = [r["cost_total"] for r in result.rows]
+        assert costs == sorted(costs, reverse=True)
+
+    def test_captured_cost_is_never_also_estimated(self) -> None:
+        from coord.reports import fold_usage
+
+        rows = [_leg("api", 1, cost_usd=2.0, tokens_in=1_000_000, tokens_out=1_000_000)]
+        result = fold_usage(rows, _unbounded_window())
+        assert result.rows[0]["cost_captured"] == pytest.approx(2.0)
+        assert result.rows[0]["cost_est"] == 0.0
+
+
+class TestUsagePricingFollowsConfig:
+    """#1116's divergence, closed. The panel priced from a compiled-in
+    snapshot; this prices from the loaded `PricingConfig`."""
+
+    def test_overriding_a_rate_moves_the_estimate(self) -> None:
+        from coord.config import ModelRates, PricingConfig
+        from coord.reports import fold_usage
+
+        rows = [_leg("api", 1, model="sonnet", tokens_in=1_000_000, tokens_out=0)]
+        window = _unbounded_window()
+
+        default = fold_usage(rows, window, pricing=PricingConfig())
+        assert default.rows[0]["cost_est"] == pytest.approx(3.00)
+
+        override = PricingConfig(
+            models={"sonnet": ModelRates(input=99.0, output=0.0)}
+        )
+        moved = fold_usage(rows, window, pricing=override)
+        assert moved.rows[0]["cost_est"] == pytest.approx(99.00)
+        assert moved.rows[0]["cost_est"] != default.rows[0]["cost_est"]
+
+    def test_pricing_block_in_coordinator_yml_reaches_the_report(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End-to-end: the rate an operator writes in coordinator.yml is the
+        rate the report estimates with — no snapshot in between."""
+        from coord.reports import run_usage
+
+        cfg = tmp_path / "coordinator.yml"
+        cfg.write_text(
+            "repos:\n"
+            "  - name: api\n"
+            "    github: acme/api\n"
+            "machines:\n"
+            "  - name: laptop\n"
+            "    host: laptop.tail\n"
+            "    repos: [api]\n"
+            "pricing:\n"
+            "  sonnet:\n"
+            "    input: 42.0\n"
+            "    output: 0.0\n"
+            "    cache_read: 0.0\n"
+            "    cache_creation: 0.0\n"
+        )
+        monkeypatch.setenv("COORD_CONFIG", str(cfg))
+
+        rows = [_leg("api", 1, model="sonnet", tokens_in=1_000_000, tokens_out=0)]
+        result = run_usage(
+            window="30d", group_by="issue", now=_U_NOW, fetch=lambda repo: rows
+        )
+        assert result.rows[0]["cost_est"] == pytest.approx(42.00)
+        assert not any(n.startswith("WARNING") for n in result.notes)
+
+    def test_unloadable_config_says_so_instead_of_silently_defaulting(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from coord.reports import run_usage
+
+        monkeypatch.setenv("COORD_CONFIG", str(tmp_path / "does-not-exist.yml"))
+        result = run_usage(
+            window="30d", now=_U_NOW,
+            fetch=lambda repo: [_leg("api", 1, model="sonnet", tokens_in=1_000)],
+        )
+        assert any("coordinator.yml could not be loaded" in n for n in result.notes)
+
+
+class TestUsageGrouping:
+    def test_group_by_repo_aggregates_across_issues(self) -> None:
+        from coord.reports import fold_usage
+
+        result = fold_usage(_usage_fixture_rows(), _unbounded_window(), group_by="repo")
+        assert result.columns[0] == "repo"
+        assert "issue" not in result.columns
+        by_repo = {r["repo"]: r for r in result.rows}
+        assert set(by_repo) == {"api", "web"}
+        # api#7 (2 legs) + api#9 (1 leg) folded into one row.
+        assert by_repo["api"]["legs"] == 3
+
+    def test_repo_param_restricts_to_one_repo(self) -> None:
+        from coord.reports import run_usage
+
+        rows = _usage_fixture_rows()
+        result = run_usage(
+            window="30d", group_by="issue", repo="web", now=_U_NOW,
+            fetch=lambda repo: rows, pricing=None,
+        )
+        assert {r["repo"] for r in result.rows} == {"web"}
+
+    def test_issue_rows_are_repo_scoped(self) -> None:
+        """Two repos' issue #5 must stay two rows — GitHub numbers are
+        per-repo, and `coordinator.yml` is explicitly multi-repo."""
+        from coord.reports import fold_usage
+
+        rows = [_leg("api", 5, cost_usd=1.0), _leg("web", 5, cost_usd=2.0)]
+        result = fold_usage(rows, _unbounded_window())
+        assert len(result.rows) == 2
+        assert {(r["repo"], r["issue"]) for r in result.rows} == {("api", 5), ("web", 5)}
+
+    def test_attributed_issue_wins_over_the_tracking_issue(self) -> None:
+        """#1553: a slice authored *for* a child books its spend to the child."""
+        from coord.reports import fold_usage
+
+        rows = [_leg("api", 1120, stage="test-author", cost_usd=7.9, for_issue_number=1124)]
+        result = fold_usage(rows, _unbounded_window())
+        assert [r["issue"] for r in result.rows] == [1124]
+
+    def test_stage_breakdown_rides_along_on_each_row(self) -> None:
+        from coord.reports import fold_usage
+
+        result = fold_usage(_usage_fixture_rows(), _unbounded_window())
+        api7 = next(r for r in result.rows if r["issue"] == 7)
+        assert {s["stage"] for s in api7["stages"]} == {"work", "review"}
+        assert sum(s["legs"] for s in api7["stages"]) == api7["legs"]
+
+
+class TestUsageWindows:
+    def test_each_preset_resolves_to_a_bounded_interval(self) -> None:
+        from coord.reports import USAGE_WINDOW_CHOICES, resolve_usage_window
+
+        for name in USAGE_WINDOW_CHOICES:
+            window = resolve_usage_window(name, _U_NOW)
+            assert window.start is not None, name
+            assert window.end is not None, name
+            assert window.end > window.start, name
+
+    def test_presets_delegate_to_usage_rollup_not_a_local_calendar(self) -> None:
+        from coord.reports import resolve_usage_window
+        from coord.usage_rollup import window_month, window_today, window_week
+
+        assert resolve_usage_window("today", _U_NOW) == window_today(_U_NOW)
+        assert resolve_usage_window("week", _U_NOW) == window_week(_U_NOW)
+        assert resolve_usage_window("month", _U_NOW) == window_month(_U_NOW)
+
+    def test_out_of_window_legs_contribute_to_nothing(self) -> None:
+        from coord.reports import fold_usage
+        from coord.usage_rollup import TimeWindow
+
+        rows = [
+            _leg("api", 1, cost_usd=5.0, dispatched_at=100.0, finished_at=200.0),
+            _leg("api", 2, cost_usd=9.0, dispatched_at=10_000.0, finished_at=11_000.0),
+        ]
+        result = fold_usage(rows, TimeWindow(start=0.0, end=1_000.0))
+        assert [r["issue"] for r in result.rows] == [1]
+        assert result.totals["cost_total"] == pytest.approx(5.0)
+
+    def test_empty_window_says_so_rather_than_rendering_a_bare_header(self) -> None:
+        from coord.reports import fold_usage
+        from coord.usage_rollup import TimeWindow
+
+        result = fold_usage(_usage_fixture_rows(), TimeWindow(start=0.0, end=1.0))
+        assert result.rows == []
+        assert any("No usage recorded" in n for n in result.notes)
+
+
+class TestUsageUnknownModel:
+    def test_unpriced_model_is_flagged_in_notes_not_priced_at_zero(self) -> None:
+        from coord.reports import fold_usage
+
+        result = fold_usage(_usage_fixture_rows(), _unbounded_window())
+        web3 = next(r for r in result.rows if r["repo"] == "web")
+        assert web3["unknown_model_legs"] == 1
+        assert web3["cost_est"] == 0.0
+        # The tokens are still counted — only the *pricing* is unknown.
+        assert web3["tokens_in"] == 500
+        assert any("web#3" in n and "no entry in the loaded" in n for n in result.notes)
+
+    def test_a_fully_priced_window_produces_no_unknown_model_note(self) -> None:
+        from coord.reports import fold_usage
+
+        rows = [_leg("api", 1, model="sonnet", tokens_in=10, tokens_out=10)]
+        result = fold_usage(rows, _unbounded_window())
+        assert not any("no entry in the loaded" in n for n in result.notes)
+
+
+class TestUsageTotals:
+    def test_totals_is_present_for_usage(self) -> None:
+        from coord.reports import fold_usage
+
+        result = fold_usage(_usage_fixture_rows(), _unbounded_window())
+        assert result.totals is not None
+        assert result.totals["legs"] == 4
+        assert result.totals["cost_total"] == pytest.approx(
+            sum(r["cost_total"] for r in result.rows)
+        )
+        # Identity columns are deliberately absent — the renderer picks its
+        # own marker (Σ) rather than the wire inventing a fake value.
+        assert "issue" not in result.totals
+        assert "repo" not in result.totals
+
+    def test_totals_is_none_for_issue_activity(self) -> None:
+        result = fold_issue_activity([], WINDOW)
+        assert result.totals is None
+        assert result.to_dict()["totals"] is None
+
+    def test_totals_is_none_for_drive_queue_status(self) -> None:
+        result = fold_drive_queue_status([], T0)
+        assert result.totals is None
+
+    def test_the_totals_key_is_additive_and_nothing_else_moved(self) -> None:
+        """Compatibility guard for the already-merged #1741 panel: adding
+        `totals` must not change any other field of an existing report."""
+        before = {
+            "report_id", "generated_at", "window", "columns",
+            "column_meta", "rows", "notes",
+        }
+        payload = fold_issue_activity([], WINDOW).to_dict()
+        assert set(payload) == before | {"totals"}
+
+    def test_cli_table_renders_the_totals_row(self) -> None:
+        from coord.commands.report import _render_table
+        from coord.reports import fold_usage
+
+        result = fold_usage(_usage_fixture_rows(), _unbounded_window()).to_dict()
+        lines = _render_table(result)
+        assert lines[-1].lstrip().startswith("Σ")
+
+    def test_cli_table_omits_the_totals_row_when_absent(self) -> None:
+        from coord.commands.report import _render_table
+
+        lines = _render_table(
+            {
+                "columns": ["a", "b"],
+                "rows": [{"a": 1, "b": 2}],
+                "notes": [],
+            }
+        )
+        assert len(lines) == 2
+
+
+class TestUsageEndToEnd:
+    def test_report_run_usage_prints_a_table(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from coord.reports import fold_usage
+
+        fixture = fold_usage(_usage_fixture_rows(), _unbounded_window()).to_dict()
+        monkeypatch.setattr(state, "run_report", lambda rid, params=None: fixture)
+        result = CliRunner().invoke(
+            main, ["report", "run", "usage", "--param", "window=today"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "Do a thing" in result.output
+        assert "Σ" in result.output
+
+    def test_daemon_endpoint_serves_usage(
+        self, report_client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        rows = _usage_fixture_rows()
+        monkeypatch.setattr("coord.reports._default_usage_rows", lambda repo: rows)
+        listed = report_client.get("/report").json()
+        assert "usage" in [r["id"] for r in listed["reports"]]
+        body = report_client.get(
+            "/report/usage", params={"window": "30d", "group_by": "repo"}
+        ).json()
+        assert body["report_id"] == "usage"
+        assert body["totals"] is not None
+        assert body["columns"][0] == "repo"
+
+    def test_daemon_rejects_a_bad_usage_param(self, report_client: TestClient) -> None:
+        resp = report_client.get("/report/usage", params={"group_by": "machine"})
+        assert resp.status_code == 400

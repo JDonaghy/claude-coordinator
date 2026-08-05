@@ -98,6 +98,13 @@ def _format_cell(column: str, row: dict, meta: dict | None = None) -> str:
         return "-"
     if is_timestamp:
         return _relative_time(value)
+    if kind == "money":
+        # Four decimals, matching `coord usage`'s rollup views — a leg can
+        # genuinely cost $0.0032 and "$0.00" would read as free.
+        try:
+            return f"${float(value):.4f}"
+        except (TypeError, ValueError):
+            return str(value)
     if isinstance(value, bool):
         return "yes" if value else "no"
     if isinstance(value, (list, tuple)):
@@ -134,14 +141,32 @@ def _render_table(result: dict) -> list[str]:
         [_truncate(_format_cell(c, r, meta_by_id.get(c)), _MAX_CELL) for c in columns]
         for r in rows
     ]
+    # #1763: an optional pinned grand-total row. Rendered through the same
+    # per-column formatter as any other row — the only special-casing is the
+    # `Σ` marker in the first column, which the wire deliberately leaves
+    # blank so each renderer picks its own.
+    totals = result.get("totals")
+    footer: list[str] | None = None
+    if isinstance(totals, dict):
+        footer = [
+            _truncate(_format_cell(c, totals, meta_by_id.get(c)), _MAX_CELL)
+            for c in columns
+        ]
+        if footer and footer[0] == "-":
+            footer[0] = "Σ"
     widths = [
-        max(len(header), *(len(row[i]) for row in cells))
+        max(len(header), *(len(row[i]) for row in cells + ([footer] if footer else [])))
         for i, header in enumerate(headers)
     ]
     lines = ["  ".join(h.ljust(widths[i]) for i, h in enumerate(headers)).rstrip()]
     for row in cells:
         lines.append(
             "  ".join(_pad(cell, widths[i], aligns[i]) for i, cell in enumerate(row)).rstrip()
+        )
+    if footer:
+        lines.append("  ".join("-" * widths[i] for i in range(len(headers))).rstrip())
+        lines.append(
+            "  ".join(_pad(cell, widths[i], aligns[i]) for i, cell in enumerate(footer)).rstrip()
         )
     return lines
 

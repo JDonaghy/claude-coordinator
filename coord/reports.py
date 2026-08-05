@@ -19,10 +19,13 @@ Three layers, deliberately separated so the interesting one is testable:
    window is covered and reports ``truncated=True`` if it genuinely could
    not finish.  Never silently drops the tail (#1742: "no silent caps").
 3. :data:`REPORTS` + :func:`run_report` — the registry and its parameter
-   validation.  Two entries: ``issue-activity`` and ``drive-queue-status``
-   (#1805) — the latter a **live snapshot** of ``drive_queue`` (no window,
-   no audit trail, no clock beyond ``generated_at``) rather than a fold over
-   history.
+   validation.  Three entries: ``issue-activity``; ``drive-queue-status``
+   (#1805), a **live snapshot** of ``drive_queue`` (no window, no audit
+   trail, no clock beyond ``generated_at``) rather than a fold over history;
+   and ``usage`` (#1763), a cost/token fold over board assignment rows that
+   delegates every number to :mod:`coord.usage_rollup` priced with the
+   daemon's own loaded ``pricing:`` config — the report that replaced
+   coord-tui's ``panel:usage`` and its hardcoded pricing snapshot.
 
 The :class:`ReportResult` field names are the **wire contract** the coord-tui
 Reports panel (#1741) renders against, and the CLI's ``--json`` and the
@@ -60,6 +63,9 @@ __all__ = [
     "run_issue_activity",
     "fold_drive_queue_status",
     "run_drive_queue_status",
+    "resolve_usage_window",
+    "fold_usage",
+    "run_usage",
     "parse_duration",
 ]
 
@@ -152,7 +158,10 @@ class ColumnMeta:
 
     id: str
     label: str
-    kind: str  # "text" | "int" | "timestamp" | "list" | "enum" | "duration"
+    # Open vocabulary — a client that meets a `kind` it predates must fall
+    # back to plain stringification, never fail to parse:
+    # "text" | "int" | "timestamp" | "list" | "enum" | "duration" | "money"
+    kind: str
     align: str = "left"  # "left" | "right"
     weight: float = 1.0  # relative column width hint
 
@@ -177,6 +186,15 @@ class ReportResult:
     ``column_meta`` is additive display metadata, one entry per ``columns``
     entry in the same order (#1760) — a client that ignores it entirely
     still gets byte-identical ``columns``/``rows``.
+
+    ``totals`` (#1763) is an optional grand-total row for reports that are a
+    *fold* with a meaningful sum (``usage``), keyed by the same column ids as
+    ``rows``.  It is **additive and defaults to ``None``**: reports that have
+    no meaningful total (``issue-activity``, ``drive-queue-status``) leave it
+    unset, and a client that ignores the key renders exactly as it did
+    before.  Identity columns are deliberately *absent* from the dict rather
+    than filled with a placeholder — a renderer that wants a ``Σ`` marker
+    picks one itself, and one that doesn't leaves the cell blank.
     """
 
     report_id: str
@@ -186,6 +204,7 @@ class ReportResult:
     rows: list[dict]
     notes: list[str]
     column_meta: list[ColumnMeta] = field(default_factory=list)
+    totals: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -196,6 +215,7 @@ class ReportResult:
             "column_meta": [m.to_dict() for m in self.column_meta],
             "rows": list(self.rows),
             "notes": list(self.notes),
+            "totals": None if self.totals is None else dict(self.totals),
         }
 
 
@@ -958,6 +978,324 @@ def run_drive_queue_status(
     )
 
 
+# ── usage: the per-issue / per-repo cost + token rollup ────────────────────
+#
+# #1763.  This is a **correctness fix**, not a consolidation.  `coord-tui`'s
+# `panel:usage` was a Rust port of `coord/usage_rollup.py` carrying a
+# hardcoded snapshot of `coord.config.PricingConfig`'s shipped defaults, so
+# an operator who overrode `pricing:` in coordinator.yml changed what
+# `coord usage` reported and left the panel confidently showing different
+# numbers (the durable #1116 finding).  The daemon holds the config, so the
+# daemon does the arithmetic: everything below *calls* `usage_rollup.rollup`
+# / `rollup_by_stage` with the loaded `PricingConfig` and reimplements none
+# of its window predicate, leg-cost rule or default sort.
+
+USAGE_WINDOW_CHOICES = ("today", "week", "month", "7d", "30d")
+USAGE_GROUP_BY_CHOICES = ("issue", "repo")
+
+# Columns depend on `group_by`: a repo-grouped row IS the whole repo, so it
+# carries no issue number and no title (same shape the retired panel used).
+USAGE_ISSUE_COLUMNS = [
+    "issue",
+    "repo",
+    "title",
+    "legs",
+    "tokens_in",
+    "tokens_out",
+    "cost_captured",
+    "cost_est",
+    "cost_total",
+]
+
+USAGE_REPO_COLUMNS = [
+    "repo",
+    "legs",
+    "tokens_in",
+    "tokens_out",
+    "cost_captured",
+    "cost_est",
+    "cost_total",
+]
+
+# #1760 display metadata, indexed by column id and emitted in `columns`
+# order — a large `weight` on `title`, `int`/`right` for the counts, and
+# `money`/`right` for the three dollar columns.  `money` is a *generic* kind
+# (the vocabulary is open, see ColumnMeta): a client that predates it falls
+# back to plain stringification and still shows the number.
+_USAGE_COLUMN_META: dict[str, ColumnMeta] = {
+    "issue": ColumnMeta(id="issue", label="Issue", kind="int", align="right", weight=0.8),
+    "repo": ColumnMeta(id="repo", label="Repo", kind="text", weight=1.5),
+    "title": ColumnMeta(id="title", label="Title", kind="text", weight=4.0),
+    "legs": ColumnMeta(id="legs", label="Legs", kind="int", align="right", weight=0.6),
+    "tokens_in": ColumnMeta(id="tokens_in", label="Tok In", kind="int", align="right"),
+    "tokens_out": ColumnMeta(id="tokens_out", label="Tok Out", kind="int", align="right"),
+    "cost_captured": ColumnMeta(
+        id="cost_captured", label="Cost $", kind="money", align="right"
+    ),
+    "cost_est": ColumnMeta(id="cost_est", label="Est ~$", kind="money", align="right"),
+    "cost_total": ColumnMeta(id="cost_total", label="Total $", kind="money", align="right"),
+}
+
+# Dollar figures are rounded before they go on the wire so a float artefact
+# (2.8000000000000003) never reaches a generic renderer. Six places is far
+# below any real per-leg cost and above any rounding that could change a
+# reported cent.
+_USAGE_COST_PLACES = 6
+
+
+def usage_columns(group_by: str) -> list[str]:
+    """The ``columns`` list for *group_by*.  Raises :class:`ReportError`."""
+    if group_by == "issue":
+        return list(USAGE_ISSUE_COLUMNS)
+    if group_by == "repo":
+        return list(USAGE_REPO_COLUMNS)
+    raise ReportError(
+        f"invalid value for 'group_by': {group_by!r} — "
+        f"allowed values: {', '.join(USAGE_GROUP_BY_CHOICES)}"
+    )
+
+
+def resolve_usage_window(window: str, now: float | None = None):
+    """Resolve a ``window`` parameter to a :class:`coord.usage_rollup.TimeWindow`.
+
+    Every preset is *called* from :mod:`coord.usage_rollup`, never
+    reimplemented — that module owns the calendar (this is precisely what the
+    retired panel hand-rolled a civil calendar to duplicate).
+    """
+    from coord.usage_rollup import (  # noqa: PLC0415
+        Window,
+        window_month,
+        window_today,
+        window_week,
+    )
+
+    if window == "today":
+        return window_today(now)
+    if window == "week":
+        return window_week(now)
+    if window == "month":
+        return window_month(now)
+    if window in ("7d", "30d"):
+        # Window.since is the *bounded* variant: [now - spec, now).
+        return Window.since(window, now)
+    raise ReportError(
+        f"invalid value for 'window': {window!r} — "
+        f"allowed values: {', '.join(USAGE_WINDOW_CHOICES)}"
+    )
+
+
+def _usage_row_title(leg_rows: Sequence[Mapping[str, Any]]) -> str | None:
+    for row in leg_rows:
+        title = row.get("issue_title")
+        if title:
+            return str(title)
+    return None
+
+
+def _usage_metrics(group: Any) -> dict[str, Any]:
+    """The numeric half of a row (or of ``totals``) — identical for both."""
+    return {
+        "legs": int(group.legs),
+        "tokens_in": int(group.tokens.input),
+        "tokens_out": int(group.tokens.output),
+        "cost_captured": round(float(group.cost_captured), _USAGE_COST_PLACES),
+        "cost_est": round(float(group.cost_est), _USAGE_COST_PLACES),
+        "cost_total": round(float(group.cost_total), _USAGE_COST_PLACES),
+        # Beyond `columns` — the contract explicitly allows extra row keys,
+        # and a client that wants the cache split or the open-leg count can
+        # have it without another column in an already-wide table.
+        "tokens_cache_read": int(group.tokens.cache_read),
+        "tokens_cache_creation": int(group.tokens.cache_creation),
+        "duration_secs": round(float(group.duration_secs), 3),
+        "open_legs": int(group.open_legs),
+        "unknown_model_legs": int(group.unknown_model_legs),
+    }
+
+
+def _usage_stage_breakdown(
+    leg_rows: Sequence[Mapping[str, Any]], window: Any, pricing: Any
+) -> list[dict[str, Any]]:
+    """Per-stage sub-rollup for one group, as a list of plain dicts.
+
+    The panel's only drill-down was "click a row → its per-stage legs"; that
+    maps onto rows without needing a second request, so it ships inline as an
+    extra row key rather than as a second report.
+    """
+    from coord.usage_rollup import rollup_by_stage  # noqa: PLC0415
+
+    sub = rollup_by_stage(list(leg_rows), window, pricing)
+    stages = [
+        {"stage": str(key), **_usage_metrics(grp)} for key, grp in sub.groups.items()
+    ]
+    stages.sort(key=lambda s: s["cost_total"], reverse=True)
+    return stages
+
+
+def fold_usage(
+    rows: Iterable[Mapping[str, Any]],
+    window: Any,
+    *,
+    group_by: str = "issue",
+    pricing: Any = None,
+    generated_at: float | None = None,
+    extra_notes: Sequence[str] = (),
+) -> ReportResult:
+    """Fold board assignment rows into a per-issue / per-repo cost rollup.
+
+    **Pure** — no DB, no daemon, no clock: *rows* is whatever the caller
+    fetched (daemon ``/board`` ``assignments`` wire shape), *window* is a
+    resolved :class:`~coord.usage_rollup.TimeWindow`, and *pricing* is the
+    :class:`~coord.config.PricingConfig` that was actually loaded.  Every
+    number comes back out of :func:`coord.usage_rollup.rollup` — this
+    function only shapes it into the report wire contract.
+
+    *pricing* left at ``None`` falls through to ``usage_rollup``'s own
+    built-in defaults, which is correct for a unit test and **not** what the
+    runner does (see :func:`run_usage`, which loads ``coordinator.yml``).
+    """
+    from coord.usage_rollup import IssueKey, rollup  # noqa: PLC0415
+
+    columns = usage_columns(group_by)
+    rows = list(rows)
+    result = rollup(rows, group_by=group_by, window=window, pricing=pricing)
+
+    out_rows: list[dict[str, Any]] = []
+    for key, group in result.groups.items():
+        row: dict[str, Any] = {}
+        if isinstance(key, IssueKey):
+            row["issue"] = int(key.issue_number)
+            row["repo"] = str(key.repo_name)
+            row["title"] = _usage_row_title(group.leg_rows)
+        else:
+            row["repo"] = str(key)
+        row.update(_usage_metrics(group))
+        row["stages"] = _usage_stage_breakdown(group.leg_rows, window, pricing)
+        out_rows.append(row)
+
+    # Same default order as `coord usage` and the retired panel: biggest
+    # spend first. `_ident` breaks ties deterministically so a frozen-clock
+    # test isn't at the mercy of dict ordering.
+    out_rows.sort(
+        key=lambda r: (-r["cost_total"], str(r.get("repo") or ""), int(r.get("issue") or 0))
+    )
+
+    start = 0.0 if getattr(window, "start", None) is None else float(window.start)
+    end = (
+        float(generated_at if generated_at is not None else start)
+        if getattr(window, "end", None) is None
+        else float(window.end)
+    )
+
+    totals = _usage_metrics(result.total)
+
+    notes: list[str] = list(extra_notes)
+    if not out_rows:
+        notes.append("No usage recorded in this window.")
+    for row in out_rows:
+        unknown = int(row.get("unknown_model_legs") or 0)
+        if unknown:
+            ident = (
+                f"{row['repo']}#{row['issue']}" if "issue" in row else str(row["repo"])
+            )
+            notes.append(
+                f"{ident}: {unknown} leg(s) ran a model with no entry in the "
+                "loaded `pricing:` config — their tokens are counted but "
+                "their spend is NOT in `cost_est` (never silently priced at "
+                "$0). Add a rate for that model to coordinator.yml."
+            )
+    if totals["open_legs"]:
+        notes.append(
+            f"{totals['open_legs']} leg(s) in this window are still running — "
+            "their duration counts as 0 and their cost is not final."
+        )
+
+    return ReportResult(
+        report_id="usage",
+        generated_at=end if generated_at is None else float(generated_at),
+        window=(start, end),
+        columns=columns,
+        column_meta=[_USAGE_COLUMN_META[c] for c in columns],
+        rows=out_rows,
+        notes=notes,
+        totals=totals,
+    )
+
+
+def _default_usage_rows(repo: str | None) -> list[dict]:  # noqa: ARG001
+    """Board assignment rows from the local DB.
+
+    Deliberately **not** :func:`coord.usage.fetch_usage_rows`: that helper
+    branches to a ``GET /board`` when a board service is configured, and a
+    report already runs *on* the daemon host (``coord.state.run_report``
+    routes a thin client's request to ``GET /report/{id}``), so going through
+    it would make the daemon HTTP-call itself.  This mirrors that helper's
+    *local* branch exactly — ``list_assignments()`` rather than the
+    retention-capped ``/board`` projection, because a usage rollup wants full
+    history.
+    """
+    from coord.dao import SqliteStore  # noqa: PLC0415
+
+    return SqliteStore().list_assignments()
+
+
+def _load_pricing() -> tuple[Any, list[str]]:
+    """The ``pricing:`` block from the loaded ``coordinator.yml``.
+
+    Returns ``(PricingConfig, notes)``.  A config that cannot be loaded falls
+    back to the built-in defaults **and says so in ``notes``** — silently
+    falling back is exactly the failure mode #1763 exists to remove.
+    """
+    from coord.config import PricingConfig  # noqa: PLC0415
+
+    try:
+        from coord.config import load, resolve_config_path  # noqa: PLC0415
+
+        return load(resolve_config_path()).pricing, []
+    except Exception as exc:  # noqa: BLE001 — surfaced as a note, not a crash
+        return (
+            PricingConfig(),
+            [
+                "WARNING: coordinator.yml could not be loaded "
+                f"({type(exc).__name__}: {exc}) — `cost_est` uses the built-in "
+                "default rates, which may differ from this fleet's `pricing:` "
+                "block."
+            ],
+        )
+
+
+def run_usage(
+    *,
+    window: str = "today",
+    group_by: str = "issue",
+    repo: str = "",
+    now: float | None = None,
+    fetch: Callable[[str | None], Sequence[Mapping[str, Any]]] | None = None,
+    pricing: Any = None,
+) -> ReportResult:
+    """Fetch board rows and fold them.  ``now``/``fetch``/``pricing`` are test
+    seams; the report's own parameters are ``window``/``group_by``/``repo``."""
+    generated_at = time.time() if now is None else float(now)
+    resolved = resolve_usage_window(window, generated_at)
+
+    fetch_fn = _default_usage_rows if fetch is None else fetch
+    rows = list(fetch_fn(repo or None) or [])
+    if repo:
+        rows = [r for r in rows if str(r.get("repo_name") or "") == repo]
+
+    extra_notes: list[str] = []
+    if pricing is None:
+        pricing, extra_notes = _load_pricing()
+
+    return fold_usage(
+        rows,
+        resolved,
+        group_by=group_by,
+        pricing=pricing,
+        generated_at=generated_at,
+        extra_notes=extra_notes,
+    )
+
+
 # ── the catalogue ──────────────────────────────────────────────────────────
 
 SINCE_PRESETS = ("1h", "6h", "24h", "3d", "7d")
@@ -1052,9 +1390,52 @@ DRIVE_QUEUE_STATUS = ReportDef(
 )
 
 
+USAGE = ReportDef(
+    id="usage",
+    title="Usage",
+    description=(
+        "Cost and token spend for a time window, one row per issue (or per "
+        "repo): legs, tokens in/out, captured $, estimated ~$ for legs with "
+        "no captured cost, and the total. Estimates use the daemon's own "
+        "loaded `pricing:` block, so they agree with `coord usage` by "
+        "construction."
+    ),
+    params=(
+        ReportParam(
+            id="window",
+            label="Time window",
+            kind="choice",
+            choices=USAGE_WINDOW_CHOICES,
+            default="today",
+            help=(
+                "today/week/month are local calendar periods; 7d/30d are "
+                "rolling windows ending now."
+            ),
+        ),
+        ReportParam(
+            id="group_by",
+            label="Group by",
+            kind="choice",
+            choices=USAGE_GROUP_BY_CHOICES,
+            default="issue",
+            help="One row per issue, or one row per repo.",
+        ),
+        ReportParam(
+            id="repo",
+            label="Repo",
+            kind="text",
+            default="",
+            help="Restrict to one repo by name. Empty means all repos.",
+        ),
+    ),
+    run=run_usage,
+)
+
+
 REPORTS: dict[str, ReportDef] = {
     ISSUE_ACTIVITY.id: ISSUE_ACTIVITY,
     DRIVE_QUEUE_STATUS.id: DRIVE_QUEUE_STATUS,
+    USAGE.id: USAGE,
 }
 
 
