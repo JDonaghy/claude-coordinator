@@ -42363,3 +42363,42 @@ Milestone tracking issue.
         assert!(!app.reports_request_export(0));
         assert!(app.reports_pending_export.is_none());
     }
+
+    #[test]
+    fn reports_export_surfaces_a_failed_write_rather_than_failing_silently() {
+        // The fetch succeeds and the write does not (the destination
+        // directory does not exist). That must come back as an explicit
+        // failure naming the path — "no file where you asked for one" is
+        // exactly the case a silent export would hide.
+        let mock = MockBoardService::start("Repo,Issue\napi,1631\n");
+        let _guard = set_test_board_service(mock.url(), None);
+
+        let dest = std::env::temp_dir()
+            .join("coord-tui-export-no-such-dir-1765")
+            .join("out.csv");
+        assert!(!dest.exists());
+
+        let mut app = make_app_with_reports(
+            BoardData::default(),
+            reports_catalogue_json(),
+            Some(&reports_result_json()),
+        );
+        app.reports_start_export("issue-activity", dest.clone());
+        let rx = app.reports_export_rx.take().expect("rx must be armed");
+        match rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the export must deliver an outcome before the timeout")
+        {
+            ReportExportOutcome::Failed(reason) => assert!(
+                reason.contains("out.csv"),
+                "#1765: a failed write must name the path it failed on: {reason}"
+            ),
+            ReportExportOutcome::Written { .. } => {
+                panic!("#1765: the write cannot have succeeded into a missing directory")
+            }
+            ReportExportOutcome::NoBoardService => {
+                panic!("#1765: the mock board service must be reached")
+            }
+        }
+        assert!(!dest.exists());
+    }
