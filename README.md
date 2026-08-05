@@ -286,7 +286,7 @@ Verdict-relay helpers: `coord report-result`, `coord set-review-findings`, `coor
 | `coord usage [--today\|--week\|--month\|--since S] [--by-issue\|--issue N\|--by repo\|week\|month\|issue] [--by-time]` | Per-issue/repo/window cost, tokens, and time-spent |
 | `coord gates <repo> <issue> [--json]` | A work row's gate columns (`test_state`, `smoke_test`, `review_verdict`, ...) plus the live review/test/merge decision — including whether a verdict is #1479-stale and the SHAs compared. Read-only |
 | `coord audit [--category C] [--repo N] [--issue N] [--since T] [--json]` | Query the durable, ordered event log |
-| `coord report list` / `coord report run <id> [--param k=v ...] [--json]` | Named reports folded out of the audit trail. One today: `issue-activity` — one row per issue that moved in a window (start, machines, fix iterations, Test/Review verdicts, merge, driver exit, outcome) plus derived anomaly notes |
+| `coord report list` / `coord report run <id> [--param k=v ...] [--format table\|json\|csv]` | Named reports folded out of the audit trail. One today: `issue-activity` — one row per issue that moved in a window (start, machines, fix iterations, Test/Review verdicts, merge, driver exit, outcome) plus derived anomaly notes. `--format csv` (#1765) emits the machine-readable form on stdout — raw values (an epoch stays an epoch), notes as leading `#` lines — identical to the daemon's `GET /report/{id}?format=csv` |
 | `coord sessions [--remote] [--prune] [--reap-merged]` | List interactive tmux sessions; reap dead/merged ones |
 | `coord terminal new\|list\|kill\|attach` | Persistent fleet-wide shell sessions |
 
