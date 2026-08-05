@@ -12,6 +12,7 @@ from coord.config import (
     AcceptanceConfig,
     AcceptanceDriverConfig,
     Config,
+    ModelsConfig,
     ProviderDef,
     ProvidersConfig,
 )
@@ -1644,6 +1645,13 @@ class TestProviderDefInPayload:
                         type="opencode",
                         binary="/opt/opencode/bin/opencode",
                         env={"FOO": "bar"},
+                        # #1798: a non-implicit provider type requires a
+                        # namespaced `provider/model` id.  Without this pin,
+                        # models.default's bare claude alias ("sonnet")
+                        # becomes the wire model and the dispatch-time gate
+                        # correctly refuses — which is #1798's whole point,
+                        # and unrelated to the payload shape under test here.
+                        model="opencode/glm-5.2",
                     ),
                     "claude": ProviderDef(type="claude"),
                 },
@@ -1698,6 +1706,13 @@ class TestProviderDefInPayload:
                         type="opencode",
                         binary="/opt/opencode/bin/opencode",
                         env={"FOO": "bar"},
+                        # #1798: a non-implicit provider type requires a
+                        # namespaced `provider/model` id.  Without this pin,
+                        # models.default's bare claude alias ("sonnet")
+                        # becomes the wire model and the dispatch-time gate
+                        # correctly refuses — which is #1798's whole point,
+                        # and unrelated to the payload shape under test here.
+                        model="opencode/glm-5.2",
                     ),
                     "claude": ProviderDef(type="claude"),
                 },
@@ -1720,7 +1735,9 @@ class TestProviderDefInPayload:
         assert second_payload.get("provider_def") == {
             "type": "opencode",
             "binary": "/opt/opencode/bin/opencode",
-            "model": None,
+            # Pinned above so the wire model stays inside the opencode
+            # namespace (#1798); the retry payload carries it verbatim.
+            "model": "opencode/glm-5.2",
             "attach_url": None,
             "env": {"FOO": "bar"},
             "extra_args": [],
@@ -1757,6 +1774,12 @@ class TestProviderDefInPayload:
                 capabilities=["provider:never-defined"],
             )],
             providers=ProvidersConfig(default="never-defined"),
+            # #1798: an unregistered provider name resolves to a
+            # non-implicit type, which requires a namespaced
+            # `provider/model` wire model.  models.default's bare "sonnet"
+            # would be refused at dispatch time before the POST — correct,
+            # but it would hide the agent-refusal path this test targets.
+            models=ModelsConfig(default="opencode/glm-5.2"),
         )
         p = Proposal(
             id=1, machine_name="laptop", repo_name="api",
