@@ -3,10 +3,11 @@
  *
  * The wire types themselves (`Assignment`, `PipelineStage`, `PipelineGate`,
  * `PipelineView`, `AssignmentStatus`, `AssignmentType`, `TestVerdict`,
- * `PipelineAction`) are generated from the Python dataclasses that produce
- * these payloads — see `./generated.ts` and `scripts/codegen.py` (#750).
- * Regenerate with `.venv/bin/python scripts/codegen.py` after any Python
- * dataclass field change; do not hand-edit the generated file.
+ * `PipelineAction`) are generated from the dashboard's OpenAPI spec — see
+ * `./generated.ts` and `scripts/codegen.py` (#750, moved onto the OpenAPI
+ * spec by #1550). Regenerate with `.venv/bin/python scripts/codegen.py`
+ * after any Python dataclass field change; do not hand-edit the generated
+ * file.
  *
  * Actions marked "(forthcoming)" in `PipelineAction`'s doc comment are
  * defined ahead of their backend implementation so TypeScript callers can
@@ -66,7 +67,7 @@ export interface SessionInfo {
   repo: string | null
   issue: number | null
   issue_title: string | null
-  /** Assignment type — work/review/smoke/fix/plan/merge/... */
+  /** Assignment type — see `AssignmentType` in `./generated` for the real value set. */
   stage: string | null
   /** Assignment status — running/done/failed/advisory/... */
   status: string | null
