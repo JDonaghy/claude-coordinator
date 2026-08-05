@@ -227,10 +227,31 @@ def is_infrastructure_failure(returncode: int, output: str) -> bool:
     Misclassifying a real failure is the worse error of the two — it is the
     one that could eventually launder a merge — so the ambiguous cases all
     fall through to "this is a verdict".
+
+    The marker check is anchored to the START of a line, not a bare substring
+    search over the whole blob (#1814 review). `coord-test-runner.sh`'s own
+    ``say()`` always emits a marker as the first characters of a line it
+    prints — but for `claude-coordinator` itself, ``test_command`` is that
+    runner's full ``pytest`` arm, which (as of this fix) contains tests whose
+    literal assertion text and parametrize IDs embed these exact marker
+    strings (see ``tests/test_coord_test_runner_toolchain.py`` and
+    ``tests/test_revalidate.py``). If any of those specific tests ever fails
+    for an unrelated reason, pytest's ``FAILED tests/...::test[MARKER...]``
+    summary line and ``E     assert 'MARKER...' in '...'`` diff both contain
+    the marker text too — but never at the start of a line: pytest indents
+    diff lines with ``E   ``/spaces and prefixes summary lines with
+    ``FAILED ``, and the runner's own re-run dumps
+    (``coord-test-runner.sh``'s ``tail -n 40 ... | sed 's/^/      /'``) are
+    explicitly indented before being echoed. A bare substring match would
+    misclassify that unrelated Python failure as infrastructure and hide it
+    behind "fix the runner environment"; anchoring to line-start does not.
     """
     if returncode == SHELL_NOT_FOUND_EXIT:
         return True
-    return any(marker in (output or "") for marker in INFRA_OUTPUT_MARKERS)
+    lines = (output or "").splitlines()
+    return any(
+        line.startswith(marker) for line in lines for marker in INFRA_OUTPUT_MARKERS
+    )
 
 
 @dataclass
@@ -768,10 +789,24 @@ def _infra_reason(stage: str, returncode: int) -> str:
     the environment as the thing to fix — because the failure that motivated
     it (``cargo: command not found`` inside the ``coord-serve`` systemd user
     unit) reads like a branch problem and is not one.
+
+    ``returncode`` alone does not always mean "exited immediately without
+    running anything" — :func:`is_infrastructure_failure` can also classify
+    on an :data:`INFRA_OUTPUT_MARKERS` hit at a returncode that isn't
+    :data:`SHELL_NOT_FOUND_EXIT` (e.g. the runner's own ``RESULT: INFRA``
+    line at exit 3, or a wrapped/nonstandard exit). The wording branches on
+    that so it never overclaims "without running anything" for a run whose
+    own output says it merely couldn't complete.
     """
+    if returncode == SHELL_NOT_FOUND_EXIT:
+        run_desc = f"the {stage} command exited {returncode} without running anything"
+    else:
+        run_desc = (
+            f"the {stage} command's own output reported it could not run "
+            f"(exit {returncode})"
+        )
     return (
-        f"revalidation COULD NOT RUN — the {stage} command exited "
-        f"{returncode} without running anything (missing toolchain / broken "
+        f"revalidation COULD NOT RUN — {run_desc} (missing toolchain / broken "
         "runner environment, NOT a test failure). This says nothing about the "
         "branches: they keep their existing verdicts and stay blocked, and "
         "nothing merged. Fix the runner environment and re-run — a systemd "
