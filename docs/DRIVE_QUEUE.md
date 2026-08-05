@@ -153,6 +153,54 @@ follow live, `-n 50` for the last tick's summary. With an empty queue a tick
 logs `capacity: 0/1 occupied, 1 free` / `no launch` and exits 0 — that is the
 timer working, not a problem.
 
+### 2a. Verify the launched drive survives the tick (#1830)
+
+The unit ships `KillMode=process` for exactly one reason: without it, systemd's
+default `KillMode=control-group` reaps the **entire cgroup** — including a
+tmux server the tick's own `coord drive --tmux` had to spawn — the instant the
+oneshot tick exits, seconds after launch. Do not remove `KillMode=process` from
+`deploy/coord-drive-queue.service`.
+
+**You cannot verify this fix with a terminal open on the box.** If a tmux
+server is already running (which an interactive session guarantees — `tmux
+ls` will show one), `tmux new-session` hands off to that pre-existing server
+instead of spawning its own, and the new session lives outside the tick's
+cgroup regardless of `KillMode`. The bug — and therefore the fix — is only
+observable when **no tmux server exists yet**. Testing "attended" always
+looks fine and proves nothing; this is exactly how the bug shipped invisibly
+in the first place (see #1830).
+
+To verify for real:
+
+```bash
+# 1. Make sure there is truly no tmux server — kill any that exists.
+#    (If you have an interactive session open on this box, this WILL kill
+#    it — do this from a box/user with no other tmux usage, or accept that
+#    tradeoff deliberately.)
+tmux kill-server 2>/dev/null; tmux ls   # must print "no server running"
+
+# 2. Queue something and fire one tick exactly as the timer would.
+coord drive-queue add REPO ISSUE
+systemctl --user start coord-drive-queue.service
+
+# 3. Confirm the launched session is STILL ALIVE after the (oneshot) unit
+#    has already finished — this is the assertion that matters, not the
+#    tick's own exit code.
+systemctl --user is-active coord-drive-queue.service   # inactive (oneshot, done)
+tmux ls                                                 # the coord-drive-* session is listed
+coord drive-sessions                                    # shows it live
+
+# 4. Confirm it actually did work, not just "stayed alive" — a session that
+#    is merely present but silently dead inside proves nothing either.
+coord drive-queue list                                  # state=running, then dispatched
+```
+
+If step 3's `tmux ls` comes back empty (or the session is gone within
+seconds), the fix regressed — most likely `KillMode=process` was dropped from
+the installed unit, or a hand-maintained `~/.config/systemd/user/` copy is
+stale relative to `deploy/coord-drive-queue.service`. Re-`cp` it and
+`systemctl --user daemon-reload`.
+
 ## 3. Stop it
 
 Two different questions, two different commands — the same "hold, don't
