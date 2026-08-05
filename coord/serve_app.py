@@ -3112,6 +3112,10 @@ def _openapi_spec() -> dict:
                                         },
                                         "rows": {"type": "array", "items": {"type": "object"}},
                                         "notes": {"type": "array", "items": {"type": "string"}},
+                                        "totals": {
+                                            "type": ["object", "null"],
+                                            "description": "#1763: optional grand-total row keyed by the same column ids as `rows`. `null` for reports with no meaningful sum (issue-activity, drive-queue-status); a client that ignores it renders exactly as before.",
+                                        },
                                     },
                                     "required": [
                                         "report_id", "generated_at", "window",
