@@ -259,11 +259,16 @@ disappearance are silent. When this happened during the #1426 cutover the first
 suspect was a concurrently-running agent; the actual culprit was the `coord
 config` used to check the work.
 
-Fleet config is edited on the **daemon host**:
+Fleet config is edited on the **daemon host** — but not by editing
+`~/.coord/coordinator.yml` directly: that path is a **symlink** into the
+`coord-settings` checkout, and `vi`/`sed -i`/most editors write-and-rename
+over it, silently replacing the symlink with a disconnected regular file
+(see section 14). Edit the checkout instead:
 
 ```bash
 coord sessions --remote        # MUST be empty — restart breaks interactive finalize
-ssh <daemon-host> 'vi ~/.coord/coordinator.yml'
+ssh <daemon-host> 'vi ~/src/coord-settings/coord/coordinator.yml'
+ssh <daemon-host> 'git -C ~/src/coord-settings commit -am "..." && git -C ~/src/coord-settings push'
 ssh <daemon-host> 'XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart coord-serve'
 coord config                   # re-caches from the daemon
 ```
