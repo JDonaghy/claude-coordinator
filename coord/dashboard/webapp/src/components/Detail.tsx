@@ -220,11 +220,12 @@ export default function Detail() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
 
-  // Pipeline data — shared cache key with Home screen
+  // Pipeline data — shared cache key with Home screen. #1549: no
+  // refetchInterval -- RealtimeProvider invalidates ['pipeline'] on the
+  // relevant SSE events, so this screen updates the same way Home does.
   const { data: pipeline, isLoading, isError } = useQuery({
     queryKey: ['pipeline'],
     queryFn: fetchPipeline,
-    refetchInterval: 4_000,
   })
 
   const view: PipelineView | null = pipeline?.find((v) => v.assignment_id === id) ?? null

@@ -7,8 +7,9 @@
  * can take over via the `/terminal/:sessionId` view, so they get first
  * billing over the pipeline list below.
  *
- * Below that: in-flight pipeline items as tappable cards, auto-refreshing
- * every 4 s. Two filter tabs:
+ * Below that: in-flight pipeline items as tappable cards, kept live by the
+ * SSE `/events` stream (#1549) rather than a poll timer -- see
+ * `src/realtime/`. Two filter tabs:
  *   Active    — everything currently in the pipeline (not yet merged)
  *   Needs me  — items with at least one available gate action (need human input)
  *
@@ -21,6 +22,7 @@ import { useQuery } from '@tanstack/react-query'
 import { fetchPipeline, fetchSessions, type PipelineView, type SessionInfo } from '@/api/client'
 import { PipelineCard } from '@/components/PipelineCard'
 import { SessionCard } from '@/components/SessionCard'
+import { ConnectionBadge } from '@/components/ConnectionBadge'
 
 // ── Filter logic ──────────────────────────────────────────────────────────────
 
@@ -256,16 +258,22 @@ export default function Home() {
   const navigate = useNavigate()
   const [filterTab, setFilterTab] = useState<FilterTab>('active')
 
+  // #1549: no refetchInterval -- kept fresh by SSE-driven invalidation
+  // (RealtimeProvider invalidates ['pipeline'] on assignment_*/board_updated
+  // events). isFetching still pulses briefly on every SSE-triggered refetch.
   const { data, isLoading, isError, isFetching, dataUpdatedAt, refetch } = useQuery({
     queryKey: ['pipeline'],
     queryFn: fetchPipeline,
-    refetchInterval: 4_000,
   })
 
+  // #1549: /api/sessions fans out one blocking ssh per machine (see
+  // fetchSessions doc comment) -- a 4s poll against a ~5s server sweep is
+  // exactly the hazard the offline-cooldown cache exists to paper over. SSE
+  // invalidation (machine_connected/disconnected, assignment_*) now drives
+  // this instead, so the request only fires when something plausibly changed.
   const { data: sessions } = useQuery({
     queryKey: ['sessions'],
     queryFn: fetchSessions,
-    refetchInterval: 4_000,
   })
 
   const handleRefresh = useCallback(() => {
@@ -304,6 +312,7 @@ export default function Home() {
           <p className="text-xs text-muted-foreground">pipeline</p>
         </div>
         <div className="flex items-center gap-2">
+          <ConnectionBadge />
           {isFetching && !isLoading && (
             <span className="h-2 w-2 animate-pulse rounded-full bg-primary" aria-label="Refreshing" />
           )}
