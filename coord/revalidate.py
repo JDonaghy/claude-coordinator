@@ -160,17 +160,77 @@ def _tail(text: str, limit: int = _OUTPUT_TAIL_CHARS) -> str:
 # identical wall, so a per-entry fallback would just reproduce the same error
 # N times for nothing. COMPOSE/BUILD/SUITE/TIMEOUT are per-branch-attributable
 # — that is precisely what the fallback exists to narrow down.
+#
+# INFRA (#1814) is a third thing again, and the distinction it draws is the
+# point of that issue: the suite did not FAIL, it did not RUN. The daemon that
+# executes this is a systemd user unit whose PATH never saw ~/.cargo/bin, so
+# `cargo` was simply not there and the shell's "command not found" was being
+# reported as a red suite for a branch CI had already proven green. Like SETUP
+# it is common-mode (never narrowable — every solo run hits the identical
+# wall), but unlike SETUP it happened *after* the composite was built, so the
+# worktree is kept and the operator-facing wording must say "could not run",
+# never "SUITE FAILED".
 KIND_OK = "ok"
 KIND_SETUP = "setup"
 KIND_COMPOSE = "compose"
 KIND_BUILD = "build"
 KIND_SUITE = "suite"
 KIND_TIMEOUT = "timeout"
+KIND_INFRA = "infra"
 
 #: Composite failure kinds a per-entry pass can actually narrow (#1715).
 NARROWABLE_KINDS = frozenset({
     KIND_COMPOSE, KIND_BUILD, KIND_SUITE, KIND_TIMEOUT,
 })
+
+#: Kinds where no suite was actually executed, so "how many suite runs did
+#: that cost" is zero and no verdict may be inferred in either direction.
+NO_SUITE_RAN_KINDS = frozenset({KIND_SETUP, KIND_INFRA})
+
+#: Exit code ``scripts/coord-test-runner.sh`` reserves for "the suite could not
+#: run" (a missing toolchain). See that script's header. Documented here, but
+#: deliberately NOT trusted on its own — see :func:`is_infrastructure_failure`.
+RUNNER_INFRA_EXIT = 3
+
+#: 127 is every POSIX shell's "command not found" — an arbitrary repo's own
+#: ``test_command`` that dies this way never started a suite either. Unlike a
+#: small integer, this one is reserved by the shell rather than chosen by the
+#: command, so it carries the same meaning for a command we did not write.
+SHELL_NOT_FOUND_EXIT = 127
+
+#: What ``coord-test-runner.sh`` prints when it cannot find a toolchain. THIS
+#: is the signal, not the exit code: a repo's own build/test command is free
+#: to exit 3 for a perfectly genuine failure (this repo's own test suite has
+#: a ``build_command = "exit 3"`` case), so keying on the number alone would
+#: relabel real red builds as infrastructure — the dangerous direction.
+INFRA_OUTPUT_MARKERS = ("TOOLCHAIN MISSING", "RESULT: INFRA")
+
+
+def is_infrastructure_failure(returncode: int, output: str) -> bool:
+    """True when a build/test command never actually ran the suite (#1814).
+
+    Two signals, either of which is enough:
+
+    * a bare shell ``command not found`` (:data:`SHELL_NOT_FOUND_EXIT`) — the
+      universal one, and the exact shape of the bug that motivated this
+      (``cargo: command not found`` inside the ``coord-serve`` daemon);
+    * one of :data:`INFRA_OUTPUT_MARKERS` in the output — the runner's own
+      explicit, deliberately unmistakable statement that it could not run.
+
+    Note what is *not* a signal: :data:`RUNNER_INFRA_EXIT` on its own. Our
+    runner always prints a marker alongside it, and an arbitrary repo's
+    command may already use 3 for a real failure, so the number adds nothing
+    and risks laundering a red build into "could not run".
+
+    Deliberately narrow in the same spirit: this never guesses from a generic
+    substring like "not found", which appears in ordinary assertion messages.
+    Misclassifying a real failure is the worse error of the two — it is the
+    one that could eventually launder a merge — so the ambiguous cases all
+    fall through to "this is a verdict".
+    """
+    if returncode == SHELL_NOT_FOUND_EXIT:
+        return True
+    return any(marker in (output or "") for marker in INFRA_OUTPUT_MARKERS)
 
 
 @dataclass
@@ -599,15 +659,21 @@ def revalidate(
                 worktree=wt_path,
             )
         if built.returncode != 0:
+            build_output = (built.stdout or "") + "\n" + (built.stderr or "")
+            infra = is_infrastructure_failure(built.returncode, build_output)
             return RevalidationResult(
                 ok=False,
-                kind=KIND_BUILD,
+                kind=KIND_INFRA if infra else KIND_BUILD,
                 reason=(
-                    "revalidation BUILD FAILED against the current base "
-                    f"(exit {built.returncode}) — every candidate stays "
-                    "blocked"
+                    _infra_reason("build", built.returncode)
+                    if infra
+                    else (
+                        "revalidation BUILD FAILED against the current base "
+                        f"(exit {built.returncode}) — every candidate stays "
+                        "blocked"
+                    )
                 ),
-                output=_tail((built.stdout or "") + "\n" + (built.stderr or "")),
+                output=_tail(build_output),
                 composed=list(composed),
                 worktree=wt_path,
             )
@@ -624,15 +690,21 @@ def revalidate(
             worktree=wt_path,
         )
     if tested.returncode != 0:
+        test_output = (tested.stdout or "") + "\n" + (tested.stderr or "")
+        infra = is_infrastructure_failure(tested.returncode, test_output)
         return RevalidationResult(
             ok=False,
-            kind=KIND_SUITE,
+            kind=KIND_INFRA if infra else KIND_SUITE,
             reason=(
-                "revalidation SUITE FAILED against the current base "
-                f"(exit {tested.returncode}) — every candidate stays "
-                "blocked, nothing merged"
+                _infra_reason("suite", tested.returncode)
+                if infra
+                else (
+                    "revalidation SUITE FAILED against the current base "
+                    f"(exit {tested.returncode}) — every candidate stays "
+                    "blocked, nothing merged"
+                )
             ),
-            output=_tail((tested.stdout or "") + "\n" + (tested.stderr or "")),
+            output=_tail(test_output),
             composed=list(composed),
             worktree=wt_path,
         )
@@ -687,6 +759,26 @@ def revalidate(
     )
 
 
+def _infra_reason(stage: str, returncode: int) -> str:
+    """Operator-facing wording for a run that never happened (#1814).
+
+    Every clause here is load-bearing. It must not contain the words "SUITE
+    FAILED" (the operator would go and debug a branch that is fine), it must
+    say out loud that the branch is unjudged rather than bad, and it must name
+    the environment as the thing to fix — because the failure that motivated
+    it (``cargo: command not found`` inside the ``coord-serve`` systemd user
+    unit) reads like a branch problem and is not one.
+    """
+    return (
+        f"revalidation COULD NOT RUN — the {stage} command exited "
+        f"{returncode} without running anything (missing toolchain / broken "
+        "runner environment, NOT a test failure). This says nothing about the "
+        "branches: they keep their existing verdicts and stay blocked, and "
+        "nothing merged. Fix the runner environment and re-run — a systemd "
+        "user unit's PATH is not a login shell's (see #1814)"
+    )
+
+
 def _label(candidate: RevalidationCandidate) -> str:
     e = candidate.entry
     return f"{e.repo_name} #{e.issue_number} ({e.branch})"
@@ -724,10 +816,12 @@ def revalidate_group(
     byte-identical to #1769's shipped single-entry behaviour.
 
     A composite that failed for a **common-mode** reason (no ``test_command``,
-    no local checkout, a dead ``git fetch``, candidates spanning two bases)
-    never falls back either — see :data:`NARROWABLE_KINDS`. Every solo run
-    would hit the same wall, so narrowing would turn one clear error into N
-    identical ones.
+    no local checkout, a dead ``git fetch``, candidates spanning two bases, or
+    a missing toolchain — #1814's :data:`KIND_INFRA`) never falls back either
+    — see :data:`NARROWABLE_KINDS`. Every solo run would hit the same wall, so
+    narrowing would turn one clear error into N identical ones. For the INFRA
+    case that matters twice over: N solo runs would each print "could not
+    run", making a broken daemon environment look like N broken branches.
 
     Worst case is therefore 1 + N runs, the bound #1715 specifies, and it is
     reached only when a composite genuinely fails on a real build/test/merge
@@ -745,9 +839,11 @@ def revalidate_group(
         candidates, config, echo=echo, timeout=timeout, runner=runner,
     )
     # A setup refusal never reached a build/test command, so it did not cost a
-    # suite run. Everything else did (or died trying), and the operator's
-    # mental model of "how many suites did that just run" should match.
-    ran = 0 if composite.kind == KIND_SETUP else 1
+    # suite run; an INFRA failure reached it but the suite still never
+    # executed (#1814). Everything else did (or died trying), and the
+    # operator's mental model of "how many suites did that just run" should
+    # match.
+    ran = 0 if composite.kind in NO_SUITE_RAN_KINDS else 1
     batch = BatchRevalidationResult(
         composite=composite,
         recorded=list(composite.recorded),
@@ -823,6 +919,19 @@ def format_batch(batch: BatchRevalidationResult) -> list[str]:
         lines.append(f"  --revalidate: PASSED — {batch.composite.reason}")
         return lines
 
+    if batch.composite.kind == KIND_INFRA:
+        # #1814: the one failure mode that is not about the branches at all.
+        # Say so on stdout too — the reason line goes to stderr, and an
+        # operator skimming the merge summary must not be left with a red
+        # composite and no explanation that it judged nothing.
+        lines.append(
+            "  --revalidate: INFRASTRUCTURE FAILURE — the suite could not "
+            "run, so no branch was judged. Nothing merged, nothing marked "
+            "failed, no verdict changed; every candidate is exactly as it "
+            "was. Fix the runner environment, then re-run --revalidate."
+        )
+        return lines
+
     if not batch.fell_back:
         return lines
 
@@ -872,12 +981,16 @@ __all__ = [
     "DEFAULT_TIMEOUT_SECONDS",
     "KIND_BUILD",
     "KIND_COMPOSE",
+    "KIND_INFRA",
     "KIND_OK",
     "KIND_SETUP",
     "KIND_SUITE",
     "KIND_TIMEOUT",
     "MAX_REVALIDATION_BATCH",
     "NARROWABLE_KINDS",
+    "NO_SUITE_RAN_KINDS",
+    "RUNNER_INFRA_EXIT",
+    "SHELL_NOT_FOUND_EXIT",
     "BatchRevalidationResult",
     "RevalidationResult",
     "client_timeout_seconds",
@@ -886,6 +999,7 @@ __all__ = [
     "format_batch",
     "format_failure",
     "group_candidates",
+    "is_infrastructure_failure",
     "local_repo_dir",
     "revalidate",
     "revalidate_group",

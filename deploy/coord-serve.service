@@ -32,6 +32,15 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# Defence in depth for #1814 ONLY — never the fix on its own. A systemd user
+# unit's PATH is systemd's, not a login shell's: ~/.profile is never sourced,
+# so ~/.cargo/bin is absent and `cargo test` inside a `coord merge
+# --revalidate` run died with "command not found". The real fix is in
+# scripts/coord-test-runner.sh, which resolves each toolchain explicitly and
+# reports a MISSING one as an infrastructure error rather than a red suite —
+# because a PATH= line here fixes this host and leaves the next one broken
+# silently, which is the same failure shape as the bug. Keep both.
+Environment=PATH=%h/.cargo/bin:%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
 ExecStart=%h/.coord-venv/bin/coord serve --config %h/.coord/coordinator.yml --host 0.0.0.0 --port 7435
 Restart=on-failure
 RestartSec=3

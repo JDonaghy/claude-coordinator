@@ -58,8 +58,22 @@
 #     run, or SKIP/REFUSE) and exits WITHOUT building or testing anything —
 #     used by the regression tests to assert routing cheaply and deterministically.
 #
+#  5. TOOLCHAIN RESOLUTION (#1814).  The daemon that runs this (coord-serve, a
+#     systemd *user* unit) has a PATH that no login shell ever touched, so
+#     `~/.cargo/bin` is simply absent and a bare `cargo` dies with
+#     "command not found".  Before #1814 that surfaced as `FAIL(rust)` — a red
+#     suite for a branch whose tests were never run.  A missing toolchain and a
+#     failing test must never produce the same verdict, so the runner now
+#     resolves each toolchain the way a human would (PATH → the default
+#     install location → the version manager) and, when it genuinely cannot
+#     find one, reports `TOOLCHAIN MISSING` and exits 3 — a distinct,
+#     infrastructure exit code that `coord merge --revalidate` renders as
+#     "could not run", never as "SUITE FAILED".
+#
 # Exit codes: 0 pass (or skip — nothing to test), 1 genuine failure or refusal
-# (cannot determine what to test), 2 usage.
+# (cannot determine what to test), 2 usage, 3 INFRASTRUCTURE — the suite could
+# not run at all (a required toolchain is missing); no verdict may be inferred
+# from it in either direction.
 
 set -euo pipefail
 
@@ -191,12 +205,74 @@ fi
 
 FAILED_SUITES=()
 FLAKES=()
+# Suites that could not run at all (missing toolchain). Kept separate from
+# FAILED_SUITES on purpose: these are NOT verdicts (#1814).
+INFRA_SUITES=()
+EXIT_INFRA=3
+
+# ── toolchain resolution (#1814) ─────────────────────────────────────────────
+#
+# `coord serve` is a systemd USER unit. Its PATH is systemd's
+# (`systemctl --user show-environment`), not a login shell's — ~/.profile and
+# the shell rcs that put `~/.cargo/bin` on PATH are never sourced for it. So a
+# bare `cargo` resolves fine over ssh and not at all inside the daemon, and
+# `coord merge --revalidate` reported that as a red suite for a branch CI had
+# already proven green.
+#
+# Resolve explicitly instead, in the order a human debugging this would try:
+# what's on PATH, then the default rustup install location, then rustup's own
+# answer. On success the toolchain's bin dir is PREPENDED to PATH, because
+# `cargo` alone is not enough — it shells out to `rustc`, which lives beside it.
+#
+# `toolchain_missing` is the one and only way this script reports "could not
+# run": one message, naming the tool, the places searched, and the PATH it
+# searched them from.
+toolchain_missing() {
+    local tool="$1" suite="$2" searched="$3"
+    say "TOOLCHAIN MISSING($suite): '$tool' not found — searched: $searched"
+    say "      This is an INFRASTRUCTURE failure, not a test failure: the $suite suite never ran, so nothing about the branch may be inferred from it (#1814)."
+    say "      If this ran from the coord-serve daemon, note that a systemd user unit's PATH is not a login shell's — ~/.profile is never sourced for it. Install the toolchain where the daemon can see it, or set Environment=PATH= in deploy/coord-serve.service."
+    say "      PATH=$PATH"
+    INFRA_SUITES+=("$suite")
+}
+
+# Echoes the resolved absolute path on success; returns 1 (silently) on failure.
+resolve_cargo() {
+    local home="${CARGO_HOME:-$HOME/.cargo}"
+    local found=""
+    if found="$(command -v cargo 2>/dev/null)" && [[ -n "$found" ]]; then
+        printf '%s\n' "$found"; return 0
+    fi
+    if [[ -x "$home/bin/cargo" ]]; then
+        printf '%s\n' "$home/bin/cargo"; return 0
+    fi
+    # rustup itself may be off PATH for the same reason cargo is.
+    local rustup=""
+    if rustup="$(command -v rustup 2>/dev/null)" && [[ -n "$rustup" ]]; then
+        :
+    elif [[ -x "$home/bin/rustup" ]]; then
+        rustup="$home/bin/rustup"
+    fi
+    if [[ -n "$rustup" ]] && found="$("$rustup" which cargo 2>/dev/null)" \
+        && [[ -n "$found" && -x "$found" ]]; then
+        printf '%s\n' "$found"; return 0
+    fi
+    return 1
+}
+
+CARGO_SEARCHED='PATH, ${CARGO_HOME:-$HOME/.cargo}/bin/cargo, `rustup which cargo`'
 
 # ── python ───────────────────────────────────────────────────────────────────
 
 run_python() {
     local venv="$WT/.venv"
     if [[ ! -x "$venv/bin/python" ]]; then
+        # Same class as the cargo case below (#1814): with no interpreter there
+        # is no suite, and "no suite" is not a verdict.
+        if ! command -v python3 >/dev/null 2>&1; then
+            toolchain_missing python3 python "PATH"
+            return 1
+        fi
         log "creating venv + installing .[dev] (~12s)"
         python3 -m venv "$venv" >/dev/null
         "$venv/bin/pip" install -q -e "$WT[dev]" >/dev/null 2>&1 || {
@@ -259,6 +335,20 @@ run_python() {
 # ── rust / coord-tui ─────────────────────────────────────────────────────────
 
 run_rust() {
+    # Resolve the toolchain BEFORE the symlink/build work: a missing cargo is
+    # not a property of the branch, and finding out about it first keeps the
+    # message clean (#1814).
+    local cargo
+    if ! cargo="$(resolve_cargo)"; then
+        toolchain_missing cargo rust "$CARGO_SEARCHED"
+        return 1
+    fi
+    # cargo shells out to rustc/rustdoc, which live beside it — putting the
+    # whole bin dir on PATH is what makes the resolved cargo actually usable.
+    PATH="$(dirname "$cargo"):$PATH"
+    export PATH
+    log "cargo: $cargo"
+
     # tui/Cargo.toml: quadraui = { path = "../../quadraui/quadraui" }, resolved
     # from tui/ — so the worktree needs a quadraui sibling or the build dies.
     local sibling
@@ -276,7 +366,7 @@ run_rust() {
     export CARGO_TARGET_DIR="$CARGO_TARGET"
     local out="$WT/.cargo.out"
     log "running: cargo test (cold ~3m, warm ~30s)"
-    if (cd "$WT/tui" && cargo test) >"$out" 2>&1; then
+    if (cd "$WT/tui" && "$cargo" test) >"$out" 2>&1; then
         say "PASS(rust): $(grep -oE '[0-9]+ passed[^;]*' "$out" | head -1)"
         return 0
     fi
@@ -304,7 +394,7 @@ run_rust() {
     : >"$rerun"
     while IFS= read -r t; do
         [[ -z "$t" ]] && continue
-        if ! (cd "$WT/tui" && cargo test "$t" -- --exact --test-threads=1) >>"$rerun" 2>&1; then
+        if ! (cd "$WT/tui" && "$cargo" test "$t" -- --exact --test-threads=1) >>"$rerun" 2>&1; then
             all_passed=0
         fi
     done <<<"$failed"
@@ -338,6 +428,14 @@ run_fallback() {
         say "PASS(fallback): $FALLBACK_CMD"
         return 0
     fi
+    # 127 is the shell's "command not found" — the suite never started, so this
+    # is the same infrastructure class as a missing cargo above (#1814) and must
+    # not be reported as a failing suite.
+    if [[ "$rc" -eq 127 ]]; then
+        toolchain_missing "${FALLBACK_CMD%% *}" fallback "the login shell's PATH"
+        tail -n 20 "$out" | sed 's/^/      /'
+        return 1
+    fi
     say "FAIL(fallback): $FALLBACK_CMD exited $rc"
     tail -n 40 "$out" | sed 's/^/      /'
     return 1
@@ -357,6 +455,15 @@ fi
 
 if [[ ${#FLAKES[@]} -gt 0 ]]; then
     say "NOTE: flakes tolerated this run: ${FLAKES[*]} — see #1260"
+fi
+
+# Checked BEFORE the FAIL branch and with its own exit code: a suite that could
+# not run is not a suite that failed, and collapsing the two is the #1814 bug.
+# A suite that genuinely failed alongside one that could not run still reports
+# INFRA — the run as a whole is untrustworthy until the environment is fixed.
+if [[ ${#INFRA_SUITES[@]} -gt 0 ]]; then
+    say "RESULT: INFRA (${INFRA_SUITES[*]}) — the suite could not run; this is NOT a test failure and no verdict may be recorded from it"
+    exit "$EXIT_INFRA"
 fi
 
 if [[ ${#FAILED_SUITES[@]} -gt 0 ]]; then
