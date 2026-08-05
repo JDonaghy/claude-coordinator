@@ -1225,67 +1225,6 @@ impl CoordApp {
             }
         }
 
-        // ── #1116: pending "Custom range…" dialog, step 1 (start) ────────────
-        // Armed by `open_usage_custom_range` (`c` on the Usage panel). Enter
-        // parses `buf` (`usage::parse_datetime_utc`) and — on success — opens
-        // step 2 for the end instant; on failure the dialog just closes and
-        // a toast explains why (this codebase's universal dialog convention;
-        // see `PendingUsageRangeStart`'s docs). Esc cancels outright.
-        if self.pending_usage_range_start.is_some() {
-            if let UiEvent::KeyPressed { key, .. } = &event {
-                match key {
-                    Key::Named(NamedKey::Enter) => {
-                        self.submit_usage_range_start();
-                    }
-                    Key::Named(NamedKey::Escape) => {
-                        self.pending_usage_range_start = None;
-                    }
-                    Key::Named(NamedKey::Backspace) => {
-                        if let Some(ref mut input) = self.pending_usage_range_start {
-                            input.buf.pop();
-                        }
-                    }
-                    Key::Char(ch) => {
-                        if let Some(ref mut input) = self.pending_usage_range_start {
-                            input.buf.push(*ch);
-                        }
-                    }
-                    _ => {}
-                }
-                return Reaction::Redraw;
-            }
-        }
-
-        // ── #1116: pending "Custom range…" dialog, step 2 (end) ──────────────
-        // Armed once step 1 resolves. Enter parses `buf` and, when it's a
-        // non-empty interval after `start`, applies `usage_scope =
-        // UsageScope::Custom { start, end }`; otherwise closes with a toast
-        // (same convention as step 1). Esc cancels outright.
-        if self.pending_usage_range_end.is_some() {
-            if let UiEvent::KeyPressed { key, .. } = &event {
-                match key {
-                    Key::Named(NamedKey::Enter) => {
-                        self.submit_usage_range_end();
-                    }
-                    Key::Named(NamedKey::Escape) => {
-                        self.pending_usage_range_end = None;
-                    }
-                    Key::Named(NamedKey::Backspace) => {
-                        if let Some(ref mut input) = self.pending_usage_range_end {
-                            input.buf.pop();
-                        }
-                    }
-                    Key::Char(ch) => {
-                        if let Some(ref mut input) = self.pending_usage_range_end {
-                            input.buf.push(*ch);
-                        }
-                    }
-                    _ => {}
-                }
-                return Reaction::Redraw;
-            }
-        }
-
         // ── #353: Pending repo picker for [Add] button ─────────────────────────
         // When multiple repos exist, this shows a numeric picker (1, 2, …).
         // Numeric keys select a repo, Enter dispatches, Esc cancels.
@@ -2286,21 +2225,10 @@ impl CoordApp {
                         self.on_audit_filters_changed();
                         needs_redraw = true;
                     }
-                    // #1116: Esc collapses the Usage per-stage drill back to
-                    // the grid instead of quitting — must precede the
-                    // unguarded catch-all below, same reasoning as the
-                    // Audit detail-pane-close arm just above.
-                    Key::Named(NamedKey::Escape)
-                        if self.active_view == SidebarView::Usage
-                            && self.usage_expanded.is_some() =>
-                    {
-                        self.usage_collapse();
-                        needs_redraw = true;
-                    }
                     // #1122 (contract §3a): Esc closes the Plans detail pane
                     // back to the roster list instead of quitting — must
                     // precede the unguarded catch-all below, same reasoning
-                    // as the Audit/Usage detail-close arms just above.
+                    // as the Audit detail-close arm just above.
                     Key::Named(NamedKey::Escape)
                         if self.active_view == SidebarView::Plans
                             && self.plans_detail_open =>
@@ -2633,63 +2561,6 @@ impl CoordApp {
                         } else if self.reports_running.is_none() {
                             self.reports_rerun_selected();
                         }
-                        needs_redraw = true;
-                    }
-
-                    // ── Usage panel keyboard nav (#1116) ─────────────────
-                    // j/k move the grid/drill selection; Enter expands the
-                    // selected grid row (Issue group-by only — a no-op for
-                    // Repo group-by, see `usage_try_expand_selected`); Esc
-                    // collapses the drill (handled earlier, alongside the
-                    // other pending-state Escape guards, since it must run
-                    // before the unguarded global `q`/Esc = Exit catch-all
-                    // above); `t` cycles scope, `g` toggles group-by, `c`
-                    // opens the "Custom range…" dialog.
-                    Key::Char('j') | Key::Named(NamedKey::Down)
-                        if self.active_view == SidebarView::Usage =>
-                    {
-                        let n = self.usage_visible_row_count();
-                        if n > 0 {
-                            self.usage_sel = (self.usage_sel + 1).min(n - 1);
-                        }
-                        self.fix_usage_scroll(content_visible_rows(ctx.main_bounds(), lh));
-                        needs_redraw = true;
-                    }
-                    Key::Char('k') | Key::Named(NamedKey::Up)
-                        if self.active_view == SidebarView::Usage =>
-                    {
-                        self.usage_sel = self.usage_sel.saturating_sub(1);
-                        self.fix_usage_scroll(content_visible_rows(ctx.main_bounds(), lh));
-                        needs_redraw = true;
-                    }
-                    Key::Named(NamedKey::Enter)
-                        if self.active_view == SidebarView::Usage
-                            && self.usage_expanded.is_none() =>
-                    {
-                        self.usage_try_expand_selected();
-                        needs_redraw = true;
-                    }
-                    Key::Char('t') if self.active_view == SidebarView::Usage => {
-                        self.usage_scope = self.usage_scope.cycle_next();
-                        self.usage_sel = 0;
-                        self.usage_scroll = 0;
-                        needs_redraw = true;
-                    }
-                    Key::Char('g')
-                        if self.active_view == SidebarView::Usage
-                            && self.usage_expanded.is_none() =>
-                    {
-                        self.usage_group_by = self.usage_group_by.next();
-                        self.usage_sel = 0;
-                        self.usage_scroll = 0;
-                        needs_redraw = true;
-                    }
-                    Key::Char('c')
-                        if self.active_view == SidebarView::Usage
-                            && self.pending_usage_range_start.is_none()
-                            && self.pending_usage_range_end.is_none() =>
-                    {
-                        self.open_usage_custom_range();
                         needs_redraw = true;
                     }
 
@@ -3189,9 +3060,6 @@ impl CoordApp {
                             // while the detail pane is open, since the
                             // guarded arm requires `!audit_detail_open`).
                             SidebarView::Audit => {}
-                            // #1116: list-mode j/k handled by the earlier
-                            // guarded arm (below); a no-op here.
-                            SidebarView::Usage => {}
                             // #1741: section-stack j/k handled by the earlier
                             // guarded arm; a no-op here.
                             SidebarView::Reports => {}
@@ -3261,8 +3129,6 @@ impl CoordApp {
                             }
                             // #1039: see Down/j arm above.
                             SidebarView::Audit => {}
-                            // #1116: see Down/j arm above.
-                            SidebarView::Usage => {}
                             // #1741: see Down/j arm above.
                             SidebarView::Reports => {}
                         }
@@ -3507,12 +3373,6 @@ impl CoordApp {
                                 // scrolled off-screen above the viewport.
                                 self.audit_scroll = 0;
                             }
-                            // #1116: Usage — Home jumps to the first row of
-                            // whichever table (grid or drill) is showing.
-                            SidebarView::Usage => {
-                                self.usage_sel = 0;
-                                self.usage_scroll = 0;
-                            }
                             // #1741: Reports — Home jumps to the first
                             // section (and its first field).
                             SidebarView::Reports => {
@@ -3603,15 +3463,6 @@ impl CoordApp {
                                     ctx.main_bounds(),
                                     lh,
                                 ));
-                            }
-                            // #1116: Usage — End jumps to the last row of
-                            // whichever table (grid or drill) is showing.
-                            SidebarView::Usage => {
-                                let n = self.usage_visible_row_count();
-                                if n > 0 {
-                                    self.usage_sel = n - 1;
-                                }
-                                self.fix_usage_scroll(content_visible_rows(ctx.main_bounds(), lh));
                             }
                             // #1741: Reports — End jumps to the last section.
                             SidebarView::Reports => {
@@ -5359,10 +5210,6 @@ impl CoordApp {
             // #1039: Audit sidebar is a placeholder (count + badge only);
             // the entry list lives in the main panel (`mouse_main_click`).
             SidebarView::Audit => false,
-            // #1116: Usage sidebar is a placeholder (scope/group-by/Σ
-            // total); the grid/drill live in the main panel
-            // (`mouse_main_click`), same as Audit.
-            SidebarView::Usage => false,
             // #1741: Reports sidebar is a summary (catalogue size + last-run
             // line); the section stack lives in the main panel.
             SidebarView::Reports => false,
@@ -5749,33 +5596,6 @@ impl CoordApp {
                 MsvClick::HeaderAction { .. } | MsvClick::Inert => false,
             };
         }
-        // #1116: Usage panel grid/drill is a `DataTable` painted straight
-        // into the main panel, same pattern as Audit but without column-
-        // resize/scrollbar-drag (deferred — see `app/usage.rs` module
-        // docs). While drilled into one issue's per-stage legs, a row
-        // click is a no-op (nothing to drill further into); a header click
-        // re-sorts the grid (no-op while drilled, since the drill table
-        // has no `sort`).
-        if self.active_view == SidebarView::Usage {
-            return match self.usage_table_hit(pos, main_b) {
-                Some(DataTableHit::Row { idx }) => {
-                    self.usage_sel = idx;
-                    if self.usage_expanded.is_none() {
-                        self.usage_try_expand_selected();
-                    }
-                    true
-                }
-                Some(DataTableHit::Header { col }) if self.usage_expanded.is_none() => {
-                    self.usage_sort_by_column(col);
-                    true
-                }
-                Some(DataTableHit::Header { .. })
-                | Some(DataTableHit::HeaderDivider { .. })
-                | Some(DataTableHit::Footer)
-                | Some(DataTableHit::Empty)
-                | None => false,
-            };
-        }
         false
     }
 
@@ -6109,9 +5929,6 @@ impl CoordApp {
             // #1039: Audit sidebar is a placeholder (count + badge only) —
             // no sidebar scroll.
             SidebarView::Audit => false,
-            // #1116: Usage sidebar is a placeholder (scope/group-by/Σ
-            // total) — no sidebar scroll.
-            SidebarView::Usage => false,
             // #1741: Reports sidebar is a short summary — no sidebar scroll.
             SidebarView::Reports => false,
         }
@@ -6371,20 +6188,6 @@ impl CoordApp {
             // #1039: Audit panel — j/k handles navigation; wheel is a no-op
             // for now, same as Plans/MergeQueue/MilestoneDag above.
             SidebarView::Audit => true,
-            // #1116: Usage panel — the grid/drill table can genuinely run
-            // long (many issues, or many legs), so unlike Audit above the
-            // wheel actually scrolls it (cheap: `usage_scroll` + the same
-            // clamping `fix_usage_scroll` keyboard nav uses).
-            SidebarView::Usage => {
-                let n = self.usage_visible_row_count();
-                if delta.y > 0.0 {
-                    self.usage_scroll = self.usage_scroll.saturating_sub(3);
-                } else if delta.y < 0.0 {
-                    let max = n.saturating_sub(visible.max(1));
-                    self.usage_scroll = (self.usage_scroll + 3).min(max);
-                }
-                true
-            }
             // #1741: Reports panel — j/k navigate the *section stack*, so
             // the wheel is given to the thing keyboard nav can't reach: the
             // result table below it, which can run long (one row per issue

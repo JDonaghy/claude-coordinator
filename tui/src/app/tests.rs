@@ -39498,282 +39498,6 @@ Milestone tracking issue.
         );
     }
 
-    // ── #1116: Usage panel (per-issue cost/token grid + drill) ───────────────
-
-    /// Shared fixture: issue #501 (repo "alpha") has one non-interactive,
-    /// fully-captured leg ($0.50). Issue #502 (repo "beta") has TWO
-    /// interactive-only legs (`is_interactive = true`, `cost_usd = None` on
-    /// both) whose combined token estimate outweighs #501's captured cost —
-    /// the exact "interactive-heavy issues aren't shown as $0" case the
-    /// issue body calls out, and it exercises the default desc-by-total-cost
-    /// sort against an issue whose cost is entirely *estimated*.
-    /// `make_assignment_typed`'s default `dispatched_at` is a fixed 1970
-    /// timestamp (never "today"), so every leg here is explicitly re-anchored
-    /// to real "now" — otherwise the default `Today` scope window would
-    /// exclude everything and the grid would render empty.
-    ///
-    /// The anchor is **midday UTC of "today"**, not raw wall-clock `now`:
-    /// offsetting straight from `now` (as an earlier version of this fixture
-    /// did) put legs up to 2h in the past, which crosses into *yesterday*
-    /// whenever the suite runs within ~2h of UTC midnight — `Today`'s window
-    /// is `[utc_day_start(now), utc_day_start(now) + 1 day)`, so a leg that
-    /// lands before the boundary silently drops out of the aggregate. That
-    /// produced a real, time-of-day-dependent flake (#1116 fix iteration 1):
-    /// the grid rendered with #502's `work` leg missing entirely, so its Σ
-    /// estimate read as the `review` leg's `~$0.9060` alone instead of the
-    /// combined `~$19.2` both tests expect. Anchoring at midday with modest
-    /// (≤2h) offsets keeps every timestamp inside the same UTC calendar day
-    /// no matter what time the test actually runs.
-    fn make_usage_grid_assignments() -> Vec<Assignment> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs_f64();
-        let day_start = (now / 86_400.0).floor() * 86_400.0;
-        let anchor = day_start + 43_200.0; // 12:00 UTC "today" — day-boundary-safe
-
-        let mut a501 = make_assignment_typed("done", 501, "alpha", Some("work"));
-        a501.model = Some("sonnet".to_string());
-        a501.cost_usd = Some(0.50);
-        a501.input_tokens = 1_000;
-        a501.output_tokens = 2_000;
-        a501.cache_read_tokens = 3_000;
-        a501.dispatched_at = Some(anchor - 3_600.0);
-        a501.finished_at = Some(anchor - 3_000.0);
-
-        // Est = (20_000*15 + 200_000*75 + 2_000_000*1.50) / 1e6 = $18.30.
-        let mut a502_work = make_assignment_typed("done", 502, "beta", Some("work"));
-        a502_work.model = Some("opus".to_string());
-        a502_work.is_interactive = true;
-        a502_work.input_tokens = 20_000;
-        a502_work.output_tokens = 200_000;
-        a502_work.cache_read_tokens = 2_000_000;
-        a502_work.dispatched_at = Some(anchor - 7_200.0);
-        a502_work.finished_at = Some(anchor - 6_000.0);
-
-        // Est = (2_000*3 + 50_000*15 + 500_000*0.30) / 1e6 = $0.9060 (4 dp).
-        let mut a502_review = make_assignment_typed("done", 502, "beta", Some("review"));
-        a502_review.model = Some("sonnet".to_string());
-        a502_review.is_interactive = true;
-        a502_review.input_tokens = 2_000;
-        a502_review.output_tokens = 50_000;
-        a502_review.cache_read_tokens = 500_000;
-        a502_review.dispatched_at = Some(anchor - 1_000.0);
-        a502_review.finished_at = Some(anchor - 500.0);
-
-        vec![a501, a502_work, a502_review]
-    }
-
-    #[test]
-    fn usage_grid_desc_sorted_click_row_expands_drill_with_estimate() {
-        use quadraui::tui::testing::driver_with_shell;
-
-        let app = make_app_with_assignments(make_usage_grid_assignments());
-        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 160, 45);
-        click_activity_icon(&mut driver, "$");
-        driver.render();
-
-        let screen = driver.screen();
-        for needle in ["Issue", "Repo", "Title", "Legs", "Cost", "Est (~)", "Out/Cache", "Time"] {
-            assert!(screen.contains(needle), "grid header must show column {needle:?}:\n{screen}");
-        }
-        assert!(screen.contains("#501"), "issue #501 row must render:\n{screen}");
-        assert!(screen.contains("#502"), "issue #502 row must render:\n{screen}");
-        assert!(
-            screen.contains("$0.50"),
-            "#501's captured cost must render as a real dollar figure:\n{screen}"
-        );
-        assert!(
-            screen.contains("~$19.2"),
-            "#502's Σ estimate (both legs interactive, no captured cost at all) \
-             must render distinctly (~$), never a silent $0:\n{screen}"
-        );
-
-        // #502's cost is entirely ESTIMATED yet still outweighs #501's
-        // captured $0.50 — the default sort (desc by captured+est) must
-        // still rank it first, proving an all-interactive issue's estimate
-        // counts toward the sort rather than defaulting it to the bottom.
-        let pos_502 = screen.find("#502").expect("issue #502 must render");
-        let pos_501 = screen.find("#501").expect("issue #501 must render");
-        assert!(
-            pos_502 < pos_501,
-            "an interactive-only issue's estimate must count toward the desc \
-             sort — #502 (~$19 estimated) must sort above #501 (captured $0.50):\n{screen}"
-        );
-
-        // Click #502's row → expand into the per-stage drill.
-        let (x, y) = driver.find("#502").expect("issue #502 row must be clickable");
-        driver.click(x, y);
-        driver.render();
-
-        let screen = driver.screen();
-        assert!(
-            screen.contains("back to grid"),
-            "drill header must show the Esc-to-back-to-grid hint:\n{screen}"
-        );
-        assert!(screen.contains("opus"), "the work leg's model must render in the drill:\n{screen}");
-        assert!(screen.contains("sonnet"), "the review leg's model must render in the drill:\n{screen}");
-        assert!(
-            screen.contains("~$18.3000"),
-            "the work leg (interactive, opus, no captured cost) must show a \
-             non-zero estimate at 4 dp, not a blank/zero cost:\n{screen}"
-        );
-        assert!(
-            screen.contains("~$0.9060"),
-            "the review leg (interactive, sonnet, no captured cost) must show \
-             a non-zero estimate at 4 dp:\n{screen}"
-        );
-    }
-
-    #[test]
-    fn usage_group_by_repo_toggle_collapses_issues_into_repo_rows() {
-        use quadraui::tui::testing::driver_with_shell;
-
-        let app = make_app_with_assignments(make_usage_grid_assignments());
-        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 160, 45);
-        click_activity_icon(&mut driver, "$");
-        driver.render();
-        assert!(driver.screen_contains("Title"), "default group-by is Issue (has a Title column)");
-        assert!(driver.screen_contains("#502"), "default group-by shows per-issue rows");
-
-        driver.type_char('g');
-        driver.render();
-
-        let screen = driver.screen();
-        assert!(
-            !screen.contains("Title"),
-            "Repo group-by has no per-issue Title column — the row IS the whole repo:\n{screen}"
-        );
-        assert!(
-            !screen.contains("#502") && !screen.contains("#501"),
-            "Repo group-by must not show per-issue identity cells:\n{screen}"
-        );
-        assert!(screen.contains("alpha"), "repo 'alpha' must still render as its own row:\n{screen}");
-        assert!(screen.contains("beta"), "repo 'beta' must still render, aggregating both its legs:\n{screen}");
-        assert!(
-            screen.contains("Group by: Repo"),
-            "the sidebar/status-bar must reflect the toggled group-by:\n{screen}"
-        );
-    }
-
-    #[test]
-    fn usage_header_click_toggles_sort_direction() {
-        use quadraui::tui::testing::driver_with_shell;
-
-        let app = make_app_with_assignments(make_usage_grid_assignments());
-        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 160, 45);
-        click_activity_icon(&mut driver, "$");
-        driver.render();
-
-        // Default sort (desc by captured+est) ranks #502 (~$19 estimated)
-        // above #501 (captured $0.50) — asserted in the sibling test above.
-        // Clicking the "Cost" (captured-only) header switches the sort key
-        // to captured cost, whose default direction is descending: #501
-        // ($0.50 captured) must now outrank #502 (captured $0 — its cost is
-        // entirely estimated), REVERSING the on-screen order.
-        let (cx, cy) = driver.find("Cost").expect("Cost header must render");
-        driver.click(cx, cy);
-        driver.render();
-
-        let screen = driver.screen();
-        let pos_501 = screen.find("#501").expect("issue #501 must render");
-        let pos_502 = screen.find("#502").expect("issue #502 must render");
-        assert!(
-            pos_501 < pos_502,
-            "sorting by captured cost (desc) must rank #501 ($0.50 captured) \
-             above #502 ($0 captured, all-estimated):\n{screen}"
-        );
-
-        // Click "Cost" again → same column, direction toggles to ascending
-        // ($0 before $0.50), flipping the order back.
-        let (cx, cy) = driver.find("Cost").expect("Cost header must still render");
-        driver.click(cx, cy);
-        driver.render();
-
-        let screen = driver.screen();
-        let pos_501 = screen.find("#501").expect("issue #501 must render");
-        let pos_502 = screen.find("#502").expect("issue #502 must render");
-        assert!(
-            pos_502 < pos_501,
-            "a second click on the same header must toggle to ascending, \
-             putting #502 ($0 captured) back above #501 ($0.50 captured):\n{screen}"
-        );
-    }
-
-    #[test]
-    fn usage_custom_range_dialog_rescopes_grid() {
-        use quadraui::tui::testing::driver_with_shell;
-
-        // A leg dispatched/finished in mid-2020 — real "now" is well past
-        // that, so the default `Today` scope must NOT show it; the
-        // custom-range dialog is the only way to bring it into view.
-        let mid_2020 = usage::parse_datetime_utc("2020-06-15").expect("valid fixture date");
-
-        let mut a = make_assignment_typed("done", 900, "gamma", Some("work"));
-        a.model = Some("sonnet".to_string());
-        a.cost_usd = Some(5.00);
-        a.dispatched_at = Some(mid_2020);
-        a.finished_at = Some(mid_2020 + 600.0);
-
-        let app = make_app_with_assignments(vec![a]);
-        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 160, 45);
-        click_activity_icon(&mut driver, "$");
-        driver.render();
-
-        let screen = driver.screen();
-        assert!(!screen.contains("#900"), "a 2020 leg must NOT appear under the default Today scope:\n{screen}");
-        assert!(
-            screen.contains("No usage data in this window"),
-            "the grid must show the empty state, not a stale/wrong row:\n{screen}"
-        );
-
-        // Open the custom-range dialog and enter [2020-06-01, 2020-07-01).
-        driver.type_char('c');
-        driver.render();
-        assert!(
-            driver.screen_contains("Custom range — start"),
-            "'c' must open the custom-range dialog's start step:\n{}",
-            driver.screen()
-        );
-        for ch in "2020-06-01".chars() {
-            driver.type_char(ch);
-        }
-        driver.render();
-        assert!(
-            driver.screen_contains("2020-06-01"),
-            "the typed start date must render in the input:\n{}",
-            driver.screen()
-        );
-
-        driver.press_named(NamedKey::Enter);
-        driver.render();
-        assert!(
-            driver.screen_contains("Custom range — end"),
-            "confirming a valid start must advance to the end step:\n{}",
-            driver.screen()
-        );
-        for ch in "2020-07-01".chars() {
-            driver.type_char(ch);
-        }
-        driver.render();
-        driver.press_named(NamedKey::Enter);
-        driver.render();
-
-        let screen = driver.screen();
-        assert!(
-            screen.contains("#900"),
-            "after applying the custom range, the grid must re-scope to include \
-             the 2020 leg:\n{screen}"
-        );
-        assert!(screen.contains("gamma"), "the repo must render too:\n{screen}");
-        assert!(screen.contains("$5.00"), "the captured cost must render:\n{screen}");
-        assert!(
-            screen.contains("2020-06-01") && screen.contains("2020-07-01"),
-            "the resolved custom range must be reflected in the scope label \
-             (sidebar / status-bar hint):\n{screen}"
-        );
-    }
-
     // ── #1300: Done section badge count vs. rendered rows ────────────────────
 
     /// Build a fixture where epic #200 is still open (in In-progress) and its
@@ -40660,33 +40384,6 @@ Milestone tracking issue.
     }
 
     #[test]
-    fn slice_usage_grid_groups_under_the_child() {
-        // The Usage panel's per-issue grid + its drill-down must agree with
-        // each other and with the Pipeline rollup above.
-        use super::usage::{aggregate_usage, issue_legs, UsageWindow};
-
-        let mut author = slice_assignment("done", "author-1");
-        author.cost_usd = Some(7.90);
-        author.dispatched_at = Some(1_000.0);
-        author.finished_at = Some(2_000.0);
-        let assignments = vec![author];
-
-        let window = UsageWindow { start: None, end: None };
-        let (rows, _totals) = aggregate_usage(&assignments, &window, UsageGroupBy::Issue);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].issue_number,
-            Some(1124),
-            "slice spend must be grouped under the child issue"
-        );
-        assert_eq!(issue_legs(&assignments, "api", 1124, &window).len(), 1);
-        assert!(
-            issue_legs(&assignments, "api", 1120, &window).is_empty(),
-            "the drill-down must not list a child's legs under the epic"
-        );
-    }
-
-    #[test]
     fn acceptance_authoring_prereq_still_resolves_for_the_child() {
         // Regression guard: #1553 must not disturb the #1084 mini-pipeline,
         // which resolves the slice by (issue_number == tracking) AND
@@ -41522,7 +41219,6 @@ Milestone tracking issue.
         for view in [
             SidebarView::Board,
             SidebarView::Audit,
-            SidebarView::Usage,
             SidebarView::Settings,
         ] {
             app.active_view = view;
@@ -42103,6 +41799,232 @@ Milestone tracking issue.
                  a panic or a phantom sort"
         );
         assert!(app.reports_sort.is_none());
+    }
+
+    // ── #1763: the `usage` report + `ReportResult.totals` ────────────────────
+    //
+    // The Usage ActivityBar panel was a Rust port of `coord/usage_rollup.py`
+    // carrying a compiled-in pricing snapshot, so an operator's `pricing:`
+    // override moved `coord usage` and left the panel showing different
+    // numbers. #1763 deleted it and made the rollup a server-side report.
+    // What is left to test client-side is exactly what stayed client-side:
+    // that a *generic* renderer shows the new report without any
+    // report-specific Rust, that the retired panel id still lands somewhere
+    // real, and that `totals` is additive.
+
+    /// The real `usage` catalogue entry, as `GET /report` serves it.
+    fn usage_catalogue_json() -> &'static str {
+        r#"{
+            "reports": [
+                {
+                    "id": "usage",
+                    "title": "Usage",
+                    "description": "Cost and token spend for a time window.",
+                    "params": [
+                        {"id": "window", "label": "Time window", "kind": "choice",
+                         "choices": ["today", "week", "month", "7d", "30d"],
+                         "default": "today", "help": "", "free_form": false},
+                        {"id": "group_by", "label": "Group by", "kind": "choice",
+                         "choices": ["issue", "repo"], "default": "issue",
+                         "help": "", "free_form": false},
+                        {"id": "repo", "label": "Repo", "kind": "text",
+                         "choices": [], "default": "", "help": "", "free_form": false}
+                    ]
+                }
+            ]
+        }"#
+    }
+
+    /// A `usage` run: two rows, `money` columns, and a `totals` footer.
+    fn usage_result_json() -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        format!(
+            r#"{{
+                "report_id": "usage",
+                "generated_at": {now},
+                "window": [{start}, {now}],
+                "columns": ["issue", "repo", "title", "legs", "cost_captured",
+                            "cost_est", "cost_total"],
+                "column_meta": [
+                    {{"id": "issue", "label": "Issue", "kind": "int",
+                      "align": "right", "weight": 0.8}},
+                    {{"id": "repo", "label": "Repo", "kind": "text",
+                      "align": "left", "weight": 1.5}},
+                    {{"id": "title", "label": "Title", "kind": "text",
+                      "align": "left", "weight": 4.0}},
+                    {{"id": "legs", "label": "Legs", "kind": "int",
+                      "align": "right", "weight": 0.6}},
+                    {{"id": "cost_captured", "label": "Cost $", "kind": "money",
+                      "align": "right", "weight": 1.0}},
+                    {{"id": "cost_est", "label": "Est ~$", "kind": "money",
+                      "align": "right", "weight": 1.0}},
+                    {{"id": "cost_total", "label": "Total $", "kind": "money",
+                      "align": "right", "weight": 1.0}}
+                ],
+                "rows": [
+                    {{"issue": 7, "repo": "api", "title": "BIGGER-SPEND", "legs": 2,
+                      "cost_captured": 1.5, "cost_est": 30.0,
+                      "cost_total": 31.500000000000004}},
+                    {{"issue": 9, "repo": "web", "title": "SMALLER-SPEND", "legs": 1,
+                      "cost_captured": 0.0, "cost_est": 2.25, "cost_total": 2.25}}
+                ],
+                "notes": [],
+                "totals": {{"legs": 3, "cost_captured": 1.5, "cost_est": 32.25,
+                            "cost_total": 33.75}}
+            }}"#,
+            now = now,
+            start = now - 86_400.0,
+        )
+    }
+
+    /// Open Reports on a seeded `usage` catalogue + result, one frame drawn.
+    fn usage_report_driver(
+        result_json: Option<&str>,
+        w: u16,
+        h: u16,
+    ) -> quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic> {
+        use quadraui::tui::testing::driver_with_shell;
+        let app = make_app_with_reports(
+            BoardData::default(),
+            usage_catalogue_json(),
+            result_json,
+        );
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), w, h);
+        click_activity_icon(&mut driver, "▤");
+        driver.render();
+        driver
+    }
+
+    #[test]
+    fn usage_activity_bar_button_is_gone() {
+        let cfg = CoordApp::shell_config();
+        assert!(
+            !cfg.panels.iter().any(|p| p.id.as_str() == "panel:usage"),
+            "#1763: the Usage panel is retired — its ActivityBar entry must \
+             not be registered any more"
+        );
+        assert!(
+            cfg.panels.iter().any(|p| p.id.as_str() == "panel:reports"),
+            "#1763: the rollup now lives behind the Reports panel, which \
+             must still be registered"
+        );
+    }
+
+    #[test]
+    fn legacy_panel_usage_id_lands_on_reports_not_a_dead_view() {
+        // The #975 `panel:milestones` precedent: an operator with the old
+        // button pinned must land on the panel that subsumed it, not on
+        // whatever view happened to be active (or nothing at all).
+        let mut app = make_test_app(BoardData::default());
+        app.active_view = SidebarView::Board;
+        app.on_shell_event(&quadraui::AppShellEvent::PanelChanged {
+            panel_id: WidgetId::new("panel:usage"),
+        });
+        assert_eq!(
+            app.active_view,
+            SidebarView::Reports,
+            "#1763: a stored `panel:usage` id must redirect to Reports"
+        );
+    }
+
+    #[test]
+    fn usage_report_renders_as_a_section_with_its_params_and_run_button() {
+        // The standing proof of #1741's generic-client property: a second
+        // report appears with its controls and no report-specific Rust.
+        let screen = usage_report_driver(None, 140, 40).screen();
+        assert!(screen.contains("Usage"), "the section header must render:\n{screen}");
+        assert!(
+            screen.contains("Time window"),
+            "the `window` param's label must render:\n{screen}"
+        );
+        assert!(
+            screen.contains("Group by"),
+            "the `group_by` param's label must render:\n{screen}"
+        );
+        assert!(
+            screen.contains("today") && screen.contains("issue"),
+            "each choice param's default must render as a selected option:\n{screen}"
+        );
+        assert!(screen.contains("Run"), "the Run button must render:\n{screen}");
+    }
+
+    #[test]
+    fn money_column_renders_dollars_not_a_raw_float() {
+        let screen = usage_report_driver(Some(&usage_result_json()), 140, 40).screen();
+        assert!(
+            screen.contains("$31.5"),
+            "#1763: a `money` cell must render as a dollar figure:\n{screen}"
+        );
+        assert!(
+            !screen.contains("31.500000000000004"),
+            "#1763: a `money` cell must never render the raw JSON float:\n{screen}"
+        );
+        // A genuine zero reads as "nothing captured", not "$0.0000".
+        assert!(
+            screen.contains('—'),
+            "#1763: a zero `money` cell must render as an em dash:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn usage_totals_render_as_a_pinned_footer_row() {
+        let screen = usage_report_driver(Some(&usage_result_json()), 140, 40).screen();
+        assert!(
+            screen.contains('Σ'),
+            "#1763: `totals` must render as a pinned footer row marked Σ:\n{screen}"
+        );
+        assert!(
+            screen.contains("$33.75"),
+            "#1763: the footer must carry the grand total:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn a_result_without_totals_renders_no_footer() {
+        // Compatibility guard for the already-shipped #1741 panel: a daemon
+        // that predates #1763 (or a report with no meaningful sum) sends no
+        // `totals`, and the table must look exactly as it did before.
+        let screen = reports_driver(&reports_result_json_meta(), 140, 40).screen();
+        assert!(
+            !screen.contains('Σ'),
+            "#1763: a result with no `totals` must not grow a footer row:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn totals_is_optional_on_the_wire() {
+        // A payload with no `totals` key at all must still deserialize —
+        // this is the older-daemon path, and a serde failure here would
+        // blank the whole panel rather than one column.
+        let parsed: super::types::ReportResult = serde_json::from_str(
+            r#"{"report_id": "issue-activity", "columns": [], "rows": [], "notes": []}"#,
+        )
+        .expect("#1763: `totals` must be optional on the wire");
+        assert!(parsed.totals.is_none());
+    }
+
+    #[test]
+    fn money_column_sorts_numerically_not_lexically() {
+        // "$2.25" sorts before "$31.50" as text and after it as a number.
+        // Sorting reads the raw JSON, so the numeric answer is the one the
+        // header click must produce.
+        let mut driver = usage_report_driver(Some(&usage_result_json()), 140, 40);
+        let (x, y) = driver
+            .find("Total $")
+            .expect("the money column header must render");
+        driver.click(x, y);
+        driver.render();
+        let screen = driver.screen();
+        let big = screen.find("BIGGER-SPEND").expect("row 7 must render");
+        let small = screen.find("SMALLER-SPEND").expect("row 9 must render");
+        assert!(
+            big > small,
+            "#1763: the first header click sorts ascending, so the $2.25 row \
+             must precede the $31.50 one:\n{screen}"
+        );
     }
 
     #[test]

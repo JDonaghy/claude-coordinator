@@ -528,6 +528,21 @@ impl CoordApp {
                     .join(", "),
                 None => Self::reports_plain_text(value),
             },
+            // #1763: a USD figure. Without this a cost column renders the
+            // raw JSON number — `31.500000000000004` next to `1.5`, which
+            // is unreadable and misaligned. Still keyed on `kind`, not on
+            // column id: any report declaring `money` gets it.
+            "money" => match value.as_f64() {
+                Some(usd) => format_money(usd),
+                None => Self::reports_plain_text(value),
+            },
+            // #1763: seconds → `1h02m03s`. Declared by no column today, but
+            // it is in the #1760 vocabulary and a raw `4523.0` in a column
+            // labelled "Time" is worse than useless.
+            "duration" => match value.as_f64() {
+                Some(secs) => format_duration_compact(secs),
+                None => Self::reports_plain_text(value),
+            },
             // `int` needs no special text — it is `align: right` that makes
             // a numeric column readable, and that is applied in
             // `reports_result_columns`. `enum`/`text`/unknown: as before.
@@ -696,7 +711,7 @@ impl CoordApp {
                 .join(", ")
         };
         let base = match kind {
-            "int" | "timestamp" | "duration" => match (a.as_f64(), b.as_f64()) {
+            "int" | "timestamp" | "duration" | "money" => match (a.as_f64(), b.as_f64()) {
                 (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
                 // A column declared numeric that isn't (mixed types, an
                 // ISO string): fall back rather than treating both as 0.
@@ -743,6 +758,45 @@ impl CoordApp {
                 decoration: Decoration::Normal,
             })
             .collect()
+    }
+
+    /// #1763: the pinned grand-total footer row, or `None` when the daemon
+    /// sent no `totals` (every report but `usage` today, and every daemon
+    /// older than #1763).
+    ///
+    /// Rendered through exactly the same per-column `kind` dispatch as any
+    /// data row — the only addition is a `Σ` marker in the leading column,
+    /// which the wire deliberately leaves blank so each client picks its
+    /// own. Nothing here knows which columns are identity columns or which
+    /// report is being shown.
+    fn reports_footer_row(result: &ReportResult) -> Option<DataRow> {
+        let totals = result.totals.as_ref()?;
+        if !totals.is_object() {
+            // A daemon sending a non-object `totals` gets no footer rather
+            // than a row of stringified JSON in every cell.
+            return None;
+        }
+        let mut cells: Vec<StyledText> = result
+            .columns
+            .iter()
+            .map(|c| {
+                let kind = Self::reports_column_kind(result, c);
+                StyledText {
+                    spans: vec![StyledSpan::with_fg(
+                        Self::reports_cell_text(totals, c, kind),
+                        Color::rgb(235, 235, 235),
+                    )],
+                }
+            })
+            .collect();
+        if let Some(first) = cells.first_mut() {
+            if first.spans.iter().all(|s| s.text.trim().is_empty()) {
+                *first = StyledText {
+                    spans: vec![StyledSpan::with_fg("Σ".to_string(), Color::rgb(235, 235, 235))],
+                };
+            }
+        }
+        Some(DataRow { cells, decoration: Decoration::Header })
     }
 
     // ── Render ───────────────────────────────────────────────────────────
@@ -927,7 +981,9 @@ impl CoordApp {
                 // and route column-sort clicks to the wrong column.
                 h_scroll: 0.0,
                 column_overrides: Vec::new(),
-                footer: None,
+                // #1763: pinned Σ row (quadraui#432) when the report
+                // supplies one — `usage` does, `issue-activity` does not.
+                footer: Self::reports_footer_row(result),
             };
             // Cache the painted geometry *with the rect it was painted
             // into* — unlike Audit's table this one does not start at the

@@ -313,19 +313,6 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         audit_scroll: 0,
         audit_h_scroll: 0.0,
         audit_scrollbar_drag: None,
-        // #1116: Usage panel — today/by-issue/cost-total-desc defaults,
-        // nothing expanded, no custom-range dialog, same as the real
-        // constructor (`CoordApp::new` in `mod.rs`).
-        usage_scope: UsageScope::Today,
-        usage_group_by: UsageGroupBy::Issue,
-        usage_sort_key: UsageSortKey::CostTotal,
-        usage_sort_dir: SortDirection::Descending,
-        usage_sel: 0,
-        usage_scroll: 0,
-        usage_expanded: None,
-        usage_table_layout: std::cell::RefCell::new(None),
-        pending_usage_range_start: None,
-        pending_usage_range_end: None,
         // #1741: Reports panel — nothing seeded by default; use
         // `make_app_with_reports` to pre-populate the catalogue (and
         // optionally a completed run) with no daemon and no fetch thread.
