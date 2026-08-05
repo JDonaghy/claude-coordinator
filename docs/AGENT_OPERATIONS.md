@@ -276,6 +276,15 @@ make it a thin client of itself).
 
 ### One-time cutover / ETL (elitebook → dellserver)
 
+**Historical — kept for the DB-copy mechanics only.** This was #591's
+one-time move, done before #1779 replaced `coordinator.yml` deploy with
+symlink + `git pull` (see `OPERATING_GOTCHAS.md` #14). Do not `scp`
+`coordinator.yml` again for routine config changes — that overwrites the live
+path with a disconnected regular file exactly like the `sed -i`/editor trap
+#14 warns about. It is only appropriate for bootstrapping a *brand-new*
+daemon host that has no `coord-settings` checkout and no symlink yet; even
+then, prefer cloning the checkout and symlinking it in per #14's recipe.
+
 The board DB currently lives on **elitebook**; #591 moves it to the always-on
 **dellserver** and makes every other box a thin client. The DB is a single
 SQLite file, so the "ETL" is a file copy + a parity check — do it during a quiet
@@ -287,7 +296,7 @@ window (no active dispatch):
 #    is self-contained (otherwise also copy coord.db-wal / coord.db-shm).
 ssh elitebook '~/.coord-venv/bin/python -c "import sqlite3;c=sqlite3.connect(\"$HOME/.coord/coord.db\");c.execute(\"PRAGMA wal_checkpoint(TRUNCATE)\");c.close()"'
 scp elitebook:~/.coord/coord.db dellserver:~/.coord/coord.db
-scp elitebook:~/.coord/coordinator.yml dellserver:~/.coord/coordinator.yml  # canonical home (was ~/coordinator.yml)
+scp elitebook:~/.coord/coordinator.yml dellserver:~/.coord/coordinator.yml  # canonical home (was ~/coordinator.yml) — historical, see note above
 # 3. Start the daemon on dellserver (service above), verify /board parity:
 #    round_number + assignment count match elitebook's `coord status`.
 # 4. Flip every machine (incl. elitebook) to a thin client: write client.toml
@@ -697,8 +706,14 @@ The `env -i` matters: it reproduces the agent's environment rather than your
 interactive PATH. This is the same trap as the elitebook `gh`-blind-workers case
 (#1483) — a tool that works when you ssh in by hand can be invisible to the agent.
 
-**4. Declare the capability** on the **daemon host's** `~/.coord/coordinator.yml`
-(not a local copy — see the config-cache note in `CLAUDE.md`):
+**4. Declare the capability** in the tracked `coord-settings` checkout
+(`~/src/coord-settings/coord/coordinator.yml` on the daemon host — commit +
+push there, then `git pull` on the daemon host), **not** by editing the
+daemon host's `~/.coord/coordinator.yml` directly: that path is a symlink
+into the checkout, and `sed -i`/most editors write-and-rename over it,
+silently replacing the symlink with a disconnected regular file (see
+`OPERATING_GOTCHAS.md` #14). Also not a local copy — see the config-cache
+note in `CLAUDE.md`:
 
 ```yaml
   - name: dellserver

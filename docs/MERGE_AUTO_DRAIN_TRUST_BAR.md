@@ -171,7 +171,13 @@ deleted, so the sequence stays readable against the changelog.
    reconstruct it after the fact via `coord audit --category merge --since <deploy
    timestamp>`).
 5. Once 10 consecutive clean drains are observed with zero incorrect merges: edit
-   dellserver's `~/.coord/coordinator.yml` (never `coordinator.remote.yml` — see
+   the tracked `coord-settings` checkout — `~/src/coord-settings/coord/coordinator.yml`
+   on dellserver, commit + push there, then `git -C ~/src/coord-settings pull` on
+   dellserver — never dellserver's live `~/.coord/coordinator.yml` directly (that
+   path is a symlink into the checkout; `sed -i`/most editors write-and-rename over
+   it and silently replace the symlink with a disconnected regular file — see
+   [`OPERATING_GOTCHAS.md` #14](OPERATING_GOTCHAS.md#14-fleet-coordinatoryml-is-edited-in-a-different-repo-than-the-one-youre-reading-this-in--and-the-daemon-can-silently-run-a-broken-copy-of-it)),
+   and never `coordinator.remote.yml` (see
    [`OPERATING_GOTCHAS.md` #8](OPERATING_GOTCHAS.md#8-coordinatorremoteyml-is-a-cache--your-config-edit-will-revert))
    to add:
    ```yaml
@@ -181,6 +187,8 @@ deleted, so the sequence stays readable against the changelog.
    ```
    then restart `coord-serve` (same quiet-fleet check as above), and confirm with
    `coord config` from a thin client that the re-fetched cache shows the new block.
+   Before any of this, run `coord diagnose --config-provenance` on dellserver to
+   confirm the live path is still actually a symlink into the checkout.
 6. Watch the first handful of auto-drain ticks closely (`journalctl --user -u
    coord-serve -f` or the daemon's own log) before walking away.
 

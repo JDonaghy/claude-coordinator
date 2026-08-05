@@ -146,6 +146,49 @@ def test_live_config_missing_entirely_is_also_a_regression(tmp_path: Path) -> No
     assert "does not exist" in lines[0]
 
 
+@pytest.mark.skipif(shutil.which("sed") is None, reason="sed not available")
+def test_sed_i_over_the_symlink_breaks_it_and_is_detected(tmp_path: Path) -> None:
+    """#1832: the exact reproduction from the incident. `sed -i` (and most
+    editors) do NOT write through a symlink — they write a temp file and
+    `rename()` it over the target, which replaces the symlink itself with a
+    plain file. Nothing about that operation errors, and the content still
+    matches the checkout, so this is the one case that must be caught by
+    inspecting the live path's *kind*, not its content."""
+    checkout = _make_checkout(tmp_path)
+    live = _symlinked_live(tmp_path, checkout)
+    assert live.is_symlink()  # sanity: starts as a real symlink
+
+    subprocess.run(
+        ["sed", "-i", "s/repos/repos/", str(live)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10.0,
+    )
+
+    # The `sed -i`-equivalent write silently swapped the symlink for a
+    # regular file with matching content.
+    assert live.is_symlink() is False
+    assert live.read_text(encoding="utf-8") == (checkout / "coord" / "coordinator.yml").read_text(
+        encoding="utf-8"
+    )
+
+    prov = config_provenance(live_path=live, checkout_dir=checkout)
+
+    assert prov.is_symlink is False
+    assert prov.in_checkout is False
+    assert prov.regression is True
+
+    lines = format_provenance_lines(prov)
+    assert len(lines) == 1
+    assert "REGRESSION" in lines[0]
+    assert "NOT a symlink" in lines[0]
+    assert "REGULAR FILE" in lines[0]
+    assert summary_line(prov) == (
+        "CONFIG_PROVENANCE: checkout=present symlinked=false dirty=false behind=0 ahead=0"
+    )
+
+
 def test_symlink_pointing_outside_the_checkout_is_a_regression(tmp_path: Path) -> None:
     checkout = _make_checkout(tmp_path)
     other = tmp_path / "unrelated.yml"
