@@ -15,6 +15,14 @@ const queryClient = new QueryClient({
       // fresh until something says otherwise, which `refetchOnWindowFocus`'s
       // default (true) still backstops for a tab that was backgrounded long
       // enough to miss its own reconnect.
+      //
+      // Footgun for the next query added to this app: `staleTime: Infinity`
+      // is a *global* default. A `useQuery` whose key isn't wired into
+      // `EVENT_QUERY_KEYS` (src/realtime/events.ts) or manually invalidated
+      // elsewhere will never refetch on its own -- only `refetchOnWindowFocus`
+      // (or an explicit `invalidateQueries` call, e.g. Detail.tsx's actions)
+      // will ever refresh it. If you add a query, add its invalidation path
+      // in the same PR.
       staleTime: Infinity,
       // Retry once on error before surfacing the failure state
       retry: 1,

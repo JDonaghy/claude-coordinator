@@ -19,6 +19,7 @@ import {
   type PipelineView,
   type PipelineActionRequest,
 } from '@/api/client'
+import { ConnectionBadge } from '@/components/ConnectionBadge'
 import { cn } from '@/lib/utils'
 
 // ── Toast ─────────────────────────────────────────────────────────────────────
@@ -39,6 +40,7 @@ function ToastList({ toasts }: ToastListProps) {
     <div
       role="status"
       aria-live="polite"
+      aria-label="Notifications"
       className="fixed bottom-6 left-0 right-0 z-50 flex flex-col items-center gap-2 px-4 pointer-events-none"
     >
       {toasts.map((t) => (
@@ -282,6 +284,10 @@ export default function Detail() {
   if (isLoading) {
     return (
       <div className="mx-auto max-w-lg px-4 py-6">
+        <header className="mb-6 flex items-center justify-between">
+          <h1 className="text-xl font-bold text-primary">coord</h1>
+          <ConnectionBadge />
+        </header>
         <p className="py-12 text-center text-sm text-muted-foreground">Loading…</p>
       </div>
     )
@@ -290,6 +296,10 @@ export default function Detail() {
   if (isError) {
     return (
       <div className="mx-auto max-w-lg px-4 py-6">
+        <header className="mb-6 flex items-center justify-between">
+          <h1 className="text-xl font-bold text-primary">coord</h1>
+          <ConnectionBadge />
+        </header>
         <p className="py-12 text-center text-sm text-destructive">Failed to load pipeline</p>
       </div>
     )
@@ -298,16 +308,19 @@ export default function Detail() {
   if (!view) {
     return (
       <div className="mx-auto max-w-lg px-4 py-6">
-        <header className="mb-6 flex items-center gap-3">
-          <button
-            type="button"
-            onClick={() => navigate(-1)}
-            className="rounded p-1 text-muted-foreground hover:text-foreground"
-            aria-label="Back"
-          >
-            ←
-          </button>
-          <h1 className="text-xl font-bold text-primary">coord</h1>
+        <header className="mb-6 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <button
+              type="button"
+              onClick={() => navigate(-1)}
+              className="rounded p-1 text-muted-foreground hover:text-foreground"
+              aria-label="Back"
+            >
+              ←
+            </button>
+            <h1 className="text-xl font-bold text-primary">coord</h1>
+          </div>
+          <ConnectionBadge />
         </header>
         <p className="text-sm text-muted-foreground">
           Assignment <span className="font-mono">{id}</span> not found in the pipeline.
@@ -348,16 +361,19 @@ export default function Detail() {
 
       {/* ── Header ────────────────────────────────────────────────────────── */}
       <header className="mb-5">
-        <div className="mb-3 flex items-center gap-3">
-          <button
-            type="button"
-            onClick={() => navigate(-1)}
-            aria-label="Back"
-            className="rounded p-1 text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            ←
-          </button>
-          <h1 className="text-xl font-bold text-primary">coord</h1>
+        <div className="mb-3 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <button
+              type="button"
+              onClick={() => navigate(-1)}
+              aria-label="Back"
+              className="rounded p-1 text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              ←
+            </button>
+            <h1 className="text-xl font-bold text-primary">coord</h1>
+          </div>
+          <ConnectionBadge />
         </div>
 
         <div className="flex items-start justify-between gap-3">
