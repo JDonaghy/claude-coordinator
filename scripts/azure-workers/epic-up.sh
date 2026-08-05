@@ -15,8 +15,12 @@ log() { printf '\n\033[1m=== %s ===\033[0m\n' "$*"; }
 # #1799 opencode-detection path below is unit-testable without a live VM.
 add_capability_if_missing() {
     local csv="$1" cap="$2"
-    local IFS=','
-    local -a caps=($csv)
+    # `read -ra` (not `local -a caps=($csv)`) so a capability string
+    # containing a shell glob character can't trigger pathname expansion --
+    # current callers only ever pass plain identifiers, but this way that
+    # stays true by construction rather than by convention.
+    local -a caps
+    IFS=',' read -ra caps <<< "$csv"
     local c
     for c in "${caps[@]}"; do
         [[ "$c" == "$cap" ]] && { echo "$csv"; return 0; }
@@ -29,19 +33,40 @@ add_capability_if_missing() {
 }
 
 # #1799: whether the machine that was JUST provisioned actually has the
-# opencode CLI on its PATH. `ssh <tailnet-name> ...` is the same access
-# pattern an operator already uses fleet-wide (docs/AGENT_OPERATIONS.md,
-# e.g. `ssh dellserver ...`), and by the time this is called the machine has
-# already proven itself reachable over the tailnet (the /health poll in
-# step 2/5). Deliberately NOT a hardcoded `CAPABILITIES` default -- that was
-# correct the day #1777 wrote it and wrong the day the image started
-# shipping opencode (the exact drift this issue is about; see also #1800's
+# opencode CLI on PATH for the `coord` user -- the account the daemon
+# dispatches work as. Two things a naive `ssh <tailnet-name> 'command -v
+# opencode'` gets wrong (both caught in review):
+#
+#   1. Wrong/no SSH user. `coordUser` ("coord") has no `authorized_keys` of
+#      its own -- only the Bicep template's `adminUsername` (default
+#      "azureuser", a distinct break-glass account) gets one populated from
+#      `sshPublicKey`. Connecting with no explicit user authenticates as the
+#      *operator's local OS username*, which has no account on the VM at
+#      all, so the connection fails closed. Same fix build-worker-image.sh
+#      already uses for its builder VM: `ssh ... ${ADMIN_USER}@${IP}`,
+#      plus `StrictHostKeyChecking=accept-new` since this is the first SSH
+#      to a brand-new host with no known_hosts entry (the /health poll in
+#      step 2/5 proves tailnet reachability over HTTP, not SSH).
+#   2. Wrong PATH even once connected. provision-worker.sh installs opencode
+#      only into ~coord/.opencode/bin (symlinked into ~coord/.local/bin),
+#      and its own prereq check only ever sees that via `as_coord`
+#      (`sudo -u coord -H bash -lc "$*"` -- a LOGIN shell as `coord`).
+#      Mirror that exactly here: sudo from the admin user into a `coord`
+#      login shell rather than checking the admin user's own PATH.
+#      `sudo -n` fails fast instead of hanging on a password prompt
+#      BatchMode can't answer, if passwordless sudo is ever missing.
+#
+# Deliberately NOT a hardcoded `CAPABILITIES` default -- that was correct
+# the day #1777 wrote it and wrong the day the image started shipping
+# opencode (the exact drift this issue is about; see also #1800's
 # golden-image staleness issue). Checking the actual machine means the
 # capability tracks the image instead of a flag that can go stale again.
 detect_opencode_capability() {
     local machine="$1"
-    ssh -o BatchMode=yes -o ConnectTimeout=5 "$machine" \
-        'command -v opencode >/dev/null 2>&1'
+    local admin_user="${2:-${ADMIN_USER:-azureuser}}"
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 \
+        "${admin_user}@${machine}" \
+        'sudo -n -u coord -H bash -lc "command -v opencode >/dev/null 2>&1"'
 }
 
 # Pull one field out of a gallery image-version resource ID:
@@ -112,6 +137,11 @@ EPIC=""; REPOS=""; CAPABILITIES="rust,python"; MACHINE=""
 # through to coordinator-machine.py so the generated entry gets a
 # repo_paths: mapping without the caller spelling each repo's path out.
 REPO_ROOT="~/src"
+# The Bicep template's break-glass admin account -- the only one whose
+# authorized_keys gets populated from sshPublicKey (see
+# detect_opencode_capability above). Override if EASY_AZURE_DIR's template
+# ever pins a different adminUsername.
+ADMIN_USER="${ADMIN_USER:-azureuser}"
 # Must match a family you hold quota in. D8as_v5 is 0/0 on this subscription;
 # D8as_v7 is the same 8 vCPU / 32 GiB in a family that has cores.
 VM_SIZE="Standard_D8as_v7"; MAX_WORKERS=2; READY_TIMEOUT=900; PAUSED=0
@@ -230,7 +260,7 @@ jq -r '"  version=\(.version // "?")  capabilities=\(.capabilities|join(","))  r
 
 # --------------------------------------------------------------------------
 log "2b/5  detect capabilities actually present on $MACHINE"
-if detect_opencode_capability "$MACHINE"; then
+if detect_opencode_capability "$MACHINE" "$ADMIN_USER"; then
     CAPABILITIES="$(add_capability_if_missing "$CAPABILITIES" "provider:opencode")"
     echo "  opencode CLI found on $MACHINE -- advertising provider:opencode"
 else
