@@ -661,6 +661,73 @@ acceptance:
         row = _acceptance_row(coord_db, "aid-setup")
         assert row["acceptance_state"] == "passed"
 
+    def test_record_routed_setup_runs_before_run_in_the_throwaway_worktree(
+        self, tmp_path: Path, coord_db,
+    ) -> None:
+        """#1817 direct regression: the bug report was specifically a
+        *routed* driver (`coord/dashboard/webapp/**`, resolved via
+        `--for-path`, exactly like the real `web-playwright` route) whose
+        `setup:` never reached `record`'s real throwaway worktree in
+        production, even though the mechanism itself worked. Neither
+        existing test covered this combination:
+        `test_record_runs_setup_before_run_in_the_throwaway_worktree` above
+        proves a *flat* driver's setup reaches record's real worktree;
+        `test_run_wires_driver_setup_into_run_driver` proves a *routed*
+        driver's setup reaches a *mocked* `run_driver` for `acceptance run`.
+        This closes the gap so routed+record can't silently regress to the
+        "declared but ignored" shape #1817 reports.
+        """
+        from coord import state
+
+        repo_dir = tmp_path / "repo"
+        sha = _init_git_repo(repo_dir, manifest={"ms01::a": 944})
+
+        blob = json.dumps({"tests": [{"id": "ms01::a", "status": "pass"}]})
+        run_cmd = (
+            f"test -f provisioned && echo '{blob}' "
+            "|| (echo 'MISSING MARKER — setup did not run first' >&2 && exit 1)"
+        )
+        config_path = tmp_path / "coordinator.yml"
+        config_path.write_text(f"""\
+repos:
+  - name: coord-tui
+    github: acme/coord-tui
+machines:
+  - name: laptop
+    host: laptop.tail
+    repos: [coord-tui]
+    repo_paths:
+      coord-tui: {repo_dir}
+acceptance:
+  drivers:
+    coord-tui:
+      routes:
+        - match: "coord/dashboard/webapp/**"
+          kind: tui-tuidriver
+          run: {json.dumps(run_cmd)}
+          setup: "touch provisioned"
+""")
+
+        state.record_dispatched(
+            assignment_id="aid-routed-setup",
+            proposal=Proposal(
+                id=1, machine_name="laptop", repo_name="coord-tui",
+                issue_number=944, issue_title="oracle loop runner", rationale="",
+            ),
+            repo_github="acme/coord-tui",
+        )
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "record", "--repo", "coord-tui", "--issue", "944",
+            "--sha", sha, "--for-path", "coord/dashboard/webapp/app.tsx",
+            "--config", str(config_path),
+        ])
+        assert result.exit_code == 0, result.output
+        assert "Acceptance PASSED" in result.output
+
+        row = _acceptance_row(coord_db, "aid-routed-setup")
+        assert row["acceptance_state"] == "passed"
+
     def test_record_no_work_assignment_errors(self, tmp_path: Path, coord_db) -> None:
         repo_dir = tmp_path / "repo"
         sha = _init_git_repo(repo_dir, manifest={"ms01::a": 944})
