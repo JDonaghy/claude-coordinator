@@ -534,6 +534,191 @@ class TestCompositeRevalidation:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 3b. #1814: "the suite could not run" is not "the suite failed"
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestInfrastructureFailureClassification:
+    """A run that never happened must not be reported as a red suite.
+
+    The daemon that executes revalidation is a systemd user unit whose PATH
+    has no `~/.cargo/bin`, so `cargo test` died with "command not found" and
+    `--revalidate` printed `SUITE FAILED` for a branch whose six CI checks
+    were green. The operator was then sent to debug a branch that was fine —
+    and, worse, the documented cure for the stale-verdict cascade silently did
+    not work for any Rust branch.
+
+    Reuses the composite tests' `_candidates` so these run against the same
+    real git fleet and the same all-or-nothing write contract.
+    """
+
+    _candidates = staticmethod(TestCompositeRevalidation._candidates)
+
+    @pytest.mark.parametrize(
+        ("returncode", "stdout"),
+        [
+            # The runner's own report: dedicated exit code AND marker.
+            (rv.RUNNER_INFRA_EXIT, "TOOLCHAIN MISSING(rust): 'cargo' not found"),
+            # A bare shell "command not found" from an arbitrary test_command.
+            (127, "sh: 1: cargo: not found"),
+            # Exit code flattened somewhere in between: the marker still classifies.
+            (1, "TOOLCHAIN MISSING(rust): 'cargo' not found\nRESULT: INFRA (rust)"),
+        ],
+    )
+    def test_unrunnable_suite_is_infra_not_a_failed_suite(
+        self, git_fleet: Path, coord_db, returncode: int, stdout: str,
+    ) -> None:
+        def runner(command, cwd, timeout):
+            return _Run(returncode, stdout=stdout)
+
+        with patch("coord.state.record_test_verdict") as record:
+            result = rv.revalidate(
+                self._candidates(), _live_config(git_fleet), runner=runner,
+            )
+
+        assert result.ok is False
+        record.assert_not_called()
+        assert result.kind == rv.KIND_INFRA
+
+        # The wording an operator reads must not send them to the branch.
+        assert "SUITE FAILED" not in result.reason
+        assert "COULD NOT RUN" in result.reason
+        rendered = "\n".join(rv.format_failure(result))
+        assert "SUITE FAILED" not in rendered
+        assert "not a test failure" in rendered.lower()
+        # Still fails closed, and still keeps the tree for inspection.
+        assert "worktree kept for inspection" in rendered
+
+    def test_a_genuinely_red_suite_is_still_a_red_suite(
+        self, git_fleet: Path, coord_db,
+    ) -> None:
+        """The dangerous direction of this change.
+
+        Misreading a real failure as infrastructure would be far worse than
+        the bug it fixes — it is the one that could eventually launder a
+        merge. A plain non-zero exit with ordinary test output stays SUITE.
+        """
+        def runner(command, cwd, timeout):
+            return _Run(1, stdout="E   assert 1 == 2\n1 failed", stderr="")
+
+        result = rv.revalidate(
+            self._candidates(), _live_config(git_fleet), runner=runner,
+        )
+
+        assert result.kind == rv.KIND_SUITE
+        assert "SUITE FAILED" in result.reason
+
+    def test_unrunnable_build_is_infra_not_a_failed_build(
+        self, git_fleet: Path, coord_db,
+    ) -> None:
+        cfg = _live_config(git_fleet)
+        cfg._repo.build_command = "cargo build"
+
+        def runner(command, cwd, timeout):
+            return _Run(127, stderr="sh: 1: cargo: not found")
+
+        result = rv.revalidate(self._candidates(), cfg, runner=runner)
+
+        assert result.kind == rv.KIND_INFRA
+        assert "BUILD FAILED" not in result.reason
+
+    def test_infra_never_narrows_to_per_entry_runs(
+        self, git_fleet: Path, coord_db,
+    ) -> None:
+        """N solo re-runs would hit the identical missing toolchain.
+
+        Narrowing here would turn one broken daemon environment into N
+        branches that each look individually broken — the precise impression
+        this issue exists to remove.
+        """
+        calls: list[str] = []
+
+        def runner(command, cwd, timeout):
+            calls.append(command)
+            return _Run(rv.RUNNER_INFRA_EXIT, stdout="TOOLCHAIN MISSING(rust)")
+
+        batch = rv.revalidate_group(
+            self._candidates(), _live_config(git_fleet), runner=runner,
+        )
+
+        assert batch.ok is False
+        assert batch.fell_back is False, "an infra failure must not be narrowed"
+        assert batch.per_entry == []
+        assert batch.culprits == []
+        assert len(calls) == 1
+        # No suite ran, so the run cost zero suite runs — the operator's
+        # "how many suites did that just run" must not count a no-op.
+        assert batch.suite_runs == 0
+
+    def test_operator_summary_says_nothing_was_judged(
+        self, git_fleet: Path, coord_db,
+    ) -> None:
+        """`format_batch` is the stdout half of the report. On an infra
+        failure it must state outright that no branch was judged, rather than
+        leaving a red composite with no explanation."""
+        def runner(command, cwd, timeout):
+            return _Run(rv.RUNNER_INFRA_EXIT, stdout="TOOLCHAIN MISSING(rust)")
+
+        batch = rv.revalidate_group(
+            self._candidates(), _live_config(git_fleet), runner=runner,
+        )
+        rendered = "\n".join(rv.format_batch(batch))
+
+        assert "INFRASTRUCTURE FAILURE" in rendered
+        assert "no branch was judged" in rendered
+        assert "SUITE FAILED" not in rendered
+        assert "FAILS alone" not in rendered
+
+
+class TestIsInfrastructureFailure:
+    """Unit coverage for the classifier itself (#1814)."""
+
+    @pytest.mark.parametrize(
+        ("rc", "output"),
+        [
+            (rv.SHELL_NOT_FOUND_EXIT, ""),
+            (1, "TOOLCHAIN MISSING(rust): 'cargo' not found"),
+            (1, "RESULT: INFRA (rust)"),
+            (rv.RUNNER_INFRA_EXIT, "RESULT: INFRA (rust)"),
+        ],
+    )
+    def test_positive_signals(self, rc: int, output: str) -> None:
+        assert rv.is_infrastructure_failure(rc, output) is True
+
+    def test_the_runners_exit_code_alone_is_not_enough(self) -> None:
+        """A repo's own build/test command may legitimately exit 3.
+
+        This repo's suite has exactly such a case (`build_command = "exit 3"`
+        standing in for a real red build). Keying on the number would relabel
+        it as infrastructure — the direction that could eventually launder a
+        merge — so the marker in the output is what decides.
+        """
+        assert rv.is_infrastructure_failure(rv.RUNNER_INFRA_EXIT, "boom") is False
+
+    @pytest.mark.parametrize(
+        ("rc", "output"),
+        [
+            (1, "RESULT: FAIL (rust)"),
+            (1, "FAILED tests/test_x.py::test_y - AssertionError"),
+            # Deliberately narrow: a bare "not found" in ordinary test output
+            # (an assertion message, a 404 in a log) is NOT infrastructure.
+            (1, "AssertionError: expected 'widget not found' in response"),
+            (2, "usage: ..."),
+        ],
+    )
+    def test_negative_signals(self, rc: int, output: str) -> None:
+        assert rv.is_infrastructure_failure(rc, output) is False
+
+    def test_zero_exit_is_never_infrastructure(self) -> None:
+        """Only reached on a non-zero exit today, but the classifier must not
+        claim a green run could not run."""
+        assert rv.is_infrastructure_failure(0, "") is False
+
+    def test_infra_is_not_narrowable(self) -> None:
+        assert rv.KIND_INFRA not in rv.NARROWABLE_KINDS
+        assert rv.KIND_INFRA in rv.NO_SUITE_RAN_KINDS
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 4. Black-box: the CLI, end to end
 # ══════════════════════════════════════════════════════════════════════════════
 
