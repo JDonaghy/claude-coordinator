@@ -512,6 +512,7 @@ def build_app(
     token: str | None = None,
     session_attacher: SessionAttacher | None = None,
     fixture: FixtureServer | None = None,
+    dist_path: Path | None = None,
 ) -> Starlette:
     """Build the dashboard Starlette app bound to a Config.
 
@@ -532,9 +533,22 @@ def build_app(
     unchanged; only the data source is swapped, so an acceptance suite built
     on this is still testing the real contract.  ``None`` (the default) is the
     ordinary live dashboard, byte-for-byte as before.
+
+    ``dist_path`` (#1543): override where the built React webapp is read
+    from — ``coord web --dist PATH`` / ``$COORD_WEB_DIST``. Lets the bundle
+    be served from outside the installed package (e.g. a checkout a build
+    hook keeps in sync with merged ``main``) so a webapp change goes live
+    without upgrading ``~/.coord-venv`` — see docs/PHONE_WEBAPP.md. ``None``
+    (the default) keeps the historical behaviour of serving
+    ``coord/dashboard/webapp/dist`` from inside the installed package.
     """
     attacher: SessionAttacher = session_attacher or TmuxSessionAttacher()
     _fixture = fixture
+    # Resolved once per app build. WEBAPP_DIST is read as a module global
+    # (not captured as a default arg) so tests that
+    # `patch("coord.dashboard.server.WEBAPP_DIST", ...)` keep working when
+    # dist_path is left unset (the CLI default).
+    webapp_dist = Path(dist_path) if dist_path is not None else WEBAPP_DIST
 
     def _read_board():
         """The board for this request — seeded fixture or the live DB/daemon.
@@ -642,7 +656,7 @@ def build_app(
     async def index(request: Request) -> HTMLResponse:
         # Serve the built React webapp when available; fall back to the legacy
         # single-file dashboard so existing behaviour is entirely unchanged.
-        spa_index = WEBAPP_DIST / "index.html"
+        spa_index = webapp_dist / "index.html"
         html = spa_index.read_text() if spa_index.exists() else (DASHBOARD_DIR / "index.html").read_text()
         return HTMLResponse(html)
 
@@ -1718,12 +1732,14 @@ def build_app(
         ])
 
     # ── Static file serving for the built React webapp ─────────────────────
-    # Only activated when `coord/dashboard/webapp/dist/` exists (i.e. after
-    # `npm run build`).  When absent the routes list is unchanged and the
-    # legacy dashboard serves normally — no test-suite impact.
-    if WEBAPP_DIST.exists():
+    # Only activated when the resolved dist dir exists (i.e. after
+    # `npm run build`, into either coord/dashboard/webapp/dist/ or the
+    # --dist/COORD_WEB_DIST override — #1543). When absent the routes list
+    # is unchanged and the legacy dashboard serves normally — no
+    # test-suite impact.
+    if webapp_dist.exists():
         # /assets/ — Vite hashed JS/CSS bundles (immutable; safe to cache).
-        _assets = WEBAPP_DIST / "assets"
+        _assets = webapp_dist / "assets"
         if _assets.exists():
             routes.append(
                 Mount("/assets", StaticFiles(directory=str(_assets)), name="assets")
@@ -1739,11 +1755,11 @@ def build_app(
               → serve index.html; the React router takes over.
             """
             path = request.path_params.get("path", "")
-            candidate = WEBAPP_DIST / path
+            candidate = webapp_dist / path
             if candidate.is_file():
                 return FileResponse(str(candidate))
             # SPA fallback — let the React router handle the path.
-            return HTMLResponse((WEBAPP_DIST / "index.html").read_text())
+            return HTMLResponse((webapp_dist / "index.html").read_text())
 
         # Not part of the JSON API contract (client-side-router fallback) —
         # excluded from the OpenAPI route inventory via include_in_schema.

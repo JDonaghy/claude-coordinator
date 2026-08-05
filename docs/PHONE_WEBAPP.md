@@ -101,6 +101,8 @@ The phone webapp calls the same `GET /api/pipeline` + `POST /api/pipeline/action
 
 As of **0.4.71** the compiled React bundle (`dist/`) is bundled into the PyPI wheel by the release workflow (`npm ci && npm run build` runs before `python -m build`). A plain `pip install claude-coordinator` or `coord agent update` is all you need — no Node.js, no checkout, no `npm run build` on the dashboard host.
 
+**In production (dellserver) this is the *fallback* path, not the primary one.** `coord-web.service` runs `coord web --dist ~/coord-web-dist`, which tracks merged `main` on a 1-minute timer — see "Going live automatically (#1543)" below. The bundled-wheel path above only matters if `~/coord-web-dist` is ever absent.
+
 `pyproject.toml` also declares `websockets` directly (#1216) — without it uvicorn silently answers a real WS upgrade with a plain HTTP 200 instead of 101, so the `/ws/terminal` bridge fails only in a real browser, not in `curl`/mocked tests. A plain `pip install` already pulls it in; no separate step needed.
 
 The legacy static `index.html` is served as a fallback if `dist/` does not exist (pre-0.4.71 wheel, or an editable install without a local build) — it shows a plain JSON board view, not the PWA.
@@ -121,6 +123,105 @@ npm run build          # produces coord/dashboard/webapp/dist/
 ```bash
 cd coord/dashboard/webapp && npm run build
 ```
+
+---
+
+## Going live automatically (#1543): merged main, not release cadence
+
+**On dellserver in production, a merged `coord/dashboard/webapp/**` change
+goes live at `http://dellserver:7434` within about a minute, with no ssh and
+no PyPI release** — and it does so *without upgrading `~/.coord-venv`*, the
+same venv `coord-agent` and `coord-serve` `ExecStart` from on that host.
+
+### Why this needed its own mechanism
+
+`coord-web`, `coord-agent`, and `coord-serve` all `ExecStart` from
+`~/.coord-venv` (see `deploy/*.service`). Before #1543, "ship a webapp
+change" meant `pip install --upgrade claude-coordinator` on that venv — which
+also upgrades the board daemon and the agent runtime on that host, and
+`coord agent update` is already known to kill running headless workers
+(#1543's issue body). During a program that merges dozens of webapp PRs while
+workers are running, a timer that did that automatically would be actively
+dangerous. So the fix targets the coupling, not the cadence.
+
+### The mechanism: `coord web --dist`
+
+`coord web` takes a `--dist PATH` flag (env `$COORD_WEB_DIST`) that serves
+the built webapp bundle from an arbitrary directory instead of the one bundled
+inside the installed package (`coord/dashboard/webapp/dist`,
+`coord/dashboard/server.py`'s `WEBAPP_DIST`). `deploy/coord-web.service`
+points it at `~/coord-web-dist`, a symlink that
+[`deploy/coord-web-dist-build.sh`](../deploy/coord-web-dist-build.sh) —
+installed as `coord-web-dist-build.timer`, firing every minute — keeps
+pointed at a fresh build of `coord/dashboard/webapp` from `origin/main`:
+
+```
+coord-web-dist-build.timer (every 1min)
+  → fetch origin/main in ~/src/claude-coordinator (read-only: fetch + rev-parse only)
+  → build that SHA in a DEDICATED worktree (~/.coord-web-checkout — never the
+    operator's own checkout, never a `coord drive` worktree)
+  → npm ci && npm run build
+  → atomically repoint ~/coord-web-dist -> ~/.coord-web-releases/<sha>
+```
+
+Publishing is a single `rename(2)` of a symlink — Starlette's
+`StaticFiles`/`FileResponse` re-resolve the directory on every request, so
+**no restart of `coord-web` happens on a normal publish.** That means a
+webapp deploy can never interrupt an attended `/ws/terminal` session (there
+is no process restart to interrupt it with) and needs no "quiet window"
+scheduling — it satisfies the "must not fire mid-session" constraint by
+construction, not by timing. A restart (or first `coord web` start) is only
+needed once, before the very first build exists, so that the static-serving
+routes get registered — see `deploy/coord-web.service`'s header.
+
+If `~/coord-web-dist` is ever absent (timer disabled, fresh install before
+the first build) `--dist` falls back to the bundled
+`coord/dashboard/webapp/dist` inside the venv — the same legacy fallback
+that existed before #1543 (and further back, the single-file legacy
+dashboard if that's absent too).
+
+### Proof this leaves the daemon/agent versions untouched
+
+```bash
+# Before shipping a webapp change:
+~/.coord-venv/bin/coord --version          # e.g. 0.4.105 (unchanged by the timer)
+readlink -f ~/coord-web-dist               # ~/.coord-web-releases/<old-sha>
+
+# Merge a coord/dashboard/webapp/** PR, wait <= 1 minute...
+
+# After:
+~/.coord-venv/bin/coord --version          # STILL 0.4.105 — the timer never
+                                            # touches this venv
+readlink -f ~/coord-web-dist               # ~/.coord-web-releases/<new-sha>
+```
+
+### Rollback (one command, pairs with #1560)
+
+```bash
+ln -sfn "$(ls -dt ~/.coord-web-releases/*/ | sed -n 2p)" ~/coord-web-dist
+```
+
+Repoints the live symlink at the release directory just before the current
+one (still on disk — `KEEP_RELEASES=3` by default). No restart needed, same
+as a forward publish.
+
+### Install
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp deploy/coord-web-dist-build.sh ~/.local/bin/
+chmod +x ~/.local/bin/coord-web-dist-build.sh
+~/.local/bin/coord-web-dist-build.sh                # first build, BEFORE starting coord-web
+cp deploy/coord-web.service deploy/coord-web-dist-build.service \
+    deploy/coord-web-dist-build.timer ~/.config/systemd/user/
+loginctl enable-linger "$USER"
+systemctl --user daemon-reload
+systemctl --user enable --now coord-web coord-web-dist-build.timer
+```
+
+See `deploy/coord-web-dist-build.sh`'s header comment for the full mechanism
+and edge cases (locking against overlapping runs, a failed build leaving the
+previous release live, pruning old releases).
 
 ---
 
@@ -307,6 +408,8 @@ The webapp ships with two test tiers:
 | `coord/dashboard/webapp/e2e/terminal.spec.ts` | **(v2, #1072)** Playwright E2E for the takeover flow |
 | `coord/dashboard/webapp/vite.config.ts` | Vite + PWA plugin config |
 | `coord/dashboard/webapp/dist/` | **Built output** (gitignored locally; bundled into the PyPI wheel by the release workflow as of 0.4.71, #758; run `npm run build` locally for editable installs) |
+| `deploy/coord-web-dist-build.sh` | **(#1543)** builds merged `main`'s webapp into `~/coord-web-dist`, decoupled from `~/.coord-venv` — see "Going live automatically" above |
+| `deploy/coord-web-dist-build.service` / `.timer` | **(#1543)** systemd units that run the script above every minute |
 | `coord/pipeline.py` | `PipelineView` / `PipelineGate` / `compute_pipeline()` — pure-computation pipeline state |
 | `tests/test_dashboard.py` | Python-level API integration tests |
 | `tests/test_dashboard_terminal.py` | **(v2, #1065)** PTY↔WS bridge integration tests |

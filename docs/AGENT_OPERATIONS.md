@@ -339,14 +339,32 @@ The deployment picture, end to end:
 | `coord web` | 7434 | dellserver only (reads the local DB) | `deploy/coord-web.service` |
 | `coord notify` (periodic) | n/a (CLI, not a listener) | dellserver only (owns the DB) | `deploy/coord-notify.service` + `deploy/coord-notify.timer` |
 | `coord drive-queue tick` (periodic) | n/a (CLI, not a listener) | dellserver only (tmux + repo checkouts) | `deploy/coord-drive-queue.service` + `deploy/coord-drive-queue.timer` |
+| `coord-web-dist-build` (periodic, #1543) | n/a (CLI, not a listener) | dellserver only (feeds `coord web --dist`) | `deploy/coord-web-dist-build.service` + `deploy/coord-web-dist-build.timer` |
 
 The phone is just a browser: open `http://<dellserver-host>:7434` on the tailnet
 and Add to Home Screen (the API is same-origin, so no client config).
 
-**Build, run, and phone access:** see [`docs/PHONE_WEBAPP.md`](PHONE_WEBAPP.md) —
-as of 0.4.71 the built PWA bundle ships inside the PyPI wheel, so a fresh
-`pip install claude-coordinator` (or `coord agent update`) is all that's needed
-on the dashboard host. No checkout or `npm run build` required.
+**Build, run, and phone access:** see [`docs/PHONE_WEBAPP.md`](PHONE_WEBAPP.md).
+
+**#1543 — merged main goes live automatically, decoupled from `~/.coord-venv`.**
+`coord-web`, `coord-agent`, and `coord-serve` all `ExecStart` from the SAME
+`~/.coord-venv` (see the table above), so upgrading that venv to ship a
+webapp change would also upgrade the board daemon and the agent runtime on
+that host — and `coord agent update` is already known to kill running
+headless workers. As of 2026-08-04, `coord-web.service` runs
+`coord web --dist ~/coord-web-dist`, and
+[`deploy/coord-web-dist-build.timer`](../deploy/coord-web-dist-build.timer)
+rebuilds that directory from `origin/main` every minute in a dedicated
+worktree, then atomically repoints the symlink — no `pip install`, no PyPI
+release, and (past the very first build) no restart of `coord-web` at all.
+Shipping a webapp change this way **never touches the shared venv** — see
+"Going live automatically (#1543)" in `docs/PHONE_WEBAPP.md` for the
+before/after version proof, the rollback command, and the full mechanism.
+This corrects an earlier (2026-08-03 and prior) revision of this doc, which
+described `~/.coord-venv`'s bundled wheel (#758) as the way a webapp change
+reached production; #758 still ships that bundle and it is still the
+fallback when `~/coord-web-dist` is absent, but it is no longer the primary
+path on dellserver.
 
 **Service unit:** [`deploy/coord-web.service`](../deploy/coord-web.service) (full
 unit + prereqs in its header). Install + restart:
@@ -356,6 +374,17 @@ cp deploy/coord-web.service ~/.config/systemd/user/
 systemctl --user daemon-reload && systemctl --user enable --now coord-web
 # restart over SSH needs the runtime-dir prefix (same #404 caveat as the agent):
 XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart coord-web
+```
+
+**Dist-build unit** (the #1543 timer above):
+[`deploy/coord-web-dist-build.service`](../deploy/coord-web-dist-build.service) +
+[`deploy/coord-web-dist-build.timer`](../deploy/coord-web-dist-build.timer). Install:
+
+```bash
+cp deploy/coord-web-dist-build.sh ~/.local/bin/ && chmod +x ~/.local/bin/coord-web-dist-build.sh
+~/.local/bin/coord-web-dist-build.sh   # first build — do this BEFORE (re)starting coord-web
+cp deploy/coord-web-dist-build.service deploy/coord-web-dist-build.timer ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now coord-web-dist-build.timer
 ```
 
 ## Periodic `coord notify` (`coord-notify` timer, #1311)
