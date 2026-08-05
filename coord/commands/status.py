@@ -623,6 +623,20 @@ def _health_vs_config_lines(machine, health: dict) -> list[tuple[bool, str]]:
     every ``rust``/``python``/``gtk`` dispatch and nothing anywhere said so.
     Same shape for ``repos: []`` (#1485's review-router misread).
 
+    #1801: that inference only holds for a **standing** agent — one with its
+    own ``coordinator.yml`` that is expected to publish from it. A
+    **config-free** agent (``health["config_free"]`` set) is DESIGNED to
+    publish empty capabilities/repos: the coordinator supplies both at
+    dispatch time instead. Before this fix, a config-free agent whose
+    machine entry in the coordinator's OWN ``coordinator.yml`` happened to
+    declare capabilities/repos (azure-epic1709: ``['rust', 'python']`` /
+    ``['claude-coordinator']``) still hit the CRIT branch below — and the
+    CRIT's own detail line ("the agent is running config-free") flatly
+    contradicted the CRIT's headline ("every dispatch ... will be refused"),
+    while dispatch in fact worked. A config-free mismatch is now reported at
+    WARN (not a problem), while a *configured* agent publishing nothing
+    still CRITs — that's the #1485/#1712 case this check exists for.
+
     Pure function — no I/O — so it's testable without a live fleet.
     """
     out: list[tuple[bool, str]] = []
@@ -642,18 +656,26 @@ def _health_vs_config_lines(machine, health: dict) -> list[tuple[bool, str]]:
         out.append((False, f"  ⚠ running config-free — {config_free}"))
 
     if declared_caps and not published_caps:
-        out.append((
-            True,
-            f"  ✗ CRIT capabilities: coordinator.yml declares {declared_caps} "
-            "but /health publishes none — this machine is silently ineligible "
-            "for every capability-matched dispatch (#1712)",
-        ))
         if config_free:
+            # #1801: expected shape for a config-free agent — the coordinator
+            # supplies capabilities at dispatch time, not this machine's own
+            # config, so an empty /health is not a dispatch blocker.
             out.append((
-                True,
-                f"        the agent is running config-free — {config_free}",
+                False,
+                f"  ⚠ capabilities: coordinator.yml declares {declared_caps} "
+                "but /health publishes none — the agent is running "
+                f"config-free ({config_free}); capabilities come from the "
+                "coordinator at dispatch time, not this machine's own "
+                "config, so this is expected, not a dispatch blocker (#1801)",
             ))
         else:
+            out.append((
+                True,
+                f"  ✗ CRIT capabilities: coordinator.yml declares "
+                f"{declared_caps} but /health publishes none — this machine "
+                "is silently ineligible for every capability-matched "
+                "dispatch (#1712)",
+            ))
             out.append((
                 True,
                 "        the agent published no capabilities despite a "
@@ -662,15 +684,85 @@ def _health_vs_config_lines(machine, health: dict) -> list[tuple[bool, str]]:
             ))
 
     if declared_repos and not published_repos:
+        if config_free:
+            out.append((
+                False,
+                f"  ⚠ repos: coordinator.yml declares {declared_repos} but "
+                "/health advertises none — the agent is running config-free "
+                f"({config_free}); repos come from the coordinator at "
+                "dispatch time, not this machine's own config, so this is "
+                "expected, not a dispatch blocker (#1801)",
+            ))
+        else:
+            out.append((
+                True,
+                f"  ✗ CRIT repos: coordinator.yml declares {declared_repos} "
+                "but /health advertises none — every dispatch to this "
+                "machine will be refused, and any reader trusting /health "
+                "sees a repo-less machine (#1485/#1712)",
+            ))
+            for repo, reason in sorted(degraded.items()):
+                out.append((True, f"        {repo}: {reason}"))
+
+    return out
+
+
+def _dispatch_blocker_lines_for_config_free(machine, cfg) -> list[tuple[bool, str]]:
+    """Real dispatch blockers on a **config-free** agent's machine (#1801).
+
+    The #1712 capabilities/repos cross-check above CRIT'd azure-epic1709 for
+    the wrong reason (an expected config-free shape) while staying silent
+    about the two things that actually *would* refuse dispatch there: a
+    declared repo with no ``repo_paths`` entry (``coord.dispatch.dispatch``
+    raises ``ValueError`` on exactly this), and a declared repo whose
+    resolved provider (``Repo.provider`` > ``providers.default``) the
+    machine hasn't declared support for via ``provider:<type>`` (the #1711
+    structural gate, ``coord.providers.guard_provider_machine_capability``).
+
+    Both are derivable from ``coordinator.yml`` alone — no ``/health``
+    round-trip needed — so this runs regardless of whether the machine is
+    currently reachable. Scoped to config-free machines because that's the
+    gap #1801 found; a standing machine's own config predates this check and
+    is out of scope here.
+
+    Pure function — no I/O — so it's testable without a live fleet.
+    """
+    from coord.config import provider_capability
+    from coord.providers import (
+        machine_supports_provider,
+        provider_type_for,
+        resolve_provider_name,
+    )
+
+    out: list[tuple[bool, str]] = []
+
+    missing_paths = sorted(r for r in machine.repos if not machine.repo_path(r))
+    if missing_paths:
         out.append((
             True,
-            f"  ✗ CRIT repos: coordinator.yml declares {declared_repos} but "
-            "/health advertises none — every dispatch to this machine will be "
-            "refused, and any reader trusting /health sees a repo-less machine "
-            "(#1485/#1712)",
+            f"  ✗ CRIT repo_paths: {missing_paths} declared under repos but "
+            "have no repo_paths entry in coordinator.yml — dispatch to this "
+            "machine for these repos will be refused (#1801)",
         ))
-        for repo, reason in sorted(degraded.items()):
-            out.append((True, f"        {repo}: {reason}"))
+
+    missing_caps: list[str] = []
+    for repo_name in machine.repos:
+        repo = cfg.repo(repo_name)
+        repo_provider = repo.provider if repo is not None else None
+        provider_name = resolve_provider_name(None, repo_provider, cfg.providers)
+        if not machine_supports_provider(machine, provider_name, cfg.providers):
+            ptype = provider_type_for(provider_name, cfg.providers)
+            cap = provider_capability(ptype)
+            if cap not in missing_caps:
+                missing_caps.append(cap)
+    if missing_caps:
+        out.append((
+            True,
+            "  ✗ CRIT provider capability: this machine's declared repos "
+            f"expect {sorted(missing_caps)} but coordinator.yml capabilities "
+            "don't include it — dispatch with that provider will be refused "
+            "(#1711/#1801)",
+        ))
 
     return out
 
@@ -730,6 +822,17 @@ def doctor(config_path: Path, machine_filter: str | None, timeout: float) -> Non
             click.echo(line)
             if is_problem:
                 any_problem = True
+
+        # #1801: for a config-free agent, the #1712 check above is silenced
+        # (empty /health capabilities/repos is the designed shape) — so run
+        # the checks that actually catch what blocks dispatch there instead:
+        # missing repo_paths, missing provider:* capability. Both come
+        # straight out of coordinator.yml.
+        if health.get("config_free"):
+            for is_problem, line in _dispatch_blocker_lines_for_config_free(m, cfg):
+                click.echo(line)
+                if is_problem:
+                    any_problem = True
 
         raw_probes = health.get("tool_versions")
         if not raw_probes:
