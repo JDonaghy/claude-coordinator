@@ -145,3 +145,65 @@ def test_reports_no_restart_and_other_lanes_untouched(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert "no coord-web restart needed" in result.stderr
     assert "7435" in result.stderr and "7433" in result.stderr
+
+
+def test_writes_sentinel_naming_the_sha_rolled_back_from(tmp_path: Path) -> None:
+    """#1560 review fix: coord-web-dist-build.timer fires again within
+    about a minute of a rollback, and (because fixing a bad commit on main
+    realistically takes longer than that) would otherwise rebuild and
+    silently republish the exact SHA an operator just rolled back away
+    from. This script must leave a sentinel naming that bad SHA so the
+    build script can refuse to republish it -- see
+    test_deploy_coord_web_dist.py's
+    test_build_script_refuses_to_republish_a_just_rolled_back_from_sha for
+    the other half of this contract."""
+    releases_dir = tmp_path / "releases"
+    releases_dir.mkdir()
+    _make_release(releases_dir, "sha-old", age_seconds=7200)
+    bad = _make_release(releases_dir, "sha-bad", age_seconds=60)
+    live_link = tmp_path / "live"
+    live_link.symlink_to(bad)
+
+    result = _run(releases_dir, live_link)
+
+    assert result.returncode == 0, result.stderr
+    sentinel = releases_dir / ".rollback-blocked-sha"
+    assert sentinel.read_text().strip() == "sha-bad"
+
+
+def test_warns_that_the_build_timer_will_try_to_republish(tmp_path: Path) -> None:
+    """The minimal half of the #1560 review fix: even independent of the
+    sentinel, the operator must be told in the script's own output that the
+    build timer is about to fire again and how to pause it if they need
+    more than a minute to fix main."""
+    releases_dir = tmp_path / "releases"
+    releases_dir.mkdir()
+    _make_release(releases_dir, "sha-old", age_seconds=7200)
+    bad = _make_release(releases_dir, "sha-bad", age_seconds=60)
+    live_link = tmp_path / "live"
+    live_link.symlink_to(bad)
+
+    result = _run(releases_dir, live_link)
+
+    assert result.returncode == 0, result.stderr
+    assert "coord-web-dist-build.timer" in result.stderr
+    assert "systemctl --user stop coord-web-dist-build.timer" in result.stderr
+
+
+def test_no_sentinel_written_when_there_was_no_prior_live_release(tmp_path: Path) -> None:
+    """When $LIVE_LINK was absent (nothing to distrust -- see
+    test_missing_live_link_publishes_newest_release above), there is no
+    "bad SHA" to block, so no sentinel should be written and no timer
+    warning should fire."""
+    releases_dir = tmp_path / "releases"
+    releases_dir.mkdir()
+    _make_release(releases_dir, "sha-old", age_seconds=7200)
+    new = _make_release(releases_dir, "sha-new", age_seconds=60)
+    live_link = tmp_path / "live"  # deliberately never created
+
+    result = _run(releases_dir, live_link)
+
+    assert result.returncode == 0, result.stderr
+    sentinel = releases_dir / ".rollback-blocked-sha"
+    assert not sentinel.exists()
+    assert "coord-web-dist-build.timer" not in result.stderr

@@ -72,6 +72,15 @@
 # script form (safer to type over ssh from a phone under stress) and the
 # full recovery runbook + timed drill transcript.
 #
+# NOT durable on its own against THIS timer: origin/main realistically
+# doesn't move within this timer's 1min cadence, so a rollback alone would
+# get silently republished (and undone) on the very next tick. That's what
+# the "Rollback-sentinel guard" below is for — coord-web-rollback.sh writes
+# $RELEASES_DIR/.rollback-blocked-sha naming the bad SHA, and this script
+# refuses to republish exactly that SHA until main moves past it or the
+# sentinel is cleared by hand. See that block, and coord-web-rollback.sh's
+# own header, for the full mechanism.
+#
 # Why fail-closed, not auto-revert-after-publish: the health check above
 # runs on a scratch port BEFORE the symlink swap, so there is no window
 # where a broken bundle is ever live — "auto-revert" would mean detecting
@@ -99,6 +108,15 @@ RELEASES_DIR="${RELEASES_DIR:-$HOME/.coord-web-releases}"
 LIVE_LINK="${LIVE_LINK:-$HOME/coord-web-dist}"
 KEEP_RELEASES="${KEEP_RELEASES:-3}"
 LOCK_FILE="${LOCK_FILE:-$HOME/.coord-web-dist-build.lock}"
+# Sentinel written by coord-web-rollback.sh (#1560) naming the SHA an
+# operator just rolled back FROM. See the "Rollback-sentinel guard" block
+# below: without this, this timer re-publishes that exact SHA on its very
+# next tick (up to 1min later) whenever origin/$BRANCH hasn't moved past it
+# yet — silently undoing a manual rollback for precisely the bug class
+# (client-side-only JS runtime errors) the manual path exists to catch. See
+# coord-web-rollback.sh's header and docs/PHONE_WEBAPP.md's "Rollback" and
+# "Recovery" sections for the full story.
+BLOCKED_SHA_FILE="${BLOCKED_SHA_FILE:-$RELEASES_DIR/.rollback-blocked-sha}"
 
 # ── Health-check-before-cutover config (#1560) ──────────────────────────────
 # 127.0.0.1-only, never $HEALTH_CHECK_HOST=0.0.0.0 — this is a throwaway
@@ -241,6 +259,37 @@ if [[ -L "$LIVE_LINK" ]]; then
   if [[ "$CURRENT_RELEASE" == "$NEW_SHA" ]]; then
     say "up to date at $NEW_SHA — nothing to build"
     exit 0
+  fi
+fi
+
+# ── Rollback-sentinel guard (#1560) ─────────────────────────────────────────
+# The up-to-date check above only short-circuits when $NEW_SHA is already
+# live. It does NOT protect an operator who just ran coord-web-rollback.sh:
+# after a rollback, $CURRENT_RELEASE is the GOOD sha they rolled back TO, so
+# $NEW_SHA (still the bad commit, since fixing/reverting main realistically
+# takes longer than this timer's 1min cadence) no longer matches it, and
+# this script would otherwise rebuild and republish the exact bad commit the
+# operator just rolled back away from — silently, within about a minute,
+# undoing their recovery. Refuse instead, until either main moves past that
+# SHA or the operator explicitly clears the sentinel.
+if [[ -f "$BLOCKED_SHA_FILE" ]]; then
+  BLOCKED_SHA="$(<"$BLOCKED_SHA_FILE")"
+  BLOCKED_SHA="${BLOCKED_SHA//[$'\t\r\n ']/}"
+  if [[ -n "$BLOCKED_SHA" && "$NEW_SHA" == "$BLOCKED_SHA" ]]; then
+    say "REFUSING to build/publish $NEW_SHA: this is the exact SHA an operator rolled back FROM"
+    say "(sentinel: $BLOCKED_SHA_FILE, written by coord-web-rollback.sh). Publishing it now would"
+    say "silently undo that rollback about a minute after they performed it, with no other warning."
+    say "Fix or revert the bad commit on origin/$BRANCH, or pause this timer entirely while you work on it:"
+    say "  systemctl --user stop coord-web-dist-build.timer"
+    say "  systemctl --user start coord-web-dist-build.timer   # resume once main is fixed"
+    say "If you are certain $NEW_SHA is actually fine and the rollback was a false alarm, clear the"
+    say "sentinel to allow it again:"
+    say "  rm $BLOCKED_SHA_FILE"
+    exit 1
+  fi
+  if [[ -n "$BLOCKED_SHA" ]]; then
+    say "origin/$BRANCH ($NEW_SHA) has moved past the previously-blocked SHA $BLOCKED_SHA — clearing sentinel $BLOCKED_SHA_FILE"
+    rm -f "$BLOCKED_SHA_FILE"
   fi
 fi
 
