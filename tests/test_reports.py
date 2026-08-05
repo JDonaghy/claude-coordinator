@@ -16,6 +16,8 @@ Three layers, tested at the seam each one actually owns:
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import sqlite3
 from pathlib import Path
@@ -33,15 +35,19 @@ from coord.db import _ensure_schema
 from coord.drive_queue import QUEUE_ALERT_ISSUE, QUEUE_ALERT_REPO
 from coord.reports import (
     REPORTS,
+    ColumnMeta,
     ReportError,
+    ReportResult,
     UnknownReportError,
     catalogue,
+    csv_filename,
     detect_prior_activity,
     fetch_audit_window,
     fold_drive_queue_status,
     fold_issue_activity,
     parse_duration,
     resolve_params,
+    result_to_csv,
     run_drive_queue_status,
     run_report,
 )
@@ -2143,3 +2149,342 @@ class TestUsageEndToEnd:
     def test_daemon_rejects_a_bad_usage_param(self, report_client: TestClient) -> None:
         resp = report_client.get("/report/usage", params={"group_by": "machine"})
         assert resp.status_code == 400
+
+
+# ── CSV export (#1765) ─────────────────────────────────────────────────────
+
+# #1631's real driver-exit reason, extended with the comma-and-newline shape
+# that hand-rolled CSV writers get wrong. This is the escaping fixture: it
+# has to survive `result_to_csv` → `csv.reader` unchanged.
+NASTY_REASON = (
+    'merge attempted 3 times without landing, last error: "conflict"\n'
+    "  hint: rebase onto origin/main and re-run"
+)
+
+
+def _csv_fixture_result() -> ReportResult:
+    """A one-row `ReportResult` carrying every cell shape the serializer has
+    to handle: raw epoch, list, bool, None, int, and a dict whose free text
+    contains a comma, a quote and a newline."""
+    return ReportResult(
+        report_id="issue-activity",
+        generated_at=WINDOW[1],
+        window=(WINDOW[0], WINDOW[1]),
+        columns=[
+            "repo", "issue", "started_at", "machines", "fix_iterations",
+            "test_verdicts", "merged_at", "counts_partial", "drive_exit",
+        ],
+        rows=[
+            {
+                "repo": "api",
+                "issue": 1631,
+                "started_at": WINDOW[0] + 400,
+                "machines": ["dellserver", "precision"],
+                "fix_iterations": 3,
+                "test_verdicts": ["failed", "passed"],
+                "merged_at": None,
+                "counts_partial": True,
+                "drive_exit": {
+                    "at": WINDOW[0] + 500,
+                    "exit_code": 1,
+                    "reason": NASTY_REASON,
+                },
+            }
+        ],
+        notes=[
+            "api#1631: driver exited exit_code=1 but the PR merged anyway",
+            "a note that\nspans two lines",
+        ],
+        column_meta=[
+            ColumnMeta(id="repo", label="Repo", kind="text"),
+            ColumnMeta(id="issue", label="Issue", kind="int", align="right"),
+            ColumnMeta(id="started_at", label="Started", kind="timestamp"),
+            ColumnMeta(id="machines", label="Machines", kind="list"),
+        ],
+    )
+
+
+def _parse_csv(text: str) -> list[list[str]]:
+    """Parse CSV that has leading `#` comment lines.
+
+    Strips only the *leading* comment block and hands the rest to
+    `csv.reader` whole — never a per-line `startswith('#')` filter, which
+    would corrupt a quoted field whose embedded newline is followed by a
+    `#`.
+    """
+    lines = text.splitlines(keepends=True)
+    body_at = 0
+    for i, line in enumerate(lines):
+        if not line.startswith("#"):
+            body_at = i
+            break
+    return list(csv.reader(io.StringIO("".join(lines[body_at:]))))
+
+
+class TestCsvSerializer:
+    def test_header_row_uses_column_meta_labels_and_falls_back_to_keys(self) -> None:
+        rows = _parse_csv(result_to_csv(_csv_fixture_result()))
+        # Labelled columns use `column_meta.label` (#1760); the rest degrade
+        # gracefully to the raw column key rather than vanishing.
+        assert rows[0] == [
+            "Repo", "Issue", "Started", "Machines", "fix_iterations",
+            "test_verdicts", "merged_at", "counts_partial", "drive_exit",
+        ]
+
+    def test_one_row_per_row(self) -> None:
+        rows = _parse_csv(result_to_csv(_csv_fixture_result()))
+        assert len(rows) == 2  # header + one data row
+
+    def test_started_at_exports_as_the_raw_epoch_not_a_relative_string(self) -> None:
+        """The whole reason the serializer is server-side: an epoch must
+        survive as a number a spreadsheet can sort, not as `13h ago`."""
+        rows = _parse_csv(result_to_csv(_csv_fixture_result()))
+        started = rows[1][rows[0].index("Started")]
+        assert float(started) == WINDOW[0] + 400
+        assert "ago" not in started
+
+    def test_list_cell_is_one_field_joined_with_semicolons(self) -> None:
+        text = result_to_csv(_csv_fixture_result())
+        rows = _parse_csv(text)
+        assert rows[1][rows[0].index("Machines")] == "dellserver; precision"
+        # One field, not two columns: every row is as wide as the header.
+        assert len(rows[1]) == len(rows[0])
+        # And the field is quoted only when it needs to be — `; ` doesn't.
+        assert "dellserver; precision" in text
+
+    def test_nasty_drive_exit_reason_round_trips_through_csv_reader(self) -> None:
+        """#1631's reason with a comma, a quote AND a newline comes back
+        byte-identical — the escaping regression test."""
+        rows = _parse_csv(result_to_csv(_csv_fixture_result()))
+        cell = rows[1][rows[0].index("drive_exit")]
+        assert cell.endswith(f"reason={NASTY_REASON}")
+        assert NASTY_REASON in cell
+        # The embedded newline stayed inside one cell rather than spilling
+        # into an extra row.
+        assert len(rows) == 2
+
+    def test_null_is_empty_and_bool_is_true_false(self) -> None:
+        rows = _parse_csv(result_to_csv(_csv_fixture_result()))
+        assert rows[1][rows[0].index("merged_at")] == ""
+        assert rows[1][rows[0].index("counts_partial")] == "true"
+
+    def test_every_note_appears_as_a_comment_line(self) -> None:
+        result = _csv_fixture_result()
+        text = result_to_csv(result)
+        comments = [l for l in text.splitlines() if l.startswith("#")]
+        assert any("1631" in c and "merged anyway" in c for c in comments)
+        # A multi-line note gets one `#` per physical line, so no fragment
+        # can escape into the data and be read as a row.
+        assert "# a note that" in comments
+        assert "# spans two lines" in comments
+        # ...and the file still parses once the comment block is skipped.
+        assert _parse_csv(text)[0][0] == "Repo"
+
+    def test_report_id_and_window_are_in_the_comment_header(self) -> None:
+        text = result_to_csv(_csv_fixture_result())
+        assert text.startswith("# report: issue-activity\n")
+        assert "# window: " in text
+
+    def test_notes_are_not_rows(self) -> None:
+        rows = _parse_csv(result_to_csv(_csv_fixture_result()))
+        assert all("merged anyway" not in cell for row in rows for cell in row)
+
+    def test_accepts_the_dict_wire_form_identically(self) -> None:
+        """The CLI holds a `to_dict()` result off the wire, the daemon holds
+        a `ReportResult`; both must serialise to the same bytes."""
+        result = _csv_fixture_result()
+        assert result_to_csv(result) == result_to_csv(result.to_dict())
+
+    def test_a_result_with_no_rows_is_still_a_header(self) -> None:
+        result = ReportResult(
+            report_id="issue-activity",
+            generated_at=WINDOW[1],
+            window=WINDOW,
+            columns=["repo", "issue"],
+            rows=[],
+            notes=[],
+        )
+        rows = _parse_csv(result_to_csv(result))
+        assert rows == [["repo", "issue"]]
+
+    def test_totals_ride_along_as_a_final_flagged_row(self) -> None:
+        """#1763's grand total exports as the last row, announced in the
+        comments so it can't be mistaken for another data row."""
+        result = ReportResult(
+            report_id="usage",
+            generated_at=WINDOW[1],
+            window=WINDOW,
+            columns=["issue", "cost"],
+            rows=[{"issue": 1, "cost": 0.5}],
+            notes=[],
+            totals={"cost": 0.5},
+        )
+        text = result_to_csv(result)
+        assert "# totals:" in text
+        rows = _parse_csv(text)
+        assert rows[-1] == ["", "0.5"]
+
+    def test_a_report_without_totals_says_nothing_about_them(self) -> None:
+        assert "# totals:" not in result_to_csv(_csv_fixture_result())
+
+    def test_filename_is_derived_from_the_result_not_the_clock(self) -> None:
+        name = csv_filename(_csv_fixture_result())
+        assert name.startswith("issue-activity-")
+        assert name.endswith(".csv")
+        # Same result → same name, however long you wait.
+        assert name == csv_filename(_csv_fixture_result())
+
+
+class TestCsvCli:
+    def test_report_run_format_csv(self, coord_db) -> None:
+        _seed_known_good_window(coord_db)
+        result = CliRunner().invoke(
+            main,
+            ["report", "run", "issue-activity", "--param", "since=13h",
+             "--format", "csv"],
+        )
+        assert result.exit_code == 0, result.output
+        rows = _parse_csv(result.output)
+        # Header + one row per issue in the seeded window.
+        assert rows[0][:2] == ["Repo", "Issue"]
+        assert {r[1] for r in rows[1:]} == {"1629", "1631", "1728", "1729"}
+
+    def test_csv_started_at_is_an_epoch(self, coord_db) -> None:
+        _seed_known_good_window(coord_db)
+        result = CliRunner().invoke(
+            main,
+            ["report", "run", "issue-activity", "--param", "since=13h",
+             "--format", "csv"],
+        )
+        rows = _parse_csv(result.output)
+        started = rows[0].index("Started")
+        assert float(rows[1][started]) > 1_000_000_000
+
+    def test_csv_carries_the_notes_as_comment_lines(self, coord_db) -> None:
+        _seed_known_good_window(coord_db)
+        result = CliRunner().invoke(
+            main,
+            ["report", "run", "issue-activity", "--param", "since=13h",
+             "--format", "csv"],
+        )
+        assert any(
+            l.startswith("#") and "1631" in l for l in result.output.splitlines()
+        )
+
+    def test_json_flag_is_still_accepted_as_an_alias(self, coord_db) -> None:
+        _seed_known_good_window(coord_db)
+        legacy = CliRunner().invoke(
+            main,
+            ["report", "run", "issue-activity", "--param", "since=13h", "--json"],
+        )
+        explicit = CliRunner().invoke(
+            main,
+            ["report", "run", "issue-activity", "--param", "since=13h",
+             "--format", "json"],
+        )
+        assert legacy.exit_code == 0, legacy.output
+        assert explicit.exit_code == 0, explicit.output
+        assert json.loads(legacy.output) == json.loads(explicit.output)
+
+    def test_json_flag_is_hidden_from_help(self, coord_db) -> None:
+        result = CliRunner().invoke(main, ["report", "run", "--help"])
+        assert result.exit_code == 0, result.output
+        assert "--format" in result.output
+        assert "--json" not in result.output
+
+    def test_default_output_is_still_the_human_table(self, coord_db) -> None:
+        _seed_known_good_window(coord_db)
+        result = CliRunner().invoke(
+            main, ["report", "run", "issue-activity", "--param", "since=13h"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "OUTCOME" in result.output
+        assert "# report:" not in result.output
+
+    def test_bad_format_is_a_usage_error(self, coord_db) -> None:
+        result = CliRunner().invoke(
+            main, ["report", "run", "issue-activity", "--format", "xlsx"]
+        )
+        assert result.exit_code != 0
+        assert "xlsx" in result.output
+
+
+class TestCsvEndpoint:
+    def test_format_csv_returns_text_csv_with_a_filename(
+        self, report_client: TestClient, rw_db
+    ) -> None:
+        _seed_known_good_window(rw_db)
+        resp = report_client.get(
+            "/report/issue-activity", params={"since": "13h", "format": "csv"}
+        )
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("text/csv")
+        disposition = resp.headers["content-disposition"]
+        assert disposition.startswith("attachment; filename=")
+        assert "issue-activity-" in disposition and ".csv" in disposition
+        rows = _parse_csv(resp.text)
+        assert {r[1] for r in rows[1:]} == {"1629", "1631", "1728", "1729"}
+
+    def test_absent_format_is_byte_identical_json_to_before(
+        self, report_client: TestClient, rw_db
+    ) -> None:
+        """Compatibility guard for the merged #1741 panel: adding `format`
+        must not change the default response at all."""
+        _seed_known_good_window(rw_db)
+        until = repr(WINDOW[1])
+        plain = report_client.get(
+            "/report/issue-activity", params={"since": "13h", "until": until}
+        )
+        explicit = report_client.get(
+            "/report/issue-activity",
+            params={"since": "13h", "until": until, "format": "json"},
+        )
+        assert plain.headers["content-type"].startswith("application/json")
+        assert plain.content == explicit.content
+
+    def test_cli_csv_and_daemon_csv_are_byte_identical(
+        self, report_client: TestClient, rw_db
+    ) -> None:
+        _seed_known_good_window(rw_db)
+        until = repr(WINDOW[1])
+        endpoint = report_client.get(
+            "/report/issue-activity",
+            params={"since": "13h", "until": until, "format": "csv"},
+        ).text
+        cli = CliRunner().invoke(
+            main,
+            ["report", "run", "issue-activity", "--param", "since=13h",
+             "--param", f"until={until}", "--format", "csv"],
+        )
+        assert cli.exit_code == 0, cli.output
+        assert cli.output == endpoint
+
+    def test_format_is_not_treated_as_a_report_parameter(
+        self, report_client: TestClient, rw_db
+    ) -> None:
+        """`resolve_params` rejects unknown parameters — `format` is a
+        rendering choice and must be popped before it gets there."""
+        resp = report_client.get(
+            "/report/issue-activity", params={"since": "13h", "format": "csv"}
+        )
+        assert resp.status_code == 200
+
+    def test_unknown_format_is_a_400_naming_what_was_allowed(
+        self, report_client: TestClient
+    ) -> None:
+        resp = report_client.get(
+            "/report/issue-activity", params={"format": "xlsx"}
+        )
+        assert resp.status_code == 400
+        assert "csv" in resp.json()["error"]
+
+    def test_csv_route_still_requires_auth(
+        self, daemon_db: Path, valid_config_path: Path, rw_db
+    ) -> None:
+        app = build_app(
+            SqliteStore(daemon_db), load_config(valid_config_path), token="s3cret"
+        )
+        with TestClient(app) as cli:
+            assert cli.get(
+                "/report/issue-activity", params={"format": "csv"}
+            ).status_code == 401

@@ -3092,6 +3092,7 @@ def _openapi_spec() -> dict:
                     {"name": "since", "in": "query", "schema": {"type": "string"}, "description": "issue-activity: window length, e.g. 13h"},
                     {"name": "until", "in": "query", "schema": {"type": "string"}, "description": "issue-activity: epoch or ISO-8601 window end; empty = now"},
                     {"name": "repo", "in": "query", "schema": {"type": "string"}, "description": "issue-activity: restrict to one repo"},
+                    {"name": "format", "in": "query", "schema": {"type": "string", "enum": ["json", "csv"]}, "description": "#1765: response encoding. Absent/`json` returns the ReportResult unchanged; `csv` returns text/csv (raw values, `#`-prefixed notes) with a Content-Disposition filename."},
                 ],
                 "responses": {
                     "200": {
@@ -3122,10 +3123,14 @@ def _openapi_spec() -> dict:
                                         "columns", "rows", "notes",
                                     ],
                                 }
-                            }
+                            },
+                            "text/csv": {
+                                "schema": {"type": "string"},
+                                "description": "#1765: `?format=csv`. Header row labelled from `column_meta`, one row per `rows` entry with raw values, `notes` as leading `#` lines.",
+                            },
                         },
                     },
-                    "400": {"description": "Unknown parameter / bad parameter value"},
+                    "400": {"description": "Unknown parameter / bad parameter value / unknown format"},
                     "404": {"description": "Unknown report id"},
                 },
             }
@@ -5533,6 +5538,16 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
 
         report_id = request.path_params["report_id"]
         params = dict(request.query_params)
+        # #1765: `format` is a *rendering* choice, not a report parameter —
+        # pop it before validation or `resolve_params` rejects it as an
+        # unknown parameter. Absent means JSON, byte-identical to what this
+        # route returned before #1765 (the merged #1741 panel depends on it).
+        fmt = (params.pop("format", "") or "json").strip().lower()
+        if fmt not in ("json", "csv"):
+            return JSONResponse(
+                {"error": f"unknown format {fmt!r} — allowed values: json, csv"},
+                status_code=400,
+            )
         try:
             result = await run_in_threadpool(_reports.run_report, report_id, params)
         except _reports.UnknownReportError as e:
@@ -5542,6 +5557,18 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         except Exception as e:  # noqa: BLE001 — surface a clean 503 rather than a stack trace
             return JSONResponse(
                 {"error": "report run failed", "detail": str(e)}, status_code=503
+            )
+        if fmt == "csv":
+            # Same serializer the CLI calls, so `coord report run --format
+            # csv` and this route emit identical bytes for identical params.
+            return Response(
+                _reports.result_to_csv(result),
+                media_type="text/csv; charset=utf-8",
+                headers={
+                    "Content-Disposition": (
+                        f'attachment; filename="{_reports.csv_filename(result)}"'
+                    )
+                },
             )
         return JSONResponse(result.to_dict())
 
