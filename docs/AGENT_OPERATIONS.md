@@ -339,7 +339,8 @@ The deployment picture, end to end:
 | `coord web` | 7434 | dellserver only (reads the local DB) | `deploy/coord-web.service` |
 | `coord notify` (periodic) | n/a (CLI, not a listener) | dellserver only (owns the DB) | `deploy/coord-notify.service` + `deploy/coord-notify.timer` |
 | `coord drive-queue tick` (periodic) | n/a (CLI, not a listener) | dellserver only (tmux + repo checkouts) | `deploy/coord-drive-queue.service` + `deploy/coord-drive-queue.timer` |
-| `coord-web-dist-build` (periodic, #1543) | n/a (CLI, not a listener) | dellserver only (feeds `coord web --dist`) | `deploy/coord-web-dist-build.service` + `deploy/coord-web-dist-build.timer` |
+| `coord-web-dist-build` (periodic, #1543, health-check #1560) | n/a (CLI, not a listener) | dellserver only (feeds `coord web --dist`) | `deploy/coord-web-dist-build.service` + `deploy/coord-web-dist-build.timer` |
+| `coord-web-rollback` (on-demand, #1560) | n/a (CLI, run manually to recover) | dellserver only (repoints `coord web --dist`) | `deploy/coord-web-rollback.sh` (no unit — one-shot recovery command) |
 
 The phone is just a browser: open `http://<dellserver-host>:7434` on the tailnet
 and Add to Home Screen (the API is same-origin, so no client config).
@@ -359,12 +360,24 @@ worktree, then atomically repoints the symlink — no `pip install`, no PyPI
 release, and (past the very first build) no restart of `coord-web` at all.
 Shipping a webapp change this way **never touches the shared venv** — see
 "Going live automatically (#1543)" in `docs/PHONE_WEBAPP.md` for the
-before/after version proof, the rollback command, and the full mechanism.
+before/after version proof and the full mechanism.
 This corrects an earlier (2026-08-03 and prior) revision of this doc, which
 described `~/.coord-venv`'s bundled wheel (#758) as the way a webapp change
 reached production; #758 still ships that bundle and it is still the
 fallback when `~/coord-web-dist` is absent, but it is no longer the primary
 path on dellserver.
+
+**#1560 — a release is health-checked before it ever goes live, and a bad
+one is one command away from being un-done.** Before repointing the
+symlink, the build timer boots the candidate release as a scratch, loopback-
+only `coord web` instance (`--fixture`-backed, so it touches no real DB) and
+probes it like a browser would; a release that fails is deleted, never
+published. If something still gets through anyway, `~/.local/bin/coord-web-rollback.sh`
+repoints `~/coord-web-dist` at the last known GOOD release in one command,
+in milliseconds, with no restart. See "Health-check before cutover (#1560)"
+and "Rollback: one command, reachable without this issue in hand (#1560)" in
+`docs/PHONE_WEBAPP.md` for the full design rationale and a timed recovery
+drill transcript.
 
 **Service unit:** [`deploy/coord-web.service`](../deploy/coord-web.service) (full
 unit + prereqs in its header). Install + restart:
@@ -381,10 +394,17 @@ XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart coord-web
 [`deploy/coord-web-dist-build.timer`](../deploy/coord-web-dist-build.timer). Install:
 
 ```bash
-cp deploy/coord-web-dist-build.sh ~/.local/bin/ && chmod +x ~/.local/bin/coord-web-dist-build.sh
+cp deploy/coord-web-dist-build.sh deploy/coord-web-rollback.sh ~/.local/bin/
+chmod +x ~/.local/bin/coord-web-dist-build.sh ~/.local/bin/coord-web-rollback.sh
 ~/.local/bin/coord-web-dist-build.sh   # first build — do this BEFORE (re)starting coord-web
 cp deploy/coord-web-dist-build.service deploy/coord-web-dist-build.timer ~/.config/systemd/user/
 systemctl --user daemon-reload && systemctl --user enable --now coord-web-dist-build.timer
+```
+
+**Recovery, from anywhere with ssh (a phone included):**
+
+```bash
+ssh <dellserver-tailnet-name> ~/.local/bin/coord-web-rollback.sh
 ```
 
 ## Periodic `coord notify` (`coord-notify` timer, #1311)

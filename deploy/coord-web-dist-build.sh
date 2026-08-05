@@ -43,14 +43,44 @@
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now coord-web-dist-build.timer
 #
+# Health-check before cutover (#1560): before a build is ever published, it
+# is booted as a SCRATCH `coord web` instance on 127.0.0.1:$HEALTH_CHECK_PORT
+# — same code path production uses, `--fixture` sourced so it needs no DB, no
+# fleet, no network and touches no live state (see coord/dashboard/fixture.py)
+# — and probed for `/` (200, real SPA markup, not the legacy fallback page)
+# and `/api/pipeline` (200, parses as a non-empty JSON array). Only a release
+# that passes both gets `mv`'d into $RELEASES_DIR and symlinked live; a
+# failing release is deleted, never published, and the CURRENT live release
+# is untouched — see "Why fail-closed, not auto-revert" below.
+#
 # Rollback (one command — pairs with #1560): repoint the live symlink at the
 # previous release directory, still on disk under $RELEASES_DIR:
+#
+#   ~/.local/bin/coord-web-rollback.sh
+#
+# or, equivalently, by hand:
 #
 #   ln -sfn "$(ls -dt ~/.coord-web-releases/*/ | sed -n 2p)" ~/coord-web-dist
 #
 # (lists release dirs newest-first, picks the SECOND newest — i.e. the one
 # before the current live release — and repoints the symlink at it; no
-# restart needed, same as a forward build.)
+# restart needed, same as a forward build.) Because a release only ever
+# lands in $RELEASES_DIR after passing the health check above, "second
+# newest directory on disk" and "last known GOOD release" are the same
+# thing — a failed build is deleted, not left there to be rolled back into.
+# See deploy/coord-web-rollback.sh and docs/PHONE_WEBAPP.md for the
+# script form (safer to type over ssh from a phone under stress) and the
+# full recovery runbook + timed drill transcript.
+#
+# Why fail-closed, not auto-revert-after-publish: the health check above
+# runs on a scratch port BEFORE the symlink swap, so there is no window
+# where a broken bundle is ever live — "auto-revert" would mean detecting
+# breakage AFTER cutover and repointing back, which is strictly weaker (some
+# nonzero time live broken) for a check this script can already make
+# BEFORE cutover. A bug the fixture-based check cannot catch (e.g. a
+# JS-only runtime error that still serves 200 HTML) would need the manual
+# `coord-web-rollback.sh` above; that path is exercised in the #1560
+# acceptance transcript in docs/PHONE_WEBAPP.md.
 #
 # See docs/PHONE_WEBAPP.md and docs/AGENT_OPERATIONS.md for the full runbook.
 
@@ -70,7 +100,114 @@ LIVE_LINK="${LIVE_LINK:-$HOME/coord-web-dist}"
 KEEP_RELEASES="${KEEP_RELEASES:-3}"
 LOCK_FILE="${LOCK_FILE:-$HOME/.coord-web-dist-build.lock}"
 
+# ── Health-check-before-cutover config (#1560) ──────────────────────────────
+# 127.0.0.1-only, never $HEALTH_CHECK_HOST=0.0.0.0 — this is a throwaway
+# probe instance, not a second public dashboard.
+HEALTH_CHECK_HOST="127.0.0.1"
+HEALTH_CHECK_PORT="${HEALTH_CHECK_PORT:-18434}"
+HEALTH_CHECK_TIMEOUT_SECS="${HEALTH_CHECK_TIMEOUT_SECS:-20}"
+# The reference seeded board (#1538) — deterministic, no DB/fleet/network, so
+# the scratch instance below never touches ~/.coord/coord.db or races the
+# real coord-web/coord-serve/coord-agent processes. Defaults to the fixture
+# AT THE SHA BEING DEPLOYED (via $WEBAPP_CHECKOUT), so the fixture schema
+# always matches the server code that will parse it.
+HEALTH_CHECK_FIXTURE="${HEALTH_CHECK_FIXTURE:-}"
+
 say() { echo "[$(date -Is)] $*" >&2; }
+
+# Resolves the installed `coord` binary for a READ-ONLY health-check probe —
+# never installs, upgrades, or otherwise mutates ~/.coord-venv (see
+# tests/test_deploy_coord_web_dist.py's ban on that). Mirrors the fallback
+# chain scripts/azure-workers/epic-up.sh / epic-down.sh already use to find
+# `coord` across dev boxes (~/.local/bin) and the dellserver production venv.
+resolve_coord_bin() {
+  local c
+  for c in "${COORD_BIN:-}" "$HOME/.coord-venv/bin/coord" "$HOME/.local/bin/coord" "$(command -v coord 2>/dev/null || true)"; do
+    if [[ -n "$c" && -x "$c" ]]; then
+      printf '%s\n' "$c"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Boots $1 (a release directory) as a scratch `coord web` instance and probes
+# it exactly like a browser hitting the live dashboard would: `/` must be the
+# real SPA (not the legacy single-file fallback `--dist` silently serves for
+# a missing/empty directory — see coord/commands/lifecycle.py's --dist help),
+# and `/api/pipeline` must answer with real, parseable pipeline data. Always
+# tears the scratch instance down before returning, pass or fail — a leaked
+# listener on $HEALTH_CHECK_PORT would wedge every subsequent run.
+health_check_release() {
+  local release_dir="$1"
+  local coord_bin fixture server_pid log_file waited base ok
+  base="http://$HEALTH_CHECK_HOST:$HEALTH_CHECK_PORT"
+
+  if ! coord_bin="$(resolve_coord_bin)"; then
+    say "ERROR: no coord binary found (checked \$COORD_BIN, ~/.coord-venv/bin/coord, ~/.local/bin/coord, PATH) — cannot health-check $release_dir"
+    return 1
+  fi
+
+  fixture="${HEALTH_CHECK_FIXTURE:-$WEBAPP_CHECKOUT/tests/fixtures/board-pipeline-basic.json}"
+  if [[ ! -f "$fixture" ]]; then
+    say "ERROR: health-check fixture missing: $fixture — cannot health-check $release_dir"
+    return 1
+  fi
+
+  log_file="$(mktemp)"
+  "$coord_bin" web --host "$HEALTH_CHECK_HOST" --port "$HEALTH_CHECK_PORT" \
+      --dist "$release_dir" --fixture "$fixture" \
+      >"$log_file" 2>&1 &
+  server_pid=$!
+  # Belt-and-braces: this fires on every return path below (including the
+  # early `return 1`s above happen before server_pid exists, so they're
+  # unaffected), so a health check that errors out never leaks the listener.
+  trap 'kill "$server_pid" 2>/dev/null; wait "$server_pid" 2>/dev/null; rm -f "$log_file"' RETURN
+
+  ok=1
+  waited=0
+  while (( waited < HEALTH_CHECK_TIMEOUT_SECS )); do
+    if curl -fsS -o /dev/null "$base/api/pipeline" 2>/dev/null; then
+      ok=0
+      break
+    fi
+    if ! kill -0 "$server_pid" 2>/dev/null; then
+      say "ERROR: scratch coord web (pid $server_pid) exited before answering — log follows:"
+      cat "$log_file" >&2
+      return 1
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  if [[ "$ok" -ne 0 ]]; then
+    say "ERROR: scratch coord web on $base did not answer /api/pipeline within ${HEALTH_CHECK_TIMEOUT_SECS}s — log follows:"
+    cat "$log_file" >&2
+    return 1
+  fi
+
+  local root_body root_status
+  root_body="$(mktemp)"
+  root_status="$(curl -fsS -o "$root_body" -w '%{http_code}' "$base/" 2>/dev/null)" || root_status="curl-failed"
+  if [[ "$root_status" != "200" ]]; then
+    say "ERROR: $base/ returned HTTP $root_status (want 200)"
+    rm -f "$root_body"
+    return 1
+  fi
+  if ! grep -q 'id="root"' "$root_body"; then
+    say "ERROR: $base/ returned 200 but not the SPA (no id=\"root\" marker) — likely the legacy fallback dashboard, meaning $release_dir has no usable dist/"
+    rm -f "$root_body"
+    return 1
+  fi
+  rm -f "$root_body"
+
+  if ! curl -fsS "$base/api/pipeline" 2>/dev/null | python3 -c 'import json, sys; data = json.load(sys.stdin); sys.exit(0 if isinstance(data, list) and len(data) > 0 else 1)'; then
+    say "ERROR: $base/api/pipeline did not return a non-empty JSON array"
+    return 1
+  fi
+
+  say "health check passed: $base/ serves the SPA, /api/pipeline answers"
+  return 0
+}
 
 # ── Single-instance guard ───────────────────────────────────────────────────
 exec 9>"$LOCK_FILE"
@@ -139,6 +276,18 @@ fi
 
 if ! mv "$WEBAPP_DIR/dist" "$RELEASE_DIR"; then
   say "ERROR: could not move built dist/ into $RELEASE_DIR — live dashboard unchanged (still $CURRENT_RELEASE)"
+  exit 1
+fi
+
+# ── Health-check before cutover (#1560) ─────────────────────────────────────
+# $RELEASE_DIR only ever survives past this point if it passes — see the
+# "Why fail-closed" note atop this file. A failing release is deleted here,
+# never left in $RELEASES_DIR, so the rollback script's "second-newest
+# directory on disk" always resolves to the last known GOOD release.
+say "health-checking $NEW_SHA on $HEALTH_CHECK_HOST:$HEALTH_CHECK_PORT before cutover"
+if ! health_check_release "$RELEASE_DIR"; then
+  say "ERROR: health check failed for $NEW_SHA — refusing to publish, live dashboard unchanged (still $CURRENT_RELEASE)"
+  rm -rf "$RELEASE_DIR"
   exit 1
 fi
 

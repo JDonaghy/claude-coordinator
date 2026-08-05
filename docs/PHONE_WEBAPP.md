@@ -195,22 +195,153 @@ readlink -f ~/coord-web-dist               # ~/.coord-web-releases/<old-sha>
 readlink -f ~/coord-web-dist               # ~/.coord-web-releases/<new-sha>
 ```
 
-### Rollback (one command, pairs with #1560)
+### Health-check before cutover (#1560)
+
+A build succeeding (`npm run build` exits 0) and the resulting page actually
+working are different claims. Before a release is ever symlinked live,
+`coord-web-dist-build.sh` boots it as a **scratch** `coord web` instance —
+bound to `127.0.0.1` only, on a throwaway port, `--fixture
+tests/fixtures/board-pipeline-basic.json` (the #1538 deterministic seeded
+board, so the probe needs no DB/fleet/network and can't race or corrupt the
+real `~/.coord/coord.db` the already-running production `coord-web` /
+`coord-serve` / `coord-agent` are using) — and probes it exactly like a
+browser would:
+
+- `GET /` must return **200** and contain the real SPA's `id="root"` mount
+  point, not the legacy single-file fallback dashboard that `--dist` quietly
+  serves instead for a missing/broken bundle (`coord/commands/lifecycle.py`'s
+  `--dist` help documents that fallback).
+- `GET /api/pipeline` must return **200** and parse as a non-empty JSON
+  array.
+
+Only a release that passes **both** gets `mv`'d into `$RELEASES_DIR` and
+symlinked live. A release that fails is deleted — never published, never
+left on disk to be mistaken for a rollback target — and the currently-live
+release is untouched.
+
+**Why fail-closed instead of auto-revert-after-publish:** the check above
+runs *before* the symlink swap, so there is no window, however brief, where
+a broken bundle is actually live — detecting breakage after cutover and
+reverting would by definition mean it was live for some nonzero time first.
+That said, the fixture-based check is necessarily incomplete: it cannot
+catch a bug that only manifests as a client-side JS runtime error (still
+serves 200 HTML with an `id="root"` div — a headless-browser check could
+catch that class of bug too, but running one from a systemd timer every
+minute was judged disproportionate for this program's scope). **That gap is
+exactly what the manual rollback below is for**, and it is what the #1560
+acceptance drill exercises.
+
+### Rollback: one command, reachable without this issue in hand (#1560)
+
+```bash
+ssh <dellserver-tailnet-name> ~/.local/bin/coord-web-rollback.sh
+```
+
+[`deploy/coord-web-rollback.sh`](../deploy/coord-web-rollback.sh) repoints
+`~/coord-web-dist` at the release directory that was live just before the
+current one — still on disk under `~/.coord-web-releases` (`KEEP_RELEASES=3`
+by default). No restart needed, same atomic `rename(2)`-over-symlink publish
+as a forward deploy. It refuses to run (exit 1, clear stderr message,
+`~/coord-web-dist` untouched) if fewer than two releases exist on disk, or if
+the candidate target has no `index.html` — it will not publish a release it
+cannot at least confirm looks like a built bundle.
+
+Because a release only ever lands in `~/.coord-web-releases` **after**
+passing the health check above, "second-newest directory on disk" and "last
+known GOOD release" are the same thing — a failed build never gets there to
+be rolled back into by mistake.
+
+Equivalent by hand, if the script itself is ever unavailable:
 
 ```bash
 ln -sfn "$(ls -dt ~/.coord-web-releases/*/ | sed -n 2p)" ~/coord-web-dist
 ```
 
-Repoints the live symlink at the release directory just before the current
-one (still on disk — `KEEP_RELEASES=3` by default). No restart needed, same
-as a forward publish.
+**`coord-serve` (7435) and `coord-agent` (7433) are untouched by both the
+deploy and the revert** — neither script does anything but build/symlink
+inside `~/coord-web-dist` / `~/.coord-web-releases`; see
+`tests/test_deploy_coord_web_dist.py` and
+`tests/test_deploy_coord_web_rollback.py` for the regression guards.
+
+#### #1560 acceptance drill: deploying a broken bundle and recovering
+
+Run **2026-08-05**, against scratch `$RELEASES_DIR`/`$LIVE_LINK` directories
+fed by a throwaway local `git` remote (not the real dellserver deploy — this
+repro touches no production state) driving the real
+`deploy/coord-web-dist-build.sh` and `deploy/coord-web-rollback.sh` end to
+end, in two parts because the two scripts guard against two different
+failure classes.
+
+**Part A — the health check catches an obviously broken build.** Starting
+from a good build already live at SHA `17b949e` (real `origin/main` tip),
+`coord/dashboard/webapp/index.html`'s SPA root div was corrupted
+(`id="root"` → `id="not-root"`) in a new commit `8f48ced` and
+`coord-web-dist-build.sh` run against it:
+
+```
+[10:34:17] building 8f48ced8651fc0d66c8283e0dd11dbc37c0f0882
+           ... npm ci && npm run build (succeeds — vite doesn't know the div id is wrong) ...
+[10:34:28] health-checking 8f48ced8651fc0d66c8283e0dd11dbc37c0f0882 on 127.0.0.1:18500 before cutover
+[10:34:29] ERROR: http://127.0.0.1:18500/ returned 200 but not the SPA (no id="root" marker) —
+           likely the legacy fallback dashboard, meaning .../releases/8f48ced8... has no usable dist/
+[10:34:29] ERROR: health check failed for 8f48ced8651fc0d66c8283e0dd11dbc37c0f0882 — refusing to
+           publish, live dashboard unchanged (still 17b949eb76cd80e9f6204e7285dcdbbe05b63c22)
+```
+
+Exit 1, 12.3s wall clock (almost all of it `npm ci && npm run build`).
+`readlink -f $LIVE_LINK` still resolved to `17b949e...` and `$RELEASES_DIR`
+contained **only** `17b949e...` — the broken release directory was deleted,
+not left on disk. **The broken bundle was never live, so there was nothing
+to recover from.** This is the fail-closed path described above; it's the
+expected, and cheapest possible, outcome for the class of bug the health
+check can see (build "succeeds" but the served HTML is wrong).
+
+**Part B — a bad bundle that gets past static checks anyway, then a timed
+manual rollback.** To exercise the actual revert command — the path that
+matters for a bug class the fixture-based check *can't* see, e.g. a
+client-side JS runtime error that still serves 200 HTML with a valid
+`id="root"` div — a second release directory (`deadbeef…`, a copy of the
+good build with a `throw new Error(...)` appended to its main JS bundle) was
+placed directly under `$RELEASES_DIR` and `$LIVE_LINK` force-pointed at it
+**by hand, bypassing the build script entirely** — simulating "this got live
+anyway, however it happened":
+
+```
+$ readlink -f $LIVE_LINK
+/…/releases/deadbeefdeadbeefdeadbeefdeadbeefdeadbeef        # the "bad" one, live
+
+$ time RELEASES_DIR=… LIVE_LINK=… ~/.local/bin/coord-web-rollback.sh
+[10:34:42] rolling back: .../releases/deadbeef... -> .../releases/17b949e...
+[10:34:42] done: $LIVE_LINK -> .../releases/17b949e... (no coord-web restart needed)
+[10:34:42] coord-serve (7435) and coord-agent (7433) were not touched by this script.
+
+real    0m0.007s
+```
+
+**Recovery time: ~7 milliseconds — well under the issue's one-minute bar.**
+`readlink -f $LIVE_LINK` confirmed it repointed to the good release; `grep
+'id="'` against its `index.html` confirmed `id="root"` (the real SPA, not
+the corrupted one) was live again. `coord-serve`/`coord-agent` were never
+started during this drill at all — confirming (along with
+`tests/test_deploy_coord_web_rollback.py`'s
+`test_reports_no_restart_and_other_lanes_untouched`) that neither script
+reaches for those services by construction, not merely because they
+happened not to be running.
+
+**Takeaway:** the two mechanisms cover different halves of the problem — the
+health check stops most broken deploys from ever going live at all (zero
+recovery time needed, because there was nothing to recover from); the
+one-command rollback is the fallback for the narrower class that gets
+through anyway, and a millisecond-scale symlink swap is fast enough that
+"ssh in from a phone and run one command" is a realistic answer to "the
+dogfood loop just went down."
 
 ### Install
 
 ```bash
 mkdir -p ~/.config/systemd/user
-cp deploy/coord-web-dist-build.sh ~/.local/bin/
-chmod +x ~/.local/bin/coord-web-dist-build.sh
+cp deploy/coord-web-dist-build.sh deploy/coord-web-rollback.sh ~/.local/bin/
+chmod +x ~/.local/bin/coord-web-dist-build.sh ~/.local/bin/coord-web-rollback.sh
 ~/.local/bin/coord-web-dist-build.sh                # first build, BEFORE starting coord-web
 cp deploy/coord-web.service deploy/coord-web-dist-build.service \
     deploy/coord-web-dist-build.timer ~/.config/systemd/user/
@@ -220,8 +351,10 @@ systemctl --user enable --now coord-web coord-web-dist-build.timer
 ```
 
 See `deploy/coord-web-dist-build.sh`'s header comment for the full mechanism
-and edge cases (locking against overlapping runs, a failed build leaving the
-previous release live, pruning old releases).
+and edge cases (locking against overlapping runs, a failed health check
+leaving the previous release live, pruning old releases), and
+`deploy/coord-web-rollback.sh`'s header comment for the rollback script
+installed alongside it above.
 
 ---
 
@@ -408,8 +541,13 @@ The webapp ships with two test tiers:
 | `coord/dashboard/webapp/e2e/terminal.spec.ts` | **(v2, #1072)** Playwright E2E for the takeover flow |
 | `coord/dashboard/webapp/vite.config.ts` | Vite + PWA plugin config |
 | `coord/dashboard/webapp/dist/` | **Built output** (gitignored locally; bundled into the PyPI wheel by the release workflow as of 0.4.71, #758; run `npm run build` locally for editable installs) |
-| `deploy/coord-web-dist-build.sh` | **(#1543)** builds merged `main`'s webapp into `~/coord-web-dist`, decoupled from `~/.coord-venv` — see "Going live automatically" above |
+| `deploy/coord-web-dist-build.sh` | **(#1543, health check #1560)** builds merged `main`'s webapp into `~/coord-web-dist`, decoupled from `~/.coord-venv`; health-checks a release on a scratch port before ever publishing it — see "Going live automatically" and "Health-check before cutover" above |
 | `deploy/coord-web-dist-build.service` / `.timer` | **(#1543)** systemd units that run the script above every minute |
+| `deploy/coord-web-rollback.sh` | **(#1560)** one-command last-known-good rollback — repoints `~/coord-web-dist` at the previous release; see "Rollback" above |
 | `coord/pipeline.py` | `PipelineView` / `PipelineGate` / `compute_pipeline()` — pure-computation pipeline state |
+| `coord/dashboard/fixture.py` | **(#1538)** `--fixture` seeded-board mode — same routes/handlers, no DB/fleet/network; what the #1560 health check boots the scratch instance with |
+| `tests/fixtures/board-pipeline-basic.json` | **(#1538)** the reference seeded board the #1560 health check probes against |
 | `tests/test_dashboard.py` | Python-level API integration tests |
 | `tests/test_dashboard_terminal.py` | **(v2, #1065)** PTY↔WS bridge integration tests |
+| `tests/test_deploy_coord_web_dist.py` | **(#1543, #1560)** content pins for the deploy units + build script, including the health-check gate |
+| `tests/test_deploy_coord_web_rollback.py` | **(#1560)** behavioural tests for `coord-web-rollback.sh`'s symlink-swap logic (real subprocess execution — no systemd/network/npm needed) |
