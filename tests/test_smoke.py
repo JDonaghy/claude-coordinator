@@ -1715,11 +1715,20 @@ def test_dispatch_pending_smoke_fix_round_shape_with_running_markers(
     """The exact board #1797 showed: both rows `test_state="running"`, the
     earlier `review_verdict=request-changes`. `running` is the #1395 transient
     marker, so the bulk scan must leave both alone rather than pile on a
-    third and fourth Test worker."""
+    third and fourth Test worker.
+
+    round2 keeps `test_state="running"` so it's caught by the pre-existing
+    `test_state is not None` filter (verifying that path is untouched), but
+    round1 is left with no verdict at all (`test_state=None`) so it actually
+    reaches `dispatch_smoke` and must be skipped by the NEW #1819
+    `superseding_work_row` check — round2 is the later work-like row on the
+    same branch, so round1 is superseded and must not get a Test dispatch
+    of its own. Without this, a bare `both running` board never drives that
+    code path at all: the pre-existing filter would skip both rows before
+    either reached `superseding_work_row`."""
     monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: None)
 
     round1, round2 = _fix_round_pair()
-    round1 = replace(round1, test_state="running")
     round2 = replace(round2, test_state="running")
     board = Board(completed=[round1, round2])
 

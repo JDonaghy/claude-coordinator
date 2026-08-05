@@ -711,6 +711,22 @@ def test_superseding_work_row_ignores_failed_later_rows() -> None:
     assert superseding_work_row(board, old) is None
 
 
+def test_superseding_work_row_ignores_advisory_later_rows() -> None:
+    """A `--fix-of` round that lands zero commits ("already fixed", or a
+    graceful usage-limit exit) is `status=advisory` — the real, documented
+    terminal status for a work-like assignment with nothing pushed
+    (`_ZERO_COMMIT_TYPES` in coord/agent.py). It must not supersede the row
+    it was fixing: an advisory row is itself never a valid Test-stage
+    dispatch target (`dispatch_smoke` requires `status == "done"`), so
+    treating it as superseding would leave the branch with NO dispatch
+    target at all."""
+    old = _work_row(aid="w1", branch="issue-16-fix", at=100.0)
+    advisory = _work_row(aid="w2", branch="issue-16-fix", at=200.0, status="advisory")
+    board = Board(completed=[old, advisory])
+
+    assert superseding_work_row(board, old) is None
+
+
 def test_superseding_work_row_ignores_non_work_types() -> None:
     """The review and smoke of a branch are not its author."""
     row = _work_row(aid="w1", branch="issue-16-fix", at=100.0)

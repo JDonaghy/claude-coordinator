@@ -173,7 +173,7 @@ def has_active_branch_followup(
     return False
 
 
-def superseding_work_row(board: Board, assignment) -> object | None:
+def superseding_work_row(board: Board, assignment) -> "Assignment | None":
     """The later work-like row on the same ``(repo, branch)``, if any (#1819).
 
     A ``work`` row that another work-like row was dispatched *after*, on the
@@ -184,8 +184,15 @@ def superseding_work_row(board: Board, assignment) -> object | None:
 
     Ordering is by ``dispatched_at``, with the assignment id as a deterministic
     tie-break so two rows stamped in the same second still order stably. A
-    ``failed`` later row does not supersede — it produced nothing, so the
-    earlier row is still the branch's author.
+    ``failed`` or ``advisory`` later row does not supersede — both are
+    terminal no-op outcomes (``_ZERO_COMMIT_TYPES`` in ``coord/agent.py``:
+    zero commits pushed, e.g. "already fixed" or a graceful usage-limit exit)
+    that leave the branch exactly as the earlier row left it, so the earlier
+    row is still the branch's author. Without excluding ``advisory`` here, a
+    `--fix-of` round that lands zero commits would falsely mark the row it
+    was fixing as superseded — and since an ``advisory`` row is itself never
+    a valid dispatch target (``dispatch_smoke`` requires ``status == "done"``),
+    the branch would then never get *any* Test dispatch.
 
     Returns the (newest) superseding row so callers can name it in a log line,
     or ``None`` when *assignment* is the branch's current work row. Related but
@@ -206,7 +213,7 @@ def superseding_work_row(board: Board, assignment) -> object | None:
             continue
         if a.type not in WORK_LIKE_TYPES:
             continue
-        if a.status == "failed":
+        if a.status in ("failed", "advisory"):
             continue
         if a.repo_name != assignment.repo_name or a.branch != branch:
             continue
