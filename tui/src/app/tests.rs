@@ -42059,3 +42059,307 @@ Milestone tracking issue.
                  wide:\n{narrow}"
         );
     }
+
+    // ── #1765: Export a report to CSV ────────────────────────────────────
+    //
+    // The Export affordance is the section header's `HeaderAction`
+    // (quadraui `SectionHeader.actions`), which renders dimmed and
+    // hit-test-inert when disabled. Every assertion below reaches the button
+    // through `find()` on the rendered grid — never a hardcoded coordinate —
+    // and distinguishes enabled from disabled *behaviourally*, since a
+    // dimmed glyph and a lit one are the same character on a text screen:
+    // a disabled action falls through to the title area (collapsing the
+    // section), an enabled one does not.
+
+    /// The Export glyph as the TUI header draws it (`Icon::fallback`).
+    const EXPORT_GLYPH: &str = "⤓";
+
+    #[test]
+    fn reports_export_action_renders_in_every_section_header() {
+        let driver = reports_driver(&reports_result_json(), 140, 40);
+        let screen = driver.screen();
+        let (x, y) = driver.find(EXPORT_GLYPH).unwrap_or_else(|| {
+            panic!("#1765: the Export action must render in the section header:\n{screen}")
+        });
+        let (_, header_y) = driver
+            .find("▾ Issue Activity")
+            .expect("section header must render");
+        assert_eq!(
+            y, header_y,
+            "#1765: Export belongs in the section header row, not the body:\n{screen}"
+        );
+        let (title_x, _) = driver.find("▾ Issue Activity").unwrap();
+        assert!(
+            x > title_x,
+            "#1765: the action is right-aligned, so it must sit right of the \
+             title:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn reports_export_is_inert_before_the_first_run() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        // No result: the action is disabled, quadraui reserves no hit region
+        // for it, and the click falls through to the title area — which
+        // toggles the section. That fall-through IS the observable proof
+        // that the button is inert.
+        let app = make_app_with_reports(BoardData::default(), reports_catalogue_json(), None);
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "▤");
+        driver.render();
+
+        let before = driver.screen();
+        assert!(
+            before.contains("▾ Issue Activity"),
+            "section must start expanded:\n{before}"
+        );
+        let (x, y) = driver
+            .find(EXPORT_GLYPH)
+            .unwrap_or_else(|| panic!("#1765: a disabled Export still renders:\n{before}"));
+        driver.click(x, y);
+        driver.render();
+
+        let after = driver.screen();
+        assert!(
+            after.contains("▸ Issue Activity"),
+            "#1765: clicking a *disabled* Export must fall through to the \
+             title area (collapsing the section), not export:\n{after}"
+        );
+        assert!(
+            !after.contains("Exporting") && !after.contains("Export failed"),
+            "#1765: an unrun report must not report an export outcome:\n{after}"
+        );
+    }
+
+    #[test]
+    fn reports_export_is_live_after_a_run_and_does_not_collapse_the_section() {
+        let mut driver = reports_driver(&reports_result_json(), 140, 40);
+        let (x, y) = driver
+            .find(EXPORT_GLYPH)
+            .unwrap_or_else(|| panic!("Export must render:\n{}", driver.screen()));
+        driver.click(x, y);
+        driver.render();
+
+        let after = driver.screen();
+        assert!(
+            after.contains("▾ Issue Activity"),
+            "#1765: an *enabled* Export owns its hit region — the click must \
+             not fall through and collapse the section:\n{after}"
+        );
+        // The click ran the whole request path in one turn: pending → save
+        // dialog → destination → export. Whichever terminal state it
+        // reached, it must have said so in the notes area — a silent write
+        // is indistinguishable from a silent failure.
+        assert!(
+            after.contains("Export"),
+            "#1765: an Export click must leave a visible outcome in the notes \
+             area:\n{after}"
+        );
+    }
+
+    #[test]
+    fn reports_export_status_renders_in_the_notes_area_alongside_the_report_notes() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        // Set on the plain `CoordApp` before it is handed to the driver:
+        // `driver.app()` is an opaque `ShellAdapter`, not a `CoordApp`.
+        let mut app = make_app_with_reports(
+            BoardData::default(),
+            reports_catalogue_json(),
+            Some(&reports_result_json()),
+        );
+        app.reports_export_status = Some("EXPORT_MARKER: wrote /tmp/x.csv".to_string());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "▤");
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("EXPORT_MARKER"),
+            "#1765: the export outcome must be visible:\n{screen}"
+        );
+        assert!(
+            screen.contains("ANOMALY_MARKER"),
+            "#1765: ...without displacing the report's own notes:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn reports_a_new_run_drops_the_previous_exports_status() {
+        let mut app = make_app_with_reports(
+            BoardData::default(),
+            reports_catalogue_json(),
+            Some(&reports_result_json()),
+        );
+        app.reports_export_status = Some("STALE_EXPORT".to_string());
+        app.reports_start_run("issue-activity");
+        assert!(
+            app.reports_export_status.is_none(),
+            "#1765: an export message describes the file for the *previous* \
+             result and must not survive a new run"
+        );
+    }
+
+    #[test]
+    fn reports_export_destination_uses_the_path_the_dialog_returned() {
+        let dest = std::path::PathBuf::from("/tmp/chosen.csv");
+        assert_eq!(
+            CoordApp::reports_export_destination(Some(dest.clone()), "gtk", "suggested.csv"),
+            crate::app::reports::ReportExportDest::Path(dest),
+        );
+    }
+
+    #[test]
+    fn reports_export_destination_is_cancelled_when_a_real_dialog_says_no() {
+        // A backend that can actually ask (GTK/macOS) returning `None` means
+        // the operator cancelled: nothing written, and — per the acceptance
+        // criteria — nothing reported as an error.
+        assert_eq!(
+            CoordApp::reports_export_destination(None, "gtk", "suggested.csv"),
+            crate::app::reports::ReportExportDest::Cancelled,
+        );
+    }
+
+    #[test]
+    fn reports_export_destination_falls_back_to_home_on_the_tui_backend() {
+        // quadraui's TUI `show_file_save_dialog` is a documented no-op that
+        // always returns `None`. Treating that as "cancelled" would make
+        // Export permanently dead in the one binary this panel ships in, so
+        // the TUI writes the suggested name into $HOME instead — and the
+        // caller reports the full path.
+        let dest = CoordApp::reports_export_destination(None, "tui", "issue-activity-1.csv");
+        match dest {
+            crate::app::reports::ReportExportDest::Path(p) => {
+                assert_eq!(p.file_name().unwrap(), "issue-activity-1.csv");
+                assert!(p.is_absolute(), "the reported path must be unambiguous");
+            }
+            crate::app::reports::ReportExportDest::Cancelled => {
+                panic!("#1765: the TUI backend cannot ask, so it must not report a cancel")
+            }
+        }
+    }
+
+    #[test]
+    fn reports_suggested_export_name_is_stamped_from_the_result_not_the_clock() {
+        let result: crate::app::types::ReportResult = serde_json::from_str(
+            r#"{"report_id": "issue-activity", "generated_at": 0,
+                 "window": [1785694800.0, 1785780900.0],
+                 "columns": [], "rows": [], "notes": []}"#,
+        )
+        .expect("fixture must parse");
+        let name = CoordApp::reports_suggested_export_name(&result);
+        // 1785780900 = 2026-08-03 18:15:00Z (cross-checked against Python's
+        // `datetime.fromtimestamp(..., utc).strftime("%Y%m%d-%H%M")`, which
+        // is what `coord.reports.csv_filename` uses). The stamp is the
+        // *window end*,
+        // so the same result always suggests the same filename — and it
+        // matches the `Content-Disposition` name the daemon offers.
+        assert_eq!(name, "issue-activity-20260803-1815.csv");
+    }
+
+    /// End-to-end: the export goes back to the **daemon** for its CSV
+    /// (`?format=csv`) and writes those bytes verbatim.
+    ///
+    /// That round trip is the entire point of #1765 — the panel already
+    /// holds the `ReportResult`, but its cells are display strings rendered
+    /// through `column_meta` (`13h ago`, `dellserver, precision`), so a
+    /// client-side CSV would export the formatting instead of the data.
+    #[test]
+    fn reports_export_writes_the_daemons_csv_verbatim() {
+        const CSV: &str = "# report: issue-activity\n# rows: 1\nRepo,Issue\napi,1631\n";
+
+        let mock = MockBoardService::start(CSV);
+        let _guard = set_test_board_service(mock.url(), None);
+
+        let dir = std::env::temp_dir().join(format!(
+            "coord-tui-export-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let dest = dir.join("out.csv");
+
+        let mut app = make_app_with_reports(
+            BoardData::default(),
+            reports_catalogue_json(),
+            Some(&reports_result_json()),
+        );
+        app.reports_start_export("issue-activity", dest.clone());
+
+        let rx = app
+            .reports_export_rx
+            .take()
+            .expect("an export must be in flight");
+        match rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the export must deliver an outcome before the timeout")
+        {
+            ReportExportOutcome::Written { path, bytes } => {
+                assert_eq!(path, dest);
+                assert_eq!(bytes, CSV.len());
+            }
+            ReportExportOutcome::NoBoardService => {
+                panic!("#1765: the mock board service must be reached")
+            }
+            ReportExportOutcome::Failed(reason) => panic!("#1765: export failed: {reason}"),
+        }
+
+        let written = std::fs::read_to_string(&dest).expect("the CSV must land on disk");
+        assert_eq!(
+            written, CSV,
+            "#1765: the daemon's bytes are written verbatim — no client-side \
+             re-formatting"
+        );
+
+        let requests = mock.requests();
+        assert!(
+            requests.iter().any(|r| r.contains("format=csv")),
+            "#1765: the export must ask the daemon for CSV rather than \
+             serialising the panel's display strings: {requests:?}"
+        );
+        assert!(
+            requests.iter().any(|r| r.contains("/report/issue-activity")),
+            "#1765: ...from that report's own route: {requests:?}"
+        );
+        // The form's parameters ride along, so the exported window is the
+        // one the panel is showing.
+        assert!(
+            requests.iter().any(|r| r.contains("since=24h")),
+            "#1765: the catalogue's parameters must be sent with the export: \
+             {requests:?}"
+        );
+
+        let _ = std::fs::remove_file(&dest);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn reports_export_with_no_board_service_reports_a_visible_failure() {
+        // A failed write/fetch must surface, never fail silently. In the
+        // test binary `resolve_board_service` is absent by construction, so
+        // this is the "the daemon isn't there" path.
+        let mut app = make_app_with_reports(
+            BoardData::default(),
+            reports_catalogue_json(),
+            Some(&reports_result_json()),
+        );
+        app.reports_start_export("issue-activity", std::env::temp_dir().join("never.csv"));
+        let rx = app.reports_export_rx.take().expect("rx must be armed");
+        assert!(matches!(
+            rx.recv_timeout(std::time::Duration::from_secs(5)),
+            Ok(ReportExportOutcome::NoBoardService)
+        ));
+        assert!(
+            !std::env::temp_dir().join("never.csv").exists(),
+            "#1765: a failed export must not leave a file behind"
+        );
+    }
+
+    #[test]
+    fn reports_export_request_is_ignored_for_a_report_with_no_result() {
+        // Defence in depth behind the disabled action: even if a click did
+        // reach the handler, a report with no result arms nothing.
+        let mut app = make_app_with_reports(BoardData::default(), reports_catalogue_json(), None);
+        assert!(!app.reports_request_export(0));
+        assert!(app.reports_pending_export.is_none());
+    }

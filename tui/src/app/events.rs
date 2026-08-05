@@ -1075,6 +1075,12 @@ impl CoordApp {
 
         // ── Mouse / scroll dispatch (before consuming the event) ─────────────
         needs_redraw |= self.handle_mouse(&event, backend, ctx);
+        // #1765: a Reports Export click parks its request in
+        // `reports_pending_export` because the click path has no `Backend`
+        // and `show_file_save_dialog` needs one. Drain it here, in the same
+        // turn as the click that made it, so the dialog opens immediately
+        // rather than on the next unrelated event.
+        needs_redraw |= self.reports_drain_pending_export(backend);
         // A mouse click on the force-quit dialog's confirm button sets this
         // (the click path can't return Reaction::Exit itself).
         if self.quit_requested {
@@ -5591,9 +5597,25 @@ impl CoordApp {
                     | Some(DataTableHit::Empty)
                     | None => false,
                 },
-                // The current sections carry no header actions; a future
-                // consumer (or a later Reports slice) routes them here.
-                MsvClick::HeaderAction { .. } | MsvClick::Inert => false,
+                // #1765: the one header action a report section carries is
+                // Export. Routed by action id, never by position — a second
+                // action added later must not silently inherit this arm.
+                //
+                // Only the *request* is recorded here: the save dialog needs
+                // a `Backend` and this function has none, so
+                // `dispatch_handle` drains it (with the backend in scope)
+                // immediately after this returns. A disabled Export never
+                // reaches this arm at all — quadraui reserves no hit region
+                // for a disabled action, so the click falls through to
+                // `HeaderHit::TitleArea` and toggles the section instead.
+                MsvClick::HeaderAction { section, action } => {
+                    if action == CoordApp::REPORTS_EXPORT_ACTION {
+                        self.reports_request_export(section)
+                    } else {
+                        false
+                    }
+                }
+                MsvClick::Inert => false,
             };
         }
         false

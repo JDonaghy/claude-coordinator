@@ -655,6 +655,76 @@ pub(crate) fn spawn_report_run(
     rx
 }
 
+/// Outcome of one CSV export (#1765): fetch `?format=csv`, write the bytes.
+pub(crate) enum ReportExportOutcome {
+    /// Written. Carries the destination and the byte count, both of which
+    /// the panel shows — "saved" with no path is barely better than silence.
+    Written { path: std::path::PathBuf, bytes: usize },
+    NoBoardService,
+    /// The fetch failed, or the write did. Both are reported the same way
+    /// (a visible message in the notes area) because both mean "there is no
+    /// file where you asked for one".
+    Failed(String),
+}
+
+/// Fetch one report as CSV and write it to `dest` (#1765).
+///
+/// The CSV is produced **server-side** — this asks the daemon for
+/// `?format=csv` rather than formatting the `ReportResult` the panel already
+/// holds. That is the whole point of the feature: the panel's cells are
+/// display strings (`13h ago`, `dellserver, precision`) rendered through
+/// `column_meta`, so a client-side CSV would export the formatting instead
+/// of the data, and its contents would depend on when Export was clicked.
+/// Going back to the server also keeps these bytes identical to
+/// `coord report run --format csv`.
+///
+/// Note the params are the ones sent to `/report/{id}`, not the ones that
+/// produced the on-screen result: a re-fetch re-runs the report, so the
+/// exported window is the one currently in the form. `reports_start_export`
+/// only arms this for a report that has already been run, so the two agree
+/// unless the operator edited a parameter without re-running.
+pub(crate) fn spawn_report_export(
+    report_id: &str,
+    params: Vec<(String, String)>,
+    dest: std::path::PathBuf,
+) -> std::sync::mpsc::Receiver<ReportExportOutcome> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let Some((url, token)) = resolve_board_service() else {
+        let _ = tx.send(ReportExportOutcome::NoBoardService);
+        return rx;
+    };
+    let report_id = report_id.to_string();
+    std::thread::spawn(move || {
+        let mut req = report_agent(30).get(&format!("{url}/report/{report_id}"));
+        for (key, value) in &params {
+            if !value.is_empty() {
+                req = req.query(key, value);
+            }
+        }
+        req = req.query("format", "csv");
+        if let Some(t) = &token {
+            req = req.set("Authorization", &format!("Bearer {t}"));
+        }
+        let outcome = match req.call() {
+            Ok(resp) => match resp.into_string() {
+                Ok(body) => match std::fs::write(&dest, body.as_bytes()) {
+                    Ok(()) => ReportExportOutcome::Written {
+                        path: dest,
+                        bytes: body.len(),
+                    },
+                    Err(e) => {
+                        ReportExportOutcome::Failed(format!("write {}: {e}", dest.display()))
+                    }
+                },
+                Err(e) => ReportExportOutcome::Failed(e.to_string()),
+            },
+            Err(e) => ReportExportOutcome::Failed(report_http_error(e)),
+        };
+        let _ = tx.send(outcome);
+    });
+    rx
+}
+
 /// #315: signal that `spawn_inject_post` sends to the main thread when
 /// the /inject POST returns HTTP 409 ("assignment is `done`") or 410
 /// (BrokenPipeError — worker stdin closed).  Both mean the worker exited
