@@ -5,17 +5,68 @@
 #   ./build-worker-image.sh --rg rg-coord-images --gallery sigcoord [--seed-cargo-target]
 #
 # Produces:  /subscriptions/.../galleries/<gallery>/images/coord-worker/versions/<YYYY.MMDD.N>
-# which is the `sourceImageId` the per-epic Bicep module deploys from.
+# which is the `sourceImageId` the per-epic Bicep module deploys from. By
+# default this script also WRITES that ID into $EPIC_ENV (default
+# ~/.coord/epic.env) so the very next epic-up.sh picks it up with no manual
+# edit (#1800) -- pass --no-update-env to publish without adopting, e.g. to
+# bake a version you want to test before pointing epic-up.sh at it.
 #
 # The builder is throwaway and short-lived, so it gets a public IP with SSH
 # locked to your current egress address. Worker VMs never do -- they are
 # no-public-IP + NAT Gateway, reachable only over the tailnet.
 set -euo pipefail
 
+log() { printf '\n\033[1m=== %s ===\033[0m\n' "$*"; }
+
+# Rewrite (or append) SOURCE_IMAGE_ID=$image_id in $EPIC_ENV so the next
+# epic-up.sh deploys from the version this run just published, instead of
+# silently redeploying whatever was pinned before (#1800). Kept as a
+# standalone function, called from main(), so it can be exercised directly
+# under pytest without touching az/ssh -- see
+# tests/test_build_worker_image_env_update.py.
+update_epic_env() {
+    local version="$1" image_id="$2"
+
+    if (( ! UPDATE_ENV )); then
+        log "--no-update-env: leaving $EPIC_ENV untouched"
+        echo "  Adopt it by hand when ready:  SOURCE_IMAGE_ID=$image_id"
+        return 0
+    fi
+
+    if [[ ! -f "$EPIC_ENV" ]]; then
+        echo "  note: $EPIC_ENV does not exist yet -- not auto-updating." >&2
+        echo "  Create it from bootstrap-shared.sh output, then set:" >&2
+        echo "    SOURCE_IMAGE_ID=$image_id" >&2
+        return 0
+    fi
+
+    cp -p "$EPIC_ENV" "${EPIC_ENV}.bak"
+
+    local tmp
+    tmp="$(mktemp "${EPIC_ENV}.XXXXXX")"
+    if grep -q '^SOURCE_IMAGE_ID=' "$EPIC_ENV"; then
+        sed "s|^SOURCE_IMAGE_ID=.*|SOURCE_IMAGE_ID=$image_id|" "$EPIC_ENV" > "$tmp"
+    else
+        cp "$EPIC_ENV" "$tmp"
+        printf 'SOURCE_IMAGE_ID=%s\n' "$image_id" >> "$tmp"
+    fi
+    chmod --reference="$EPIC_ENV" "$tmp"
+    mv "$tmp" "$EPIC_ENV"
+
+    log "$EPIC_ENV updated"
+    echo "  SOURCE_IMAGE_ID=$image_id"
+    echo "  (previous contents backed up to ${EPIC_ENV}.bak)"
+}
+
+main() {
 RG=""; GALLERY=""; LOCATION="eastus"; IMAGE_DEF="coord-worker"
 VM_SIZE="Standard_D8as_v7"; OS_DISK_GB=128; ADMIN_USER="azureuser"
 PROVISION_ARGS=""
 BUILDER="coord-img-builder-$$"
+# Subscription-specific IDs live outside the repo -- same file and override
+# convention as epic-up.sh/epic-down.sh.
+EPIC_ENV="${EPIC_ENV:-$HOME/.coord/epic.env}"
+UPDATE_ENV=1
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -26,13 +77,13 @@ while [[ $# -gt 0 ]]; do
         --seed-cargo-target) PROVISION_ARGS+=" --seed-cargo-target"; OS_DISK_GB=256; shift ;;
         --with-gtk)          PROVISION_ARGS+=" --with-gtk"; shift ;;
         --with-browser)      PROVISION_ARGS+=" --with-browser"; shift ;;
+        --no-update-env)     UPDATE_ENV=0; shift ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
 [[ -n "$RG" && -n "$GALLERY" ]] || { echo "usage: $0 --rg <rg> --gallery <gallery>" >&2; exit 2; }
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-log() { printf '\n\033[1m=== %s ===\033[0m\n' "$*"; }
 
 cleanup() {
     if [[ "${KEEP_BUILDER:-0}" == "1" ]]; then
@@ -174,14 +225,19 @@ IMAGE_ID="$(az sig image-version show -g "$RG" --gallery-name "$GALLERY" \
 
 # --------------------------------------------------------------------------
 log "6/6  done"
+update_epic_env "$VERSION" "$IMAGE_ID"
 cat <<EOF
 
   Image version: $VERSION
   sourceImageId: $IMAGE_ID
 
-  Feed that into the coord-worker-vm Bicep module's sourceImageId param.
   Rebuild when: a coord release lands (agent-side changes need a fresh venv),
   the Claude Code CLI updates, or the crate cache goes stale enough that the
   first build re-fetches most of the registry.
 
 EOF
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
