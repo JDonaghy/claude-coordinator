@@ -884,6 +884,14 @@ class SmokeVerdictStatus:
     row is pinned at the transient ``test_state="running"`` marker (#1395)
     with no Test worker left alive to resolve it. That is an *abandoned*
     verdict, not an absent one — see :data:`RUNNING_MARKER_STALE_AFTER`.
+
+    ``spared_reason`` is the mirror image, set only on a passing (``ok``)
+    verdict when the merge base *did* move but one of the #1479 escape
+    hatches proved the move couldn't have invalidated the verdict — #1738
+    (base move inert), #1778 (branch inert), or #1847 (base move and branch
+    touch disjoint files). ``None`` whenever the base didn't move at all, so
+    the common unremarkable-fresh case stays silent. See
+    :func:`_base_move_spared` for the three wordings.
     """
 
     ok: bool
@@ -892,6 +900,7 @@ class SmokeVerdictStatus:
     anchor: str | None = None  # "base" | "branch" | "run" (SMOKE_STALE only)
     recorded_sha: str | None = None
     current_sha: str | None = None
+    spared_reason: str | None = None  # set only on `ok=True` after a base move (#1847)
 
     @property
     def short_reason(self) -> str | None:
@@ -1025,6 +1034,60 @@ def _path_is_inert(path: str) -> bool:
     return "/" not in path and path.endswith(".md")
 
 
+def _fetch_compare_files(
+    gh_ops: "GhOps | None",
+    repo_github: str | None,
+    base_sha: str | None,
+    head_sha: str | None,
+) -> list[str] | None:
+    """Fetch the file list for one ``get_compare_files(base_sha, head_sha)``
+    compare, failing closed to ``None`` (never raising) whenever the answer
+    can't be established: no *gh_ops*/*repo_github* to ask, a missing SHA on
+    either side, the call raising, or it returning ``None`` (unreadable)
+    itself.
+
+    The single I/O seam behind :func:`_base_move_is_inert`,
+    :func:`_branch_is_inert`, and (#1847) :func:`_base_move_disjoint_from_branch`
+    — all three ultimately ask "what files does this compare touch" of one of
+    the same two compares (``test_base_sha..current_base_sha`` or
+    ``test_base_sha..test_head_sha``), so :func:`_base_move_spared` fetches
+    each side through here at most once and shares the result across every
+    predicate that consults it, rather than each predicate fetching its own
+    copy.
+
+    Note: :class:`coord.gate_snapshot.GateSnapshot` (the ``/board`` display
+    path's ``gh_ops`` stand-in) does not yet cache ``get_compare_files``, so a
+    plain ``AttributeError`` lands here and this fails closed exactly as it
+    does for a genuine lookup failure — the display can show STALE for a
+    base move that a live ``coord merge``/``coord drive`` (real
+    ``coord.github_ops``) correctly treats as fresh. That's the safe
+    direction of disagreement (pessimistic display, correct live gate) —
+    the opposite of the #1640 incident — but wiring this cache through
+    :class:`~coord.gate_snapshot.GateSnapshotRefresher` would close it too.
+    """
+    if gh_ops is None or not repo_github or not base_sha or not head_sha:
+        return None
+    try:
+        return gh_ops.get_compare_files(repo_github, base_sha, head_sha)
+    except Exception:  # noqa: BLE001 — fail-safe: unknown diff is not "inert"/disjoint
+        return None
+
+
+def _files_are_inert(files: list[str] | None) -> bool:
+    """True when *files* — an already-fetched compare file list — is
+    non-``None`` and every entry passes :func:`_path_is_inert`.
+
+    ``None`` (an unreadable compare) fails closed to ``False``. Factored out
+    of :func:`_base_move_is_inert`/:func:`_branch_is_inert` (#1847) so the
+    same predicate can run against a list :func:`_base_move_spared` fetched
+    once, instead of each of the three #1479 escape hatches fetching (and
+    re-checking) its own copy.
+    """
+    if files is None:
+        return False
+    return all(_path_is_inert(f) for f in files)
+
+
 def _base_move_is_inert(
     gh_ops: "GhOps | None", repo_github: str | None, old_sha: str, new_sha: str
 ) -> bool:
@@ -1038,25 +1101,13 @@ def _base_move_is_inert(
     empty-but-unconfirmed. The bar set by #1738 is "bias hard toward staling":
     a false "fresh" merges untested code; a false "stale" only costs a re-run.
 
-    Note: :class:`coord.gate_snapshot.GateSnapshot` (the ``/board`` display
-    path's ``gh_ops`` stand-in) does not yet cache ``get_compare_files``, so a
-    plain ``AttributeError`` lands here and this fails closed exactly as it
-    does for a genuine lookup failure — the display can show STALE for a
-    base move that a live ``coord merge``/``coord drive`` (real
-    ``coord.github_ops``) correctly treats as fresh. That's the safe
-    direction of disagreement (pessimistic display, correct live gate) —
-    the opposite of the #1640 incident — but wiring this cache through
-    :class:`~coord.gate_snapshot.GateSnapshotRefresher` would close it too.
+    Thin composition of :func:`_fetch_compare_files` + :func:`_files_are_inert`
+    — kept as its own function (rather than inlined at the one call site) so
+    it stays independently testable and so :func:`_base_move_spared`'s
+    single-fetch orchestration reads as "the same predicates, sharing one
+    fetch" rather than a parallel implementation.
     """
-    if gh_ops is None or not repo_github:
-        return False
-    try:
-        files = gh_ops.get_compare_files(repo_github, old_sha, new_sha)
-    except Exception:  # noqa: BLE001 — fail-safe: unknown diff is not "inert"
-        return False
-    if files is None:
-        return False
-    return all(_path_is_inert(f) for f in files)
+    return _files_are_inert(_fetch_compare_files(gh_ops, repo_github, old_sha, new_sha))
 
 
 def _branch_is_inert(
@@ -1074,12 +1125,12 @@ def _branch_is_inert(
     This is the mirror of :func:`_base_move_is_inert`: that function asks
     "did the base move through anything that matters"; this one asks "does
     the branch touch anything that matters", independent of whether the base
-    moved at all. The two are consulted together at the base-move staling
-    check (#1479) — either one being true is enough to skip staling on a
-    base move alone. Neither check replaces the separate branch-*content*-
-    changed check (patch-id comparison) that follows: a branch that is
-    inert today and later gains a `coord/**` commit is caught by that check,
-    not this one.
+    moved at all. The three are consulted together at the base-move staling
+    check (#1479/#1847) by :func:`_base_move_spared` — any one being true is
+    enough to skip staling on a base move alone. None of the three replace
+    the separate branch-*content*-changed check (patch-id comparison) that
+    follows: a branch that is inert today and later gains a `coord/**`
+    commit is caught by that check, not this one.
 
     Fails closed exactly like :func:`_base_move_is_inert` — returns
     ``False`` ("not proven inert, stale as before") whenever inertness can't
@@ -1093,15 +1144,86 @@ def _branch_is_inert(
     runner could point at the `scripts/` allowlist and declare its own diff
     untestable, skipping the gate it is trying to evade.
     """
-    if gh_ops is None or not repo_github or not base_sha or not branch_sha:
+    return _files_are_inert(
+        _fetch_compare_files(gh_ops, repo_github, base_sha, branch_sha)
+    )
+
+
+def _base_move_disjoint_from_branch(
+    base_files: list[str] | None, branch_files: list[str] | None
+) -> bool:
+    """True when the files the base moved through and the files the branch
+    touches share no path (#1847) — the third #1479 base-move escape hatch,
+    alongside :func:`_base_move_is_inert` and :func:`_branch_is_inert`.
+
+    Those two are allowlist-based: each asks "is this one diff inert on its
+    own". This asks a different, cheaper-to-satisfy question — "do these two
+    diffs have anything to do with each other" — which is the shape that
+    actually costs a human intervention on a queue drain: a substantive base
+    move and a substantive branch that simply never touch the same file.
+
+    Fails closed to ``False`` when either list is ``None`` (an unreadable
+    compare on either side), matching the fail-closed posture of the other
+    two checks: a false "disjoint" would let an untested base/branch
+    combination merge; a false "overlapping" only costs a redundant re-run.
+
+    File-level disjointness is *not* semantic independence — a base change
+    to one module can still break a branch that never names it (there is no
+    compiler to catch a moved signature at this granularity, and a shared
+    `conftest.py` fixture makes it worse). Two things bound that risk enough
+    to accept it here rather than requiring semantic analysis:
+
+    * CI already tests the *composite*. `.github/workflows/test.yml` runs
+      pytest and `.github/workflows/cargo-test.yml` runs cargo test on every
+      `pull_request` push, built against branch-merged-into-base, and
+      `coord merge` gates on those checks independently via
+      `coord.ci_store.CiStore` — the local Test verdict this function spares
+      is substantially re-deriving what CI already proves.
+    * GitHub does not re-run PR workflows when only the *base* moves (only
+      on head `synchronize`), which is a real gap — but it is the SAME gap
+      `_base_move_is_inert`/`_branch_is_inert` already accept for their own
+      allowlisted content, not a new one this check introduces. Closing it
+      (re-running CI on a base move) is out of scope here.
+    """
+    if base_files is None or branch_files is None:
         return False
-    try:
-        files = gh_ops.get_compare_files(repo_github, base_sha, branch_sha)
-    except Exception:  # noqa: BLE001 — fail-safe: unknown diff is not "inert"
-        return False
-    if files is None:
-        return False
-    return all(_path_is_inert(f) for f in files)
+    return set(base_files).isdisjoint(branch_files)
+
+
+def _base_move_spared(
+    gh_ops: "GhOps | None",
+    repo_github: str | None,
+    test_base_sha: str,
+    current_base_sha: str,
+    test_head_sha: str | None,
+) -> tuple[bool, str | None]:
+    """Whether a moved base still spares a `passed` verdict recorded against
+    *test_base_sha*, and — when it does — why.
+
+    Tries the three #1479 escape hatches in order, stopping at the first
+    that fires: #1738 (:func:`_base_move_is_inert`), #1778
+    (:func:`_branch_is_inert`), #1847 (:func:`_base_move_disjoint_from_branch`).
+    Ordered cheapest-first and fetch-sharing on purpose: the base-move file
+    list is fetched once and checked for #1738 before the branch file list is
+    fetched at all; the branch file list, once fetched for #1778, is reused
+    for #1847 rather than re-fetched. At most two `get_compare_files` calls
+    total per invocation, regardless of which disjunct fires or whether none
+    do — same worst case as the pre-#1847 `_base_move_is_inert(...) or
+    _branch_is_inert(...)` this replaces at the call site.
+    """
+    base_files = _fetch_compare_files(
+        gh_ops, repo_github, test_base_sha, current_base_sha
+    )
+    if _files_are_inert(base_files):
+        return True, "base move touches only inert paths (#1738)"
+    branch_files = _fetch_compare_files(
+        gh_ops, repo_github, test_base_sha, test_head_sha
+    )
+    if _files_are_inert(branch_files):
+        return True, "branch touches only inert paths (#1778)"
+    if _base_move_disjoint_from_branch(base_files, branch_files):
+        return True, "base move and branch touch disjoint files (#1847)"
+    return False, None
 
 
 def has_smoke_verdict(
@@ -1336,49 +1458,45 @@ def evaluate_smoke_verdict(
             except Exception:  # noqa: BLE001 — fail-safe: unknown SHA is not blocking
                 current_base_sha = None
             base_sha_attempted = True
+
+        # #1738/#1778/#1847: the base moved, but a moved SHA doesn't
+        # necessarily mean a content change that could affect a test result.
+        # `_base_move_spared` tries, in order: is the base move itself
+        # provably inert content (docs/scripts/issue-template only, #1738);
+        # failing that, is *this branch*'s entire diff (as actually tested,
+        # test_base_sha..test_head_sha) provably inert (#1778); failing that,
+        # do the two diffs simply touch disjoint files (#1847) — a
+        # substantive base move and a substantive branch that have nothing to
+        # do with each other. Any one being true means the tested combination
+        # is still covered — fall through to the branch-content check below
+        # instead of staling here. If the branch has since gained real
+        # content, that check still catches it independently via the
+        # patch-id compare (#1847 doesn't short-circuit it).
+        base_move_spare_reason: str | None = None
         if (
             test_base_sha is not None
             and current_base_sha is not None
             and test_base_sha != current_base_sha
-            # #1738: the base moved, but a moved SHA doesn't necessarily mean
-            # a content change that could affect a test result — same
-            # reasoning the branch-side check below already applies via
-            # patch-id, just answered here by "what files actually moved"
-            # instead of "is the diff byte-identical". A base move whose
-            # entire diff is docs/scripts/issue-template content is provably
-            # inert and does not invalidate the verdict — fall through to the
-            # branch-content check below instead of staling here.
-            #
-            # #1778: the mirror case — the base move might be substantive,
-            # but if *this branch*'s entire diff is inert content, the suite
-            # can't tell the two SHAs apart either way. Checked against the
-            # branch as it was actually tested (test_base_sha..test_head_sha)
-            # so this doesn't depend on the branch-content check below having
-            # run yet; if the branch has since gained real content, that
-            # check still catches it independently via the patch-id compare.
-            and not (
-                _base_move_is_inert(
-                    gh_ops, repo_github, test_base_sha, current_base_sha
-                )
-                or _branch_is_inert(
-                    gh_ops,
-                    repo_github,
-                    test_base_sha,
-                    getattr(a, "test_head_sha", None),
-                )
-            )
         ):
-            # stale: re-verify against the new base
-            if stale is None:
-                stale = SmokeVerdictStatus(
-                    ok=False,
-                    kind=SMOKE_STALE,
-                    assignment_id=getattr(a, "assignment_id", None),
-                    anchor="base",
-                    recorded_sha=test_base_sha,
-                    current_sha=current_base_sha,
-                )
-            continue
+            spared, base_move_spare_reason = _base_move_spared(
+                gh_ops,
+                repo_github,
+                test_base_sha,
+                current_base_sha,
+                getattr(a, "test_head_sha", None),
+            )
+            if not spared:
+                # stale: re-verify against the new base
+                if stale is None:
+                    stale = SmokeVerdictStatus(
+                        ok=False,
+                        kind=SMOKE_STALE,
+                        assignment_id=getattr(a, "assignment_id", None),
+                        anchor="base",
+                        recorded_sha=test_base_sha,
+                        current_sha=current_base_sha,
+                    )
+                continue
 
         # Branch content changed since the test ran. Same SHA-then-patch-id
         # fallback as has_approved_review: a content-identical rebase (SHA
@@ -1429,7 +1547,10 @@ def evaluate_smoke_verdict(
                 continue
 
         return SmokeVerdictStatus(
-            ok=True, kind=SMOKE_OK, assignment_id=getattr(a, "assignment_id", None)
+            ok=True,
+            kind=SMOKE_OK,
+            assignment_id=getattr(a, "assignment_id", None),
+            spared_reason=base_move_spare_reason,
         )
 
     if stale is not None:
@@ -1728,6 +1849,12 @@ class GhOps(Protocol):
         #1778: also used by :func:`_branch_is_inert`, the mirror check — is
         the *branch's* own diff (not the base move) entirely inert, so a
         base move (however substantive) doesn't need to re-verify it either.
+
+        #1847: both file lists (fetched once each, via
+        :func:`_fetch_compare_files`) also feed
+        :func:`_base_move_disjoint_from_branch` — the third #1479 escape
+        hatch, sparing a verdict when the two diffs simply touch no files in
+        common, independent of either being inert on its own.
         """
         ...
 
@@ -3215,6 +3342,7 @@ def process(
                 # #1640: when a verdict exists but failed the #1479 freshness
                 # binding, say so (and against which SHA) rather than
                 # reporting it as never recorded.
+                _smoke = None  # read below for the "merged" preview note (#1847)
                 if (
                     not skip_smoke
                     and config is not None
@@ -3298,12 +3426,25 @@ def process(
                                 "rebase-merged — would fall back to --squash "
                                 "(#1467)",
                             ))
+                # #1847: name *why* a base move didn't stale the smoke
+                # verdict, distinctly for each of the three #1479 escape
+                # hatches, so `--dry-run`/the TUI don't just say "fresh" —
+                # they say fresh *because the base move was inert*, *because
+                # the branch was inert*, or *because the two diffs are
+                # disjoint*. Absent whenever the base never moved at all
+                # (the common, unremarkable case stays quiet).
+                _smoke_note = (
+                    f" [test verdict fresh: {_smoke.spared_reason}]"
+                    if _smoke is not None and _smoke.ok and _smoke.spared_reason
+                    else ""
+                )
                 events.append(MergeEvent(
                     entry, "merged",
                     f"(dry run) would merge {entry.branch} → {entry.target_branch} "
                     f"via --{_preview_method}"
                     f"{_bypass_note(entry, config)}"
-                    f"{_ci_note}",
+                    f"{_ci_note}"
+                    f"{_smoke_note}",
                 ))
             continue
 

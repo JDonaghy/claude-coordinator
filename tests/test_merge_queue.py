@@ -5326,6 +5326,12 @@ class TestStaleSmokeVerdictReporting:
         # always asks for `head == branch_sha`, the base-move check for
         # whatever the current base SHA is.
         branch_compare_files: list[str] | None = None
+        # #1847: every (base, head) pair passed to `get_compare_files`, in
+        # call order — lets a test assert the fetch-once-per-side budget
+        # (`_base_move_spared` must call this at most twice, regardless of
+        # which #1479 escape hatch fires) without changing what the fake
+        # returns.
+        compare_files_calls: list[tuple[str, str]] = field(default_factory=list)
 
         def get_branch_sha(self, repo: str, branch: str) -> str | None:
             return self.base_sha if branch == "main" else self.branch_sha
@@ -5334,6 +5340,7 @@ class TestStaleSmokeVerdictReporting:
             return "patch-1"
 
         def get_compare_files(self, repo: str, base: str, head: str) -> list[str] | None:
+            self.compare_files_calls.append((base, head))
             if head == self.branch_sha:
                 return self.branch_compare_files
             return self.compare_files
@@ -5815,12 +5822,16 @@ class TestStaleSmokeVerdictReporting:
         assert verdict.anchor == "base"
 
     def test_branch_touching_tests_dir_stays_stale_on_base_move(self) -> None:
+        """The branch's own diff also touches the base-moved file — #1847's
+        disjointness escape hatch must not fire on an *overlapping* pair, so
+        this is deliberately not disjoint from `compare_files` (that shape is
+        covered separately by the #1847 tests below)."""
         board = self._board(completed=[self._tested_work()])
         entry = _q("w1", target="main")
         entry.target_branch_head_sha = "base-new"
         gh = self._Gh(
             compare_files=["coord/merge_queue.py"],
-            branch_compare_files=["tests/test_merge_queue.py"],
+            branch_compare_files=["coord/merge_queue.py", "tests/test_merge_queue.py"],
         )
 
         verdict = mq.evaluate_smoke_verdict(entry, board, gh)
@@ -5829,12 +5840,14 @@ class TestStaleSmokeVerdictReporting:
         assert verdict.kind == mq.SMOKE_STALE
 
     def test_branch_touching_tui_stays_stale_on_base_move(self) -> None:
+        """Overlapping with the base move (see the docstring above) — #1847
+        must not spare a branch that shares a file with the base's diff."""
         board = self._board(completed=[self._tested_work()])
         entry = _q("w1", target="main")
         entry.target_branch_head_sha = "base-new"
         gh = self._Gh(
             compare_files=["coord/merge_queue.py"],
-            branch_compare_files=["tui/app.py"],
+            branch_compare_files=["coord/merge_queue.py", "tui/app.py"],
         )
 
         verdict = mq.evaluate_smoke_verdict(entry, board, gh)
@@ -5843,12 +5856,14 @@ class TestStaleSmokeVerdictReporting:
         assert verdict.kind == mq.SMOKE_STALE
 
     def test_branch_touching_pyproject_stays_stale_on_base_move(self) -> None:
+        """Overlapping with the base move (see the docstring above) — #1847
+        must not spare a branch that shares a file with the base's diff."""
         board = self._board(completed=[self._tested_work()])
         entry = _q("w1", target="main")
         entry.target_branch_head_sha = "base-new"
         gh = self._Gh(
             compare_files=["coord/merge_queue.py"],
-            branch_compare_files=["pyproject.toml"],
+            branch_compare_files=["coord/merge_queue.py", "pyproject.toml"],
         )
 
         verdict = mq.evaluate_smoke_verdict(entry, board, gh)
@@ -5859,13 +5874,18 @@ class TestStaleSmokeVerdictReporting:
     def test_branch_editing_the_test_runner_is_not_inert(self) -> None:
         """The self-certification hole: a branch cannot point at the
         `scripts/` allowlist to declare its own edit of the composed test
-        runner inert and skip its gate."""
+        runner inert and skip its gate. Overlapping with the base move (see
+        the docstring above `test_branch_touching_tui_stays_stale_on_base_move`)
+        so #1847's disjointness hatch can't spare it either — the point of
+        this test is the deny-list, not disjointness."""
         board = self._board(completed=[self._tested_work()])
         entry = _q("w1", target="main")
         entry.target_branch_head_sha = "base-new"
         gh = self._Gh(
             compare_files=["coord/merge_queue.py"],
-            branch_compare_files=["scripts/coord-test-runner.sh"],
+            branch_compare_files=[
+                "coord/merge_queue.py", "scripts/coord-test-runner.sh",
+            ],
         )
 
         verdict = mq.evaluate_smoke_verdict(entry, board, gh)
@@ -5972,6 +5992,230 @@ class TestStaleSmokeVerdictReporting:
         blocked = [e for e in events if e.kind == "smoke_required"]
         assert len(blocked) == 1
         assert "stale" in blocked[0].message
+
+    # ── #1847: disjoint base-move and branch file sets ─────────────────────
+    #
+    # #1738 and #1778 are both allowlist-based: "is this one diff inert on
+    # its own". Neither helps the common case that actually costs a human
+    # intervention on a queue drain — a substantive base move and a
+    # substantive branch that simply have nothing to do with each other. This
+    # third escape hatch asks that question directly: do the two file sets
+    # intersect at all.
+
+    def test_disjoint_base_move_and_branch_spares_the_verdict(self) -> None:
+        """The issue's acceptance case 1: base move touches `coord/state.py`,
+        branch touches `tui/src/app/render.rs` — no overlap, neither side is
+        on the #1738/#1778 allowlist, and the verdict still survives."""
+        board = self._board(completed=[self._tested_work()])
+        entry = _q("w1", target="main")
+        entry.target_branch_head_sha = "base-new"
+        gh = self._Gh(
+            compare_files=["coord/state.py"],
+            branch_compare_files=["tui/src/app/render.rs"],
+        )
+
+        verdict = mq.evaluate_smoke_verdict(entry, board, gh)
+
+        assert verdict.ok is True
+        assert verdict.kind == mq.SMOKE_OK
+        assert verdict.spared_reason == (
+            "base move and branch touch disjoint files (#1847)"
+        )
+
+    def test_overlapping_base_move_and_branch_stays_stale(self) -> None:
+        """The issue's acceptance case 2: base move touches
+        `coord/state.py`, branch touches `coord/state.py` and
+        `coord/drive.py` — the shared file means the two diffs are NOT
+        disjoint, so #1847 does not apply and the verdict stales exactly as
+        today."""
+        board = self._board(completed=[self._tested_work()])
+        entry = _q("w1", target="main")
+        entry.target_branch_head_sha = "base-new"
+        gh = self._Gh(
+            compare_files=["coord/state.py"],
+            branch_compare_files=["coord/state.py", "coord/drive.py"],
+        )
+
+        verdict = mq.evaluate_smoke_verdict(entry, board, gh)
+
+        assert verdict.ok is False
+        assert verdict.kind == mq.SMOKE_STALE
+        assert verdict.anchor == "base"
+
+    def test_disjoint_check_fails_closed_without_gh_ops(self) -> None:
+        """No *gh_ops* to ask ⇒ neither file list can be fetched ⇒ stale, not
+        spared — the fail-closed posture #1738/#1778 already have."""
+        board = self._board(completed=[self._tested_work()])
+        entry = _q("w1", target="main")
+        entry.target_branch_head_sha = "base-new"
+
+        verdict = mq.evaluate_smoke_verdict(entry, board, None)
+
+        assert verdict.ok is False
+        assert verdict.kind == mq.SMOKE_STALE
+        assert verdict.anchor == "base"
+
+    def test_disjoint_check_fails_closed_when_compare_returns_none(self) -> None:
+        """`get_compare_files` answering ``None`` (unreadable compare) on
+        either side must not be read as "disjoint" — that would let an
+        unproven combination merge."""
+        board = self._board(completed=[self._tested_work()])
+        entry = _q("w1", target="main")
+        entry.target_branch_head_sha = "base-new"
+        gh = self._Gh(compare_files=None, branch_compare_files=None)
+
+        verdict = mq.evaluate_smoke_verdict(entry, board, gh)
+
+        assert verdict.ok is False
+        assert verdict.kind == mq.SMOKE_STALE
+
+    def test_disjoint_check_fails_closed_when_compare_raises(self) -> None:
+        """A raising compare call must degrade to stale, not to "disjoint by
+        default"."""
+        class _Raising(self._Gh):
+            def get_compare_files(self, repo, base, head):
+                raise RuntimeError("gh api boom")
+
+        board = self._board(completed=[self._tested_work()])
+        entry = _q("w1", target="main")
+        entry.target_branch_head_sha = "base-new"
+
+        verdict = mq.evaluate_smoke_verdict(entry, board, _Raising())
+
+        assert verdict.ok is False
+        assert verdict.kind == mq.SMOKE_STALE
+
+    def test_base_move_disjoint_from_branch_is_a_pure_predicate(self) -> None:
+        """Direct unit coverage of the new predicate, independent of the
+        `evaluate_smoke_verdict` plumbing around it."""
+        assert mq._base_move_disjoint_from_branch(
+            ["coord/state.py"], ["tui/src/app/render.rs"]
+        ) is True
+        assert mq._base_move_disjoint_from_branch(
+            ["coord/state.py"], ["coord/state.py", "coord/drive.py"]
+        ) is False
+        assert mq._base_move_disjoint_from_branch(None, ["coord/drive.py"]) is False
+        assert mq._base_move_disjoint_from_branch(["coord/state.py"], None) is False
+        assert mq._base_move_disjoint_from_branch(None, None) is False
+        # Both empty (a compare that legitimately touched nothing) is
+        # vacuously disjoint — there is nothing to overlap on.
+        assert mq._base_move_disjoint_from_branch([], []) is True
+
+    def test_get_compare_files_called_at_most_twice_when_disjoint_fires(
+        self,
+    ) -> None:
+        """#1847's net-I/O promise: even though three disjuncts are now
+        consulted (#1738, #1778, #1847), `get_compare_files` is called at
+        most twice total — once per side — because the disjointness check
+        reuses the two lists the first two checks already fetched."""
+        board = self._board(completed=[self._tested_work()])
+        entry = _q("w1", target="main")
+        entry.target_branch_head_sha = "base-new"
+        gh = self._Gh(
+            compare_files=["coord/state.py"],
+            branch_compare_files=["tui/src/app/render.rs"],
+        )
+
+        verdict = mq.evaluate_smoke_verdict(entry, board, gh)
+
+        assert verdict.ok is True
+        assert len(gh.compare_files_calls) <= 2
+
+    def test_get_compare_files_called_once_when_base_move_alone_is_inert(
+        self,
+    ) -> None:
+        """Ordering is preserved: the #1738 base-inert check is tried first
+        and, when it alone settles the question, the branch side is never
+        fetched at all — one call, not two."""
+        board = self._board(completed=[self._tested_work()])
+        entry = _q("w1", target="main")
+        entry.target_branch_head_sha = "base-new"
+        gh = self._Gh(compare_files=["docs/README.md"])
+
+        verdict = mq.evaluate_smoke_verdict(entry, board, gh)
+
+        assert verdict.ok is True
+        assert verdict.spared_reason == "base move touches only inert paths (#1738)"
+        assert len(gh.compare_files_calls) == 1
+
+    def test_get_compare_files_called_at_most_twice_when_nothing_spares_it(
+        self,
+    ) -> None:
+        """The plain-stale path (no disjunct fires) is still bounded at two
+        calls — the pre-#1847 worst case, unchanged."""
+        board = self._board(completed=[self._tested_work()])
+        entry = _q("w1", target="main")
+        entry.target_branch_head_sha = "base-new"
+        gh = self._Gh(
+            compare_files=["coord/state.py"],
+            branch_compare_files=["coord/state.py", "coord/drive.py"],
+        )
+
+        verdict = mq.evaluate_smoke_verdict(entry, board, gh)
+
+        assert verdict.ok is False
+        assert len(gh.compare_files_calls) <= 2
+
+    def test_disjoint_spare_does_not_short_circuit_the_branch_content_check(
+        self,
+    ) -> None:
+        """#1847 only answers the base-move question. A branch that gains
+        real content after its verdict was recorded is still caught by the
+        separate patch-id-based branch-content check that follows,
+        independent of whether the base move was disjoint from it."""
+        board = self._board(completed=[self._tested_work()])
+        entry = _q("w1", target="main")
+        entry.target_branch_head_sha = "base-new"
+        entry.branch_head_sha = "branch-new"   # new commit pushed
+        entry.branch_patch_id = "patch-2"       # content actually changed
+        gh = self._Gh(
+            compare_files=["coord/state.py"],
+            branch_compare_files=["tui/src/app/render.rs"],
+        )
+
+        verdict = mq.evaluate_smoke_verdict(entry, board, gh)
+
+        assert verdict.ok is False
+        assert verdict.kind == mq.SMOKE_STALE
+        assert verdict.anchor == "branch"
+
+    def test_dry_run_names_disjointness_distinctly_from_the_inert_reasons(
+        self,
+    ) -> None:
+        """`coord merge --dry-run`'s "would merge" preview names *why* a
+        base move didn't stale the verdict, and the #1847 wording is
+        distinguishable from the #1738/#1778 inert wordings."""
+        cfg = self._config()
+        board = self._board(completed=[self._tested_work()])
+        items = [_q("w1", target="main", size=10)]
+        gh = self._Gh(
+            compare_files=["coord/state.py"],
+            branch_compare_files=["tui/src/app/render.rs"],
+        )
+
+        events = process(items, gh, config=cfg, board=board, dry_run=True)
+
+        merged = [e for e in events if e.kind == "merged"]
+        assert len(merged) == 1
+        assert "disjoint" in merged[0].message
+        assert "#1847" in merged[0].message
+        assert "#1738" not in merged[0].message
+        assert "#1778" not in merged[0].message
+
+    def test_dry_run_names_the_1738_inert_reason_distinctly(self) -> None:
+        """Same preview, but spared via the #1738 inert-base-move hatch
+        instead — the wording must differ from the #1847 one above."""
+        cfg = self._config()
+        board = self._board(completed=[self._tested_work()])
+        items = [_q("w1", target="main", size=10)]
+        gh = self._Gh(compare_files=["docs/README.md"])
+
+        events = process(items, gh, config=cfg, board=board, dry_run=True)
+
+        merged = [e for e in events if e.kind == "merged"]
+        assert len(merged) == 1
+        assert "#1738" in merged[0].message
+        assert "#1847" not in merged[0].message
 
 
 def _patched_time(now: float):
