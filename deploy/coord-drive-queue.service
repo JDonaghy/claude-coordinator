@@ -65,6 +65,20 @@
 #
 # See docs/DRIVE_QUEUE.md for the full runbook (enqueue, install, stop,
 # reading QUEUE: STALLED / QUEUE: BLOCKED, and the operational traps).
+#
+# KillMode=process (#1830) — REQUIRED, do not remove. systemd's default
+# KillMode=control-group would reap this unit's entire cgroup when the tick
+# exits. When the tick launches `coord drive --tmux` and NO tmux server is
+# already running, `tmux new-session` has to spawn the server itself, and
+# that server lands inside THIS unit's cgroup — so the drive it just started
+# dies with the tick, seconds later. The failure is invisible whenever a
+# tmux server already exists (e.g. an operator has a terminal open on the
+# box), because then `tmux new-session` hands off to that pre-existing
+# server, which lives outside this cgroup. That made the queue appear to
+# work in every manual/attended test and fail only unattended — see #1830
+# for the full diagnosis and the repro. KillMode=process kills only the
+# tick's own process on unit stop/exit and leaves everything else it
+# started (the tmux server, the drive loop) alone.
 
 [Unit]
 Description=coord drive-queue tick (#1756)
@@ -73,6 +87,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+KillMode=process
 ExecStart=%h/.local/bin/coord drive-queue tick --config %h/.coord/coordinator.yml
 # Generous relative to the tick's own ~120s launch-subprocess timeout
 # (_LAUNCH_TIMEOUT_SECONDS in coord/commands/drive_queue.py), but well below
