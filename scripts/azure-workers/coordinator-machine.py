@@ -117,6 +117,15 @@ def cmd_add(args: argparse.Namespace, lines: list[str]) -> list[str]:
         f"{pad}  capabilities: [{', '.join(args.capabilities.split(','))}]\n",
         f"{pad}  repos: [{', '.join(wanted)}]\n",
     ]
+    # #1799: without repo_paths a freshly registered machine cannot receive a
+    # single dispatch (`coord.dispatch.dispatch` refuses with "No repo_path
+    # configured" before it ever gets near the provider/TOS gates). The image
+    # bakes every repo at `--repo-root`/<name> (default ~/src/<name>), so
+    # derive the mapping instead of making the caller spell each one out.
+    root = args.repo_root.rstrip("/")
+    block.append(f"{pad}  repo_paths:\n")
+    for r in wanted:
+        block.append(f"{pad}    {r}: {root}/{r}\n")
     if args.max_workers:
         block.append(f"{pad}  max_workers: {args.max_workers}\n")
     return lines[:end] + block + lines[end:]
@@ -144,6 +153,16 @@ def main() -> None:
     add.add_argument("--host", required=True, help="tailnet hostname — must match the VM's --hostname")
     add.add_argument("--capabilities", default="rust,python")
     add.add_argument("--repos", required=True, help="comma-separated repo names")
+    add.add_argument(
+        "--repo-root",
+        default="~/src",
+        help=(
+            "parent directory each --repos entry lives under on the machine "
+            "(the golden image bakes every repo at <repo-root>/<name>). "
+            "Used to derive machines[].repo_paths — without it a registered "
+            "machine cannot receive a single dispatch (#1799)."
+        ),
+    )
     add.add_argument("--max-workers", type=int, default=0)
 
     rm = sub.add_parser("remove")

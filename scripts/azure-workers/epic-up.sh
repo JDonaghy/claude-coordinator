@@ -10,6 +10,40 @@ set -euo pipefail
 
 log() { printf '\n\033[1m=== %s ===\033[0m\n' "$*"; }
 
+# Comma-separated capability list helper: append $2 to the CSV in $1 unless
+# already present. Pure string logic -- no ssh, no side effects -- so the
+# #1799 opencode-detection path below is unit-testable without a live VM.
+add_capability_if_missing() {
+    local csv="$1" cap="$2"
+    local IFS=','
+    local -a caps=($csv)
+    local c
+    for c in "${caps[@]}"; do
+        [[ "$c" == "$cap" ]] && { echo "$csv"; return 0; }
+    done
+    if [[ -z "$csv" ]]; then
+        echo "$cap"
+    else
+        echo "${csv},${cap}"
+    fi
+}
+
+# #1799: whether the machine that was JUST provisioned actually has the
+# opencode CLI on its PATH. `ssh <tailnet-name> ...` is the same access
+# pattern an operator already uses fleet-wide (docs/AGENT_OPERATIONS.md,
+# e.g. `ssh dellserver ...`), and by the time this is called the machine has
+# already proven itself reachable over the tailnet (the /health poll in
+# step 2/5). Deliberately NOT a hardcoded `CAPABILITIES` default -- that was
+# correct the day #1777 wrote it and wrong the day the image started
+# shipping opencode (the exact drift this issue is about; see also #1800's
+# golden-image staleness issue). Checking the actual machine means the
+# capability tracks the image instead of a flag that can go stale again.
+detect_opencode_capability() {
+    local machine="$1"
+    ssh -o BatchMode=yes -o ConnectTimeout=5 "$machine" \
+        'command -v opencode >/dev/null 2>&1'
+}
+
 # Pull one field out of a gallery image-version resource ID:
 #   /subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Compute/
 #     galleries/<gallery>/images/<imageDef>/versions/<version>
@@ -74,6 +108,10 @@ done
 unset _v
 
 EPIC=""; REPOS=""; CAPABILITIES="rust,python"; MACHINE=""
+# The golden image bakes every repo at $REPO_ROOT/<name> (#1799) -- passed
+# through to coordinator-machine.py so the generated entry gets a
+# repo_paths: mapping without the caller spelling each repo's path out.
+REPO_ROOT="~/src"
 # Must match a family you hold quota in. D8as_v5 is 0/0 on this subscription;
 # D8as_v7 is the same 8 vCPU / 32 GiB in a family that has cores.
 VM_SIZE="Standard_D8as_v7"; MAX_WORKERS=2; READY_TIMEOUT=900; PAUSED=0
@@ -84,6 +122,7 @@ while [[ $# -gt 0 ]]; do
         --epic)         EPIC="$2"; shift 2 ;;
         --repos)        REPOS="$2"; shift 2 ;;
         --capabilities) CAPABILITIES="$2"; shift 2 ;;
+        --repo-root)    REPO_ROOT="$2"; shift 2 ;;
         --machine)      MACHINE="$2"; shift 2 ;;
         --vm-size)      VM_SIZE="$2"; shift 2 ;;
         --max-workers)  MAX_WORKERS="$2"; shift 2 ;;
@@ -190,6 +229,15 @@ echo
 jq -r '"  version=\(.version // "?")  capabilities=\(.capabilities|join(","))  repos=\(.repos|join(","))"' <<<"$health"
 
 # --------------------------------------------------------------------------
+log "2b/5  detect capabilities actually present on $MACHINE"
+if detect_opencode_capability "$MACHINE"; then
+    CAPABILITIES="$(add_capability_if_missing "$CAPABILITIES" "provider:opencode")"
+    echo "  opencode CLI found on $MACHINE -- advertising provider:opencode"
+else
+    echo "  opencode CLI not found on $MACHINE -- not advertising provider:opencode" >&2
+fi
+
+# --------------------------------------------------------------------------
 log "3/5  register in coordinator.yml on $DAEMON_HOST"
 # The daemon host's ~/.coord/coordinator.yml is the real config. Editing the
 # local copy would be pointless: on a thin client that file is a CACHE that is
@@ -199,15 +247,15 @@ trap 'ssh "$DAEMON_HOST" "rm -f $REMOTE_HELPER" 2>/dev/null || true' EXIT
 scp -q "$HERE/coordinator-machine.py" "${DAEMON_HOST}:${REMOTE_HELPER}"
 
 ssh "$DAEMON_HOST" bash -euo pipefail -s -- \
-    "$MACHINE" "$CAPABILITIES" "$REPOS" "$MAX_WORKERS" "$REMOTE_HELPER" <<'REMOTE'
-MACHINE="$1"; CAPS="$2"; REPOS="$3"; MAXW="$4"; HELPER="$5"
+    "$MACHINE" "$CAPABILITIES" "$REPOS" "$MAX_WORKERS" "$REMOTE_HELPER" "$REPO_ROOT" <<'REMOTE'
+MACHINE="$1"; CAPS="$2"; REPOS="$3"; MAXW="$4"; HELPER="$5"; REPO_ROOT="$6"
 CFG="$HOME/.coord/coordinator.yml"
 TMP="$(mktemp "${CFG}.XXXXXX")"
 trap 'rm -f "$TMP"' EXIT
 
 python3 "$HELPER" --file "$CFG" --out "$TMP" add \
     --name "$MACHINE" --host "$MACHINE" \
-    --capabilities "$CAPS" --repos "$REPOS" --max-workers "$MAXW"
+    --capabilities "$CAPS" --repos "$REPOS" --repo-root "$REPO_ROOT" --max-workers "$MAXW"
 
 # Validate with coord's OWN parser, via the interpreter that runs coord.
 #
@@ -229,7 +277,7 @@ resolve_coord() {
 COORD="$(resolve_coord)" || { echo "coord not found on this host" >&2; exit 1; }
 PYBIN="$(dirname "$COORD")/python"
 [[ -x "$PYBIN" ]] || PYBIN="$(head -1 "$COORD" | sed 's|^#!||')"
-"$PYBIN" - "$TMP" "$MACHINE" <<'PYEOF'
+"$PYBIN" - "$TMP" "$MACHINE" "$REPOS" <<'PYEOF'
 import sys
 from pathlib import Path
 from coord.config import load
@@ -238,6 +286,25 @@ names = [m.name for m in cfg.machines]
 if sys.argv[2] not in names:
     sys.exit(f"validation failed: {sys.argv[2]} absent after edit. Parsed: {names}")
 print(f"  validated: {len(names)} machines, including {sys.argv[2]}")
+
+# #1799: epic-up.sh used to end with a "ready" banner for a machine that
+# could not accept a single dispatch -- `coord.dispatch.dispatch` refuses
+# with "No repo_path configured" before it ever reaches the provider/TOS
+# gates. Reuse that exact precondition here (Machine.repo_path) instead of
+# waiting for a real `coord assign` against a live issue to discover it --
+# this is the repo_path half of what a `coord assign --dry-run` would have
+# caught; the equivalent provider-capability half is exactly what step 2b/5
+# (detect_opencode_capability) exists to get right before this point.
+machine = next(m for m in cfg.machines if m.name == sys.argv[2])
+repos = [r for r in sys.argv[3].split(",") if r]
+missing = [r for r in repos if machine.repo_path(r) is None]
+if missing:
+    sys.exit(
+        f"validation failed: {sys.argv[2]} has no repo_path for {missing} -- "
+        f"coord assign would refuse with 'No repo_path configured'. "
+        f"coordinator-machine.py should have derived these from --repos."
+    )
+print(f"  dispatchable: repo_path present for {repos}")
 PYEOF
 
 # Atomic. `coord serve` reloads on mtime change (#1081) -- no restart, and no
@@ -287,6 +354,7 @@ cat <<EOF
 
   machine   $MACHINE
   repos     $REPOS
+  caps      $CAPABILITIES
   egress IP $NAT_IP
   image     $(parse_image_id "$SOURCE_IMAGE_ID" version)
   teardown  ./epic-down.sh --epic $EPIC
