@@ -592,7 +592,7 @@ describe('Detail — toast and in-flight states', () => {
     await user.click(screen.getByText('Pass'))
 
     await waitFor(() => {
-      expect(screen.getByRole('status')).toHaveTextContent(/marked passed/i)
+      expect(screen.getByRole('status', { name: 'Notifications' })).toHaveTextContent(/marked passed/i)
     })
   })
 
@@ -609,7 +609,7 @@ describe('Detail — toast and in-flight states', () => {
     await user.click(screen.getByText('Pass'))
 
     await waitFor(() => {
-      expect(screen.getByRole('status')).toHaveTextContent('Board locked')
+      expect(screen.getByRole('status', { name: 'Notifications' })).toHaveTextContent('Board locked')
     })
   })
 
