@@ -193,11 +193,20 @@ class FleetSnapshot:
 
     Only ever populated by the daemon (``coord.serve_app``'s health-poll
     tick), from data it already collected polling every agent's ``/health``
-    plus a handful of daemon-host-local facts (its own venv, the CLI venv,
-    the locally-built ``tui/`` binary).  ``coord health`` run by hand on a
+    plus a handful of facts that are genuinely local to the daemon process
+    itself (its own ``coord-serve`` venv).  ``coord health`` run by hand on a
     single machine has no fleet view — ``HealthContext.fleet`` is ``None``
     there, and ``fleet``-scope checks are simply not run (see
     ``registry.run_all``'s ``scopes`` filter).
+
+    #1806: the CLI-venv version and the ``tui/`` binary-vs-source comparison
+    are NOT daemon-host facts, even though an earlier version of this
+    dataclass's ``daemon_host`` blob carried them — both are facts about
+    whichever machine the operator actually put them on, which is often not
+    the daemon host.  They ride ``machines`` instead (each machine's own
+    ``cli_venv``/``tui_binary`` checks, see
+    :mod:`coord.health.checks.deploy_lane_facts`) and are aggregated fleet-
+    wide from there, not read out of ``daemon_host``.
     """
 
     # machine_name -> {"state": "online"/"offline"/..., "reason": str,
@@ -205,10 +214,12 @@ class FleetSnapshot:
     # "checks": <agent's own H-1 report dict, or None if unreachable/old agent>}
     machines: dict[str, dict] = field(default_factory=dict)
     # Free-form daemon-host-local facts a fleet probe needs (its own
-    # coord-serve venv version, the CLI venv version, the tui/ binary's
-    # resolved path + mtime, /board latency + payload size, phantom-running
-    # assignment ids, ...).  Kept untyped/free-form (like ``values`` on
-    # CheckResult) so a new fleet fact doesn't require touching this dataclass.
+    # coord-serve venv version, /board latency + payload size, phantom-
+    # running assignment ids, per-repo toolchain kinds + CI's pinned
+    # versions, ...).  Kept untyped/free-form (like ``values`` on
+    # CheckResult) so a new fleet fact doesn't require touching this
+    # dataclass.  See the class docstring's #1806 note for what does NOT
+    # belong here.
     daemon_host: dict[str, Any] = field(default_factory=dict)
 
 

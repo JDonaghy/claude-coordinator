@@ -5,17 +5,26 @@ them), the ``coord-serve`` process on the daemon host, the operator's
 ``~/.coord-cli-venv``, and the locally-built ``tui/`` binary.  The CLI venv
 lane exists *specifically* because it was found three releases stale on
 2026-07-29 — silently driving `coord` commands without fixes everyone
-believed were live.  This module never probes the filesystem itself: the
-daemon's health-poll tick (``coord.serve_app``) gathers the raw per-lane
-facts into ``HealthContext.fleet.daemon_host`` (the same "gather in the
-context, judge in the probe" split ``build_context``/``local_checkouts``
-already use for machine-scope checks) — this module only turns those facts
-into a severity, exactly like every other check in this package.
+believed were live.
 
-Both checks below are fail-soft toward UNKNOWN, never toward OK: a lane this
-daemon has no data for (an agent that never reported, a CLI venv that was
-never configured) must not read as "in sync" just because there was nothing
-to disagree with.
+This module never probes the filesystem itself.  Two different sources feed
+it, and #1806 is precisely about not conflating them:
+
+* ``coord-serve``'s own version is a genuinely daemon-host-local fact (it can
+  only be introspected from the process actually running it) — the daemon's
+  health-poll tick gathers that into ``HealthContext.fleet.daemon_host``
+  (``coord.serve_app``'s ``FleetHealthRefresher``).
+* The CLI venv's version is *not* a daemon-host fact — it's whichever
+  machine's filesystem the operator actually put ``~/.coord-cli-venv`` on,
+  which is very often a different box from the one running ``coord-serve``.
+  That fact rides the same transport every agent's ``~/.coord-venv`` already
+  does: each machine's own ``/health`` poll, via the ``cli_venv`` machine-
+  scope check in :mod:`coord.health.checks.deploy_lane_facts`.  See #1806.
+
+Both checks below are fail-soft toward UNKNOWN, never toward OK: a lane no
+machine has data for (an agent that never reported, a CLI venv that was
+never configured anywhere) must not read as "in sync" just because there was
+nothing to disagree with.
 """
 
 from __future__ import annotations
@@ -24,12 +33,39 @@ from coord.health.models import CheckResult, HealthContext, Severity
 from coord.health.registry import check
 
 
+def _machine_check_values(ctx: HealthContext, check_id: str) -> dict[str, dict]:
+    """machine_name -> that machine's reported ``values`` for *check_id*.
+
+    Only includes machines whose result for this check exists and didn't
+    error — a machine that never runs/reports this check is simply absent
+    from the returned dict (the right shape for "optional lane" checks like
+    ``cli_venv``/``tui_binary``, where most machines legitimately have
+    nothing to say). ``_agent_lane_versions`` below wants the opposite shape
+    — every machine present, ``None`` standing in for "no data" — because
+    ``agent_venv`` is mandatory on every machine, so it doesn't use this
+    helper.
+    """
+    out: dict[str, dict] = {}
+    if ctx.fleet is None:
+        return out
+    for name, entry in ctx.fleet.machines.items():
+        checks = (entry or {}).get("checks") or {}
+        for r in checks.get("results", []) or []:
+            if r.get("check_id") == check_id and not r.get("error"):
+                out[name] = r.get("values") or {}
+                break
+    return out
+
+
 def _agent_lane_versions(ctx: HealthContext) -> dict[str, str | None]:
     """machine_name -> its reported ``agent_venv`` version, or ``None``.
 
     ``None`` covers both "machine offline" and "machine online but its
     ``agent_venv`` check didn't run/errored" — both are "no data", not
-    "matches everyone else".
+    "matches everyone else". Unlike ``_machine_check_values``, every machine
+    in ``ctx.fleet.machines`` gets an entry — ``agent_venv`` is mandatory,
+    so a machine with nothing to say about it is a missing lane, not an
+    inapplicable one.
     """
     out: dict[str, str | None] = {}
     if ctx.fleet is None:
@@ -42,6 +78,25 @@ def _agent_lane_versions(ctx: HealthContext) -> dict[str, str | None]:
                 version = (r.get("values") or {}).get("version") or None
                 break
         out[name] = version
+    return out
+
+
+def _cli_venv_lanes(ctx: HealthContext) -> dict[str, str | None]:
+    """``~/.coord-cli-venv (<machine>)`` -> version, for every machine whose
+    own ``cli_venv`` check (#1806) reports one present.
+
+    Named per-machine, unlike the daemon-host fact it replaces, because more
+    than one machine can plausibly have a CLI venv (more than one operator).
+    When *no* machine reports one present, a single ``"~/.coord-cli-venv":
+    None`` entry stands in — "no data anywhere", not "matches everyone else"
+    just because nothing disagreed.
+    """
+    out: dict[str, str | None] = {}
+    for name, values in _machine_check_values(ctx, "cli_venv").items():
+        if values.get("present"):
+            out[f"~/.coord-cli-venv ({name})"] = values.get("version") or None
+    if not out:
+        out["~/.coord-cli-venv"] = None
     return out
 
 
@@ -68,7 +123,7 @@ def probe_deploy_lanes(ctx: HealthContext) -> CheckResult:
     lanes: dict[str, str | None] = dict(_agent_lane_versions(ctx))
     dh = ctx.fleet.daemon_host or {}
     lanes["coord-serve (daemon host)"] = dh.get("coord_serve_version")
-    lanes["~/.coord-cli-venv"] = dh.get("cli_venv_version")
+    lanes.update(_cli_venv_lanes(ctx))
 
     known = {v for v in lanes.values() if v}
     missing = sorted(name for name, v in lanes.items() if not v)
@@ -122,10 +177,16 @@ def probe_deploy_lanes(ctx: HealthContext) -> CheckResult:
     order=11,
     description=(
         "The locally-built tui/ binary is not older than the tui/ source "
-        "tree it was supposedly built from."
+        "tree it was supposedly built from, on every machine that has one."
     ),
 )
 def probe_tui_binary(ctx: HealthContext) -> CheckResult:
+    """Aggregates every machine's own ``tui_binary`` machine-scope check
+    (:mod:`coord.health.checks.deploy_lane_facts`, #1806) instead of
+    ``os.stat``-ing a single path on the daemon host — the daemon host is
+    frequently not the operator's machine, so a single-path check there was
+    structurally blind to the binary that actually matters.
+    """
     if ctx.fleet is None:
         return CheckResult(
             check_id="fleet_tui_binary",
@@ -134,67 +195,72 @@ def probe_tui_binary(ctx: HealthContext) -> CheckResult:
             headroom="no fleet snapshot (fleet checks only run on the daemon)",
         )
 
-    dh = ctx.fleet.daemon_host or {}
-    path = dh.get("tui_binary_path")
-    if not path:
-        # The daemon always resolves a path (config override, else the README's
-        # ~/.local/bin/coord-tui), so this only fires for a snapshot assembled
-        # without daemon-host facts at all — "no data", never "in sync".
-        return CheckResult(
-            check_id="fleet_tui_binary",
-            scope="fleet",
-            severity=Severity.UNKNOWN,
-            headroom="no tui binary path in the daemon-host facts",
-        )
+    facts = _machine_check_values(ctx, "tui_binary")
+    present = {name: v for name, v in facts.items() if v.get("present")}
 
-    binary_mtime = dh.get("tui_binary_mtime")
-    source_mtime = dh.get("tui_source_mtime")
-    if binary_mtime is None:
+    if not present:
         return CheckResult(
             check_id="fleet_tui_binary",
             scope="fleet",
             severity=Severity.UNKNOWN,
-            headroom=f"no binary at {path}",
+            headroom="no machine reports a coord-tui binary",
             detail=(
                 "build and install it (`cd tui && cargo build && cp "
-                "target/debug/coord-tui ~/.local/bin/coord-tui`), or set "
+                "target/debug/coord-tui ~/.local/bin/coord-tui`) on the "
+                "machine you actually run the tui from, or set "
                 "health.tui_binary_path if it lives elsewhere"
             ),
-            values={"path": path},
-        )
-    if source_mtime is None:
-        return CheckResult(
-            check_id="fleet_tui_binary",
-            scope="fleet",
-            severity=Severity.OK,
-            headroom="binary present (tui/ source tree not found to compare)",
-            values={"path": path, "binary_mtime": binary_mtime},
+            values={"machines": facts},
         )
 
-    if source_mtime > binary_mtime:
-        stale_hours = (source_mtime - binary_mtime) / 3600.0
+    # Compare each machine against ITS OWN source tree — a machine with no
+    # tui/ checkout has nothing to compare against and is left out of the
+    # verdict (present, uncomparable), same as the single-machine case
+    # always was; it just no longer speaks for the whole fleet.
+    stale: list[tuple[str, float, float]] = []
+    comparable: list[str] = []
+    for name, values in present.items():
+        binary_mtime = values.get("binary_mtime")
+        source_mtime = values.get("source_mtime")
+        if binary_mtime is None or source_mtime is None:
+            continue
+        comparable.append(name)
+        if source_mtime > binary_mtime:
+            stale.append((name, binary_mtime, source_mtime))
+
+    if stale:
+        # Worst (most hours stale) first, but name every stale machine —
+        # this check exists specifically so a stale lane is never silent.
+        stale.sort(key=lambda t: (t[2] - t[1]), reverse=True)
+        names = ", ".join(n for n, _, _ in stale)
+        _worst_name, worst_bm, worst_sm = stale[0]
+        stale_hours = (worst_sm - worst_bm) / 3600.0
         return CheckResult(
             check_id="fleet_tui_binary",
             scope="fleet",
             severity=Severity.WARN,
-            headroom=f"binary is {stale_hours:.1f}h older than tui/ source",
-            detail="rebuild the tui/ binary — source changed since the last local build",
-            threshold="warn when source/ is newer than the built binary",
-            values={
-                "path": path,
-                "binary_mtime": binary_mtime,
-                "source_mtime": source_mtime,
-            },
+            headroom=f"{names}: binary is {stale_hours:.1f}h older than tui/ source",
+            detail=f"rebuild the tui/ binary on: {names}",
+            threshold="warn when any machine's source/ is newer than its built binary",
+            values={"machines": facts, "stale": [n for n, _, _ in stale]},
+        )
+
+    if not comparable:
+        return CheckResult(
+            check_id="fleet_tui_binary",
+            scope="fleet",
+            severity=Severity.OK,
+            headroom=(
+                f"binary present on {', '.join(sorted(present))} "
+                "(no source tree found to compare)"
+            ),
+            values={"machines": facts},
         )
 
     return CheckResult(
         check_id="fleet_tui_binary",
         scope="fleet",
         severity=Severity.OK,
-        headroom="up to date with tui/ source",
-        values={
-            "path": path,
-            "binary_mtime": binary_mtime,
-            "source_mtime": source_mtime,
-        },
+        headroom=f"up to date with tui/ source on {', '.join(sorted(comparable))}",
+        values={"machines": facts},
     )
