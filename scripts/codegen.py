@@ -1,32 +1,32 @@
-"""Generate TypeScript wire types from the Python dataclasses that define them (#750).
+"""Generate TypeScript wire types from the dashboard's OpenAPI spec (#1550).
 
 There is no single source of truth for any wire type in this repo — every
-contract is a hand-maintained mirror on both sides. For the dashboard API
-(`coord/pipeline.py` / `coord/dashboard/server.py` dataclasses `asdict`'d over
-`GET /api/board` and `GET /api/pipeline`) the TS mirror lives in
-`coord/dashboard/webapp/src/api/client.ts` and had already started drifting in
-the open (fields added to `Assignment`/`PipelineView` with no corresponding TS
-field, or vice versa).
+contract is a hand-maintained mirror on both sides. #750 closed that gap by
+generating `coord/dashboard/webapp/src/api/generated.ts` straight from the
+Python dataclasses (`coord.models.Assignment`, `coord.pipeline.PipelineStage`
+/ `PipelineGate` / `PipelineView`). #1550 moves the source of truth up one
+level: this script now reads `coord.dashboard.server.openapi_spec()` —
+the same `components/schemas` document served at `GET /openapi.json` and
+already regression-tested against the real Starlette route table
+(`tests/test_openapi.py`'s `declared_routes(...) == spec_routes(...)`,
+#757) — instead of introspecting the dataclasses a second time. Generating
+from the *served* contract, rather than from the Python types that happen to
+back it today, means a future endpoint whose response shape isn't a bare
+`dataclasses.asdict()` (a hand-composed object, a subset of fields, a $ref
+array) still gets a correct TS mirror: whatever `coord/openapi.py` says the
+wire shape is, is what ships to TypeScript.
 
-This script closes that gap for the TS side: it introspects the real Python
-dataclasses (`coord.models.Assignment`, `coord.pipeline.PipelineStage`,
-`coord.pipeline.PipelineGate`, `coord.pipeline.PipelineView`) via
-`dataclasses.fields()` + `typing.get_type_hints()` and emits matching
-TypeScript `interface`s to `coord/dashboard/webapp/src/api/generated.ts`. A
-Python field addition/removal/type change regenerates the TS automatically —
-no more manually keeping two files in sync.
-
-`ENUM_OVERRIDES` below exists because several fields are typed as a bare `str`
-in Python (dataclasses can't express "this string is really one of these N
-values") but are documented as small fixed enums, either in an inline comment
-next to the field or by their real call-site usage. These are hand-curated —
-update them alongside the Python source when a new value is introduced. The
-`_ENUM_BLOCK` constants (`AssignmentStatus`, `AssignmentType`, `TestVerdict`,
-`PipelineAction`) are themselves hand-authored (not derived from a dataclass):
-they encode wire-contract decisions — including actions the client supports
-that aren't dispatched by `compute_pipeline` (e.g. "unstick") and forthcoming
-values ahead of their backend implementation — that don't correspond 1:1 to
-a single Python type.
+`ENUM_OVERRIDES` below exists because JSON Schema (like the dataclasses
+before it) can't express "this string is really one of these N values" —
+`coord/openapi.py:json_schema_for` maps every `str` field to a bare
+`{"type": "string"}`. These are hand-curated — update them alongside the
+Python source when a new value is introduced. The `_ENUM_BLOCK` constants
+(`AssignmentStatus`, `AssignmentType`, `TestVerdict`, `PipelineAction`) are
+themselves hand-authored (not derived from a schema): they encode
+wire-contract decisions — including actions the client supports that aren't
+dispatched by `compute_pipeline` (e.g. "unstick") and forthcoming values
+ahead of their backend implementation — that don't correspond 1:1 to a
+single schema.
 
 Usage:
     .venv/bin/python scripts/codegen.py            # regenerate generated.ts in place
@@ -39,33 +39,36 @@ for the /board golden fixture) so a stale checkout fails the build.
 
 from __future__ import annotations
 
-import dataclasses
 import sys
-import types
-import typing
 from pathlib import Path
+from typing import Any
 
-from coord.models import Assignment
-from coord.pipeline import PipelineGate, PipelineStage, PipelineView
+from coord.dashboard.server import openapi_spec
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_PATH = REPO_ROOT / "coord" / "dashboard" / "webapp" / "src" / "api" / "generated.ts"
 
-# Dataclasses to emit as TS interfaces, in dependency order (a dataclass
-# referenced by a later one — e.g. PipelineView.stages: list[PipelineStage] —
-# must be emitted first so the generated file doesn't forward-reference).
-DATACLASSES: tuple[type, ...] = (PipelineStage, PipelineGate, PipelineView, Assignment)
+# Schemas to emit as TS interfaces, in display order — purely cosmetic (TS
+# `interface` declarations are hoisted, so forward references within
+# generated.ts are legal regardless of order). Anything present in the spec
+# but not listed here is appended afterwards, sorted by name, so a newly
+# schema-registered dataclass is never silently dropped.
+SCHEMA_DISPLAY_ORDER: tuple[str, ...] = (
+    "PipelineStage",
+    "PipelineGate",
+    "PipelineView",
+    "Assignment",
+)
 
-# (dataclass name, field name) -> literal TS type, bypassing the mechanical
-# str/int/bool/list/dict mapping below. See module docstring for why these
-# exist and where each value set comes from.
+# (schema name, field name) -> literal TS type, bypassing the mechanical
+# JSON-Schema-to-TS mapping below. See module docstring for why these exist
+# and where each value set comes from.
 ENUM_OVERRIDES: dict[tuple[str, str], str] = {
     # coord/models.py Assignment.status: default "pending"; dao.TERMINAL_STATUSES
     # adds "done"/"merged"/"failed"/"cancelled"/"advisory"; "running" once dispatched.
     ("Assignment", "status"): "AssignmentStatus",
-    # coord/models.py Assignment.type: "work" (default) | "review" | "plan" |
-    # "smoke" | "conflict-fix", plus "merge"/"fix" per the client's forward-looking
-    # PipelineAction-adjacent contract (see AssignmentType below).
+    # coord/models.py Assignment.type — see AssignmentType below for the real
+    # value set (#1550 found and fixed a drifted hand enum here, see PR).
     ("Assignment", "type"): "AssignmentType",
     # coord/models.py Assignment.smoke_test docstring: "None | pass | fail".
     ("Assignment", "smoke_test"): "'pass' | 'fail' | null",
@@ -87,10 +90,17 @@ ENUM_OVERRIDES: dict[tuple[str, str], str] = {
     # post_findings, record-review-verdict, dispatch_fix, merge, retry) are a
     # subset of the full PipelineAction contract below.
     ("PipelineGate", "action"): "PipelineAction",
+    # coord/pipeline.py PipelineStage.status: the four literal values
+    # compute_pipeline assigns (see its "Build stages list" section) —
+    # "active" | "completed" | "skipped" | "waiting". #1550: this was
+    # generated as a bare `string` before the OpenAPI-spec switch; verified
+    # against the four literal assignments in coord/pipeline.py and tightened
+    # here since a JSON Schema `{"type": "string"}` can't express it either.
+    ("PipelineStage", "status"): "'active' | 'completed' | 'skipped' | 'waiting'",
 }
 
 # Hand-authored wire-contract enums — see module docstring for why these are
-# not mechanically derived from a Python type.
+# not mechanically derived from a schema.
 _ENUM_BLOCK = """\
 export type AssignmentStatus =
   | 'pending'
@@ -101,14 +111,34 @@ export type AssignmentStatus =
   | 'advisory'
   | 'merged'
 
+/**
+ * coord/models.py Assignment.type's real value set — #1550 found this had
+ * drifted: the hand-authored enum this replaces listed 'merge' and 'fix',
+ * neither of which is ever a literal `type=` value (coord/config.py's #1137
+ * audit note: a dedicated `type="merge"` was tried and reverted; `type="fix"`
+ * was deliberately never introduced — both share `type="work"` with their
+ * headless counterpart and are distinguished by `provider_name`/
+ * `review_of_assignment_id` instead, see `attention_threshold_for`) — while
+ * missing seven values that are real: 'audit' (coord/models.py docstring,
+ * #885 --audit-of), and the six interactive session types from
+ * coord/config.py's `INTERACTIVE_SESSION_TYPES` plus the two headless
+ * lightweight-worker types from `_DEFAULT_ATTENTION_THRESHOLDS`.
+ */
 export type AssignmentType =
   | 'work'
   | 'review'
   | 'plan'
   | 'smoke'
   | 'conflict-fix'
-  | 'merge'
-  | 'fix'
+  | 'mock-author'
+  | 'test-author'
+  | 'audit'
+  | 'chat'
+  | 'troubleshoot'
+  | 'milestone-chat'
+  | 'refinement'
+  | 'new-issue-chat'
+  | 'test-chat'
 
 export type TestVerdict = 'passed' | 'failed' | 'skipped' | 'running'
 
@@ -143,9 +173,10 @@ HEADER = """\
 /**
  * AUTO-GENERATED — DO NOT EDIT BY HAND.
  *
- * Generated by `scripts/codegen.py` from the Python dataclasses that define
- * the coordinator's wire types (coord/models.py, coord/pipeline.py) — #750.
- * Regenerate after any field change:
+ * Generated by `scripts/codegen.py` from the dashboard's OpenAPI 3 spec
+ * (`coord.dashboard.server.openapi_spec()`, itself built by
+ * `coord/openapi.py` from `coord/models.py` / `coord/pipeline.py`) — #1550
+ * (originally #750). Regenerate after any field change:
  *
  *     .venv/bin/python scripts/codegen.py
  *
@@ -155,68 +186,72 @@ HEADER = """\
 """
 
 
-def _ts_scalar(tp: object) -> str | None:
-    if tp is str:
-        return "string"
-    if tp is bool:
-        return "boolean"
-    if tp in (int, float):
-        return "number"
-    return None
+def ts_type_from_schema(schema: dict[str, Any]) -> str:
+    """Map a JSON Schema fragment (as produced by ``coord/openapi.py``'s
+    ``json_schema_for``/``dataclass_schema``) to a TypeScript type string.
+
+    Mirrors the shape of ``coord/openapi.py:json_schema_for`` structurally,
+    just targeting TypeScript instead of building the schema itself.
+    """
+    if "$ref" in schema:
+        base = schema["$ref"].rsplit("/", 1)[-1]
+    elif "anyOf" in schema:
+        base = " | ".join(ts_type_from_schema(s) for s in schema["anyOf"])
+    else:
+        json_type = schema.get("type")
+        if json_type == "null":
+            return "null"
+        if json_type == "string":
+            base = "string"
+        elif json_type == "boolean":
+            base = "boolean"
+        elif json_type in ("integer", "number"):
+            base = "number"
+        elif json_type == "array":
+            items = schema.get("items") or {}
+            base = f"{ts_type_from_schema(items)}[]" if items else "unknown[]"
+        elif json_type == "object":
+            addl = schema.get("additionalProperties")
+            if isinstance(addl, dict):
+                base = f"Record<string, {ts_type_from_schema(addl)}>"
+            else:
+                base = "Record<string, unknown>"
+        elif json_type is None:
+            base = "unknown"
+        else:
+            raise TypeError(
+                f"scripts/codegen.py: no TS mapping for JSON Schema type {json_type!r} "
+                f"(schema={schema!r}) — add one to ts_type_from_schema()."
+            )
+
+    return f"{base} | null" if schema.get("nullable") else base
 
 
-def ts_type(tp: object) -> str:
-    """Map a resolved Python type (from typing.get_type_hints) to a TS type string."""
-    if tp is type(None):
-        return "null"
-    if isinstance(tp, type):
-        scalar = _ts_scalar(tp)
-        if scalar is not None:
-            return scalar
-        if dataclasses.is_dataclass(tp):
-            return tp.__name__
-        if tp is dict:
-            return "Record<string, unknown>"
-    if tp is typing.Any:
-        return "unknown"
-
-    origin = typing.get_origin(tp)
-    args = typing.get_args(tp)
-
-    if origin in (list, typing.List):
-        (inner,) = args
-        return f"{ts_type(inner)}[]"
-    if origin in (dict, typing.Dict):
-        if len(args) == 2:
-            return f"Record<string, {ts_type(args[1])}>"
-        return "Record<string, unknown>"
-    if origin is typing.Union or origin is types.UnionType:
-        non_none = [a for a in args if a is not type(None)]
-        has_none = len(non_none) != len(args)
-        mapped = [ts_type(a) for a in non_none]
-        result = " | ".join(mapped) if mapped else "unknown"
-        return f"{result} | null" if has_none else result
-
-    raise TypeError(
-        f"scripts/codegen.py: no TS mapping for Python type {tp!r} — add one to ts_type() "
-        "or an entry to ENUM_OVERRIDES."
-    )
-
-
-def emit_interface(cls: type) -> str:
-    hints = typing.get_type_hints(cls)
-    lines = [f"export interface {cls.__name__} {{"]
-    for f in dataclasses.fields(cls):
-        override = ENUM_OVERRIDES.get((cls.__name__, f.name))
-        ts = override if override is not None else ts_type(hints[f.name])
-        lines.append(f"  {f.name}: {ts}")
+def emit_interface(name: str, schema: dict[str, Any]) -> str:
+    properties: dict[str, Any] = schema.get("properties", {})
+    lines = [f"export interface {name} {{"]
+    for field_name, field_schema in properties.items():
+        override = ENUM_OVERRIDES.get((name, field_name))
+        ts = override if override is not None else ts_type_from_schema(field_schema)
+        lines.append(f"  {field_name}: {ts}")
     lines.append("}")
     return "\n".join(lines)
 
 
+def _ordered_schema_names(schemas: dict[str, Any]) -> list[str]:
+    """#1550: display order for the emitted interfaces — see
+    ``SCHEMA_DISPLAY_ORDER``'s docstring. Every schema in the spec is
+    emitted; nothing is silently dropped."""
+    known = [name for name in SCHEMA_DISPLAY_ORDER if name in schemas]
+    unknown = sorted(name for name in schemas if name not in SCHEMA_DISPLAY_ORDER)
+    return known + unknown
+
+
 def generate() -> str:
+    spec = openapi_spec()
+    schemas: dict[str, Any] = spec.get("components", {}).get("schemas", {})
     parts = [HEADER, _ENUM_BLOCK]
-    parts.extend(emit_interface(cls) for cls in DATACLASSES)
+    parts.extend(emit_interface(name, schemas[name]) for name in _ordered_schema_names(schemas))
     return "\n\n".join(parts) + "\n"
 
 

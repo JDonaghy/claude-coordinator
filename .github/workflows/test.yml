@@ -109,3 +109,32 @@ jobs:
       - run: npm ci
       - run: npx playwright install chromium --with-deps
       - run: npm run test:e2e
+
+  # #1550: `coord/dashboard/webapp/src/api/generated.ts` is produced by
+  # `scripts/codegen.py` from the dashboard's OpenAPI spec
+  # (`coord.dashboard.server.openapi_spec()`) — this job is the drift gate.
+  # `--check` regenerates in memory and fails without writing if the
+  # committed file differs, so a Python dataclass field change that forgot
+  # to `python scripts/codegen.py` fails CI here instead of shipping a
+  # webapp that silently drops/misreads a field (the #632 failure class).
+  # `npm run typecheck` + the Vitest suite then confirm every consumer of
+  # the generated types (client.ts, the components) still compiles and
+  # passes against whatever the regenerated shape is.
+  webapp-types:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: python scripts/codegen.py --check
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - working-directory: coord/dashboard/webapp
+        run: npm ci
+      - working-directory: coord/dashboard/webapp
+        run: npm run typecheck
+      - working-directory: coord/dashboard/webapp
+        run: npm run test

@@ -1,15 +1,21 @@
-"""#750: generated.ts must never drift from what scripts/codegen.py produces.
+"""#750/#1550: generated.ts must never drift from what scripts/codegen.py produces.
 
 Mirrors tests/test_board_fixture.py's freshness-check pattern for the golden
 /board fixture — here the "fixture" is the generated TypeScript wire-type
 file itself (coord/dashboard/webapp/src/api/generated.ts), mechanically
-derived from coord/models.py:Assignment and coord/pipeline.py:PipelineStage /
-PipelineGate / PipelineView.
+derived from coord.dashboard.server.openapi_spec()'s `components/schemas`
+(itself built by coord/openapi.py from coord/models.py:Assignment and
+coord/pipeline.py:PipelineStage / PipelineGate / PipelineView — #1550 moved
+the codegen source from the dataclasses directly to the served OpenAPI spec,
+see scripts/codegen.py's module docstring).
 
 If a Python dataclass field is added, removed, or retyped without
 regenerating, this test goes red — closing the "hand-mirrored wire contract"
 drift class described in #750 (the same class #632/#748 closed for the
-Rust /board struct).
+Rust /board struct). Because the spec itself is drift-tested against the real
+route table (tests/test_openapi.py, #757), this also transitively guards
+against `src/api/generated.ts` describing an endpoint shape the server no
+longer actually serves.
 """
 
 from __future__ import annotations

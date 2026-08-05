@@ -252,17 +252,25 @@ async def _poll_once(
     return possibly_stuck
 
 
-def _openapi_spec() -> dict:
+def openapi_spec() -> dict:
     """#757: the dashboard's OpenAPI 3 document.
 
     ``GET /api/board`` and ``GET /api/pipeline`` are fully specified via
     :func:`coord.openapi.dataclass_schema` over ``coord.models.Assignment`` /
-    ``coord.pipeline.PipelineView`` — the same dataclasses #750's TS codegen
-    (``scripts/codegen.py``) already introspects, so this spec and the
-    generated TS types describe the identical wire shape. The action-style
-    ``POST /api/pipeline/action`` endpoint documents its ``action`` enum but
-    leaves the response loosely typed since each action returns a distinct
-    ad-hoc shape.
+    ``coord.pipeline.PipelineView``. #1550's TS codegen (``scripts/codegen.py``)
+    reads its ``components/schemas`` straight from *this* spec — not from the
+    dataclasses directly — so the generated TS types describe exactly what the
+    server declares it serves, and the existing ``declared_routes(app.routes)
+    == spec_routes(spec)`` test (``tests/test_openapi.py``) transitively
+    guarantees they can't drift from the real route table either. The
+    action-style ``POST /api/pipeline/action`` endpoint documents its
+    ``action`` enum but leaves the response loosely typed since each action
+    returns a distinct ad-hoc shape.
+
+    Public (no leading underscore) because ``scripts/codegen.py`` imports it
+    as its source of truth; ``coord/agent_app.py`` and ``coord/serve_app.py``
+    keep their own ``_openapi_spec()`` private since nothing outside those
+    modules consumes them (yet).
     """
     components: dict = {}
     assignment_ref = dataclass_schema(Assignment, components)
@@ -1654,7 +1662,7 @@ def build_app(
         WebSocketRoute("/ws/terminal/{session_id}", terminal_ws),
     ]
     # #757: served OpenAPI 3 spec + Swagger UI docs page.
-    routes.extend(openapi_and_docs_routes(_openapi_spec()))
+    routes.extend(openapi_and_docs_routes(openapi_spec()))
 
     # ── Fixture-mode introspection (#1538) ─────────────────────────────────
     # Registered ONLY under `coord web --fixture`, so the live dashboard's
