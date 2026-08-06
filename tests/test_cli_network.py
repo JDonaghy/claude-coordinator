@@ -487,3 +487,102 @@ class TestApproveProviderAwareModel:
         )
         assert "zhipuai/glm-4.6" in result.output
         assert "overriding plan-time model 'haiku'" in result.output
+
+
+PROVIDER_LABEL_CONFIG_YAML = """\
+repos:
+  - name: api
+    github: acme/api
+    provider: repo-provider
+machines:
+  - name: laptop
+    host: laptop.tailnet
+    repos: [api]
+    repo_paths:
+      api: /tmp/api
+providers:
+  default: claude
+  definitions:
+    fast-claude:
+      type: claude
+    repo-provider:
+      type: claude
+  labels:
+    harness:fast-claude: fast-claude
+"""
+
+
+class TestApproveProviderLabel:
+    """#1889: `coord approve` (like `coord assign`) resolves providers.labels
+    against the proposal's issue, and names the label in its output —
+    the same transparency #1707 established for the explicit-flag / repo-
+    default links of the chain."""
+
+    @pytest.fixture
+    def provider_label_config_file(self, tmp_path: Path) -> Path:
+        p = tmp_path / "coordinator.yml"
+        p.write_text(PROVIDER_LABEL_CONFIG_YAML)
+        return p
+
+    def test_labelled_issue_routes_to_labelled_provider_and_names_it(
+        self, provider_label_config_file: Path, coord_dir: Path,
+    ) -> None:
+        from coord.models import Proposal
+
+        state_mod.save_proposals(
+            [
+                Proposal(
+                    id=1, machine_name="laptop", repo_name="api",
+                    issue_number=10, issue_title="t", rationale="r",
+                    files_likely=["a.py"], briefing="b", type="work",
+                ),
+            ]
+        )
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "label-approve-1"}
+        mock_resp.raise_for_status.return_value = None
+        with patch("coord.dispatch.httpx.post", return_value=mock_resp) as mock_post, \
+             patch(
+                 "coord.github_ops.get_issue",
+                 return_value={"labels": [{"name": "harness:fast-claude"}]},
+             ), \
+             patch("coord.github_ops.post_issue_comment"):
+            result = CliRunner().invoke(
+                main, ["approve", "1", "--config", str(provider_label_config_file)]
+            )
+        assert result.exit_code == 0, result.output
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload.get("provider") == "fast-claude"
+        assert "via label 'harness:fast-claude'" in result.output
+
+    def test_unlabelled_issue_falls_back_to_repo_provider(
+        self, provider_label_config_file: Path, coord_dir: Path,
+    ) -> None:
+        from coord.models import Proposal
+
+        state_mod.save_proposals(
+            [
+                Proposal(
+                    id=1, machine_name="laptop", repo_name="api",
+                    issue_number=10, issue_title="t", rationale="r",
+                    files_likely=["a.py"], briefing="b", type="work",
+                ),
+            ]
+        )
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "label-approve-2"}
+        mock_resp.raise_for_status.return_value = None
+        with patch("coord.dispatch.httpx.post", return_value=mock_resp) as mock_post, \
+             patch(
+                 "coord.github_ops.get_issue", return_value={"labels": [{"name": "bug"}]},
+             ), \
+             patch("coord.github_ops.post_issue_comment"):
+            result = CliRunner().invoke(
+                main, ["approve", "1", "--config", str(provider_label_config_file)]
+            )
+        assert result.exit_code == 0, result.output
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload.get("provider") == "repo-provider"
+        assert "via label" not in result.output

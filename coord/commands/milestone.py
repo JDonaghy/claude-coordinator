@@ -872,6 +872,8 @@ def _echo_outcome(outcome: DispatchOutcome) -> None:
         )
         if outcome.model_reason:
             click.echo(f"     model: {outcome.model_reason}")
+        if outcome.provider_reason:
+            click.echo(f"     provider: {outcome.provider_reason}")
     else:
         click.echo(
             f"  #{outcome.issue_number}: dispatch failed: {outcome.error}", err=True

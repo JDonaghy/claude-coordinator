@@ -255,6 +255,109 @@ class TestProviderDryRun:
         disp.assert_not_called()
 
 
+# #1889: providers.labels — an issue-level lever mirroring models.labels, so
+# `gh issue edit N --add-label harness:opencode` routes the harness with no
+# --provider flag to remember. `repo-provider` also configured so these
+# tests can prove the label link outranks it in the precedence chain.
+CONFIG_YAML_WITH_PROVIDER_LABELS = """\
+repos:
+  - name: api
+    github: acme/api
+    default_branch: main
+    provider: repo-provider
+machines:
+  - name: laptop
+    host: laptop.tailnet
+    repos: [api]
+    repo_paths:
+      api: /tmp/api
+providers:
+  definitions:
+    fast-claude:
+      type: claude
+    repo-provider:
+      type: claude
+  labels:
+    harness:fast-claude: fast-claude
+"""
+
+
+@pytest.fixture
+def config_file_with_provider_labels(tmp_path: Path) -> Path:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(CONFIG_YAML_WITH_PROVIDER_LABELS)
+    return p
+
+
+class TestProviderLabelDryRun:
+    """#1889 acceptance: `coord assign --dry-run` names the label as the
+    reason a providers.labels match won — the same transparency #1707/#1454
+    established for the explicit-flag / repo-default links of the chain."""
+
+    def test_dry_run_labelled_issue_names_the_label(
+        self, config_file_with_provider_labels: Path, coord_dir: Path
+    ) -> None:
+        with patch(
+            "coord.github_ops.get_issue",
+            return_value={"title": "t", "labels": [{"name": "harness:fast-claude"}]},
+        ):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "assign", "laptop", "api", "42",
+                    "--config", str(config_file_with_provider_labels),
+                    "--dry-run",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        assert "fast-claude" in result.output
+        assert "via label 'harness:fast-claude'" in result.output
+
+    def test_dry_run_unlabelled_issue_falls_back_to_repo_default(
+        self, config_file_with_provider_labels: Path, coord_dir: Path
+    ) -> None:
+        """The same issue WITHOUT the label resolves to the repo default —
+        the label is not sticky, and doesn't leak into unrelated issues."""
+        with patch(
+            "coord.github_ops.get_issue",
+            return_value={"title": "t", "labels": [{"name": "bug"}]},
+        ):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "assign", "laptop", "api", "42",
+                    "--config", str(config_file_with_provider_labels),
+                    "--dry-run",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        assert "repo-provider" in result.output
+        assert "Repo.provider" in result.output
+        assert "via label" not in result.output
+
+    def test_dry_run_explicit_provider_flag_still_beats_label(
+        self, config_file_with_provider_labels: Path, coord_dir: Path
+    ) -> None:
+        """--provider still beats providers.labels — the precedence chain's
+        top link is unchanged by #1889."""
+        with patch(
+            "coord.github_ops.get_issue",
+            return_value={"title": "t", "labels": [{"name": "harness:fast-claude"}]},
+        ):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "assign", "laptop", "api", "42",
+                    "--config", str(config_file_with_provider_labels),
+                    "--provider", "repo-provider",
+                    "--dry-run",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        assert "explicit --provider" in result.output
+        assert "via label" not in result.output
+
+
 # A provider definition of a genuinely different backend TYPE (opencode) —
 # used to prove a machine that hasn't declared `provider:opencode` gets
 # refused, naming the machine that DOES (#1711). Deliberately does NOT mock

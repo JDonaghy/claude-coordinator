@@ -638,6 +638,85 @@ def test_resolve_spec_none_repo_none_uses_default() -> None:
     assert resolve_provider_name(None, None, cfg) == "claude"
 
 
+# ── Registry: resolve_provider_name issue_labels (providers.labels, #1889) ──
+
+
+def test_resolve_label_wins_over_repo_and_default() -> None:
+    """#1889 acceptance: an issue labelled harness:opencode, dispatched via
+    a path that passes no --provider, resolves to opencode."""
+    cfg = ProvidersConfig(
+        default="claude", labels={"harness:opencode": "opencode"},
+    )
+    result = resolve_provider_name(
+        None, "repo-provider", cfg, issue_labels=["harness:opencode"],
+    )
+    assert result == "opencode"
+
+
+def test_resolve_no_label_match_falls_back_to_repo() -> None:
+    """#1889 acceptance: the same issue WITHOUT the label resolves to the
+    repo/global default, unaffected by an unrelated providers.labels entry."""
+    cfg = ProvidersConfig(
+        default="claude", labels={"harness:opencode": "opencode"},
+    )
+    result = resolve_provider_name(
+        None, "repo-provider", cfg, issue_labels=["bug"],
+    )
+    assert result == "repo-provider"
+
+
+def test_resolve_spec_provider_beats_label() -> None:
+    """#1889 acceptance: an explicit --provider still beats the label — the
+    precedence chain's top link is unchanged."""
+    cfg = ProvidersConfig(
+        default="claude", labels={"harness:opencode": "opencode"},
+    )
+    result = resolve_provider_name(
+        "claude", "repo-provider", cfg, issue_labels=["harness:opencode"],
+    )
+    assert result == "claude"
+
+
+def test_resolve_label_beats_repo_provider() -> None:
+    """The label link sits ABOVE repo_provider in the chain (spec > label >
+    repo > default) — a per-issue harness eval overrides the repo's own
+    pinned provider without editing coordinator.yml."""
+    cfg = ProvidersConfig(
+        default="claude", labels={"harness:opencode": "opencode"},
+    )
+    result = resolve_provider_name(
+        None, "some-other-provider", cfg, issue_labels=["harness:opencode"],
+    )
+    assert result == "opencode"
+
+
+def test_resolve_no_issue_labels_reproduces_pre_1889_behavior() -> None:
+    """issue_labels=None (the default) skips the label link entirely — every
+    pre-#1889 caller that doesn't pass it is unaffected even when
+    providers.labels IS configured."""
+    cfg = ProvidersConfig(
+        default="claude", labels={"harness:opencode": "opencode"},
+    )
+    assert resolve_provider_name(None, "repo-provider", cfg) == "repo-provider"
+    assert resolve_provider_name(None, "repo-provider", cfg, issue_labels=[]) == "repo-provider"
+
+
+def test_resolve_label_label_conflict_uses_config_declaration_order() -> None:
+    """#1889: two providers.labels matches on one issue (e.g. both
+    harness:opencode and harness:claude present) is decided deterministically
+    by the config's own declaration order, not the issue's label order."""
+    cfg = ProvidersConfig(
+        default="claude",
+        labels={"harness:opencode": "opencode", "harness:claude": "claude"},
+    )
+    assert resolve_provider_name(
+        None, None, cfg, issue_labels=["harness:claude", "harness:opencode"],
+    ) == "opencode"
+    assert resolve_provider_name(
+        None, None, cfg, issue_labels=["harness:opencode", "harness:claude"],
+    ) == "opencode"
+
+
 # ── provider-availability machine capability gate (#1711) ──────────────────────
 
 
@@ -846,6 +925,55 @@ def test_describe_provider_choice_matches_resolve_provider_name() -> None:
         resolved = resolve_provider_name(spec, repo, cfg)
         reason = describe_provider_choice(spec, repo, cfg)
         assert reason.startswith(resolved + " (")
+
+
+# ── describe_provider_choice issue_labels (providers.labels, #1889) ────────────
+
+
+def test_describe_provider_choice_names_the_matched_label() -> None:
+    """#1889 acceptance: `coord assign --dry-run` (and any other dry-run/
+    status caller) names the label as the reason, mirroring
+    describe_model_choice's #1454 shape for models.labels."""
+    cfg = ProvidersConfig(default="claude", labels={"harness:opencode": "opencode"})
+    reason = describe_provider_choice(
+        None, "repo-provider", cfg, issue_labels=["harness:opencode"],
+    )
+    assert reason == "opencode (via label 'harness:opencode')"
+
+
+def test_describe_provider_choice_ambiguous_label_names_shadowed_too() -> None:
+    """#1889: two providers.labels matches on one issue names BOTH the
+    winner and the loser, mirroring describe_model_choice's #1633
+    shadowed_labels phrasing — a route that looks surprising is
+    self-explaining instead of read from source."""
+    cfg = ProvidersConfig(
+        default="claude",
+        labels={"harness:opencode": "opencode", "harness:claude": "claude"},
+    )
+    reason = describe_provider_choice(
+        None, None, cfg, issue_labels=["harness:claude", "harness:opencode"],
+    )
+    assert reason == (
+        "opencode (via label 'harness:opencode', shadowing 'harness:claude')"
+    )
+
+
+def test_describe_provider_choice_explicit_spec_still_wins_over_label() -> None:
+    """An explicit --provider always wins the phrasing outright, regardless
+    of what a providers.labels match found underneath it."""
+    cfg = ProvidersConfig(default="claude", labels={"harness:opencode": "opencode"})
+    reason = describe_provider_choice(
+        "claude", "repo-provider", cfg, issue_labels=["harness:opencode"],
+    )
+    assert reason == "claude (explicit --provider)"
+
+
+def test_describe_provider_choice_no_label_match_falls_through_to_repo() -> None:
+    cfg = ProvidersConfig(default="claude", labels={"harness:opencode": "opencode"})
+    reason = describe_provider_choice(
+        None, "repo-provider", cfg, issue_labels=["bug"],
+    )
+    assert reason == "repo-provider (repo default: Repo.provider)"
 
 
 # ── parse_log delegation ──────────────────────────────────────────────────────

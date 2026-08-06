@@ -507,6 +507,10 @@ class DispatchOutcome:
     # model was ever resolved) or for a non-"work" proposal_type.
     model: str | None = None
     model_reason: str | None = None
+    # #1889: mirrors `model_reason` above, for the effective PROVIDER
+    # instead — see `coord.providers.describe_provider_choice`. `None` on a
+    # failed outcome (no provider was ever resolved).
+    provider_reason: str | None = None
 
 
 def dispatch_entry(
@@ -619,17 +623,23 @@ def dispatch_entry(
         if proposal_type == "work"
         else (None, None, [])
     )
+    # #1889: providers.labels gets the identical type="work"-only gating —
+    # this is also the daemon's auto-drain tick, a headless path with no
+    # human to type `--provider`, exactly what #1889 exists for.
+    provider_issue_labels = issue_labels if proposal_type == "work" else None
     # #1706 review fix: milestone dispatch has no per-call `--provider`
-    # override, so the effective provider is spec(None) → repo → default —
-    # same chain `coord.dispatch.dispatch()` uses. Route model resolution
-    # through `resolve_dispatch_model_alias` so a non-claude/claude-pty
-    # provider's own pinned `model` isn't shadowed by `models.default`; see
-    # that function's docstring for the full rationale. Without this,
-    # `resolved_model` was always truthy by the time it reached
-    # `Proposal.model`, so `dispatch()`'s own provider-aware fallback could
-    # never fire for `coord milestone dispatch`.
+    # override, so the effective provider is spec(None) → label → repo →
+    # default — same chain `coord.dispatch.dispatch()` uses. Route model
+    # resolution through `resolve_dispatch_model_alias` so a non-claude/
+    # claude-pty provider's own pinned `model` isn't shadowed by
+    # `models.default`; see that function's docstring for the full
+    # rationale. Without this, `resolved_model` was always truthy by the
+    # time it reached `Proposal.model`, so `dispatch()`'s own
+    # provider-aware fallback could never fire for `coord milestone
+    # dispatch`.
     effective_provider_name = resolve_provider_name(
         None, repo_cfg.provider, config.providers,
+        issue_labels=provider_issue_labels,
     )
     resolved_model = resolve_dispatch_model_alias(
         explicit_model=None,
@@ -670,6 +680,18 @@ def dispatch_entry(
             )
         else:
             model_reason = "none (provider default; no --model support at this call site)"
+
+    # #1889: mirrors the model_reason block above — state which link of the
+    # spec(None) → providers.labels → repo → default chain
+    # (coord.providers.resolve_provider_name) won, so a providers.labels
+    # match (e.g. `harness:opencode`) is legible in `coord milestone
+    # dispatch`'s output, not just discoverable via coordinator.yml.
+    from coord.providers import describe_provider_choice  # noqa: PLC0415
+
+    provider_reason = describe_provider_choice(
+        None, repo_cfg.provider, config.providers,
+        issue_labels=provider_issue_labels,
+    )
 
     proposal = Proposal(
         id=0,
@@ -725,4 +747,5 @@ def dispatch_entry(
         assignment_id=str(assignment_id),
         model=resolved_model,
         model_reason=model_reason,
+        provider_reason=provider_reason,
     )

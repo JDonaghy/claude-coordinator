@@ -1615,6 +1615,179 @@ class TestProviderDispatch:
         assert payload.get("provider") == "spec-provider"
 
 
+class TestProviderLabelDispatch:
+    """#1889 acceptance: `providers.labels` — a per-issue-label provider
+    override, resolved via `proposal.issue_labels` and slotted into
+    `resolve_provider_name`'s precedence chain between the per-assignment
+    override and the repo default. Exercises the actual `dispatch()`
+    chokepoint every headless path (coord assign, coord approve, coord
+    milestone dispatch, coord drive, the drive queue, the auto-loop) funnels
+    through, so a fix here covers all of them without a flag to remember."""
+
+    def _cfg(self, *, repo_provider: str | None = None) -> Config:
+        return Config(
+            repos=[Repo(name="api", github="acme/api", provider=repo_provider)],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+            )],
+            providers=ProvidersConfig(
+                default="claude",
+                definitions={
+                    "claude": ProviderDef(type="claude"),
+                    "fast-claude": ProviderDef(type="claude"),
+                },
+                labels={"harness:opencode": "fast-claude"},
+            ),
+        )
+
+    @patch("coord.dispatch.httpx.post")
+    def test_labelled_issue_with_no_spec_provider_resolves_to_label(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """An issue labelled harness:opencode, dispatched via a path that
+        passes no --provider (proposal.provider=None), resolves to the
+        labelled provider."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "abc"}
+        mock_post.return_value = mock_resp
+
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=10, issue_title="Fix auth", rationale="ok",
+            issue_labels=["harness:opencode"],
+        )
+        result = dispatch(p, self._cfg())
+        assert result["_provider_name"] == "fast-claude"
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload.get("provider") == "fast-claude"
+
+    @patch("coord.dispatch.httpx.post")
+    def test_same_issue_without_label_resolves_to_default(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """The same issue WITHOUT the label resolves to the repo/global
+        default (here: providers.default, since the repo has none set)."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "abc"}
+        mock_post.return_value = mock_resp
+
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=10, issue_title="Fix auth", rationale="ok",
+            issue_labels=["bug"],
+        )
+        result = dispatch(p, self._cfg())
+        assert result["_provider_name"] == "claude"
+        payload = mock_post.call_args.kwargs["json"]
+        assert "provider" not in payload
+
+    @patch("coord.dispatch.httpx.post")
+    def test_explicit_spec_provider_still_beats_label(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """An explicit proposal.provider (the `--provider` flag's carrier)
+        still beats a providers.labels match — the precedence chain's top
+        link is unchanged."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "abc"}
+        mock_post.return_value = mock_resp
+
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=10, issue_title="Fix auth", rationale="ok",
+            issue_labels=["harness:opencode"], provider="claude",
+        )
+        result = dispatch(p, self._cfg())
+        assert result["_provider_name"] == "claude"
+
+    @patch("coord.dispatch.httpx.post")
+    def test_label_beats_repo_provider(self, mock_post: MagicMock) -> None:
+        """The label link sits above the repo default in the chain — a
+        per-issue harness eval overrides even a repo pinned to a different
+        provider, with no coordinator.yml edit."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "abc"}
+        mock_post.return_value = mock_resp
+
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=10, issue_title="Fix auth", rationale="ok",
+            issue_labels=["harness:opencode"],
+        )
+        result = dispatch(p, self._cfg(repo_provider="claude"))
+        assert result["_provider_name"] == "fast-claude"
+
+    @patch("coord.dispatch.httpx.post")
+    def test_plan_type_proposal_not_routed_by_label(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """#1430 gating mirrored for providers.labels: a plan-stage
+        proposal must not inherit a harness-eval label meant for the
+        eventual work dispatch — same restriction models.labels uses."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "abc"}
+        mock_post.return_value = mock_resp
+
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=10, issue_title="Fix auth", rationale="ok",
+            issue_labels=["harness:opencode"], type="plan",
+        )
+        result = dispatch(p, self._cfg())
+        assert result["_provider_name"] == "claude"
+
+    @patch("coord.dispatch.httpx.post")
+    def test_provider_label_vs_model_label_conflict_provider_pin_wins(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """#1889's sharp edge (the #1798 class of bug, one level up): an
+        issue carries BOTH a providers.labels match (harness:opencode ->
+        opencode, whose definition pins a model) AND a models.labels match
+        (tier:small -> a Claude alias). #1798 already settled model-vs-
+        provider-pin (the pin wins over label-routed models); this proves
+        that decision still holds once the PROVIDER itself is also
+        label-routed, not just repo/default-routed — i.e. the two label
+        levers compose instead of silently disagreeing."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "abc"}
+        mock_post.return_value = mock_resp
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+                # #1711: opencode is a non-implicit provider TYPE — declare
+                # it so the capability gate doesn't refuse before this
+                # test's actual concern (label composition) ever runs.
+                capabilities=["provider:opencode"],
+            )],
+            providers=ProvidersConfig(
+                default="claude",
+                definitions={
+                    "claude": ProviderDef(type="claude"),
+                    "opencode": ProviderDef(type="opencode", model="opencode/glm-5.2"),
+                },
+                labels={"harness:opencode": "opencode"},
+            ),
+            models=ModelsConfig(labels={"tier:small": "haiku"}),
+        )
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=10, issue_title="Fix auth", rationale="ok",
+            issue_labels=["harness:opencode", "tier:small"],
+        )
+        result = dispatch(p, cfg)
+        assert result["_provider_name"] == "opencode"
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload.get("provider") == "opencode"
+        assert payload["model"] is None, (
+            "the opencode definition's own pinned model must win over the "
+            f"tier:small -> 'haiku' Claude-alias label match; got {payload['model']!r}"
+        )
+
+
 class TestProviderDefInPayload:
     """#1796 fix iteration 1 (review finding, blocking): dispatch() must be
     able to carry the resolved provider's own definition (type/binary/model/

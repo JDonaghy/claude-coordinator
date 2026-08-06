@@ -520,6 +520,55 @@ class TestResolveModels:
         resolve_models([p], cfg, issues_by_repo)
         assert p.model is None
 
+    def test_issue_labels_stamped_even_when_model_already_set(self) -> None:
+        """#1889: `proposal.issue_labels` is stamped regardless of whether
+        `proposal.model` was already resolved — `filter_unroutable_provider_
+        proposals` (below) needs it for providers.labels even when models
+        .labels already decided the model."""
+        cfg = self._config_with_labels()
+        p = self._proposal(issue_number=10, model="haiku")
+        issues_by_repo = {
+            "api": [{"number": 10, "title": "x", "labels": [{"name": "tier:large"}]}]
+        }
+        resolve_models([p], cfg, issues_by_repo)
+        assert p.model == "haiku"  # unchanged (existing #1430 behavior)
+        assert p.issue_labels == ["tier:large"]  # #1889: stamped anyway
+
+    def test_issue_labels_stamped_when_only_providers_labels_configured(self) -> None:
+        """#1889: providers.labels alone (no models.labels) must still make
+        resolve_models() stamp `proposal.issue_labels` — a provider-only
+        harness eval must not require models.labels to also be configured
+        just to get its issue's labels threaded through to
+        filter_unroutable_provider_proposals."""
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(name="laptop", host="laptop.tailnet", repos=["api"])],
+            providers=ProvidersConfig(
+                definitions={"opencode": ProviderDef(type="opencode")},
+                labels={"harness:opencode": "opencode"},
+            ),
+        )
+        p = self._proposal(issue_number=10)
+        issues_by_repo = {
+            "api": [{"number": 10, "title": "x", "labels": [{"name": "harness:opencode"}]}]
+        }
+        resolve_models([p], cfg, issues_by_repo)
+        assert p.issue_labels == ["harness:opencode"]
+        assert p.model is None  # no models.labels configured -> unchanged
+
+    def test_neither_labels_kind_configured_is_still_a_noop(self) -> None:
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(name="laptop", host="laptop.tailnet", repos=["api"])],
+        )
+        p = self._proposal(issue_number=10)
+        issues_by_repo = {
+            "api": [{"number": 10, "title": "x", "labels": [{"name": "documentation"}]}]
+        }
+        resolve_models([p], cfg, issues_by_repo)
+        assert p.model is None
+        assert p.issue_labels == []
+
     def test_propose_calls_resolve_models(self) -> None:
         """propose() should apply label-based model resolution to proposals."""
         cfg = self._config_with_labels()
@@ -677,6 +726,56 @@ class TestFilterUnroutableProviderProposals:
             issue_number=10, issue_title="Fix auth", rationale="best fit",
         )
         kept, dropped = filter_unroutable_provider_proposals([p], config)
+        assert kept == [p]
+        assert dropped == []
+
+    def test_label_routed_provider_is_resolved_via_issue_labels(self) -> None:
+        """#1889: a proposal whose `issue_labels` matches `providers.labels`
+        must be routed by the LABEL-resolved provider, not the repo's own
+        (implicit claude) default — so a machine that only declares
+        `provider:opencode` (not the repo's nominal default) is correctly
+        kept/dropped based on what will actually be dispatched."""
+        from coord.brain import filter_unroutable_provider_proposals
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],  # no repo.provider
+            machines=[Machine(name="laptop", host="laptop.tailnet", repos=["api"])],
+            providers=ProvidersConfig(
+                definitions={"opencode": ProviderDef(type="opencode")},
+                labels={"harness:opencode": "opencode"},
+            ),
+        )
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=10, issue_title="Fix auth", rationale="best fit",
+            issue_labels=["harness:opencode"],
+        )
+        kept, dropped = filter_unroutable_provider_proposals([p], cfg)
+        assert kept == []
+        assert len(dropped) == 1
+        assert "opencode" in dropped[0][1]
+
+    def test_plan_type_proposal_ignores_issue_labels_for_provider_routing(self) -> None:
+        """#1430 gating mirrored for providers.labels: a plan-stage proposal
+        must not be routed by a harness-eval label meant for the eventual
+        work dispatch — it's kept even though its (incidental) issue_labels
+        would otherwise route it to an opencode-only machine."""
+        from coord.brain import filter_unroutable_provider_proposals
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(name="laptop", host="laptop.tailnet", repos=["api"])],
+            providers=ProvidersConfig(
+                definitions={"opencode": ProviderDef(type="opencode")},
+                labels={"harness:opencode": "opencode"},
+            ),
+        )
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=10, issue_title="Fix auth", rationale="best fit",
+            issue_labels=["harness:opencode"], type="plan",
+        )
+        kept, dropped = filter_unroutable_provider_proposals([p], cfg)
         assert kept == [p]
         assert dropped == []
 

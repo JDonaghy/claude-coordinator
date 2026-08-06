@@ -7,10 +7,10 @@ Public API
     :class:`~coord.config.ProviderDef`'s ``type`` field.  Raises
     :class:`ValueError` for unknown types.
 
-``resolve_provider_name(spec_provider, repo_provider, providers_cfg) -> str``
+``resolve_provider_name(spec_provider, repo_provider, providers_cfg, issue_labels=None) -> str``
     Apply the precedence chain
-    ``spec → repo → providers.default → "claude"``
-    and return the winning provider name.
+    ``spec → providers.labels (issue_labels) → repo → providers.default → "claude"``
+    (#1889 inserted the label link) and return the winning provider name.
 
 ``get_provider(provider_name, cfg=None) -> Provider``
     #1710: the single coordinator-side helper that turns a bare
@@ -253,24 +253,40 @@ def resolve_provider_name(
     spec_provider: str | None,
     repo_provider: str | None,
     providers_cfg: "ProvidersConfig",
+    issue_labels: "list[str] | None" = None,
 ) -> str:
     """Return the effective provider name using the precedence chain.
 
     Precedence (highest to lowest):
     1. *spec_provider* — per-assignment override (``AssignmentSpec.provider``).
-    2. *repo_provider* — per-repo default (``Repo.provider`` in config).
-    3. ``providers_cfg.default`` — global default (defaults to ``"claude"``).
+    2. A ``providers.labels`` match against *issue_labels* (#1889) — e.g.
+       ``harness:opencode`` -> ``opencode``. See
+       :meth:`coord.config.ProvidersConfig.provider_for_labels` for the
+       match rule. ``None``/empty *issue_labels* (the default) skips this
+       link entirely, reproducing pre-#1889 behavior exactly.
+    3. *repo_provider* — per-repo default (``Repo.provider`` in config).
+    4. ``providers_cfg.default`` — global default (defaults to ``"claude"``).
 
     Args:
         spec_provider: Provider name from the assignment spec, or ``None``.
         repo_provider: Provider name from the repo config, or ``None``.
         providers_cfg: The parsed :class:`~coord.config.ProvidersConfig`.
+        issue_labels: The target issue's GitHub label names, or ``None``.
+            #1889: every caller gates this to ``type="work"`` proposals only
+            (pass ``None`` for plan/review/smoke dispatches) — the same
+            restriction ``models.labels`` uses (#1430), so a harness-eval
+            label meant for the eventual work dispatch never leaks into a
+            cheap/read-only stage.
 
     Returns:
         The winning provider name (always a non-empty string).
     """
     if spec_provider is not None:
         return spec_provider
+    if issue_labels:
+        label_provider = providers_cfg.provider_for_labels(issue_labels)
+        if label_provider is not None:
+            return label_provider
     if repo_provider is not None:
         return repo_provider
     return providers_cfg.default
@@ -280,30 +296,56 @@ def describe_provider_choice(
     spec_provider: str | None,
     repo_provider: str | None,
     providers_cfg: "ProvidersConfig",
+    issue_labels: "list[str] | None" = None,
 ) -> str:
     """Format a one-line explanation of why the effective provider was chosen.
 
     #1707: mirrors ``coord.config.describe_model_choice``'s shape — state the
-    winning name AND which link of the ``spec → repo → providers.default``
-    precedence chain (:func:`resolve_provider_name`) supplied it, so
+    winning name AND which link of the
+    ``spec → label → repo → providers.default`` precedence chain
+    (:func:`resolve_provider_name`) supplied it, so
     ``coord assign --dry-run --provider ...`` (and any other dry-run/status
     caller) never leaves an operator guessing whether a provider came from an
-    explicit ``--provider``, a repo default, or the global fallback — the
-    exact ambiguity #1454 fixed for models.
+    explicit ``--provider``, a ``providers.labels`` match, a repo default, or
+    the global fallback — the exact ambiguity #1454 fixed for models.
+
+    #1889: when a ``providers.labels`` match won, names the matched label
+    (and any other configured label present on the issue that it shadowed —
+    mirrors :func:`coord.config.describe_model_choice`'s
+    *shadowed_labels* phrasing, #1633), so a route that might look
+    surprising is self-explaining at dispatch time instead of read from
+    source — the exact transparency gap #1798 called out for the sibling
+    model-label lever.
 
     Args:
         spec_provider: Provider name from the assignment spec / CLI flag, or
             ``None``.
         repo_provider: Provider name from the repo config, or ``None``.
         providers_cfg: The parsed :class:`~coord.config.ProvidersConfig`.
+        issue_labels: The target issue's GitHub label names, or ``None`` —
+            see :func:`resolve_provider_name`'s docstring for the
+            ``type="work"``-only gating every caller applies.
 
     Returns:
-        E.g. ``"opencode (explicit --provider)"`` or
+        E.g. ``"opencode (explicit --provider)"``,
+        ``"opencode (via label 'harness:opencode')"``, or
         ``"claude (providers.default)"``.
     """
-    name = resolve_provider_name(spec_provider, repo_provider, providers_cfg)
+    name = resolve_provider_name(spec_provider, repo_provider, providers_cfg, issue_labels)
     if spec_provider is not None:
         return f"{name} (explicit --provider)"
+    if issue_labels:
+        _, matched_label, shadowed_labels = providers_cfg.provider_for_labels_with_reason(
+            issue_labels
+        )
+        if matched_label:
+            if shadowed_labels:
+                shadowed_str = ", ".join(repr(label) for label in shadowed_labels)
+                return (
+                    f"{name} (via label {matched_label!r}, "
+                    f"shadowing {shadowed_str})"
+                )
+            return f"{name} (via label {matched_label!r})"
     if repo_provider is not None:
         return f"{name} (repo default: Repo.provider)"
     return f"{name} (providers.default)"
@@ -566,12 +608,13 @@ def guard_unattended_dispatch(
     providers_cfg: "ProvidersConfig",
     models_cfg: "ModelsConfig | None" = None,
     where: str = "unattended dispatch",
+    issue_labels: "list[str] | None" = None,
 ) -> str:
     """STRUCTURAL TOS-COMPLIANCE GATE for unattended dispatch (#437).
 
     Resolves the effective provider name with :func:`resolve_provider_name`
-    (precedence: spec → repo → providers.default), then instantiates the
-    provider via :func:`build_provider` and inspects its
+    (precedence: spec → label → repo → providers.default), then
+    instantiates the provider via :func:`build_provider` and inspects its
     :class:`~coord.providers.base.Capabilities`.  Raises :class:`ValueError`
     if ``capabilities().human_attended_only`` is ``True`` — that flag means
     the backend (currently :class:`~coord.providers.claude_pty.ClaudePtyProvider`,
@@ -595,6 +638,11 @@ def guard_unattended_dispatch(
         where: Short description of the calling site (e.g.
             ``"coord approve / dispatch"``) — interpolated into the error
             message so the human knows which path refused.
+        issue_labels: The target issue's GitHub label names, or ``None``
+            (#1889) — forwarded to :func:`resolve_provider_name` for
+            ``providers.labels`` resolution. Callers gate this to
+            ``type="work"`` proposals only, mirroring ``models.labels``
+            (#1430); ``None`` reproduces pre-#1889 behavior exactly.
 
     Returns:
         The effective provider name (also returned for callers that want to
@@ -605,7 +653,7 @@ def guard_unattended_dispatch(
             The message names the provider, explains why, and points the
             user at ``coord assign --interactive``.
     """
-    name = resolve_provider_name(spec_provider, repo_provider, providers_cfg)
+    name = resolve_provider_name(spec_provider, repo_provider, providers_cfg, issue_labels)
     definition = providers_cfg.definitions.get(name)
     if definition is None:
         # Unknown name (not in registry) → fall through; the agent's own
