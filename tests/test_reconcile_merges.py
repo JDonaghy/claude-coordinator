@@ -1321,3 +1321,120 @@ def test_wedged_review_repair_respects_issue_filter(monkeypatch, config) -> None
     assert a2.review_state == "done"
     assert ("wedged_review_reset", "ta-1117") in writes
     assert ("wedged_review_reset", "ta-2000") not in writes
+
+
+# ── #1767 drop stale drive escalations for out-of-band resolutions ─────────
+
+
+def test_dismisses_escalation_when_issue_is_terminal(monkeypatch, config) -> None:
+    from coord import state
+
+    state._record_drive_escalation_local(
+        "api", 42,
+        stage="merge",
+        reason="merge: BLOCKED — smoke_required",
+        gate_readings="smoke=missing",
+        proposed_command="gh pr merge 9 --rebase",
+    )
+    _patch_probes(monkeypatch, terminal=True)
+
+    actions = reconcile_board_merges(Board(), config)
+
+    assert state._get_drive_escalation_local("api", 42) is None
+    assert any("dismiss escalation" in s and "#1767" in s for s in actions)
+
+
+def test_leaves_escalation_when_issue_still_open(monkeypatch, config) -> None:
+    from coord import state
+
+    state._record_drive_escalation_local(
+        "api", 42,
+        stage="merge",
+        reason="merge: BLOCKED — smoke_required",
+        gate_readings="smoke=missing",
+        proposed_command="gh pr merge 9 --rebase",
+    )
+    _patch_probes(monkeypatch, terminal=False)
+
+    actions = reconcile_board_merges(Board(), config)
+
+    assert state._get_drive_escalation_local("api", 42) is not None
+    assert not any("dismiss escalation" in s for s in actions)
+
+
+def test_escalation_dismiss_dry_run_makes_no_writes(monkeypatch, config) -> None:
+    from coord import state
+
+    state._record_drive_escalation_local(
+        "api", 42,
+        stage="merge",
+        reason="merge: BLOCKED — smoke_required",
+        gate_readings="smoke=missing",
+        proposed_command="gh pr merge 9 --rebase",
+    )
+    _patch_probes(monkeypatch, terminal=True)
+
+    actions = reconcile_board_merges(Board(), config, dry_run=True)
+
+    assert state._get_drive_escalation_local("api", 42) is not None
+    assert any(
+        "dismiss escalation" in s and "[dry-run]" in s for s in actions
+    )
+
+
+def test_escalation_for_unknown_repo_is_left_alone(monkeypatch, config) -> None:
+    """The drive-queue's own synthetic alert entry (repo_name="(drive-queue)",
+    not a real GitHub repo) must never be probed via `gh` or dismissed by
+    this sweep — it has its own lifecycle (#1753 DQ-1)."""
+    from coord import state
+
+    state._record_drive_escalation_local(
+        "(drive-queue)", 0,
+        stage="queue-alert",
+        reason="QUEUE: BLOCKED 2",
+        gate_readings="",
+        proposed_command="",
+    )
+    _patch_probes(monkeypatch, terminal=True)
+
+    reconcile_board_merges(Board(), config)
+
+    assert state._get_drive_escalation_local("(drive-queue)", 0) is not None
+
+
+def test_escalation_dismiss_respects_issue_filter(monkeypatch, config) -> None:
+    from coord import state
+
+    state._record_drive_escalation_local(
+        "api", 42, stage="merge", reason="r1", gate_readings="", proposed_command="",
+    )
+    state._record_drive_escalation_local(
+        "api", 99, stage="merge", reason="r2", gate_readings="", proposed_command="",
+    )
+    _patch_probes(monkeypatch, terminal=True)
+
+    reconcile_board_merges(Board(), config, issue=42)
+
+    assert state._get_drive_escalation_local("api", 42) is None
+    assert state._get_drive_escalation_local("api", 99) is not None
+
+
+def test_merging_via_coord_merge_leaves_no_dangling_escalation_after_reconcile(
+    monkeypatch, config
+) -> None:
+    """End-to-end sanity for the two-layer fix (#1767): a `work` row that's
+    already flipped to 'merged' with no lingering ghost still gets its
+    escalation cleared by this sweep, covering the case where the merge
+    happened out of band and only reconciliation ever sees it."""
+    from coord import state
+
+    a = _done_work(issue_number=7, branch="issue-7-fix", status="merged")
+    board = Board(completed=[a])
+    state._record_drive_escalation_local(
+        "api", 7, stage="merge", reason="stale", gate_readings="", proposed_command="",
+    )
+    _patch_probes(monkeypatch, terminal=True)
+
+    reconcile_board_merges(board, config)
+
+    assert state._get_drive_escalation_local("api", 7) is None
