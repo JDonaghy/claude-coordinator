@@ -215,7 +215,7 @@ fn dark_palette() -> quadraui::Theme {
         warning_fg: Color::rgb(200, 200, 70),            // pending/unknown  = yellow
         // ── Stage-badge overrides ─────────────────────────────────────────
         link_fg: Color::rgb(150, 200, 240),              // "work" stage
-        badge_request_changes: Color::rgb(200, 180, 100),// "review" stage
+        badge_warning: Color::rgb(200, 180, 100),// "review" stage
         diagnostic_hint: Color::rgb(180, 150, 220),      // "smoke" stage
         accent_fg: Color::rgb(100, 180, 240),            // "merge" stage / key accent
         // badge_passed default (120,200,120) covers the "done" stage badge.
@@ -276,13 +276,13 @@ fn light_palette() -> quadraui::Theme {
         badge_running: Color::rgb(40, 160, 40),          // active = darker green
         badge_passed: Color::rgb(40, 140, 40),           // done   = dark green
         badge_blocked: Color::rgb(185, 40, 40),          // failed = dark red
-        badge_request_changes: Color::rgb(155, 120, 0),  // review = dark amber
+        badge_warning: Color::rgb(155, 120, 0),  // review = dark amber
         diagnostic_hint: Color::rgb(110, 80, 180),       // smoke  = dark violet
         // ── Board ─────────────────────────────────────────────────────────
         board_selected_card_bg: Color::rgb(175, 210, 255),
         board_col_header_bg: Color::rgb(225, 228, 240),
-        decision_hint_bg: Color::rgb(228, 232, 252),
-        decision_hint_fg: Color::rgb(40, 60, 125),
+        card_hint_bg: Color::rgb(228, 232, 252),
+        card_hint_fg: Color::rgb(40, 60, 125),
         // Editor fields unused in coord-tui — light-appropriate defaults.
         editor_active_background: Color::rgb(255, 255, 255),
         cursorline_bg: Color::rgb(240, 243, 250),
@@ -364,13 +364,13 @@ fn high_contrast_palette() -> quadraui::Theme {
         badge_running: Color::rgb(0, 255, 0),            // active = pure green
         badge_passed: Color::rgb(0, 220, 0),             // done   = bright green
         badge_blocked: Color::rgb(255, 0, 0),            // failed = pure red
-        badge_request_changes: Color::rgb(255, 180, 0),  // review = bright amber
+        badge_warning: Color::rgb(255, 180, 0),  // review = bright amber
         diagnostic_hint: Color::rgb(200, 100, 255),      // smoke  = bright violet
         // ── Board ─────────────────────────────────────────────────────────
         board_selected_card_bg: Color::rgb(0, 80, 180),
         board_col_header_bg: Color::rgb(30, 30, 30),
-        decision_hint_bg: Color::rgb(20, 20, 20),
-        decision_hint_fg: fg,
+        card_hint_bg: Color::rgb(20, 20, 20),
+        card_hint_fg: fg,
         // Editor fields
         editor_active_background: bg,
         cursorline_bg: Color::rgb(20, 20, 20),
@@ -466,13 +466,13 @@ fn solarized_palette() -> quadraui::Theme {
         badge_running: green,                            // active = solarized green
         badge_passed: Color::rgb(100, 140, 40),          // done   = muted green
         badge_blocked: red,                             // failed = solarized red
-        badge_request_changes: orange,                  // review = solarized orange
+        badge_warning: orange,                  // review = solarized orange
         diagnostic_hint: violet,                        // smoke  = solarized violet
         // ── Board ─────────────────────────────────────────────────────────
         board_selected_card_bg: Color::rgb(0, 75, 90),
         board_col_header_bg: base02,
-        decision_hint_bg: Color::rgb(5, 50, 62),
-        decision_hint_fg: base1,
+        card_hint_bg: Color::rgb(5, 50, 62),
+        card_hint_fg: base1,
         // Editor fields
         editor_active_background: base03,
         cursorline_bg: Color::rgb(5, 50, 62),

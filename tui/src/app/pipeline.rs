@@ -588,7 +588,7 @@ impl PipelineNotVisible {
 ///
 /// Colour mapping (semantic → `quadraui::Theme` field, overridden per palette):
 /// - `"work"`   → `theme.link_fg`              (blue: active work item)
-/// - `"review"` → `theme.badge_request_changes` (amber: awaiting review)
+/// - `"review"` → `theme.badge_warning` (amber: awaiting review)
 /// - `"smoke"`  → `theme.diagnostic_hint`       (violet: smoke-test gate)
 /// - `"merge"`  → `theme.accent_fg`             (blue: merge stage)
 /// - `"done"`   → `theme.badge_passed`          (green: completed)
@@ -596,7 +596,7 @@ impl PipelineNotVisible {
 pub(crate) fn stage_badge(stage: &str, theme: &quadraui::Theme) -> (String, Color) {
     match stage {
         "work" => ("work".into(), theme.link_fg),
-        "review" => ("review".into(), theme.badge_request_changes),
+        "review" => ("review".into(), theme.badge_warning),
         "smoke" => ("smoke".into(), theme.diagnostic_hint),
         "merge" => ("merge".into(), theme.accent_fg),
         "done" => ("done".into(), theme.badge_passed),
@@ -2097,7 +2097,7 @@ impl CoordApp {
             NodeState::Done => ("done", self.active_theme.badge_passed),
             NodeState::InFlight => ("in-flight", self.active_theme.link_fg),
             NodeState::Ready => ("ready", self.active_theme.accent_fg),
-            NodeState::Blocked(_) => ("blocked", self.active_theme.badge_request_changes),
+            NodeState::Blocked(_) => ("blocked", self.active_theme.badge_warning),
         };
         // #1199 fix (duplicated-number label): a child that has aged out of
         // the `open_issues` cache (a closed/old sub-issue no longer synced —
