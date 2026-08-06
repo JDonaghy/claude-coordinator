@@ -14,6 +14,13 @@ name: Rust tests
 # step can write outside the workspace, unlike actions/checkout@v4 which
 # enforces a workspace-relative path restriction.
 
+# #1865: the path-dep clone below always pulls quadraui's *default* branch
+# (develop) — a moving target, not a pin. That's deliberate: it's what lets
+# this job catch a quadraui-side break at all. But it also means push/PR
+# triggers alone are blind to that class of break: a break in quadraui touches
+# nothing in this repo's tui/**, so nothing fires, and the workflow can sit
+# green-and-stale for hours (see #1865's timeline). The schedule/dispatch
+# triggers below put the job on quadraui's clock instead of tui/**'s churn.
 on:
   push:
     branches: [main]
@@ -27,6 +34,15 @@ on:
       - 'tui/**'
       # Self-trigger so edits to this workflow are exercised by their own PR.
       - '.github/workflows/cargo-test.yml'
+  # #1865: run once a day so a quadraui `develop` break is caught even when no
+  # tui/** file in *this* repo changed. Cadence is deliberately coarse — the
+  # same person works both repos in the same sessions, so the value here is
+  # catching a break before the next local rebuild, not sub-hour latency.
+  schedule:
+    - cron: '0 6 * * *'
+  # #1865: makes "is tui/ still buildable against quadraui develop?" a
+  # one-click question from the Actions tab instead of a local rebuild.
+  workflow_dispatch:
 
 jobs:
   cargo-test:
@@ -41,8 +57,22 @@ jobs:
       # actions/checkout@v4 refuses any `path:` outside $GITHUB_WORKSPACE, so we
       # use a plain `git clone` instead — shell steps are not subject to that
       # restriction and can write to the parent directory freely.
+      #
+      # #1865: the clone target is a moving branch (quadraui's default,
+      # develop), so this job's result depends on *when* it ran, not only on
+      # the commit under test. Log the SHA into the step summary so a red run
+      # can be triaged into "quadraui broke us" vs "this PR broke us" without
+      # re-deriving it by hand.
       - name: Check out quadraui (sibling path dep)
-        run: git clone https://github.com/${{ github.repository_owner }}/quadraui ../quadraui
+        run: |
+          git clone https://github.com/${{ github.repository_owner }}/quadraui ../quadraui
+          quadraui_sha="$(git -C ../quadraui rev-parse HEAD)"
+          {
+            echo "### quadraui SHA under test"
+            echo
+            echo "[\`$quadraui_sha\`](https://github.com/${{ github.repository_owner }}/quadraui/commit/$quadraui_sha)"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Building tui/ against quadraui @ $quadraui_sha"
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -61,6 +91,14 @@ jobs:
       - name: Install coord CLI (tui integration tests spawn it)
         run: pip install -e .
 
+      # #1865: scheduled/manual runs check tui/ against a moving quadraui
+      # develop, so a red run here reflects quadraui's state at run time, not
+      # a regression in whatever PR happens to be open. Only push/pull_request
+      # runs — which check a specific commit against develop *now*, and whose
+      # failure is what branch protection should act on — are allowed to fail
+      # the job. continue-on-error keeps schedule/workflow_dispatch reporting
+      # (still visible as a warning in the run) without ever gating a merge.
       - name: cargo test (tui)
         working-directory: tui
         run: cargo test
+        continue-on-error: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
