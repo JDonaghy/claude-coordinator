@@ -1109,13 +1109,18 @@ def plan_tick(
        alert — being at capacity is the queue working, not a problem to
        report.
     4. Walk ``waiting`` by ``position``, FIRST ELIGIBLE WINS: an entry still
-       inside its startup grace window defers (#1794), unsatisfiable blocks
-       and escalates, unsatisfied defers (position unchanged), the first
-       eligible entry is the launch.  Everything after the launch is walked in
-       REPORT-ONLY mode (``Deferral.counted=False``, no updates) so
-       ``--dry-run`` can explain the rest of the queue.
-    5. No launch with at least one waiting entry ⇒ exactly ONE queue-level
-       alert.
+       inside its startup grace window defers (#1794); an entry whose own
+       issue is already landed (merged or closed) reconciles straight to
+       ``done`` without ever launching (#1873) — checked before its `after=`
+       graph, so a landed entry is never blocked or deferred on account of its
+       own now-irrelevant pre-reqs; unsatisfiable blocks and escalates,
+       unsatisfied defers (position unchanged), the first eligible entry is
+       the launch.  Everything after the launch is walked in REPORT-ONLY mode
+       (``Deferral.counted=False``, no updates) so ``--dry-run`` can explain
+       the rest of the queue.
+    5. No launch with at least one entry STILL genuinely waiting (deferred or
+       blocked — #1873 reconciliations do not count, see below) ⇒ exactly ONE
+       queue-level alert.
 
     An entry reconciled from ``running`` back to ``waiting`` in step 1 IS
     walked in step 4 — its attempt was already consumed, so a drive that died
@@ -1228,6 +1233,17 @@ def plan_tick(
         )
 
     launch: QueueEntry | None = None
+    # #1873: keys that reconciled straight to `done` in the walk below —
+    # landed under someone else's branch/PR, closed by hand as obsolete, or
+    # picked up by `coord reconcile-merges` — WITHOUT this queue ever
+    # launching them.  These must not count toward the queue-level alert
+    # below: they were neither deferred nor blocked, so they have nothing to
+    # show up in `details`, and counting them in "considered N" without a
+    # matching detail line is exactly the "considered N, N-1 explained"
+    # contradiction the "considered N" comment below warns about — see the
+    # #1864 incident this branch exists to fix, where the ENTIRE queue was
+    # this case and the tick has nothing to be stalled about.
+    landed_keys: set[str] = set()
     waiting = [e for e in ordered if states.get(e.key) == STATE_WAITING]
     for entry in waiting:
         if launch is not None:
@@ -1258,6 +1274,43 @@ def plan_tick(
                 )
             )
             continue
+        # #1873: checked BEFORE `_resolve_prereqs`, not after.  The entry's
+        # own board state is unconditional — if this issue is already landed,
+        # its `after=` graph is irrelevant, including when that graph is
+        # itself unsatisfiable (unknown pre-req, cycle, a pre-req that is
+        # `blocked`/`failed`).  Checking prereqs first would route a landed
+        # entry with a broken pre-req into the BLOCKED branch below, which
+        # escalates and demands a manual `remove && add` for an entry that
+        # needs neither — it is already done.  `_reconcile_running` catches
+        # this same fact for entries that WERE launched (:813); a `waiting`
+        # entry never enters that function at all, so nothing had checked the
+        # board against the entry's own issue until now.
+        facts = board.facts(entry.key)
+        if facts.landed:
+            witness = "merged" if facts.merged else "closed"
+            reason = (
+                f"done — issue already {witness}, never launched by this queue"
+            )
+            reconciles.append(
+                Reconcile(
+                    entry.key,
+                    "done",
+                    reason,
+                    occupies=False,
+                    # attempts is deliberately NOT incremented: nothing was
+                    # ever launched for this entry, so charging it a retry
+                    # would be charging it for work that landed elsewhere
+                    # (same reasoning as the BLOCKED branch's "operator's
+                    # typo" comment just below).
+                    updates={
+                        "state": STATE_DONE,
+                        "last_reason": reason,
+                    },
+                )
+            )
+            states[entry.key] = STATE_DONE
+            landed_keys.add(entry.key)
+            continue
         verdict = _resolve_prereqs(entry, board, states, cycle_keys)
         if verdict.unsatisfiable:
             blocked.append(
@@ -1287,42 +1340,16 @@ def plan_tick(
                 )
             )
             continue
-        # #1873: the entry itself may already be done — landed under someone
-        # else's branch/PR, closed by hand as obsolete, or reconciled by
-        # `coord reconcile-merges` — without this queue ever having launched
-        # it.  `_reconcile_running` catches exactly this for entries that
-        # WERE launched (:813); a `waiting` entry never enters that function
-        # at all, so nothing had checked the board against the entry's own
-        # issue until now.  Reached only once prereqs are satisfied, which a
-        # landed entry with no unmet `after=` trivially is.
-        facts = board.facts(entry.key)
-        if facts.landed:
-            witness = "merged" if facts.merged else "closed"
-            reason = (
-                f"done — issue already {witness}, never launched by this queue"
-            )
-            reconciles.append(
-                Reconcile(
-                    entry.key,
-                    "done",
-                    reason,
-                    occupies=False,
-                    # attempts is deliberately NOT incremented: nothing was
-                    # ever launched for this entry, so charging it a retry
-                    # would be charging it for work that landed elsewhere
-                    # (same reasoning as the BLOCKED branch above, :1257).
-                    updates={
-                        "state": STATE_DONE,
-                        "last_reason": reason,
-                    },
-                )
-            )
-            states[entry.key] = STATE_DONE
-            continue
         launch = by_key[entry.key]
 
     alert: QueueAlert | None = None
-    if launch is None and waiting:
+    # `waiting`, minus anything the walk above reconciled straight to `done`
+    # (#1873) — those were never deferred or blocked, so they have no line in
+    # `details` and must not be counted as "considered" either.  What is left
+    # is exactly the set of entries that are genuinely still waiting: deferred
+    # or blocked, each with a matching `details` entry.
+    still_waiting = [e for e in waiting if e.key not in landed_keys]
+    if launch is None and still_waiting:
         details = [f"{item.key}: {item.reason}" for item in deferrals]
         details += [f"{item.key}: BLOCKED — {item.reason}" for item in blocked]
         alert = QueueAlert(
@@ -1331,8 +1358,8 @@ def plan_tick(
             # contradicts `coord drive-queue status` two lines below it is an
             # alert operators learn to distrust.
             reason=(
-                f"nothing eligible to launch: considered {len(waiting)} waiting "
-                f"entr{'y' if len(waiting) == 1 else 'ies'}, "
+                f"nothing eligible to launch: considered {len(still_waiting)} "
+                f"waiting entr{'y' if len(still_waiting) == 1 else 'ies'}, "
                 f"{capacity - occupied} free slot(s)"
             ),
             details=tuple(details),
