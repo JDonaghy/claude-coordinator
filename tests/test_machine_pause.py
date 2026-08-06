@@ -10,6 +10,7 @@ silently failed from the TUI.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
@@ -239,3 +240,52 @@ def test_unpause_cli_fails_loudly_when_daemon_unreachable(
     assert result.exit_code == 1
     assert "resumed: dellserver" not in result.output
     assert "error" in result.output.lower()
+
+
+# ── #1862 review: `coord unpause` on a quiet-covered machine, asserted on
+# the literal printed message ────────────────────────────────────────────────
+#
+# `tests/test_quiet_hours.py` and `tests/test_serve.py` already cover the
+# `UnpauseOutcome`/HTTP-JSON level of "quiet hours overridden". This is the
+# CLI-level check the #1862 review asked for: actually invoke `coord
+# unpause` via `CliRunner` against a quiet-covered machine and assert on the
+# exact string `coord/commands/agent_ops.py`'s `unpause()` prints — not just
+# that `outcome.kind == "quiet_override"` a few layers down.
+
+
+def test_unpause_cli_reports_the_quiet_hours_override_message(
+    tmp_home: Path, tmp_path: Path
+) -> None:
+    """A wide (~1h) window centered on the real clock, like
+    `test_serve.py::test_pause_endpoints_fold_in_quiet_hours`, so the test
+    isn't racy against wall-clock time."""
+    now = datetime.now(timezone.utc)
+    start = (now - timedelta(minutes=30)).time().replace(second=0, microsecond=0)
+    end = (now + timedelta(minutes=30)).time().replace(second=0, microsecond=0)
+    cfg = tmp_path / "coordinator.yml"
+    cfg.write_text(
+        "repos:\n"
+        "  - name: api\n"
+        "    github: acme/api\n"
+        "machines:\n"
+        "  - name: elitebook\n"
+        "    host: elitebook.tail\n"
+        "    quiet_hours:\n"
+        f"      start: \"{start.strftime('%H:%M')}\"\n"
+        f"      end: \"{end.strftime('%H:%M')}\"\n"
+        "      tz: UTC\n"
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["unpause", "--config", str(cfg), "elitebook"])
+    assert result.exit_code == 0, f"exit {result.exit_code}: {result.output}"
+    expected = (
+        f"elitebook: quiet hours overridden until {end.strftime('%H:%M')} "
+        f"(UTC) — resumes its normal quiet schedule next window"
+    )
+    assert expected in result.output
+
+    # Says what it did AND actually did it (#1563's failure class): the
+    # override sticks on the very next read of the same window.
+    data = json.loads(str((tmp_home / ".coord" / "paused_machines.json").read_text()))
+    assert data.get("quiet_overrides", {}).get("elitebook")

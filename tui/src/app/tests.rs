@@ -40102,11 +40102,12 @@ Milestone tracking issue.
         let mut app = make_app_default();
         assert!(app.paused_machines.is_empty());
         let (tx, rx) = std::sync::mpsc::channel();
-        tx.send(
-            ["dellserver".to_string(), "elitebook".to_string()]
+        tx.send(data::PausedFetch {
+            paused: ["dellserver".to_string(), "elitebook".to_string()]
                 .into_iter()
                 .collect(),
-        )
+            quiet: std::collections::HashSet::new(),
+        })
         .unwrap();
         app.pending_paused_machines = Some(rx);
 
@@ -40130,8 +40131,11 @@ Milestone tracking issue.
         let mut app = make_app_default();
         app.paused_machines.insert("dellserver".to_string());
         let (tx, rx) = std::sync::mpsc::channel();
-        tx.send(["dellserver".to_string()].into_iter().collect())
-            .unwrap();
+        tx.send(data::PausedFetch {
+            paused: ["dellserver".to_string()].into_iter().collect(),
+            quiet: std::collections::HashSet::new(),
+        })
+        .unwrap();
         app.pending_paused_machines = Some(rx);
 
         // Same set both sides agree on → no redundant update reported, but
@@ -40143,7 +40147,7 @@ Milestone tracking issue.
     #[test]
     fn poll_paused_machines_noop_while_empty() {
         let mut app = make_app_default();
-        let (_tx, rx) = std::sync::mpsc::channel::<std::collections::HashSet<String>>();
+        let (_tx, rx) = std::sync::mpsc::channel::<data::PausedFetch>();
         app.pending_paused_machines = Some(rx);
         // Nothing sent yet → no update, receiver retained for a later poll.
         assert!(!app.poll_paused_machines());
@@ -40153,7 +40157,7 @@ Milestone tracking issue.
     #[test]
     fn poll_paused_machines_disconnected_clears_pending() {
         let mut app = make_app_default();
-        let (tx, rx) = std::sync::mpsc::channel::<std::collections::HashSet<String>>();
+        let (tx, rx) = std::sync::mpsc::channel::<data::PausedFetch>();
         drop(tx);
         app.pending_paused_machines = Some(rx);
         assert!(!app.poll_paused_machines());
@@ -40178,9 +40182,12 @@ Milestone tracking issue.
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("spawn_paused_machines_fetch must deliver a result before the timeout");
 
-        assert_eq!(got.len(), 2);
-        assert!(got.contains("dellserver"));
-        assert!(got.contains("precision"));
+        assert_eq!(got.paused.len(), 2);
+        assert!(got.paused.contains("dellserver"));
+        assert!(got.paused.contains("precision"));
+        // Fixture response has no "quiet" key — must degrade to empty
+        // rather than erroring on the missing optional field.
+        assert!(got.quiet.is_empty());
 
         let requests = mock.requests();
         assert_eq!(
@@ -40207,10 +40214,84 @@ Milestone tracking issue.
 
         let got = fetch_paused_machines();
         assert!(
-            got.is_empty(),
-            "a malformed daemon response must degrade to an empty set, got {:?}",
+            got.paused.is_empty() && got.quiet.is_empty(),
+            "a malformed daemon response must degrade to an empty result, got {:?}",
             got
         );
+    }
+
+    /// #1862: the daemon's `/pause` response distinguishes a quiet-hours
+    /// pause from a hand pause via an optional `quiet` array (always a
+    /// subset of `paused`) — the wire format `coord.serve_app.get_pause`
+    /// emits. Assert the TUI's fetch parses it into `PausedFetch.quiet`
+    /// rather than only ever reading `paused`.
+    #[test]
+    fn spawn_paused_machines_fetch_parses_quiet_field() {
+        let mock = MockBoardService::start(
+            r#"{"paused": ["dellserver", "elitebook"], "quiet": ["elitebook"]}"#,
+        );
+        let _guard = set_test_board_service(mock.url(), None);
+
+        let rx = spawn_paused_machines_fetch();
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("spawn_paused_machines_fetch must deliver a result before the timeout");
+
+        assert_eq!(
+            got.paused,
+            ["dellserver".to_string(), "elitebook".to_string()]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(got.quiet, ["elitebook".to_string()].into_iter().collect());
+    }
+
+    /// #1862 review finding: an operator debugging a stalled queue at 1AM
+    /// needs to tell a quiet-hours-covered machine apart from a
+    /// hand-paused one in the TUI sidebar, not just in `coord status`.
+    /// "elitebook" is quiet-paused (badge `[QUIET]`), "dellserver" is
+    /// hand-paused only (badge `[PAUSED]`), "precision" is neither.
+    #[test]
+    fn machines_list_badges_quiet_paused_machine_differently_from_hand_paused() {
+        fn machine(name: &str) -> Machine {
+            Machine {
+                name: name.to_string(),
+                host: String::new(),
+                reachable: true,
+                active_count: 0,
+                repos: vec![],
+                version: None,
+                worktree_bytes: 0,
+            }
+        }
+        let data = BoardData {
+            machines: vec![machine("dellserver"), machine("elitebook"), machine("precision")],
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+        app.paused_machines = ["dellserver".to_string(), "elitebook".to_string()]
+            .into_iter()
+            .collect();
+        app.quiet_paused_machines = ["elitebook".to_string()].into_iter().collect();
+
+        let list = app.machines_list(true);
+        let row_text = |name: &str| -> String {
+            list.items
+                .iter()
+                .zip(app.data.machines.iter())
+                .find(|(_, m)| m.name == name)
+                .map(|(item, _)| {
+                    item.text.spans.iter().map(|s| s.text.as_str()).collect::<String>()
+                })
+                .unwrap_or_default()
+        };
+
+        assert!(row_text("dellserver").contains("[PAUSED]"), "{}", row_text("dellserver"));
+        assert!(!row_text("dellserver").contains("[QUIET]"));
+        assert!(row_text("elitebook").contains("[QUIET]"), "{}", row_text("elitebook"));
+        assert!(!row_text("elitebook").contains("[PAUSED]"));
+        assert!(!row_text("precision").contains("[PAUSED]"));
+        assert!(!row_text("precision").contains("[QUIET]"));
     }
 
     // ── #1553: oracle-loop slice work is attributed to the CHILD issue ──────

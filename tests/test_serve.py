@@ -142,16 +142,20 @@ def test_pause_endpoints_roundtrip(
     cfg = load_config(valid_config_path)
     app = build_app(SqliteStore(file_db), cfg)
     with TestClient(app) as cli:
-        assert cli.get("/pause").json() == {"paused": []}
+        assert cli.get("/pause").json() == {"paused": [], "quiet": []}
 
         resp = cli.post("/pause", json={"machine": "laptop", "action": "pause"})
         assert resp.status_code == 200
-        assert resp.json() == {"paused": ["laptop"], "changed": True}
-        assert cli.get("/pause").json() == {"paused": ["laptop"]}
+        # "laptop" has no `quiet_hours` in this fixture config, so the hand
+        # pause never shows up in "quiet" — #1862: that's what lets a thin
+        # client (the TUI included) tell a hand pause apart from a
+        # quiet-hours one from this same endpoint.
+        assert resp.json() == {"paused": ["laptop"], "quiet": [], "changed": True}
+        assert cli.get("/pause").json() == {"paused": ["laptop"], "quiet": []}
 
         # Pausing an already-paused machine is idempotent: changed=False.
         resp = cli.post("/pause", json={"machine": "laptop", "action": "pause"})
-        assert resp.json() == {"paused": ["laptop"], "changed": False}
+        assert resp.json() == {"paused": ["laptop"], "quiet": [], "changed": False}
 
         resp = cli.post("/pause", json={"machine": "laptop", "action": "unpause"})
         assert resp.status_code == 200
@@ -160,7 +164,7 @@ def test_pause_endpoints_roundtrip(
         # client can never mistake one for the other. "laptop" has no
         # `quiet_hours` in this fixture config, so it's a plain resume.
         assert resp.json() == {
-            "paused": [], "changed": True, "kind": "resumed",
+            "paused": [], "quiet": [], "changed": True, "kind": "resumed",
             "quiet_until": None, "tz": None,
         }
 
@@ -217,8 +221,10 @@ def test_pause_endpoints_fold_in_quiet_hours(
     app = build_app(SqliteStore(file_db), cfg)
     with TestClient(app) as cli:
         # Quiet-hours-covered machine shows up in /pause with no explicit
-        # `coord pause` ever having been called.
-        assert cli.get("/pause").json() == {"paused": ["elitebook"]}
+        # `coord pause` ever having been called — and, #1862 review finding,
+        # it's also named in "quiet" so a thin client (the TUI included)
+        # can tell it apart from a hand pause without a second lookup.
+        assert cli.get("/pause").json() == {"paused": ["elitebook"], "quiet": ["elitebook"]}
 
         # `coord unpause elitebook` grants an override — not a silent no-op,
         # not a lie ("changed" is True and it SAYS what it did, #1563).
@@ -229,14 +235,17 @@ def test_pause_endpoints_fold_in_quiet_hours(
         assert body["kind"] == "quiet_override"
         assert body["tz"] == "UTC"
         assert body["paused"] == []
+        assert body["quiet"] == []
 
         # The override sticks on the very next read (the #1563 failure class
         # this closes: `coord unpause` reporting success and then having the
-        # machine paused again on the next poll).
-        assert cli.get("/pause").json() == {"paused": []}
+        # machine paused again on the next poll) — and it's no longer
+        # reported as quiet-paused either.
+        assert cli.get("/pause").json() == {"paused": [], "quiet": []}
 
         # A machine with no `quiet_hours:` block is never touched.
         assert "server" not in cli.get("/pause").json()["paused"]
+        assert "server" not in cli.get("/pause").json()["quiet"]
 
 
 def test_pause_on_thin_client_reaches_daemon_and_blocks_dispatch(

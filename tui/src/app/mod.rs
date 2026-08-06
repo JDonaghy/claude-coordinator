@@ -2243,12 +2243,23 @@ pub struct CoordApp {
     /// `best_machine_for()` keep selecting a machine the operator just
     /// paused — see `spawn_paused_machines_fetch`/`poll_paused_machines`.
     paused_machines: std::collections::HashSet<String>,
+    /// #1862: subset of `paused_machines` that's paused specifically
+    /// because a `quiet_hours` window covers the current moment, rather
+    /// than an explicit `coord pause` — lets `machines_list()` badge a
+    /// quiet-paused machine differently from a hand-paused one (the
+    /// acceptance criterion that a 1AM operator can tell "asleep until
+    /// 08:00" from "someone paused this"). Only ever populated via the
+    /// daemon's `GET /pause` (`data::PausedFetch`'s `quiet` field) — see
+    /// its doc comment for why the local-file fallback always leaves this
+    /// empty. Never consulted for routing, display only.
+    quiet_paused_machines: std::collections::HashSet<String>,
     /// #1563: in-flight background fetch of the paused-machine set (local
     /// file read or daemon `GET /pause`, whichever `spawn_paused_machines_fetch`
     /// determined applies). Armed at startup and re-armed by `refresh()` on
     /// the same cadence as `pending_remote_sessions`/`pending_drive_sessions`;
-    /// `poll_paused_machines()` drains it into `paused_machines`.
-    pending_paused_machines: Option<std::sync::mpsc::Receiver<std::collections::HashSet<String>>>,
+    /// `poll_paused_machines()` drains it into `paused_machines`/
+    /// `quiet_paused_machines`.
+    pending_paused_machines: Option<std::sync::mpsc::Receiver<data::PausedFetch>>,
     /// #245: pending `coord merge --force-merge` confirmation.  `Some(repo)`
     /// means the user pressed `m` while the "Checks failed" hint was visible
     /// and we're waiting for one-key confirmation before bypassing the CI
@@ -3474,6 +3485,7 @@ impl CoordApp {
             chat_last_activity: None,
             chat_spinner_throttle: 0,
             paused_machines: read_paused_machines(),
+            quiet_paused_machines: std::collections::HashSet::new(),
             pending_paused_machines: Some(spawn_paused_machines_fetch()),
             pending_force_merge: None,
             pending_merge_all_ready: None,
@@ -6556,7 +6568,16 @@ impl CoordApp {
                 // glance which rows are excluded from routing.  Amber so
                 // it doesn't read as a failure (machine is healthy, just
                 // deliberately offline for new work).
-                if self.paused_machines.contains(&m.name) {
+                //
+                // #1862: a quiet-hours pause gets its own badge/color — an
+                // operator debugging a stalled queue at 1AM needs to tell
+                // "asleep until 08:00" (nothing to do) from "someone
+                // paused this" (maybe worth investigating) at a glance.
+                // Blue so it reads as scheduled/expected rather than the
+                // amber "someone did this" signal.
+                if self.quiet_paused_machines.contains(&m.name) {
+                    spans.push(StyledSpan::with_fg(" [QUIET]", Color::rgb(90, 160, 230)));
+                } else if self.paused_machines.contains(&m.name) {
                     spans.push(StyledSpan::with_fg(" [PAUSED]", Color::rgb(230, 180, 60)));
                 }
 

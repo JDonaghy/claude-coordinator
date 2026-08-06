@@ -7905,8 +7905,14 @@ impl CoordApp {
         match rx.try_recv() {
             Ok(fresh) => {
                 self.pending_paused_machines = None;
-                if fresh != self.paused_machines {
-                    self.paused_machines = fresh;
+                // #1862: `quiet` rides alongside `paused` in the same
+                // fetch/channel (`data::PausedFetch`) — compare both so a
+                // machine flipping from hand-paused to quiet-paused (or
+                // vice versa) with the same net `paused` membership still
+                // triggers a redraw of the sidebar badge.
+                if fresh.paused != self.paused_machines || fresh.quiet != self.quiet_paused_machines {
+                    self.paused_machines = fresh.paused;
+                    self.quiet_paused_machines = fresh.quiet;
                     return true;
                 }
                 false

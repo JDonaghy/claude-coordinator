@@ -855,14 +855,29 @@ def assign(
     # Refuse direct assignment to a paused machine — `coord pause` exists
     # so the user can explicitly steer work away.  If they meant to dispatch
     # anyway they should `coord unpause` first.  #1862: also refuses inside
-    # a machine's `quiet_hours` window, same message — `coord unpause` is
-    # the fix there too (it grants a quiet-hours override).
-    from coord.machine_pause import is_paused as _is_paused
-    if _is_paused(machine, cfg.machines):
-        click.echo(
-            f"error: machine {machine!r} is paused; run `coord unpause {machine}` first",
-            err=True,
-        )
+    # a machine's `quiet_hours` window — `coord unpause` is the fix there
+    # too (it grants a quiet-hours override) — but the message names the
+    # window and its end time rather than reusing the generic hand-pause
+    # wording, so the operator isn't left guessing whether this is a
+    # deliberate `coord pause` or just an overnight window about to lift
+    # on its own (same distinguishability #1862 requires of `coord status`
+    # and the TUI sidebar, applied to this refusal too).
+    from coord.machine_pause import describe_pause_state as _describe_pause_state
+    from coord.machine_pause import paused_set as _paused_set
+    paused = _paused_set(cfg.machines)
+    if machine in paused:
+        state = _describe_pause_state(machine_obj, paused)
+        if state is not None and state.kind == "quiet":
+            click.echo(
+                f"error: machine {machine!r} is in quiet hours {state.detail}; "
+                f"run `coord unpause {machine}` to override for the rest of the window",
+                err=True,
+            )
+        else:
+            click.echo(
+                f"error: machine {machine!r} is paused; run `coord unpause {machine}` first",
+                err=True,
+            )
         sys.exit(2)
 
     # #1707: validate --provider at the CLI, before any network call or

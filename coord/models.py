@@ -160,6 +160,16 @@ class QuietHours:
     ``start == end`` is rejected at config-parse time (ambiguous — "quiet
     all day" vs "never quiet" — rather than guessed; a machine that wants to
     be quiet all day should just be `coord pause`d).
+
+    Known limitation (#1862 review, not blocking, no issue filed yet):
+    ``covers()``/``window_end_instant()`` do plain wall-clock arithmetic via
+    ``ZoneInfo`` with no special-casing for the two annual DST-transition
+    days in ``tz``. A window boundary that falls in a nonexistent (spring-
+    forward) or ambiguous (fall-back) local hour on those two days could be
+    off by up to an hour. Not called out by #1862 and not a regression from
+    anything that existed before it — a fix would need to decide which of
+    the two ambiguous instants "wins" and is a candidate for its own
+    follow-up rather than folding into this feature.
     """
 
     start: time

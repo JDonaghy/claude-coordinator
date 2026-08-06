@@ -6130,6 +6130,14 @@ impl CoordApp {
                             self.paused_machines.insert(name.clone());
                         } else {
                             self.paused_machines.remove(&name);
+                            // #1862: `coord unpause` on a quiet-paused machine
+                            // grants an override (dispatchable again this
+                            // window) — clear the quiet badge too, or it would
+                            // stay stuck on `[QUIET]` (paused_machines no
+                            // longer contains it, but the badge check looks at
+                            // `quiet_paused_machines` first) until the next
+                            // periodic `GET /pause` refresh catches up.
+                            self.quiet_paused_machines.remove(&name);
                         }
                         let verb = if action_id == "machine-pause" {
                             "paused"

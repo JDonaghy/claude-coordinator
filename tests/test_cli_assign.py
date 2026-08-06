@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -106,6 +108,72 @@ machines:
         )
         assert result.exit_code == 2
         assert "does not list repo" in result.output
+
+    def test_hand_paused_machine_refuses_with_generic_message(
+        self, tmp_path: Path, coord_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#1862 review: `coord assign` to a hand-paused machine must keep
+        the plain "is paused" wording — quiet-hours-specific phrasing is
+        reserved for machines actually inside a `quiet_hours` window (see
+        the sibling test below)."""
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        (tmp_path / "home" / ".coord").mkdir(parents=True)
+        (tmp_path / "home" / ".coord" / "paused_machines.json").write_text(
+            json.dumps({"paused": ["laptop"]})
+        )
+        config_file = tmp_path / "coordinator.yml"
+        config_file.write_text(CONFIG_YAML)
+
+        result = CliRunner().invoke(
+            main, ["assign", "laptop", "api", "42", "--config", str(config_file)]
+        )
+        assert result.exit_code == 2
+        assert "machine 'laptop' is paused; run `coord unpause laptop` first" in result.output
+        assert "quiet hours" not in result.output
+
+    def test_quiet_paused_machine_refuses_naming_the_window(
+        self, tmp_path: Path, coord_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#1862 review finding: `coord assign`'s refusal for a
+        quiet-paused machine used the same generic "is paused" wording as a
+        hand pause, leaving the operator to guess whether it's a deliberate
+        `coord pause` or an overnight window about to lift on its own. It
+        must instead name the window and its end time — the same
+        distinguishability #1862 requires of `coord status`/the TUI
+        sidebar, applied here too."""
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        (tmp_path / "home" / ".coord").mkdir(parents=True)
+
+        now = datetime.now(timezone.utc)
+        start = (now - timedelta(minutes=30)).time().replace(second=0, microsecond=0)
+        end = (now + timedelta(minutes=30)).time().replace(second=0, microsecond=0)
+        cfg_yaml = f"""\
+repos:
+  - name: api
+    github: acme/api
+    default_branch: main
+machines:
+  - name: laptop
+    host: laptop.tailnet
+    repos: [api]
+    repo_paths:
+      api: /tmp/api
+    quiet_hours:
+      start: "{start.strftime('%H:%M')}"
+      end: "{end.strftime('%H:%M')}"
+      tz: UTC
+"""
+        config_file = tmp_path / "coordinator.yml"
+        config_file.write_text(cfg_yaml)
+
+        result = CliRunner().invoke(
+            main, ["assign", "laptop", "api", "42", "--config", str(config_file)]
+        )
+        assert result.exit_code == 2
+        assert "quiet hours" in result.output
+        assert f"until {end.strftime('%H:%M')} (UTC)" in result.output
+        assert "coord unpause laptop" in result.output
+        assert "machine 'laptop' is paused; run" not in result.output
 
 
 class TestAssignDryRun:
