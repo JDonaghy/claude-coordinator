@@ -475,6 +475,53 @@ def test_a_landed_entry_writes_are_applied_through_the_normal_writes_path():
     assert "attempts" not in writes[entry_key(REPO, 1864)]
 
 
+def test_a_landed_waiting_entry_does_not_raise_a_stalled_alert():
+    # The exact #1864 reproduction from the review: a single `waiting` entry
+    # whose issue is closed.  `plan.launch` being `None` is correct, but
+    # `plan.alert` must ALSO be `None` — the tick reconciled the entry
+    # cleanly, it did not stall.  Before this fix, the `waiting` snapshot
+    # taken before the walk still counted this entry as "considered", and it
+    # has no `details` line (it was never deferred or blocked), so the queue
+    # escalated a `QUEUE: STALLED` record for a tick that had nothing wrong.
+    entries = [entry(1864)]
+    plan = plan_tick(entries, board(closed=(1864,)), capacity=1)
+    assert plan.launch is None
+    assert plan.alert is None
+
+
+def test_a_mixed_queue_only_counts_the_genuinely_blocked_entry_in_the_alert():
+    # One entry reconciles via #1873 (closed, never launched); the other is
+    # genuinely unsatisfiable and blocks.  The alert must describe ONLY the
+    # blocked entry — "considered N" and `len(details)` must agree, or the
+    # alert contradicts `coord drive-queue status` two lines below it.
+    entries = [
+        entry(1864, position=0),
+        entry(1654, position=1, after=("ghost#99",)),
+    ]
+    plan = plan_tick(entries, board(closed=(1864,)), capacity=2)
+    assert plan.launch is None
+    assert plan.alert is not None
+    assert "considered 1 waiting entry" in plan.alert.reason
+    assert len(plan.alert.details) == 1
+    assert entry_key(REPO, 1654) in plan.alert.details[0]
+    assert entry_key(REPO, 1864) not in " ".join(plan.alert.details)
+
+
+def test_a_landed_entry_with_an_unsatisfiable_prereq_still_reconciles_to_done():
+    # Ordering matters: the entry's own board state is checked BEFORE its
+    # `after=` graph, so a landed entry whose pre-req is unsatisfiable (here,
+    # unknown) reconciles to `done` rather than being routed into BLOCKED —
+    # which would escalate and demand a manual `remove && add` for an entry
+    # that is already finished.
+    entries = [entry(1864, after=("ghost#99",))]
+    plan = plan_tick(entries, board(closed=(1864,)), capacity=1)
+    assert plan.launch is None
+    assert plan.blocked == ()
+    assert [r.outcome for r in plan.reconciles] == ["done"]
+    assert plan.reconciles[0].updates["state"] == STATE_DONE
+    assert plan.alert is None
+
+
 def test_a_dead_drive_is_requeued_at_the_same_position_with_an_attempt_spent():
     entries = [entry(1650, position=3, state=STATE_RUNNING, attempts=0)]
     plan = plan_tick(entries, board(), capacity=1)
