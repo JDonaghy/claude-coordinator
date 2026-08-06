@@ -479,3 +479,39 @@ class TestFixFromRedCi:
             )
 
         assert result.exit_code == 0, result.output
+
+    def test_dispatch_refused_by_a_pre_dispatch_guard_exits_distinctly(
+        self, ci_config: Path, coord_dir: Path, monkeypatch
+    ) -> None:
+        """#1844: THIS `coord fix` arm (a work assignment id — a failed local
+        test or red CI, drive.py's `command=("fix", state.work_aid)`) goes
+        through `_dispatch_followup` → `dispatch()`, so a deterministic
+        pre-dispatch guard refusal (`coord.dispatch.DispatchRefused`) must
+        exit `EXIT_DISPATCH_REFUSED`, not the generic 1, so `coord drive`'s
+        subprocess call can tell it apart from a transient failure instead
+        of retrying it. (The review-id arm routes through
+        `coord.auto_loop._dispatch_fix` instead, which never runs this
+        guard — not covered by this test.)
+        """
+        from coord.dispatch import DispatchRefused
+        from coord.drive import EXIT_DISPATCH_REFUSED
+
+        work = _work(test_state="failed", test_reason="assert 1 == 2")
+        state_mod.save_board(Board(completed=[work]))
+
+        def boom(*a, **k):
+            raise AssertionError("CI must not be consulted when the test gate failed")
+
+        monkeypatch.setattr("coord.ci_store.build_ci_store", boom)
+
+        with patch(
+            "coord.dispatch.dispatch",
+            side_effect=DispatchRefused("no acceptance slice yet — run ..."),
+        ):
+            result = CliRunner().invoke(
+                main, ["fix", "work-abc", "--config", str(ci_config)]
+            )
+
+        assert result.exit_code == EXIT_DISPATCH_REFUSED
+        assert result.exit_code != 1
+        assert "no acceptance slice yet" in result.output

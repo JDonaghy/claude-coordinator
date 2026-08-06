@@ -577,6 +577,59 @@ def test_a_dead_drives_own_exit_reason_reaches_the_queue_row(cli, seed, launches
     assert state._get_drive_escalation_local(REPO, 1762) is not None
 
 
+def test_a_permanent_dispatch_refusal_blocks_on_the_first_tick_no_attempt_spent(
+    cli, seed, launches,
+):
+    """#1844, end-to-end. The regression test built from the exact #1817
+    shape: `coord drive` refused a dispatch on a deterministic pre-dispatch
+    guard (`enforce_oracle_readiness`) and exited `EXIT_DISPATCH_REFUSED`,
+    recorded as `details.exit_code` on its own `drive_exited` audit row
+    (exactly what `coord.drive.Driver._drive_exit_summary` writes after this
+    issue's `coord/drive.py` fix). The tick must NOT treat this like the
+    genuine-death case (`test_a_dead_drives_own_exit_reason_reaches_the_
+    queue_row` above): straight to `blocked`, `attempts` UNCHANGED — not
+    incremented once and then reset, literally never touched — and
+    `last_reason` must carry the guard's own remedy.
+    """
+    from coord.audit import record_audit
+    from coord.drive import EXIT_DISPATCH_REFUSED
+
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    cli("tick")
+    assert queued(1762)["attempts"] == 0
+
+    refusal = (
+        "drive exited for claude-coordinator#1762 (exit_code="
+        f"{EXIT_DISPATCH_REFUSED}): dispatch failed: Issue #1762 is part of "
+        "oracle-opted-in milestone ms-51 (Gate A satisfied) but has no "
+        "acceptance slice yet — run `coord acceptance author "
+        "claude-coordinator <tracking_issue> --issue 1762` first."
+    )
+    launched_at = queued(1762)["launched_at"]
+    _backdate(1762, DRIVE_STARTUP_GRACE_SECONDS + 60)
+    record_audit(
+        tier="business", category="drive", event_type="drive_exited",
+        actor="drive", summary=refusal, repo=REPO, issue=1762,
+        ts=launched_at + 5,
+        details={"exit_code": EXIT_DISPATCH_REFUSED, "error": refusal},
+    )
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    assert refusal in result.output
+    # NOT the retry path: no second launch, no requeue.
+    assert len(launches) == 1, launches
+    assert "died without landing the work" not in result.output
+
+    entry = queued(1762)
+    assert entry["state"] == "blocked"
+    assert entry["attempts"] == 0
+    assert refusal in entry["last_reason"]
+    assert "coord acceptance author" in entry["last_reason"]
+    assert state._get_drive_escalation_local(REPO, 1762) is not None
+
+
 def test_a_repeatedly_dead_drive_still_reaches_blocked_and_escalates(
     cli, seed, launches
 ):
