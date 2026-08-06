@@ -655,6 +655,46 @@ class TestMergeOnly:
         assert states["x1"] == mq.PENDING, f"x1 should still be PENDING, got {states['x1']!r}"
         assert states["x3"] == mq.PENDING, f"x3 should still be PENDING, got {states['x3']!r}"
 
+    def test_only_merges_when_the_auto_enqueue_scan_has_not_run_yet(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """#1845: a done, fully-gated work row with NO merge-queue entry yet
+        (the auto-enqueue scan hasn't run) must be merged by `--only` on this
+        call, not reported as a failure. Reproduces the race a drive's merge
+        stage hit overnight: the work finished moments before the daemon
+        tick's own scan, `--only` found nothing, and the drive burned one of
+        its 3 attempts on a false negative."""
+        from coord.models import Assignment, Board
+        from coord.state import save_board
+
+        work = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=1845,
+            issue_title="#1845", assignment_id="w1845", type="work",
+            status="done", branch="issue-1845-fix",
+            test_state="passed",  # smoke gate satisfied (#465)
+        )
+        save_board(Board(active=[], completed=[work]))
+        # No `_seed_queue(...)` call — the queue starts EMPTY, exactly the
+        # state the auto-enqueue scan hasn't caught up to yet.
+        assert mq.load_queue() == []
+
+        def fake_create_pr(repo, *, base, head, title, body):
+            return {"number": 900, "url": "u/900", "existed": False}
+
+        def fake_merge(repo, number, method="rebase"):
+            return True, "ok"
+
+        with patch("coord.github_ops.create_pr", side_effect=fake_create_pr), \
+             patch("coord.github_ops.get_pr_size", return_value=10), \
+             patch("coord.github_ops.merge_pr", side_effect=fake_merge):
+            result = CliRunner().invoke(
+                main, ["merge", "--config", str(config_file), "--only", "w1845"]
+            )
+
+        assert result.exit_code == 0, result.output
+        states = {e.assignment_id: e.state for e in mq.load_queue()}
+        assert states.get("w1845") == mq.MERGED, result.output
+
     def test_only_errors_when_entry_not_found(
         self, config_file: Path, coord_dir: Path
     ) -> None:

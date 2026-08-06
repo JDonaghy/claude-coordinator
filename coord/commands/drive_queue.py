@@ -534,6 +534,55 @@ def _fetch_board_view() -> BoardView:
     return build_board_view(payload, list_drive_sessions())
 
 
+def _fetch_exit_reasons(entries: list) -> dict[str, str]:
+    """The drive's own ``drive_exited`` summary for every ``running`` entry
+    THIS launch, keyed by entry key (#1845/#1844).
+
+    ``coord.drive.Driver.run`` already writes the true reason a run stopped —
+    a deliberate refusal narrated in full, not just an exit code — to the
+    audit trail before it returns. Nothing downstream used to read it, so
+    `_reconcile_running`'s "no session, no active work, nothing landed" death
+    classifier (which also matches a clean, deliberate exit) always
+    overwrote it with a synthesised "drive session died" reason. This is the
+    one DB read the shell does to close that gap; `plan_tick`/
+    `_reconcile_running` stay pure and just consume the result as data (like
+    *probes*).
+
+    Scoped with ``since=entry.launched_at`` so a stale reason from a PRIOR
+    attempt on the same (repo, issue) — the entry's key doesn't change
+    across a retry — is never replayed as if it explained the run that just
+    ended. An entry with no `launched_at` (a row from before this launch was
+    stamped) is skipped; the caller's fallback wording covers it.
+
+    Fail-soft per entry: an unreadable audit table degrades to "no reason
+    known for this entry", never aborts the tick — same posture as
+    :func:`_local_issue_rows`.
+    """
+    from coord.audit import query_audit_log  # noqa: PLC0415
+
+    reasons: dict[str, str] = {}
+    for e in entries:
+        if e.state != STATE_RUNNING or e.launched_at is None:
+            continue
+        try:
+            result = query_audit_log(
+                event_type="drive_exited",
+                repo=e.repo,
+                issue=e.issue,
+                since=e.launched_at,
+                limit=1,
+            )
+        except Exception:  # noqa: BLE001 — see the fail-soft note above
+            continue
+        rows = result.get("entries") or []
+        if not rows:
+            continue
+        summary = rows[0].get("summary")
+        if summary:
+            reasons[e.key] = str(summary)
+    return reasons
+
+
 def _launch_argv(entry: QueueEntry, config_path: Path | None) -> list[str]:
     """The ``coord drive --tmux`` argv for *entry*.
 
@@ -759,6 +808,14 @@ def drive_queue_tick(max_parallel: int, dry_run: bool, config_path: Path) -> Non
             for target in pending:
                 probes[target.key] = _run_resume_probe(target)
 
+        # #1845/#1844: the drive's own `drive_exited` summary for each
+        # `running` entry, when one was recorded for THIS launch — read here
+        # (the shell) and handed to `plan_tick` as data, same as `probes`,
+        # so a "no session, no active work, nothing landed" reconcile can
+        # report the drive's real reason instead of a synthesised "drive
+        # session died" for an exit that was actually deliberate.
+        exit_reasons = _fetch_exit_reasons(entries)
+
         # #1794: the clock is the shell's to read, never `coord.drive_queue`'s.
         # It powers the startup grace window on both sides of the tick — a
         # drive launched seconds ago is `starting`, not dead, and cannot be
@@ -777,6 +834,7 @@ def drive_queue_tick(max_parallel: int, dry_run: bool, config_path: Path) -> Non
             probes=probes,
             now=time.time(),
             local_host=_local_host_id(),
+            exit_reasons=exit_reasons,
         )
 
         for line in render_plan(plan, dry_run=dry_run):
