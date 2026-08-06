@@ -530,21 +530,29 @@ def dispatch(
     # unattended dispatch through a provider whose capabilities mark it
     # ``human_attended_only`` (subscription-billed interactive Claude
     # Code).  Precedence: per-proposal override (if the brain ever sets
-    # one) → per-repo ``Repo.provider`` → ``config.providers.default``.
-    # Deferred import so the unattended dispatch surface stays free of a
-    # module-level cycle with the provider registry.
+    # one) → ``providers.labels`` match (#1889) → per-repo
+    # ``Repo.provider`` → ``config.providers.default``.  Deferred import so
+    # the unattended dispatch surface stays free of a module-level cycle
+    # with the provider registry.
     from coord.providers import guard_unattended_dispatch  # noqa: PLC0415
     spec_provider = getattr(proposal, "provider", None)
-    # #324: resolve the effective provider name (spec > repo > default) so
-    # the coordinator DB always records the winning provider regardless of
-    # which level supplied it, and the wire payload carries the exact name
-    # the agent should look up in its registry.
+    # #1889: providers.labels routes work dispatches by the issue's
+    # harness-eval label (e.g. `harness:opencode`); plan/review/smoke
+    # proposals deliberately stay off it, same as `models.labels` (#1430) —
+    # a label meant for the eventual work dispatch must not leak into a
+    # cheap/read-only stage.
+    provider_issue_labels = proposal.issue_labels if proposal.type == "work" else None
+    # #324: resolve the effective provider name (spec > label > repo >
+    # default) so the coordinator DB always records the winning provider
+    # regardless of which level supplied it, and the wire payload carries
+    # the exact name the agent should look up in its registry.
     effective_provider_name: str = guard_unattended_dispatch(
         spec_provider=spec_provider,
         repo_provider=repo.provider if repo is not None else None,
         providers_cfg=config.providers,
         models_cfg=config.models,
         where="coord approve / dispatch",
+        issue_labels=provider_issue_labels,
     )
 
     # #1711: STRUCTURAL PROVIDER-AVAILABILITY GATE — refuse to route a

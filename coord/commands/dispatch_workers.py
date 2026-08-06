@@ -4587,8 +4587,13 @@ def _dispatch_headless(
 
     # #1707: resolve the effective provider BEFORE the model, so model
     # resolution can be provider-aware (#1706 review fix, below).
+    # #1889: providers.labels (work dispatch only, mirrors models.labels'
+    # #1430 gating) — must be resolved with the SAME issue_labels the model
+    # resolution below uses, or the two could silently disagree about which
+    # provider is effective.
     effective_provider_name = resolve_provider_name(
         provider, repo_cfg.provider, cfg.providers,
+        issue_labels=issue_labels if not effective_plan_only else None,
     )
 
     # Resolve model: --model flag → models.labels (work dispatch only) →
@@ -4676,10 +4681,13 @@ def _dispatch_headless(
                 click.echo(f"  model: {_pinned.model} (via {_via})")
 
     # #1707: mirror the --model reasoning line above — state which link of
-    # the spec (--provider) → repo (Repo.provider) → providers.default chain
-    # (coord.providers.resolve_provider_name) won, so a mixed claude/opencode
-    # fleet is legible at dispatch time (including under --dry-run, before
-    # any of it is committed) instead of only discoverable via coordinator.yml.
+    # the spec (--provider) → providers.labels → repo (Repo.provider) →
+    # providers.default chain (coord.providers.resolve_provider_name) won,
+    # so a mixed claude/opencode fleet is legible at dispatch time
+    # (including under --dry-run, before any of it is committed) instead of
+    # only discoverable via coordinator.yml. #1889: issue_labels threaded
+    # through so a providers.labels match (e.g. `harness:opencode`) is named
+    # explicitly, not just inferred from source.
     from coord.providers import describe_provider_choice  # noqa: PLC0415
 
     click.echo(
@@ -4688,6 +4696,7 @@ def _dispatch_headless(
             spec_provider=provider,
             repo_provider=repo_cfg.provider,
             providers_cfg=cfg.providers,
+            issue_labels=issue_labels if not effective_plan_only else None,
         )
     )
 

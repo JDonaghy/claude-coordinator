@@ -1236,6 +1236,93 @@ def test_providers_extra_args_non_string_element_raises(tmp_path: Path) -> None:
         load(p)
 
 
+# ── providers.labels (#1889) ──────────────────────────────────────────────────
+
+
+def test_providers_labels_absent_defaults_to_empty(tmp_path: Path) -> None:
+    """No 'labels' key -> ProvidersConfig.labels is an empty dict."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(_MIN_CONFIG)
+    cfg = load(p)
+    assert cfg.providers.labels == {}
+
+
+def test_providers_labels_parsed_when_provider_defined(tmp_path: Path) -> None:
+    """A label -> provider mapping is parsed when the provider is a known
+    definition (implicit 'claude' or an explicit entry)."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        _MIN_CONFIG
+        + "providers:\n"
+        "  definitions:\n"
+        "    opencode:\n"
+        "      type: opencode\n"
+        "  labels:\n"
+        "    harness:opencode: opencode\n"
+        "    harness:claude: claude\n"
+    )
+    cfg = load(p)
+    assert cfg.providers.labels == {
+        "harness:opencode": "opencode",
+        "harness:claude": "claude",
+    }
+
+
+def test_providers_labels_not_a_mapping_raises(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(_MIN_CONFIG + "providers:\n  labels: [a, b]\n")
+    with pytest.raises(ConfigError, match="providers.labels must be a mapping"):
+        load(p)
+
+
+def test_providers_labels_non_string_value_raises(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        _MIN_CONFIG
+        + "providers:\n"
+        "  labels:\n"
+        "    harness:opencode: 42\n"
+    )
+    with pytest.raises(ConfigError, match="providers.labels must be a mapping"):
+        load(p)
+
+
+def test_providers_labels_unknown_provider_raises(tmp_path: Path) -> None:
+    """#1889 acceptance: a providers.labels value naming an undefined
+    provider fails coord.config.load — the same parse-time posture
+    reviews.provider uses (#1811), so a typo'd label mapping is a
+    config-load error, not a 2am dispatch-time surprise."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        _MIN_CONFIG
+        + "providers:\n"
+        "  labels:\n"
+        "    harness:totally-unregistered: totally-unregistered\n"
+    )
+    with pytest.raises(
+        ConfigError, match="providers.labels references unknown provider"
+    ):
+        load(p)
+
+
+def test_providers_labels_validated_against_own_block_definitions(tmp_path: Path) -> None:
+    """A provider defined in the SAME providers: block (not just the
+    implicit 'claude') is a valid labels target — labels are validated
+    after definitions are parsed."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        _MIN_CONFIG
+        + "providers:\n"
+        "  definitions:\n"
+        "    fast-claude:\n"
+        "      type: claude\n"
+        "  labels:\n"
+        "    tier:small: fast-claude\n"
+    )
+    cfg = load(p)
+    assert cfg.providers.labels == {"tier:small": "fast-claude"}
+
+
 # ── Repo.provider (#323) ──────────────────────────────────────────────────────
 
 

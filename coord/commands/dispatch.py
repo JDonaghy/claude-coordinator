@@ -320,26 +320,49 @@ def approve(
         shadowed_labels: list[str] = []
         label_model: str | None = None
         used_plan_time_snapshot = False
+        # #1889: this issue's labels, used for BOTH models.labels (below)
+        # and providers.labels (the resolve_provider_name call right after
+        # this block).
+        work_issue_labels: list[str] = []
         if p.type == "work":
             if p.model:
                 label_model = p.model
                 used_plan_time_snapshot = True
+                # #1889: no live re-fetch here — mirrors the model-resolution
+                # optimization above (a plan-time-resolved model is trusted
+                # as-is, no freshness re-check). Reuse the plan-time label
+                # snapshot `coord.brain.resolve_models()` already stamped
+                # onto the proposal (empty if that never ran, e.g. a hand-
+                # authored/edited proposal) so providers.labels has SOME
+                # signal here without adding a GitHub call this branch has
+                # deliberately never made.
+                work_issue_labels = list(p.issue_labels)
             else:
                 repo_for_model = cfg.repo(p.repo_name)
-                fresh_labels: list[str] = []
                 if repo_for_model is not None:
                     try:
                         fresh_issue = github_ops.get_issue(repo_for_model.github, p.issue_number)
-                        fresh_labels = [
+                        work_issue_labels = [
                             lbl.get("name", "") for lbl in (fresh_issue.get("labels") or [])
                         ]
                     except RuntimeError:
-                        fresh_labels = []  # fail open — fall back to default below
+                        work_issue_labels = []  # fail open — fall back to default below
                 label_model, matched_label, shadowed_labels = (
-                    cfg.models.model_for_labels_with_reason(fresh_labels)
+                    cfg.models.model_for_labels_with_reason(work_issue_labels)
                 )
+            # #1889: write the (possibly freshly-fetched) labels back onto
+            # the proposal — `dispatch()` (called below) does its OWN
+            # providers.labels resolution from `proposal.issue_labels`, and
+            # it must agree with what THIS loop just echoed, or the dry-run/
+            # echoed reason and the actual wire payload could silently
+            # disagree (the exact divergence class #1798 was about, one
+            # level up).
+            p.issue_labels = work_issue_labels
         # #1707: needed regardless of whether p.model still needs resolving
         # below — also used by the "model:" echo's provider-pin branch.
+        # #1889: `issue_labels=work_issue_labels` threads providers.labels
+        # through the same precedence chain — see resolve_provider_name's
+        # docstring for the full spec > label > repo > default order.
         from coord.providers import resolve_provider_name  # noqa: PLC0415
 
         repo_for_provider = cfg.repo(p.repo_name)
@@ -347,6 +370,7 @@ def approve(
             p.provider,
             repo_for_provider.provider if repo_for_provider is not None else None,
             cfg.providers,
+            issue_labels=work_issue_labels,
         )
         # #1706 review fix: don't force `models.default` (a Claude model
         # alias) onto a non-claude/claude-pty provider that pins its own
@@ -399,6 +423,24 @@ def approve(
                     )
                 else:
                     click.echo(f"     model: {_pinned.model} (via {_via})")
+        # #1889: mirror the --model reasoning line above — state which link
+        # of the spec (Proposal.provider) → providers.labels → repo
+        # (Repo.provider) → providers.default chain
+        # (coord.providers.resolve_provider_name) won, so a
+        # providers.labels match (e.g. `harness:opencode`) is legible at
+        # `coord approve`/`--dry-run` time, not just discoverable via
+        # coordinator.yml.
+        from coord.providers import describe_provider_choice  # noqa: PLC0415
+
+        click.echo(
+            "     provider: "
+            + describe_provider_choice(
+                spec_provider=p.provider,
+                repo_provider=repo_for_provider.provider if repo_for_provider is not None else None,
+                providers_cfg=cfg.providers,
+                issue_labels=work_issue_labels,
+            )
+        )
         # Resolve required_gates: fall back to config default for proposals
         # that were saved before label-based gate resolution was wired in.
         if not p.required_gates:

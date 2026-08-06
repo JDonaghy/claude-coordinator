@@ -209,10 +209,25 @@ models:
 # repos or some assignments through a different backend.
 #
 # Precedence chain (highest → lowest):
-#   AssignmentSpec.provider  →  Repo.provider  →  providers.default
+#   AssignmentSpec.provider → providers.labels (issue label) → Repo.provider → providers.default
 #
 # providers:
 #   default: claude                 # name in `definitions` to use by default
+#   # labels (#1889): per-issue-label provider override — the issue-level
+#   # lever `--provider` can't give you on a headless dispatch path (coord
+#   # drive / the drive queue / the auto-loop never pass a flag). Mirrors
+#   # `models.labels` below: `gh issue edit N --add-label harness:opencode`
+#   # routes just THAT issue through opencode, no coordinator.yml edit, no
+#   # repo-wide `provider:` pin. Gated to type="work" dispatches only, same
+#   # as models.labels — plan/review/smoke stages never inherit it. Values
+#   # are validated against `definitions` below at config-load time (an
+#   # unknown provider name here is a config error, not a 2am dispatch-time
+#   # surprise). `coord assign --dry-run` / `coord approve` / `coord
+#   # milestone dispatch` all name the matched label in their "provider:"
+#   # line.
+#   labels:
+#     harness:opencode: opencode
+#     harness:claude: claude
 #   definitions:
 #     claude:                       # built-in; redefining is optional
 #       type: claude                # "claude", "claude-pty", or "opencode"

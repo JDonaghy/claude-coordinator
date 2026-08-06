@@ -1156,20 +1156,84 @@ class ProvidersConfig:
     ``"claude"`` definition is present in ``definitions``.
 
     Attributes:
-        default: The provider name used when no per-spec or per-repo
-            override is set.  Defaults to ``"claude"``.
+        default: The provider name used when no per-spec, per-label, or
+            per-repo override is set.  Defaults to ``"claude"``.
         definitions: Named provider definitions keyed by provider name.
             An implicit ``"claude"`` entry is always materialised if absent.
+        labels: Per-issue-label provider override (#1889), e.g.
+            ``{"harness:opencode": "opencode"}`` — mirrors
+            :attr:`ModelsConfig.labels`' shape and precedent, including its
+            provenance reporting (:meth:`model_for_labels_with_reason`
+            here becomes :meth:`provider_for_labels_with_reason`). Resolved
+            via :func:`coord.providers.resolve_provider_name`'s
+            ``issue_labels`` param, slotted into the precedence chain
+            between *spec_provider* and *repo_provider* — see that
+            function's docstring for the full chain. Values are validated
+            against ``definitions`` at parse time in ``_parse_providers``
+            (mirrors ``reviews.provider``, #1811): an unknown provider name
+            here is a config-load error, not a dispatch-time surprise
+            discovered at 2am. Every dispatch site gates this to
+            ``type="work"`` proposals only, the same restriction
+            ``models.labels`` uses (#1430) — plan/review/smoke dispatches
+            must not inherit a harness-eval label meant for the eventual
+            work dispatch.
     """
 
     default: str = "claude"
     definitions: dict[str, ProviderDef] = field(default_factory=dict)
+    labels: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         # Always ensure the implicit "claude" definition exists so callers
         # can look it up by name without checking for its presence.
         if "claude" not in self.definitions:
             self.definitions["claude"] = ProviderDef(type="claude")
+
+    def provider_for_labels(self, issue_labels: list[str]) -> str | None:
+        """Resolve an issue's GitHub labels to a provider name via ``labels``.
+
+        #1889: mirrors :meth:`ModelsConfig.model_for_labels` — see
+        :meth:`provider_for_labels_with_reason` for the full precedence
+        rule. Returns ``None`` (never *default* or *repo_provider*) when no
+        configured label is present on the issue, or ``labels`` itself is
+        empty. Callers are expected to fall back to *repo_provider*/
+        ``default`` themselves (:func:`coord.providers.resolve_provider_name`
+        does this).
+        """
+        return self.provider_for_labels_with_reason(issue_labels)[0]
+
+    def provider_for_labels_with_reason(
+        self, issue_labels: list[str]
+    ) -> tuple[str | None, str | None, list[str]]:
+        """Like :meth:`provider_for_labels`, but also returns the label that
+        matched and any configured labels it shadowed.
+
+        Returns ``(provider, matched_label, shadowed_labels)``, or
+        ``(None, None, [])`` under the same conditions
+        :meth:`provider_for_labels` returns ``None``.
+
+        #1889: mirrors :meth:`ModelsConfig.model_for_labels_with_reason`
+        (#1633)'s provenance shape, minus the ``tier:*`` grouping —
+        ``providers.labels`` has no size-tier concept, so precedence among
+        several configured labels present on the same issue (e.g. both
+        ``harness:opencode`` and ``harness:claude``) is simply ``labels``'s
+        own declaration order in ``coordinator.yml``, exactly like
+        ``models.labels``' non-tier group. Ties are NOT broken by the
+        issue's own label order (GitHub-controlled, not config-controlled)
+        for the same reason #1633 fixed that for models: the same issue +
+        config must always resolve to the same provider, regardless of
+        what order GitHub reports the issue's labels in.
+        """
+        if not self.labels:
+            return None, None, []
+        present_in_config_order = [
+            label for label in self.labels if label in issue_labels
+        ]
+        if not present_in_config_order:
+            return None, None, []
+        matched = present_in_config_order[0]
+        shadowed = present_in_config_order[1:]
+        return self.labels[matched], matched, shadowed
 
 
 # #1711: provider-availability capability vocabulary.
@@ -2742,6 +2806,26 @@ def _parse_providers(raw: Any) -> ProvidersConfig:
     # without checking presence first.
     if "claude" not in cfg.definitions:
         cfg.definitions["claude"] = ProviderDef(type="claude")
+
+    # #1889: providers.labels — an issue-level lever mirroring
+    # models.labels (label name -> provider name), parsed AFTER
+    # cfg.definitions above so it can be validated against the very
+    # registry it references. Validated at parse time, the same pattern
+    # reviews.provider uses (#1811) — an unknown provider name here is a
+    # config-load error, not a dispatch-time surprise discovered at 2am.
+    labels_raw = raw.get("labels", {}) or {}
+    if not isinstance(labels_raw, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in labels_raw.items()
+    ):
+        raise ConfigError(
+            "providers.labels must be a mapping of label name → provider name"
+        )
+    unknown_providers = sorted(set(labels_raw.values()) - set(cfg.definitions))
+    if unknown_providers:
+        raise ConfigError(
+            f"providers.labels references unknown provider(s): {unknown_providers}"
+        )
+    cfg.labels = dict(labels_raw)
 
     return cfg
 

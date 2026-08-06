@@ -678,6 +678,48 @@ class TestDispatchEntry:
         assert "zhipuai/glm-4.6" in outcome.model_reason
         assert "overriding label 'tier:large'" in outcome.model_reason
 
+    def test_providers_labels_routes_the_dispatch_and_names_it(self, coord_db) -> None:
+        """#1889: `coord milestone dispatch` is a headless path (also the
+        daemon's auto-drain tick) with no `--provider` flag to type — a
+        `harness:opencode`-labelled issue must still route to the labelled
+        provider, and `outcome.provider_reason` must name the label so the
+        CLI/auto-drain log is self-explaining."""
+        cfg = _config(
+            [_machine("laptop", ["api"])],
+            repos=[Repo(name="api", github="acme/api")],  # no repo.provider
+        )
+        cfg.providers = ProvidersConfig(
+            default="claude",
+            definitions={
+                "claude": ProviderDef(type="claude"),
+                "fast-claude": ProviderDef(type="claude"),
+            },
+            labels={"harness:opencode": "fast-claude"},
+        )
+        board = Board()
+        pick = self._pick(cfg, board)
+        repo = cfg.repo("api")
+
+        proposals = []
+
+        def fake_dispatch(proposal, config):
+            proposals.append(proposal)
+            return {"id": "asn-label-1"}
+
+        with patch(
+            "coord.github_ops.get_issue",
+            return_value={"title": "Fix X", "body": "b", "labels": [{"name": "harness:opencode"}]},
+        ), \
+             patch("coord.dispatch.dispatch", side_effect=fake_dispatch), \
+             patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.github_ops.check_branch_exists", return_value=False):
+            outcome = dispatch_entry(pick, repo, cfg, board, tracking_issue=100)
+
+        assert outcome.ok is True
+        assert len(proposals) == 1
+        assert outcome.provider_reason is not None
+        assert outcome.provider_reason == "fast-claude (via label 'harness:opencode')"
+
     def test_claimed_issue_is_not_dispatched(self, coord_db) -> None:
         cfg = _config([_machine("laptop", ["api"])])
         board = Board(active=[_running("server", 762)])  # already claimed elsewhere

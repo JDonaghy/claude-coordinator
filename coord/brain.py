@@ -390,12 +390,20 @@ def resolve_models(
     unchanged. Never overrides a model already set on the proposal (the
     brain's own JSON output, or a human editing saved proposals before
     approving).
+
+    #1889: also stamps ``proposal.issue_labels`` when only
+    ``config.providers.labels`` (not ``config.models.labels``) is
+    configured, so :func:`filter_unroutable_provider_proposals` (below) can
+    resolve ``providers.labels`` too — a provider-only label eval must not
+    require ``models.labels`` to also be configured just to get its issue's
+    labels threaded through. No extra GitHub call either way: both concerns
+    read the same already-fetched ``issues_by_repo``.
     """
-    if not config.models.labels:
-        return  # no label overrides configured, nothing to do
+    if not config.models.labels and not config.providers.labels:
+        return  # no label overrides of either kind configured, nothing to do
 
     for proposal in proposals:
-        if proposal.type != "work" or proposal.model:
+        if proposal.type != "work":
             continue
         repo_issues = issues_by_repo.get(proposal.repo_name, [])
         issue = next(
@@ -408,6 +416,8 @@ def resolve_models(
             lbl.get("name", "") for lbl in (issue.get("labels") or [])
         ]
         proposal.issue_labels = issue_labels
+        if proposal.model:
+            continue
         resolved = config.models.model_for_labels(issue_labels)
         if resolved:
             proposal.model = resolved
@@ -522,10 +532,16 @@ def filter_unroutable_provider_proposals(
             kept.append(p)
             continue
         repo = config.repo(p.repo_name)
+        # #1889: providers.labels, gated to type="work" like every other
+        # dispatch site — `p.issue_labels` is stamped by `resolve_models`
+        # above (in the same `propose()` call, before this filter runs) for
+        # both models.labels and providers.labels, so this reflects the
+        # same labels `coord approve`/`dispatch()` will resolve against.
         effective_provider_name = resolve_provider_name(
             getattr(p, "provider", None),
             repo.provider if repo is not None else None,
             config.providers,
+            issue_labels=p.issue_labels if p.type == "work" else None,
         )
         try:
             guard_provider_machine_capability(
