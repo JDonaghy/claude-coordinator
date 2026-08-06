@@ -47,6 +47,36 @@
 //! the loaded page while presenting itself as the answer (see `audit.rs`,
 //! which defers column sort for exactly that reason).
 //!
+//! **#1853 — the result table's columns are drag-resizable.** `weight` is a
+//! good default and a bad *fixed* choice: `drive-queue-status` puts a wide
+//! TITLE and a wide LAST REASON on the same row, and which one the operator
+//! needs to read depends on whether they are chasing a stall or scanning the
+//! queue. Dragging a header divider now moves width between that divider's
+//! two columns, for every report in the catalogue at once — the panel builds
+//! one table, so nothing about this is per-report.
+//!
+//! Two things make it more than Audit's `audit_column_overrides` copied
+//! across:
+//!
+//! 1. **The column set is dynamic.** Overrides are stored keyed by
+//!    `(report_id, column ids)` (`ReportsColumnKey`) and read back through
+//!    `reports_active_overrides`, which yields nothing when the key doesn't
+//!    match the result on screen. A width dragged in one report can therefore
+//!    never re-apply to another report's identically-positioned column.
+//! 2. **`h_scroll` stays pinned at `0.0`.** The drag goes through
+//!    `DataTableLayout::drag_divider` (quadraui), which holds the dragged
+//!    *pair's* combined width constant and freezes every other column at its
+//!    resolved width — so a resize cannot make the content wider than it
+//!    already was, and cannot newly push the table into horizontal scrolling.
+//!    That matters because `DataTableLayout::hit_test` has no concept of
+//!    `h_scroll` while the renderer *does* subtract it, so a non-zero
+//!    `h_scroll` would shift the painted headers out from under the hit-test
+//!    and route #1762's sort clicks to the wrong column. See the comment on
+//!    the `h_scroll` field in `render_reports_result`.
+//!
+//! Session-only, like the sort and like Audit's widths: nothing is written to
+//! settings.
+//!
 //! No sealed acceptance contract exists for this panel (there is no
 //! `tests/acceptance/**` slice for #1741) — the in-crate `TuiDriver` tests in
 //! `app/tests.rs` are the gate.
@@ -1030,8 +1060,20 @@ impl CoordApp {
                 // concept of `h_scroll`, so a non-zero value here would
                 // shift the painted headers out from under the hit-test
                 // and route column-sort clicks to the wrong column.
+                //
+                // #1853 confirmed that reading is still correct, and that
+                // Audit (which *does* drive `audit_h_scroll`) has the same
+                // latent mis-routing — unnoticed only because a stray
+                // header click there does nothing. Filed separately; not
+                // touched here. Column resize does not reopen the question:
+                // `drag_divider` moves width *between* a pair and freezes
+                // the rest, so total content width is unchanged by a drag
+                // and a resize can never newly force horizontal scrolling.
                 h_scroll: 0.0,
-                column_overrides: Vec::new(),
+                // #1853: user-dragged widths for *this* column set, or
+                // empty when the last drag belonged to a different report
+                // (or a differently-shaped result from the same one).
+                column_overrides: self.reports_active_overrides(result),
                 // #1763: pinned Σ row (quadraui#432) when the report
                 // supplies one — `usage` does, `issue-activity` does not.
                 footer: Self::reports_footer_row(result),
@@ -1116,6 +1158,112 @@ impl CoordApp {
         // now, so "stay where you were" is meaningless — go to the top,
         // which is where the answer to "sort by this" actually is.
         self.reports_result_scroll = 0;
+        true
+    }
+
+    // ── #1853: result-table column resize ────────────────────────────────
+
+    /// The identity of `result`'s column set — see [`ReportsColumnKey`].
+    fn reports_columns_key(result: &ReportResult) -> ReportsColumnKey {
+        (result.report_id.clone(), result.columns.clone())
+    }
+
+    /// The width overrides that legitimately apply to `result`, or an empty
+    /// vec meaning "none — lay this table out at its declared `weight`s".
+    ///
+    /// This is the whole invalidation mechanism, and it is a *read-side*
+    /// check on purpose. Clearing the stored overrides at each site that
+    /// can swap the result (a run completing, a re-run changing shape, a
+    /// future path nobody has written yet) would be a list that has to stay
+    /// exhaustive forever; comparing the key at the point of use cannot be
+    /// forgotten, because the only way to get overrides out is through
+    /// here. A stale override is therefore not "cleared late" — it is never
+    /// reachable at all.
+    ///
+    /// The length guard is belt-and-braces for a malformed key, not the
+    /// invalidation itself: two different reports can have the same column
+    /// count, so length alone would happily hand `usage`'s dragged widths
+    /// to `drive-queue-status`.
+    fn reports_active_overrides(&self, result: &ReportResult) -> Vec<Option<f32>> {
+        match self.reports_column_overrides.as_ref() {
+            Some((key, widths))
+                if *key == Self::reports_columns_key(result)
+                    && widths.len() == result.columns.len() =>
+            {
+                widths.clone()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Minimum width (cells) either half of a dragged divider pair may be
+    /// squeezed to — same floor as `AUDIT_MIN_COLUMN_WIDTH`, and enforced by
+    /// `drag_divider` on *both* sides so a drag can neither collapse the
+    /// column being widened's neighbour nor the column itself.
+    const REPORTS_MIN_COLUMN_WIDTH: f32 = 4.0;
+
+    /// Continue an in-progress result-table column-resize drag, started by a
+    /// `MouseDown` on a `DataTableHit::HeaderDivider` (`reports_resize_col`
+    /// set by `mouse_main_click` in `events.rs`) and released on `MouseUp`.
+    ///
+    /// `pos` is in absolute backend coordinates and is made table-local
+    /// against the *cached rect*, not `main_b` — the same origin
+    /// `reports_table_hit` uses. Unlike Audit's table this one does not
+    /// start at the main panel's origin (the section stack sits above it),
+    /// so `audit_update_resize_drag`'s `main_b` signature is not
+    /// transferable; taking the origin from the same cache that produced
+    /// the hit is what keeps the dragged divider under the cursor.
+    ///
+    /// The arithmetic is quadraui's `DataTableLayout::drag_divider` rather
+    /// than a local `pointer_x - column.x`: it moves width strictly between
+    /// the divider's two columns with their combined width held constant,
+    /// and freezes every other column at its currently-resolved width so an
+    /// untouched `Flex` column can't be reshuffled by pass 2's
+    /// redistribution (quadraui#521). Two consequences matter here — an
+    /// unrelated column never moves under the user mid-drag, and the table's
+    /// total content width is invariant under a resize, which is why this
+    /// feature does not reopen the `h_scroll` question.
+    ///
+    /// Returns `true` (redraw needed) only while a drag is actually in
+    /// progress against a table that is still on screen.
+    pub(crate) fn reports_update_resize_drag(&mut self, pos: Point) -> bool {
+        let Some(col) = self.reports_resize_col else {
+            return false;
+        };
+        // Key and current widths are captured as owned values so the
+        // immutable borrow of `reports_result` ends before the store below.
+        let (key, current) = match self.reports_result.as_ref() {
+            Some(result) => (
+                Self::reports_columns_key(result),
+                self.reports_active_overrides(result),
+            ),
+            None => return false,
+        };
+        let next = {
+            let cache = self.reports_table_layout.borrow();
+            let Some((rect, layout)) = cache.as_ref() else {
+                return false;
+            };
+            // A divider only exists between two columns; a `col` past the
+            // end means the cached layout is from a differently-shaped
+            // result and this drag no longer refers to anything.
+            if col + 1 >= layout.columns.len() {
+                return false;
+            }
+            layout.drag_divider(
+                &current,
+                col,
+                pos.x - rect.x,
+                Self::REPORTS_MIN_COLUMN_WIDTH,
+            )
+        };
+        // Store only a well-formed override set: `drag_divider` sizes its
+        // result from the *layout*, and a layout painted from a stale result
+        // could disagree with the key we are about to file it under.
+        if next.len() != key.1.len() {
+            return false;
+        }
+        self.reports_column_overrides = Some((key, next));
         true
     }
 
