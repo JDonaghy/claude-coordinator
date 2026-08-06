@@ -21,6 +21,7 @@ from coord.ci_store import (
     CheckRun,
     NoOpCi,
     build_ci_store,
+    checks_are_stale,
     failed_checks,
     in_flight_checks,
     summarize,
@@ -36,14 +37,24 @@ class TestNoOpCi:
     def test_returns_empty(self) -> None:
         assert NoOpCi().list_checks_for_pr("acme/api", 1) == []
 
+    def test_rerun_for_pr_is_a_noop(self) -> None:
+        """#1851: `ci_store: { type: none }` disables CI gating entirely —
+        rerun_for_pr must not pretend to do anything."""
+        assert NoOpCi().rerun_for_pr("acme/api", 1) is False
+
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-def _check(name: str, status: str = "completed", conclusion: str | None = "success") -> CheckRun:
+def _check(
+    name: str,
+    status: str = "completed",
+    conclusion: str | None = "success",
+    started_at: float | None = None,
+) -> CheckRun:
     return CheckRun(
         name=name, status=status, conclusion=conclusion,
         url=f"https://gh/runs/{name}", run_id=name,
-        started_at=None, completed_at=None,
+        started_at=started_at, completed_at=None,
     )
 
 
@@ -98,6 +109,43 @@ class TestInFlightChecks:
         ]
         names = {x.name for x in in_flight_checks(items)}
         assert names == {"a", "b"}
+
+
+class TestChecksAreStale:
+    """#1851: a green check whose `started_at` predates the base's newest
+    commit is stale — GitHub only re-runs `pull_request` checks on head
+    `synchronize`, never on base movement."""
+
+    def test_no_checks_is_not_stale(self) -> None:
+        """Nothing to compare — the caller's own "no checks" handling covers
+        this, not staleness."""
+        assert checks_are_stale([], 1000.0) is False
+
+    def test_check_started_before_base_commit_is_stale(self) -> None:
+        checks = [_check("ci", started_at=500.0)]
+        assert checks_are_stale(checks, 1000.0) is True
+
+    def test_check_started_after_base_commit_is_fresh(self) -> None:
+        checks = [_check("ci", started_at=1500.0)]
+        assert checks_are_stale(checks, 1000.0) is False
+
+    def test_one_stale_check_among_fresh_ones_is_stale(self) -> None:
+        """Bias toward stale: ANY check predating the base commit is enough,
+        even if its siblings are fresh."""
+        checks = [_check("a", started_at=1500.0), _check("b", started_at=500.0)]
+        assert checks_are_stale(checks, 1000.0) is True
+
+    def test_unreadable_base_commit_time_is_stale(self) -> None:
+        """Fail-closed path 1: base_commit_time is None (unreadable / no
+        gh_ops capability to ask)."""
+        checks = [_check("ci", started_at=1500.0)]
+        assert checks_are_stale(checks, None) is True
+
+    def test_missing_started_at_is_stale(self) -> None:
+        """Fail-closed path 2: the check itself carries no started_at, even
+        though a base_commit_time is known."""
+        checks = [_check("ci", started_at=None)]
+        assert checks_are_stale(checks, 1000.0) is True
 
 
 class TestSummarize:
@@ -367,6 +415,105 @@ class TestGitHubCi:
             store.list_checks_for_pr("acme/api", 43)  # different PR
         assert run.call_count == 2
 
+    def test_run_id_extracted_from_job_link(self) -> None:
+        """#1851: a job-shaped link (".../runs/{run_id}/job/{job_id}") must
+        yield the *run* id, not the trailing job id — `gh run rerun` takes a
+        run id. Pre-#1851 this field took the last path segment (the job
+        id); nothing read `run_id` before #1851 (see `coord/ci_store.py`'s
+        Phase 1 header), so this is a fix, not a behaviour change any caller
+        depended on."""
+        store = GitHubCi()
+        with patch("coord.ci_github.subprocess.run", return_value=_gh_result(GH_SAMPLE)):
+            checks = store.list_checks_for_pr("acme/api", 42)
+        by_name = {c.name: c for c in checks}
+        assert by_name["test (3.12)"].run_id == "123"
+
+    def test_run_id_extracted_from_bare_run_link(self) -> None:
+        store = GitHubCi()
+        with patch("coord.ci_github.subprocess.run", return_value=_gh_result(GH_SAMPLE)):
+            checks = store.list_checks_for_pr("acme/api", 42)
+        by_name = {c.name: c for c in checks}
+        assert by_name["deploy-preview"].run_id == "789"
+
+    def test_run_id_empty_when_link_empty(self) -> None:
+        store = GitHubCi()
+        with patch("coord.ci_github.subprocess.run", return_value=_gh_result(GH_SAMPLE)):
+            checks = store.list_checks_for_pr("acme/api", 42)
+        by_name = {c.name: c for c in checks}
+        assert by_name["lint"].run_id == ""
+
+
+class TestGitHubCiRerunForPr:
+    """#1851: the remedy side — re-running a PR's CI via `gh run rerun`."""
+
+    def _payload(self, run_ids: list[str]) -> str:
+        return json.dumps([
+            {
+                "name": f"check-{rid}", "state": "SUCCESS", "bucket": "pass",
+                "link": f"https://github.com/acme/api/actions/runs/{rid}",
+                "startedAt": "2026-05-24T12:00:00Z", "completedAt": "2026-05-24T12:05:00Z",
+            }
+            for rid in run_ids
+        ])
+
+    def test_reruns_every_distinct_run_id(self) -> None:
+        store = GitHubCi()
+        with patch("coord.ci_github.subprocess.run") as run:
+            run.side_effect = [
+                _gh_result(self._payload(["1", "2"])),  # list_checks_for_pr
+                _gh_result(""),  # gh run rerun 1
+                _gh_result(""),  # gh run rerun 2
+            ]
+            ok = store.rerun_for_pr("acme/api", 42)
+        assert ok is True
+        rerun_calls = [c for c in run.call_args_list if c.args[0][:3] == ["gh", "run", "rerun"]]
+        assert len(rerun_calls) == 2
+        rerun_ids = {c.args[0][3] for c in rerun_calls}
+        assert rerun_ids == {"1", "2"}
+        for c in rerun_calls:
+            assert c.args[0][4:] == ["--repo", "acme/api"]
+
+    def test_no_checks_returns_false(self) -> None:
+        store = GitHubCi()
+        with patch("coord.ci_github.subprocess.run", return_value=_gh_result("[]")):
+            assert store.rerun_for_pr("acme/api", 42) is False
+
+    def test_check_with_no_readable_run_id_is_skipped(self) -> None:
+        payload = json.dumps([
+            {"name": "third-party", "state": "SUCCESS", "bucket": "pass",
+             "link": "", "startedAt": "2026-05-24T12:00:00Z", "completedAt": ""},
+        ])
+        store = GitHubCi()
+        with patch("coord.ci_github.subprocess.run", return_value=_gh_result(payload)) as run:
+            ok = store.rerun_for_pr("acme/api", 42)
+        assert ok is False
+        assert run.call_count == 1  # only the list_checks_for_pr call
+
+    def test_partial_failure_reports_false(self) -> None:
+        """One `gh run rerun` failing must not report success — the caller
+        needs to know the rerun only partially worked."""
+        store = GitHubCi()
+        with patch("coord.ci_github.subprocess.run") as run:
+            run.side_effect = [
+                _gh_result(self._payload(["1", "2"])),
+                _gh_result("", returncode=0),
+                _gh_result("", returncode=1, stderr="run already in progress"),
+            ]
+            ok = store.rerun_for_pr("acme/api", 42)
+        assert ok is False
+
+    def test_success_invalidates_cache(self) -> None:
+        store = GitHubCi(cache_ttl=60.0)
+        with patch("coord.ci_github.subprocess.run") as run:
+            run.side_effect = [
+                _gh_result(self._payload(["1"])),
+                _gh_result(""),
+                _gh_result(self._payload(["1"])),  # re-fetched after invalidate
+            ]
+            store.rerun_for_pr("acme/api", 42)
+            store.list_checks_for_pr("acme/api", 42)
+        assert run.call_count == 3
+
 
 # ── Merge gate integration ───────────────────────────────────────────────────
 
@@ -394,6 +541,11 @@ class FakeGh:
     # the pre-#1624 "no PR found" behaviour.
     existing_prs: dict[str, dict] = dataclass_field(default_factory=dict)
     find_pr_calls: list[tuple[str, str]] = dataclass_field(default_factory=list)
+    # #1851: the target branch's "current" commit timestamp for the CI
+    # staleness check. Defaults to the epoch so any check carrying a real
+    # (post-1970) `started_at` reads as fresh by default — tests that care
+    # about staleness set this explicitly instead.
+    branch_commit_timestamp: float | None = 0.0
 
     def create_pr(self, repo: str, *, base: str, head: str, title: str, body: str) -> dict:
         n = self.next_pr
@@ -410,6 +562,9 @@ class FakeGh:
     def find_pr_for_branch(self, repo: str, branch: str) -> dict | None:
         self.find_pr_calls.append((repo, branch))
         return self.existing_prs.get(branch)
+
+    def get_branch_commit_timestamp(self, repo: str, branch: str) -> float | None:
+        return self.branch_commit_timestamp
 
 
 def _entry(aid: str = "a") -> QueuedMerge:
@@ -448,7 +603,10 @@ class TestMergeGate:
     def test_passing_checks_allow_merge(self) -> None:
         items = [_entry("a")]
         gh = FakeGh()
-        ci = FakeCi(by_pr={100: [_check("ci", conclusion="success")]})
+        # #1851: a real (post-epoch) started_at, fresh against FakeGh's
+        # default `branch_commit_timestamp=0.0` — otherwise a check with no
+        # recorded start time reads as CI-stale (fail-closed) and blocks.
+        ci = FakeCi(by_pr={100: [_check("ci", conclusion="success", started_at=1000.0)]})
         process(items, gh, ci_store=ci)
         assert gh.merge_calls == [(100, "rebase")]
         assert items[0].state == MERGED
@@ -562,7 +720,7 @@ class TestDryRunCiGate:
     def test_resolves_existing_pr_and_allows_on_green_ci(self) -> None:
         items = [_entry("a")]
         gh = FakeGh(existing_prs={"worker/a": {"number": 612, "url": "https://gh/x/612"}})
-        ci = FakeCi(by_pr={612: [_check("ci", conclusion="success")]})
+        ci = FakeCi(by_pr={612: [_check("ci", conclusion="success", started_at=1000.0)]})
         events = process(items, gh, ci_store=ci, dry_run=True)
 
         assert gh.merge_calls == []
@@ -574,6 +732,7 @@ class TestDryRunCiGate:
         kinds = [e.kind for e in events]
         assert "checks_failed" not in kinds
         assert "checks_pending" not in kinds
+        assert "checks_stale" not in kinds
         assert "merged" in kinds
 
     def test_reports_ci_unknown_when_no_pr_yet(self) -> None:
@@ -638,7 +797,7 @@ class TestMergeGateThroughGitHubCi:
         gh = FakeGh()
         payload = json.dumps([
             {"name": "test (3.13)", "state": "SUCCESS", "bucket": "pass",
-             "link": "", "startedAt": "", "completedAt": ""},
+             "link": "", "startedAt": "2026-05-24T12:00:00Z", "completedAt": "2026-05-24T12:05:00Z"},
         ])
         ci = GitHubCi()
         with patch("coord.ci_github.subprocess.run", return_value=_gh_result(payload)):

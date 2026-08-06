@@ -2521,3 +2521,102 @@ class TestResolveBoardWorkKey:
 
     def test_tolerates_none_board(self) -> None:
         assert mq.resolve_board_work_key(None, "w42") == []
+
+
+class TestMergeRevalidateCiRerunCli:
+    """#1851 black-box: `coord merge --revalidate` re-runs CI (not a local
+    suite) for an entry blocked solely on stale CI checks. `--dry-run` names
+    it without triggering anything; plain `--dry-run` (no --revalidate)
+    still names the PR as CI-stale in the gate reading."""
+
+    @staticmethod
+    def _config(tmp_path: Path) -> Path:
+        p = tmp_path / "coordinator.yml"
+        p.write_text(
+            "repos:\n"
+            "  - name: api\n"
+            "    github: acme/api\n"
+            "    default_branch: main\n"
+            "machines:\n"
+            "  - name: laptop\n"
+            "    host: laptop.tailnet\n"
+            "    repos: [api]\n"
+            "    repo_paths:\n"
+            "      api: /tmp/api\n"
+            "reviews:\n"
+            "  enabled: false\n"
+            "pipeline:\n"
+            "  default_gates: [merge]\n"
+            "ci_store:\n"
+            "  type: github\n"
+        )
+        return p
+
+    @staticmethod
+    def _fake_ci():
+        from types import SimpleNamespace
+
+        class _Ci:
+            def __init__(self):
+                self.is_available = True
+                self.rerun_calls: list = []
+
+            def list_checks_for_pr(self, repo, number):
+                # Green, but started well before the (mocked) base commit
+                # time below — the #1851 staleness signal.
+                return [SimpleNamespace(
+                    name="build", status="completed", conclusion="success",
+                    started_at=500.0, completed_at=None,
+                )]
+
+            def rerun_for_pr(self, repo, number):
+                self.rerun_calls.append((repo, number))
+                return True
+
+        return _Ci()
+
+    def _seed(self) -> None:
+        entry = _entry("w1", size=50)
+        entry.pr_number = 501
+        _seed_queue([entry])
+
+    def test_plain_dry_run_names_it_as_ci_stale(self, tmp_path: Path, coord_db) -> None:
+        cfg = self._config(tmp_path)
+        self._seed()
+        ci = self._fake_ci()
+        with patch("coord.ci_store.build_ci_store", return_value=ci), \
+             patch("coord.github_ops.get_branch_commit_timestamp", return_value=1000.0):
+            result = CliRunner().invoke(main, ["merge", "--config", str(cfg), "--dry-run"])
+
+        assert result.exit_code == 0, result.output
+        assert ci.rerun_calls == []
+        assert "checks_stale" in result.output or "CI stale" in result.output
+
+    def test_revalidate_dry_run_names_the_rerun_without_triggering(
+        self, tmp_path: Path, coord_db,
+    ) -> None:
+        cfg = self._config(tmp_path)
+        self._seed()
+        ci = self._fake_ci()
+        with patch("coord.ci_store.build_ci_store", return_value=ci), \
+             patch("coord.github_ops.get_branch_commit_timestamp", return_value=1000.0):
+            result = CliRunner().invoke(
+                main, ["merge", "--config", str(cfg), "--revalidate", "--dry-run"],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert ci.rerun_calls == []
+        assert "would re-run CI" in result.output
+        assert "PR #501" in result.output
+
+    def test_revalidate_triggers_the_ci_rerun(self, tmp_path: Path, coord_db) -> None:
+        cfg = self._config(tmp_path)
+        self._seed()
+        ci = self._fake_ci()
+        with patch("coord.ci_store.build_ci_store", return_value=ci), \
+             patch("coord.github_ops.get_branch_commit_timestamp", return_value=1000.0):
+            result = CliRunner().invoke(main, ["merge", "--config", str(cfg), "--revalidate"])
+
+        assert result.exit_code == 0, result.output
+        assert ci.rerun_calls == [("acme/api", 501)]
+        assert "triggered a CI re-run" in result.output
