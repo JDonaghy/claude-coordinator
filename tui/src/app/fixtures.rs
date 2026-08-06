@@ -115,6 +115,7 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         chat_last_activity: None,
         chat_spinner_throttle: 0,
         paused_machines: read_paused_machines(),
+        quiet_paused_machines: std::collections::HashSet::new(),
         pending_paused_machines: None,
         pending_force_merge: None,
         pending_merge_all_ready: None,

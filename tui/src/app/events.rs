@@ -3957,6 +3957,12 @@ impl CoordApp {
                                     // reflects the new state immediately.
                                     if is_paused {
                                         self.paused_machines.remove(&name);
+                                        // #1862: an unpause of a quiet-paused
+                                        // machine grants an override — clear
+                                        // the quiet badge too, or it would
+                                        // stick on `[QUIET]` until the next
+                                        // periodic `GET /pause` refresh.
+                                        self.quiet_paused_machines.remove(&name);
                                     } else {
                                         self.paused_machines.insert(name.clone());
                                     }

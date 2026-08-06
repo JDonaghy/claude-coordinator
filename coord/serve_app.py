@@ -5382,16 +5382,27 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         # own tick loop (`_tick_loop` → reconcile/dispatch) ultimately read.
         #
         # #1862: passing `config.machines` folds each machine's `quiet_hours`
-        # window into the response — this is what makes the TUI's paused
+        # window into `paused` — this is what makes the TUI's paused
         # indicator (`fetch_paused_machines()`, a plain HTTP GET here) reflect
-        # quiet hours with zero Rust changes: it already just checks set
-        # membership. `_refresh_config()` first so a hand-edited
+        # quiet hours with zero Rust changes to the routing/membership check.
+        # `quiet` additionally names WHICH of those are quiet-paused rather
+        # than hand-paused — review finding on the original PR: without it,
+        # a thin client (the TUI included) can see membership but can't
+        # distinguish "asleep until 08:00" from "someone paused this",
+        # exactly the ambiguity #1862 says an operator debugging a stalled
+        # queue at 1AM needs resolved. `quiet` is always a subset of
+        # `paused`. `_refresh_config()` first so a hand-edited
         # coordinator.yml's quiet_hours takes effect on the very next poll
         # rather than waiting for a daemon restart.
         _refresh_config()
-        from coord.machine_pause import local_paused_set  # noqa: PLC0415
+        from coord.machine_pause import local_paused_set, quiet_paused_names  # noqa: PLC0415
 
-        return JSONResponse({"paused": sorted(local_paused_set(config.machines))})
+        return JSONResponse(
+            {
+                "paused": sorted(local_paused_set(config.machines)),
+                "quiet": sorted(quiet_paused_names(config.machines)),
+            }
+        )
 
     async def post_pause(request: Request) -> Response:
         # #1563: pause/unpause a machine on the daemon's local-only store —
@@ -5401,7 +5412,12 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         # unpause() (which would re-route back out over HTTP if this daemon
         # process happened to have its own board_service configured).
         _refresh_config()
-        from coord.machine_pause import local_pause, local_paused_set, local_unpause_effective  # noqa: PLC0415
+        from coord.machine_pause import (  # noqa: PLC0415
+            local_pause,
+            local_paused_set,
+            local_unpause_effective,
+            quiet_paused_names,
+        )
 
         body = await _read_json(request)
         if body is None:
@@ -5413,7 +5429,11 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         if action == "pause":
             changed = local_pause(machine)
             return JSONResponse(
-                {"paused": sorted(local_paused_set(config.machines)), "changed": changed}
+                {
+                    "paused": sorted(local_paused_set(config.machines)),
+                    "quiet": sorted(quiet_paused_names(config.machines)),
+                    "changed": changed,
+                }
             )
         elif action == "unpause":
             # #1862: explicit-pause removal vs quiet-hours override vs true
@@ -5424,6 +5444,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             return JSONResponse(
                 {
                     "paused": sorted(local_paused_set(config.machines)),
+                    "quiet": sorted(quiet_paused_names(config.machines)),
                     "changed": outcome.changed,
                     "kind": outcome.kind,
                     "quiet_until": outcome.quiet_until,

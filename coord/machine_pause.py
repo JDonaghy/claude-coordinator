@@ -298,6 +298,27 @@ def local_unpause_effective(
 # ── #1862: quiet-hours computation ──────────────────────────────────────────
 
 
+def quiet_paused_names(
+    machines: Sequence["Machine"] | None = None, *, now: datetime | None = None,
+) -> set[str]:
+    """Public: names of machines currently paused SPECIFICALLY because a
+    `quiet_hours` window covers *now* (never overridden — an active
+    `coord unpause` override excludes a machine from this set, same as it
+    excludes it from `local_paused_set()`'s union).
+
+    Always a subset of `local_paused_set(machines, now=now)`. Review finding
+    on #1862's original PR: `coord status`'s `describe_pause_state()`
+    distinguished a quiet-paused machine from a hand-paused one, but the
+    daemon's `/pause` endpoint and the TUI sidebar badge did not — this is
+    the choke point both now call so a machine "asleep until 08:00" reads
+    differently from one someone explicitly paused, everywhere pause state
+    is displayed, not just `coord status`.
+    """
+    if not machines:
+        return set()
+    return _quiet_covered_names(machines, now=now)
+
+
 def _quiet_covered_names(
     machines: Sequence["Machine"], *, now: datetime | None = None,
 ) -> set[str]:

@@ -2070,14 +2070,36 @@ pub(crate) fn fetch_remote_config_to_cache() -> Option<std::path::PathBuf> {
 /// thread that never saw the caller's thread-local and would always
 /// observe `None`. Mirrors `spawn_audit_fetch`'s identical
 /// resolve-before-spawn shape.
-pub(crate) fn spawn_paused_machines_fetch()
--> std::sync::mpsc::Receiver<std::collections::HashSet<String>> {
+pub(crate) fn spawn_paused_machines_fetch() -> std::sync::mpsc::Receiver<PausedFetch> {
     let (tx, rx) = std::sync::mpsc::channel();
     let resolved = resolve_board_service();
     std::thread::spawn(move || {
         let _ = tx.send(fetch_paused_machines_resolved(resolved));
     });
     rx
+}
+
+/// #1862: paired result of a paused-machine fetch. `paused` is the full
+/// effective paused set (explicit `coord pause` UNION quiet-hours-covered
+/// machines — unchanged from pre-#1862). `quiet` is the subset of `paused`
+/// that's paused *specifically* because a `quiet_hours` window covers the
+/// current moment, so the sidebar badge (`mod.rs`'s `machines_list`) can
+/// tell a quiet-paused machine apart from a hand-paused one without a
+/// second routing check — mirroring `coord.machine_pause.describe_pause_state`
+/// on the Python side. `quiet` is always a subset of `paused`.
+///
+/// Only the daemon's `GET /pause` (thin-client path, `coord.serve_app.get_pause`)
+/// can populate `quiet` — the local `~/.coord/paused_machines.json` file
+/// has no notion of quiet hours (that lives in `coordinator.yml`, which
+/// this process doesn't parse), so the local-file fallback in
+/// [`fetch_paused_machines_resolved`] always reports `quiet` empty. That's
+/// a pre-existing gap (the base `paused` fold from quiet hours is ALSO
+/// daemon-only, see the comments on `read_paused_machines`/
+/// `spawn_paused_machines_fetch`), not a regression introduced here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PausedFetch {
+    pub(crate) paused: std::collections::HashSet<String>,
+    pub(crate) quiet: std::collections::HashSet<String>,
 }
 
 /// #1563: the synchronous half of [`spawn_paused_machines_fetch`] — daemon
@@ -2094,7 +2116,7 @@ pub(crate) fn spawn_paused_machines_fetch()
 /// blocks on the (possibly remote) read — hence `#[cfg(test)]` rather than
 /// `pub(crate)` unconditionally, to avoid an unused-in-release warning.
 #[cfg(test)]
-pub(crate) fn fetch_paused_machines() -> std::collections::HashSet<String> {
+pub(crate) fn fetch_paused_machines() -> PausedFetch {
     fetch_paused_machines_resolved(resolve_board_service())
 }
 
@@ -2102,11 +2124,12 @@ pub(crate) fn fetch_paused_machines() -> std::collections::HashSet<String> {
 /// [`spawn_paused_machines_fetch`], parameterized on an already-resolved
 /// board service so the latter can resolve on the caller's thread and pass
 /// the result into its spawned closure (see that function's doc comment).
-fn fetch_paused_machines_resolved(
-    resolved: Option<(String, Option<String>)>,
-) -> std::collections::HashSet<String> {
+fn fetch_paused_machines_resolved(resolved: Option<(String, Option<String>)>) -> PausedFetch {
     let Some((url, token)) = resolved else {
-        return super::read_paused_machines();
+        return PausedFetch {
+            paused: super::read_paused_machines(),
+            quiet: std::collections::HashSet::new(),
+        };
     };
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(std::time::Duration::from_secs(5))
@@ -2116,15 +2139,28 @@ fn fetch_paused_machines_resolved(
     if let Some(t) = token.as_deref() {
         req = req.set("Authorization", &format!("Bearer {t}"));
     }
-    (|| -> Option<std::collections::HashSet<String>> {
+    (|| -> Option<PausedFetch> {
         let text = req.call().ok()?.into_string().ok()?;
         let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-        let arr = v.get("paused")?.as_array()?;
-        Some(
-            arr.iter()
-                .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                .collect(),
-        )
+        fn str_set(v: &serde_json::Value, key: &str) -> std::collections::HashSet<String> {
+            v.get(key)
+                .and_then(|x| x.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+        // `paused` must be present to trust the response at all (matches
+        // the pre-#1862 contract exactly); `quiet` is a newer, optional
+        // field — its absence (an older daemon) degrades to "no quiet
+        // distinction available" rather than discarding the whole response.
+        v.get("paused")?;
+        Some(PausedFetch {
+            paused: str_set(&v, "paused"),
+            quiet: str_set(&v, "quiet"),
+        })
     })()
     .unwrap_or_default()
 }
