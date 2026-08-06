@@ -1162,8 +1162,12 @@ def plan_tick(
     # gate, and `released` falls through to the walk below in this same tick.
     holds = _resolve_holds(ordered, states, probes or {})
 
+    # NOTE: "reconciles" is deliberately NOT in plan_base.  The waiting-entry
+    # walk below (#1873) can append to `reconciles` too — a `waiting` entry
+    # whose own issue already landed reconciles to `done` there — so every
+    # return site passes `reconciles=tuple(reconciles)` explicitly, taken at
+    # the point of that return rather than frozen here before the walk runs.
     plan_base = {
-        "reconciles": tuple(reconciles),
         "holds": tuple(holds),
         "occupied": occupied,
         "capacity": capacity,
@@ -1177,6 +1181,7 @@ def plan_tick(
         # which is exactly why an explicit operator-declared gate exists.
         return TickPlan(
             **plan_base,
+            reconciles=tuple(reconciles),
             blocked=tuple(blocked),
             deferrals=(),
             alert=_hold_alert(gate),
@@ -1185,7 +1190,12 @@ def plan_tick(
 
     if capacity - occupied <= 0:
         return TickPlan(
-            **plan_base, blocked=tuple(blocked), deferrals=(), alert=None, launch=None
+            **plan_base,
+            reconciles=tuple(reconciles),
+            blocked=tuple(blocked),
+            deferrals=(),
+            alert=None,
+            launch=None,
         )
 
     # Cycles are re-checked here, not just at `add` time: `remove` can leave
@@ -1277,6 +1287,38 @@ def plan_tick(
                 )
             )
             continue
+        # #1873: the entry itself may already be done — landed under someone
+        # else's branch/PR, closed by hand as obsolete, or reconciled by
+        # `coord reconcile-merges` — without this queue ever having launched
+        # it.  `_reconcile_running` catches exactly this for entries that
+        # WERE launched (:813); a `waiting` entry never enters that function
+        # at all, so nothing had checked the board against the entry's own
+        # issue until now.  Reached only once prereqs are satisfied, which a
+        # landed entry with no unmet `after=` trivially is.
+        facts = board.facts(entry.key)
+        if facts.landed:
+            witness = "merged" if facts.merged else "closed"
+            reason = (
+                f"done — issue already {witness}, never launched by this queue"
+            )
+            reconciles.append(
+                Reconcile(
+                    entry.key,
+                    "done",
+                    reason,
+                    occupies=False,
+                    # attempts is deliberately NOT incremented: nothing was
+                    # ever launched for this entry, so charging it a retry
+                    # would be charging it for work that landed elsewhere
+                    # (same reasoning as the BLOCKED branch above, :1257).
+                    updates={
+                        "state": STATE_DONE,
+                        "last_reason": reason,
+                    },
+                )
+            )
+            states[entry.key] = STATE_DONE
+            continue
         launch = by_key[entry.key]
 
     alert: QueueAlert | None = None
@@ -1298,6 +1340,7 @@ def plan_tick(
 
     return TickPlan(
         **plan_base,
+        reconciles=tuple(reconciles),
         blocked=tuple(blocked),
         deferrals=tuple(deferrals),
         alert=alert,

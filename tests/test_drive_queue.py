@@ -394,6 +394,87 @@ def test_a_finished_drive_becomes_done():
     assert plan.occupied == 0
 
 
+# ── plan_tick: a `waiting` entry whose issue already landed (#1873) ─────────
+#
+# The launch-side counterpart to test_a_finished_drive_becomes_done above:
+# that test covers an entry `_reconcile_running` catches because it was
+# actually launched.  A `waiting` entry never reaches that function at all —
+# #1864 was the live incident: its work landed inside #1862's PR and the
+# issue closed, but the queue row was never touched and `drive-queue tick`
+# was about to burn a full drive re-discovering that.
+
+
+def test_a_waiting_entry_whose_issue_is_closed_reconciles_to_done_unlaunched():
+    entries = [entry(1864)]
+    plan = plan_tick(entries, board(closed=(1864,)), capacity=1)
+    assert plan.launch is None
+    assert [r.outcome for r in plan.reconciles] == ["done"]
+    reconcile = plan.reconciles[0]
+    assert reconcile.updates["state"] == STATE_DONE
+    assert "never launched" in reconcile.reason
+    assert "closed" in reconcile.reason
+
+
+def test_a_waiting_entry_whose_work_merged_but_issue_still_open_also_reconciles():
+    # #611 is why both witnesses exist: merged work can leave an issue open.
+    entries = [entry(1864)]
+    plan = plan_tick(entries, board(merged=(1864,), open_=(1864,)), capacity=1)
+    assert plan.launch is None
+    assert [r.outcome for r in plan.reconciles] == ["done"]
+    reconcile = plan.reconciles[0]
+    assert reconcile.updates["state"] == STATE_DONE
+    assert "merged" in reconcile.reason
+
+
+def test_a_landed_waiting_entry_does_not_consume_an_attempt():
+    entries = [entry(1864, attempts=2)]
+    plan = plan_tick(entries, board(closed=(1864,)), capacity=1)
+    updates = plan.reconciles[0].updates
+    assert "attempts" not in updates
+
+
+def test_a_landed_waiting_entrys_reason_is_distinct_from_a_real_completion():
+    # The reason text must not read as "a drive ran and finished" — nothing
+    # was ever launched for this entry.
+    entries = [entry(1864)]
+    plan = plan_tick(entries, board(closed=(1864,)), capacity=1)
+    reason = plan.reconciles[0].reason
+    assert "drive finished" not in reason
+    assert "never launched" in reason
+
+
+def test_a_genuinely_open_waiting_entry_still_launches():
+    entries = [entry(1864)]
+    plan = plan_tick(entries, board(open_=(1864,)), capacity=1)
+    assert plan.launch is not None and plan.launch.issue == 1864
+    assert plan.reconciles == ()
+
+
+def test_a_landed_entry_does_not_block_downstream_after_entries():
+    # `_resolve_prereqs` already reads `facts.landed` straight off the board
+    # (:707) — it does not care whether the pre-req's own queue row ever
+    # transitioned to `done`.  A landed-but-still-`waiting` upstream entry
+    # must not stall its successor.
+    entries = [
+        entry(1864, position=0, after=()),
+        entry(1866, position=1, after=(entry_key(REPO, 1864),)),
+    ]
+    plan = plan_tick(entries, board(closed=(1864,)), capacity=2)
+    assert plan.launch is not None and plan.launch.issue == 1866
+    outcomes = {r.key: r.outcome for r in plan.reconciles}
+    assert outcomes[entry_key(REPO, 1864)] == "done"
+
+
+def test_a_landed_entry_writes_are_applied_through_the_normal_writes_path():
+    # The `Reconcile` this produces must flow through `TickPlan.writes()` the
+    # same as every other reconcile — no separate plumbing for #1873's case.
+    entries = [entry(1864)]
+    plan = plan_tick(entries, board(closed=(1864,)), capacity=1)
+    writes = dict(plan.writes())
+    assert writes[entry_key(REPO, 1864)]["state"] == STATE_DONE
+    assert "attempts" not in writes[entry_key(REPO, 1864)]
+
+
 def test_a_dead_drive_is_requeued_at_the_same_position_with_an_attempt_spent():
     entries = [entry(1650, position=3, state=STATE_RUNNING, attempts=0)]
     plan = plan_tick(entries, board(), capacity=1)
