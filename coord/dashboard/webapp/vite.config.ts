@@ -42,6 +42,12 @@ export default defineConfig({
       },
       workbox: {
         globPatterns: ['**/*.{js,css,html,ico,png,svg,webmanifest}'],
+        // The dev-only component gallery (#1546, src/components/Gallery.tsx)
+        // is route-guarded behind `import.meta.env.DEV` so no production
+        // build can ever navigate to it, but Rollup still emits it as its
+        // own lazy chunk (it's a real `import()` call site). Precaching a
+        // ~100KB chunk nothing can reach would be pure waste.
+        globIgnores: ['**/Gallery-*.js'],
         runtimeCaching: [
           {
             urlPattern: /^\/api\//,

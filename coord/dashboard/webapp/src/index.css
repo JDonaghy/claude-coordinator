@@ -2,29 +2,192 @@
 @tailwind components;
 @tailwind utilities;
 
+/*
+ * coord web — design tokens (#1546)
+ *
+ * The raw palette below is copied verbatim from the Gate-A design mocks'
+ * shared reference, docs/mocks/web/_tokens.css — that file says explicitly
+ * it is "the seed for W1-1's real token layer." Keep the two in sync; if a
+ * value changes here, change it there too (or vice versa).
+ *
+ * Dark is the default and the preferred reading mode; light is a real,
+ * designed second theme, not a mechanical inversion. Both are switched by
+ * `data-theme` on <html> (see src/components/theme-provider.tsx) rather
+ * than Tailwind's `dark:` class variant, because that's what the mocks
+ * already do and what avoids a flash of the wrong theme (the attribute is
+ * set by a blocking inline script in index.html before paint).
+ *
+ * A second layer of semantic aliases (--background, --foreground, --card,
+ * --primary, ...) maps the raw palette onto the shadcn/ui vocabulary that
+ * ui/* primitives and pre-existing components (PipelineCard,
+ * ConnectionBadge, MobileKeyBar) consume — see tailwind.config.js for the
+ * full rationale, including why shadcn's `accent` slot is kept pointed at
+ * a neutral hover surface instead of the mock's cyan "brand" accent.
+ */
+
 @layer base {
   :root {
-    /* Dark theme matching coord's existing colour palette */
-    --background: 220 13% 7%;        /* #0d1117 */
-    --foreground: 213 31% 91%;       /* #c9d1d9 */
-    --card: 222 47% 10%;             /* #161b22 */
-    --card-foreground: 213 31% 91%;
-    --popover: 222 47% 10%;
-    --popover-foreground: 213 31% 91%;
-    --primary: 212 100% 56%;         /* #1f6feb */
-    --primary-foreground: 0 0% 100%;
-    --secondary: 222 20% 17%;        /* #21262d */
-    --secondary-foreground: 213 31% 91%;
-    --muted: 222 20% 17%;
-    --muted-foreground: 215 13% 55%; /* #8b949e */
-    --accent: 222 20% 17%;
-    --accent-foreground: 213 31% 91%;
-    --destructive: 0 63% 50%;        /* #da3633 */
-    --destructive-foreground: 0 0% 100%;
-    --border: 215 13% 22%;           /* #30363d */
-    --input: 215 13% 22%;
-    --ring: 212 100% 56%;
-    --radius: 0.5rem;
+    /* ── raw palette — type ──────────────────────────────────────────── */
+    --font-ui: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto,
+      'Helvetica Neue', Arial, sans-serif;
+    /* mono is reserved for values the machine owns: issue numbers,
+       branches, SHAs, machine names, durations, costs. Never for chrome. */
+    --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas,
+      'Liberation Mono', monospace;
+
+    --step--1: 0.75rem;
+    --step-0: 0.875rem;
+    --step-1: 1rem;
+    --step-2: 1.25rem;
+    --step-3: 1.5rem;
+
+    /* ── raw palette — geometry ──────────────────────────────────────── */
+    --r-sm: 5px;
+    --r-md: 8px;
+    --r-lg: 12px;
+
+    --rail-w: 216px;
+    --rail-w-collapsed: 60px;
+    --panel-w: 360px;
+  }
+
+  /* `:root` carries the dark values too (dark is the default, and it's the
+     fallback if `data-theme` is ever missing) -- but the SAME selector list
+     also includes the bare `[data-theme='dark']` attribute, not just
+     `:root[data-theme='dark']`. That's deliberate: it's what lets a nested
+     subtree (e.g. the gallery's side-by-side theme preview,
+     src/components/Gallery.tsx) force dark back on, even inside a page
+     whose <html> is already light -- a plain `:root` rule only ever matches
+     the root element, so without this a nested `data-theme="dark"` div
+     would have no rule to reset it and would just inherit light. */
+  :root,
+  [data-theme='dark'] {
+    /* ── raw palette — ground & surfaces ──────────────────────────── */
+    --ground: #101418;
+    --surface: #171c22;
+    --surface-2: #1e242b;
+    --surface-3: #252d36;
+    --line: #2a323b;
+    --line-strong: #3a444f;
+
+    /* ── raw palette — text ──────────────────────────────────────────── */
+    --text: #dfe6ee;
+    --text-dim: #8b97a5;
+    --text-faint: #5f6b78;
+
+    /* ── raw palette — accent: "work is happening here" ────────────────
+       Below AA (~3.4:1) against --ground; see the README note under
+       `.text-faint` usage in the gallery for why that's an intentional,
+       carried-over Gate-A choice rather than an oversight. */
+    --accent: #4fb8cf;
+    --accent-dim: #2d7688;
+    --accent-wash: rgba(79, 184, 207, 0.12);
+
+    /* ── raw palette — semantic state (deliberately desaturated) ──────── */
+    --pass: #4ea87a;
+    --pass-wash: rgba(78, 168, 122, 0.14);
+    --attn: #d9a54c;
+    --attn-wash: rgba(217, 165, 76, 0.14);
+    --fail: #d9605e;
+    --fail-wash: rgba(217, 96, 94, 0.14);
+    --idle: #55606d;
+    --idle-wash: rgba(85, 96, 109, 0.14);
+
+    /* ── semantic aliases (shadcn/ui vocabulary) ────────────────────── */
+    --background: var(--ground);
+    --foreground: var(--text);
+
+    --card: var(--surface);
+    --card-foreground: var(--text);
+    --popover: var(--surface-2);
+    --popover-foreground: var(--text);
+
+    --primary: var(--accent);
+    --primary-foreground: #08161a;
+    --secondary: var(--surface-2);
+    --secondary-foreground: var(--text);
+    --muted: var(--surface-2);
+    --muted-foreground: var(--text-dim);
+
+    /* Neutral hover/press highlight — NOT the brand cyan. Existing
+       components (e.g. MobileKeyBar's `active:bg-accent`) already depend
+       on this meaning; see tailwind.config.js. */
+    --accent-surface: var(--surface-2);
+    --accent-surface-foreground: var(--text);
+
+    --destructive: var(--fail);
+    --destructive-foreground: #ffffff;
+
+    --border: var(--line);
+    --input: var(--line);
+    --ring: var(--accent);
+    --radius: var(--r-md);
+  }
+
+  /* Not scoped to :root: same reasoning as `[data-theme='dark']` above. */
+  [data-theme='light'] {
+    --ground: #f5f7f9;
+    --surface: #ffffff;
+    --surface-2: #eef1f5;
+    --surface-3: #e3e8ee;
+    --line: #dde3ea;
+    --line-strong: #c3ccd6;
+
+    --text: #1a212a;
+    --text-dim: #5b6672;
+    --text-faint: #8a95a1;
+
+    --accent: #1d7f96;
+    --accent-dim: #8fc9d6;
+    --accent-wash: rgba(29, 127, 150, 0.1);
+
+    --pass: #2f7d55;
+    --pass-wash: rgba(47, 125, 85, 0.11);
+    --attn: #a4741d;
+    --attn-wash: rgba(164, 116, 29, 0.12);
+    --fail: #b8403e;
+    --fail-wash: rgba(184, 64, 62, 0.11);
+    --idle: #97a1ac;
+    --idle-wash: rgba(151, 161, 172, 0.14);
+
+    /* ── semantic aliases — redeclared, not inherited ─────────────────
+       Custom properties resolve `var(--x)` against the *declaring*
+       element, then inherit the already-resolved value -- a descendant
+       that overrides --ground doesn't retroactively change what an
+       ancestor's `--background: var(--ground)` computed to. So every
+       alias needs restating here against the raw tokens just set above,
+       or `bg-background`/`text-foreground`/etc. would silently keep
+       whatever the dark block resolved them to. (Learned by screenshotting
+       the gallery's side-by-side preview mid-build: without this, the
+       "light" pane rendered with dark colours.) */
+    --background: var(--ground);
+    --foreground: var(--text);
+
+    --card: var(--surface);
+    --card-foreground: var(--text);
+    --popover: var(--surface-2);
+    --popover-foreground: var(--text);
+
+    --primary: var(--accent);
+    /* Light theme's --accent is a darker teal than dark theme's bright
+       cyan, so the button text that sits on top of it needs to flip from
+       dark ink to white to keep 4.5:1 contrast (measured ~4.6:1 white vs
+       ~4.0:1 black). */
+    --primary-foreground: #ffffff;
+    --secondary: var(--surface-2);
+    --secondary-foreground: var(--text);
+    --muted: var(--surface-2);
+    --muted-foreground: var(--text-dim);
+
+    --accent-surface: var(--surface-2);
+    --accent-surface-foreground: var(--text);
+
+    --destructive: var(--fail);
+    --destructive-foreground: #ffffff;
+
+    --border: var(--line);
+    --input: var(--line);
+    --ring: var(--accent);
   }
 }
 
@@ -34,9 +197,14 @@
   }
   body {
     @apply bg-background text-foreground;
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial,
-      sans-serif;
+    font-family: var(--font-ui);
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
+  }
+  /* Matches the mocks' `.mono` convenience class: tabular figures so
+     durations/costs/ids don't jitter as digits change. */
+  .mono {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
   }
 }
