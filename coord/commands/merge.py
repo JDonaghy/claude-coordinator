@@ -110,6 +110,61 @@ def _apply_revalidation(items, board, config, gh_ops, *, dry_run: bool):
     return refreshed if refreshed is not None else _Board(active=[], completed=[])
 
 
+def _apply_ci_revalidation(items, board, config, ci_store, gh_ops, *, dry_run: bool) -> None:
+    """#1851: the ``--revalidate`` arm for CI staleness — the CI analogue of
+    :func:`_apply_revalidation`'s stale-local-verdict arm, resolving a
+    different staleness signal (see ``coord/ci_store.py``'s module docstring
+    for why the two are distinct: GitHub re-runs ``pull_request`` checks on
+    head ``synchronize``, never on base movement, so a green check can
+    outlive the base it actually validated even when the local Test verdict
+    is perfectly fresh).
+
+    Unlike :func:`_apply_revalidation` there is nothing to compose and no
+    local suite to run — the remedy is :meth:`coord.ci_store.CiStore.
+    rerun_for_pr`, a ``gh run rerun`` that costs CI minutes on GitHub's own
+    runners, not a routed Test-stage agent. Strictly cheaper than what
+    :func:`_apply_revalidation` does for the same reason CI should always be
+    preferred when both would establish the same fact (#1851's "Cost
+    framing").
+
+    Opt-in behind ``--revalidate`` exactly like :func:`_apply_revalidation`
+    — never called from auto-drain (see ``docs/DRIVE_QUEUE.md``). Under
+    ``--dry-run`` this only *names* what it would trigger; no ``gh`` mutation
+    runs.
+    """
+    from coord import merge_queue as _mq  # noqa: PLC0415
+
+    if ci_store is None or not ci_store.is_available:
+        return
+    candidates = _mq.ci_revalidation_candidates(items, board, config, ci_store, gh_ops)
+    if not candidates:
+        click.echo(
+            "  --revalidate: no entry is blocked solely on stale CI checks "
+            "— nothing to re-run"
+        )
+        return
+    for entry in candidates:
+        label = f"{entry.repo_name} #{entry.issue_number} ({entry.branch})"
+        if dry_run:
+            click.echo(
+                f"  --revalidate: would re-run CI for {label} "
+                f"(PR #{entry.pr_number}) — checks predate the current base"
+            )
+            continue
+        ok = ci_store.rerun_for_pr(entry.repo_github, entry.pr_number)
+        if ok:
+            click.echo(
+                f"  --revalidate: triggered a CI re-run for {label} "
+                f"(PR #{entry.pr_number})"
+            )
+        else:
+            click.echo(
+                f"  --revalidate: could not trigger a CI re-run for {label} "
+                f"(PR #{entry.pr_number}) — see gh output above",
+                err=True,
+            )
+
+
 def _dispatch_conflict_fixes(events, config, *, dry_run: bool) -> None:
     """#241: classify any conflict events and dispatch a conflict-fix worker
     for the eligible ones.  Mutates each conflict event's ``ev.entry.state``
@@ -1333,6 +1388,14 @@ def merge(
             board_only = _apply_revalidation(
                 only_items, board_only, cfg_only, gh_ops, dry_run=dry_run,
             )
+        # #1851: CI staleness is a separate gate from the local smoke
+        # verdict — always run under --revalidate, independent of
+        # --skip-smoke (which waives the smoke gate specifically, not CI).
+        if revalidate:
+            _apply_ci_revalidation(
+                only_items, board_only, cfg_only, ci_store_only, gh_ops,
+                dry_run=dry_run,
+            )
         events_only = mq.process(
             only_items, gh_ops,
             method=method, dry_run=dry_run, presorted=True,
@@ -1604,6 +1667,11 @@ def merge(
     # `coord merge` behaves byte-identically to before.
     if revalidate and not skip_smoke:
         board = _apply_revalidation(pending, board, cfg, gh_ops, dry_run=dry_run)
+    # #1851: CI staleness is a separate gate from the local smoke verdict —
+    # always run under --revalidate, independent of --skip-smoke (which
+    # waives the smoke gate specifically, not CI).
+    if revalidate:
+        _apply_ci_revalidation(pending, board, cfg, ci_store, gh_ops, dry_run=dry_run)
     events = mq.process(
         items, gh_ops,
         method=method, dry_run=dry_run, presorted=presorted,

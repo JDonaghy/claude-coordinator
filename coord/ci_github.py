@@ -11,6 +11,7 @@ one wasted retry, and the user will re-run ``coord merge`` anyway.
 
 from __future__ import annotations
 
+import re
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -51,6 +52,29 @@ _BUCKET_CONCLUSIONS: dict[str, str] = {
     "skipping": "skipped",
     "cancel": "cancelled",
 }
+
+
+# #1851: an Actions check `link` is either a *run* URL
+# (".../actions/runs/{run_id}") or a *job* URL
+# (".../actions/runs/{run_id}/job/{job_id}") depending on whether the check
+# has a job breakdown yet. `gh run rerun` takes the *run* id specifically —
+# taking the last path segment (the pre-#1851 behaviour of the `run_id` field
+# below) silently grabs the job id off a job URL instead. Nothing before
+# #1851 ever read `CheckRun.run_id` (see the Phase 1 header in
+# `coord/ci_store.py`), so fixing the extraction here has no back-compat
+# concern.
+_RUN_ID_RE = re.compile(r"/runs/(\d+)")
+
+
+def _run_id_from_link(link: str) -> str:
+    """Extract the numeric Actions *run* id from a `gh pr checks` `link` URL.
+
+    Returns ``""`` when *link* is empty or doesn't match the expected Actions
+    URL shape (e.g. a third-party check with no GitHub Actions run behind
+    it) — callers treat an empty run id as "not rerunnable".
+    """
+    match = _RUN_ID_RE.search(link or "")
+    return match.group(1) if match else ""
 
 
 def _normalize_bucket(bucket: str) -> str:
@@ -120,6 +144,46 @@ class GitHubCi:
                 continue
             del self._cache[key]
 
+    def rerun_for_pr(self, repo: str, number: int) -> bool:
+        """Re-run every distinct Actions run behind *repo*#*number*'s current
+        checks via ``gh run rerun`` (#1851).
+
+        A PR's checks can span more than one workflow run — `test.yml` and
+        `cargo-test.yml` in this repo, for instance — so this reruns every
+        distinct ``run_id`` among the PR's checks, not just the first. Best
+        effort throughout: a check with no readable run id (an empty ``link``,
+        or a third-party check with no Actions run behind it at all) is
+        skipped rather than failing the whole call, and any individual
+        ``gh run rerun`` failure is logged into the return value rather than
+        raised — this is the remedy side of a fail-closed *reading*
+        (:func:`coord.ci_store.checks_are_stale`), not itself required to be
+        fail-closed: a rerun that only partially succeeds still helps, but
+        the caller must not be told it fully worked.
+
+        Returns ``True`` only when at least one run id was found *and* every
+        rerun call it issued exited zero. Returns ``False`` when there was
+        nothing rerunnable (no checks, or none with a readable run id) or any
+        rerun call failed. Invalidates this PR's cache entry on any success
+        so the next :meth:`list_checks_for_pr` reflects the freshly-queued
+        run instead of the briefly-cached pre-rerun snapshot.
+        """
+        checks = self.list_checks_for_pr(repo, number)
+        run_ids = sorted({c.run_id for c in checks if c.run_id})
+        if not run_ids:
+            return False
+        all_ok = True
+        any_ok = False
+        for run_id in run_ids:
+            # #1483: route through the single `gh` sink instead of shelling
+            # out here directly.
+            if github_ops.rerun_workflow_run(repo, run_id):
+                any_ok = True
+            else:
+                all_ok = False
+        if any_ok:
+            self.invalidate(repo, number)
+        return all_ok and any_ok
+
     # ── Internal ────────────────────────────────────────────────────────────
 
     def _fetch(self, repo: str, number: int) -> list[CheckRun]:
@@ -158,7 +222,7 @@ class GitHubCi:
                 status=_status_from_bucket(str(entry.get("bucket", ""))),
                 conclusion=_conclusion_from_bucket(str(entry.get("bucket", ""))),
                 url=str(entry.get("link", "")),
-                run_id=str(entry.get("link", "")).rstrip("/").rsplit("/", 1)[-1],
+                run_id=_run_id_from_link(str(entry.get("link", ""))),
                 started_at=_parse_ts(entry.get("startedAt")),
                 completed_at=_parse_ts(entry.get("completedAt")),
             )

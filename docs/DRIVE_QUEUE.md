@@ -72,6 +72,19 @@ automatically, on a STALE (not missing) verdict, bounded by the same
 genuine fixes, so a queue that keeps re-staling itself burns it fast and still
 lands on the human escalation.
 
+**A fourth, distinct staleness signal (#1851): a green *CI check* can itself be
+stale.** GitHub re-runs `pull_request` workflows on head `synchronize` —
+never on base movement — so a passing check only proves the composite passed
+against the base *as of the last head push*, not as of now. Every merge on the
+repo silently widens that gap for every other open PR. `coord merge --dry-run`
+now names this ("CI stale: checks predate the current base…"), distinctly
+from "CI failed"/"CI running", and `coord merge --revalidate` triggers a
+`gh run rerun` for it — strictly cheaper than the local-suite arms above
+(CI minutes, not a routed Test-stage agent), and skipped automatically when
+the same #1847 disjointness check already proved the base move irrelevant.
+Same posture as everything else on this page: reporting is unconditional,
+the re-run is opt-in behind `--revalidate`, and auto-drain never triggers it.
+
 **Practical guidance:** queue depth per repo is no longer bounded by the
 *arithmetic* — it is bounded by whether anyone is around to type
 `coord merge --revalidate` afterwards. For a genuinely unattended overnight

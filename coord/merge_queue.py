@@ -18,9 +18,11 @@ from typing import Iterable, Protocol
 
 from coord.audit import record_audit
 from coord.ci_store import (
+    CheckRun,
     CiCheckSummary,
     CiStore,
     NoOpCi,
+    checks_are_stale,
     failed_checks,
     in_flight_checks,
     summarize,
@@ -1226,6 +1228,66 @@ def _base_move_spared(
     return False, None
 
 
+# #1851: the reason string prefix `_entry_gate_status` returns for a CI-stale
+# entry. Both the wording and the eligibility check in
+# :func:`ci_revalidation_candidates` key off this constant so the two can
+# never drift apart the way #1141 warns about (see `STALE_SMOKE_MARKERS`'s
+# comment above for the same lesson learned the hard way for the smoke gate).
+CI_STALE_PREFIX = "CI stale:"
+
+
+def _ci_checks_are_stale(
+    checks: "list[CheckRun]",
+    gh_ops: "GhOps | None",
+    repo_github: str | None,
+    target_branch: str | None,
+    smoke: "SmokeVerdictStatus | None",
+) -> bool:
+    """True when *checks* — already confirmed by the caller to have no
+    failed/in-flight entries — are stale relative to *target_branch*'s
+    current base (#1851).
+
+    GitHub does not re-run ``pull_request`` workflows on a base-only move
+    (only on head ``synchronize``), so a green check can silently outlive the
+    base commit it actually validated. See ``coord/ci_store.py``'s module
+    docstring and :func:`coord.ci_store.checks_are_stale` for the full
+    rationale; this function supplies the two pieces that predicate needs and
+    can't fetch for itself — the base's current commit timestamp, and (#1847
+    reuse) whether the base move can be dismissed without even reading one.
+
+    *smoke*, when given, is the :class:`SmokeVerdictStatus` this same gate
+    pass already computed for the entry's local Test verdict (evaluated only
+    when the smoke gate applies). Its ``spared_reason`` is set exactly when a
+    moved base was proven inert (#1738), the branch's own diff was proven
+    inert (#1778), or the two diffs are file-disjoint (#1847) — any one of
+    which spares the local verdict for the *same* base move, and the same
+    reasoning spares the CI result: "the two checks answer the same question
+    about different evidence" (#1851). When *smoke* is ``None`` or carries no
+    ``spared_reason`` (smoke gate not required/evaluated for this entry, or
+    the base move wasn't spared), this falls back to a pure timestamp
+    comparison — the only evidence available without an anchor.
+
+    Fails closed (returns ``True``) whenever the timestamp comparison itself
+    can't be made: no *gh_ops*, no *target_branch*, a *gh_ops* stand-in with
+    no ``get_branch_commit_timestamp`` (e.g. :class:`coord.gate_snapshot.
+    GateSnapshot`, which doesn't cache it — same documented pessimistic-
+    display tradeoff as :func:`_fetch_compare_files`), or a live lookup that
+    raises or returns ``None``.
+    """
+    if smoke is not None and smoke.spared_reason is not None:
+        return False
+    if gh_ops is None or not repo_github or not target_branch:
+        return True
+    getter = getattr(gh_ops, "get_branch_commit_timestamp", None)
+    if getter is None:
+        return True
+    try:
+        base_commit_time = getter(repo_github, target_branch)
+    except Exception:  # noqa: BLE001 — fail-safe: unknown timestamp is stale, not blocking here
+        base_commit_time = None
+    return checks_are_stale(checks, base_commit_time)
+
+
 def has_smoke_verdict(
     entry: "QueuedMerge", board, gh_ops: "GhOps | None" = None
 ) -> bool:
@@ -1644,6 +1706,46 @@ def revalidation_candidates(
             work_assignment_id=smoke.assignment_id,
             smoke=smoke,
         ))
+    return out
+
+
+def ci_revalidation_candidates(
+    items: Iterable["QueuedMerge"],
+    board,
+    config,
+    ci_store: "CiStore | None",
+    gh_ops: "GhOps | None" = None,
+) -> list["QueuedMerge"]:
+    """The subset of *items* ``--revalidate`` may trigger a CI re-run for
+    (#1851) — the CI analogue of :func:`revalidation_candidates`.
+
+    An entry qualifies only when it is ``PENDING`` and
+    :func:`_entry_gate_status` blocks it for CI staleness specifically (a
+    reason starting with :data:`CI_STALE_PREFIX`) — which only happens after
+    every gate ahead of CI in that function's evaluation order (review,
+    smoke) has already passed, and the CI checks themselves are neither
+    failed nor still running, only stale. This mirrors
+    :func:`revalidation_candidates`'s "blocked *solely* on..." policy: an
+    entry that also needs a review or a fresh local Test verdict is left
+    alone here exactly as it already is there — a re-run is never offered as
+    a distraction from a block it can't resolve.
+
+    Returns the raw :class:`QueuedMerge` entries (unlike
+    :class:`RevalidationCandidate`, there is no local verdict to re-record —
+    the remedy is :meth:`coord.ci_store.CiStore.rerun_for_pr`, keyed off
+    ``entry.repo_github``/``entry.pr_number`` alone).
+    """
+    if ci_store is None or not ci_store.is_available:
+        return []
+    out: list["QueuedMerge"] = []
+    for entry in items:
+        if getattr(entry, "state", None) != PENDING:
+            continue
+        if not getattr(entry, "pr_number", None):
+            continue
+        status, reason = _entry_gate_status(entry, board, config, ci_store, gh_ops)
+        if status == PLAN_BLOCKED and (reason or "").startswith(CI_STALE_PREFIX):
+            out.append(entry)
     return out
 
 
@@ -2505,7 +2607,15 @@ def _entry_gate_status(
     ``force_merge`` here (unlike :func:`process`'s live override) — the plan
     view has no such flag; an operator who wants to see the override outcome
     reads the ``coord merge --force-merge`` output itself.
+
+    #1851: a CI gate that reads all-green additionally checks *staleness* —
+    whether every passing check predates the target branch's current HEAD
+    commit, which GitHub's own re-run-on-``synchronize``-only behaviour never
+    catches. Reported with the :data:`CI_STALE_PREFIX` wording, distinct from
+    "CI failed"/"CI running" so an operator (and :func:`ci_revalidation_candidates`,
+    which keys off the same prefix) can tell the three apart.
     """
+    smoke: "SmokeVerdictStatus | None" = None
     if config is not None and board is not None:
         # #1506: pass gh_ops through so a null branch_patch_id (e.g. an entry
         # whose approved review predates #1475) is computed on demand rather
@@ -2530,6 +2640,14 @@ def _entry_gate_status(
         if pending:
             summary = ", ".join(c.name for c in pending)
             return PLAN_BLOCKED, f"CI running: {summary}"
+        if checks and _ci_checks_are_stale(
+            checks, gh_ops, entry.repo_github, entry.target_branch, smoke
+        ):
+            return (
+                PLAN_BLOCKED,
+                f"{CI_STALE_PREFIX} checks predate the current base — "
+                "re-run CI (`coord merge --revalidate`) before merging",
+            )
     if gh_ops is not None and entry.pr_number:
         try:
             commit_messages = gh_ops.get_pr_commit_messages(
@@ -3397,6 +3515,23 @@ def process(
                                 f"(dry run) would be blocked: checks still running: {summary}",
                             ))
                             continue
+                        # #1851: a green CI result can itself be stale —
+                        # GitHub re-runs `pull_request` checks on head
+                        # `synchronize`, never on base movement, so a check
+                        # that started before the base's newest commit
+                        # landed never saw it. Named distinctly from
+                        # checks_failed/checks_pending above.
+                        if checks and _ci_checks_are_stale(
+                            checks, gh_ops, entry.repo_github,
+                            entry.target_branch, _smoke,
+                        ):
+                            events.append(MergeEvent(
+                                entry, "checks_stale",
+                                "(dry run) would be blocked: CI checks "
+                                "predate the current base — re-run CI "
+                                f"(`coord merge --revalidate`) for {entry.branch}",
+                            ))
+                            continue
                     else:
                         _ci_note = " [gate: unknown (no PR yet) — CI cannot be evaluated]"
                 # #1467-review: preview the rebase→squash fallback in
@@ -3552,6 +3687,10 @@ def process(
             # the verdict cannot be confirmed; block rather than silently merge.
             # #1640: distinguish "never recorded" from "recorded but stale
             # against the current base" — both used to print the former.
+            # #1851: also read below by the CI-staleness check, which reuses
+            # `smoke.spared_reason` when the smoke gate evaluated this same
+            # base move — `None` when smoke wasn't required for this entry.
+            smoke: "SmokeVerdictStatus | None" = None
             if (
                 not skip_smoke
                 and config is not None
@@ -3592,6 +3731,21 @@ def process(
                     msg = f"checks still running: {summary}"
                     entry.error = msg
                     events.append(MergeEvent(entry, "checks_pending", msg))
+                    continue  # #292: skip, don't halt the group
+                # #1851: a green CI result can itself be stale relative to the
+                # base — see `_ci_checks_are_stale`'s docstring. Named
+                # distinctly (`checks_stale`) from checks_failed/
+                # checks_pending above so an operator (and `coord merge
+                # --revalidate`, the remedy) can tell the three apart.
+                if checks and _ci_checks_are_stale(
+                    checks, gh_ops, entry.repo_github, entry.target_branch, smoke,
+                ):
+                    msg = (
+                        f"{CI_STALE_PREFIX} checks predate the current base "
+                        "— re-run CI (`coord merge --revalidate`) before merging"
+                    )
+                    entry.error = msg
+                    events.append(MergeEvent(entry, "checks_stale", msg))
                     continue  # #292: skip, don't halt the group
             # #1318: cache is_epic_issue lookups for this entry — the same
             # referenced number can show up in both the PR body and one or

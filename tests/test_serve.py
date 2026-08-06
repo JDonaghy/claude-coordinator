@@ -5373,6 +5373,98 @@ def test_auto_drain_blocked_entry_not_touched(
     assert items[0].state == "pending"
 
 
+def test_auto_drain_never_triggers_ci_rerun_for_stale_ci(
+    tmp_path: "Path", rw_db, monkeypatch
+) -> None:
+    """#1851: a green-but-CI-stale entry (approved review + passed test, but
+    its CI checks predate the base's newest commit) must be BLOCKED by the
+    unattended auto-drain tick, and — the point of this test — must never
+    trigger `ci_store.rerun_for_pr()`. That remedy is opt-in behind `coord
+    merge --revalidate` only; auto-drain starting CI runs on its own
+    schedule is the same shape as the suite-runs-on-a-timer behaviour gated
+    off after the 2026-06-07 token-burn incident.
+
+    Asserted dynamically via a spy call count on the actual `ci_store` the
+    gate consults — not by inspecting `_auto_drain_tick`'s source — per
+    #1851's acceptance criteria ("asserted by a test, not just by
+    inspection").
+    """
+    from types import SimpleNamespace
+
+    from coord.config import load as load_config
+    from coord import merge_queue as mq
+    from coord.serve_app import _auto_drain_tick
+
+    aid, branch, issue_number = "work-cistale1", "issue-57-impl", 57
+    rw_db.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')")
+    rw_db.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('round_number', '1')")
+    rw_db.execute(
+        "INSERT INTO assignments "
+        "(assignment_id, machine_name, repo_name, repo_github, issue_number, "
+        " issue_title, status, type, branch, test_state) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (aid, "laptop", "api", "acme/api", issue_number, "The issue", "done", "work", branch, "passed"),
+    )
+    rw_db.execute(
+        "INSERT INTO assignments "
+        "(assignment_id, machine_name, repo_name, repo_github, issue_number, "
+        " issue_title, status, type, review_of_assignment_id, review_verdict) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (
+            f"rev-{aid}", "server", "api", "acme/api", issue_number, "Review of issue",
+            "done", "review", aid, "approve",
+        ),
+    )
+    rw_db.execute(
+        "INSERT INTO merge_queue "
+        "(assignment_id, repo_name, repo_github, branch, target_branch, "
+        " issue_number, issue_title, state, pr_number) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (aid, "api", "acme/api", branch, "main", issue_number, "The issue", "pending", 501),
+    )
+    rw_db.commit()
+
+    rerun_calls: list = []
+    merge_calls: list = []
+
+    class _FakeCiStore:
+        is_available = True
+
+        def list_checks_for_pr(self, repo, number):
+            # Green, but started well before the (mocked) base commit time
+            # below — the #1851 staleness signal.
+            return [SimpleNamespace(
+                name="build", status="completed", conclusion="success",
+                started_at=500.0, completed_at=None,
+            )]
+
+        def rerun_for_pr(self, repo, number):
+            rerun_calls.append((repo, number))
+            return True
+
+    monkeypatch.setattr("coord.ci_store.build_ci_store", lambda t: _FakeCiStore())
+    monkeypatch.setattr(
+        "coord.github_ops.get_branch_commit_timestamp",
+        lambda repo, branch: 1000.0,  # newer than the check's started_at=500.0
+    )
+    monkeypatch.setattr(
+        "coord.github_ops.merge_pr",
+        lambda repo, number, method="rebase": merge_calls.append((repo, number)) or (True, "merged"),
+    )
+
+    cfg = load_config(_make_drain_config(tmp_path, auto_drain=True))
+    events = _auto_drain_tick(cfg)
+
+    assert rerun_calls == [], f"auto-drain must never call rerun_for_pr: {rerun_calls}"
+    assert merge_calls == [], "a CI-stale entry must not merge from auto-drain"
+    merge_events = [ev for ev in events if ev.kind == "merged"]
+    assert merge_events == [], f"expected no merged events, got: {[ev.kind for ev in events]}"
+
+    items = mq.load_queue()
+    assert len(items) == 1
+    assert items[0].state == "pending"
+
+
 def test_auto_drain_error_isolation(
     tmp_path: "Path", rw_db, monkeypatch
 ) -> None:

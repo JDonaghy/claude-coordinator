@@ -1656,6 +1656,72 @@ class TestGetPrChecks:
         assert not isinstance(exc_info.value, github_ops.GhTooOldForJsonChecks)
 
 
+class TestRerunWorkflowRun:
+    """#1851: the single gh sink for coord.ci_github.GitHubCi.rerun_for_pr."""
+
+    def test_success_returns_true(self) -> None:
+        class _FakeResult:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        with patch(
+            "coord.github_ops.subprocess.run", return_value=_FakeResult()
+        ) as mock_run:
+            assert github_ops.rerun_workflow_run("acme/api", "12345") is True
+        args = mock_run.call_args.args[0]
+        assert args == ["gh", "run", "rerun", "12345", "--repo", "acme/api"]
+
+    def test_nonzero_exit_returns_false(self) -> None:
+        class _FakeResult:
+            returncode = 1
+            stdout = ""
+            stderr = "run already in progress"
+
+        with patch("coord.github_ops.subprocess.run", return_value=_FakeResult()):
+            assert github_ops.rerun_workflow_run("acme/api", "12345") is False
+
+    def test_gh_missing_returns_false(self) -> None:
+        with patch("coord.github_ops.subprocess.run", side_effect=FileNotFoundError):
+            assert github_ops.rerun_workflow_run("acme/api", "12345") is False
+
+    def test_gh_timeout_returns_false(self) -> None:
+        with patch(
+            "coord.github_ops.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="gh", timeout=30),
+        ):
+            assert github_ops.rerun_workflow_run("acme/api", "12345") is False
+
+
+class TestGetBranchCommitTimestamp:
+    """#1851: the base-side half of the CI-staleness comparison."""
+
+    def test_parses_committer_date(self) -> None:
+        payload = json.dumps({
+            "commit": {
+                "sha": "abc123",
+                "commit": {"committer": {"date": "2026-05-24T12:00:00Z"}},
+            }
+        })
+        with patch("coord.github_ops._gh", return_value=payload):
+            ts = github_ops.get_branch_commit_timestamp("acme/api", "main")
+        assert isinstance(ts, float)
+        import datetime as _dt
+        assert _dt.datetime.fromtimestamp(ts, tz=_dt.timezone.utc).year == 2026
+
+    def test_returns_none_on_gh_error(self) -> None:
+        with patch("coord.github_ops._gh", side_effect=RuntimeError("gh boom")):
+            assert github_ops.get_branch_commit_timestamp("acme/api", "main") is None
+
+    def test_returns_none_on_malformed_response(self) -> None:
+        with patch("coord.github_ops._gh", return_value="not json"):
+            assert github_ops.get_branch_commit_timestamp("acme/api", "main") is None
+
+    def test_returns_none_on_missing_fields(self) -> None:
+        with patch("coord.github_ops._gh", return_value=json.dumps({"commit": {}})):
+            assert github_ops.get_branch_commit_timestamp("acme/api", "main") is None
+
+
 class TestPrChecksJsonFieldsAreValid:
     """#1564 regression: `coord.github_ops.PR_CHECKS_JSON_FIELDS` must stay a
     subset of what the installed `gh` actually advertises via

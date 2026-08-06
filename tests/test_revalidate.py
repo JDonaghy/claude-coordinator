@@ -757,6 +757,137 @@ class TestIsInfrastructureFailure:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 3.5. #1851: `_apply_ci_revalidation` — the CI-rerun arm of --revalidate
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Unlike `_apply_revalidation` (the local-suite arm exercised end to end in
+# section 4 below), this arm's remedy is a `gh run rerun` — no worktree, no
+# local suite, no board write. Exercised directly against
+# `coord.commands.merge._apply_ci_revalidation` with fakes, rather than
+# through the full CLI/git-fleet black-box, since there is no local git state
+# for it to touch.
+
+class _CiRerunFake:
+    """Green checks whose `started_at` predates the base commit time — the
+    #1851 staleness signal — with a spy on `rerun_for_pr`."""
+
+    def __init__(self, *, checks_started_at: float | None = 500.0, rerun_ok: bool = True):
+        self.is_available = True
+        self.checks_started_at = checks_started_at
+        self.rerun_ok = rerun_ok
+        self.rerun_calls: list[tuple[str, int]] = []
+
+    def list_checks_for_pr(self, repo, number):
+        from types import SimpleNamespace
+        return [SimpleNamespace(
+            name="build", status="completed", conclusion="success",
+            started_at=self.checks_started_at, completed_at=None,
+        )]
+
+    def rerun_for_pr(self, repo, number):
+        self.rerun_calls.append((repo, number))
+        return self.rerun_ok
+
+
+class _GhBranchTimestamp:
+    def __init__(self, ts: float | None = 1000.0):
+        self.ts = ts
+
+    def get_branch_commit_timestamp(self, repo, branch):
+        return self.ts
+
+
+class TestApplyCiRevalidation:
+    @staticmethod
+    def _entry_with_pr(pr: int | None):
+        e = _entry("w1", issue=101)
+        e.pr_number = pr
+        return e
+
+    def test_triggers_rerun_for_a_ci_stale_entry(self, capsys) -> None:
+        from coord.commands.merge import _apply_ci_revalidation
+
+        items = [self._entry_with_pr(501)]
+        ci = _CiRerunFake()
+        cfg = _config(gates=["merge"], reviews=False)
+
+        _apply_ci_revalidation(
+            items, Board(active=[], completed=[]), cfg, ci, _GhBranchTimestamp(),
+            dry_run=False,
+        )
+
+        assert ci.rerun_calls == [("acme/api", 501)]
+        out = capsys.readouterr().out
+        assert "triggered a CI re-run" in out
+        assert "PR #501" in out
+
+    def test_dry_run_names_it_without_triggering(self, capsys) -> None:
+        from coord.commands.merge import _apply_ci_revalidation
+
+        items = [self._entry_with_pr(501)]
+        ci = _CiRerunFake()
+        cfg = _config(gates=["merge"], reviews=False)
+
+        _apply_ci_revalidation(
+            items, Board(active=[], completed=[]), cfg, ci, _GhBranchTimestamp(),
+            dry_run=True,
+        )
+
+        assert ci.rerun_calls == [], "dry-run must not trigger a real rerun"
+        out = capsys.readouterr().out
+        assert "would re-run CI" in out
+        assert "PR #501" in out
+
+    def test_nothing_stale_says_so_and_triggers_nothing(self, capsys) -> None:
+        from coord.commands.merge import _apply_ci_revalidation
+
+        items = [self._entry_with_pr(501)]
+        # Checks postdate the base — fresh, not stale.
+        ci = _CiRerunFake(checks_started_at=1500.0)
+        cfg = _config(gates=["merge"], reviews=False)
+
+        _apply_ci_revalidation(
+            items, Board(active=[], completed=[]), cfg, ci, _GhBranchTimestamp(),
+            dry_run=False,
+        )
+
+        assert ci.rerun_calls == []
+        out = capsys.readouterr().out
+        assert "no entry is blocked solely on stale CI checks" in out
+
+    def test_ci_store_none_is_inert(self, capsys) -> None:
+        from coord.commands.merge import _apply_ci_revalidation
+
+        items = [self._entry_with_pr(501)]
+        cfg = _config(gates=["merge"], reviews=False)
+
+        _apply_ci_revalidation(
+            items, Board(active=[], completed=[]), cfg, None, _GhBranchTimestamp(),
+            dry_run=False,
+        )
+        # No exception, no output claiming anything was found/triggered.
+        out = capsys.readouterr().out
+        assert "triggered" not in out
+
+    def test_partial_rerun_failure_is_reported(self, capsys) -> None:
+        from coord.commands.merge import _apply_ci_revalidation
+
+        items = [self._entry_with_pr(501)]
+        ci = _CiRerunFake(rerun_ok=False)
+        cfg = _config(gates=["merge"], reviews=False)
+
+        _apply_ci_revalidation(
+            items, Board(active=[], completed=[]), cfg, ci, _GhBranchTimestamp(),
+            dry_run=False,
+        )
+
+        assert ci.rerun_calls == [("acme/api", 501)]
+        captured = capsys.readouterr()
+        # `click.echo(..., err=True)` for the failure line — checked on stderr.
+        assert "could not trigger a CI re-run" in captured.err
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 4. Black-box: the CLI, end to end
 # ══════════════════════════════════════════════════════════════════════════════
 

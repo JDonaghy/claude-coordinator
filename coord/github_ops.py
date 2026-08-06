@@ -6,6 +6,7 @@ import json
 import re
 import socket
 import subprocess
+from datetime import datetime
 from typing import Any
 
 
@@ -1214,6 +1215,36 @@ def get_branch_sha(repo: str, branch: str) -> str | None:
         return None
 
 
+def get_branch_commit_timestamp(repo: str, branch: str) -> float | None:
+    """Return the unix timestamp of *branch*'s current HEAD commit on *repo*,
+    or ``None`` on failure (#1851).
+
+    The base-side half of :func:`coord.ci_store.checks_are_stale`'s
+    comparison: a green CI check's ``started_at`` predating this timestamp
+    means the check ran before the base's newest commit landed — GitHub only
+    re-runs ``pull_request`` checks on head ``synchronize``, never on base
+    movement, so that check never saw it.
+
+    Same endpoint as :func:`get_branch_sha` (``GET
+    repos/{repo}/branches/{branch}``) — reads the commit's ``committer.date``
+    (when it landed on the branch) rather than ``author.date`` (when it was
+    originally authored, which for a rebased/cherry-picked commit can predate
+    the merge by a wide margin and would understate how fresh the base
+    actually is). Best-effort like :func:`get_branch_sha`: returns ``None``
+    when GitHub is unavailable, ``gh`` is not authenticated, the branch
+    doesn't exist, or the response is missing the expected fields — callers
+    must treat ``None`` as "unknown" and fail closed (stale), never as "the
+    base never moved".
+    """
+    try:
+        raw = _gh("api", f"repos/{repo}/branches/{branch}")
+        data = _json_loads_or(raw, default={})
+        date = data["commit"]["commit"]["committer"]["date"]
+        return datetime.fromisoformat(str(date).replace("Z", "+00:00")).timestamp()
+    except Exception:  # noqa: BLE001 — fail-safe: unknown timestamp is stale, not blocking here
+        return None
+
+
 # ── PR operations (used by the merge queue) ──────────────────────────────
 
 def find_pr_for_branch(repo: str, branch: str) -> dict | None:
@@ -1382,6 +1413,27 @@ def get_pr_checks(repo: str, number: int) -> list[dict]:
     # is a deliberate default here — that's ``gh``'s normal "zero checks
     # configured" response, not a decode failure.
     return json.loads(stdout or "[]")
+
+
+def rerun_workflow_run(repo: str, run_id: str) -> bool:
+    """Re-run Actions workflow run *run_id* on *repo* via ``gh run rerun``.
+
+    The single ``gh`` sink (#1483) for :meth:`coord.ci_github.GitHubCi.
+    rerun_for_pr` (#1851) — the same seam :func:`get_pr_checks` is for
+    reading checks. Returns ``True`` only on a clean (exit 0) rerun; any
+    subprocess failure (missing ``gh``, timeout, non-zero exit — e.g. the run
+    is already in progress, or the id is stale/invalid) returns ``False``
+    rather than raising, matching this module's other best-effort mutators
+    (:func:`merge_pr`, :func:`edit_pr_body`).
+    """
+    try:
+        result = subprocess.run(
+            ["gh", "run", "rerun", str(run_id), "--repo", repo],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
 
 
 def truncate_diff_text(diff: str, max_chars: int = 60000) -> str:

@@ -4737,6 +4737,310 @@ class TestPlan:
         assert reason is not None and "#1120" in reason
 
 
+# ── #1851: CI results staled by base movement ────────────────────────────────
+
+class TestCiChecksAreStale:
+    """Direct unit coverage of `_ci_checks_are_stale`, independent of the
+    `plan()`/`process()` plumbing around it."""
+
+    @staticmethod
+    def _checks(started_at: float | None = 1500.0):
+        from coord.ci_store import CheckRun
+        return [CheckRun(
+            name="build", status="completed", conclusion="success",
+            url="", run_id="1", started_at=started_at, completed_at=None,
+        )]
+
+    class _Gh:
+        def __init__(self, ts: float | None = 1000.0):
+            self.ts = ts
+        def get_branch_commit_timestamp(self, repo: str, branch: str) -> float | None:
+            return self.ts
+
+    def test_fresh_when_checks_postdate_base(self) -> None:
+        checks = self._checks(started_at=1500.0)
+        assert mq._ci_checks_are_stale(checks, self._Gh(1000.0), "acme/api", "main", None) is False
+
+    def test_stale_when_checks_predate_base(self) -> None:
+        checks = self._checks(started_at=500.0)
+        assert mq._ci_checks_are_stale(checks, self._Gh(1000.0), "acme/api", "main", None) is True
+
+    def test_fails_closed_without_gh_ops(self) -> None:
+        checks = self._checks(started_at=1500.0)
+        assert mq._ci_checks_are_stale(checks, None, "acme/api", "main", None) is True
+
+    def test_fails_closed_without_target_branch(self) -> None:
+        checks = self._checks(started_at=1500.0)
+        assert mq._ci_checks_are_stale(checks, self._Gh(1000.0), "acme/api", None, None) is True
+
+    def test_fails_closed_when_gh_ops_lacks_the_capability(self) -> None:
+        """A gh_ops stand-in with no `get_branch_commit_timestamp` (e.g.
+        `coord.gate_snapshot.GateSnapshot`) must degrade to stale, matching
+        `_fetch_compare_files`'s documented AttributeError-fails-closed
+        posture for the same reason."""
+        class _NoTimestampGh:
+            pass
+        checks = self._checks(started_at=1500.0)
+        assert mq._ci_checks_are_stale(checks, _NoTimestampGh(), "acme/api", "main", None) is True
+
+    def test_fails_closed_when_lookup_raises(self) -> None:
+        class _RaisingGh:
+            def get_branch_commit_timestamp(self, repo, branch):
+                raise RuntimeError("gh api boom")
+        checks = self._checks(started_at=1500.0)
+        assert mq._ci_checks_are_stale(checks, _RaisingGh(), "acme/api", "main", None) is True
+
+    def test_smoke_spared_reason_short_circuits_to_fresh(self) -> None:
+        """#1851: when the smoke gate already proved this base move inert/
+        disjoint for the SAME entry, CI staleness is spared too — without
+        even reading a timestamp (the fake gh_ops below has none)."""
+        class _NoTimestampGh:
+            pass
+        spared = mq.SmokeVerdictStatus(
+            ok=True, kind=mq.SMOKE_OK,
+            spared_reason="base move and branch touch disjoint files (#1847)",
+        )
+        checks = self._checks(started_at=500.0)  # would be stale on timestamps alone
+        assert mq._ci_checks_are_stale(
+            checks, _NoTimestampGh(), "acme/api", "main", spared
+        ) is False
+
+    def test_smoke_ok_without_spared_reason_falls_back_to_timestamp(self) -> None:
+        """smoke.ok=True but spared_reason=None means the base never moved at
+        all for the smoke check — that tells us nothing about CI, so this
+        still falls back to the timestamp comparison."""
+        smoke = mq.SmokeVerdictStatus(ok=True, kind=mq.SMOKE_OK, spared_reason=None)
+        checks = self._checks(started_at=500.0)
+        assert mq._ci_checks_are_stale(
+            checks, self._Gh(1000.0), "acme/api", "main", smoke
+        ) is True
+
+
+class TestPlanCiStaleness:
+    """#1851 acceptance: `plan()`/`_entry_gate_status()` reads a stale-but-
+    green CI result distinctly from "CI failed"/"CI running"."""
+
+    @staticmethod
+    def _config():
+        return TestPlan._config(review_enabled=False, gates=["merge"])
+
+    @staticmethod
+    def _board():
+        from coord.models import Board
+        return Board(active=[], completed=[])
+
+    @staticmethod
+    def _ci(started_at: float | None):
+        from types import SimpleNamespace
+
+        class _Ci:
+            is_available = True
+            def list_checks_for_pr(self, repo, number):
+                return [SimpleNamespace(
+                    name="build", status="completed", conclusion="success",
+                    started_at=started_at, completed_at=None,
+                )]
+        return _Ci()
+
+    @staticmethod
+    def _gh(ts: float | None):
+        class _Gh:
+            def get_branch_commit_timestamp(self, repo, branch):
+                return ts
+        return _Gh()
+
+    def test_blocked_ci_stale_distinctly_from_failed_and_running(self, coord_db) -> None:
+        items = [_q("w1", size=50, pr=99)]
+        save_queue(items)
+        plan = mq.plan(
+            self._board(), self._config(),
+            ci_store=self._ci(started_at=500.0), gh_ops=self._gh(1000.0),
+        )
+        assert plan[0].status == mq.PLAN_BLOCKED
+        assert plan[0].reason is not None
+        assert plan[0].reason.startswith(mq.CI_STALE_PREFIX)
+        assert "CI failed" not in plan[0].reason
+        assert "CI running" not in plan[0].reason
+
+    def test_ready_when_checks_postdate_base(self, coord_db) -> None:
+        items = [_q("w1", size=50, pr=99)]
+        save_queue(items)
+        plan = mq.plan(
+            self._board(), self._config(),
+            ci_store=self._ci(started_at=1500.0), gh_ops=self._gh(1000.0),
+        )
+        assert plan[0].status == mq.PLAN_READY
+        assert plan[0].reason is None
+
+    def test_blocked_ci_failed_is_not_reported_as_stale(self, coord_db) -> None:
+        """Failed checks take precedence — never reported as stale."""
+        from types import SimpleNamespace
+
+        class _Ci:
+            is_available = True
+            def list_checks_for_pr(self, repo, number):
+                return [SimpleNamespace(
+                    name="build", status="completed", conclusion="failure",
+                    started_at=500.0, completed_at=None,
+                )]
+
+        items = [_q("w1", size=50, pr=99)]
+        save_queue(items)
+        plan = mq.plan(self._board(), self._config(), ci_store=_Ci(), gh_ops=self._gh(1000.0))
+        assert plan[0].status == mq.PLAN_BLOCKED
+        assert "CI failed" in (plan[0].reason or "")
+        assert not (plan[0].reason or "").startswith(mq.CI_STALE_PREFIX)
+
+
+class TestCiRevalidationCandidates:
+    """#1851: the eligibility policy for `coord merge --revalidate`'s CI
+    re-run arm — the CI analogue of `revalidation_candidates`."""
+
+    @staticmethod
+    def _board():
+        from coord.models import Board
+        return Board(active=[], completed=[])
+
+    @staticmethod
+    def _ci(started_at: float | None, *, available: bool = True):
+        from types import SimpleNamespace
+
+        class _Ci:
+            is_available = available
+            def list_checks_for_pr(self, repo, number):
+                return [SimpleNamespace(
+                    name="build", status="completed", conclusion="success",
+                    started_at=started_at, completed_at=None,
+                )]
+        return _Ci()
+
+    @staticmethod
+    def _gh(ts: float | None):
+        class _Gh:
+            def get_branch_commit_timestamp(self, repo, branch):
+                return ts
+        return _Gh()
+
+    @staticmethod
+    def _cfg():
+        return TestPlan._config(review_enabled=False, gates=["merge"])
+
+    def test_candidate_blocked_solely_on_ci_staleness(self) -> None:
+        entry = _q("w1", size=50, pr=99)
+        out = mq.ci_revalidation_candidates(
+            [entry], self._board(), self._cfg(),
+            self._ci(started_at=500.0), self._gh(1000.0),
+        )
+        assert out == [entry]
+
+    def test_no_candidates_when_fresh(self) -> None:
+        entry = _q("w1", size=50, pr=99)
+        out = mq.ci_revalidation_candidates(
+            [entry], self._board(), self._cfg(),
+            self._ci(started_at=1500.0), self._gh(1000.0),
+        )
+        assert out == []
+
+    def test_no_candidates_without_pr_number(self) -> None:
+        entry = _q("w1", size=50)  # pr_number=None
+        out = mq.ci_revalidation_candidates(
+            [entry], self._board(), self._cfg(),
+            self._ci(started_at=500.0), self._gh(1000.0),
+        )
+        assert out == []
+
+    def test_no_candidates_when_ci_store_unavailable(self) -> None:
+        entry = _q("w1", size=50, pr=99)
+        out = mq.ci_revalidation_candidates(
+            [entry], self._board(), self._cfg(),
+            self._ci(started_at=500.0, available=False), self._gh(1000.0),
+        )
+        assert out == []
+
+    def test_no_candidates_when_ci_store_is_none(self) -> None:
+        entry = _q("w1", size=50, pr=99)
+        out = mq.ci_revalidation_candidates([entry], self._board(), self._cfg(), None, self._gh(1000.0))
+        assert out == []
+
+    def test_no_candidates_when_also_blocked_on_review(self) -> None:
+        """Blocked on review AND stale CI → not offered a CI re-run, mirroring
+        `revalidation_candidates`'s "blocked solely on..." policy."""
+        cfg = TestPlan._config(review_enabled=True, gates=["review", "merge"])
+        entry = _q("w1", size=50, pr=99)
+        out = mq.ci_revalidation_candidates(
+            [entry], self._board(), cfg,
+            self._ci(started_at=500.0), self._gh(1000.0),
+        )
+        assert out == []
+
+    def test_no_candidates_for_non_pending_entries(self) -> None:
+        entry = _q("w1", size=50, pr=99, state=MERGED)
+        out = mq.ci_revalidation_candidates(
+            [entry], self._board(), self._cfg(),
+            self._ci(started_at=500.0), self._gh(1000.0),
+        )
+        assert out == []
+
+
+class TestProcessCiStaleness:
+    """#1851: `process()` refuses to merge a green-but-CI-stale entry, in
+    both the live path and the `--dry-run` preview — named distinctly
+    (`checks_stale`) from `checks_failed`/`checks_pending`."""
+
+    @staticmethod
+    def _ci(started_at: float | None):
+        from types import SimpleNamespace
+
+        class _Ci:
+            is_available = True
+            def list_checks_for_pr(self, repo, number):
+                return [SimpleNamespace(
+                    name="build", status="completed", conclusion="success",
+                    started_at=started_at, completed_at=None,
+                )]
+        return _Ci()
+
+    class _Gh(FakeGh):
+        ts: float = 1000.0
+        def get_branch_commit_timestamp(self, repo, branch):
+            return self.ts
+
+    def test_live_merge_blocked_and_reports_checks_stale(self) -> None:
+        items = [_q("w1", pr=99)]
+        gh = self._Gh()
+        events = process(items, gh, ci_store=self._ci(started_at=500.0))
+        assert items[0].state == PENDING
+        assert gh.merge_calls == []
+        kinds = [e.kind for e in events]
+        assert "checks_stale" in kinds
+        assert "checks_failed" not in kinds
+        assert "checks_pending" not in kinds
+
+    def test_live_merge_proceeds_when_checks_fresh(self) -> None:
+        items = [_q("w1", pr=99)]
+        gh = self._Gh()
+        events = process(items, gh, ci_store=self._ci(started_at=1500.0))
+        assert items[0].state == MERGED
+        kinds = [e.kind for e in events]
+        assert "checks_stale" not in kinds
+
+    def test_force_merge_overrides_ci_staleness(self) -> None:
+        items = [_q("w1", pr=99)]
+        gh = self._Gh()
+        process(items, gh, ci_store=self._ci(started_at=500.0), force_merge=True)
+        assert items[0].state == MERGED
+
+    def test_dry_run_previews_checks_stale_without_merging(self) -> None:
+        items = [_q("w1", pr=99)]
+        gh = self._Gh()
+        events = process(items, gh, ci_store=self._ci(started_at=500.0), dry_run=True)
+        assert items[0].state == PENDING
+        assert gh.merge_calls == []
+        kinds = [e.kind for e in events]
+        assert "checks_stale" in kinds
+        assert "merged" not in kinds
+
+
 # ── #778: staging_items() ─────────────────────────────────────────────────────
 
 class TestStagingItems:
