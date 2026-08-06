@@ -30,6 +30,7 @@ TWO POSTURES WORTH KEEPING WHEN EDITING THIS FILE:
 from __future__ import annotations
 
 import json as _json
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -84,8 +85,13 @@ This is the durable, board-backed replacement: declare the order once, then
 let `tick` launch at most one drive per run, first-eligible-wins, never past
 the concurrency ceiling.
 
-Run `tick` from a systemd timer (DQ-4) or by hand. It is safe to run at any
-time and from any machine that can reach the board daemon.
+Run `tick` from a systemd timer (DQ-4) or by hand, on any machine that can
+reach the board daemon — the board itself is fleet-global. Liveness of a
+RUNNING entry is not: it is always a local `tmux` read, so a tick only ever
+confirms a session it launched itself. A tick run on a different machine than
+the one that launched an entry reads that entry as UNKNOWN, not dead, and
+leaves it alone rather than reaping a healthy drive out from under another
+host (#1870).
 """
 
 
@@ -492,6 +498,19 @@ def _local_issue_rows() -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def _local_host_id() -> str:
+    """This machine's identity for #1870's launch-host / reconcile matching.
+
+    Same normalisation every other host-locality check in this codebase uses
+    (``coord/commands/sessions.py``, ``coord/commands/_common.py``,
+    ``coord.interactive._get_local_short_hostname``): the short hostname,
+    lowercased, domain suffix dropped — so a machine addressed as
+    ``dellserver`` in one config and ``dellserver.local`` by DNS still
+    compares equal to itself.
+    """
+    return socket.gethostname().split(".")[0].lower()
+
+
 def _fetch_board_view() -> BoardView:
     """Board + live drive sessions, typed.
 
@@ -685,6 +704,11 @@ def drive_queue_tick(max_parallel: int, dry_run: bool, config_path: Path) -> Non
     slow tick must never stack, and two ticks seconds apart are safe: a drive
     launched inside the startup grace window reconciles as `starting`
     (occupying a slot, attempts untouched) rather than as a death (#1794).
+    Two ticks on DIFFERENT machines are also safe: liveness is always a local
+    `tmux` read, so a tick reconciles only the entries it itself launched —
+    one launched elsewhere reads as `unknown`, occupying its slot but never
+    retried or relaunched, rather than being declared dead out from under the
+    host actually running it (#1870).
     """
     from coord.filelock import FileLock, LockBusy, drive_queue_lock_path  # noqa: PLC0415
     from coord.state import list_drive_queue, update_drive_queue_entry  # noqa: PLC0415
@@ -741,8 +765,18 @@ def drive_queue_tick(max_parallel: int, dry_run: bool, config_path: Path) -> Non
         # relaunched — so a tick that fires immediately after another (which
         # `docs/DRIVE_QUEUE.md` §2's install sequence reliably produces) sees
         # a running entry rather than a phantom death.
+        #
+        # #1870: same posture for the machine's own identity. Liveness is a
+        # LOCAL tmux read; without `local_host` a tick on host B would read a
+        # healthy drive launched on host A as dead the instant it fell out of
+        # #1794's grace window, and reap it.
         plan = plan_tick(
-            entries, board, max_parallel, probes=probes, now=time.time()
+            entries,
+            board,
+            max_parallel,
+            probes=probes,
+            now=time.time(),
+            local_host=_local_host_id(),
         )
 
         for line in render_plan(plan, dry_run=dry_run):
@@ -814,6 +848,9 @@ def drive_queue_tick(max_parallel: int, dry_run: bool, config_path: Path) -> Non
                 session_name=session,
                 launched_at=time.time(),
                 last_reason="",
+                # #1870: stamp THIS host as the launcher so a later tick —
+                # possibly on a different machine — knows whose tmux to trust.
+                launch_host=_local_host_id(),
             )
             click.echo(f"launched {target.key} in tmux session {session!r}")
             return

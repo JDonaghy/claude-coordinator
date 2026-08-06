@@ -354,12 +354,52 @@ and then to `blocked` at `max_attempts`. The failure signature to watch for
 is `retry — drive session died without landing the work` appearing **within
 seconds** of a launch; that must never happen again.
 
-## 8. #1715
+## 8. The cross-host trap (#1870)
+
+Liveness (`coord.drive.list_drive_sessions()`) is always a **local** `tmux
+list-sessions` — but `tick` can run from any machine that can reach the board
+daemon (see "1. Enqueue" above and `coord drive-queue --help`), and the queue
+row itself is board-global. Two live `coord drive` sessions on the same issue
+at once, one healthy:
+
+```
+elitebook:   launched 01:20Z — work=done, test=running, pushed 941df76
+dellserver:  launched 02:07Z — a SECOND drive the timer's own tick started
+```
+
+The 02:07Z tick ran on `dellserver` (its documented home, "2. Install the
+timer" above); the entry had been launched by hand from `elitebook` 47
+minutes earlier. `dellserver`'s tick checked *its own* tmux, found nothing,
+and — before #1870 — concluded the drive had died: `"retry — drive session
+died without landing the work, launched 2841s ago (attempt 1/2)"`. It had
+not died; it was on a different machine, well past #1794's grace window,
+which delays a misclassification but cannot prevent one that is not
+transient.
+
+Every `drive_queue` row now carries `launch_host` — the short hostname of the
+machine whose tick actually ran `coord drive --tmux` for it, stamped at
+launch alongside `session_name`/`launched_at`. `tick` compares that against
+its own hostname before trusting a `retry` verdict: a mismatch reconciles to
+`unknown`, not `retry` — the entry keeps its slot, its state, and its attempt
+count untouched, exactly like `starting` (#1794) and `held` (#1660) before
+it. Only a tick running on the SAME host that launched an entry may ever
+retry or relaunch it. A row with no `launch_host` (predates this column, or a
+hand-edited `running` state) degrades to the pre-#1870 behavior exactly —
+reconciled locally, same as always.
+
+Practical consequence: the timer still belongs on the daemon host (§2), but
+running `tick` by hand from a *different* machine — e.g. to walk a queue
+entry forward while debugging — no longer risks a duplicate launch on the
+next scheduled tick. It does mean that entry's own reconciliation (and its
+eventual `retry`/`done`) now belongs to whichever host launched it, until
+that host's tick runs again.
+
+## 9. #1715
 
 See "Read this before queuing more than ~2 issues" above, at the top of this
 document.
 
-## 9. #1738
+## 10. #1738
 
 See the same section — it's the smaller, already-partially-fixed version of
 the same class of problem (a content-irrelevant base move staling a Test

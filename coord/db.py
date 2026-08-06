@@ -324,6 +324,19 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         -- ~/.coord/coord.db (DQ-1 shipped before this) gains them in place —
         -- SQLite has no "ADD COLUMN IF NOT EXISTS", hence both.  See
         -- coord/drive_queue.py for the lifecycle those columns encode.
+        --
+        -- #1870: `launch_host` is the SHORT HOSTNAME of the machine whose tick
+        -- actually ran `coord drive --tmux` for this entry — set alongside
+        -- `session_name`/`launched_at` when the launch succeeds, '' for a row
+        -- that predates this column or was hand-flipped to `running`.
+        -- Liveness (`coord.drive.list_drive_sessions`) is always a LOCAL tmux
+        -- read; without this column a tick running on a DIFFERENT host than
+        -- the one that launched the drive has no way to know that, sees no
+        -- session, and reaps a healthy drive out from under another machine
+        -- (the 2026-08-06 incident: a drive 47 minutes into Test on
+        -- `elitebook` was declared dead and relaunched by the timer on
+        -- `dellserver`).  `_reconcile_running` treats a mismatch as UNKNOWN,
+        -- never as dead — see coord/drive_queue.py.
         CREATE TABLE IF NOT EXISTS drive_queue (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
             repo_name     TEXT    NOT NULL,
@@ -343,6 +356,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             resume_when   TEXT    NOT NULL DEFAULT '',
             hold_state    TEXT    NOT NULL DEFAULT '',
             hold_probes   INTEGER NOT NULL DEFAULT 0,
+            launch_host   TEXT    NOT NULL DEFAULT '',
             UNIQUE(repo_name, issue_number)
         );
 
@@ -609,6 +623,11 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         "ALTER TABLE drive_queue ADD COLUMN resume_when TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE drive_queue ADD COLUMN hold_state TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE drive_queue ADD COLUMN hold_probes INTEGER NOT NULL DEFAULT 0",
+        # #1870: the short hostname of the machine that actually launched this
+        # entry's `coord drive --tmux` — see the CREATE TABLE comment above.
+        # '' for every row written before this migration; `_reconcile_running`
+        # treats that exactly like "launched here" (today's behaviour).
+        "ALTER TABLE drive_queue ADD COLUMN launch_host TEXT NOT NULL DEFAULT ''",
     ]
     for sql in migrations:
         try:
