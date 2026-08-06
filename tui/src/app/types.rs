@@ -1720,6 +1720,19 @@ pub struct ReportResult {
     pub totals: Option<serde_json::Value>,
 }
 
+/// #1853: identity of the column set a Reports result-table width override
+/// was measured against — `(report_id, column ids)`.
+///
+/// Both halves are load-bearing. The report id alone would let one report's
+/// override survive that report changing shape (a daemon adding a column);
+/// the column ids alone would let two reports that happen to share column
+/// names collide. Together they say exactly "these widths were dragged
+/// against *this* table", which is the only condition under which replaying
+/// them is honest. A column *count* is deliberately not part of the
+/// comparison — it is implied by the id list, and on its own it would let a
+/// five-column `usage` inherit a five-column `drive-queue-status`'s widths.
+pub(crate) type ReportsColumnKey = (String, Vec<String>);
+
 /// #1040: time-range filter for the Audit panel, cycled forward by the `t`
 /// key (contract §8, `tests/acceptance/ms-33/contract.md`). Maps to the
 /// `/audit` endpoint's `since` query param — there is deliberately no

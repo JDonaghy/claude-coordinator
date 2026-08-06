@@ -4604,6 +4604,13 @@ impl CoordApp {
                             };
                         }
                     }
+                    // #1853: continue an in-progress Reports result-table
+                    // column-resize drag. Same precedence and shape as the
+                    // Audit block above, minus `main_b` — the Reports table
+                    // caches its own origin (see `reports_update_resize_drag`).
+                    if self.active_view == SidebarView::Reports && buttons.left {
+                        redraw |= self.reports_update_resize_drag(pos);
+                    }
                     if self.terminal_host_sel_dragging && buttons.left {
                         if let Some((col, row)) =
                             self.active_terminal_pixel_to_cell(pos, main_b, lh, char_w)
@@ -4709,11 +4716,19 @@ impl CoordApp {
                 // #1094 fix: release an in-progress scrollbar-track drag
                 // the same way — started by a `MouseDown` inside
                 // `audit_scrollbar_hit`'s region (`mouse_main_click` below).
-                if btn == MouseButton::Left
-                    && (self.audit_resize_col.take().is_some()
-                        || self.audit_scrollbar_drag.take().is_some())
-                {
-                    return true;
+                // #1853: and a Reports result-table column-resize drag,
+                // the same way. Each `take()` is evaluated unconditionally
+                // rather than short-circuited behind `||` — with the
+                // short-circuit, a release while an earlier drag was active
+                // would leave a later one latched, and the next unrelated
+                // mouse-move would resume resizing a column nobody grabbed.
+                if btn == MouseButton::Left {
+                    let mut released = self.audit_resize_col.take().is_some();
+                    released |= self.audit_scrollbar_drag.take().is_some();
+                    released |= self.reports_resize_col.take().is_some();
+                    if released {
+                        return true;
+                    }
                 }
                 if let Some(sidebar_b) = ctx.sidebar_bounds() {
                     match self.active_view {
@@ -5592,13 +5607,22 @@ impl CoordApp {
                 // one server-paginated page and a client-side sort of them
                 // would be a lie (see `audit.rs`'s module docs).
                 //
-                // Rows are not selectable (there is nothing to drill into
-                // yet) and the table has no footer, so every other hit is
-                // a no-op.
+                // #1853: a header-*divider* click starts a column-resize
+                // drag instead. Rows are not selectable (there is nothing
+                // to drill into yet) and the table's footer is a pinned Σ
+                // row, so every remaining hit is a no-op.
                 MsvClick::Outside => match self.reports_table_hit(pos) {
                     Some(DataTableHit::Header { col }) => self.reports_sort_by_column(col),
+                    // #1853: a divider hit begins a column-resize drag,
+                    // continued in the `MouseMoved` arm above and released
+                    // on `MouseUp`. `hit_test` gives the divider grab zone
+                    // priority over the header body, so this arm is what
+                    // keeps a drag from also toggling the sort.
+                    Some(DataTableHit::HeaderDivider { col }) => {
+                        self.reports_resize_col = Some(col);
+                        true
+                    }
                     Some(DataTableHit::Row { .. })
-                    | Some(DataTableHit::HeaderDivider { .. })
                     | Some(DataTableHit::Footer)
                     | Some(DataTableHit::Empty)
                     | None => false,

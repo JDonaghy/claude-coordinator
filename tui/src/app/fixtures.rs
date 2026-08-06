@@ -335,6 +335,12 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         reports_layout: std::cell::RefCell::new(MsvLayoutCache::default()),
         reports_sort: None,
         reports_table_layout: std::cell::RefCell::new(None),
+        // #1853: no dragged column widths and no active resize drag by
+        // default. `None` rather than `vec![None; N]` (Audit's shape) —
+        // there is no N until a result lands, which is the whole reason
+        // these are keyed.
+        reports_column_overrides: None,
+        reports_resize_col: None,
         reports_pending_export: None,
         reports_export_status: None,
         reports_export_rx: None,
@@ -414,6 +420,58 @@ pub fn make_app_with_reports(
         }
     }
     app
+}
+
+/// #1853 test seam: the sending half of a fake in-flight report run, handed
+/// back by [`make_app_with_reports_awaiting_run`] so a test can decide *when*
+/// the next result lands.
+///
+/// Exists because `TuiDriver::app_mut` yields the opaque shell adapter, not
+/// the `CoordApp` inside it — a driver test therefore has no way to swap
+/// `reports_result` mid-session by poking state. Delivering through the
+/// app's own run channel is better than poking anyway: it is the exact path
+/// a real completed run takes (`run_periodic_work` drains it on the next
+/// event), so what the test exercises is the real report switch, not a
+/// hand-assembled imitation of one.
+pub struct PendingReportRun {
+    tx: std::sync::mpsc::Sender<super::data::ReportRunOutcome>,
+}
+
+impl PendingReportRun {
+    /// Deliver `result_json` as the run's outcome. It is picked up by the
+    /// next `run_periodic_work` tick — i.e. by the next event the driver
+    /// dispatches while the Reports panel is the active view.
+    ///
+    /// Returns `false` if `result_json` doesn't parse or the app has been
+    /// dropped, so a typo in a test fixture fails at the `assert!` rather
+    /// than as a mystifying "the table never changed".
+    pub fn deliver(&self, result_json: &str) -> bool {
+        match serde_json::from_str::<super::types::ReportResult>(result_json) {
+            Ok(result) => self
+                .tx
+                .send(super::data::ReportRunOutcome::Result(Box::new(result)))
+                .is_ok(),
+            Err(_) => false,
+        }
+    }
+}
+
+/// #1853 data-model seam: [`make_app_with_reports`] plus an *open run
+/// channel*, so a driver test can replace the report on screen part-way
+/// through a session — the event a column-width override must not survive.
+///
+/// The app looks exactly as it does with a run in flight, minus the thread:
+/// `reports_run_rx` is live and empty, and stays that way until the returned
+/// [`PendingReportRun::deliver`] is called.
+pub fn make_app_with_reports_awaiting_run(
+    data: BoardData,
+    catalogue_json: &str,
+    result_json: &str,
+) -> (CoordApp, PendingReportRun) {
+    let mut app = make_app_with_reports(data, catalogue_json, Some(result_json));
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.reports_run_rx = Some(rx);
+    (app, PendingReportRun { tx })
 }
 
 /// #1087: a minimal, in-process, `std`-only mock HTTP server for exercising

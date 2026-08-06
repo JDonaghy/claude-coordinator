@@ -41882,6 +41882,398 @@ Milestone tracking issue.
         assert!(app.reports_sort.is_none());
     }
 
+    // ── #1853: result-table column resize ────────────────────────────────
+    //
+    // One table serves every report, so these land resize for the whole
+    // catalogue at once. The two things that are *not* a copy of Audit's
+    // #1094 resize get a test each: overrides must not survive onto a
+    // different column set (`..._must_not_leak_across_reports`), and a
+    // resize must not disturb #1762's sort routing, which is what the
+    // pinned `h_scroll: 0.0` exists to protect
+    // (`..._still_sorts_the_column_under_the_cursor`).
+    //
+    // Every coordinate comes from `find`. Left-aligned header text starts
+    // exactly at its column's left edge (the same property #1762's
+    // weight test relies on), so a left-aligned header's x *is* its
+    // column's left edge — and therefore also the divider between it and
+    // the column before it, which is what these drags grab.
+
+    /// A second five-column result from a *different* report, with column
+    /// ids and labels that share nothing with `reports_result_json_meta`'s.
+    ///
+    /// Five columns on purpose: the leak test has to be one a length check
+    /// could not pass. Shaped after the real `drive-queue-status`, which is
+    /// the report that motivated #1853 (a wide TITLE and a wide LAST REASON
+    /// competing for the same row).
+    fn reports_result_json_other_five() -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        format!(
+            r#"{{
+                    "report_id": "drive-queue-status",
+                    "generated_at": {now},
+                    "window": [{start}, {now}],
+                    "columns": ["item", "doc", "state", "tries", "reason"],
+                    "column_meta": [
+                        {{"id": "item", "label": "Item", "kind": "int",
+                          "align": "right", "weight": 1.0}},
+                        {{"id": "doc", "label": "Doc", "kind": "text",
+                          "align": "left", "weight": 3.0}},
+                        {{"id": "state", "label": "State", "kind": "text",
+                          "align": "left", "weight": 1.0}},
+                        {{"id": "tries", "label": "Tries", "kind": "int",
+                          "align": "left", "weight": 2.5}},
+                        {{"id": "reason", "label": "Reason", "kind": "text",
+                          "align": "left", "weight": 1.0}}
+                    ],
+                    "rows": [
+                        {{"item": 1, "doc": "QUEUE-DOC-ONE", "state": "queued",
+                          "tries": 0, "reason": "waiting"}}
+                    ],
+                    "notes": []
+                }}"#,
+            now = now,
+            start = now - 3600.0,
+        )
+    }
+
+    /// A *four*-column result — the "works for every report, not one"
+    /// half of the acceptance: nothing about resize may be sized to
+    /// `reports_result_json_meta`'s five.
+    fn reports_result_json_four() -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        format!(
+            r#"{{
+                    "report_id": "usage",
+                    "generated_at": {now},
+                    "window": [{start}, {now}],
+                    "columns": ["model", "calls", "tokens", "spend"],
+                    "column_meta": [
+                        {{"id": "model", "label": "Model", "kind": "text",
+                          "align": "left", "weight": 2.0}},
+                        {{"id": "calls", "label": "Calls", "kind": "text",
+                          "align": "left", "weight": 2.0}},
+                        {{"id": "tokens", "label": "Tokens", "kind": "text",
+                          "align": "left", "weight": 2.0}},
+                        {{"id": "spend", "label": "Spend", "kind": "money",
+                          "align": "right", "weight": 1.0}}
+                    ],
+                    "rows": [
+                        {{"model": "opus", "calls": "12", "tokens": "900",
+                          "spend": 1.5}}
+                    ],
+                    "notes": []
+                }}"#,
+            now = now,
+            start = now - 3600.0,
+        )
+    }
+
+    /// Terminal size for the resize tests. Wider than the 140 the #1762
+    /// tests use because these ones assert on header *positions* after
+    /// narrowing a column: at 140 the main panel gives an eleven-weight
+    /// table about ten cells per unit weight, so a six-cell drag squeezes
+    /// `Started` down to `Star` and `find` — correctly — stops seeing it.
+    /// The extra width buys margin for the drag, and changes nothing about
+    /// what is under test.
+    const REPORTS_RESIZE_COLS: u16 = 200;
+    const REPORTS_RESIZE_ROWS: u16 = 40;
+
+    /// The x-offset of each label's rendered header cell, in the order
+    /// given. Panics (with the screen) if any is missing, so a truncated
+    /// header shows up as a named failure rather than a silent `None`.
+    fn reports_header_xs<A: quadraui::AppLogic>(
+        driver: &quadraui::tui::testing::TuiDriver<A>,
+        labels: &[&str],
+    ) -> Vec<f32> {
+        labels
+            .iter()
+            .map(|l| {
+                driver
+                    .find(l)
+                    .unwrap_or_else(|| {
+                        panic!("#1853: header {l:?} must render:\n{}", driver.screen())
+                    })
+                    .0
+            })
+            .collect()
+    }
+
+    /// Drag the divider on the LEFT edge of `right_label`'s column by `dx`
+    /// cells, then repaint. `right_label` must be a left-aligned header, so
+    /// its x is that column's left edge — which is exactly the boundary
+    /// `DataTableLayout::hit_test` reports as `HeaderDivider`.
+    fn reports_drag_divider<A: quadraui::AppLogic>(
+        driver: &mut quadraui::tui::testing::TuiDriver<A>,
+        right_label: &str,
+        dx: f32,
+    ) -> f32 {
+        let (x, y) = driver.find(right_label).unwrap_or_else(|| {
+            panic!(
+                "#1853: header {right_label:?} must render before dragging \
+                     its divider:\n{}",
+                driver.screen()
+            )
+        });
+        driver.mouse_down(x, y);
+        driver.mouse_move(x + dx, y);
+        driver.mouse_up(x + dx, y);
+        driver.render();
+        x
+    }
+
+    /// Dispatch an event that does nothing but let the app do its periodic
+    /// work — the tick that drains a completed report run. A *button-less*
+    /// move, deliberately: `mouse_move` holds the left button down, which
+    /// would look like the continuation of a resize drag.
+    fn reports_idle_tick<A: quadraui::AppLogic>(
+        driver: &mut quadraui::tui::testing::TuiDriver<A>,
+    ) {
+        driver.dispatch(quadraui::UiEvent::MouseMoved {
+            position: quadraui::Point::new(0.0, 0.0),
+            buttons: quadraui::ButtonMask::default(),
+        });
+        driver.render();
+    }
+
+    #[test]
+    fn reports_divider_drag_resizes_only_its_own_pair() {
+        let mut driver = reports_driver(
+            &reports_result_json_meta(),
+            REPORTS_RESIZE_COLS,
+            REPORTS_RESIZE_ROWS,
+        );
+        let before = reports_header_xs(&driver, &["Title", "Started", "Machines"]);
+
+        // The divider between `Title` and `Started`, dragged 8 cells right.
+        reports_drag_divider(&mut driver, "Started", 8.0);
+        let after = reports_header_xs(&driver, &["Title", "Started", "Machines"]);
+
+        assert_eq!(
+            before[0], after[0],
+            "#1853: dragging a divider must not move the left column's own \
+                 left edge — that edge is fixed by the columns before it:\n{}",
+            driver.screen()
+        );
+        assert!(
+            (after[1] - (before[1] + 8.0)).abs() <= 1.0,
+            "#1853: dragging the Title|Started divider 8 cells right must \
+                 widen Title by ~8 — `Started` moved from {} to {}:\n{}",
+            before[1],
+            after[1],
+            driver.screen()
+        );
+        // The pair-only invariant, and the reason this feature does not
+        // reopen the pinned `h_scroll`: `drag_divider` holds the dragged
+        // pair's combined width constant, so every column after the pair —
+        // and therefore the table's total content width — is untouched. A
+        // resize can never newly force horizontal scrolling.
+        assert_eq!(
+            before[2], after[2],
+            "#1853: a divider drag must move width between its own two \
+                 columns only — `Machines` (two columns right of the drag) \
+                 moved from {} to {}:\n{}",
+            before[2],
+            after[2],
+            driver.screen()
+        );
+    }
+
+    #[test]
+    fn reports_divider_drag_survives_until_the_panel_changes_report() {
+        // "the change persists while the panel stays open": the width must
+        // still be there after unrelated repaints and an unrelated click.
+        let mut driver = reports_driver(
+            &reports_result_json_meta(),
+            REPORTS_RESIZE_COLS,
+            REPORTS_RESIZE_ROWS,
+        );
+        let before = reports_header_xs(&driver, &["Started"])[0];
+        reports_drag_divider(&mut driver, "Started", 6.0);
+        let dragged = reports_header_xs(&driver, &["Started"])[0];
+        assert!(dragged > before, "the drag must have widened Title");
+
+        for _ in 0..3 {
+            reports_idle_tick(&mut driver);
+        }
+        assert_eq!(
+            dragged,
+            reports_header_xs(&driver, &["Started"])[0],
+            "#1853: a dragged width must survive repaints for as long as the \
+                 panel stays on the same result:\n{}",
+            driver.screen()
+        );
+    }
+
+    #[test]
+    fn reports_divider_drag_works_on_a_report_with_a_different_column_count() {
+        // The catalogue-wide half of the acceptance: the four-column report
+        // resizes with the same code, no per-report anything.
+        let mut driver = reports_driver(
+            &reports_result_json_four(),
+            REPORTS_RESIZE_COLS,
+            REPORTS_RESIZE_ROWS,
+        );
+        let before = reports_header_xs(&driver, &["Model", "Calls", "Tokens"]);
+        reports_drag_divider(&mut driver, "Calls", 7.0);
+        let after = reports_header_xs(&driver, &["Model", "Calls", "Tokens"]);
+
+        assert!(
+            (after[1] - (before[1] + 7.0)).abs() <= 1.0,
+            "#1853: resize must work on a four-column report too — `Calls` \
+                 moved from {} to {}:\n{}",
+            before[1],
+            after[1],
+            driver.screen()
+        );
+        assert_eq!(
+            before[2], after[2],
+            "#1853: …and still only move its own pair:\n{}",
+            driver.screen()
+        );
+    }
+
+    #[test]
+    fn reports_column_widths_must_not_leak_across_reports() {
+        // The dynamic-column-set hazard, asserted with two reports that have
+        // the **same** column count — so a length check alone cannot pass
+        // this. Widths dragged against `issue-activity`'s five columns must
+        // not re-apply to `drive-queue-status`'s five, where index 1 is a
+        // different column entirely.
+        let other = reports_result_json_other_five();
+
+        // Control: the same second report, in a session where nothing was
+        // ever dragged. Its header offsets are the `column_meta` widths.
+        let control = reports_driver(&other, REPORTS_RESIZE_COLS, REPORTS_RESIZE_ROWS);
+        let expected = reports_header_xs(&control, &["Doc", "State", "Tries", "Reason"]);
+
+        let (app, pending) = make_app_with_reports_awaiting_run(
+            BoardData::default(),
+            reports_catalogue_json(),
+            &reports_result_json_meta(),
+        );
+        let mut driver = quadraui::tui::testing::driver_with_shell(
+            app,
+            CoordApp::shell_config(),
+            REPORTS_RESIZE_COLS,
+            REPORTS_RESIZE_ROWS,
+        );
+        click_activity_icon(&mut driver, "▤");
+        driver.render();
+
+        // Drag hard enough that inheriting the override would be obvious —
+        // column 1 of `issue-activity` ends up far from where column 1 of
+        // `drive-queue-status` declares itself.
+        let started_before = reports_header_xs(&driver, &["Started"])[0];
+        reports_drag_divider(&mut driver, "Started", 8.0);
+        assert!(
+            reports_header_xs(&driver, &["Started"])[0] > started_before,
+            "the drag must have visibly moved something first:\n{}",
+            driver.screen()
+        );
+
+        // The report on screen is replaced by a completed run of a
+        // *different* report — the real path, drained by the app's own
+        // periodic work on the next event.
+        assert!(
+            pending.deliver(&other),
+            "#1853 fixture: the queued result must parse and send"
+        );
+        reports_idle_tick(&mut driver);
+
+        let actual = reports_header_xs(&driver, &["Doc", "State", "Tries", "Reason"]);
+        assert_eq!(
+            expected,
+            actual,
+            "#1853: switching to a different report with the SAME column \
+                 count must discard the stale overrides and render at the new \
+                 report's declared `column_meta` widths — expected {expected:?}, \
+                 got {actual:?}:\n{}",
+            driver.screen()
+        );
+    }
+
+    #[test]
+    fn reports_header_click_after_a_resize_still_sorts_the_column_under_it() {
+        // The regression the pinned `h_scroll: 0.0` exists to prevent, now
+        // that resize is the thing that moves headers around: a sort click
+        // must land on the column the operator actually clicked, not on
+        // whatever used to be there.
+        let mut driver = reports_driver(
+            &reports_result_json_meta(),
+            REPORTS_RESIZE_COLS,
+            REPORTS_RESIZE_ROWS,
+        );
+        reports_drag_divider(&mut driver, "Started", 12.0);
+
+        let (machines_x, header_y) = driver
+            .find("Machines")
+            .unwrap_or_else(|| panic!("Machines header must render:\n{}", driver.screen()));
+        // Well clear of the ±3-cell divider grab zone at either edge, and
+        // far from the drag's release point so the backend's double-click
+        // detector can't fold the two together.
+        driver.click(machines_x + 5.0, header_y);
+        driver.render();
+
+        let screen = driver.screen();
+        let row: String = screen_row(&screen, header_y).into_iter().collect();
+        let cells: Vec<char> = row.chars().collect();
+        let at_machines: String = cells
+            .iter()
+            .skip(machines_x as usize)
+            .take("Machines ▲".chars().count())
+            .collect();
+        assert_eq!(
+            at_machines, "Machines ▲",
+            "#1853/#1762: after a resize, a header click must sort the column \
+                 under the cursor — the ▲ must be on `Machines`, whose column \
+                 starts at x={machines_x}. Header row was:\n{row}\n{screen}"
+        );
+        assert_eq!(
+            row.matches('▲').count(),
+            1,
+            "#1853: exactly one column may carry the ascending indicator:\n{row}"
+        );
+    }
+
+    #[test]
+    fn reports_column_overrides_are_session_only() {
+        // Session-only, matching Audit (#1094) and the panel's own sort:
+        // persisting widths is a separate decision and explicitly not part
+        // of #1853.
+        //
+        // Asserted as "a freshly-built app has no overrides". That is the
+        // whole observable consequence of not persisting: `Settings` has no
+        // width field to write, so the only load path a restored width could
+        // arrive through is the one that doesn't exist. The drag's single
+        // store is `CoordApp::reports_column_overrides` — an in-memory field
+        // — and nothing in `settings.rs` reads or writes it.
+        let mut app = make_app_with_reports(
+            BoardData::default(),
+            reports_catalogue_json(),
+            Some(&reports_result_json_meta()),
+        );
+        assert!(
+            app.reports_column_overrides.is_none(),
+            "#1853: a freshly-built app must have no column overrides — there \
+                 is no settings field for them to be loaded from"
+        );
+        // …and with no table painted yet there is nothing a stray drag could
+        // resize, so a spurious `MouseMoved` cannot invent one.
+        app.reports_resize_col = Some(0);
+        assert!(
+            !app.reports_update_resize_drag(Point::new(40.0, 3.0)),
+            "#1853: a resize drag against a table that was never painted must \
+                 be a no-op"
+        );
+        assert!(app.reports_column_overrides.is_none());
+    }
+
     // ── #1763: the `usage` report + `ReportResult.totals` ────────────────────
     //
     // The Usage ActivityBar panel was a Rust port of `coord/usage_rollup.py`

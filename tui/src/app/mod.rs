@@ -3178,6 +3178,31 @@ pub struct CoordApp {
     /// start at the main panel's origin; the section stack sits above it.
     /// `None` whenever no table is on screen.
     reports_table_layout: std::cell::RefCell<Option<(Rect, DataTableLayout)>>,
+    /// #1853: per-column width overrides from a user's header-divider drag
+    /// on the result `DataTable`, **paired with the column set they were
+    /// measured against** — `(report_id, column ids)`.
+    ///
+    /// The key is the whole point, and the one structural difference from
+    /// Audit's `audit_column_overrides`. Audit has five columns forever, so
+    /// a bare `Vec<Option<f32>>` can never mean the wrong thing there. A
+    /// report's columns come from the daemon and differ per report, so an
+    /// unkeyed override would silently re-apply column 2's dragged width to
+    /// a *different* column 2 the moment another report's result landed —
+    /// mis-sizing a column the user never touched. Keying by report id
+    /// **and** column ids is what makes a stale override unrepresentable;
+    /// a length check alone would not, since two reports can have the same
+    /// column count. Read back through `reports_active_overrides`, which
+    /// returns "no overrides" whenever the key doesn't match the result
+    /// being rendered.
+    ///
+    /// Session-only, exactly like `audit_column_overrides` and like the
+    /// panel's sort: nothing here is written to settings.
+    reports_column_overrides: Option<(ReportsColumnKey, Vec<Option<f32>>)>,
+    /// #1853: index of the result-table column being resized (the column to
+    /// the LEFT of the dragged divider), set by a `MouseDown` on a
+    /// `DataTableHit::HeaderDivider` and cleared on `MouseUp`. `None` when
+    /// no resize drag is in progress. Mirrors `audit_resize_col`.
+    reports_resize_col: Option<usize>,
     /// #1765: the report id whose section-header Export action was just
     /// clicked, awaiting the save dialog.
     ///
@@ -3726,6 +3751,8 @@ impl CoordApp {
             reports_layout: std::cell::RefCell::new(MsvLayoutCache::default()),
             reports_sort: None,
             reports_table_layout: std::cell::RefCell::new(None),
+            reports_column_overrides: None,
+            reports_resize_col: None,
             reports_pending_export: None,
             reports_export_status: None,
             reports_export_rx: None,
