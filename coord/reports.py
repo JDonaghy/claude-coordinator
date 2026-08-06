@@ -892,12 +892,50 @@ def fold_drive_queue_status(
     if not rows:
         notes.append("The drive queue is empty.")
     else:
-        running = sum(1 for r in rows if r["state"] == "running")
-        waiting = sum(1 for r in rows if r["state"] == "waiting")
-        notes.append(
-            f"{len(rows)} entr{'y' if len(rows) == 1 else 'ies'} queued "
-            f"({running} running, {waiting} waiting)."
+        from coord.drive_queue import (  # noqa: PLC0415
+            STATE_BLOCKED,
+            STATE_DONE,
+            STATE_FAILED,
+            STATE_RUNNING,
+            STATE_WAITING,
+            TERMINAL_QUEUE_STATES,
         )
+
+        counts: dict[str, int] = {}
+        for r in rows:
+            counts[r["state"]] = counts.get(r["state"], 0) + 1
+        # The headline is entries the queue will still act on — `done` (and
+        # any other terminal state) is run history, not queue depth, so it
+        # is excluded here rather than folded into `len(rows)` (#1855).
+        queued = sum(n for state, n in counts.items() if state not in TERMINAL_QUEUE_STATES)
+
+        def _ordered(present: set[str], preferred: tuple[str, ...]) -> list[str]:
+            # `preferred` is display polish only — any state absent from it
+            # (a future addition to drive_queue.py's five, or one we simply
+            # forgot to list) still surfaces, just alphabetically after the
+            # known ones, so nothing can silently vanish the way `blocked`
+            # did before this fix.
+            return [s for s in preferred if s in present] + sorted(present - set(preferred))
+
+        non_terminal_states = _ordered(
+            {s for s in counts if s not in TERMINAL_QUEUE_STATES},
+            (STATE_RUNNING, STATE_WAITING),
+        )
+        # `blocked`/`failed` are the states that need a human — call them
+        # out ahead of the benign `done` count, not appended after it.
+        terminal_states = _ordered(
+            {s for s in counts if s in TERMINAL_QUEUE_STATES},
+            (STATE_BLOCKED, STATE_FAILED, STATE_DONE),
+        )
+
+        breakdown = ", ".join(f"{counts[s]} {s}" for s in non_terminal_states)
+        headline = f"{queued} entr{'y' if queued == 1 else 'ies'} queued"
+        if breakdown:
+            headline += f" ({breakdown})"
+        terminal_parts = [f"{counts[s]} {s}" for s in terminal_states]
+        if terminal_parts:
+            headline += " · " + " · ".join(terminal_parts)
+        notes.append(headline + ".")
         retried = [r for r in rows if r["attempts"] >= _RETRIED_ATTEMPTS_THRESHOLD]
         if retried:
             named = ", ".join(

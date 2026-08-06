@@ -700,6 +700,9 @@ class TestFoldDriveQueueStatus:
         ]
 
     def test_mixed_states_counted_in_notes(self) -> None:
+        # 4 rows total, but only 3 are non-terminal (1 running + 2 waiting).
+        # The headline must count those 3, not all 4 (#1855) — and the
+        # `blocked` entry must be named, not silently folded away.
         rows = [
             _dq_row(1, position=0, state_="running"),
             _dq_row(2, position=1, state_="waiting"),
@@ -708,8 +711,55 @@ class TestFoldDriveQueueStatus:
         ]
         result = fold_drive_queue_status(rows, 1000.0)
         assert len(result.rows) == 4
-        assert any("4 entries queued" in n and "1 running" in n and "2 waiting" in n
-                    for n in result.notes)
+        assert any(
+            "3 entries queued" in n and "1 running" in n and "2 waiting" in n and "1 blocked" in n
+            for n in result.notes
+        )
+        assert not any("4 entries queued" in n for n in result.notes)
+
+    def test_headline_count_is_non_terminal_entries_only(self) -> None:
+        # 8 non-terminal (1 running, 7 waiting) + 11 done == 19 rows total,
+        # matching the issue's own reproduction (#1855): the headline must
+        # read 8, never 19.
+        rows = (
+            [_dq_row(1, position=0, state_="running")]
+            + [_dq_row(n, position=n, state_="waiting") for n in range(2, 9)]
+            + [_dq_row(n, position=n, state_="done") for n in range(9, 20)]
+        )
+        result = fold_drive_queue_status(rows, 1000.0)
+        assert len(result.rows) == 19
+        headline = next(n for n in result.notes if "queued" in n)
+        assert "8 entries queued" in headline
+        assert "11 done" in headline
+
+    def test_blocked_named_in_summary(self) -> None:
+        rows = [_dq_row(1, state_="waiting"), _dq_row(2, state_="blocked")]
+        result = fold_drive_queue_status(rows, 1000.0)
+        headline = next(n for n in result.notes if "queued" in n)
+        assert "1 blocked" in headline
+
+    def test_failed_named_in_summary(self) -> None:
+        rows = [_dq_row(1, state_="waiting"), _dq_row(2, state_="failed")]
+        result = fold_drive_queue_status(rows, 1000.0)
+        headline = next(n for n in result.notes if "queued" in n)
+        assert "1 failed" in headline
+
+    def test_zero_count_states_do_not_appear(self) -> None:
+        rows = [_dq_row(1, state_="waiting")]
+        result = fold_drive_queue_status(rows, 1000.0)
+        headline = next(n for n in result.notes if "queued" in n)
+        assert "running" not in headline
+        assert "blocked" not in headline
+        assert "failed" not in headline
+        assert "done" not in headline
+
+    def test_all_done_queue_does_not_read_as_entries_queued(self) -> None:
+        rows = [_dq_row(n, state_="done") for n in range(1, 4)]
+        result = fold_drive_queue_status(rows, 1000.0)
+        headline = next(n for n in result.notes if "queued" in n)
+        assert "3 entries queued" not in headline
+        assert "0 entries queued" in headline
+        assert "3 done" in headline
 
     def test_run_order_preserved_from_input_not_resorted(self) -> None:
         # list_drive_queue already returns ORDER BY position, id — the fold
