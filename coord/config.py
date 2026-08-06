@@ -81,6 +81,22 @@ class ReviewsConfig:
     enabled: bool = True
     auto_dispatch: bool = True
     require_approval: bool = False
+    # #1811: optional provider override for the REVIEW dispatch, independent
+    # of the repo's own worker provider (`Repo.provider`). Threaded as
+    # `spec_provider` at both `guard_unattended_dispatch` call sites in
+    # coord/review.py — same precedence seam `resolve_provider_name` already
+    # implements (spec > repo > providers.default), just given a review-only
+    # entry point. `None` (the default) inherits `repo.provider` exactly as
+    # before this field existed — no existing deployment's behavior changes.
+    # Without this, the only way to review a repo pinned to a second backend
+    # (e.g. `provider: opencode`) is to let the review silently inherit that
+    # same backend — sharing the worker's model family removes the "zero
+    # shared context" independence adversarial review depends on. Validated
+    # against `providers.definitions` at parse time in `_parse_reviews` (an
+    # unknown name is a config error, not a dispatch-time surprise); the
+    # `human_attended_only` TOS gate (#437) still applies to whatever this
+    # resolves to, same as `repo.provider`.
+    provider: str | None = None
     reviewer_prompt: str = ""
     checklist: list[str] = field(default_factory=lambda: [
         "Check for platform-specific code in shared/cross-platform paths",
@@ -1402,7 +1418,13 @@ def parse_mapping(raw: Any, *, path: Path | None = None) -> Config:
     machines = _parse_machines(raw.get("machines"), repos)
     _validate_dependencies(repos)
     hooks = _parse_hooks(raw.get("hooks"))
-    reviews = _parse_reviews(raw.get("reviews"), {r.name for r in repos})
+    # #1811: providers parsed before reviews so `reviews.provider` can be
+    # validated against `providers.definitions` at parse time — mirrors how
+    # `reviews.repo_overrides` validates against `repo_names` above.
+    providers = _parse_providers(raw.get("providers"))
+    reviews = _parse_reviews(
+        raw.get("reviews"), {r.name for r in repos}, set(providers.definitions),
+    )
     concurrency = _parse_concurrency(raw.get("concurrency"))
     smoke_tests = _parse_smoke_tests(raw.get("smoke_tests"))
     acceptance = _parse_acceptance(raw.get("acceptance"))
@@ -1413,7 +1435,6 @@ def parse_mapping(raw: Any, *, path: Path | None = None) -> Config:
     ci_store = _parse_ci_store(raw.get("ci_store"))
     merge = _parse_merge(raw.get("merge"))
     milestone = _parse_milestone(raw.get("milestone"))
-    providers = _parse_providers(raw.get("providers"))
     audit = _parse_audit(raw.get("audit"))
     pricing = _parse_pricing(raw.get("pricing"))
     health = _parse_health(raw.get("health"))
@@ -1741,13 +1762,30 @@ def _parse_hooks(raw: Any) -> HooksConfig:
     return hooks
 
 
-def _parse_reviews(raw: Any, repo_names: set[str]) -> ReviewsConfig:
+def _parse_reviews(
+    raw: Any, repo_names: set[str], provider_names: set[str] | None = None,
+) -> ReviewsConfig:
     if raw is None:
         return ReviewsConfig()
     if not isinstance(raw, dict):
         raise ConfigError("'reviews' must be a mapping")
 
     cfg = ReviewsConfig()
+
+    # #1811: reviews.provider — validated against providers.definitions the
+    # same way reviews.repo_overrides is validated against repo_names below,
+    # so an unknown name is a config error at parse time, not a silent
+    # dispatch-time fallback.
+    if "provider" in raw:
+        value = raw["provider"]
+        if not isinstance(value, str) or not value:
+            raise ConfigError("reviews.provider must be a non-empty string")
+        if provider_names is not None and value not in provider_names:
+            raise ConfigError(
+                f"reviews.provider references unknown provider: {value!r}"
+            )
+        cfg.provider = value
+
     for bool_field in ("enabled", "auto_dispatch", "require_approval", "allow_review_flood"):
         if bool_field in raw:
             value = raw[bool_field]

@@ -1031,8 +1031,20 @@ def build_review_briefing(
     sealed_paths: list[str] | None = None,
     sealed_entrypoints: list[str] | None = None,
     assignment_type: str = "work",
+    provider_same_as_worker: bool = False,
+    review_provider: str | None = None,
 ) -> str:
     """Assemble the reviewer's prompt. Pure function — easy to test.
+
+    *provider_same_as_worker* (#1811) is True when the review's resolved
+    provider (``review_provider``) is the same name as the worker's own
+    resolved provider — e.g. a repo pinned to ``opencode`` with no
+    ``reviews.provider`` override, so the review inherits it too. Provider
+    co-location is a *larger* loss of independence than machine co-location
+    (``same_as_worker`` below): a fresh session removes shared context, but
+    not shared blind spots. When True, a note is appended mirroring
+    ``same_as_worker``'s — the reviewer is told to be extra rigorous for the
+    same reason a same-machine reviewer is.
 
     When *review_iteration* > 0 the work is a re-review of a fix worker's
     commits (a prior round requested changes). The "What to do" section is
@@ -1092,6 +1104,13 @@ def build_review_briefing(
             "- NOTE: only one machine is configured for this repo, so you are "
             "running on the same machine as the worker. Your session is still "
             "fresh (no shared context), but be extra rigorous."
+        )
+    if provider_same_as_worker:
+        lines.append(
+            f"- NOTE: this review is running on the same provider "
+            f"({review_provider or 'claude'}) as the worker's own dispatch. "
+            "Your session is still fresh (no shared context), but a shared "
+            "model family means shared blind spots — be extra rigorous."
         )
     lines.append("")
 
@@ -1611,10 +1630,19 @@ def dispatch_review(
     # off" / "machine unreachable") so callers leave review_state as
     # 'pending' and retry on the next notify call — consistent with how
     # _reassign handles the same guard in reconcile.py.
+    #
+    # #1811: ``spec_provider=config.reviews.provider`` — a review-only
+    # override that outranks ``repo.provider`` in the same precedence chain
+    # (spec > repo > providers.default) every other dispatch path already
+    # uses. ``None`` (unset) resolves to exactly the same effective name as
+    # before this field existed, so an unconfigured deployment sees no
+    # behavior change. The guard still refuses a ``human_attended_only``
+    # resolution regardless of which link in the chain supplied it — a
+    # named ``reviews.provider`` gets no exemption from the #437 gate.
     from coord.providers import guard_unattended_dispatch  # noqa: PLC0415
     try:
-        guard_unattended_dispatch(
-            spec_provider=None,
+        review_provider_name = guard_unattended_dispatch(
+            spec_provider=config.reviews.provider,
             repo_provider=repo.provider,
             providers_cfg=config.providers,
             models_cfg=config.models,
@@ -1759,6 +1787,24 @@ def dispatch_review(
     fetch_body = issue_body_fetcher or _fetch_issue_body
     issue_body = fetch_body(repo.github, completed.issue_number)
 
+    # #1811: does the resolved review provider share the worker's model
+    # family? ``completed.provider_name`` is the *resolved* name recorded at
+    # work-dispatch time (spec > repo > providers.default); ``None`` means a
+    # row predating #324 or a path that doesn't set it, which the rest of
+    # the codebase (e.g. coord/gates.py's TUI rendering) treats as the
+    # implicit "claude" default. Provider co-location is a larger loss of
+    # independence than machine co-location (a fresh session removes shared
+    # context, but not shared blind spots) — surfaced below in the
+    # reviewer's own briefing, mirroring ``same_as_worker``.
+    worker_provider_name = completed.provider_name or "claude"
+    provider_same_as_worker = review_provider_name == worker_provider_name
+    if provider_same_as_worker:
+        log.info(
+            "[review] %s: reviewer provider %r matches worker provider — "
+            "reduced independence (shared model family)",
+            completed.assignment_id, review_provider_name,
+        )
+
     # Pin the reviewer's model to avoid the agent defaulting to Opus (#911).
     # #1430: deliberately not consulting models.labels — the reviewer's
     # effort scales with diff size, not the original work issue's tier
@@ -1864,6 +1910,8 @@ def dispatch_review(
             branch=completed.branch,
             worker_machine=completed.machine_name,
             same_as_worker=same_as_worker,
+            provider_same_as_worker=provider_same_as_worker,
+            review_provider=review_provider_name,
             reviews_cfg=config.reviews,
             repo_claude_md=claude_md,
             default_branch=base_branch,
@@ -1894,6 +1942,22 @@ def dispatch_review(
             # branch exists locally yet.  Match the work-dispatch path.
             "branch": base_branch or "main",
         }
+        # #1811: carry the resolved review provider onto the wire the same
+        # way coord.dispatch.dispatch() does for work — without this the
+        # agent's own AssignmentSpec.provider stays None and it silently
+        # runs its legacy default worker command regardless of what
+        # guard_unattended_dispatch resolved above, which is exactly the
+        # "configuration appears to work while doing nothing" trap #1811
+        # calls out. Gated by the same helper dispatch() uses so a vanilla,
+        # uncustomized "claude" resolution keeps an unconfigured
+        # deployment's wire payload byte-identical to before this field
+        # existed.
+        from coord.dispatch import _wire_payload_needs_provider_field  # noqa: PLC0415
+
+        if review_provider_name and _wire_payload_needs_provider_field(
+            review_provider_name, config,
+        ):
+            payload["provider"] = review_provider_name
 
         url = f"http://{machine.host}:{AGENT_PORT}/assign"
         try:
@@ -1956,6 +2020,13 @@ def dispatch_review(
             review_target=str(pr["number"]) if pr else completed.branch,
             review_of_assignment_id=completed.assignment_id,
             model=review_model_alias,
+            # #1811: record the resolved review provider the same way
+            # coord.dispatch.dispatch() records the work provider — so the
+            # TUI/audit trail can distinguish a review that ran through
+            # `reviews.provider`/`repo.provider` from one that fell through
+            # to `providers.default`, instead of guessing "claude" for every
+            # review row the way a `None` here used to force.
+            provider_name=review_provider_name,
             review_head_sha=review_head_sha,
             review_patch_id=review_patch_id,
             # #1553: a review of an oracle-loop acceptance slice is work for
@@ -2504,10 +2575,12 @@ def dispatch_scoped_review(
     # Without this gate a repo/provider configured that way could have a
     # scoped review silently routed to it — the #1476 findings called this
     # out explicitly as a gap versus dispatch_review.
+    # #1811: same review-only provider override as dispatch_review — see
+    # its call site's comment for the precedence/no-op-when-unset rationale.
     from coord.providers import guard_unattended_dispatch  # noqa: PLC0415
     try:
-        guard_unattended_dispatch(
-            spec_provider=None,
+        review_provider_name = guard_unattended_dispatch(
+            spec_provider=config.reviews.provider,
             repo_provider=repo.provider,
             providers_cfg=config.providers,
             models_cfg=config.models,
@@ -2609,6 +2682,15 @@ def dispatch_scoped_review(
             "review_target": str(entry.pr_number) if entry.pr_number else entry.branch,
             "branch": base_branch or "main",
         }
+        # #1811: mirror dispatch_review's wire-provider threading — see its
+        # payload comment for why omitting this silently strands the
+        # resolved provider at the TOS-gate check above.
+        from coord.dispatch import _wire_payload_needs_provider_field  # noqa: PLC0415
+
+        if review_provider_name and _wire_payload_needs_provider_field(
+            review_provider_name, config,
+        ):
+            payload["provider"] = review_provider_name
 
         url = f"http://{machine.host}:{AGENT_PORT}/assign"
         try:
@@ -2643,6 +2725,7 @@ def dispatch_scoped_review(
             # auto_loop's request-changes dispatch) working unmodified.
             review_of_assignment_id=prior_review.review_of_assignment_id,
             model=review_model_alias,
+            provider_name=review_provider_name,
             review_head_sha=review_head_sha,
             review_patch_id=review_patch_id,
             # #1476 audit trail.

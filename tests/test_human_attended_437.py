@@ -364,6 +364,52 @@ def test_dispatch_review_refuses_human_attended(monkeypatch, capsys) -> None:
     )
 
 
+def test_dispatch_review_refuses_human_attended_via_reviews_provider(
+    monkeypatch, capsys,
+) -> None:
+    """#1811 regression: the #437 TOS-compliance gate must still apply when
+    the human-attended provider comes from ``reviews.provider`` rather than
+    ``repo.provider`` — routing the new field through
+    ``guard_unattended_dispatch``'s ``spec_provider`` (which already
+    outranks ``repo_provider``) must not create a way to smuggle a
+    human-attended provider past the gate that #437 established. The repo's
+    OWN provider here is the ordinary, unattended "claude" — only
+    ``reviews.provider`` names the human-attended one — so a refusal here
+    can only be explained by the new field actually being checked.
+    """
+    from coord.review import dispatch_review
+    from coord.models import Assignment, Board
+
+    cfg = _make_config_with_default_provider("claude")
+    # repo.provider left unset (implicit "claude", not human-attended).
+    cfg.reviews = ReviewsConfig(
+        enabled=True, auto_dispatch=True, provider="subscription-claude",
+    )
+
+    board = Board()
+    completed = Assignment(
+        machine_name="m1",
+        repo_name="myrepo",
+        issue_number=42,
+        issue_title="Test",
+        files_allowed=[],
+        files_forbidden=[],
+        briefing="b",
+        assignment_id="abc",
+        status="done",
+        branch="issue-42-test",
+        type="work",
+    )
+    result = dispatch_review(completed, board, cfg)
+    assert result is None, (
+        "dispatch_review must refuse a human-attended reviews.provider"
+    )
+    captured = capsys.readouterr()
+    assert "human_attended_only=True" in captured.out, (
+        "Expected a warning mentioning human_attended_only=True in stdout"
+    )
+
+
 def test_reassign_refuses_human_attended() -> None:
     """coord.reconcile._reassign returns None when the provider is human-attended."""
     from coord.reconcile import _reassign
