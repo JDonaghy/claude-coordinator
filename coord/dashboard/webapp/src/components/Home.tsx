@@ -1,11 +1,19 @@
 /**
- * Home — the main screen of the Phone Control Center.
+ * Home — the Pipeline panel.
+ *
+ * It is the *list panel's* content, not a screen (#1547): the app shell owns
+ * the frame (rail, status bar, detail column) and renders this same component
+ * into the list slot at every viewport — a 360px column on a 32" monitor, the
+ * whole screen on a phone. Nothing below is breakpoint-aware; the only
+ * concession to width is Tailwind responsive classes on presentation.
  *
  * A "Live sessions" section (#1067) surfaces live coord-* interactive
- * sessions (#1066's `GET /api/sessions`) at the TOP of the screen, above
- * everything else — these are in-progress human-attended sessions the phone
- * can take over via the `/terminal/:sessionId` view, so they get first
- * billing over the pipeline list below.
+ * sessions (#1066's `GET /api/sessions`) at the TOP, above everything else —
+ * these are in-progress human-attended sessions that can be taken over via
+ * the `/terminal/:sessionId` view, so they get first billing over the
+ * pipeline list below. (The rail's Sessions view lists the same cards; this
+ * section stays because "attention before detail" says the pipeline should
+ * still open with what's live.)
  *
  * Below that: in-flight pipeline items as tappable cards, kept live by the
  * SSE `/events` stream (#1549) rather than a poll timer -- see
@@ -17,33 +25,17 @@
  * trigger an immediate refetch.
  */
 import { useCallback, useRef, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useMatch, useNavigate } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { fetchPipeline, fetchSessions, type PipelineView, type SessionInfo } from '@/api/client'
 import { PipelineCard } from '@/components/PipelineCard'
 import { SessionCard } from '@/components/SessionCard'
-import { ConnectionBadge } from '@/components/ConnectionBadge'
+import { PanelHeader } from '@/components/PanelHeader'
+import { isActive, needsMe } from '@/lib/pipeline'
 
 // ── Filter logic ──────────────────────────────────────────────────────────────
 
 type FilterTab = 'active' | 'needs-me'
-
-/**
- * "Active": items that haven't finished (current_stage !== "merged").
- * This keeps the list focused on in-flight work without cluttering with history.
- */
-function isActive(view: PipelineView): boolean {
-  return view.current_stage !== 'merged'
-}
-
-/**
- * "Needs me": items where at least one human gate action is available.
- * E.g.: work done (needs test dispatch), review approved (needs merge queue),
- * smoke passed (needs merge queue), merge ready (needs merge), failures (need retry/fix).
- */
-function needsMe(view: PipelineView): boolean {
-  return view.available_gates.length > 0
-}
 
 const FILTER_FNS: Record<FilterTab, (v: PipelineView) => boolean> = {
   'active': isActive,
@@ -111,17 +103,42 @@ interface UsePullToRefreshOptions {
   onRefresh: () => void
 }
 
+/**
+ * "Already at the top?" — walked up from the touch target rather than read off
+ * `window`.
+ *
+ * This used to be `window.scrollY === 0`, which was true because the panel was
+ * the document. Under the shell (#1547) the list scrolls inside an
+ * `overflow-y-auto` column, so `window.scrollY` is *permanently* 0 and that
+ * test would have fired a refetch on every downward scroll gesture on the
+ * phone — the exact regression the story's "phone flows work unchanged"
+ * criterion is about.
+ */
+function isScrolledToTop(target: EventTarget | null): boolean {
+  let el: HTMLElement | null = target instanceof HTMLElement ? target : null
+  while (el && el !== document.body) {
+    if (el.scrollTop > 0) return false
+    el = el.parentElement
+  }
+  return (window.scrollY || document.documentElement.scrollTop || 0) === 0
+}
+
 function usePullToRefresh({ onRefresh }: UsePullToRefreshOptions) {
   const startYRef = useRef(0)
+  const startedAtTopRef = useRef(false)
 
   const onTouchStart = useCallback((e: React.TouchEvent) => {
     startYRef.current = e.touches[0].clientY
+    // Sampled at touch *start*: by the time the gesture ends the container has
+    // already been scrolled by it, so asking then would answer the wrong
+    // question.
+    startedAtTopRef.current = isScrolledToTop(e.target)
   }, [])
 
   const onTouchEnd = useCallback(
     (e: React.TouchEvent) => {
       const dy = e.changedTouches[0].clientY - startYRef.current
-      if (dy > PTR_THRESHOLD_PX && window.scrollY === 0) {
+      if (dy > PTR_THRESHOLD_PX && startedAtTopRef.current) {
         onRefresh()
       }
     },
@@ -213,6 +230,7 @@ function LiveSessions({ sessions, onSelect }: LiveSessionsProps) {
 interface DoneSectionProps {
   items: PipelineView[]
   onSelect: (assignmentId: string) => void
+  selectedId?: string
 }
 
 /**
@@ -221,7 +239,7 @@ interface DoneSectionProps {
  * staying one tap away. Sorted by finished_at descending by the caller
  * (groupActiveItems), so expanding always shows most-recently-finished first.
  */
-function DoneSection({ items, onSelect }: DoneSectionProps) {
+function DoneSection({ items, onSelect, selectedId }: DoneSectionProps) {
   const [expanded, setExpanded] = useState(false)
 
   if (items.length === 0) return null
@@ -243,6 +261,7 @@ function DoneSection({ items, onSelect }: DoneSectionProps) {
             <PipelineCard
               key={view.assignment_id}
               view={view}
+              selected={view.assignment_id === selectedId}
               onClick={() => onSelect(view.assignment_id)}
             />
           ))}
@@ -257,6 +276,13 @@ function DoneSection({ items, onSelect }: DoneSectionProps) {
 export default function Home() {
   const navigate = useNavigate()
   const [filterTab, setFilterTab] = useState<FilterTab>('active')
+
+  // Which row is open in the detail panel. Read from the route rather than
+  // passed in, because on narrow this component and the detail are never on
+  // screen together and there is nobody to pass it — the URL is the one thing
+  // both compositions agree on. Renders as a marker only; on narrow the
+  // detail has replaced the list anyway, so nothing is marked.
+  const selectedId = useMatch('/detail/:id')?.params.id
 
   // #1549: no refetchInterval -- kept fresh by SSE-driven invalidation
   // (RealtimeProvider invalidates ['pipeline'] on assignment_*/board_updated
@@ -301,26 +327,19 @@ export default function Home() {
 
   return (
     <div
-      className="mx-auto max-w-lg px-4 py-6"
+      className="mx-auto w-full max-w-lg px-4 py-4"
       onTouchStart={onTouchStart}
       onTouchEnd={onTouchEnd}
     >
-      {/* Header */}
-      <header className="mb-5 flex items-center justify-between">
-        <div>
-          <h1 className="text-xl font-bold text-primary">coord</h1>
-          <p className="text-xs text-muted-foreground">pipeline</p>
-        </div>
-        <div className="flex items-center gap-2">
-          <ConnectionBadge />
-          {isFetching && !isLoading && (
-            <span className="h-2 w-2 animate-pulse rounded-full bg-primary" aria-label="Refreshing" />
-          )}
-          {updatedLabel && (
-            <span className="text-xs text-muted-foreground">{updatedLabel}</span>
-          )}
-        </div>
-      </header>
+      {/* Header. Connection state moved to the shell's status bar (#1547) —
+          it's app-wide truth, and with wide showing list + detail at once,
+          two live-region badges saying the same thing is noise. */}
+      <PanelHeader title="Pipeline" count={data ? counts.active : undefined}>
+        {isFetching && !isLoading && (
+          <span className="h-2 w-2 animate-pulse rounded-full bg-primary" aria-label="Refreshing" />
+        )}
+        {updatedLabel && <span className="font-mono text-[.7rem] text-faint">{updatedLabel}</span>}
+      </PanelHeader>
 
       {/* Live sessions — surfaced above everything else (#1067) */}
       <LiveSessions
@@ -367,11 +386,16 @@ export default function Home() {
               <PipelineCard
                 key={view.assignment_id}
                 view={view}
+                selected={view.assignment_id === selectedId}
                 onClick={() => navigate(`/detail/${view.assignment_id}`)}
               />
             ))}
           </section>
-          <DoneSection items={done} onSelect={(assignmentId) => navigate(`/detail/${assignmentId}`)} />
+          <DoneSection
+            items={done}
+            selectedId={selectedId}
+            onSelect={(assignmentId) => navigate(`/detail/${assignmentId}`)}
+          />
         </>
       )}
 
