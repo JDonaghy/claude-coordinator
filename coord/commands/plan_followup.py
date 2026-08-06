@@ -11,6 +11,7 @@ import click
 import httpx
 
 from coord.config import Config
+from coord.dispatch import DispatchRefused
 
 from coord.commands._common import AGENT_PORT, _CONFIG_OPTION, _load_config
 
@@ -799,6 +800,23 @@ def fix(assignment_id: str, config_path: Path, guidance: str, force: bool) -> No
     except httpx.HTTPError as e:
         click.echo(f"error: dispatch failed: {e}", err=True)
         sys.exit(1)
+    except DispatchRefused as e:
+        # #1844: this arm of `coord fix` (a failed test / red CI, reached
+        # from a WORK assignment id — see `coord/drive.py`'s
+        # `command=("fix", state.work_aid)`) is a RUN action `coord drive`
+        # dispatches directly, and `_dispatch_followup` → `dispatch()` raises
+        # THIS (a `ValueError` subclass) specifically for a deterministic
+        # pre-dispatch guard refusal — not worth a retry. (The OTHER `coord
+        # fix` arm — a request-changes review id — routes through
+        # `_fix_from_review` → `coord.auto_loop._dispatch_fix`, which POSTs
+        # directly and never runs these guards at all; this branch does not
+        # cover it.) Same distinguishable exit code as `_dispatch_headless`'s
+        # equivalent branch (coord/commands/dispatch_workers.py), so `coord
+        # drive`'s subprocess call can tell this apart from a crash.
+        from coord.drive import EXIT_DISPATCH_REFUSED  # noqa: PLC0415
+
+        click.echo(f"error: {e}", err=True)
+        sys.exit(EXIT_DISPATCH_REFUSED)
     except ValueError as e:
         click.echo(f"error: {e}", err=True)
         sys.exit(1)
@@ -931,6 +949,18 @@ def approve_plan(assignment_id: str, config_path: Path) -> None:
     except httpx.HTTPError as e:
         click.echo(f"error: dispatch failed: {e}", err=True)
         sys.exit(1)
+    except DispatchRefused as e:
+        # #1844: same reasoning as `_dispatch_headless`'s equivalent branch
+        # (coord/commands/dispatch_workers.py) — `dispatch()` raises THIS (a
+        # `ValueError` subclass) specifically for a deterministic
+        # pre-dispatch guard refusal. `coord approve-plan` is the other RUN
+        # action `coord drive`'s work-stage dispatch can hit this on (the
+        # #1453 plan → work hand-off), so it needs the same distinguishable
+        # exit code.
+        from coord.drive import EXIT_DISPATCH_REFUSED  # noqa: PLC0415
+
+        click.echo(f"error: {e}", err=True)
+        sys.exit(EXIT_DISPATCH_REFUSED)
     except ValueError as e:
         click.echo(f"error: {e}", err=True)
         sys.exit(1)

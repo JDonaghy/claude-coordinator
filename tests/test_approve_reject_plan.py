@@ -348,6 +348,37 @@ class TestApprovePlan:
         assert result.exit_code == 1
         assert "dispatch failed" in result.output
 
+    def test_dispatch_refused_by_a_pre_dispatch_guard_exits_distinctly(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """#1844: `coord approve-plan` is a RUN action `coord drive`
+        dispatches directly (the #1453 plan → work hand-off). A deterministic
+        pre-dispatch guard refusal (`coord.dispatch.DispatchRefused`) must
+        exit `EXIT_DISPATCH_REFUSED`, not the generic 1 the httpx-error test
+        above asserts, so `coord drive`'s subprocess call can tell it apart
+        from a transient failure instead of retrying it.
+        """
+        from coord.dispatch import DispatchRefused
+        from coord.drive import EXIT_DISPATCH_REFUSED
+
+        a = _make_plan_assignment(
+            assignment_id="plan-015", plan=_SAMPLE_PLAN_DICT
+        )
+        board = Board(active=[], completed=[a])
+        state_mod.save_board(board)
+
+        with patch(
+            "coord.dispatch.dispatch",
+            side_effect=DispatchRefused("no acceptance slice yet — run ..."),
+        ):
+            result = CliRunner().invoke(
+                main, ["approve-plan", "plan-015", "--config", str(config_file)]
+            )
+
+        assert result.exit_code == EXIT_DISPATCH_REFUSED
+        assert result.exit_code != 1
+        assert "no acceptance slice yet" in result.output
+
 
 # ── reject-plan ───────────────────────────────────────────────────────────────
 

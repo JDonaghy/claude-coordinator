@@ -4557,6 +4557,7 @@ def _dispatch_headless(
     """
     from coord.board_service import read_board, write_board  # noqa: PLC0415
     from coord.dispatch import (  # noqa: PLC0415
+        DispatchRefused,
         dispatch,
         post_briefing,
         resolve_dispatch_model_alias,
@@ -4766,6 +4767,21 @@ def _dispatch_headless(
     except httpx.HTTPError as e:
         click.echo(f"  dispatch failed: {e}", err=True)
         sys.exit(1)
+    except DispatchRefused as e:
+        # #1844: `enforce_oracle_readiness`/`enforce_epic_dispatch_guard`
+        # raise THIS (a `ValueError` subclass, caught before the generic
+        # branch below) specifically because their refusal is DETERMINISTIC —
+        # nothing about retrying this exact command changes the condition
+        # that refused it (no acceptance slice appears, no label gets added).
+        # A distinct exit code is what lets `coord drive`'s own subprocess
+        # call — and, through it, `coord drive-queue`'s tick — tell this
+        # apart from a crash instead of retrying a guaranteed-to-fail
+        # dispatch until `max_attempts` is exhausted (the #1817 overnight
+        # incident this issue is named for).
+        from coord.drive import EXIT_DISPATCH_REFUSED  # noqa: PLC0415
+
+        click.echo(f"  dispatch failed: {e}", err=True)
+        sys.exit(EXIT_DISPATCH_REFUSED)
     except ValueError as e:
         click.echo(f"  dispatch failed: {e}", err=True)
         sys.exit(1)

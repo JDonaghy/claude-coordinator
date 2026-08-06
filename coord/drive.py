@@ -134,6 +134,24 @@ EXIT_DEADLINE = 3
 # alone tells a wrapper/notify path "a human decision is waiting on the
 # board" apart from "something actually broke" — see `_escalate_merge`.
 EXIT_ESCALATED = 4
+# #1844: distinct from EXIT_TERMINAL_FAILURE for the ONE failure shape that
+# is deterministic rather than transient — `coord.dispatch.DispatchRefused`
+# (raised by `enforce_oracle_readiness`/`enforce_epic_dispatch_guard`, a
+# `ValueError` subclass) reaching `coord assign`/`coord approve-plan`/`coord
+# fix`'s own dispatch call, refusing the exact dispatch this run just
+# attempted.
+# Nothing in a retry changes the condition that caused the refusal — no
+# acceptance slice appears, no label gets added — so retrying costs a full
+# tick cycle and changes nothing. `coord drive`'s own subprocess call
+# (`Driver._spawn`) is what SEES this code on the `coord assign`/
+# `approve-plan` child process; `_loop`'s RUN-action handling then re-raises
+# with this SAME code (not EXIT_TERMINAL_FAILURE) so the distinction survives
+# into `_drive_exit_summary`'s `drive_exited` audit row, which is the one
+# thing `coord/drive_queue.py`'s tick can actually read after the process is
+# gone. See the 2026-08-04/05 overnight run (#1817): two identical, fully
+# actionable refusals were retried and exhausted as "drive session died",
+# discarding the guard's own remedy in the process.
+EXIT_DISPATCH_REFUSED = 5
 
 
 class DriveError(Exception):
@@ -2066,6 +2084,17 @@ class Driver:
     # as opposed to a raised DriveError) still narrates WHY, not just the
     # bare exit code.
     _last_exit_message: str = field(default="", init=False, repr=False)
+    # #1844: the most recent `_spawn`ed subprocess's combined stdout+stderr —
+    # the ONLY place the real text of a `coord assign`/`approve-plan`
+    # refusal exists once the subprocess has exited (`_append_run_log`
+    # writes the same bytes to disk, but nothing downstream re-reads that
+    # file). `_loop`'s RUN-action handling reaches for this when the child
+    # exits `EXIT_DISPATCH_REFUSED`, so the guard's own message — remedy
+    # included — becomes the raised `DriveError`'s message instead of a
+    # generic "coord assign ... exited 5". Overwritten on every `_spawn`
+    # call, so it is only ever trustworthy read immediately after one, which
+    # is exactly how `_loop` uses it.
+    _last_run_output: str = field(default="", init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.out = self.out or sys.stdout
@@ -2156,6 +2185,7 @@ class Driver:
         if combined:
             print(combined.rstrip("\n"), file=self.out, flush=True)
         self._append_run_log(combined)
+        self._last_run_output = combined.strip()
         return proc.returncode
 
     def run_notify(self) -> None:
@@ -2520,6 +2550,24 @@ class Driver:
                     action.command, serialize_merge=action.serialize_merge
                 )
                 if rc != 0:
+                    # #1844: `coord assign`/`coord approve-plan` exits this
+                    # SAME code (see EXIT_DISPATCH_REFUSED's docstring) only
+                    # when a pre-dispatch guard refused deterministically —
+                    # never for a transient failure. That refusal's own
+                    # message (the guard's remedy, verbatim) is what the
+                    # child just printed to stdout/stderr, captured above by
+                    # `_spawn` into `_last_run_output`; `action.error_message`
+                    # is a STATIC string chosen when the Action was built and
+                    # cannot carry it. Re-raising with the SAME exit code (not
+                    # EXIT_TERMINAL_FAILURE) is what lets `_drive_exit_summary`
+                    # and, downstream, `coord/drive_queue.py`'s tick tell this
+                    # refusal apart from a genuine crash.
+                    if rc == EXIT_DISPATCH_REFUSED:
+                        msg = self._last_run_output or action.error_message or (
+                            f"coord {' '.join(action.command)} refused "
+                            f"(exit {rc})"
+                        )
+                        raise DriveError(msg, EXIT_DISPATCH_REFUSED)
                     msg = action.error_message or (
                         f"coord {' '.join(action.command)} exited {rc}"
                     )

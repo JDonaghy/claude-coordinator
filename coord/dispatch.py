@@ -20,6 +20,32 @@ from coord.models import Proposal, Repo
 AGENT_PORT = 7433
 
 
+class DispatchRefused(ValueError):
+    """A pre-dispatch guard's refusal — deterministic, not transient (#1844).
+
+    Raised by :func:`enforce_oracle_readiness` and
+    :func:`enforce_epic_dispatch_guard` instead of a plain ``ValueError``:
+    both refuse on a condition that CANNOT change between attempts (no
+    acceptance slice exists yet; a tracking issue carries the epic label),
+    unlike the other ``ValueError``s ``dispatch()`` can raise (an unresolved
+    machine/repo_path, the #437 TOS gate, a provider/machine capability
+    mismatch) which this deliberately leaves alone — those are refusals too,
+    but reclassifying their retry-worthiness is outside what this issue
+    covers, and several of them ARE operator-fixable in ways a running fleet
+    can race (e.g. adding a capability to a machine's config while `coord
+    drive-queue` is ticking).
+
+    A subclass of ``ValueError``, not a new hierarchy: every existing
+    ``except ValueError`` catch (CLI error handling, tests asserting the
+    message) keeps working completely unchanged — `str(exc)` is still the
+    plain refusal text. Only a caller that specifically wants to know "was
+    this refusal deterministic" (``coord drive``'s subprocess boundary, via
+    ``coord assign``/``coord approve-plan``/``coord fix`` mapping THIS
+    exception — and no other — to ``coord.drive.EXIT_DISPATCH_REFUSED``)
+    needs to catch it by name.
+    """
+
+
 def enforce_oracle_readiness(
     *, proposal_type: str, repo: Repo | None, config: Config, issue_number: int,
 ) -> None:
@@ -29,11 +55,14 @@ def enforce_oracle_readiness(
     satisfied) but has no JIT-authored acceptance slice yet, or whose repo
     declares a driver ``kind`` this install doesn't implement.
 
-    Raises :class:`ValueError` on refusal — the same exception type every
-    existing dispatch-time check (missing ``repo_path``, the #437 TOS gate)
-    already raises, so callers get "refuse cleanly" for free via their
+    Raises :class:`DispatchRefused` on refusal — a :class:`ValueError`
+    subclass (#1844), so callers get "refuse cleanly" for free via their
     existing ``except ValueError`` handling (``coord approve``, ``coord
-    assign``, ``coord milestone dispatch``) with zero CLI-layer changes.
+    assign``, ``coord milestone dispatch``) with zero CLI-layer changes, same
+    as before this was split out from a plain ``ValueError``. Distinct from
+    it specifically so `coord drive`'s subprocess boundary can tell THIS
+    refusal — deterministic, no acceptance slice will appear on retry —
+    apart from a transient one (missing ``repo_path``, the #437 TOS gate).
 
     Cheap no-op — no network call — for every dispatch outside #1138's
     scope: non-work proposal types (``plan``, ``review``, ``smoke``, ...),
@@ -75,7 +104,7 @@ def enforce_oracle_readiness(
         repo, config, milestone_number, issue_number, issue_labels,
     )
     if readiness.reason is not None:
-        raise ValueError(readiness.reason)
+        raise DispatchRefused(readiness.reason)
 
 
 def enforce_epic_dispatch_guard(
@@ -102,9 +131,10 @@ def enforce_epic_dispatch_guard(
     Override: label the issue ``oracle:exempt`` (the existing "I know what
     I'm doing, let this bypass oracle-loop-specific gating" signal — see
     :func:`enforce_oracle_readiness`) to dispatch anyway. Raises
-    :class:`ValueError` on refusal, same as every other dispatch-time gate
-    here, so callers get "refuse cleanly" for free via their existing
-    ``except ValueError`` handling.
+    :class:`DispatchRefused` on refusal (#1844) — same deterministic-refusal
+    reasoning as :func:`enforce_oracle_readiness`, and still a
+    :class:`ValueError` under the hood, so callers get "refuse cleanly" for
+    free via their existing ``except ValueError`` handling.
 
     Fails OPEN (proceeds) if the issue can't be fetched or *repo* is
     ``None`` — mirrors :func:`enforce_oracle_readiness`'s posture; a
@@ -141,7 +171,7 @@ def enforce_epic_dispatch_guard(
     if TRACKING_ISSUE_LABEL not in issue_labels or "oracle:exempt" in issue_labels:
         return
 
-    raise ValueError(
+    raise DispatchRefused(
         f"refusing type={proposal_type!r} dispatch against #{issue_number}: it "
         f"carries the {TRACKING_ISSUE_LABEL!r} label (a milestone tracking/epic "
         "issue) — merging this would close the epic while its real sub-issues "

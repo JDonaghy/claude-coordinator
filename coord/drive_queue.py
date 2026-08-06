@@ -473,6 +473,9 @@ class Reconcile:
       tmux read, so a foreign host's session is invisible here — that is not
       evidence of anything.  Occupies; never a death, never a retry.
     * ``done``      — merged, or the issue closed.
+    * ``refused``   — #1844: the drive's own exit was a PERMANENT pre-dispatch
+      guard refusal (``coord.drive.EXIT_DISPATCH_REFUSED``).  Goes straight to
+      ``blocked``; costs NO attempt — pairs with a :class:`Blocked`.
     * ``retry``     — genuinely dead: no session, no active work, and past the
       startup grace window.  Costs one attempt.
     * ``exhausted`` — as ``retry``, but out of attempts; pairs with a
@@ -480,7 +483,7 @@ class Reconcile:
     """
 
     key: str
-    outcome: str  # alive | starting | held | done | retry | exhausted
+    outcome: str  # alive | starting | held | unknown | done | refused | retry | exhausted
     reason: str
     occupies: bool = False
     updates: Mapping[str, Any] = field(default_factory=dict)
@@ -797,6 +800,7 @@ def _reconcile_running(
     grace_seconds: float = DRIVE_STARTUP_GRACE_SECONDS,
     local_host: str | None = None,
     exit_reasons: Mapping[str, str] | None = None,
+    exit_refused: Mapping[str, bool] | None = None,
 ) -> tuple[Reconcile, Blocked | None]:
     """Resolve one ``running`` entry against the board.
 
@@ -809,21 +813,29 @@ def _reconcile_running(
       watching keep running on the fleet (#1660).  Such an entry has no tmux
       session and no merge yet — counting it as free is exactly the 2026-08-01
       incident, where five expired drives were each stacked on top of.
+    * ``refused`` is #1844: a drive that exited on a PERMANENT pre-dispatch
+      guard refusal is definitively finished — checked right after ``held``,
+      BEFORE the #1870 cross-host guard and the #1794 startup grace window,
+      because this evidence (the drive's own audit trail, scoped to this
+      exact launch) is stronger than anything a local tmux read or the
+      startup clock can offer; neither of those exists to protect a
+      conclusion this certain. See the extended note below.
     * ``unknown`` is #1870: ``board.live_sessions`` is always a LOCAL tmux
       read, but the queue is fleet-global.  When *entry* was launched on a
       DIFFERENT host than *local_host*, an absent local session proves
       nothing — the drive may be 47 minutes into Test on the machine that
-      actually launched it.  Checked AFTER ``held`` (a real board signal
-      always wins) and BEFORE the grace window / death (neither of which may
-      run on evidence this tick cannot see).
+      actually launched it.  Checked AFTER ``held``/``refused`` (real
+      evidence always wins) and BEFORE the grace window / death (neither of
+      which may run on evidence this tick cannot see).
     * ``starting`` is #1794: a drive that has been launched but has not yet
       registered a session reading OR put work on the board is not dead, it is
       young.  See :data:`DRIVE_STARTUP_GRACE_SECONDS`.
 
     ``retry`` is therefore reachable only when the session is absent, no work
-    is active, nothing landed, the launch host is this host (or unrecorded),
-    AND the launch is older than the grace window — i.e. when death is the
-    only remaining explanation.
+    is active, nothing landed, the drive's own exit was not a permanent
+    refusal, the launch host is this host (or unrecorded), AND the launch is
+    older than the grace window — i.e. when death is the only remaining
+    explanation.
 
     *local_host* is the shell's identity for the machine THIS tick is running
     on (``None`` disables the check entirely — the pre-#1870 behaviour, same
@@ -832,7 +844,7 @@ def _reconcile_running(
     treated as launched here, so it degrades to today's behaviour exactly.
 
     #1845/#1844: "no session, no active work, nothing landed" is also exactly
-    what a drive that exited *deliberately* — a clean ``exit_code=1`` after it
+    what a drive that exited *deliberately* — a clean, non-crash exit after it
     diagnosed its own blocker and gave up — looks like from here. The drive
     already wrote the true reason to the audit trail (``drive_exited``,
     ``coord.drive.Driver._drive_exit_summary``); nothing downstream of that
@@ -841,11 +853,20 @@ def _reconcile_running(
     (keyed by :attr:`QueueEntry.key`, fetched by the shell from
     :func:`coord.audit.query_audit_log` for the current run only — never a
     stale reason from a prior attempt on the same entry) is that write,
-    threaded through as data so this function stays pure. When present it
-    replaces the synthesised "drive session died" wording below; the state
-    transition (``retry`` vs ``exhausted``) is unchanged either way — a
-    genuine reason does not change whether the entry gets another attempt,
-    only what the operator is told about the one that just ended.
+    threaded through as data so this function stays pure.
+
+    *exit_refused* (same keying, same "this run only" scoping) is #1844's
+    addition: ``True`` when that exit carried ``coord.drive.
+    EXIT_DISPATCH_REFUSED`` rather than a generic non-zero code — i.e. a
+    PERMANENT pre-dispatch guard refusal, not a transient death. That one
+    boolean is the only thing that changes the state transition: an entry
+    with ``exit_refused=True`` goes straight to ``blocked`` (the ``refused``
+    branch above), attempts untouched, on the FIRST tick that observes it —
+    never ``retry``, because nothing about waiting and relaunching can change
+    a condition a retry cannot affect. Every other exit reason — present or
+    absent, refused or not — only ever changes the WORDING below; whether the
+    entry gets another attempt is otherwise unaffected by #1845/#1844 (still
+    ``retry`` until ``max_attempts``, still ``exhausted`` → ``blocked`` after).
     """
     facts = board.facts(entry.key)
 
@@ -885,6 +906,48 @@ def _reconcile_running(
                 },
             ),
             None,
+        )
+
+    # #1844: a drive that exited on a PERMANENT pre-dispatch guard refusal
+    # (`coord.dispatch.enforce_oracle_readiness`, `enforce_epic_dispatch_
+    # guard`, or any other check `coord assign`/`coord approve-plan`/`coord
+    # fix` raises a plain `ValueError` for — see `coord.drive.
+    # EXIT_DISPATCH_REFUSED`'s docstring) is definitively FINISHED for this
+    # launch, not merely absent from this tick's evidence. Checked before the
+    # #1870 cross-host guard and the #1794 startup grace window below — both
+    # of which exist only to withhold judgement on WEAK evidence (an absent
+    # local tmux session proves nothing about a foreign host, or about a
+    # drive that has not had time to start yet). This is the strongest
+    # evidence available: the drive's own audit trail, scoped to THIS launch
+    # by the shell (`since=entry.launched_at`), naming its own exit code.
+    # Retrying a deterministic refusal costs a full tick cycle and changes
+    # nothing — the #1817 overnight incident this issue is named for spent
+    # both of its attempts on an identical, guaranteed-to-fail dispatch
+    # before exhausting to `blocked` anyway. So this goes straight to
+    # `blocked`, WITHOUT incrementing `attempts` — there was never anything
+    # to retry.
+    own_reason = (exit_reasons or {}).get(entry.key)
+    if own_reason and (exit_refused or {}).get(entry.key):
+        reason = (
+            f"{own_reason} — refused by a pre-dispatch guard, which cannot "
+            "change on retry (#1844); blocking without spending an attempt"
+        )
+        # `Reconcile.updates` is deliberately EMPTY, same as `exhausted`
+        # below — the paired `Blocked` carries every write, applied once by
+        # `TickPlan.writes()`. `attempts` is absent from BOTH: there is
+        # nothing to spend, unlike `exhausted`'s Blocked which stamps the
+        # final attempt count.
+        return (
+            Reconcile(entry.key, "refused", reason, occupies=False),
+            Blocked(
+                entry.key,
+                reason,
+                updates={
+                    "state": STATE_BLOCKED,
+                    "last_reason": reason,
+                    "session_name": None,
+                },
+            ),
         )
 
     if (
@@ -950,7 +1013,10 @@ def _reconcile_running(
     # that failed to fetch it.
     since = _startup_age(entry, now)
     launched = f", launched {since:.0f}s ago" if since is not None else ""
-    own_reason = (exit_reasons or {}).get(entry.key)
+    # `own_reason` was already resolved above (before the cross-host/startup
+    # checks) so the `refused` branch could use it; reused here unchanged —
+    # a non-refusal exit reason (a genuine death that still narrated why)
+    # still wins over the synthesised wording, same as #1845.
 
     attempts = entry.attempts + 1
     if attempts < max_attempts:
@@ -1170,6 +1236,7 @@ def plan_tick(
     grace_seconds: float = DRIVE_STARTUP_GRACE_SECONDS,
     local_host: str | None = None,
     exit_reasons: Mapping[str, str] | None = None,
+    exit_refused: Mapping[str, bool] | None = None,
 ) -> TickPlan:
     """Decide one tick.  Pure; the caller executes the returned plan.
 
@@ -1183,10 +1250,18 @@ def plan_tick(
 
     *exit_reasons* maps a ``running`` entry's key to the drive's own
     ``drive_exited`` audit summary for THIS launch (#1845/#1844) — see
-    :func:`_reconcile_running` for what it changes (wording only, never the
-    ``retry``/``exhausted`` decision) and why "for this launch" matters (a
-    stale reason from a prior attempt on the same entry must never be
-    replayed as if it explained the current one).
+    :func:`_reconcile_running` for what it changes (wording, and — when
+    *exit_refused* also marks the entry — the ``retry``/``exhausted``
+    decision itself) and why "for this launch" matters (a stale reason from a
+    prior attempt on the same entry must never be replayed as if it explained
+    the current one).
+
+    *exit_refused* maps the same keys to ``True`` when that exit was a
+    PERMANENT pre-dispatch guard refusal (``coord.drive.
+    EXIT_DISPATCH_REFUSED``) rather than a transient death (#1844). Unlike
+    *exit_reasons*, this DOES change the decision: such an entry reconciles
+    straight to ``blocked`` with ``attempts`` unchanged, never ``retry`` —
+    see :func:`_reconcile_running`'s ``refused`` branch.
 
     *now* is the shell's ``time.time()``, passed in rather than read here (see
     the module docstring).  It powers #1794's startup grace window on both
@@ -1265,6 +1340,7 @@ def plan_tick(
             grace_seconds=grace_seconds,
             local_host=local_host,
             exit_reasons=exit_reasons,
+            exit_refused=exit_refused,
         )
         reconciles.append(reconcile)
         if reconcile.occupies:

@@ -35,6 +35,7 @@ import pytest
 from coord.config import Config, UsageGateConfig
 from coord.drive import (
     EXIT_DEADLINE,
+    EXIT_DISPATCH_REFUSED,
     EXIT_ESCALATED,
     EXIT_OK,
     EXIT_TERMINAL_FAILURE,
@@ -2733,6 +2734,71 @@ def test_a_die_on_error_action_raises_a_drive_error(driver_factory, monkeypatch)
     with pytest.raises(DriveError) as exc:
         driver.run()
     assert exc.value.exit_code == EXIT_TERMINAL_FAILURE
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# #1844: a permanent pre-dispatch refusal is NOT a generic RUN-action
+# failure. `coord assign`/`coord approve-plan`/`coord fix` exit
+# EXIT_DISPATCH_REFUSED (not the generic 1) when `enforce_oracle_readiness`/
+# `enforce_epic_dispatch_guard` refuse deterministically; `_loop`'s RUN
+# handling must re-raise with THAT exit code, carrying the child's own
+# captured output (the guard's remedy, verbatim) rather than a synthesised
+# "coord ... exited 5" — that captured text is what `_drive_exit_summary`
+# folds into the `drive_exited` audit row, which is the only thing
+# `coord/drive_queue.py`'s tick can read once this process is gone.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def test_a_dispatch_refusal_raises_a_drive_error_with_the_distinct_exit_code(
+    driver_factory, monkeypatch,
+):
+    driver = driver_factory([board(status="failed", failure_reason="boom")])
+    refusal_text = (
+        "  dispatch failed: Issue #1817 is part of oracle-opted-in milestone "
+        "ms-51 (Gate A satisfied) but has no acceptance slice yet — run "
+        "`coord acceptance author claude-coordinator <tracking_issue> "
+        "--issue 1817` first."
+    )
+
+    def refused_run(argv, **kw):
+        return subprocess.CompletedProcess(argv, EXIT_DISPATCH_REFUSED, "", refusal_text)
+
+    monkeypatch.setattr("coord.drive.subprocess.run", refused_run)
+    with pytest.raises(DriveError) as exc:
+        driver.run()
+    # THE two things #1844 exists for: the exit code is distinguishable from
+    # a crash (EXIT_TERMINAL_FAILURE), and the message is the guard's OWN
+    # text — including its remedy — not a generic "exited 5".
+    assert exc.value.exit_code == EXIT_DISPATCH_REFUSED
+    assert exc.value.exit_code != EXIT_TERMINAL_FAILURE
+    assert "acceptance author" in str(exc.value)
+    assert refusal_text.strip() in str(exc.value)
+
+
+def test_a_dispatch_refusals_reason_reaches_the_drive_exited_audit_row(
+    driver_factory, monkeypatch, coord_db,
+):
+    """End-to-end through `Driver.run()`'s audit boundary (#1499): the
+    `drive_exited` row's `details.exit_code` must be EXIT_DISPATCH_REFUSED —
+    the ONE fact `coord/commands/drive_queue.py`'s `_fetch_exit_reasons`
+    reads to tell a refusal apart from a genuine death — and its `summary`
+    must carry the refusal's own text.
+    """
+    driver = driver_factory([board(status="failed", failure_reason="boom")])
+    refusal_text = "refusing: no acceptance slice yet — run `coord acceptance author ...`"
+
+    def refused_run(argv, **kw):
+        return subprocess.CompletedProcess(argv, EXIT_DISPATCH_REFUSED, "", refusal_text)
+
+    monkeypatch.setattr("coord.drive.subprocess.run", refused_run)
+    with pytest.raises(DriveError):
+        driver.run()
+
+    rows = _drive_audit_rows(coord_db)
+    assert [r["event_type"] for r in rows] == ["drive_started", "drive_exited"]
+    details = json.loads(rows[1]["details_json"])
+    assert details["exit_code"] == EXIT_DISPATCH_REFUSED
+    assert refusal_text in rows[1]["summary"]
 
 
 def test_a_warn_on_error_action_keeps_looping(driver_factory, monkeypatch, capsys):

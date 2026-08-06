@@ -17,6 +17,7 @@ from coord.config import (
     ProvidersConfig,
 )
 from coord.dispatch import (
+    DispatchRefused,
     dispatch,
     enforce_epic_dispatch_guard,
     enforce_model_provider_compatibility,
@@ -562,8 +563,14 @@ class TestDispatch:
             id=1, machine_name="ghost", repo_name="api",
             issue_number=1, issue_title="x", rationale="",
         )
-        with pytest.raises(ValueError, match="Unknown machine"):
+        # #1844: deliberately a plain `ValueError`, NOT `DispatchRefused` —
+        # only `enforce_oracle_readiness`/`enforce_epic_dispatch_guard` raise
+        # the subclass; reclassifying every other dispatch-time `ValueError`
+        # as a deterministic refusal is explicitly out of this issue's scope
+        # (see `DispatchRefused`'s docstring).
+        with pytest.raises(ValueError, match="Unknown machine") as exc:
             dispatch(bad, config)
+        assert not isinstance(exc.value, DispatchRefused)
 
     def test_missing_repo_path_raises(self) -> None:
         cfg = Config(
@@ -574,8 +581,9 @@ class TestDispatch:
             id=1, machine_name="laptop", repo_name="api",
             issue_number=1, issue_title="x", rationale="",
         )
-        with pytest.raises(ValueError, match="repo_path"):
+        with pytest.raises(ValueError, match="repo_path") as exc:
             dispatch(p, cfg)
+        assert not isinstance(exc.value, DispatchRefused)
 
 
 class TestOverlapFenceWiring:
@@ -905,7 +913,14 @@ class TestOracleReadinessGate:
             "contract body" if path.endswith("contract.md") else (_ for _ in ()).throw(RuntimeError("404"))
         )
 
-        with pytest.raises(ValueError, match="no acceptance slice yet"):
+        # #1844: this refusal must be `DispatchRefused` specifically, not a
+        # plain `ValueError` — it is what `coord assign`/`coord approve-plan`
+        # (coord/commands/dispatch_workers.py, coord/commands/
+        # plan_followup.py) catch to map to `coord.drive.
+        # EXIT_DISPATCH_REFUSED` instead of the generic exit 1, so `coord
+        # drive-queue`'s tick can tell a deterministic refusal apart from a
+        # crash rather than retrying it (the #1817 overnight incident).
+        with pytest.raises(DispatchRefused, match="no acceptance slice yet"):
             dispatch(p, cfg)
         mock_post.assert_not_called()
 
@@ -1060,7 +1075,9 @@ class TestEpicDispatchGuard:
         )
         mock_get_issue.return_value = {"labels": [{"name": "epic"}]}
 
-        with pytest.raises(ValueError, match="epic"):
+        # #1844: same reasoning as `test_refuses_work_dispatch_with_no_slice`
+        # above — deterministic, so `DispatchRefused` specifically.
+        with pytest.raises(DispatchRefused, match="epic"):
             dispatch(p, cfg)
         mock_post.assert_not_called()
 

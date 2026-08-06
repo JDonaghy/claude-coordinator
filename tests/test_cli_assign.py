@@ -357,6 +357,40 @@ class TestAssignDispatch:
         assert result.exit_code == 1
         assert "dispatch failed" in result.output
 
+    def test_dispatch_refused_by_a_pre_dispatch_guard_exits_distinctly(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """#1844: a deterministic pre-dispatch guard refusal (`enforce_
+        oracle_readiness`/`enforce_epic_dispatch_guard`, raised as
+        `coord.dispatch.DispatchRefused`) must exit `EXIT_DISPATCH_REFUSED`
+        — NOT the generic 1 the httpx-error test above asserts — so `coord
+        drive`'s subprocess call (this is exactly the RUN action `coord
+        drive` dispatches for a fresh work assignment) can tell a refusal
+        apart from a transient failure instead of retrying it.
+        """
+        from coord.dispatch import DispatchRefused
+        from coord.drive import EXIT_DISPATCH_REFUSED
+
+        with patch("coord.github_ops.get_issue", return_value={"title": "t"}), \
+             patch("coord.github_ops.check_branch_exists", return_value=False), \
+             patch(
+                 "coord.dispatch.dispatch",
+                 side_effect=DispatchRefused(
+                     "Issue #1817 is part of oracle-opted-in milestone ms-51 "
+                     "(Gate A satisfied) but has no acceptance slice yet — "
+                     "run `coord acceptance author claude-coordinator "
+                     "<tracking_issue> --issue 1817` first."
+                 ),
+             ):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "7", "--config", str(config_file)],
+            )
+        assert result.exit_code == EXIT_DISPATCH_REFUSED
+        assert result.exit_code != 1
+        assert "dispatch failed" in result.output
+        assert "coord acceptance author" in result.output
+
     def test_issue_fetch_failure(self, config_file: Path, coord_dir: Path) -> None:
         with patch(
             "coord.github_ops.get_issue",

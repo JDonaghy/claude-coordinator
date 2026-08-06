@@ -637,6 +637,115 @@ def test_no_exit_reason_falls_back_to_the_synthesised_death_wording():
     )
 
 
+# ── plan_tick: a permanent dispatch refusal blocks straight away (#1844) ────
+#
+# The defect #1845 did NOT fix: `_reconcile_running`'s death branch treats a
+# drive refused by a deterministic pre-dispatch guard (`enforce_oracle_
+# readiness`, `enforce_epic_dispatch_guard`) exactly like a genuine crash —
+# it retries the identical guaranteed-to-fail dispatch, burns an attempt, and
+# only reaches `blocked` after `max_attempts` is exhausted. This is the exact
+# #1817 overnight shape: two identical, fully actionable refusals were
+# retried and only THEN blocked, discarding the guard's own remedy along the
+# way (`exit_reasons` alone, #1845's fix, only changes the WORDING of that
+# outcome — see the tests above). `exit_refused` is what changes the
+# DECISION: straight to `blocked`, attempts untouched, on the FIRST tick.
+
+
+REFUSAL = (
+    "drive exited for claude-coordinator#1817 (exit_code=5): dispatch failed: "
+    "Issue #1817 is part of oracle-opted-in milestone ms-51 (Gate A "
+    "satisfied) but has no acceptance slice yet — run `coord acceptance "
+    "author claude-coordinator <tracking_issue> --issue 1817` first."
+)
+
+
+def test_a_permanent_refusal_blocks_immediately_with_attempts_unspent():
+    """The acceptance criterion, asserted the way the issue insists on: on
+    the attempt counter, not just the final state."""
+    entries = [entry(1650, position=3, state=STATE_RUNNING, attempts=0)]
+    plan = plan_tick(
+        entries, board(), capacity=1,
+        exit_reasons={entry_key(REPO, 1650): REFUSAL},
+        exit_refused={entry_key(REPO, 1650): True},
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "refused"
+    assert reconcile.occupies is False
+    # NOT `retry`: no requeue, no attempt spent — check both the reconcile
+    # and the paired Blocked never touch `attempts` at all (a bare `0` would
+    # also satisfy "attempts == 0" but wrongly imply a write happened).
+    assert "attempts" not in reconcile.updates
+    assert [b.key for b in plan.blocked] == [entry_key(REPO, 1650)]
+    blocked = plan.blocked[0]
+    assert "attempts" not in blocked.updates
+    assert blocked.updates["state"] == STATE_BLOCKED
+    # The guard's own message — remedy included — survives verbatim into
+    # both the reconcile log line and what `coord drive-queue list`/`status`
+    # will show as `last_reason`.
+    assert REFUSAL in reconcile.reason
+    assert REFUSAL in blocked.reason
+    assert REFUSAL in blocked.updates["last_reason"]
+    assert "coord acceptance author" in blocked.updates["last_reason"]
+    assert "drive session died" not in blocked.reason
+
+
+def test_a_permanent_refusal_blocks_even_on_a_fresh_entrys_first_tick():
+    """Not just "no MORE attempts spent" — no attempt at all, ever, for a
+    refusal observed on attempt 0. `entry.attempts` (the pre-tick value)
+    must be what an operator sees after re-adding this exact entry."""
+    entries = [entry(1817, state=STATE_RUNNING, attempts=0)]
+    plan = plan_tick(
+        entries, board(), capacity=1,
+        exit_reasons={entry_key(REPO, 1817): REFUSAL},
+        exit_refused={entry_key(REPO, 1817): True},
+    )
+    assert plan.reconciles[0].outcome == "refused"
+    assert plan.blocked[0].updates.get("attempts") is None
+    assert plan.launch is None
+
+
+def test_exit_reason_without_the_refused_flag_still_retries_normally():
+    """`exit_reasons` alone (a genuine death that happened to narrate why,
+    #1845) must NOT trip the new `refused` branch — only `exit_refused`
+    does. No regression on the #1845 behaviour pinned above."""
+    entries = [entry(1650, position=3, state=STATE_RUNNING, attempts=0)]
+    plan = plan_tick(
+        entries, board(), capacity=1,
+        exit_reasons={entry_key(REPO, 1650): REFUSAL},
+        exit_refused={},
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "retry"
+    assert reconcile.updates["attempts"] == 1
+
+
+def test_a_refused_entry_deep_into_its_attempt_budget_still_spends_none():
+    """`exit_refused` short-circuits regardless of how many attempts this
+    entry has already burned on genuine deaths — the LAST attempt is not
+    "closer to exhausted", it is still a refusal, still costs nothing."""
+    entries = [
+        entry(1817, state=STATE_RUNNING, attempts=DEFAULT_MAX_ATTEMPTS - 1)
+    ]
+    plan = plan_tick(
+        entries, board(), capacity=1,
+        exit_reasons={entry_key(REPO, 1817): REFUSAL},
+        exit_refused={entry_key(REPO, 1817): True},
+    )
+    assert plan.reconciles[0].outcome == "refused"  # not "exhausted"
+    assert "attempts" not in plan.blocked[0].updates
+
+
+def test_a_genuine_death_still_retries_and_exhausts_with_no_refused_flag():
+    """Regression bar: the retry mechanism this issue explicitly leaves
+    alone. Three genuine deaths recovered on attempt 2 the same overnight
+    run #1844 is named for — this must keep working exactly as #1794/#1845
+    left it when `exit_refused` says nothing (the default, `None`)."""
+    entries = [entry(1650, state=STATE_RUNNING, attempts=DEFAULT_MAX_ATTEMPTS - 1)]
+    plan = plan_tick(entries, board(), capacity=1)
+    assert plan.reconciles[0].outcome == "exhausted"
+    assert plan.blocked[0].updates["attempts"] == DEFAULT_MAX_ATTEMPTS
+
+
 # ── plan_tick: the startup grace window (#1794) ──────────────────────────────
 #
 # 2026-08-03, the first unattended run of the #1756 timer: a tick 40s after a
