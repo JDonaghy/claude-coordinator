@@ -1,7 +1,8 @@
 import { lazy, Suspense } from 'react'
 import { BrowserRouter, Routes, Route } from 'react-router-dom'
-import Home from '@/components/Home'
 import Detail from '@/components/Detail'
+import { ShellLayout } from '@/shell/ShellLayout'
+import { EmptyDetail } from '@/shell/EmptyDetail'
 import { ThemeProvider } from '@/components/ui/theme-provider'
 import { Toaster } from '@/components/ui/toaster'
 
@@ -23,37 +24,52 @@ const Gallery = lazy(() => import('@/components/Gallery'))
 /**
  * App root.  BrowserRouter is used here; the dashboard server serves index.html
  * as a SPA fallback for all non-API paths so deep links work on hard reload.
+ *
+ * Routing shape (#1547): `ShellLayout` is a react-router *layout route*, so
+ * `/` and `/detail/:id` both render inside the responsive shell (rail + list +
+ * detail on wide, the phone app on narrow) with the child route filling the
+ * detail slot. The URLs themselves are unchanged — restructuring them for deep
+ * links is the next story (#1548).
+ *
+ * `/terminal/:sessionId` stays deliberately *outside* the shell: the PTY pane
+ * wants the whole viewport and brings its own key bar, and framing a terminal
+ * in a rail plus a status bar would cost it rows on exactly the device (a
+ * phone) where rows are scarcest.
  */
 export default function App() {
   return (
     <ThemeProvider>
-      <div className="min-h-screen bg-background text-foreground">
-        <BrowserRouter>
-          <Routes>
-            <Route path="/" element={<Home />} />
+      <BrowserRouter>
+        <Routes>
+          <Route element={<ShellLayout />}>
+            <Route path="/" element={<EmptyDetail />} />
             <Route path="/detail/:id" element={<Detail />} />
-            <Route
-              path="/terminal/:sessionId"
-              element={
+          </Route>
+          <Route
+            path="/terminal/:sessionId"
+            element={
+              <div className="min-h-screen bg-background text-foreground">
                 <Suspense fallback={null}>
                   <Terminal />
                 </Suspense>
-              }
-            />
-            {import.meta.env.DEV && (
-              <Route
-                path="/gallery"
-                element={
+              </div>
+            }
+          />
+          {import.meta.env.DEV && (
+            <Route
+              path="/gallery"
+              element={
+                <div className="min-h-screen bg-background text-foreground">
                   <Suspense fallback={null}>
                     <Gallery />
                   </Suspense>
-                }
-              />
-            )}
-          </Routes>
-        </BrowserRouter>
-        <Toaster />
-      </div>
+                </div>
+              }
+            />
+          )}
+        </Routes>
+      </BrowserRouter>
+      <Toaster />
     </ThemeProvider>
   )
 }

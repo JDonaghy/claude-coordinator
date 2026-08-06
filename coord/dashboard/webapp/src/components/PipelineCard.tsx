@@ -100,16 +100,30 @@ function stageStatusInfo(currentStage: string): StatusInfo {
 export interface PipelineCardProps {
   view: PipelineView
   onClick: () => void
+  /**
+   * This row's item is the one open in the detail panel (#1547).
+   *
+   * Only ever true on a viewport wide enough to show list and detail at once —
+   * on a phone the detail replaces the list, so there is nothing to mark. The
+   * treatment is the mock's `.row[aria-selected="true"]`: an accent bar on the
+   * leading edge plus a stronger border, never a fill, because the accent
+   * means "work is happening here" and a selected row hasn't earned it.
+   */
+  selected?: boolean
 }
 
-export function PipelineCard({ view, onClick }: PipelineCardProps) {
+export function PipelineCard({ view, onClick, selected }: PipelineCardProps) {
   const { label: statusLabel, className: statusClass } = stageStatusInfo(view.current_stage)
 
   return (
     <button
       type="button"
       onClick={onClick}
-      className="w-full rounded-lg border border-border bg-card p-4 text-left shadow-sm transition-colors active:bg-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      aria-current={selected ? 'true' : undefined}
+      className={cn(
+        'relative w-full overflow-hidden rounded-lg border border-border bg-card p-4 text-left shadow-sm transition-colors active:bg-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+        selected && 'border-line-strong before:absolute before:inset-y-2 before:left-0 before:w-[2px] before:rounded-r-sm before:bg-brand before:content-[\'\']',
+      )}
     >
       {/* Top row: issue title + status badge */}
       <div className="flex items-start justify-between gap-3">

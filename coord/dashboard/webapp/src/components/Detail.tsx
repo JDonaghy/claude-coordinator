@@ -1,5 +1,11 @@
 /**
- * Detail — per-item detail screen for a pipeline assignment.
+ * Detail — per-item detail for a pipeline assignment.
+ *
+ * Like Home, this is *panel content*, not a screen (#1547): the shell renders
+ * it into the detail slot — the third column on wide, the whole screen after a
+ * drill-in on narrow — and nothing here branches on viewport. App chrome
+ * (wordmark, connection state) moved to the shell, which owns exactly one copy
+ * of each now that both panels can be on screen at the same time.
  *
  * Shows the assignment header, test-gate actions, review section (findings +
  * verdict), merge section (gate status + merge / force), optional smoke/unstick
@@ -19,7 +25,6 @@ import {
   type PipelineView,
   type PipelineActionRequest,
 } from '@/api/client'
-import { ConnectionBadge } from '@/components/ConnectionBadge'
 import { cn } from '@/lib/utils'
 
 // ── Toast ─────────────────────────────────────────────────────────────────────
@@ -197,6 +202,18 @@ const STAGE_LABEL: Record<string, string> = {
 
 const FAILED_STAGES = new Set(['failed', 'review_failed', 'smoke_failed'])
 
+/**
+ * The detail's own content column (#1547).
+ *
+ * `max-w-3xl` rather than the old `max-w-lg`: this is now the *detail slot* of
+ * the shell, which on a wide viewport is whatever is left after the rail and
+ * the list — a 512px column stranded in the middle of 1000px of empty ground
+ * looked like a rendering bug. On a phone every candidate max-width exceeds
+ * the viewport, so `px-4` is what actually sets the measure there and the
+ * layout is byte-for-byte what it was.
+ */
+const detailShellClass = 'mx-auto w-full max-w-3xl px-4 py-5 md:px-6'
+
 function stageStatus(currentStage: string): { label: string; className: string } {
   const RUNNING = new Set(['coding', 'review_running', 'smoke_running', 'merging'])
   if (RUNNING.has(currentStage)) {
@@ -283,11 +300,7 @@ export default function Detail() {
 
   if (isLoading) {
     return (
-      <div className="mx-auto max-w-lg px-4 py-6">
-        <header className="mb-6 flex items-center justify-between">
-          <h1 className="text-xl font-bold text-primary">coord</h1>
-          <ConnectionBadge />
-        </header>
+      <div className={detailShellClass}>
         <p className="py-12 text-center text-sm text-muted-foreground">Loading…</p>
       </div>
     )
@@ -295,11 +308,7 @@ export default function Detail() {
 
   if (isError) {
     return (
-      <div className="mx-auto max-w-lg px-4 py-6">
-        <header className="mb-6 flex items-center justify-between">
-          <h1 className="text-xl font-bold text-primary">coord</h1>
-          <ConnectionBadge />
-        </header>
+      <div className={detailShellClass}>
         <p className="py-12 text-center text-sm text-destructive">Failed to load pipeline</p>
       </div>
     )
@@ -307,20 +316,17 @@ export default function Detail() {
 
   if (!view) {
     return (
-      <div className="mx-auto max-w-lg px-4 py-6">
-        <header className="mb-6 flex items-center justify-between gap-3">
-          <div className="flex items-center gap-3">
-            <button
-              type="button"
-              onClick={() => navigate(-1)}
-              className="rounded p-1 text-muted-foreground hover:text-foreground"
-              aria-label="Back"
-            >
-              ←
-            </button>
-            <h1 className="text-xl font-bold text-primary">coord</h1>
-          </div>
-          <ConnectionBadge />
+      <div className={detailShellClass}>
+        <header className="mb-6 flex items-center gap-3">
+          <button
+            type="button"
+            onClick={() => navigate(-1)}
+            className="rounded p-1 text-muted-foreground hover:text-foreground"
+            aria-label="Back"
+          >
+            ←
+          </button>
+          <h1 className="text-step-1 font-semibold text-foreground">Not found</h1>
         </header>
         <p className="text-sm text-muted-foreground">
           Assignment <span className="font-mono">{id}</span> not found in the pipeline.
@@ -332,7 +338,7 @@ export default function Detail() {
   const { label: statusLabel, className: statusClass } = stageStatus(view.current_stage)
 
   return (
-    <div className="mx-auto max-w-lg px-4 py-6 pb-24">
+    <div className={cn(detailShellClass, 'pb-24')}>
       <ToastList toasts={toasts} />
 
       {failDialogOpen && (
@@ -361,28 +367,24 @@ export default function Detail() {
 
       {/* ── Header ────────────────────────────────────────────────────────── */}
       <header className="mb-5">
-        <div className="mb-3 flex items-center justify-between gap-3">
-          <div className="flex items-center gap-3">
-            <button
-              type="button"
-              onClick={() => navigate(-1)}
-              aria-label="Back"
-              className="rounded p-1 text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            >
-              ←
-            </button>
-            <h1 className="text-xl font-bold text-primary">coord</h1>
-          </div>
-          <ConnectionBadge />
-        </div>
-
-        <div className="flex items-start justify-between gap-3">
-          <div className="min-w-0">
+        <div className="flex items-start gap-2">
+          {/* Back is the phone's drill-out and the wide layout's "clear the
+              selection" — `navigate(-1)` does the right thing for both, since
+              in each case the previous entry is the list at `/`. */}
+          <button
+            type="button"
+            onClick={() => navigate(-1)}
+            aria-label="Back"
+            className="-ml-1 shrink-0 rounded p-1 text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            ←
+          </button>
+          <div className="min-w-0 flex-1">
             <p className="text-xs text-muted-foreground">
-              {view.repo_name}{' '}
+              <span className="font-mono">{view.repo_name}</span>{' '}
               <span className="font-mono">#{view.issue_number}</span>
               {' · '}
-              {view.machine_name}
+              <span className="font-mono">{view.machine_name}</span>
             </p>
             <h2 className="mt-0.5 text-base font-semibold text-foreground">
               {view.issue_title}

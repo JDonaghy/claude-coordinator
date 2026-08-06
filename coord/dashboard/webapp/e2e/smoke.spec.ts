@@ -91,6 +91,20 @@ async function mockApi(page: Page): Promise<void> {
 
 test.describe('coord webapp smoke suite (#741)', () => {
   /**
+   * Pinned to a phone viewport (#1547).
+   *
+   * This suite is, and always was, the *phone* app's regression net — it was
+   * simply running at Playwright's `Desktop Chrome` default (1280×720) by
+   * accident, because until the responsive shell landed the app rendered the
+   * same single column at every width. Now 1280px is the wide layout, where
+   * list and detail are both on screen and "clicking a card opens its detail
+   * view" would resolve the issue title twice and trip Playwright's strict
+   * mode. Making the viewport explicit says what these three tests are for;
+   * the wide and mid layouts get their own coverage in `shell.spec.ts`.
+   */
+  test.use({ viewport: { width: 390, height: 844 } })
+
+  /**
    * Core smoke 1: the home screen must render at least one PipelineCard for
    * each active item in the seeded /api/pipeline response.
    *
