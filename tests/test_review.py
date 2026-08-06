@@ -8,7 +8,14 @@ from pathlib import Path
 
 import pytest
 
-from coord.config import Config, PipelineConfig, ReviewsConfig, load
+from coord.config import (
+    Config,
+    PipelineConfig,
+    ProviderDef,
+    ProvidersConfig,
+    ReviewsConfig,
+    load,
+)
 from coord.merge_queue import QueuedMerge
 from coord.models import Assignment, Board, Machine, Repo
 from coord.review import (
@@ -169,6 +176,64 @@ reviews:
         load(p)
 
 
+def test_reviews_config_provider_defaults_to_none(tmp_path: Path) -> None:
+    """#1811 regression: no ``reviews.provider`` in coordinator.yml must leave
+    ``cfg.reviews.provider`` as ``None`` — the review dispatch path then
+    inherits ``repo.provider`` exactly as it did before this field existed.
+    No existing deployment (none of which set this brand-new key) may see
+    ANY behavior change."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n  - name: api\n    github: acme/api\n"
+        "machines:\n  - name: laptop\n    host: laptop.tail\n    repos: [api]\n"
+    )
+    cfg = load(p)
+    assert cfg.reviews.provider is None
+
+
+def test_reviews_config_parses_provider(tmp_path: Path) -> None:
+    """A ``reviews.provider`` naming a provider actually registered under
+    ``providers.definitions`` parses cleanly and is recorded verbatim."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        """\
+repos:
+  - name: api
+    github: acme/api
+    provider: opencode
+machines:
+  - name: laptop
+    host: laptop.tail
+    repos: [api]
+providers:
+  definitions:
+    opencode:
+      type: opencode
+reviews:
+  provider: claude
+"""
+    )
+    cfg = load(p)
+    assert cfg.reviews.provider == "claude"
+    assert cfg.repos[0].provider == "opencode"
+
+
+def test_reviews_config_rejects_unknown_provider(tmp_path: Path) -> None:
+    """#1811: an unknown ``reviews.provider`` name must be a config error at
+    PARSE time — not a silent dispatch-time fallback (mirrors how #1796
+    treats an unresolvable named provider as a hard refusal rather than a
+    quiet default)."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n  - name: api\n    github: acme/api\n"
+        "machines:\n  - name: laptop\n    host: laptop.tail\n    repos: [api]\n"
+        "reviews:\n  provider: nonexistent-provider\n"
+    )
+    from coord.config import ConfigError
+    with pytest.raises(ConfigError, match="unknown provider: 'nonexistent-provider'"):
+        load(p)
+
+
 # ── Machine selection ───────────────────────────────────────────────────────
 
 
@@ -270,6 +335,39 @@ def test_briefing_warns_when_same_machine() -> None:
         reviews_cfg=ReviewsConfig(enabled=True), repo_claude_md=None,
     )
     assert "running on the same machine as the worker" in briefing
+
+
+def test_briefing_warns_when_provider_same_as_worker() -> None:
+    """#1811: when the resolved review provider matches the worker's own,
+    the reviewer's own prompt must say so — mirroring the same_as_worker
+    machine-co-location note. Provider co-location is a LARGER loss of
+    independence than machine co-location (a fresh session removes shared
+    context, but not shared blind spots)."""
+    briefing = build_review_briefing(
+        pr_number=42, pr_url=None, repo_github="acme/api", repo_name="api",
+        issue_number=7, issue_title="Fix login", issue_body="",
+        branch="issue-7", worker_machine="laptop", same_as_worker=False,
+        reviews_cfg=ReviewsConfig(enabled=True), repo_claude_md=None,
+        provider_same_as_worker=True, review_provider="opencode",
+    )
+    assert "same provider" in briefing
+    assert "opencode" in briefing
+    assert "shared model family" in briefing
+    # Machine co-location note must stay independent of the provider one.
+    assert "running on the same machine as the worker" not in briefing
+
+
+def test_briefing_no_provider_note_when_providers_differ() -> None:
+    """Sanity companion to the above: no co-location note when the reviewer's
+    provider is NOT the same as the worker's."""
+    briefing = build_review_briefing(
+        pr_number=42, pr_url=None, repo_github="acme/api", repo_name="api",
+        issue_number=7, issue_title="Fix login", issue_body="",
+        branch="issue-7", worker_machine="laptop", same_as_worker=False,
+        reviews_cfg=ReviewsConfig(enabled=True), repo_claude_md=None,
+        provider_same_as_worker=False, review_provider="claude",
+    )
+    assert "same provider" not in briefing
 
 
 def test_briefing_requires_the_three_finding_sections() -> None:
@@ -1131,6 +1229,109 @@ def test_dispatch_review_sends_to_different_machine_and_appends_to_board(
     assert payload["review_target"] == "42"
     assert payload["repo_path"] == "/srv/api"  # reviewer's local path
     assert "# Project rules" in payload["briefing"]
+
+
+def _opencode_repo_config(*, reviews_provider: str | None) -> Config:
+    """A repo pinned to `provider: opencode`, with a distinctly-named
+    claude-type provider (`review-claude`) also registered, so a test can
+    tell "the review's own provider" apart from both `repo.provider` and
+    the bare implicit `"claude"` default by name alone."""
+    repo = Repo(
+        name="api", github="acme/api", depends_on=[], default_branch="main",
+        provider="opencode",
+    )
+    return Config(
+        repos=[repo],
+        machines=[
+            Machine(
+                name="laptop", host="laptop.tail",
+                capabilities=["python", "provider:opencode"], repos=["api"],
+                repo_paths={"api": "/work/api"},
+            ),
+            Machine(
+                name="server", host="server.tail",
+                capabilities=["python", "provider:opencode"], repos=["api"],
+                repo_paths={"api": "/srv/api"},
+            ),
+        ],
+        reviews=ReviewsConfig(
+            enabled=True, auto_dispatch=True, provider=reviews_provider,
+        ),
+        providers=ProvidersConfig(
+            definitions={
+                "claude": ProviderDef(type="claude"),
+                "opencode": ProviderDef(type="opencode"),
+                "review-claude": ProviderDef(type="claude"),
+            },
+        ),
+    )
+
+
+def test_dispatch_review_uses_reviews_provider_over_repo_provider(
+) -> None:
+    """#1811 acceptance: `reviews.provider` set to a claude-type provider on
+    a repo pinned to an opencode-type provider (`repo.provider="opencode"`)
+    dispatches the review through the named claude-type provider, NOT
+    through opencode — the whole point of #1811 (worker on opencode,
+    reviewer on claude, zero shared model family). Must fail against
+    today's code, where the review guard always resolves `repo.provider`
+    (there is no way to override it) and the wire payload never even
+    carries a "provider" key for reviews at all."""
+    cfg = _opencode_repo_config(reviews_provider="review-claude")
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    client = _FakeHTTPClient({"id": "review-claude-1"})
+
+    result = dispatch_review(
+        completed, board, cfg,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {
+            "number": 42, "url": "https://github.com/acme/api/pull/42",
+            "existed": True,
+        },
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+        remote_branch_checker=lambda repo, branch: True,
+    )
+
+    assert result is not None
+    # Recorded on the Assignment exactly like coord.dispatch.dispatch()
+    # records the work provider — not silently dropped.
+    assert result.provider_name == "review-claude"
+
+    assert len(client.calls) == 1
+    _url, payload = client.calls[0]
+    assert payload["provider"] == "review-claude"
+
+
+def test_dispatch_review_unset_provider_inherits_repo_provider(
+) -> None:
+    """#1811 regression: leaving `reviews.provider` unset must inherit
+    `repo.provider` exactly as it did before this field existed — the
+    behavior of every existing deployment (none of which set the brand-new
+    key) must not change."""
+    cfg = _opencode_repo_config(reviews_provider=None)
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    client = _FakeHTTPClient({"id": "review-opencode-1"})
+
+    result = dispatch_review(
+        completed, board, cfg,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {
+            "number": 42, "url": "https://github.com/acme/api/pull/42",
+            "existed": True,
+        },
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+        remote_branch_checker=lambda repo, branch: True,
+    )
+
+    assert result is not None
+    assert result.provider_name == "opencode"
+    assert len(client.calls) == 1
+    _url, payload = client.calls[0]
+    assert payload["provider"] == "opencode"
 
 
 def test_dispatch_review_uses_feature_branch_for_opted_in_milestone(
