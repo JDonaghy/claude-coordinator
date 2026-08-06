@@ -2187,4 +2187,47 @@ def reconcile_board_merges(
             a.review_state = "pending"
             state.reset_wedged_test_author_review(a.assignment_id or "")
 
+    # (g) #1767 — drop drive escalations whose issue resolved out of band.
+    #
+    # `coord merge`'s success path (merge_queue.process()) dismisses the
+    # escalation for the issue it just merged, but that only covers work
+    # that landed *through* `coord merge`. Work merged directly on GitHub,
+    # or closed without merging, never goes through that path — its
+    # escalation (if any) would otherwise linger forever, since nothing
+    # else ever clears one short of `coord escalate dismiss`. Measured on
+    # the live board (#1767): four open escalations, three already stale —
+    # PRs merged and issues closed days earlier, with the escalation the
+    # only record that hadn't caught up.
+    #
+    # Conservative like every sweep above: only acts when `work_is_terminal`
+    # confirms the issue closed or its PR merged, reusing `terminal_cache`
+    # and the `work_branch_for` lookup built for sweep (e) so this costs no
+    # extra `gh` calls for issues already resolved elsewhere in this run.
+    # An escalation on a still-open, still-blocked issue is never touched,
+    # no matter how old — age is not the signal, resolved state is.
+    for _entry in state.list_drive_escalations(repo):
+        _esc_repo = _entry.get("repo_name")
+        _esc_issue = _entry.get("issue_number")
+        if _esc_repo is None or _esc_issue is None:
+            continue
+        if issue is not None and _esc_issue != issue:
+            continue
+        _repo_cfg = config.repo(_esc_repo)
+        if _repo_cfg is None:
+            # Also filters out the drive-queue's own synthetic alert entry
+            # (repo_name="(drive-queue)"), which isn't a real GitHub issue.
+            continue
+        _branch = work_branch_for.get((_esc_repo, _esc_issue))
+        if not github_ops.work_is_terminal(
+            _repo_cfg.github, _esc_issue, _branch, cache=terminal_cache
+        ):
+            continue
+        actions.append(
+            f"dismiss escalation {_esc_repo} #{_esc_issue}: "
+            "issue resolved out of band (#1767)"
+            + (" [dry-run]" if dry_run else "")
+        )
+        if not dry_run:
+            state.dismiss_drive_escalation(_esc_repo, _esc_issue)
+
     return actions

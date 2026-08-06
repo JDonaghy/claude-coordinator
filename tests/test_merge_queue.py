@@ -375,6 +375,71 @@ class TestProcess:
         merged = [e for e in events if e.kind == "merged"]
         assert merged and "left open" in merged[0].message
 
+    def test_successful_merge_dismisses_the_drive_escalation(self, coord_db) -> None:
+        # #1767: a merge landing through `coord merge` is exactly the kind
+        # of resolution that should clear a stale drive escalation for the
+        # same issue — nothing else in the pipeline ever does.
+        from coord import state
+
+        state._record_drive_escalation_local(
+            "api", 1,
+            stage="merge",
+            reason="merge: BLOCKED — smoke_required",
+            gate_readings="smoke=missing",
+            proposed_command="coord merge --only a",
+        )
+        items = [_q("a")]  # repo="api", issue_number=1 per the `_q` helper
+        process(items, FakeGh())
+
+        assert items[0].state == MERGED
+        assert state._get_drive_escalation_local("api", 1) is None
+
+    def test_successful_merge_with_no_escalation_is_a_noop(self, coord_db) -> None:
+        # #1767: dismissing must be safe (and silent) when there was never
+        # an escalation on file — no existence check should be required.
+        from coord import state
+
+        items = [_q("a")]
+        process(items, FakeGh())
+
+        assert items[0].state == MERGED
+        assert state._get_drive_escalation_local("api", 1) is None
+
+    def test_dry_run_never_dismisses_the_drive_escalation(self, coord_db) -> None:
+        # #1767: a dry-run preview never reaches the real merge path, so it
+        # must not touch the escalation record either.
+        from coord import state
+
+        state._record_drive_escalation_local(
+            "api", 1,
+            stage="merge",
+            reason="merge: BLOCKED — smoke_required",
+            gate_readings="smoke=missing",
+            proposed_command="coord merge --only a",
+        )
+        items = [_q("a")]
+        process(items, FakeGh(), dry_run=True)
+
+        assert state._get_drive_escalation_local("api", 1) is not None
+
+    def test_unrelated_escalation_is_untouched_by_a_merge(self, coord_db) -> None:
+        # #1767: dismissal is scoped to the exact (repo, issue) that merged —
+        # an escalation for a different issue must survive.
+        from coord import state
+
+        state._record_drive_escalation_local(
+            "api", 999,
+            stage="merge",
+            reason="merge: BLOCKED — smoke_required",
+            gate_readings="smoke=missing",
+            proposed_command="coord merge --only other",
+        )
+        items = [_q("a")]  # issue_number=1, distinct from the seeded #999
+        process(items, FakeGh())
+
+        assert items[0].state == MERGED
+        assert state._get_drive_escalation_local("api", 999) is not None
+
     def test_briefing_body_uses_refs_for_mock_author(self) -> None:
         # #1077: the fallback create_pr body (when no PR was opened upstream)
         # must use the non-closing "Refs #N" for mock-author entries.

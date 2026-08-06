@@ -29,7 +29,7 @@ from coord.ci_store import (
 from coord.db import get_connection
 from coord.models import CLOSES_ISSUE_TYPES, WORK_LIKE_TYPES, Assignment
 from coord.pr_body_lint import downgrade_closing_keywords, find_closing_references
-from coord.state import COORD_DIR
+from coord.state import COORD_DIR, dismiss_drive_escalation
 
 _log = logging.getLogger(__name__)
 
@@ -3732,6 +3732,17 @@ def process(
             if ok:
                 entry.state = MERGED
                 entry.error = None
+                # #1767: the condition that produced a drive escalation for
+                # this issue (if any) just resolved through the normal
+                # pipeline — clear it so `coord escalate list` doesn't
+                # accumulate phantoms for merged work. Idempotent and a
+                # no-op when there's nothing on file; routes through
+                # `coord.state` so it works (via the daemon) from a thin
+                # client rather than writing the local DB directly.
+                try:
+                    dismiss_drive_escalation(entry.repo_name, entry.issue_number)
+                except Exception:  # noqa: BLE001 — never fail a merge on this
+                    pass
                 # #1213: audit any gate bypassed by a per-issue label override
                 # BEFORE announcing the merge, so the "merged" event message
                 # already carries the bypass note — a bypass is never silent.
