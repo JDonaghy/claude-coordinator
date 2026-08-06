@@ -520,6 +520,63 @@ def test_a_drive_genuinely_dead_past_the_window_still_retries(cli, seed, launche
     assert entry["attempts"] == 1
 
 
+def test_a_dead_drives_own_exit_reason_reaches_the_queue_row(cli, seed, launches):
+    """#1845/#1844, end-to-end: when the drive itself recorded why it
+    stopped — a `drive_exited` audit row written before `coord drive`
+    returned — the tick must carry THAT reason forward instead of
+    overwriting it with "drive session died". The audit row is exactly
+    what `coord.drive.Driver.run` already writes on every exit; the tick
+    just wasn't reading it.
+
+    Checked on the retry tick's OUTPUT (a successful relaunch blanks
+    `last_reason` back to "" a moment later, same as any other retry — see
+    `test_back_to_back_ticks_launch_exactly_one_drive`) and on the FINAL
+    blocked row's `last_reason`, which is the one an operator actually goes
+    looking at afterwards.
+    """
+    from coord.audit import record_audit
+
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    cli("tick")
+
+    def _own_reason(n: int) -> str:
+        return (
+            f"drive exited for claude-coordinator#1762 (exit_code=1): "
+            f"merge attempted 3 times without landing (attempt {n})."
+        )
+
+    launched_at = queued(1762)["launched_at"]
+    _backdate(1762, DRIVE_STARTUP_GRACE_SECONDS + 60)
+    record_audit(
+        tier="business", category="drive", event_type="drive_exited",
+        actor="drive", summary=_own_reason(1), repo=REPO, issue=1762,
+        ts=launched_at + 5,
+    )
+    first_retry = cli("tick")
+    assert first_retry.exit_code == 0, first_retry.output
+    assert _own_reason(1) in first_retry.output
+    assert "died without landing the work" not in first_retry.output
+    assert queued(1762)["attempts"] == 1
+
+    launched_at = queued(1762)["launched_at"]
+    _backdate(1762, DRIVE_STARTUP_GRACE_SECONDS + 60)
+    record_audit(
+        tier="business", category="drive", event_type="drive_exited",
+        actor="drive", summary=_own_reason(2), repo=REPO, issue=1762,
+        ts=launched_at + 5,
+    )
+    second_retry = cli("tick")
+    assert second_retry.exit_code == 0, second_retry.output
+
+    entry = queued(1762)
+    assert entry["state"] == "blocked"
+    assert entry["attempts"] == 2
+    assert _own_reason(2) in entry["last_reason"]
+    assert "died without landing the work" not in entry["last_reason"]
+    assert state._get_drive_escalation_local(REPO, 1762) is not None
+
+
 def test_a_repeatedly_dead_drive_still_reaches_blocked_and_escalates(
     cli, seed, launches
 ):

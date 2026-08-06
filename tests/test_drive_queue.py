@@ -573,6 +573,70 @@ def test_max_attempts_is_injectable():
     assert plan.reconciles[0].outcome == "exhausted"
 
 
+# ── plan_tick: the drive's own exit reason wins over "died" (#1845/#1844) ────
+#
+# `_reconcile_running`'s death branch ("no session, no active work, nothing
+# landed") also matches a drive that exited DELIBERATELY — a clean
+# `exit_code=1` after diagnosing its own blocker (a merge-queue race in
+# #1845, an oracle refusal in #1844) — and used to overwrite that already-
+# recorded diagnosis with a synthesised "drive session died" every time. The
+# shell reads the drive's own `drive_exited` audit summary and hands it in as
+# `exit_reasons`; these tests pin what `_reconcile_running` does with it.
+
+
+def test_a_dead_drives_own_exit_reason_replaces_the_synthesised_death():
+    """#1845: a drive that exited on its own diagnosis must have THAT
+    diagnosis carried forward as `last_reason`, not "drive session died"."""
+    entries = [entry(1650, position=3, state=STATE_RUNNING, attempts=0)]
+    own_reason = (
+        "drive exited for api#1650 (exit_code=1): merge attempted 3 times "
+        "without landing."
+    )
+    plan = plan_tick(
+        entries, board(), capacity=1,
+        exit_reasons={entry_key(REPO, 1650): own_reason},
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "retry"  # state transition is unchanged
+    assert own_reason in reconcile.reason
+    assert own_reason in reconcile.updates["last_reason"]
+    assert "drive session died" not in reconcile.reason
+
+
+def test_an_exhausted_drives_own_exit_reason_replaces_the_synthesised_death():
+    """Same fix, at the `exhausted` branch — no regression on retry exhausting
+    to `blocked` (the path that recovered #1845's overnight incidents)."""
+    entries = [
+        entry(1650, state=STATE_RUNNING, attempts=DEFAULT_MAX_ATTEMPTS - 1)
+    ]
+    own_reason = (
+        "drive exited for api#1650 (exit_code=1): a permanent refusal, not "
+        "a crash"
+    )
+    plan = plan_tick(
+        entries, board(), capacity=1,
+        exit_reasons={entry_key(REPO, 1650): own_reason},
+    )
+    assert plan.reconciles[0].outcome == "exhausted"
+    assert own_reason in plan.blocked[0].reason
+    assert own_reason in plan.blocked[0].updates["last_reason"]
+    assert "drive session died" not in plan.blocked[0].reason
+    # The reason changed; the outcome — still exhausts, still blocks — did not.
+    assert plan.blocked[0].updates["state"] == STATE_BLOCKED
+    assert plan.blocked[0].updates["attempts"] == DEFAULT_MAX_ATTEMPTS
+
+
+def test_no_exit_reason_falls_back_to_the_synthesised_death_wording():
+    """No regression: a genuine crash (no `drive_exited` row, or the shell's
+    audit fetch came back empty) keeps the pre-#1845 wording exactly."""
+    entries = [entry(1650, position=3, state=STATE_RUNNING, attempts=0)]
+    plan = plan_tick(entries, board(), capacity=1, exit_reasons={})
+    assert (
+        "drive session died without landing the work"
+        in plan.reconciles[0].reason
+    )
+
+
 # ── plan_tick: the startup grace window (#1794) ──────────────────────────────
 #
 # 2026-08-03, the first unattended run of the #1756 timer: a tick 40s after a

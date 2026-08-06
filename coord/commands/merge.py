@@ -1202,6 +1202,31 @@ def merge(
         only_queue = mq.load_queue()
         only_entry = mq.resolve_entry_key(only_queue, only_assignment)
         if only_entry is None:
+            # #1845: `--only` used to fail outright right here even when the
+            # addressed row is done, fully gated, and simply hasn't been
+            # through the auto-enqueue scan yet — `coord merge` (no --only)
+            # runs that scan on every invocation, but the surgical --only
+            # path went straight to the queue lookup and never triggered it.
+            # A drive's merge stage hits this race routinely: the work
+            # finishes moments before the daemon tick's own scan runs, and
+            # each `--only` attempt in that window used to burn one of the
+            # drive's few merge attempts on a false negative — see the
+            # overnight incident in #1845. `enqueue_approved_work` is the
+            # SAME scan `coord merge` (no --only) runs; when a matching
+            # board row exists and every gate already passes, run it inline
+            # and retry the resolution once before reporting failure.
+            _retry_board = load_board()
+            if _retry_board is not None:
+                _retry_rows = mq.resolve_board_work_key(_retry_board, only_assignment)
+                _retry_all_gated = bool(_retry_rows) and all(
+                    not mq.merge_gate_failures(a, cfg_only, _retry_board, gh_ops)
+                    for a in _retry_rows
+                )
+                if _retry_all_gated:
+                    mq.enqueue_approved_work(cfg_only, _retry_board)
+                    only_queue = mq.load_queue()
+                    only_entry = mq.resolve_entry_key(only_queue, only_assignment)
+        if only_entry is None:
             # #1695: the old message said only "tried assignment_id,
             # repo#issue, issue number, and branch name", which reads as a
             # key-lookup problem and sends the operator hunting for a

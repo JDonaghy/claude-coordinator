@@ -796,6 +796,7 @@ def _reconcile_running(
     now: float | None = None,
     grace_seconds: float = DRIVE_STARTUP_GRACE_SECONDS,
     local_host: str | None = None,
+    exit_reasons: Mapping[str, str] | None = None,
 ) -> tuple[Reconcile, Blocked | None]:
     """Resolve one ``running`` entry against the board.
 
@@ -829,6 +830,22 @@ def _reconcile_running(
     posture as ``now=None`` disabling the grace window).  An entry with no
     recorded ``launch_host`` (predates #1870, or a hand-edited row) is always
     treated as launched here, so it degrades to today's behaviour exactly.
+
+    #1845/#1844: "no session, no active work, nothing landed" is also exactly
+    what a drive that exited *deliberately* — a clean ``exit_code=1`` after it
+    diagnosed its own blocker and gave up — looks like from here. The drive
+    already wrote the true reason to the audit trail (``drive_exited``,
+    ``coord.drive.Driver._drive_exit_summary``); nothing downstream of that
+    write used to read it, so every one of those orderly exits was reported
+    as "drive session died" — a crash where there was none. *exit_reasons*
+    (keyed by :attr:`QueueEntry.key`, fetched by the shell from
+    :func:`coord.audit.query_audit_log` for the current run only — never a
+    stale reason from a prior attempt on the same entry) is that write,
+    threaded through as data so this function stays pure. When present it
+    replaces the synthesised "drive session died" wording below; the state
+    transition (``retry`` vs ``exhausted``) is unchanged either way — a
+    genuine reason does not change whether the entry gets another attempt,
+    only what the operator is told about the one that just ended.
     """
     facts = board.facts(entry.key)
 
@@ -922,19 +939,32 @@ def _reconcile_running(
         )
 
     # Past the grace window (or with no launch stamp to measure), with no
-    # session, no active work and nothing landed: death is the only remaining
-    # explanation.  The age is quoted so a journal reader can tell a genuine
-    # death from a grace window that was set too short.
+    # session, no active work and nothing landed: this entry did not land the
+    # work by any board-visible path. #1845/#1844: that no longer means
+    # "died" — the drive may have exited deliberately, with its own reason
+    # already on the audit trail. Prefer that reason when one was recorded
+    # for this run; fall back to the synthesised wording (with the launch age
+    # quoted, so a journal reader can tell a genuine death from a grace
+    # window that was set too short) when it wasn't — e.g. no audit row at
+    # all, a crash that never reached the `drive_exited` write, or a shell
+    # that failed to fetch it.
     since = _startup_age(entry, now)
     launched = f", launched {since:.0f}s ago" if since is not None else ""
+    own_reason = (exit_reasons or {}).get(entry.key)
 
     attempts = entry.attempts + 1
     if attempts < max_attempts:
-        reason = (
-            f"drive session died without landing the work"
-            f"{launched} (attempt {attempts}/{max_attempts}) — requeued at "
-            f"position {entry.position}"
-        )
+        if own_reason:
+            reason = (
+                f"{own_reason} (attempt {attempts}/{max_attempts}) — "
+                f"requeued at position {entry.position}"
+            )
+        else:
+            reason = (
+                f"drive session died without landing the work"
+                f"{launched} (attempt {attempts}/{max_attempts}) — requeued at "
+                f"position {entry.position}"
+            )
         return (
             Reconcile(
                 entry.key,
@@ -951,10 +981,15 @@ def _reconcile_running(
             None,
         )
 
-    reason = (
-        f"drive session died without landing the work"
-        f"{launched} {attempts}/{max_attempts} times — giving up"
-    )
+    if own_reason:
+        reason = (
+            f"{own_reason} ({attempts}/{max_attempts} attempts) — giving up"
+        )
+    else:
+        reason = (
+            f"drive session died without landing the work"
+            f"{launched} {attempts}/{max_attempts} times — giving up"
+        )
     return (
         Reconcile(entry.key, "exhausted", reason, occupies=False),
         Blocked(
@@ -1134,6 +1169,7 @@ def plan_tick(
     now: float | None = None,
     grace_seconds: float = DRIVE_STARTUP_GRACE_SECONDS,
     local_host: str | None = None,
+    exit_reasons: Mapping[str, str] | None = None,
 ) -> TickPlan:
     """Decide one tick.  Pure; the caller executes the returned plan.
 
@@ -1144,6 +1180,13 @@ def plan_tick(
     *probes* maps an entry key to the :class:`ProbeResult` the shell got from
     running that entry's ``resume_when`` (see :func:`pending_probe_targets`);
     an absent key simply means no probe ran.
+
+    *exit_reasons* maps a ``running`` entry's key to the drive's own
+    ``drive_exited`` audit summary for THIS launch (#1845/#1844) — see
+    :func:`_reconcile_running` for what it changes (wording only, never the
+    ``retry``/``exhausted`` decision) and why "for this launch" matters (a
+    stale reason from a prior attempt on the same entry must never be
+    replayed as if it explained the current one).
 
     *now* is the shell's ``time.time()``, passed in rather than read here (see
     the module docstring).  It powers #1794's startup grace window on both
@@ -1221,6 +1264,7 @@ def plan_tick(
             now=now,
             grace_seconds=grace_seconds,
             local_host=local_host,
+            exit_reasons=exit_reasons,
         )
         reconciles.append(reconcile)
         if reconcile.occupies:
