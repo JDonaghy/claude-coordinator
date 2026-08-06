@@ -465,7 +465,7 @@ fn milestone_node_badge(state: &NodeState, theme: &quadraui::Theme) -> (&'static
         NodeState::Done => ("done", theme.badge_passed),
         NodeState::InFlight => ("in-flight", theme.link_fg),
         NodeState::Ready => ("ready", theme.accent_fg),
-        NodeState::Blocked(_) => ("blocked", theme.badge_request_changes),
+        NodeState::Blocked(_) => ("blocked", theme.badge_warning),
     }
 }
 

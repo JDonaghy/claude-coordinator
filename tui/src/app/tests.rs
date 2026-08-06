@@ -25188,8 +25188,8 @@
         a.review_verdict = Some("approve".to_string());
         let g = make_issue_group("done", vec![a]);
         let badges = kanban_stage_badges(&g);
-        let review = badges.iter().find(|(s, _)| *s == Stage::Review).unwrap();
-        assert_eq!(review.1, BadgeStatus::Passed,
+        let review = badges.iter().find(|b| b.label == "R").unwrap();
+        assert_eq!(review.status, BadgeStatus::Passed,
             "\"approve\" verdict must yield Passed badge");
     }
 
@@ -25199,9 +25199,9 @@
         a.review_verdict = Some("request-changes".to_string());
         let g = make_issue_group("done", vec![a]);
         let badges = kanban_stage_badges(&g);
-        let review = badges.iter().find(|(s, _)| *s == Stage::Review).unwrap();
-        assert_eq!(review.1, BadgeStatus::RequestChanges,
-            "\"request-changes\" verdict must yield RequestChanges badge");
+        let review = badges.iter().find(|b| b.label == "R").unwrap();
+        assert_eq!(review.status, BadgeStatus::Warning,
+            "\"request-changes\" verdict must yield Warning badge");
     }
 
     /// The GitHub REST names must NOT match the coord-native arms; they should
@@ -25212,8 +25212,8 @@
         a.review_verdict = Some("approved".to_string()); // wrong/GitHub name
         let g = make_issue_group("done", vec![a]);
         let badges = kanban_stage_badges(&g);
-        let review = badges.iter().find(|(s, _)| *s == Stage::Review).unwrap();
-        assert_eq!(review.1, BadgeStatus::Running,
+        let review = badges.iter().find(|b| b.label == "R").unwrap();
+        assert_eq!(review.status, BadgeStatus::Running,
             "GitHub-style \"approved\" must not match the coord-native arm");
     }
 
@@ -25222,8 +25222,8 @@
         let a = make_assignment_typed("running", 1, "repo-a", Some("work"));
         let g = make_issue_group("running", vec![a]);
         let badges = kanban_stage_badges(&g);
-        let review = badges.iter().find(|(s, _)| *s == Stage::Review).unwrap();
-        assert_eq!(review.1, BadgeStatus::Pending,
+        let review = badges.iter().find(|b| b.label == "R").unwrap();
+        assert_eq!(review.status, BadgeStatus::Pending,
             "no review_verdict must yield Pending badge");
     }
 
@@ -25232,8 +25232,8 @@
         let a = make_assignment_typed("running", 1, "repo-a", Some("work"));
         let g = make_issue_group("running", vec![a]);
         let badges = kanban_stage_badges(&g);
-        let work = badges.iter().find(|(s, _)| *s == Stage::Work).unwrap();
-        assert_eq!(work.1, BadgeStatus::Running,
+        let work = badges.iter().find(|b| b.label == "W").unwrap();
+        assert_eq!(work.status, BadgeStatus::Running,
             "running assignment must yield Running work badge");
     }
 
@@ -25241,8 +25241,8 @@
     fn kanban_stage_badges_merge_status_when_merged() {
         let g = make_issue_group("merged", vec![]);
         let badges = kanban_stage_badges(&g);
-        let merge = badges.iter().find(|(s, _)| *s == Stage::Merge).unwrap();
-        assert_eq!(merge.1, BadgeStatus::Passed,
+        let merge = badges.iter().find(|b| b.label == "M").unwrap();
+        assert_eq!(merge.status, BadgeStatus::Passed,
             "merged status must yield Passed merge badge");
     }
 
@@ -32004,7 +32004,7 @@ Milestone tracking issue.
     }
 
     /// #1270 TuiDriver black-box: the Kanban board marks an epic card and
-    /// attributes its children to it via `decision_hint`, instead of every
+    /// attributes its children to it via the card `hint`, instead of every
     /// issue rendering as an unlabelled loose card.
     ///
     /// Reuses `make_board_epic_nesting_app`, where child #201 carries a
@@ -32043,7 +32043,7 @@ Milestone tracking issue.
         assert_eq!(
             screen.matches("part of epic #200").count(),
             2,
-            "both children must be attributed to epic #200 via decision_hint, regardless of column:\n{screen}",
+            "both children must be attributed to epic #200 via the card hint, regardless of column:\n{screen}",
         );
         // The unrelated plain issue #205 has neither marker.
         assert!(

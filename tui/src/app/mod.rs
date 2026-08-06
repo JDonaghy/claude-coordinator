@@ -66,8 +66,7 @@ use quadraui::{
     ShellConfig, ShellContext, SidebarPanel, SidebarPanelHit, StageStatus, StatusBar,
     StatusBarSegment, Scrollbar, StyledSpan, StyledText, TabBar, TabItem, TextRegion, Toolbar,
     ToolbarButton, ToolbarHoverTracker, ToolbarItemMeasure, TreeRow, UiEvent, WidgetId,
-    BadgeStatus, BoardCard, BoardColumn, BoardHit, BoardLayout, BoardModel, MoveDir,
-    Stage,
+    BadgeStatus, BoardCard, BoardColumn, BoardHit, BoardLayout, BoardModel, CardBadge, MoveDir,
     // #1094: Audit panel row list — first `DataTable` use in coord-tui.
     Column, ColumnAlign, ColumnWidth, DataRow, DataTable, DataTableHit, DataTableLayout,
     // #1116: Usage panel grid/drill sort-arrow indicator.
@@ -3356,7 +3355,12 @@ fn key_to_binding_str(key: &Key) -> String {
 ///
 /// Returns a compact badge row: Plan → Work → Test → Review → Merge.
 /// Status is inferred from the group's status_summary and assignments.
-fn kanban_stage_badges(g: &IssueGroup) -> Vec<(Stage, BadgeStatus)> {
+///
+/// quadraui#476 genericized the Board primitive: the old fixed `Stage` enum
+/// (which rendered as the single chars `P W T R M`) is gone, and badge
+/// vocabulary is now host-supplied via [`CardBadge`]. The single-char labels
+/// below preserve the previous on-screen rendering exactly.
+fn kanban_stage_badges(g: &IssueGroup) -> Vec<CardBadge> {
     // Determine the dominant assignment status.
     let has_running = g.assignments.iter().any(|a| a.status == "running");
     let has_failed = g.assignments.iter().any(|a| a.status == "failed");
@@ -3380,7 +3384,9 @@ fn kanban_stage_badges(g: &IssueGroup) -> Vec<(Stage, BadgeStatus)> {
             .last();
         match verdict {
             Some("approve") => BadgeStatus::Passed,
-            Some("request-changes") => BadgeStatus::RequestChanges,
+            // quadraui#476 renamed `RequestChanges` -> the generic `Warning`
+            // ("needs attention before it can proceed"), same ↩ glyph + tint.
+            Some("request-changes") => BadgeStatus::Warning,
             Some(_) => BadgeStatus::Running,
             None => BadgeStatus::Pending,
         }
@@ -3394,9 +3400,9 @@ fn kanban_stage_badges(g: &IssueGroup) -> Vec<(Stage, BadgeStatus)> {
     };
 
     vec![
-        (Stage::Work, work_status),
-        (Stage::Review, review_status),
-        (Stage::Merge, merge_status),
+        CardBadge { label: "W".into(), status: work_status },
+        CardBadge { label: "R".into(), status: review_status },
+        CardBadge { label: "M".into(), status: merge_status },
     ]
 }
 
@@ -6074,7 +6080,7 @@ impl CoordApp {
         // as before) — an epic and its children can genuinely land in
         // different columns. What changes is *labelling*: the epic card
         // gets the same "◆EPIC" marker the Pipeline/Board panel use, and
-        // every child card gets a `decision_hint` naming its parent epic, so
+        // every child card gets a `hint` naming its parent epic, so
         // the two no longer read as unrelated loose cards scattered across
         // columns with zero visual link between them.
         let epic_parents = self.board_epic_child_parents();
@@ -6082,25 +6088,20 @@ impl CoordApp {
         for (repo, groups) in &self.board_issues_cache {
             for g in groups {
                 let card_id = WidgetId::new(&format!("card:{}:{}", repo, g.issue_number));
-                let stage_badges = kanban_stage_badges(g);
-                let machine = g.assignments.iter()
-                    .find(|a| a.status == "running")
-                    .map(|a| a.machine.clone());
+                let badges = kanban_stage_badges(g);
                 let mut labels = vec![repo.clone()];
                 if labels_carry_epic_label(&g.labels) {
                     labels.push("◆EPIC".to_string());
                 }
-                let decision_hint = epic_parents
+                let hint = epic_parents
                     .get(&(repo.clone(), g.issue_number))
                     .map(|epic_number| format!("↳ part of epic #{epic_number}"));
                 let card = BoardCard {
                     id: card_id,
                     title: format!("#{} {}", g.issue_number, g.issue_title),
                     labels,
-                    stage_badges,
-                    assignee: None,
-                    machine,
-                    decision_hint,
+                    badges,
+                    hint,
                 };
                 match g.lifecycle_section() {
                     "in-flight" => inflight_cards.push(card),
