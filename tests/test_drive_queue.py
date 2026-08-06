@@ -738,6 +738,175 @@ def test_the_default_window_clears_the_measured_startup_time():
     assert DRIVE_STARTUP_GRACE_SECONDS >= 300.0
 
 
+# ── plan_tick: the cross-host guard (#1870) ──────────────────────────────────
+#
+# 2026-08-06: two live `coord drive` sessions on the same issue at once. One
+# was launched by hand on `elitebook` and was 47 minutes (2841s) into a
+# healthy run — `work=done`, `test=running`. The other was a duplicate the
+# TIMER's own tick launched on `dellserver` after concluding, from ITS local
+# (and therefore blind) tmux read, that the elitebook session had "died
+# without landing the work". #1794's grace window does not help here: the
+# session was three orders of magnitude past any plausible grace and still
+# invisible — the miss is not transient, it is structural, because liveness
+# is always a local `tmux list-sessions` and the queue is fleet-global.
+
+
+def test_a_drive_launched_on_another_host_is_unknown_not_dead():
+    """THE regression for #1870 — the elitebook/dellserver duplicate launch."""
+    entries = [
+        running_since(
+            1811,
+            DRIVE_STARTUP_GRACE_SECONDS + 2841.0,
+            position=0,
+            attempts=0,
+            launch_host="elitebook",
+        )
+    ]
+    plan = plan_tick(
+        entries, board(), capacity=1, now=NOW, local_host="dellserver"
+    )
+
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "unknown"
+    assert reconcile.occupies is True
+    # The three things the incident got wrong, asserted one by one — the same
+    # shape as #1794's own regression test above.
+    assert "state" not in reconcile.updates  # stays `running`
+    assert "attempts" not in reconcile.updates  # no attempt spent
+    assert plan.launch is None  # no duplicate drive
+    assert plan.occupied == 1
+    assert "elitebook" in reconcile.reason
+    assert "dellserver" in reconcile.reason
+
+
+def test_a_cross_host_entry_is_never_relaunched_even_with_free_capacity():
+    """AC: no second drive for an entry with a live session on another host."""
+    entries = [
+        running_since(
+            1811,
+            DRIVE_STARTUP_GRACE_SECONDS + 100.0,
+            position=0,
+            launch_host="elitebook",
+        ),
+        entry(1812, position=1),
+    ]
+    plan = plan_tick(
+        entries, board(open_=(1812,)), capacity=5, now=NOW, local_host="dellserver"
+    )
+    # Free capacity and a fully eligible successor — #1812 launches, #1811
+    # does not get a second drive.
+    assert plan.launch is not None and plan.launch.issue == 1812
+    assert plan.occupied == 1
+
+
+def test_a_same_host_entry_still_reconciles_normally():
+    """The guard is scoped to a MISMATCH — this host's own launch is unaffected."""
+    entries = [
+        running_since(
+            1811,
+            DRIVE_STARTUP_GRACE_SECONDS + 1.0,
+            attempts=0,
+            launch_host="dellserver",
+        )
+    ]
+    plan = plan_tick(
+        entries, board(), capacity=1, now=NOW, local_host="dellserver"
+    )
+    assert plan.reconciles[0].outcome == "retry"
+    assert plan.reconciles[0].updates["attempts"] == 1
+
+
+def test_the_host_match_is_case_insensitive():
+    entries = [
+        running_since(
+            1811,
+            DRIVE_STARTUP_GRACE_SECONDS + 1.0,
+            launch_host="DellServer",
+        )
+    ]
+    plan = plan_tick(
+        entries, board(), capacity=1, now=NOW, local_host="dellserver"
+    )
+    assert plan.reconciles[0].outcome == "retry"
+
+
+def test_an_entry_with_no_recorded_launch_host_keeps_the_pre_1870_behaviour():
+    """AC: entries predating the column (or hand-edited) behave exactly as today."""
+    entries = [
+        running_since(1811, DRIVE_STARTUP_GRACE_SECONDS + 1.0, attempts=0)
+    ]
+    assert entries[0].launch_host == ""
+    plan = plan_tick(
+        entries, board(), capacity=1, now=NOW, local_host="dellserver"
+    )
+    assert plan.reconciles[0].outcome == "retry"
+
+
+def test_omitting_local_host_disables_the_cross_host_check_entirely():
+    """`local_host=None` is the pure-logic caller's opt-out, like `now=None`."""
+    entries = [
+        running_since(
+            1811,
+            DRIVE_STARTUP_GRACE_SECONDS + 1.0,
+            launch_host="elitebook",
+        )
+    ]
+    plan = plan_tick(entries, board(), capacity=1, now=NOW)
+    assert plan.reconciles[0].outcome == "retry"
+
+
+def test_a_live_session_still_wins_over_a_host_mismatch():
+    """A real positive signal always outranks the cross-host guard."""
+    entries = [running_since(1811, 5.0, launch_host="elitebook")]
+    plan = plan_tick(
+        entries,
+        board(sessions=(1811,)),
+        capacity=1,
+        now=NOW,
+        local_host="dellserver",
+    )
+    assert plan.reconciles[0].outcome == "alive"
+
+
+def test_active_work_still_wins_over_a_host_mismatch():
+    """#1660's `held` is a board-global fact; it must not be shadowed by #1870."""
+    entries = [running_since(1811, 5.0, launch_host="elitebook")]
+    plan = plan_tick(
+        entries,
+        board(active=(1811,)),
+        capacity=1,
+        now=NOW,
+        local_host="dellserver",
+    )
+    assert plan.reconciles[0].outcome == "held"
+
+
+def test_landed_still_wins_over_a_host_mismatch():
+    entries = [running_since(1811, 5.0, launch_host="elitebook")]
+    plan = plan_tick(
+        entries,
+        board(merged=(1811,)),
+        capacity=1,
+        now=NOW,
+        local_host="dellserver",
+    )
+    assert plan.reconciles[0].outcome == "done"
+
+
+def test_a_cross_host_entry_holds_its_slot_against_the_rest_of_the_queue():
+    entries = [
+        running_since(1811, 5.0, position=0, launch_host="elitebook"),
+        entry(1812, position=1),
+    ]
+    plan = plan_tick(
+        entries, board(open_=(1812,)), capacity=1, now=NOW, local_host="dellserver"
+    )
+    assert plan.occupied == 1
+    assert plan.launch is None
+    # At capacity is the queue working, not a stall — no escalation.
+    assert plan.alert is None
+
+
 # ── rendering ────────────────────────────────────────────────────────────────
 
 
@@ -766,6 +935,29 @@ def test_render_plan_narrates_a_starting_drive_and_the_full_slot():
     )
     assert "reconcile claude-coordinator#1762: starting" in text
     assert "startup grace window (#1794)" in text
+    assert "no launch — at capacity (1/1 occupied)" in text
+    assert "retry" not in text
+
+
+def test_render_plan_narrates_a_cross_host_entry_as_unknown():
+    """#1870 was diagnosed from a journal too; the journal has to say it."""
+    entries = [
+        entry(
+            1811,
+            position=0,
+            state=STATE_RUNNING,
+            launched_at=NOW - (DRIVE_STARTUP_GRACE_SECONDS + 2841.0),
+            launch_host="elitebook",
+        ),
+    ]
+    text = "\n".join(
+        render_plan(
+            plan_tick(entries, board(), capacity=1, now=NOW, local_host="dellserver")
+        )
+    )
+    assert "reconcile claude-coordinator#1811: unknown" in text
+    assert "elitebook" in text
+    assert "not this host" in text
     assert "no launch — at capacity (1/1 occupied)" in text
     assert "retry" not in text
 

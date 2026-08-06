@@ -538,6 +538,109 @@ def test_a_repeatedly_dead_drive_still_reaches_blocked_and_escalates(
     assert state._get_drive_escalation_local(REPO, 1762) is not None
 
 
+# ── tick: the cross-host guard (#1870) ───────────────────────────────────────
+#
+# 2026-08-06: a drive launched by hand on `elitebook` was 47 minutes into a
+# healthy run when the timer's own tick, on `dellserver`, checked its LOCAL
+# tmux, found nothing, and launched a duplicate. `launch_host` is stamped at
+# launch time and compared against the ticking host's own identity before a
+# `running` entry is ever allowed to reconcile to `retry`.
+
+
+def test_tick_stamps_the_launching_hosts_identity(cli, seed, launches, monkeypatch):
+    monkeypatch.setattr("socket.gethostname", lambda: "dellserver")
+    seed(issues={1811: "open"})
+    cli("add", REPO, "1811")
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    assert queued(1811)["launch_host"] == "dellserver"
+
+
+def test_a_tick_on_a_different_host_never_reaps_a_healthy_remote_drive(
+    cli, seed, launches, monkeypatch
+):
+    """THE regression for #1870 — the elitebook/dellserver duplicate launch."""
+    monkeypatch.setattr("socket.gethostname", lambda: "elitebook")
+    seed(issues={1811: "open"})
+    cli("add", REPO, "1811")
+    cli("tick")
+    assert len(launches) == 1
+    assert queued(1811)["launch_host"] == "elitebook"
+    _backdate(1811, DRIVE_STARTUP_GRACE_SECONDS + 2841)
+
+    # The timer's own tick, on a DIFFERENT machine.
+    monkeypatch.setattr("socket.gethostname", lambda: "dellserver")
+    result = cli("tick")
+
+    assert result.exit_code == 0, result.output
+    assert "unknown" in result.output
+    assert "elitebook" in result.output
+    assert "died without landing the work" not in result.output
+    # No second drive, no consumed attempt, no escalation — a healthy remote
+    # drive must come out of this tick exactly as it went in.
+    assert len(launches) == 1, launches
+    entry = queued(1811)
+    assert entry["state"] == "running"
+    assert entry["attempts"] == 0
+    assert state._get_drive_escalation_local(REPO, 1811) is None
+    assert state._get_drive_escalation_local(QUEUE_ALERT_REPO, QUEUE_ALERT_ISSUE) is None
+
+
+def test_a_tick_on_the_launching_host_still_detects_a_genuine_death(
+    cli, seed, launches, monkeypatch
+):
+    """The guard must not swallow a REAL death on the entry's own host."""
+    monkeypatch.setattr("socket.gethostname", lambda: "dellserver")
+    seed(issues={1811: "open"})
+    cli("add", REPO, "1811")
+    cli("tick")
+    _backdate(1811, DRIVE_STARTUP_GRACE_SECONDS + 60)
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    assert "died without landing the work" in result.output
+    assert len(launches) == 2, launches
+    assert queued(1811)["attempts"] == 1
+
+
+def test_an_entry_launched_before_1870_keeps_the_pre_1870_behaviour(
+    cli, seed, launches, monkeypatch
+):
+    """A row with no recorded `launch_host` degrades to today's behaviour."""
+    monkeypatch.setattr("socket.gethostname", lambda: "dellserver")
+    seed(issues={1811: "open"})
+    cli("add", REPO, "1811")
+    state._update_drive_queue_entry_local(
+        REPO, 1811, state="running", launched_at=time.time()
+    )
+    assert queued(1811)["launch_host"] in (None, "")
+    _backdate(1811, DRIVE_STARTUP_GRACE_SECONDS + 60)
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    assert "died without landing the work" in result.output
+    assert queued(1811)["attempts"] == 1
+
+
+def test_group_help_no_longer_claims_bare_host_independence():
+    result = CliRunner().invoke(main, ["drive-queue", "--help"])
+    assert result.exit_code == 0, result.output
+    assert "safe to run at any time and from any machine that can reach" not in (
+        result.output
+    )
+    assert "1870" in result.output
+
+
+def test_tick_help_no_longer_claims_bare_host_independence():
+    result = CliRunner().invoke(main, ["drive-queue", "tick", "--help"])
+    assert result.exit_code == 0, result.output
+    assert "safe to run at any time and from any machine that can reach" not in (
+        result.output
+    )
+    assert "1870" in result.output
+
+
 def test_a_requeued_entry_is_never_relaunched_inside_the_window(
     cli, seed, launches
 ):

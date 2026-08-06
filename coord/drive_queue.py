@@ -261,6 +261,14 @@ class QueueEntry:
     last_reason: str = ""
     session_name: str = ""
     launched_at: float | None = None
+    # #1870: the short hostname of the machine whose tick launched THIS
+    # session — stamped alongside `session_name`/`launched_at` when the
+    # launch succeeds.  '' for a row predating this column or hand-flipped to
+    # `running`, which degrades to the pre-#1870 behaviour exactly (see
+    # `_reconcile_running`).  Liveness (`list_drive_sessions`) is always a
+    # LOCAL tmux read; this is what lets a tick tell "no session because it's
+    # dead" apart from "no session because it's not MY session to see".
+    launch_host: str = ""
     # #1757 deploy gate.  `hold_after`/`hold_reason`/`resume_when` are
     # operator-declared (written by `enqueue`); `hold_state`/`hold_probes` are
     # the tick's run state.
@@ -314,6 +322,7 @@ class QueueEntry:
             last_reason=str(row.get("last_reason") or ""),
             session_name=str(row.get("session_name") or ""),
             launched_at=None if launched_at is None else float(launched_at),
+            launch_host=str(row.get("launch_host") or ""),
             # SQLite hands `hold_after` back as 0/1; a JSON client may send a
             # real bool.  `bool(...)` accepts both and, for a row written
             # before #1757's migration ran, an absent key reads as False —
@@ -459,6 +468,10 @@ class Reconcile:
       not yet visible anywhere else (#1794).  Occupies; never a death.
     * ``held``      — session gone but work still ACTIVE on the board (the
       #1660 observer-deadline case).  Occupies; never a death.
+    * ``unknown``   — this entry's ``launch_host`` names a DIFFERENT machine
+      than the one running this tick (#1870).  Liveness is always a LOCAL
+      tmux read, so a foreign host's session is invisible here — that is not
+      evidence of anything.  Occupies; never a death, never a retry.
     * ``done``      — merged, or the issue closed.
     * ``retry``     — genuinely dead: no session, no active work, and past the
       startup grace window.  Costs one attempt.
@@ -782,6 +795,7 @@ def _reconcile_running(
     *,
     now: float | None = None,
     grace_seconds: float = DRIVE_STARTUP_GRACE_SECONDS,
+    local_host: str | None = None,
 ) -> tuple[Reconcile, Blocked | None]:
     """Resolve one ``running`` entry against the board.
 
@@ -794,13 +808,27 @@ def _reconcile_running(
       watching keep running on the fleet (#1660).  Such an entry has no tmux
       session and no merge yet — counting it as free is exactly the 2026-08-01
       incident, where five expired drives were each stacked on top of.
+    * ``unknown`` is #1870: ``board.live_sessions`` is always a LOCAL tmux
+      read, but the queue is fleet-global.  When *entry* was launched on a
+      DIFFERENT host than *local_host*, an absent local session proves
+      nothing — the drive may be 47 minutes into Test on the machine that
+      actually launched it.  Checked AFTER ``held`` (a real board signal
+      always wins) and BEFORE the grace window / death (neither of which may
+      run on evidence this tick cannot see).
     * ``starting`` is #1794: a drive that has been launched but has not yet
       registered a session reading OR put work on the board is not dead, it is
       young.  See :data:`DRIVE_STARTUP_GRACE_SECONDS`.
 
     ``retry`` is therefore reachable only when the session is absent, no work
-    is active, nothing landed, AND the launch is older than the grace window —
-    i.e. when death is the only remaining explanation.
+    is active, nothing landed, the launch host is this host (or unrecorded),
+    AND the launch is older than the grace window — i.e. when death is the
+    only remaining explanation.
+
+    *local_host* is the shell's identity for the machine THIS tick is running
+    on (``None`` disables the check entirely — the pre-#1870 behaviour, same
+    posture as ``now=None`` disabling the grace window).  An entry with no
+    recorded ``launch_host`` (predates #1870, or a hand-edited row) is always
+    treated as launched here, so it degrades to today's behaviour exactly.
     """
     facts = board.facts(entry.key)
 
@@ -838,6 +866,34 @@ def _reconcile_running(
                 updates={
                     "last_reason": "session gone, work still active on the board",
                 },
+            ),
+            None,
+        )
+
+    if (
+        local_host is not None
+        and entry.launch_host
+        and entry.launch_host.lower() != local_host.lower()
+    ):
+        # #1870.  This tick's tmux read is LOCAL; it cannot see a session on
+        # the host that actually launched this entry, so its absence here is
+        # not evidence of anything.  Fail-soft exactly like an unreachable
+        # probe would: occupy the slot, touch neither `state` nor `attempts`,
+        # and never relaunch — the same posture #1794 established for "tmux
+        # unavailable" / "no server running" / "timed out".
+        reason = (
+            f"drive was launched on {entry.launch_host!r}, not this host "
+            f"({local_host!r}) — liveness cannot be verified from here, so "
+            f"this is UNKNOWN, not dead (#1870); still occupying a slot, no "
+            f"attempt spent"
+        )
+        return (
+            Reconcile(
+                entry.key,
+                "unknown",
+                reason,
+                occupies=True,
+                updates={"last_reason": reason},
             ),
             None,
         )
@@ -1077,6 +1133,7 @@ def plan_tick(
     probes: Mapping[str, ProbeResult] | None = None,
     now: float | None = None,
     grace_seconds: float = DRIVE_STARTUP_GRACE_SECONDS,
+    local_host: str | None = None,
 ) -> TickPlan:
     """Decide one tick.  Pure; the caller executes the returned plan.
 
@@ -1095,6 +1152,14 @@ def plan_tick(
     launch is still that recent (step 4 below).  ``None`` disables the window
     entirely, which is the pre-#1794 behaviour — the production shell always
     passes a real clock.
+
+    *local_host* is the shell's identity for the machine THIS tick is running
+    on (#1870).  It powers the cross-host guard in :func:`_reconcile_running`:
+    an entry whose ``launch_host`` names a DIFFERENT machine reconciles to
+    ``unknown`` rather than ``retry``, because this tick's tmux read cannot
+    see that host at all.  ``None`` disables the check entirely, the
+    pre-#1870 behaviour — the production shell always passes its own
+    hostname.
 
     The algorithm, from #1754, plus #1757's step 2:
 
@@ -1150,7 +1215,12 @@ def plan_tick(
         if entry.state != STATE_RUNNING:
             continue
         reconcile, block = _reconcile_running(
-            entry, board, max_attempts, now=now, grace_seconds=grace_seconds
+            entry,
+            board,
+            max_attempts,
+            now=now,
+            grace_seconds=grace_seconds,
+            local_host=local_host,
         )
         reconciles.append(reconcile)
         if reconcile.occupies:

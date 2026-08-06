@@ -4578,7 +4578,7 @@ def _list_drive_escalations_local(repo_name: str | None = None) -> list[dict]:
 _DRIVE_QUEUE_COLUMNS = (
     "id, repo_name, issue_number, position, machine, after_json, state, "
     "attempts, deferrals, last_reason, session_name, launched_at, enqueued_at, "
-    "hold_after, hold_reason, resume_when, hold_state, hold_probes"
+    "hold_after, hold_reason, resume_when, hold_state, hold_probes, launch_host"
 )
 
 # Fields `update_drive_queue_entry` may write. Deliberately excludes the
@@ -4586,7 +4586,10 @@ _DRIVE_QUEUE_COLUMNS = (
 # hold_after/hold_reason/resume_when) — those move via `enqueue`/`move`, so a
 # tick can never silently reorder the queue or re-author a deploy gate. The
 # gate's RUN state (`hold_state`/`hold_probes`) IS the tick's to write, the
-# same split `state`/`attempts` already draw.
+# same split `state`/`attempts` already draw. `launch_host` (#1870) joins
+# `session_name`/`launched_at` in that same tick-owned set — it is stamped
+# with the LAUNCHING host's identity at the moment the launch subprocess
+# reports success, never operator-declared.
 _DRIVE_QUEUE_UPDATABLE = frozenset(
     {
         "state",
@@ -4597,6 +4600,7 @@ _DRIVE_QUEUE_UPDATABLE = frozenset(
         "launched_at",
         "hold_state",
         "hold_probes",
+        "launch_host",
     }
 )
 
@@ -4813,8 +4817,9 @@ def update_drive_queue_entry(repo_name: str, issue_number: int, **fields) -> boo
     """Write the tick-owned columns of a queue entry.
 
     Accepts any of ``state`` / ``attempts`` / ``deferrals`` / ``last_reason`` /
-    ``session_name`` / ``launched_at``; anything else raises ``ValueError``
-    (the queue's order is owned by ``enqueue``/``move``, not by a tick).
+    ``session_name`` / ``launched_at`` / ``launch_host``; anything else raises
+    ``ValueError`` (the queue's order is owned by ``enqueue``/``move``, not by
+    a tick).
 
     Routes to the daemon when ``board_service`` is set. Returns whether a row
     was actually updated.
