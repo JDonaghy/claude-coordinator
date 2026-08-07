@@ -400,16 +400,90 @@ def _start_agent_server(
         server.shutdown()
 
 
+def _resolve_target_version(
+    explicit_version: str | None,
+    *,
+    own_version: str = __version__,
+    index_url: str = "https://pypi.org/simple",
+    timeout: float = 5.0,
+) -> tuple[str, list[str]]:
+    """Resolve the version `coord agent update` should target.
+
+    #1886 Path A: the target used to come straight from this CLI's own
+    ``__version__`` — reasonable-sounding ("bring the fleet in line with
+    whatever's running here"), but wrong the instant the operator's own
+    install is behind PyPI: a stale CLI silently under-updates the entire
+    fleet and still reports success on every machine, because success was
+    judged against the wrong target from the start. The target must come
+    from PyPI's simple index instead — the same source ``pip install -U``
+    itself resolves against (see ``coord.health.pypi`` for why the simple
+    index and not the JSON API) — so a stale operator CLI either targets
+    the real, newer release or says so loudly, never silently targets its
+    own age.
+
+    ``explicit_version`` (``--version``) always wins and skips the network
+    call entirely — the documented escape hatch for pinning to a rollback
+    or a pre-release on purpose.
+
+    Returns ``(target_version, warning_lines)``. Warnings are informational
+    except for the "operator CLI is behind PyPI" case, where the returned
+    target is the newer PyPI release (never ``own_version``) — that's the
+    whole point of resolving from PyPI instead of trusting the caller.
+    A PyPI lookup failure (network down, unparseable index, ...) degrades
+    to targeting ``own_version`` with a warning rather than failing the
+    whole command — this fix must not turn "no network" into "can no
+    longer update the fleet at all."
+    """
+    if explicit_version:
+        return explicit_version, []
+
+    from coord.health.pypi import latest_release, parse_version  # noqa: PLC0415
+
+    try:
+        latest, _finals = latest_release(
+            "claude-coordinator", index_url=index_url, timeout=timeout
+        )
+    except Exception as exc:  # noqa: BLE001 — degrade, don't fail the update
+        return own_version, [
+            "⚠ could not resolve the latest release from PyPI's simple "
+            f"index ({type(exc).__name__}: {exc}) — targeting this CLI's "
+            f"own version v{own_version} instead. Pass --version to pin "
+            "explicitly, or fix network access so this can be verified.",
+        ]
+
+    if latest is None:
+        return own_version, [
+            "⚠ PyPI's simple index returned no parseable claude-coordinator "
+            f"releases — targeting this CLI's own version v{own_version} "
+            "instead. Pass --version to pin explicitly.",
+        ]
+
+    own = parse_version(own_version)
+    if own is None or latest > own:
+        return latest.raw, [
+            f"⚠ this operator CLI is v{own_version} but PyPI's latest "
+            f"release is v{latest.raw} — targeting v{latest.raw} (the PyPI "
+            "release), not this CLI's own version. This CLI's own "
+            "`claude-coordinator` install is stale; consider `pip install "
+            "--upgrade claude-coordinator` here too.",
+        ]
+
+    return own_version, []
+
+
 @agent.command(
     "update",
     help=(
         "POST /update to one or all agent servers, pinning the upgrade to "
-        "this coordinator's own version (git pull for editable installs, "
-        "pip install --no-cache-dir --upgrade claude-coordinator==<version> "
-        "otherwise).  Polls each agent's self-reported version for up to "
-        "--timeout seconds and reports success only once it matches the "
-        "requested version, escalating to a `systemctl --user restart "
-        "coord-agent` if the version is stuck."
+        "the latest release on PyPI's simple index (or --version, when "
+        "given) — NOT this CLI's own version (#1886: a stale operator "
+        "install must never silently under-update the fleet).  Runs git "
+        "pull for editable installs, pip install --no-cache-dir --upgrade "
+        "claude-coordinator==<version> otherwise.  Polls each agent's "
+        "self-reported *running* version for up to --timeout seconds and "
+        "reports success only once it matches the requested version, "
+        "escalating to a `systemctl --user restart coord-agent` if the "
+        "version is stuck."
     ),
 )
 
@@ -432,6 +506,17 @@ def _start_agent_server(
 
 
 @click.option(
+    "--version",
+    "version_override",
+    default=None,
+    help=(
+        "Pin the upgrade to this exact version instead of resolving the "
+        "latest release from PyPI's simple index (#1886)."
+    ),
+)
+
+
+@click.option(
     "--timeout",
     default=120,
     show_default=True,
@@ -444,18 +529,31 @@ def agent_update(
     config_path: Path,
     machine_filter: str | None,
     all_machines: bool,
+    version_override: str | None,
     timeout: int,
 ) -> None:
-    # #1568: the coordinator's own version IS the requested version — the
-    # whole point of `coord agent update` is to bring the fleet in line
-    # with whatever's running here.  Sending it lets the agent pin its pip
+    # #1886 Path A: the target used to be `__version__` — this CLI's own
+    # version.  A stale operator install (PyPI already has v0.4.108, this
+    # CLI is still v0.4.107) silently under-updated the whole fleet and
+    # still printed three clean checkmarks, because "success" was judged
+    # against the wrong target from the start.  Resolve the target from
+    # PyPI's simple index instead (the same source `pip install -U`
+    # itself resolves against — see coord.health.pypi) so a stale operator
+    # CLI is either overridden by the real target or refuses loudly,
+    # rather than silently pinning the fleet to its own age.  --version
+    # remains an explicit escape hatch for pinning to something else on
+    # purpose (a rollback, a pre-release, ...).
+    target_version, resolve_warnings = _resolve_target_version(version_override)
+    for line in resolve_warnings:
+        click.echo(line, err=True)
+
+    # #1568: sending an explicit target_version lets the agent pin its pip
     # install to that exact release (turning a stale-index no-op into a
     # loud pip failure) and lets THIS command verify success by polling
     # for that exact version, instead of inferring success from "the POST
     # was accepted" (false positive on a cache-stale no-op) or failure
     # from "the process stopped answering pings" (false negative on the
     # execv-under-systemd restart, #404).
-    target_version = __version__
 
     cfg = _load_config(config_path)
     targets = _resolve_agent_targets(cfg, machine_filter, all_machines)
@@ -527,11 +625,28 @@ def agent_update(
             elif not outcome.get("came_online"):
                 click.echo(f"  {machine.name}: ✗ did not come back online", err=True)
             else:
-                click.echo(
-                    f"  {machine.name}: ✗ still reporting {version_now}, "
-                    f"expected {target_version}",
-                    err=True,
-                )
+                installed_now = outcome.get("installed_version_now")
+                if installed_now and installed_now != version_now:
+                    # #1886 Path B: pip (or the disk) has already moved to
+                    # a newer install, but the running process — the only
+                    # thing "matched" ever keys off of — hasn't caught up.
+                    # Distinguishing this from a bare "still reporting X"
+                    # is the whole point: it says the process needs a
+                    # restart, not another pip attempt.
+                    click.echo(
+                        f"  {machine.name}: ✗ installed {installed_now} but the "
+                        f"running process still reports {version_now} (expected "
+                        f"{target_version}) — it hasn't restarted since the "
+                        "update; try `systemctl --user restart coord-agent` "
+                        "on that machine",
+                        err=True,
+                    )
+                else:
+                    click.echo(
+                        f"  {machine.name}: ✗ still reporting {version_now}, "
+                        f"expected {target_version}",
+                        err=True,
+                    )
 
         if not all_matched:
             sys.exit(1)
@@ -912,7 +1027,7 @@ def _wait_agents_updated(
     it one more short window before giving up.
 
     Returns ``{machine_name: {matched, came_online, version_now,
-    version_before, result, error, escalated}}``.
+    installed_version_now, version_before, result, error, escalated}}``.
     """
     # Scale the sleep down for short timeouts (e.g. tests passing
     # --timeout 1) so a tiny deadline isn't dominated by a single fixed
@@ -924,6 +1039,7 @@ def _wait_agents_updated(
             "matched": False,
             "came_online": False,
             "version_now": "?",
+            "installed_version_now": None,
             "version_before": None,
             "result": None,
             "error": None,
@@ -944,8 +1060,16 @@ def _wait_agents_updated(
         except Exception:
             return False
 
+        # #1886 Path B: `version` (checked below) is the RUNNING process's
+        # loaded-module version — the only thing "matched" may key off of.
+        # `installed_version` is a disk read that can advance the instant
+        # pip writes to site-packages, well before (or without) a restart
+        # (#404's execv-under-systemd stall). Recording both lets a
+        # still-pending outcome say *why* — "installed advanced, running
+        # didn't" — instead of a bare "still reporting X".
         version_now = health.get("version")
         info["version_now"] = version_now or "?"
+        info["installed_version_now"] = health.get("installed_version")
         last = health.get("last_update") or {}
         info["result"] = last.get("result")
         info["error"] = last.get("error")

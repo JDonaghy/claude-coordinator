@@ -209,6 +209,32 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
                 version_line = f"  agent-version: {agent_version}"
         click.echo(f"    host: {m.host}  repos: {repos}{version_line}")
 
+        # #1886 Path B: `/health` exposes `installed_version` (a disk read
+        # that advances the instant `pip` writes to site-packages)
+        # separately from `version` (the running process's loaded module,
+        # fixed at import time — never advances without a restart). A
+        # process that never restarted after `coord agent update` — the
+        # execv-under-systemd stall, #404 — is otherwise invisible: `pip
+        # show` and this agent's own `version` field both "agree" with
+        # whatever was installed last, even though the code actually
+        # executing hasn't changed. Surfacing the drift here means it's
+        # visible on every `coord status`, not only when an update happens
+        # to be running.
+        if s.is_online and s.health:
+            installed_version = s.health.get("installed_version")
+            running_version = s.health.get("version")
+            if (
+                installed_version
+                and running_version
+                and installed_version != running_version
+            ):
+                click.echo(
+                    f"    ⚠ running v{running_version} but installed "
+                    f"v{installed_version} — process hasn't restarted since "
+                    "its last update (`systemctl --user restart coord-agent` "
+                    "on that machine, or `coord agent update` to retry)"
+                )
+
         # #1527: `/health`'s `degraded` dict names any configured repo whose
         # `repo_path` is missing/unconfigured on this machine — the machine
         # can still be green/idle above while every dispatch for that one

@@ -580,6 +580,240 @@ class TestEscalateRestart:
         assert ok is False
 
 
+# ── #1886: PyPI-resolved target version ────────────────────────────────────
+
+
+class TestResolveTargetVersion:
+    """`_resolve_target_version` (#1886 Path A): the target must come from
+    PyPI's simple index, not this CLI's own (possibly stale) __version__,
+    except when --version explicitly overrides it."""
+
+    def test_explicit_version_wins_without_hitting_pypi(self) -> None:
+        from coord.commands.agent_ops import _resolve_target_version
+
+        with patch("coord.health.pypi.latest_release") as mock_latest:
+            target, warnings = _resolve_target_version("1.2.3", own_version="1.0.0")
+
+        assert target == "1.2.3"
+        assert warnings == []
+        mock_latest.assert_not_called()
+
+    def test_targets_newer_pypi_release_and_warns_when_cli_is_stale(self) -> None:
+        """The reported bug: PyPI already has v0.4.108, the operator CLI is
+        still v0.4.107 — the target must be 0.4.108, with a loud warning,
+        never a silent 0.4.107."""
+        from coord.commands.agent_ops import _resolve_target_version
+        from coord.health.pypi import parse_version
+
+        with patch(
+            "coord.health.pypi.latest_release",
+            return_value=(
+                parse_version("0.4.108"),
+                [parse_version("0.4.107"), parse_version("0.4.108")],
+            ),
+        ):
+            target, warnings = _resolve_target_version(None, own_version="0.4.107")
+
+        assert target == "0.4.108"
+        assert warnings
+        assert "0.4.107" in warnings[0]
+        assert "0.4.108" in warnings[0]
+
+    def test_targets_own_version_when_already_current(self) -> None:
+        from coord.commands.agent_ops import _resolve_target_version
+        from coord.health.pypi import parse_version
+
+        with patch(
+            "coord.health.pypi.latest_release",
+            return_value=(parse_version("0.4.108"), [parse_version("0.4.108")]),
+        ):
+            target, warnings = _resolve_target_version(None, own_version="0.4.108")
+
+        assert target == "0.4.108"
+        assert warnings == []
+
+    def test_targets_own_version_when_ahead_of_latest_pypi_release(self) -> None:
+        """An editable/dev checkout ahead of the last PyPI release must not
+        be dragged backwards."""
+        from coord.commands.agent_ops import _resolve_target_version
+        from coord.health.pypi import parse_version
+
+        with patch(
+            "coord.health.pypi.latest_release",
+            return_value=(parse_version("0.4.108"), [parse_version("0.4.108")]),
+        ):
+            target, warnings = _resolve_target_version(None, own_version="0.4.109")
+
+        assert target == "0.4.109"
+        assert warnings == []
+
+    def test_falls_back_to_own_version_when_pypi_unreachable(self) -> None:
+        from coord.commands.agent_ops import _resolve_target_version
+
+        with patch(
+            "coord.health.pypi.latest_release",
+            side_effect=Exception("connection refused"),
+        ):
+            target, warnings = _resolve_target_version(None, own_version="0.4.107")
+
+        assert target == "0.4.107"
+        assert warnings
+        assert "pypi" in warnings[0].lower()
+
+    def test_falls_back_to_own_version_when_pypi_has_no_releases(self) -> None:
+        from coord.commands.agent_ops import _resolve_target_version
+
+        with patch("coord.health.pypi.latest_release", return_value=(None, [])):
+            target, warnings = _resolve_target_version(None, own_version="0.4.107")
+
+        assert target == "0.4.107"
+        assert warnings
+
+
+# ── #1886: /health exposes running vs installed version ────────────────────
+
+
+class TestHealthInstalledVersion:
+    def test_health_reports_installed_version_separately_from_running(
+        self, tmp_path: Path
+    ) -> None:
+        """#1886 Path B: `version` is bound at process import time (the
+        RUNNING, loaded-module version) and `installed_version` is a fresh
+        disk read that can advance without a restart. Both must be visible
+        on /health so a caller can detect the drift itself."""
+        client, server = _make_client(tmp_path)
+        with patch("coord.agent_app._installed_version", return_value="9.9.9"):
+            r = client.get("/health")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["installed_version"] == "9.9.9"
+        assert body["version"] == __version__
+        assert body["installed_version"] != body["version"]
+        server.shutdown()
+
+    def test_health_installed_version_matches_running_when_in_sync(
+        self, tmp_path: Path
+    ) -> None:
+        client, server = _make_client(tmp_path)
+        with patch("coord.agent_app._installed_version", return_value=__version__):
+            r = client.get("/health")
+        body = r.json()
+        assert body["installed_version"] == body["version"] == __version__
+        server.shutdown()
+
+
+# ── #1886 / #404: systemd-aware restart ─────────────────────────────────────
+
+
+class TestSystemdAwareRestart:
+    def test_running_under_systemd_detects_invocation_id(self, monkeypatch) -> None:
+        from coord.agent_app import _running_under_systemd
+
+        monkeypatch.delenv("INVOCATION_ID", raising=False)
+        assert _running_under_systemd() is False
+        monkeypatch.setenv("INVOCATION_ID", "abc123")
+        assert _running_under_systemd() is True
+
+    def test_restart_via_systemctl_sets_xdg_runtime_dir(self, monkeypatch) -> None:
+        from coord.agent_app import _restart_via_systemctl
+
+        monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+        monkeypatch.setattr("os.getuid", lambda: 1000, raising=False)
+        captured: dict = {}
+
+        def fake_popen(cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["env"] = kwargs.get("env")
+            return MagicMock()
+
+        with patch("coord.agent_app.subprocess.Popen", side_effect=fake_popen):
+            ok = _restart_via_systemctl()
+
+        assert ok is True
+        assert captured["cmd"] == ["systemctl", "--user", "restart", "coord-agent"]
+        assert captured["env"]["XDG_RUNTIME_DIR"] == "/run/user/1000"
+
+    def test_restart_via_systemctl_returns_false_on_launch_failure(self) -> None:
+        from coord.agent_app import _restart_via_systemctl
+
+        with patch(
+            "coord.agent_app.subprocess.Popen",
+            side_effect=FileNotFoundError("no systemctl"),
+        ):
+            assert _restart_via_systemctl() is False
+
+    def test_default_exec_restart_prefers_systemctl_under_systemd(
+        self, monkeypatch
+    ) -> None:
+        """#404 / #1886: os.execv alone doesn't take under systemd (same
+        PID, stale code survives). Under systemd, restart via `systemctl
+        --user restart` and exit — never os.execv."""
+        from coord import agent_app
+
+        monkeypatch.setenv("INVOCATION_ID", "abc123")
+        popen_calls: list = []
+
+        def fake_popen(cmd, **kwargs):
+            popen_calls.append(cmd)
+            return MagicMock()
+
+        # The real os._exit() never returns — simulate that with an
+        # exception so a bug that let control fall through to os.execv
+        # afterward would show up as `mock_execv` having been called,
+        # instead of silently passing.
+        exit_calls: list = []
+
+        def fake_exit(code):
+            exit_calls.append(code)
+            raise SystemExit(code)
+
+        with (
+            patch("coord.agent_app.subprocess.Popen", side_effect=fake_popen),
+            patch("coord.agent_app.os._exit", side_effect=fake_exit),
+            patch("coord.agent_app.os.execv") as mock_execv,
+        ):
+            with pytest.raises(SystemExit):
+                agent_app._default_exec_restart(["coord", "agent"])
+
+        assert popen_calls, "expected systemctl --user restart to be launched"
+        assert popen_calls[0][:3] == ["systemctl", "--user", "restart"]
+        assert "coord-agent" in popen_calls[0]
+        assert exit_calls == [0]
+        mock_execv.assert_not_called()
+
+    def test_default_exec_restart_falls_back_to_execv_without_systemd(
+        self, monkeypatch
+    ) -> None:
+        from coord import agent_app
+
+        monkeypatch.delenv("INVOCATION_ID", raising=False)
+        with (
+            patch("coord.agent_app.subprocess.Popen") as mock_popen,
+            patch("coord.agent_app.os.execv") as mock_execv,
+        ):
+            agent_app._default_exec_restart(["coord", "agent"])
+
+        mock_popen.assert_not_called()
+        assert mock_execv.called
+
+    def test_default_exec_restart_falls_back_to_execv_when_systemctl_launch_fails(
+        self, monkeypatch
+    ) -> None:
+        from coord import agent_app
+
+        monkeypatch.setenv("INVOCATION_ID", "abc123")
+        with (
+            patch(
+                "coord.agent_app.subprocess.Popen",
+                side_effect=FileNotFoundError("no systemctl"),
+            ),
+            patch("coord.agent_app.os.execv") as mock_execv,
+        ):
+            agent_app._default_exec_restart(["coord", "agent"])
+
+        assert mock_execv.called
+
+
 # ── CLI: coord agent update / restart ─────────────────────────────────────
 
 
@@ -909,6 +1143,121 @@ class TestAgentUpdateCLI:
         assert result.exit_code == 0, result.output
         assert __version__ in result.output
 
+    def test_update_installed_advanced_but_running_stuck_reports_failure(
+        self, config_file: Path, coord_db
+    ) -> None:
+        """Acceptance criterion (#1886): a stubbed agent whose *installed*
+        version has advanced (pip/disk) but whose *running* process has
+        not (the execv-under-systemd stall, #404) must report failure, not
+        ✓ — even though `installed_version` already agrees with the
+        target and `last_update.result == "upgraded"`."""
+        def fake_post(url, *args, **kwargs):
+            r = MagicMock()
+            r.status_code = 202
+            r.json.return_value = {"status": "updating", "mode": "pip install --upgrade"}
+            return r
+
+        def fake_get(url, *args, **kwargs):
+            r = MagicMock()
+            r.status_code = 200
+            r.json.return_value = {
+                # installed_version reflects the freshly pip-installed
+                # package; version is the stale, still-running process.
+                "version": "0.4.106",
+                "installed_version": __version__,
+                "last_update": {
+                    "result": "upgraded",
+                    "version_before": "0.4.106",
+                    "version_after": __version__,
+                },
+            }
+            return r
+
+        with (
+            patch("coord.cli.httpx.post", side_effect=fake_post),
+            patch("coord.cli.httpx.get", side_effect=fake_get),
+            patch("coord.commands.agent_ops._escalate_restart", return_value=False),
+        ):
+            result = CliRunner().invoke(
+                main,
+                ["agent", "update", "--machine", "laptop", "--version", __version__,
+                 "--timeout", "1", "--config", str(config_file)],
+            )
+
+        assert result.exit_code != 0, result.output
+        assert "✗" in result.output
+        assert "0.4.106" in result.output
+
+    def test_update_targets_pypi_latest_when_operator_cli_is_stale(
+        self, config_file: Path, coord_db
+    ) -> None:
+        """#1886 Path A: the reported bug — PyPI already has a newer
+        release than this CLI's own __version__. The target must be the
+        PyPI release, with a loud warning, never a silent
+        under-update pinned to this CLI's own stale version."""
+        from coord.health.pypi import parse_version
+
+        def fake_post(url, *args, **kwargs):
+            r = MagicMock()
+            r.status_code = 202
+            r.json.return_value = {"status": "updating", "mode": "pip install --upgrade"}
+            return r
+
+        def fake_get(url, *args, **kwargs):
+            r = MagicMock()
+            r.status_code = 200
+            r.json.return_value = {"version": "9.9.9", "last_update": {"result": "upgraded"}}
+            return r
+
+        with (
+            patch("coord.cli.httpx.post", side_effect=fake_post),
+            patch("coord.cli.httpx.get", side_effect=fake_get),
+            patch(
+                "coord.health.pypi.latest_release",
+                return_value=(parse_version("9.9.9"), [parse_version("9.9.9")]),
+            ),
+        ):
+            result = CliRunner().invoke(
+                main,
+                ["agent", "update", "--machine", "laptop", "--timeout", "5",
+                 "--config", str(config_file)],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "9.9.9" in result.output
+        assert "stale" in result.output.lower()
+
+    def test_update_version_override_skips_pypi_resolution(
+        self, config_file: Path, coord_db
+    ) -> None:
+        """--version pins the target directly — no PyPI lookup, no warning."""
+        def fake_post(url, *args, **kwargs):
+            r = MagicMock()
+            r.status_code = 202
+            r.json.return_value = {"status": "updating", "mode": "pip install --upgrade"}
+            return r
+
+        def fake_get(url, *args, **kwargs):
+            r = MagicMock()
+            r.status_code = 200
+            r.json.return_value = {"version": "1.2.3", "last_update": {"result": "upgraded"}}
+            return r
+
+        with (
+            patch("coord.cli.httpx.post", side_effect=fake_post),
+            patch("coord.cli.httpx.get", side_effect=fake_get),
+            patch("coord.health.pypi.latest_release") as mock_latest,
+        ):
+            result = CliRunner().invoke(
+                main,
+                ["agent", "update", "--machine", "laptop", "--version", "1.2.3",
+                 "--timeout", "5", "--config", str(config_file)],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "1.2.3" in result.output
+        mock_latest.assert_not_called()
+
 
 class TestAgentVersionsCLI:
     """#1568 suggested fix #4: a fleet-wide check the operator can run to
@@ -1204,3 +1553,78 @@ class TestStatusVersionDisplay:
             )
         assert result.exit_code == 0, result.output
         assert "agent-version" not in result.output
+
+    def test_status_flags_running_installed_drift(
+        self, config_file: Path, coord_db
+    ) -> None:
+        """#1886 item 4: a process that upgraded on disk but never
+        restarted (the execv-under-systemd stall, #404) must be visible
+        from `coord status` alone — no update needs to be running."""
+        from coord import network
+
+        statuses = [
+            network.MachineStatus(
+                machine=MagicMock(name="laptop", host="laptop.tailnet", repos=["api"]),
+                state=network.ONLINE,
+                latency_ms=12.0,
+                health={
+                    "machine": "laptop",
+                    "version": "0.4.106",
+                    "installed_version": "0.4.108",
+                },
+            ),
+        ]
+        statuses[0].machine.name = "laptop"
+        statuses[0].machine.host = "laptop.tailnet"
+        statuses[0].machine.repos = ["api"]
+
+        status_data = {"active": [], "completed": [], "version": "0.4.106"}
+        with (
+            patch("coord.network.check_all", return_value=statuses),
+            patch(
+                "coord.network.fetch_status",
+                return_value=network.StatusResult(data=status_data),
+            ),
+        ):
+            result = CliRunner().invoke(
+                main, ["status", "--config", str(config_file)]
+            )
+        assert result.exit_code == 0, result.output
+        assert "0.4.106" in result.output
+        assert "0.4.108" in result.output
+        assert "restart" in result.output.lower()
+
+    def test_status_no_drift_warning_when_running_matches_installed(
+        self, config_file: Path, coord_db
+    ) -> None:
+        from coord import network
+
+        statuses = [
+            network.MachineStatus(
+                machine=MagicMock(name="laptop", host="laptop.tailnet", repos=["api"]),
+                state=network.ONLINE,
+                latency_ms=12.0,
+                health={
+                    "machine": "laptop",
+                    "version": __version__,
+                    "installed_version": __version__,
+                },
+            ),
+        ]
+        statuses[0].machine.name = "laptop"
+        statuses[0].machine.host = "laptop.tailnet"
+        statuses[0].machine.repos = ["api"]
+
+        status_data = {"active": [], "completed": [], "version": __version__}
+        with (
+            patch("coord.network.check_all", return_value=statuses),
+            patch(
+                "coord.network.fetch_status",
+                return_value=network.StatusResult(data=status_data),
+            ),
+        ):
+            result = CliRunner().invoke(
+                main, ["status", "--config", str(config_file)]
+            )
+        assert result.exit_code == 0, result.output
+        assert "hasn't restarted" not in result.output

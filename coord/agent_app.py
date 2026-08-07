@@ -69,12 +69,66 @@ def _read_last_update(state_dir: Path) -> dict | None:
         return None
 
 
-def _default_exec_restart(argv: list[str]) -> None:
-    """Re-exec the current process with the same argv.
+def _running_under_systemd() -> bool:
+    """True when this process was started by systemd (in practice, a user
+    unit — see ``deploy/coord-agent.service``).
 
-    Uses ``sys.executable`` so it works whether *coord* was invoked as a
-    console-script entry-point or via ``python -m coord``.
+    ``INVOCATION_ID`` is set by systemd for every unit invocation (since
+    v232) and is the standard "am I running under systemd" signal — unlike
+    checking the parent PID, it survives the process being reparented.
     """
+    return bool(os.environ.get("INVOCATION_ID"))
+
+
+def _restart_via_systemctl(unit: str = "coord-agent") -> bool:
+    """Best-effort ``systemctl --user restart <unit>``, run from *inside*
+    the unit's own process.
+
+    #404 / #1886: ``os.execv`` self-restart does not take under systemd —
+    same PID survives with stale code loaded, and nothing detected it
+    (that silent survival is the concrete failure #1886 reports). Asking
+    systemd itself to restart the unit is the mechanism that's known to
+    work — it's the documented manual workaround, and what
+    ``coord.commands.agent_ops._escalate_restart`` already does over SSH
+    as a fallback from the CLI side. Doing it from inside the process
+    removes the dependency on a human noticing the stall and running it
+    by hand.
+
+    Returns True once the ``systemctl`` command has been launched — NOT
+    whether the restart actually completed; the caller's process is about
+    to exit either way, so there is nothing left here to poll for.
+    """
+    env = dict(os.environ)
+    # Should already be set for a process systemd itself started, but
+    # setting it explicitly costs nothing and matches the SSH-driven
+    # fallback in agent_ops.py, where it IS load-bearing.
+    env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    try:
+        subprocess.Popen(
+            ["systemctl", "--user", "restart", unit],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return False
+    return True
+
+
+def _default_exec_restart(argv: list[str]) -> None:
+    """Restart the agent process — via systemd when running under it,
+    otherwise by re-exec'ing in place.
+
+    #404 / #1886: a bare ``os.execv`` doesn't take under systemd (same
+    PID, stale code), and nothing used to detect it. Under systemd, ask
+    systemd to restart the unit instead — the mechanism actually known to
+    work — and let this process exit; falls back to ``os.execv`` (using
+    ``sys.executable`` so it works whether *coord* was invoked as a
+    console-script entry-point or via ``python -m coord``) when not under
+    systemd, or if handing off to systemctl itself failed to launch.
+    """
+    if _running_under_systemd() and _restart_via_systemctl():
+        os._exit(0)
     os.execv(sys.executable, [sys.executable] + argv)
 
 
@@ -357,7 +411,19 @@ def build_app(
         # only bites the first /health after a restart or every few
         # minutes, but push it off-loop regardless.
         data = await asyncio.to_thread(server.health)
+        # #1886 Path B: `version` is bound at process import time (see the
+        # module-level `from coord import __version__` above) and never
+        # changes for the life of this process — it is the *running*,
+        # loaded-module version. `installed_version` is a fresh disk read
+        # (see `_installed_version` above) and changes the instant `pip`
+        # writes to site-packages, regardless of whether this process has
+        # restarted to pick it up. Exposing both — instead of just one,
+        # ambiguous "version" — lets a caller (`coord agent update`'s poll
+        # loop, `coord status`) detect a process that never restarted
+        # after an update purely from /health, without inferring it from
+        # liveness or PID.
         data["version"] = __version__
+        data["installed_version"] = _installed_version()
         # Surface the most recent /update attempt so the CLI can show
         # "0.3.0 → 0.4.0" or "no_change (0.3.0)" or "failed: <error>".
         last = _read_last_update(server.state_dir)
