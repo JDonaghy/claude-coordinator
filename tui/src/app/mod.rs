@@ -3203,6 +3203,15 @@ pub struct CoordApp {
     /// `DataTableHit::HeaderDivider` and cleared on `MouseUp`. `None` when
     /// no resize drag is in progress. Mirrors `audit_resize_col`.
     reports_resize_col: Option<usize>,
+    /// #1910: whether a `MouseDown` landed on the result table's vertical
+    /// scrollbar track and a drag is in progress, so subsequent `MouseMoved`
+    /// events should keep scrubbing `reports_result_scroll` instead of doing
+    /// anything else. Cleared on `MouseUp`. There is no horizontal
+    /// counterpart — the table's `h_scroll` is pinned at `0.0` (see
+    /// `render_reports_result`), so no horizontal scrollbar can ever be on
+    /// screen to drag. Mirrors `audit_scrollbar_drag`, minus the axis enum
+    /// since only one axis exists here.
+    reports_vscroll_drag: bool,
     /// #1765: the report id whose section-header Export action was just
     /// clicked, awaiting the save dialog.
     ///
@@ -3753,6 +3762,7 @@ impl CoordApp {
             reports_table_layout: std::cell::RefCell::new(None),
             reports_column_overrides: None,
             reports_resize_col: None,
+            reports_vscroll_drag: false,
             reports_pending_export: None,
             reports_export_status: None,
             reports_export_rx: None,

@@ -4608,8 +4608,16 @@ impl CoordApp {
                     // column-resize drag. Same precedence and shape as the
                     // Audit block above, minus `main_b` — the Reports table
                     // caches its own origin (see `reports_update_resize_drag`).
+                    //
+                    // #1910: and a vertical-scrollbar-track drag, started by
+                    // a `MouseDown` inside `reports_scrollbar_hit`'s region
+                    // (`mouse_main_click` below) — same shape as
+                    // `audit_scrollbar_drag`'s continuation above.
                     if self.active_view == SidebarView::Reports && buttons.left {
                         redraw |= self.reports_update_resize_drag(pos);
+                        if self.reports_vscroll_drag {
+                            redraw |= self.reports_apply_vscroll(pos);
+                        }
                     }
                     if self.terminal_host_sel_dragging && buttons.left {
                         if let Some((col, row)) =
@@ -4717,15 +4725,18 @@ impl CoordApp {
                 // the same way — started by a `MouseDown` inside
                 // `audit_scrollbar_hit`'s region (`mouse_main_click` below).
                 // #1853: and a Reports result-table column-resize drag,
-                // the same way. Each `take()` is evaluated unconditionally
-                // rather than short-circuited behind `||` — with the
+                // the same way. #1910: and a Reports vertical-scrollbar-track
+                // drag. Each release is evaluated unconditionally rather
+                // than short-circuited behind `||` — with the
                 // short-circuit, a release while an earlier drag was active
                 // would leave a later one latched, and the next unrelated
-                // mouse-move would resume resizing a column nobody grabbed.
+                // mouse-move would resume resizing a column (or scrolling)
+                // nobody grabbed.
                 if btn == MouseButton::Left {
                     let mut released = self.audit_resize_col.take().is_some();
                     released |= self.audit_scrollbar_drag.take().is_some();
                     released |= self.reports_resize_col.take().is_some();
+                    released |= std::mem::take(&mut self.reports_vscroll_drag);
                     if released {
                         return true;
                     }
@@ -5611,6 +5622,18 @@ impl CoordApp {
                 // drag instead. Rows are not selectable (there is nothing
                 // to drill into yet) and the table's footer is a pinned Σ
                 // row, so every remaining hit is a no-op.
+                //
+                // #1910: a vertical-scrollbar-track hit is checked FIRST,
+                // before `reports_table_hit` — same reason as
+                // `audit_scrollbar_hit`'s callers: `DataTableLayout::
+                // hit_test` has no concept of the scrollbar strip, so
+                // without this a click/drag on the thumb fell through and
+                // was mis-hit-tested as a row.
+                MsvClick::Outside if self.reports_scrollbar_hit(pos) => {
+                    self.reports_vscroll_drag = true;
+                    self.reports_apply_vscroll(pos);
+                    true
+                }
                 MsvClick::Outside => match self.reports_table_hit(pos) {
                     Some(DataTableHit::Header { col }) => self.reports_sort_by_column(col),
                     // #1853: a divider hit begins a column-resize drag,
@@ -6253,7 +6276,19 @@ impl CoordApp {
                 if delta.y > 0.0 {
                     self.reports_result_scroll = self.reports_result_scroll.saturating_sub(3);
                 } else if delta.y < 0.0 {
-                    let max = n.saturating_sub(visible.max(1));
+                    // #1910: `visible` here is `content_visible_rows(main_b,
+                    // lh)` — the whole main panel's row count, computed
+                    // above this match. The result table's own viewport is
+                    // smaller (the section stack sits above it, and the
+                    // notes block can take a slice below), so using `visible`
+                    // made `max` clamp too low — sometimes `0` — and wheel-
+                    // down looked completely dead on a report tall enough to
+                    // need scrolling. `reports_table_visible_rows` reads the
+                    // actual painted `DataTableLayout` instead; `visible` is
+                    // only a fallback for the one frame before anything has
+                    // rendered.
+                    let table_visible = self.reports_table_visible_rows().unwrap_or(visible).max(1);
+                    let max = n.saturating_sub(table_visible);
                     self.reports_result_scroll = (self.reports_result_scroll + 3).min(max);
                 }
                 true
