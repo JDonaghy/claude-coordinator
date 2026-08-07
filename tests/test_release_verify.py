@@ -23,9 +23,7 @@ its-own, unreachable-is-never-OK, and read-only.
 from __future__ import annotations
 
 import json
-import os
 import stat
-import sys
 from pathlib import Path
 
 import pytest
@@ -718,6 +716,33 @@ def test_daemon_serve_lane_name_matches_what_the_fleet_check_publishes() -> None
         "fleet_deploy_lanes"
     ]
     assert rv.DAEMON_SERVE_LANE in result.values["lanes"]
+
+
+def test_board_fetch_falls_back_to_loopback_on_the_daemon_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On the daemon host `resolve_board_service()` is None (host mode reads
+    the DB directly). Without this fallback, running the command *on the
+    daemon host* would silently drop the `coord-serve process` lane — exactly
+    the lane #1834 exists to stop losing."""
+    seen: dict = {}
+
+    monkeypatch.setattr("coord.client.resolve_board_service", lambda *a, **k: None)
+    monkeypatch.setattr("coord.serve_app.resolve_serve_token", lambda *a, **k: "tok")
+
+    def fake_fetch(svc, *, timeout=None):
+        seen["url"] = svc.url
+        seen["token"] = svc.token
+        seen["timeout"] = timeout
+        return {}
+
+    monkeypatch.setattr("coord.client.fetch_board_payload", fake_fetch)
+    assert rv._default_board_fetch() == {}
+    assert seen["url"].startswith("http://127.0.0.1:")
+    assert seen["token"] == "tok"
+    # NOT the per-host --timeout: /board is a multi-megabyte read and a 5s
+    # budget makes a healthy daemon look unreachable (a recorded gotcha).
+    assert seen["timeout"] == rv._BOARD_TIMEOUT >= 30.0
 
 
 def test_a_board_that_cannot_be_read_is_no_data_not_a_crash() -> None:
