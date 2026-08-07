@@ -2332,6 +2332,15 @@ def test_branch_has_commits_is_false_with_no_branch(tmp_path):
 # ═══════════════════════════════════════════════════════════════════════════
 
 
+_needs_real_flock = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="FileLock is backed by fcntl.flock() (coord/filelock.py) — POSIX-only "
+    "advisory locking, no Windows lock backend implemented yet",
+)
+
+
+@pytest.mark.posix_only
+@_needs_real_flock
 def test_a_second_lock_holder_is_refused_immediately(tmp_path):
     first = FileLock(tmp_path / "l")
     first.acquire(timeout=0.0)
@@ -2346,6 +2355,8 @@ def test_a_second_lock_holder_is_refused_immediately(tmp_path):
     second.release()
 
 
+@pytest.mark.posix_only
+@_needs_real_flock
 def test_lock_is_released_on_context_exit(tmp_path):
     with FileLock(tmp_path / "l"):
         pass
@@ -2880,6 +2891,8 @@ def test_a_blip_on_the_preflight_read_is_a_usage_error(driver_factory):
     assert exc.value.exit_code == EXIT_USAGE
 
 
+@pytest.mark.posix_only
+@_needs_real_flock
 def test_driver_refuses_a_second_run_on_the_same_issue(driver_factory, tmp_path):
     """A per-issue lock: two drivers on the same issue would double-dispatch."""
     held = FileLock(tmp_path / f"lock-{REPO}-{ISSUE}")
@@ -2896,6 +2909,8 @@ def test_driver_refuses_a_second_run_on_the_same_issue(driver_factory, tmp_path)
         held.release()
 
 
+@pytest.mark.posix_only
+@_needs_real_flock
 def test_driver_allows_a_concurrent_run_on_a_different_issue(driver_factory, tmp_path):
     held = FileLock(tmp_path / f"lock-{REPO}-999")
     held.acquire(timeout=0.0)
@@ -2906,6 +2921,8 @@ def test_driver_allows_a_concurrent_run_on_a_different_issue(driver_factory, tmp
         held.release()
 
 
+@pytest.mark.posix_only
+@_needs_real_flock
 def test_driver_releases_the_lock_and_removes_the_holder_file(driver_factory, tmp_path):
     driver = driver_factory([board(status="merged")])
     assert driver.run() == EXIT_OK

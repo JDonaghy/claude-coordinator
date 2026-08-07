@@ -128,3 +128,14 @@ coord = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+markers = [
+    # #1895: tests that exercise a genuinely POSIX-only mechanism (real
+    # `pty.fork()`, `fcntl.flock()`, tmux/interactive-session control) that
+    # has no Windows port yet. Use `@pytest.mark.skipif(sys.platform ==
+    # \"win32\", reason=\"...\")` with a specific reason naming the
+    # unportable dependency — this marker just registers the label so
+    # `pytest --strict-markers` (if ever enabled) doesn't choke on it, and
+    # so these tests are greppable as a single set. The set should shrink as
+    # CP-1/CP-5/CP-7 port each mechanism; see docs/CROSS_PLATFORM.md.
+    "posix_only: needs a POSIX-only OS primitive (pty.fork/fcntl.flock/tmux) not yet ported to Windows",
+]

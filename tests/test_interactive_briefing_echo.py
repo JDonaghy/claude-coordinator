@@ -22,6 +22,20 @@ from unittest.mock import MagicMock
 
 import pytest
 
+# #1895: every test in this file does `import pty` and drives a real
+# `pty.fork()` (see the module docstring) to exercise the pre-fork echo. The
+# stdlib `pty` module doesn't exist on Windows at all, so there is no way to
+# even import it here, let alone fork one — this is not a "not implemented
+# yet" gap `#1156`'s import guards fix, it needs an actual Windows PTY port
+# (ConPTY) that hasn't landed. See docs/CROSS_PLATFORM.md §4/§8.
+pytestmark = [
+    pytest.mark.posix_only,
+    pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="needs the stdlib `pty` module (pty.fork()) — POSIX-only, no Windows port yet",
+    ),
+]
+
 
 # ---------------------------------------------------------------------------
 # Helpers

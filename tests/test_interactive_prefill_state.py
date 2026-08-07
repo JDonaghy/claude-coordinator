@@ -26,6 +26,15 @@ import sys
 
 import pytest
 
+# #1895: reused on the two real-`pty.fork()` end-to-end tests below (the
+# `_prefill_step`/`_prefill_on_master_data` unit tests above them are pure
+# in-memory state-machine checks and need no POSIX primitive at all).
+_needs_real_pty = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="drives the real coord.interactive._launch_via_pty relay loop "
+    "(pty.fork() + a real child process) — POSIX-only, no Windows port yet",
+)
+
 from coord.interactive import (
     _INJECT_MAX_ATTEMPTS,
     _READY_QUIESCE_CAP_S,
@@ -294,6 +303,8 @@ _CHILD_SCRIPT = (
 )
 
 
+@pytest.mark.posix_only
+@_needs_real_pty
 def test_launch_via_pty_lands_briefing_after_banner_interrupt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -368,6 +379,8 @@ _RETRY_CHILD_SCRIPT = (
 )
 
 
+@pytest.mark.posix_only
+@_needs_real_pty
 def test_launch_via_pty_clears_input_box_before_retry_paste(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
