@@ -197,6 +197,30 @@ class TestBuildBriefing:
         assert "web-playwright" in TEST_AUTHOR_SYSTEM_PROMPT
         assert "data-testid" in TEST_AUTHOR_SYSTEM_PROMPT
 
+    # ── #1818: web-playwright fixture-seeding convention ────────────────────
+
+    def test_fixtures_line_present_for_web_playwright(self) -> None:
+        briefing = build_test_author_briefing(**self._kwargs(
+            driver_kind="web-playwright", driver_mock="*.html",
+        ))
+        assert "FIXTURES: tests/acceptance/ms-25/fixtures/<name>.json" in briefing
+        assert "page.route()" in briefing
+
+    def test_fixtures_line_absent_for_other_driver_kinds(self) -> None:
+        briefing = build_test_author_briefing(**self._kwargs())
+        assert "FIXTURES:" not in briefing
+
+    def test_system_prompt_tells_web_author_to_seed_via_fixture_not_route(
+        self,
+    ) -> None:
+        """#1818: the next web test-author should copy a real
+        `coord/dashboard/fixture.py`-shaped fixture instead of inventing an
+        inline `page.route()` payload."""
+        assert "fixtures/<name>.json" in TEST_AUTHOR_SYSTEM_PROMPT
+        assert "coord/dashboard/fixture.py" in TEST_AUTHOR_SYSTEM_PROMPT
+        assert "page.route()` interception" in TEST_AUTHOR_SYSTEM_PROMPT
+        assert "ms-51" in TEST_AUTHOR_SYSTEM_PROMPT
+
 
 # ── dispatch_test_author ────────────────────────────────────────────────────
 
