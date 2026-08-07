@@ -14,12 +14,10 @@ or decision-making of its own.
 from __future__ import annotations
 
 import asyncio
-import fcntl
 import os
 import socket
 import struct
 import subprocess
-import termios
 from pathlib import Path
 from typing import Protocol
 
@@ -173,7 +171,9 @@ class TmuxSessionAttacher:
     """
 
     async def attach(self, host: str | None, session_name: str) -> AttachedPty:
+        import fcntl  # stdlib, Unix-only -- deferred for platform safety
         import pty  # stdlib, Unix-only -- deferred for platform safety
+        import termios  # stdlib, Unix-only -- deferred for platform safety
 
         host_obj = TmuxHost(ssh_target=host)
 
@@ -332,6 +332,9 @@ class _RealAttachedPty:
             pass
 
     def resize(self, cols: int, rows: int) -> None:
+        import fcntl  # stdlib, Unix-only -- deferred for platform safety
+        import termios  # stdlib, Unix-only -- deferred for platform safety
+
         try:
             fcntl.ioctl(
                 self._master_fd,

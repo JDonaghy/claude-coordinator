@@ -526,7 +526,7 @@ class TestTmuxSessionAttacherResizeHardening:
         if ioctl_side_effect is not None:
             cms.append(
                 patch(
-                    "coord.dashboard.terminal.fcntl.ioctl",
+                    "fcntl.ioctl",
                     side_effect=ioctl_side_effect,
                 )
             )
@@ -631,7 +631,7 @@ class TestTmuxSessionAttacherResizeHardening:
                 side_effect=OSError("no tmux"),
             ),
             patch(
-                "coord.dashboard.terminal.fcntl.ioctl",
+                "fcntl.ioctl",
                 side_effect=OSError("bad fd"),
             ),
             patch(

@@ -30,6 +30,9 @@ dependencies = [
     # httptools/uvloop that /ws/terminal doesn't need.
     "websockets>=12.0",
     "psutil>=5.9",
+    # Cross-platform state-root resolution (#1156): OS-native app-data dirs on
+    # Windows/macOS while POSIX keeps the legacy ~/.coord path.
+    "platformdirs>=4.0",
 ]
 
 [project.urls]

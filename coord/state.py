@@ -42,6 +42,7 @@ from coord.models import (
     SplitChunk,
     SplitProposal,
 )
+from coord.platform_paths import default_coord_dir
 
 # Re-exported for backward compatibility (these moved to coord._board_mapping in
 # #584 so the daemon/client can share the one mapping):
@@ -49,7 +50,7 @@ from coord.models import (
 __all__ = ["_json_loads", "_decode_smoke_tests", "_row_to_assignment"]
 
 # ── Directory for logs and other non-DB state ─────────────────────────────────
-COORD_DIR = Path.home() / ".coord"
+COORD_DIR = default_coord_dir()
 
 # Legacy file-path constants — kept so that existing monkeypatch.setattr calls
 # don't blow up with AttributeError.  None of the functions read/write these.
