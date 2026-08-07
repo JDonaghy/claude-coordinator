@@ -42875,3 +42875,261 @@ Milestone tracking issue.
         }
         assert!(!dest.exists());
     }
+
+    // ── #1910: result-table vertical scroll (wheel + scrollbar drag) ──────
+    //
+    // The wheel arm for `SidebarView::Reports` (events.rs) and the drag
+    // wiring below both existed before #1910 in *shape* only: the wheel
+    // clamped scroll against `content_visible_rows(main_b, lh)` — the whole
+    // main panel's row count, which overcounts what the result table's own
+    // viewport shows (the section stack sits above it) — so the computed
+    // `max` was too low and wheel-down looked dead well before the last
+    // row. The scrollbar thumb was paint-only: `DataTableLayout::hit_test`
+    // has no concept of the strip it reserves for it, so a click/drag there
+    // fell through to a row hit, same gap #1094 found (and fixed) for
+    // Audit. Both are fixed in `reports.rs`
+    // (`reports_table_visible_rows` / `reports_scrollbar_hit` /
+    // `reports_apply_vscroll`) and wired in `events.rs`.
+
+    /// A same-shape `ReportResult` with `n` rows, each uniquely labelled
+    /// `ROW-000`..`ROW-{n-1:03}` so a specific row's presence on screen
+    /// proves exactly how far the table has scrolled.
+    fn reports_result_json_many_rows(n: usize) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        let rows: Vec<String> = (0..n)
+            .map(|i| format!(r#"{{"issue": "ROW-{i:03}", "outcome": "merged"}}"#))
+            .collect();
+        format!(
+            r#"{{
+                    "report_id": "issue-activity",
+                    "generated_at": {now},
+                    "window": [{start}, {now}],
+                    "columns": ["issue", "outcome"],
+                    "rows": [{rows}],
+                    "notes": []
+                }}"#,
+            now = now,
+            start = now - 3600.0,
+            rows = rows.join(","),
+        )
+    }
+
+    /// Terminal size for the #1910 scroll tests: wide enough for both
+    /// columns, short enough (30 rows) that the 60-row fixture below needs
+    /// real scrolling — the table's own viewport works out to 24 visible
+    /// rows (`ROW-000`..`ROW-023` on the first frame), well short of 60.
+    const REPORTS_SCROLL_COLS: u16 = 140;
+    const REPORTS_SCROLL_ROWS: u16 = 30;
+
+    /// Dispatch a mouse-wheel event at `pos` — the shape `driver.click` /
+    /// `driver.mouse_down` use, but for `UiEvent::Scroll`. `dy` follows the
+    /// same sign convention as `mouse_main_scroll`'s `delta.y`: positive
+    /// scrolls up (toward the first row), negative scrolls down.
+    fn reports_wheel<A: quadraui::AppLogic>(
+        driver: &mut quadraui::tui::testing::TuiDriver<A>,
+        pos: (f32, f32),
+        dy: f32,
+    ) {
+        driver.dispatch(quadraui::UiEvent::Scroll {
+            widget: None,
+            delta: ScrollDelta::new(0.0, dy),
+            position: Point::new(pos.0, pos.1),
+        });
+        driver.render();
+    }
+
+    #[test]
+    fn reports_wheel_scrolls_the_result_table_both_directions_and_clamps() {
+        let mut driver = reports_driver(
+            &reports_result_json_many_rows(60),
+            REPORTS_SCROLL_COLS,
+            REPORTS_SCROLL_ROWS,
+        );
+        // Sanity on the unscrolled first frame: the fold is between
+        // ROW-023 (last visible) and ROW-024 (first hidden).
+        let anchor = driver
+            .find("ROW-000")
+            .expect("first row must render before any scroll");
+        assert!(
+            driver.find("ROW-024").is_none(),
+            "#1910: ROW-024 must start below the fold on the first frame:\n{}",
+            driver.screen()
+        );
+
+        // 12 wheel-down notches (3 rows each = 36) exactly reaches this
+        // fixture's max scroll (60 rows - 24 visible = 36), so the table
+        // ends showing ROW-036..ROW-059.
+        for _ in 0..12 {
+            reports_wheel(&mut driver, anchor, -1.0);
+        }
+        assert!(
+            driver.find("ROW-059").is_some(),
+            "#1910: 12 wheel-down notches must reach the last row:\n{}",
+            driver.screen()
+        );
+        assert!(
+            driver.screen().contains("ROW-036"),
+            "#1910: the table must have scrolled to show ROW-036 at the top:\n{}",
+            driver.screen()
+        );
+        assert!(
+            !driver.screen().contains("ROW-000"),
+            "#1910: ROW-000 must have scrolled off the top:\n{}",
+            driver.screen()
+        );
+
+        // Over-scrolling must clamp at the last row, not go past it (no
+        // blank rows, no panic on an out-of-range offset).
+        for _ in 0..5 {
+            reports_wheel(&mut driver, anchor, -1.0);
+        }
+        assert!(
+            driver.find("ROW-059").is_some(),
+            "#1910: extra wheel-down notches past the end must stay clamped \
+                 on the last row:\n{}",
+            driver.screen()
+        );
+
+        // Wheel back up to the top.
+        for _ in 0..12 {
+            reports_wheel(&mut driver, anchor, 1.0);
+        }
+        assert!(
+            driver.find("ROW-000").is_some(),
+            "#1910: wheeling back up the same number of notches must return \
+                 to the first row:\n{}",
+            driver.screen()
+        );
+
+        // And clamp at the top too — no negative offset.
+        for _ in 0..5 {
+            reports_wheel(&mut driver, anchor, 1.0);
+        }
+        assert!(
+            driver.find("ROW-000").is_some(),
+            "#1910: extra wheel-up notches past the top must stay clamped \
+                 on the first row:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// Column of the result table's vertical scrollbar (the rightmost `█`/
+    /// `░` glyphs `quadraui`'s rasteriser paints once `show_scrollbar` is
+    /// true and the content overflows), and the row range its track spans.
+    /// `None` if no scrollbar is on screen (nothing to scroll, or no result
+    /// yet).
+    fn reports_scrollbar_track(screen: &str) -> Option<(f32, f32, f32)> {
+        let mut x = None;
+        let mut y_min = f32::MAX;
+        let mut y_max = f32::MIN;
+        for (y, line) in screen.lines().enumerate() {
+            if let Some(col) = line.chars().position(|c| c == '█' || c == '░') {
+                x = Some(col as f32 + 0.5);
+                y_min = y_min.min(y as f32 + 0.5);
+                y_max = y_max.max(y as f32 + 0.5);
+            }
+        }
+        x.map(|x| (x, y_min, y_max))
+    }
+
+    #[test]
+    fn reports_scrollbar_thumb_drag_scrolls_the_table() {
+        let mut driver = reports_driver(
+            &reports_result_json_many_rows(60),
+            REPORTS_SCROLL_COLS,
+            REPORTS_SCROLL_ROWS,
+        );
+        let (sb_x, track_y0, track_y1) = reports_scrollbar_track(&driver.screen())
+            .unwrap_or_else(|| panic!("scrollbar must render for a 60-row result over a \
+                24-row viewport:\n{}", driver.screen()));
+
+        // Drag the thumb (currently at the top) to the bottom of the track.
+        // The nudge past `track_y1` (rather than landing exactly on it) is
+        // deliberate: `track_y1` is the *centre* of the last track cell
+        // `reports_scrollbar_track` found, and `reports_apply_vscroll`
+        // computes its fraction against the cell's far edge — so a target
+        // at the exact centre resolves to one row short of `max_scroll`
+        // after rounding. `+ 0.49` reaches that edge while staying inside
+        // the same terminal row (and so inside `ctx.in_main`'s bounds,
+        // which a real drag can never leave either) — a target that lands
+        // in the status-bar row below would fall outside `ctx.in_main`
+        // entirely and the drag would silently stop applying, exactly the
+        // failure this fixture's height was chosen to surface.
+        driver.mouse_down(sb_x, track_y0);
+        driver.mouse_move(sb_x, track_y1 + 0.49);
+        driver.mouse_up(sb_x, track_y1 + 0.49);
+        driver.render();
+        assert!(
+            driver.find("ROW-059").is_some(),
+            "#1910: dragging the scrollbar thumb to the bottom of the track \
+                 must scroll to the last row:\n{}",
+            driver.screen()
+        );
+        assert!(
+            !driver.screen().contains("ROW-000"),
+            "#1910: dragging to the bottom must scroll ROW-000 off screen:\n{}",
+            driver.screen()
+        );
+
+        // Drag back to the top the same way — nudged above `track_y0`'s
+        // centre but still inside the track's top row, for the same reason
+        // as the `+ 0.49` above.
+        driver.mouse_down(sb_x, track_y1);
+        driver.mouse_move(sb_x, track_y0 - 0.49);
+        driver.mouse_up(sb_x, track_y0 - 0.49);
+        driver.render();
+        assert!(
+            driver.find("ROW-000").is_some(),
+            "#1910: dragging the scrollbar thumb back to the top of the \
+                 track must scroll back to the first row:\n{}",
+            driver.screen()
+        );
+    }
+
+    #[test]
+    fn reports_scroll_offset_survives_panel_refresh() {
+        // #1910 acceptance: the offset must not snap back to the top while
+        // a report is being read — i.e. across ordinary repaints, not just
+        // across the click that produced them. `reports_idle_tick` (already
+        // used by the #1853 column-resize-persistence tests) is exactly
+        // that: a button-less mouse move that lets `run_periodic_work` run
+        // and forces a repaint, without itself touching scroll or selection.
+        let mut driver = reports_driver(
+            &reports_result_json_many_rows(60),
+            REPORTS_SCROLL_COLS,
+            REPORTS_SCROLL_ROWS,
+        );
+        let anchor = driver
+            .find("ROW-000")
+            .expect("first row must render before any scroll");
+        for _ in 0..5 {
+            reports_wheel(&mut driver, anchor, -1.0);
+        }
+        let scrolled = driver.screen();
+        assert!(
+            !scrolled.contains("ROW-000"),
+            "#1910: five wheel-down notches (15 rows) must have moved \
+                 ROW-000 off screen before the refresh check even starts:\n{scrolled}"
+        );
+
+        for _ in 0..3 {
+            reports_idle_tick(&mut driver);
+        }
+
+        let after_refresh = driver.screen();
+        assert!(
+            !after_refresh.contains("ROW-000"),
+            "#1910: an ordinary repaint (no click, no new run) must not \
+                 reset the scroll offset back to the top:\n{after_refresh}"
+        );
+        assert_eq!(
+            scrolled, after_refresh,
+            "#1910: the result table's painted rows must be pixel-identical \
+                 before and after an idle repaint — same scroll offset, same \
+                 rows on screen"
+        );
+    }
+

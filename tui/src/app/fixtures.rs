@@ -341,6 +341,7 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         // these are keyed.
         reports_column_overrides: None,
         reports_resize_col: None,
+        reports_vscroll_drag: false,
         reports_pending_export: None,
         reports_export_status: None,
         reports_export_rx: None,
