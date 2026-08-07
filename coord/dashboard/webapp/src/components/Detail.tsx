@@ -14,6 +14,15 @@
  * All write operations go through POST /api/pipeline/action; the pipeline data
  * is read from the same ['pipeline'] React-Query cache used by the Home screen
  * so updates are reflected immediately on both screens.
+ *
+ * Route (#1548): `/pipeline/:repo/:issue[/:tab]`, not `assignment_id` — an
+ * issue outlives any one assignment (work, then a fix, then another fix are
+ * separate `assignment_id`s for the same issue), and `repo` + `issue` is what
+ * a link pasted into a GitHub comment or Slack actually means by "that
+ * issue". `:tab` round-trips (so `/pipeline/repo/42/log` is a valid, stable
+ * address) but doesn't change what renders yet — the `Overview / Issue / Log
+ * / Findings / Summary` tab set is M-W2 scope (`docs/WEB_CONTROL_CENTER.md`);
+ * this component still renders its one flowing view regardless of `tab`.
  */
 import { useCallback, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
@@ -235,7 +244,7 @@ function stageStatus(currentStage: string): { label: string; className: string }
 // ── Main component ────────────────────────────────────────────────────────────
 
 export default function Detail() {
-  const { id } = useParams<{ id: string }>()
+  const { repo, issue } = useParams<{ repo: string; issue: string }>()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
 
@@ -247,7 +256,13 @@ export default function Detail() {
     queryFn: fetchPipeline,
   })
 
-  const view: PipelineView | null = pipeline?.find((v) => v.assignment_id === id) ?? null
+  // Keyed on repo + issue_number (#1548), not assignment_id — see the route
+  // comment above. `issue` arrives as a route-param string; PipelineView's
+  // `issue_number` is a number, so the comparison converts rather than the
+  // reverse (a leading-zero or malformed URL segment must fail the match,
+  // not silently coerce to some other issue's number).
+  const view: PipelineView | null =
+    pipeline?.find((v) => v.repo_name === repo && String(v.issue_number) === issue) ?? null
 
   // UI state
   const [diffExpanded, setDiffExpanded] = useState(false)
@@ -329,7 +344,11 @@ export default function Detail() {
           <h1 className="text-step-1 font-semibold text-foreground">Not found</h1>
         </header>
         <p className="text-sm text-muted-foreground">
-          Assignment <span className="font-mono">{id}</span> not found in the pipeline.
+          Issue{' '}
+          <span className="font-mono">
+            {repo}#{issue}
+          </span>{' '}
+          not found in the pipeline.
         </p>
       </div>
     )

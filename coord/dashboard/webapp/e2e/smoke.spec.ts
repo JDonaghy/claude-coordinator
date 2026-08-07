@@ -150,8 +150,8 @@ test.describe('coord webapp smoke suite (#741)', () => {
 
   /**
    * Core smoke 3: clicking a pipeline card must navigate to the Detail view
-   * for that issue.  The URL must include the assignment id, and the detail
-   * panel must render the issue title.
+   * for that issue.  The URL must be the repo/issue route (#1548), and the
+   * detail panel must render the issue title.
    *
    * Guards the click → react-router navigate → Detail component mount path.
    */
@@ -171,8 +171,9 @@ test.describe('coord webapp smoke suite (#741)', () => {
     // Click the first card.
     await page.getByText('Fix the dashboard rendering').click()
 
-    // The URL must include the assignment id.
-    await expect(page).toHaveURL(/work-1/)
+    // The URL must be the addressable repo/issue route (#1548), not the
+    // assignment id — an issue outlives any one assignment.
+    await expect(page).toHaveURL(/\/pipeline\/api\/42/)
 
     // The detail view must render the issue title.
     await expect(page.getByText('Fix the dashboard rendering')).toBeVisible()

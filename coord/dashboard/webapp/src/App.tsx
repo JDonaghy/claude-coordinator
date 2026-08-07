@@ -1,8 +1,10 @@
 import { lazy, Suspense } from 'react'
-import { BrowserRouter, Routes, Route } from 'react-router-dom'
+import { BrowserRouter, Navigate, Routes, Route } from 'react-router-dom'
 import Detail from '@/components/Detail'
+import SessionDetail from '@/components/SessionDetail'
 import { ShellLayout } from '@/shell/ShellLayout'
 import { EmptyDetail } from '@/shell/EmptyDetail'
+import { paths } from '@/routes/paths'
 import { ThemeProvider } from '@/components/ui/theme-provider'
 import { Toaster } from '@/components/ui/toaster'
 
@@ -25,25 +27,88 @@ const Gallery = lazy(() => import('@/components/Gallery'))
  * App root.  BrowserRouter is used here; the dashboard server serves index.html
  * as a SPA fallback for all non-API paths so deep links work on hard reload.
  *
- * Routing shape (#1547): `ShellLayout` is a react-router *layout route*, so
- * `/` and `/detail/:id` both render inside the responsive shell (rail + list +
- * detail on wide, the phone app on narrow) with the child route filling the
- * detail slot. The URLs themselves are unchanged — restructuring them for deep
- * links is the next story (#1548).
+ * Route tree (#1548) — every screen the app can show gets one address:
  *
- * `/terminal/:sessionId` stays deliberately *outside* the shell: the PTY pane
- * wants the whole viewport and brings its own key bar, and framing a terminal
- * in a rail plus a status bar would cost it rows on exactly the device (a
- * phone) where rows are scarcest.
+ *   /                                -> redirect to /pipeline (replace, so
+ *                                        it doesn't leave a dead entry back
+ *                                        button lands on)
+ *   /pipeline                        -> EmptyDetail in the detail slot
+ *   /pipeline/:repo/:issue           -> Detail (keyed on repo+issue, not
+ *                                        assignment_id -- see Detail.tsx)
+ *   /pipeline/:repo/:issue/:tab      -> Detail, tab param threaded through
+ *                                        for M-W2 to consume; round-trips
+ *                                        today without changing what renders
+ *   /sessions                        -> EmptyDetail
+ *   /sessions/:id                    -> SessionDetail
+ *   /board /machines /merge-queue
+ *   /milestones /audit /spend
+ *   /settings                        -> ComingSoon(view) -- placeholders for
+ *                                        the M-W2+ panels, addressable today
+ *                                        so a link to one isn't a 404 while
+ *                                        it's being built
+ *   *  (inside the shell)            -> RouteNotFound -- a real not-found
+ *                                        state for a genuinely unknown path,
+ *                                        rendered inside the shell (rail,
+ *                                        status bar) rather than a blank page
+ *
+ * Every route below `/pipeline` is a child of `ShellLayout`, the react-router
+ * *layout route*: the child fills the detail slot (rail + list + detail on
+ * wide, the phone app on narrow) and `ShellLayout` derives the rail selection
+ * and the list panel's content from the URL itself (`shellViewFromPath`)
+ * rather than from separately persisted state -- see `shellState.ts`'s doc
+ * comment.
+ *
+ * The `/` redirect is deliberately declared *outside* `ShellLayout`, as a
+ * sibling of it rather than one of its children. `AppShell` only mounts the
+ * detail slot -- the thing that would render a child route's `element` --
+ * when `showDetail` is true, and on narrow that's `false` until an item is
+ * selected (`detailActive`). A redirect placed under `ShellLayout` therefore
+ * silently never fires on a phone-sized cold load at `/`: `Outlet` is never
+ * mounted, so `<Navigate>`'s effect never runs, and the shell renders with no
+ * matched child at all -- exactly the "genuinely unknown route" case, so it
+ * falls through to the `*` not-found state instead of redirecting. Matching
+ * `/` *before* composing the shell sidesteps the whole class of bug: nothing
+ * about "should this redirect fire" may depend on shell layout state.
+ *
+ * `/terminal/:sessionId` stays deliberately *outside* the shell for a
+ * different reason: the PTY pane wants the whole viewport and brings its own
+ * key bar, and framing a terminal in a rail plus a status bar would cost it
+ * rows on exactly the device (a phone) where rows are scarcest.
  */
 export default function App() {
   return (
     <ThemeProvider>
       <BrowserRouter>
         <Routes>
+          <Route path="/" element={<Navigate to={paths.pipeline()} replace />} />
+
           <Route element={<ShellLayout />}>
-            <Route path="/" element={<EmptyDetail />} />
-            <Route path="/detail/:id" element={<Detail />} />
+            <Route path="/pipeline" element={<EmptyDetail />} />
+            <Route path="/pipeline/:repo/:issue" element={<Detail />} />
+            <Route path="/pipeline/:repo/:issue/:tab" element={<Detail />} />
+
+            <Route path="/sessions" element={<EmptyDetail />} />
+            <Route path="/sessions/:id" element={<SessionDetail />} />
+
+            {/* Placeholders for the M-W2+ panels (#1548) -- addressable now,
+                not a 404, so a bookmark or a pasted link survives the panel
+                shipping later. The rail marks each of these 'soon' and won't
+                navigate here on a click (railItems.ts); this is what a typed
+                or pasted link to one lands on in the meantime. */}
+            <Route path="/board" element={null} />
+            <Route path="/machines" element={null} />
+            <Route path="/merge-queue" element={null} />
+            <Route path="/milestones" element={null} />
+            <Route path="/audit" element={null} />
+            <Route path="/spend" element={null} />
+            <Route path="/settings" element={null} />
+
+            {/* Genuinely unknown path under the shell -- a typo'd URL, or a
+                link to a feature that no longer exists. `ShellLayout` puts
+                `RouteNotFound` in the *list* slot for this case (there is no
+                "current view" to hand a list to); this route's own element
+                stays empty so wide doesn't show the same message twice. */}
+            <Route path="*" element={null} />
           </Route>
           <Route
             path="/terminal/:sessionId"

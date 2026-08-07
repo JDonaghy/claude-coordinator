@@ -94,9 +94,9 @@ function renderDetail(viewOverride?: Partial<PipelineView>) {
     view,
     ...render(
       <QueryClientProvider client={queryClient}>
-        <MemoryRouter initialEntries={['/detail/work-1']}>
+        <MemoryRouter initialEntries={['/pipeline/myrepo/42']}>
           <Routes>
-            <Route path="/detail/:id" element={<Detail />} />
+            <Route path="/pipeline/:repo/:issue" element={<Detail />} />
           </Routes>
         </MemoryRouter>
       </QueryClientProvider>
@@ -114,9 +114,9 @@ describe('Detail — loading states', () => {
 
     render(
       <QueryClientProvider client={createTestQueryClient()}>
-        <MemoryRouter initialEntries={['/detail/work-1']}>
+        <MemoryRouter initialEntries={['/pipeline/myrepo/42']}>
           <Routes>
-            <Route path="/detail/:id" element={<Detail />} />
+            <Route path="/pipeline/:repo/:issue" element={<Detail />} />
           </Routes>
         </MemoryRouter>
       </QueryClientProvider>
@@ -131,9 +131,9 @@ describe('Detail — loading states', () => {
 
     render(
       <QueryClientProvider client={createTestQueryClient()}>
-        <MemoryRouter initialEntries={['/detail/work-1']}>
+        <MemoryRouter initialEntries={['/pipeline/myrepo/42']}>
           <Routes>
-            <Route path="/detail/:id" element={<Detail />} />
+            <Route path="/pipeline/:repo/:issue" element={<Detail />} />
           </Routes>
         </MemoryRouter>
       </QueryClientProvider>
@@ -144,16 +144,18 @@ describe('Detail — loading states', () => {
     })
   })
 
-  it('shows not-found message when id is absent from pipeline data', async () => {
-    // Pipeline has a different assignment
-    vi.mocked(fetchPipeline).mockResolvedValue([makeView({ assignment_id: 'other-id' })])
+  it('shows not-found message when the repo/issue is absent from pipeline data', async () => {
+    // Pipeline has a different issue entirely
+    vi.mocked(fetchPipeline).mockResolvedValue([
+      makeView({ repo_name: 'other-repo', issue_number: 999 }),
+    ])
     vi.mocked(fetchDiff).mockResolvedValue(makeDiff())
 
     render(
       <QueryClientProvider client={createTestQueryClient()}>
-        <MemoryRouter initialEntries={['/detail/work-1']}>
+        <MemoryRouter initialEntries={['/pipeline/myrepo/42']}>
           <Routes>
-            <Route path="/detail/:id" element={<Detail />} />
+            <Route path="/pipeline/:repo/:issue" element={<Detail />} />
           </Routes>
         </MemoryRouter>
       </QueryClientProvider>
@@ -327,9 +329,9 @@ describe('Detail — test gate', () => {
     const queryClient = createTestQueryClient()
     render(
       <QueryClientProvider client={queryClient}>
-        <MemoryRouter initialEntries={['/detail/work-1']}>
+        <MemoryRouter initialEntries={['/pipeline/myrepo/42']}>
           <Routes>
-            <Route path="/detail/:id" element={<Detail />} />
+            <Route path="/pipeline/:repo/:issue" element={<Detail />} />
           </Routes>
         </MemoryRouter>
       </QueryClientProvider>

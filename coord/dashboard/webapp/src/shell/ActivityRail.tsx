@@ -36,7 +36,10 @@ import type { ShellView } from './shellState'
 export interface ActivityRailProps {
   mode: ShellMode
   collapsed: boolean
-  view: ShellView
+  /** `null` when the current URL doesn't belong to any rail view (#1548) —
+   * e.g. a genuinely unknown route. Nothing in the rail lights up rather
+   * than falling back to a view that isn't actually selected. */
+  view: ShellView | null
   onSelect: (view: ShellView) => void
   onToggleCollapsed: () => void
   /** Wide only: whether the list column is minimised away. */
