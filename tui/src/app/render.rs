@@ -1132,7 +1132,25 @@ pub(crate) fn parse_json_events_readable(
 ) -> Vec<ListItem> {
     let type_val = match json_str(line, "type") {
         Some(t) => t,
-        None => return Vec::new(),
+        None => {
+            // #1954: a line with no JSON "type" field isn't necessarily
+            // noise — it's the `# agent=… repo=… argv=…` header every log
+            // starts with, or an `[sse error] …` diagnostic the watch pool
+            // injects when the stream itself fails (see
+            // `settings_ui::drain_pool_entry`). Silently dropping it here
+            // used to destroy the only evidence of *why* a stream died.
+            // Render it verbatim instead — skip only genuinely blank lines.
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return Vec::new();
+            }
+            let color = if trimmed.starts_with("[sse error]") {
+                Color::rgb(220, 100, 100)
+            } else {
+                Color::rgb(140, 140, 140)
+            };
+            return vec![activity_item(trimmed, color)];
+        }
     };
 
     match type_val.as_str() {
@@ -3453,6 +3471,25 @@ impl CoordApp {
                         }
                     }
                     if sse.done {
+                        // #1954: a stream that ended without ever delivering
+                        // a single recognizable log event (no line with a
+                        // JSON "type" field — e.g. it died on connection
+                        // errors before any turn data arrived, so `lines`
+                        // holds only `[sse error] …` diagnostics or nothing
+                        // at all) has no real content for the parse above to
+                        // show. Defect-1 now renders those diagnostic lines
+                        // verbatim instead of dropping them, but the actual
+                        // log is still the thing worth showing — it's
+                        // reachable over `GET /logs/{id}` (or the local
+                        // file) for the life of the worker, so fall back to
+                        // it rather than leaving the pane holding only a
+                        // couple of error lines and a bare end-of-stream
+                        // marker.
+                        let has_real_content =
+                            sse.lines.iter().any(|l| json_str(l, "type").is_some());
+                        if !has_real_content {
+                            items.extend(self.get_activity_log(&a.id, &a.machine));
+                        }
                         items.push(kv_item(
                             "",
                             "  ── stream ended ──",

@@ -12646,6 +12646,77 @@
         assert!(app.watch_pool[TEST_AID].sse.lines.is_empty());
     }
 
+    // ── #1954: fail-limit latch must not be permanent ───────────────────────
+
+    #[test]
+    fn drain_sse_watch_retries_after_backoff_once_latched() {
+        // Simulate a stream that hit the 3-failures/10s guard well in the
+        // past (first_fail_at 25s ago — comfortably past the backoff
+        // window). Before #1954 `done=true` meant dead forever; now the
+        // next drain tick should clear the latch and attempt a fresh
+        // reconnect on its own, with no `R` keypress required.
+        let mut app = make_app_default();
+        let (mut state, _tx) = make_sse_state_pair();
+        state.done = true;
+        state.fail_count = 3;
+        state.first_fail_at = Some(Instant::now() - Duration::from_secs(25));
+        install_watch_ctx(&mut app, state);
+
+        let changed = app.drain_pool_entry(TEST_AID);
+        assert!(
+            changed,
+            "clearing an elapsed latch should report a redraw-worthy change"
+        );
+
+        let sse = &app.watch_pool[TEST_AID].sse;
+        assert!(
+            !sse.done,
+            "backoff elapsed — the stream must no longer be latched dead"
+        );
+        assert_eq!(
+            sse.fail_count, 0,
+            "the failure window must reset so the retry gets a clean slate"
+        );
+    }
+
+    #[test]
+    fn drain_sse_watch_stays_latched_before_backoff_elapses() {
+        // A stream latched moments ago must NOT retry yet — that would
+        // defeat the point of the fail-limit guard (avoiding a tight
+        // reconnect loop against a genuinely broken host).
+        let mut app = make_app_default();
+        let (mut state, _tx) = make_sse_state_pair();
+        state.done = true;
+        state.fail_count = 3;
+        state.first_fail_at = Some(Instant::now());
+        install_watch_ctx(&mut app, state);
+
+        let changed = app.drain_pool_entry(TEST_AID);
+        assert!(!changed, "should not retry before the backoff window elapses");
+        assert!(
+            app.watch_pool[TEST_AID].sse.done,
+            "should remain latched until the backoff window passes"
+        );
+    }
+
+    #[test]
+    fn drain_sse_watch_clean_end_never_auto_retries() {
+        // A clean stream end (the `Done` message, fail_count never bumped)
+        // must never be treated as retry-eligible no matter how much
+        // wall-clock time passes — the assignment already finished, so
+        // there is nothing left to reconnect to.
+        let mut app = make_app_default();
+        let (mut state, _tx) = make_sse_state_pair();
+        state.done = true;
+        state.fail_count = 0;
+        state.first_fail_at = None;
+        install_watch_ctx(&mut app, state);
+
+        let changed = app.drain_pool_entry(TEST_AID);
+        assert!(!changed);
+        assert!(app.watch_pool[TEST_AID].sse.done);
+    }
+
     #[test]
     fn close_watch_clears_focus_but_keeps_pool() {
         // close_watch() should clear watch_focused (hiding the overlay) but
@@ -19816,6 +19887,62 @@
         );
     }
 
+    // ── #1954: non-JSON lines must survive, not vanish ──────────────────────
+
+    #[test]
+    fn readable_non_json_header_line_renders_verbatim() {
+        // Every agent log starts with a `# agent=… repo=… argv=…` header —
+        // no JSON "type" field. Before #1954 this returned an empty Vec,
+        // silently dropping it (and, worse, dropping the `[sse error] …`
+        // diagnostic the watch pool injects on the same code path).
+        let line = "# agent=claude repo=my-repo argv=[\"claude\", \"-p\"]";
+        let mut turn = 0;
+        let items = parse_json_events_readable(line, &mut turn, None, 80);
+        assert!(
+            !items.is_empty(),
+            "a non-JSON header line must still produce a renderable item"
+        );
+        let all_text: String = items
+            .iter()
+            .flat_map(|i| i.text.spans.iter().map(|s| s.text.as_str()))
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            all_text.contains("agent=claude"),
+            "header text must survive verbatim: {all_text:?}"
+        );
+    }
+
+    #[test]
+    fn readable_sse_error_line_renders_verbatim() {
+        // settings_ui::drain_pool_entry pushes `[sse error] …` into
+        // `sse.lines` specifically so a connection failure is diagnosable.
+        // It has no JSON "type" field, so it must survive the same
+        // non-JSON fallback as the header line above.
+        let line = "[sse error] connection refused";
+        let mut turn = 0;
+        let items = parse_json_events_readable(line, &mut turn, None, 80);
+        let all_text: String = items
+            .iter()
+            .flat_map(|i| i.text.spans.iter().map(|s| s.text.as_str()))
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            all_text.contains("[sse error] connection refused"),
+            "sse error diagnostic must survive verbatim: {all_text:?}"
+        );
+    }
+
+    #[test]
+    fn readable_blank_non_json_line_is_still_skipped() {
+        // Genuinely blank lines (or pure whitespace) are not useful
+        // diagnostics — they should still be dropped, not rendered as
+        // empty rows.
+        let mut turn = 0;
+        assert!(parse_json_events_readable("", &mut turn, None, 80).is_empty());
+        assert!(parse_json_events_readable("   ", &mut turn, None, 80).is_empty());
+    }
+
     // ── user_epoch_per_turn / user_epoch_elapsed (#309) ─────────────────────
 
     #[test]
@@ -20131,6 +20258,98 @@
             driver.screen_contains(LOG_TEXT),
             "Streaming log content must appear on the Pipeline Log tab:\n{}",
             driver.screen()
+        );
+    }
+
+    /// #1954: a stream that latched dead (3 failures/10s) before a single
+    /// real log line ever arrived — `sse.lines` holds only the
+    /// `[sse error] …` diagnostic `settings_ui::drain_pool_entry` injects —
+    /// must show both that diagnostic (defect 1: non-JSON lines used to be
+    /// dropped silently) *and* fall back to the full log fetch (defect 2:
+    /// the Log tab used to render nothing but a bare `── stream ended ──`
+    /// marker in this exact state). Regression coverage for the #1929 live
+    /// incident this issue describes.
+    #[test]
+    fn tuidriver_dead_stream_with_only_diagnostics_falls_back_to_full_log() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        // Assignment id chosen so it can never collide with a real
+        // ~/.coord/logs/{id}.log on the machine running this test — the
+        // fallback path (get_activity_log) reads real files on disk.
+        let asgn = make_assignment_typed("running", 1954, "my-repo", Some("work"));
+        let aid = asgn.id.clone();
+
+        let mut app = make_test_app(BoardData {
+            assignments: vec![asgn],
+            ..BoardData::default()
+        });
+
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 1954,
+            title: "Dead stream test issue".to_string(),
+            body: String::new(),
+            repo_slug: "acme/my-repo".to_string(),
+            coord_repo: Some("my-repo".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string(), "status:ready".to_string()],
+            is_closed: false,
+        }];
+        app.pipeline_sel = Some(0);
+        app.pipeline_detail_tab = PipelineDetailTab::Log;
+        app.active_view = SidebarView::Pipeline;
+
+        // Simulate the #1929 incident: the SSE connection failed 3× before
+        // any turn data arrived, so `lines` holds only the injected
+        // diagnostic — no line in it has a JSON "type" field.
+        let now = Instant::now();
+        let (_, rx) = std::sync::mpsc::channel::<SseWatchMsg>();
+        app.watch_pool.insert(
+            aid,
+            WatchContext {
+                state: WatchState {
+                    assignment_id: "id-1954-dead".to_string(),
+                    machine: "nonexistent-test-machine".to_string(),
+                    repo: "my-repo".to_string(),
+                    issue_number: 1954,
+                    assignment_type: "work".to_string(),
+                    scroll: usize::MAX,
+                },
+                sse: WatchSseState {
+                    rx,
+                    lines: vec!["[sse error] connection refused".to_string()],
+                    line_times: vec![now],
+                    current_turn: 0,
+                    last_event_id: 0,
+                    fail_count: 3,
+                    first_fail_at: Some(now),
+                    done: true,
+                    host: "nonexistent-test-machine".to_string(),
+                    pending_tail: String::new(),
+                },
+                inject_transcript: Vec::new(),
+                inject_sse_offsets: Vec::new(),
+                history_turns: Vec::new(),
+                last_focused_at: now,
+            },
+        );
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        let screen = driver.screen();
+
+        assert!(
+            screen.contains("sse error") && screen.contains("connection refused"),
+            "the SSE failure diagnostic must remain visible instead of being \
+             silently dropped:\n{screen}"
+        );
+        assert!(
+            screen.contains("Log unavailable") || screen.contains("host unknown"),
+            "a dead stream with no real log content must fall back to the \
+             full log fetch instead of showing only the diagnostic and a \
+             bare marker:\n{screen}"
+        );
+        assert!(
+            screen.contains("stream ended"),
+            "the terminal marker should still show once the stream is done:\n{screen}"
         );
     }
 
