@@ -2205,6 +2205,28 @@ def _openapi_spec() -> dict:
             }
         },
         "/milestone-gate": {
+            "get": {
+                "summary": (
+                    "#1930 (epic #1440): read one milestone's gate record "
+                    "for the exactly-one-overseer guard — a thin client's "
+                    "local DB never received what `save_milestone_gate` "
+                    "posted here."
+                ),
+                "parameters": [
+                    {
+                        "name": "repo_name", "in": "query", "required": True,
+                        "schema": {"type": "string"},
+                    },
+                    {
+                        "name": "tracking_issue", "in": "query", "required": True,
+                        "schema": {"type": "integer"},
+                    },
+                ],
+                "responses": {
+                    "200": {"description": "OK"},
+                    "400": {"description": "Missing/bad repo_name or tracking_issue"},
+                },
+            },
             "post": {
                 "summary": (
                     "Upsert a milestone's gate-walk record for `coord milestone "
@@ -4622,6 +4644,42 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             )
         return JSONResponse({"ok": True})
 
+    async def get_milestone_gate(request: Request) -> Response:
+        # #1930 (epic #1440): read one milestone's gate record so a thin
+        # client's exactly-one-overseer guard (`coord milestone dispatch`,
+        # and the "resume, don't restart" check in `coord milestone drive`)
+        # can see what `save_milestone_gate` wrote here instead of a local
+        # DB that never received it. Mirrors get_drive_queue above: `repo_name`
+        # + `tracking_issue` narrows to the (at most one) record for that
+        # milestone; both are required — unlike /drive-queue there is no
+        # "list them all" use case from a client, so this doesn't bother
+        # supporting it.
+        from coord import state  # noqa: PLC0415
+
+        repo_name = request.query_params.get("repo_name")
+        raw_issue = request.query_params.get("tracking_issue")
+        if not repo_name or raw_issue is None:
+            return JSONResponse(
+                {"error": "repo_name and tracking_issue are required"},
+                status_code=400,
+            )
+        try:
+            tracking_issue = int(raw_issue)
+        except (TypeError, ValueError):
+            return JSONResponse(
+                {"error": "tracking_issue must be an int"}, status_code=400
+            )
+        try:
+            record = state._get_milestone_gate_local(
+                repo_name=repo_name, tracking_issue=tracking_issue
+            )
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "milestone-gate read failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse({"entries": [record] if record else []})
+
     async def post_milestone_gate(request: Request) -> Response:
         # #1929 (epic #1440): upsert a milestone's gate record on the shared
         # DB for a thin client's `coord milestone drive`. Mirrors
@@ -6842,6 +6900,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route("/completion", post_completion, methods=["POST"]),
         Route("/dispatched-work", post_dispatched_work, methods=["POST"]),
         Route("/milestone-drain", post_milestone_drain, methods=["POST"]),
+        Route("/milestone-gate", get_milestone_gate, methods=["GET"]),
         Route("/milestone-gate", post_milestone_gate, methods=["POST"]),
         Route("/dispatched", post_dispatched, methods=["POST"]),
         Route("/test-verdict", post_test_verdict, methods=["POST"]),

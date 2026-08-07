@@ -3132,15 +3132,47 @@ def list_milestone_gates() -> list[dict]:
     """Every milestone currently under gate control.
 
     Local-DB only (no thin-client routing), matching
-    :func:`list_milestone_drains`: the only reader is the daemon's own tick
-    loop, which always runs against the canonical DB directly.
+    :func:`list_milestone_drains`: the only readers are the daemon's own
+    tick loop and :func:`_get_milestone_gate_local` (which single-record
+    reads — including a thin client's, via ``GET /milestone-gate`` — funnel
+    through), both of which always run against the canonical DB directly.
     """
     conn = get_connection()
     return _load_milestone_gates_raw(conn)
 
 
 def get_milestone_gate(*, repo_name: str, tracking_issue: int) -> dict | None:
-    """One milestone's gate record, or ``None`` if it isn't gate-driven."""
+    """One milestone's gate record, or ``None`` if it isn't gate-driven.
+
+    Routes to the daemon when ``board_service`` is set (#1930, epic #1440),
+    mirroring :func:`get_drive_queue_entry`. This is the read half of the
+    exactly-one-overseer guard in ``coord milestone dispatch`` (and the
+    "resume, don't restart" check in ``coord milestone drive``) — both run
+    on thin clients whose local DB never received the record
+    :func:`save_milestone_gate` posted to the daemon, since all writes route
+    away when a board service is configured. Unlike most routed readers
+    here, a routing failure is **not** swallowed to ``None`` — see
+    :func:`coord.client.fetch_milestone_gate` — so it propagates to the
+    caller, which must treat "couldn't ask" as "assume gated, refuse" rather
+    than silently proceed.
+    """
+    svc = _board_service()
+    if svc is not None:
+        from coord.client import fetch_milestone_gate  # noqa: PLC0415
+
+        return fetch_milestone_gate(svc, repo_name, tracking_issue)
+    return _get_milestone_gate_local(repo_name=repo_name, tracking_issue=tracking_issue)
+
+
+def _get_milestone_gate_local(*, repo_name: str, tracking_issue: int) -> dict | None:
+    """Local-DB-only lookup — the daemon's own reader, never routed.
+
+    Used both as :func:`get_milestone_gate`'s local-mode fallback and
+    directly by the daemon's ``GET /milestone-gate`` handler, matching
+    :func:`_get_drive_queue_entry_local`'s shape: the daemon must always
+    read its own canonical DB regardless of environment, never re-route to
+    itself over HTTP.
+    """
     for g in list_milestone_gates():
         if (
             g.get("repo_name") == repo_name

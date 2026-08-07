@@ -394,6 +394,40 @@ def fetch_drive_queue_entry(
     return None
 
 
+def fetch_milestone_gate(
+    svc: ServiceConfig,
+    repo_name: str,
+    tracking_issue: int,
+    *,
+    timeout: float = _DEFAULT_TIMEOUT,
+) -> dict | None:
+    """GET one milestone's gate record from the daemon (#1930, epic #1440).
+
+    Deliberately does **not** follow the fail-soft-to-``None`` convention
+    the other ``fetch_*`` helpers in this module use. The one caller that
+    matters, ``coord milestone dispatch``'s exactly-one-overseer guard, must
+    be able to tell "confirmed not gate-controlled" apart from "couldn't
+    ask the daemon" — collapsing both to ``None`` would let a thin client
+    that can't reach the daemon silently race a gate tick it has no way to
+    see, which is exactly the bug #1930 exists to close. Raises
+    ``httpx.HTTPError`` on a network/HTTP failure and ``ValueError`` on a
+    malformed body; callers should treat either as "unknown — refuse rather
+    than risk a race", not swallow it.
+    """
+    resp = httpx.get(
+        f"{svc.url}/milestone-gate",
+        params={"repo_name": repo_name, "tracking_issue": tracking_issue},
+        headers=_headers(svc),
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    entries = data.get("entries") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        raise ValueError("malformed /milestone-gate response: no 'entries' list")
+    return entries[0] if entries else None
+
+
 def fetch_audit_log(
     svc: ServiceConfig,
     *,
