@@ -69,7 +69,6 @@ Linux/macOS only.
 
 from __future__ import annotations
 
-import fcntl
 import json
 import logging
 import os
@@ -83,9 +82,7 @@ import struct
 import subprocess
 import sys
 import tempfile
-import termios
 import time
-import tty
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Sequence
@@ -1140,7 +1137,10 @@ def _launch_via_pty(
     can delegate to it both directly (no tmux) and as a fallback from the
     tmux path.
     """
+    import fcntl  # stdlib, Unix-only — deferred for platform safety  # noqa: PLC0415
     import pty  # stdlib, Unix-only — deferred for platform safety  # noqa: PLC0415
+    import termios  # stdlib, Unix-only — deferred for platform safety  # noqa: PLC0415
+    import tty  # stdlib, Unix-only — deferred for platform safety  # noqa: PLC0415
 
     fd_in = sys.stdin.fileno()
     fd_out = sys.stdout.fileno()

@@ -16,7 +16,9 @@ import json
 import sqlite3
 from pathlib import Path
 
-COORD_DIR = Path.home() / ".coord"
+from coord.platform_paths import default_coord_dir
+
+COORD_DIR = default_coord_dir()
 DB_PATH = COORD_DIR / "coord.db"
 
 _conn: sqlite3.Connection | None = None

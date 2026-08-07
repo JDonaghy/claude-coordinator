@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import yaml
 
 from coord.models import Machine, QuietHours, Repo, WorkerPermissionsConfig
+from coord.platform_paths import default_coord_dir
 
 
 DEFAULT_CONFIG_PATH = Path("coordinator.yml")
@@ -21,7 +22,7 @@ DEFAULT_CONFIG_PATH = Path("coordinator.yml")
 # Canonical config home — works on a machine that has no repo checkout, mirroring
 # where ``~/.coord/coord.db`` and ``~/.coord/client.toml`` already live.  This is
 # the recommended location; ``./coordinator.yml`` stays a development fallback.
-USER_CONFIG_PATH = Path.home() / ".coord" / "coordinator.yml"
+USER_CONFIG_PATH = default_coord_dir() / "coordinator.yml"
 
 
 def resolve_config_path() -> Path:

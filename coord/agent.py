@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 from coord import cargo_cache
+from coord.platform_paths import default_coord_dir
 
 if TYPE_CHECKING:
     # Type-only import to give `_spawn_pty` a precise annotation without
@@ -36,7 +37,7 @@ if TYPE_CHECKING:
     from coord.providers.claude_pty import ClaudePtyProvider
 
 
-DEFAULT_STATE_DIR = Path.home() / ".coord"
+DEFAULT_STATE_DIR = default_coord_dir()
 DEFAULT_WORKER_BINARY = "claude"
 
 # Module logger — surfaced in the daemon / agent server logs so agent-side

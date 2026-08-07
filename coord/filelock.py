@@ -17,27 +17,79 @@ exactly the deploy step #1616 requires) can never strand the pipeline behind
 a lock nobody holds.  The lock is advisory and per-open-file-description, so
 the two callers must both go through this class for it to mean anything.
 
-POSIX-only, like the rest of the fleet's session machinery (see
-``coord/interactive.py``'s note on ``fcntl``).
+Cross-platform (#1156): POSIX uses ``fcntl.flock``; Windows has no ``fcntl``,
+so it goes through ``msvcrt.locking`` instead, behind the same non-blocking
+try/timeout/``LockBusy`` contract.  ``msvcrt.locking`` locks a byte range
+rather than the whole file, so both backends lock/unlock the same single byte
+at offset 0 — irrelevant to callers, who never read/write through the lock
+fd, only hold it.  Whichever backend is live, the process-death safety
+property above holds: both OS lock primitives are released when the holding
+process exits, even if it is killed without a chance to call
+:meth:`FileLock.release`.
 """
 
 from __future__ import annotations
 
 import errno
-import fcntl
 import os
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# ``fcntl``/``msvcrt`` are both deferred into the two functions below rather
+# than imported at module level: on POSIX, ``msvcrt`` genuinely doesn't
+# exist; on Windows, ``fcntl`` doesn't.  Deferring means this module (and
+# every top-level importer of it, notably `coord.drive`) loads cleanly on
+# either platform -- only the codepath actually exercised at lock time needs
+# its platform's module to be importable (#1156).
 
 
 class LockBusy(Exception):
     """Someone else holds the lock."""
 
 
+def _lock_exclusive_nonblocking(fd: int) -> None:
+    """Try to take an exclusive, non-blocking lock on *fd*.
+
+    Raises ``OSError`` with an ``errno`` matching the POSIX "already locked"
+    codes (``EACCES``/``EAGAIN``) on contention, on both backends, so
+    :meth:`FileLock.acquire`'s retry/timeout loop below needs no
+    platform branch of its own.
+    """
+    if sys.platform == "win32":
+        import msvcrt  # stdlib, Windows-only -- deferred for platform safety  # noqa: PLC0415
+
+        try:
+            # ``msvcrt.locking`` locks relative to the file's current
+            # position; ``acquire`` always hands us a freshly-opened fd
+            # positioned at 0, so this locks the single byte at offset 0 —
+            # a stable, single-byte region every caller agrees on.
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
+            raise OSError(errno.EACCES, exc.strerror or str(exc)) from exc
+    else:
+        import fcntl  # stdlib, POSIX-only -- deferred for platform safety  # noqa: PLC0415
+
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock(fd: int) -> None:
+    if sys.platform == "win32":
+        import msvcrt  # stdlib, Windows-only -- deferred for platform safety  # noqa: PLC0415
+
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl  # stdlib, POSIX-only -- deferred for platform safety  # noqa: PLC0415
+
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
 @dataclass
 class FileLock:
-    """``flock``-based advisory lock, the Python twin of the bash ``flock -n``."""
+    """Advisory lock, the Python twin of the bash ``flock -n`` -- ``fcntl.flock``
+    on POSIX, ``msvcrt.locking`` on Windows (see module docstring)."""
 
     path: Path
     _fd: int | None = field(default=None, init=False, repr=False)
@@ -49,7 +101,7 @@ class FileLock:
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                _lock_exclusive_nonblocking(fd)
                 self._fd = fd
                 return
             except OSError as exc:
@@ -65,7 +117,7 @@ class FileLock:
         if self._fd is None:
             return
         try:
-            fcntl.flock(self._fd, fcntl.LOCK_UN)
+            _unlock(self._fd)
         finally:
             os.close(self._fd)
             self._fd = None
