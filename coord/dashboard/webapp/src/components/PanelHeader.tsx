@@ -8,8 +8,20 @@
  * icon row with no head, so without this the phone would lose the app's
  * identity entirely; from 768px up the rail head carries it and a second mark
  * here would just be a duplicate.
+ *
+ * The theme toggle (#1551) is narrow-only for the same reason and by the same
+ * mechanism: `docs/mocks/web/pipeline-narrow.html`'s per-view topbar carries
+ * its own Theme icon-button (`id="theme"`) because the bottom nav has no room
+ * for it — narrow's rail deliberately shows only `ready` nav entries
+ * (`ActivityRail.tsx`) and a dimmed un-tappable settings-style control there
+ * would eat thumb real estate. From 768px up the rail foot already has
+ * "Theme" (`ActivityRail.tsx`), so this one is `md:hidden` — CSS `display:
+ * none`, which Playwright's (and every screen reader's) accessibility-tree
+ * role queries already exclude, exactly like the `co` mark above — never two
+ * "Switch to … theme" buttons live in the tree at once.
  */
 import type { ReactNode } from 'react'
+import { ThemeToggle } from '@/components/ui/theme-toggle'
 
 export interface PanelHeaderProps {
   title: string
@@ -36,7 +48,12 @@ export function PanelHeader({ title, count, countLabel = 'tracked', children }: 
           {count} {countLabel}
         </span>
       )}
-      {children && <div className="ml-auto flex items-center gap-2">{children}</div>}
+      <div className="ml-auto flex items-center gap-2">
+        {children}
+        <div className="md:hidden">
+          <ThemeToggle />
+        </div>
+      </div>
     </header>
   )
 }

@@ -12,6 +12,7 @@ import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import Home from '@/components/Home'
+import { ThemeProvider } from '@/components/ui/theme-provider'
 import { type PipelineView, type SessionInfo } from '@/api/client'
 
 // ── Mock API client + navigate ────────────────────────────────────────────────
@@ -93,13 +94,15 @@ function createTestQueryClient() {
 
 function renderHome() {
   return render(
-    <QueryClientProvider client={createTestQueryClient()}>
-      <MemoryRouter initialEntries={['/']}>
-        <Routes>
-          <Route path="/" element={<Home />} />
-        </Routes>
-      </MemoryRouter>
-    </QueryClientProvider>,
+    <ThemeProvider>
+      <QueryClientProvider client={createTestQueryClient()}>
+        <MemoryRouter initialEntries={['/']}>
+          <Routes>
+            <Route path="/" element={<Home />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>
+    </ThemeProvider>,
   )
 }
 

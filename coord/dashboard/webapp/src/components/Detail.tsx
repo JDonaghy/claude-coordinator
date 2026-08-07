@@ -35,6 +35,7 @@ import {
   type PipelineActionRequest,
 } from '@/api/client'
 import { cn } from '@/lib/utils'
+import { paths } from '@/routes/paths'
 
 // ── Toast ─────────────────────────────────────────────────────────────────────
 
@@ -264,6 +265,25 @@ export default function Detail() {
   const view: PipelineView | null =
     pipeline?.find((v) => v.repo_name === repo && String(v.issue_number) === issue) ?? null
 
+  // `navigate(-1)` is a silent no-op when there is no in-app history entry to
+  // pop -- exactly what happens on a cold deep-link load (#1551): a user
+  // follows a shared `/pipeline/repo/42` link (a bookmark, a notification, a
+  // pasted Slack URL -- precisely what #1548's route shape exists to make
+  // possible) directly into Detail, with nothing before it in the tab's
+  // history, and Back does nothing, stranding them here. React Router's
+  // browser history stamps `window.history.state.idx` with this tab's own
+  // navigation-stack position (0 at the very first entry it ever
+  // pushed/replaced); `idx > 0` means there really is a previous in-app entry
+  // to go back to. Falling back to the pipeline list route (rather than
+  // leaving the button a no-op, or leaving the SPA via `window.history.back()`
+  // straight to whatever opened the tab) matches what Back already means on
+  // wide -- "clear the detail selection, stay on the list".
+  const handleBack = useCallback(() => {
+    const idx = (window.history.state as { idx?: number } | null)?.idx
+    if (typeof idx === 'number' && idx > 0) navigate(-1)
+    else navigate(paths.pipeline())
+  }, [navigate])
+
   // UI state
   const [diffExpanded, setDiffExpanded] = useState(false)
   const [inFlight, setInFlight] = useState<string | null>(null)
@@ -335,7 +355,7 @@ export default function Detail() {
         <header className="mb-6 flex items-center gap-3">
           <button
             type="button"
-            onClick={() => navigate(-1)}
+            onClick={handleBack}
             className="rounded p-1 text-muted-foreground hover:text-foreground"
             aria-label="Back"
           >
@@ -388,11 +408,13 @@ export default function Detail() {
       <header className="mb-5">
         <div className="flex items-start gap-2">
           {/* Back is the phone's drill-out and the wide layout's "clear the
-              selection" — `navigate(-1)` does the right thing for both, since
-              in each case the previous entry is the list at `/`. */}
+              selection" — `handleBack` pops in-app history when there is any
+              (the previous entry is the list at `/` either way), and falls
+              back to the pipeline list route on a cold deep-link load, where
+              there is none (#1551). */}
           <button
             type="button"
-            onClick={() => navigate(-1)}
+            onClick={handleBack}
             aria-label="Back"
             className="-ml-1 shrink-0 rounded p-1 text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
