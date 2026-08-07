@@ -121,6 +121,7 @@ from coord.worker_events import is_usage_limit_reason
 # See `_STALE_SMOKE_MARKERS` / `_is_stale_smoke_reason` below.
 from coord.merge_queue import (
     STALE_SMOKE_MARKERS as _mq_stale_smoke_markers,
+    is_ci_pending_reason,
     is_stale_smoke_reason as _mq_is_stale_smoke_reason,
 )
 
@@ -1755,6 +1756,29 @@ def _decide_merge(
         )
     if divergence is not None:
         return _escalate_merge(state, state.merge_status, gate_kind=divergence)
+
+    # #1891: a CI verdict that has not arrived is not a CI verdict of "no" —
+    # checked BEFORE the `status` switch below (and regardless of what
+    # `status` itself reads) because `merge_reason` is the more robust of the
+    # two: `drive_state._merge_entry` falls back to the raw queue row's own
+    # *persisted* `error` whenever the live plan's re-evaluation comes back
+    # empty (e.g. `_gate_refresher`'s periodic snapshot lagging or gapping a
+    # real `coord merge` attempt's fresher read — see
+    # `coord.merge_queue.CI_PENDING_PREFIX`'s docstring), while `merge_status`
+    # has no such fallback and can still read `""`/`"PENDING"`/`"READY"` in
+    # exactly that gap. #1891's incident was a drive burning its whole
+    # `--max-merge-attempts` budget (and then a drive-queue launch attempt)
+    # retrying a merge that only more real time — never another retry —
+    # could resolve. No number of retries makes a check that hasn't reported
+    # yet report sooner, so this is a bare wait, exactly like BLOCKED below,
+    # and it never spends `counters.merge_attempts`.
+    if is_ci_pending_reason(state.merge_reason):
+        return _wait(
+            label=(
+                "MERGE: CI checks have not reported yet — waiting, not "
+                f"retrying (#1891): {state.merge_reason}"
+            )
+        )
 
     status = state.merge_status
     if status.upper() == "HUMAN_REQUIRED":

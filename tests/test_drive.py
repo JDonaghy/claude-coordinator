@@ -1646,6 +1646,90 @@ def test_a_blocked_merge_waits_and_reports_the_gate():
     assert "CI running" in action.label
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# #1891: a CI verdict that has not arrived must not consume merge budget —
+# checked off `merge_reason` (which falls back to the raw queue row's own
+# persisted `error` when the board's live re-evaluation comes back empty),
+# NOT off `merge_status` — so this fires regardless of whatever `merge_status`
+# happens to read: "", "PENDING", "READY", or "BLOCKED" are all real values
+# the board can show for the exact same still-pending checks, depending on
+# whether `_gate_refresher`'s periodic snapshot caught up with a live `coord
+# merge` attempt's own fresher read. See `coord.merge_queue.CI_PENDING_PREFIX`.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.parametrize("status", ["", "PENDING", "READY", "BLOCKED"])
+def test_checks_pending_waits_regardless_of_which_status_the_board_shows(status):
+    """The board can legitimately show any of these for the SAME still-pending
+    checks (see the module comment above) — every one of them must wait, not
+    retry, as long as `merge_reason` names the pending checks."""
+    action = step(
+        approved_work(
+            merge_status=status,
+            merge_reason="CI running: build, lint",
+        )
+    )
+    assert action.kind == WAIT
+    assert "CI running: build, lint" in action.label
+    assert "not retrying" in action.label
+
+
+def test_checks_pending_never_spends_an_attempt_across_several_polls():
+    """Acceptance (#1891): `merge_attempts` does not increase across several
+    polls while checks remain pending — the exact accounting bug the GitHub
+    Actions outage of 2026-08-06 hit: three attempts, then `_die()`, for an
+    entry whose checks were merely starved of runners, not failing."""
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_merge_attempts=2)
+    s = approved_work(merge_status="", merge_reason="CI running: build")
+
+    for _ in range(5):
+        action = step(s, opts, counters=counters)
+        assert action.kind == WAIT
+        assert counters.merge_attempts == 0
+
+
+def test_checks_pending_reason_is_recognised_via_the_shared_predicate_not_ad_hoc_text():
+    """Guards against a future edit accidentally narrowing the match to the
+    board-render wording only — `process()`'s live `entry.error` uses the
+    identical `CI_PENDING_PREFIX`, and both must keep working."""
+    from coord.merge_queue import CI_PENDING_PREFIX, is_ci_pending_reason
+
+    assert is_ci_pending_reason(f"{CI_PENDING_PREFIX} build")
+    assert not is_ci_pending_reason("checks failed: build (failure)")
+    assert not is_ci_pending_reason("")
+    assert not is_ci_pending_reason(None)
+
+
+def test_a_genuinely_failed_check_still_walks_the_bounded_retry_path():
+    """Regression guard: this fix must not be readable as "ignore CI
+    failures". A `checks_failed` reason — even reaching the drive through the
+    SAME empty/PENDING/READY `merge_status` gap `checks_pending` can — is not
+    an `is_ci_pending_reason` match, so it falls through unchanged to the
+    existing bounded retry (RUN, capped, then exhausted)."""
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_merge_attempts=2)
+    s = approved_work(merge_status="", merge_reason="checks failed: build (failure)")
+
+    assert step(s, opts, counters=counters).kind == RUN
+    assert counters.merge_attempts == 1
+    assert step(s, opts, counters=counters).kind == RUN
+    assert counters.merge_attempts == 2
+    exhausted = step(s, opts, counters=counters)
+    assert exhausted.is_exit
+    assert "merge attempted 2 times without landing" in exhausted.message
+
+
+def test_a_genuinely_failed_check_reported_as_blocked_still_just_waits_like_before():
+    """When the board DOES correctly render `BLOCKED` for a failed check (the
+    common case), behaviour is byte-for-byte unchanged from before #1891 —
+    same as `test_a_blocked_merge_waits_and_reports_the_gate`, just with the
+    CI-failed wording instead of CI-running."""
+    action = step(approved_work(merge_status="BLOCKED", merge_reason="CI failed: build (failure)"))
+    assert action.kind == WAIT
+    assert "CI failed" in action.label
+
+
 # ── #1505: escalate on a status retrying can't fix ──────────────────────────
 
 

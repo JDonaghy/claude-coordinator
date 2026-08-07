@@ -64,9 +64,10 @@ def board(
     open_: tuple[int, ...] = (),
     active: tuple[int, ...] = (),
     sessions: tuple[int, ...] = (),
+    ci_pending: tuple[int, ...] = (),
 ) -> BoardView:
     facts: dict[str, IssueFacts] = {}
-    for issue in {*merged, *closed, *open_, *active}:
+    for issue in {*merged, *closed, *open_, *active, *ci_pending}:
         facts[entry_key(REPO, issue)] = IssueFacts(
             known=True,
             issue_state=(
@@ -74,6 +75,9 @@ def board(
             ),
             merged=issue in merged,
             active_work=issue in active,
+            # #1891: the board's current read of this issue's merge gate —
+            # nothing stronger than "CI checks have not reported yet".
+            merge_ci_pending=issue in ci_pending,
         )
     return BoardView(
         issues=facts,
@@ -188,6 +192,64 @@ def test_build_board_view_reads_merge_and_activity_from_work_like_rows():
     assert view.facts(entry_key(REPO, 1654)).open
     assert not view.facts(entry_key(REPO, 1660)).active_work
     assert view.live_sessions == frozenset({entry_key(REPO, 1654)})
+
+
+def test_build_board_view_reads_merge_ci_pending_from_the_live_plan_reason():
+    """#1891: the live `merge_plan` section (board-render time) is the
+    primary source — mirrors `drive_state._merge_entry`'s own resolution."""
+    view = build_board_view(
+        {
+            "merge_plan": [
+                {
+                    "repo_name": REPO, "issue_number": 1650,
+                    "reason": "CI running: build, lint",
+                },
+                {
+                    "repo_name": REPO, "issue_number": 1654,
+                    "reason": "CI failed: build (failure)",
+                },
+            ],
+            "merge_queue": [
+                {"repo_name": REPO, "issue_number": 1650, "error": None},
+                {"repo_name": REPO, "issue_number": 1654, "error": None},
+            ],
+        },
+        [],
+    )
+    assert view.facts(entry_key(REPO, 1650)).merge_ci_pending
+    assert not view.facts(entry_key(REPO, 1654)).merge_ci_pending
+
+
+def test_build_board_view_falls_back_to_the_raw_queue_rows_persisted_error():
+    """#1891: when the live plan's re-evaluation comes back with no reason
+    (e.g. a `_gate_refresher` snapshot that lagged or gapped a real `coord
+    merge` attempt's fresher read — see `CI_PENDING_PREFIX`'s docstring),
+    `merge_ci_pending` still sees the checks-pending signal through the raw
+    `merge_queue` row's own persisted `error` — exactly the fallback
+    `drive_state._merge_entry` uses for `merge_reason`."""
+    view = build_board_view(
+        {
+            "merge_plan": [
+                {"repo_name": REPO, "issue_number": 1650, "reason": None},
+            ],
+            "merge_queue": [
+                {
+                    "repo_name": REPO, "issue_number": 1650,
+                    "error": "CI running: build",
+                },
+            ],
+        },
+        [],
+    )
+    assert view.facts(entry_key(REPO, 1650)).merge_ci_pending
+
+
+def test_build_board_view_ci_pending_is_false_with_no_merge_sections_at_all():
+    """A board payload predating #1891 (or a standalone fetch with neither
+    section populated) degrades to `merge_ci_pending=False` everywhere,
+    never raises."""
+    view = build_board_view({"assignments": [], "issues": []}, [])
+    assert not view.facts(entry_key(REPO, 1650)).merge_ci_pending
 
 
 def test_unknown_issues_report_nothing_rather_than_raising():
@@ -635,6 +697,88 @@ def test_no_exit_reason_falls_back_to_the_synthesised_death_wording():
         "drive session died without landing the work"
         in plan.reconciles[0].reason
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# #1891: `parked` — a CI verdict that has not arrived must not consume merge
+# budget. Same "no session, no active work, nothing landed" evidence as
+# `retry`/`exhausted`, but the board's OWN current read of the issue names
+# nothing stronger than "CI checks have not reported yet"
+# (`IssueFacts.merge_ci_pending`) — so this goes straight to `STATE_PARKED`
+# instead: no attempt spent, no `blocked`, no escalation, and — unlike
+# `blocked` — no operator command needed to release it. See
+# `coord.drive_queue.STATE_PARKED`'s docstring.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def test_a_dead_drive_still_ci_pending_parks_without_spending_an_attempt():
+    entries = [entry(1650, position=3, state=STATE_RUNNING, attempts=0)]
+    plan = plan_tick(entries, board(ci_pending=(1650,)), capacity=1)
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "parked"
+    assert reconcile.updates["state"] == "parked"
+    assert "attempts" not in reconcile.updates
+    assert plan.blocked == ()
+    assert plan.launch is None  # nothing to launch — it is parked, not waiting
+
+
+def test_a_parked_entry_never_reaches_blocked_even_deep_into_the_attempt_budget():
+    """The whole point: an entry that would have exhausted retries (attempts
+    already at max_attempts - 1) still parks, not blocks, when the board
+    shows nothing but CI silence — attempts genuinely never move."""
+    entries = [
+        entry(1650, state=STATE_RUNNING, attempts=DEFAULT_MAX_ATTEMPTS - 1)
+    ]
+    plan = plan_tick(entries, board(ci_pending=(1650,)), capacity=1)
+    assert plan.reconciles[0].outcome == "parked"
+    assert plan.blocked == ()
+    assert plan.alert is None
+
+
+def test_a_parked_entry_resumes_to_waiting_and_launches_once_ci_reports():
+    """Acceptance: a parked entry resumes automatically on a later tick once
+    checks report, with no operator command — modelled here as the SAME
+    entry, now persisted as `parked`, ticked again against a board that no
+    longer shows `merge_ci_pending` for it."""
+    entries = [entry(1650, position=3, state="parked", attempts=0)]
+    plan = plan_tick(entries, board(), capacity=1)  # ci_pending cleared
+    resumed = [r for r in plan.reconciles if r.key == entry_key(REPO, 1650)]
+    assert [r.outcome for r in resumed] == ["resumed"]
+    assert resumed[0].updates["state"] == STATE_WAITING
+    assert "attempts" not in resumed[0].updates
+    # …and it falls straight into this SAME tick's launch selection — no
+    # human, no separate tick required.
+    assert plan.launch is not None and plan.launch.issue == 1650
+
+
+def test_a_still_parked_entry_is_not_relaunched_while_ci_is_still_pending():
+    entries = [entry(1650, position=3, state="parked", attempts=0)]
+    plan = plan_tick(entries, board(ci_pending=(1650,)), capacity=1)
+    assert plan.reconciles == ()  # still gated — nothing to report or write
+    assert plan.launch is None
+
+
+def test_a_parked_entry_that_lands_while_parked_reconciles_to_done():
+    entries = [entry(1650, position=3, state="parked", attempts=0)]
+    plan = plan_tick(entries, board(merged=(1650,), ci_pending=(1650,)), capacity=1)
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "done"
+    assert reconcile.updates["state"] == STATE_DONE
+    assert plan.launch is None
+
+
+def test_a_genuinely_dead_drive_without_ci_pending_still_retries_normally():
+    """No regression: without `merge_ci_pending`, a dead drive takes the
+    EXACT pre-#1891 path — this is byte-for-byte
+    `test_a_dead_drive_is_requeued_at_the_same_position_with_an_attempt_spent`
+    with an explicit (empty) `board()`, pinning that the new branch is
+    opt-in, not a default."""
+    entries = [entry(1650, position=3, state=STATE_RUNNING, attempts=0)]
+    plan = plan_tick(entries, board(), capacity=1)
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "retry"
+    assert reconcile.updates["state"] == STATE_WAITING
+    assert reconcile.updates["attempts"] == 1
 
 
 # ── plan_tick: a permanent dispatch refusal blocks straight away (#1844) ────
