@@ -293,3 +293,161 @@ def test_newest_rust_source_walk_on_a_missing_or_empty_dir_is_none(
     assert dlf._newest_rust_source_mtime(tmp_path / "nope") is None
     (tmp_path / "empty").mkdir()
     assert dlf._newest_rust_source_mtime(tmp_path / "empty") is None
+
+
+# ── webapp_bundle (#1834 lane 5) ───────────────────────────────────────────
+#
+# Same shape as tui_binary above, deliberately: a `dist/` bundle vs. the
+# webapp/ source tree it was built from, never a version comparison (see
+# this module's docstring for why version is the wrong question here).
+
+
+def test_webapp_bundle_absent_is_ok_not_warn(tmp_path) -> None:
+    """The common case — most machines never run `coord web --dist` — must
+    not read as a fault."""
+    result = dlf.probe_webapp_bundle(make_ctx(tmp_path))
+    assert result.severity is Severity.OK
+    assert result.headroom == "not present on this machine"
+    assert result.values["present"] is False
+
+
+def test_webapp_bundle_present_no_source_tree_is_ok(tmp_path) -> None:
+    dist = tmp_path / "coord-web-dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("")
+    result = dlf.probe_webapp_bundle(make_ctx(tmp_path))
+    assert result.severity is Severity.OK
+    assert "not found to compare" in result.headroom
+    assert result.values["present"] is True
+    assert "source_mtime" not in result.values
+
+
+def test_webapp_bundle_newer_than_source_is_ok(tmp_path) -> None:
+    checkout = tmp_path / "src" / "claude-coordinator"
+    src = checkout / "coord" / "dashboard" / "webapp" / "src"
+    src.mkdir(parents=True)
+    old = src / "App.tsx"
+    old.write_text("")
+    os.utime(old, (NOW - 3600, NOW - 3600))
+
+    dist = tmp_path / "coord-web-dist"
+    dist.mkdir()
+    os.utime(dist, (NOW, NOW))
+
+    ctx = make_ctx(
+        tmp_path, checkouts=(Checkout(name="coordinator", path=checkout),)
+    )
+    result = dlf.probe_webapp_bundle(ctx)
+    assert result.severity is Severity.OK
+    assert result.headroom == "up to date with webapp/ source"
+    assert result.values["source_mtime"] == pytest.approx(NOW - 3600)
+
+
+def test_webapp_bundle_older_than_source_is_warn(tmp_path) -> None:
+    checkout = tmp_path / "src" / "claude-coordinator"
+    src = checkout / "coord" / "dashboard" / "webapp" / "src"
+    src.mkdir(parents=True)
+    new = src / "App.tsx"
+    new.write_text("")
+    os.utime(new, (NOW, NOW))
+
+    dist = tmp_path / "coord-web-dist"
+    dist.mkdir()
+    os.utime(dist, (NOW - 9000, NOW - 9000))  # 2.5h before the source
+
+    ctx = make_ctx(
+        tmp_path, checkouts=(Checkout(name="coordinator", path=checkout),)
+    )
+    result = dlf.probe_webapp_bundle(ctx)
+    assert result.severity is Severity.WARN
+    assert "2.5h older" in result.headroom
+    assert "coord-web-dist-build.timer" in result.detail
+
+
+def test_webapp_bundle_exactly_equal_mtimes_is_ok_not_warn(tmp_path) -> None:
+    checkout = tmp_path / "src" / "claude-coordinator"
+    src = checkout / "coord" / "dashboard" / "webapp" / "src"
+    src.mkdir(parents=True)
+    ts = src / "App.tsx"
+    ts.write_text("")
+    os.utime(ts, (NOW, NOW))
+
+    dist = tmp_path / "coord-web-dist"
+    dist.mkdir()
+    os.utime(dist, (NOW, NOW))
+
+    ctx = make_ctx(
+        tmp_path, checkouts=(Checkout(name="coordinator", path=checkout),)
+    )
+    assert dlf.probe_webapp_bundle(ctx).severity is Severity.OK
+
+
+def test_webapp_bundle_source_walk_skips_node_modules_and_dist(tmp_path) -> None:
+    """A stale `dist/` sitting inside the source checkout, or a huge
+    `node_modules/`, must never be allowed to masquerade as "source"."""
+    checkout = tmp_path / "src" / "claude-coordinator"
+    src = checkout / "coord" / "dashboard" / "webapp" / "src"
+    src.mkdir(parents=True)
+    real = src / "App.tsx"
+    real.write_text("")
+    os.utime(real, (NOW - 10_000, NOW - 10_000))
+    for junk_dir in ("node_modules", "dist"):
+        d = src / junk_dir / "deep"
+        d.mkdir(parents=True)
+        junk = d / "generated.js"
+        junk.write_text("")
+        os.utime(junk, (NOW, NOW))
+
+    assert dlf._newest_webapp_source_mtime(src) == pytest.approx(NOW - 10_000)
+
+
+def test_webapp_bundle_reports_the_live_sha_from_the_symlink_target(tmp_path) -> None:
+    releases = tmp_path / "releases"
+    release_dir = releases / "abc123"
+    release_dir.mkdir(parents=True)
+    dist = tmp_path / "coord-web-dist"
+    dist.symlink_to(release_dir)
+
+    result = dlf.probe_webapp_bundle(make_ctx(tmp_path))
+    assert result.values["present"] is True
+    assert result.values["sha"] == "abc123"
+
+
+def test_resolve_webapp_dist_path_prefers_the_configured_path(tmp_path) -> None:
+    ctx = make_ctx(
+        tmp_path, thresholds=HealthConfig(webapp_dist_path="~/custom/dist")
+    )
+    assert dlf.resolve_webapp_dist_path(ctx) == tmp_path / "custom" / "dist"
+
+
+def test_resolve_webapp_source_dir_prefers_the_configured_path(tmp_path) -> None:
+    configured = tmp_path / "elsewhere" / "src"
+    ctx = make_ctx(
+        tmp_path, thresholds=HealthConfig(webapp_source_dir=str(configured))
+    )
+    assert dlf.resolve_webapp_source_dir(ctx) == configured
+
+
+def test_resolve_webapp_source_dir_falls_back_to_the_first_checkout_with_one(
+    tmp_path,
+) -> None:
+    checkout_a = tmp_path / "a"
+    checkout_a.mkdir()
+    checkout_b = tmp_path / "b"
+    (checkout_b / "coord" / "dashboard" / "webapp" / "src").mkdir(parents=True)
+    ctx = make_ctx(
+        tmp_path,
+        checkouts=(
+            Checkout(name="a", path=checkout_a),
+            Checkout(name="b", path=checkout_b),
+        ),
+    )
+    assert (
+        dlf.resolve_webapp_source_dir(ctx)
+        == checkout_b / "coord" / "dashboard" / "webapp" / "src"
+    )
+
+
+def test_resolve_webapp_source_dir_is_none_when_no_checkout_has_one(tmp_path) -> None:
+    ctx = make_ctx(tmp_path, checkouts=())
+    assert dlf.resolve_webapp_source_dir(ctx) is None

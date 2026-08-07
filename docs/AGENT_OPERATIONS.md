@@ -788,12 +788,34 @@ Three things follow, and they are why this command is shaped the way it is:
 | unit files vs `deploy/**` | each machine's `/health` | `unit_drift` / PATH shadow (#1831) |
 | `~/.coord-cli-venv` | each machine's `/health` | `cli_venv` (#1806) |
 | `coord-tui` binary vs `tui/` source | each machine's `/health` | `tui_binary` — until PKG-3/PKG-4 give it a real channel |
+| `coord web --dist` bundle vs `coord/dashboard/webapp/` source | each machine's `/health` | `webapp_bundle` / `fleet_webapp_bundle` — lane 5, staleness only (see below) |
 
-`.githooks/**` (lane 5 above) is deliberately **not** graded here: its failure
+`.githooks/**` (lane 6 above) is deliberately **not** graded here: its failure
 mode is the inverse — it is live everywhere at the next `git fetch`, with no
 release to be behind — so "is it at the released version?" is not a
-well-formed question for it. `~/.coord/coordinator.yml` provenance has its own
-sweep: `coord diagnose` (`coord/fleet_config_health.py`, #1779).
+well-formed question for it. `~/.coord/coordinator.yml` provenance (lane 7)
+has its own sweep: `coord diagnose` (`coord/fleet_config_health.py`, #1779).
+
+**Lane 5, the webapp bundle, is graded on different terms than every other
+row above — deliberately, not by oversight.** Every other lane compares
+against *the released version*: a pip version string that both an agent venv
+and a spawned `coord` can report. The webapp bundle has no such string to
+compare against. `deploy/coord-web-dist-build.timer` publishes it
+continuously off `origin/main`'s SHA, once a minute, **decoupled on purpose**
+from the `~/.coord-venv` release cadence every other lane rides (#1543) —
+that decoupling is the entire point of that pipeline, so folding it into the
+version-skew map above would manufacture permanent, meaningless "skew"
+between a semver string and a git SHA on every correctly-running fleet, not
+report a real defect. What `webapp_bundle` (machine-scope) /
+`fleet_webapp_bundle` (fleet-scope) check instead, on its own terms — the
+same shape `tui_binary`/`fleet_tui_binary` already use for the locally-built
+`coord-tui` binary — is whether the live bundle is *stale relative to the
+`coord/dashboard/webapp/` source tree it claims to have been built from*, and
+whether two machines both serving `coord web` agree on which build that is.
+A WARN there means "`coord-web-dist-build.timer` has stopped publishing",
+which is the failure mode this lane exists to catch; it says nothing about
+whether that publish is caught up with the latest tagged release, because
+that was never a question this pipeline answers.
 
 A host that does not answer is reported **UNKNOWN, never OK** — "we could not
 ask" must not render as "verified", which is the entire thesis of #1834.
