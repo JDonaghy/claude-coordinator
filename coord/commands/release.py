@@ -23,6 +23,8 @@ from pathlib import Path
 
 import click
 
+from coord.commands._common import _CONFIG_OPTION
+
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
@@ -164,3 +166,143 @@ def release_preflight(path_opt: str | None) -> None:
         f"release preflight OK — local main matches origin/main, working "
         f"tree clean, version {version} ready to tag."
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# `coord release verify` — the POST-release half (#1834)
+# ──────────────────────────────────────────────────────────────────────────
+#
+# `release-preflight` above guards the moment *before* a tag is pushed. It
+# says nothing about whether the release that came out the other end ever
+# reached the fleet — and on 2026-08-04 it demonstrably had not, while four
+# independent readouts said it had. See `coord/release_verify.py` for the
+# incident and the design rules; this file only owns the click surface.
+#
+# `release-preflight` stays registered as a flat top-level command for
+# backward compatibility (it is in every operator's muscle memory and in
+# docs/AGENT_OPERATIONS.md); the new `release` group carries `verify`, and
+# aliases `preflight` under it so the pair is discoverable together.
+
+
+@click.group("release", help="Release lifecycle checks (#1471, #1834).")
+def release_group() -> None:
+    """Pre-tag sanity checks and post-release fleet verification."""
+
+
+def _resolve_expected(expected: str | None, *, use_pypi: bool, index_url: str,
+                      timeout: float) -> tuple[str | None, str | None]:
+    """(expected version, warning) — the version every lane *should* be on.
+
+    ``--expected`` wins outright. ``--pypi`` asks the simple index (never the
+    JSON API — see ``coord.health.pypi`` for why that distinction is
+    load-bearing rather than pedantic). With neither, there is no absolute to
+    grade against and the command falls back to pure skew detection, which is
+    what actually caught 2026-08-04: nobody knew what to expect, but two
+    lanes disagreeing was already conclusive.
+    """
+    if expected:
+        return expected.lstrip("v"), None
+    if not use_pypi:
+        return None, None
+    from coord.health.pypi import latest_release  # noqa: PLC0415
+
+    try:
+        latest, _all = latest_release(
+            "claude-coordinator", index_url=index_url, timeout=timeout
+        )
+    except Exception as exc:  # noqa: BLE001 — read-only, degrade to skew-only
+        return None, f"could not read the PyPI simple index ({exc}); checking skew only"
+    if latest is None:
+        return None, "PyPI simple index returned no release; checking skew only"
+    return latest.raw, None
+
+
+@release_group.command(
+    "verify",
+    help=(
+        "Assert every deploy lane on every host actually reflects the "
+        "released version (#1834). Read-only; safe to run mid-flight."
+    ),
+)
+@_CONFIG_OPTION
+@click.option(
+    "--expected",
+    default=None,
+    help=(
+        "The version every lane must be on (leading 'v' optional). Without "
+        "it, the command reports skew BETWEEN lanes, which is what the "
+        "2026-08-04 incident actually looked like."
+    ),
+)
+@click.option(
+    "--pypi/--no-pypi",
+    "use_pypi",
+    default=False,
+    help="Resolve --expected from the PyPI simple index (the released version).",
+)
+@click.option("--machine", "machine_filter", default=None,
+              help="Only poll this machine (still reports it as one lane set).")
+@click.option("--timeout", default=5.0, show_default=True,
+              help="Per-host HTTP timeout, seconds.")
+@click.option("--json", "as_json", is_flag=True, help="Emit the report as JSON.")
+@click.option("-v", "--verbose", is_flag=True, help="Show each lane's resolved path.")
+@click.option(
+    "--exit-code/--no-exit-code",
+    default=True,
+    show_default=True,
+    help="Exit 2 on crit, 1 on warn/unknown (mirrors `coord health`).",
+)
+def release_verify(
+    config_path: Path,
+    expected: str | None,
+    use_pypi: bool,
+    machine_filter: str | None,
+    timeout: float,
+    as_json: bool,
+    verbose: bool,
+    exit_code: bool,
+) -> None:
+    """Post-release: prove the fleet is on the version you think it is.
+
+    Runs entirely over HTTP — each machine's own ``/health`` plus the
+    daemon's ``/board`` — so it works from a thin client with no checkout and
+    no credentials, and it never writes anything anywhere.
+    """
+    import json as _json  # noqa: PLC0415
+
+    from coord import release_verify as rv  # noqa: PLC0415
+    from coord.commands._common import _load_config  # noqa: PLC0415
+
+    config = _load_config(config_path)
+    index_url = getattr(getattr(config, "health", None), "pypi_index_url",
+                        "https://pypi.org/simple")
+    resolved, warning = _resolve_expected(
+        expected, use_pypi=use_pypi, index_url=index_url, timeout=timeout
+    )
+    if warning and not as_json:
+        click.echo(f"warning: {warning}", err=True)
+
+    machine_health, unreachable, daemon_host, daemon_name = rv.gather(
+        config, timeout=timeout, machine_filter=machine_filter
+    )
+    report = rv.verify(
+        machine_health=machine_health,
+        unreachable=unreachable,
+        daemon_host=daemon_host,
+        daemon_host_name=daemon_name,
+        expected=resolved,
+    )
+
+    if as_json:
+        click.echo(_json.dumps(report.to_dict(), indent=2, sort_keys=True))
+    else:
+        click.echo(rv.render(report, verbose=verbose))
+
+    if exit_code and report.exit_code:
+        sys.exit(report.exit_code)
+
+
+# Same callback under the group, so `coord release preflight` and `coord
+# release verify` are one discoverable pair. The flat `coord
+# release-preflight` above keeps working unchanged.
+release_group.add_command(release_preflight, name="preflight")

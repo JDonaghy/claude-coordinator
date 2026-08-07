@@ -1318,6 +1318,19 @@ def model_plausible_for_provider_type(model: str, provider_type: str) -> bool:
 # one big root filesystem still reports one line.
 _DEFAULT_HEALTH_DISK_PATHS = ("/", "/home", "~/.coord")
 
+# The systemd *user* units `spawned_coord` (#1834) introspects. Duplicated
+# from `coord.health.checks.spawned_coord.DEFAULT_UNITS` rather than imported,
+# same reason as AGENT_PORT in coord/commands/_common.py: config must not
+# import the check registry (probes import config, not the other way round).
+# tests/test_release_verify.py pins the two lists together.
+_DEFAULT_SPAWNED_COORD_UNITS = (
+    "coord-serve",
+    "coord-agent",
+    "coord-web",
+    "coord-drive-queue",
+    "coord-notify",
+)
+
 
 @dataclass
 class HealthConfig:
@@ -1424,6 +1437,16 @@ class HealthConfig:
     deploy_dir: str | None = None
     # Where systemd user units actually live. None -> ~/.config/systemd/user.
     systemd_user_dir: str | None = None
+
+    # ── what a running service actually spawns (#1834) ────────────────────
+    # The systemd user units whose LIVE process environment `spawned_coord`
+    # reads to predict which `coord` binary their subprocesses will get.
+    # Unlike the path-ish options above, an EMPTY list here really does mean
+    # "off" — the unit names are the check's entire subject, so there is no
+    # documented default to fall back to once they are cleared.
+    spawned_coord_units: list[str] = field(
+        default_factory=lambda: list(_DEFAULT_SPAWNED_COORD_UNITS)
+    )
 
 
 @dataclass
@@ -2437,6 +2460,7 @@ _HEALTH_STR_LIST_FIELDS: tuple[str, ...] = (
     "disabled_checks",
     "disk_paths",
     "cargo_target_extra_dirs",
+    "spawned_coord_units",
 )
 # Path-ish overrides: a string, or null to mean "use the documented default".
 # Table-driven for the same reason as the numeric fields above — a new deploy

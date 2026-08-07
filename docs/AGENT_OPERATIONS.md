@@ -57,6 +57,17 @@ gh run list --repo JDonaghy/claude-coordinator --workflow publish.yml --limit 1
 gh run watch <run-id> --repo JDonaghy/claude-coordinator
 ```
 
+**Then, once the rollout is done, verify it actually landed:**
+
+```bash
+coord release verify --pypi
+```
+
+This is the post-release step (#1834). It is not optional bookkeeping — see
+[The post-release step](#the-post-release-step-coord-release-verify-1834)
+below for the release where every other readout said the fleet was current
+while the daemon was spawning code two releases old.
+
 PyPI propagation can lag a minute or two after the workflow goes green.
 `pip install --upgrade` (and `coord agent update`) may report
 `no_change` until the new version is visible — wait and retry rather
@@ -633,7 +644,7 @@ releases behind. Every timer-launched drive in that window had been running with
 | # | lane | how it updates | needed when |
 |---|---|---|---|
 | 1 | `~/.coord-venv` × N (agents) | `coord agent update --all`, or per-machine pip + `systemctl --user restart coord-agent` | any `coord/agent.py` change; always safe to do |
-| 2 | `coord serve` (daemon host) | `systemctl --user restart coord-serve` **after** lane 1 upgraded the on-disk code | any `serve_app.py` / `state.py` / `review.py` / `merge_queue.py` change |
+| 2 | `coord serve` (daemon host) — **and the PATH it hands its children** | `systemctl --user restart coord-serve` **after** lane 1 upgraded the on-disk code; the PATH half is lane 6's `cp` + `daemon-reload` | any `serve_app.py` / `state.py` / `review.py` / `merge_queue.py` change. The second half is its own failure: on 2026-08-04 the daemon was current and everything it *spawned* was two releases back (see `coord release verify` below) |
 | 3 | `coord-tui` | local `cargo build && cp target/debug/coord-tui ~/.local/bin/` | any `tui/**` change — never PyPI |
 | 4 | **`~/.coord-cli-venv`** | manual `pip install --upgrade` + verify `coord --version` | **every release**, because the sequencer drives through it |
 | 5 | `.githooks/` hooks | nothing to run — live on the next `git fetch` (given `core.hooksPath` is already set) | any `.githooks/**` change — see below, this lane's failure mode is the opposite of 1–4 |
@@ -704,6 +715,89 @@ This lane deliberately has **no automatic install step** — see this repo's
 unit on every host automatically is a bigger blast radius than silent drift
 is. Detection first; a human runs the `cp` + `systemctl --user restart`.
 
+## The post-release step: `coord release verify` (#1834)
+
+**Run this after every release, once the rollout is done.** It is the one
+command that asks whether the whole system is actually at one version, across
+every lane in the table above and every host in `coordinator.yml`:
+
+```bash
+coord release verify --pypi          # grade every lane against the released version
+coord release verify                 # no absolute — report skew BETWEEN lanes
+coord release verify --expected 0.4.105 -v
+coord release verify --json          # for a script or a dashboard
+```
+
+Exit codes mirror `coord health`: **0** clean, **1** something unverified
+(a host that did not answer, a lane with no data, a stale `coord-tui`), **2**
+a real drift finding. It runs entirely over HTTP — each machine's own
+`/health` plus the daemon's `/board` — so it works **from a thin client** with
+no checkout and no credentials, and it is **strictly read-only**: safe to run
+mid-flight, and it never fixes anything (`coord agent update` owns that lane;
+automatically writing `systemctl` units across every host is a far bigger
+blast radius than detection).
+
+### Why it exists: 2026-08-04, when every readout said the fleet was fine
+
+Hours after v0.4.105 shipped:
+
+| readout | said |
+|---|---|
+| PyPI simple index | 0.4.105 |
+| `coord status` — all three agents | 0.4.105 |
+| `~/.coord-venv/bin/coord version` (daemon host) | 0.4.105 |
+| `~/.local/bin/coord version` | 0.4.105 |
+| **what the daemon actually spawned** | **0.4.103** |
+
+Nothing was lying. Each readout read a different lane, correctly, and no
+command compared them. `coord-serve`'s hand-installed unit began its
+`Environment=PATH=` with an editable checkout two releases back, and
+`coord_argv()` (`coord/drive.py`) resolves every subprocess with
+`shutil.which("coord")` — so the daemon ran the release and everything it
+spawned ran the checkout.
+
+Three things follow, and they are why this command is shaped the way it is:
+
+- **It verifies the running *process*, not the venv.** `pip install --upgrade`
+  silently no-ops often enough to be a documented fleet gotcha, so a venv
+  reporting the right version proves nothing about what executes. The
+  `<unit> spawns` lanes read `/proc/<mainpid>/environ` on each host — the PATH
+  the kernel is actually holding for the live service — resolve `coord` on it
+  with the same `shutil.which` call `coord_argv()` makes, and ask *that* binary
+  its version (`coord/health/checks/spawned_coord.py`). This is strictly
+  stronger than `unit_drift`'s PATH-shadow check, which reads unit *files* and
+  so cannot see a drop-in, an `EnvironmentFile`, `systemctl --user
+  set-environment`, or a service started by hand from a shell with a dev venv
+  activated. Both checks exist; neither subsumes the other.
+- **It reports skew BETWEEN lanes, not staleness within one.** Every
+  individual lane was green on 2026-08-04; the defect existed only as a
+  relationship. `--expected`/`--pypi` narrow that to "disagreement with a named
+  version", but skew alone is already conclusive and is reported without one.
+- **Any editable install on a service PATH is a finding on its own** —
+  CRIT regardless of the version it currently reports. It is a drift amplifier
+  that silently tracks a checkout nothing keeps current, so today's accidental
+  agreement is not evidence of anything.
+
+### What it covers
+
+| lane | source | check |
+|---|---|---|
+| `~/.coord-venv` × N (agents) | each machine's `/health` | `agent_venv` (+ editable detection) |
+| `<unit> spawns` × N (live services) | each machine's `/health` | `spawned_coord` — **the 2026-08-04 lane** |
+| `coord-serve process` (daemon host) | `/board` → `fleet_deploy_lanes` | daemon's own install (#1806: only introspectable from the process itself) |
+| unit files vs `deploy/**` | each machine's `/health` | `unit_drift` / PATH shadow (#1831) |
+| `~/.coord-cli-venv` | each machine's `/health` | `cli_venv` (#1806) |
+| `coord-tui` binary vs `tui/` source | each machine's `/health` | `tui_binary` — until PKG-3/PKG-4 give it a real channel |
+
+`.githooks/**` (lane 5 above) is deliberately **not** graded here: its failure
+mode is the inverse — it is live everywhere at the next `git fetch`, with no
+release to be behind — so "is it at the released version?" is not a
+well-formed question for it. `~/.coord/coordinator.yml` provenance has its own
+sweep: `coord diagnose` (`coord/fleet_config_health.py`, #1779).
+
+A host that does not answer is reported **UNKNOWN, never OK** — "we could not
+ask" must not render as "verified", which is the entire thesis of #1834.
+
 ## Fleet-wide version check
 
 ```bash
@@ -716,6 +810,12 @@ before trusting a rule change made against the coordinator's local version,
 and after `coord agent update --all` to confirm the rollout actually landed
 everywhere — a split-brain fleet is only detectable by comparing versions
 directly, not by whether the last `coord agent update` reported success.
+
+**This is a subset of `coord release verify` above, and a strictly weaker
+one**: it compares *agent self-reported* versions only, which is exactly the
+readout that was green throughout 2026-08-04. Use it for a quick rollout
+confirmation; use `coord release verify` before you believe a release is
+actually live.
 
 ## Making a machine `browser`-capable (Playwright, #1541)
 

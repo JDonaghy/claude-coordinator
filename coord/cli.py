@@ -131,7 +131,7 @@ from coord.commands.drive_queue import drive_queue_group
 from coord.commands.lifecycle import done, housekeeping, notify, resume, serve, web
 from coord.commands.milestone import milestone_group
 from coord.commands.plans import plans_cmd
-from coord.commands.release import release_preflight
+from coord.commands.release import release_group, release_preflight
 from coord.commands.plan_followup import (
     _dispatch_followup,  # noqa: F401 — re-exported for tests
     approve_plan,
@@ -409,6 +409,10 @@ main.add_command(resume_stuck)
 main.add_command(install_skills)
 main.add_command(acceptance_group)
 main.add_command(release_preflight)
+# #1834: `coord release verify` (and `coord release preflight` as an alias of
+# the flat command above), grouped so the pre-tag and post-release halves of
+# the release story are discoverable together.
+main.add_command(release_group)
 
 
 # #1809: without this guard, `python -m coord.cli <args>` just IMPORTS the
