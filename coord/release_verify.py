@@ -534,6 +534,43 @@ def gather(
 #: rename over there fails here loudly instead of silently dropping the lane.
 DAEMON_SERVE_LANE = "coord-serve (daemon host)"
 
+#: Deliberately NOT the per-host `--timeout`. `/board` is a multi-megabyte
+#: read on a real fleet and routinely takes several seconds; a recorded
+#: operational gotcha is that a 5s budget makes a healthy daemon look
+#: unreachable. Timing out here would silently drop the `coord-serve process`
+#: lane — precisely the lane #1834 exists to stop losing — so it gets its own,
+#: generous budget.
+_BOARD_TIMEOUT = 30.0
+
+
+def _default_board_fetch() -> dict:
+    """``GET /board``, from a thin client *or* from the daemon host itself.
+
+    A thin client has ``board_service`` configured and reads it over
+    Tailscale. On the daemon host ``resolve_board_service()`` returns None
+    (host mode reads the DB directly) — and without the loopback fallback
+    below, running ``coord release verify`` *on the daemon host* would
+    silently drop the ``coord-serve process`` lane, which is exactly the lane
+    #1834 exists to stop losing. The daemon's own version cannot be read any
+    other way from a sibling process: it is introspection of a running
+    interpreter (#1806), so ``/board`` is the only publisher.
+    """
+    from coord.client import (  # noqa: PLC0415
+        ServiceConfig,
+        fetch_board_payload,
+        resolve_board_service,
+    )
+
+    svc = resolve_board_service()
+    if svc is None:
+        from coord.commands._common import SERVE_PORT  # noqa: PLC0415
+        from coord.serve_app import resolve_serve_token  # noqa: PLC0415
+
+        svc = ServiceConfig(
+            url=f"http://127.0.0.1:{SERVE_PORT}", token=resolve_serve_token()
+        )
+    return fetch_board_payload(svc, timeout=_BOARD_TIMEOUT)
+
 
 def _daemon_facts(board_payload: Callable[[], dict] | None) -> tuple[dict | None, str]:
     """The ``coord-serve`` process's own version, read out of ``/board``.
@@ -553,19 +590,7 @@ def _daemon_facts(board_payload: Callable[[], dict] | None) -> tuple[dict | None
     rather than skipping — a daemon nobody could ask is exactly the lane
     2026-08-04 hid in.
     """
-    fetch = board_payload
-    if fetch is None:
-
-        def fetch() -> dict:  # type: ignore[misc]
-            from coord.client import (  # noqa: PLC0415
-                fetch_board_payload,
-                resolve_board_service,
-            )
-
-            svc = resolve_board_service()
-            if svc is None:
-                return {}
-            return fetch_board_payload(svc)
+    fetch = board_payload or _default_board_fetch
 
     try:
         payload = fetch() or {}
