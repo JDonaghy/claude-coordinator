@@ -82,6 +82,18 @@ yourself and write your Playwright assertions (roles, visible text, \
 The mock is part of the contract; contract.md alone may not spell out \
 every DOM detail.
    Do not invent a contract yourself.
+1c. For a `web-playwright` driver ONLY: seed your slice with a fixture \
+file, not `page.route()`. Write `tests/acceptance/ms-NN/fixtures/<name>.json` \
+(schema: `coord/dashboard/fixture.py`'s module docstring — same shape as \
+`tests/fixtures/board-pipeline-basic.json`, which is a worked example) and \
+`playwright.acceptance.config.ts` will automatically boot a real \
+`coord web --fixture` process seeded from it for your slice (#1818) — no \
+`page.route()` interception needed anywhere in your spec, and no dev server \
+guesswork about which endpoints exist. Write AT MOST ONE `*.json` file under \
+that `fixtures/` directory; the config raises if it finds more than one. \
+(The one exception in this repo is `tests/acceptance/ms-51/` — an earlier, \
+deliberately-unmigrated `page.route()` slice kept as-is; do not use it as a \
+template.)
 2. Author (or extend) the acceptance suite in `tests/acceptance/ms-NN/`, \
 using the repo's declared driver framework (kind + run command are in your \
 briefing) — the tests must be runnable by that exact command.
@@ -225,6 +237,14 @@ def build_test_author_briefing(
     transcribe into DOM assertions (see :data:`TEST_AUTHOR_SYSTEM_PROMPT`
     step 1b) — contract.md alone is not guaranteed to spell out every
     role/text/test-id.
+
+    For ``driver_kind == "web-playwright"`` a ``FIXTURES:`` line is also
+    emitted (#1818): ``playwright.acceptance.config.ts`` boots a real
+    ``coord web --fixture`` process seeded from
+    ``tests/acceptance/ms-NN/fixtures/*.json`` when present, so the author
+    should seed the slice that way instead of hand-rolling a
+    ``page.route()`` interception (see :data:`TEST_AUTHOR_SYSTEM_PROMPT`
+    step 1c).
     """
     contract_path = f"{ACCEPTANCE_DIRNAME}/{ms_dir}/contract.md"
     manifest_glob = f"{ACCEPTANCE_DIRNAME}/{ms_dir}/manifest.(yml|json)"
@@ -239,6 +259,13 @@ def build_test_author_briefing(
     )
     parts.append(f"CONTRACT: {contract_path}")
     parts.append(f"MOCKS: {mocks_glob}")
+    if driver_kind == "web-playwright":
+        parts.append(
+            f"FIXTURES: {ACCEPTANCE_DIRNAME}/{ms_dir}/fixtures/<name>.json "
+            "(at most one file — schema: coord/dashboard/fixture.py, worked "
+            "example: tests/fixtures/board-pipeline-basic.json). Seed your "
+            "slice with this instead of page.route() — #1818."
+        )
     parts.append(f"MANIFEST: {manifest_glob}")
     parts.append(f"DRIVER: kind={driver_kind!r}  run={driver_run!r}")
     if driver_entrypoint:
