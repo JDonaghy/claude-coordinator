@@ -21,10 +21,12 @@ from coord.ci_store import (
     CheckRun,
     CiCheckSummary,
     CiStore,
+    JobRun,
     NoOpCi,
     checks_are_stale,
     failed_checks,
     in_flight_checks,
+    is_verdictless_job,
     summarize,
     summarize_counts,
 )
@@ -1294,6 +1296,93 @@ def is_ci_absent_reason(reason: str | None) -> bool:
     return (reason or "").startswith(CI_ABSENT_PREFIX)
 
 
+# #1892: the reason string prefix for a `checks_failed` entry whose failing
+# checks carry NO VERDICT ABOUT THE CODE — every one of them either never got
+# a runner (cancelled at the queue timeout, zero steps) or died at "Set up
+# job" (before checkout, so no repo code ran). Distinctly named from the
+# plain "checks failed: ..." wording a genuine red suite produces, so
+# `coord.drive`'s retry accounting and `coord.drive_queue`'s `parked` state
+# (both already keying off :data:`CI_PENDING_PREFIX`/`is_ci_pending_reason`
+# for the #1891 "still running" case) can extend the identical treatment to
+# this one: don't spend a merge attempt / launch attempt on a failure that
+# says nothing about whether the branch is any good — see
+# :func:`_ci_infra_reason` for the classification and `MAX_CI_INFRA_RERUNS`
+# for the auto-rerun this reason also triggers.
+#
+# Deliberately NOT surfaced by `_entry_gate_status` (board-render time,
+# consumed by `plan()`/`/board`): classifying this needs one extra
+# `gh api .../actions/runs/{id}/jobs` call per distinct failing run
+# (`CiStore.list_jobs_for_run`), and `coord.gate_snapshot`'s module
+# docstring states Invariant 1 — the board *read* path performs no
+# third-party I/O. Only the LIVE merge path (`process()`, which already
+# pays for fresh truth — see that module's docstring) computes this and
+# persists it onto `QueuedMerge.error`; `coord.drive_state._merge_entry`
+# prefers that raw, more-specific reading over the plan's own generic
+# re-derivation when the two diverge (mirrors the NEEDS_ATTENTION recovery
+# a few lines into that function).
+CI_INFRA_PREFIX = "CI infra:"
+
+
+def is_ci_infra_reason(reason: str | None) -> bool:
+    """True when *reason* names a `checks_failed` block whose failures were
+    all classified verdictless (#1892) — see :data:`CI_INFRA_PREFIX`."""
+    return (reason or "").startswith(CI_INFRA_PREFIX)
+
+
+# #1892: auto-reruns `process()` will trigger for a single entry's verdictless
+# CI failure (via `CiStore.rerun_for_pr`) before giving up and parking it for
+# a human instead of the queue's own #1891 machinery. A workflow genuinely
+# broken at the "Set up job" level — a bad `uses:` ref, a deleted action —
+# would otherwise loop this forever; two tries is enough to ride out a queue-
+# timeout blip or a transient "Service Unavailable" without masking a
+# standing breakage.
+MAX_CI_INFRA_RERUNS = 2
+
+
+def _ci_infra_reason(
+    ci: "CiStore", repo: str, number: int, failed: "list[CheckRun]"
+) -> str | None:
+    """The :data:`CI_INFRA_PREFIX` reason when EVERY check in *failed* is
+    verdictless (#1892), else ``None``.
+
+    Issues at most one :meth:`CiStore.list_jobs_for_run` call per distinct
+    ``run_id`` among *failed* — never when *failed* is empty (the all-green
+    or still-pending path), matching the "only on the failure path" scoping
+    this feature was built to. ``getattr(ci, "list_jobs_for_run", None)``
+    mirrors the same fail-closed-toward-"no answer" pattern
+    ``_ci_checks_are_stale``/``_ci_expects_checks`` already use for a
+    ``CiStore`` stand-in that predates a capability (a duck-typed test stub,
+    or :class:`coord.gate_snapshot.GateSnapshot` — which deliberately does
+    NOT implement this, per Invariant 1 above) — such a store just never
+    produces this classification, falling back to the plain "checks failed"
+    wording exactly like #1892 didn't exist for it.
+    """
+    if not failed:
+        return None
+    list_jobs = getattr(ci, "list_jobs_for_run", None)
+    if list_jobs is None:
+        return None
+    run_ids = sorted({c.run_id for c in failed if c.run_id})
+    jobs_by_run: dict[str, dict[str, JobRun]] = {}
+    for run_id in run_ids:
+        try:
+            jobs = list_jobs(repo, run_id)
+        except Exception:  # noqa: BLE001 — classification-only, never raises upward
+            jobs = []
+        jobs_by_run[run_id] = {j.name: j for j in (jobs or [])}
+    all_verdictless = all(
+        is_verdictless_job(c, jobs_by_run.get(c.run_id, {}).get(c.name))
+        for c in failed
+    )
+    if not all_verdictless:
+        return None
+    summary = ", ".join(f"{c.name} ({c.conclusion})" for c in failed)
+    return (
+        f"{CI_INFRA_PREFIX} {summary} — no verdict about the code (never "
+        "assigned a runner, or died before checkout)"
+    )
+
+
 def _ci_expects_checks(
     ci_store: "CiStore", repo_github: str | None, pr_number: int | None
 ) -> bool:
@@ -1968,6 +2057,15 @@ class QueuedMerge:
     # means "no override" for both fresh entries and rows predating this
     # column (NULL decodes to []) — both fall back identically.
     required_gates: list[str] = field(default_factory=list)
+    # #1892: count of automatic `CiStore.rerun_for_pr` calls `process()` has
+    # issued for this entry's CURRENT run of verdictless CI failures —
+    # capped at `MAX_CI_INFRA_RERUNS`. Persists across ticks (unlike the
+    # transient `branch_head_sha`/`branch_patch_id` fields above) because the
+    # whole point is a durable ceiling: a workflow broken at "Set up job"
+    # must stop auto-rerunning and park for a human, not retry every tick
+    # forever. 0 for every entry that has never hit a verdictless failure,
+    # and for rows predating this column.
+    ci_infra_reruns: int = 0
 
 
 class GhOps(Protocol):
@@ -2127,6 +2225,9 @@ def load_queue() -> list[QueuedMerge]:
             # and '[]' (explicit "no override") both decode to [] — the
             # gate falls back to config.pipeline.default_gates for either.
             required_gates=json.loads(row["required_gates"]) if row["required_gates"] else [],
+            # #1892: column added via migration; NULL (pre-migration rows)
+            # decodes to 0 — no auto-reruns spent yet, same as a fresh entry.
+            ci_infra_reruns=row["ci_infra_reruns"] or 0,
         )
         for row in rows
     ]
@@ -2143,14 +2244,15 @@ def save_queue(items: list[QueuedMerge]) -> None:
                     assignment_id, repo_name, repo_github, branch,
                     target_branch, issue_number, issue_title, state,
                     pr_number, pr_url, size, last_attempt, error, enqueued_at,
-                    assignment_type, required_gates
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    assignment_type, required_gates, ci_infra_reruns
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     item.assignment_id, item.repo_name, item.repo_github,
                     item.branch, item.target_branch, item.issue_number,
                     item.issue_title, item.state, item.pr_number, item.pr_url,
                     item.size, item.last_attempt, item.error, item.enqueued_at,
                     item.assignment_type, json.dumps(list(item.required_gates or [])),
+                    item.ci_infra_reruns,
                 ),
             )
 
@@ -3613,12 +3715,20 @@ def process(
                             continue
                         failed = failed_checks(checks)
                         if failed:
+                            # #1892: preview-only — never mutates, never
+                            # reruns; just shows the same classification a
+                            # live attempt would compute so `--dry-run`
+                            # doesn't undersell what's actually blocking.
+                            infra_reason = _ci_infra_reason(
+                                ci, entry.repo_github, entry.pr_number, failed
+                            )
                             summary = ", ".join(
                                 f"{c.name} ({c.conclusion})" for c in failed
                             )
+                            msg = infra_reason or f"checks failed: {summary}"
                             events.append(MergeEvent(
                                 entry, "checks_failed",
-                                f"(dry run) would be blocked: checks failed: {summary}",
+                                f"(dry run) would be blocked: {msg}",
                             ))
                             continue
                         pending = in_flight_checks(checks)
@@ -3856,10 +3966,76 @@ def process(
                     summary = ", ".join(
                         f"{c.name} ({c.conclusion})" for c in failed
                     )
+                    # #1892: classify BEFORE deciding the message/event — a
+                    # verdictless failure (every failing check says nothing
+                    # about the code: never assigned a runner, or died at
+                    # "Set up job") gets auto-rerun instead of the plain
+                    # "checks failed" block, up to MAX_CI_INFRA_RERUNS times
+                    # per entry. This is the one extra `gh api .../jobs` call
+                    # per distinct failing run — never issued above on the
+                    # absent/pending paths, only here once something has
+                    # actually failed.
+                    infra_reason = _ci_infra_reason(
+                        ci, entry.repo_github, entry.pr_number, failed
+                    )
+                    if (
+                        infra_reason is not None
+                        and entry.ci_infra_reruns < MAX_CI_INFRA_RERUNS
+                    ):
+                        entry.ci_infra_reruns += 1
+                        reran = ci.rerun_for_pr(entry.repo_github, entry.pr_number)
+                        _log.info(
+                            "#1892 auto-rerun %d/%d for %s#%d (PR #%s): %s "
+                            "(rerun_for_pr %s)",
+                            entry.ci_infra_reruns, MAX_CI_INFRA_RERUNS,
+                            entry.repo_name, entry.issue_number,
+                            entry.pr_number, summary,
+                            "triggered" if reran else "FAILED",
+                        )
+                        msg = (
+                            f"{infra_reason} — auto-rerun "
+                            f"{entry.ci_infra_reruns}/{MAX_CI_INFRA_RERUNS} "
+                            f"{'triggered' if reran else 'failed to trigger'}"
+                        )
+                        entry.error = msg
+                        events.append(MergeEvent(entry, "ci_infra_rerun", msg))
+                        continue  # #292: skip, don't halt the group
+                    if infra_reason is not None:
+                        # #1892: budget exhausted — a workflow broken at
+                        # "Set up job" itself (a bad `uses:` ref, a deleted
+                        # action) must stop auto-rerunning and surface to a
+                        # human instead of looping forever. Deliberately
+                        # WITHOUT the CI_INFRA_PREFIX from here on: this is
+                        # no longer something more real time alone resolves,
+                        # so it falls back to being treated exactly like a
+                        # genuine `checks_failed` block (drive attempts are
+                        # spent on it again, same as today).
+                        _log.info(
+                            "#1892 auto-rerun budget exhausted for %s#%d "
+                            "(PR #%s) after %d/%d tries: %s",
+                            entry.repo_name, entry.issue_number,
+                            entry.pr_number, entry.ci_infra_reruns,
+                            MAX_CI_INFRA_RERUNS, summary,
+                        )
+                        msg = (
+                            f"checks failed: {summary} — auto-rerun budget "
+                            f"exhausted ({entry.ci_infra_reruns}/"
+                            f"{MAX_CI_INFRA_RERUNS}); needs a human"
+                        )
+                        entry.error = msg
+                        events.append(MergeEvent(entry, "checks_failed", msg))
+                        continue  # #292: skip, don't halt the group
                     msg = f"checks failed: {summary}"
                     entry.error = msg
                     events.append(MergeEvent(entry, "checks_failed", msg))
                     continue  # #292: skip, don't halt the group
+                # #1892: nothing is failing any more (this line is only
+                # reached once `if failed:` above did NOT fire) — whatever
+                # verdictless run the auto-rerun budget was tracking has
+                # resolved one way or another, so a LATER failure (a fresh
+                # push, a flaky green-then-red) starts its own budget from
+                # zero rather than inheriting an unrelated exhausted count.
+                entry.ci_infra_reruns = 0
                 pending = in_flight_checks(checks)
                 if pending:
                     summary = ", ".join(c.name for c in pending)

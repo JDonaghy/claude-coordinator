@@ -1730,6 +1730,77 @@ def test_a_genuinely_failed_check_reported_as_blocked_still_just_waits_like_befo
     assert "CI failed" in action.label
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# #1892: the sibling case — a CI verdict DID arrive, but every failing check
+# carried no verdict about the code (never assigned a runner, or died before
+# checkout). `coord merge`'s own live attempt auto-reruns CI for this case
+# instead; the drive must wait for that rerun, not retry `coord merge`
+# itself or burn its merge-attempt budget on a no-op observation.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.parametrize("status", ["", "PENDING", "READY", "BLOCKED"])
+def test_ci_infra_failure_waits_regardless_of_which_status_the_board_shows(status):
+    action = step(
+        approved_work(
+            merge_status=status,
+            merge_reason=(
+                "CI infra: no-gh-on-path (cancelled) — no verdict about the "
+                "code (never assigned a runner, or died before checkout)"
+            ),
+        )
+    )
+    assert action.kind == WAIT
+    assert "auto-rerunning" in action.label
+    assert "not retrying" in action.label
+
+
+def test_ci_infra_failure_never_spends_an_attempt_across_several_polls():
+    """Acceptance (#1892): a PR whose failures are ALL verdictless does not
+    consume a drive merge attempt, mirroring
+    test_checks_pending_never_spends_an_attempt_across_several_polls."""
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_merge_attempts=2)
+    s = approved_work(
+        merge_status="",
+        merge_reason="CI infra: e2e (failure) — no verdict about the code",
+    )
+
+    for _ in range(5):
+        action = step(s, opts, counters=counters)
+        assert action.kind == WAIT
+        assert counters.merge_attempts == 0
+
+
+def test_ci_infra_reason_is_recognised_via_the_shared_predicate_not_ad_hoc_text():
+    from coord.merge_queue import CI_INFRA_PREFIX, is_ci_infra_reason
+
+    assert is_ci_infra_reason(f"{CI_INFRA_PREFIX} e2e (failure)")
+    assert not is_ci_infra_reason("checks failed: build (failure)")
+    assert not is_ci_infra_reason("CI running: build")
+    assert not is_ci_infra_reason("")
+    assert not is_ci_infra_reason(None)
+
+
+def test_a_genuinely_failed_check_is_not_read_as_ci_infra():
+    """Regression guard (acceptance criterion): a PR with ANY genuinely
+    failed check must behave exactly as today — a plain 'checks failed: ...'
+    reason (no CI_INFRA_PREFIX) still walks the bounded retry path, exactly
+    like test_a_genuinely_failed_check_still_walks_the_bounded_retry_path."""
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_merge_attempts=2)
+    s = approved_work(
+        merge_status="",
+        merge_reason=(
+            "checks failed: build (failure) — auto-rerun budget exhausted "
+            "(2/2); needs a human"
+        ),
+    )
+
+    assert step(s, opts, counters=counters).kind == RUN
+    assert counters.merge_attempts == 1
+
+
 # ── #1505: escalate on a status retrying can't fix ──────────────────────────
 
 

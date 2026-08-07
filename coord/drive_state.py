@@ -34,6 +34,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from coord.merge_queue import is_ci_infra_reason
 from coord.models import WORK_LIKE_TYPES
 
 # Assignment types that can carry the Test/Review gates for an issue.  Sourced
@@ -383,9 +384,27 @@ def _merge_entry(payload: dict, repo: str, issue: int) -> dict | None:
             f"/pull/{plan_entry['pr_number']}"
         )
 
+    reason = plan_entry.get("reason") or (raw_entry or {}).get("error")
+    # #1892: `plan_entry["reason"]` is `_entry_gate_status`'s FRESH
+    # re-derivation at board-build time — and that function never computes
+    # the CI_INFRA_PREFIX classification, because doing so needs an extra
+    # `gh api .../jobs` call the board *read* path must never make (see
+    # `coord.gate_snapshot`'s Invariant 1). Only a LIVE `coord merge`
+    # attempt (`merge_queue.process()`, which already pays for fresh truth)
+    # computes it and persists it onto the raw row's `error`. So a
+    # verdictless CI failure always re-derives as the plain "checks failed:
+    # ..." wording in `plan_entry`, shadowing the more specific reading the
+    # raw row already has — recover it here, mirroring the NEEDS_ATTENTION
+    # recovery above: prefer the raw row's reason whenever IT carries the
+    # #1892 classification and the plan's own fresher reason doesn't.
+    if raw_entry is not None:
+        raw_reason = raw_entry.get("error")
+        if is_ci_infra_reason(raw_reason) and not is_ci_infra_reason(reason):
+            reason = raw_reason
+
     return {
         "status": status,
-        "reason": plan_entry.get("reason") or (raw_entry or {}).get("error"),
+        "reason": reason,
         "pr_url": pr_url,
         "assignment_id": plan_entry.get("assignment_id"),
     }

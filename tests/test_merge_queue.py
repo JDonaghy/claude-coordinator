@@ -11,6 +11,7 @@ from unittest.mock import patch
 import pytest
 
 from coord import merge_queue as mq
+from coord.ci_store import CheckRun, JobRun, JobStep
 from coord.merge_queue import (
     CONFLICT,
     MERGED,
@@ -26,6 +27,23 @@ from coord.merge_queue import (
     sequence,
 )
 from coord.models import Assignment
+
+
+def _check(
+    name: str,
+    *,
+    status: str = "completed",
+    conclusion: str | None = "failure",
+    run_id: str = "1",
+) -> CheckRun:
+    """#1892 test helper: a `CheckRun` with a settable `run_id`, needed to
+    exercise `_ci_infra_reason`'s per-run job lookup — mirrors
+    `tests/test_ci_store.py`'s `_check`, which has no `run_id` parameter."""
+    return CheckRun(
+        name=name, status=status, conclusion=conclusion,
+        url=f"https://gh/runs/{run_id}", run_id=run_id,
+        started_at=None, completed_at=None,
+    )
 
 
 def _q(
@@ -124,6 +142,16 @@ class TestPersistence:
         save_queue([_q("a", required_gates=["merge"]), _q("b")])
         again = {x.assignment_id: x.required_gates for x in load_queue()}
         assert again == {"a": ["merge"], "b": []}
+
+    def test_roundtrip_preserves_ci_infra_reruns(self, coord_db) -> None:
+        # #1892: the auto-rerun cap must survive a save/load cycle, or a
+        # daemon restart mid-way through a verdictless-CI-failure streak
+        # would reset the counter and let a broken workflow rerun forever.
+        a = _q("a")
+        a.ci_infra_reruns = 2
+        save_queue([a, _q("b")])
+        again = {x.assignment_id: x.ci_infra_reruns for x in load_queue()}
+        assert again == {"a": 2, "b": 0}
 
 
 class TestEnqueue:
@@ -5087,6 +5115,241 @@ class TestProcessCiStaleness:
         kinds = [e.kind for e in events]
         assert "checks_stale" in kinds
         assert "merged" not in kinds
+
+
+class TestCiInfraReason:
+    """#1892: `_ci_infra_reason` — the classification helper, isolated from
+    `process()`'s I/O. `getattr(ci, "list_jobs_for_run", None)` is the
+    backward-compat seam: a CiStore stand-in that predates #1892 (most
+    duck-typed test stubs in this file, and `coord.gate_snapshot.
+    GateSnapshot`) must degrade to "no classification", not raise."""
+
+    _fn = staticmethod(mq._ci_infra_reason)
+    from coord.ci_store import JobRun as _JobRun, JobStep as _JobStep
+
+    class _Ci:
+        def __init__(self, jobs_by_run):
+            self._jobs_by_run = jobs_by_run
+            self.calls: list[tuple[str, str]] = []
+
+        def list_jobs_for_run(self, repo, run_id):
+            self.calls.append((repo, run_id))
+            return self._jobs_by_run.get(run_id, [])
+
+    def test_empty_failed_list_is_none_and_makes_no_calls(self) -> None:
+        ci = self._Ci({})
+        assert self._fn(ci, "acme/api", 1, []) is None
+        assert ci.calls == []
+
+    def test_all_verdictless_returns_the_prefixed_reason(self) -> None:
+        checks = [_check("e2e", conclusion="cancelled")]
+        checks[0].run_id = "999"
+        ci = self._Ci({"999": [self._JobRun(name="e2e", conclusion="cancelled", runner_name="", steps=[])]})
+        reason = self._fn(ci, "acme/api", 1, checks)
+        assert reason is not None
+        assert reason.startswith("CI infra:")
+        assert "e2e (cancelled)" in reason
+
+    def test_one_real_failure_among_verdictless_ones_returns_none(self) -> None:
+        """The hazard the issue warns against: ANY genuinely-failed check in
+        the mix must block the whole classification, not just be ignored."""
+        infra = _check("e2e", conclusion="cancelled")
+        infra.run_id = "999"
+        real = _check("build", conclusion="failure")
+        real.run_id = "999"
+        ci = self._Ci({"999": [
+            self._JobRun(name="e2e", conclusion="cancelled", runner_name="", steps=[]),
+            self._JobRun(
+                name="build", conclusion="failure", runner_name="r1",
+                steps=[
+                    self._JobStep(name="Set up job", conclusion="success"),
+                    self._JobStep(name="Run pytest", conclusion="failure"),
+                ],
+            ),
+        ]})
+        assert self._fn(ci, "acme/api", 1, [infra, real]) is None
+
+    def test_stub_without_list_jobs_for_run_degrades_to_none(self) -> None:
+        """Every pre-#1892 duck-typed CiStore stub in this file (and
+        `coord.gate_snapshot.GateSnapshot`, which deliberately does not
+        implement this — the board *read* path must never make this extra
+        call) must not raise; classification just isn't available."""
+        class _OldCi:
+            pass
+        checks = [_check("e2e", conclusion="cancelled")]
+        assert self._fn(_OldCi(), "acme/api", 1, checks) is None
+
+    def test_only_one_call_per_distinct_run_id(self) -> None:
+        checks = [_check("a", conclusion="cancelled"), _check("b", conclusion="cancelled")]
+        checks[0].run_id = "999"
+        checks[1].run_id = "999"
+        ci = self._Ci({"999": [
+            self._JobRun(name="a", conclusion="cancelled", runner_name="", steps=[]),
+            self._JobRun(name="b", conclusion="cancelled", runner_name="", steps=[]),
+        ]})
+        self._fn(ci, "acme/api", 1, checks)
+        assert ci.calls == [("acme/api", "999")]
+
+
+class TestProcessCiInfraAutoRerun:
+    """#1892: `process()`'s live merge path auto-reruns CI (instead of just
+    blocking) when every failing check is verdictless, capped at
+    MAX_CI_INFRA_RERUNS, logging every attempt — and behaves exactly like
+    today for a genuine failure or a passing PR."""
+
+    @staticmethod
+    def _verdictless_checks():
+        c = _check("e2e", conclusion="cancelled")
+        c.run_id = "999"
+        return [c]
+
+    @staticmethod
+    def _verdictless_jobs():
+        return {"999": [JobRun(name="e2e", conclusion="cancelled", runner_name="", steps=[])]}
+
+    class _Ci:
+        is_available = True
+
+        def __init__(self, *, checks, jobs_by_run, rerun_ok=True):
+            self._checks = checks
+            self._jobs_by_run = jobs_by_run
+            self.rerun_ok = rerun_ok
+            self.jobs_calls: list[tuple[str, str]] = []
+            self.rerun_calls: list[tuple[str, int]] = []
+
+        def list_checks_for_pr(self, repo, number):
+            return self._checks
+
+        def list_jobs_for_run(self, repo, run_id):
+            self.jobs_calls.append((repo, run_id))
+            return self._jobs_by_run.get(run_id, [])
+
+        def rerun_for_pr(self, repo, number):
+            self.rerun_calls.append((repo, number))
+            return self.rerun_ok
+
+    def test_first_failure_triggers_auto_rerun_not_a_plain_block(self, caplog) -> None:
+        import logging
+        caplog.set_level(logging.INFO, logger="coord.merge_queue")
+        items = [_q("w1", pr=99)]
+        gh = FakeGh()
+        ci = self._Ci(checks=self._verdictless_checks(), jobs_by_run=self._verdictless_jobs())
+
+        events = process(items, gh, ci_store=ci)
+
+        assert items[0].state == PENDING
+        assert items[0].ci_infra_reruns == 1
+        assert ci.rerun_calls == [("acme/api", 99)]
+        kinds = [e.kind for e in events]
+        assert "ci_infra_rerun" in kinds
+        assert "checks_failed" not in kinds
+        assert items[0].error is not None
+        assert items[0].error.startswith("CI infra:")
+        assert "auto-rerun 1/2 triggered" in items[0].error
+        assert any("#1892 auto-rerun" in r.message for r in caplog.records)
+
+    def test_reruns_stop_at_the_cap_and_every_one_is_logged(self, caplog) -> None:
+        import logging
+        from coord.merge_queue import MAX_CI_INFRA_RERUNS
+        caplog.set_level(logging.INFO, logger="coord.merge_queue")
+        items = [_q("w1", pr=99)]
+        gh = FakeGh()
+        ci = self._Ci(checks=self._verdictless_checks(), jobs_by_run=self._verdictless_jobs())
+
+        for expected in range(1, MAX_CI_INFRA_RERUNS + 1):
+            process(items, gh, ci_store=ci)
+            assert items[0].ci_infra_reruns == expected
+
+        assert len(ci.rerun_calls) == MAX_CI_INFRA_RERUNS
+        infra_logs = [r for r in caplog.records if "#1892 auto-rerun" in r.message]
+        assert len(infra_logs) == MAX_CI_INFRA_RERUNS
+
+        # One more tick: budget exhausted, no further rerun, falls back to a
+        # plain (non-CI_INFRA-prefixed) checks_failed block for a human.
+        events = process(items, gh, ci_store=ci)
+        assert len(ci.rerun_calls) == MAX_CI_INFRA_RERUNS  # unchanged
+        assert items[0].ci_infra_reruns == MAX_CI_INFRA_RERUNS  # unchanged
+        kinds = [e.kind for e in events]
+        assert "checks_failed" in kinds
+        assert "ci_infra_rerun" not in kinds
+        assert not items[0].error.startswith("CI infra:")
+        assert "checks failed:" in items[0].error
+        assert "auto-rerun budget exhausted" in items[0].error
+
+    def test_a_genuine_failure_is_never_auto_rerun(self) -> None:
+        """Acceptance criterion: a PR with ANY genuinely-failed check
+        behaves exactly as today — plain checks_failed, no rerun call."""
+        items = [_q("w1", pr=99)]
+        gh = FakeGh()
+        real_failure = _check("build", conclusion="failure")
+        real_failure.run_id = "999"
+        ci = self._Ci(
+            checks=[real_failure],
+            jobs_by_run={"999": [JobRun(
+                name="build", conclusion="failure", runner_name="r1",
+                steps=[
+                    JobStep(name="Set up job", conclusion="success"),
+                    JobStep(name="Run pytest", conclusion="failure"),
+                ],
+            )]},
+        )
+
+        events = process(items, gh, ci_store=ci)
+
+        assert ci.rerun_calls == []
+        assert items[0].ci_infra_reruns == 0
+        kinds = [e.kind for e in events]
+        assert "checks_failed" in kinds
+        assert "ci_infra_rerun" not in kinds
+        assert items[0].error == "checks failed: build (failure)"
+
+    def test_jobs_api_never_called_on_the_all_green_path(self) -> None:
+        """Acceptance criterion: the extra jobs API call happens only on the
+        failure path — assert it is not called when all checks pass."""
+        items = [_q("w1", pr=99)]
+        gh = FakeGh()
+        passing = _check("e2e", conclusion="success")
+        passing.run_id = "999"
+        ci = self._Ci(checks=[passing], jobs_by_run={})
+
+        process(items, gh, ci_store=ci)
+
+        # #1892's acceptance criterion is specifically about the extra jobs
+        # call, not about whether the merge itself completes — a plain
+        # `FakeGh` has no `get_branch_commit_timestamp`, so the unrelated
+        # #1851 staleness gate fails closed regardless of #1892.
+        assert ci.jobs_calls == []
+        assert ci.rerun_calls == []
+
+    def test_dry_run_previews_the_infra_reason_without_mutating_anything(self) -> None:
+        items = [_q("w1", pr=99)]
+        gh = FakeGh()
+        ci = self._Ci(checks=self._verdictless_checks(), jobs_by_run=self._verdictless_jobs())
+
+        events = process(items, gh, ci_store=ci, dry_run=True)
+
+        assert items[0].state == PENDING
+        assert items[0].ci_infra_reruns == 0  # #1892: dry-run never mutates
+        assert ci.rerun_calls == []  # #1892: dry-run never reruns CI
+        kinds = [e.kind for e in events]
+        assert "checks_failed" in kinds
+        msg = next(e.message for e in events if e.kind == "checks_failed")
+        assert "CI infra:" in msg
+
+    def test_resets_after_a_clean_pass_so_a_later_failure_starts_fresh(self) -> None:
+        """A later, unrelated verdictless failure must get its own budget —
+        not inherit an exhausted count from an earlier, already-resolved one."""
+        from coord.merge_queue import MAX_CI_INFRA_RERUNS
+        items = [_q("w1", pr=99)]
+        items[0].ci_infra_reruns = MAX_CI_INFRA_RERUNS
+        gh = FakeGh()
+        passing = _check("e2e", conclusion="success")
+        passing.run_id = "999"
+        ci = self._Ci(checks=[passing], jobs_by_run={})
+
+        process(items, gh, ci_store=ci)
+
+        assert items[0].ci_infra_reruns == 0
 
 
 # ── #778: staging_items() ─────────────────────────────────────────────────────

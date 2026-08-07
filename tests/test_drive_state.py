@@ -453,6 +453,74 @@ def test_merge_entry_falls_back_to_the_raw_queue_and_upcases_state():
     assert state.merge_aid == "w0"
 
 
+def test_merge_entry_prefers_the_raw_rows_ci_infra_reason_over_the_plans_generic_one():
+    """#1892: `_entry_gate_status` (board-render time, what `merge_plan`
+    carries) never computes the CI_INFRA_PREFIX classification — it needs
+    an extra `gh api .../jobs` call the board *read* path must never make.
+    Only a LIVE `coord merge` attempt computes it and persists it onto the
+    raw `merge_queue` row's `error`. Without this recovery, `merge_reason`
+    would always read the plan's generic "checks failed: ..." and
+    `coord.drive`/`coord.drive_queue` would never see the #1892
+    classification at all — mirrors
+    test_needs_attention_plan_entry_recovers_a_retryable_conflict_from_the_raw_queue
+    for the identical shadowing problem, one field over."""
+    payload = {
+        "assignments": [row(assignment_id="w1")],
+        "merge_plan": [
+            {
+                "repo_name": REPO,
+                "issue_number": 1392,
+                "status": "BLOCKED",
+                "reason": "checks failed: e2e (cancelled)",
+                "assignment_id": "w1",
+            }
+        ],
+        "merge_queue": [
+            {
+                "repo_name": REPO,
+                "issue_number": 1392,
+                "state": "pending",
+                "error": (
+                    "CI infra: e2e (cancelled) — no verdict about the code "
+                    "(never assigned a runner, or died before checkout)"
+                ),
+                "assignment_id": "w1",
+            }
+        ],
+    }
+    state = project(payload, REPO, 1392, make_config())
+    assert state.merge_reason.startswith("CI infra:")
+
+
+def test_merge_entry_leaves_a_genuine_checks_failed_reason_alone():
+    """Regression: when the raw row's error is NOT a #1892 classification
+    (a genuine failure, or simply unset), the plan's own reason wins exactly
+    as before — no unwanted substitution."""
+    payload = {
+        "assignments": [row(assignment_id="w1")],
+        "merge_plan": [
+            {
+                "repo_name": REPO,
+                "issue_number": 1392,
+                "status": "BLOCKED",
+                "reason": "checks failed: build (failure)",
+                "assignment_id": "w1",
+            }
+        ],
+        "merge_queue": [
+            {
+                "repo_name": REPO,
+                "issue_number": 1392,
+                "state": "pending",
+                "error": "checks failed: build (failure)",
+                "assignment_id": "w1",
+            }
+        ],
+    }
+    state = project(payload, REPO, 1392, make_config())
+    assert state.merge_reason == "checks failed: build (failure)"
+
+
 def test_needs_attention_plan_entry_recovers_a_retryable_conflict_from_the_raw_queue():
     """#1505 review fix: `merge_queue.plan()` collapses CONFLICT into
     NEEDS_ATTENTION for display, and `merge_plan` is what a normal

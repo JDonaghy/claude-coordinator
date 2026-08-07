@@ -157,7 +157,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             error TEXT,
             enqueued_at REAL,
             assignment_type TEXT DEFAULT 'work',
-            required_gates TEXT
+            required_gates TEXT,
+            ci_infra_reruns INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS plans (
@@ -628,6 +629,13 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         # '' for every row written before this migration; `_reconcile_running`
         # treats that exactly like "launched here" (today's behaviour).
         "ALTER TABLE drive_queue ADD COLUMN launch_host TEXT NOT NULL DEFAULT ''",
+        # #1892: count of automatic `CiStore.rerun_for_pr` calls `merge_queue
+        # .process()` has issued for this entry's current verdictless-CI-
+        # failure streak — see `coord.merge_queue.MAX_CI_INFRA_RERUNS` and
+        # `QueuedMerge.ci_infra_reruns`'s docstring. 0 for every row
+        # predating this column (no auto-reruns spent yet), same as the
+        # column's own default for freshly-enqueued entries.
+        "ALTER TABLE merge_queue ADD COLUMN ci_infra_reruns INTEGER NOT NULL DEFAULT 0",
     ]
     for sql in migrations:
         try:

@@ -252,6 +252,88 @@ def test_build_board_view_ci_pending_is_false_with_no_merge_sections_at_all():
     assert not view.facts(entry_key(REPO, 1650)).merge_ci_pending
 
 
+# ── #1892: the sibling trigger — a verdictless CI failure ──────────────────
+
+def test_build_board_view_reads_merge_ci_pending_from_a_ci_infra_raw_row():
+    """#1892: `_entry_gate_status` (board-render time) never computes the
+    CI_INFRA_PREFIX classification — it needs an extra `gh api .../jobs`
+    call the board *read* path must never make (`coord.gate_snapshot`'s
+    Invariant 1). Only a LIVE `coord merge` attempt computes it and persists
+    it onto the raw `merge_queue` row's `error`; the live `merge_plan`
+    reason for the SAME entry still reads the generic "checks failed: ..."
+    wording. `build_board_view` must prefer the raw row's more specific
+    reading — mirroring `drive_state._merge_entry`'s identical recovery —
+    or a verdictless failure would never park at all."""
+    view = build_board_view(
+        {
+            "merge_plan": [
+                {
+                    "repo_name": REPO, "issue_number": 1892,
+                    "reason": "checks failed: e2e (cancelled)",
+                },
+            ],
+            "merge_queue": [
+                {
+                    "repo_name": REPO, "issue_number": 1892,
+                    "error": (
+                        "CI infra: e2e (cancelled) — no verdict about the "
+                        "code (never assigned a runner, or died before "
+                        "checkout)"
+                    ),
+                },
+            ],
+        },
+        [],
+    )
+    facts = view.facts(entry_key(REPO, 1892))
+    assert facts.merge_ci_pending
+    assert facts.merge_ci_pending_reason.startswith("CI infra:")
+
+
+def test_build_board_view_does_not_park_a_genuine_checks_failed_entry():
+    """Regression: a plain 'checks failed' reason on BOTH the plan and the
+    raw row — no #1892 classification anywhere — must not park."""
+    view = build_board_view(
+        {
+            "merge_plan": [
+                {
+                    "repo_name": REPO, "issue_number": 1893,
+                    "reason": "checks failed: build (failure)",
+                },
+            ],
+            "merge_queue": [
+                {
+                    "repo_name": REPO, "issue_number": 1893,
+                    "error": "checks failed: build (failure)",
+                },
+            ],
+        },
+        [],
+    )
+    assert not view.facts(entry_key(REPO, 1893)).merge_ci_pending
+
+
+def test_build_board_view_live_ci_infra_plan_reason_also_parks():
+    """If a future refactor DOES let the plan itself carry the #1892
+    wording, `build_board_view` must still recognise it directly — the raw-
+    row cross-check is a fallback, not the only path."""
+    view = build_board_view(
+        {
+            "merge_plan": [
+                {
+                    "repo_name": REPO, "issue_number": 1894,
+                    "reason": "CI infra: e2e (cancelled)",
+                },
+            ],
+            "merge_queue": [
+                {"repo_name": REPO, "issue_number": 1894, "error": None},
+            ],
+        },
+        [],
+    )
+    assert view.facts(entry_key(REPO, 1894)).merge_ci_pending
+
+
 def test_unknown_issues_report_nothing_rather_than_raising():
     view = build_board_view({}, [])
     facts = view.facts("nope#1")
