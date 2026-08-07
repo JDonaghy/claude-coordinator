@@ -413,6 +413,8 @@ class TestDrainLocking:
     behaves as advertised, given #1597 (no single-flight on /board rebuild).
     These prove it, rather than trusting it."""
 
+    @pytest.mark.posix_only
+    @_needs_real_flock
     def test_uses_the_same_lock_class_and_path_as_the_drive(self) -> None:
         """"The same lock" is only a real claim if it is literally the same
         class on the same path — two implementations agreeing on a filename
