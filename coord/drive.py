@@ -121,6 +121,7 @@ from coord.worker_events import is_usage_limit_reason
 # See `_STALE_SMOKE_MARKERS` / `_is_stale_smoke_reason` below.
 from coord.merge_queue import (
     STALE_SMOKE_MARKERS as _mq_stale_smoke_markers,
+    is_ci_infra_reason,
     is_ci_pending_reason,
     is_stale_smoke_reason as _mq_is_stale_smoke_reason,
 )
@@ -1777,6 +1778,22 @@ def _decide_merge(
             label=(
                 "MERGE: CI checks have not reported yet — waiting, not "
                 f"retrying (#1891): {state.merge_reason}"
+            )
+        )
+
+    # #1892: the sibling case — a CI verdict DID arrive, but every failing
+    # check said nothing about the code (never assigned a runner, or died
+    # before checkout). `coord merge`'s own live attempt is already
+    # auto-rerunning CI for this (see `coord.merge_queue.MAX_CI_INFRA_RERUNS`)
+    # — retrying `coord merge` here would just re-observe the same in-flight
+    # rerun and spend an attempt for nothing. Same bare wait as the #1891
+    # case above, and for the identical reason: only more real time (here,
+    # the rerun landing) resolves it, never another `coord merge` retry.
+    if is_ci_infra_reason(state.merge_reason):
+        return _wait(
+            label=(
+                "MERGE: CI failed with no verdict about the code — "
+                f"auto-rerunning, not retrying (#1892): {state.merge_reason}"
             )
         )
 

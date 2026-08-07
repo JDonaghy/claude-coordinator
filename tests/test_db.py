@@ -244,6 +244,81 @@ class TestDriveQueueDeployGateColumns:
         assert entry["hold_state"] == "armed"
 
 
+# ── merge_queue.ci_infra_reruns column (#1892) ──────────────────────────────
+
+_PRE_1892_MERGE_QUEUE_TABLE = """
+    CREATE TABLE merge_queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        assignment_id TEXT NOT NULL,
+        repo_name TEXT NOT NULL,
+        repo_github TEXT NOT NULL,
+        branch TEXT NOT NULL,
+        target_branch TEXT NOT NULL,
+        issue_number INTEGER NOT NULL,
+        issue_title TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'pending',
+        pr_number INTEGER,
+        pr_url TEXT,
+        size INTEGER,
+        last_attempt REAL,
+        error TEXT,
+        enqueued_at REAL,
+        assignment_type TEXT DEFAULT 'work',
+        required_gates TEXT
+    )
+"""
+
+
+def _merge_queue_columns(conn: sqlite3.Connection) -> set[str]:
+    return {r[1] for r in conn.execute("PRAGMA table_info(merge_queue)").fetchall()}
+
+
+class TestMergeQueueCiInfraRerunsColumn:
+    def test_fresh_database_has_it_from_the_create(
+        self, isolated_conn: sqlite3.Connection
+    ) -> None:
+        assert "ci_infra_reruns" in _merge_queue_columns(isolated_conn)
+
+    def test_existing_database_gains_it_in_place(self) -> None:
+        """The real path: a coord.db created before #1892, upgraded by
+        _ensure_schema — built with the pre-#1892 `CREATE TABLE` (not the
+        current one) so this keeps testing the migration even after the
+        CREATE itself grew the column."""
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(_PRE_1892_MERGE_QUEUE_TABLE)
+        conn.execute(
+            "INSERT INTO merge_queue "
+            "(assignment_id, repo_name, repo_github, branch, target_branch, "
+            "issue_number, issue_title) "
+            "VALUES ('w1', 'api', 'acme/api', 'b', 'main', 7, 't')"
+        )
+        conn.commit()
+        assert "ci_infra_reruns" not in _merge_queue_columns(conn)
+
+        _ensure_schema(conn)
+
+        assert "ci_infra_reruns" in _merge_queue_columns(conn)
+        # A pre-existing row survives and reads as "no auto-reruns spent
+        # yet" — the same default a freshly-enqueued entry gets.
+        row = conn.execute(
+            "SELECT ci_infra_reruns FROM merge_queue WHERE issue_number = 7"
+        ).fetchone()
+        assert row["ci_infra_reruns"] == 0
+        conn.close()
+
+    def test_migration_is_idempotent(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(_PRE_1892_MERGE_QUEUE_TABLE)
+        conn.commit()
+        _ensure_schema(conn)
+        _ensure_schema(conn)
+        _ensure_schema(conn)
+        assert "ci_infra_reruns" in _merge_queue_columns(conn)
+        conn.close()
+
+
 # ── override_connection ────────────────────────────────────────────────────────
 
 class TestOverrideConnection:

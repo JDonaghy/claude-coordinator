@@ -11,6 +11,15 @@ base movement, so a passing check proves the composite passed against the
 base *as of the last head push*, not as of now. Polling and non-GitHub
 backends remain deferred.
 
+Phase 3 (#1892) adds a **RED** check's own analogue of the same question:
+did this failure say anything about the code at all? :meth:`CiStore.
+list_jobs_for_run` and :func:`is_verdictless_job` distinguish "never assigned
+a runner" / "died before checkout" (a statement about the CI *platform*) from
+a genuine test failure (a statement about the *code*) — used exclusively by
+:mod:`coord.merge_queue`'s drive-retry accounting, never by the merge gate
+itself (:func:`failed_checks` and ``_PASSING_CONCLUSIONS`` are unchanged: a
+verdictless check still blocks the merge, it just doesn't cost a retry).
+
 The split between :class:`CiStore` (Protocol) and the concrete backends
 (:class:`coord.ci_github.GitHubCi`, :class:`NoOpCi`) means tests can pass a
 stub through ``ci_store=`` without touching subprocess at all.
@@ -18,7 +27,7 @@ stub through ``ci_store=`` without touching subprocess at all.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
 
@@ -38,6 +47,38 @@ class CiCheckSummary:
     running: int
     failed_names: list[str]
     first_failed_url: str | None
+
+
+@dataclass
+class JobStep:
+    """One step of a GitHub Actions job (#1892).
+
+    ``conclusion`` mirrors :class:`CheckRun`'s field: ``None`` while the step
+    hasn't finished, otherwise success/failure/cancelled/skipped/... — the
+    same vocabulary GitHub uses for check-run conclusions, one level down.
+    """
+
+    name: str
+    conclusion: str | None
+
+
+@dataclass
+class JobRun:
+    """One job of a GitHub Actions run — the step-level detail a
+    :class:`CheckRun` doesn't carry (#1892).
+
+    Populated only on the CI-failure classification path (see
+    :func:`is_verdictless_job`): a :class:`CheckRun` names a *check*
+    (workflow name, e.g. ``test (3.12)``), and this is the matching *job*
+    (same name, fetched via ``gh api repos/{repo}/actions/runs/{id}/jobs``)
+    with its steps. ``runner_name`` is empty when GitHub never assigned this
+    job a runner at all — the "cancelled at the queue timeout" signature.
+    """
+
+    name: str
+    conclusion: str | None
+    runner_name: str
+    steps: list[JobStep] = field(default_factory=list)
 
 
 @dataclass
@@ -121,6 +162,35 @@ class CiStore(Protocol):
         :mod:`coord.revalidate`'s module docstring and
         ``docs/DRIVE_QUEUE.md`` for why ``--revalidate`` is opt-in and
         auto-drain must never trigger work on its own schedule.
+
+        #1892: this same method is ALSO the auto-rerun remedy for a
+        verdictless CI failure — see :mod:`coord.merge_queue`'s
+        ``_ci_infra_reason``/``MAX_CI_INFRA_RERUNS``. That call site runs
+        unattended (unlike ``--revalidate``), which is safe specifically
+        *because* the trigger is narrow (every failing check carries no
+        verdict about the code) and bounded (capped, then parked for a
+        human) — it is not a general license for auto-drain to rerun CI.
+        """
+        ...
+
+    def list_jobs_for_run(self, repo: str, run_id: str) -> list[JobRun]:
+        """Job/step detail for Actions run *run_id* on *repo* (#1892).
+
+        The one piece of data :class:`CheckRun` doesn't carry and the CI
+        gate (``failed_checks``/``_PASSING_CONCLUSIONS``) never needed: which
+        step (if any) actually ran before a check failed. Exists solely to
+        back :func:`is_verdictless_job` — the drive's retry-accounting
+        question "did this failure say anything about the code?", never the
+        merge gate itself.
+
+        Callers MUST only invoke this after a check has already been found
+        failing (:func:`failed_checks` non-empty) — never on the passing or
+        pending path, and never from a request-time board read (see
+        ``coord.gate_snapshot``'s Invariant 1: the read path performs no
+        third-party I/O). Best-effort: a backend that can't answer this
+        returns ``[]``, which :func:`is_verdictless_job` always reads as "no
+        job data, therefore not verdictless" — the same false-negative bias
+        as an unmatched job (see that function's docstring).
         """
         ...
 
@@ -149,6 +219,11 @@ class NoOpCi:
         """No-op: CI gating is disabled entirely, so there is nothing to
         re-run and nothing to report as stale (#1851)."""
         return False
+
+    def list_jobs_for_run(self, repo: str, run_id: str) -> list[JobRun]:
+        """No-op: CI gating is disabled entirely, so there is no job/step
+        detail to fetch (#1892)."""
+        return []
 
 
 # ── Classification helpers ──────────────────────────────────────────────────
@@ -185,6 +260,56 @@ def failed_checks(checks: list[CheckRun]) -> list[CheckRun]:
 def in_flight_checks(checks: list[CheckRun]) -> list[CheckRun]:
     """Return checks that are queued or running (not yet completed)."""
     return [c for c in checks if c.status != "completed"]
+
+
+# #1892: two real signatures — recorded from JDonaghy/claude-coordinator run
+# 31117792472 and JDonaghy/vimcode run 31119463000, both 2026-08-06 — for a
+# CI failure that says nothing about the code:
+#
+# 1. Never assigned a runner: cancelled at the queue timeout, `runner_name`
+#    empty, `steps` empty. GitHub does create a job record for this (unlike
+#    a run that never even reaches job-scheduling), but with zero steps.
+# 2. Got a runner, died before checkout: exactly one step, named literally
+#    "Set up job", with a non-passing conclusion — nothing past it ran, so
+#    no repo code executed either.
+#
+# Deliberately narrow — see this module's `_PASSING_CONCLUSIONS` comment for
+# the identical lesson learned the hard way (#1525) about allow-lists vs.
+# catch-alls, and the issue's own hazard note: a classifier that is too eager
+# becomes a way to launder real failures into "infrastructure". Prefer false
+# negatives — a platform failure misread as real costs one manual unblock; a
+# real failure misread as platform noise costs a bad merge. So both
+# `check is None`/`job is None` (no job data — including a fetch failure;
+# see `CiStore.list_jobs_for_run`'s docstring) and any shape that isn't
+# EXACTLY one of the two above read as "carries a verdict", never as
+# verdictless.
+_SET_UP_JOB_STEP_NAME = "Set up job"
+
+
+def is_verdictless_job(check: CheckRun, job: JobRun | None) -> bool:
+    """True when *check* failed for a reason that says nothing about the
+    code — see the two signatures documented above (#1892).
+
+    Only meaningful for a check :func:`failed_checks` already selected
+    (``status == "completed"`` and a non-passing conclusion); a check that
+    is still in flight, or one this function is asked about with no
+    matching *job* record, always reads ``False`` — "carries a verdict",
+    the safe default per the false-negative bias above.
+
+    This is a **narrower** question than the merge gate's own — it does not
+    change whether the check counts as failed (:func:`failed_checks` is
+    untouched), only whether the failure is evidence about the *code*. Used
+    exclusively by the drive's retry accounting (:mod:`coord.merge_queue`'s
+    ``_ci_infra_reason``), never by the gate itself.
+    """
+    if check.status != "completed" or job is None:
+        return False
+    if check.conclusion == "cancelled":
+        return len(job.steps) == 0
+    failed_steps = [
+        s for s in job.steps if s.conclusion not in (None, "success", "skipped")
+    ]
+    return len(failed_steps) == 1 and failed_steps[0].name == _SET_UP_JOB_STEP_NAME
 
 
 def checks_are_stale(checks: list[CheckRun], base_commit_time: float | None) -> bool:

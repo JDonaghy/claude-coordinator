@@ -55,7 +55,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
 
 from coord.drive_state import TERMINAL_STATUSES, WORK_LIKE
-from coord.merge_queue import is_ci_pending_reason
+from coord.merge_queue import is_ci_infra_reason, is_ci_pending_reason
 
 # ── queue states ─────────────────────────────────────────────────────────────
 #
@@ -81,6 +81,16 @@ STATE_FAILED = "failed"
 # interventions", so a queue read (`coord drive-queue list`/`status`) must
 # render it distinctly from both `waiting` (nothing wrong) and `blocked`
 # (needs a human) — see `_STATE_ORDER` in `coord/commands/drive_queue.py`.
+#
+# #1892 extends the SAME state to a second trigger:
+# `coord.merge_queue.is_ci_infra_reason` — a CI verdict that DID arrive but
+# said nothing about the code (never assigned a runner, or died before
+# checkout). There the "more real time" that un-parks the entry is the
+# in-flight auto-rerun (`MAX_CI_INFRA_RERUNS`) landing, not a verdict that
+# simply hasn't shown up yet — but the queue-level treatment is identical:
+# relaunching a fresh `coord drive` right now would just observe the same
+# rerun-in-progress and wait again, so this parks instead of spending an
+# attempt. See `build_board_view`'s population of `merge_ci_pending` below.
 STATE_PARKED = "parked"
 
 TERMINAL_QUEUE_STATES: frozenset[str] = frozenset(
@@ -482,8 +492,21 @@ def build_board_view(
         if not repo or number is None:
             continue
         key = entry_key(repo, int(number))
-        reason = plan_reasons.get(key) or str(row.get("error") or "")
-        if is_ci_pending_reason(reason):
+        plan_reason = plan_reasons.get(key) or ""
+        raw_reason = str(row.get("error") or "")
+        reason = plan_reason or raw_reason
+        # #1892: same recovery `drive_state._merge_entry` applies — the
+        # plan's own reason is `_entry_gate_status`'s fresh re-derivation at
+        # board-build time, which never computes the CI_INFRA_PREFIX
+        # classification (it needs an extra `gh api .../jobs` call the
+        # board *read* path must never make — see `coord.gate_snapshot`'s
+        # Invariant 1). Only a LIVE `coord merge` attempt computes it and
+        # persists it onto the raw row. Prefer the raw reading whenever it
+        # carries the classification and the plan's fresher one doesn't —
+        # otherwise a verdictless failure would never park here at all.
+        if is_ci_infra_reason(raw_reason) and not is_ci_infra_reason(plan_reason):
+            reason = raw_reason
+        if is_ci_pending_reason(reason) or is_ci_infra_reason(reason):
             got = slot(key)
             got["merge_ci_pending"] = True
             got["merge_ci_pending_reason"] = reason

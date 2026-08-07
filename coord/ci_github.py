@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from coord import github_ops
-from coord.ci_store import CheckRun
+from coord.ci_store import CheckRun, JobRun, JobStep
 
 
 def _parse_ts(raw: str | None) -> float | None:
@@ -119,6 +119,16 @@ class GitHubCi:
     # cached answer instead of paying a `gh api .../actions/workflows` round
     # trip each.
     _workflow_cache: dict[str, tuple[float, bool]] = field(default_factory=dict)
+    # #1892: (repo, run_id) -> (fetched_at, jobs). Only ever populated by
+    # `list_jobs_for_run`, which callers invoke exclusively on the CI-failure
+    # classification path (see that method's docstring) — this cache exists
+    # so a board build that re-evaluates the SAME still-failing PR every tick
+    # (`plan()` -> `_entry_gate_status`, or a `process()` retry loop) doesn't
+    # re-issue the extra `gh api .../jobs` call every time; it shares
+    # `cache_ttl` with `_cache` above rather than a second knob.
+    _jobs_cache: dict[tuple[str, str], tuple[float, list[JobRun]]] = field(
+        default_factory=dict
+    )
 
     @property
     def is_available(self) -> bool:
@@ -217,6 +227,59 @@ class GitHubCi:
         if any_ok:
             self.invalidate(repo, number)
         return all_ok and any_ok
+
+    def list_jobs_for_run(self, repo: str, run_id: str) -> list["JobRun"]:
+        """Job/step detail for Actions run *run_id* on *repo* via ``gh api``
+        (#1892) — backs :func:`coord.ci_store.is_verdictless_job`.
+
+        Deliberately best-effort in a way :meth:`list_checks_for_pr` is NOT
+        (#1525's fail-closed posture applies to the merge *gate*; this is a
+        narrower, purely-advisory retry-accounting read — see
+        :class:`coord.ci_store.CiStore`'s own docstring for the same
+        distinction drawn for ``list_jobs_for_run``). Any read failure —
+        missing ``gh``, timeout, malformed JSON, an expired/nonexistent run
+        id — returns ``[]`` rather than raising or synthesizing a failing
+        placeholder; the caller's classifier already treats "no job data" as
+        "not verdictless" (the safe false-negative direction), so there is
+        nothing this method needs to signal beyond an empty result.
+        """
+        key = (repo, str(run_id))
+        now = time.time()
+        cached = self._jobs_cache.get(key)
+        if cached is not None and (now - cached[0]) < self.cache_ttl:
+            return cached[1]
+        jobs = self._fetch_jobs(repo, run_id)
+        self._jobs_cache[key] = (now, jobs)
+        return jobs
+
+    def _fetch_jobs(self, repo: str, run_id: str) -> list["JobRun"]:
+        try:
+            raw = github_ops.get_run_jobs(repo, run_id)
+        except (FileNotFoundError, subprocess.TimeoutExpired, RuntimeError, ValueError):
+            return []
+        if not isinstance(raw, list):
+            return []
+        jobs: list[JobRun] = []
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            steps = [
+                JobStep(
+                    name=str(step.get("name", "")),
+                    conclusion=step.get("conclusion"),
+                )
+                for step in (entry.get("steps") or [])
+                if isinstance(step, dict)
+            ]
+            jobs.append(
+                JobRun(
+                    name=str(entry.get("name", "")),
+                    conclusion=entry.get("conclusion"),
+                    runner_name=str(entry.get("runner_name") or ""),
+                    steps=steps,
+                )
+            )
+        return jobs
 
     # ── Internal ────────────────────────────────────────────────────────────
 

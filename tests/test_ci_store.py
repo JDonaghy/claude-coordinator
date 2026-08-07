@@ -19,11 +19,14 @@ from coord import github_ops
 from coord.ci_github import GitHubCi
 from coord.ci_store import (
     CheckRun,
+    JobRun,
+    JobStep,
     NoOpCi,
     build_ci_store,
     checks_are_stale,
     failed_checks,
     in_flight_checks,
+    is_verdictless_job,
     summarize,
 )
 
@@ -152,6 +155,103 @@ class TestChecksAreStale:
         though a base_commit_time is known."""
         checks = [_check("ci", started_at=None)]
         assert checks_are_stale(checks, 1000.0) is True
+
+
+# ── is_verdictless_job (#1892) ────────────────────────────────────────────────
+#
+# Fixtures below are lifted verbatim (trimmed to the fields the classifier
+# reads) from the two real signatures the issue documents:
+# JDonaghy/claude-coordinator run 31117792472 attempt 2 (the "died at Set up
+# job" job, `e2e`) and JDonaghy/vimcode run 31119463000 attempt 2 (the
+# "never assigned a runner" job, `Test (Linux, headless)`).
+
+def _never_assigned_a_runner() -> JobRun:
+    """GitHub's own shape for a job cancelled at the queue timeout: a job
+    record DOES exist, but with an empty runner and zero steps."""
+    return JobRun(name="e2e", conclusion="cancelled", runner_name="", steps=[])
+
+
+def _died_before_checkout() -> JobRun:
+    """GitHub's own shape for a job that got a runner but died setting it
+    up: exactly one step, named literally "Set up job", non-passing."""
+    return JobRun(
+        name="e2e", conclusion="failure", runner_name="GitHub Actions 1000009736",
+        steps=[JobStep(name="Set up job", conclusion="failure")],
+    )
+
+
+def _ran_and_failed() -> JobRun:
+    """A real failure: got a runner, ran past "Set up job", and a LATER
+    step failed — this carries a verdict about the code."""
+    return JobRun(
+        name="e2e", conclusion="failure", runner_name="GitHub Actions 1000009718",
+        steps=[
+            JobStep(name="Set up job", conclusion="success"),
+            JobStep(name="Run actions/checkout@v4", conclusion="success"),
+            JobStep(name="Run pytest", conclusion="failure"),
+        ],
+    )
+
+
+class TestIsVerdictlessJob:
+    def test_never_assigned_a_runner_is_verdictless(self) -> None:
+        check = _check("e2e", conclusion="cancelled")
+        assert is_verdictless_job(check, _never_assigned_a_runner()) is True
+
+    def test_died_before_checkout_is_verdictless(self) -> None:
+        check = _check("e2e", conclusion="failure")
+        assert is_verdictless_job(check, _died_before_checkout()) is True
+
+    def test_a_real_failure_carries_a_verdict(self) -> None:
+        """The hazard the issue warns against: this must NOT be laundered
+        into "infrastructure" just because it also has a runner and steps."""
+        check = _check("e2e", conclusion="failure")
+        assert is_verdictless_job(check, _ran_and_failed()) is False
+
+    def test_cancelled_with_steps_recorded_carries_a_verdict(self) -> None:
+        """Only EXACTLY zero steps is the "never started" signature — a
+        cancelled job that got partway through is a different story."""
+        check = _check("e2e", conclusion="cancelled")
+        job = JobRun(
+            name="e2e", conclusion="cancelled", runner_name="GitHub Actions 1",
+            steps=[JobStep(name="Set up job", conclusion="success")],
+        )
+        assert is_verdictless_job(check, job) is False
+
+    def test_failure_with_a_second_failed_step_carries_a_verdict(self) -> None:
+        """Real-world third shape (webapp-types, run 31123113788 attempt 1):
+        a job with a runner assigned, conclusion=failure, but ZERO recorded
+        steps — the runner itself likely died mid-run. This is neither
+        documented signature (not cancelled; no "Set up job" step at all),
+        so per the false-negative bias it must read as carrying a verdict,
+        not as infrastructure noise."""
+        check = _check("webapp-types", conclusion="failure")
+        job = JobRun(
+            name="webapp-types", conclusion="failure",
+            runner_name="GitHub Actions 1000009756", steps=[],
+        )
+        assert is_verdictless_job(check, job) is False
+
+    def test_no_job_data_carries_a_verdict(self) -> None:
+        """No matching job (unmatched name, or CiStore.list_jobs_for_run
+        failed/returned nothing) must default to "carries a verdict" — the
+        safe false-negative direction, never the reverse."""
+        check = _check("e2e", conclusion="cancelled")
+        assert is_verdictless_job(check, None) is False
+
+    def test_in_flight_check_carries_a_verdict(self) -> None:
+        """Only a completed check is ever asked about — an in-flight one
+        must never be misread as verdictless."""
+        check = _check("e2e", status="in_progress", conclusion=None)
+        assert is_verdictless_job(check, _never_assigned_a_runner()) is False
+
+    def test_success_conclusion_is_not_relevant_here(self) -> None:
+        """Not a signature this function is meant to see in practice
+        (callers only ask about `failed_checks` output) but a defensive
+        check: a passing check with an empty-steps job must not read as
+        verdictless — the "cancelled" branch is conclusion-specific."""
+        check = _check("e2e", conclusion="success")
+        assert is_verdictless_job(check, _never_assigned_a_runner()) is False
 
 
 class TestSummarize:
@@ -567,6 +667,116 @@ class TestGitHubCiRerunForPr:
             store.rerun_for_pr("acme/api", 42)
             store.list_checks_for_pr("acme/api", 42)
         assert run.call_count == 3
+
+
+class TestGitHubCiListJobsForRun:
+    """#1892: `gh api repos/{repo}/actions/runs/{id}/jobs` job/step detail —
+    the extra call the CI-failure classification path pays for. Fixture
+    shapes below are the real ``jobs`` response bodies recorded from
+    JDonaghy/vimcode run 31119463000 (trimmed to the fields this code
+    reads)."""
+
+    # Attempt 1: got a runner, died at "Set up job".
+    DIED_BEFORE_CHECKOUT = json.dumps({
+        "total_count": 1,
+        "jobs": [
+            {
+                "id": 1, "run_id": 31119463000, "name": "Test (Linux, headless)",
+                "status": "completed", "conclusion": "failure",
+                "runner_name": "GitHub Actions 1000009740",
+                "steps": [
+                    {"name": "Set up job", "status": "completed", "conclusion": "failure", "number": 1},
+                ],
+            },
+        ],
+    })
+
+    # Attempt 2: never assigned a runner — cancelled at the queue timeout.
+    NEVER_ASSIGNED_A_RUNNER = json.dumps({
+        "total_count": 1,
+        "jobs": [
+            {
+                "id": 2, "run_id": 31119463000, "name": "Test (Linux, headless)",
+                "status": "completed", "conclusion": "cancelled",
+                "runner_name": "", "steps": [],
+            },
+        ],
+    })
+
+    def test_parses_died_before_checkout_shape(self) -> None:
+        store = GitHubCi()
+        with patch(
+            "coord.ci_github.subprocess.run",
+            return_value=_gh_result(self.DIED_BEFORE_CHECKOUT),
+        ):
+            jobs = store.list_jobs_for_run("JDonaghy/vimcode", "31119463000")
+        assert len(jobs) == 1
+        job = jobs[0]
+        assert job.name == "Test (Linux, headless)"
+        assert job.conclusion == "failure"
+        assert job.runner_name == "GitHub Actions 1000009740"
+        assert [(s.name, s.conclusion) for s in job.steps] == [("Set up job", "failure")]
+
+    def test_parses_never_assigned_a_runner_shape(self) -> None:
+        store = GitHubCi()
+        with patch(
+            "coord.ci_github.subprocess.run",
+            return_value=_gh_result(self.NEVER_ASSIGNED_A_RUNNER),
+        ):
+            jobs = store.list_jobs_for_run("JDonaghy/vimcode", "31119463000")
+        assert len(jobs) == 1
+        job = jobs[0]
+        assert job.conclusion == "cancelled"
+        assert job.runner_name == ""
+        assert job.steps == []
+
+    def test_calls_the_documented_gh_api_endpoint(self) -> None:
+        store = GitHubCi()
+        with patch(
+            "coord.ci_github.subprocess.run",
+            return_value=_gh_result(self.NEVER_ASSIGNED_A_RUNNER),
+        ) as run:
+            store.list_jobs_for_run("JDonaghy/vimcode", "31119463000")
+        args = run.call_args.args[0]
+        assert args == [
+            "gh", "api", "repos/JDonaghy/vimcode/actions/runs/31119463000/jobs",
+        ]
+
+    def test_read_failure_returns_empty_not_raises(self) -> None:
+        """#1892's false-negative bias: a failed fetch must degrade to "no
+        job data" — the classifier already treats that as "not verdictless",
+        so there is nothing to raise or synthesize here."""
+        store = GitHubCi()
+        with patch("coord.ci_github.subprocess.run", side_effect=FileNotFoundError):
+            assert store.list_jobs_for_run("acme/api", "1") == []
+
+    def test_malformed_response_returns_empty(self) -> None:
+        store = GitHubCi()
+        with patch(
+            "coord.ci_github.subprocess.run",
+            return_value=_gh_result("not json"),
+        ):
+            assert store.list_jobs_for_run("acme/api", "1") == []
+
+    def test_cache_avoids_second_call(self) -> None:
+        store = GitHubCi(cache_ttl=60.0)
+        with patch(
+            "coord.ci_github.subprocess.run",
+            return_value=_gh_result(self.NEVER_ASSIGNED_A_RUNNER),
+        ) as run:
+            store.list_jobs_for_run("acme/api", "1")
+            store.list_jobs_for_run("acme/api", "1")
+        assert run.call_count == 1
+
+    def test_cache_keyed_per_run_id(self) -> None:
+        store = GitHubCi(cache_ttl=60.0)
+        with patch(
+            "coord.ci_github.subprocess.run",
+            return_value=_gh_result(self.NEVER_ASSIGNED_A_RUNNER),
+        ) as run:
+            store.list_jobs_for_run("acme/api", "1")
+            store.list_jobs_for_run("acme/api", "2")
+        assert run.call_count == 2
 
 
 # ── Merge gate integration ───────────────────────────────────────────────────

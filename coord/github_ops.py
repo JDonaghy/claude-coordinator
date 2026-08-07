@@ -1442,6 +1442,32 @@ def get_pr_checks(repo: str, number: int) -> list[dict]:
     return json.loads(stdout or "[]")
 
 
+def get_run_jobs(repo: str, run_id: str) -> list[dict]:
+    """Return ``gh api .../actions/runs/{run_id}/jobs``' raw ``jobs`` list (#1892).
+
+    The single ``gh`` sink for :meth:`coord.ci_github.GitHubCi.
+    list_jobs_for_run` — the one call that carries per-step detail
+    (``runner_name``, each step's ``name``/``conclusion``) a plain
+    ``gh pr checks`` read never has. Deliberately NOT the ``--json``
+    field-selection style :func:`get_pr_checks` uses: ``gh api`` returns the
+    endpoint's full JSON shape and this needs several nested fields
+    (``steps[].name``, ``steps[].conclusion``, ``runner_name``) that aren't
+    worth hand-picking.
+
+    Raises ``RuntimeError``/``ValueError`` on any read failure — auth,
+    rate-limit, malformed response, or the run id simply not existing
+    (rerun raced a retention window). Callers on the classification path
+    (:mod:`coord.ci_store`'s false-negative bias) must catch and treat a
+    raised error the same as "no job data" — never as evidence either way.
+    """
+    data = _gh_json("api", f"repos/{repo}/actions/runs/{run_id}/jobs", default=None)
+    if not isinstance(data, dict) or not isinstance(data.get("jobs"), list):
+        raise RuntimeError(
+            f"gh api repos/{repo}/actions/runs/{run_id}/jobs: malformed response"
+        )
+    return data["jobs"]
+
+
 def rerun_workflow_run(repo: str, run_id: str) -> bool:
     """Re-run Actions workflow run *run_id* on *repo* via ``gh run rerun``.
 
