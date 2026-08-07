@@ -109,6 +109,10 @@ scp -q "$HERE/coordinator-machine.py" "${DAEMON_HOST}:${REMOTE_HELPER}"
 ssh "$DAEMON_HOST" bash -euo pipefail -s -- "$MACHINE" "$REMOTE_HELPER" <<'REMOTE'
 MACHINE="$1"; HELPER="$2"
 CFG="$HOME/.coord/coordinator.yml"
+# #1887: same fix as epic-up.sh's registration step -- resolve the symlink
+# into the coord-settings checkout (#1832) before writing, so `mv` lands on
+# the real, version-controlled file instead of replacing the symlink itself.
+CFG="$(readlink -f "$CFG")"
 TMP="$(mktemp "${CFG}.XXXXXX")"
 trap 'rm -f "$TMP"' EXIT
 
@@ -147,6 +151,14 @@ chmod --reference="$CFG" "$TMP"
 mv "$TMP" "$CFG"
 trap - EXIT
 echo "  coordinator.yml updated"
+
+# #1887: same reasoning as epic-up.sh -- deregistering is also a content
+# change inside coord-settings when #1832's symlink applies. Surface the
+# exact commit rather than leaving the checkout silently dirty.
+if git_root="$(git -C "$(dirname "$CFG")" rev-parse --show-toplevel 2>/dev/null)"; then
+    echo "  NOTE: $CFG lives in $git_root -- commit the change there, e.g.:"
+    echo "    git -C $git_root add $(realpath --relative-to="$git_root" "$CFG") && git -C $git_root commit -m 'coord: deregister $MACHINE'"
+fi
 REMOTE
 
 # --------------------------------------------------------------------------

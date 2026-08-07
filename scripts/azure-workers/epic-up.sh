@@ -280,6 +280,13 @@ ssh "$DAEMON_HOST" bash -euo pipefail -s -- \
     "$MACHINE" "$CAPABILITIES" "$REPOS" "$MAX_WORKERS" "$REMOTE_HELPER" "$REPO_ROOT" <<'REMOTE'
 MACHINE="$1"; CAPS="$2"; REPOS="$3"; MAXW="$4"; HELPER="$5"; REPO_ROOT="$6"
 CFG="$HOME/.coord/coordinator.yml"
+# #1887: ~/.coord/coordinator.yml is a symlink into the version-controlled
+# coord-settings checkout on hosts that adopted #1832. `mv` replaces the
+# SYMLINK itself, not its target, so writing straight to $CFG would silently
+# leave the fleet running a disconnected, untracked regular file -- the
+# exact failure #1832 exists to prevent. readlink -f is a no-op when $CFG is
+# already a plain file, so this is safe on hosts without the symlink too.
+CFG="$(readlink -f "$CFG")"
 TMP="$(mktemp "${CFG}.XXXXXX")"
 trap 'rm -f "$TMP"' EXIT
 
@@ -343,6 +350,17 @@ chmod --reference="$CFG" "$TMP"
 mv "$TMP" "$CFG"
 trap - EXIT
 echo "  coordinator.yml updated"
+
+# #1887: registering a machine is a CONTENT change inside coord-settings (when
+# #1832's symlink applies) -- leaving that checkout dirty and unmentioned is
+# its own trap: the next `git pull` there looks clean and quietly discards
+# this edit. Print the exact command rather than committing on the
+# operator's behalf (an operator mid-edit of coordinator.yml elsewhere in the
+# same checkout should not have an unrelated commit made for them).
+if git_root="$(git -C "$(dirname "$CFG")" rev-parse --show-toplevel 2>/dev/null)"; then
+    echo "  NOTE: $CFG lives in $git_root -- commit the change there, e.g.:"
+    echo "    git -C $git_root add $(realpath --relative-to="$git_root" "$CFG") && git -C $git_root commit -m 'coord: register $MACHINE'"
+fi
 REMOTE
 
 # --------------------------------------------------------------------------
