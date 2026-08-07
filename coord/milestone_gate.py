@@ -62,6 +62,44 @@ consequently *not* gated on ``milestone.auto_dispatch``: an operator who
 explicitly asked for one milestone to be gate-driven has already given the
 approval that flag exists to represent, and leaving the tick behind it would
 mean a ``drive`` that silently does nothing.
+
+Exactly one overseer (#1930, epic #1440 S-2)
+---------------------------------------------
+
+#1440's acceptance says the "exactly one overseer" decision must be
+structural, not documentary — #1870 is the counter-example this file exists
+to not repeat: a second entry point observed stale state and raced the first,
+producing a duplicate drive. Applied to a gate-controlled milestone, the
+**daemon's gate tick is the sole owner of its ``work`` drain** — every other
+entry point that could dispatch the same frontier must refuse or delegate,
+never guess-and-race:
+
+- ``coord milestone drive`` **delegates**. It writes a ``GateRecord`` (cold
+  start) or re-persists the existing one (resume) but never calls
+  :func:`apply_step` and never dispatches — only ``_milestone_gate_tick``
+  does either. Running it twice, from two operators or two machines, is
+  therefore inert past the first call: same key, same record, no side
+  effect. There is nothing here for a second caller to race.
+- ``coord milestone dispatch`` (the manual, non-gate CLI) **refuses**. Before
+  #1930 it had no idea a gate record existed and would happily dispatch the
+  same ready frontier the gate tick's ``work`` state was about to (or had
+  just) dispatched — the exact "two gates disagreeing about whether work may
+  start" shape #1870 already taught this codebase to fear, just reached from
+  the operator's keyboard instead of a second host's timer. See
+  ``coord.commands.milestone.milestone_dispatch_cmd``'s gate-record check,
+  which runs before the GitHub fetch and before ``--dry-run``/``--next``, so
+  the refusal is unconditional and cheap.
+- ``_milestone_drain_tick`` (the legacy ``milestone.auto_dispatch`` path)
+  **delegates** by skipping any milestone with a gate record — see above.
+- A second daemon process ticking the same board is out of scope here: this
+  module has no leader-election of its own and assumes the fleet convention
+  documented in ``docs/DRIVE_QUEUE.md`` (one daemon owns tick duty) holds for
+  the milestone-gate tick too. ``_save_milestone_gate_local``'s whole-record
+  upsert is not a compare-and-swap, so two daemons ticking concurrently could
+  still interleave writes — that would need a real distributed lock, which is
+  a different, larger change than this issue's scope (client vs. daemon
+  entry points). Flagged here rather than left for the next reader to
+  discover the hard way.
 """
 
 from __future__ import annotations
