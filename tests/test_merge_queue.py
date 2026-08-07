@@ -4422,6 +4422,54 @@ class TestPlan:
         assert plan[0].status == mq.PLAN_BLOCKED
         assert "CI running" in (plan[0].reason or "")
 
+    def test_blocked_ci_absent_when_repo_declares_ci(self, coord_db) -> None:
+        """#1904: an empty check list for a repo that declares CI must show
+        BLOCKED with a `checks_absent`-style reason — not READY, the
+        pre-#1904 read that let a PR whose CI never ran merge as green."""
+
+        class FakeCi:
+            is_available = True
+            def list_checks_for_pr(self, repo, number):
+                return []
+            def expects_checks(self, repo, number):
+                return True
+
+        items = [_q("w1", size=50, pr=99)]
+        save_queue(items)
+        board = self._board(completed=[
+            self._work("w1", test_state="passed"),
+            self._review("w1", verdict="approve"),
+        ])
+        cfg = self._config()
+        plan = mq.plan(board, cfg, ci_store=FakeCi())
+        assert plan[0].status == mq.PLAN_BLOCKED
+        assert "CI never ran" in (plan[0].reason or "")
+        assert mq.is_ci_absent_reason(plan[0].reason)
+
+    def test_ready_when_no_workflows_declared_and_checks_empty(self, coord_db) -> None:
+        """Companion regression: a repo with no CI configured at all
+        (`expects_checks` answers False) must still show READY for an empty
+        check list — the #1904 fix must not deadlock repos that legitimately
+        have no workflows."""
+
+        class FakeCi:
+            is_available = True
+            def list_checks_for_pr(self, repo, number):
+                return []
+            def expects_checks(self, repo, number):
+                return False
+
+        items = [_q("w1", size=50, pr=99)]
+        save_queue(items)
+        board = self._board(completed=[
+            self._work("w1", test_state="passed"),
+            self._review("w1", verdict="approve"),
+        ])
+        cfg = self._config()
+        plan = mq.plan(board, cfg, ci_store=FakeCi())
+        assert plan[0].status == mq.PLAN_READY
+        assert plan[0].reason is None
+
     def test_ci_summary_populated_from_ci_store(self, coord_db) -> None:
         """#1344: plan() attaches a structured `ci_summary` + `pr_number` so
         the TUI can render CI badges straight from `/board` instead of

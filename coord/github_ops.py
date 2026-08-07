@@ -1372,6 +1372,33 @@ def _gh_too_old_message(stderr: str) -> str:
     )
 
 
+def get_repo_workflow_count(repo: str) -> int:
+    """Number of GitHub Actions workflows GitHub recognises for *repo* (#1904).
+
+    Backs :meth:`coord.ci_github.GitHubCi.expects_checks` — the signal that
+    distinguishes "this repo has no CI configured" (an empty ``gh pr checks``
+    result is correct) from "CI exists but never triggered for this PR" (an
+    empty result is a red flag: a throttled webhook, a wedged run, a
+    ``paths:``-filtered-out workflow). Queries the workflow *definitions*
+    GitHub knows about for the repo as a whole — not any particular branch
+    or PR's check runs — so the answer doesn't depend on whether this PR's
+    push ever actually triggered a run, which is exactly the case this
+    exists to catch.
+
+    Raises (``RuntimeError``/:class:`GhError`) on any read failure — auth,
+    rate-limit, malformed response — rather than defaulting to 0. A caller
+    that can't tell "no workflows" from "couldn't check" must not silently
+    treat the latter as the former; see #1525 for the identical reasoning
+    applied to check-run reads themselves.
+    """
+    data = _gh_json("api", f"repos/{repo}/actions/workflows", default=None)
+    if not isinstance(data, dict) or not isinstance(data.get("total_count"), int):
+        raise RuntimeError(
+            f"gh api repos/{repo}/actions/workflows: malformed response"
+        )
+    return data["total_count"]
+
+
 def get_pr_checks(repo: str, number: int) -> list[dict]:
     """Return ``gh pr checks``' raw check-run list for PR *number*.
 

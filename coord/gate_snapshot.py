@@ -125,6 +125,12 @@ class GateSnapshot:
     branch_patch_ids: dict[tuple[str, str, str], str | None] = field(
         default_factory=dict
     )
+    # #1904: repo -> whether the inner CiStore believes this repo declares
+    # CI at all — the signal `expects_checks` below needs to tell "no CI
+    # configured" apart from "CI exists but never reported for this PR"
+    # when `list_checks_for_pr` comes back empty. Keyed on repo (not
+    # (repo, number)) since workflow declarations are repo-wide.
+    workflows_declared: dict[str, bool] = field(default_factory=dict)
     ci_available: bool = False
     refreshed_at: float | None = None
 
@@ -141,6 +147,19 @@ class GateSnapshot:
             if age is None or age > STALE_AFTER_SECONDS:
                 return [_stale_check(age)]
         return self.checks.get((repo, number), [])
+
+    def expects_checks(self, repo: str, number: int) -> bool:
+        # #1904: unlike `list_checks_for_pr`'s "unknown reads as failing"
+        # (#1525) posture, a repo this snapshot hasn't cached an answer for
+        # yet — never refreshed, or `ci_available=False` — reads as `False`
+        # (not "checks absent"). This mirrors the module docstring's
+        # documented "fail-open by construction" tradeoff for a snapshot
+        # that hasn't (yet) done any I/O: a fresh daemon boot serves an
+        # unannotated board instantly rather than reading every pending
+        # entry as untested-and-blocked before the first tick even runs.
+        # Once `refresh()` has run at least once for this repo, the cached
+        # answer is real GitHub truth, not a guess.
+        return self.workflows_declared.get(repo, False)
 
     @property
     def is_available(self) -> bool:
@@ -229,6 +248,7 @@ class GateSnapshotRefresher:
         epics: dict[tuple[str, int], bool] = {}
         branch_shas: dict[tuple[str, str], str | None] = {}
         branch_patch_ids: dict[tuple[str, str, str], str | None] = {}
+        workflows_declared: dict[str, bool] = {}
         for entry in pending:
             # Branch HEAD + merge-base HEAD + the branch's patch-id against
             # that base — the three anchors #821/#1475/#1479 compare a
@@ -259,6 +279,17 @@ class GateSnapshotRefresher:
                     checks[key] = inner.list_checks_for_pr(*key)
                 except Exception:  # noqa: BLE001 — fail-open for this entry
                     checks[key] = []
+                # #1904: repo-wide, so dedupe across every pending entry in
+                # the same repo — one `gh api .../actions/workflows` call
+                # per repo per tick, not one per PR. A failure here reads
+                # as `False` (not "checks absent") for this snapshot cycle
+                # — see `expects_checks`' docstring for why the *display*
+                # path stays fail-open where the live gate fails closed.
+                if entry.repo_github not in workflows_declared:
+                    try:
+                        workflows_declared[entry.repo_github] = inner.expects_checks(*key)
+                    except Exception:  # noqa: BLE001 — fail-open for this repo
+                        workflows_declared[entry.repo_github] = False
             try:
                 msgs = github_ops.get_pr_commit_messages(*key)
             except Exception:  # noqa: BLE001
@@ -282,6 +313,7 @@ class GateSnapshotRefresher:
             epic_issues=epics,
             branch_shas=branch_shas,
             branch_patch_ids=branch_patch_ids,
+            workflows_declared=workflows_declared,
             ci_available=ci_available,
             refreshed_at=time.time(),
         )

@@ -113,6 +113,12 @@ class GitHubCi:
 
     cache_ttl: float = 10.0
     _cache: dict[tuple[str, int], tuple[float, list[CheckRun]]] = field(default_factory=dict)
+    # #1904: repo -> (fetched_at, expects_checks). Keyed by repo alone (not
+    # (repo, number) like `_cache` above) — whether a repo declares Actions
+    # workflows doesn't vary per PR, so every PR in the same repo shares one
+    # cached answer instead of paying a `gh api .../actions/workflows` round
+    # trip each.
+    _workflow_cache: dict[str, tuple[float, bool]] = field(default_factory=dict)
 
     @property
     def is_available(self) -> bool:
@@ -131,6 +137,34 @@ class GitHubCi:
         checks = self._fetch(repo, number)
         self._cache[key] = (now, checks)
         return checks
+
+    def expects_checks(self, repo: str, number: int) -> bool:
+        """True when *repo* declares at least one GitHub Actions workflow (#1904).
+
+        *number* is accepted only to satisfy :class:`coord.ci_store.CiStore`'s
+        shape — workflow *definitions* are repo-wide, not per-PR, so the
+        cache (see ``_workflow_cache`` above) is keyed on *repo* alone.
+
+        Fails closed (returns ``True``) on any read failure — an
+        unreadable/erroring ``gh api .../actions/workflows`` call means "we
+        don't know if this repo has CI", and #1525's rule is that unknown
+        must read as "checks were expected", not as the free pass that let
+        an empty ``checks`` list merge untested code in the first place.
+        """
+        now = time.time()
+        cached = self._workflow_cache.get(repo)
+        if cached is not None and (now - cached[0]) < self.cache_ttl:
+            return cached[1]
+        result = self._fetch_expects_checks(repo)
+        self._workflow_cache[repo] = (now, result)
+        return result
+
+    def _fetch_expects_checks(self, repo: str) -> bool:
+        try:
+            count = github_ops.get_repo_workflow_count(repo)
+        except (FileNotFoundError, subprocess.TimeoutExpired, RuntimeError, ValueError):
+            return True  # fail closed — see expects_checks' docstring
+        return count > 0
 
     def invalidate(self, repo: str | None = None, number: int | None = None) -> None:
         """Drop cached entries — pass nothing to clear everything."""

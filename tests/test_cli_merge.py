@@ -2620,3 +2620,154 @@ class TestMergeRevalidateCiRerunCli:
         assert result.exit_code == 0, result.output
         assert ci.rerun_calls == [("acme/api", 501)]
         assert "triggered a CI re-run" in result.output
+
+
+class TestMergeGateChecksAbsent:
+    """#1904 black-box: `checks == []` is ambiguous — "no CI configured"
+    (merge is correct) vs. "CI exists but never triggered for this PR" (a
+    throttled webhook, a wedged run, a path-filtered-out workflow — merge is
+    wrong). Every CI gate predicate (`failed_checks`/`in_flight_checks`/
+    `checks_are_stale`) is a filter over `checks` and passes vacuously on
+    `[]`, so before #1904 all three surfaces below — `--plan`, `--dry-run`,
+    and the real merge — agreed on the wrong answer: READY / "would merge" /
+    merged. This proves all three now agree on the *right* one, and that a
+    repo genuinely lacking CI (`expects_checks` answering `False`, mirroring
+    a repo with no workflows or `ci_store: {type: none}`) is not deadlocked
+    by the fix.
+    """
+
+    @staticmethod
+    def _config(tmp_path: Path) -> Path:
+        p = tmp_path / "coordinator.yml"
+        p.write_text(
+            "repos:\n"
+            "  - name: api\n"
+            "    github: acme/api\n"
+            "    default_branch: main\n"
+            "machines:\n"
+            "  - name: laptop\n"
+            "    host: laptop.tailnet\n"
+            "    repos: [api]\n"
+            "    repo_paths:\n"
+            "      api: /tmp/api\n"
+            "reviews:\n"
+            "  enabled: false\n"
+            "ci_store:\n"
+            "  type: github\n"
+        )
+        return p
+
+    @staticmethod
+    def _fake_ci(*, declares_ci: bool):
+        class _Ci:
+            is_available = True
+
+            def list_checks_for_pr(self, repo, number):
+                return []
+
+            def expects_checks(self, repo, number):
+                return declares_ci
+
+        return _Ci()
+
+    def _seed(self) -> None:
+        entry = _entry("w1", size=50)
+        entry.pr_number = 501
+        _seed_queue([entry])
+
+    # ── repo declares CI, checks never reported: all three surfaces block ──
+
+    def test_plan_blocks_when_ci_declared_but_absent(
+        self, tmp_path: Path, coord_db
+    ) -> None:
+        cfg = self._config(tmp_path)
+        self._seed()
+        ci = self._fake_ci(declares_ci=True)
+        with patch("coord.ci_store.build_ci_store", return_value=ci):
+            result = CliRunner().invoke(
+                main, ["merge", "--config", str(cfg), "--plan"]
+            )
+        assert result.exit_code == 0, result.output
+        assert "BLOCKED" in result.output
+        assert "CI never ran" in result.output
+
+    def test_dry_run_blocks_when_ci_declared_but_absent(
+        self, tmp_path: Path, coord_db
+    ) -> None:
+        cfg = self._config(tmp_path)
+        self._seed()
+        ci = self._fake_ci(declares_ci=True)
+        with patch("coord.ci_store.build_ci_store", return_value=ci):
+            result = CliRunner().invoke(
+                main, ["merge", "--config", str(cfg), "--dry-run"]
+            )
+        assert result.exit_code == 0, result.output
+        assert "checks_absent" in result.output
+        assert "CI never ran" in result.output
+        assert "would merge" not in result.output
+
+    def test_real_merge_blocks_when_ci_declared_but_absent(
+        self, tmp_path: Path, coord_db
+    ) -> None:
+        cfg = self._config(tmp_path)
+        self._seed()
+        ci = self._fake_ci(declares_ci=True)
+        with patch("coord.ci_store.build_ci_store", return_value=ci), \
+             patch("coord.github_ops.merge_pr") as merge_fn:
+            result = CliRunner().invoke(main, ["merge", "--config", str(cfg)])
+        assert result.exit_code == 0, result.output
+        merge_fn.assert_not_called()
+        entry = mq.load_queue()[0]
+        assert entry.state == mq.PENDING
+        assert entry.error is not None and "CI never ran" in entry.error
+        assert "checks_absent" in result.output
+
+    def test_force_merge_overrides_checks_absent(
+        self, tmp_path: Path, coord_db
+    ) -> None:
+        """The escape hatch (#1904 proposed fix item 3): --force-merge still
+        overrides, unchanged, so an operator who has independently verified
+        the PR is safe isn't stuck."""
+        cfg = self._config(tmp_path)
+        self._seed()
+        ci = self._fake_ci(declares_ci=True)
+        with patch("coord.ci_store.build_ci_store", return_value=ci), \
+             patch("coord.github_ops.merge_pr", return_value=(True, "ok")) as merge_fn:
+            result = CliRunner().invoke(
+                main, ["merge", "--config", str(cfg), "--force-merge"]
+            )
+        assert result.exit_code == 0, result.output
+        merge_fn.assert_called_once()
+        assert mq.load_queue()[0].state == mq.MERGED
+
+    # ── repo has no CI at all: none of the three surfaces regress ──────────
+
+    def test_all_three_paths_still_merge_when_no_workflows_declared(
+        self, tmp_path: Path, coord_db
+    ) -> None:
+        cfg = self._config(tmp_path)
+        ci = self._fake_ci(declares_ci=False)
+
+        self._seed()
+        with patch("coord.ci_store.build_ci_store", return_value=ci):
+            plan_result = CliRunner().invoke(
+                main, ["merge", "--config", str(cfg), "--plan"]
+            )
+        assert plan_result.exit_code == 0, plan_result.output
+        assert "READY" in plan_result.output
+        assert "BLOCKED" not in plan_result.output
+
+        with patch("coord.ci_store.build_ci_store", return_value=ci):
+            dry_result = CliRunner().invoke(
+                main, ["merge", "--config", str(cfg), "--dry-run"]
+            )
+        assert dry_result.exit_code == 0, dry_result.output
+        assert "would merge" in dry_result.output
+        assert "checks_absent" not in dry_result.output
+
+        with patch("coord.ci_store.build_ci_store", return_value=ci), \
+             patch("coord.github_ops.merge_pr", return_value=(True, "ok")) as merge_fn:
+            real_result = CliRunner().invoke(main, ["merge", "--config", str(cfg)])
+        assert real_result.exit_code == 0, real_result.output
+        merge_fn.assert_called_once()
+        assert mq.load_queue()[0].state == mq.MERGED

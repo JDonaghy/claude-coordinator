@@ -1271,6 +1271,57 @@ def is_ci_pending_reason(reason: str | None) -> bool:
     return (reason or "").startswith(CI_PENDING_PREFIX)
 
 
+# #1904: every CI gate predicate — `failed_checks`, `in_flight_checks`,
+# `_ci_checks_are_stale` — is a filter *over* `checks`, so `checks == []`
+# satisfies all three vacuously and the pre-#1904 gate fell all the way
+# through to "merge". `checks == []` is genuinely ambiguous (see
+# `CiStore.expects_checks`'s docstring): "no CI configured for this repo"
+# (correct to merge) and "CI exists but never triggered for this PR" (a
+# throttled webhook, a wedged run, a path-filtered-out workflow — wrong to
+# merge) both produce it. `CI_ABSENT_PREFIX` names the second reading,
+# distinctly from `CI_PENDING_PREFIX` ("checks exist, still running") and
+# `CI_STALE_PREFIX` ("checks exist, green, but predate the base") — an
+# operator (and `coord drive`) needs to know nothing was ever triggered, not
+# that something is still in flight.
+CI_ABSENT_PREFIX = "CI never ran:"
+
+
+def is_ci_absent_reason(reason: str | None) -> bool:
+    """True when *reason* names a PR whose CI was expected to run but never
+    reported a single check (#1904) — as opposed to one that ran and failed
+    (``checks_failed``), is still running (:func:`is_ci_pending_reason`), or
+    ran stale (``CI_STALE_PREFIX``)."""
+    return (reason or "").startswith(CI_ABSENT_PREFIX)
+
+
+def _ci_expects_checks(
+    ci_store: "CiStore", repo_github: str | None, pr_number: int | None
+) -> bool:
+    """True when *ci_store* believes *repo_github*#*pr_number* should have
+    reported at least one check (#1904) — i.e. an empty
+    ``list_checks_for_pr`` result is suspicious, not a legitimate "no CI
+    here" reading. Callers only consult this once ``list_checks_for_pr`` has
+    already come back empty.
+
+    ``getattr(..., None)`` mirrors `_ci_checks_are_stale`'s own fail-closed
+    posture toward a ``CiStore``/``GhOps`` stand-in that predates a
+    capability (see that function's ``get_branch_commit_timestamp`` probe):
+    a store that hasn't been taught to answer this question yet reads as
+    "checks were expected" rather than silently reopening the #1904 hole for
+    any backend or test double this code doesn't already know about.
+    :class:`coord.ci_store.NoOpCi` and :class:`coord.ci_github.GitHubCi`
+    both implement this explicitly; so does
+    :class:`coord.gate_snapshot.GateSnapshot`.
+    """
+    probe = getattr(ci_store, "expects_checks", None)
+    if probe is None:
+        return True
+    try:
+        return bool(probe(repo_github, pr_number))
+    except Exception:  # noqa: BLE001 — fail closed: an erroring probe still means "assume expected"
+        return True
+
+
 def _ci_checks_are_stale(
     checks: "list[CheckRun]",
     gh_ops: "GhOps | None",
@@ -2667,6 +2718,17 @@ def _entry_gate_status(
                 return PLAN_BLOCKED, smoke.short_reason
     if ci_store is not None and ci_store.is_available and entry.pr_number:
         checks = ci_store.list_checks_for_pr(entry.repo_github, entry.pr_number)
+        # #1904: an empty check list satisfies every gate below vacuously —
+        # must be handled explicitly, before those gates, or a PR whose CI
+        # never ran at all reads as clear to merge.
+        if not checks and _ci_expects_checks(
+            ci_store, entry.repo_github, entry.pr_number
+        ):
+            return (
+                PLAN_BLOCKED,
+                f"{CI_ABSENT_PREFIX} no checks reported for PR #{entry.pr_number} "
+                "though this repo declares CI — merging would run untested code",
+            )
         failed = failed_checks(checks)
         if failed:
             summary = ", ".join(f"{c.name} ({c.conclusion})" for c in failed)
@@ -3325,7 +3387,9 @@ def process(
 
     When ``ci_store`` is provided and available, each PR is checked against
     its CI status before merge.  A failed check produces a ``checks_failed``
-    event; a still-running check produces ``checks_pending``.  In both cases
+    event; a still-running check produces ``checks_pending``; a PR whose CI
+    was expected to run but reported zero checks at all — a distinct case
+    from either, see #1904 — produces ``checks_absent``.  In all three cases
     the entry is **skipped** (``continue``) rather than halting the group, so
     a ready sibling can still merge.  ``force_merge=True`` skips this gate.
 
@@ -3532,6 +3596,21 @@ def process(
                 if not force_merge and ci.is_available:
                     if entry.pr_number is not None:
                         checks = ci.list_checks_for_pr(entry.repo_github, entry.pr_number)
+                        # #1904: same explicit "empty checks" handling the
+                        # real path applies below — every gate that follows
+                        # is a filter over `checks` and passes vacuously on
+                        # `[]`, so a PR whose CI never ran must be caught
+                        # here, not silently reported as "would merge".
+                        if not checks and _ci_expects_checks(
+                            ci, entry.repo_github, entry.pr_number
+                        ):
+                            events.append(MergeEvent(
+                                entry, "checks_absent",
+                                f"(dry run) would be blocked: {CI_ABSENT_PREFIX} "
+                                f"no checks reported for {entry.branch} though "
+                                "this repo declares CI",
+                            ))
+                            continue
                         failed = failed_checks(checks)
                         if failed:
                             summary = ", ".join(
@@ -3751,6 +3830,27 @@ def process(
             # block an approved sibling in the same (repo, target) group.
             if not force_merge and ci.is_available:
                 checks = ci.list_checks_for_pr(entry.repo_github, entry.pr_number)
+                # #1904: `failed_checks`/`in_flight_checks`/`_ci_checks_are_stale`
+                # below are all filters over `checks` — an empty list
+                # satisfies every one of them vacuously, which is exactly
+                # the mechanism that let a PR whose CI never ran (a
+                # throttled webhook, a wedged run, a path-filtered-out
+                # workflow) merge as if it were green. Handled explicitly,
+                # ahead of those gates, and only when `expects_checks` says
+                # this repo actually declares CI — a repo with none
+                # configured (`NoOpCi`, or `GitHubCi` against a repo with no
+                # workflows) must not deadlock on this.
+                if not checks and _ci_expects_checks(
+                    ci, entry.repo_github, entry.pr_number
+                ):
+                    msg = (
+                        f"{CI_ABSENT_PREFIX} no checks reported for PR "
+                        f"#{entry.pr_number} though this repo declares CI "
+                        "— merging would run untested code"
+                    )
+                    entry.error = msg
+                    events.append(MergeEvent(entry, "checks_absent", msg))
+                    continue  # #292: skip, don't halt the group
                 failed = failed_checks(checks)
                 if failed:
                     summary = ", ".join(
