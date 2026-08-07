@@ -840,6 +840,12 @@ class _BannerInterruptPtyProvider(ClaudePtyProvider):
         return [sys.executable, "-c", _BANNER_INTERRUPT_PTY_MOCK]
 
 
+@pytest.mark.posix_only
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="black-box fixture spawns coord.agent._spawn_pty for real (real "
+    "pty.fork() + real subprocess, no mocking) — POSIX-only, no Windows port yet",
+)
 def test_pty_spawn_retries_after_banner_interrupted_dropped_paste(
     tmp_path: Path,
 ) -> None:

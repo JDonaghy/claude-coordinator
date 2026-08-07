@@ -20,6 +20,33 @@ jobs:
       - run: pip install -e ".[dev]"
       - run: pytest
 
+  # #1895 (CP-4 slice of #1159): real Windows verification, on every PR,
+  # before we own any Windows hardware — the repo is public, so
+  # `windows-latest` runners cost nothing.
+  #
+  # This job is EXPECTED TO BE RED when it lands: `coord.cli` cannot import
+  # on Windows today (`cli.py` -> `coord/interactive.py`'s unconditional
+  # `import fcntl`, a POSIX-only stdlib module). #1156 (CP-1, the import
+  # guards) is what makes this job green — and #1156 is the one that removes
+  # `continue-on-error` below. Until then this is a visible-but-non-blocking
+  # signal, not a real gate: do NOT read `continue-on-error: true` as
+  # permanent, and do not remove it before #1156 lands either (that would
+  # turn an expected-red job into a merge-blocker for everyone).
+  #
+  # Python 3.12 only, deliberately not the 3.12/3.13 matrix `test` runs above
+  # — the matrix axis there is Python versions on Linux; this job's axis is
+  # the platform. See docs/CROSS_PLATFORM.md §9.
+  windows:
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: pytest
+
   # #1484: run the full suite with `gh` made unresolvable on PATH.
   #
   # Filed after the #1472 elitebook incident: a worker's systemd PATH excluded

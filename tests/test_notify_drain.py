@@ -23,6 +23,7 @@ things it MUST now do, and the things it must still refuse to do.
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -400,6 +401,13 @@ class TestDrainIsIdempotent:
 # ── concurrency: the lock (verify, do not inherit — #1597) ───────────────────
 
 
+_needs_real_flock = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="FileLock is backed by fcntl.flock() (coord/filelock.py) — POSIX-only "
+    "advisory locking, no Windows lock backend implemented yet",
+)
+
+
 class TestDrainLocking:
     """The decision explicitly says not to assume ``~/.coord/notify.lock``
     behaves as advertised, given #1597 (no single-flight on /board rebuild).
@@ -416,6 +424,8 @@ class TestDrainLocking:
         assert drive_mod.LockBusy is filelock.LockBusy
         assert filelock.notify_lock_path() == Path.home() / ".coord" / "notify.lock"
 
+    @pytest.mark.posix_only
+    @_needs_real_flock
     def test_skips_when_the_lock_is_already_held(
         self, coord_dir: Path, config: Config, lock_path: Path
     ) -> None:
@@ -442,6 +452,8 @@ class TestDrainLocking:
             "tick still advances it"
         )
 
+    @pytest.mark.posix_only
+    @_needs_real_flock
     def test_a_drive_holding_the_lock_blocks_the_daemon_clock(
         self, coord_dir: Path, lock_path: Path
     ) -> None:
@@ -479,6 +491,8 @@ class TestDrainLocking:
             notify_mod.run_drain(cfg, lock_path=lock_path)
         assert dispatched == ["one-review"], "exactly one review across both"
 
+    @pytest.mark.posix_only
+    @_needs_real_flock
     def test_lock_is_released_even_when_the_pass_raises(
         self, coord_dir: Path, config: Config, lock_path: Path
     ) -> None:

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -992,6 +993,12 @@ def test_a_requeued_entry_is_never_relaunched_inside_the_window(
 # ── tick: the lock and the fail-closed board ─────────────────────────────────
 
 
+@pytest.mark.posix_only
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="FileLock is backed by fcntl.flock() (coord/filelock.py) — POSIX-only "
+    "advisory locking, no Windows lock backend implemented yet",
+)
 def test_tick_with_a_held_flock_exits_zero_without_touching_the_queue(
     cli, seed, launches, tick_lock
 ):
