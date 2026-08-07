@@ -23,6 +23,11 @@
 
   Seed data matches e2e/smoke.spec.ts's SEEDED_PIPELINE so the fixture server
   (#1538) and the existing smoke suite describe the same two items.
+
+  Amended (see #1950): the header was re-synced to the post-#1547 PanelHeader
+  shell (`coord`/`pipeline` -> `Pipeline` + a "N tracked" count). Only the
+  header changed; the rest of this mock is untouched. §4d/§4f (stage-chip
+  order and the always-skipped test chip, #1724) remain deliberately unfixed.
 -->
 <style>
   :root {
@@ -46,11 +51,22 @@
   }
   .screen { max-width: 32rem; margin: 0 auto; padding: 1.5rem 1rem; }
 
-  /* Header */
-  header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1.25rem; }
-  h1 { margin: 0; font-size: 1.25rem; font-weight: 700; color: var(--primary); }
-  .subtitle { margin: 0; font-size: .75rem; color: var(--muted-foreground); }
-  .header-right { display: flex; align-items: center; gap: .5rem; }
+  /* Header — PanelHeader (#1547). Was `coord` / `pipeline` before the M-W1 shell landed;
+     see the §1 amendment note in contract.md (#1950). */
+  header { display: flex; align-items: center; gap: .625rem; margin-bottom: 1.25rem; }
+  .co-badge {
+    display: grid; place-items: center; flex-shrink: 0;
+    width: 22px; height: 22px; border-radius: .375rem;
+    background: linear-gradient(to bottom right, var(--primary), #1a56b0);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: .62rem; font-weight: 700; color: #0b1013;
+  }
+  h1 { margin: 0; font-size: 1.15rem; font-weight: 600; color: var(--foreground); }
+  .header-count {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: .75rem; color: var(--muted-foreground);
+  }
+  .header-right { display: flex; align-items: center; gap: .5rem; margin-left: auto; }
   .updated { font-size: .75rem; color: var(--muted-foreground); }
 
   /* Filter tabs */
@@ -114,10 +130,14 @@
 <div class="screen">
 
   <header>
-    <div>
-      <h1>coord</h1>
-      <p class="subtitle">pipeline</p>
-    </div>
+    <!-- Decorative, md:hidden in the real app — not part of the contract. -->
+    <span class="co-badge" aria-hidden="true">co</span>
+    <h1>Pipeline</h1>
+    <!--
+      Header count == counts.active == the Active tab's count below (3).
+      Distinct element from the tab count (§2d) but the same underlying value.
+    -->
+    <span class="header-count">3 tracked</span>
     <div class="header-right">
       <span class="updated">10:42:07 AM</span>
     </div>

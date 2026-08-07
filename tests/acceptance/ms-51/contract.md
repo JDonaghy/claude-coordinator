@@ -44,8 +44,21 @@ Tailwind utility, which are refactor noise.
 
 ## §1 — Header
 
-- **§1a** An `h1` with the exact text `coord`.
-- **§1b** The text `pipeline` is present as the subtitle beneath it.
+> Amended (post-#1547 re-sync, see #1950): the header used to read `coord` / `pipeline`.
+> #1547 replaced it with the shared `PanelHeader` component; `coord`/`pipeline` no longer
+> appear anywhere in the header. This section now pins the shipped `PanelHeader` markup
+> (`Home.tsx:348`, `PanelHeader.tsx:36-59`).
+
+- **§1a** An `h1` with the exact text `Pipeline`.
+- **§1b** A mono count element immediately follows the `h1`: the text `3 tracked`. This is
+  the *header's* count (`PanelHeader`'s `count`/`countLabel` props), a distinct element
+  from the per-tab counts in §2d — but it is driven by the same underlying value
+  (`counts.active`, `Home.tsx:348`), so on the seeded fixture it is always the same
+  number as the `Active` tab's count (`3`).
+
+  > Not asserted: an `aria-hidden="true"` `co` badge that precedes the `h1`, visible only
+  > below the `md` (768px) breakpoint. It is decorative and breakpoint-dependent — the
+  > slice must not assert it.
 
 ## §2 — Filter tabs
 
