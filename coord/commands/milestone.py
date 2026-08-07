@@ -1136,6 +1136,24 @@ def milestone_drive_cmd(
     )
     record = mg.GateRecord.from_dict(existing) if existing else None
     if record is None:
+        if existing is not None:
+            # A record was found but couldn't be parsed (unknown schema, or
+            # a `gate` value this build doesn't recognize — e.g. written by
+            # a different-schema client via the permissive `/milestone-gate`
+            # endpoint). Rewinding silently to Gate A here would re-run
+            # gates this milestone may have already cleared — the exact
+            # thing GateRecord exists to prevent (see its `from_dict`
+            # docstring). Loudly say so instead of guessing, mirroring the
+            # warning `_milestone_gate_tick` logs for the same situation.
+            click.echo(
+                f"warning: existing gate record for {repo_entry.name}"
+                f"#{tracking_issue} could not be parsed (raw={existing!r}) — "
+                "starting a fresh walk at Gate A. If this milestone had "
+                "already cleared gates, that history is now lost; inspect "
+                "or delete the malformed record out of band before "
+                "re-driving if that matters.",
+                err=True,
+            )
         now = _time.time()
         record = mg.GateRecord(
             repo_name=repo_entry.name,
@@ -1181,7 +1199,8 @@ def milestone_drive_cmd(
     state.save_milestone_gate(record.to_dict())
     for line in mg.format_plan(
         record, steps, to_dispatch=to_dispatch, skipped=skipped, waiting=waiting,
-    )[:-2]:
+        footer=False,
+    ):
         click.echo(line)
     click.echo()
     click.echo(
@@ -1921,7 +1940,8 @@ def milestone_ship_cmd(
     if dry_run:
         click.echo(
             f"(dry run) would open/merge a PR: {feature_branch} -> "
-            f"{repo_entry.develop_branch} (method={merge_method})"
+            f"{repo_entry.develop_branch} (method={merge_method}), then close "
+            f"tracking issue #{tracking_issue} on success"
         )
         return
 
@@ -1955,3 +1975,37 @@ def milestone_ship_cmd(
         f"shipped: {feature_branch} -> {repo_entry.develop_branch} "
         f"(PR #{pr['number']}, {pr['url']})"
     )
+
+    # ── Close the tracking issue ─────────────────────────────────────────
+    # This is the completion signal Gate D (`coord milestone drive`,
+    # `coord.milestone_gate.probe_milestone`'s `shipped` probe) watches for
+    # — nothing else in the pipeline closes it. `force=True`: this command
+    # already proved every work-order node terminal (`is_milestone_complete`
+    # above) by the milestone's own definition of "done", which is not
+    # necessarily the same set of issues GitHub's sub-issues API would list
+    # as this issue's children, so the #1196 open-children guard would be
+    # the wrong gate to also apply here. A close failure must not undo the
+    # merge that already happened — report it and tell the operator how to
+    # finish by hand rather than exiting non-zero.
+    try:
+        github_ops.close_issue(
+            repo_entry.github,
+            tracking_issue,
+            comment=(
+                f"Closed by `coord milestone ship`: {feature_branch} merged "
+                f"into {repo_entry.develop_branch} (PR #{pr['number']})."
+            ),
+            force=True,
+        )
+        click.echo(
+            f"closed tracking issue #{tracking_issue} "
+            "(coord milestone drive's Gate D will observe this on its next tick)"
+        )
+    except RuntimeError as e:
+        click.echo(
+            f"warning: shipped but could not close tracking issue "
+            f"#{tracking_issue}: {e} — close it manually (`gh issue close "
+            f"{tracking_issue} --repo {repo_entry.github}`), otherwise Gate D "
+            "will hold forever waiting for it",
+            err=True,
+        )

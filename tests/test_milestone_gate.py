@@ -601,3 +601,38 @@ def test_drive_registers_and_is_resumable(tmp_path: Path, rw_db, monkeypatch) ->
     assert mg.GateRecord.from_dict(
         state.get_milestone_gate(repo_name="api", tracking_issue=100)
     ).gate == mg.GATE_C, "drive rewound a resumed milestone back to Gate A"
+
+
+def test_drive_warns_loudly_when_existing_record_is_malformed(
+    tmp_path: Path, rw_db, monkeypatch
+) -> None:
+    """#1929 review: a record that fails `GateRecord.from_dict` (e.g. an
+    unknown `gate` written by a different-schema client via the permissive
+    `/milestone-gate` endpoint) must not be silently coerced back to Gate A
+    with no indication anything was wrong — that discards `cleared` history
+    with no trace. `drive` still has to make forward progress (there's no
+    CLI verb to repair/delete the record), but it must say so loudly, the
+    same way `_milestone_gate_tick` logs a warning for the identical case."""
+    from click.testing import CliRunner
+
+    from coord import state
+    from coord.commands.milestone import milestone_drive_cmd
+
+    _stub_github(monkeypatch)
+    _stub_dispatch(monkeypatch, [])
+    cfg_path = str(_make_config(tmp_path))
+
+    # Not a valid GateRecord: `gate` is outside GATE_SEQUENCE.
+    state.save_milestone_gate(
+        {"repo_name": "api", "tracking_issue": 100, "gate": "not-a-real-gate"}
+    )
+
+    result = CliRunner().invoke(milestone_drive_cmd, ["api", "100", "--config", cfg_path])
+    assert result.exit_code == 0, result.output
+    assert "warning: existing gate record" in result.output
+    assert "could not be parsed" in result.output
+
+    saved = mg.GateRecord.from_dict(
+        state.get_milestone_gate(repo_name="api", tracking_issue=100)
+    )
+    assert saved.gate == mg.GATE_A

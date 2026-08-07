@@ -174,6 +174,7 @@ class TestMilestoneShip:
         assert "Gate C: GREEN" in result.output
         assert "dry run" in result.output
         assert "feature/ms-17 -> develop" in result.output
+        assert "close tracking issue #100" in result.output
         mock_exists.assert_not_called()
         mock_create_pr.assert_not_called()
 
@@ -204,13 +205,15 @@ class TestMilestoneShip:
              patch("coord.github_ops.create_pr", return_value={
                  "number": 55, "url": "https://github.com/acme/coord-tui/pull/55", "existed": False,
              }) as mock_create_pr, \
-             patch("coord.github_ops.merge_pr", return_value=(True, "merged")) as mock_merge_pr:
+             patch("coord.github_ops.merge_pr", return_value=(True, "merged")) as mock_merge_pr, \
+             patch("coord.github_ops.close_issue") as mock_close_issue:
             result = CliRunner().invoke(main, [
                 "milestone", "ship", "coord-tui", "100", "--config", str(config_path),
             ])
         assert result.exit_code == 0, result.output
         assert "shipped: feature/ms-17 -> develop" in result.output
         assert "#55" in result.output
+        assert "closed tracking issue #100" in result.output
 
         mock_create_pr.assert_called_once()
         _, kwargs = mock_create_pr.call_args
@@ -218,6 +221,44 @@ class TestMilestoneShip:
         assert kwargs["head"] == "feature/ms-17"
 
         mock_merge_pr.assert_called_once_with("acme/coord-tui", 55, method="merge")
+
+        # #1929 review: ship must close the tracking issue on success — it
+        # is Gate D's only observable "shipped" signal (probe_milestone
+        # reads the tracking issue's own GitHub state). force=True because
+        # is_milestone_complete already proved the work order done by its
+        # own definition, independent of GitHub's sub-issues graph.
+        mock_close_issue.assert_called_once()
+        args, kwargs = mock_close_issue.call_args
+        assert args[:2] == ("acme/coord-tui", 100)
+        assert kwargs["force"] is True
+
+    def test_ship_reports_but_does_not_fail_when_close_fails(
+        self, tmp_path: Path, coord_db
+    ) -> None:
+        """A close failure must not undo a merge that already happened —
+        `ship` still reports success, with a warning telling the operator
+        to close the tracking issue by hand so Gate D can advance (#1929
+        review: the HOLD message promises Gate D observes this closure)."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        config_path = _write_config(tmp_path, repo_path=str(repo_dir), run_cmd=f"echo '{_GREEN_BLOB}'")
+        board = Board(completed=[_gate_b_review(verdict="approve")])
+        with patch("coord.github_ops.get_issue", side_effect=lambda r, n: _get_issue(r, n, closed_numbers={930, 931})), \
+             patch("coord.github_ops.get_open_issues", return_value=[]), \
+             patch("coord.board_service.read_board", return_value=board), \
+             patch("coord.github_ops.branch_exists_on_remote", return_value=True), \
+             patch("coord.github_ops.create_pr", return_value={
+                 "number": 55, "url": "https://github.com/acme/coord-tui/pull/55", "existed": False,
+             }), \
+             patch("coord.github_ops.merge_pr", return_value=(True, "merged")), \
+             patch("coord.github_ops.close_issue", side_effect=RuntimeError("boom")):
+            result = CliRunner().invoke(main, [
+                "milestone", "ship", "coord-tui", "100", "--config", str(config_path),
+            ])
+        assert result.exit_code == 0, result.output
+        assert "shipped: feature/ms-17 -> develop" in result.output
+        assert "warning: shipped but could not close tracking issue #100" in result.output
+        assert "gh issue close 100" in result.output
 
     def test_merge_method_option_is_threaded(self, tmp_path: Path, coord_db) -> None:
         repo_dir = tmp_path / "repo"
@@ -231,7 +272,8 @@ class TestMilestoneShip:
              patch("coord.github_ops.create_pr", return_value={
                  "number": 55, "url": "https://github.com/acme/coord-tui/pull/55", "existed": False,
              }), \
-             patch("coord.github_ops.merge_pr", return_value=(True, "merged")) as mock_merge_pr:
+             patch("coord.github_ops.merge_pr", return_value=(True, "merged")) as mock_merge_pr, \
+             patch("coord.github_ops.close_issue"):
             result = CliRunner().invoke(main, [
                 "milestone", "ship", "coord-tui", "100", "--method", "squash",
                 "--config", str(config_path),
