@@ -21,6 +21,15 @@ it, and #1806 is precisely about not conflating them:
   does: each machine's own ``/health`` poll, via the ``cli_venv`` machine-
   scope check in :mod:`coord.health.checks.deploy_lane_facts`.  See #1806.
 
+#1834 added a fifth kind of lane, and it is the one that makes this check
+worth running: ``<unit> spawns (<machine>)`` — the version each *running*
+coord service would actually hand its subprocesses, resolved from the live
+process's own PATH. Every lane above measures an install; on 2026-08-04 all
+of them agreed on 0.4.105 while the daemon spawned 0.4.103, because the
+defect was not in any install but in what ``shutil.which("coord")`` found
+first. Skew is only ever visible as a *relationship between* lanes, which is
+why it is checked here and not by any amount of per-lane staleness logic.
+
 Both checks below are fail-soft toward UNKNOWN, never toward OK: a lane no
 machine has data for (an agent that never reported, a CLI venv that was
 never configured anywhere) must not read as "in sync" just because there was
@@ -81,6 +90,59 @@ def _agent_lane_versions(ctx: HealthContext) -> dict[str, str | None]:
     return out
 
 
+def _machine_check_rows(ctx: HealthContext, check_id: str) -> dict[str, list[dict]]:
+    """machine_name -> every non-errored result row this machine reported for
+    *check_id*.
+
+    :func:`_machine_check_values` stops at the first match, which is right for
+    the singleton checks it was written for. ``spawned_coord`` (#1834) reports
+    one row **per running unit**, so a first-match read would see only
+    ``coord-agent`` and structurally miss ``coord-serve`` — the one unit whose
+    spawned version was the whole 2026-08-04 incident.
+    """
+    out: dict[str, list[dict]] = {}
+    if ctx.fleet is None:
+        return out
+    for name, entry in ctx.fleet.machines.items():
+        checks = (entry or {}).get("checks") or {}
+        rows = [
+            r
+            for r in (checks.get("results") or [])
+            if r.get("check_id") == check_id and not r.get("error")
+        ]
+        if rows:
+            out[name] = rows
+    return out
+
+
+def _spawned_lanes(ctx: HealthContext) -> dict[str, str]:
+    """``<unit> spawns (<machine>)`` -> the version that unit would actually
+    spawn, for every running coord service across the fleet (#1834).
+
+    This is the lane that did not exist on 2026-08-04, and its absence is why
+    every other lane in this check read green while the fleet was running two
+    versions: each of them measures an *install*, and the defect lived in what
+    ``shutil.which("coord")`` resolved to inside a live service's PATH.
+    See :mod:`coord.health.checks.spawned_coord`.
+
+    Only units with a resolvable spawned version become lanes. A unit whose
+    PATH has no ``coord`` on it at all is deliberately **not** a lane: its
+    subprocesses fall back to ``python -m coord.cli`` on the parent's own
+    interpreter, which cannot disagree with the parent, so admitting it as a
+    null lane would manufacture a permanent "missing lane" UNKNOWN on every
+    correctly-deployed fleet.
+    """
+    out: dict[str, str] = {}
+    for machine, rows in _machine_check_rows(ctx, "spawned_coord").items():
+        for row in rows:
+            values = row.get("values") or {}
+            version = values.get("version")
+            unit = row.get("subject") or values.get("unit")
+            if version and unit:
+                out[f"{unit} spawns ({machine})"] = version
+    return out
+
+
 def _cli_venv_lanes(ctx: HealthContext) -> dict[str, str | None]:
     """``~/.coord-cli-venv (<machine>)`` -> version, for every machine whose
     own ``cli_venv`` check (#1806) reports one present.
@@ -107,8 +169,8 @@ def _cli_venv_lanes(ctx: HealthContext) -> dict[str, str | None]:
     order=10,
     description=(
         "Every ~/.coord-venv (per agent), the daemon's own coord-serve "
-        "install, and ~/.coord-cli-venv all report the same "
-        "claude-coordinator version."
+        "install, ~/.coord-cli-venv, and the coord each running service "
+        "would actually spawn all report the same claude-coordinator version."
     ),
 )
 def probe_deploy_lanes(ctx: HealthContext) -> CheckResult:
@@ -124,6 +186,9 @@ def probe_deploy_lanes(ctx: HealthContext) -> CheckResult:
     dh = ctx.fleet.daemon_host or {}
     lanes["coord-serve (daemon host)"] = dh.get("coord_serve_version")
     lanes.update(_cli_venv_lanes(ctx))
+    # #1834: what each running service would actually SPAWN. Added last and
+    # only where known, so it can introduce skew but never a missing lane.
+    lanes.update(_spawned_lanes(ctx))
 
     known = {v for v in lanes.values() if v}
     missing = sorted(name for name, v in lanes.items() if not v)
