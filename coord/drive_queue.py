@@ -55,6 +55,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
 
 from coord.drive_state import TERMINAL_STATUSES, WORK_LIKE
+from coord.merge_queue import is_ci_pending_reason
 
 # ── queue states ─────────────────────────────────────────────────────────────
 #
@@ -68,6 +69,19 @@ STATE_RUNNING = "running"
 STATE_DONE = "done"
 STATE_BLOCKED = "blocked"
 STATE_FAILED = "failed"
+# #1891: a drive that died while ITS OWN issue's merge was refused for
+# nothing stronger than "CI checks have not reported yet" (see
+# `coord.merge_queue.is_ci_pending_reason`) — as opposed to genuinely dead,
+# genuinely refused, or genuinely out of attempts. Deliberately NOT in
+# `TERMINAL_QUEUE_STATES`: unlike `blocked`, this is not a state an operator
+# must release — `plan_tick` re-checks it every tick (see the pre-pass in
+# `plan_tick`) and flips it straight back to `waiting` — without spending an
+# attempt — the moment the board shows the gate has cleared. The whole
+# feature this state exists for is "one GitHub Actions outage costs zero
+# interventions", so a queue read (`coord drive-queue list`/`status`) must
+# render it distinctly from both `waiting` (nothing wrong) and `blocked`
+# (needs a human) — see `_STATE_ORDER` in `coord/commands/drive_queue.py`.
+STATE_PARKED = "parked"
 
 TERMINAL_QUEUE_STATES: frozenset[str] = frozenset(
     {STATE_DONE, STATE_BLOCKED, STATE_FAILED}
@@ -359,6 +373,19 @@ class IssueFacts:
     issue_state: str = ""  # "open" / "closed" / "" when the board has no row
     merged: bool = False  # a work-like assignment with status == 'merged'
     active_work: bool = False  # a NON-terminal work-like assignment
+    # #1891: this issue's CURRENT merge-queue entry is refused for nothing
+    # stronger than "CI checks have not reported yet" — see
+    # `build_board_view`'s population of this field for exactly which board
+    # sections it reads (and why it reads BOTH of them) and
+    # `_reconcile_running`'s `parked` outcome for the one place it changes a
+    # decision.
+    merge_ci_pending: bool = False
+    # The actual board/queue reason text `merge_ci_pending` was derived from
+    # (e.g. ``"CI running: build, lint"``) — carried alongside the bool
+    # purely for diagnostics, so a `parked` reconcile's `reason` can quote
+    # the SAME text an operator would see on `IssueState.merge_reason`
+    # instead of a generic synthesised sentence.
+    merge_ci_pending_reason: str = ""
 
     @property
     def open(self) -> bool:
@@ -432,6 +459,35 @@ def build_board_view(
         entry = slot(entry_key(repo, int(number)))
         entry["issue_state"] = str(row.get("state") or "").lower()
 
+    # #1891: `merge_ci_pending` — mirrors `drive_state._merge_entry`'s OWN
+    # reason resolution exactly (live `merge_plan` reason, falling back to
+    # the raw `merge_queue` row's persisted `error` when the plan's
+    # re-evaluation comes back empty) rather than importing that per-issue
+    # function and calling it once per queue entry: this is a single O(N)
+    # pass over the SAME two board sections `_merge_entry` scans, building a
+    # dict up front the way every other fact in this function already does.
+    # See `coord.merge_queue.CI_PENDING_PREFIX`'s docstring for why the raw
+    # row is a required second read, not a belt-and-braces extra one.
+    plan_reasons: dict[str, str] = {}
+    for row in payload.get("merge_plan") or []:
+        repo = row.get("repo_name") or ""
+        number = row.get("issue_number")
+        if not repo or number is None:
+            continue
+        plan_reasons[entry_key(repo, int(number))] = str(row.get("reason") or "")
+
+    for row in payload.get("merge_queue") or []:
+        repo = row.get("repo_name") or ""
+        number = row.get("issue_number")
+        if not repo or number is None:
+            continue
+        key = entry_key(repo, int(number))
+        reason = plan_reasons.get(key) or str(row.get("error") or "")
+        if is_ci_pending_reason(reason):
+            got = slot(key)
+            got["merge_ci_pending"] = True
+            got["merge_ci_pending_reason"] = reason
+
     sessions: set[str] = set()
     for item in live_sessions:
         if isinstance(item, str):
@@ -476,6 +532,16 @@ class Reconcile:
     * ``refused``   — #1844: the drive's own exit was a PERMANENT pre-dispatch
       guard refusal (``coord.drive.EXIT_DISPATCH_REFUSED``).  Goes straight to
       ``blocked``; costs NO attempt — pairs with a :class:`Blocked`.
+    * ``parked``    — #1891: no session, no active work, nothing landed — same
+      evidence as ``retry`` — but the board's OWN current read of this
+      entry's merge gate names nothing stronger than "CI checks have not
+      reported yet" (``IssueFacts.merge_ci_pending``, sourced independently
+      of whatever killed the drive). Goes straight to :data:`STATE_PARKED`;
+      costs NO attempt — a missing verdict is not a failed one, and no
+      number of relaunches changes it, only more real time. Re-checked
+      every tick by the pre-pass in :func:`plan_tick`, which flips it back
+      to ``waiting`` — no human, no escalation — the moment the board shows
+      the gate has cleared.
     * ``retry``     — genuinely dead: no session, no active work, and past the
       startup grace window.  Costs one attempt.
     * ``exhausted`` — as ``retry``, but out of attempts; pairs with a
@@ -483,7 +549,7 @@ class Reconcile:
     """
 
     key: str
-    outcome: str  # alive | starting | held | unknown | done | refused | retry | exhausted
+    outcome: str  # alive | starting | held | unknown | done | refused | parked | retry | exhausted
     reason: str
     occupies: bool = False
     updates: Mapping[str, Any] = field(default_factory=dict)
@@ -1018,6 +1084,38 @@ def _reconcile_running(
     # a non-refusal exit reason (a genuine death that still narrated why)
     # still wins over the synthesised wording, same as #1845.
 
+    # #1891: checked BEFORE the retry/exhausted computation below, and
+    # deliberately independent of `own_reason`/`exit_refused` — it does not
+    # matter WHY this drive is no longer visible (a deadline, a crash, a
+    # machine reboot mid-wait); what matters is whether the board's OWN
+    # current read of this entry's issue still shows nothing stronger than
+    # "CI checks have not reported yet". Relaunching a fresh `coord drive`
+    # right now would just observe the identical silence and wait again — so
+    # this parks instead, without spending an attempt (mirrors `refused`
+    # just above: `Reconcile.updates` carries the whole transition, no paired
+    # `Blocked`, because unlike `refused` this is not a terminal condition —
+    # see `plan_tick`'s pre-pass, which is what un-parks it).
+    if facts.merge_ci_pending:
+        reason = (
+            f"{facts.merge_ci_pending_reason or 'CI checks have not reported yet'}"
+            f"{launched} — parking without spending an attempt; the queue "
+            "resumes it automatically once they do, no operator needed (#1891)"
+        )
+        return (
+            Reconcile(
+                entry.key,
+                "parked",
+                reason,
+                occupies=False,
+                updates={
+                    "state": STATE_PARKED,
+                    "last_reason": reason,
+                    "session_name": None,
+                },
+            ),
+            None,
+        )
+
     attempts = entry.attempts + 1
     if attempts < max_attempts:
         if own_reason:
@@ -1279,9 +1377,14 @@ def plan_tick(
     pre-#1870 behaviour — the production shell always passes its own
     hostname.
 
-    The algorithm, from #1754, plus #1757's step 2:
+    The algorithm, from #1754, plus #1757's step 2 and #1891's step 1b:
 
     1. Reconcile every ``running`` entry (:func:`_reconcile_running`).
+    1b. Re-check every ``parked`` entry (#1891) against the CURRENT board:
+        landed ⇒ ``done``; gate cleared ⇒ ``waiting`` (falls into step 4 on
+        this SAME tick); gate still shut ⇒ untouched, no write, nothing to
+        report. Never spends an attempt either way — a missing CI verdict is
+        not a failed one.
     2. Resolve deploy gates (:func:`_resolve_holds`).  ANY gate left closed
        returns immediately with no launch and a HELD alert — before the
        capacity check, and regardless of how eligible the rest of the queue
@@ -1351,6 +1454,58 @@ def plan_tick(
         if block is not None:
             blocked.append(block)
             states[entry.key] = STATE_BLOCKED
+
+    # #1891 step 1b: re-check every `parked` entry against the CURRENT board,
+    # independent of capacity/holds below — mirrors step 1's own `done` check
+    # (an entry can land while parked exactly as it can while running) and,
+    # like step 1, never spends an attempt either way. `entry.landed` wins
+    # unconditionally over "still gated", same ordering `_reconcile_running`
+    # uses for a `running` entry. A gate that CLEARED flips `states` straight
+    # to `waiting` here — not `by_key`, which stays whatever DQ-1 loaded — so
+    # it falls into the SAME step-4 walk below, on the SAME tick, exactly
+    # like a deploy gate released in step 2 (see this function's docstring
+    # for why that same-tick fall-through matters). A gate that is STILL
+    # shut is left alone entirely: no reconcile, no write, nothing to
+    # report — the parked row itself, rendered by `coord drive-queue list`/
+    # `status`, already answers "why isn't this launching".
+    for entry in ordered:
+        if entry.state != STATE_PARKED:
+            continue
+        facts = board.facts(entry.key)
+        if facts.landed:
+            witness = "merged" if facts.merged else "closed"
+            reason = f"done — issue already {witness} while parked (#1891)"
+            reconciles.append(
+                Reconcile(
+                    entry.key,
+                    "done",
+                    reason,
+                    occupies=False,
+                    updates={
+                        "state": STATE_DONE,
+                        "last_reason": reason,
+                        "session_name": None,
+                    },
+                )
+            )
+            states[entry.key] = STATE_DONE
+            continue
+        if facts.merge_ci_pending:
+            continue
+        reason = (
+            f"CI checks for {entry.key} have reported — resuming from "
+            "parked without spending an attempt (#1891)"
+        )
+        reconciles.append(
+            Reconcile(
+                entry.key,
+                "resumed",
+                reason,
+                occupies=False,
+                updates={"state": STATE_WAITING, "last_reason": reason},
+            )
+        )
+        states[entry.key] = STATE_WAITING
 
     # #1757 step 2: deploy gates.  Resolved from the POST-reconcile states, so
     # a `--hold-after` entry that reconciled to `blocked` cannot also fire a

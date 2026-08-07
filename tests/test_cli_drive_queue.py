@@ -20,6 +20,7 @@ CLI, so a broken flag, a bad render, or an unrouted write fails these tests.
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -628,6 +629,126 @@ def test_a_permanent_dispatch_refusal_blocks_on_the_first_tick_no_attempt_spent(
     assert refusal in entry["last_reason"]
     assert "coord acceptance author" in entry["last_reason"]
     assert state._get_drive_escalation_local(REPO, 1762) is not None
+
+
+# ── #1891: `parked` — a missing CI verdict must not consume merge budget ────
+#
+# Black-box per this repo's CLAUDE.md: drives the queue through a simulated
+# pending-CI window (a `merge_queue` row persisted the SAME way a real `coord
+# merge` attempt would leave it after observing `checks_pending`) and asserts
+# on `coord drive-queue list`/`status`'s RENDERED output, not just internal
+# counters — a held queue must not look like an idle one.
+
+
+def _seed_ci_pending_merge_row(coord_db, issue: int, *, reason: str = "CI running: build") -> None:
+    """A `merge_queue` row shaped the way a live `coord merge --only` attempt
+    leaves it after observing `checks_pending` — `entry.state` stays
+    ``pending`` (unchanged, per `merge_queue.process()`), only `error`
+    carries the `CI_PENDING_PREFIX`-tagged reason. This is exactly what
+    `_local_merge_queue_rows()` reads back for a standalone/local-DB tick
+    (this test suite's environment — no daemon `board_service` configured).
+    """
+    coord_db.execute(
+        "INSERT INTO merge_queue "
+        "(assignment_id, repo_name, repo_github, branch, target_branch, "
+        " issue_number, issue_title, state, error, enqueued_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+        (
+            f"w{issue}", REPO, "john/claude-coordinator", f"work-{issue}", "main",
+            issue, f"issue {issue}", reason, time.time(),
+        ),
+    )
+    coord_db.commit()
+
+
+def test_a_parked_entry_renders_distinctly_from_waiting_and_blocked(
+    cli, seed, launches, coord_db,
+):
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    cli("tick")
+    assert queued(1762)["state"] == "running"
+
+    _seed_ci_pending_merge_row(coord_db, 1762)
+    _backdate(1762, DRIVE_STARTUP_GRACE_SECONDS + 60)
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    assert "parked" in result.output
+    assert "CI running: build" in result.output
+
+    entry = queued(1762)
+    assert entry["state"] == "parked"
+    assert entry["attempts"] == 0  # the whole point: never spent
+
+    listing = cli("list")
+    assert re.search(r"claude-coordinator#1762\s+parked", listing.output)
+    assert "waiting" not in listing.output
+    assert "blocked" not in listing.output
+
+    status = cli("status")
+    assert "1 parked" in status.output
+    assert "blocked" not in status.output
+    # No escalation of any kind — parked is quiet by design, unlike blocked.
+    assert state._get_drive_escalation_local(REPO, 1762) is None
+    assert (
+        state._get_drive_escalation_local(QUEUE_ALERT_REPO, QUEUE_ALERT_ISSUE)
+        is None
+    )
+
+
+def test_a_parked_entry_resumes_and_launches_once_ci_reports_no_operator(
+    cli, seed, launches, coord_db,
+):
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    cli("tick")
+    _seed_ci_pending_merge_row(coord_db, 1762)
+    _backdate(1762, DRIVE_STARTUP_GRACE_SECONDS + 60)
+    cli("tick")
+    assert queued(1762)["state"] == "parked"
+
+    # Checks report — clear the persisted signal exactly as the NEXT live
+    # `coord merge` attempt (or a fresh `_gate_refresher` pass) would once
+    # GitHub reports a real conclusion. No `coord drive-queue` command is
+    # involved — the very next tick is the only thing that runs.
+    coord_db.execute(
+        "UPDATE merge_queue SET error = NULL WHERE issue_number = ?", (1762,)
+    )
+    coord_db.commit()
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    entry = queued(1762)
+    assert entry["state"] == "running"  # resumed straight into a fresh launch
+    assert entry["attempts"] == 0
+    assert len(launches) == 2, launches
+
+    status = cli("status")
+    assert "parked" not in status.output
+    assert "1 running" in status.output
+
+
+def test_a_still_parked_entry_stays_parked_across_a_quiet_tick(
+    cli, seed, launches, coord_db,
+):
+    """No regression: a tick that fires while CI is STILL pending leaves the
+    entry exactly where it was — no relaunch, no write, no drift."""
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    cli("tick")
+    _seed_ci_pending_merge_row(coord_db, 1762)
+    _backdate(1762, DRIVE_STARTUP_GRACE_SECONDS + 60)
+    cli("tick")
+    assert queued(1762)["state"] == "parked"
+    assert len(launches) == 1, launches
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    entry = queued(1762)
+    assert entry["state"] == "parked"
+    assert entry["attempts"] == 0
+    assert len(launches) == 1, launches  # no second launch attempt
 
 
 def test_a_repeatedly_dead_drive_still_reaches_blocked_and_escalates(

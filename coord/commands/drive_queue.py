@@ -47,6 +47,7 @@ from coord.drive_queue import (
     QUEUE_ALERT_STAGE,
     RESUME_PROBE_TIMEOUT_SECONDS,
     STATE_BLOCKED,
+    STATE_PARKED,
     STATE_RUNNING,
     STATE_WAITING,
     BoardView,
@@ -73,8 +74,14 @@ from coord.drive_queue import (
 _LAUNCH_TIMEOUT_SECONDS = 120.0
 
 # Counts are rendered in pipeline order, not alphabetically, so
-# `coord drive-queue status` reads as "1 running · 1 waiting".
-_STATE_ORDER = (STATE_RUNNING, STATE_WAITING, STATE_BLOCKED, "done", "failed")
+# `coord drive-queue status` reads as "1 running · 1 waiting". `parked`
+# (#1891) sits between `waiting` and `blocked` — closer to "nothing wrong"
+# than to "needs a human", but distinct from both, which is the entire point
+# of the state: a held queue must not look like an idle one, see
+# `coord.drive_queue.STATE_PARKED`'s docstring.
+_STATE_ORDER = (
+    STATE_RUNNING, STATE_WAITING, STATE_PARKED, STATE_BLOCKED, "done", "failed",
+)
 
 
 _GROUP_HELP = """The operator-declared `coord drive` work queue (#1750).
@@ -498,6 +505,35 @@ def _local_issue_rows() -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def _local_merge_queue_rows() -> list[dict]:
+    """``merge_queue`` rows straight from the local DB (daemon-host path only).
+
+    Same gap as :func:`_local_issue_rows`, one table over: the standalone
+    ``coord.client.serialize_board`` payload ships assignment rows and
+    ``round_number`` only — no ``merge_queue`` (and no ``merge_plan``, which
+    is computed, not stored) — so on the daemon host itself (no
+    ``board_service`` configured, the tick reads the local DB directly)
+    :func:`build_board_view`'s ``merge_ci_pending`` fact (#1891) would never
+    see a checks-still-pending entry at all. ``merge_plan`` is deliberately
+    NOT backfilled here — it needs a live ``config``/``ci_store`` to compute,
+    and ``build_board_view`` already falls back to this raw table's ``error``
+    column when the plan section is absent, exactly the fallback
+    ``drive_state._merge_entry`` uses for the same gap.
+
+    Fail-soft: an unreadable table degrades to ``[]``, same posture as
+    :func:`_local_issue_rows`.
+    """
+    from coord.db import get_connection  # noqa: PLC0415
+
+    try:
+        rows = get_connection().execute(
+            "SELECT repo_name, issue_number, error FROM merge_queue"
+        ).fetchall()
+    except Exception:  # noqa: BLE001 — see the fail-soft note above
+        return []
+    return [dict(r) for r in rows]
+
+
 def _local_host_id() -> str:
     """This machine's identity for #1870's launch-host / reconcile matching.
 
@@ -530,7 +566,12 @@ def _fetch_board_view() -> BoardView:
         # Standalone shape (see _local_issue_rows).  Gated on board_service
         # being unset so a thin client never reads its own local DB — the key
         # is always present in the daemon's projection, even when empty.
-        payload = {**payload, "issues": _local_issue_rows()}
+        payload = {
+            **payload,
+            "issues": _local_issue_rows(),
+            # #1891: same top-up, one table over — see _local_merge_queue_rows.
+            "merge_queue": _local_merge_queue_rows(),
+        }
     return build_board_view(payload, list_drive_sessions())
 
 

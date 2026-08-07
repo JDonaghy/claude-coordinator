@@ -1236,6 +1236,41 @@ def _base_move_spared(
 CI_STALE_PREFIX = "CI stale:"
 
 
+# #1891: the reason string prefix `_entry_gate_status` (board-render time)
+# and `process()`'s live `checks_pending` event (real merge-attempt time)
+# BOTH use for "checks exist on GitHub but have not reported a conclusion
+# yet" — as opposed to `checks_failed` (a check that DID report, and
+# reported red). This is the one piece of vocabulary #1891's incident was
+# missing: a CI verdict that has not arrived was indistinguishable from one
+# that arrived and said no, so a drive spent its bounded merge-attempt
+# budget (and then a drive-queue launch attempt) retrying a merge that only
+# more real time — never another retry — could resolve.
+#
+# `IssueState.merge_reason` (`drive_state._merge_entry`) already falls back
+# from the live plan's freshly-recomputed `reason` to the raw queue row's
+# *persisted* `error` whenever the plan's own re-evaluation comes back
+# empty — which is exactly what happens when `_gate_refresher`'s
+# periodically-refreshed snapshot (`coord/gate_snapshot.py`) lags or gaps a
+# live `coord merge` attempt's own fresher read. That makes `merge_reason`
+# — not `merge_status`, which has no such fallback — the robust signal to
+# key off. `coord.drive._decide_merge` and `coord.drive_queue`'s `parked`
+# outcome both import :func:`is_ci_pending_reason` below so the two can
+# never drift apart the way #1141 warns about.
+CI_PENDING_PREFIX = "CI running:"
+
+
+def is_ci_pending_reason(reason: str | None) -> bool:
+    """True when *reason* names checks that exist but have not reported a
+    conclusion yet (#1891) — as opposed to a check that ran and failed.
+
+    The single implementation of the pending-vs-failed distinction over merge
+    prose, the same posture :func:`is_stale_smoke_reason` takes for the smoke
+    gate: callers whose input is a persisted ``merge_reason``/``entry.error``
+    string (not a live ``CheckRun`` list) use this instead of re-deriving it.
+    """
+    return (reason or "").startswith(CI_PENDING_PREFIX)
+
+
 def _ci_checks_are_stale(
     checks: "list[CheckRun]",
     gh_ops: "GhOps | None",
@@ -2639,7 +2674,7 @@ def _entry_gate_status(
         pending = in_flight_checks(checks)
         if pending:
             summary = ", ".join(c.name for c in pending)
-            return PLAN_BLOCKED, f"CI running: {summary}"
+            return PLAN_BLOCKED, f"{CI_PENDING_PREFIX} {summary}"
         if checks and _ci_checks_are_stale(
             checks, gh_ops, entry.repo_github, entry.target_branch, smoke
         ):
@@ -3728,7 +3763,13 @@ def process(
                 pending = in_flight_checks(checks)
                 if pending:
                     summary = ", ".join(c.name for c in pending)
-                    msg = f"checks still running: {summary}"
+                    # #1891: same `CI_PENDING_PREFIX` wording `_entry_gate_status`
+                    # returns for the board render — this is what lets
+                    # `IssueState.merge_reason`'s raw-row fallback (see that
+                    # constant's docstring) carry the SAME, recognisable marker
+                    # even when it falls back to this persisted `entry.error`
+                    # instead of a fresh live re-evaluation.
+                    msg = f"{CI_PENDING_PREFIX} {summary}"
                     entry.error = msg
                     events.append(MergeEvent(entry, "checks_pending", msg))
                     continue  # #292: skip, don't halt the group
