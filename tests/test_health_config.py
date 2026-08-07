@@ -114,6 +114,29 @@ def test_daemon_host_lane_paths_default_to_none_meaning_documented_location() ->
     assert cfg.tui_source_dir is None
 
 
+def test_unit_drift_paths_round_trip(tmp_path) -> None:
+    """#1831: the unit-drift check's two path overrides must be settable
+    from YAML, same convention as the #1630 lane paths above."""
+    cfg = load(
+        _write(
+            tmp_path,
+            """
+            health:
+              deploy_dir: /src/coordinator/deploy
+              systemd_user_dir: /custom/systemd/user
+            """,
+        )
+    )
+    assert cfg.health.deploy_dir == "/src/coordinator/deploy"
+    assert cfg.health.systemd_user_dir == "/custom/systemd/user"
+
+
+def test_unit_drift_paths_default_to_none_meaning_documented_location() -> None:
+    cfg = _parse_health({})
+    assert cfg.deploy_dir is None
+    assert cfg.systemd_user_dir is None
+
+
 # ── validation ───────────────────────────────────────────────────────────────
 
 
@@ -147,6 +170,9 @@ def test_unknown_option_is_rejected() -> None:
         ({"tui_binary_path": 5}, "string or null"),
         ({"tui_source_dir": []}, "string or null"),
         ({"tui_binary_path": "   "}, "non-empty string or null"),
+        ({"deploy_dir": 5}, "string or null"),
+        ({"systemd_user_dir": []}, "string or null"),
+        ({"deploy_dir": "   "}, "non-empty string or null"),
     ],
 )
 def test_invalid_values_are_rejected(block, match) -> None:

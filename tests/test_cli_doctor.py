@@ -377,3 +377,115 @@ def test_doctor_does_not_warn_when_a_capability_has_an_always_awake_machine(
     result = _run_doctor(quiet_but_covered_config_path, monkeypatch, statuses)
     assert result.exit_code == 0, result.output
     assert "only ever offered by machine(s) with quiet_hours" not in result.output
+
+
+# ── unit_drift (#1831) ────────────────────────────────────────────────────
+#
+# `coord doctor` projects the machine's own `unit_drift` H-1 result
+# (coord/health/checks/unit_drift.py) out of `/health["health"]["results"]` —
+# see `_unit_drift_lines` in coord/commands/status.py. These drive it
+# end-to-end through the real `doctor` command rather than unit-testing that
+# helper directly, matching this file's own convention.
+
+
+def _health_with_unit_drift(tool_versions: dict, machine, *, unit_results: list[dict]) -> dict:
+    h = _health(tool_versions, machine)
+    h["health"] = {"results": unit_results}
+    return h
+
+
+def test_doctor_reports_a_stale_unit(valid_config_path, monkeypatch) -> None:
+    """The acceptance-criteria "stale unit -> reported" half, through `coord
+    doctor` itself."""
+    from coord.config import load
+
+    cfg = load(valid_config_path)
+    m = cfg.machines[0]
+    statuses = [
+        MachineStatus(
+            machine=m, state=ONLINE,
+            health=_health_with_unit_drift(
+                {"git": _ok_probe(), "gh": _ok_probe()}, m,
+                unit_results=[{
+                    "check_id": "unit_drift",
+                    "subject": "coord-serve.service",
+                    "severity": "warn",
+                    "headroom": "stale — installed 504.0h ago, 3 line(s) differ from deploy/coord-serve.service",
+                    "detail": "cp deploy/coord-serve.service ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user restart coord-serve",
+                }],
+            ),
+        ),
+        *[
+            MachineStatus(
+                machine=other, state=ONLINE,
+                health=_health({"git": _ok_probe(), "gh": _ok_probe()}, other),
+            )
+            for other in cfg.machines[1:]
+        ],
+    ]
+    result = _run_doctor(valid_config_path, monkeypatch, statuses)
+    assert result.exit_code == 1, result.output
+    assert "unit drift coord-serve.service" in result.output
+    assert "stale" in result.output
+    assert "fix:" in result.output
+
+
+def test_doctor_is_silent_about_a_matching_unit(valid_config_path, monkeypatch) -> None:
+    """The acceptance-criteria "matching unit -> silent" half — a machine
+    whose installed unit matches deploy/ must not fire `coord doctor`, and
+    must not even print a line for it."""
+    from coord.config import load
+
+    cfg = load(valid_config_path)
+    machines = cfg.machines
+    statuses = [
+        MachineStatus(
+            machine=m, state=ONLINE,
+            health=_health_with_unit_drift(
+                {"git": _ok_probe(), "gh": _ok_probe()}, m,
+                unit_results=[{
+                    "check_id": "unit_drift",
+                    "subject": "coord-serve.service",
+                    "severity": "ok",
+                    "headroom": "matches deploy/",
+                }],
+            ),
+        )
+        for m in machines
+    ]
+    result = _run_doctor(valid_config_path, monkeypatch, statuses)
+    assert result.exit_code == 0, result.output
+    assert "unit drift" not in result.output
+
+
+def test_doctor_reports_a_path_shadow_risk_as_crit(valid_config_path, monkeypatch) -> None:
+    from coord.config import load
+
+    cfg = load(valid_config_path)
+    m = cfg.machines[0]
+    statuses = [
+        MachineStatus(
+            machine=m, state=ONLINE,
+            health=_health_with_unit_drift(
+                {"git": _ok_probe(), "gh": _ok_probe()}, m,
+                unit_results=[{
+                    "check_id": "unit_drift",
+                    "subject": "coord-serve.service",
+                    "severity": "crit",
+                    "headroom": "PATH shadow risk (504.0h since install)",
+                    "detail": "editable checkout shadows the release",
+                }],
+            ),
+        ),
+        *[
+            MachineStatus(
+                machine=other, state=ONLINE,
+                health=_health({"git": _ok_probe(), "gh": _ok_probe()}, other),
+            )
+            for other in cfg.machines[1:]
+        ],
+    ]
+    result = _run_doctor(valid_config_path, monkeypatch, statuses)
+    assert result.exit_code == 1, result.output
+    assert "CRIT unit drift coord-serve.service" in result.output
+    assert "PATH shadow risk" in result.output

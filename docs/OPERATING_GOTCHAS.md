@@ -18,6 +18,8 @@ Which deploy step applies is decided by **the file the fix touched**:
 | `coord/serve_app.py`, daemon-side reconcile/tick | **restart `coord-serve`** on the daemon host |
 | other `coord/**` | live immediately on the coordinator's editable install |
 | `tui/**` | **local `cargo build` + copy to `~/.local/bin/coord-tui`** |
+| `.githooks/**` | live on the **next `git fetch`**, everywhere `core.hooksPath` is set — no release, no restart (the opposite failure mode; see [`AGENT_OPERATIONS.md`](AGENT_OPERATIONS.md#the-fifth-surface-githooks--the-opposite-failure-mode)) |
+| `deploy/**` (systemd unit files) | **nothing — there is no deploy step.** Manual `cp` to `~/.config/systemd/user/` + `systemctl --user restart` per affected host; see §15 below and [`AGENT_OPERATIONS.md`](AGENT_OPERATIONS.md#the-sixth-surface-deploy--reviewed-like-code-installed-by-nobody) |
 
 **Exception: dellserver.** The "editable install" row assumes a dev checkout at
 `~/src/claude-coordinator`. dellserver's `coord-serve` *and* its `coord` CLI both
@@ -647,3 +649,51 @@ checkout — which is every machine except the daemon host and the operator's
 box; the checkout is deliberately kept out of the fleet's own repo list so a
 dispatched worker can never edit the file governing its own concurrency
 limits, capability routing, and review gates.
+
+---
+
+## 15. `deploy/**` is a deploy lane with no deploy step — a unit file drifts forever unless you diff it by hand
+
+`deploy/*.service`/`*.timer` is version-controlled, reviewed, and merged like
+any other file. **Nothing in the release path ever installs it.** Bump → PR →
+merge → tag push → `publish.yml` → PyPI, then `coord agent update` for the
+venvs — none of that touches `~/.config/systemd/user/`. A unit is
+hand-installed once at machine setup and then drifts silently: reviewing and
+merging a `deploy/**` change *reads* like shipping a fix, the same trap as
+item 1's table above, except here there isn't even a documented "restart X"
+step to forget — there's no step at all.
+
+Found on dellserver 2026-08-04 (#1831), immediately after a release, and it
+was not cosmetic drift: `coord-serve.service` was **three weeks stale**, and
+its `Environment=PATH=` still put an **editable** checkout of this repo
+(`~/src/claude-coordinator/.venv/bin`) ahead of the pinned release.
+`coord_argv()` (`coord/drive.py`) resolves subprocesses via
+`shutil.which("coord")` — i.e. from that PATH — so the daemon process itself
+ran the release while every worker it spawned ran stale editable code. Every
+version readout anyone checked (daemon, all three agents, PyPI's simple
+index, `~/.local/bin/coord`) said the release was live. None of them look at
+what a unit's *subprocesses* actually resolve `coord` to — that fact only
+exists on the filesystem of whichever host installed the unit, and nothing
+was diffing it against `deploy/`.
+
+**Two independent things closed this, and either alone regresses the other's
+prior fix** — see `deploy/coord-serve.service`'s own comment, which names
+both #1814 (added `~/.cargo/bin` for `cargo test` inside a revalidate) and
+#1117 (added the repo venv so `cli-pytest` acceptance subprocesses import
+`httpx`). The corrected PATH keeps both, ordered so `~/.local/bin` (a symlink
+onto the pinned release) precedes the repo venv — the repo venv shadowing the
+release was never necessary for either fix, it just happened to be first.
+
+**Detection, not automation.** `coord doctor` / `coord health` now report
+unit-file drift as a check (`unit_drift` / `fleet_unit_drift`,
+`coord/health/checks/unit_drift.py`) — installed content vs. `deploy/`
+(STALE, with the installed mtime and a line-diff summary), and separately,
+CRIT if any unit's PATH lets a `.venv/bin` checkout precede the release entry
+points (`~/.local/bin`, `~/.coord-venv/bin`). Run `coord doctor` after any
+`deploy/**` merge and after any machine-setup change that touches a unit
+file — there is no automatic install step by design (writing a `systemctl`
+unit on every host unattended is a bigger blast radius than silent drift),
+so a human still has to run the `cp` + `systemctl --user daemon-reload &&
+systemctl --user restart <unit>` the check's own detail line prints.
+
+Full story: [`AGENT_OPERATIONS.md`](AGENT_OPERATIONS.md#the-sixth-surface-deploy--reviewed-like-code-installed-by-nobody).
