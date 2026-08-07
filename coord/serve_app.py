@@ -45,7 +45,8 @@ import os
 import sqlite3
 import sys
 import threading
-from dataclasses import asdict, fields
+from dataclasses import asdict, dataclass, fields
+from dataclasses import replace as _replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -1307,11 +1308,32 @@ def _milestone_drain_tick(config: Config) -> list:
     if not drains:
         return []
 
+    # #1929 (epic #1440): a milestone under gate control is drained by
+    # _milestone_gate_tick as its `work` state, never here. Two independently
+    # gated dispatch paths for one milestone is exactly the bug the gate
+    # record exists to prevent — a milestone parked at Gate A (contract
+    # missing, or a future sibling's Gate-A pause) must not have its frontier
+    # dispatched behind the gate walk's back. Gate driving wins; see
+    # coord.milestone_gate's module docstring for the full rationale.
+    from coord.state import list_milestone_gates  # noqa: PLC0415
+
+    gated_keys = {
+        (g.get("repo_name"), g.get("tracking_issue"))
+        for g in list_milestone_gates()
+    }
+
     board = build_board()
     outcomes: list = []
     for entry in drains:
         repo_name = entry.get("repo_name")
         tracking_issue = entry.get("tracking_issue")
+        if (repo_name, tracking_issue) in gated_keys:
+            log.debug(
+                "milestone-drain: %s #%s is gate-driven — skipping "
+                "(the gate tick owns its `work` state)",
+                repo_name, tracking_issue,
+            )
+            continue
         repo_cfg = config.repo(repo_name) if repo_name else None
         if repo_cfg is None or tracking_issue is None:
             log.warning(
@@ -1366,6 +1388,216 @@ def _milestone_drain_tick(config: Config) -> list:
             deregister_milestone_drain(repo_name=repo_name, tracking_issue=tracking_issue)
 
     return outcomes
+
+
+def _as_int_or_none(value: object) -> int | None:
+    """``int(value)`` or ``None`` — used when pruning a malformed gate record
+    whose ``tracking_issue`` may not be a number at all."""
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+@dataclass(frozen=True)
+class MilestoneGateResult:
+    """One milestone's outcome for one :func:`_milestone_gate_tick` pass."""
+
+    repo_name: str
+    tracking_issue: int
+    #: The gate the milestone was in when the tick started.
+    from_gate: str
+    #: The gate it is in after the tick (equal to ``from_gate`` on a hold).
+    to_gate: str
+    action: str
+    reason: str
+    #: ``dispatch_entry`` outcomes produced by the ``work`` gate this pass.
+    dispatched: tuple = ()
+    #: True when the walk reached a terminal gate and was deregistered.
+    deregistered: bool = False
+
+
+def _milestone_gate_tick(config: Config, *, now: float | None = None) -> list:
+    """Advance every gate-driven milestone by one step — #1929 (epic #1440).
+
+    The daemon-side driver for :mod:`coord.milestone_gate`: for each record
+    in ``coord.state.list_milestone_gates`` (written by ``coord milestone
+    drive``), re-fetch the tracking issue, probe the live gate inputs,
+    evaluate **one** transition, and persist the result.
+
+    Resumability comes from the record, not from memory: the tick reads
+    ``record.gate`` and evaluates *that* gate, so a daemon restarted
+    mid-milestone picks the walk up exactly where it left off and never
+    re-runs a gate it already cleared (the gates it left are appended to
+    ``record.cleared`` on the way past). The whole function is stateless
+    between calls — nothing is cached across ticks.
+
+    ``work`` is the only gate with a side effect, and it delegates to the
+    *existing* drain primitives (``plan_dispatch`` + ``dispatch_entry``)
+    rather than adding a second dispatch mechanism. Every other gate is a
+    hold-and-report: it logs why it cannot advance and leaves the record
+    where it is. Nothing here silently falls through.
+
+    Deliberately **not** gated on ``config.milestone.auto_dispatch`` — that
+    flag gates the legacy standalone drain (:func:`_milestone_drain_tick`),
+    whereas gate driving is opted into per milestone by an explicit ``coord
+    milestone drive``. Leaving the tick behind the global flag would make
+    that command silently do nothing. The two paths are kept from fighting by
+    :func:`_milestone_drain_tick` skipping any gate-driven milestone.
+
+    Extracted module-level (like ``_auto_drain_tick`` / ``_milestone_drain_tick``)
+    so tests can call it directly without the async ``_tick_loop``.
+
+    A per-milestone fetch/probe/dispatch error must not silence the other
+    milestones — caught and logged per record, and never deregistering (a
+    transient GitHub failure must be retried, not treated as terminal).
+    """
+    import logging  # noqa: PLC0415
+
+    from coord import milestone_dispatch as md  # noqa: PLC0415
+    from coord import milestone_gate as mg  # noqa: PLC0415
+    from coord.state import (  # noqa: PLC0415
+        _save_milestone_gate_local,  # local write: the daemon IS the canonical DB
+        build_board,
+        delete_milestone_gate,
+        list_milestone_gates,
+    )
+
+    log = logging.getLogger("coord.serve")
+
+    raw_records = list_milestone_gates()
+    if not raw_records:
+        return []
+
+    board = build_board()
+    results: list[MilestoneGateResult] = []
+
+    for raw in raw_records:
+        record = mg.GateRecord.from_dict(raw)
+        if record is None:
+            # Unusable record (corrupt, or a gate name this build doesn't
+            # know). Drop it rather than guessing a gate — silently coercing
+            # it to Gate A would re-run gates the milestone already cleared,
+            # the exact thing the record exists to prevent.
+            log.warning("milestone-gate: dropping malformed record %r", raw)
+            issue_key = _as_int_or_none(raw.get("tracking_issue"))
+            if issue_key is not None:
+                delete_milestone_gate(
+                    repo_name=str(raw.get("repo_name") or ""),
+                    tracking_issue=issue_key,
+                )
+            continue
+
+        repo_cfg = config.repo(record.repo_name)
+        if repo_cfg is None:
+            log.warning(
+                "milestone-gate: dropping unknown-repo record %s", record.label
+            )
+            delete_milestone_gate(
+                repo_name=record.repo_name, tracking_issue=record.tracking_issue
+            )
+            continue
+
+        try:
+            ctx = md.fetch_milestone_context(repo_cfg, record.tracking_issue)
+        except md.MilestoneDispatchError as e:
+            # Transient/structural fetch failure: hold in place and retry next
+            # tick. Never deregister — mirrors _milestone_drain_tick.
+            log.warning("milestone-gate: %s fetch failed: %s", record.label, e)
+            continue
+
+        try:
+            probes = mg.probe_milestone(ctx, board, config, repo_cfg)
+        except Exception:  # noqa: BLE001
+            log.warning(
+                "milestone-gate: %s probe failed — holding", record.label,
+                exc_info=True,
+            )
+            continue
+
+        # Backfill the milestone number the first time we see it, so a record
+        # written by `coord milestone drive` before any fetch still reports a
+        # useful label.
+        if record.milestone_number != ctx.milestone_number:
+            record = _replace(record, milestone_number=ctx.milestone_number)
+
+        step = mg.evaluate_gate(record.gate, probes)
+
+        dispatched: list = []
+        if step.action == mg.DISPATCH:
+            # The `work` state IS the drain — same primitives the manual CLI
+            # and _milestone_drain_tick use, so gate policy and dispatch
+            # policy can't drift apart.
+            try:
+                plan = md.plan_dispatch(
+                    ctx.work_order, board, config, repo_cfg, ctx.terminal_issues
+                )
+                for pick in plan.to_dispatch:
+                    outcome = md.dispatch_entry(
+                        pick, repo_cfg, config, board,
+                        tracking_issue=record.tracking_issue,
+                    )
+                    dispatched.append(outcome)
+                    if outcome.ok:
+                        log.info(
+                            "milestone-gate: %s work → #%d dispatched to %s "
+                            "(assignment %s)",
+                            record.label, outcome.issue_number,
+                            outcome.machine_name, outcome.assignment_id,
+                        )
+                    else:
+                        log.warning(
+                            "milestone-gate: %s work → #%d dispatch failed: %s",
+                            record.label, outcome.issue_number, outcome.error,
+                        )
+            except Exception:  # noqa: BLE001
+                log.warning(
+                    "milestone-gate: %s drain failed — holding at `work`",
+                    record.label, exc_info=True,
+                )
+
+        updated = mg.apply_step(record, step, now=now)
+
+        if step.action == mg.ADVANCE:
+            log.info(
+                "milestone-gate: %s %s → %s (%s)",
+                record.label, record.gate, step.to_gate, step.reason,
+            )
+        elif step.action == mg.HOLD:
+            # The load-bearing line of this whole issue: a gate that cannot
+            # advance says so, every tick, by name. Never a silent no-op.
+            log.info(
+                "milestone-gate: %s HOLD at %s — %s",
+                record.label, record.gate, step.reason,
+            )
+
+        deregistered = False
+        if updated.gate in mg.TERMINAL_GATES:
+            log.info(
+                "milestone-gate: %s reached %s — deregistering",
+                record.label, updated.gate,
+            )
+            delete_milestone_gate(
+                repo_name=updated.repo_name, tracking_issue=updated.tracking_issue
+            )
+            deregistered = True
+        else:
+            _save_milestone_gate_local(updated.to_dict())
+
+        results.append(
+            MilestoneGateResult(
+                repo_name=record.repo_name,
+                tracking_issue=record.tracking_issue,
+                from_gate=record.gate,
+                to_gate=updated.gate,
+                action=step.action,
+                reason=step.reason,
+                dispatched=tuple(dispatched),
+                deregistered=deregistered,
+            )
+        )
+
+    return results
 
 
 def _milestone_progress_tick(config: Config) -> list[str]:
@@ -1969,6 +2201,46 @@ def _openapi_spec() -> dict:
                         "content": {"application/json": {"schema": ok_response}},
                     },
                     "400": {"description": "Bad milestone-drain"},
+                },
+            }
+        },
+        "/milestone-gate": {
+            "post": {
+                "summary": (
+                    "Upsert a milestone's gate-walk record for `coord milestone "
+                    "drive` (#1929, epic #1440)"
+                ),
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "record": {
+                                        "type": "object",
+                                        "description": (
+                                            "A serialized coord.milestone_gate."
+                                            "GateRecord: repo_name, tracking_issue, "
+                                            "gate, entered_at, updated_at, "
+                                            "waiting_on, milestone_number, cleared. "
+                                            "Keyed on (repo_name, tracking_issue) — "
+                                            "an existing record for that pair is "
+                                            "replaced wholesale."
+                                        ),
+                                    },
+                                },
+                                "required": ["record"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {"application/json": {"schema": ok_response}},
+                    },
+                    "400": {"description": "Bad milestone-gate"},
                 },
             }
         },
@@ -4350,6 +4622,31 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             )
         return JSONResponse({"ok": True})
 
+    async def post_milestone_gate(request: Request) -> Response:
+        # #1929 (epic #1440): upsert a milestone's gate record on the shared
+        # DB for a thin client's `coord milestone drive`. Mirrors
+        # post_milestone_drain above — same seam, same error posture.
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        record = body.get("record")
+        if not isinstance(record, dict):
+            return JSONResponse(
+                {"error": "milestone-gate needs a 'record' object"}, status_code=400
+            )
+        try:
+            state._save_milestone_gate_local(record)
+        except (TypeError, KeyError, ValueError) as e:
+            return JSONResponse({"error": f"bad milestone-gate: {e}"}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "milestone-gate write failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse({"ok": True})
+
     async def post_dispatched(request: Request) -> Response:
         # #590 Phase 2: record a thin client's review/fix/rework/merge dispatch.
         from coord import state  # noqa: PLC0415
@@ -6299,6 +6596,36 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                                 )
                     except Exception:  # noqa: BLE001
                         log.warning("milestone-drain tick failed", exc_info=True)
+                # Step 3b-bis: #1929 (epic #1440) — advance every gate-driven
+                # milestone by one step of the A → work → B → C → D walk.
+                # Runs right after the legacy drain (and after reconcile, for
+                # the same freshly-terminal-dependency reason) and, crucially,
+                # is NOT behind config.milestone.auto_dispatch: gate driving is
+                # opted into per milestone by an explicit `coord milestone
+                # drive`, so hiding this behind a global flag would make that
+                # command silently no-op. The two paths can't fight —
+                # _milestone_drain_tick skips any milestone with a gate record
+                # (see coord.milestone_gate's module docstring). Independent
+                # try/except so a gate failure never silences the other steps.
+                try:
+                    gate_results = await run_in_threadpool(
+                        _milestone_gate_tick, config
+                    )
+                    for res in gate_results:
+                        if res.action == "advance":
+                            log.info(
+                                "milestone-gate: %s#%d %s → %s",
+                                res.repo_name, res.tracking_issue,
+                                res.from_gate, res.to_gate,
+                            )
+                        elif res.action == "hold":
+                            log.info(
+                                "milestone-gate: %s#%d holding at %s — %s",
+                                res.repo_name, res.tracking_issue,
+                                res.from_gate, res.reason,
+                            )
+                except Exception:  # noqa: BLE001
+                    log.warning("milestone-gate tick failed", exc_info=True)
                 # Step 3c: #1412 — refresh the `## Progress` section of every
                 # actively-registered milestone's tracking issue on the same
                 # cadence as the drain above. Deliberately NOT gated on
@@ -6515,6 +6842,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route("/completion", post_completion, methods=["POST"]),
         Route("/dispatched-work", post_dispatched_work, methods=["POST"]),
         Route("/milestone-drain", post_milestone_drain, methods=["POST"]),
+        Route("/milestone-gate", post_milestone_gate, methods=["POST"]),
         Route("/dispatched", post_dispatched, methods=["POST"]),
         Route("/test-verdict", post_test_verdict, methods=["POST"]),
         Route("/review-reaffirm", post_review_reaffirm, methods=["POST"]),
