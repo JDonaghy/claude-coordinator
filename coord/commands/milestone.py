@@ -948,14 +948,31 @@ def milestone_dispatch_cmd(
     # refusal costs nothing and can never be silently bypassed by a flag.
     from coord import state as state_mod  # noqa: PLC0415
 
-    existing_gate = state_mod.get_milestone_gate(
-        repo_name=repo_entry.name, tracking_issue=tracking_issue
-    )
+    try:
+        existing_gate = state_mod.get_milestone_gate(
+            repo_name=repo_entry.name, tracking_issue=tracking_issue
+        )
+    except Exception as e:  # noqa: BLE001 — see coord.client.fetch_milestone_gate:
+        # a thin client that can't reach the daemon has no way to know
+        # whether this milestone is gate-controlled, so refuse rather than
+        # risk racing a gate tick it can't see (#1930, epic #1440) — the
+        # same "refuse, never race" posture as the guard below, just for
+        # "couldn't determine" instead of "confirmed gated".
+        click.echo(
+            f"error: could not check #{tracking_issue}'s gate status ({e}) "
+            "— refusing to dispatch rather than risk racing a gate tick "
+            "this client can't see. Retry once the daemon is reachable, or "
+            "run this on the daemon host directly.",
+            err=True,
+        )
+        sys.exit(1)
     if existing_gate is not None:
         from coord import milestone_gate as mg  # noqa: PLC0415
 
-        gate_name = str(existing_gate.get("gate") or mg.GATE_A)
-        gate_label = mg.GATE_LABELS.get(gate_name, gate_name)
+        gate_name = str(existing_gate.get("gate") or "")
+        gate_label = (
+            mg.GATE_LABELS.get(gate_name, gate_name) if gate_name else "an unknown gate"
+        )
         click.echo(
             f"error: #{tracking_issue} is under gate control, currently at "
             f"{gate_label} — the daemon's gate tick is the sole driver of "
@@ -1161,9 +1178,25 @@ def milestone_drive_cmd(
     # Resume, don't restart: an existing record is the source of truth for
     # which gate this milestone is in. `drive` on an already-driven milestone
     # re-reports its position rather than rewinding the walk to Gate A.
-    existing = state.get_milestone_gate(
-        repo_name=repo_entry.name, tracking_issue=tracking_issue
-    )
+    try:
+        existing = state.get_milestone_gate(
+            repo_name=repo_entry.name, tracking_issue=tracking_issue
+        )
+    except Exception as e:  # noqa: BLE001 — see coord.client.fetch_milestone_gate:
+        # a thin client that can't reach the daemon can't tell "never
+        # driven" from "already driven, record unreadable right now" —
+        # restarting at Gate A below would silently clobber real progress
+        # once `save_milestone_gate` lands its wholesale upsert (#1930,
+        # epic #1440's non-blocking follow-up: same root cause as the
+        # dispatch guard above).
+        click.echo(
+            f"error: could not read #{tracking_issue}'s existing gate record "
+            f"({e}) — refusing to drive rather than risk restarting an "
+            "in-progress walk this client can't see. Retry once the daemon "
+            "is reachable, or run this on the daemon host directly.",
+            err=True,
+        )
+        sys.exit(1)
     record = mg.GateRecord.from_dict(existing) if existing else None
     if record is None:
         if existing is not None:

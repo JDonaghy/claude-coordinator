@@ -326,6 +326,95 @@ def test_daemon_milestone_gate_endpoint_writes_the_record(tmp_path: Path, rw_db)
     ) == rec
 
 
+def test_daemon_milestone_gate_get_endpoint(tmp_path: Path, rw_db) -> None:
+    """#1930 fix-review: `GET /milestone-gate` is the read half of
+    `post_milestone_gate` above — without it, a thin client's
+    exactly-one-overseer guard has no way to see what a *different* thin
+    client's `save_milestone_gate` posted here."""
+    from starlette.testclient import TestClient
+
+    from coord.dao import SqliteStore
+    from coord.serve_app import build_app
+
+    db_path = tmp_path / "board.db"
+    conn = sqlite3.connect(str(db_path))
+    from coord.db import _ensure_schema
+
+    _ensure_schema(conn)
+    conn.commit()
+    conn.close()
+
+    rec = mg.GateRecord(repo_name="api", tracking_issue=100, gate=mg.GATE_B)
+    app = build_app(SqliteStore(db_path), load_config(_make_config(tmp_path)))
+    with TestClient(app) as cli:
+        missing = cli.get(
+            "/milestone-gate",
+            params={"repo_name": "api", "tracking_issue": 100},
+        )
+        cli.post("/milestone-gate", json={"record": rec.to_dict()})
+        found = cli.get(
+            "/milestone-gate",
+            params={"repo_name": "api", "tracking_issue": 100},
+        )
+        other_issue = cli.get(
+            "/milestone-gate",
+            params={"repo_name": "api", "tracking_issue": 999},
+        )
+        bad_params = cli.get("/milestone-gate", params={"repo_name": "api"})
+
+    assert missing.status_code == 200
+    assert missing.json() == {"entries": []}
+    assert found.status_code == 200
+    assert found.json()["entries"] == [rec.to_dict()]
+    assert other_issue.json() == {"entries": []}
+    assert bad_params.status_code == 400
+
+
+def test_get_milestone_gate_routes_to_daemon_when_service_set(monkeypatch) -> None:
+    """The read-side mirror of
+    test_save_milestone_gate_routes_to_daemon_when_service_set: a thin
+    client's `get_milestone_gate` must reach the daemon rather than consult
+    a local DB the write never touched."""
+    from coord import client as cc
+    from coord import state
+
+    monkeypatch.setattr(
+        cc, "resolve_board_service", lambda *a, **k: cc.ServiceConfig("http://d:7435")
+    )
+    rec = mg.GateRecord(repo_name="api", tracking_issue=100, gate=mg.GATE_D).to_dict()
+    captured: dict = {}
+
+    def _fake_get(svc, repo_name, tracking_issue, **kw):
+        captured.update(repo_name=repo_name, tracking_issue=tracking_issue)
+        return rec
+
+    monkeypatch.setattr(cc, "fetch_milestone_gate", _fake_get)
+
+    result = state.get_milestone_gate(repo_name="api", tracking_issue=100)
+
+    assert result == rec
+    assert captured == {"repo_name": "api", "tracking_issue": 100}
+
+
+def test_get_milestone_gate_does_not_swallow_daemon_read_failure(monkeypatch) -> None:
+    """A routing failure must propagate — not collapse to `None` (which a
+    caller would read as "not gate-controlled" and dispatch unguarded)."""
+    from coord import client as cc
+    from coord import state
+
+    monkeypatch.setattr(
+        cc, "resolve_board_service", lambda *a, **k: cc.ServiceConfig("http://d:7435")
+    )
+
+    def _boom(*a, **k):
+        raise ConnectionError("daemon unreachable")
+
+    monkeypatch.setattr(cc, "fetch_milestone_gate", _boom)
+
+    with pytest.raises(ConnectionError):
+        state.get_milestone_gate(repo_name="api", tracking_issue=100)
+
+
 # ── the daemon tick ──────────────────────────────────────────────────────────
 
 

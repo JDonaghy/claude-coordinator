@@ -520,3 +520,116 @@ class TestMilestoneDispatchGateControlled:
         assert result.exit_code == 0, result.output
         assert "under gate control" not in result.output
         disp.assert_not_called()  # dry-run never dispatches regardless
+
+
+class TestMilestoneDispatchGateControlledThinClient:
+    """#1930 fix-review: the guard above must also hold on a thin client
+    (``board_service`` configured, per docs/ARCHITECTURE.md's "coord and
+    coord-tui on any machine render and drive the same board as bearer-token
+    thin clients"), where the local SQLite DB never received the gate record
+    `coord milestone drive` posted to the daemon. `state.get_milestone_gate`
+    must route the read to the daemon (mirroring `save_milestone_gate`'s
+    write routing) rather than silently consulting an empty local DB."""
+
+    def test_gate_controlled_milestone_refused_via_daemon_routed_read(
+        self, config_file: Path, monkeypatch,
+    ) -> None:
+        from coord import client as cc
+
+        monkeypatch.setattr(
+            cc, "resolve_board_service",
+            lambda *a, **k: cc.ServiceConfig("http://daemon:7435"),
+        )
+        # `_load_config` also routes through `resolve_board_service` — feed
+        # it the local config file rather than actually reaching out.
+        monkeypatch.setattr(cc, "fetch_remote_config", lambda *a, **k: config_file)
+        record = mg.GateRecord(
+            repo_name="api", tracking_issue=100, gate=mg.GATE_C,
+        ).to_dict()
+        monkeypatch.setattr(
+            cc, "fetch_milestone_gate", lambda svc, repo, issue, **kw: record,
+        )
+        # The local DB genuinely has nothing — proving the refusal came from
+        # the routed read, not a local write that leaked in.
+        assert state_mod.list_milestone_gates() == []
+
+        with patch("coord.github_ops.get_issue", side_effect=_get_issue) as get_issue, \
+             patch("coord.github_ops.get_open_issues") as get_open, \
+             patch("coord.dispatch.dispatch") as disp:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "dispatch", "api", "100", "--config", str(config_file)],
+            )
+        assert result.exit_code == 1, result.output
+        assert "under gate control" in result.output
+        assert "Gate C" in result.output
+        get_issue.assert_not_called()
+        get_open.assert_not_called()
+        disp.assert_not_called()
+
+    def test_no_gate_on_daemon_dispatches_normally(
+        self, config_file: Path, monkeypatch,
+    ) -> None:
+        """Control: the routed read confirming "not gated" (not just "daemon
+        unreachable") must still let dispatch proceed."""
+        from coord import client as cc
+
+        monkeypatch.setattr(
+            cc, "resolve_board_service",
+            lambda *a, **k: cc.ServiceConfig("http://daemon:7435"),
+        )
+        monkeypatch.setattr(cc, "fetch_remote_config", lambda *a, **k: config_file)
+        monkeypatch.setattr(
+            cc, "fetch_milestone_gate", lambda svc, repo, issue, **kw: None,
+        )
+        open_issues = [
+            {"number": 762, "milestone": {"number": 9}},
+            {"number": 763, "milestone": {"number": 9}},
+            {"number": 765, "milestone": {"number": 9}},
+        ]
+        with patch("coord.github_ops.get_issue", side_effect=_get_issue), \
+             patch("coord.github_ops.get_open_issues", return_value=open_issues), \
+             patch("coord.board_service.read_board", return_value=Board()), \
+             patch("coord.dispatch.dispatch") as disp:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "dispatch", "api", "100", "--config", str(config_file),
+                 "--dry-run"],
+            )
+        assert result.exit_code == 0, result.output
+        assert "under gate control" not in result.output
+        disp.assert_not_called()  # dry-run never dispatches regardless
+
+    def test_unreachable_daemon_refuses_rather_than_silently_dispatching(
+        self, config_file: Path, monkeypatch,
+    ) -> None:
+        """The blocking failure mode: a thin client that can't reach the
+        daemon has no way to know whether this milestone is gate-controlled.
+        It must fail loud/safe (refuse) rather than silently treat "couldn't
+        ask" as "not gated" and race the daemon's tick."""
+        from coord import client as cc
+
+        monkeypatch.setattr(
+            cc, "resolve_board_service",
+            lambda *a, **k: cc.ServiceConfig("http://daemon:7435"),
+        )
+        monkeypatch.setattr(cc, "fetch_remote_config", lambda *a, **k: config_file)
+
+        def _boom(*a, **k):
+            raise ConnectionError("daemon unreachable")
+
+        monkeypatch.setattr(cc, "fetch_milestone_gate", _boom)
+
+        with patch("coord.github_ops.get_issue", side_effect=_get_issue) as get_issue, \
+             patch("coord.github_ops.get_open_issues") as get_open, \
+             patch("coord.dispatch.dispatch") as disp:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "dispatch", "api", "100", "--config", str(config_file)],
+            )
+        assert result.exit_code == 1, result.output
+        assert "could not check" in result.output
+        assert "refusing to dispatch" in result.output
+        get_issue.assert_not_called()
+        get_open.assert_not_called()
+        disp.assert_not_called()
