@@ -5,6 +5,14 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// #1954: how long an SSE watch stream stays latched `done` after hitting
+/// the 3-failures/10s limit before `drain_pool_entry` retries it on its own.
+/// Deliberately well clear of the 10-second failure-counting window, so a
+/// retry attempt can never be mistaken for "still mid failure-burst" — if it
+/// fails again, that starts a fresh window rather than immediately
+/// re-latching.
+const SSE_RETRY_BACKOFF: Duration = Duration::from_secs(20);
+
 // ─── Shared periodic work (called from both handle() and tick()) ─────────────
 
 /// Extract `(repo, issue_number)` from a `CommandResult::label` of the shape
@@ -1227,10 +1235,19 @@ impl CoordApp {
     /// Reconnect strategy (per entry): on transient errors, reopen the stream
     /// using `Last-Event-Id` so replay starts from the last received byte
     /// offset.  After **3 failures within 10 seconds** a toast is shown
-    /// (keyed to the affected issue) and reconnection stops — the user must
-    /// press `R` while watching that issue to retry.  Background streams
-    /// (not currently focused) show the toast with the issue number so the
-    /// user can switch to them to diagnose the failure.
+    /// (keyed to the affected issue) and the stream latches `done` —
+    /// pressing `R` while watching that issue reconnects immediately, but
+    /// per #1954 that isn't the only way back: once
+    /// [`SSE_RETRY_BACKOFF`] has passed since the first failure in the
+    /// losing window, the *next* drain tick clears the failure state and
+    /// retries on its own (see the `sse.done` branch below). A worker that
+    /// hiccups during dispatch (e.g. `/stream` 404 before
+    /// `assignment.log_path` is set) routinely recovers seconds later —
+    /// there is no good reason for a 4-hour run to stay dark for the rest
+    /// of the assignment just because three fast retries lost a race at
+    /// the start. Background streams (not currently focused) show the
+    /// toast with the issue number so the user can switch to them to
+    /// diagnose the failure, but no longer *need* to.
     ///
     /// Maximum pool size is `WATCH_POOL_CAP` (currently 8 concurrent streams).
     pub(crate) fn drain_watch_pool(&mut self) -> bool {
@@ -1252,126 +1269,150 @@ impl CoordApp {
         if let Some(ctx) = self.watch_pool.get_mut(id) {
             let sse = &mut ctx.sse;
             if sse.done {
-                return false;
-            }
-            loop {
-                use std::sync::mpsc::TryRecvError;
-                let msg = match sse.rx.try_recv() {
-                    Ok(m) => m,
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        // Background thread exited without sending; treat as error.
-                        sse.fail_count += 1;
-                        match sse.first_fail_at {
-                            None => sse.first_fail_at = Some(Instant::now()),
-                            Some(t) if t.elapsed() > Duration::from_secs(10) => {
-                                sse.first_fail_at = Some(Instant::now());
-                                sse.fail_count = 1;
+                // #1954: distinguish "stream ended cleanly" (fail_count is
+                // whatever it was before the clean `Done`, never bumped past
+                // the fail-limit by the `Done` path itself) from "latched
+                // dead by the 3-failures/10s guard" (fail_count >= 3, the
+                // only path that sets both `done` and `fail_count >= 3`
+                // together). Only the latter is eligible for automatic
+                // retry — a cleanly-finished assignment's log is not coming
+                // back, and reopening it would just replay stale content
+                // forever. `first_fail_at` doubles as the backoff clock:
+                // it's set to the start of the losing window and untouched
+                // once latched, so its age is exactly how long the stream
+                // has been dark.
+                let eligible_for_retry = sse.fail_count >= 3
+                    && sse
+                        .first_fail_at
+                        .is_some_and(|t| t.elapsed() >= SSE_RETRY_BACKOFF);
+                if !eligible_for_retry {
+                    return false;
+                }
+                sse.done = false;
+                sse.fail_count = 0;
+                sse.first_fail_at = None;
+                needs_reconnect = true;
+                got_new = true;
+            } else {
+                loop {
+                    use std::sync::mpsc::TryRecvError;
+                    let msg = match sse.rx.try_recv() {
+                        Ok(m) => m,
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => {
+                            // Background thread exited without sending; treat as error.
+                            sse.fail_count += 1;
+                            match sse.first_fail_at {
+                                None => sse.first_fail_at = Some(Instant::now()),
+                                Some(t) if t.elapsed() > Duration::from_secs(10) => {
+                                    sse.first_fail_at = Some(Instant::now());
+                                    sse.fail_count = 1;
+                                }
+                                _ => {}
                             }
-                            _ => {}
+                            if sse.fail_count >= 3 {
+                                sse.done = true;
+                                fail_limit_hit = true;
+                            } else {
+                                needs_reconnect = true;
+                            }
+                            got_new = true;
+                            break;
                         }
-                        if sse.fail_count >= 3 {
-                            sse.done = true;
-                            fail_limit_hit = true;
-                        } else {
-                            needs_reconnect = true;
-                        }
-                        got_new = true;
-                        break;
-                    }
-                };
+                    };
 
-                match msg {
-                    SseWatchMsg::Lines { last_id, text } => {
-                        sse.last_event_id = last_id;
-                        // Reassemble lines split across SSE chunks. The agent
-                        // emits whatever it read from the log file (up to
-                        // LOG_CHUNK_SIZE=4096 bytes), so a JSON line longer
-                        // than that arrives in pieces. If the chunk doesn't
-                        // end with `\n`, hold the trailing partial line until
-                        // the next chunk completes it. Without this, broken
-                        // half-lines reach parse_json_event and we lose
-                        // fields like total_cost_usd / stop_reason that come
-                        // after the split point.
-                        let mut payload = std::mem::take(&mut sse.pending_tail);
-                        payload.push_str(&text);
-                        let (complete, tail) = if payload.ends_with('\n') {
-                            (payload.clone(), String::new())
-                        } else if let Some(last_nl) = payload.rfind('\n') {
-                            let (a, b) = payload.split_at(last_nl + 1);
-                            (a.to_string(), b.to_string())
-                        } else {
-                            (String::new(), payload.clone())
-                        };
-                        let now = Instant::now();
-                        for line in complete.lines() {
-                            if json_str(line, "type").as_deref() == Some("assistant") {
-                                sse.current_turn += 1;
+                    match msg {
+                        SseWatchMsg::Lines { last_id, text } => {
+                            sse.last_event_id = last_id;
+                            // Reassemble lines split across SSE chunks. The agent
+                            // emits whatever it read from the log file (up to
+                            // LOG_CHUNK_SIZE=4096 bytes), so a JSON line longer
+                            // than that arrives in pieces. If the chunk doesn't
+                            // end with `\n`, hold the trailing partial line until
+                            // the next chunk completes it. Without this, broken
+                            // half-lines reach parse_json_event and we lose
+                            // fields like total_cost_usd / stop_reason that come
+                            // after the split point.
+                            let mut payload = std::mem::take(&mut sse.pending_tail);
+                            payload.push_str(&text);
+                            let (complete, tail) = if payload.ends_with('\n') {
+                                (payload.clone(), String::new())
+                            } else if let Some(last_nl) = payload.rfind('\n') {
+                                let (a, b) = payload.split_at(last_nl + 1);
+                                (a.to_string(), b.to_string())
+                            } else {
+                                (String::new(), payload.clone())
+                            };
+                            let now = Instant::now();
+                            for line in complete.lines() {
+                                if json_str(line, "type").as_deref() == Some("assistant") {
+                                    sse.current_turn += 1;
+                                }
+                                sse.lines.push(line.to_string());
+                                sse.line_times.push(now);
                             }
-                            sse.lines.push(line.to_string());
-                            sse.line_times.push(now);
+                            sse.pending_tail = tail;
+                            got_new = true;
                         }
-                        sse.pending_tail = tail;
-                        got_new = true;
-                    }
-                    SseWatchMsg::Done { last_id } if !sse.pending_tail.is_empty() => {
-                        // Stream is ending — flush any trailing partial line
-                        // before transitioning to done. Without this, a final
-                        // result line whose terminating `\n` never reached us
-                        // (worker exited mid-write) would be invisible.
-                        let tail = std::mem::take(&mut sse.pending_tail);
-                        let now = Instant::now();
-                        for line in tail.lines() {
-                            if json_str(line, "type").as_deref() == Some("assistant") {
-                                sse.current_turn += 1;
+                        SseWatchMsg::Done { last_id } if !sse.pending_tail.is_empty() => {
+                            // Stream is ending — flush any trailing partial line
+                            // before transitioning to done. Without this, a final
+                            // result line whose terminating `\n` never reached us
+                            // (worker exited mid-write) would be invisible.
+                            let tail = std::mem::take(&mut sse.pending_tail);
+                            let now = Instant::now();
+                            for line in tail.lines() {
+                                if json_str(line, "type").as_deref() == Some("assistant") {
+                                    sse.current_turn += 1;
+                                }
+                                sse.lines.push(line.to_string());
+                                sse.line_times.push(now);
                             }
-                            sse.lines.push(line.to_string());
-                            sse.line_times.push(now);
-                        }
-                        sse.last_event_id = last_id;
-                        sse.done = true;
-                        got_new = true;
-                        break;
-                    }
-                    SseWatchMsg::Done { last_id } => {
-                        sse.last_event_id = last_id;
-                        sse.done = true;
-                        got_new = true;
-                        break;
-                    }
-                    SseWatchMsg::Error(err_msg) => {
-                        // Surface the actual error in the log so the user
-                        // can diagnose connection issues without grepping
-                        // agent journalctl. Capped to one line in the panel.
-                        sse.lines.push(format!("[sse error] {}", err_msg));
-                        // #899: every push to `lines` MUST push a matching
-                        // timestamp — the render cache-extend path slices
-                        // `line_times` with indices derived from `lines.len()`
-                        // and panics ("range start index N out of range") if
-                        // the two vectors desync.
-                        sse.line_times.push(Instant::now());
-                        // Connection failure. Update the failure window.
-                        sse.fail_count += 1;
-                        match sse.first_fail_at {
-                            None => sse.first_fail_at = Some(Instant::now()),
-                            Some(t) if t.elapsed() > Duration::from_secs(10) => {
-                                // Window expired: reset to a fresh 10-second window.
-                                sse.first_fail_at = Some(Instant::now());
-                                sse.fail_count = 1;
-                            }
-                            _ => {}
-                        }
-                        if sse.fail_count >= 3 {
+                            sse.last_event_id = last_id;
                             sse.done = true;
-                            fail_limit_hit = true;
-                        } else {
-                            needs_reconnect = true;
+                            got_new = true;
+                            break;
                         }
-                        got_new = true;
-                        break;
-                    }
-                    SseWatchMsg::Heartbeat => {
-                        // No-op: the thread just confirmed the channel is alive.
+                        SseWatchMsg::Done { last_id } => {
+                            sse.last_event_id = last_id;
+                            sse.done = true;
+                            got_new = true;
+                            break;
+                        }
+                        SseWatchMsg::Error(err_msg) => {
+                            // Surface the actual error in the log so the user
+                            // can diagnose connection issues without grepping
+                            // agent journalctl. Capped to one line in the panel.
+                            sse.lines.push(format!("[sse error] {}", err_msg));
+                            // #899: every push to `lines` MUST push a matching
+                            // timestamp — the render cache-extend path slices
+                            // `line_times` with indices derived from `lines.len()`
+                            // and panics ("range start index N out of range") if
+                            // the two vectors desync.
+                            sse.line_times.push(Instant::now());
+                            // Connection failure. Update the failure window.
+                            sse.fail_count += 1;
+                            match sse.first_fail_at {
+                                None => sse.first_fail_at = Some(Instant::now()),
+                                Some(t) if t.elapsed() > Duration::from_secs(10) => {
+                                    // Window expired: reset to a fresh 10-second window.
+                                    sse.first_fail_at = Some(Instant::now());
+                                    sse.fail_count = 1;
+                                }
+                                _ => {}
+                            }
+                            if sse.fail_count >= 3 {
+                                sse.done = true;
+                                fail_limit_hit = true;
+                            } else {
+                                needs_reconnect = true;
+                            }
+                            got_new = true;
+                            break;
+                        }
+                        SseWatchMsg::Heartbeat => {
+                            // No-op: the thread just confirmed the channel is alive.
+                        }
                     }
                 }
             }
@@ -1382,15 +1423,18 @@ impl CoordApp {
             // Include issue number so background-stream failures are identifiable.
             let issue_num = self.watch_pool.get(id).map(|ctx| ctx.state.issue_number);
             let is_focused = self.watch_focused.as_deref() == Some(id);
+            let retry_secs = SSE_RETRY_BACKOFF.as_secs();
             let msg = if is_focused {
-                "Lost connection 3× in 10 s — press R to reconnect".to_string()
+                format!(
+                    "Lost connection 3× in 10 s — retrying in {retry_secs}s (press R for now)"
+                )
             } else if let Some(n) = issue_num {
                 format!(
-                    "Lost connection to #{} 3× in 10 s — switch to it and press R",
-                    n
+                    "Lost connection to #{n} 3× in 10 s — retrying in {retry_secs}s \
+                     (switch to it and press R for now)"
                 )
             } else {
-                "Lost SSE connection 3× in 10 s".to_string()
+                format!("Lost SSE connection 3× in 10 s — retrying in {retry_secs}s")
             };
             self.push_toast("SSE stream error", &msg, ToastSeverity::Error);
         } else if needs_reconnect {
