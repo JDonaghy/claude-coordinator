@@ -1,24 +1,28 @@
 /**
- * Integration tests for the responsive shell (#1547).
+ * Integration tests for the responsive shell (#1547) and its route tree
+ * (#1548).
  *
- * These mount the *real* composition — App's layout route, ShellLayout,
- * AppShell, ActivityRail and the real Home/Detail panels — with only the API
- * client mocked, because the thing under test is precisely how those fit
- * together at each breakpoint. Anything that asserted against a hand-rolled
- * fixture shell would pass while the app was broken.
+ * These mount the *real* composition — a route tree shaped like `App.tsx`'s,
+ * `ShellLayout`, `AppShell`, `ActivityRail` and the real Home/Detail panels —
+ * with only the API client mocked, because the thing under test is precisely
+ * how those fit together at each breakpoint and how the URL drives them.
+ * Anything that asserted against a hand-rolled fixture shell would pass while
+ * the app was broken.
  *
  * jsdom has no layout, so `stubViewport` drives `matchMedia` instead; see
  * `stubViewport.ts` for why that is the only lever available here.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, waitFor, fireEvent } from '@testing-library/react'
+import { render, screen, waitFor, fireEvent, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { MemoryRouter, Routes, Route } from 'react-router-dom'
+import { MemoryRouter, Navigate, Routes, Route, useLocation } from 'react-router-dom'
 
 import { ThemeProvider } from '@/components/ui/theme-provider'
 import Detail from '@/components/Detail'
+import SessionDetail from '@/components/SessionDetail'
 import { type PipelineView, type SessionInfo } from '@/api/client'
+import { paths } from '@/routes/paths'
 import { ShellLayout } from '../ShellLayout'
 import { EmptyDetail } from '../EmptyDetail'
 import { LIST_WIDTH_DEFAULT_PX, SHELL_STORAGE_KEY } from '../shellState'
@@ -81,7 +85,13 @@ function makeSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
   }
 }
 
-function renderShell(initialPath = '/') {
+/** Surfaces the router's current path in the DOM, for deep-link / back-forward assertions. */
+function LocationProbe() {
+  const location = useLocation()
+  return <div data-testid="location-pathname">{location.pathname}</div>
+}
+
+function renderShell(initialPath = paths.pipeline()) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false, refetchOnWindowFocus: false } },
   })
@@ -89,10 +99,24 @@ function renderShell(initialPath = '/') {
     <QueryClientProvider client={queryClient}>
       <ThemeProvider>
         <MemoryRouter initialEntries={[initialPath]}>
+          <LocationProbe />
           <Routes>
+            {/* Deliberately a *sibling* of ShellLayout, not a child of it —
+                see App.tsx's doc comment: AppShell only mounts the detail
+                slot (where a child route's element renders) when an item is
+                selected, so a redirect nested under the shell would silently
+                never fire on a narrow cold load at /. This mirrors the real
+                route tree exactly so this test file can catch that class of
+                bug instead of hiding it. */}
+            <Route path="/" element={<Navigate to={paths.pipeline()} replace />} />
             <Route element={<ShellLayout />}>
-              <Route path="/" element={<EmptyDetail />} />
-              <Route path="/detail/:id" element={<Detail />} />
+              <Route path="/pipeline" element={<EmptyDetail />} />
+              <Route path="/pipeline/:repo/:issue" element={<Detail />} />
+              <Route path="/pipeline/:repo/:issue/:tab" element={<Detail />} />
+              <Route path="/sessions" element={<EmptyDetail />} />
+              <Route path="/sessions/:id" element={<SessionDetail />} />
+              <Route path="/board" element={null} />
+              <Route path="*" element={null} />
             </Route>
           </Routes>
         </MemoryRouter>
@@ -104,6 +128,7 @@ function renderShell(initialPath = '/') {
 const listRegion = () => screen.queryByRole('region', { name: 'List' })
 const detailRegion = () => screen.queryByRole('main', { name: 'Detail' })
 const railRegion = () => screen.getByRole('navigation', { name: 'Views' })
+const locationPath = () => screen.getByTestId('location-pathname').textContent
 
 /**
  * The list panel by DOM presence rather than by role.
@@ -167,13 +192,13 @@ describe('shell — wide (>= 1024px)', () => {
     )
   })
 
-  it('shows the empty-selection placeholder in the detail column at /', async () => {
+  it('shows the empty-selection placeholder in the detail column at /pipeline', async () => {
     renderShell()
     expect(await screen.findByText('Nothing selected')).toBeInTheDocument()
   })
 
   it('fills the detail column from the route without unmounting the list', async () => {
-    renderShell('/detail/work-1')
+    renderShell(paths.pipelineItem('myrepo', 42))
 
     expect(listRegion()).toBeInTheDocument()
     // The row in the list *and* the heading in the detail — the wide layout's
@@ -225,16 +250,18 @@ describe('shell — wide (>= 1024px)', () => {
     expect(persisted.listWidthPx).toBe(640)
   })
 
-  it('restores a persisted panel width and view on reload', async () => {
+  it('restores a persisted panel width from localStorage; the URL (not localStorage) picks the view', async () => {
     window.localStorage.setItem(
       SHELL_STORAGE_KEY,
-      JSON.stringify({ view: 'sessions', listWidthPx: 480, railCollapsed: true }),
+      JSON.stringify({ listWidthPx: 480, railCollapsed: true }),
     )
-    renderShell()
+    renderShell(paths.sessions())
 
     const separator = await screen.findByRole('separator', { name: 'Resize list panel' })
     expect(separator).toHaveAttribute('aria-valuenow', '480')
-    // The Sessions view, not Pipeline, is what came back.
+    // The Sessions view, because that's what the URL says — not because
+    // anything was persisted about "the view" (that concept no longer exists,
+    // see shellState.ts).
     expect(await screen.findByRole('heading', { name: 'Sessions' })).toBeInTheDocument()
   })
 })
@@ -244,7 +271,7 @@ describe('shell — wide (>= 1024px)', () => {
 describe('shell — narrow (< 768px): the phone app, preserved', () => {
   beforeEach(() => stubViewportWidth(NARROW_PX))
 
-  it('mounts only the list at /', async () => {
+  it('mounts only the list at /pipeline', async () => {
     renderShell()
 
     expect(listRegion()).toBeInTheDocument()
@@ -252,14 +279,31 @@ describe('shell — narrow (< 768px): the phone app, preserved', () => {
     expect(await screen.findByText('Fix the thing')).toBeInTheDocument()
   })
 
-  it('mounts only the detail after a drill-in', async () => {
-    renderShell('/detail/work-1')
+  it('mounts only the detail after a cold-loaded deep link', async () => {
+    renderShell(paths.pipelineItem('myrepo', 42))
 
     await waitFor(() => expect(detailRegion()).toBeInTheDocument())
     expect(listRegion()).not.toBeInTheDocument()
     // Exactly one — the list is gone, so no duplicated row text.
     expect(await screen.findAllByText('Fix the thing')).toHaveLength(1)
-    expect(screen.getByLabelText('Back')).toBeInTheDocument()
+  })
+
+  it('drill-in via the list pushes a history entry, and Back goes up (not out of the app)', async () => {
+    renderShell()
+    expect(locationPath()).toBe(paths.pipeline())
+
+    await userEvent.click(await screen.findByText('Fix the thing'))
+    await waitFor(() => expect(detailRegion()).toBeInTheDocument())
+    expect(listRegion()).not.toBeInTheDocument()
+    expect(locationPath()).toBe(paths.pipelineItem('myrepo', 42))
+
+    const back = screen.getByLabelText('Back')
+    await userEvent.click(back)
+
+    // Back peels one level -- to the list at /pipeline -- not out of the SPA.
+    await waitFor(() => expect(listRegion()).toBeInTheDocument())
+    expect(detailRegion()).not.toBeInTheDocument()
+    expect(locationPath()).toBe(paths.pipeline())
   })
 
   it('shows only built views in the bottom row', async () => {
@@ -300,7 +344,7 @@ describe('shell — medium (768–1023px)', () => {
   beforeEach(() => stubViewportWidth(MEDIUM_PX))
 
   it('keeps the list mounted under the detail overlay instead of replacing it', async () => {
-    renderShell('/detail/work-1')
+    renderShell(paths.pipelineItem('myrepo', 42))
 
     const list = listElement()
     expect(list).toBeInTheDocument()
@@ -337,18 +381,17 @@ describe('shell — medium (768–1023px)', () => {
 describe('shell — activity rail view selection', () => {
   beforeEach(() => stubViewportWidth(WIDE_PX))
 
-  it('swaps the list panel and persists the choice', async () => {
+  it("swaps the list panel by navigating to the view's own URL", async () => {
     const user = userEvent.setup()
     renderShell()
     await screen.findByRole('heading', { name: 'Pipeline' })
+    expect(locationPath()).toBe(paths.pipeline())
 
     await user.click(screen.getByRole('button', { name: /^Sessions/ }))
 
     expect(await screen.findByRole('heading', { name: 'Sessions' })).toBeInTheDocument()
     expect(screen.queryByRole('heading', { name: 'Pipeline' })).not.toBeInTheDocument()
-
-    const persisted = JSON.parse(window.localStorage.getItem(SHELL_STORAGE_KEY) ?? '{}')
-    expect(persisted.view).toBe('sessions')
+    expect(locationPath()).toBe(paths.sessions())
   })
 
   it('ignores a click on an unbuilt view', async () => {
@@ -359,7 +402,7 @@ describe('shell — activity rail view selection', () => {
     await user.click(screen.getByRole('button', { name: /Board/ }))
 
     expect(screen.getByRole('heading', { name: 'Pipeline' })).toBeInTheDocument()
-    expect(window.localStorage.getItem(SHELL_STORAGE_KEY)).toBeNull()
+    expect(locationPath()).toBe(paths.pipeline())
   })
 
   it('collapses and restores the list column from the rail', async () => {
@@ -385,5 +428,93 @@ describe('shell — activity rail view selection', () => {
     expect(screen.getByRole('button', { name: 'Expand rail' })).toBeInTheDocument()
     const persisted = JSON.parse(window.localStorage.getItem(SHELL_STORAGE_KEY) ?? '{}')
     expect(persisted.railCollapsed).toBe(true)
+  })
+})
+
+// ── deep links (#1548) ───────────────────────────────────────────────────────
+
+describe('shell — deep links and route tree', () => {
+  beforeEach(() => stubViewportWidth(WIDE_PX))
+
+  it('redirects a cold load of / to /pipeline', async () => {
+    renderShell('/')
+    await waitFor(() => expect(locationPath()).toBe(paths.pipeline()))
+    expect(await screen.findByRole('heading', { name: 'Pipeline' })).toBeInTheDocument()
+  })
+
+  it('cold-loads a pipeline item deep link straight into the detail column', async () => {
+    renderShell(paths.pipelineItem('myrepo', 42))
+
+    const detail = detailRegion()
+    expect(detail).toBeInTheDocument()
+    expect(await within(detail!).findByText('Fix the thing')).toBeInTheDocument()
+    // The list is on screen too (wide) -- both agree on the same item.
+    expect(listRegion()).toBeInTheDocument()
+  })
+
+  it('cold-loads a deep link with a tab segment without crashing or losing the item', async () => {
+    renderShell(paths.pipelineItem('myrepo', 42, 'log'))
+
+    expect(locationPath()).toBe('/pipeline/myrepo/42/log')
+    // Tab *content* is M-W2 scope -- the acceptance surface for this story is
+    // that the route resolves to the right item and doesn't 404 or crash.
+    await waitFor(() => expect(screen.getAllByText('Fix the thing').length).toBeGreaterThan(0))
+  })
+
+  it('cold-loads a session deep link into the detail column', async () => {
+    renderShell(paths.session('sess-1'))
+
+    const detail = detailRegion()
+    expect(detail).toBeInTheDocument()
+    expect(await within(detail!).findByText('Live session issue')).toBeInTheDocument()
+    expect(within(detail!).getByRole('button', { name: 'Take over' })).toBeInTheDocument()
+  })
+
+  it('shows a real not-found state for a stale issue rather than a blank panel', async () => {
+    renderShell(paths.pipelineItem('myrepo', 999))
+
+    expect(await screen.findByText(/not found in the pipeline/i)).toBeInTheDocument()
+    // The list is still there and still usable -- a stale link doesn't take
+    // down the rest of the shell.
+    expect(listRegion()).toBeInTheDocument()
+  })
+
+  it('shows a real not-found state for a session id that is no longer live', async () => {
+    renderShell(paths.session('does-not-exist'))
+
+    expect(await screen.findByText(/no longer live/i)).toBeInTheDocument()
+  })
+
+  it('renders a not-found state, not a blank panel or a crash, for an unknown route', async () => {
+    renderShell('/this/route/does/not/exist')
+
+    expect(await screen.findByText('Page not found')).toBeInTheDocument()
+    expect(railRegion()).toBeInTheDocument()
+  })
+})
+
+// ── deep links at narrow (regression coverage for the / redirect) ───────────
+
+/**
+ * `AppShell` only mounts the detail slot — the thing a child route's
+ * `element` renders into — when `showDetail` is true, and on narrow that's
+ * `false` until an item is selected. A `/` -> `/pipeline` redirect declared
+ * as a *child* of `ShellLayout` would therefore silently never fire on a
+ * phone-sized cold load: `<Navigate>`'s effect never runs because it's never
+ * mounted. This exact bug shipped past an all-wide-viewport test suite
+ * (every other deep-link test in this file stubs `WIDE_PX`, where the detail
+ * slot is unconditionally mounted) and only showed up in a real browser at a
+ * phone width. `App.tsx` fixes it by declaring the redirect as a *sibling* of
+ * `ShellLayout`; this test (at `NARROW_PX`) is what would have caught the
+ * regression before it shipped.
+ */
+describe('shell — deep links at narrow', () => {
+  beforeEach(() => stubViewportWidth(NARROW_PX))
+
+  it('redirects a cold load of / to /pipeline on narrow, where the detail slot starts unmounted', async () => {
+    renderShell('/')
+    await waitFor(() => expect(locationPath()).toBe(paths.pipeline()))
+    expect(await screen.findByText('Fix the thing')).toBeInTheDocument()
+    expect(screen.queryByText('Page not found')).not.toBeInTheDocument()
   })
 })

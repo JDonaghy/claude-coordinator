@@ -151,7 +151,9 @@ test.describe('shell — wide viewport', () => {
     await page.goto('/')
 
     await list(page).getByText('Fix the dashboard rendering').click()
-    await expect(page).toHaveURL(/work-1/)
+    // #1548: the URL is keyed on repo + issue (`api`/`42`), not the
+    // assignment id (`work-1`) — an issue outlives any one assignment.
+    await expect(page).toHaveURL(/\/pipeline\/api\/42/)
 
     await expect(detail(page).getByText('Fix the dashboard rendering')).toBeVisible()
     // The list did not go anywhere — that's what makes this the wide layout.

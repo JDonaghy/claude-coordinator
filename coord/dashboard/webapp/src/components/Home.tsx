@@ -32,6 +32,7 @@ import { PipelineCard } from '@/components/PipelineCard'
 import { SessionCard } from '@/components/SessionCard'
 import { PanelHeader } from '@/components/PanelHeader'
 import { isActive, needsMe } from '@/lib/pipeline'
+import { paths } from '@/routes/paths'
 
 // ── Filter logic ──────────────────────────────────────────────────────────────
 
@@ -229,8 +230,8 @@ function LiveSessions({ sessions, onSelect }: LiveSessionsProps) {
 
 interface DoneSectionProps {
   items: PipelineView[]
-  onSelect: (assignmentId: string) => void
-  selectedId?: string
+  onSelect: (view: PipelineView) => void
+  isSelected: (view: PipelineView) => boolean
 }
 
 /**
@@ -239,7 +240,7 @@ interface DoneSectionProps {
  * staying one tap away. Sorted by finished_at descending by the caller
  * (groupActiveItems), so expanding always shows most-recently-finished first.
  */
-function DoneSection({ items, onSelect, selectedId }: DoneSectionProps) {
+function DoneSection({ items, onSelect, isSelected }: DoneSectionProps) {
   const [expanded, setExpanded] = useState(false)
 
   if (items.length === 0) return null
@@ -261,8 +262,8 @@ function DoneSection({ items, onSelect, selectedId }: DoneSectionProps) {
             <PipelineCard
               key={view.assignment_id}
               view={view}
-              selected={view.assignment_id === selectedId}
-              onClick={() => onSelect(view.assignment_id)}
+              selected={isSelected(view)}
+              onClick={() => onSelect(view)}
             />
           ))}
         </div>
@@ -282,7 +283,17 @@ export default function Home() {
   // screen together and there is nobody to pass it — the URL is the one thing
   // both compositions agree on. Renders as a marker only; on narrow the
   // detail has replaced the list anyway, so nothing is marked.
-  const selectedId = useMatch('/detail/:id')?.params.id
+  //
+  // Keyed on repo + issue (#1548), not `assignment_id`: the URL is
+  // `/pipeline/:repo/:issue[/:tab]`, so both the two- and three-segment forms
+  // must mark the same row.
+  const itemMatch = useMatch('/pipeline/:repo/:issue')
+  const itemTabMatch = useMatch('/pipeline/:repo/:issue/:tab')
+  const detailMatch = itemMatch ?? itemTabMatch
+  const selectedRepo = detailMatch?.params.repo
+  const selectedIssue = detailMatch?.params.issue
+  const isSelected = (view: PipelineView): boolean =>
+    selectedRepo === view.repo_name && selectedIssue === String(view.issue_number)
 
   // #1549: no refetchInterval -- kept fresh by SSE-driven invalidation
   // (RealtimeProvider invalidates ['pipeline'] on assignment_*/board_updated
@@ -344,7 +355,7 @@ export default function Home() {
       {/* Live sessions — surfaced above everything else (#1067) */}
       <LiveSessions
         sessions={sessions ?? []}
-        onSelect={(sessionId) => navigate(`/terminal/${sessionId}`)}
+        onSelect={(sessionId) => navigate(paths.terminal(sessionId))}
       />
 
       {/* Filter tabs */}
@@ -386,15 +397,15 @@ export default function Home() {
               <PipelineCard
                 key={view.assignment_id}
                 view={view}
-                selected={view.assignment_id === selectedId}
-                onClick={() => navigate(`/detail/${view.assignment_id}`)}
+                selected={isSelected(view)}
+                onClick={() => navigate(paths.pipelineItem(view.repo_name, view.issue_number))}
               />
             ))}
           </section>
           <DoneSection
             items={done}
-            selectedId={selectedId}
-            onSelect={(assignmentId) => navigate(`/detail/${assignmentId}`)}
+            isSelected={isSelected}
+            onSelect={(view) => navigate(paths.pipelineItem(view.repo_name, view.issue_number))}
           />
         </>
       )}

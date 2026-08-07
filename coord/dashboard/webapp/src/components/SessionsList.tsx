@@ -10,6 +10,13 @@
  *
  * Home keeps its own "Live sessions" section unchanged: "attention before
  * detail" says the pipeline view should still open with what's live.
+ *
+ * Rows navigate to `/sessions/:id` (#1548) — the same list -> detail
+ * convention as `Home` -> `Detail` — rather than jumping straight to the
+ * full-screen terminal, so the selection is addressable and the shell fills
+ * its detail column on wide instead of leaving the shell entirely. Home's
+ * own "Live sessions" quick-glance section keeps its direct-to-terminal
+ * shortcut unchanged.
  */
 import { useNavigate } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
@@ -17,6 +24,7 @@ import { useQuery } from '@tanstack/react-query'
 import { fetchSessions } from '@/api/client'
 import { SessionCard } from '@/components/SessionCard'
 import { PanelHeader } from '@/components/PanelHeader'
+import { paths } from '@/routes/paths'
 
 export default function SessionsList() {
   const navigate = useNavigate()
@@ -54,7 +62,7 @@ export default function SessionsList() {
             <SessionCard
               key={session.session_id}
               session={session}
-              onClick={() => navigate(`/terminal/${session.session_id}`)}
+              onClick={() => navigate(paths.session(session.session_id))}
             />
           ))}
         </section>
