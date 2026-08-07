@@ -625,7 +625,7 @@ Found stale on 2026-07-29 at **0.4.84 while the fleet was on 0.4.87** — three
 releases behind. Every timer-launched drive in that window had been running without
 #1564's CI merge gate, #1565, #1567, and #1568, all of which were believed live.
 
-**Add it to every release.** The complete deploy surface is five lanes:
+**Add it to every release.** The complete deploy surface is six lanes:
 
 | # | lane | how it updates | needed when |
 |---|---|---|---|
@@ -634,6 +634,7 @@ releases behind. Every timer-launched drive in that window had been running with
 | 3 | `coord-tui` | local `cargo build && cp target/debug/coord-tui ~/.local/bin/` | any `tui/**` change — never PyPI |
 | 4 | **`~/.coord-cli-venv`** | manual `pip install --upgrade` + verify `coord --version` | **every release**, because the sequencer drives through it |
 | 5 | `.githooks/` hooks | nothing to run — live on the next `git fetch` (given `core.hooksPath` is already set) | any `.githooks/**` change — see below, this lane's failure mode is the opposite of 1–4 |
+| 6 | `deploy/*.service`/`*.timer` (systemd units) | manual `cp deploy/<unit> ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user restart <unit>` on each affected host | any `deploy/**` change — see below, `coord doctor`/`coord health` is the only thing that notices when this is skipped |
 
 ### The fifth surface: `.githooks/**` — the opposite failure mode
 
@@ -655,6 +656,50 @@ machines, which also disables every *other* hook in `.githooks/`, not just
 the broken one. Treat `.githooks/**` changes with the same caution as a
 schema migration: they need to be right on merge, because there is no lane 5
 "upgrade" step to catch them first.
+
+### The sixth surface: `deploy/**` — reviewed like code, installed by nobody
+
+`deploy/*.service`/`*.timer` is version-controlled, reviewed, and merged the
+same as any other file — which reads as "shipping a fix" and is not. **The
+release path (bump → PR → merge → tag push → `publish.yml` → PyPI, then
+`coord agent update` for the venvs) never touches
+`~/.config/systemd/user/`.** A unit is hand-installed once at machine setup
+(`cp deploy/coord-serve.service ~/.config/systemd/user/`, per that file's own
+install instructions) and then drifts forever — nothing re-copies it, and
+nothing notices when it stops matching.
+
+Found on dellserver 2026-08-04 (#1831), immediately after a release: the
+installed `coord-serve.service` was **three weeks stale**, and the drift
+wasn't cosmetic. Its `Environment=PATH=` still started with an *editable*
+checkout of this repo (`~/src/claude-coordinator/.venv/bin`). `coord_argv()`
+(`coord/drive.py`) resolves subprocesses via `shutil.which("coord")` — i.e.
+from that PATH — so the daemon itself ran the pinned release while
+everything it spawned ran whatever stale branch that checkout happened to
+sit on. Every version readout (daemon, all three agents, `~/.local/bin/coord`,
+the PyPI simple index) said the release was live; none of them looked at what
+the daemon's own children would actually resolve.
+
+**Two things close this, together — neither alone is sufficient:**
+
+- **`~/.local/bin` (a symlink onto `~/.coord-venv/bin/coord`, the pinned
+  release) must precede any editable checkout's `.venv/bin` on a unit's
+  PATH.** This is the structural fix: even a completely stale checkout can
+  no longer shadow the release once the release resolves first. See
+  `deploy/coord-serve.service`'s own comment for why the repo venv is kept
+  on the PATH at all (#1117 — `pytest`/`python3` need its deps) and why it
+  goes *after* `~/.local/bin`, not before.
+- **`coord doctor` / `coord health`** report unit-file drift as a first-class
+  check (`unit_drift` / `fleet_unit_drift`, `coord/health/checks/
+  unit_drift.py`, #1831) — STALE content vs. `deploy/`, and separately, CRIT
+  if any unit's PATH lets an editable checkout precede the release. Run
+  `coord doctor` after any `deploy/**` change lands and after any
+  `deploy/**`-affecting machine setup, the same way lane 1–4's "needed when"
+  column above expects a manual verification step.
+
+This lane deliberately has **no automatic install step** — see this repo's
+`coordinator.yml` docs / the #1831 issue's non-goals: writing a `systemctl`
+unit on every host automatically is a bigger blast radius than silent drift
+is. Detection first; a human runs the `cp` + `systemctl --user restart`.
 
 ## Fleet-wide version check
 

@@ -718,6 +718,44 @@ def _health_vs_config_lines(machine, health: dict) -> list[tuple[bool, str]]:
     return out
 
 
+def _unit_drift_lines(health: dict) -> list[tuple[bool, str]]:
+    """Render a machine's ``unit_drift`` H-1 results (``coord/health/checks/
+    unit_drift.py``, #1831) as ``coord doctor`` lines.
+
+    ``/health``'s ``health`` block already carries every machine/checkout
+    check this agent ran (``_cached_local_health`` in ``coord/agent.py``) —
+    this just projects the one check id ``coord doctor`` cares about into its
+    own report, the same way the tool_versions section below projects
+    ``health["tool_versions"]``. An agent predating #1831 simply has no
+    ``unit_drift`` entries here, so this renders nothing for it — never a
+    false "clean".
+
+    Pure function — no I/O — so it's testable without a live fleet.
+    """
+    out: list[tuple[bool, str]] = []
+    results = ((health.get("health") or {}).get("results") or [])
+    for r in results:
+        if r.get("check_id") != "unit_drift":
+            continue
+        severity = r.get("severity")
+        subject = r.get("subject")
+        headroom = r.get("headroom", "")
+        label = f" {subject}" if subject else ""
+        if severity == "crit":
+            out.append((True, f"  ✗ CRIT unit drift{label}: {headroom}"))
+            detail = r.get("detail")
+            if detail:
+                out.append((True, f"        {detail}"))
+        elif severity == "warn":
+            out.append((True, f"  ⚠ unit drift{label}: {headroom}"))
+            detail = r.get("detail")
+            if detail:
+                out.append((True, f"        fix: {detail}"))
+        elif severity == "unknown":
+            out.append((False, f"  ? unit drift{label}: {headroom}"))
+    return out
+
+
 def _dispatch_blocker_lines_for_config_free(machine, cfg) -> list[tuple[bool, str]]:
     """Real dispatch blockers on a **config-free** agent's machine (#1801).
 
@@ -844,6 +882,15 @@ def doctor(config_path: Path, machine_filter: str | None, timeout: float) -> Non
                 click.echo(line)
                 if is_problem:
                     any_problem = True
+
+        # #1831: installed systemd units silently drift from deploy/ — this
+        # is the same class of blind spot #1712 closed for capabilities/repos,
+        # projected from the machine's own unit_drift H-1 check rather than
+        # SSHing in to diff unit files by hand.
+        for is_problem, line in _unit_drift_lines(health):
+            click.echo(line)
+            if is_problem:
+                any_problem = True
 
         raw_probes = health.get("tool_versions")
         if not raw_probes:

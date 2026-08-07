@@ -86,6 +86,21 @@ def _tui(*, present: bool = True, binary_mtime: float | None = None,
     return result
 
 
+def _unit_drift(subject: str, severity: str, *, installed: bool = True,
+                errored: bool = False) -> dict:
+    """A single ``unit_drift`` machine-scope result (#1831) — the
+    per-machine-scope check returns one of these per deploy-lane unit."""
+    result = {
+        "check_id": "unit_drift",
+        "subject": subject,
+        "severity": severity,
+        "values": {"installed": installed},
+    }
+    if errored:
+        result["error"] = "probe exploded"
+    return result
+
+
 def _machine(*results: dict, state: str = "online") -> dict:
     """A machine entry shaped like the one the refresher builds, carrying
     whichever machine-scope check results (``_agent``/``_cli_venv``/
@@ -96,7 +111,7 @@ def _machine(*results: dict, state: str = "online") -> dict:
 # ── every fleet probe is actually registered ─────────────────────────────────
 
 
-def test_all_five_fleet_probes_run() -> None:
+def test_all_fleet_probes_run() -> None:
     results = _run(_ctx())
     assert set(results) == {
         "fleet_deploy_lanes",
@@ -104,6 +119,7 @@ def test_all_five_fleet_probes_run() -> None:
         "fleet_board_latency",
         "fleet_phantom_running",
         "fleet_toolchain_skew",
+        "fleet_unit_drift",
     }
 
 
@@ -480,3 +496,100 @@ def test_phantom_many_rows_samples_five_and_says_there_are_more() -> None:
     # consumer even though the human-facing detail samples five.
     assert len(r.values["assignment_ids"]) == 8
 
+
+
+# ── fleet_unit_drift ─────────────────────────────────────────────────────────
+#
+# #1831: aggregates every machine's own `unit_drift` machine-scope check
+# (coord.health.checks.unit_drift) the same way fleet_deploy_lanes aggregates
+# cli_venv/tui_binary — see that section's header for the shared rationale.
+
+
+def test_unit_drift_no_data_anywhere_is_unknown() -> None:
+    r = _run(_ctx(machines={"dellserver": _machine()}))["fleet_unit_drift"]
+    assert r.severity is Severity.UNKNOWN
+    assert "no machine has reported" in r.headroom
+
+
+def test_unit_drift_all_matching_is_ok() -> None:
+    r = _run(
+        _ctx(
+            machines={
+                "dellserver": _machine(
+                    _unit_drift("coord-serve.service", "ok"),
+                    _unit_drift("coord-agent.service", "ok"),
+                ),
+                "elitebook": _machine(
+                    _unit_drift("coord-agent.service", "ok", installed=False),
+                ),
+            }
+        )
+    )["fleet_unit_drift"]
+    assert r.severity is Severity.OK
+    assert r.values["checked_units"] == 2  # only the installed=True ones
+
+
+def test_unit_drift_stale_unit_is_warn_and_names_the_machine_and_unit() -> None:
+    """The acceptance-criteria "stale unit -> reported" half, at fleet scope."""
+    r = _run(
+        _ctx(
+            machines={
+                "dellserver": _machine(
+                    _unit_drift("coord-serve.service", "warn"),
+                )
+            }
+        )
+    )["fleet_unit_drift"]
+    assert r.severity is Severity.WARN
+    assert "dellserver/coord-serve.service" in r.headroom
+    assert r.values["stale"] == [{"machine": "dellserver", "unit": "coord-serve.service"}]
+
+
+def test_unit_drift_matching_unit_is_ok_and_silent() -> None:
+    """The acceptance-criteria "matching unit -> silent" half, at fleet scope."""
+    r = _run(
+        _ctx(
+            machines={
+                "dellserver": _machine(
+                    _unit_drift("coord-serve.service", "ok"),
+                )
+            }
+        )
+    )["fleet_unit_drift"]
+    assert r.severity is Severity.OK
+    assert r.values["stale"] == []
+    assert r.values["shadowed"] == []
+
+
+def test_unit_drift_path_shadow_risk_is_crit_and_beats_a_merely_stale_unit() -> None:
+    r = _run(
+        _ctx(
+            machines={
+                "dellserver": _machine(
+                    _unit_drift("coord-serve.service", "crit"),
+                ),
+                "elitebook": _machine(
+                    _unit_drift("coord-agent.service", "warn"),
+                ),
+            }
+        )
+    )["fleet_unit_drift"]
+    assert r.severity is Severity.CRIT
+    assert "dellserver/coord-serve.service" in r.headroom
+    assert r.values["shadowed"] == [
+        {"machine": "dellserver", "unit": "coord-serve.service"}
+    ]
+
+
+def test_unit_drift_errored_machine_check_is_excluded_not_treated_as_present() -> None:
+    r = _run(
+        _ctx(
+            machines={
+                "dellserver": _machine(
+                    _unit_drift("coord-serve.service", "unknown", errored=True),
+                )
+            }
+        )
+    )["fleet_unit_drift"]
+    assert r.severity is Severity.UNKNOWN
+    assert "no machine has reported" in r.headroom

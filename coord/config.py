@@ -1411,6 +1411,20 @@ class HealthConfig:
     # above `target/` would sweep a multi-GB build dir on every refresh.
     tui_source_dir: str | None = None
 
+    # ── systemd unit-file drift (#1831) ────────────────────────────────────
+    # `deploy/*.service`/`*.timer` is version-controlled and reviewed but
+    # nothing installs it — a unit hand-copied at machine setup drifts
+    # forever from what's checked in. These two follow the same convention
+    # as the deploy-lane paths above: None means "use the documented default
+    # location", not "disable the check".
+    #
+    # The checked-in reference directory. None -> `<checkout>/deploy` for the
+    # first configured local checkout that has one (normally the
+    # claude-coordinator checkout named in repo_paths).
+    deploy_dir: str | None = None
+    # Where systemd user units actually live. None -> ~/.config/systemd/user.
+    systemd_user_dir: str | None = None
+
 
 @dataclass
 class Config:
@@ -2432,6 +2446,8 @@ _HEALTH_OPT_STR_FIELDS: tuple[str, ...] = (
     "cli_venv_python",
     "tui_binary_path",
     "tui_source_dir",
+    "deploy_dir",
+    "systemd_user_dir",
 )
 # Pairs that must not be inverted.  A config where warn is stricter than crit
 # silently makes the crit level unreachable — the check keeps reporting WARN
