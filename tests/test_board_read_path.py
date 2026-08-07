@@ -675,6 +675,10 @@ def test_gate_refresher_populates_snapshot_from_queue(rw_db, monkeypatch) -> Non
                 )
             ]
 
+        def expects_checks(self, repo: str, number: int) -> bool:
+            calls.append(("expects_checks", repo, number))
+            return True
+
     monkeypatch.setattr(gs, "build_ci_store", lambda t: _FakeCi())
 
     import coord.github_ops as github_ops
@@ -701,12 +705,16 @@ def test_gate_refresher_populates_snapshot_from_queue(rw_db, monkeypatch) -> Non
     assert refresher.snapshot().is_available is False
 
     snap = refresher.refresh(Config(repos=[], machines=[]))
-    assert calls == [("checks", "acme/api", 7)]
+    assert ("checks", "acme/api", 7) in calls
+    assert ("expects_checks", "acme/api", 7) in calls
     assert snap.is_available is True
     assert [c.name for c in snap.list_checks_for_pr("acme/api", 7)] == ["ci"]
     assert snap.get_pr_commit_messages("acme/api", 7)
     assert snap.is_epic_issue("acme/api", 90) is True
     assert snap.is_epic_issue("acme/api", 42) is False
+    # #1904: the per-repo "does this repo declare CI" cache the board read
+    # path's `checks_absent` gate consults.
+    assert snap.expects_checks("acme/api", 7) is True
     assert refresher.snapshot() is snap
 
 

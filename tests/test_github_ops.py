@@ -1497,6 +1497,62 @@ class TestGetPrHeadRef:
             assert github_ops.get_pr_head_ref("acme/api", 42) is None
 
 
+class TestGetRepoWorkflowCount:
+    """#1904: backs `GitHubCi.expects_checks` — the signal that tells "no CI
+    configured for this repo" apart from "CI exists but never triggered"
+    when `gh pr checks` comes back empty."""
+
+    def test_returns_total_count(self) -> None:
+        payload = json.dumps({"total_count": 3, "workflows": [{}, {}, {}]})
+
+        class _FakeResult:
+            returncode = 0
+            stdout = payload
+            stderr = ""
+
+        with patch("coord.github_ops.subprocess.run", return_value=_FakeResult()):
+            assert github_ops.get_repo_workflow_count("acme/api") == 3
+
+    def test_zero_workflows(self) -> None:
+        payload = json.dumps({"total_count": 0, "workflows": []})
+
+        class _FakeResult:
+            returncode = 0
+            stdout = payload
+            stderr = ""
+
+        with patch("coord.github_ops.subprocess.run", return_value=_FakeResult()):
+            assert github_ops.get_repo_workflow_count("acme/api") == 0
+
+    def test_nonzero_exit_raises(self) -> None:
+        class _FakeResult:
+            returncode = 1
+            stdout = ""
+            stderr = "authentication required"
+
+        with patch("coord.github_ops.subprocess.run", return_value=_FakeResult()):
+            with pytest.raises(RuntimeError):
+                github_ops.get_repo_workflow_count("acme/api")
+
+    def test_malformed_response_raises_not_fails_open(self) -> None:
+        """A response missing `total_count` must raise — not default to 0 —
+        so `GitHubCi.expects_checks` fails closed (#1525's rule applied
+        here: unknown must read as "checks were expected")."""
+        class _FakeResult:
+            returncode = 0
+            stdout = json.dumps({"unexpected": "shape"})
+            stderr = ""
+
+        with patch("coord.github_ops.subprocess.run", return_value=_FakeResult()):
+            with pytest.raises(RuntimeError):
+                github_ops.get_repo_workflow_count("acme/api")
+
+    def test_gh_missing_raises(self) -> None:
+        with patch("coord.github_ops.subprocess.run", side_effect=FileNotFoundError):
+            with pytest.raises(RuntimeError):
+                github_ops.get_repo_workflow_count("acme/api")
+
+
 class TestGetPrChecks:
     """#1483: the single gh sink for coord.ci_github.GitHubCi, the CI backend
     behind the merge gate."""

@@ -42,6 +42,12 @@ class TestNoOpCi:
         rerun_for_pr must not pretend to do anything."""
         assert NoOpCi().rerun_for_pr("acme/api", 1) is False
 
+    def test_expects_checks_is_false(self) -> None:
+        """#1904: `ci_store: { type: none }` is the supported "this repo has
+        no CI" opt-out — an empty check list from `NoOpCi` must never read
+        as `checks_absent`."""
+        assert NoOpCi().expects_checks("acme/api", 1) is False
+
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -443,6 +449,54 @@ class TestGitHubCi:
         assert by_name["lint"].run_id == ""
 
 
+class TestGitHubCiExpectsChecks:
+    """#1904: `GitHubCi.expects_checks` — the signal that tells "no CI
+    configured for this repo" apart from "CI exists but never triggered"
+    when `list_checks_for_pr` comes back empty."""
+
+    def test_true_when_repo_declares_workflows(self) -> None:
+        store = GitHubCi()
+        with patch("coord.github_ops.get_repo_workflow_count", return_value=3):
+            assert store.expects_checks("acme/api", 42) is True
+
+    def test_false_when_repo_has_no_workflows(self) -> None:
+        store = GitHubCi()
+        with patch("coord.github_ops.get_repo_workflow_count", return_value=0):
+            assert store.expects_checks("acme/api", 42) is False
+
+    def test_fails_closed_on_read_error(self) -> None:
+        """An unreadable `gh api .../actions/workflows` call must default to
+        `True` (checks were expected), not `False` — #1525's rule that an
+        unknown reads as blocking, not as a free pass."""
+        store = GitHubCi()
+        with patch(
+            "coord.github_ops.get_repo_workflow_count",
+            side_effect=RuntimeError("gh: authentication required"),
+        ):
+            assert store.expects_checks("acme/api", 42) is True
+
+    def test_cached_per_repo_not_per_pr(self) -> None:
+        """Workflow declarations are repo-wide — two different PRs in the
+        same repo must share one cached answer, not pay a `gh api` round
+        trip each."""
+        store = GitHubCi(cache_ttl=60.0)
+        with patch(
+            "coord.github_ops.get_repo_workflow_count", return_value=1
+        ) as fn:
+            store.expects_checks("acme/api", 42)
+            store.expects_checks("acme/api", 43)
+        assert fn.call_count == 1
+
+    def test_cache_keyed_per_repo(self) -> None:
+        store = GitHubCi(cache_ttl=60.0)
+        with patch(
+            "coord.github_ops.get_repo_workflow_count", return_value=1
+        ) as fn:
+            store.expects_checks("acme/api", 42)
+            store.expects_checks("acme/ui", 42)  # different repo
+        assert fn.call_count == 2
+
+
 class TestGitHubCiRerunForPr:
     """#1851: the remedy side — re-running a PR's CI via `gh run rerun`."""
 
@@ -527,9 +581,19 @@ class FakeCi:
 
     by_pr: dict[int, list[CheckRun]] = dataclass_field(default_factory=dict)
     is_available: bool = True
+    # #1904: whether a PR *not* listed in `by_pr` (so `list_checks_for_pr`
+    # returns `[]`) should read as "checks expected but absent" (True) or
+    # as the pre-#1904 "nothing to check for this PR" default (False).
+    # Defaults False so every existing test here — which only ever sets up
+    # `by_pr` for the specific PR(s) it cares about and never expects an
+    # unrelated PR to block — keeps its prior behaviour unchanged.
+    declares_ci: bool = False
 
     def list_checks_for_pr(self, repo: str, number: int) -> list[CheckRun]:
         return self.by_pr.get(number, [])
+
+    def expects_checks(self, repo: str, number: int) -> bool:
+        return self.declares_ci
 
 
 @dataclass
@@ -663,6 +727,76 @@ class TestMergeGate:
         gh = FakeGh()
         process(items, gh)
         assert gh.merge_calls == [(100, "rebase")]
+
+    # ── #1904: checks == [] is ambiguous — "no CI configured" (merge is
+    # correct) vs. "CI exists but never triggered for this PR" (merge is
+    # wrong). `FakeCi.declares_ci` is the stub's answer to that question.
+
+    def test_checks_absent_blocks_merge_when_ci_declared(self) -> None:
+        """A repo that declares CI but never reported a single check for
+        this PR — the exact 2026-08-06 webhook-throttle shape — must block,
+        not silently merge untested code."""
+        items = [_entry("a")]
+        gh = FakeGh()
+        ci = FakeCi(by_pr={}, declares_ci=True)
+        events = process(items, gh, ci_store=ci)
+        assert gh.merge_calls == []
+        assert items[0].state == PENDING
+        kinds = [e.kind for e in events]
+        assert "checks_absent" in kinds
+        assert "checks_failed" not in kinds
+        assert "checks_pending" not in kinds
+        absent_event = next(e for e in events if e.kind == "checks_absent")
+        assert "CI never ran" in absent_event.message
+
+    def test_checks_absent_reason_persisted_on_entry(self) -> None:
+        """The blocked reason lands on `entry.error` — the field
+        `IssueState.merge_reason` and the board read (#1891's fallback)
+        consult — not just the transient event."""
+        items = [_entry("a")]
+        gh = FakeGh()
+        ci = FakeCi(by_pr={}, declares_ci=True)
+        process(items, gh, ci_store=ci)
+        assert items[0].error is not None
+        assert "CI never ran" in items[0].error
+
+    def test_no_workflows_declared_still_allows_merge(self) -> None:
+        """Companion regression: a repo with no CI configured at all
+        (`expects_checks` answers False, mirroring a repo with no
+        `.github/workflows` or `GitHubCi` reading zero declared workflows)
+        must not be deadlocked by the #1904 fix — an empty check list here
+        is the correct, unremarkable reading."""
+        items = [_entry("a")]
+        gh = FakeGh()
+        ci = FakeCi(by_pr={}, declares_ci=False)
+        process(items, gh, ci_store=ci)
+        assert gh.merge_calls == [(100, "rebase")]
+        assert items[0].state == MERGED
+
+    def test_force_merge_overrides_checks_absent(self) -> None:
+        items = [_entry("a")]
+        gh = FakeGh()
+        ci = FakeCi(by_pr={}, declares_ci=True)
+        process(items, gh, ci_store=ci, force_merge=True)
+        assert gh.merge_calls == [(100, "rebase")]
+        assert items[0].state == MERGED
+
+    def test_checks_absent_dry_run_matches_real_path(self) -> None:
+        """--dry-run must report the same verdict the real path would —
+        the #1904 incident's dry-run mirrors the real bug exactly, so the
+        usual "check with --dry-run first" habit didn't catch it either.
+        Uses an already-open PR (`existing_prs`) so dry-run's CI gate is
+        actually evaluated — a brand-new entry with no PR yet is a
+        different, already-covered case (`test_reports_ci_unknown_when_no_pr_yet`)."""
+        items = [_entry("a")]
+        gh = FakeGh(existing_prs={"worker/a": {"number": 612, "url": "https://gh/x/612"}})
+        ci = FakeCi(by_pr={}, declares_ci=True)
+        events = process(items, gh, ci_store=ci, dry_run=True)
+        assert gh.merge_calls == []
+        kinds = [e.kind for e in events]
+        assert "checks_absent" in kinds
+        merged_events = [e for e in events if e.kind == "merged"]
+        assert not merged_events
 
     def test_failed_check_halts_group_only(self) -> None:
         """A failed check on one PR shouldn't block PRs in other groups."""

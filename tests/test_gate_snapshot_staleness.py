@@ -72,3 +72,37 @@ class TestGateSnapshotStaleness:
         snap = GateSnapshot()
         assert snap.list_checks_for_pr("acme/api", 7) == []
         assert snap.is_available is False
+
+
+class TestGateSnapshotExpectsChecks:
+    """#1904: `GateSnapshot.expects_checks` — the per-repo cache `refresh()`
+    populates from the inner `CiStore` so the board/`--plan` read path can
+    tell "no CI configured" apart from "CI exists but never triggered" the
+    same way the live merge gate does."""
+
+    def test_true_when_repo_cached_as_declaring_ci(self) -> None:
+        snap = GateSnapshot(
+            workflows_declared={"acme/api": True}, ci_available=True,
+        )
+        assert snap.expects_checks("acme/api", 7) is True
+
+    def test_false_when_repo_cached_as_not_declaring_ci(self) -> None:
+        snap = GateSnapshot(
+            workflows_declared={"acme/api": False}, ci_available=True,
+        )
+        assert snap.expects_checks("acme/api", 7) is False
+
+    def test_uncached_repo_fails_open(self) -> None:
+        """Unlike `list_checks_for_pr`'s "unknown reads as failing" (#1525)
+        posture, a repo this snapshot hasn't cached an answer for yet —
+        never refreshed, or a fresh daemon boot before the first tick —
+        reads as `False` (not `checks_absent`). This mirrors the module's
+        documented "fail-open by construction" tradeoff: a fresh daemon
+        serves an unannotated board instantly rather than reading every
+        pending entry as untested-and-blocked before any I/O has happened."""
+        snap = GateSnapshot(workflows_declared={}, ci_available=True)
+        assert snap.expects_checks("acme/api", 7) is False
+
+    def test_no_backend_configured_fails_open(self) -> None:
+        snap = GateSnapshot()
+        assert snap.expects_checks("acme/api", 7) is False

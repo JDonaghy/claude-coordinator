@@ -86,6 +86,32 @@ class CiStore(Protocol):
     @property
     def is_available(self) -> bool: ...
 
+    def expects_checks(self, repo: str, number: int) -> bool:
+        """True when *repo*/*number* should have reported at least one check.
+
+        #1904: ``checks == []`` is genuinely ambiguous — "no CI is
+        configured for this repo" (merging is correct) and "CI exists but
+        was never triggered" (a throttled webhook, a wedged run, a
+        path-filtered-out workflow — merging is wrong) both produce it, and
+        every gate predicate (:func:`failed_checks`, :func:`in_flight_checks`,
+        :func:`checks_are_stale`) is a filter that reads an empty list as
+        "nothing wrong". This is the one method that answers "which of the
+        two is this" *without* looking at any particular PR's checks — it
+        asks whether the backend believes CI exists for this repo at all.
+        Callers (``coord.merge_queue``'s ``checks_absent`` gate) only
+        consult this when ``list_checks_for_pr`` has already come back
+        empty; a non-empty check list settles the question on its own.
+
+        :class:`NoOpCi` answers ``False`` unconditionally — it is the
+        supported "this repo has no CI" opt-out (``ci_store: {type:
+        none}``), so nothing it reports should ever read as "checks
+        absent". A backend that can't determine this at all should default
+        to ``True`` (fail closed, mirroring #1525's "unknown reads as
+        blocking" posture) rather than silently reopening the hole this
+        method exists to close.
+        """
+        ...
+
     def rerun_for_pr(self, repo: str, number: int) -> bool:
         """Re-run *repo*#*number*'s CI workflows. Returns whether it worked.
 
@@ -112,6 +138,11 @@ class NoOpCi:
 
     @property
     def is_available(self) -> bool:
+        return False
+
+    def expects_checks(self, repo: str, number: int) -> bool:
+        """Always ``False`` — CI gating is opted out entirely (#1904), so an
+        empty check list is never "checks absent", it's "no CI here"."""
         return False
 
     def rerun_for_pr(self, repo: str, number: int) -> bool:
@@ -171,7 +202,9 @@ def checks_are_stale(checks: list[CheckRun], base_commit_time: float | None) -> 
     doesn't re-derive that itself, so it never contradicts "CI failed"/"CI
     running" with a third, competing reading of the same checks. An empty
     *checks* list (nothing to compare) reads as not-stale; the caller's own
-    "no checks" handling covers that case.
+    "no checks" handling covers that case — see :meth:`CiStore.expects_checks`
+    and ``coord.merge_queue``'s ``checks_absent`` gate (#1904), which now
+    implements exactly that handling at all three call sites.
 
     Fails closed toward **stale** — mirroring
     :func:`coord.merge_queue._base_move_is_inert`'s documented bias ("a false
