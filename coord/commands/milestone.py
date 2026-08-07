@@ -937,6 +937,36 @@ def milestone_dispatch_cmd(
 
     from coord import board_service
 
+    # #1930 (epic #1440, S-2): a milestone under gate control (`coord
+    # milestone drive`) is drained EXCLUSIVELY by the daemon's gate tick, as
+    # its `work` state — see `coord.milestone_gate`'s module docstring. This
+    # manual command is the second dispatch path #1440 exists to close: an
+    # operator who runs it against a gate-controlled milestone would launch
+    # the same frontier the daemon is about to (or just did) launch, racing
+    # it rather than being refused or delegating to it. Checked before the
+    # GitHub fetch below (and before Gate A, `--dry-run`, `--next`) so the
+    # refusal costs nothing and can never be silently bypassed by a flag.
+    from coord import state as state_mod  # noqa: PLC0415
+
+    existing_gate = state_mod.get_milestone_gate(
+        repo_name=repo_entry.name, tracking_issue=tracking_issue
+    )
+    if existing_gate is not None:
+        from coord import milestone_gate as mg  # noqa: PLC0415
+
+        gate_name = str(existing_gate.get("gate") or mg.GATE_A)
+        gate_label = mg.GATE_LABELS.get(gate_name, gate_name)
+        click.echo(
+            f"error: #{tracking_issue} is under gate control, currently at "
+            f"{gate_label} — the daemon's gate tick is the sole driver of "
+            "this milestone's frontier (epic #1440). Running `coord "
+            "milestone dispatch` here would race it, not replace it. Use "
+            "`coord milestone drive --dry-run` to see the planned sequence, "
+            "or wait for the daemon to reach `work`.",
+            err=True,
+        )
+        sys.exit(1)
+
     try:
         ctx = fetch_milestone_context(repo_entry, tracking_issue)
     except MilestoneDispatchError as e:
@@ -1196,6 +1226,13 @@ def milestone_drive_cmd(
         )
         sys.exit(1)
 
+    # #1930: this call is the ENTIRE side effect of `drive` — it persists the
+    # record (unchanged, if one already existed) but never calls
+    # `mg.apply_step` and never dispatches. Only the daemon's
+    # `_milestone_gate_tick` advances the walk or drains `work`, so running
+    # `drive` again (same operator, a second operator, a second machine) is
+    # inert: same key, same record, nothing to race. See
+    # `coord.milestone_gate`'s "Exactly one overseer" module docstring.
     state.save_milestone_gate(record.to_dict())
     for line in mg.format_plan(
         record, steps, to_dispatch=to_dispatch, skipped=skipped, waiting=waiting,

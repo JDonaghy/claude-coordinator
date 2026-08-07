@@ -20,6 +20,7 @@ from unittest.mock import patch
 import pytest
 from click.testing import CliRunner
 
+from coord import milestone_gate as mg
 from coord import state as state_mod
 from coord.cli import main
 from coord.models import Board
@@ -445,3 +446,77 @@ class TestMilestoneDispatchGateA:
             )
         get_file.assert_not_called()
         assert "Gate A" not in result.output
+
+
+class TestMilestoneDispatchGateControlled:
+    """#1930 (epic #1440 S-2): a milestone under gate control (``coord
+    milestone drive``) is drained exclusively by the daemon's gate tick.
+    Manual ``coord milestone dispatch`` against that same milestone is the
+    second-dispatch-path race #1440 exists to close structurally — it must
+    refuse, not race the daemon's own `work`-state drain. This is the case
+    the issue calls out as "the one an operator will actually hit"."""
+
+    def test_bulk_dispatch_refused_against_gate_controlled_milestone(
+        self, config_file: Path,
+    ) -> None:
+        state_mod.save_milestone_gate(
+            mg.GateRecord(
+                repo_name="api", tracking_issue=100, gate=mg.WORK,
+            ).to_dict()
+        )
+        with patch("coord.github_ops.get_issue", side_effect=_get_issue) as get_issue, \
+             patch("coord.github_ops.get_open_issues") as get_open, \
+             patch("coord.dispatch.dispatch") as disp:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "dispatch", "api", "100", "--config", str(config_file)],
+            )
+        assert result.exit_code == 1, result.output
+        assert "under gate control" in result.output
+        assert "work — drain the ready frontier" in result.output
+        assert "coord milestone drive --dry-run" in result.output
+        # Refused before the GitHub fetch even happens — cheap and
+        # unconditional, mirroring Gate A's posture.
+        get_issue.assert_not_called()
+        get_open.assert_not_called()
+        disp.assert_not_called()
+
+    def test_dry_run_and_next_also_refused(self, config_file: Path) -> None:
+        state_mod.save_milestone_gate(
+            mg.GateRecord(
+                repo_name="api", tracking_issue=100, gate=mg.GATE_B,
+            ).to_dict()
+        )
+        with patch("coord.github_ops.get_issue", side_effect=_get_issue), \
+             patch("coord.github_ops.get_open_issues"), \
+             patch("coord.dispatch.dispatch") as disp:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "dispatch", "api", "100", "--config", str(config_file),
+                 "--dry-run", "--next"],
+            )
+        assert result.exit_code == 1, result.output
+        assert "under gate control" in result.output
+        assert "Gate B" in result.output
+        disp.assert_not_called()
+
+    def test_no_gate_record_dispatches_normally(self, config_file: Path) -> None:
+        """Control: a milestone with no gate record at all is unaffected —
+        the check must not false-positive on every dispatch."""
+        open_issues = [
+            {"number": 762, "milestone": {"number": 9}},
+            {"number": 763, "milestone": {"number": 9}},
+            {"number": 765, "milestone": {"number": 9}},
+        ]
+        with patch("coord.github_ops.get_issue", side_effect=_get_issue), \
+             patch("coord.github_ops.get_open_issues", return_value=open_issues), \
+             patch("coord.board_service.read_board", return_value=Board()), \
+             patch("coord.dispatch.dispatch") as disp:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "dispatch", "api", "100", "--config", str(config_file),
+                 "--dry-run"],
+            )
+        assert result.exit_code == 0, result.output
+        assert "under gate control" not in result.output
+        disp.assert_not_called()  # dry-run never dispatches regardless
