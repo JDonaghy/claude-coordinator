@@ -103,6 +103,17 @@ jobs:
         working-directory: coord/dashboard/webapp
     steps:
       - uses: actions/checkout@v4
+      # #1551: `live-update-fixture.spec.ts` spawns a real
+      # `coord web --fixture` process, so the CLI has to be installed and on
+      # PATH — without it Playwright fails with `spawn coord ENOENT`. Every
+      # earlier spec drove a browser only, which is why this job never needed
+      # Python before. The job defaults `run:` steps into the webapp
+      # directory, so the install step overrides it back to the repo root.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - working-directory: .
+        run: pip install -e ".[dev]"
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
