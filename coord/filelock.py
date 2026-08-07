@@ -67,6 +67,18 @@ def _lock_exclusive_nonblocking(fd: int) -> None:
             # a stable, single-byte region every caller agrees on.
             msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
         except OSError as exc:
+            if exc.errno is not None:
+                # ``msvcrt.locking`` already sets a real errno (contention
+                # maps to EACCES/EAGAIN via CPython's Windows error table,
+                # same as the POSIX path below) -- propagate it untouched
+                # rather than relabelling genuine, non-contention failures
+                # (e.g. disk I/O errors) as lock contention, which would
+                # make FileLock.acquire's retry loop spin forever instead
+                # of surfacing the real error.
+                raise
+            # Defensive fallback only: some failure without an errno
+            # attached at all -- treat conservatively as contention so the
+            # retry/timeout loop above still applies.
             raise OSError(errno.EACCES, exc.strerror or str(exc)) from exc
     else:
         import fcntl  # stdlib, POSIX-only -- deferred for platform safety  # noqa: PLC0415

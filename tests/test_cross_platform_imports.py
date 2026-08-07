@@ -32,7 +32,7 @@ import sys, importlib.abc
 _BLOCKED = {_BLOCKED_POSIX_MODULES!r}
 
 class _BlockPosix(importlib.abc.MetaPathFinder):
-    def find_module(self, name, path=None):
+    def find_spec(self, name, path, target=None):
         if name in _BLOCKED:
             raise ImportError(f"{{name}} blocked (simulated non-POSIX)")
         return None

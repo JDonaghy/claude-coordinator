@@ -20,6 +20,7 @@ substituted.
 
 from __future__ import annotations
 
+import errno
 import os
 import sys
 
@@ -105,6 +106,35 @@ def test_windows_backend_context_manager(fake_windows, tmp_path) -> None:
     contender = FileLock(path)
     contender.acquire(timeout=0)
     contender.release()
+
+
+def test_windows_backend_non_contention_error_propagates(monkeypatch, tmp_path) -> None:
+    """A genuine (non-contention) OSError from ``msvcrt.locking`` -- e.g. a
+    real I/O failure -- must propagate with its real errno, not be
+    relabelled as lock contention.
+
+    ``FileLock.__enter__``/every ``with FileLock(...)`` caller uses
+    ``timeout=None`` (block forever); if a non-contention failure were
+    misclassified as ``EACCES``/``EAGAIN`` the acquire retry loop would spin
+    forever instead of surfacing the real error.
+    """
+    monkeypatch.setattr(sys, "platform", "win32")
+
+    class _FailingMsvcrt:
+        LK_UNLCK = 0
+        LK_LOCK = 1
+        LK_NBLCK = 2
+
+        def locking(self, fd: int, mode: int, nbytes: int) -> None:
+            raise OSError(errno.EIO, "Disk error")
+
+    monkeypatch.setitem(sys.modules, "msvcrt", _FailingMsvcrt())
+
+    lock = FileLock(tmp_path / "test.lock")
+    with pytest.raises(OSError) as exc_info:
+        lock.acquire(timeout=None)
+    assert exc_info.value.errno == errno.EIO
+    assert not isinstance(exc_info.value, LockBusy)
 
 
 def test_posix_backend_contention_and_release(tmp_path, monkeypatch) -> None:
