@@ -199,7 +199,7 @@ For work bigger than one issue, group issues under an **epic** and drive the who
 | **A — contract** | `coord acceptance mock` | A mock-first, black-box acceptance contract exists before any issue dispatches (repos with an `acceptance.drivers` entry). |
 | **B — architecture** | `coord milestone gate-b` | An independent review confirms the *assembled* milestone was built to the Gate-A contract. |
 | **C — acceptance** | `coord milestone gate-c` | The full accumulated acceptance suite is green (catches integration gaps between issues). |
-| **D — ship** | `coord milestone ship` | Merges the milestone's `feature/ms-NN` branch to `develop`, gated on Gate B (approved) + Gate C (re-run live). |
+| **D — ship** | `coord milestone ship` | Merges the milestone's `feature/ms-NN` branch to `develop`, gated on Gate B (approved) + Gate C (re-run live), then closes the tracking issue — the signal `coord milestone drive`'s Gate D watches for. |
 
 `coord milestone drive` (below) walks a milestone through all four as a single durable state machine instead of four manual steps.
 
@@ -216,7 +216,7 @@ coord milestone ship  myrepo <epic>          # Gate D → merge feature/ms-NN in
 
 **Driving the whole walk (`coord milestone drive`, #1929).** The commands above are each a manual step. `coord milestone drive myrepo <epic>` instead puts the milestone under **gate control**: a durable, board-backed gate record (`coord/milestone_gate.py`) records which gate it is in, when it entered, and what it is waiting on, and the daemon advances it one step per tick through **A → work → B → C → D → done**. Because the record lives on the board, a daemon restarted mid-milestone resumes at the gate it was in and never re-runs a gate it already cleared. `coord milestone drive myrepo <epic> --dry-run` prints the full planned sequence — every gate, the work order's ready frontier, what would dispatch — and dispatches nothing.
 
-Today every gate edge past `work` is an explicit, **logged hold**: the machine reports *why* it cannot advance and stays put (the individual edge behaviours — Gate-A pause, contract amendment, red acceptance, Gate-B request-changes, Gate-C red — are separate work). Nothing ever falls through silently.
+Today every gate edge past `work` is an explicit, **logged hold**: the machine reports *why* it cannot advance and stays put (the individual edge behaviours — Gate-A pause, contract amendment, red acceptance, Gate-B request-changes, Gate-C red — are separate work). Nothing ever falls through silently. Gate D is the one exception that already resolves on its own: a successful `coord milestone ship` closes the tracking issue as its last step, and that closure — not the `ship` invocation itself — is what Gate D observes to advance to `done` and deregister.
 
 > **`drive` vs. `milestone.auto_dispatch`.** They are mutually exclusive per milestone, and gate driving wins. `milestone.auto_dispatch` enables the *legacy standalone drain* — the daemon re-dispatching a milestone's ready frontier with no gate walk around it. A gate-driven milestone is drained by the gate tick as its `work` state instead, so the drain tick skips it. Otherwise a milestone parked at Gate A could still have work dispatched behind the gate walk's back. `drive` is therefore its own per-milestone opt-in and is not behind the global flag.
 

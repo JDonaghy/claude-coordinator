@@ -335,7 +335,11 @@ class GateProbes:
     gate_c_green: bool | None = None
     #: Whether the milestone has shipped.  Gate D never ships anything from
     #: here (``coord milestone ship`` is an explicit operator action); this
-    #: only *observes* that it happened so the walk can terminate.
+    #: only *observes* that it happened so the walk can terminate.  The
+    #: observable signal is the tracking issue's own GitHub state — ``ship``
+    #: closes it as the last step of a successful run, so this is true iff
+    #: that closure (by ``ship`` or otherwise) has landed.  See
+    #: :func:`probe_milestone`.
     shipped: bool = False
     #: Whether the work order is empty — a tracking issue with no ``## Work
     #: order`` block can't be driven, and saying so beats holding forever at
@@ -435,8 +439,12 @@ def evaluate_gate(gate: str, probes: GateProbes) -> GateStep:
         return GateStep(
             gate, HOLD,
             "ship is an explicit operator action — run `coord milestone ship "
-            "<repo> <tracking_issue>`; this gate only observes that it "
-            "happened",
+            "<repo> <tracking_issue>`, which merges feature/ms-NN into develop "
+            "*and then closes the tracking issue on success*; this gate "
+            "watches for that closure (not the ship command running) to "
+            "detect completion. If the tracking issue was already closed by "
+            "some other means, that satisfies this gate too — but a bare "
+            "`ship` run without a closed issue never will",
         )
 
     if gate == DONE:
@@ -508,7 +516,22 @@ def probe_milestone(
     ``shipped`` is read off the tracking issue's own state: closing the epic
     is the observable end of the walk, and it costs nothing extra — the
     tracking issue is already fetched by
-    :func:`~coord.milestone_dispatch.fetch_milestone_context`.
+    :func:`~coord.milestone_dispatch.fetch_milestone_context`.  ``coord
+    milestone ship`` (``coord/commands/milestone.py``) closes the tracking
+    issue itself once the merge succeeds, specifically so this probe has
+    something to observe — Gate D does not hold forever waiting on a manual
+    close that nothing in the pipeline actually performs.
+
+    This always computes *every* probe, regardless of which gate the
+    milestone is currently sitting in — a milestone parked at Gate C still
+    pays for a Gate-A contract-file fetch every tick.  That is deliberate,
+    not an oversight: :func:`plan_sequence` evaluates every gate from the
+    current one through :data:`DONE` against this *same* probe set to build
+    the ``--dry-run`` projection, so the downstream probes have to exist
+    even when the live gate doesn't need them yet.  Making this lazy would
+    mean threading "which gates does the caller actually need" through two
+    layers to save one GitHub call per tick — a real but minor cost, not a
+    correctness issue.
     """
     from coord.gate_b import latest_gate_b_verdict  # noqa: PLC0415
     from coord.milestone_dispatch import gate_a_status, is_milestone_complete  # noqa: PLC0415
@@ -576,6 +599,7 @@ def format_plan(
     to_dispatch: list = (),
     skipped: list = (),
     waiting: list = (),
+    footer: bool = True,
 ) -> list[str]:
     """Render a ``--dry-run`` report: the gate walk plus the work frontier.
 
@@ -585,6 +609,13 @@ def format_plan(
     halves of #1440's fourth acceptance bullet — every gate, *and* what would
     dispatch — in one output.  Returns lines rather than echoing so both the
     CLI and a test can consume it.
+
+    ``footer`` controls whether the trailing blank line + "(dry run — ...)"
+    line is included.  A non-dry-run confirmation (``coord milestone drive``
+    without ``--dry-run``) wants the same report *without* that footer, since
+    the record was in fact written — pass ``footer=False`` there rather than
+    slicing the returned list, which silently breaks if this function's own
+    footer shape ever changes.
     """
     lines: list[str] = [
         f"Gate walk for {record.label}"
@@ -634,6 +665,7 @@ def format_plan(
         for b in waiting:
             lines.append(f"    #{b.issue_number}: {b.reason}")
 
-    lines.append("")
-    lines.append("(dry run — nothing dispatched, no gate record written)")
+    if footer:
+        lines.append("")
+        lines.append("(dry run — nothing dispatched, no gate record written)")
     return lines
