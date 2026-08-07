@@ -1082,6 +1082,116 @@ def milestone_dispatch_cmd(
         sys.exit(1)
 
 
+@milestone_group.command(
+    "drive",
+    help=(
+        "Put a milestone under gate control (#1929, epic #1440): the daemon "
+        "walks it through Gate A (contract) -> work -> Gate B (architecture) "
+        "-> Gate C (acceptance) -> Gate D (ship), one step per tick, from a "
+        "durable board-backed gate record. The `work` state IS the frontier "
+        "drain, so a gate-driven milestone is NOT also drained by the "
+        "independently-gated `milestone.auto_dispatch` path. Every gate edge "
+        "other than the A->work and work->B ones is currently an explicit, "
+        "logged HOLD (the individual edge behaviours are epic #1440's other "
+        "children) — never a silent fall-through. Use --dry-run to print the "
+        "full planned sequence without dispatching or writing anything."
+    ),
+)
+@click.argument("repo")
+@click.argument("tracking_issue", type=int)
+@click.option(
+    "--dry-run", is_flag=True,
+    help=(
+        "Print the full planned gate sequence + the work order's ready "
+        "frontier and exit. Dispatches nothing and writes no gate record."
+    ),
+)
+@_CONFIG_OPTION
+def milestone_drive_cmd(
+    repo: str, tracking_issue: int, dry_run: bool, config_path: Path
+) -> None:
+    import dataclasses
+    import time as _time
+
+    from coord import board_service, state
+    from coord import milestone_gate as mg
+
+    cfg = _load_config(config_path)
+    repo_entry = cfg.repo(repo)
+    if repo_entry is None:
+        click.echo(f"error: unknown repo {repo!r}", err=True)
+        sys.exit(2)
+
+    try:
+        ctx = fetch_milestone_context(repo_entry, tracking_issue)
+    except MilestoneDispatchError as e:
+        click.echo(f"error: {e}", err=True)
+        sys.exit(1)
+
+    # Resume, don't restart: an existing record is the source of truth for
+    # which gate this milestone is in. `drive` on an already-driven milestone
+    # re-reports its position rather than rewinding the walk to Gate A.
+    existing = state.get_milestone_gate(
+        repo_name=repo_entry.name, tracking_issue=tracking_issue
+    )
+    record = mg.GateRecord.from_dict(existing) if existing else None
+    if record is None:
+        now = _time.time()
+        record = mg.GateRecord(
+            repo_name=repo_entry.name,
+            tracking_issue=tracking_issue,
+            gate=mg.GATE_A,
+            entered_at=now,
+            updated_at=now,
+            milestone_number=ctx.milestone_number,
+        )
+    else:
+        record = dataclasses.replace(record, milestone_number=ctx.milestone_number)
+
+    board = board_service.read_board()
+    probes = mg.probe_milestone(ctx, board, cfg, repo_entry)
+    steps = mg.plan_sequence(record, probes)
+
+    # The frontier half of the dry-run report. Computed for both modes so the
+    # non-dry-run confirmation shows what the first `work` tick will do.
+    if ctx.work_order.nodes:
+        plan = plan_dispatch(
+            ctx.work_order, board, cfg, repo_entry, ctx.terminal_issues
+        )
+        to_dispatch, skipped, waiting = plan.to_dispatch, plan.skipped, plan.waiting
+    else:
+        to_dispatch, skipped, waiting = [], [], []
+
+    if dry_run:
+        for line in mg.format_plan(
+            record, steps,
+            to_dispatch=to_dispatch, skipped=skipped, waiting=waiting,
+        ):
+            click.echo(line)
+        return
+
+    if not ctx.work_order.nodes:
+        click.echo(
+            f"error: #{tracking_issue} has no `## Work order` block — nothing "
+            "to drive (write one with `coord milestone write-order`)",
+            err=True,
+        )
+        sys.exit(1)
+
+    state.save_milestone_gate(record.to_dict())
+    for line in mg.format_plan(
+        record, steps, to_dispatch=to_dispatch, skipped=skipped, waiting=waiting,
+    )[:-2]:
+        click.echo(line)
+    click.echo()
+    click.echo(
+        f"Milestone #{tracking_issue} is now under gate control at "
+        f"{mg.GATE_LABELS.get(record.gate, record.gate)}. The daemon advances "
+        "it one gate per tick; `coord milestone drive --dry-run` re-prints the "
+        "plan at any time."
+    )
+
+
 def _resolve_milestone_membership(
     repo_entry, milestone_number: int, work_order: WorkOrder
 ) -> tuple[set[int], set[int]]:

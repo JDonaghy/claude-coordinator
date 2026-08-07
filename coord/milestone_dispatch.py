@@ -87,6 +87,12 @@ class MilestoneContext:
     milestone_number: int
     work_order: WorkOrder
     terminal_issues: frozenset[int] = field(default_factory=frozenset)
+    #: The tracking issue's own GitHub state (``"OPEN"``/``"CLOSED"``).
+    #: #1929: the milestone gate machine's Gate D observes "has this shipped"
+    #: from here — closing the epic is the observable end of the walk. Comes
+    #: free from the ``get_issue`` call this function already makes; defaulted
+    #: so every existing construction site (tests included) is unaffected.
+    tracking_issue_state: str = "OPEN"
 
 
 def fetch_milestone_context(repo_cfg: Repo, tracking_issue: int) -> MilestoneContext:
@@ -115,12 +121,15 @@ def fetch_milestone_context(repo_cfg: Repo, tracking_issue: int) -> MilestoneCon
     except WorkOrderError as e:
         raise MilestoneDispatchError(str(e)) from e
 
+    tracking_issue_state = str(issue_data.get("state") or "OPEN").upper()
+
     if not work_order.nodes:
         return MilestoneContext(
             tracking_issue=tracking_issue,
             milestone_number=milestone_number,
             work_order=work_order,
             terminal_issues=frozenset(),
+            tracking_issue_state=tracking_issue_state,
         )
 
     # Membership + terminal state — mirrors coord/commands/milestone.py's
@@ -160,6 +169,7 @@ def fetch_milestone_context(repo_cfg: Repo, tracking_issue: int) -> MilestoneCon
         milestone_number=milestone_number,
         work_order=work_order,
         terminal_issues=frozenset(terminal_issues),
+        tracking_issue_state=tracking_issue_state,
     )
 
 

@@ -3072,6 +3072,128 @@ def deregister_milestone_drain(*, repo_name: str, tracking_issue: int) -> None:
         )
 
 
+# ── #1929: milestone gate records (epic #1440) ──────────────────────────────
+#
+# The durable half of the milestone gate state machine
+# (:mod:`coord.milestone_gate`): one JSON record per driven
+# ``(repo_name, tracking_issue)`` under the ``milestone_gates`` board_meta
+# key, deliberately sitting in the same seam as ``milestone_drains`` above so
+# **one board read answers "what is this milestone doing"**.
+#
+# Storage shape mirrors the drain registry exactly (a JSON list under one
+# board_meta key, tolerant decode, whole-list rewrite under one transaction)
+# rather than earning a table: the row count is "milestones an operator is
+# actively driving", i.e. single digits, and the daemon tick rewrites the
+# whole set each pass anyway.
+
+
+def save_milestone_gate(record: dict) -> None:
+    """Upsert one milestone's gate record — routes to the daemon when set.
+
+    The write path for both ``coord milestone drive`` (cold start, from a
+    possibly-thin client) and the daemon's own
+    ``coord.serve_app._milestone_gate_tick`` (every transition).  Keyed on
+    ``(repo_name, tracking_issue)``; an existing record for that pair is
+    replaced wholesale, which is what makes the tick idempotent — re-running
+    it with the same inputs re-persists the same record.
+    """
+    svc = _board_service()
+    resp = _route_write(svc, "/milestone-gate", {"record": record})
+    if resp is not None:
+        return
+    _save_milestone_gate_local(record)
+
+
+def _save_milestone_gate_local(record: dict) -> None:
+    repo_name = record.get("repo_name")
+    tracking_issue = record.get("tracking_issue")
+    if not isinstance(repo_name, str) or not repo_name or tracking_issue is None:
+        raise ValueError("milestone gate record needs repo_name + tracking_issue")
+    tracking_issue = int(tracking_issue)
+    record = {**record, "tracking_issue": tracking_issue}
+
+    conn = get_connection()
+    with conn:
+        gates = _load_milestone_gates_raw(conn)
+        key = (repo_name, tracking_issue)
+        remaining = [
+            g for g in gates
+            if (g.get("repo_name"), _as_int(g.get("tracking_issue"))) != key
+        ]
+        remaining.append(record)
+        conn.execute(
+            "INSERT OR REPLACE INTO board_meta (key, value) VALUES "
+            "('milestone_gates', ?)",
+            (json.dumps(remaining),),
+        )
+
+
+def list_milestone_gates() -> list[dict]:
+    """Every milestone currently under gate control.
+
+    Local-DB only (no thin-client routing), matching
+    :func:`list_milestone_drains`: the only reader is the daemon's own tick
+    loop, which always runs against the canonical DB directly.
+    """
+    conn = get_connection()
+    return _load_milestone_gates_raw(conn)
+
+
+def get_milestone_gate(*, repo_name: str, tracking_issue: int) -> dict | None:
+    """One milestone's gate record, or ``None`` if it isn't gate-driven."""
+    for g in list_milestone_gates():
+        if (
+            g.get("repo_name") == repo_name
+            and _as_int(g.get("tracking_issue")) == tracking_issue
+        ):
+            return g
+    return None
+
+
+def _as_int(value: object) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _load_milestone_gates_raw(conn: sqlite3.Connection) -> list[dict]:
+    row = conn.execute(
+        "SELECT value FROM board_meta WHERE key = 'milestone_gates'"
+    ).fetchone()
+    if row is None:
+        return []
+    try:
+        data = json.loads(row["value"])
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [d for d in data if isinstance(d, dict)]
+
+
+def delete_milestone_gate(*, repo_name: str, tracking_issue: int) -> None:
+    """Drop a milestone from gate control.
+
+    Local-DB only — called by the daemon's gate tick once the walk reaches a
+    terminal gate (:data:`coord.milestone_gate.TERMINAL_GATES`), the gate-record
+    analogue of :func:`deregister_milestone_drain`.
+    """
+    conn = get_connection()
+    with conn:
+        gates = _load_milestone_gates_raw(conn)
+        key = (repo_name, tracking_issue)
+        remaining = [
+            g for g in gates
+            if (g.get("repo_name"), _as_int(g.get("tracking_issue"))) != key
+        ]
+        conn.execute(
+            "INSERT OR REPLACE INTO board_meta (key, value) VALUES "
+            "('milestone_gates', ?)",
+            (json.dumps(remaining),),
+        )
+
+
 # ── #1630: fleet-health aggregation ─────────────────────────────────────────
 # Local-DB only, like list_milestone_drains above — the only writer is the
 # daemon's own health-poll tick (coord.serve_app), which always runs
