@@ -27,6 +27,19 @@ an operator's CLI venv nor a local ``tui/`` checkout+build — so both probes
 report that plainly as ``OK`` ("not present on this machine") rather than
 ``UNKNOWN``/``WARN``: a box that was never meant to have either lane must
 not read as faulty just because it doesn't.
+
+A third check, ``webapp_bundle``, joins these two for the same reason and
+the same shape (#1834 lane 5, the phone-webapp bundle `coord web --dist`
+serves): the machine actually running `coord web` is very often not the
+daemon host either. It is deliberately **not** graded against the released
+wheel's version the way ``agent_venv``/``spawned_coord`` are —
+``deploy/coord-web-dist-build.timer`` publishes continuously off
+``origin/main``'s SHA (#1543), decoupled on purpose from the
+``~/.coord-venv`` release cadence, so "is it on the released version?" is
+not a well-formed question for it. What *is* well-formed, and what this
+checks — mirroring ``tui_binary`` exactly — is whether the live bundle is
+older than the ``coord/dashboard/webapp/`` source tree it claims to have
+been built from.
 """
 
 from __future__ import annotations
@@ -45,6 +58,9 @@ from coord.health.units import expand, shorten_path
 # documented default location", NOT "disable the lane".
 _DEFAULT_CLI_VENV_PYTHON = "~/.coord-cli-venv/bin/python3"
 _DEFAULT_TUI_BINARY = "~/.local/bin/coord-tui"
+# Mirrors `deploy/coord-web-dist-build.sh`'s `$LIVE_LINK` — the symlink
+# `coord-web-dist-build.timer` atomically repoints at each new release.
+_DEFAULT_WEBAPP_DIST = "~/coord-web-dist"
 
 # Cap on the tui/ source walk, mirroring the old daemon-side walk: the tree
 # is a few hundred .rs files, so anything past this is a misconfigured
@@ -53,6 +69,13 @@ _DEFAULT_TUI_BINARY = "~/.local/bin/coord-tui"
 # yields a *lower bound* on the newest mtime — it can only under-report
 # staleness, never fabricate it.
 _MAX_TUI_SOURCE_FILES = 5000
+# Same cap, same reasoning, for the webapp/ source walk below.
+_MAX_WEBAPP_SOURCE_FILES = 5000
+# Directories a webapp source walk must never descend into: dependency and
+# build output trees that dwarf the actual source and would either blow the
+# file cap on noise or (worse) let a stale `dist/` sitting inside a checkout
+# masquerade as "source newer than itself".
+_WEBAPP_SOURCE_SKIP_DIRS = {"node_modules", "dist", "build", "coverage"}
 
 
 def resolve_cli_venv_python(ctx: HealthContext):
@@ -89,6 +112,69 @@ def resolve_tui_source_dir(ctx: HealthContext):
         if candidate.is_dir():
             return candidate
     return None
+
+
+def resolve_webapp_dist_path(ctx: HealthContext):
+    """This machine's live ``coord web --dist`` bundle, if any (#1834)."""
+    configured = getattr(ctx.thresholds, "webapp_dist_path", None)
+    if configured:
+        return expand(configured, ctx.home)
+    return expand(_DEFAULT_WEBAPP_DIST, ctx.home)
+
+
+def resolve_webapp_source_dir(ctx: HealthContext):
+    """``<checkout>/coord/dashboard/webapp/src`` for the first local checkout
+    that has one. Same convention as :func:`resolve_tui_source_dir`."""
+    configured = getattr(ctx.thresholds, "webapp_source_dir", None)
+    if configured:
+        return expand(configured, ctx.home)
+    for checkout in ctx.checkouts:
+        candidate = checkout.path / "coord" / "dashboard" / "webapp" / "src"
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+def _newest_webapp_source_mtime(source_dir):
+    """Newest mtime under *source_dir*, skipping dependency/build dirs.
+
+    Unlike :func:`_newest_rust_source_mtime` this is deliberately NOT
+    extension-filtered: a webapp source tree mixes ``.ts``/``.tsx``/``.css``/
+    ``.html`` meaningfully and filtering would only risk under-reporting
+    staleness. ``node_modules``/``dist``/``build`` are the trees that
+    actually need skipping (size, and — for ``dist``/``build`` sitting
+    inside a checkout — self-reference), so those are excluded outright.
+    """
+    newest = 0.0
+    seen = 0
+    try:
+        if not source_dir.is_dir():
+            return None
+        stack = [source_dir]
+        while stack:
+            current = stack.pop()
+            try:
+                entries = list(current.iterdir())
+            except OSError:
+                continue
+            for entry in entries:
+                name = entry.name
+                if name.startswith(".") or name in _WEBAPP_SOURCE_SKIP_DIRS:
+                    continue
+                try:
+                    if entry.is_dir():
+                        stack.append(entry)
+                        continue
+                    newest = max(newest, entry.stat().st_mtime)
+                except OSError:
+                    continue
+                seen += 1
+                if seen >= _MAX_WEBAPP_SOURCE_FILES:
+                    stack.clear()
+                    break
+    except OSError:
+        return newest or None
+    return newest or None
 
 
 def _newest_rust_source_mtime(source_dir):
@@ -265,5 +351,106 @@ def probe_tui_binary(ctx: HealthContext) -> CheckResult:
         scope="machine",
         severity=Severity.OK,
         headroom="up to date with tui/ source",
+        values=values,
+    )
+
+
+@check(
+    id="webapp_bundle",
+    scope="machine",
+    title="webapp bundle",
+    order=47,
+    description=(
+        "This machine's live `coord web --dist` bundle vs. the "
+        "coord/dashboard/webapp/ source tree it was supposedly built from — "
+        "feeds fleet_webapp_bundle (#1834 lane 5)."
+    ),
+)
+def probe_webapp_bundle(ctx: HealthContext) -> CheckResult:
+    """The webapp analogue of :func:`probe_tui_binary`: same shape, same
+    fail-soft-to-absent convention, different subject.
+
+    Not graded against ``OWN_VERSION`` or the released wheel — see this
+    module's docstring — so this only ever reports staleness relative to the
+    ``webapp/`` source tree, never a version.
+    """
+    dist_path = resolve_webapp_dist_path(ctx)
+    values: dict = {"path": str(dist_path)}
+
+    try:
+        present = dist_path.exists()
+    except OSError:
+        present = False
+
+    if not present:
+        # Most machines never run `coord web --dist` — absent, not stale.
+        return CheckResult(
+            check_id="webapp_bundle",
+            scope="machine",
+            severity=Severity.OK,
+            headroom="not present on this machine",
+            values={**values, "present": False},
+        )
+
+    values["present"] = True
+    try:
+        resolved = dist_path.resolve()
+        # `coord-web-dist-build.sh` names each release directory after the
+        # SHA it built — the symlink target's basename doubles as "which
+        # commit this machine is actually serving" whenever that convention
+        # holds, and is simply absent (not fabricated) when it doesn't.
+        values["sha"] = resolved.name
+    except OSError:
+        resolved = dist_path
+
+    try:
+        dist_mtime = resolved.stat().st_mtime
+    except OSError:
+        dist_mtime = None
+    values["dist_mtime"] = dist_mtime
+
+    source_dir = resolve_webapp_source_dir(ctx)
+    if source_dir is None or dist_mtime is None:
+        return CheckResult(
+            check_id="webapp_bundle",
+            scope="machine",
+            severity=Severity.OK,
+            headroom="bundle present (webapp/ source tree not found to compare)",
+            values=values,
+        )
+
+    values["source_dir"] = str(source_dir)
+    source_mtime = _newest_webapp_source_mtime(source_dir)
+    if source_mtime is None:
+        return CheckResult(
+            check_id="webapp_bundle",
+            scope="machine",
+            severity=Severity.OK,
+            headroom="bundle present (webapp/ source tree not found to compare)",
+            values=values,
+        )
+
+    values["source_mtime"] = source_mtime
+    if source_mtime > dist_mtime:
+        stale_hours = (source_mtime - dist_mtime) / 3600.0
+        return CheckResult(
+            check_id="webapp_bundle",
+            scope="machine",
+            severity=Severity.WARN,
+            headroom=f"bundle is {stale_hours:.1f}h older than webapp/ source",
+            detail=(
+                "coord-web-dist-build.timer has not published since this "
+                "source changed — check `systemctl --user status "
+                "coord-web-dist-build.timer` on this machine"
+            ),
+            threshold="warn when webapp/ source is newer than the live bundle",
+            values=values,
+        )
+
+    return CheckResult(
+        check_id="webapp_bundle",
+        scope="machine",
+        severity=Severity.OK,
+        headroom="up to date with webapp/ source",
         values=values,
     )

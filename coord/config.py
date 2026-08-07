@@ -1423,6 +1423,16 @@ class HealthConfig:
     # Deliberately points at `src/`, not the crate root: rooting the mtime walk
     # above `target/` would sweep a multi-GB build dir on every refresh.
     tui_source_dir: str | None = None
+    # Absolute path to the live `coord web --dist` bundle (#1834 lane 5).
+    # None → ~/coord-web-dist — the symlink `deploy/coord-web-dist-build.timer`
+    # atomically repoints at each new release (#1543).
+    webapp_dist_path: str | None = None
+    # Directory holding the coord/dashboard/webapp/ sources the bundle was
+    # built from.  None → `<checkout>/coord/dashboard/webapp/src` for the
+    # first configured local checkout that has one.  Same `src/`-not-root
+    # reasoning as `tui_source_dir`: rooting at the webapp package root would
+    # sweep `node_modules`/`dist` were they not already skipped by name.
+    webapp_source_dir: str | None = None
 
     # ── systemd unit-file drift (#1831) ────────────────────────────────────
     # `deploy/*.service`/`*.timer` is version-controlled and reviewed but
@@ -2472,6 +2482,8 @@ _HEALTH_OPT_STR_FIELDS: tuple[str, ...] = (
     "tui_source_dir",
     "deploy_dir",
     "systemd_user_dir",
+    "webapp_dist_path",
+    "webapp_source_dir",
 )
 # Pairs that must not be inverted.  A config where warn is stricter than crit
 # silently makes the crit level unreachable — the check keeps reporting WARN

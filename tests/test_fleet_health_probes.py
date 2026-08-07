@@ -116,6 +116,7 @@ def test_all_fleet_probes_run() -> None:
     assert set(results) == {
         "fleet_deploy_lanes",
         "fleet_tui_binary",
+        "fleet_webapp_bundle",
         "fleet_board_latency",
         "fleet_phantom_running",
         "fleet_toolchain_skew",
@@ -377,6 +378,116 @@ def test_tui_binary_errored_machine_check_is_excluded_not_treated_as_present() -
     )["fleet_tui_binary"]
     assert r.severity is Severity.UNKNOWN
     assert "no machine reports a coord-tui binary" in r.headroom
+
+
+# ── fleet_webapp_bundle (#1834 lane 5) ────────────────────────────────────────
+#
+# Same shape as fleet_tui_binary above — a `webapp_bundle` machine-scope fact,
+# aggregated across `ctx.fleet.machines`, judged for staleness against its own
+# source tree, never for version (see deploy_lane_facts.py's module
+# docstring for why: the bundle is SHA-versioned off a continuous publish
+# timer, not pip-versioned like every other lane in this module).
+
+
+def _webapp(*, present: bool = True, sha: str | None = None,
+            dist_mtime: float | None = None, source_mtime: float | None = None,
+            errored: bool = False) -> dict:
+    values: dict = {"present": present, "path": "/home/x/coord-web-dist"}
+    if present:
+        values["dist_mtime"] = dist_mtime
+        if sha is not None:
+            values["sha"] = sha
+        if source_mtime is not None:
+            values["source_mtime"] = source_mtime
+    result = {"check_id": "webapp_bundle", "values": values}
+    if errored:
+        result["error"] = "stat exploded"
+    return result
+
+
+def test_webapp_bundle_newer_than_source_is_ok() -> None:
+    r = _run(
+        _ctx(
+            machines={
+                "dellserver": _machine(
+                    _webapp(dist_mtime=NOW, source_mtime=NOW - 3600)
+                ),
+            }
+        )
+    )["fleet_webapp_bundle"]
+    assert r.severity is Severity.OK
+    assert "up to date" in r.headroom
+    assert "dellserver" in r.headroom
+
+
+def test_webapp_bundle_older_than_source_is_warn_with_the_staleness_in_hours() -> None:
+    r = _run(
+        _ctx(
+            machines={
+                "dellserver": _machine(
+                    _webapp(dist_mtime=NOW - 9000, source_mtime=NOW)  # 2.5h stale
+                ),
+            }
+        )
+    )["fleet_webapp_bundle"]
+    assert r.severity is Severity.WARN
+    assert "2.5h older" in r.headroom
+    assert "dellserver" in r.headroom
+    assert "coord-web-dist-build.timer" in r.detail
+    assert "dellserver" in r.detail
+
+
+def test_webapp_bundle_no_machine_reports_one_is_unknown() -> None:
+    r = _run(
+        _ctx(machines={"dellserver": _machine(_webapp(present=False))})
+    )["fleet_webapp_bundle"]
+    assert r.severity is Severity.UNKNOWN
+    assert "no machine reports a coord-web-dist bundle" in r.headroom
+    assert "coord-web-dist-build" in r.detail
+
+
+def test_webapp_bundle_present_but_no_source_tree_is_ok_not_a_fabricated_verdict() -> None:
+    r = _run(
+        _ctx(machines={"dellserver": _machine(_webapp(dist_mtime=NOW))})
+    )["fleet_webapp_bundle"]
+    assert r.severity is Severity.OK
+    assert "no source tree found to compare" in r.headroom
+
+
+def test_webapp_bundle_two_machines_serving_different_shas_is_warn() -> None:
+    """This is drift too — no comparable source, but two machines both
+    running `coord web` disagree on which build is live."""
+    r = _run(
+        _ctx(
+            machines={
+                "dellserver": _machine(_webapp(sha="aaa111", dist_mtime=NOW)),
+                "elitebook": _machine(_webapp(sha="bbb222", dist_mtime=NOW)),
+            }
+        )
+    )["fleet_webapp_bundle"]
+    assert r.severity is Severity.WARN
+    assert "2 different bundles" in r.headroom
+    assert "aaa111" in r.detail and "bbb222" in r.detail
+
+
+def test_webapp_bundle_matching_shas_across_machines_is_ok() -> None:
+    r = _run(
+        _ctx(
+            machines={
+                "dellserver": _machine(_webapp(sha="aaa111", dist_mtime=NOW)),
+                "elitebook": _machine(_webapp(sha="aaa111", dist_mtime=NOW)),
+            }
+        )
+    )["fleet_webapp_bundle"]
+    assert r.severity is Severity.OK
+
+
+def test_webapp_bundle_errored_machine_check_is_excluded_not_treated_as_present() -> None:
+    r = _run(
+        _ctx(machines={"dellserver": _machine(_webapp(dist_mtime=NOW, errored=True))})
+    )["fleet_webapp_bundle"]
+    assert r.severity is Severity.UNKNOWN
+    assert "no machine reports a coord-web-dist bundle" in r.headroom
 
 
 # ── fleet_board_latency ──────────────────────────────────────────────────────

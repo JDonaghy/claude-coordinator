@@ -334,6 +334,25 @@ def findings_for_host(host: str, health: dict | None) -> list[Finding]:
                 )
             )
 
+    # ── webapp bundle vs coord/dashboard/webapp/ source (#1834 lane 5) ───
+    # Deliberately not a Lane/version comparison — see release_verify.py's
+    # module docstring and coord.health.checks.fleet_deploy_lanes: the
+    # bundle is versioned by origin/main's SHA on a continuous publish
+    # timer (#1543), never by the pip release every other lane compares
+    # against, so folding it into `versions` would manufacture permanent,
+    # meaningless skew rather than report a real one.
+    for row in _rows(health, "webapp_bundle"):
+        if row.get("severity") == "warn":
+            out.append(
+                Finding(
+                    severity="warn",
+                    host=host,
+                    lane="webapp bundle",
+                    summary=str(row.get("headroom") or "webapp bundle is stale"),
+                    detail=str(row.get("detail") or ""),
+                )
+            )
+
     return out
 
 

@@ -34,6 +34,19 @@ Both checks below are fail-soft toward UNKNOWN, never toward OK: a lane no
 machine has data for (an agent that never reported, a CLI venv that was
 never configured anywhere) must not read as "in sync" just because there was
 nothing to disagree with.
+
+A third fleet check, ``fleet_webapp_bundle``, aggregates ``webapp_bundle``
+(#1834 lane 5, the phone-webapp bundle `coord web --dist` serves) the same
+way ``fleet_tui_binary`` aggregates ``tui_binary`` — same source
+(:mod:`coord.health.checks.deploy_lane_facts`), same shape, same fail-soft
+convention. It is deliberately **not** folded into the version-skew map
+below: ``deploy/coord-web-dist-build.timer`` publishes continuously off
+``origin/main``'s SHA, decoupled on purpose from the pip release cadence
+every other lane in this module compares against, so a bundle's "version" is
+never comparable to ``coord-serve``'s or an agent venv's. What it CAN
+report — staleness against its own source tree, and disagreement between
+machines about which bundle is live — it does, on its own terms, exactly
+like ``tui_binary`` already does for the same reason.
 """
 
 from __future__ import annotations
@@ -327,5 +340,130 @@ def probe_tui_binary(ctx: HealthContext) -> CheckResult:
         scope="fleet",
         severity=Severity.OK,
         headroom=f"up to date with tui/ source on {', '.join(sorted(comparable))}",
+        values={"machines": facts},
+    )
+
+
+@check(
+    id="fleet_webapp_bundle",
+    scope="fleet",
+    title="webapp bundle",
+    order=13,
+    description=(
+        "The dist/ bundle `coord web --dist` serves is not older than the "
+        "coord/dashboard/webapp/ source tree it was supposedly built from, "
+        "on every machine that has one (#1834 lane 5)."
+    ),
+)
+def probe_webapp_bundle(ctx: HealthContext) -> CheckResult:
+    """Aggregates every machine's own ``webapp_bundle`` machine-scope check
+    — the same "measure locally, judge centrally" split :func:`probe_tui_binary`
+    uses above, for the same reason: the machine actually running `coord web`
+    is very often not the daemon host.
+
+    Deliberately NOT compared against the released wheel's version, unlike
+    every other lane in this module: `coord-web-dist-build.timer` publishes
+    continuously off `origin/main`'s SHA (#1543), decoupled on purpose from
+    the ~/.coord-venv release cadence, so "is it at the released version?" is
+    not a well-formed question for it — see docs/AGENT_OPERATIONS.md's
+    `coord release verify` section. What IS well-formed, and what this
+    checks: whether the live bundle is stale relative to the source it
+    claims to have been built from, and whether machines that both run
+    `coord web` agree on which bundle that is.
+    """
+    if ctx.fleet is None:
+        return CheckResult(
+            check_id="fleet_webapp_bundle",
+            scope="fleet",
+            severity=Severity.UNKNOWN,
+            headroom="no fleet snapshot (fleet checks only run on the daemon)",
+        )
+
+    facts = _machine_check_values(ctx, "webapp_bundle")
+    present = {name: v for name, v in facts.items() if v.get("present")}
+
+    if not present:
+        return CheckResult(
+            check_id="fleet_webapp_bundle",
+            scope="fleet",
+            severity=Severity.UNKNOWN,
+            headroom="no machine reports a coord-web-dist bundle",
+            detail=(
+                "install deploy/coord-web-dist-build.service + .timer on the "
+                "machine that runs `coord web` (see docs/AGENT_OPERATIONS.md), "
+                "or set health.webapp_dist_path if it lives elsewhere"
+            ),
+            values={"machines": facts},
+        )
+
+    # Compare each machine against ITS OWN source tree, same reasoning as
+    # fleet_tui_binary: a machine with no webapp/ checkout has nothing to
+    # compare against and is left out of the verdict (present, uncomparable).
+    stale: list[tuple[str, float, float]] = []
+    comparable: list[str] = []
+    for name, values in present.items():
+        dist_mtime = values.get("dist_mtime")
+        source_mtime = values.get("source_mtime")
+        if dist_mtime is None or source_mtime is None:
+            continue
+        comparable.append(name)
+        if source_mtime > dist_mtime:
+            stale.append((name, dist_mtime, source_mtime))
+
+    if stale:
+        stale.sort(key=lambda t: (t[2] - t[1]), reverse=True)
+        names = ", ".join(n for n, _, _ in stale)
+        _worst_name, worst_dm, worst_sm = stale[0]
+        stale_hours = (worst_sm - worst_dm) / 3600.0
+        return CheckResult(
+            check_id="fleet_webapp_bundle",
+            scope="fleet",
+            severity=Severity.WARN,
+            headroom=f"{names}: bundle is {stale_hours:.1f}h older than webapp/ source",
+            detail=f"check coord-web-dist-build.timer on: {names}",
+            threshold="warn when any machine's webapp/ source is newer than its live bundle",
+            values={"machines": facts, "stale": [n for n, _, _ in stale]},
+        )
+
+    # Two machines both running `coord web` but serving different builds is
+    # its own drift, independent of staleness against source — most fleets
+    # only ever have one, but when there are two they must agree.
+    shas = {v.get("sha") for v in present.values() if v.get("sha")}
+    if len(shas) > 1:
+        by_sha: dict[str, list[str]] = {}
+        for name, v in present.items():
+            sha = v.get("sha")
+            if sha:
+                by_sha.setdefault(sha, []).append(name)
+        skew_desc = "; ".join(
+            f"{sha}: {', '.join(sorted(names))}" for sha, names in sorted(by_sha.items())
+        )
+        return CheckResult(
+            check_id="fleet_webapp_bundle",
+            scope="fleet",
+            severity=Severity.WARN,
+            headroom=f"{len(shas)} different bundles live across the fleet",
+            detail=skew_desc,
+            threshold="warn when machines serving coord web disagree on the live bundle",
+            values={"machines": facts},
+        )
+
+    if not comparable:
+        return CheckResult(
+            check_id="fleet_webapp_bundle",
+            scope="fleet",
+            severity=Severity.OK,
+            headroom=(
+                f"bundle present on {', '.join(sorted(present))} "
+                "(no source tree found to compare)"
+            ),
+            values={"machines": facts},
+        )
+
+    return CheckResult(
+        check_id="fleet_webapp_bundle",
+        scope="fleet",
+        severity=Severity.OK,
+        headroom=f"up to date with webapp/ source on {', '.join(sorted(comparable))}",
         values={"machines": facts},
     )

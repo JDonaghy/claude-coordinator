@@ -194,6 +194,17 @@ def resolve_coord(path_value: str) -> str | None:
     benign case — ``coord_argv`` then falls back to ``[sys.executable, "-m",
     "coord.cli"]``, i.e. the *parent's own* install, which by construction
     cannot be skewed against the parent.
+
+    KNOWN BLIND SPOT: ``coord_argv()`` checks ``$COORD_DRIVE_COORD_BIN``
+    *before* ever calling ``shutil.which`` and, if set, returns that override
+    verbatim — this function has no way to see that env var (it isn't part
+    of ``PATH``, which is all ``/proc/<pid>/environ`` gives this check reason
+    to read) or predict it. A live service whose environment sets that
+    variable would have its actual spawn target silently diverge from what
+    this lane reports, in either direction (a false OK or a false CRIT,
+    depending on what happens to also resolve on PATH). It is documented on
+    ``coord_argv`` as existing "for tests" but is not fenced off from
+    production, so this is a real if unlikely gap — not a hypothetical one.
     """
     if not path_value:
         return None
@@ -284,7 +295,7 @@ def is_editable(module_file: str | None) -> bool | None:
     id="spawned_coord",
     scope="machine",
     title="spawned coord",
-    order=45,
+    order=46,
     description=(
         "The `coord` that each running coord service would actually spawn — "
         "resolved from the live process's own PATH via shutil.which, the way "

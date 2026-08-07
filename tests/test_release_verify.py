@@ -585,6 +585,50 @@ def test_unit_drift_and_tui_staleness_are_folded_in() -> None:
     assert report.severity == "crit"
 
 
+def test_webapp_bundle_staleness_is_folded_in() -> None:
+    """Lane 5 of the issue's enumeration — the webapp bundle — rides the same
+    report too, on staleness-vs-source terms rather than a version (see
+    coord/health/checks/fleet_deploy_lanes.py's module docstring for why a
+    version comparison would be meaningless here)."""
+    report = rv.verify(
+        machine_health={
+            "dellserver": _health(
+                _agent_venv(RELEASED),
+                _result("webapp_bundle", severity="warn",
+                        headroom="bundle is 3.0h older than webapp/ source",
+                        detail="check coord-web-dist-build.timer on: dellserver"),
+            )
+        },
+        expected=RELEASED,
+    )
+    lanes = {f.lane for f in report.findings}
+    assert "webapp bundle" in lanes
+    assert report.severity == "warn"  # agent_venv alone is already clean here
+    warn_findings = [f for f in report.findings if f.lane == "webapp bundle"]
+    assert warn_findings[0].severity == "warn"
+    assert "coord-web-dist-build.timer" in warn_findings[0].detail
+
+
+def test_webapp_bundle_never_becomes_a_version_lane() -> None:
+    """The bundle is SHA-versioned off a continuous publish timer (#1543),
+    never pip-versioned — folding it into the version-skew map would
+    manufacture permanent, meaningless skew against every other lane's
+    semver string. It must never appear in report.lanes at all."""
+    report = rv.verify(
+        machine_health={
+            "dellserver": _health(
+                _agent_venv(RELEASED),
+                _result("webapp_bundle", severity="ok", headroom="up to date",
+                        present=True, sha="abc123", dist_mtime=1.0),
+            )
+        },
+        expected=RELEASED,
+    )
+    assert report.ok, rv.render(report)
+    assert not any(lane.lane == "webapp bundle" for lane in report.lanes)
+    assert "abc123" not in report.versions
+
+
 def test_absent_cli_venv_is_not_a_lane() -> None:
     """Most machines never had one. An absent optional lane must not become a
     permanent UNKNOWN."""
