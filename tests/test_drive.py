@@ -32,7 +32,7 @@ from pathlib import Path
 
 import pytest
 
-from coord.config import Config, UsageGateConfig
+from coord.config import Config, ProviderDef, ProvidersConfig, UsageGateConfig
 from coord.drive import (
     EXIT_DEADLINE,
     EXIT_DISPATCH_REFUSED,
@@ -139,6 +139,35 @@ def test_preflight_refuses_when_no_machine_hosts_the_repo():
         preflight(state(), DriveOptions())
     assert "no unpaused machine hosts" in str(exc.value)
     assert exc.value.exit_code == EXIT_USAGE
+
+
+def test_preflight_refuses_distinctly_when_hosts_exist_but_none_are_capable():
+    """#1906: a fleet that DOES host the repo but has no machine advertising
+    the resolved provider must not collapse into the generic 'no unpaused
+    machine hosts' message — the two are different problems (add a machine
+    vs. add a capability) with different fixes."""
+    with pytest.raises(DriveError) as exc:
+        preflight(
+            state(picked_machine_no_capable=True, picked_machine_provider="opencode"),
+            DriveOptions(),
+        )
+    message = str(exc.value)
+    assert "no unpaused machine advertises" in message
+    assert "opencode" in message
+    assert "no unpaused machine hosts" not in message
+    assert exc.value.exit_code == EXIT_USAGE
+
+
+def test_preflight_explicit_machine_wins_even_when_selection_found_no_capable_host():
+    """Explicit beats inferred (#1906 design point): an operator naming a
+    machine is never silently re-routed or refused by THIS gate — #1711's
+    dispatch-time guard is the one that gets to refuse an explicit but
+    incapable machine, not the picker."""
+    pre = preflight(
+        state(picked_machine_no_capable=True, picked_machine_provider="opencode"),
+        DriveOptions(machine="precision"),
+    )
+    assert pre.machine == "precision"
 
 
 def test_preflight_warns_when_the_auto_loop_is_off():
@@ -2412,6 +2441,71 @@ def test_driver_exits_zero_on_a_verified_merge(driver_factory, capsys):
     driver = driver_factory([board(status="merged")])
     assert driver.run() == EXIT_OK
     assert "MERGED" in capsys.readouterr().out
+
+
+def _mixed_fleet_drive_config() -> Config:
+    """#1906 acceptance fixture: one claude-only machine, one that also
+    advertises `provider:opencode`, wired through `providers.labels` so a
+    `harness:opencode` label resolves the effective provider."""
+    return Config(
+        repos=[Repo(name=REPO, github="john/claude-coordinator", test_command="pytest -q")],
+        machines=[
+            Machine(name="claude-only", host="claude-only", repos=[REPO]),
+            Machine(
+                name="opencode-box", host="opencode-box", repos=[REPO],
+                capabilities=["provider:opencode"],
+            ),
+        ],
+        providers=ProvidersConfig(
+            definitions={"opencode": ProviderDef(type="opencode")},
+            labels={"harness:opencode": "opencode"},
+        ),
+    )
+
+
+def test_driver_auto_picks_the_capable_machine_for_an_opencode_labelled_issue(
+    driver_factory, capsys,
+):
+    """#1906 end-to-end acceptance: no `--machine`, the issue's cached label
+    resolves to `opencode`, and the dispatched `coord assign` argv — the
+    actual dispatch target, not just the absence of a #1711 exception —
+    names the capable machine, never the incapable one."""
+    payload = {
+        "assignments": [],
+        "issues": [{"repo_name": REPO, "number": ISSUE, "labels": ["harness:opencode"]}],
+    }
+    driver = driver_factory(
+        [payload],
+        opts=DriveOptions(machine="", poll=1.0, deadline_mins=0.5 / 60.0),
+        config=_mixed_fleet_drive_config(),
+    )
+    assert driver.run() == EXIT_DEADLINE
+    assert driver.recorded, "expected at least one dispatched coord command"
+    dispatched = driver.recorded[0]
+    assert "assign" in dispatched
+    assert "opencode-box" in dispatched
+    assert "claude-only" not in dispatched
+    assert "opencode" in capsys.readouterr().out  # the provider provenance log line
+
+
+def test_driver_reports_the_distinct_no_capable_machine_error(driver_factory):
+    """The fleet hosts the repo but nobody advertises `opencode` — must not
+    read as the generic 'no unpaused machine hosts' message (#1906)."""
+    config = _mixed_fleet_drive_config()
+    config.machines = [config.machines[0]]  # claude-only survives; opencode-box doesn't
+    payload = {
+        "assignments": [],
+        "issues": [{"repo_name": REPO, "number": ISSUE, "labels": ["harness:opencode"]}],
+    }
+    driver = driver_factory(
+        [payload], opts=DriveOptions(machine=""), config=config,
+    )
+    with pytest.raises(DriveError) as exc:
+        driver.run()
+    message = str(exc.value)
+    assert "no unpaused machine advertises" in message
+    assert "opencode" in message
+    assert exc.value.exit_code == EXIT_USAGE
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -15,12 +15,14 @@ import json
 
 import pytest
 
-from coord.config import Config
+from coord.config import Config, ProviderDef, ProvidersConfig
 from coord.drive_state import (
     BoardFetcher,
     DriveStateError,
     IssueState,
+    MachineChoice,
     pick_machine,
+    pick_machine_choice,
     project,
 )
 from coord.models import Machine, Repo
@@ -29,7 +31,12 @@ from coord.models import Machine, Repo
 REPO = "claude-coordinator"
 
 
-def make_config(*, machines: list[Machine] | None = None) -> Config:
+def make_config(
+    *,
+    machines: list[Machine] | None = None,
+    providers: ProvidersConfig | None = None,
+    repo_provider: str | None = None,
+) -> Config:
     return Config(
         repos=[
             Repo(
@@ -37,11 +44,13 @@ def make_config(*, machines: list[Machine] | None = None) -> Config:
                 github="john/claude-coordinator",
                 default_branch="main",
                 test_command="pytest -q",
+                provider=repo_provider,
             )
         ],
         machines=machines
         if machines is not None
         else [Machine(name="precision", host="precision", repos=[REPO])],
+        providers=providers if providers is not None else ProvidersConfig(),
     )
 
 
@@ -673,6 +682,175 @@ def test_pick_machine_is_deterministic_on_a_tie():
         ]
     )
     assert pick_machine({}, REPO, config) == "alpha"
+
+
+# ── pick_machine_choice / provider-aware selection (#1906) ──────────────────
+
+
+def _mixed_fleet_config(**kw) -> Config:
+    """One claude-only machine, one that also advertises `provider:opencode`
+    — the mixed-capability fleet #1906 exists for (a claude-only ephemeral
+    worker or the Windows box alongside a machine that has opencode)."""
+    kw.setdefault(
+        "providers", ProvidersConfig(definitions={"opencode": ProviderDef(type="opencode")})
+    )
+    kw.setdefault(
+        "machines",
+        [
+            Machine(name="claude-only", host="claude-only", repos=[REPO]),
+            Machine(
+                name="opencode-box", host="opencode-box", repos=[REPO],
+                capabilities=["provider:opencode"],
+            ),
+        ],
+    )
+    return make_config(**kw)
+
+
+def test_pick_machine_with_no_issue_labels_is_provider_blind_like_before():
+    """`issue_labels=None` (the default) must reproduce the pre-#1906
+    provider-blind pick byte-for-byte — every caller that doesn't opt in,
+    including the whole pre-#1906 test suite above."""
+    config = _mixed_fleet_config()
+    # Alphabetically "claude-only" would win a tie anyway, so pin the load
+    # onto it to prove this is really unpaused+repo filtering, not luck.
+    payload = {
+        "assignments": [
+            row(assignment_id="a", machine_name="opencode-box", status="running"),
+        ]
+    }
+    assert pick_machine(payload, REPO, config) == "claude-only"
+
+
+def test_pick_machine_routes_an_opencode_labelled_issue_to_the_capable_machine():
+    """#1906 acceptance: an issue resolving to opencode with no --machine
+    routes to the capable machine, never to the incapable one — even when
+    the incapable machine would otherwise win the least-loaded tie-break."""
+    config = _mixed_fleet_config(providers=ProvidersConfig(
+        definitions={"opencode": ProviderDef(type="opencode")},
+        labels={"harness:opencode": "opencode"},
+    ))
+    picked = pick_machine(
+        payload={}, repo=REPO, config=config, issue_labels=["harness:opencode"],
+    )
+    assert picked == "opencode-box"
+
+
+def test_pick_machine_choice_never_picks_the_incapable_machine_even_when_idle():
+    """The capable machine is busy and the incapable one is idle — the
+    provider-aware picker must still refuse the incapable one rather than
+    load-balancing onto it (the exact #1711 refusal this selection change
+    exists to avoid triggering)."""
+    config = _mixed_fleet_config(providers=ProvidersConfig(
+        definitions={"opencode": ProviderDef(type="opencode")},
+        labels={"harness:opencode": "opencode"},
+    ))
+    payload = {
+        "assignments": [
+            row(assignment_id="a", machine_name="opencode-box", status="running"),
+        ]
+    }
+    choice = pick_machine_choice(payload, REPO, config, issue_labels=["harness:opencode"])
+    assert choice.name == "opencode-box"
+    assert choice.no_capable_machine is False
+
+
+def test_pick_machine_choice_distinct_reason_when_no_machine_advertises_it():
+    """A fleet where NO machine advertises the resolved provider must report
+    the distinct 'no machine advertises' failure — not silently collapse
+    into the generic 'no host' empty-string return an operator can't tell
+    apart from 'repo unhosted'."""
+    providers = ProvidersConfig(
+        definitions={"opencode": ProviderDef(type="opencode")},
+        labels={"harness:opencode": "opencode"},
+    )
+    config = make_config(
+        machines=[Machine(name="claude-only", host="claude-only", repos=[REPO])],
+        providers=providers,
+    )
+    choice = pick_machine_choice({}, REPO, config, issue_labels=["harness:opencode"])
+    assert choice == MachineChoice(
+        provider_name="opencode", provider_reason=choice.provider_reason,
+        no_capable_machine=True,
+    )
+    assert choice.name == ""
+    assert "opencode" in choice.provider_reason
+
+
+def test_pick_machine_choice_still_reports_no_host_when_repo_is_unhosted():
+    """The OTHER empty-string case — nothing hosts the repo at all — must
+    stay distinguishable (no_capable_machine stays False) even when
+    issue_labels is supplied, since provider resolution never even ran."""
+    config = _mixed_fleet_config(machines=[])
+    choice = pick_machine_choice({}, REPO, config, issue_labels=["harness:opencode"])
+    assert choice == MachineChoice()
+
+
+def test_pick_machine_choice_paused_capable_machine_is_not_selected(monkeypatch):
+    """A capable-but-paused machine composes correctly with the provider
+    filter — pause and capability are two independent filters that must
+    both apply, not just whichever one a call site happened to remember."""
+    monkeypatch.setattr("coord.machine_pause.paused_set", lambda *a, **k: {"opencode-box"})
+    config = _mixed_fleet_config(providers=ProvidersConfig(
+        definitions={"opencode": ProviderDef(type="opencode")},
+        labels={"harness:opencode": "opencode"},
+    ))
+    choice = pick_machine_choice({}, REPO, config, issue_labels=["harness:opencode"])
+    assert choice.no_capable_machine is True
+    assert choice.name == ""
+
+
+def test_pick_machine_repo_level_provider_also_filters_without_a_label():
+    """The repo-level `Repo.provider` link (no `providers.labels` match
+    needed) still narrows candidates — #1906 isn't only reachable via
+    issue labels."""
+    config = _mixed_fleet_config(repo_provider="opencode")
+    assert (
+        pick_machine(payload={}, repo=REPO, config=config, issue_labels=[])
+        == "opencode-box"
+    )
+
+
+def test_project_resolves_provider_before_picking_a_capable_machine():
+    """End-to-end through `project()`: the issue's cached GitHub labels
+    (already part of the `/board` payload's `issues` list, #1906 needs no
+    extra I/O) resolve `providers.labels`, and the resulting `IssueState`
+    carries both the capability-aware pick and its provenance."""
+    config = _mixed_fleet_config(providers=ProvidersConfig(
+        definitions={"opencode": ProviderDef(type="opencode")},
+        labels={"harness:opencode": "opencode"},
+    ))
+    payload = {
+        "assignments": [],
+        "issues": [
+            {"repo_name": REPO, "number": 1392, "labels": ["harness:opencode"]},
+        ],
+    }
+    state = project(payload, REPO, 1392, config)
+    assert state.picked_machine == "opencode-box"
+    assert state.picked_machine_provider == "opencode"
+    assert "opencode" in state.picked_machine_provider_reason
+    assert state.picked_machine_no_capable is False
+
+
+def test_project_flags_no_capable_machine_distinctly_from_no_host():
+    config = make_config(
+        machines=[Machine(name="claude-only", host="claude-only", repos=[REPO])],
+        providers=ProvidersConfig(
+            definitions={"opencode": ProviderDef(type="opencode")},
+            labels={"harness:opencode": "opencode"},
+        ),
+    )
+    payload = {
+        "assignments": [],
+        "issues": [
+            {"repo_name": REPO, "number": 1392, "labels": ["harness:opencode"]},
+        ],
+    }
+    state = project(payload, REPO, 1392, config)
+    assert state.picked_machine == ""
+    assert state.picked_machine_no_capable is True
+    assert state.picked_machine_provider == "opencode"
 
 
 # ── fingerprint / flat dict ──────────────────────────────────────────────────

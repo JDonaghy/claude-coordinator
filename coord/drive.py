@@ -727,9 +727,33 @@ def preflight(
     lets the run proceed. *config* is likewise optional — ``None`` skips the
     usage gate entirely (no ``usage_gate`` section to consult), which is what
     every pre-#1466 test in this file's suite still passes.
+
+    #1906: ``state.picked_machine`` is now itself provider-capability-aware
+    (:func:`coord.drive_state.pick_machine_choice`, resolved once in
+    :func:`project`) whenever an auto-pick happens — this function no
+    longer needs to (and does not) resolve the provider itself; it only
+    reports the *result*, including the distinct "no capable machine" vs.
+    "no host at all" failure state on ``state``.
     """
     machine = opts.machine or state.picked_machine
     if not machine:
+        # #1906: an explicit `--machine` always wins (never reaches here —
+        # `opts.machine` short-circuits `or` above) and hits #1711's own
+        # refusal downstream in `coord.dispatch.dispatch()` instead, exactly
+        # like today. This branch is only the AUTO-pick failing, and it now
+        # has two distinct causes that must not collapse into one message:
+        # no unpaused machine hosts the repo at all, vs. at least one does
+        # but none advertise the resolved provider (`state.picked_machine`'s
+        # own `coord.drive_state.pick_machine_choice` already did the
+        # capability filtering — see `IssueState.picked_machine_no_capable`).
+        if state.picked_machine_no_capable:
+            raise DriveError(
+                f"no unpaused machine advertises provider "
+                f"{state.picked_machine_provider!r} for {state.repo} — pass "
+                "--machine, or add the capability to a machine's "
+                "coordinator.yml machines[].capabilities",
+                EXIT_USAGE,
+            )
         raise DriveError(
             f"no unpaused machine hosts {state.repo} — pass --machine",
             EXIT_USAGE,
@@ -2419,6 +2443,13 @@ class Driver:
 
         self.log(f"driving {self.repo} #{self.issue}")
         self.log(f"  machine        : {machine}")
+        if not self.opts.machine and state.picked_machine_provider_reason:
+            # #1906: only meaningful for an AUTO-picked machine — an
+            # explicit `--machine` never ran this selection's provider
+            # resolution (it wins outright; #1711's dispatch-time guard is
+            # the enforcement for it). Mirrors `coord assign --dry-run`'s
+            # own "provider: ..." line (`describe_provider_choice`).
+            self.log(f"  provider       : {state.picked_machine_provider_reason}")
         self.log(f"  acceptance     : {oracle.reason}")
         self.log(
             f"  test command   : {state.repo_test_command or '<none configured>'} "

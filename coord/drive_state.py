@@ -114,6 +114,20 @@ class IssueState:
     merge_aid: str = ""
 
     picked_machine: str = ""
+    # #1906: the provider `picked_machine` was actually filtered against
+    # (`""` when no candidate machine hosted `repo` at all — provider
+    # resolution never ran). `picked_machine_provider_reason` is
+    # `coord.providers.describe_provider_choice`'s provenance string, so
+    # `--dry-run` shows not just the winning provider but *why* (spec →
+    # `providers.labels` → repo → `providers.default`) — the same
+    # transparency `coord assign --dry-run` already gives a hand dispatch.
+    picked_machine_provider: str = ""
+    picked_machine_provider_reason: str = ""
+    # True when at least one unpaused machine hosts `repo` (so this is NOT
+    # the plain "no unpaused machine hosts {repo}" case) but NONE of them
+    # advertise `picked_machine_provider` — the distinct #1906 failure mode
+    # `preflight()` reports separately, per #1711's own refusal shape.
+    picked_machine_no_capable: bool = False
 
     # ── #1453: oracle-loop JIT slice authoring ──────────────────────────
     # `milestone_number` is the issue's own GitHub milestone (the `ms-NN`
@@ -244,9 +258,18 @@ def project(payload: dict, repo: str, issue: int, config: Any) -> IssueState:
     # already published on /board, no extra I/O (see IssueState's docstring
     # for the two source lists and their TUI-side counterparts).
     milestone_number = None
+    # #1906: the same cached `/board` `issues` row already carries this
+    # issue's GitHub labels (`coord.dao`'s `issues: {"labels"}` JSON column)
+    # — reused below by `pick_machine` to resolve the effective provider
+    # (`coord.providers.resolve_provider_name`'s `providers.labels` link,
+    # #1889) BEFORE picking a machine, so selection is capability-aware
+    # instead of discovering a mismatch only when #1711's dispatch-time
+    # guard refuses it. No extra I/O: `issues` is already part of *payload*.
+    issue_labels: list[str] = []
     for oi in payload.get("issues") or []:
         if oi.get("repo_name") == repo and oi.get("number") == issue:
             milestone_number = oi.get("milestone_number")
+            issue_labels = list(oi.get("labels") or [])
             break
 
     milestone_tracking_issue = None
@@ -269,6 +292,10 @@ def project(payload: dict, repo: str, issue: int, config: Any) -> IssueState:
             and a.get("type") == "test-author"
             and a.get("for_issue_number") == issue
         ]
+    )
+
+    _machine_pick = pick_machine_choice(
+        payload, repo, config, issue_labels=issue_labels,
     )
 
     return IssueState(
@@ -306,7 +333,10 @@ def project(payload: dict, repo: str, issue: int, config: Any) -> IssueState:
         merge_reason=(merge_entry or {}).get("reason") or "",
         merge_pr_url=(merge_entry or {}).get("pr_url") or "",
         merge_aid=(merge_entry or {}).get("assignment_id") or "",
-        picked_machine=pick_machine(payload, repo, config),
+        picked_machine=_machine_pick.name,
+        picked_machine_provider=_machine_pick.provider_name,
+        picked_machine_provider_reason=_machine_pick.provider_reason,
+        picked_machine_no_capable=_machine_pick.no_capable_machine,
         milestone_number=milestone_number,
         milestone_tracking_issue=milestone_tracking_issue,
         acceptance_author_aid=g(acceptance_author, "assignment_id"),
@@ -410,12 +440,53 @@ def _merge_entry(payload: dict, repo: str, issue: int) -> dict | None:
     }
 
 
-def pick_machine(payload: dict, repo: str, config: Any) -> str:
-    """Least-loaded unpaused machine that hosts *repo*, or ``""`` if none.
+@dataclass(frozen=True)
+class MachineChoice:
+    """The result of :func:`pick_machine_choice` — a picked machine name plus
+    enough provenance for :func:`coord.drive.preflight` to tell the two
+    "nothing to dispatch to" failure modes apart (#1906).
+
+    ``name`` is ``""`` in both failure modes: no unpaused machine hosts the
+    repo at all, or at least one does but none advertise the resolved
+    provider. ``no_capable_machine`` is what distinguishes them — see
+    ``IssueState.picked_machine_no_capable``'s docstring.
+    """
+
+    name: str = ""
+    provider_name: str = ""
+    provider_reason: str = ""
+    no_capable_machine: bool = False
+
+
+def pick_machine_choice(
+    payload: dict,
+    repo: str,
+    config: Any,
+    *,
+    issue_labels: list[str] | None = None,
+) -> MachineChoice:
+    """Least-loaded unpaused **and capable** machine that hosts *repo*.
 
     Deliberately simple — this is not ``coord plan``'s brain (which costs an
     LLM call).  Load is counted from the board's non-terminal rows, so a
     machine already running two workers loses to an idle peer.
+
+    #1906: *issue_labels* (``None`` skips provider resolution entirely,
+    reproducing the pre-#1906 provider-blind pick byte-for-byte — every
+    caller that doesn't pass it, including every pre-#1906 test) resolves
+    the effective provider (spec(None) -> ``providers.labels`` -> repo ->
+    ``providers.default``, :func:`coord.providers.resolve_provider_name`)
+    and narrows candidates to those :func:`coord.providers.
+    machine_supports_provider` agrees can run it — the SAME predicate
+    #1711's ``guard_provider_machine_capability`` uses to refuse a mismatch
+    at dispatch time. Selection now agrees with that gate instead of
+    discovering the mismatch from its refusal message after the fact.
+
+    An empty *issue_labels* list (the issue is real but carries no labels,
+    or isn't in the local `/board` issues cache yet) still resolves a
+    provider — spec/label just contribute nothing, same as ``None`` would,
+    but capability filtering still applies (repo/``providers.default`` can
+    still name a non-implicit provider).
     """
     try:
         from coord.machine_pause import paused_set  # noqa: PLC0415
@@ -430,13 +501,59 @@ def pick_machine(payload: dict, repo: str, config: Any) -> str:
             name = a.get("machine_name") or ""
             load[name] = load.get(name, 0) + 1
 
-    candidates = [
+    hosts = [
         m for m in config.machines if repo in (m.repos or []) and m.name not in paused
     ]
-    if not candidates:
-        return ""
-    candidates.sort(key=lambda m: (load.get(m.name, 0), m.name))
-    return candidates[0].name
+    if not hosts:
+        return MachineChoice()
+
+    candidates = hosts
+    provider_name = ""
+    provider_reason = ""
+    if issue_labels is not None:
+        from coord.providers import (  # noqa: PLC0415
+            describe_provider_choice,
+            machine_supports_provider,
+            resolve_provider_name,
+        )
+
+        repo_cfg = config.repo(repo)
+        repo_provider = repo_cfg.provider if repo_cfg is not None else None
+        provider_name = resolve_provider_name(
+            None, repo_provider, config.providers, issue_labels=issue_labels or None,
+        )
+        provider_reason = describe_provider_choice(
+            None, repo_provider, config.providers, issue_labels=issue_labels or None,
+        )
+        candidates = [
+            m for m in hosts
+            if machine_supports_provider(m, provider_name, config.providers)
+        ]
+        if not candidates:
+            return MachineChoice(
+                provider_name=provider_name,
+                provider_reason=provider_reason,
+                no_capable_machine=True,
+            )
+
+    candidates = sorted(candidates, key=lambda m: (load.get(m.name, 0), m.name))
+    return MachineChoice(
+        name=candidates[0].name,
+        provider_name=provider_name,
+        provider_reason=provider_reason,
+    )
+
+
+def pick_machine(
+    payload: dict, repo: str, config: Any, *, issue_labels: list[str] | None = None,
+) -> str:
+    """Thin string-returning wrapper around :func:`pick_machine_choice`.
+
+    Kept for callers (and the pre-#1906 test suite) that only want the
+    picked machine's name, not the provider provenance / failure-mode split
+    — see that function's docstring for the *issue_labels* contract.
+    """
+    return pick_machine_choice(payload, repo, config, issue_labels=issue_labels).name
 
 
 # ── board fetch (the one I/O boundary) ───────────────────────────────────────
