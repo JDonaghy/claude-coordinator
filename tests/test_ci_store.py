@@ -668,6 +668,62 @@ class TestGitHubCiRerunForPr:
             store.list_checks_for_pr("acme/api", 42)
         assert run.call_count == 3
 
+    def test_success_invalidates_the_jobs_cache_for_the_reran_run_ids(self) -> None:
+        """#1892 non-blocking finding: `gh run rerun` reruns the SAME Actions
+        run id, so a cached `list_jobs_for_run` entry for that run id must
+        not survive a successful rerun — otherwise a `list_jobs_for_run`
+        call shortly after the rerun (within `cache_ttl`) could hand back
+        stale pre-rerun job/step detail, which paired with a fresh
+        `list_checks_for_pr` re-read is exactly the "launders a real
+        failure into infrastructure" hazard the issue warns against."""
+        jobs_payload = json.dumps({
+            "total_count": 1,
+            "jobs": [{
+                "id": 1, "run_id": 1, "name": "test",
+                "status": "completed", "conclusion": "cancelled",
+                "runner_name": "", "steps": [],
+            }],
+        })
+        store = GitHubCi(cache_ttl=60.0)
+        with patch("coord.ci_github.subprocess.run") as run:
+            run.side_effect = [
+                _gh_result(jobs_payload),  # list_jobs_for_run, pre-rerun
+                _gh_result(self._payload(["1"])),  # list_checks_for_pr (inside rerun_for_pr)
+                _gh_result(""),  # gh run rerun 1
+                _gh_result(jobs_payload),  # list_jobs_for_run, post-rerun — must NOT be cached
+            ]
+            store.list_jobs_for_run("acme/api", "1")
+            store.rerun_for_pr("acme/api", 42)
+            store.list_jobs_for_run("acme/api", "1")
+        assert run.call_count == 4
+
+    def test_failed_rerun_leaves_the_jobs_cache_alone(self) -> None:
+        """A rerun that didn't actually succeed has nothing stale to worry
+        about invalidating — mirrors the existing checks-cache behavior
+        (only a success invalidates)."""
+        jobs_payload = json.dumps({
+            "total_count": 1,
+            "jobs": [{
+                "id": 1, "run_id": 1, "name": "test",
+                "status": "completed", "conclusion": "cancelled",
+                "runner_name": "", "steps": [],
+            }],
+        })
+        store = GitHubCi(cache_ttl=60.0)
+        with patch("coord.ci_github.subprocess.run") as run:
+            run.side_effect = [
+                _gh_result(jobs_payload),  # list_jobs_for_run, pre-rerun
+                _gh_result(self._payload(["1"])),  # list_checks_for_pr
+                _gh_result("", returncode=1, stderr="boom"),  # gh run rerun fails
+                # list_jobs_for_run below must be served from cache — no
+                # further subprocess call queued.
+            ]
+            store.list_jobs_for_run("acme/api", "1")
+            ok = store.rerun_for_pr("acme/api", 42)
+            assert ok is False
+            store.list_jobs_for_run("acme/api", "1")
+        assert run.call_count == 3
+
 
 class TestGitHubCiListJobsForRun:
     """#1892: `gh api repos/{repo}/actions/runs/{id}/jobs` job/step detail —

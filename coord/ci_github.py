@@ -207,9 +207,15 @@ class GitHubCi:
         Returns ``True`` only when at least one run id was found *and* every
         rerun call it issued exited zero. Returns ``False`` when there was
         nothing rerunnable (no checks, or none with a readable run id) or any
-        rerun call failed. Invalidates this PR's cache entry on any success
-        so the next :meth:`list_checks_for_pr` reflects the freshly-queued
-        run instead of the briefly-cached pre-rerun snapshot.
+        rerun call failed. Invalidates this PR's checks cache entry AND
+        (#1892) any cached :meth:`list_jobs_for_run` entry for the run ids
+        being rerun on any success, so neither the next
+        :meth:`list_checks_for_pr` nor the next :meth:`list_jobs_for_run`
+        can hand back a briefly-cached pre-rerun snapshot — `gh run rerun`
+        reruns the SAME Actions run id, so a stale `_jobs_cache` hit within
+        `cache_ttl` could otherwise launder a real failure into
+        "infrastructure" by pairing a fresh check re-read with stale
+        job/step detail from before the rerun.
         """
         checks = self.list_checks_for_pr(repo, number)
         run_ids = sorted({c.run_id for c in checks if c.run_id})
@@ -226,6 +232,8 @@ class GitHubCi:
                 all_ok = False
         if any_ok:
             self.invalidate(repo, number)
+            for run_id in run_ids:
+                self._jobs_cache.pop((repo, str(run_id)), None)
         return all_ok and any_ok
 
     def list_jobs_for_run(self, repo: str, run_id: str) -> list["JobRun"]:
@@ -255,7 +263,12 @@ class GitHubCi:
     def _fetch_jobs(self, repo: str, run_id: str) -> list["JobRun"]:
         try:
             raw = github_ops.get_run_jobs(repo, run_id)
-        except (FileNotFoundError, subprocess.TimeoutExpired, RuntimeError, ValueError):
+        except (RuntimeError, ValueError):
+            # `github_ops.get_run_jobs` only ever raises `RuntimeError`
+            # (`GhError`, itself a `RuntimeError` subclass, already wraps
+            # gh-not-found/timeout/OSError inside `_gh`/`_gh_json`) or
+            # `ValueError` — no need to duplicate the lower-level exception
+            # types here.
             return []
         if not isinstance(raw, list):
             return []

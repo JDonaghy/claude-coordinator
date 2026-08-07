@@ -5276,6 +5276,59 @@ class TestProcessCiInfraAutoRerun:
         assert "checks failed:" in items[0].error
         assert "auto-rerun budget exhausted" in items[0].error
 
+    def test_pending_between_two_verdictless_failures_does_not_reset_the_budget(
+        self, caplog
+    ) -> None:
+        """Regression: a tick that observes the rerun still in-flight (the
+        realistic outcome — a real Actions run takes real wall-clock minutes
+        to resolve, so the tick right after this same code triggers a rerun
+        will almost always see it as pending, not yet completed) must NOT
+        reset `ci_infra_reruns` to 0. Only a genuine resolution (nothing
+        failed AND nothing pending) may reset it. Otherwise a workflow
+        genuinely broken at "Set up job" fails -> reruns(1) ->
+        pending(would wrongly reset to 0) -> fails again -> reruns(1 again)
+        forever, never reaching MAX_CI_INFRA_RERUNS and never parking for a
+        human — exactly the loop #1892 requires a hard cap against."""
+        import logging
+        from coord.merge_queue import MAX_CI_INFRA_RERUNS
+        caplog.set_level(logging.INFO, logger="coord.merge_queue")
+        items = [_q("w1", pr=99)]
+        gh = FakeGh()
+        ci = self._Ci(checks=self._verdictless_checks(), jobs_by_run=self._verdictless_jobs())
+
+        # Tick 1: verdictless failure -> auto-rerun #1.
+        process(items, gh, ci_store=ci)
+        assert items[0].ci_infra_reruns == 1
+
+        # Tick 2: the rerun triggered above hasn't resolved yet — it's
+        # still queued/in-progress, not failed. This must NOT reset the
+        # budget just because `failed_checks` is currently empty.
+        pending_check = _check("e2e", status="in_progress", conclusion=None)
+        pending_check.run_id = "999"
+        ci._checks = [pending_check]
+        events = process(items, gh, ci_store=ci)
+        kinds = [e.kind for e in events]
+        assert "checks_pending" in kinds
+        assert items[0].ci_infra_reruns == 1  # unchanged — NOT reset to 0
+        assert ci.rerun_calls == [("acme/api", 99)]  # no extra rerun issued
+
+        # Tick 3: the (still-broken) workflow fails again -> auto-rerun #2,
+        # correctly continuing the SAME budget rather than starting over.
+        ci._checks = self._verdictless_checks()
+        process(items, gh, ci_store=ci)
+        assert items[0].ci_infra_reruns == 2
+        assert len(ci.rerun_calls) == 2
+
+        # Tick 4: budget now exhausted -> falls through to a human, not a
+        # third auto-rerun.
+        events = process(items, gh, ci_store=ci)
+        assert len(ci.rerun_calls) == 2  # unchanged — cap held
+        assert items[0].ci_infra_reruns == MAX_CI_INFRA_RERUNS
+        kinds = [e.kind for e in events]
+        assert "checks_failed" in kinds
+        assert "ci_infra_rerun" not in kinds
+        assert "auto-rerun budget exhausted" in items[0].error
+
     def test_a_genuine_failure_is_never_auto_rerun(self) -> None:
         """Acceptance criterion: a PR with ANY genuinely-failed check
         behaves exactly as today — plain checks_failed, no rerun call."""

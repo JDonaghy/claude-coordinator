@@ -4029,13 +4029,6 @@ def process(
                     entry.error = msg
                     events.append(MergeEvent(entry, "checks_failed", msg))
                     continue  # #292: skip, don't halt the group
-                # #1892: nothing is failing any more (this line is only
-                # reached once `if failed:` above did NOT fire) — whatever
-                # verdictless run the auto-rerun budget was tracking has
-                # resolved one way or another, so a LATER failure (a fresh
-                # push, a flaky green-then-red) starts its own budget from
-                # zero rather than inheriting an unrelated exhausted count.
-                entry.ci_infra_reruns = 0
                 pending = in_flight_checks(checks)
                 if pending:
                     summary = ", ".join(c.name for c in pending)
@@ -4049,6 +4042,29 @@ def process(
                     entry.error = msg
                     events.append(MergeEvent(entry, "checks_pending", msg))
                     continue  # #292: skip, don't halt the group
+                # #1892: this line is only reached once BOTH `if failed:`
+                # and `if pending:` above did not fire — a genuine
+                # resolution (checks non-empty*, nothing failed, nothing
+                # pending), not merely "not currently failed". Resetting on
+                # "not failed" alone was a bug: the tick right after this
+                # same code triggers an auto-rerun almost always observes
+                # the rerun as still pending (a real Actions run takes real
+                # wall-clock minutes), which would zero the budget before
+                # the rerun itself ever resolves — so a workflow genuinely
+                # broken at "Set up job" would fail, rerun, get reset to 0
+                # while pending, fail again, rerun again... forever, never
+                # reaching MAX_CI_INFRA_RERUNS and never parking for a
+                # human. Whatever verdictless run the budget was tracking
+                # has now actually resolved one way or another, so a LATER
+                # failure (a fresh push, a flaky green-then-red) starts its
+                # own budget from zero rather than inheriting an unrelated
+                # exhausted count.
+                # * `checks` can still be `[]` here for a repo that doesn't
+                # declare CI at all (`_ci_expects_checks` false, so the
+                # `checks_absent` branch above didn't fire) — resetting in
+                # that case is harmless since such an entry can never have
+                # accrued a nonzero `ci_infra_reruns` to begin with.
+                entry.ci_infra_reruns = 0
                 # #1851: a green CI result can itself be stale relative to the
                 # base — see `_ci_checks_are_stale`'s docstring. Named
                 # distinctly (`checks_stale`) from checks_failed/
