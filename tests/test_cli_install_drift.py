@@ -162,7 +162,9 @@ def test_stale_banner_fires_past_commit_threshold(tmp_path: Path) -> None:
     text = output_and_stderr(result)
     assert "STALE INSTALL" in text
     assert "5 commit(s)" in text
-    assert "pip install --upgrade claude-coordinator" in text
+    # #1237: the hint names the `[server]` extra — a checkout stale enough to
+    # trip this banner is a coordinator/agent host, which needs the full stack.
+    assert "pip install --upgrade 'claude-coordinator[server]'" in text
     # The escalated banner replaces the mild message, it doesn't stack with it.
     assert "Edits to the source tree will NOT reach the CLI" not in text
 

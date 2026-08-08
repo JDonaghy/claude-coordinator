@@ -276,7 +276,11 @@ class TestUpdateEndpoint:
 
         pip_cmds = [c for c in calls if "pip" in " ".join(c) or "install" in c]
         assert pip_cmds, "expected a pip call"
-        assert any("claude-coordinator==9.9.9" in c for c in pip_cmds[0]), pip_cmds
+        # #1237: the spec carries the `[server]` extra — an agent must
+        # reinstall itself with the server runtime, not the client base.
+        assert any(
+            "claude-coordinator[server]==9.9.9" in c for c in pip_cmds[0]
+        ), pip_cmds
         server.shutdown()
 
     def test_update_omits_pin_when_no_target_version(self, tmp_path: Path) -> None:
@@ -298,7 +302,8 @@ class TestUpdateEndpoint:
 
         pip_cmds = [c for c in calls if "install" in c]
         assert pip_cmds, "expected a pip call"
-        assert "claude-coordinator" in pip_cmds[0]
+        # #1237: unpinned, but still carrying the mandatory `[server]` extra.
+        assert "claude-coordinator[server]" in pip_cmds[0]
         assert not any("==" in arg for arg in pip_cmds[0])
         server.shutdown()
 

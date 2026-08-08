@@ -18,20 +18,20 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Software Development :: Build Tools",
 ]
+# #1237 (PKG-1): the BASE install is a *client*. It must stay small enough
+# that `pip install claude-coordinator` gives a third party a working CLI for
+# driving a remote fleet without dragging in a web server. Anything only the
+# agent/serve/web/brain runtime needs belongs in the `server` extra below, and
+# must be imported function-locally (never at module scope on a path
+# `import coord.cli` can reach) — tests/test_client_base_install.py is the
+# regression gate for exactly that.
 dependencies = [
     "click>=8.1",
     "pyyaml>=6.0",
     "httpx>=0.27",
-    "starlette>=0.37",
-    "uvicorn>=0.30",
-    # Required for uvicorn to perform a real WebSocket upgrade (101) rather
-    # than silently answering with a plain HTTP 200 (#1216). Pinned directly
-    # rather than via the `uvicorn[standard]` extra, which also pulls in
-    # httptools/uvloop that /ws/terminal doesn't need.
-    "websockets>=12.0",
-    "psutil>=5.9",
     # Cross-platform state-root resolution (#1156): OS-native app-data dirs on
-    # Windows/macOS while POSIX keeps the legacy ~/.coord path.
+    # Windows/macOS while POSIX keeps the legacy ~/.coord path. Client-side —
+    # every command resolves the state root, so this stays in the base.
     "platformdirs>=4.0",
 ]
 
@@ -41,7 +41,34 @@ Repository = "https://github.com/JDonaghy/claude-coordinator"
 Issues = "https://github.com/JDonaghy/claude-coordinator/issues"
 
 [project.optional-dependencies]
+# #1237 (PKG-1): the server runtime — `coord serve`, `coord web`, `coord
+# agent`. Every remote agent and the board daemon host need this; a pure
+# client does not. `pip install 'claude-coordinator[server]'`.
+#
+# INVARIANT: every agent venv and the daemon host MUST install the extra —
+# `pip install 'claude-coordinator[server]'`, not the bare name. install-agent.sh,
+# scripts/azure-workers/provision-worker.sh and `coord agent update`
+# (coord/agent_app.py) all carry the extra for this reason. A bare base
+# install on an agent still *imports* fine; it fails at `coord agent` with the
+# actionable message from `coord.commands._common.server_extra_guard`.
+server = [
+    "starlette>=0.37",
+    "uvicorn>=0.30",
+    # Required for uvicorn to perform a real WebSocket upgrade (101) rather
+    # than silently answering with a plain HTTP 200 (#1216). Pinned directly
+    # rather than via the `uvicorn[standard]` extra, which also pulls in
+    # httptools/uvloop that /ws/terminal doesn't need.
+    "websockets>=12.0",
+    # Agent-side process/host metrics behind GET /metrics (coord/agent_app.py).
+    "psutil>=5.9",
+]
+# Convenience alias: "give me everything a full node runs".
+all = ["claude-coordinator[server]"]
 dev = [
+    # The test suite exercises serve_app/agent_app/dashboard end to end, so a
+    # dev install is necessarily a full-fat install. Self-referential extra
+    # (PEP 621) so there is exactly one list of server deps to keep current.
+    "claude-coordinator[server]",
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     # Parallel test execution. The suite is the dominant cost of the Test gate

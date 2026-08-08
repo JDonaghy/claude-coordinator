@@ -23,6 +23,13 @@ from coord.events import stream_assignment_log
 from coord.openapi import build_spec, dataclass_schema, openapi_and_docs_routes
 
 
+#: What `POST /update` asks pip to install (#1237). An agent *is* the server
+#: half of the package, so it must reinstall itself WITH the `[server]` extra —
+#: a bare `claude-coordinator` upgrade would, on a fresh venv, leave the agent
+#: without starlette/uvicorn and dead on the next restart.
+AGENT_PKG_NAME = "claude-coordinator[server]"
+
+
 def _installed_version() -> str | None:
     """Return the currently-installed claude-coordinator version.
 
@@ -576,7 +583,9 @@ def build_app(
 
         Detects whether the install is editable (``pip install -e .``) and
         runs ``git pull --ff-only`` in the project directory in that case.
-        For regular installs it runs ``pip install --upgrade claude-coordinator``.
+        For regular installs it runs ``pip install --upgrade
+        claude-coordinator[server]`` (#1237 — the extra is mandatory on an
+        agent; see :data:`AGENT_PKG_NAME`).
         Either way the process is restarted with ``os.execv`` after the upgrade
         succeeds.  The upgrade and restart run in a daemon-less background
         thread so the HTTP response is returned to the caller before the
@@ -643,9 +652,9 @@ def build_app(
                     # turns "PyPI hasn't propagated yet" into a hard pip
                     # failure instead of a quiet resolve-to-old-version.
                     pkg_spec = (
-                        f"claude-coordinator=={target_version}"
+                        f"{AGENT_PKG_NAME}=={target_version}"
                         if target_version
-                        else "claude-coordinator"
+                        else AGENT_PKG_NAME
                     )
                     result = subprocess.run(
                         [

@@ -11,7 +11,12 @@ from pathlib import Path
 import click
 
 
-from coord.commands._common import SERVE_PORT, _CONFIG_OPTION, _load_config
+from coord.commands._common import (
+    SERVE_PORT,
+    _CONFIG_OPTION,
+    _load_config,
+    server_extra_guard,
+)
 
 
 def _print_housekeeping_result(resp: dict) -> None:
@@ -388,9 +393,11 @@ def web(
     fixture_path: Path | None,
     dist_path: Path | None,
 ) -> None:
-    import uvicorn
-    from coord.dashboard.server import build_app
-    from coord.dashboard.terminal import resolve_web_token
+    # #1237: function-local + guarded — see _start_agent_server for why.
+    with server_extra_guard("web"):
+        import uvicorn
+        from coord.dashboard.server import build_app
+        from coord.dashboard.terminal import resolve_web_token
 
     fixture = None
     if fixture_path is not None:
@@ -470,12 +477,14 @@ def web(
 
 
 def serve(config_path: Path, bind_host: str, bind_port: int, token: str | None) -> None:
-    import uvicorn
+    # #1237: function-local + guarded — see _start_agent_server for why.
+    with server_extra_guard("serve"):
+        import uvicorn
 
-    from coord.dao import SqliteStore
-    from coord.db import DB_PATH
-    from coord.serve_app import build_app as build_serve_app
-    from coord.serve_app import resolve_serve_token
+        from coord.dao import SqliteStore
+        from coord.db import DB_PATH
+        from coord.serve_app import build_app as build_serve_app
+        from coord.serve_app import resolve_serve_token
 
     cfg = _load_config(config_path)
     token = resolve_serve_token(token)

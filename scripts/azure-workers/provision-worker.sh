@@ -151,7 +151,9 @@ log "8/9  coord venv (PyPI, NEVER editable) + repo clones + warm caches"
 # so released versions never propagate. Do not "improve" this to pip install -e.
 as_coord "python3 -m venv ~/.coord-venv"
 as_coord "~/.coord-venv/bin/pip install --upgrade pip -q"
-as_coord "~/.coord-venv/bin/pip install --upgrade claude-coordinator -q"
+# #1237: the `[server]` extra is mandatory on an agent — the base package is a
+# client-only CLI and `coord agent` there refuses to boot.
+as_coord "~/.coord-venv/bin/pip install --upgrade 'claude-coordinator[server]' -q"
 as_coord "~/.coord-venv/bin/coord version"
 
 as_coord "mkdir -p ~/src"
