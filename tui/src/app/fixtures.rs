@@ -126,6 +126,10 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         drive_queue_overlay_open: false,
         drive_queue_sel: 0,
         pending_drive_queue_after: None,
+        queue_sel: 0,
+        queue_scroll: 0,
+        queue_sort: None,
+        queue_table_layout: std::cell::RefCell::new(None),
         dialog_layout: std::cell::RefCell::new(None),
         pending_restart: None,
         machine_last_contact: std::collections::HashMap::new(),
@@ -384,6 +388,35 @@ pub fn make_app_with_audit_json(data: BoardData, audit_json: &str) -> CoordApp {
     let mut app = make_test_app(data);
     if let Ok(page) = serde_json::from_str::<super::types::AuditPage>(audit_json) {
         app.audit_page = Some(page);
+    }
+    app
+}
+
+/// #1866 (Q-1) data-model seam: build a [`CoordApp`] whose `/board` payload
+/// carries a drive queue, from a raw JSON array shaped exactly like
+/// `/board`'s own `drive_queue` key (OpenAPI `BoardDriveQueueEntry`, i.e. a
+/// raw `drive_queue` table dump — note `after_json`, not `after`).
+///
+/// Deliberately takes **JSON rather than a `Vec<BoardDriveQueueEntry>`**:
+/// that type is `pub(crate)`, so a `pub fn` accepting it would not compile
+/// (E0446), and going through the wire shape means a fixture that drifts
+/// from the daemon's payload fails here instead of rendering a plausible
+/// lie. Same posture as [`make_app_with_audit_json`].
+///
+/// The Queue panel carries no fetch of its own — `/board` already ships this
+/// data and the existing poll refreshes it — so unlike
+/// [`make_app_with_reports`] there is nothing here to mark as "already
+/// fetched".
+///
+/// Malformed JSON is a silent no-op (the panel then renders its own empty
+/// state) rather than a panic — assert on the resulting screen, not on this
+/// function's return.
+pub fn make_app_with_drive_queue(data: BoardData, drive_queue_json: &str) -> CoordApp {
+    let mut app = make_test_app(data);
+    if let Ok(entries) =
+        serde_json::from_str::<Vec<super::types::BoardDriveQueueEntry>>(drive_queue_json)
+    {
+        app.data.drive_queue = entries;
     }
     app
 }

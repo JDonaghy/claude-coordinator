@@ -2315,6 +2315,32 @@ pub struct CoordApp {
     /// (submit) or Esc (cancel), same posture as
     /// `pending_milestone_row_input`.
     pending_drive_queue_after: Option<PendingDriveQueueAfter>,
+    /// #1866 (Q-1): selected row index into `queue_rows()` — the Queue
+    /// panel's own *filtered, possibly re-sorted* row set, which is NOT the
+    /// same index space as `drive_queue_sel` above (that one indexes the
+    /// overlay's unfiltered `drive_queue_entries()`). Kept separate so the
+    /// two surfaces can't yank each other's cursor around.
+    queue_sel: usize,
+    /// #1866: vertical scroll offset into the Queue grid, kept in step with
+    /// `queue_sel` by `fix_queue_scroll` and driven directly by the wheel
+    /// and the scrollbar track.
+    queue_scroll: usize,
+    /// #1866: which grid column is sorted and in which direction, or `None`
+    /// for the queue's own run (`position`) order. Toggled by a header click
+    /// (`queue_sort_by_column`). View state over a live row set, never
+    /// persisted — the same posture as `reports_sort`.
+    queue_sort: Option<(usize, SortDirection)>,
+    /// #1866: the most recently painted Queue-grid geometry **and the rect
+    /// it was painted into**, cached so `events.rs` can route a click
+    /// without a `Backend` handle.
+    ///
+    /// The rect is part of the cache for the reason `reports_table_layout`
+    /// documents and `audit_table_layout` gets away with ignoring: this
+    /// table need not start at the main panel's origin, so a bare
+    /// `pos - main_b` would mis-hit-test. Set to `None` at the top of
+    /// `render_queue_panel`, so a click can never route against a table
+    /// that isn't on screen.
+    queue_table_layout: std::cell::RefCell<Option<(Rect, DataTableLayout)>>,
     /// Cached `DialogLayout` from the last prompt-dialog render — used for
     /// click hit-testing on dialog buttons.  Populated while any
     /// `pending_*` prompt dialog is visible; cleared when it dismisses.
@@ -3536,6 +3562,10 @@ impl CoordApp {
             drive_queue_overlay_open: false,
             drive_queue_sel: 0,
             pending_drive_queue_after: None,
+            queue_sel: 0,
+            queue_scroll: 0,
+            queue_sort: None,
+            queue_table_layout: std::cell::RefCell::new(None),
             dialog_layout: std::cell::RefCell::new(None),
             pending_restart: None,
             machine_last_contact: std::collections::HashMap::new(),
@@ -3924,6 +3954,18 @@ impl CoordApp {
                     icon: "▤".into(),
                     tooltip: "Reports".into(),
                     title: "REPORTS".into(),
+                },
+                // #1866 (Q-1): Queue panel — the live drive-queue grid.
+                // `⇅` (up-down arrow) is the reorder affordance that is the
+                // point of this panel, and collides with none of the icons
+                // above (B M ▶ >_ ▦ ≣ ◆ ◉ § ▤) or the pinned ⚙. Deliberately
+                // NOT `≣`, which is already Merge Queue — two queues with
+                // one glyph is how an activity bar stops being scannable.
+                PanelDefinition {
+                    id: WidgetId::new("panel:queue"),
+                    icon: "⇅".into(),
+                    tooltip: "Queue".into(),
+                    title: "QUEUE".into(),
                 },
             ],
         )
@@ -7802,6 +7844,17 @@ impl CoordApp {
             } else {
                 " j/k=section  Space=collapse  Tab=field  ←/→=value  \
                  Enter=run  r=re-run  q=quit "
+                    .to_string()
+            }
+        } else if self.active_view == SidebarView::Queue {
+            // #1866: the two hint sets are "there is a queue" and "there
+            // isn't" — the reorder/remove/unblock verbs are all row-scoped,
+            // so advertising them over an empty grid would be a lie.
+            if self.queue_rows().is_empty() {
+                " drive queue is empty  q=quit ".to_string()
+            } else {
+                " j/k=nav  J/K=reorder  x=remove  u=unblock  r=resume  \
+                 click header=sort  right-click=menu  q=quit "
                     .to_string()
             }
         } else {

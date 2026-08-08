@@ -303,7 +303,11 @@ impl CoordApp {
             // section's own form (collapsing a section must hide it) — a
             // panel-level toolbar button would be a second, always-visible
             // trigger with no section to bind it to.
-            | SidebarView::Reports => return None,
+            | SidebarView::Reports
+            // #1866: Queue's verbs are all row-scoped (J/K reorder, x/u/r,
+            // right-click menu) — a panel-level toolbar button would have no
+            // row to bind to, exactly as for Reports above.
+            | SidebarView::Queue => return None,
         };
 
         Some(Toolbar {

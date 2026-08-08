@@ -1022,6 +1022,581 @@ impl CoordApp {
         self.dispatch_drive_queue_move(&repo, issue, to);
         self.drive_queue_move_selection(delta as isize);
     }
+
+    // ── #1866 (Q-1): the Queue panel ─────────────────────────────────────
+    //
+    // A live `DataTable` grid over the same `data.drive_queue` the overlay
+    // above reads. Everything below is *presentation and routing*: the
+    // entries, the predicates, the colours and — crucially — the write seam
+    // are all the ones already defined in this module, so the panel and the
+    // overlay can never disagree about what the queue is or what a verb does.
+    //
+    // **No fetch.** `/board` already carries `drive_queue` and the existing
+    // `start_data_load` poll refreshes it every `settings.refresh_cadence`.
+    // Unlike Reports (#1741) and Audit (#1039) there is deliberately no
+    // view-gated fetch block in `settings_ui.rs::run_periodic_work` and no
+    // `spawn_*` for this panel — that would be a second source of truth for
+    // data already in memory.
+
+    /// The Queue grid's columns. Index order **is** the `DataTable` column
+    /// order and the index `queue_sort` refers to, so this table and the
+    /// `QUEUE_COL_*` constants below must move together.
+    ///
+    /// Shape taken from `drive-queue-status` (`coord/reports.py`) minus what
+    /// a live *pending* view has no use for. `Reason` carries by far the
+    /// heaviest weight on purpose: on a stalled entry `last_reason` is the
+    /// whole story, and a column too narrow to read it turns the panel back
+    /// into "go and run the CLI".
+    pub(crate) const QUEUE_COLUMNS: &'static [(&'static str, f32, ColumnAlign)] = &[
+        ("#", 0.5, ColumnAlign::Right),
+        ("Issue", 1.6, ColumnAlign::Left),
+        ("Title", 3.0, ColumnAlign::Left),
+        ("State", 1.0, ColumnAlign::Left),
+        ("Machine", 1.2, ColumnAlign::Left),
+        ("Tries", 0.6, ColumnAlign::Right),
+        ("After", 1.4, ColumnAlign::Left),
+        ("Hold", 0.9, ColumnAlign::Left),
+        ("Reason", 4.0, ColumnAlign::Left),
+    ];
+
+    /// Index of the `#` (position) column — sorted numerically.
+    pub(crate) const QUEUE_COL_POSITION: usize = 0;
+    /// Index of the `Tries` (attempts) column — sorted numerically.
+    pub(crate) const QUEUE_COL_TRIES: usize = 5;
+
+    /// `DataTable` columns from [`Self::QUEUE_COLUMNS`].
+    fn queue_columns() -> Vec<Column> {
+        Self::QUEUE_COLUMNS
+            .iter()
+            .map(|(title, weight, align)| Column {
+                title: (*title).to_string(),
+                width: ColumnWidth::Flex(*weight),
+                align: *align,
+            })
+            .collect()
+    }
+
+    /// The rows the Queue panel renders: every **non-terminal** entry, in
+    /// `queue_sort` order (the queue's own run order when unsorted).
+    ///
+    /// `done` is the only state excluded. `blocked` — and any state a newer
+    /// daemon invents, `failed` included — is non-terminal *to the operator*:
+    /// those are precisely the entries that have stopped and need a human,
+    /// and a live view that hides one is the same defect #1855 fixes in the
+    /// report's summary line.
+    pub(crate) fn queue_rows(&self) -> Vec<QueueRow> {
+        let mut rows: Vec<QueueRow> = self
+            .drive_queue_entries()
+            .into_iter()
+            .filter(|e| is_pending(e))
+            .map(|e| self.queue_row(e))
+            .collect();
+        if let Some((col, dir)) = self.queue_sort {
+            // Stable, so ties keep the queue's own run order — the
+            // meaningful secondary key for every column here.
+            rows.sort_by(|a, b| queue_compare_rows(a, b, col, dir));
+        }
+        rows
+    }
+
+    /// Project one wire entry into its rendered cells plus the raw values
+    /// the grid sorts, reorders and builds a row menu from.
+    fn queue_row(&self, e: &BoardDriveQueueEntry) -> QueueRow {
+        let or_dash = |s: String| {
+            if s.is_empty() {
+                QUEUE_EMPTY_CELL.to_string()
+            } else {
+                s
+            }
+        };
+        QueueRow {
+            repo_name: e.repo_name.clone(),
+            issue_number: e.issue_number,
+            position: e.position,
+            attempts: e.attempts,
+            state: e.state.clone(),
+            held: is_holding(e),
+            cells: vec![
+                e.position.to_string(),
+                e.key(),
+                or_dash(self.queue_issue_title(&e.repo_name, e.issue_number)),
+                or_dash(e.state.clone()),
+                or_dash(e.machine.clone().unwrap_or_default()),
+                e.attempts.to_string(),
+                or_dash(e.after.join(", ")),
+                queue_hold_cell(e),
+                or_dash(e.last_reason.clone()),
+            ],
+        }
+    }
+
+    /// Issue title for a queued entry, from whatever this client already
+    /// holds: the Board's own issue cache, then the Pipeline roster, then
+    /// the assignment list.
+    ///
+    /// Empty when none of them knows it — `drive_queue` is a raw table dump
+    /// and carries no title, and adding a fetch for one would be exactly the
+    /// second source of truth this panel exists to avoid. The caller renders
+    /// an em dash for that case rather than a blank, so "we don't know" and
+    /// "the column failed to paint" don't look identical.
+    fn queue_issue_title(&self, repo: &str, issue: i64) -> String {
+        let Ok(n) = u64::try_from(issue) else {
+            return String::new();
+        };
+        for (r, groups) in &self.board_issues_cache {
+            if r != repo {
+                continue;
+            }
+            if let Some(g) = groups
+                .iter()
+                .find(|g| g.issue_number == n && !g.issue_title.is_empty())
+            {
+                return g.issue_title.clone();
+            }
+        }
+        if let Some(p) = self.pipeline_issues.iter().find(|p| {
+            p.number == n && p.coord_repo.as_deref() == Some(repo) && !p.title.is_empty()
+        }) {
+            return p.title.clone();
+        }
+        self.data
+            .assignments
+            .iter()
+            .find(|a| a.repo == repo && a.issue_number == n && !a.issue_title.is_empty())
+            .map(|a| a.issue_title.clone())
+            .unwrap_or_default()
+    }
+
+    /// `DataTable` body rows, coloured by wire `state`.
+    fn queue_data_rows(rows: &[QueueRow]) -> Vec<DataRow> {
+        rows.iter()
+            .map(|r| {
+                // Straight from the overlay's own palette so two surfaces
+                // onto one queue can never disagree about what red means.
+                // An unrecognised state renders neutral rather than silently
+                // green (#1485) — but it IS rendered.
+                let (fg, _bg) = dq_state_colors(&r.state);
+                DataRow {
+                    cells: r
+                        .cells
+                        .iter()
+                        .map(|c| StyledText {
+                            spans: vec![StyledSpan::with_fg(c.clone(), fg)],
+                        })
+                        .collect(),
+                    decoration: Decoration::Normal,
+                }
+            })
+            .collect()
+    }
+
+    /// Sidebar for the Queue panel: the same aggregate reading
+    /// [`summarize_drive_queue`] gives the status bar, spelled out one count
+    /// per row. Read-only — every verb lives on the grid.
+    pub(crate) fn queue_sidebar(&self) -> ListView {
+        let s = summarize_drive_queue(&self.data.drive_queue);
+        let pending = self.queue_rows().len();
+        let mut items = vec![activity_item(
+            &format!(
+                "  {pending} pending entr{}",
+                if pending == 1 { "y" } else { "ies" }
+            ),
+            Color::rgb(160, 160, 160),
+        )];
+        items.push(activity_item(
+            &format!("  {} running", s.running),
+            dq_state_colors(QUEUE_STATE_RUNNING).0,
+        ));
+        items.push(activity_item(
+            &format!("  {} waiting ({} eligible)", s.waiting, s.eligible),
+            dq_state_colors(QUEUE_STATE_WAITING).0,
+        ));
+        if s.blocked > 0 {
+            items.push(activity_item(
+                &format!("  {} blocked", s.blocked),
+                dq_state_colors(QUEUE_STATE_BLOCKED).0,
+            ));
+        }
+        if s.held > 0 {
+            items.push(activity_item(
+                &format!("  {} held (deploy gate)", s.held),
+                Color::rgb(255, 210, 100),
+            ));
+        }
+        ListView {
+            id: WidgetId::new("queue-sidebar"),
+            title: Some(StyledText::plain(" QUEUE ")),
+            items,
+            selected_idx: 0,
+            scroll_offset: 0,
+            has_focus: false,
+            bordered: false,
+            h_scroll: 0,
+            max_content_width: None,
+            show_v_scrollbar: false,
+        }
+    }
+
+    /// Render the Queue grid into `rect`.
+    pub(crate) fn render_queue_panel(&self, backend: &mut dyn Backend, rect: Rect, _lh: f32) {
+        // Cleared FIRST and unconditionally. Both early returns below paint
+        // no table at all, and a stale cache would let a later click route a
+        // header/row hit against geometry that is no longer on screen.
+        *self.queue_table_layout.borrow_mut() = None;
+
+        let rows = self.queue_rows();
+        if rows.is_empty() {
+            // An empty grid renders as a bare header row, which reads like a
+            // broken fetch. Say which of the two empties this actually is.
+            let total = self.data.drive_queue.len();
+            let message = if total == 0 {
+                "  Drive queue is empty — nothing waiting or running.".to_string()
+            } else {
+                format!(
+                    "  Nothing pending — all {total} queued entr{} have finished \
+                     (done entries are not shown here).",
+                    if total == 1 { "y" } else { "ies" },
+                )
+            };
+            backend.draw_list(rect, &plain_list("queue-empty", &message, 0));
+            return;
+        }
+
+        let table = DataTable {
+            id: WidgetId::new("queue-grid"),
+            columns: Self::queue_columns(),
+            rows: Self::queue_data_rows(&rows),
+            selected_idx: Some(self.queue_sel.min(rows.len() - 1)),
+            scroll_offset: self.queue_scroll,
+            // The ▲/▼ header indicator is drawn by the primitive itself —
+            // the app only says which column and which way.
+            sort: self.queue_sort,
+            has_focus: true,
+            show_scrollbar: true,
+            // `None`: columns squeeze to fit rather than forcing horizontal
+            // scrolling. With `h_scroll` pinned at 0.0 (below) a content
+            // width past the viewport would make the right-hand columns
+            // permanently unreachable — worse than a narrow `Reason`.
+            min_total_width: None,
+            // Pinned at 0.0. `DataTableLayout::hit_test` has no concept of
+            // `h_scroll`, so a non-zero value shifts the painted headers out
+            // from under the hit-test and routes a sort click to the wrong
+            // column. The reasoning is written out in full at
+            // `reports.rs::render_reports_result`.
+            h_scroll: 0.0,
+            // No column-resize drag on this table yet (#1853 covers that for
+            // the Reports result table).
+            column_overrides: Vec::new(),
+            footer: None,
+        };
+        let layout = backend.draw_data_table(rect, &table, None);
+        // Cached WITH the rect it was painted into — the Reports pattern,
+        // not Audit's. This table does not necessarily start at the main
+        // panel's origin, so a bare `pos - main_b` would mis-hit-test.
+        *self.queue_table_layout.borrow_mut() = Some((rect, layout));
+    }
+
+    /// Rows actually visible inside the grid's own viewport, from the
+    /// last-painted layout. `None` before anything has been painted.
+    pub(crate) fn queue_table_visible_rows(&self) -> Option<usize> {
+        self.queue_table_layout
+            .borrow()
+            .as_ref()
+            .map(|(_, layout)| layout.visible_rows)
+    }
+
+    /// Hit-test a click against the last-painted grid, or `None` when no
+    /// grid is on screen.
+    pub(crate) fn queue_table_hit(&self, pos: Point) -> Option<DataTableHit> {
+        let n = self.queue_rows().len();
+        let cache = self.queue_table_layout.borrow();
+        let (rect, layout) = cache.as_ref()?;
+        Some(layout.hit_test(pos.x - rect.x, pos.y - rect.y, self.queue_scroll, n))
+    }
+
+    /// Did a click land on the grid's vertical scrollbar track?
+    ///
+    /// Checked BEFORE [`Self::queue_table_hit`] by every caller:
+    /// `DataTableLayout::hit_test` has no concept of the scrollbar strip it
+    /// reserves space for (the #1094 gap), so without this a click on the
+    /// thumb mis-resolves to whichever row sits under it.
+    pub(crate) fn queue_scrollbar_hit(&self, pos: Point) -> bool {
+        let cache = self.queue_table_layout.borrow();
+        let Some((rect, layout)) = cache.as_ref() else {
+            return false;
+        };
+        let x = pos.x - rect.x;
+        let y = pos.y - rect.y;
+        if x < 0.0 || y < 0.0 || x >= layout.viewport_width || y >= layout.viewport_height {
+            return false;
+        }
+        layout.scrollbar_width > 0.0
+            && x >= layout.viewport_width - layout.scrollbar_width
+            && y >= layout.header_height
+    }
+
+    /// Jump `queue_scroll` to the row implied by a click along the vertical
+    /// scrollbar track. Mirrors `reports_apply_vscroll`.
+    pub(crate) fn queue_apply_vscroll(&mut self, pos: Point) -> bool {
+        let n = self.queue_rows().len();
+        if n == 0 {
+            return false;
+        }
+        let (track_y0, track_h, visible_rows) = {
+            let cache = self.queue_table_layout.borrow();
+            let Some((rect, layout)) = cache.as_ref() else {
+                return false;
+            };
+            let track_y0 = rect.y + layout.header_height;
+            let track_h = (layout.viewport_height
+                - layout.header_height
+                - layout.h_scrollbar_height)
+                .max(1.0);
+            (track_y0, track_h, layout.visible_rows.max(1))
+        };
+        let max_scroll = n.saturating_sub(visible_rows);
+        self.queue_scroll = if max_scroll == 0 {
+            0
+        } else {
+            let frac = ((pos.y - track_y0) / track_h).clamp(0.0, 1.0);
+            (frac * max_scroll as f32).round() as usize
+        };
+        true
+    }
+
+    /// Click a grid column header: `None → ▲ → ▼ → None` for that column,
+    /// switching straight to ▲ when a different column is clicked.
+    ///
+    /// Client-side sort is correct here for the same reason it is in Reports
+    /// and wrong in Audit: the entry set on screen is the complete queue,
+    /// not one server-paginated page of it. The third click clearing the
+    /// sort is what makes the queue's own run order reachable again — and
+    /// run order is the answer to a different question from any column sort.
+    pub(crate) fn queue_sort_by_column(&mut self, col: usize) -> bool {
+        if col >= Self::QUEUE_COLUMNS.len() {
+            return false;
+        }
+        self.queue_sort = match self.queue_sort {
+            Some((c, SortDirection::Ascending)) if c == col => {
+                Some((col, SortDirection::Descending))
+            }
+            Some((c, SortDirection::Descending)) if c == col => None,
+            _ => Some((col, SortDirection::Ascending)),
+        };
+        // The row that was under the viewport means something different now.
+        self.queue_scroll = 0;
+        true
+    }
+
+    /// The selected grid row, or `None` when the grid is empty.
+    ///
+    /// Clamped rather than returning `None` for an out-of-range
+    /// `queue_sel`, and clamped **the same way the renderer clamps
+    /// `selected_idx`** — the queue shrinks under this panel on every poll
+    /// (an entry finishes and drops out), and a highlight sitting on the
+    /// tail row while `J`/`x` silently no-op'd against a dangling index is
+    /// the exact divergence between "the row I can see selected" and "the
+    /// row the verb acts on" that makes a destructive menu dangerous.
+    pub(crate) fn queue_selected_row(&self) -> Option<QueueRow> {
+        let rows = self.queue_rows();
+        let idx = self.queue_sel.min(rows.len().checked_sub(1)?);
+        rows.into_iter().nth(idx)
+    }
+
+    /// Move the grid selection by `delta` rows, clamped. No wraparound —
+    /// same reasoning as the overlay's [`Self::drive_queue_move_selection`].
+    pub(crate) fn queue_move_selection(&mut self, delta: isize) {
+        let len = self.queue_rows().len();
+        if len == 0 {
+            self.queue_sel = 0;
+            return;
+        }
+        let next = (self.queue_sel as isize + delta).clamp(0, len as isize - 1);
+        self.queue_sel = next as usize;
+    }
+
+    /// Keep `queue_sel` inside the grid's own painted viewport.
+    ///
+    /// `fallback_visible` is only used for the one frame before anything has
+    /// been painted — after that the real `DataTableLayout::visible_rows` is
+    /// authoritative (the #1910 lesson: the panel's row count overcounts what
+    /// the table itself shows).
+    pub(crate) fn fix_queue_scroll(&mut self, fallback_visible: usize) {
+        let visible = self
+            .queue_table_visible_rows()
+            .unwrap_or(fallback_visible)
+            .max(1);
+        if self.queue_sel < self.queue_scroll {
+            self.queue_scroll = self.queue_sel;
+        } else if self.queue_sel >= self.queue_scroll + visible {
+            self.queue_scroll = self.queue_sel + 1 - visible;
+        }
+    }
+
+    /// The right-click target for the selected grid row.
+    ///
+    /// Builds the *same* [`ContextMenuTarget::DriveQueueRow`] the overlay
+    /// does, so the menu (`context_menu_items_for_drive_queue_row`,
+    /// including its `disabled_because` reasons for end-of-queue moves) and
+    /// every dispatcher behind it are shared verbatim.
+    pub(crate) fn queue_context_target(&self) -> Option<ContextMenuTarget> {
+        let queue_len = self.data.drive_queue.len();
+        let r = self.queue_selected_row()?;
+        Some(ContextMenuTarget::DriveQueueRow {
+            repo_name: r.repo_name,
+            issue_number: r.issue_number,
+            state: r.state,
+            position: r.position,
+            queue_len,
+            held: r.held,
+        })
+    }
+
+    /// `J`/`K`: move the selected entry `delta` slots down/up the queue and
+    /// follow it with the selection.
+    ///
+    /// Goes through the exact write seam the overlay and the row menu use —
+    /// `coord drive-queue move` via `spawn_queued`, corrected by the next
+    /// `/board` poll. Deliberately NOT `POST /drive-queue`: the CLI path
+    /// re-validates (cycles, clamping, dense renumbering) and the HTTP path
+    /// would bypass all of it.
+    ///
+    /// The move is expressed in `position` space over the WHOLE queue,
+    /// `done` rows included — the position the CLI acts on is the one in the
+    /// table, not the one in this filtered view.
+    pub(crate) fn queue_selected_move(&mut self, delta: i64) {
+        let Some(r) = self.queue_selected_row() else {
+            return;
+        };
+        let len = self.data.drive_queue.len() as i64;
+        let to = (r.position + delta).clamp(0, (len - 1).max(0));
+        if to == r.position {
+            return;
+        }
+        self.dispatch_drive_queue_move(&r.repo_name, r.issue_number, to);
+        // Follow the entry so repeated `J` walks it down the queue instead
+        // of walking the cursor off it. Only meaningful in the panel's
+        // natural (run) order — under a column sort the row's new slot isn't
+        // knowable until the next poll, so the selection stays put.
+        if self.queue_sort.is_none() {
+            self.queue_move_selection(delta as isize);
+        }
+    }
+
+    /// `x` — remove the selected entry from the queue.
+    pub(crate) fn queue_remove_selected(&mut self) {
+        let Some(r) = self.queue_selected_row() else {
+            return;
+        };
+        self.dispatch_drive_queue_remove(&r.repo_name, r.issue_number);
+        // `dispatch_drive_queue_remove` clamps the OVERLAY's selection; this
+        // panel's index is into a different (filtered) row set.
+        self.queue_move_selection(0);
+    }
+
+    /// `u` — unblock the selected entry. Refuses on anything but a `blocked`
+    /// row rather than promising a state change that cannot happen, exactly
+    /// as the overlay's `u` does.
+    pub(crate) fn queue_unblock_selected(&mut self) {
+        match self
+            .queue_selected_row()
+            .filter(|r| r.state == QUEUE_STATE_BLOCKED)
+        {
+            Some(r) => self.dispatch_drive_queue_unblock(&r.repo_name, r.issue_number),
+            None => self.push_toast(
+                "Drive queue",
+                "only a blocked entry can be unblocked.",
+                ToastSeverity::Warning,
+            ),
+        }
+    }
+
+    /// `r` — release the selected entry's fired deploy gate (#1757). Refuses
+    /// on any other row rather than falling back to "resume whatever is
+    /// held" — see [`Self::dispatch_drive_queue_resume`].
+    pub(crate) fn queue_resume_selected(&mut self) {
+        match self.queue_selected_row().filter(|r| r.held) {
+            Some(r) => self.dispatch_drive_queue_resume(&r.repo_name, r.issue_number),
+            None => self.push_toast(
+                "Drive queue",
+                "only an entry whose deploy gate has fired can be resumed.",
+                ToastSeverity::Warning,
+            ),
+        }
+    }
+}
+
+/// #1866: one Queue-panel row — the rendered cell strings plus the raw
+/// values the grid needs for sorting, reordering and the row menu.
+///
+/// Built once per frame by [`CoordApp::queue_rows`] and consumed by the
+/// renderer AND by every hit-test / keyboard path, so what an operator sees
+/// and what `J` moves can never come from two different passes over
+/// `data.drive_queue`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct QueueRow {
+    pub(crate) repo_name: String,
+    pub(crate) issue_number: i64,
+    /// Dense 0-based slot in the WHOLE queue (`done` rows included) — the
+    /// number `coord drive-queue move --to` speaks in.
+    pub(crate) position: i64,
+    pub(crate) attempts: i64,
+    /// Wire `state`, verbatim.
+    pub(crate) state: String,
+    /// `hold_state == "fired"` — this entry's deploy gate is holding the
+    /// queue shut.
+    pub(crate) held: bool,
+    /// Rendered cells, one per [`CoordApp::QUEUE_COLUMNS`] entry.
+    pub(crate) cells: Vec<String>,
+}
+
+/// What an absent value renders as. A blank cell and a failed paint look
+/// identical; an em dash says "there is nothing here" out loud.
+pub(crate) const QUEUE_EMPTY_CELL: &str = "—";
+
+/// The `Hold` cell for one entry — #1757's DEPLOY GATE, read verbatim off
+/// `hold_state` (never re-derived, same posture as `state`).
+fn queue_hold_cell(e: &BoardDriveQueueEntry) -> String {
+    if is_holding(e) {
+        // Upper-case because this is the one value that stops the queue
+        // dead: nothing launches, however eligible, until a human releases.
+        return "FIRED".to_string();
+    }
+    if e.hold_after == 0 {
+        return QUEUE_EMPTY_CELL.to_string();
+    }
+    if e.hold_state.is_empty() {
+        "gate".to_string()
+    } else {
+        e.hold_state.clone()
+    }
+}
+
+/// Order two Queue rows by `col`.
+///
+/// Numeric for the two numeric columns, case-insensitive text otherwise.
+/// Comparing the *rendered* strings for `#`/`Tries` would sort `10` before
+/// `2` — the same defect #1762 fixed for the Reports result table.
+fn queue_compare_rows(
+    a: &QueueRow,
+    b: &QueueRow,
+    col: usize,
+    dir: SortDirection,
+) -> std::cmp::Ordering {
+    let base = match col {
+        CoordApp::QUEUE_COL_POSITION => a.position.cmp(&b.position),
+        CoordApp::QUEUE_COL_TRIES => a.attempts.cmp(&b.attempts),
+        _ => {
+            let empty = String::new();
+            let av = a.cells.get(col).unwrap_or(&empty).to_lowercase();
+            let bv = b.cells.get(col).unwrap_or(&empty).to_lowercase();
+            av.cmp(&bv)
+        }
+    };
+    match dir {
+        SortDirection::Ascending => base,
+        SortDirection::Descending => base.reverse(),
+    }
 }
 
 fn dq_muted_row(text: &str) -> ListItem {
@@ -1041,7 +1616,7 @@ fn dq_muted_row(text: &str) -> ListItem {
 /// Row colour by wire `state`. An unrecognised state renders neutral — never
 /// silently green (#1485's "absence must never read as healthy" applied to a
 /// state string this build has never heard of).
-fn dq_state_colors(state: &str) -> (Color, Color) {
+pub(crate) fn dq_state_colors(state: &str) -> (Color, Color) {
     match state {
         QUEUE_STATE_RUNNING => (Color::rgb(120, 210, 120), Color::rgb(15, 50, 15)),
         QUEUE_STATE_BLOCKED => (Color::rgb(255, 120, 120), Color::rgb(60, 15, 15)),
