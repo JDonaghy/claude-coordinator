@@ -2354,6 +2354,22 @@ pub struct CoordApp {
     /// word-wrap to the live viewport. Same `last_issue_panel_cols` pattern
     /// used by the Board/Pipeline Issue tabs.
     last_queue_detail_cols: std::cell::Cell<usize>,
+    /// #1867: visible-row count of the Queue detail pane's OWN painted
+    /// rect, stashed alongside `last_queue_detail_cols` right before
+    /// drawing. The detail pane is only the bottom ~40% of the Queue
+    /// panel (`render_queue_panel`'s `detail_h`) — the generic `visible`
+    /// computed in `mouse_main_scroll` from `ctx.main_bounds()` is the
+    /// WHOLE panel (grid + detail) and overestimates this pane's rows by
+    /// roughly 2-3x, which was the #1910-class bug: `max = items -
+    /// (visible - 1)` saturates to 0 for any body shorter than the full
+    /// panel, and wheel-down goes dead.
+    last_queue_detail_visible_rows: std::cell::Cell<usize>,
+    /// #1867: `queue_issue_body_list().items.len()` from the last paint,
+    /// stashed at the same time as `last_queue_detail_visible_rows` so
+    /// `mouse_main_scroll` doesn't have to re-run `queue_issue_body_list`
+    /// (a markdown re-render that also drains the pending-fetch channel and
+    /// touches the fetch cache) on every wheel notch just to read a length.
+    last_queue_detail_item_count: std::cell::Cell<usize>,
     /// Cached `DialogLayout` from the last prompt-dialog render — used for
     /// click hit-testing on dialog buttons.  Populated while any
     /// `pending_*` prompt dialog is visible; cleared when it dismisses.
@@ -3581,6 +3597,8 @@ impl CoordApp {
             queue_table_layout: std::cell::RefCell::new(None),
             queue_detail_scroll: 0,
             last_queue_detail_cols: std::cell::Cell::new(120),
+            last_queue_detail_visible_rows: std::cell::Cell::new(10),
+            last_queue_detail_item_count: std::cell::Cell::new(0),
             dialog_layout: std::cell::RefCell::new(None),
             pending_restart: None,
             machine_last_contact: std::collections::HashMap::new(),
