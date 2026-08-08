@@ -1238,7 +1238,7 @@ impl CoordApp {
     }
 
     /// Render the Queue grid into `rect`.
-    pub(crate) fn render_queue_panel(&self, backend: &mut dyn Backend, rect: Rect, _lh: f32) {
+    pub(crate) fn render_queue_panel(&self, backend: &mut dyn Backend, rect: Rect, lh: f32) {
         // Cleared FIRST and unconditionally. Both early returns below paint
         // no table at all, and a stale cache would let a later click route a
         // header/row hit against geometry that is no longer on screen.
@@ -1248,6 +1248,7 @@ impl CoordApp {
         if rows.is_empty() {
             // An empty grid renders as a bare header row, which reads like a
             // broken fetch. Say which of the two empties this actually is.
+            // Nothing to select either, so no detail pane below it.
             let total = self.data.drive_queue.len();
             let message = if total == 0 {
                 "  Drive queue is empty — nothing waiting or running.".to_string()
@@ -1261,6 +1262,20 @@ impl CoordApp {
             backend.draw_list(rect, &plain_list("queue-empty", &message, 0));
             return;
         }
+
+        // #1867 (Q-2): bottom ~40% is the selected row's issue body,
+        // scrollable. Same split shape as Audit's entry-detail pane
+        // (`audit.rs::render_audit_panel`) — reserve at least 7 rows (this
+        // pane has no fixed header the way Audit's key/value list does, but
+        // a shorter pane than that reads as decorative rather than usable)
+        // for the detail body, the rest for the grid above it. Unlike Audit
+        // the split is unconditional: there is no open/close toggle here,
+        // the pane is always part of the Queue panel's layout.
+        let min_detail_h = (lh * 7.0).min(rect.height);
+        let detail_h = (rect.height * 0.4).max(min_detail_h).min(rect.height);
+        let list_h = (rect.height - detail_h).max(0.0);
+        let list_rect = Rect::new(rect.x, rect.y, rect.width, list_h);
+        let detail_rect = Rect::new(rect.x, rect.y + list_h, rect.width, rect.height - list_h);
 
         let table = DataTable {
             id: WidgetId::new("queue-grid"),
@@ -1289,11 +1304,142 @@ impl CoordApp {
             column_overrides: Vec::new(),
             footer: None,
         };
-        let layout = backend.draw_data_table(rect, &table, None);
+        let layout = backend.draw_data_table(list_rect, &table, None);
         // Cached WITH the rect it was painted into — the Reports pattern,
         // not Audit's. This table does not necessarily start at the main
         // panel's origin, so a bare `pos - main_b` would mis-hit-test.
-        *self.queue_table_layout.borrow_mut() = Some((rect, layout));
+        *self.queue_table_layout.borrow_mut() = Some((list_rect, layout));
+
+        // #1867: stash the pane's painted width so `queue_issue_body_list`
+        // word-wraps to the live viewport — the `last_issue_panel_cols`
+        // pattern (`render.rs:175`), just under its own `Cell`.
+        self.last_queue_detail_cols.set(detail_rect.width as usize);
+        backend.draw_list(detail_rect, &self.queue_issue_body_list());
+    }
+
+    /// #1867 (Q-2): the selected Queue row's issue body, rendered through the
+    /// shared `issue_body_list` helper (never a second renderer). Same
+    /// layered lookup as `board_issue_body_list` (`render.rs:1754`) — this
+    /// exists so a fetch stays a last resort, not the common path:
+    ///
+    /// 1. Synced row in `data.open_issues` — fast path, no I/O. `/board`
+    ///    ships the full `issues` table, so this is the overwhelming case.
+    /// 2. In-memory `fetched_issues_cache`, populated by a prior background
+    ///    `gh issue view` for this session (shared with Board/Pipeline — one
+    ///    fetch of an issue serves every panel that shows it).
+    /// 3. An in-flight background fetch — show a "Fetching…" placeholder and
+    ///    let the next render pick up the result.
+    /// 4. No data yet — spawn `gh issue view` in the background (at most
+    ///    once per issue: step 3's in-flight check makes every subsequent
+    ///    frame a no-op fetch-wise until it resolves) and show a placeholder.
+    pub(crate) fn queue_issue_body_list(&self) -> ListView {
+        // #1867: use the pane width stashed at draw time for word-wrapping.
+        let wrap_width = self.last_queue_detail_cols.get().max(40);
+        let Some(row) = self.queue_selected_row() else {
+            return issue_body_list(None, self.queue_detail_scroll, "queue-issue-body", wrap_width);
+        };
+        let repo = row.repo_name.clone();
+        let Ok(number) = u64::try_from(row.issue_number) else {
+            return issue_body_list(None, self.queue_detail_scroll, "queue-issue-body", wrap_width);
+        };
+        let key = (repo.clone(), number);
+        // The queue's own title lookup (`queue_row`'s Title cell, minus the
+        // em-dash-for-unknown substitution) — used below whenever the body
+        // itself is a placeholder rather than the real fetched/synced issue.
+        let title = self.queue_issue_title(&repo, row.issue_number);
+
+        // 1. Synced row.
+        if let Some(oi) = self
+            .data
+            .open_issues
+            .iter()
+            .find(|oi| oi.repo_name == repo && oi.number == number)
+        {
+            return issue_body_list(
+                Some((oi.number, oi.title.as_str(), oi.body.as_str(), &oi.labels[..])),
+                self.queue_detail_scroll,
+                "queue-issue-body",
+                wrap_width,
+            );
+        }
+
+        // 2. Drain any completed background fetch into the cache so step 3
+        // picks it up. Keyed identically to (and shared with) Board/Pipeline
+        // — a fetch either of them already made satisfies this panel too.
+        let pending_result = {
+            let pending = self.pending_issue_fetches.borrow();
+            pending.get(&key).map(|rx| rx.try_recv())
+        };
+        if let Some(recv) = pending_result {
+            match recv {
+                Ok(Ok(fetched)) => {
+                    self.pending_issue_fetches.borrow_mut().remove(&key);
+                    self.fetched_issues_cache
+                        .borrow_mut()
+                        .insert(key.clone(), fetched);
+                }
+                Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // Fetch finished with an error or the thread died — drop
+                    // the receiver so the cold path below re-spawns next
+                    // render. Error surfaces below as the placeholder.
+                    self.pending_issue_fetches.borrow_mut().remove(&key);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {} // still in flight
+            }
+        }
+
+        // 3. In-memory cache (populated by a completed fetch).
+        if let Some(f) = self.fetched_issues_cache.borrow().get(&key).cloned() {
+            return issue_body_list(
+                Some((f.number, f.title.as_str(), f.body.as_str(), &f.labels[..])),
+                self.queue_detail_scroll,
+                "queue-issue-body",
+                wrap_width,
+            );
+        }
+
+        // 4. Spawn if no fetch is already running — at most one background
+        // fetch per issue, never one per frame.
+        if !self.pending_issue_fetches.borrow().contains_key(&key) {
+            let slug = self
+                .data
+                .pipeline_repos
+                .iter()
+                .find(|(local, _)| local == &repo)
+                .map(|(_, slug)| slug.clone());
+            if let Some(slug) = slug {
+                let rx = spawn_issue_fetch(slug, repo.clone(), number);
+                self.pending_issue_fetches
+                    .borrow_mut()
+                    .insert(key.clone(), rx);
+            } else {
+                // No slug → can't fetch. Show the title we have with a hint.
+                return issue_body_list(
+                    Some((
+                        number,
+                        title.as_str(),
+                        "(no GitHub slug for this repo — add it to coordinator.yml.repos[].github)",
+                        &[][..],
+                    )),
+                    self.queue_detail_scroll,
+                    "queue-issue-body",
+                    wrap_width,
+                );
+            }
+        }
+
+        // Placeholder while the fetch is in flight.
+        issue_body_list(
+            Some((
+                number,
+                title.as_str(),
+                "(fetching body via `gh issue view`…)",
+                &[][..],
+            )),
+            self.queue_detail_scroll,
+            "queue-issue-body",
+            wrap_width,
+        )
     }
 
     /// Rows actually visible inside the grid's own viewport, from the
@@ -1385,6 +1531,10 @@ impl CoordApp {
         };
         // The row that was under the viewport means something different now.
         self.queue_scroll = 0;
+        // #1867: a re-sort can put an entirely different entry at the same
+        // index `queue_sel` already points to — the detail pane's scroll
+        // offset must not survive that.
+        self.queue_detail_scroll = 0;
         true
     }
 
@@ -1403,16 +1553,33 @@ impl CoordApp {
         rows.into_iter().nth(idx)
     }
 
+    /// #1867 (Q-2): set `queue_sel`, resetting `queue_detail_scroll` to 0
+    /// whenever the selection actually changes.
+    ///
+    /// The single choke point every selection-mutating path (keyboard
+    /// nav, Home/End, a grid click) routes through, so a short issue's body
+    /// can never render at a long issue's scroll offset — which would read
+    /// as "no body" rather than "this one is just short". Comparing indices
+    /// rather than resetting unconditionally means re-landing on the
+    /// already-selected row (e.g. a no-op `queue_move_selection` at either
+    /// end of the grid) leaves an in-progress read of the body undisturbed.
+    pub(crate) fn queue_set_sel(&mut self, idx: usize) {
+        if idx != self.queue_sel {
+            self.queue_detail_scroll = 0;
+        }
+        self.queue_sel = idx;
+    }
+
     /// Move the grid selection by `delta` rows, clamped. No wraparound —
     /// same reasoning as the overlay's [`Self::drive_queue_move_selection`].
     pub(crate) fn queue_move_selection(&mut self, delta: isize) {
         let len = self.queue_rows().len();
         if len == 0 {
-            self.queue_sel = 0;
+            self.queue_set_sel(0);
             return;
         }
         let next = (self.queue_sel as isize + delta).clamp(0, len as isize - 1);
-        self.queue_sel = next as usize;
+        self.queue_set_sel(next as usize);
     }
 
     /// Keep `queue_sel` inside the grid's own painted viewport.
@@ -1491,6 +1658,13 @@ impl CoordApp {
         self.dispatch_drive_queue_remove(&r.repo_name, r.issue_number);
         // `dispatch_drive_queue_remove` clamps the OVERLAY's selection; this
         // panel's index is into a different (filtered) row set.
+        //
+        // #1867: `queue_move_selection(0)` is a delta-0 no-op on the index
+        // itself, so `queue_set_sel` won't see a change to reset on — but
+        // the entry now sitting at that index is a different one (the
+        // removed row's neighbour shifted up), so the detail pane's scroll
+        // offset is stale regardless. Reset explicitly.
+        self.queue_detail_scroll = 0;
         self.queue_move_selection(0);
     }
 
