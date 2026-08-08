@@ -4,7 +4,13 @@ Main is now a protected branch: `git push origin main` can be silently
 rejected while a subsequent `git push origin vX.Y.Z` still succeeds, since
 they're independent refs. `release_preflight_checks` is meant to catch that
 locally, before a tag is ever pushed, by confirming local main actually
-matches origin/main (plus a clean tree and a consistent version bump).
+matches origin/main (plus a clean tree).
+
+#1238: the version is now single-sourced from the git tag (setuptools-scm)
+rather than hand-maintained `pyproject.toml`/`coord/__init__.py` literals, so
+the checks that used to compare those two files (and guard against re-using
+an already-tagged version) are gone along with the literals themselves —
+see `release_preflight_checks`'s docstring.
 
 These fixtures build real local-only git repos with a local bare "origin" so
 the ancestor/head checks exercise the same git plumbing a real release does,
@@ -29,13 +35,10 @@ def _git(cwd: Path, *args: str) -> str:
     ).stdout.strip()
 
 
-def _write_versions(repo: Path, version: str) -> None:
-    (repo / "pyproject.toml").write_text(
-        f'[project]\nname = "claude-coordinator"\nversion = "{version}"\n'
-    )
-    coord_dir = repo / "coord"
-    coord_dir.mkdir(exist_ok=True)
-    (coord_dir / "__init__.py").write_text(f'__version__ = "{version}"\n')
+def _write_marker_file(repo: Path, content: str) -> None:
+    """A trivial tracked file to commit/dirty — stands in for whatever a real
+    release's source changes are, now that there's no version file to bump."""
+    (repo / "MARKER.txt").write_text(content)
 
 
 def _commit_all(repo: Path, message: str) -> str:
@@ -46,8 +49,8 @@ def _commit_all(repo: Path, message: str) -> str:
 
 @pytest.fixture
 def clean_repo(tmp_path: Path) -> Path:
-    """A clone on ``main``, in sync with a local bare ``origin``, versions
-    consistent at 0.4.82 — the fully-green baseline other tests mutate."""
+    """A clone on ``main``, in sync with a local bare ``origin`` — the fully
+    green baseline other tests mutate."""
     origin = tmp_path / "origin.git"
     origin.mkdir()
     _git(origin, "init", "--bare", "-b", "main")
@@ -58,7 +61,7 @@ def clean_repo(tmp_path: Path) -> Path:
     _git(clone, "config", "user.email", "t@t.com")
     _git(clone, "config", "user.name", "Test")
     _git(clone, "remote", "add", "origin", str(origin))
-    _write_versions(clone, "0.4.82")
+    _write_marker_file(clone, "initial\n")
     _commit_all(clone, "initial")
     _git(clone, "push", "-u", "origin", "main")
     return clone
@@ -69,7 +72,7 @@ class TestReleasePreflightChecks:
         assert release_preflight_checks(clean_repo) == []
 
     def test_dirty_working_tree_is_flagged(self, clean_repo: Path) -> None:
-        (clean_repo / "coord" / "__init__.py").write_text('__version__ = "0.4.83"\n')
+        _write_marker_file(clean_repo, "uncommitted change\n")
 
         problems = release_preflight_checks(clean_repo)
 
@@ -79,8 +82,8 @@ class TestReleasePreflightChecks:
         """The #1471 core failure: a local commit that main's branch
         protection rejected. Local main has moved past origin/main —
         exactly the state that let a bad tag get pushed."""
-        _write_versions(clean_repo, "0.4.83")
-        _commit_all(clean_repo, "bump to 0.4.83")
+        _write_marker_file(clean_repo, "unpushed change\n")
+        _commit_all(clean_repo, "unpushed change")
         # Deliberately NOT pushed to origin — simulates the rejected push.
 
         problems = release_preflight_checks(clean_repo)
@@ -95,22 +98,13 @@ class TestReleasePreflightChecks:
         _git(clean_repo.parent, "clone", origin_url, str(other_clone_dir))
         _git(other_clone_dir, "config", "user.email", "t@t.com")
         _git(other_clone_dir, "config", "user.name", "Test")
-        _write_versions(other_clone_dir, "0.4.83")
-        _commit_all(other_clone_dir, "someone else's bump")
+        _write_marker_file(other_clone_dir, "someone else's change\n")
+        _commit_all(other_clone_dir, "someone else's change")
         _git(other_clone_dir, "push", "origin", "main")
 
         problems = release_preflight_checks(clean_repo)
 
         assert any("!=" in p and "origin/main" in p for p in problems)
-
-    def test_version_mismatch_between_files_is_flagged(self, clean_repo: Path) -> None:
-        (clean_repo / "coord" / "__init__.py").write_text('__version__ = "0.4.83"\n')
-        _commit_all(clean_repo, "oops mismatched bump")
-        _git(clean_repo, "push", "origin", "main")
-
-        problems = release_preflight_checks(clean_repo)
-
-        assert any("version mismatch" in p for p in problems)
 
     def test_not_on_main_is_flagged(self, clean_repo: Path) -> None:
         _git(clean_repo, "checkout", "-b", "some-feature-branch")
@@ -118,13 +112,6 @@ class TestReleasePreflightChecks:
         problems = release_preflight_checks(clean_repo)
 
         assert any("not on main" in p for p in problems)
-
-    def test_already_tagged_version_is_flagged(self, clean_repo: Path) -> None:
-        _git(clean_repo, "tag", "v0.4.82")
-
-        problems = release_preflight_checks(clean_repo)
-
-        assert any("v0.4.82" in p and "already exists" in p for p in problems)
 
     def test_not_a_git_repo_is_flagged(self, tmp_path: Path) -> None:
         plain_dir = tmp_path / "not_a_repo"
@@ -145,7 +132,7 @@ class TestReleasePreflightCli:
         assert "OK" in result.output
 
     def test_cli_exits_nonzero_and_lists_problems_when_dirty(self, clean_repo: Path) -> None:
-        (clean_repo / "coord" / "__init__.py").write_text('__version__ = "0.4.83"\n')
+        _write_marker_file(clean_repo, "uncommitted change\n")
 
         runner = CliRunner()
         result = runner.invoke(main, ["release-preflight", "--path", str(clean_repo)])

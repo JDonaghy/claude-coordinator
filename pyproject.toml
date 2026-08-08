@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=68", "setuptools-scm>=8", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-coordinator"
-version = "0.4.110"
+dynamic = ["version"]
 description = "Coordinate Claude Code workers across multiple machines and repos."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -57,6 +57,22 @@ coord = "coord.cli:main"
 [tool.setuptools.packages.find]
 include = ["coord*"]
 exclude = ["tests*"]
+
+# #1238: the git tag is now the ONLY version source — no more hand-maintained
+# `version = "X.Y.Z"` here plus a matching `__version__` literal in
+# coord/__init__.py (they drifted; that drift caused the real 0.4.70-vs-0.4.71
+# torn-install incident #1182 exists to detect). Tagging `vX.Y.Z` on main and
+# pushing it *is* the release version — see docs/AGENT_OPERATIONS.md for the
+# release flow. `coord/__init__.py` reads the resolved version back out of
+# installed package metadata (`importlib.metadata`) rather than duplicating
+# it.
+#
+# A checkout with no reachable tag (shallow CI clone, tagless fork) or a tree
+# with commits past the last tag builds as `X.Y.Z.devN+g<sha>` instead of
+# crashing — see `fallback_version` below for the "no scm info at all" case
+# (e.g. a git-archive tarball with no `.git`).
+[tool.setuptools_scm]
+fallback_version = "0.0.0.dev0"
 
 [tool.setuptools.package-data]
 coord = [

@@ -8,17 +8,16 @@ that, at that moment, existed nowhere but the releaser's local checkout and
 the tag.
 
 This command is a fast, local, no-side-effects check meant to run right
-before tagging a release, per the fixed flow in docs/AGENT_OPERATIONS.md
-(bump -> branch -> PR -> merge -> pull merged main -> tag -> push tag). It
-does not push, tag, or modify anything itself.
+before tagging a release, per the flow in docs/AGENT_OPERATIONS.md (merge PR
+-> pull merged main -> tag -> push tag — #1238 dropped the version-bump step
+that used to precede it: the git tag *is* the version now, single-sourced
+via setuptools-scm). It does not push, tag, or modify anything itself.
 """
 
 from __future__ import annotations
 
-import re
 import subprocess
 import sys
-import tomllib
 from pathlib import Path
 
 import click
@@ -35,25 +34,6 @@ def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
     )
 
 
-def _read_pyproject_version(repo_root: Path) -> str | None:
-    pyproject = repo_root / "pyproject.toml"
-    if not pyproject.exists():
-        return None
-    try:
-        data = tomllib.loads(pyproject.read_text())
-    except Exception:  # noqa: BLE001 — malformed file surfaces as "could not read"
-        return None
-    return data.get("project", {}).get("version")
-
-
-def _read_init_version(repo_root: Path) -> str | None:
-    init_path = repo_root / "coord" / "__init__.py"
-    if not init_path.exists():
-        return None
-    match = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', init_path.read_text())
-    return match.group(1) if match else None
-
-
 def release_preflight_checks(repo_root: Path) -> list[str]:
     """Return a list of problems with *repo_root* as a release candidate.
 
@@ -66,10 +46,16 @@ def release_preflight_checks(repo_root: Path) -> list[str]:
     - working tree is clean (no staged/unstaged changes)
     - currently on ``main``, and local ``main`` == ``origin/main`` (the
       protected-branch push must have already landed via a merged PR)
-    - ``pyproject.toml``'s ``version`` and ``coord/__init__.py``'s
-      ``__version__`` agree
-    - that version isn't already tagged (guards against re-tagging or a
-      forgotten bump)
+
+    #1238: this used to also assert ``pyproject.toml``'s ``version`` and
+    ``coord/__init__.py``'s ``__version__`` agreed, and that the version
+    they named wasn't already tagged. Both checks are gone along with the
+    hand-maintained version literals they compared — the version is now
+    single-sourced from the git tag itself (setuptools-scm), so there is no
+    bump left to forget or mismatch. Cutting a release is just choosing and
+    pushing a ``vX.Y.Z`` tag that doesn't exist yet; ``git tag vX.Y.Z``
+    itself already refuses a name collision, so a redundant check here would
+    add nothing.
     """
     problems: list[str] = []
 
@@ -108,28 +94,10 @@ def release_preflight_checks(repo_root: Path) -> list[str]:
             problems.append(
                 f"local main ({local_head[:8]}) != origin/main ({remote_head[:8]}) — "
                 "pull/rebase onto origin/main first. main is protected: your "
-                "version bump must land there via a merged PR *before* you tag "
+                "change must land there via a merged PR *before* you tag "
                 "it (#1471) — a tag built from a commit main rejected still "
                 "publishes to PyPI, and PyPI releases are immutable."
             )
-
-    pyproject_version = _read_pyproject_version(repo_root)
-    init_version = _read_init_version(repo_root)
-    if pyproject_version is None:
-        problems.append("could not read version from pyproject.toml")
-    if init_version is None:
-        problems.append("could not read __version__ from coord/__init__.py")
-    if pyproject_version and init_version and pyproject_version != init_version:
-        problems.append(
-            f"version mismatch: pyproject.toml={pyproject_version} vs "
-            f"coord/__init__.py={init_version} — these must match"
-        )
-
-    if pyproject_version:
-        tag = f"v{pyproject_version}"
-        tag_check = _git(repo_root, "rev-parse", "-q", "--verify", f"refs/tags/{tag}")
-        if tag_check.returncode == 0:
-            problems.append(f"tag {tag} already exists — bump the version before releasing")
 
     return problems
 
@@ -148,11 +116,10 @@ def release_preflight(path_opt: str | None) -> None:
     """Fail loudly, before any tag is pushed, if release ordering would be wrong.
 
     Run this right before ``git tag vX.Y.Z && git push origin vX.Y.Z``. It
-    fetches ``origin/main`` and confirms local ``main`` matches it, the
-    working tree is clean, and the version bump is consistent — so the
-    #1471 failure mode (tagging a commit that never actually landed on the
-    protected ``main`` branch) is caught locally instead of shipping an
-    immutable bad PyPI release.
+    fetches ``origin/main`` and confirms local ``main`` matches it and the
+    working tree is clean — so the #1471 failure mode (tagging a commit that
+    never actually landed on the protected ``main`` branch) is caught
+    locally instead of shipping an immutable bad PyPI release.
     """
     repo_root = Path(path_opt).expanduser() if path_opt else Path.cwd()
     problems = release_preflight_checks(repo_root)
@@ -161,10 +128,9 @@ def release_preflight(path_opt: str | None) -> None:
         for problem in problems:
             click.echo(f"  - {problem}", err=True)
         sys.exit(1)
-    version = _read_pyproject_version(repo_root)
     click.echo(
-        f"release preflight OK — local main matches origin/main, working "
-        f"tree clean, version {version} ready to tag."
+        "release preflight OK — local main matches origin/main, working "
+        "tree clean. Ready to tag: git tag vX.Y.Z && git push origin vX.Y.Z."
     )
 
 

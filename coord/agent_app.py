@@ -26,25 +26,15 @@ from coord.openapi import build_spec, dataclass_schema, openapi_and_docs_routes
 def _installed_version() -> str | None:
     """Return the currently-installed claude-coordinator version.
 
-    Reads ``__version__`` directly from ``coord/__init__.py`` on disk so
-    a bumped version in source is picked up immediately — important for
-    editable installs where ``importlib.metadata`` reads from a
-    ``.egg-info`` that's only regenerated on ``pip install -e .``.
-
-    Falls back to ``importlib.metadata`` only if the disk read fails.
+    #1238: ``coord.__version__`` (imported once, at module-import time — see
+    the module-level ``from coord import __version__`` above) and this are
+    deliberately different reads. This one re-queries ``importlib.metadata``
+    fresh on every call, so it reflects a ``pip install``/``pip install
+    --upgrade`` that happened to site-packages *after* this process started,
+    without needing a restart — exactly what ``/health`` needs to tell "the
+    process hasn't restarted since the last update" apart from "the update
+    never happened".
     """
-    try:
-        import coord  # noqa: PLC0415
-        if coord.__file__:
-            from pathlib import Path  # noqa: PLC0415
-            text = Path(coord.__file__).read_text()
-            for line in text.splitlines():
-                if line.startswith("__version__"):
-                    # parse: __version__ = "0.4.1"
-                    raw = line.split("=", 1)[1].strip()
-                    return raw.strip('"').strip("'")
-    except Exception:
-        pass
     try:
         from importlib.metadata import version as _metaver  # noqa: PLC0415
         return _metaver("claude-coordinator")
