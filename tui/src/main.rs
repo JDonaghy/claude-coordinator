@@ -6,7 +6,43 @@
 
 use coord_tui::CoordApp;
 
+/// Returns `true` when `args` contains `--version` or `-V`.
+///
+/// Extracted from `main` so the flag-matching logic itself is unit
+/// testable — `main`'s body (terminal takeover, panic hook, `catch_unwind`)
+/// isn't something a `#[test]` can exercise directly.
+fn wants_version<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    args.into_iter()
+        .any(|a| a.as_ref() == "--version" || a.as_ref() == "-V")
+}
+
+/// The `--version`/`-V` output, e.g. `coord-tui 0.4.71`.
+///
+/// #1239 (PKG-3): reads `CARGO_PKG_VERSION`, which cargo populates from
+/// `tui/Cargo.toml`'s `[package] version`. The release workflow
+/// (`.github/workflows/release-tui.yml`) stamps that field from the pushed
+/// `vX.Y.Z` tag before building — the same tag the Python wheel's
+/// setuptools-scm version derives from — so `coord-tui --version` and
+/// `coord --version` agree on a tagged release build. There is
+/// deliberately no separate version literal here to drift out of sync
+/// with.
+fn version_string() -> String {
+    format!("coord-tui {}", env!("CARGO_PKG_VERSION"))
+}
+
 fn main() {
+    // `--version`/`-V` short-circuits before any of the TUI setup below
+    // (env var poking, panic hook install, terminal takeover) — a version
+    // check must never touch the terminal or spawn anything.
+    if wants_version(std::env::args().skip(1)) {
+        println!("{}", version_string());
+        return;
+    }
+
     // Force non-interactive mode on every subprocess the TUI (or any tool
     // it spawns) launches.  Without these, an SSH passphrase or HTTPS
     // credential prompt from a child git/ssh process can grab the TTY,
@@ -103,5 +139,48 @@ fn main() {
             summary
         );
         std::process::exit(101);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wants_version_detects_long_flag() {
+        assert!(wants_version(["--version"]));
+    }
+
+    #[test]
+    fn wants_version_detects_short_flag() {
+        assert!(wants_version(["-V"]));
+    }
+
+    #[test]
+    fn wants_version_ignores_unrelated_args() {
+        assert!(!wants_version(["--help"]));
+        assert!(!wants_version(Vec::<&str>::new()));
+    }
+
+    #[test]
+    fn wants_version_finds_flag_anywhere_in_argv() {
+        // argv[0] (the program path) is already skipped by the caller, but
+        // the flag can still appear after other args (e.g. `coord-tui -x
+        // --version`) — it shouldn't have to be first.
+        assert!(wants_version(["-x", "--version"]));
+    }
+
+    #[test]
+    fn version_string_matches_cargo_pkg_version() {
+        // Cargo populates CARGO_PKG_VERSION from tui/Cargo.toml's [package]
+        // version at compile time — see release-tui.yml's version-stamp
+        // step, which rewrites that field from the release tag before
+        // building. This test guards the format (`coord-tui <version>`),
+        // not a hardcoded version number.
+        assert_eq!(
+            version_string(),
+            format!("coord-tui {}", env!("CARGO_PKG_VERSION"))
+        );
+        assert!(version_string().starts_with("coord-tui "));
     }
 }
