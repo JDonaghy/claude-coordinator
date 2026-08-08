@@ -498,7 +498,12 @@ def test_capacity_above_one_launches_while_another_drive_runs():
         entry(1650, position=0, state=STATE_RUNNING),
         entry(1654, position=1),
     ]
-    plan = plan_tick(entries, board(sessions=(1650,)), capacity=2)
+    # Both entries are the SAME repo, so #1972's per-repo ceiling has to be
+    # raised for the global ceiling to be the thing under test here — with the
+    # default of 1 this queue deliberately defers (the test right below).
+    plan = plan_tick(
+        entries, board(sessions=(1650,)), capacity=2, max_parallel_per_repo=2
+    )
     assert plan.occupied == 1
     assert plan.launch is not None and plan.launch.issue == 1654
 
@@ -525,6 +530,228 @@ def test_entries_after_the_launch_are_reported_but_never_counted():
     assert f"defer {entry_key(REPO, 1654)}" in text
     assert entry_key(REPO, 1650) in text
     assert "not reached this tick" in text
+
+
+# ── plan_tick: the per-repo ceiling (#1972) ─────────────────────────────────
+#
+# Per-repo serialisation, cross-repo parallelism. The hazard that forced
+# serialisation is intra-repo (a merge stales the Test verdicts of the other
+# queued branches in THAT repo), so repo is the axis along which extra
+# parallelism is safe. Before this, `--max-parallel` was one global counter:
+# capacity 3 with a 39-entry claude-coordinator queue would launch the two
+# entries most likely to stale each other and never reach the quadraui entry
+# that could have run for free.
+
+
+def cross_repo_board(
+    *,
+    open_: tuple[str, ...] = (),
+    sessions: tuple[str, ...] = (),
+    active: tuple[str, ...] = (),
+) -> BoardView:
+    """A board keyed by fully-qualified ``repo#N``, for the multi-repo tests.
+
+    The module-level ``board()`` helper hardcodes ``REPO``, which is exactly
+    the single-repo assumption #1972 exists to break.
+    """
+    facts = {
+        key: IssueFacts(
+            known=True,
+            issue_state="open",
+            active_work=key in active,
+        )
+        for key in {*open_, *active, *sessions}
+    }
+    return BoardView(issues=facts, live_sessions=frozenset(sessions))
+
+
+def other(issue: int, repo: str, position: int, **kw) -> QueueEntry:
+    return QueueEntry(repo=repo, issue=issue, position=position, **kw)
+
+
+def test_a_second_repo_rides_alongside_an_in_progress_repo():
+    """#1972's headline scenario, asserted end to end.
+
+    Capacity 3. Position 0 is a claude-coordinator drive in progress;
+    positions 1..38 are claude-coordinator and blocked BY DESIGN; position 39
+    is quadraui. The tick must launch the quadraui entry — the walk already
+    skips deferred entries, so all this needs is for the same-repo entries to
+    actually defer.
+    """
+    entries = [entry(1650, position=0, state=STATE_RUNNING)]
+    entries += [entry(1700 + i, position=i + 1) for i in range(38)]
+    entries.append(other(302, "quadraui", position=39))
+    board_view = cross_repo_board(
+        sessions=(entry_key(REPO, 1650),),
+        active=(entry_key(REPO, 1650),),
+        open_=tuple(entry_key(REPO, 1700 + i) for i in range(38))
+        + ("quadraui#302",),
+    )
+
+    plan = plan_tick(entries, board_view, capacity=3)
+
+    assert plan.launch is not None
+    assert plan.launch.key == "quadraui#302"
+    assert plan.occupied == 1
+    assert plan.repo_occupied == {REPO: 1}
+
+
+def test_same_repo_entries_defer_rather_than_block():
+    entries = [
+        entry(1650, position=0, state=STATE_RUNNING),
+        entry(1654, position=1, deferrals=2),
+        other(302, "quadraui", position=2),
+    ]
+    plan = plan_tick(
+        entries,
+        cross_repo_board(
+            sessions=(entry_key(REPO, 1650),),
+            open_=(entry_key(REPO, 1654), "quadraui#302"),
+        ),
+        capacity=3,
+    )
+    assert plan.launch is not None and plan.launch.key == "quadraui#302"
+    assert plan.blocked == ()  # a defer, never a block
+    deferral = next(d for d in plan.deferrals if d.key == entry_key(REPO, 1654))
+    assert deferral.repo_limited is True
+    # Position untouched, no attempt consumed — only the deferral counter and
+    # the reason an operator reads in `coord drive-queue list` move.
+    assert set(deferral.updates) == {"deferrals", "last_reason"}
+    assert deferral.updates["deferrals"] == 3
+    assert "at its limit (1/1)" in deferral.reason
+
+
+def test_the_per_repo_ceiling_is_configurable():
+    entries = [
+        entry(1650, position=0, state=STATE_RUNNING),
+        entry(1654, position=1),
+    ]
+    board_view = cross_repo_board(
+        sessions=(entry_key(REPO, 1650),), open_=(entry_key(REPO, 1654),)
+    )
+    assert plan_tick(entries, board_view, capacity=3).launch is None
+    raised = plan_tick(entries, board_view, capacity=3, max_parallel_per_repo=2)
+    assert raised.launch is not None and raised.launch.issue == 1654
+    # 0 disables the ceiling entirely — one global counter, as before #1972.
+    off = plan_tick(entries, board_view, capacity=3, max_parallel_per_repo=0)
+    assert off.launch is not None and off.launch.issue == 1654
+
+
+def test_the_global_ceiling_still_wins_over_a_repo_with_headroom():
+    """Both apply, GLOBAL first — a full fleet launches nothing, any repo."""
+    entries = [
+        entry(1650, position=0, state=STATE_RUNNING),
+        other(302, "quadraui", position=1),
+    ]
+    plan = plan_tick(
+        entries,
+        cross_repo_board(
+            sessions=(entry_key(REPO, 1650),), open_=("quadraui#302",)
+        ),
+        capacity=1,
+    )
+    assert plan.launch is None
+    assert plan.deferrals == ()  # the walk never ran; at capacity is not a defer
+
+
+def test_a_repo_limited_queue_is_saturated_not_stalled():
+    """No queue-level alert: this is the queue working, like at-capacity."""
+    entries = [
+        entry(1650, position=0, state=STATE_RUNNING),
+        entry(1654, position=1),
+    ]
+    plan = plan_tick(
+        entries,
+        cross_repo_board(
+            sessions=(entry_key(REPO, 1650),), open_=(entry_key(REPO, 1654),)
+        ),
+        capacity=3,
+    )
+    assert plan.launch is None
+    assert plan.alert is None
+    text = "\n".join(render_plan(plan))
+    assert "per-repo: claude-coordinator 1/1" in text
+    assert "every waiting entry's repo is at its per-repo limit" in text
+
+
+def test_a_genuinely_stuck_entry_still_alerts_alongside_a_repo_limit_defer():
+    """Mixed tick: something really is stuck, so the alert names all of it."""
+    entries = [
+        entry(1650, position=0, state=STATE_RUNNING),
+        entry(1654, position=1),
+        other(302, "quadraui", position=2, after=("quadraui#1",)),
+    ]
+    plan = plan_tick(
+        entries,
+        cross_repo_board(
+            sessions=(entry_key(REPO, 1650),), open_=(entry_key(REPO, 1654),)
+        ),
+        capacity=3,
+    )
+    assert plan.launch is None
+    assert plan.alert is not None
+    assert len(plan.alert.details) == 2  # both deferrals explained
+
+
+def test_the_launch_takes_its_own_repos_slot_in_the_report_only_tail():
+    """`--dry-run` must not call the next same-repo entry eligible."""
+    entries = [
+        other(302, "quadraui", position=0),
+        other(303, "quadraui", position=1),
+    ]
+    plan = plan_tick(
+        entries,
+        cross_repo_board(open_=("quadraui#302", "quadraui#303")),
+        capacity=3,
+    )
+    assert plan.launch is not None and plan.launch.issue == 302
+    assert [d.key for d in plan.deferrals] == ["quadraui#303"]
+    assert plan.deferrals[0].counted is False  # never competed for the slot
+    assert plan.deferrals[0].updates == {}
+    assert plan.writes() == []
+    assert "at its limit (1/1)" in plan.deferrals[0].reason
+
+
+def test_an_unsatisfiable_prereq_still_blocks_inside_a_full_repo():
+    """Capacity is not an excuse to sit on a permanently broken entry."""
+    entries = [
+        entry(1650, position=0, state=STATE_RUNNING),
+        entry(1654, position=1, after=("ghost#1",)),
+    ]
+    plan = plan_tick(
+        entries,
+        cross_repo_board(sessions=(entry_key(REPO, 1650),)),
+        capacity=3,
+    )
+    assert [b.key for b in plan.blocked] == [entry_key(REPO, 1654)]
+    assert plan.alert is not None  # blocked is a stall, and stalls escalate
+
+
+def test_the_capacity_line_shows_the_per_repo_breakdown():
+    entries = [
+        entry(1650, position=0, state=STATE_RUNNING),
+        other(302, "quadraui", position=1, state=STATE_RUNNING),
+        entry(1654, position=2),
+    ]
+    plan = plan_tick(
+        entries,
+        cross_repo_board(
+            sessions=(entry_key(REPO, 1650), "quadraui#302"),
+            open_=(entry_key(REPO, 1654),),
+        ),
+        capacity=4,
+    )
+    text = "\n".join(render_plan(plan, dry_run=True))
+    assert "2/4 occupied" in text
+    assert "per-repo: claude-coordinator 1/1, quadraui 1/1" in text
+    # #1660's caveat, restated where it now bites one repo instead of the queue.
+    assert "counted from board state" in text
+
+
+def test_a_plan_without_a_per_repo_ceiling_renders_the_original_line():
+    entries = [entry(1650, position=0)]
+    plan = plan_tick(entries, board(), capacity=1, max_parallel_per_repo=0)
+    assert "per-repo" not in "\n".join(render_plan(plan))
 
 
 # ── plan_tick: reconciliation ────────────────────────────────────────────────
@@ -1190,7 +1417,16 @@ def test_a_cross_host_entry_is_never_relaunched_even_with_free_capacity():
         entry(1812, position=1),
     ]
     plan = plan_tick(
-        entries, board(open_=(1812,)), capacity=5, now=NOW, local_host="dellserver"
+        entries,
+        board(open_=(1812,)),
+        capacity=5,
+        now=NOW,
+        local_host="dellserver",
+        # Same repo on both rows: the #1870 guard is what this test is about,
+        # so #1972's per-repo ceiling is raised out of the way (with the
+        # default of 1, #1811's cross-host slot would legitimately defer
+        # #1812 and the assertion below would be testing the wrong feature).
+        max_parallel_per_repo=5,
     )
     # Free capacity and a fully eligible successor — #1812 launches, #1811
     # does not get a second drive.

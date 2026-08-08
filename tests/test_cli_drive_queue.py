@@ -37,16 +37,23 @@ from coord.drive_queue import (
 )
 
 REPO = "claude-coordinator"
+# A SECOND repo, so #1972's per-repo capacity has something to be per-repo
+# about: the whole point is that a quadraui entry can ride alongside an
+# in-progress claude-coordinator one.
+OTHER_REPO = "quadraui"
 
 _CONFIG_YAML = f"""\
 repos:
   - name: {REPO}
     github: john/claude-coordinator
     default_branch: main
+  - name: {OTHER_REPO}
+    github: john/quadraui
+    default_branch: main
 machines:
   - name: dellserver
     host: dellserver
-    repos: [{REPO}]
+    repos: [{REPO}, {OTHER_REPO}]
 """
 
 
@@ -80,12 +87,13 @@ def seed(coord_db):
         *,
         issues: dict[int, str] | None = None,
         assignments: list[dict[str, Any]] | None = None,
+        repo: str = REPO,
     ) -> None:
         for number, issue_state in (issues or {}).items():
             coord_db.execute(
                 "INSERT OR REPLACE INTO issues (repo_name, number, title, state) "
                 "VALUES (?, ?, ?, ?)",
-                (REPO, number, f"issue {number}", issue_state),
+                (repo, number, f"issue {number}", issue_state),
             )
         for index, row in enumerate(assignments or []):
             coord_db.execute(
@@ -94,8 +102,10 @@ def seed(coord_db):
                 " machine_name, type, status, dispatched_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    row.get("assignment_id", f"a{index}"),
-                    REPO,
+                    # Repo-qualified so a test can seed BOTH repos without the
+                    # second call colliding on the assignment_id primary key.
+                    row.get("assignment_id", f"a-{repo}-{index}"),
+                    repo,
                     row["issue_number"],
                     f"issue {row['issue_number']}",
                     "dellserver",
@@ -443,6 +453,91 @@ def test_a_finished_drive_is_reconciled_done_and_frees_its_slot(
     assert result.exit_code == 0, result.output
     assert queued(1650)["state"] == "done"
     assert "1654" in " ".join(launches[0])
+
+
+# ── tick: per-repo capacity (#1972) ──────────────────────────────────────────
+
+
+def test_a_second_repo_launches_alongside_an_in_progress_repo(
+    cli, seed, launches, live_sessions
+):
+    """#1972's acceptance scenario, through the real CLI.
+
+    Capacity 3. One claude-coordinator drive is in progress, several more
+    claude-coordinator entries are queued behind it, and a quadraui entry sits
+    at the BACK. The tick must ride the quadraui entry alongside the running
+    one instead of launching a same-repo neighbour (which could stale its Test
+    verdict) or idling behind the queue.
+    """
+    seed(issues={1650: "open", 1654: "open", 1655: "open"})
+    seed(issues={302: "open"}, repo=OTHER_REPO)
+    cli("add", REPO, "1650")
+    cli("add", REPO, "1654")
+    cli("add", REPO, "1655")
+    cli("add", OTHER_REPO, "302")
+    state._update_drive_queue_entry_local(REPO, 1650, state="running")
+    live_sessions(1650)
+
+    result = cli("tick", "--max-parallel", "3")
+    assert result.exit_code == 0, result.output
+    assert len(launches) == 1, launches
+    assert OTHER_REPO in launches[0] and "302" in launches[0]
+    assert f"{OTHER_REPO}#302" in result.output
+
+    # The passed-over same-repo entries DEFERRED: still waiting, still in
+    # position, no attempt spent, and the reason names the per-repo limit.
+    for issue, position in ((1654, 1), (1655, 2)):
+        row = queued(issue)
+        assert row["state"] == "waiting"
+        assert row["position"] == position
+        assert row["attempts"] == 0
+        assert "at its limit (1/1)" in row["last_reason"]
+
+    # No escalation: a repo waiting on its own in-flight drive is the queue
+    # working, not a stall.
+    assert (
+        state._get_drive_escalation_local(QUEUE_ALERT_REPO, QUEUE_ALERT_ISSUE)
+        is None
+    )
+
+
+def test_dry_run_explains_the_per_repo_occupancy(
+    cli, seed, launches, live_sessions
+):
+    seed(issues={1650: "open", 1654: "open"})
+    cli("add", REPO, "1650")
+    cli("add", REPO, "1654")
+    state._update_drive_queue_entry_local(REPO, 1650, state="running")
+    live_sessions(1650)
+
+    result = cli("tick", "--max-parallel", "3", "--dry-run")
+    assert result.exit_code == 0, result.output
+    assert f"per-repo: {REPO} 1/1" in result.output
+    assert "counted from board state" in result.output
+    assert "at its limit (1/1)" in result.output
+    assert launches == []
+    assert queued(1654)["deferrals"] == 0  # --dry-run mutates nothing
+
+
+def test_the_per_repo_ceiling_is_configurable_from_the_cli(
+    cli, seed, launches, live_sessions
+):
+    seed(issues={1650: "open", 1654: "open"})
+    cli("add", REPO, "1650")
+    cli("add", REPO, "1654")
+    state._update_drive_queue_entry_local(REPO, 1650, state="running")
+    live_sessions(1650)
+
+    result = cli("tick", "--max-parallel", "3", "--max-parallel-per-repo", "2")
+    assert result.exit_code == 0, result.output
+    assert len(launches) == 1, launches
+    assert "1654" in " ".join(launches[0])
+
+
+def test_a_negative_per_repo_ceiling_is_refused(cli):
+    result = cli("tick", "--max-parallel-per-repo", "-1")
+    assert result.exit_code != 0
+    assert "--max-parallel-per-repo" in result.output
 
 
 # ── tick: the startup grace window (#1794) ───────────────────────────────────
