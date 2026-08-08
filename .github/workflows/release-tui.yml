@@ -1,0 +1,200 @@
+name: Release coord-tui binaries
+
+# #1239 (PKG-3): coord-tui is the single biggest "offer it to someone else"
+# gap in this project — today it is `version = "0.1.0"` hardcoded, hand-built
+# with `cargo build`, and copied to ~/.local/bin by hand. There is no
+# distribution channel, so a release of claude-coordinator silently excludes
+# the TUI. This workflow builds coord-tui for linux/mac/windows on a `vX.Y.Z`
+# tag push, stamps its version from that same tag (matching the Python
+# wheel's setuptools-scm-derived version — see pyproject.toml), and attaches
+# the binaries to the GitHub Release that .github/workflows/publish.yml
+# creates for the wheel.
+#
+# Hand-written matrix, not cargo-dist (the issue's preferred option): coord-tui
+# depends on quadraui via a local *path* dependency
+# (`quadraui = { path = "../../quadraui/quadraui" }` in tui/Cargo.toml) —
+# a sibling checkout, not a crates.io/registry dependency. Reproducing that
+# layout in CI (see the "Check out quadraui" step below, mirrored from
+# cargo-test.yml) is straightforward in a plain shell step but is exactly the
+# kind of pre-build repo-fetch cargo-dist does not model, so the fallback
+# named in the issue is what's implemented here.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      fake_tag:
+        description: >-
+          Dry-run version tag (e.g. v0.0.0-dryrun). Exercises the full
+          build+stamp+verify pipeline for every target without creating or
+          touching any GitHub Release — binaries land as workflow artifacts
+          instead, so a maintainer can validate the pipeline without cutting
+          a real release.
+        required: true
+        default: v0.0.0-dryrun
+
+env:
+  # #1239: the quadraui commit this release build pins against. tui/Cargo.toml's
+  # path dependency floats on whatever a checkout happens to have on disk —
+  # deliberately so in cargo-test.yml, which clones quadraui's default branch
+  # to catch breaks early (see that workflow's #1865 comments). A *tagged
+  # release* needs the opposite property: a tagged binary must be
+  # reproducible, not a function of whenever CI happened to run. Bump this
+  # SHA deliberately (as its own commit, with a comment on why) when
+  # coord-tui needs a newer quadraui; never let it float here.
+  QUADRAUI_PIN_SHA: 8a455a5c0772c12cff2dee6db408d9490b51b4df
+
+jobs:
+  # Refuses to build/release a tag whose commit never landed on main — mirrors
+  # publish.yml's identical guard for the Python wheel (see #1471 there).
+  # Skipped entirely for workflow_dispatch dry runs, which build from
+  # whatever ref the dispatch was run against and never touch a release.
+  verify-tag:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify tag is on main
+        run: |
+          git fetch origin main
+          tagged_commit="${{ github.sha }}"
+          if ! git merge-base --is-ancestor "$tagged_commit" origin/main; then
+            echo "::error::Tag ${{ github.ref_name }} points at commit $tagged_commit, which is not an ancestor of origin/main. Refusing to build release binaries — merge the commit to main first, then re-tag it."
+            exit 1
+          fi
+
+  build:
+    needs: [verify-tag]
+    # `always()`: verify-tag is skipped (not failed) on workflow_dispatch, and
+    # a skipped dependency must not skip this job too.
+    if: ${{ always() && (needs.verify-tag.result == 'success' || needs.verify-tag.result == 'skipped') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target_name: x86_64-linux
+            os: ubuntu-latest
+            bin_ext: ""
+          - target_name: x86_64-macos
+            os: macos-13
+            bin_ext: ""
+          - target_name: aarch64-macos
+            os: macos-14
+            bin_ext: ""
+          - target_name: x86_64-windows
+            os: windows-latest
+            bin_ext: ".exe"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Reproduce the sibling-directory layout tui/Cargo.toml's path
+      # dependency expects (`../../quadraui/quadraui` relative to tui/Cargo.toml
+      # resolves to $GITHUB_WORKSPACE/../quadraui/quadraui) — same approach as
+      # cargo-test.yml, but pinned to QUADRAUI_PIN_SHA instead of floating on
+      # a default branch, so this build is reproducible from the tag alone.
+      - name: Check out quadraui (pinned, sibling path dep)
+        shell: bash
+        run: |
+          git clone https://github.com/${{ github.repository_owner }}/quadraui ../quadraui
+          git -C ../quadraui checkout "$QUADRAUI_PIN_SHA"
+          echo "Building tui/ against pinned quadraui @ $QUADRAUI_PIN_SHA"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tui
+          key: release-${{ matrix.target_name }}
+
+      - name: Resolve release version
+        id: version
+        shell: bash
+        run: |
+          tag="${{ github.event.inputs.fake_tag || github.ref_name }}"
+          version="${tag#v}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Stamp coord-tui version from tag
+        shell: bash
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          # #1239: single-source the release version from the pushed tag,
+          # the same way pyproject.toml's setuptools-scm config derives the
+          # Python wheel's version from it — no hand-maintained version
+          # literal to drift out of sync (see #1182, the torn-install
+          # incident that made drift here a known failure mode).
+          #
+          # The `^version = ` anchor only matches a line that starts with
+          # "version" in column 0 — the [package] version field — never the
+          # nested `name = { version = "...", ... }` dependency specifiers
+          # elsewhere in the manifest (those never start a line with
+          # "version").
+          sed -i.bak -E "s/^version = \"[^\"]+\"/version = \"$version\"/" tui/Cargo.toml
+          rm tui/Cargo.toml.bak
+          grep '^version' tui/Cargo.toml
+
+      - name: Build coord-tui (release)
+        working-directory: tui
+        run: cargo build --release --bin coord-tui
+
+      - name: Verify --version reports the tag version
+        shell: bash
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          out="$(./tui/target/release/coord-tui${{ matrix.bin_ext }} --version)"
+          echo "coord-tui --version -> $out"
+          case "$out" in
+            *"$version"*) ;;
+            *)
+              echo "::error::coord-tui --version ($out) does not contain expected version $version"
+              exit 1
+              ;;
+          esac
+
+      - name: Stage artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "tui/target/release/coord-tui${{ matrix.bin_ext }}" "dist/coord-tui-${{ matrix.target_name }}${{ matrix.bin_ext }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coord-tui-${{ matrix.target_name }}
+          path: dist/coord-tui-${{ matrix.target_name }}${{ matrix.bin_ext }}
+          if-no-files-found: error
+
+  # Single release step (rather than each matrix leg calling
+  # softprops/action-gh-release for itself) to avoid four parallel jobs
+  # racing to create/update the same GitHub Release for the same tag.
+  release:
+    needs: [build]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: coord-tui-*
+          path: dist
+          merge-multiple: false
+
+      - name: Flatten downloaded artifacts
+        run: |
+          mkdir -p release-assets
+          find dist -type f -exec cp {} release-assets/ \;
+          ls -la release-assets
+
+      # Attaches to the same GitHub Release publish.yml creates for the
+      # Python wheel (softprops/action-gh-release upserts by tag_name, so
+      # whichever workflow's step runs first creates it and the other
+      # appends assets to it).
+      - name: Attach coord-tui binaries to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: release-assets/*
