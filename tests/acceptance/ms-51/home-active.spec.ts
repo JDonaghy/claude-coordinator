@@ -199,10 +199,27 @@ test.describe('ms-51 Home Active tab (#1544)', () => {
     await page.goto('/')
   })
 
-  /** §1a — an h1 whose exact text is `coord`. §1b — the `pipeline` subtitle. */
-  test('header shows the coord title and the pipeline subtitle', async ({ page }) => {
-    await expect(page.getByRole('heading', { level: 1, name: 'coord', exact: true })).toBeVisible()
-    await expect(page.getByText('pipeline', { exact: true })).toBeVisible()
+  /**
+   * §1a — an h1 whose exact text is `Pipeline`.
+   * §1b — a mono count element reading `3 tracked`.
+   *
+   * RE-AUTHORED against the amended §1 (#1950/#1951, commit c6ab101). #1547
+   * replaced the old `coord` / `pipeline` header with the shared PanelHeader,
+   * and `coord`/`pipeline` no longer appear in the header at all — but the
+   * contract was amended without re-authoring this slice, so the test kept
+   * asserting the pre-#1547 shape and went red. That drift between a contract
+   * and its executable half is precisely what contract.md's "Amending" section
+   * forbids, and what this oracle exists to catch.
+   *
+   * Deliberately NOT asserted: the `aria-hidden="true"` `co` badge that
+   * precedes the h1 — §1b calls it decorative and breakpoint-dependent (only
+   * visible below md/768px) and instructs the slice not to assert it.
+   */
+  test('header shows the Pipeline title and the tracked count', async ({ page }) => {
+    await expect(
+      page.getByRole('heading', { level: 1, name: 'Pipeline', exact: true }),
+    ).toBeVisible()                                                          // §1a
+    await expect(page.getByText('3 tracked', { exact: true })).toBeVisible() // §1b
   })
 
   /**
