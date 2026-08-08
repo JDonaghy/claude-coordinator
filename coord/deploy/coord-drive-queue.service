@@ -88,7 +88,18 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 KillMode=process
-ExecStart=%h/.local/bin/coord drive-queue tick --config %h/.coord/coordinator.yml
+# --max-parallel 3 (#2012) — the global ceiling, one slot per repo in the
+# fleet (claude-coordinator, quadraui, vimcode). #1972 added the SECOND
+# ceiling, --max-parallel-per-repo (default 1), which is what keeps two
+# drives off the same repo; without raising this outer one the per-repo
+# ceiling can never bind, because the walk stops at the global limit
+# first and never reaches an entry from a different repo.
+#
+# Raise this ONLY on a host whose coord actually enforces the per-repo
+# ceiling (>= the release carrying #1972). A higher global ceiling on an
+# older coord launches two same-repo drives, which stale each other's
+# Test verdicts (#1479) — the exact collision #1972 exists to prevent.
+ExecStart=%h/.local/bin/coord drive-queue tick --max-parallel 3 --config %h/.coord/coordinator.yml
 # Generous relative to the tick's own ~120s launch-subprocess timeout
 # (_LAUNCH_TIMEOUT_SECONDS in coord/commands/drive_queue.py), but well below
 # the timer's 15-minute cadence (coord-drive-queue.timer) so a genuinely
