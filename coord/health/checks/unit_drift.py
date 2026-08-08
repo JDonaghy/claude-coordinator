@@ -52,6 +52,31 @@ editable/source checkout, a configured directory, or an old wheel that ships
 no units) the verdict is annotated and a *match* grades UNKNOWN rather than
 OK: an un-annotated green from an unverified reference is worse than no
 check at all.
+
+#1928 — ``coord-agent.service`` is a template, not a plain file
+-----------------------------------------------------------------
+Unlike its siblings (byte-for-byte ``cp``-installed from ``deploy/``),
+``deploy/coord-agent.service`` carries ``<MACHINE_NAME>``/``<PORT>``
+placeholders that every real install fills in — via the documented manual
+``sed`` (leaving systemd's ``%h`` specifier alone) or via
+``install-agent.sh``'s inline heredoc (which expands ``%h`` to a literal
+``$HOME`` and drops the ~76-line doc-comment header entirely). A byte-diff
+against the raw template can never match either of those, so it warned on
+every host, permanently — and printed a bare ``cp`` remedy that, followed
+verbatim, installs the placeholders as literal text and takes the unit
+down.
+
+``_content_matches`` fixes this without weakening the check: it normalizes
+away the two kinds of noise that are never a real difference — comment/blank
+lines, and the ``%h`` vs. literal-``$HOME`` spelling — and then, only if the
+(normalized) reference still contains placeholder tokens, accepts an
+installed copy that fills them in *consistently* (the same placeholder
+resolves to the same value everywhere it appears). A unit that is missing a
+real property — e.g. elitebook's installed copy drops ``--machine``/
+``--port`` from ``ExecStart`` entirely rather than filling them in — still
+fails the match and still warns; that is a real defect, not template noise.
+The remedy for a still-drifting *templated* unit is never the bare ``cp``:
+see :func:`_templated_remedy`.
 """
 
 from __future__ import annotations
@@ -73,6 +98,28 @@ _SYSTEMD_USER_DIR = "~/.config/systemd/user"
 _RELEASE_MARKERS = ("/.local/bin", "/.coord-venv/bin")
 
 _PATH_LINE_RE = re.compile(r"^Environment\s*=\s*PATH=(.*)$", re.MULTILINE)
+
+# #1928: a template placeholder, e.g. `<MACHINE_NAME>` or `<PORT>` — see
+# `deploy/coord-agent.service`. Uppercase-with-underscores by convention so
+# it can never collide with a real systemd directive or value.
+_PLACEHOLDER_RE = re.compile(r"<([A-Z][A-Z0-9_]*)>")
+
+# Placeholders this module knows a real, safe substitution for — used to
+# build a runnable remedy in `_templated_remedy` instead of a bare `cp`
+# (#1928). Anything not listed here still gets a safe remedy, just not one
+# that reaches for a value this module has no business guessing.
+_KNOWN_PLACEHOLDER_VALUES = {
+    "MACHINE_NAME": "$(hostname -s)",
+    "PORT": "7433",
+}
+
+# Sentinel used to fold systemd's `%h` specifier and this host's literal
+# $HOME into one token before comparing unit text (#1928) — install-agent.sh
+# expands $HOME to a literal path in the unit it writes; deploy/*.service
+# and a manual sed-install both keep `%h` literal. Both are correct, so
+# neither spelling may count as drift. Chosen to be inert under re.escape()
+# (see `_placeholder_pattern`) and never appear in a real unit file.
+_HOME_TOKEN = "\x00HOME\x00"
 
 
 def packaged_unit_dir():
@@ -227,6 +274,123 @@ def _unit_files(deploy_dir):
     return sorted(out, key=lambda p: p.name)
 
 
+def _strip_noise_lines(text: str) -> str:
+    """Drop comment and blank lines.
+
+    Doc prose that never affects what systemd actually runs — and the
+    biggest source of #1928's false drift: `deploy/coord-agent.service`
+    carries ~76 lines of install documentation that `install-agent.sh`'s
+    generated unit never includes, so a raw byte-diff always "differed" on
+    that alone, template placeholders aside.
+    """
+    return "\n".join(
+        line for line in text.splitlines() if line.strip() and not line.strip().startswith("#")
+    )
+
+
+def _normalize_home(text: str, home: Path) -> str:
+    """Fold systemd's `%h` specifier and this host's literal $HOME into one
+    token (#1928), so a unit that spells its home directory either way
+    compares equal. `install-agent.sh`'s heredoc expands `$HOME` to a
+    literal path when it writes the unit; `deploy/coord-agent.service` and a
+    manual sed-install both leave `%h` for systemd to resolve at run time.
+    Both are correct — neither spelling is drift.
+    """
+    text = text.replace("%h", _HOME_TOKEN)
+    home_str = str(home)
+    if home_str and home_str != "/":
+        text = text.replace(home_str, _HOME_TOKEN)
+    return text
+
+
+def _normalize_unit_text(text: str, home: Path) -> str:
+    """Strip the noise `_content_matches` never treats as drift (#1928)."""
+    return _strip_noise_lines(_normalize_home(text, home))
+
+
+def _placeholder_pattern(normalized_deploy_text: str) -> re.Pattern[str]:
+    """Compile *normalized_deploy_text* into a regex matching any rendering
+    of its `<PLACEHOLDER>` tokens — each becomes a capture group on first
+    use and a backreference on repeat, so the same placeholder must resolve
+    to the same value everywhere it appears (#1928: `<PORT>` shows up in
+    both `Description=` and `ExecStart=` in `deploy/coord-agent.service`).
+
+    `re.escape()` leaves `<`, `>`, letters, digits and `_` untouched (see
+    module-level note on `_HOME_TOKEN`), so the placeholder tokens and the
+    home sentinel both survive escaping intact and are still findable.
+    """
+    seen: set[str] = set()
+
+    def repl(m: re.Match[str]) -> str:
+        name = m.group(1)
+        if name in seen:
+            return f"(?P={name})"
+        seen.add(name)
+        return f"(?P<{name}>.+?)"
+
+    escaped = re.escape(normalized_deploy_text)
+    return re.compile(_PLACEHOLDER_RE.sub(repl, escaped), re.DOTALL)
+
+
+def _content_matches(deploy_text: str, installed_text: str, home: Path) -> bool:
+    """Does *installed_text* satisfy *deploy_text* (#1928)?
+
+    Exact, modulo the noise `_normalize_unit_text` strips, when
+    *deploy_text* is a plain file (every lane but `coord-agent.service`
+    today). When *deploy_text* is a template — it still contains
+    `<PLACEHOLDER>` tokens after normalizing — an installed copy that fills
+    them in consistently also counts as a match: the placeholder is the
+    only thing allowed to differ, so a unit that's missing a real property
+    (e.g. `ExecStart` dropping `--machine`/`--port` entirely rather than
+    filling them in) still fails to match and still reports drift.
+    """
+    deploy_norm = _normalize_unit_text(deploy_text, home)
+    installed_norm = _normalize_unit_text(installed_text, home)
+    if deploy_norm == installed_norm:
+        return True
+    if not _PLACEHOLDER_RE.search(deploy_norm):
+        return False
+    return _placeholder_pattern(deploy_norm).fullmatch(installed_norm) is not None
+
+
+def _is_templated(deploy_text: str) -> bool:
+    """Does the *raw* reference text contain unfilled placeholders (#1928)?
+
+    Checked against the raw text, not the normalized one, purely so this
+    reads naturally at call sites that haven't normalized anything yet —
+    normalization never introduces or removes a `<PLACEHOLDER>` token.
+    """
+    return _PLACEHOLDER_RE.search(deploy_text) is not None
+
+
+def _templated_remedy(deploy_text: str, deploy_path: Path, installed_path: Path, service: str) -> str:
+    """The remedy for a still-drifting *templated* unit (#1928).
+
+    Never the bare `cp` the non-template branch prints: run verbatim, that
+    installs `<MACHINE_NAME>`/`<PORT>` as literal text and the unit refuses
+    to start — which is this issue's entire complaint. When every
+    placeholder in the template has a known, safe substitution (today:
+    `MACHINE_NAME`, `PORT`) the remedy is a real, runnable `sed` — copy-paste
+    safe, per #1928's acceptance criteria. If some future placeholder has no
+    known substitution, fall back to a pointer at the template's own
+    documented install procedure rather than guess a value.
+    """
+    names = sorted(set(_PLACEHOLDER_RE.findall(deploy_text)))
+    if names and all(n in _KNOWN_PLACEHOLDER_VALUES for n in names):
+        sed_args = " ".join(f'-e "s/<{n}>/{_KNOWN_PLACEHOLDER_VALUES[n]}/"' for n in names)
+        return (
+            f"{deploy_path} is a TEMPLATE — do not cp it verbatim (#1928). Render "
+            f"it for this host first: sed {sed_args} {deploy_path} > {installed_path} "
+            f"&& systemctl --user daemon-reload && systemctl --user restart {service}"
+        )
+    return (
+        f"{deploy_path} is a TEMPLATE ({', '.join(names)} placeholder(s)) — copying "
+        "it verbatim installs those as literal text and the unit will not start. "
+        f"See the install instructions at the top of {deploy_path} (sed substitution "
+        "or install-agent.sh) to render it for this host before installing."
+    )
+
+
 def _diff_summary(installed_text: str, deploy_text: str) -> tuple[int, int | None]:
     """(changed line count, first differing line number in the installed
     file) between two unit files — a cheap stand-in for a full diff in a
@@ -359,8 +523,13 @@ def probe_unit_drift(ctx: HealthContext) -> list[CheckResult]:
 
         values["installed"] = True
         values["installed_mtime"] = installed_mtime
-        matches = deploy_text == installed_text
+        # #1928: not a bare `==` — `deploy_text` may be a template (today,
+        # only coord-agent.service), and even for a plain file, comment/blank
+        # lines and %h-vs-literal-$HOME spelling are never real drift.
+        templated = _is_templated(deploy_text)
+        matches = _content_matches(deploy_text, installed_text, ctx.home)
         values["matches"] = matches
+        values["templated"] = templated
         shadow_entry = find_path_shadow(installed_text)
         values["shadow_entry"] = shadow_entry
 
@@ -393,9 +562,24 @@ def probe_unit_drift(ctx: HealthContext) -> list[CheckResult]:
             values["diff_lines"] = changed
             values["first_diff_line"] = first_line
             where = f", first differing at line {first_line}" if first_line else ""
-            # The remedy sources from the SAME file the diff read (#1927) —
-            # a `cp` out of an unverified checkout is how a stale unit got
-            # cemented in the first place.
+            # #1928: a templated reference (coord-agent.service) never gets
+            # the bare `cp` remedy below — followed verbatim it installs
+            # `<MACHINE_NAME>`/`<PORT>` as literal text and takes the unit
+            # down. See `_templated_remedy`.
+            if templated:
+                detail = (
+                    f"{_templated_remedy(deploy_text, deploy_path, installed_path, name.rsplit('.', 1)[0])}"
+                    f"   # reference: {reference.label}"
+                )
+            else:
+                # The remedy sources from the SAME file the diff read
+                # (#1927) — a `cp` out of an unverified checkout is how a
+                # stale unit got cemented in the first place.
+                detail = (
+                    f"cp {deploy_path} {installed_path} && systemctl --user "
+                    f"daemon-reload && systemctl --user restart "
+                    f"{name.rsplit('.', 1)[0]}   # reference: {reference.label}"
+                )
             results.append(
                 CheckResult(
                     check_id="unit_drift",
@@ -407,11 +591,7 @@ def probe_unit_drift(ctx: HealthContext) -> list[CheckResult]:
                         f"line(s) differ from {reference.short_label}"
                         f"{where}"
                     ),
-                    detail=(
-                        f"cp {deploy_path} {installed_path} && systemctl --user "
-                        f"daemon-reload && systemctl --user restart "
-                        f"{name.rsplit('.', 1)[0]}   # reference: {reference.label}"
-                    ),
+                    detail=detail,
                     threshold=f"warn when installed content != {reference.short_label}",
                     values=values,
                 )
