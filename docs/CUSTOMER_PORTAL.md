@@ -168,7 +168,7 @@ clock pauses nights/weekends/holidays), are unchanged from `PLATFORM_EVOLUTION.m
 
 | Piece | Choice | Why |
 |---|---|---|
-| Static site | **Pages** | builds from a **private** repo — GitHub Pages does not on the free plan |
+| Static site | **Pages** | same platform as the API — one deploy lane, no cross-origin boundary |
 | API | **Workers** | same platform, no server, no standing cost |
 | Records | **D1** | real SQL over SQLite; the record model is relational and small |
 | Artifacts | **R2** | mock bundles + screenshots; no egress fees |
@@ -182,17 +182,38 @@ are a bad pair.
 Standing cost is a domain name plus almost certainly $0 of Cloudflare's free tiers at this volume;
 budget ~$5/mo for headroom. Compare to ~$24–26/mo for the Azure path, most of it buying a SPOF.
 
-### Repo: separate and private
+### Repo: separate, public, MIT
 
-A public-facing web app has a different release cadence, a different threat model, a different
-toolchain, and a different set of secrets from the coordinator. It should not ride the coordinator's
-PyPI release lane or its four deploy surfaces. Private, because intake text and mocks are customer
-material and the repo will accumulate examples of both.
+**Separate.** A public-facing web app has a different release cadence, a different threat model, a
+different toolchain, and a different set of secrets from the coordinator. It should not ride the
+coordinator's PyPI release lane or its four deploy surfaces. This is the same class of question as
+the open **#1850** (*should `tui/` be extracted into its own repo*), and the answer here is clearer
+than there: the portal shares no build, no runtime, and no deploy path with `coord`. Only the sync
+contract couples them, and a contract is exactly what a repo boundary should carry.
 
-This is the same class of question as the open **#1850** (*should `tui/` be extracted into its own
-repo*), and the answer here is clearer than there: the portal shares no build, no runtime, and no
-deploy path with `coord`. Only the sync contract couples them, and a contract is exactly what a repo
-boundary should carry.
+**Public.** The portal is a thin client over a fleet it cannot reach — it holds no credentials that
+grant execution, no repo access, and no path inward (see *The security posture*). Its security rests
+on the tailnet ACL, the outbound-only bridge, and Access — never on the source being unreadable. So
+publishing the sync contract costs nothing, and the reflex to re-close the repo "to be safe" should
+be resisted: it would buy obscurity in exchange for a second release lane.
+
+> **Consequence — customer material never enters the repo.** Intake text, design rounds, mocks and
+> screenshots live in **D1 and R2 only**. Fixtures, seed data, and E2E specs use synthetic
+> submissions. A private repo would have made this a property of the host; a public one makes it a
+> rule that has to be held deliberately — which is why it is written down here and carried in #1980
+> and #1983. It is also the cleaner boundary: code in git, customer data in storage, nothing that
+> lives in both.
+
+**Secrets** follow from public: the Cloudflare API token, account and zone ids, and any provider key
+live in GitHub Actions secrets and `wrangler secret put` — never in `wrangler.toml`, never in a
+committed `.dev.vars`.
+
+**MIT.** Note the asymmetry, and that it is deliberate: `claude-coordinator` is **FSL-1.1-MIT**
+(source-available, no competing service for two years, then MIT), while the portal is permissive from
+day one. The portal is an intake and sign-off surface for a coordinator fleet — without one it is a
+form that talks to nothing. The defensible part is the pipeline it feeds (gates, oracle, review), and
+that part keeps its FSL. Matching FSL here would protect nothing that isn't already protected, at the
+cost of making the one component we might want others to read or reuse harder to adopt.
 
 **Domain:** a `heurontech.com` subdomain, DNS on Cloudflare — natural once Cloudflare is the host.
 
