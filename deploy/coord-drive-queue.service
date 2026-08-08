@@ -99,7 +99,20 @@ KillMode=process
 # ceiling (>= the release carrying #1972). A higher global ceiling on an
 # older coord launches two same-repo drives, which stale each other's
 # Test verdicts (#1479) — the exact collision #1972 exists to prevent.
-ExecStart=%h/.local/bin/coord drive-queue tick --max-parallel 3 --config %h/.coord/coordinator.yml
+# --max-parallel-per-repo 2 (2026-08-08): raised from the default 1 after
+# measuring that the queue ran DRY at 1/repo — every remaining entry was
+# claude-coordinator, so one lane was taken and the other two machines sat
+# idle with nothing eligible to give them. Two per repo is the only lever
+# that adds concurrency here: machine selection is least-loaded with no
+# per-machine ceiling (drive_state.pick_machine_choice), so nothing else
+# was constraining the fleet.
+#
+# COST, accepted deliberately: two drives in one repo can stale each
+# other's Test verdict (#1479). #1715's batch revalidation softens it but
+# does not remove it — on 2026-08-08 that collision cost two manual
+# interventions (#1950, #1895). If stale-verdict escalations start
+# recurring, drop this back to 1 before adding machinery to cope.
+ExecStart=%h/.local/bin/coord drive-queue tick --max-parallel 4 --max-parallel-per-repo 2 --config %h/.coord/coordinator.yml
 # Generous relative to the tick's own ~120s launch-subprocess timeout
 # (_LAUNCH_TIMEOUT_SECONDS in coord/commands/drive_queue.py), but well below
 # the timer's 15-minute cadence (coord-drive-queue.timer) so a genuinely
