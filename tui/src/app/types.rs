@@ -1643,7 +1643,14 @@ pub struct ReportDef {
     pub id: String,
     #[serde(default)]
     pub title: String,
+    // #1911: the sidebar's `MultiSectionView` section header is one line
+    // (title + badge) and the body is the parameter form — neither has room
+    // for a description, so nothing in `tui/**` reads this today. Kept
+    // (rather than dropped) because it is part of `GET /report`'s wire
+    // contract; deserialisation must not choke on a field the daemon still
+    // sends. Same posture as `ReportParamDef::free_form` just below.
     #[serde(default)]
+    #[allow(dead_code)]
     pub description: String,
     #[serde(default)]
     pub params: Vec<ReportParamDef>,

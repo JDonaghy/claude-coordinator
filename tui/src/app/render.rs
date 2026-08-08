@@ -111,9 +111,11 @@ impl ShellApp for CoordApp {
                 SidebarView::Audit => {
                     backend.draw_list(sidebar_rect, &self.audit_sidebar());
                 }
-                // #1741: Reports sidebar — catalogue size + last run summary.
+                // #1911: Reports sidebar — one collapsible section per
+                // catalogue entry (parameters + Run), moved here from the
+                // main panel so the grid gets the main panel to itself.
                 SidebarView::Reports => {
-                    backend.draw_list(sidebar_rect, &self.reports_sidebar());
+                    self.render_reports_sidebar(backend, sidebar_rect);
                 }
                 // #1866: Queue sidebar — the aggregate queue reading
                 // (running / waiting / blocked / held). The grid itself
@@ -528,8 +530,8 @@ impl ShellApp for CoordApp {
             SidebarView::Audit => {
                 self.render_audit_panel(backend, m, lh);
             }
-            // #1741: Reports panel — collapsible per-report section stack,
-            // with the last run's table + notes below it.
+            // #1911: Reports panel — the result grid + notes only; the
+            // section stack (parameters + Run) lives in the sidebar now.
             SidebarView::Reports => {
                 self.render_reports_panel(backend, m, lh);
             }

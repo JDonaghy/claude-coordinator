@@ -1,9 +1,19 @@
 //! Reports ActivityBar panel (#1741) — Phase B of the Reports feature.
 //!
-//! A stack of collapsible sections, one per entry in the report catalogue
-//! (`GET /report`, #1742). Each section's body is that report's parameter
-//! form plus a `Run` button; running it renders the resulting `ReportResult`
-//! as a `DataTable` with the notes block beneath.
+//! **#1911 split the panel across sidebar and main.** A stack of
+//! collapsible sections, one per entry in the report catalogue (`GET
+//! /report`, #1742), renders in the **sidebar** (`render_reports_sidebar`);
+//! each section's body is that report's parameter form plus a `Run` button.
+//! Running a report renders the resulting `ReportResult` as a `DataTable`,
+//! with the notes block beneath it, in the **main panel**
+//! (`render_reports_panel`) — nothing else lives there. Before #1911 the
+//! whole stack-then-table layout was stacked in the main panel alone,
+//! competing with the grid for height; see those two functions' docs for
+//! the split's mechanics, and `app/msv.rs` for the `MultiSectionView`
+//! render-then-hit-test contract both still follow (the sections just paint
+//! into a different `Rect` now — the click routing that consumes the cache
+//! moved from `mouse_main_click` to `mouse_sidebar_click` in `events.rs`,
+//! but nothing about the cache itself changed).
 //!
 //! **This module is a pure client over #1742.** It builds its section list
 //! and every parameter control from the catalogue's metadata at runtime —
@@ -170,6 +180,28 @@ impl CoordApp {
                 self.reports_expanded.insert(id);
             }
         }
+    }
+
+    /// Move the selected section by `delta` (`j`/`Down` = `1`, `k`/`Up` =
+    /// `-1`), clamped to the catalogue's bounds, and reset focus to the
+    /// section's first field. A no-op on an empty catalogue.
+    ///
+    /// Pulled out of the `j`/`k` key-handling match arms in `events.rs` so
+    /// a test can drive this exact behaviour directly: `reports_view`'s
+    /// `active_section` has no textual (or even colour) rendering in the
+    /// TUI rasteriser today — `paint_header` never reads it — so a
+    /// `TuiDriver`-based test has nothing on screen to assert against for
+    /// "which section did j/k select". Same trade `reports_step_choice`
+    /// already makes for `SegmentedControl`'s colour-only selection state.
+    pub(crate) fn reports_move_selection(&mut self, delta: isize) {
+        let n = self.reports_catalogue().len();
+        if n == 0 {
+            return;
+        }
+        let next = (self.reports_sel as isize + delta).clamp(0, n as isize - 1);
+        self.reports_sel = next as usize;
+        self.reports_field_sel = 0;
+        self.reports_clamp_field_sel();
     }
 
     /// Toggle one section's collapsed state (header click, or `Space`).
@@ -418,104 +450,62 @@ impl CoordApp {
         }
     }
 
-    /// Main-axis rows one section occupies: its header, plus its form's
-    /// fields when expanded. Mirrors `tui_msv_layout`'s own `measure`
-    /// closure (`SectionBody::Form(f) => f.fields.len()`), which is what
-    /// makes the carved `msv_rect` below exactly fit the stack.
-    fn reports_section_rows(&self, def: &ReportDef) -> usize {
-        1 + if self.reports_is_expanded(&def.id) {
-            Self::reports_field_count(def)
-        } else {
-            0
-        }
-    }
-
     // ── Sidebar ──────────────────────────────────────────────────────────
 
-    /// Sidebar content: the panel title, the catalogue size, and the last
-    /// run's window + row count. Follows `audit_sidebar` — a bare `ListView`,
-    /// not a `SidebarSystem` tree.
-    pub(crate) fn reports_sidebar(&self) -> ListView {
-        let n = self.reports_catalogue().len();
-        let mut items = vec![activity_item(
-            &format!("  {n} report{}", if n == 1 { "" } else { "s" }),
-            Color::rgb(160, 160, 160),
-        )];
-        if let Some(def) = self.reports_selected() {
-            items.push(activity_item(
-                &format!("  Selected: {}", def.title),
-                Color::rgb(150, 180, 220),
-            ));
-            // The catalogue's own one-liner — the only place it fits, since
-            // the section header is a single row of title + badge.
-            if !def.description.is_empty() {
-                items.push(activity_item(
-                    &format!("  {}", trunc(&def.description, 30)),
-                    Color::rgb(140, 140, 140),
-                ));
-            }
-            // The values the next run will actually use. A segmented
-            // control shows every option and marks the selected one with
-            // colour alone, which is invisible to anything reading the
-            // rendered grid (the operator squinting at a dim palette, and
-            // the screen-level tests) — this states it in text.
-            for param in &def.params {
-                let value = self.reports_param_value(&def.id, param);
-                let label = if param.label.is_empty() {
-                    param.id.as_str()
-                } else {
-                    param.label.as_str()
-                };
-                items.push(activity_item(
-                    &format!("  {label}: {value}"),
-                    Color::rgb(150, 180, 220),
-                ));
-            }
+    /// #1911: render the section stack (parameters + Run, one collapsible
+    /// section per catalogue entry) into the sidebar — moved here from the
+    /// main panel so the main panel is free to give the result grid the
+    /// space it actually needs.
+    ///
+    /// Same render-then-cache discipline as the pre-#1911 main-panel version
+    /// (`app/msv.rs`'s module docs): build the view, ask the backend for its
+    /// layout, paint from that layout, then stash it in `reports_layout` so
+    /// `events.rs`'s click routing (now in `mouse_sidebar_click`) hit-tests
+    /// the exact geometry that was painted.
+    ///
+    /// `Last run: N rows` and `Window: <w>` (pre-#1911 sidebar content) are
+    /// gone rather than moved: row count is self-evident from the grid the
+    /// main panel now has room to show, and the window is visible in the
+    /// parameters that produced it. `Running: <id>` survives as the
+    /// per-section badge (`reports_badge`) it already was.
+    pub(crate) fn render_reports_sidebar(&self, backend: &mut dyn Backend, rect: Rect) {
+        let catalogue = self.reports_catalogue();
+        if catalogue.is_empty() {
+            // #1911: deliberately terser than `render_reports_panel`'s
+            // counterpart of this message — the sidebar's default width (35
+            // cols) can't fit an arbitrary daemon-supplied failure reason
+            // without ugly mid-word truncation, and the main panel has the
+            // room and shows the same states with the full reason attached.
+            let message = if self.reports_error.is_some() {
+                "  No reports available.  (fetch failed)"
+            } else if self.reports_no_service {
+                "  No reports available.  (no board service)"
+            } else if self.reports_catalogue.is_none() {
+                "  Loading reports…"
+            } else {
+                "  No reports available.  (empty catalogue)"
+            };
+            self.reports_layout.borrow_mut().clear();
+            backend.draw_list(rect, &plain_list("reports-empty", message, 0));
+            return;
         }
-        match (&self.reports_running, &self.reports_result) {
-            (Some(id), _) => items.push(activity_item(
-                &format!("  Running: {id}"),
-                Color::rgb(230, 200, 120),
-            )),
-            (None, Some(result)) => {
-                items.push(activity_item(
-                    &format!(
-                        "  Last run: {} row{}",
-                        result.rows.len(),
-                        if result.rows.len() == 1 { "" } else { "s" }
-                    ),
-                    Color::rgb(140, 200, 140),
-                ));
-                if let Some(window) = Self::reports_window_label(result) {
-                    items.push(activity_item(
-                        &format!("  Window: {window}"),
-                        Color::rgb(150, 180, 220),
-                    ));
+
+        let view = self.reports_view();
+        let layout = backend.msv_layout(rect, &view);
+        backend.draw_multi_section_view(rect, &view);
+        let forms: Vec<Option<FormLayout>> = view
+            .sections
+            .iter()
+            .enumerate()
+            .map(|(i, section)| {
+                let body = layout.sections.get(i)?.body_bounds;
+                match (&section.body, section.collapsed) {
+                    (SectionBody::Form(form), false) => Some(backend.form_layout(body, form)),
+                    _ => None,
                 }
-            }
-            (None, None) => items.push(activity_item(
-                "  No run yet (Enter to run)",
-                Color::rgb(140, 140, 140),
-            )),
-        }
-        if let Some(err) = &self.reports_error {
-            items.push(activity_item(
-                &format!("  Error: {}", trunc(err, 28)),
-                Color::rgb(230, 130, 130),
-            ));
-        }
-        ListView {
-            id: WidgetId::new("reports-sidebar"),
-            title: Some(StyledText::plain(" REPORTS ")),
-            items,
-            selected_idx: 0,
-            scroll_offset: 0,
-            has_focus: false,
-            bordered: false,
-            h_scroll: 0,
-            max_content_width: None,
-            show_v_scrollbar: false,
-        }
+            })
+            .collect();
+        self.reports_layout.borrow_mut().set(layout, forms);
     }
 
     /// `"<start> → <end>"` for a result's window, or `None` when the daemon
@@ -887,15 +877,23 @@ impl CoordApp {
 
     // ── Render ───────────────────────────────────────────────────────────
 
-    /// Render the Reports main panel: the collapsible section stack on top,
-    /// the last run's result (table + notes) beneath it.
+    /// Render the Reports main panel: **only** the last run's result — the
+    /// grid, and its notes beneath it.
+    ///
+    /// #1911: the collapsible section stack (parameters + Run) that used to
+    /// sit above this and compete with the grid for height now lives in
+    /// `render_reports_sidebar` instead, so this panel gets the whole main
+    /// area. There is no "carve the stack off the top" split to do here any
+    /// more.
     pub(crate) fn render_reports_panel(&self, backend: &mut dyn Backend, rect: Rect, lh: f32) {
-        let catalogue = self.reports_catalogue();
-        if catalogue.is_empty() {
+        if self.reports_catalogue().is_empty() {
             // Deliberately NOT the audit panel's "treat unfetched and empty
             // identically" posture: an empty `/report` catalogue means the
             // daemon is older than #1742 (or unreachable), and that has to
-            // be diagnosable without attaching a debugger.
+            // be diagnosable without attaching a debugger. The full-detail
+            // counterpart of `render_reports_sidebar`'s short version of
+            // this message — this panel has the width for the daemon's own
+            // failure reason.
             let message = if let Some(reason) = &self.reports_error {
                 format!("  No reports available.  (catalogue fetch failed: {reason})")
             } else if self.reports_no_service {
@@ -905,84 +903,26 @@ impl CoordApp {
             } else {
                 "  No reports available.  (the daemon's catalogue is empty)".to_string()
             };
-            self.reports_layout.borrow_mut().clear();
             *self.reports_table_layout.borrow_mut() = None;
-            backend.draw_list(rect, &plain_list("reports-empty", &message, 0));
+            backend.draw_list(rect, &plain_list("reports-empty-main", &message, 0));
             return;
         }
+        self.render_reports_result(backend, rect, lh);
+    }
 
-        // #1762: drop last frame's table geometry up front. Every path that
-        // actually paints a table re-sets it below; every path that doesn't
-        // (an error, a run in flight, a zero-row result, a result area too
-        // short to draw into) leaves it `None`, so a header click can never
-        // be routed against a table that is no longer on screen.
+    /// The result area: an in-flight line, a failure, an explicit
+    /// no-activity body, or the table + notes.
+    fn render_reports_result(&self, backend: &mut dyn Backend, rect: Rect, lh: f32) {
+        // #1762: drop last frame's table geometry up front. Every path below
+        // that actually paints a table re-sets it; every path that doesn't
+        // (an error, a run in flight, no result yet, a zero-row result)
+        // leaves it `None`, so a header click can never be routed against a
+        // table that is no longer on screen. Pre-#1911 this lived in the
+        // caller (`render_reports_panel`), which had other reasons to run
+        // unconditionally before the empty-catalogue early return; now that
+        // this function IS the whole main panel, the clear belongs here.
         *self.reports_table_layout.borrow_mut() = None;
 
-        // Carve the section stack off the top at exactly the height it
-        // needs, so the remainder goes to the result. `lh` converts rows to
-        // backend units (1.0 per row in the TUI), same as `audit.rs`'s
-        // detail-pane split.
-        let stack_rows: usize = catalogue.iter().map(|d| self.reports_section_rows(d)).sum();
-        let max_rows = ((rect.height / lh).floor() as usize).max(1);
-        // Always leave at least a few rows for the result area once there is
-        // something to show there, so a long section stack can't hide it.
-        let reserve = if self.reports_has_result_area() {
-            Self::REPORTS_RESULT_MIN_ROWS
-        } else {
-            0
-        };
-        let msv_rows = stack_rows.min(max_rows.saturating_sub(reserve).max(1));
-        let msv_h = (msv_rows as f32 * lh).min(rect.height);
-        let msv_rect = Rect::new(rect.x, rect.y, rect.width, msv_h);
-
-        // Layout ONCE, paint from that layout, cache it for hit-testing —
-        // the contract `MultiSectionView` exists to enforce (see
-        // `app/msv.rs`'s module docs). `Backend::msv_layout` and
-        // `Backend::draw_multi_section_view` both delegate to the
-        // rasteriser's `tui_msv_layout`, so both consume identical metrics.
-        let view = self.reports_view();
-        let layout = backend.msv_layout(msv_rect, &view);
-        backend.draw_multi_section_view(msv_rect, &view);
-        let forms: Vec<Option<FormLayout>> = view
-            .sections
-            .iter()
-            .enumerate()
-            .map(|(i, section)| {
-                let body = layout.sections.get(i)?.body_bounds;
-                match (&section.body, section.collapsed) {
-                    (SectionBody::Form(form), false) => Some(backend.form_layout(body, form)),
-                    _ => None,
-                }
-            })
-            .collect();
-        self.reports_layout.borrow_mut().set(layout, forms);
-
-        let result_rect = Rect::new(
-            rect.x,
-            rect.y + msv_h,
-            rect.width,
-            (rect.height - msv_h).max(0.0),
-        );
-        if result_rect.height >= lh {
-            self.render_reports_result(backend, result_rect, lh);
-        }
-    }
-
-    /// Rows reserved for the result area whenever there is anything to show
-    /// there (a run, an error, or a completed result): enough for a table
-    /// header plus a couple of rows, so it can never be squeezed to nothing.
-    const REPORTS_RESULT_MIN_ROWS: usize = 6;
-
-    /// Whether the area below the section stack has anything to render.
-    fn reports_has_result_area(&self) -> bool {
-        self.reports_running.is_some()
-            || self.reports_result.is_some()
-            || self.reports_error.is_some()
-    }
-
-    /// The result area beneath the section stack: an in-flight line, a
-    /// failure, an explicit no-activity body, or the table + notes.
-    fn render_reports_result(&self, backend: &mut dyn Backend, rect: Rect, lh: f32) {
         // A failed run wins over any previously-completed result: leaving
         // the old table on screen under a fresh failure is the exact
         // "stale result" the acceptance criteria rule out.

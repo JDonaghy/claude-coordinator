@@ -40994,6 +40994,34 @@ Milestone tracking issue.
         )
     }
 
+    /// The current value of `report_id`'s `param_id` param, read straight
+    /// off app state.
+    ///
+    /// #1911: a `choice` param rendered as a `SegmentedControl` marks its
+    /// selected option with colour alone (`accent_fg` vs `dim_fg` in
+    /// `quadraui`'s TUI rasteriser) — `TuiDriver::screen()` is plain text
+    /// with no style information, so it cannot tell which option is
+    /// selected. Pre-#1911 the sidebar carried a redundant `"{label}:
+    /// {value}"` text line specifically so screen-text assertions (and a
+    /// human squinting at a dim palette) had a way to read the selection;
+    /// #1911 dropped that line as part of "sidebar is only the form now".
+    /// Reading the value straight off app state is the direct replacement —
+    /// same pattern the Settings-panel tests already use for their own
+    /// `SegmentedControl` fields.
+    fn reports_param_value_now(app: &CoordApp, report_id: &str, param_id: &str) -> String {
+        let def = app
+            .reports_catalogue()
+            .iter()
+            .find(|d| d.id == report_id)
+            .unwrap_or_else(|| panic!("report {report_id:?} not in catalogue"));
+        let param = def
+            .params
+            .iter()
+            .find(|p| p.id == param_id)
+            .unwrap_or_else(|| panic!("param {param_id:?} not on report {report_id:?}"));
+        app.reports_param_value(report_id, param)
+    }
+
     #[test]
     fn reports_activity_bar_button_opens_the_panel() {
         use quadraui::tui::testing::driver_with_shell;
@@ -41031,18 +41059,62 @@ Milestone tracking issue.
         }
     }
 
+    /// #1911 acceptance test: `Last run:` and `Window:` — the pre-#1911
+    /// sidebar summary bullets this issue explicitly dropped — must not
+    /// appear anywhere on screen, with or without a completed run. Row
+    /// count is self-evident from the grid now, and the window is visible
+    /// in the parameters that produced it.
     #[test]
-    fn reports_section_header_click_collapses_and_expands() {
+    fn reports_last_run_and_window_labels_are_gone() {
         use quadraui::tui::testing::driver_with_shell;
 
-        let app = make_app_with_reports(BoardData::default(), reports_catalogue_json(), None);
+        let result = reports_result_json();
+        let app = make_app_with_reports(
+            BoardData::default(),
+            reports_catalogue_json(),
+            Some(&result),
+        );
         let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
         click_activity_icon(&mut driver, "▤");
         driver.render();
 
-        // Target the chevron-prefixed header, which only the main pane
-        // renders — the sidebar also carries a "Selected: Issue Activity"
-        // line, and a bare `find("Issue Activity")` could land on either.
+        let screen = driver.screen();
+        assert!(driver.find("claude-coordinator#1629").is_some());
+        assert!(
+            !screen.contains("Last run:"),
+            "#1911: `Last run:` must be gone — row count is self-evident \
+                 from the grid:\n{screen}"
+        );
+        assert!(
+            !screen.contains("Window:"),
+            "#1911: `Window:` must be gone — it's visible in the \
+                 parameters that produced the result:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn reports_section_header_click_collapses_and_expands() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        // #1911: seed a completed result too, so this test can also pin
+        // "collapsing a section does not disturb the grid" — the section
+        // stack and the result grid are two entirely separate render
+        // functions now (`render_reports_sidebar` / `render_reports_panel`),
+        // but that separation is exactly the kind of thing a stray shared
+        // bit of state could quietly break.
+        let result = reports_result_json();
+        let app = make_app_with_reports(
+            BoardData::default(),
+            reports_catalogue_json(),
+            Some(&result),
+        );
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "▤");
+        driver.render();
+        assert!(driver.screen().contains("claude-coordinator#1629"));
+
+        // The chevron-prefixed header renders in the sidebar (moved there
+        // by #1911, from the main panel pre-#1911).
         let (x, y) = driver
             .find("▾ Issue Activity")
             .unwrap_or_else(|| panic!("section header not rendered:\n{}", driver.screen()));
@@ -41054,8 +41126,7 @@ Milestone tracking issue.
             collapsed.contains("▸ Issue Activity"),
             "#1741: a collapsed section must show the ▸ chevron:\n{collapsed}"
         );
-        // `7d` and `Run` are form-only strings (the sidebar's parameter
-        // lines show the *selected* value, `24h`, not every option).
+        // `7d` and `Run` are form-only strings.
         assert!(
             !collapsed.contains("7d"),
             "#1741: a collapsed section must hide its parameter form \
@@ -41066,12 +41137,19 @@ Milestone tracking issue.
             "#1741: a collapsed section must hide its Run button — a hidden \
                  form with a live trigger is worse than either:\n{collapsed}"
         );
+        // #1911: the main panel's grid must be unaffected — it renders from
+        // `reports_result`, which a sidebar-only collapse never touches.
+        assert!(
+            collapsed.contains("claude-coordinator#1629"),
+            "#1911: collapsing a sidebar section must not disturb the main \
+                 panel's grid:\n{collapsed}"
+        );
 
         // Clicking the header again restores it. Click the *title* this
         // time, not the chevron — both are `HeaderHit`s that toggle, and a
         // second click on the identical cell would be folded into a
         // `DoubleClick` by the backend's detector and never reach
-        // `mouse_main_click` at all.
+        // `mouse_sidebar_click` at all.
         let (x, y) = driver
             .find("▸ Issue Activity")
             .expect("collapsed header must still render");
@@ -41082,6 +41160,10 @@ Milestone tracking issue.
         assert!(
             expanded.contains("▾ Issue Activity") && expanded.contains("7d"),
             "#1741: clicking a collapsed header must re-expand it:\n{expanded}"
+        );
+        assert!(
+            expanded.contains("claude-coordinator#1629"),
+            "#1911: re-expanding must not disturb the grid either:\n{expanded}"
         );
     }
 
@@ -41117,69 +41199,76 @@ Milestone tracking issue.
                      render {needle:?} with zero tui/** changes:\n{screen}"
             );
         }
-        assert!(
-            screen.contains("2 reports"),
-            "#1741: the sidebar must count the catalogue it was given:\n{screen}"
-        );
     }
+
+    // #1911: `reports_segmented_control_click_selects_that_option` and
+    // `reports_arrow_keys_step_the_focused_choice_param` used to drive this
+    // through a `TuiDriver` and assert on the pre-#1911 sidebar's redundant
+    // `"{label}: {value}"` summary line. That line is gone (this issue
+    // dropped it along with `Last run:`/`Window:`), and there is no
+    // replacement to assert on: `SegmentedControl` marks its selected
+    // option with colour alone (`accent_fg` vs `dim_fg`, `quadraui`'s
+    // `tui/form.rs`), and `MultiSectionView`'s `active_section` isn't
+    // rendered distinctly at all in the TUI backend (`paint_header` never
+    // reads it) — so `TuiDriver::screen()`'s plain text has nothing to
+    // read either way. `TuiDriver::app()`/`app_mut()` can't fill the gap:
+    // both hand back the opaque `ShellAdapter`, not the concrete
+    // `CoordApp` inside it (see `PendingReportRun`'s doc comment in
+    // `fixtures.rs` for the same limitation hit from the other direction).
+    // These two tests therefore call the app methods directly — the same
+    // trade the Settings-panel `SegmentedControl` tests already make
+    // (`apply_settings_event_theme_mutates_and_returns_true` et al.).
 
     #[test]
     fn reports_segmented_control_click_selects_that_option() {
-        use quadraui::tui::testing::driver_with_shell;
-
-        let app = make_app_with_reports(BoardData::default(), reports_catalogue_json(), None);
-        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
-        click_activity_icon(&mut driver, "▤");
-        driver.render();
-
-        assert!(
-            driver.screen().contains("Time range: 24h"),
-            "#1741: the sidebar must show the catalogue's default before any \
-                 edit:\n{}",
-            driver.screen()
+        let mut app = make_app_with_reports(BoardData::default(), reports_catalogue_json(), None);
+        assert_eq!(
+            reports_param_value_now(&app, "issue-activity", "since"),
+            "24h",
+            "#1741: the catalogue's default must be selected before any edit"
         );
 
-        // The segmented control's per-option hit regions come from the form
-        // layout's synthetic `__seg_<idx>` ids — clicking the option text
-        // must select exactly that option.
-        let (x, y) = driver
-            .find("6h")
-            .unwrap_or_else(|| panic!("6h option not rendered:\n{}", driver.screen()));
-        driver.click(x, y);
-        driver.render();
-
-        assert!(
-            driver.screen().contains("Time range: 6h"),
-            "#1741: clicking a segmented option must select it:\n{}",
-            driver.screen()
+        // "since"'s choices are ["1h","6h","24h","3d","7d"] — index 1 is
+        // "6h". This is the exact id the real form layout hands
+        // `reports_apply_field_click` for a segmented option's per-item hit
+        // region (see `reports_param_form`'s `FieldKind::SegmentedControl`
+        // and `split_segment_id`); the click-to-id geometry itself is
+        // quadraui's own hit-testing contract, exercised by other
+        // driver-based Reports tests (e.g.
+        // `reports_section_header_click_collapses_and_expands`).
+        let field = WidgetId::new(format!(
+            "{}__seg_1",
+            CoordApp::reports_param_field_id("issue-activity", "since").as_str()
+        ));
+        assert!(app.reports_apply_field_click(0, &field));
+        assert_eq!(
+            reports_param_value_now(&app, "issue-activity", "since"),
+            "6h",
+            "#1741: clicking a segmented option must select it"
         );
     }
 
     #[test]
     fn reports_arrow_keys_step_the_focused_choice_param() {
-        use quadraui::tui::testing::driver_with_shell;
+        let mut app = make_app_with_reports(BoardData::default(), reports_catalogue_json(), None);
 
-        let app = make_app_with_reports(BoardData::default(), reports_catalogue_json(), None);
-        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
-        click_activity_icon(&mut driver, "▤");
-        driver.render();
-
-        // Field 0 of the selected section is `since` — → steps forward
+        // Field 0 of the selected section is `since` (`reports_sel` and
+        // `reports_field_sel` both default to `0`) — → steps forward
         // through the catalogue's own choices (24h → 3d), ← comes back.
-        driver.press_named(NamedKey::Right);
-        driver.render();
-        assert!(
-            driver.screen().contains("Time range: 3d"),
-            "#1741: → must step the focused choice param forward:\n{}",
-            driver.screen()
+        // `reports_step_choice` is exactly what the `Right`/`Left` key
+        // arms in `events.rs` call.
+        app.reports_step_choice(true);
+        assert_eq!(
+            reports_param_value_now(&app, "issue-activity", "since"),
+            "3d",
+            "#1741: → must step the focused choice param forward"
         );
 
-        driver.press_named(NamedKey::Left);
-        driver.render();
-        assert!(
-            driver.screen().contains("Time range: 24h"),
-            "#1741: ← must step it back:\n{}",
-            driver.screen()
+        app.reports_step_choice(false);
+        assert_eq!(
+            reports_param_value_now(&app, "issue-activity", "since"),
+            "24h",
+            "#1741: ← must step it back"
         );
     }
 
@@ -41215,7 +41304,7 @@ Milestone tracking issue.
             );
         }
 
-        let (_, table_y) = driver
+        let (table_x, table_y) = driver
             .find("claude-coordinator#1629")
             .expect("result row must render");
         let (_, notes_y) = driver.find("ANOMALY_MARKER").expect("note must render");
@@ -41224,18 +41313,66 @@ Milestone tracking issue.
             "#1741: the notes block must render BELOW the table \
                  (table_y={table_y} notes_y={notes_y})"
         );
-        let (_, section_y) = driver
+        // #1911: the section stack moved to the sidebar, so it now renders
+        // to the LEFT of the result table (main panel) rather than above
+        // it — the sidebar's whole x-range precedes the main panel's, so
+        // any sidebar text has a smaller x than any main-panel text.
+        let (section_x, _) = driver
             .find("Issue Activity")
             .expect("section header must render");
         assert!(
-            table_y > section_y,
-            "#1741: the result must render below the section stack \
-                 (section_y={section_y} table_y={table_y})"
+            table_x > section_x,
+            "#1741: the result must render in the main panel, to the right \
+                 of the sidebar's section stack (section_x={section_x} \
+                 table_x={table_x})"
         );
         assert!(
             screen.contains("2 rows"),
             "#1741: the section badge must summarise the last run:\n{screen}"
         );
+    }
+
+    /// #1911 acceptance test: the main panel is grid + notes ONLY — no
+    /// parameter form, anywhere in it. "It still works" (the sidebar
+    /// having gained the sections) is the easy way to accidentally leave a
+    /// stray copy of the old main-panel layout in place; this pins the
+    /// negative.
+    #[test]
+    fn reports_main_panel_has_no_parameter_forms() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let result = reports_result_json();
+        let app = make_app_with_reports(
+            BoardData::default(),
+            reports_catalogue_json(),
+            Some(&result),
+        );
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "▤");
+        driver.render();
+
+        let screen = driver.screen();
+        let (table_x, _) = driver
+            .find("claude-coordinator#1629")
+            .expect("result row must render in the main panel");
+
+        // Every bit of parameter-form chrome — a choice param's label, a
+        // text param's label, the Run button — must sit to the LEFT of the
+        // main panel's own content (i.e. still inside the sidebar), never
+        // at or past the main panel's x. `find` returns each needle's only
+        // occurrence on screen (the pre-#1911 main panel is the one place
+        // that could have duplicated it), so a hit at `x >= table_x` means
+        // the form leaked into the main panel.
+        for needle in ["Time range", "Repo", "Run"] {
+            let (x, _) = driver
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} must render in the sidebar:\n{screen}"));
+            assert!(
+                x < table_x,
+                "#1911: {needle:?} must render in the sidebar (x={x}), not \
+                     leak into the main panel (grid starts at x={table_x}):\n{screen}"
+            );
+        }
     }
 
     #[test]
@@ -41353,6 +41490,49 @@ Milestone tracking issue.
         );
     }
 
+    /// #1911 acceptance test: a run started from the sidebar's Run button
+    /// must land its rows in the MAIN panel's grid. Delivers the completed
+    /// result on the channel `reports_start_run` opens (the same one the
+    /// Run click above puts in flight) rather than clicking Run and waiting
+    /// on it live — a real click spawns a real background fetch that never
+    /// resolves under `cfg(test)` (no board service), same as
+    /// `reports_run_click_marks_the_report_in_flight` notes. Combined with
+    /// that test (click → in flight) this pins the whole path the #1911
+    /// sidebar move had to keep intact: Run lives in the sidebar now, but
+    /// firing it still ends with the result in the main panel, never the
+    /// sidebar.
+    #[test]
+    fn reports_completed_run_populates_the_main_panel_grid() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let (app, pending) = make_app_with_reports_awaiting_run(
+            BoardData::default(),
+            reports_catalogue_json(),
+            &reports_result_json_empty(),
+        );
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "▤");
+        driver.render();
+        assert!(
+            !driver.screen().contains("claude-coordinator#1629"),
+            "sanity: the seeded result has no rows yet:\n{}",
+            driver.screen()
+        );
+
+        assert!(
+            pending.deliver(&reports_result_json()),
+            "#1911 fixture: the queued result must parse and send"
+        );
+        reports_idle_tick(&mut driver);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("claude-coordinator#1629") && screen.contains("claude-coordinator#1631"),
+            "#1911: a completed run fired from the sidebar's Run button must \
+                 populate the main panel's grid:\n{screen}"
+        );
+    }
+
     #[test]
     fn reports_r_key_reruns_the_selected_report() {
         use quadraui::tui::testing::driver_with_shell;
@@ -41429,8 +41609,11 @@ Milestone tracking issue.
         driver.render();
 
         let screen = driver.screen();
+        // #1911: same rendering change as the Backspace test above — the
+        // `TextInput` field shows its live value in brackets now, not a
+        // sidebar summary line.
         assert!(
-            screen.contains("Repo: quadraui"),
+            screen.contains("[quadraui]"),
             "#1741: typing into a focused text param must edit it:\n{screen}"
         );
         assert!(
@@ -41469,8 +41652,11 @@ Milestone tracking issue.
         driver.press_named(NamedKey::Backspace);
         driver.render();
 
+        // #1911: the `TextInput` field itself (in the sidebar now) renders
+        // its live value in brackets (`[ab]`) — the pre-#1911 redundant
+        // sidebar summary line (`"Repo: ab"`) this used to check is gone.
         assert!(
-            driver.screen().contains("Repo: ab"),
+            driver.screen().contains("[ab]"),
             "#1741: Backspace must delete from the focused text param:\n{}",
             driver.screen()
         );
@@ -41478,32 +41664,34 @@ Milestone tracking issue.
 
     #[test]
     fn reports_j_k_move_between_sections() {
-        use quadraui::tui::testing::driver_with_shell;
-
-        let app = make_app_with_reports(
+        // #1911: the sidebar no longer carries a redundant "Selected: X"
+        // text line (dropped along with `Last run:`/`Window:`), and
+        // `MultiSectionView`'s `active_section` isn't rendered distinctly
+        // at all in the TUI backend — see the block comment above
+        // `reports_segmented_control_click_selects_that_option` for the
+        // full reasoning. Drives `reports_move_selection` directly (the
+        // exact method the `j`/`k` key arms in `events.rs` call) rather
+        // than through a `TuiDriver`.
+        let mut app = make_app_with_reports(
             BoardData::default(),
             reports_catalogue_json_two_reports(),
             None,
         );
-        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
-        click_activity_icon(&mut driver, "▤");
-        driver.render();
-        assert!(driver.screen().contains("Selected: Issue Activity"));
+        let selected_title = |app: &CoordApp| app.reports_selected().map(|d| d.title.clone());
+        assert_eq!(selected_title(&app).as_deref(), Some("Issue Activity"));
 
-        driver.type_char('j');
-        driver.render();
-        assert!(
-            driver.screen().contains("Selected: Worker Throughput"),
-            "#1741: j must move to the next section:\n{}",
-            driver.screen()
+        app.reports_move_selection(1);
+        assert_eq!(
+            selected_title(&app).as_deref(),
+            Some("Worker Throughput"),
+            "#1741: j must move to the next section"
         );
 
-        driver.type_char('k');
-        driver.render();
-        assert!(
-            driver.screen().contains("Selected: Issue Activity"),
-            "#1741: k must move back:\n{}",
-            driver.screen()
+        app.reports_move_selection(-1);
+        assert_eq!(
+            selected_title(&app).as_deref(),
+            Some("Issue Activity"),
+            "#1741: k must move back"
         );
     }
 
@@ -42752,6 +42940,65 @@ Milestone tracking issue.
         );
     }
 
+    /// #1911 "Second constraint: width" — the issue asked to verify
+    /// parameter forms stay usable at the sidebar's default width before
+    /// committing to this layout, and to say so rather than silently
+    /// truncate a field into ambiguity if it doesn't fit.
+    ///
+    /// At the shell's default sidebar width (35 cols, `shell_config()`),
+    /// every field here renders. `usage`'s three params (`window`: 5
+    /// choices, `group_by`: 2 choices, `repo`: text) are the widest
+    /// parameter set in the production catalogue — wider than
+    /// `issue-activity`'s `since`/`until`/`repo`, which fit with room to
+    /// spare.
+    ///
+    /// One known imperfection, deliberately NOT worked around here:
+    /// `window`'s `SegmentedControl` (`Time window[today|week|month|7d|
+    /// 30d]`, ~36 cells including its label) is ~1 cell wider than the
+    /// 35-col default, and quadraui's TUI `SegmentedControl` painter
+    /// (`tui/form.rs`) hard-truncates at the viewport edge with no
+    /// ellipsis/wrap — so the LAST option's closing bracket gets clipped
+    /// (`...7d|30` — the `d]` is lost). Every option's own text still
+    /// starts inside the visible width (this test's assertions below all
+    /// pass), so the effect is "one option's tail is cut", not
+    /// label-ambiguity across the whole control, and widening the sidebar
+    /// (up to quadraui's configured max of 55) removes it entirely. Fixing
+    /// the painter to ellipsis/wrap instead of hard-truncating is a
+    /// quadraui change — out of this issue's scope (see CLAUDE.md's
+    /// path-dep rules for `~/src/quadraui`); noted here rather than
+    /// silently accepted.
+    #[test]
+    fn reports_widest_catalogue_params_stay_usable_at_default_sidebar_width() {
+        use quadraui::tui::testing::driver_with_shell;
+        let catalogue = r#"{"reports":[{"id":"usage","title":"Usage","description":"d","params":[
+            {"id":"window","label":"Time window","kind":"choice","choices":["today","week","month","7d","30d"],"default":"today","help":""},
+            {"id":"group_by","label":"Group by","kind":"choice","choices":["issue","repo"],"default":"issue","help":""},
+            {"id":"repo","label":"Repo","kind":"text","choices":[],"default":"","help":"Empty means all repos"}
+        ]}]}"#;
+        let app = make_app_with_reports(BoardData::default(), catalogue, None);
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "▤");
+        driver.render();
+
+        let screen = driver.screen();
+        for needle in [
+            "Time window",
+            "today",
+            "week",
+            "month",
+            "Group by",
+            "issue",
+            "Repo",
+            "Run",
+        ] {
+            assert!(
+                screen.contains(needle),
+                "#1911: {needle:?} must stay readable at the sidebar's \
+                     default width:\n{screen}"
+            );
+        }
+    }
+
     // ── #1765: Export a report to CSV ────────────────────────────────────
     //
     // The Export affordance is the section header's `HeaderAction`
@@ -43138,8 +43385,12 @@ Milestone tracking issue.
 
     /// Terminal size for the #1910 scroll tests: wide enough for both
     /// columns, short enough (30 rows) that the 60-row fixture below needs
-    /// real scrolling — the table's own viewport works out to 24 visible
-    /// rows (`ROW-000`..`ROW-023` on the first frame), well short of 60.
+    /// real scrolling — the table's own viewport works out to 28 visible
+    /// rows (`ROW-000`..`ROW-027` on the first frame), well short of 60.
+    ///
+    /// #1911: 28, not the pre-#1911 24 — the result table is now the whole
+    /// main panel (no section stack sharing it above), so the same terminal
+    /// height yields a taller viewport.
     const REPORTS_SCROLL_COLS: u16 = 140;
     const REPORTS_SCROLL_ROWS: u16 = 30;
 
@@ -43168,30 +43419,31 @@ Milestone tracking issue.
             REPORTS_SCROLL_ROWS,
         );
         // Sanity on the unscrolled first frame: the fold is between
-        // ROW-023 (last visible) and ROW-024 (first hidden).
+        // ROW-027 (last visible) and ROW-028 (first hidden).
         let anchor = driver
             .find("ROW-000")
             .expect("first row must render before any scroll");
         assert!(
-            driver.find("ROW-024").is_none(),
-            "#1910: ROW-024 must start below the fold on the first frame:\n{}",
+            driver.find("ROW-028").is_none(),
+            "#1910: ROW-028 must start below the fold on the first frame:\n{}",
             driver.screen()
         );
 
-        // 12 wheel-down notches (3 rows each = 36) exactly reaches this
-        // fixture's max scroll (60 rows - 24 visible = 36), so the table
-        // ends showing ROW-036..ROW-059.
-        for _ in 0..12 {
+        // 11 wheel-down notches (3 rows each = 33) overshoots this
+        // fixture's max scroll (60 rows - 28 visible = 32) by one row, so
+        // the clamp lands exactly at 32 and the table ends showing
+        // ROW-032..ROW-059.
+        for _ in 0..11 {
             reports_wheel(&mut driver, anchor, -1.0);
         }
         assert!(
             driver.find("ROW-059").is_some(),
-            "#1910: 12 wheel-down notches must reach the last row:\n{}",
+            "#1910: 11 wheel-down notches must reach the last row:\n{}",
             driver.screen()
         );
         assert!(
-            driver.screen().contains("ROW-036"),
-            "#1910: the table must have scrolled to show ROW-036 at the top:\n{}",
+            driver.screen().contains("ROW-032"),
+            "#1910: the table must have scrolled to show ROW-032 at the top:\n{}",
             driver.screen()
         );
         assert!(
@@ -43213,7 +43465,7 @@ Milestone tracking issue.
         );
 
         // Wheel back up to the top.
-        for _ in 0..12 {
+        for _ in 0..11 {
             reports_wheel(&mut driver, anchor, 1.0);
         }
         assert!(
