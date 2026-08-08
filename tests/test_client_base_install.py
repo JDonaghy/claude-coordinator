@@ -121,11 +121,23 @@ def test_server_dep_is_in_the_server_extra(module: str) -> None:
 
 
 def test_base_dependencies_are_the_client_set() -> None:
-    """Base install = click + pyyaml + httpx + platformdirs. Pinned as an
-    exact set so a new base dependency is a deliberate, reviewed decision
-    rather than something that drifts in unnoticed."""
+    """Base install = click + pyyaml + httpx + platformdirs, plus tzdata on
+    Windows only. Pinned as an exact set so a new base dependency is a
+    deliberate, reviewed decision rather than something that drifts in
+    unnoticed.
+
+    `tzdata` (#1895) is the one marker-gated entry. Windows ships no IANA
+    time-zone database, and `zoneinfo` is imported by production modules
+    (coord/config.py, coord/models.py, coord/failure_class.py,
+    coord/machine_pause.py), so a Windows client raises
+    ZoneInfoNotFoundError on any named-zone lookup without it. It is
+    `sys_platform == "win32"`-gated, so it costs a POSIX client nothing and
+    does not widen the client install this test exists to keep narrow.
+    Caught by the windows-latest job #1895 adds, which died during
+    collection on `America/Chicago` before running a single test.
+    """
     base = _requirement_names(_pyproject()["project"]["dependencies"])
-    assert base == {"click", "pyyaml", "httpx", "platformdirs"}
+    assert base == {"click", "pyyaml", "httpx", "platformdirs", "tzdata"}
 
 
 def test_dev_and_all_extras_pull_in_the_server_extra() -> None:
