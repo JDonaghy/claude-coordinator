@@ -4,6 +4,15 @@
 > claude-coordinator from a single-fleet local tool into a cloud-coordinated, multi-engineer
 > platform with an eventual non-technical **customer portal**. Not committed direction — a
 > thinking artifact to react to.
+>
+> **⚠️ Superseded for the portal (2026-08-07):** the *Phase-2 spike* and *Where the customer portal
+> sits* sections below are **no longer the sequencing authority** — see
+> [`CUSTOMER_PORTAL.md`](CUSTOMER_PORTAL.md) (milestone #23, epic #836). Making the portal
+> **asynchronous** and **outbound-polled** removes its dependency on Phases 1/3/5 entirely: no Cloud
+> API extraction, no Azure Postgres, no standing Tailscale subnet router. The status vocabulary and
+> up-mapping analysis below still stand and are carried forward unchanged. **Phases 1, 3, 4 and 6
+> are unaffected** — they remain the plan for the cloud/multi-engineer platform, which the portal no
+> longer waits on.
 
 ## Intent
 
