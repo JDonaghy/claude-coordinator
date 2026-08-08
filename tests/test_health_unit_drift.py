@@ -464,3 +464,288 @@ def test_in_git_worktree_distinguishes_a_checkout_from_site_packages(
     site = tmp_path / "venv" / "lib" / "site-packages" / "coord" / "deploy"
     site.mkdir(parents=True)
     assert ud.in_git_worktree(site) is False
+
+
+# ── #1928: coord-agent.service is a template, not a plain file ────────────
+#
+# `deploy/coord-agent.service` carries `<MACHINE_NAME>`/`<PORT>` placeholders
+# that every real install fills in — a byte-diff against it warned on every
+# host, permanently, and its remedy was a bare `cp` that (followed verbatim)
+# installs the placeholders as literal text and takes the unit down. These
+# mirror a shrunk version of the real template plus the two real install
+# shapes described in the issue: a manual sed-install (keeps the ~76-line
+# doc header and `%h`) and an install-agent.sh install (drops the header,
+# expands `%h` to a literal $HOME, adds its own small PATH comment).
+
+TEMPLATE_UNIT = (
+    "# some doc comment\n"
+    "# another doc comment\n"
+    "\n"
+    "[Unit]\n"
+    "Description=Coordinator agent server (port <PORT>)\n"
+    "After=network-online.target\n"
+    "\n"
+    "[Service]\n"
+    "Type=simple\n"
+    "ExecStart=%h/.coord-venv/bin/coord agent --machine <MACHINE_NAME> --port <PORT>\n"
+    "Restart=on-failure\n"
+    "RestartSec=5\n"
+    "Environment=PATH=%h/.coord-venv/bin:%h/.cargo/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin\n"
+    "\n"
+    "[Install]\n"
+    "WantedBy=default.target\n"
+)
+
+
+def _sed_installed(home: Path, machine: str = "dellserver", port: str = "7433") -> str:
+    """The manual-install shape: `<MACHINE_NAME>`/`<PORT>` filled in, `%h`
+    and the doc-comment header left exactly as the template has them."""
+    return TEMPLATE_UNIT.replace("<MACHINE_NAME>", machine).replace("<PORT>", port)
+
+
+def _agent_installer_installed(home: Path, machine: str = "dellserver", port: str = "7433") -> str:
+    """The install-agent.sh shape: no doc header, `%h` expanded to a literal
+    $HOME, its own small PATH comment — see `install-agent.sh`'s heredoc."""
+    return (
+        "[Unit]\n"
+        f"Description=Coordinator agent server (port {port})\n"
+        "After=network-online.target\n"
+        "\n"
+        "[Service]\n"
+        "Type=simple\n"
+        f"ExecStart={home}/.coord-venv/bin/coord agent --machine {machine} --port {port}\n"
+        "Restart=on-failure\n"
+        "RestartSec=5\n"
+        "# #1671: include ~/.cargo/bin so a rustup-installed toolchain resolves\n"
+        f"Environment=PATH={home}/.coord-venv/bin:{home}/.cargo/bin:{home}/.local/bin:/usr/local/bin:/usr/bin:/bin\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=default.target\n"
+    )
+
+
+def test_sed_installed_template_reports_no_drift(tmp_path, monkeypatch) -> None:
+    """The documented manual install (sed `<MACHINE_NAME>`/`<PORT>`, leave
+    `%h` and the header alone) must grade OK — acceptance criterion 1."""
+    packaged = tmp_path / "site-packages" / "coord" / "deploy"
+    packaged.mkdir(parents=True)
+    (packaged / "coord-agent.service").write_text(TEMPLATE_UNIT)
+    use_packaged(monkeypatch, packaged)
+    _install(tmp_path, "coord-agent.service", _sed_installed(tmp_path))
+
+    (r,) = ud.probe_unit_drift(make_ctx(tmp_path))
+    assert r.severity is Severity.OK
+    assert r.values["matches"] is True
+    assert r.values["templated"] is True
+
+
+def test_install_agent_sh_installed_template_reports_no_drift(tmp_path, monkeypatch) -> None:
+    """The real-world install path (install-agent.sh's heredoc) must also
+    grade OK — this is the actual shape running on the fleet in #1928."""
+    packaged = tmp_path / "site-packages" / "coord" / "deploy"
+    packaged.mkdir(parents=True)
+    (packaged / "coord-agent.service").write_text(TEMPLATE_UNIT)
+    use_packaged(monkeypatch, packaged)
+    _install(tmp_path, "coord-agent.service", _agent_installer_installed(tmp_path))
+
+    (r,) = ud.probe_unit_drift(make_ctx(tmp_path))
+    assert r.severity is Severity.OK
+    assert r.values["matches"] is True
+
+
+def test_different_machine_and_port_values_still_match_consistently(tmp_path, monkeypatch) -> None:
+    """`<PORT>` appears twice (Description and ExecStart) — both occurrences
+    must resolve to the SAME value, but any value is acceptable."""
+    packaged = tmp_path / "site-packages" / "coord" / "deploy"
+    packaged.mkdir(parents=True)
+    (packaged / "coord-agent.service").write_text(TEMPLATE_UNIT)
+    use_packaged(monkeypatch, packaged)
+    _install(
+        tmp_path,
+        "coord-agent.service",
+        _agent_installer_installed(tmp_path, machine="precision", port="7500"),
+    )
+
+    (r,) = ud.probe_unit_drift(make_ctx(tmp_path))
+    assert r.severity is Severity.OK
+
+
+def test_inconsistent_placeholder_values_still_report_drift(tmp_path, monkeypatch) -> None:
+    """If the two `<PORT>` occurrences resolve to DIFFERENT values, that's a
+    real inconsistency (hand-edited unit, botched substitution) — not
+    something placeholder-tolerance should paper over."""
+    packaged = tmp_path / "site-packages" / "coord" / "deploy"
+    packaged.mkdir(parents=True)
+    (packaged / "coord-agent.service").write_text(TEMPLATE_UNIT)
+    use_packaged(monkeypatch, packaged)
+    installed = _agent_installer_installed(tmp_path, machine="dellserver", port="7433")
+    installed = installed.replace("(port 7433)", "(port 9999)", 1)
+    _install(tmp_path, "coord-agent.service", installed)
+
+    (r,) = ud.probe_unit_drift(make_ctx(tmp_path))
+    assert r.severity is Severity.WARN
+    assert r.values["matches"] is False
+
+
+def test_missing_required_flags_still_report_drift(tmp_path, monkeypatch) -> None:
+    """elitebook's real #1928 shape: ExecStart drops `--machine`/`--port`
+    entirely instead of filling them in — a real defect, and placeholder
+    tolerance must not paper over it (acceptance criterion 2)."""
+    packaged = tmp_path / "site-packages" / "coord" / "deploy"
+    packaged.mkdir(parents=True)
+    (packaged / "coord-agent.service").write_text(TEMPLATE_UNIT)
+    use_packaged(monkeypatch, packaged)
+    installed = _agent_installer_installed(tmp_path).replace(
+        "coord agent --machine dellserver --port 7433",
+        "coord agent",
+    )
+    _install(tmp_path, "coord-agent.service", installed)
+
+    (r,) = ud.probe_unit_drift(make_ctx(tmp_path))
+    assert r.severity is Severity.WARN
+    assert r.values["matches"] is False
+    assert r.values["templated"] is True
+
+
+def test_templated_unit_warn_never_prints_a_bare_cp_remedy(tmp_path, monkeypatch) -> None:
+    """Acceptance criterion 3: followed verbatim, the remedy for a
+    still-drifting templated unit must not install unresolved placeholders."""
+    packaged = tmp_path / "site-packages" / "coord" / "deploy"
+    packaged.mkdir(parents=True)
+    deploy_path = packaged / "coord-agent.service"
+    deploy_path.write_text(TEMPLATE_UNIT)
+    use_packaged(monkeypatch, packaged)
+    # Inconsistent `<PORT>` occurrences (Description says 7433, ExecStart
+    # says 9999) — a real defect the placeholder tolerance must not paper
+    # over, used here purely to force the WARN path this test inspects.
+    broken = _agent_installer_installed(tmp_path).replace("(port 7433)", "(port 9999)", 1)
+    installed_path = _install(tmp_path, "coord-agent.service", broken)
+
+    (r,) = ud.probe_unit_drift(make_ctx(tmp_path))
+    assert r.severity is Severity.WARN
+    assert f"cp {deploy_path} {installed_path}" not in r.detail
+    assert "sed" in r.detail
+    assert "TEMPLATE" in r.detail
+    # The remedy must not be pasted as a `cp` that carries the raw
+    # placeholders into the install target.
+    assert "<MACHINE_NAME>" not in r.detail.split("sed")[0]
+
+
+def test_unknown_placeholder_falls_back_to_a_documentation_pointer(tmp_path, monkeypatch) -> None:
+    """A placeholder this module has no known safe substitution for must not
+    be guessed at — the remedy points at the template's own docs instead."""
+    packaged = tmp_path / "site-packages" / "coord" / "deploy"
+    packaged.mkdir(parents=True)
+    weird_template = TEMPLATE_UNIT.replace("<MACHINE_NAME>", "<SOME_FUTURE_FIELD>")
+    (packaged / "coord-agent.service").write_text(weird_template)
+    use_packaged(monkeypatch, packaged)
+    _install(tmp_path, "coord-agent.service", "[Unit]\nnot even close\n")
+
+    (r,) = ud.probe_unit_drift(make_ctx(tmp_path))
+    assert r.severity is Severity.WARN
+    assert "cp " not in r.detail
+    assert "SOME_FUTURE_FIELD" in r.detail
+
+
+def test_non_templated_lane_keeps_the_bare_cp_remedy(tmp_path, monkeypatch) -> None:
+    """Only a templated reference changes the remedy — every other lane is
+    still `cp`-installed directly from `deploy/`, so the old remedy stays
+    correct and unchanged for it."""
+    packaged = tmp_path / "site-packages" / "coord" / "deploy"
+    packaged.mkdir(parents=True)
+    (packaged / "coord-serve.service").write_text(UNIT_TEXT + "Extra=1\n")
+    use_packaged(monkeypatch, packaged)
+    _install(tmp_path, "coord-serve.service", UNIT_TEXT)
+
+    (r,) = ud.probe_unit_drift(make_ctx(tmp_path))
+    assert r.severity is Severity.WARN
+    assert r.values["templated"] is False
+    assert "cp" in r.detail and "restart" in r.detail
+
+
+def test_comment_only_diff_is_not_drift(tmp_path, monkeypatch) -> None:
+    """A unit whose only difference from the reference is doc comments —
+    e.g. install-agent.sh's PATH comment that `deploy/` doesn't carry — is
+    not drift; comments never affect what systemd runs."""
+    packaged = tmp_path / "site-packages" / "coord" / "deploy"
+    packaged.mkdir(parents=True)
+    (packaged / "coord-serve.service").write_text(UNIT_TEXT)
+    use_packaged(monkeypatch, packaged)
+    _install(tmp_path, "coord-serve.service", "# an extra comment\n" + UNIT_TEXT)
+
+    (r,) = ud.probe_unit_drift(make_ctx(tmp_path))
+    assert r.severity is Severity.OK
+    assert r.values["matches"] is True
+
+
+def test_literal_home_and_percent_h_specifier_are_equivalent(tmp_path, monkeypatch) -> None:
+    """install-agent.sh expands `%h` to this host's literal $HOME when it
+    writes the unit; `deploy/` keeps `%h` literal for systemd to resolve.
+    Both are correct — neither spelling is drift."""
+    packaged = tmp_path / "site-packages" / "coord" / "deploy"
+    packaged.mkdir(parents=True)
+    (packaged / "coord-serve.service").write_text(UNIT_TEXT)
+    use_packaged(monkeypatch, packaged)
+    literal = UNIT_TEXT.replace("%h", str(tmp_path))
+    _install(tmp_path, "coord-serve.service", literal)
+
+    (r,) = ud.probe_unit_drift(make_ctx(tmp_path))
+    assert r.severity is Severity.OK
+    assert r.values["matches"] is True
+
+
+def test_real_coord_agent_service_matches_a_realistic_install(tmp_path, monkeypatch) -> None:
+    """Not synthetic: reads the actual `deploy/coord-agent.service` in this
+    checkout and checks it against a realistic install-agent.sh-shaped
+    install (real values substituted, `%h` expanded to a literal $HOME, no
+    doc header) — the exact real-world shape #1928 was filed against
+    (dellserver/precision, which DO carry `--machine`/`--port`). Locks the
+    fix to the real file, not just the shrunk `TEMPLATE_UNIT` fixture."""
+    real_template_path = Path(__file__).resolve().parents[1] / "deploy" / "coord-agent.service"
+    real_template = real_template_path.read_text()
+    assert ud._is_templated(real_template), "fixture assumption: the real file is templated"
+
+    packaged = tmp_path / "site-packages" / "coord" / "deploy"
+    packaged.mkdir(parents=True)
+    (packaged / "coord-agent.service").write_text(real_template)
+    use_packaged(monkeypatch, packaged)
+
+    installed_text = (
+        real_template
+        # install-agent.sh's heredoc keeps only the [Unit]/[Service]/[Install]
+        # body and its own PATH comment — the ~76-line doc header above
+        # `[Unit]` is dropped entirely.
+    )
+    # Strip everything before `[Unit]` (the doc header) to mirror
+    # install-agent.sh not emitting it, then fill in the placeholders and
+    # swap `%h` for a literal $HOME the way the heredoc's `$VENV_DIR`/`$HOME`
+    # expansion does.
+    body = installed_text[installed_text.index("[Unit]"):]
+    body = body.replace("<MACHINE_NAME>", "dellserver").replace("<PORT>", "7433")
+    body = body.replace("%h", str(tmp_path))
+    _install(tmp_path, "coord-agent.service", body)
+
+    (r,) = ud.probe_unit_drift(make_ctx(tmp_path))
+    assert r.severity is Severity.OK, r.detail
+    assert r.values["matches"] is True
+
+
+def test_real_deploy_dir_placeholder_units_never_get_a_bare_cp_remedy() -> None:
+    """A repo-wide guard over the actual `deploy/` directory (not a
+    synthetic fixture): whatever unit files exist there today or in the
+    future, if any carries a `<PLACEHOLDER>`, the WARN path for it must
+    never be the bare `cp` — that's #1928's exact failure mode, and this
+    pins it against every current and future templated unit, not just
+    `coord-agent.service`."""
+    import coord
+
+    real_deploy = Path(coord.__file__).resolve().parent / "deploy"
+    for deploy_path in ud._unit_files(real_deploy):
+        deploy_text = deploy_path.read_text()
+        if not ud._is_templated(deploy_text):
+            continue
+        installed_path = Path("/tmp/nonexistent") / deploy_path.name
+        remedy = ud._templated_remedy(
+            deploy_text, deploy_path, installed_path, deploy_path.stem
+        )
+        assert f"cp {deploy_path} {installed_path}" not in remedy
