@@ -33,6 +33,15 @@ dependencies = [
     # Windows/macOS while POSIX keeps the legacy ~/.coord path. Client-side —
     # every command resolves the state root, so this stays in the base.
     "platformdirs>=4.0",
+    # Windows ships no IANA time-zone database, so `zoneinfo` cannot
+    # resolve a named zone without this. NOT a test-only concern:
+    # coord/config.py, coord/models.py, coord/failure_class.py and
+    # coord/machine_pause.py all resolve named zones at runtime, so a
+    # Windows client hits ZoneInfoNotFoundError on ordinary use — which
+    # is why this belongs in the BASE deps and not in [dev] or [server].
+    # Found by the windows-latest job this issue adds: it died during
+    # collection on `America/Chicago` before running a single test.
+    "tzdata; sys_platform == 'win32'",
 ]
 
 [project.urls]
