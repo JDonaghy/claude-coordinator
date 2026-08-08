@@ -43160,6 +43160,27 @@ Milestone tracking issue.
         driver.render();
     }
 
+    /// The result table's painted region of `screen`: every line from `x0`
+    /// — the table's left edge — rightward, with the bottom status-bar row
+    /// dropped.
+    ///
+    /// #1996: the whole-screen comparison this exists to replace was flaky.
+    /// The Reports screen paints two live wall-clock readouts OUTSIDE the
+    /// result table — the params pane's `Window: … → Ns ago` and the shell
+    /// status bar's `↻ Ns` — so a wall-second ticking between two renders
+    /// made two otherwise byte-identical screens differ by one character,
+    /// and `main` went red at `aa9dff0`. Everything at or right of the
+    /// table's left edge, status bar excluded, is deterministic, so the
+    /// assertion stays exact over precisely the cells the test is about.
+    fn reports_table_region(screen: &str, x0: usize) -> String {
+        let lines: Vec<&str> = screen.lines().collect();
+        let body = lines.split_last().map(|(_, rest)| rest).unwrap_or(&[]);
+        body.iter()
+            .map(|line| line.chars().skip(x0).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
     fn reports_wheel_scrolls_the_result_table_both_directions_and_clamps() {
         let mut driver = reports_driver(
@@ -43324,6 +43345,11 @@ Milestone tracking issue.
         let anchor = driver
             .find("ROW-000")
             .expect("first row must render before any scroll");
+        // #1996: the first row's x IS the result table's left edge (the
+        // `issue` column), and a vertical scroll never moves a column
+        // horizontally — so this anchor, captured before any scrolling,
+        // stays the right slice point for every later render.
+        let table_x = anchor.0 as usize;
         for _ in 0..5 {
             reports_wheel(&mut driver, anchor, -1.0);
         }
@@ -43345,10 +43371,13 @@ Milestone tracking issue.
                  reset the scroll offset back to the top:\n{after_refresh}"
         );
         assert_eq!(
-            scrolled, after_refresh,
+            reports_table_region(&scrolled, table_x),
+            reports_table_region(&after_refresh, table_x),
             "#1910: the result table's painted rows must be pixel-identical \
                  before and after an idle repaint — same scroll offset, same \
-                 rows on screen"
+                 rows on screen (#1996: compared over the table region only, \
+                 because the params pane and the status bar outside it paint \
+                 a live clock)\nbefore:\n{scrolled}\nafter:\n{after_refresh}"
         );
     }
 
