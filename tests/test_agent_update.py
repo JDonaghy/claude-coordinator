@@ -16,6 +16,7 @@ from starlette.testclient import TestClient
 from coord import __version__
 from coord.agent import AgentServer
 from coord.agent_app import _detect_install_mode, build_app
+from coord.agent_update import UpdateResult
 from coord.cli import main
 
 
@@ -123,62 +124,66 @@ class TestStatusVersion:
 
 
 class TestUpdateEndpoint:
+    """#1241: `/update` now runs a blue/green swap (`coord.agent_update.
+    perform_update`) instead of an in-place `pip install --upgrade` — these
+    tests mock that call rather than `subprocess.run` directly, since the
+    mechanics of the swap itself are covered by
+    `tests/test_agent_update_bluegreen.py`. Every test here also relies on
+    the autouse `_no_real_agent_venv` fixture (tests/conftest.py) pointing
+    `COORD_VENV_DIR` at a per-test tmp path — a test that forgot to mock
+    `perform_update` would otherwise reach a REAL `python -m venv` /
+    `pip install` against that tmp path rather than the real
+    `~/.coord-venv` on whatever machine runs pytest.
+    """
+
     def test_update_returns_202(self, tmp_path: Path) -> None:
         restarted: list[list[str]] = []
-        client, server = _make_client(tmp_path, exec_restart=restarted.append)
-        r = client.post("/update")
-        assert r.status_code == 202
-        body = r.json()
-        assert body["status"] == "updating"
-        assert "mode" in body
-        server.shutdown()
-
-    def test_update_response_has_mode_field(self, tmp_path: Path) -> None:
-        client, server = _make_client(tmp_path)
-        r = client.post("/update")
-        assert r.status_code == 202
-        body = r.json()
-        assert body["mode"] in ("editable (git pull)", "pip install --upgrade")
+        with (
+            patch("coord.agent_app._detect_install_mode", return_value=(False, None)),
+            patch(
+                "coord.agent_app.agent_update.perform_update",
+                return_value=UpdateResult(ok=True, swapped=True, new_version="9.9.9"),
+            ),
+        ):
+            client, server = _make_client(tmp_path, exec_restart=restarted.append)
+            r = client.post("/update")
+            assert r.status_code == 202
+            body = r.json()
+            assert body["status"] == "updating"
+            assert body["mode"] == "pip install (blue/green)"
         server.shutdown()
 
     def test_update_triggers_exec_restart_after_success(self, tmp_path: Path) -> None:
-        """exec_restart must be called after a successful upgrade.
-
-        Force the editable-mode path so we always restart on a 0 returncode
-        (the pip-install path also requires a version delta — covered in
-        test_update_skips_restart_when_pip_no_change below).
-
-        NOTE: the polling loop MUST stay inside the patch context — the
-        background thread reads `subprocess.run` lazily; if the patch
-        exits first, the real `git pull` runs against the fake path and
-        fails with returncode != 0.
-        """
+        """exec_restart must be called after a successful, version-changing swap."""
         restarted: list[list[str]] = []
-        with patch("coord.agent_app._detect_install_mode") as mock_detect:
-            mock_detect.return_value = (True, "/fake/project")
-            with patch("coord.agent_app.subprocess.run") as mock_run:
-                mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-                client, server = _make_client(tmp_path, exec_restart=restarted.append)
-                client.post("/update")
-                assert _wait_until(lambda: bool(restarted)), \
-                    "exec_restart was never called"
-
+        with (
+            patch("coord.agent_app._detect_install_mode", return_value=(False, None)),
+            patch("coord.agent_app._installed_version", return_value="0.3.0"),
+            patch(
+                "coord.agent_app.agent_update.perform_update",
+                return_value=UpdateResult(ok=True, swapped=True, new_version="0.4.0"),
+            ),
+        ):
+            client, server = _make_client(tmp_path, exec_restart=restarted.append)
+            client.post("/update")
+            assert _wait_until(lambda: bool(restarted)), "exec_restart was never called"
         server.shutdown()
 
-    def test_update_skips_restart_when_pip_no_change(self, tmp_path: Path) -> None:
-        """If pip succeeds but resolves to the same version, no restart and
-        a no_change result is persisted for the next /health to surface."""
+    def test_update_skips_restart_when_no_version_change(self, tmp_path: Path) -> None:
+        """If the swap somehow lands on the same version, no restart — a
+        no_change result is persisted for the next /health to surface."""
         restarted: list[list[str]] = []
-        with patch("coord.agent_app._detect_install_mode") as mock_detect:
-            mock_detect.return_value = (False, None)  # pip path
-            with patch("coord.agent_app._installed_version", return_value="0.3.0"):
-                with patch("coord.agent_app.subprocess.run") as mock_run:
-                    mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-                    client, server = _make_client(tmp_path, exec_restart=restarted.append)
-                    client.post("/update")
-                    # Wait for the background thread to finish (it persists
-                    # last_update.json); then confirm no restart occurred.
-                    last = _wait_for_last_update(server)
+        with (
+            patch("coord.agent_app._detect_install_mode", return_value=(False, None)),
+            patch("coord.agent_app._installed_version", return_value="0.3.0"),
+            patch(
+                "coord.agent_app.agent_update.perform_update",
+                return_value=UpdateResult(ok=True, swapped=True, new_version="0.3.0"),
+            ),
+        ):
+            client, server = _make_client(tmp_path, exec_restart=restarted.append)
+            client.post("/update")
+            last = _wait_for_last_update(server)
 
         assert not restarted, "exec_restart fired even though version didn't change"
         assert last["result"] == "no_change"
@@ -187,124 +192,187 @@ class TestUpdateEndpoint:
         server.shutdown()
 
     def test_update_does_not_restart_on_upgrade_failure(self, tmp_path: Path) -> None:
-        """If the upgrade command fails, exec_restart must NOT be called."""
+        """If the blue/green swap fails, exec_restart must NOT be called."""
         restarted: list[list[str]] = []
-        with patch("coord.agent_app.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="error")
+        with (
+            patch("coord.agent_app._detect_install_mode", return_value=(False, None)),
+            patch(
+                "coord.agent_app.agent_update.perform_update",
+                return_value=UpdateResult(ok=False, swapped=False, error="pip install failed"),
+            ),
+        ):
             client, server = _make_client(tmp_path, exec_restart=restarted.append)
             client.post("/update")
-            # The failure path persists last_update.json; wait for the
-            # background thread to finish (inside the patch context, since it
-            # reads subprocess.run lazily) before asserting no restart.
-            assert _wait_until(
-                lambda: (server.state_dir / "last_update.json").exists()
-            ), "background update thread never wrote last_update.json"
+            last = _wait_for_last_update(server)
 
         assert not restarted, "exec_restart should not have been called on failure"
+        assert last["result"] == "failed"
+        assert last["error"] == "pip install failed"
         server.shutdown()
 
-    def test_update_editable_mode_uses_git_pull(self, tmp_path: Path) -> None:
-        """In editable mode, /update should run 'git pull --ff-only'."""
-        calls: list[list[str]] = []
-
-        def fake_run(cmd, **_kwargs):
-            calls.append(list(cmd))
-            return MagicMock(returncode=0, stdout="", stderr="")
-
+    def test_update_editable_install_refuses_synchronously(self, tmp_path: Path) -> None:
+        """#1241 requirement 4: an editable install must be reported as
+        drift and refused outright — never silently `git pull`ed, and
+        never handed to the blue/green swap."""
+        restarted: list[list[str]] = []
         with (
-            patch("coord.agent_app._detect_install_mode", return_value=(True, "/src/coord")),
-            patch("coord.agent_app.subprocess.run", side_effect=fake_run),
+            patch(
+                "coord.agent_app._detect_install_mode",
+                return_value=(True, "/src/claude-coordinator"),
+            ),
+            patch("coord.agent_app.agent_update.perform_update") as mock_perform,
         ):
-            client, server = _make_client(tmp_path)
-            client.post("/update")
-            # Wait for the specific call the assertions need (git pull),
-            # not just any git call.  Staying inside the patch context
-            # ensures fake_run intercepts every subprocess.run the
-            # background thread makes.
-            _wait_until(lambda: any("pull" in c for c in calls))
+            client, server = _make_client(tmp_path, exec_restart=restarted.append)
+            r = client.post("/update")
 
-        git_cmds = [c for c in calls if "git" in c]
-        assert git_cmds, "expected a git call"
-        assert any("pull" in c for c in git_cmds)
+        assert r.status_code == 409
+        body = r.json()
+        assert body["result"] == "refused"
+        assert "editable" in body["error"].lower()
+        mock_perform.assert_not_called()
+        assert not restarted
+
+        last = _wait_for_last_update(server)
+        assert last["result"] == "refused"
         server.shutdown()
 
-    def test_update_pip_mode_uses_pip_install(self, tmp_path: Path) -> None:
-        """In non-editable mode, /update should run pip install --upgrade."""
-        calls: list[list[str]] = []
+    def test_update_refuses_when_active_assignments_without_force(
+        self, tmp_path: Path
+    ) -> None:
+        """#1241 requirement 3: live sessions block an update unless forced —
+        the same 'never restart during live sessions' operator rule
+        `/restart` already documents, enforced here too."""
+        repo = _init_repo(tmp_path / "repo")
+        server = AgentServer(
+            machine_name="test",
+            repos=["api"],
+            state_dir=tmp_path / "state",
+            worker_command=lambda spec: ["/bin/sh", "-c", "sleep 30"],
+            repo_paths={"api": str(repo)},
+        )
+        restarted: list[list[str]] = []
+        app = build_app(server, exec_restart=restarted.append)
+        client = TestClient(app)
 
-        def fake_run(cmd, **_kwargs):
-            calls.append(list(cmd))
-            return MagicMock(returncode=0, stdout="", stderr="")
+        from coord.agent import AssignmentSpec
+
+        spec = AssignmentSpec(
+            repo_name="api", repo_path=str(repo), issue_number=1,
+            issue_title="t", briefing="b",
+        )
+        a = server.assign(spec)
+        assert _wait_until(lambda: server.get(a.id).status == "running")
 
         with (
             patch("coord.agent_app._detect_install_mode", return_value=(False, None)),
-            patch("coord.agent_app.subprocess.run", side_effect=fake_run),
+            patch("coord.agent_app.agent_update.perform_update") as mock_perform,
         ):
-            client, server = _make_client(tmp_path)
-            client.post("/update")
-            # Wait for the specific call the assertions need (pip install
-            # --upgrade), not just any call.  Staying inside the patch
-            # context ensures fake_run intercepts every subprocess.run the
-            # background thread makes.
-            _wait_until(
-                lambda: any("install" in c and "--upgrade" in c for c in calls)
-            )
+            r = client.post("/update")
 
-        pip_cmds = [c for c in calls if "pip" in " ".join(c)]
-        assert pip_cmds, "expected a pip call"
-        assert any("install" in c and "--upgrade" in c for c in pip_cmds)
-        server.shutdown()
+        assert r.status_code == 409
+        body = r.json()
+        assert body["result"] == "refused"
+        assert "active assignment" in body["error"]
+        mock_perform.assert_not_called()
+        assert not restarted
+        server.shutdown(kill_running=True)
 
-    def test_update_pins_target_version_when_supplied(self, tmp_path: Path) -> None:
-        """#1568: when the caller supplies target_version, pip must be
-        pinned to that exact release (claude-coordinator==X.Y.Z) instead
-        of a bare --upgrade — this turns a stale PyPI index/cache into a
-        loud pip failure instead of a silent no-op resolving to old code."""
-        calls: list[list[str]] = []
+    def test_update_force_bypasses_active_assignment_guard(self, tmp_path: Path) -> None:
+        repo = _init_repo(tmp_path / "repo")
+        server = AgentServer(
+            machine_name="test",
+            repos=["api"],
+            state_dir=tmp_path / "state",
+            worker_command=lambda spec: ["/bin/sh", "-c", "sleep 30"],
+            repo_paths={"api": str(repo)},
+        )
+        restarted: list[list[str]] = []
+        app = build_app(server, exec_restart=restarted.append)
+        client = TestClient(app)
 
-        def fake_run(cmd, **_kwargs):
-            calls.append(list(cmd))
-            return MagicMock(returncode=0, stdout="", stderr="")
+        from coord.agent import AssignmentSpec
+
+        spec = AssignmentSpec(
+            repo_name="api", repo_path=str(repo), issue_number=1,
+            issue_title="t", briefing="b",
+        )
+        a = server.assign(spec)
+        assert _wait_until(lambda: server.get(a.id).status == "running")
 
         with (
             patch("coord.agent_app._detect_install_mode", return_value=(False, None)),
-            patch("coord.agent_app.subprocess.run", side_effect=fake_run),
+            patch("coord.agent_app._installed_version", return_value="0.3.0"),
+            patch(
+                "coord.agent_app.agent_update.perform_update",
+                return_value=UpdateResult(ok=True, swapped=True, new_version="0.4.0"),
+            ) as mock_perform,
+        ):
+            r = client.post("/update", json={"force": True})
+            assert r.status_code == 202
+            assert _wait_until(lambda: bool(restarted))
+
+        mock_perform.assert_called_once()
+        server.shutdown(kill_running=True)
+
+    def test_update_passes_target_version_through_to_perform_update(
+        self, tmp_path: Path
+    ) -> None:
+        """#1568: target_version flows straight through to the blue/green
+        swap, which pins the pip install to that exact release."""
+        with (
+            patch("coord.agent_app._detect_install_mode", return_value=(False, None)),
+            patch(
+                "coord.agent_app.agent_update.perform_update",
+                return_value=UpdateResult(ok=True, swapped=True, new_version="9.9.9"),
+            ) as mock_perform,
         ):
             client, server = _make_client(tmp_path)
             client.post("/update", json={"target_version": "9.9.9"})
-            _wait_until(lambda: any("install" in c for c in calls))
+            assert _wait_until(lambda: mock_perform.called)
 
-        pip_cmds = [c for c in calls if "pip" in " ".join(c) or "install" in c]
-        assert pip_cmds, "expected a pip call"
-        # #1237: the spec carries the `[server]` extra — an agent must
-        # reinstall itself with the server runtime, not the client base.
-        assert any(
-            "claude-coordinator[server]==9.9.9" in c for c in pip_cmds[0]
-        ), pip_cmds
+        args, kwargs = mock_perform.call_args
+        # #1237: the package spec carries the `[server]` extra.
+        assert args[1] == "claude-coordinator[server]"
+        assert kwargs.get("target_version") == "9.9.9"
         server.shutdown()
 
     def test_update_omits_pin_when_no_target_version(self, tmp_path: Path) -> None:
-        """Backward compat: no target_version in the request body means a
-        bare --upgrade, same as before #1568."""
-        calls: list[list[str]] = []
-
-        def fake_run(cmd, **_kwargs):
-            calls.append(list(cmd))
-            return MagicMock(returncode=0, stdout="", stderr="")
-
+        """Backward compat: no target_version in the request body means
+        `perform_update` gets `target_version=None` (an unpinned install)."""
         with (
             patch("coord.agent_app._detect_install_mode", return_value=(False, None)),
-            patch("coord.agent_app.subprocess.run", side_effect=fake_run),
+            patch(
+                "coord.agent_app.agent_update.perform_update",
+                return_value=UpdateResult(ok=True, swapped=True, new_version="0.4.0"),
+            ) as mock_perform,
         ):
             client, server = _make_client(tmp_path)
             client.post("/update")
-            _wait_until(lambda: any("install" in c for c in calls))
+            assert _wait_until(lambda: mock_perform.called)
 
-        pip_cmds = [c for c in calls if "install" in c]
-        assert pip_cmds, "expected a pip call"
-        # #1237: unpinned, but still carrying the mandatory `[server]` extra.
-        assert "claude-coordinator[server]" in pip_cmds[0]
-        assert not any("==" in arg for arg in pip_cmds[0])
+        _args, kwargs = mock_perform.call_args
+        assert kwargs.get("target_version") is None
+        server.shutdown()
+
+    def test_update_uses_venv_dir_from_env_override(self, tmp_path: Path) -> None:
+        """`_venv_dir()` respects `COORD_VENV_DIR` — the same seam the
+        autouse `_no_real_agent_venv` fixture uses to keep every other test
+        off the real `~/.coord-venv`."""
+        custom_venv = tmp_path / "custom-venv"
+        with (
+            patch.dict("os.environ", {"COORD_VENV_DIR": str(custom_venv)}),
+            patch("coord.agent_app._detect_install_mode", return_value=(False, None)),
+            patch(
+                "coord.agent_app.agent_update.perform_update",
+                return_value=UpdateResult(ok=True, swapped=True, new_version="0.4.0"),
+            ) as mock_perform,
+        ):
+            client, server = _make_client(tmp_path)
+            client.post("/update")
+            assert _wait_until(lambda: mock_perform.called)
+
+        args, _kwargs = mock_perform.call_args
+        assert args[0] == custom_venv
         server.shutdown()
 
     def test_update_last_update_shows_upgraded_even_if_exec_restart_raises(
@@ -321,17 +389,18 @@ class TestUpdateEndpoint:
             raise RuntimeError("simulated exec_restart failure")
 
         with (
-            patch("coord.agent_app._detect_install_mode", return_value=(True, "/fake/src")),
-            patch("coord.agent_app.subprocess.run") as mock_run,
+            patch("coord.agent_app._detect_install_mode", return_value=(False, None)),
+            patch("coord.agent_app._installed_version", return_value="0.3.0"),
+            patch(
+                "coord.agent_app.agent_update.perform_update",
+                return_value=UpdateResult(ok=True, swapped=True, new_version="0.4.0"),
+            ),
         ):
-            mock_run.return_value = MagicMock(returncode=0, stdout="Already up to date.", stderr="")
             client, server = _make_client(tmp_path, exec_restart=boom)
             client.post("/update")
-            # Give the background thread time to complete (inside the patch
-            # context — it reads subprocess.run lazily).
             last = _wait_for_last_update(server)
 
-        # The upgrade step succeeded; result must be "upgraded" even though
+        # The swap succeeded; result must be "upgraded" even though
         # exec_restart itself raised an exception.
         assert last["result"] == "upgraded", (
             f"expected result='upgraded', got {last['result']!r}; "
@@ -339,45 +408,135 @@ class TestUpdateEndpoint:
         )
         server.shutdown()
 
-    def test_update_git_pull_fnf_writes_failed_result(self, tmp_path: Path) -> None:
-        """If the git pull cwd doesn't exist, result must be 'failed' (not 'upgraded').
-
-        This covers the scenario where the editable install's source directory
-        has been deleted (e.g. it was a worktree that got pruned).  The pip/git
-        step raises FileNotFoundError BEFORE the upgrade succeeds, so
-        last_update.json should record result='failed'.  Regression test for
-        issue #280.
+    def test_update_perform_update_raising_writes_failed_result(
+        self, tmp_path: Path
+    ) -> None:
+        """If `perform_update` itself raises (rather than returning a
+        failed UpdateResult), result must still be 'failed', not
+        'upgraded'.  Regression test for issue #280's original shape.
         """
         restarted: list = []
-
-        # Build the server (and the underlying git repo) BEFORE patching
-        # subprocess.run — _make_server calls git init/commit which must
-        # use the real subprocess.run.
         client, server = _make_client(tmp_path, exec_restart=restarted.append)
 
-        def fake_run(cmd, **kwargs):
-            # Simulate subprocess.run raising FileNotFoundError because the
-            # cwd (the deleted worktree) no longer exists.
-            raise FileNotFoundError(
-                2, "No such file or directory", "/home/user/.coord/worktrees/deadbeef"
-            )
-
         with (
-            patch("coord.agent_app._detect_install_mode",
-                  return_value=(True, "/home/user/.coord/worktrees/deadbeef")),
-            patch("coord.agent_app.subprocess.run", side_effect=fake_run),
+            patch("coord.agent_app._detect_install_mode", return_value=(False, None)),
+            patch(
+                "coord.agent_app.agent_update.perform_update",
+                side_effect=FileNotFoundError(
+                    2, "No such file or directory", "/home/user/.coord/worktrees/deadbeef"
+                ),
+            ),
         ):
             client.post("/update")
-            # Wait for the background thread to write last_update.json.  This
-            # must stay INSIDE the patch context (see NOTE in
-            # test_update_triggers_exec_restart_after_success): the background
-            # thread reads subprocess.run lazily.
             last = _wait_for_last_update(server)
 
-        assert not restarted, "exec_restart must not fire when git pull raises"
+        assert not restarted, "exec_restart must not fire when perform_update raises"
         assert last["result"] == "failed"
         assert "FileNotFoundError" in (last.get("error") or "")
         server.shutdown()
+
+
+# ── /rollback ─────────────────────────────────────────────────────────────
+
+
+class TestRollbackEndpoint:
+    """#1241: `/rollback` flips `~/.coord-venv` back onto the previous
+    blue/green generation that every successful `/update` retains. Mocks
+    `coord.agent_update.rollback` — the mechanics of the swap itself are
+    covered by `tests/test_agent_update_bluegreen.py`.
+    """
+
+    def test_rollback_returns_202_and_restarts(self, tmp_path: Path) -> None:
+        restarted: list[list[str]] = []
+        with patch(
+            "coord.agent_app.agent_update.rollback",
+            return_value=UpdateResult(
+                ok=True, swapped=True, slot=Path("/x/.coord-venv.blue"), new_version="0.3.0"
+            ),
+        ):
+            client, server = _make_client(tmp_path, exec_restart=restarted.append)
+            r = client.post("/rollback")
+            assert r.status_code == 202
+            assert _wait_until(lambda: bool(restarted))
+        server.shutdown()
+
+    def test_rollback_404_when_no_previous_generation(self, tmp_path: Path) -> None:
+        restarted: list[list[str]] = []
+        with patch(
+            "coord.agent_app.agent_update.rollback",
+            return_value=UpdateResult(ok=False, swapped=False, error="no previous generation at ..."),
+        ):
+            client, server = _make_client(tmp_path, exec_restart=restarted.append)
+            r = client.post("/rollback")
+
+        assert r.status_code == 404
+        assert not restarted
+        server.shutdown()
+
+    def test_rollback_refuses_with_active_assignments_without_force(
+        self, tmp_path: Path
+    ) -> None:
+        repo = _init_repo(tmp_path / "repo")
+        server = AgentServer(
+            machine_name="test",
+            repos=["api"],
+            state_dir=tmp_path / "state",
+            worker_command=lambda spec: ["/bin/sh", "-c", "sleep 30"],
+            repo_paths={"api": str(repo)},
+        )
+        restarted: list[list[str]] = []
+        app = build_app(server, exec_restart=restarted.append)
+        client = TestClient(app)
+
+        from coord.agent import AssignmentSpec
+
+        spec = AssignmentSpec(
+            repo_name="api", repo_path=str(repo), issue_number=1,
+            issue_title="t", briefing="b",
+        )
+        a = server.assign(spec)
+        assert _wait_until(lambda: server.get(a.id).status == "running")
+
+        with patch("coord.agent_app.agent_update.rollback") as mock_rollback:
+            r = client.post("/rollback")
+
+        assert r.status_code == 409
+        mock_rollback.assert_not_called()
+        assert not restarted
+        server.shutdown(kill_running=True)
+
+    def test_rollback_force_bypasses_active_assignment_guard(self, tmp_path: Path) -> None:
+        repo = _init_repo(tmp_path / "repo")
+        server = AgentServer(
+            machine_name="test",
+            repos=["api"],
+            state_dir=tmp_path / "state",
+            worker_command=lambda spec: ["/bin/sh", "-c", "sleep 30"],
+            repo_paths={"api": str(repo)},
+        )
+        restarted: list[list[str]] = []
+        app = build_app(server, exec_restart=restarted.append)
+        client = TestClient(app)
+
+        from coord.agent import AssignmentSpec
+
+        spec = AssignmentSpec(
+            repo_name="api", repo_path=str(repo), issue_number=1,
+            issue_title="t", briefing="b",
+        )
+        a = server.assign(spec)
+        assert _wait_until(lambda: server.get(a.id).status == "running")
+
+        with patch(
+            "coord.agent_app.agent_update.rollback",
+            return_value=UpdateResult(ok=True, swapped=True, new_version="0.3.0"),
+        ) as mock_rollback:
+            r = client.post("/rollback", json={"force": True})
+            assert r.status_code == 202
+            assert _wait_until(lambda: bool(restarted))
+
+        mock_rollback.assert_called_once()
+        server.shutdown(kill_running=True)
 
 
 # ── /restart ──────────────────────────────────────────────────────────────
@@ -1262,6 +1421,158 @@ class TestAgentUpdateCLI:
         assert result.exit_code == 0, result.output
         assert "1.2.3" in result.output
         mock_latest.assert_not_called()
+
+    def test_update_sends_force_flag_in_body(
+        self, config_file: Path, coord_db
+    ) -> None:
+        """#1241: --force must be echoed to the agent so it can bypass its
+        own live-session guard."""
+        posted_bodies: list[dict] = []
+
+        def fake_post(url, *args, **kwargs):
+            posted_bodies.append(kwargs.get("json", {}))
+            r = MagicMock()
+            r.status_code = 202
+            r.json.return_value = {"status": "updating", "mode": "pip install (blue/green)"}
+            return r
+
+        def fake_get(url, *args, **kwargs):
+            r = MagicMock()
+            r.status_code = 200
+            r.json.return_value = {"version": __version__, "last_update": {"result": "upgraded"}}
+            return r
+
+        with (
+            patch("coord.cli.httpx.post", side_effect=fake_post),
+            patch("coord.cli.httpx.get", side_effect=fake_get),
+        ):
+            CliRunner().invoke(
+                main,
+                ["agent", "update", "--machine", "laptop", "--force",
+                 "--timeout", "5", "--config", str(config_file)],
+            )
+
+        assert posted_bodies
+        assert posted_bodies[0].get("force") is True
+
+    def test_update_omits_force_by_default(
+        self, config_file: Path, coord_db
+    ) -> None:
+        posted_bodies: list[dict] = []
+
+        def fake_post(url, *args, **kwargs):
+            posted_bodies.append(kwargs.get("json", {}))
+            r = MagicMock()
+            r.status_code = 202
+            r.json.return_value = {"status": "updating", "mode": "pip install (blue/green)"}
+            return r
+
+        def fake_get(url, *args, **kwargs):
+            r = MagicMock()
+            r.status_code = 200
+            r.json.return_value = {"version": __version__, "last_update": {"result": "upgraded"}}
+            return r
+
+        with (
+            patch("coord.cli.httpx.post", side_effect=fake_post),
+            patch("coord.cli.httpx.get", side_effect=fake_get),
+        ):
+            CliRunner().invoke(
+                main,
+                ["agent", "update", "--machine", "laptop",
+                 "--timeout", "5", "--config", str(config_file)],
+            )
+
+        assert posted_bodies
+        assert posted_bodies[0].get("force") is False
+
+    def test_update_reports_refusal_without_waiting(
+        self, config_file: Path, coord_db
+    ) -> None:
+        """#1241: a 409 refusal (editable install, or live sessions without
+        --force) must be reported directly and must NOT burn the
+        --timeout window polling /health for a version change that will
+        never come — /health is never even queried."""
+        get_calls: list[str] = []
+
+        def fake_post(url, *args, **kwargs):
+            r = MagicMock()
+            r.status_code = 409
+            r.json.return_value = {
+                "result": "refused",
+                "error": "3 active assignment(s) running — pass force=true to update anyway",
+            }
+            return r
+
+        def fake_get(url, *args, **kwargs):
+            get_calls.append(url)
+            r = MagicMock()
+            r.status_code = 200
+            r.json.return_value = {"version": "0.4.84"}
+            return r
+
+        with (
+            patch("coord.cli.httpx.post", side_effect=fake_post),
+            patch("coord.cli.httpx.get", side_effect=fake_get),
+        ):
+            result = CliRunner().invoke(
+                main,
+                ["agent", "update", "--machine", "laptop", "--timeout", "30",
+                 "--config", str(config_file)],
+            )
+
+        assert result.exit_code != 0, result.output
+        assert "refused" in result.output.lower()
+        assert "active assignment" in result.output
+        # One /health call is expected — the pre-POST `agent_started_at`
+        # snapshot (`_fetch_pre_started_at`) — but the post-POST poll loop
+        # (`_wait_agents_updated`) must never run for a refused machine, so
+        # no more than that single call happens over the 30s --timeout.
+        health_calls = [u for u in get_calls if "/health" in u]
+        assert len(health_calls) <= 1, (
+            f"refused machine must not be polled for a version change, got {health_calls}"
+        )
+
+    def test_update_mixed_accepted_and_refused_machines(
+        self, config_file: Path, coord_db
+    ) -> None:
+        """One machine accepts, one refuses — the accepted one is still
+        polled and reported normally; the refused one is reported
+        separately; the command exits non-zero overall."""
+        def fake_post(url, *args, **kwargs):
+            r = MagicMock()
+            if "laptop" in url:
+                r.status_code = 202
+                r.json.return_value = {"status": "updating", "mode": "pip install (blue/green)"}
+            else:
+                r.status_code = 409
+                r.json.return_value = {"result": "refused", "error": "editable install detected"}
+            return r
+
+        def fake_get(url, *args, **kwargs):
+            r = MagicMock()
+            r.status_code = 200
+            r.json.return_value = {
+                "version": __version__,
+                "last_update": {"result": "upgraded", "version_before": "0.0.1"},
+            }
+            return r
+
+        with (
+            patch("coord.cli.httpx.post", side_effect=fake_post),
+            patch("coord.cli.httpx.get", side_effect=fake_get),
+        ):
+            result = CliRunner().invoke(
+                main,
+                ["agent", "update", "--all", "--timeout", "5",
+                 "--config", str(config_file)],
+            )
+
+        assert result.exit_code != 0, result.output
+        assert "laptop" in result.output
+        assert "✓" in result.output
+        assert "server" in result.output
+        assert "editable install detected" in result.output
 
 
 class TestAgentVersionsCLI:

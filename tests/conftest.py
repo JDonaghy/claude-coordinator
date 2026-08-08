@@ -218,6 +218,28 @@ def valid_config_path(tmp_path: Path, valid_config_yaml: str) -> Path:
 
 
 @pytest.fixture(autouse=True)
+def _no_real_agent_venv(monkeypatch, tmp_path):
+    """#1241: default `coord.agent_app._venv_dir()` to a per-test tmp
+    directory so a test exercising the (unmocked) blue/green update path
+    can never resolve to — and mutate or delete — the real
+    ``~/.coord-venv`` on the machine running pytest.
+
+    This bit for real during development of #1241: a test hitting
+    ``POST /update`` without mocking ``coord.agent_update.perform_update``
+    migrated the dev machine's own live agent venv into the blue/green
+    symlink layout, and a second such test then ``rmtree``'d the slot that
+    turned out to hold the original install — breaking every *new*
+    ``coord`` invocation on that host (the already-running agent process
+    kept working off its already-open files, but its systemd unit would
+    have failed on its next restart). Tests exercising the real swap logic
+    point ``COORD_VENV_DIR`` at their own ``tmp_path`` explicitly (or
+    mock ``coord.agent_update.perform_update``/``subprocess.run``
+    outright); this default only protects tests that forgot to.
+    """
+    monkeypatch.setenv("COORD_VENV_DIR", str(tmp_path / "unused-coord-venv"))
+
+
+@pytest.fixture(autouse=True)
 def coord_db():
     """Isolated in-memory SQLite database, active for every test automatically.
 

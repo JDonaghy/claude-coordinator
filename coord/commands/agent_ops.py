@@ -487,13 +487,19 @@ def _resolve_target_version(
         "POST /update to one or all agent servers, pinning the upgrade to "
         "the latest release on PyPI's simple index (or --version, when "
         "given) — NOT this CLI's own version (#1886: a stale operator "
-        "install must never silently under-update the fleet).  Runs git "
-        "pull for editable installs, pip install --no-cache-dir --upgrade "
-        "claude-coordinator==<version> otherwise.  Polls each agent's "
-        "self-reported *running* version for up to --timeout seconds and "
-        "reports success only once it matches the requested version, "
-        "escalating to a `systemctl --user restart coord-agent` if the "
-        "version is stuck."
+        "install must never silently under-update the fleet).  #1241: each "
+        "agent installs the target version into a FRESH venv slot, "
+        "smoke-checks it, then atomically swaps it into place — an "
+        "in-flight update can never leave a torn/partial install for a "
+        "concurrent `coord` invocation to observe.  An editable install "
+        "(`pip install -e .`) is refused outright, never silently `git "
+        "pull`ed.  An agent with live (RUNNING/PENDING) assignments also "
+        "refuses unless --force is given, since the restart-after-swap "
+        "kills them mid-flight.  Polls each agent's self-reported "
+        "*running* version for up to --timeout seconds and reports "
+        "success only once it matches the requested version, escalating "
+        "to a `systemctl --user restart coord-agent` if the version is "
+        "stuck."
     ),
 )
 
@@ -535,12 +541,24 @@ def _resolve_target_version(
 )
 
 
+@click.option(
+    "--force",
+    is_flag=True,
+    help=(
+        "Update even if the agent has live (RUNNING/PENDING) assignments — "
+        "the restart-after-swap kills them mid-flight (#1241). Without "
+        "this, an agent with live sessions refuses the update outright."
+    ),
+)
+
+
 def agent_update(
     config_path: Path,
     machine_filter: str | None,
     all_machines: bool,
     version_override: str | None,
     timeout: int,
+    force: bool,
 ) -> None:
     # #1886 Path A: the target used to be `__version__` — this CLI's own
     # version.  A stale operator install (PyPI already has v0.4.108, this
@@ -578,35 +596,53 @@ def agent_update(
     # from "new agent came back up".
     pre_started_at = _fetch_pre_started_at(targets)
 
+    # #1241: a machine that refuses (editable install, or live sessions
+    # without --force) never gets restarted, so polling it for a version
+    # change would just burn the whole --timeout window for nothing.
+    # `posted` is the subset of `targets` that actually accepted the POST;
+    # `refused_reasons` carries why the rest didn't.
+    posted: list = []
+    refused_reasons: dict[str, str] = {}
+
     for machine in targets:
         url = f"http://{machine.host}:{AGENT_PORT}/update"
         click.echo(f"  {machine.name}: POST {url} ...", nl=False)
         try:
             resp = httpx.post(
-                url, json={"target_version": target_version}, timeout=10
+                url, json={"target_version": target_version, "force": force}, timeout=10
             )
             if resp.status_code == 202:
                 data = resp.json()
                 click.echo(f" accepted (mode: {data.get('mode', '?')})")
+                posted.append(machine)
+            elif resp.status_code == 409:
+                try:
+                    reason = resp.json().get("error") or "refused"
+                except Exception:
+                    reason = "refused"
+                click.echo(f" refused — {reason}")
+                refused_reasons[machine.name] = reason
             else:
                 click.echo(f" HTTP {resp.status_code}")
+                refused_reasons[machine.name] = f"HTTP {resp.status_code}"
         except (httpx.HTTPError, httpx.TimeoutException) as e:
             click.echo(f" error: {e}")
+            refused_reasons[machine.name] = str(e)
 
-    if targets:
+    all_matched = not refused_reasons
+    if posted:
         click.echo(
             f"\nWaiting up to {timeout}s for agent(s) to report v{target_version}..."
         )
         outcomes = _wait_agents_updated(
-            targets,
+            posted,
             target_version=target_version,
             timeout=timeout,
             pre_started_at=pre_started_at,
         )
 
         click.echo("")
-        all_matched = True
-        for machine in targets:
+        for machine in posted:
             outcome = outcomes[machine.name]
             version_now = outcome["version_now"]
             if outcome["matched"]:
@@ -658,8 +694,14 @@ def agent_update(
                         err=True,
                     )
 
-        if not all_matched:
-            sys.exit(1)
+    if refused_reasons:
+        if posted:
+            click.echo("")
+        for name, reason in refused_reasons.items():
+            click.echo(f"  {name}: ✗ refused — {reason}", err=True)
+
+    if not all_matched:
+        sys.exit(1)
 
 
 @agent.command(
