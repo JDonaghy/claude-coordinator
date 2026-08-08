@@ -76,6 +76,26 @@ class TestVersionMetadataFallback:
             mock_version.assert_called_once_with("claude-coordinator")
 
 
+def _require_build_backend() -> None:
+    """Skip (don't fail) when the build backend isn't importable here.
+
+    The `dev` extra installs setuptools/setuptools-scm/wheel precisely so
+    these tests run in the documented `pip install -e ".[dev]"` venv and in
+    CI, which is where the regression guard has to bite. This guard only
+    covers a hand-rolled environment that installed pytest without the
+    extra: skipping there beats a `--no-build-isolation` failure that looks
+    like a version-derivation bug but isn't.
+    """
+    for mod in ("setuptools", "setuptools_scm", "wheel"):
+        pytest.importorskip(
+            mod,
+            reason=(
+                f"{mod} is not importable in this interpreter; install the dev "
+                'extra (`pip install -e ".[dev]"`) to run the wheel-build tests'
+            ),
+        )
+
+
 def _run(cmd: list[str], cwd: Path, env: dict | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
         cmd, cwd=str(cwd), capture_output=True, text=True, timeout=120, env=env
@@ -114,9 +134,19 @@ def tagless_clone(tmp_path: Path) -> Path:
 
 def _build_wheel(repo_dir: Path, out_dir: Path) -> Path:
     """Build a wheel from *repo_dir*, the same build backend the publish
-    workflow's `python -m build` invokes. `--no-build-isolation` reuses this
-    interpreter's already-installed setuptools/wheel/setuptools-scm instead
-    of fetching a fresh build env, so this needs no network access."""
+    workflow's `python -m build` invokes.
+
+    `--no-build-isolation` builds against *this* interpreter's installed
+    setuptools/wheel/setuptools-scm rather than letting pip create a
+    throwaway build env, so the build needs no network access and no
+    per-test venv rebuild. That only works because the `dev` extra in
+    pyproject.toml installs those three packages alongside pytest —
+    `[build-system].requires` alone would not, since PEP 517 discards the
+    isolated env it installs them into. `_require_build_backend()` turns a
+    non-standard env that lacks them into an explicit skip rather than a
+    confusing "build backend unavailable" failure.
+    """
+    _require_build_backend()
     out_dir.mkdir(parents=True, exist_ok=True)
     result = _run(
         [

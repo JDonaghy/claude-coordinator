@@ -49,6 +49,17 @@ dev = [
     # identical results (4642 passed) across repeated runs. Not required —
     # tooling that runs the suite should fall back to serial when it is absent.
     "pytest-xdist>=3.5",
+    # #1238: the build backend itself, mirrored out of `[build-system].requires`
+    # above. Those are installed into an ephemeral, discarded venv by PEP 517
+    # build isolation, so a plain `pip install -e ".[dev]"` leaves them
+    # *unimportable* in the dev/CI interpreter. tests/test_version_single_source.py
+    # builds a real wheel from a tagged clone to assert the tag-derived version,
+    # and does so with `--no-build-isolation` (no network, no per-test venv
+    # rebuild) — which needs these importable here. Keep in sync with
+    # `[build-system].requires`.
+    "setuptools>=68",
+    "setuptools-scm>=8",
+    "wheel",
 ]
 
 [project.scripts]
