@@ -534,6 +534,66 @@ class TestCompositeRevalidation:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 3a. #1924: the composed-suite subprocess must not inherit `coord serve`'s
+#     own daemon-routing guard vars (e.g. `COORD_MERGE_ON_DAEMON`) — a thin
+#     client's `--revalidate` is routed to the daemon, whose process has that
+#     var set on itself for the very request running the revalidation, and
+#     the suite subprocess inherited it by default, failing tests that assert
+#     it unset regardless of what the branch under test contains.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestSuiteEnvironmentScrub:
+    def test_shell_runner_scrubs_every_known_daemon_guard(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        for var in rv._DAEMON_GUARD_ENV_VARS:
+            monkeypatch.setenv(var, "1")
+
+        check = " && ".join(
+            f'test -z "${{{var}:-}}"' for var in rv._DAEMON_GUARD_ENV_VARS
+        )
+        result = rv._shell_runner(check, tmp_path, 30)
+
+        assert result.returncode == 0, (
+            f"a daemon guard var leaked into the suite subprocess: "
+            f"{result.stdout} {result.stderr}"
+        )
+
+    def test_shell_runner_still_inherits_ordinary_env(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """The scrub is targeted — it must not turn into a blanket
+        ``env={}`` that breaks a suite relying on e.g. PATH or a repo's own
+        env vars."""
+        monkeypatch.setenv("COORD_MERGE_ON_DAEMON", "1")
+        monkeypatch.setenv("COORD_REVALIDATE_TEST_MARKER", "present")
+
+        result = rv._shell_runner(
+            'test "$COORD_REVALIDATE_TEST_MARKER" = "present"', tmp_path, 30,
+        )
+
+        assert result.returncode == 0, result.stderr
+
+    def test_composite_revalidation_suite_never_sees_the_merge_guard(
+        self, git_fleet: Path, coord_db, monkeypatch,
+    ) -> None:
+        """End-to-end, through the real (non-fake) runner: `coord serve`'s
+        own ``COORD_MERGE_ON_DAEMON=1`` — set on its process for the very
+        `/merge --revalidate` request that reaches this code — must not
+        reach the composed suite."""
+        monkeypatch.setenv("COORD_MERGE_ON_DAEMON", "1")
+        cfg = _live_config(
+            git_fleet, test_command='test -z "${COORD_MERGE_ON_DAEMON:-}"',
+        )
+        candidates = TestCompositeRevalidation._candidates()
+
+        with patch("coord.state.record_test_verdict"):
+            result = rv.revalidate(candidates, cfg)  # no `runner=` kwarg
+
+        assert result.ok, result.reason
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 3b. #1814: "the suite could not run" is not "the suite failed"
 # ══════════════════════════════════════════════════════════════════════════════
 
