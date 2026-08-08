@@ -1,0 +1,87 @@
+# coord web — phone/web control-center dashboard (#700/#703).
+#
+# A systemd *user* unit (mirrors coord-serve). Serves the board dashboard +
+# the React/Vite phone PWA on port 7434. It is the THIRD always-on user
+# service, after coord-agent (every worker box) and coord-serve (the DB host).
+#
+# Install on the SAME always-on box that owns ~/.coord/coord.db (dellserver):
+# `coord web` reads the LOCAL board (state.load_board/build_board) — it does
+# NOT yet go through the coord serve daemon — so it MUST run where the DB
+# lives. Do not run it on a thin-client machine (it would render an empty
+# board). Routing it through the daemon so it can run anywhere — like the
+# CLI/TUI thin clients — is tracked in #749 (the BoardService facade).
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/coord-web.service ~/.config/systemd/user/
+#   loginctl enable-linger "$USER"          # survive logout / reboot
+#   # First build the dist dir BEFORE starting the service — the assets
+#   # Mount/SPA catch-all routes are registered once at process start, so
+#   # they need something to point at (see coord-web-dist-build.sh):
+#   ~/.local/bin/coord-web-dist-build.sh
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now coord-web
+#   # ...and the timer that keeps the dist dir tracking merged main (#1543):
+#   cp deploy/coord-web-dist-build.service deploy/coord-web-dist-build.timer \
+#       ~/.config/systemd/user/
+#   systemctl --user enable --now coord-web-dist-build.timer
+#
+# Prereqs on the dashboard host (== the DB host):
+#   - ~/.coord-venv has claude-coordinator installed via PyPI (`coord`
+#     itself — the daemon/CLI binary; unrelated to the webapp bundle below).
+#   - ~/.coord/coordinator.yml exists (canonical location; same resolution as
+#     the daemon: $COORD_CONFIG → ~/.coord/coordinator.yml → ./coordinator.yml).
+#   - ~/.coord/coord.db exists (this box owns it).
+#   - ~/coord-web-dist exists — a symlink that coord-web-dist-build.sh /
+#     .timer keep pointed at a fresh build of coord/dashboard/webapp from
+#     merged main (#1543; see deploy/coord-web-dist-build.sh's header for the
+#     full mechanism). This is intentionally decoupled from ~/.coord-venv: a
+#     merged webapp PR goes live within ~1 minute via that timer, with no
+#     `pip install`, no PyPI release, and no restart of coord-web,
+#     coord-agent, or coord-serve.
+#
+#     #1543 CORRECTION (2026-08-04): earlier revisions of this file said
+#     ~/.coord-venv's wheel bundles the built webapp (#758, landed
+#     2026-08-03) and that upgrading the venv was how a webapp change went
+#     live. That is still TRUE of the wheel, but is no longer how this unit
+#     serves the webapp — the --dist override below reads from
+#     ~/coord-web-dist instead, specifically so shipping a webapp change
+#     does not require upgrading the venv that coord-agent/coord-serve also
+#     run from. If ~/coord-web-dist is ever missing (fresh install before
+#     the first build, or the timer disabled), --dist falls back to the
+#     bundled coord/dashboard/webapp/dist inside the venv, same legacy
+#     fallback as before.
+#
+# Reach it from a phone on the tailnet: http://<dellserver-host>:7434
+# (same-origin API, so the phone needs no config; Add to Home Screen installs
+# the PWA).
+#
+# Restart over SSH needs the runtime-dir prefix (same #404 caveat as the agent):
+#   XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart coord-web
+#
+# Restarting coord-web (or its dist rebuilding) never touches ~/.coord-venv,
+# so it cannot disturb coord-serve (7435) or coord-agent (7433) — see
+# docs/PHONE_WEBAPP.md's "Going live automatically (#1543)" section for the
+# before/after version proof this was verified against.
+#
+# See docs/AGENT_OPERATIONS.md → "Web dashboard (coord web)".
+
+[Unit]
+Description=coord web — phone/web control-center dashboard (#700)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.coord-venv/bin/coord web --config %h/.coord/coordinator.yml --host 0.0.0.0 --port 7434 --dist %h/coord-web-dist
+# Belt-and-suspenders for #1229: systemd user units have no controlling TTY so
+# TERM is absent from the process environment.  The terminal bridge code now
+# calls env.setdefault("TERM", "xterm-256color") before spawning tmux, but
+# setting it here too ensures any other subprocess spawned by coord web also
+# has a sane terminal type without requiring a code fix for each callsite.
+Environment=TERM=xterm-256color
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

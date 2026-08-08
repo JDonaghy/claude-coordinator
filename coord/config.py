@@ -1442,9 +1442,14 @@ class HealthConfig:
     # as the deploy-lane paths above: None means "use the documented default
     # location", not "disable the check".
     #
-    # The checked-in reference directory. None -> `<checkout>/deploy` for the
-    # first configured local checkout that has one (normally the
-    # claude-coordinator checkout named in repo_paths).
+    # The reference directory — a FALLBACK only, since #1927. The check now
+    # diffs against `coord/deploy/` inside the installed distribution (the
+    # released artifact for the running version, which cannot drift with
+    # this host); both this setting and the checkout scan below apply only
+    # when the installed wheel ships no units of its own, and whatever they
+    # point at is reported as an unverified working copy.
+    # None -> `<checkout>/deploy` for the first configured local checkout
+    # that has one (normally the claude-coordinator checkout in repo_paths).
     deploy_dir: str | None = None
     # Where systemd user units actually live. None -> ~/.config/systemd/user.
     systemd_user_dir: str | None = None

@@ -585,6 +585,34 @@ def test_unit_drift_and_tui_staleness_are_folded_in() -> None:
     assert report.severity == "crit"
 
 
+def test_unit_drift_against_an_unverified_reference_is_reported_not_dropped() -> None:
+    """#1927: this command is the trust anchor #1835 gates on, so a match the
+    machine could not vouch for has to reach the report. It rides as UNKNOWN
+    — it must annotate the green, not page."""
+    report = rv.verify(
+        machine_health={
+            "dellserver": _health(
+                _agent_venv(RELEASED),
+                _result(
+                    "unit_drift",
+                    subject="coord-serve.service",
+                    severity="unknown",
+                    headroom=(
+                        "matches /home/john/src/claude-coordinator/deploy, but "
+                        "that reference is an unverified working copy"
+                    ),
+                    detail="install a release wheel on this host",
+                ),
+            )
+        },
+        expected=RELEASED,
+    )
+    finding = next(f for f in report.findings if f.lane == "unit coord-serve.service")
+    assert finding.severity == "unknown"
+    assert "unverified working copy" in finding.summary
+    assert report.severity == "unknown"  # annotated, not paged
+
+
 def test_webapp_bundle_staleness_is_folded_in() -> None:
     """Lane 5 of the issue's enumeration — the webapp bundle — rides the same
     report too, on staleness-vs-source terms rather than a version (see

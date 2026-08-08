@@ -307,10 +307,18 @@ def findings_for_host(host: str, health: dict | None) -> list[Finding]:
                 )
             )
 
-    # ── unit files vs deploy/ (#1831, folded in per #1834's lane 3) ──────
+    # ── unit files vs the packaged release units (#1831, #1927, folded in
+    # per #1834's lane 3) ────────────────────────────────────────────────
+    # UNKNOWN rows are findings too (#1927): the machine-scope check grades a
+    # match against an *unverified* reference — a working copy nothing keeps
+    # current — as UNKNOWN rather than OK, because a stale checkout and a
+    # stale installed unit go stale together and agree. Dropping those rows
+    # here would restore precisely the false green this fold-in exists to
+    # surface. UNKNOWN outranks OK and is outranked by WARN, so it annotates
+    # the report without paging.
     for row in _rows(health, "unit_drift"):
         sev = row.get("severity")
-        if sev in ("crit", "warn"):
+        if sev in ("crit", "warn", "unknown"):
             out.append(
                 Finding(
                     severity=str(sev),

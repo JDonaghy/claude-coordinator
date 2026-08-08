@@ -87,15 +87,23 @@ def _tui(*, present: bool = True, binary_mtime: float | None = None,
 
 
 def _unit_drift(subject: str, severity: str, *, installed: bool = True,
-                errored: bool = False) -> dict:
+                errored: bool = False, reference_verified: bool | None = None) -> dict:
     """A single ``unit_drift`` machine-scope result (#1831) — the
-    per-machine-scope check returns one of these per deploy-lane unit."""
+    per-machine-scope check returns one of these per deploy-lane unit.
+
+    ``reference_verified`` (#1927) says whether the machine diffed against
+    the units packaged with its installed release or against a working copy
+    nothing keeps current. Default None = the key is absent entirely, which
+    is what an agent predating #1927 reports.
+    """
     result = {
         "check_id": "unit_drift",
         "subject": subject,
         "severity": severity,
         "values": {"installed": installed},
     }
+    if reference_verified is not None:
+        result["values"]["reference_verified"] = reference_verified
     if errored:
         result["error"] = "probe exploded"
     return result
@@ -670,6 +678,69 @@ def test_unit_drift_matching_unit_is_ok_and_silent() -> None:
     assert r.severity is Severity.OK
     assert r.values["stale"] == []
     assert r.values["shadowed"] == []
+
+
+def test_unit_drift_unverified_reference_is_unknown_not_ok() -> None:
+    """#1927: a machine that diffed against its own git checkout proved
+    nothing — both sides go stale together — so its match must not count
+    toward the fleet's green."""
+    r = _run(
+        _ctx(
+            machines={
+                "dellserver": _machine(
+                    _unit_drift(
+                        "coord-serve.service", "unknown", reference_verified=False
+                    ),
+                ),
+                "elitebook": _machine(
+                    _unit_drift(
+                        "coord-agent.service", "ok", reference_verified=True
+                    ),
+                ),
+            }
+        )
+    )["fleet_unit_drift"]
+    assert r.severity is Severity.UNKNOWN
+    assert "dellserver/coord-serve.service" in r.headroom
+    assert "elitebook" not in r.headroom
+    assert r.values["unverified_reference"] == [
+        {"machine": "dellserver", "unit": "coord-serve.service"}
+    ]
+
+
+def test_unit_drift_verified_reference_still_reads_ok() -> None:
+    r = _run(
+        _ctx(
+            machines={
+                "dellserver": _machine(
+                    _unit_drift("coord-serve.service", "ok", reference_verified=True),
+                )
+            }
+        )
+    )["fleet_unit_drift"]
+    assert r.severity is Severity.OK
+    assert r.values["unverified_reference"] == []
+
+
+def test_unit_drift_real_drift_outranks_an_unverified_reference() -> None:
+    """A machine that can't vouch for its reference must never mask a
+    machine that found actual drift."""
+    r = _run(
+        _ctx(
+            machines={
+                "dellserver": _machine(
+                    _unit_drift(
+                        "coord-serve.service", "unknown", reference_verified=False
+                    ),
+                ),
+                "elitebook": _machine(
+                    _unit_drift("coord-agent.service", "warn", reference_verified=True),
+                ),
+            }
+        )
+    )["fleet_unit_drift"]
+    assert r.severity is Severity.WARN
+    assert "elitebook/coord-agent.service" in r.headroom
 
 
 def test_unit_drift_path_shadow_risk_is_crit_and_beats_a_merely_stale_unit() -> None:

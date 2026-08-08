@@ -1,0 +1,96 @@
+# coord drive-queue tick — periodic drain of the operator-declared drive
+# queue (#1750/#1754, DQ-4/#1756).
+#
+# A systemd *user* unit (mirrors coord-agent/coord-serve/coord-web/coord-notify),
+# paired with coord-drive-queue.timer. Runs `coord drive-queue tick`, which
+# reconciles the queue against live board state and launches AT MOST ONE
+# `coord drive --tmux` per tick — never more, never past `--max-parallel`.
+# Install ONLY on the box that can see the board (dellserver in production,
+# the same host that runs coord-serve/coord-web/coord-notify): the tick
+# subprocess-launches `coord drive --tmux`, which needs a local tmux server
+# and the repo checkouts under SRC_ROOT, so it belongs on the daemon host, not
+# a thin client.
+#
+# Type=oneshot + `coord drive-queue tick`'s own flock (coord.filelock,
+# drive_queue_lock_path()) means a slow tick cannot stack: if a tick is still
+# running when the timer fires again, the new invocation takes the lock
+# non-blocking, sees it busy, prints "another drive-queue tick is running —
+# skipping", and exits 0 without touching the queue. Nothing here needs to
+# serialize invocations itself.
+#
+# COORD_BIN — the runner's own CLI must be a PINNED, NON-EDITABLE install
+# (#1523): worker branch churn must never be able to rewrite the tool that is
+# driving it, mid-run. On dellserver, ~/.local/bin/coord is a symlink into
+# ~/.coord-venv — the SAME venv deploy/coord-agent.service runs `coord agent`
+# from (see install-agent.sh) — so that already satisfies #1523, and it rides
+# the ordinary agent-venv upgrade lane rather than needing its own. Before
+# relying on a fix landing on this host:
+#
+#   coord agent update --machine dellserver   # or --all; the standard lane
+#   ~/.local/bin/coord --version              # VERIFY it took — an upgrade
+#                                              # silently no-ops more often
+#                                              # than you would think
+#
+# Do NOT confuse this with the epic sequencer's separate, bespoke
+# ~/.coord-cli-venv on elitebook (docs/AGENT_OPERATIONS.md's "fourth lane") —
+# that one has no automatic upgrade path at all and was found three releases
+# stale on 2026-07-29. This unit intentionally does not use that pattern.
+#
+# If you ever install this timer on a DIFFERENT machine, first confirm THAT
+# machine's `coord` is a non-editable install before trusting it unattended:
+#
+#   readlink -f ~/.local/bin/coord
+#   pip show claude-coordinator | grep -i editable   # must print NOTHING
+#
+# An editable checkout (e.g. elitebook's dev box, where ~/.local/bin/coord
+# points at ~/src/claude-coordinator) lets a worker's branch churn rewrite the
+# runner's own code out from under a live tick. Do not install this unit
+# there. See docs/DRIVE_QUEUE.md.
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/coord-drive-queue.service deploy/coord-drive-queue.timer \
+#       ~/.config/systemd/user/
+#   loginctl enable-linger "$USER"          # survive logout / reboot
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now coord-drive-queue.timer
+#
+# This is a Type=oneshot service activated BY THE TIMER — do not
+# `systemctl --user enable coord-drive-queue.service` directly (it has no
+# [Install] section; the timer unit is what you enable).
+#
+# Prereqs: same as coord-notify — coordinator.yml at ~/.coord/coordinator.yml,
+# a tmux server the launched `coord drive --tmux` sessions can attach to, and
+# the repo checkouts `coord drive` expects under its default SRC_ROOT.
+#
+# See docs/DRIVE_QUEUE.md for the full runbook (enqueue, install, stop,
+# reading QUEUE: STALLED / QUEUE: BLOCKED, and the operational traps).
+#
+# KillMode=process (#1830) — REQUIRED, do not remove. systemd's default
+# KillMode=control-group would reap this unit's entire cgroup when the tick
+# exits. When the tick launches `coord drive --tmux` and NO tmux server is
+# already running, `tmux new-session` has to spawn the server itself, and
+# that server lands inside THIS unit's cgroup — so the drive it just started
+# dies with the tick, seconds later. The failure is invisible whenever a
+# tmux server already exists (e.g. an operator has a terminal open on the
+# box), because then `tmux new-session` hands off to that pre-existing
+# server, which lives outside this cgroup. That made the queue appear to
+# work in every manual/attended test and fail only unattended — see #1830
+# for the full diagnosis and the repro. KillMode=process kills only the
+# tick's own process on unit stop/exit and leaves everything else it
+# started (the tmux server, the drive loop) alone.
+
+[Unit]
+Description=coord drive-queue tick (#1756)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+KillMode=process
+ExecStart=%h/.local/bin/coord drive-queue tick --config %h/.coord/coordinator.yml
+# Generous relative to the tick's own ~120s launch-subprocess timeout
+# (_LAUNCH_TIMEOUT_SECONDS in coord/commands/drive_queue.py), but well below
+# the timer's 15-minute cadence (coord-drive-queue.timer) so a genuinely
+# wedged tick can't run into the next fire.
+TimeoutStartSec=300

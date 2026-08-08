@@ -1,4 +1,5 @@
-"""Fleet-scope: does any machine's installed unit drift from `deploy/`? (#1831)
+"""Fleet-scope: does any machine's installed unit drift from the released
+unit files? (#1831, #1927)
 
 Aggregates every machine's own `unit_drift` machine-scope check
 (:mod:`coord.health.checks.unit_drift`) instead of reading the filesystem
@@ -67,6 +68,16 @@ def probe_fleet_unit_drift(ctx: HealthContext) -> CheckResult:
     ]
     stale = [(m, r) for m, r in all_results if r.get("severity") == "warn"]
     checked = [(m, r) for m, r in all_results if (r.get("values") or {}).get("installed")]
+    # #1927: a machine that diffed against its own git working copy proved
+    # nothing — a stale checkout and a stale installed unit agree with each
+    # other. Those results arrive as UNKNOWN and must not be counted toward
+    # the fleet's green.
+    unverified = [
+        (m, r)
+        for m, r in all_results
+        if (r.get("values") or {}).get("installed")
+        and (r.get("values") or {}).get("reference_verified") is False
+    ]
 
     values = {
         "machines": sorted({m for m, _ in all_results}),
@@ -75,6 +86,9 @@ def probe_fleet_unit_drift(ctx: HealthContext) -> CheckResult:
             {"machine": m, "unit": r.get("subject")} for m, r in shadowed
         ],
         "stale": [{"machine": m, "unit": r.get("subject")} for m, r in stale],
+        "unverified_reference": [
+            {"machine": m, "unit": r.get("subject")} for m, r in unverified
+        ],
     }
 
     if shadowed:
@@ -99,9 +113,27 @@ def probe_fleet_unit_drift(ctx: HealthContext) -> CheckResult:
             check_id="fleet_unit_drift",
             scope="fleet",
             severity=Severity.WARN,
-            headroom=f"installed unit(s) stale vs deploy/: {names}",
-            detail="cp the checked-in unit over the installed one and restart it — see the machine-scope unit_drift detail for the exact command",
-            threshold="warn when any installed unit's content != deploy/",
+            headroom=f"installed unit(s) stale vs the released units: {names}",
+            detail="cp the reference unit over the installed one and restart it — see the machine-scope unit_drift detail for the exact command",
+            threshold="warn when any installed unit's content != the released unit",
+            values=values,
+        )
+
+    if unverified:
+        names = ", ".join(
+            sorted({f"{m}/{r.get('subject')}" for m, r in unverified})
+        )
+        return CheckResult(
+            check_id="fleet_unit_drift",
+            scope="fleet",
+            severity=Severity.UNKNOWN,
+            headroom=f"reference is an unverified working copy on: {names}",
+            detail=(
+                "these machines diffed their installed units against a git "
+                "checkout nothing verifies is current, so a match proves "
+                "nothing — both sides go stale together (#1927). Install a "
+                "release wheel there; it ships the reference units."
+            ),
             values=values,
         )
 
@@ -111,7 +143,7 @@ def probe_fleet_unit_drift(ctx: HealthContext) -> CheckResult:
         severity=Severity.OK,
         headroom=(
             f"{len(checked)} installed unit(s) across {len(values['machines'])} "
-            "machine(s) match deploy/"
+            "machine(s) match the released units"
             if checked
             else "no machine has any deploy-lane unit installed"
         ),

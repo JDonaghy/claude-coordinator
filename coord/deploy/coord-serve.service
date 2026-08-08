@@ -1,0 +1,73 @@
+# coord serve — portable control-center daemon (#584/#591).
+#
+# A systemd *user* unit (mirrors coord-agent). Runs the read+write daemon that
+# fronts the one shared ~/.coord/coord.db so any Tailscale machine renders/drives
+# the same board. Install on the always-on box that owns the DB (dellserver).
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/coord-serve.service ~/.config/systemd/user/
+#   loginctl enable-linger "$USER"          # survive logout / reboot
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now coord-serve
+#
+# Prereqs on the daemon host:
+#   - ~/.coord-venv has a coord BUILD that includes `coord serve` (a release
+#     >= the #584/#590 cut, or an editable checkout of the branch). PyPI
+#     releases before that do NOT have the command.
+#   - ~/.coord/coordinator.yml exists (canonical location; the daemon serves it
+#     at GET /config so clients need none). Resolution: $COORD_CONFIG →
+#     ~/.coord/coordinator.yml → ./coordinator.yml.
+#   - ~/.coord/coord.db exists (after the one-time cutover/ETL).
+#   - Bearer token (recommended): printf '%s' "<secret>" > ~/.coord/serve_token
+#     && chmod 600 ~/.coord/serve_token   (resolve_serve_token reads it; never
+#     put --token on ExecStart — it would leak via `ps`).
+#
+# See docs/AGENT_OPERATIONS.md → "Control-center daemon (coord serve)".
+
+[Unit]
+Description=coord serve — portable control-center daemon (#584)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# PATH here merges TWO independent, still-load-bearing fixes — #1831 found
+# them landed a month apart, each unaware of the other, and each one alone
+# regresses the other's issue:
+#
+# - #1814 added ~/.cargo/bin. Defence in depth ONLY — never the fix on its
+#   own. A systemd user unit's PATH is systemd's, not a login shell's:
+#   ~/.profile is never sourced, so ~/.cargo/bin is absent and `cargo test`
+#   inside a `coord merge --revalidate` run died with "command not found".
+#   The real fix is in scripts/coord-test-runner.sh, which resolves each
+#   toolchain explicitly and reports a MISSING one as an infrastructure
+#   error rather than a red suite — because a PATH= line here fixes this
+#   host and leaves the next one broken silently, which is the same failure
+#   shape as the bug. Keep both.
+# - #1117 added the repo venv (%h/src/claude-coordinator/.venv/bin) so
+#   acceptance.drivers subprocesses shelled out via
+#   subprocess.run(shell=True) (e.g. the cli-pytest driver's `pytest
+#   tests/acceptance/{ms}`) resolve `pytest`/`python3` with the repo's
+#   runtime deps (e.g. httpx) instead of falling back to bare
+#   /usr/bin/python3, which lacks them -> every acceptance run/record
+#   silently failed with an ImportError, not a real test failure.
+#
+# #1831: putting the repo venv FIRST let a stale editable checkout there
+# shadow the pinned release for every `shutil.which("coord")` resolution
+# (coord_argv(), coord/drive.py) — the daemon ran 0.4.105 while everything
+# it spawned ran 0.4.103 editable code from a checkout nobody was updating.
+# ~/.local/bin goes ahead of it (a symlink to ~/.coord-venv/bin/coord, i.e.
+# the pinned release) so `coord` always resolves there first and a stale
+# checkout can never shadow it again; the repo venv stays LAST, after
+# ~/.local/bin, so pytest/python3 still see it for #1117.  This ordering is
+# the structural fix — see the `coord health`/`coord doctor` unit_drift
+# check (#1831), which flags any unit whose PATH puts a `.venv/bin` entry
+# ahead of ~/.local/bin or ~/.coord-venv/bin.
+Environment=PATH=%h/.cargo/bin:%h/.local/bin:%h/src/claude-coordinator/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
+ExecStart=%h/.coord-venv/bin/coord serve --config %h/.coord/coordinator.yml --host 0.0.0.0 --port 7435
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

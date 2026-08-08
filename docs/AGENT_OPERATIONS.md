@@ -704,8 +704,17 @@ the daemon's own children would actually resolve.
   goes *after* `~/.local/bin`, not before.
 - **`coord doctor` / `coord health`** report unit-file drift as a first-class
   check (`unit_drift` / `fleet_unit_drift`, `coord/health/checks/
-  unit_drift.py`, #1831) — STALE content vs. `deploy/`, and separately, CRIT
-  if any unit's PATH lets an editable checkout precede the release. Run
+  unit_drift.py`, #1831) — STALE content vs. the units packaged with the
+  installed release (`coord/deploy/`, kept byte-identical to `deploy/` by
+  `tests/test_packaged_deploy_units.py`), and separately, CRIT
+  if any unit's PATH lets an editable checkout precede the release. The
+  reference is the released artifact rather than the host's checkout on
+  purpose (#1927): a checkout nobody pulled goes stale in lockstep with the
+  installed unit, so the two agree and the diff reports clean in exactly the
+  #1831 case it exists to catch. A host whose reference *is* only a working
+  copy (source install, or a wheel predating #1927) now reports UNKNOWN on a
+  match rather than OK — an un-annotated green from an unverified reference
+  is worse than no check. Run
   `coord doctor` after any `deploy/**` change lands and after any
   `deploy/**`-affecting machine setup, the same way lane 1–4's "needed when"
   column above expects a manual verification step.
@@ -785,7 +794,7 @@ Three things follow, and they are why this command is shaped the way it is:
 | `~/.coord-venv` × N (agents) | each machine's `/health` | `agent_venv` (+ editable detection) |
 | `<unit> spawns` × N (live services) | each machine's `/health` | `spawned_coord` — **the 2026-08-04 lane** |
 | `coord-serve process` (daemon host) | `/board` → `fleet_deploy_lanes` | daemon's own install (#1806: only introspectable from the process itself) |
-| unit files vs `deploy/**` | each machine's `/health` | `unit_drift` / PATH shadow (#1831) |
+| unit files vs the packaged `coord/deploy/**` | each machine's `/health` | `unit_drift` / PATH shadow (#1831, #1927) |
 | `~/.coord-cli-venv` | each machine's `/health` | `cli_venv` (#1806) |
 | `coord-tui` binary vs `tui/` source | each machine's `/health` | `tui_binary` — until PKG-3/PKG-4 give it a real channel |
 | `coord web --dist` bundle vs `coord/dashboard/webapp/` source | each machine's `/health` | `webapp_bundle` / `fleet_webapp_bundle` — lane 5, staleness only (see below) |
