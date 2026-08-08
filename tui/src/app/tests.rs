@@ -44043,3 +44043,319 @@ Milestone tracking issue.
              highlight stays visible"
         );
     }
+
+    // ── #1867 (Q-2): Queue panel detail pane ────────────────────────────
+    //
+    // Black-box `TuiDriver` tests, in-crate, reusing the Q-1 fixtures above
+    // (`queue_fixture_json`, `queue_app`, `queue_driver`, `QUEUE_ICON`) plus
+    // `reports_wheel` — the wheel-dispatch helper is panel-agnostic, just a
+    // `UiEvent::Scroll` at a position.
+
+    /// Q-2 variant of `queue_driver` that also seeds `data.open_issues` —
+    /// the detail pane's fast path (`CoordApp::queue_issue_body_list`).
+    fn queue_driver_with_issues(
+        data: BoardData,
+        drive_queue_json: &str,
+        w: u16,
+        h: u16,
+    ) -> quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic> {
+        use quadraui::tui::testing::driver_with_shell;
+        let app = make_app_with_drive_queue(data, drive_queue_json);
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), w, h);
+        click_activity_icon(&mut driver, QUEUE_ICON);
+        driver.render();
+        driver
+    }
+
+    /// One `open_issues` row with the given body — the detail pane's
+    /// synced-row fast path.
+    fn open_issue(repo: &str, number: u64, title: &str, body: &str) -> OpenIssue {
+        OpenIssue {
+            repo_name: repo.to_string(),
+            number,
+            title: title.to_string(),
+            body: body.to_string(),
+            state: "open".to_string(),
+            labels: Vec::new(),
+            milestone_number: None,
+            milestone_title: None,
+        }
+    }
+
+    /// Flatten a `ListView`'s rendered text into one string, for
+    /// placeholder-text assertions that don't care about row boundaries.
+    fn list_text(list: &ListView) -> String {
+        list.items
+            .iter()
+            .flat_map(|i| i.text.spans.iter().map(|s| s.text.clone()))
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    #[test]
+    fn tuidriver_queue_detail_pane_renders_the_selected_rows_body() {
+        let mut data = BoardData::default();
+        data.open_issues
+            .push(open_issue("myrepo", 701, "T701", "BODY-701-UNIQUE"));
+        let driver = queue_driver_with_issues(data, queue_fixture_json(), 160, 30);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("BODY-701-UNIQUE"),
+            "#1867: row 0 (myrepo#701) is selected by default — its body \
+             must render in the bottom pane:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn tuidriver_queue_detail_pane_switches_body_when_the_selection_moves() {
+        let mut data = BoardData::default();
+        data.open_issues
+            .push(open_issue("myrepo", 701, "T701", "BODY-701-UNIQUE"));
+        data.open_issues
+            .push(open_issue("myrepo", 702, "T702", "BODY-702-UNIQUE"));
+        let mut driver = queue_driver_with_issues(data, queue_fixture_json(), 160, 30);
+        assert!(driver.screen().contains("BODY-701-UNIQUE"));
+
+        // Default focus is the grid (`Sidebar`), so a plain `j` still moves
+        // the row cursor — the #1867 gating on `FocusedRegion::Sidebar` must
+        // not have broken Q-1's row navigation.
+        driver.press(Key::Char('j'));
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("BODY-702-UNIQUE") && !screen.contains("BODY-701-UNIQUE"),
+            "#1867: moving the grid selection must swap the detail pane's \
+             body to the newly-selected row:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn queue_detail_scroll_resets_when_the_selection_changes() {
+        let mut app = queue_app(queue_fixture_json());
+        app.queue_detail_scroll = 7;
+        app.queue_move_selection(1); // row 0 → row 1, a real change.
+        assert_eq!(
+            app.queue_detail_scroll, 0,
+            "#1867: a short issue must not inherit a long one's scroll \
+             offset — that reads as \"no body\""
+        );
+    }
+
+    #[test]
+    fn queue_detail_scroll_survives_a_no_op_move() {
+        let mut app = queue_app(queue_fixture_json());
+        app.queue_detail_scroll = 3;
+        app.queue_move_selection(-1); // already at row 0 — clamps, no change.
+        assert_eq!(
+            app.queue_detail_scroll, 3,
+            "#1867: a move that lands back on the same row must not disturb \
+             an in-progress read of the body"
+        );
+    }
+
+    #[test]
+    fn queue_detail_scroll_resets_when_a_header_sort_reshuffles_the_rows() {
+        let mut app = queue_app(queue_fixture_json());
+        app.queue_detail_scroll = 4;
+        assert!(app.queue_sort_by_column(CoordApp::QUEUE_COL_TRIES));
+        assert_eq!(
+            app.queue_detail_scroll, 0,
+            "#1867: a re-sort can put a different entry at the same index \
+             `queue_sel` already points to — the scroll offset must not \
+             survive that"
+        );
+    }
+
+    #[test]
+    fn queue_detail_scroll_resets_when_the_selected_row_is_removed() {
+        let mut app = queue_app(queue_fixture_json());
+        app.queue_detail_scroll = 5;
+        app.queue_remove_selected();
+        assert_eq!(
+            app.queue_detail_scroll, 0,
+            "#1867: removing the selected row leaves a DIFFERENT entry \
+             under the (unchanged) index — the scroll offset is stale \
+             regardless of whether the index itself moved"
+        );
+    }
+
+    #[test]
+    fn queue_issue_body_no_github_slug_shows_a_placeholder_and_spawns_no_fetch() {
+        // Row 0 is myrepo#701; `data.pipeline_repos` carries no slug for
+        // `myrepo`, so the body list must fall back to the "no GitHub slug"
+        // placeholder rather than attempting (and failing) a `gh` call.
+        let app = queue_app(queue_fixture_json());
+        let rendered = list_text(&app.queue_issue_body_list());
+        assert!(
+            rendered.contains("no GitHub slug"),
+            "#1867: an issue absent from `open_issues` with no repo slug \
+             must show the same placeholder Board/Pipeline already use:\n{rendered}"
+        );
+        assert!(
+            app.pending_issue_fetches.borrow().is_empty(),
+            "#1867: without a slug there is nothing to fetch — no \
+             background thread may be spawned"
+        );
+    }
+
+    #[test]
+    fn queue_issue_body_in_flight_fetch_is_not_respawned_every_frame() {
+        // Row 0 is myrepo#701. Pre-seed an in-flight fetch with a channel
+        // that never resolves — standing in for a real `spawn_issue_fetch`
+        // thread that hasn't finished yet, without this test actually
+        // shelling out to `gh` (this crate has no injectable command runner
+        // for that call, and a `gh`-authenticated dev machine could
+        // otherwise write through to the real local issues DB via
+        // `upsert_issue_db`).
+        let mut data = BoardData::default();
+        data.pipeline_repos = vec![("myrepo".to_string(), "example-org/myrepo".to_string())];
+        let app = make_app_with_drive_queue(data, queue_fixture_json());
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.pending_issue_fetches
+            .borrow_mut()
+            .insert(("myrepo".to_string(), 701u64), rx);
+
+        let first = list_text(&app.queue_issue_body_list());
+        assert!(
+            first.contains("fetching"),
+            "#1867: an in-flight fetch must show the fetching placeholder:\n{first}"
+        );
+        assert_eq!(
+            app.pending_issue_fetches.borrow().len(),
+            1,
+            "#1867: exactly the one pre-seeded fetch"
+        );
+
+        // A second frame's render must not spawn a second fetch for the
+        // same issue.
+        let _second = app.queue_issue_body_list();
+        assert_eq!(
+            app.pending_issue_fetches.borrow().len(),
+            1,
+            "#1867: a background fetch may be triggered at most once per \
+             issue, never once per frame"
+        );
+    }
+
+    #[test]
+    fn tuidriver_queue_detail_pane_rewraps_to_the_live_panel_width() {
+        // #1867: `last_queue_detail_cols` exists so a resize re-wraps rather
+        // than wrapping to a stale width. `TuiDriver` has no live resize
+        // hook, so two drivers built at different terminal widths stand in
+        // for "before" and "after" a resize.
+        let body: String = std::iter::repeat("word ").take(40).collect();
+        let build = |w: u16| {
+            let mut data = BoardData::default();
+            data.open_issues
+                .push(open_issue("myrepo", 701, "T701", body.trim_end()));
+            queue_driver_with_issues(data, queue_fixture_json(), w, 30)
+        };
+        let narrow = build(60);
+        let wide = build(220);
+
+        let count_word_lines =
+            |screen: &str| screen.lines().filter(|l| l.contains("word")).count();
+        let narrow_lines = count_word_lines(&narrow.screen());
+        let wide_lines = count_word_lines(&wide.screen());
+        assert!(
+            narrow_lines > wide_lines,
+            "#1867: the same body must wrap across MORE lines in the \
+             narrower pane — narrow={narrow_lines} lines, wide={wide_lines} \
+             lines.\nnarrow:\n{}\nwide:\n{}",
+            narrow.screen(),
+            wide.screen(),
+        );
+    }
+
+    #[test]
+    fn tuidriver_queue_detail_pane_scrolls_via_mouse_wheel() {
+        let body: String = (0..40)
+            .map(|i| format!("LINE-{i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let mut data = BoardData::default();
+        data.open_issues.push(open_issue("myrepo", 701, "T701", &body));
+        let mut driver = queue_driver_with_issues(data, queue_fixture_json(), 160, 24);
+
+        let (x, y) = driver.find("LINE-00").unwrap_or_else(|| {
+            panic!(
+                "LINE-00 must render on the first frame:\n{}",
+                driver.screen()
+            )
+        });
+        assert!(
+            !driver.screen().contains("LINE-20"),
+            "sanity: the pane must not already show every line before any \
+             scroll:\n{}",
+            driver.screen()
+        );
+
+        for _ in 0..30 {
+            reports_wheel(&mut driver, (x, y), -1.0);
+        }
+
+        assert!(
+            !driver.screen().contains("LINE-00"),
+            "#1867: 30 wheel-down notches over the detail pane must scroll \
+             LINE-00 out of view:\n{}",
+            driver.screen()
+        );
+    }
+
+    #[test]
+    fn tuidriver_queue_detail_pane_scrolls_via_keyboard_off_sidebar_focus() {
+        let body: String = (0..40)
+            .map(|i| format!("LINE-{i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let mut data = BoardData::default();
+        data.open_issues.push(open_issue("myrepo", 701, "T701", &body));
+        let mut driver = queue_driver_with_issues(data, queue_fixture_json(), 160, 24);
+
+        assert!(
+            driver.screen().contains("LINE-00"),
+            "sanity: the first line must render before any scroll:\n{}",
+            driver.screen()
+        );
+
+        // Ctrl-W, then `l`: cycle focus Sidebar → Main, off the grid's
+        // default j/k-moves-the-cursor binding.
+        driver.ctrl_char('w');
+        driver.press(Key::Char('l'));
+        for _ in 0..30 {
+            driver.press(Key::Char('j'));
+        }
+        driver.render();
+
+        assert!(
+            !driver.screen().contains("LINE-00"),
+            "#1867: keyboard j, once focus has moved off the grid, must \
+             scroll the detail pane rather than the (now-unfocused) row \
+             cursor:\n{}",
+            driver.screen()
+        );
+    }
+
+    #[test]
+    fn queue_grid_stays_usable_at_the_split_reduced_height() {
+        // The split must not collapse the grid below a readable minimum —
+        // its declared columns and every unfinished row must still render
+        // even once ~40% of the panel is given to the detail pane.
+        let driver = queue_driver(queue_fixture_json(), 200, 24);
+        let screen = driver.screen();
+        for title in ["Issue", "Title", "State", "Reason"] {
+            assert!(
+                screen.contains(title),
+                "#1867: the grid's `{title}` column must still render at a \
+                 reduced height:\n{screen}"
+            );
+        }
+        for issue in ["701", "702", "703", "704", "705"] {
+            assert!(
+                screen.contains(&format!("myrepo#{issue}")),
+                "#1867: every unfinished row must still be reachable, not \
+                 crowded out by the detail pane:\n{screen}"
+            );
+        }
+    }

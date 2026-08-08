@@ -45,6 +45,10 @@ impl CoordApp {
     /// - **Pipeline** default stage view / Stages tab → `pipeline_stage_content_scroll`
     ///   (the field `pipeline_tab_body_list` renders with); every other
     ///   Pipeline tab → `pipeline_detail_scroll`.
+    /// - **Queue** (#1867, Q-2) → `queue_detail_scroll` (the issue-body pane
+    ///   under the grid). The grid itself keeps j/k as row-select while
+    ///   focus sits at its default (`Sidebar`) — see the dedicated Queue j/k
+    ///   arm this falls through from.
     ///
     /// Returns `true` when a field was updated (every list+detail view); the
     /// caller then requests a redraw.  Views without a scrollable content pane
@@ -80,6 +84,10 @@ impl CoordApp {
                         self.pipeline_detail_scroll = step(self.pipeline_detail_scroll, down);
                     }
                 }
+                true
+            }
+            SidebarView::Queue => {
+                self.queue_detail_scroll = step(self.queue_detail_scroll, down);
                 true
             }
             _ => false,
@@ -2584,15 +2592,24 @@ impl CoordApp {
                     // already live off the `/board` poll, so `r` is free for
                     // "resume" (release a fired deploy gate), matching the
                     // overlay.
+                    //
+                    // #1867 (Q-2): gated to `FocusedRegion::Sidebar` (the
+                    // panel's default focus) now that the panel also has a
+                    // detail pane below the grid. Ctrl-W'd off Sidebar, j/k
+                    // fall through to the generic `scroll_focused_content`
+                    // arm further down and scroll the issue body instead —
+                    // same Main/Detail convention as Board/Machines/Pipeline.
                     Key::Char('j') | Key::Named(NamedKey::Down)
-                        if self.active_view == SidebarView::Queue =>
+                        if self.active_view == SidebarView::Queue
+                            && self.focused_region == FocusedRegion::Sidebar =>
                     {
                         self.queue_move_selection(1);
                         self.fix_queue_scroll(content_visible_rows(ctx.main_bounds(), lh));
                         needs_redraw = true;
                     }
                     Key::Char('k') | Key::Named(NamedKey::Up)
-                        if self.active_view == SidebarView::Queue =>
+                        if self.active_view == SidebarView::Queue
+                            && self.focused_region == FocusedRegion::Sidebar =>
                     {
                         self.queue_move_selection(-1);
                         self.fix_queue_scroll(content_visible_rows(ctx.main_bounds(), lh));
@@ -3445,7 +3462,7 @@ impl CoordApp {
                             // #1866: Queue — Home jumps to the head of the
                             // queue (and scrolls it into view).
                             SidebarView::Queue => {
-                                self.queue_sel = 0;
+                                self.queue_set_sel(0);
                                 self.queue_scroll = 0;
                             }
                         }
@@ -3545,7 +3562,7 @@ impl CoordApp {
                             SidebarView::Queue => {
                                 let n = self.queue_rows().len();
                                 if n > 0 {
-                                    self.queue_sel = n - 1;
+                                    self.queue_set_sel(n - 1);
                                 }
                                 self.fix_queue_scroll(content_visible_rows(
                                     ctx.main_bounds(),
@@ -4532,7 +4549,7 @@ impl CoordApp {
                     // worst possible kind of surprise.
                     if self.active_view == SidebarView::Queue {
                         if let Some(DataTableHit::Row { idx }) = self.queue_table_hit(pos) {
-                            self.queue_sel = idx;
+                            self.queue_set_sel(idx);
                         }
                         if let Some(target) = self.queue_context_target() {
                             if self.open_context_menu(pos, target) {
@@ -5693,7 +5710,7 @@ impl CoordApp {
             return match self.queue_table_hit(pos) {
                 Some(DataTableHit::Header { col }) => self.queue_sort_by_column(col),
                 Some(DataTableHit::Row { idx }) => {
-                    self.queue_sel = idx;
+                    self.queue_set_sel(idx);
                     true
                 }
                 // No column-resize drag on this table yet (#1853 covers that
@@ -6422,17 +6439,44 @@ impl CoordApp {
                 }
                 true
             }
-            // #1866: Queue panel — the whole main pane is the grid, and it
-            // can run long. Clamped against the table's OWN painted
-            // viewport, not the panel's row count (the #1910 lesson).
+            // #1866: Queue panel grid, clamped against the table's OWN
+            // painted viewport, not the panel's row count (the #1910
+            // lesson).
+            //
+            // #1867 (Q-2): the panel is now split grid-over-detail
+            // (`render_queue_panel`), so the wheel must route to whichever
+            // pane the pointer is actually over. `queue_table_layout`'s
+            // cached rect IS the grid's own painted bounds (set to the
+            // post-split `list_rect`, not the full panel) — below its
+            // bottom edge is the detail pane. Before anything has been
+            // painted (cache `None`, only reachable for one frame) the
+            // whole panel counts as the grid, matching the pre-split
+            // behaviour rather than guessing at an unpainted split.
             SidebarView::Queue => {
-                let n = self.queue_rows().len();
-                if delta.y > 0.0 {
-                    self.queue_scroll = self.queue_scroll.saturating_sub(3);
-                } else if delta.y < 0.0 {
-                    let table_visible = self.queue_table_visible_rows().unwrap_or(visible).max(1);
-                    let max = n.saturating_sub(table_visible);
-                    self.queue_scroll = (self.queue_scroll + 3).min(max);
+                let over_grid = self
+                    .queue_table_layout
+                    .borrow()
+                    .as_ref()
+                    .map(|(rect, _)| pos.y < rect.y + rect.height)
+                    .unwrap_or(true);
+                if over_grid {
+                    let n = self.queue_rows().len();
+                    if delta.y > 0.0 {
+                        self.queue_scroll = self.queue_scroll.saturating_sub(3);
+                    } else if delta.y < 0.0 {
+                        let table_visible =
+                            self.queue_table_visible_rows().unwrap_or(visible).max(1);
+                        let max = n.saturating_sub(table_visible);
+                        self.queue_scroll = (self.queue_scroll + 3).min(max);
+                    }
+                } else {
+                    let items = self.queue_issue_body_list().items.len();
+                    let max = items.saturating_sub(visible.saturating_sub(1));
+                    if delta.y > 0.0 {
+                        self.queue_detail_scroll = self.queue_detail_scroll.saturating_sub(1);
+                    } else if delta.y < 0.0 {
+                        self.queue_detail_scroll = (self.queue_detail_scroll + 1).min(max);
+                    }
                 }
                 true
             }

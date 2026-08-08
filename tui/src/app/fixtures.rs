@@ -130,6 +130,8 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         queue_scroll: 0,
         queue_sort: None,
         queue_table_layout: std::cell::RefCell::new(None),
+        queue_detail_scroll: 0,
+        last_queue_detail_cols: std::cell::Cell::new(120),
         dialog_layout: std::cell::RefCell::new(None),
         pending_restart: None,
         machine_last_contact: std::collections::HashMap::new(),

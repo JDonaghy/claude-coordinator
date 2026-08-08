@@ -2341,6 +2341,19 @@ pub struct CoordApp {
     /// `render_queue_panel`, so a click can never route against a table
     /// that isn't on screen.
     queue_table_layout: std::cell::RefCell<Option<(Rect, DataTableLayout)>>,
+    /// #1867 (Q-2): vertical scroll offset into the selected row's issue
+    /// body, rendered in the bottom ~40% of the Queue panel. Stepped by
+    /// `scroll_focused_content` (keyboard, once focus has moved off the grid
+    /// via Ctrl-W) and by the mouse wheel over the detail pane
+    /// (`mouse_main_scroll`). Reset to 0 whenever the selected row changes
+    /// (`CoordApp::queue_set_sel`) — otherwise a short issue would inherit a
+    /// long one's offset and render blank, reading as "no body".
+    queue_detail_scroll: usize,
+    /// #1867: the content width the Queue detail pane was last painted at,
+    /// stashed immediately before drawing so `queue_issue_body_list` can
+    /// word-wrap to the live viewport. Same `last_issue_panel_cols` pattern
+    /// used by the Board/Pipeline Issue tabs.
+    last_queue_detail_cols: std::cell::Cell<usize>,
     /// Cached `DialogLayout` from the last prompt-dialog render — used for
     /// click hit-testing on dialog buttons.  Populated while any
     /// `pending_*` prompt dialog is visible; cleared when it dismisses.
@@ -3566,6 +3579,8 @@ impl CoordApp {
             queue_scroll: 0,
             queue_sort: None,
             queue_table_layout: std::cell::RefCell::new(None),
+            queue_detail_scroll: 0,
+            last_queue_detail_cols: std::cell::Cell::new(120),
             dialog_layout: std::cell::RefCell::new(None),
             pending_restart: None,
             machine_last_contact: std::collections::HashMap::new(),
