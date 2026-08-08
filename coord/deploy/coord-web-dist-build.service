@@ -1,0 +1,43 @@
+# coord-web-dist-build — pull merged main and rebuild the React webapp bundle
+# that `coord web --dist` serves (#1543), paired with
+# coord-web-dist-build.timer.
+#
+# A systemd *user* unit, Type=oneshot, mirroring coord-drive-queue.service's
+# tick pattern (timer-fired, its own flock so a slow run can't stack).  Runs
+# deploy/coord-web-dist-build.sh, which:
+#   - fetches origin/main into ~/src/claude-coordinator (read-only — only
+#     `git fetch` + `rev-parse`, never touches that checkout's working tree
+#     or whatever branch an operator has it parked on),
+#   - builds coord/dashboard/webapp from that SHA inside a DEDICATED worktree
+#     (~/.coord-web-checkout, never shared with an operator or `coord drive`),
+#   - atomically repoints ~/coord-web-dist at the new build.
+#
+# Deliberately separate from coord-agent/coord-serve/coord-web's
+# ~/.coord-venv: this unit never runs `pip install`, never touches that venv,
+# and its failure mode (a broken npm build) leaves the PREVIOUS release live
+# — see the script's header for the exact guarantee. Restarting THIS unit
+# does not restart coord-web, coord-serve, or coord-agent, and does not
+# interrupt an attended /ws/terminal session (no process restart happens at
+# all on a normal publish — see the script header).
+#
+# Install: see deploy/coord-web-dist-build.sh's header, or
+# docs/PHONE_WEBAPP.md / docs/AGENT_OPERATIONS.md.
+#
+# This is a Type=oneshot service activated BY THE TIMER — do not
+# `systemctl --user enable coord-web-dist-build.service` directly (it has no
+# [Install] section; the timer unit is what you enable).
+
+[Unit]
+Description=Build coord webapp dist from merged main (#1543)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/coord-web-dist-build.sh
+# The script has its own flock (coord-web-dist-build.lock); this is a
+# generous ceiling for a wedged `npm ci`/`npm run build`, well below the
+# timer's 1-minute cadence so a genuinely stuck run can't run into the next
+# fire indefinitely.
+TimeoutStartSec=300
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin

@@ -51,6 +51,24 @@ def _make_deploy_dir(tmp_path: Path, units: dict[str, str]) -> Path:
     return deploy_dir
 
 
+@pytest.fixture(autouse=True)
+def no_packaged_units(monkeypatch):
+    """Default every test to "this install ships no packaged units".
+
+    Without this the probe would find THIS repo's real `coord/deploy/`
+    (#1927) instead of whatever the test built under `tmp_path`. Tests that
+    care about the packaged reference opt in with :func:`use_packaged`.
+    """
+    monkeypatch.setattr(ud, "packaged_unit_dir", lambda: None)
+
+
+def use_packaged(monkeypatch, path: Path, *, verified: bool = True, version="0.4.110"):
+    """Point the probe at `path` as the packaged (released) reference."""
+    monkeypatch.setattr(ud, "packaged_unit_dir", lambda: path)
+    monkeypatch.setattr(ud, "in_git_worktree", lambda _p: not verified)
+    monkeypatch.setattr(ud, "installed_version", lambda: version)
+
+
 # ── resolve_deploy_dir / resolve_systemd_user_dir ──────────────────────────
 
 
@@ -108,22 +126,29 @@ def test_unit_not_installed_is_ok(tmp_path) -> None:
     assert r.values["installed"] is False
 
 
-def test_matching_unit_is_ok_and_silent(tmp_path) -> None:
-    """The acceptance-criteria "matching unit -> silent" half."""
-    checkout = tmp_path / "src" / "claude-coordinator"
-    (checkout / "deploy").mkdir(parents=True)
-    (checkout / "deploy" / "coord-serve.service").write_text(UNIT_TEXT)
+def test_matching_unit_is_ok_and_silent(tmp_path, monkeypatch) -> None:
+    """The acceptance-criteria "matching unit -> silent" half.
+
+    Only a *verified* reference — the units packaged with the installed
+    release — can produce this green (#1927).
+    """
+    packaged = tmp_path / "site-packages" / "coord" / "deploy"
+    packaged.mkdir(parents=True)
+    (packaged / "coord-serve.service").write_text(UNIT_TEXT)
+    use_packaged(monkeypatch, packaged)
     installed_dir = tmp_path / ".config" / "systemd" / "user"
     installed_dir.mkdir(parents=True)
     (installed_dir / "coord-serve.service").write_text(UNIT_TEXT)
 
-    ctx = make_ctx(tmp_path, checkouts=(Checkout(name="coordinator", path=checkout),))
-    results = ud.probe_unit_drift(ctx)
+    results = ud.probe_unit_drift(make_ctx(tmp_path))
     assert len(results) == 1
     r = results[0]
     assert r.severity is Severity.OK
-    assert r.headroom == "matches deploy/"
+    assert r.headroom == "matches packaged coord 0.4.110"
     assert r.values["matches"] is True
+    assert r.values["reference_verified"] is True
+    assert r.values["reference_source"] == "package"
+    assert r.values["reference_version"] == "0.4.110"
 
 
 def test_stale_unit_is_warn_and_reports_mtime_and_diff(tmp_path) -> None:
@@ -168,15 +193,15 @@ def test_unreadable_installed_unit_is_unknown(tmp_path) -> None:
     assert results[0].error
 
 
-def test_multiple_units_each_get_their_own_result(tmp_path) -> None:
-    checkout = tmp_path / "src" / "claude-coordinator"
-    (checkout / "deploy").mkdir(parents=True)
-    (checkout / "deploy" / "coord-serve.service").write_text(UNIT_TEXT)
-    (checkout / "deploy" / "coord-agent.service").write_text(UNIT_TEXT)
-    (checkout / "deploy" / "coord-notify.timer").write_text("[Timer]\n")
+def test_multiple_units_each_get_their_own_result(tmp_path, monkeypatch) -> None:
+    packaged = tmp_path / "site-packages" / "coord" / "deploy"
+    packaged.mkdir(parents=True)
+    (packaged / "coord-serve.service").write_text(UNIT_TEXT)
+    (packaged / "coord-agent.service").write_text(UNIT_TEXT)
+    (packaged / "coord-notify.timer").write_text("[Timer]\n")
+    use_packaged(monkeypatch, packaged)
 
-    ctx = make_ctx(tmp_path, checkouts=(Checkout(name="coordinator", path=checkout),))
-    results = ud.probe_unit_drift(ctx)
+    results = ud.probe_unit_drift(make_ctx(tmp_path))
     subjects = sorted(r.subject for r in results)
     assert subjects == [
         "coord-agent.service",
@@ -247,3 +272,195 @@ def test_shadow_risk_wins_over_content_match(tmp_path) -> None:
     assert r.severity is Severity.CRIT
     assert r.values["matches"] is True
     assert r.values["shadow_entry"] == "%h/src/claude-coordinator/.venv/bin"
+
+
+# ── #1927: the reference must be the released artifact ────────────────────
+#
+# The check diffed installed units against `<checkout>/deploy/<name>` — a
+# file in the host's own working copy that nothing verifies is current.
+# Installed units and checkouts go stale for the same reason (nobody
+# pulled), so they go stale together and the diff reports clean: the check
+# was least reliable in exactly the #1831 case it exists to catch.
+
+
+RELEASED_UNIT = UNIT_TEXT + "Environment=COORD_RELEASED=1\n"
+
+
+def _install(tmp_path: Path, name: str, text: str) -> Path:
+    installed_dir = tmp_path / ".config" / "systemd" / "user"
+    installed_dir.mkdir(parents=True, exist_ok=True)
+    path = installed_dir / name
+    path.write_text(text)
+    return path
+
+
+def _stale_checkout(tmp_path: Path, name: str, text: str) -> Path:
+    """A git checkout parked days behind the release — the false-green half."""
+    checkout = tmp_path / "src" / "claude-coordinator"
+    (checkout / "deploy").mkdir(parents=True, exist_ok=True)
+    (checkout / "deploy" / name).write_text(text)
+    return checkout
+
+
+def test_stale_checkout_and_stale_unit_that_agree_still_report_drift(
+    tmp_path, monkeypatch
+) -> None:
+    """The direct #1831 regression: both sides stale, so they MATCH.
+
+    dellserver ran a `coord-serve.service` whose PATH had been wrong for
+    591.8h while its checkout sat days behind. Diffed against that checkout
+    the installed unit was byte-identical and the tool reported clean.
+    Against the packaged release it is drift, which is the point.
+    """
+    packaged = tmp_path / "site-packages" / "coord" / "deploy"
+    packaged.mkdir(parents=True)
+    (packaged / "coord-serve.service").write_text(RELEASED_UNIT)
+    use_packaged(monkeypatch, packaged)
+
+    checkout = _stale_checkout(tmp_path, "coord-serve.service", UNIT_TEXT)
+    installed = _install(tmp_path, "coord-serve.service", UNIT_TEXT)
+    # The old reference and the installed unit agree exactly.
+    assert (checkout / "deploy" / "coord-serve.service").read_text() == (
+        installed.read_text()
+    )
+
+    ctx = make_ctx(tmp_path, checkouts=(Checkout(name="coordinator", path=checkout),))
+    results = ud.probe_unit_drift(ctx)
+    assert len(results) == 1
+    r = results[0]
+    assert r.severity is Severity.WARN
+    assert r.values["reference_source"] == "package"
+    assert r.values["reference_verified"] is True
+    assert r.values["diff_lines"] >= 1
+
+
+def test_stale_checkout_with_a_correct_unit_does_not_report_drift(
+    tmp_path, monkeypatch
+) -> None:
+    """The observed 2026-08-07 false red: the *reference* was the stale side.
+
+    A unit installed 0.0h ago from the released tag reported "stale — 42
+    line(s) differ" because dellserver's checkout was days behind.
+    """
+    packaged = tmp_path / "site-packages" / "coord" / "deploy"
+    packaged.mkdir(parents=True)
+    (packaged / "coord-serve.service").write_text(RELEASED_UNIT)
+    use_packaged(monkeypatch, packaged)
+
+    checkout = _stale_checkout(tmp_path, "coord-serve.service", UNIT_TEXT)
+    _install(tmp_path, "coord-serve.service", RELEASED_UNIT)
+
+    ctx = make_ctx(tmp_path, checkouts=(Checkout(name="coordinator", path=checkout),))
+    results = ud.probe_unit_drift(ctx)
+    assert len(results) == 1
+    assert results[0].severity is Severity.OK
+    assert results[0].values["matches"] is True
+
+
+def test_remedy_sources_from_the_verified_reference_not_the_checkout(
+    tmp_path, monkeypatch
+) -> None:
+    """`cp` out of an unverified checkout is how a stale unit got cemented."""
+    packaged = tmp_path / "site-packages" / "coord" / "deploy"
+    packaged.mkdir(parents=True)
+    (packaged / "coord-serve.service").write_text(RELEASED_UNIT)
+    use_packaged(monkeypatch, packaged)
+
+    checkout = _stale_checkout(tmp_path, "coord-serve.service", "[Service]\nstale=1\n")
+    _install(tmp_path, "coord-serve.service", UNIT_TEXT)
+
+    ctx = make_ctx(tmp_path, checkouts=(Checkout(name="coordinator", path=checkout),))
+    (r,) = ud.probe_unit_drift(ctx)
+    assert r.severity is Severity.WARN
+    assert str(packaged / "coord-serve.service") in r.detail
+    assert str(checkout) not in r.detail
+    assert r.values["deploy_path"] == str(packaged / "coord-serve.service")
+
+
+def test_match_against_an_unverified_working_copy_is_unknown_not_ok(
+    tmp_path, monkeypatch
+) -> None:
+    """An un-annotated green from an unverified reference is worse than no
+    check, so a match the tool cannot vouch for grades UNKNOWN."""
+    checkout = _stale_checkout(tmp_path, "coord-serve.service", UNIT_TEXT)
+    _install(tmp_path, "coord-serve.service", UNIT_TEXT)
+
+    ctx = make_ctx(tmp_path, checkouts=(Checkout(name="coordinator", path=checkout),))
+    (r,) = ud.probe_unit_drift(ctx)
+    assert r.severity is Severity.UNKNOWN
+    assert r.values["matches"] is True
+    assert r.values["reference_source"] == "checkout"
+    assert r.values["reference_verified"] is False
+    assert "unverified working copy" in r.headroom
+    assert str(checkout) in r.detail
+
+
+def test_source_checkout_install_is_an_unverified_reference(
+    tmp_path, monkeypatch
+) -> None:
+    """`coord/deploy/` inside an EDITABLE install is still a working copy —
+    the package dir sits under a `.git`, so it gets no green either."""
+    packaged = tmp_path / "src" / "claude-coordinator" / "coord" / "deploy"
+    packaged.mkdir(parents=True)
+    (packaged / "coord-serve.service").write_text(UNIT_TEXT)
+    use_packaged(monkeypatch, packaged, verified=False)
+    _install(tmp_path, "coord-serve.service", UNIT_TEXT)
+
+    (r,) = ud.probe_unit_drift(make_ctx(tmp_path))
+    assert r.severity is Severity.UNKNOWN
+    assert r.values["reference_source"] == "package"
+    assert r.values["reference_verified"] is False
+
+
+def test_configured_deploy_dir_is_only_a_fallback_and_is_unverified(
+    tmp_path, monkeypatch
+) -> None:
+    """`health.deploy_dir` still points the check somewhere when the wheel
+    ships no units, but it names a host path nothing verifies."""
+    configured = tmp_path / "elsewhere" / "deploy"
+    configured.mkdir(parents=True)
+    (configured / "coord-serve.service").write_text(UNIT_TEXT)
+    ctx = make_ctx(tmp_path, thresholds=HealthConfig(deploy_dir=str(configured)))
+    ref = ud.resolve_reference(ctx)
+    assert ref is not None
+    assert ref.source == "configured"
+    assert ref.verified is False
+
+    packaged = tmp_path / "site-packages" / "coord" / "deploy"
+    packaged.mkdir(parents=True)
+    (packaged / "coord-serve.service").write_text(RELEASED_UNIT)
+    use_packaged(monkeypatch, packaged)
+    ref = ud.resolve_reference(ctx)
+    assert ref is not None
+    assert ref.source == "package"
+    assert ref.path == packaged
+
+
+# ── the real packaged reference ───────────────────────────────────────────
+
+
+def test_this_distribution_ships_its_reference_units() -> None:
+    """Not a mock: the distribution must actually carry
+    `coord/deploy/*.service`, or every host silently falls back to its own
+    working copy. Resolved without `packaged_unit_dir` (which the autouse
+    fixture stubs out) so it asserts the real layout."""
+    import coord
+
+    packaged = Path(coord.__file__).resolve().parent / "deploy"
+    assert packaged.is_dir()
+    names = {p.name for p in ud._unit_files(packaged)}
+    assert "coord-serve.service" in names
+    assert "coord-agent.service" in names
+
+
+def test_in_git_worktree_distinguishes_a_checkout_from_site_packages(
+    tmp_path,
+) -> None:
+    checkout = tmp_path / "src" / "claude-coordinator"
+    (checkout / ".git").mkdir(parents=True)
+    (checkout / "coord" / "deploy").mkdir(parents=True)
+    assert ud.in_git_worktree(checkout / "coord" / "deploy") is True
+
+    site = tmp_path / "venv" / "lib" / "site-packages" / "coord" / "deploy"
+    site.mkdir(parents=True)
+    assert ud.in_git_worktree(site) is False

@@ -59,7 +59,17 @@ include = ["coord*"]
 exclude = ["tests*"]
 
 [tool.setuptools.package-data]
-coord = ["skills/**/*", "dashboard/webapp/dist/**/*", "agents/**/*"]
+coord = [
+    "skills/**/*",
+    "dashboard/webapp/dist/**/*",
+    "agents/**/*",
+    # #1927: the systemd units the `unit_drift` check diffs installed copies
+    # against. Shipped INSIDE the package so the reference is the released
+    # artifact for the installed version rather than whatever the host's git
+    # checkout happens to be parked on. Kept byte-identical to the top-level
+    # `deploy/` by tests/test_packaged_deploy_units.py.
+    "deploy/*",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

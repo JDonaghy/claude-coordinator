@@ -1,0 +1,39 @@
+# coord drive-queue tick — fires coord-drive-queue.service (Type=oneshot) on
+# a cadence. See that unit's header for the full rationale and the
+# COORD_BIN / #1523 pinned-runner requirement.
+#
+# 3 minutes (was 15). The earlier rationale — "between launches the tick is
+# only ever OBSERVING ... a tighter interval buys nothing but load" — missed
+# that the tick is ALSO the only thing that notices a drive has finished and
+# launches the next entry. Capacity is 1, so the interval is a hard lower
+# bound on the dead time between issues, not idle observation.
+#
+# Measured 2026-08-07 from the queue journal: #1910's PR merged at 12:47:36,
+# the 12:46:42 tick still saw it alive, and the next tick launched #1834 at
+# 13:02:13 — 14m37s of an idle fleet. Completions land uniformly inside the
+# interval, so the expected loss is HALF of it per issue (~7.5min at 15min).
+# Over a queue of 18 that was ~2.2 hours of nothing happening.
+#
+# Reconcile and launch happen in the SAME tick (13:02:12 reconciled #1910
+# done, 13:02:13 launched #1834), so the cost is one interval, not two.
+#
+# A tick is a /board read plus reconciliation, and #1597 added the /board
+# single-flight guard, so 20 ticks/hour is affordable. `Type=oneshot` + the
+# tick's own flock means it cannot stack even if it fired faster than a tick
+# takes to run. AccuracySec is tightened to 15s to match: systemd's default
+# batching slop of 1min is 33% of a 3min interval.
+#
+# Install: see deploy/coord-drive-queue.service's header, or
+# docs/DRIVE_QUEUE.md.
+
+[Unit]
+Description=Run coord drive-queue tick every 3 minutes (#1756)
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=3min
+AccuracySec=15s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

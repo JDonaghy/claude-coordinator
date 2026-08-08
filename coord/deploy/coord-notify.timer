@@ -1,0 +1,24 @@
+# coord notify — periodic driver for thin-client setups (#1311). Fires
+# coord-notify.service (Type=oneshot) on a cadence. See that unit's header
+# for the full rationale ("THIS TIMER IS THE SANCTIONED SINGLE DRIVER").
+#
+# 5 minutes is deliberately coarser than the in-process TUI's 30s cadence —
+# this timer's job is "don't let the pipeline stall unnoticed for the whole
+# session," not sub-minute responsiveness. Tighten OnUnitActiveSec if that
+# proves too slow in practice; there's no correctness reason it needs to be
+# this conservative, just no reason to hammer `gh` harder than necessary.
+#
+# Install: see deploy/coord-notify.service's header, or
+# docs/AGENT_OPERATIONS.md → "Periodic coord notify (coord-notify timer)".
+
+[Unit]
+Description=Run coord notify every few minutes (#1311)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

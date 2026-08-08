@@ -686,8 +686,12 @@ release was never necessary for either fix, it just happened to be first.
 
 **Detection, not automation.** `coord doctor` / `coord health` now report
 unit-file drift as a check (`unit_drift` / `fleet_unit_drift`,
-`coord/health/checks/unit_drift.py`) — installed content vs. `deploy/`
-(STALE, with the installed mtime and a line-diff summary), and separately,
+`coord/health/checks/unit_drift.py`) — installed content vs. the units
+**packaged with the installed release** (`coord/deploy/`, #1927; the
+reference is deliberately *not* the host's own `deploy/` checkout, which
+goes stale in step with the installed unit and so reports clean exactly
+when it shouldn't) with the installed mtime and a line-diff summary, and
+separately,
 CRIT if any unit's PATH lets a `.venv/bin` checkout precede the release entry
 points (`~/.local/bin`, `~/.coord-venv/bin`). Run `coord doctor` after any
 `deploy/**` merge and after any machine-setup change that touches a unit
