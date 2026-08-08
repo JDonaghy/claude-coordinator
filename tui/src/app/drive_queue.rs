@@ -1,5 +1,5 @@
 //! The operator-declared `coord drive` work queue (#1750 DQ-3 / #1755) —
-//! an always-visible status-bar segment, a right-click detail overlay, and
+//! an always-visible status-bar segment, the Queue panel (#1866/#1867), and
 //! "Add to drive queue" on the Pipeline row menu.
 //!
 //! The TUI is where the operator reads the pipeline and forms the intent
@@ -22,13 +22,12 @@
 //! and no client-side mutation of `data.drive_queue` beyond the optimistic
 //! removal `escalation.rs` already precedents.
 //!
-//! **Reached by right-click, not a status-bar letter row** — see
-//! `fleet_health.rs`'s module doc comment for why (`StatusBarSegment::
-//! action_id` exists on the wire but this codebase wires no per-segment
-//! click dispatch, and adding one was explicitly out of scope for #1755).
-//! Right-clicking anywhere on the status bar opens the shared
-//! [`ContextMenuTarget::FleetHealth`] menu, which since #1755 carries a
-//! "Drive queue…" item alongside "Fleet health…".
+//! **One queue surface, not two (#1868).** Until #1868 this module also
+//! carried a right-click detail overlay that rendered the same rows through
+//! a second code path — two surfaces over one data source drift, and #1868
+//! retired it now that the Queue panel is proven. The status-bar segment's
+//! "Drive queue…" menu item now switches straight to the panel
+//! (`SidebarView::Queue`) instead of opening a modal.
 //!
 //! **Import pattern:** `use super::*` is intentional — see `fleet_health.rs`
 //! / `escalation.rs` / `drive.rs` for the same rationale.
@@ -447,227 +446,6 @@ impl CoordApp {
         items
     }
 
-    // ── overlay ──────────────────────────────────────────────────────────
-
-    pub(crate) fn open_drive_queue_overlay(&mut self) {
-        self.drive_queue_overlay_open = true;
-        let len = self.data.drive_queue.len();
-        if self.drive_queue_sel >= len {
-            self.drive_queue_sel = len.saturating_sub(1);
-        }
-    }
-
-    pub(crate) fn close_drive_queue_overlay(&mut self) {
-        self.drive_queue_overlay_open = false;
-    }
-
-    /// Move the overlay selection by `delta` rows, clamped. No wraparound —
-    /// a queue is short and ordered, and wrapping past the tail hides how
-    /// close to the end you are.
-    pub(crate) fn drive_queue_move_selection(&mut self, delta: isize) {
-        let len = self.drive_queue_entries().len();
-        if len == 0 {
-            self.drive_queue_sel = 0;
-            return;
-        }
-        let next = (self.drive_queue_sel as isize + delta).clamp(0, len as isize - 1);
-        self.drive_queue_sel = next as usize;
-    }
-
-    /// Popup geometry — same inset formula as `fleet_health_overlay_rect`.
-    fn drive_queue_overlay_rect(main: Rect) -> Rect {
-        let w = (main.width - 4.0).max(20.0).min(main.width);
-        let h = (main.height - 2.0).max(10.0).min(main.height);
-        let x = main.x + (main.width - w) * 0.5;
-        let y = main.y + (main.height - h) * 0.5;
-        Rect::new(x, y, w, h)
-    }
-
-    /// One `ListItem` per queue row, plus its optional muted continuation
-    /// line. Returns `(items, row_targets)` where `row_targets[i]` is the
-    /// queue index the painted row `i` belongs to (`None` for the trailing
-    /// hint rows) — so [`Self::drive_queue_row_at`] hit-tests against the
-    /// exact shape that was painted rather than re-deriving row arithmetic
-    /// that could drift (the `plans_row_at` precedent).
-    fn drive_queue_overlay_items(&self) -> (Vec<ListItem>, Vec<Option<usize>>) {
-        let rows = self.drive_queue_entries();
-        let mut items: Vec<ListItem> = Vec::new();
-        let mut targets: Vec<Option<usize>> = Vec::new();
-
-        if rows.is_empty() {
-            items.push(dq_muted_row(
-                "Drive queue is empty — right-click a Pipeline row → \"Add to drive queue\".",
-            ));
-            targets.push(None);
-        }
-
-        for (idx, e) in rows.iter().enumerate() {
-            let selected = idx == self.drive_queue_sel;
-            let (fg, _) = dq_state_colors(&e.state);
-            let mut line = format!(
-                "{} {:>2}  {:<28} {:<8}",
-                if selected { "▸" } else { " " },
-                e.position,
-                e.key(),
-                e.state,
-            );
-            match e.machine.as_deref() {
-                Some(m) if !m.is_empty() => line.push_str(&format!("  on {m}")),
-                // An unpinned row is the normal case, not a gap — say what
-                // it means rather than leaving the column blank.
-                _ => line.push_str("  (unpinned)"),
-            }
-            if let Some(s) = e.session_name.as_deref() {
-                if !s.is_empty() {
-                    line.push_str(&format!("  tmux:{s}"));
-                }
-            }
-            if !e.after.is_empty() {
-                line.push_str(&format!("  after {}", e.after.join(",")));
-            }
-            // #1757: a deploy gate is on the ROW, not just in the aggregate —
-            // an operator scanning the queue has to be able to see which entry
-            // is going to stop it before it stops.
-            if e.hold_after != 0 {
-                let state = if e.hold_state.is_empty() {
-                    "armed"
-                } else {
-                    e.hold_state.as_str()
-                };
-                line.push_str(&format!("  hold:{state}"));
-            }
-            items.push(ListItem {
-                text: StyledText {
-                    spans: vec![StyledSpan::with_fg(line, fg)],
-                },
-                icon: None,
-                detail: None,
-                decoration: if selected {
-                    Decoration::Header
-                } else {
-                    Decoration::Normal
-                },
-            });
-            targets.push(Some(idx));
-
-            // Why a row is being passed over is the single most useful thing
-            // in this overlay — always shown when there is anything to show.
-            if e.deferrals > 0 || !e.last_reason.is_empty() || e.attempts > 0 {
-                let mut bits: Vec<String> = Vec::new();
-                if e.attempts > 0 {
-                    bits.push(format!("attempts {}", e.attempts));
-                }
-                if e.deferrals > 0 {
-                    bits.push(format!("deferrals {}", e.deferrals));
-                }
-                if !e.last_reason.is_empty() {
-                    bits.push(format!("last: {}", e.last_reason));
-                }
-                items.push(dq_muted_row(&format!("      {}", bits.join("  ·  "))));
-                targets.push(Some(idx));
-            }
-
-            // The gate's own line: what the operator has to DO, and (when a
-            // probe is declared) whether it is failing. Shown for an `armed`
-            // gate too — knowing the deploy step is coming is what lets an
-            // operator queue the work and walk away.
-            if e.hold_after != 0 {
-                items.push(dq_muted_row(&format!(
-                    "      hold-after: {}",
-                    hold_headline(e)
-                )));
-                targets.push(Some(idx));
-                if !e.resume_when.is_empty() {
-                    let mut probe = format!("      resume-when: {}", e.resume_when);
-                    if e.hold_probes > 0 {
-                        probe.push_str(&format!("  (failed {}×)", e.hold_probes));
-                    }
-                    items.push(dq_muted_row(&probe));
-                    targets.push(Some(idx));
-                }
-            }
-        }
-
-        items.push(dq_muted_row(""));
-        targets.push(None);
-        items.push(dq_muted_row(
-            "(j/k select · x remove · K/J move up/down · u unblock · r resume · right-click for the menu · Esc closes)",
-        ));
-        targets.push(None);
-        (items, targets)
-    }
-
-    /// The `ListView` the overlay paints. Shared by the paint path and the
-    /// hit-test so the two can never disagree about the layout.
-    fn drive_queue_list_view(&self, items: Vec<ListItem>, total: usize, rect: Rect) -> ListView {
-        ListView {
-            id: WidgetId::new("drive-queue-overlay"),
-            title: Some(StyledText::plain("Drive queue".to_string())),
-            items,
-            selected_idx: 0,
-            scroll_offset: 0,
-            has_focus: true,
-            bordered: true,
-            h_scroll: 0,
-            max_content_width: None,
-            show_v_scrollbar: (total as f32) > (rect.height.max(1.0)),
-        }
-    }
-
-    /// Paint the overlay — a no-op when closed.
-    pub(crate) fn render_drive_queue_overlay(&self, backend: &mut dyn Backend, main: Rect) {
-        if !self.drive_queue_overlay_open {
-            return;
-        }
-        let (items, _) = self.drive_queue_overlay_items();
-        let rect = Self::drive_queue_overlay_rect(main);
-        let total = items.len();
-        let view = self.drive_queue_list_view(items, total, rect);
-        backend.draw_list(rect, &view);
-    }
-
-    /// Queue index under `pos`, or `None` for the border / hint rows /
-    /// outside. Built from the same painted item list as the render path.
-    pub(crate) fn drive_queue_row_at(&self, pos: Point, main: Rect, lh: f32) -> Option<usize> {
-        if !self.drive_queue_overlay_open {
-            return None;
-        }
-        let (items, targets) = self.drive_queue_overlay_items();
-        let rect = Self::drive_queue_overlay_rect(main);
-        let total = items.len();
-        let view = self.drive_queue_list_view(items, total, rect);
-        let layout = view.layout(rect.width, rect.height, lh, |_| ListItemMeasure::new(lh));
-        match layout.hit_test(pos.x - rect.x, pos.y - rect.y) {
-            ListViewHit::Item(idx) => targets.get(idx).copied().flatten(),
-            _ => None,
-        }
-    }
-
-    /// True iff `pos` lands anywhere inside the open overlay.
-    pub(crate) fn drive_queue_overlay_hit(&self, pos: Point, main: Rect) -> bool {
-        if !self.drive_queue_overlay_open {
-            return false;
-        }
-        let r = Self::drive_queue_overlay_rect(main);
-        pos.x >= r.x && pos.x < r.x + r.width && pos.y >= r.y && pos.y < r.y + r.height
-    }
-
-    /// The right-click target for the overlay's currently-selected row.
-    /// `None` for an empty queue (nothing to act on).
-    pub(crate) fn drive_queue_context_target(&self) -> Option<ContextMenuTarget> {
-        let rows = self.drive_queue_entries();
-        let queue_len = rows.len();
-        let e = rows.get(self.drive_queue_sel)?;
-        Some(ContextMenuTarget::DriveQueueRow {
-            repo_name: e.repo_name.clone(),
-            issue_number: e.issue_number,
-            state: e.state.clone(),
-            position: e.position,
-            queue_len,
-            held: is_holding(e),
-        })
-    }
-
     /// Per-row menu: Resume / Move up / Move down / Unblock / Remove.
     /// End-of-queue moves are DISABLED with a reason rather than silently
     /// no-op'ing (#1598's `disabled_because` precedent).
@@ -793,10 +571,9 @@ impl CoordApp {
         self.data
             .drive_queue
             .retain(|e| !(e.repo_name == repo && e.issue_number == issue));
-        let len = self.drive_queue_entries().len();
-        if self.drive_queue_sel >= len {
-            self.drive_queue_sel = len.saturating_sub(1);
-        }
+        // #1868: clamping the Queue panel's own selection after a removal is
+        // `queue_remove_selected`'s job (it indexes a different, filtered row
+        // set) — the drive-queue overlay this used to also clamp for is gone.
         self.push_toast(
             "Drive queue",
             &format!("removed {repo} #{issue} from the queue"),
@@ -943,93 +720,14 @@ impl CoordApp {
         self.dispatch_drive_queue_add(&input.repo_name, input.issue_number, None, &after);
     }
 
-    /// Keyboard handling while the overlay owns input. Returns `true` when
-    /// the key was consumed (which, for this overlay, is every key — it is
-    /// modal, same as the fleet-health overlay).
-    pub(crate) fn drive_queue_overlay_key(&mut self, key: &Key) -> bool {
-        match key {
-            Key::Named(NamedKey::Escape) => {
-                self.close_drive_queue_overlay();
-            }
-            Key::Named(NamedKey::Down) | Key::Char('j') => self.drive_queue_move_selection(1),
-            Key::Named(NamedKey::Up) | Key::Char('k') => self.drive_queue_move_selection(-1),
-            Key::Char('J') => self.drive_queue_selected_move(1),
-            Key::Char('K') => self.drive_queue_selected_move(-1),
-            Key::Char('x') => {
-                if let Some((repo, issue)) = self.drive_queue_selected_key() {
-                    self.dispatch_drive_queue_remove(&repo, issue);
-                }
-            }
-            Key::Char('u') => {
-                let target = self
-                    .drive_queue_entries()
-                    .get(self.drive_queue_sel)
-                    .filter(|e| e.state == QUEUE_STATE_BLOCKED)
-                    .map(|e| (e.repo_name.clone(), e.issue_number));
-                match target {
-                    Some((repo, issue)) => self.dispatch_drive_queue_unblock(&repo, issue),
-                    None => self.push_toast(
-                        "Drive queue",
-                        "only a blocked entry can be unblocked.",
-                        ToastSeverity::Warning,
-                    ),
-                }
-            }
-            // #1757: release the selected row's fired deploy gate. Refuses on
-            // any other row rather than falling back to "resume whatever is
-            // held" — see `dispatch_drive_queue_resume`.
-            Key::Char('r') => {
-                let target = self
-                    .drive_queue_entries()
-                    .get(self.drive_queue_sel)
-                    .filter(|e| is_holding(e))
-                    .map(|e| (e.repo_name.clone(), e.issue_number));
-                match target {
-                    Some((repo, issue)) => self.dispatch_drive_queue_resume(&repo, issue),
-                    None => self.push_toast(
-                        "Drive queue",
-                        "only an entry whose deploy gate has fired can be resumed.",
-                        ToastSeverity::Warning,
-                    ),
-                }
-            }
-            _ => {}
-        }
-        true
-    }
-
-    /// `(repo, issue)` of the overlay's selected row.
-    fn drive_queue_selected_key(&self) -> Option<(String, i64)> {
-        self.drive_queue_entries()
-            .get(self.drive_queue_sel)
-            .map(|e| (e.repo_name.clone(), e.issue_number))
-    }
-
-    /// Move the selected row `delta` slots and follow it with the selection
-    /// (so repeated `K` walks an entry up the queue instead of walking the
-    /// cursor off it).
-    pub(crate) fn drive_queue_selected_move(&mut self, delta: i64) {
-        let rows = self.drive_queue_entries();
-        let len = rows.len();
-        let Some(e) = rows.get(self.drive_queue_sel) else {
-            return;
-        };
-        let (repo, issue, position) = (e.repo_name.clone(), e.issue_number, e.position);
-        let to = (position + delta).clamp(0, (len as i64 - 1).max(0));
-        if to == position {
-            return;
-        }
-        self.dispatch_drive_queue_move(&repo, issue, to);
-        self.drive_queue_move_selection(delta as isize);
-    }
-
     // ── #1866 (Q-1): the Queue panel ─────────────────────────────────────
     //
-    // A live `DataTable` grid over the same `data.drive_queue` the overlay
-    // above reads. Everything below is *presentation and routing*: the
-    // entries, the predicates, the colours and — crucially — the write seam
-    // are all the ones already defined in this module, so the panel and the
-    // overlay can never disagree about what the queue is or what a verb does.
+    // A live `DataTable` grid over `data.drive_queue`. Everything below is
+    // *presentation and routing*: the entries, the predicates, the colours
+    // and — crucially — the write seam are all the ones already defined
+    // above in this module (originally shared with the drive-queue overlay;
+    // #1868 retired that surface, leaving the panel as the one place they
+    // are consumed).
     //
     // **No fetch.** `/board` already carries `drive_queue` and the existing
     // `start_data_load` poll refreshes it every `settings.refresh_cadence`.
@@ -1079,16 +777,24 @@ impl CoordApp {
     /// The rows the Queue panel renders: every **non-terminal** entry, in
     /// `queue_sort` order (the queue's own run order when unsorted).
     ///
-    /// `done` is the only state excluded. `blocked` — and any state a newer
-    /// daemon invents, `failed` included — is non-terminal *to the operator*:
-    /// those are precisely the entries that have stopped and need a human,
-    /// and a live view that hides one is the same defect #1855 fixes in the
-    /// report's summary line.
+    /// `done` is the only state excluded — with one exception: a row whose
+    /// deploy gate has fired (`is_holding`) is kept even though it is `done`
+    /// by construction (`_resolve_holds` in `coord/drive_queue.py` only fires
+    /// a gate the tick its entry reconciles to `done`; see `is_holding`'s own
+    /// doc comment for the same rule applied to `summarize_drive_queue`).
+    /// Dropping it here would make "r resume" — #1868's acceptance bar for
+    /// this panel replacing the drive-queue overlay — unreachable: the exact
+    /// row `queue_resume_selected` needs to act on would never appear to be
+    /// selected. `blocked` — and any state a newer daemon invents, `failed`
+    /// included — is non-terminal *to the operator*: those are precisely the
+    /// entries that have stopped and need a human, and a live view that
+    /// hides one is the same defect #1855 fixes in the report's summary
+    /// line.
     pub(crate) fn queue_rows(&self) -> Vec<QueueRow> {
         let mut rows: Vec<QueueRow> = self
             .drive_queue_entries()
             .into_iter()
-            .filter(|e| is_pending(e))
+            .filter(|e| is_pending(e) || is_holding(e))
             .map(|e| self.queue_row(e))
             .collect();
         if let Some((col, dir)) = self.queue_sort {
@@ -1585,8 +1291,9 @@ impl CoordApp {
         self.queue_sel = idx;
     }
 
-    /// Move the grid selection by `delta` rows, clamped. No wraparound —
-    /// same reasoning as the overlay's [`Self::drive_queue_move_selection`].
+    /// Move the grid selection by `delta` rows, clamped. No wraparound — a
+    /// queue is short and ordered, and wrapping past the tail hides how
+    /// close to the end you are.
     pub(crate) fn queue_move_selection(&mut self, delta: isize) {
         let len = self.queue_rows().len();
         if len == 0 {
@@ -1671,8 +1378,9 @@ impl CoordApp {
             return;
         };
         self.dispatch_drive_queue_remove(&r.repo_name, r.issue_number);
-        // `dispatch_drive_queue_remove` clamps the OVERLAY's selection; this
-        // panel's index is into a different (filtered) row set.
+        // `dispatch_drive_queue_remove` no longer clamps a selection itself
+        // (#1868 — that was the retired overlay's bookkeeping); this panel
+        // clamps its own `queue_sel` below, into ITS (filtered) row set.
         //
         // #1867: `queue_move_selection(0)` is a delta-0 no-op on the index
         // itself, so `queue_set_sel` won't see a change to reset on — but
@@ -1785,20 +1493,6 @@ fn queue_compare_rows(
     match dir {
         SortDirection::Ascending => base,
         SortDirection::Descending => base.reverse(),
-    }
-}
-
-fn dq_muted_row(text: &str) -> ListItem {
-    ListItem {
-        text: StyledText {
-            spans: vec![StyledSpan::with_fg(
-                text.to_string(),
-                Color::rgb(140, 140, 150),
-            )],
-        },
-        icon: None,
-        detail: None,
-        decoration: Decoration::Muted,
     }
 }
 
@@ -2130,7 +1824,7 @@ mod tests {
     }
 
     #[test]
-    fn overlay_row_menu_gates_moves_at_the_ends_and_unblock_off_waiting() {
+    fn row_menu_gates_moves_at_the_ends_and_unblock_off_waiting() {
         let app = make_test_app(BoardData::default());
         let first = app.context_menu_items_for_drive_queue_row(QUEUE_STATE_WAITING, 0, 3, false);
         assert!(first[0].disabled, "'Move up' disabled at position 0");
@@ -2308,10 +2002,10 @@ mod tests {
         );
     }
 
-    // ── overlay state ────────────────────────────────────────────────────
+    // ── drive_queue_entries (shared by the Queue panel) ──────────────────
 
     #[test]
-    fn overlay_entries_are_returned_in_position_order() {
+    fn entries_are_returned_in_position_order() {
         let app = make_test_app(BoardData {
             drive_queue: vec![
                 entry(9, 2, QUEUE_STATE_WAITING, &[]),
@@ -2330,92 +2024,7 @@ mod tests {
     }
 
     #[test]
-    fn overlay_selection_clamps_and_never_wraps() {
-        let mut app = make_test_app(BoardData {
-            drive_queue: vec![
-                entry(1, 0, QUEUE_STATE_WAITING, &[]),
-                entry(2, 1, QUEUE_STATE_WAITING, &[]),
-            ],
-            ..BoardData::default()
-        });
-        app.drive_queue_move_selection(-1);
-        assert_eq!(app.drive_queue_sel, 0, "no wrap past the head");
-        app.drive_queue_move_selection(5);
-        assert_eq!(app.drive_queue_sel, 1, "no wrap past the tail");
-    }
-
-    #[test]
-    fn opening_the_overlay_clamps_a_stale_selection() {
-        let mut app = make_test_app(BoardData {
-            drive_queue: vec![entry(1, 0, QUEUE_STATE_WAITING, &[])],
-            ..BoardData::default()
-        });
-        app.drive_queue_sel = 9;
-        app.open_drive_queue_overlay();
-        assert_eq!(app.drive_queue_sel, 0);
-    }
-
-    #[test]
-    fn overlay_key_x_removes_the_selected_row() {
-        let mut app = make_test_app(BoardData {
-            drive_queue: vec![
-                entry(1, 0, QUEUE_STATE_WAITING, &[]),
-                entry(2, 1, QUEUE_STATE_WAITING, &[]),
-            ],
-            ..BoardData::default()
-        });
-        app.open_drive_queue_overlay();
-        app.drive_queue_overlay_key(&Key::Char('j'));
-        app.drive_queue_overlay_key(&Key::Char('x'));
-        assert_eq!(
-            app.command_runner.spawned_calls[0],
-            vec!["drive-queue", "remove", "myrepo", "2"]
-        );
-    }
-
-    #[test]
-    fn overlay_key_u_refuses_a_row_that_is_not_blocked() {
-        let mut app = make_test_app(BoardData {
-            drive_queue: vec![entry(1, 0, QUEUE_STATE_WAITING, &[])],
-            ..BoardData::default()
-        });
-        app.open_drive_queue_overlay();
-        app.drive_queue_overlay_key(&Key::Char('u'));
-        assert!(
-            app.command_runner.spawned_calls.is_empty(),
-            "unblocking a waiting row must not shell anything"
-        );
-    }
-
-    #[test]
-    fn overlay_key_shift_k_moves_the_entry_and_follows_it() {
-        let mut app = make_test_app(BoardData {
-            drive_queue: vec![
-                entry(1, 0, QUEUE_STATE_WAITING, &[]),
-                entry(2, 1, QUEUE_STATE_WAITING, &[]),
-            ],
-            ..BoardData::default()
-        });
-        app.open_drive_queue_overlay();
-        app.drive_queue_sel = 1;
-        app.drive_queue_overlay_key(&Key::Char('K'));
-        assert_eq!(
-            app.command_runner.spawned_calls[0],
-            vec!["drive-queue", "move", "myrepo", "2", "--to", "0"]
-        );
-        assert_eq!(app.drive_queue_sel, 0, "selection follows the moved entry");
-    }
-
-    #[test]
-    fn overlay_escape_closes() {
-        let mut app = make_test_app(BoardData::default());
-        app.open_drive_queue_overlay();
-        app.drive_queue_overlay_key(&Key::Named(NamedKey::Escape));
-        assert!(!app.drive_queue_overlay_open);
-    }
-
-    #[test]
-    fn overlay_context_target_carries_the_selected_row() {
+    fn queue_context_target_carries_the_selected_row() {
         let mut app = make_test_app(BoardData {
             drive_queue: vec![
                 entry(1, 0, QUEUE_STATE_WAITING, &[]),
@@ -2423,9 +2032,8 @@ mod tests {
             ],
             ..BoardData::default()
         });
-        app.open_drive_queue_overlay();
-        app.drive_queue_sel = 1;
-        match app.drive_queue_context_target().expect("a target") {
+        app.queue_set_sel(1);
+        match app.queue_context_target().expect("a target") {
             ContextMenuTarget::DriveQueueRow {
                 repo_name,
                 issue_number,
@@ -2446,10 +2054,9 @@ mod tests {
     }
 
     #[test]
-    fn overlay_context_target_is_none_for_an_empty_queue() {
-        let mut app = make_test_app(BoardData::default());
-        app.open_drive_queue_overlay();
-        assert!(app.drive_queue_context_target().is_none());
+    fn queue_context_target_is_none_for_an_empty_queue() {
+        let app = make_test_app(BoardData::default());
+        assert!(app.queue_context_target().is_none());
     }
 
     // ── TuiDriver black-box (#1755 acceptance) ───────────────────────────
@@ -2557,15 +2164,16 @@ mod tests {
         );
     }
 
-    /// Right-click the status bar → "Drive queue…" → the overlay lists every
-    /// entry in `position` order, with `deferrals` / `last_reason` for the
-    /// entry being skipped.
+    /// #1868 (Q-3): right-click the status bar → "Drive queue…" switches to
+    /// the Queue panel — the modal overlay this item used to open is gone,
+    /// and the panel is the one queue surface now. Every entry the overlay
+    /// would have listed, including WHY a skipped one is waiting, is on the
+    /// panel's grid.
     #[test]
-    fn tuidriver_status_bar_menu_opens_the_overlay_in_position_order() {
+    fn tuidriver_status_bar_menu_switches_to_the_queue_panel() {
         use quadraui::tui::testing::driver_with_shell;
 
         let mut skipped = entry(9, 1, QUEUE_STATE_WAITING, &["myrepo#7"]);
-        skipped.deferrals = 3;
         skipped.last_reason = "pre-req myrepo#7 has not merged".to_string();
         let app = driver_app(vec![entry(7, 0, QUEUE_STATE_RUNNING, &[]), skipped]);
         let mut driver = driver_with_shell(app, CoordApp::shell_config(), 200, 44);
@@ -2598,28 +2206,24 @@ mod tests {
         // one item-height below where it visibly renders.
         driver.click(mx, my - 0.1);
 
-        let overlay = driver.screen();
+        let panel = driver.screen();
         assert!(
-            overlay.contains("Drive queue"),
-            "the overlay must be open:\n{overlay}"
-        );
-        let running_at = overlay
-            .find("myrepo#7")
-            .unwrap_or_else(|| panic!("position-0 entry missing:\n{overlay}"));
-        let waiting_at = overlay
-            .find("myrepo#9")
-            .unwrap_or_else(|| panic!("position-1 entry missing:\n{overlay}"));
-        assert!(
-            running_at < waiting_at,
-            "entries must be listed in position order:\n{overlay}"
+            panel.contains("QUEUE"),
+            "the click must land on the Queue panel (its sidebar header), \
+             not the retired modal overlay:\n{panel}"
         );
         assert!(
-            overlay.contains("deferrals 3"),
-            "a skipped entry must show its deferral count:\n{overlay}"
+            !panel.contains("Drive queue is empty"),
+            "that string only ever appeared in the overlay's empty state — \
+             its presence here would mean the overlay is still reachable:\n{panel}"
         );
         assert!(
-            overlay.contains("pre-req myrepo#7 has not merged"),
-            "a skipped entry must show WHY it is being passed over:\n{overlay}"
+            panel.contains("myrepo#7") && panel.contains("myrepo#9"),
+            "both entries must be on the panel's grid:\n{panel}"
+        );
+        assert!(
+            panel.contains("pre-req myrepo#7 has not merged"),
+            "…including WHY the waiting one hasn't started, in its Reason column:\n{panel}"
         );
     }
 
@@ -2714,13 +2318,12 @@ mod tests {
         );
     }
 
-    /// A probe that keeps failing must be visible on the bar, not only in
-    /// the overlay — "held" and "held and the probe has failed 40 times"
-    /// need different responses from the operator.
+    /// A probe that keeps failing must be visible on the bar — "held" and
+    /// "held and the probe has failed 40 times" need different responses
+    /// from the operator.
     #[test]
     fn status_text_held_surfaces_a_rising_probe_count() {
         let rows = vec![BoardDriveQueueEntry {
-            resume_when: "curl -sf http://dellserver:7435/drive-queue".to_string(),
             hold_probes: 7,
             ..held_entry(1753, 0, "restart coord-serve")
         }];
@@ -2806,7 +2409,7 @@ mod tests {
     }
 
     #[test]
-    fn overlay_row_menu_offers_resume_only_on_a_held_row() {
+    fn row_menu_offers_resume_only_on_a_held_row() {
         let app = make_test_app(BoardData::default());
         let held = app.context_menu_items_for_drive_queue_row(QUEUE_STATE_DONE, 0, 2, true);
         assert_eq!(
@@ -2824,15 +2427,34 @@ mod tests {
         );
     }
 
+    /// #1868: a fired gate's entry is `done` by construction (see
+    /// `is_holding`'s doc comment), and `queue_rows` must keep it anyway — a
+    /// panel that filters it out the same way it filters every other `done`
+    /// row would make it impossible to ever select the row `r` needs to act
+    /// on.
     #[test]
-    fn overlay_context_target_marks_a_held_row_as_held() {
+    fn queue_rows_keeps_a_held_row_even_though_it_is_done() {
+        let app = make_test_app(BoardData {
+            drive_queue: vec![held_entry(1753, 0, "deploy")],
+            ..BoardData::default()
+        });
+        let rows = app.queue_rows();
+        assert_eq!(
+            rows.len(),
+            1,
+            "a held row must survive the done filter, or Resume is unreachable"
+        );
+        assert!(rows[0].held);
+    }
+
+    #[test]
+    fn queue_context_target_marks_a_held_row_as_held() {
         let mut app = make_test_app(BoardData {
             drive_queue: vec![held_entry(1753, 0, "deploy")],
             ..BoardData::default()
         });
-        app.open_drive_queue_overlay();
-        app.drive_queue_sel = 0;
-        match app.drive_queue_context_target().expect("a target") {
+        app.queue_set_sel(0);
+        match app.queue_context_target().expect("a target") {
             ContextMenuTarget::DriveQueueRow { held, .. } => assert!(held),
             other => panic!("wrong target: {other:?}"),
         }
@@ -2858,7 +2480,7 @@ mod tests {
     }
 
     #[test]
-    fn overlay_key_r_resumes_a_held_row_and_refuses_any_other() {
+    fn queue_resume_selected_resumes_a_held_row_and_refuses_any_other() {
         let mut app = make_test_app(BoardData {
             drive_queue: vec![
                 entry(1, 0, QUEUE_STATE_WAITING, &[]),
@@ -2866,33 +2488,32 @@ mod tests {
             ],
             ..BoardData::default()
         });
-        app.open_drive_queue_overlay();
 
-        app.drive_queue_sel = 0;
-        app.drive_queue_overlay_key(&Key::Char('r'));
+        app.queue_set_sel(0);
+        app.queue_resume_selected();
         assert!(
             app.command_runner.spawned_calls.is_empty(),
             "`r` on a row with no fired gate must spawn nothing"
         );
 
-        app.drive_queue_sel = 1;
-        app.drive_queue_overlay_key(&Key::Char('r'));
+        app.queue_set_sel(1);
+        app.queue_resume_selected();
         assert_eq!(
             app.command_runner.spawned_calls,
             vec![vec!["drive-queue", "resume", "myrepo", "1753"]]
         );
     }
 
-    /// The overlay must SAY what the operator has to do, not just that
-    /// something is held — the `hold_reason` is the runbook line.
+    /// #1868: the Queue panel — the drive-queue overlay's replacement — must
+    /// SAY what the operator has to do, not just that something is held, and
+    /// must still let them act on it once the overlay is gone.
     #[test]
-    fn tuidriver_overlay_shows_the_gate_and_offers_resume() {
+    fn tuidriver_queue_panel_shows_the_gate_and_offers_resume() {
         use quadraui::tui::testing::driver_with_shell;
 
         let mut app = make_test_app(BoardData {
             drive_queue: vec![
                 BoardDriveQueueEntry {
-                    resume_when: "curl -sf http://dellserver:7435/drive-queue".to_string(),
                     hold_probes: 3,
                     ..held_entry(1753, 0, "release + restart coord-serve")
                 },
@@ -2900,10 +2521,14 @@ mod tests {
             ],
             ..BoardData::default()
         });
-        app.open_drive_queue_overlay();
-        app.drive_queue_sel = 0;
+        app.active_view = SidebarView::Queue;
 
-        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 160, 40);
+        // Wide enough that the status bar's HELD sentence — reason AND
+        // probe count — survives whole, the same headroom
+        // `tuidriver_status_bar_renders_every_queue_state` above gives it;
+        // the #1755 fixed-column driver_app repo/machine names push the
+        // other segments wider than that test's fixture does.
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 240, 40);
         let screen = driver.screen();
         assert!(
             screen.contains("HELD"),
@@ -2911,11 +2536,16 @@ mod tests {
         );
         assert!(
             screen.contains("release + restart coord-serve"),
-            "the overlay must render the operator's own hold reason:\n{screen}"
+            "…and name the operator's own hold reason:\n{screen}"
         );
         assert!(
             screen.contains("failed 3"),
             "a failing probe must show its rising attempt count:\n{screen}"
+        );
+        assert!(
+            screen.contains("myrepo#1753"),
+            "the held row itself must be selectable on the panel's grid, \
+             despite being `done`:\n{screen}"
         );
 
         let (x, y) = driver

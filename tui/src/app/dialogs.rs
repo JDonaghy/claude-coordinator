@@ -1137,14 +1137,15 @@ impl CoordApp {
             // #1631 (H-4) / #1755 (DQ-3): right-click anywhere on the status
             // bar. One target covers the WHOLE bar (there is no per-segment
             // click dispatch in this codebase — see `fleet_health.rs`'s
-            // module doc comment), so its menu is the union of the bar's
-            // detail overlays: "Fleet health…" then "Drive queue…".
+            // module doc comment), so its menu is the union of "Fleet
+            // health…" (opens the fleet-health detail overlay) and "Drive
+            // queue…" (switches to the Queue panel, #1868).
             ContextMenuTarget::FleetHealth => {
                 let mut v = self.context_menu_items_for_fleet_health();
                 v.extend(self.context_menu_items_for_drive_queue_segment());
                 v
             }
-            // #1755 (DQ-3): right-click on a drive-queue overlay row.
+            // #1755 (DQ-3) / #1868 (Q-3): right-click on a Queue panel row.
             ContextMenuTarget::DriveQueueRow {
                 state,
                 position,
@@ -5922,9 +5923,9 @@ impl CoordApp {
                     ContextMenuTarget::TerminalRow { .. } => 0,
                     ContextMenuTarget::PlansStub { .. } => 0,
                     ContextMenuTarget::FleetHealth => 0,
-                    // #1755: the drive-queue overlay rows carry an issue
-                    // number, and it's an `i64` on the wire — clamp rather
-                    // than silently reporting 0 for a legitimate row.
+                    // #1755: drive-queue rows carry an issue number, and
+                    // it's an `i64` on the wire — clamp rather than silently
+                    // reporting 0 for a legitimate row.
                     ContextMenuTarget::DriveQueueRow { issue_number, .. } => {
                         (*issue_number).max(0) as u64
                     }
@@ -5956,14 +5957,15 @@ impl CoordApp {
                 self.open_fleet_health_overlay();
                 true
             }
-            // #1755 (DQ-3): the status bar's "Drive queue…" menu item —
-            // opens the detail overlay (`drive_queue.rs::
-            // render_drive_queue_overlay`); Esc closes it (`events.rs`).
+            // #1755 (DQ-3) / #1868 (Q-3): the status bar's "Drive queue…"
+            // menu item — the modal overlay it used to open was retired by
+            // #1868 in favour of the Queue panel, the one queue surface.
             "open-drive-queue-detail" => {
-                self.open_drive_queue_overlay();
+                self.switch_active_view(SidebarView::Queue);
                 true
             }
-            // #1755 (DQ-3): drive-queue overlay row actions. Each shells the
+            // #1755 (DQ-3): drive-queue row actions (Queue panel, and the
+            // Pipeline/Board "Add to drive queue" row menu). Each shells the
             // matching `coord drive-queue` verb through the spawn-and-toast
             // seam — no direct DB access, same posture as every other TUI
             // action.

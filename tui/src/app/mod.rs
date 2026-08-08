@@ -2300,26 +2300,13 @@ pub struct CoordApp {
     /// rows grouped under a machine header, sourced from `self.data.
     /// fleet_health`) doesn't fit that controller's notes/actions shape.
     fleet_health_overlay_open: bool,
-    /// #1755 (DQ-3): the drive-queue detail overlay — opened via the status
-    /// bar's "Drive queue…" right-click menu entry (`drive_queue.rs`). Owns
-    /// ALL input while open, same posture as `fleet_health_overlay_open`
-    /// above, but unlike that read-only report this one is *actionable*
-    /// (remove / move / unblock), so it also tracks a selection.
-    drive_queue_overlay_open: bool,
-    /// Selected row index into `drive_queue_entries()` (position order), not
-    /// into the unsorted `data.drive_queue`. Clamped on open and after every
-    /// removal so a shrinking queue can never leave it dangling.
-    drive_queue_sel: usize,
     /// #1755: the "Add to drive queue after…" prompt. `Some` while the
     /// operator is typing pre-req issue numbers; owns ALL keys until Enter
     /// (submit) or Esc (cancel), same posture as
     /// `pending_milestone_row_input`.
     pending_drive_queue_after: Option<PendingDriveQueueAfter>,
     /// #1866 (Q-1): selected row index into `queue_rows()` — the Queue
-    /// panel's own *filtered, possibly re-sorted* row set, which is NOT the
-    /// same index space as `drive_queue_sel` above (that one indexes the
-    /// overlay's unfiltered `drive_queue_entries()`). Kept separate so the
-    /// two surfaces can't yank each other's cursor around.
+    /// panel's own *filtered, possibly re-sorted* row set.
     queue_sel: usize,
     /// #1866: vertical scroll offset into the Queue grid, kept in step with
     /// `queue_sel` by `fix_queue_scroll` and driven directly by the wheel
@@ -3588,8 +3575,6 @@ impl CoordApp {
             pending_clipboard_copy: None,
             context_menu_layout: std::cell::RefCell::new(Vec::new()),
             fleet_health_overlay_open: false,
-            drive_queue_overlay_open: false,
-            drive_queue_sel: 0,
             pending_drive_queue_after: None,
             queue_sel: 0,
             queue_scroll: 0,
@@ -7542,8 +7527,9 @@ impl CoordApp {
         // broken feature. Escalates to warn (STALLED: rows waiting, none
         // eligible) / crit (BLOCKED) so the epic's "if nothing can start,
         // alert the operator" requirement has a surface. Right-click the
-        // status bar → "Drive queue…" for the detail overlay
-        // (`drive_queue.rs`).
+        // status bar → "Drive queue…" switches to the Queue panel
+        // (`drive_queue.rs`) — its modal overlay predecessor was retired by
+        // #1868.
         //
         // **Ordered BEFORE fleet health deliberately.** The bar drops whole
         // trailing `left` segments once the view hints claim the rest of the
