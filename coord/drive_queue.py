@@ -125,6 +125,43 @@ RESUME_PROBE_TIMEOUT_SECONDS = 5.0
 # an unsatisfiable pre-req.
 DEFAULT_MAX_ATTEMPTS = 2
 
+# ── the per-repo ceiling (#1972) ─────────────────────────────────────────────
+#
+# `--max-parallel` is one GLOBAL counter, which makes the queue answer the
+# wrong question.  The hazard that forced serialisation in the first place is
+# strictly INTRA-repo: a merge stales the Test verdict of every other queued
+# branch in that repo, because #1479's freshness keys on the base of the
+# branch's own repo.  A vimcode merge cannot stale a quadraui branch.  So repo
+# is precisely the boundary along which parallelism is safe — within a repo is
+# the risky case, across repos is nearly free.
+#
+# Counting one global slot conflates the two.  With `--max-parallel 3` and a
+# queue of 39 claude-coordinator entries followed by one quadraui entry, the
+# tick launches claude-coordinator #2 and #3 — the two launches most likely to
+# stale each other — and never reaches the quadraui entry that could have run
+# alongside them for free.  Getting the wanted behaviour meant hand-chaining
+# `--after` across 38 entries: tedious, fragile, and wrong the moment the queue
+# is reordered.
+#
+# So occupancy is counted per repo as well as globally, and an entry whose repo
+# is already at this ceiling DEFERS (position unchanged, no attempt consumed,
+# no escalation — a "not yet", exactly like an unsatisfied `after`).  The walk
+# then lands naturally on the first entry from a repo that still has headroom.
+#
+# The default is 1 — today's effective behaviour for the single-repo queues
+# that are the common case, since `--max-parallel` itself defaults to 1.  It is
+# configurable rather than hardcoded because #1715 (batch revalidation) closed,
+# which makes intra-repo parallelism materially less punishing than it was; 0
+# disables the per-repo ceiling entirely and restores the pre-#1972 behaviour.
+#
+# CAVEAT worth stating where the constant lives: per-repo occupancy inherits
+# rule 1 above — it is counted from BOARD state, not live sessions (#1660).  A
+# drive whose observer died still holds its repo's slot until something
+# reconciles it.  That is strictly better than before (a wedged drive now
+# blocks one repo instead of the whole queue) but it is also quieter, which is
+# why `render_plan` prints the per-repo breakdown and says where it came from.
+DEFAULT_MAX_PARALLEL_PER_REPO = 1
+
 # ── the startup grace window (#1794) ─────────────────────────────────────────
 #
 # A drive is NOT established the instant `coord drive --tmux` exits 0.  #1606's
@@ -598,12 +635,21 @@ class Deferral:
     rest of the queue going?" in the same breath.  Counting it would ruin the
     signal ``deferrals`` carries: *how many times this entry was passed over
     while a slot was actually available*.
+
+    ``repo_limited=True`` marks the #1972 deferral — the entry was otherwise
+    fully eligible and lost its turn only because its REPO was already at
+    ``max_parallel_per_repo``.  It is flagged rather than string-matched
+    because the tick has to tell that case apart from a genuine stall: a queue
+    whose remaining entries are all waiting on their own repo's in-flight work
+    is the queue working exactly as designed, so it raises no queue-level
+    alert — the same posture the global at-capacity return takes.
     """
 
     key: str
     reason: str
     updates: Mapping[str, Any] = field(default_factory=dict)
     counted: bool = True
+    repo_limited: bool = False
 
 
 @dataclass(frozen=True)
@@ -677,6 +723,16 @@ class TickPlan:
     alert: QueueAlert | None = None
     occupied: int = 0
     capacity: int = 0
+    # #1972: the same occupancy, broken down by repo, plus the per-repo ceiling
+    # it is measured against.  `repo_occupied` holds only repos that actually
+    # occupy something (a repo with no live drive is simply absent, not 0), and
+    # it is the PRE-launch reading — the same instant `occupied` is taken — so
+    # the two never disagree.  `repo_capacity == 0` means no per-repo ceiling
+    # was applied at all, which is what a `TickPlan` built by hand (or by a
+    # pre-#1972 caller) gets, and what makes `render_plan` fall back to the
+    # original single-line capacity render.
+    repo_occupied: Mapping[str, int] = field(default_factory=dict)
+    repo_capacity: int = 0
 
     @property
     def free_slots(self) -> int:
@@ -1352,6 +1408,7 @@ def plan_tick(
     capacity: int,
     *,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    max_parallel_per_repo: int = DEFAULT_MAX_PARALLEL_PER_REPO,
     probes: Mapping[str, ProbeResult] | None = None,
     now: float | None = None,
     grace_seconds: float = DRIVE_STARTUP_GRACE_SECONDS,
@@ -1364,6 +1421,15 @@ def plan_tick(
     *capacity* is the CEILING (``--max-parallel``), not the number of free
     slots — how many slots are already occupied is a decision (rule 1 above),
     and decisions live in here, not in the shell.
+
+    *max_parallel_per_repo* is the SECOND ceiling (#1972), applied per repo
+    after the global one: an entry whose repo already occupies this many slots
+    defers, so the walk lands on the first entry from a repo with headroom.
+    Both ceilings apply, global first.  ``0`` disables it (pre-#1972
+    behaviour); the default of 1 is per-repo serialisation, which for a
+    single-repo queue at ``--max-parallel 1`` is exactly what the queue did
+    before.  See :data:`DEFAULT_MAX_PARALLEL_PER_REPO` for why repo is the
+    right axis and what the board-derived counting means for a wedged drive.
 
     *probes* maps an entry key to the :class:`ProbeResult` the shell got from
     running that entry's ``resume_when`` (see :func:`pending_probe_targets`);
@@ -1423,13 +1489,20 @@ def plan_tick(
        ``done`` without ever launching (#1873) — checked before its `after=`
        graph, so a landed entry is never blocked or deferred on account of its
        own now-irrelevant pre-reqs; unsatisfiable blocks and escalates,
-       unsatisfied defers (position unchanged), the first eligible entry is
-       the launch.  Everything after the launch is walked in REPORT-ONLY mode
+       unsatisfied defers (position unchanged); an entry whose REPO is already
+       at *max_parallel_per_repo* defers too (#1972, checked LAST — a broken
+       pre-req is a permanent fact and must still escalate, whatever the
+       repo's occupancy is doing this tick); the first eligible entry is the
+       launch.  Everything after the launch is walked in REPORT-ONLY mode
        (``Deferral.counted=False``, no updates) so ``--dry-run`` can explain
-       the rest of the queue.
+       the rest of the queue — including against the launch's own repo, which
+       the report-only pass counts as occupied.
     5. No launch with at least one entry STILL genuinely waiting (deferred or
        blocked — #1873 reconciliations do not count, see below) ⇒ exactly ONE
-       queue-level alert.
+       queue-level alert.  #1972's repo-limit deferrals do not count either:
+       a queue whose every remaining entry is waiting on its own repo's
+       in-flight work is saturated, not stalled, and alerting on it every tick
+       is how an alert channel gets muted (same reasoning as step 3).
 
     An entry reconciled from ``running`` back to ``waiting`` in step 1 IS
     walked in step 4 — its attempt was already consumed, so a drive that died
@@ -1454,6 +1527,11 @@ def plan_tick(
     blocked: list[Blocked] = []
     deferrals: list[Deferral] = []
     occupied = 0
+    # #1972: the same count, keyed by repo.  Populated from the SAME
+    # `reconcile.occupies` verdict as `occupied` above — one source of truth, so
+    # the per-repo view can never claim a slot the global view does not.
+    repo_occupied: dict[str, int] = {}
+    repo_capacity = max(0, int(max_parallel_per_repo))
 
     for entry in ordered:
         if entry.state != STATE_RUNNING:
@@ -1471,6 +1549,7 @@ def plan_tick(
         reconciles.append(reconcile)
         if reconcile.occupies:
             occupied += 1
+            repo_occupied[entry.repo] = repo_occupied.get(entry.repo, 0) + 1
         new_state = reconcile.updates.get("state")
         if new_state:
             states[entry.key] = str(new_state)
@@ -1544,6 +1623,11 @@ def plan_tick(
         "holds": tuple(holds),
         "occupied": occupied,
         "capacity": capacity,
+        # A copy, not the live dict: the walk below mutates its own projection
+        # of these counts (it charges the launch to its repo) and the plan must
+        # report the reading that `occupied` was taken from.
+        "repo_occupied": dict(repo_occupied),
+        "repo_capacity": repo_capacity,
     }
 
     gate = next((h for h in holds if h.blocking), None)
@@ -1600,6 +1684,33 @@ def plan_tick(
             f"grace window, so a second `coord drive` is refused (#1794)"
         )
 
+    # #1972's projection of per-repo occupancy AS THE WALK SEES IT: the board
+    # reading above, plus this tick's own launch once one is chosen.  Kept
+    # separate from `repo_occupied` (reported in the plan) so the launch's own
+    # slot is charged to the report-only pass — otherwise `--dry-run` would
+    # cheerfully explain that the next same-repo entry is eligible, one line
+    # under the launch that just took its repo's last slot.
+    repo_slots: dict[str, int] = dict(repo_occupied)
+
+    def _repo_limit_reason(candidate: QueueEntry) -> str:
+        """#1972's per-repo ceiling: '' unless this entry's repo is full.
+
+        A DEFER, never a block: nothing is wrong with the entry, its position
+        does not move, no attempt is spent and nothing escalates.  It is the
+        same "not yet" an unsatisfied `after` produces — the difference is only
+        that what it is waiting on is its own repo's in-flight drive rather
+        than a named pre-req.
+        """
+        if not repo_capacity:
+            return ""
+        used = repo_slots.get(candidate.repo, 0)
+        if used < repo_capacity:
+            return ""
+        return (
+            f"repo {candidate.repo} at its limit ({used}/{repo_capacity}) — "
+            "deferring so a different repo can launch"
+        )
+
     launch: QueueEntry | None = None
     # #1873: keys that reconciled straight to `done` in the walk below —
     # landed under someone else's branch/PR, closed by hand as obsolete, or
@@ -1627,6 +1738,14 @@ def plan_tick(
             if not verdict.satisfied:
                 deferrals.append(
                     Deferral(entry.key, verdict.reason, counted=False)
+                )
+                continue
+            repo_limit = _repo_limit_reason(entry)
+            if repo_limit:
+                deferrals.append(
+                    Deferral(
+                        entry.key, repo_limit, counted=False, repo_limited=True
+                    )
                 )
             continue
         cooldown = _cooldown_reason(entry)
@@ -1708,7 +1827,30 @@ def plan_tick(
                 )
             )
             continue
+        # #1972, checked LAST: everything above is a fact about the ENTRY (is
+        # it still starting, has it already landed, are its pre-reqs sound),
+        # and those verdicts must not change because some unrelated drive in
+        # the same repo happens to be up.  In particular an unsatisfiable
+        # pre-req still blocks and escalates here rather than hiding behind a
+        # repo-limit deferral that would silently postpone it forever.
+        repo_limit = _repo_limit_reason(entry)
+        if repo_limit:
+            deferrals.append(
+                Deferral(
+                    entry.key,
+                    repo_limit,
+                    updates={
+                        "deferrals": entry.deferrals + 1,
+                        "last_reason": repo_limit,
+                    },
+                    repo_limited=True,
+                )
+            )
+            continue
         launch = by_key[entry.key]
+        # The launch takes its repo's slot for the rest of THIS walk, so the
+        # report-only tail explains the remaining same-repo entries correctly.
+        repo_slots[launch.repo] = repo_slots.get(launch.repo, 0) + 1
 
     alert: QueueAlert | None = None
     # `waiting`, minus anything the walk above reconciled straight to `done`
@@ -1717,7 +1859,16 @@ def plan_tick(
     # is exactly the set of entries that are genuinely still waiting: deferred
     # or blocked, each with a matching `details` entry.
     still_waiting = [e for e in waiting if e.key not in landed_keys]
-    if launch is None and still_waiting:
+    # #1972: minus anything whose ONLY reason for standing still is that its
+    # own repo is busy.  That is the queue doing its job — the same condition
+    # the global at-capacity return above answers with `alert=None` — and a
+    # 39-entry single-repo queue would otherwise escalate on every tick for the
+    # duration of the batch.  A MIXED tick still alerts: if even one entry is
+    # deferred on a pre-req or blocked outright, something really is stuck and
+    # the alert names all of it, repo-limit lines included.
+    repo_limited_keys = {item.key for item in deferrals if item.repo_limited}
+    stalled = [e for e in still_waiting if e.key not in repo_limited_keys]
+    if launch is None and stalled:
         details = [f"{item.key}: {item.reason}" for item in deferrals]
         details += [f"{item.key}: BLOCKED — {item.reason}" for item in blocked]
         alert = QueueAlert(
@@ -1753,6 +1904,23 @@ def render_plan(plan: TickPlan, *, dry_run: bool = False) -> list[str]:
         f"capacity: {plan.occupied}/{plan.capacity} occupied, "
         f"{plan.free_slots} free"
     ]
+    if plan.repo_capacity:
+        # #1972: "1/3 occupied" alone cannot answer "so why didn't item 2 go?"
+        # — the answer is per-repo, so print the breakdown rather than making
+        # the operator read the code.  The provenance is spelled out because
+        # this counter inherits rule 1 (board state, not live sessions): a
+        # drive whose observer died still holds its repo's slot, and after
+        # #1972 that wedges ONE repo instead of the whole queue, which is
+        # better but also much quieter.
+        detail = ", ".join(
+            f"{repo} {count}/{plan.repo_capacity}"
+            for repo, count in sorted(plan.repo_occupied.items())
+        )
+        lines.append(
+            f"  per-repo: {detail or 'no repo occupied'} (limit "
+            f"{plan.repo_capacity}/repo, counted from board state — a drive "
+            "whose observer died still holds its repo's slot)"
+        )
     for item in plan.reconciles:
         lines.append(f"  reconcile {item.key}: {item.outcome} — {item.reason}")
     # #1757: the gate line goes directly under its reconcile, because "1753
@@ -1792,6 +1960,16 @@ def render_plan(plan: TickPlan, *, dry_run: bool = False) -> list[str]:
         # on its own is indistinguishable from a stalled queue.
         lines.append(
             f"  no launch — at capacity ({plan.occupied}/{plan.capacity} occupied)"
+        )
+    elif plan.deferrals and all(item.repo_limited for item in plan.deferrals):
+        # Same reasoning as the at-capacity line above: with free GLOBAL slots
+        # and no launch, a bare "no launch" reads as a stalled queue in a
+        # journal.  This one is saturated per repo, not stalled — and unlike
+        # the global case it raises no alert, so this line is the only place it
+        # is ever said.
+        lines.append(
+            f"  no launch — every waiting entry's repo is at its per-repo "
+            f"limit ({plan.repo_capacity}/repo)"
         )
     else:
         lines.append("  no launch")

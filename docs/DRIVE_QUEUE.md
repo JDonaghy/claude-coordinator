@@ -25,6 +25,10 @@ and merging the first one stales the other *N−1*. That is the cascade, and it
 used to cost *N−1* human interventions — which defeats the entire point of an
 unattended timer.
 
+Note the "on that repo": the cascade is intra-repo, which is why the tick's
+second capacity ceiling is **per repo** (§9) and defaults to 1. Cross-repo
+entries in the same queue do not stale each other and are launched in parallel.
+
 Three arms have since landed against it:
 
 * **#1738** — `coord drive` re-dispatches the Test stage once, automatically,
@@ -248,6 +252,11 @@ reads as "nothing to report" when it might mean "the segment crashed"):
 | `QUEUE: empty` | nothing queued | nothing |
 | `QUEUE: 1 running · 3 waiting` | normal operation | nothing |
 | `QUEUE: STALLED — 3 waiting, none eligible` (warn) | capacity is **free**, but every waiting entry is deferred — usually waiting on an `--after` pre-req that hasn't landed yet | usually self-resolves once the pre-req lands; `coord drive-queue status` shows the alert's `gate_readings` detail lines naming exactly which entries are deferred and why |
+
+Entries deferred **only** because their repo is at `--max-parallel-per-repo`
+(§9) deliberately raise no alert at all — that is the queue working, not a
+stall. A mixed tick (something also deferred on a pre-req, or blocked) still
+alerts, and lists the repo-limit deferrals alongside.
 | `QUEUE: BLOCKED 2 · 1 waiting` (warn/crit, **outranks a simultaneous stall**) | one or more entries are unsatisfiable and will never launch on their own: a dependency cycle, an `--after` pre-req that can't resolve, or a drive session that died `attempts` times in a row (default `DEFAULT_MAX_ATTEMPTS = 2`) | needs an operator action — see below |
 
 `coord drive-queue status` (or the TUI overlay) shows the reason for both.
@@ -407,12 +416,70 @@ next scheduled tick. It does mean that entry's own reconciliation (and its
 eventual `retry`/`done`) now belongs to whichever host launched it, until
 that host's tick runs again.
 
-## 9. #1715
+## 9. Per-repo capacity (#1972)
+
+`--max-parallel` is the **global** ceiling. There is a second one:
+`--max-parallel-per-repo`, **default 1**.
+
+The hazard that forced serialisation in the first place is strictly
+*intra-repo* — a merge stales every other queued branch's Test verdict in
+**that** repo, because #1479's freshness keys on the base of the branch's own
+repo (the cascade at the top of this document). A vimcode merge cannot stale a
+quadraui branch. So repo is precisely the boundary along which extra
+parallelism is safe: within a repo is the risky case, across repos is nearly
+free.
+
+One global counter conflated the two. With `--max-parallel 3` and a queue of 39
+claude-coordinator entries followed by one quadraui entry, a tick launched the
+same-repo neighbours most likely to stale each other and never reached the
+quadraui entry that could have run alongside for free. The only way to get the
+wanted behaviour was hand-chaining `--after` across 38 entries — tedious,
+fragile, and wrong the moment the queue was reordered.
+
+Now the tick counts occupancy per repo as well as globally, and an entry whose
+repo is at the ceiling **defers**: position unchanged, no attempt spent, no
+escalation — a "not yet", exactly like an unsatisfied `--after`. The launch
+walk is unchanged (it already skipped deferred entries and took the first
+eligible one), so it simply lands on the first entry from a repo with headroom:
+
+```
+capacity: 1/3 occupied, 2 free
+  per-repo: claude-coordinator 1/1 (limit 1/repo, counted from board state —
+      a drive whose observer died still holds its repo's slot)
+  reconcile claude-coordinator#1650: alive — drive session is live
+  defer claude-coordinator#1654: repo claude-coordinator at its limit (1/1) —
+      deferring so a different repo can launch
+  launch quadraui#302
+```
+
+Both ceilings apply, **global first**: a full fleet still launches nothing, for
+any repo. `--max-parallel-per-repo 0` turns the per-repo ceiling off entirely
+(one global counter, the pre-#1972 behaviour); raising it above 1 is reasonable
+now that #1715 batches revalidation, which is why it is a flag rather than a
+hardcoded 1.
+
+Two things to know:
+
+* **A repo-limited queue raises no alert.** Every remaining entry waiting on
+  its own repo's in-flight drive is the queue working, not a stall — same
+  posture as being globally at capacity. A tick where *anything* is deferred on
+  a pre-req or blocked still raises the usual `QUEUE: STALLED` / `BLOCKED`
+  alert, with the repo-limit lines listed alongside.
+* **Per-repo occupancy inherits §6.** It is counted from **board state**, not
+  live sessions, so a drive whose observer died on its deadline still holds its
+  repo's slot until something reconciles it. After #1972 that wedges one repo
+  instead of the whole queue — better, but also quieter, which is why the
+  breakdown and its provenance are printed on every tick.
+* **It is not a machine guarantee.** Two entries for different repos pinned to
+  the same machine with `--machine` are both eligible here and can still
+  contend downstream. The per-repo counter says nothing about hosts.
+
+## 10. #1715
 
 See "Read this before queuing more than ~2 issues" above, at the top of this
 document.
 
-## 10. #1738
+## 11. #1738
 
 See the same section — it's the smaller, already-partially-fixed version of
 the same class of problem (a content-irrelevant base move staling a Test

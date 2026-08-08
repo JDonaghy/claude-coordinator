@@ -41,6 +41,7 @@ import click
 from coord.commands._common import _CONFIG_OPTION
 from coord.drive_queue import (
     DEFAULT_MAX_ATTEMPTS,
+    DEFAULT_MAX_PARALLEL_PER_REPO,
     HOLD_RELEASED,
     QUEUE_ALERT_ISSUE,
     QUEUE_ALERT_REPO,
@@ -797,13 +798,31 @@ def _requeue_command(entry: QueueEntry | None, key: str) -> str:
     ),
 )
 @click.option(
+    "--max-parallel-per-repo",
+    type=int,
+    default=DEFAULT_MAX_PARALLEL_PER_REPO,
+    show_default=True,
+    help=(
+        "Per-repo concurrency ceiling, applied after --max-parallel (#1972). "
+        "An entry whose repo is already at it DEFERS — position unchanged, no "
+        "attempt spent — so the walk lands on the first entry from a repo with "
+        "headroom: per-repo serialisation, cross-repo parallelism. 0 disables "
+        "it, restoring one global counter."
+    ),
+)
+@click.option(
     "--dry-run",
     is_flag=True,
     default=False,
     help="Print the resolved plan and mutate nothing.",
 )
 @_CONFIG_OPTION
-def drive_queue_tick(max_parallel: int, dry_run: bool, config_path: Path) -> None:
+def drive_queue_tick(
+    max_parallel: int,
+    max_parallel_per_repo: int,
+    dry_run: bool,
+    config_path: Path,
+) -> None:
     """Drain one step of the queue: reconcile, then launch at most one drive.
 
     Safe to run on any interval and from any machine that can reach the board
@@ -816,12 +835,24 @@ def drive_queue_tick(max_parallel: int, dry_run: bool, config_path: Path) -> Non
     one launched elsewhere reads as `unknown`, occupying its slot but never
     retried or relaunched, rather than being declared dead out from under the
     host actually running it (#1870).
+
+    Capacity has two ceilings (#1972): the global `--max-parallel`, then
+    `--max-parallel-per-repo` (default 1). Entries whose repo is already at the
+    per-repo ceiling defer, so a tick with a claude-coordinator drive running
+    skips the 38 queued claude-coordinator entries behind it and launches the
+    quadraui one — per-repo serialisation, cross-repo parallelism. `--dry-run`
+    prints the per-repo breakdown so "why didn't item 2 go?" is answerable from
+    the output alone.
     """
     from coord.filelock import FileLock, LockBusy, drive_queue_lock_path  # noqa: PLC0415
     from coord.state import list_drive_queue, update_drive_queue_entry  # noqa: PLC0415
 
     if max_parallel < 1:
         raise click.ClickException("--max-parallel must be at least 1")
+    if max_parallel_per_repo < 0:
+        raise click.ClickException(
+            "--max-parallel-per-repo must be 0 (no per-repo ceiling) or more"
+        )
 
     lock = FileLock(drive_queue_lock_path())
     try:
@@ -893,6 +924,7 @@ def drive_queue_tick(max_parallel: int, dry_run: bool, config_path: Path) -> Non
             entries,
             board,
             max_parallel,
+            max_parallel_per_repo=max_parallel_per_repo,
             probes=probes,
             now=time.time(),
             local_host=_local_host_id(),
