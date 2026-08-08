@@ -761,3 +761,29 @@ A `REVIEW_VERDICT:` marker that IS present but malformed (a bolded
 convention, different detection path (`coord.review.detect_unparsed_review_marker`
 vs. `coord.review.detect_end_review_without_verdict` for the header-omitted-
 entirely case documented above).
+
+**Historical rows predate the `verdict_source` column and read as `agent`
+by construction — that is wrong for two known rows.** `verdict_source`
+defaults to `NULL` on any pre-#1956 row, and every reader (`format_gate_report`,
+`coord.models.Assignment.verdict_source`) treats `NULL` as `"agent"` — an
+earned verdict, indistinguishable from a relay. Two rows from 2026-08-07
+are known to be mislabeled that way and still need a one-time manual
+backfill (an operator action against the live board, not something this
+codebase can migrate automatically — a migration has no way to know which
+historical `approve`s were relayed):
+
+```
+# fb021a044a0e (quadraui#533) — recovered from transcript, see case study above
+coord report-result --assignment fb021a044a0e --status done --verdict approve \
+  --verdict-source recovered \
+  --verdict-reason "REVIEW_VERDICT header missing, recovered from transcript (#1956)"
+
+# 7c5a9fe11925 (quadraui#545) — operator deliberately overrode a live request-changes
+# after resolving the sole blocking finding (PR metadata, #1978)
+coord report-result --assignment 7c5a9fe11925 --status done --verdict approve \
+  --verdict-source overridden \
+  --verdict-reason "operator override: resolved sole blocking finding (PR metadata, #1978)"
+```
+
+Until an operator runs these, `coord gates` / the audit trail will keep
+showing both as plain `agent`-sourced approvals.

@@ -467,11 +467,16 @@ def format_gate_report(report: GateReport) -> str:
             f"review_of_assignment_id={row.review_of_assignment_id or '-'}"
         )
         # #1956: only printed when this row actually carries a verdict AND a
-        # provenance value — a plain "verdict_source=None" on every ordinary
-        # row (the overwhelming majority, and every pre-#1956 row) would be
-        # noise; None already means "agent" by construction (see
-        # coord.models.Assignment.verdict_source).
-        if row.review_verdict is not None and row.verdict_source is not None:
+        # provenance value that is NOT the default "agent" — a plain
+        # "verdict_source=agent" on every ordinary row (the overwhelming
+        # majority, including every row `coord report-result --verdict`
+        # persists going forward — see `issue_store._persist_verdict_source`,
+        # which always stamps a source, never leaves the column NULL) would
+        # be exactly the noise this line was written to avoid. `None` and
+        # the literal `"agent"` both mean "an agent produced this verdict"
+        # (see coord.models.Assignment.verdict_source) — only surface the
+        # cases that need a human's attention: recovered/overridden.
+        if row.review_verdict is not None and row.verdict_source not in (None, "agent"):
             lines.append(
                 f"      verdict_source={row.verdict_source}"
                 + (

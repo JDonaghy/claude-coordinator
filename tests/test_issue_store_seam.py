@@ -798,6 +798,108 @@ class TestPostResult:
             with pytest.raises(RuntimeError, match="readback mismatch"):
                 issue_store._persist_review_verdict(self._verdict_record("aid-mismatch"))
 
+    def test_verdict_source_without_verdict_is_refused_at_seam(self) -> None:
+        """#1956 review follow-up: the CLI (`coord/commands/review.py`) has
+        a fast client-side guard refusing `--verdict-source` without
+        `--verdict`, but a direct (non-CLI) `post_result` caller bypassed
+        it entirely — `_persist_verdict_source` is only invoked inside the
+        `if record.verdict is not None:` branch, so the stated provenance
+        would be silently discarded. Mirror the guard at the write seam so
+        every caller, not just the CLI, is protected."""
+        _seed_running_assignment("aid-rev-src-noverdict", assignment_type="review")
+        with pytest.raises(ValueError, match="verdict_source only makes sense"):
+            issue_store.post_result(
+                issue_store.ResultRecord(
+                    assignment_id="aid-rev-src-noverdict",
+                    machine_name="laptop",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=7,
+                    status="done",
+                    verdict=None,
+                    summary="no verdict yet",
+                    verdict_source="recovered",
+                    verdict_source_reason="testing the seam guard",
+                )
+            )
+
+    def test_verdict_source_write_retries_transient_failure_then_succeeds(self) -> None:
+        """Mirrors `test_verdict_write_retries_transient_failure_then_succeeds`
+        for the sibling provenance write — a transient failure on the first
+        attempt must be absorbed by the retry rather than silently no-op'ing
+        (the #1956 review's blocking finding: this used to be a bare
+        `except Exception: pass`)."""
+        import sqlite3
+
+        _seed_running_assignment("aid-src-flaky", assignment_type="review")
+        real_get_connection = state_mod.get_connection
+        calls = {"n": 0}
+
+        def flaky_get_connection():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return real_get_connection()
+
+        with patch("time.sleep"), \
+             patch("coord.state.get_connection", side_effect=flaky_get_connection):
+            issue_store._persist_verdict_source(
+                self._verdict_record("aid-src-flaky")
+            )
+        assert calls["n"] >= 2, "expected at least one retry after the flaky first call"
+        row = state_mod.get_connection().execute(
+            "SELECT verdict_source FROM assignments WHERE assignment_id=?",
+            ("aid-src-flaky",),
+        ).fetchone()
+        assert row["verdict_source"] == "agent"
+
+    def test_verdict_source_write_logs_warning_after_exhausting_retries(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """#1956 review blocking finding: `_persist_verdict_source` must not
+        swallow a persistent failure silently — it stays best-effort (does
+        not raise, unlike `_persist_review_verdict`) but now logs loudly so
+        the gap between a durably-landed verdict and its missing provenance
+        is discoverable instead of invisible."""
+        import sqlite3
+
+        _seed_running_assignment("aid-src-stuck", assignment_type="review")
+
+        def always_locked():
+            raise sqlite3.OperationalError("database is locked")
+
+        with patch("time.sleep"), \
+             patch("coord.state.get_connection", side_effect=always_locked), \
+             caplog.at_level("WARNING", logger="coord.issue_store"):
+            issue_store._persist_verdict_source(
+                self._verdict_record("aid-src-stuck")
+            )  # must not raise — see docstring
+        assert any(
+            "verdict_source" in rec.message and "aid-src-stuck" in rec.message
+            for rec in caplog.records
+        ), f"expected a warning about the failed verdict_source write, got: {caplog.records}"
+
+    def test_verdict_source_write_logs_warning_on_readback_mismatch(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The readback-verification half of the same fix: even when the
+        UPDATE itself raises nothing, a stale readback (the write silently
+        matched zero rows) must still be caught and logged, not trusted."""
+        _seed_running_assignment("aid-src-mismatch", assignment_type="review")
+
+        with patch("time.sleep"), \
+             patch.object(
+                 issue_store, "_read_verdict_source_local",
+                 return_value=("overridden", "some other reason"),
+             ), \
+             caplog.at_level("WARNING", logger="coord.issue_store"):
+            issue_store._persist_verdict_source(
+                self._verdict_record("aid-src-mismatch")
+            )  # must not raise
+        assert any(
+            "readback mismatch" in rec.message for rec in caplog.records
+        ), f"expected a readback-mismatch warning, got: {caplog.records}"
+
     def test_findings_body_persisted_and_posted(self) -> None:
         """`--body-file` path: the full findings are persisted on the row (as
         the {verdict, body} JSON the fix worker's DB-cache reads) AND embedded

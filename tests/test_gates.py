@@ -551,6 +551,24 @@ class TestFormatting:
         text = format_gate_report(report)
         assert "verdict_source" not in text
 
+    def test_format_omits_verdict_source_line_when_explicitly_agent(
+        self, config: Config,
+    ) -> None:
+        """#1956 review follow-up: `issue_store._persist_verdict_source`
+        always stamps the literal string "agent" (never leaves the column
+        NULL) on every `coord report-result --verdict` call going forward —
+        so the "quiet common case" from the test above must also hold when
+        `verdict_source` is the explicit string "agent", not just `None`,
+        or every ordinary review row would print noise post-#1956."""
+        work = _work(test_state="passed")
+        review = _review("w1", verdict="approve")
+        review.verdict_source = "agent"
+        board = Board(active=[], completed=[work, review])
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+
+        text = format_gate_report(report)
+        assert "verdict_source" not in text
+
     def test_format_shows_toolchain_and_falls_back_to_unknown(self, config: Config) -> None:
         with_toolchain = _work(test_state="passed", test_toolchain="rustc 1.95.0")
         board = Board(active=[], completed=[with_toolchain])

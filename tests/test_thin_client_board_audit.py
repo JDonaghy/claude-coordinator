@@ -347,6 +347,12 @@ EXTENDED_ALLOWLIST: dict[str, set[tuple[str, str]]] = {
         ("get_audit_runs_for_epic", "get_connection"),
         ("_read_audit_run_local", "get_connection"),
         ("_persist_audit_result", "get_connection"),
+        # #1956: verdict provenance (verdict_source/verdict_source_reason) —
+        # same local-DB-only seam as the #990 pair above; written from
+        # _post_result_local right after _persist_review_verdict, never from
+        # a thin-client CLI path directly.
+        ("_read_verdict_source_local", "get_connection"),
+        ("_persist_verdict_source", "get_connection"),
     },
     # coord/interactive.py — raw get_connection calls for session/assignment
     # management (reading status, marking stale rows terminal).  These are
