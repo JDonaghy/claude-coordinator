@@ -792,20 +792,6 @@ impl CoordApp {
             return Reaction::Redraw;
         }
 
-        // ── #1755 (DQ-3): the drive-queue overlay owns ALL keyboard input
-        // while open. Unlike the read-only fleet-health report above it is
-        // actionable — j/k select, K/J move the selected entry, x removes,
-        // u unblocks, Esc closes (`drive_queue.rs::drive_queue_overlay_key`,
-        // which also carries the doc comment for each key). Mouse events
-        // deliberately fall through to `handle_mouse`, which hit-tests the
-        // overlay itself (right-click → the per-row context menu).
-        if self.drive_queue_overlay_open {
-            if let UiEvent::KeyPressed { key, .. } = &event {
-                self.drive_queue_overlay_key(key);
-                return Reaction::Redraw;
-            }
-        }
-
         // ── #1755 (DQ-3): "Add to drive queue after…" single-field input.
         // Same Enter-submits / Esc-cancels shape as
         // `pending_milestone_row_input` below.
@@ -2584,14 +2570,14 @@ impl CoordApp {
                     // the interaction the operator actually performs (six
                     // `coord drive-queue move`s in one unattended session on
                     // 2026-08-05, every one of them typed into a shell).
-                    // This is the overlay's binding set, moved rather than
-                    // invented (`drive_queue_overlay_key`), so muscle memory
-                    // carries over and the overlay stays a working fallback.
+                    // This was the drive-queue overlay's binding set
+                    // (retired by #1868 — the panel is the one queue surface
+                    // now), moved rather than invented, so muscle memory
+                    // carries over.
                     //
                     // There is deliberately no `r=refresh`: the grid is
                     // already live off the `/board` poll, so `r` is free for
-                    // "resume" (release a fired deploy gate), matching the
-                    // overlay.
+                    // "resume" (release a fired deploy gate).
                     //
                     // #1867 (Q-2): gated to `FocusedRegion::Sidebar` (the
                     // panel's default focus) now that the panel also has a
@@ -4341,23 +4327,6 @@ impl CoordApp {
                 if let Some(handled) = self.handle_context_menu_click(pos, backend) {
                     return handled;
                 }
-                // #1755 (DQ-3): the drive-queue overlay is above every panel
-                // — a left-click inside it selects the row under the cursor
-                // (hit-tested against the same painted item list the render
-                // path builds, the `plans_row_at` precedent), and a click
-                // anywhere else dismisses it rather than falling through to
-                // a panel the operator can't even see.
-                if self.drive_queue_overlay_open {
-                    let main_b = ctx.main_bounds();
-                    if self.drive_queue_overlay_hit(pos, main_b) {
-                        if let Some(idx) = self.drive_queue_row_at(pos, main_b, lh) {
-                            self.drive_queue_sel = idx;
-                        }
-                    } else {
-                        self.close_drive_queue_overlay();
-                    }
-                    return true;
-                }
                 if ctx.in_sidebar(pos.x, pos.y) {
                     if let Some(sidebar_b) = ctx.sidebar_bounds() {
                         return self.mouse_sidebar_click(event, pos, sidebar_b, backend);
@@ -4475,29 +4444,6 @@ impl CoordApp {
                 // newly-selected row as the target.
                 let pos = *position;
                 let modifiers = *modifiers;
-                // #1755 (DQ-3): while the drive-queue overlay is open it is
-                // the topmost surface — right-click selects the row under
-                // the cursor and opens its Remove/Move/Unblock menu, exactly
-                // the "right-click over hotkeys" posture the rest of this
-                // client takes. Checked before the sidebar/status-bar
-                // branches so a menu can't be opened for a panel the overlay
-                // is covering.
-                if self.drive_queue_overlay_open {
-                    let main_b = ctx.main_bounds();
-                    if self.drive_queue_overlay_hit(pos, main_b) {
-                        if let Some(idx) =
-                            self.drive_queue_row_at(pos, main_b, backend.line_height())
-                        {
-                            self.drive_queue_sel = idx;
-                        }
-                        if let Some(target) = self.drive_queue_context_target() {
-                            if self.open_context_menu(pos, target) {
-                                return true;
-                            }
-                        }
-                    }
-                    return true;
-                }
                 if ctx.in_sidebar(pos.x, pos.y) {
                     if let Some(sidebar_b) = ctx.sidebar_bounds() {
                         // Pre-select the row under the cursor by routing

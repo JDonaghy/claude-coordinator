@@ -123,8 +123,6 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         pending_clipboard_copy: None,
         context_menu_layout: std::cell::RefCell::new(Vec::new()),
         fleet_health_overlay_open: false,
-        drive_queue_overlay_open: false,
-        drive_queue_sel: 0,
         pending_drive_queue_after: None,
         queue_sel: 0,
         queue_scroll: 0,

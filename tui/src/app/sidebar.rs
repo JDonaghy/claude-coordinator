@@ -214,8 +214,9 @@ impl CoordApp {
             || self.command_palette.is_some()
             // #1631: the fleet-health detail overlay owns ALL input while open.
             || self.fleet_health_overlay_open
-            // #1755: so does the drive-queue overlay and its "after…" prompt.
-            || self.drive_queue_overlay_open
+            // #1755: the "Add to drive queue after…" prompt owns ALL input
+            // while open (the drive-queue overlay itself was retired by
+            // #1868 — the Queue panel is the one queue surface now).
             || self.pending_drive_queue_after.is_some()
     }
 

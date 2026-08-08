@@ -863,10 +863,7 @@ pub(crate) struct BoardDriveQueueEntry {
     pub(crate) deferrals: i64,
     #[serde(default)]
     pub(crate) last_reason: String,
-    /// tmux session name for a `running` entry (`coord drive --tmux`).
-    #[serde(default)]
-    pub(crate) session_name: Option<String>,
-    #[allow(dead_code)] // wire parity; the overlay shows `state`, not the clock
+    #[allow(dead_code)] // wire parity; the Queue panel shows `state`, not the clock
     #[serde(default)]
     pub(crate) launched_at: Option<f64>,
     /// #1757: this entry ends with a DEPLOY GATE — when it completes, the
@@ -882,10 +879,6 @@ pub(crate) struct BoardDriveQueueEntry {
     /// What the operator must do while the gate is held — rendered verbatim.
     #[serde(default)]
     pub(crate) hold_reason: String,
-    /// Optional probe command re-run each tick while the gate is held; exit 0
-    /// auto-releases it. Empty = manual `coord drive-queue resume` only.
-    #[serde(default)]
-    pub(crate) resume_when: String,
     /// `""` | `armed` | `fired` | `released` — decided by the tick, consumed
     /// verbatim here (same posture as `state` above).
     #[serde(default)]
@@ -1027,9 +1020,10 @@ pub(crate) enum ContextMenuTarget {
         milestone: Option<(i64, String)>,
     },
     /// #1631 (H-4): right-click anywhere on the status bar. Carries no
-    /// payload — the menu it opens lists the bar's own detail overlays
-    /// ("Fleet health…", and since #1755 "Drive queue…"), unconditionally,
-    /// regardless of where in the bar the click landed.
+    /// payload — the menu it opens lists "Fleet health…" (opens the
+    /// fleet-health detail overlay) and, since #1755, "Drive queue…"
+    /// (switches to the Queue panel, #1868), unconditionally, regardless of
+    /// where in the bar the click landed.
     ///
     /// **Deliberately still one target for the whole bar**, not one per
     /// segment: `StatusBarSegment::action_id` exists on the wire but this
@@ -1037,9 +1031,11 @@ pub(crate) enum ContextMenuTarget {
     /// was explicitly out of scope for #1755. See `fleet_health.rs`'s module
     /// doc comment.
     FleetHealth,
-    /// #1755 (DQ-3): right-click on a row of the drive-queue detail overlay.
-    /// Carries the row's identity + state so the menu can offer Remove /
-    /// Move / Unblock without re-reading a selection that may have moved.
+    /// #1755 (DQ-3): right-click on a row of the Queue panel (`drive_queue.rs`
+    /// — the drive-queue detail overlay this target used to also serve was
+    /// retired by #1868). Carries the row's identity + state so the menu can
+    /// offer Remove / Move / Unblock without re-reading a selection that may
+    /// have moved.
     DriveQueueRow {
         repo_name: String,
         issue_number: i64,
