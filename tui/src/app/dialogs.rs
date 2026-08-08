@@ -1080,6 +1080,14 @@ impl CoordApp {
             SidebarView::Terminal => self
                 .selected_fleet_terminal()
                 .map(|(machine, name)| ContextMenuTarget::TerminalRow { machine, name }),
+            // #1866 (Q-1): the Queue grid's selected row. Builds the very
+            // same `DriveQueueRow` target the #1755 overlay does, so the
+            // menu (move/remove/unblock/resume, with end-of-queue moves
+            // `disabled_because` rather than silently no-op) and every
+            // dispatcher behind it are shared verbatim between the two
+            // surfaces. Reached by the keyboard menu key here; the mouse
+            // path pre-selects the row under the cursor first (`events.rs`).
+            SidebarView::Queue => self.queue_context_target(),
             _ => None,
         }
     }

@@ -43352,3 +43352,694 @@ Milestone tracking issue.
         );
     }
 
+
+    // ── #1866 (Q-1): the Queue panel ────────────────────────────────────
+    //
+    // Black-box `TuiDriver` tests, in-crate because the fixtures are
+    // private. Every target is located with `driver.find(...)`, never a
+    // hardcoded coordinate.
+
+    /// The activity-bar glyph for the Queue panel (`CoordApp::shell_config`).
+    const QUEUE_ICON: &str = "⇅";
+
+    /// A drive queue in the wire shape `/board` ships (note `after_json`,
+    /// not `after`), covering every state the panel has an opinion about:
+    /// one `running`, two `waiting` (one of them gated behind the other),
+    /// one `blocked`, one `failed` — a state THIS build has never heard of,
+    /// standing in for a newer daemon — and one `done`, which is the only
+    /// entry that must not appear.
+    fn queue_fixture_json() -> &'static str {
+        r#"[
+            {"repo_name": "myrepo", "issue_number": 700, "position": 0,
+             "state": "done", "attempts": 1, "last_reason": "REASON-DONE"},
+            {"repo_name": "myrepo", "issue_number": 701, "position": 1,
+             "state": "running", "machine": "alpha", "attempts": 1,
+             "last_reason": "REASON-RUNNING"},
+            {"repo_name": "myrepo", "issue_number": 702, "position": 2,
+             "state": "waiting", "attempts": 0, "after_json": ["myrepo#701"],
+             "last_reason": "REASON-WAITING"},
+            {"repo_name": "myrepo", "issue_number": 703, "position": 3,
+             "state": "blocked", "attempts": 9, "last_reason": "REASON-BLOCKED"},
+            {"repo_name": "myrepo", "issue_number": 704, "position": 4,
+             "state": "failed", "attempts": 3, "last_reason": "REASON-FAILED"},
+            {"repo_name": "myrepo", "issue_number": 705, "position": 5,
+             "state": "waiting", "machine": "beta", "attempts": 0,
+             "hold_after": 1, "hold_state": "fired", "hold_reason": "deploy it",
+             "last_reason": "REASON-HELD"}
+        ]"#
+    }
+
+    /// Open the Queue panel on a seeded queue and render one frame.
+    fn queue_driver(
+        drive_queue_json: &str,
+        w: u16,
+        h: u16,
+    ) -> quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic> {
+        use quadraui::tui::testing::driver_with_shell;
+        let app = make_app_with_drive_queue(BoardData::default(), drive_queue_json);
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), w, h);
+        click_activity_icon(&mut driver, QUEUE_ICON);
+        driver.render();
+        driver
+    }
+
+    /// A `CoordApp` (no driver) sitting on the fixture queue, for the write
+    /// path — `TuiDriver::app_mut` yields the opaque shell adapter, so
+    /// `command_runner.spawned_calls` is only reachable this way.
+    fn queue_app(drive_queue_json: &str) -> CoordApp {
+        make_app_with_drive_queue(BoardData::default(), drive_queue_json)
+    }
+
+    #[test]
+    fn tuidriver_queue_panel_is_reachable_from_the_activity_bar() {
+        let driver = queue_driver(queue_fixture_json(), 160, 30);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("QUEUE"),
+            "#1866: clicking the {QUEUE_ICON} activity-bar icon must land on \
+             the Queue panel (its sidebar header):\n{screen}"
+        );
+    }
+
+    #[test]
+    fn tuidriver_queue_panel_shows_every_unfinished_state_and_hides_done() {
+        let driver = queue_driver(queue_fixture_json(), 160, 30);
+        let screen = driver.screen();
+        for (issue, reason) in [
+            ("701", "REASON-RUNNING"),
+            ("702", "REASON-WAITING"),
+            ("703", "REASON-BLOCKED"),
+            ("704", "REASON-FAILED"),
+            ("705", "REASON-HELD"),
+        ] {
+            assert!(
+                screen.contains(&format!("myrepo#{issue}")),
+                "#1866: myrepo#{issue} has not finished, so a LIVE view must \
+                 not hide it — blocked/failed entries are precisely the ones \
+                 needing a human:\n{screen}"
+            );
+            assert!(
+                screen.contains(reason),
+                "#1866: `last_reason` carries the whole story on a stalled \
+                 entry, so {reason} must be legible, not truncated away:\n{screen}"
+            );
+        }
+        assert!(
+            !screen.contains("myrepo#700"),
+            "#1866: `done` is the ONE state this panel excludes — it is \
+             history, not pending work:\n{screen}"
+        );
+        assert!(
+            !screen.contains("REASON-DONE"),
+            "#1866: …and nothing of the done entry may leak through:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn tuidriver_queue_panel_renders_the_declared_columns() {
+        let driver = queue_driver(queue_fixture_json(), 200, 30);
+        let screen = driver.screen();
+        for title in ["Issue", "Title", "State", "Machine", "Tries", "After", "Hold", "Reason"] {
+            assert!(
+                screen.contains(title),
+                "#1866: the grid must carry a `{title}` column:\n{screen}"
+            );
+        }
+        assert!(
+            screen.contains("FIRED"),
+            "#1866: a fired deploy gate stops the whole queue — the `Hold` \
+             cell must say so:\n{screen}"
+        );
+        assert!(
+            screen.contains("alpha") && screen.contains("beta"),
+            "#1866: the machine pin is an operator intent and must be \
+             visible:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn tuidriver_queue_panel_states_are_visually_distinguishable() {
+        // Colour is asserted at the model layer (the screen dump is plain
+        // text) — but the model is exactly what the renderer consumes, so a
+        // regression that flattened the palette would fail here.
+        assert_ne!(
+            dq_state_colors("running").0,
+            dq_state_colors("blocked").0,
+            "#1866: running and blocked must not paint the same colour"
+        );
+        assert_ne!(
+            dq_state_colors("waiting").0,
+            dq_state_colors("blocked").0,
+            "#1866: waiting and blocked must not paint the same colour"
+        );
+        // …and the state word itself is always on screen, which is what
+        // makes an unrecognised state (`failed`) distinguishable even though
+        // `dq_state_colors` deliberately renders it neutral rather than
+        // guessing at a colour for it.
+        let driver = queue_driver(queue_fixture_json(), 160, 30);
+        let screen = driver.screen();
+        for state in ["running", "waiting", "blocked", "failed"] {
+            assert!(
+                screen.contains(state),
+                "#1866: the wire state `{state}` must be rendered verbatim:\n{screen}"
+            );
+        }
+    }
+
+    #[test]
+    fn tuidriver_queue_panel_empty_queue_says_so() {
+        let driver = queue_driver("[]", 160, 30);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Drive queue is empty"),
+            "#1866: an empty grid renders as a bare header row, which reads \
+             like a broken fetch — say what actually happened:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn tuidriver_queue_panel_all_done_is_not_the_same_as_empty() {
+        let driver = queue_driver(
+            r#"[{"repo_name": "myrepo", "issue_number": 700, "position": 0,
+                 "state": "done"}]"#,
+            160,
+            30,
+        );
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Nothing pending") && screen.contains("done entries"),
+            "#1866: 'the queue is empty' and 'everything in it has finished' \
+             are different facts and must not render identically:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn tuidriver_queue_header_click_cycles_sort_ascending_descending_off() {
+        let mut driver = queue_driver(queue_fixture_json(), 200, 30);
+        assert!(
+            !driver.screen().contains('▲') && !driver.screen().contains('▼'),
+            "#1866: an unsorted grid must show no indicator:\n{}",
+            driver.screen()
+        );
+
+        // Click a few cells INTO the header text, never at its first cell:
+        // `DataTableLayout::hit_test` gives a ±3-cell divider grab zone
+        // priority over the header, and a column's left edge IS the previous
+        // column's right edge. Successive clicks are 5 cells apart so the
+        // backend's double-click detector can't fold two into one.
+        // `Reason` is the target because it is by far the widest column
+        // here: three clicks 7 cells apart all stay clear of the ±3-cell
+        // divider grab zones at either edge, and far enough apart that the
+        // backend's double-click detector (1.5-cell radius) can never fold
+        // two of them into a `DoubleClick` that the click handler never sees.
+        let (x, y) = driver
+            .find("Reason")
+            .unwrap_or_else(|| panic!("Reason header must render:\n{}", driver.screen()));
+        driver.click(x + 3.0, y);
+        driver.render();
+        assert!(
+            driver.screen().contains('▲'),
+            "#1866: the first header click must sort ascending:\n{}",
+            driver.screen()
+        );
+
+        driver.click(x + 10.0, y);
+        driver.render();
+        assert!(
+            driver.screen().contains('▼') && !driver.screen().contains('▲'),
+            "#1866: the second click must flip to descending:\n{}",
+            driver.screen()
+        );
+
+        driver.click(x + 17.0, y);
+        driver.render();
+        assert!(
+            !driver.screen().contains('▲') && !driver.screen().contains('▼'),
+            "#1866: the third click must clear the sort, so the queue's own \
+             RUN ORDER is reachable again — which is a different answer from \
+             any column sort:\n{}",
+            driver.screen()
+        );
+    }
+
+    #[test]
+    fn tuidriver_queue_sort_click_lands_on_the_column_under_the_cursor() {
+        // The regression the pinned `h_scroll: 0.0` exists to prevent: a
+        // non-zero h_scroll would shift the painted headers out from under
+        // `DataTableLayout::hit_test`, which has no concept of it, and route
+        // the sort to a neighbouring column.
+        let mut driver = queue_driver(queue_fixture_json(), 200, 30);
+        let (x, y) = driver
+            .find("Reason")
+            .unwrap_or_else(|| panic!("Reason header must render:\n{}", driver.screen()));
+        driver.click(x + 3.0, y);
+        driver.render();
+
+        let screen = driver.screen();
+        let row: String = screen_row(&screen, y).into_iter().collect();
+        let cells: Vec<char> = row.chars().collect();
+        let at_reason: String = cells
+            .iter()
+            .skip(x as usize)
+            .take("Reason ▲".chars().count())
+            .collect();
+        assert_eq!(
+            at_reason, "Reason ▲",
+            "#1866: the ▲ must land on `Reason`, the column actually under \
+             the cursor at x={x}. Header row was:\n{row}\n{screen}"
+        );
+        assert_eq!(
+            row.matches('▲').count(),
+            1,
+            "#1866: exactly one column may carry the ascending indicator:\n{row}"
+        );
+    }
+
+    #[test]
+    fn queue_sort_orders_numeric_columns_numerically() {
+        // `Tries` runs 0, 0, 1, 3, 9 here. A lexical sort of the RENDERED
+        // strings would be indistinguishable at these values, so the test
+        // uses the raw comparator against a two-digit attempt count that
+        // sorts the other way as text ("10" < "9").
+        let mut app = queue_app(
+            r#"[{"repo_name": "r", "issue_number": 1, "position": 0,
+                 "state": "waiting", "attempts": 10},
+                {"repo_name": "r", "issue_number": 2, "position": 1,
+                 "state": "waiting", "attempts": 9}]"#,
+        );
+        assert!(
+            app.queue_sort_by_column(CoordApp::QUEUE_COL_TRIES),
+            "sorting the Tries column must apply"
+        );
+        let order: Vec<i64> = app.queue_rows().iter().map(|r| r.attempts).collect();
+        assert_eq!(
+            order,
+            vec![9, 10],
+            "#1866: `Tries` must sort numerically — a lexical sort would put \
+             10 before 9 (the #1762 defect)"
+        );
+    }
+
+    #[test]
+    fn queue_sort_past_the_last_column_is_a_no_op() {
+        let mut app = queue_app(queue_fixture_json());
+        assert!(
+            !app.queue_sort_by_column(99),
+            "#1866: a header click past the last column must be a no-op, not \
+             a panic or a phantom sort"
+        );
+        assert!(app.queue_sort.is_none());
+    }
+
+    #[test]
+    fn queue_shift_j_moves_the_entry_through_the_coord_cli() {
+        // The write seam is deliberately `coord drive-queue move` via
+        // `spawn_queued` and NOT `POST /drive-queue`: the CLI path
+        // re-validates (cycles, clamping, dense renumbering) and the HTTP
+        // path would bypass all of it.
+        let mut app = queue_app(queue_fixture_json());
+        // Row 0 of the panel is myrepo#701 (position 1) — #700 is `done` and
+        // filtered out, which is exactly why the panel index and the queue
+        // position are not the same number.
+        assert_eq!(app.queue_selected_row().map(|r| r.issue_number), Some(701));
+        assert_eq!(app.queue_selected_row().map(|r| r.position), Some(1));
+
+        app.queue_selected_move(1);
+
+        assert_eq!(
+            app.command_runner.spawned_calls,
+            vec![vec![
+                "drive-queue".to_string(),
+                "move".to_string(),
+                "myrepo".to_string(),
+                "701".to_string(),
+                "--to".to_string(),
+                // Position space, over the WHOLE queue including the `done`
+                // row — the number the CLI speaks in, not the panel index.
+                "2".to_string(),
+            ]],
+            "#1866: `J` must move the entry through `coord drive-queue move`"
+        );
+        assert_eq!(
+            app.queue_sel, 1,
+            "#1866: the selection must FOLLOW the entry, so repeated `J` \
+             walks it down the queue instead of walking the cursor off it"
+        );
+    }
+
+    #[test]
+    fn queue_shift_k_at_the_head_of_the_queue_sends_nothing() {
+        let mut app = queue_app(
+            r#"[{"repo_name": "r", "issue_number": 1, "position": 0,
+                 "state": "waiting"}]"#,
+        );
+        app.queue_selected_move(-1);
+        assert!(
+            app.command_runner.spawned_calls.is_empty(),
+            "#1866: a move that would clamp back to where it already is must \
+             send no command at all — a toast claiming '→ 0' on a row already \
+             at 0 is a lie"
+        );
+    }
+
+    #[test]
+    fn queue_reorder_survives_the_next_board_poll() {
+        // `dispatch_drive_queue_move` makes NO optimistic local change (the
+        // #1755 posture this panel inherits), so the only thing that can put
+        // the row in its new slot is the CLI write landing and coming back
+        // on the next `/board`. This test plays that second half.
+        let mut app = queue_app(queue_fixture_json());
+        app.queue_selected_move(1);
+        assert!(!app.command_runner.spawned_calls.is_empty());
+
+        // The next poll: the daemon has renumbered, #702 now precedes #701.
+        app.data.drive_queue = serde_json::from_str(
+            r#"[
+                {"repo_name": "myrepo", "issue_number": 700, "position": 0,
+                 "state": "done"},
+                {"repo_name": "myrepo", "issue_number": 702, "position": 1,
+                 "state": "waiting"},
+                {"repo_name": "myrepo", "issue_number": 701, "position": 2,
+                 "state": "running"}
+            ]"#,
+        )
+        .expect("poll fixture must parse");
+
+        let order: Vec<i64> = app.queue_rows().iter().map(|r| r.issue_number).collect();
+        assert_eq!(
+            order,
+            vec![702, 701],
+            "#1866: the grid must render the queue the daemon came back with"
+        );
+    }
+
+    #[test]
+    fn queue_row_menu_offers_the_shared_drive_queue_verbs() {
+        let app = queue_app(queue_fixture_json());
+        let target = app
+            .queue_context_target()
+            .expect("a non-empty grid must build a row target");
+        let (state, position, queue_len, held) = match &target {
+            ContextMenuTarget::DriveQueueRow {
+                state,
+                position,
+                queue_len,
+                held,
+                ..
+            } => (state.clone(), *position, *queue_len, *held),
+            _ => panic!("#1866: expected a DriveQueueRow target"),
+        };
+        assert_eq!(
+            queue_len, 6,
+            "#1866: `queue_len` gates the 'already last' reason and must \
+             count the WHOLE queue, `done` rows included"
+        );
+        let ids: Vec<String> = app
+            .context_menu_items_for_drive_queue_row(&state, position, queue_len, held)
+            .iter()
+            .filter_map(|i| i.action_id.clone())
+            .collect();
+        for id in [
+            "drive-queue-move-up",
+            "drive-queue-move-down",
+            "drive-queue-remove",
+        ] {
+            assert!(
+                ids.iter().any(|got| got == id),
+                "#1866: the row menu must offer `{id}` — got {ids:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn queue_row_menu_disables_end_of_queue_moves_with_a_reason() {
+        let mut app = queue_app(queue_fixture_json());
+        // Last pending row is myrepo#705 at position 5 — the tail.
+        app.queue_sel = app.queue_rows().len() - 1;
+        let target = app.queue_context_target().expect("tail row must exist");
+        let ContextMenuTarget::DriveQueueRow {
+            state,
+            position,
+            queue_len,
+            held,
+            ..
+        } = &target
+        else {
+            panic!("#1866: expected a DriveQueueRow target");
+        };
+        let items = app.context_menu_items_for_drive_queue_row(state, *position, *queue_len, *held);
+        let down = items
+            .iter()
+            .find(|i| i.action_id.as_deref() == Some("drive-queue-move-down"))
+            .expect("Move down must be present even at the tail");
+        assert!(
+            down.disabled,
+            "#1866: an end-of-queue move must be DISABLED, not a silent no-op"
+        );
+        assert!(
+            down.disabled_reason.is_some(),
+            "#1866: …and it must say why (#1598's `disabled_because`)"
+        );
+        // The same row's gate has fired, so Resume must lead.
+        assert_eq!(
+            items.first().and_then(|i| i.action_id.as_deref()),
+            Some("drive-queue-resume"),
+            "#1866: when a deploy gate has fired, releasing it is the only \
+             action that changes anything — it must not be buried"
+        );
+    }
+
+    #[test]
+    fn queue_unblock_refuses_on_a_row_that_is_not_blocked() {
+        let mut app = queue_app(queue_fixture_json());
+        // Row 0 is `running`.
+        app.queue_unblock_selected();
+        assert!(
+            app.command_runner.spawned_calls.is_empty(),
+            "#1866: `u` on a non-blocked row must promise nothing"
+        );
+        assert!(
+            app.toasts.iter().any(|t| t.0.body.contains("blocked")),
+            "#1866: …and must say why, rather than doing nothing silently: {:?}",
+            app.toasts.iter().map(|t| &t.0.body).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn queue_remove_keeps_the_selection_inside_the_grid() {
+        let mut app = queue_app(queue_fixture_json());
+        app.queue_sel = app.queue_rows().len() - 1;
+        app.queue_remove_selected();
+        let len = app.queue_rows().len();
+        assert!(
+            app.queue_sel < len.max(1),
+            "#1866: removing the tail row must not leave `queue_sel` dangling \
+             past the end of the (differently indexed) panel row set"
+        );
+    }
+
+    #[test]
+    fn queue_panel_adds_no_fetch_of_its_own() {
+        // The acceptance criterion, asserted where it can actually be
+        // checked: `run_periodic_work` is where Reports (#1741) and Audit
+        // (#1039) arm their view-gated fetches. The Queue panel must appear
+        // nowhere in it — `/board` already carries `drive_queue` and the
+        // existing poll refreshes it, so a second fetch would be a second
+        // source of truth for data already in memory.
+        let src = include_str!("settings_ui.rs");
+        assert!(
+            !src.contains("SidebarView::Queue"),
+            "#1866: no view-gated fetch block may exist for the Queue panel"
+        );
+        let src = include_str!("data.rs");
+        assert!(
+            !src.contains("drive_queue_fetch") && !src.contains("spawn_drive_queue"),
+            "#1866: no `spawn_*` may exist for queue data"
+        );
+        // Belt and braces: sitting on the panel spawns no `coord` command.
+        let driver = queue_driver(queue_fixture_json(), 160, 30);
+        assert!(
+            driver.screen().contains("myrepo#701"),
+            "the grid must actually have rendered before this asserts \
+             anything:\n{}",
+            driver.screen()
+        );
+    }
+
+    #[test]
+    fn queue_grid_pins_h_scroll_at_zero() {
+        // Guards the trap documented at `reports.rs:1025-1032`: a non-zero
+        // `h_scroll` shifts the painted headers out from under
+        // `DataTableLayout::hit_test`, which has no concept of it, and
+        // routes sort clicks to the wrong column.
+        let src = include_str!("drive_queue.rs");
+        let grid = src
+            .split("id: WidgetId::new(\"queue-grid\")")
+            .nth(1)
+            .expect("the Queue grid's DataTable literal must exist");
+        let table = grid.split("};").next().unwrap_or(grid);
+        assert!(
+            table.contains("h_scroll: 0.0"),
+            "#1866: the Queue grid's `h_scroll` must stay pinned at 0.0"
+        );
+    }
+
+    #[test]
+    fn tuidriver_queue_right_click_opens_the_shared_row_menu() {
+        let mut driver = queue_driver(queue_fixture_json(), 200, 30);
+        let (x, y) = driver.find("myrepo#703").unwrap_or_else(|| {
+            panic!(
+                "#1866: the blocked row must render before it can be \
+                 right-clicked:\n{}",
+                driver.screen()
+            )
+        });
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: MouseButton::Right,
+            position: Point::new(x, y),
+            modifiers: Modifiers::default(),
+        });
+        let menu = driver.screen();
+        for label in ["Move up", "Move down", "Remove from queue", "Unblock"] {
+            assert!(
+                menu.contains(label),
+                "#1866: the row menu must offer `{label}` — it is the #1755 \
+                 overlay's menu, shared verbatim:\n{menu}"
+            );
+        }
+        driver.press_named(quadraui::NamedKey::Escape);
+    }
+
+    #[test]
+    fn tuidriver_queue_right_click_selects_the_row_under_the_cursor() {
+        // Not the row that happened to be selected before the click — on a
+        // destructive verb (Remove) that is the worst kind of surprise.
+        let mut driver = queue_driver(queue_fixture_json(), 200, 30);
+        // Row 0 (`myrepo#701`, running) is selected on first paint; #705 is
+        // the tail, whose deploy gate has fired.
+        let (x, y) = driver
+            .find("myrepo#705")
+            .unwrap_or_else(|| panic!("tail row must render:\n{}", driver.screen()));
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: MouseButton::Right,
+            position: Point::new(x, y),
+            modifiers: Modifiers::default(),
+        });
+        let menu = driver.screen();
+        assert!(
+            menu.contains("Resume"),
+            "#1866: the menu must be built for the row under the CURSOR — \
+             only #705's gate has fired, so 'Resume' proves the right-click \
+             re-selected rather than reusing the old selection:\n{menu}"
+        );
+        assert!(
+            menu.contains("already last"),
+            "#1866: …and the tail row's 'Move down' must carry its \
+             disabled-because reason:\n{menu}"
+        );
+        driver.press_named(quadraui::NamedKey::Escape);
+    }
+
+    #[test]
+    fn tuidriver_queue_j_moves_the_cursor_and_shift_j_moves_the_entry() {
+        // Two different verbs on the same letter — the distinction the
+        // overlay already draws, carried across so muscle memory survives.
+        let mut driver = queue_driver(queue_fixture_json(), 200, 30);
+        driver.press(quadraui::Key::Char('j'));
+        driver.render();
+        driver.press(quadraui::Key::Char('J'));
+        driver.render();
+        let screen = driver.screen();
+        // The write is a queued `coord` invocation whose effect only lands
+        // on the next `/board` poll, so the observable-on-screen half is the
+        // toast naming the exact move.
+        assert!(
+            screen.contains("moving myrepo #702"),
+            "#1866: `J` over the second row must dispatch a move for THAT \
+             row (`j` having moved the cursor to it first):\n{screen}"
+        );
+    }
+
+    #[test]
+    fn tuidriver_queue_shift_k_at_position_zero_reports_nothing() {
+        // Note this is `position == 0`, not "first row of the panel": the
+        // grid hides `done` entries but the CLI still speaks in whole-queue
+        // positions, so the panel's top row is only un-movable when it also
+        // happens to sit in slot 0. Getting that wrong would show a toast
+        // promising a move that clamps to a no-op.
+        let mut driver = queue_driver(
+            r#"[{"repo_name": "myrepo", "issue_number": 701, "position": 0,
+                 "state": "waiting"},
+                {"repo_name": "myrepo", "issue_number": 702, "position": 1,
+                 "state": "waiting"}]"#,
+            200,
+            30,
+        );
+        driver.press(quadraui::Key::Char('K'));
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("moving myrepo"),
+            "#1866: a row already in slot 0 cannot move up; no command, and \
+             therefore no toast claiming one was sent:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn queue_title_column_uses_what_the_client_already_knows() {
+        // The wire `drive_queue` row carries no title — it is a raw table
+        // dump. Rather than adding a fetch (the one thing this panel must
+        // not do), the title comes from data already in memory.
+        let mut data = BoardData::default();
+        let mut a = make_assignment("running");
+        a.repo = "myrepo".to_string();
+        a.issue_number = 701;
+        a.issue_title = "TITLE-FROM-ASSIGNMENTS".to_string();
+        data.assignments = vec![a];
+
+        let app = make_app_with_drive_queue(
+            data,
+            r#"[{"repo_name": "myrepo", "issue_number": 701, "position": 0,
+                 "state": "running"},
+                {"repo_name": "myrepo", "issue_number": 999, "position": 1,
+                 "state": "waiting"}]"#,
+        );
+        let rows = app.queue_rows();
+        assert_eq!(rows[0].cells[2], "TITLE-FROM-ASSIGNMENTS");
+        assert_eq!(
+            rows[1].cells[2], QUEUE_EMPTY_CELL,
+            "#1866: an unknown title must render as an em dash — a blank \
+             cell and a failed paint look identical"
+        );
+    }
+
+    #[test]
+    fn queue_selection_tracks_the_highlight_when_the_queue_shrinks() {
+        // The queue shrinks under this panel on every poll (an entry
+        // finishes and drops out of the pending set). The row the renderer
+        // highlights and the row a verb acts on must not diverge.
+        let mut app = queue_app(queue_fixture_json());
+        app.queue_sel = app.queue_rows().len() - 1;
+        let tail_before = app.queue_selected_row().map(|r| r.issue_number);
+        assert_eq!(tail_before, Some(705));
+
+        // Next poll: the queue is down to two pending rows, so `queue_sel`
+        // now points past the end.
+        app.data.drive_queue = serde_json::from_str(
+            r#"[{"repo_name": "myrepo", "issue_number": 701, "position": 0,
+                 "state": "running"},
+                {"repo_name": "myrepo", "issue_number": 702, "position": 1,
+                 "state": "waiting"}]"#,
+        )
+        .expect("poll fixture must parse");
+
+        assert_eq!(
+            app.queue_selected_row().map(|r| r.issue_number),
+            Some(702),
+            "#1866: a stale `queue_sel` must clamp to the tail — the same \
+             row the renderer highlights — not resolve to nothing while the \
+             highlight stays visible"
+        );
+    }

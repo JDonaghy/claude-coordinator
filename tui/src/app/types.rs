@@ -164,6 +164,18 @@ pub(crate) enum SidebarView {
     /// beneath the stack. Nothing about any specific report is hardcoded
     /// here — see `app/reports.rs`.
     Reports,
+    /// #1866 (Q-1): Queue panel — a live `DataTable` grid over the drive
+    /// queue (`BoardData::drive_queue`), filtered to the entries that have
+    /// not finished, sortable by header click and reorderable with `J`/`K`.
+    ///
+    /// **Carries no fetch of its own.** `/board` already ships `drive_queue`
+    /// and the existing `start_data_load` poll refreshes it on
+    /// `settings.refresh_cadence`, so — unlike Reports (#1741) and Audit
+    /// (#1039) — there is deliberately no view-gated fetch block in
+    /// `settings_ui.rs::run_periodic_work` and no `spawn_*` for this panel.
+    /// Adding one would be a second source of truth for data already in
+    /// memory. See `app/drive_queue.rs`'s "Queue panel" section.
+    Queue,
 }
 
 impl SidebarView {
@@ -181,6 +193,7 @@ impl SidebarView {
             SidebarView::Sessions => "Sessions",
             SidebarView::Audit => "Audit",
             SidebarView::Reports => "Reports",
+            SidebarView::Queue => "Queue",
         }
     }
 
@@ -208,6 +221,7 @@ impl SidebarView {
             SidebarView::Sessions => Some(WidgetId::new("panel:sessions")),
             SidebarView::Audit => Some(WidgetId::new("panel:audit")),
             SidebarView::Reports => Some(WidgetId::new("panel:reports")),
+            SidebarView::Queue => Some(WidgetId::new("panel:queue")),
             SidebarView::MilestoneDag => None,
         }
     }

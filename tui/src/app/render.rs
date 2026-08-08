@@ -115,6 +115,12 @@ impl ShellApp for CoordApp {
                 SidebarView::Reports => {
                     backend.draw_list(sidebar_rect, &self.reports_sidebar());
                 }
+                // #1866: Queue sidebar — the aggregate queue reading
+                // (running / waiting / blocked / held). The grid itself
+                // lives in the main panel.
+                SidebarView::Queue => {
+                    backend.draw_list(sidebar_rect, &self.queue_sidebar());
+                }
             }
         }
 
@@ -527,6 +533,10 @@ impl ShellApp for CoordApp {
             SidebarView::Reports => {
                 self.render_reports_panel(backend, m, lh);
             }
+            // #1866: Queue panel — the live drive-queue grid.
+            SidebarView::Queue => {
+                self.render_queue_panel(backend, m, lh);
+            }
         }
 
         // ── Inject chat overlay — renders over the main panel ───────────
@@ -721,6 +731,10 @@ impl ShellApp for CoordApp {
             // operator who had that button pinned lands on the panel that
             // subsumed it rather than on a dead view.
             "panel:reports" | "panel:usage" => SidebarView::Reports,
+            // #1866 (Q-1): Queue panel — the live drive-queue grid. Carries
+            // no fetch of its own (`/board` already ships `drive_queue`), so
+            // unlike `panel:pipeline` above there is nothing to kick here.
+            "panel:queue" => SidebarView::Queue,
             _ => return,
         };
         // #1124: the `?` help overlay / `/` command palette are scoped to

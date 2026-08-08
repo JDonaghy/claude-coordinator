@@ -2570,6 +2570,57 @@ impl CoordApp {
                         needs_redraw = true;
                     }
 
+                    // ── #1866 (Q-1): Queue panel ─────────────────────────
+                    //
+                    // j/k move the cursor; J/K move the SELECTED ENTRY —
+                    // the interaction the operator actually performs (six
+                    // `coord drive-queue move`s in one unattended session on
+                    // 2026-08-05, every one of them typed into a shell).
+                    // This is the overlay's binding set, moved rather than
+                    // invented (`drive_queue_overlay_key`), so muscle memory
+                    // carries over and the overlay stays a working fallback.
+                    //
+                    // There is deliberately no `r=refresh`: the grid is
+                    // already live off the `/board` poll, so `r` is free for
+                    // "resume" (release a fired deploy gate), matching the
+                    // overlay.
+                    Key::Char('j') | Key::Named(NamedKey::Down)
+                        if self.active_view == SidebarView::Queue =>
+                    {
+                        self.queue_move_selection(1);
+                        self.fix_queue_scroll(content_visible_rows(ctx.main_bounds(), lh));
+                        needs_redraw = true;
+                    }
+                    Key::Char('k') | Key::Named(NamedKey::Up)
+                        if self.active_view == SidebarView::Queue =>
+                    {
+                        self.queue_move_selection(-1);
+                        self.fix_queue_scroll(content_visible_rows(ctx.main_bounds(), lh));
+                        needs_redraw = true;
+                    }
+                    Key::Char('J') if self.active_view == SidebarView::Queue => {
+                        self.queue_selected_move(1);
+                        self.fix_queue_scroll(content_visible_rows(ctx.main_bounds(), lh));
+                        needs_redraw = true;
+                    }
+                    Key::Char('K') if self.active_view == SidebarView::Queue => {
+                        self.queue_selected_move(-1);
+                        self.fix_queue_scroll(content_visible_rows(ctx.main_bounds(), lh));
+                        needs_redraw = true;
+                    }
+                    Key::Char('x') if self.active_view == SidebarView::Queue => {
+                        self.queue_remove_selected();
+                        needs_redraw = true;
+                    }
+                    Key::Char('u') if self.active_view == SidebarView::Queue => {
+                        self.queue_unblock_selected();
+                        needs_redraw = true;
+                    }
+                    Key::Char('r') if self.active_view == SidebarView::Queue => {
+                        self.queue_resume_selected();
+                        needs_redraw = true;
+                    }
+
                     // ── Merge Queue keyboard nav (#737) ──────────────────
                     Key::Char('j') | Key::Named(NamedKey::Down)
                         if self.active_view == SidebarView::MergeQueue =>
@@ -3069,6 +3120,9 @@ impl CoordApp {
                             // #1741: section-stack j/k handled by the earlier
                             // guarded arm; a no-op here.
                             SidebarView::Reports => {}
+                            // #1866: Queue grid j/k handled by the earlier
+                            // guarded arm.
+                            SidebarView::Queue => {}
                         }
                         needs_redraw = true;
                     }
@@ -3137,6 +3191,8 @@ impl CoordApp {
                             SidebarView::Audit => {}
                             // #1741: see Down/j arm above.
                             SidebarView::Reports => {}
+                            // #1866: see Down/j arm above.
+                            SidebarView::Queue => {}
                         }
                         needs_redraw = true;
                     }
@@ -3386,6 +3442,12 @@ impl CoordApp {
                                 self.reports_field_sel = 0;
                                 self.reports_clamp_field_sel();
                             }
+                            // #1866: Queue — Home jumps to the head of the
+                            // queue (and scrolls it into view).
+                            SidebarView::Queue => {
+                                self.queue_sel = 0;
+                                self.queue_scroll = 0;
+                            }
                         }
                         needs_redraw = true;
                     }
@@ -3478,6 +3540,17 @@ impl CoordApp {
                                 }
                                 self.reports_field_sel = 0;
                                 self.reports_clamp_field_sel();
+                            }
+                            // #1866: Queue — End jumps to the tail.
+                            SidebarView::Queue => {
+                                let n = self.queue_rows().len();
+                                if n > 0 {
+                                    self.queue_sel = n - 1;
+                                }
+                                self.fix_queue_scroll(content_visible_rows(
+                                    ctx.main_bounds(),
+                                    lh,
+                                ));
                             }
                         }
                         needs_redraw = true;
@@ -4449,6 +4522,24 @@ impl CoordApp {
                     // Pre-select the row under the cursor (mirrors the
                     // synthetic-left-click pattern above) before resolving
                     // the target from the now-current selection.
+                    // #1866 (Q-1): the Queue grid also lives in the MAIN
+                    // panel, so it needs the same treatment as Plans below:
+                    // pre-select the row under the cursor, then open the
+                    // shared drive-queue row menu for it. Falling through to
+                    // `context_menu_target_for_selection` alone would open
+                    // the menu for whatever row was selected *before* the
+                    // click, which on a destructive verb (Remove) is the
+                    // worst possible kind of surprise.
+                    if self.active_view == SidebarView::Queue {
+                        if let Some(DataTableHit::Row { idx }) = self.queue_table_hit(pos) {
+                            self.queue_sel = idx;
+                        }
+                        if let Some(target) = self.queue_context_target() {
+                            if self.open_context_menu(pos, target) {
+                                return true;
+                            }
+                        }
+                    }
                     if self.active_view == SidebarView::Plans && !self.plans_detail_open {
                         // #1122: while the detail pane is open the roster
                         // list isn't painted at all, so `plans_row_at`
@@ -5251,6 +5342,9 @@ impl CoordApp {
             // #1741: Reports sidebar is a summary (catalogue size + last-run
             // line); the section stack lives in the main panel.
             SidebarView::Reports => false,
+            // #1866: Queue sidebar is a read-only count summary; the grid
+            // lives in the main panel (`mouse_main_click`).
+            SidebarView::Queue => false,
         }
     }
 
@@ -5575,6 +5669,39 @@ impl CoordApp {
                 // The audit table has no footer, so `Footer` can't occur —
                 // treat it (and the other non-actionable hits) as a no-op.
                 Some(DataTableHit::Header { .. })
+                | Some(DataTableHit::Footer)
+                | Some(DataTableHit::Empty)
+                | None => false,
+            };
+        }
+        // #1866 (Q-1): Queue panel — the whole main pane is one `DataTable`.
+        //
+        // A header click sorts by that column (None→▲→▼→None). Client-side
+        // sorting is correct here for the same reason it is in Reports and
+        // wrong in Audit: the rows on screen are the complete queue, not one
+        // server-paginated page of it.
+        //
+        // The vertical-scrollbar track is tested FIRST, before
+        // `queue_table_hit`: `DataTableLayout::hit_test` has no concept of
+        // the scrollbar strip it reserves space for, so without this a click
+        // on the thumb mis-resolves to whichever row sits under it (#1094's
+        // gap, re-hit by Reports at #1910).
+        if self.active_view == SidebarView::Queue {
+            if self.queue_scrollbar_hit(pos) {
+                return self.queue_apply_vscroll(pos);
+            }
+            return match self.queue_table_hit(pos) {
+                Some(DataTableHit::Header { col }) => self.queue_sort_by_column(col),
+                Some(DataTableHit::Row { idx }) => {
+                    self.queue_sel = idx;
+                    true
+                }
+                // No column-resize drag on this table yet (#1853 covers that
+                // for Reports), and there is no footer — so a divider hit is
+                // a plain no-op rather than being mis-read as a header
+                // click, which would sort a column the operator was aiming
+                // to resize.
+                Some(DataTableHit::HeaderDivider { .. })
                 | Some(DataTableHit::Footer)
                 | Some(DataTableHit::Empty)
                 | None => false,
@@ -6006,6 +6133,8 @@ impl CoordApp {
             SidebarView::Audit => false,
             // #1741: Reports sidebar is a short summary — no sidebar scroll.
             SidebarView::Reports => false,
+            // #1866: Queue sidebar is a short count summary — no scroll.
+            SidebarView::Queue => false,
         }
     }
 
@@ -6290,6 +6419,20 @@ impl CoordApp {
                     let table_visible = self.reports_table_visible_rows().unwrap_or(visible).max(1);
                     let max = n.saturating_sub(table_visible);
                     self.reports_result_scroll = (self.reports_result_scroll + 3).min(max);
+                }
+                true
+            }
+            // #1866: Queue panel — the whole main pane is the grid, and it
+            // can run long. Clamped against the table's OWN painted
+            // viewport, not the panel's row count (the #1910 lesson).
+            SidebarView::Queue => {
+                let n = self.queue_rows().len();
+                if delta.y > 0.0 {
+                    self.queue_scroll = self.queue_scroll.saturating_sub(3);
+                } else if delta.y < 0.0 {
+                    let table_visible = self.queue_table_visible_rows().unwrap_or(visible).max(1);
+                    let max = n.saturating_sub(table_visible);
+                    self.queue_scroll = (self.queue_scroll + 3).min(max);
                 }
                 true
             }
