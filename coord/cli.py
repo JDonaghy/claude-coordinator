@@ -252,7 +252,7 @@ def _warn_if_source_install_drift() -> None:
                 f"checkout at {local_init.parent} has moved past that release.\n"
                 "This install may be silently evaluating RETIRED logic (#1182 — this is "
                 "how a false merge-gate block slipped through).  Fix:\n"
-                "  pip install --upgrade claude-coordinator   "
+                "  pip install --upgrade 'claude-coordinator[server]'   "
                 "(if a release covers those commits)\n"
                 "  pip install -e .                           (to run live source instead)\n"
                 f"{banner}",

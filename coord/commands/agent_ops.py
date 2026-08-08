@@ -22,7 +22,12 @@ from coord.config import Config
 if TYPE_CHECKING:  # pragma: no cover — typing only
     from collections.abc import Callable
 
-from coord.commands._common import AGENT_PORT, _CONFIG_OPTION, _load_config
+from coord.commands._common import (
+    AGENT_PORT,
+    _CONFIG_OPTION,
+    _load_config,
+    server_extra_guard,
+)
 
 
 @click.group(
@@ -344,10 +349,15 @@ def _start_agent_server(
     bind_port: int,
 ) -> None:
     """Internal helper: start the uvicorn-backed agent server."""
-    import uvicorn
+    # #1237: these imports are function-local *and* guarded so (a) `import
+    # coord.cli` stays client-clean on a base install and (b) hitting `coord
+    # agent` there says "install the [server] extra" instead of raising a raw
+    # ModuleNotFoundError.
+    with server_extra_guard("agent"):
+        import uvicorn
 
-    from coord.agent import AgentServer
-    from coord.agent_app import build_app
+        from coord.agent import AgentServer
+        from coord.agent_app import build_app
 
     startup = _resolve_agent_startup(config_path, machine_name)
     machine = startup.machine

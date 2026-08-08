@@ -1,24 +1,88 @@
 """Shared infra for coord/commands/*.py: config loading, the shared
 ``--config`` option, port constants, and the handful of helpers used by
-more than one command module. Extracted from coord/cli.py (#747)."""
+more than one command module. Extracted from coord/cli.py (#747).
+
+#1237 (PKG-1): this module is imported by *every* command module, including
+the client-clean ones, so it is the one file that absolutely must not reach
+the server stack at import time. Keep it that way:
+
+- No module-scope import of ``coord.serve_app`` / ``coord.agent_app`` /
+  ``coord.dashboard.*`` / ``starlette`` / ``uvicorn`` / ``psutil``. The port
+  constants below are deliberately *duplicated literals* rather than
+  re-exports for this reason — importing ``coord.serve_app`` just to read
+  ``SERVE_PORT`` would drag starlette into ``coord status``.
+- Server-only work goes behind :func:`server_extra_guard`, which turns the
+  resulting ``ModuleNotFoundError`` into an actionable "install the [server]
+  extra" message.
+"""
 
 from __future__ import annotations
 
 import json
 import socket
 import sys
+from contextlib import contextmanager
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import click
 
 from coord.config import Config, ConfigError, load, resolve_config_path
-from coord.brain import AGENT_PORT
 
+if TYPE_CHECKING:  # pragma: no cover — typing only
+    from collections.abc import Iterator
+
+# Canonical constant in coord.brain.AGENT_PORT — duplicated here as a literal
+# so the CLI decorator default doesn't have to import the brain (and, through
+# it, the provider stack) on every `coord` invocation.
 AGENT_PORT = 7433
 # Portable control-center daemon port (#584); canonical constant in
 # coord.serve_app.SERVE_PORT — duplicated here for the CLI decorator default,
 # mirroring the AGENT_PORT pattern above.
 SERVE_PORT = 7435
+
+#: Distributions provided by the ``[server]`` extra (#1237). A
+#: ``ModuleNotFoundError`` naming any of these from a server codepath means
+#: "base install, no extra" — not a bug.
+SERVER_EXTRA_MODULES = frozenset({"starlette", "uvicorn", "websockets", "psutil"})
+
+#: What to tell a user who hit a server command on a client-only install.
+SERVER_EXTRA_INSTALL_HINT = "pip install 'claude-coordinator[server]'"
+
+
+@contextmanager
+def server_extra_guard(feature: str) -> "Iterator[None]":
+    """Translate a missing ``[server]`` extra into an actionable CLI error.
+
+    ``pip install claude-coordinator`` installs a *client* (#1237): no
+    starlette/uvicorn/websockets/psutil. Wrap the function-local imports that
+    boot a server in this so the failure reads as "you need the extra" rather
+    than a raw ``ModuleNotFoundError: No module named 'uvicorn'`` traceback::
+
+        with server_extra_guard("serve"):
+            import uvicorn
+            from coord.serve_app import build_app
+
+    *feature* is the user-facing command name (``"serve"``, ``"web"``,
+    ``"agent"``) and is echoed back in the message.
+
+    Anything that is *not* one of the extra's modules re-raises untouched — a
+    genuinely broken import inside ``coord.serve_app`` must not be papered
+    over as a packaging problem.
+    """
+    try:
+        yield
+    except ModuleNotFoundError as exc:
+        missing = (exc.name or "").split(".")[0]
+        if missing not in SERVER_EXTRA_MODULES:
+            raise
+        raise click.ClickException(
+            f"`coord {feature}` needs the server extra, which is not installed "
+            f"(missing {missing!r}).\n"
+            f"  Install it with:  {SERVER_EXTRA_INSTALL_HINT}\n"
+            "  The base `claude-coordinator` install is a client-only CLI — it "
+            "can drive a remote fleet, but not host one (#1237)."
+        ) from exc
 
 
 _CONFIG_OPTION = click.option(

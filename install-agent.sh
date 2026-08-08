@@ -5,7 +5,10 @@ set -euo pipefail
 VENV_DIR="$HOME/.coord-venv"
 MACHINE_NAME=""
 PORT=7433
-INSTALL_SOURCE="claude-coordinator"  # PyPI package name
+# #1237: the `[server]` extra is MANDATORY on an agent. The base package is a
+# client-only CLI (no starlette/uvicorn), so `coord agent` on a bare install
+# refuses to boot with an "install the [server] extra" message.
+INSTALL_SOURCE="claude-coordinator[server]"  # PyPI package name + server extra
 # Fall back to GitHub install if PyPI isn't published yet
 GITHUB_REPO="https://github.com/JDonaghy/claude-coordinator.git"
 
@@ -14,7 +17,7 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         --machine) MACHINE_NAME="$2"; shift 2 ;;
         --port) PORT="$2"; shift 2 ;;
-        --from-github) INSTALL_SOURCE="git+${GITHUB_REPO}"; shift ;;
+        --from-github) INSTALL_SOURCE="claude-coordinator[server] @ git+${GITHUB_REPO}"; shift ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
