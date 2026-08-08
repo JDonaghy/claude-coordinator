@@ -701,3 +701,63 @@ so a human still has to run the `cp` + `systemctl --user daemon-reload &&
 systemctl --user restart <unit>` the check's own detail line prints.
 
 Full story: [`AGENT_OPERATIONS.md`](AGENT_OPERATIONS.md#the-sixth-surface-deploy--reviewed-like-code-installed-by-nobody).
+
+---
+
+## 16. A review that reached `END_REVIEW` with no `REVIEW_VERDICT:` header is recoverable — recover it, don't re-dispatch (#1956)
+
+A headless reviewer can write a complete, well-reasoned review — full body,
+`## Blocking findings` / `None.`, thorough — and still end with `status=done`
++ `review_verdict=None` on the board, because it followed the *tail* of the
+required format (`END_REVIEW`) while dropping the *header* that carries the
+machine-readable data (`REVIEW_VERDICT:`). Live on quadraui#533
+(2026-08-07): grepping the raw log for `REVIEW_VERDICT` found the string
+exactly once, and that occurrence was inside the reviewer's own briefing
+instructions — never emitted by the model. `coord gates` blocks with
+`review : BLOCKED — review required but not approved`, which reads
+*identically* to "review hasn't run yet" — nothing says the verdict is
+sitting right there in the log, recoverable.
+
+**How to tell the two apart.** `coord gates <repo> <issue>` now renders this
+case as `review : ERROR`, not `BLOCKED` — `coord notify`'s own log also
+carries a `log.warning` naming the assignment and quoting the excerpt right
+before `END_REVIEW`, and the GitHub completion comment posted for the review
+assignment says so too (distinct wording from the generic "findings could
+not be extracted" message). If you see plain `BLOCKED`, the review really
+hasn't produced anything usable yet; if you see `ERROR` (or the loud log
+line / GitHub comment), the verdict is very likely sitting in the transcript
+already.
+
+**Recovery — do NOT re-dispatch.** Re-running the review costs a full cycle
+to re-derive a conclusion already sitting in the log, and elitebook has a
+documented ~14% rate of dropping the header again on the very next attempt
+(`incident_elitebook_review_verdict_capture_drops`). Instead, read the
+transcript, confirm the verdict the reviewer actually reached, and relay it
+through the same seam a reviewer's own `REVIEW_VERDICT:` line would have
+written to:
+
+```
+coord report-result --assignment <review_assignment_id> \
+  --verdict <approve|request-changes> \
+  --verdict-source recovered \
+  --verdict-reason "REVIEW_VERDICT header missing, recovered from transcript (#1956)" \
+  --body-file <extracted-review.md>       # required with --verdict request-changes
+```
+
+`--verdict-source recovered` (with a required `--verdict-reason`) is not
+optional decoration — a relayed verdict with no stated provenance is
+indistinguishable from one the reviewer agent produced itself at every
+surface that shows it (`coord gates`, the board, the audit trail). Use
+`--verdict-source overridden` instead of `recovered` when you are recording
+a **different** verdict than what the reviewer actually concluded (a
+deliberate human override), never for a straightforward transcript rescue —
+the two read differently everywhere downstream, on purpose (#1956's second
+half: a recovery asserts "the reviewer decided this, we merely restored it";
+an override asserts "the reviewer decided otherwise and a human disagreed").
+
+A `REVIEW_VERDICT:` marker that IS present but malformed (a bolded
+`**REVIEW_VERDICT:**`, mismatched terminator, …) is the older, sibling
+#1348 diagnostic — same recovery command, same `--verdict-source recovered`
+convention, different detection path (`coord.review.detect_unparsed_review_marker`
+vs. `coord.review.detect_end_review_without_verdict` for the header-omitted-
+entirely case documented above).

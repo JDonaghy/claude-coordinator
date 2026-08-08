@@ -1537,17 +1537,125 @@ def _persist_review_findings(assignment_id: str, verdict: str, body: str) -> Non
         )
 
 
+def _fetch_raw_log_text(transition: Transition, entry: dict) -> str | None:
+    """Best-effort raw log text for #1956/#1348 diagnostics.
+
+    Mirrors the local-file-then-agent-fetch fallback :func:`_try_parse_and_post_review`
+    itself uses to PARSE the log, but returns the raw text instead — the
+    diagnostic detectors (:func:`coord.review.detect_end_review_without_verdict`,
+    :func:`coord.review.detect_unparsed_review_marker`) need the text the
+    strict parser already rejected, not another parse attempt. Returns
+    ``None`` on any I/O failure — diagnostics are best-effort by design and
+    must never be the reason ``coord notify`` raises.
+    """
+    log_path = entry.get("log_path")
+    if log_path:
+        try:
+            return Path(log_path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            pass
+    host = _agent_host(transition.machine_name)
+    if host:
+        try:
+            resp = httpx.get(
+                f"http://{host}:{AGENT_PORT}/logs/{transition.assignment_id}",
+                timeout=15.0,
+            )
+            resp.raise_for_status()
+            return resp.text
+        except (httpx.HTTPError, httpx.TimeoutException):
+            return None
+    return None
+
+
+def _warn_missing_review_verdict(
+    transition: Transition, entry: dict, diagnostic: list,
+) -> None:
+    """#1956: when a review's structured verdict could not be parsed, make it
+    LOUD instead of silent — run the #1348/#1956 diagnostics against the raw
+    log text and ``log.warning`` a recovery command.
+
+    Before this, a review that reached ``END_REVIEW`` with a full body but
+    no ``REVIEW_VERDICT:`` header (quadraui#533's live incident — grepping
+    the raw log found the string exactly once, inside the briefing's own
+    instructions, never in an assistant message) landed ``status="done"``
+    with ``review_verdict IS NULL`` and nothing anywhere said so; the merge
+    gate just read ``review_required`` forever. Appends whichever
+    diagnostic fired (if any) to *diagnostic* so :func:`post_transition` can
+    tailor the GitHub-visible completion comment too — the operator should
+    not have to go spelunking in ``coord notify``'s own log to learn this.
+    Best-effort throughout: a failure to even fetch the raw text is
+    swallowed, matching this module's "never crash notify" contract.
+    """
+    from coord.review import (  # noqa: PLC0415
+        detect_end_review_without_verdict,
+        detect_unparsed_review_marker,
+    )
+
+    text = _fetch_raw_log_text(transition, entry)
+    if not text:
+        return
+    aid = transition.assignment_id
+    log_path = entry.get("log_path")
+    recover_hint = (
+        f"coord report-result --assignment {aid} "
+        "--verdict <approve|request-changes> --verdict-source recovered "
+        '--verdict-reason "<why>" --body-file <extracted-review.md>'
+    )
+
+    end_marker = detect_end_review_without_verdict(text, transcript_path=log_path)
+    if end_marker is not None:
+        log.warning(
+            "review %s: reviewer wrote END_REVIEW but never emitted "
+            "REVIEW_VERDICT: anywhere (#1956) — this is NOT a crashed/"
+            "truncated session, the verdict is very likely recoverable "
+            "from the transcript. Recover with:\n  %s\nExcerpt before "
+            "END_REVIEW:\n%s",
+            aid, recover_hint, end_marker.excerpt,
+        )
+        diagnostic.append(end_marker)
+        return
+
+    marker = detect_unparsed_review_marker(text, transcript_path=log_path)
+    if marker is not None:
+        log.warning(
+            "review %s: a REVIEW_VERDICT: marker is present but malformed "
+            "(#1348, detected word=%r) — the strict parser rejected it. "
+            "Recover with:\n  %s",
+            aid, marker.verdict_word, recover_hint,
+        )
+        diagnostic.append(marker)
+        return
+
+    log.debug(
+        "review %s: no REVIEW_VERDICT:/END_REVIEW markers found at all — "
+        "likely a crashed or truncated session, not a #1956/#1348 "
+        "recoverable case",
+        aid,
+    )
+
+
 def _try_parse_and_post_review(
     transition: Transition,
     record: dict,
     entry: dict,
     duration: float | None,
+    *,
+    _diagnostic: list | None = None,
 ) -> bool:
     """Parse reviewer findings from the log and post as a PR review or issue comment.
 
     Returns True if a review was successfully posted (either as a ``gh pr review``
     or as an issue comment when no PR number is available), False on any failure.
     Silently swallows all errors so callers can fall back gracefully.
+
+    *_diagnostic* (#1956): optional out-parameter, mirroring
+    ``coord.interactive``'s identically-shaped convention for #1348. When a
+    list is supplied and the structured verdict cannot be parsed, whichever
+    of :func:`coord.review.detect_end_review_without_verdict` /
+    :func:`coord.review.detect_unparsed_review_marker` fires is appended to
+    it, so the caller can tailor the fallback GitHub comment instead of a
+    generic "could not be extracted" message every single time.
     """
     from coord.review import parse_review_from_log, parse_review_from_agent  # noqa: PLC0415
 
@@ -1574,6 +1682,14 @@ def _try_parse_and_post_review(
                 )
 
     if findings is None:
+        if _diagnostic is not None:
+            try:
+                _warn_missing_review_verdict(transition, entry, _diagnostic)
+            except Exception as exc:  # noqa: BLE001 — diagnostics must never crash notify
+                log.debug(
+                    "review %s: #1956 diagnostic itself failed: %s",
+                    transition.assignment_id, exc,
+                )
         return False
 
     # #253: persist the parsed verdict on the review assignment so the merge
@@ -1826,16 +1942,46 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
     elif transition.event == EVENT_COMPLETION and assignment_type == "review":
         # For review assignments, parse the structured findings and post as a
         # PR review (or issue comment when no PR number is available).  Fall
-        # back to a plain completion comment noting the parse failure.
-        posted = _try_parse_and_post_review(transition, record, entry, duration)
+        # back to a plain completion comment noting the parse failure — #1956:
+        # tailored per-diagnostic instead of one generic message, so an
+        # operator reading GitHub (not `coord notify`'s own log) can ALSO see
+        # that a verdict is recoverable, not just that parsing failed.
+        _diag: list = []
+        posted = _try_parse_and_post_review(
+            transition, record, entry, duration, _diagnostic=_diag,
+        )
         if not posted:
-            post_completion(
-                exit_code=transition.exit_code or 0,
-                summary=(
+            from coord.review import EndReviewWithoutVerdict  # noqa: PLC0415
+
+            if _diag and isinstance(_diag[0], EndReviewWithoutVerdict):
+                fallback_summary = (
+                    "Review assignment completed and the reviewer wrote END_REVIEW, "
+                    "but never emitted the machine-readable REVIEW_VERDICT: header "
+                    "(#1956) — this is NOT a crashed/truncated session, the verdict "
+                    "is very likely recoverable from the transcript. Recover with: "
+                    f"`coord report-result --assignment {transition.assignment_id} "
+                    "--verdict <approve|request-changes> --verdict-source recovered "
+                    '--verdict-reason "<why>" --body-file <extracted-review.md>`.'
+                )
+            elif _diag:
+                fallback_summary = (
+                    "Review assignment completed but a REVIEW_VERDICT: marker in "
+                    "the worker log was malformed and could not be parsed (#1348) "
+                    "— the verdict is likely still recoverable from the transcript. "
+                    "Recover with: "
+                    f"`coord report-result --assignment {transition.assignment_id} "
+                    "--verdict <approve|request-changes> --verdict-source recovered "
+                    '--verdict-reason "<why>" --body-file <extracted-review.md>`.'
+                )
+            else:
+                fallback_summary = (
                     "Review assignment completed but findings could not be extracted "
                     "from the worker log. The reviewer may not have produced the "
                     "expected structured output (REVIEW_VERDICT / REVIEW_BODY / END_REVIEW)."
-                ),
+                )
+            post_completion(
+                exit_code=transition.exit_code or 0,
+                summary=fallback_summary,
                 **common,
             )
         mark_notified(

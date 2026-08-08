@@ -504,6 +504,10 @@ class TestProcessReviewCompletion:
         # verdict stays readable alongside the coordinator's.
         assert review.review_verdict_original == "request-changes"
         assert "blocking=0" in (review.review_verdict_override_reason or "")
+        # #1956: this IS a coordinator override of the reviewer's own
+        # verdict — provenance must say so, with the same reason.
+        assert review.verdict_source == "overridden"
+        assert review.verdict_source_reason == review.review_verdict_override_reason
         mock_notice.assert_called_once()
         # The GitHub notice must name the reviewer's original verdict.
         assert mock_notice.call_args.kwargs["original_verdict"] == "request-changes"

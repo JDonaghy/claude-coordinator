@@ -65,6 +65,9 @@ __all__ = [
     "STATUS_ALREADY_IMPLEMENTED",
     "VERDICT_APPROVE",
     "VERDICT_REQUEST_CHANGES",
+    "VERDICT_SOURCE_AGENT",
+    "VERDICT_SOURCE_RECOVERED",
+    "VERDICT_SOURCE_OVERRIDDEN",
     "get_audit_runs_for_epic",
     "diff_audit_goals",
 ]
@@ -81,6 +84,14 @@ VERDICT_REQUEST_CHANGES = "request-changes"
 
 _VALID_STATUSES = (STATUS_DONE, STATUS_BLOCKED, STATUS_ALREADY_IMPLEMENTED)
 _VALID_VERDICTS = (VERDICT_APPROVE, VERDICT_REQUEST_CHANGES)
+
+# #1956: verdict provenance — see coord.models.Assignment.verdict_source.
+VERDICT_SOURCE_AGENT = "agent"
+VERDICT_SOURCE_RECOVERED = "recovered"
+VERDICT_SOURCE_OVERRIDDEN = "overridden"
+_VALID_VERDICT_SOURCES = (
+    VERDICT_SOURCE_AGENT, VERDICT_SOURCE_RECOVERED, VERDICT_SOURCE_OVERRIDDEN,
+)
 
 ResultStatus = Literal["done", "blocked", "already-implemented"]
 ResultVerdict = Literal["approve", "request-changes"]
@@ -163,6 +174,17 @@ class ResultRecord:
     # (the #650 incident: a 5166-char review clobbered to a 58-char
     # placeholder by finishing the exit process twice).
     allow_overwrite_findings: bool = False
+    # #1956: verdict provenance — see coord.models.Assignment.verdict_source
+    # for the three values and why conflating them was the second half of
+    # #1956.  None (the default — every existing caller, including the
+    # ordinary agent self-report path) is recorded as "agent"; an operator
+    # relaying a verdict that was NOT freshly produced by this session's own
+    # reasoning (a transcript recovery, or a deliberate override of what the
+    # session actually reported) must say so explicitly via
+    # ``--verdict-source`` plus a required ``--verdict-reason`` — see
+    # ``_validate_result``.
+    verdict_source: str | None = None
+    verdict_source_reason: str | None = None
 
 
 # ── Resolved terminal state (what the seam writes back) ─────────────────────
@@ -372,6 +394,31 @@ def _validate_result(record: ResultRecord) -> None:
             "a review with no body, which would strand the fix worker with "
             "nothing to fix (#607). Recover the findings from the session "
             "transcript or supply them with --body-file."
+        )
+
+    # ── #1956: verdict provenance ─────────────────────────────────────────────
+    # A relayed verdict recorded with no marker of WHO decided it (an
+    # operator "recovering" it from a transcript vs. deliberately
+    # "overriding" what the reviewer actually said) is indistinguishable
+    # from an agent-produced one at every downstream reader — the merge
+    # gate, `coord gates`, the TUI, the audit trail. Refusing an unstated
+    # non-"agent" source at this single write seam (mirroring #617's
+    # empty-findings refusal above) makes that ambiguity unrepresentable
+    # instead of relying on every caller to remember to pass a reason.
+    if record.verdict_source is not None and record.verdict_source not in _VALID_VERDICT_SOURCES:
+        raise ValueError(
+            f"invalid verdict_source {record.verdict_source!r} "
+            f"(expected one of {_VALID_VERDICT_SOURCES!r} or None)"
+        )
+    if record.verdict_source in ("recovered", "overridden") and not (
+        record.verdict_source_reason and record.verdict_source_reason.strip()
+    ):
+        raise ValueError(
+            f"verdict_source={record.verdict_source!r} requires a non-empty "
+            "verdict_source_reason (--verdict-reason on the CLI) — a relayed "
+            "verdict must carry a reason so it is auditable, not silently "
+            "indistinguishable from one the reviewer agent itself produced "
+            "(#1956)."
         )
 
     # ── #886 Phase 2: structured audit verdict shape ─────────────────────────
@@ -739,6 +786,41 @@ def _persist_review_verdict(record: ResultRecord) -> bool:
         f"assignment {record.assignment_id!r} after {attempts} attempts "
         f"(#990): {last_exc}"
     ) from last_exc
+
+
+def _persist_verdict_source(record: ResultRecord) -> None:
+    """Best-effort: stamp verdict provenance (#1956) alongside `review_verdict`.
+
+    Deliberately separate from :func:`_persist_review_verdict`'s retry/raise
+    contract — provenance is metadata ABOUT a verdict write that already
+    succeeded (this is only ever called after that function returns), so a
+    transient failure here must not turn a landed verdict into a reported
+    CLI error. ``record.verdict_source`` defaults to ``"agent"`` when unset
+    (``_validate_result`` already confirmed it's a valid value, or None).
+
+    Always called from :func:`_post_result_local`, which — like every other
+    caller in this module — runs strictly LOCALLY (either directly, or
+    inside the daemon's own ``/result`` handler after it reconstructs the
+    ``ResultRecord``): no separate daemon route is needed for this column,
+    unlike ``update_assignment_review_findings``'s ``POST
+    /review-findings``, because the routing already happened one level up
+    at ``post_result``.
+    """
+    from coord.state import get_connection  # noqa: PLC0415
+
+    if not record.assignment_id:
+        return
+    source = record.verdict_source or VERDICT_SOURCE_AGENT
+    try:
+        conn = get_connection()
+        conn.execute(
+            "UPDATE assignments SET verdict_source=?, verdict_source_reason=? "
+            "WHERE assignment_id=?",
+            (source, record.verdict_source_reason, record.assignment_id),
+        )
+        conn.commit()
+    except Exception:  # noqa: BLE001 — best-effort; see docstring
+        pass
 
 
 # ── Milestone Outcome Audit — versioned runs + diff (#886 Phase 2) ─────────
@@ -1174,6 +1256,17 @@ def _post_result_local(record: ResultRecord) -> StoreOutcome:
     findings_written = True
     if record.verdict is not None:
         findings_written = _persist_review_verdict(record)
+        # #1956: stamp provenance alongside the verdict itself. Best-effort
+        # by design (a provenance-column write failure must not turn an
+        # already-durably-persisted verdict into a reported CLI failure —
+        # `_persist_review_verdict` above is the one write this function
+        # raises loudly for) but still ALWAYS attempted, defaulting to
+        # "agent" when the caller didn't say otherwise — the common case
+        # (an agent self-reporting its own session) is the overwhelming
+        # majority of `report-result --verdict` calls and must read as
+        # exactly that, not as an unlabeled NULL indistinguishable from a
+        # pre-#1956 row.
+        _persist_verdict_source(record)
     # #603: a request-changes verdict is durable context for EVERY future agent
     # on the issue — record a short note in the per-issue digest (local writer;
     # daemon-side on a thin client, so use the _local variant).

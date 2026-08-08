@@ -349,6 +349,14 @@ def process_review_completion(
         review.review_verdict_original = findings.verdict
         review.review_verdict_override_reason = override_reason
         review.review_verdict = "approve"
+        # #1956: this IS a coordinator override of the reviewer's own
+        # verdict — stamp the same provenance a human relaying an override
+        # via `coord report-result --verdict-source overridden` would carry,
+        # so this automatic path and a manual one read identically at every
+        # surface that shows verdict_source, instead of only the manual path
+        # being auditable.
+        review.verdict_source = "overridden"
+        review.verdict_source_reason = override_reason
         _record_verdict_override(
             review, board,
             original_verdict=findings.verdict,

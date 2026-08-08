@@ -115,6 +115,9 @@ def _assignment_upsert_params(a: Assignment) -> tuple:
         (json.dumps(a.smoke_tests) if a.smoke_tests is not None else None),
         # #324: resolved provider name; None → NULL.
         a.provider_name,
+        # #1956: verdict provenance; None → NULL (treated as "agent").
+        a.verdict_source,
+        a.verdict_source_reason,
     )
 
 
@@ -128,7 +131,7 @@ _UPSERT_SQL = """
         review_posted_at, test_state, test_reason, review_verdict,
         review_verdict_original, review_verdict_override_reason, review_head_sha,
         review_patch_id, review_scoped, review_scope_base_sha,
-        cost_usd, smoke_tests, provider_name
+        cost_usd, smoke_tests, provider_name, verdict_source, verdict_source_reason
     ) VALUES (
         ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?,
@@ -138,7 +141,7 @@ _UPSERT_SQL = """
         ?, ?, ?, ?,
         ?, ?, ?,
         ?, ?, ?,
-        ?, ?, ?
+        ?, ?, ?, ?, ?
     )
     ON CONFLICT(assignment_id) DO UPDATE SET
         -- #1451: `status`/`finished_at` are guarded by a finished_at-CAS, not
@@ -280,7 +283,17 @@ _UPSERT_SQL = """
         smoke_tests        = COALESCE(excluded.smoke_tests, smoke_tests),
         -- #324: once a provider_name is recorded at dispatch, a later
         -- upsert without one (e.g. agent reload) must not clear it.
-        provider_name      = COALESCE(excluded.provider_name, provider_name)
+        provider_name      = COALESCE(excluded.provider_name, provider_name),
+        -- #1956: once verdict provenance is recorded (a single-row seam
+        -- write — issue_store._persist_verdict_source, never this whole-
+        -- board upsert itself), a later upsert from a path that doesn't
+        -- know about it (agent reload, thin-client round-trip) must not
+        -- erase it — same COALESCE-preserve pattern as review_verdict_
+        -- original/review_verdict_override_reason above, for the same
+        -- reason: a provenance-bearing column is written once and audited,
+        -- never silently reverted.
+        verdict_source        = COALESCE(excluded.verdict_source, verdict_source),
+        verdict_source_reason = COALESCE(excluded.verdict_source_reason, verdict_source_reason)
 """
 
 

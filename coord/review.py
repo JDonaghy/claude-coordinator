@@ -328,6 +328,108 @@ def detect_unparsed_review_marker(
     )
 
 
+# ── #1956 ask 3: END_REVIEW present, REVIEW_VERDICT absent entirely ─────────
+#
+# quadraui#533's live incident: the reviewer wrote a complete, thorough
+# review and ended with `END_REVIEW`, but never wrote `REVIEW_VERDICT:`
+# ANYWHERE — grepping the raw log found the string exactly once, inside the
+# briefing's own instructions, never in an assistant message. That is a
+# DIFFERENT failure signature from #1348's "marker present but malformed"
+# (e.g. a bolded `**REVIEW_VERDICT:**`): here the model followed the *tail*
+# of the required format while dropping the *header* that carries the data
+# entirely, rather than attempting the header and getting the syntax wrong.
+# `detect_unparsed_review_marker` cannot see this case at all — it only
+# fires when a `REVIEW_VERDICT:` marker exists to detect.
+
+@dataclass
+class EndReviewWithoutVerdict:
+    """Diagnostic returned when *text* has an ``END_REVIEW`` terminator but
+    NO ``REVIEW_VERDICT:`` marker anywhere (#1956 ask 3).
+
+    Distinguishing this from a crashed/truncated session (which never
+    reaches ``END_REVIEW`` at all — nothing to recover) matters
+    operationally: a session that wrote ``END_REVIEW`` almost certainly
+    reached a real verdict, it just never printed the machine-readable
+    header for it. The verdict is very likely recoverable from ``excerpt``
+    (the prose immediately before ``END_REVIEW``) by an operator reading it
+    and re-running ``coord report-result --assignment <id> --verdict
+    <approve|request-changes> --verdict-source recovered --verdict-reason
+    "..." --body-file <extracted-review.md>``.
+
+    **Diagnostic only — never a parser, same contract as
+    :func:`detect_unparsed_review_marker`.** MUST NOT be used to
+    auto-record a verdict, and must only be called AFTER
+    :func:`parse_review_from_log` / :func:`_parse_review_text` has already
+    returned ``None`` for this same text.
+    """
+
+    excerpt: str
+    transcript_path: str | None = None
+    host: str | None = None
+
+
+_END_REVIEW_DETECT_RE = re.compile(rf"{_MD}END_REVIEW{_MD}", re.IGNORECASE)
+
+
+def detect_end_review_without_verdict(
+    text: str,
+    *,
+    transcript_path: str | None = None,
+    host: str | None = None,
+) -> EndReviewWithoutVerdict | None:
+    """Return diagnostic info when *text* has ``END_REVIEW`` but no
+    ``REVIEW_VERDICT:`` marker at all (#1956 ask 3).
+
+    *text* is decoded via :func:`_decode_transcript_for_diagnostic` first,
+    exactly like the strict parser and :func:`detect_unparsed_review_marker`
+    — see that function's docstring for why (stream-json newline-escaping,
+    and excluding the non-JSON argv/header comment line whose embedded
+    system-prompt TEMPLATE would otherwise spuriously contain both markers).
+
+    Returns ``None`` when:
+
+    * No ``END_REVIEW`` terminator is present at all — this is NOT the
+      #1956 signature; a session that never reached ``END_REVIEW`` more
+      likely crashed or was truncated, a different failure with a different
+      (probably unrecoverable) remedy.
+    * A ``REVIEW_VERDICT:`` marker IS present somewhere, even a malformed
+      one — that is :func:`detect_unparsed_review_marker`'s territory: the
+      header was ATTEMPTED (and rejected), not omitted entirely. The two
+      diagnostics are mutually exclusive by construction.
+    * The strict parse actually SUCCEEDED on this same text — defensive
+      guard mirroring :func:`detect_unparsed_review_marker`, so a caller
+      that forgets the "call after strict-parse" contract never
+      double-reports.
+
+    The excerpt is the text immediately BEFORE the LAST ``END_REVIEW`` line
+    (a reviewer that second-guesses itself mid-session writes the real one
+    last — same convention as :func:`_parse_review_text`'s ``matches[-1]``),
+    capped at :data:`_DIAGNOSTIC_EXCERPT_MAX` chars — there's no
+    ``REVIEW_VERDICT:``/``REVIEW_BODY:`` line to anchor on instead, since by
+    definition neither exists in *text*.
+    """
+    decoded = _decode_transcript_for_diagnostic(text)
+    search_text = text if decoded is None else decoded
+
+    if _REVIEW_MARKER_DETECT_RE.search(search_text):
+        return None  # a REVIEW_VERDICT: marker exists — different diagnostic
+    matches = list(_END_REVIEW_DETECT_RE.finditer(search_text))
+    if not matches:
+        return None
+    if _REVIEW_BLOCK_RE.search(search_text):
+        return None  # strict parse actually succeeded — never double-report
+
+    m = matches[-1]
+    end = m.start()
+    start = max(0, end - _DIAGNOSTIC_EXCERPT_MAX)
+    excerpt = search_text[start:end].strip()
+    return EndReviewWithoutVerdict(
+        excerpt=excerpt,
+        transcript_path=transcript_path,
+        host=host,
+    )
+
+
 # ── #248: machine-readable review header ────────────────────────────────────
 #
 # When the coordinator posts a review comment back to GitHub it prepends a

@@ -154,6 +154,10 @@ def row_to_assignment(row: object) -> Assignment:
         # #1499: durable drive provenance; None for a hand `coord assign`
         # and for rows predating this column.
         driven_by=d.get("driven_by"),
+        # #1956: verdict provenance; None (→ treated as "agent") for every
+        # row predating this column and for a normally-parsed verdict.
+        verdict_source=d.get("verdict_source"),
+        verdict_source_reason=d.get("verdict_source_reason"),
     )
 
 

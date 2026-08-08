@@ -407,6 +407,52 @@ class TestDecision:
         assert by_gate["test"].required is False
         assert by_gate["merge"].ok is True
 
+    def test_review_verdict_unparseable_reported_distinctly(self, config: Config) -> None:
+        """#1956: a review row that finished (status='done') with NO
+        parseable verdict must be reported distinctly from a review that
+        simply hasn't run yet (test_review_not_approved_blocks_merge above)
+        — needs operator recovery, not another dispatched review."""
+        work = _work(test_state="passed")
+        review = _review("w1", verdict=None)  # status="done" per `_review`'s default
+        board = Board(active=[], completed=[work, review])
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+
+        by_gate = {d.gate: d for d in report.decisions}
+        assert by_gate["review"].ok is False
+        assert by_gate["review"].verdict_unparseable is True
+        assert "r1" in by_gate["review"].reason
+        assert "coord report-result" in by_gate["review"].reason
+        assert "--verdict-source recovered" in by_gate["review"].reason
+        assert by_gate["merge"].ok is False
+        assert by_gate["merge"].reason == REVIEW_REQUIRED
+
+    def test_review_not_approved_without_verdict_row_is_not_unparseable(
+        self, config: Config,
+    ) -> None:
+        """The ordinary 'no review dispatched at all' case (no review row on
+        the board) must NOT be misreported as verdict_unparseable — that flag
+        is specifically for a review row that FINISHED with a NULL verdict."""
+        work = _work(test_state="passed")
+        board = Board(active=[], completed=[work])  # no review row at all
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+
+        by_gate = {d.gate: d for d in report.decisions}
+        assert by_gate["review"].ok is False
+        assert by_gate["review"].verdict_unparseable is False
+        assert by_gate["review"].reason == "review required but not approved"
+
+    def test_review_request_changes_is_not_unparseable(self, config: Config) -> None:
+        """A review that genuinely requested changes (a real, present verdict)
+        must not be misreported as the #1956 defect either."""
+        work = _work(test_state="passed")
+        review = _review("w1", verdict="request-changes")
+        board = Board(active=[], completed=[work, review])
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+
+        by_gate = {d.gate: d for d in report.decisions}
+        assert by_gate["review"].ok is False
+        assert by_gate["review"].verdict_unparseable is False
+
     def test_gh_ops_none_skips_live_lookups_fail_open(self, config: Config) -> None:
         # #1479-review: without gh_ops, the staleness comparison has no live
         # SHAs to compare against — the recorded verdict is trusted as-is
@@ -465,6 +511,45 @@ class TestFormatting:
         assert "oldbase"[:7] in text
         assert "newbase"[:7] in text
         assert "BLOCKED" in text
+
+    def test_format_shows_error_not_blocked_for_unparseable_verdict(
+        self, config: Config,
+    ) -> None:
+        """#1956: rendered as 'ERROR', never 'BLOCKED' — 'BLOCKED' reads
+        identically to 'not yet reviewed'/'requested changes', exactly the
+        ambiguity #1956 reports."""
+        work = _work(test_state="passed")
+        review = _review("w1", verdict=None)
+        board = Board(active=[], completed=[work, review])
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+
+        text = format_gate_report(report)
+        assert "review : ERROR" in text
+        assert "review : BLOCKED" not in text
+        assert "coord report-result" in text
+
+    def test_format_shows_verdict_source_when_present(self, config: Config) -> None:
+        work = _work(test_state="passed")
+        review = _review("w1", verdict="approve")
+        review.verdict_source = "recovered"
+        review.verdict_source_reason = "REVIEW_VERDICT header missing, recovered from transcript"
+        board = Board(active=[], completed=[work, review])
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+
+        text = format_gate_report(report)
+        assert "verdict_source=recovered" in text
+        assert "recovered from transcript" in text
+
+    def test_format_omits_verdict_source_line_when_none(self, config: Config) -> None:
+        """The overwhelming common case (verdict_source=None, meaning
+        'agent') must not print noise on every ordinary row."""
+        work = _work(test_state="passed")
+        review = _review("w1", verdict="approve")
+        board = Board(active=[], completed=[work, review])
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+
+        text = format_gate_report(report)
+        assert "verdict_source" not in text
 
     def test_format_shows_toolchain_and_falls_back_to_unknown(self, config: Config) -> None:
         with_toolchain = _work(test_state="passed", test_toolchain="rustc 1.95.0")

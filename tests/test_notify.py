@@ -452,6 +452,61 @@ class TestReviewNotify:
         assert "could not be extracted" in body
         assert "REVIEW_VERDICT" in body
 
+    def test_review_fallback_end_review_without_verdict_is_not_silent(
+        self, coord_dir: Path, config: Config, tmp_path: Path, caplog
+    ) -> None:
+        """#1956: a reviewer that writes a full body + END_REVIEW but NEVER
+        emits REVIEW_VERDICT: (quadraui#533's live shape — grepping the raw
+        log found the string exactly once, inside the briefing template, not
+        in any assistant message) must NOT fall back to the same generic
+        "could not be extracted" message as a genuinely empty/crashed log.
+        This is a distinct, more actionable signature: the verdict is very
+        likely recoverable from the transcript.
+        """
+        import logging
+
+        _record_review_assignment("rev5", review_target="88")
+        log = tmp_path / "no_header.log"
+        log.write_text(
+            "## Review: PR #536\n\n"
+            "I read the whole diff carefully.\n\n"
+            "## Blocking findings\n\nNone.\n\n"
+            "## Non-blocking concerns\n\nNone.\n\n"
+            "## Nits\n\nNone.\n\n"
+            "This looks good to merge.\n"
+            "END_REVIEW\n",
+            encoding="utf-8",
+        )
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("rev5", "done", log_path=str(log))],
+        }
+        with caplog.at_level(logging.WARNING, logger="coord.notify"), \
+             patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.notify.github_ops.post_pr_review") as mock_review, \
+             patch("coord.dispatch.github_ops.post_issue_comment") as mock_post:
+            posted, _stuck, _attn, _stalled = notify_mod.run(config)
+
+        assert len(posted) == 1
+        mock_review.assert_not_called()
+        mock_post.assert_called_once()
+        body = mock_post.call_args.args[2]
+        # Distinct from the generic "could not be extracted" message.
+        assert "could not be extracted" not in body
+        assert "1956" in body
+        assert "coord report-result" in body
+        assert "--verdict-source recovered" in body
+        # Loud in the log too, not just on GitHub.
+        assert any("1956" in r.message for r in caplog.records)
+        assert any("END_REVIEW" in r.message for r in caplog.records)
+        # The row still lands terminal (this fix does not invent a new
+        # status) — but coord.gates (tested separately) now reports this
+        # distinctly instead of identically to "not yet reviewed".
+        board = state_mod.build_board()
+        row = next(a for a in board.completed if a.assignment_id == "rev5")
+        assert row.status == "done"
+        assert row.review_verdict is None
+
     def test_review_fallback_when_no_log_path(
         self, coord_dir: Path, config: Config
     ) -> None:

@@ -604,6 +604,115 @@ class TestPostResult:
         ).fetchone()
         assert row["review_verdict"] == "approve"
 
+    # ── #1956: verdict provenance ────────────────────────────────────────────
+
+    def test_verdict_source_defaults_to_agent(self) -> None:
+        """The overwhelming common case — an agent self-reporting its own
+        session's verdict — must record verdict_source='agent' even though
+        the caller never mentioned provenance at all."""
+        _seed_running_assignment("aid-rev-agent", assignment_type="review")
+        with patch("coord.github_ops.post_issue_comment"):
+            issue_store.post_result(
+                issue_store.ResultRecord(
+                    assignment_id="aid-rev-agent",
+                    machine_name="laptop",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=7,
+                    status="done",
+                    verdict="approve",
+                    summary="LGTM",
+                )
+            )
+        row = state_mod.get_connection().execute(
+            "SELECT verdict_source, verdict_source_reason FROM assignments WHERE assignment_id=?",
+            ("aid-rev-agent",),
+        ).fetchone()
+        assert row["verdict_source"] == "agent"
+        assert row["verdict_source_reason"] is None
+
+    def test_verdict_source_recovered_is_persisted_with_reason(self) -> None:
+        _seed_running_assignment("aid-rev-recovered", assignment_type="review")
+        with patch("coord.github_ops.post_issue_comment"):
+            issue_store.post_result(
+                issue_store.ResultRecord(
+                    assignment_id="aid-rev-recovered",
+                    machine_name="laptop",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=7,
+                    status="done",
+                    verdict="approve",
+                    summary="LGTM",
+                    verdict_source="recovered",
+                    verdict_source_reason="REVIEW_VERDICT header missing, recovered from transcript",
+                )
+            )
+        row = state_mod.get_connection().execute(
+            "SELECT verdict_source, verdict_source_reason FROM assignments WHERE assignment_id=?",
+            ("aid-rev-recovered",),
+        ).fetchone()
+        assert row["verdict_source"] == "recovered"
+        assert row["verdict_source_reason"] == (
+            "REVIEW_VERDICT header missing, recovered from transcript"
+        )
+
+    def test_verdict_source_recovered_without_reason_is_refused(self) -> None:
+        """#1956 keystone invariant: a relayed verdict with no stated reason
+        is indistinguishable from an agent-produced one — refuse it at the
+        write seam, mirroring #617's empty-findings refusal."""
+        _seed_running_assignment("aid-rev-norsn", assignment_type="review")
+        with pytest.raises(ValueError, match="verdict_source_reason"):
+            issue_store.post_result(
+                issue_store.ResultRecord(
+                    assignment_id="aid-rev-norsn",
+                    machine_name="laptop",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=7,
+                    status="done",
+                    verdict="approve",
+                    summary="LGTM",
+                    verdict_source="recovered",
+                    verdict_source_reason=None,
+                )
+            )
+
+    def test_verdict_source_overridden_without_reason_is_refused(self) -> None:
+        _seed_running_assignment("aid-rev-noreason2", assignment_type="review")
+        with pytest.raises(ValueError, match="verdict_source_reason"):
+            issue_store.post_result(
+                issue_store.ResultRecord(
+                    assignment_id="aid-rev-noreason2",
+                    machine_name="laptop",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=7,
+                    status="done",
+                    verdict="approve",
+                    summary="approving despite the reviewer",
+                    verdict_source="overridden",
+                    verdict_source_reason="   ",  # blank after strip
+                )
+            )
+
+    def test_invalid_verdict_source_is_refused(self) -> None:
+        _seed_running_assignment("aid-rev-badsrc", assignment_type="review")
+        with pytest.raises(ValueError, match="invalid verdict_source"):
+            issue_store.post_result(
+                issue_store.ResultRecord(
+                    assignment_id="aid-rev-badsrc",
+                    machine_name="laptop",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=7,
+                    status="done",
+                    verdict="approve",
+                    summary="LGTM",
+                    verdict_source="made-up-value",
+                )
+            )
+
     # ── #990: verdict write must not silently no-op ─────────────────────────
     #
     # These exercise `_persist_review_verdict` directly (rather than going
@@ -1085,6 +1194,75 @@ class TestReportResultCli:
         assert row["review_verdict"] == "request-changes"
         # The body is persisted (not silently discarded).
         assert row["review_findings"] and "foo.rs:10" in row["review_findings"]
+
+    def test_review_verdict_source_recovered_recorded(self, config_file: Path) -> None:
+        """#1956: `--verdict-source recovered --verdict-reason ...` on the
+        CLI is threaded through to the DB, distinguishing an operator's
+        transcript recovery from an ordinary agent self-report."""
+        _seed_running_assignment("cli-5", assignment_type="review")
+        with patch("coord.github_ops.post_issue_comment"):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "report-result",
+                    "--assignment", "cli-5",
+                    "--status", "done",
+                    "--verdict", "approve",
+                    "--summary", "recovered from transcript",
+                    "--verdict-source", "recovered",
+                    "--verdict-reason", "REVIEW_VERDICT header missing (#1956)",
+                    "--config", str(config_file),
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        row = state_mod.get_connection().execute(
+            "SELECT review_verdict, verdict_source, verdict_source_reason "
+            "FROM assignments WHERE assignment_id=?",
+            ("cli-5",),
+        ).fetchone()
+        assert row["review_verdict"] == "approve"
+        assert row["verdict_source"] == "recovered"
+        assert row["verdict_source_reason"] == "REVIEW_VERDICT header missing (#1956)"
+
+    def test_review_verdict_source_without_reason_refused_by_cli(
+        self, config_file: Path,
+    ) -> None:
+        """Fast client-side feedback (before any board/network round trip) —
+        mirrors the server-side issue_store._validate_result refusal."""
+        _seed_running_assignment("cli-6", assignment_type="review")
+        result = CliRunner().invoke(
+            main,
+            [
+                "report-result",
+                "--assignment", "cli-6",
+                "--status", "done",
+                "--verdict", "approve",
+                "--summary", "override",
+                "--verdict-source", "overridden",
+                "--config", str(config_file),
+            ],
+        )
+        assert result.exit_code != 0
+        assert "--verdict-reason" in result.output
+
+    def test_verdict_source_without_verdict_refused_by_cli(
+        self, config_file: Path,
+    ) -> None:
+        _seed_running_assignment("cli-7")
+        result = CliRunner().invoke(
+            main,
+            [
+                "report-result",
+                "--assignment", "cli-7",
+                "--status", "done",
+                "--summary", "no verdict here",
+                "--verdict-source", "recovered",
+                "--verdict-reason", "n/a",
+                "--config", str(config_file),
+            ],
+        )
+        assert result.exit_code != 0
+        assert "--verdict-source" in result.output
 
     def test_verdict_persist_failure_exits_nonzero(self, config_file: Path) -> None:
         """#990: if the verdict write can't be durably confirmed (retries
