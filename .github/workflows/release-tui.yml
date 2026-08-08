@@ -74,19 +74,36 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # `best_effort: false` legs are the acceptance bar ("assets for at
+          # least linux + macOS") — a failure there should still fail this
+          # job and block the release, same as before.
           - target_name: x86_64-linux
             os: ubuntu-latest
             bin_ext: ""
+            best_effort: false
           - target_name: x86_64-macos
             os: macos-13
             bin_ext: ""
+            best_effort: false
           - target_name: aarch64-macos
             os: macos-14
             bin_ext: ""
+            best_effort: false
+          # Windows is not part of the stated acceptance bar. `best_effort:
+          # true` (via the job-level `continue-on-error` below) means a
+          # Windows-only failure — e.g. a native-dep hiccup in rusqlite's
+          # bundled build or portable-pty — no longer marks the whole
+          # `build` job failed, which would otherwise block `release` and
+          # withhold the already-successful linux/macOS artifacts too.
           - target_name: x86_64-windows
             os: windows-latest
             bin_ext: ".exe"
+            best_effort: true
     runs-on: ${{ matrix.os }}
+    # See the `best_effort` matrix comment above: only the Windows leg opts
+    # into tolerating its own failure without failing the overall `build`
+    # job (and therefore blocking `release`, which `needs: [build]`).
+    continue-on-error: ${{ matrix.best_effort }}
     steps:
       - uses: actions/checkout@v4
 
@@ -112,8 +129,18 @@ jobs:
       - name: Resolve release version
         id: version
         shell: bash
+        # `FAKE_TAG`/`REF_NAME` come in via `env:` rather than being spliced
+        # directly into this script (the standard `${{ }}`-in-`run:`
+        # anti-pattern) — `github.event.inputs.fake_tag` is
+        # `workflow_dispatch` input text, and even though triggering that
+        # dispatch already requires repo write access, passing it through an
+        # env var instead of interpolating it into the shell script avoids
+        # arbitrary text being spliced into (and executed as) bash.
+        env:
+          FAKE_TAG: ${{ github.event.inputs.fake_tag }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          tag="${{ github.event.inputs.fake_tag || github.ref_name }}"
+          tag="${FAKE_TAG:-$REF_NAME}"
           version="${tag#v}"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
