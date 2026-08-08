@@ -17,7 +17,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from coord import __version__
+from coord import __version__, agent_update
 from coord.agent import RUNNING, PENDING, AgentAssignment, AgentServer, AssignmentSpec
 from coord.events import stream_assignment_log
 from coord.openapi import build_spec, dataclass_schema, openapi_and_docs_routes
@@ -28,6 +28,17 @@ from coord.openapi import build_spec, dataclass_schema, openapi_and_docs_routes
 #: a bare `claude-coordinator` upgrade would, on a fresh venv, leave the agent
 #: without starlette/uvicorn and dead on the next restart.
 AGENT_PKG_NAME = "claude-coordinator[server]"
+
+
+def _venv_dir() -> Path:
+    """Root of the venv `coord agent update` swaps blue/green (#1241).
+
+    Overridable via `COORD_VENV_DIR` (tests, non-default installs);
+    defaults to `~/.coord-venv` — the path `install-agent.sh` creates and
+    every `deploy/coord-*.service` unit hardcodes as `ExecStart`'s venv.
+    """
+    override = os.environ.get("COORD_VENV_DIR")
+    return Path(override) if override else Path.home() / ".coord-venv"
 
 
 def _installed_version() -> str | None:
@@ -119,14 +130,29 @@ def _default_exec_restart(argv: list[str]) -> None:
     #404 / #1886: a bare ``os.execv`` doesn't take under systemd (same
     PID, stale code), and nothing used to detect it. Under systemd, ask
     systemd to restart the unit instead — the mechanism actually known to
-    work — and let this process exit; falls back to ``os.execv`` (using
-    ``sys.executable`` so it works whether *coord* was invoked as a
-    console-script entry-point or via ``python -m coord``) when not under
-    systemd, or if handing off to systemctl itself failed to launch.
+    work — and let this process exit; that also re-runs `ExecStart`
+    through `~/.coord-venv` fresh, which is what makes a #1241 blue/green
+    swap actually take effect (see below).
+
+    #1241: falls back to ``os.execv`` using the *current* `~/.coord-venv`
+    symlink's python, re-resolved right now — NOT ``sys.executable``.
+    ``sys.executable`` is the literal interpreter path baked into this
+    process's own venv *slot* at the time it started (e.g.
+    ``~/.coord-venv.blue/bin/python3``, from that slot's own shebang line)
+    and stays pinned to that slot for the process's whole life, even after
+    a blue/green swap flips the symlink onto the other slot. Re-exec'ing
+    with it would silently keep running the OLD slot forever — the process
+    "restarts" but never advances. Resolving through the symlink instead
+    picks up whichever slot is live *right now*. Falls back to
+    ``sys.executable`` when there's no such venv at all (dev/editable
+    installs not using the blue/green layout), preserving the pre-#1241
+    behaviour there.
     """
     if _running_under_systemd() and _restart_via_systemctl():
         os._exit(0)
-    os.execv(sys.executable, [sys.executable] + argv)
+    venv_python = _venv_dir() / "bin" / "python"
+    executable = str(venv_python) if venv_python.exists() else sys.executable
+    os.execv(executable, [executable] + argv)
 
 
 def _detect_install_mode() -> tuple[bool, str | None]:
@@ -296,6 +322,16 @@ def _openapi_spec() -> dict:
             "post": {
                 "summary": "Upgrade the installed package and restart the agent process",
                 "responses": {"202": {"description": "Updating"}},
+            }
+        },
+        "/rollback": {
+            "post": {
+                "summary": "Roll back to the previous blue/green venv generation and restart",
+                "responses": {
+                    "202": {"description": "Rolling back"},
+                    "404": {"description": "No previous generation to roll back to"},
+                    "409": {"description": "Live sessions running; pass force=true"},
+                },
             }
         },
         "/restart": {
@@ -579,35 +615,62 @@ def build_app(
         )
 
     async def update(request: Request) -> JSONResponse:
-        """Upgrade the package and restart the agent process.
+        """Atomically install the target version and restart the agent (#1241).
 
-        Detects whether the install is editable (``pip install -e .``) and
-        runs ``git pull --ff-only`` in the project directory in that case.
-        For regular installs it runs ``pip install --upgrade
-        claude-coordinator[server]`` (#1237 — the extra is mandatory on an
-        agent; see :data:`AGENT_PKG_NAME`).
-        Either way the process is restarted with ``os.execv`` after the upgrade
-        succeeds.  The upgrade and restart run in a daemon-less background
-        thread so the HTTP response is returned to the caller before the
-        process is replaced.
+        Installs into a *fresh* venv slot next to the live one, smoke-checks
+        it, then atomically flips ``~/.coord-venv`` onto it — see
+        :mod:`coord.agent_update` for why an in-place ``pip install
+        --upgrade`` isn't safe (it can leave a concurrent ``coord``
+        invocation observing a half-written ``site-packages``). The process
+        is restarted with ``exec_restart`` after a successful swap. Both the
+        install and the restart run in a daemon-less background thread so
+        the HTTP response reaches the caller before the process is
+        replaced.
+
+        Refuses outright — HTTP 409, nothing touched, no restart — rather
+        than acting, in two cases:
+
+        - **Editable install** (``pip install -e .``): ``~/.coord-venv``
+          must stay a PyPI install (mirrors ``coord.health.checks.
+          agent_install``'s ``agent_venv`` check). An editable checkout is
+          reported as drift, never silently ``git pull``ed — the operator
+          switches it back by hand (see ``docs/AGENT_OPERATIONS.md``'s
+          editable → PyPI section).
+        - **Live sessions**: when this agent has active (RUNNING/PENDING)
+          assignments and the caller didn't pass ``{"force": true}`` — the
+          restart-after-swap kills any in-flight worker, the same "never
+          restart during live sessions" operator rule ``/restart`` already
+          documents, now enforced here too.
 
         Request body (JSON, optional)::
 
-            {"target_version": "0.4.85"}
+            {"target_version": "0.4.85", "force": false}
 
         #1568: when the caller (``coord agent update``) knows exactly which
-        release it's asking for, it passes ``target_version``.  For a
-        non-editable install this pins the pip install to that exact
-        version (``claude-coordinator==0.4.85``) instead of the bare
-        ``--upgrade``, so a stale PyPI index/cache produces a loud pip
-        failure ("no matching distribution") rather than a silent no-op
-        that pip reports as success.  ``target_version`` is also echoed
-        back in ``last_update`` so ``/health`` lets the caller verify the
-        upgrade actually landed rather than inferring success from the
-        POST being accepted or the process merely answering pings again.
+        release it's asking for, it passes ``target_version``, pinning the
+        pip install to that exact version rather than a bare ``--upgrade``
+        so a stale PyPI index/cache produces a loud pip failure ("no
+        matching distribution") instead of a silent no-op. ``target_version``
+        is echoed back in ``last_update`` so ``/health`` lets the caller
+        verify the upgrade actually landed.
         """
         is_editable, project_path = _detect_install_mode()
-        mode = "editable (git pull)" if is_editable else "pip install --upgrade"
+        if is_editable:
+            payload = {
+                "mode": "editable (refused)",
+                "started_at": time.time(),
+                "finished_at": time.time(),
+                "result": "refused",
+                "error": (
+                    f"editable install detected at {project_path!r} — "
+                    "refusing to touch it automatically (#1241: "
+                    "~/.coord-venv must stay a PyPI install). Switch it "
+                    "back by hand — see docs/AGENT_OPERATIONS.md's "
+                    "editable → PyPI section — then retry."
+                ),
+            }
+            _write_last_update(server.state_dir, payload)
+            return JSONResponse(payload, status_code=409)
 
         body: dict = {}
         try:
@@ -617,8 +680,35 @@ def build_app(
         if not isinstance(body, dict):
             body = {}
         target_version = body.get("target_version") or None
+        force = bool(body.get("force"))
 
-        # Capture argv now — os.execv replaces the process later.
+        with server._lock:
+            active_count = sum(
+                1
+                for a in server._assignments.values()
+                if a.status in (PENDING, RUNNING)
+            )
+        if active_count and not force:
+            payload = {
+                "mode": "pip install (blue/green)",
+                "started_at": time.time(),
+                "finished_at": time.time(),
+                "target_version": target_version,
+                "result": "refused",
+                "error": (
+                    f"{active_count} active assignment(s) running — "
+                    "updating restarts the process and kills them "
+                    'mid-flight. Pass {"force": true} (CLI: `coord agent '
+                    "update --force`) to update anyway, or wait for them "
+                    "to finish."
+                ),
+            }
+            _write_last_update(server.state_dir, payload)
+            return JSONResponse(payload, status_code=409)
+
+        mode = "pip install (blue/green)"
+
+        # Capture argv now — exec_restart replaces the process later.
         saved_argv = list(sys.argv)
         state_dir = server.state_dir
 
@@ -636,77 +726,54 @@ def build_app(
                 "log_excerpt": "",
             }
             try:
-                if is_editable and project_path:
-                    result = subprocess.run(
-                        ["git", "pull", "--ff-only"],
-                        cwd=project_path,
-                        capture_output=True,
-                        text=True,
-                        timeout=60,
-                    )
-                else:
-                    # --no-cache-dir bypasses pip's local wheel cache, which
-                    # has caused stale-version resolutions on at least one
-                    # machine (PyPI metadata races with `pip install --upgrade`).
-                    # Pinning to target_version (when the caller supplied one)
-                    # turns "PyPI hasn't propagated yet" into a hard pip
-                    # failure instead of a quiet resolve-to-old-version.
-                    pkg_spec = (
-                        f"{AGENT_PKG_NAME}=={target_version}"
-                        if target_version
-                        else AGENT_PKG_NAME
-                    )
-                    result = subprocess.run(
-                        [
-                            sys.executable, "-m", "pip", "install",
-                            "--upgrade", "--no-cache-dir",
-                            pkg_spec,
-                        ],
-                        capture_output=True,
-                        text=True,
-                        timeout=180,
-                    )
+                venv_dir = _venv_dir()
+                result = agent_update.perform_update(
+                    venv_dir, AGENT_PKG_NAME, target_version=target_version,
+                )
                 payload["finished_at"] = time.time()
-                # Persist the full pip/git output to a log file so the
-                # user can read it after the agent restarts.
+                # Persist the full venv/pip/smoke-check transcript to a log
+                # file so the user can read it after the agent restarts.
                 log_path = state_dir / "last_update.log"
                 try:
                     log_path.parent.mkdir(parents=True, exist_ok=True)
                     log_path.write_text(
                         f"# mode: {mode}\n"
-                        f"# returncode: {result.returncode}\n"
-                        f"# argv: {result.args}\n\n"
-                        f"--- stdout ---\n{result.stdout}\n"
-                        f"--- stderr ---\n{result.stderr}\n"
+                        f"# venv_dir: {venv_dir}\n"
+                        f"# ok: {result.ok}  swapped: {result.swapped}\n"
+                        f"# slot: {result.slot}  previous_slot: {result.previous_slot}\n\n"
+                        f"{result.log}\n"
                     )
                 except Exception:  # noqa: BLE001
                     pass
                 # Keep a short excerpt inline so it appears in /health.
-                tail = (result.stderr or result.stdout or "").splitlines()
+                tail = (result.log or "").splitlines()
                 payload["log_excerpt"] = "\n".join(tail[-20:])
 
-                if result.returncode != 0:
-                    payload["error"] = (
-                        f"upgrade exited {result.returncode}; see "
-                        f"~/.coord/last_update.log on this machine"
+                if not result.ok:
+                    payload["error"] = result.error or (
+                        "blue/green update failed; see "
+                        "~/.coord/last_update.log on this machine"
                     )
                     _write_last_update(state_dir, payload)
                     return
 
-                # Resolve what's installed now so we can report a delta and
-                # skip restarting if nothing actually changed.
-                version_after = _installed_version() or "unknown"
+                # #1241: prefer the version the smoke check already read
+                # straight from the new slot (deterministic, no reliance on
+                # this process's own site-packages resolution having
+                # noticed the symlink flip yet) — fall back to a fresh
+                # in-process read only if that's somehow missing.
+                version_after = result.new_version or _installed_version() or "unknown"
                 payload["version_after"] = version_after
-                if version_after == version_before and not is_editable:
-                    # Nothing to do — pip reported success but resolved to
-                    # the same version. Common cause: PyPI hasn't propagated
-                    # the new release yet, or the package isn't on the index
-                    # the venv's pip is pointed at.
+                if version_after == version_before:
+                    # Swap "succeeded" but landed on the same version —
+                    # shouldn't happen (the smoke check already verified
+                    # target_version when one was given) but don't restart
+                    # into a no-op.
                     payload["result"] = "no_change"
                     payload["error"] = (
-                        f"pip resolved to {version_after} (same as installed). "
-                        "PyPI may not have propagated the new release yet, or "
-                        "this venv's pip is pointed at a different index."
+                        f"swap completed but resolved to {version_after} "
+                        "(same as before) — unexpected for a successful "
+                        "blue/green update"
                     )
                     _write_last_update(state_dir, payload)
                     return
@@ -723,6 +790,91 @@ def build_app(
 
         threading.Thread(target=_do_update, daemon=False, name="agent-update").start()
         return JSONResponse({"status": "updating", "mode": mode}, status_code=202)
+
+    async def rollback(request: Request) -> JSONResponse:
+        """Flip ``~/.coord-venv`` back onto the previous blue/green
+        generation and restart (#1241).
+
+        Every successful ``/update`` keeps exactly one prior generation on
+        disk (see :mod:`coord.agent_update`) precisely so this exists.
+        Refuses — 404, nothing touched — when there's no previous
+        generation (e.g. this machine has never run a blue/green
+        ``/update``), and 409 (same as ``/update``, same ``{"force":
+        true}`` override) when live sessions are running.
+
+        Request body (JSON, optional)::
+
+            {"force": false}
+        """
+        body: dict = {}
+        try:
+            body = await request.json()
+        except Exception:
+            pass
+        if not isinstance(body, dict):
+            body = {}
+        force = bool(body.get("force"))
+
+        with server._lock:
+            active_count = sum(
+                1
+                for a in server._assignments.values()
+                if a.status in (PENDING, RUNNING)
+            )
+        if active_count and not force:
+            payload = {
+                "mode": "rollback",
+                "started_at": time.time(),
+                "finished_at": time.time(),
+                "result": "refused",
+                "error": (
+                    f"{active_count} active assignment(s) running — rolling "
+                    "back restarts the process and kills them mid-flight. "
+                    'Pass {"force": true} to roll back anyway, or wait for '
+                    "them to finish."
+                ),
+            }
+            _write_last_update(server.state_dir, payload)
+            return JSONResponse(payload, status_code=409)
+
+        venv_dir = _venv_dir()
+        version_before = _installed_version() or "unknown"
+        result = agent_update.rollback(venv_dir)
+        if not result.ok:
+            payload = {
+                "mode": "rollback",
+                "started_at": time.time(),
+                "finished_at": time.time(),
+                "version_before": version_before,
+                "result": "failed",
+                "error": result.error,
+                "log_excerpt": "\n".join((result.log or "").splitlines()[-20:]),
+            }
+            _write_last_update(server.state_dir, payload)
+            return JSONResponse(payload, status_code=404 if "no previous generation" in (result.error or "") else 500)
+
+        saved_argv = list(sys.argv)
+        state_dir = server.state_dir
+
+        def _do_rollback() -> None:
+            payload = {
+                "mode": "rollback",
+                "started_at": time.time(),
+                "finished_at": time.time(),
+                "version_before": version_before,
+                "version_after": result.new_version or "unknown",
+                "result": "upgraded",
+                "error": None,
+                "log_excerpt": "\n".join((result.log or "").splitlines()[-20:]),
+            }
+            _write_last_update(state_dir, payload)
+            time.sleep(0.5)
+            exec_restart(saved_argv)
+
+        threading.Thread(target=_do_rollback, daemon=False, name="agent-rollback").start()
+        return JSONResponse(
+            {"status": "rolling back", "slot": str(result.slot)}, status_code=202
+        )
 
     async def artifact_manifest(request: Request) -> JSONResponse:
         """Return a JSON manifest of stashed artifacts for a (repo, branch) pair.
@@ -906,6 +1058,7 @@ def build_app(
         Route("/logs/{id}", logs, methods=["GET"]),
         Route("/stream/{id}", stream, methods=["GET"]),
         Route("/update", update, methods=["POST"]),
+        Route("/rollback", rollback, methods=["POST"]),
         Route("/restart", restart, methods=["POST"]),
         Route("/worktree-clean", worktree_clean, methods=["POST"]),
         # #305: artifact stash manifest (GET /artifact/<repo>/<branch>)
