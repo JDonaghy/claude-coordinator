@@ -2491,20 +2491,13 @@ impl CoordApp {
                     Key::Char('j') | Key::Named(NamedKey::Down)
                         if self.active_view == SidebarView::Reports =>
                     {
-                        let n = self.reports_catalogue().len();
-                        if n > 0 {
-                            self.reports_sel = (self.reports_sel + 1).min(n - 1);
-                        }
-                        self.reports_field_sel = 0;
-                        self.reports_clamp_field_sel();
+                        self.reports_move_selection(1);
                         needs_redraw = true;
                     }
                     Key::Char('k') | Key::Named(NamedKey::Up)
                         if self.active_view == SidebarView::Reports =>
                     {
-                        self.reports_sel = self.reports_sel.saturating_sub(1);
-                        self.reports_field_sel = 0;
-                        self.reports_clamp_field_sel();
+                        self.reports_move_selection(-1);
                         needs_redraw = true;
                     }
                     // Space toggles the selected section's collapse; Enter
@@ -5302,9 +5295,61 @@ impl CoordApp {
             // #1039: Audit sidebar is a placeholder (count + badge only);
             // the entry list lives in the main panel (`mouse_main_click`).
             SidebarView::Audit => false,
-            // #1741: Reports sidebar is a summary (catalogue size + last-run
-            // line); the section stack lives in the main panel.
-            SidebarView::Reports => false,
+            // #1911: Reports sidebar — the section stack (parameters + Run)
+            // moved here from the main panel. Routing goes through the
+            // reusable `MsvLayoutCache` (`app/msv.rs`), which hit-tests the
+            // exact layout `render_reports_sidebar` painted and, for a click
+            // inside a section body, descends into that body's own `Form`
+            // layout (in form-local coordinates). A header hit toggles
+            // collapse; a field hit is applied by
+            // `reports_apply_field_click` (segmented option → set the
+            // value, Run → fire the run, text → focus it). `Outside` can't
+            // occur for a click routed here at all (the sidebar has nothing
+            // below the stack) but is handled the same as `Inert` rather
+            // than assumed unreachable.
+            //
+            // Nothing here knows what any parameter means — that is the
+            // whole point of the panel, and it is why the routing could be
+            // lifted out report-agnostic for #571's later consumers.
+            SidebarView::Reports => {
+                let route = self.reports_layout.borrow().route_click(pos);
+                match route {
+                    MsvClick::ToggleSection(section) => {
+                        let id = self.reports_catalogue().get(section).map(|d| d.id.clone());
+                        if let Some(id) = id {
+                            self.reports_sel = section;
+                            self.reports_field_sel = 0;
+                            self.reports_toggle_expanded(&id);
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    MsvClick::Field { section, field } => {
+                        self.reports_apply_field_click(section, &field)
+                    }
+                    // #1765: the one header action a report section carries
+                    // is Export. Routed by action id, never by position — a
+                    // second action added later must not silently inherit
+                    // this arm.
+                    //
+                    // Only the *request* is recorded here: the save dialog
+                    // needs a `Backend` and this function has one, but
+                    // `dispatch_handle` is the established place that drains
+                    // `reports_pending_export` (same as when this routing
+                    // lived in `mouse_main_click`) — kept that way rather
+                    // than special-cased here so there is exactly one drain
+                    // site.
+                    MsvClick::HeaderAction { section, action } => {
+                        if action == CoordApp::REPORTS_EXPORT_ACTION {
+                            self.reports_request_export(section)
+                        } else {
+                            false
+                        }
+                    }
+                    MsvClick::Inert | MsvClick::Outside => false,
+                }
+            }
             // #1866: Queue sidebar is a read-only count summary; the grid
             // lives in the main panel (`mouse_main_click`).
             SidebarView::Queue => false,
@@ -5670,95 +5715,45 @@ impl CoordApp {
                 | None => false,
             };
         }
-        // #1741: Reports panel — the section stack is a `MultiSectionView`.
-        // Routing goes through the reusable `MsvLayoutCache` (`app/msv.rs`),
-        // which hit-tests the exact layout that was painted and, for a click
-        // inside a section body, descends into that body's own `Form`
-        // layout (in form-local coordinates). A header hit toggles collapse;
-        // a field hit is applied by `reports_apply_field_click` (segmented
-        // option → set the value, Run → fire the run, text → focus it).
+        // #1911: Reports main panel is now just the result `DataTable` (+
+        // notes) — the section stack moved to the sidebar
+        // (`mouse_sidebar_click` handles its clicks now). So a click here
+        // can only land on the table.
         //
-        // Nothing here knows what any parameter means — that is the whole
-        // point of the panel, and it is why the routing could be lifted out
-        // report-agnostic for #571's later consumers.
+        // #1910: the vertical-scrollbar-track hit is checked FIRST, before
+        // `reports_table_hit` — same reason as `audit_scrollbar_hit`'s
+        // callers: `DataTableLayout::hit_test` has no concept of the
+        // scrollbar strip it reserves space for, so without this a
+        // click/drag on the thumb fell through and was mis-hit-tested as a
+        // row.
         if self.active_view == SidebarView::Reports {
-            let route = self.reports_layout.borrow().route_click(pos);
-            return match route {
-                MsvClick::ToggleSection(section) => {
-                    let id = self.reports_catalogue().get(section).map(|d| d.id.clone());
-                    if let Some(id) = id {
-                        self.reports_sel = section;
-                        self.reports_field_sel = 0;
-                        self.reports_toggle_expanded(&id);
-                        return true;
-                    }
-                    false
-                }
-                MsvClick::Field { section, field } => {
-                    self.reports_apply_field_click(section, &field)
-                }
-                // #1762: everything below the section stack is the result
-                // table, and `Outside` is exactly "not in the stack" — so
-                // this is where a click on the result `DataTable` lands.
-                //
-                // A header click sorts by that column. It is the first
-                // `DataTableHit::Header` coord-tui acts on in the Reports
-                // panel, and only correct *here*: a `ReportResult` is a
-                // complete bounded set, where the Audit table's rows are
-                // one server-paginated page and a client-side sort of them
-                // would be a lie (see `audit.rs`'s module docs).
-                //
-                // #1853: a header-*divider* click starts a column-resize
-                // drag instead. Rows are not selectable (there is nothing
-                // to drill into yet) and the table's footer is a pinned Σ
-                // row, so every remaining hit is a no-op.
-                //
-                // #1910: a vertical-scrollbar-track hit is checked FIRST,
-                // before `reports_table_hit` — same reason as
-                // `audit_scrollbar_hit`'s callers: `DataTableLayout::
-                // hit_test` has no concept of the scrollbar strip, so
-                // without this a click/drag on the thumb fell through and
-                // was mis-hit-tested as a row.
-                MsvClick::Outside if self.reports_scrollbar_hit(pos) => {
-                    self.reports_vscroll_drag = true;
-                    self.reports_apply_vscroll(pos);
+            if self.reports_scrollbar_hit(pos) {
+                self.reports_vscroll_drag = true;
+                self.reports_apply_vscroll(pos);
+                return true;
+            }
+            return match self.reports_table_hit(pos) {
+                // A header click sorts by that column — correct here (and
+                // not in Audit) because a `ReportResult` is a complete
+                // bounded set, not one server-paginated page (see
+                // `audit.rs`'s module docs).
+                Some(DataTableHit::Header { col }) => self.reports_sort_by_column(col),
+                // #1853: a divider hit begins a column-resize drag,
+                // continued in the `MouseMoved` arm above and released on
+                // `MouseUp`. `hit_test` gives the divider grab zone priority
+                // over the header body, so this arm is what keeps a drag
+                // from also toggling the sort.
+                Some(DataTableHit::HeaderDivider { col }) => {
+                    self.reports_resize_col = Some(col);
                     true
                 }
-                MsvClick::Outside => match self.reports_table_hit(pos) {
-                    Some(DataTableHit::Header { col }) => self.reports_sort_by_column(col),
-                    // #1853: a divider hit begins a column-resize drag,
-                    // continued in the `MouseMoved` arm above and released
-                    // on `MouseUp`. `hit_test` gives the divider grab zone
-                    // priority over the header body, so this arm is what
-                    // keeps a drag from also toggling the sort.
-                    Some(DataTableHit::HeaderDivider { col }) => {
-                        self.reports_resize_col = Some(col);
-                        true
-                    }
-                    Some(DataTableHit::Row { .. })
-                    | Some(DataTableHit::Footer)
-                    | Some(DataTableHit::Empty)
-                    | None => false,
-                },
-                // #1765: the one header action a report section carries is
-                // Export. Routed by action id, never by position — a second
-                // action added later must not silently inherit this arm.
-                //
-                // Only the *request* is recorded here: the save dialog needs
-                // a `Backend` and this function has none, so
-                // `dispatch_handle` drains it (with the backend in scope)
-                // immediately after this returns. A disabled Export never
-                // reaches this arm at all — quadraui reserves no hit region
-                // for a disabled action, so the click falls through to
-                // `HeaderHit::TitleArea` and toggles the section instead.
-                MsvClick::HeaderAction { section, action } => {
-                    if action == CoordApp::REPORTS_EXPORT_ACTION {
-                        self.reports_request_export(section)
-                    } else {
-                        false
-                    }
-                }
-                MsvClick::Inert => false,
+                // Rows are not selectable (nothing to drill into yet) and
+                // the footer is a pinned Σ row — every remaining hit is a
+                // no-op.
+                Some(DataTableHit::Row { .. })
+                | Some(DataTableHit::Footer)
+                | Some(DataTableHit::Empty)
+                | None => false,
             };
         }
         false
@@ -6094,7 +6089,16 @@ impl CoordApp {
             // #1039: Audit sidebar is a placeholder (count + badge only) —
             // no sidebar scroll.
             SidebarView::Audit => false,
-            // #1741: Reports sidebar is a short summary — no sidebar scroll.
+            // #1911: the section stack fills the sidebar now, but it lays
+            // out at its natural content height (`ScrollMode::WholePanel`
+            // with `panel_scroll` pinned at `0.0`, same as the pre-#1911
+            // main-panel placement) rather than driving a scroll offset from
+            // the wheel — matching every catalogue in production today (3
+            // reports, each ≤ 5 rows expanded) comfortably fits a sidebar
+            // without scrolling. A catalogue that stops fitting needs this
+            // wired for real (`SidebarSystem`'s `scroll_panel` is the
+            // pattern to follow); tracked as a known gap rather than solved
+            // speculatively here.
             SidebarView::Reports => false,
             // #1866: Queue sidebar is a short count summary — no scroll.
             SidebarView::Queue => false,
@@ -6355,10 +6359,18 @@ impl CoordApp {
             // #1039: Audit panel — j/k handles navigation; wheel is a no-op
             // for now, same as Plans/MergeQueue/MilestoneDag above.
             SidebarView::Audit => true,
-            // #1741: Reports panel — j/k navigate the *section stack*, so
-            // the wheel is given to the thing keyboard nav can't reach: the
-            // result table below it, which can run long (one row per issue
-            // in the window).
+            // #1741: Reports panel — j/k navigate the *section stack* (now
+            // in the sidebar, #1911), so the wheel here is given entirely to
+            // the result table, which can run long (one row per issue in
+            // the window).
+            //
+            // #1911: this main panel is now *only* the result table (+
+            // notes) — the section stack that used to sit above it moved to
+            // the sidebar, so `visible`/`main_b` here already describe the
+            // table's own area, not a shared panel. `reports_table_visible_
+            // rows` (below) is kept as the primary source anyway: it reads
+            // the actual painted `DataTableLayout`, which also accounts for
+            // the notes block possibly taking a slice off the bottom.
             SidebarView::Reports => {
                 let n = self
                     .reports_result
@@ -6368,17 +6380,9 @@ impl CoordApp {
                 if delta.y > 0.0 {
                     self.reports_result_scroll = self.reports_result_scroll.saturating_sub(3);
                 } else if delta.y < 0.0 {
-                    // #1910: `visible` here is `content_visible_rows(main_b,
-                    // lh)` — the whole main panel's row count, computed
-                    // above this match. The result table's own viewport is
-                    // smaller (the section stack sits above it, and the
-                    // notes block can take a slice below), so using `visible`
-                    // made `max` clamp too low — sometimes `0` — and wheel-
-                    // down looked completely dead on a report tall enough to
-                    // need scrolling. `reports_table_visible_rows` reads the
-                    // actual painted `DataTableLayout` instead; `visible` is
-                    // only a fallback for the one frame before anything has
-                    // rendered.
+                    // #1910: `visible` is only a fallback for the one frame
+                    // before anything has rendered — `reports_table_visible_
+                    // rows` reads the real count off the last-painted table.
                     let table_visible = self.reports_table_visible_rows().unwrap_or(visible).max(1);
                     let max = n.saturating_sub(table_visible);
                     self.reports_result_scroll = (self.reports_result_scroll + 3).min(max);

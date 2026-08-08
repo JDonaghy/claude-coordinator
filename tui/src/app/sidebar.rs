@@ -301,9 +301,10 @@ impl CoordApp {
             | SidebarView::Sessions
             | SidebarView::Audit
             // #1741: Reports' only verb is Run, and it lives inside each
-            // section's own form (collapsing a section must hide it) — a
-            // panel-level toolbar button would be a second, always-visible
-            // trigger with no section to bind it to.
+            // section's own form (collapsing a section must hide it — the
+            // stack itself moved into the sidebar in #1911, but that verb
+            // stayed put) — a panel-level toolbar button would be a second,
+            // always-visible trigger with no section to bind it to.
             | SidebarView::Reports
             // #1866: Queue's verbs are all row-scoped (J/K reorder, x/u/r,
             // right-click menu) — a panel-level toolbar button would have no
