@@ -18,6 +18,17 @@
 > the **coord web control center** ([`docs/WEB_CONTROL_CENTER.md`](docs/WEB_CONTROL_CENTER.md)),
 > a multi-milestone React app that is simultaneously the deliverable and the deliberate
 > real-world trial of `epic → oracle → drive`. See the near-term section below.
+>
+> _The second lane (2026-08-07):_ **the test-first bug lane**
+> ([`docs/TEST_FIRST_BUG_LANE.md`](docs/TEST_FIRST_BUG_LANE.md), milestone #61) — the web
+> control center proves the **feature** lane (multi-issue, greenfield, Gate-A contract per
+> milestone). It says nothing about the **bug** lane: a single issue, a brownfield repo, and
+> an expectation that comes from a *bug report* rather than a design. Target acceptance test:
+> **a screenshot plus a description becomes an issue, is dispatched, and comes back fixed —
+> with no manual smoke by the operator at any point.** Both lanes share the `coord acceptance`
+> machinery; what the bug lane lacks is intake, the red-test authoring gate, and a standing
+> re-run cadence. vimcode is the testbed for it (and the forcing function for quadraui's gaps),
+> **not** a product being maintained.
 
 ## 🎯 North star
 
