@@ -76,6 +76,7 @@ from coord.commands.sessions import (
     watch,
 )
 from coord.commands.terminal import terminal_group
+from coord.commands.tui import tui_group
 
 # #1628: the health check engine ships its own CLI surface inside
 # coord/health/ so the whole feature — registry, probes, renderer, command —
@@ -413,6 +414,7 @@ main.add_command(release_preflight)
 # the flat command above), grouped so the pre-tag and post-release halves of
 # the release story are discoverable together.
 main.add_command(release_group)
+main.add_command(tui_group)
 
 
 # #1809: without this guard, `python -m coord.cli <args>` just IMPORTS the
