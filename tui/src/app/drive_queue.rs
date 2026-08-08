@@ -1314,7 +1314,22 @@ impl CoordApp {
         // word-wraps to the live viewport — the `last_issue_panel_cols`
         // pattern (`render.rs:175`), just under its own `Cell`.
         self.last_queue_detail_cols.set(detail_rect.width as usize);
-        backend.draw_list(detail_rect, &self.queue_issue_body_list());
+        // #1867 fix: also stash the pane's OWN visible-row count (its rect
+        // is only the bottom ~40% of `rect`, never the whole panel) so
+        // `mouse_main_scroll`'s clamp doesn't use the full-panel `visible`
+        // and saturate to 0 for any body shorter than the whole panel. See
+        // `last_queue_detail_visible_rows`'s doc comment for the bug this
+        // avoids.
+        self.last_queue_detail_visible_rows
+            .set(content_visible_rows(detail_rect, lh).max(1));
+        // Built once here and reused for both the paint and the item-count
+        // cache, so `mouse_main_scroll` can read `last_queue_detail_item_count`
+        // instead of re-running this (a markdown re-render that also drains
+        // the pending-fetch channel) on every wheel notch.
+        let detail_list = self.queue_issue_body_list();
+        self.last_queue_detail_item_count
+            .set(detail_list.items.len());
+        backend.draw_list(detail_rect, &detail_list);
     }
 
     /// #1867 (Q-2): the selected Queue row's issue body, rendered through the

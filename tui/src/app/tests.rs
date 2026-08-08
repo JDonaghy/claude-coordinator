@@ -44304,6 +44304,60 @@ Milestone tracking issue.
     }
 
     #[test]
+    fn tuidriver_queue_detail_pane_wheel_scrolls_a_typical_short_body() {
+        // Regression test for the #1910-class bug flagged in review: the
+        // previous mouse_main_scroll Queue-detail arm clamped against
+        // `visible` — `content_visible_rows(main_b, lh)`, the WHOLE Queue
+        // panel (grid + detail combined) — instead of the detail pane's own
+        // (much smaller, bottom ~40%) painted viewport. At 160x24 that
+        // whole-panel `visible` is 22 rows while the detail pane's actual
+        // viewport is only 8 rows. Any body whose wrapped item count fell at
+        // or below 21 (`visible - 1`) made the old clamp's
+        // `items.saturating_sub(visible - 1)` saturate to 0, and
+        // wheel-down went completely dead — even though the pane itself had
+        // plenty left to scroll.
+        //
+        // 8 short paragraphs, blank-line separated, render as 17 list items
+        // (1 header + 1 blank + 15 body/blank lines) at this width — short
+        // enough to be a typical real issue body, comfortably below the old
+        // buggy clamp's 21-item ceiling, but well above the detail pane's
+        // own 8-row viewport, so there is genuinely more to scroll.
+        let body: String = (0..8)
+            .map(|i| format!("LINE-{i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let mut data = BoardData::default();
+        data.open_issues.push(open_issue("myrepo", 701, "T701", &body));
+        let mut driver = queue_driver_with_issues(data, queue_fixture_json(), 160, 24);
+
+        let (x, y) = driver.find("LINE-00").unwrap_or_else(|| {
+            panic!(
+                "LINE-00 must render on the first frame:\n{}",
+                driver.screen()
+            )
+        });
+        assert!(
+            !driver.screen().contains("LINE-07"),
+            "sanity: the pane must not already show the last paragraph \
+             before any scroll:\n{}",
+            driver.screen()
+        );
+
+        for _ in 0..30 {
+            reports_wheel(&mut driver, (x, y), -1.0);
+        }
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("LINE-07") && !screen.contains("LINE-00"),
+            "#1867: wheel-down over the detail pane must keep scrolling a \
+             short (typical-length) body all the way to its last \
+             paragraph — a dead-at-0 clamp would leave LINE-00 pinned in \
+             view:\n{screen}"
+        );
+    }
+
+    #[test]
     fn tuidriver_queue_detail_pane_scrolls_via_keyboard_off_sidebar_focus() {
         let body: String = (0..40)
             .map(|i| format!("LINE-{i:02}"))

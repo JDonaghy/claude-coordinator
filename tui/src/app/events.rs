@@ -6470,8 +6470,29 @@ impl CoordApp {
                         self.queue_scroll = (self.queue_scroll + 3).min(max);
                     }
                 } else {
-                    let items = self.queue_issue_body_list().items.len();
-                    let max = items.saturating_sub(visible.saturating_sub(1));
+                    // #1867 fix: `visible` here is the WHOLE Queue panel
+                    // (grid + detail, `content_visible_rows(main_b, lh)`
+                    // computed above), not the detail pane's own viewport —
+                    // the pane is only the bottom ~40% of that rect
+                    // (`render_queue_panel`'s `detail_h`). Using `visible`
+                    // overestimated the pane's row count by ~2-3x, so `max
+                    // = items - (visible - 1)` saturated to 0 for any body
+                    // shorter than the full-panel row count — the common
+                    // case — and wheel-down went dead (the #1910 lesson,
+                    // applied here to the detail pane the way the grid arm
+                    // above already applies it via `queue_table_visible_rows`).
+                    // `last_queue_detail_visible_rows` is the pane's own
+                    // painted row count, stashed at draw time.
+                    //
+                    // `items` is read from `last_queue_detail_item_count`
+                    // (also stashed at draw time) rather than calling
+                    // `queue_issue_body_list()` here — that call re-runs the
+                    // markdown-to-`ListView` render and, via its layered
+                    // lookup, drains the pending-fetch channel / touches the
+                    // fetch cache, which is wasted work on every wheel notch.
+                    let items = self.last_queue_detail_item_count.get();
+                    let detail_visible = self.last_queue_detail_visible_rows.get().max(1);
+                    let max = items.saturating_sub(detail_visible.saturating_sub(1));
                     if delta.y > 0.0 {
                         self.queue_detail_scroll = self.queue_detail_scroll.saturating_sub(1);
                     } else if delta.y < 0.0 {
