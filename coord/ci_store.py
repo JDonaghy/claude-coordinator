@@ -27,6 +27,7 @@ stub through ``ci_store=`` without touching subprocess at all.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
@@ -260,6 +261,142 @@ def failed_checks(checks: list[CheckRun]) -> list[CheckRun]:
 def in_flight_checks(checks: list[CheckRun]) -> list[CheckRun]:
     """Return checks that are queued or running (not yet completed)."""
     return [c for c in checks if c.status != "completed"]
+
+
+# ── Post-rerun settle wait (#1925) ──────────────────────────────────────────
+#
+# `coord merge --revalidate`'s CI arm (`_apply_ci_revalidation` in
+# `coord/commands/merge.py`) triggers `rerun_for_pr` for an entry whose CI
+# checks are green but stale (predate the current base), then used to hand
+# the entry straight to `merge_queue.process()`'s gate a moment later.
+# `rerun_for_pr` invalidates the check cache, so that very next
+# `list_checks_for_pr` read can land in the few-second window before GitHub
+# has created ANY check-run record for the new workflow run: `gh pr checks`
+# itself errors ("no checks reported on the ... branch"), which
+# `coord.ci_github.GitHubCi._fetch` (correctly, per #1525) turns into a
+# synthetic `conclusion="unknown"` check — and the fail-closed allow-list
+# blocks on that exactly as it should for a GENUINE unreadable status. The
+# bug was evaluating the gate a heartbeat after triggering the very re-run
+# that caused this transient, self-inflicted reading — reliably, every time,
+# since a freshly-triggered run cannot possibly have registered yet.
+#
+# `wait_for_ci_settle` closes that window: after triggering, poll (bounded)
+# until the new run has both registered on GitHub AND finished, so the gate
+# evaluates a real result — a genuine pass or a genuine failure — instead of
+# the registration gap. This is what lets a healthy branch merge in the same
+# `--revalidate` invocation instead of needing a human to come back once CI
+# settles.
+CI_RERUN_POLL_INTERVAL_SECONDS = 10.0
+
+# ~3 minutes was the observed real-world settle time for the two 2026-08-07
+# reproductions (#1925). This gives roughly a 2x margin without making a
+# healthy `--revalidate` run hang needlessly long once CI is genuinely done.
+CI_RERUN_MAX_WAIT_SECONDS = 360.0
+
+
+def _is_unreadable_check(check) -> bool:
+    """True for the #1525 synthetic "could not read CI status" / "gh too
+    old" stand-ins (``coord.ci_github._unreadable_check`` /
+    ``_gh_too_old_check``) — the read itself failed, so this says nothing
+    about the code yet. Duck-typed on ``.conclusion``/``.name`` rather than
+    importing ``coord.ci_github`` — this module must stay backend-agnostic,
+    and every stub/fake ``CheckRun``-alike in the test suite already has
+    both attributes.
+    """
+    return (
+        getattr(check, "conclusion", None) == "unknown"
+        and str(getattr(check, "name", "")).startswith("coord: ")
+    )
+
+
+@dataclass
+class CiSettleResult:
+    """Outcome of :func:`wait_for_ci_settle` (#1925).
+
+    ``settled`` is the only thing callers need to branch on: ``True`` means
+    *checks* is a genuine, resolved result (real pass or real fail) safe to
+    hand to the merge gate. ``False`` means the wait budget ran out first —
+    ``registering`` then distinguishes *why*: ``True`` is the self-inflicted
+    "the re-run we just triggered still hasn't registered/resolved" case
+    (never a real CI verdict), ``False`` means real checks are in flight and
+    have simply not finished yet (an honest, already-correctly-classified
+    ``checks_pending``).
+    """
+
+    settled: bool
+    checks: list[CheckRun]
+    waited_seconds: float
+    registering: bool = False
+
+
+def wait_for_ci_settle(
+    ci_store: "CiStore",
+    repo: str,
+    number: int,
+    *,
+    timeout: float = CI_RERUN_MAX_WAIT_SECONDS,
+    poll_interval: float = CI_RERUN_POLL_INTERVAL_SECONDS,
+    echo=None,
+    sleep=None,
+    clock=None,
+) -> CiSettleResult:
+    """Bounded poll for a just-triggered CI re-run to register and finish.
+
+    Only ever called right after a successful :meth:`CiStore.rerun_for_pr`
+    (#1925) — see this section's header comment for the exact bug this
+    closes. Every poll invalidates the backend's cache first (best-effort;
+    only :class:`coord.ci_github.GitHubCi` implements ``invalidate``, so a
+    stub without it is left alone) so each read is a fresh one, not a cached
+    pre-rerun snapshot.
+
+    A "registering" read — no checks at all yet, or every check present is
+    one of the #1525 synthetic unreadable stand-ins (see
+    :func:`_is_unreadable_check`) — never counts as settled, however many
+    times it's observed; only real, resolved checks do. Genuinely in-flight
+    real checks (a run that registered and is now actually executing) also
+    keep polling — that's the ordinary "wait for CI to finish" case this
+    function exists to cover, not just the registration gap.
+
+    Returns as soon as *checks* is non-empty, none of it is the synthetic
+    unreadable stand-in, and none of it is still in-flight — i.e. a genuine
+    resolved result, pass or fail alike; the caller (and ultimately
+    ``merge_queue.process()``) decides what that result means. Gives up once
+    *timeout* elapses, returning whatever was last observed with
+    ``settled=False``.
+    """
+    echo = echo or (lambda msg: None)
+    sleep = sleep if sleep is not None else time.sleep
+    clock = clock if clock is not None else time.monotonic
+
+    start = clock()
+    checks: list[CheckRun] = []
+    announced = False
+    while True:
+        invalidate = getattr(ci_store, "invalidate", None)
+        if callable(invalidate):
+            try:
+                invalidate(repo, number)
+            except Exception:  # noqa: BLE001 — best-effort cache-bust only
+                pass
+        checks = ci_store.list_checks_for_pr(repo, number)
+        registering = not checks or all(_is_unreadable_check(c) for c in checks)
+        if not registering and not in_flight_checks(checks):
+            return CiSettleResult(
+                settled=True, checks=checks, waited_seconds=clock() - start,
+            )
+        elapsed = clock() - start
+        if elapsed >= timeout:
+            return CiSettleResult(
+                settled=False, checks=checks, waited_seconds=elapsed,
+                registering=registering,
+            )
+        if not announced:
+            echo(
+                f"  --revalidate: waiting for the CI re-run on {repo}#{number} "
+                "to register and settle before evaluating the gate (#1925)..."
+            )
+            announced = True
+        sleep(poll_interval)
 
 
 # #1892: two real signatures — recorded from JDonaghy/claude-coordinator run

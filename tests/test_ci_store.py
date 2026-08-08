@@ -120,6 +120,175 @@ class TestInFlightChecks:
         assert names == {"a", "b"}
 
 
+class _FakeClock:
+    """Deterministic (clock, sleep) pair for `wait_for_ci_settle` tests
+    (#1925) — `sleep` advances the same counter `clock` reads, so a bounded
+    poll loop runs to completion instantly with no real wall-clock wait."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def clock(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+class _ScriptedCi:
+    """`list_checks_for_pr` returns each item of *script* in turn (repeating
+    the last one once exhausted); `invalidate` is a no-op spy."""
+
+    def __init__(self, script: list[list]) -> None:
+        self.script = script
+        self.calls = 0
+        self.invalidated: list[tuple] = []
+
+    def list_checks_for_pr(self, repo, number):
+        i = min(self.calls, len(self.script) - 1)
+        self.calls += 1
+        return self.script[i]
+
+    def invalidate(self, repo, number):
+        self.invalidated.append((repo, number))
+
+
+def _unreadable(detail: str = "gh pr checks failed") -> CheckRun:
+    return CheckRun(
+        name=f"coord: could not read CI status for acme/api#1 ({detail})",
+        status="completed", conclusion="unknown",
+        url="", run_id="", started_at=None, completed_at=None,
+    )
+
+
+class TestWaitForCiSettle:
+    """#1925: `--revalidate`'s CI arm triggers a re-run and then used to
+    evaluate the merge gate before the new run had registered on GitHub —
+    `gh pr checks` errors in that window, which reads as the #1525 synthetic
+    `unknown` conclusion and fail-closes on a condition the command just
+    created. `wait_for_ci_settle` is the bounded poll that closes the gap."""
+
+    def test_already_settled_returns_immediately_no_sleep(self) -> None:
+        from coord.ci_store import wait_for_ci_settle
+
+        ci = _ScriptedCi([[_check("build")]])
+        clk = _FakeClock()
+
+        result = wait_for_ci_settle(
+            ci, "acme/api", 1, sleep=clk.sleep, clock=clk.clock,
+        )
+
+        assert result.settled is True
+        assert result.registering is False
+        assert clk.sleeps == []
+        assert ci.invalidated == [("acme/api", 1)]
+
+    def test_registering_then_settles_green(self) -> None:
+        """The exact #1925 shape: the first read(s) hit the registration
+        gap (synthetic unreadable check), then the real run shows up green.
+        Must NOT be reported as settled until the real check appears."""
+        from coord.ci_store import wait_for_ci_settle
+
+        ci = _ScriptedCi([
+            [_unreadable()],
+            [_unreadable()],
+            [_check("build", conclusion="success")],
+        ])
+        clk = _FakeClock()
+
+        result = wait_for_ci_settle(
+            ci, "acme/api", 1, sleep=clk.sleep, clock=clk.clock,
+        )
+
+        assert result.settled is True
+        assert result.registering is False
+        assert [c.conclusion for c in result.checks] == ["success"]
+        assert len(clk.sleeps) == 2  # polled past the two unreadable reads
+
+    def test_registering_then_settles_red_is_still_a_real_result(self) -> None:
+        """A genuinely failing composed re-run must settle as a real failure
+        — never laundered into a pass, and never left stuck on 'registering'
+        just because it's bad news."""
+        from coord.ci_store import wait_for_ci_settle
+
+        ci = _ScriptedCi([
+            [_unreadable()],
+            [_check("build", conclusion="failure")],
+        ])
+        clk = _FakeClock()
+
+        result = wait_for_ci_settle(
+            ci, "acme/api", 1, sleep=clk.sleep, clock=clk.clock,
+        )
+
+        assert result.settled is True
+        assert [c.conclusion for c in result.checks] == ["failure"]
+
+    def test_never_registers_times_out_as_registering(self) -> None:
+        """A re-run that never registers within the budget must NOT be
+        confused with a genuinely in-flight real check — `registering=True`
+        is the signal the caller uses to defer rather than block."""
+        from coord.ci_store import wait_for_ci_settle
+
+        ci = _ScriptedCi([[_unreadable()]])
+        clk = _FakeClock()
+
+        result = wait_for_ci_settle(
+            ci, "acme/api", 1, timeout=30.0, poll_interval=10.0,
+            sleep=clk.sleep, clock=clk.clock,
+        )
+
+        assert result.settled is False
+        assert result.registering is True
+        assert result.waited_seconds >= 30.0
+
+    def test_genuinely_in_flight_real_check_times_out_as_not_registering(
+        self,
+    ) -> None:
+        """A real check that's simply still running when the budget runs
+        out is an honest 'CI running' — distinct from the registration gap,
+        so the caller must NOT treat it as self-inflicted churn."""
+        from coord.ci_store import wait_for_ci_settle
+
+        ci = _ScriptedCi([[_check("build", status="in_progress", conclusion=None)]])
+        clk = _FakeClock()
+
+        result = wait_for_ci_settle(
+            ci, "acme/api", 1, timeout=20.0, poll_interval=10.0,
+            sleep=clk.sleep, clock=clk.clock,
+        )
+
+        assert result.settled is False
+        assert result.registering is False
+
+    def test_empty_checks_counts_as_registering(self) -> None:
+        from coord.ci_store import wait_for_ci_settle
+
+        ci = _ScriptedCi([[], [_check("build")]])
+        clk = _FakeClock()
+
+        result = wait_for_ci_settle(
+            ci, "acme/api", 1, sleep=clk.sleep, clock=clk.clock,
+        )
+
+        assert result.settled is True
+        assert len(clk.sleeps) == 1
+
+    def test_missing_invalidate_is_tolerated(self) -> None:
+        """A CiStore stub with no `invalidate` method (most test fakes, and
+        `NoOpCi`) must not raise — `getattr(..., None)` guards it."""
+        from coord.ci_store import wait_for_ci_settle
+
+        class _NoInvalidate:
+            def list_checks_for_pr(self, repo, number):
+                return [_check("build")]
+
+        result = wait_for_ci_settle(_NoInvalidate(), "acme/api", 1)
+        assert result.settled is True
+
+
 class TestChecksAreStale:
     """#1851: a green check whose `started_at` predates the base's newest
     commit is stale — GitHub only re-runs `pull_request` checks on head

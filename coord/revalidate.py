@@ -134,10 +134,25 @@ def client_timeout_seconds(revalidate: bool) -> float:
     execute the whole suite up to ``1 + MAX_REVALIDATION_BATCH`` times (see
     that constant) before the daemon responds, so it gets a window sized off
     that worst case instead of a single :data:`DEFAULT_TIMEOUT_SECONDS`.
+
+    #1925 adds a second, independent cost on the same request: the CI arm
+    (``_apply_ci_revalidation`` in ``coord/commands/merge.py``) now waits,
+    per CI-stale candidate, up to :data:`coord.ci_store.
+    CI_RERUN_MAX_WAIT_SECONDS` for a just-triggered re-run to settle before
+    ``process()`` evaluates it — bounded polling, not a suite run, but still
+    wall-clock the daemon holds the request open for. Worst case is every
+    candidate in the batch needing the full CI wait, serially, so the same
+    :data:`MAX_REVALIDATION_BATCH` ceiling scales this term too.
     """
     if not revalidate:
         return 900.0
-    return float(DEFAULT_TIMEOUT_SECONDS) * (1 + MAX_REVALIDATION_BATCH) + 300.0
+    from coord.ci_store import CI_RERUN_MAX_WAIT_SECONDS  # noqa: PLC0415
+
+    return (
+        float(DEFAULT_TIMEOUT_SECONDS) * (1 + MAX_REVALIDATION_BATCH)
+        + float(CI_RERUN_MAX_WAIT_SECONDS) * MAX_REVALIDATION_BATCH
+        + 300.0
+    )
 
 
 # How much of a failing run's output to quote back. The whole point of the
