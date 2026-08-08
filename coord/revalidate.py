@@ -90,6 +90,7 @@ does not happen.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -984,16 +985,59 @@ def format_batch(batch: BatchRevalidationResult) -> list[str]:
     return lines
 
 
+# #1924: every guard var `serve_app.py` sets on *itself* to keep a daemon
+# command handler from re-routing its own request back to the daemon (see
+# ``daemon_reroute_target()`` in board_service.py and its call sites in
+# commands/merge.py, commands/status.py, commands/acceptance.py,
+# commands/gates.py, commands/lifecycle.py). These are process-global — set
+# with a plain ``os.environ[...] = "1"`` around the handler body, not scoped
+# to the request — so when `coord merge --revalidate` is invoked from a thin
+# client, routed to the daemon, and its composed-suite subprocess inherits
+# the parent's environment by default, the suite sees whichever of these
+# happened to be set on `coord serve`'s own process at the time (in
+# particular `COORD_MERGE_ON_DAEMON`, set for the very request that is
+# running this revalidation). The suite is supposed to behave exactly like a
+# clean checkout's test run; a leaked guard var makes tests that assert on
+# these vars fail regardless of what the branch under test contains. Kept as
+# an explicit tuple (not a dynamic "*_ON_DAEMON" glob over os.environ) so
+# adding a new guard var in serve_app.py is a visible, deliberate edit here
+# too, rather than something that's silently swept up or silently missed.
+_DAEMON_GUARD_ENV_VARS = (
+    "COORD_MERGE_ON_DAEMON",
+    "COORD_RECONCILE_ON_DAEMON",
+    "COORD_DIAGNOSE_ON_DAEMON",
+    "COORD_GATES_ON_DAEMON",
+    "COORD_TEST_PLAN_ON_DAEMON",
+    "COORD_HOUSEKEEPING_ON_DAEMON",
+    "COORD_NOTIFY_ON_DAEMON",
+    "COORD_ACCEPTANCE_ON_DAEMON",
+)
+
+
+def _suite_subprocess_env() -> dict[str, str]:
+    """``os.environ`` minus the daemon-internal routing guards (#1924).
+
+    The composed-suite subprocess should look like a clean checkout's test
+    run irrespective of whether the parent process invoking it happens to be
+    a bare shell or `coord serve` mid-request. See ``_DAEMON_GUARD_ENV_VARS``.
+    """
+    return {
+        k: v for k, v in os.environ.items() if k not in _DAEMON_GUARD_ENV_VARS
+    }
+
+
 def _shell_runner(command: str, cwd: Path, timeout: int):
     """Run *command* through the shell in *cwd*, capturing output.
 
     Same shape as ``coord test``'s build/test step (``subprocess.run(cmd,
     shell=True, cwd=worktree)``) — the repo's own configured command, run in
-    the composite worktree, inheriting the environment.
+    the composite worktree, inheriting the environment — MINUS the
+    daemon-internal routing guards (#1924), which must never leak into a
+    subprocess that is supposed to behave like a clean checkout.
     """
     return subprocess.run(
         command, shell=True, cwd=str(cwd), capture_output=True, text=True,
-        timeout=timeout,
+        timeout=timeout, env=_suite_subprocess_env(),
     )
 
 
