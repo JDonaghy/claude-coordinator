@@ -13,6 +13,7 @@ Usage
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 
@@ -24,6 +25,22 @@ DB_PATH = COORD_DIR / "coord.db"
 _conn: sqlite3.Connection | None = None
 
 
+class ProductionDatabaseGuardError(RuntimeError):
+    """Raised when code running under pytest tries to open the live
+    ``~/.coord/coord.db`` (#1960).
+
+    The autouse ``coord_db`` fixture in ``tests/conftest.py`` overrides the
+    module-level singleton with an isolated ``:memory:`` connection before
+    every test body runs, so ``get_connection()`` normally never reaches
+    ``_open()`` at all during a test. This guard exists for the paths that
+    fixture can't reach: code that calls ``_open(DB_PATH)`` directly, a
+    subprocess the test spawned that re-imports ``coord.db`` fresh (pytest's
+    ``PYTEST_CURRENT_TEST`` env var is inherited by child processes by
+    default), or a test that closes the override and lets the singleton fall
+    back to the real path.
+    """
+
+
 def get_connection() -> sqlite3.Connection:
     """Return the module-level singleton connection, opening it on first call."""
     global _conn
@@ -33,6 +50,17 @@ def get_connection() -> sqlite3.Connection:
 
 
 def _open(path: Path) -> sqlite3.Connection:
+    if path == DB_PATH and os.environ.get("PYTEST_CURRENT_TEST"):
+        raise ProductionDatabaseGuardError(
+            f"Refusing to open the production coordinator database at "
+            f"{path} while running under pytest "
+            f"(PYTEST_CURRENT_TEST={os.environ['PYTEST_CURRENT_TEST']!r}). "
+            "A test (or a subprocess it spawned) resolved the real "
+            "~/.coord/coord.db instead of an isolated one -- see #1960. "
+            "Fix: rely on the autouse `coord_db` fixture (already active for "
+            "every test and overrides this singleton with an in-memory DB), "
+            "or pass an explicit isolated path instead of coord.db.DB_PATH."
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
