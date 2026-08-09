@@ -328,13 +328,6 @@ pub(crate) struct EpicNesting {
     pub(crate) nested: std::collections::HashSet<(String, u64)>,
 }
 
-/// Width of one arrow connector between stages, in TUI cells. Mirrors the
-/// constant used by quadraui's `tui_pipeline_view_layout` so host
-/// hit-testing matches the painted geometry.
-pub(crate) const PIPELINE_ARROW_WIDTH: f32 = 4.0;
-/// Height of the action-button row when any stage has an action.
-pub(crate) const PIPELINE_ACTION_HEIGHT: f32 = 1.0;
-
 /// #1198: gold/amber marker colour for the epic-row badge — distinct from
 /// every other colour already in play on a leaf row (repo-tag purple
 /// `rgb(180, 140, 240)`, queue-depth amber `rgb(220, 160, 40)`, stage
@@ -390,24 +383,6 @@ pub(crate) const QUEUED_LABEL: &str = "status:queued";
 /// list, mirroring `labels_carry_epic_label`'s convention.
 pub(crate) fn labels_carry_queued_label(labels: &[String]) -> bool {
     labels.iter().any(|l| l.eq_ignore_ascii_case(QUEUED_LABEL))
-}
-
-/// Compute the PipelineView layout that the TUI backend would paint into
-/// `rect`. Lets `mouse_main_click` hit-test without holding a `Backend`.
-///
-/// Matches the constants used by `quadraui::tui::tui_pipeline_view_layout`;
-/// if those drift, the GTK and TUI flows could disagree on stage bounds.
-pub(crate) fn tui_pipeline_layout(view: &QuiPipelineView, rect: Rect) -> quadraui::PipelineViewLayout {
-    let action_h = if view.stages.iter().any(|s| s.action.is_some()) {
-        PIPELINE_ACTION_HEIGHT
-    } else {
-        0.0
-    };
-    view.layout(
-        rect.x,
-        rect.y,
-        quadraui::PipelineViewMeasure::new(rect.width, rect.height, PIPELINE_ARROW_WIDTH, action_h),
-    )
 }
 
 /// #1174 (docs/ORACLE_LOOP.md, #1173): build the local launcher line for

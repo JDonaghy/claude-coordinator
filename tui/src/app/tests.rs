@@ -4330,11 +4330,12 @@
     fn mouse_main_click_board_always_returns_false() {
         let mut app = make_app_default();
         let main_b = Rect::new(50.0, 0.0, 40.0, 40.0);
+        let backend = quadraui::tui::TuiBackend::new();
         // #249 Principle 1: the Board panel now has a toolbar row at the
         // top (`tb_h = lh * 1.4 = 1.4` with lh=1.0).  Click well below
         // that — the Board body itself has no clickable widgets so the
         // click still returns false.
-        let changed = app.mouse_main_click(Point::new(51.0, 10.0), main_b, 1.0);
+        let changed = app.mouse_main_click(Point::new(51.0, 10.0), main_b, 1.0, &backend);
         assert!(!changed);
     }
 
@@ -4417,8 +4418,9 @@
     fn mouse_main_click_below_tab_row_is_ignored() {
         let mut app = make_app_default();
         let main_b = Rect::new(50.0, 0.0, 40.0, 40.0);
+        let backend = quadraui::tui::TuiBackend::new();
         // Click well below the toolbar (`tb_h = 1.4`).
-        let changed = app.mouse_main_click(Point::new(55.0, 10.0), main_b, 1.0);
+        let changed = app.mouse_main_click(Point::new(55.0, 10.0), main_b, 1.0, &backend);
         assert!(!changed);
     }
 
@@ -4427,7 +4429,8 @@
         let mut app = make_app_default();
         app.active_view = SidebarView::Machines;
         let main_b = Rect::new(50.0, 0.0, 40.0, 40.0);
-        let changed = app.mouse_main_click(Point::new(55.0, 0.0), main_b, 1.0);
+        let backend = quadraui::tui::TuiBackend::new();
+        let changed = app.mouse_main_click(Point::new(55.0, 0.0), main_b, 1.0, &backend);
         assert!(!changed);
     }
 
@@ -4464,15 +4467,18 @@
             (content_rect.height - bar_h).max(0.0),
         );
         let pv_rect = pipeline_detail_pv_rect(pv_origin, lh);
-        // Match the production hit-test: stripped view, no action bounds.
+        // Match the production hit-test: stripped view, no action bounds,
+        // and the same `Backend::pipeline_view_layout` production now uses
+        // (#1377) rather than a hand-rolled re-derivation.
+        let backend = quadraui::tui::TuiBackend::new();
         let view = app.build_pipeline_widget().expect("widget");
-        let layout = tui_pipeline_layout(&pipeline_view_for_render(&view), pv_rect);
+        let layout = backend.pipeline_view_layout(pv_rect, &pipeline_view_for_render(&view));
 
         let work_stage = &layout.stages[0];
         let bb = work_stage.box_bounds;
         let click_pos = Point::new(bb.x + bb.width / 2.0, bb.y + bb.height / 2.0);
 
-        let result = app.mouse_main_click(click_pos, main_b, lh);
+        let result = app.mouse_main_click(click_pos, main_b, lh, &backend);
         assert!(result, "click on stage body should be handled");
         assert_eq!(
             app.pipeline_focused_stage,
@@ -4517,7 +4523,8 @@
             content_rect.x + content_rect.width / 2.0,
             content_rect.y + bar_h / 2.0,
         );
-        let result = app.mouse_main_click(click_pos, main_b, lh);
+        let backend = quadraui::tui::TuiBackend::new();
+        let result = app.mouse_main_click(click_pos, main_b, lh, &backend);
         assert!(result, "click on action bar should be handled");
     }
 
@@ -18431,6 +18438,48 @@
         );
     }
 
+    /// #1377: quadraui's TUI `PipelineView` rasteriser reserves a blank row
+    /// above the stage boxes for the keyboard-focus caret, so every box is
+    /// painted one row lower than its `PipelineViewMeasure` origin. The
+    /// hit-test path must apply the same offset or every box's painted
+    /// bottom row goes dead (and the blank caret row above the box becomes
+    /// clickable instead) — exactly the drift this issue reports.
+    ///
+    /// Black-box via `TuiDriver`: locate the Work box's bottom border glyph
+    /// (`╰`, the first one on screen, since Work is the leftmost stage) and
+    /// click squarely on it. Before the fix this misses (no focus, no
+    /// "Stage content" reveal); after the fix it hits the box body.
+    #[test]
+    fn overview_tab_click_stage_box_bottom_row_focuses() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Overview;
+        app.pipeline_sel = Some(0); // issue #42
+        app.pipeline_focused_stage = None; // no stage focused initially
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+
+        // Sanity: the box is actually painted with rounded bottom corners.
+        let corner = driver.find("╰");
+        assert!(
+            corner.is_some(),
+            "#1377: Work box's bottom border must be painted:\n{}",
+            driver.screen()
+        );
+        let (col, row) = corner.unwrap();
+        driver.click(col, row);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Stage content: Work"),
+            "#1377: clicking the box's painted bottom row must focus it \
+             (hit-test must apply the same focus-caret offset quadraui \
+             paints with):\n{screen}"
+        );
+    }
+
     // ── parse_issue_proposal (#316) ────────────────────────────────────────────
 
     /// Helper: build a stream-json text line as the worker emits.
@@ -26161,7 +26210,8 @@
         // x=3.0 lands in " Board " (0..7 → first 7 chars from origin_x=0).
         let main_b = Rect::new(0.0, 0.0, 200.0, 40.0);
         let click_pos = Point::new(3.0, 2.5);
-        let changed = app.mouse_main_click(click_pos, main_b, lh);
+        let backend = quadraui::tui::TuiBackend::new();
+        let changed = app.mouse_main_click(click_pos, main_b, lh, &backend);
 
         assert!(changed, "tab click must return true (state changed)");
         assert_eq!(
@@ -26191,7 +26241,8 @@
         // Cumulative widths: 0–7, 7–14, 14–26, 26–36.
         // Click at x=30.0 lands in " Terminal " (26–36).
         let click_pos = Point::new(30.0, 2.5);
-        let changed = app.mouse_main_click(click_pos, main_b, lh);
+        let backend = quadraui::tui::TuiBackend::new();
+        let changed = app.mouse_main_click(click_pos, main_b, lh, &backend);
 
         assert!(changed, "tab click must return true (state changed)");
         assert_eq!(
