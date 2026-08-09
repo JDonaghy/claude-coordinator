@@ -13,3 +13,8 @@ coordinator.yml
 tui/target/
 tui/*.err
 tui/*.out
+
+# #1973: opt-in local quadraui path override (see
+# tui/cargo-config-local-quadraui.toml.example) — never commit a
+# machine-local co-development override.
+tui/.cargo/config.toml
