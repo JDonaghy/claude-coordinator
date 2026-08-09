@@ -4419,7 +4419,7 @@ impl CoordApp {
                         self.pty_pressed_buttons |= pty_button_bit(MouseButton::Left);
                         return true;
                     }
-                    self.mouse_main_click(pos, main_b, lh)
+                    self.mouse_main_click(pos, main_b, lh, backend)
                 } else {
                     false
                 }
@@ -5405,7 +5405,19 @@ impl CoordApp {
     /// - **Pipeline** — handles the tab bar and the `PipelineView` primitive
     ///   hit-test (dispatches the Go action when a stage button is clicked).
     /// - **Machines** — no-op (no interactive elements in the main panel).
-    pub(crate) fn mouse_main_click(&mut self, pos: Point, main_b: Rect, lh: f32) -> bool {
+    ///
+    /// Takes `backend` (read-only) so the Pipeline stage hit-test can go
+    /// through `Backend::pipeline_view_layout` — the same paint-free
+    /// measurer `draw_pipeline_view` derives its own layout from (#1377) —
+    /// rather than a hand-rolled re-derivation that can silently drift from
+    /// the painted geometry.
+    pub(crate) fn mouse_main_click(
+        &mut self,
+        pos: Point,
+        main_b: Rect,
+        lh: f32,
+        backend: &dyn Backend,
+    ) -> bool {
         // #249 Principle 1: toolbar row at the top of main_content_bounds
         // is hit-tested first.  A click inside it dispatches the action
         // bound to the corresponding `toolbar:<verb>` segment.  We
@@ -5608,8 +5620,14 @@ impl CoordApp {
                     let pv_rect = pipeline_detail_pv_rect(pv_origin, lh);
                     // Match the render path: stripped view → action_height=0,
                     // so action_bounds is always None and only Body hits fire.
+                    // #1377: go through `Backend::pipeline_view_layout` —
+                    // the same paint-free measurer `draw_pipeline_view`
+                    // derives its layout from — instead of a hand-rolled
+                    // re-derivation, so paint and hit-test can never drift
+                    // (e.g. the focus-caret row quadraui's rasteriser
+                    // reserves above the boxes).
                     let render_view = pipeline_view_for_render(&view);
-                    let layout = tui_pipeline_layout(&render_view, pv_rect);
+                    let layout = backend.pipeline_view_layout(pv_rect, &render_view);
                     match layout.hit_test(pos.x, pos.y) {
                         PipelineHit::Action(stage_idx) => {
                             // Defensive: with action-stripped view this branch

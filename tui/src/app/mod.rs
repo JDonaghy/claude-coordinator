@@ -8111,8 +8111,9 @@ pub(crate) fn first_meaningful_stderr_line(stderr: &str) -> Option<String> {
 /// and `pipeline_action_button`); the visible buttons move to the bar above.
 ///
 /// Pass the *stripped* view to both `draw_pipeline_view` AND
-/// `tui_pipeline_layout` so paint and hit-test agree on the (now-shrunk)
-/// stage-box bounds — quadraui drops the action row when no stage has one.
+/// `Backend::pipeline_view_layout` so paint and hit-test agree on the
+/// (now-shrunk) stage-box bounds — quadraui drops the action row when no
+/// stage has one.
 
 
 
