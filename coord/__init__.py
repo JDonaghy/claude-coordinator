@@ -4,9 +4,26 @@ from __future__ import annotations
 
 from importlib.metadata import Distribution, PackageNotFoundError
 from importlib.metadata import version as _pkg_version
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+# NOTE on the `# noqa: PLC0415` (import-outside-toplevel) markers below:
+# `json`/`pathlib.Path`/`urllib.parse`/`subprocess`/`setuptools_scm` are all
+# deferred into the function bodies that use them rather than imported at
+# module scope, so the common (non-editable-install) path through
+# `_resolve_version` — every `coord` invocation except a developer/operator
+# checkout — pays zero import cost for machinery it never touches. Each
+# import is module-level-safe on its own; this is purely to keep the hot
+# path cheap, not a cycle-avoidance workaround. The `TYPE_CHECKING`-only
+# import above gives `_editable_source_root`'s return annotation a real
+# name for type checkers without paying that cost at runtime either (`from
+# __future__ import annotations` already defers evaluating the annotation
+# itself).
 
 
-def _editable_source_root(dist_name: str):
+def _editable_source_root(dist_name: str) -> Path | None:
     """Return the source checkout root when *dist_name* is installed
     editable (PEP 660, ``pip install -e .``), else ``None``.
 
@@ -41,7 +58,7 @@ def _editable_source_root(dist_name: str):
     return root if root.is_dir() else None
 
 
-def _live_scm_version(root) -> str | None:
+def _live_scm_version(root: Path) -> str | None:
     """Best-effort live version for an editable checkout at *root*, so
     ``__version__`` doesn't trust a ``.dist-info`` stamp frozen at ``pip
     install -e .`` time (#2010). Two tiers, most-accurate first:
@@ -56,6 +73,20 @@ def _live_scm_version(root) -> str | None:
        clean tagged commit (the common case); slightly less precise
        (raw git-describe form, not PEP 440) when HEAD has moved past the
        last tag, but still honest and never a stale number.
+
+       KNOWN TRADE-OFF: this tier's output (e.g. ``3.4.5-dirty``, hyphen
+       separated) is not the same string ``setuptools_scm`` or a wheel
+       build would produce for that same commit (PEP 440,
+       ``3.4.5.dev0+g<sha>``-style). If ``coord status``'s drift check
+       ever does plain string equality between an operator's and an
+       agent's version, an operator that falls all the way to this tier
+       can show spurious drift against an otherwise-matching agent — a
+       strict improvement over pre-#2010 (never a *stale* number) but not
+       a guarantee of an *exact-format* match. Every real agent/daemon
+       install is a wheel, never editable (see the INVARIANT in
+       CLAUDE.md's release section), so this only affects
+       operator-vs-operator comparisons, and only when tier 1
+       (``setuptools_scm``) is unavailable.
 
     Returns ``None`` — never raises — when neither works; callers fall
     back to the (possibly stale) package metadata.
@@ -103,6 +134,18 @@ def _resolve_version(dist_name: str) -> str:
     versions against it) reflects the code actually running, rather than
     accusing every agent of drift from a number that was wrong about the
     operator, not them.
+
+    COST: this runs once at module-import time — i.e. for every ``coord``
+    invocation, not just ``--version``/``status``. On a non-editable
+    install (every agent/daemon; see the wheel-only INVARIANT in
+    CLAUDE.md's release section) it's just the one ``importlib.metadata``
+    lookup already required by #1238. On an editable install without
+    ``setuptools_scm`` importable, it additionally spawns one ``git
+    describe`` subprocess (bounded by a 5s timeout — see
+    ``_live_scm_version``) per invocation. That's an operator/developer
+    checkout only, and negligible next to a `claude -p` subprocess launch
+    or a board read; revisit only if something starts shelling out to
+    ``coord`` in a tight loop from such a checkout.
     """
     try:
         installed_version = _pkg_version(dist_name)
