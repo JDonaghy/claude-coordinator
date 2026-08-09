@@ -44020,14 +44020,15 @@ Milestone tracking issue.
         let target = app
             .queue_context_target()
             .expect("a non-empty grid must build a row target");
-        let (state, position, queue_len, held) = match &target {
+        let (repo_name, issue_number, state, position, queue_len, held) = match &target {
             ContextMenuTarget::DriveQueueRow {
+                repo_name,
+                issue_number,
                 state,
                 position,
                 queue_len,
                 held,
-                ..
-            } => (state.clone(), *position, *queue_len, *held),
+            } => (repo_name.clone(), *issue_number, state.clone(), *position, *queue_len, *held),
             _ => panic!("#1866: expected a DriveQueueRow target"),
         };
         assert_eq!(
@@ -44036,7 +44037,14 @@ Milestone tracking issue.
              count the WHOLE queue, `done` rows included"
         );
         let ids: Vec<String> = app
-            .context_menu_items_for_drive_queue_row(&state, position, queue_len, held)
+            .context_menu_items_for_drive_queue_row(
+                &repo_name,
+                issue_number,
+                &state,
+                position,
+                queue_len,
+                held,
+            )
             .iter()
             .filter_map(|i| i.action_id.clone())
             .collect();
@@ -44059,16 +44067,24 @@ Milestone tracking issue.
         app.queue_sel = app.queue_rows().len() - 1;
         let target = app.queue_context_target().expect("tail row must exist");
         let ContextMenuTarget::DriveQueueRow {
+            repo_name,
+            issue_number,
             state,
             position,
             queue_len,
             held,
-            ..
         } = &target
         else {
             panic!("#1866: expected a DriveQueueRow target");
         };
-        let items = app.context_menu_items_for_drive_queue_row(state, *position, *queue_len, *held);
+        let items = app.context_menu_items_for_drive_queue_row(
+            repo_name,
+            *issue_number,
+            state,
+            *position,
+            *queue_len,
+            *held,
+        );
         let down = items
             .iter()
             .find(|i| i.action_id.as_deref() == Some("drive-queue-move-down"))
@@ -44221,6 +44237,337 @@ Milestone tracking issue.
              disabled-because reason:\n{menu}"
         );
         driver.press_named(quadraui::NamedKey::Escape);
+    }
+
+    // ── #2016: Queue row → "View in Pipeline" / "View on Board" ──────────
+    //
+    // The Queue panel's per-row menu never got the #815/#1598 navigation
+    // affordance the Board already has. These tests mirror the
+    // `jump_to_pipeline_*` suite above, but drive the Queue row's own menu
+    // (`context_menu_items_for_drive_queue_row`) rather than the Board's.
+
+    /// A 3-row drive queue (positions 0/1/2, all `waiting`) whose MIDDLE row
+    /// is `myrepo#7` — neither first nor last, so both "Move up" and "Move
+    /// down" are enabled and the keyboard-nav step count below the menu
+    /// stays fixed regardless of end-of-queue disabling.
+    fn queue_fixture_json_middle_row_7() -> &'static str {
+        r#"[
+            {"repo_name": "myrepo", "issue_number": 6, "position": 0, "state": "waiting"},
+            {"repo_name": "myrepo", "issue_number": 7, "position": 1, "state": "waiting"},
+            {"repo_name": "myrepo", "issue_number": 8, "position": 2, "state": "waiting"}
+        ]"#
+    }
+
+    #[test]
+    fn tuidriver_queue_right_click_shows_view_in_pipeline_and_view_on_board() {
+        let mut driver = queue_driver(queue_fixture_json(), 200, 30);
+        let (x, y) = driver.find("myrepo#703").unwrap_or_else(|| {
+            panic!(
+                "#2016: the blocked row must render before it can be \
+                 right-clicked:\n{}",
+                driver.screen()
+            )
+        });
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: MouseButton::Right,
+            position: Point::new(x, y),
+            modifiers: Modifiers::default(),
+        });
+        let menu = driver.screen();
+        for label in ["View in Pipeline", "View on Board"] {
+            assert!(
+                menu.contains(label),
+                "#2016: the Queue row menu must offer `{label}` — the Board \
+                 already has both; the Queue panel is a dead end without \
+                 them:\n{menu}"
+            );
+        }
+        driver.press_named(quadraui::NamedKey::Escape);
+    }
+
+    /// #2016 core behaviour: "View in Pipeline" on a queued issue that IS in
+    /// the Pipeline must switch to the Pipeline view with that issue
+    /// selected — including the #869 case where its milestone group is
+    /// collapsed by default. Asserted on the rendered screen grid, not just
+    /// `active_view`.
+    #[test]
+    fn tuidriver_queue_view_in_pipeline_lands_on_a_tracked_issue_with_collapsed_milestone() {
+        use quadraui::tui::testing::driver_with_shell;
+        let mut app = make_app_with_drive_queue(
+            BoardData {
+                open_issues: vec![OpenIssue {
+                    repo_name: "myrepo".to_string(),
+                    number: 7,
+                    title: "Jump test issue".to_string(),
+                    body: String::new(),
+                    labels: vec!["coord".to_string()],
+                    state: "open".to_string(),
+                    milestone_number: Some(3),
+                    milestone_title: Some("Sprint 1".to_string()),
+                }],
+                pipeline_repos: vec![("myrepo".to_string(), "acme/myrepo".to_string())],
+                ..BoardData::default()
+            },
+            queue_fixture_json_middle_row_7(),
+        );
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 7,
+            title: "Jump test issue".to_string(),
+            body: String::new(),
+            repo_slug: "acme/myrepo".to_string(),
+            coord_repo: Some("myrepo".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: false,
+        }];
+        app.rebuild_board_sidebar();
+        app.rebuild_pipeline_sidebar(None);
+        app.active_view = SidebarView::Queue;
+
+        // Sanity: the milestone sub-header defaults to collapsed (#857)
+        // before the jump.
+        assert!(
+            !app
+                .pipeline_milestone_expanded
+                .contains_key(&("new".to_string(), "myrepo".to_string(), "3".to_string())),
+            "#2016: milestone key must be untouched (collapsed by #857 default) before the jump"
+        );
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        let (x, y) = driver
+            .find("myrepo#7")
+            .unwrap_or_else(|| panic!("queue row myrepo#7 must render:\n{}", driver.screen()));
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: MouseButton::Right,
+            position: Point::new(x, y),
+            modifiers: Modifiers::default(),
+        });
+        assert!(
+            driver.screen().contains("View in Pipeline"),
+            "sanity: menu must be open with 'View in Pipeline' listed:\n{}",
+            driver.screen()
+        );
+        // Middle row ⇒ both Move up/down enabled ⇒ selectable order is
+        // [Move up, Move down, View in Pipeline, View on Board, Remove].
+        // Two Down presses from the initial "Move up" selection land on
+        // "View in Pipeline".
+        driver.press_named(quadraui::NamedKey::Down);
+        driver.press_named(quadraui::NamedKey::Down);
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        let pipeline_screen = driver.screen();
+        assert!(
+            pipeline_screen.contains("PIPELINE"),
+            "#2016: 'View in Pipeline' must switch to the Pipeline view:\n{pipeline_screen}"
+        );
+        assert!(
+            pipeline_screen.contains("Sprint 1"),
+            "#2016/#869: the milestone sub-header must be revealed so the \
+             selected row is visible:\n{pipeline_screen}"
+        );
+        assert!(
+            pipeline_screen.contains("#7"),
+            "#2016: issue #7 must be visible in the Pipeline after the \
+             jump:\n{pipeline_screen}"
+        );
+    }
+
+    /// #2016: "View in Pipeline" must render disabled, with
+    /// `PipelineNotVisible::menu_hint()`'s reason, for a queued issue that
+    /// has no visible Pipeline row (here: untracked — `pipeline_issues` is
+    /// empty) — the #1598 regression verbatim, ported to the Queue panel.
+    #[test]
+    fn tuidriver_queue_view_in_pipeline_disabled_with_reason_for_untracked_issue() {
+        let mut driver = queue_driver(queue_fixture_json_middle_row_7(), 200, 30);
+        let (x, y) = driver
+            .find("myrepo#7")
+            .unwrap_or_else(|| panic!("queue row myrepo#7 must render:\n{}", driver.screen()));
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: MouseButton::Right,
+            position: Point::new(x, y),
+            modifiers: Modifiers::default(),
+        });
+        let menu = driver.screen();
+        assert!(
+            menu.contains("View in Pipeline"),
+            "#2016: 'View in Pipeline' must still appear in the menu:\n{menu}"
+        );
+        assert!(
+            menu.contains("no coord label"),
+            "#2016: the disabled item must show a visible reason instead of \
+             a silent disabled==true with no explanation:\n{menu}"
+        );
+        driver.press_named(quadraui::NamedKey::Escape);
+    }
+
+    /// #2016: "View on Board" switches to the Board view with the row's
+    /// issue selected. The sidebar's "No milestone" group defaults to
+    /// collapsed, so neither issue's title renders in the tree — the
+    /// distinguishing title text can only come from the Board detail pane,
+    /// which only populates for the actually-selected issue. A second,
+    /// differently-titled issue (never queued) proves the jump landed on
+    /// #7 specifically, not just "whichever issue Board defaults to."
+    #[test]
+    fn tuidriver_queue_view_on_board_switches_to_board_with_issue_selected() {
+        use quadraui::tui::testing::driver_with_shell;
+        let mut app = make_app_with_drive_queue(
+            BoardData {
+                open_issues: vec![
+                    OpenIssue {
+                        repo_name: "myrepo".to_string(),
+                        number: 7,
+                        title: "Board target issue".to_string(),
+                        body: String::new(),
+                        labels: vec![],
+                        state: "open".to_string(),
+                        milestone_number: None,
+                        milestone_title: None,
+                    },
+                    OpenIssue {
+                        repo_name: "myrepo".to_string(),
+                        number: 9,
+                        title: "Decoy issue never queued".to_string(),
+                        body: String::new(),
+                        labels: vec![],
+                        state: "open".to_string(),
+                        milestone_number: None,
+                        milestone_title: None,
+                    },
+                ],
+                pipeline_repos: vec![("myrepo".to_string(), "acme/myrepo".to_string())],
+                ..BoardData::default()
+            },
+            queue_fixture_json_middle_row_7(),
+        );
+        // Untracked (no `pipeline_issues`) ⇒ "View in Pipeline" renders
+        // disabled and is skipped by keyboard nav, same as the disabled-item
+        // test above — so only two Down presses are needed to reach "View
+        // on Board" too.
+        app.rebuild_board_sidebar();
+        app.active_view = SidebarView::Queue;
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        let (x, y) = driver
+            .find("myrepo#7")
+            .unwrap_or_else(|| panic!("queue row myrepo#7 must render:\n{}", driver.screen()));
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: MouseButton::Right,
+            position: Point::new(x, y),
+            modifiers: Modifiers::default(),
+        });
+        driver.press_named(quadraui::NamedKey::Down);
+        driver.press_named(quadraui::NamedKey::Down);
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        let board_screen = driver.screen();
+        assert!(
+            board_screen.contains("BOARD"),
+            "#2016: 'View on Board' must switch to the Board view:\n{board_screen}"
+        );
+        assert!(
+            board_screen.contains("Board target issue"),
+            "#2016: the Board detail pane must show THIS issue's title — proof \
+             `select_issue` actually landed on #7, not just that the Board \
+             view opened:\n{board_screen}"
+        );
+        assert!(
+            !board_screen.contains("Decoy issue never queued"),
+            "#2016: the OTHER issue's title must not appear — it would if the \
+             jump had landed on whatever Board defaults to instead of #7:\n{board_screen}"
+        );
+    }
+
+    /// #2016: jumping away from the Queue panel must not disturb queue
+    /// state — no reorder, no optimistic mutation. Compares the row order
+    /// before the jump against the order after jumping to the Pipeline and
+    /// switching back to the Queue panel.
+    #[test]
+    fn tuidriver_queue_jump_to_pipeline_leaves_queue_order_unchanged() {
+        use quadraui::tui::testing::driver_with_shell;
+        let mut app = make_app_with_drive_queue(
+            BoardData {
+                open_issues: vec![OpenIssue {
+                    repo_name: "myrepo".to_string(),
+                    number: 7,
+                    title: "Jump test issue".to_string(),
+                    body: String::new(),
+                    labels: vec!["coord".to_string()],
+                    state: "open".to_string(),
+                    milestone_number: None,
+                    milestone_title: None,
+                }],
+                pipeline_repos: vec![("myrepo".to_string(), "acme/myrepo".to_string())],
+                ..BoardData::default()
+            },
+            queue_fixture_json_middle_row_7(),
+        );
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 7,
+            title: "Jump test issue".to_string(),
+            body: String::new(),
+            repo_slug: "acme/myrepo".to_string(),
+            coord_repo: Some("myrepo".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: false,
+        }];
+        app.rebuild_board_sidebar();
+        app.rebuild_pipeline_sidebar(None);
+        app.active_view = SidebarView::Queue;
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        let before = driver.screen();
+        let before_order: Vec<usize> = ["myrepo#6", "myrepo#7", "myrepo#8"]
+            .iter()
+            .map(|needle| {
+                before
+                    .find(needle)
+                    .unwrap_or_else(|| panic!("{needle} must render before the jump:\n{before}"))
+            })
+            .collect();
+        assert!(
+            before_order.windows(2).all(|w| w[0] < w[1]),
+            "sanity: rows must render in position order before the jump:\n{before}"
+        );
+
+        let (x, y) = driver
+            .find("myrepo#7")
+            .unwrap_or_else(|| panic!("queue row myrepo#7 must render:\n{}", driver.screen()));
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: MouseButton::Right,
+            position: Point::new(x, y),
+            modifiers: Modifiers::default(),
+        });
+        driver.press_named(quadraui::NamedKey::Down);
+        driver.press_named(quadraui::NamedKey::Down);
+        driver.press_named(quadraui::NamedKey::Enter);
+        assert!(
+            driver.screen().contains("PIPELINE"),
+            "sanity: the jump must have landed on the Pipeline view:\n{}",
+            driver.screen()
+        );
+
+        // Back to the Queue panel.
+        click_activity_icon(&mut driver, QUEUE_ICON);
+        let after = driver.screen();
+        let after_order: Vec<usize> = ["myrepo#6", "myrepo#7", "myrepo#8"]
+            .iter()
+            .map(|needle| {
+                after
+                    .find(needle)
+                    .unwrap_or_else(|| panic!("{needle} must still render after the jump:\n{after}"))
+            })
+            .collect();
+        assert!(
+            after_order.windows(2).all(|w| w[0] < w[1]),
+            "#2016: the Queue panel's row order must be unchanged after \
+             jumping away and back — no reorder, no optimistic mutation:\n{after}"
+        );
     }
 
     #[test]
