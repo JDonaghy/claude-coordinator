@@ -239,10 +239,16 @@ impl SidebarFilter {
 
     /// Move the cursor one Unicode scalar left.
     fn cursor_left(&mut self) {
-        let chars: Vec<char> = self.query.chars().collect();
-        let char_pos = chars.len().min(self.cursor);
-        if char_pos > 0 {
-            self.cursor = chars[..char_pos - 1].iter().collect::<String>().len();
+        if self.cursor > 0 {
+            // Find the start of the previous char (UTF-8 aware) — same
+            // boundary walk `backspace` uses, so the cursor always lands on
+            // a valid char boundary regardless of prior (possibly stale)
+            // byte offset.
+            let mut prev = self.cursor - 1;
+            while prev > 0 && !self.query.is_char_boundary(prev) {
+                prev -= 1;
+            }
+            self.cursor = prev;
         }
     }
 
