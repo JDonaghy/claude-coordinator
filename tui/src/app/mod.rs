@@ -62,6 +62,8 @@ use quadraui::{
     DialogSeverity, DialogTextInput,
     Key, ListItem, ListItemMeasure, ListView, ListViewHit, Modifiers, MouseButton, NamedKey,
     PipelineHit, PipelineStage as QuiPipelineStage, PipelineView as QuiPipelineView,
+    // #2017: resize-cursor hover affordance for the Queue splitter.
+    PointerShape, ResizeEdge,
     Point, Reaction, Rect, ScrollDelta, ScrollMode, SectionSize, Series, ShellApp,
     ShellConfig, ShellContext, SidebarPanel, SidebarPanelHit, StageStatus, StatusBar,
     StatusBarSegment, Scrollbar, StyledSpan, StyledText, TabBar, TabItem, TextRegion, Toolbar,
@@ -2357,6 +2359,48 @@ pub struct CoordApp {
     /// (a markdown re-render that also drains the pending-fetch channel and
     /// touches the fetch cache) on every wheel notch just to read a length.
     last_queue_detail_item_count: std::cell::Cell<usize>,
+    /// #2017: the Queue panel's grid/detail split, as the DETAIL pane's
+    /// fraction of the panel height available to the two panes (i.e. minus
+    /// the one-row draggable separator) — a fraction rather than an
+    /// absolute row count so a terminal resize preserves the operator's
+    /// intent instead of snapping back to the old 40% default or
+    /// permanently squashing one side (#2017 acceptance test 4). Read and
+    /// clamped by `CoordApp::queue_clamp_detail_h` on every paint
+    /// (`render_queue_panel`) and rewritten live while `queue_split_drag`
+    /// is active (`queue_update_split_drag`). Session-only persistence —
+    /// same tier as `audit_column_overrides` / `reports_column_overrides`;
+    /// no cross-restart UI-state store exists in this codebase yet.
+    queue_split_frac: f32,
+    /// #2017: `true` while the operator is dragging the separator between
+    /// the Queue grid and its detail pane — set on a `MouseDown` inside
+    /// `queue_separator_hit`'s region and cleared on `MouseUp`. Mirrors
+    /// `audit_resize_col` / `reports_resize_col`'s drag-state shape.
+    queue_split_drag: bool,
+    /// #2017: the most recently painted separator's rect, cached by
+    /// `render_queue_panel` so `events.rs` can hit-test a click/hover
+    /// without a `Backend` handle. `None` when no grid+detail split is on
+    /// screen (empty queue — see `render_queue_panel`'s early return).
+    queue_separator_rect: std::cell::Cell<Option<Rect>>,
+    /// #2017: `true` while the operator is dragging the Queue grid's own
+    /// vertical-scrollbar thumb — set on a `MouseDown` inside
+    /// `queue_scrollbar_hit`'s region and cleared on `MouseUp`. Mirrors
+    /// `reports_vscroll_drag`; the click-to-position half
+    /// (`queue_apply_vscroll`) already existed pre-#2017, this just adds
+    /// the continuation so the drag doesn't die after one jump.
+    queue_vscroll_drag: bool,
+    /// #2017: the Queue detail pane's most recently painted vertical
+    /// scrollbar geometry (`Backend::list_vscrollbar`, called with the same
+    /// `detail_rect` `render_queue_panel` draws into), cached so
+    /// `events.rs` can hit-test and drag-scrub it without a `Backend`
+    /// handle at click time. `None` whenever the pane's content fits (no
+    /// track painted — `ListView::vscrollbar` already returns `None` for
+    /// that case, and this cache mirrors it verbatim) or nothing is on
+    /// screen.
+    queue_detail_scrollbar: std::cell::RefCell<Option<Scrollbar>>,
+    /// #2017: `true` while the operator is dragging the Queue detail pane's
+    /// vertical-scrollbar thumb. Same shape as `queue_vscroll_drag`, for
+    /// the other pane.
+    queue_detail_vscroll_drag: bool,
     /// Cached `DialogLayout` from the last prompt-dialog render — used for
     /// click hit-testing on dialog buttons.  Populated while any
     /// `pending_*` prompt dialog is visible; cleared when it dismisses.
@@ -3584,6 +3628,16 @@ impl CoordApp {
             last_queue_detail_cols: std::cell::Cell::new(120),
             last_queue_detail_visible_rows: std::cell::Cell::new(10),
             last_queue_detail_item_count: std::cell::Cell::new(0),
+            // #2017: same 40% default `render_queue_panel` hardcoded before
+            // the splitter existed — the floor clamps still apply on top of
+            // this on every paint, so a pathologically small starting value
+            // here couldn't collapse either pane anyway.
+            queue_split_frac: 0.4,
+            queue_split_drag: false,
+            queue_separator_rect: std::cell::Cell::new(None),
+            queue_vscroll_drag: false,
+            queue_detail_scrollbar: std::cell::RefCell::new(None),
+            queue_detail_vscroll_drag: false,
             dialog_layout: std::cell::RefCell::new(None),
             pending_restart: None,
             machine_last_contact: std::collections::HashMap::new(),

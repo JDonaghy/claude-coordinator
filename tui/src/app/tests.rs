@@ -25947,8 +25947,8 @@
         let body = "a".repeat(120);
         let issue = Some((1u64, "Title", body.as_str(), [].as_slice()));
 
-        let unwrapped = issue_body_list(issue, 0, "test-unwrapped", 0);
-        let wrapped = issue_body_list(issue, 0, "test-wrapped", 40);
+        let unwrapped = issue_body_list(issue, 0, "test-unwrapped", 0, false);
+        let wrapped = issue_body_list(issue, 0, "test-wrapped", 40, false);
 
         // header + blank separator + body lines.
         // The wrapped list must have more rows than the unwrapped one.
@@ -25971,8 +25971,8 @@
         let body = format!("```\n{}\n```", long_code);
         let issue = Some((2u64, "Code", body.as_str(), [].as_slice()));
 
-        let unwrapped = issue_body_list(issue, 0, "test-code-unwrapped", 0);
-        let wrapped = issue_body_list(issue, 0, "test-code-wrapped", 40);
+        let unwrapped = issue_body_list(issue, 0, "test-code-unwrapped", 0, false);
+        let wrapped = issue_body_list(issue, 0, "test-code-wrapped", 40, false);
 
         // The code block interior must not be word-wrapped, so both paths
         // produce the same number of rows.
@@ -25992,8 +25992,8 @@
         let body = "Short line.";
         let issue = Some((3u64, "Short", body, [].as_slice()));
 
-        let a = issue_body_list(issue, 0, "test-a", 0);
-        let b = issue_body_list(issue, 0, "test-b", 0);
+        let a = issue_body_list(issue, 0, "test-a", 0, false);
+        let b = issue_body_list(issue, 0, "test-b", 0, false);
 
         assert_eq!(
             a.items.len(),
@@ -45040,4 +45040,441 @@ Milestone tracking issue.
                  crowded out by the detail pane:\n{screen}"
             );
         }
+    }
+
+    // ── #2017: draggable grid/detail splitter + working scrollbars ────────
+
+    /// `n` plain `waiting` entries, `myrepo#800..myrepo#{800+n-1}` — a long,
+    /// state-agnostic queue for splitter/scrollbar geometry tests (as
+    /// opposed to `queue_fixture_json`'s small, state-varied fixture, which
+    /// is for the state-rendering tests above).
+    fn queue_fixture_json_many_rows(n: usize) -> String {
+        let entries: Vec<String> = (0..n)
+            .map(|i| {
+                format!(
+                    r#"{{"repo_name": "myrepo", "issue_number": {num}, "position": {i}, "state": "waiting", "attempts": 0}}"#,
+                    num = 800 + i,
+                )
+            })
+            .collect();
+        format!("[{}]", entries.join(","))
+    }
+
+    /// Count of non-overlapping occurrences of `needle` in `haystack`.
+    fn count_matches(haystack: &str, needle: &str) -> usize {
+        haystack.matches(needle).count()
+    }
+
+    /// Column of a vertical scrollbar's `█`/`░` glyphs, and the row range
+    /// its track spans, restricted to screen rows `[y0, y1)`. Restricting
+    /// the row range is what lets a caller tell the grid's scrollbar apart
+    /// from the detail pane's — #2017 gives both panes one, painted with
+    /// the same glyphs, one above the separator and one below it. Mirrors
+    /// `reports_scrollbar_track`.
+    fn scrollbar_track_in_rows(screen: &str, y0: usize, y1: usize) -> Option<(f32, f32, f32)> {
+        let mut x = None;
+        let mut row_min = f32::MAX;
+        let mut row_max = f32::MIN;
+        for (y, line) in screen.lines().enumerate() {
+            if y < y0 || y >= y1 {
+                continue;
+            }
+            if let Some(col) = line.chars().position(|c| c == '█' || c == '░') {
+                x = Some(col as f32 + 0.5);
+                row_min = row_min.min(y as f32 + 0.5);
+                row_max = row_max.max(y as f32 + 0.5);
+            }
+        }
+        x.map(|x| (x, row_min, row_max))
+    }
+
+    /// Locate the draggable separator (`CoordApp::queue_separator_list`'s
+    /// hint text) on screen.
+    fn find_queue_separator<A: quadraui::AppLogic>(
+        driver: &quadraui::tui::testing::TuiDriver<A>,
+    ) -> (f32, f32) {
+        driver
+            .find("drag to resize")
+            .unwrap_or_else(|| panic!("Queue splitter must render:\n{}", driver.screen()))
+    }
+
+    #[test]
+    fn tuidriver_queue_splitter_drag_toward_the_bottom_grows_the_grid() {
+        // #2017 acceptance 1/2: dragging the separator moves the split
+        // live and both panes re-layout under the cursor. Moving the
+        // separator DOWN hands more of the panel to the grid above it and
+        // less to the detail pane below it — asserted on the rendered
+        // grid, per the issue's own acceptance bar ("more queue rows
+        // visible after than before").
+        let n = 20;
+        let mut driver = queue_driver(&queue_fixture_json_many_rows(n), 160, 26);
+        // Every visible grid row's `#`/Issue cell starts "myrepo#8" (all
+        // 20 fixture issue numbers, 800-819, start with digit 8) — a
+        // count of this substring is a count of visible grid rows.
+        let before = count_matches(&driver.screen(), "myrepo#8");
+
+        let (sx, sy) = find_queue_separator(&driver);
+        driver.mouse_down(sx, sy);
+        driver.mouse_move(sx, sy + 6.0);
+        driver.mouse_up(sx, sy + 6.0);
+        driver.render();
+
+        let after = count_matches(&driver.screen(), "myrepo#8");
+        assert!(
+            after > before,
+            "#2017: dragging the separator toward the bottom must grow \
+             the grid — {before} rows visible before, {after} after:\n{}",
+            driver.screen()
+        );
+    }
+
+    #[test]
+    fn tuidriver_queue_splitter_drag_toward_the_top_shrinks_the_grid() {
+        // #2017 acceptance 1/2 (the inverse direction): moving the
+        // separator UP hands more of the panel to the detail pane and less
+        // to the grid.
+        let n = 20;
+        let mut driver = queue_driver(&queue_fixture_json_many_rows(n), 160, 26);
+        let before = count_matches(&driver.screen(), "myrepo#8");
+
+        let (sx, sy) = find_queue_separator(&driver);
+        driver.mouse_down(sx, sy);
+        driver.mouse_move(sx, sy - 4.0);
+        driver.mouse_up(sx, sy - 4.0);
+        driver.render();
+
+        let after = count_matches(&driver.screen(), "myrepo#8");
+        assert!(
+            after < before,
+            "#2017: dragging the separator toward the top must shrink the \
+             grid — {before} rows visible before, {after} after:\n{}",
+            driver.screen()
+        );
+    }
+
+    #[test]
+    fn tuidriver_queue_splitter_drag_past_either_extreme_clamps_instead_of_collapsing() {
+        // #2017 acceptance 3: a drag past either extreme must clamp at the
+        // floor rather than collapsing a pane to nothing — both panes must
+        // still render (the grid's header + at least one row; the detail
+        // pane's own content) after each extreme.
+        //
+        // No `data.open_issues`/`pipeline_repos` slug is seeded, so the
+        // detail pane always shows the "no GitHub slug" placeholder
+        // (`queue_issue_body_list`'s cold path) — a stable, height-
+        // independent proof the detail pane rendered *something*, however
+        // short its clamped viewport gets.
+        let mut driver = queue_driver(&queue_fixture_json_many_rows(20), 160, 30);
+
+        // Drag far toward the top — must clamp at the grid's floor
+        // (`QUEUE_MIN_GRID_ROWS`), not vanish. `-12` comfortably overshoots
+        // it: at this fixture/terminal size the grid starts around 14 rows
+        // tall, so the floor (3 rows) is reached well before `-12`.
+        let (sx, sy) = find_queue_separator(&driver);
+        driver.mouse_down(sx, sy);
+        driver.mouse_move(sx, sy - 12.0);
+        driver.mouse_up(sx, sy - 12.0);
+        driver.render();
+        let top_screen = driver.screen();
+        assert!(
+            top_screen.contains("Issue") && top_screen.contains("myrepo#800"),
+            "#2017: dragging past the top extreme must clamp the grid at \
+             its floor, not collapse it — the header and at least one row \
+             must still render:\n{top_screen}"
+        );
+        assert!(
+            top_screen.contains("no GitHub slug"),
+            "#2017: …and the detail pane must still render too:\n{top_screen}"
+        );
+
+        // Drag far toward the bottom — must clamp at the detail pane's
+        // floor (`QUEUE_MIN_DETAIL_ROWS`) instead.
+        let (sx2, sy2) = find_queue_separator(&driver);
+        driver.mouse_down(sx2, sy2);
+        driver.mouse_move(sx2, sy2 + 9.0);
+        driver.mouse_up(sx2, sy2 + 9.0);
+        driver.render();
+        let bottom_screen = driver.screen();
+        assert!(
+            bottom_screen.contains("Issue") && bottom_screen.contains("myrepo#800"),
+            "#2017: dragging past the bottom extreme must still render the \
+             grid at its clamped floor:\n{bottom_screen}"
+        );
+        assert!(
+            bottom_screen.contains("no GitHub slug"),
+            "#2017: …and the detail pane must still render too:\n{bottom_screen}"
+        );
+    }
+
+    #[test]
+    fn queue_split_frac_persists_proportionally_across_different_panel_heights() {
+        // #2017 acceptance 4: the split is stored as a FRACTION
+        // (`queue_split_frac`), not an absolute row count, precisely so a
+        // terminal resize preserves the operator's intent rather than
+        // snapping back to the pre-#2017 hardcoded 40%. `TuiDriver` has no
+        // live resize hook (see `tuidriver_queue_detail_pane_rewraps_to_
+        // the_live_panel_width` above), so this builds the app with a
+        // distinctive non-default fraction ALREADY set — exactly what the
+        // app looks like immediately after a resize, since nothing on the
+        // resize path touches `queue_split_frac` — and checks the detail
+        // pane gets more room than the 40%-default at BOTH of two
+        // different panel heights, rather than one of them snapping back.
+        let body: String = (0..30)
+            .map(|i| format!("LINE-{i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let grown = |h: u16| {
+            use quadraui::tui::testing::driver_with_shell;
+            let mut data = BoardData::default();
+            data.open_issues.push(open_issue("myrepo", 701, "T701", &body));
+            let mut app = make_app_with_drive_queue(data, queue_fixture_json());
+            app.queue_split_frac = 0.7;
+            let mut driver = driver_with_shell(app, CoordApp::shell_config(), 160, h);
+            click_activity_icon(&mut driver, QUEUE_ICON);
+            driver.render();
+            driver
+        };
+        let default_frac = |h: u16| {
+            let mut data = BoardData::default();
+            data.open_issues.push(open_issue("myrepo", 701, "T701", &body));
+            queue_driver_with_issues(data, queue_fixture_json(), 160, h)
+        };
+        let count_lines = |screen: &str| screen.lines().filter(|l| l.contains("LINE-")).count();
+
+        for h in [24u16, 40u16] {
+            let grown_lines = count_lines(&grown(h).screen());
+            let default_lines = count_lines(&default_frac(h).screen());
+            assert!(
+                grown_lines > default_lines,
+                "#2017: a `queue_split_frac` of 0.7 must show more of the \
+                 body than the 0.4 default at EVERY panel height, not just \
+                 the one it happened to be set at — at height {h}: \
+                 grown={grown_lines} lines, default={default_lines} lines"
+            );
+        }
+    }
+
+    #[test]
+    fn tuidriver_queue_grid_scrollbar_thumb_drag_scrolls_the_grid() {
+        // #2017 acceptance 5: press-drag-release on the grid's own
+        // scrollbar thumb must keep `queue_scroll` tracking the cursor
+        // across the whole gesture, not just jump once on the initial
+        // click — `queue_apply_vscroll`'s click-to-position already
+        // existed pre-#2017; `queue_vscroll_drag` is the continuation.
+        // Mirrors `reports_scrollbar_thumb_drag_scrolls_the_table`.
+        let n = 40;
+        let mut driver = queue_driver(&queue_fixture_json_many_rows(n), 160, 26);
+        let (_sep_x, sep_y) = find_queue_separator(&driver);
+        let screen = driver.screen();
+        let (sb_x, track_y0, track_y1) = scrollbar_track_in_rows(&screen, 0, sep_y as usize)
+            .unwrap_or_else(|| panic!("grid scrollbar must render for a {n}-row queue:\n{screen}"));
+
+        assert!(
+            driver.screen().contains("myrepo#800"),
+            "sanity: the first row must be visible before any scroll:\n{}",
+            driver.screen()
+        );
+
+        // The `+ 0.49` nudge past `track_y1` is the same edge-vs-centre
+        // correction `reports_scrollbar_thumb_drag_scrolls_the_table`
+        // documents: `track_y1` is the last track cell's CENTRE, and
+        // `queue_apply_detail_vscroll`/`queue_apply_vscroll` resolve
+        // fraction against the cell's far edge.
+        driver.mouse_down(sb_x, track_y0);
+        driver.mouse_move(sb_x, track_y1 + 0.49);
+        driver.mouse_up(sb_x, track_y1 + 0.49);
+        driver.render();
+
+        let last_issue = format!("myrepo#{}", 800 + n - 1);
+        assert!(
+            driver.screen().contains(&last_issue),
+            "#2017: dragging the grid scrollbar thumb to the bottom of the \
+             track must scroll to the last row:\n{}",
+            driver.screen()
+        );
+        assert!(
+            !driver.screen().contains("myrepo#800"),
+            "#2017: …and scroll the first row off screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    #[test]
+    fn tuidriver_queue_detail_scrollbar_thumb_drag_scrolls_the_detail_pane() {
+        // #2017 acceptance 6: the detail pane must paint a real vertical
+        // scrollbar (`show_v_scrollbar: true`, wired through
+        // `issue_body_list`'s new parameter — #1867 hardcoded this
+        // `false` for every caller, Board and Pipeline included) and
+        // support the same press/move/release gesture as the grid's.
+        let body: String = (0..40)
+            .map(|i| format!("LINE-{i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let mut data = BoardData::default();
+        data.open_issues.push(open_issue("myrepo", 701, "T701", &body));
+        let mut driver = queue_driver_with_issues(data, queue_fixture_json(), 160, 26);
+
+        let (_sep_x, sep_y) = find_queue_separator(&driver);
+        let screen = driver.screen();
+        let total_rows = screen.lines().count();
+        let (sb_x, track_y0, track_y1) =
+            scrollbar_track_in_rows(&screen, sep_y as usize + 1, total_rows).unwrap_or_else(|| {
+                panic!("detail-pane scrollbar must render for a 40-paragraph body:\n{screen}")
+            });
+
+        assert!(
+            driver.screen().contains("LINE-00"),
+            "sanity: LINE-00 must render before any scroll:\n{}",
+            driver.screen()
+        );
+
+        driver.mouse_down(sb_x, track_y0);
+        driver.mouse_move(sb_x, track_y1 + 0.49);
+        driver.mouse_up(sb_x, track_y1 + 0.49);
+        driver.render();
+
+        assert!(
+            driver.screen().contains("LINE-39"),
+            "#2017: dragging the detail-pane scrollbar thumb to the bottom \
+             of the track must scroll to the last paragraph:\n{}",
+            driver.screen()
+        );
+        assert!(
+            !driver.screen().contains("LINE-00"),
+            "#2017: …and scroll the first paragraph off screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    #[test]
+    fn tuidriver_queue_panel_paints_no_scrollbar_when_content_fits() {
+        // #2017 acceptance 7: a short queue and a short body must not
+        // paint either pane's scrollbar track. `ListView::vscrollbar` /
+        // `DataTableLayout` both already omit the strip when content
+        // fits — this is the end-to-end proof neither track paints "just
+        // in case" once #2017 wires the detail pane's up.
+        let mut data = BoardData::default();
+        data.open_issues
+            .push(open_issue("myrepo", 701, "T701", "short body, one line"));
+        let driver = queue_driver_with_issues(data, queue_fixture_json(), 160, 30);
+        let screen = driver.screen();
+        assert!(
+            !screen.contains('█') && !screen.contains('░'),
+            "#2017: neither pane's content overflows its viewport at this \
+             size — no scrollbar track may paint in either:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn tuidriver_queue_wheel_reaches_the_bottom_of_both_panes_after_a_splitter_drag() {
+        // #2017 acceptance 8 — the #1867/#1910 regression guard: once a
+        // splitter drag has changed both viewport heights, wheel-down must
+        // still reach the bottom of the detail pane AND the grid. The
+        // per-frame caches this depends on (`last_queue_detail_visible_
+        // rows` / `last_queue_detail_item_count` / `queue_table_visible_
+        // rows`) are all re-stashed by every `render_queue_panel` call —
+        // including the one right after a drag — so a stale, pre-drag
+        // viewport count must never leak into the wheel clamp.
+        let n = 30;
+        let body: String = (0..30)
+            .map(|i| format!("LINE-{i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let mut data = BoardData::default();
+        data.open_issues.push(open_issue("myrepo", 800, "T800", &body));
+        let mut driver =
+            queue_driver_with_issues(data, &queue_fixture_json_many_rows(n), 160, 30);
+
+        // Shrink the detail pane substantially (drag the separator toward
+        // the bottom), then confirm wheel-down over it still reaches the
+        // last paragraph despite the much shorter viewport.
+        let (sx, sy) = find_queue_separator(&driver);
+        driver.mouse_down(sx, sy);
+        driver.mouse_move(sx, sy + 8.0);
+        driver.mouse_up(sx, sy + 8.0);
+        driver.render();
+
+        let (dx, dy) = driver.find("LINE-00").unwrap_or_else(|| {
+            panic!("LINE-00 must still render post-drag:\n{}", driver.screen())
+        });
+        for _ in 0..60 {
+            reports_wheel(&mut driver, (dx, dy), -1.0);
+        }
+        assert!(
+            driver.screen().contains("LINE-29") && !driver.screen().contains("LINE-00"),
+            "#2017/#1910: wheel-down over the (now much shorter) detail \
+             pane must still reach the last paragraph after a splitter \
+             drag:\n{}",
+            driver.screen()
+        );
+
+        // Now shrink the GRID instead (drag the separator toward the top)
+        // and confirm wheel-down over the grid still reaches the last row.
+        let (sx2, sy2) = find_queue_separator(&driver);
+        driver.mouse_down(sx2, sy2);
+        driver.mouse_move(sx2, sy2 - 10.0);
+        driver.mouse_up(sx2, sy2 - 10.0);
+        driver.render();
+
+        let (gx, gy) = driver.find("myrepo#800").unwrap_or_else(|| {
+            panic!(
+                "myrepo#800 must still render post-drag:\n{}",
+                driver.screen()
+            )
+        });
+        for _ in 0..30 {
+            reports_wheel(&mut driver, (gx, gy), -1.0);
+        }
+        let last_issue = format!("myrepo#{}", 800 + n - 1);
+        assert!(
+            driver.screen().contains(&last_issue),
+            "#2017/#1910: wheel-down over the (now much shorter) grid must \
+             still reach the last row after a splitter drag:\n{}",
+            driver.screen()
+        );
+    }
+
+    #[test]
+    fn tuidriver_queue_scrollbar_click_does_not_select_a_row() {
+        // #2017 acceptance 9: the grid's scrollbar-track hit region must
+        // take priority over a row hit underneath it — a click there must
+        // not select whichever row happens to render under the track.
+        let n = 30;
+        let mut data = BoardData::default();
+        // Unique bodies per row so a changed selection is observable in
+        // the detail pane.
+        for i in 0..n {
+            data.open_issues.push(open_issue(
+                "myrepo",
+                800 + i as u64,
+                &format!("T{}", 800 + i),
+                &format!("BODY-{}-UNIQUE", 800 + i),
+            ));
+        }
+        let mut driver =
+            queue_driver_with_issues(data, &queue_fixture_json_many_rows(n), 160, 26);
+        assert!(
+            driver.screen().contains("BODY-800-UNIQUE"),
+            "sanity: row 0 (myrepo#800) is selected by default:\n{}",
+            driver.screen()
+        );
+
+        let (_sep_x, sep_y) = find_queue_separator(&driver);
+        let screen = driver.screen();
+        let (sb_x, track_y0, _track_y1) = scrollbar_track_in_rows(&screen, 0, sep_y as usize)
+            .unwrap_or_else(|| panic!("grid scrollbar must render for a {n}-row queue:\n{screen}"));
+
+        // A plain click partway down the track — hit-tested as a bare row
+        // click this would land on a different row than the one currently
+        // selected.
+        driver.mouse_down(sb_x, track_y0 + 3.0);
+        driver.mouse_up(sb_x, track_y0 + 3.0);
+        driver.render();
+
+        assert!(
+            driver.screen().contains("BODY-800-UNIQUE"),
+            "#2017: a scrollbar-track click must not change the row \
+             selection:\n{}",
+            driver.screen()
+        );
     }

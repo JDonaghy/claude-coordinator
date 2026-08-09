@@ -4666,6 +4666,43 @@ impl CoordApp {
                             redraw |= self.reports_apply_vscroll(pos);
                         }
                     }
+                    // #2017: continue an in-progress Queue splitter drag
+                    // and/or either pane's scrollbar-track drag, same
+                    // precedence and shape as the Audit/Reports blocks
+                    // above. All three drag flags are mutually exclusive by
+                    // construction (`mouse_main_click` sets at most one per
+                    // `MouseDown`), so checking them unconditionally rather
+                    // than as an `else if` chain costs nothing and stays
+                    // consistent with `MouseUp`'s unconditional release
+                    // below.
+                    if self.active_view == SidebarView::Queue && buttons.left {
+                        if self.queue_split_drag {
+                            redraw |= self.queue_update_split_drag(pos, main_b, lh);
+                        }
+                        if self.queue_vscroll_drag {
+                            redraw |= self.queue_apply_vscroll(pos);
+                        }
+                        if self.queue_detail_vscroll_drag {
+                            redraw |= self.queue_apply_detail_vscroll(pos);
+                        }
+                    }
+                    // #2017: resize-cursor hover affordance over the
+                    // separator — "should show a resize affordance on hover
+                    // if the backend supports it". `set_cursor` no-ops on
+                    // backends that can't (TUI's default impl), so this is
+                    // safe to call unconditionally rather than gating on
+                    // backend capability. Reset to `Default` on every other
+                    // Queue mouse move so the pointer doesn't stay stuck as
+                    // a resize glyph once the cursor (or the drag) leaves
+                    // the separator.
+                    if self.active_view == SidebarView::Queue {
+                        let hovering_sep = self.queue_split_drag || self.queue_separator_hit(pos);
+                        backend.set_cursor(if hovering_sep {
+                            PointerShape::Resize(ResizeEdge::North)
+                        } else {
+                            PointerShape::Default
+                        });
+                    }
                     if self.terminal_host_sel_dragging && buttons.left {
                         if let Some((col, row)) =
                             self.active_terminal_pixel_to_cell(pos, main_b, lh, char_w)
@@ -4773,17 +4810,21 @@ impl CoordApp {
                 // `audit_scrollbar_hit`'s region (`mouse_main_click` below).
                 // #1853: and a Reports result-table column-resize drag,
                 // the same way. #1910: and a Reports vertical-scrollbar-track
-                // drag. Each release is evaluated unconditionally rather
-                // than short-circuited behind `||` — with the
-                // short-circuit, a release while an earlier drag was active
-                // would leave a later one latched, and the next unrelated
-                // mouse-move would resume resizing a column (or scrolling)
-                // nobody grabbed.
+                // drag. #2017: and the Queue splitter drag plus either of its
+                // panes' scrollbar-track drags. Each release is evaluated
+                // unconditionally rather than short-circuited behind `||` —
+                // with the short-circuit, a release while an earlier drag
+                // was active would leave a later one latched, and the next
+                // unrelated mouse-move would resume resizing a column (or
+                // scrolling) nobody grabbed.
                 if btn == MouseButton::Left {
                     let mut released = self.audit_resize_col.take().is_some();
                     released |= self.audit_scrollbar_drag.take().is_some();
                     released |= self.reports_resize_col.take().is_some();
                     released |= std::mem::take(&mut self.reports_vscroll_drag);
+                    released |= std::mem::take(&mut self.queue_split_drag);
+                    released |= std::mem::take(&mut self.queue_vscroll_drag);
+                    released |= std::mem::take(&mut self.queue_detail_vscroll_drag);
                     if released {
                         return true;
                     }
@@ -5682,21 +5723,35 @@ impl CoordApp {
                 | None => false,
             };
         }
-        // #1866 (Q-1): Queue panel — the whole main pane is one `DataTable`.
+        // #1866 (Q-1): Queue panel — grid, draggable separator (#2017), and
+        // detail pane.
         //
         // A header click sorts by that column (None→▲→▼→None). Client-side
         // sorting is correct here for the same reason it is in Reports and
         // wrong in Audit: the rows on screen are the complete queue, not one
         // server-paginated page of it.
         //
-        // The vertical-scrollbar track is tested FIRST, before
-        // `queue_table_hit`: `DataTableLayout::hit_test` has no concept of
-        // the scrollbar strip it reserves space for, so without this a click
-        // on the thumb mis-resolves to whichever row sits under it (#1094's
-        // gap, re-hit by Reports at #1910).
+        // Both scrollbar tracks and the separator are tested FIRST, before
+        // `queue_table_hit`: `DataTableLayout::hit_test`/`ListViewLayout::
+        // hit_test` have no concept of the scrollbar strip or separator
+        // widget, so without this a click there mis-resolves to whichever
+        // row sits under it (#1094's gap, re-hit by Reports at #1910, and
+        // now a third region — the separator — that could be confused with
+        // either track's end, per #2017's own acceptance test 9: a
+        // scrollbar-track click must not fall through to a row select OR
+        // start a separator drag).
         if self.active_view == SidebarView::Queue {
             if self.queue_scrollbar_hit(pos) {
+                self.queue_vscroll_drag = true;
                 return self.queue_apply_vscroll(pos);
+            }
+            if self.queue_detail_scrollbar_hit(pos) {
+                self.queue_detail_vscroll_drag = true;
+                return self.queue_apply_detail_vscroll(pos);
+            }
+            if self.queue_separator_hit(pos) {
+                self.queue_split_drag = true;
+                return true;
             }
             return match self.queue_table_hit(pos) {
                 Some(DataTableHit::Header { col }) => self.queue_sort_by_column(col),

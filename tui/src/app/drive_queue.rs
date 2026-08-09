@@ -972,18 +972,93 @@ impl CoordApp {
         }
     }
 
-    /// Render the Queue grid into `rect`.
+    /// #2017: minimum rows the grid may be squeezed to during a splitter
+    /// drag — one header row plus two data rows, so it never shrinks to
+    /// something that reads as "gone" the way a bare header would. The
+    /// detail pane's own floor (`QUEUE_MIN_DETAIL_ROWS`) predates this and
+    /// is the precedent this mirrors on the other side of the split.
+    const QUEUE_MIN_GRID_ROWS: f32 = 3.0;
+
+    /// #1867's original floor, unchanged: below 7 rows the detail pane
+    /// reads as decorative rather than usable (no fixed header the way
+    /// Audit's key/value list has, so it needs more headroom than the grid
+    /// does).
+    const QUEUE_MIN_DETAIL_ROWS: f32 = 7.0;
+
+    /// #2017: clamp a candidate detail-pane height into
+    /// `[detail floor, avail - grid floor]`, squeezing both floors evenly
+    /// instead of letting one win outright when `avail` is too short to fit
+    /// both (acceptance test 3: "both panes still render" even on a tiny
+    /// terminal).
+    ///
+    /// Single source of truth for `render_queue_panel`'s paint (fed
+    /// `avail * queue_split_frac`, the persisted intent) and
+    /// `queue_update_split_drag`'s live recompute (fed the cursor's raw
+    /// position) — so the two can never resolve the same drag to two
+    /// different heights. Mirrors `drag_divider`'s both-sides clamp
+    /// (`reports.rs::REPORTS_MIN_COLUMN_WIDTH`) applied to rows instead of
+    /// columns.
+    fn queue_clamp_detail_h(avail: f32, desired_detail_h: f32, lh: f32) -> f32 {
+        let min_detail_h = (lh * Self::QUEUE_MIN_DETAIL_ROWS).min(avail).max(0.0);
+        let min_grid_h = (lh * Self::QUEUE_MIN_GRID_ROWS).min(avail).max(0.0);
+        let (min_detail_h, min_grid_h) = if min_detail_h + min_grid_h > avail {
+            let half = (avail / 2.0).max(0.0);
+            (half, half)
+        } else {
+            (min_detail_h, min_grid_h)
+        };
+        let max_detail_h = (avail - min_grid_h).max(min_detail_h);
+        desired_detail_h.clamp(min_detail_h, max_detail_h)
+    }
+
+    /// #2017: the draggable separator between the grid and the detail pane
+    /// — a single highlighted row. `ListItem` carries no per-row background
+    /// override of its own, so this leans on the rasteriser's
+    /// selected-row highlight (`has_focus: true` + `selected_idx: 0`) to
+    /// paint a full-width bar rather than plain text sitting on the
+    /// ordinary background — the boundary needs to read as a grabbable
+    /// widget, not an implicit gap between two others.
+    fn queue_separator_list() -> ListView {
+        ListView {
+            id: WidgetId::new("queue-splitter"),
+            title: None,
+            items: vec![ListItem {
+                text: StyledText {
+                    spans: vec![StyledSpan::with_fg(
+                        " ⋮⋮⋮ drag to resize ⋮⋮⋮ ",
+                        Color::rgb(230, 230, 255),
+                    )],
+                },
+                icon: None,
+                detail: None,
+                decoration: Decoration::Normal,
+            }],
+            selected_idx: 0,
+            scroll_offset: 0,
+            has_focus: true,
+            bordered: false,
+            h_scroll: 0,
+            max_content_width: None,
+            show_v_scrollbar: false,
+        }
+    }
+
+    /// Render the Queue grid, draggable separator, and detail pane into
+    /// `rect`.
     pub(crate) fn render_queue_panel(&self, backend: &mut dyn Backend, rect: Rect, lh: f32) {
         // Cleared FIRST and unconditionally. Both early returns below paint
-        // no table at all, and a stale cache would let a later click route a
-        // header/row hit against geometry that is no longer on screen.
+        // no table (or split) at all, and a stale cache would let a later
+        // click route a header/row/separator/scrollbar hit against geometry
+        // that is no longer on screen.
         *self.queue_table_layout.borrow_mut() = None;
+        self.queue_separator_rect.set(None);
+        *self.queue_detail_scrollbar.borrow_mut() = None;
 
         let rows = self.queue_rows();
         if rows.is_empty() {
             // An empty grid renders as a bare header row, which reads like a
             // broken fetch. Say which of the two empties this actually is.
-            // Nothing to select either, so no detail pane below it.
+            // Nothing to select either, so no split/detail pane below it.
             let total = self.data.drive_queue.len();
             let message = if total == 0 {
                 "  Drive queue is empty — nothing waiting or running.".to_string()
@@ -998,19 +1073,24 @@ impl CoordApp {
             return;
         }
 
-        // #1867 (Q-2): bottom ~40% is the selected row's issue body,
-        // scrollable. Same split shape as Audit's entry-detail pane
-        // (`audit.rs::render_audit_panel`) — reserve at least 7 rows (this
-        // pane has no fixed header the way Audit's key/value list does, but
-        // a shorter pane than that reads as decorative rather than usable)
-        // for the detail body, the rest for the grid above it. Unlike Audit
-        // the split is unconditional: there is no open/close toggle here,
-        // the pane is always part of the Queue panel's layout.
-        let min_detail_h = (lh * 7.0).min(rect.height);
-        let detail_h = (rect.height * 0.4).max(min_detail_h).min(rect.height);
-        let list_h = (rect.height - detail_h).max(0.0);
+        // #2017: the split is now operator-draggable (`queue_split_frac`,
+        // persisted for the session) rather than the #1867 hardcoded 40%,
+        // with a one-row separator carved out between the two panes so the
+        // boundary is a real, grabbable widget instead of an implicit gap.
+        // `avail` is what the split fraction actually divides — the panel
+        // height minus that separator row.
+        let sep_h = lh.max(1.0).min(rect.height);
+        let avail = (rect.height - sep_h).max(0.0);
+        let detail_h = Self::queue_clamp_detail_h(avail, avail * self.queue_split_frac, lh);
+        let list_h = (avail - detail_h).max(0.0);
         let list_rect = Rect::new(rect.x, rect.y, rect.width, list_h);
-        let detail_rect = Rect::new(rect.x, rect.y + list_h, rect.width, rect.height - list_h);
+        let sep_rect = Rect::new(rect.x, rect.y + list_h, rect.width, sep_h);
+        let detail_rect = Rect::new(
+            rect.x,
+            rect.y + list_h + sep_h,
+            rect.width,
+            (rect.height - list_h - sep_h).max(0.0),
+        );
 
         let table = DataTable {
             id: WidgetId::new("queue-grid"),
@@ -1045,25 +1125,43 @@ impl CoordApp {
         // panel's origin, so a bare `pos - main_b` would mis-hit-test.
         *self.queue_table_layout.borrow_mut() = Some((list_rect, layout));
 
+        backend.draw_list(sep_rect, &Self::queue_separator_list());
+        self.queue_separator_rect.set(Some(sep_rect));
+
         // #1867: stash the pane's painted width so `queue_issue_body_list`
         // word-wraps to the live viewport — the `last_issue_panel_cols`
         // pattern (`render.rs:175`), just under its own `Cell`.
         self.last_queue_detail_cols.set(detail_rect.width as usize);
         // #1867 fix: also stash the pane's OWN visible-row count (its rect
-        // is only the bottom ~40% of `rect`, never the whole panel) so
+        // is only a fraction of `rect`, never the whole panel) so
         // `mouse_main_scroll`'s clamp doesn't use the full-panel `visible`
         // and saturate to 0 for any body shorter than the whole panel. See
         // `last_queue_detail_visible_rows`'s doc comment for the bug this
-        // avoids.
+        // avoids. #2017: still correct after a splitter drag, since this is
+        // read from the just-computed `detail_rect`, never a stale one.
         self.last_queue_detail_visible_rows
             .set(content_visible_rows(detail_rect, lh).max(1));
         // Built once here and reused for both the paint and the item-count
         // cache, so `mouse_main_scroll` can read `last_queue_detail_item_count`
         // instead of re-running this (a markdown re-render that also drains
         // the pending-fetch channel) on every wheel notch.
+        //
+        // #2017: `show_v_scrollbar: true` (set inside `queue_issue_body_list`
+        // via `issue_body_list`'s new parameter) — this is the one place
+        // among the three `issue_body_list` callers (Board, Pipeline, Queue)
+        // where it's on, so only this panel gains the track.
         let detail_list = self.queue_issue_body_list();
         self.last_queue_detail_item_count
             .set(detail_list.items.len());
+        // #2017: the detail pane's scrollbar geometry, from the SAME
+        // `ListView` and rect the paint below uses — `Backend::
+        // list_vscrollbar` is the single source of truth the rasteriser
+        // consumes too, so a click can never hit-test against geometry the
+        // paint disagrees with. `None` when the body fits (no track), which
+        // `queue_detail_scrollbar_hit` / `queue_apply_detail_vscroll` both
+        // already treat as "nothing to do".
+        *self.queue_detail_scrollbar.borrow_mut() =
+            backend.list_vscrollbar(detail_rect, &detail_list);
         backend.draw_list(detail_rect, &detail_list);
     }
 
@@ -1086,11 +1184,23 @@ impl CoordApp {
         // #1867: use the pane width stashed at draw time for word-wrapping.
         let wrap_width = self.last_queue_detail_cols.get().max(40);
         let Some(row) = self.queue_selected_row() else {
-            return issue_body_list(None, self.queue_detail_scroll, "queue-issue-body", wrap_width);
+            return issue_body_list(
+                None,
+                self.queue_detail_scroll,
+                "queue-issue-body",
+                wrap_width,
+                true,
+            );
         };
         let repo = row.repo_name.clone();
         let Ok(number) = u64::try_from(row.issue_number) else {
-            return issue_body_list(None, self.queue_detail_scroll, "queue-issue-body", wrap_width);
+            return issue_body_list(
+                None,
+                self.queue_detail_scroll,
+                "queue-issue-body",
+                wrap_width,
+                true,
+            );
         };
         let key = (repo.clone(), number);
         // The queue's own title lookup (`queue_row`'s Title cell, minus the
@@ -1110,6 +1220,7 @@ impl CoordApp {
                 self.queue_detail_scroll,
                 "queue-issue-body",
                 wrap_width,
+                true,
             );
         }
 
@@ -1145,6 +1256,7 @@ impl CoordApp {
                 self.queue_detail_scroll,
                 "queue-issue-body",
                 wrap_width,
+                true,
             );
         }
 
@@ -1174,6 +1286,7 @@ impl CoordApp {
                     self.queue_detail_scroll,
                     "queue-issue-body",
                     wrap_width,
+                    true,
                 );
             }
         }
@@ -1189,6 +1302,7 @@ impl CoordApp {
             self.queue_detail_scroll,
             "queue-issue-body",
             wrap_width,
+            true,
         )
     }
 
@@ -1255,6 +1369,95 @@ impl CoordApp {
             0
         } else {
             let frac = ((pos.y - track_y0) / track_h).clamp(0.0, 1.0);
+            (frac * max_scroll as f32).round() as usize
+        };
+        true
+    }
+
+    /// #2017: did a click/hover land on the draggable separator between the
+    /// grid and the detail pane? Checked ahead of `queue_table_hit` by every
+    /// caller, the same #1094-precedent reason `queue_scrollbar_hit` is: the
+    /// separator is a real widget with its own painted rect
+    /// (`queue_separator_rect`), not something `DataTableLayout::hit_test`
+    /// or `ListViewLayout::hit_test` knows anything about.
+    pub(crate) fn queue_separator_hit(&self, pos: Point) -> bool {
+        let Some(r) = self.queue_separator_rect.get() else {
+            return false;
+        };
+        pos.x >= r.x && pos.x < r.x + r.width && pos.y >= r.y && pos.y < r.y + r.height
+    }
+
+    /// #2017: continue an in-progress splitter drag (started by a
+    /// `MouseDown` on the separator — see `queue_separator_hit` and
+    /// `mouse_main_click`), recomputing `queue_split_frac` from the
+    /// cursor's live `pos` so the separator tracks it. No-op (returns
+    /// `false`) when no drag is in progress or `main_b` is degenerate.
+    ///
+    /// `main_b` is the panel rect `render_queue_panel` painted into as
+    /// `rect` — Queue has no `panel_toolbar()` (see `sidebar.rs`), so
+    /// `ctx.main_bounds()` at drag time is exactly that rect, the same
+    /// assumption `mouse_main_scroll`'s Queue arm already relies on.
+    ///
+    /// Runs the SAME floor clamp (`queue_clamp_detail_h`) the paint uses,
+    /// fed the cursor's raw position instead of the persisted fraction —
+    /// this is what keeps a drag that hits a floor from "fighting" the next
+    /// render rather than settling there.
+    pub(crate) fn queue_update_split_drag(&mut self, pos: Point, main_b: Rect, lh: f32) -> bool {
+        if !self.queue_split_drag || main_b.height <= 0.0 {
+            return false;
+        }
+        let sep_h = lh.max(1.0).min(main_b.height);
+        let avail = (main_b.height - sep_h).max(0.0);
+        if avail <= 0.0 {
+            return false;
+        }
+        // The cursor's y becomes the separator's top edge; everything below
+        // it, minus the separator's own row, is the detail pane.
+        let desired_detail_h = (main_b.y + main_b.height) - (pos.y + sep_h);
+        let detail_h = Self::queue_clamp_detail_h(avail, desired_detail_h, lh);
+        self.queue_split_frac = detail_h / avail;
+        true
+    }
+
+    /// #2017: did a click land on the detail pane's vertical scrollbar
+    /// track? Same #1094-precedent shape as `queue_scrollbar_hit`, over the
+    /// `Scrollbar` geometry `render_queue_panel` cached from `Backend::
+    /// list_vscrollbar` rather than a `DataTableLayout`.
+    pub(crate) fn queue_detail_scrollbar_hit(&self, pos: Point) -> bool {
+        let cache = self.queue_detail_scrollbar.borrow();
+        let Some(sb) = cache.as_ref() else {
+            return false;
+        };
+        let t = sb.track;
+        pos.x >= t.x && pos.x < t.x + t.width && pos.y >= t.y && pos.y < t.y + t.height
+    }
+
+    /// #2017: jump `queue_detail_scroll` to the position implied by a
+    /// click/drag along the detail pane's vertical scrollbar track. Mirrors
+    /// `queue_apply_vscroll` / `reports_apply_vscroll`, over the cached
+    /// `Scrollbar.track` instead of a `DataTableLayout`.
+    ///
+    /// Reads `last_queue_detail_item_count` / `last_queue_detail_visible_rows`
+    /// — the same live, per-frame-refreshed pane geometry `mouse_main_scroll`'s
+    /// wheel arm already uses (the #1867/#1910 lesson this issue's
+    /// acceptance test 8 guards): both are re-stashed on every
+    /// `render_queue_panel` call, so a splitter drag that just changed the
+    /// pane's height is reflected immediately, never a stale value.
+    pub(crate) fn queue_apply_detail_vscroll(&mut self, pos: Point) -> bool {
+        let items = self.last_queue_detail_item_count.get();
+        let visible = self.last_queue_detail_visible_rows.get().max(1);
+        let max_scroll = items.saturating_sub(visible);
+        let track = {
+            let cache = self.queue_detail_scrollbar.borrow();
+            match cache.as_ref() {
+                Some(sb) => sb.track,
+                None => return false,
+            }
+        };
+        self.queue_detail_scroll = if max_scroll == 0 || track.height <= 0.0 {
+            0
+        } else {
+            let frac = ((pos.y - track.y) / track.height).clamp(0.0, 1.0);
             (frac * max_scroll as f32).round() as usize
         };
         true
