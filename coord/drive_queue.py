@@ -1466,14 +1466,19 @@ def plan_tick(
     pre-#1870 behaviour — the production shell always passes its own
     hostname.
 
-    The algorithm, from #1754, plus #1757's step 2 and #1891's step 1b:
+    The algorithm, from #1754, plus #1757's step 2, #1891's step 1b, and
+    #2055's extension of it:
 
     1. Reconcile every ``running`` entry (:func:`_reconcile_running`).
-    1b. Re-check every ``parked`` entry (#1891) against the CURRENT board:
-        landed ⇒ ``done``; gate cleared ⇒ ``waiting`` (falls into step 4 on
-        this SAME tick); gate still shut ⇒ untouched, no write, nothing to
-        report. Never spends an attempt either way — a missing CI verdict is
-        not a failed one.
+    1b. Re-check every ``parked``/``blocked``/``failed`` entry against the
+        CURRENT board: landed ⇒ ``done`` (#1891 for ``parked``, #2055 for
+        ``blocked``/``failed``). For ``parked`` only, not-yet-landed then
+        also checks the gate: cleared ⇒ ``waiting`` (falls into step 4 on
+        this SAME tick); still shut ⇒ untouched, no write, nothing to
+        report. ``blocked``/``failed`` that haven't landed are left alone
+        entirely — this never resurrects them for dispatch, only lets a
+        finished one stop claiming to be unfinished. Never spends an
+        attempt either way — a missing CI verdict is not a failed one.
     2. Resolve deploy gates (:func:`_resolve_holds`).  ANY gate left closed
        returns immediately with no launch and a HELD alert — before the
        capacity check, and regardless of how eligible the rest of the queue
@@ -1570,13 +1575,25 @@ def plan_tick(
     # shut is left alone entirely: no reconcile, no write, nothing to
     # report — the parked row itself, rendered by `coord drive-queue list`/
     # `status`, already answers "why isn't this launching".
+    #
+    # #2055 extends the SAME `landed` check to `blocked` and `failed`
+    # entries. `blocked`/`failed` are terminal for dispatch — the queue gave
+    # up on them, and this loop must NOT resurrect them for a relaunch, the
+    # way the `parked` branch below resumes to `waiting` on cleared CI. But
+    # "the queue gave up" and "the work is done" are independent facts: a
+    # human fixes a blocked/failed issue by hand and merges it out of band
+    # exactly as often as a parked one lands while its gate is still shut.
+    # Without this, that merge is invisible forever — `blocked`/`failed`
+    # have no other re-check, so the board keeps reporting finished work as
+    # outstanding until someone notices and runs
+    # `coord drive-queue remove`. See #1956 for a live instance.
     for entry in ordered:
-        if entry.state != STATE_PARKED:
+        if entry.state not in (STATE_PARKED, STATE_BLOCKED, STATE_FAILED):
             continue
         facts = board.facts(entry.key)
         if facts.landed:
             witness = "merged" if facts.merged else "closed"
-            reason = f"done — issue already {witness} while parked (#1891)"
+            reason = f"done — issue already {witness} while {entry.state} (#2055)"
             reconciles.append(
                 Reconcile(
                     entry.key,
@@ -1591,6 +1608,13 @@ def plan_tick(
                 )
             )
             states[entry.key] = STATE_DONE
+            continue
+        if entry.state != STATE_PARKED:
+            # `blocked`/`failed` entries are terminal for dispatch: the
+            # landed check above is the only re-check they get. Never fall
+            # through to the parked-only CI resume below — that would
+            # relaunch a gave-up entry outside the `blocked`/`failed`
+            # attempt-tracking this function's docstring describes (#2055).
             continue
         if facts.merge_ci_pending:
             continue
