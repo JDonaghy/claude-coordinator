@@ -1,0 +1,38 @@
+# coord release propagate — fires coord-release-propagate.service
+# (Type=oneshot) on a cadence. See that unit's header for the full rationale.
+#
+# 20 minutes. The tick is cheap and almost always a no-op: it reads the board,
+# finds the fleet busy, records a deferral and exits. What the interval
+# actually buys is *latency from quiescence to deployed* — the window between
+# a drive finishing and the next one launching is minutes wide
+# (coord-drive-queue.timer fires every 3 minutes), so a slow propagation
+# cadence would routinely miss the gap and the fleet would sit a release
+# behind for hours.
+#
+# Not tighter than that, for two reasons. Each fire that *does* find a window
+# restarts every agent, so an over-eager cadence turns a transient idle moment
+# into a fleet restart the operator did not ask for. And a propagation run
+# holds the window it found: an interval shorter than a full roll+verify
+# sweep would just queue up runs behind each other.
+#
+# Persistent=true so a host that was asleep or rebooted catches up on the next
+# boot rather than waiting a full interval — the whole point is that the fleet
+# converges on the released version without anyone thinking about it.
+#
+# RandomizedDelaySec spreads fires if this unit is ever (against the advice in
+# the service header) installed on more than one host: two propagations
+# racing would both find the same window and both start restarting agents.
+# The real defence is "install on the daemon host only"; this is the belt.
+
+[Unit]
+Description=Attempt fleet propagation of the released version every 20 minutes (#1835)
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=20min
+RandomizedDelaySec=2min
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

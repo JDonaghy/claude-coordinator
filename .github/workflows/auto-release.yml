@@ -1,0 +1,142 @@
+name: Auto-release on merge to main
+
+# #1835 (PKG-7): the publish half of "merging a PR to `main` is the only
+# human action in a release".
+#
+# What this does is deliberately small: decide whether this merge ships
+# anything, pick the next `vX.Y.Z`, and push that tag. Everything after the
+# tag already exists and is unchanged — `publish.yml` (#1242, PKG-6) turns
+# one `v*` tag into one Release carrying the wheel, the bundled webapp and
+# the coord-tui binaries, and refuses to publish from a commit that never
+# landed on main (#1471). This workflow adds no new publishing path; it
+# removes the human who used to type `git tag`.
+#
+# The *propagate* half is not here and must not be. `coord agent update`
+# restarts each agent, and a restart kills every in-flight headless worker,
+# so a merge-triggered fleet upgrade would routinely destroy overnight drive
+# queue work (#56/#1750) — the more the queue works, the more it destroys.
+# Propagation is scheduled against fleet quiescence instead: `coord release
+# propagate`, run by `deploy/coord-release-propagate.timer`. See
+# `coord/release_propagate.py` and docs/AGENT_OPERATIONS.md.
+#
+# TRIGGER POLICY — path-filtered, opt-out by commit message, coalesced.
+# The full justification (and the rejected alternatives: every-merge,
+# label-gated, batched) lives in `scripts/next_release_tag.py`'s docstring,
+# next to the code that implements it and the tests that pin it, rather than
+# in YAML comments nothing executes.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: >-
+          Compute and print the decision (release? which tag?) for the
+          current tip of main WITHOUT pushing any tag. This is how you
+          validate a change to the policy, since a real run publishes
+          immutably to PyPI.
+        type: boolean
+        default: true
+
+# Coalescing, per the trigger policy: a burst of merges collapses to ONE
+# release at the tip instead of one per merge. `cancel-in-progress` is safe
+# here precisely because this workflow's only side effect is the final tag
+# push — a cancelled run has published nothing.
+concurrency:
+  group: auto-release-main
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  decide-and-tag:
+    runs-on: ubuntu-latest
+    permissions:
+      # Pushing the tag. This is the only write in the workflow.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history AND tags: the next version is derived from the
+          # highest existing `vX.Y.Z`, and a shallow clone would see none of
+          # them and mint `v0.0.1` over the top of a live release line.
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Which paths this push actually changed. `github.event.before` is the
+      # previous tip of main; on the very first push to a branch it is the
+      # all-zeroes SHA, in which case we fall back to the merge commit's own
+      # diff. An unresolvable diff yields an EMPTY list, which
+      # `scripts/next_release_tag.py` treats as "ships code" on purpose —
+      # failing open to a superfluous release beats failing closed to a fix
+      # that silently never ships.
+      - name: Collect changed paths
+        id: changed
+        shell: bash
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          set -o pipefail
+          files=""
+          if [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] \
+             && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            files="$(git diff --name-only "$BEFORE" "$AFTER" || true)"
+          else
+            files="$(git show --pretty=format: --name-only "$AFTER" || true)"
+          fi
+          echo "changed paths:"
+          echo "$files"
+          {
+            echo "files<<__EOF__"
+            echo "$files"
+            echo "__EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether to release, and under what tag
+        id: decide
+        shell: bash
+        # Message and file list ride in through `env:` rather than being
+        # spliced into the script — a merge commit message is attacker-ish
+        # text from a PR title, and `${{ }}`-in-`run:` executes it as bash.
+        env:
+          MSG: ${{ github.event.head_commit.message }}
+          FILES: ${{ steps.changed.outputs.files }}
+        run: |
+          printf '%s\n' "$FILES" | python scripts/next_release_tag.py \
+            --message "$MSG" --changed-files-from-stdin
+
+      - name: No release for this merge
+        if: steps.decide.outputs.release != 'true'
+        run: |
+          echo "::notice::No release cut — ${{ steps.decide.outputs.reason }}"
+
+      - name: Tag the release
+        # The dry-run dispatch stops here: it has printed the decision, which
+        # is the entire point of dispatching it.
+        if: >-
+          steps.decide.outputs.release == 'true' &&
+          github.event.inputs.dry_run != 'true'
+        env:
+          TAG: ${{ steps.decide.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Idempotence: a re-run of this workflow for the same tip must not
+          # fail the job trying to re-create a tag that already exists (and
+          # must certainly not move it — `publish.yml` has already published
+          # against it and PyPI uploads are immutable).
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "::notice::$TAG already exists — nothing to do."
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "Release $TAG (auto-cut on merge, #1835)"
+          git push origin "$TAG"
+          echo "::notice::Pushed $TAG — publish.yml takes it from here."

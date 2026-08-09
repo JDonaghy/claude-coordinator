@@ -1,0 +1,83 @@
+# coord release propagate — the PROPAGATE half of merge-triggered release
+# (#1835, PKG-7).
+#
+# A systemd *user* unit (mirrors coord-drive-queue), paired with
+# coord-release-propagate.timer. Each fire is one attempt:
+#
+#   1. resolve the released version from PyPI's simple index;
+#   2. ask the drive queue and the board whether the fleet is QUIESCENT;
+#   3. if it is not — record a deferral and exit 0. This is the normal,
+#      expected outcome most of the time and it is NOT a failure;
+#   4. if it is — roll each lane in the daemon-first order, run
+#      `coord release verify` as the final gate, roll back on red, and
+#      release the drive-queue deploy gates (#1757) that were waiting for
+#      exactly this deploy.
+#
+# WHY THIS IS A TIMER AND NOT A GITHUB ACTION
+# -------------------------------------------
+# The *publish* half IS a GitHub Action (.github/workflows/auto-release.yml)
+# because publishing touches no running host. Propagation restarts every
+# agent, and a restart kills every in-flight headless worker — so it must
+# wait for a window where nothing is mid-flight. GitHub cannot see that;
+# only the board can. Hence: publish on merge, propagate on quiescence.
+#
+# WHICH HOST
+# ----------
+# Install ONLY on the daemon host (dellserver in production — the same box
+# that runs coord-serve / coord-drive-queue / coord-notify). This unit reads
+# `/board` and POSTs to every agent, and it releases drive-queue holds, so it
+# belongs where the queue and the board already live. Installing a second
+# copy elsewhere gives the fleet two independent things deciding to restart
+# it, which is the #1440 two-overseers failure in a new costume.
+#
+# COORD_BIN — same #1523 requirement as coord-drive-queue.service: the CLI
+# this unit runs must be a PINNED, NON-EDITABLE install, because it is the
+# thing that upgrades everything else. On dellserver ~/.local/bin/coord is a
+# symlink into ~/.coord-venv, which satisfies that and rides the ordinary
+# agent-venv lane. Do NOT install this unit on a dev box whose
+# ~/.local/bin/coord points at a checkout.
+#
+# SELF-UPDATE ORDERING: this unit's own CLI lives in the venv it is about to
+# swap. That is safe *because* #1241 made the swap atomic (blue/green symlink
+# flip) — a running `coord release propagate` keeps executing the fully-old
+# slot it started from; it can never observe a half-written site-packages.
+# The next fire runs the new one.
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/coord-release-propagate.service \
+#      deploy/coord-release-propagate.timer ~/.config/systemd/user/
+#   loginctl enable-linger "$USER"
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now coord-release-propagate.timer
+#
+# (After the first release carrying #1835, `coord release propagate` installs
+# unit updates itself via each agent's POST /deploy-units — but it only
+# refreshes units a host ALREADY has, so this first install is by hand, once.)
+#
+# This is a Type=oneshot service activated BY THE TIMER — do not
+# `systemctl --user enable coord-release-propagate.service` directly.
+#
+# Read the journal it writes with `coord release history`, not just
+# `journalctl`: the JSONL record survives a half-installed venv and is the
+# thing that makes "the fleet reached that version" checkable after the fact.
+
+[Unit]
+Description=Propagate the released version to the fleet at the next quiescent window (#1835)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# No --force, ever, from a timer. --force rolls over a BUSY fleet and kills
+# in-flight headless workers — the single thing this whole design exists to
+# avoid. It stays an interactive-operator flag.
+#
+# --verify and --rollback-on-red are the defaults; named explicitly here so
+# the unit reads as the policy it is, and so a future default change cannot
+# silently disarm the fleet's rollback.
+ExecStart=%h/.local/bin/coord release propagate --verify --rollback-on-red --config %h/.coord/coordinator.yml
+# A roll waits up to --timeout (180s) per agent for the new version to be
+# reported, across every machine, plus two full verification sweeps. Generous,
+# but well under the timer's cadence so a wedged run cannot run into the next.
+TimeoutStartSec=1800
