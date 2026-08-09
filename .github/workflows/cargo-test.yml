@@ -6,28 +6,18 @@ name: Rust tests
 # Issue #741 called for either resolving or tracking the gap — this resolves it
 # for the coord-tui crate (the tui/ subdirectory of this repo).
 #
-# Path-dep note: tui/Cargo.toml has
-#   quadraui = { path = "../../quadraui/quadraui", ... }
-# which mirrors the local dev layout ~/src/claude-coordinator/ (sibling of
-# ~/src/quadraui/).  On CI we replicate that layout by cloning quadraui to
-# ../quadraui (relative to $GITHUB_WORKSPACE) via `git clone` — a plain shell
-# step can write outside the workspace, unlike actions/checkout@v4 which
-# enforces a workspace-relative path restriction.
-
-# #1865: the path-dep clone below always pulls quadraui's *default* branch
-# (develop) — a moving target, not a pin. That's deliberate: it's what lets
-# this job catch a quadraui-side break at all. But it also means push/PR
-# triggers alone are blind to that class of break: a break in quadraui touches
-# nothing in this repo's tui/**, so nothing fires, and the workflow can sit
-# green-and-stale for hours (see #1865's timeline). The schedule/dispatch
-# triggers below put the job on quadraui's clock instead of tui/**'s churn.
-#
-# Transfers to vimcode? vimcode (a separate repo) has the identical exposure:
-# vimcode/Cargo.toml carries the same sibling path dep on quadraui, and its
-# own ci.yml presumably has the same tui/PR-path-only blind spot. This same
-# schedule+workflow_dispatch+SHA-logging+continue-on-error shape should port
-# there cleanly — nothing here is coord-tui-specific. Out of scope for #1865
-# (different repo); noted so the port is a cheap follow-up, not a rediscovery.
+# #1973: tui/Cargo.toml pins quadraui by `git`/`rev` rather than a sibling
+# path dependency, so `cargo test` here fetches quadraui straight from
+# GitHub at the pinned rev — there is nothing left to check out or reproduce
+# a sibling-directory layout for. That also retired this workflow's original
+# #1865 role: the schedule/workflow_dispatch "canary" triggers below used to
+# build tui/ against quadraui's *moving* `develop` branch specifically to
+# catch a quadraui-side break before it reached coord-tui. Since the pin, a
+# scheduled run here would just rebuild the same pinned rev every time and
+# report green regardless of what quadraui's develop is doing — a canary
+# that can't smell smoke. Per #1973's decision, vimcode (which keeps the
+# floating path dep on purpose) is the sole canary for quadraui breaks going
+# forward; this workflow is back to being a plain gate on tui/** changes.
 on:
   push:
     branches: [main]
@@ -41,16 +31,9 @@ on:
       - 'tui/**'
       # Self-trigger so edits to this workflow are exercised by their own PR.
       - '.github/workflows/cargo-test.yml'
-  # #1865: run once a day so a quadraui `develop` break is caught even when no
-  # tui/** file in *this* repo changed. Cadence is deliberately coarse — the
-  # same person works both repos in the same sessions, so the value here is
-  # catching a break before the next local rebuild, not sub-hour latency.
-  # Minute deliberately off-the-hour (:17, not :00) — top-of-hour crons are a
-  # common GitHub Actions queuing hotspot; this dodges that contention.
-  schedule:
-    - cron: '17 6 * * *'
-  # #1865: makes "is tui/ still buildable against quadraui develop?" a
-  # one-click question from the Actions tab instead of a local rebuild.
+  # Manual re-run convenience — no longer a "check tui/ against quadraui
+  # develop" canary (see #1973 note above); it now just builds tui/ at
+  # whatever ref is checked out, same as push/pull_request.
   workflow_dispatch:
 
 jobs:
@@ -58,30 +41,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      # Reproduce the sibling-directory layout that tui/Cargo.toml expects:
-      #   quadraui = { path = "../../quadraui/quadraui" }
-      # From tui/ that resolves to $GITHUB_WORKSPACE/../quadraui/quadraui.
-      #
-      # actions/checkout@v4 refuses any `path:` outside $GITHUB_WORKSPACE, so we
-      # use a plain `git clone` instead — shell steps are not subject to that
-      # restriction and can write to the parent directory freely.
-      #
-      # #1865: the clone target is a moving branch (quadraui's default,
-      # develop), so this job's result depends on *when* it ran, not only on
-      # the commit under test. Log the SHA into the step summary so a red run
-      # can be triaged into "quadraui broke us" vs "this PR broke us" without
-      # re-deriving it by hand.
-      - name: Check out quadraui (sibling path dep)
-        run: |
-          git clone https://github.com/${{ github.repository_owner }}/quadraui ../quadraui
-          quadraui_sha="$(git -C ../quadraui rev-parse HEAD)"
-          {
-            echo "### quadraui SHA under test"
-            echo
-            echo "[\`$quadraui_sha\`](https://github.com/${{ github.repository_owner }}/quadraui/commit/$quadraui_sha)"
-          } >> "$GITHUB_STEP_SUMMARY"
-          echo "Building tui/ against quadraui @ $quadraui_sha"
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -100,33 +59,6 @@ jobs:
       - name: Install coord CLI (tui integration tests spawn it)
         run: pip install -e .
 
-      # #1865: scheduled/manual runs check tui/ against a moving quadraui
-      # develop, so a red run here reflects quadraui's state at run time, not
-      # a regression in whatever PR happens to be open. Only push/pull_request
-      # runs — which check a specific commit against develop *now*, and whose
-      # failure is what branch protection should act on — are allowed to fail
-      # the job. continue-on-error keeps schedule/workflow_dispatch reporting
-      # (still visible as a warning in the run) without ever gating a merge.
-      #
-      # Notifier-lane gap (#1865 acceptance bar): this repo's periodic
-      # stuck/needs-attention notifier is #1632 (milestone #53), and #1632 is
-      # itself blocked on the daemon-clock plumbing this schedule trigger
-      # exists partly to enable — see coord/notify.py's dispatch docstring
-      # ("periodic detector is #1632's job, which is blocked on this"). So
-      # #1632 is not ready to wire today. Two consequences worth flagging
-      # explicitly rather than leaving implicit:
-      #   1. continue-on-error marks the *job* green even when this step
-      #      fails, so GitHub's own default "scheduled workflow failed" email
-      #      to watchers never fires either — a red step here is genuinely
-      #      opt-in-discovery only (Actions tab or `gh run list`), not just
-      #      "less visible than a real failure."
-      #   2. Until #1632 lands, that's the accepted gap: wiring an
-      #      always-on-orange-warning into a bespoke notifier here would be
-      #      throwaway work once #1632's periodic detector exists.
-      # Follow-up: wire this workflow's scheduled-failure signal into #1632's
-      # notifier lane once it's unblocked (tracked against #1632 / milestone
-      # #53, not a new issue).
       - name: cargo test (tui)
         working-directory: tui
         run: cargo test
-        continue-on-error: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}

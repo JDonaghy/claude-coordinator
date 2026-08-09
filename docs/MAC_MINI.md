@@ -200,8 +200,11 @@ agent in a foreground/tmux session or hand-write a plist.
 - Watch memory pressure before raising concurrency past 1.
 - Sweep `target/` dirs periodically — 57GB of artifacts accumulates from *one* checkout each, and
   worktrees multiply it.
-- `coord-tui` links `quadraui` by relative path (`../../quadraui/quadraui`), so the mac needs the
-  same worktree symlink arrangement the Linux agents use.
+- `vimcode` links `quadraui` by relative path (`../quadraui/quadraui`, from vimcode's repo root),
+  so the mac needs the same worktree symlink arrangement the Linux agents use — for vimcode
+  only. `coord-tui` no longer has this exposure: since #1973 it pins quadraui by git rev in
+  `tui/Cargo.toml`, so `cargo build`/`cargo test` in `tui/` fetch quadraui straight from GitHub
+  and need no sibling checkout or symlink at all.
 
 ## Related
 
