@@ -1285,6 +1285,15 @@ def is_ci_pending_reason(reason: str | None) -> bool:
 # `CI_STALE_PREFIX` ("checks exist, green, but predate the base") — an
 # operator (and `coord drive`) needs to know nothing was ever triggered, not
 # that something is still in flight.
+#
+# #1877: `checks == []` has a THIRD reading — the PR conflicts with its
+# base, so GitHub never built a merge ref to run a `pull_request`-triggered
+# workflow against at all. Unlike the "never triggered" reading above, this
+# one is self-healing: routing it to the #241 conflict-fix path (rather
+# than blocking here) is the cure. `process()` and `_entry_gate_status`
+# both consult `GhOps.check_pr_mergeable` before committing to the
+# `CI_ABSENT_PREFIX` block, specifically to give this reading a chance to
+# fall through first — see the `#1877` comments at each call site.
 CI_ABSENT_PREFIX = "CI never ran:"
 
 
@@ -2826,11 +2835,38 @@ def _entry_gate_status(
         if not checks and _ci_expects_checks(
             ci_store, entry.repo_github, entry.pr_number
         ):
-            return (
-                PLAN_BLOCKED,
-                f"{CI_ABSENT_PREFIX} no checks reported for PR #{entry.pr_number} "
-                "though this repo declares CI — merging would run untested code",
-            )
+            # #1877: an empty check list is ALSO what GitHub reports for a
+            # PR that conflicts with its base — it can never build a merge
+            # ref, so no `pull_request`-triggered workflow ever runs. That
+            # is a different fact from "CI never ran on a mergeable PR" and
+            # needs the opposite response: don't block here, mirror what
+            # `process()` does — fall through so `coord merge` attempts the
+            # merge, discovers the real conflict, and routes to the #241
+            # conflict-fix path via the `conflict` event, instead of
+            # pre-empting it with a "CI never ran" block only a human can
+            # clear. `check_pr_mergeable` is duck-typed/optional here
+            # (unlike in `process()`, where `gh_ops` is always a live
+            # client): this function also runs against a `GateSnapshot`
+            # (the `/board` read path, #1336 Invariant 1 — no third-party
+            # I/O), which doesn't implement it — a missing probe reads as
+            # inconclusive, same as a `None`/confirmed-mergeable verdict,
+            # and today's block is left untouched.
+            _mergeable_probe = getattr(gh_ops, "check_pr_mergeable", None)
+            conflicted = False
+            if _mergeable_probe is not None:
+                try:
+                    conflicted = (
+                        _mergeable_probe(entry.repo_github, entry.pr_number)
+                        is False
+                    )
+                except Exception:  # noqa: BLE001 — inconclusive, not a block override
+                    conflicted = False
+            if not conflicted:
+                return (
+                    PLAN_BLOCKED,
+                    f"{CI_ABSENT_PREFIX} no checks reported for PR #{entry.pr_number} "
+                    "though this repo declares CI — merging would run untested code",
+                )
         failed = failed_checks(checks)
         if failed:
             summary = ", ".join(f"{c.name} ({c.conclusion})" for c in failed)
@@ -3706,6 +3742,29 @@ def process(
                         if not checks and _ci_expects_checks(
                             ci, entry.repo_github, entry.pr_number
                         ):
+                            # #1877: mirror the real path's fall-through —
+                            # an empty check list also means "PR conflicts
+                            # with its base, GitHub never built a merge ref
+                            # to test" and a real run routes that to the
+                            # #241 conflict-fix path rather than blocking
+                            # on CI. Preview that accurately instead of
+                            # either the misleading "CI never ran" (nothing
+                            # here is a CI problem) or letting it fall
+                            # through to the "would merge" message below
+                            # (the merge attempt itself would fail).
+                            conflicted = gh_ops.check_pr_mergeable(
+                                entry.repo_github, entry.pr_number
+                            ) is False
+                            if conflicted:
+                                events.append(MergeEvent(
+                                    entry, "conflict",
+                                    f"(dry run) {entry.branch} conflicts "
+                                    f"with {entry.target_branch} and "
+                                    "reports no checks — a real run would "
+                                    "route to the #241 conflict-fix path "
+                                    "rather than block on CI (#1877)",
+                                ))
+                                continue
                             events.append(MergeEvent(
                                 entry, "checks_absent",
                                 f"(dry run) would be blocked: {CI_ABSENT_PREFIX} "
@@ -3953,14 +4012,33 @@ def process(
                 if not checks and _ci_expects_checks(
                     ci, entry.repo_github, entry.pr_number
                 ):
-                    msg = (
-                        f"{CI_ABSENT_PREFIX} no checks reported for PR "
-                        f"#{entry.pr_number} though this repo declares CI "
-                        "— merging would run untested code"
-                    )
-                    entry.error = msg
-                    events.append(MergeEvent(entry, "checks_absent", msg))
-                    continue  # #292: skip, don't halt the group
+                    # #1877: an empty check list is ALSO what GitHub reports
+                    # for a PR that conflicts with its base — GitHub can
+                    # never build a merge ref for a conflicted PR, so no
+                    # `pull_request`-triggered workflow ever runs. That is a
+                    # different fact from "CI never ran on a mergeable PR"
+                    # and needs the opposite response: fall through to the
+                    # merge attempt below, which discovers the real conflict
+                    # and (via the `conflict` event / `_dispatch_conflict_
+                    # fixes`) dispatches #241's conflict-fix rebase, instead
+                    # of pre-empting it here with a "CI never ran" block
+                    # that only a human can clear. A confirmed-mergeable or
+                    # inconclusive (`None` — still computing, or the `gh`
+                    # call itself failed) read leaves today's block
+                    # untouched; this is not a license to skip the CI gate
+                    # for a merely-slow or unreadable mergeability check.
+                    conflicted = gh_ops.check_pr_mergeable(
+                        entry.repo_github, entry.pr_number
+                    ) is False
+                    if not conflicted:
+                        msg = (
+                            f"{CI_ABSENT_PREFIX} no checks reported for PR "
+                            f"#{entry.pr_number} though this repo declares CI "
+                            "— merging would run untested code"
+                        )
+                        entry.error = msg
+                        events.append(MergeEvent(entry, "checks_absent", msg))
+                        continue  # #292: skip, don't halt the group
                 failed = failed_checks(checks)
                 if failed:
                     summary = ", ".join(

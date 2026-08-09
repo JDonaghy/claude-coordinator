@@ -4498,6 +4498,68 @@ class TestPlan:
         assert plan[0].status == mq.PLAN_READY
         assert plan[0].reason is None
 
+    def test_ready_when_conflicted_and_checks_empty(self, coord_db) -> None:
+        """#1877: GitHub cannot build a merge ref for a conflicted PR, so no
+        `pull_request`-triggered workflow ever runs — its check list reads
+        empty for the SAME reason a genuinely-untested PR's does, but needs
+        the opposite response: don't block on `CI never ran`, fall through
+        so `coord merge` attempts it and routes to the #241 conflict-fix
+        path. `plan()` mirrors that fall-through by reporting READY rather
+        than pre-empting it with the #1904 CI-absent block."""
+
+        class FakeCi:
+            is_available = True
+            def list_checks_for_pr(self, repo, number):
+                return []
+            def expects_checks(self, repo, number):
+                return True
+
+        items = [_q("w1", size=50, pr=99)]
+        save_queue(items)
+        board = self._board(completed=[
+            self._work("w1", test_state="passed"),
+            self._review("w1", verdict="approve"),
+        ])
+        cfg = self._config()
+        gh = FakeGh(mergeable_results={99: False})
+        plan = mq.plan(board, cfg, ci_store=FakeCi(), gh_ops=gh)
+        assert plan[0].status == mq.PLAN_READY
+        assert plan[0].reason is None
+        assert ("acme/api", 99) in gh.mergeable_calls
+
+    def test_blocked_ci_absent_stays_blocked_when_not_confirmed_conflicted(
+        self, coord_db
+    ) -> None:
+        """#1877 companion: the fall-through only fires on a CONFIRMED
+        conflict (`check_pr_mergeable` returns `False`). A clean PR
+        (`True`), an inconclusive read (`None` — still computing, or the
+        probe errored), or no `gh_ops` at all must all keep today's #1904
+        `CI never ran` block — this is not a license to skip the CI gate
+        whenever mergeability merely isn't known."""
+
+        class FakeCi:
+            is_available = True
+            def list_checks_for_pr(self, repo, number):
+                return []
+            def expects_checks(self, repo, number):
+                return True
+
+        cfg = self._config()
+        board = self._board(completed=[
+            self._work("w1", test_state="passed"),
+            self._review("w1", verdict="approve"),
+        ])
+
+        for mergeable_results, gh_ops in [
+            ({99: True}, FakeGh(mergeable_results={99: True})),
+            ({99: None}, FakeGh(mergeable_results={99: None})),
+            (None, None),
+        ]:
+            save_queue([_q("w1", size=50, pr=99)])
+            plan = mq.plan(board, cfg, ci_store=FakeCi(), gh_ops=gh_ops)
+            assert plan[0].status == mq.PLAN_BLOCKED, mergeable_results
+            assert mq.is_ci_absent_reason(plan[0].reason), mergeable_results
+
     def test_ci_summary_populated_from_ci_store(self, coord_db) -> None:
         """#1344: plan() attaches a structured `ci_summary` + `pr_number` so
         the TUI can render CI badges straight from `/board` instead of
@@ -5153,6 +5215,103 @@ class TestProcessCiStaleness:
         kinds = [e.kind for e in events]
         assert "checks_stale" in kinds
         assert "merged" not in kinds
+
+
+class TestProcessConflictedEmptyChecks:
+    """#1877: a conflicted PR reports zero CI checks — GitHub can't build a
+    merge ref to run a `pull_request`-triggered workflow against it. Before
+    this fix, that empty check list was indistinguishable from #1904's "CI
+    never ran on a mergeable PR" and blocked the merge — pre-empting the
+    #241 conflict-fix rebase that would have resolved it (the live incident
+    behind this issue, claude-coordinator#1845, lost both of its queue
+    retries to exactly this). `process()` must consult `check_pr_mergeable`
+    and, for a CONFIRMED conflict only, fall through to the real merge
+    attempt so the resulting `gh pr merge` failure routes through the
+    existing `conflict` event / classify-and-dispatch machinery."""
+
+    @staticmethod
+    def _ci_no_checks():
+        class _Ci:
+            is_available = True
+            def list_checks_for_pr(self, repo, number):
+                return []
+            def expects_checks(self, repo, number):
+                return True
+        return _Ci()
+
+    def test_confirmed_conflict_falls_through_to_conflict_event(self) -> None:
+        items = [_q("w1", pr=99)]
+        gh = FakeGh(
+            mergeable_results={99: False},
+            merge_results={99: (False, "Pull Request is not mergeable")},
+        )
+        events = process(items, gh, ci_store=self._ci_no_checks())
+
+        assert gh.mergeable_calls == [("acme/api", 99)]
+        assert gh.merge_calls, "expected the real merge attempt to run"
+        kinds = [e.kind for e in events]
+        assert "conflict" in kinds
+        assert "checks_absent" not in kinds
+        assert items[0].state == CONFLICT
+        # The real `gh pr merge` error routes through the SAME classifier
+        # #241 already uses — this fix only changes reachability, not the
+        # classify-and-dispatch machinery itself.
+        assert mq.classify_conflict(items[0].error) == "rebaseable"
+
+    def test_unconfirmed_mergeability_still_blocks_as_checks_absent(self) -> None:
+        """Companion (acceptance criterion): a clean PR (`True`) or an
+        inconclusive read (`None` — still computing, or the probe errored)
+        must NOT fall through — only a confirmed `False` does. The #1904
+        gate stays intact for the genuinely-untested-but-mergeable case."""
+        for verdict in (True, None):
+            items = [_q("w1", pr=99)]
+            gh = FakeGh(mergeable_results={99: verdict})
+            events = process(items, gh, ci_store=self._ci_no_checks())
+
+            assert gh.merge_calls == [], verdict
+            kinds = [e.kind for e in events]
+            assert "checks_absent" in kinds, verdict
+            assert "conflict" not in kinds, verdict
+            assert items[0].state == PENDING, verdict
+            assert mq.is_ci_absent_reason(items[0].error), verdict
+
+    def test_failing_checks_still_block_regardless_of_mergeability(self) -> None:
+        """Acceptance criterion: a PR with genuinely failing (non-empty)
+        checks must block exactly as today — the #1877 fall-through only
+        applies to the ambiguous empty-checks case, never overrides a real
+        red check, and must not even pay for the extra `check_pr_mergeable`
+        call outside that one case."""
+        from types import SimpleNamespace
+
+        class _Ci:
+            is_available = True
+            def list_checks_for_pr(self, repo, number):
+                return [SimpleNamespace(
+                    name="build", status="completed", conclusion="failure",
+                    run_id=None,
+                )]
+
+        items = [_q("w1", pr=99)]
+        gh = FakeGh(mergeable_results={99: False})
+        events = process(items, gh, ci_store=_Ci())
+
+        assert gh.mergeable_calls == [], "mergeability must not be consulted here"
+        kinds = [e.kind for e in events]
+        assert "checks_failed" in kinds
+        assert "conflict" not in kinds
+        assert items[0].state == PENDING
+
+    def test_dry_run_previews_conflict_route_without_merging(self) -> None:
+        items = [_q("w1", pr=99)]
+        gh = FakeGh(mergeable_results={99: False})
+        events = process(items, gh, ci_store=self._ci_no_checks(), dry_run=True)
+
+        assert gh.merge_calls == []
+        kinds = [e.kind for e in events]
+        assert "conflict" in kinds
+        assert "checks_absent" not in kinds
+        assert "merged" not in kinds
+        assert items[0].state == PENDING
 
 
 class TestCiInfraReason:
