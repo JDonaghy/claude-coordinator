@@ -18,6 +18,7 @@ from coord.milestone_order import (
     WorkOrderError,
     WorkOrderNode,
     compute_progress,
+    milestone_work_order_membership,
     parse_progress,
     parse_sub_issues,
     parse_work_order,
@@ -810,3 +811,79 @@ class TestReplaceProgressSection:
         # `## Progress` section, no further churn.
         again = replace_progress_section(new_body, rendered)
         assert again == new_body
+
+
+# ── milestone_work_order_membership (#2040) ──────────────────────────────────
+
+
+def _issue(number: int, *, labels=(), body="", repo_name="api", **extra) -> dict:
+    return {
+        "repo_name": repo_name,
+        "number": number,
+        "labels": list(labels),
+        "body": body,
+        **extra,
+    }
+
+
+class TestMilestoneWorkOrderMembership:
+    def test_resolves_tracking_issue_and_member_issue_numbers(self) -> None:
+        issues = [
+            _issue(
+                1120,
+                labels=["epic"],
+                body="## Work order\n- #1392 {group: A}\n- #1393 {after: #1392}\n",
+                milestone_title="ms-38",
+            ),
+            _issue(1392, labels=[]),
+        ]
+        result = milestone_work_order_membership(issues)
+        assert result == [
+            {
+                "repo_name": "api",
+                "tracking_issue": 1120,
+                "milestone_title": "ms-38",
+                "nodes": [{"issue_number": 1392}, {"issue_number": 1393}],
+            }
+        ]
+
+    def test_skips_a_non_epic_issue_even_with_a_work_order_shaped_body(self) -> None:
+        issues = [_issue(1120, labels=[], body="## Work order\n- #1392\n")]
+        assert milestone_work_order_membership(issues) == []
+
+    def test_skips_an_epic_with_no_work_order_block(self) -> None:
+        issues = [_issue(1120, labels=["epic"], body="just some text")]
+        assert milestone_work_order_membership(issues) == []
+
+    def test_skips_an_epic_with_an_unparseable_work_order_rather_than_raising(
+        self,
+    ) -> None:
+        """Fail-open, mirroring `coord.serve_app`'s board() handler: one bad
+        epic body must never blank the whole projection."""
+        issues = [
+            _issue(
+                1120,
+                labels=["epic"],
+                body="## Work order\n- #1392 {after: #9999}\n",  # undeclared target
+            )
+        ]
+        assert milestone_work_order_membership(issues) == []
+
+    def test_defaults_milestone_title_when_absent(self) -> None:
+        issues = [_issue(1120, labels=["epic"], body="## Work order\n- #1392\n")]
+        result = milestone_work_order_membership(issues)
+        assert result[0]["milestone_title"] == ""
+
+    def test_multiple_repos_and_epics_each_produce_their_own_entry(self) -> None:
+        issues = [
+            _issue(
+                1120, labels=["epic"], body="## Work order\n- #1392\n", repo_name="api",
+            ),
+            _issue(
+                55, labels=["epic"], body="## Work order\n- #7\n", repo_name="web",
+            ),
+        ]
+        result = milestone_work_order_membership(issues)
+        assert {(r["repo_name"], r["tracking_issue"]) for r in result} == {
+            ("api", 1120), ("web", 55),
+        }

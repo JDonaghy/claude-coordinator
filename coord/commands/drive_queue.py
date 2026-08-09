@@ -563,16 +563,23 @@ def _fetch_board_view() -> BoardView:
     payload = BoardFetcher().fetch()
     if not isinstance(payload, dict):
         raise ValueError(f"board payload is not an object: {type(payload).__name__}")
-    if "issues" not in payload and resolve_board_service() is None:
-        # Standalone shape (see _local_issue_rows).  Gated on board_service
-        # being unset so a thin client never reads its own local DB — the key
-        # is always present in the daemon's projection, even when empty.
-        payload = {
-            **payload,
-            "issues": _local_issue_rows(),
+    # Standalone shape top-up, gated per-key rather than on "issues" alone
+    # (#2040: BoardFetcher's own standalone path now supplies "issues" —
+    # see coord.drive_state.BoardFetcher._fetch_local — so a single combined
+    # gate on that key would silently stop topping up "merge_queue" too,
+    # regressing #1891's merge_ci_pending signal on the daemon host). Each
+    # top-up is independently gated on board_service being unset so a thin
+    # client never reads its own local DB — both keys are always present in
+    # the daemon's HTTP projection, even when empty.
+    if resolve_board_service() is None:
+        top_up: dict = {}
+        if "issues" not in payload:
+            top_up["issues"] = _local_issue_rows()
+        if "merge_queue" not in payload:
             # #1891: same top-up, one table over — see _local_merge_queue_rows.
-            "merge_queue": _local_merge_queue_rows(),
-        }
+            top_up["merge_queue"] = _local_merge_queue_rows()
+        if top_up:
+            payload = {**payload, **top_up}
     return build_board_view(payload, list_drive_sessions())
 
 

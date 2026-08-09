@@ -12,6 +12,7 @@ concurrent drivers pair a fresh ETag with a stale body — PR #1391).
 from __future__ import annotations
 
 import json
+import sqlite3
 
 import pytest
 
@@ -979,8 +980,76 @@ def test_fetch_ignores_a_torn_or_legacy_cache_file(tmp_path, board_service, monk
     )
 
 
-def test_fetch_uses_the_local_db_when_standalone(monkeypatch, tmp_path):
+def test_fetch_tops_up_issues_and_milestone_work_orders_when_standalone(
+    monkeypatch, tmp_path, coord_db
+):
+    """#2040: the daemon-host path used to be JUST ``serialize_board(read_board())``
+    — ``{assignments, round_number}`` and nothing else, no ``issues`` key at
+    all — so :func:`project`'s ``milestone_number``/``milestone_tracking_issue``
+    resolution always saw ``None`` on the daemon host, silently defeating the
+    #1453 oracle gate (every oracle-opted-in issue misread as a plain "normal
+    drive" and dead-ended on the #1138 refusal #1453 exists to prevent). This
+    drives ``fetch()`` against the REAL ``issues`` schema (the autouse
+    ``coord_db`` fixture's ``:memory:`` DB, same as ``coord.commands.
+    drive_queue``'s own local-DB top-up tests) rather than mocking the query
+    away, so a schema drift would fail this test too.
+    """
     monkeypatch.setattr("coord.client.resolve_board_service", lambda *a, **k: None)
     monkeypatch.setattr("coord.board_service.read_board", lambda: "BOARD")
     monkeypatch.setattr("coord.client.serialize_board", lambda b: {"from": b})
-    assert BoardFetcher(cache_dir=tmp_path).fetch() == {"from": "BOARD"}
+
+    coord_db.execute(
+        "INSERT INTO issues (repo_name, number, state, milestone_number, "
+        "milestone_title, labels, body) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            REPO, 1120, "open", 38, "ms-38", json.dumps(["epic"]),
+            "## Work order\n- #1392 {group: A}\n",
+        ),
+    )
+    coord_db.execute(
+        "INSERT INTO issues (repo_name, number, state, milestone_number, "
+        "milestone_title, labels, body) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (REPO, 1392, "open", 38, "ms-38", "[]", ""),
+    )
+    coord_db.commit()
+
+    payload = BoardFetcher(cache_dir=tmp_path).fetch()
+
+    assert payload["from"] == "BOARD"  # the assignments/round_number base is untouched
+    assert {i["number"] for i in payload["issues"]} == {1120, 1392}
+    assert payload["milestone_work_orders"] == [
+        {
+            "repo_name": REPO,
+            "tracking_issue": 1120,
+            "milestone_title": "ms-38",
+            "nodes": [{"issue_number": 1392}],
+        }
+    ]
+
+    # And the whole thing round-trips through `project()` exactly like this
+    # — the actual #2040 regression: the oracle gate reading
+    # `milestone_number`/`milestone_tracking_issue` off a daemon-host fetch.
+    state = project(payload, REPO, 1392, make_config())
+    assert state.milestone_number == 38
+    assert state.milestone_tracking_issue == 1120
+
+
+def test_fetch_local_issue_rows_fail_soft_on_an_unreadable_table(monkeypatch, tmp_path):
+    """Mirrors ``coord.commands.drive_queue._local_issue_rows``'s fail-soft
+    posture: an unreadable ``issues`` table degrades the board read to `[]`
+    (and therefore no ``milestone_work_orders``) rather than aborting the
+    whole ``coord drive`` poll.
+    """
+
+    class _BrokenConn:
+        def execute(self, *a, **k):
+            raise sqlite3.OperationalError("no such table: issues")
+
+    monkeypatch.setattr("coord.client.resolve_board_service", lambda *a, **k: None)
+    monkeypatch.setattr("coord.board_service.read_board", lambda: "BOARD")
+    monkeypatch.setattr("coord.client.serialize_board", lambda b: {"from": b})
+    monkeypatch.setattr("coord.db.get_connection", lambda: _BrokenConn())
+
+    payload = BoardFetcher(cache_dir=tmp_path).fetch()
+    assert payload["issues"] == []
+    assert payload["milestone_work_orders"] == []
