@@ -1467,11 +1467,19 @@ pub(crate) fn pipeline_detail_pv_rect_strip(main: Rect, lh: f32) -> Rect {
 /// TUI, pixels for GTK).  Passed to `render_markdown_to_styled_wrapped` so
 /// long body lines are word-wrapped to the panel width (#669); fenced code
 /// blocks are never wrapped.  Pass 0 to disable wrapping.
+///
+/// `show_v_scrollbar` is per-call rather than a hardcoded `false` so #2017
+/// can give the Queue panel's detail pane a real scrollbar without flipping
+/// it on for Board and Pipeline too — this helper is shared across all
+/// three, and `ListView::show_v_scrollbar` has no other way to differ per
+/// caller. Board and Pipeline pass `false` (unchanged); only Queue passes
+/// `true`.
 pub(crate) fn issue_body_list(
     issue: Option<(u64, &str, &str, &[String])>,
     scroll_offset: usize,
     widget_id: &'static str,
     width: usize,
+    show_v_scrollbar: bool,
 ) -> ListView {
     let mut items: Vec<ListItem> = Vec::new();
     match issue {
@@ -1541,7 +1549,7 @@ pub(crate) fn issue_body_list(
         bordered: false,
         h_scroll: 0,
         max_content_width: None,
-        show_v_scrollbar: false,
+        show_v_scrollbar,
     }
 }
 
@@ -1733,7 +1741,7 @@ impl CoordApp {
         let repo = self.board_active_repo().map(str::to_string);
         let group = self.board_selected_issue_group().cloned();
         let (Some(repo), Some(g)) = (repo, group) else {
-            return issue_body_list(None, self.detail_scroll, "board-issue-body", wrap_width);
+            return issue_body_list(None, self.detail_scroll, "board-issue-body", wrap_width, false);
         };
         let key = (repo.clone(), g.issue_number);
 
@@ -1754,6 +1762,7 @@ impl CoordApp {
                 self.detail_scroll,
                 "board-issue-body",
                 wrap_width,
+                false,
             );
         }
 
@@ -1787,6 +1796,7 @@ impl CoordApp {
                 self.detail_scroll,
                 "board-issue-body",
                 wrap_width,
+                false,
             );
         }
 
@@ -1817,6 +1827,7 @@ impl CoordApp {
                     self.detail_scroll,
                     "board-issue-body",
                     wrap_width,
+                    false,
                 );
             }
         }
@@ -1832,6 +1843,7 @@ impl CoordApp {
             self.detail_scroll,
             "board-issue-body",
             wrap_width,
+            false,
         )
     }
 
@@ -1910,6 +1922,7 @@ impl CoordApp {
             self.pipeline_detail_scroll,
             "pipeline-issue-body",
             wrap_width,
+            false,
         )
     }
 
