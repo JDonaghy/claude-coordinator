@@ -446,11 +446,14 @@ impl CoordApp {
         items
     }
 
-    /// Per-row menu: Resume / Move up / Move down / Unblock / Remove.
+    /// Per-row menu: Resume / Move up / Move down / Unblock / View in
+    /// Pipeline / View on Board / Remove.
     /// End-of-queue moves are DISABLED with a reason rather than silently
     /// no-op'ing (#1598's `disabled_because` precedent).
     pub(crate) fn context_menu_items_for_drive_queue_row(
         &self,
+        repo_name: &str,
+        issue_number: i64,
         state: &str,
         position: i64,
         queue_len: usize,
@@ -486,6 +489,32 @@ impl CoordApp {
                 ContextMenuItem::action("drive-queue-unblock", "Unblock").with_shortcut("u"),
             );
         }
+        items.push(ContextMenuItem::separator());
+        // #2016: navigate to this row's issue elsewhere in the app. Placed
+        // after the state-changing actions and behind their own separator so
+        // navigation never becomes the default-selected item on a row whose
+        // primary action is Resume (#1757) — and before Remove, so the
+        // destructive action stays last.
+        //
+        // "View in Pipeline" is disabled with a reason exactly when the jump
+        // would not land — `pipeline_jump_target` is the SAME query
+        // `jump_to_pipeline` uses to perform the jump (the #1598 regression:
+        // an enabled entry that then fails to land is worse than a disabled
+        // one).
+        let jump_result = self.pipeline_jump_target(repo_name, issue_number.max(0) as u64);
+        let mut view_in_pipeline =
+            ContextMenuItem::action("drive-queue-view-in-pipeline", "View in Pipeline");
+        if let Err(reason) = jump_result {
+            view_in_pipeline = view_in_pipeline.disabled_because(reason.menu_hint());
+        }
+        items.push(view_in_pipeline);
+        // "View on Board" is always enabled — a queue row always carries an
+        // issue number, and `select_issue`'s existing no-op-if-not-loaded
+        // behaviour is acceptable here (no new toast).
+        items.push(ContextMenuItem::action(
+            "drive-queue-view-on-board",
+            "View on Board",
+        ));
         items.push(ContextMenuItem::separator());
         items.push(
             ContextMenuItem::action("drive-queue-remove", "Remove from queue").with_shortcut("x"),
@@ -1826,7 +1855,8 @@ mod tests {
     #[test]
     fn row_menu_gates_moves_at_the_ends_and_unblock_off_waiting() {
         let app = make_test_app(BoardData::default());
-        let first = app.context_menu_items_for_drive_queue_row(QUEUE_STATE_WAITING, 0, 3, false);
+        let first =
+            app.context_menu_items_for_drive_queue_row("myrepo", 42, QUEUE_STATE_WAITING, 0, 3, false);
         assert!(first[0].disabled, "'Move up' disabled at position 0");
         assert_eq!(first[0].disabled_reason.as_deref(), Some("already first"));
         assert!(!first[1].disabled, "'Move down' enabled mid-queue");
@@ -1835,7 +1865,8 @@ mod tests {
             "a waiting row has nothing to unblock"
         );
 
-        let last = app.context_menu_items_for_drive_queue_row(QUEUE_STATE_BLOCKED, 2, 3, false);
+        let last =
+            app.context_menu_items_for_drive_queue_row("myrepo", 42, QUEUE_STATE_BLOCKED, 2, 3, false);
         assert!(last[1].disabled, "'Move down' disabled at the tail");
         assert!(last.iter().any(|i| i.label == "Unblock"));
     }
@@ -2411,7 +2442,7 @@ mod tests {
     #[test]
     fn row_menu_offers_resume_only_on_a_held_row() {
         let app = make_test_app(BoardData::default());
-        let held = app.context_menu_items_for_drive_queue_row(QUEUE_STATE_DONE, 0, 2, true);
+        let held = app.context_menu_items_for_drive_queue_row("myrepo", 42, QUEUE_STATE_DONE, 0, 2, true);
         assert_eq!(
             held[0].action_id.as_deref(),
             Some("drive-queue-resume"),
@@ -2420,7 +2451,8 @@ mod tests {
         );
         assert!(!held[0].disabled);
 
-        let plain = app.context_menu_items_for_drive_queue_row(QUEUE_STATE_WAITING, 0, 2, false);
+        let plain =
+            app.context_menu_items_for_drive_queue_row("myrepo", 42, QUEUE_STATE_WAITING, 0, 2, false);
         assert!(
             !plain.iter().any(|i| i.action_id.as_deref() == Some("drive-queue-resume")),
             "an unheld row has no gate to release"

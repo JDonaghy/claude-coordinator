@@ -1147,13 +1147,20 @@ impl CoordApp {
             }
             // #1755 (DQ-3) / #1868 (Q-3): right-click on a Queue panel row.
             ContextMenuTarget::DriveQueueRow {
+                repo_name,
+                issue_number,
                 state,
                 position,
                 queue_len,
                 held,
-                ..
-            } => self
-                .context_menu_items_for_drive_queue_row(state, *position, *queue_len, *held),
+            } => self.context_menu_items_for_drive_queue_row(
+                repo_name,
+                *issue_number,
+                state,
+                *position,
+                *queue_len,
+                *held,
+            ),
         };
         if items.is_empty() {
             return false;
@@ -5122,16 +5129,29 @@ impl CoordApp {
     }
 
     /// #815: Jump from the Board to the Pipeline for the currently-selected
-    /// issue.  If the issue resolves to a real, currently-rendered Pipeline
-    /// row (per [`Self::pipeline_jump_target`] — #1598: the same query the
-    /// right-click menu's enablement check uses), the Pipeline view is
-    /// activated and the issue is highlighted.  Otherwise a toast names the
-    /// specific reason ([`PipelineNotVisible`]) and the Board view stays
-    /// active.
+    /// issue.  Thin wrapper around [`Self::jump_to_pipeline`] — see that
+    /// method for the reveal-and-select behaviour shared with #2016's Queue
+    /// panel "View in Pipeline" entry.
     pub(crate) fn jump_board_to_pipeline(&mut self) {
         let Some((repo_name, issue_number)) = self.board_selected_issue() else {
             return;
         };
+        self.jump_to_pipeline(&repo_name, issue_number);
+    }
+
+    /// #2016: shared reveal-and-select body for "View in Pipeline", called
+    /// by both the Board row jump (`jump_board_to_pipeline`, #815) and the
+    /// Queue row jump (`drive-queue-view-in-pipeline`) — #1069 already
+    /// showed how this logic drifts when duplicated, so there is exactly
+    /// one copy.
+    ///
+    /// If `repo`/`number` resolves to a real, currently-rendered Pipeline
+    /// row (per [`Self::pipeline_jump_target`] — #1598: the same query the
+    /// right-click menu's enablement check uses), the Pipeline view is
+    /// activated and the issue is highlighted.  Otherwise a toast names the
+    /// specific reason ([`PipelineNotVisible`]) and the caller's current
+    /// view stays active.
+    pub(crate) fn jump_to_pipeline(&mut self, repo_name: &str, issue_number: u64) {
         // Kick the pipeline loader so data is current — in particular, if the
         // user has never visited the Pipeline view this session, pipeline_issues
         // is empty and the lookup below would always miss (false negative).
@@ -5139,7 +5159,7 @@ impl CoordApp {
         // Match by coord_repo (the local repo name from coordinator.yml) just
         // like `confirm_issue_finder` does — `board_active_repo` returns the
         // local name, not the GitHub owner/name slug.
-        match self.pipeline_jump_target(&repo_name, issue_number) {
+        match self.pipeline_jump_target(repo_name, issue_number) {
             Ok(idx) => {
                 let pi = &self.pipeline_issues[idx];
                 let repo_slug = pi.repo_slug.clone();
@@ -6018,6 +6038,35 @@ impl CoordApp {
                 {
                     let (repo, issue) = (repo_name.clone(), *issue_number);
                     self.dispatch_drive_queue_resume(&repo, issue);
+                }
+                true
+            }
+            // #2016: Queue row → "View in Pipeline" / "View on Board" — jump
+            // to the row's issue elsewhere in the app without disturbing the
+            // queue itself (no reorder, no optimistic mutation, no refetch).
+            "drive-queue-view-in-pipeline" => {
+                if let ContextMenuTarget::DriveQueueRow {
+                    repo_name,
+                    issue_number,
+                    ..
+                } = target
+                {
+                    let (repo, issue) = (repo_name.clone(), (*issue_number).max(0) as u64);
+                    self.jump_to_pipeline(&repo, issue);
+                }
+                true
+            }
+            "drive-queue-view-on-board" => {
+                if let ContextMenuTarget::DriveQueueRow {
+                    repo_name,
+                    issue_number,
+                    ..
+                } = target
+                {
+                    let (repo, issue) = (repo_name.clone(), (*issue_number).max(0) as u64);
+                    self.switch_active_view(SidebarView::Board);
+                    self.select_issue(&repo, issue);
+                    self.detail_scroll = 0;
                 }
                 true
             }
