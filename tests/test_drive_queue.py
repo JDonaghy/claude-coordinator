@@ -26,6 +26,7 @@ from coord.drive_queue import (
     ProbeResult,
     STATE_BLOCKED,
     STATE_DONE,
+    STATE_FAILED,
     STATE_RUNNING,
     STATE_WAITING,
     BoardView,
@@ -1073,6 +1074,61 @@ def test_a_parked_entry_that_lands_while_parked_reconciles_to_done():
     reconcile = plan.reconciles[0]
     assert reconcile.outcome == "done"
     assert reconcile.updates["state"] == STATE_DONE
+    assert plan.launch is None
+
+
+# ── #2055: `blocked`/`failed` re-checked against the board too ─────────────
+#
+# #1891's landed re-check above was `parked`-only. `blocked`/`failed` got no
+# such check, so an entry that merges by hand while blocked showed as
+# `blocked` forever — the board never asked again. These extend the SAME
+# `landed` branch to `blocked`/`failed`, without granting them the `parked`
+# branch's CI-pending resume (that would resurrect a gave-up entry for
+# dispatch, which is explicitly not the fix). See #1956 for the live
+# instance this was spotted from.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def test_a_blocked_entry_that_lands_reconciles_to_done():
+    entries = [entry(1650, position=3, state=STATE_BLOCKED, attempts=2)]
+    plan = plan_tick(entries, board(merged=(1650,)), capacity=1)
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "done"
+    assert reconcile.updates["state"] == STATE_DONE
+    assert plan.launch is None
+
+
+def test_a_blocked_entry_that_closed_without_merging_also_reconciles_to_done():
+    entries = [entry(1650, position=3, state=STATE_BLOCKED, attempts=2)]
+    plan = plan_tick(entries, board(closed=(1650,)), capacity=1)
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "done"
+    assert reconcile.updates["state"] == STATE_DONE
+
+
+def test_a_still_blocked_entry_is_left_untouched_not_resumed_to_waiting():
+    """The whole point of scoping this to the `landed` branch only: a
+    blocked entry whose issue has NOT landed must stay blocked — it must
+    NOT fall into the `parked` branch's CI-pending resume, which would
+    relaunch a gave-up entry outside its attempt budget."""
+    entries = [entry(1650, position=3, state=STATE_BLOCKED, attempts=2)]
+    plan = plan_tick(entries, board(), capacity=1)
+    assert plan.reconciles == ()  # nothing to report or write
+    assert plan.launch is None
+
+
+def test_a_failed_entry_that_lands_reconciles_to_done():
+    entries = [entry(1650, position=3, state=STATE_FAILED, attempts=2)]
+    plan = plan_tick(entries, board(merged=(1650,)), capacity=1)
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "done"
+    assert reconcile.updates["state"] == STATE_DONE
+
+
+def test_a_still_failed_entry_is_left_untouched():
+    entries = [entry(1650, position=3, state=STATE_FAILED, attempts=2)]
+    plan = plan_tick(entries, board(), capacity=1)
+    assert plan.reconciles == ()
     assert plan.launch is None
 
 
