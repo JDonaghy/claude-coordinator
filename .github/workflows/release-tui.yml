@@ -12,13 +12,13 @@ name: Release coord-tui binaries
 # itself — see the PKG-6 note below.
 #
 # Hand-written matrix, not cargo-dist (the issue's preferred option): coord-tui
-# depends on quadraui via a local *path* dependency
-# (`quadraui = { path = "../../quadraui/quadraui" }` in tui/Cargo.toml) —
-# a sibling checkout, not a crates.io/registry dependency. Reproducing that
-# layout in CI (see the "Check out quadraui" step below, mirrored from
-# cargo-test.yml) is straightforward in a plain shell step but is exactly the
-# kind of pre-build repo-fetch cargo-dist does not model, so the fallback
-# named in the issue is what's implemented here.
+# depends on quadraui via a `git`/`rev` dependency (`tui/Cargo.toml`, #1973) —
+# not a crates.io/registry dependency — which cargo-dist does not model, so
+# the fallback named in the issue is what's implemented here. Since #1973,
+# cargo fetches quadraui straight from GitHub at the rev pinned in
+# `tui/Cargo.toml`; there is no sibling checkout to reproduce in CI and
+# nothing here to keep in sync with that pin — it's read from the one place,
+# the manifest, same as every other dependency.
 #
 # #1242 (PKG-6): this is now a *reusable* workflow rather than one that fires
 # on `v*` itself. It used to be triggered by the tag push directly and then
@@ -63,17 +63,6 @@ on:
           a real release.
         required: true
         default: v0.0.0-dryrun
-
-env:
-  # #1239: the quadraui commit this release build pins against. tui/Cargo.toml's
-  # path dependency floats on whatever a checkout happens to have on disk —
-  # deliberately so in cargo-test.yml, which clones quadraui's default branch
-  # to catch breaks early (see that workflow's #1865 comments). A *tagged
-  # release* needs the opposite property: a tagged binary must be
-  # reproducible, not a function of whenever CI happened to run. Bump this
-  # SHA deliberately (as its own commit, with a comment on why) when
-  # coord-tui needs a newer quadraui; never let it float here.
-  QUADRAUI_PIN_SHA: 8a455a5c0772c12cff2dee6db408d9490b51b4df
 
 jobs:
   # #1242: the "tag must be an ancestor of origin/main" guard (#1471) used to
@@ -150,18 +139,11 @@ jobs:
           # input's description.
           ref: ${{ inputs.ref }}
 
-      # Reproduce the sibling-directory layout tui/Cargo.toml's path
-      # dependency expects (`../../quadraui/quadraui` relative to tui/Cargo.toml
-      # resolves to $GITHUB_WORKSPACE/../quadraui/quadraui) — same approach as
-      # cargo-test.yml, but pinned to QUADRAUI_PIN_SHA instead of floating on
-      # a default branch, so this build is reproducible from the tag alone.
-      - name: Check out quadraui (pinned, sibling path dep)
-        shell: bash
-        run: |
-          git clone https://github.com/${{ github.repository_owner }}/quadraui ../quadraui
-          git -C ../quadraui checkout "$QUADRAUI_PIN_SHA"
-          echo "Building tui/ against pinned quadraui @ $QUADRAUI_PIN_SHA"
-
+      # #1973: no sibling quadraui checkout to reproduce here any more —
+      # tui/Cargo.toml's `git`/`rev` dependency makes `cargo build` fetch
+      # quadraui straight from GitHub at the pinned rev, same as any other
+      # dependency. The release build is reproducible from the tag alone
+      # because the manifest checked out at that tag carries the pin.
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2

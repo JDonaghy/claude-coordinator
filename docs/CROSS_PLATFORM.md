@@ -180,8 +180,10 @@ single-node just restarts the child.)
 `Path.home()/".coord"` (`coord/db.py:19`) is already cross-platform. The real snags:
 - `~/.coord-venv/bin`, `~/.local/bin`, and `$HOME`-form strings *sent to remote shells* → adopt
   `platformdirs`; and (per #2) don't send shell strings — server-side ops.
-- **Git worktree symlinks on Windows** (the quadraui `../../quadraui/quadraui` path-dep symlink) need
-  Developer Mode / admin → use **directory junctions** or absolute-path deps.
+- **Git worktree symlinks on Windows** (the quadraui `../quadraui/quadraui` path-dep symlink,
+  which vimcode still carries on purpose — see JDonaghy/vimcode#638 — but coord-tui no longer
+  does since #1973 pinned `tui/Cargo.toml` to a quadraui git rev) need Developer Mode / admin →
+  use **directory junctions** or absolute-path deps.
 - The `/home/john/.coord/…` → `-home-john--coord-…` claude-projects path mangling
   (`coord/interactive.py:1831`) assumes POSIX slashes *and* reverse-engineers claude Code's
   projects-dir layout, which differs per OS → needs an OS-aware variant.
