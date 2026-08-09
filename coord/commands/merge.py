@@ -799,7 +799,62 @@ def _print_sibling_overlap_warnings(warnings: list) -> None:
         )
 
 
-def _explain_missing_only_entry(key: str, config) -> list[str]:
+def _board_row_gate_report(a, config, board, gh_ops: "GhOps | None"):
+    """The live, #1479-freshness-aware gate report for board row *a* — the
+    SAME evaluation ``coord gates <repo> <issue>`` runs
+    (:func:`coord.gates.build_gate_report`), or ``None`` when it couldn't be
+    computed (repo not configured, no branch, board/config error, …).
+
+    Shared by both ``--only`` call sites that used to re-derive gate status
+    by calling :func:`coord.merge_queue.merge_gate_failures` directly on a
+    raw board ``Assignment`` — the #1845 retry-enqueue probe below and
+    :func:`_explain_missing_only_entry`'s diagnostic. A bare ``Assignment``
+    has no ``repo_github``/``branch_head_sha``/``target_branch_head_sha``/
+    ``branch_patch_id`` (those only exist on a
+    :class:`~coord.merge_queue.QueuedMerge` that has been through
+    :func:`~coord.merge_queue.process`), so every #1479 staleness check
+    inside :func:`~coord.merge_queue.evaluate_smoke_verdict` silently no-ops
+    against it — the row reads as fresh no matter how stale it really is.
+    ``build_gate_report`` builds the same synthetic, live-SHA-backed
+    ``QueuedMerge`` ``coord gates`` does, so the two can never disagree
+    (#1926).
+
+    Never raises: any failure degrades to ``None``, which both callers
+    treat as "not gated" / "not evaluated" rather than a guessed pass.
+    """
+    from coord.gates import build_gate_report as _build_gate_report  # noqa: PLC0415
+    from coord.models import effective_issue_number as _effective_issue_number  # noqa: PLC0415
+
+    try:
+        return _build_gate_report(
+            board,
+            config,
+            a.repo_name,
+            _effective_issue_number(a) or a.issue_number,
+            gh_ops=gh_ops,
+        )
+    except Exception:  # noqa: BLE001 — diagnostics/probes must never mask the error
+        return None
+
+
+def _board_row_merge_gate_ok(a, config, board, gh_ops: "GhOps | None") -> bool:
+    """True only when *a*'s live gate report says the merge gate is
+    satisfied — see :func:`_board_row_gate_report`. Fails closed to
+    ``False`` (not gated) whenever the report itself couldn't be computed,
+    matching #1926's "silence is safe, optimism is not": a ``False`` here
+    just means the caller falls through to a diagnostic, never a wrongly
+    attempted enqueue/merge.
+    """
+    report = _board_row_gate_report(a, config, board, gh_ops)
+    if report is None:
+        return False
+    merge_decision = next((d for d in report.decisions if d.gate == "merge"), None)
+    return merge_decision is not None and merge_decision.ok
+
+
+def _explain_missing_only_entry(
+    key: str, config, gh_ops: "GhOps | None" = None
+) -> list[str]:
     """#1695: explain why ``coord merge --only <key>`` found no queue entry.
 
     Returns the lines to print on stderr. The pre-#1695 message was a single
@@ -822,8 +877,23 @@ def _explain_missing_only_entry(key: str, config) -> list[str]:
        non-gate skips (issue closed, branch gone from origin, PR already
        merged) or the scan simply has not run yet.
 
-    Never raises: a board/config problem degrades to case 1's wording rather
-    than replacing a clear error with a traceback.
+    #1926: case 2/3 used to call :func:`coord.merge_queue.merge_gate_failures`
+    directly on the raw board ``Assignment`` with no *gh_ops* and no live
+    SHAs, which makes every #1479 staleness check inside
+    :func:`~coord.merge_queue.evaluate_smoke_verdict` a silent no-op (it needs
+    ``entry.repo_github``/``entry.target_branch_head_sha``/etc., none of which
+    a bare work ``Assignment`` carries — those only exist on a
+    :class:`~coord.merge_queue.QueuedMerge` that has been through
+    :func:`~coord.merge_queue.process`). That let this fallback print "all
+    merge gates pass" for a row ``coord gates`` reported ``BLOCKED`` with a
+    STALE verdict — the exact false-green this issue is about. Routing
+    through :func:`coord.gates.build_gate_report` instead reuses the SAME
+    live-SHA-backed evaluation ``coord gates`` runs, so the two can never
+    disagree.
+
+    Never raises: a board/config problem, or a gate report that can't reach a
+    merge decision (no branch, repo not configured, …), degrades to an
+    honest "not evaluated" line rather than a guessed pass.
     """
     from coord import merge_queue as _mq  # noqa: PLC0415
     from coord.state import load_board as _load_board  # noqa: PLC0415
@@ -850,23 +920,41 @@ def _explain_missing_only_entry(key: str, config) -> list[str]:
     ]
     any_blocked = False
     for a in rows:
-        try:
-            failures = _mq.merge_gate_failures(a, config, board)
-        except Exception:  # noqa: BLE001
-            failures = []
         where = f"{a.repo_name} #{a.issue_number} (assignment {a.assignment_id}, branch {a.branch})"
-        if failures:
-            any_blocked = True
+        report = _board_row_gate_report(a, config, board, gh_ops)
+        merge_decision = (
+            next((d for d in report.decisions if d.gate == "merge"), None)
+            if report is not None
+            else None
+        )
+        if merge_decision is None:
+            # Same evaluation `coord gates` runs couldn't reach a merge
+            # decision for this row (repo not configured, no branch on the
+            # winning assignment, board/config error, …). Say so instead of
+            # guessing — silence is safe, optimism is not (#1926).
             lines.append(
-                f"  {where} — enqueue blocked by "
-                f"{_mq.describe_merge_gate_failures(failures)}"
+                f"  {where} — gate status not evaluated on this path; run "
+                f"`coord gates {a.repo_name} {a.issue_number}` for the live "
+                "decision."
             )
+            continue
+        if not merge_decision.ok:
+            any_blocked = True
+            clauses = []
+            for gate_name, waiver_flag in (
+                ("review", "--skip-review"),
+                ("test", "--skip-smoke"),
+            ):
+                d = next((x for x in report.decisions if x.gate == gate_name), None)
+                if d is not None and not d.ok:
+                    clauses.append(f"{gate_name} gate — {d.reason} (waive with {waiver_flag})")
+            lines.append(f"  {where} — enqueue blocked by {'; '.join(clauses)}")
         else:
             lines.append(
-                f"  {where} — all merge gates pass; it was skipped for a "
-                "non-gate reason (issue closed, branch missing from origin, "
-                "or PR already merged), or the auto-enqueue scan has not run "
-                "yet."
+                f"  {where} — all merge gates pass (#1479 freshness checked); "
+                "it was skipped for a non-gate reason (issue closed, branch "
+                "missing from origin, or PR already merged), or the "
+                "auto-enqueue scan has not run yet."
             )
     if any_blocked:
         lines.append(
@@ -1323,11 +1411,20 @@ def merge(
             # SAME scan `coord merge` (no --only) runs; when a matching
             # board row exists and every gate already passes, run it inline
             # and retry the resolution once before reporting failure.
+            #
+            # #1926: "every gate already passes" is decided by
+            # `_board_row_merge_gate_ok`, NOT a direct
+            # `mq.merge_gate_failures(a, ...)` call on the raw board
+            # `Assignment` — that call silently no-ops every #1479 staleness
+            # check (the Assignment has no repo_github/live-SHA fields), so
+            # a row with a genuinely STALE verdict used to read as "gated"
+            # here and get enqueued (and then merge-attempted) on the same
+            # false-green basis the fallback message below was fixed for.
             _retry_board = load_board()
             if _retry_board is not None:
                 _retry_rows = mq.resolve_board_work_key(_retry_board, only_assignment)
                 _retry_all_gated = bool(_retry_rows) and all(
-                    not mq.merge_gate_failures(a, cfg_only, _retry_board, gh_ops)
+                    _board_row_merge_gate_ok(a, cfg_only, _retry_board, gh_ops)
                     for a in _retry_rows
                 )
                 if _retry_all_gated:
@@ -1340,7 +1437,7 @@ def merge(
             # key-lookup problem and sends the operator hunting for a
             # different identifier. Usually the identifier was fine and a
             # gate was the reason no entry exists — so say which.
-            for line in _explain_missing_only_entry(only_assignment, cfg_only):
+            for line in _explain_missing_only_entry(only_assignment, cfg_only, gh_ops):
                 click.echo(line, err=True)
             sys.exit(1)
         # #1251: --override-human-required is the explicit, audited escape

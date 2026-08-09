@@ -2354,6 +2354,98 @@ class TestGateBlockedRowEntersQueueBlocked:
         assert "no entry found" in combined
         assert "did not resolve" in combined, combined
 
+    def test_only_fallback_never_claims_pass_on_a_stale_verdict_row(
+        self, config_file: Path, coord_dir: Path, coord_db
+    ) -> None:
+        """#1926: the board-row fallback must run the SAME #1479 freshness
+        check `coord gates` runs — it must never say "all merge gates pass"
+        for a row `coord gates` would report BLOCKED (test STALE).
+
+        Reproduces the quadraui #532 shape: a `passed` smoke verdict
+        recorded against a base SHA that has since moved, with no compare
+        evidence proving the move inert — a genuine STALE, not a benign
+        skip. Before the fix, `_explain_missing_only_entry` called
+        `merge_gate_failures` directly on the raw board `Assignment`, which
+        has no `repo_github`/live-SHA fields — every #1479 staleness check
+        silently no-opped and the fallback printed "all merge gates pass".
+        """
+        from coord.models import Assignment, Board
+        from coord.state import record_test_staleness_anchor, save_board
+
+        # Reviews disabled (default `config_file`/`CONFIG_YAML`) so only the
+        # smoke/test gate is in play — isolates the #1479 staleness bug from
+        # the review gate this class's other fixtures exercise.
+        work = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=1926,
+            issue_title="#1926", assignment_id="w1926", type="work",
+            status="done", branch="issue-1926-blocked",
+            test_state="passed",
+        )
+        board = Board(active=[], completed=[work])
+        save_board(board)
+        # `save_board`'s whole-board upsert deliberately excludes the #1479
+        # freshness anchors (test_head_sha/test_base_sha/test_patch_id) —
+        # they're written only by the dedicated single-row seam writer, the
+        # same one `coord test`/`coord merge --revalidate` use, so a stale
+        # whole-board snapshot can never clobber them (see `_UPSERT_SQL`'s
+        # #1482/#1565 comments). Stamp them the same way here.
+        record_test_staleness_anchor(
+            assignment_id="w1926",
+            test_head_sha="branchsha000",
+            test_base_sha="oldbase000",
+            test_patch_id=None,
+        )
+        # Deliberately do NOT run the scan first — the queue stays empty,
+        # forcing `--only` onto the board-row fallback this issue is about.
+        assert mq.load_queue() == []
+
+        def fake_get_branch_sha(repo, branch):
+            # The base moved since the verdict was recorded; the branch
+            # itself did not.
+            return "newbase111" if branch == "main" else "branchsha000"
+
+        with patch(
+            "coord.github_ops.get_branch_sha", side_effect=fake_get_branch_sha
+        ), patch(
+            "coord.github_ops.get_branch_patch_id", return_value=None
+        ), patch(
+            "coord.github_ops.get_compare_files", return_value=None
+        ):
+            result = CliRunner().invoke(
+                main, ["merge", "--config", str(config_file), "--only", "1926"]
+            )
+
+            combined = result.output + (result.stderr or "")
+            assert result.exit_code != 0
+            assert "all merge gates pass" not in combined, combined
+            assert "enqueue blocked by" in combined, combined
+            assert "test gate" in combined, combined
+            assert "stale" in combined.lower(), combined
+            # #1926's more dangerous half: the #1845 retry-enqueue probe
+            # (`_board_row_merge_gate_ok`, hit just before this fallback
+            # message) must ALSO see the row as blocked — never silently
+            # enqueue (and merge-attempt) a STALE row on the same
+            # missing-repo_github false-green this test guards against.
+            assert mq.load_queue() == [], mq.load_queue()
+
+            # `coord gates` must agree — same evaluation, same verdict, under
+            # the same live-SHA mocks (the direct check the acceptance
+            # criteria ask for: staling a verdict and asserting the two
+            # agree). Read the board back from the DB (not the in-memory
+            # `board` local) so the freshness anchors just stamped above are
+            # actually present, matching what a real `coord gates` run reads.
+            from coord import github_ops as _gh_ops
+            from coord.commands._common import _load_config
+            from coord.gates import build_gate_report
+            from coord.state import build_board
+
+            report = build_gate_report(
+                build_board(), _load_config(config_file), "api", 1926,
+                gh_ops=_gh_ops,
+            )
+            merge_decision = next(d for d in report.decisions if d.gate == "merge")
+            assert not merge_decision.ok, "coord gates must also report BLOCKED"
+
     # ── no regression for the happy path ─────────────────────────────────
 
     def test_approved_and_smoke_passed_row_enqueues_and_merges_unchanged(
