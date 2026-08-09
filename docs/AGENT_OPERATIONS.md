@@ -81,11 +81,56 @@ and runs one attempt:
 3. **If busy: record a deferral and exit 0.** This is the normal outcome
    most of the time and it is not a failure.
 4. **If not: roll each lane, daemon host first** (see below).
-5. **Run `coord release verify` as the final gate.** On CRIT, roll every
+5. **Run `coord release verify` as the final gate — scoped to the lanes
+   this run could actually roll (#2052).** On CRIT *in scope*, roll every
    host this run updated back to its previous venv generation (#1241's
    blue/green keeps exactly one) and exit 2.
 6. **On green, release the deploy gates** that were waiting for this deploy
    — the queue starts launching again on its own.
+
+**The gate's scope, and why it has one (#2052).** `coord release verify`
+grades lanes propagation *cannot roll*. On 2026-08-09, the first run that
+ever reached step 5 did everything it was capable of — three python lanes,
+three unit lanes, the one `coord-tui` it could reach — and still came back
+red, because verify also counted `~/.coord-cli-venv` (a lane propagation has
+no model of), the two *remote* `coord-tui` binaries (which propagation
+itself reports have **no remote install path**) and the `coord-serve`
+process (whose venv had swapped but whose *process* nothing here restarts).
+`--rollback-on-red` then reverted its own good work. That was not a
+transient failure: it would have fired on every run, forever.
+
+So findings now split two ways, and `coord release history` shows both:
+
+* **blocking** — a lane this run attempted *and could have moved*. These
+  are the only findings `--rollback-on-red` may act on.
+* **advisory** — a lane propagation has no channel for. Reported loudly,
+  journalled in full, **never** grounds for a rollback. An advisory CRIT is
+  a real defect somebody must fix by hand; it is simply not evidence that
+  *this roll* was bad.
+
+A lane nobody has classified still blocks — the exemption is an allow-list
+of known gaps, not a fallthrough, because a gate that quietly stops gating
+is the failure mode all of this exists to prevent. The known gaps today are
+`~/.coord-cli-venv`, `webapp bundle`, and any `<unit> spawns` lane other
+than `coord-agent` (a python roll re-execs the agent and nothing else, so
+`coord-serve` keeps running the generation it started with until you
+`systemctl --user restart coord-serve` yourself).
+
+**A rollback restores service state, not just the symlink (#2052).** The
+same run left precision's `coord-agent` `inactive (dead)` and never restarted
+it — recovery needed a human. `coord release rollback` and propagation's own
+revert now wait for `/health` to answer again, escalate once to the
+documented SSH `systemctl --user restart coord-agent` (#404/#1568), and only
+then give up — naming the host as **DOWN** rather than reporting a tidy
+"rolling back". `--wait` tunes the window.
+
+**The daemon host is derived, or the run refuses (#2052).** It is the
+machine whose own `/health` reports a running `coord-serve` unit. If nothing
+can name it and the fleet has more than one host, propagation **refuses to
+roll** rather than falling back to `coordinator.yml` order — that guess
+briefly put the daemon *behind* both its callers during a partial revert,
+which is precisely the 405 hazard the lane order exists to prevent. Pass
+`--daemon-host <machine>` to pin it.
 
 The loop closes: the gate stops the queue for the deploy, propagation
 performs the deploy, propagation restarts the queue.
@@ -829,11 +874,21 @@ command that asks whether the whole system is actually at one version, across
 every lane in the table above and every host in `coordinator.yml`:
 
 ```bash
-coord release verify --pypi          # grade every lane against the released version
-coord release verify                 # no absolute — report skew BETWEEN lanes
+coord release verify                 # --pypi is the DEFAULT: grade every lane
+                                     # against the released version
+coord release verify --no-pypi       # no absolute — report skew BETWEEN lanes only
 coord release verify --expected 0.4.105 -v
 coord release verify --json          # for a script or a dashboard
 ```
+
+**`--pypi` is on by default (#2052 / #2035 item 4).** Without an expected
+version this command compares the fleet **against itself**, so a fleet that
+is uniformly *behind* reads as health — demonstrated, not hypothesised: after
+#2052's botched propagation reverted every host to 0.5.4 while `main` was
+four releases ahead, `coord release verify` reported `crit=0`. A `--no-pypi`
+run with no `--expected` therefore now emits an UNKNOWN finding saying so
+rather than a clean bill of health; skew between lanes is still CRIT on its
+own, exactly as before.
 
 Exit codes mirror `coord health`: **0** clean, **1** something unverified
 (a host that did not answer, a lane with no data, a stale `coord-tui`), **2**

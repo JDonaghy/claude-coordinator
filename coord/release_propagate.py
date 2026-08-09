@@ -69,6 +69,38 @@ Propagation is therefore explicitly **not** all-or-nothing; it is ordered so
 that every intermediate state is one the protocol already tolerates
 (old caller → new daemon), and never the one it does not.
 
+THE GATE'S SCOPE MUST MATCH PROPAGATION'S REACH
+-----------------------------------------------
+#2052: propagation gates its roll on ``coord release verify``, but verify
+grades lanes propagation **cannot roll**. On 2026-08-09, the first run that
+ever reached the verify step did everything it was capable of — three python
+lanes, three unit lanes, the one ``coord-tui`` it could reach — and still
+came back red, because verify also counted ``~/.coord-cli-venv`` (a lane this
+module has zero references to), the two *remote* ``coord-tui`` binaries
+(which propagation itself reports have no remote install path) and the
+``coord-serve`` process (whose venv had swapped but whose process nothing
+here restarts). ``--rollback-on-red`` then reverted its own good work — and
+would have done so on every run, forever.
+
+:func:`scope_verification` is the fix, and the rule it encodes is general:
+**a verify gate must not be able to fail for reasons the thing it gates
+cannot influence.** Findings on lanes this run attempted and could have moved
+are *blocking*; findings on lanes with no channel are *advisory* — reported,
+journalled in full, never grounds for a rollback. Rolling back a good python
+roll because a per-host binary could not be installed remotely is a category
+error, not a safety measure.
+
+Advisory is emphatically not "ignored", and the exemption is an allow-list of
+*known* gaps rather than "anything we failed to classify" — an unrecognised
+lane keeps the gate. A check that quietly stopped checking is the failure
+this whole module exists to prevent.
+
+Worth naming on its own: this defect was invisible for five runs because
+every one of them found live work and correctly deferred. The deferral path
+was thoroughly tested by circumstance; the success path was not tested at
+all. **A mechanism whose failure mode only appears on the happy path needs
+its happy path tested first, not last.**
+
 PURITY
 ------
 Nothing in this module runs a subprocess, opens a socket, touches the DB or

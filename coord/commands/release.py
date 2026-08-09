@@ -404,7 +404,9 @@ def _lane_versions_by_host(report) -> dict[str, list[str | None]]:
               help="Version to propagate (leading 'v' optional). Default: PyPI's latest.")
 @click.option("--daemon-host", "daemon_host_override", default=None,
               help="Machine name running coord-serve. It rolls FIRST — a caller "
-                   "must never reach an endpoint its daemon predates.")
+                   "must never reach an endpoint its daemon predates. Normally "
+                   "DERIVED from the fleet's own /health; pass this when it "
+                   "cannot be, since an unorderable multi-host run refuses.")
 @click.option("--lane", "lane_filter", multiple=True,
               type=click.Choice(["python", "units", "tui"]),
               help="Only roll these lanes (repeatable). Default: all of them.")
@@ -417,7 +419,9 @@ def _lane_versions_by_host(report) -> dict[str, list[str | None]]:
               help="Run `coord release verify` as the final gate.")
 @click.option("--rollback-on-red/--no-rollback-on-red", default=True, show_default=True,
               help="Roll every updated host back to its previous venv generation "
-                   "when verification comes back CRIT.")
+                   "when verification comes back CRIT *on a lane this run could "
+                   "actually roll* (#2052). Findings on lanes propagation has no "
+                   "channel for are advisory and never trigger this.")
 @click.option("--release-holds/--no-release-holds", "release_holds", default=True,
               show_default=True,
               help="After a VERIFIED roll, release the drive-queue deploy gates "
@@ -438,7 +442,15 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
     timeout: float,
     as_json: bool,
 ) -> None:
-    """One propagation attempt. Exit 0 on deferral, 1 on red, 2 on rollback."""
+    """One propagation attempt. Exit 0 on deferral, 1 on red, 2 on rollback.
+
+    #2052: the final gate is scoped to the lanes this run attempted and could
+    have moved. Verify grades lanes propagation cannot roll — the operator's
+    ``~/.coord-cli-venv``, a remote ``coord-tui`` binary, the ``coord-serve``
+    process — and holding a roll to those made every successful run red, which
+    ``--rollback-on-red`` then reverted. Those findings are still reported and
+    journalled in full; they are simply not evidence about *this* roll.
+    """
     import json as _json  # noqa: PLC0415
     import time  # noqa: PLC0415
 
