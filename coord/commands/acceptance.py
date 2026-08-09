@@ -227,6 +227,14 @@ def acceptance_run(
     _check_local_capability(driver_cfg, repo, cfg)
     cwd = Path(path_opt).expanduser() if path_opt else Path.cwd()
 
+    # #2038: name the commit this verdict is actually about, and warn (never
+    # gate — the worker loop legitimately runs against uncommitted work) when
+    # it's behind origin's default branch. Best-effort/non-fatal by design.
+    repo_entry = cfg.repo(repo)
+    default_branch = (getattr(repo_entry, "default_branch", None) or "main") if repo_entry else "main"
+    for line in _checkout_freshness_lines(cwd, repo, default_branch):
+        click.echo(line, err=True)
+
     # #1125 review finding 2: resolve the `{ms}` template (e.g. a routed
     # `run: "pytest tests/acceptance/{ms}"`) from the issue's manifest-mapped
     # ms-NN dir *before* running, when scoped to one issue. Fails soft to
@@ -266,6 +274,71 @@ def acceptance_run(
     click.echo(json.dumps(verdict, indent=2))
     if verdict["total"] == 0 or not verdict["green"]:
         sys.exit(1)
+
+
+def _checkout_freshness_lines(cwd: Path, repo: str, default_branch: str) -> list[str]:
+    """Best-effort ``acceptance: {repo} @ {sha} ({branch})`` header plus a
+    dirty-tree / behind-``origin/{default_branch}`` warning line for each
+    condition that applies (#2038).
+
+    ``coord acceptance run`` answers "is the sealed suite green" for
+    *whatever is in the current checkout*, with no indication of which
+    commit that is — exactly right for a worker's own warm loop (it
+    legitimately runs against uncommitted work), but a false-signal
+    generator for a coordinator's red-first / sanity re-run against a
+    checkout that quietly fell behind ``origin``: every test 404s or fails
+    and nothing in the output names a commit, so it reads as a broken merge
+    rather than a stale tree. This stays informational (a warning, never a
+    gate) — failing closed here would break the worker loop.
+
+    Silently returns ``[]`` (no header at all) when *cwd* isn't a git
+    checkout, or any git call errors/times out — this must never turn an
+    otherwise-successful acceptance run into a crash, and a worker running
+    in a network-isolated sandbox shouldn't see a scary "git fetch failed"
+    on every single invocation.
+    """
+    import subprocess  # noqa: PLC0415 — mirrors the rest of this module's lazy subprocess imports
+
+    def _git(*args: str, timeout: float = 10.0) -> subprocess.CompletedProcess | None:
+        try:
+            return subprocess.run(
+                ["git", *args], cwd=str(cwd), capture_output=True, text=True, timeout=timeout,
+            )
+        except (subprocess.SubprocessError, OSError):
+            return None
+
+    head = _git("rev-parse", "--short=9", "HEAD")
+    if head is None or head.returncode != 0:
+        return []
+    sha = head.stdout.strip()
+
+    branch_res = _git("branch", "--show-current")
+    branch = (branch_res.stdout.strip() if branch_res and branch_res.returncode == 0 else "") \
+        or "HEAD (detached)"
+
+    lines = [f"acceptance: {repo} @ {sha} ({branch})"]
+
+    status_res = _git("status", "--porcelain")
+    if status_res is not None and status_res.returncode == 0 and status_res.stdout.strip():
+        lines.append("  ⚠ working tree has uncommitted changes")
+
+    # Single-branch fetch (never touches the working tree or local branch
+    # refs) so the behind-check reflects the ACTUAL remote, not whatever
+    # `origin/<default_branch>` happened to be cached from a previous
+    # fetch elsewhere — that staleness is exactly what bit #2038.
+    fetch_res = _git("fetch", "origin", default_branch, "--quiet", timeout=20.0)
+    if fetch_res is not None and fetch_res.returncode == 0:
+        count_res = _git("rev-list", "--count", "HEAD..FETCH_HEAD")
+        if count_res is not None and count_res.returncode == 0:
+            raw = count_res.stdout.strip()
+            if raw.isdigit() and int(raw) > 0:
+                n = int(raw)
+                lines.append(
+                    f"  ⚠ checkout is {n} commit{'s' if n != 1 else ''} behind "
+                    f"origin/{default_branch} — `git pull` before trusting a "
+                    "red/green verdict"
+                )
+    return lines
 
 
 def _acceptance_worktree_path(repo_name: str, issue_number: int) -> Path:

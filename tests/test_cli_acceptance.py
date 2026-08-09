@@ -278,6 +278,126 @@ class TestAcceptanceRun:
         assert "entrypoint" not in result.output
 
 
+def _git(cwd: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", *args], cwd=str(cwd), check=True, capture_output=True, text=True,
+    )
+
+
+def _init_repo_with_origin(tmp_path: Path) -> tuple[Path, Path]:
+    """A local bare "origin" plus a clone-shaped work checkout tracking it —
+    enough to exercise #2038's behind-origin check without any real
+    network."""
+    origin = tmp_path / "origin.git"
+    _git(tmp_path, "init", "--bare", "-b", "main", str(origin))
+
+    work = tmp_path / "repo"
+    work.mkdir()
+    _git(work, "init", "-b", "main")
+    _git(work, "config", "user.email", "test@example.com")
+    _git(work, "config", "user.name", "Test")
+    (work / "README.md").write_text("hello\n")
+    _git(work, "add", "README.md")
+    _git(work, "commit", "-m", "init")
+    _git(work, "remote", "add", "origin", str(origin))
+    _git(work, "push", "-u", "origin", "main")
+    return origin, work
+
+
+class TestAcceptanceRunCheckoutFreshness:
+    """#2038: `coord acceptance run` silently drove whatever the current
+    checkout happened to be, with no indication of which commit — a stale
+    tree read as a catastrophic sealed-suite failure. `run` now prints the
+    SHA/branch it's testing and warns (stderr, never a gate) when the tree
+    is dirty or behind `origin/<default_branch>`."""
+
+    def test_run_prints_sha_and_branch_header(self, tmp_path: Path) -> None:
+        _origin, work = _init_repo_with_origin(tmp_path)
+        blob = json.dumps({"tests": [{"id": "ms01::a", "status": "pass"}]})
+        _write_manifest(work / "tests" / "acceptance", {"ms01::a": 944})
+        # Commit the manifest too — an untracked manifest would itself read
+        # as a dirty tree, muddying this "clean" baseline case.
+        _git(work, "add", "tests")
+        _git(work, "commit", "-m", "manifest")
+        config_path = _write_config(tmp_path, repo_path=str(work), run_cmd=f"echo '{blob}'")
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "run", "--repo", "coord-tui", "--issue", "944",
+            "--path", str(work), "--config", str(config_path),
+        ])
+        assert result.exit_code == 0, result.output
+        assert "acceptance: coord-tui @ " in result.output
+        assert "(main)" in result.output
+        assert "uncommitted changes" not in result.output
+        assert "behind" not in result.output
+        # The verdict JSON must still be the trailing, cleanly-parseable blob.
+        payload = json.loads(result.output[result.output.index("{"):])
+        assert payload["green"] is True
+
+    def test_run_warns_on_dirty_working_tree(self, tmp_path: Path) -> None:
+        _origin, work = _init_repo_with_origin(tmp_path)
+        blob = json.dumps({"tests": [{"id": "ms01::a", "status": "pass"}]})
+        _write_manifest(work / "tests" / "acceptance", {"ms01::a": 944})
+        config_path = _write_config(tmp_path, repo_path=str(work), run_cmd=f"echo '{blob}'")
+
+        # Uncommitted change — must not exist as a driver-invisible surprise.
+        (work / "README.md").write_text("modified\n")
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "run", "--repo", "coord-tui", "--issue", "944",
+            "--path", str(work), "--config", str(config_path),
+        ])
+        assert "uncommitted changes" in result.output
+
+    def test_run_warns_when_behind_origin_default_branch(self, tmp_path: Path) -> None:
+        origin, work = _init_repo_with_origin(tmp_path)
+        blob = json.dumps({"tests": [{"id": "ms01::a", "status": "pass"}]})
+        _write_manifest(work / "tests" / "acceptance", {"ms01::a": 944})
+        config_path = _write_config(tmp_path, repo_path=str(work), run_cmd=f"echo '{blob}'")
+
+        # A second clone pushes a commit `work` never fetches — mirrors the
+        # #2038 incident: `work`'s checkout is now one commit stale.
+        other = tmp_path / "other"
+        _git(tmp_path, "clone", str(origin), str(other))
+        _git(other, "config", "user.email", "test@example.com")
+        _git(other, "config", "user.name", "Test")
+        (other / "NEWFILE.txt").write_text("new\n")
+        _git(other, "add", "NEWFILE.txt")
+        _git(other, "commit", "-m", "second commit")
+        _git(other, "push", "origin", "main")
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "run", "--repo", "coord-tui", "--issue", "944",
+            "--path", str(work), "--config", str(config_path),
+        ])
+        assert "checkout is 1 commit behind origin/main" in result.output
+        assert "git pull" in result.output
+        # Warning only — never a gate; the driver's own verdict still decides
+        # exit code (all tests passed here).
+        assert result.exit_code == 0, result.output
+
+    def test_run_over_non_git_checkout_prints_no_freshness_header(
+        self, tmp_path: Path
+    ) -> None:
+        """A plain (non-git) directory — same shape a throwaway/extracted
+        checkout might be — degrades to no header at all rather than
+        crashing the run."""
+        blob = json.dumps({"tests": [{"id": "ms01::a", "status": "pass"}]})
+        cwd = tmp_path / "repo"
+        cwd.mkdir()
+        _write_manifest(cwd / "tests" / "acceptance", {"ms01::a": 944})
+        config_path = _write_config(tmp_path, repo_path=str(cwd), run_cmd=f"echo '{blob}'")
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "run", "--repo", "coord-tui", "--issue", "944",
+            "--path", str(cwd), "--config", str(config_path),
+        ])
+        assert result.exit_code == 0, result.output
+        assert "acceptance:" not in result.output
+        payload = json.loads(result.output)
+        assert payload["green"] is True
+
+
 ROUTED_CONFIG_YAML = """\
 repos:
   - name: coord-tui
