@@ -6733,6 +6733,38 @@
         assert!(!f.focused, "clear drops focus");
     }
 
+    /// #1378: `cursor_left` used to conflate the byte offset `cursor` with a
+    /// char index (`chars.len().min(self.cursor)`), so once a multibyte char
+    /// sat left of the cursor, Left-arrow permanently stopped moving.
+    /// Worked example from the report: "héllo" is 6 bytes / 5 chars; with
+    /// the cursor at byte 5 (just before the final "o"), the old code
+    /// computed `char_pos = min(5, 5) = 5`, took `chars[..4]` ("héll", which
+    /// is itself 5 bytes), and reassigned `cursor = 5` — unchanged, so the
+    /// cursor got stuck one step short of the char boundary before "é".
+    #[test]
+    fn sidebar_filter_cursor_left_multibyte_does_not_stall() {
+        let mut f = SidebarFilter::default();
+        f.set_value("héllo"); // 6 bytes, 5 chars; 'é' is 2 bytes (byte offset 1..3)
+        assert_eq!(f.cursor, 6, "set_value parks the cursor at the end (byte len)");
+
+        f.cursor_left(); // before the final 'o' -> before the second 'l'
+        assert_eq!(f.cursor, 5);
+        f.cursor_left(); // before the second 'l' -> before the first 'l'
+        assert_eq!(f.cursor, 4);
+        f.cursor_left(); // before the first 'l' -> before 'é' (crosses the multibyte char)
+        assert_eq!(f.cursor, 3);
+        f.cursor_left(); // before 'é' -> before 'h' (lands before the 2-byte char, not stuck)
+        assert_eq!(f.cursor, 1);
+        f.cursor_left(); // before 'h' -> start of string
+        assert_eq!(f.cursor, 0);
+        f.cursor_left(); // already at 0 -> no-op, must not underflow
+        assert_eq!(f.cursor, 0);
+
+        // Cursor must always land on a valid UTF-8 char boundary so a
+        // subsequent insert/backspace/slice can't panic.
+        assert!(f.query.is_char_boundary(f.cursor));
+    }
+
     // ── #646/#566: filter blur (ESC, row-click, main-click) ──────────────
 
     /// ESC while the filter is focused AND non-empty blurs (clear + unfocus).
