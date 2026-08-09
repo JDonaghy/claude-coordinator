@@ -1045,6 +1045,22 @@ class FakeGh:
     # (post-1970) `started_at` reads as fresh by default — tests that care
     # about staleness set this explicitly instead.
     branch_commit_timestamp: float | None = 0.0
+    # #1877: before committing to a `checks_absent` block, the gate asks
+    # whether the PR is CONFLICTED — a PR that can't build a merge ref never
+    # gets checks, and that reading routes to #241's conflict-fix rebase
+    # instead of a human-only block. Mirrors the same pair on
+    # tests/test_merge_queue.py's FakeGh.
+    #
+    # Defaults to an empty dict, so an unset PR reads `None` — INCONCLUSIVE,
+    # not "mergeable". Only a confirmed `False` diverts; None leaves the
+    # checks_absent block exactly as it was pre-#1877, which is what every
+    # test here (none of which is about conflicts) expects.
+    mergeable_results: dict[int, bool | None] = dataclass_field(default_factory=dict)
+    mergeable_calls: list[tuple[str, int]] = dataclass_field(default_factory=list)
+
+    def check_pr_mergeable(self, repo: str, number: int) -> bool | None:
+        self.mergeable_calls.append((repo, number))
+        return self.mergeable_results.get(number)
 
     def create_pr(self, repo: str, *, base: str, head: str, title: str, body: str) -> dict:
         n = self.next_pr
