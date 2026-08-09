@@ -767,6 +767,82 @@ def test_gate_refresher_publishes_branch_freshness_anchors(
     assert pid_calls == [("acme/api", "main", "issue-42-fix")]
 
 
+def test_gate_refresher_publishes_branch_commit_timestamp(
+    rw_db, monkeypatch
+) -> None:
+    """#1998: the snapshot must answer `get_branch_commit_timestamp`.
+
+    `merge_queue._ci_checks_are_stale` (the #1851 CI-staleness gate) fails
+    CLOSED — reports "stale" — when handed a gh_ops stand-in with no
+    `get_branch_commit_timestamp`, unlike the #1479 checks' fail-open
+    posture. A snapshot that simply lacked this method therefore did not
+    degrade quietly: it reported EVERY green, non-pending CI check served
+    through `/board` as unconditionally stale, for as long as the attribute
+    stayed missing. Same #1640 "two readers, one truth" mechanism as
+    `test_gate_refresher_publishes_branch_freshness_anchors` above, for the
+    newer accessor: `coord merge --plan` (served from `/board`, i.e. this
+    snapshot) said BLOCKED "CI stale" for an entry the live gate (`coord
+    merge --dry-run`/`--only`, live `github_ops`) never blocked at all.
+    """
+    import coord.gate_snapshot as gs
+    import coord.github_ops as github_ops
+    from coord.config import Config
+
+    _seed_pending_merge(rw_db)
+
+    ts_calls: list[tuple[str, str]] = []
+
+    def _ts(repo: str, branch: str) -> float:
+        ts_calls.append((repo, branch))
+        return 1234.0
+
+    monkeypatch.setattr(gs, "build_ci_store", lambda t: None)
+    monkeypatch.setattr(github_ops, "get_branch_sha", lambda repo, branch: None)
+    monkeypatch.setattr(github_ops, "get_branch_patch_id", lambda r, b, h: None)
+    monkeypatch.setattr(github_ops, "get_branch_commit_timestamp", _ts)
+    monkeypatch.setattr(github_ops, "get_pr_commit_messages", lambda repo, n: [])
+
+    # Pre-refresh: unknown, not an AttributeError — the fail-open caching
+    # contract (the *consumer* still fails closed on `None`, see
+    # `TestCiChecksAreStale.test_gate_snapshot_fails_closed_for_an_uncached_branch`
+    # in tests/test_merge_queue.py).
+    assert gs.GateSnapshot().get_branch_commit_timestamp("acme/api", "main") is None
+
+    refresher = gs.GateSnapshotRefresher()
+    snap = refresher.refresh(Config(repos=[], machines=[]))
+
+    assert snap.get_branch_commit_timestamp("acme/api", "main") == 1234.0
+    # Deduped: one lookup for the one distinct target branch, not one per
+    # pending entry sharing it.
+    assert ts_calls == [("acme/api", "main")]
+
+
+def test_gate_refresher_branch_commit_timestamp_failure_is_fail_open(
+    rw_db, monkeypatch
+) -> None:
+    """A `gh` failure caches `None` for that branch — "anchor unavailable",
+    the same value the live path produces — never a crash. The consumer
+    (`_ci_checks_are_stale`) is what turns that `None` into "stale"."""
+    import coord.gate_snapshot as gs
+    import coord.github_ops as github_ops
+    from coord.config import Config
+
+    _seed_pending_merge(rw_db)
+
+    def _boom(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise RuntimeError("gh exploded")
+
+    monkeypatch.setattr(gs, "build_ci_store", lambda t: None)
+    monkeypatch.setattr(github_ops, "get_branch_sha", lambda repo, branch: None)
+    monkeypatch.setattr(github_ops, "get_branch_patch_id", lambda r, b, h: None)
+    monkeypatch.setattr(github_ops, "get_branch_commit_timestamp", _boom)
+    monkeypatch.setattr(github_ops, "get_pr_commit_messages", lambda repo, n: [])
+
+    snap = gs.GateSnapshotRefresher().refresh(Config(repos=[], machines=[]))
+
+    assert snap.get_branch_commit_timestamp("acme/api", "main") is None
+
+
 def test_gate_refresher_branch_sha_failure_is_fail_open(rw_db, monkeypatch) -> None:
     """A `gh` failure caches None for that branch — "anchor unavailable",
     the same value the live path produces — never a crash or a false block."""
