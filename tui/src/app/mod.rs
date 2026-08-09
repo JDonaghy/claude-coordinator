@@ -217,14 +217,22 @@ impl SidebarFilter {
         self.cursor += c.len_utf8();
     }
 
+    /// Walk backward from `from` (a byte offset into `query`, not necessarily
+    /// on a char boundary) to the start of the previous UTF-8 char boundary.
+    /// Shared by `backspace` and `cursor_left` so both land on a valid
+    /// boundary regardless of prior (possibly stale) byte offsets.
+    fn prev_char_boundary(&self, from: usize) -> usize {
+        let mut prev = from.saturating_sub(1);
+        while prev > 0 && !self.query.is_char_boundary(prev) {
+            prev -= 1;
+        }
+        prev
+    }
+
     /// Delete the char before the cursor (UTF-8 aware), if any.
     fn backspace(&mut self) {
         if self.cursor > 0 {
-            // Find the start of the previous char (UTF-8 aware).
-            let mut prev = self.cursor - 1;
-            while prev > 0 && !self.query.is_char_boundary(prev) {
-                prev -= 1;
-            }
+            let prev = self.prev_char_boundary(self.cursor);
             self.query.remove(prev);
             self.cursor = prev;
         }
@@ -240,15 +248,7 @@ impl SidebarFilter {
     /// Move the cursor one Unicode scalar left.
     fn cursor_left(&mut self) {
         if self.cursor > 0 {
-            // Find the start of the previous char (UTF-8 aware) — same
-            // boundary walk `backspace` uses, so the cursor always lands on
-            // a valid char boundary regardless of prior (possibly stale)
-            // byte offset.
-            let mut prev = self.cursor - 1;
-            while prev > 0 && !self.query.is_char_boundary(prev) {
-                prev -= 1;
-            }
-            self.cursor = prev;
+            self.cursor = self.prev_char_boundary(self.cursor);
         }
     }
 

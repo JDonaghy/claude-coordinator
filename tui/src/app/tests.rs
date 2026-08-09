@@ -6765,6 +6765,59 @@
         assert!(f.query.is_char_boundary(f.cursor));
     }
 
+    /// #1378 black-box regression: drives the real `event → handle → render`
+    /// path through `TuiDriver` (not a direct call into `cursor_left`) to
+    /// confirm Left-arrow no longer stalls once a multibyte char sits left
+    /// of the cursor in the Board FILTER box.
+    ///
+    /// Types "héllo" (cursor parks at byte 6, the end), presses Left twice
+    /// (6->5, before the final "o"; then 5->4, before the second "l" —
+    /// this second press is exactly where the old byte/char-index conflation
+    /// stalled per the issue's worked example), then types "X" and reads the
+    /// resulting FILTER text off the rendered screen. A fixed cursor lands
+    /// the "X" between the two "l"s ("hélXlo"); the old bug would have left
+    /// the cursor stuck one step short and produced "héllXo" instead.
+    #[test]
+    fn board_filter_cursor_left_multibyte_does_not_stall_black_box() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_app_default();
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        driver.render();
+
+        // Focus the FILTER box ('/') and type a query containing a 2-byte
+        // UTF-8 char ('é') left of where the cursor will end up.
+        driver.type_char('/');
+        for c in "héllo".chars() {
+            driver.type_char(c);
+        }
+        driver.render();
+        assert!(
+            driver.screen_contains("héllo"),
+            "sanity: typed query must be visible before moving the cursor:\n{}",
+            driver.screen(),
+        );
+
+        // Two Left presses: 6->5 (uncontested), then 5->4 — the second is
+        // the exact byte offset the old code got stuck at.
+        driver.press_named(quadraui::NamedKey::Left);
+        driver.press_named(quadraui::NamedKey::Left);
+        driver.type_char('X');
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("hélXlo"),
+            "Left-arrow must land the cursor between the two 'l's, not stall \
+             before the multibyte 'é':\n{screen}",
+        );
+        assert!(
+            !screen.contains("héllXo"),
+            "'X' landing before the final 'o' means Left-arrow silently \
+             stalled at the multibyte boundary:\n{screen}",
+        );
+    }
+
     // ── #646/#566: filter blur (ESC, row-click, main-click) ──────────────
 
     /// ESC while the filter is focused AND non-empty blurs (clear + unfocus).
