@@ -4850,14 +4850,52 @@ class TestCiChecksAreStale:
         assert mq._ci_checks_are_stale(checks, self._Gh(1000.0), "acme/api", None, None) is True
 
     def test_fails_closed_when_gh_ops_lacks_the_capability(self) -> None:
-        """A gh_ops stand-in with no `get_branch_commit_timestamp` (e.g.
-        `coord.gate_snapshot.GateSnapshot`) must degrade to stale, matching
-        `_fetch_compare_files`'s documented AttributeError-fails-closed
-        posture for the same reason."""
+        """A gh_ops stand-in with no `get_branch_commit_timestamp` at all
+        must degrade to stale, matching `_fetch_compare_files`'s documented
+        AttributeError-fails-closed posture for the same reason. Before
+        #1998, `coord.gate_snapshot.GateSnapshot` was exactly such a
+        stand-in — see `test_gate_snapshot_serves_a_real_commit_timestamp`
+        below for the regression coverage on that specific object."""
         class _NoTimestampGh:
             pass
         checks = self._checks(started_at=1500.0)
         assert mq._ci_checks_are_stale(checks, _NoTimestampGh(), "acme/api", "main", None) is True
+
+    def test_gate_snapshot_serves_a_real_commit_timestamp(self) -> None:
+        """#1998: `GateSnapshot` (the gh_ops stand-in `coord.serve_app`'s
+        `/board` build hands to `plan()`) used to have no
+        `get_branch_commit_timestamp` at all, so every green, non-pending CI
+        check served through `/board` read as unconditionally stale —
+        regardless of how fresh it actually was. `coord merge --plan`,
+        served from `/board`, disagreed with the live gate (`coord merge
+        --dry-run`/`--only`, which builds its own live `github_ops`) for
+        every single entry whose checks had cleared "pending", exactly the
+        #1640 "two readers, one truth" split repeated for a newer accessor.
+        Once the snapshot actually caches a timestamp, the SAME
+        `_ci_checks_are_stale` call the live gate makes must reach the same
+        verdict from either object."""
+        from coord.gate_snapshot import GateSnapshot
+
+        snap = GateSnapshot(
+            branch_commit_timestamps={("acme/api", "main"): 1000.0},
+        )
+        checks_fresh = self._checks(started_at=1500.0)
+        assert mq._ci_checks_are_stale(checks_fresh, snap, "acme/api", "main", None) is False
+        checks_stale = self._checks(started_at=500.0)
+        assert mq._ci_checks_are_stale(checks_stale, snap, "acme/api", "main", None) is True
+
+    def test_gate_snapshot_fails_closed_for_an_uncached_branch(self) -> None:
+        """A `GateSnapshot` that has never resolved this (repo, branch) pair
+        — never refreshed, or the underlying `gh api` lookup failed — still
+        reads `None` (via dict.get, no AttributeError) and the consumer's own
+        fail-closed posture still applies. This is the fail-*open caching*/
+        fail-*closed verdict* split `branch_commit_timestamps`'s own
+        docstring describes."""
+        from coord.gate_snapshot import GateSnapshot
+
+        snap = GateSnapshot()
+        checks = self._checks(started_at=1500.0)
+        assert mq._ci_checks_are_stale(checks, snap, "acme/api", "main", None) is True
 
     def test_fails_closed_when_lookup_raises(self) -> None:
         class _RaisingGh:

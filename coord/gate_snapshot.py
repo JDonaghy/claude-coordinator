@@ -22,7 +22,10 @@ consumer seams:
   ``is_epic_issue``);
 * the two ``coord.github_ops`` functions the #821/#1475/#1479 review- and
   smoke-freshness checks read (``get_branch_sha`` / ``get_branch_patch_id``)
-  — added by #1640, see below.
+  — added by #1640, see below;
+* the ``coord.github_ops.get_branch_commit_timestamp`` function
+  ``merge_queue._ci_checks_are_stale`` reads for the #1851 CI-staleness gate
+  — added by #1998, see below.
 
 #1640: the snapshot used to duck-type only the first two seams, and
 ``merge_queue.has_smoke_verdict`` wraps each of its ``gh_ops`` lookups in a
@@ -35,6 +38,25 @@ READY for an entry that ``coord merge --only`` (live ``github_ops``, which
 does resolve the SHAs) correctly refused as stale.  The lookups are served
 here from tick-refreshed data so the read path still performs no third-party
 I/O, and the two readers now apply the identical #1479 binding.
+
+#1998: the exact same hole existed for ``get_branch_commit_timestamp`` — but
+inverted, and worse. ``merge_queue._ci_checks_are_stale`` (the #1851 gate)
+explicitly *fails closed* (returns "stale") when handed a *gh_ops* stand-in
+with no ``get_branch_commit_timestamp``, rather than fail-open like the
+#1479 checks above. A snapshot missing this method therefore did not degrade
+to a no-op silently — it reported EVERY green, non-pending CI check served
+through ``/board`` as permanently stale, unconditionally, for as long as the
+attribute was absent. That is a "pessimistic display" by the gate's own
+docstring, a defensible tradeoff on its own — until ``coord.drive_queue``'s
+#1891 park/resume machinery, which reads its "has CI reported?" signal off
+this exact ``/board``-served reason, treated the display's pessimism as
+nothing stronger than "still running" (which does not hold a park open) and
+moved on — except the *other* consumer of the same reason, an operator
+running ``coord merge --plan``, saw "CI stale" and a `--revalidate` remedy
+that could not actually clear it (the live gate, e.g. ``coord merge
+--dry-run``/``--only``, was never stale at all). Same #1640 mechanism, same
+fix: serve the timestamp from tick-refreshed data instead of leaving the
+duck-typed seam unimplemented.
 
 Fail-open by construction for a pair that has *never* been refreshed at all
 (no backend configured yet, ``ci_available=False``): ``commit_messages`` /
@@ -125,6 +147,16 @@ class GateSnapshot:
     branch_patch_ids: dict[tuple[str, str, str], str | None] = field(
         default_factory=dict
     )
+    # #1998: (repo, branch) -> that branch's HEAD commit's unix timestamp —
+    # the base-side half of the #1851 CI-staleness comparison
+    # (`merge_queue._ci_checks_are_stale`). A key that is absent (never
+    # refreshed, or the lookup failed) yields `None`, which that function
+    # already treats as "can't compare" and fails closed on — same fail-open
+    # *caching* convention as `branch_shas`/`branch_patch_ids` above; the
+    # fail-*closed* verdict itself lives entirely in the consumer, not here.
+    branch_commit_timestamps: dict[tuple[str, str], float | None] = field(
+        default_factory=dict
+    )
     # #1904: repo -> whether the inner CiStore believes this repo declares
     # CI at all — the signal `expects_checks` below needs to tell "no CI
     # configured" apart from "CI exists but never reported for this PR"
@@ -180,6 +212,9 @@ class GateSnapshot:
     def get_branch_patch_id(self, repo: str, base: str, branch: str) -> str | None:
         return self.branch_patch_ids.get((repo, base, branch))
 
+    def get_branch_commit_timestamp(self, repo: str, branch: str) -> float | None:
+        return self.branch_commit_timestamps.get((repo, branch))
+
 
 class GateSnapshotRefresher:
     """Owns the current :class:`GateSnapshot`; refreshed by the daemon tick.
@@ -205,8 +240,9 @@ class GateSnapshotRefresher:
         Reads the queue from the local DB, fetches CI checks + PR commit
         messages (+ epic-ness of any closing-keyword targets) per pending
         entry with a PR, plus (#1640) the branch/base HEAD SHAs and the
-        branch's patch-id for every pending entry, and atomically publishes a
-        new snapshot.  Per-entry failures degrade that entry to the fail-open
+        branch's patch-id, and (#1998) the target branch's HEAD commit
+        timestamp, for every pending entry, and atomically publishes a new
+        snapshot.  Per-entry failures degrade that entry to the fail-open
         values; they never abort the pass or unpublish other entries' data.
 
         Cost note (#1640): the SHA sweep adds up to two ``gh api
@@ -215,7 +251,13 @@ class GateSnapshotRefresher:
         of N entries sharing one target branch pays for that base once.  The
         merge queue's *pending* set is what bounds this — merged history is
         never refreshed — so it stays proportional to work actually waiting
-        to merge, not to project age.
+        to merge, not to project age.  The #1998 commit-timestamp sweep reads
+        the same ``repos/…/branches/{target_branch}`` endpoint already
+        fetched for ``branch_shas`` above but is not merged into that same
+        call — it is deduped independently, on ``(repo, target_branch)``
+        only, so it adds at most one further already-cached-shape ``gh api``
+        call per distinct target branch per pass, same bound as the SHA
+        sweep.
         """
         from coord import github_ops  # noqa: PLC0415
         from coord.merge_queue import PENDING, load_queue  # noqa: PLC0415
@@ -248,6 +290,7 @@ class GateSnapshotRefresher:
         epics: dict[tuple[str, int], bool] = {}
         branch_shas: dict[tuple[str, str], str | None] = {}
         branch_patch_ids: dict[tuple[str, str, str], str | None] = {}
+        branch_commit_timestamps: dict[tuple[str, str], float | None] = {}
         workflows_declared: dict[str, bool] = {}
         for entry in pending:
             # Branch HEAD + merge-base HEAD + the branch's patch-id against
@@ -265,6 +308,26 @@ class GateSnapshotRefresher:
                     branch_shas[(repo, branch)] = github_ops.get_branch_sha(repo, branch)
                 except Exception:  # noqa: BLE001 — fail-open for this branch
                     branch_shas[(repo, branch)] = None
+            # #1998: the target branch's HEAD commit timestamp — the anchor
+            # `merge_queue._ci_checks_are_stale` (#1851) needs to tell a
+            # genuinely-stale green check apart from one that predates the
+            # base by nothing at all. Keyed on (repo, target_branch) only —
+            # unlike `branch_shas` above, the staleness gate never reads the
+            # entry's OWN branch's timestamp, only the base's — deduped the
+            # same way, one `gh api` call per distinct target branch per
+            # tick, not per entry.
+            ts_repo, ts_branch = entry.repo_github, entry.target_branch
+            if (
+                ts_repo
+                and ts_branch
+                and (ts_repo, ts_branch) not in branch_commit_timestamps
+            ):
+                try:
+                    branch_commit_timestamps[(ts_repo, ts_branch)] = (
+                        github_ops.get_branch_commit_timestamp(ts_repo, ts_branch)
+                    )
+                except Exception:  # noqa: BLE001 — fail-open for this branch
+                    branch_commit_timestamps[(ts_repo, ts_branch)] = None
             pid_key = (entry.repo_github, entry.target_branch, entry.branch)
             if all(pid_key) and pid_key not in branch_patch_ids:
                 try:
@@ -313,6 +376,7 @@ class GateSnapshotRefresher:
             epic_issues=epics,
             branch_shas=branch_shas,
             branch_patch_ids=branch_patch_ids,
+            branch_commit_timestamps=branch_commit_timestamps,
             workflows_declared=workflows_declared,
             ci_available=ci_available,
             refreshed_at=time.time(),
