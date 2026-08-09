@@ -2,71 +2,161 @@
 
 How to install, upgrade, diagnose, and recover the per-machine agent server.
 
-## Publishing a release (PyPI)
+## Releasing: merge to `main`. That's the whole runbook. (#1835)
 
-**Releases are published by GitHub Actions, not by local `twine upload`.**
-The PyPI token lives in the `PYPI_API_TOKEN` repo secret; it is not
-available on any developer machine. Do not run `twine upload` locally —
-it will hang on an interactive token prompt.
+**The only human action in a release is merging the PR.** Everything after
+the merge — picking the version, tagging, building, publishing, rolling the
+fleet, verifying it, rolling back if it's red — happens with no human and no
+agent. There is no version to bump (#1238 removed both literals; the git tag
+*is* the version), no tag to push, and no `coord agent update` to remember.
 
-The release is triggered by **pushing a `v*` tag**
-(`.github/workflows/publish.yml`). The workflow builds the sdist + wheel,
-publishes to PyPI via `pypa/gh-action-pypi-publish`, and cuts a GitHub
-release with auto-generated notes.
+This section is the program of record. If you find yourself typing
+`git tag` or `coord agent update` as part of a normal release, something is
+broken — fix that, don't route around it.
 
-To cut a release:
+### The two halves, and why they are separate
+
+The pipeline is deliberately cut in two, and the cut is the design:
+
+| | **Publish** | **Propagate** |
+|---|---|---|
+| trigger | the merge, immediately | the next **quiescent window** |
+| runs on | GitHub Actions | `coord-release-propagate.timer`, daemon host |
+| touches | PyPI + the GitHub Release | every host's venv, units, `coord-tui` |
+| restarts anything? | **no** | **yes — every agent** |
+
+`coord agent update` restarts the agent, and a restart kills every in-flight
+headless worker. With overnight drive queues (#56/#1750) the fleet is rarely
+idle, so a merge-triggered *fleet upgrade* would routinely destroy in-flight
+work — and the better the queue works, the more it destroys. Publishing
+touches no running host, so it can happen the instant you merge. Propagation
+cannot, so it waits.
+
+### Half 1 — publish, on merge
+
+`.github/workflows/auto-release.yml` fires on every push to `main`, decides
+whether the merge ships anything, picks the next `vX.Y.Z`, and pushes that
+tag. `.github/workflows/publish.yml` (unchanged, #1242) then turns that one
+tag into one GitHub Release carrying the wheel (webapp bundled), the sdist
+and the `coord-tui` binaries, and uploads to PyPI.
+
+**Trigger policy** — path-filtered, opt-out by commit message, coalesced.
+The judgement lives in `scripts/next_release_tag.py` (with tests in
+`tests/test_next_release_tag.py`), not in YAML:
+
+- **Docs-/tests-only merges cut nothing.** A PyPI version is an immutable
+  public name; it doesn't get spent on a change no user of the wheel can
+  observe. Anything under `coord/`, `tui/`, `deploy/`, `scripts/`,
+  `pyproject.toml`, `MANIFEST.in`, `install-agent.sh` or
+  `.github/workflows/` ships — and anything *unrecognised* counts as
+  shipping, so the failure mode is a superfluous release, never a fix that
+  silently never reaches a host.
+- **A burst of merges is one release.** The workflow's `concurrency` group
+  cancels a superseded run, so five merges in five minutes mint one tag at
+  the tip.
+- **Opt out with `[no release]`** (or `[skip release]`) in the merge commit
+  message. `[minor]` / `[major]` bump those components instead of the patch.
+
+Rehearse a policy change without publishing anything:
 
 ```bash
-# 1. Bump the version in BOTH places (they must match):
-#    - pyproject.toml  → version = "X.Y.Z"
-#    - coord/__init__.py → __version__ = "X.Y.Z"
-# 2. Commit the bump on a branch and open a PR — a plain `git push origin
-#    main` no longer works (see below). Wait for its checks to go green,
-#    then merge it:
-git checkout -b release-vX.Y.Z
-git commit -am "Release vX.Y.Z"
-git push -u origin release-vX.Y.Z
-gh pr create --title "Release vX.Y.Z" --body "Version bump."
-# ... wait for checks, then merge (coord merge / gh pr merge / the UI) ...
-# 3. Pull the merged commit onto local main, run the preflight check, then
-#    tag *that* commit and push the tag — THIS is what publishes:
-git checkout main && git pull origin main
-coord release-preflight
-git tag vX.Y.Z <merged-commit-sha>
-git push origin vX.Y.Z
+gh workflow run auto-release.yml -f dry_run=true   # prints the decision, pushes nothing
 ```
 
-**`main` requires passing status checks to push to (#1525).** Since
-`required_status_checks` was enabled on `main`, a fresh commit has no check
-runs yet, so `git push origin main` is rejected — even for admins
-(`enforce_admins` is on). The bump must go through a PR like any other
-change: branch → checks → merge → *then* tag the merged commit. Tagging
-before the bump has actually landed on `main` risks publishing (immutably,
-to PyPI) a commit `main` never accepted.
+**`main` requires passing status checks to push to (#1525)**, which is why
+the trigger is a *merge*, not a push. Nothing about that changed; the
+release just stopped needing a second human action after it.
 
-`coord release-preflight` asserts you're on `main` with a clean tree that
-matches `origin/main` — i.e. it's a **post-merge, pre-tag** check. Run it
-after the release PR merges and you've pulled, not on the `release-v*`
-branch itself (it will correctly refuse there — the bump hasn't landed on
-`main` yet at that point).
+### Half 2 — propagate, at the next quiescent window
 
-Watch the run:
+`coord-release-propagate.timer` on the daemon host fires every 20 minutes
+and runs one attempt:
+
+1. **Resolve the target** from PyPI's simple index.
+2. **Ask whether there is a window.** Quiescence is the *drive queue's*
+   definition, not a second opinion — a queue entry in `running`, or any
+   agent with a live `RUNNING`/`PENDING` assignment, means busy. A fired
+   `--hold-after` deploy gate (#1757) is **not** busy: it means the queue
+   has deliberately stopped *waiting for exactly this deploy*.
+3. **If busy: record a deferral and exit 0.** This is the normal outcome
+   most of the time and it is not a failure.
+4. **If not: roll each lane, daemon host first** (see below).
+5. **Run `coord release verify` as the final gate.** On CRIT, roll every
+   host this run updated back to its previous venv generation (#1241's
+   blue/green keeps exactly one) and exit 2.
+6. **On green, release the deploy gates** that were waiting for this deploy
+   — the queue starts launching again on its own.
+
+The loop closes: the gate stops the queue for the deploy, propagation
+performs the deploy, propagation restarts the queue.
+
+**Lane order, and the skew question.** A fleet mid-roll has hosts at two
+versions. That is safe in **one direction only**: a *newer daemon serving
+older callers* is the steady state between every release and every fleet
+update anyway, but an *older daemon* asked for an endpoint it predates
+returns 405 — a documented failure here. So the order is fixed and not
+negotiable:
+
+1. the **daemon host**'s Python lane (`~/.coord-venv`) — always first;
+2. every other machine's Python lane;
+3. each host's **systemd unit** lane — only *after* that host's venv
+   swapped, because the reference units ship *inside* the wheel
+   (`coord/deploy/`, #1927);
+4. **`coord-tui`** last — a pure board-API client, safe at any skew.
+
+Propagation is therefore explicitly **not** all-or-nothing. It is ordered so
+every intermediate state is one the protocol already tolerates.
+
+**The units lane (#1831) now has a deploy step.** Each agent serves
+`POST /deploy-units`, which rewrites the units this host *already runs* from
+the packaged release, renders `<MACHINE_NAME>`/`<PORT>` templates for that
+host (#1928), keeps a `.pre-<version>.bak` of each, and `daemon-reload`s.
+It **restarts nothing**, so no worker dies. Two things it deliberately will
+not do: install a packaged unit this host has never had (which services a
+host runs is a topology decision, not a release decision — it reports them
+instead), and guess a placeholder value it doesn't know (it skips and says
+so). Both show up in `coord release history`.
+
+### Watching it, after the fact
 
 ```bash
-gh run list --repo JDonaghy/claude-coordinator --workflow publish.yml --limit 1
-gh run watch <run-id> --repo JDonaghy/claude-coordinator
+coord release history            # every attempt: deferrals collapsed, rolls in full
+coord release history -v --json  # the raw JSONL records
+coord release verify --pypi      # the same gate propagation runs, on demand
 ```
 
-**Then, once the rollout is done, verify it actually landed:**
+An **empty** history is itself a finding: it means the timer never ran.
+That distinction is the point — on 2026-08-04 a silent no-op was
+indistinguishable from a silent success for hours (see
+[The post-release step](#the-post-release-step-coord-release-verify-1834)).
+The journal is `~/.coord/release_propagation.jsonl`, deliberately a file
+rather than a DB table so it stays readable with `tail` *while* the upgrade
+it describes is in flight.
+
+### Escape hatches (all of them optional)
 
 ```bash
-coord release verify --pypi
+coord release propagate --dry-run          # window verdict + roll plan, changes nothing
+coord release propagate --target v0.4.111  # pin the version instead of asking PyPI
+coord release propagate --lane units       # one lane only
+coord release propagate --force            # roll over a BUSY fleet — KILLS live workers
+coord release rollback --yes               # one command: every agent back one generation
 ```
 
-This is the post-release step (#1834). It is not optional bookkeeping — see
-[The post-release step](#the-post-release-step-coord-release-verify-1834)
-below for the release where every other readout said the fleet was current
-while the daemon was spawning code two releases old.
+`--force` is an interactive-operator flag and is deliberately absent from
+the systemd unit. `coord release rollback` is the #1560 requirement that
+rollback be one command rather than a runbook.
+
+`coord release-preflight` still exists for the manual path (it asserts
+you're on a clean `main` matching `origin/main` — a **post-merge, pre-tag**
+check). You should not need it in a normal release any more.
+
+**`coord-tui` is the one lane propagation cannot finish remotely.** It's a
+per-host binary in `~/.local/bin` with no agent endpoint, so propagation
+rolls it on the host it runs on and *reports the others as a gap* rather
+than silently omitting them. On any other host: `coord tui update`.
+
+### PyPI timing gotchas (unchanged)
 
 PyPI propagation can lag a minute or two after the workflow goes green.
 `pip install --upgrade` (and `coord agent update`) may report
@@ -100,15 +190,23 @@ infer success from pip's exit code.**
 prompts) only takes effect on agents after a release + rollout.**
 Coordinator-only Python (CLI, `notify.py`, `merge_queue.py`, parsers) is
 live from the editable install the moment it's on disk — but agents run
-from PyPI, so agent-side changes need this release flow plus the rollout
-below. Two surfaces sit outside this PyPI flow entirely:
+from PyPI, so agent-side changes reach them only when propagation rolls the
+Python lane. That is now automatic; what used to be "plus the rollout below"
+is now "plus the next quiescent window".
 
-- **`coord-tui`** is a Rust binary — rebuild + reinstall locally
-  (`cd tui && cargo build && cp target/debug/coord-tui ~/.local/bin/`),
-  never PyPI. Don't bump the version for tui-only changes.
+- **`coord-tui`** is a Rust binary. Since #1239/#1240 it *is* built and
+  attached to every release, and `coord tui update` installs it — so
+  "rebuild it locally" is now the dev-loop path, not the distribution path.
+  Propagation rolls this lane only on the host it runs on (no agent
+  endpoint installs a binary remotely); run `coord tui update` on the
+  others, and check `coord release history` for which hosts it named.
 - **The phone webapp** (`coord/dashboard/webapp/`) is bundled into the
   PyPI wheel as of 0.4.71 (built by the release workflow). No `npm run build`
   is needed on the dashboard host after a `pip install` or `coord agent update`.
+- **`deploy/**`** used to be the lane with no deploy step. It has one now —
+  see "The units lane" above and the `deploy/coord-release-propagate.*`
+  units, which must themselves be installed by hand **once**, on the daemon
+  host, to bootstrap the loop.
 
 ## Install a new agent (first time)
 

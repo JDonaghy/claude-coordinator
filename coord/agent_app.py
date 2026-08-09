@@ -324,6 +324,19 @@ def _openapi_spec() -> dict:
                 "responses": {"202": {"description": "Updating"}},
             }
         },
+        "/deploy-units": {
+            "post": {
+                "summary": (
+                    "Install this host's systemd user units from the units "
+                    "packaged in the running release (#1831/#1835). Restarts "
+                    "nothing — daemon-reload only."
+                ),
+                "responses": {
+                    "200": {"description": "Units deployed (or nothing to do)"},
+                    "500": {"description": "A unit could not be written, or daemon-reload failed"},
+                },
+            }
+        },
         "/rollback": {
             "post": {
                 "summary": "Roll back to the previous blue/green venv generation and restart",
@@ -791,6 +804,68 @@ def build_app(
         threading.Thread(target=_do_update, daemon=False, name="agent-update").start()
         return JSONResponse({"status": "updating", "mode": mode}, status_code=202)
 
+    async def deploy_units(request: Request) -> JSONResponse:
+        """Install this host's systemd user units from the wheel (#1831/#1835).
+
+        The `deploy/**` lane's missing *deploy step*. ``unit_drift`` already
+        detects that ``~/.config/systemd/user/coord-*.service`` has fallen
+        behind the units packaged in the installed release; until now the
+        remedy was a human with ``cp`` and ``systemctl``, which is exactly
+        the gap #1835 cannot ship around — #1543's whole mechanism was three
+        unit files and a shell script.
+
+        Ordering matters and is the caller's job, not this endpoint's: the
+        reference is ``coord/deploy/`` *inside the installed distribution*,
+        so this must run **after** that host's ``/update`` swapped the venv,
+        or it re-installs the version the host already had. ``coord release
+        propagate`` (:func:`coord.release_propagate.plan_lanes`) encodes that
+        order.
+
+        Synchronous, unlike ``/update``: writing a handful of unit files and
+        running ``daemon-reload`` takes milliseconds and — critically —
+        **restarts nothing**. A ``daemon-reload`` re-reads unit files; it
+        does not restart running services, so no in-flight worker dies here.
+        Restarting the affected services stays an explicit, separate
+        operator action.
+
+        Body (JSON, optional)::
+
+            {"dry_run": false}
+
+        A units-lane deploy touches only units this host *already* has
+        installed, and keeps a ``.bak`` of each — see
+        :mod:`coord.deploy_units` for why both are deliberate.
+        """
+        from coord import deploy_units as du  # noqa: PLC0415
+        from coord.brain import AGENT_PORT  # noqa: PLC0415
+
+        body: dict = {}
+        try:
+            body = await request.json()
+        except Exception:
+            pass
+        if not isinstance(body, dict):
+            body = {}
+        dry_run = bool(body.get("dry_run"))
+
+        report = du.install_units(
+            machine_name=getattr(server, "machine_name", None),
+            port=AGENT_PORT,
+            version=_installed_version(),
+            dry_run=dry_run,
+        )
+        payload = report.to_dict()
+        payload["dry_run"] = dry_run
+        payload["reloaded"] = False
+        payload["reload_detail"] = ""
+        if report.changed and not dry_run:
+            ok, detail = du.daemon_reload()
+            payload["reloaded"] = ok
+            payload["reload_detail"] = detail
+            if not ok:
+                payload["ok"] = False
+        return JSONResponse(payload, status_code=200 if payload.get("ok") else 500)
+
     async def rollback(request: Request) -> JSONResponse:
         """Flip ``~/.coord-venv`` back onto the previous blue/green
         generation and restart (#1241).
@@ -1058,6 +1133,9 @@ def build_app(
         Route("/logs/{id}", logs, methods=["GET"]),
         Route("/stream/{id}", stream, methods=["GET"]),
         Route("/update", update, methods=["POST"]),
+        # #1831/#1835: the `deploy/**` lane's deploy step. Must be POSTed
+        # AFTER /update on the same host — see the handler's docstring.
+        Route("/deploy-units", deploy_units, methods=["POST"]),
         Route("/rollback", rollback, methods=["POST"]),
         Route("/restart", restart, methods=["POST"]),
         Route("/worktree-clean", worktree_clean, methods=["POST"]),
