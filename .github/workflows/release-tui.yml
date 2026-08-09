@@ -4,11 +4,12 @@ name: Release coord-tui binaries
 # gap in this project — today it is `version = "0.1.0"` hardcoded, hand-built
 # with `cargo build`, and copied to ~/.local/bin by hand. There is no
 # distribution channel, so a release of claude-coordinator silently excludes
-# the TUI. This workflow builds coord-tui for linux/mac/windows on a `vX.Y.Z`
-# tag push, stamps its version from that same tag (matching the Python
-# wheel's setuptools-scm-derived version — see pyproject.toml), and attaches
-# the binaries to the GitHub Release that .github/workflows/publish.yml
-# creates for the wheel.
+# the TUI. This workflow builds coord-tui for linux/mac/windows for a
+# `vX.Y.Z` release and stamps its version from that same tag (matching the
+# Python wheel's setuptools-scm-derived version — see pyproject.toml), so
+# the binaries land on the GitHub Release next to the wheel. Since #1242 it
+# is invoked by .github/workflows/publish.yml rather than by the tag push
+# itself — see the PKG-6 note below.
 #
 # Hand-written matrix, not cargo-dist (the issue's preferred option): coord-tui
 # depends on quadraui via a local *path* dependency
@@ -18,9 +19,28 @@ name: Release coord-tui binaries
 # cargo-test.yml) is straightforward in a plain shell step but is exactly the
 # kind of pre-build repo-fetch cargo-dist does not model, so the fallback
 # named in the issue is what's implemented here.
+#
+# #1242 (PKG-6): this is now a *reusable* workflow rather than one that fires
+# on `v*` itself. It used to be triggered by the tag push directly and then
+# call softprops/action-gh-release to attach its binaries — racing
+# publish.yml, which was separately creating/updating the very same Release
+# for the wheel. Now publish.yml owns the `v*` trigger, calls this workflow
+# with the tag, and is the single place a GitHub Release gets created; this
+# workflow only builds, stamps, verifies, and uploads workflow artifacts.
+#
+# The `workflow_dispatch` dry-run below is unchanged and still standalone: it
+# exercises the whole build+stamp+verify pipeline for every target without
+# touching any Release.
 on:
-  push:
-    tags: ["v*"]
+  workflow_call:
+    inputs:
+      tag:
+        description: >-
+          The release tag being built (e.g. v0.4.106). Passed down from
+          publish.yml so the binaries and the Python wheel are stamped from
+          one value rather than each re-deriving it from `github.ref_name`.
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       fake_tag:
@@ -45,31 +65,13 @@ env:
   QUADRAUI_PIN_SHA: 8a455a5c0772c12cff2dee6db408d9490b51b4df
 
 jobs:
-  # Refuses to build/release a tag whose commit never landed on main — mirrors
-  # publish.yml's identical guard for the Python wheel (see #1471 there).
-  # Skipped entirely for workflow_dispatch dry runs, which build from
-  # whatever ref the dispatch was run against and never touch a release.
-  verify-tag:
-    if: github.event_name == 'push'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Verify tag is on main
-        run: |
-          git fetch origin main
-          tagged_commit="${{ github.sha }}"
-          if ! git merge-base --is-ancestor "$tagged_commit" origin/main; then
-            echo "::error::Tag ${{ github.ref_name }} points at commit $tagged_commit, which is not an ancestor of origin/main. Refusing to build release binaries — merge the commit to main first, then re-tag it."
-            exit 1
-          fi
-
+  # #1242: the "tag must be an ancestor of origin/main" guard (#1471) used to
+  # live here too, because this workflow was independently triggered by the
+  # tag push. It now lives *only* in publish.yml's `verify-tag` job, which
+  # every job in the release run — including the `build-tui` job that calls
+  # this workflow — gates on via `needs:`. One guard, one place, no drift
+  # between two copies of the same check.
   build:
-    needs: [verify-tag]
-    # `always()`: verify-tag is skipped (not failed) on workflow_dispatch, and
-    # a skipped dependency must not skip this job too.
-    if: ${{ always() && (needs.verify-tag.result == 'success' || needs.verify-tag.result == 'skipped') }}
     strategy:
       fail-fast: false
       matrix:
@@ -93,8 +95,10 @@ jobs:
           # true` (via the job-level `continue-on-error` below) means a
           # Windows-only failure — e.g. a native-dep hiccup in rusqlite's
           # bundled build or portable-pty — no longer marks the whole
-          # `build` job failed, which would otherwise block `release` and
-          # withhold the already-successful linux/macOS artifacts too.
+          # `build` job failed, which would otherwise fail this whole
+          # reusable workflow and, through publish.yml's `needs: [build-tui]`,
+          # withhold the release along with the already-successful
+          # linux/macOS artifacts and the wheel.
           - target_name: x86_64-windows
             os: windows-latest
             bin_ext: ".exe"
@@ -102,7 +106,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     # See the `best_effort` matrix comment above: only the Windows leg opts
     # into tolerating its own failure without failing the overall `build`
-    # job (and therefore blocking `release`, which `needs: [build]`).
+    # job (and therefore blocking publish.yml's `release` job, which gates
+    # on this workflow via `needs: [build-tui]`).
     continue-on-error: ${{ matrix.best_effort }}
     steps:
       - uses: actions/checkout@v4
@@ -129,19 +134,27 @@ jobs:
       - name: Resolve release version
         id: version
         shell: bash
-        # `FAKE_TAG`/`REF_NAME` come in via `env:` rather than being spliced
-        # directly into this script (the standard `${{ }}`-in-`run:`
-        # anti-pattern) — `github.event.inputs.fake_tag` is
-        # `workflow_dispatch` input text, and even though triggering that
+        # `CALL_TAG`/`FAKE_TAG`/`REF_NAME` come in via `env:` rather than
+        # being spliced directly into this script (the standard
+        # `${{ }}`-in-`run:` anti-pattern) — `github.event.inputs.fake_tag`
+        # is `workflow_dispatch` input text, and even though triggering that
         # dispatch already requires repo write access, passing it through an
         # env var instead of interpolating it into the shell script avoids
         # arbitrary text being spliced into (and executed as) bash.
+        #
+        # Precedence: the tag publish.yml handed down (#1242) wins, then a
+        # dry-run's fake tag, then the ref this ran against. Only one of the
+        # first two is ever non-empty — `inputs.tag` is unset under
+        # workflow_dispatch and `github.event.inputs` is null under
+        # workflow_call.
         env:
+          CALL_TAG: ${{ inputs.tag }}
           FAKE_TAG: ${{ github.event.inputs.fake_tag }}
           REF_NAME: ${{ github.ref_name }}
         run: |
-          tag="${FAKE_TAG:-$REF_NAME}"
+          tag="${CALL_TAG:-${FAKE_TAG:-$REF_NAME}}"
           version="${tag#v}"
+          echo "Building coord-tui for tag $tag (version $version)"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
@@ -188,40 +201,19 @@ jobs:
           mkdir -p dist
           cp "tui/target/release/coord-tui${{ matrix.bin_ext }}" "dist/coord-tui-${{ matrix.target_name }}${{ matrix.bin_ext }}"
 
+      # #1242: the end of this workflow's job. These artifacts belong to the
+      # calling run (a reusable workflow's jobs share the caller's run and
+      # artifact scope), so publish.yml's `release` job downloads them
+      # alongside the wheel and publishes everything in one Release. There is
+      # deliberately no softprops/action-gh-release step here any more —
+      # exactly one job in the whole release run may create the Release, and
+      # that job is publish.yml's.
+      #
+      # The asset filename is load-bearing: `coord tui update`
+      # (coord/tui_release.py's `asset_filename`) resolves this exact name
+      # from a release's asset list.
       - uses: actions/upload-artifact@v4
         with:
           name: coord-tui-${{ matrix.target_name }}
           path: dist/coord-tui-${{ matrix.target_name }}${{ matrix.bin_ext }}
           if-no-files-found: error
-
-  # Single release step (rather than each matrix leg calling
-  # softprops/action-gh-release for itself) to avoid four parallel jobs
-  # racing to create/update the same GitHub Release for the same tag.
-  release:
-    needs: [build]
-    if: github.event_name == 'push'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: coord-tui-*
-          path: dist
-          merge-multiple: false
-
-      - name: Flatten downloaded artifacts
-        run: |
-          mkdir -p release-assets
-          find dist -type f -exec cp {} release-assets/ \;
-          ls -la release-assets
-
-      # Attaches to the same GitHub Release publish.yml creates for the
-      # Python wheel (softprops/action-gh-release upserts by tag_name, so
-      # whichever workflow's step runs first creates it and the other
-      # appends assets to it).
-      - name: Attach coord-tui binaries to GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          files: release-assets/*

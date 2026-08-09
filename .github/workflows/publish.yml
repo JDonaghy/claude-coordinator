@@ -1,24 +1,105 @@
-name: Publish to PyPI
+name: Release (wheel + coord-tui binaries)
+
+# #1242 (PKG-6): ONE `v*` tag produces ONE GitHub Release carrying the whole
+# system at one version — the PyPI wheel (with the React webapp bundled
+# inside it and the `[server]` extra declared), the coord-tui binaries, and
+# generated release notes.
+#
+# What this replaced, and why it mattered:
+#
+#   Two independent workflows both fired on `v*` and both called
+#   softprops/action-gh-release for the same tag. That action upserts by
+#   `tag_name`, so whichever run's step landed first *created* the Release
+#   and the other merely appended to it. This workflow was the one asking
+#   for `generate_release_notes: true`, so whether the release even had
+#   notes depended on a race between two runs — and neither workflow
+#   attached the wheel, so the "release" a third party could download was
+#   binaries only, with the actual Python package reachable solely from
+#   PyPI.
+#
+#   Now release-tui.yml is a *reusable* workflow (`workflow_call`) that this
+#   one calls, so both halves are jobs of a single run, and exactly one job
+#   — `release`, at the bottom — creates the GitHub Release.
+#
+# Version single-sourcing (#1238, PKG-2): nothing here hardcodes a version.
+# The wheel's comes from setuptools-scm reading the tag; coord-tui's comes
+# from the same tag, passed down to release-tui.yml by `plan` below. The
+# `build-wheel` and `verify-assets` jobs are the gates that they agree.
+#
+# Release muscle-memory: push a `vX.Y.Z` tag. Do NOT commit a version bump —
+# there is no version literal left to bump.
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run_tag:
+        description: >-
+          Dry-run version tag. Builds the wheel (webapp and all) and every
+          coord-tui target, verifies each is stamped with this version and
+          that the complete asset set is present — then STOPS. No PyPI
+          upload, no GitHub Release, no tag pushed. This is how you validate
+          a change to this workflow, since a real run publishes immutably to
+          PyPI. Must be PEP 440-parseable once the leading `v` is stripped
+          (so `v0.0.0`, not `v0.0.0-dryrun`) — the wheel half is checked
+          against it by scripts/verify_release_wheel.py.
+        required: true
+        default: v0.0.0
+
+# Least privilege by default; only the `release` job writes to the repo.
+permissions:
+  contents: read
 
 jobs:
-  publish:
+  # Resolve "what version is this run building, and is it for real?" exactly
+  # once, so every downstream job reads one value instead of each
+  # re-deriving it from the event.
+  plan:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      dry_run: ${{ steps.resolve.outputs.dry_run }}
+    steps:
+      - id: resolve
+        shell: bash
+        # Via `env:` rather than spliced into the script — `dry_run_tag` is
+        # workflow_dispatch input text, and interpolating it directly into
+        # `run:` would splice it into (and execute it as) bash.
+        env:
+          DISPATCH_TAG: ${{ github.event.inputs.dry_run_tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ -n "$DISPATCH_TAG" ]; then
+            tag="$DISPATCH_TAG"
+            dry_run=true
+          else
+            tag="$REF_NAME"
+            dry_run=false
+          fi
+          echo "Building $tag (dry_run=$dry_run)"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "dry_run=$dry_run" >> "$GITHUB_OUTPUT"
+
+  # #1471: main is a protected branch, so `git push origin main` can be
+  # rejected while a subsequent `git push origin vX.Y.Z` still succeeds (they
+  # are independent refs). Refuse to publish from a tag whose commit never
+  # actually landed on main — PyPI releases are immutable, so failing here is
+  # far cheaper than a bad publish. Every build job in this run gates on this
+  # one, including the coord-tui build (which used to carry its own copy of
+  # this check back when it was independently triggered by the tag push).
+  #
+  # Skipped for dry runs, which build whatever ref they were dispatched
+  # against and never publish anything.
+  verify-tag:
+    needs: [plan]
+    if: needs.plan.outputs.dry_run != 'true'
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - name: Verify tag is on main
-        # #1471: main is a protected branch, so `git push origin main` can be
-        # rejected while a subsequent `git push origin vX.Y.Z` still succeeds
-        # (they are independent refs). Refuse to publish from a tag whose
-        # commit never actually landed on main — PyPI releases are immutable,
-        # so failing here is far cheaper than a bad publish.
         run: |
           git fetch origin main
           tagged_commit="${{ github.sha }}"
@@ -26,22 +107,159 @@ jobs:
             echo "::error::Tag ${{ github.ref_name }} points at commit $tagged_commit, which is not an ancestor of origin/main. This tag was likely pushed from a local commit that main's branch protection rejected. Refusing to publish — merge the commit to main first, then re-tag it."
             exit 1
           fi
+
+  build-wheel:
+    needs: [plan, verify-tag]
+    # `always()`: verify-tag is *skipped* (not failed) on a dry run, and a
+    # skipped dependency would otherwise skip this job too.
+    if: ${{ always() && needs.plan.result == 'success' && (needs.verify-tag.result == 'success' || needs.verify-tag.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # setuptools-scm derives the version from the nearest reachable git
+          # tag (#1238) and *falls back* to `X.Y.Z.devN+g<sha>` rather than
+          # failing when it can't see one — which is right for a dev checkout
+          # and catastrophic for a PyPI upload. Full history + tags, never a
+          # shallow clone, so the tag is always reachable.
+          fetch-depth: 0
+          fetch-tags: true
+
+      # A dry run is dispatched against a branch, not a tag, so there is no
+      # release tag for setuptools-scm to find. A throwaway *local* tag on
+      # HEAD gives the dry run the same code path a real release takes
+      # (nothing is pushed; this checkout is discarded with the runner).
+      - name: Stamp a throwaway local tag (dry run only)
+        if: needs.plan.outputs.dry_run == 'true'
+        env:
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: git tag -f "$TAG"
+
+      - name: Show the version setuptools-scm will resolve
+        run: git describe --tags --dirty --always
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install build
+      # `packaging` for scripts/verify_release_wheel.py's PEP 440 comparison.
+      - run: pip install build packaging
+
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
+      # Must precede `python -m build`: the bundle is gitignored and
+      # force-included via MANIFEST.in, so a wheel built without it is valid
+      # but serves an empty `coord web`.
       - name: Build React webapp
         working-directory: coord/dashboard/webapp
         run: npm ci && npm run build
+
       - run: python -m build
+
+      - name: Verify the wheel is stamped with the tag (+ [server] extra + webapp)
+        env:
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: python scripts/verify_release_wheel.py --tag "$TAG" --dist dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-dist
+          path: dist/*
+          if-no-files-found: error
+
+  # PKG-3's build matrix, called as a reusable workflow so its binaries are
+  # artifacts of *this* run and land in the same Release as the wheel. The
+  # tag is passed explicitly rather than left to `github.ref_name` inside the
+  # callee: "everything at one version" should be a value handed down from
+  # one place, not re-derived independently in two.
+  build-tui:
+    needs: [plan, verify-tag]
+    if: ${{ always() && needs.plan.result == 'success' && (needs.verify-tag.result == 'success' || needs.verify-tag.result == 'skipped') }}
+    uses: ./.github/workflows/release-tui.yml
+    with:
+      tag: ${{ needs.plan.outputs.tag }}
+
+  # The acceptance gate, and the reason a dry run is worth running: prove the
+  # single asset set is complete BEFORE anything irreversible happens. Runs
+  # identically in both modes.
+  verify-assets:
+    # `plan` is already a transitive dependency, but `needs.plan.outputs` is
+    # only readable from a *direct* `needs` entry.
+    needs: [plan, build-wheel, build-tui]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect and check the release asset set
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          find artifacts -type f \( -name '*.whl' -o -name '*.tar.gz' -o -name 'coord-tui-*' \) \
+            -exec cp {} release-assets/ \;
+          ls -la release-assets
+
+          missing=""
+          # One wheel + one sdist. scripts/verify_release_wheel.py already
+          # proved they carry the tag version; this proves they got here.
+          compgen -G 'release-assets/*.whl' > /dev/null || missing="$missing wheel"
+          compgen -G 'release-assets/*.tar.gz' > /dev/null || missing="$missing sdist"
+
+          # release-tui.yml's non-best-effort matrix legs — the stated
+          # acceptance bar. Windows is deliberately absent: it is
+          # `best_effort: true` there, so a Windows-only build hiccup must
+          # not withhold an otherwise-complete release. `coord tui update`
+          # (coord/tui_release.py) resolves exactly these asset names.
+          for target in x86_64-linux x86_64-macos aarch64-macos; do
+            [ -f "release-assets/coord-tui-$target" ] || missing="$missing coord-tui-$target"
+          done
+
+          if [ -n "$missing" ]; then
+            echo "::error::Release ${{ needs.plan.outputs.tag }} would be incomplete — missing:$missing"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: release-assets/*
+          if-no-files-found: error
+
+  publish-pypi:
+    needs: [plan, verify-assets]
+    if: needs.plan.outputs.dry_run != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: python-dist
+          path: dist
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           password: ${{ secrets.PYPI_API_TOKEN }}
-      - name: Create GitHub Release
+
+  # The single owner of the GitHub Release. Runs only once every other half
+  # has succeeded, so a Release never exists advertising a wheel that failed
+  # to upload or binaries that failed to build. Skipped entirely on a dry
+  # run — `verify-assets` above already proved what it would have published.
+  release:
+    needs: [plan, verify-assets, publish-pypi]
+    if: needs.plan.outputs.dry_run != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: release-assets
+
+      - name: Create the GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.ref_name }}
           generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: release-assets/*
