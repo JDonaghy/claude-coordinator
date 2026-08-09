@@ -30,6 +30,18 @@ Three layers:
   the regression guard for `[tool.setuptools_scm]`/`fallback_version` being
   broken in `pyproject.toml`.
 
+* ``TestEditableInstallEndToEnd`` — the #2010 black-box acceptance
+  criteria, i.e. the issue's own repro steps run for real: `pip install -e
+  .` a tagged clone (`--no-build-isolation`, offline, same approach as the
+  wheel helpers below), advance the checkout past the tag with **no
+  reinstall** (`git commit` + `git tag`, standing in for `git pull`), and
+  assert `coord --version` reports the *live* version rather than the
+  `.dist-info` snapshot frozen at install time. Unlike the unit tests
+  above, nothing here is mocked: it exercises the real `direct_url.json`
+  shape pip writes for an editable install, the real
+  `Distribution.from_name` metadata lookup, and the real `coord.cli`
+  console-script wiring end to end.
+
 The build tests reuse the same local-clone git fixture style as
 tests/test_cli_release_preflight.py (a throwaway repo built from real `git`
 commands, no network), but tag/untag a clone of *this* repo rather than
@@ -392,3 +404,90 @@ class TestBuildFromGitTag:
         version = _cli_version_from_wheel(wheel, tmp_path / "run")
 
         assert re.match(r"^\d+(\.\d+)*\.dev\d+\+g[0-9a-f]+$", version), version
+
+
+def _install_editable(repo_dir: Path, install_dir: Path) -> None:
+    """Editable-install (PEP 660, `pip install -e .`) *repo_dir* into
+    *install_dir* via `--target`, offline (`--no-build-isolation
+    --no-deps`) the same way `_build_wheel` builds a regular wheel above.
+
+    `--target` is what keeps this isolated from *this test process's own*
+    editable install of `claude-coordinator` (the `pip install -e
+    ".[dev]"` dev/CI setup these tests run under) — the finder pip writes
+    resolves entirely from the `direct_url.json`/`.pth` it drops into
+    *install_dir*, pointed at *repo_dir*, and nothing this call installs
+    touches the interpreter's own site-packages.
+    """
+    _require_build_backend()
+    install_dir.mkdir(parents=True, exist_ok=True)
+    result = _run(
+        [
+            sys.executable, "-m", "pip", "install", "--no-deps", "--no-build-isolation",
+            "--target", str(install_dir), "-e", str(repo_dir),
+        ],
+        cwd=repo_dir,
+    )
+    assert result.returncode == 0, f"editable install failed:\n{result.stdout}\n{result.stderr}"
+
+
+def _cli_version_from_editable_install(install_dir: Path, work_dir: Path) -> str:
+    """Invoke the real `coord.cli` module against an editable install at
+    *install_dir* — same `python -m` wiring `_cli_version_from_wheel`
+    exercises for a wheel, so no console-script or fresh-venv machinery is
+    needed, and callable repeatedly against the same *install_dir* without
+    reinstalling (the whole point: #2010 is about what changes *between*
+    two such calls with nothing reinstalled in between)."""
+    neutral_cwd = work_dir / "cwd"
+    neutral_cwd.mkdir(parents=True)
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(install_dir)
+    result = _run([sys.executable, "-m", "coord.cli", "--version"], cwd=neutral_cwd, env=env)
+    assert result.returncode == 0, f"coord --version failed:\n{result.stdout}\n{result.stderr}"
+
+    match = re.search(r"coord, version (\S+)", result.stdout)
+    assert match, f"unexpected --version output: {result.stdout!r}"
+    return match.group(1)
+
+
+class TestEditableInstallEndToEnd:
+    """#2010's literal repro steps, run for real end to end: `pip install
+    -e .` at a tag, advance the checkout past it with nothing
+    reinstalled, and assert `coord --version` reports the *live* version —
+    not the `.dist-info` snapshot frozen at install time."""
+
+    def test_version_updates_after_git_pull_without_reinstall(
+        self, tagged_clone: Path, tmp_path: Path
+    ) -> None:
+        # `tagged_clone` is tagged v9.9.9 on HEAD with no upstream `git
+        # config` guaranteed — set identity explicitly so the `git commit`
+        # below works the same in CI as it does locally.
+        result = _run(["git", "config", "user.email", "test@example.com"], cwd=tagged_clone)
+        assert result.returncode == 0, result.stderr
+        result = _run(["git", "config", "user.name", "Test"], cwd=tagged_clone)
+        assert result.returncode == 0, result.stderr
+
+        install_dir = tmp_path / "install"
+        _install_editable(tagged_clone, install_dir)
+
+        # Immediately after `pip install -e .` at v9.9.9, the frozen
+        # `.dist-info` snapshot and the live git state still agree.
+        version = _cli_version_from_editable_install(install_dir, tmp_path / "run1")
+        assert version == "9.9.9"
+
+        # Advance the checkout past the install-time tag -- standing in for
+        # the issue's `git pull` -- without touching `install_dir` at all.
+        result = _run(
+            ["git", "commit", "--allow-empty", "-q", "-m", "advance past v9.9.9"],
+            cwd=tagged_clone,
+        )
+        assert result.returncode == 0, result.stderr
+        result = _run(["git", "tag", "v10.0.0"], cwd=tagged_clone)
+        assert result.returncode == 0, result.stderr
+
+        version = _cli_version_from_editable_install(install_dir, tmp_path / "run2")
+
+        # Pre-#2010, `.dist-info` is written once at install time and never
+        # refreshed, so this would still read "9.9.9" here -- the exact
+        # operator-facing symptom: the CLI misreporting *itself* as stale,
+        # not an honest "unknown".
+        assert version == "10.0.0"
