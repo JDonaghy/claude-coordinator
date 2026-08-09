@@ -267,12 +267,23 @@ def test_a_fired_deploy_gate_does_not_defer(valid_config_path, state_dir, no_net
 
 
 def _stub_lanes(monkeypatch, *, python_ok=True, calls=None):
-    """Replace the three per-lane executors with recorders."""
+    """Replace the three per-lane executors with recorders.
+
+    *python_ok* is either a single bool applied to every host, or a
+    ``{host: bool}`` mapping for tests that need one host's python lane to
+    fail while another's succeeds (e.g. the daemon-leads invariant).
+    """
     log = calls if calls is not None else []
+
+    def _ok_for(host: str) -> bool:
+        if isinstance(python_ok, dict):
+            return python_ok.get(host, True)
+        return python_ok
 
     def _python(machine, **kwargs):
         log.append(("python", machine.name))
-        return python_ok, "now v0.4.111" if python_ok else "pip failed"
+        ok = _ok_for(machine.name)
+        return ok, "now v0.4.111" if ok else "pip failed"
 
     def _units(machine, **kwargs):
         log.append(("units", machine.name))
@@ -353,6 +364,49 @@ def test_a_host_whose_python_lane_failed_is_not_rolled_back(valid_config_path,
          "--target", "0.4.111", "--daemon-host", "server"],
     )
     assert rolled_back == []
+
+
+def test_a_failed_daemon_python_roll_skips_other_hosts_python_lane(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    """#1835 review: plan_lanes() puts the daemon host's python lane first so
+    that 'a caller must never reach an endpoint its daemon predates' holds —
+    but that invariant is only real if a failure there actually stops the
+    rest of the python lane. If `server` (the daemon) fails its own python
+    roll, `laptop` must never be advanced to target_version anyway; doing so
+    would reproduce the documented 405 skew for the rest of this run."""
+    calls = _stub_lanes(monkeypatch, python_ok={"server": False, "laptop": True})
+    # The stubbed verify gate reports whatever `versions` says regardless of
+    # what the roll loop actually did — it is not the seam under test here.
+    # What's under test is that the loop itself never advances `laptop` past
+    # the daemon, independent of what the final gate later decides.
+    _stub_verify(monkeypatch, versions={"laptop": ["0.4.110"], "server": ["0.4.110"]})
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111", "--daemon-host", "server"],
+    )
+    assert result.exit_code == 0, result.output
+    # The daemon's own python lane was attempted and failed...
+    assert ("python", "server") in calls
+    # ...but laptop's python lane was never attempted at all — not
+    # attempted and failed, simply skipped outright.
+    assert ("python", "laptop") not in calls
+
+    record = _records(state_dir)[0]
+    laptop_python = next(
+        l for l in record["lanes"] if l["lane"] == "python" and l["host"] == "laptop"
+    )
+    # "not attempted" is recorded as ok=None, distinct from ok=False (a real
+    # failure) — a re-run should resume this host, not treat it as needing
+    # a rollback.
+    assert laptop_python["ok"] is None
+    assert "not attempted" in laptop_python["detail"]
+    # No lane record claims laptop's python roll succeeded.
+    assert not any(
+        l["lane"] == "python" and l["host"] == "laptop" and l["ok"] is True
+        for l in record["lanes"]
+    )
 
 
 def test_no_rollback_on_red_reports_instead(valid_config_path, state_dir, no_network,
