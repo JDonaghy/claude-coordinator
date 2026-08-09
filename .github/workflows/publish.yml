@@ -368,6 +368,10 @@ jobs:
       # coord.health.pypi index parser it reuses are pure stdlib on purpose,
       # so the check that proves the release exists cannot itself be broken
       # by a dependency resolution failure.
+      #
+      # Known edge: re-pushing a tag from before this landed checks out a
+      # tree with no such script, and this job fails. That is the right way
+      # round — a loud failure on an unsupported path, not a silent green.
       - name: Prove the release actually exists
         env:
           TAG: ${{ needs.plan.outputs.tag }}
