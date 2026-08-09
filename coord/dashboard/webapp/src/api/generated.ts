@@ -148,6 +148,8 @@ export interface Assignment {
   review_verdict: 'approve' | 'request-changes' | null
   review_verdict_original: string | null
   review_verdict_override_reason: string | null
+  verdict_source: string | null
+  verdict_source_reason: string | null
   review_head_sha: string | null
   review_patch_id: string | null
   review_scoped: boolean

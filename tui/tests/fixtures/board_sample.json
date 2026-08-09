@@ -63,7 +63,9 @@
       "test_state": null,
       "test_toolchain": null,
       "type": "work",
-      "unreachable_count": 0
+      "unreachable_count": 0,
+      "verdict_source": null,
+      "verdict_source_reason": null
     },
     {
       "acceptance_passed": null,
@@ -128,7 +130,9 @@
       "test_state": null,
       "test_toolchain": null,
       "type": "review",
-      "unreachable_count": 0
+      "unreachable_count": 0,
+      "verdict_source": null,
+      "verdict_source_reason": null
     },
     {
       "acceptance_passed": null,
@@ -204,7 +208,9 @@
       "test_state": "passed",
       "test_toolchain": null,
       "type": "work",
-      "unreachable_count": 0
+      "unreachable_count": 0,
+      "verdict_source": null,
+      "verdict_source_reason": null
     }
   ],
   "audit_recent_count": 0,
