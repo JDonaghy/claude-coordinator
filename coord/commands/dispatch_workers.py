@@ -229,17 +229,25 @@ def _dispatch_review_of(
         review_iteration=getattr(work, "review_iteration", 0) or 0,
         diff_text=review_diff_text,
     )
-    # #651: this used to tell the reviewer to report via report-result
-    # "instead of" the REVIEW_VERDICT block the briefing's tail (below)
-    # describes — two conflicting instructions for the same handoff, so
-    # the agent could do neither cleanly.  The block is the PRIMARY
-    # channel: it's PATH-independent (no reliance on `coord` being on the
-    # interactive session's PATH) and it's what the #606 transcript-floor
-    # recovery scans for when nothing was self-reported.  `coord
-    # report-result` is framed as an OPTIONAL fast path on top of it —
-    # since #590 it routes to the daemon's shared DB (board_service) from
-    # any machine, so it's worth doing when `coord` is reachable, but it
-    # is never a substitute for emitting the block.
+    # #651 (reversed by #1457): #651 told the reviewer to report via
+    # report-result "instead of" the REVIEW_VERDICT block the briefing's
+    # tail (below) describes — two conflicting instructions for the same
+    # handoff — and framed the printed block as PRIMARY with
+    # `coord report-result` as an OPTIONAL fast path never actually asked
+    # for. That left the "preferred self-report path" (the #606 PATH-fix's
+    # own words, coord/interactive.py:_with_coord_on_path) unreachable
+    # without a human asking for it every session: the operator always had
+    # to prompt the agent to run report-result before exiting. #1457: BOTH
+    # are now REQUIRED, belt and braces — `coord report-result` FIRST as
+    # the authoritative write straight to the coordinator's board (its
+    # PATH is fixed for exactly this by #606, its assignment id is $COORD_
+    # ASSIGNMENT_ID exported below, and #590 makes it work from a remote
+    # session too), and the REVIEW_VERDICT block ALWAYS ALSO, unconditionally,
+    # as the PATH-independent backup the #606 transcript-floor recovery scans
+    # for when report-result never ran or failed. Neither step substitutes
+    # for the other, and the exit finalize's `already_recorded` check
+    # (coord/interactive.py:_assignment_already_recorded) means a successful
+    # report-result is never clobbered by the backstop.
     _remote_note = (
         ""
         if _is_local
@@ -251,30 +259,35 @@ def _dispatch_review_of(
     )
     report_reminder = (
         f"[Coordinator review assignment {assignment_id}] This is a "
-        f"HUMAN-ATTENDED interactive review {_remote_note}When you finish:\n"
-        "  1. ALWAYS end your session by outputting the "
+        f"HUMAN-ATTENDED interactive review {_remote_note}When you finish, "
+        "record your verdict TWICE — belt and braces, neither step "
+        "substitutes for the other:\n"
+        "  1. REQUIRED, PRIMARY — write your full findings (every blocking "
+        f"item, with file:line) to a file (e.g. /tmp/review-{assignment_id}.md) "
+        "and run, BEFORE you end your session:\n"
+        f"     coord report-result --assignment {assignment_id} "
+        "--status done --verdict approve|request-changes "
+        f"--summary <one-line summary> --body-file /tmp/review-{assignment_id}.md\n"
+        "     This writes your verdict straight to the coordinator's shared "
+        "board (#590) — the authoritative record, and it reaches the merge "
+        "gate the moment you run it. `coord` is on your PATH (the coordinator "
+        "prepends its venv bin for this) and your assignment id is also in "
+        "$COORD_ASSIGNMENT_ID. Check the command's output for a "
+        "confirmation; if it errors, say so plainly — then continue to "
+        "step 2 regardless.\n"
+        "  2. REQUIRED, BACKUP — ALWAYS ALSO, regardless of whether step 1 "
+        "ran or succeeded, end your session by outputting the "
         "`REVIEW_VERDICT: / REVIEW_BODY: / END_REVIEW` block described at "
-        "the end of this briefing, with your FULL findings (every "
-        "blocking item, with file:line) in REVIEW_BODY. This is the "
-        "REQUIRED, PATH-independent step — it is recovered from your "
-        "session transcript even if nothing else below runs.\n"
+        "the end of this briefing, with the SAME full findings in "
+        "REVIEW_BODY. This is the PATH-independent fallback — it is "
+        "recovered from your session transcript even when step 1 never ran. "
+        "It does NOT replace step 1; do both, every time.\n"
         "     The three marker lines are parsed by machine: emit each at "
         "the start of its own line as literal plain text, with NO Markdown "
         "decoration. `**REVIEW_VERDICT: request-changes**` is WRONG and is "
         "silently dropped (#1346); `REVIEW_VERDICT: request-changes` is "
         "right. The body between the markers may be Markdown.\n"
-        "  2. OPTIONALLY, if `coord` is on your PATH, you can ALSO write "
-        f"those same findings to a file (e.g. /tmp/review-{assignment_id}.md) "
-        "and run:\n"
-        f"     coord report-result --assignment {assignment_id} "
-        "--status done --verdict approve|request-changes "
-        f"--summary <one-line summary> --body-file /tmp/review-{assignment_id}.md\n"
-        "     as a faster path that skips the operator relay prompt — "
-        "your `coord report-result` routes to the coordinator's shared "
-        "board (#590), so the verdict reaches the merge gate from here. "
-        "This is a shortcut, NOT a substitute for step 1: always emit the "
-        "REVIEW_VERDICT block regardless of whether `coord` is reachable. "
-        "Do NOT run any `gh` commands; the coordinator posts the verdict + "
+        "  Do NOT run any `gh` commands; the coordinator posts the verdict + "
         "findings for you.\n\n"
     )
     effective_briefing = _issue_ctx + report_reminder + review_briefing
