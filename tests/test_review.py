@@ -391,6 +391,27 @@ def test_briefing_requires_the_three_finding_sections() -> None:
     assert "None." in briefing
 
 
+def test_briefing_instructs_report_result_before_the_printed_block() -> None:
+    """#1457: `build_review_briefing`'s own tail (shared by headless and
+    interactive dispatch alike) must also ask for `coord report-result`
+    ahead of the printed REVIEW_VERDICT block, gated on `$COORD_ASSIGNMENT_ID`
+    so a headless reviewer — which never learns its own assignment id before
+    dispatch — safely skips it and falls straight through to the always-
+    required printed block."""
+    from coord.review import REVIEWER_SYSTEM_PROMPT
+
+    briefing = build_review_briefing(
+        pr_number=42, pr_url=None, repo_github="acme/api", repo_name="api",
+        issue_number=7, issue_title="Fix login", issue_body="",
+        branch="issue-7", worker_machine="laptop", same_as_worker=False,
+        reviews_cfg=ReviewsConfig(enabled=True), repo_claude_md=None,
+    )
+    for text in (briefing, REVIEWER_SYSTEM_PROMPT):
+        assert "coord report-result" in text
+        assert "COORD_ASSIGNMENT_ID" in text
+        assert "belt and braces" in text
+
+
 def test_briefing_uses_generic_checklist_when_none_configured() -> None:
     briefing = build_review_briefing(
         pr_number=1, pr_url=None, repo_github="acme/api", repo_name="api",
@@ -1856,6 +1877,10 @@ def test_scoped_briefing_contains_delta_and_established_context_framing() -> Non
     assert "## Blocking findings" in briefing
     assert "## Non-blocking concerns" in briefing
     assert "## Nits" in briefing
+    # #1457: same report-result-before-the-block contract as a full review.
+    assert "coord report-result" in briefing
+    assert "COORD_ASSIGNMENT_ID" in briefing
+    assert "belt and braces" in briefing
 
 
 def _scoped_entry(**overrides) -> QueuedMerge:
@@ -2515,6 +2540,24 @@ def test_reviewer_system_prompt_instructs_structured_output() -> None:
     assert "REVIEW_VERDICT:" in REVIEWER_SYSTEM_PROMPT
     assert "REVIEW_BODY:" in REVIEWER_SYSTEM_PROMPT
     assert "END_REVIEW" in REVIEWER_SYSTEM_PROMPT
+
+
+def test_reviewer_system_prompt_instructs_report_result_as_required_primary() -> None:
+    """#1457: `report-result` never appeared in REVIEWER_SYSTEM_PROMPT — the
+    only verdict-recording instruction the agent actually reads was "print
+    the REVIEW_VERDICT block", even though the #606 PATH-fix (coord/
+    interactive.py:_with_coord_on_path) exists specifically to make `coord
+    report-result` reachable and calls it the reviewer's "PREFERRED
+    self-report path". The prompt must now instruct the agent to run
+    `coord report-result` (keyed off `$COORD_ASSIGNMENT_ID`) BEFORE printing
+    the REVIEW_VERDICT block, with the block kept as a REQUIRED backup, not
+    an optional one."""
+    assert "coord report-result" in REVIEWER_SYSTEM_PROMPT
+    assert "COORD_ASSIGNMENT_ID" in REVIEWER_SYSTEM_PROMPT
+    assert "belt and braces" in REVIEWER_SYSTEM_PROMPT
+    # The block stays REQUIRED — it is not downgraded now that report-result
+    # is also asked for.
+    assert "REQUIRED" in REVIEWER_SYSTEM_PROMPT
 
 
 def test_reviewer_system_prompt_states_end_review_as_hard_requirement() -> None:

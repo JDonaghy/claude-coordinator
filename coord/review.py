@@ -852,7 +852,20 @@ How to review:
 2. Read the PR diff using `git diff` or the briefing instructions.
 3. Check the diff against the review checklist in your briefing.
 4. For each finding, cite the specific file:line and the rule it violates.
-5. At the END of your session, output your verdict in this exact format:
+5. Before you end your session, record your verdict TWICE — belt and \
+braces, neither step substitutes for the other:
+
+   a. PRIMARY (do this FIRST, if you can): if the environment variable \
+`COORD_ASSIGNMENT_ID` is set, write your full findings to a file and run:
+      `coord report-result --assignment "$COORD_ASSIGNMENT_ID" --status done \
+--verdict approve|request-changes --body-file <file>`
+      This writes your verdict straight to the coordinator's board — the \
+authoritative record. Check the command's output for a confirmation; if it \
+errors, or `COORD_ASSIGNMENT_ID` is unset, or `coord` is not on your PATH, \
+say so plainly and fall through to step b anyway — it is REQUIRED \
+regardless.
+   b. BACKUP (always do this too, even after a successful step a): at the \
+END of your session, output your verdict in this exact format:
 
 REVIEW_VERDICT: approve
 REVIEW_BODY:
@@ -865,6 +878,10 @@ REVIEW_VERDICT: request-changes
 REVIEW_BODY:
 <your full review text in markdown>
 END_REVIEW
+
+This printed block is the PATH-independent fallback recovered from your \
+session transcript even when step a never ran or failed — it is REQUIRED \
+every time, not just when `coord report-result` is unavailable.
 
 Structure the markdown body with these three headings, in this order, ALWAYS \
 all three even when a section is empty — write `None` under a heading with \
@@ -1429,9 +1446,19 @@ def build_review_briefing(
         lines.append("3. Review the diff against the checklist above.")
     lines.append("")
     lines.append(
-        "4. At the END of your session, output your findings in this exact format "
-        "(the coordinator will post the review to GitHub on your behalf — "
-        "do NOT run any `gh` commands):"
+        "4. Before you end your session, record your verdict TWICE — belt "
+        "and braces, neither step substitutes for the other. FIRST, if the "
+        "environment variable `COORD_ASSIGNMENT_ID` is set, write your full "
+        "findings to a file and run `coord report-result --assignment "
+        '"$COORD_ASSIGNMENT_ID" --status done --verdict '
+        "approve|request-changes --body-file <file>` — this writes straight "
+        "to the coordinator's board and is the authoritative record. If "
+        "`COORD_ASSIGNMENT_ID` is unset, `coord` errors, or it's not on "
+        "your PATH, say so plainly and move on to the required backup "
+        "below regardless. THEN, at the END of your session, ALWAYS ALSO "
+        "output your findings in this exact format as the PATH-independent "
+        "backup (the coordinator will post the review to GitHub on your "
+        "behalf — do NOT run any `gh` commands):"
     )
     lines.append("")
     lines.append("```")
@@ -2569,8 +2596,18 @@ def build_scoped_review_briefing(
         "that code was already approved."
     )
     lines.append(
-        "3. At the END of your session, output your findings in this exact "
-        "format (the coordinator posts the review to GitHub on your "
+        "3. Before you end your session, record your verdict TWICE — belt "
+        "and braces, neither step substitutes for the other. FIRST, if the "
+        "environment variable `COORD_ASSIGNMENT_ID` is set, write your full "
+        "findings to a file and run `coord report-result --assignment "
+        '"$COORD_ASSIGNMENT_ID" --status done --verdict '
+        "approve|request-changes --body-file <file>` — this writes straight "
+        "to the coordinator's board and is the authoritative record. If "
+        "`COORD_ASSIGNMENT_ID` is unset, `coord` errors, or it's not on "
+        "your PATH, say so plainly and move on to the required backup "
+        "below regardless. THEN, at the END of your session, ALWAYS ALSO "
+        "output your findings in this exact format as the PATH-independent "
+        "backup (the coordinator posts the review to GitHub on your "
         "behalf — do NOT run any `gh` commands):"
     )
     lines.append("")

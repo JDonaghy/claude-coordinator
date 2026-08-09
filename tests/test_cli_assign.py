@@ -810,17 +810,17 @@ class TestAssignInteractiveReview:
         ]
         assert review_rows == [], "dry-run must not persist a review assignment"
 
-    def test_review_of_briefing_verdict_block_is_primary_channel(
+    def test_review_of_briefing_report_result_is_required_primary_channel(
         self, config_file: Path, coord_dir: Path
     ) -> None:
-        """#651: the interactive review briefing used to tell the reviewer to
-        report via `coord report-result` *instead of* the REVIEW_VERDICT /
-        END_REVIEW block the briefing's tail describes — two conflicting
-        instructions for the same handoff.  The block must now be framed as
-        the required, PATH-independent primary channel (it's what the #606
-        transcript-floor recovery scans for), with `coord report-result`
-        described as an optional fast path on top of it — never a
-        substitute."""
+        """#1457: the interactive review briefing used to frame `coord
+        report-result` as an OPTIONAL fast path on top of a PRIMARY
+        REVIEW_VERDICT block — the "preferred self-report path" the #606
+        PATH-fix exists for was never actually asked for, so an operator had
+        to prompt the reviewer to run it every session. Both steps are now
+        REQUIRED — `coord report-result` FIRST as the authoritative write,
+        the REVIEW_VERDICT block ALWAYS ALSO as the PATH-independent
+        backup — belt and braces, neither substitutes for the other."""
         from unittest.mock import MagicMock
 
         _seed_done_work("work-abc", "issue-1-fix-bug")
@@ -847,17 +847,16 @@ class TestAssignInteractiveReview:
         assert result.exit_code == 0, result.output
         assert len(captured) == 1
         brief = captured[0]
-        # The block is present and described as required, not optional.
+        # Both channels are present and both are described as required.
         assert "REVIEW_VERDICT: / REVIEW_BODY: / END_REVIEW" in brief
-        assert "REQUIRED" in brief
-        # report-result is offered, but explicitly framed as a shortcut, not
-        # a replacement for the block.
         assert "coord report-result" in brief
-        assert "OPTIONALLY" in brief
-        assert "NOT a substitute for step 1" in brief
-        # The old conflicting phrasing telling the reviewer to use
-        # report-result INSTEAD OF the block must be gone.
-        assert "not the" not in brief
+        assert "REQUIRED, PRIMARY" in brief
+        assert "REQUIRED, BACKUP" in brief
+        assert "belt and braces" in brief
+        assert "does NOT replace step 1" in brief
+        # The old #651 phrasing framing report-result as merely OPTIONAL
+        # must be gone.
+        assert "OPTIONALLY" not in brief
 
     def test_review_of_remote_dry_run_builds_remote_dispatch(
         self, config_file: Path, coord_dir: Path
