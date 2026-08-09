@@ -1474,12 +1474,21 @@ pub(crate) fn pipeline_detail_pv_rect_strip(main: Rect, lh: f32) -> Rect {
 /// three, and `ListView::show_v_scrollbar` has no other way to differ per
 /// caller. Board and Pipeline pass `false` (unchanged); only Queue passes
 /// `true`.
+///
+/// `repo` names the row's repo in full in the header line, e.g.
+/// `claude-coordinator #1835`. `None` keeps the header as plain `#1835`
+/// (Board and Pipeline: both are already scoped to one repo via their own
+/// selector, so restating it here would be noise). #2042: Queue's grid
+/// shortens the `Issue`/`After` cells to a repo alias, so its detail pane —
+/// the cheapest place available — is where the full name has to stay
+/// discoverable; only Queue passes `Some`.
 pub(crate) fn issue_body_list(
     issue: Option<(u64, &str, &str, &[String])>,
     scroll_offset: usize,
     widget_id: &'static str,
     width: usize,
     show_v_scrollbar: bool,
+    repo: Option<&str>,
 ) -> ListView {
     let mut items: Vec<ListItem> = Vec::new();
     match issue {
@@ -1491,10 +1500,14 @@ pub(crate) fn issue_body_list(
             ));
         }
         Some((number, title, body, labels)) => {
+            let number_span = match repo {
+                Some(repo) => format!(" {repo} #{number}"),
+                None => format!(" #{number}"),
+            };
             items.push(ListItem {
                 text: StyledText {
                     spans: vec![
-                        StyledSpan::with_fg(format!(" #{}", number), Color::rgb(150, 150, 240)),
+                        StyledSpan::with_fg(number_span, Color::rgb(150, 150, 240)),
                         StyledSpan::with_fg(format!("  {}", title), Color::rgb(230, 230, 255)),
                     ],
                 },
@@ -1741,7 +1754,14 @@ impl CoordApp {
         let repo = self.board_active_repo().map(str::to_string);
         let group = self.board_selected_issue_group().cloned();
         let (Some(repo), Some(g)) = (repo, group) else {
-            return issue_body_list(None, self.detail_scroll, "board-issue-body", wrap_width, false);
+            return issue_body_list(
+                None,
+                self.detail_scroll,
+                "board-issue-body",
+                wrap_width,
+                false,
+                None,
+            );
         };
         let key = (repo.clone(), g.issue_number);
 
@@ -1763,6 +1783,7 @@ impl CoordApp {
                 "board-issue-body",
                 wrap_width,
                 false,
+                None,
             );
         }
 
@@ -1797,6 +1818,7 @@ impl CoordApp {
                 "board-issue-body",
                 wrap_width,
                 false,
+                None,
             );
         }
 
@@ -1828,6 +1850,7 @@ impl CoordApp {
                     "board-issue-body",
                     wrap_width,
                     false,
+                    None,
                 );
             }
         }
@@ -1844,6 +1867,7 @@ impl CoordApp {
             "board-issue-body",
             wrap_width,
             false,
+            None,
         )
     }
 
@@ -1923,6 +1947,7 @@ impl CoordApp {
             "pipeline-issue-body",
             wrap_width,
             false,
+            None,
         )
     }
 

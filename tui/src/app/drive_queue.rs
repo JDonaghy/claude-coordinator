@@ -853,12 +853,18 @@ impl CoordApp {
             held: is_holding(e),
             cells: vec![
                 e.position.to_string(),
-                e.key(),
+                alias_queue_key(&e.key()),
                 or_dash(self.queue_issue_title(&e.repo_name, e.issue_number)),
                 or_dash(e.state.clone()),
                 or_dash(e.machine.clone().unwrap_or_default()),
                 e.attempts.to_string(),
-                or_dash(e.after.join(", ")),
+                or_dash(
+                    e.after
+                        .iter()
+                        .map(|a| alias_queue_key(a))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ),
                 queue_hold_cell(e),
                 or_dash(e.last_reason.clone()),
             ],
@@ -1190,6 +1196,7 @@ impl CoordApp {
                 "queue-issue-body",
                 wrap_width,
                 true,
+                None,
             );
         };
         let repo = row.repo_name.clone();
@@ -1200,6 +1207,7 @@ impl CoordApp {
                 "queue-issue-body",
                 wrap_width,
                 true,
+                None,
             );
         };
         let key = (repo.clone(), number);
@@ -1221,6 +1229,7 @@ impl CoordApp {
                 "queue-issue-body",
                 wrap_width,
                 true,
+                Some(&repo),
             );
         }
 
@@ -1257,6 +1266,7 @@ impl CoordApp {
                 "queue-issue-body",
                 wrap_width,
                 true,
+                Some(&repo),
             );
         }
 
@@ -1287,6 +1297,7 @@ impl CoordApp {
                     "queue-issue-body",
                     wrap_width,
                     true,
+                    Some(&repo),
                 );
             }
         }
@@ -1303,6 +1314,7 @@ impl CoordApp {
             "queue-issue-body",
             wrap_width,
             true,
+            Some(&repo),
         )
     }
 
@@ -1682,6 +1694,39 @@ pub(crate) struct QueueRow {
 /// What an absent value renders as. A blank cell and a failed paint look
 /// identical; an em dash says "there is nothing here" out loud.
 pub(crate) const QUEUE_EMPTY_CELL: &str = "—";
+
+/// #2042: short alias for a repo name, used ONLY in the Queue grid's `Issue`
+/// and `After` cells — the full name repeats on every row there and crowds
+/// out `Reason`, the column that actually explains a stuck entry. Rule:
+/// split on `-`, take each word's first character, uppercase, concatenate.
+/// `claude-coordinator` → `CC`, `coord-portal` → `CP`, `vimcode` → `V`.
+///
+/// A repeated or trailing `-` yields empty words, which `filter_map` simply
+/// drops — no panic, no empty-letter placeholder.
+///
+/// **Known scope limitation, not a bug to fix here:** this has no collision
+/// handling. Two repo names that start the same way (`coord-portal` and a
+/// hypothetical future `coord-proxy`) would both alias to `CP`. There is no
+/// collision in the current fleet (`CC`, `CP`, `V`, `Q`), so this function
+/// does not disambiguate — see #2042.
+pub(crate) fn repo_alias(repo_name: &str) -> String {
+    repo_name
+        .split('-')
+        .filter_map(|word| word.chars().next())
+        .flat_map(|c| c.to_uppercase())
+        .collect()
+}
+
+/// Render a `"repo#N"` queue key (`BoardDriveQueueEntry::key()`, or one of
+/// `after`'s entries — same format) with the repo replaced by its
+/// [`repo_alias`]. The one place both the `Issue` and `After` cells go
+/// through, so the derivation isn't inlined twice (#2042).
+pub(crate) fn alias_queue_key(key: &str) -> String {
+    match key.split_once('#') {
+        Some((repo, rest)) => format!("{}#{}", repo_alias(repo), rest),
+        None => key.to_string(),
+    }
+}
 
 /// The `Hold` cell for one entry — #1757's DEPLOY GATE, read verbatim off
 /// `hold_state` (never re-derived, same posture as `state`).
@@ -2452,7 +2497,9 @@ mod tests {
              its presence here would mean the overlay is still reachable:\n{panel}"
         );
         assert!(
-            panel.contains("myrepo#7") && panel.contains("myrepo#9"),
+            // #2042: the grid's Issue/After cells render the `M` alias, not
+            // the full repo name — `Reason` (checked below) is untouched.
+            panel.contains("M#7") && panel.contains("M#9"),
             "both entries must be on the panel's grid:\n{panel}"
         );
         assert!(
@@ -2778,13 +2825,15 @@ mod tests {
             "a failing probe must show its rising attempt count:\n{screen}"
         );
         assert!(
-            screen.contains("myrepo#1753"),
+            // #2042: the grid renders `M#1753` (the alias), not the full
+            // `myrepo#1753` key.
+            screen.contains("M#1753"),
             "the held row itself must be selectable on the panel's grid, \
              despite being `done`:\n{screen}"
         );
 
         let (x, y) = driver
-            .find("myrepo#1753")
+            .find("M#1753")
             .unwrap_or_else(|| panic!("held row not found:\n{}", driver.screen()));
         driver.dispatch(UiEvent::MouseDown {
             widget: None,
