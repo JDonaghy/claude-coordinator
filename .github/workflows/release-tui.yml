@@ -71,6 +71,24 @@ jobs:
   # every job in the release run — including the `build-tui` job that calls
   # this workflow — gates on via `needs:`. One guard, one place, no drift
   # between two copies of the same check.
+  # RUNNER LABELS ARE A LIVE DEPENDENCY — pin them to images that still exist,
+  # and re-check when GitHub retires one (#2036).
+  #
+  # A retired runner label does not fail. It QUEUES, forever, with the job
+  # showing a perfectly ordinary "queued" spinner and the run reporting no
+  # error at all. On 2026-08-09 `macos-13` (retired) held three runs hostage —
+  # the oldest for 23 hours — and, because #1242 made publish-pypi gate on
+  # `verify-assets` -> `build-tui`, it blocked EVERY PyPI release rather than
+  # just the binary it was building. Before #1242 the same dead label only
+  # stranded a redundant standalone run, so it sat unnoticed: the breakage was
+  # already there and became load-bearing when the workflows were unified.
+  #
+  # `continue-on-error` / `best_effort` is NO protection here — those act on a
+  # job that FAILS, and a job with an unschedulable label never starts. The
+  # loud-failure guard for this class belongs in the release post-condition
+  # (#2035): fail the release if the artifact never reaches the PyPI simple
+  # index within a bounded window, instead of waiting on a runner that is
+  # never coming.
   build:
     strategy:
       fail-fast: false
@@ -83,12 +101,17 @@ jobs:
             os: ubuntu-latest
             bin_ext: ""
             best_effort: false
+          # macos-15-intel, not the retired macos-13: this is the current
+          # Intel x64 image (macos-26-intel is the newer one when we want it).
           - target_name: x86_64-macos
-            os: macos-13
+            os: macos-15-intel
             bin_ext: ""
             best_effort: false
+          # macos-15, not macos-14: 14 is DEPRECATED, i.e. exactly one
+          # retirement away from reproducing the macos-13 hang above. Moved
+          # now rather than after it costs another release.
           - target_name: aarch64-macos
-            os: macos-14
+            os: macos-15
             bin_ext: ""
             best_effort: false
           # Windows is not part of the stated acceptance bar. `best_effort:
