@@ -109,6 +109,7 @@ __all__ = [
     "render_sub_issues",
     "replace_sub_issues_section",
     "remove_sub_issues_section",
+    "milestone_work_order_membership",
     "validate_milestone_membership",
     "FrontierEntry",
     "BlockedNode",
@@ -219,6 +220,54 @@ def parse_sub_issues(body: str) -> WorkOrder:
     :func:`parse_work_order`).
     """
     return _parse_checklist_section(body, _SUB_ISSUES_HEADING_RE, "sub-issues")
+
+
+def milestone_work_order_membership(issues: Iterable[dict]) -> list[dict]:
+    """Minimal ``milestone_work_orders`` projection: which tracking issue (if
+    any) each issue's ``## Work order`` block claims as a member — nothing
+    about readiness.
+
+    #2040: ``coord.serve_app``'s ``/board`` handler computes a RICHER
+    ``milestone_work_orders`` (ready/blocked/next-up per node, via
+    :func:`ready_frontier` over a live :class:`~coord.models.Board` +
+    ``Config``) for the TUI's Pipeline cards — that version needs I/O this
+    function deliberately avoids (a board snapshot, repo config). The ONE
+    consumer of ``milestone_work_orders`` outside that HTTP wire shape is
+    :func:`coord.drive_state.project`, and it only ever reads
+    ``tracking_issue`` plus membership (``nodes[].issue_number``) to resolve
+    ``IssueState.milestone_tracking_issue`` — so this gives
+    :class:`~coord.drive_state.BoardFetcher`'s daemon-host path (which has no
+    HTTP round trip to lean on) the same answer with no extra I/O beyond the
+    ``issues`` rows it already has.
+
+    *issues* is a ``/board``-shaped ``issues`` list (each dict carrying at
+    least ``repo_name``, ``number``, ``labels``, ``body``; ``milestone_title``
+    is optional). Same fail-open posture as the HTTP handler's block: a
+    tracking issue (``TRACKING_ISSUE_LABEL``) with no body, an unparseable
+    ``## Work order`` block, or an empty one is skipped rather than raising —
+    one bad epic must never blank the whole projection.
+    """
+    out: list[dict] = []
+    for ti in issues:
+        labels = ti.get("labels") or []
+        if TRACKING_ISSUE_LABEL not in labels:
+            continue
+        repo_name = ti.get("repo_name") or ""
+        if not repo_name:
+            continue
+        try:
+            wo = parse_work_order(ti.get("body") or "")
+        except Exception:  # noqa: BLE001 — bad work order: skip this tracking issue
+            continue
+        if not wo.nodes:
+            continue
+        out.append({
+            "repo_name": repo_name,
+            "tracking_issue": ti.get("number"),
+            "milestone_title": ti.get("milestone_title") or "",
+            "nodes": [{"issue_number": n.issue_number} for n in wo.nodes],
+        })
+    return out
 
 
 def _parse_checklist_section(

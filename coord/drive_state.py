@@ -578,6 +578,53 @@ def scratch_dir() -> Path:
     return base
 
 
+def _local_issue_rows() -> list[dict]:
+    """``issues`` rows straight from the local DB (daemon-host path only).
+
+    #2040: :meth:`BoardFetcher._fetch_local`'s standalone payload used to
+    carry no ``issues`` key at all (see that method's docstring) — this is
+    the top-up. Same fail-soft posture and the same
+    ``coord.db.get_connection()`` singleton
+    ``coord.commands.drive_queue._local_issue_rows`` already uses for its own
+    (narrower — ``repo_name, number, state`` only) top-up of the same
+    standalone-payload gap; this one additionally selects ``milestone_number``
+    / ``milestone_title`` / ``labels`` / ``body`` — what :func:`project`'s
+    oracle-loop resolution and :func:`coord.milestone_order.
+    milestone_work_order_membership` need that the narrower query doesn't
+    carry.
+
+    Deliberately queries ``get_connection()`` rather than
+    ``coord.dao.SqliteStore`` — see :meth:`BoardFetcher._fetch_local`'s
+    docstring for why the latter is wrong for anything running in-process
+    with the rest of the CLI (as ``coord drive`` does on the daemon host).
+
+    Fail-soft: an unreadable/absent table degrades to ``[]``, which puts the
+    daemon host back on the assignment-only signals rather than aborting the
+    whole board read over one bad table.
+    """
+    from coord.db import get_connection  # noqa: PLC0415
+
+    try:
+        rows = get_connection().execute(
+            "SELECT repo_name, number, state, milestone_number, milestone_title, "
+            "labels, body FROM issues"
+        ).fetchall()
+    except Exception:  # noqa: BLE001 — see the fail-soft note above
+        return []
+
+    out: list[dict] = []
+    for r in rows:
+        d = dict(r)
+        labels = d.get("labels")
+        if isinstance(labels, (str, bytes, bytearray)):
+            try:
+                d["labels"] = json.loads(labels) if labels else None
+            except (json.JSONDecodeError, TypeError):
+                d["labels"] = None
+        out.append(d)
+    return out
+
+
 @dataclass
 class BoardFetcher:
     """``GET /board`` with an ETag cache, or the local DB when standalone.
@@ -595,11 +642,7 @@ class BoardFetcher:
 
         svc = resolve_board_service()
         if svc is None:
-            # Standalone (daemon host): build the payload from the local DB.
-            from coord.board_service import read_board  # noqa: PLC0415
-            from coord.client import serialize_board  # noqa: PLC0415
-
-            return serialize_board(read_board())
+            return self._fetch_local()
 
         import httpx  # noqa: PLC0415
 
@@ -617,6 +660,56 @@ class BoardFetcher:
         resp.raise_for_status()
         payload = resp.json()
         self._write_cache(cache_path, resp.headers.get("etag"), payload)
+        return payload
+
+    @staticmethod
+    def _fetch_local() -> dict:
+        """Standalone (daemon host, no ``board_service`` configured): the old
+        ``{assignments, round_number}`` write-serialization, topped up with
+        the two keys :func:`project`'s #1453 oracle-loop resolution needs.
+
+        #2040: this used to be JUST ``serialize_board(read_board())`` —
+        ``coord.client.serialize_board`` is the ``POST /board`` UPSERT
+        payload (only what ``coord.state.save_board`` persists), reused here
+        by accident for a READ. It carries no ``issues`` key at all, so
+        :func:`project`'s ``milestone_number`` / ``milestone_tracking_issue``
+        resolution always saw ``None`` on the daemon host — silently
+        defeating the #1453 oracle gate (every oracle-opted-in issue read as
+        a plain "normal drive" and dead-ended on the #1138 refusal #1453
+        exists to prevent).
+
+        Deliberately NOT ``coord.dao.SqliteStore`` (what ``coord.serve_app``'s
+        ``/board`` handler uses): that class opens its OWN ``sqlite3``
+        connection straight at ``coord.db.DB_PATH``, bypassing the
+        ``coord.db.get_connection()`` singleton entirely — the exact
+        production-DB-read-during-a-test shape #1960's
+        ``ProductionDatabaseGuardError`` exists to catch, just through a path
+        that guard doesn't cover (confirmed the hard way: swapping it in here
+        made 20 ``tests/test_cli_drive_queue.py`` tests silently read the
+        real ``~/.coord/coord.db`` instead of the seeded ``:memory:`` one).
+        ``coord drive``/``drive-queue tick`` run IN-PROCESS with the rest of
+        the CLI on the daemon host (unlike ``coord serve``, a separate
+        process), so this has to go through the same connection every other
+        in-process reader does — :func:`_local_issue_rows` below queries it
+        directly, mirroring ``coord.commands.drive_queue._local_issue_rows``'s
+        established fail-soft top-up pattern for the same standalone-payload
+        gap, one table over.
+
+        ``milestone_work_orders`` — the other key :func:`project` needs, and
+        the one no raw table backs — is derived from those same rows by
+        :func:`coord.milestone_order.milestone_work_order_membership`; see
+        its docstring for why a membership-only projection (no readiness) is
+        the right scope for this call site.
+        """
+        from coord.board_service import read_board  # noqa: PLC0415
+        from coord.client import serialize_board  # noqa: PLC0415
+        from coord.milestone_order import milestone_work_order_membership  # noqa: PLC0415
+
+        payload = serialize_board(read_board())
+        payload["issues"] = _local_issue_rows()
+        payload["milestone_work_orders"] = milestone_work_order_membership(
+            payload["issues"]
+        )
         return payload
 
     def _cache_path(self, url: str) -> Path:
