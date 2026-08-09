@@ -88,18 +88,28 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 KillMode=process
-# --max-parallel 3 (#2012) — the global ceiling, one slot per repo in the
-# fleet (claude-coordinator, quadraui, vimcode). #1972 added the SECOND
-# ceiling, --max-parallel-per-repo (default 1), which is what keeps two
-# drives off the same repo; without raising this outer one the per-repo
-# ceiling can never bind, because the walk stops at the global limit
-# first and never reaches an entry from a different repo.
+# --max-parallel 4 (#2012, raised from 3 in #2057) — the global ceiling,
+# ONE SLOT PER REPO IN THE FLEET: claude-coordinator, quadraui, vimcode,
+# coord-portal. It was 3 because the fleet had three repos when #2012 set
+# it; coord-portal joined afterwards and the number was never revisited, so
+# the fourth repo could never drive concurrently no matter what was queued.
+#
+# KEEP THIS EQUAL TO THE REPO COUNT. It is not a tuning knob for how hard
+# the fleet works — that is what the per-repo ceiling and machine capacity
+# decide. Set it lower and a repo silently loses its lane; set it higher
+# and it does nothing, because the per-repo ceiling still admits only one
+# drive per repo.
+#
+# #1972 added the SECOND ceiling, --max-parallel-per-repo (default 1),
+# which is what keeps two drives off the same repo; without raising this
+# outer one the per-repo ceiling can never bind, because the walk stops at
+# the global limit first and never reaches an entry from a different repo.
 #
 # Raise this ONLY on a host whose coord actually enforces the per-repo
 # ceiling (>= the release carrying #1972). A higher global ceiling on an
 # older coord launches two same-repo drives, which stale each other's
 # Test verdicts (#1479) — the exact collision #1972 exists to prevent.
-ExecStart=%h/.local/bin/coord drive-queue tick --max-parallel 3 --config %h/.coord/coordinator.yml
+ExecStart=%h/.local/bin/coord drive-queue tick --max-parallel 4 --config %h/.coord/coordinator.yml
 # Generous relative to the tick's own ~120s launch-subprocess timeout
 # (_LAUNCH_TIMEOUT_SECONDS in coord/commands/drive_queue.py), but well below
 # the timer's 15-minute cadence (coord-drive-queue.timer) so a genuinely
