@@ -105,6 +105,14 @@ def test_an_undetectable_diff_ships():
     assert ships_code([])
 
 
+def test_githooks_only_ships_nothing():
+    """CLAUDE.md: '.githooks/** is a fifth deploy surface whose failure mode
+    is the opposite of the other four — a merged hook is live on every
+    machine at the next fetch, no release, no restart.' Cutting a release
+    (and a fleet-wide propagation restart) for it would be pure waste."""
+    assert not ships_code([".githooks/post-checkout"])
+
+
 # ── bump ─────────────────────────────────────────────────────────────────
 
 

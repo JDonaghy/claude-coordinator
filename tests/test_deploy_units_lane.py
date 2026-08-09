@@ -189,7 +189,6 @@ def test_a_dry_run_writes_nothing(reference, installed):
 def test_a_wheel_with_no_packaged_units_reports_rather_than_crashes(tmp_path):
     """An install predating #1927 ships no `coord/deploy/`. There is nothing
     to deploy from, and saying so is the whole answer."""
-    report = du.install_units(target_dir=tmp_path, reference_dir=None)
     # reference_dir=None falls back to the real packaged dir, which exists in
     # this checkout — so drive the empty case explicitly instead.
     empty = tmp_path / "empty"

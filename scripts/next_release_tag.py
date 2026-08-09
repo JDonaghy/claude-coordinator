@@ -98,6 +98,12 @@ NON_SHIPPING_PREFIXES: tuple[str, ...] = (
     "LICENSE",
     ".github/ISSUE_TEMPLATE/",
     ".gitignore",
+    # CLAUDE.md: ".githooks/** is a fifth deploy surface whose failure mode
+    # is the opposite of the other four — a merged hook is live on every
+    # machine at the next fetch, no release, no restart." Minting a release
+    # for it would be pure waste: fleet-wide propagation for a change that's
+    # already everywhere.
+    ".githooks/",
 )
 
 #: Case-insensitive markers in the merge commit message that suppress the

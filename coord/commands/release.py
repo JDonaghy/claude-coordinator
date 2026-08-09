@@ -530,6 +530,19 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
     updated_hosts: list[str] = []
     local_name = _local_machine_name(config)
 
+    # #1835 review: plan_lanes() puts the daemon host's python lane first
+    # specifically so "a caller must never reach an endpoint its daemon
+    # predates" holds — but that is only true if a failure there actually
+    # stops every other host's python lane from rolling forward. Without
+    # this, a failed daemon roll left the loop free to advance every other
+    # host to target_version anyway, reproducing the documented 405 skew
+    # for the rest of this run (up to --timeout seconds per remaining
+    # host) until the final `coord release verify` gate caught it — or,
+    # with --no-verify, not at all. So this is an enforced precondition,
+    # not just an ordering suggestion: once the daemon's own python roll
+    # fails, every other host's python lane is skipped outright.
+    daemon_python_failed = False
+
     for roll in rolls:
         machine = by_name.get(roll.host)
         if machine is None:
@@ -541,6 +554,25 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
                                  "detail": "skipped — host unreachable"})
             continue
 
+        if (
+            roll.lane == rp.LANE_PYTHON
+            and daemon_python_failed
+            and roll.host != daemon_name
+        ):
+            # Not a failure of *this* host — it was simply never attempted,
+            # because attempting it would put it ahead of a daemon that
+            # cannot yet serve it. A re-run after the daemon is fixed
+            # should resume here, not treat this host as needing rollback.
+            detail = (
+                "not attempted — daemon host's python lane failed; rolling "
+                "this host first would reproduce the 405 skew the lane "
+                "order exists to prevent"
+            )
+            record.lanes.append({"lane": roll.lane, "host": roll.host, "ok": None,
+                                 "detail": detail})
+            click.echo(f"  · {roll.label}: {detail}")
+            continue
+
         if roll.lane == rp.LANE_PYTHON:
             ok, detail = _roll_python(
                 machine, target_version=record.target_version,
@@ -548,6 +580,8 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
             )
             if ok:
                 updated_hosts.append(roll.host)
+            elif roll.host == daemon_name:
+                daemon_python_failed = True
         elif roll.lane == rp.LANE_UNITS:
             ok, detail = _roll_units(machine, agent_port=AGENT_PORT)
         else:
@@ -590,8 +624,9 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
         _finish(rp.STATUS_FAILED, 1)
 
     # ── 6. release the deploy gates that were waiting for this ───────────
-    verified = True
-    for key in rp.holds_to_release(quiescence, verified=verified):
+    # Reaching this line means `after.severity != "crit"` — both crit
+    # branches above already exit — so this roll is, definitionally, verified.
+    for key in rp.holds_to_release(quiescence, verified=True):
         if not release_holds:
             click.echo(f"  · deploy gate {key} left held (--no-release-holds)")
             continue
