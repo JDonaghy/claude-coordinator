@@ -1862,3 +1862,83 @@ class TestRecordTestVerdictToolchain:
         board = build_board()
         row = next(a for a in board.active if a.assignment_id == "aid-old")
         assert row.test_toolchain is None
+
+
+class TestVerdictSourceRoundTrip:
+    """#1956: `verdict_source`/`verdict_source_reason` round-trip through the
+    whole-board upsert (`save_board` -> `_UPSERT_SQL`/`_assignment_upsert_params`
+    -> `build_board` -> `row_to_assignment`) — the write path #1956's
+    `coord.auto_loop` override stamps into, and every other whole-board saver
+    (the periodic reconcile ticks chief among them) shares."""
+
+    def test_round_trips_through_save_and_build_board(self, coord_db) -> None:
+        from coord.models import Assignment, Board
+        from coord.state import build_board, save_board
+
+        review = Assignment(
+            machine_name="precision",
+            repo_name="api",
+            issue_number=42,
+            issue_title="[review] fix the thing",
+            assignment_id="rev-vs-1",
+            type="review",
+            status="done",
+            review_verdict="approve",
+            verdict_source="overridden",
+            verdict_source_reason="#476 approve-with-nits gate: blocking=0",
+            dispatched_at=1.0,
+            finished_at=2.0,
+        )
+        save_board(Board(active=[], completed=[review]))
+
+        board = build_board()
+        row = next(a for a in board.completed if a.assignment_id == "rev-vs-1")
+        assert row.verdict_source == "overridden"
+        assert row.verdict_source_reason == "#476 approve-with-nits gate: blocking=0"
+
+    def test_once_set_a_later_upsert_without_it_does_not_erase_it(
+        self, coord_db,
+    ) -> None:
+        """Mirrors review_verdict_original's own COALESCE-preserve guard
+        (#1456): a later whole-board save from a path that doesn't know
+        about provenance (agent reload, thin-client round-trip) must not
+        silently erase a value already recorded."""
+        from coord.models import Assignment, Board
+        from coord.state import build_board, save_board
+
+        review = Assignment(
+            machine_name="precision",
+            repo_name="api",
+            issue_number=42,
+            issue_title="[review] fix the thing",
+            assignment_id="rev-vs-2",
+            type="review",
+            status="done",
+            review_verdict="approve",
+            verdict_source="recovered",
+            verdict_source_reason="header missing, recovered from transcript",
+            dispatched_at=1.0,
+            finished_at=2.0,
+        )
+        save_board(Board(active=[], completed=[review]))
+
+        # A later save of the SAME row with no provenance set (e.g. a stale
+        # snapshot from a code path predating #1956).
+        stale = Assignment(
+            machine_name="precision",
+            repo_name="api",
+            issue_number=42,
+            issue_title="[review] fix the thing",
+            assignment_id="rev-vs-2",
+            type="review",
+            status="done",
+            review_verdict="approve",
+            dispatched_at=1.0,
+            finished_at=2.0,
+        )
+        save_board(Board(active=[], completed=[stale]))
+
+        board = build_board()
+        row = next(a for a in board.completed if a.assignment_id == "rev-vs-2")
+        assert row.verdict_source == "recovered"
+        assert row.verdict_source_reason == "header missing, recovered from transcript"

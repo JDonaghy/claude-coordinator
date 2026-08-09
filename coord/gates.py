@@ -81,6 +81,11 @@ class AssignmentGateRow:
     review_state: str | None
     review_verdict: str | None
     review_of_assignment_id: str | None
+    # #1956: WHO recorded review_verdict and HOW — "agent" (the parsed
+    # common case, or None for pre-#1956 rows), "recovered", or
+    # "overridden". See coord.models.Assignment.verdict_source.
+    verdict_source: str | None
+    verdict_source_reason: str | None
 
 
 @dataclass
@@ -96,6 +101,15 @@ class GateDecision:
     anchor: str | None = None  # "base" | "branch"
     recorded_sha: str | None = None
     current_sha: str | None = None
+    # #1956: True only for the "review" gate, and only when it's blocked
+    # because a linked review row finished (status="done") with NO
+    # parseable verdict at all — a defect, not a state. Distinguishing this
+    # from an ordinary "review required but not approved" (a review that
+    # simply hasn't run, or genuinely requested changes) matters: it needs
+    # OPERATOR RECOVERY (see `reason` for the exact command), not another
+    # dispatched review — re-dispatching just re-derives a conclusion that
+    # already exists in the log, per #1956's "Not the fix" section.
+    verdict_unparseable: bool = False
 
 
 @dataclass
@@ -128,6 +142,8 @@ def _row_from_assignment(a: "Assignment") -> AssignmentGateRow:
         review_state=a.review_state,
         review_verdict=a.review_verdict,
         review_of_assignment_id=a.review_of_assignment_id,
+        verdict_source=a.verdict_source,
+        verdict_source_reason=a.verdict_source_reason,
     )
 
 
@@ -177,6 +193,52 @@ def _select_winning_work_assignment(work_like: list["Assignment"]) -> "Assignmen
         if (a.dispatched_at or 0.0) >= (winner.dispatched_at or 0.0):
             winner = a
     return winner
+
+
+def _find_verdict_unparseable_review(
+    entry: "mq.QueuedMerge", board: "Board",
+) -> "Assignment | None":
+    """Return a review row linked to *entry*'s work chain that finished
+    (``status == "done"``) with NO parseable ``review_verdict`` at all, or
+    ``None`` (#1956).
+
+    This is the exact defect #1956 reports: a review session completes —
+    sometimes with a full, well-reasoned body ending in ``END_REVIEW`` — but
+    the reviewer never emitted the machine-readable ``REVIEW_VERDICT:``
+    header, so ``review_verdict`` stays ``NULL`` forever.  Before this,
+    ``has_approved_review`` reports exactly the same "not approved" for this
+    row as it would for a review that simply hasn't run yet, or one that
+    genuinely requested changes — three very different situations rendered
+    identically. Surfacing this distinctly here lets :func:`build_gate_report`
+    give the operator the actual recovery command instead of a generic
+    "review required but not approved" that suggests re-dispatching (which
+    #1956 explicitly calls out as "Not the fix" — it just re-derives a
+    conclusion already sitting in the log, and is a coin flip whether the
+    next attempt drops the header too).
+
+    Reuses :func:`coord.merge_queue._chain_work_ids` (the same branch/
+    ``review_of_assignment_id`` chain :func:`~coord.merge_queue.has_approved_review`
+    walks) so this never drifts from what that function actually considers
+    "linked to this entry".  When more than one such row exists, the most
+    recently dispatched one is returned.
+    """
+    from coord import merge_queue as mq  # noqa: PLC0415
+
+    pool = list(getattr(board, "completed", []) or []) + list(getattr(board, "active", []) or [])
+    branch_work_ids = mq._chain_work_ids(entry, pool)  # noqa: SLF001
+    if not branch_work_ids:
+        return None
+    candidates = [
+        a for a in pool
+        if getattr(a, "type", None) == "review"
+        and getattr(a, "review_of_assignment_id", None) in branch_work_ids
+        and getattr(a, "status", None) == "done"
+        and getattr(a, "review_verdict", None) is None
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda a: getattr(a, "dispatched_at", None) or 0.0)
+    return candidates[-1]
 
 
 def build_gate_report(
@@ -307,12 +369,35 @@ def build_gate_report(
     review_required = mq.requires_review(entry, config)
     review_ok = True
     review_reason: str | None = None
+    review_verdict_unparseable = False
     if review_required:
         review_ok = mq.has_approved_review(entry, board, gh_ops)
         if not review_ok:
-            review_reason = "review required but not approved"
+            # #1956: don't lump "verdict capture failed" in with the
+            # generic "not approved" — a review row that finished with no
+            # parseable verdict needs OPERATOR RECOVERY, not another
+            # dispatched review (see _find_verdict_unparseable_review's
+            # docstring). Checked only on the refusal path — a review that
+            # actually approved never reaches here.
+            unparseable = _find_verdict_unparseable_review(entry, board)
+            if unparseable is not None:
+                review_verdict_unparseable = True
+                review_reason = (
+                    f"review {unparseable.assignment_id!r} finished with NO "
+                    "parseable verdict (#1956) — needs operator recovery, "
+                    "not a pending/failed review: `coord report-result "
+                    f"--assignment {unparseable.assignment_id} --verdict "
+                    "<approve|request-changes> --verdict-source recovered "
+                    '--verdict-reason "<why>" --body-file '
+                    "<extracted-review.md>`"
+                )
+            else:
+                review_reason = "review required but not approved"
     report.decisions.append(
-        GateDecision(gate="review", required=review_required, ok=review_ok, reason=review_reason)
+        GateDecision(
+            gate="review", required=review_required, ok=review_ok, reason=review_reason,
+            verdict_unparseable=review_verdict_unparseable,
+        )
     )
 
     smoke_required = mq.requires_smoke(entry, config)
@@ -381,6 +466,25 @@ def format_gate_report(report: GateReport) -> str:
             f"      review_state={row.review_state}  review_verdict={row.review_verdict}  "
             f"review_of_assignment_id={row.review_of_assignment_id or '-'}"
         )
+        # #1956: only printed when this row actually carries a verdict AND a
+        # provenance value that is NOT the default "agent" — a plain
+        # "verdict_source=agent" on every ordinary row (the overwhelming
+        # majority, including every row `coord report-result --verdict`
+        # persists going forward — see `issue_store._persist_verdict_source`,
+        # which always stamps a source, never leaves the column NULL) would
+        # be exactly the noise this line was written to avoid. `None` and
+        # the literal `"agent"` both mean "an agent produced this verdict"
+        # (see coord.models.Assignment.verdict_source) — only surface the
+        # cases that need a human's attention: recovered/overridden.
+        if row.review_verdict is not None and row.verdict_source not in (None, "agent"):
+            lines.append(
+                f"      verdict_source={row.verdict_source}"
+                + (
+                    f"  reason={row.verdict_source_reason!r}"
+                    if row.verdict_source_reason
+                    else ""
+                )
+            )
 
     if report.decisions:
         by_gate = {d.gate: d for d in report.decisions}
@@ -394,6 +498,12 @@ def format_gate_report(report: GateReport) -> str:
                 lines.append("  review : not required")
             elif review.ok:
                 lines.append("  review : approve")
+            elif review.verdict_unparseable:
+                # #1956: deliberately NOT "BLOCKED" — that word reads
+                # identically to "not yet reviewed" / "requested changes",
+                # exactly the ambiguity #1956 reports. This needs operator
+                # recovery, not a wait.
+                lines.append(f"  review : ERROR — {review.reason}")
             else:
                 lines.append(f"  review : BLOCKED — {review.reason}")
         test = by_gate.get("test")

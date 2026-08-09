@@ -439,6 +439,31 @@ class Assignment:
     # approve) was invisible precisely because only the final value was stored.
     review_verdict_original: str | None = None
     review_verdict_override_reason: str | None = None
+    # #1956: provenance for `review_verdict` — WHO decided it and HOW, not
+    # just what was decided. A relayed verdict (`coord report-result
+    # --verdict` posted by an operator, not parsed from the reviewer's own
+    # log) is otherwise indistinguishable from one the reviewer agent
+    # produced itself — every downstream reader (merge gate, `coord gates`,
+    # the TUI) sees a plain "approve" either way. Three values:
+    #   "agent"      — parsed from the reviewer's own transcript (the
+    #                  overwhelming common case; also the default when this
+    #                  column is NULL, for every row predating this feature).
+    #   "recovered"  — the reviewer reached a verdict and said so in prose,
+    #                  but never emitted the machine-readable REVIEW_VERDICT
+    #                  header; an operator (or the #1956 transcript-floor
+    #                  fallback) rescued it from the transcript. Asserts
+    #                  "the reviewer decided this, we merely restored it."
+    #   "overridden" — a human (or the #476 approve-with-nits gate) recorded
+    #                  a DIFFERENT verdict than the reviewer's own. Asserts
+    #                  "the reviewer decided otherwise and this overrides
+    #                  it." Always paired with `review_verdict_original`
+    #                  when the override happened automatically (#476); a
+    #                  manual override may have no prior agent verdict at
+    #                  all (e.g. an interactive review that never finished).
+    # `verdict_source_reason` is a required, human-readable justification for
+    # anything that isn't "agent" — see issue_store._validate_result.
+    verdict_source: str | None = None
+    verdict_source_reason: str | None = None
     # #821: SHA of the branch HEAD captured at the time the review assignment
     # ran.  When set, `has_approved_review` compares this against the merge
     # queue entry's `branch_head_sha` to reject stale approvals — if the

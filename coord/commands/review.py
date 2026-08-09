@@ -707,6 +707,35 @@ def _prompt_and_relay_test_verdict(
 )
 
 
+@click.option(
+    "--verdict-source",
+    type=click.Choice(["recovered", "overridden"]),
+    default=None,
+    help=(
+        "#1956: state EXPLICITLY when --verdict is not the reviewer's own "
+        "fresh self-report. 'recovered' = the reviewer reached this verdict "
+        "and said so in prose, but never emitted the machine-readable "
+        "REVIEW_VERDICT header — you rescued it from the transcript. "
+        "'overridden' = a human is recording a DIFFERENT verdict than what "
+        "the reviewer actually produced (or no reviewer verdict exists at "
+        "all). Omit this for the normal case: an agent self-reporting its "
+        "own session's verdict before exiting — that is recorded as "
+        "'agent' automatically. Requires --verdict-reason."
+    ),
+)
+
+
+@click.option(
+    "--verdict-reason",
+    default=None,
+    help=(
+        "Required with --verdict-source: a short justification for the "
+        "recovery/override, so the provenance is auditable rather than "
+        "reading identically to an agent-produced verdict (#1956)."
+    ),
+)
+
+
 @_CONFIG_OPTION
 def report_result(
     assignment_id_opt: str | None,
@@ -717,6 +746,8 @@ def report_result(
     body_inline: str | None,
     audit_json_file: str | None,
     force: bool,
+    verdict_source: str | None,
+    verdict_reason: str | None,
     config_path: Path,
 ) -> None:
     """``coord report-result --assignment <id> --status <s> [--verdict <v>] --summary <text>``
@@ -927,6 +958,26 @@ def report_result(
         )
         sys.exit(2)
 
+    # #1956: fast client-side feedback for the same invariant
+    # issue_store._validate_result enforces server-side — a relayed verdict
+    # with no stated reason is indistinguishable from an agent's own, so
+    # refuse it here before any network/board resolution happens.
+    if verdict_source is not None and verdict is None:
+        click.echo(
+            "error: --verdict-source only makes sense alongside --verdict "
+            "(it describes the provenance of the verdict being recorded).",
+            err=True,
+        )
+        sys.exit(2)
+    if verdict_source is not None and not (verdict_reason and verdict_reason.strip()):
+        click.echo(
+            f"error: --verdict-source {verdict_source!r} requires "
+            "--verdict-reason — a relayed verdict must carry a reason so "
+            "it's auditable, not silently read as agent-produced (#1956).",
+            err=True,
+        )
+        sys.exit(2)
+
     # #949: push the worktree's commits BEFORE recording 'done' so completed
     # interactive work is never stranded.  report-result is the "done" path for
     # interactive fix/merge/work sessions; when a session declares done here
@@ -974,6 +1025,8 @@ def report_result(
         audit_goals=audit_goals,
         audit_bottom_line=audit_bottom_line,
         allow_overwrite_findings=force,
+        verdict_source=verdict_source,
+        verdict_source_reason=verdict_reason,
     )
     try:
         outcome = issue_store.post_result(record_obj)

@@ -36,6 +36,7 @@ issue, so the pipeline sees an interactive completion identically to a
 from __future__ import annotations
 
 import json
+import logging
 import time
 from dataclasses import asdict, dataclass
 from typing import Literal
@@ -65,9 +66,14 @@ __all__ = [
     "STATUS_ALREADY_IMPLEMENTED",
     "VERDICT_APPROVE",
     "VERDICT_REQUEST_CHANGES",
+    "VERDICT_SOURCE_AGENT",
+    "VERDICT_SOURCE_RECOVERED",
+    "VERDICT_SOURCE_OVERRIDDEN",
     "get_audit_runs_for_epic",
     "diff_audit_goals",
 ]
+
+log = logging.getLogger(__name__)
 
 
 # ── Public enum-style constants ─────────────────────────────────────────────
@@ -81,6 +87,14 @@ VERDICT_REQUEST_CHANGES = "request-changes"
 
 _VALID_STATUSES = (STATUS_DONE, STATUS_BLOCKED, STATUS_ALREADY_IMPLEMENTED)
 _VALID_VERDICTS = (VERDICT_APPROVE, VERDICT_REQUEST_CHANGES)
+
+# #1956: verdict provenance — see coord.models.Assignment.verdict_source.
+VERDICT_SOURCE_AGENT = "agent"
+VERDICT_SOURCE_RECOVERED = "recovered"
+VERDICT_SOURCE_OVERRIDDEN = "overridden"
+_VALID_VERDICT_SOURCES = (
+    VERDICT_SOURCE_AGENT, VERDICT_SOURCE_RECOVERED, VERDICT_SOURCE_OVERRIDDEN,
+)
 
 ResultStatus = Literal["done", "blocked", "already-implemented"]
 ResultVerdict = Literal["approve", "request-changes"]
@@ -163,6 +177,17 @@ class ResultRecord:
     # (the #650 incident: a 5166-char review clobbered to a 58-char
     # placeholder by finishing the exit process twice).
     allow_overwrite_findings: bool = False
+    # #1956: verdict provenance — see coord.models.Assignment.verdict_source
+    # for the three values and why conflating them was the second half of
+    # #1956.  None (the default — every existing caller, including the
+    # ordinary agent self-report path) is recorded as "agent"; an operator
+    # relaying a verdict that was NOT freshly produced by this session's own
+    # reasoning (a transcript recovery, or a deliberate override of what the
+    # session actually reported) must say so explicitly via
+    # ``--verdict-source`` plus a required ``--verdict-reason`` — see
+    # ``_validate_result``.
+    verdict_source: str | None = None
+    verdict_source_reason: str | None = None
 
 
 # ── Resolved terminal state (what the seam writes back) ─────────────────────
@@ -372,6 +397,47 @@ def _validate_result(record: ResultRecord) -> None:
             "a review with no body, which would strand the fix worker with "
             "nothing to fix (#607). Recover the findings from the session "
             "transcript or supply them with --body-file."
+        )
+
+    # ── #1956: verdict provenance ─────────────────────────────────────────────
+    # A relayed verdict recorded with no marker of WHO decided it (an
+    # operator "recovering" it from a transcript vs. deliberately
+    # "overriding" what the reviewer actually said) is indistinguishable
+    # from an agent-produced one at every downstream reader — the merge
+    # gate, `coord gates`, the TUI, the audit trail. Refusing an unstated
+    # non-"agent" source at this single write seam (mirroring #617's
+    # empty-findings refusal above) makes that ambiguity unrepresentable
+    # instead of relying on every caller to remember to pass a reason.
+    if record.verdict_source is not None and record.verdict_source not in _VALID_VERDICT_SOURCES:
+        raise ValueError(
+            f"invalid verdict_source {record.verdict_source!r} "
+            f"(expected one of {_VALID_VERDICT_SOURCES!r} or None)"
+        )
+    # Mirror the `coord report-result` CLI's fast client-side guard here too
+    # (coord/commands/review.py) — this is the single write seam ALL callers
+    # funnel through (the CLI, the operator-prompt verdict relay, any future
+    # direct `post_result` caller), and a direct non-CLI caller passing
+    # `verdict_source` without `verdict` would otherwise sail through this
+    # validator, reach `_post_result_local`, and have its stated provenance
+    # silently discarded — `_persist_verdict_source` is only invoked inside
+    # the `if record.verdict is not None:` block, so nothing would ever be
+    # written. Refusing it here, at the seam, makes that gap unrepresentable
+    # regardless of which caller triggers it.
+    if record.verdict_source is not None and record.verdict is None:
+        raise ValueError(
+            "verdict_source only makes sense alongside verdict — it describes "
+            "the provenance of the verdict being recorded, and there is no "
+            "verdict here for it to describe (#1956)."
+        )
+    if record.verdict_source in ("recovered", "overridden") and not (
+        record.verdict_source_reason and record.verdict_source_reason.strip()
+    ):
+        raise ValueError(
+            f"verdict_source={record.verdict_source!r} requires a non-empty "
+            "verdict_source_reason (--verdict-reason on the CLI) — a relayed "
+            "verdict must carry a reason so it is auditable, not silently "
+            "indistinguishable from one the reviewer agent itself produced "
+            "(#1956)."
         )
 
     # ── #886 Phase 2: structured audit verdict shape ─────────────────────────
@@ -739,6 +805,113 @@ def _persist_review_verdict(record: ResultRecord) -> bool:
         f"assignment {record.assignment_id!r} after {attempts} attempts "
         f"(#990): {last_exc}"
     ) from last_exc
+
+
+def _read_verdict_source_local(assignment_id: str) -> tuple[str | None, str | None]:
+    """Read back the persisted ``(verdict_source, verdict_source_reason)``
+    columns, or ``(None, None)`` if the row is absent. Used by
+    :func:`_persist_verdict_source` to verify a write actually landed
+    rather than trusting a bare ``commit()`` call — mirrors
+    :func:`_read_review_verdict_local` above."""
+    from coord.state import get_connection  # noqa: PLC0415
+
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT verdict_source, verdict_source_reason FROM assignments "
+        "WHERE assignment_id = ?",
+        (assignment_id,),
+    ).fetchone()
+    if row is None:
+        return None, None
+    if hasattr(row, "keys"):
+        return row["verdict_source"], row["verdict_source_reason"]
+    return row[0], row[1]
+
+
+def _persist_verdict_source(record: ResultRecord) -> None:
+    """Best-effort: stamp verdict provenance (#1956) alongside `review_verdict`.
+
+    Deliberately separate from :func:`_persist_review_verdict`'s retry/RAISE
+    contract — provenance is metadata ABOUT a verdict write that already
+    succeeded (this is only ever called after that function returns), so a
+    failure here must not turn a landed verdict into a reported CLI error.
+    ``record.verdict_source`` defaults to ``"agent"`` when unset
+    (``_validate_result`` already confirmed it's a valid value, or None).
+
+    Still best-effort — this function never raises — but it is NOT a bare
+    ``except Exception: pass`` anymore. That used to be exactly the
+    anti-pattern :func:`_persist_review_verdict`'s own docstring (#990)
+    documents fixing for the sibling ``review_verdict`` column: a transient
+    SQLite lock (the daemon DB is concurrently written by other ticks/
+    agents) could make this write silently no-op right after
+    ``_persist_review_verdict`` durably landed the verdict itself, leaving
+    ``verdict_source IS NULL`` — which every reader (``format_gate_report``,
+    ``coord.models.Assignment.verdict_source``'s own docstring) treats as
+    ``"agent"``, indistinguishable from an earned verdict. That reproduces,
+    for the provenance feature itself, the exact "silent loss" failure
+    #1956 exists to close.
+
+    So: retries a few times with backoff to absorb transient contention,
+    reads the columns back and compares them to what we intended to write
+    (catches both a raised exception AND a write that silently no-ops), and
+    — if it still can't confirm the write landed — ``log.warning``s loudly
+    with a recovery command instead of swallowing the failure silently. The
+    CLI call itself still exits 0 (the verdict itself IS durably recorded;
+    only its provenance annotation is at risk), but the failure is now
+    discoverable instead of invisible.
+
+    Always called from :func:`_post_result_local`, which — like every other
+    caller in this module — runs strictly LOCALLY (either directly, or
+    inside the daemon's own ``/result`` handler after it reconstructs the
+    ``ResultRecord``): no separate daemon route is needed for this column,
+    unlike ``update_assignment_review_findings``'s ``POST
+    /review-findings``, because the routing already happened one level up
+    at ``post_result``.
+    """
+    from coord.state import get_connection  # noqa: PLC0415
+
+    if not record.assignment_id:
+        return
+    source = record.verdict_source or VERDICT_SOURCE_AGENT
+    reason = record.verdict_source_reason
+
+    attempts = 3
+    delay = 0.15
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            conn = get_connection()
+            conn.execute(
+                "UPDATE assignments SET verdict_source=?, verdict_source_reason=? "
+                "WHERE assignment_id=?",
+                (source, reason, record.assignment_id),
+            )
+            conn.commit()
+            actual_source, actual_reason = _read_verdict_source_local(record.assignment_id)
+            if actual_source == source and actual_reason == reason:
+                return
+            last_exc = RuntimeError(
+                f"verdict_source readback mismatch for assignment "
+                f"{record.assignment_id!r}: wrote {(source, reason)!r}, "
+                f"read back {(actual_source, actual_reason)!r} "
+                f"(attempt {attempt}/{attempts})"
+            )
+        except Exception as exc:  # noqa: BLE001 — retried below; logged after
+            last_exc = exc
+        if attempt < attempts:
+            time.sleep(delay)
+            delay *= 2
+    log.warning(
+        "failed to durably persist verdict_source=%r (reason=%r) for "
+        "assignment %r after %d attempts (#1956): %s — review_verdict "
+        "IS landed, but its provenance is not: the row will read as "
+        "verdict_source=agent (indistinguishable from earned) until this "
+        "is corrected manually, e.g.:\n"
+        "  coord report-result --assignment %s --status done "
+        "--verdict <same-verdict> --verdict-source %s --verdict-reason %r",
+        source, reason, record.assignment_id, attempts, last_exc,
+        record.assignment_id, source, reason,
+    )
 
 
 # ── Milestone Outcome Audit — versioned runs + diff (#886 Phase 2) ─────────
@@ -1174,6 +1347,17 @@ def _post_result_local(record: ResultRecord) -> StoreOutcome:
     findings_written = True
     if record.verdict is not None:
         findings_written = _persist_review_verdict(record)
+        # #1956: stamp provenance alongside the verdict itself. Best-effort
+        # by design (a provenance-column write failure must not turn an
+        # already-durably-persisted verdict into a reported CLI failure —
+        # `_persist_review_verdict` above is the one write this function
+        # raises loudly for) but still ALWAYS attempted, defaulting to
+        # "agent" when the caller didn't say otherwise — the common case
+        # (an agent self-reporting its own session) is the overwhelming
+        # majority of `report-result --verdict` calls and must read as
+        # exactly that, not as an unlabeled NULL indistinguishable from a
+        # pre-#1956 row.
+        _persist_verdict_source(record)
     # #603: a request-changes verdict is durable context for EVERY future agent
     # on the issue — record a short note in the per-issue digest (local writer;
     # daemon-side on a thin client, so use the _local variant).
