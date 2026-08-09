@@ -26032,8 +26032,8 @@
         let body = "a".repeat(120);
         let issue = Some((1u64, "Title", body.as_str(), [].as_slice()));
 
-        let unwrapped = issue_body_list(issue, 0, "test-unwrapped", 0, false);
-        let wrapped = issue_body_list(issue, 0, "test-wrapped", 40, false);
+        let unwrapped = issue_body_list(issue, 0, "test-unwrapped", 0, false, None);
+        let wrapped = issue_body_list(issue, 0, "test-wrapped", 40, false, None);
 
         // header + blank separator + body lines.
         // The wrapped list must have more rows than the unwrapped one.
@@ -26056,8 +26056,8 @@
         let body = format!("```\n{}\n```", long_code);
         let issue = Some((2u64, "Code", body.as_str(), [].as_slice()));
 
-        let unwrapped = issue_body_list(issue, 0, "test-code-unwrapped", 0, false);
-        let wrapped = issue_body_list(issue, 0, "test-code-wrapped", 40, false);
+        let unwrapped = issue_body_list(issue, 0, "test-code-unwrapped", 0, false, None);
+        let wrapped = issue_body_list(issue, 0, "test-code-wrapped", 40, false, None);
 
         // The code block interior must not be word-wrapped, so both paths
         // produce the same number of rows.
@@ -26077,8 +26077,8 @@
         let body = "Short line.";
         let issue = Some((3u64, "Short", body, [].as_slice()));
 
-        let a = issue_body_list(issue, 0, "test-a", 0, false);
-        let b = issue_body_list(issue, 0, "test-b", 0, false);
+        let a = issue_body_list(issue, 0, "test-a", 0, false, None);
+        let b = issue_body_list(issue, 0, "test-b", 0, false, None);
 
         assert_eq!(
             a.items.len(),
@@ -43799,10 +43799,10 @@ Milestone tracking issue.
             ("705", "REASON-HELD"),
         ] {
             assert!(
-                screen.contains(&format!("myrepo#{issue}")),
-                "#1866: myrepo#{issue} has not finished, so a LIVE view must \
-                 not hide it — blocked/failed entries are precisely the ones \
-                 needing a human:\n{screen}"
+                screen.contains(&format!("M#{issue}")),
+                "#1866/#2042: myrepo#{issue} has not finished, so a LIVE view \
+                 must not hide it (rendered as the M# alias) — blocked/failed \
+                 entries are precisely the ones needing a human:\n{screen}"
             );
             assert!(
                 screen.contains(reason),
@@ -43811,7 +43811,7 @@ Milestone tracking issue.
             );
         }
         assert!(
-            !screen.contains("myrepo#700"),
+            !screen.contains("M#700"),
             "#1866: `done` is the ONE state this panel excludes — it is \
              history, not pending work:\n{screen}"
         );
@@ -44024,7 +44024,7 @@ Milestone tracking issue.
         // re-validates (cycles, clamping, dense renumbering) and the HTTP
         // path would bypass all of it.
         let mut app = queue_app(queue_fixture_json());
-        // Row 0 of the panel is myrepo#701 (position 1) — #700 is `done` and
+        // Row 0 of the panel is M#701 (position 1) — #700 is `done` and
         // filtered out, which is exactly why the panel index and the queue
         // position are not the same number.
         assert_eq!(app.queue_selected_row().map(|r| r.issue_number), Some(701));
@@ -44148,7 +44148,7 @@ Milestone tracking issue.
     #[test]
     fn queue_row_menu_disables_end_of_queue_moves_with_a_reason() {
         let mut app = queue_app(queue_fixture_json());
-        // Last pending row is myrepo#705 at position 5 — the tail.
+        // Last pending row is M#705 at position 5 — the tail.
         app.queue_sel = app.queue_rows().len() - 1;
         let target = app.queue_context_target().expect("tail row must exist");
         let ContextMenuTarget::DriveQueueRow {
@@ -44241,7 +44241,7 @@ Milestone tracking issue.
         // Belt and braces: sitting on the panel spawns no `coord` command.
         let driver = queue_driver(queue_fixture_json(), 160, 30);
         assert!(
-            driver.screen().contains("myrepo#701"),
+            driver.screen().contains("M#701"),
             "the grid must actually have rendered before this asserts \
              anything:\n{}",
             driver.screen()
@@ -44269,7 +44269,7 @@ Milestone tracking issue.
     #[test]
     fn tuidriver_queue_right_click_opens_the_shared_row_menu() {
         let mut driver = queue_driver(queue_fixture_json(), 200, 30);
-        let (x, y) = driver.find("myrepo#703").unwrap_or_else(|| {
+        let (x, y) = driver.find("M#703").unwrap_or_else(|| {
             panic!(
                 "#1866: the blocked row must render before it can be \
                  right-clicked:\n{}",
@@ -44298,10 +44298,10 @@ Milestone tracking issue.
         // Not the row that happened to be selected before the click — on a
         // destructive verb (Remove) that is the worst kind of surprise.
         let mut driver = queue_driver(queue_fixture_json(), 200, 30);
-        // Row 0 (`myrepo#701`, running) is selected on first paint; #705 is
+        // Row 0 (`M#701`, running) is selected on first paint; #705 is
         // the tail, whose deploy gate has fired.
         let (x, y) = driver
-            .find("myrepo#705")
+            .find("M#705")
             .unwrap_or_else(|| panic!("tail row must render:\n{}", driver.screen()));
         driver.dispatch(UiEvent::MouseDown {
             widget: None,
@@ -44332,7 +44332,7 @@ Milestone tracking issue.
     // (`context_menu_items_for_drive_queue_row`) rather than the Board's.
 
     /// A 3-row drive queue (positions 0/1/2, all `waiting`) whose MIDDLE row
-    /// is `myrepo#7` — neither first nor last, so both "Move up" and "Move
+    /// is `M#7` (`myrepo`'s alias) — neither first nor last, so both "Move up" and "Move
     /// down" are enabled and the keyboard-nav step count below the menu
     /// stays fixed regardless of end-of-queue disabling.
     fn queue_fixture_json_middle_row_7() -> &'static str {
@@ -44346,7 +44346,7 @@ Milestone tracking issue.
     #[test]
     fn tuidriver_queue_right_click_shows_view_in_pipeline_and_view_on_board() {
         let mut driver = queue_driver(queue_fixture_json(), 200, 30);
-        let (x, y) = driver.find("myrepo#703").unwrap_or_else(|| {
+        let (x, y) = driver.find("M#703").unwrap_or_else(|| {
             panic!(
                 "#2016: the blocked row must render before it can be \
                  right-clicked:\n{}",
@@ -44421,8 +44421,8 @@ Milestone tracking issue.
 
         let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
         let (x, y) = driver
-            .find("myrepo#7")
-            .unwrap_or_else(|| panic!("queue row myrepo#7 must render:\n{}", driver.screen()));
+            .find("M#7")
+            .unwrap_or_else(|| panic!("queue row M#7 must render:\n{}", driver.screen()));
         driver.dispatch(UiEvent::MouseDown {
             widget: None,
             button: MouseButton::Right,
@@ -44467,8 +44467,8 @@ Milestone tracking issue.
     fn tuidriver_queue_view_in_pipeline_disabled_with_reason_for_untracked_issue() {
         let mut driver = queue_driver(queue_fixture_json_middle_row_7(), 200, 30);
         let (x, y) = driver
-            .find("myrepo#7")
-            .unwrap_or_else(|| panic!("queue row myrepo#7 must render:\n{}", driver.screen()));
+            .find("M#7")
+            .unwrap_or_else(|| panic!("queue row M#7 must render:\n{}", driver.screen()));
         driver.dispatch(UiEvent::MouseDown {
             widget: None,
             button: MouseButton::Right,
@@ -44536,8 +44536,8 @@ Milestone tracking issue.
 
         let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
         let (x, y) = driver
-            .find("myrepo#7")
-            .unwrap_or_else(|| panic!("queue row myrepo#7 must render:\n{}", driver.screen()));
+            .find("M#7")
+            .unwrap_or_else(|| panic!("queue row M#7 must render:\n{}", driver.screen()));
         driver.dispatch(UiEvent::MouseDown {
             widget: None,
             button: MouseButton::Right,
@@ -44606,7 +44606,7 @@ Milestone tracking issue.
 
         let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
         let before = driver.screen();
-        let before_order: Vec<usize> = ["myrepo#6", "myrepo#7", "myrepo#8"]
+        let before_order: Vec<usize> = ["M#6", "M#7", "M#8"]
             .iter()
             .map(|needle| {
                 before
@@ -44620,8 +44620,8 @@ Milestone tracking issue.
         );
 
         let (x, y) = driver
-            .find("myrepo#7")
-            .unwrap_or_else(|| panic!("queue row myrepo#7 must render:\n{}", driver.screen()));
+            .find("M#7")
+            .unwrap_or_else(|| panic!("queue row M#7 must render:\n{}", driver.screen()));
         driver.dispatch(UiEvent::MouseDown {
             widget: None,
             button: MouseButton::Right,
@@ -44640,7 +44640,7 @@ Milestone tracking issue.
         // Back to the Queue panel.
         click_activity_icon(&mut driver, QUEUE_ICON);
         let after = driver.screen();
-        let after_order: Vec<usize> = ["myrepo#6", "myrepo#7", "myrepo#8"]
+        let after_order: Vec<usize> = ["M#6", "M#7", "M#8"]
             .iter()
             .map(|needle| {
                 after
@@ -44814,7 +44814,7 @@ Milestone tracking issue.
         let screen = driver.screen();
         assert!(
             screen.contains("BODY-701-UNIQUE"),
-            "#1867: row 0 (myrepo#701) is selected by default — its body \
+            "#1867: row 0 (M#701) is selected by default — its body \
              must render in the bottom pane:\n{screen}"
         );
     }
@@ -44895,7 +44895,7 @@ Milestone tracking issue.
 
     #[test]
     fn queue_issue_body_no_github_slug_shows_a_placeholder_and_spawns_no_fetch() {
-        // Row 0 is myrepo#701; `data.pipeline_repos` carries no slug for
+        // Row 0 is M#701; `data.pipeline_repos` carries no slug for
         // `myrepo`, so the body list must fall back to the "no GitHub slug"
         // placeholder rather than attempting (and failing) a `gh` call.
         let app = queue_app(queue_fixture_json());
@@ -44914,7 +44914,7 @@ Milestone tracking issue.
 
     #[test]
     fn queue_issue_body_in_flight_fetch_is_not_respawned_every_frame() {
-        // Row 0 is myrepo#701. Pre-seed an in-flight fetch with a channel
+        // Row 0 is M#701. Pre-seed an in-flight fetch with a channel
         // that never resolves — standing in for a real `spawn_issue_fetch`
         // thread that hasn't finished yet, without this test actually
         // shelling out to `gh` (this crate has no injectable command runner
@@ -45120,7 +45120,7 @@ Milestone tracking issue.
         }
         for issue in ["701", "702", "703", "704", "705"] {
             assert!(
-                screen.contains(&format!("myrepo#{issue}")),
+                screen.contains(&format!("M#{issue}")),
                 "#1867: every unfinished row must still be reachable, not \
                  crowded out by the detail pane:\n{screen}"
             );
@@ -45129,10 +45129,11 @@ Milestone tracking issue.
 
     // ── #2017: draggable grid/detail splitter + working scrollbars ────────
 
-    /// `n` plain `waiting` entries, `myrepo#800..myrepo#{800+n-1}` — a long,
-    /// state-agnostic queue for splitter/scrollbar geometry tests (as
-    /// opposed to `queue_fixture_json`'s small, state-varied fixture, which
-    /// is for the state-rendering tests above).
+    /// `n` plain `waiting` entries for `myrepo` — rendered `M#800..M#{800+n-1}`
+    /// (`M` is `myrepo`'s #2042 alias) — a long, state-agnostic queue for
+    /// splitter/scrollbar geometry tests (as opposed to
+    /// `queue_fixture_json`'s small, state-varied fixture, which is for the
+    /// state-rendering tests above).
     fn queue_fixture_json_many_rows(n: usize) -> String {
         let entries: Vec<String> = (0..n)
             .map(|i| {
@@ -45193,10 +45194,11 @@ Milestone tracking issue.
         // visible after than before").
         let n = 20;
         let mut driver = queue_driver(&queue_fixture_json_many_rows(n), 160, 26);
-        // Every visible grid row's `#`/Issue cell starts "myrepo#8" (all
-        // 20 fixture issue numbers, 800-819, start with digit 8) — a
-        // count of this substring is a count of visible grid rows.
-        let before = count_matches(&driver.screen(), "myrepo#8");
+        // Every visible grid row's `#`/Issue cell starts "M#8" (all
+        // 20 fixture issue numbers, 800-819, start with digit 8, and
+        // `myrepo` aliases to `M` per #2042) — a count of this substring
+        // is a count of visible grid rows.
+        let before = count_matches(&driver.screen(), "M#8");
 
         let (sx, sy) = find_queue_separator(&driver);
         driver.mouse_down(sx, sy);
@@ -45204,7 +45206,7 @@ Milestone tracking issue.
         driver.mouse_up(sx, sy + 6.0);
         driver.render();
 
-        let after = count_matches(&driver.screen(), "myrepo#8");
+        let after = count_matches(&driver.screen(), "M#8");
         assert!(
             after > before,
             "#2017: dragging the separator toward the bottom must grow \
@@ -45220,7 +45222,7 @@ Milestone tracking issue.
         // to the grid.
         let n = 20;
         let mut driver = queue_driver(&queue_fixture_json_many_rows(n), 160, 26);
-        let before = count_matches(&driver.screen(), "myrepo#8");
+        let before = count_matches(&driver.screen(), "M#8");
 
         let (sx, sy) = find_queue_separator(&driver);
         driver.mouse_down(sx, sy);
@@ -45228,7 +45230,7 @@ Milestone tracking issue.
         driver.mouse_up(sx, sy - 4.0);
         driver.render();
 
-        let after = count_matches(&driver.screen(), "myrepo#8");
+        let after = count_matches(&driver.screen(), "M#8");
         assert!(
             after < before,
             "#2017: dragging the separator toward the top must shrink the \
@@ -45262,7 +45264,7 @@ Milestone tracking issue.
         driver.render();
         let top_screen = driver.screen();
         assert!(
-            top_screen.contains("Issue") && top_screen.contains("myrepo#800"),
+            top_screen.contains("Issue") && top_screen.contains("M#800"),
             "#2017: dragging past the top extreme must clamp the grid at \
              its floor, not collapse it — the header and at least one row \
              must still render:\n{top_screen}"
@@ -45281,7 +45283,7 @@ Milestone tracking issue.
         driver.render();
         let bottom_screen = driver.screen();
         assert!(
-            bottom_screen.contains("Issue") && bottom_screen.contains("myrepo#800"),
+            bottom_screen.contains("Issue") && bottom_screen.contains("M#800"),
             "#2017: dragging past the bottom extreme must still render the \
              grid at its clamped floor:\n{bottom_screen}"
         );
@@ -45355,7 +45357,7 @@ Milestone tracking issue.
             .unwrap_or_else(|| panic!("grid scrollbar must render for a {n}-row queue:\n{screen}"));
 
         assert!(
-            driver.screen().contains("myrepo#800"),
+            driver.screen().contains("M#800"),
             "sanity: the first row must be visible before any scroll:\n{}",
             driver.screen()
         );
@@ -45370,7 +45372,7 @@ Milestone tracking issue.
         driver.mouse_up(sb_x, track_y1 + 0.49);
         driver.render();
 
-        let last_issue = format!("myrepo#{}", 800 + n - 1);
+        let last_issue = format!("M#{}", 800 + n - 1);
         assert!(
             driver.screen().contains(&last_issue),
             "#2017: dragging the grid scrollbar thumb to the bottom of the \
@@ -45378,7 +45380,7 @@ Milestone tracking issue.
             driver.screen()
         );
         assert!(
-            !driver.screen().contains("myrepo#800"),
+            !driver.screen().contains("M#800"),
             "#2017: …and scroll the first row off screen:\n{}",
             driver.screen()
         );
@@ -45501,16 +45503,16 @@ Milestone tracking issue.
         driver.mouse_up(sx2, sy2 - 10.0);
         driver.render();
 
-        let (gx, gy) = driver.find("myrepo#800").unwrap_or_else(|| {
+        let (gx, gy) = driver.find("M#800").unwrap_or_else(|| {
             panic!(
-                "myrepo#800 must still render post-drag:\n{}",
+                "M#800 must still render post-drag:\n{}",
                 driver.screen()
             )
         });
         for _ in 0..30 {
             reports_wheel(&mut driver, (gx, gy), -1.0);
         }
-        let last_issue = format!("myrepo#{}", 800 + n - 1);
+        let last_issue = format!("M#{}", 800 + n - 1);
         assert!(
             driver.screen().contains(&last_issue),
             "#2017/#1910: wheel-down over the (now much shorter) grid must \
@@ -45540,7 +45542,7 @@ Milestone tracking issue.
             queue_driver_with_issues(data, &queue_fixture_json_many_rows(n), 160, 26);
         assert!(
             driver.screen().contains("BODY-800-UNIQUE"),
-            "sanity: row 0 (myrepo#800) is selected by default:\n{}",
+            "sanity: row 0 (M#800) is selected by default:\n{}",
             driver.screen()
         );
 
@@ -45561,5 +45563,199 @@ Milestone tracking issue.
             "#2017: a scrollbar-track click must not change the row \
              selection:\n{}",
             driver.screen()
+        );
+    }
+
+    // ── #2042: Queue grid Issue/After cells render a short repo alias ─────
+
+    /// The alias helper itself: split on `-`, first letter of each word,
+    /// uppercase, concatenate — checked against the fleet the issue names,
+    /// plus a repeated/trailing `-` (must not panic; the empty words those
+    /// produce must simply drop out rather than contributing a stray letter).
+    #[test]
+    fn repo_alias_matches_the_fleet_and_survives_ugly_input() {
+        assert_eq!(repo_alias("claude-coordinator"), "CC");
+        assert_eq!(repo_alias("coord-portal"), "CP");
+        assert_eq!(repo_alias("vimcode"), "V");
+        assert_eq!(repo_alias("quadraui"), "Q");
+        assert_eq!(
+            repo_alias("coord--proxy-"),
+            "CP",
+            "a repeated/trailing `-` produces empty words that must be \
+             skipped, not panic or contribute a stray letter"
+        );
+        assert_eq!(repo_alias(""), "");
+    }
+
+    /// #2042 acceptance 1: a queued `claude-coordinator` row renders the
+    /// `CC#<n>` alias in the Issue cell, and the full `claude-coordinator#<n>`
+    /// key must not appear anywhere in the grid. (The detail pane spells the
+    /// repo out in full too, but with a SPACE — `claude-coordinator #1835`,
+    /// never the grid's unspaced key — so it can never satisfy this
+    /// `contains` check by accident.)
+    #[test]
+    fn tuidriver_queue_issue_cell_renders_the_repo_alias_not_the_full_name() {
+        let driver = queue_driver(
+            r#"[{"repo_name": "claude-coordinator", "issue_number": 1835,
+                 "position": 0, "state": "waiting"}]"#,
+            160,
+            30,
+        );
+        let screen = driver.screen();
+        assert!(
+            screen.contains("CC#1835"),
+            "#2042: the Issue cell must render the `CC` alias:\n{screen}"
+        );
+        assert!(
+            !screen.contains("claude-coordinator#1835"),
+            "#2042: the full repo#issue key must not appear on screen:\n{screen}"
+        );
+    }
+
+    /// #2042 acceptance 2: an `After` cell with two dependencies renders
+    /// BOTH aliased, comma-separated — the issue's own worked example.
+    #[test]
+    fn tuidriver_queue_after_cell_renders_every_dependency_aliased() {
+        let driver = queue_driver(
+            r#"[
+                {"repo_name": "claude-coordinator", "issue_number": 1834,
+                 "position": 0, "state": "waiting"},
+                {"repo_name": "claude-coordinator", "issue_number": 1241,
+                 "position": 1, "state": "waiting"},
+                {"repo_name": "claude-coordinator", "issue_number": 1835,
+                 "position": 2, "state": "waiting",
+                 "after_json": ["claude-coordinator#1834", "claude-coordinator#1241"]}
+            ]"#,
+            220,
+            30,
+        );
+        let screen = driver.screen();
+        assert!(
+            screen.contains("CC#1834, CC#1241"),
+            "#2042: the After cell must render every pre-req aliased and \
+             comma-separated:\n{screen}"
+        );
+    }
+
+    /// #2042: the alias is presentation only. `queue_context_target` — what
+    /// every row action (Move/Remove/Resume/…) is dispatched against — must
+    /// still carry the FULL repo name, never the `CC` cell text.
+    #[test]
+    fn queue_context_target_carries_the_full_repo_name_despite_the_alias_cell() {
+        let mut app = queue_app(
+            r#"[{"repo_name": "claude-coordinator", "issue_number": 1835,
+                 "position": 0, "state": "waiting"}]"#,
+        );
+        app.queue_set_sel(0);
+        match app.queue_context_target().expect("a target") {
+            ContextMenuTarget::DriveQueueRow {
+                repo_name,
+                issue_number,
+                ..
+            } => {
+                assert_eq!(repo_name, "claude-coordinator");
+                assert_eq!(issue_number, 1835);
+            }
+            other => panic!("wrong target: {other:?}"),
+        }
+    }
+
+    /// #2042 acceptance 4, end to end: right-click the row rendered as
+    /// `CC#1835` and remove it via the row menu. `dispatch_drive_queue_remove`
+    /// matches on `e.repo_name == repo` — if the click path leaked the ALIAS
+    /// through instead of the real repo name, that match would silently miss
+    /// and the row would still be on screen after "Remove from queue".
+    #[test]
+    fn tuidriver_queue_right_click_remove_targets_the_real_repo_not_the_alias() {
+        let mut driver = queue_driver(
+            r#"[
+                {"repo_name": "claude-coordinator", "issue_number": 1834,
+                 "position": 0, "state": "waiting"},
+                {"repo_name": "claude-coordinator", "issue_number": 1835,
+                 "position": 1, "state": "waiting"}
+            ]"#,
+            200,
+            30,
+        );
+        let (x, y) = driver
+            .find("CC#1835")
+            .unwrap_or_else(|| panic!("queue row CC#1835 must render:\n{}", driver.screen()));
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: MouseButton::Right,
+            position: Point::new(x, y),
+            modifiers: Modifiers::default(),
+        });
+        assert!(
+            driver.screen().contains("Remove from queue"),
+            "sanity: the row menu must be open:\n{}",
+            driver.screen()
+        );
+        // Row 1 of 2 (the tail): "Move down" is disabled ("already last")
+        // and "View in Pipeline" is disabled too (no `pipeline_repos`
+        // configured) — both skipped by keyboard nav (same reasoning as
+        // `tuidriver_queue_view_on_board_switches_to_board_with_issue_selected`
+        // above). Initial selection lands on "Move up"; two Downs land on
+        // "Remove from queue" (skipping to "View on Board" then it).
+        driver.press_named(quadraui::NamedKey::Down);
+        driver.press_named(quadraui::NamedKey::Down);
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("CC#1835"),
+            "#2042: Remove must have matched the row's REAL repo name \
+             (`claude-coordinator`), not the `CC` alias — if it had used \
+             the alias, `e.repo_name == repo` would never match and this \
+             row would still be on screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("CC#1834"),
+            "sanity: the OTHER row must be untouched:\n{screen}"
+        );
+    }
+
+    /// #2042 acceptance 5: sorting by the Issue column — now the ALIASED
+    /// string, per `queue_compare_rows`'s existing "sort the rendered cell"
+    /// rule, which this issue deliberately leaves untouched — must still
+    /// group same-repo rows together. For today's fleet the alias order
+    /// matches the full-name order (`CC` < `CP`, same as `claude-coordinator`
+    /// < `coord-portal`), so grouping is unchanged in practice; this guards
+    /// that rather than the separate (known, out-of-scope) lexicographic
+    /// issue-number wart the issue also calls out.
+    #[test]
+    fn queue_issue_sort_still_groups_rows_by_repo() {
+        let mut app = queue_app(
+            r#"[
+                {"repo_name": "coord-portal", "issue_number": 5,
+                 "position": 0, "state": "waiting"},
+                {"repo_name": "claude-coordinator", "issue_number": 9,
+                 "position": 1, "state": "waiting"},
+                {"repo_name": "coord-portal", "issue_number": 3,
+                 "position": 2, "state": "waiting"},
+                {"repo_name": "claude-coordinator", "issue_number": 1,
+                 "position": 3, "state": "waiting"}
+            ]"#,
+        );
+        // Column 1 is "Issue" (`CoordApp::QUEUE_COLUMNS[1]`).
+        assert!(
+            app.queue_sort_by_column(1),
+            "sorting the Issue column must apply"
+        );
+        let repos: Vec<String> = app
+            .queue_rows()
+            .iter()
+            .map(|r| r.repo_name.clone())
+            .collect();
+        assert_eq!(
+            repos,
+            vec![
+                "claude-coordinator",
+                "claude-coordinator",
+                "coord-portal",
+                "coord-portal",
+            ],
+            "#2042: ascending Issue sort (`cc#1` < `cc#9` < `cp#3` < `cp#5`) \
+             must keep every repo's rows contiguous:\n{repos:?}"
         );
     }
