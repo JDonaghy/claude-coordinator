@@ -41,6 +41,17 @@ on:
           one value rather than each re-deriving it from `github.ref_name`.
         required: true
         type: string
+      ref:
+        description: >-
+          The git ref to build (normally `refs/tags/<tag>`). #2035: when
+          publish.yml is itself invoked via `workflow_call` from
+          auto-release.yml, the default checkout ref is the *caller's* branch
+          — main — so without this the binaries would be built from whatever
+          landed on main after the tag was cut, yet stamped with the tag's
+          version. Empty means "the default ref" (the dry-run dispatch).
+        required: false
+        default: ""
+        type: string
   workflow_dispatch:
     inputs:
       fake_tag:
@@ -134,6 +145,10 @@ jobs:
     continue-on-error: ${{ matrix.best_effort }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Empty (the dry-run dispatch) means the default ref. See the `ref`
+          # input's description.
+          ref: ${{ inputs.ref }}
 
       # Reproduce the sibling-directory layout tui/Cargo.toml's path
       # dependency expects (`../../quadraui/quadraui` relative to tui/Cargo.toml

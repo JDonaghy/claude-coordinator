@@ -4,12 +4,35 @@ name: Auto-release on merge to main
 # human action in a release".
 #
 # What this does is deliberately small: decide whether this merge ships
-# anything, pick the next `vX.Y.Z`, and push that tag. Everything after the
-# tag already exists and is unchanged — `publish.yml` (#1242, PKG-6) turns
-# one `v*` tag into one Release carrying the wheel, the bundled webapp and
-# the coord-tui binaries, and refuses to publish from a commit that never
-# landed on main (#1471). This workflow adds no new publishing path; it
-# removes the human who used to type `git tag`.
+# anything, pick the next `vX.Y.Z`, push that tag — and then *call*
+# `publish.yml` (#1242, PKG-6), which turns that tag into one Release
+# carrying the wheel, the bundled webapp and the coord-tui binaries, and
+# refuses to publish from a commit that never landed on main (#1471). This
+# workflow adds no new publishing path; it removes the human who used to type
+# `git tag`.
+#
+# #2035 — WHY IT CALLS PUBLISH INSTEAD OF JUST PUSHING A TAG.
+# It used to push the tag and stop, on the assumption that the tag push would
+# fire `publish.yml`'s `on: push: tags: ["v*"]`. It cannot. GitHub does not
+# trigger workflows from events created with the default `GITHUB_TOKEN` —
+# the standard recursion guard — so the first real firing (v0.5.2) put a tag
+# on the remote, produced no GitHub Release and nothing on PyPI, and reported
+# `success`. Re-pushing the byte-identical tag object from a workstation
+# under ordinary user credentials fired publish within seconds; nothing about
+# the tag had changed, only the identity of the pusher.
+#
+# Of the two fixes available — call the workflow directly, or push the tag
+# with a PAT/deploy key/App token — this takes the first. It removes the
+# token class from the problem entirely rather than swapping it for a secret
+# whose expiry becomes the next silent-failure mode, and it keeps ONE code
+# path for "how a release happens": a hand-pushed tag and a merge-triggered
+# release now run the same jobs.
+#
+# And regardless of trigger, `publish.yml`'s `verify-published` job is the
+# post-condition that makes this class of defect *loud*: the run cannot go
+# green until the version is servable from the PyPI simple index and the
+# GitHub Release exists. A release path that cannot detect its own no-op is
+# not safe to run unattended.
 #
 # The *propagate* half is not here and must not be. `coord agent update`
 # restarts each agent, and a restart kills every in-flight headless worker,
@@ -39,13 +62,24 @@ on:
         type: boolean
         default: true
 
-# Coalescing, per the trigger policy: a burst of merges collapses to ONE
-# release at the tip instead of one per merge. `cancel-in-progress` is safe
-# here precisely because this workflow's only side effect is the final tag
-# push — a cancelled run has published nothing.
+# Coalescing, per the trigger policy: a burst of merges collapses to fewer
+# releases than merges.
+#
+# #2035 flipped `cancel-in-progress` to false. It was true back when this
+# workflow's only side effect was the final tag push, so a cancelled run had
+# published nothing. Now the publish runs *inside* this run, and cancelling
+# mid-run can abort between the PyPI upload and the GitHub Release — the
+# half-released state this issue exists to make impossible.
+#
+# Queuing keeps most of the coalescing anyway: GitHub holds at most one
+# running plus one *pending* run per group and cancels the previously pending
+# one, so a burst of merges during a ~15-minute release run collapses to the
+# last of them. What it costs is that a merge landing after a run finishes
+# gets its own release, which is the trigger policy's stated intent
+# (path-filtered per merge) rather than a regression.
 concurrency:
   group: auto-release-main
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -54,8 +88,15 @@ jobs:
   decide-and-tag:
     runs-on: ubuntu-latest
     permissions:
-      # Pushing the tag. This is the only write in the workflow.
+      # Pushing the tag. This is the only write in this job.
       contents: write
+    outputs:
+      # The tag `publish` should release, or empty for "release nothing".
+      # Non-empty in two cases: we just pushed a new tag, or main's tip was
+      # already tagged and that release may never have been published (the
+      # #2035 state) — re-driving publish for an existing tag is idempotent
+      # (`skip-existing` on the upload) and is the recovery path.
+      publish_tag: ${{ steps.tag.outputs.publish_tag || steps.changed.outputs.already_released_tag }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -69,13 +110,28 @@ jobs:
         with:
           python-version: "3.12"
 
-      # Which paths this push actually changed. `github.event.before` is the
-      # previous tip of main; on the very first push to a branch it is the
-      # all-zeroes SHA, in which case we fall back to the merge commit's own
-      # diff. An unresolvable diff yields an EMPTY list, which
+      # Which paths are UNRELEASED — everything since the last `vX.Y.Z`, not
+      # just what this one push changed.
+      #
+      # #2035: the base used to be `github.event.before` (the previous tip of
+      # main), which silently drops work whenever runs coalesce. Merge a code
+      # change, then a docs change while the first run is still going: the
+      # code run is superseded, and the docs run diffs only its own push,
+      # decides "docs only", and the code change never ships. Diffing from
+      # the last released tag makes every run's decision cover everything not
+      # yet released, so coalescing can only ever *delay* a release, never
+      # lose one. `github.event.before` remains the fallback for a repo with
+      # no release tags at all; on the very first push to a branch that is
+      # the all-zeroes SHA, in which case we fall back again to the merge
+      # commit's own diff.
+      #
+      # An unresolvable diff yields an EMPTY list, which
       # `scripts/next_release_tag.py` treats as "ships code" on purpose —
       # failing open to a superfluous release beats failing closed to a fix
-      # that silently never ships.
+      # that silently never ships. The one case where empty means the
+      # opposite is "HEAD *is* the last released tag", which is handled
+      # explicitly below rather than left to fail open into a duplicate
+      # release of an identical tree.
       - name: Collect changed paths
         id: changed
         shell: bash
@@ -84,12 +140,33 @@ jobs:
           AFTER: ${{ github.sha }}
         run: |
           set -o pipefail
-          files=""
-          if [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] \
+          head_commit="$(git rev-parse "$AFTER^{commit}")"
+
+          base=""
+          last_tag="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n 1 || true)"
+          if [ -n "$last_tag" ] && git merge-base --is-ancestor "$last_tag^{commit}" "$head_commit" 2>/dev/null; then
+            base="$(git rev-parse "$last_tag^{commit}")"
+            echo "base: $last_tag ($base) — the last released commit"
+          elif [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] \
              && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
-            files="$(git diff --name-only "$BEFORE" "$AFTER" || true)"
+            base="$(git rev-parse "$BEFORE^{commit}")"
+            echo "base: $BEFORE (no usable release tag; falling back to the previous tip)"
+          fi
+
+          # Tip already carries a release tag. Minting a second version for a
+          # byte-identical tree would be pure waste, but skipping outright is
+          # what left v0.5.2 stranded — so re-drive publish for the tag that
+          # is already there. If it published fine, that run is a no-op that
+          # re-proves it; if it never published, this is the recovery.
+          if [ -n "$base" ] && [ "$base" = "$head_commit" ]; then
+            echo "::notice::$last_tag already points at this commit — re-driving publish for it rather than minting a new version."
+            echo "already_released_tag=$last_tag" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ -n "$base" ]; then
+            files="$(git diff --name-only "$base" "$head_commit" || true)"
           else
-            files="$(git show --pretty=format: --name-only "$AFTER" || true)"
+            files="$(git show --pretty=format: --name-only "$head_commit" || true)"
           fi
           echo "changed paths:"
           echo "$files"
@@ -101,6 +178,9 @@ jobs:
 
       - name: Decide whether to release, and under what tag
         id: decide
+        # Nothing to decide when the tip is already tagged — that tag is
+        # handed straight to `publish` instead.
+        if: steps.changed.outputs.already_released_tag == ''
         shell: bash
         # Message and file list ride in through `env:` rather than being
         # spliced into the script — a merge commit message is attacker-ish
@@ -113,11 +193,14 @@ jobs:
             --message "$MSG" --changed-files-from-stdin
 
       - name: No release for this merge
-        if: steps.decide.outputs.release != 'true'
+        if: >-
+          steps.changed.outputs.already_released_tag == '' &&
+          steps.decide.outputs.release != 'true'
         run: |
           echo "::notice::No release cut — ${{ steps.decide.outputs.reason }}"
 
       - name: Tag the release
+        id: tag
         # The dry-run dispatch stops here: it has printed the decision, which
         # is the entire point of dispatching it.
         if: >-
@@ -129,14 +212,42 @@ jobs:
           set -euo pipefail
           # Idempotence: a re-run of this workflow for the same tip must not
           # fail the job trying to re-create a tag that already exists (and
-          # must certainly not move it — `publish.yml` has already published
-          # against it and PyPI uploads are immutable).
+          # must certainly not move it — `publish.yml` may already have
+          # published against it and PyPI uploads are immutable). It still
+          # hands the tag to `publish` (#2035): a tag that exists is not
+          # evidence that it was ever published, which is the entire bug.
           if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
-            echo "::notice::$TAG already exists — nothing to do."
-            exit 0
+            echo "::notice::$TAG already exists — not re-creating it, but re-driving publish for it."
+          else
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$TAG" -m "Release $TAG (auto-cut on merge, #1835)"
+            git push origin "$TAG"
+            echo "::notice::Pushed $TAG."
           fi
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "$TAG" -m "Release $TAG (auto-cut on merge, #1835)"
-          git push origin "$TAG"
-          echo "::notice::Pushed $TAG — publish.yml takes it from here."
+          echo "publish_tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  # #2035: the publish, invoked directly rather than left to a `push: tags`
+  # event the default GITHUB_TOKEN can never fire. Because publish.yml is a
+  # reusable workflow, its jobs are jobs of THIS run: the tag, the build, the
+  # upload, the Release and the `verify-published` post-condition all live
+  # under one green-or-red check, so "auto-release succeeded" now means the
+  # release exists rather than "the tag push exited zero".
+  #
+  # `permissions` here (not at workflow level) caps what the called workflow
+  # can do: a caller cannot grant a reusable workflow more than it holds, and
+  # publish.yml's `release` job needs `contents: write` to create the Release.
+  # Scoping it to this job keeps the rest of the run read-only.
+  publish:
+    needs: [decide-and-tag]
+    if: >-
+      needs.decide-and-tag.outputs.publish_tag != '' &&
+      github.event.inputs.dry_run != 'true'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/publish.yml
+    with:
+      tag: ${{ needs.decide-and-tag.outputs.publish_tag }}
+    # PYPI_API_TOKEN lives in the caller's scope; a reusable workflow sees no
+    # secrets unless they are passed or inherited.
+    secrets: inherit

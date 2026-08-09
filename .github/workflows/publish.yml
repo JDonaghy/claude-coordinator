@@ -28,10 +28,31 @@ name: Release (wheel + coord-tui binaries)
 #
 # Release muscle-memory: push a `vX.Y.Z` tag. Do NOT commit a version bump —
 # there is no version literal left to bump.
+#
+# #2035: this workflow is now ALSO callable (`workflow_call`), and that is how
+# the automated path reaches it. GitHub deliberately does not start workflows
+# from events created with the default `GITHUB_TOKEN` (the recursion guard),
+# so a `v*` tag pushed by auto-release.yml could never trigger the `push`
+# entry below — it tagged v0.5.2, published nothing, and reported success.
+# Calling this workflow directly removes the token class from the problem
+# entirely while keeping ONE code path for "how a release happens": the
+# manual `git tag` push and the merge-triggered release run the same jobs.
 
 on:
   push:
     tags: ["v*"]
+  # The automated entrypoint (#2035). auto-release.yml pushes the tag, then
+  # calls this with that tag rather than hoping a `push` event fires.
+  workflow_call:
+    inputs:
+      tag:
+        description: >-
+          The release tag to publish, e.g. `v0.5.2`. It must already exist on
+          the remote — every job checks out `refs/tags/<tag>` so the build is
+          a function of the tag alone, not of wherever `main` happens to have
+          moved since the caller tagged it.
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       dry_run_tag:
@@ -60,26 +81,52 @@ jobs:
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
       dry_run: ${{ steps.resolve.outputs.dry_run }}
+      # The git ref every job in this run checks out. Under `workflow_call`
+      # (#2035) `github.ref` is the *caller's* ref — `main` — so a checkout
+      # that trusted the default would build whatever landed on main after
+      # the caller cut the tag, and stamp it with the tag's version. Pinning
+      # `refs/tags/<tag>` makes the build a function of the tag in every
+      # mode, which is the property #1238's tag-is-the-version rests on.
+      ref: ${{ steps.resolve.outputs.ref }}
     steps:
       - id: resolve
         shell: bash
         # Via `env:` rather than spliced into the script — `dry_run_tag` is
         # workflow_dispatch input text, and interpolating it directly into
         # `run:` would splice it into (and execute it as) bash.
+        #
+        # Precedence: a `workflow_call` tag wins (the automated path), then a
+        # dry-run's dispatch tag, then the ref this ran against (a real `v*`
+        # tag push). Only one is ever non-empty — `inputs.tag` is unset under
+        # push/dispatch, and `github.event.inputs` is null under
+        # workflow_call.
         env:
+          CALL_TAG: ${{ inputs.tag }}
           DISPATCH_TAG: ${{ github.event.inputs.dry_run_tag }}
           REF_NAME: ${{ github.ref_name }}
         run: |
-          if [ -n "$DISPATCH_TAG" ]; then
+          if [ -n "$CALL_TAG" ]; then
+            tag="$CALL_TAG"
+            dry_run=false
+          elif [ -n "$DISPATCH_TAG" ]; then
             tag="$DISPATCH_TAG"
             dry_run=true
           else
             tag="$REF_NAME"
             dry_run=false
           fi
-          echo "Building $tag (dry_run=$dry_run)"
+          # A dry run is dispatched against a *branch*, so there is no tag to
+          # check out; it builds the ref it was dispatched against (and
+          # `build-wheel` stamps a throwaway local tag on it).
+          if [ "$dry_run" = "true" ]; then
+            ref=""
+          else
+            ref="refs/tags/$tag"
+          fi
+          echo "Building $tag (dry_run=$dry_run, ref=${ref:-<default>})"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "dry_run=$dry_run" >> "$GITHUB_OUTPUT"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
 
   # #1471: main is a protected branch, so `git push origin main` can be
   # rejected while a subsequent `git push origin vX.Y.Z` still succeeds (they
@@ -99,12 +146,21 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ needs.plan.outputs.ref }}
       - name: Verify tag is on main
+        env:
+          TAG: ${{ needs.plan.outputs.tag }}
         run: |
+          set -euo pipefail
           git fetch origin main
-          tagged_commit="${{ github.sha }}"
+          # HEAD, not `github.sha`: under `workflow_call` (#2035) `github.sha`
+          # is the caller's commit (main's tip), not the tagged commit, so
+          # reading it here would check the wrong object — and would pass
+          # trivially, since main's tip is always an ancestor of main.
+          tagged_commit="$(git rev-parse HEAD)"
+          echo "Tag $TAG -> $tagged_commit"
           if ! git merge-base --is-ancestor "$tagged_commit" origin/main; then
-            echo "::error::Tag ${{ github.ref_name }} points at commit $tagged_commit, which is not an ancestor of origin/main. This tag was likely pushed from a local commit that main's branch protection rejected. Refusing to publish — merge the commit to main first, then re-tag it."
+            echo "::error::Tag $TAG points at commit $tagged_commit, which is not an ancestor of origin/main. This tag was likely pushed from a local commit that main's branch protection rejected. Refusing to publish — merge the commit to main first, then re-tag it."
             exit 1
           fi
 
@@ -124,6 +180,8 @@ jobs:
           # shallow clone, so the tag is always reachable.
           fetch-depth: 0
           fetch-tags: true
+          # Empty on a dry run (see `plan`), which means "the default ref".
+          ref: ${{ needs.plan.outputs.ref }}
 
       # A dry run is dispatched against a branch, not a tag, so there is no
       # release tag for setuptools-scm to find. A throwaway *local* tag on
@@ -178,6 +236,10 @@ jobs:
     uses: ./.github/workflows/release-tui.yml
     with:
       tag: ${{ needs.plan.outputs.tag }}
+      # Same reason build-wheel pins it (#2035): under `workflow_call` the
+      # default ref is the caller's branch, so the binaries would be built
+      # from main's tip and stamped with the tag's version.
+      ref: ${{ needs.plan.outputs.ref }}
 
   # The acceptance gate, and the reason a dry run is worth running: prove the
   # single asset set is complete BEFORE anything irreversible happens. Runs
@@ -239,6 +301,14 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           password: ${{ secrets.PYPI_API_TOKEN }}
+          # #2035: make the release path re-runnable. A run that uploaded the
+          # wheel and then failed downstream (or was cancelled) must be
+          # re-runnable to completion; without this, the retry dies on PyPI's
+          # immutability and the release stays half-done forever. This does
+          # not weaken the gate — `verify-published` below independently
+          # proves the version really is servable, so "the upload was a
+          # no-op" can no longer be mistaken for "the release happened".
+          skip-existing: true
 
   # The single owner of the GitHub Release. Runs only once every other half
   # has succeeded, so a Release never exists advertising a wheel that failed
@@ -259,7 +329,55 @@ jobs:
       - name: Create the GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
+          # `needs.plan.outputs.tag`, not `github.ref_name`: under
+          # `workflow_call` (#2035) the latter is the caller's branch, which
+          # would cut a Release named `main`.
+          tag_name: ${{ needs.plan.outputs.tag }}
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: release-assets/*
+
+  # ────────────────────────────────────────────────────────────────────────
+  # #2035: THE POST-CONDITION. Nothing above proves the release exists.
+  #
+  # Every job so far reports success when its own steps exit zero, which is
+  # not the same claim as "a user can install this version". The first fully
+  # automatic release (v0.5.2, 2026-08-09) tagged, published nothing, and
+  # went green — and green is worse than red here, because every deploy lane
+  # then targets a version that does not exist while `coord release verify`
+  # sees the fleet uniformly agreeing on the old one and calls that health.
+  #
+  # This job is what makes that state unreachable: poll until the version is
+  # actually servable, then fail loudly and specifically if it never is. It
+  # runs for BOTH entrypoints — a hand-pushed tag and the merge-triggered
+  # call — because the defect it guards is a property of the release path,
+  # not of any one trigger.
+  # ────────────────────────────────────────────────────────────────────────
+  verify-published:
+    needs: [plan, publish-pypi, release]
+    if: needs.plan.outputs.dry_run != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # No `pip install`: scripts/verify_release_published.py and the
+      # coord.health.pypi index parser it reuses are pure stdlib on purpose,
+      # so the check that proves the release exists cannot itself be broken
+      # by a dependency resolution failure.
+      #
+      # Known edge: re-pushing a tag from before this landed checks out a
+      # tree with no such script, and this job fails. That is the right way
+      # round — a loud failure on an unsupported path, not a silent green.
+      - name: Prove the release actually exists
+        env:
+          TAG: ${{ needs.plan.outputs.tag }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python scripts/verify_release_published.py \
+            --tag "$TAG" \
+            --github-repo "${{ github.repository }}" \
+            --timeout 600 --interval 15
