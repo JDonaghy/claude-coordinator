@@ -20,9 +20,25 @@ jobs:
       - run: pip install -e ".[dev]"
       - run: pytest
 
-  # #1895 (CP-4 slice of #1159): real Windows verification, on every PR,
-  # before we own any Windows hardware — the repo is public, so
-  # `windows-latest` runners cost nothing.
+  # #1895 (CP-4 slice of #1159): real Windows verification — the repo is
+  # public, so `windows-latest` runners cost nothing.
+  #
+  # PUSH-TO-MAIN ONLY, not per-PR (#2039). This job takes ~21-28 min while
+  # every other job finishes in ~6, and `coord merge`'s gate blocks on
+  # `checks_pending` — so per-PR it was ~20 min of pure MERGE LATENCY, not
+  # just CI wall-clock. It is also the string in every park event from the
+  # 2026-08-08 stall (`parked — CI running: windows`): each drive parked on it
+  # and handed off, which is how five PRs piled up unmerged.
+  #
+  # What that latency bought per-PR was ~nothing. The job is deliberately red
+  # and non-blocking (see below), so nothing gates on its result; its output
+  # is one number (`368 failed, ...`) that only moves when someone works on
+  # #1156. Running it per-merge keeps that baseline just as current.
+  #
+  # REVISIT WHEN #1156 LANDS. Once the suite is genuinely green and blocking,
+  # per-PR coverage is worth its duration again — and at that point the right
+  # move is probably to keep it per-PR but shrink it to the import smoke
+  # #1895's own title describes, rather than the full suite.
   #
   # This job is EXPECTED TO BE RED when it lands: `coord.cli` cannot import
   # on Windows today (`cli.py` -> `coord/interactive.py`'s unconditional
@@ -48,6 +64,12 @@ jobs:
   # — the matrix axis there is Python versions on Linux; this job's axis is
   # the platform. See docs/CROSS_PLATFORM.md §9.
   windows:
+    # #2039: on `push` (i.e. merges to main) only. On a `pull_request` event
+    # this evaluates false and the job is SKIPPED — conclusion `skipped`,
+    # which is already in `ci_store._PASSING_CONCLUSIONS`, so the merge gate
+    # is satisfied rather than merely tolerant. `windows` is not a required
+    # status check either, so branch protection is unaffected.
+    if: github.event_name == 'push'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
