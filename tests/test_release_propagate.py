@@ -367,3 +367,218 @@ def test_a_dry_run_is_labelled_as_one():
     record = rp.PropagationRecord(started_at=1.0, target_version="0.4.111",
                                   dry_run=True, status=rp.STATUS_ROLLED)
     assert "[dry-run]" in "\n".join(rp.render_record(record))
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# #2052: the gate's scope must match propagation's reach
+# ──────────────────────────────────────────────────────────────────────────
+#
+# The defect this section pins is not a flaky failure — it fired on every
+# run that reached the verify step, forever. `coord release propagate` gated
+# its roll on `coord release verify`, which grades lanes propagation cannot
+# roll, so a run that succeeded at everything it was capable of doing came
+# back red and `--rollback-on-red` reverted its own good work.
+
+
+def _run_lanes(overrides: dict | None = None):
+    """The 2026-08-09 20:22 UTC run, as it was journalled."""
+    lanes = [
+        {"lane": "python", "host": "precision", "ok": True, "detail": "now v0.5.8"},
+        {"lane": "python", "host": "elitebook", "ok": True, "detail": "now v0.5.8"},
+        {"lane": "python", "host": "dellserver", "ok": True, "detail": "now v0.5.8"},
+        {"lane": "units", "host": "precision", "ok": True, "detail": "1 unit refreshed"},
+        {"lane": "units", "host": "elitebook", "ok": True, "detail": "1 unit refreshed"},
+        {"lane": "units", "host": "dellserver", "ok": True, "detail": "2 units refreshed"},
+        {"lane": "tui", "host": "precision", "ok": None, "unrollable": True,
+         "detail": "coord-tui is a per-host binary with no remote install path"},
+        {"lane": "tui", "host": "elitebook", "ok": None, "unrollable": True,
+         "detail": "coord-tui is a per-host binary with no remote install path"},
+        {"lane": "tui", "host": "dellserver", "ok": True, "detail": "coord-tui now v0.5.8"},
+    ]
+    over = overrides or {}
+    return [{**lane, **over.get((lane["lane"], lane["host"]), {})} for lane in lanes]
+
+
+def _finding(severity, host, lane, summary="on 0.5.4, expected 0.5.8"):
+    return {"severity": severity, "host": host, "lane": lane, "summary": summary,
+            "detail": ""}
+
+
+def test_2026_08_09_a_run_that_did_everything_it_could_is_not_red():
+    """The regression, replayed. Every lane propagation *can* roll, rolled.
+    Verification then came back crit on `~/.coord-cli-venv` (a lane this
+    module has zero references to), on the two remote `coord-tui` binaries
+    (which propagation itself reports have NO remote install path), and on
+    the `coord-serve` process (whose venv swapped but whose process nothing
+    here restarts). None of those is evidence this roll went wrong."""
+    verification = {
+        "severity": "crit",
+        "findings": [
+            _finding("crit", "elitebook", "~/.coord-cli-venv (elitebook)"),
+            _finding("crit", "daemon", "coord-serve process (daemon)"),
+            _finding("warn", "precision", "coord-tui", "tui binary is stale"),
+            _finding("warn", "elitebook", "coord-tui", "tui binary is stale"),
+        ],
+    }
+    verdict = rp.scope_verification(verification, lanes=_run_lanes())
+    assert not verdict.red, verdict.blocking
+    assert verdict.severity == "ok"
+    # Nothing is dropped — advisory means "fix by hand", not "never happened".
+    assert len(verdict.advisory) == 4
+    assert set(verdict.unrollable) == {"tui@precision", "tui@elitebook"}
+
+
+def test_a_lane_this_run_actually_rolled_still_blocks():
+    """Scoping the gate must not become removing it. If the python lane this
+    run rolled is still on the old version, that is exactly what the gate is
+    for and it must still be red."""
+    verification = {
+        "severity": "crit",
+        "findings": [_finding("crit", "precision", "~/.coord-venv (precision)")],
+    }
+    verdict = rp.scope_verification(verification, lanes=_run_lanes())
+    assert verdict.red
+    assert len(verdict.blocking) == 1
+    assert not verdict.advisory
+
+
+def test_a_grouped_finding_blocks_when_ANY_lane_in_it_is_in_scope():
+    """`coord release verify` groups an --expected mismatch into one finding
+    per offending version, naming several lanes at once. One rollable lane in
+    that list is enough to make the whole sentence this run's problem."""
+    verification = {
+        "severity": "crit",
+        "findings": [
+            _finding("crit", "elitebook, precision",
+                     "~/.coord-cli-venv (elitebook), ~/.coord-venv (precision)"),
+        ],
+    }
+    verdict = rp.scope_verification(verification, lanes=_run_lanes())
+    assert verdict.red
+
+
+def test_a_grouped_finding_of_only_unreachable_lanes_is_advisory():
+    verification = {
+        "severity": "crit",
+        "findings": [
+            _finding("crit", "elitebook, daemon",
+                     "~/.coord-cli-venv (elitebook), coord-serve process (daemon)"),
+        ],
+    }
+    verdict = rp.scope_verification(verification, lanes=_run_lanes())
+    assert not verdict.red
+    assert len(verdict.advisory) == 1
+
+
+def test_the_tui_lane_blocks_on_the_host_that_could_actually_roll_it():
+    """The asymmetry is the whole point: the same lane is in scope where a
+    channel exists and out of scope where none does."""
+    verification = {
+        "severity": "warn",
+        "findings": [_finding("crit", "dellserver", "coord-tui")],
+    }
+    verdict = rp.scope_verification(verification, lanes=_run_lanes())
+    assert verdict.red, "dellserver's coord-tui DID roll — its staleness is ours"
+
+
+def test_a_lane_the_run_attempted_and_failed_is_in_scope():
+    """Attempted-and-failed is not the same as unrollable. A failed python
+    roll is precisely what the gate exists to catch."""
+    lanes = _run_lanes({("python", "precision"): {"ok": False, "detail": "pip failed"}})
+    verification = {
+        "severity": "crit",
+        "findings": [_finding("crit", "precision", "~/.coord-venv (precision)")],
+    }
+    assert rp.scope_verification(verification, lanes=lanes).red
+
+
+def test_a_lane_skipped_because_the_daemon_failed_is_not_in_scope():
+    """`ok=None` with no `unrollable` flag means "never attempted" — a re-run
+    resumes it, so this run cannot be held to its state."""
+    lanes = _run_lanes({
+        ("python", "elitebook"): {"ok": None, "detail": "not attempted — daemon failed"},
+    })
+    verification = {
+        "severity": "crit",
+        "findings": [_finding("crit", "elitebook", "~/.coord-venv (elitebook)")],
+    }
+    assert not rp.scope_verification(verification, lanes=lanes).red
+
+
+def test_an_unrecognised_lane_keeps_the_gate_rather_than_slipping_through():
+    """The exemption list is an allow-list of KNOWN gaps, not "anything we
+    failed to classify". A lane added to the verifier tomorrow must keep the
+    gate honest until somebody decides otherwise."""
+    verification = {
+        "severity": "crit",
+        "findings": [_finding("crit", "precision", "some-new-lane (precision)")],
+    }
+    assert rp.scope_verification(verification, lanes=_run_lanes()).red
+
+
+def test_an_unreachable_host_is_never_silently_exempted():
+    verification = {
+        "severity": "unknown",
+        "findings": [
+            {"severity": "unknown", "host": "precision", "lane": "(all lanes)",
+             "summary": "host unreachable — its lanes are unverified", "detail": ""},
+        ],
+    }
+    verdict = rp.scope_verification(verification, lanes=_run_lanes())
+    assert verdict.severity == "unknown"
+    assert len(verdict.blocking) == 1
+
+
+def test_coord_agent_spawns_is_in_scope_but_coord_serve_spawns_is_not():
+    """POST /update swaps the venv and re-execs THE AGENT — and nothing else.
+    coord-serve keeps running the generation it started with, so its live
+    process is out of this command's reach however green the venv goes."""
+    assert rp.verify_lane_kind("coord-agent spawns") == rp.LANE_PYTHON
+    assert rp.verify_lane_kind("coord-serve spawns") is None
+    assert rp.lane_is_out_of_reach("coord-serve spawns")
+    assert not rp.lane_is_out_of_reach("coord-agent spawns")
+
+
+def test_the_cli_venv_is_outside_this_module_entirely():
+    """`release_propagate.py` contains zero references to coord-cli-venv —
+    the lane is outside its model, yet the gate counted it."""
+    assert rp.verify_lane_kind("~/.coord-cli-venv") is None
+    assert rp.lane_is_out_of_reach("~/.coord-cli-venv")
+
+
+def test_lane_labels_round_trip():
+    assert rp.parse_lane_label("~/.coord-venv (precision)") == (
+        "precision", "~/.coord-venv"
+    )
+    assert rp.parse_lane_label("coord-serve process (daemon)") == (
+        "daemon", "coord-serve process"
+    )
+    assert rp.parse_lane_label("coord-tui") is None
+    assert rp.parse_lane_label("(version skew)") is None
+
+
+def test_no_verification_at_all_is_not_a_pass_or_a_failure():
+    verdict = rp.scope_verification(None, lanes=_run_lanes())
+    assert verdict.severity == "ok"
+    assert verdict.blocking == ()
+    assert set(verdict.unrollable) == {"tui@precision", "tui@elitebook"}
+
+
+def test_the_gate_verdict_is_rendered_so_a_scoped_gate_is_never_invisible():
+    """Scoping the gate is only safe if the scoping is legible afterwards —
+    a check that quietly stopped checking is the failure this whole module
+    exists to prevent."""
+    record = rp.PropagationRecord(
+        started_at=1.0, target_version="0.5.8", status=rp.STATUS_VERIFIED,
+        lanes=_run_lanes(),
+        verification={"severity": "crit", "findings": []},
+        gate=rp.scope_verification(
+            {"severity": "crit",
+             "findings": [_finding("crit", "elitebook", "~/.coord-cli-venv (elitebook)")]},
+            lanes=_run_lanes(),
+        ).to_dict(),
+    )
+    out = "\n".join(rp.render_record(record))
+    assert "advisory" in out
+    assert "~/.coord-cli-venv" in out
+    assert "tui@precision" in out

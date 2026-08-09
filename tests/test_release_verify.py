@@ -893,7 +893,8 @@ def test_cli_release_verify_passes_on_a_clean_fleet(
         ),
     )
     result = CliRunner().invoke(
-        main, ["release", "verify", "--config", str(tmp_path / "coordinator.yml")]
+        main, ["release", "verify", "--expected", RELEASED, "--no-pypi",
+               "--config", str(tmp_path / "coordinator.yml")]
     )
     assert result.exit_code == 0, result.output
     assert "RELEASE VERIFY: OK" in result.output
@@ -915,7 +916,7 @@ def test_cli_release_verify_json_mode(
         ),
     )
     result = CliRunner().invoke(
-        main, ["release", "verify", "--json", "--no-exit-code",
+        main, ["release", "verify", "--json", "--no-exit-code", "--no-pypi",
                "--config", str(tmp_path / "coordinator.yml")]
     )
     assert result.exit_code == 0, result.output
@@ -943,3 +944,108 @@ def test_verify_writes_nothing(tmp_path: Path, monkeypatch) -> None:
         expected=RELEASED,
     )
     assert sorted(p.name for p in tmp_path.iterdir()) == before
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# #2052 fault 3 / #2035 item 4: uniform staleness must not read as health
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def test_a_uniformly_stale_fleet_is_not_reported_clean() -> None:
+    """The demonstration, not the hypothesis. After #2052's botched
+    propagation reverted the fleet, every lane agreed on 0.4.104 while `main`
+    was four releases ahead — and `coord release verify` said crit=0, because
+    it compares the fleet against *itself*. Agreement is not currency, and a
+    skew-only run must say so rather than render a clean bill of health."""
+    report = rv.verify(
+        machine_health={
+            "dellserver": _health(_agent_venv(STALE)),
+            "elitebook": _health(_agent_venv(STALE)),
+        },
+    )
+    assert not report.ok, rv.render(report)
+    assert report.severity == "unknown"  # annotated, never paged
+    finding = next(f for f in report.findings if f.lane == "(expected version)")
+    assert "uniformly BEHIND" in finding.summary
+    assert "--pypi" in finding.detail
+
+
+def test_the_no_expected_finding_never_masks_real_skew() -> None:
+    """Skew is already conclusive without an expected version — the #2035
+    annotation must not downgrade or duplicate it."""
+    report = rv.verify(
+        machine_health={
+            "dellserver": _health(_agent_venv(RELEASED)),
+            "elitebook": _health(_agent_venv(STALE)),
+        },
+    )
+    assert report.severity == "crit"
+    assert not any(f.lane == "(expected version)" for f in report.findings)
+
+
+def test_an_expected_version_suppresses_the_annotation() -> None:
+    report = rv.verify(
+        machine_health={"dellserver": _health(_agent_venv(RELEASED))},
+        expected=RELEASED,
+    )
+    assert report.ok, rv.render(report)
+
+
+def test_an_empty_lane_set_does_not_get_the_no_expected_annotation() -> None:
+    """"No lanes at all" already has its own, better finding; adding "and we
+    don't know what to expect" on top would be noise about nothing."""
+    report = rv.verify(machine_health={})
+    assert not any(f.lane == "(expected version)" for f in report.findings)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# #2052 fault 2: the daemon host is DERIVED, never guessed
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def test_the_daemon_host_is_derived_from_a_running_coord_serve() -> None:
+    """It is not a mystery: it is the machine with a live `coord-serve`, and
+    every agent already publishes exactly that in its own /health."""
+    assert rv.daemon_host_from_health({
+        "precision": _health(_agent_venv(RELEASED), _spawns("coord-agent", RELEASED)),
+        "dellserver": _health(_agent_venv(RELEASED),
+                              _spawns("coord-agent", RELEASED),
+                              _spawns("coord-serve", RELEASED)),
+    }) == "dellserver"
+
+
+def test_no_running_coord_serve_anywhere_is_none_not_a_guess() -> None:
+    assert rv.daemon_host_from_health({
+        "precision": _health(_agent_venv(RELEASED), _spawns("coord-agent", RELEASED)),
+    }) is None
+    assert rv.daemon_host_from_health({"precision": None}) is None
+
+
+def test_two_hosts_claiming_coord_serve_is_none_not_a_coin_flip() -> None:
+    """Two live daemons is a fault in its own right. A caller that has to
+    order a roll around "the" daemon must refuse, not pick one."""
+    assert rv.daemon_host_from_health({
+        "a": _health(_spawns("coord-serve", RELEASED)),
+        "b": _health(_spawns("coord-serve", RELEASED)),
+    }) is None
+
+
+def test_gather_labels_the_daemon_lane_with_the_real_machine_name(monkeypatch) -> None:
+    """A lane labelled "daemon" cannot be matched to a host by anything
+    downstream — which is how propagation ended up guessing at config order."""
+    class _M:
+        def __init__(self, name): self.name = name; self.host = name
+
+    class _Status:
+        is_online = True
+        health = _health(_agent_venv(RELEASED), _spawns("coord-serve", RELEASED))
+
+    class _Cfg:
+        machines = [_M("dellserver")]
+
+    _health_map, _unreachable, _facts, name = rv.gather(
+        _Cfg(),
+        check_machine=lambda machine, **kw: _Status(),
+        board_payload=lambda: {},
+    )
+    assert name == "dellserver"

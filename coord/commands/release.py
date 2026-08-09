@@ -203,8 +203,14 @@ def _resolve_expected(expected: str | None, *, use_pypi: bool, index_url: str,
 @click.option(
     "--pypi/--no-pypi",
     "use_pypi",
-    default=False,
-    help="Resolve --expected from the PyPI simple index (the released version).",
+    default=True,
+    show_default=True,
+    help=(
+        "Resolve --expected from the PyPI simple index (the released "
+        "version). On by default since #2052: without an expected version "
+        "this command compares the fleet against ITSELF, so a fleet that is "
+        "uniformly four releases behind reports crit=0."
+    ),
 )
 @click.option("--machine", "machine_filter", default=None,
               help="Only poll this machine (still reports it as one lane set).")
@@ -306,19 +312,42 @@ def _fetch_board() -> tuple[dict, str | None]:
         return {}, f"{type(exc).__name__}: {exc}"
 
 
-def _daemon_machine_name(config, override: str | None) -> str | None:
+def _daemon_machine_name(
+    config, override: str | None, machine_health: dict | None = None
+) -> str | None:
     """Which machine in ``coordinator.yml`` runs ``coord-serve``.
 
     The daemon must lead every roll (see :func:`coord.release_propagate.
     plan_lanes`), so getting this wrong is not cosmetic — it reintroduces
-    the documented 405. Resolution order: the explicit flag, then the host
-    in the configured ``board_service`` URL matched against each machine's
-    host, then None (in which case ordering degrades to config order and
-    the command says so out loud rather than pretending).
+    the documented 405, and #2052 watched exactly that happen: a partial
+    revert briefly left the daemon host on 0.5.4 while both callers sat on
+    0.5.8, because nothing could name the daemon and the roll fell back to
+    ``coordinator.yml`` order.
+
+    Resolution order, derivation first and guesswork nowhere:
+
+    1. the explicit ``--daemon-host`` flag;
+    2. **derived** — the machine whose own ``/health`` reports a running
+       ``coord-serve`` unit (:func:`coord.release_verify.
+       daemon_host_from_health`). This is the fact itself, not a proxy for it;
+    3. the host in the configured ``board_service`` URL matched against each
+       machine's host — still derived, just from config rather than from the
+       fleet;
+    4. ``None``, which the caller treats as *refuse the run*. Ordering is the
+       one thing protecting against the 405; a run that cannot order itself
+       must stop, not roll in whatever order the file happens to list.
     """
     machines = list(getattr(config, "machines", ()) or ())
     if override:
         return override
+
+    if machine_health:
+        from coord.release_verify import daemon_host_from_health  # noqa: PLC0415
+
+        derived = daemon_host_from_health(machine_health)
+        if derived:
+            return derived
+
     try:
         from urllib.parse import urlparse  # noqa: PLC0415
 
@@ -489,14 +518,24 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
         expected=record.target_version,
     )
     hosts = [m.name for m in (getattr(config, "machines", ()) or ())]
-    daemon_name = _daemon_machine_name(config, daemon_host_override)
-    if daemon_name is None:
-        click.echo(
-            "warning: could not identify which machine runs coord-serve — "
-            "rolling in coordinator.yml order. Pass --daemon-host to pin it; "
-            "the daemon must never lag a caller (the documented 405).",
-            err=True,
+    daemon_name = _daemon_machine_name(config, daemon_host_override, machine_health)
+    if daemon_name is None and len(hosts) > 1:
+        # #2052 fault 2: this used to warn and roll in coordinator.yml order.
+        # It then briefly put the daemon host BEHIND both its callers during a
+        # partial revert — the documented 405 hazard the warning itself named.
+        # Ordering is the one thing protecting against that, so an unorderable
+        # run refuses. It is not a failure of the fleet, but it is a failure of
+        # this run, and a recorded one.
+        record.error = (
+            "could not identify which machine runs coord-serve, and this "
+            "fleet has more than one host — REFUSING to roll. The lane order "
+            "(daemon first) is the only thing preventing the documented 405, "
+            "and rolling in coordinator.yml order is a guess, not an order. "
+            "Fix the daemon host's /health so its coord-serve unit is "
+            "visible, or pass --daemon-host <machine>."
         )
+        click.echo(f"error: {record.error}", err=True)
+        _finish(rp.STATUS_FAILED, 1)
     current = rp.hosts_already_current(_lane_versions_by_host(before), record.target_version)
     rolls = rp.plan_lanes(
         daemon_host=daemon_name,
@@ -589,9 +628,18 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
                 machine, target_version=record.target_version, local_name=local_name
             )
 
-        record.lanes.append({"lane": roll.lane, "host": roll.host, "ok": ok,
-                             "detail": detail})
-        click.echo(f"  {'✓' if ok else '✗'} {roll.label}: {detail}")
+        # #2052: `ok is None` from a lane executor means "there is no channel
+        # for this lane on this host" — not a failure, and emphatically not
+        # something the post-roll gate may hold this run to. The remote
+        # coord-tui binary is the canonical case: propagation itself reports
+        # there is no remote install path, so counting its staleness as
+        # grounds for rolling back a good python roll is a category error.
+        entry = {"lane": roll.lane, "host": roll.host, "ok": ok, "detail": detail}
+        if ok is None:
+            entry["unrollable"] = True
+        record.lanes.append(entry)
+        click.echo(f"  {'·' if ok is None else ('✓' if ok else '✗')} "
+                   f"{roll.label}: {detail}")
 
     # ── 5. the final gate ────────────────────────────────────────────────
     if not do_verify:
@@ -607,20 +655,58 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
     )
     record.verification = after.to_dict()
 
-    if after.severity == "crit" and rollback_on_red:
+    # #2052: the gate is scoped to the lanes this run attempted and could
+    # have moved. The full report above is still journalled verbatim — this
+    # narrows what may TRIGGER a rollback, not what gets reported.
+    gate = rp.scope_verification(record.verification, lanes=record.lanes)
+    record.gate = gate.to_dict()
+    for finding in gate.advisory:
+        click.echo(
+            f"  ~ advisory [{finding.get('severity')}] {finding.get('host')} "
+            f"{finding.get('lane')}: {finding.get('summary')} "
+            "— outside propagation's reach, fix by hand",
+            err=True,
+        )
+    if gate.unrollable:
+        click.echo(
+            "  ~ lanes with no channel from this host: "
+            + ", ".join(gate.unrollable),
+            err=True,
+        )
+
+    if gate.red and rollback_on_red:
         # #1835: "a red post-deploy verification must roll back, not just
         # report." Only the hosts THIS run updated — rolling back a host we
         # never touched would undo somebody else's deliberate state.
+        down: list[str] = []
         for host in updated_hosts:
             machine = by_name.get(host)
             if machine is None:
                 continue
-            ok, detail = _rollback_host(machine, agent_port=AGENT_PORT)
+            ok, detail = _rollback_host(
+                machine, agent_port=AGENT_PORT, timeout=min(timeout, 120.0)
+            )
             record.rolled_back.append(f"{host}: {detail}")
+            if not ok:
+                down.append(host)
             click.echo(f"  {'↩' if ok else '✗'} rollback {host}: {detail}")
+        # #2052 fault 1: a rollback that stops a service and does not restore
+        # it leaves the fleet WORSE off than the failed roll did — precision's
+        # coord-agent sat `inactive (dead)` until a human noticed. If any host
+        # did not come back, that is the headline, not a footnote.
+        if down:
+            record.error = (
+                "ROLLBACK LEFT AGENTS DOWN: "
+                + ", ".join(down)
+                + " — these hosts answered the rollback but never came back "
+                "on /health, and an SSH `systemctl --user restart "
+                "coord-agent` did not revive them either. Recover by hand "
+                "before anything else."
+            )
+            click.echo(f"error: {record.error}", err=True)
         _finish(rp.STATUS_ROLLED_BACK, 2)
 
-    if after.severity == "crit":
+    if gate.red:
         _finish(rp.STATUS_FAILED, 1)
 
     # ── 6. release the deploy gates that were waiting for this ───────────
@@ -694,8 +780,13 @@ def _roll_python(machine, *, target_version: str, agent_port: int, timeout: floa
     )
 
 
-def _roll_units(machine, *, agent_port: int) -> tuple[bool, str]:
-    """POST /deploy-units — the `deploy/**` lane's deploy step (#1831)."""
+def _roll_units(machine, *, agent_port: int) -> tuple[bool | None, str]:
+    """POST /deploy-units — the `deploy/**` lane's deploy step (#1831).
+
+    Returns ``ok=None`` when this host offers no channel for the lane at all
+    (see :func:`_roll_tui` and #2052): the run is not accountable for a lane
+    it was structurally unable to roll.
+    """
     status, body, error = _post(
         f"http://{machine.host}:{agent_port}/deploy-units", {}, timeout=30.0
     )
@@ -704,9 +795,10 @@ def _roll_units(machine, *, agent_port: int) -> tuple[bool, str]:
     if status in (404, 405):
         # Bootstrap: this agent predates the endpoint. It will have it after
         # the python lane above lands, so this is a *next run* fact, not a
-        # failure — recorded rather than swallowed.
-        return False, ("agent has no /deploy-units yet (predates #1835) — "
-                       "the next propagation will roll this lane")
+        # failure — recorded rather than swallowed, and NOT grounds for the
+        # gate to revert everything else this run got right (#2052).
+        return None, ("agent has no /deploy-units yet (predates #1835) — "
+                      "the next propagation will roll this lane")
     if status != 200:
         return False, str(body.get("error") or body.get("summary") or f"HTTP {status}")
     units = body.get("units") or []
@@ -724,7 +816,9 @@ def _roll_units(machine, *, agent_port: int) -> tuple[bool, str]:
     return True, "; ".join(parts)
 
 
-def _roll_tui(machine, *, target_version: str, local_name: str | None) -> tuple[bool, str]:
+def _roll_tui(
+    machine, *, target_version: str, local_name: str | None
+) -> tuple[bool | None, str]:
     """`coord tui update` — local host only, and honest about the rest.
 
     ``coord-tui`` is a binary in each host's ``~/.local/bin``; there is no
@@ -732,11 +826,17 @@ def _roll_tui(machine, *, target_version: str, local_name: str | None) -> tuple[
     command is running. Remote hosts are recorded as an explicit gap rather
     than silently omitted — a lane nobody can see is the lane that bites
     (#1834).
+
+    #2052: that gap returns ``ok=None``, not ``ok=False``. It used to return
+    False, which the post-roll gate then read as a failed lane and
+    ``--rollback-on-red`` used as grounds to revert three good python rolls.
+    A lane that reports "there is no remote install path" in its own failure
+    message cannot also be evidence that this run went wrong.
     """
     import subprocess  # noqa: PLC0415
 
     if local_name is None or machine.name != local_name:
-        return False, (
+        return None, (
             f"coord-tui is a per-host binary with no remote install path — run "
             f"`coord tui update --version {target_version}` on {machine.name}"
         )
@@ -753,18 +853,98 @@ def _roll_tui(machine, *, target_version: str, local_name: str | None) -> tuple[
     return False, (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()[:300]
 
 
-def _rollback_host(machine, *, agent_port: int) -> tuple[bool, str]:
-    """POST /rollback — back to the previous blue/green generation (#1241)."""
+def _get(url: str, *, timeout: float) -> tuple[int | None, dict]:
+    """GET JSON, tolerantly. ``(status, body)`` — never raises."""
+    import httpx  # noqa: PLC0415
+
+    try:
+        resp = httpx.get(url, timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return None, {}
+    try:
+        body = resp.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    return resp.status_code, (body if isinstance(body, dict) else {})
+
+
+def _wait_agent_back(machine, *, agent_port: int, timeout: float) -> tuple[bool, str]:
+    """Poll ``/health`` until the agent answers again. ``(back, version)``.
+
+    A rollback re-execs the agent process, and #2052 fault 1 is what happens
+    when that re-exec does not take: precision's ``coord-agent`` went
+    ``inactive (dead)`` at the moment of the rollback and stayed there until
+    a human noticed. "The POST was accepted" is therefore not an outcome —
+    the outcome is whether the service is serving again.
+    """
+    import time  # noqa: PLC0415
+
+    deadline = time.time() + max(timeout, 1.0)
+    poll = min(2.0, max(timeout / 10, 0.05))
+    while True:
+        status, body = _get(f"http://{machine.host}:{agent_port}/health", timeout=3.0)
+        if status == 200:
+            return True, str(body.get("version") or "?")
+        if time.time() >= deadline:
+            return False, "?"
+        time.sleep(poll)
+
+
+def _rollback_host(
+    machine, *, agent_port: int, timeout: float = 90.0
+) -> tuple[bool, str]:
+    """POST /rollback — back to the previous blue/green generation (#1241) —
+    and then put the service back on its feet.
+
+    #2052 fault 1: "a rollback that stops a service and does not restore it
+    leaves the fleet worse off than the failed roll did." This used to return
+    True the instant the agent answered 202, which is a statement about the
+    *request*, not about the host. It now waits for ``/health`` to answer
+    again, escalates once to the documented SSH ``systemctl --user restart
+    coord-agent`` (#404/#1568 — ``os.execv`` self-restart does not always
+    take under systemd), and only then gives up — loudly, naming the host as
+    DOWN rather than reporting a tidy "rolling back".
+    """
+    from coord.commands.agent_ops import _escalate_restart  # noqa: PLC0415
+
     status, body, error = _post(
         f"http://{machine.host}:{agent_port}/rollback", {"force": True}, timeout=30.0
     )
     if error:
         return False, error
-    if status == 202:
-        return True, "rolling back to the previous generation"
     if status == 404:
         return False, "no previous generation on this host"
-    return False, str(body.get("error") or f"HTTP {status}")
+    if status != 202:
+        return False, str(body.get("error") or f"HTTP {status}")
+
+    back, version = _wait_agent_back(machine, agent_port=agent_port, timeout=timeout)
+    if back:
+        return True, f"rolled back; agent is serving again on v{version}"
+
+    # The re-exec did not take. This is the documented systemd stall, and it
+    # has a documented fix — apply it rather than handing the operator a
+    # dead host and a tidy success message.
+    escalated = _escalate_restart(machine)
+    if escalated:
+        back, version = _wait_agent_back(
+            machine, agent_port=agent_port, timeout=min(timeout, 60.0)
+        )
+        if back:
+            return True, (
+                f"rolled back; agent needed an SSH `systemctl --user restart "
+                f"coord-agent` but is serving again on v{version}"
+            )
+    return False, (
+        "rolled back the venv but the agent is DOWN — it never came back on "
+        f"/health within {timeout:.0f}s and "
+        + (
+            "the SSH restart did not revive it"
+            if escalated
+            else "the SSH `systemctl --user restart coord-agent` escalation "
+            "could not run"
+        )
+        + f". Recover by hand on {machine.name}."
+    )
 
 
 def _release_hold(key: str) -> tuple[bool, str]:
@@ -805,7 +985,11 @@ def _release_hold(key: str) -> tuple[bool, str]:
 @_CONFIG_OPTION
 @click.option("--machine", "machine_filter", default=None, help="Only this machine.")
 @click.option("--yes", is_flag=True, help="Skip the confirmation prompt.")
-def release_rollback(config_path: Path, machine_filter: str | None, yes: bool) -> None:
+@click.option("--wait", default=90.0, show_default=True,
+              help="Seconds to wait for each agent to start serving again "
+                   "before escalating to an SSH restart (#2052).")
+def release_rollback(config_path: Path, machine_filter: str | None, yes: bool,
+                     wait: float) -> None:
     """#1560 requires rollback to be one command, not a runbook.
 
     Every successful ``/update`` leaves the previous generation on disk
@@ -832,7 +1016,7 @@ def release_rollback(config_path: Path, machine_filter: str | None, yes: bool) -
         )
     failures = 0
     for machine in machines:
-        ok, detail = _rollback_host(machine, agent_port=AGENT_PORT)
+        ok, detail = _rollback_host(machine, agent_port=AGENT_PORT, timeout=wait)
         click.echo(f"  {'↩' if ok else '✗'} {machine.name}: {detail}")
         failures += 0 if ok else 1
     if failures:
