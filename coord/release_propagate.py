@@ -81,6 +81,7 @@ facts, calls in here, executes the plan and appends the journal.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -101,6 +102,239 @@ LANE_TUI = "tui"
 #: Every lane this module knows how to roll, in no particular order — the
 #: *order* is :func:`plan_lanes`'s output, not this tuple.
 ALL_LANES: tuple[str, ...] = (LANE_PYTHON, LANE_UNITS, LANE_TUI)
+
+# ── the gate's scope ─────────────────────────────────────────────────────────
+#
+# #2052: `coord release propagate` gated its roll on `coord release verify`,
+# but verify grades lanes propagation **cannot roll**. On the first quiescent
+# window the run did everything it was capable of — three python lanes, three
+# unit lanes, the one coord-tui it could reach — and still came back red,
+# because verify also counted `~/.coord-cli-venv` (a lane this module has no
+# model of at all), the two remote `coord-tui` binaries (which propagation
+# itself reports have NO remote install path), and the `coord-serve` process
+# (whose venv had swapped but whose process nothing here restarts). With
+# `--rollback-on-red` that reverted its own good work — every run, forever.
+#
+# The rule this section encodes: **a verify gate must not be able to fail for
+# reasons the thing it gates cannot influence.** Findings on lanes this run
+# actually attempted are BLOCKING; findings on lanes propagation has no
+# channel for are ADVISORY — reported loudly, never grounds for a rollback.
+#
+# Advisory is not "ignored". An advisory crit is a real defect somebody must
+# fix by hand; it is simply not evidence that *this roll* was bad, and
+# reverting a good python roll because a per-host binary could not be
+# installed remotely is a category error.
+
+#: ``coord release verify`` lane name -> the propagation lane that could move
+#: it. Exact names, matched against :func:`coord.release_verify.lanes_for_host`
+#: and :func:`~coord.release_verify.findings_for_host`.
+_VERIFY_LANE_EXACT: dict[str, str] = {
+    "~/.coord-venv": LANE_PYTHON,
+    "coord-tui": LANE_TUI,
+}
+
+#: Units whose *live process* a python-lane roll actually replaces. ``POST
+#: /update`` swaps the venv and then re-execs **the agent** — and nothing
+#: else. ``coord-serve``, ``coord-web``, ``coord-drive-queue`` and friends
+#: keep running the generation they started with until something restarts
+#: them, so their ``<unit> spawns`` lanes are outside this command's reach
+#: however green the venv underneath goes. That is exactly the third failure
+#: in #2052's run: "the venv swapped, but the *process* had not been
+#: restarted at the moment verify ran".
+RESTARTED_BY_PYTHON_LANE: frozenset[str] = frozenset({"coord-agent"})
+
+#: Lanes ``coord release verify`` grades that propagation has no channel for,
+#: named individually so the exemption is a decision rather than a fallthrough.
+#: ``~/.coord-cli-venv`` is the headline: `release_propagate.py` contains zero
+#: references to it, so it is outside this module's model entirely — yet the
+#: gate counted it. ``coord-serve process`` is the daemon's own live process
+#: (see :data:`RESTARTED_BY_PYTHON_LANE`); ``webapp bundle`` is SHA-versioned
+#: off a continuous timer and never pip-versioned at all.
+OUT_OF_REACH_LANES: frozenset[str] = frozenset(
+    {"~/.coord-cli-venv", "coord-serve process", "webapp bundle"}
+)
+
+#: ``"~/.coord-venv (precision)"`` — the label `coord release verify` builds
+#: for a lane, and the only form a grouped finding names its lanes by.
+_LANE_LABEL = re.compile(r"^(?P<lane>.+?)\s+\((?P<host>[^()]+)\)$")
+
+
+def parse_lane_label(label: str) -> tuple[str, str] | None:
+    """``"~/.coord-venv (precision)"`` -> ``("precision", "~/.coord-venv")``.
+
+    ``coord release verify`` groups an ``--expected`` mismatch into ONE
+    finding per offending version, naming its lanes as a comma-joined list of
+    these labels. Scoping the gate therefore has to take such a finding apart
+    again: "0.5.4, expected 0.5.8" across the CLI venv and the daemon process
+    is advisory, the same sentence across a host's ``~/.coord-venv`` is not.
+    """
+    match = _LANE_LABEL.match(label.strip())
+    if not match:
+        return None
+    return match.group("host").strip(), match.group("lane").strip()
+
+
+def verify_lane_kind(lane: str) -> str | None:
+    """Which propagation lane could move ``coord release verify``'s *lane*.
+
+    ``None`` means "no propagation lane moves this" — which is not the same
+    as "this lane is fine", only "this run is not what would fix it".
+    """
+    name = lane.strip()
+    if name in _VERIFY_LANE_EXACT:
+        return _VERIFY_LANE_EXACT[name]
+    if name.startswith("unit "):
+        # `unit coord-agent.service` — the #1831 deploy/** lane, rolled by
+        # POST /deploy-units.
+        return LANE_UNITS
+    if name.endswith(" spawns"):
+        unit = name[: -len(" spawns")].strip()
+        return LANE_PYTHON if unit in RESTARTED_BY_PYTHON_LANE else None
+    return None
+
+
+def lane_is_out_of_reach(lane: str) -> bool:
+    """Is *lane* one propagation structurally cannot influence?
+
+    Deliberately an allow-list of *known* gaps rather than "anything
+    :func:`verify_lane_kind` didn't recognise". A lane nobody thought about
+    must keep the gate honest — the failure mode this whole module exists for
+    is a check that quietly stopped checking.
+    """
+    name = lane.strip()
+    if name in OUT_OF_REACH_LANES:
+        return True
+    return name.endswith(" spawns") and verify_lane_kind(name) is None
+
+
+@dataclass(frozen=True)
+class GateVerdict:
+    """What the post-roll verification means *for this run*.
+
+    ``severity`` is the worst **blocking** severity — the only thing
+    ``--rollback-on-red`` may act on. ``advisory`` carries everything real but
+    out of reach, so scoping the gate never becomes hiding the finding.
+    """
+
+    severity: str = "ok"
+    blocking: tuple[dict, ...] = ()
+    advisory: tuple[dict, ...] = ()
+    #: ``lane@host`` for every lane this run could not roll here at all.
+    unrollable: tuple[str, ...] = ()
+
+    @property
+    def red(self) -> bool:
+        return self.severity == "crit"
+
+    def to_dict(self) -> dict:
+        return {
+            "severity": self.severity,
+            "blocking": [dict(f) for f in self.blocking],
+            "advisory": [dict(f) for f in self.advisory],
+            "unrollable": list(self.unrollable),
+        }
+
+
+#: Same ranking `coord release verify` uses; re-spelled rather than imported
+#: to keep this module import-free of the verifier (the shell owns that seam).
+_SEVERITY_RANK = {"ok": 0, "unknown": 1, "warn": 2, "crit": 3}
+
+
+def _finding_pairs(finding: Mapping[str, Any]) -> list[tuple[str, str]]:
+    """``(host, lane)`` for every lane a verify finding actually speaks about."""
+    lane_field = str(finding.get("lane") or "")
+    pairs = [
+        parsed
+        for part in lane_field.split(", ")
+        if (parsed := parse_lane_label(part)) is not None
+    ]
+    if pairs:
+        return pairs
+    return [(str(finding.get("host") or ""), lane_field)]
+
+
+def attempted_scope(lanes: Iterable[Mapping[str, Any]]) -> set[tuple[str, str]]:
+    """``{(lane, host)}`` this run actually attempted and could have moved.
+
+    Read straight off the journalled lane records, so the gate's scope is
+    exactly what the history says the run did — not a second, parallel
+    account of it that could drift.
+
+    Excluded, on purpose:
+
+    * ``ok is None`` **without** a real attempt — a host skipped because the
+      daemon's python lane failed, or already on the target;
+    * anything flagged ``unrollable`` — a lane with no channel *on this host*
+      (the remote ``coord-tui``, an agent that predates ``/deploy-units``).
+      Attempting is not the same as being able to.
+    """
+    scope: set[tuple[str, str]] = set()
+    for row in lanes:
+        lane = str(row.get("lane") or "")
+        host = str(row.get("host") or "")
+        if lane not in ALL_LANES or not host:
+            continue
+        if row.get("unrollable"):
+            continue
+        if row.get("ok") is None:
+            continue
+        scope.add((lane, host))
+    return scope
+
+
+def scope_verification(
+    verification: Mapping[str, Any] | None,
+    *,
+    lanes: Iterable[Mapping[str, Any]] = (),
+) -> GateVerdict:
+    """Split a ``coord release verify`` report into blocking and advisory.
+
+    *verification* is the report as :meth:`coord.release_verify.VerifyReport.
+    to_dict` renders it; *lanes* are this run's journalled lane records.
+
+    A finding is BLOCKING when any lane it names is one this run attempted
+    and could have moved, or when it names a lane nothing here recognises (an
+    unclassifiable finding must keep the gate honest — see
+    :func:`lane_is_out_of_reach`). Everything else is advisory.
+    """
+    rows = list(lanes)
+    scope = attempted_scope(rows)
+    unrollable = tuple(
+        f"{row.get('lane')}@{row.get('host')}" for row in rows if row.get("unrollable")
+    )
+    if not verification:
+        return GateVerdict(unrollable=unrollable)
+
+    blocking: list[dict] = []
+    advisory: list[dict] = []
+    for finding in verification.get("findings") or []:
+        if not isinstance(finding, Mapping):
+            continue
+        pairs = _finding_pairs(finding)
+        holds = False
+        for host, lane in pairs:
+            kind = verify_lane_kind(lane)
+            if kind is not None:
+                holds = holds or (kind, host) in scope
+            elif not lane_is_out_of_reach(lane):
+                # Not a lane this module has an opinion about — e.g. an
+                # unreachable host's "(all lanes)", or a lane added to the
+                # verifier since. Fail toward keeping the gate.
+                holds = True
+        (blocking if holds else advisory).append(dict(finding))
+
+    severity = "ok"
+    for finding in blocking:
+        sev = str(finding.get("severity") or "unknown")
+        if _SEVERITY_RANK.get(sev, 1) > _SEVERITY_RANK[severity]:
+            severity = sev
+    return GateVerdict(
+        severity=severity,
+        blocking=tuple(blocking),
+        advisory=tuple(advisory),
+        unrollable=unrollable,
+    )
+
 
 # ── propagation outcomes ─────────────────────────────────────────────────────
 #
@@ -442,8 +676,13 @@ class PropagationRecord:
     #: ``[{"lane":..., "host":..., "ok":..., "detail":...}, ...]``, in the
     #: order they actually ran.
     lanes: list[dict] = field(default_factory=list)
-    #: What `coord release verify` said, as its own JSON report.
+    #: What `coord release verify` said, as its own JSON report. The WHOLE
+    #: report, always — scoping the gate (below) must never shrink the record.
     verification: dict | None = None
+    #: :meth:`GateVerdict.to_dict` — which of those findings this run is
+    #: actually accountable for (#2052). This, not ``verification``, is what
+    #: ``--rollback-on-red`` acts on.
+    gate: dict | None = None
     rolled_back: list[str] = field(default_factory=list)
     released_holds: list[str] = field(default_factory=list)
     finished_at: float | None = None
@@ -573,6 +812,31 @@ def render_record(record: PropagationRecord | Mapping[str, Any]) -> list[str]:
                 f"      - [{finding.get('severity')}] {finding.get('host')} "
                 f"{finding.get('lane')}: {finding.get('summary')}"
             )
+
+    # #2052: the gate's scope is part of the answer, not debug output. A run
+    # that was held to lanes it could not roll is exactly the defect this
+    # block exists to make visible the next time it happens.
+    gate = data.get("gate")
+    if gate:
+        blocking = gate.get("blocking") or []
+        advisory = gate.get("advisory") or []
+        lines.append(
+            f"    gate: {gate.get('severity', '?')} "
+            f"({len(blocking)} blocking, {len(advisory)} advisory — "
+            "advisory lanes are ones propagation cannot roll)"
+        )
+        for finding in advisory[:5]:
+            lines.append(
+                f"      ~ advisory [{finding.get('severity')}] "
+                f"{finding.get('host')} {finding.get('lane')}: "
+                f"{finding.get('summary')}"
+            )
+        if gate.get("unrollable"):
+            lines.append(
+                "      ~ no channel from here: "
+                + ", ".join(gate["unrollable"])
+            )
+
     if data.get("rolled_back"):
         lines.append(f"    rolled back: {', '.join(data['rolled_back'])}")
     if data.get("released_holds"):

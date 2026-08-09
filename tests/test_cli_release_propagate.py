@@ -266,7 +266,7 @@ def test_a_fired_deploy_gate_does_not_defer(valid_config_path, state_dir, no_net
 # ── the roll, the final gate, and the rollback on red ────────────────────
 
 
-def _stub_lanes(monkeypatch, *, python_ok=True, calls=None):
+def _stub_lanes(monkeypatch, *, python_ok=True, calls=None, tui_local=None):
     """Replace the three per-lane executors with recorders.
 
     *python_ok* is either a single bool applied to every host, or a
@@ -291,6 +291,9 @@ def _stub_lanes(monkeypatch, *, python_ok=True, calls=None):
 
     def _tui(machine, **kwargs):
         log.append(("tui", machine.name))
+        if tui_local is not None and machine.name != tui_local:
+            # #2052: no channel for this lane here — `ok=None`, never False.
+            return None, "coord-tui is a per-host binary with no remote install path"
         return True, "coord-tui now v0.4.111"
 
     monkeypatch.setattr(release_cmd, "_roll_python", _python)
@@ -506,12 +509,66 @@ def test_release_rollback_hits_every_machine(valid_config_path, monkeypatch):
         return 202, {}, ""
 
     monkeypatch.setattr(release_cmd, "_post", _fake_post)
+    monkeypatch.setattr(release_cmd, "_get",
+                        lambda url, *, timeout: (200, {"version": "0.4.110"}))
     result = CliRunner().invoke(
         main, ["release", "rollback", "--config", str(valid_config_path), "--yes"]
     )
     assert result.exit_code == 0, result.output
     assert len(hit) == 2
     assert all(u.endswith("/rollback") for u in hit)
+    # #2052 fault 1: "rolling back" is a statement about the request. The
+    # outcome is whether the service is serving again.
+    assert "serving again" in result.output
+
+
+def test_a_rollback_that_leaves_the_agent_dead_says_so(valid_config_path, monkeypatch):
+    """#2052 fault 1: precision's coord-agent went `inactive (dead)` at the
+    moment of the rollback and was never restarted — recovery needed a human.
+    A rollback that stops a service and does not restore it leaves the fleet
+    WORSE off than the failed roll did, so it must escalate, and then shout."""
+    monkeypatch.setattr(release_cmd, "_post", lambda *a, **k: (202, {}, ""))
+    monkeypatch.setattr(release_cmd, "_get", lambda url, *, timeout: (None, {}))
+    escalated: list[str] = []
+    monkeypatch.setattr(
+        "coord.commands.agent_ops._escalate_restart",
+        lambda machine: (escalated.append(machine.name), False)[1],
+    )
+    result = CliRunner().invoke(
+        main, ["release", "rollback", "--config", str(valid_config_path), "--yes",
+               "--wait", "1"]
+    )
+    assert result.exit_code == 1, result.output
+    assert "DOWN" in result.output
+    # The documented systemd-stall fix is APPLIED, not merely suggested.
+    assert escalated, "a dead agent must be restarted, not just reported"
+
+
+def test_a_rollback_rescued_by_the_ssh_restart_is_a_success(valid_config_path,
+                                                            monkeypatch):
+    """#404/#1568: `os.execv` does not always take under systemd. The
+    documented fix is an SSH `systemctl --user restart coord-agent` — and a
+    host that came back that way is genuinely back."""
+    monkeypatch.setattr(release_cmd, "_post", lambda *a, **k: (202, {}, ""))
+    answers = iter([(None, {})] * 200)
+    revived = {"yes": False}
+
+    def _fake_get(url, *, timeout):
+        if revived["yes"]:
+            return 200, {"version": "0.4.110"}
+        return next(answers)
+
+    monkeypatch.setattr(release_cmd, "_get", _fake_get)
+    monkeypatch.setattr(
+        "coord.commands.agent_ops._escalate_restart",
+        lambda machine: revived.__setitem__("yes", True) or True,
+    )
+    result = CliRunner().invoke(
+        main, ["release", "rollback", "--config", str(valid_config_path), "--yes",
+               "--wait", "1"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "systemctl --user restart" in result.output
 
 
 def test_release_rollback_reports_a_host_with_no_previous_generation(valid_config_path,
@@ -524,11 +581,224 @@ def test_release_rollback_reports_a_host_with_no_previous_generation(valid_confi
     assert "no previous generation" in result.output
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# #2052: the gate cannot fail for reasons propagation cannot influence
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def test_2026_08_09_a_good_roll_is_not_reverted_by_lanes_it_cannot_roll(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    """The regression, end to end. #2052: every lane propagation *can* roll,
+    rolled — three python lanes, three unit lanes, the one coord-tui it could
+    reach. Verification then came back crit on `~/.coord-cli-venv` (a lane
+    this command has no model of), on the remote `coord-tui` binaries (which
+    it reports itself have NO remote install path) and on the `coord-serve`
+    process — and `--rollback-on-red` reverted the lot. Not a transient
+    failure: it would have happened on every run, forever."""
+    from coord import release_verify as rv
+
+    # `server` is the host this command runs on, so it is the only host whose
+    # coord-tui binary has any install path at all — exactly the shape of the
+    # real run, where 1 of 3 tui lanes could roll.
+    _stub_lanes(monkeypatch, tui_local="server")
+    _stub_verify(
+        monkeypatch,
+        versions={"laptop": ["0.4.110"], "server": ["0.4.110"]},
+        findings=[
+            rv.Finding(severity="crit", host="laptop",
+                       lane="~/.coord-cli-venv (laptop)",
+                       summary="on 0.4.104, expected 0.4.111"),
+            rv.Finding(severity="crit", host="server",
+                       lane="coord-serve process (server)",
+                       summary="on 0.4.104, expected 0.4.111"),
+            rv.Finding(severity="warn", host="laptop", lane="coord-tui",
+                       summary="tui binary is stale"),
+        ],
+    )
+    monkeypatch.setattr(
+        release_cmd, "_rollback_host",
+        lambda *a, **k: pytest.fail(
+            "reverting a good python roll because a per-host binary could "
+            "not be installed remotely is a category error"
+        ),
+    )
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111", "--daemon-host", "server"],
+    )
+    assert result.exit_code == 0, result.output
+    record = _records(state_dir)[0]
+    assert record["status"] == rp.STATUS_VERIFIED
+    # The full report is still journalled verbatim — scoping the gate must
+    # never shrink the record.
+    assert record["verification"]["severity"] == "crit"
+    assert len(record["verification"]["findings"]) == 3
+    # ...and the scoping itself is legible, so a gate that stopped gating
+    # would be visible rather than silent.
+    assert record["gate"]["severity"] == "ok"
+    assert len(record["gate"]["advisory"]) == 3
+    assert "advisory" in result.output
+
+
+def test_a_crit_on_a_lane_this_run_rolled_still_reverts(valid_config_path, state_dir,
+                                                        no_network, monkeypatch):
+    """Scoping the gate is not removing it."""
+    from coord import release_verify as rv
+
+    _stub_lanes(monkeypatch)
+    _stub_verify(
+        monkeypatch,
+        versions={"laptop": ["0.4.110"], "server": ["0.4.110"]},
+        findings=[rv.Finding(severity="crit", host="laptop",
+                             lane="~/.coord-venv (laptop)",
+                             summary="on 0.4.110, expected 0.4.111")],
+    )
+    rolled_back: list[str] = []
+    monkeypatch.setattr(
+        release_cmd, "_rollback_host",
+        lambda machine, **k: (rolled_back.append(machine.name), (True, "back up"))[1],
+    )
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111", "--daemon-host", "server"],
+    )
+    assert result.exit_code == 2, result.output
+    assert sorted(rolled_back) == ["laptop", "server"]
+
+
+def test_the_remote_tui_lane_is_recorded_as_unrollable_not_failed(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    """`coord-tui` is a per-host binary with no remote install path — the
+    command says so in its own failure message. A lane that reports it cannot
+    be rolled from here must not also count as this run going wrong."""
+    _stub_lanes(monkeypatch, tui_local="server")
+    _stub_verify(monkeypatch, versions={"laptop": ["0.4.110"], "server": ["0.4.110"]})
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111", "--daemon-host", "server"],
+    )
+    assert result.exit_code == 0, result.output
+    record = _records(state_dir)[0]
+    laptop_tui = next(
+        l for l in record["lanes"] if l["lane"] == "tui" and l["host"] == "laptop"
+    )
+    assert laptop_tui["ok"] is None
+    assert laptop_tui["unrollable"] is True
+    assert "tui@laptop" in record["gate"]["unrollable"]
+
+
+def test_an_agent_without_deploy_units_is_a_next_run_fact_not_a_red_gate(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    """Bootstrap: an agent that predates /deploy-units gets the endpoint once
+    the python lane lands. That is a fact about the next run, and it must not
+    revert this one."""
+    _stub_lanes(monkeypatch)
+    monkeypatch.setattr(
+        release_cmd, "_roll_units",
+        lambda machine, **k: (None, "agent has no /deploy-units yet"),
+    )
+    _stub_verify(monkeypatch, versions={"laptop": ["0.4.110"], "server": ["0.4.110"]})
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111", "--daemon-host", "server"],
+    )
+    assert result.exit_code == 0, result.output
+    record = _records(state_dir)[0]
+    assert all(
+        l["unrollable"] is True
+        for l in record["lanes"] if l["lane"] == "units"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# #2052 fault 2: the daemon host is derived, or the run refuses
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def test_the_daemon_host_is_derived_from_the_fleets_own_health(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    """No --daemon-host flag, and it still leads: `server` is the machine
+    whose /health reports a running coord-serve."""
+    calls = _stub_lanes(monkeypatch)
+    _stub_verify(monkeypatch, versions={"laptop": ["0.4.110"], "server": ["0.4.110"]},
+                 daemon="server")
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111"],
+    )
+    assert result.exit_code == 0, result.output
+    assert calls[0] == ("python", "server")
+
+
+def test_an_unidentifiable_daemon_host_refuses_instead_of_guessing(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    """#2052 fault 2: this used to warn and roll in coordinator.yml order,
+    which during a partial revert briefly left the daemon host BEHIND both
+    its callers — the documented 405 hazard the warning itself named.
+    Ordering is the one thing protecting against that."""
+    _stub_lanes(
+        monkeypatch,
+        calls=None,
+    )
+    monkeypatch.setattr(
+        release_cmd, "_roll_python",
+        lambda *a, **k: pytest.fail("an unorderable run must not roll anything"),
+    )
+    monkeypatch.setattr(release_cmd, "_daemon_machine_name", lambda *a, **k: None)
+    _stub_verify(monkeypatch, versions={"laptop": ["0.4.110"], "server": ["0.4.110"]},
+                 daemon=None)
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111"],
+    )
+    assert result.exit_code == 1, result.output
+    record = _records(state_dir)[0]
+    assert record["status"] == rp.STATUS_FAILED
+    assert "REFUSING" in record["error"]
+    assert "405" in record["error"]
+
+
 # ── helpers ──────────────────────────────────────────────────────────────
 
 
-def _stub_verify(monkeypatch, *, versions: dict[str, list[str]], severity: str = "ok"):
-    """Replace `coord.release_verify`'s fleet sweep with a canned lane set."""
+def _serve_health(host: str) -> dict:
+    """A ``/health`` body whose ``spawned_coord`` rows name a live coord-serve.
+
+    #2052 fault 2: this is how the daemon host is *derived* rather than
+    guessed. Stubbing `gather` with an empty machine_health used to leave
+    propagation unable to name the daemon at all, which is precisely the
+    state that let it roll in coordinator.yml order and briefly put the
+    daemon behind both its callers.
+    """
+    return {
+        "version": "0.4.111",
+        "health": {"schema": 1, "results": [
+            {"check_id": "spawned_coord", "subject": "coord-serve",
+             "severity": "ok", "values": {"unit": "coord-serve", "pid": 1,
+                                          "version": "0.4.111"}},
+        ]},
+    }
+
+
+def _stub_verify(monkeypatch, *, versions: dict[str, list[str]], severity: str = "ok",
+                 daemon: str | None = "server", findings=None):
+    """Replace `coord.release_verify`'s fleet sweep with a canned lane set.
+
+    *daemon* is the machine whose ``/health`` reports a running coord-serve —
+    the fact `_daemon_machine_name` derives the roll order from. Pass None to
+    model a fleet nothing can name a daemon for (which now REFUSES to roll).
+    """
     from coord import release_verify as rv
 
     lanes = [
@@ -536,12 +806,20 @@ def _stub_verify(monkeypatch, *, versions: dict[str, list[str]], severity: str =
         for host, vs in versions.items()
         for v in vs
     ]
-    findings = (
-        [rv.Finding(severity="crit", host="?", lane="?", summary="stubbed")]
-        if severity == "crit"
-        else []
-    )
-    monkeypatch.setattr(rv, "gather", lambda *a, **k: ({}, {}, None, "daemon"))
+    if findings is None:
+        findings = (
+            # #2052: a crit the gate can actually attribute to this run. A
+            # finding on a lane propagation cannot roll is advisory, and
+            # tests that want THAT say so explicitly.
+            [rv.Finding(severity="crit", host=host, lane=f"~/.coord-venv ({host})",
+                        summary="stubbed")
+             for host in sorted(versions)]
+            if severity == "crit"
+            else []
+        )
+    machine_health = {daemon: _serve_health(daemon)} if daemon else {}
+    monkeypatch.setattr(rv, "gather",
+                        lambda *a, **k: (machine_health, {}, None, daemon or "daemon"))
     monkeypatch.setattr(
         rv, "verify",
         lambda **kwargs: rv.VerifyReport(

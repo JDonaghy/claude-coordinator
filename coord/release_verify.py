@@ -364,6 +364,39 @@ def findings_for_host(host: str, health: dict | None) -> list[Finding]:
     return out
 
 
+#: The systemd user unit that IS the daemon. A machine whose ``spawned_coord``
+#: check reports a row for this unit is, by definition, the machine running
+#: ``coord-serve`` — that check only emits a row per unit it found *running*
+#: (see :func:`coord.health.checks.spawned_coord.running_unit_pids`).
+DAEMON_UNIT = "coord-serve"
+
+
+def daemon_host_from_health(machine_health: dict[str, dict | None]) -> str | None:
+    """Which machine actually runs ``coord-serve``, derived — never guessed.
+
+    #2052 fault 2: ``coord release propagate`` could not identify the daemon
+    host and fell back to ``coordinator.yml`` order, which during a partial
+    revert put the daemon *behind* its callers — precisely the 405 hazard the
+    lane order exists to prevent. The daemon host is not a mystery: it is the
+    machine with a running ``coord-serve``, and every agent already publishes
+    exactly that fact in its own ``/health`` (``spawned_coord`` emits one row
+    per *running* coord unit).
+
+    Returns ``None`` when nobody reports one **or when more than one machine
+    does** — two live daemons is a fault in its own right, and a caller that
+    must order a roll around "the" daemon should refuse rather than pick one.
+    """
+    found = [
+        host
+        for host in sorted(machine_health)
+        if any(
+            (row.get("subject") or (row.get("values") or {}).get("unit")) == DAEMON_UNIT
+            for row in _rows(machine_health[host], "spawned_coord")
+        )
+    ]
+    return found[0] if len(found) == 1 else None
+
+
 def daemon_lanes(daemon_host: dict | None, *, host: str = "daemon") -> list[Lane]:
     """The lanes only the ``coord-serve`` process itself can report.
 
@@ -480,22 +513,47 @@ def verify(
                     ),
                 )
             )
-    elif len(versions) > 1:
+    else:
         # No --expected: skew alone is the finding. This is the 2026-08-04
         # shape — nobody knew what to expect, but two lanes disagreeing was
         # already conclusive.
-        spread = "; ".join(
-            f"{v}: {', '.join(labels)}" for v, labels in sorted(versions.items())
-        )
-        report.findings.append(
-            Finding(
-                severity="crit",
-                host="(fleet)",
-                lane="(version skew)",
-                summary=f"{len(versions)} versions live across the fleet",
-                detail=spread,
+        if len(versions) > 1:
+            spread = "; ".join(
+                f"{v}: {', '.join(labels)}" for v, labels in sorted(versions.items())
             )
-        )
+            report.findings.append(
+                Finding(
+                    severity="crit",
+                    host="(fleet)",
+                    lane="(version skew)",
+                    summary=f"{len(versions)} versions live across the fleet",
+                    detail=spread,
+                )
+            )
+        elif versions:
+            # #2035 item 4, demonstrated by #2052: after a botched
+            # propagation reverted the whole fleet to 0.4.104 while `main`
+            # was four releases ahead, this command reported `crit=0` — it
+            # compares the fleet against *itself*, so **uniform staleness
+            # reads as health**. A skew-only run can never see that, and
+            # must therefore never render as a clean bill of health.
+            report.findings.append(
+                Finding(
+                    severity="unknown",
+                    host="(fleet)",
+                    lane="(expected version)",
+                    summary=(
+                        "no expected version to grade against — a fleet that "
+                        "is uniformly BEHIND reads as clean here"
+                    ),
+                    detail=(
+                        f"every lane agrees on {next(iter(sorted(versions)))}, "
+                        "but nothing here knows whether that is the released "
+                        "version. Pass --expected vX.Y.Z, or --pypi to resolve "
+                        "it from the simple index."
+                    ),
+                )
+            )
 
     report.findings.sort(key=lambda f: (-f.rank, f.host, f.lane))
     return report
@@ -552,6 +610,14 @@ def gather(
         health[machine.name] = getattr(status, "health", None)
 
     daemon_host, daemon_name = _daemon_facts(board_payload)
+    # #2052 fault 2: label the daemon's lane with the machine that actually
+    # runs it whenever the fleet's own health says which one that is. The
+    # literal "daemon" placeholder is a last resort, not a name — a lane
+    # labelled after nothing cannot be matched to a host by anything
+    # downstream (which is how propagation ended up guessing at config order).
+    derived = daemon_host_from_health(health)
+    if derived:
+        daemon_name = derived
     return health, unreachable, daemon_host, daemon_name
 
 
