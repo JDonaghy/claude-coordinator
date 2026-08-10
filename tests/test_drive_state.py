@@ -1053,3 +1053,38 @@ def test_fetch_local_issue_rows_fail_soft_on_an_unreadable_table(monkeypatch, tm
     payload = BoardFetcher(cache_dir=tmp_path).fetch()
     assert payload["issues"] == []
     assert payload["milestone_work_orders"] == []
+
+
+# ── #2024: the per-issue Test-stage policy the driver has to be able to see ──
+
+
+@pytest.mark.parametrize(
+    "labels,expected",
+    [
+        (["enhancement", "test-mode:smoke"], "smoke"),
+        (["test-mode:auto"], "auto"),
+        (["enhancement"], ""),
+        ([], ""),
+        # Both set: `auto` wins, matching `coord.state._get_issue_test_mode_local`
+        # exactly — an explicit opt-in to the headless path beats the default.
+        (["test-mode:smoke", "test-mode:auto"], "auto"),
+    ],
+)
+def test_project_reads_the_issue_test_mode_from_labels(labels, expected):
+    """The driver reads the SAME `test-mode:*` labels
+    `coord.smoke.dispatch_pending_smoke` gates on. Without it, a completed row
+    with no test verdict is ambiguous: "the daemon dispatches next tick"
+    (poll) vs "the headless Test stage is off for this issue, so nothing will
+    ever dispatch" (dead end — vimcode#635, #2024)."""
+    payload = {
+        "assignments": [],
+        "issues": [{"repo_name": REPO, "number": 1392, "labels": labels}],
+    }
+    assert project(payload, REPO, 1392, make_config()).issue_test_mode == expected
+
+
+def test_project_test_mode_is_empty_when_the_issue_is_not_cached():
+    """Fails OPEN onto "no policy set" — never onto a policy nobody asked
+    for."""
+    state = project({"assignments": [], "issues": []}, REPO, 1392, make_config())
+    assert state.issue_test_mode == ""

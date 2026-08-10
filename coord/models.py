@@ -312,6 +312,47 @@ CLOSES_ISSUE_TYPES: frozenset[str] = frozenset({"work"})
 # which must also list it since it mutates GitHub via `gh pr create`.
 PR_HELPER_TYPE = "pr-helper"
 
+# #685: the per-issue Test-stage POLICY labels, and the one pure function that
+# reads them. ``test-mode:auto`` → the headless Test stage auto-dispatches
+# (`coord.smoke.dispatch_pending_smoke`); ``test-mode:smoke`` → it deliberately
+# does NOT, because the Test stage for that issue is human-attended (the TUI
+# offers an interactive smoke agent instead); no label → back-compat, respect
+# ``smoke_tests.auto_queue``.
+#
+# #2024: this used to be an inline pair of `in labels` checks inside
+# ``coord.state._get_issue_test_mode_local`` and nowhere else, because only the
+# dispatcher ever asked. The DRIVER has to ask too — a `test-mode:smoke` issue
+# is precisely the shape where a completed fix round's Test stage will never be
+# dispatched by anything automatic (``coord.dead_end`` shape 3), and a driver
+# that can't see the policy counts "no state change" against a transition that
+# is never coming (vimcode#635: 25 min, then 160 min, on one issue). Hoisted
+# here — import-light, no DB — so the dispatcher's reading and the driver's
+# reading are the same three lines and cannot drift.
+TEST_MODE_AUTO_LABEL = "test-mode:auto"
+TEST_MODE_SMOKE_LABEL = "test-mode:smoke"
+
+
+def test_mode_from_labels(labels) -> str | None:
+    """``"auto"`` / ``"smoke"`` / ``None`` for an issue's GitHub *labels*.
+
+    ``auto`` wins when both are present (an explicit opt-in to the headless
+    path beats the human-attended default), matching the original
+    ``_get_issue_test_mode_local`` ordering exactly. Tolerates ``None`` and
+    any non-list input by returning ``None`` — every caller here fails OPEN
+    onto "no policy set", never onto a policy nobody asked for.
+    """
+    if not labels:
+        return None
+    try:
+        names = list(labels)
+    except TypeError:
+        return None
+    if TEST_MODE_AUTO_LABEL in names:
+        return "auto"
+    if TEST_MODE_SMOKE_LABEL in names:
+        return "smoke"
+    return None
+
 
 @dataclass
 class Assignment:

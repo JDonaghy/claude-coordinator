@@ -1813,3 +1813,31 @@ def test_redispatch_keeps_the_entry_mergeable(
         http_client=_FakeClient({"id": "smoke-third"}),
         diff_lookup=lambda repo, branch: ["src/gtk/window.c"],
     ) is None
+
+
+def test_dispatch_pending_smoke_says_why_it_skipped_test_mode_smoke(
+    gtk_and_server_config: Config, monkeypatch, caplog,
+) -> None:
+    """#2024: the `test-mode:smoke` skip is correct but was completely SILENT,
+    and silence is what dead-ends an unattended `--fix-of` round — review
+    dispatch is held until this row carries a passed/skipped verdict
+    (`pipeline.test_precedes_review`) and, under this policy, no automatic
+    component will ever record one. The log line has to name the row and the
+    two commands that clear it (vimcode#635: 25 min, then 160 min, each
+    cleared by hand)."""
+    import logging
+
+    monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: "smoke")
+
+    board = Board(completed=[_completed()])
+    with caplog.at_level(logging.INFO, logger="coord.smoke"):
+        assert dispatch_pending_smoke(board, gtk_and_server_config) == []
+
+    msg = "\n".join(r.getMessage() for r in caplog.records)
+    assert "test-mode:smoke" in msg
+    assert "abc123" in msg          # the row an operator has to act on
+    assert "coord test" in msg      # ...and how
+    assert "--smoke-of" in msg
+    # The policy itself is untouched: still no dispatch, no verdict invented.
+    assert board.active == []
+    assert board.completed[0].test_state is None

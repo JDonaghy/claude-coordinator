@@ -615,3 +615,91 @@ class TestFormatting:
         review = _review("w1", verdict="approve")
         board = Board(active=[], completed=[work, review])
         build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+
+
+# ── #2024: `coord gates` vs the driver — same branch, two different rows ────
+
+
+class TestFixRoundTestGateAttribution:
+    """The #2024 reading gap, live on JDonaghy/vimcode#635 (2026-08-08).
+
+    A `--fix-of` round is a NEW work row on the SAME branch, carrying its own
+    empty ``test_state``. The merge gate is branch-scoped by design (#1819: a
+    Test run measures the ``(branch, base)`` pair), so it is satisfied by the
+    PARENT's verdict and ``coord gates`` printed a bare ``test : passed`` —
+    while ``coord drive`` and ``dispatch_pending_reviews``, which gate on the
+    CURRENT row's own verdict, correctly held on ``test=-``. Neither reading
+    was wrong; the summary was silent about which row it described, and that
+    silence is what turned a blocked pipeline into an invisible one (25
+    minutes, then 160).
+    """
+
+    def _fix_chain(self):
+        """work (test passed) → review request-changes → fix round, untested,
+        all on ONE branch."""
+        parent = _work(aid="8965c04", test_state="passed", dispatched_at=1.0)
+        review = _review("8965c04", aid="b4f2741", verdict="request-changes",
+                         dispatched_at=2.0)
+        fix = _work(aid="78cfb47", test_state=None, dispatched_at=3.0)
+        fix.review_of_assignment_id = "8965c04"
+        fix.review_iteration = 1
+        return parent, review, fix
+
+    def test_test_decision_names_the_row_that_supplied_the_verdict(
+        self, config: Config,
+    ) -> None:
+        parent, review, fix = self._fix_chain()
+        review.review_verdict = "approve"  # so only the TEST gate is at issue
+        board = Board(active=[], completed=[parent, review, fix])
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+
+        test = {d.gate: d for d in report.decisions}["test"]
+        assert test.ok is True
+        # The verdict is the PARENT's, and the report now says so.
+        assert test.assignment_id == "8965c04"
+
+    def test_note_states_the_current_row_has_no_verdict_of_its_own(
+        self, config: Config,
+    ) -> None:
+        parent, review, fix = self._fix_chain()
+        review.review_verdict = "approve"
+        board = Board(active=[], completed=[parent, review, fix])
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+
+        note = next((n for n in report.notes if "#2024" in n), None)
+        assert note is not None, report.notes
+        assert "8965c04" in note      # where the verdict came from
+        assert "78cfb47" in note      # the row the driver is actually gating on
+        assert "coord test 78cfb47 --passed" in note
+
+    def test_no_note_when_the_current_row_carries_its_own_verdict(
+        self, config: Config,
+    ) -> None:
+        """The ordinary case — every round tested — must stay quiet, or the
+        note becomes noise nobody reads."""
+        parent, review, fix = self._fix_chain()
+        review.review_verdict = "approve"
+        fix.test_state = "passed"
+        board = Board(active=[], completed=[parent, review, fix])
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+
+        assert not any("#2024" in n for n in report.notes)
+
+    def test_no_note_on_a_single_row_issue(self, config: Config) -> None:
+        work = _work(test_state="passed")
+        review = _review("w1", verdict="approve")
+        board = Board(active=[], completed=[work, review])
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+
+        assert not any("#2024" in n for n in report.notes)
+
+    def test_format_prints_the_row_the_verdict_was_recorded_on(
+        self, config: Config,
+    ) -> None:
+        parent, review, fix = self._fix_chain()
+        review.review_verdict = "approve"
+        board = Board(active=[], completed=[parent, review, fix])
+        report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
+
+        text = format_gate_report(report)
+        assert "test   : passed (recorded on 8965c04)" in text

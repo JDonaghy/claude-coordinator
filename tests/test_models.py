@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from coord.models import Assignment, Board, Machine, Repo
 
 
@@ -104,3 +106,35 @@ def test_machine_can_work_on() -> None:
     m = Machine(name="laptop", host="h", repos=["api"])
     assert m.can_work_on("api")
     assert not m.can_work_on("other")
+
+
+# ── #685/#2024: the per-issue Test-stage policy label ────────────────────────
+
+
+def test_test_mode_from_labels_reads_both_policies():
+    from coord.models import test_mode_from_labels
+
+    assert test_mode_from_labels(["enhancement", "test-mode:smoke"]) == "smoke"
+    assert test_mode_from_labels(["test-mode:auto"]) == "auto"
+
+
+def test_test_mode_from_labels_prefers_auto_when_both_are_present():
+    """Preserves `coord.state._get_issue_test_mode_local`'s original ordering
+    exactly — this function was hoisted out of it (#2024) so the dispatcher's
+    reading and the driver's reading cannot drift, which only holds if the
+    hoist changed no behaviour."""
+    from coord.models import test_mode_from_labels
+
+    assert test_mode_from_labels(["test-mode:smoke", "test-mode:auto"]) == "auto"
+
+
+@pytest.mark.parametrize("labels", [None, [], ["enhancement"], 7, "test-mode:smoke"])
+def test_test_mode_from_labels_fails_open(labels):
+    """Anything that isn't an explicit policy label reads as "no policy set" —
+    never as a policy nobody asked for. A bare string is deliberately included:
+    `"test-mode:smoke" in "test-mode:smoke"` is True for a substring check, and
+    a policy inferred from a stray string would silently switch the headless
+    Test stage off for an issue."""
+    from coord.models import test_mode_from_labels
+
+    assert test_mode_from_labels(labels) is None

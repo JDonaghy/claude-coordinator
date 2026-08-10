@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any
 
 from coord.merge_queue import is_ci_infra_reason
-from coord.models import WORK_LIKE_TYPES
+from coord.models import WORK_LIKE_TYPES, test_mode_from_labels
 
 # Assignment types that can carry the Test/Review gates for an issue.  Sourced
 # from coord.models so this never drifts from the source of truth (#1141 was
@@ -151,6 +151,20 @@ class IssueState:
     acceptance_author_status: str = ""
     acceptance_author_branch: str = ""
     acceptance_author_machine: str = ""
+
+    # #2024/#685: the issue's Test-stage POLICY, read from the same
+    # `test-mode:*` labels `coord.smoke.dispatch_pending_smoke` gates on
+    # (`coord.models.test_mode_from_labels` — one shared reading, no drift).
+    #   ""       → no label: the headless Test stage auto-dispatches per
+    #              `smoke_tests.auto_queue`.
+    #   "auto"   → same, explicitly opted in.
+    #   "smoke"  → the headless path deliberately SKIPS this issue; the Test
+    #              stage is human-attended (the TUI's interactive smoke agent).
+    # The driver needs this because a completed row with no test verdict means
+    # two opposite things depending on it: "the daemon will dispatch on the
+    # next tick" (poll) vs "nothing automatic will EVER dispatch" (dead end —
+    # `coord.dead_end` shape 3).
+    issue_test_mode: str = ""
 
     # ── derived ──────────────────────────────────────────────────────────
     @property
@@ -339,6 +353,11 @@ def project(payload: dict, repo: str, issue: int, config: Any) -> IssueState:
         picked_machine_no_capable=_machine_pick.no_capable_machine,
         milestone_number=milestone_number,
         milestone_tracking_issue=milestone_tracking_issue,
+        # #2024: the per-issue Test-stage policy, off the labels already read
+        # above (no extra I/O). `test_mode_from_labels` is the same function
+        # `coord.state._get_issue_test_mode_local` uses, so the driver and the
+        # dispatcher cannot disagree about what the label means.
+        issue_test_mode=test_mode_from_labels(issue_labels) or "",
         acceptance_author_aid=g(acceptance_author, "assignment_id"),
         acceptance_author_status=g(acceptance_author, "status"),
         acceptance_author_branch=g(acceptance_author, "branch"),
