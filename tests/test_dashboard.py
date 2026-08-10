@@ -990,12 +990,16 @@ class TestPipelineReviewFindings:
     """Tests that GET /api/pipeline includes review_verdict and review_findings_body."""
 
     def _board_with_review(self) -> "Board":
+        # #2066: recent, not epoch, timestamps — /api/pipeline now bounds its
+        # default response to a recency window, and these tests are about the
+        # review-verdict fields, not about that window.
+        now = time.time()
         work = Assignment(
             machine_name="laptop", repo_name="api",
             issue_number=42, issue_title="Fix auth",
             assignment_id="work001", status="done",
             branch="issue-42-fix-auth",
-            finished_at=1.0,
+            finished_at=now,
         )
         review = Assignment(
             machine_name="laptop", repo_name="api",
@@ -1004,8 +1008,8 @@ class TestPipelineReviewFindings:
             type="review",
             review_of_assignment_id="work001",
             review_verdict="approve",
-            review_posted_at=2.0,
-            finished_at=2.0,
+            review_posted_at=now,
+            finished_at=now,
         )
         return Board(active=[], completed=[work, review])
 
@@ -1035,7 +1039,7 @@ class TestPipelineReviewFindings:
             machine_name="laptop", repo_name="api",
             issue_number=99, issue_title="Standalone",
             assignment_id="work002", status="done",
-            finished_at=1.0,
+            finished_at=time.time(),
         )
         board = Board(active=[], completed=[work])
         client = _client()
