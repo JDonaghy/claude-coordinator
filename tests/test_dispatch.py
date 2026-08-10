@@ -29,6 +29,31 @@ from coord.dispatch import (
 from coord.models import Machine, Proposal, Repo
 
 
+@pytest.fixture(autouse=True)
+def _gate_a_signed_off():
+    """#2063: record the Gate-A human verdict these tests' fixtures imply.
+
+    Every oracle-gate test in this module predates the sign-off gate and
+    uses the literal ``"contract body"`` as the milestone's contract, with
+    Gate A "satisfied" meaning only "the file exists". Approving exactly
+    that content keeps them exercising the #1138/#1314 gates they were
+    written for instead of tripping over the newer one — which has its own
+    coverage in tests/test_gate_a.py. A no-driver repo never reaches this
+    lookup at all, so the patch is inert for the rest of the module.
+    """
+    from coord.gate_a import contract_digest, make_record
+
+    record = make_record(
+        repo_name="api",
+        milestone_number=37,
+        verdict="approved",
+        contract_sha=contract_digest("contract body"),
+        now=1000.0,
+    ).to_dict()
+    with patch("coord.state.get_gate_a_approval", return_value=record):
+        yield
+
+
 @pytest.fixture
 def config() -> Config:
     return Config(

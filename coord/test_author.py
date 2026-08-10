@@ -42,7 +42,11 @@ from coord.acceptance import ACCEPTANCE_DIRNAME
 from coord.config import Config
 from coord.dispatch import AGENT_PORT
 from coord.machine_pause import paused_set
-from coord.milestone_dispatch import MilestoneDispatchError, fetch_milestone_context
+from coord.milestone_dispatch import (
+    MilestoneDispatchError,
+    fetch_milestone_context,
+    gate_a_signoff_status,
+)
 from coord.models import Assignment, Machine
 
 # The test-author never needs `gh` — every fact it needs (tracking issue,
@@ -384,6 +388,18 @@ def dispatch_test_author(
             f"#{ctx.milestone_number}'s work order (tracking issue #{tracking_issue})"
         )
 
+    # #2063: refuse to author a sealed slice against a contract no human has
+    # signed off on. This is the path that actually burned money on
+    # coord-portal ms-2 — an independent test-author authored ~$2.70 of
+    # sealed suite against an unapproved surface, and it happened to be a
+    # good contract by luck, not process. The strings a contract pins
+    # (button text, data-testid hooks, status vocabulary) become assertions
+    # the worker may never edit, so a wrong one is not cosmetic: it is a
+    # suite that enforces the wrong product.
+    signoff_refusal = gate_a_signoff_status(repo_cfg, config, ctx.milestone_number)
+    if signoff_refusal is not None:
+        raise RuntimeError(signoff_refusal)
+
     if machine_override:
         machine = next(
             (m for m in config.machines if m.name == machine_override), None
@@ -680,6 +696,18 @@ def dispatch_test_author_interactive(
             f"issue #{issue_number} is not a member of milestone "
             f"#{ctx.milestone_number}'s work order (tracking issue #{tracking_issue})"
         )
+
+    # #2063: refuse to author a sealed slice against a contract no human has
+    # signed off on. This is the path that actually burned money on
+    # coord-portal ms-2 — an independent test-author authored ~$2.70 of
+    # sealed suite against an unapproved surface, and it happened to be a
+    # good contract by luck, not process. The strings a contract pins
+    # (button text, data-testid hooks, status vocabulary) become assertions
+    # the worker may never edit, so a wrong one is not cosmetic: it is a
+    # suite that enforces the wrong product.
+    signoff_refusal = gate_a_signoff_status(repo_cfg, config, ctx.milestone_number)
+    if signoff_refusal is not None:
+        raise RuntimeError(signoff_refusal)
 
     if machine_override:
         machine = next(

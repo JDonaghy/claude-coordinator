@@ -352,6 +352,77 @@ class TestIssueOracleReadyGateA:
         assert r.reason is None
 
 
+# ── gate_a_signoff_status: the milestone-level wrapper ──────────────────────
+
+
+class TestGateASignoffStatus:
+    """The seam `coord acceptance author` gates on — the path that actually
+    burned money on coord-portal ms-2 (a sealed slice authored against an
+    unapproved contract)."""
+
+    def _status(self, *, contract: str | None, approval):
+        from coord.milestone_dispatch import gate_a_signoff_status
+
+        files = {MANIFEST_PATH: "tests:\n  ms37::a: 1118\n"}
+        if contract is not None:
+            files[CONTRACT_PATH] = contract
+        return gate_a_signoff_status(
+            _cfg().repo("api"),
+            _cfg(),
+            37,
+            fetch_manifest=_fetch(files),
+            fetch_gate_a_approval=lambda *a: approval,
+        )
+
+    def test_refuses_without_a_verdict(self) -> None:
+        reason = self._status(contract=CONTRACT_V1, approval=None)
+        assert reason is not None
+        assert "coord gate-a --approved api" in reason
+
+    def test_passes_with_a_matching_verdict(self) -> None:
+        assert self._status(
+            contract=CONTRACT_V1, approval=_approved(CONTRACT_V1)
+        ) is None
+
+    def test_refuses_after_an_amend(self) -> None:
+        assert self._status(
+            contract=CONTRACT_V2, approval=_approved(CONTRACT_V1)
+        ) is not None
+
+    def test_no_contract_is_gate_a_status_s_refusal_not_this_one(self) -> None:
+        assert self._status(contract=None, approval=None) is None
+
+    def test_no_driver_is_a_no_op(self) -> None:
+        from coord.milestone_dispatch import gate_a_signoff_status
+
+        cfg = Config(repos=[Repo(name="api", github="acme/api")], machines=[])
+        assert gate_a_signoff_status(cfg.repo("api"), cfg, 37) is None
+
+    def test_contract_is_fetched_once(self) -> None:
+        """The existence probe and the content read share one memoised
+        fetch — otherwise every call pulls contract.md twice over `gh`."""
+        from coord.milestone_dispatch import gate_a_signoff_status
+
+        calls: list[str] = []
+
+        def _f(repo_github: str, path: str, branch: str) -> str | None:
+            calls.append(path)
+            if path == CONTRACT_PATH:
+                return CONTRACT_V1
+            if path == MANIFEST_PATH:
+                return "tests:\n  ms37::a: 1118\n"
+            return None
+
+        gate_a_signoff_status(
+            _cfg().repo("api"),
+            _cfg(),
+            37,
+            fetch_manifest=_f,
+            fetch_gate_a_approval=lambda *a: _approved(CONTRACT_V1),
+        )
+        assert calls.count(CONTRACT_PATH) == 1
+
+
 # ── the manifest opt-out ────────────────────────────────────────────────────
 
 
@@ -377,6 +448,134 @@ class TestManifestGateAKey:
         from coord.acceptance import parse_manifest_text
 
         assert parse_manifest_text("gate_a: [1, 2]\n").gate_a_exempt is False
+
+
+# ── persistence + the daemon seam ───────────────────────────────────────────
+
+
+class TestPersistence:
+    def test_upsert_replaces_the_milestones_verdict(self, coord_db) -> None:
+        from coord.state import list_gate_a_approvals, save_gate_a_approval
+
+        save_gate_a_approval(_approved(CONTRACT_V1, verdict="changes"))
+        save_gate_a_approval(_approved(CONTRACT_V2))
+        rows = list_gate_a_approvals()
+        assert len(rows) == 1
+        assert rows[0]["verdict"] == "approved"
+        assert rows[0]["contract_sha"] == gate_a.contract_digest(CONTRACT_V2)
+
+    def test_verdicts_for_different_milestones_coexist(self, coord_db) -> None:
+        from coord.state import get_gate_a_approval, save_gate_a_approval
+
+        save_gate_a_approval(_approved(CONTRACT_V1))
+        other = _approved(CONTRACT_V1)
+        other["milestone_number"] = 38
+        save_gate_a_approval(other)
+        assert get_gate_a_approval(repo_name="api", milestone_number=37) is not None
+        assert get_gate_a_approval(repo_name="api", milestone_number=38) is not None
+        assert get_gate_a_approval(repo_name="api", milestone_number=99) is None
+
+    def test_record_without_a_key_is_rejected(self, coord_db) -> None:
+        from coord.state import _save_gate_a_approval_local
+
+        with pytest.raises(ValueError):
+            _save_gate_a_approval_local({"verdict": "approved"})
+
+    def test_write_routes_to_the_daemon_when_configured(self, monkeypatch) -> None:
+        """A thin client must not write a verdict into a local DB nobody
+        reads — same posture as `save_milestone_gate` (#1929)."""
+        from coord import client as cc
+        from coord import state
+
+        monkeypatch.setattr(
+            cc,
+            "resolve_board_service",
+            lambda *a, **k: cc.ServiceConfig("http://d:7435"),
+        )
+        captured: dict = {}
+        monkeypatch.setattr(
+            cc,
+            "post_record",
+            lambda svc, path, payload, **kw: captured.update(
+                path=path, payload=payload
+            )
+            or {"ok": True},
+        )
+        record = _approved(CONTRACT_V1)
+        state.save_gate_a_approval(record)
+        assert captured["path"] == "/gate-a-approval"
+        assert captured["payload"] == {"record": record}
+        assert state.list_gate_a_approvals() == []  # routed → no local write
+
+    def test_unreachable_daemon_reads_as_no_verdict(self, monkeypatch) -> None:
+        """Fails CLOSED: "couldn't ask" collapsing to "no verdict" makes the
+        guard refuse, which is the safe direction for this gate."""
+        import httpx
+
+        from coord import client as cc
+
+        def _boom(*a, **k):
+            raise httpx.ConnectError("nope")
+
+        monkeypatch.setattr(cc.httpx, "get", _boom)
+        assert (
+            cc.fetch_gate_a_approval(cc.ServiceConfig("http://d:7435"), "api", 37)
+            is None
+        )
+
+
+def test_daemon_gate_a_approval_endpoints(tmp_path) -> None:
+    """#2063: POST/GET `/gate-a-approval` — the thin-client seam, mirroring
+    `/milestone-gate`."""
+    import sqlite3
+
+    from starlette.testclient import TestClient
+
+    from coord import db, state
+    from coord.config import load as load_config
+    from coord.dao import SqliteStore
+    from coord.db import _ensure_schema
+    from coord.serve_app import build_app
+
+    cfg_path = tmp_path / "coordinator-gate-a.yml"
+    cfg_path.write_text(
+        "repos:\n  - name: api\n    github: acme/api\n\n"
+        "machines:\n  - name: laptop\n    host: laptop.tailnet\n"
+        "    repos: [api]\n    repo_paths:\n      api: /tmp/api\n"
+    )
+    db_path = tmp_path / "board.db"
+    conn = sqlite3.connect(str(db_path), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    _ensure_schema(conn)
+    conn.commit()
+    db.override_connection(conn)
+
+    record = _approved(CONTRACT_V1)
+    app = build_app(SqliteStore(db_path), load_config(cfg_path))
+    with TestClient(app) as cli:
+        missing = cli.get(
+            "/gate-a-approval", params={"repo_name": "api", "milestone_number": 37}
+        )
+        ok = cli.post("/gate-a-approval", json={"record": record})
+        bad = cli.post("/gate-a-approval", json={"record": "not-an-object"})
+        found = cli.get(
+            "/gate-a-approval", params={"repo_name": "api", "milestone_number": 37}
+        )
+        other = cli.get(
+            "/gate-a-approval", params={"repo_name": "api", "milestone_number": 99}
+        )
+        bad_params = cli.get("/gate-a-approval", params={"repo_name": "api"})
+
+    assert missing.json() == {"entries": []}
+    assert ok.status_code == 200
+    assert bad.status_code == 400
+    assert found.json()["entries"] == [record]
+    assert other.json() == {"entries": []}
+    assert bad_params.status_code == 400
+    assert (
+        state._get_gate_a_approval_local(repo_name="api", milestone_number=37)
+        == record
+    )
 
 
 # ── the drive-queue disposition (#2040: park, never terminal `blocked`) ─────
@@ -471,6 +670,62 @@ class TestDriveQueueParksNotBlocks:
         assert len(resumed) == 1
         assert resumed[0].updates["state"] == STATE_WAITING
         assert "#2063" in resumed[0].reason
+
+    def test_shell_resolver_keeps_an_unchanged_verdict_parked(
+        self, coord_db
+    ) -> None:
+        """`_fetch_gate_a_pending` is the shell half: it re-reads the
+        recorded verdict for the (repo, milestone) in the park marker."""
+        from coord.commands.drive_queue import _fetch_gate_a_pending
+        from coord.drive_queue import STATE_PARKED
+
+        entry = self._entry(
+            state=STATE_PARKED,
+            last_reason=f"... {gate_a.park_marker('api', 37, gate_a.NO_VERDICT)}",
+        )
+        assert _fetch_gate_a_pending([entry]) == {entry.key: True}
+
+    def test_shell_resolver_clears_once_a_verdict_is_recorded(
+        self, coord_db
+    ) -> None:
+        from coord.commands.drive_queue import _fetch_gate_a_pending
+        from coord.drive_queue import STATE_PARKED
+        from coord.state import save_gate_a_approval
+
+        entry = self._entry(
+            state=STATE_PARKED,
+            last_reason=f"... {gate_a.park_marker('api', 37, gate_a.NO_VERDICT)}",
+        )
+        save_gate_a_approval(_approved(CONTRACT_V1))
+        assert _fetch_gate_a_pending([entry]) == {entry.key: False}
+
+    def test_shell_resolver_re_parks_after_a_changes_verdict(
+        self, coord_db
+    ) -> None:
+        """A `--changes` verdict refuses too. Once the entry has re-parked
+        AGAINST that verdict, it must stay parked — otherwise the queue
+        relaunches into the identical refusal every tick."""
+        from coord.commands.drive_queue import _fetch_gate_a_pending
+        from coord.drive_queue import STATE_PARKED
+        from coord.state import save_gate_a_approval
+
+        record = _approved(CONTRACT_V1, verdict=gate_a.VERDICT_CHANGES)
+        save_gate_a_approval(record)
+        fingerprint = gate_a.approval_fingerprint(record)
+        entry = self._entry(
+            state=STATE_PARKED,
+            last_reason=f"... {gate_a.park_marker('api', 37, fingerprint)}",
+        )
+        assert _fetch_gate_a_pending([entry]) == {entry.key: True}
+
+    def test_shell_resolver_ignores_non_gate_a_parks(self, coord_db) -> None:
+        from coord.commands.drive_queue import _fetch_gate_a_pending
+        from coord.drive_queue import STATE_PARKED
+
+        entry = self._entry(
+            state=STATE_PARKED, last_reason="CI running: checks pending"
+        )
+        assert _fetch_gate_a_pending([entry]) == {}
 
     def test_unresolvable_gate_a_park_stays_parked(self) -> None:
         """Fail closed: no entry in `gate_a_pending` (the shell could not
