@@ -29,6 +29,16 @@ from coord.openapi import build_spec, dataclass_schema, openapi_and_docs_routes
 #: without starlette/uvicorn and dead on the next restart.
 AGENT_PKG_NAME = "claude-coordinator[server]"
 
+#: The sibling systemd *user* units `POST /restart-services` (#2069) is
+#: allowed to restart. `coord-agent` is deliberately excluded — that unit
+#: restarts itself, via `/update`/`/rollback`/`/restart`, and doing it again
+#: here would race those endpoints' own restart threads. Matches
+#: `coord.health.checks.spawned_coord.DEFAULT_UNITS` minus `coord-agent` and
+#: `coord-notify` (the latter has no deploy lane of its own to be behind on).
+RESTARTABLE_SIBLING_UNITS: frozenset[str] = frozenset(
+    {"coord-serve", "coord-web", "coord-drive-queue"}
+)
+
 
 def _venv_dir() -> Path:
     """Root of the venv `coord agent update` swaps blue/green (#1241).
@@ -121,6 +131,48 @@ def _restart_via_systemctl(unit: str = "coord-agent") -> bool:
     except Exception:
         return False
     return True
+
+
+def _restart_sibling_unit(unit: str, *, timeout: float = 30.0) -> tuple[bool, str]:
+    """``systemctl --user restart <unit>`` for a UNIT OTHER THAN THIS ONE,
+    and wait for it to report active (#2069).
+
+    Unlike :func:`_restart_via_systemctl` — used for the agent's OWN restart,
+    where the caller is about to exit and there is nothing left here to poll
+    for — this process stays alive throughout a sibling's restart, so it can
+    and should wait rather than fire-and-forget. "The systemctl command was
+    launched" is a statement about the request, not the outcome; #2052 fault
+    1 is exactly what trusting that distinction cost on a self-restart, and
+    there's no reason to reintroduce it here just because it's a neighbour's
+    process instead of this one's.
+    """
+    env = dict(os.environ)
+    env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "restart", unit],
+            env=env, capture_output=True, text=True, timeout=15,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return False, f"{type(exc).__name__}: {exc}"
+    if result.returncode != 0:
+        return False, (result.stderr or result.stdout or "systemctl restart failed").strip()[:300]
+
+    deadline = time.time() + max(timeout, 0.0)
+    while True:
+        try:
+            probe = subprocess.run(
+                ["systemctl", "--user", "is-active", unit],
+                env=env, capture_output=True, text=True, timeout=5,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return False, f"{type(exc).__name__}: {exc}"
+        state = probe.stdout.strip()
+        if state == "active":
+            return True, "active"
+        if time.time() >= deadline:
+            return False, f"still {state or 'unknown'} {timeout:.0f}s after restart"
+        time.sleep(0.5)
 
 
 def _default_exec_restart(argv: list[str]) -> None:
@@ -334,6 +386,36 @@ def _openapi_spec() -> dict:
                 "responses": {
                     "200": {"description": "Units deployed (or nothing to do)"},
                     "500": {"description": "A unit could not be written, or daemon-reload failed"},
+                },
+            }
+        },
+        "/restart-services": {
+            "post": {
+                "summary": (
+                    "Restart whichever of coord-serve/coord-web/coord-drive-queue "
+                    "are actually running on this host (#2069) — the rest of a "
+                    "python-lane roll that /update itself only does for "
+                    "coord-agent. Call AFTER /update on the same host."
+                ),
+                "requestBody": {
+                    "required": False,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "units": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    }
+                                },
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {"description": "Restart attempted for every running sibling unit"},
+                    "400": {"description": "\"units\" named something not restartable here"},
                 },
             }
         },
@@ -866,6 +948,90 @@ def build_app(
                 payload["ok"] = False
         return JSONResponse(payload, status_code=200 if payload.get("ok") else 500)
 
+    async def restart_services(request: Request) -> JSONResponse:
+        """Restart this host's sibling coord-* units (#2069).
+
+        ``POST /update`` swaps the venv and re-execs **the agent** — and
+        nothing else. ``coord-serve``, ``coord-web`` and ``coord-drive-queue``
+        keep running the generation they started with until something
+        restarts THEM, which used to mean a human. This is that something,
+        meant to be called right after ``/update`` lands on the same host
+        (see ``coord/commands/release.py``'s ``_roll_python``).
+
+        Which of the three units to touch is decided HERE, from what
+        ``coord.health.checks.spawned_coord`` finds actually running on this
+        host right now — the same "which services a host runs is a topology
+        decision, not a release decision" rule ``/deploy-units`` already
+        follows. A host that never ran ``coord-web`` never gets one started
+        by this call.
+
+        Synchronous, unlike ``/update``: restarting a sibling process does
+        not kill the request handling this restart (that's the whole reason
+        it can wait for confirmation rather than fire-and-forget — see
+        :func:`_restart_sibling_unit`).
+
+        Request body (JSON, optional)::
+
+            {"units": ["coord-serve", "coord-web"]}
+
+        Omit ``units`` (or POST ``{}``/no body) to consider all of
+        :data:`RESTARTABLE_SIBLING_UNITS`. Naming a unit outside that set is
+        a 400 — ``coord-agent`` restarts itself through ``/update``,
+        ``/rollback`` and ``/restart``, and doing it again from here would
+        race those endpoints' own restart threads.
+        """
+        from coord.health.checks.spawned_coord import running_unit_pids  # noqa: PLC0415
+
+        body: dict = {}
+        try:
+            body = await request.json()
+        except Exception:
+            pass
+        if not isinstance(body, dict):
+            body = {}
+        raw_units = body.get("units")
+        if raw_units is None:
+            wanted = set(RESTARTABLE_SIBLING_UNITS)
+        elif isinstance(raw_units, list):
+            wanted = {str(u) for u in raw_units}
+        else:
+            return JSONResponse({"error": "\"units\" must be a list"}, status_code=400)
+        unknown = wanted - RESTARTABLE_SIBLING_UNITS
+        if unknown:
+            return JSONResponse(
+                {
+                    "error": (
+                        f"not a restartable sibling unit here: {', '.join(sorted(unknown))} "
+                        f"— must be one of {', '.join(sorted(RESTARTABLE_SIBLING_UNITS))}"
+                    )
+                },
+                status_code=400,
+            )
+
+        if not _running_under_systemd():
+            return JSONResponse(
+                {
+                    "units": {},
+                    "detail": (
+                        "this agent is not running under systemd — nothing here "
+                        "can restart a sibling unit"
+                    ),
+                },
+                status_code=200,
+            )
+
+        running = running_unit_pids(tuple(sorted(wanted)))
+        results: dict[str, dict] = {}
+        all_ok = True
+        for unit in sorted(wanted):
+            if unit not in running:
+                results[unit] = {"restarted": None, "detail": "not running on this host"}
+                continue
+            restarted, detail = _restart_sibling_unit(unit)
+            results[unit] = {"restarted": restarted, "detail": detail}
+            all_ok = all_ok and restarted
+        return JSONResponse({"units": results}, status_code=200 if all_ok else 500)
+
     async def rollback(request: Request) -> JSONResponse:
         """Flip ``~/.coord-venv`` back onto the previous blue/green
         generation and restart (#1241).
@@ -1136,6 +1302,11 @@ def build_app(
         # #1831/#1835: the `deploy/**` lane's deploy step. Must be POSTed
         # AFTER /update on the same host — see the handler's docstring.
         Route("/deploy-units", deploy_units, methods=["POST"]),
+        # #2069: restarts coord-serve/coord-web/coord-drive-queue — the rest
+        # of a python-lane roll /update itself only does for coord-agent.
+        # Must be POSTed AFTER /update on the same host, same reason as
+        # /deploy-units above.
+        Route("/restart-services", restart_services, methods=["POST"]),
         Route("/rollback", rollback, methods=["POST"]),
         Route("/restart", restart, methods=["POST"]),
         Route("/worktree-clean", worktree_clean, methods=["POST"]),

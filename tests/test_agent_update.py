@@ -978,6 +978,74 @@ class TestSystemdAwareRestart:
         assert mock_execv.called
 
 
+class TestRestartSiblingUnit:
+    """`_restart_sibling_unit` (#2069) — restarting a NEIGHBOUR unit, not
+    this process. Unlike `_restart_via_systemctl` (used for the agent's own
+    restart, where the caller is about to exit and cannot wait for itself),
+    this one runs the systemctl restart AND waits for `is-active`, because
+    the calling process — the agent — stays alive throughout."""
+
+    def test_waits_for_is_active_and_reports_success(self, monkeypatch) -> None:
+        from coord.agent_app import _restart_sibling_unit
+
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[:3] == ["systemctl", "--user", "restart"]:
+                return MagicMock(returncode=0, stdout="", stderr="")
+            return MagicMock(returncode=0, stdout="active\n", stderr="")
+
+        with patch("coord.agent_app.subprocess.run", side_effect=fake_run):
+            ok, detail = _restart_sibling_unit("coord-serve", timeout=5.0)
+
+        assert ok is True
+        assert detail == "active"
+        assert calls[0] == ["systemctl", "--user", "restart", "coord-serve"]
+        assert calls[1] == ["systemctl", "--user", "is-active", "coord-serve"]
+
+    def test_a_restart_command_that_fails_never_polls(self, monkeypatch) -> None:
+        from coord.agent_app import _restart_sibling_unit
+
+        with patch(
+            "coord.agent_app.subprocess.run",
+            return_value=MagicMock(returncode=1, stdout="", stderr="unit not found"),
+        ):
+            ok, detail = _restart_sibling_unit("coord-web", timeout=5.0)
+
+        assert ok is False
+        assert "unit not found" in detail
+
+    def test_gives_up_after_the_timeout_if_never_active(self, monkeypatch) -> None:
+        from coord.agent_app import _restart_sibling_unit
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:3] == ["systemctl", "--user", "restart"]:
+                return MagicMock(returncode=0, stdout="", stderr="")
+            return MagicMock(returncode=0, stdout="activating\n", stderr="")
+
+        with (
+            patch("coord.agent_app.subprocess.run", side_effect=fake_run),
+            patch("coord.agent_app.time.sleep"),
+        ):
+            ok, detail = _restart_sibling_unit("coord-drive-queue", timeout=0.01)
+
+        assert ok is False
+        assert "activating" in detail
+
+    def test_a_launch_exception_is_reported_not_raised(self, monkeypatch) -> None:
+        from coord.agent_app import _restart_sibling_unit
+
+        with patch(
+            "coord.agent_app.subprocess.run",
+            side_effect=FileNotFoundError("no systemctl"),
+        ):
+            ok, detail = _restart_sibling_unit("coord-serve", timeout=5.0)
+
+        assert ok is False
+        assert "no systemctl" in detail
+
+
 # ── CLI: coord agent update / restart ─────────────────────────────────────
 
 
