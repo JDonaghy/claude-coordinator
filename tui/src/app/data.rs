@@ -17,6 +17,13 @@ pub(crate) enum SseWatchMsg {
     Done { last_id: u64 },
     /// Connection or read error. The main thread decides whether to reconnect.
     Error(String),
+    /// #2064: the agent answered the initial connect with HTTP 404 — there is
+    /// no log for this assignment and there never will be (e.g. a terminal
+    /// `chat`/advisory row with no live session). This is categorically
+    /// different from `Error`: retrying can't fix a resource that doesn't
+    /// exist, so the main thread treats it as terminal rather than feeding it
+    /// into the transient-failure/backoff/reconnect machinery.
+    NotFound,
     /// SSE keepalive comment received. Used to detect when the receiver has
     /// been dropped (cancel signal): if `tx.send` fails, the thread exits.
     Heartbeat,
@@ -3136,6 +3143,14 @@ pub(crate) fn spawn_sse_watch(
 
         let resp = match builder.call() {
             Ok(r) => r,
+            // #2064: a 404 on the initial connect means the agent has no log
+            // for this assignment and never will (unknown assignment id, or
+            // an ended session with no log_path) — distinct from a transport
+            // failure, which is genuinely worth retrying.
+            Err(ureq::Error::Status(404, _)) => {
+                let _ = tx.send(SseWatchMsg::NotFound);
+                return;
+            }
             Err(e) => {
                 let _ = tx.send(SseWatchMsg::Error(e.to_string()));
                 return;
