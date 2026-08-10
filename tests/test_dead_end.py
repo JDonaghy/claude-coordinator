@@ -285,11 +285,14 @@ def test_gates_carry_the_readings_that_proved_the_dead_end() -> None:
 #   [work]  78cfb47e0b99  done  test=-        fix round 1, stalled ~25m
 #   [work]  87e6d76eab4e  done  test=-        fix round 2, stalled 160m
 #
-# The issue carries `test-mode:smoke`, so `dispatch_pending_smoke` skips it on
-# every tick BY DESIGN (#685) — while review dispatch is held until the CURRENT
-# row carries a passed/skipped verdict. One component requires a verdict; by
-# policy no component produces one. Both rounds cleared within minutes of an
-# operator running `coord test <fix_aid> --passed` by hand, which is what pins
+# The issue carries `test-mode:smoke` — confirmed against the live board
+# (`coord.state.get_issue_test_mode("vimcode", 635)`, re-checked 2026-08-10,
+# still `"smoke"` post-merge), not assumed — so `dispatch_pending_smoke` skips
+# it on every tick BY DESIGN (#685), while review dispatch is held until the
+# CURRENT row carries a passed/skipped verdict. One component requires a
+# verdict; by policy no component produces one. Both rounds cleared within
+# minutes of an operator running `coord test <fix_aid> --passed` by hand, which
+# is what pins
 # the cause. Elapsed time is not the signal — the label is.
 
 

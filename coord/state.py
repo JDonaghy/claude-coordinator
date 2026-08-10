@@ -45,6 +45,7 @@ from coord.models import (
     Proposal,
     SplitChunk,
     SplitProposal,
+    test_mode_from_labels,
 )
 from coord.platform_paths import default_coord_dir
 
@@ -3675,11 +3676,11 @@ def _get_issue_test_mode_local(repo_name: str, issue_number: int) -> str | None:
         labels: list[str] = json.loads(row["labels"] or "[]")
     except (json.JSONDecodeError, TypeError):
         return None
-    # #2024: the label→policy reading lives in `coord.models` so the DRIVER's
-    # copy of it (`coord.drive_state.project`, which reads the same labels off
-    # the `/board` payload) can never drift from the DISPATCHER's.
-    from coord.models import test_mode_from_labels  # noqa: PLC0415
-
+    # #2024: the label→policy reading lives in `coord.models` (imported at
+    # module scope above, alongside this file's other `coord.models` names)
+    # so the DRIVER's copy of it (`coord.drive_state.project`, which reads the
+    # same labels off the `/board` payload) can never drift from the
+    # DISPATCHER's.
     return test_mode_from_labels(labels)
 
 

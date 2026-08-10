@@ -1852,3 +1852,81 @@ def test_dispatch_pending_smoke_says_why_it_skipped_test_mode_smoke(
     with caplog.at_level(logging.INFO, logger="coord.smoke"):
         assert dispatch_pending_smoke(board, gtk_and_server_config) == []
     assert [r for r in caplog.records if "test-mode:smoke" in r.getMessage()] == []
+
+
+def _fix_assignment(*, parent_id: str = "work-1", branch: str = "issue-1-fix") -> Assignment:
+    """The literal shape `coord.auto_loop._dispatch_fix` produces for the
+    common case: `type=fix_type` where `fix_type` is `"work"` unless the
+    source row was `"test-author"`, `review_of_assignment_id=work.assignment_id`
+    (link back to the row it fixes), `branch=work.branch` (same branch —
+    `--fix-of` reuses it by design), `review_iteration=iteration` (the bounce
+    counter). Not a hypothetical fixture — every field here is copied from
+    `_dispatch_fix`'s actual `Assignment(...)` construction in
+    `coord/auto_loop.py`.
+    """
+    return replace(
+        _completed(branch=branch),
+        assignment_id="fix-1",
+        dispatched_at=200.0,
+        review_of_assignment_id=parent_id,
+        review_iteration=1,
+    )
+
+
+def test_dispatch_smoke_dispatches_for_a_fix_assignment(
+    gtk_and_server_config: Config,
+) -> None:
+    """#2024 Ask 1, proved directly rather than asserted in a commit message:
+    a completed **fix** assignment (see `_fix_assignment` above) gets a
+    Test-stage `smoke` assignment dispatched — exactly like a fresh work row
+    does. There never was a `type` filter excluding fix rows: `WORK_LIKE_TYPES`
+    only discriminates on `type`, and a fix row's `type` IS `"work"`. The dead
+    end this issue reports is specific to the `test-mode:smoke` per-issue
+    POLICY skip covered above, not a structural gap in the dispatch path
+    itself. Asserted on the board, per the issue's own acceptance criterion —
+    not inferred from the gate summary.
+    """
+    parent = replace(_completed(), assignment_id="work-1", dispatched_at=100.0)
+    fix = _fix_assignment()
+    board = Board(completed=[parent, fix])
+
+    dispatched = dispatch_smoke(
+        fix, board, gtk_and_server_config,
+        http_client=_FakeClient({"id": "smoke-fix-1"}),
+        diff_lookup=lambda repo, branch: ["src/gtk/window.c"],
+    )
+
+    assert dispatched is not None
+    assert dispatched.type == "smoke"
+    assert dispatched.review_of_assignment_id == "fix-1"
+    assert dispatched in board.active
+
+
+def test_dispatch_pending_smoke_dispatches_for_a_fix_assignment_through_bulk_path(
+    gtk_and_server_config: Config, monkeypatch,
+) -> None:
+    """Same claim as above, through `dispatch_pending_smoke` — the single
+    choke point `reconcile()` (human-invoked `coord resume`) and `coord
+    notify` (the unattended 5-minute timer) actually route bulk Test-stage
+    dispatch through. Proving it only against `dispatch_smoke` would leave
+    open the question this issue is actually about: does the UNATTENDED path
+    reach a fix row at all. It does, with no per-issue test-mode policy set.
+    """
+    monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "coord.smoke.httpx", _FakeClient({"id": "smoke-fix-1"}),
+    )
+    monkeypatch.setattr(
+        "coord.smoke._fetch_touched_files", lambda repo, branch: ["src/gtk/window.c"]
+    )
+
+    parent = replace(_completed(), assignment_id="work-1", dispatched_at=100.0)
+    fix = _fix_assignment()
+    board = Board(completed=[parent, fix])
+
+    dispatched = dispatch_pending_smoke(board, gtk_and_server_config)
+
+    assert len(dispatched) == 1
+    assert dispatched[0].type == "smoke"
+    assert dispatched[0].review_of_assignment_id == "fix-1"
+    assert dispatched[0] in board.active
