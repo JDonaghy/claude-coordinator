@@ -64,6 +64,14 @@ logger = logging.getLogger("coord.smoke")
 # been reported this process (see `dispatch_pending_smoke`). Process-lifetime,
 # not persisted — the point is one clear statement per daemon run, not an
 # every-tick repeat of a refusal that is expected to hold for hours.
+#
+# Deliberately never pruned (e.g. when an operator clears the block with
+# `coord set-test-mode <repo> <issue> auto` or records a verdict by hand):
+# membership is a small, immutable assignment-id string per row that ever hit
+# this skip, so the set's lifetime cost is bounded by "how many rows stalled
+# on this policy while the daemon has been up" — negligible next to the board
+# itself, and a daemon restart clears it for free (the next occurrence logs
+# again, which is exactly when an operator wants to hear it).
 _TEST_MODE_SKIP_LOGGED: set[str] = set()
 
 
