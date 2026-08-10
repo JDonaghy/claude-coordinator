@@ -2674,9 +2674,22 @@ def resolve_entry_key(items: list["QueuedMerge"], key: str) -> "QueuedMerge | No
        explicitly: "if an ID is genuinely re-keyed between passes, resolve
        by branch".
 
-    When more than one entry matches forms 2-4, the most recently added
-    match wins (``load_queue()`` returns rows in insertion order) — the
-    #1477 tie-break, applied uniformly.
+    When more than one entry matches forms 2-4, :func:`_pick_ambiguous_match`
+    breaks the tie: an entry still in play (not ``MERGED``/``SKIPPED``) is
+    preferred over one already at rest, and only among equally-actionable
+    (or equally-terminal) candidates does "most recently added" apply
+    (``load_queue()`` returns rows in insertion order) — the #1477 tie-break.
+    #2080: two sealed slices of the same milestone share one *tracking*
+    issue number, so a bare-issue or ``repo#issue`` key is routinely
+    ambiguous between them even though each is a distinct, independently
+    mergeable entry. Plain "most recent wins" used to resolve that ambiguity
+    to whichever slice merged *first* — because merging is what makes an
+    entry's ``load_queue()`` position look "most recent" to a re-read of the
+    file — permanently orphaning the other slice's ``--only <issue>`` runs
+    behind an already-``MERGED`` sibling. Preferring the still-pending entry
+    fixes that without changing behaviour for the (still ambiguous, still a
+    caller error to rely on) case where two matches are equally actionable —
+    use the branch name there.
 
     Returns ``None`` when nothing matches any form — callers must treat
     that as an explicit error, never a silent no-op (#1477).
@@ -2695,7 +2708,7 @@ def resolve_entry_key(items: list["QueuedMerge"], key: str) -> "QueuedMerge | No
             if e.issue_number == issue_number and repo_part in (e.repo_name, e.repo_github)
         ]
         if matches:
-            return matches[-1]
+            return _pick_ambiguous_match(matches)
         return None
     try:
         bare_issue_number = int(key)
@@ -2704,11 +2717,38 @@ def resolve_entry_key(items: list["QueuedMerge"], key: str) -> "QueuedMerge | No
     if bare_issue_number is not None:
         matches = [e for e in items if e.issue_number == bare_issue_number]
         if matches:
-            return matches[-1]
+            return _pick_ambiguous_match(matches)
     branch_matches = [e for e in items if e.branch == key]
     if branch_matches:
         return branch_matches[-1]
     return None
+
+
+# States a queue entry never leaves once reached — resolving a shared key
+# (durable repo#issue, or bare issue number) against a mix of these and
+# still-actionable states should never silently prefer the entry that's
+# already done (#2080).
+_RESOLVE_TERMINAL_STATES = (MERGED, SKIPPED)
+
+
+def _pick_ambiguous_match(matches: list["QueuedMerge"]) -> "QueuedMerge":
+    """Break a tie between several :func:`resolve_entry_key` *matches* that
+    share one durable key (#2080).
+
+    Two sealed slices of the same milestone share the milestone's tracking
+    issue number, so ``repo#issue`` and bare-issue-number resolution
+    routinely finds more than one queue entry. Prefer an entry that is still
+    actionable (state not in :data:`_RESOLVE_TERMINAL_STATES`) over one
+    already at rest — a merged sibling is never the row an operator meant by
+    the shared key once anything else with that key is still pending. Among
+    equally-actionable (or equally-terminal) candidates, fall back to
+    "most recently added" (*matches* is in ``load_queue()`` insertion
+    order) — the pre-existing #1477 tie-break, applied only where it can no
+    longer pick a done entry over a live one.
+    """
+    actionable = [e for e in matches if e.state not in _RESOLVE_TERMINAL_STATES]
+    pool = actionable if actionable else matches
+    return pool[-1]
 
 
 def resolve_board_work_key(board, key: str) -> "list":

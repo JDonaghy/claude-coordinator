@@ -3373,6 +3373,71 @@ class TestResolveEntryKey:
         items = [old, new]
         assert mq.resolve_entry_key(items, "1461") is new
 
+    # ── #2080: two slices of one milestone share the tracking issue ────────
+
+    def test_ambiguous_bare_issue_number_prefers_pending_over_merged_sibling(
+        self, coord_db
+    ) -> None:
+        """The exact #2080 sequence: slice-32 is enqueued first and is still
+        PENDING; slice-33 is enqueued after it and merges first (an operator
+        ran ``--only <tracking-issue>`` once and it happened to land on
+        slice-33). A second ``--only <tracking-issue>`` run must reach the
+        still-pending slice-32, not the merged slice-33 that "most recently
+        added" would otherwise re-pick — that's the bug that made slice-32
+        unreachable by the identifier the board itself printed."""
+        slice_32 = _q("slice-32-aid", branch="ms-2-slice-32", state=PENDING)
+        slice_32.issue_number = 34  # the shared milestone tracking issue
+        slice_33 = _q("slice-33-aid", branch="ms-2-slice-33", state=MERGED)
+        slice_33.issue_number = 34
+        items = [slice_32, slice_33]  # insertion order: 32 then 33
+        assert mq.resolve_entry_key(items, "34") is slice_32
+
+    def test_ambiguous_durable_key_prefers_pending_over_merged_sibling(
+        self, coord_db
+    ) -> None:
+        slice_32 = _q(
+            "slice-32-aid", branch="ms-2-slice-32", state=PENDING,
+            repo="acceptance", repo_github="acme/acceptance",
+        )
+        slice_32.issue_number = 34
+        slice_33 = _q(
+            "slice-33-aid", branch="ms-2-slice-33", state=MERGED,
+            repo="acceptance", repo_github="acme/acceptance",
+        )
+        slice_33.issue_number = 34
+        items = [slice_32, slice_33]
+        assert mq.resolve_entry_key(items, "acceptance#34") is slice_32
+        assert mq.resolve_entry_key(items, "acme/acceptance#34") is slice_32
+
+    def test_ambiguous_bare_issue_number_still_prefers_most_recent_when_both_pending(
+        self, coord_db
+    ) -> None:
+        """When two matches are equally actionable (neither has merged yet),
+        there is no way to tell them apart from state alone — the pre-#2080
+        "most recently added" tie-break still applies, and the operator is
+        still on the hook to disambiguate by branch name if they meant the
+        other one."""
+        slice_32 = _q("slice-32-aid", branch="ms-2-slice-32", state=PENDING)
+        slice_32.issue_number = 34
+        slice_33 = _q("slice-33-aid", branch="ms-2-slice-33", state=PENDING)
+        slice_33.issue_number = 34
+        items = [slice_32, slice_33]
+        assert mq.resolve_entry_key(items, "34") is slice_33
+
+    def test_ambiguous_bare_issue_number_falls_back_to_most_recent_when_all_terminal(
+        self, coord_db
+    ) -> None:
+        """Both matches already at rest (e.g. both merged) is the one case
+        where preferring "actionable" can't disambiguate — fall back to the
+        pre-#2080 "most recently added" behaviour rather than matching
+        nothing."""
+        older = _q("older-aid", branch="ms-2-slice-32", state=MERGED)
+        older.issue_number = 34
+        newer = _q("newer-aid", branch="ms-2-slice-33", state=mq.SKIPPED)
+        newer.issue_number = 34
+        items = [older, newer]
+        assert mq.resolve_entry_key(items, "34") is newer
+
 
 class TestDropEntryDurableKey:
     """#1477: drop_entry() resolves the durable 'repo#issue' form too."""
