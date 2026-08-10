@@ -1769,6 +1769,122 @@ def test_merge_retries_are_bounded():
     assert "merge attempted 2 times without landing" in exhausted.message
 
 
+def test_exhausted_merge_attempts_quotes_the_last_captured_diagnostic():
+    """#2078: the give-up message used to echo the board's empty
+    `merge_status`/`merge_reason` fields verbatim — 'status=none reason=none',
+    carrying no diagnosis at all. `Driver._loop` now captures each `coord
+    merge --only` attempt's own output (`_explain_missing_only_entry`'s
+    diagnosis) into `counters.last_merge_diagnostic`; the die message must
+    quote it instead of just the bare fields."""
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_merge_attempts=2)
+    s = approved_work()
+
+    assert step(s, opts, counters=counters).kind == RUN
+    # Simulate what Driver._loop does after the first attempt's subprocess
+    # returns — captures its combined stdout+stderr, which for a row that
+    # cannot be enqueued at all (no board row matches the identifier) reads
+    # roughly like this.
+    counters.last_merge_diagnostic = (
+        "merge-queue: no entry found for 'w1' "
+        "(tried assignment_id, repo#issue, issue number, and branch name)\n"
+        "  no done work row on the board matches that identifier either — "
+        "the identifier did not resolve."
+    )
+    assert step(s, opts, counters=counters).kind == RUN
+    exhausted = step(s, opts, counters=counters)
+    assert exhausted.is_exit
+    assert "merge attempted 2 times without landing" in exhausted.message
+    assert "no entry found for 'w1'" in exhausted.message
+    assert "identifier did not resolve" in exhausted.message
+
+
+def test_exhausted_merge_attempts_says_so_when_nothing_was_ever_captured():
+    """`Driver._loop` failing to wire the capture up at all (or a test
+    driving `decide()` directly, with no Driver in the loop) must not print
+    a blank diagnostic block — say plainly that nothing was captured."""
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_merge_attempts=1)
+    s = approved_work()
+
+    assert step(s, opts, counters=counters).kind == RUN
+    exhausted = step(s, opts, counters=counters)
+    assert exhausted.is_exit
+    assert "no output captured from the merge attempts" in exhausted.message
+
+
+def test_empty_status_with_a_known_gate_block_waits_instead_of_retrying_blind():
+    """#2078 core fix: once a prior `coord merge --only` attempt's captured
+    diagnostic already names a genuine, un-satisfied review/smoke gate, a
+    board `merge_status` of "" (no queue entry at all) is no longer treated
+    as blindly retryable — it behaves like a BLOCKED entry (wait, re-check),
+    the same as if the board itself had rendered BLOCKED with this reason.
+    No further merge attempt is spent chasing a gate a retry cannot change."""
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_merge_attempts=3)
+    counters.last_merge_diagnostic = (
+        "merge-queue: no entry found for 'w1', but 1 done work row(s) on the "
+        "board match it:\n"
+        "  claude-coordinator #1392 (assignment w1, branch fix-1392) — "
+        "enqueue blocked by smoke gate — test verdict stale (recorded "
+        "against base 5f34a46, base now ff1bd1f) (waive with --skip-smoke)"
+    )
+    s = approved_work()
+
+    action = step(s, opts, counters=counters)
+    assert action.kind == WAIT
+    assert "not yet enqueued" in action.label
+    assert "test verdict stale" in action.label
+    assert counters.merge_attempts == 0
+
+
+def test_empty_status_still_retries_blind_when_the_diagnostic_names_no_gate():
+    """The companion case: when the last captured diagnostic reports that
+    every gate already passes (a genuine "not enqueued yet" timing gap) or
+    that no board row matched at all, there is nothing to wait on — the
+    bounded `--only` retry is still the right move, unchanged from before
+    #2078."""
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_merge_attempts=2)
+    counters.last_merge_diagnostic = (
+        "merge-queue: no entry found for 'w1', but 1 done work row(s) on the "
+        "board match it:\n"
+        "  claude-coordinator #1392 (assignment w1, branch fix-1392) — all "
+        "merge gates pass; it was skipped for a non-gate reason (issue "
+        "closed, branch missing from origin, or PR already merged), or the "
+        "auto-enqueue scan has not run yet."
+    )
+    s = approved_work()
+
+    action = step(s, opts, counters=counters)
+    assert action.kind == RUN
+    assert counters.merge_attempts == 1
+
+
+def test_extract_gate_block_reason_parses_the_explain_missing_only_entry_line():
+    from coord.drive import _extract_gate_block_reason
+
+    assert _extract_gate_block_reason("") is None
+    assert (
+        _extract_gate_block_reason(
+            "merge-queue: no entry found for 'w1', but 1 done work row(s) "
+            "match it:\n"
+            "  repo #1 (assignment w1, branch b) — enqueue blocked by "
+            "review gate — review required but not approved "
+            "(waive with --skip-review)"
+        )
+        == "review gate — review required but not approved "
+        "(waive with --skip-review)"
+    )
+    assert (
+        _extract_gate_block_reason(
+            "  repo #1 (assignment w1, branch b) — all merge gates pass; "
+            "it was skipped for a non-gate reason ..."
+        )
+        is None
+    )
+
+
 def test_human_required_merge_is_terminal_with_the_override_recipe():
     action = step(approved_work(merge_status="HUMAN_REQUIRED", merge_reason="semantic"))
     assert action.is_exit
@@ -2803,6 +2919,64 @@ def test_driver_shells_out_to_coord_and_never_calls_internals(driver_factory):
     assert driver.run() == EXIT_TERMINAL_FAILURE  # cap reached, never landed
     argvs = [" ".join(a) for a in driver.recorded]  # type: ignore[attr-defined]
     assert any("merge --only w1 --method rebase" in a for a in argvs), argvs
+
+
+def test_driver_captures_the_merge_attempts_own_diagnostic_into_the_die_message(
+    driver_factory, monkeypatch, capsys,
+):
+    """#2078 end to end: `Driver._loop` must actually capture each `coord
+    merge --only` attempt's stdout/stderr (what `_explain_missing_only_entry`
+    prints when there's no queue entry) and thread it through to the final
+    give-up message — not just leave the pure-decide()-level plumbing
+    (`counters.last_merge_diagnostic`) unwired.
+
+    The diagnostic here deliberately reports "identifier did not resolve"
+    (no board row matched at all) rather than a named gate — a named-gate
+    diagnostic exercises the WAIT-instead-of-retry arm (covered at the pure
+    `decide()` level by `test_empty_status_with_a_known_gate_block_waits_
+    instead_of_retrying_blind`), which would make this run stall out at the
+    deadline instead of reaching the exhausted-attempts die this test wants.
+    """
+    payload = board(
+        status="done", test_state="passed", review_state="done", review_iteration=0
+    )
+    payload["assignments"].append(
+        {
+            "repo_name": REPO,
+            "issue_number": ISSUE,
+            "type": "review",
+            "assignment_id": "r1",
+            "dispatched_at": 2.0,
+            "status": "done",
+            "review_of_assignment_id": "w1",
+            "review_verdict": "approve",
+        }
+    )
+    driver = driver_factory(
+        [payload],
+        opts=DriveOptions(
+            machine="precision", poll=1.0, max_merge_attempts=1, deadline_mins=1.0
+        ),
+    )
+
+    def fake_run(argv, **kw):
+        if "merge" in argv and "--only" in argv:
+            return subprocess.CompletedProcess(
+                argv, 1,
+                "merge-queue: no entry found for 'w1' (tried assignment_id, "
+                "repo#issue, issue number, and branch name)\n"
+                "  no done work row on the board matches that identifier "
+                "either — the identifier did not resolve.\n",
+                "",
+            )
+        return subprocess.CompletedProcess(argv, 0, "ok\n", "")
+
+    monkeypatch.setattr("coord.drive.subprocess.run", fake_run)
+
+    assert driver.run() == EXIT_TERMINAL_FAILURE
+    err = capsys.readouterr().err
+    assert "no entry found for 'w1'" in err
+    assert "identifier did not resolve" in err
 
 
 def test_driver_escalates_and_writes_the_record_via_the_cli(driver_factory):
