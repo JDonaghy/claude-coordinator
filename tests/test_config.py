@@ -812,6 +812,87 @@ def test_pipeline_attention_thresholds_rejects_bad_duration(tmp_path: Path) -> N
         load(p)
 
 
+# ── #2048: liveness_auditor ──────────────────────────────────────────────────
+
+
+def test_liveness_auditor_defaults_off() -> None:
+    """Ships dark — see LivenessAuditorConfig's docstring."""
+    cfg = PipelineConfig()
+    assert cfg.liveness_auditor.enabled is False
+    assert cfg.liveness_auditor.strikes == 3
+    assert cfg.liveness_auditor.debounce_seconds == 60.0
+    assert cfg.liveness_auditor.model == "claude-haiku-4-5"
+    assert cfg.liveness_auditor.claude_bin is None
+
+
+def test_liveness_auditor_parsed_from_yaml(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+        "pipeline:\n"
+        "  liveness_auditor:\n"
+        "    enabled: true\n"
+        "    strikes: 5\n"
+        "    debounce_seconds: 2m\n"
+        "    model: claude-haiku-4-5\n"
+        "    timeout_seconds: 45\n"
+        "    claude_bin: /usr/local/bin/claude\n"
+    )
+    cfg = load(p)
+    la = cfg.pipeline.liveness_auditor
+    assert la.enabled is True
+    assert la.strikes == 5
+    assert la.debounce_seconds == 120.0
+    assert la.model == "claude-haiku-4-5"
+    assert la.timeout_seconds == 45.0
+    assert la.claude_bin == "/usr/local/bin/claude"
+
+
+def test_liveness_auditor_absent_block_keeps_defaults(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+    )
+    cfg = load(p)
+    assert cfg.pipeline.liveness_auditor.enabled is False
+
+
+def test_liveness_auditor_rejects_bad_strikes(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+        "pipeline:\n"
+        "  liveness_auditor:\n"
+        "    strikes: 0\n"
+    )
+    with pytest.raises(ConfigError, match="strikes"):
+        load(p)
+
+
+def test_liveness_auditor_rejects_non_bool_enabled(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+        "pipeline:\n"
+        "  liveness_auditor:\n"
+        "    enabled: yes-please\n"
+    )
+    with pytest.raises(ConfigError, match="enabled"):
+        load(p)
+
+
 def test_pipeline_convergence_rounds_rejects_non_positive(tmp_path: Path) -> None:
     p = tmp_path / "coordinator.yml"
     p.write_text(

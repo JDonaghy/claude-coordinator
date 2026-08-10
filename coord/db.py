@@ -413,6 +413,25 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             received_at  REAL    NOT NULL
         );
 
+        -- #2048: per-assignment tracking state for the cheap per-turn
+        -- liveness auditor (coord/liveness_auditor.py). One row per
+        -- assignment ever audited; consecutive_blocked is the running
+        -- streak of BLOCKED verdicts (reset to 0 by any continue/done),
+        -- and `raised` flips to 1 the one time the streak first reaches
+        -- the configured strike count, so a stall is reported once rather
+        -- than on every subsequent poll while the worker stays blocked.
+        -- Read/written ONLY by coord.notify.detect_liveness_stall and
+        -- coord.state's accessors below — never by anything that also
+        -- touches Assignment.status/review_state/test_state (the auditor
+        -- is a tripwire, not a gate).
+        CREATE TABLE IF NOT EXISTS liveness_audits (
+            assignment_id       TEXT PRIMARY KEY,
+            consecutive_blocked INTEGER NOT NULL DEFAULT 0,
+            last_audit_at       REAL,
+            last_verdict        TEXT,
+            raised              INTEGER NOT NULL DEFAULT 0
+        );
+
         CREATE INDEX IF NOT EXISTS idx_assignments_status ON assignments(status);
         CREATE INDEX IF NOT EXISTS idx_assignments_machine ON assignments(machine_name);
         CREATE INDEX IF NOT EXISTS idx_merge_queue_state ON merge_queue(state);

@@ -20,6 +20,10 @@ import warnings
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from coord.liveness_auditor import AuditState
 
 _log = logging.getLogger(__name__)
 
@@ -1510,6 +1514,7 @@ def _mark_notified_local(
         EVENT_ADVISORY,
         EVENT_COMPLETION,
         EVENT_FAILURE,
+        EVENT_LIVENESS_STALL,
         EVENT_NEEDS_ATTENTION,
         EVENT_PLAN,
         EVENT_STALLED,
@@ -1575,16 +1580,22 @@ def _mark_notified_local(
     conn.commit()
 
     # #1036: this is the single funnel every notify.py call site (completion,
-    # failure, advisory, stuck, needs-attention, stalled) reaches — hook here
-    # rather than at each of the ~10 mark_notified() call sites.  Stuck/needs-
-    # attention/stalled keys are composite (f"{aid}:stuck" /
-    # f"{aid}:needs-attention" / f"{aid}:stalled", see notify.py's
-    # _stuck_notified_key / _needs_attention_notified_key /
-    # _stalled_notified_key) so strip the suffix to recover the real
+    # failure, advisory, stuck, needs-attention, stalled, liveness) reaches —
+    # hook here rather than at each of the ~10 mark_notified() call sites.
+    # Stuck/needs-attention/stalled/liveness keys are composite
+    # (f"{aid}:stuck" / f"{aid}:needs-attention" / f"{aid}:stalled" /
+    # f"{aid}:liveness", see notify.py's _stuck_notified_key /
+    # _needs_attention_notified_key / _stalled_notified_key /
+    # _liveness_notified_key) so strip the suffix to recover the real
     # assignment_id for the repo/issue lookup and for the audit row's
-    # correlation key.
+    # correlation key. This composite-key shape is also what keeps the
+    # bare `else` branch above (line ~1551, `status='failed'`) from ever
+    # touching a real assignment row for these four events: the UPDATE runs
+    # against the literal composite string, which never matches an
+    # `assignments.assignment_id` — a deliberate no-op, not an oversight
+    # (see #2048's "auditor writes no board status" acceptance bar).
     real_assignment_id = assignment_id
-    for _suffix in (":stuck", ":needs-attention", ":stalled"):
+    for _suffix in (":stuck", ":needs-attention", ":stalled", ":liveness"):
         if real_assignment_id.endswith(_suffix):
             real_assignment_id = real_assignment_id[: -len(_suffix)]
             break
@@ -1600,11 +1611,13 @@ def _mark_notified_local(
         EVENT_STUCK: "override",
         EVENT_NEEDS_ATTENTION: "override",
         EVENT_STALLED: "override",
+        EVENT_LIVENESS_STALL: "override",
     }.get(event, "dispatch")
     _event_actor = {
         EVENT_STUCK: "daemon",
         EVENT_NEEDS_ATTENTION: "daemon",
         EVENT_STALLED: "daemon",
+        EVENT_LIVENESS_STALL: "daemon",
     }.get(event, "worker")
     _record_audit(
         tier="business",
@@ -1620,6 +1633,63 @@ def _mark_notified_local(
         machine=row["machine_name"] if row is not None else None,
         details={"branch": branch} if branch is not None else None,
     )
+
+
+# ── Liveness-auditor ledger (#2048) ─────────────────────────────────────────
+#
+# Tracks the running BLOCKED-verdict streak per assignment across separate
+# `coord notify` invocations (this is polled state, not held by a
+# long-lived process) — see `coord.liveness_auditor.AuditState`. Local-DB
+# only for v1: `coord notify` reroutes the WHOLE command to the daemon when
+# `COORD_NOTIFY_ON_DAEMON` is set (coord.commands.lifecycle.notify), so
+# `coord.notify.detect_liveness_stall`'s reads/writes here already land on
+# the daemon's canonical DB without needing a dedicated HTTP route — the
+# same reasoning `mark_notified`'s docstring gives for its own
+# `coord notify` call sites.
+
+
+def load_liveness_audit_state(assignment_id: str) -> AuditState:
+    """Return the persisted #2048 audit-tracking state for *assignment_id*,
+    or a fresh (never-audited) state if none exists yet."""
+    from coord.liveness_auditor import AuditState  # noqa: PLC0415 — avoid import cycle
+
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT consecutive_blocked, last_audit_at, last_verdict, raised "
+        "FROM liveness_audits WHERE assignment_id=?",
+        (assignment_id,),
+    ).fetchone()
+    if row is None:
+        return AuditState()
+    return AuditState(
+        consecutive_blocked=row["consecutive_blocked"] or 0,
+        last_audit_at=row["last_audit_at"],
+        last_verdict=row["last_verdict"],
+        raised=bool(row["raised"]),
+    )
+
+
+def save_liveness_audit_state(assignment_id: str, state: AuditState) -> None:
+    """Upsert the #2048 audit-tracking state for *assignment_id*."""
+    conn = get_connection()
+    with conn:
+        conn.execute(
+            """INSERT INTO liveness_audits
+                   (assignment_id, consecutive_blocked, last_audit_at, last_verdict, raised)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(assignment_id) DO UPDATE SET
+                   consecutive_blocked=excluded.consecutive_blocked,
+                   last_audit_at=excluded.last_audit_at,
+                   last_verdict=excluded.last_verdict,
+                   raised=excluded.raised""",
+            (
+                assignment_id,
+                state.consecutive_blocked,
+                state.last_audit_at,
+                state.last_verdict,
+                int(state.raised),
+            ),
+        )
 
 
 def mark_needs_attention_notified(assignment_id: str) -> None:

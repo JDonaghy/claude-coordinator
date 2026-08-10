@@ -167,6 +167,26 @@ pipeline:
   # test verdict). Omit this block to accept the same default.
   default_gates: [test, review, merge]
 
+  # #2048: cheap, independent, per-turn liveness auditor. After each worker
+  # turn a small model (default Haiku) sees ONLY the assignment's briefing
+  # and that one turn's output — never the transcript, never the worker's
+  # own STATUS:/STUCK: lines — and rules continue/done/blocked. `strikes`
+  # consecutive `blocked` verdicts raise a diagnostic GitHub comment +
+  # EVENT_LIVENESS_STALL; a single bad turn is normal and does nothing.
+  # Gates NOTHING: no board status, review_state, or test_state is ever
+  # touched by this — it's a tripwire between the review/test gates, not a
+  # gate itself. Off by default; ships dark until it earns trust the same
+  # way auto_dispatch_stalled/escalate_semantic_conflicts did. Runs
+  # daemon-side inside `coord notify` — a config change here needs a
+  # `coord-serve` restart, not just a merge.
+  # liveness_auditor:
+  #   enabled: false
+  #   strikes: 3                # consecutive `blocked` verdicts before raising
+  #   debounce_seconds: 60      # at most one audit per this many seconds/assignment
+  #   model: claude-haiku-4-5   # cheapest current model — fixed-size context keeps cost flat
+  #   timeout_seconds: 30
+  #   # claude_bin: claude      # override the `claude` binary path/name
+
 concurrency:
   max_workers: 2          # max simultaneous claude -p sessions across all machines
   stagger_seconds: 30     # delay between starting workers

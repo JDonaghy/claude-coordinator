@@ -35,6 +35,14 @@ EVENT_NEEDS_ATTENTION = "needs_attention"
 # work chains for a downstream step that should have happened by now and
 # didn't.
 EVENT_STALLED = "stalled_pipeline"
+# #2048: N consecutive BLOCKED verdicts from the cheap per-turn liveness
+# auditor (coord/liveness_auditor.py). Distinct from EVENT_STUCK (self-
+# reported) and EVENT_NEEDS_ATTENTION (wall-clock/round-count, no
+# judgment) — this is an independent small-model *opinion* raised on a
+# per-turn cadence, cheap enough to run continuously. Detection +
+# surfacing only, exactly like EVENT_NEEDS_ATTENTION/EVENT_STALLED: never
+# gates status/review_state/test_state.
+EVENT_LIVENESS_STALL = "liveness_stall"
 
 
 @dataclass
@@ -408,6 +416,55 @@ def format_needs_attention(
         "Detection + surfacing only — nothing was killed or reassigned. A "
         "human should take a look; use `coord log <id>` to see what it's "
         "doing, or `coord retry`/`coord stop` to intervene.",
+    ]
+    return "\n".join(lines)
+
+
+def format_liveness_stall(
+    *,
+    assignment_id: str,
+    machine_name: str,
+    repo_name: str,
+    issue_number: int,
+    consecutive_blocked: int,
+) -> str:
+    """Format a "liveness auditor" comment (#2048) — *consecutive_blocked*
+    independent per-turn audits in a row judged this worker's latest turn
+    as showing no progress toward the objective.
+
+    This is a cheap small-model *opinion*, not a correctness check — it
+    complements, and is deliberately weaker than, an adversarial review or
+    the sealed oracle suite. See ``coord/liveness_auditor.py``'s module
+    docstring.
+    """
+    marker = _marker(
+        EVENT_LIVENESS_STALL,
+        assignment=assignment_id,
+        machine=machine_name,
+        repo=repo_name,
+        strikes=consecutive_blocked,
+    )
+    lines = [
+        marker,
+        "## 🐢 Liveness auditor: possible stall",
+        f"**Machine:** {machine_name}",
+        f"**Assignment:** {assignment_id}",
+        f"**Issue:** #{issue_number}",
+        f"**Consecutive BLOCKED verdicts:** {consecutive_blocked}",
+        "",
+        (
+            "An independent, cheap small-model auditor judged this "
+            "worker's last few turns as showing no progress toward the "
+            "objective — repeating itself, confused, or spinning. It saw "
+            "only the objective and each turn's own output, never the "
+            "transcript or the worker's self-reported status."
+        ),
+        "",
+        "This is a tripwire, not a verdict: nothing was killed, gated, or "
+        "reassigned, and no board status changed. It runs continuously "
+        "for pennies and is meant to be wrong sometimes — a human should "
+        "take a look with `coord log <id>` and decide whether to "
+        "intervene.",
     ]
     return "\n".join(lines)
 

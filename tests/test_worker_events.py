@@ -20,6 +20,8 @@ from coord.worker_events import (
     is_stream_json,
     is_usage_limit_reason,
     iter_events,
+    latest_assistant_turn_text,
+    latest_assistant_turn_text_from_text,
     parse_event,
     parse_log,
     render_event,
@@ -428,6 +430,54 @@ class TestIterEvents:
         tail_events = list(iter_events(p, tail_bytes=256))
         assert len(tail_events) > 0
         assert all(isinstance(e, WorkerEvent) for e in tail_events)
+
+
+# ── latest_assistant_turn_text (#2048) ──────────────────────────────────────
+
+
+class TestLatestAssistantTurnText:
+    def test_no_assistant_turn_returns_none(self) -> None:
+        text = _ndjson([_init_event()])
+        assert latest_assistant_turn_text_from_text(text) is None
+
+    def test_single_turn_returns_its_text(self) -> None:
+        text = _ndjson([_init_event(), _assistant_text_event("doing the thing")])
+        assert latest_assistant_turn_text_from_text(text) == "doing the thing"
+
+    def test_returns_only_the_most_recent_turn_not_the_transcript(self) -> None:
+        """The whole point of #2048's context isolation: only the LAST turn
+        comes back, never earlier ones — a caller must not be able to
+        recover the transcript from this helper."""
+        text = _ndjson([
+            _init_event(),
+            _assistant_text_event("first turn: exploring the repo"),
+            _assistant_text_event("second turn: still exploring"),
+            _assistant_text_event("third and final turn: found it"),
+        ])
+        result = latest_assistant_turn_text_from_text(text)
+        assert result == "third and final turn: found it"
+        assert "first turn" not in result
+        assert "second turn" not in result
+
+    def test_tool_only_turn_summarises_tool_names(self) -> None:
+        text = _ndjson([
+            _init_event(),
+            _assistant_tool_use_event("Bash", {"command": "pytest"}),
+        ])
+        result = latest_assistant_turn_text_from_text(text)
+        assert result is not None
+        assert "Bash" in result
+
+    def test_from_file_reads_tail_only(self, tmp_path: Path) -> None:
+        p = tmp_path / "log.log"
+        events = [_init_event()] + [
+            _assistant_text_event(f"turn {i}") for i in range(50)
+        ]
+        p.write_text(_ndjson(events))
+        assert latest_assistant_turn_text(p) == "turn 49"
+
+    def test_missing_file_returns_none(self, tmp_path: Path) -> None:
+        assert latest_assistant_turn_text(tmp_path / "nope.log") is None
 
 
 # ── render_event / render_log ──────────────────────────────────────────────

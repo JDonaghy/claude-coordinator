@@ -29,10 +29,12 @@ from coord.comments import (
     EVENT_ADVISORY,
     EVENT_COMPLETION,
     EVENT_FAILURE,
+    EVENT_LIVENESS_STALL,
     EVENT_NEEDS_ATTENTION,
     EVENT_PLAN,
     EVENT_STALLED,
     EVENT_STUCK,
+    format_liveness_stall,
     format_needs_attention,
     format_plan,
     format_stalled_pipeline,
@@ -45,9 +47,11 @@ from coord.progress import parse_progress
 from coord.state import (
     load_dispatched,
     load_done_reviews_needing_post,
+    load_liveness_audit_state,
     load_notified,
     mark_notified,
     mark_review_posted,
+    save_liveness_audit_state,
     save_plan,
 )
 
@@ -134,6 +138,33 @@ def _stalled_notified_key(assignment_id: str) -> str:
     and vice versa.
     """
     return f"{assignment_id}:stalled"
+
+
+@dataclass
+class LivenessStallDetection:
+    """#2048: N consecutive ``blocked`` verdicts from the cheap per-turn
+    liveness auditor. See :func:`detect_liveness_stall`."""
+
+    assignment_id: str
+    machine_name: str
+    repo_name: str
+    issue_number: int
+    consecutive_blocked: int
+    last_verdict: str | None
+
+
+def _liveness_notified_key(assignment_id: str) -> str:
+    """Notified ledger key for liveness-stall events (#2048).
+
+    Composite key (mirrors :func:`_needs_attention_notified_key` /
+    :func:`_stalled_notified_key`) so a one-shot liveness comment does not
+    block later completion/failure/stuck/needs-attention/stalled
+    notifications for the same assignment_id, and vice versa. This exact
+    shape is also what keeps ``mark_notified``'s bare-``else`` branch from
+    ever writing ``status='failed'`` onto a real assignment row for this
+    event — see the comment in ``coord.state._mark_notified_local``.
+    """
+    return f"{assignment_id}:liveness"
 
 
 def _fmt_minutes(seconds: float) -> str:
@@ -285,6 +316,187 @@ def post_needs_attention(detection: NeedsAttentionDetection, record: dict) -> No
         record["repo_github"], detection.issue_number, body
     )
     mark_notified(_needs_attention_notified_key(detection.assignment_id), EVENT_NEEDS_ATTENTION)
+
+
+# ── Liveness auditor (#2048) ─────────────────────────────────────────────────
+#
+# Tier 2.5 in the stall-detection ladder (see coord/liveness_auditor.py's
+# module docstring): a cheap, independent, per-turn judgment call, sitting
+# between EVENT_NEEDS_ATTENTION (a clock, no judgment) and a metered
+# adversarial review (judgment, but only at a stage boundary). Detection +
+# a one-shot GitHub comment only, mirroring detect_needs_attention's/
+# detect_stalled_pipeline's contract exactly: this function NEVER sets
+# Assignment.status/review_state/test_state, never kills/reassigns a
+# worker, and never influences a merge decision. It only ever (a) runs a
+# `claude -p` subprocess against a fixed-size (objective, latest-turn)
+# context and (b) records/reads the resulting strike streak.
+
+
+def _fetch_log_text_for_liveness(
+    machine_name: str, log_path: str | None, assignment_id: str,
+) -> str | None:
+    """Best-effort log text for a RUNNING assignment, for the liveness
+    auditor to pull the latest turn out of.
+
+    Mirrors :func:`_fetch_raw_log_text`'s local-file-then-agent-fetch
+    fallback (that helper takes a completed :class:`Transition`; this one
+    is called against a still-running assignment, so it takes the bare
+    fields instead). Returns ``None`` on any I/O failure — best-effort, the
+    auditor must never be the reason ``coord notify`` raises.
+    """
+    if log_path:
+        try:
+            return Path(log_path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            pass
+    host = _agent_host(machine_name)
+    if host:
+        try:
+            resp = httpx.get(
+                f"http://{host}:{AGENT_PORT}/logs/{assignment_id}", timeout=15.0
+            )
+            resp.raise_for_status()
+            return resp.text
+        except (httpx.HTTPError, httpx.TimeoutException):
+            return None
+    return None
+
+
+def detect_liveness_stall(
+    config: Config, *, now: float | None = None
+) -> list[tuple[LivenessStallDetection, dict]]:
+    """#2048: run the cheap per-turn liveness auditor against running
+    assignments and flag the ones whose latest turns earned
+    ``config.pipeline.liveness_auditor.strikes`` consecutive ``blocked``
+    verdicts in a row.
+
+    Returns ``(LivenessStallDetection, dispatch_record)`` pairs, mirroring
+    :func:`detect_needs_attention`'s shape. No-ops entirely (returns ``[]``
+    without touching the DB or spawning a subprocess) when
+    ``config.pipeline.liveness_auditor.enabled`` is ``False`` — the default.
+    """
+    cfg = config.pipeline.liveness_auditor
+    if not cfg.enabled:
+        return []
+
+    from coord.liveness_auditor import (  # noqa: PLC0415
+        apply_verdict,
+        run_audit,
+        should_audit,
+        strip_self_report_lines,
+    )
+    from coord.worker_events import latest_assistant_turn_text_from_text  # noqa: PLC0415
+
+    if now is None:
+        now = time.time()
+
+    dispatched = load_dispatched()
+    if not dispatched:
+        return []
+    notified = load_notified()
+
+    active_records = [
+        r for r in dispatched
+        if (r.get("status") or "").lower() == "running"
+        and r["assignment_id"] not in notified
+        and _liveness_notified_key(r["assignment_id"]) not in notified
+    ]
+    if not active_records:
+        return []
+
+    machines_by_name = {m.name: m for m in config.machines}
+    by_machine: dict[str, list[dict]] = {}
+    for r in active_records:
+        by_machine.setdefault(r["machine_name"], []).append(r)
+
+    results: list[tuple[LivenessStallDetection, dict]] = []
+    for machine_name, records in by_machine.items():
+        machine = machines_by_name.get(machine_name)
+        if machine is None:
+            continue
+        status = _agent_status(machine.host)
+        if status is None:
+            continue
+        active_by_id: dict[str, dict] = {}
+        for entry in status.get("active", []):
+            eid = entry.get("id")
+            if eid:
+                active_by_id[eid] = entry
+
+        for record in records:
+            aid = record["assignment_id"]
+            entry = active_by_id.get(aid)
+            if entry is None:
+                continue
+
+            state = load_liveness_audit_state(aid)
+            if state.raised:
+                continue
+            if not should_audit(
+                last_audit_at=state.last_audit_at,
+                now=now,
+                debounce_seconds=cfg.debounce_seconds,
+            ):
+                continue
+
+            text = _fetch_log_text_for_liveness(
+                record["machine_name"], entry.get("log_path"), aid
+            )
+            if text is None:
+                continue
+            # Bound to the tail — the auditor only ever needs the single
+            # most recent turn, never the whole (potentially multi-MB)
+            # transcript.
+            turn_text = latest_assistant_turn_text_from_text(text[-65536:])
+            if turn_text is None:
+                continue  # no assistant turn yet — nothing to audit
+
+            # #2048 context isolation: strip the worker's own STATUS:/
+            # STUCK: lines before the auditor ever sees this turn — see
+            # coord.liveness_auditor's module docstring.
+            turn_text = strip_self_report_lines(turn_text)
+
+            outcome = run_audit(
+                record.get("briefing") or "",
+                turn_text,
+                model=cfg.model,
+                claude_bin=cfg.claude_bin,
+                timeout=cfg.timeout_seconds,
+            )
+            new_state, just_raised = apply_verdict(
+                state, outcome.verdict, now=now, strikes=cfg.strikes
+            )
+            save_liveness_audit_state(aid, new_state)
+
+            if just_raised:
+                results.append((
+                    LivenessStallDetection(
+                        assignment_id=aid,
+                        machine_name=record["machine_name"],
+                        repo_name=record["repo_name"],
+                        issue_number=record["issue_number"],
+                        consecutive_blocked=new_state.consecutive_blocked,
+                        last_verdict=new_state.last_verdict,
+                    ),
+                    record,
+                ))
+
+    return results
+
+
+def post_liveness_stall(detection: LivenessStallDetection, record: dict) -> None:
+    """Post a liveness-stall comment to GitHub and mark notified (#2048)."""
+    body = format_liveness_stall(
+        assignment_id=detection.assignment_id,
+        machine_name=detection.machine_name,
+        repo_name=detection.repo_name,
+        issue_number=detection.issue_number,
+        consecutive_blocked=detection.consecutive_blocked,
+    )
+    github_ops.post_issue_comment(
+        record["repo_github"], detection.issue_number, body
+    )
+    mark_notified(_liveness_notified_key(detection.assignment_id), EVENT_LIVENESS_STALL)
 
 
 # ── Stalled-pipeline sweeper (#1441) ────────────────────────────────────────
@@ -2716,19 +2928,24 @@ def run(
     list[StuckDetection],
     list[NeedsAttentionDetection],
     list[StalledDetection],
+    list[LivenessStallDetection],
 ]:
     """Detect and post all pending transitions, stuck signals, #846
-    needs-attention detections, and #1441 stalled-pipeline detections.
+    needs-attention detections, #1441 stalled-pipeline detections, and
+    #2048 liveness-auditor stalls.
 
     Also dispatches any pending reviews found on the saved board so that
     ``coord notify`` acts as a reliable review-dispatch trigger in addition
     to ``coord status --reconcile``.
 
     Returns (posted_transitions, posted_stuck, posted_needs_attention,
-    posted_stalled). The stalled entry is new in #1441 — appended rather than
-    inserted, so any existing caller unpacking a 3-tuple positionally would
-    break loudly (a good thing: it means the CLI/board/TUI surfacing this
-    issue asks for was actually wired up, not silently skipped).
+    posted_stalled, posted_liveness). The liveness entry is new in #2048 —
+    appended rather than inserted, following #1441's own precedent: any
+    existing caller unpacking a 4-tuple positionally breaks loudly, which
+    is a good thing (it means the CLI/board/TUI surfacing was actually
+    wired up, not silently skipped). ``posted_liveness`` is always ``[]``
+    when ``config.pipeline.liveness_auditor.enabled`` is ``False`` (the
+    default).
     """
     # Refresh the agent-host cache so _try_parse_and_post_review (and any
     # other helper using _agent_host) can resolve hostnames without
@@ -2897,4 +3114,19 @@ def run(
     except Exception:  # noqa: BLE001
         log.exception("detect_stalled_pipeline: unexpected error")
 
-    return posted, stuck_posted, needs_attention_posted, stalled_posted
+    # #2048: cheap per-turn liveness auditor. Best-effort, non-fatal —
+    # mirrors the #846 needs-attention block above. Entirely a no-op
+    # (returns [] immediately, no subprocess, no DB write) unless
+    # config.pipeline.liveness_auditor.enabled is set.
+    liveness_posted: list[LivenessStallDetection] = []
+    try:
+        for detection, record in detect_liveness_stall(config):
+            try:
+                post_liveness_stall(detection, record)
+            except Exception:  # noqa: BLE001
+                continue
+            liveness_posted.append(detection)
+    except Exception:  # noqa: BLE001
+        log.exception("detect_liveness_stall: unexpected error")
+
+    return posted, stuck_posted, needs_attention_posted, stalled_posted, liveness_posted
