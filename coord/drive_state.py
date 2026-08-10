@@ -152,6 +152,32 @@ class IssueState:
     acceptance_author_branch: str = ""
     acceptance_author_machine: str = ""
 
+    # ── #2079: the JIT slice's OWN landing state ────────────────────────
+    # The slice row is `WORK_LIKE` (coord.models.WORK_LIKE_TYPES includes
+    # "test-author"), so the daemon's passive tick dispatches its Test and
+    # Review stages and `enqueue_approved_work` puts it in the merge queue —
+    # all of that runs unconditionally. The ONE step that does not is the
+    # final drain (`serve_app._auto_drain_tick`, gated on
+    # `merge.auto_drain`, which is `false` in the standing fleet config), so
+    # a green, READY slice sits there forever and `coord drive` idles to its
+    # deadline waiting for a merge nobody will perform. These fields are
+    # what let `coord.drive._decide_acceptance_landing` drive that last step
+    # itself (`coord merge --only <slice aid>`), exactly as it already does
+    # for the issue's own work row.
+    #
+    # All four reads are over data already on `/board` — no extra I/O. The
+    # merge entry is matched on the slice's ASSIGNMENT ID, not on
+    # (repo, issue): the slice row's `issue_number` is the milestone's
+    # TRACKING issue, which may carry other queue entries of its own (the
+    # Gate-A mock, a sibling issue's slice).
+    acceptance_author_test_state: str = ""
+    acceptance_review_aid: str = ""
+    acceptance_review_verdict: str = ""
+    acceptance_merge_status: str = ""
+    acceptance_merge_reason: str = ""
+    acceptance_merge_aid: str = ""
+    acceptance_merge_pr_url: str = ""
+
     # #2024/#685: the issue's Test-stage POLICY, read from the same
     # `test-mode:*` labels `coord.smoke.dispatch_pending_smoke` gates on
     # (`coord.models.test_mode_from_labels` — one shared reading, no drift).
@@ -181,6 +207,16 @@ class IssueState:
         real transition the driver just reacted to, not a stall. Omitting it
         would both mute the ``state:`` log line for that change and let the
         stall timer keep counting through it.
+
+        #2079: the oracle-mode JIT slice's own landing fields are here for
+        the same reason. While `coord drive` is waiting on the slice, EVERY
+        work-row field above is empty and frozen (the work row does not
+        exist yet, by construction), so the slice progressing from
+        `test_state=""` → `passed` → an approved review → a READY queue
+        entry produced no fingerprint change at all: the `state:` line never
+        printed, and the stall detector nudged `coord notify` every
+        `--stall` minutes as if nothing were happening. Real transitions,
+        rendered as a stall.
         """
         return "|".join(
             str(v)
@@ -194,6 +230,12 @@ class IssueState:
                 self.review_verdict,
                 self.merge_status,
                 self.merge_reason,
+                self.acceptance_author_aid,
+                self.acceptance_author_status,
+                self.acceptance_author_test_state,
+                self.acceptance_review_verdict,
+                self.acceptance_merge_status,
+                self.acceptance_merge_reason,
             )
         )
 
@@ -308,6 +350,32 @@ def project(payload: dict, repo: str, issue: int, config: Any) -> IssueState:
         ]
     )
 
+    # #2079: the slice's own Test/Review/Merge landing state. Its review
+    # child is keyed the same way the work row's is (`review_of_assignment_id`
+    # → the reviewed row's id), and its merge-queue entry is matched on that
+    # id too — see the `acceptance_*` field block in `IssueState` for why the
+    # (repo, issue) match `_merge_entry` uses for the work row would be wrong
+    # here.
+    acceptance_author_aid = g(acceptance_author, "assignment_id")
+    acceptance_review = (
+        _latest(
+            [
+                a
+                for a in payload.get("assignments") or []
+                if a.get("repo_name") == repo
+                and a.get("type") == "review"
+                and a.get("review_of_assignment_id") == acceptance_author_aid
+            ]
+        )
+        if acceptance_author_aid
+        else None
+    )
+    acceptance_merge = (
+        _merge_entry(payload, repo, issue, assignment_id=acceptance_author_aid)
+        if acceptance_author_aid
+        else None
+    )
+
     _machine_pick = pick_machine_choice(
         payload, repo, config, issue_labels=issue_labels,
     )
@@ -358,16 +426,33 @@ def project(payload: dict, repo: str, issue: int, config: Any) -> IssueState:
         # `coord.state._get_issue_test_mode_local` uses, so the driver and the
         # dispatcher cannot disagree about what the label means.
         issue_test_mode=test_mode_from_labels(issue_labels) or "",
-        acceptance_author_aid=g(acceptance_author, "assignment_id"),
+        acceptance_author_aid=acceptance_author_aid,
         acceptance_author_status=g(acceptance_author, "status"),
         acceptance_author_branch=g(acceptance_author, "branch"),
         acceptance_author_machine=g(acceptance_author, "machine_name"),
+        acceptance_author_test_state=g(acceptance_author, "test_state"),
+        acceptance_review_aid=g(acceptance_review, "assignment_id"),
+        acceptance_review_verdict=g(acceptance_review, "review_verdict"),
+        acceptance_merge_status=(acceptance_merge or {}).get("status") or "",
+        acceptance_merge_reason=(acceptance_merge or {}).get("reason") or "",
+        acceptance_merge_aid=(acceptance_merge or {}).get("assignment_id") or "",
+        acceptance_merge_pr_url=(acceptance_merge or {}).get("pr_url") or "",
     )
 
 
-def _merge_entry(payload: dict, repo: str, issue: int) -> dict | None:
+def _merge_entry(
+    payload: dict, repo: str, issue: int, *, assignment_id: str = ""
+) -> dict | None:
     """Merge state for (*repo*, *issue*): the plan entry, cross-checked
     against the raw queue row.
+
+    #2079: pass *assignment_id* to match on the queue entry's own
+    ``assignment_id`` instead of on ``issue_number``. That is the right key —
+    and (repo, issue) the wrong one — for the oracle-mode JIT acceptance
+    slice: its assignment row's ``issue_number`` is the milestone's TRACKING
+    issue (#1171/#1138), which routinely carries queue entries belonging to
+    OTHER rows (the Gate-A mock, a sibling member issue's slice). Matching on
+    the issue there would hand the driver a stranger's merge status.
 
     Matched on (repo, issue) rather than assignment id on purpose: the
     enqueued entry may be keyed to an earlier work row in a fix chain.
@@ -397,15 +482,22 @@ def _merge_entry(payload: dict, repo: str, issue: int) -> dict | None:
     escalation record's proposed ``gh pr merge`` command still gets a PR
     number on a normal daemon-backed board.
     """
+    def _matches(entry: dict) -> bool:
+        if entry.get("repo_name") != repo:
+            return False
+        if assignment_id:
+            return entry.get("assignment_id") == assignment_id
+        return entry.get("issue_number") == issue
+
     plan_entry = None
     for entry in payload.get("merge_plan") or []:
-        if entry.get("repo_name") == repo and entry.get("issue_number") == issue:
+        if _matches(entry):
             plan_entry = entry
             break
 
     raw_entry = None
     for entry in payload.get("merge_queue") or []:
-        if entry.get("repo_name") == repo and entry.get("issue_number") == issue:
+        if _matches(entry):
             raw_entry = entry
             break
 

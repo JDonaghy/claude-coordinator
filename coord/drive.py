@@ -59,9 +59,16 @@ acceptance author <repo> <tracking_issue> --issue <N>``, plus ``--for-path``
 when the repo's driver is routed — resolved from the milestone's Gate-A
 mock kind via the SHARED :func:`coord.acceptance.resolve_for_path`, so this
 never drifts from whatever eventually resolves it for the TUI's own menu,
-#1460) and :func:`_decide_acceptance_author` observes it through to a landed
-merge (``status='merged'``, #609 — its own Test/Review/Merge are driven by
-coord exactly like a normal work row) before ever calling ``coord assign``.
+#1460) and :func:`_decide_acceptance_author` drives it through to a landed
+merge (``status='merged'``, #609) before ever calling ``coord assign``.
+The slice's Test and Review stages are dispatched by coord's own passive tick
+exactly like a normal work row's, so this only observes those; its MERGE is
+not (``serve_app._auto_drain_tick`` is gated on ``merge.auto_drain``, which is
+off by default and off in the standing fleet config), so
+:func:`_decide_acceptance_landing` performs it — the same bounded ``coord
+merge --only <aid>`` this driver already runs for the work row (#2079: before
+that, every oracle issue idled through ``2 × --deadline`` waiting for a drain
+loop that was switched off, then landed in a terminal ``blocked`` state).
 An ``advisory`` JIT-slice exit is handled exactly like the main work row's
 (``--accept-advisory``, #1357) rather than waited on forever.
 ``--no-acceptance`` opts out back to the pre-#1453 behaviour.
@@ -266,6 +273,22 @@ class DriveCounters:
     # attempt that produced it — one poll's staleness is the price of
     # keeping the I/O boundary in `Driver`, not in `decide()`.
     last_merge_diagnostic: str = ""
+    # #2079: a SECOND, independent budget of exactly the same shape, spent
+    # only on landing the oracle-mode JIT acceptance slice
+    # (`_decide_acceptance_landing`). Separate rather than shared because the
+    # slice and the issue's own work row are two different PRs with two
+    # different merge queues and two different `coord merge --only` targets:
+    # three attempts spent landing the slice must not silently leave the work
+    # row's own merge with zero. Lazily created (`slice_budget`) so the
+    # overwhelming majority of drives — non-oracle ones — never allocate it,
+    # and `--dry-run`'s counter snapshot stays unchanged for them.
+    acceptance: "DriveCounters | None" = None
+
+    def slice_budget(self) -> "DriveCounters":
+        """This run's slice-landing budget, created on first use (#2079)."""
+        if self.acceptance is None:
+            self.acceptance = DriveCounters()
+        return self.acceptance
 
 
 # ── actions ──────────────────────────────────────────────────────────────────
@@ -297,6 +320,15 @@ class Action:
     error_message: str = ""
     serialize_merge: bool = False
     warnings: tuple[str, ...] = ()
+    # #2079: which merge this Action's `coord merge --only` attempt belongs
+    # to — the issue's own work row ("work", the default and the only value
+    # before #2079) or the oracle-mode JIT acceptance slice ("acceptance").
+    # Read by `Driver._loop` to file the captured diagnostic against the
+    # matching `DriveCounters` (see `DriveCounters.acceptance`); a slice
+    # attempt's `_explain_missing_only_entry` output must not overwrite what
+    # the work row's own last attempt reported, or `_decide_merge` would
+    # diagnose one PR using the other PR's gates.
+    merge_scope: str = "work"
 
     @property
     def is_exit(self) -> bool:
@@ -405,6 +437,14 @@ def resolve_oracle_decision(
     explanation once an oracle-opted-in milestone's issue reaches it — this
     proactively drives the authoring + merge to completion FIRST so a plain
     ``coord drive`` doesn't dead-end on that refusal.
+
+    #2079: "drives the merge to completion" is now literally true. Until
+    #2079 this module said so here and said the opposite in
+    :func:`_decide_acceptance_author` ("this only observes"), and the
+    observing version was the one that shipped — so every oracle issue burned
+    ``2 × --deadline`` waiting for ``serve_app._auto_drain_tick``, which is
+    off (``merge.auto_drain: false``) in the standing fleet config and merges
+    nothing, ever. :func:`_decide_acceptance_landing` is the reconciliation.
     """
     if opts.no_acceptance:
         return OracleDecision(False, "--no-acceptance set — normal drive")
@@ -448,6 +488,7 @@ def _decide_acceptance_author(
     state: IssueState,
     oracle: OracleDecision,
     opts: DriveOptions,
+    counters: DriveCounters,
     machine: str,
     gate_checker: AcceptanceGateChecker,
     verifier: MergeVerifier,
@@ -456,17 +497,31 @@ def _decide_acceptance_author(
     through to dispatching work normally" (only ever called when
     ``oracle.active``).
 
-    Observes a `type="test-author"` assignment scoped to THIS issue
+    Drives a `type="test-author"` assignment scoped to THIS issue
     (``for_issue_number == state.issue`` — #1171/#1138 key the JIT slice's
     row on the milestone's TRACKING issue via `issue_number`, so it never
     shows up as this issue's own ``work_aid``; see ``IssueState``'s
-    docstring). That assignment is itself `WORK_LIKE`
-    (``coord.models.WORK_LIKE_TYPES``), so coord drives its OWN Test → Review
-    → Merge exactly like a normal work row (dispatch_pending_smoke /
-    dispatch_pending_reviews / the merge queue) with zero help from this
-    driver — this only waits for its board row to reach ``status='merged'``
-    (#609), the identical terminal signal :func:`decide`'s own merged check
-    uses for the real work row.
+    docstring) all the way to ``status='merged'`` (#609) — the identical
+    terminal signal :func:`decide`'s own merged check uses for the real work
+    row.
+
+    **#2079 — how much of that landing is actually somebody else's job.**
+    The slice row is `WORK_LIKE` (``coord.models.WORK_LIKE_TYPES`` contains
+    ``"test-author"``), so the daemon's passive tick really does run its
+    Test and Review stages and really does enqueue it
+    (``dispatch_pending_smoke`` / ``dispatch_pending_reviews`` /
+    ``merge_queue.enqueue_approved_work``) with zero help from this driver.
+    Every one of those steps runs unconditionally. Exactly ONE does not: the
+    final drain, ``serve_app._auto_drain_tick``, gated on
+    ``merge.auto_drain`` — ``false`` by default and ``false`` in the standing
+    fleet config. So the pre-#2079 comment here ("this only observes") was
+    describing a pipeline with its last stage switched off: the slice reached
+    READY with a green, ``MERGEABLE``/``CLEAN`` PR and then nothing merged
+    it, ever, while this driver idled to ``--deadline`` twice and left the
+    issue ``blocked`` (terminal — a manual ``remove`` + ``add`` to clear).
+    Landing that last step is what :func:`_decide_acceptance_landing` does,
+    with the same bounded ``coord merge --only <aid>`` call
+    :func:`_decide_merge` already makes for the work row.
     """
     aid = state.acceptance_author_aid
     status = state.acceptance_author_status
@@ -560,8 +615,14 @@ def _decide_acceptance_author(
                 "   Proceed anyway with --accept-advisory, or re-run coord "
                 "drive with --no-acceptance."
             )
-        return Action(
-            kind=WAIT,
+        # #2079: "proceeding per --accept-advisory" now proceeds. This used
+        # to be a bare WAIT, which for an ADVISORY row is unreachable-by-
+        # construction: `coord.reconcile` explicitly skips advisory rows in
+        # the Test/Review/Merge auto-loop (the very fact the comment above
+        # cites), so the thing being waited for could not happen even with
+        # `merge.auto_drain` on.
+        return replace(
+            _decide_acceptance_landing(state, oracle, opts, counters, machine),
             warnings=(
                 f"ACCEPTANCE: JIT slice {aid} is ADVISORY with commits present "
                 "— proceeding per --accept-advisory (#1357)",
@@ -593,15 +654,159 @@ def _decide_acceptance_author(
                 "   or re-run coord drive with --no-acceptance to skip JIT "
                 "authoring."
             )
+        # Authoring finished and the branch carries commits: hand over to the
+        # landing driver, which observes the daemon-driven Test/Review stages
+        # and performs the one step the daemon will not (#2079 — the merge).
+        return _decide_acceptance_landing(state, oracle, opts, counters, machine)
 
-    # "" / running: still authoring. done (with commits, checked above):
-    # authoring finished, now landing through Test → Review → Merge — coord's
-    # own tick loop drives that, exactly like a normal work row; this only
-    # observes (same posture as every other gate in this module).
-    verb = "authoring" if status in ("", "running") else "landing (Test → Review → Merge)"
+    # "" / running: still authoring — nothing to drive yet.
     return _wait(
-        label=f"ACCEPTANCE: JIT slice {aid} status={status or '(none)'} — {verb}"
+        label=(
+            f"ACCEPTANCE: JIT slice {aid} status={status or '(none)'} — authoring"
+        )
     )
+
+
+def _decide_acceptance_landing(
+    state: IssueState,
+    oracle: OracleDecision,
+    opts: DriveOptions,
+    counters: DriveCounters,
+    machine: str,
+) -> Action:
+    """Land the authored JIT acceptance slice (#2079).
+
+    Reached only once the slice's own ``test-author`` row is terminal WITH
+    commits on its branch — i.e. there is a real PR to land. From here the
+    slice walks the identical Test → Review → Merge path a work row does, and
+    this function takes the identical posture :func:`decide` takes for the
+    work row: **observe the stages the daemon dispatches, perform the merge
+    itself.**
+
+    The split is not a style choice, it is where the daemon's tick actually
+    stops. ``dispatch_pending_smoke``, ``dispatch_pending_reviews`` and
+    ``merge_queue.enqueue_approved_work`` all run unconditionally on
+    ``serve_app._passive_tick``; ``_auto_drain_tick`` — the step that turns a
+    READY queue entry into a merged PR — runs only when ``merge.auto_drain``
+    is on, and it is off. So waiting for the first three is waiting for
+    something that will happen, and waiting for the fourth is the #1526
+    defect: an unbounded wait for an event that cannot occur.
+
+    Three shapes get an immediate, actionable exit instead of a wait,
+    because for each of them the corrective action belongs to a loop that
+    will never run for this row:
+
+    * a FAILED slice test — the work row's equivalent dispatches
+      ``coord fix``, but nothing dispatches one for a ``test-author`` row
+      whose Test stage failed;
+    * a ``request-changes`` slice review — ``auto_loop`` accepts a
+      ``test-author`` fix (``FIX_DISPATCH_TYPES``), but the daemon drain
+      deliberately excludes fix dispatch (#476/#477, and #1692's own
+      analysis), so for the work row it is THIS driver that runs
+      ``coord fix``; there was no such arm for the slice;
+    * ``--no-merge`` — the slice merge is a hard prerequisite for
+      dispatching any work at all (#1138), so with merging switched off the
+      run cannot progress, and saying so beats idling to the deadline.
+
+    The merge itself reuses :func:`_decide_merge` verbatim against a shadow
+    :class:`~coord.drive_state.IssueState` whose "work row" IS the slice —
+    that is what carries #1891 (CI not reported → wait, don't retry), #1892
+    (CI infra failure → wait), #1505 (a status no retry can fix →
+    escalate), #1526 (driver/gate divergence) and #2078 (quote the real
+    ``coord merge --only`` diagnostic) into the slice lane without a second
+    implementation of any of them.
+    """
+    aid = state.acceptance_author_aid
+    merge_status = (state.acceptance_merge_status or "").upper()
+
+    # Already landed on GitHub; the board row just hasn't been reconciled to
+    # `status='merged'` yet. Checked FIRST: MERGED is not in
+    # `_RETRYABLE_MERGE_STATUSES`, so handing it to `_decide_merge` would
+    # escalate a success.
+    if merge_status == "MERGED":
+        return _wait(
+            label=(
+                f"ACCEPTANCE: JIT slice {aid} PR is MERGED — waiting for the "
+                "board row to reconcile to status='merged'"
+            )
+        )
+
+    test_state = state.acceptance_author_test_state
+    if test_state == "failed":
+        return _die(
+            f"the JIT acceptance slice {aid} FAILED its Test stage — nothing "
+            "will fix it on its own (the review→fix loop that covers a work "
+            "row is not dispatched for a test-author row).\n"
+            f"   inspect: coord log {aid} --machine "
+            f"{state.acceptance_author_machine or machine}\n"
+            f"   Fix it: coord fix {aid}\n"
+            "   or re-run coord drive with --no-acceptance to skip JIT "
+            "authoring."
+        )
+
+    if state.acceptance_review_verdict == "request-changes":
+        return _die(
+            f"the JIT acceptance slice {aid} was reviewed REQUEST-CHANGES "
+            f"(review {state.acceptance_review_aid or 'unknown'}) — it will "
+            "never reach the merge queue until that is addressed, and no "
+            "loop dispatches the fix for a test-author row on its own.\n"
+            f"   Findings: coord log {state.acceptance_review_aid or aid}\n"
+            f"   Fix it: coord fix {state.acceptance_review_aid or aid}\n"
+            "   or re-run coord drive with --no-acceptance to skip JIT "
+            "authoring."
+        )
+
+    if not opts.do_merge:
+        pr = state.acceptance_merge_pr_url or "(no PR recorded yet)"
+        return _die(
+            f"the JIT acceptance slice {aid} is authored but NOT landed, and "
+            "--no-merge is set.\n"
+            f"   Its PR: {pr}\n"
+            "   #1138 refuses to dispatch work for this issue until the slice "
+            "is merged, so this run cannot progress.\n"
+            f"   Land it by hand: coord merge --only {aid} --method "
+            f"{opts.merge_method}\n"
+            "   or re-run coord drive without --no-merge (or with "
+            "--no-acceptance to skip JIT authoring)."
+        )
+
+    # The shadow state: the slice IS the work row. `issue` becomes the
+    # milestone's TRACKING issue because that is what the slice's own board
+    # row and merge-queue entry are keyed on — so every `coord diagnose
+    # <repo> <issue>` / `coord escalate record <repo> <issue>` command
+    # `_decide_merge` and `_escalate_merge` compose points at the row a human
+    # would actually have to fix.
+    shadow = replace(
+        state,
+        issue=oracle.tracking_issue or state.issue,
+        work_aid=aid,
+        work_branch=state.acceptance_author_branch,
+        work_machine=state.acceptance_author_machine,
+        work_test_state=test_state,
+        work_test_reason="",
+        review_aid=state.acceptance_review_aid,
+        review_verdict=state.acceptance_review_verdict,
+        merge_status=state.acceptance_merge_status,
+        merge_reason=state.acceptance_merge_reason,
+        merge_aid=state.acceptance_merge_aid,
+        merge_pr_url=state.acceptance_merge_pr_url,
+    )
+    action = _decide_merge(shadow, opts, counters.slice_budget())
+    return replace(
+        action, label=_acceptance_label(action.label), merge_scope="acceptance"
+    )
+
+
+def _acceptance_label(label: str) -> str:
+    """Re-badge a :func:`_decide_merge` label as a slice-lane one (#2079).
+
+    Without this the pane prints ``MERGE: attempt 1/3`` for the SLICE's merge
+    while the issue's own work row does not exist yet — the single most
+    confusing line this driver could emit.
+    """
+    if not label:
+        return ""
+    return "ACCEPTANCE/" + label
 
 
 # ── merge verification ───────────────────────────────────────────────────────
@@ -945,7 +1150,9 @@ def decide(
 
     # ---- no work yet: plan and/or dispatch ---------------------------------
     if not state.work_aid:
-        return _dispatch_work_stage(state, opts, machine, oracle, gate_checker, verifier)
+        return _dispatch_work_stage(
+            state, opts, counters, machine, oracle, gate_checker, verifier
+        )
 
     # ---- work died from hitting the account's usage limit: wait -----------
     #
@@ -1105,6 +1312,7 @@ def decide(
 def _dispatch_work_stage(
     state: IssueState,
     opts: DriveOptions,
+    counters: DriveCounters,
     machine: str,
     oracle: OracleDecision | None = None,
     gate_checker: AcceptanceGateChecker | None = None,
@@ -1113,19 +1321,24 @@ def _dispatch_work_stage(
     """No work row yet: run the optional plan stage, then dispatch the work.
 
     #1453: when *oracle* is active, the sealed JIT acceptance slice for this
-    issue is authored — and observed through to a landed merge — BEFORE
+    issue is authored — and driven through to a landed merge (#2079) — BEFORE
     either the plan or the direct-assign path below. Otherwise the #1138
     hard gate (``coord.dispatch.enforce_oracle_readiness``) would simply
     refuse the eventual ``coord assign``/``coord approve-plan`` once an
     oracle-opted-in milestone's issue reaches it, with this driver never
     having explained why.
+
+    *counters* is threaded in for the slice's own merge budget (#2079 —
+    ``DriveCounters.acceptance``); every other decision here is stateless.
     """
     if oracle is not None and oracle.active:
         assert gate_checker is not None and verifier is not None, (
             "oracle.active implies resolve_oracle_decision ran with a real "
             "gate_checker; decide()/Driver always thread one through"
         )
-        gate = _decide_acceptance_author(state, oracle, opts, machine, gate_checker, verifier)
+        gate = _decide_acceptance_author(
+            state, oracle, opts, counters, machine, gate_checker, verifier
+        )
         if gate is not None:
             return gate
 
@@ -2721,6 +2934,25 @@ class Driver:
                     # it had already burned the whole retry budget.
                     + (f" ({state.merge_reason})" if state.merge_reason else "")
                     + f" active={state.active_count}"
+                    # #2079: while the oracle slice is landing, every field
+                    # above is empty by construction (the work row does not
+                    # exist yet) — so without this the one line that is
+                    # supposed to narrate progress narrated nothing at all
+                    # for hours. Only printed when a slice row exists, so a
+                    # normal drive's line is byte-for-byte unchanged.
+                    + (
+                        f" | slice={state.acceptance_author_status or '-'}"
+                        f" test={state.acceptance_author_test_state or '-'}"
+                        f" review={state.acceptance_review_verdict or '-'}"
+                        f" merge={state.acceptance_merge_status or '-'}"
+                        + (
+                            f" ({state.acceptance_merge_reason})"
+                            if state.acceptance_merge_reason
+                            else ""
+                        )
+                        if state.acceptance_author_aid
+                        else ""
+                    )
                 )
             elif now - last_change > self.opts.stall_secs and (
                 last_nudge is None or now - last_nudge > self.opts.stall_secs
@@ -2802,7 +3034,18 @@ class Driver:
                     # avoid a blind retry once a real gate block is already
                     # known, and to name it in the give-up message instead of
                     # the board's empty fields.
-                    counters.last_merge_diagnostic = self._last_run_output
+                    #
+                    # #2079: `_decide_merge` now has two callers — the work
+                    # row and the oracle JIT slice — with one budget each, so
+                    # the diagnostic is filed against the budget that actually
+                    # spent the attempt. Cross-filing it would diagnose one PR
+                    # using the other PR's gates.
+                    budget = (
+                        counters.slice_budget()
+                        if action.merge_scope == "acceptance"
+                        else counters
+                    )
+                    budget.last_merge_diagnostic = self._last_run_output
                 if rc != 0:
                     # #1844: `coord assign`/`coord approve-plan` exits this
                     # SAME code (see EXIT_DISPATCH_REFUSED's docstring) only

@@ -242,6 +242,100 @@ def test_project_picks_the_most_recent_acceptance_author_row():
     assert state.acceptance_author_status == "running"
 
 
+# ── #2079: the slice's own landing state ─────────────────────────────────────
+
+
+def test_project_reads_the_slice_test_review_and_merge_state():
+    """The driver cannot land the slice without seeing the slice's own
+    gates — and none of them are reachable through the work-row fields
+    (there is no work row yet, by construction)."""
+    payload = {
+        "assignments": [
+            row(
+                assignment_id="ta1",
+                issue_number=1120,
+                type="test-author",
+                status="done",
+                for_issue_number=1392,
+                branch="test-author-ms-38-slice-1392",
+                test_state="passed",
+            ),
+            row(
+                assignment_id="rv1",
+                issue_number=1120,
+                type="review",
+                status="done",
+                review_of_assignment_id="ta1",
+                review_verdict="approve",
+            ),
+        ],
+        "merge_queue": [
+            {
+                "repo_name": REPO,
+                "issue_number": 1120,
+                "assignment_id": "ta1",
+                "state": "ready",
+                "pr_url": "https://github.com/john/claude-coordinator/pull/43",
+            }
+        ],
+    }
+    state = project(payload, REPO, 1392, make_config())
+    assert state.acceptance_author_test_state == "passed"
+    assert state.acceptance_review_aid == "rv1"
+    assert state.acceptance_review_verdict == "approve"
+    assert state.acceptance_merge_status == "READY"
+    assert state.acceptance_merge_pr_url.endswith("/pull/43")
+    # ...and none of it leaks into the work row, which does not exist yet.
+    assert state.work_aid == ""
+    assert state.merge_status == ""
+
+
+def test_project_matches_the_slice_merge_entry_on_assignment_id_not_issue():
+    """The tracking issue routinely carries OTHER queue entries (the Gate-A
+    mock, a sibling member issue's slice). Matching on `issue_number` there
+    would hand the driver a stranger's merge status — and then
+    `coord merge --only` against the wrong PR."""
+    payload = {
+        "assignments": [
+            row(
+                assignment_id="ta1",
+                issue_number=1120,
+                type="test-author",
+                status="done",
+                for_issue_number=1392,
+            )
+        ],
+        "merge_queue": [
+            {
+                "repo_name": REPO,
+                "issue_number": 1120,
+                "assignment_id": "mock-author-1",  # the Gate-A contract, not us
+                "state": "conflict",
+                "error": "not our conflict",
+            }
+        ],
+    }
+    state = project(payload, REPO, 1392, make_config())
+    assert state.acceptance_merge_status == ""
+    assert state.acceptance_merge_reason == ""
+
+
+def test_fingerprint_moves_when_only_the_slice_moves():
+    """While the slice is landing, every work-row field is empty and frozen.
+    Without the slice fields the fingerprint never changed, so the `state:`
+    line never printed and `--stall` nudged `coord notify` every 20 minutes
+    as if nothing were happening."""
+    before = IssueState(
+        repo=REPO, issue=1392, acceptance_author_aid="ta1",
+        acceptance_author_status="done", acceptance_author_test_state="",
+    )
+    after = IssueState(
+        repo=REPO, issue=1392, acceptance_author_aid="ta1",
+        acceptance_author_status="done", acceptance_author_test_state="passed",
+    )
+    assert before.fingerprint != after.fingerprint
+
+
 # ── review/smoke keyed on the work row ───────────────────────────────────────
 
 
