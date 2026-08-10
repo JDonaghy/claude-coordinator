@@ -594,10 +594,21 @@ def detect_stalled_pipeline(
        precondition was outstanding, and nothing has re-examined it since).
     2. ``review_done_no_verdict`` (#1582) — the head's linked review is
        ``status="done"`` but ``review_verdict IS NULL``: the reviewing
-       session finalised without ever capturing a verdict (#812 — a session
-       that failed to start, or exited before ``coord report-result``/the
-       transcript-floor ran; elitebook's documented ~14% review-verdict
-       drop rate, #873). This matches NONE of the other three arms — it
+       session finalised without ever capturing a verdict (elitebook's
+       documented ~14% review-verdict drop rate, #873).
+
+       #2019: the detail text used to blame this on "the session likely
+       failed to start or exited before recording one (#812)" for EVERY
+       review. That was wrong twice over on the #1956 reference case — the
+       session ran 392s, produced a complete 6.5KB review and exited 0, and
+       #812 is CLOSED and was about *interactive* reviews, while that one was
+       ``interactive=False``. An operator following it looked at a closed
+       issue and a false cause. The wording is now provider-aware: a headless
+       review that reached ``done`` is reported as the
+       END_REVIEW-without-verdict class (#1956), and only a ``claude-pty``
+       review still cites #812's never-started shape.
+
+       This matches NONE of the other three arms — it
        isn't ``request-changes`` (no verdict at all), a review WAS
        dispatched (so not ``done_no_review``), and there is no approval (so
        not ``approved_not_queued``) — so before this arm existed it fell
@@ -743,11 +754,33 @@ def detect_stalled_pipeline(
             # approval), so this row would otherwise fall all the way
             # through with `reason` left unset.
             reason = "review_done_no_verdict"
-            detail = (
-                f"Review {review.assignment_id} finalised as done but no "
-                "verdict was ever captured — the session likely failed to "
-                "start or exited before recording one (#812)."
-            )
+            # #2019: provider-aware, because the pre-#2019 single sentence
+            # ("the session likely failed to start or exited before recording
+            # one (#812)") was demonstrably false for the headless case and
+            # pointed at a CLOSED issue about interactive reviews. See this
+            # function's docstring, arm 2.
+            if review.provider_name == "claude-pty":
+                detail = (
+                    f"Review {review.assignment_id} finalised as done but no "
+                    "verdict was ever captured — an interactive review that "
+                    "failed to start, or exited before `coord report-result` "
+                    "ran (#812)."
+                )
+            else:
+                detail = (
+                    f"Review {review.assignment_id} finalised as done but no "
+                    "verdict was ever captured. This is a HEADLESS review "
+                    "that ran to completion (a session that died lands "
+                    "status='failed', not 'done'), so the reviewer's "
+                    "REVIEW_VERDICT header was omitted or unparsed — the "
+                    "END_REVIEW-without-verdict class (#1956), not a "
+                    "never-started session. The verdict is very likely "
+                    "already in the transcript; relay it rather than "
+                    "re-dispatching: coord report-result --assignment "
+                    f"{review.assignment_id} --status done --verdict "
+                    "<approve|request-changes> --verdict-source recovered "
+                    "--verdict-reason '...' --body-file <extracted-review.md>"
+                )
         elif (
             review is None
             and "review" in required_gates

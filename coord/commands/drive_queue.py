@@ -583,10 +583,12 @@ def _fetch_board_view() -> BoardView:
     return build_board_view(payload, list_drive_sessions())
 
 
-def _fetch_exit_reasons(entries: list) -> tuple[dict[str, str], dict[str, bool]]:
-    """The drive's own ``drive_exited`` summary — and whether it was a
-    PERMANENT pre-dispatch refusal — for every ``running`` entry THIS
-    launch, keyed by entry key (#1845/#1844).
+def _fetch_exit_reasons(
+    entries: list,
+) -> tuple[dict[str, str], dict[str, bool], dict[str, bool]]:
+    """The drive's own ``drive_exited`` summary — and whether it was
+    PERMANENT (a pre-dispatch refusal, or a dead end) — for every ``running``
+    entry THIS launch, keyed by entry key (#1845/#1844/#2019).
 
     ``coord.drive.Driver.run`` already writes the true reason a run stopped —
     a deliberate refusal narrated in full, not just an exit code — to the
@@ -598,8 +600,8 @@ def _fetch_exit_reasons(entries: list) -> tuple[dict[str, str], dict[str, bool]]
     `_reconcile_running` stay pure and just consume the result as data (like
     *probes*).
 
-    Returns ``(reasons, refused)``. *reasons* is the summary text, same as
-    before #1844. *refused* is ``True`` for a key whose recorded
+    Returns ``(reasons, refused, dead_end)``. *reasons* is the summary text,
+    same as before #1844. *refused* is ``True`` for a key whose recorded
     ``details.exit_code`` equals ``coord.drive.EXIT_DISPATCH_REFUSED`` — a
     DETERMINISTIC pre-dispatch guard refusal (#1138's oracle-readiness gate,
     #1314's epic-target gate, or any other check `coord assign`/`coord
@@ -607,6 +609,14 @@ def _fetch_exit_reasons(entries: list) -> tuple[dict[str, str], dict[str, bool]]
     a transient crash. `_reconcile_running` uses this second mapping to skip
     straight to `blocked` without spending an attempt — see its ``refused``
     branch.
+
+    *dead_end* (#2019) is the same signal for ``coord.drive.EXIT_DEAD_END``:
+    the drive's dead-end predicate found the row terminal and unactionable
+    and exited on the first poll rather than counting ``no state change``
+    against an event that cannot happen. Same disposition as *refused*
+    (`blocked`, no attempt spent), separate mapping so the blocked entry's
+    ``last_reason`` names the real cause instead of claiming a pre-dispatch
+    guard refused something.
 
     Scoped with ``since=entry.launched_at`` so a stale reason (or refusal)
     from a PRIOR attempt on the same (repo, issue) — the entry's key doesn't
@@ -619,10 +629,11 @@ def _fetch_exit_reasons(entries: list) -> tuple[dict[str, str], dict[str, bool]]
     :func:`_local_issue_rows`.
     """
     from coord.audit import query_audit_log  # noqa: PLC0415
-    from coord.drive import EXIT_DISPATCH_REFUSED  # noqa: PLC0415
+    from coord.drive import EXIT_DEAD_END, EXIT_DISPATCH_REFUSED  # noqa: PLC0415
 
     reasons: dict[str, str] = {}
     refused: dict[str, bool] = {}
+    dead_end: dict[str, bool] = {}
     for e in entries:
         if e.state != STATE_RUNNING or e.launched_at is None:
             continue
@@ -646,7 +657,9 @@ def _fetch_exit_reasons(entries: list) -> tuple[dict[str, str], dict[str, bool]]
         details = row.get("details") or {}
         if details.get("exit_code") == EXIT_DISPATCH_REFUSED:
             refused[e.key] = True
-    return reasons, refused
+        elif details.get("exit_code") == EXIT_DEAD_END:
+            dead_end[e.key] = True
+    return reasons, refused, dead_end
 
 
 def _launch_argv(entry: QueueEntry, config_path: Path | None) -> list[str]:
@@ -913,8 +926,9 @@ def drive_queue_tick(
         # synthesised "drive session died" for an exit that was actually
         # deliberate, and — when it was a deterministic refusal — block
         # immediately instead of spending an attempt on a guaranteed-to-fail
-        # retry.
-        exit_reasons, exit_refused = _fetch_exit_reasons(entries)
+        # retry. #2019 adds a second permanent cause with the same handling:
+        # a drive that exited on its own dead-end predicate.
+        exit_reasons, exit_refused, exit_dead_end = _fetch_exit_reasons(entries)
 
         # #1794: the clock is the shell's to read, never `coord.drive_queue`'s.
         # It powers the startup grace window on both sides of the tick — a
@@ -937,6 +951,7 @@ def drive_queue_tick(
             local_host=_local_host_id(),
             exit_reasons=exit_reasons,
             exit_refused=exit_refused,
+            exit_dead_end=exit_dead_end,
         )
 
         for line in render_plan(plan, dry_run=dry_run):

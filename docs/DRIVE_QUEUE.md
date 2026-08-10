@@ -271,6 +271,27 @@ coord drive-queue remove REPO ISSUE && coord drive-queue add REPO ISSUE
 
 or, from the TUI overlay, select the blocked entry and press `u`.
 
+### 4a. Blocked *without* spending an attempt — permanent causes
+
+Two `blocked` reasons are **not** "died `attempts` times". They block on the
+**first** tick that observes them, with `attempts` untouched, because a
+relaunch is guaranteed to reproduce the same outcome. Both are read from the
+drive's own `drive_exited` audit row for that launch, so the reason survives
+the tmux session:
+
+| Exit code | `drive-queue` outcome | Means | Fix |
+|---|---|---|---|
+| `5` (`EXIT_DISPATCH_REFUSED`, #1844) | `refused` | a **pre-dispatch guard** refused the exact dispatch this run attempted (oracle readiness, epic target, …) | the guard's own remedy, quoted verbatim in `last_reason` |
+| `6` (`EXIT_DEAD_END`, #2019) | `dead_end` | the **board row is terminal and unactionable**: nothing active on the fleet, every stage finished, no gate transition available to any amount of polling | the recovery command in `last_reason`; also recorded as a `coord escalate` row and posted to the issue |
+
+A dead end is what `coord drive` used to report as `no state change in
+140.558m`, forever — see `coord/dead_end.py` for the shapes it recognises and,
+just as importantly, the shapes it deliberately does **not** (a Test stage
+that has merely not been dispatched *yet* is indistinguishable from one that
+never will be, so it is left alone rather than escalated). Elapsed time is not
+an input: the predicate refuses to fire while anything is active, so a
+legitimately quiet long-running stage can never trip it however long it runs.
+
 ## 5. The pinned-CLI trap
 
 The timer runs a **specific installed `coord`**, not a checkout — it does not

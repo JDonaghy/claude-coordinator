@@ -279,6 +279,47 @@ class TestReviewDoneNoVerdict:
         assert "review-1" in detection.detail
         assert work.assignment_id == "work-1"
 
+    def test_a_headless_review_is_not_blamed_on_the_closed_812(
+        self, config: Config
+    ) -> None:
+        """#2019: the detail this arm emitted for the claude-coordinator#1956
+        incident said "the session likely failed to start or exited before
+        recording one (#812)". Every clause of that was wrong for the row it
+        described — the session ran 392s, produced a complete 6.5KB review and
+        exited 0; #812 is CLOSED; and #812 was about *interactive* reviews
+        while this one was `interactive=False`. An operator who followed the
+        message landed on a closed issue and a false cause.
+
+        The headless wording now names the real class (#1956,
+        END_REVIEW-without-verdict) and carries the relay command, since
+        re-dispatching is explicitly the wrong move (docs/OPERATING_GOTCHAS.md:
+        it re-derives a conclusion already in the log, and the drop reproduces
+        at ~14%, #873).
+        """
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict=None),
+        )
+        detection, _ = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        )[0]
+        assert "#812" not in detection.detail
+        assert "#1956" in detection.detail
+        assert "coord report-result --assignment review-1" in detection.detail
+
+    def test_an_interactive_review_still_cites_812(self, config: Config) -> None:
+        """The other half of the same fix: #812's "never started / exited
+        before `coord report-result` ran" shape IS the right diagnosis for a
+        `claude-pty` review, and must survive. Provider-aware, not blanket."""
+        review = _review("work-1", aid="review-1", review_verdict=None)
+        review.provider_name = "claude-pty"
+        board = _board(_work("work-1", test_state="passed"), review)
+        detection, _ = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        )[0]
+        assert "#812" in detection.detail
+        assert "interactive" in detection.detail
+
     def test_not_flagged_when_review_still_running_no_verdict(
         self, config: Config
     ) -> None:
