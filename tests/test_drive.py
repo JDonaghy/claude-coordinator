@@ -3432,3 +3432,82 @@ def test_coord_argv_fallback_argv_is_actually_executable(monkeypatch):
         f"expected a version string on stdout, got: {result.stdout!r} "
         f"(stderr={result.stderr!r})"
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# #2024: a --fix-of round whose Test stage is human-attended by policy
+#
+# JDonaghy/vimcode#635, 2026-08-08. The issue carries `test-mode:smoke`, the
+# per-issue policy (#685) that switches the HEADLESS Test stage off:
+# `dispatch_pending_smoke` skips it on every tick by design. Review dispatch is
+# meanwhile held until the CURRENT work row carries a passed/skipped verdict
+# (`pipeline.test_precedes_review`). A fix round is a new work row with its own
+# empty `test_state`, so an unattended round cannot advance at all — twice on
+# one issue, 25 minutes then 160, each cleared within minutes of an operator
+# running `coord test <fix_aid> --passed` by hand.
+#
+# Before this, `_decide_test` returned a bare `_wait()` for it — the same
+# `no state change` counter #2019 is about, against an event that never comes.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def fix_round_awaiting_attended_test(**kw) -> IssueState:
+    base = dict(
+        work_aid="78cfb47e0b99",
+        work_test_state="",
+        work_review_iter=1,
+        issue_test_mode="smoke",
+    )
+    base.update(kw)
+    return done_work(**base)
+
+
+def test_a_fix_round_with_no_attended_test_stage_escalates_instead_of_waiting():
+    action = step(fix_round_awaiting_attended_test())
+    assert action.is_exit
+    assert action.exit_code == EXIT_DEAD_END
+    assert "test-mode:smoke" in action.message
+    assert "coord test 78cfb47e0b99 --passed" in action.message
+    assert "no state change" not in action.message
+
+
+def test_the_attended_test_dead_end_records_a_test_stage_escalation():
+    action = step(fix_round_awaiting_attended_test())
+    assert action.command[:4] == ("escalate", "record", REPO, str(ISSUE))
+    assert action.command[action.command.index("--stage") + 1] == "test"
+    assert action.command[action.command.index("--assignment") + 1] == "78cfb47e0b99"
+
+
+def test_an_unlabelled_issue_still_waits_for_coord_to_dispatch_the_stage():
+    """The regression bar for #1426's wait: with no `test-mode:*` policy the
+    daemon IS going to dispatch, so "no verdict yet" must stay a WAIT. This is
+    the same assertion as
+    `test_no_test_verdict_yet_waits_for_coord_to_dispatch_the_stage`, restated
+    here because it is what stops the new shape from firing on every
+    freshly-completed row on the fleet."""
+    action = step(fix_round_awaiting_attended_test(issue_test_mode=""))
+    assert action.kind == WAIT
+    assert action.command == ()
+
+
+def test_skip_test_still_records_a_verdict_under_test_mode_smoke():
+    """`--skip-test` is a live Test-stage move the operator explicitly asked
+    for; the dead end must not escalate past it."""
+    action = step(
+        fix_round_awaiting_attended_test(),
+        DriveOptions(machine="precision", skip_test=True),
+    )
+    assert action.command == (
+        "test", "--skipped", "--reason", "coord drive --skip-test", "78cfb47e0b99",
+    )
+
+
+def test_an_attended_test_stage_in_flight_is_not_a_dead_end():
+    """The interactive smoke this policy asks for is a real board row, so it
+    shows up as `active`. The predicate's hard precondition already refuses —
+    asserted here through the driver, since this is the one thing standing
+    between the shape and a false positive on the policy's happy path."""
+    action = step(
+        fix_round_awaiting_attended_test(active_count=1, active_types=("smoke",))
+    )
+    assert action.kind == WAIT

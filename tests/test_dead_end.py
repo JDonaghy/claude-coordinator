@@ -275,3 +275,131 @@ def test_gates_carry_the_readings_that_proved_the_dead_end() -> None:
     assert gates["review_status"] == "done"
     assert gates["review_verdict"] == "(none)"
     assert gates["test_state"] == "passed"
+
+
+# ── #2024: a --fix-of round whose Test stage is human-attended by policy ─────
+#
+# The live shape, twice on JDonaghy/vimcode#635 in one session (2026-08-08):
+#
+#   [work]  8965c044976e  done  test=skipped  -> review request-changes
+#   [work]  78cfb47e0b99  done  test=-        fix round 1, stalled ~25m
+#   [work]  87e6d76eab4e  done  test=-        fix round 2, stalled 160m
+#
+# The issue carries `test-mode:smoke`, so `dispatch_pending_smoke` skips it on
+# every tick BY DESIGN (#685) — while review dispatch is held until the CURRENT
+# row carries a passed/skipped verdict. One component requires a verdict; by
+# policy no component produces one. Both rounds cleared within minutes of an
+# operator running `coord test <fix_aid> --passed` by hand, which is what pins
+# the cause. Elapsed time is not the signal — the label is.
+
+
+def fix_round_awaiting_human_test_fields() -> dict:
+    """Fix round 1 on #635: a `[fix-N]` work row (its own empty test_state,
+    no Test-stage child of its own) on a `test-mode:smoke` issue, nothing
+    active."""
+    return dict(
+        work_aid="78cfb47e0b99",
+        work_status="done",
+        work_branch="issue-635-595-stage-6b",
+        work_test_state="",
+        work_review_iter=1,
+        smoke_aid="",
+        issue_test_mode="smoke",
+        active_count=0,
+    )
+
+
+def test_fix_round_with_no_test_stage_under_test_mode_smoke_is_a_dead_end() -> None:
+    found = detect_dead_end(state(**fix_round_awaiting_human_test_fields()))
+    assert found is not None
+    assert found.kind == "test_stage_human_attended"
+    assert found.stage == "test"
+    assert found.assignment_id == "78cfb47e0b99"
+    # The reason must name the POLICY (that's the provable part) and the row.
+    assert "test-mode:smoke" in found.reason
+    assert "78cfb47e0b99" in found.reason
+    # ...and the recovery must be the command that actually cleared it live.
+    assert "coord test 78cfb47e0b99 --passed" in found.recovery
+    assert "--smoke-of 78cfb47e0b99" in found.recovery
+
+
+def test_no_test_mode_label_is_not_a_dead_end() -> None:
+    """The unlabelled variant stays deliberately uncovered: with no policy on
+    the issue, `dispatch_pending_smoke` is expected to dispatch on its next
+    tick, so "no verdict yet" is indistinguishable from "healthy, one tick
+    early". Escalating that would fire on every freshly-completed row."""
+    fields = fix_round_awaiting_human_test_fields()
+    fields["issue_test_mode"] = ""
+    assert detect_dead_end(state(**fields)) is None
+
+
+def test_test_mode_auto_is_not_a_dead_end() -> None:
+    """`test-mode:auto` is the opposite policy — the headless Test stage IS
+    armed for this issue, so a verdict is genuinely coming."""
+    fields = fix_round_awaiting_human_test_fields()
+    fields["issue_test_mode"] = "auto"
+    assert detect_dead_end(state(**fields)) is None
+
+
+def test_an_attended_test_stage_already_dispatched_is_not_a_dead_end() -> None:
+    """A Test-stage child for THIS row means the stage did happen — a `done`
+    smoke whose verdict hasn't propagated yet is #1605's bounded lag, not a
+    dead end."""
+    fields = fix_round_awaiting_human_test_fields()
+    fields["smoke_aid"] = "s1"
+    fields["smoke_status"] = "done"
+    assert detect_dead_end(state(**fields)) is None
+
+
+@pytest.mark.parametrize("verdict", ["running", "passed", "skipped", "failed"])
+def test_any_test_state_at_all_is_not_this_dead_end(verdict: str) -> None:
+    """`running` is #1395's transient marker (`_decide_test` waits on it, and
+    #1605 owns the abandoned case); the terminal verdicts are live moves —
+    `passed`/`skipped` fall through to the review gate, `failed` into the
+    bounded `coord fix` loop. None of them is this shape."""
+    fields = fix_round_awaiting_human_test_fields()
+    fields["work_test_state"] = verdict
+    found = detect_dead_end(state(**fields))
+    assert found is None or found.kind != "test_stage_human_attended"
+
+
+def test_an_interactive_smoke_in_flight_is_not_a_dead_end() -> None:
+    """The attended Test stage this policy asks for is a real board row, so
+    while it runs `active_count > 0` and the hard precondition already
+    refuses. Stated as its own test because it is the ONE thing standing
+    between this shape and a false positive on the policy's happy path."""
+    fields = fix_round_awaiting_human_test_fields()
+    fields["active_count"] = 1
+    assert detect_dead_end(state(**fields)) is None
+
+
+def test_skip_test_keeps_its_move() -> None:
+    """`coord drive --skip-test` exists precisely to record `skipped` for a
+    verdict-less row. The predicate must not escalate past a move the operator
+    explicitly asked for."""
+    fields = fix_round_awaiting_human_test_fields()
+    assert detect_dead_end(state(**fields), can_waive_test_gate=True) is None
+
+
+def test_a_terminal_review_dead_end_still_outranks_the_test_shape() -> None:
+    """Shape ordering: a row that is BOTH verdict-less at Test and carrying a
+    terminal review with no verdict is reported as the review dead end — the
+    older, more specific recovery. Guards against the new shape swallowing
+    #1956's."""
+    fields = fix_round_awaiting_human_test_fields()
+    fields.update(review_aid="rev1", review_status="done", review_verdict="")
+    found = detect_dead_end(state(**fields))
+    assert found is not None
+    assert found.kind == "review_terminal_no_verdict"
+
+
+def test_gates_record_the_test_mode_policy_that_proved_shape_3() -> None:
+    """#2024: for the human-attended shape the LABEL is the whole proof, so it
+    has to survive onto the escalation row — `coord escalate list` is all an
+    operator has once the tmux pane is gone."""
+    found = detect_dead_end(state(**fix_round_awaiting_human_test_fields()))
+    assert found is not None
+    gates = dict(found.gates)
+    assert gates["issue_test_mode"] == "smoke"
+    assert gates["test_state"] == "(none)"
+    assert gates["active"] == "0"

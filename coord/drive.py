@@ -1059,7 +1059,9 @@ def decide(
     #
     # `detect_dead_end` itself refuses to fire while `active_count > 0`, so a
     # healthy long-running stage is structurally incapable of reaching this.
-    dead_end = detect_dead_end(state)
+    # #2024: `--skip-test` is a live Test-stage move (`_decide_test` records
+    # `skipped`), so the human-attended-Test shape must not escalate past it.
+    dead_end = detect_dead_end(state, can_waive_test_gate=opts.skip_test)
     if dead_end is not None:
         return replace(
             _escalate_dead_end(state, dead_end), warnings=warnings

@@ -39,15 +39,18 @@ so the die never fired and ``_decide_review`` fell through to a bare
 
 WHAT IS DELIBERATELY *NOT* COVERED
 ----------------------------------
-* **A Test stage that was never dispatched** (``test_state=""`` with no smoke
-  row) — vimcode#635, whose cause is #2024.  From board state alone this is
-  indistinguishable from "the daemon will dispatch it on the next tick", and
-  the dispatcher's own refusal set (``coord.smoke.dispatch_smoke`` returns
-  ``None`` for a superseded row, a capability-rule miss on a non-``work``
-  type, a missing smoke command, …) is not re-derivable here without
-  duplicating it.  Guessing would escalate healthy rows.  What IS covered is
-  the case where the dispatcher **left a marker saying it gave up**:
-  ``test_state="blocked"`` (#1672), below.
+* **A Test stage that was never dispatched, with no policy saying so**
+  (``test_state=""``, no smoke row, no ``test-mode:*`` label) — from board
+  state alone that is indistinguishable from "the daemon will dispatch it on
+  the next tick", and the rest of the dispatcher's refusal set
+  (``coord.smoke.dispatch_smoke`` returns ``None`` for a superseded row, a
+  capability-rule miss on a non-``work`` type, a missing smoke command, …) is
+  not re-derivable here without duplicating it.  Guessing would escalate
+  healthy rows.  Two variants ARE covered, both because something on the board
+  positively states that no dispatch is coming: ``test_state="blocked"``, the
+  marker the dispatcher leaves when it gives up (#1672, shape 2), and
+  ``test-mode:smoke``, the per-issue POLICY that switches the headless Test
+  stage off entirely (#685/#2024, shape 3).
 * **A ``done`` smoke row whose verdict has not landed yet** — #1605 already
   established that this has an expected, bounded propagation lag and is not a
   defect.  Only the contradictions #1605 itself detects are terminal.
@@ -112,17 +115,29 @@ def _gates(state) -> tuple[tuple[str, str], ...]:
     return (
         ("work_status", state.work_status or "(empty)"),
         ("test_state", state.work_test_state or "(none)"),
+        # #2024: the per-issue Test-stage POLICY is a reading in its own right
+        # — for shape 3 it is the entire proof, and on every other shape it is
+        # the difference between "no verdict yet" and "no verdict, ever".
+        ("issue_test_mode", state.issue_test_mode or "(none)"),
         ("review_status", state.review_status or "(none)"),
         ("review_verdict", state.review_verdict or "(none)"),
         ("active", str(state.active_count)),
     )
 
 
-def detect_dead_end(state) -> DeadEnd | None:
+def detect_dead_end(state, *, can_waive_test_gate: bool = False) -> DeadEnd | None:
     """The predicate: ``None`` when the row can still move on its own.
 
     *state* is a :class:`coord.drive_state.IssueState` (untyped here purely to
-    keep this module import-light — it reads five attributes and nothing else).
+    keep this module import-light — it reads a handful of attributes and
+    nothing else).
+
+    *can_waive_test_gate* (#2024) is the caller saying "I still have a Test-
+    stage move of my own" — today that is ``coord drive --skip-test``, whose
+    ``_decide_test`` records ``skipped`` for a verdict-less row. Shape 3 below
+    is exactly the shape that flag exists to unblock, so with it set that shape
+    is not a dead end: the driver must be allowed to use the move the operator
+    explicitly asked for rather than escalate past it.
 
     Pure, cheap, and safe to call on every poll: no I/O, no clock, no
     counters.  The caller (``coord.drive.decide``) turns a non-``None`` result
@@ -240,6 +255,75 @@ def detect_dead_end(state) -> DeadEnd | None:
             ),
             recovery=(
                 f"coord diagnose {state.repo} {state.issue} --stage test --reset"
+            ),
+            assignment_id=state.work_aid,
+            gates=_gates(state),
+        )
+
+    # ── shape 3: the Test stage is HUMAN-ATTENDED by policy (#685/#2024) ────
+    # `test-mode:smoke` means "the headless Test stage does not run for this
+    # issue; the TUI offers an interactive smoke agent instead" —
+    # `dispatch_pending_smoke` skips the row unconditionally, on every tick,
+    # forever. Review dispatch is meanwhile gated on a passed/skipped verdict
+    # for THIS work row (`pipeline.test_precedes_review()`, honoured by both
+    # `dispatch_pending_reviews` and `auto_loop.run_for_fix_transition`), so a
+    # completed row with no verdict of its own cannot advance: one component
+    # requires a verdict and, by policy, no component will produce one.
+    #
+    # Why this bites `--fix-of` rounds specifically (#2024): a fix round is a
+    # NEW work row on the SAME branch, and it carries its own empty
+    # `test_state`. The parent's verdict satisfies the branch-scoped MERGE
+    # gate (`coord gates` reads `test: passed` off it — see the note
+    # `coord.gates.build_gate_report` now emits), which is why the stall reads
+    # as "slow" rather than "blocked". Round 0 gets attended because a human is
+    # watching the first pass; rounds 1..N complete unattended at 3am and sit
+    # there. Observed twice on JDonaghy/vimcode#635 (2026-08-08): 25 minutes,
+    # then 160 minutes on the same issue, each cleared within minutes of an
+    # operator running `coord test <fix_aid> --passed` by hand.
+    #
+    # Deliberately narrow, so it can never fire on a healthy row:
+    #   * `active_count == 0` (above) — an interactive smoke session IS a live
+    #     board row, so an attended Test stage in progress never reaches here.
+    #   * `smoke_aid` empty — a Test-stage child dispatched for THIS row (by a
+    #     human, `--smoke-of`, or an earlier auto pass) means the stage did
+    #     happen; #1605 owns a `done` smoke whose verdict hasn't landed yet.
+    #   * `work_test_state` empty — not "running" (#1395's transient marker,
+    #     `_decide_test` waits on it), not a terminal verdict, not "blocked"
+    #     (shape 2 above owns that, and reads better).
+    if (
+        not can_waive_test_gate
+        and state.issue_test_mode == "smoke"
+        and state.work_status == "done"
+        and state.work_aid
+        and not state.work_test_state
+        and not state.smoke_aid
+    ):
+        return DeadEnd(
+            kind="test_stage_human_attended",
+            stage="test",
+            reason=(
+                f"work {state.work_aid} finished with NO Test verdict, and "
+                f"{state.repo}#{state.issue} is labelled `test-mode:smoke` — "
+                "the per-issue policy (#685) that switches the HEADLESS Test "
+                "stage off: coord.smoke.dispatch_pending_smoke skips this "
+                "issue on every tick by design, so no smoke assignment is "
+                "coming. Review dispatch is meanwhile held until THIS row "
+                "carries a passed/skipped verdict "
+                "(pipeline.test_precedes_review), so nothing can advance "
+                "without a human. This is the #2024 shape: a --fix-of round "
+                "is a new work row with its own empty test_state, and the "
+                "parent's verdict satisfies only the branch-scoped merge gate "
+                "(`coord gates` reads `test: passed` off the parent row) — "
+                "which is why this reads as slow rather than blocked (#2019)."
+            ),
+            # Two doors, cheapest first: record the verdict directly, or run
+            # the attended Test stage the label asked for. Both are real; the
+            # operator picks by whether the suite actually needs running.
+            recovery=(
+                f"coord test {state.work_aid} --passed   # or --skipped "
+                "--reason '<why>'; to actually run it, `coord assign "
+                f"<machine> {state.repo} {state.issue} --smoke-of "
+                f"{state.work_aid} --interactive`"
             ),
             assignment_id=state.work_aid,
             gates=_gates(state),

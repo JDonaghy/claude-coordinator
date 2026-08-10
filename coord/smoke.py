@@ -967,6 +967,35 @@ def dispatch_pending_smoke(
         #   no label        → no policy set → respect auto_queue (back-compat).
         test_mode = get_issue_test_mode(completed.repo_name, completed.issue_number)
         if test_mode == "smoke":
+            # #2024: say so. This skip is CORRECT (the policy asked for a
+            # human-attended Test stage) but it was completely silent, and
+            # silence here is what dead-ends an unattended `--fix-of` round:
+            # review dispatch is held until this row carries a passed/skipped
+            # verdict (`pipeline.test_precedes_review`), and under this policy
+            # no automatic component will ever produce one. Round 0 gets
+            # attended because a human is watching; rounds 1..N complete at 3am
+            # and sit there (vimcode#635: 25 min, then 160 min). The DRIVER now
+            # recognises the shape from the same label and escalates instead of
+            # counting (`coord.dead_end` shape 3) — this line is the daemon-side
+            # half of the same statement, for whoever reads the log first.
+            #
+            # Deliberately NOT widened to "dispatch anyway for fix rounds":
+            # that would silently override an explicit per-issue policy. The
+            # answer to "nobody will produce a verdict" is to SAY so, not to
+            # take the decision away from the operator who set the label.
+            logger.info(
+                "dispatch_pending_smoke: skipping %s#%s row %s — issue is "
+                "labelled `test-mode:smoke`, so the headless Test stage is off "
+                "for it by policy (#685) and NOTHING automatic will record a "
+                "verdict. Review dispatch stays held until one exists: `coord "
+                "test %s --passed|--skipped`, or run the attended stage with "
+                "`coord assign <machine> %s %s --smoke-of %s --interactive` "
+                "(#2024).",
+                completed.repo_name, completed.issue_number,
+                completed.assignment_id, completed.assignment_id,
+                completed.repo_name, completed.issue_number,
+                completed.assignment_id,
+            )
             continue
 
         smoke = dispatch_smoke(completed, board, config, now=now)

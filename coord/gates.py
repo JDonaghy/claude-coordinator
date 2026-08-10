@@ -110,6 +110,15 @@ class GateDecision:
     # dispatched review — re-dispatching just re-derives a conclusion that
     # already exists in the log, per #1956's "Not the fix" section.
     verdict_unparseable: bool = False
+    # #2024: WHICH assignment supplied this gate's verdict. Populated for the
+    # "test" gate, where the merge gate is deliberately branch-scoped (a Test
+    # run measures the (branch, base) pair, #1819) and so is routinely
+    # satisfied by a row that is NOT the branch's current work row — the
+    # parent of a `--fix-of` round, most often. Without naming the row, `coord
+    # gates` printing `test : passed` while `coord drive` holds on `test=-`
+    # for the fix row reads as two components disagreeing about one fact
+    # instead of two components correctly answering two different questions.
+    assignment_id: str | None = None
 
 
 @dataclass
@@ -404,12 +413,48 @@ def build_gate_report(
     smoke_status = mq.evaluate_smoke_verdict(entry, board, gh_ops) if smoke_required else None
     test_ok = (not smoke_required) or bool(smoke_status and smoke_status.ok)
     test_decision = GateDecision(gate="test", required=smoke_required, ok=test_ok)
+    if smoke_status is not None:
+        # #2024: recorded on BOTH paths, not just the refusal — "which row is
+        # this verdict actually about" is the question a green summary hides.
+        test_decision.assignment_id = smoke_status.assignment_id
     if smoke_status is not None and not smoke_status.ok:
         test_decision.reason = smoke_status.message
         test_decision.anchor = smoke_status.anchor
         test_decision.recorded_sha = smoke_status.recorded_sha
         test_decision.current_sha = smoke_status.current_sha
     report.decisions.append(test_decision)
+
+    # #2024: the two readings, reconciled by SAYING WHICH ROW EACH IS ABOUT.
+    # The merge gate is branch-scoped by design (#1819: a Test run measures the
+    # (branch, base) pair), so on a `--fix-of` chain — where every round is a
+    # new work row on the SAME branch — it is routinely satisfied by the
+    # PARENT's verdict. The per-iteration readers (`coord drive`'s
+    # `work_test_state`, `dispatch_pending_reviews`, `auto_loop`'s #1612 gate)
+    # key on the CURRENT row's own verdict and correctly hold when it is
+    # empty. Both are right; only the summary was silent about the difference,
+    # which is what turned a blocked pipeline into an invisible one (25 min,
+    # then 160 min, on vimcode#635).
+    if (
+        test_ok
+        and smoke_required
+        and test_decision.assignment_id
+        and winner.assignment_id
+        and test_decision.assignment_id != winner.assignment_id
+        and winner.test_state not in ("passed", "skipped")
+    ):
+        report.notes.append(
+            f"test PASSED is the branch-scoped merge reading: the verdict was "
+            f"recorded on {test_decision.assignment_id}, not on this branch's "
+            f"current work row {winner.assignment_id} "
+            f"(review_iteration={winner.review_iteration or 0}, "
+            f"test_state={winner.test_state or 'none'}). Per-iteration readers "
+            "— `coord drive`'s Test stage and review auto-dispatch "
+            "(pipeline.test_precedes_review) — gate on the CURRENT row's own "
+            "verdict, so review dispatch can still be held while this line "
+            "reads passed. Record one with `coord test "
+            f"{winner.assignment_id} --passed` (or --skipped) once the fix "
+            "round has actually been tested (#2024)."
+        )
 
     merge_blocked_gate: str | None = None
     if review_required and not review_ok:
@@ -511,7 +556,14 @@ def format_gate_report(report: GateReport) -> str:
             if not test.required:
                 lines.append("  test   : not required")
             elif test.ok:
-                lines.append("  test   : passed")
+                # #2024: name the row the verdict sits on. `coord gates` and
+                # `coord drive` are allowed to answer differently (branch gate
+                # vs per-iteration gate) — they are not allowed to do it
+                # silently.
+                lines.append(
+                    "  test   : passed"
+                    + (f" (recorded on {test.assignment_id})" if test.assignment_id else "")
+                )
             elif test.anchor:
                 noun = "base" if test.anchor == "base" else "branch"
                 lines.append(
