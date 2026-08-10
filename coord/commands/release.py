@@ -394,9 +394,10 @@ def _lane_versions_by_host(report) -> dict[str, list[str | None]]:
 @release_group.command(
     "propagate",
     help=(
-        "Roll the released version onto the fleet at the next QUIESCENT "
-        "window, verify it, and roll back on red (#1835). Safe to run from "
-        "a timer: a busy fleet is a recorded deferral, not a failure."
+        "Roll the released version onto each host at ITS next quiescent "
+        "window (#2067 — per host, not fleet-wide), verify it, and roll "
+        "back on red (#1835). Safe to run from a timer: a busy host is a "
+        "recorded deferral for that host, not a failure of the run."
     ),
 )
 @_CONFIG_OPTION
@@ -443,6 +444,15 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
     as_json: bool,
 ) -> None:
     """One propagation attempt. Exit 0 on deferral, 1 on red, 2 on rollback.
+
+    #2067: the window is assessed PER HOST, not fleet-wide. A host with a
+    live assignment or a running drive-queue entry defers on its own; the
+    others roll and get verified this run regardless. The one case that
+    still defers the whole run is the daemon host itself being occupied —
+    every other host's python lane has to wait behind it (see
+    ``coord/release_propagate.py``'s LANE ORDER section) — and the case a
+    signal can't be pinned to any one host at all (an unreadable board), in
+    which nothing can be proven safe to roll.
 
     #2052: the final gate is scoped to the lanes this run attempted and could
     have moved. Verify grades lanes propagation cannot roll — the operator's
@@ -494,7 +504,7 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
         )
         _finish(rp.STATUS_FAILED, 1)
 
-    # ── 2. is there a window? ────────────────────────────────────────────
+    # ── 2. is there a window? (fleet + per-host, #2067) ──────────────────
     board, board_error = _fetch_board()
     extra_busy = []
     if board_error:
@@ -508,17 +518,29 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
     )
     record.quiescence = quiescence.to_dict()
 
-    if not quiescence.quiescent and not force:
+    hosts = [m.name for m in (getattr(config, "machines", ()) or ())]
+    busy_hosts = quiescence.busy_hosts()
+    # #2067: a signal that cannot be pinned to a host (the board itself
+    # unreadable, a drive-queue entry with no recorded launch host) has to
+    # block every host — and so does every configured host individually
+    # being occupied, which is the same outcome by a different route. Either
+    # way there is no window anywhere, so there is nothing to gain by
+    # spending a `gather()` sweep finding that out the slow way.
+    fully_busy = bool(quiescence.fleet_wide_busy) or (
+        bool(hosts) and busy_hosts.issuperset(hosts)
+    )
+    if fully_busy and not force:
         # The single most important line in this command: a deferral is a
         # normal, recorded, exit-0 outcome. A timer that defers all night
         # must be visibly *working*, not visibly failing.
         _finish(rp.STATUS_DEFERRED, 0)
-    if not quiescence.quiescent and force:
+    if quiescence.busy and force:
         click.echo(
             "warning: --force — rolling over a BUSY fleet; in-flight "
             f"headless workers will be killed ({quiescence.reason})",
             err=True,
         )
+        busy_hosts = set()  # --force overrides per-host busyness too
 
     # ── 3. who still needs it, and in what order? ────────────────────────
     machine_health, unreachable, daemon_facts, daemon_label = rv.gather(
@@ -529,7 +551,6 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
         daemon_host=daemon_facts, daemon_host_name=daemon_label,
         expected=record.target_version,
     )
-    hosts = [m.name for m in (getattr(config, "machines", ()) or ())]
     daemon_name = _daemon_machine_name(config, daemon_host_override, machine_health)
     if daemon_name is None and len(hosts) > 1:
         # #2052 fault 2: this used to warn and roll in coordinator.yml order.
@@ -549,16 +570,35 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
         click.echo(f"error: {record.error}", err=True)
         _finish(rp.STATUS_FAILED, 1)
     current = rp.hosts_already_current(_lane_versions_by_host(before), record.target_version)
+
+    # #2067: the daemon must lead every python-lane roll (see the module
+    # docstring's LANE ORDER section) — if it is itself occupied and not
+    # already on the target, nothing may roll ahead of it, because that
+    # would put a caller on a newer `coord` than the daemon it talks to
+    # (the documented 405). This is the one case a per-host window still
+    # has to defer the WHOLE run rather than just skip the busy host.
+    if daemon_name in busy_hosts and daemon_name not in current:
+        _finish(rp.STATUS_DEFERRED, 0)
+
+    still_busy = busy_hosts - set(current)
     rolls = rp.plan_lanes(
         daemon_host=daemon_name,
         hosts=hosts,
         lanes=lane_filter or rp.ALL_LANES,
-        skip_hosts=current,
+        skip_hosts=set(current) | busy_hosts,
     )
     for host in current:
         record.lanes.append(
             {"lane": "-", "host": host, "ok": None,
              "detail": f"already on v{record.target_version}"}
+        )
+    for host in sorted(still_busy):
+        # #2067: the whole point — a busy host defers on its own, it does
+        # not hold every OTHER host hostage. A re-run resumes it, same as
+        # an unreachable host or a failed daemon roll does today.
+        record.lanes.append(
+            {"lane": "-", "host": host, "ok": None,
+             "detail": f"deferred — {quiescence.busy_reason_for_host(host)}"}
         )
     for host, reason in sorted(unreachable.items()):
         record.lanes.append(
@@ -571,10 +611,12 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
                 {"lane": roll.lane, "host": roll.host, "ok": None,
                  "detail": f"would roll ({roll.rationale})"}
             )
-        _finish(rp.STATUS_ROLLED if rolls else rp.STATUS_UP_TO_DATE, 0)
+        if rolls:
+            _finish(rp.STATUS_ROLLED, 0)
+        _finish(rp.STATUS_DEFERRED if still_busy else rp.STATUS_UP_TO_DATE, 0)
 
     if not rolls:
-        _finish(rp.STATUS_UP_TO_DATE, 0)
+        _finish(rp.STATUS_DEFERRED if still_busy else rp.STATUS_UP_TO_DATE, 0)
 
     # ── 4. roll, in the planned order ────────────────────────────────────
     by_name = {m.name: m for m in (getattr(config, "machines", ()) or ())}

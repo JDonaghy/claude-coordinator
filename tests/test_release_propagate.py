@@ -148,6 +148,125 @@ def test_queue_key_falls_back_across_row_spellings():
     assert fired == ("quadraui#302",)
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# #2067: quiescence is per-host, not fleet-wide all-or-nothing
+# ──────────────────────────────────────────────────────────────────────────
+#
+# A continuously-running drive queue keeps SOME host busy essentially always,
+# so the fleet-wide `quiescent` boolean never arrives on a working overnight
+# queue. Every `Busy` already carries the host it belongs to; these pin that
+# down to a per-host verdict a caller can actually roll against.
+
+
+def test_a_running_entry_is_attributed_to_its_launch_host():
+    """#1870's `launch_host` is the ground truth for where a running drive
+    queue entry actually occupies a host — not `machine`, which is only an
+    operator's pin."""
+    q = rp.assess_quiescence(
+        queue_entries=[
+            {"repo_name": "vimcode", "issue_number": 634, "state": STATE_RUNNING,
+             "machine": "requested-host", "launch_host": "precision"},
+        ],
+    )
+    assert q.busy[0].host == "precision"
+
+
+def test_a_running_entry_falls_back_to_machine_when_launch_host_is_absent():
+    q = rp.assess_quiescence(
+        queue_entries=[
+            {"repo_name": "r", "issue_number": 1, "state": STATE_RUNNING,
+             "machine": "dellserver"},
+        ],
+    )
+    assert q.busy[0].host == "dellserver"
+
+
+def test_a_running_entry_with_no_recorded_host_is_unattributable():
+    """Neither `launch_host` nor `machine` present — a legacy or hand-edited
+    row. This must NOT be silently dropped from consideration; it has to
+    block every host, since there is no way to know which one it actually
+    occupies."""
+    q = rp.assess_quiescence(
+        queue_entries=[{"repo_name": "r", "issue_number": 1, "state": STATE_RUNNING}],
+    )
+    assert q.busy[0].host is None
+    assert q.fleet_wide_busy == q.busy
+
+
+def test_a_live_assignment_is_attributed_to_its_machine():
+    q = rp.assess_quiescence(
+        assignments=[{"machine_name": "dellserver", "issue_number": 42,
+                      "status": "RUNNING"}],
+    )
+    assert q.busy[0].host == "dellserver"
+
+
+def test_rollable_hosts_excludes_only_the_occupied_ones():
+    """The whole point: three hosts busy on three different machines is not
+    a reason to roll none of the OTHER machines."""
+    q = rp.assess_quiescence(
+        queue_entries=[
+            {"repo_name": "a", "issue_number": 1, "state": STATE_RUNNING,
+             "launch_host": "dellserver"},
+        ],
+        assignments=[{"machine_name": "precision", "issue_number": 634,
+                      "status": "RUNNING"}],
+    )
+    assert q.rollable_hosts(["precision", "dellserver", "elitebook"]) == ["elitebook"]
+
+
+def test_rollable_hosts_is_empty_when_a_signal_cannot_be_pinned_to_a_host():
+    """An unreadable board (or any other unattributable signal) means 'busy
+    somewhere unknown', which is indistinguishable from 'busy everywhere' and
+    must be treated as such — never as 'busy nowhere in particular'."""
+    q = rp.assess_quiescence(
+        extra_busy=[rp.Busy(kind="board unreadable", subject="/board")],
+    )
+    assert q.rollable_hosts(["precision", "dellserver"]) == []
+
+
+def test_rollable_hosts_with_nothing_busy_is_every_host():
+    q = rp.assess_quiescence()
+    assert q.rollable_hosts(["a", "b"]) == ["a", "b"]
+
+
+def test_busy_reason_for_host_names_only_what_blocks_that_host():
+    q = rp.assess_quiescence(
+        assignments=[
+            {"machine_name": "precision", "issue_number": 1, "status": "RUNNING"},
+            {"machine_name": "dellserver", "issue_number": 2, "status": "RUNNING"},
+        ],
+    )
+    reason = q.busy_reason_for_host("precision")
+    assert "precision:1" in reason
+    assert "dellserver:2" not in reason
+
+
+def test_busy_reason_for_host_is_empty_for_a_free_host():
+    q = rp.assess_quiescence(
+        assignments=[{"machine_name": "precision", "issue_number": 1,
+                      "status": "RUNNING"}],
+    )
+    assert q.busy_reason_for_host("elitebook") == ""
+
+
+def test_an_unattributable_signal_still_names_itself_in_every_hosts_reason():
+    q = rp.assess_quiescence(extra_busy=[rp.Busy(kind="board unreadable",
+                                                  subject="/board")])
+    assert "board unreadable" in q.busy_reason_for_host("any-host")
+
+
+def test_fleet_wide_reason_is_unchanged_by_per_host_attribution():
+    """The fleet-wide summary — still used by `--force`'s warning — reads
+    exactly as it always did; per-host attribution is additive."""
+    q = rp.assess_quiescence(
+        assignments=[{"machine_name": "dellserver", "issue_number": 42,
+                      "status": "RUNNING"}],
+    )
+    assert "dellserver:42" in q.reason
+    assert not q.quiescent
+
+
 # ── holds_to_release ─────────────────────────────────────────────────────
 
 
