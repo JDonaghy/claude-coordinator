@@ -786,6 +786,19 @@ impl CoordApp {
         ("Reason", 4.0, ColumnAlign::Left),
     ];
 
+    /// #2043: the Queue grid never squeezes its columns below this many
+    /// characters; past it the grid scrolls horizontally instead
+    /// (`render_queue_panel`'s `min_total_width`). In CHARACTERS —
+    /// `min_total_width` itself is surface-native (px on GTK, cells on
+    /// TUI, per `quadraui/src/primitives/data_table.rs:106-114`), so a bare
+    /// `Some(120.0)` would mean 120 pixels (~20 characters) on GTK. It is
+    /// multiplied by `Backend::char_width()` at the one call site that
+    /// needs it (`render_queue_panel`) rather than promoted into a
+    /// backend-independent length type in quadraui — an API change for two
+    /// downstream consumers, for one multiplication. If a second consumer
+    /// ever needs the same conversion, that's the moment to promote it.
+    const QUEUE_MIN_WIDTH_CHARS: f32 = 120.0;
+
     /// Index of the `#` (position) column — sorted numerically.
     pub(crate) const QUEUE_COL_POSITION: usize = 0;
     /// Index of the `Tries` (attempts) column — sorted numerically.
@@ -1109,17 +1122,25 @@ impl CoordApp {
             sort: self.queue_sort,
             has_focus: true,
             show_scrollbar: true,
-            // `None`: columns squeeze to fit rather than forcing horizontal
-            // scrolling. With `h_scroll` pinned at 0.0 (below) a content
-            // width past the viewport would make the right-hand columns
-            // permanently unreachable — worse than a narrow `Reason`.
-            min_total_width: None,
-            // Pinned at 0.0. `DataTableLayout::hit_test` has no concept of
-            // `h_scroll`, so a non-zero value shifts the painted headers out
-            // from under the hit-test and routes a sort click to the wrong
-            // column. The reasoning is written out in full at
-            // `reports.rs::render_reports_result`.
-            h_scroll: 0.0,
+            // #2043: below `QUEUE_MIN_WIDTH_CHARS` the grid stops squeezing
+            // and scrolls horizontally instead — `Reason` (`Flex(4.0)`) was
+            // routinely truncated to uselessness before this floor existed.
+            // `min_total_width` is surface-native (px on GTK, cells on TUI —
+            // see `QUEUE_MIN_WIDTH_CHARS`'s own doc comment), hence the
+            // `char_width()` multiply here rather than in the constant.
+            min_total_width: Some(Self::QUEUE_MIN_WIDTH_CHARS * backend.char_width().max(1.0)),
+            // #2043: was pinned at 0.0 — `DataTableLayout::hit_test` had no
+            // concept of `h_scroll`, so a non-zero value shifted the painted
+            // headers out from under the hit-test and routed a sort click to
+            // the wrong column (the reasoning is written out in full at
+            // `reports.rs::render_reports_result`, which still pins its own
+            // table at 0.0 for the same reason). quadraui#550 fixed
+            // `hit_test` itself to be `h_scroll`-aware, so this grid — the
+            // first table in this crate to actually drive the field — can
+            // now use it safely. `queue_h_scroll` only moves once the grid
+            // has dropped below the floor above and started scrolling; see
+            // its own doc comment.
+            h_scroll: self.queue_h_scroll,
             // No column-resize drag on this table yet (#1853 covers that for
             // the Reports result table).
             column_overrides: Vec::new(),
@@ -1336,25 +1357,42 @@ impl CoordApp {
         Some(layout.hit_test(pos.x - rect.x, pos.y - rect.y, self.queue_scroll, n))
     }
 
-    /// Did a click land on the grid's vertical scrollbar track?
+    /// Did a click land on either of the grid's scrollbar tracks?
     ///
     /// Checked BEFORE [`Self::queue_table_hit`] by every caller:
-    /// `DataTableLayout::hit_test` has no concept of the scrollbar strip it
-    /// reserves space for (the #1094 gap), so without this a click on the
-    /// thumb mis-resolves to whichever row sits under it.
-    pub(crate) fn queue_scrollbar_hit(&self, pos: Point) -> bool {
+    /// `DataTableLayout::hit_test` has no concept of either scrollbar strip
+    /// it reserves space for (the #1094 gap, and its horizontal twin), so
+    /// without this a click on either thumb mis-resolves to whichever
+    /// header/row sits under it.
+    ///
+    /// #2043: extended from a plain vertical-only `bool` to
+    /// `Option<QueueScrollAxis>` the same way `audit_scrollbar_hit` reports
+    /// both of Audit's tracks — same geometry the TUI rasteriser paints
+    /// them at (`quadraui::tui::data_table::draw_data_table`: the vertical
+    /// track occupies the rightmost `scrollbar_width` columns below the
+    /// header row; the horizontal track occupies the bottom
+    /// `h_scrollbar_height` row(s), left of the vertical track). Vertical
+    /// takes priority in the bottom-right corner, matching Audit's own
+    /// priority order.
+    pub(crate) fn queue_scrollbar_hit(&self, pos: Point) -> Option<QueueScrollAxis> {
         let cache = self.queue_table_layout.borrow();
-        let Some((rect, layout)) = cache.as_ref() else {
-            return false;
-        };
+        let (rect, layout) = cache.as_ref()?;
         let x = pos.x - rect.x;
         let y = pos.y - rect.y;
         if x < 0.0 || y < 0.0 || x >= layout.viewport_width || y >= layout.viewport_height {
-            return false;
+            return None;
         }
-        layout.scrollbar_width > 0.0
+        if layout.scrollbar_width > 0.0
             && x >= layout.viewport_width - layout.scrollbar_width
             && y >= layout.header_height
+        {
+            return Some(QueueScrollAxis::Vertical);
+        }
+        if layout.h_scrollbar_height > 0.0 && y >= layout.viewport_height - layout.h_scrollbar_height
+        {
+            return Some(QueueScrollAxis::Horizontal);
+        }
+        None
     }
 
     /// Jump `queue_scroll` to the row implied by a click along the vertical
@@ -1383,6 +1421,63 @@ impl CoordApp {
             let frac = ((pos.y - track_y0) / track_h).clamp(0.0, 1.0);
             (frac * max_scroll as f32).round() as usize
         };
+        true
+    }
+
+    /// #2043: jump `queue_h_scroll` to the column offset implied by a
+    /// click/drag along the grid's horizontal scrollbar track. Mirrors
+    /// `queue_apply_vscroll` for the other axis (and `audit_apply_hscroll`
+    /// for the other table) — over the cached `queue_table_layout` instead
+    /// of a `main_b` handle, the same `rect`-carrying-cache reason
+    /// `queue_table_hit` documents.
+    pub(crate) fn queue_apply_hscroll(&mut self, pos: Point) -> bool {
+        let (track_x0, track_w, content_w, visible_w) = {
+            let cache = self.queue_table_layout.borrow();
+            let Some((rect, layout)) = cache.as_ref() else {
+                return false;
+            };
+            let visible_w = (layout.viewport_width - layout.scrollbar_width).max(1.0);
+            (rect.x, visible_w, layout.content_width, visible_w)
+        };
+        let max_scroll = (content_w - visible_w).max(0.0);
+        self.queue_h_scroll = if max_scroll <= 0.0 {
+            0.0
+        } else {
+            let frac = ((pos.x - track_x0) / track_w).clamp(0.0, 1.0);
+            frac * max_scroll
+        };
+        true
+    }
+
+    /// #2043: step `queue_h_scroll` by one wheel notch — the horizontal
+    /// twin of `mouse_main_scroll`'s vertical Queue-grid wheel handling,
+    /// driven by `delta.x` (positive = scroll right, matching
+    /// `ScrollDelta`'s `ScrollRight` convention — see
+    /// `quadraui::tui::events`). Clamped to `[0, content_width -
+    /// visible_width]`, the same bound `queue_apply_hscroll` computes for
+    /// click-to-position, so wheel and track-click can never disagree on
+    /// where "all the way right" is. A no-op (returns `false`) whenever
+    /// the grid isn't actually scrolling horizontally — `max_scroll` is
+    /// `<= 0.0` below the `QUEUE_MIN_WIDTH_CHARS` floor.
+    pub(crate) fn queue_apply_hwheel(&mut self, delta_x: f32) -> bool {
+        let (content_w, visible_w) = {
+            let cache = self.queue_table_layout.borrow();
+            let Some((_, layout)) = cache.as_ref() else {
+                return false;
+            };
+            (
+                layout.content_width,
+                (layout.viewport_width - layout.scrollbar_width).max(1.0),
+            )
+        };
+        let max_scroll = (content_w - visible_w).max(0.0);
+        if max_scroll <= 0.0 {
+            self.queue_h_scroll = 0.0;
+            return false;
+        }
+        const STEP: f32 = 4.0;
+        let next = self.queue_h_scroll + delta_x.signum() * STEP;
+        self.queue_h_scroll = next.clamp(0.0, max_scroll);
         true
     }
 
