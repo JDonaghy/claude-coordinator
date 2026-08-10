@@ -252,6 +252,20 @@ class DriveCounters:
     # different review row (`drive_state.project` keys the review on the
     # current work id), so its id simply doesn't match this one.
     review_fix_dispatched_for: str = ""
+    # #2078: the combined stdout+stderr of the MOST RECENT `coord merge
+    # --only <aid>` attempt (`Driver._loop` captures it via `run_coord`'s own
+    # `_last_run_output`, right after each merge Action runs). When the board
+    # carries no merge-queue entry at all (`merge_status == ""`), this is the
+    # ONLY place the real reason lives: `coord merge --only` prints
+    # `_explain_missing_only_entry`'s diagnosis (naming the blocking
+    # review/smoke gate, or "identifier didn't resolve", or "all gates
+    # pass — not enqueued yet") on every such attempt, but the driver used to
+    # discard it and echo the board's empty fields instead. Threaded through
+    # `DriveCounters` (not returned some other way) because `_decide_merge`
+    # is pure and only ever sees this value on the NEXT poll after the
+    # attempt that produced it — one poll's staleness is the price of
+    # keeping the I/O boundary in `Driver`, not in `decide()`.
+    last_merge_diagnostic: str = ""
 
 
 # ── actions ──────────────────────────────────────────────────────────────────
@@ -1564,7 +1578,35 @@ def _decide_review(
 # (escalated on sight). See `_merge_entry`'s docstring for the full story.
 _RETRYABLE_MERGE_STATUSES = frozenset({"", "PENDING", "READY", "MERGING", "CONFLICT"})
 
+# #2078: matches the "enqueue blocked by <gate> gate — <reason> (waive with
+# <flag>)" line `coord.commands.merge._explain_missing_only_entry` prints for
+# each board row a failed `coord merge --only <aid>` matched but could not
+# enqueue. `re.MULTILINE` + `$` (not the whole string) so it still finds the
+# line even when `_explain_missing_only_entry` reports several matching rows
+# (rare — normally there is exactly one board row per (repo, issue)).
+_ENQUEUE_BLOCKED_RE = re.compile(r"enqueue blocked by (.+)$", re.MULTILINE)
+
 _PR_NUMBER_RE = re.compile(r"/pull/(\d+)")
+
+
+def _extract_gate_block_reason(diagnostic: str) -> str | None:
+    """Pull the named gate failure out of a captured `coord merge --only`
+    diagnostic (#2078).
+
+    `coord merge --only <aid>`, when it finds no queue entry for *aid*,
+    prints `_explain_missing_only_entry`'s diagnosis (commands/merge.py) —
+    one line per matching board row, each either naming the blocking
+    review/smoke gate (what this extracts) or reporting that every gate
+    already passes / that no board row matched at all (neither of which this
+    matches). `_decide_merge`'s empty-status arm uses a non-``None`` result
+    to tell "a real, persistent gate failure" — worth waiting on, like a
+    BLOCKED board entry — apart from "not enqueued yet" or "identifier
+    didn't resolve", which are still worth retrying. Returns ``None`` for an
+    empty *diagnostic* (no attempt has run yet this drive) or one with no
+    matching line.
+    """
+    match = _ENQUEUE_BLOCKED_RE.search(diagnostic)
+    return match.group(1).strip() if match else None
 
 
 def _extract_pr_number(pr_url: str) -> int | None:
@@ -1924,6 +1966,32 @@ def _decide_merge(
             )
         )
 
+    # #2078: an EMPTY status means "the board has no merge-queue entry for
+    # this issue at all" — a fundamentally different fact from a real
+    # PENDING/READY/MERGING/CONFLICT status, even though `""` sits in
+    # `_RETRYABLE_MERGE_STATUSES` alongside them and used to retry
+    # identically. `coord merge --only <aid>`, when it finds no entry, prints
+    # exactly why (`_explain_missing_only_entry`, #1695) — every attempt
+    # below captures that text into `counters.last_merge_diagnostic`
+    # (`Driver._loop`), so by the SECOND empty-status poll this driver
+    # already knows, from its own prior attempt, whether the row is simply
+    # not enqueued yet (self-heals — fall through to the bounded retry) or
+    # genuinely blocked on a review/smoke gate that a fourth identical
+    # `--only` cannot change (wait, like the BLOCKED arm above, instead of
+    # spending another attempt on a no-op). A CI-only block stays invisible
+    # here — CI is only evaluated once a row is enqueued — and falls through
+    # to the retry below, where the die message now quotes whatever the
+    # driver actually observed instead of echoing the board's empty fields.
+    if status == "":
+        gate_reason = _extract_gate_block_reason(counters.last_merge_diagnostic)
+        if gate_reason:
+            return _wait(
+                label=(
+                    "MERGE: blocked (not yet enqueued) — "
+                    f"{gate_reason}; re-checking"
+                )
+            )
+
     # #1505: a status no retry can fix (most commonly NEEDS_ATTENTION)
     # escalates immediately rather than falling into the bounded retry below
     # — see `_RETRYABLE_MERGE_STATUSES` and `_escalate_merge`.
@@ -1937,10 +2005,24 @@ def _decide_merge(
     # (e.g. a fresh conflict on every rebase attempt) must still terminate
     # rather than spin forever.
     if counters.merge_attempts >= opts.max_merge_attempts:
+        # #2078: quote the last captured `coord merge --only` diagnostic
+        # instead of just the board's (possibly still-empty) status/reason
+        # fields — `coord merge --plan` was never actually run here, but the
+        # SAME underlying gate check (`_explain_missing_only_entry`) already
+        # ran, on every attempt above, and its output is exactly the
+        # diagnosis a human would otherwise have to go fetch by hand.
+        diagnostic = counters.last_merge_diagnostic.strip()
+        diagnostic_block = (
+            "\n".join(f"     {line}" for line in diagnostic.splitlines())
+            if diagnostic
+            else "     (no output captured from the merge attempts)"
+        )
         return _die(
             f"merge attempted {counters.merge_attempts} times without landing.\n"
             f"   Last board state: status='{status or 'none'}' "
             f"reason='{state.merge_reason or 'none'}'\n"
+            f"   Last `coord merge --only` diagnostic:\n"
+            f"{diagnostic_block}\n"
             f"   Inspect the gates: coord merge --plan --repo {state.repo}"
         )
     counters.merge_attempts += 1
@@ -2711,6 +2793,16 @@ class Driver:
                 rc = self.run_coord(
                     action.command, serialize_merge=action.serialize_merge
                 )
+                if action.serialize_merge:
+                    # #2078: `serialize_merge` is set on exactly one Action —
+                    # `_decide_merge`'s bounded `coord merge --only <aid>`
+                    # retry — so this is the merge attempt's own diagnostic,
+                    # captured for `_decide_merge` to read back (via
+                    # `counters.last_merge_diagnostic`) on the NEXT poll: to
+                    # avoid a blind retry once a real gate block is already
+                    # known, and to name it in the give-up message instead of
+                    # the board's empty fields.
+                    counters.last_merge_diagnostic = self._last_run_output
                 if rc != 0:
                     # #1844: `coord assign`/`coord approve-plan` exits this
                     # SAME code (see EXIT_DISPATCH_REFUSED's docstring) only
