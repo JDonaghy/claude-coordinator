@@ -61,6 +61,17 @@ _SESSIONS_SLOW_THRESHOLD = 3.0  # seconds; a healthy sweep is normally <1s
 # on every ~4s dashboard poll.
 _SESSIONS_COOLDOWN = 20.0  # seconds before a down machine is re-probed
 
+# #2066: PipelineView.current_stage values that represent genuinely finished
+# work with no pending action — safe for api_pipeline's recency cutoff to age
+# out. Every other current_stage ("coding", "review_running", "review_done",
+# "smoke_running", "smoke_passed", "merge_ready", "merging") is live pipeline
+# state — either still in progress or waiting on a human gate click — and
+# must never be dropped by age alone, however stale its timestamps look.
+# See coord/pipeline.py's compute_pipeline() for the full current_stage set.
+_PIPELINE_QUIESCENT_STAGES = frozenset(
+    {"done", "merged", "failed", "review_failed", "smoke_failed"}
+)
+
 # Bug 1 fix: distinct event type for cancelled assignments so they are not
 # bucketed as FAILED on the client.  Not yet in coord.events — defined here
 # until a shared constants refactor can move it.
@@ -1098,25 +1109,52 @@ def build_app(
 
         #2066: bounded by default to active work + recently-finished terminal
         work, and sorted newest-first — the unbounded response used to grow
-        ~14 rows/day forever (711 rows, 2 of them live, when filed) because
-        nothing here applied the retention policy ``/board``'s DAO layer
-        already enforces (``coord.dao._board_retention_cutoff`` /
-        ``COORD_BOARD_RETENTION_DAYS``, default 14 days — reused verbatim
-        here rather than inventing a second policy, per #773's precedent).
+        ~14 rows/day forever (711 rows, 2 of them live, when filed). The
+        cutoff itself (``coord.dao._board_retention_cutoff`` /
+        ``COORD_BOARD_RETENTION_DAYS``, default 14 days) is reused from
+        ``/board``'s DAO layer per #773's precedent, but *what* gets aged is
+        deliberately not a straight port of ``coord.dao.compute_board_keep_ids``:
+        that function judges a row's own ``status`` against
+        ``TERMINAL_STATUSES``, then closes the kept set over
+        ``review_of_assignment_id`` links so an in-flight review/smoke never
+        strands its parent work row. Here we instead filter on
+        ``PipelineView.current_stage`` *after* ``compute_pipeline`` has
+        already inspected the linked review/smoke assignment — a work
+        assignment's own ``status`` flips to ``"done"`` the moment coding
+        finishes, independent of whether its review or smoke is still
+        running (``coord/notify.py`` documents this as the normal, possibly
+        long-lived intermediate state #846 ``needs_attention`` exists to
+        catch), so gating on ``a.status`` alone silently aged out exactly the
+        stalled-review rows that matter most. Filtering on ``current_stage``
+        gets the same protection as the DAO's closure — and additionally
+        covers "finished this sub-stage, awaiting a human gate click"
+        states (``review_done``, ``smoke_passed``, ``merge_ready``,
+        ``merging``) that the closure alone wouldn't, since those have no
+        non-terminal linked assignment to close over.  We deliberately do
+        **not** port the DAO's third exemption — "latest assignment of a
+        still-open issue" — the issue that drove this fix
+        (claude-coordinator#772) is itself an *open* issue with a long-dead
+        assignment, so keeping every open issue's latest row alive forever
+        would defeat the bound.
+
         ``?include=all`` opts back into the full, unbounded history.
 
-        The recency signal is ``finished_at`` when present, falling back to
-        ``dispatched_at`` (mirrors ``coord.dao.compute_board_keep_ids``) — a
-        row with neither is kept rather than guessed away. This fallback
-        matters independently of whatever turns out to be causing some rows'
-        ``finished_at`` to read back ``None`` (#2066's still-open second
-        half): ``dispatched_at`` is unconditionally stamped at dispatch time
-        by every code path, so the bound holds even for a row whose
+        The recency signal is ``PipelineView.finished_at`` — the max across
+        the work/review/smoke assignments (#1218) — when present, falling
+        back to the work assignment's own ``dispatched_at``; a row with
+        neither is kept rather than guessed away (same conservative rule as
+        ``compute_board_keep_ids``). Using ``pv.finished_at`` rather than the
+        raw ``a.finished_at`` matters independently of whatever turns out to
+        be causing some rows' ``finished_at`` to read back ``None``
+        (#2066's still-open second half): ``a.finished_at`` freezes at
+        coding-done and doesn't advance as review/smoke progress, while
+        ``dispatched_at`` is unconditionally stamped at dispatch time by
+        every code path, so the bound holds even for a row whose
         ``finished_at`` never got recorded.
         """
         from dataclasses import asdict
 
-        from coord.dao import TERMINAL_STATUSES, _board_retention_cutoff
+        from coord.dao import _board_retention_cutoff
         from coord.pipeline import compute_pipeline
         from coord.merge_queue import load_queue
         from coord.state import load_assignment_review_findings
@@ -1145,17 +1183,22 @@ def build_app(
             # Exclude assignments with no id (shouldn't normally happen).
             if not a.assignment_id:
                 continue
+            # No review findings yet — current_stage/finished_at (used for the
+            # cutoff decision below) don't depend on it, so defer the DB call
+            # until we know the row survives the filter.
+            pv = compute_pipeline(
+                a, board, mq_items, config,
+                review_findings_body=None,
+                now=pipeline_now,
+            )
             if (
                 cutoff is not None
-                and a.status in TERMINAL_STATUSES
+                and pv.current_stage in _PIPELINE_QUIESCENT_STAGES
                 and a.assignment_id not in merge_queue_ids
             ):
-                ts = a.finished_at if a.finished_at is not None else a.dispatched_at
+                ts = pv.finished_at if pv.finished_at is not None else a.dispatched_at
                 if ts is not None and ts < cutoff:
                     continue
-            # Pre-load review findings body (DB call; pure-computation path kept
-            # clean by passing it as a parameter rather than inside compute_pipeline).
-            findings_body: str | None = None
             rev_aid = review_by_work.get(a.assignment_id)
             if rev_aid:
                 found = (
@@ -1164,12 +1207,7 @@ def build_app(
                     else load_assignment_review_findings(rev_aid)
                 )
                 if found:
-                    _, findings_body = found
-            pv = compute_pipeline(
-                a, board, mq_items, config,
-                review_findings_body=findings_body,
-                now=pipeline_now,
-            )
+                    _, pv.review_findings_body = found
             pipelines.append(pv)
 
         # Newest-first: today's running work above a July failure, not the

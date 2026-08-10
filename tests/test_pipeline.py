@@ -782,6 +782,100 @@ class TestPipelineRetention:
         ids = [pv["assignment_id"] for pv in r.json()]
         assert ids == ["queued1"]
 
+    def test_done_work_with_stalled_review_kept_regardless_of_age(self) -> None:
+        """The blocking case from #2066's review: a work assignment's own
+        ``status`` flips to "done" as soon as coding finishes, independent of
+        whether its linked review is still running. A work row whose coding
+        finished 20 days ago but whose review has been stuck/retried for
+        weeks must stay visible by default — it's exactly the stalled-review
+        row #846 needs_attention exists to surface, not dead history.
+        """
+        import time
+
+        old_work = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=1, issue_title="Coding done, review stuck",
+            assignment_id="work-stalled", status="done", type="work",
+            dispatched_at=time.time() - 25 * 86400,
+            finished_at=time.time() - 20 * 86400,
+        )
+        stuck_review = _review(of_aid="work-stalled", status="running")
+        board = Board(active=[stuck_review], completed=[old_work])
+        client = _dashboard_client()
+        with (
+            patch("coord.dashboard.server.read_board", return_value=board),
+            patch("coord.merge_queue.load_queue", return_value=[]),
+            patch("coord.state.load_assignment_review_findings", return_value=None),
+        ):
+            r = client.get("/api/pipeline")
+        assert r.status_code == 200
+        data = r.json()
+        ids = [pv["assignment_id"] for pv in data]
+        assert ids == ["work-stalled"]
+        assert data[0]["current_stage"] == "review_running"
+
+    def test_review_done_awaiting_merge_kept_regardless_of_age(self) -> None:
+        """A work item that finished its review sub-stage and is just
+        waiting for a "Queue for Merge" click is an active pipeline card
+        with an available gate action — it must not age out even though
+        neither the work nor its (also finished) review status is
+        non-terminal and it isn't literally merge-queued yet.
+        """
+        import time
+
+        old_work = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=1, issue_title="Review done, awaiting merge",
+            assignment_id="work-review-done", status="done", type="work",
+            dispatched_at=time.time() - 25 * 86400,
+            finished_at=time.time() - 20 * 86400,
+        )
+        finished_review = _review(
+            of_aid="work-review-done", status="done", aid="rev-old",
+        )
+        finished_review.finished_at = time.time() - 20 * 86400
+        board = Board(active=[], completed=[old_work, finished_review])
+        client = _dashboard_client()
+        with (
+            patch("coord.dashboard.server.read_board", return_value=board),
+            patch("coord.merge_queue.load_queue", return_value=[]),
+            patch("coord.state.load_assignment_review_findings", return_value=None),
+        ):
+            r = client.get("/api/pipeline")
+        assert r.status_code == 200
+        data = r.json()
+        ids = [pv["assignment_id"] for pv in data]
+        assert ids == ["work-review-done"]
+        assert data[0]["current_stage"] == "review_done"
+
+    def test_review_failed_ages_out_like_top_level_failed(self) -> None:
+        """A sub-stage failure (review_failed) is just as dead as a
+        top-level "failed" work row once it's old — it should age out the
+        same way, not be treated as permanently live like review_running.
+        """
+        import time
+
+        old_work = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=1, issue_title="Review failed long ago",
+            assignment_id="work-review-failed", status="done", type="work",
+            dispatched_at=time.time() - 25 * 86400,
+            finished_at=time.time() - 20 * 86400,
+        )
+        failed_review = _review(
+            of_aid="work-review-failed", status="failed", aid="rev-failed",
+        )
+        failed_review.finished_at = time.time() - 20 * 86400
+        board = Board(active=[], completed=[old_work, failed_review])
+        client = _dashboard_client()
+        with (
+            patch("coord.dashboard.server.read_board", return_value=board),
+            patch("coord.merge_queue.load_queue", return_value=[]),
+        ):
+            r = client.get("/api/pipeline")
+        assert r.status_code == 200
+        assert r.json() == []
+
 
 class TestPipelineActionAPI:
     def test_missing_fields_returns_400(self) -> None:
