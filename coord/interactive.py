@@ -1845,6 +1845,7 @@ def _finalize_merge_blocked(
     branch: str | None = None,
     smoke_restored_paths: list[str] | None = None,
     smoke_restore_error: str | None = None,
+    test_verdict_recovered: str | None = None,
 ) -> InteractiveFinalizeResult:
     """Record a botched ``--merge-of`` rebase as blocked → ``failed`` (#604).
 
@@ -1857,13 +1858,14 @@ def _finalize_merge_blocked(
     posted on the issue, so the operator sees exactly why.  Cleans up the
     worktree afterwards, matching the normal-path discipline.
 
-    *smoke_restored_paths*/*smoke_restore_error* (#1256): this gate is
-    unreachable for a smoke session in practice (every ``smoke_repo_path``
-    caller also passes ``worktree_path=None``, and the gate above requires
-    ``verify_merge and worktree_path``) — but the restore mutation in
-    :func:`finalize_interactive_exit` runs unconditionally before this gate
-    is even checked, so if that invariant ever changes, the result must
-    still be threaded through rather than silently dropped.
+    *smoke_restored_paths*/*smoke_restore_error*/*test_verdict_recovered*
+    (#1256, #1351): this gate is unreachable for a smoke session in practice
+    (every ``smoke_repo_path``/``smoke_of`` caller also passes
+    ``worktree_path=None``, and the gate above requires ``verify_merge and
+    worktree_path``) — but the restore mutation and the Test transcript-floor
+    in :func:`finalize_interactive_exit` both run unconditionally before this
+    gate is even checked, so if that invariant ever changes, their results
+    must still be threaded through rather than silently dropped.
     """
     from coord.issue_store import (  # noqa: PLC0415
         STATUS_BLOCKED,
@@ -1918,6 +1920,7 @@ def _finalize_merge_blocked(
         merge_verify=merge_verify,
         smoke_restored_paths=list(smoke_restored_paths or []),
         smoke_restore_error=smoke_restore_error,
+        test_verdict_recovered=test_verdict_recovered,
     )
 
 
@@ -2617,16 +2620,26 @@ def finalize_interactive_exit(
 
     *smoke_of* (#1351): the WORK assignment id a Test (smoke) session was
     dispatched to validate (``review_of_assignment_id`` on the smoke row).
-    When given, the #1351 Test transcript-floor runs before the operator
-    prompt: it looks for a ``TEST_VERDICT:``/``TEST_REASON:``/``END_TEST``
-    block in THIS session's own transcript and, if found and the work row
-    has no verdict yet, records it on *smoke_of* — never on this session's
-    own ``assignment_id``. This is the Test-gate twin of the #606 review
-    transcript-floor below: a human-attended Test session's only channel
-    back to the board was, before this, a successful ``coord test
-    --passed|--fail`` run INSIDE the session, with no structured block, no
-    transcript floor, and no fallback if that command never ran (#1351).
-    ``None`` (every non-smoke caller) makes this an unconditional no-op.
+    When given, the #1351 Test transcript-floor runs FIRST, unconditionally,
+    right after the restore-on-exit step above and BEFORE the
+    ``_assignment_already_recorded(assignment_id)`` gate below: it looks for
+    a ``TEST_VERDICT:``/``TEST_REASON:``/``END_TEST`` block in THIS session's
+    own transcript and, if found and the work row has no verdict yet,
+    records it on *smoke_of* — never on this session's own ``assignment_id``.
+    It must run before that gate because the gate reads the status of THIS
+    session's own row (the smoke row), not the work row — and the smoke
+    briefing unconditionally requires the agent to close the smoke row with
+    ``coord report-result`` as a terminal step regardless of whether it also
+    ran ``coord test``. If the floor ran after that gate, the everyday case
+    of "agent forgot to run `coord test` but still closed the smoke row"
+    would return through that early return before the floor ever executed,
+    silently disabling the very mechanism this issue added. This is the
+    Test-gate twin of the #606 review transcript-floor below: a
+    human-attended Test session's only channel back to the board was,
+    before this, a successful ``coord test --passed|--fail`` run INSIDE the
+    session, with no structured block, no transcript floor, and no fallback
+    if that command never ran (#1351). ``None`` (every non-smoke caller)
+    makes this an unconditional no-op.
     """
     _effective_patterns = list(artifact_paths or [])
 
@@ -2638,6 +2651,52 @@ def finalize_interactive_exit(
                 smoke_repo_path, assignment_id, ssh_target=ssh_target
             )
         )
+
+    # ── Test transcript-floor (#1351): durable Test-gate verdict capture ────
+    # Mirrors the review transcript-floor further below, but for the Test
+    # gate: a human-attended smoke session's ONLY channel back to the board
+    # was, before this, `coord test --passed|--fail` running successfully
+    # INSIDE the session — no structured block, no transcript floor, no
+    # fallback. Recover a TEST_VERDICT:/TEST_REASON:/END_TEST block from
+    # THIS session's own transcript and record it on the WORK row
+    # (`smoke_of`), never on this session's own `assignment_id` — the same
+    # rule `_prompt_and_relay_test_verdict` follows for its own (later)
+    # backstop.
+    #
+    # Runs HERE — unconditionally, before the `_assignment_already_recorded`
+    # gate below — and NOT after it, deliberately. That gate reads the
+    # status of THIS session's own row (the smoke row), not the work row it
+    # targets. The smoke briefing unconditionally requires the agent to close
+    # the smoke row with `coord report-result` as a terminal step regardless
+    # of whether `coord test` also ran, so the everyday failure mode is: the
+    # agent forgets `coord test` but still closes the smoke row cleanly. If
+    # this floor ran after that gate, that exact case would hit the early
+    # return before the floor ever executed — silently disabling the
+    # mechanism this issue exists to add. Self-gating on `smoke_of`: every
+    # non-smoke caller passes `smoke_of=None` and this is a no-op, same as
+    # the review floor is a no-op for a work session whose transcript
+    # carries no REVIEW_VERDICT block.
+    _test_verdict_recorded: str | None = None
+    if smoke_of:
+        try:
+            _work_test_state = _read_test_state(smoke_of)
+            if not _work_test_state:
+                _tv = _test_verdict_from_transcript(
+                    issue_number, started_at, assignment_id=assignment_id,
+                    ssh_target=ssh_target,
+                )
+                if _tv is not None:
+                    from coord.state import record_test_verdict as _record_tv_floor  # noqa: PLC0415
+
+                    _record_tv_floor(
+                        assignment_id=smoke_of,
+                        test_state=_tv.verdict,
+                        test_reason=_tv.reason or None,
+                    )
+                    _test_verdict_recorded = _tv.verdict
+        except Exception:  # noqa: BLE001 — best-effort; the operator prompt
+            # backstop is still the ultimate fallback if this fails.
+            pass
 
     # ── Merge-prep verification gate (#604) ──────────────────────────────────
     # For the interactive MERGE agent (--merge-of), GIT TRUTH OVERRIDES the
@@ -2693,6 +2752,7 @@ def finalize_interactive_exit(
                     branch=branch,
                     smoke_restored_paths=_smoke_restored,
                     smoke_restore_error=_smoke_restore_error,
+                    test_verdict_recovered=_test_verdict_recorded,
                 )
 
     # Respect an explicit `coord report-result` from the agent.  Without
@@ -2735,6 +2795,7 @@ def finalize_interactive_exit(
             smoke_restored_paths=_smoke_restored,
             smoke_restore_error=_smoke_restore_error,
             artifacts_stashed=_artifacts_stashed,
+            test_verdict_recovered=_test_verdict_recorded,
         )
 
     # ── Transcript-floor (#606): durable review capture ──────────────────────
@@ -2792,44 +2853,8 @@ def finalize_interactive_exit(
                 merge_verify=merge_verify,
                 smoke_restored_paths=_smoke_restored,
                 smoke_restore_error=_smoke_restore_error,
+                test_verdict_recovered=_test_verdict_recorded,
             )
-
-    # ── Test transcript-floor (#1351): durable Test-gate verdict capture ────
-    # Mirrors the review transcript-floor immediately above, but for the Test
-    # gate: a human-attended smoke session's ONLY channel back to the board
-    # was, before this, `coord test --passed|--fail` running successfully
-    # INSIDE the session — no structured block, no transcript floor, no
-    # fallback. Recover a TEST_VERDICT:/TEST_REASON:/END_TEST block from
-    # THIS session's own transcript and record it on the WORK row
-    # (`smoke_of`), never on this session's own `assignment_id` — the same
-    # rule `_prompt_and_relay_test_verdict` follows for its own (later)
-    # backstop. Runs BEFORE the operator prompt: that prompt's idempotency
-    # gate reads the exact `test_state` column this writes, so a verdict
-    # recovered here silently satisfies it — no double-prompt. Self-gating
-    # on `smoke_of`: every non-smoke caller passes `smoke_of=None` and this
-    # is a no-op, same as the review floor is a no-op for a work session
-    # whose transcript carries no REVIEW_VERDICT block.
-    _test_verdict_recorded: str | None = None
-    if smoke_of:
-        try:
-            _work_test_state = _read_test_state(smoke_of)
-            if not _work_test_state:
-                _tv = _test_verdict_from_transcript(
-                    issue_number, started_at, assignment_id=assignment_id,
-                    ssh_target=ssh_target,
-                )
-                if _tv is not None:
-                    from coord.state import record_test_verdict as _record_tv_floor  # noqa: PLC0415
-
-                    _record_tv_floor(
-                        assignment_id=smoke_of,
-                        test_state=_tv.verdict,
-                        test_reason=_tv.reason or None,
-                    )
-                    _test_verdict_recorded = _tv.verdict
-        except Exception:  # noqa: BLE001 — best-effort; the operator prompt
-            # backstop is still the ultimate fallback if this fails.
-            pass
 
     # worktree_path is None for a human-attended REVIEW (migration A1): the
     # review runs read-only in the LIVE checkout, so there is no session

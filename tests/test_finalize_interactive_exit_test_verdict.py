@@ -162,3 +162,68 @@ class TestFinalizeWiresTestTranscriptFloor:
 
         mock_floor.assert_not_called()
         assert result.test_verdict_recovered is None
+
+    def test_recovers_even_when_smoke_row_already_closed(self) -> None:
+        """The modal failure mode (#1351 review finding): the agent forgets
+        to run `coord test` but DOES run the closing `coord report-result
+        --status done` the smoke briefing unconditionally requires — so by
+        the time this session's tmux exits and finalize_interactive_exit
+        runs, the smoke row's own status is already terminal ("done"), not
+        "running". The Test transcript-floor targets the WORK row
+        (`smoke_of`), a different row than the one
+        `_assignment_already_recorded(assignment_id)` inspects, so it must
+        still run and recover the verdict even though this session's own row
+        is already closed."""
+        _seed_running_assignment(
+            "work-1351d", assignment_type="work", issue_number=1351
+        )
+        _seed_running_assignment(
+            "smoke-1351d", assignment_type="smoke", issue_number=1351
+        )
+
+        from coord import issue_store
+
+        issue_store.post_result(
+            issue_store.ResultRecord(
+                assignment_id="smoke-1351d",
+                machine_name="laptop",
+                repo_name="api",
+                repo_github="acme/api",
+                issue_number=1351,
+                status="done",
+                verdict=None,
+                summary="smoke session closed per the briefing's terminal step",
+            )
+        )
+
+        with (
+            patch("coord.github_ops.post_issue_comment"),
+            patch(
+                "coord.interactive._review_findings_from_transcript",
+                return_value=None,
+            ),
+            patch(
+                "coord.interactive._test_verdict_from_transcript",
+                return_value=TestVerdictFindings(
+                    verdict="failed", reason="crashes on launch"
+                ),
+            ) as mock_floor,
+        ):
+            result = finalize_interactive_exit(
+                assignment_id="smoke-1351d",
+                repo_name="api",
+                repo_github="acme/api",
+                issue_number=1351,
+                machine_name="laptop",
+                worktree_path=None,
+                base_branch="main",
+                exit_code=0,
+                started_at=0.0,
+                repo_path=None,
+                smoke_of="work-1351d",
+            )
+
+        mock_floor.assert_called_once()
+        assert result.test_verdict_recovered == "failed"
+        assert _test_state_of("work-1351d") == "failed"
+        assert _test_state_of("smoke-1351d") is None
