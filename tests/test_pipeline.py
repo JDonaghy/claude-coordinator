@@ -20,6 +20,11 @@ from coord.state import save_board
 
 
 def _config(default_gates: list[str] | None = None) -> Config:
+    # #1724: the default here mirrors the real shipped default
+    # (coord.config.PipelineConfig.default_gates / coordinator.yml) —
+    # ["test", "review", "merge"] — rather than an ad hoc subset, so tests
+    # against the default config exercise the same gate set/order production
+    # does. Pass an explicit default_gates to test a narrower configuration.
     return Config(
         repos=[Repo(name="api", github="acme/api")],
         machines=[Machine(
@@ -27,7 +32,9 @@ def _config(default_gates: list[str] | None = None) -> Config:
             repo_paths={"api": "/tmp/api"},
         )],
         pipeline=PipelineConfig(
-            default_gates=default_gates if default_gates is not None else ["review", "merge"],
+            default_gates=(
+                default_gates if default_gates is not None else ["test", "review", "merge"]
+            ),
         ),
     )
 
@@ -121,12 +128,14 @@ class TestComputePipeline:
 
     def test_done_no_downstream_gives_done_stage(self) -> None:
         a = _work(status="done")
-        pv = compute_pipeline(a, _board(a), [], _config())
+        # Pin a config whose default_gates omits "test" — review offered,
+        # smoke not offered. (The module default includes "test"; see
+        # test_done_with_all_gates_shows_review_and_smoke for that case.)
+        pv = compute_pipeline(a, _board(a), [], _config(default_gates=["review", "merge"]))
         assert pv.current_stage == "done"
-        # default_gates=["review", "merge"] — review offered, smoke not offered
         gate_actions = {g.action for g in pv.available_gates}
         assert "dispatch_review" in gate_actions
-        assert "dispatch_smoke" not in gate_actions  # "smoke" not in default_gates
+        assert "dispatch_smoke" not in gate_actions  # "test" not in default_gates
         assert "enqueue" in gate_actions
 
     def test_done_with_active_review_gives_review_running(self) -> None:
@@ -176,19 +185,27 @@ class TestComputePipeline:
         assert "enqueue" in gate_actions
 
     def test_smoke_test_pass_gives_smoke_passed(self) -> None:
-        a = _work(status="done", smoke_test="pass")
+        """A genuinely-skipped gate still reports "skipped", not absent
+        (#1724): config.default_gates includes "test" — so the stage row
+        exists — but this assignment's own required_gates drops it, so it
+        shows skipped even though a smoke_test verdict was recorded. (Compare
+        test_required_gates_from_config_default_when_empty, where the gate is
+        missing from config entirely and the stage row itself disappears.)"""
+        a = _work(status="done", smoke_test="pass", required_gates=["review", "merge"])
         pv = compute_pipeline(a, _board(a), [], _config())
         assert pv.current_stage == "smoke_passed"
         smoke = next(s for s in pv.stages if s.name == "smoke")
-        # smoke is skipped (not in default required_gates = ["review", "merge"])
         assert smoke.status == "skipped"
         # Gates should offer enqueue
         gate_actions = {g.action for g in pv.available_gates}
         assert "enqueue" in gate_actions
 
     def test_smoke_test_pass_with_smoke_gate(self) -> None:
-        """smoke_passed when 'smoke' is in required_gates → smoke stage completed."""
-        a = _work(status="done", smoke_test="pass", required_gates=["smoke", "merge"])
+        """smoke_passed when the "test" gate is in required_gates → the smoke
+        stage shows completed, not skipped (#1724 regression: required_gates
+        uses the config gate name "test", not the internal stage name
+        "smoke" — a recorded passed verdict must be visible on the strip)."""
+        a = _work(status="done", smoke_test="pass", required_gates=["test", "merge"])
         pv = compute_pipeline(a, _board(a), [], _config())
         assert pv.current_stage == "smoke_passed"
         smoke = next(s for s in pv.stages if s.name == "smoke")
@@ -255,12 +272,22 @@ class TestComputePipeline:
         assert merge.status == "waiting"  # next action after done
 
     def test_required_gates_from_config_default_when_empty(self) -> None:
-        """Empty required_gates on assignment → fall back to config.pipeline.default_gates."""
-        cfg = _config(default_gates=["merge"])
+        """Empty required_gates on assignment → fall back to
+        config.pipeline.default_gates, for both which stages are skipped and
+        (#1724) which stages appear in the strip at all — stage_order is
+        itself derived from default_gates, so a gate absent from config
+        entirely doesn't get a stage row (vs. one present in config but
+        dropped from this assignment's required_gates, which stays visible
+        but "skipped" — see test_label_override_merge_only_skips_review_smoke)."""
+        cfg = _config(default_gates=["review", "merge"])  # no "test" gate at all
         a = _work(status="done", required_gates=[])  # empty = use config default
         pv = compute_pipeline(a, _board(a), [], cfg)
+        stage_names = [s.name for s in pv.stages]
+        assert stage_names == ["coding", "review", "merge"]  # "smoke" absent, not skipped
         review = next(s for s in pv.stages if s.name == "review")
-        assert review.status == "skipped"  # "review" not in ["merge"]
+        # required_gates falls back to config default (["review", "merge"]),
+        # which includes "review" — so it is not skipped.
+        assert review.status != "skipped"
 
     def test_progress_pct_increases_through_pipeline(self) -> None:
         a_running = _work(status="running")
@@ -279,6 +306,22 @@ class TestComputePipeline:
     def test_pipeline_view_contains_all_four_stages(self) -> None:
         a = _work(status="running")
         pv = compute_pipeline(a, _board(a), [], _config())
+        stage_names = [s.name for s in pv.stages]
+        # #1724: with the real default_gates=["test", "review", "merge"], the
+        # displayed order is work/test/review/merge (Test precedes Review) —
+        # "coding" is the internal name for the work stage and "smoke" is
+        # the internal name for the test stage; see STAGE_LABEL in the
+        # webapp for the display mapping.
+        assert stage_names == ["coding", "smoke", "review", "merge"]
+
+    def test_stage_order_follows_default_gates_not_hardcoded(self) -> None:
+        """#1724: changing config.pipeline.default_gates changes the emitted
+        stage order — proof the order is no longer hardcoded. Using the old
+        #520-era order (["review", "test", "merge"]) here must emit
+        review-before-test, the mirror image of the module default."""
+        a = _work(status="running")
+        cfg = _config(default_gates=["review", "test", "merge"])
+        pv = compute_pipeline(a, _board(a), [], cfg)
         stage_names = [s.name for s in pv.stages]
         assert stage_names == ["coding", "review", "smoke", "merge"]
 
@@ -332,8 +375,8 @@ class TestComputePipeline:
     # ── Issue #5: available_gates filtered by required_gates ─────────────────
 
     def test_done_with_all_gates_shows_review_and_smoke(self) -> None:
-        """required_gates=["review","smoke","merge"] → both review and smoke gates."""
-        a = _work(status="done", required_gates=["review", "smoke", "merge"])
+        """required_gates=["review","test","merge"] → both review and smoke gates."""
+        a = _work(status="done", required_gates=["review", "test", "merge"])
         pv = compute_pipeline(a, _board(a), [], _config())
         gate_actions = {g.action for g in pv.available_gates}
         assert "dispatch_review" in gate_actions
@@ -357,6 +400,43 @@ class TestComputePipeline:
         assert "dispatch_review" in gate_actions
         assert "dispatch_smoke" not in gate_actions
         assert "enqueue" in gate_actions
+
+    # ── #1724: Test pill wrongly "skipped" + Review-before-Test ordering ─────
+
+    def test_required_gates_test_leaves_smoke_stage_not_skipped(self) -> None:
+        """Direct regression for #1724 defect 1: required_gates=["test",
+        "review","merge"] — the real config gate name — must not leave the
+        smoke/test stage "skipped". The bug compared the projection's
+        internal stage name ("smoke") against required_gates directly, so
+        "smoke" not in ["test","review","merge"] was always true and every
+        item's Test pill rendered permanently skipped/greyed regardless of
+        verdict."""
+        a = _work(status="running", required_gates=["test", "review", "merge"])
+        pv = compute_pipeline(a, _board(a), [], _config())
+        smoke = next(s for s in pv.stages if s.name == "smoke")
+        assert smoke.status != "skipped"
+
+    def test_default_gates_not_corrupted_by_naming_fix(self) -> None:
+        """Regression guard: #1724 must be fixed by translating names at one
+        seam, NOT by adding "smoke" to default_gates — that would corrupt
+        the config every other gate check reads (coord.merge_queue's
+        requires_smoke/_bypassed_gates, coord.review's dispatch-gate,
+        PipelineConfig.test_precedes_review — all key off "test"). The
+        shipped default stays exactly ["test", "review", "merge"]."""
+        assert PipelineConfig().default_gates == ["test", "review", "merge"]
+        assert "smoke" not in PipelineConfig().default_gates
+
+    def test_coordinator_example_yml_gate_names_unchanged(self) -> None:
+        """Regression guard: the shipped coordinator.example.yml's
+        pipeline.default_gates (and smoke_tests config block) are unchanged
+        by this fix — the fix is confined to coord/pipeline.py's internal
+        stage-name lookup, not the on-disk config shape."""
+        import yaml
+
+        repo_root = Path(__file__).resolve().parent.parent
+        raw = yaml.safe_load((repo_root / "coordinator.example.yml").read_text())
+        assert raw["pipeline"]["default_gates"] == ["test", "review", "merge"]
+        assert "smoke_tests" in raw
 
 
 # ── #1218: finished_at field (dashboard "Work done" recency sort) ──────────
@@ -605,7 +685,7 @@ class TestPipelineAPI:
         assert len(data) == 1
         pv = data[0]
         stage_names = [s["name"] for s in pv["stages"]]
-        assert stage_names == ["coding", "review", "smoke", "merge"]
+        assert stage_names == ["coding", "smoke", "review", "merge"]
         # Each stage has required fields
         for s in pv["stages"]:
             assert "name" in s
@@ -937,7 +1017,10 @@ class TestPipelineActionAPI:
             review_of_assignment_id="a1", review_verdict="approve",
         )
         board = Board(completed=[a, rev])
-        client = _dashboard_client()
+        # This test is scoped to the review gate specifically — pin a config
+        # without "test" so the (unrelated) smoke/test gate doesn't also
+        # need satisfying here.
+        client = _dashboard_client(_config(default_gates=["review", "merge"]))
         with (
             patch("coord.dashboard.server.read_board", return_value=board),
             patch("coord.merge_queue.load_queue", return_value=[]),

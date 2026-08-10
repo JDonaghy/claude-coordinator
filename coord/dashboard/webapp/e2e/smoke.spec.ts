@@ -22,6 +22,14 @@ import { test, expect, type Page } from '@playwright/test'
 /**
  * A minimal /api/pipeline response with two active items and one completed.
  * Mirrors the `make_test_app(BoardData)` pattern from coord-tui.
+ *
+ * #1724: every real item has FOUR stages — coding, smoke ("test" gate,
+ * ordered before review per config.pipeline.default_gates =
+ * ["test","review","merge"]), review, merge. This fixture used to have only
+ * three (no smoke/test stage at all), so it never rendered a Test pill and
+ * was blind to both #1724 defects (the Test pill stuck "skipped", and the
+ * displayed order having Review before Test). Kept at four stages, in the
+ * real order, so this fixture stays representative.
  */
 const SEEDED_PIPELINE = [
   {
@@ -32,7 +40,8 @@ const SEEDED_PIPELINE = [
     machine_name: 'laptop',
     current_stage: 'coding',
     stages: [
-      { name: 'coding', status: 'active', is_current: true },
+      { name: 'coding', status: 'active',  is_current: true },
+      { name: 'smoke',  status: 'waiting', is_current: false },
       { name: 'review', status: 'waiting', is_current: false },
       { name: 'merge',  status: 'waiting', is_current: false },
     ],
@@ -52,6 +61,7 @@ const SEEDED_PIPELINE = [
     current_stage: 'review_running',
     stages: [
       { name: 'coding', status: 'completed', is_current: false },
+      { name: 'smoke',  status: 'completed', is_current: false },
       { name: 'review', status: 'active',    is_current: true  },
       { name: 'merge',  status: 'waiting',   is_current: false },
     ],
@@ -60,7 +70,7 @@ const SEEDED_PIPELINE = [
     review_findings_pending: false,
     review_verdict: null,
     review_findings_body: null,
-    test_verdict: null,
+    test_verdict: 'passed',
   },
 ]
 
