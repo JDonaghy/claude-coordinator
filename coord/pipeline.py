@@ -9,8 +9,13 @@ The pipeline is intentionally pure-computation: ``compute_pipeline`` takes
 already-loaded data structures and returns a value object — no I/O, no side
 effects.  The dashboard server wires the real persistence layer.
 
-Pipeline stages (in order):
-    coding  → review  → smoke  → merge
+Pipeline stages (in order): ``coding`` prepended, then whichever gates
+``config.pipeline.default_gates`` lists, in that order — e.g. the shipped
+default ``["test", "review", "merge"]`` yields ``coding → smoke → review →
+merge`` (see ``_STAGE_NAME_TO_GATE_NAME`` below for the ``smoke``/``test``
+alias). #1724: this used to be hardcoded as ``coding → review → smoke →
+merge``, which both mislabelled the gate and inverted Test/Review relative
+to config.
 
 Each stage may be "waiting", "active", "completed", or "skipped".  The
 ``required_gates`` field on the assignment (defaulting to
@@ -102,6 +107,32 @@ class PipelineView:
     # recently made progress) — see compute_pipeline for the derivation.
     # None only when nothing involved has finished yet (still coding).
     finished_at: float | None = None
+
+
+# ── Canonical gate naming (#1724) ────────────────────────────────────────────
+#
+# This module's internal stage/group name for the smoke-test gate is
+# "smoke" — it matches ``assignment.type == "smoke"``, the ``_STAGE_GROUP``
+# keys below, and the fine-grained "smoke_running"/"smoke_passed"/
+# "smoke_failed" ``current_stage`` values, all of which describe the
+# *smoke assignment*, not the gate.  ``config.pipeline.default_gates`` (and
+# ``Assignment.required_gates``) instead call this gate "test" — same
+# convention ``coord/merge_queue.py``'s ``requires_smoke``/``_bypassed_gates``
+# and ``coord/stage_projection.py`` (the TUI projection) already use.  #1724
+# found the code below comparing "smoke" against ``required_gates`` directly,
+# so the membership check always failed. Translate at this one seam instead
+# of scattering "smoke"/"test" string comparisons through the stage logic.
+_STAGE_NAME_TO_GATE_NAME: dict[str, str] = {"smoke": "test"}
+_GATE_NAME_TO_STAGE_NAME: dict[str, str] = {
+    v: k for k, v in _STAGE_NAME_TO_GATE_NAME.items()
+}
+
+
+def _gate_name_for(stage_name: str) -> str:
+    """Translate an internal stage/group name to the ``default_gates`` /
+    ``required_gates`` name it corresponds to (identity for stages that
+    aren't renamed, e.g. "review"/"merge")."""
+    return _STAGE_NAME_TO_GATE_NAME.get(stage_name, stage_name)
 
 
 # ── Stage progression constants ──────────────────────────────────────────────
@@ -254,17 +285,21 @@ def compute_pipeline(
     # Stages that appear after the current group are "waiting"; those before are
     # "completed".  "active" is the current group if still in progress.
 
-    # Define ordering for stage progression.
-    stage_order = ["coding", "review", "smoke", "merge"]
+    # Define ordering for stage progression. #1724: derived from
+    # config.pipeline.default_gates (translating each configured gate name
+    # back to its internal stage name) rather than hardcoded, so the
+    # displayed order can't drift from the order the rest of the pipeline
+    # actually enforces. "coding" (the work stage) always prepends — it is
+    # never a configurable gate.
+    stage_order = ["coding"] + [
+        _GATE_NAME_TO_STAGE_NAME.get(gate, gate) for gate in config.pipeline.default_gates
+    ]
     current_group_idx = (
         stage_order.index(current_group) if current_group in stage_order else -1
     )
 
     for i, stage_name in enumerate(stage_order):
-        if stage_name in ("review", "smoke") and stage_name not in required_gates:
-            stages.append(PipelineStage(name=stage_name, status="skipped", is_current=False))
-            continue
-        if stage_name == "merge" and "merge" not in required_gates:
+        if stage_name != "coding" and _gate_name_for(stage_name) not in required_gates:
             stages.append(PipelineStage(name=stage_name, status="skipped", is_current=False))
             continue
 
@@ -300,7 +335,7 @@ def compute_pipeline(
         # Only offer review/smoke gates if those stages are actually required.
         if "review" in required_gates:
             available_gates.append(PipelineGate("dispatch_review", "Dispatch Review", _EP))
-        if "smoke" in required_gates:
+        if _gate_name_for("smoke") in required_gates:
             available_gates.append(PipelineGate("dispatch_smoke", "Dispatch Smoke", _EP))
         available_gates.append(PipelineGate("enqueue", "Queue for Merge", _EP))
     elif current_stage == "review_failed":
