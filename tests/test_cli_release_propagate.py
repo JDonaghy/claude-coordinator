@@ -720,10 +720,17 @@ def test_2026_08_09_a_good_roll_is_not_reverted_by_lanes_it_cannot_roll(
     """The regression, end to end. #2052: every lane propagation *can* roll,
     rolled — three python lanes, three unit lanes, the one coord-tui it could
     reach. Verification then came back crit on `~/.coord-cli-venv` (a lane
-    this command has no model of), on the remote `coord-tui` binaries (which
-    it reports itself have NO remote install path) and on the `coord-serve`
-    process — and `--rollback-on-red` reverted the lot. Not a transient
-    failure: it would have happened on every run, forever."""
+    this command has no model of) and on the remote `coord-tui` binary (which
+    it reports itself has NO remote install path), plus a stale `webapp
+    bundle` (SHA-versioned off its own timer, never pip-versioned at all) —
+    and `--rollback-on-red` reverted the lot. Not a transient failure: it
+    would have happened on every run, forever.
+
+    #2069 closed the fourth lane this incident actually hit — `coord-serve
+    process` — by having the python lane restart coord-serve itself; see
+    `tests/test_release_propagate.py::
+    test_a_sibling_unit_finding_blocks_when_its_host_python_lane_rolled` for
+    that lane now correctly blocking instead of being advisory forever."""
     from coord import release_verify as rv
 
     # `server` is the host this command runs on, so it is the only host whose
@@ -737,9 +744,9 @@ def test_2026_08_09_a_good_roll_is_not_reverted_by_lanes_it_cannot_roll(
             rv.Finding(severity="crit", host="laptop",
                        lane="~/.coord-cli-venv (laptop)",
                        summary="on 0.4.104, expected 0.4.111"),
-            rv.Finding(severity="crit", host="server",
-                       lane="coord-serve process (server)",
-                       summary="on 0.4.104, expected 0.4.111"),
+            rv.Finding(severity="warn", host="server",
+                       lane="webapp bundle",
+                       summary="webapp bundle is stale"),
             rv.Finding(severity="warn", host="laptop", lane="coord-tui",
                        summary="tui binary is stale"),
         ],
@@ -954,3 +961,136 @@ def _stub_verify(monkeypatch, *, versions: dict[str, list[str]], severity: str =
             expected=kwargs.get("expected"), lanes=lanes, findings=findings
         ),
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# #2069: the python lane restarts coord-serve/coord-web/coord-drive-queue,
+# not just coord-agent
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _machine(name="server", host="server.tailnet"):
+    from coord.models import Machine
+
+    return Machine(name=name, host=host)
+
+
+def _stub_agent_update_ok(monkeypatch, *, target="0.4.111"):
+    """Make `_roll_python`'s own `/update` half succeed without a real agent."""
+    monkeypatch.setattr(release_cmd, "_post",
+                        lambda url, payload, *, timeout: (202, {}, ""))
+    monkeypatch.setattr(
+        "coord.commands.agent_ops._fetch_pre_started_at", lambda machines: {}
+    )
+    monkeypatch.setattr(
+        "coord.commands.agent_ops._wait_agents_updated",
+        lambda machines, *, target_version, timeout, pre_started_at: {
+            m.name: {"matched": True} for m in machines
+        },
+    )
+
+
+def test_roll_python_restarts_sibling_services_after_the_venv_swap(monkeypatch):
+    """The concrete cost this issue names: v0.5.13 carried a fix inside
+    coord-serve, but only coord-agent got restarted, so the daemon kept
+    serving v0.5.8's code under a v0.5.13 label. `_roll_python` must now call
+    `/restart-services` right after `/update` reports success."""
+    posts: list[tuple[str, dict]] = []
+
+    def _fake_post(url, payload, *, timeout):
+        posts.append((url, payload))
+        if url.endswith("/update"):
+            return 202, {}, ""
+        if url.endswith("/restart-services"):
+            return 200, {"units": {
+                "coord-serve": {"restarted": True, "detail": "active"},
+                "coord-web": {"restarted": None, "detail": "not running on this host"},
+                "coord-drive-queue": {"restarted": None, "detail": "not running on this host"},
+            }}, ""
+        raise AssertionError(f"unexpected POST {url}")
+
+    monkeypatch.setattr(release_cmd, "_post", _fake_post)
+    monkeypatch.setattr(
+        "coord.commands.agent_ops._fetch_pre_started_at", lambda machines: {}
+    )
+    monkeypatch.setattr(
+        "coord.commands.agent_ops._wait_agents_updated",
+        lambda machines, *, target_version, timeout, pre_started_at: {
+            m.name: {"matched": True} for m in machines
+        },
+    )
+
+    ok, detail = release_cmd._roll_python(
+        _machine(), target_version="0.4.111", agent_port=7433, timeout=5.0, force=False
+    )
+    assert ok
+    assert "now v0.4.111" in detail
+    assert "restarted coord-serve" in detail
+    urls = [u for u, _ in posts]
+    assert urls == [
+        "http://server.tailnet:7433/update",
+        "http://server.tailnet:7433/restart-services",
+    ], "restart-services must be called AFTER update, on the same host"
+
+
+def test_roll_python_stays_ok_when_a_sibling_restart_fails(monkeypatch):
+    """A failed sibling restart does not fail the python lane outright — the
+    venv genuinely did swap. It stays discoverable: the detail says so, and
+    (per test_release_propagate.py's #2069 tests) `coord release verify`'s
+    gate now treats that host's `coord-serve spawns` finding as blocking."""
+    _stub_agent_update_ok(monkeypatch)
+
+    def _fake_post(url, payload, *, timeout):
+        if url.endswith("/update"):
+            return 202, {}, ""
+        return 200, {"units": {
+            "coord-serve": {"restarted": False, "detail": "still activating 30s after restart"},
+        }}, ""
+
+    monkeypatch.setattr(release_cmd, "_post", _fake_post)
+    ok, detail = release_cmd._roll_python(
+        _machine(), target_version="0.4.111", agent_port=7433, timeout=5.0, force=False
+    )
+    assert ok, "the venv swap itself succeeded and must still be recorded as such"
+    assert "FAILED to restart" in detail
+    assert "coord-serve" in detail
+    assert "verify" in detail
+
+
+def test_roll_python_tolerates_an_agent_that_predates_restart_services(monkeypatch):
+    """A host on an old agent build has no /restart-services endpoint yet.
+    That must not turn a successful venv swap into a failed python lane."""
+    _stub_agent_update_ok(monkeypatch)
+    monkeypatch.setattr(
+        release_cmd, "_post",
+        lambda url, payload, *, timeout: (
+            (202, {}, "") if url.endswith("/update") else (404, {}, "")
+        ),
+    )
+    ok, detail = release_cmd._roll_python(
+        _machine(), target_version="0.4.111", agent_port=7433, timeout=5.0, force=False
+    )
+    assert ok
+    assert "now v0.4.111" in detail
+
+
+def test_restart_sibling_services_reports_a_mix_of_outcomes(monkeypatch):
+    calls = []
+
+    def _fake_post(url, payload, *, timeout):
+        calls.append(url)
+        return 200, {"units": {
+            "coord-serve": {"restarted": True, "detail": "active"},
+            "coord-web": {"restarted": False, "detail": "still deactivating"},
+            "coord-drive-queue": {"restarted": None, "detail": "not running on this host"},
+        }}, ""
+
+    monkeypatch.setattr(release_cmd, "_post", _fake_post)
+    ok, detail = release_cmd._restart_sibling_services(
+        _machine(), agent_port=7433, timeout=5.0
+    )
+    assert not ok
+    assert "restarted coord-serve" in detail
+    assert "not running here: coord-drive-queue" in detail
+    assert "FAILED to restart: coord-web" in detail
+    assert calls == ["http://server.tailnet:7433/restart-services"]

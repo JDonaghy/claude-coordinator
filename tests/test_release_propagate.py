@@ -648,14 +648,49 @@ def test_an_unreachable_host_is_never_silently_exempted():
     assert len(verdict.blocking) == 1
 
 
-def test_coord_agent_spawns_is_in_scope_but_coord_serve_spawns_is_not():
-    """POST /update swaps the venv and re-execs THE AGENT — and nothing else.
-    coord-serve keeps running the generation it started with, so its live
-    process is out of this command's reach however green the venv goes."""
-    assert rp.verify_lane_kind("coord-agent spawns") == rp.LANE_PYTHON
-    assert rp.verify_lane_kind("coord-serve spawns") is None
-    assert rp.lane_is_out_of_reach("coord-serve spawns")
-    assert not rp.lane_is_out_of_reach("coord-agent spawns")
+def test_the_python_lane_now_reaches_every_restarted_sibling_unit():
+    """#2069: `_roll_python` restarts coord-serve/coord-web/coord-drive-queue
+    right after `/update` lands, the same way it always restarted coord-agent
+    itself — so their `<unit> spawns` findings are graded like any other
+    python-lane lane, not permanently advisory."""
+    for unit in ("coord-agent", "coord-serve", "coord-web", "coord-drive-queue"):
+        assert rp.verify_lane_kind(f"{unit} spawns") == rp.LANE_PYTHON
+        assert not rp.lane_is_out_of_reach(f"{unit} spawns")
+
+
+def test_coord_serve_process_is_in_reach_too():
+    """`coord-serve process` (the daemon's own introspected version) is a
+    different lane than `coord-serve spawns` — #2069's restart covers both,
+    so both must resolve to the python lane rather than only the "spawns"
+    suffix pattern catching one of them."""
+    assert rp.verify_lane_kind("coord-serve process") == rp.LANE_PYTHON
+    assert not rp.lane_is_out_of_reach("coord-serve process")
+
+
+def test_a_sibling_unit_finding_blocks_when_its_host_python_lane_rolled():
+    """The asymmetry #2069 introduces: a host whose python lane this run
+    actually rolled is now accountable for coord-serve too."""
+    lanes = _run_lanes()  # python rolled on precision, elitebook, dellserver
+    verification = {
+        "severity": "crit",
+        "findings": [_finding("crit", "precision", "coord-serve spawns")],
+    }
+    assert rp.scope_verification(verification, lanes=lanes).red
+
+
+def test_a_sibling_unit_finding_on_an_unresolved_daemon_host_stays_advisory():
+    """`coord-serve process` is labelled with whatever `daemon_host_from_health`
+    could derive — a real machine name in the normal case, but still the
+    literal "daemon" placeholder when no machine could be identified. Scoping
+    can only correlate hosts it actually rolled; a placeholder host that
+    matches no journalled lane must not silently start blocking."""
+    verification = {
+        "severity": "crit",
+        "findings": [_finding("crit", "daemon", "coord-serve process (daemon)")],
+    }
+    verdict = rp.scope_verification(verification, lanes=_run_lanes())
+    assert not verdict.red
+    assert len(verdict.advisory) == 1
 
 
 def test_the_cli_venv_is_outside_this_module_entirely():

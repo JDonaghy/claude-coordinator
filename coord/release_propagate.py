@@ -132,6 +132,36 @@ was thoroughly tested by circumstance; the success path was not tested at
 all. **A mechanism whose failure mode only appears on the happy path needs
 its happy path tested first, not last.**
 
+REACH MUST GROW TO MEET THE GATE, NOT THE OTHER WAY AROUND
+------------------------------------------------------------
+#2069 (split out of #2067, the window bug): #2052 correctly stopped a run
+from being punished for lanes it could not move. It did not make those lanes
+move — a run could restart nothing but ``coord-agent``, report success, and
+leave ``coord-serve`` serving v0.5.8's ``review.py`` while every readout said
+v0.5.13. Advisory is "not ignored", but nothing downstream *acts* on an
+advisory finding either, so a half-deploy and a whole one produced the same
+green result — quietly, because #2052 had (correctly) silenced the loud
+wrong version of this failure.
+
+The fix is not a bigger allow-list; it is closing the gaps :data:`
+OUT_OF_REACH_LANES` was recording. ``coord-serve``, ``coord-web`` and
+``coord-drive-queue`` now get restarted as the last step of their host's
+python lane (see :data:`RESTARTED_BY_PYTHON_LANE` and ``coord/commands/
+release.py``'s ``_roll_python``), so their ``<unit> spawns`` findings — and,
+for the daemon specifically, its own ``coord-serve process`` version — are
+graded exactly like ``coord-agent spawns`` always was: blocking when this run
+attempted that host's python lane, advisory when it did not. Coverage and
+enforcement move together on purpose: :func:`scope_verification` reads
+:data:`OUT_OF_REACH_LANES` and :data:`RESTARTED_BY_PYTHON_LANE` directly, so
+shrinking one of those sets is the whole patch — no second edit to the gate
+logic is needed to re-arm it for a lane that just gained a channel.
+
+``~/.coord-cli-venv`` and the two remote ``coord-tui`` binaries are still
+open — #2069's fix 2 and fix 3, respectively. Neither has a channel yet, so
+both stay in :data:`OUT_OF_REACH_LANES` (``coord-tui`` per-host is handled
+separately, by :func:`lane_is_out_of_reach`'s "unrollable" path rather than
+this set — see :func:`plan_lanes`'s LANE ORDER section).
+
 PURITY
 ------
 Nothing in this module runs a subprocess, opens a socket, touches the DB or
@@ -191,31 +221,48 @@ ALL_LANES: tuple[str, ...] = (LANE_PYTHON, LANE_UNITS, LANE_TUI)
 #: ``coord release verify`` lane name -> the propagation lane that could move
 #: it. Exact names, matched against :func:`coord.release_verify.lanes_for_host`
 #: and :func:`~coord.release_verify.findings_for_host`.
+#:
+#: ``coord-serve process`` (:func:`coord.release_verify.daemon_lanes`) is the
+#: daemon's own introspected version — a different lane than ``coord-serve
+#: spawns`` (what it would hand subprocesses), and the one #2069's restart
+#: actually targets, so it needs its own exact entry rather than falling out
+#: of the ``" spawns"`` suffix rule below.
 _VERIFY_LANE_EXACT: dict[str, str] = {
     "~/.coord-venv": LANE_PYTHON,
     "coord-tui": LANE_TUI,
+    "coord-serve process": LANE_PYTHON,
 }
 
 #: Units whose *live process* a python-lane roll actually replaces. ``POST
-#: /update`` swaps the venv and then re-execs **the agent** — and nothing
-#: else. ``coord-serve``, ``coord-web``, ``coord-drive-queue`` and friends
-#: keep running the generation they started with until something restarts
-#: them, so their ``<unit> spawns`` lanes are outside this command's reach
-#: however green the venv underneath goes. That is exactly the third failure
-#: in #2052's run: "the venv swapped, but the *process* had not been
-#: restarted at the moment verify ran".
-RESTARTED_BY_PYTHON_LANE: frozenset[str] = frozenset({"coord-agent"})
+#: /update`` swaps the venv and re-execs **the agent**; #2069 closes the rest
+#: of the gap it used to leave open — the same roll now also asks the agent
+#: to ``systemctl --user restart`` every sibling unit it finds running on
+#: that host (``POST /restart-services``, called right after ``/update``
+#: lands — see ``coord/commands/release.py``'s ``_roll_python``). Before
+#: #2069, ``coord-serve``, ``coord-web`` and ``coord-drive-queue`` kept
+#: running the generation they started with until a human restarted them by
+#: hand — exactly the third failure in #2052's run: "the venv swapped, but
+#: the *process* had not been restarted at the moment verify ran". A host
+#: that does not actually run one of these units is unaffected — which unit
+#: to restart is read off that host's own ``spawned_coord`` facts (a
+#: topology question), never assumed from this list.
+RESTARTED_BY_PYTHON_LANE: frozenset[str] = frozenset(
+    {"coord-agent", "coord-serve", "coord-web", "coord-drive-queue"}
+)
 
 #: Lanes ``coord release verify`` grades that propagation has no channel for,
 #: named individually so the exemption is a decision rather than a fallthrough.
 #: ``~/.coord-cli-venv`` is the headline: `release_propagate.py` contains zero
-#: references to it, so it is outside this module's model entirely — yet the
-#: gate counted it. ``coord-serve process`` is the daemon's own live process
-#: (see :data:`RESTARTED_BY_PYTHON_LANE`); ``webapp bundle`` is SHA-versioned
-#: off a continuous timer and never pip-versioned at all.
-OUT_OF_REACH_LANES: frozenset[str] = frozenset(
-    {"~/.coord-cli-venv", "coord-serve process", "webapp bundle"}
-)
+#: references to it (#2069's fix 2 is still open — see the module docstring);
+#: ``webapp bundle`` is SHA-versioned off a continuous timer and never
+#: pip-versioned at all, so it has no "target version" to roll TO in the
+#: first place. ``coord-serve process`` used to live here too — #2069 gave it
+#: a channel (the restart above), so it now has its own entry in
+#: :data:`_VERIFY_LANE_EXACT` instead, graded the same way every other
+#: reachable lane is: blocking exactly when this run attempted that host's
+#: python lane. Shrinking this set is exactly how new coverage is meant to
+#: re-arm the gate (see the module docstring above).
+OUT_OF_REACH_LANES: frozenset[str] = frozenset({"~/.coord-cli-venv", "webapp bundle"})
 
 #: ``"~/.coord-venv (precision)"`` — the label `coord release verify` builds
 #: for a lane, and the only form a grouped finding names its lanes by.

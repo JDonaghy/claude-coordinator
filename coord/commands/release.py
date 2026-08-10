@@ -456,10 +456,19 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
 
     #2052: the final gate is scoped to the lanes this run attempted and could
     have moved. Verify grades lanes propagation cannot roll — the operator's
-    ``~/.coord-cli-venv``, a remote ``coord-tui`` binary, the ``coord-serve``
-    process — and holding a roll to those made every successful run red, which
+    ``~/.coord-cli-venv`` and a remote ``coord-tui`` binary, currently — and
+    holding a roll to those made every successful run red, which
     ``--rollback-on-red`` then reverted. Those findings are still reported and
     journalled in full; they are simply not evidence about *this* roll.
+
+    #2069: the python lane's reach used to stop at ``coord-agent`` — a venv
+    could swap cleanly while ``coord-serve`` kept serving the generation it
+    started with, and this command still exited green. ``_roll_python`` now
+    also restarts ``coord-serve``/``coord-web``/``coord-drive-queue`` on
+    whichever host actually runs them, right after that host's own ``/update``
+    lands, so the ``coord-serve process`` and ``<unit> spawns`` findings are
+    graded like any other python-lane lane instead of being permanently
+    advisory.
     """
     import json as _json  # noqa: PLC0415
     import time  # noqa: PLC0415
@@ -825,13 +834,77 @@ def _roll_python(machine, *, target_version: str, agent_port: int, timeout: floa
         pre_started_at=pre,
     )
     outcome = outcomes.get(machine.name) or {}
-    if outcome.get("matched"):
-        return True, f"now v{target_version}"
-    return False, str(
-        outcome.get("error")
-        or f"still reporting v{outcome.get('version_now', '?')} after "
-           f"{timeout:.0f}s (last update result: {outcome.get('result')})"
+    if not outcome.get("matched"):
+        return False, str(
+            outcome.get("error")
+            or f"still reporting v{outcome.get('version_now', '?')} after "
+               f"{timeout:.0f}s (last update result: {outcome.get('result')})"
+        )
+
+    # #2069: /update only ever restarted the agent — coord-serve, coord-web
+    # and coord-drive-queue kept running the generation they started with
+    # until a human restarted them by hand. This is the rest of the lane,
+    # not a separate one: it runs against whichever of those three units the
+    # freshly-restarted agent finds actually running on ITS host, so a run
+    # that never touches coord-web anywhere still reports "now vX.Y.Z" clean.
+    sib_ok, sib_detail = _restart_sibling_services(machine, agent_port=agent_port)
+    if sib_ok:
+        return True, f"now v{target_version}; {sib_detail}"
+    return True, (
+        f"now v{target_version}; {sib_detail} — `coord release verify` will "
+        "catch the resulting skew"
     )
+
+
+def _restart_sibling_services(
+    machine, *, agent_port: int, timeout: float = 120.0
+) -> tuple[bool, str]:
+    """``POST /restart-services`` — the rest of a python-lane roll (#2069).
+
+    ``/update`` swaps the venv and re-execs *the agent* — and nothing else.
+    ``coord-serve``, ``coord-web`` and ``coord-drive-queue`` keep running the
+    generation they started with until something restarts them, so this is
+    called right after ``/update`` reports success above. Which of the three
+    units actually need restarting is decided on the agent side, from what
+    it finds running on its own host (see the endpoint's docstring) — this
+    function only reports what came back.
+
+    ``ok=False`` here does not fail the python lane on its own (the venv DID
+    swap — that is still true and still worth recording as such); it means
+    the post-roll ``coord release verify`` gate — which #2069 also taught to
+    treat these units' lanes as ones this run attempted — will find the skew
+    and treat it as blocking, same as any other failed python lane would be.
+    """
+    status, body, error = _post(
+        f"http://{machine.host}:{agent_port}/restart-services", {}, timeout=timeout,
+    )
+    if error:
+        return False, f"sibling service restart: {error}"
+    if status != 200:
+        return False, f"sibling service restart: {body.get('error') or f'HTTP {status}'}"
+
+    units = body.get("units") or {}
+    restarted = sorted(u for u, r in units.items() if isinstance(r, dict) and r.get("restarted"))
+    skipped = sorted(
+        u for u, r in units.items() if isinstance(r, dict) and r.get("restarted") is None
+    )
+    failed = {
+        u: (r.get("detail") or "?")
+        for u, r in units.items() if isinstance(r, dict) and r.get("restarted") is False
+    }
+    parts = []
+    if restarted:
+        parts.append(f"restarted {', '.join(restarted)}")
+    if skipped:
+        parts.append(f"not running here: {', '.join(skipped)}")
+    if failed:
+        parts.append(
+            "FAILED to restart: "
+            + ", ".join(f"{u} ({detail})" for u, detail in sorted(failed.items()))
+        )
+    if not parts:
+        parts.append(body.get("detail") or "no sibling units to restart")
+    return not failed, "; ".join(parts)
 
 
 def _roll_units(machine, *, agent_port: int) -> tuple[bool | None, str]:
