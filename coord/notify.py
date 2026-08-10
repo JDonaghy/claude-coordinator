@@ -355,11 +355,27 @@ def _latest_turn_text_for_liveness(
     Returns ``None`` on any I/O failure or if the tail has no assistant
     turn yet — best-effort, the auditor must never be the reason
     ``coord notify`` raises.
+
+    The ``log_path`` recorded on an :class:`~coord.agent.AgentAssignment` is
+    a path on the *worker's own* machine, and ``coord notify`` normally runs
+    on the daemon host — so for the multi-machine fleet topology this repo
+    is built around, that path usually does NOT exist locally and the HTTP
+    fallback is the only branch that can ever return text. The local branch
+    is therefore taken only when the file actually exists: because
+    :func:`~coord.worker_events.latest_assistant_turn_text` swallows a
+    missing/unreadable file and returns ``None`` internally, committing to
+    it unconditionally would make the agent-fetch below dead code and the
+    auditor would silently never fire for any remote worker (#2048 review).
     """
     if log_path:
         from coord.worker_events import latest_assistant_turn_text  # noqa: PLC0415
 
-        return latest_assistant_turn_text(log_path, tail_bytes=65536)
+        try:
+            local_readable = Path(log_path).is_file()
+        except OSError:
+            local_readable = False
+        if local_readable:
+            return latest_assistant_turn_text(log_path, tail_bytes=65536)
     host = _agent_host(machine_name)
     if host:
         from coord.worker_events import latest_assistant_turn_text_from_text  # noqa: PLC0415

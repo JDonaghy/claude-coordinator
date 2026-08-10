@@ -326,3 +326,99 @@ class TestNeverGatesBoardState:
             # A later pass must not re-detect (already-raised + notified).
             again = notify_mod.detect_liveness_stall(config, now=t0 + 1000)
             assert again == []
+
+
+# ── remote workers: local-read-failure falls through to the agent fetch ──────
+
+
+class _FakeResponse:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    def raise_for_status(self) -> None:
+        return None
+
+
+def _remote_log_text(text: str) -> str:
+    return json.dumps({
+        "type": "assistant",
+        "message": {"content": [{"type": "text", "text": text}]},
+    }) + "\n"
+
+
+class TestRemoteWorkerLogFallback:
+    """``AgentAssignment.log_path`` is a path on the WORKER's machine, and
+    ``coord notify`` normally runs on the daemon host — so in the normal
+    multi-machine topology the local read fails and the HTTP agent-fetch is
+    the only branch that can return anything (#2048 review). Every other
+    test in this file happens to write the log to a real local ``tmp_path``,
+    so these are the ones that cover the remote fleet.
+    """
+
+    def test_helper_falls_back_to_agent_fetch_when_local_path_missing(
+        self, tmp_path: Path
+    ) -> None:
+        missing = tmp_path / "not-on-this-machine" / "log.jsonl"
+        with patch.object(
+            notify_mod, "_agent_host", return_value="laptop.tailnet",
+        ), patch.object(
+            notify_mod.httpx, "get",
+            return_value=_FakeResponse(_remote_log_text("remote turn text")),
+        ) as mock_get:
+            text = notify_mod._latest_turn_text_for_liveness(
+                "laptop", str(missing), "abc123",
+            )
+        assert text == "remote turn text"
+        assert mock_get.called
+
+    def test_helper_prefers_the_local_file_when_it_exists(
+        self, tmp_path: Path
+    ) -> None:
+        log_path = _log_with_turn(tmp_path, "local turn text")
+        with patch.object(
+            notify_mod, "_agent_host", return_value="laptop.tailnet",
+        ), patch.object(notify_mod.httpx, "get") as mock_get:
+            text = notify_mod._latest_turn_text_for_liveness(
+                "laptop", str(log_path), "abc123",
+            )
+        assert text == "local turn text"
+        mock_get.assert_not_called()
+
+    def test_helper_returns_none_when_local_missing_and_no_agent_host(
+        self, tmp_path: Path
+    ) -> None:
+        missing = tmp_path / "gone.jsonl"
+        with patch.object(notify_mod, "_agent_host", return_value=None):
+            assert notify_mod._latest_turn_text_for_liveness(
+                "laptop", str(missing), "abc123",
+            ) is None
+
+    def test_remote_worker_still_reaches_three_strikes(
+        self, tmp_path: Path, config: Config,
+    ) -> None:
+        """End-to-end: a worker whose log lives on another machine must still
+        be audited and still raise at the third strike."""
+        _record("abc123")
+        missing = tmp_path / "worker-only" / "log.jsonl"  # never created here
+        t0 = 9_000_000.0
+
+        with patch.object(
+            notify_mod, "_agent_status",
+            return_value=_active_status("abc123", missing),
+        ), patch.object(
+            notify_mod, "_agent_host", return_value="laptop.tailnet",
+        ), patch.object(
+            notify_mod.httpx, "get",
+            return_value=_FakeResponse(_remote_log_text("same failed command again")),
+        ), patch(
+            "coord.liveness_auditor.run_audit",
+            return_value=AuditOutcome(verdict="blocked", raw_output="blocked"),
+        ) as mock_audit:
+            r1 = notify_mod.detect_liveness_stall(config, now=t0)
+            r2 = notify_mod.detect_liveness_stall(config, now=t0 + 61)
+            r3 = notify_mod.detect_liveness_stall(config, now=t0 + 122)
+
+        assert mock_audit.call_count == 3
+        assert r1 == [] and r2 == []
+        assert len(r3) == 1
+        assert r3[0][0].consecutive_blocked == 3
