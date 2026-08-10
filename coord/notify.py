@@ -332,33 +332,46 @@ def post_needs_attention(detection: NeedsAttentionDetection, record: dict) -> No
 # context and (b) records/reads the resulting strike streak.
 
 
-def _fetch_log_text_for_liveness(
+def _latest_turn_text_for_liveness(
     machine_name: str, log_path: str | None, assignment_id: str,
 ) -> str | None:
-    """Best-effort log text for a RUNNING assignment, for the liveness
-    auditor to pull the latest turn out of.
+    """Best-effort latest-assistant-turn text for a RUNNING assignment, for
+    the liveness auditor.
 
     Mirrors :func:`_fetch_raw_log_text`'s local-file-then-agent-fetch
     fallback (that helper takes a completed :class:`Transition`; this one
     is called against a still-running assignment, so it takes the bare
-    fields instead). Returns ``None`` on any I/O failure — best-effort, the
-    auditor must never be the reason ``coord notify`` raises.
+    fields instead) — with one deliberate difference: the local-file
+    branch uses :func:`coord.worker_events.latest_assistant_turn_text`'s
+    seek-based tail read (``tail_bytes=65536``) instead of reading the
+    whole file into memory. This runs once per debounce interval for the
+    *entire lifetime* of a running assignment, so a full read here would
+    quietly turn "audit cost is flat" into "disk I/O scales with log
+    size" — worst in exactly the stuck-worker-with-a-growing-log scenario
+    the auditor exists to catch (#2048 review). The remote (agent-fetch)
+    branch has no tail-range support server-side, so it still fetches the
+    full response and slices in Python.
+
+    Returns ``None`` on any I/O failure or if the tail has no assistant
+    turn yet — best-effort, the auditor must never be the reason
+    ``coord notify`` raises.
     """
     if log_path:
-        try:
-            return Path(log_path).read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            pass
+        from coord.worker_events import latest_assistant_turn_text  # noqa: PLC0415
+
+        return latest_assistant_turn_text(log_path, tail_bytes=65536)
     host = _agent_host(machine_name)
     if host:
+        from coord.worker_events import latest_assistant_turn_text_from_text  # noqa: PLC0415
+
         try:
             resp = httpx.get(
                 f"http://{host}:{AGENT_PORT}/logs/{assignment_id}", timeout=15.0
             )
             resp.raise_for_status()
-            return resp.text
         except (httpx.HTTPError, httpx.TimeoutException):
             return None
+        return latest_assistant_turn_text_from_text(resp.text[-65536:])
     return None
 
 
@@ -385,7 +398,6 @@ def detect_liveness_stall(
         should_audit,
         strip_self_report_lines,
     )
-    from coord.worker_events import latest_assistant_turn_text_from_text  # noqa: PLC0415
 
     if now is None:
         now = time.time()
@@ -409,6 +421,15 @@ def detect_liveness_stall(
     for r in active_records:
         by_machine.setdefault(r["machine_name"], []).append(r)
 
+    # Deliberately serial: each `run_audit` call below is a subprocess
+    # spawn with up to a `timeout_seconds` (default 30s) ceiling, and
+    # audits for every not-yet-raised running assignment past its
+    # debounce window run one at a time in this loop. At today's typical
+    # concurrency this is a non-issue; if the audited fleet grows enough
+    # for a single `coord notify` pass to stack up meaningful wall-clock
+    # time here, parallelize (e.g. a bounded thread pool around
+    # `run_audit`) rather than accept unbounded serial latency (#2048
+    # review).
     results: list[tuple[LivenessStallDetection, dict]] = []
     for machine_name, records in by_machine.items():
         machine = machines_by_name.get(machine_name)
@@ -439,17 +460,16 @@ def detect_liveness_stall(
             ):
                 continue
 
-            text = _fetch_log_text_for_liveness(
+            # Seek-based tail read for a local log (see
+            # _latest_turn_text_for_liveness's docstring) — the auditor
+            # only ever needs the single most recent turn, never the
+            # whole (potentially multi-MB) transcript, and this repeats
+            # every debounce interval for the assignment's whole runtime.
+            turn_text = _latest_turn_text_for_liveness(
                 record["machine_name"], entry.get("log_path"), aid
             )
-            if text is None:
-                continue
-            # Bound to the tail — the auditor only ever needs the single
-            # most recent turn, never the whole (potentially multi-MB)
-            # transcript.
-            turn_text = latest_assistant_turn_text_from_text(text[-65536:])
             if turn_text is None:
-                continue  # no assistant turn yet — nothing to audit
+                continue  # no assistant turn yet, or fetch failed
 
             # #2048 context isolation: strip the worker's own STATUS:/
             # STUCK: lines before the auditor ever sees this turn — see

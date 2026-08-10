@@ -62,6 +62,30 @@ _VERDICT_RE = re.compile(r"\b(continue|done|blocked)\b", re.IGNORECASE)
 # either.
 _SELF_REPORT_LINE_RE = re.compile(r"^\s*(STATUS|STUCK):.*$", re.MULTILINE | re.IGNORECASE)
 
+# The audit's whole cost model rests on a FIXED context size — see the
+# module docstring's "~1,000 in / ~30 out" breakdown, and the issue's own
+# "objective / briefing excerpt — ~300 tokens" line (note: *excerpt*, not
+# the whole document). Nothing upstream of this module enforces that: the
+# caller (``coord.notify.detect_liveness_stall``) passes an assignment's
+# raw ``briefing`` straight through, and a full GitHub-issue briefing
+# regularly runs 5,000-15,000+ tokens (see ``AgentAssignment.to_status_dict``'s
+# docstring in ``coord/agent.py`` — "a full briefing can be tens of KB").
+# Truncate defensively here, in the one place every caller funnels
+# through, so the excerpt the cost model assumes is what the model
+# actually sees regardless of what a caller was handed.
+_OBJECTIVE_EXCERPT_CHARS = 1_200  # ~300 tokens @ ~4 chars/token
+_TURN_EXCERPT_CHARS = 2_000  # ~500 tokens @ ~4 chars/token
+
+
+def _excerpt(text: str, limit: int) -> str:
+    """Truncate *text* to at most *limit* characters, marking truncation
+    so a shortened excerpt is never silently indistinguishable from the
+    full text."""
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + " …[truncated]"
+
+
 _AUDIT_SYSTEM_PROMPT = (
     "You are a cheap, independent liveness auditor watching a coding agent "
     "one turn at a time. You do NOT see the conversation history and you "
@@ -94,9 +118,16 @@ def strip_self_report_lines(text: str) -> str:
 def build_audit_user_message(objective: str, turn_text: str) -> str:
     """Render the ``(objective, latest turn)`` pair as the auditor's one
     and only user message. No transcript, no history — this string IS the
-    entire context the model sees, by construction."""
+    entire context the model sees, by construction.
+
+    Both inputs are excerpted (see ``_OBJECTIVE_EXCERPT_CHARS``/
+    ``_TURN_EXCERPT_CHARS`` above) so a caller handing this a raw,
+    multi-KB assignment briefing or an unusually large turn still gets
+    the fixed-size context the auditor's cost model is built on."""
     objective = (objective or "").strip() or "(no objective provided)"
+    objective = _excerpt(objective, _OBJECTIVE_EXCERPT_CHARS)
     turn_text = (turn_text or "").strip() or "(no output on this turn)"
+    turn_text = _excerpt(turn_text, _TURN_EXCERPT_CHARS)
     return f"OBJECTIVE:\n{objective}\n\nLATEST TURN OUTPUT:\n{turn_text}"
 
 
