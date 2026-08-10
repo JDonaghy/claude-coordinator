@@ -9,6 +9,7 @@ import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { PipelineCard } from '@/components/PipelineCard'
 import { type PipelineView } from '@/api/client'
+import { needsMe, hasAvailableGate } from '@/lib/pipeline'
 
 // ── Test helpers ──────────────────────────────────────────────────────────────
 
@@ -131,13 +132,31 @@ describe('filter helpers', () => {
     expect(isActive(merged)).toBe(false)
   })
 
-  it('needsMe returns true when available_gates is non-empty', () => {
+  // #1966: "needs me" mirrors the server's `needs_attention` verdict, not
+  // gate availability — an item can have gates without being flagged, and
+  // (in principle) be flagged without an actionable gate. `hasAvailableGate`
+  // is the separate, gate-based predicate that still drives Active-tab sort
+  // priority (see Home.tsx's groupActiveItems).
+  it('needsMe tracks needs_attention, independent of available_gates', () => {
+    const gateNoFlag = makeView({
+      available_gates: [{ action: 'merge', label: 'Merge', endpoint: '/api/pipeline/action' }],
+      needs_attention: false,
+    })
+    const flagNoGate = makeView({
+      available_gates: [],
+      needs_attention: true,
+      needs_attention_reason: 'wall_clock',
+    })
+    expect(needsMe(gateNoFlag)).toBe(false)
+    expect(needsMe(flagNoGate)).toBe(true)
+  })
+
+  it('hasAvailableGate returns true when available_gates is non-empty', () => {
     const noAction = makeView({ available_gates: [] })
     const hasAction = makeView({
       available_gates: [{ action: 'merge', label: 'Merge', endpoint: '/api/pipeline/action' }],
     })
-    const needsMe = (v: PipelineView) => v.available_gates.length > 0
-    expect(needsMe(noAction)).toBe(false)
-    expect(needsMe(hasAction)).toBe(true)
+    expect(hasAvailableGate(noAction)).toBe(false)
+    expect(hasAvailableGate(hasAction)).toBe(true)
   })
 })

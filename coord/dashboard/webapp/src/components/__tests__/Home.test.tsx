@@ -254,6 +254,8 @@ describe('Home — Active tab grouping', () => {
       issue_title: 'Finished needing merge',
       current_stage: 'done',
       available_gates: [{ action: 'enqueue', label: 'Queue', endpoint: '/api/pipeline/action' }],
+      needs_attention: true,
+      needs_attention_reason: 'wall_clock',
       finished_at: 100,
     })
     vi.mocked(fetchPipeline).mockResolvedValue([done])
@@ -267,5 +269,81 @@ describe('Home — Active tab grouping', () => {
     // Rendered directly — no collapsed "Work done" wrapper on this tab.
     expect(await screen.findByText('Finished needing merge')).toBeInTheDocument()
     expect(screen.queryByText(/Work done \(/)).not.toBeInTheDocument()
+  })
+})
+
+// ── Needs-me badge mirrors the server's needs_attention field (#1966) ──────────
+
+describe('Home — Needs me count matches the API', () => {
+  it('badges exactly the items with needs_attention true, ignoring available_gates', async () => {
+    // Deliberately the inverse of the pre-#1966 behavior: most items expose
+    // gate actions (so the old available_gates.length > 0 rule would badge
+    // nearly all of them) but only two carry needs_attention === true. The
+    // tab count must equal 2, not 3 — proving the badge no longer recomputes
+    // its own answer.
+    const flagged1 = makeView({
+      assignment_id: 'a-flagged-1',
+      issue_title: 'Stuck item one',
+      available_gates: [{ action: 'retry', label: 'Retry', endpoint: '/api/pipeline/action' }],
+      needs_attention: true,
+      needs_attention_reason: 'wall_clock',
+    })
+    const flagged2 = makeView({
+      assignment_id: 'a-flagged-2',
+      issue_title: 'Stuck item two',
+      available_gates: [],
+      needs_attention: true,
+      needs_attention_reason: 'non_convergence',
+    })
+    const unflaggedWithGate = makeView({
+      assignment_id: 'a-unflagged',
+      issue_title: 'Ordinary item with a gate',
+      available_gates: [{ action: 'enqueue', label: 'Queue', endpoint: '/api/pipeline/action' }],
+      needs_attention: false,
+    })
+    vi.mocked(fetchPipeline).mockResolvedValue([flagged1, flagged2, unflaggedWithGate])
+    vi.mocked(fetchSessions).mockResolvedValue([])
+
+    renderHome()
+
+    const tab = await screen.findByRole('tab', { name: /Needs me/i })
+    expect(tab).toHaveTextContent('2')
+
+    await userEvent.click(tab)
+
+    expect(await screen.findByText('Stuck item one')).toBeInTheDocument()
+    expect(await screen.findByText('Stuck item two')).toBeInTheDocument()
+    expect(screen.queryByText('Ordinary item with a gate')).not.toBeInTheDocument()
+  })
+
+  it('reads "Needs me 0" with an empty list when nothing is flagged', async () => {
+    const items = [
+      makeView({
+        assignment_id: 'a-1',
+        issue_title: 'Busy but not flagged',
+        available_gates: [{ action: 'merge', label: 'Merge', endpoint: '/api/pipeline/action' }],
+        needs_attention: false,
+      }),
+      makeView({
+        assignment_id: 'a-2',
+        issue_title: 'Also busy but not flagged',
+        available_gates: [{ action: 'enqueue', label: 'Queue', endpoint: '/api/pipeline/action' }],
+        needs_attention: false,
+      }),
+    ]
+    vi.mocked(fetchPipeline).mockResolvedValue(items)
+    vi.mocked(fetchSessions).mockResolvedValue([])
+
+    renderHome()
+
+    const tab = await screen.findByRole('tab', { name: /Needs me/i })
+    // No count badge is rendered at all when the count is zero (see
+    // FilterTabs: `{count > 0 && ...}`).
+    expect(tab).not.toHaveTextContent(/\d/)
+
+    await userEvent.click(tab)
+
+    expect(await screen.findByText('All clear')).toBeInTheDocument()
+    expect(screen.queryByText('Busy but not flagged')).not.toBeInTheDocument()
   })
 })
