@@ -418,8 +418,21 @@ def has_approved_review(
     # process() time from the live branch tip) and the review has a
     # review_head_sha (set when the review assignment ran), an approval only
     # counts when the two SHAs match — i.e. no new commits were pushed after
-    # the review completed.  When either SHA is absent (pre-821 rows or SHA
-    # tracking unavailable) the check is skipped (backward-compatible).
+    # the review completed.  When the review has no review_head_sha at all
+    # (pre-#821 rows, SHA tracking never available for that verdict) the
+    # check is skipped — nothing to compare against, unchanged from before
+    # #821 existed.
+    #
+    # #2085: a review WITH a review_head_sha but a caller that cannot supply
+    # entry.branch_head_sha (a raw work Assignment — no such attribute; a
+    # QueuedMerge whose branch was deleted — attribute present but None) is
+    # the opposite case and must fail CLOSED, not skip the check. Before
+    # #2085 `current_sha is None` fell through to the same "return True" as
+    # "review predates SHA tracking", so any caller that didn't populate
+    # branch_head_sha (the board's stage projection, `enqueue_approved_work`,
+    # a queue row whose branch had just been deleted) silently accepted a
+    # superseded approval — see #2085 for the observed #1966 chain and the
+    # deleted-branch READY flip this produced.
     current_sha = getattr(entry, "branch_head_sha", None)
     current_patch_id = getattr(entry, "branch_patch_id", None)
     patch_id_attempted = current_patch_id is not None
@@ -432,14 +445,25 @@ def has_approved_review(
         if getattr(a, "review_verdict", None) != "approve":
             continue
         review_sha = getattr(a, "review_head_sha", None)
-        if review_sha is not None and current_sha is not None and review_sha != current_sha:
-            # #1475: the SHA moved — before declaring the approval stale,
-            # check whether the underlying content is identical via
-            # patch-id. A pure rebase (no conflict) replays the identical
-            # diff against a new base and produces the same patch-id even
-            # though the commit SHA changed; a conflict resolution or a
-            # genuine content change produces a different one. Fail closed
-            # when either patch-id is unavailable.
+        # #2085: `current_sha is None` (branch head unknown to this caller)
+        # is folded into the same "not confirmed fresh" branch as an actual
+        # mismatch — previously it skipped straight to `return True` below,
+        # which is exactly the fail-open gap #2085 documents. A review with
+        # no `review_head_sha` at all (the `review_sha is not None` guard)
+        # still takes the legacy no-SHA-to-compare path unchanged.
+        if review_sha is not None and (current_sha is None or review_sha != current_sha):
+            # #1475: the SHA moved (or is unknown) — before declaring the
+            # approval stale/unconfirmed, check whether the underlying
+            # content is identical via patch-id. A pure rebase (no conflict)
+            # replays the identical diff against a new base and produces the
+            # same patch-id even though the commit SHA changed; a conflict
+            # resolution or a genuine content change produces a different
+            # one. Fail closed when either patch-id is unavailable — which
+            # it always is when *entry* has no way to supply one (e.g. a raw
+            # work Assignment with no `branch_patch_id` attribute and
+            # *gh_ops* is ``None``), so a caller with no live SHA/patch-id
+            # access correctly can never confirm freshness and falls to
+            # `continue` → ``False``.
             review_patch_id = getattr(a, "review_patch_id", None)
             if review_patch_id is not None:
                 if current_patch_id is None and not patch_id_attempted:
@@ -448,7 +472,7 @@ def has_approved_review(
                     patch_id_attempted = True
                 if current_patch_id is not None and review_patch_id == current_patch_id:
                     return True  # content-identical rebase — approval still covers it
-            continue  # stale: branch moved past the commit the review covered
+            continue  # stale/unconfirmed: cannot prove this approval covers the current head
         return True
     return False
 
@@ -3322,37 +3346,19 @@ class StagingItem:
     reason: str | None   # None when ready; human-readable gate failure when blocked
 
 
-def _work_has_approved_review_a(a, board) -> bool:
-    """True when *a* (a work Assignment) has an approved review on *board*.
-
-    Mirrors :func:`has_approved_review` but accepts a raw Assignment rather
-    than a QueuedMerge entry, since staging items are not yet in the queue.
-    Delegates to the shared :func:`_chain_work_ids` fixed-point expansion
-    (#567 follow-up) rather than a standalone branch-only expansion: any work
-    assignment on the same branch, or connected via the
-    ``review_of_assignment_id`` chain — which also catches fix workers
-    dispatched with ``branch=NULL`` (the #557 gap) — counts. ``_chain_work_ids``
-    is duck-typed on ``.assignment_id``/``.branch``, both present on a raw
-    ``Assignment``, so it accepts *a* directly.
-    """
-    pool = (
-        list(getattr(board, "completed", []) or [])
-        + list(getattr(board, "active", []) or [])
-    )
-
-    branch_work_ids = _chain_work_ids(a, pool)
-
-    if not branch_work_ids:
-        return False
-
-    for x in pool:
-        if getattr(x, "type", None) != "review":
-            continue
-        if getattr(x, "review_of_assignment_id", None) not in branch_work_ids:
-            continue
-        if getattr(x, "review_verdict", None) == "approve":
-            return True
-    return False
+# #2085: `_work_has_approved_review_a` (a hand-rolled "any approve on any
+# connected work id" scan, no SHA/patch-id binding at all) used to live here
+# as a second implementation of the same question `has_approved_review`
+# answers — "two surfaces that happen to agree" is exactly the shape #2096
+# warns about, and this one agreed by being *more* permissive than the real
+# gate rather than less: a staging item could read READY off a review that
+# `coord merge` would refuse as stale. `has_approved_review` is already
+# duck-typed on `.assignment_id`/`.branch` (both present on a raw
+# `Assignment`) via `_chain_work_ids`, and getattr-defaults every SHA/
+# patch-id field a raw Assignment doesn't carry to `None` — which, since
+# #2085, means it fails CLOSED on any review whose approval can't be
+# confirmed fresh rather than skipping the check. staging_items now calls
+# `has_approved_review(a, board, gh_ops)` directly below.
 
 
 def _staging_smoke_entry(a, config):
@@ -3479,7 +3485,7 @@ def staging_items(board, config, gh_ops: "GhOps | None" = None) -> list[StagingI
         # approved — the item isn't "approved" yet and should not appear in the
         # staging section (it belongs to the pipeline, not the merge staging).
         if config is not None and board is not None:
-            if requires_review(a, config) and not _work_has_approved_review_a(a, board):
+            if requires_review(a, config) and not has_approved_review(a, board, gh_ops):
                 continue
 
         # Gate: smoke.  When the test gate is enabled and no *fresh* verdict

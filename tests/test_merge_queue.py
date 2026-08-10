@@ -1393,6 +1393,73 @@ class TestReviewGate:
         board = self._board(completed=[work, review])
         assert mq.has_approved_review(entry, board) is True
 
+    # ── #2085: a caller that cannot supply the current branch SHA must fail
+    # closed, not skip the check — the opposite gap from #1396's "review
+    # predates SHA tracking" backward-compat case just below.
+
+    def test_has_approved_review_missing_current_sha_fails_closed(self) -> None:
+        """#2085: `entry.branch_head_sha` unset (never populated — e.g. a
+        deleted branch, per #2085's "second, sharper failure mode": GitHub's
+        `get_branch_sha` returns None for a branch that no longer exists, and
+        that None is what lands in `branch_head_sha`) with a review that DOES
+        carry a `review_head_sha` must be treated as unconfirmed, not
+        approved. Before #2085 this fell through to the same `return True` as
+        the pre-#821 "review predates SHA tracking" case — the exact
+        fail-open gap the #1966 chain and the deleted-branch READY flip both
+        traced back to."""
+        work = self._work("w1")
+        review = self._review("w1", verdict="approve")
+        review.review_head_sha = "abc123"  # the review DID capture a SHA
+
+        entry = _q("w1", branch="worker/w1")
+        entry.branch_head_sha = None  # unknown to this caller (or branch deleted)
+
+        board = self._board(completed=[work, review])
+        assert mq.has_approved_review(entry, board) is False
+
+    def test_has_approved_review_raw_work_assignment_caller_fails_closed(self) -> None:
+        """#2085: the exact caller shape the issue names — `has_approved_review`
+        invoked with a raw work `Assignment` (no `branch_head_sha` attribute
+        at all, not merely `None`), as `merge_gate_failures`/`passes_merge_gates`
+        do for `enqueue_approved_work` and the board's stage projection's
+        underlying question. `getattr(entry, "branch_head_sha", None)` used to
+        make this indistinguishable from "no SHA to compare against" and
+        accept any historical approval; it must now refuse one that carries a
+        `review_head_sha` this caller cannot confirm."""
+        work = self._work("w1")
+        review = self._review("w1", verdict="approve")
+        review.review_head_sha = "abc123"
+        board = self._board(completed=[work, review])
+
+        # `work` itself stands in for the caller's entry — a plain Assignment,
+        # never a QueuedMerge, so it has no branch_head_sha attribute.
+        assert mq.has_approved_review(work, board) is False
+
+    def test_has_approved_review_superseded_by_later_request_changes(self) -> None:
+        """#2085: the #1966 chain itself — an `approve` at an earlier commit,
+        superseded by a `request-changes` review dispatched against later
+        commits. The live merge gate (entry.branch_head_sha populated from
+        the CURRENT branch tip, as `process()` does) must refuse: the only
+        `approve` review's SHA no longer matches the branch, and there is no
+        patch-id to prove the content is unchanged."""
+        work_orig = self._work("w-orig")
+        review_orig = self._review("w-orig", verdict="approve")
+        review_orig.review_head_sha = "sha-a"
+
+        work_fix = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="w-fix", type="work", status="done",
+            branch="worker/w-orig", review_of_assignment_id="w-orig",
+        )
+        review_fix = self._review("w-fix", verdict="request-changes")
+        review_fix.review_head_sha = "sha-b"
+
+        entry = _q("w-fix", branch="worker/w-orig")
+        entry.branch_head_sha = "sha-b"  # the CURRENT branch tip
+
+        board = self._board(completed=[work_orig, review_orig, work_fix, review_fix])
+        assert mq.has_approved_review(entry, board) is False
+
     def test_has_approved_review_no_sha_skips_commit_check(self) -> None:
         """#821: when SHAs are absent, the commit check is skipped (backward compat)."""
         work = self._work("w1")
@@ -3814,6 +3881,76 @@ class TestEnqueueApprovedWork:
         assert changed == []  # already correct — no change
         assert load_queue()[0].assignment_id == "fix1"
 
+    def test_does_not_rekey_onto_an_approval_superseded_by_request_changes(
+        self, coord_db
+    ) -> None:
+        """#2085: the #1966 chain. round 1 (approve) is followed by round 2
+        (a fix round on the SAME branch whose review comes back
+        request-changes). `group_branch_candidates` picks round 2 as the
+        branch's current winner (most recent passed test verdict), so the
+        gate this daemon tick actually evaluates is round 2's — and it must
+        see NO approved review, because the only `approve` on this branch's
+        chain covers a commit round 2 has already moved past.
+
+        Before #2085, `passes_merge_gates` -> `has_approved_review(a, board,
+        gh_ops=None)` — called with a raw work ``Assignment``, no
+        ``branch_head_sha`` attribute — treated that missing attribute as
+        "nothing to compare against" and accepted round 1's stale approval
+        outright, re-keying (or creating) a queue entry the merge gate would
+        then refuse on the very next real merge attempt: exactly the
+        re-enqueue-forever loop #2085 traces `enqueue_approved_work` to.
+        """
+        cfg = self._config()
+
+        round1_work = self._work("round1", branch="issue-1-impl")
+        round1_review = Assignment(
+            machine_name="m2", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="rev-round1", type="review", status="done",
+            review_of_assignment_id="round1", review_verdict="approve",
+            review_head_sha="sha-a",
+        )
+        # An earlier daemon tick already enqueued round 1's (then-valid)
+        # approval — the entry exists, keyed to round1.
+        mq.save_queue([
+            QueuedMerge(
+                assignment_id="round1",
+                repo_name="api",
+                repo_github="acme/api",
+                branch="issue-1-impl",
+                target_branch="main",
+                issue_number=1,
+                issue_title="t",
+            )
+        ])
+
+        round2_work = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="[fix-1] t",
+            assignment_id="round2", type="work", status="done",
+            branch="issue-1-impl", review_of_assignment_id="round1",
+            test_state="passed",
+        )
+        round2_review = Assignment(
+            machine_name="m2", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="rev-round2", type="review", status="done",
+            review_of_assignment_id="round2", review_verdict="request-changes",
+            review_head_sha="sha-b",
+        )
+        board = self._board(
+            completed=[round1_work, round1_review, round2_work, round2_review]
+        )
+
+        changed = mq.enqueue_approved_work(cfg, board)
+
+        assert changed == [], (
+            "a superseded approval must not re-key the queue entry onto the "
+            "unapproved round"
+        )
+        items = load_queue()
+        assert len(items) == 1
+        # Left exactly as it was — still keyed to round1, not silently
+        # advanced to round2 behind an approval that doesn't cover it.
+        assert items[0].assignment_id == "round1"
+
     # ── #934 milestone-aware target_branch ──────────────────────────────────
 
     @staticmethod
@@ -5840,11 +5977,12 @@ class TestStagingItems:
     # ── #567 follow-up: fix worker with branch=NULL must still be found ────
 
     def test_ready_when_fix_worker_approved_with_null_branch(self, coord_db) -> None:
-        """#567 follow-up: `_work_has_approved_review_a` (used by
-        staging_items, the /board staging section) must recognize an approved
-        review on a fix worker dispatched with branch=NULL (the #557 gap) via
-        the review_of_assignment_id chain — not just branch-keyed siblings.
-        Mirrors the has_approved_review fix, now sharing `_chain_work_ids`."""
+        """#567 follow-up: `has_approved_review` (called directly by
+        staging_items since #2085, the /board staging section) must
+        recognize an approved review on a fix worker dispatched with
+        branch=NULL (the #557 gap) via the review_of_assignment_id chain —
+        not just branch-keyed siblings. Mirrors the has_approved_review fix,
+        via the shared `_chain_work_ids`."""
         orig_work = self._work("orig", branch="worker/orig")
         fix_work = Assignment(
             machine_name="m1", repo_name="api", issue_number=42,

@@ -454,10 +454,11 @@ class TestDecision:
         assert by_gate["review"].verdict_unparseable is False
 
     def test_gh_ops_none_skips_live_lookups_fail_open(self, config: Config) -> None:
-        # #1479-review: without gh_ops, the staleness comparison has no live
-        # SHAs to compare against — the recorded verdict is trusted as-is
-        # (the pre-#1479 fail-open convention), matching how has_approved_review/
-        # evaluate_smoke_verdict behave when handed no gh_ops.
+        # #1479-review: without gh_ops, `evaluate_smoke_verdict`'s staleness
+        # comparison has no live SHAs to compare against, so the recorded
+        # test verdict is trusted as-is (the pre-#1479 fail-open convention,
+        # unchanged by #2085 — smoke staleness is a separate question from
+        # review staleness and this test still pins its behaviour).
         work = _work(
             test_state="passed",
             test_head_sha="branchsha", test_base_sha="oldbase",
@@ -468,7 +469,17 @@ class TestDecision:
 
         by_gate = {d.gate: d for d in report.decisions}
         assert by_gate["test"].ok is True
-        assert by_gate["merge"].ok is True
+        # #2085: `has_approved_review` no longer fails OPEN when it cannot
+        # confirm the branch's current head — and without `gh_ops`, this
+        # `entry.branch_head_sha` is never populated (see the "populate the
+        # freshness anchors LIVE" block above, guarded on `gh_ops is not
+        # None`) even though the review DOES carry a `review_head_sha`. A
+        # `coord gates` run with no live GitHub access can no longer report
+        # "merge READY" for something `coord merge --dry-run` (which always
+        # has `gh_ops`) would refuse — the exact board-vs-gate disagreement
+        # #2085 traces to this same fail-open shape at other call sites.
+        assert by_gate["merge"].ok is False
+        assert by_gate["merge"].reason == "review_required"
         assert report.target_branch == "main"  # falls back, no milestone lookup
 
 

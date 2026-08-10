@@ -357,6 +357,16 @@ def build_gate_report(
     # backfills base/branch SHAs and patch-id on demand) — without doing it
     # here, a row that never went through a live `coord merge`/auto-drain
     # tick would show every staleness check as a silent no-op.
+    # #2085: when *gh_ops* is None this block never runs, so `entry.
+    # branch_head_sha` stays at its default (None) — and, since #2085,
+    # `has_approved_review` treats an unset branch head as UNCONFIRMED
+    # rather than "nothing to compare, trust the verdict": a review carrying
+    # a `review_head_sha` reports the review gate BLOCKED, not READY, when
+    # this diagnostic has no live GitHub access. That is intentional — a
+    # `coord gates` run with no `gh_ops` must not report "merge READY" for
+    # something a real `coord merge --dry-run` (which always has `gh_ops`)
+    # would refuse; see `tests/test_gates.py::
+    # test_gh_ops_none_skips_live_lookups_fail_open`.
     if gh_ops is not None:
         try:
             entry.branch_head_sha = gh_ops.get_branch_sha(entry.repo_github, entry.branch)
