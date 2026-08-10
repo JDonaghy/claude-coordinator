@@ -2394,6 +2394,23 @@ pub struct CoordApp {
     /// (`queue_apply_vscroll`) already existed pre-#2017, this just adds
     /// the continuation so the drag doesn't die after one jump.
     queue_vscroll_drag: bool,
+    /// #2043: horizontal scroll offset (cells) into the Queue grid, applied
+    /// only once the grid has dropped below its `QUEUE_MIN_WIDTH_CHARS`
+    /// floor and started scrolling instead of squeezing columns
+    /// (`render_queue_panel`). Driven by the horizontal scrollbar's
+    /// click-to-position (`queue_apply_hscroll`) and its wheel
+    /// (`mouse_main_scroll`'s Queue arm) — mirrors `audit_h_scroll`, minus
+    /// the quadraui#550 caveat: that fix is what makes driving this safe at
+    /// all (a non-zero value used to shift painted headers out from under
+    /// `DataTableLayout::hit_test`, mis-routing sort clicks — see
+    /// `reports.rs:76-85`).
+    queue_h_scroll: f32,
+    /// #2043: `true` while the operator is dragging the Queue grid's own
+    /// horizontal-scrollbar thumb — set on a `MouseDown` inside
+    /// `queue_scrollbar_hit`'s `Horizontal` region and cleared on
+    /// `MouseUp`. Mirrors `queue_vscroll_drag`, the other axis of the same
+    /// track pair.
+    queue_hscroll_drag: bool,
     /// #2017: the Queue detail pane's most recently painted vertical
     /// scrollbar geometry (`Backend::list_vscrollbar`, called with the same
     /// `detail_rect` `render_queue_panel` draws into), cached so
@@ -3381,6 +3398,18 @@ pub(crate) enum AuditScrollAxis {
     Horizontal,
 }
 
+/// #2043: which axis of the Queue grid's scrollbars a `MouseDown`/drag is
+/// currently operating on. Same shape and reason as `AuditScrollAxis` —
+/// `DataTableLayout::hit_test` has no concept of either scrollbar strip, so
+/// `queue_scrollbar_hit` hit-tests them itself and needs to report which one
+/// so the caller (`mouse_main_click`) arms the matching drag flag
+/// (`queue_vscroll_drag` / `queue_hscroll_drag`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QueueScrollAxis {
+    Vertical,
+    Horizontal,
+}
+
 /// #728: Time-window for the Done section in the Pipeline sidebar.
 ///
 /// Cycled forward (H2 → H24 → D7 → All) by the `→` key while the Done
@@ -3642,6 +3671,8 @@ impl CoordApp {
             queue_split_drag: false,
             queue_separator_rect: std::cell::Cell::new(None),
             queue_vscroll_drag: false,
+            queue_h_scroll: 0.0,
+            queue_hscroll_drag: false,
             queue_detail_scrollbar: std::cell::RefCell::new(None),
             queue_detail_vscroll_drag: false,
             dialog_layout: std::cell::RefCell::new(None),

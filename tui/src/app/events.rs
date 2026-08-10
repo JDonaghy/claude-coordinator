@@ -4667,20 +4667,24 @@ impl CoordApp {
                         }
                     }
                     // #2017: continue an in-progress Queue splitter drag
-                    // and/or either pane's scrollbar-track drag, same
+                    // and/or any pane's/axis's scrollbar-track drag, same
                     // precedence and shape as the Audit/Reports blocks
-                    // above. All three drag flags are mutually exclusive by
-                    // construction (`mouse_main_click` sets at most one per
-                    // `MouseDown`), so checking them unconditionally rather
-                    // than as an `else if` chain costs nothing and stays
-                    // consistent with `MouseUp`'s unconditional release
-                    // below.
+                    // above. #2043 adds `queue_hscroll_drag` alongside
+                    // `queue_vscroll_drag` — all four drag flags are
+                    // mutually exclusive by construction (`mouse_main_click`
+                    // sets at most one per `MouseDown`), so checking them
+                    // unconditionally rather than as an `else if` chain
+                    // costs nothing and stays consistent with `MouseUp`'s
+                    // unconditional release below.
                     if self.active_view == SidebarView::Queue && buttons.left {
                         if self.queue_split_drag {
                             redraw |= self.queue_update_split_drag(pos, main_b, lh);
                         }
                         if self.queue_vscroll_drag {
                             redraw |= self.queue_apply_vscroll(pos);
+                        }
+                        if self.queue_hscroll_drag {
+                            redraw |= self.queue_apply_hscroll(pos);
                         }
                         if self.queue_detail_vscroll_drag {
                             redraw |= self.queue_apply_detail_vscroll(pos);
@@ -4811,7 +4815,8 @@ impl CoordApp {
                 // #1853: and a Reports result-table column-resize drag,
                 // the same way. #1910: and a Reports vertical-scrollbar-track
                 // drag. #2017: and the Queue splitter drag plus either of its
-                // panes' scrollbar-track drags. Each release is evaluated
+                // panes' scrollbar-track drags. #2043: and the Queue grid's
+                // horizontal-scrollbar-track drag. Each release is evaluated
                 // unconditionally rather than short-circuited behind `||` —
                 // with the short-circuit, a release while an earlier drag
                 // was active would leave a later one latched, and the next
@@ -4824,6 +4829,7 @@ impl CoordApp {
                     released |= std::mem::take(&mut self.reports_vscroll_drag);
                     released |= std::mem::take(&mut self.queue_split_drag);
                     released |= std::mem::take(&mut self.queue_vscroll_drag);
+                    released |= std::mem::take(&mut self.queue_hscroll_drag);
                     released |= std::mem::take(&mut self.queue_detail_vscroll_drag);
                     if released {
                         return true;
@@ -5759,9 +5765,17 @@ impl CoordApp {
         // scrollbar-track click must not fall through to a row select OR
         // start a separator drag).
         if self.active_view == SidebarView::Queue {
-            if self.queue_scrollbar_hit(pos) {
-                self.queue_vscroll_drag = true;
-                return self.queue_apply_vscroll(pos);
+            if let Some(axis) = self.queue_scrollbar_hit(pos) {
+                return match axis {
+                    QueueScrollAxis::Vertical => {
+                        self.queue_vscroll_drag = true;
+                        self.queue_apply_vscroll(pos)
+                    }
+                    QueueScrollAxis::Horizontal => {
+                        self.queue_hscroll_drag = true;
+                        self.queue_apply_hscroll(pos)
+                    }
+                };
             }
             if self.queue_detail_scrollbar_hit(pos) {
                 self.queue_detail_vscroll_drag = true;
@@ -6491,6 +6505,16 @@ impl CoordApp {
                             self.queue_table_visible_rows().unwrap_or(visible).max(1);
                         let max = n.saturating_sub(table_visible);
                         self.queue_scroll = (self.queue_scroll + 3).min(max);
+                    }
+                    // #2043: a genuine horizontal wheel/tilt notch
+                    // (`delta.x`, populated by quadraui's `ScrollLeft`/
+                    // `ScrollRight` translation) steps `queue_h_scroll`.
+                    // No-op below the `QUEUE_MIN_WIDTH_CHARS` floor —
+                    // `queue_apply_hwheel` clamps to `content_width -
+                    // visible_width`, which is `<= 0.0` whenever the grid
+                    // isn't actually scrolling horizontally.
+                    if delta.x != 0.0 {
+                        self.queue_apply_hwheel(delta.x);
                     }
                 } else {
                     // #1867 fix: `visible` here is the WHOLE Queue panel

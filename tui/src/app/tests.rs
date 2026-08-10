@@ -44449,11 +44449,17 @@ Milestone tracking issue.
     }
 
     #[test]
-    fn queue_grid_pins_h_scroll_at_zero() {
-        // Guards the trap documented at `reports.rs:1025-1032`: a non-zero
-        // `h_scroll` shifts the painted headers out from under
-        // `DataTableLayout::hit_test`, which has no concept of it, and
-        // routes sort clicks to the wrong column.
+    fn queue_grid_drives_h_scroll_and_sets_a_min_width_floor() {
+        // #2043 superseded the #1866-era `queue_grid_pins_h_scroll_at_zero`
+        // guard: `h_scroll` pinned at `0.0` was the workaround for
+        // `DataTableLayout::hit_test` having no concept of it (the trap
+        // documented at `reports.rs:1025-1032` and, historically, right
+        // here). quadraui#550 fixed `hit_test` itself to be `h_scroll`-aware
+        // (see `tui/Cargo.toml`'s pin-bump commit), so the Queue grid can
+        // now drive both fields the earlier guard forbade — this test
+        // asserts the NEW contract instead of the old one, the same way a
+        // source-inspection guard should move when the constraint it
+        // guarded is retired, not just get deleted.
         let src = include_str!("drive_queue.rs");
         let grid = src
             .split("id: WidgetId::new(\"queue-grid\")")
@@ -44461,8 +44467,17 @@ Milestone tracking issue.
             .expect("the Queue grid's DataTable literal must exist");
         let table = grid.split("};").next().unwrap_or(grid);
         assert!(
-            table.contains("h_scroll: 0.0"),
-            "#1866: the Queue grid's `h_scroll` must stay pinned at 0.0"
+            table.contains("h_scroll: self.queue_h_scroll"),
+            "#2043: the Queue grid's `h_scroll` must be driven by \
+             `self.queue_h_scroll`, not pinned at 0.0 — quadraui#550 made \
+             this safe:\n{table}"
+        );
+        assert!(
+            table.contains("min_total_width: Some(Self::QUEUE_MIN_WIDTH_CHARS"),
+            "#2043: the Queue grid must set a `min_total_width` floor \
+             (`QUEUE_MIN_WIDTH_CHARS`) rather than `None` — below it the \
+             grid must scroll horizontally instead of squeezing columns \
+             to uselessness:\n{table}"
         );
     }
 
@@ -45374,6 +45389,34 @@ Milestone tracking issue.
         x.map(|x| (x, row_min, row_max))
     }
 
+    /// Row of a horizontal scrollbar's `▄`/`▁` half-block glyphs, and the
+    /// column range its track spans, restricted to screen rows `[y0, y1)`.
+    /// #2043's horizontal twin of `scrollbar_track_in_rows` — same
+    /// row-range restriction, same reason (telling the grid's own track
+    /// apart from anything else on screen).
+    fn hscrollbar_track_in_row(screen: &str, y0: usize, y1: usize) -> Option<(f32, f32, f32)> {
+        let mut y = None;
+        let mut col_min = f32::MAX;
+        let mut col_max = f32::MIN;
+        for (row, line) in screen.lines().enumerate() {
+            if row < y0 || row >= y1 {
+                continue;
+            }
+            let cols: Vec<usize> = line
+                .chars()
+                .enumerate()
+                .filter(|(_, c)| *c == '▄' || *c == '▁')
+                .map(|(i, _)| i)
+                .collect();
+            if !cols.is_empty() {
+                y = Some(row as f32 + 0.5);
+                col_min = col_min.min(*cols.iter().min().unwrap() as f32 + 0.5);
+                col_max = col_max.max(*cols.iter().max().unwrap() as f32 + 0.5);
+            }
+        }
+        y.map(|y| (y, col_min, col_max))
+    }
+
     /// Locate the draggable separator (`CoordApp::queue_separator_list`'s
     /// hint text) on screen.
     fn find_queue_separator<A: quadraui::AppLogic>(
@@ -45763,6 +45806,415 @@ Milestone tracking issue.
             "#2017: a scrollbar-track click must not change the row \
              selection:\n{}",
             driver.screen()
+        );
+    }
+
+    // ── #2043: 120-char min grid width + horizontal scrollbar ─────────────
+    //
+    // Gated on quadraui#550 (`DataTableLayout::hit_test` becoming
+    // `h_scroll`-aware — see `tui/Cargo.toml`'s pin bump commit and
+    // `render_queue_panel`'s `h_scroll` doc comment). Acceptance test 6
+    // below is the regression guard that only passes with the fix in.
+
+    /// A narrow driver width whose main panel comfortably clears BELOW
+    /// `CoordApp::QUEUE_MIN_WIDTH_CHARS` (120) — `default_sidebar_width`
+    /// (35) + the activity bar (3) leaves ~52 columns of main panel at a
+    /// 90-column terminal, well under the floor.
+    const QUEUE_NARROW_COLS: u16 = 90;
+    /// A wide driver width whose main panel comfortably clears AT/ABOVE the
+    /// floor — the same 160 columns every other Queue `TuiDriver` test in
+    /// this file already uses, so acceptance test 2 doubles as "nothing
+    /// about the existing tests' assumptions changed".
+    const QUEUE_WIDE_COLS: u16 = 160;
+
+    #[test]
+    fn tuidriver_queue_grid_scrolls_horizontally_below_the_120_char_floor() {
+        // #2043 acceptance 1: below the 120-char floor the grid stops
+        // squeezing its columns and scrolls horizontally instead — a
+        // horizontal scrollbar must paint.
+        let driver = queue_driver(queue_fixture_json(), QUEUE_NARROW_COLS, 30);
+        let screen = driver.screen();
+        let (_sep_x, sep_y) = find_queue_separator(&driver);
+        let sep_y = sep_y as usize;
+        assert!(
+            hscrollbar_track_in_row(&screen, 0, sep_y).is_some(),
+            "#2043: a {QUEUE_NARROW_COLS}-column terminal puts the grid's \
+             main panel well under the 120-char floor — a horizontal \
+             scrollbar must paint:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn tuidriver_queue_grid_does_not_scroll_horizontally_at_or_above_the_120_char_floor() {
+        // #2043 acceptance 2: at/above the floor, no horizontal scrollbar
+        // paints and column widths are exactly what they were before this
+        // issue — the same squeeze-to-fit behaviour every other Queue
+        // TuiDriver test in this file already assumes (all of which use
+        // this same `QUEUE_WIDE_COLS` and, pre-#2043, never saw a floor at
+        // all). The "widths unchanged" half follows from
+        // `DataTable::layout`'s own formula — `min_total_width` only
+        // overrides `visible_col_area` when it EXCEEDS it, so once this
+        // assertion confirms the floor is inactive here, the flex-squeeze
+        // math is bit-for-bit what it was before `min_total_width` was set.
+        let driver = queue_driver(queue_fixture_json(), QUEUE_WIDE_COLS, 30);
+        let screen = driver.screen();
+        let (_sep_x, sep_y) = find_queue_separator(&driver);
+        let sep_y = sep_y as usize;
+        assert!(
+            hscrollbar_track_in_row(&screen, 0, sep_y).is_none(),
+            "#2043: a {QUEUE_WIDE_COLS}-column terminal puts the grid's main \
+             panel at/above the 120-char floor — no horizontal scrollbar may \
+             paint:\n{screen}"
+        );
+        assert!(
+            screen.contains("Reason"),
+            "#2043: `Reason` (the last, widest column) must still render \
+             on screen at {QUEUE_WIDE_COLS} columns — with no floor active \
+             every column fits, same as before this issue:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn tuidriver_queue_horizontal_track_click_jumps_to_that_position() {
+        // #2043 acceptance 3: a click on the horizontal track jumps
+        // `queue_h_scroll` to that position — click at the track's far
+        // right must scroll to (or very near) the end. `Reason` (the
+        // last, widest column) is scrolled fully off-screen at
+        // `h_scroll == 0.0` in a `QUEUE_NARROW_COLS`-wide terminal (proven
+        // by the sanity check below) and must come into view after the
+        // click.
+        let mut driver = queue_driver(queue_fixture_json(), QUEUE_NARROW_COLS, 30);
+        let screen_before = driver.screen();
+        assert!(
+            !screen_before.contains("Reason"),
+            "sanity: at h_scroll=0 in a {QUEUE_NARROW_COLS}-col terminal, \
+             `Reason` must be scrolled off the right edge — otherwise this \
+             test isn't exercising a real scroll:\n{screen_before}"
+        );
+
+        let (_sep_x, sep_y) = find_queue_separator(&driver);
+        let (sb_y, _track_x0, track_x1) =
+            hscrollbar_track_in_row(&screen_before, 0, sep_y as usize).unwrap_or_else(|| {
+                panic!(
+                    "horizontal scrollbar must render at {QUEUE_NARROW_COLS} \
+                     cols:\n{screen_before}"
+                )
+            });
+
+        driver.click(track_x1, sb_y);
+        driver.render();
+
+        assert!(
+            driver.screen().contains("Reason"),
+            "#2043: a click at the far right of the horizontal track must \
+             scroll the grid to (or near) the end, bringing `Reason` into \
+             view:\n{}",
+            driver.screen()
+        );
+    }
+
+    #[test]
+    fn tuidriver_queue_horizontal_thumb_drag_tracks_the_cursor_across_the_whole_gesture() {
+        // #2043 acceptance 4: press/move/release on the h-thumb tracks the
+        // cursor continuously, not just a single jump on `MouseDown` — the
+        // same press-drag-release shape
+        // `tuidriver_queue_grid_scrollbar_thumb_drag_scrolls_the_grid`
+        // proves for the vertical track.
+        //
+        // Observed via the header row's rendered text (row 0 — Queue has
+        // no panel toolbar, so the grid starts at the very top of the
+        // main panel): `driver_with_shell` wraps the app in a private
+        // `ShellAdapter` this crate can't see through, so there is no
+        // `driver.app().queue_h_scroll` to poke — every Queue mouse test
+        // in this file asserts on rendered content instead. Comparing the
+        // WHOLE row (sidebar included) is still exact: the sidebar's
+        // portion of row 0 never changes across these steps, so any
+        // difference is entirely inside the grid.
+        let mut driver = queue_driver(queue_fixture_json(), QUEUE_NARROW_COLS, 30);
+        let (_sep_x, sep_y) = find_queue_separator(&driver);
+        let screen = driver.screen();
+        let (sb_y, track_x0, track_x1) =
+            hscrollbar_track_in_row(&screen, 0, sep_y as usize).unwrap_or_else(|| {
+                panic!("horizontal scrollbar must render at {QUEUE_NARROW_COLS} cols:\n{screen}")
+            });
+
+        driver.mouse_down(track_x0, sb_y);
+        driver.render();
+        let header_after_down = screen_row(&driver.screen(), 0.0);
+
+        // Drag to the middle and check the header followed, then drag on
+        // to the far right and check it moved further still. A single
+        // click-to-position jump on `MouseDown` would already satisfy a
+        // start-to-end assertion; checking an INTERMEDIATE point is what
+        // proves the drag is CONTINUED via `MouseMoved`, not just the
+        // initial jump.
+        let mid_x = (track_x0 + track_x1) / 2.0;
+        driver.mouse_move(mid_x, sb_y);
+        driver.render();
+        let header_mid = screen_row(&driver.screen(), 0.0);
+        assert_ne!(
+            header_mid, header_after_down,
+            "#2043: dragging the h-thumb to the middle of the track must \
+             scroll the grid — header row unchanged:\n{}",
+            driver.screen()
+        );
+
+        driver.mouse_move(track_x1, sb_y);
+        driver.render();
+        let header_end = screen_row(&driver.screen(), 0.0);
+        assert_ne!(
+            header_end, header_mid,
+            "#2043: continuing the drag to the track's far right must keep \
+             scrolling the grid further — a `MouseMoved` that isn't \
+             tracked would leave the header stuck at the middle-drag \
+             state:\n{}",
+            driver.screen()
+        );
+        assert!(
+            driver.screen().contains("Reason"),
+            "#2043: dragging to the track's far right must reach (or come \
+             close to) the end, bringing `Reason` into view:\n{}",
+            driver.screen()
+        );
+
+        driver.mouse_up(track_x1, sb_y);
+        driver.render();
+        let header_after_up = screen_row(&driver.screen(), 0.0);
+        assert_eq!(
+            header_after_up, header_end,
+            "#2043: `MouseUp` must not itself move the scroll position — it \
+             only releases the drag"
+        );
+
+        // …and the drag really is released: a later `MouseMoved` (which
+        // `TuiDriver::mouse_move` always reports with the left button
+        // held, same as a real stray drag elsewhere would) must not keep
+        // scrubbing the h-scroll.
+        driver.mouse_move(track_x0, sb_y);
+        driver.render();
+        assert_eq!(
+            screen_row(&driver.screen(), 0.0),
+            header_after_up,
+            "#2043: `MouseUp` must clear `queue_hscroll_drag`, or this \
+             later unrelated `MouseMoved` would keep scrubbing the \
+             h-scroll"
+        );
+    }
+
+    #[test]
+    fn tuidriver_queue_wheel_scrolls_horizontally() {
+        // #2043 acceptance 5: a genuine horizontal wheel/tilt notch over
+        // the grid scrolls it — observed via the header row's rendered
+        // text changing (screen-only; see the thumb-drag test's comment
+        // above for why), dispatched at a position over a column that's
+        // actually visible at `h_scroll == 0.0` (`Issue`, unlike `Reason`
+        // in this narrow terminal).
+        let mut driver = queue_driver(queue_fixture_json(), QUEUE_NARROW_COLS, 30);
+        let (gx, gy) = driver
+            .find("Issue")
+            .unwrap_or_else(|| panic!("Issue header must render:\n{}", driver.screen()));
+        let header_before = screen_row(&driver.screen(), 0.0);
+
+        for _ in 0..60 {
+            driver.dispatch(quadraui::UiEvent::Scroll {
+                widget: None,
+                delta: ScrollDelta::new(1.0, 0.0),
+                position: Point::new(gx, gy),
+            });
+            driver.render();
+        }
+
+        let header_after = screen_row(&driver.screen(), 0.0);
+        assert_ne!(
+            header_before, header_after,
+            "#2043: a horizontal wheel notch over the grid must scroll \
+             it:\n{}",
+            driver.screen()
+        );
+        assert!(
+            driver.screen().contains("Reason"),
+            "#2043: 60 notches must be enough to clamp the scroll all the \
+             way to the end, bringing `Reason` into view:\n{}",
+            driver.screen()
+        );
+    }
+
+    #[test]
+    fn tuidriver_queue_header_click_after_h_scroll_still_sorts_the_column_under_it() {
+        // #2043 acceptance 6 — the quadraui#550 regression guard this whole
+        // issue is gated on. `DataTableLayout::hit_test` had no concept of
+        // `h_scroll`, so a click at a scrolled header's ON-SCREEN position
+        // used to resolve against the UNSCROLLED geometry — sorting
+        // whichever column originally sat at those coordinates, not the
+        // one the operator was looking at. Mirrors
+        // `reports_header_click_after_a_resize_still_sorts_the_column_under_it`
+        // (the #1853/#1910 precedent for the same class of bug via resize
+        // instead of scroll).
+        let mut driver = queue_driver(queue_fixture_json(), QUEUE_NARROW_COLS, 30);
+        let screen_before = driver.screen();
+        assert!(
+            !screen_before.contains("Reason"),
+            "sanity: at h_scroll=0 in a {QUEUE_NARROW_COLS}-col terminal, \
+             `Reason` must be scrolled off the right edge — otherwise this \
+             test isn't exercising a real scroll:\n{screen_before}"
+        );
+
+        let (_sep_x, sep_y) = find_queue_separator(&driver);
+        let (sb_y, _track_x0, track_x1) =
+            hscrollbar_track_in_row(&screen_before, 0, sep_y as usize).unwrap_or_else(|| {
+                panic!(
+                    "horizontal scrollbar must render at {QUEUE_NARROW_COLS} \
+                     cols:\n{screen_before}"
+                )
+            });
+
+        // Scroll to the far right of the track — large enough to push the
+        // `#` column fully off-screen (the issue's own acceptance
+        // wording) and bring `Reason` fully into view.
+        driver.click(track_x1, sb_y);
+        driver.render();
+
+        let (reason_x, header_y) = driver.find("Reason").unwrap_or_else(|| {
+            panic!("Reason header must render post-scroll:\n{}", driver.screen())
+        });
+
+        // Click the header at its CURRENT (scrolled) on-screen position —
+        // `+ 5.0` clears `Reason`'s own left divider-grab zone (shared
+        // with `Hold`'s right edge), the same margin
+        // `reports_header_click_after_a_resize_still_sorts_the_column_under_it`
+        // takes for the same reason.
+        driver.click(reason_x + 5.0, header_y);
+        driver.render();
+
+        let screen = driver.screen();
+        let row: String = screen_row(&screen, header_y).into_iter().collect();
+        let at_reason: String = row
+            .chars()
+            .skip(reason_x as usize)
+            .take("Reason ▲".chars().count())
+            .collect();
+        assert_eq!(
+            at_reason, "Reason ▲",
+            "#2043/quadraui#550: a click on the header now painted at \
+             x={reason_x} must sort `Reason` — the column actually under \
+             the cursor, not whatever occupied that x before the scroll. \
+             Header row was:\n{row}\n{screen}"
+        );
+        assert_eq!(
+            row.matches('▲').count() + row.matches('▼').count(),
+            1,
+            "#2043: exactly one column may carry a sort indicator:\n{row}"
+        );
+    }
+
+    #[test]
+    fn tuidriver_queue_horizontal_track_click_selects_no_row_and_starts_no_other_drag() {
+        // #2043 acceptance 7: a click on the horizontal track must not
+        // select a row or arm any other drag — mirrors
+        // `tuidriver_queue_scrollbar_click_does_not_select_a_row` for the
+        // vertical track. "No other drag" is checked via two more
+        // screen-observable proxies (no `driver.app()` field poke — see the
+        // thumb-drag test's comment for why): the splitter must not have
+        // moved (rules out `queue_split_drag`), and the detail pane's body
+        // must be unchanged (rules out `queue_detail_vscroll_drag`).
+        let mut data = BoardData::default();
+        data.open_issues
+            .push(open_issue("myrepo", 701, "T701", "BODY-701-UNIQUE"));
+        let mut driver =
+            queue_driver_with_issues(data, queue_fixture_json(), QUEUE_NARROW_COLS, 30);
+        assert!(
+            driver.screen().contains("BODY-701-UNIQUE"),
+            "sanity: row 0 (myrepo#701, the `running` entry) is selected by \
+             default — its body must render in the detail pane (the \
+             grid's own `Reason` cell is scrolled off-screen at \
+             {QUEUE_NARROW_COLS} columns, so it can't prove selection \
+             here):\n{}",
+            driver.screen()
+        );
+
+        let (sep_x_before, sep_y_before) = find_queue_separator(&driver);
+        let screen = driver.screen();
+        let (sb_y, track_x0, _track_x1) =
+            hscrollbar_track_in_row(&screen, 0, sep_y_before as usize).unwrap_or_else(|| {
+                panic!("horizontal scrollbar must render at {QUEUE_NARROW_COLS} cols:\n{screen}")
+            });
+
+        driver.mouse_down(track_x0 + 3.0, sb_y);
+        driver.mouse_up(track_x0 + 3.0, sb_y);
+        driver.render();
+
+        assert!(
+            driver.screen().contains("BODY-701-UNIQUE"),
+            "#2043: a horizontal-scrollbar-track click must not change the \
+             row selection, and the detail pane's body must be untouched \
+             (rules out `queue_detail_vscroll_drag`):\n{}",
+            driver.screen()
+        );
+        let (sep_x_after, sep_y_after) = find_queue_separator(&driver);
+        assert_eq!(
+            (sep_x_before, sep_y_before),
+            (sep_x_after, sep_y_after),
+            "#2043: a horizontal-track click must not move the grid/detail \
+             splitter — it must not have armed `queue_split_drag`"
+        );
+    }
+
+    #[test]
+    fn tuidriver_queue_horizontal_scrollbar_survives_a_splitter_drag() {
+        // #2043 acceptance 8 — must not regress #2017: after a splitter
+        // drag changes the grid's height, the horizontal scrollbar must
+        // still paint in the right place and still hit-test correctly.
+        let mut driver = queue_driver(queue_fixture_json(), QUEUE_NARROW_COLS, 30);
+
+        let (sx, sy) = find_queue_separator(&driver);
+        driver.mouse_down(sx, sy);
+        driver.mouse_move(sx, sy - 4.0);
+        driver.mouse_up(sx, sy - 4.0);
+        driver.render();
+
+        let (_sep_x, sep_y) = find_queue_separator(&driver);
+        let screen_before = driver.screen();
+        let (sb_y, _track_x0, track_x1) =
+            hscrollbar_track_in_row(&screen_before, 0, sep_y as usize).unwrap_or_else(|| {
+                panic!(
+                    "#2043/#2017: horizontal scrollbar must still paint \
+                     after a splitter drag:\n{screen_before}"
+                )
+            });
+        assert!(
+            !screen_before.contains("Reason"),
+            "sanity: `Reason` must still be scrolled off-screen right \
+             after the splitter drag (h_scroll is untouched by it) — \
+             otherwise this test isn't exercising a real scroll:\n{screen_before}"
+        );
+
+        driver.click(track_x1, sb_y);
+        driver.render();
+        let (reason_x, header_y) = driver.find("Reason").unwrap_or_else(|| {
+            panic!(
+                "#2043/#2017: the horizontal track must still hit-test \
+                 correctly after a splitter drag, bringing `Reason` into \
+                 view:\n{}",
+                driver.screen()
+            )
+        });
+
+        // …and a sort click at the new (post-splitter-drag AND
+        // post-h-scroll) header position must still land on the right
+        // column.
+        driver.click(reason_x + 5.0, header_y);
+        driver.render();
+        let screen = driver.screen();
+        let row: String = screen_row(&screen, header_y).into_iter().collect();
+        let at_reason: String = row
+            .chars()
+            .skip(reason_x as usize)
+            .take("Reason ▲".chars().count())
+            .collect();
+        assert_eq!(
+            at_reason, "Reason ▲",
+            "#2043/#2017: after a splitter drag, a header click at a \
+             scrolled position must still sort the right column:\n{row}\n{screen}"
         );
     }
 
