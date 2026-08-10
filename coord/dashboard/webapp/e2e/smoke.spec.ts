@@ -137,11 +137,11 @@ test.describe('coord webapp smoke suite (#741)', () => {
 
   /**
    * Core smoke 2: the "Active" filter tab must be the default, and the
-   * "Needs me" tab must switch the visible set to only items the API flags
-   * via `needs_attention` (#1966 — the tab mirrors that field exactly rather
-   * than recomputing its own answer from available gates). With the seeded
-   * data (neither item carries `needs_attention: true`), "Needs me" renders
-   * empty.
+   * "Needs me" tab must switch the visible set to only items the API says are
+   * waiting on a human — either flagged via `needs_attention` or parked on an
+   * offered gate (#1966 — see `lib/pipeline.ts`'s `needsMe`). With the seeded
+   * data (neither item carries `needs_attention: true`, neither has
+   * `available_gates`), "Needs me" renders empty.
    *
    * Guards the filter-tab click → state update → re-render path.
    */
@@ -152,9 +152,9 @@ test.describe('coord webapp smoke suite (#741)', () => {
     // Default: both items visible under "Active".
     await expect(page.getByText('Fix the dashboard rendering')).toBeVisible()
 
-    // Click "Needs me" — neither seeded item has needs_attention: true, so
-    // the list should be empty. The filter tabs render with role="tab"
-    // (inside role="tablist").
+    // Click "Needs me" — neither seeded item is flagged or gated, so the list
+    // should be empty. The filter tabs render with role="tab" (inside
+    // role="tablist").
     await page.getByRole('tab', { name: /needs.me/i }).click()
 
     // Neither card should be visible.

@@ -132,12 +132,11 @@ describe('filter helpers', () => {
     expect(isActive(merged)).toBe(false)
   })
 
-  // #1966: "needs me" mirrors the server's `needs_attention` verdict, not
-  // gate availability — an item can have gates without being flagged, and
-  // (in principle) be flagged without an actionable gate. `hasAvailableGate`
-  // is the separate, gate-based predicate that still drives Active-tab sort
-  // priority (see Home.tsx's groupActiveItems).
-  it('needsMe tracks needs_attention, independent of available_gates', () => {
+  // #1966: "needs me" is the union of the two server-reported reasons an item
+  // can be waiting on a human — the daemon's `needs_attention` verdict and an
+  // offered gate action. It used to read `available_gates` alone, which
+  // silently dropped every flagged-but-gateless item.
+  it('needsMe is true for a flagged item with no gate and for a gated item', () => {
     const gateNoFlag = makeView({
       available_gates: [{ action: 'merge', label: 'Merge', endpoint: '/api/pipeline/action' }],
       needs_attention: false,
@@ -147,8 +146,10 @@ describe('filter helpers', () => {
       needs_attention: true,
       needs_attention_reason: 'wall_clock',
     })
-    expect(needsMe(gateNoFlag)).toBe(false)
+    const neither = makeView({ available_gates: [], needs_attention: false })
+    expect(needsMe(gateNoFlag)).toBe(true)
     expect(needsMe(flagNoGate)).toBe(true)
+    expect(needsMe(neither)).toBe(false)
   })
 
   it('hasAvailableGate returns true when available_gates is non-empty', () => {

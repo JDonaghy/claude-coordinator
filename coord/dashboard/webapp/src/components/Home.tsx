@@ -19,9 +19,10 @@
  * SSE `/events` stream (#1549) rather than a poll timer -- see
  * `src/realtime/`. Two filter tabs:
  *   Active    — everything currently in the pipeline (not yet merged)
- *   Needs me  — items the server flags via `needs_attention` (#1966: this
- *               used to be recomputed client-side from available gates and
- *               disagreed with the API; it now mirrors the API exactly)
+ *   Needs me  — items waiting on a human: the server's `needs_attention`
+ *               verdict OR an offered gate action (#1966 — see
+ *               `lib/pipeline.ts`'s `needsMe` for why both halves count and
+ *               why neither is recomputed client-side)
  *
  * Pull-to-refresh: drag down from the top (when already scrolled to top) to
  * trigger an immediate refetch.
@@ -33,7 +34,7 @@ import { fetchPipeline, fetchSessions, type PipelineView, type SessionInfo } fro
 import { PipelineCard } from '@/components/PipelineCard'
 import { SessionCard } from '@/components/SessionCard'
 import { PanelHeader } from '@/components/PanelHeader'
-import { isActive, needsMe, hasAvailableGate } from '@/lib/pipeline'
+import { isActive, needsMe } from '@/lib/pipeline'
 import { paths } from '@/routes/paths'
 
 // ── Filter logic ──────────────────────────────────────────────────────────────
@@ -69,15 +70,16 @@ const RUNNING_STAGES = new Set(['coding', 'review_running', 'smoke_running', 'me
 /**
  * Split the "Active" tab's items into "in progress" (shown expanded) and
  * "done-ish" (collapsed by default, see DONE_ISH_STAGES). Within "in
- * progress", items with an available gate action (`hasAvailableGate`) sort
- * first, then actively-running items, with the incoming order preserved as
- * the tiebreak (stable sort). "Done-ish" items are returned unsorted here —
- * the caller sorts them by finished_at descending.
+ * progress", items waiting on a human (`needsMe`) sort first, then
+ * actively-running items, with the incoming order preserved as the tiebreak
+ * (stable sort). "Done-ish" items are returned unsorted here — the caller
+ * sorts them by finished_at descending.
  *
- * #1966: this sort deliberately uses `hasAvailableGate`, not `needsMe` — "has
- * something actionable" is a useful sort key even though it's no longer what
- * the "Needs me" tab/badge means (that now mirrors the server's
- * `needs_attention` exactly). Conflating the two was the bug.
+ * The sort key is the same `needsMe` the tab and badge use, deliberately:
+ * "floats to the top of Active" and "appears under Needs me" answering
+ * differently is the kind of drift #1966 was about. Since #1966 that includes
+ * items the daemon flagged via `needs_attention` with no gate offered yet —
+ * a stuck item now sorts to the top instead of being buried mid-list.
  */
 function groupActiveItems(views: PipelineView[]): { inProgress: PipelineView[]; done: PipelineView[] } {
   const inProgress: PipelineView[] = []
@@ -91,7 +93,7 @@ function groupActiveItems(views: PipelineView[]): { inProgress: PipelineView[]; 
   }
 
   const priority = (view: PipelineView): number => {
-    if (hasAvailableGate(view)) return 0
+    if (needsMe(view)) return 0
     if (RUNNING_STAGES.has(view.current_stage)) return 1
     return 2
   }

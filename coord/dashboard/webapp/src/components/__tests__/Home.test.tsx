@@ -272,36 +272,38 @@ describe('Home — Active tab grouping', () => {
   })
 })
 
-// ── Needs-me badge mirrors the server's needs_attention field (#1966) ──────────
+// ── Needs-me honours the server's needs_attention field (#1966) ───────────────
 
-describe('Home — Needs me count matches the API', () => {
-  it('badges exactly the items with needs_attention true, ignoring available_gates', async () => {
-    // Deliberately the inverse of the pre-#1966 behavior: most items expose
-    // gate actions (so the old available_gates.length > 0 rule would badge
-    // nearly all of them) but only two carry needs_attention === true. The
-    // tab count must equal 2, not 3 — proving the badge no longer recomputes
-    // its own answer.
-    const flagged1 = makeView({
-      assignment_id: 'a-flagged-1',
-      issue_title: 'Stuck item one',
-      available_gates: [{ action: 'retry', label: 'Retry', endpoint: '/api/pipeline/action' }],
+describe('Home — Needs me count is built from server fields', () => {
+  it('counts and lists an item the server flagged even when it offers no gate', async () => {
+    // The #1966 regression: the tab used to read `available_gates` ONLY, so an
+    // item the daemon had explicitly flagged as stuck (wall-clock /
+    // non-convergence) but which sits mid-`coding` with no gate offered was
+    // absent from the very tab whose job is "what is waiting for me" — and
+    // never contributed to the badge the API's `needs_attention` was supposed
+    // to agree with. Both items below must be counted: one via each half.
+    const flaggedNoGate = makeView({
+      assignment_id: 'a-flagged',
+      issue_title: 'Stuck with no gate',
+      current_stage: 'coding',
+      available_gates: [],
       needs_attention: true,
       needs_attention_reason: 'wall_clock',
     })
-    const flagged2 = makeView({
-      assignment_id: 'a-flagged-2',
-      issue_title: 'Stuck item two',
-      available_gates: [],
-      needs_attention: true,
-      needs_attention_reason: 'non_convergence',
-    })
-    const unflaggedWithGate = makeView({
-      assignment_id: 'a-unflagged',
-      issue_title: 'Ordinary item with a gate',
+    const gatedNotFlagged = makeView({
+      assignment_id: 'a-gated',
+      issue_title: 'Parked on a gate',
       available_gates: [{ action: 'enqueue', label: 'Queue', endpoint: '/api/pipeline/action' }],
       needs_attention: false,
     })
-    vi.mocked(fetchPipeline).mockResolvedValue([flagged1, flagged2, unflaggedWithGate])
+    const neither = makeView({
+      assignment_id: 'a-neither',
+      issue_title: 'Just running along',
+      current_stage: 'coding',
+      available_gates: [],
+      needs_attention: false,
+    })
+    vi.mocked(fetchPipeline).mockResolvedValue([flaggedNoGate, gatedNotFlagged, neither])
     vi.mocked(fetchSessions).mockResolvedValue([])
 
     renderHome()
@@ -311,23 +313,57 @@ describe('Home — Needs me count matches the API', () => {
 
     await userEvent.click(tab)
 
-    expect(await screen.findByText('Stuck item one')).toBeInTheDocument()
-    expect(await screen.findByText('Stuck item two')).toBeInTheDocument()
-    expect(screen.queryByText('Ordinary item with a gate')).not.toBeInTheDocument()
+    expect(await screen.findByText('Stuck with no gate')).toBeInTheDocument()
+    expect(await screen.findByText('Parked on a gate')).toBeInTheDocument()
+    expect(screen.queryByText('Just running along')).not.toBeInTheDocument()
   })
 
-  it('reads "Needs me 0" with an empty list when nothing is flagged', async () => {
+  it('sorts a flagged-but-gateless item to the top of the Active tab', async () => {
+    // Same widening applied to the Active tab's sort key: before #1966 the
+    // priority bucket also keyed off gates alone, so a flagged stuck item was
+    // buried below ordinary running work.
+    const running = makeView({
+      assignment_id: 'a-running',
+      issue_title: 'Ordinary running item',
+      current_stage: 'coding',
+      available_gates: [],
+      needs_attention: false,
+    })
+    const flaggedNoGate = makeView({
+      assignment_id: 'a-flagged',
+      issue_title: 'Stuck with no gate',
+      current_stage: 'coding',
+      available_gates: [],
+      needs_attention: true,
+      needs_attention_reason: 'non_convergence',
+    })
+    vi.mocked(fetchPipeline).mockResolvedValue([running, flaggedNoGate])
+    vi.mocked(fetchSessions).mockResolvedValue([])
+
+    renderHome()
+
+    const flaggedCard = await screen.findByText('Stuck with no gate')
+    const runningCard = await screen.findByText('Ordinary running item')
+    expect(
+      flaggedCard.compareDocumentPosition(runningCard) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy()
+  })
+
+  it('renders no count element and an empty list when nothing needs a human', async () => {
+    // ms-51 §2d: "A tab with a zero count renders NO count element."
     const items = [
       makeView({
         assignment_id: 'a-1',
-        issue_title: 'Busy but not flagged',
-        available_gates: [{ action: 'merge', label: 'Merge', endpoint: '/api/pipeline/action' }],
+        issue_title: 'Busy and unflagged',
+        current_stage: 'coding',
+        available_gates: [],
         needs_attention: false,
       }),
       makeView({
         assignment_id: 'a-2',
-        issue_title: 'Also busy but not flagged',
-        available_gates: [{ action: 'enqueue', label: 'Queue', endpoint: '/api/pipeline/action' }],
+        issue_title: 'Also busy and unflagged',
+        current_stage: 'review_running',
+        available_gates: [],
         needs_attention: false,
       }),
     ]
@@ -337,13 +373,11 @@ describe('Home — Needs me count matches the API', () => {
     renderHome()
 
     const tab = await screen.findByRole('tab', { name: /Needs me/i })
-    // No count badge is rendered at all when the count is zero (see
-    // FilterTabs: `{count > 0 && ...}`).
     expect(tab).not.toHaveTextContent(/\d/)
 
     await userEvent.click(tab)
 
     expect(await screen.findByText('All clear')).toBeInTheDocument()
-    expect(screen.queryByText('Busy but not flagged')).not.toBeInTheDocument()
+    expect(screen.queryByText('Busy and unflagged')).not.toBeInTheDocument()
   })
 })

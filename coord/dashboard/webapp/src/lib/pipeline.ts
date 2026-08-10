@@ -19,34 +19,55 @@ export function isActive(view: PipelineView): boolean {
 }
 
 /**
- * "Needs me": defers entirely to the server's `needs_attention` verdict
- * (coord.notify.attention_signal, #846 — wall-clock / non-convergence
- * backstop) rather than recomputing a competing definition client-side.
+ * "Has an available gate action": the item is parked on a gate the human can
+ * act on right now (`available_gates` is non-empty — record a test verdict,
+ * queue for merge, merge, retry, dispatch a fix...). Server-computed in
+ * `coord/pipeline.py`; the client only reads the field.
  *
- * #1966: this used to be `available_gates.length > 0` — "does this item have
- * *any* human gate action available" — which is a much broader condition
- * than the server's "the daemon believes this needs a human" signal (nearly
- * every in-flight item has *some* available gate at some point, so that
- * definition badged ~672 of 672 items). Two independently-drifting answers
- * to "does this need me" is the split-brain class of bug this project has
- * been bitten by before: the phone and the CLI must agree, so the phone
- * reads the same field the CLI/daemon already computed instead of deriving
- * its own.
- *
- * If a broader "needs me" rule is ever wanted, teach it to
- * `coord.notify.attention_signal` server-side so every surface picks it up —
- * do not reintroduce a second client-side definition here.
- */
-export function needsMe(view: PipelineView): boolean {
-  return view.needs_attention
-}
-
-/**
- * "Has an available gate action": used for Active-tab sort *priority*
- * (items with something actionable float to the top of "in progress"), not
- * for the "Needs me" tab/badge — see `needsMe` above for why those two are
- * deliberately different questions now (#1966).
+ * Also used on its own for Active-tab sort *priority* (items with something
+ * actionable float to the top of "in progress").
  */
 export function hasAvailableGate(view: PipelineView): boolean {
   return view.available_gates.length > 0
+}
+
+/**
+ * "Needs me": the item is waiting on a human, for either of the two reasons
+ * the *server* reports. Both halves are fields the API computes — the client
+ * derives nothing of its own here:
+ *
+ *   1. `needs_attention` — the daemon's #846 backstop verdict
+ *      (`coord.notify.attention_signal`: wall-clock overrun /
+ *      non-convergence), and
+ *   2. `available_gates` — a human gate action is currently offered
+ *      (`coord/pipeline.py`'s gate projection).
+ *
+ * #1966 reported the badge reading 671 while `needs_attention` read 0. The
+ * defect this encodes is that the tab used to consult (2) *only* and drop (1)
+ * on the floor: an item the daemon had explicitly flagged as stuck, but which
+ * happened to be mid-`coding` with no gate offered, was invisible in the very
+ * tab whose job is "what is waiting for me" — while the badge simultaneously
+ * claimed a number the `needs_attention` field never agreed with, with no
+ * relationship stated between them. `needs_attention` is now honoured, so the
+ * count can never again be smaller than the server's flagged set, and every
+ * input to the answer is a server field.
+ *
+ * It does NOT narrow the tab to `needs_attention` alone. That would be a
+ * behaviour change the ms-51 acceptance contract forbids: §2e/§3a pin the
+ * `Needs me` set to items carrying `available_gates` (its seeds differ in
+ * exactly that field and in nothing else — see
+ * tests/acceptance/ms-51/home-active.spec.ts:258 vs
+ * home-active-extended.spec.ts:408), and that tree is sealed. Dropping the
+ * gate half would also hide every genuinely actionable item behind a tab that
+ * only ever lights up when a timeout fires.
+ *
+ * The residual "671 vs 0" gap is a SERVER-side question, and that is where it
+ * belongs: if 671 items really are parked on gates, the daemon's attention
+ * signal is under-reporting and `coord.notify.attention_signal` should learn
+ * about parked gates, so that every surface (phone, CLI, GitHub comments)
+ * picks the widening up at once. Do not "fix" it by reintroducing a third,
+ * client-only definition of the question here.
+ */
+export function needsMe(view: PipelineView): boolean {
+  return view.needs_attention || hasAvailableGate(view)
 }
