@@ -148,6 +148,15 @@ class TestEvaluate:
         d = self._evaluate(exempt=True)
         assert d.ok is True
         assert d.state == gate_a.STATE_EXEMPT
+        assert d.exempt_reason == ""
+
+    def test_declared_milestone_exemption_carries_its_reason(self) -> None:
+        """#2063's "explicit and declared... reviewable" opt-out only holds
+        if the reason an operator wrote in the manifest's `gate_a: {exempt:
+        true, reason: ...}` actually survives into the decision, instead of
+        being parsed and discarded."""
+        d = self._evaluate(exempt=True, exempt_reason="no user-visible surface")
+        assert d.exempt_reason == "no user-visible surface"
 
     def test_unknown_schema_degrades_to_no_approval(self) -> None:
         record = _approved(CONTRACT_V1)
@@ -201,6 +210,28 @@ class TestMakeRecord:
         )
         back = gate_a.GateAApproval.from_dict(rec.to_dict())
         assert back == rec
+
+
+class TestSummarise:
+    """`coord gate-a <repo> <issue>`'s one-line output — the surface an
+    operator actually reads."""
+
+    def test_exempt_without_a_reason(self) -> None:
+        d = gate_a.GateADecision(state=gate_a.STATE_EXEMPT, ok=True)
+        assert gate_a.summarise(d) == (
+            "exempt — this milestone declared it needs no human sign-off"
+        )
+
+    def test_exempt_surfaces_the_declared_reason(self) -> None:
+        """The reason threaded through `evaluate()` must actually reach the
+        text an operator sees — that's what makes the opt-out "reviewable"
+        rather than just "known to have happened"."""
+        d = gate_a.GateADecision(
+            state=gate_a.STATE_EXEMPT, ok=True, exempt_reason="no user-visible surface",
+        )
+        summary = gate_a.summarise(d)
+        assert "exempt" in summary
+        assert "no user-visible surface" in summary
 
 
 # ── the park marker ─────────────────────────────────────────────────────────

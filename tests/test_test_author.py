@@ -17,6 +17,7 @@ import pytest
 
 from coord.agent import _slugify
 from coord.config import AcceptanceConfig, AcceptanceDriverConfig, Config
+from coord.dispatch import DispatchRefused
 from coord.milestone_dispatch import MilestoneContext, MilestoneDispatchError
 from coord.milestone_order import WorkOrder, WorkOrderNode
 from coord.models import Machine, Repo, WorkerPermissionsConfig
@@ -321,6 +322,31 @@ class TestDispatchTestAuthor:
                     "coord-tui", 947, cfg, machine_override="ghost",
                 )
 
+    def test_gate_a_signoff_refusal_raises_dispatch_refused_not_plain_runtime_error(
+        self,
+    ) -> None:
+        """#2063: the Gate-A "no recorded sign-off" refusal must be a
+        `DispatchRefused` (a `ValueError` subclass), NOT a plain
+        `RuntimeError` like every other failure mode here — otherwise
+        `coord acceptance author`'s CLI can't classify it as
+        `EXIT_DISPATCH_REFUSED`, and `coord drive-queue` cannot tell it
+        apart from a crash (it would burn attempts toward terminal
+        `blocked` instead of parking, #2040)."""
+        cfg = _config([_machine("laptop", ["coord-tui"])], driver=self._driver())
+        refusal = (
+            "Gate A has no recorded human sign-off for ms-25 "
+            "[gate-a-approval repo=coord-tui ms-25 v=none]"
+        )
+        with patch("coord.test_author.fetch_milestone_context", return_value=self._ctx()), \
+             patch("coord.test_author.gate_a_signoff_status", return_value=refusal):
+            with pytest.raises(DispatchRefused, match="no recorded human sign-off") as exc_info:
+                dispatch_test_author("coord-tui", 947, cfg)
+            # DispatchRefused IS a ValueError, never a RuntimeError — the
+            # CLI's `except RuntimeError` must not swallow this refusal
+            # under the generic exit(1) path.
+            assert isinstance(exc_info.value, ValueError)
+            assert not isinstance(exc_info.value, RuntimeError)
+
     def test_happy_path_milestone_mode_posts_and_records(self) -> None:
         cfg = _config([_machine("laptop", ["coord-tui"])], driver=self._driver())
         fake_client = MagicMock()
@@ -614,6 +640,27 @@ class TestDispatchTestAuthorInteractive:
         with patch("coord.test_author.fetch_milestone_context", return_value=self._ctx()):
             with pytest.raises(RuntimeError, match="no machine claims repo"):
                 dispatch_test_author_interactive("coord-tui", 947, cfg)
+
+    def test_gate_a_signoff_refusal_raises_dispatch_refused_not_plain_runtime_error(
+        self,
+    ) -> None:
+        """#2063: mirrors TestDispatchTestAuthor's equivalent test — the
+        `--interactive` branch (`coord acceptance author --interactive`,
+        the autonomous JIT-authoring path the coord-portal ms-2 incident
+        describes) must classify the refusal identically, or it falls
+        through the CLI's generic `except RuntimeError` -> exit(1) path
+        instead of `EXIT_DISPATCH_REFUSED`."""
+        cfg = _config([_machine("laptop", ["coord-tui"])], driver=self._driver())
+        refusal = (
+            "Gate A has no recorded human sign-off for ms-25 "
+            "[gate-a-approval repo=coord-tui ms-25 v=none]"
+        )
+        with patch("coord.test_author.fetch_milestone_context", return_value=self._ctx()), \
+             patch("coord.test_author.gate_a_signoff_status", return_value=refusal):
+            with pytest.raises(DispatchRefused, match="no recorded human sign-off") as exc_info:
+                dispatch_test_author_interactive("coord-tui", 947, cfg)
+            assert isinstance(exc_info.value, ValueError)
+            assert not isinstance(exc_info.value, RuntimeError)
 
     # ── dry run ─────────────────────────────────────────────────────────
 

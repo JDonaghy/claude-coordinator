@@ -538,6 +538,42 @@ class TestIssueOracleReady:
         assert "tests/acceptance/ms-37/contract.md" in calls
         assert readiness.has_slice is True
 
+    def test_file_exists_and_contract_read_share_one_fetch_when_file_exists_not_overridden(
+        self,
+    ) -> None:
+        """#2063 review: `gate_a_status`'s existence probe and the
+        sign-off's content read both want `contract.md`. When the caller
+        doesn't override `file_exists` (the real dispatch path —
+        `coord.dispatch.enforce_oracle_readiness` calls this with neither
+        override) they must share one memoised fetch, exactly like
+        `gate_a_signoff_status` already does for its own pair of calls —
+        otherwise every dispatch-readiness check against an oracle-opted
+        milestone doubles its GitHub API cost for no reason."""
+        cfg = _oracle_cfg()
+        repo = cfg.repo("api")
+        calls: list[str] = []
+
+        def _fetch(repo_github: str, path: str, branch: str) -> str | None:
+            calls.append(path)
+            if path.endswith("manifest.yml"):
+                return "tests:\n  ms37::a: 1118\n"
+            if path.endswith("contract.md"):
+                return CONTRACT
+            return None
+
+        readiness = issue_oracle_ready(
+            repo, cfg, 37, 1118,
+            fetch_manifest=_fetch,
+            fetch_gate_a_approval=_approval(),
+        )
+        contract_calls = [c for c in calls if c.endswith("contract.md")]
+        assert contract_calls == ["tests/acceptance/ms-37/contract.md"], (
+            f"contract.md must be fetched exactly once, not {len(contract_calls)} "
+            f"times: {calls}"
+        )
+        assert readiness.reason is None
+        assert readiness.gate_a_state == "approved"
+
     def test_default_fetch_manifest_uses_github_ops(self) -> None:
         cfg = _oracle_cfg()
         repo = cfg.repo("api")
