@@ -801,6 +801,21 @@ impl CoordApp {
                 view_gate_a_item.disabled =
                     epic_issue.and_then(|iss| self.pipeline_pr_number(iss)).is_none();
                 items.push(view_gate_a_item);
+                // #2063: the sign-off itself, right beside the 👁 that opens
+                // the thing being signed off on — reviewing and recording are
+                // one gesture. Until now "merging that PR is what satisfies
+                // Gate A" was a convention nothing enforced; these record a
+                // board verdict (`coord gate-a`) that
+                // `coord.milestone_dispatch.issue_oracle_ready` refuses
+                // dispatch without.
+                items.push(ContextMenuItem::action(
+                    "approve-gate-a",
+                    "Approve Gate A",
+                ));
+                items.push(ContextMenuItem::action(
+                    "request-gate-a-changes",
+                    "Request Gate A changes",
+                ));
             }
             // #1223 (was #1060, docs/ORACLE_LOOP.md, #931/#932): the
             // per-issue acceptance actions — JIT authoring of THIS issue's
@@ -6416,6 +6431,18 @@ impl CoordApp {
                         ToastSeverity::Warning,
                     );
                 }
+                true
+            }
+            // #2063: record the human Gate-A verdict. `--approved` is what
+            // unblocks the milestone's issues; `--changes` records a
+            // rejection so the refusal downstream can say what to fix
+            // instead of "nobody has looked yet".
+            "approve-gate-a" => {
+                self.dispatch_gate_a_verdict_for_selected_pipeline_row(true);
+                true
+            }
+            "request-gate-a-changes" => {
+                self.dispatch_gate_a_verdict_for_selected_pipeline_row(false);
                 true
             }
             // #1060: JIT-author this issue's acceptance-suite slice —

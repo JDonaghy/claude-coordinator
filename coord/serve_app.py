@@ -2266,6 +2266,70 @@ def _openapi_spec() -> dict:
                 },
             }
         },
+        "/gate-a-approval": {
+            "get": {
+                "summary": (
+                    "#2063: read one milestone's Gate-A human sign-off record "
+                    "so a thin client's dispatch guard can see what "
+                    "`coord gate-a` posted here."
+                ),
+                "parameters": [
+                    {
+                        "name": "repo_name", "in": "query", "required": True,
+                        "schema": {"type": "string"},
+                    },
+                    {
+                        "name": "milestone_number", "in": "query", "required": True,
+                        "schema": {"type": "integer"},
+                    },
+                ],
+                "responses": {
+                    "200": {"description": "OK"},
+                    "400": {
+                        "description": "Missing/bad repo_name or milestone_number"
+                    },
+                },
+            },
+            "post": {
+                "summary": (
+                    "Record a human Gate-A verdict on a milestone's contract "
+                    "(#2063) — `coord gate-a --approved|--changes`"
+                ),
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "record": {
+                                        "type": "object",
+                                        "description": (
+                                            "A serialized coord.gate_a."
+                                            "GateAApproval: repo_name, "
+                                            "milestone_number, verdict, "
+                                            "contract_sha, tracking_issue, note, "
+                                            "actor, recorded_at. Keyed on "
+                                            "(repo_name, milestone_number) — an "
+                                            "existing verdict for that pair is "
+                                            "replaced wholesale."
+                                        ),
+                                    },
+                                },
+                                "required": ["record"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {"application/json": {"schema": ok_response}},
+                    },
+                    "400": {"description": "Bad gate-a-approval"},
+                },
+            },
+        },
         "/dispatched": {
             "post": {
                 "summary": "Record a thin client's review/fix/rework/merge dispatch (#590 Phase 2)",
@@ -4705,6 +4769,65 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             )
         return JSONResponse({"ok": True})
 
+    async def get_gate_a_approval(request: Request) -> Response:
+        # #2063: read one milestone's Gate-A human sign-off record so a thin
+        # client's dispatch guard (`coord.milestone_dispatch.
+        # issue_oracle_ready`) sees what `coord gate-a` wrote here rather
+        # than a local DB that never received it. Same shape as
+        # get_milestone_gate above, keyed on (repo_name, milestone_number).
+        from coord import state  # noqa: PLC0415
+
+        repo_name = request.query_params.get("repo_name")
+        raw_ms = request.query_params.get("milestone_number")
+        if not repo_name or raw_ms is None:
+            return JSONResponse(
+                {"error": "repo_name and milestone_number are required"},
+                status_code=400,
+            )
+        try:
+            milestone_number = int(raw_ms)
+        except (TypeError, ValueError):
+            return JSONResponse(
+                {"error": "milestone_number must be an int"}, status_code=400
+            )
+        try:
+            record = state._get_gate_a_approval_local(
+                repo_name=repo_name, milestone_number=milestone_number
+            )
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "gate-a-approval read failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse({"entries": [record] if record else []})
+
+    async def post_gate_a_approval(request: Request) -> Response:
+        # #2063: upsert a milestone's Gate-A verdict on the shared DB for a
+        # thin client's `coord gate-a --approved|--changes`. Mirrors
+        # post_milestone_gate above — same seam, same error posture.
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        record = body.get("record")
+        if not isinstance(record, dict):
+            return JSONResponse(
+                {"error": "gate-a-approval needs a 'record' object"}, status_code=400
+            )
+        try:
+            state._save_gate_a_approval_local(record)
+        except (TypeError, KeyError, ValueError) as e:
+            return JSONResponse(
+                {"error": f"bad gate-a-approval: {e}"}, status_code=400
+            )
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "gate-a-approval write failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse({"ok": True})
+
     async def post_dispatched(request: Request) -> Response:
         # #590 Phase 2: record a thin client's review/fix/rework/merge dispatch.
         from coord import state  # noqa: PLC0415
@@ -6902,6 +7025,8 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route("/milestone-drain", post_milestone_drain, methods=["POST"]),
         Route("/milestone-gate", get_milestone_gate, methods=["GET"]),
         Route("/milestone-gate", post_milestone_gate, methods=["POST"]),
+        Route("/gate-a-approval", get_gate_a_approval, methods=["GET"]),
+        Route("/gate-a-approval", post_gate_a_approval, methods=["POST"]),
         Route("/dispatched", post_dispatched, methods=["POST"]),
         Route("/test-verdict", post_test_verdict, methods=["POST"]),
         Route("/review-reaffirm", post_review_reaffirm, methods=["POST"]),

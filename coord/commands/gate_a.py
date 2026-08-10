@@ -1,0 +1,217 @@
+"""``coord gate-a`` — record (or read) the human sign-off on a milestone's
+Gate-A contract (#2063).
+
+The sibling gate is enforced; this one was not. ``coord test --passed|--fail``
+writes a verdict the pipeline holds review on
+(``PipelineConfig.test_precedes_review``), whereas Gate A said only "merging
+the Gate-A PR is sign-off" — a convention anything able to merge a PR
+satisfies, including a coordinator session, silently, on CI green. It failed
+on two consecutive coord-portal milestones (ms-1/PR #18, ms-2/PR #35): both
+times the mocks were merged unseen, and the operator raised it themselves.
+
+This command is the verdict half of the fix. The refusal half lives in
+:func:`coord.milestone_dispatch.issue_oracle_ready` — deliberately at the
+point where the contract is **consumed**, not at the merge, because the
+Gate-A PR is merged with ``gh pr merge`` outside coord entirely.
+
+Usage::
+
+    coord gate-a acme-portal 17               # read the current verdict
+    coord gate-a --approved acme-portal 17
+    coord gate-a --changes acme-portal 17 --note "status vocabulary is wrong"
+
+The verdict is keyed to the **content hash** of
+``tests/acceptance/ms-NN/contract.md`` on the repo's default branch, so a
+later ``coord acceptance mock ... --amend`` invalidates it automatically:
+approving v1 must not silently approve v2.
+"""
+
+from __future__ import annotations
+
+import getpass
+import sys
+from pathlib import Path
+
+import click
+
+from coord import gate_a as gate_a_mod
+from coord.commands._common import _CONFIG_OPTION, _load_config
+
+
+def _actor() -> str:
+    try:
+        return getpass.getuser()
+    except Exception:  # noqa: BLE001 — no passwd entry in some containers
+        return "unknown"
+
+
+def _fetch_contract(repo_cfg, milestone_number: int) -> str | None:
+    from coord import github_ops  # noqa: PLC0415
+    from coord.acceptance import gate_a_contract_path  # noqa: PLC0415
+
+    try:
+        return github_ops.get_repo_file(
+            repo_cfg.github,
+            gate_a_contract_path(milestone_number),
+            branch=repo_cfg.default_branch,
+        )
+    except RuntimeError:
+        return None
+
+
+@click.command(
+    "gate-a",
+    help=(
+        "Record the human sign-off on a milestone's Gate-A contract, or read "
+        "the current verdict. Mirrors `coord test --passed|--fail`: nothing "
+        "downstream of Gate A dispatches until a verdict exists for the "
+        "contract's CURRENT content (#2063)."
+    ),
+)
+@click.argument("repo")
+@click.argument("tracking_issue", type=int)
+@click.option(
+    "--approved",
+    "verdict",
+    flag_value=gate_a_mod.VERDICT_APPROVED,
+    help="A human read the rendered mock(s) + contract.md and signs off.",
+)
+@click.option(
+    "--changes",
+    "verdict",
+    flag_value=gate_a_mod.VERDICT_CHANGES,
+    help=(
+        "A human read it and wants the contract changed — amend it with "
+        "`coord acceptance mock <repo> <issue> --amend \"...\"`."
+    ),
+)
+@click.option(
+    "--note",
+    default="",
+    help="What you want changed (or any context worth keeping with the verdict).",
+)
+@_CONFIG_OPTION
+def gate_a(
+    repo: str,
+    tracking_issue: int,
+    verdict: str | None,
+    note: str,
+    config_path: Path,
+) -> None:
+    from coord import state  # noqa: PLC0415
+    from coord import github_ops  # noqa: PLC0415
+    from coord.audit import record_audit  # noqa: PLC0415
+
+    cfg = _load_config(config_path)
+    repo_cfg = cfg.repo(repo)
+    if repo_cfg is None:
+        click.echo(f"error: unknown repo {repo!r}", err=True)
+        sys.exit(2)
+
+    try:
+        issue_data = github_ops.get_issue(repo_cfg.github, tracking_issue)
+    except RuntimeError as e:
+        click.echo(f"error: could not fetch #{tracking_issue}: {e}", err=True)
+        sys.exit(1)
+
+    milestone_number = (issue_data.get("milestone") or {}).get("number")
+    if milestone_number is None:
+        click.echo(
+            f"error: #{tracking_issue} has no milestone — Gate A is a "
+            "milestone-level gate, so there is nothing to sign off on.",
+            err=True,
+        )
+        sys.exit(2)
+    milestone_number = int(milestone_number)
+
+    contract_text = _fetch_contract(repo_cfg, milestone_number)
+    if contract_text is None:
+        from coord.acceptance import gate_a_contract_path  # noqa: PLC0415
+
+        click.echo(
+            f"error: {gate_a_contract_path(milestone_number)!r} does not exist "
+            f"on {repo_cfg.github}@{repo_cfg.default_branch} yet — there is no "
+            "contract to approve. Run `coord acceptance mock "
+            f"{repo} {tracking_issue}` first, and merge its PR.",
+            err=True,
+        )
+        sys.exit(1)
+
+    sha = gate_a_mod.contract_digest(contract_text)
+
+    # Read-only mode: no verdict flag => report where this milestone stands.
+    if verdict is None:
+        stored = state.get_gate_a_approval(
+            repo_name=repo_cfg.name, milestone_number=milestone_number
+        )
+        decision = gate_a_mod.evaluate(
+            repo_name=repo_cfg.name,
+            milestone_number=milestone_number,
+            contract_text=contract_text,
+            approval=stored,
+        )
+        click.echo(
+            f"Gate A ms-{milestone_number} ({repo}#{tracking_issue}): "
+            f"{gate_a_mod.summarise(decision)}"
+        )
+        if decision.approval is not None and decision.approval.note:
+            click.echo(f"  note: {decision.approval.note}")
+        if not decision.ok:
+            click.echo("")
+            click.echo(decision.reason or "")
+            sys.exit(1)
+        return
+
+    record = gate_a_mod.make_record(
+        repo_name=repo_cfg.name,
+        milestone_number=milestone_number,
+        verdict=verdict,
+        contract_sha=sha,
+        tracking_issue=tracking_issue,
+        note=note,
+        actor=_actor(),
+    )
+    try:
+        state.save_gate_a_approval(record.to_dict())
+    except Exception as e:  # noqa: BLE001
+        click.echo(f"error: could not record Gate A verdict: {e}", err=True)
+        sys.exit(1)
+
+    record_audit(
+        tier="business",
+        category="gate",
+        event_type=f"gate_a_{verdict}",
+        actor=record.actor,
+        summary=(
+            f"Gate A {verdict} for {repo} ms-{milestone_number} "
+            f"(contract {gate_a_mod.short_digest(sha)})"
+            + (f": {note}" if note else "")
+        ),
+        repo=repo_cfg.name,
+        issue=tracking_issue,
+        details={
+            "milestone_number": milestone_number,
+            "contract_sha": sha,
+            "verdict": verdict,
+            "note": note,
+        },
+    )
+
+    if verdict == gate_a_mod.VERDICT_APPROVED:
+        click.echo(
+            f"Gate A approved for {repo} ms-{milestone_number} "
+            f"(contract {gate_a_mod.short_digest(sha)}) — this milestone's "
+            "issues may now dispatch."
+        )
+        click.echo(
+            "  An `--amend` to the contract invalidates this; re-approve after one."
+        )
+    else:
+        click.echo(
+            f"Gate A changes requested for {repo} ms-{milestone_number} "
+            f"(contract {gate_a_mod.short_digest(sha)}) — dispatch stays refused."
+        )
+        click.echo(
+            f'  Next: coord acceptance mock {repo} {tracking_issue} --amend "'
+            f'{note or "<what to change>"}"'
+        )

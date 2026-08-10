@@ -3288,6 +3288,113 @@ def _load_milestone_gates_raw(conn: sqlite3.Connection) -> list[dict]:
     return [d for d in data if isinstance(d, dict)]
 
 
+# ── #2063: Gate A human sign-off records ────────────────────────────────────
+#
+# One JSON record per ``(repo_name, milestone_number)`` under the
+# ``gate_a_approvals`` board_meta key — the same seam and the same
+# whole-list-rewrite shape as ``milestone_gates`` above, for the same reason
+# (the row count is "milestones with a contract", i.e. single digits, and one
+# board read answers "has a human signed off on this surface").
+#
+# The write is ``coord gate-a --approved|--changes``; the read is
+# :func:`coord.milestone_dispatch.issue_oracle_ready`, which refuses Work
+# dispatch when a milestone's contract exists but carries no verdict for its
+# CURRENT content (see :mod:`coord.gate_a`).
+
+
+def save_gate_a_approval(record: dict) -> None:
+    """Upsert one milestone's Gate-A verdict — routes to the daemon when set.
+
+    Keyed on ``(repo_name, milestone_number)``; an existing verdict for that
+    pair is replaced wholesale, so re-recording after an ``--amend`` is a
+    plain overwrite rather than an append (there is exactly one live
+    contract per milestone, so exactly one live verdict).
+    """
+    svc = _board_service()
+    resp = _route_write(svc, "/gate-a-approval", {"record": record})
+    if resp is not None:
+        return
+    _save_gate_a_approval_local(record)
+
+
+def _save_gate_a_approval_local(record: dict) -> None:
+    repo_name = record.get("repo_name")
+    milestone_number = record.get("milestone_number")
+    if not isinstance(repo_name, str) or not repo_name or milestone_number is None:
+        raise ValueError("gate-a approval needs repo_name + milestone_number")
+    milestone_number = int(milestone_number)
+    record = {**record, "milestone_number": milestone_number}
+
+    conn = get_connection()
+    with conn:
+        approvals = _load_gate_a_approvals_raw(conn)
+        key = (repo_name, milestone_number)
+        remaining = [
+            a for a in approvals
+            if (a.get("repo_name"), _as_int(a.get("milestone_number"))) != key
+        ]
+        remaining.append(record)
+        conn.execute(
+            "INSERT OR REPLACE INTO board_meta (key, value) VALUES "
+            "('gate_a_approvals', ?)",
+            (json.dumps(remaining),),
+        )
+
+
+def list_gate_a_approvals() -> list[dict]:
+    """Every recorded Gate-A verdict (local DB only, like
+    :func:`list_milestone_gates`)."""
+    conn = get_connection()
+    return _load_gate_a_approvals_raw(conn)
+
+
+def get_gate_a_approval(*, repo_name: str, milestone_number: int) -> dict | None:
+    """One milestone's Gate-A verdict, or ``None`` if nobody has recorded one.
+
+    Routes to the daemon when ``board_service`` is set, mirroring
+    :func:`get_milestone_gate`. Unlike that reader, a routing failure IS
+    swallowed to ``None`` (see :func:`coord.client.fetch_gate_a_approval`):
+    "couldn't ask" collapsing to "no approval recorded" fails **closed**
+    here — the guard refuses — which is the safe direction for this gate.
+    """
+    svc = _board_service()
+    if svc is not None:
+        from coord.client import fetch_gate_a_approval  # noqa: PLC0415
+
+        return fetch_gate_a_approval(svc, repo_name, milestone_number)
+    return _get_gate_a_approval_local(
+        repo_name=repo_name, milestone_number=milestone_number
+    )
+
+
+def _get_gate_a_approval_local(
+    *, repo_name: str, milestone_number: int
+) -> dict | None:
+    """Local-DB-only lookup — the daemon's own reader, never routed."""
+    for a in list_gate_a_approvals():
+        if (
+            a.get("repo_name") == repo_name
+            and _as_int(a.get("milestone_number")) == milestone_number
+        ):
+            return a
+    return None
+
+
+def _load_gate_a_approvals_raw(conn: sqlite3.Connection) -> list[dict]:
+    row = conn.execute(
+        "SELECT value FROM board_meta WHERE key = 'gate_a_approvals'"
+    ).fetchone()
+    if row is None:
+        return []
+    try:
+        data = json.loads(row["value"])
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [d for d in data if isinstance(d, dict)]
+
+
 def delete_milestone_gate(*, repo_name: str, tracking_issue: int) -> None:
     """Drop a milestone from gate control.
 

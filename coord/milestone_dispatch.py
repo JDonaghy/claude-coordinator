@@ -54,6 +54,8 @@ __all__ = [
     "GateAFileExists",
     "gate_a_status",
     "ManifestFetch",
+    "GateAApprovalFetch",
+    "gate_a_signoff",
     "OracleReadiness",
     "issue_oracle_ready",
     "pick_machine",
@@ -287,6 +289,67 @@ def _unsupported_driver_kinds(entry: "AcceptanceDriverConfig") -> tuple[str, ...
     return tuple(sorted(k for k in kinds if k and k not in SUPPORTED_KINDS))
 
 
+# (repo_name, milestone_number) -> the stored Gate-A verdict dict, or None.
+# Injected so tests never touch the board DB — mirrors ManifestFetch above.
+GateAApprovalFetch = Callable[[str, int], "dict | None"]
+
+
+def _default_fetch_gate_a_approval(repo_name: str, milestone_number: int):
+    from coord import state  # noqa: PLC0415
+
+    try:
+        return state.get_gate_a_approval(
+            repo_name=repo_name, milestone_number=milestone_number
+        )
+    except Exception:  # noqa: BLE001
+        # Fail CLOSED: an unreadable board collapses to "no verdict
+        # recorded", which refuses with an operator-readable remedy rather
+        # than letting work dispatch against an unreviewed surface (#2063).
+        return None
+
+
+def gate_a_signoff(
+    repo_cfg: Repo,
+    milestone_number: int,
+    manifest,
+    *,
+    fetch: ManifestFetch,
+    approval_fetch: GateAApprovalFetch,
+):
+    """The #2063 human sign-off half of Gate A, as a
+    :class:`coord.gate_a.GateADecision`.
+
+    Gate A has always had two halves that #2063 finally separates: *does the
+    contract exist* (:func:`gate_a_status`, #930) and *has a human read it*.
+    The second was a convention — "merging the Gate-A PR is sign-off" — which
+    anything able to merge a PR satisfied, silently, on CI green. This
+    fetches the contract's **current content**, hashes it, and asks whether a
+    recorded verdict covers exactly that content.
+
+    Deliberately consumed here rather than at the merge: the Gate-A PR is
+    merged with ``gh pr merge``, outside coord entirely, so no coord-side
+    check ever sees it. Refusing where the contract is *consumed* means an
+    unapproved contract merging is harmless — nothing is authored and no
+    work dispatches until a human records a verdict.
+    """
+    from coord import gate_a as gate_a_mod  # noqa: PLC0415
+    from coord.acceptance import gate_a_contract_path  # noqa: PLC0415
+
+    contract_text = fetch(
+        repo_cfg.github,
+        gate_a_contract_path(milestone_number),
+        repo_cfg.default_branch,
+    )
+    return gate_a_mod.evaluate(
+        repo_name=repo_cfg.name,
+        milestone_number=milestone_number,
+        contract_text=contract_text,
+        approval=approval_fetch(repo_cfg.name, milestone_number),
+        exempt=bool(getattr(manifest, "gate_a_exempt", False)),
+        exempt_reason=str(getattr(manifest, "gate_a_exempt_reason", "") or ""),
+    )
+
+
 @dataclass(frozen=True)
 class OracleReadiness:
     """Issue-level oracle-loop dispatch readiness (#1138), layered on top of
@@ -309,6 +372,11 @@ class OracleReadiness:
     has_slice: bool = False
     unsupported_kinds: tuple[str, ...] = ()
     reason: str | None = None
+    #: #2063: the Gate-A human sign-off state for this issue's milestone —
+    #: one of :mod:`coord.gate_a`'s ``STATE_*`` values, or ``""`` when this
+    #: gate doesn't apply. ``"approved"``/``"exempt"`` are the only values
+    #: that let ``reason`` be ``None``.
+    gate_a_state: str = ""
 
 
 def issue_oracle_ready(
@@ -320,6 +388,7 @@ def issue_oracle_ready(
     *,
     file_exists: GateAFileExists | None = None,
     fetch_manifest: ManifestFetch | None = None,
+    fetch_gate_a_approval: GateAApprovalFetch | None = None,
 ) -> OracleReadiness:
     """The #1138 hard gate: refuse Work dispatch for an issue that belongs
     to an oracle-opted-in milestone (Gate A satisfied — ``contract.md``
@@ -337,6 +406,14 @@ def issue_oracle_ready(
     driver rather than consuming it, like #1125) via an explicit
     ``exempt:`` list in the milestone's manifest or an ``oracle:exempt``
     label — a declared, reviewable decision rather than tribal knowledge.
+
+    #2063 adds a second refusal on the same seam: the contract exists but
+    carries **no recorded human sign-off** for its current content (see
+    :func:`gate_a_signoff`). That refusal's prose carries
+    :func:`coord.gate_a.park_marker` so ``coord drive-queue``'s tick parks
+    the entry (re-checked every tick) instead of landing it in terminal
+    ``blocked``, which nothing re-evaluates (#2040) — this is an explicitly
+    operator-fixable condition with a one-command remedy.
     """
     if milestone_number is None or not config.acceptance.has_driver(repo_cfg.name):
         return OracleReadiness()
@@ -357,10 +434,31 @@ def issue_oracle_ready(
     entry = config.acceptance.drivers.get(repo_cfg.name)
     unsupported = _unsupported_driver_kinds(entry) if entry is not None else ()
 
+    # #2063: the human sign-off half of Gate A is checked FIRST, and is not
+    # bypassed by the issue-level `exempt` list. `exempt` says "this ISSUE
+    # doesn't consume the sealed suite" (e.g. #1125, which builds the
+    # driver); it says nothing about whether a human has read the milestone's
+    # contract — the surface every sibling issue is about to be built
+    # against. The one legitimate opt-out is milestone-level and declared in
+    # the manifest (`gate_a: {exempt: true}`), which `gate_a_signoff` honours.
+    signoff = gate_a_signoff(
+        repo_cfg,
+        milestone_number,
+        manifest,
+        fetch=fetch,
+        approval_fetch=fetch_gate_a_approval or _default_fetch_gate_a_approval,
+    )
+    if not signoff.ok:
+        return OracleReadiness(
+            applies=True, exempt=exempt, has_slice=has_slice,
+            unsupported_kinds=unsupported, reason=signoff.reason,
+            gate_a_state=signoff.state,
+        )
+
     if exempt:
         return OracleReadiness(
             applies=True, exempt=True, has_slice=has_slice,
-            unsupported_kinds=unsupported,
+            unsupported_kinds=unsupported, gate_a_state=signoff.state,
         )
 
     reason: str | None = None
@@ -386,6 +484,7 @@ def issue_oracle_ready(
     return OracleReadiness(
         applies=True, exempt=False, has_slice=has_slice,
         unsupported_kinds=unsupported, reason=reason,
+        gate_a_state=signoff.state,
     )
 
 

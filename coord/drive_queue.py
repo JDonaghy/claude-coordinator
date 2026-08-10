@@ -55,6 +55,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
 
 from coord.drive_state import TERMINAL_STATUSES, WORK_LIKE
+from coord.gate_a import is_gate_a_refusal_reason
 from coord.merge_queue import is_ci_infra_reason, is_ci_pending_reason
 
 # ── queue states ─────────────────────────────────────────────────────────────
@@ -1104,6 +1105,38 @@ def _reconcile_running(
     # construction (`_drive_exit_summary` records exactly one), so the order
     # is never actually load-bearing.
     own_reason = (exit_reasons or {}).get(entry.key)
+
+    # #2063 rides the SAME evidence as `refused` below but reaches the
+    # OPPOSITE conclusion, so it is checked first. A Gate-A "no recorded
+    # human sign-off" refusal is not permanent: it is an explicitly
+    # operator-fixable condition with a one-command remedy (`coord gate-a
+    # --approved`), and it self-clears the moment that verdict is recorded.
+    # Landing it in terminal `blocked` — which nothing re-evaluates and
+    # `coord drive-queue add` will not clear (#2040) — would leave the entry
+    # dead AFTER the human approved, requiring an undocumented remove+add.
+    # So it parks (#1891 semantics: re-checked every tick, no attempt spent),
+    # and `plan_tick`'s pre-pass below un-parks it once the verdict exists.
+    if own_reason and is_gate_a_refusal_reason(own_reason):
+        reason = (
+            f"{own_reason} — parking without spending an attempt; the queue "
+            "resumes it automatically once a human records the verdict, no "
+            "queue surgery needed (#2063)"
+        )
+        return (
+            Reconcile(
+                entry.key,
+                "parked",
+                reason,
+                occupies=False,
+                updates={
+                    "state": STATE_PARKED,
+                    "last_reason": reason,
+                    "session_name": None,
+                },
+            ),
+            None,
+        )
+
     permanent: tuple[str, str] | None = None
     if own_reason and (exit_refused or {}).get(entry.key):
         permanent = (
@@ -1460,6 +1493,7 @@ def plan_tick(
     exit_reasons: Mapping[str, str] | None = None,
     exit_refused: Mapping[str, bool] | None = None,
     exit_dead_end: Mapping[str, bool] | None = None,
+    gate_a_pending: Mapping[str, bool] | None = None,
 ) -> TickPlan:
     """Decide one tick.  Pure; the caller executes the returned plan.
 
@@ -1645,6 +1679,33 @@ def plan_tick(
             states[entry.key] = STATE_DONE
             continue
         if facts.merge_ci_pending:
+            continue
+        # #2063: a Gate-A park is gated on a HUMAN, not on the board, so the
+        # `merge_ci_pending` predicate above says nothing about it. Without
+        # this branch such an entry would resume on the very next tick and
+        # relaunch straight back into the identical refusal, forever — the
+        # hot loop that "park, don't block" is supposed to avoid. The
+        # shell resolves `gate_a_pending` by re-reading the recorded verdict
+        # for the (repo, milestone) embedded in the park reason's marker (a
+        # local board read, no `gh` call per entry); an entry it can't
+        # resolve stays parked, which fails closed exactly like the guard.
+        if is_gate_a_refusal_reason(entry.last_reason):
+            if (gate_a_pending or {}).get(entry.key, True):
+                continue
+            reason = (
+                f"Gate A sign-off recorded for {entry.key} — resuming from "
+                "parked without spending an attempt (#2063)"
+            )
+            reconciles.append(
+                Reconcile(
+                    entry.key,
+                    "resumed",
+                    reason,
+                    occupies=False,
+                    updates={"state": STATE_WAITING, "last_reason": reason},
+                )
+            )
+            states[entry.key] = STATE_WAITING
             continue
         reason = (
             f"CI checks for {entry.key} have reported — resuming from "
