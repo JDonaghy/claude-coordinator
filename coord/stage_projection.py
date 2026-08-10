@@ -392,6 +392,24 @@ def issue_has_any_approved_review(
     off a single ``QueuedMerge`` entry) — this collects every work
     assignment for the *issue* so a bounce-created fix worker's approval is
     found even when a merge-queue entry is still keyed to the original work.
+
+    #2085: before this fix, ANY historical ``approve`` anywhere in the
+    issue's work chain counted, forever — including one superseded by a
+    later ``request-changes`` on newer commits. That produced a board
+    record with ``stages["review"] == "failed"`` (the general
+    ``stage_status_for`` dispatcher already keys off the *latest* review by
+    dispatch order) sitting next to ``has_approved_review: True`` in the
+    same projection — self-contradictory on its face, and the exact
+    daemon-vs-gate disagreement #2085 traces back to `coord drive` looping
+    on a merge that could never land.
+    ``coord.merge_queue.has_approved_review`` closes the equivalent gap with
+    a live commit-SHA/patch-id bind, which this module deliberately has no
+    I/O to perform (see module docstring). Dispatch order over the issue's
+    own recorded verdict history is the best available DB-only proxy, and —
+    crucially — it is the SAME ordering rule ``stage_status_for`` already
+    applies to the "review" stage badge computed alongside this field in
+    :func:`compute_issue_projection`, so the two can no longer disagree the
+    way the #2085 board record did.
     """
     # #1142: CLOSES_ISSUE_TYPES, not a bare `type == "work"` — see the same
     # rationale in `merge_stage_status_for` above.
@@ -403,23 +421,31 @@ def issue_has_any_approved_review(
     if seed_work_id:
         work_ids.add(seed_work_id)
 
-    # #331: self-approval / PR-comment-fallback verdict stamped directly on
-    # a work assignment.
-    if any(
-        a.assignment_id in work_ids and a.review_verdict == "approve"
-        for a in assignments_for_issue
-    ):
-        return True
-
     if not work_ids:
         return False
 
-    return any(
-        a.type == "review"
-        and a.review_of_assignment_id in work_ids
-        and a.review_verdict == "approve"
+    # Every verdict-bearing event connected to this issue's work chain:
+    # dedicated ``type="review"`` rows scoped by ``review_of_assignment_id``,
+    # AND (#331) a verdict stamped directly on a work row itself
+    # (self-approval / PR-comment-fallback, no separate reviewer dispatched).
+    # The MOST RECENTLY DISPATCHED event wins — mirrors
+    # ``stage_status_for``'s own "latest by dispatch" rule for the "review"
+    # stage, so an earlier ``approve`` superseded by a later
+    # ``request-changes`` (on newer commits) no longer counts, matching what
+    # the merge gate's commit-bound check would also refuse.
+    events = [
+        a
         for a in assignments_for_issue
-    )
+        if a.review_verdict
+        and (
+            (a.type == "review" and a.review_of_assignment_id in work_ids)
+            or a.assignment_id in work_ids
+        )
+    ]
+    if not events:
+        return False
+
+    return _latest_by_dispatch(events).review_verdict == "approve"
 
 
 # ── Board-level projection ──────────────────────────────────────────────

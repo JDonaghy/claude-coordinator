@@ -5061,6 +5061,106 @@ def test_board_issue_stage_projection_contains_correct_fields(
     assert entry["stages"]["review"] == "done"
 
 
+def test_board_issue_stage_projection_agrees_with_merge_plan_on_superseded_approval(
+    rw_db, valid_config_path: Path, tmp_path: Path
+) -> None:
+    """#2085 black-box regression: the #1966 work chain (an early ``approve``
+    superseded by a later ``request-changes`` on newer commits) must read the
+    SAME verdict on both surfaces the daemon serves off one ``/board`` build —
+    the per-issue stage projection's ``has_approved_review`` flag AND the
+    merge queue's own plan/gate status — not the self-contradictory pair
+    the issue observed (``stages["review"] == "failed"`` next to
+    ``has_approved_review: True``, while the live merge gate separately
+    refused as ``review_required``).
+
+    Chain (mirrors #2085's Observed table exactly):
+      work c908129d  -> approve review (rev-orig, review_head_sha=sha-a)
+      work 8e3eb76e (fix round, same branch) -> request-changes review
+        (rev-fix, review_head_sha=sha-b), the LATEST verdict-bearing event.
+
+    No live ``gh_ops`` is wired into this daemon build (``/board`` makes zero
+    ``gh`` subprocess calls — see the #1336 invariant in serve_app.py), so the
+    merge-queue row's ``branch_head_sha`` is never populated — exactly the
+    caller shape #2085 traces the bug to. Before the fix, both the projection
+    and the plan read this as approved/READY; after, both must agree it is
+    NOT approved.
+    """
+    from coord.config import load as load_config
+    from coord.dao import SqliteStore
+    from coord.serve_app import build_app
+
+    rw_db.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')")
+    rw_db.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('round_number', '1')")
+    rw_db.execute(
+        "INSERT INTO assignments "
+        "(assignment_id, machine_name, repo_name, repo_github, issue_number, "
+        " issue_title, status, type, branch, test_state, dispatched_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        ("c908129d", "laptop", "api", "acme/api", 1966, "Flaky merge gate",
+         "done", "work", "issue-1966-fix", "passed", 1.0),
+    )
+    rw_db.execute(
+        "INSERT INTO assignments "
+        "(assignment_id, machine_name, repo_name, repo_github, issue_number, "
+        " issue_title, status, type, review_of_assignment_id, review_verdict, "
+        " review_head_sha, dispatched_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("rev-orig", "server", "api", "acme/api", 1966, "Flaky merge gate",
+         "done", "review", "c908129d", "approve", "sha-a", 2.0),
+    )
+    rw_db.execute(
+        "INSERT INTO assignments "
+        "(assignment_id, machine_name, repo_name, repo_github, issue_number, "
+        " issue_title, status, type, branch, test_state, dispatched_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        ("8e3eb76e", "laptop", "api", "acme/api", 1966, "Flaky merge gate",
+         "done", "work", "issue-1966-fix", "passed", 3.0),
+    )
+    rw_db.execute(
+        "INSERT INTO assignments "
+        "(assignment_id, machine_name, repo_name, repo_github, issue_number, "
+        " issue_title, status, type, review_of_assignment_id, review_verdict, "
+        " review_head_sha, dispatched_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("rev-fix", "server", "api", "acme/api", 1966, "Flaky merge gate",
+         "done", "review", "8e3eb76e", "request-changes", "sha-b", 4.0),
+    )
+    # The queue entry is re-keyed to the fix round (as `enqueue_approved_work`
+    # would leave it) — no `branch_head_sha` populated, mirroring a daemon
+    # `/board` build's zero-`gh`-I/O read path.
+    rw_db.execute(
+        "INSERT INTO merge_queue "
+        "(assignment_id, repo_name, repo_github, branch, target_branch, "
+        " issue_number, issue_title, state) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        ("8e3eb76e", "api", "acme/api", "issue-1966-fix", "main", 1966,
+         "Flaky merge gate", "pending"),
+    )
+    rw_db.commit()
+
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(tmp_path / "rw.db"), cfg)
+    with TestClient(app) as cli:
+        board = cli.get("/board").json()
+
+    proj = {(e["repo_name"], e["issue_number"]): e for e in board["issue_stage_projection"]}
+    assert ("api", 1966) in proj
+    entry = proj[("api", 1966)]
+    # The general stage dispatcher already keyed off the LATEST review by
+    # dispatch order — this is the reference the top-level field must match.
+    assert entry["stages"]["review"] == "failed"
+    assert entry["has_approved_review"] is False, (
+        "has_approved_review must not read an approval superseded by a "
+        "later request-changes review as still covering the branch"
+    )
+
+    plan_entries = {pm["assignment_id"]: pm for pm in board["merge_plan"]}
+    assert "8e3eb76e" in plan_entries
+    plan_entry = plan_entries["8e3eb76e"]
+    assert plan_entry["status"] == "BLOCKED"
+    assert "review" in (plan_entry["reason"] or "").lower()
+
+
 def test_board_issue_stage_projection_does_not_503_on_error(
     file_db: Path, valid_config_path: Path, monkeypatch
 ) -> None:
