@@ -34,16 +34,47 @@ with a commit-message opt-out, coalesced by a workflow concurrency group**:
   released", so a bisect over releases stops matching the history — and the
   reason to batch (PyPI noise) is better solved by coalescing, below.
 
-* **Coalesced, so a burst of merges is one release.** The workflow's
-  ``concurrency`` group cancels a superseded auto-release run, so five
-  merges landing in five minutes mint one tag at the tip rather than five.
-  Propagation is quiescence-scheduled anyway (#1835's other half), so the
-  fleet would have collapsed them regardless; this just stops PyPI carrying
-  four versions nothing ever ran.
+* **Coalesced when merges land inside the same publish window, not
+  otherwise.** ``auto-release.yml``'s ``concurrency`` group used to cancel a
+  superseded run outright, so five merges landing in five minutes minted one
+  tag at the tip rather than five. #2035 flipped ``cancel-in-progress`` to
+  ``false``: cancelling mid-run could abort between the PyPI upload and the
+  GitHub Release, leaving a half-published version. What ``false`` actually
+  buys is queuing — GitHub holds at most one running plus one *pending* run
+  per group and collapses a burst of pending merges into the last of them —
+  so coalescing now only catches merges landing *during* the running
+  publish, roughly a 15-minute window. At the cadence this repo has actually
+  seen (v0.5.1 -> v0.5.26 in under 48 hours, one release per merge), that
+  window rarely has two merges in it, so coalescing is not the thing keeping
+  PyPI version count down — :func:`ships_code` is. A merge landing after a
+  run finishes gets its own release; that is the trigger policy's intent
+  (path-filtered per merge), not a bug.
 
 * **Opt-out via the commit subject.** ``[no release]`` / ``[skip release]``
   in the merge commit message suppresses the tag. An escape hatch that
   lives in the merge itself needs no second action and no repo state.
+
+WHY ``tui/`` STAYS A SHIPPING PREFIX (#2081)
+---------------------------------------------
+A `tui/`-only merge cuts a PyPI version whose wheel is byte-identical to its
+predecessor except the version string, and it moves the fleet's expected
+version, so every host's `coord release verify` goes red for a change that
+cannot reach any of them — coord-tui is a per-host binary with no remote
+install path (see `lane_is_out_of_reach` in `coord/release_propagate.py`).
+That is a real cost, and #2081 asked, explicitly, whether `tui/` should keep
+driving a PyPI/expected-version bump at all, or only a GitHub Release (PKG-6,
+#1242, attaches the coord-tui binaries there and does need an artifact home).
+
+Judged not worth doing here: the two are not separable without touching how a
+release is *built*, which #2081 puts out of scope (`publish.yml`'s jobs are
+one call, one tag, one Release — #1238/PKG-2's whole point was removing a
+second version to drift from the first). Splitting them would mean either a
+second tag namespace for coord-tui, or teaching `publish.yml` to skip the
+PyPI/verify-published leg for some tags but not others — real surgery on the
+publish pipeline, not a path-filter tweak. `tui/` therefore stays in
+:data:`SHIPPING_PREFIXES`, deliberately, and this paragraph — plus
+``test_tui_only_still_ships`` in ``tests/test_next_release_tag.py`` — is that
+decision on the record rather than left implicit.
 
 VERSION SELECTION
 -----------------
@@ -81,7 +112,6 @@ SHIPPING_PREFIXES: tuple[str, ...] = (
     "pyproject.toml",
     "MANIFEST.in",
     "install-agent.sh",
-    ".github/workflows/",
 )
 
 #: Path prefixes that demonstrably ship nothing. Kept as an explicit
@@ -104,6 +134,17 @@ NON_SHIPPING_PREFIXES: tuple[str, ...] = (
     # for it would be pure waste: fleet-wide propagation for a change that's
     # already everywhere.
     ".githooks/",
+    # #2081: a workflow file reaches no wheel, no binary and no host's unit
+    # directory — the version of a workflow that RUNS is whatever is at the
+    # tip of main, and a tag changes nothing about that. This is the
+    # `.githooks/` case again, same comment applying verbatim. Even
+    # `publish.yml`/`release-tui.yml`, which decide how a release's assets are
+    # *built*, never need a version bump to take effect — only a re-run
+    # (`workflow_dispatch`) — so there is no workflow-file change that
+    # legitimately wants an automatic patch bump. v0.5.7's entire release
+    # range was one file, `.github/workflows/test.yml`: a release that shipped
+    # nothing and moved the fleet's expected version for no payload.
+    ".github/workflows/",
 )
 
 #: Case-insensitive markers in the merge commit message that suppress the

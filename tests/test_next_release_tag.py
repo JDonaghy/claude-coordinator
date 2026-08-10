@@ -113,6 +113,31 @@ def test_githooks_only_ships_nothing():
     assert not ships_code([".githooks/post-checkout"])
 
 
+def test_workflow_files_only_ship_nothing():
+    """#2081: v0.5.7's entire release range was one file,
+    `.github/workflows/test.yml`. A workflow reaches no wheel, no binary and
+    no host's unit directory — the version that RUNS is whatever is at the
+    tip of main, so a tag changes nothing about it. Same case as
+    `.githooks/`, same fix: it must not drive a release."""
+    assert not ships_code([".github/workflows/test.yml"])
+    assert not ships_code([".github/workflows/publish.yml", ".github/workflows/release-tui.yml"])
+
+
+def test_workflow_and_docs_together_still_ship_nothing():
+    assert not ships_code([".github/workflows/test.yml", "docs/AGENT_OPERATIONS.md"])
+
+
+def test_tui_only_still_ships():
+    """#2081 asked, explicitly, whether a `tui/`-only merge should keep
+    driving a PyPI/expected-version bump given coord-tui has no remote
+    install path (`lane_is_out_of_reach` — the fleet's release-verify lanes
+    go red for a change that can never reach them). Judged not worth
+    splitting from how a release is built (out of this issue's scope, see
+    `scripts/next_release_tag.py`'s module docstring): `tui/` stays a
+    shipping prefix, on purpose, and this test is that decision pinned."""
+    assert ships_code(["tui/src/panels/queue.rs"])
+
+
 # ── bump ─────────────────────────────────────────────────────────────────
 
 
@@ -154,6 +179,32 @@ def test_a_docs_merge_cuts_nothing():
     assert not decision.release
     assert decision.tag is None
     assert "docs/tests only" in decision.reason
+
+
+def test_a_workflow_only_merge_cuts_nothing():
+    """#2081: v0.5.7 was this exact merge — one changed file,
+    `.github/workflows/test.yml` — and it minted a PyPI version anyway."""
+    decision = decide(
+        tags=["v0.5.6"],
+        message="ci: bump the test matrix",
+        changed_files=[".github/workflows/test.yml"],
+    )
+    assert not decision.release
+    assert decision.tag is None
+
+
+def test_a_tui_only_merge_still_cuts_the_next_patch():
+    """#2081: judged (see the module docstring) not worth splitting `tui/`
+    out of the shipping filter, so it still bumps like any other shipping
+    path. Pinned so a future change to this behaviour is a deliberate diff,
+    not a silent regression either way."""
+    decision = decide(
+        tags=["v0.5.20"],
+        message="fix(#2064): SSE 404 is terminal",
+        changed_files=["tui/src/panels/queue.rs"],
+    )
+    assert decision.release
+    assert decision.tag == "v0.5.21"
 
 
 @pytest.mark.parametrize("marker", ["[no release]", "[skip release]", "[NO RELEASE]"])
