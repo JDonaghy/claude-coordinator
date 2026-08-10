@@ -60,6 +60,12 @@ from coord.models import WORK_LIKE_TYPES, Assignment, Board, Machine
 
 logger = logging.getLogger("coord.smoke")
 
+# #2024: assignment ids whose `test-mode:smoke` Test-stage skip has already
+# been reported this process (see `dispatch_pending_smoke`). Process-lifetime,
+# not persisted — the point is one clear statement per daemon run, not an
+# every-tick repeat of a refusal that is expected to hold for hours.
+_TEST_MODE_SKIP_LOGGED: set[str] = set()
+
 
 SMOKE_SYSTEM_PROMPT = """\
 You are a smoke-test runner dispatched by the coordinator. \
@@ -983,6 +989,17 @@ def dispatch_pending_smoke(
             # that would silently override an explicit per-issue policy. The
             # answer to "nobody will produce a verdict" is to SAY so, not to
             # take the decision away from the operator who set the label.
+            #
+            # ONCE per row per process, not once per tick — #1678 is the
+            # standing lesson that a refusal re-logged every 30 s against a
+            # state that cannot change is its own kind of noise (this row can
+            # sit here for hours by design). The daemon is long-lived, so the
+            # set is the right lifetime; a restart re-states it, which is
+            # exactly when an operator wants to hear it again.
+            if completed.assignment_id in _TEST_MODE_SKIP_LOGGED:
+                continue
+            if completed.assignment_id:
+                _TEST_MODE_SKIP_LOGGED.add(completed.assignment_id)
             logger.info(
                 "dispatch_pending_smoke: skipping %s#%s row %s — issue is "
                 "labelled `test-mode:smoke`, so the headless Test stage is off "
