@@ -79,9 +79,15 @@ def test_a_busy_fleet_defers_at_exit_zero(valid_config_path, state_dir, no_netwo
 
 
 def test_a_deferral_is_journalled(valid_config_path, state_dir, no_network, monkeypatch):
+    """#2067: a deferral is per-host now — a single busy host no longer
+    defers the whole run (see the tests below), so this exercises the case
+    that genuinely must still defer everything: EVERY configured host
+    (`laptop` and `server`, per `valid_config_path`) is occupied."""
     monkeypatch.setattr(
         release_cmd, "_fetch_board",
         lambda: ({"assignments": [{"machine_name": "laptop", "issue_number": 9,
+                                   "status": "RUNNING"},
+                                  {"machine_name": "server", "issue_number": 10,
                                    "status": "RUNNING"}]}, None),
     )
     CliRunner().invoke(
@@ -261,6 +267,128 @@ def test_a_fired_deploy_gate_does_not_defer(valid_config_path, state_dir, no_net
     assert result.exit_code == 0, result.output
     assert rp.STATUS_DEFERRED not in result.output
     assert "waiting on exactly this deploy" in result.output
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# #2067: quiescence is per host — a busy host defers on its own, and does
+# not hold the rest of the fleet hostage
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def test_a_busy_non_daemon_host_defers_alone_while_the_daemon_rolls(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    """The regression, end to end: `laptop` has a live assignment; `server`
+    (the daemon) is free. Under the old fleet-wide reading this deferred
+    everything, forever, on a fleet whose drive queue never goes idle.
+    `server` must roll and verify while `laptop`'s lanes are recorded as a
+    per-host deferral, not attempted."""
+    monkeypatch.setattr(
+        release_cmd, "_fetch_board",
+        lambda: ({"assignments": [{"machine_name": "laptop", "issue_number": 9,
+                                   "status": "RUNNING"}]}, None),
+    )
+    calls = _stub_lanes(monkeypatch)
+    _stub_verify(monkeypatch, versions={"laptop": ["0.4.110"], "server": ["0.4.110"]},
+                 daemon="server")
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111"],
+    )
+    assert result.exit_code == 0, result.output
+    # `server`'s lanes were attempted; `laptop`'s never were.
+    assert any(host == "server" for _lane, host in calls)
+    assert not any(host == "laptop" for _lane, host in calls)
+
+    record = _records(state_dir)[0]
+    assert record["status"] == rp.STATUS_VERIFIED
+    laptop_lane = next(l for l in record["lanes"] if l["host"] == "laptop")
+    assert laptop_lane["lane"] == "-"
+    assert laptop_lane["ok"] is None
+    assert "deferred" in laptop_lane["detail"]
+    assert "laptop:9" in laptop_lane["detail"]
+
+
+def test_a_busy_daemon_host_defers_the_whole_run(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    """The one case per-host quiescence still has to defer everything: the
+    DAEMON is occupied. Rolling `laptop` ahead of an unrolled `server` would
+    put a caller on a newer `coord` than the daemon it talks to — the
+    documented 405 — so nothing may roll until `server` itself is free."""
+    monkeypatch.setattr(
+        release_cmd, "_fetch_board",
+        lambda: ({"assignments": [{"machine_name": "server", "issue_number": 9,
+                                   "status": "RUNNING"}]}, None),
+    )
+    monkeypatch.setattr(
+        release_cmd, "_roll_python",
+        lambda *a, **k: pytest.fail("a busy daemon must roll nothing, anywhere"),
+    )
+    _stub_verify(monkeypatch, versions={"laptop": ["0.4.110"], "server": ["0.4.110"]},
+                 daemon="server")
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111"],
+    )
+    assert result.exit_code == 0, result.output
+    record = _records(state_dir)[0]
+    assert record["status"] == rp.STATUS_DEFERRED
+    assert record["lanes"] == []
+
+
+def test_force_rolls_over_per_host_busyness_too(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    """`--force` already killed in-flight work fleet-wide before #2067; it
+    must still roll every host, busy or not, rather than defer any of them."""
+    monkeypatch.setattr(
+        release_cmd, "_fetch_board",
+        lambda: ({"assignments": [{"machine_name": "laptop", "issue_number": 9,
+                                   "status": "RUNNING"},
+                                  {"machine_name": "server", "issue_number": 10,
+                                   "status": "RUNNING"}]}, None),
+    )
+    calls = _stub_lanes(monkeypatch)
+    _stub_verify(monkeypatch, versions={"laptop": ["0.4.110"], "server": ["0.4.110"]},
+                 daemon="server")
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111", "--force"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "--force" in result.output  # the kill warning
+    assert {host for _lane, host in calls} == {"laptop", "server"}
+    assert _records(state_dir)[0]["status"] == rp.STATUS_VERIFIED
+
+
+def test_a_busy_host_is_visible_in_a_dry_run_plan(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    monkeypatch.setattr(
+        release_cmd, "_fetch_board",
+        lambda: ({"assignments": [{"machine_name": "laptop", "issue_number": 9,
+                                   "status": "RUNNING"}]}, None),
+    )
+    _stub_verify(monkeypatch, versions={"laptop": ["0.4.110"], "server": ["0.4.110"]},
+                 daemon="server")
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111", "--dry-run"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "would roll" in result.output
+    assert "server" in "\n".join(
+        l for l in result.output.splitlines() if "would roll" in l
+    )
+    assert "laptop" not in "\n".join(
+        l for l in result.output.splitlines() if "would roll" in l
+    )
+    assert "laptop:9" in result.output
 
 
 # ── the roll, the final gate, and the rollback on red ────────────────────

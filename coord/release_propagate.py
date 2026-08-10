@@ -45,6 +45,37 @@ its constants rather than re-spelling them:
   queue for the deploy, propagation performs the deploy, propagation restarts
   the queue. One mechanism, one loop, no second notion of quiescence.
 
+QUIESCENCE IS PER-HOST, NOT FLEET-WIDE ALL-OR-NOTHING
+------------------------------------------------------
+#2067: every :class:`Busy` signal already carries the host it belongs to —
+a drive-queue entry names the host that launched it, a live assignment
+names the machine running it. Collapsing that to one fleet-wide boolean
+(``not busy``) means a single continuously-running drive queue, on any one
+host, defers propagation *forever*: the queue refills from its backlog
+every few minutes, so at least one entry is running essentially always, and
+"quiescent" never arrives. That is not a rare edge case, it is the steady
+state of a working overnight queue — the busier and more useful the queue
+is, the less this fleet-wide reading ever fires.
+
+:attr:`Quiescence.quiescent`/``reason`` remain the fleet-wide summary (still
+the right answer for `--force`, and for the one case that genuinely must
+stay all-or-nothing — see below). A caller that wants to roll a
+partially-busy fleet uses :meth:`Quiescence.rollable_hosts` instead: a host
+with no busy signal against it is free to roll *now*, independent of
+whatever else is running elsewhere. A signal that cannot be pinned to one
+host (the board itself unreadable, a drive-queue row with no recorded
+``launch_host``) is the one thing that still has to block everything —
+see :attr:`Quiescence.fleet_wide_busy` — because there is no way to tell
+"busy everywhere" apart from "busy on some host we can't name".
+
+Per-host quiescence does not repeal the daemon-leads invariant below: if
+the daemon host itself is occupied (and not already on the target), no
+other host's python lane may roll ahead of it either, because that would
+put a caller on a newer `coord` than the daemon it talks to — the
+documented 405. The shell (`coord/commands/release.py`) enforces this by
+deferring the whole run only in that one case; every other combination of
+busy hosts rolls whatever it can and defers only what it can't.
+
 LANE ORDER ANSWERS THE SKEW QUESTION
 ------------------------------------
 #1835 asks whether a fleet mid-roll — hosts at two versions — is safe for
@@ -409,6 +440,14 @@ class Busy:
     kind: str
     subject: str
     detail: str = ""
+    #: Which host this signal blocks, or ``None`` when it cannot be pinned
+    #: to one — a drive-queue entry launched before #1870 recorded
+    #: ``launch_host``, or a fleet-level fact like "the board itself is
+    #: unreadable" that says nothing about which host is actually busy.
+    #: #2067: an unattributable signal must fail toward blocking EVERY
+    #: host, never toward blocking none of them — see
+    #: :attr:`Quiescence.fleet_wide_busy`.
+    host: str | None = None
 
     def describe(self) -> str:
         base = f"{self.kind}: {self.subject}"
@@ -417,7 +456,18 @@ class Busy:
 
 @dataclass(frozen=True)
 class Quiescence:
-    """Is there a window right now, and if not, why not."""
+    """Is there a window right now, and if not, where.
+
+    #2067: quiescence used to be one fleet-wide boolean, computed by
+    discarding the host every :class:`Busy` already carries. On a fleet
+    whose drive queue runs continuously, *some* host is busy essentially
+    always, so that boolean is false essentially always and propagation
+    never fires — "correctly, quietly, and uselessly". ``quiescent``/
+    ``reason`` stay as the fleet-wide summary (still meaningful — an
+    unattributable signal or `--force` both want a single answer), but a
+    caller that wants to roll a partially-busy fleet should use
+    :meth:`rollable_hosts` instead.
+    """
 
     quiescent: bool
     busy: tuple[Busy, ...] = ()
@@ -437,6 +487,46 @@ class Quiescence:
                 )
             return "quiescent — nothing in flight"
         return "; ".join(b.describe() for b in self.busy) or "busy"
+
+    @property
+    def fleet_wide_busy(self) -> tuple[Busy, ...]:
+        """Busy signals that cannot be pinned to one host.
+
+        These block every host, not just the (nonexistent) one they name —
+        there is no way to know which host an unattributable signal
+        actually occupies, so the safe read is "all of them".
+        """
+        return tuple(b for b in self.busy if b.host is None)
+
+    def busy_hosts(self) -> set[str]:
+        """Every host a *specific* busy signal names.
+
+        Excludes unattributable signals — see :attr:`fleet_wide_busy` for
+        those; a caller must check both, which :meth:`rollable_hosts` does.
+        """
+        return {b.host for b in self.busy if b.host}
+
+    def rollable_hosts(self, hosts: Iterable[str]) -> list[str]:
+        """Which of *hosts* have no busy signal against them right now.
+
+        Empty whenever any busy signal cannot be attributed to a host: an
+        unreadable board, or a drive-queue entry with no recorded launch
+        host, means "the fleet is busy somewhere unknown", which is not
+        distinguishable from "everywhere" and must be treated as such.
+        """
+        if self.fleet_wide_busy:
+            return []
+        occupied = self.busy_hosts()
+        return [h for h in hosts if h not in occupied]
+
+    def busy_reason_for_host(self, host: str) -> str:
+        """Why *host* specifically is not rollable right now.
+
+        Empty string when nothing names it — the caller's cue that this
+        host is free.
+        """
+        reasons = [b.describe() for b in self.busy if b.host is None or b.host == host]
+        return "; ".join(reasons)
 
     def to_dict(self) -> dict:
         return {
@@ -493,11 +583,22 @@ def assess_quiescence(
         state = str(entry.get("state") or "")
         key = _queue_key(entry)
         if state == STATE_RUNNING:
+            # #2067: attribute to the host actually running the drive, so a
+            # continuously-busy queue blocks only its occupied hosts, not
+            # the whole fleet. `launch_host` (#1870) is the ground truth —
+            # the host whose tick launched THIS session; `machine` is a
+            # weaker fallback (an operator's pin, not necessarily where a
+            # legacy/hand-edited row is actually running). Neither present
+            # means this signal cannot be pinned to a host at all, and must
+            # block every host rather than none — see
+            # `Quiescence.fleet_wide_busy`.
+            host = str(entry.get("launch_host") or entry.get("machine") or "") or None
             busy.append(
                 Busy(
                     kind="drive-queue entry running",
                     subject=key,
                     detail="restarting agents now would kill it mid-flight",
+                    host=host,
                 )
             )
         # A *fired* gate is the opposite of busy — the queue has stopped
@@ -509,7 +610,7 @@ def assess_quiescence(
         status = str(row.get("status") or "").upper()
         if status not in LIVE_ASSIGNMENT_STATUSES:
             continue
-        machine = str(row.get("machine_name") or row.get("machine") or "?")
+        machine = str(row.get("machine_name") or row.get("machine") or "") or None
         subject = str(
             row.get("issue_number")
             or row.get("issue")
@@ -519,8 +620,9 @@ def assess_quiescence(
         busy.append(
             Busy(
                 kind=f"live {status} assignment",
-                subject=f"{machine}:{subject}",
+                subject=f"{machine or '?'}:{subject}",
                 detail="`coord agent update` would refuse this host anyway",
+                host=machine,
             )
         )
 
