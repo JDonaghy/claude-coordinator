@@ -829,7 +829,12 @@ def test_oracle_active_advisory_with_commits_requires_accept_advisory():
     assert "--accept-advisory" in action.message
 
 
-def test_oracle_active_advisory_with_commits_and_accept_advisory_waits():
+def test_oracle_active_advisory_with_commits_and_accept_advisory_lands_the_slice():
+    """#2079: "proceeding per --accept-advisory" proceeds to the MERGE.
+
+    It used to be a bare WAIT, which for an ADVISORY row can never resolve —
+    `coord.reconcile` skips advisory rows in the Test/Review/Merge auto-loop.
+    """
     oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
     verifier = FakeVerifier(has_commits=True)
     action = step(
@@ -842,7 +847,8 @@ def test_oracle_active_advisory_with_commits_and_accept_advisory_waits():
         oracle=oracle,
         verifier=verifier,
     )
-    assert action.kind == WAIT
+    assert action.kind == RUN
+    assert action.command == ("merge", "--only", "ta1", "--method", "rebase")
     assert any("--accept-advisory" in w for w in action.warnings)
 
 
@@ -905,10 +911,17 @@ def test_oracle_active_done_with_no_branch_is_terminal():
     assert "no commits" in action.message
 
 
-def test_oracle_active_done_with_commits_waits():
-    """The common case is unaffected: a DONE slice whose branch actually
-    carries commits keeps waiting for coord's own Test/Review/Merge loop to
-    land it."""
+def test_oracle_active_done_with_commits_lands_the_slice():
+    """#2079: a DONE slice whose branch carries commits is MERGED by this
+    driver, not waited on.
+
+    Pre-#2079 this returned a bare WAIT on the theory that "coord's own tick
+    loop drives Test → Review → Merge". Three of those four steps are indeed
+    the daemon's, but the merge is `serve_app._auto_drain_tick`, gated on
+    `merge.auto_drain` — off by default and off in the standing fleet config
+    — so the wait was for an event that could not occur, and every oracle
+    issue burned `2 × --deadline` and ended `blocked`.
+    """
     oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
     verifier = FakeVerifier(has_commits=True)
     action = step(
@@ -920,7 +933,11 @@ def test_oracle_active_done_with_commits_waits():
         oracle=oracle,
         verifier=verifier,
     )
-    assert action.kind == WAIT
+    assert action.kind == RUN
+    assert action.command == ("merge", "--only", "ta1", "--method", "rebase")
+    assert action.serialize_merge
+    assert action.merge_scope == "acceptance"
+    assert action.label.startswith("ACCEPTANCE/")
     assert not action.is_exit
     assert verifier.commits_calls == 1
 
@@ -942,6 +959,169 @@ def test_oracle_active_advisory_behaviour_is_unchanged_by_the_done_fix():
     assert action.is_exit
     assert action.exit_code == EXIT_TERMINAL_FAILURE
     assert "ADVISORY" in action.message
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# #2079: the JIT slice is LANDED, not merely watched
+#
+# The incident: coord-portal #32 sat `blocked` after two 240-minute attempts
+# with no `issue-32-*` branch ever created — the worker never ran, because
+# `issue_oracle_ready` reads the manifest from the DEFAULT BRANCH and the
+# slice was still sitting on an unmerged branch behind a green,
+# MERGEABLE/CLEAN PR. Nothing was wrong except that nothing merges a READY
+# merge-queue entry when `merge.auto_drain` is false.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def landing_state(**kw) -> IssueState:
+    """An oracle state whose slice is authored, pushed and awaiting its
+    merge — the shape the whole issue is about."""
+    base = dict(
+        acceptance_author_aid="ta1",
+        acceptance_author_status="done",
+        acceptance_author_branch="test-author-ms-38-slice-32",
+        acceptance_author_test_state="passed",
+        acceptance_review_aid="rv1",
+        acceptance_review_verdict="approve",
+        acceptance_merge_status="READY",
+    )
+    base.update(kw)
+    return oracle_state(**base)
+
+
+def landing_step(s: IssueState, opts: DriveOptions | None = None, **kw) -> Action:
+    kw.setdefault("oracle", OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120))
+    kw.setdefault("verifier", FakeVerifier(has_commits=True))
+    return step(s, opts, **kw)
+
+
+def test_ready_slice_is_merged_by_this_driver():
+    """The fix, in one assertion: a READY slice queue entry gets the same
+    bounded `coord merge --only <aid>` the work row already gets."""
+    counters = DriveCounters()
+    action = landing_step(landing_state(), counters=counters)
+    assert action.command == ("merge", "--only", "ta1", "--method", "rebase")
+    assert action.serialize_merge
+
+
+def test_slice_merge_spends_its_own_budget_not_the_work_row_s():
+    """Two PRs, two queues, two budgets. Landing the slice must not silently
+    leave the issue's own merge with zero attempts left."""
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_merge_attempts=3)
+    for _ in range(3):
+        assert landing_step(landing_state(), opts, counters=counters).kind == RUN
+    assert counters.merge_attempts == 0
+    assert counters.acceptance is not None
+    assert counters.acceptance.merge_attempts == 3
+
+    # ...and the budget really is bounded: the 4th poll gives up with the
+    # captured diagnostic rather than retrying forever.
+    action = landing_step(landing_state(), opts, counters=counters)
+    assert action.is_exit
+    assert action.exit_code == EXIT_TERMINAL_FAILURE
+    assert "merge attempted 3 times" in action.message
+
+
+def test_slice_merge_diagnostic_is_filed_against_the_slice_budget():
+    """`merge_scope` is what stops a slice attempt's `coord merge --only`
+    output from being read back as the work row's own diagnosis."""
+    action = landing_step(landing_state())
+    assert action.merge_scope == "acceptance"
+
+    work = step(
+        state(
+            work_aid="w1",
+            work_status="done",
+            work_branch="issue-1392",
+            work_test_state="passed",
+            review_verdict="approve",
+            merge_status="READY",
+        )
+    )
+    assert work.command[0] == "merge"
+    assert work.merge_scope == "work"
+
+
+def test_already_merged_slice_waits_for_the_board_instead_of_escalating():
+    """MERGED is not in `_RETRYABLE_MERGE_STATUSES`, so handing it straight
+    to `_decide_merge` would escalate a success."""
+    action = landing_step(landing_state(acceptance_merge_status="MERGED"))
+    assert action.kind == WAIT
+    assert not action.is_exit
+    assert "MERGED" in action.label
+
+
+def test_failed_slice_test_stops_with_the_fix_command():
+    """Nothing dispatches a fix for a test-author row whose Test stage
+    failed — so this must not be a wait."""
+    action = landing_step(
+        landing_state(acceptance_author_test_state="failed", acceptance_merge_status="")
+    )
+    assert action.is_exit
+    assert action.exit_code == EXIT_TERMINAL_FAILURE
+    assert "coord fix ta1" in action.message
+
+
+def test_slice_review_request_changes_stops_with_the_fix_command():
+    action = landing_step(
+        landing_state(
+            acceptance_review_verdict="request-changes",
+            acceptance_merge_status="",
+        )
+    )
+    assert action.is_exit
+    assert action.exit_code == EXIT_TERMINAL_FAILURE
+    assert "coord fix rv1" in action.message
+
+
+def test_no_merge_refuses_up_front_instead_of_idling_to_the_deadline():
+    """`--no-merge` makes the run unable to progress at all (#1138 refuses
+    the work dispatch until the slice lands) — say so immediately."""
+    action = landing_step(
+        landing_state(), DriveOptions(machine="precision", do_merge=False)
+    )
+    assert action.is_exit
+    assert action.exit_code == EXIT_TERMINAL_FAILURE
+    assert "coord merge --only ta1" in action.message
+
+
+def test_slice_still_awaiting_its_daemon_dispatched_test_verdict_waits():
+    """The three stages the daemon DOES run unconditionally are still just
+    observed — no `coord merge` is fired at a row that isn't enqueued."""
+    action = landing_step(
+        landing_state(
+            acceptance_author_test_state="",
+            acceptance_review_aid="",
+            acceptance_review_verdict="",
+            acceptance_merge_status="",
+        )
+    )
+    # `merge_status=""` is retryable (the entry may simply not be enqueued
+    # yet), so the driver attempts once and reads the refusal back — it never
+    # sits silent.
+    assert action.kind == RUN
+    assert action.command == ("merge", "--only", "ta1", "--method", "rebase")
+
+
+def test_slice_escalation_names_the_tracking_issue_not_the_member_issue():
+    """The slice's board row and queue entry are keyed on the milestone's
+    TRACKING issue, so every command an escalation proposes must point
+    there."""
+    action = landing_step(landing_state(acceptance_merge_status="NEEDS_ATTENTION"))
+    assert action.is_exit
+    assert action.exit_code == EXIT_ESCALATED
+    assert "escalate" in action.command
+    assert "1120" in action.command
+    assert str(ISSUE) not in action.command
+
+
+def test_slice_landing_never_touches_the_work_row_dispatch():
+    """Belt and braces: while the slice is landing, `coord assign` must not
+    be reachable — that is the #1138 refusal this whole path exists to
+    avoid."""
+    action = landing_step(landing_state())
+    assert action.command[0] != "assign"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
