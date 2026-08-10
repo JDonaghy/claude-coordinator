@@ -198,6 +198,14 @@ class GateADecision:
     contract_sha: str = ""
     approval: GateAApproval | None = None
     reason: str | None = None
+    #: The manifest's ``gate_a: {exempt: true, reason: "..."}`` text, when
+    #: ``state`` is :data:`STATE_EXEMPT` — ``""`` otherwise (including when
+    #: exempt but no reason was declared). The Proposed-shape item this
+    #: implements calls the opt-out "explicit and declared... reviewable" —
+    #: that only holds if the reason an operator wrote down is actually
+    #: surfaced somewhere (``coord gate-a``, the TUI), not just parsed and
+    #: discarded.
+    exempt_reason: str = ""
 
 
 def make_record(
@@ -329,6 +337,7 @@ def evaluate(
             ok=True,
             contract_sha=contract_digest(contract_text) if contract_text else "",
             approval=None,
+            exempt_reason=exempt_reason,
         )
 
     record = (
@@ -431,6 +440,11 @@ def evaluate(
 def summarise(decision: GateADecision) -> str:
     """One-line human summary of *decision*, for ``coord gate-a`` output."""
     if decision.state == STATE_EXEMPT:
+        if decision.exempt_reason:
+            return (
+                "exempt — this milestone declared it needs no human "
+                f"sign-off ({decision.exempt_reason})"
+            )
         return "exempt — this milestone declared it needs no human sign-off"
     if decision.state == STATE_APPROVED:
         who = decision.approval.actor if decision.approval else ""

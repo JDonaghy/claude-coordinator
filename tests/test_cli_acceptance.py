@@ -1245,6 +1245,35 @@ class TestAcceptanceAuthor:
         assert result.exit_code == 1
         assert "no acceptance driver configured" in result.output
 
+    def test_gate_a_refusal_exits_dispatch_refused_not_terminal_failure(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """#2063: the Gate-A "no recorded sign-off" refusal must map to
+        `EXIT_DISPATCH_REFUSED` (5), not the generic terminal-failure exit
+        (1) every other `dispatch_test_author` failure uses — otherwise
+        `coord drive`'s subprocess boundary can't tell this deterministic,
+        operator-fixable refusal apart from a crash, and `coord drive-queue`
+        parks it (#1891/#1892) instead of burning attempts toward terminal
+        `blocked` (#2040) on a contract nobody approved."""
+        from coord.dispatch import DispatchRefused
+        from coord.drive import EXIT_DISPATCH_REFUSED
+
+        config_path = self._config_no_driver(tmp_path)
+
+        def fake_dispatch(*a, **kw):
+            raise DispatchRefused(
+                "Gate A has no recorded human sign-off for ms-37 "
+                "[gate-a-approval repo=coord-tui ms-37 v=none]"
+            )
+
+        monkeypatch.setattr("coord.test_author.dispatch_test_author", fake_dispatch)
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "author", "coord-tui", "947", "--config", str(config_path),
+        ])
+        assert result.exit_code == EXIT_DISPATCH_REFUSED
+        assert "no recorded human sign-off" in result.output
+
 
 class TestAcceptanceAuthorInteractive:
     """#1173: `coord acceptance author --interactive` — thin CLI glue over
@@ -1361,6 +1390,36 @@ class TestAcceptanceAuthorInteractive:
         ])
         assert result.exit_code == 1
         assert "no machine claims repo" in result.output
+
+    def test_gate_a_refusal_exits_dispatch_refused_not_terminal_failure(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """#2063: same as the headless `TestAcceptanceAuthor` case above —
+        the `--interactive` branch has its own `except RuntimeError` and
+        must classify the Gate-A refusal identically, or `coord drive`'s
+        `--interactive`-attended JIT-authoring path falls through to
+        terminal `blocked` while the headless path parks correctly."""
+        from coord.dispatch import DispatchRefused
+        from coord.drive import EXIT_DISPATCH_REFUSED
+
+        config_path = self._config_no_driver(tmp_path)
+
+        def fake_interactive(*a, **kw):
+            raise DispatchRefused(
+                "Gate A has no recorded human sign-off for ms-37 "
+                "[gate-a-approval repo=coord-tui ms-37 v=none]"
+            )
+
+        monkeypatch.setattr(
+            "coord.test_author.dispatch_test_author_interactive", fake_interactive,
+        )
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "author", "coord-tui", "947", "--interactive",
+            "--config", str(config_path),
+        ])
+        assert result.exit_code == EXIT_DISPATCH_REFUSED
+        assert "no recorded human sign-off" in result.output
 
     def test_dry_run_without_interactive_errors(
         self, tmp_path: Path, monkeypatch,

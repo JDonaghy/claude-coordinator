@@ -17,13 +17,15 @@ Bypassing `dispatch()` means that seal never applies to this type, by
 construction, instead of needing a type-gated exception in a shared
 hot path.
 
-The dispatcher does NOT read `contract.md` itself — no local checkout is
-required to dispatch. The worker gets a full worktree (this is a
-write-capable, non-chat type, so `AgentServer.assign` gives it one same as
-`work`/`smoke`/`conflict-fix`) and is told, in its briefing, to read the
-contract from its own checkout. This mirrors `coord.acceptance.
-oracle_loop_contract_block` (#945), which points the *worker's* briefing at
-the same path rather than embedding the contract text.
+The dispatcher does NOT embed `contract.md`'s text into the worker's
+briefing — no local checkout is required to dispatch, and the worker is
+told, in its briefing, to read the contract from its own checkout. This
+mirrors `coord.acceptance.oracle_loop_contract_block` (#945), which points
+the *worker's* briefing at the same path rather than embedding the contract
+text. (The coordinator itself now does fetch `contract.md`'s content
+server-side, via `gate_a_signoff_status`'s #2063 sign-off check below — the
+invariant this docstring is actually protecting is "never in the worker's
+prompt", not "never read at all".)
 """
 
 from __future__ import annotations
@@ -40,7 +42,7 @@ import httpx
 from coord import github_ops
 from coord.acceptance import ACCEPTANCE_DIRNAME
 from coord.config import Config
-from coord.dispatch import AGENT_PORT
+from coord.dispatch import AGENT_PORT, DispatchRefused
 from coord.machine_pause import paused_set
 from coord.milestone_dispatch import (
     MilestoneDispatchError,
@@ -351,7 +353,11 @@ def dispatch_test_author(
     resolution failure (unknown repo, no acceptance driver configured (or,
     for a routed repo, no driver resolves for *path*), bad tracking issue,
     `issue_number` not a member of the milestone's work order, no qualified
-    machine, or the agent rejecting the dispatch).
+    machine, or the agent rejecting the dispatch) — EXCEPT the #2063 Gate-A
+    sign-off refusal (contract exists but carries no recorded human
+    verdict), which raises `coord.dispatch.DispatchRefused` (a `ValueError`
+    subclass) instead, so callers can tell a deterministic, operator-fixable
+    refusal apart from every other, non-recoverable failure mode here.
 
     Branch: milestone mode (`issue_number=None`) shares one branch/PR across
     repeated calls, keyed on *tracking_issue*. JIT mode (`issue_number` set)
@@ -396,9 +402,19 @@ def dispatch_test_author(
     # (button text, data-testid hooks, status vocabulary) become assertions
     # the worker may never edit, so a wrong one is not cosmetic: it is a
     # suite that enforces the wrong product.
+    #
+    # Raised as `DispatchRefused` (a `ValueError` subclass), NOT a plain
+    # `RuntimeError` like every other failure mode in this function: this
+    # refusal is deterministic and operator-fixable (`coord gate-a
+    # --approved`), not a crash, and `coord acceptance author`'s CLI handler
+    # maps THIS exception — and only this one — to `EXIT_DISPATCH_REFUSED`
+    # so `coord drive-queue`'s tick can park the entry (#1891/#1892) instead
+    # of burning attempts toward terminal `blocked` (#2040) on an unapproved
+    # contract. Same distinguishing pattern `enforce_oracle_readiness` (the
+    # Work-dispatch guard this mirrors) already uses in `coord/dispatch.py`.
     signoff_refusal = gate_a_signoff_status(repo_cfg, config, ctx.milestone_number)
     if signoff_refusal is not None:
-        raise RuntimeError(signoff_refusal)
+        raise DispatchRefused(signoff_refusal)
 
     if machine_override:
         machine = next(
@@ -643,7 +659,11 @@ def dispatch_test_author_interactive(
     milestone/issue-membership/machine), plus a worktree/remote-launch setup
     failure (mirrors ``--rework-of``'s #618 failure-reason backstop: the
     reason is recorded on the assignment row before the error is raised, so
-    the TUI can explain a red box with no log file).
+    the TUI can explain a red box with no log file) — EXCEPT the #2063
+    Gate-A sign-off refusal, which (as in :func:`dispatch_test_author`)
+    raises :class:`coord.dispatch.DispatchRefused` instead, so `coord
+    acceptance author --interactive`'s CLI handler can map it to
+    ``EXIT_DISPATCH_REFUSED``.
     """
     from coord.agent import (  # noqa: PLC0415
         AssignmentSpec,
@@ -705,9 +725,19 @@ def dispatch_test_author_interactive(
     # (button text, data-testid hooks, status vocabulary) become assertions
     # the worker may never edit, so a wrong one is not cosmetic: it is a
     # suite that enforces the wrong product.
+    #
+    # Raised as `DispatchRefused` (a `ValueError` subclass), NOT a plain
+    # `RuntimeError` like every other failure mode in this function: this
+    # refusal is deterministic and operator-fixable (`coord gate-a
+    # --approved`), not a crash, and `coord acceptance author`'s CLI handler
+    # maps THIS exception — and only this one — to `EXIT_DISPATCH_REFUSED`
+    # so `coord drive-queue`'s tick can park the entry (#1891/#1892) instead
+    # of burning attempts toward terminal `blocked` (#2040) on an unapproved
+    # contract. Same distinguishing pattern `enforce_oracle_readiness` (the
+    # Work-dispatch guard this mirrors) already uses in `coord/dispatch.py`.
     signoff_refusal = gate_a_signoff_status(repo_cfg, config, ctx.milestone_number)
     if signoff_refusal is not None:
-        raise RuntimeError(signoff_refusal)
+        raise DispatchRefused(signoff_refusal)
 
     if machine_override:
         machine = next(

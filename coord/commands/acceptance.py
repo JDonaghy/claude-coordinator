@@ -45,6 +45,7 @@ from coord.acceptance import (
 from coord.acceptance_drivers import DriverError, run_driver
 from coord.commands._common import _CONFIG_OPTION, _load_config
 from coord.comments import format_needs_attention
+from coord.dispatch import DispatchRefused
 
 
 @click.group("acceptance")
@@ -468,6 +469,19 @@ def acceptance_author(
                 path=route_path,
                 dry_run=dry_run,
             )
+        except DispatchRefused as e:
+            # #2063: the Gate-A sign-off refusal is deterministic and
+            # operator-fixable (`coord gate-a --approved`), not a crash —
+            # exit EXIT_DISPATCH_REFUSED (not the generic 1 below) so
+            # `coord drive`'s subprocess boundary and `coord drive-queue`'s
+            # tick can tell it apart and PARK the entry (#1891/#1892)
+            # instead of burning attempts toward terminal `blocked` (#2040).
+            # Mirrors `coord fix`'s/`coord assign`'s existing
+            # `except DispatchRefused` handling.
+            from coord.drive import EXIT_DISPATCH_REFUSED  # noqa: PLC0415
+
+            click.echo(f"error: {e}", err=True)
+            sys.exit(EXIT_DISPATCH_REFUSED)
         except RuntimeError as e:
             click.echo(f"error: {e}", err=True)
             sys.exit(1)
@@ -488,6 +502,14 @@ def acceptance_author(
             machine_override=machine_override,
             path=route_path,
         )
+    except DispatchRefused as e:
+        # #2063: see the matching --interactive branch above — same
+        # deterministic-refusal exit code so the headless dispatch path
+        # parks instead of blocking too.
+        from coord.drive import EXIT_DISPATCH_REFUSED  # noqa: PLC0415
+
+        click.echo(f"error: {e}", err=True)
+        sys.exit(EXIT_DISPATCH_REFUSED)
     except RuntimeError as e:
         click.echo(f"error: {e}", err=True)
         sys.exit(1)

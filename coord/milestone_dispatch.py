@@ -478,13 +478,36 @@ def issue_oracle_ready(
     if milestone_number is None or not config.acceptance.has_driver(repo_cfg.name):
         return OracleReadiness()
 
-    if gate_a_status(repo_cfg, config, milestone_number, file_exists=file_exists) is not None:
+    # One memoised fetch seam shared by `gate_a_status`'s existence probe and
+    # the manifest/contract content reads below — same fix
+    # `gate_a_signoff_status` already applies for its own pair of calls.
+    # Without this, every dispatch-readiness check against an oracle-opted
+    # milestone pulls `tests/acceptance/ms-NN/contract.md` over `gh` TWICE:
+    # once here (existence only, content discarded) and again inside
+    # `gate_a_signoff` below (content, to hash it). Only takes effect when
+    # *file_exists* isn't explicitly overridden — callers that inject their
+    # own (tests) keep exactly their prior behaviour.
+    base_fetch = fetch_manifest or _default_fetch_repo_file
+    _fetch_seen: dict[tuple[str, str, str], "str | None"] = {}
+
+    def fetch(repo_github: str, path: str, branch: str) -> "str | None":
+        key = (repo_github, path, branch)
+        if key not in _fetch_seen:
+            _fetch_seen[key] = base_fetch(repo_github, path, branch)
+        return _fetch_seen[key]
+
+    effective_file_exists = file_exists or (
+        lambda g, p, b: fetch(g, p, b) is not None
+    )
+
+    if gate_a_status(
+        repo_cfg, config, milestone_number, file_exists=effective_file_exists
+    ) is not None:
         return OracleReadiness()
 
     from coord.acceptance import test_ids_for_issue  # noqa: PLC0415
     from coord.acceptance_drivers import SUPPORTED_KINDS  # noqa: PLC0415
 
-    fetch = fetch_manifest or _default_fetch_repo_file
     manifest = _fetch_manifest_data(
         repo_cfg.github, milestone_number, repo_cfg.default_branch, fetch,
     )
