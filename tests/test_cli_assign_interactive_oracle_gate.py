@@ -38,6 +38,26 @@ acceptance:
 """
 
 
+@pytest.fixture(autouse=True)
+def _gate_a_signed_off():
+    """#2063: these tests use the literal ``"contract body"`` as the
+    milestone contract and predate the Gate-A human sign-off gate. Record
+    the matching verdict so they keep exercising the #1138 slice gate (and
+    the #1314 epic guard) they were written for; the sign-off gate has its
+    own coverage in tests/test_gate_a.py."""
+    from coord.gate_a import contract_digest, make_record
+
+    record = make_record(
+        repo_name="api",
+        milestone_number=37,
+        verdict="approved",
+        contract_sha=contract_digest("contract body"),
+        now=1000.0,
+    ).to_dict()
+    with patch("coord.state.get_gate_a_approval", return_value=record):
+        yield
+
+
 @pytest.fixture
 def config_file(tmp_path: Path) -> Path:
     p = tmp_path / "coordinator.yml"

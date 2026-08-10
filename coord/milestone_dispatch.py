@@ -56,6 +56,7 @@ __all__ = [
     "ManifestFetch",
     "GateAApprovalFetch",
     "gate_a_signoff",
+    "gate_a_signoff_status",
     "OracleReadiness",
     "issue_oracle_ready",
     "pick_machine",
@@ -348,6 +349,65 @@ def gate_a_signoff(
         exempt=bool(getattr(manifest, "gate_a_exempt", False)),
         exempt_reason=str(getattr(manifest, "gate_a_exempt_reason", "") or ""),
     )
+
+
+def gate_a_signoff_status(
+    repo_cfg: Repo,
+    config: "Config",
+    milestone_number: int,
+    *,
+    fetch_manifest: ManifestFetch | None = None,
+    fetch_gate_a_approval: GateAApprovalFetch | None = None,
+) -> str | None:
+    """``None`` when a human has signed off on this milestone's contract,
+    a refusal reason otherwise (#2063).
+
+    The milestone-level convenience wrapper around :func:`gate_a_signoff`,
+    shaped like :func:`gate_a_status` so callers that gate on a *milestone*
+    rather than an issue — ``coord acceptance author``, which dispatches the
+    independent ``test-author`` — read the same one-line refusal. That path
+    is the one that actually burned money on coord-portal ms-2: a sealed
+    slice authored against a contract nobody had approved. It happened to be
+    a good contract; that was luck, not process.
+
+    A no-op (``None``) for repos with no ``acceptance.drivers`` entry, and
+    for a milestone whose contract does not exist yet — the latter is
+    :func:`gate_a_status`'s own, already-surfaced refusal.
+    """
+    if not config.acceptance.has_driver(repo_cfg.name):
+        return None
+
+    # One memoised fetch seam for both the existence probe and the content
+    # read — `gate_a_status` only wants "is it there", `gate_a_signoff`
+    # wants the bytes, and without this the contract would be pulled twice
+    # over `gh` on every call.
+    base = fetch_manifest or _default_fetch_repo_file
+    seen: dict[tuple[str, str, str], "str | None"] = {}
+
+    def fetch(repo_github: str, path: str, branch: str) -> "str | None":
+        key = (repo_github, path, branch)
+        if key not in seen:
+            seen[key] = base(repo_github, path, branch)
+        return seen[key]
+
+    if gate_a_status(
+        repo_cfg,
+        config,
+        milestone_number,
+        file_exists=lambda g, p, b: fetch(g, p, b) is not None,
+    ) is not None:
+        return None
+    manifest = _fetch_manifest_data(
+        repo_cfg.github, milestone_number, repo_cfg.default_branch, fetch,
+    )
+    decision = gate_a_signoff(
+        repo_cfg,
+        milestone_number,
+        manifest,
+        fetch=fetch,
+        approval_fetch=fetch_gate_a_approval or _default_fetch_gate_a_approval,
+    )
+    return None if decision.ok else decision.reason
 
 
 @dataclass(frozen=True)
