@@ -1027,7 +1027,14 @@ def build_app(
             if unit not in running:
                 results[unit] = {"restarted": None, "detail": "not running on this host"}
                 continue
-            restarted, detail = _restart_sibling_unit(unit)
+            # #2069 follow-up: _restart_sibling_unit is synchronous — subprocess.run
+            # calls plus a time.sleep(0.5) poll loop for up to `timeout` seconds per
+            # unit. This handler is `async def`, so Starlette does not thread it
+            # automatically; running that blocking work inline here would freeze the
+            # single uvicorn event loop (no other request — status polls, cancels,
+            # health checks — could be served) for up to ~90s across 3 units. Same
+            # fix as `server.health` above: hand it to a worker thread and await it.
+            restarted, detail = await asyncio.to_thread(_restart_sibling_unit, unit)
             results[unit] = {"restarted": restarted, "detail": detail}
             all_ok = all_ok and restarted
         return JSONResponse({"units": results}, status_code=200 if all_ok else 500)

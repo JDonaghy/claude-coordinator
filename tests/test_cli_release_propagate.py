@@ -1043,7 +1043,12 @@ def test_roll_python_stays_ok_when_a_sibling_restart_fails(monkeypatch):
     def _fake_post(url, payload, *, timeout):
         if url.endswith("/update"):
             return 202, {}, ""
-        return 200, {"units": {
+        # #2069: the real endpoint (agent_app.py's restart_services) returns HTTP
+        # 500 — not 200 — whenever any unit fails to restart, with the same
+        # {"units": {...}} body shape either way. Mocking 200 here would let a
+        # since-fixed bug (the caller discarding per-unit detail on a real 500)
+        # regress silently.
+        return 500, {"units": {
             "coord-serve": {"restarted": False, "detail": "still activating 30s after restart"},
         }}, ""
 
@@ -1079,7 +1084,10 @@ def test_restart_sibling_services_reports_a_mix_of_outcomes(monkeypatch):
 
     def _fake_post(url, payload, *, timeout):
         calls.append(url)
-        return 200, {"units": {
+        # #2069: a mixed outcome with any failed unit is a real HTTP 500 from the
+        # endpoint (agent_app.py's restart_services), not a 200 — see the comment
+        # in test_roll_python_stays_ok_when_a_sibling_restart_fails above.
+        return 500, {"units": {
             "coord-serve": {"restarted": True, "detail": "active"},
             "coord-web": {"restarted": False, "detail": "still deactivating"},
             "coord-drive-queue": {"restarted": None, "detail": "not running on this host"},
