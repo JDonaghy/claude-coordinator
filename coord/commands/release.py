@@ -880,7 +880,16 @@ def _restart_sibling_services(
     )
     if error:
         return False, f"sibling service restart: {error}"
-    if status != 200:
+    # The endpoint (`agent_app.py`'s `restart_services`) returns HTTP 500 — with the
+    # *same* `{"units": {...}}` body shape as 200 — whenever any single unit fails to
+    # restart. That is the exact partial-failure path this function exists to report
+    # in detail, so a 500 *with a `units` body* must still be parsed below rather than
+    # treated as an opaque failure. A 500 WITHOUT a `units` body is a different,
+    # genuinely-unexpected failure (an unhandled exception, a proxy error, ...) —
+    # Starlette's own default error page carries no such body — and must still
+    # short-circuit, or a real crash would be misread as "no sibling units to
+    # restart" / a false-positive success.
+    if status != 200 and not (status == 500 and "units" in body):
         return False, f"sibling service restart: {body.get('error') or f'HTTP {status}'}"
 
     units = body.get("units") or {}
