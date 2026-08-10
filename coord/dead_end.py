@@ -1,0 +1,248 @@
+"""The driver's dead-end predicate (#2019).
+
+``coord drive`` could not tell **"still working"** apart from **"finished in
+a state I cannot act on."**  Both rendered as ``no state change in N m`` and
+the second one looped forever — a counter incrementing against an event that
+can never occur, holding a tmux session, a queue slot and (since #1972) an
+entire repo's capacity lane.  The live case this module is named for burned
+**140 minutes** on claude-coordinator#1956 with ``review=done/-`` on screen
+the whole time.
+
+WHAT THIS MODULE IS
+-------------------
+One pure function, :func:`detect_dead_end`, over the driver's already-computed
+:class:`coord.drive_state.IssueState`.  It answers a single question:
+
+    Is this row **terminal AND unactionable** — i.e. is there no board
+    transition left that any amount of polling could produce?
+
+It is **not** a stall detector.  Per #2019 ask 4, elapsed time is deliberately
+NOT an input: a healthy long-running Work stage is legitimately quiet for
+hours, and a dead end is knowable at minute zero.  The only clock-shaped
+guard here is the hard precondition ``active_count == 0`` — if anything at all
+is running on the fleet, this function returns ``None``, however long it has
+been running.  That guard is what makes a false positive on a healthy stage
+structurally impossible rather than merely unlikely.
+
+WHY THE 140 MINUTES HAPPENED (the field-mismatch bug)
+-----------------------------------------------------
+``coord.drive._decide_review`` has had a ``_die`` for "review finished with no
+verdict" since the original bash port — but it keys on
+``state.work_review_state``, the **work** row's projected ``review_state``.
+The incident's board showed ``review=done/-``, which is
+``state.review_status`` — the **review assignment's own** status.  On #1956
+the review row reached ``status="done"`` while the work row's ``review_state``
+was never advanced (advancing it is exactly what recording the verdict does),
+so the die never fired and ``_decide_review`` fell through to a bare
+``_wait()``.  Two readings of "the review is done", one checked, one not.
+:data:`_TERMINAL_REVIEW_STATUSES` closes that by keying on the review row.
+
+WHAT IS DELIBERATELY *NOT* COVERED
+----------------------------------
+* **A Test stage that was never dispatched** (``test_state=""`` with no smoke
+  row) — vimcode#635, whose cause is #2024.  From board state alone this is
+  indistinguishable from "the daemon will dispatch it on the next tick", and
+  the dispatcher's own refusal set (``coord.smoke.dispatch_smoke`` returns
+  ``None`` for a superseded row, a capability-rule miss on a non-``work``
+  type, a missing smoke command, …) is not re-derivable here without
+  duplicating it.  Guessing would escalate healthy rows.  What IS covered is
+  the case where the dispatcher **left a marker saying it gave up**:
+  ``test_state="blocked"`` (#1672), below.
+* **A ``done`` smoke row whose verdict has not landed yet** — #1605 already
+  established that this has an expected, bounded propagation lag and is not a
+  defect.  Only the contradictions #1605 itself detects are terminal.
+* **A zero-commit advisory / a refused pre-dispatch guard** — already
+  escalated correctly by ``coord.drive._decide_advisory``, the "finished with
+  no branch" die, and #1844's ``EXIT_DISPATCH_REFUSED``.  vimcode#634 proved
+  that path works; this module deliberately does not touch it.
+
+The registry below is meant to grow one *proven* shape at a time.  A shape
+belongs here only when the board state alone makes the row unactionable — not
+when it merely looks quiet.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+# A review assignment that reached one of these is FINISHED — no worker is
+# coming back to add a verdict.  `"failed"` is deliberately absent: #1584
+# owns it with a bounded `coord review` re-dispatch, and a dead-end verdict
+# there would steal a retry that genuinely can succeed.
+_TERMINAL_REVIEW_STATUSES = frozenset({"done", "cancelled"})
+
+
+@dataclass(frozen=True)
+class DeadEnd:
+    """One terminal-and-unactionable board shape, fully described.
+
+    ``reason`` names the SPECIFIC dead end (#2019 ask 3) — "review reached
+    done with no verdict" rather than "no state change in 140.558m" — and
+    ``recovery`` is the command an operator can paste.  Both end up on the
+    ``coord escalate record`` row, in the drive-queue entry's ``last_reason``,
+    and in the GitHub escalation comment, so all three surfaces say the same
+    thing.
+    """
+
+    kind: str
+    """Stable slug for the shape, e.g. ``review_terminal_no_verdict``."""
+
+    stage: str
+    """Pipeline stage the dead end sits in — ``coord escalate record --stage``."""
+
+    reason: str
+    """Why no poll can change this.  One paragraph, operator-facing."""
+
+    recovery: str
+    """The command that unblocks it, ready to paste."""
+
+    assignment_id: str = ""
+    """The row an operator should look at first (``""`` when unknown)."""
+
+    gates: tuple[tuple[str, str], ...] = ()
+    """Observed gate readings, ``(key, value)`` — mirrors ``_escalate_merge``."""
+
+
+def _gates(state) -> tuple[tuple[str, str], ...]:
+    """The board readings worth recording on any dead end.
+
+    Same shape as ``coord.drive._escalate_merge``'s ``gate_pairs`` so the two
+    escalation kinds render identically in ``coord escalate list``.
+    """
+    return (
+        ("work_status", state.work_status or "(empty)"),
+        ("test_state", state.work_test_state or "(none)"),
+        ("review_status", state.review_status or "(none)"),
+        ("review_verdict", state.review_verdict or "(none)"),
+        ("active", str(state.active_count)),
+    )
+
+
+def detect_dead_end(state) -> DeadEnd | None:
+    """The predicate: ``None`` when the row can still move on its own.
+
+    *state* is a :class:`coord.drive_state.IssueState` (untyped here purely to
+    keep this module import-light — it reads five attributes and nothing else).
+
+    Pure, cheap, and safe to call on every poll: no I/O, no clock, no
+    counters.  The caller (``coord.drive.decide``) turns a non-``None`` result
+    into an ``EXIT`` action carrying ``coord.drive.EXIT_DEAD_END``.
+    """
+    # #1672's "the fleet cannot route this Test stage" marker.  IMPORTED (not
+    # mirrored as a literal) so the two can never drift: `dispatch_smoke`
+    # bails out on this exact value, and its refusal to re-probe is precisely
+    # why a driver polling against it can never make progress.  Deferred to
+    # call time purely to keep THIS module importable on its own without
+    # dragging in `coord.smoke`'s `httpx` dependency — `coord.drive` already
+    # pulls httpx in via `coord.usage_limits`, so nothing is saved there, but
+    # a predicate this small should stay cheap to import and test in
+    # isolation.
+    from coord.smoke import TEST_STATE_BLOCKED  # noqa: PLC0415
+    # THE conservative guard, and it stays first.  #2019 acceptance: "a
+    # genuinely long-running work stage (active=1) does NOT escalate, however
+    # long it runs."  Anything in flight — work, test, review, a fix round,
+    # the acceptance author — makes every question below premature.
+    if state.active_count > 0:
+        return None
+
+    # ── shape 1: the review row is terminal and carries no verdict ──────────
+    # claude-coordinator#1956, 2026-08-08.  The driver can neither dispatch a
+    # fix (there is no `request-changes` to fix) nor proceed to merge (there
+    # is no `approve` to merge on), and the row that would have supplied
+    # either is finished.  Nothing about waiting changes that.
+    if (
+        state.review_aid
+        and state.review_status in _TERMINAL_REVIEW_STATUSES
+        and not state.review_verdict
+        # Belt-and-braces: an actionable failed test outranks a stale review
+        # on the same work row — let `_decide_test`'s bounded fix loop have
+        # it rather than dead-ending a row that still has a live move.
+        and state.work_test_state != "failed"
+    ):
+        if state.review_status == "cancelled":
+            return DeadEnd(
+                kind="review_cancelled_no_verdict",
+                stage="review",
+                reason=(
+                    f"review {state.review_aid} was CANCELLED before recording "
+                    "a verdict — no verdict is coming, and this driver has "
+                    "nothing to approve, fix, or merge on. Terminal on the "
+                    "board; polling cannot change it (#2019)."
+                ),
+                recovery=f"coord review {state.work_aid}",
+                assignment_id=state.review_aid,
+                gates=_gates(state),
+            )
+        # status == "done": the session finalised CLEANLY.  Saying so matters
+        # — #2019 acceptance requires this text to distinguish an
+        # END_REVIEW-without-verdict from a crashed session, and to stop
+        # citing the CLOSED #812 (which was about INTERACTIVE reviews that
+        # never started) at a headless review that ran to completion.  A
+        # review worker that actually died lands `status="failed"`, which is
+        # `_decide_review`'s #1584 bounded-retry arm, not this one.
+        #
+        # #812 is deliberately absent from the text below — even as a
+        # disclaimer.  An operator who greps the reason for an issue number
+        # to open must never land on a closed one, and "not #812" reads as
+        # "#812" to every mechanical reader (and to a tired one at 2am).  The
+        # correction lives here, in the source, where it belongs.
+        return DeadEnd(
+            kind="review_terminal_no_verdict",
+            stage="review",
+            reason=(
+                f"review {state.review_aid} reached status=done carrying NO "
+                "verdict. The review session finalised cleanly — a crashed, "
+                "killed or never-started session lands status='failed' (which "
+                "this driver retries), so this is the END_REVIEW-without-"
+                "verdict class: the reviewer finished and its REVIEW_VERDICT "
+                "header was never emitted or never parsed (#1956, "
+                "coord.review.detect_end_review_without_verdict). The verdict "
+                "is very likely already sitting in the transcript. With no "
+                "verdict there is no fix to dispatch and no approval to merge "
+                "on, and the review row is terminal — no number of polls "
+                "changes that (#2019)."
+            ),
+            # Straight out of docs/OPERATING_GOTCHAS.md's "Recovery — do NOT
+            # re-dispatch" block: re-running the review costs a full cycle to
+            # re-derive a conclusion already in the log, and the drop
+            # reproduces at a documented ~14% rate (#873).
+            recovery=(
+                f"coord report-result --assignment {state.review_aid} "
+                "--status done --verdict <approve|request-changes> "
+                "--verdict-source recovered --verdict-reason 'REVIEW_VERDICT "
+                "header missing, recovered from transcript (#1956)' "
+                "--body-file <extracted-review.md>"
+            ),
+            assignment_id=state.review_aid,
+            gates=_gates(state),
+        )
+
+    # ── shape 2: the Test stage is BLOCKED (#1672) ─────────────────────────
+    # `dispatch_smoke` stamps `test_state="blocked"` when no capability-
+    # matched machine could run the suite, and then REFUSES to re-probe on
+    # every tick — deliberately, that spin is what #1672 closed.  So the
+    # driver polling for a verdict is polling for something the dispatcher
+    # has already decided not to produce.  vimcode#635's shape, in the one
+    # variant the board makes provable.
+    if state.work_test_state == TEST_STATE_BLOCKED:
+        return DeadEnd(
+            kind="test_stage_blocked",
+            stage="test",
+            reason=(
+                f"the Test stage for {state.work_aid} is BLOCKED: "
+                f"{state.work_test_reason or 'no reason recorded'} — "
+                "coord.smoke.dispatch_smoke found no capability-matched "
+                "machine and recorded 'blocked' rather than re-probing a "
+                "broken fleet on every tick (#1672). It will not try again "
+                "on its own, so waiting for a verdict here waits forever "
+                "(#2019). Fix the fleet (or the capability rules), then "
+                "clear the marker."
+            ),
+            recovery=(
+                f"coord diagnose {state.repo} {state.issue} --stage test --reset"
+            ),
+            assignment_id=state.work_aid,
+            gates=_gates(state),
+        )
+
+    return None

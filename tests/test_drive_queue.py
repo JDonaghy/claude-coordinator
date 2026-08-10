@@ -1199,6 +1199,112 @@ def test_a_genuine_death_still_retries_and_exhausts_with_no_refused_flag():
     assert plan.blocked[0].updates["attempts"] == DEFAULT_MAX_ATTEMPTS
 
 
+# ── plan_tick: a dead-end exit blocks the entry (#2019) ──────────────────────
+#
+# The second PERMANENT cause, sharing #1844's branch. Before #2019 this shape
+# never reached the queue at all — the drive did not exit, it counted `no
+# state change` for 140 minutes while holding the tmux session, the queue slot
+# and (since #1972) the whole repo's capacity lane. Now it exits within one
+# poll, and the tick's job is to make that visible in `coord drive-queue
+# list`/`status` with the SPECIFIC reason, without spending an attempt on a
+# relaunch that would reproduce the identical dead end.
+
+DEAD_END_REASON = (
+    "drive exited for claude-coordinator#1956 (exit_code=6): DEAD END "
+    "[review_terminal_no_verdict] — this row is terminal and unactionable; "
+    "exiting instead of polling (#2019).\n   review c9b489b2333e reached "
+    "status=done carrying NO verdict.\n   Recover: coord report-result "
+    "--assignment c9b489b2333e --status done --verdict "
+    "<approve|request-changes> --verdict-source recovered ..."
+)
+
+
+def test_a_dead_end_exit_blocks_immediately_with_attempts_unspent():
+    """#2019 acceptance: "the queue entry is left `blocked` with a reason
+    naming the specific dead end and the recovery command"."""
+    entries = [entry(1956, position=3, state=STATE_RUNNING, attempts=0)]
+    plan = plan_tick(
+        entries, board(), capacity=1,
+        exit_reasons={entry_key(REPO, 1956): DEAD_END_REASON},
+        exit_dead_end={entry_key(REPO, 1956): True},
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "dead_end"
+    assert reconcile.occupies is False
+    # No relaunch, no attempt spent — a dead end is not a flaky death.
+    assert "attempts" not in reconcile.updates
+    assert plan.launch is None
+    blocked = plan.blocked[0]
+    assert blocked.key == entry_key(REPO, 1956)
+    assert "attempts" not in blocked.updates
+    assert blocked.updates["state"] == STATE_BLOCKED
+    # The specific dead end AND its recovery command reach `last_reason`,
+    # which is what `coord drive-queue list`/`status` render. "no state
+    # change in 140.558m" is what this replaces.
+    last_reason = blocked.updates["last_reason"]
+    assert "review_terminal_no_verdict" in last_reason
+    assert "coord report-result --assignment c9b489b2333e" in last_reason
+    assert "drive session died" not in last_reason
+
+
+def test_a_dead_end_reason_is_not_reported_as_a_pre_dispatch_refusal():
+    """Two permanent causes, one branch — but never one wording. #1844's
+    "refused by a pre-dispatch guard" would send an operator hunting for a
+    guard that never fired."""
+    entries = [entry(1956, state=STATE_RUNNING, attempts=0)]
+    plan = plan_tick(
+        entries, board(), capacity=1,
+        exit_reasons={entry_key(REPO, 1956): DEAD_END_REASON},
+        exit_dead_end={entry_key(REPO, 1956): True},
+    )
+    reason = plan.blocked[0].reason
+    assert "pre-dispatch guard" not in reason
+    assert "terminal and unactionable" in reason
+    assert "#2019" in reason
+
+
+def test_a_dead_end_entry_deep_into_its_attempt_budget_still_spends_none():
+    """Same short-circuit property #1844 asserts: how many attempts a genuine
+    death already burned is irrelevant — a dead end still costs nothing and
+    reports as `dead_end`, never `exhausted`."""
+    entries = [entry(1956, state=STATE_RUNNING, attempts=DEFAULT_MAX_ATTEMPTS - 1)]
+    plan = plan_tick(
+        entries, board(), capacity=1,
+        exit_reasons={entry_key(REPO, 1956): DEAD_END_REASON},
+        exit_dead_end={entry_key(REPO, 1956): True},
+    )
+    assert plan.reconciles[0].outcome == "dead_end"
+    assert "attempts" not in plan.blocked[0].updates
+
+
+def test_exit_reason_without_the_dead_end_flag_still_retries_normally():
+    """The #1845 regression bar, restated for the new flag: narrating a
+    reason must not by itself block anything."""
+    entries = [entry(1956, state=STATE_RUNNING, attempts=0)]
+    plan = plan_tick(
+        entries, board(), capacity=1,
+        exit_reasons={entry_key(REPO, 1956): DEAD_END_REASON},
+        exit_dead_end={},
+    )
+    assert plan.reconciles[0].outcome == "retry"
+    assert plan.reconciles[0].updates["attempts"] == 1
+
+
+def test_refused_still_wins_and_still_reads_as_refused():
+    """#1844's path must be untouched by #2019 sharing its branch. The two
+    exit codes are mutually exclusive by construction, but if both flags ever
+    arrive for one key the pre-dispatch wording is what shows."""
+    entries = [entry(1817, state=STATE_RUNNING, attempts=0)]
+    plan = plan_tick(
+        entries, board(), capacity=1,
+        exit_reasons={entry_key(REPO, 1817): REFUSAL},
+        exit_refused={entry_key(REPO, 1817): True},
+        exit_dead_end={entry_key(REPO, 1817): True},
+    )
+    assert plan.reconciles[0].outcome == "refused"
+    assert "pre-dispatch guard" in plan.blocked[0].reason
+
+
 # ── plan_tick: the startup grace window (#1794) ──────────────────────────────
 #
 # 2026-08-03, the first unattended run of the #1756 timer: a tick 40s after a

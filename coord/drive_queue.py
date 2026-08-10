@@ -592,6 +592,12 @@ class Reconcile:
     * ``refused``   — #1844: the drive's own exit was a PERMANENT pre-dispatch
       guard refusal (``coord.drive.EXIT_DISPATCH_REFUSED``).  Goes straight to
       ``blocked``; costs NO attempt — pairs with a :class:`Blocked`.
+    * ``dead_end``  — #2019: the drive's own exit was ``coord.drive.
+      EXIT_DEAD_END`` — its dead-end predicate found the row terminal and
+      unactionable (nothing active, every stage terminal, no gate transition
+      available).  Same disposition as ``refused`` (straight to ``blocked``,
+      NO attempt spent, pairs with a :class:`Blocked`); a distinct outcome
+      only so the journal line names the right cause.
     * ``parked``    — #1891: no session, no active work, nothing landed — same
       evidence as ``retry`` — but the board's OWN current read of this
       entry's merge gate names nothing stronger than "CI checks have not
@@ -946,6 +952,7 @@ def _reconcile_running(
     local_host: str | None = None,
     exit_reasons: Mapping[str, str] | None = None,
     exit_refused: Mapping[str, bool] | None = None,
+    exit_dead_end: Mapping[str, bool] | None = None,
 ) -> tuple[Reconcile, Blocked | None]:
     """Resolve one ``running`` entry against the board.
 
@@ -958,8 +965,11 @@ def _reconcile_running(
       watching keep running on the fleet (#1660).  Such an entry has no tmux
       session and no merge yet — counting it as free is exactly the 2026-08-01
       incident, where five expired drives were each stacked on top of.
-    * ``refused`` is #1844: a drive that exited on a PERMANENT pre-dispatch
-      guard refusal is definitively finished — checked right after ``held``,
+    * ``refused``/``dead_end`` are #1844/#2019: a drive that exited on a
+      PERMANENT pre-dispatch guard refusal — or, since #2019, on a
+      terminal-and-unactionable board row — is definitively finished for this
+      launch.  Both share one branch below; only the wording differs.
+      Checked right after ``held``,
       BEFORE the #1870 cross-host guard and the #1794 startup grace window,
       because this evidence (the drive's own audit trail, scoped to this
       exact launch) is stronger than anything a local tmux read or the
@@ -1008,7 +1018,20 @@ def _reconcile_running(
     with ``exit_refused=True`` goes straight to ``blocked`` (the ``refused``
     branch above), attempts untouched, on the FIRST tick that observes it —
     never ``retry``, because nothing about waiting and relaunching can change
-    a condition a retry cannot affect. Every other exit reason — present or
+    a condition a retry cannot affect.
+
+    *exit_dead_end* (#2019) is the SAME contract for a second permanent cause:
+    ``True`` when the exit carried ``coord.drive.EXIT_DEAD_END`` — the drive's
+    own dead-end predicate (``coord.dead_end.detect_dead_end``) found the row
+    terminal and unactionable, with nothing active on the fleet and no gate
+    transition available. Relaunching a drive against an unchanged dead-end
+    row reproduces the dead end exactly, so it too blocks without spending an
+    attempt; only the reason wording differs from ``exit_refused``'s. Before
+    #2019 this shape did not even reach here — the drive never exited, it
+    counted ``no state change`` against a held tmux session, a held queue slot
+    and (since #1972) a whole repo's capacity lane for 140 minutes.
+
+    Every other exit reason — present or
     absent, refused or not — only ever changes the WORDING below; whether the
     entry gets another attempt is otherwise unaffected by #1845/#1844 (still
     ``retry`` until ``max_attempts``, still ``exhausted`` → ``blocked`` after).
@@ -1071,19 +1094,40 @@ def _reconcile_running(
     # before exhausting to `blocked` anyway. So this goes straight to
     # `blocked`, WITHOUT incrementing `attempts` — there was never anything
     # to retry.
+    #
+    # #2019 rides the SAME branch with a second cause: `exit_dead_end`. The
+    # evidence is identically strong (the drive's own audit trail, this launch,
+    # naming its own exit code) and the conclusion is identical (relaunching
+    # against an unchanged row reproduces the outcome exactly), so only the
+    # wording and the reported outcome differ. `exit_refused` is checked FIRST
+    # purely for stability — the two codes are mutually exclusive by
+    # construction (`_drive_exit_summary` records exactly one), so the order
+    # is never actually load-bearing.
     own_reason = (exit_reasons or {}).get(entry.key)
+    permanent: tuple[str, str] | None = None
     if own_reason and (exit_refused or {}).get(entry.key):
-        reason = (
-            f"{own_reason} — refused by a pre-dispatch guard, which cannot "
-            "change on retry (#1844); blocking without spending an attempt"
+        permanent = (
+            "refused",
+            "refused by a pre-dispatch guard, which cannot change on retry "
+            "(#1844); blocking without spending an attempt",
         )
+    elif own_reason and (exit_dead_end or {}).get(entry.key):
+        permanent = (
+            "dead_end",
+            "the board row is terminal and unactionable (nothing active, no "
+            "gate transition available), which cannot change on retry "
+            "(#2019); blocking without spending an attempt",
+        )
+    if permanent is not None:
+        outcome, explanation = permanent
+        reason = f"{own_reason} — {explanation}"
         # `Reconcile.updates` is deliberately EMPTY, same as `exhausted`
         # below — the paired `Blocked` carries every write, applied once by
         # `TickPlan.writes()`. `attempts` is absent from BOTH: there is
         # nothing to spend, unlike `exhausted`'s Blocked which stamps the
         # final attempt count.
         return (
-            Reconcile(entry.key, "refused", reason, occupies=False),
+            Reconcile(entry.key, outcome, reason, occupies=False),
             Blocked(
                 entry.key,
                 reason,
@@ -1415,6 +1459,7 @@ def plan_tick(
     local_host: str | None = None,
     exit_reasons: Mapping[str, str] | None = None,
     exit_refused: Mapping[str, bool] | None = None,
+    exit_dead_end: Mapping[str, bool] | None = None,
 ) -> TickPlan:
     """Decide one tick.  Pure; the caller executes the returned plan.
 
@@ -1449,6 +1494,12 @@ def plan_tick(
     *exit_reasons*, this DOES change the decision: such an entry reconciles
     straight to ``blocked`` with ``attempts`` unchanged, never ``retry`` —
     see :func:`_reconcile_running`'s ``refused`` branch.
+
+    *exit_dead_end* is the #2019 twin: ``True`` when the exit was
+    ``coord.drive.EXIT_DEAD_END`` (the row was terminal and unactionable).
+    Same disposition, same branch, different wording — a relaunch against an
+    unchanged dead-end row reproduces the dead end exactly, so it too costs no
+    attempt.
 
     *now* is the shell's ``time.time()``, passed in rather than read here (see
     the module docstring).  It powers #1794's startup grace window on both
@@ -1545,6 +1596,7 @@ def plan_tick(
             local_host=local_host,
             exit_reasons=exit_reasons,
             exit_refused=exit_refused,
+            exit_dead_end=exit_dead_end,
         )
         reconciles.append(reconcile)
         if reconcile.occupies:

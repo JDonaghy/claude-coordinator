@@ -34,6 +34,7 @@ import pytest
 
 from coord.config import Config, ProviderDef, ProvidersConfig, UsageGateConfig
 from coord.drive import (
+    EXIT_DEAD_END,
     EXIT_DEADLINE,
     EXIT_DISPATCH_REFUSED,
     EXIT_ESCALATED,
@@ -1295,6 +1296,166 @@ def test_a_review_that_finished_with_no_verdict_is_terminal():
     action = step(work_tested(review_aid="r1", work_review_state="done"))
     assert action.is_exit
     assert "NO verdict" in action.message
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# the dead-end predicate (#2019)
+#
+# `coord drive` could not tell "still working" from "finished in a state I
+# cannot act on". Both rendered as `no state change`, and the second looped
+# forever. claude-coordinator#1956, 2026-08-08: 140 minutes of a live drive
+# session, a held queue slot and a held per-repo capacity slot (#1972),
+# producing nothing, with `active=0` printed on every single line.
+#
+# WHY the pre-existing "review finished with no verdict" die above did not
+# catch it: it keys on `work_review_state` — the WORK row's projected
+# `review_state` — while the incident's board line read `review=done/-`,
+# which is `review_status`, the REVIEW row's own status. Advancing the work
+# row's `review_state` is exactly what recording a verdict does, so on the
+# one board shape where the verdict is missing, the field the die reads is
+# guaranteed to be stale. Two readings of "the review is done"; only one was
+# ever checked.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def test_a_terminal_review_with_no_verdict_escalates_instead_of_looping():
+    """#2019 acceptance: "a board state of work=done test=passed
+    review=done/verdict=None drives to escalation, not to a `no state change`
+    loop", and "exits non-zero within one poll rather than looping".
+
+    This is the #1956 incident state, verbatim, in ONE decide() call.
+    """
+    action = step(
+        work_tested(review_aid="c9b489b2333e", review_status="done", review_verdict="")
+    )
+    assert action.is_exit
+    assert action.exit_code == EXIT_DEAD_END
+    # Distinguishable from a crash (1) and from a #1844 guard refusal (5) by
+    # the exit code alone — that code is the only thing `drive_queue`'s tick
+    # can read once the process is gone.
+    assert action.exit_code not in (EXIT_TERMINAL_FAILURE, EXIT_DISPATCH_REFUSED)
+
+
+def test_the_dead_end_message_names_the_dead_end_and_the_recovery_command():
+    """#2019 ask 3. `no state change in 140.558m` is not actionable; the
+    documented `coord report-result` relay is. And the reason must not send an
+    operator to CLOSED #812 for a headless review that ran to completion."""
+    action = step(
+        work_tested(review_aid="c9b489b2333e", review_status="done", review_verdict="")
+    )
+    assert "review_terminal_no_verdict" in action.message
+    assert "coord report-result --assignment c9b489b2333e" in action.message
+    assert "--verdict-source recovered" in action.message
+    assert "#812" not in action.message
+    assert "no state change" not in action.message
+
+
+def test_the_dead_end_records_a_board_visible_escalation_through_the_cli():
+    """Same contract every other board mutation in this module honours: the
+    write goes out as a `coord` subcommand argv (run by `_loop`'s exit
+    handling), never a direct internal call. Without it the reason dies with
+    the tmux pane — which is exactly how the 2026-07-27/28 run produced three
+    unexplained deaths (#1526)."""
+    action = step(
+        work_tested(review_aid="c9b489b2333e", review_status="done", review_verdict="")
+    )
+    assert action.command[:4] == ("escalate", "record", REPO, str(ISSUE))
+    assert "--stage" in action.command
+    assert action.command[action.command.index("--stage") + 1] == "review"
+    proposed = action.command[action.command.index("--command") + 1]
+    assert proposed.startswith("coord report-result --assignment c9b489b2333e")
+    assert action.command[action.command.index("--assignment") + 1] == "c9b489b2333e"
+
+
+def test_a_long_running_stage_never_dead_ends_however_long_it_runs():
+    """#2019 acceptance: "a genuinely long-running work stage (active=1) does
+    NOT escalate, however long it runs."
+
+    "However long" is enforced structurally rather than by a threshold: the
+    predicate takes no clock at all (ask 4 — elapsed time must NOT be the
+    trigger), so this is byte-for-byte the same call on poll 1 and poll
+    10,000. The state is otherwise the full #1956 dead-end shape, so
+    `active_count` is carrying the whole decision.
+    """
+    s = work_tested(
+        review_aid="c9b489b2333e",
+        review_status="done",
+        review_verdict="",
+        active_count=1,
+        active_types=("work",),
+    )
+    for _ in range(3):  # identical result, poll after poll after poll
+        action = step(s)
+        assert action.kind == WAIT
+        assert action.exit_code == 0
+
+
+def test_a_failed_review_worker_is_still_retried_not_dead_ended():
+    """Blast-radius bar. #1584's bounded `coord review` re-dispatch is a move
+    that genuinely can succeed; a dead end must never steal it."""
+    action = step(
+        work_tested(
+            review_aid="r1", review_status="failed",
+            review_failure_reason="529 Overloaded",
+        ),
+        DriveOptions(machine="precision", max_work_retries=1),
+    )
+    assert action.kind == RUN
+    assert action.command == ("review", "w1")
+
+
+def test_a_blocked_test_stage_escalates_instead_of_warning_every_poll():
+    """#1672 stamps `test_state="blocked"` when no capability-matched machine
+    could run the suite, then deliberately never re-probes. Before #2019 this
+    fell through `_decide_test` to a bare WAIT carrying an "unexpected
+    test_state" warning — a spin with a note attached."""
+    action = step(
+        done_work(
+            work_test_state="blocked",
+            work_test_reason="no machine advertises capability 'gtk'",
+        )
+    )
+    assert action.is_exit
+    assert action.exit_code == EXIT_DEAD_END
+    assert "test_stage_blocked" in action.message
+    assert f"coord diagnose {REPO} {ISSUE} --stage test --reset" in action.message
+
+
+def test_a_dead_end_exit_code_reaches_the_drive_exited_audit_row(
+    driver_factory, monkeypatch, coord_db,
+):
+    """The end-to-end seam, through `Driver.run()`'s audit boundary (#1499).
+
+    `details.exit_code == EXIT_DEAD_END` is the ONE fact
+    `coord/commands/drive_queue.py`'s `_fetch_exit_reasons` reads to block the
+    queue entry without spending an attempt — everything else about the run
+    is gone by the time the tick looks.
+    """
+    monkeypatch.setattr(
+        "coord.drive.Driver._post_escalation_comment", lambda *a, **kw: None
+    )
+    payload = board(status="done", test_state="passed")
+    payload["assignments"].append({
+        "repo_name": REPO,
+        "issue_number": ISSUE,
+        "type": "review",
+        "assignment_id": "c9b489b2333e",
+        "review_of_assignment_id": "w1",
+        "dispatched_at": 2.0,
+        "status": "done",
+        "review_verdict": None,
+    })
+    driver = driver_factory([payload])
+    assert driver.run() == EXIT_DEAD_END
+
+    rows = _drive_audit_rows(coord_db)
+    assert [r["event_type"] for r in rows] == ["drive_started", "drive_exited"]
+    details = json.loads(rows[1]["details_json"])
+    assert details["exit_code"] == EXIT_DEAD_END
+    assert "review_terminal_no_verdict" in rows[1]["summary"]
+    # ...and the board-visible escalation went out as a `coord` argv, once.
+    escalations = [c for c in driver.recorded if c[1:3] == ["escalate", "record"]]
+    assert len(escalations) == 1
 
 
 def test_a_review_worker_that_died_retries_through_the_cli_then_stops_at_the_cap():

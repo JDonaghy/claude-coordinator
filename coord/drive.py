@@ -100,6 +100,7 @@ from coord.interactive import (
     tmux_available,
     tmux_session_alive,
 )
+from coord.dead_end import DeadEnd, detect_dead_end
 from coord.failure_class import classify_failure, plan_usage_limit_resume
 from coord.usage_limits import PlanLimits, evaluate_usage_gate, get_plan_limits
 # Lost in the #1584-onto-#1590 rebase: _decide_review() calls this, but the
@@ -154,6 +155,18 @@ EXIT_ESCALATED = 4
 # actionable refusals were retried and exhausted as "drive session died",
 # discarding the guard's own remedy in the process.
 EXIT_DISPATCH_REFUSED = 5
+# #2019: the row is TERMINAL AND UNACTIONABLE — every stage finished, nothing
+# is active on the fleet, and no gate transition is available to any amount of
+# polling. Same *class* as EXIT_DISPATCH_REFUSED above (a condition retrying
+# cannot change) but a different *cause*: nothing refused a dispatch here;
+# the board simply came to rest in a shape with no legal move. Kept distinct
+# so `coord/drive_queue.py`'s tick can block the entry with the RIGHT reason
+# rather than the pre-dispatch-guard wording, and so an operator reading an
+# exit code alone can tell "a guard said no" from "the pipeline dead-ended".
+# See `coord.dead_end.detect_dead_end` for what qualifies, and #1956 /
+# vimcode#635 for the two live incidents (140 minutes and ~25 minutes of a
+# held queue slot, respectively, producing nothing).
+EXIT_DEAD_END = 6
 
 
 class DriveError(Exception):
@@ -825,6 +838,55 @@ def preflight(
 # ── the state machine (pure) ─────────────────────────────────────────────────
 
 
+def _escalate_dead_end(state: IssueState, dead_end: DeadEnd) -> Action:
+    """Build the EXIT action for a terminal-and-unactionable row (#2019).
+
+    Structurally identical to :func:`_escalate_merge` — same ``coord escalate
+    record`` argv, same "this function stays pure, the write happens in
+    :meth:`Driver._loop`'s exit handling" split — because the operator-facing
+    outcome is the same: a board-visible record naming the blocker and the
+    command that clears it, instead of a counter ticking against an event that
+    can never happen.
+
+    The exit code is what differs.  :data:`EXIT_ESCALATED` means "a human
+    decision is waiting"; :data:`EXIT_DEAD_END` additionally means "and no
+    relaunch of this drive can change it", which is the fact
+    ``coord/drive_queue.py``'s tick needs to block the entry WITHOUT spending
+    an attempt (the #1844 posture, applied to a second cause).
+    """
+    gates_summary = " | ".join(f"{k}={v}" for k, v in dead_end.gates)
+
+    command: list[str] = [
+        "escalate", "record", state.repo, str(state.issue),
+        "--stage", dead_end.stage,
+        "--reason", f"{dead_end.kind}: {dead_end.reason}",
+    ]
+    for key, value in dead_end.gates:
+        command += ["--gate", f"{key}={value}"]
+    command += ["--command", dead_end.recovery]
+    if dead_end.assignment_id:
+        command += ["--assignment", dead_end.assignment_id]
+
+    return Action(
+        kind=EXIT,
+        exit_code=EXIT_DEAD_END,
+        message=(
+            f"DEAD END [{dead_end.kind}] — this row is terminal and "
+            "unactionable; exiting instead of polling (#2019).\n"
+            f"   {dead_end.reason}\n"
+            f"   gates: {gates_summary}\n"
+            f"   Recover: {dead_end.recovery}\n"
+            f"   Recorded on the board — see: coord escalate list --repo "
+            f"{state.repo}"
+        ),
+        command=tuple(command),
+        error_message=(
+            "failed to record the dead-end escalation on the board (exiting "
+            f"anyway — resolve by hand: {dead_end.recovery})"
+        ),
+    )
+
+
 def decide(
     state: IssueState,
     opts: DriveOptions,
@@ -979,6 +1041,28 @@ def decide(
             "(0-commit advisory).\n"
             f"   inspect: coord log {state.work_aid} --machine "
             f"{state.work_machine or machine}"
+        )
+
+    # ---- the dead-end predicate (#2019) ------------------------------------
+    #
+    # Positioned HERE — after the merged/active/work-status arms above have
+    # all had their say, before the Test and Review gates — on purpose:
+    #
+    #  * everything above it is either terminal-and-already-reported (merged,
+    #    cancelled, an unexpected status) or genuinely actionable (a bounded
+    #    work retry, a usage-limit wait, an advisory), so the predicate can
+    #    never steal a live move from them;
+    #  * everything below it is a gate that, on the shapes the predicate
+    #    recognises, would return a bare `_wait()` and spin — which is the
+    #    entire bug (#1956: 140 minutes of `no state change`, with `active=0`
+    #    printed on every line).
+    #
+    # `detect_dead_end` itself refuses to fire while `active_count > 0`, so a
+    # healthy long-running stage is structurally incapable of reaching this.
+    dead_end = detect_dead_end(state)
+    if dead_end is not None:
+        return replace(
+            _escalate_dead_end(state, dead_end), warnings=warnings
         )
 
     test = _decide_test(state, opts, counters, machine)
@@ -2604,7 +2688,11 @@ class Driver:
                 # operator thinks to run `coord escalate list`). This is what
                 # turned "drive died without closing the issue" into three
                 # unexplained deaths during the 2026-07-27/28 overnight run.
-                if action.exit_code == EXIT_ESCALATED:
+                # #2019 rides the same rail: a dead end is exactly the
+                # "nobody is coming" case this comment exists for, and the
+                # tmux pane it would otherwise be trapped in dies with the
+                # session.
+                if action.exit_code in (EXIT_ESCALATED, EXIT_DEAD_END):
                     self._post_escalation_comment(state, action.message)
                 if action.exit_code == EXIT_OK:
                     for line in action.message.splitlines():
