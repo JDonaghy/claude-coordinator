@@ -12810,6 +12810,71 @@
     }
 
     #[test]
+    fn drain_sse_watch_not_found_is_terminal_not_a_lost_connection() {
+        // #2064: a 404 on connect (no log for this assignment, and never
+        // will be — e.g. a terminal `chat`/advisory row) must be latched
+        // done WITHOUT bumping fail_count, so it can never satisfy the
+        // `eligible_for_retry` check (which requires fail_count >= 3) and
+        // therefore never re-enters the reconnect/backoff loop that used to
+        // re-raise "SSE stream error" forever.
+        let mut app = make_app_default();
+        let (state, tx) = make_sse_state_pair();
+        install_watch_ctx(&mut app, state);
+
+        tx.send(SseWatchMsg::NotFound).unwrap();
+        let changed = app.drain_sse_watch();
+        assert!(changed);
+
+        let sse = &app.watch_pool[TEST_AID].sse;
+        assert!(sse.done, "NotFound should latch the stream done");
+        assert_eq!(
+            sse.fail_count, 0,
+            "NotFound must not be counted as a connection failure"
+        );
+
+        // Exactly one toast, and it must NOT be the misleading
+        // "SSE stream error" / "lost connection" framing — this isn't a
+        // dropped link, and pressing R can't fix it.
+        assert_eq!(app.toasts.len(), 1, "should push exactly one toast");
+        let (toast, _, severity) = &app.toasts[0];
+        assert_eq!(*severity, ToastSeverity::Info);
+        assert_ne!(toast.title, "SSE stream error");
+        assert!(!toast.body.to_lowercase().contains("lost connection"));
+        assert!(!toast.body.to_lowercase().contains("press r"));
+    }
+
+    #[test]
+    fn drain_sse_watch_not_found_never_retoasts_on_later_ticks() {
+        // Once latched terminal by a NotFound, later drain ticks must be
+        // silent no-ops forever — not just "no crash," but literally no new
+        // toast — since `fail_count` stays 0 and `eligible_for_retry`
+        // (fail_count >= 3) can never become true again.
+        let mut app = make_app_default();
+        let (state, tx) = make_sse_state_pair();
+        install_watch_ctx(&mut app, state);
+
+        tx.send(SseWatchMsg::NotFound).unwrap();
+        assert!(app.drain_sse_watch());
+        assert_eq!(app.toasts.len(), 1);
+
+        // Simulate the passage of way more than the retry backoff window —
+        // this is exactly the scenario that used to loop the "lost
+        // connection" toast forever.
+        if let Some(ctx) = app.watch_pool.get_mut(TEST_AID) {
+            ctx.sse.first_fail_at = Some(Instant::now() - Duration::from_secs(3600));
+        }
+
+        let changed = app.drain_pool_entry(TEST_AID);
+        assert!(!changed, "a terminal NotFound stream must stay quiet");
+        assert_eq!(
+            app.toasts.len(),
+            1,
+            "no additional toast should ever be pushed"
+        );
+        assert!(app.watch_pool[TEST_AID].sse.done);
+    }
+
+    #[test]
     fn close_watch_clears_focus_but_keeps_pool() {
         // close_watch() should clear watch_focused (hiding the overlay) but
         // leave the pool entry alive so background accumulation continues.

@@ -1264,6 +1264,7 @@ impl CoordApp {
         let mut got_new = false;
         let mut needs_reconnect = false;
         let mut fail_limit_hit = false;
+        let mut not_found = false;
 
         // First pass: drain all pending messages while we hold a mutable ref.
         if let Some(ctx) = self.watch_pool.get_mut(id) {
@@ -1410,6 +1411,22 @@ impl CoordApp {
                             got_new = true;
                             break;
                         }
+                        SseWatchMsg::NotFound => {
+                            // #2064: the agent has no log for this assignment
+                            // and never will — a 404 on connect, not a
+                            // dropped link. Latch done *without* touching
+                            // fail_count/first_fail_at, so the `sse.done`
+                            // branch's `eligible_for_retry` check above
+                            // (which requires `fail_count >= 3`) never fires
+                            // and this stream just goes quiet for good,
+                            // instead of re-raising "lost connection" forever.
+                            sse.lines.push("[no log for this row]".to_string());
+                            sse.line_times.push(Instant::now());
+                            sse.done = true;
+                            not_found = true;
+                            got_new = true;
+                            break;
+                        }
                         SseWatchMsg::Heartbeat => {
                             // No-op: the thread just confirmed the channel is alive.
                         }
@@ -1437,6 +1454,18 @@ impl CoordApp {
                 format!("Lost SSE connection 3× in 10 s — retrying in {retry_secs}s")
             };
             self.push_toast("SSE stream error", &msg, ToastSeverity::Error);
+        } else if not_found {
+            // #2064: terminal, not a connection problem — say the true thing
+            // once at info severity instead of an error toast that would
+            // otherwise recur every backoff cycle forever (fail_count never
+            // reaches the retry-eligible threshold, so this branch only runs
+            // on the single tick the `NotFound` message arrives).
+            let issue_num = self.watch_pool.get(id).map(|ctx| ctx.state.issue_number);
+            let msg = match issue_num {
+                Some(n) => format!("#{n} has no log to stream — nothing to watch here"),
+                None => "No log to stream for this row".to_string(),
+            };
+            self.push_toast("No log for this row", &msg, ToastSeverity::Info);
         } else if needs_reconnect {
             // Clone what we need before taking a new mutable borrow.
             let (host, last_id) = match self.watch_pool.get(id) {
