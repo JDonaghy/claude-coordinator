@@ -446,16 +446,19 @@ def _merge_entry(
     """Merge state for (*repo*, *issue*): the plan entry, cross-checked
     against the raw queue row.
 
-    #2079: pass *assignment_id* to match on the queue entry's own
-    ``assignment_id`` instead of on ``issue_number``. That is the right key —
-    and (repo, issue) the wrong one — for the oracle-mode JIT acceptance
-    slice: its assignment row's ``issue_number`` is the milestone's TRACKING
-    issue (#1171/#1138), which routinely carries queue entries belonging to
-    OTHER rows (the Gate-A mock, a sibling member issue's slice). Matching on
-    the issue there would hand the driver a stranger's merge status.
-
     Matched on (repo, issue) rather than assignment id on purpose: the
     enqueued entry may be keyed to an earlier work row in a fix chain.
+
+    #2079: *assignment_id* overrides that, matching the queue entry's own
+    ``assignment_id`` instead. It is the right key — and (repo, issue) the
+    wrong one — for exactly one caller, the oracle-mode JIT acceptance
+    slice: that row's ``issue_number`` is the milestone's TRACKING issue
+    (#1171/#1138), which routinely carries queue entries belonging to OTHER
+    rows (the Gate-A mock, a sibling member issue's slice), so matching on
+    the issue would hand the driver a stranger's merge status. The fix-chain
+    concern above does not apply, because the caller resolves the slice row
+    with ``_latest`` — it is already looking at the newest aid, which is the
+    one ``enqueue_approved_work`` re-keys the entry to.
 
     #1505 review fix: ``merge_queue.plan()``'s ``_state_to_plan_status``
     deliberately collapses CONFLICT, HUMAN_REQUIRED, and SKIPPED into a
@@ -482,6 +485,7 @@ def _merge_entry(
     escalation record's proposed ``gh pr merge`` command still gets a PR
     number on a normal daemon-backed board.
     """
+
     def _matches(entry: dict) -> bool:
         if entry.get("repo_name") != repo:
             return False
