@@ -44460,24 +44460,46 @@ Milestone tracking issue.
         // asserts the NEW contract instead of the old one, the same way a
         // source-inspection guard should move when the constraint it
         // guarded is retired, not just get deleted.
+        //
+        // The literal itself sets `h_scroll: 0.0` as a placeholder — the
+        // real value is assigned just below the literal, AFTER a clamp
+        // against this frame's freshly-probed layout (the resize self-heal
+        // fix; see `queue_clamp_h_scroll` and its call site's doc comment).
+        // So this test widens its window past the closing `};` to also
+        // cover that assignment, rather than looking inside the literal.
         let src = include_str!("drive_queue.rs");
-        let grid = src
+        let after_grid = src
             .split("id: WidgetId::new(\"queue-grid\")")
             .nth(1)
             .expect("the Queue grid's DataTable literal must exist");
-        let table = grid.split("};").next().unwrap_or(grid);
+        let window = after_grid
+            .split("backend.draw_data_table(list_rect, &table, None)")
+            .next()
+            .unwrap_or(after_grid);
         assert!(
-            table.contains("h_scroll: self.queue_h_scroll"),
-            "#2043: the Queue grid's `h_scroll` must be driven by \
-             `self.queue_h_scroll`, not pinned at 0.0 — quadraui#550 made \
-             this safe:\n{table}"
+            window.contains("h_scroll: 0.0,"),
+            "#2043: the Queue grid's `DataTable` literal must set \
+             `h_scroll` to a placeholder that gets overwritten below \
+             (never a live, unclamped value baked straight into the \
+             literal):\n{window}"
         );
         assert!(
-            table.contains("min_total_width: Some(Self::QUEUE_MIN_WIDTH_CHARS"),
+            window.contains("table.h_scroll = clamped_h_scroll")
+                && window.contains("Self::queue_clamp_h_scroll(self.queue_h_scroll.get()"),
+            "#2043: the Queue grid's real `h_scroll` must be assigned AFTER \
+             the literal, from `queue_clamp_h_scroll` — never pinned at 0.0 \
+             (quadraui#550 made driving it safe) and never fed the raw, \
+             unclamped `self.queue_h_scroll` straight into the paint (a \
+             stale offset from before a resize back above \
+             `QUEUE_MIN_WIDTH_CHARS` must not go on shifting the grid with \
+             no scrollbar left to click to fix it):\n{window}"
+        );
+        assert!(
+            window.contains("min_total_width: Some(Self::QUEUE_MIN_WIDTH_CHARS"),
             "#2043: the Queue grid must set a `min_total_width` floor \
              (`QUEUE_MIN_WIDTH_CHARS`) rather than `None` — below it the \
              grid must scroll horizontally instead of squeezing columns \
-             to uselessness:\n{table}"
+             to uselessness:\n{window}"
         );
     }
 
