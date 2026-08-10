@@ -1483,6 +1483,13 @@ class InteractiveFinalizeResult:
             configured globs, which is exactly the silent-failure mode the
             issue's fix items #2/#3 asked to stop hiding — callers should
             treat ``0`` as worth a warning, not as "nothing happened".
+        test_verdict_recovered: ``"passed"`` / ``"failed"`` when the #1351
+            Test transcript-floor recovered a ``TEST_VERDICT:`` block and
+            recorded it on the WORK row (only possible when the caller
+            passed ``smoke_of``). ``None`` when no ``smoke_of`` was given,
+            the work row already had a verdict, or nothing was recovered —
+            the operator-prompt backstop (`_prompt_and_relay_test_verdict`)
+            is still the ultimate fallback in every one of those cases.
     """
 
     terminal_status: str
@@ -1502,6 +1509,7 @@ class InteractiveFinalizeResult:
     smoke_restored_paths: list[str] = field(default_factory=list)
     smoke_restore_error: str | None = field(default=None)
     artifacts_stashed: int | None = field(default=None)
+    test_verdict_recovered: str | None = field(default=None)
 
 
 def _git_push(wt_path: Path, *, timeout: float = 60.0) -> tuple[bool, str | None]:
@@ -2309,6 +2317,218 @@ def _review_findings_from_transcript(
     return None
 
 
+def _fetch_remote_test_verdict(
+    issue_number: int,
+    cutoff: float,
+    ssh_target: str,
+    *,
+    assignment_id: str,
+    timeout: float = 30.0,
+):
+    """Remote twin of the Test transcript-floor (#1351): parse the
+    ``TEST_VERDICT:`` block from the Claude transcript on the SESSION'S OWN
+    host.
+
+    Mirrors :func:`_fetch_remote_review_findings` exactly — same ssh listing
+    (newest-first, active at/after *cutoff*, no early break per #619), same
+    cat-back-to-a-tempfile-then-parse shape. Uses
+    :func:`coord.review.parse_test_verdict_from_log` instead of
+    ``parse_review_from_log``, and gates on THIS smoke session's own
+    *assignment_id* — embedded verbatim in the smoke briefing's
+    ``[Coordinator smoke assignment <id>]`` header (see
+    ``_smoke_report_reminder`` in ``coord/commands/dispatch_workers.py``) —
+    plus the issue number, the same #989 double-gate the review floor uses.
+    Returns the first ``TestVerdictFindings`` that parses AND passes both
+    gates, or ``None``.
+    """
+    from coord.review import parse_test_verdict_from_log  # noqa: PLC0415
+
+    list_cmd = (
+        'find "$HOME/.claude/projects" -maxdepth 2 -name "*.jsonl" '
+        r"-printf '%T@\t%p\n' 2>/dev/null | sort -rn | head -200"
+    )
+    try:
+        listing = subprocess.run(
+            ["ssh", *_SSH_MUX_OPTS, ssh_target, list_cmd],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if listing.returncode != 0:
+        return None
+
+    candidates: list[str] = []
+    for raw in (listing.stdout or "").splitlines():
+        if "\t" not in raw:
+            continue
+        mtime_s, path = raw.split("\t", 1)
+        try:
+            mtime = float(mtime_s)
+        except ValueError:
+            continue
+        path = path.strip()
+        if path and mtime >= cutoff:
+            candidates.append(path)
+
+    for remote_path in candidates:
+        try:
+            cat = subprocess.run(
+                ["ssh", *_SSH_MUX_OPTS, ssh_target, f"cat {shlex.quote(remote_path)}"],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except (subprocess.SubprocessError, OSError):
+            continue
+        if cat.returncode != 0 or not cat.stdout:
+            continue
+        tmp_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w", suffix=".jsonl", delete=False, encoding="utf-8"
+            ) as tf:
+                tf.write(cat.stdout)
+                tmp_path = Path(tf.name)
+            findings = parse_test_verdict_from_log(tmp_path)
+        finally:
+            if tmp_path is not None:
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+        if (
+            findings is not None
+            and _transcript_names_issue(cat.stdout, issue_number)
+            and _transcript_names_assignment(cat.stdout, assignment_id)
+        ):
+            return findings
+    return None
+
+
+def _test_verdict_from_transcript(
+    issue_number: int,
+    started_at: float | None,
+    *,
+    assignment_id: str,
+    projects_dir: Path | None = None,
+    ssh_target: str | None = None,
+):
+    """Recover a human-attended Test session's verdict from the Claude
+    session transcript — the Test-gate twin of the #606 review
+    transcript-floor (#1351).
+
+    A Test (smoke) session's only channel back to the board was, before
+    this, ``coord test --passed|--fail`` running successfully inside the
+    session — no structured block, no transcript floor, no fallback (unlike
+    a review, which has had the #606/#651 ``REVIEW_VERDICT`` treatment all
+    along). This recovers the same class of durable, PATH-independent
+    verdict for the Test gate: it parses the most-recent transcript(s)
+    active during this session for a ``TEST_VERDICT:``/``TEST_REASON:``/
+    ``END_TEST`` block via :func:`coord.review.parse_test_verdict_from_log`,
+    gated on this exact smoke session's *assignment_id* AND the issue number
+    — the same #989 double-gate :func:`_review_findings_from_transcript`
+    uses, for the same reason (a sibling issue's transcript can legitimately
+    name this issue number in prose; only the assignment id, a fresh
+    ``uuid4().hex[:12]`` embedded in the smoke briefing's own header, can't).
+
+    Returns the parsed :class:`coord.review.TestVerdictFindings` or ``None``.
+    **The caller is responsible for recording the result against the WORK
+    assignment id** (``smoke_of`` / ``review_of_assignment_id``), never this
+    session's own row — this function only locates and parses the
+    transcript, gated on the SESSION's own id, not the work id. See
+    :func:`finalize_interactive_exit`'s ``smoke_of`` parameter, which follows
+    the same rule :func:`coord.commands.review._prompt_and_relay_test_verdict`
+    already does for its own (later, operator-prompt) backstop.
+    """
+    from coord.review import parse_test_verdict_from_log  # noqa: PLC0415
+
+    if started_at is None:
+        return None
+    cutoff = started_at - 5.0
+    if ssh_target is not None:
+        result = _fetch_remote_test_verdict(
+            issue_number, cutoff, ssh_target, assignment_id=assignment_id,
+        )
+        if result is None:
+            # One settle-and-retry, mirroring the review floor's #619 flush
+            # race guard.
+            time.sleep(2.0)
+            result = _fetch_remote_test_verdict(
+                issue_number, cutoff, ssh_target, assignment_id=assignment_id,
+            )
+        return result
+    base = projects_dir if projects_dir is not None else (Path.home() / ".claude" / "projects")
+    if not base.is_dir():
+        return None
+    candidates: list[tuple[float, Path]] = []
+    for p in base.glob("*/*.jsonl"):
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            continue
+        if mtime >= cutoff:
+            candidates.append((mtime, p))
+    candidates.sort(reverse=True)  # newest first — the just-exited session
+
+    for _mtime, p in candidates:
+        findings = parse_test_verdict_from_log(p)
+        if findings is None:
+            continue
+        try:
+            raw = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            raw = findings.reason
+        if _transcript_names_issue(raw, issue_number) and _transcript_names_assignment(
+            raw, assignment_id
+        ):
+            return findings
+    return None
+
+
+def _read_test_state(work_assignment_id: str) -> str | None:
+    """Best-effort read of ``test_state`` for *work_assignment_id* (#1351).
+
+    Point-lookup-first, mirroring the idempotency gate in
+    :func:`coord.commands.review._prompt_and_relay_test_verdict` (#1349): a
+    thin client hits the single-assignment endpoint rather than paying for
+    the full board collection just to read one field off one row. Returns
+    ``None`` on any read failure (transport, unknown id, pre-#1336 daemon) or
+    when no verdict is set — callers must treat that as "unknown, proceed"
+    since the write it guards is itself idempotent, not as confirmation that
+    no verdict exists.
+    """
+    try:
+        from coord.board_service import resolve as _resolve_bs  # noqa: PLC0415
+
+        svc = _resolve_bs()
+        if svc is not None:
+            from coord.client import fetch_assignment, fetch_board_payload  # noqa: PLC0415
+
+            row = fetch_assignment(svc, work_assignment_id)
+            if row is None:
+                payload = fetch_board_payload(svc)
+                row = next(
+                    (
+                        a for a in payload.get("assignments", [])
+                        if a.get("assignment_id") == work_assignment_id
+                    ),
+                    None,
+                )
+            if row is not None:
+                return (row.get("test_state") or "").strip() or None
+        else:
+            from coord.board_service import read_board as _read_board_ts  # noqa: PLC0415
+
+            work = _read_board_ts().find_by_id(work_assignment_id)
+            if work is not None:
+                return (work.test_state or "").strip() or None
+    except Exception:  # noqa: BLE001 — best-effort
+        pass
+    return None
+
+
 def _persist_interactive_tokens(
     assignment_id: str,
     started_at: float | None,
@@ -2361,6 +2581,7 @@ def finalize_interactive_exit(
     ssh_target: str | None = None,
     branch: str | None = None,
     smoke_repo_path: str | None = None,
+    smoke_of: str | None = None,
 ) -> InteractiveFinalizeResult:
     """Git-floor backstop for the interactive launcher exit path (#466).
 
@@ -2393,6 +2614,19 @@ def finalize_interactive_exit(
     FIRST, unconditionally, before any of the branches below — so it lands
     regardless of which one ultimately returns.  See
     :func:`restore_live_checkout_from_smoke_snapshot`.
+
+    *smoke_of* (#1351): the WORK assignment id a Test (smoke) session was
+    dispatched to validate (``review_of_assignment_id`` on the smoke row).
+    When given, the #1351 Test transcript-floor runs before the operator
+    prompt: it looks for a ``TEST_VERDICT:``/``TEST_REASON:``/``END_TEST``
+    block in THIS session's own transcript and, if found and the work row
+    has no verdict yet, records it on *smoke_of* — never on this session's
+    own ``assignment_id``. This is the Test-gate twin of the #606 review
+    transcript-floor below: a human-attended Test session's only channel
+    back to the board was, before this, a successful ``coord test
+    --passed|--fail`` run INSIDE the session, with no structured block, no
+    transcript floor, and no fallback if that command never ran (#1351).
+    ``None`` (every non-smoke caller) makes this an unconditional no-op.
     """
     _effective_patterns = list(artifact_paths or [])
 
@@ -2560,6 +2794,43 @@ def finalize_interactive_exit(
                 smoke_restore_error=_smoke_restore_error,
             )
 
+    # ── Test transcript-floor (#1351): durable Test-gate verdict capture ────
+    # Mirrors the review transcript-floor immediately above, but for the Test
+    # gate: a human-attended smoke session's ONLY channel back to the board
+    # was, before this, `coord test --passed|--fail` running successfully
+    # INSIDE the session — no structured block, no transcript floor, no
+    # fallback. Recover a TEST_VERDICT:/TEST_REASON:/END_TEST block from
+    # THIS session's own transcript and record it on the WORK row
+    # (`smoke_of`), never on this session's own `assignment_id` — the same
+    # rule `_prompt_and_relay_test_verdict` follows for its own (later)
+    # backstop. Runs BEFORE the operator prompt: that prompt's idempotency
+    # gate reads the exact `test_state` column this writes, so a verdict
+    # recovered here silently satisfies it — no double-prompt. Self-gating
+    # on `smoke_of`: every non-smoke caller passes `smoke_of=None` and this
+    # is a no-op, same as the review floor is a no-op for a work session
+    # whose transcript carries no REVIEW_VERDICT block.
+    _test_verdict_recorded: str | None = None
+    if smoke_of:
+        try:
+            _work_test_state = _read_test_state(smoke_of)
+            if not _work_test_state:
+                _tv = _test_verdict_from_transcript(
+                    issue_number, started_at, assignment_id=assignment_id,
+                    ssh_target=ssh_target,
+                )
+                if _tv is not None:
+                    from coord.state import record_test_verdict as _record_tv_floor  # noqa: PLC0415
+
+                    _record_tv_floor(
+                        assignment_id=smoke_of,
+                        test_state=_tv.verdict,
+                        test_reason=_tv.reason or None,
+                    )
+                    _test_verdict_recorded = _tv.verdict
+        except Exception:  # noqa: BLE001 — best-effort; the operator prompt
+            # backstop is still the ultimate fallback if this fails.
+            pass
+
     # worktree_path is None for a human-attended REVIEW (migration A1): the
     # review runs read-only in the LIVE checkout, so there is no session
     # worktree to push from, count commits in, or remove.  Guard every git
@@ -2699,6 +2970,7 @@ def finalize_interactive_exit(
         smoke_restored_paths=_smoke_restored,
         smoke_restore_error=_smoke_restore_error,
         artifacts_stashed=artifacts_stashed,
+        test_verdict_recovered=_test_verdict_recorded,
     )
 
 

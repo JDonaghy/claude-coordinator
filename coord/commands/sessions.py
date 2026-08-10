@@ -1350,7 +1350,21 @@ def reattach(assignment_id: str, config_path: Path) -> None:
                     # acts when a matching snapshot marker exists) — safe to
                     # pass unconditionally on the read-only/DB-only branch.
                     smoke_repo_path=remote_repo_sh,
+                    # #1351: only meaningful for a smoke session (it names
+                    # the WORK row the Test transcript-floor records
+                    # against) — a no-op (None) for every other type.
+                    smoke_of=(
+                        review_of_assignment_id_val
+                        if assignment_type_val == "smoke" else None
+                    ),
                 )
+                if fr2.test_verdict_recovered:
+                    click.echo(
+                        f"  test verdict {fr2.test_verdict_recovered!r} "
+                        "recovered from the remote session transcript and "
+                        f"recorded on the work assignment "
+                        f"{review_of_assignment_id_val} (#1351)"
+                    )
                 if fr2.smoke_restored_paths:
                     click.echo(
                         "  live checkout restored (#1256): reverted "
@@ -1463,7 +1477,21 @@ def reattach(assignment_id: str, config_path: Path) -> None:
                 # matching snapshot marker exists, which only smoke dispatch
                 # ever creates.
                 smoke_repo_path=repo_path_val,
+                # #1351: only meaningful for a smoke session (it names the
+                # WORK row the Test transcript-floor records against) — a
+                # no-op (None) for every other type.
+                smoke_of=(
+                    review_of_assignment_id_val
+                    if assignment_type_val == "smoke" else None
+                ),
             )
+            if finalize_result.test_verdict_recovered:
+                click.echo(
+                    f"  test verdict {finalize_result.test_verdict_recovered!r} "
+                    "recovered from the session transcript and recorded on "
+                    f"the work assignment {review_of_assignment_id_val} "
+                    "(#1351)"
+                )
             if finalize_result.smoke_restored_paths:
                 click.echo(
                     "  live checkout restored (#1256): reverted "

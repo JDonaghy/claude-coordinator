@@ -49,16 +49,21 @@ def _echo_artifact_stash(fr: object) -> None:
 
 
 def _smoke_report_reminder(*, assignment_id: str, smoke_of: str) -> str:
-    """The reporting contract prepended to an interactive smoke briefing (#1349).
+    """The reporting contract prepended to an interactive smoke briefing
+    (#1349, updated #1351).
 
-    Recording the verdict is the ONE artifact this session exists to produce,
-    and — unlike a review, which emits a transcript-recoverable
-    ``REVIEW_VERDICT`` block (#606/#651) — a test verdict has NO
-    PATH-independent fallback channel. If ``coord test`` never runs, or runs
-    and fails, the verdict is simply lost and the operator is re-prompted on
-    exit for something the agent was dispatched to do. So the contract is
-    stated as a terminal obligation, and the agent is required to CONFIRM the
-    command succeeded rather than assume it did.
+    Recording the verdict is the ONE artifact this session exists to produce.
+    Until #1351, a test verdict had NO PATH-independent fallback channel — a
+    review has always had one (the transcript-recoverable ``REVIEW_VERDICT``
+    block, #606/#651): if ``coord test`` never ran, or ran and failed, the
+    verdict was simply lost and the operator was re-prompted on exit for
+    something the agent was dispatched to do. #1351 closes that gap by giving
+    the Test gate the same two-channel contract a review has always had: a
+    PRIMARY fast path (``coord test``, written straight to the board) plus a
+    BACKUP structured block (``TEST_VERDICT:``/``TEST_REASON:``/
+    ``END_TEST``) recovered from the session transcript even when the
+    primary path never ran. Both are REQUIRED, every time — the backup does
+    not excuse skipping the primary, and vice versa.
 
     Extracted to module scope so the contract is unit-testable — the briefing
     text IS the product here, and a silent edit that drops the obligation is
@@ -67,18 +72,40 @@ def _smoke_report_reminder(*, assignment_id: str, smoke_of: str) -> str:
     return (
         f"[Coordinator smoke assignment {assignment_id}] HUMAN-ATTENDED "
         "interactive smoke test.\n"
-        "  REQUIRED terminal step — do this BEFORE you finish, every time, "
-        "even if the session was short or the operator seems done:\n"
-        f"    coord test --passed {smoke_of}\n"
-        f"    coord test --fail {smoke_of} --reason \"<full failure brief>\"\n"
-        "  Run exactly one of them once the operator has a clear position. "
-        "Then CHECK THE OUTPUT: the command prints a confirmation. If it "
-        "errored, or `coord` is not on your PATH, say so plainly to the "
-        "operator and print the exact command for them to run — do NOT report "
-        "the verdict as recorded when you have not seen it confirmed. There "
-        "is no automatic recovery for a test verdict: if this command does "
-        "not run, the verdict is lost and the operator has to re-enter it by "
-        "hand.\n"
+        "  Record your verdict TWICE before you finish — belt and braces, "
+        "neither step substitutes for the other, even if the session was "
+        "short or the operator seems done:\n"
+        "  a. PRIMARY (do this first, once the operator has a clear "
+        "position):\n"
+        f"       coord test --passed {smoke_of}\n"
+        f"       coord test --fail {smoke_of} --reason \"<full failure brief>\"\n"
+        "     Run exactly one of them. Then CHECK THE OUTPUT: the command "
+        "prints a confirmation. If it errored, or `coord` is not on your "
+        "PATH, say so plainly to the operator — and fall through to step b "
+        "anyway; it is REQUIRED regardless. Do NOT report the verdict as "
+        "recorded when you have not seen it confirmed.\n"
+        "  b. BACKUP (always do this too, even after a successful step a): "
+        "at the END of your session, output your verdict in this exact "
+        "format:\n\n"
+        "TEST_VERDICT: passed\n"
+        "TEST_REASON:\n"
+        "<none, or brief notes>\n"
+        "END_TEST\n\n"
+        "Or for a failure:\n\n"
+        "TEST_VERDICT: failed\n"
+        "TEST_REASON:\n"
+        "<the COMPLETE failure brief: what was checked, expected vs actual, "
+        "the repro steps, and the suspected files/area — not just one "
+        "line; this reason IS what the fix worker is briefed with, so make "
+        "it self-contained>\n"
+        "END_TEST\n\n"
+        "This printed block is the PATH-independent fallback recovered from "
+        "your session transcript even when step a never ran or failed — it "
+        "is REQUIRED every time, not just when `coord test` is unavailable. "
+        "`END_TEST` is a HARD REQUIREMENT: the coordinator only records a "
+        "verdict recovered this way when it sees that exact line. The LAST "
+        "LINE of your LAST MESSAGE must be exactly `END_TEST` on its own "
+        "line, with nothing after it.\n"
         f"  Then run `coord report-result --assignment {assignment_id} "
         "--status done --summary <one-line summary>` so this session's row "
         "closes.\n\n"
@@ -716,6 +743,10 @@ def _dispatch_smoke_of(
         "steps, and the suspected files/area — not just one line. This "
         "reason IS what the fix worker is briefed with, so make it "
         "self-contained.\n"
+        "   Then ALSO print the TEST_VERDICT:/TEST_REASON:/END_TEST backup "
+        "block described in your first message, even after `coord test` "
+        "succeeds — it is the PATH-independent fallback recovered from this "
+        "session's transcript if `coord test` didn't actually land.\n"
         "   Then tell the operator exactly what happens next (the TUI "
         "will offer the fix or merge step).\n"
     )
@@ -885,7 +916,14 @@ def _dispatch_smoke_of(
                 log_path=None,
                 repo_path=None,
                 smoke_repo_path=smoke_repo_path,
+                smoke_of=smoke_of,
             )
+            if _fr.test_verdict_recovered:
+                click.echo(
+                    f"  test verdict {_fr.test_verdict_recovered!r} recovered "
+                    "from the session transcript and recorded on the work "
+                    f"assignment {smoke_of} (#1351)"
+                )
             if _fr.smoke_restored_paths:
                 click.echo(
                     "  live checkout restored (#1256): reverted "
@@ -1020,7 +1058,14 @@ def _dispatch_smoke_of(
             repo_path=None,
             ssh_target=machine_obj.host,
             smoke_repo_path=_rp_sh,
+            smoke_of=smoke_of,
         )
+        if _fr.test_verdict_recovered:
+            click.echo(
+                f"  test verdict {_fr.test_verdict_recovered!r} recovered "
+                "from the session transcript and recorded on the work "
+                f"assignment {smoke_of} (#1351)"
+            )
         if _fr.smoke_restored_paths:
             click.echo(
                 "  live checkout restored (#1256): reverted "
