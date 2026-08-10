@@ -459,6 +459,66 @@ class TestFixFromRedCi:
         )
         assert result.exit_code != 0
         assert "expected a failed test verdict" in result.output
+        assert "--force" in result.output
+
+    def test_green_ci_with_force_but_no_guidance_still_refuses(
+        self, ci_config: Path, coord_dir: Path, monkeypatch
+    ) -> None:
+        """#2051: `--force` alone would dispatch a fix worker with nothing to
+        go on — no failed verdict, no CI read, no guidance. Require the
+        caller to say what's actually broken."""
+        work = _work(test_state="passed", smoke_test="pass")
+        state_mod.save_board(Board(completed=[work]))
+
+        fake_store = MagicMock()
+        fake_store.is_available = True
+        fake_store.list_checks_for_pr.return_value = [_check("build", "success")]
+        monkeypatch.setattr(
+            "coord.ci_store.build_ci_store", lambda _type: fake_store
+        )
+
+        result = CliRunner().invoke(
+            main, ["fix", "work-abc", "--force", "--config", str(ci_config)]
+        )
+        assert result.exit_code != 0
+        assert "--guidance" in result.output
+
+    def test_green_ci_with_force_and_guidance_dispatches(
+        self, ci_config: Path, coord_dir: Path, monkeypatch
+    ) -> None:
+        """#2051: a caller who knows the PR is red — and the automated CI
+        read missed it — has a way through via `--force` + `--guidance`."""
+        work = _work(test_state="passed", smoke_test="pass")
+        state_mod.save_board(Board(completed=[work]))
+
+        fake_store = MagicMock()
+        fake_store.is_available = True
+        fake_store.list_checks_for_pr.return_value = [_check("build", "success")]
+        monkeypatch.setattr(
+            "coord.ci_store.build_ci_store", lambda _type: fake_store
+        )
+
+        captured = {}
+
+        def fake_dispatch(proposal, config, **kwargs):
+            captured["briefing"] = proposal.briefing
+            captured["target_branch"] = proposal.target_branch
+            return {"id": "fix-forced"}
+
+        with patch("coord.dispatch.dispatch", side_effect=fake_dispatch), \
+             patch("coord.github_ops.post_issue_comment"):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "fix", "work-abc", "--force",
+                    "--guidance", "windows job is red, see run 123",
+                    "--config", str(ci_config),
+                ],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert captured["target_branch"] == WORK_BRANCH
+        assert "windows job is red, see run 123" in captured["briefing"]
 
     def test_a_failed_local_test_takes_priority_and_reads_no_ci(
         self, ci_config: Path, coord_dir: Path, monkeypatch

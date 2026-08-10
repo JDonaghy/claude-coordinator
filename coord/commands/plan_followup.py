@@ -692,7 +692,10 @@ def _fix_from_review(
     is_flag=True,
     help=(
         "Override the #555 interactive-work exclusion when fixing a review of "
-        "work that ran under claude-pty. Does NOT override "
+        "work that ran under claude-pty, or (#2051) dispatch a WORK-row fix "
+        "when neither the test verdict nor a live CI read shows a failure — "
+        "for when the caller knows the PR is red but the check missed it "
+        "(ci_store not configured, a transient read error). Does NOT override "
         "max_review_iterations or the #522 terminal-work guard."
     ),
 )
@@ -728,15 +731,40 @@ def fix(assignment_id: str, config_path: Path, guidance: str, force: bool) -> No
     # zero-I/O and the existing failure story keeps priority.
     ci_story = None if test_failed else _ci_failure_story(cfg, assignment)
 
+    # #2051: none of the three doors (failed test verdict, red CI, or the
+    # review-id door handled above) is open.  `_ci_failure_story` is
+    # read-only and fail-quiet (see its docstring) — it returns `None` for
+    # "no evidence of a failure", never "CI is green" — so a caller who
+    # KNOWS the PR is red (ci_store not configured for this repo, a
+    # transient GitHub API error, a check that hasn't reported yet) would
+    # otherwise be stranded with no headless door onto the ORIGINAL branch.
+    # `--force` is that caller's release valve; it is NOT a way to skip the
+    # #555 / #522 / max_review_iterations guards, which sit elsewhere.
+    forced_without_evidence = False
     if not test_failed and ci_story is None:
-        click.echo(
-            f"error: assignment {assignment_id} test_state is "
-            f"{assignment.test_state!r} / smoke_test is "
-            f"{assignment.smoke_test!r}, expected a failed test verdict "
-            "(or red CI on its PR, or a request-changes review id)",
-            err=True,
-        )
-        sys.exit(1)
+        if not force:
+            click.echo(
+                f"error: assignment {assignment_id} test_state is "
+                f"{assignment.test_state!r} / smoke_test is "
+                f"{assignment.smoke_test!r}, expected a failed test verdict "
+                "(or red CI on its PR, or a request-changes review id). If "
+                "the PR is actually red and this check missed it, re-run "
+                "with --force.",
+                err=True,
+            )
+            sys.exit(1)
+        if not guidance:
+            # There's no failed verdict, CI read, or test-output file to
+            # brief the fix worker with — `--force` alone would dispatch it
+            # blind. Require the caller to say what's actually broken.
+            click.echo(
+                f"error: --force on assignment {assignment_id} also needs "
+                "--guidance — there's no failed test verdict or CI read to "
+                "brief the fix worker with, so say what's actually broken.",
+                err=True,
+            )
+            sys.exit(1)
+        forced_without_evidence = True
 
     repo = cfg.repo(assignment.repo_name)
     if repo is None:
@@ -768,8 +796,16 @@ def fix(assignment_id: str, config_path: Path, guidance: str, force: bool) -> No
         )
 
     guidance_text = guidance or "Fix the failing tests and push."
-    _what = "red CI" if ci_story is not None else "a failed smoke test"
-    _failure_heading = "CI failure" if ci_story is not None else "Test failure"
+    if forced_without_evidence:
+        _what = (
+            "a reported failure (--force: neither a failed test verdict nor "
+            "an automated CI read found one — the caller attests the PR is "
+            "red)"
+        )
+        _failure_heading = "Reported failure (--force, unverified)"
+    else:
+        _what = "red CI" if ci_story is not None else "a failed smoke test"
+        _failure_heading = "CI failure" if ci_story is not None else "Test failure"
 
     briefing = (
         f"You are fixing {_what} for issue #{assignment.issue_number}: {assignment.issue_title}\n\n"
