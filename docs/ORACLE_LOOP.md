@@ -232,6 +232,20 @@ Read the current state at any time with `coord gate-a <repo> <tracking_issue>` (
 **Phase 1 — per issue:**
 3. **[coord]** Dispatch Work with the briefing contract above (issue + #603 digest + contract slice +
    the sealed `coord acceptance run --issue N` command).
+   - **`coord drive` does steps 2–3 as one move ("oracle drive", #1453).** Seeing a merged Gate-A
+     contract and a configured `acceptance.drivers` entry, it authors this issue's JIT slice and
+     then **lands it** — Test and Review are dispatched by the daemon's own passive tick, and the
+     merge is `coord drive`'s own bounded `coord merge --only <slice aid>` — before it will
+     `coord assign` anything. It has to: `issue_oracle_ready` (#1138) reads the manifest from the
+     **default branch**, so until the slice PR merges the Work dispatch stays refused.
+   - **Why the driver merges it rather than waiting** (#2079): the daemon's drain step,
+     `_auto_drain_tick`, is gated on `merge.auto_drain`, which is `false` — see
+     [`MERGE_AUTO_DRAIN_TRUST_BAR.md`](MERGE_AUTO_DRAIN_TRUST_BAR.md). Nothing else merges a READY
+     entry. Before this, oracle-mode drives waited on that drain and burned `2 × --deadline` per
+     issue before landing in a terminal `blocked` state.
+   - If the slice cannot land — its Test failed, its review requested changes, or `--no-merge` is
+     set — the drive **stops immediately and names the command**, rather than idling to the
+     deadline. `--no-acceptance` opts the run out of the whole path.
 4. **[worker]** Implements; writes unit tests (tier 1).
 5. **[worker] in-session oracle loop:** `run --issue N` → fix → repeat (warm, no reset) →
    **converge → push + done**, or **stall → `acceptance stall` → WIP snapshot** (§ above).

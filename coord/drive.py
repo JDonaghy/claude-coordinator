@@ -793,7 +793,10 @@ def _decide_acceptance_landing(
     )
     action = _decide_merge(shadow, opts, counters.slice_budget())
     return replace(
-        action, label=_acceptance_label(action.label), merge_scope="acceptance"
+        action,
+        label=_acceptance_label(action.label),
+        message=_acceptance_message(action.message, state),
+        merge_scope="acceptance",
     )
 
 
@@ -807,6 +810,26 @@ def _acceptance_label(label: str) -> str:
     if not label:
         return ""
     return "ACCEPTANCE/" + label
+
+
+def _acceptance_message(message: str, state: IssueState) -> str:
+    """The same re-badging for an EXIT action's message (#2079).
+
+    The exit message is what reaches the issue comment
+    (``Driver._post_escalation_comment``) and the drive-queue's stop reason —
+    i.e. the only two places a human reads it after the tmux pane is gone. A
+    bare "merge attempted 3 times without landing" there points them at the
+    issue's own PR, which does not exist yet.
+    """
+    if not message:
+        return ""
+    return (
+        f"the JIT acceptance slice for #{state.issue} could not be landed "
+        f"(slice {state.acceptance_author_aid}, branch "
+        f"{state.acceptance_author_branch or '(none)'}) — no work can be "
+        "dispatched for this issue until it merges (#1138/#2079):\n"
+        f"{message}"
+    )
 
 
 # ── merge verification ───────────────────────────────────────────────────────

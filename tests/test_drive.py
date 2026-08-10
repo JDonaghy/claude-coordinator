@@ -1021,6 +1021,10 @@ def test_slice_merge_spends_its_own_budget_not_the_work_row_s():
     assert action.is_exit
     assert action.exit_code == EXIT_TERMINAL_FAILURE
     assert "merge attempted 3 times" in action.message
+    # ...and the message says WHICH merge. It is the only thing a human sees
+    # once the pane is gone (it becomes the issue comment / queue stop reason).
+    assert "JIT acceptance slice" in action.message
+    assert "ta1" in action.message
 
 
 def test_slice_merge_diagnostic_is_filed_against_the_slice_budget():
