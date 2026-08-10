@@ -613,6 +613,176 @@ class TestPipelineAPI:
             assert "is_current" in s
 
 
+class TestPipelineRetention:
+    """#2066: /api/pipeline bounds its default response to a recency window
+    instead of returning every 'work' assignment the board has ever recorded.
+    """
+
+    def test_old_terminal_row_excluded_by_default(self) -> None:
+        import time
+
+        old = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=1, issue_title="Ancient",
+            assignment_id="old1", status="done", type="work",
+            finished_at=time.time() - 30 * 86400,  # 30 days ago
+        )
+        board = Board(active=[], completed=[old])
+        client = _dashboard_client()
+        with (
+            patch("coord.dashboard.server.read_board", return_value=board),
+            patch("coord.merge_queue.load_queue", return_value=[]),
+        ):
+            r = client.get("/api/pipeline")
+        assert r.status_code == 200
+        assert r.json() == []
+
+    def test_old_terminal_row_included_with_include_all(self) -> None:
+        import time
+
+        old = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=1, issue_title="Ancient",
+            assignment_id="old1", status="done", type="work",
+            finished_at=time.time() - 30 * 86400,
+        )
+        board = Board(active=[], completed=[old])
+        client = _dashboard_client()
+        with (
+            patch("coord.dashboard.server.read_board", return_value=board),
+            patch("coord.merge_queue.load_queue", return_value=[]),
+        ):
+            r = client.get("/api/pipeline?include=all")
+        assert r.status_code == 200
+        ids = [pv["assignment_id"] for pv in r.json()]
+        assert ids == ["old1"]
+
+    def test_old_terminal_row_with_no_finished_at_falls_back_to_dispatched_at(
+        self,
+    ) -> None:
+        """#2066's still-open half: some terminal rows have finished_at=None.
+        The recency bound must not treat that as "keep forever" — it falls
+        back to dispatched_at, which every assignment always has.
+        """
+        import time
+
+        old = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=1, issue_title="Ancient, no finished_at",
+            assignment_id="old2", status="done", type="work",
+            dispatched_at=time.time() - 30 * 86400,
+            finished_at=None,
+        )
+        board = Board(active=[], completed=[old])
+        client = _dashboard_client()
+        with (
+            patch("coord.dashboard.server.read_board", return_value=board),
+            patch("coord.merge_queue.load_queue", return_value=[]),
+        ):
+            r = client.get("/api/pipeline")
+        assert r.status_code == 200
+        assert r.json() == []
+
+    def test_undatable_terminal_row_is_kept_conservatively(self) -> None:
+        """No finished_at AND no dispatched_at: can't positively date it as
+        old, so it stays — same conservative rule as
+        coord.dao.compute_board_keep_ids.
+        """
+        undated = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=1, issue_title="Undatable",
+            assignment_id="undated1", status="done", type="work",
+            dispatched_at=None, finished_at=None,
+        )
+        board = Board(active=[], completed=[undated])
+        client = _dashboard_client()
+        with (
+            patch("coord.dashboard.server.read_board", return_value=board),
+            patch("coord.merge_queue.load_queue", return_value=[]),
+        ):
+            r = client.get("/api/pipeline")
+        assert r.status_code == 200
+        ids = [pv["assignment_id"] for pv in r.json()]
+        assert ids == ["undated1"]
+
+    def test_active_row_always_kept_regardless_of_age(self) -> None:
+        import time
+
+        old_active = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=1, issue_title="Still running",
+            assignment_id="active1", status="running", type="work",
+            dispatched_at=time.time() - 30 * 86400,
+        )
+        board = Board(active=[old_active], completed=[])
+        client = _dashboard_client()
+        with (
+            patch("coord.dashboard.server.read_board", return_value=board),
+            patch("coord.merge_queue.load_queue", return_value=[]),
+        ):
+            r = client.get("/api/pipeline")
+        assert r.status_code == 200
+        ids = [pv["assignment_id"] for pv in r.json()]
+        assert ids == ["active1"]
+
+    def test_sorted_newest_first(self) -> None:
+        import time
+
+        now = time.time()
+        older = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=1, issue_title="Older",
+            assignment_id="older1", status="done", type="work",
+            finished_at=now - 3600,
+        )
+        newer = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=2, issue_title="Newer",
+            assignment_id="newer1", status="done", type="work",
+            finished_at=now - 60,
+        )
+        # Seeded in oldest-first order to prove the response is actually sorted,
+        # not just passed through in board order.
+        board = Board(active=[], completed=[older, newer])
+        client = _dashboard_client()
+        with (
+            patch("coord.dashboard.server.read_board", return_value=board),
+            patch("coord.merge_queue.load_queue", return_value=[]),
+        ):
+            r = client.get("/api/pipeline")
+        assert r.status_code == 200
+        ids = [pv["assignment_id"] for pv in r.json()]
+        assert ids == ["newer1", "older1"]
+
+    def test_row_in_merge_queue_kept_regardless_of_age(self) -> None:
+        """A terminal row still parked in the merge queue must not age out —
+        mirrors coord.dao.compute_board_keep_ids's merge-queue exemption."""
+        import time
+
+        old_queued = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=1, issue_title="Queued for ages",
+            assignment_id="queued1", status="done", type="work",
+            branch="issue-1-fix",
+            finished_at=time.time() - 30 * 86400,
+        )
+        board = Board(active=[], completed=[old_queued])
+        mq_entry = QueuedMerge(
+            assignment_id="queued1", repo_name="api", repo_github="acme/api",
+            branch="issue-1-fix", target_branch="main",
+            issue_number=1, issue_title="Queued for ages", state=PENDING,
+        )
+        client = _dashboard_client()
+        with (
+            patch("coord.dashboard.server.read_board", return_value=board),
+            patch("coord.merge_queue.load_queue", return_value=[mq_entry]),
+        ):
+            r = client.get("/api/pipeline")
+        assert r.status_code == 200
+        ids = [pv["assignment_id"] for pv in r.json()]
+        assert ids == ["queued1"]
+
+
 class TestPipelineActionAPI:
     def test_missing_fields_returns_400(self) -> None:
         client = _dashboard_client()

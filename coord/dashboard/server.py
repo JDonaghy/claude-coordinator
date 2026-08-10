@@ -431,6 +431,21 @@ def openapi_spec() -> dict:
         "/api/pipeline": {
             "get": {
                 "summary": "PipelineView for every type='work' assignment",
+                "description": (
+                    "#2066: bounded by default to active work plus terminal work "
+                    "finished within COORD_BOARD_RETENTION_DAYS (default 14). Pass "
+                    "?include=all to get the full, unbounded history. Sorted "
+                    "newest-first by finished_at (falling back to dispatched_at)."
+                ),
+                "parameters": [
+                    {
+                        "name": "include",
+                        "in": "query",
+                        "required": False,
+                        "schema": {"type": "string", "enum": ["all"]},
+                        "description": "Pass 'all' to bypass the default recency window.",
+                    }
+                ],
                 "responses": {
                     "200": {
                         "description": "OK",
@@ -1080,9 +1095,28 @@ def build_app(
         serialization underneath are the same ``compute_pipeline`` + ``asdict``
         the live dashboard runs, which is what keeps a fixture-backed
         acceptance suite honest.
+
+        #2066: bounded by default to active work + recently-finished terminal
+        work, and sorted newest-first — the unbounded response used to grow
+        ~14 rows/day forever (711 rows, 2 of them live, when filed) because
+        nothing here applied the retention policy ``/board``'s DAO layer
+        already enforces (``coord.dao._board_retention_cutoff`` /
+        ``COORD_BOARD_RETENTION_DAYS``, default 14 days — reused verbatim
+        here rather than inventing a second policy, per #773's precedent).
+        ``?include=all`` opts back into the full, unbounded history.
+
+        The recency signal is ``finished_at`` when present, falling back to
+        ``dispatched_at`` (mirrors ``coord.dao.compute_board_keep_ids``) — a
+        row with neither is kept rather than guessed away. This fallback
+        matters independently of whatever turns out to be causing some rows'
+        ``finished_at`` to read back ``None`` (#2066's still-open second
+        half): ``dispatched_at`` is unconditionally stamped at dispatch time
+        by every code path, so the bound holds even for a row whose
+        ``finished_at`` never got recorded.
         """
         from dataclasses import asdict
 
+        from coord.dao import TERMINAL_STATUSES, _board_retention_cutoff
         from coord.pipeline import compute_pipeline
         from coord.merge_queue import load_queue
         from coord.state import load_assignment_review_findings
@@ -1090,6 +1124,10 @@ def build_app(
         board = _read_board()
         mq_items = _fixture.merge_queue() if _fixture is not None else load_queue()
         pipeline_now = _fixture.now if _fixture is not None else None
+        now = pipeline_now if pipeline_now is not None else time.time()
+
+        include_all = request.query_params.get("include") == "all"
+        cutoff = None if include_all else _board_retention_cutoff(now)
 
         # Build a lookup of review assignment id per work assignment_id so we can
         # fetch the review findings body with one pass instead of N nested loops.
@@ -1098,14 +1136,23 @@ def build_app(
         for a in all_assignments:
             if a.type == "review" and a.review_of_assignment_id and a.assignment_id:
                 review_by_work[a.review_of_assignment_id] = a.assignment_id
+        merge_queue_ids = {m.assignment_id for m in mq_items if m.assignment_id}
 
-        pipelines = []
+        pipelines: list[PipelineView] = []
         for a in all_assignments:
             if a.type not in ("work", None, ""):
                 continue
             # Exclude assignments with no id (shouldn't normally happen).
             if not a.assignment_id:
                 continue
+            if (
+                cutoff is not None
+                and a.status in TERMINAL_STATUSES
+                and a.assignment_id not in merge_queue_ids
+            ):
+                ts = a.finished_at if a.finished_at is not None else a.dispatched_at
+                if ts is not None and ts < cutoff:
+                    continue
             # Pre-load review findings body (DB call; pure-computation path kept
             # clean by passing it as a parameter rather than inside compute_pipeline).
             findings_body: str | None = None
@@ -1123,9 +1170,23 @@ def build_app(
                 review_findings_body=findings_body,
                 now=pipeline_now,
             )
-            pipelines.append(asdict(pv))
+            pipelines.append(pv)
 
-        return JSONResponse(pipelines)
+        # Newest-first: today's running work above a July failure, not the
+        # reverse (#2066 step 3). Same finished_at-then-dispatched_at signal
+        # as the cutoff above; a genuinely undatable row sorts last.
+        dispatched_by_id = {a.assignment_id: a.dispatched_at for a in all_assignments}
+        pipelines.sort(
+            key=lambda pv: (
+                pv.finished_at
+                if pv.finished_at is not None
+                else dispatched_by_id.get(pv.assignment_id)
+            )
+            or 0.0,
+            reverse=True,
+        )
+
+        return JSONResponse([asdict(pv) for pv in pipelines])
 
     # Actions whose live handler returns a fixed-shape success envelope. The
     # fixture branch below reproduces that envelope exactly (`ok: true` plus
