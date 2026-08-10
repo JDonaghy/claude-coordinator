@@ -182,10 +182,20 @@ class ManifestData:
     oracle-opted-in milestone that are deliberately validated by their own
     unit tests instead of the sealed suite — e.g. the driver-building issue
     itself, #1125 — declared here instead of living only as tribal knowledge
-    in an issue body)."""
+    in an issue body).
+
+    #2063 adds the milestone-level ``gate_a:`` block: the declared,
+    reviewable opt-out from the Gate-A human sign-off gate, same posture as
+    ``exempt:`` above — a milestone whose surface genuinely needs no human
+    eye says so in the repo, in writing, rather than the gate quietly not
+    existing for everyone."""
 
     tests: dict[str, int] = field(default_factory=dict)
     exempt: frozenset[int] = field(default_factory=frozenset)
+    #: ``gate_a: {exempt: true, reason: "..."}`` — this milestone's contract
+    #: may be consumed without a recorded human verdict (#2063).
+    gate_a_exempt: bool = False
+    gate_a_exempt_reason: str = ""
 
 
 def parse_manifest_text(text: str, *, source: str = "<manifest>") -> ManifestData:
@@ -202,6 +212,13 @@ def parse_manifest_text(text: str, *, source: str = "<manifest>") -> ManifestDat
     - ``issues: {<issue-number>: [<test-id>, ...], ...}`` — grouped by issue.
     - ``exempt: [<issue-number>, ...]`` — issues exempted from the #1138
       issue-level oracle gate (no slice required before Work dispatch).
+
+    Plus one milestone-level block:
+
+    - ``gate_a: {exempt: true, reason: "..."}`` — this milestone's contract
+      may be consumed without a recorded human sign-off (#2063). ``gate_a:
+      true`` is accepted as shorthand. Anything else (including a missing
+      key) leaves the gate on.
     """
     try:
         raw = yaml.safe_load(text)
@@ -231,7 +248,21 @@ def parse_manifest_text(text: str, *, source: str = "<manifest>") -> ManifestDat
     if isinstance(exempt_raw, list):
         exempt = frozenset(int(x) for x in exempt_raw)
 
-    return ManifestData(tests=mapping, exempt=exempt)
+    gate_a_exempt = False
+    gate_a_reason = ""
+    gate_a_raw = raw.get("gate_a")
+    if isinstance(gate_a_raw, dict):
+        gate_a_exempt = bool(gate_a_raw.get("exempt"))
+        gate_a_reason = str(gate_a_raw.get("reason") or "")
+    elif isinstance(gate_a_raw, bool):
+        gate_a_exempt = gate_a_raw
+
+    return ManifestData(
+        tests=mapping,
+        exempt=exempt,
+        gate_a_exempt=gate_a_exempt,
+        gate_a_exempt_reason=gate_a_reason,
+    )
 
 
 def _parse_manifest_file(path: Path) -> dict[str, int]:

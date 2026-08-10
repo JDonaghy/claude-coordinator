@@ -2223,6 +2223,90 @@
     }
 
     #[test]
+    fn gate_a_verdict_menu_items_present_only_on_epic_row() {
+        // #2063: recording the sign-off must sit beside the 👁 that opens
+        // the thing being signed off on — reviewing and recording are one
+        // gesture. Black-box, same shape as the sibling Gate-A menu test.
+        use quadraui::tui::testing::driver_with_shell;
+
+        let epic_app = make_pipeline_app_for_audit_menu_test(0);
+        let mut driver = driver_with_shell(epic_app, CoordApp::shell_config(), 120, 40);
+        driver.type_char('.');
+        assert!(
+            driver.screen_contains("Approve Gate A"),
+            "epic row's context menu must offer 'Approve Gate A':\n{}",
+            driver.screen(),
+        );
+        assert!(
+            driver.screen_contains("Request Gate A changes"),
+            "epic row's context menu must offer 'Request Gate A changes':\n{}",
+            driver.screen(),
+        );
+
+        let plain_app = make_pipeline_app_for_audit_menu_test(1);
+        let mut driver = driver_with_shell(plain_app, CoordApp::shell_config(), 120, 40);
+        driver.type_char('.');
+        assert!(
+            !driver.screen_contains("Approve Gate A"),
+            "non-epic row's context menu must NOT offer 'Approve Gate A':\n{}",
+            driver.screen(),
+        );
+        assert!(
+            !driver.screen_contains("Request Gate A changes"),
+            "non-epic row's context menu must NOT offer 'Request Gate A changes':\n{}",
+            driver.screen(),
+        );
+    }
+
+    #[test]
+    fn approve_gate_a_action_spawns_gate_a_approved_command() {
+        // #2063: the verdict is a board write, not a browser open — the
+        // action must fire `coord gate-a --approved <repo> <tracking_issue>`.
+        let mut app = make_pipeline_app_for_audit_menu_test(0);
+        let target = ContextMenuTarget::PipelineRow {
+            issue_number: Some(751),
+            repo_name: Some("api".to_string()),
+            lifecycle: PipelineRowLifecycle::New,
+        };
+        let handled = app.dispatch_context_menu_action("approve-gate-a", &target);
+        assert!(handled, "approve-gate-a must be a recognised action");
+        assert_eq!(
+            app.command_runner.spawned_calls,
+            vec![vec![
+                "gate-a".to_string(),
+                "--approved".to_string(),
+                "api".to_string(),
+                "751".to_string(),
+            ]],
+        );
+    }
+
+    #[test]
+    fn request_gate_a_changes_action_spawns_changes_command() {
+        // #2063: "changes" is a recorded REJECTION, not merely the absence
+        // of an approval — the refusal downstream reads it to say what to
+        // fix instead of "nobody has looked yet".
+        let mut app = make_pipeline_app_for_audit_menu_test(0);
+        let target = ContextMenuTarget::PipelineRow {
+            issue_number: Some(751),
+            repo_name: Some("api".to_string()),
+            lifecycle: PipelineRowLifecycle::New,
+        };
+        let handled =
+            app.dispatch_context_menu_action("request-gate-a-changes", &target);
+        assert!(handled, "request-gate-a-changes must be a recognised action");
+        assert_eq!(
+            app.command_runner.spawned_calls,
+            vec![vec![
+                "gate-a".to_string(),
+                "--changes".to_string(),
+                "api".to_string(),
+                "751".to_string(),
+            ]],
+        );
+    }
+
+    #[test]
     fn view_gate_a_mock_item_disabled_until_a_pr_exists() {
         // #1059: "View Gate A mock" is the sign-off viewer (opens the
         // mock-author's PR — contract.md + the rendered mock(s) — in the

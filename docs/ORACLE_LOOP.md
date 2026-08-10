@@ -121,6 +121,7 @@ One command, framework-agnostic above the driver:
 | Subcommand | Who runs it | What it does |
 |---|---|---|
 | `coord acceptance mock --milestone NN` | Gate A dispatch (#930) | Dispatch a **mock-author** agent: render the viewable mock + write `contract.md` from it. |
+| `coord gate-a --approved \| --changes <repo> <tracking_issue>` | Gate A sign-off (#2063) | Record the **human verdict** on `contract.md`, keyed to its content hash. Nothing downstream dispatches without one. |
 | `coord acceptance author --milestone NN [--issue N]` | Gate A / JIT (#931) | Dispatch the independent **`test-author`**: write/extend the red acceptance suite from the contract. |
 | `coord acceptance run --issue N` | **worker, in-session** | Run issue N's slice via the repo driver; return **structured** per-test pass/fail. Sealed: verdicts only, no test source. |
 | `coord acceptance run --all` | coordinator (Gate C) | Run the full accumulated suite. |
@@ -176,8 +177,57 @@ Legend: **[indep]** zero-worker-context agent · **[worker]** implementer · **[
 **Phase 0 — Milestone kickoff (Gate A), once:**
 1. **[indep] `coord acceptance mock`** renders the viewable mock; **[human]** reacts and signs off
    (UX discovery, against a cheap mock). The approved mock + `contract.md` is the pinned surface.
+1b. **[human] `coord gate-a --approved <repo> <tracking_issue>`** records that sign-off on the
+   board. **Merging the Gate-A PR is not sign-off** (#2063). See "Gate A sign-off is enforced"
+   below — nothing dispatches against an unapproved contract.
 2. **[indep] `coord acceptance author`** writes the red suite from the contract. Gate A **blocks
-   issue dispatch until the contract exists.**
+   issue dispatch until the contract exists** *and* **carries a recorded human verdict.**
+
+### Gate A sign-off is enforced (#2063)
+
+Gate A used to have two halves, only one of which was a gate: *does `contract.md` exist* (checked
+by `coord.milestone_dispatch.gate_a_status`, #930) and *has a human read it* — which was the
+convention "merging that PR is what satisfies Gate A". Anything that can merge a PR satisfied it,
+including a coordinator session, silently, on CI green. It failed on two consecutive coord-portal
+milestones (ms-1/PR #18, ms-2/PR #35): the mocks merged unseen, and by the time the operator asked
+the second time an independent `test-author` had already authored a sealed slice against a contract
+nobody had approved.
+
+| | Verdict | Enforced |
+|---|---|---|
+| **Test** | `coord test --passed \| --fail` | yes — review held until a verdict (`PipelineConfig.test_precedes_review`) |
+| **Gate A** | `coord gate-a --approved \| --changes` | **yes** — `issue_oracle_ready` refuses Work dispatch without one |
+
+- **Where it is enforced: at the consumer, not at the merge.** The Gate-A PR is merged with
+  `gh pr merge`, outside coord entirely, so no coord-side check ever sees it. The refusal lives in
+  `coord.milestone_dispatch.issue_oracle_ready` (#1138) — the same guard that already refuses when
+  `contract.md` is absent. An unapproved contract merging is therefore harmless: nothing is
+  authored and no work dispatches until a verdict exists.
+- **The verdict is keyed to the contract's content hash.** `coord acceptance mock --amend`
+  changes `contract.md`, which invalidates a prior approval automatically (state `stale`).
+  Approving v1 must not silently approve v2 — that is the same failure this gate exists to
+  prevent, one level up. Whitespace/line-ending-only differences do not invalidate it.
+- **`--changes` is a recorded rejection**, not merely the absence of an approval: the downstream
+  refusal quotes your `--note` and points at `coord acceptance mock ... --amend` instead of
+  saying "nobody has looked yet".
+- **It refuses, it does not kill the queue.** A `coord drive-queue` entry that hits this refusal
+  **parks** (re-checked every tick, #1891/#1892) rather than landing in terminal `blocked`, which
+  nothing re-evaluates and `coord drive-queue add` cannot clear (#2040). Record the verdict and
+  the entry resumes on the next tick with no queue surgery.
+- **Opt-out is per-milestone, declared, and reviewable** — same posture as `oracle:exempt`. In
+  `tests/acceptance/ms-NN/manifest.yml`:
+
+  ```yaml
+  gate_a:
+    exempt: true
+    reason: no user-visible surface — this milestone is a storage migration
+  ```
+
+  Note the issue-level `exempt:` list does **not** bypass this gate: it says "this *issue* doesn't
+  consume the sealed suite", which says nothing about whether a human read the contract every
+  sibling issue is built against.
+
+Read the current state at any time with `coord gate-a <repo> <tracking_issue>` (no flag).
 
 **Phase 1 — per issue:**
 3. **[coord]** Dispatch Work with the briefing contract above (issue + #603 digest + contract slice +
@@ -215,8 +265,15 @@ Phase 0 steps 1–2 and Phase 1 step 6 above are also reachable by right-clickin
   not a live session). The CLI's own claim-detection refuses a duplicate dispatch while one is
   already in flight. This *is* Phase 0 step 1.
 - **"View Gate A mock (PR)"** 👁 → opens that worker's PR in the browser so a human can read
-  `contract.md` + the rendered mock(s) and sign off — merging that PR is what satisfies Gate A.
-  Disabled until a PR exists.
+  `contract.md` + the rendered mock(s). Disabled until a PR exists. **Merging that PR does not
+  satisfy Gate A** (#2063) — it is only how you *see* what you are signing off on.
+- **"Approve Gate A"** ✓ → `coord gate-a --approved <repo> <tracking_issue>` — records the verdict
+  that actually satisfies Gate A. Sits directly beside the 👁 on purpose: reviewing and recording
+  are one gesture.
+- **"Request Gate A changes"** ✎ → `coord gate-a --changes <repo> <tracking_issue>` — records a
+  rejection; dispatch stays refused. Add the substance with
+  `coord acceptance mock <repo> <tracking_issue> --amend "<what to change>"` (the TUI has no
+  text-input on this path, so the `--note` is CLI-only).
 
 **On any ordinary member-issue row of a milestone's `## Work order`** (resolved via
 `milestone_tracking_issue_for`; **not** epic-gated — applies per-issue, independent of the

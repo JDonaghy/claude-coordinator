@@ -292,15 +292,62 @@ def _oracle_cfg(*, kind: str = "cli-pytest", routes: list | None = None) -> Conf
     )
 
 
-def _manifest_fetch(mapping: dict[str, str | None]):
+#: The Gate-A contract these fixtures pretend is on the default branch.
+#: #2063 made `issue_oracle_ready` read its CONTENT (not just its
+#: existence), so every fixture that expects dispatch to proceed must serve
+#: one and record a matching approval.
+CONTRACT = "# Contract\n\n- the Save button says `Save`\n"
+
+
+def _manifest_fetch(
+    mapping: dict[str, str | None],
+    *,
+    milestone: int = 37,
+    contract: str | None = CONTRACT,
+):
     """Build a ManifestFetch stub: {path: content_or_None}. Any path not in
     *mapping* returns None (file doesn't exist), matching the real
-    GitHub-fetch semantics."""
+    GitHub-fetch semantics.
+
+    The milestone's ``contract.md`` is served by default (#2063) so these
+    fixtures exercise the *slice* gate rather than tripping over the
+    sign-off gate that now runs ahead of it; pass ``contract=None`` to
+    simulate a contract that can't be read.
+    """
+    mapping = dict(mapping)
+    if contract is not None:
+        mapping.setdefault(f"tests/acceptance/ms-{milestone}/contract.md", contract)
 
     def _fetch(repo_github: str, path: str, branch: str) -> str | None:
         return mapping.get(path)
 
     return _fetch
+
+
+def _approval(
+    *,
+    repo_name: str = "api",
+    milestone: int = 37,
+    contract: str | None = CONTRACT,
+    verdict: str = "approved",
+):
+    """A `fetch_gate_a_approval` stub returning a verdict keyed to *contract*.
+
+    ``contract=None`` yields "nobody has recorded anything" — the #2063
+    refusal.
+    """
+    from coord.gate_a import contract_digest, make_record
+
+    if contract is None:
+        return lambda *_a: None
+    record = make_record(
+        repo_name=repo_name,
+        milestone_number=milestone,
+        verdict=verdict,
+        contract_sha=contract_digest(contract),
+        now=1000.0,
+    ).to_dict()
+    return lambda *_a: record
 
 
 class TestIssueOracleReady:
@@ -344,6 +391,7 @@ class TestIssueOracleReady:
         readiness = issue_oracle_ready(
             repo, cfg, 37, 1118,
             file_exists=lambda *a: True, fetch_manifest=fetch,
+            fetch_gate_a_approval=_approval(),
         )
         assert readiness.applies is True
         assert readiness.has_slice is False
@@ -361,6 +409,7 @@ class TestIssueOracleReady:
         readiness = issue_oracle_ready(
             repo, cfg, 37, 1118,
             file_exists=lambda *a: True, fetch_manifest=fetch,
+            fetch_gate_a_approval=_approval(),
         )
         assert readiness.applies is True
         assert readiness.has_slice is True
@@ -376,6 +425,7 @@ class TestIssueOracleReady:
         readiness = issue_oracle_ready(
             repo, cfg, 37, 1118,
             file_exists=lambda *a: True, fetch_manifest=fetch,
+            fetch_gate_a_approval=_approval(),
         )
         assert readiness.has_slice is False
         assert readiness.reason is not None
@@ -389,6 +439,7 @@ class TestIssueOracleReady:
         readiness = issue_oracle_ready(
             repo, cfg, 37, 1118,
             file_exists=lambda *a: True, fetch_manifest=fetch,
+            fetch_gate_a_approval=_approval(),
         )
         assert readiness.applies is True
         assert readiness.exempt is True
@@ -401,6 +452,7 @@ class TestIssueOracleReady:
         readiness = issue_oracle_ready(
             repo, cfg, 37, 1118, ["oracle:exempt"],
             file_exists=lambda *a: True, fetch_manifest=fetch,
+            fetch_gate_a_approval=_approval(),
         )
         assert readiness.exempt is True
         assert readiness.reason is None
@@ -418,6 +470,7 @@ class TestIssueOracleReady:
         readiness = issue_oracle_ready(
             repo, cfg, 37, 1118,
             file_exists=lambda *a: True, fetch_manifest=fetch,
+            fetch_gate_a_approval=_approval(),
         )
         assert readiness.has_slice is True
         assert readiness.unsupported_kinds == ("native",)
@@ -433,6 +486,7 @@ class TestIssueOracleReady:
         readiness = issue_oracle_ready(
             repo, cfg, 37, 1118,
             file_exists=lambda *a: True, fetch_manifest=fetch,
+            fetch_gate_a_approval=_approval(),
         )
         assert readiness.exempt is True
         assert readiness.reason is None
@@ -451,6 +505,7 @@ class TestIssueOracleReady:
         readiness = issue_oracle_ready(
             repo, cfg, 37, 1118,
             file_exists=lambda *a: True, fetch_manifest=fetch,
+            fetch_gate_a_approval=_approval(),
         )
         assert readiness.unsupported_kinds == ()
         assert readiness.reason is None
@@ -464,17 +519,23 @@ class TestIssueOracleReady:
             calls.append(path)
             if path.endswith(".json"):
                 return '{"tests": {"a": 1118}}'
+            if path.endswith("contract.md"):
+                return CONTRACT
             return None
 
         readiness = issue_oracle_ready(
             repo, cfg, 37, 1118,
             file_exists=lambda *a: True, fetch_manifest=_fetch,
+            fetch_gate_a_approval=_approval(),
         )
-        assert calls == [
+        # The manifest probe order is unchanged; the contract read (#2063)
+        # rides the same fetch seam and lands after it.
+        assert [c for c in calls if "manifest" in c] == [
             "tests/acceptance/ms-37/manifest.yml",
             "tests/acceptance/ms-37/manifest.yaml",
             "tests/acceptance/ms-37/manifest.json",
         ]
+        assert "tests/acceptance/ms-37/contract.md" in calls
         assert readiness.has_slice is True
 
     def test_default_fetch_manifest_uses_github_ops(self) -> None:

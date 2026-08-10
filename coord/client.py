@@ -394,6 +394,42 @@ def fetch_drive_queue_entry(
     return None
 
 
+def fetch_gate_a_approval(
+    svc: ServiceConfig,
+    repo_name: str,
+    milestone_number: int,
+    *,
+    timeout: float = _DEFAULT_TIMEOUT,
+) -> dict | None:
+    """GET one milestone's Gate-A human sign-off record (#2063).
+
+    Fail-soft to ``None`` — the opposite posture to
+    :func:`fetch_milestone_gate` above, and deliberately so. There, "couldn't
+    ask" collapsing to ``None`` would let a thin client silently race a gate
+    tick, so it raises. Here ``None`` means "no approval recorded", which
+    makes the only consumer
+    (:func:`coord.milestone_dispatch.issue_oracle_ready`) **refuse** — an
+    unreachable daemon fails closed, with a refusal an operator can read and
+    act on, rather than a traceback out of an unrelated dispatch path.
+    """
+    try:
+        resp = httpx.get(
+            f"{svc.url}/gate-a-approval",
+            params={"repo_name": repo_name, "milestone_number": milestone_number},
+            headers=_headers(svc),
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except (httpx.HTTPError, ValueError):
+        return None
+    entries = data.get("entries") if isinstance(data, dict) else None
+    if isinstance(entries, list) and entries:
+        first = entries[0]
+        return first if isinstance(first, dict) else None
+    return None
+
+
 def fetch_milestone_gate(
     svc: ServiceConfig,
     repo_name: str,

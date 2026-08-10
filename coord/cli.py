@@ -30,6 +30,7 @@ from coord import __version__
 
 from coord.commands.acceptance import acceptance_group
 from coord.commands.audit import audit
+from coord.commands.gate_a import gate_a
 from coord.commands.report import report_group
 from coord.commands.scorecard import scorecard
 
@@ -409,6 +410,10 @@ main.add_command(reject_plan)
 main.add_command(resume_stuck)
 main.add_command(install_skills)
 main.add_command(acceptance_group)
+# #2063: the Gate-A human sign-off verdict, sibling to `coord test
+# --passed|--fail`. Flat (not under `acceptance`) because it is an operator
+# gesture on a milestone, not part of the acceptance runner.
+main.add_command(gate_a)
 main.add_command(release_preflight)
 # #1834: `coord release verify` (and `coord release preflight` as an alias of
 # the flat command above), grouped so the pre-tag and post-release halves of

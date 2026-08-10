@@ -662,6 +662,57 @@ def _fetch_exit_reasons(
     return reasons, refused, dead_end
 
 
+def _fetch_gate_a_pending(entries: list) -> dict[str, bool]:
+    """``{entry_key: still_waiting_on_a_human}`` for every entry parked on a
+    missing Gate-A sign-off (#2063).
+
+    The ``(repo_name, milestone_number)`` pair comes out of the park
+    reason's own marker (:func:`coord.gate_a.parse_park_marker`), so this is
+    a pure board read — no ``gh`` call, and no work at all on a tick where
+    nothing is parked that way.
+
+    Fails **closed**: an entry whose verdict can't be read stays parked. The
+    cost of being wrong in that direction is a parked row an operator can
+    see and release; the cost of being wrong the other way is dispatching
+    work against a contract nobody approved, which is the whole issue.
+    """
+    from coord.gate_a import approval_fingerprint, parse_park_marker  # noqa: PLC0415
+
+    pending: dict[str, bool] = {}
+    #: ``None`` marks "the board could not be read for this milestone".
+    cache: dict[tuple[str, int], str | None] = {}
+    for e in entries:
+        if e.state != STATE_PARKED:
+            continue
+        parsed = parse_park_marker(getattr(e, "last_reason", "") or "")
+        if parsed is None:
+            continue
+        repo_name, milestone_number, parked_fingerprint = parsed
+        key = (repo_name, milestone_number)
+        if key not in cache:
+            try:
+                from coord.state import get_gate_a_approval  # noqa: PLC0415
+
+                raw = get_gate_a_approval(
+                    repo_name=repo_name, milestone_number=milestone_number
+                )
+                cache[key] = approval_fingerprint(raw)
+            except Exception:  # noqa: BLE001 — fail closed, stay parked
+                cache[key] = None
+        if cache[key] is None:
+            pending[e.key] = True
+            continue
+        # Resume when the stored verdict has CHANGED since the park — not
+        # merely when one exists. A `--changes` verdict refuses too, so
+        # "exists" would resume, relaunch, refuse and re-park every tick
+        # forever; "changed" bounds it at one relaunch per operator action.
+        # The guard itself re-derives the real answer (including the
+        # contract-SHA freshness check) on that relaunch, so this predicate
+        # deliberately does not duplicate it.
+        pending[e.key] = cache[key] == parked_fingerprint
+    return pending
+
+
 def _launch_argv(entry: QueueEntry, config_path: Path | None) -> list[str]:
     """The ``coord drive --tmux`` argv for *entry*.
 
@@ -930,6 +981,13 @@ def drive_queue_tick(
         # a drive that exited on its own dead-end predicate.
         exit_reasons, exit_refused, exit_dead_end = _fetch_exit_reasons(entries)
 
+        # #2063: for every entry parked on a missing Gate-A human sign-off,
+        # re-read the recorded verdict so `plan_tick` can un-park it the tick
+        # after the operator approves. Board-only (the (repo, milestone) pair
+        # is embedded in the park reason's marker), so this costs nothing per
+        # tick when no entry is parked that way — which is the common case.
+        gate_a_pending = _fetch_gate_a_pending(entries)
+
         # #1794: the clock is the shell's to read, never `coord.drive_queue`'s.
         # It powers the startup grace window on both sides of the tick — a
         # drive launched seconds ago is `starting`, not dead, and cannot be
@@ -952,6 +1010,7 @@ def drive_queue_tick(
             exit_reasons=exit_reasons,
             exit_refused=exit_refused,
             exit_dead_end=exit_dead_end,
+            gate_a_pending=gate_a_pending,
         )
 
         for line in render_plan(plan, dry_run=dry_run):

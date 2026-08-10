@@ -3121,6 +3121,77 @@ impl CoordApp {
         }
     }
 
+    /// #2063: record the human Gate-A verdict for the selected epic row —
+    /// `coord gate-a --approved|--changes <repo> <tracking_issue>`.
+    ///
+    /// Sits beside "View Gate A mock (PR)" 👁 deliberately: reviewing and
+    /// recording should be the same gesture. Before this, sign-off was a
+    /// convention ("merging the PR is sign-off") that anything able to merge
+    /// a PR satisfied silently, and nothing downstream ever checked — the
+    /// mocks for two consecutive coord-portal milestones merged unseen.
+    ///
+    /// `approved == false` records `--changes`, which leaves dispatch
+    /// refused; the note is deliberately not prompted for here (the TUI has
+    /// no text-input primitive on this path) — the toast points at the
+    /// `--amend` that carries the actual correction.
+    pub(crate) fn dispatch_gate_a_verdict_for_selected_pipeline_row(
+        &mut self,
+        approved: bool,
+    ) -> bool {
+        let title = if approved {
+            "Approve Gate A"
+        } else {
+            "Request Gate A changes"
+        };
+        let Some(idx) = self.pipeline_sel else {
+            return false;
+        };
+        let Some(issue) = self.pipeline_issues.get(idx).cloned() else {
+            return false;
+        };
+        let Some(repo) = issue.coord_repo.clone() else {
+            self.push_toast(
+                title,
+                "No local repo mapping for this issue — cannot record a verdict.",
+                ToastSeverity::Warning,
+            );
+            return false;
+        };
+        let flag = if approved { "--approved" } else { "--changes" };
+        let issue_str = issue.number.to_string();
+        let cmd_strs: Vec<String> = vec![
+            "gate-a".to_string(),
+            flag.to_string(),
+            repo.clone(),
+            issue_str,
+        ];
+        let cmd_refs: Vec<&str> = cmd_strs.iter().map(|s| s.as_str()).collect();
+        use crate::commands::SpawnQueuedOutcome;
+        match self.command_runner.spawn_queued(&cmd_refs) {
+            SpawnQueuedOutcome::Started => {
+                self.push_toast(
+                    if approved {
+                        "Gate A approved"
+                    } else {
+                        "Gate A changes requested"
+                    },
+                    &format!("coord {}", cmd_strs.join(" ")),
+                    ToastSeverity::Info,
+                );
+                true
+            }
+            SpawnQueuedOutcome::Queued => {
+                self.push_toast(
+                    "⏳ Queued",
+                    "Gate A verdict runs after current command",
+                    ToastSeverity::Info,
+                );
+                true
+            }
+            SpawnQueuedOutcome::Deduped => false,
+        }
+    }
+
     /// #1060 (docs/ORACLE_LOOP.md, #931): resolve the milestone
     /// tracking-issue number for `issue` via `self.data.milestone_work_orders`
     /// (#795) — the epic that owns the `## Work order` block `issue` is a

@@ -608,6 +608,9 @@ pub(crate) fn icon_for_action(action_id: &str) -> Option<&'static str> {
         "audit-outcomes" => Some("🔍"),
         "dispatch-gate-a-mock" => Some("🎭"),
         "view-gate-a-mock" => Some("👁"),
+        // #2063: the sign-off verdict, beside the 👁 it follows from.
+        "approve-gate-a" => Some("✓"),
+        "request-gate-a-changes" => Some("✎"),
         "troubleshoot-interactive" => Some("⚕"),
         "diagnose-fix-stage" => Some("⚕"),
         "diagnose-stage" => Some("⚕"),
