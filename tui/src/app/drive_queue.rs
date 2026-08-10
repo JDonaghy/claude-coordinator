@@ -1111,7 +1111,7 @@ impl CoordApp {
             (rect.height - list_h - sep_h).max(0.0),
         );
 
-        let table = DataTable {
+        let mut table = DataTable {
             id: WidgetId::new("queue-grid"),
             columns: Self::queue_columns(),
             rows: Self::queue_data_rows(&rows),
@@ -1140,12 +1140,38 @@ impl CoordApp {
             // now use it safely. `queue_h_scroll` only moves once the grid
             // has dropped below the floor above and started scrolling; see
             // its own doc comment.
-            h_scroll: self.queue_h_scroll,
+            //
+            // Placeholder here — clamped and overwritten just below, BEFORE
+            // `draw_data_table` runs, so this frame is never painted with a
+            // stale offset (see the clamp's own comment for why "clamp
+            // after paint" isn't good enough).
+            h_scroll: 0.0,
             // No column-resize drag on this table yet (#1853 covers that for
             // the Reports result table).
             column_overrides: Vec::new(),
             footer: None,
         };
+        // #2043 fix: a resize (or anything else that shrinks `content_width`
+        // back to/under the viewport — the min-width floor is the only way
+        // that happens today, but nothing here assumes that) must not let a
+        // stale `queue_h_scroll` from a previous, narrower paint go on
+        // shifting this frame's columns left. `render_queue_panel` takes
+        // `&self`, so a bare field couldn't self-correct even if it wanted
+        // to — that's why `queue_h_scroll` is a `Cell` (see its own doc
+        // comment).
+        //
+        // `data_table_layout` is a pure layout computation (no paint), so
+        // probing it here to learn `content_width`/`viewport_width` before
+        // the real `draw_data_table` call below costs nothing visually and
+        // is what lets the clamp land BEFORE this frame paints, not after —
+        // clamping post-paint would still ship one fully mis-rendered frame
+        // per resize, exactly the bug this fixes.
+        let probe = backend.data_table_layout(list_rect, &table);
+        let visible_w = (probe.viewport_width - probe.scrollbar_width).max(1.0);
+        let clamped_h_scroll =
+            Self::queue_clamp_h_scroll(self.queue_h_scroll.get(), probe.content_width, visible_w);
+        self.queue_h_scroll.set(clamped_h_scroll);
+        table.h_scroll = clamped_h_scroll;
         let layout = backend.draw_data_table(list_rect, &table, None);
         // Cached WITH the rect it was painted into — the Reports pattern,
         // not Audit's. This table does not necessarily start at the main
@@ -1440,13 +1466,24 @@ impl CoordApp {
             (rect.x, visible_w, layout.content_width, visible_w)
         };
         let max_scroll = (content_w - visible_w).max(0.0);
-        self.queue_h_scroll = if max_scroll <= 0.0 {
+        self.queue_h_scroll.set(if max_scroll <= 0.0 {
             0.0
         } else {
             let frac = ((pos.x - track_x0) / track_w).clamp(0.0, 1.0);
             frac * max_scroll
-        };
+        });
         true
+    }
+
+    /// #2043: clamp `h_scroll` to `[0, content_width - visible_width]` —
+    /// the single formula `queue_apply_hscroll`, `queue_apply_hwheel`, and
+    /// `render_queue_panel`'s per-frame resize self-heal all defer to, so
+    /// click, wheel, and a bare repaint can never disagree on where "all
+    /// the way right" is (or, once the grid stops scrolling at all, that
+    /// it's `0.0`).
+    fn queue_clamp_h_scroll(h_scroll: f32, content_width: f32, visible_width: f32) -> f32 {
+        let max_scroll = (content_width - visible_width).max(0.0);
+        h_scroll.clamp(0.0, max_scroll)
     }
 
     /// #2043: step `queue_h_scroll` by one wheel notch — the horizontal
@@ -1472,12 +1509,12 @@ impl CoordApp {
         };
         let max_scroll = (content_w - visible_w).max(0.0);
         if max_scroll <= 0.0 {
-            self.queue_h_scroll = 0.0;
+            self.queue_h_scroll.set(0.0);
             return false;
         }
         const STEP: f32 = 4.0;
-        let next = self.queue_h_scroll + delta_x.signum() * STEP;
-        self.queue_h_scroll = next.clamp(0.0, max_scroll);
+        let next = self.queue_h_scroll.get() + delta_x.signum() * STEP;
+        self.queue_h_scroll.set(next.clamp(0.0, max_scroll));
         true
     }
 
@@ -2941,5 +2978,44 @@ mod tests {
             menu.contains("Resume"),
             "right-click on a held row must offer Resume:\n{menu}"
         );
+    }
+
+    // ── #2043 fix: `queue_clamp_h_scroll` resize self-heal ─────────────────
+    //
+    // `TuiDriver` has no way to change a running driver's terminal width
+    // (`TuiDriver::new` bakes it into the `TestBackend` for the driver's
+    // whole life — see `quadraui::tui::testing`), so there is no in-crate
+    // black-box way to drive an actual "narrow, scroll, then widen" resize
+    // through `dispatch_handle` the way the other #2043 acceptance tests
+    // drive clicks/drags/wheel. These are direct unit tests of the pure
+    // clamp formula `render_queue_panel` calls before every paint instead —
+    // see that call site's doc comment for why the clamp has to run BEFORE
+    // `draw_data_table`, not after. The real end-to-end resize scenario
+    // (narrow → scroll → widen) is called out in SMOKE_TESTS for manual
+    // verification against a live terminal.
+
+    #[test]
+    fn queue_clamp_h_scroll_is_a_no_op_within_bounds() {
+        assert_eq!(CoordApp::queue_clamp_h_scroll(20.0, 200.0, 100.0), 20.0);
+    }
+
+    #[test]
+    fn queue_clamp_h_scroll_pulls_a_too_large_offset_down_to_the_new_max() {
+        // The exact resize-back-above-the-floor shape the bug report
+        // describes: `h_scroll` was 20 while the grid was narrow and
+        // scrolling (content_width=200, visible=100 ⇒ max_scroll=100), the
+        // terminal widened so the SAME table now has content_width=100 at
+        // visible=100 — no more room to scroll at all, so the offset must
+        // collapse to 0, not stay pinned at a now-meaningless 20.
+        assert_eq!(CoordApp::queue_clamp_h_scroll(20.0, 100.0, 100.0), 0.0);
+        // A partial shrink — still scrolling, but the old offset now
+        // overshoots the new (smaller) max — clamps down to the new max
+        // rather than staying past the end of the content.
+        assert_eq!(CoordApp::queue_clamp_h_scroll(80.0, 150.0, 100.0), 50.0);
+    }
+
+    #[test]
+    fn queue_clamp_h_scroll_never_goes_negative() {
+        assert_eq!(CoordApp::queue_clamp_h_scroll(-5.0, 200.0, 100.0), 0.0);
     }
 }

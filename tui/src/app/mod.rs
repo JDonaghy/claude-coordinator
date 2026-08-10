@@ -2404,7 +2404,16 @@ pub struct CoordApp {
     /// all (a non-zero value used to shift painted headers out from under
     /// `DataTableLayout::hit_test`, mis-routing sort clicks — see
     /// `reports.rs:76-85`).
-    queue_h_scroll: f32,
+    ///
+    /// `Cell`, not a bare `f32`, because `render_queue_panel` takes `&self`
+    /// (the immediate-mode pattern every `render_*_panel` in this crate
+    /// follows) but still has to self-correct this value every frame: a
+    /// terminal resize back above `QUEUE_MIN_WIDTH_CHARS` shrinks
+    /// `content_width` back to the viewport, and a stale offset from before
+    /// the resize must not go on shifting the painted grid left with no
+    /// scrollbar left to click to fix it. See `queue_clamp_h_scroll` and
+    /// its call site in `render_queue_panel`.
+    queue_h_scroll: std::cell::Cell<f32>,
     /// #2043: `true` while the operator is dragging the Queue grid's own
     /// horizontal-scrollbar thumb — set on a `MouseDown` inside
     /// `queue_scrollbar_hit`'s `Horizontal` region and cleared on
@@ -3671,7 +3680,7 @@ impl CoordApp {
             queue_split_drag: false,
             queue_separator_rect: std::cell::Cell::new(None),
             queue_vscroll_drag: false,
-            queue_h_scroll: 0.0,
+            queue_h_scroll: std::cell::Cell::new(0.0),
             queue_hscroll_drag: false,
             queue_detail_scrollbar: std::cell::RefCell::new(None),
             queue_detail_vscroll_drag: false,

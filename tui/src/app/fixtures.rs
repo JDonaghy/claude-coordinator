@@ -136,7 +136,7 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         queue_split_drag: false,
         queue_separator_rect: std::cell::Cell::new(None),
         queue_vscroll_drag: false,
-        queue_h_scroll: 0.0,
+        queue_h_scroll: std::cell::Cell::new(0.0),
         queue_hscroll_drag: false,
         queue_detail_scrollbar: std::cell::RefCell::new(None),
         queue_detail_vscroll_drag: false,
