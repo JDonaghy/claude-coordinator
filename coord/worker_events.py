@@ -631,6 +631,17 @@ def _read_tail(path: Path, tail_bytes: int) -> str:
         return f.read()
 
 
+def iter_events_from_text(text: str) -> Iterable[WorkerEvent]:
+    """Yield :class:`WorkerEvent` for each parseable line in an in-memory
+    string. Shared by :func:`iter_events` (file-backed) and callers that
+    already have the log text in hand (e.g. fetched over HTTP from a
+    remote agent) and want to avoid a redundant write-then-read."""
+    for line in text.splitlines():
+        ev = parse_event(line)
+        if ev is not None:
+            yield ev
+
+
 def iter_events(log_path: str | Path, *, tail_bytes: int = 0) -> Iterable[WorkerEvent]:
     """Yield :class:`WorkerEvent` for each parseable line in *log_path*.
 
@@ -645,10 +656,63 @@ def iter_events(log_path: str | Path, *, tail_bytes: int = 0) -> Iterable[Worker
         text = _read_tail(p, tail_bytes)
     except OSError:
         return
-    for line in text.splitlines():
-        ev = parse_event(line)
-        if ev is not None:
-            yield ev
+    yield from iter_events_from_text(text)
+
+
+# ── Single-latest-turn extraction (#2048) ───────────────────────────────────
+#
+# The liveness auditor (coord/liveness_auditor.py) must see ONLY the single
+# most recent assistant turn — never the transcript. These helpers pick that
+# one turn's text (or, for a tool-only turn with no text block, a compact
+# summary of which tools it called) out of a stream-json log.
+
+
+def _turn_text_or_tool_summary(event: WorkerEvent) -> str:
+    text = _assistant_text(event)
+    if text:
+        return text
+    message = event.raw.get("message") or {}
+    tool_names = [
+        block.get("name")
+        for block in _iter_content_blocks(message)
+        if block.get("type") == "tool_use"
+    ]
+    tool_names = [t for t in tool_names if t]
+    return f"[tool_use: {', '.join(tool_names)}]" if tool_names else ""
+
+
+def latest_assistant_turn_text_from_text(text: str) -> str | None:
+    """Return the most recent assistant turn's text (or tool-use summary)
+    found in *text*, or ``None`` if the text contains no assistant turn at
+    all. An empty string is a real, meaningful result (the last turn
+    produced neither text nor a recognised tool call) and is distinct from
+    ``None`` (no turn found to look at)."""
+    found = False
+    last_text = ""
+    for event in iter_events_from_text(text):
+        if event.type != "assistant":
+            continue
+        found = True
+        last_text = _turn_text_or_tool_summary(event)
+    return last_text if found else None
+
+
+def latest_assistant_turn_text(
+    log_path: str | Path, *, tail_bytes: int = 65536
+) -> str | None:
+    """File-backed counterpart to
+    :func:`latest_assistant_turn_text_from_text` — reads only the tail of
+    *log_path* (a full stream-json transcript can be multi-MB; the auditor
+    only ever needs the last turn) and returns ``None`` for a missing file,
+    read error, or a tail slice with no assistant turn in it."""
+    p = Path(log_path)
+    if not p.exists():
+        return None
+    try:
+        text = _read_tail(p, tail_bytes)
+    except OSError:
+        return None
+    return latest_assistant_turn_text_from_text(text)
 
 
 def parse_log(log_path: str | Path, tail_bytes: int = 65536) -> WorkerSummary:

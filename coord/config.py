@@ -13,6 +13,12 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 
+from coord.liveness_auditor import (
+    DEFAULT_DEBOUNCE_SECONDS as DEFAULT_LIVENESS_DEBOUNCE_SECONDS,
+    DEFAULT_MODEL as DEFAULT_LIVENESS_MODEL,
+    DEFAULT_STRIKES as DEFAULT_LIVENESS_STRIKES,
+    DEFAULT_TIMEOUT_SECONDS as DEFAULT_LIVENESS_TIMEOUT_SECONDS,
+)
 from coord.models import Machine, QuietHours, Repo, WorkerPermissionsConfig
 from coord.platform_paths import default_coord_dir
 
@@ -725,6 +731,49 @@ INTERACTIVE_SESSION_TYPES: frozenset[str] = frozenset({
 
 
 @dataclass
+class LivenessAuditorConfig:
+    """#2048: cheap, independent per-turn liveness auditor tunables.
+
+    ``enabled`` (default ``False``) — the auditor ships dark. It costs a
+    ``claude -p`` subprocess spawn per debounced audit and needs a
+    ``coord-serve`` restart to pick up config changes (it runs inside
+    ``coord.notify.detect_liveness_stall``, daemon-side), so it earns
+    trust the same way ``auto_dispatch_stalled``/
+    ``escalate_semantic_conflicts`` did before it: off until an operator
+    turns it on.
+
+    ``strikes`` — consecutive ``blocked`` verdicts required before an
+    ``EVENT_LIVENESS_STALL`` is raised. One bad turn is normal; this many
+    in a row is a stall. Default 3 (matches OpenChamber's Session Goals,
+    the prior art this borrows from).
+
+    ``debounce_seconds`` — minimum wall-clock gap between audits for the
+    same assignment. A stall is a multi-minute phenomenon; auditing every
+    turn buys no extra signal and pays for a process spawn each time.
+    Default 60s.
+
+    ``model`` — the model the audit subprocess runs. Default
+    ``"claude-haiku-4-5"``, the cheapest current model — the audit's whole
+    design rests on a fixed ~1k-token context, so the cost stays flat
+    regardless of session length (see ``coord/liveness_auditor.py``'s
+    module docstring for the numbers).
+
+    ``timeout_seconds`` — subprocess timeout per audit call. Default 30s.
+
+    ``claude_bin`` — override the ``claude`` binary path/name, mirroring
+    other subprocess-spawning config in this file. ``None`` (default) uses
+    the CLI's own resolution of ``claude`` on ``$PATH``.
+    """
+
+    enabled: bool = False
+    strikes: int = DEFAULT_LIVENESS_STRIKES
+    debounce_seconds: float = DEFAULT_LIVENESS_DEBOUNCE_SECONDS
+    model: str = DEFAULT_LIVENESS_MODEL
+    timeout_seconds: float = DEFAULT_LIVENESS_TIMEOUT_SECONDS
+    claude_bin: str | None = None
+
+
+@dataclass
 class PipelineConfig:
     """Assignment lifecycle gate configuration.
 
@@ -799,6 +848,11 @@ class PipelineConfig:
     ``notified`` ledger keyed by ``_stalled_notified_key`` (shared with the
     comment) still applies, so a row is acted on once per tick-cycle, not
     every 5 minutes.
+
+    ``liveness_auditor`` (#2048) configures the cheap, independent,
+    per-turn liveness auditor — see :class:`LivenessAuditorConfig`. Off by
+    default; gates nothing even when enabled (see
+    :func:`coord.notify.detect_liveness_stall`).
     """
 
     default_gates: list[str] = field(default_factory=lambda: ["test", "review", "merge"])
@@ -815,6 +869,8 @@ class PipelineConfig:
         default_factory=lambda: dict(_DEFAULT_ATTENTION_THRESHOLDS)
     )
     convergence_rounds: int = 3
+    # #2048 — DEFAULT OFF. See LivenessAuditorConfig's docstring.
+    liveness_auditor: LivenessAuditorConfig = field(default_factory=LivenessAuditorConfig)
 
     def attention_threshold_for(
         self,
@@ -2348,6 +2404,56 @@ def _parse_pipeline(raw: Any) -> PipelineConfig:
         if not isinstance(value, int) or value < 1:
             raise ConfigError("pipeline.convergence_rounds must be a positive integer")
         cfg.convergence_rounds = value
+
+    if "liveness_auditor" in raw:
+        cfg.liveness_auditor = _parse_liveness_auditor(raw["liveness_auditor"])
+
+    return cfg
+
+
+def _parse_liveness_auditor(raw: Any) -> LivenessAuditorConfig:
+    if raw is None:
+        return LivenessAuditorConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'pipeline.liveness_auditor' must be a mapping")
+
+    cfg = LivenessAuditorConfig()
+
+    if "enabled" in raw:
+        value = raw["enabled"]
+        if not isinstance(value, bool):
+            raise ConfigError("pipeline.liveness_auditor.enabled must be a boolean")
+        cfg.enabled = value
+
+    if "strikes" in raw:
+        value = raw["strikes"]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ConfigError("pipeline.liveness_auditor.strikes must be a positive integer")
+        cfg.strikes = value
+
+    if "debounce_seconds" in raw:
+        cfg.debounce_seconds = _parse_duration_seconds(
+            raw["debounce_seconds"], context="pipeline.liveness_auditor.debounce_seconds"
+        )
+
+    if "model" in raw:
+        value = raw["model"]
+        if not isinstance(value, str) or not value.strip():
+            raise ConfigError("pipeline.liveness_auditor.model must be a non-empty string")
+        cfg.model = value.strip()
+
+    if "timeout_seconds" in raw:
+        cfg.timeout_seconds = _parse_duration_seconds(
+            raw["timeout_seconds"], context="pipeline.liveness_auditor.timeout_seconds"
+        )
+
+    if "claude_bin" in raw:
+        value = raw["claude_bin"]
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise ConfigError(
+                "pipeline.liveness_auditor.claude_bin must be a non-empty string or null"
+            )
+        cfg.claude_bin = value.strip() if isinstance(value, str) else None
 
     return cfg
 
