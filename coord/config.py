@@ -735,12 +735,16 @@ class LivenessAuditorConfig:
     """#2048: cheap, independent per-turn liveness auditor tunables.
 
     ``enabled`` (default ``False``) — the auditor ships dark. It costs a
-    ``claude -p`` subprocess spawn per debounced audit and needs a
-    ``coord-serve`` restart to pick up config changes (it runs inside
-    ``coord.notify.detect_liveness_stall``, daemon-side), so it earns
-    trust the same way ``auto_dispatch_stalled``/
-    ``escalate_semantic_conflicts`` did before it: off until an operator
-    turns it on.
+    ``claude -p`` subprocess spawn per debounced audit, so it earns trust
+    the same way ``auto_dispatch_stalled``/``escalate_semantic_conflicts``
+    did before it: off until an operator turns it on. Unlike a
+    daemon-side setting, a config change here does NOT need a
+    ``coord-serve`` restart: ``detect_liveness_stall`` only runs inside
+    ``coord notify``'s ``run()``, invoked as a fresh CLI process by the
+    ``coord-notify.timer`` systemd unit (or by ``coord drive``'s stall
+    nudge) — each invocation loads this config fresh off disk, so an edit
+    takes effect on the next timer tick (≤5 min), independent of any
+    long-running daemon.
 
     ``strikes`` — consecutive ``blocked`` verdicts required before an
     ``EVENT_LIVENESS_STALL`` is raised. One bad turn is normal; this many

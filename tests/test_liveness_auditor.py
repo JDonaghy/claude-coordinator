@@ -89,6 +89,30 @@ class TestBuildAuditUserMessage:
         msg2 = build_audit_user_message("obj", "turn")
         assert msg1 == msg2
 
+    def test_long_objective_is_excerpted(self) -> None:
+        """A real GitHub-issue briefing regularly runs 5,000-15,000+
+        tokens — the auditor's cost model budgets an ~300-token excerpt,
+        not the whole document (#2048 review). A raw multi-KB briefing
+        passed straight through must not blow past that budget."""
+        huge_briefing = "x" * 50_000
+        msg = build_audit_user_message(huge_briefing, "did some work")
+        # The full 50k-char briefing must not appear verbatim.
+        assert huge_briefing not in msg
+        # But the message is still small — bounded, not merely "smaller".
+        assert len(msg) < 5_000
+        assert "[truncated]" in msg
+
+    def test_long_turn_text_is_excerpted(self) -> None:
+        huge_turn = "y" * 50_000
+        msg = build_audit_user_message("objective", huge_turn)
+        assert huge_turn not in msg
+        assert len(msg) < 5_000
+        assert "[truncated]" in msg
+
+    def test_short_objective_and_turn_not_marked_truncated(self) -> None:
+        msg = build_audit_user_message("short objective", "short turn")
+        assert "[truncated]" not in msg
+
 
 # ── parse_verdict ────────────────────────────────────────────────────────────
 
