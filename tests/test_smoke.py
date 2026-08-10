@@ -1828,6 +1828,8 @@ def test_dispatch_pending_smoke_says_why_it_skipped_test_mode_smoke(
     import logging
 
     monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: "smoke")
+    # Process-lifetime dedupe set — isolate this test from any earlier one.
+    monkeypatch.setattr("coord.smoke._TEST_MODE_SKIP_LOGGED", set())
 
     board = Board(completed=[_completed()])
     with caplog.at_level(logging.INFO, logger="coord.smoke"):
@@ -1841,3 +1843,12 @@ def test_dispatch_pending_smoke_says_why_it_skipped_test_mode_smoke(
     # The policy itself is untouched: still no dispatch, no verdict invented.
     assert board.active == []
     assert board.completed[0].test_state is None
+
+    # ...and it says it ONCE per process, not once per tick. #1678 is the
+    # standing lesson here: this row can legitimately sit unresolved for
+    # hours, and a refusal re-logged every 30 s against a state that cannot
+    # change is its own kind of noise.
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="coord.smoke"):
+        assert dispatch_pending_smoke(board, gtk_and_server_config) == []
+    assert [r for r in caplog.records if "test-mode:smoke" in r.getMessage()] == []
