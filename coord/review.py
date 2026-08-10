@@ -831,6 +831,135 @@ def fetch_review_findings_from_github(
     return None
 
 
+# ── Test-gate verdict output parsing (#1351) ────────────────────────────────
+#
+# A human-attended Test (smoke) session had, before this, exactly ONE channel
+# for its verdict to reach the board: the agent successfully running `coord
+# test --passed|--fail` INSIDE the session. If `coord` wasn't on the
+# session's PATH, the command errored, or the agent simply never got to it,
+# the verdict was gone — no structured block, no transcript floor, no
+# fallback. This is the same gap #651 closed for reviews (the
+# ``REVIEW_VERDICT:``/``REVIEW_BODY:``/``END_REVIEW`` block, recovered by the
+# #606 transcript-floor even when ``coord report-result`` never ran), applied
+# to the Test gate: ``TEST_VERDICT: passed|failed`` / ``TEST_REASON:`` /
+# ``END_TEST``, parsed exactly as tolerantly as ``_REVIEW_BLOCK_RE`` parses a
+# review — Markdown decoration around the markers (bold, code-spans,
+# headings) is absorbed by the same ``_MD`` pattern, for the same #1346
+# reason: a reviewer/tester that bolds ``**TEST_VERDICT:**`` must not have an
+# otherwise-complete, correctly-terminated block silently discarded.
+
+@dataclass
+class TestVerdictFindings:
+    """Structured Test-gate verdict extracted from a smoke-session log."""
+    __test__ = False  # not a pytest test class — the name just starts with "Test"
+    verdict: str  # "passed" or "failed"
+    reason: str
+
+
+_TEST_BLOCK_RE = re.compile(
+    rf"TEST_VERDICT:{_MD}(passed|failed|pass|fail){_MD}[\r\n]+"
+    rf"(?:{_MD}TEST_REASON:{_MD}[\r\n]+)?(.*?)[\r\n]*{_MD}END_TEST",
+    re.DOTALL | re.IGNORECASE,
+)
+
+# Map short-form aliases to the canonical verdicts, mirroring
+# `_VERDICT_ALIASES` for the review block.
+_TEST_VERDICT_ALIASES: dict[str, str] = {
+    "pass": "passed",
+    "fail": "failed",
+}
+
+
+def _parse_test_verdict_text(text: str) -> TestVerdictFindings | None:
+    """Extract the last TestVerdictFindings block from *text*, or None.
+
+    Mirrors :func:`_parse_review_text` exactly: *text* is decoded via
+    :func:`_decode_transcript_for_diagnostic` first (a stream-json log stores
+    every real newline inside the assistant's text as the two-character
+    escape ``\\n``, which ``[\\r\\n]+`` can never match undecoded), and the
+    LAST match wins (``matches[-1]``, not ``.search()``) so a tester that
+    second-guesses itself mid-session has its final verdict win, and so the
+    non-JSON argv/header comment line's embedded briefing template (which
+    contains this exact block as an example — see ``_smoke_report_reminder``
+    in ``coord/commands/dispatch_workers.py``) never wins over a real,
+    later verdict.
+    """
+    decoded = _decode_transcript_for_diagnostic(text)
+    search_text = text if decoded is None else decoded
+    matches = list(_TEST_BLOCK_RE.finditer(search_text))
+    if not matches:
+        return None
+    m = matches[-1]
+    verdict_raw = m.group(1).lower().strip()
+    verdict = _TEST_VERDICT_ALIASES.get(verdict_raw, verdict_raw)
+    reason = m.group(2).strip()
+    if verdict not in ("passed", "failed"):
+        return None
+    return TestVerdictFindings(verdict=verdict, reason=reason)
+
+
+def _parse_test_verdict_from_lines(
+    lines: Iterable[str],
+    *,
+    stream_json: bool,
+) -> TestVerdictFindings | None:
+    """Shared core: extract a Test-gate verdict from log lines.
+
+    Mirrors :func:`_parse_review_from_lines` — used by both
+    :func:`parse_test_verdict_from_log` (local file) and the remote
+    transcript-floor's own file-fetch-then-parse path.
+    """
+    from coord.worker_events import _assistant_text, parse_event  # noqa: PLC0415
+
+    if not stream_json:
+        text = "\n".join(lines)
+        return _parse_test_verdict_text(text)
+
+    all_texts: list[str] = []
+    for line in lines:
+        event = parse_event(line.rstrip("\n"))
+        if event is None:
+            continue
+        if event.type == "assistant":
+            text = _assistant_text(event)
+            if text:
+                all_texts.append(text)
+    # Search from the end — the tester emits the verdict last.
+    for text in reversed(all_texts):
+        findings = _parse_test_verdict_text(text)
+        if findings is not None:
+            return findings
+    # Fallback: search the full concatenated text (handles multi-turn output).
+    return _parse_test_verdict_text("\n".join(all_texts))
+
+
+def parse_test_verdict_from_log(log_path: str | Path) -> TestVerdictFindings | None:
+    """Parse a Test-gate verdict from a completed smoke-session log (#1351).
+
+    Sibling to :func:`parse_review_from_log`: same stream-json/plain-text
+    on-disk-shape detection, same tolerant grammar. Returns ``None`` if the
+    file does not exist or contains no structured ``TEST_VERDICT:`` block.
+    """
+    from coord.worker_events import is_stream_json  # noqa: PLC0415
+
+    p = Path(log_path)
+    if not p.exists():
+        return None
+
+    if is_stream_json(p):
+        try:
+            with open(p, encoding="utf-8", errors="replace") as f:
+                return _parse_test_verdict_from_lines(f, stream_json=True)
+        except OSError:
+            return None
+    else:
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+        return _parse_test_verdict_from_lines(text.splitlines(), stream_json=False)
+
+
 REVIEWER_SYSTEM_PROMPT = """\
 You are an independent code reviewer dispatched by the coordinator. \
 Your job is to find problems — do NOT rubber-stamp.
