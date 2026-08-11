@@ -82,6 +82,48 @@ def _issue_has_plan_assignment(assignments_for_issue: list) -> bool:
     return any(a.type == "plan" for a in assignments_for_issue)
 
 
+def _work_ids_for_issue(assignments_for_issue: list, seed_work_id: str | None = None) -> set[str]:
+    """Every ``CLOSES_ISSUE_TYPES`` assignment id for this issue, plus
+    *seed_work_id* when given (#292: a queue entry keyed to a work id whose
+    row has since been pruned from the board)."""
+    work_ids = {
+        a.assignment_id
+        for a in assignments_for_issue
+        if a.type in CLOSES_ISSUE_TYPES and a.assignment_id
+    }
+    if seed_work_id:
+        work_ids.add(seed_work_id)
+    return work_ids
+
+
+def _review_verdict_events(assignments_for_issue: list, work_ids: set[str]) -> list:
+    """Every verdict-bearing event connected to *work_ids*: dedicated
+    ``type="review"`` rows scoped by ``review_of_assignment_id``, AND (#331)
+    a verdict stamped directly on a work row itself (self-approval /
+    PR-comment-fallback, no separate reviewer dispatched).
+
+    #2085 (non-blocking finding): shared by :func:`issue_has_any_approved_review`
+    and the "review" stage branch of :func:`stage_status_for` so the two can
+    never disagree about which events count. Before this was factored out,
+    ``stage_status_for``'s ``assignments_for_stage(..., "review", ...)`` only
+    ever matched ``type == "review"`` rows — a self-approval stamped directly
+    on a work row (no dedicated review assignment at all) was invisible to
+    it, so ``has_approved_review: True`` could sit next to
+    ``stages["review"]`` reading ``PENDING``/``SKIPPED`` in the same
+    projection — the same READY-vs-refused disagreement #2085 is about, just
+    via a different path.
+    """
+    return [
+        a
+        for a in assignments_for_issue
+        if a.review_verdict
+        and (
+            (a.type == "review" and a.review_of_assignment_id in work_ids)
+            or a.assignment_id in work_ids
+        )
+    ]
+
+
 def assignments_for_stage(
     assignments_for_issue: list,
     stage: str,
@@ -336,6 +378,15 @@ def stage_status_for(
 ) -> str:
     """Mirrors ``pipeline.rs::stage_status_for`` — the generic per-stage
     dispatcher, including the #193 "stale downstream verdict" check.
+
+    #2085: the "review" stage branch deliberately DIVERGES from
+    ``pipeline.rs`` in one respect — it also folds in a #331 self-approval
+    verdict stamped directly on a work row (see the ``stage == "review"``
+    block below). That closes a same-projection disagreement this server
+    endpoint can produce (``has_approved_review: True`` next to
+    ``stages["review"]`` reading ``PENDING``); local-mode ``coord-tui``
+    (no server) still has the older, narrower behavior until the Rust side
+    picks up the equivalent fix.
     """
     if stage == "merge":
         return merge_stage_status_for(
@@ -347,6 +398,18 @@ def stage_status_for(
         )
 
     matching = assignments_for_stage(assignments_for_issue, stage, require_plan=require_plan)
+    if stage == "review":
+        # #2085 (non-blocking finding): `assignments_for_stage`'s strict
+        # `type == "review"` filter misses a #331 self-approval verdict
+        # stamped directly on a work row — fold in the SAME event set
+        # `issue_has_any_approved_review` scans so the "review" stage badge
+        # and the projection's `has_approved_review` field can't disagree.
+        work_ids = _work_ids_for_issue(assignments_for_issue)
+        seen = {id(a) for a in matching}
+        matching = matching + [
+            a for a in _review_verdict_events(assignments_for_issue, work_ids)
+            if id(a) not in seen and a.type != "review"
+        ]
     # #1566: "finalizing" is a review row whose agent finished but whose
     # verdict hasn't been parsed + persisted yet (`coord notify`'s slower,
     # separate step — see `coord.reconcile.reconcile_completed_assignments`).
@@ -408,40 +471,24 @@ def issue_has_any_approved_review(
     own recorded verdict history is the best available DB-only proxy, and —
     crucially — it is the SAME ordering rule ``stage_status_for`` already
     applies to the "review" stage badge computed alongside this field in
-    :func:`compute_issue_projection`, so the two can no longer disagree the
-    way the #2085 board record did.
+    :func:`compute_issue_projection` (both now share
+    :func:`_review_verdict_events`, #2085), so the two can no longer disagree
+    the way the #2085 board record did — including the #331 self-approval
+    case, where earlier the "review" stage badge alone missed the event this
+    function already counted.
     """
     # #1142: CLOSES_ISSUE_TYPES, not a bare `type == "work"` — see the same
     # rationale in `merge_stage_status_for` above.
-    work_ids = {
-        a.assignment_id
-        for a in assignments_for_issue
-        if a.type in CLOSES_ISSUE_TYPES and a.assignment_id
-    }
-    if seed_work_id:
-        work_ids.add(seed_work_id)
-
+    work_ids = _work_ids_for_issue(assignments_for_issue, seed_work_id)
     if not work_ids:
         return False
 
-    # Every verdict-bearing event connected to this issue's work chain:
-    # dedicated ``type="review"`` rows scoped by ``review_of_assignment_id``,
-    # AND (#331) a verdict stamped directly on a work row itself
-    # (self-approval / PR-comment-fallback, no separate reviewer dispatched).
-    # The MOST RECENTLY DISPATCHED event wins — mirrors
-    # ``stage_status_for``'s own "latest by dispatch" rule for the "review"
-    # stage, so an earlier ``approve`` superseded by a later
-    # ``request-changes`` (on newer commits) no longer counts, matching what
-    # the merge gate's commit-bound check would also refuse.
-    events = [
-        a
-        for a in assignments_for_issue
-        if a.review_verdict
-        and (
-            (a.type == "review" and a.review_of_assignment_id in work_ids)
-            or a.assignment_id in work_ids
-        )
-    ]
+    # The MOST RECENTLY DISPATCHED event wins — mirrors `stage_status_for`'s
+    # own "latest by dispatch" rule for the "review" stage, so an earlier
+    # `approve` superseded by a later `request-changes` (on newer commits)
+    # no longer counts, matching what the merge gate's commit-bound check
+    # would also refuse.
+    events = _review_verdict_events(assignments_for_issue, work_ids)
     if not events:
         return False
 

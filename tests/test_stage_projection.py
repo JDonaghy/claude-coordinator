@@ -350,6 +350,35 @@ def test_approved_review_self_stamped_on_work():
     assert sp.issue_has_any_approved_review(a) is True
 
 
+def test_self_stamped_approval_is_also_reflected_in_review_stage_badge():
+    """#2085 (non-blocking finding): before this fix, a #331 self-approval
+    verdict (stamped directly on a work row, no separate ``type="review"``
+    assignment dispatched) was counted by `issue_has_any_approved_review`
+    but INVISIBLE to `stage_status_for`'s "review" stage — which only ever
+    scans `type == "review"` rows — so a projection could read
+    `has_approved_review: True` next to `stages["review"] == PENDING` at
+    once, the same READY-vs-refused self-contradiction #2085 is about, via a
+    different path. The two must agree: both now share
+    `_review_verdict_events`.
+    """
+    a = [_work(assignment_id="w1", status="done", review_verdict="approve", dispatched_at=1.0)]
+    assert sp.issue_has_any_approved_review(a) is True
+    assert sp.stage_status_for(
+        a, "review", stage_names=["work", "review"], is_closed=False, require_plan=False,
+    ) == sp.DONE
+
+
+def test_self_stamped_request_changes_is_also_reflected_in_review_stage_badge():
+    """#2085 (non-blocking finding), the mirror case: a self-stamped
+    ``request-changes`` must read FAILED on the "review" stage badge too,
+    not just count against `issue_has_any_approved_review`."""
+    a = [_work(assignment_id="w1", status="done", review_verdict="request-changes", dispatched_at=1.0)]
+    assert sp.issue_has_any_approved_review(a) is False
+    assert sp.stage_status_for(
+        a, "review", stage_names=["work", "review"], is_closed=False, require_plan=False,
+    ) == sp.FAILED
+
+
 def test_approved_review_self_stamped_on_pr_helper_does_not_count():
     """#1142: a review verdict stamped on a `pr-helper`-type row (a `coord
     pr` helper for a non-closes-issue original) must not count as an

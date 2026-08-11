@@ -1708,23 +1708,14 @@ def merge(
                 # changes visibility, never eligibility — auto-drain only
                 # ever touches PLAN_READY entries, and a blocked entry is
                 # PLAN_BLOCKED, so this is safe with `merge.auto_drain: true`.
-                gate_failures = mq.merge_gate_failures(a, cfg, board)
-                gate_note = ""
-                if gate_failures:
-                    gate_note = (
-                        " — BLOCKED: "
-                        + mq.describe_merge_gate_failures(gate_failures)
-                    )
-                # #736 / #292: use refresh_entry_assignment (not bare
-                # enqueue) so an existing PENDING entry is re-keyed to the
-                # latest fix assignment when the original assignment_id no
-                # longer matches.  Dedup by (repo_github, branch) is
-                # preserved — refresh_entry_assignment is a no-op when the
-                # entry is already correctly keyed.
+                #
                 # #934: target `feature/ms-NN` when this issue belongs to a
                 # milestone and the repo opted into the git model — the
                 # milestone lookup itself is skipped (no `gh` call) when it
                 # hasn't, falling back to `default_branch` unchanged.
+                # #2085: resolved BEFORE the gate check now (it used to run
+                # after) — `mq.live_gate_entry` below needs a target_branch
+                # to populate the #821/#1479 freshness anchors live.
                 target_branch = repo_cfg.default_branch
                 if getattr(repo_cfg, "develop_branch", None):
                     from coord.branch_model import (  # noqa: PLC0415
@@ -1737,6 +1728,34 @@ def merge(
                     )
                     target_branch = resolve_base_branch(repo_cfg, milestone_number)
 
+                # #2085: `a` is a raw board Assignment — no `branch_head_sha`/
+                # `repo_github`/`target_branch` attribute, so handing it
+                # straight to `merge_gate_failures` made the #821
+                # SHA-freshness check inside `has_approved_review`
+                # permanently unconfirmable (fails closed on every review
+                # carrying a real `review_head_sha`, i.e. virtually every
+                # modern approval) — this scan printed "BLOCKED: review
+                # required but not approved" for ordinary fresh approvals on
+                # every single invocation. `mq.live_gate_entry` builds the
+                # same live-anchored synthetic entry
+                # `coord.gates.build_gate_report` uses, backed by `_gho`
+                # (already available in this loop for the terminal-state
+                # check above), so a genuinely fresh approval reads BLOCKED
+                # only when it actually is.
+                gate_entry = mq.live_gate_entry(a, repo_cfg.github, target_branch, _gho)
+                gate_failures = mq.merge_gate_failures(gate_entry, cfg, board, _gho)
+                gate_note = ""
+                if gate_failures:
+                    gate_note = (
+                        " — BLOCKED: "
+                        + mq.describe_merge_gate_failures(gate_failures)
+                    )
+                # #736 / #292: use refresh_entry_assignment (not bare
+                # enqueue) so an existing PENDING entry is re-keyed to the
+                # latest fix assignment when the original assignment_id no
+                # longer matches.  Dedup by (repo_github, branch) is
+                # preserved — refresh_entry_assignment is a no-op when the
+                # entry is already correctly keyed.
                 if mq.refresh_entry_assignment(
                     a,
                     repo_github=repo_cfg.github,

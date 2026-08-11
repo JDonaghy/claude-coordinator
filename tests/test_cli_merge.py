@@ -1436,6 +1436,59 @@ class TestMergeAutoEnqueue:
         assert "auto-enqueued" in result.output
         assert any(e.issue_number == 947 for e in mq.load_queue())
 
+    def test_auto_enqueue_scan_confirms_fresh_approval_via_live_branch_sha(
+        self, config_file: Path, coord_dir: Path, coord_db
+    ) -> None:
+        """#2085 (fix-iteration regression guard): a review that DOES carry
+        a `review_head_sha` (essentially every real review completion) and
+        matches the branch's LIVE current head must be scanned as
+        auto-enqueued, not printed as BLOCKED. Before this fix, the
+        auto-enqueue scan called `mq.merge_gate_failures(a, cfg, board)`
+        with no `gh_ops` at all, handing `has_approved_review` a raw work
+        `Assignment` with no `branch_head_sha` — since #2085 made an
+        unconfirmed SHA fail CLOSED, every `coord merge` invocation printed
+        "BLOCKED: review required but not approved" for an ordinary fresh
+        approval, not just a superseded one.
+        """
+        from coord.models import Assignment, Board
+        from coord.state import save_board
+
+        config_file.write_text(CONFIG_YAML.replace(
+            "reviews:\n  enabled: false\n", ""
+        ))
+
+        work = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=948,
+            issue_title="#948", assignment_id="w948", type="work",
+            status="done", branch="issue-948-fix", test_state="passed",
+        )
+        review = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=948,
+            issue_title="#948 review", assignment_id="r948", type="review",
+            status="done", branch="issue-948-fix",
+            review_of_assignment_id="w948", review_verdict="approve",
+            review_head_sha="sha-current",
+        )
+        save_board(Board(active=[], completed=[work, review]))
+
+        with patch(
+            "coord.github_ops.list_remote_branch_names",
+            return_value={"main", "issue-948-fix"},
+        ), patch(
+            "coord.github_ops.get_branch_sha",
+            side_effect=lambda repo, branch: (
+                "sha-current" if branch == "issue-948-fix" else None
+            ),
+        ):
+            result = CliRunner().invoke(
+                main, ["merge", "--dry-run", "--config", str(config_file)],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "auto-enqueued" in result.output, result.output
+        assert "BLOCKED" not in result.output, result.output
+        assert any(e.issue_number == 948 for e in mq.load_queue())
+
     # ── #1490: one branch, N work rows, one queue entry ────────────────────
 
     def test_three_work_rows_one_branch_produce_one_auto_enqueue_line(

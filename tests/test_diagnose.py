@@ -475,6 +475,45 @@ def test_merge_stage_detects_and_enqueues_approved_unqueued_work(
     assert any(i.branch == "issue-1566-fix" for i in items)
 
 
+def test_merge_stage_enqueues_when_approval_confirmed_via_live_branch_sha(
+    monkeypatch, config
+) -> None:
+    """#2085 (fix-iteration regression guard): the winning review carries a
+    `review_head_sha` (as virtually every real review completion does) that
+    matches the branch's LIVE current head — `_diagnose_unqueued_merge` must
+    still enqueue it, not misreport a perfectly fresh approval as "waiting
+    on the pipeline". Before this fix, `_diagnose_unqueued_merge` called
+    `mq.passes_merge_gates(winner, config, board)` with no `gh_ops` at all,
+    handing `has_approved_review` a raw work `Assignment` with no
+    `branch_head_sha` attribute — since #2085 made an unconfirmed SHA fail
+    CLOSED, this diagnostic would call "does not (yet) pass the review/
+    smoke gates" on every ordinary approval, not just a superseded one.
+    """
+    from coord import github_ops
+    from coord import merge_queue as mq
+
+    monkeypatch.setattr(github_ops, "work_is_terminal", lambda *a, **k: False)
+    monkeypatch.setattr(
+        github_ops, "get_branch_sha",
+        lambda repo, branch: "sha-current" if branch == "issue-1566-fix" else None,
+    )
+    _stub(monkeypatch, session="dead")
+    board = _seed_1566_topology()
+    for a in board.completed:
+        if a.type == "review" and a.review_verdict == "approve":
+            a.review_head_sha = "sha-current"
+
+    res = diagnose.diagnose_stage(board, config, "api", 1566, "merge")
+
+    assert res.recovered is True
+    assert not any("nothing to reconcile" in f for f in res.findings)
+    assert not any("does not (yet) pass" in f for f in res.findings), res.findings
+    assert any("enqueued" in a for a in res.actions_taken), res.actions_taken
+
+    items = mq.load_queue()
+    assert any(i.branch == "issue-1566-fix" for i in items)
+
+
 def test_merge_stage_reports_gate_blocked_unqueued_work_not_wedged(
     monkeypatch, config
 ) -> None:

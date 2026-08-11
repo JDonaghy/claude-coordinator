@@ -743,7 +743,30 @@ def _diagnose_unqueued_merge(
         return
     winner, _superseded = winners[0]
 
-    if not mq.passes_merge_gates(winner, config, board):
+    # #2085: `winner` is a raw board Assignment — no `branch_head_sha`/
+    # `repo_github`/`target_branch` attribute, so handing it straight to
+    # `passes_merge_gates` made the #821 SHA-freshness check inside
+    # `has_approved_review` permanently unconfirmable (fails closed on every
+    # review carrying a real `review_head_sha`, i.e. virtually every modern
+    # approval — this diagnostic would report "waiting on the pipeline" for
+    # branches that actually pass every real gate). Build the same
+    # live-anchored synthetic entry `coord.gates.build_gate_report` uses so
+    # a genuinely fresh approval can still be confirmed. Falls back to the
+    # raw `winner` row (gate then fails closed, never open) when the repo
+    # isn't configured.
+    from coord import github_ops  # noqa: PLC0415
+
+    gate_entry = winner
+    repo_cfg = config.repo(repo_name)
+    if repo_cfg is not None:
+        from coord.branch_model import resolve_base_branch_for_issue_number  # noqa: PLC0415
+
+        target_branch = resolve_base_branch_for_issue_number(
+            repo_cfg, repo_cfg.github, issue_number,
+        )
+        gate_entry = mq.live_gate_entry(winner, repo_cfg.github, target_branch, github_ops)
+
+    if not mq.passes_merge_gates(gate_entry, config, board, gh_ops=github_ops):
         res.findings.append(
             f"merge stage: {branch} is done but not queued for merge, and does "
             f"not (yet) pass the review/smoke gates — winning row "
