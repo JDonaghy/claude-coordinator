@@ -677,6 +677,126 @@ the queue. Full runbook, including the enqueue commands, the `QUEUE: STALLED`
 vs `QUEUE: BLOCKED` status-bar reading, the pinned-CLI upgrade trap, and the
 `#1715` "don't queue more than ~2" caveat: [`docs/DRIVE_QUEUE.md`](DRIVE_QUEUE.md).
 
+## Daemon-host unit inventory — what dellserver runs
+
+**If the daemon host is lost, this is the list you rebuild from.** Which units
+a host runs is not derivable from the wheel: `deploy/` ships *all* of them and
+`coord release verify` deliberately refuses to infer intent from that
+(*"a release does not decide which services a host runs"* — it reports
+`10 packaged unit(s) NOT installed here` on workers and correctly does nothing
+about it). So the mapping lives here.
+
+| Unit | Role | Enable step |
+|---|---|---|
+| `coord-agent.service` | every machine | `install-agent.sh` (the only one it enables) |
+| `coord-serve.service` | daemon host | see "Board daemon" above |
+| `coord-web.service` | daemon host | see "Phone/web dashboard" above |
+| `coord-web-dist-build.timer` | daemon host | see "Web bundle rebuild" above |
+| `coord-notify.timer` | daemon host | see "Periodic `coord notify`" above |
+| `coord-drive-queue.timer` | daemon host | see "Periodic `coord drive-queue tick`" above |
+| `coord-release-propagate.timer` | daemon host | **below** |
+| `coord-db-backup.timer` | daemon host | **below** |
+
+Workers (precision, elitebook) run `coord-agent` **only**.
+
+Tracking issue for making this checkable rather than prose: **#2098**.
+
+## Fleet version propagation (`coord-release-propagate` timer, #1835/PKG-7)
+
+Publishing a release touches no running host; *propagating* it restarts every
+agent, and a restart kills every in-flight headless worker. So publish is a
+GitHub Action and propagation is a quiescence-scheduled timer on the daemon
+host. It resolves PyPI's latest, rolls the lanes it can reach, runs
+`coord release verify`, rolls back on red, and releases drive-queue deploy
+gates waiting on that deploy.
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp deploy/coord-release-propagate.service deploy/coord-release-propagate.timer \
+    ~/.config/systemd/user/
+loginctl enable-linger "$USER"
+systemctl --user daemon-reload
+systemctl --user enable --now coord-release-propagate.timer
+```
+
+**This step was missing from this document until 2026-08-10, and the timer was
+never enabled as a result.** The fleet ran 11 releases behind (0.5.15 vs
+0.5.26) for a day with every readout looking normal, because a disabled timer
+and a deferring timer produce identical evidence: nothing. Check
+`systemctl --user is-enabled coord-release-propagate.timer` before believing
+the fleet is current, and `coord release verify` for the truth per lane.
+
+**It may not get a window on its own.** Quiescence is per-host (#2067) — a busy
+host defers only itself — but there is one fleet-wide exception: if the
+**daemon host** is busy and not already on the target version, the whole run
+defers, since no host's python lane may roll ahead of an unrolled daemon (the
+documented 405). Because dellserver is both the daemon host *and* a work
+machine, any drive running there blocks the entire roll. The drive queue
+relaunches on a 3-minute tick and propagation retries every 20, so the roll
+waits on a short inter-drive gap coinciding with a propagate tick — which
+happens, but can take hours.
+
+To force the window deliberately (hold, do not kill):
+
+```bash
+systemctl --user stop coord-drive-queue.timer   # no NEW drives launch
+# let the running drive finish; then:
+coord release propagate --daemon-host dellserver
+systemctl --user start coord-drive-queue.timer
+```
+
+A queued entry carrying `--hold-after` (#1757) also creates the gap by design:
+the queue stops itself, propagation sees a *fired* gate as the opposite of
+busy, rolls, and releases the hold.
+
+## `coord.db` backups to the external SSD (interim — #1822 owns the real thing)
+
+`~/.coord/coord.db` on the daemon host is the fleet's canonical state and had
+no backup at all until 2026-08-10. This is a stopgap while **#1822**
+(continuous backup + *verified restore*, `tier:large`) is unstarted. Installed
+on dellserver:
+
+```bash
+# script: ~/.local/bin/coord-db-backup.sh   (also see #2098 — belongs in deploy/)
+systemctl --user enable --now coord-db-backup.timer      # hourly, Persistent=true
+```
+
+| | |
+|---|---|
+| target | `/media/crucial/coord-backups/` — Crucial X9 2TB SSD, **ext4** |
+| cadence | hourly, `Persistent=true` (catches up after a reboot) |
+| retention | 168 snapshots ≈ 7 days, ~68 MB each |
+| latest | `coord.db.latest` symlink |
+
+`VACUUM INTO`, never `cp`: coord-serve writes continuously, and a plain copy of
+a WAL-mode database under load can capture a torn file — the failure you only
+discover at restore. Each snapshot is `PRAGMA integrity_check`ed and asserted
+non-empty before it counts; a failed check is kept as `.REJECTED` rather than
+deleted. The script **refuses to run when the SSD is not mounted**, because
+`/media/crucial` is still a perfectly good directory on the root filesystem
+when nothing is mounted there, and would otherwise receive "backups" of the
+disk they exist to protect.
+
+Do not use `/media/passport` — that is a WD My Passport *spinning* disk
+formatted NTFS, a poor target for SQLite snapshots and permissions.
+
+Check it:
+
+```bash
+systemctl --user list-timers coord-db-backup.timer
+journalctl --user -u coord-db-backup.service --since today
+ls -lh /media/crucial/coord-backups/ | tail -5
+sqlite3 /media/crucial/coord-backups/coord.db.latest 'PRAGMA integrity_check; SELECT COUNT(*) FROM assignments;'
+```
+
+**What this does NOT protect against.** The snapshots live on a disk attached
+to the machine they protect. This covers db corruption, a bad migration,
+accidental deletion and OS-disk failure — **not** dellserver being lost, stolen
+or destroyed. And matching row counts are not a restore drill: nothing has yet
+stood a `coord-serve` up against a restored snapshot. Both gaps belong to
+#1822; the cheap interim notch is an rsync of `coord.db.latest` to one other
+fleet machine over Tailscale.
+
 ## Graphify graph: reseed a machine's local clone
 
 `graphify-out/` is **not** tracked in git (claude-coordinator, vimcode, and quadraui all gitignore it as of 2026-06-07). Each repo's knowledge graph is a regenerable, machine-local cache rebuilt by the `post-commit` / `post-checkout` git hooks. PyPI agent installs have no clone and don't need this — it applies only to machines with a **local git checkout** of these repos (the dev machine, and any worker box that builds/tests them).
