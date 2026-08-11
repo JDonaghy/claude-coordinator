@@ -19,15 +19,29 @@ from starlette.routing import Route
 
 from coord import __version__, agent_update
 from coord.agent import RUNNING, PENDING, AgentAssignment, AgentServer, AssignmentSpec
+from coord.dist_name import resolve_installed, resolve_installed_name
+from coord.dist_name import pkg_spec as _dist_pkg_spec
 from coord.events import stream_assignment_log
 from coord.openapi import build_spec, dataclass_schema, openapi_and_docs_routes
 
 
-#: What `POST /update` asks pip to install (#1237). An agent *is* the server
-#: half of the package, so it must reinstall itself WITH the `[server]` extra —
-#: a bare `claude-coordinator` upgrade would, on a fresh venv, leave the agent
-#: without starlette/uvicorn and dead on the next restart.
-AGENT_PKG_NAME = "claude-coordinator[server]"
+def _agent_pkg_spec() -> str:
+    """What `POST /update` asks pip to install (#1237). An agent *is* the
+    server half of the package, so it must reinstall itself WITH the
+    `[server]` extra — a bare upgrade would, on a fresh venv, leave the
+    agent without starlette/uvicorn and dead on the next restart.
+
+    #2103: resolved tolerantly against whichever of `code-coordinator` /
+    `claude-coordinator` is currently installed, rather than the old
+    hardcoded `claude-coordinator[server]` — installing the wrong name once
+    the fleet is mid-rename either 404s against PyPI or, worse, silently
+    reinstalls the stale package. Deliberately NOT caught here: if neither
+    name resolves, the caller (`_do_update`'s existing try/except) turns
+    that into an explicit `last_update.json` failure naming both names
+    tried, instead of guessing.
+    """
+    return _dist_pkg_spec(extra="server")
+
 
 #: The sibling systemd *user* units `POST /restart-services` (#2069) is
 #: allowed to restart. `coord-agent` is deliberately excluded — that unit
@@ -52,7 +66,7 @@ def _venv_dir() -> Path:
 
 
 def _installed_version() -> str | None:
-    """Return the currently-installed claude-coordinator version.
+    """Return the currently-installed coordinator distribution's version.
 
     #1238: ``coord.__version__`` (imported once, at module-import time — see
     the module-level ``from coord import __version__`` above) and this are
@@ -62,10 +76,15 @@ def _installed_version() -> str | None:
     without needing a restart — exactly what ``/health`` needs to tell "the
     process hasn't restarted since the last update" apart from "the update
     never happened".
+
+    #2103: tries `code-coordinator` then falls back to `claude-coordinator`
+    (see ``coord.dist_name``) rather than hardcoding one name — installing
+    under the name this process doesn't query used to make a fully-updated
+    agent report ``None`` here, the exact false negative behind the
+    fleet's most-recurring `✗ did not come back`.
     """
     try:
-        from importlib.metadata import version as _metaver  # noqa: PLC0415
-        return _metaver("claude-coordinator")
+        return resolve_installed().version
     except Exception:
         return None
 
@@ -213,10 +232,20 @@ def _detect_install_mode() -> tuple[bool, str | None]:
     *is_editable* is True when the package is installed in editable mode (i.e.
     ``pip install -e .``).  *project_path* is the on-disk source directory for
     editable installs, or *None* for regular (site-packages) installs.
+
+    #2103: ``pip show`` needs an exact distribution name, so this resolves
+    which of `code-coordinator` / `claude-coordinator` is actually installed
+    (see ``coord.dist_name``) first rather than hardcoding one — asking
+    `pip show` for a name nothing is installed under always reports "not
+    editable", which would misreport a real editable install once the
+    fleet's mid-rename.
     """
+    dist_name = resolve_installed_name()
+    if dist_name is None:
+        return False, None
     try:
         result = subprocess.run(
-            [sys.executable, "-m", "pip", "show", "claude-coordinator"],
+            [sys.executable, "-m", "pip", "show", dist_name],
             capture_output=True,
             text=True,
             timeout=15,
@@ -823,7 +852,7 @@ def build_app(
             try:
                 venv_dir = _venv_dir()
                 result = agent_update.perform_update(
-                    venv_dir, AGENT_PKG_NAME, target_version=target_version,
+                    venv_dir, _agent_pkg_spec(), target_version=target_version,
                 )
                 payload["finished_at"] = time.time()
                 # Persist the full venv/pip/smoke-check transcript to a log
