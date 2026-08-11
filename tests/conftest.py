@@ -175,6 +175,38 @@ def _no_live_gh(monkeypatch):
     monkeypatch.setattr(github_ops, "_gh", _gh_guard)
 
 
+@pytest.fixture(autouse=True)
+def _interactive_stdin_is_tty(monkeypatch):
+    """#2086: ``coord assign --interactive`` now refuses up front when
+    stdin is not a TTY (``coord.commands.dispatch._stdin_is_tty()``) — a
+    human-attended session has no operator to drive the paste/attach
+    handshake without one. Under pytest, real stdin is essentially never a
+    TTY, but the large majority of ``--interactive`` dispatch tests
+    (``test_cli_assign.py``, ``test_cli_assign_interactive_remote.py``,
+    ...) mock out the actual launcher
+    (``launch_human_attended_interactive`` / ``_launch_via_tmux``) entirely
+    and are modelling an operator sitting at a real terminal, not the
+    headless/no-TTY failure mode this gate exists to catch. Default to
+    ``True`` here — mirroring every other "safe default, tests exercising
+    the real thing opt out" fixture above — so those tests keep exercising
+    what they were written to exercise.
+
+    Patches the ``_stdin_is_tty()`` seam rather than ``sys.stdin.isatty``
+    directly: these tests drive the CLI through
+    ``click.testing.CliRunner.invoke()``, which swaps in its own
+    (permanently non-TTY) stdin object for the duration of the call — a
+    pre-``invoke()`` patch of the OLD ``sys.stdin`` object's ``isatty``
+    attribute has no effect on CliRunner's replacement. The handful of
+    tests for the refusal itself patch
+    ``coord.commands.dispatch._stdin_is_tty`` back to ``False`` (or, for
+    the pre-existing non-TTY review/test-verdict relay paths in
+    ``coord/commands/review.py`` — which are NOT reached through
+    CliRunner — monkeypatch ``sys.stdin.isatty`` directly); either runs
+    after this fixture and wins.
+    """
+    monkeypatch.setattr("coord.commands.dispatch._stdin_is_tty", lambda: True)
+
+
 def output_and_stderr(result) -> str:
     """CLI text across click versions: newer click separates stderr; older
     mixes it into .output and raises on .stderr access."""
