@@ -662,6 +662,42 @@ class TestDispatchTestAuthorInteractive:
             assert isinstance(exc_info.value, ValueError)
             assert not isinstance(exc_info.value, RuntimeError)
 
+    # ── #2086: --interactive requires a TTY ────────────────────────────
+    # `_build_interactive_launch_setup` is the SAME shared choke point
+    # `coord assign --interactive` passes through — see
+    # `coord.commands.dispatch._require_interactive_tty`'s docstring. A
+    # no-TTY dispatch here used to claim + record the assignment exactly
+    # like the `coord assign --interactive` bug #2086 describes, then fail
+    # to attach, leaving a phantom `running` row the #466 git-floor
+    # backstop could flip to a false `done`.
+
+    def test_refuses_without_tty_before_claiming_or_recording(self) -> None:
+        cfg = _config([_machine("laptop", ["coord-tui"])], driver=self._driver())
+        with patch("coord.test_author.fetch_milestone_context", return_value=self._ctx()), \
+             patch("coord.commands.dispatch._stdin_is_tty", return_value=False):
+            with pytest.raises(RuntimeError, match="--interactive requires a TTY"):
+                dispatch_test_author_interactive("coord-tui", 947, cfg)
+
+        from coord.state import build_board
+        b = build_board()
+        assert b.active == []
+        assert b.completed == [], (
+            "no assignment should be claimed/recorded when the TTY gate refuses"
+        )
+
+    def test_dry_run_bypasses_tty_requirement(self) -> None:
+        """A --dry-run preview never claims or writes anything (see
+        test_dry_run_does_not_persist_or_launch below), so it's exempt from
+        the TTY gate — mirrors `coord assign --interactive --dry-run`."""
+        cfg = _config([_machine("laptop", ["coord-tui"])], driver=self._driver())
+        with patch("coord.test_author.fetch_milestone_context", return_value=self._ctx()), \
+             patch("socket.gethostname", return_value="laptop"), \
+             patch("coord.commands.dispatch._stdin_is_tty", return_value=False):
+            exit_code = dispatch_test_author_interactive(
+                "coord-tui", 947, cfg, dry_run=True,
+            )
+        assert exit_code == 0
+
     # ── dry run ─────────────────────────────────────────────────────────
 
     def test_dry_run_does_not_persist_or_launch(self) -> None:

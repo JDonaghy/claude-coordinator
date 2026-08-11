@@ -244,6 +244,29 @@ class TestAssignInteractiveRequiresTty:
         assert result.exit_code == 0, result.output
         assert "--interactive requires a TTY" not in result.output
 
+    def test_dry_run_bypasses_tty_requirement(
+        self, config_file: Path, coord_dir: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """`--interactive --dry-run` never claims/records anything (every
+        `_dispatch_*_of` flavour short-circuits on `dry_run` before any
+        claim/attach code runs), so it's exempt from the TTY gate — a
+        script previewing what an interactive dispatch would do should be
+        able to run headlessly."""
+        monkeypatch.setattr(
+            "coord.commands.dispatch._stdin_is_tty", lambda: False
+        )
+        with patch(
+            "coord.github_ops.get_issue",
+            return_value={"title": "Some issue", "body": ""},
+        ):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "42", "--config", str(config_file),
+                 "--interactive", "--dry-run"],
+            )
+        assert result.exit_code == 0, result.output
+        assert "--interactive requires a TTY" not in result.output
+
 
 class TestAssignDryRun:
     def test_dry_run_does_not_dispatch(self, config_file: Path, coord_dir: Path) -> None:
