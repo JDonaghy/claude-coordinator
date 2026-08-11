@@ -176,6 +176,75 @@ machines:
         assert "machine 'laptop' is paused; run" not in result.output
 
 
+class TestAssignInteractiveRequiresTty:
+    """#2086: `coord assign --interactive` must refuse up front when stdin
+    is not a TTY, rather than silently degrading into a session that never
+    actually attaches (the operator's `input()` prompts swallow the
+    resulting EOFError) while the coordinator has already claimed the issue
+    and recorded a `running` assignment — which the git-floor backstop can
+    then flip to a false `done` on exit, and the auto-loop dispatches real
+    downstream stages against work that never happened.
+    """
+
+    def test_refuses_without_tty_before_any_network_or_board_write(
+        self, config_file: Path, coord_dir: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(
+            "coord.commands.dispatch._stdin_is_tty", lambda: False
+        )
+        with patch("coord.github_ops.get_issue") as mock_get_issue:
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "42", "--config", str(config_file),
+                 "--interactive"],
+            )
+        assert result.exit_code == 2
+        assert "--interactive requires a TTY" in result.output
+        # The refusal must land before the issue fetch (and therefore
+        # before any claim/board write downstream of it) — not after.
+        mock_get_issue.assert_not_called()
+
+    def test_headless_dispatch_unaffected_by_missing_tty(
+        self, config_file: Path, coord_dir: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The TTY gate is scoped to `--interactive` only — a plain headless
+        `coord assign` must dispatch normally even with no TTY on stdin
+        (the everyday case: cron, the auto-loop, CI)."""
+        monkeypatch.setattr(
+            "coord.commands.dispatch._stdin_is_tty", lambda: False
+        )
+        with patch(
+            "coord.github_ops.get_issue",
+            return_value={"title": "Some issue", "body": ""},
+        ), patch("coord.commands.dispatch._dispatch_headless") as mock_headless:
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "42", "--config", str(config_file)],
+            )
+        assert result.exit_code == 0, result.output
+        mock_headless.assert_called_once()
+
+    def test_interactive_with_tty_is_not_refused(
+        self, config_file: Path, coord_dir: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Sanity check the positive case: a real TTY on stdin sails past
+        the new gate (dry-run so nothing is actually launched)."""
+        monkeypatch.setattr(
+            "coord.commands.dispatch._stdin_is_tty", lambda: True
+        )
+        with patch(
+            "coord.github_ops.get_issue",
+            return_value={"title": "Some issue", "body": ""},
+        ):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "42", "--config", str(config_file),
+                 "--interactive", "--dry-run"],
+            )
+        assert result.exit_code == 0, result.output
+        assert "--interactive requires a TTY" not in result.output
+
+
 class TestAssignDryRun:
     def test_dry_run_does_not_dispatch(self, config_file: Path, coord_dir: Path) -> None:
         with patch("coord.github_ops.get_issue", return_value={"title": "Add feature X"}):

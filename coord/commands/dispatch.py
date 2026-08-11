@@ -32,6 +32,20 @@ from coord.commands.dispatch_workers import (
 )
 
 
+def _stdin_is_tty() -> bool:
+    """Seam over ``sys.stdin.isatty()`` (#2086).
+
+    ``click.testing.CliRunner.invoke()`` swaps in its own non-TTY stdin
+    object for the duration of the call, so a test that monkeypatches
+    ``sys.stdin.isatty`` *before* calling ``invoke()`` is patching an
+    attribute on the object ``sys.stdin`` pointed at pre-call — CliRunner's
+    replacement object is unaffected. Routing the check through this
+    module-level function gives tests (and any other caller) a stable seam
+    to patch directly instead.
+    """
+    return sys.stdin.isatty()
+
+
 @click.command(help="Brain proposes assignments for idle machines.")
 @_CONFIG_OPTION
 @click.option("--dry-run", is_flag=True, help="Plan without saving proposals.")
@@ -949,6 +963,34 @@ def assign(
             "error: --provider is not supported with --interactive "
             "(interactive sessions always use the human-attended claude-pty "
             "provider directly; there is no name to select)",
+            err=True,
+        )
+        sys.exit(2)
+
+    # #2086: refuse --interactive up front when stdin is not a TTY, rather
+    # than silently degrading. Every --interactive flavour hands the child
+    # session (and, for a remote/tmux target, the final `tmux
+    # attach-session`) the operator's own terminal — there's no human at the
+    # keyboard to drive the paste/attach handshake without one. Left
+    # unchecked, this used to fall through to `input()` in interactive.py
+    # swallowing the resulting EOFError, the attach failing ("Pseudo-terminal
+    # will not be allocated…" / "no sessions"), and the session never
+    # actually starting — yet the assignment was already claimed + recorded
+    # as dispatched by the time any of that happened, so the git-floor
+    # backstop (see finalize_interactive_exit/finalize_remote_interactive_exit
+    # in coord/interactive.py) could go on to record a false `done` and the
+    # auto-loop would dispatch real, metered downstream stages (Test, Review,
+    # Merge) against work that never happened. Same precedent as --skip-review
+    # refusing explicitly rather than silently degrading when routed to the
+    # daemon (#821/#1489): fail loudly, before the issue fetch / claim /
+    # board write ever run, so a confusing multi-minute cascade becomes one
+    # clear error instead.
+    if interactive and not _stdin_is_tty():
+        click.echo(
+            "error: --interactive requires a TTY on stdin — it drives a "
+            "human-attended claude session (pre-filling the briefing and "
+            "attaching your terminal to it). Run this from an actual "
+            "terminal, or omit --interactive for headless dispatch.",
             err=True,
         )
         sys.exit(2)
