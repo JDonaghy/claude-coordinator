@@ -657,6 +657,41 @@ def test_webapp_bundle_never_becomes_a_version_lane() -> None:
     assert "abc123" not in report.versions
 
 
+def test_tui_binary_never_becomes_a_version_lane() -> None:
+    """#2102's grading rule, pinned: `coord-tui` is graded by LOCAL build
+    staleness (binary mtime vs. `tui/` source mtime — see
+    coord/health/checks/deploy_lane_facts.py), never by comparing an
+    installed version against `--expected`/`--pypi`.
+
+    That matters now specifically because a `tui/`-only release publishes no
+    PyPI wheel (#2102): PyPI's "latest" stays on the OLD version while the
+    GitHub Release and any freshly-`coord tui update`'d binary are ahead of
+    it. A version-vs-`expected` comparison for coord-tui would therefore
+    grade every such binary "ahead of expected" and turn every tui-only
+    release into a permanent false crit — exactly the outcome #2102 warns
+    against. Since `coord-tui` never enters `report.lanes`/`report.versions`
+    at all, that trap cannot fire today. If a future change adds a real
+    installed-version lane for coord-tui, it must grade against the latest
+    GitHub Release tag, not PyPI — PyPI cannot see a tui-only release at all.
+    """
+    report = rv.verify(
+        machine_health={
+            "dellserver": _health(
+                _agent_venv(RELEASED),
+                _result("tui_binary", severity="ok", headroom="up to date",
+                        present=True, path="~/.local/bin/coord-tui",
+                        binary_mtime=2.0, source_mtime=1.0),
+            )
+        },
+        expected=RELEASED,
+    )
+    assert report.ok, rv.render(report)
+    assert not any(lane.lane == "coord-tui" for lane in report.lanes)
+    # The only version lane present is agent_venv's — tui_binary contributed
+    # no entry to the skew map at all, not even an agreeing one.
+    assert report.versions == {RELEASED: ["~/.coord-venv (dellserver)"]}
+
+
 def test_absent_cli_venv_is_not_a_lane() -> None:
     """Most machines never had one. An absent optional lane must not become a
     permanent UNKNOWN."""

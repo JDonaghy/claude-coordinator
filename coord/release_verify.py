@@ -330,6 +330,17 @@ def findings_for_host(host: str, health: dict | None) -> list[Finding]:
             )
 
     # ── coord-tui, until PKG-3/PKG-4 give it a real channel ──────────────
+    # #2102's grading rule: staleness (this binary's mtime vs. its `tui/`
+    # source tree — see coord.health.checks.deploy_lane_facts), never a
+    # version compared against `expected`/`--pypi`. A `tui/`-only range now
+    # publishes no PyPI wheel, so PyPI's "latest" stays behind a fresh
+    # `coord tui update` on purpose — grading coord-tui's version against it
+    # would read every such release as "ahead of expected" forever. This is
+    # also why `lanes_for_host` never emits a `coord-tui` Lane at all: a
+    # WARN here is a real, actionable finding, but it must never enter
+    # `report.versions`' skew map. If coord-tui ever gets a real
+    # installed-version lane, grade it against the latest GitHub Release
+    # tag — PyPI cannot see a tui-only release.
     for row in _rows(health, "tui_binary"):
         if row.get("severity") == "warn":
             out.append(

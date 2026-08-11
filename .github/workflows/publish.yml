@@ -142,10 +142,20 @@ jobs:
     needs: [plan]
     if: needs.plan.outputs.dry_run != 'true'
     runs-on: ubuntu-latest
+    outputs:
+      # Does THIS tag's release range ship PyPI wheel content? (#2102) A
+      # `tui/`-only range still gets here — it still cuts a tag and a
+      # GitHub Release — but publish-pypi below skips the upload for it.
+      wheel: ${{ steps.wheel.outputs.wheel }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # Needed for the wheel-decision step below: it lists every
+          # existing `vX.Y.Z` tag to find the one this range released
+          # *from*. build-wheel needs the same thing for setuptools-scm and
+          # sets it for the same reason.
+          fetch-tags: true
           ref: ${{ needs.plan.outputs.ref }}
       - name: Verify tag is on main
         env:
@@ -163,6 +173,22 @@ jobs:
             echo "::error::Tag $TAG points at commit $tagged_commit, which is not an ancestor of origin/main. This tag was likely pushed from a local commit that main's branch protection rejected. Refusing to publish — merge the commit to main first, then re-tag it."
             exit 1
           fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # #2102: computed HERE, from the tag and git history alone, rather
+      # than threaded down from auto-release.yml's merge-time `decide` step
+      # — that step doesn't run at all on the `already_released_tag`
+      # recovery path or a hand-pushed tag, and this must give the same
+      # answer on every entrypoint. See next_release_tag.py's
+      # `--wheel-for-tag` and its module docstring.
+      - name: Decide whether this range ships a PyPI wheel
+        id: wheel
+        env:
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: python scripts/next_release_tag.py --wheel-for-tag "$TAG"
 
   build-wheel:
     needs: [plan, verify-tag]
@@ -288,9 +314,17 @@ jobs:
           path: release-assets/*
           if-no-files-found: error
 
+  # #2102: skipped for a `tui/`-only range. Nothing changed in the wheel this
+  # run built (it's still built and still attached to the GitHub Release
+  # below, byte-identical to its predecessor apart from the version string),
+  # so there is nothing to publish — a `tui/`-only merge must not mint a PyPI
+  # upload, and `verify-tag`'s `wheel` output (computed from the tag alone,
+  # independent of how it was triggered) is what decides. Failing OPEN: an
+  # empty/unset output (a value neither 'true' nor 'false') still publishes —
+  # see next_release_tag.py's `ships_wheel` for the same fail-open reasoning.
   publish-pypi:
-    needs: [plan, verify-assets]
-    if: needs.plan.outputs.dry_run != 'true'
+    needs: [plan, verify-tag, verify-assets]
+    if: needs.plan.outputs.dry_run != 'true' && needs.verify-tag.outputs.wheel != 'false'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -314,9 +348,16 @@ jobs:
   # has succeeded, so a Release never exists advertising a wheel that failed
   # to upload or binaries that failed to build. Skipped entirely on a dry
   # run — `verify-assets` above already proved what it would have published.
+  #
+  # `always()` + the explicit `publish-pypi` result check (#2102): a
+  # `tui/`-only range SKIPS publish-pypi above rather than failing it, and a
+  # skipped `needs` job would otherwise skip every job downstream of it by
+  # default — which would leave `tui/`-only ranges cutting no GitHub Release
+  # at all, the opposite of what this issue asks for. `success` still gates
+  # normally for a mixed range that actually published.
   release:
     needs: [plan, verify-assets, publish-pypi]
-    if: needs.plan.outputs.dry_run != 'true'
+    if: ${{ always() && needs.plan.outputs.dry_run != 'true' && needs.verify-assets.result == 'success' && (needs.publish-pypi.result == 'success' || needs.publish-pypi.result == 'skipped') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -352,10 +393,22 @@ jobs:
   # runs for BOTH entrypoints — a hand-pushed tag and the merge-triggered
   # call — because the defect it guards is a property of the release path,
   # not of any one trigger.
+  #
+  # #2102: for a `tui/`-only range this no longer means "servable from
+  # PyPI" — publish-pypi deliberately skipped, so polling the index would
+  # wait 600s and then fail loudly for a wheel that was never supposed to
+  # exist. The post-condition instead becomes "the GitHub Release exists
+  # with its assets" (`--skip-pypi`), which is #2035's actual invariant —
+  # the release path must not be able to report success while having
+  # published nothing it was supposed to. `always()` + the explicit
+  # `release` check, same reasoning as the `release` job above: publish-pypi
+  # is SKIPPED (not failed) for that range, and a skipped `needs` job would
+  # otherwise skip this post-condition too — the one job in this workflow
+  # that must never silently not run on a real release.
   # ────────────────────────────────────────────────────────────────────────
   verify-published:
-    needs: [plan, publish-pypi, release]
-    if: needs.plan.outputs.dry_run != 'true'
+    needs: [plan, verify-tag, publish-pypi, release]
+    if: ${{ always() && needs.plan.outputs.dry_run != 'true' && needs.release.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -376,8 +429,12 @@ jobs:
         env:
           TAG: ${{ needs.plan.outputs.tag }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WHEEL: ${{ needs.verify-tag.outputs.wheel }}
         run: |
-          python scripts/verify_release_published.py \
-            --tag "$TAG" \
-            --github-repo "${{ github.repository }}" \
-            --timeout 600 --interval 15
+          set -euo pipefail
+          args=(--tag "$TAG" --github-repo "${{ github.repository }}" --timeout 600 --interval 15)
+          if [ "$WHEEL" = "false" ]; then
+            echo "::notice::$TAG shipped no PyPI wheel (tui/-only range, #2102) — checking the GitHub Release only."
+            args+=(--skip-pypi)
+          fi
+          python scripts/verify_release_published.py "${args[@]}"

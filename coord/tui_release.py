@@ -14,6 +14,17 @@ install the binary without a human ever visiting the Releases page by hand.
 Kept framework-agnostic (no ``click``) so :mod:`coord.commands.tui`'s CLI
 wiring is a thin layer over functions a plain unit test can call directly.
 
+#2102: a `tui/`-only release now publishes no PyPI wheel — PyPI's simple
+index is deliberately left pointing at the older version, since the wheel a
+`tui/`-only range would build is a no-op. That is safe for this whole module
+precisely because nothing here ever asks PyPI anything: every function below
+resolves the release to install from the GitHub Releases API alone (`--repo`/
+`--api-base`, defaulting to this project's own release channel), keyed on the
+tag it is given (or, by default, ``coord.__version__`` — this coordinator's
+own installed version, resolved from :mod:`coord`, not from PyPI). Installing
+an explicit ``coord tui update --version X.Y.Z`` therefore works identically
+whether or not X.Y.Z's release carries a wheel.
+
 Two invariants drive the design:
 
 * **Atomic install.** The download always lands in a temp file *in the same

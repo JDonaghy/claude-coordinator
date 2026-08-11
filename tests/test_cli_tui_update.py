@@ -180,6 +180,43 @@ def test_tui_update_is_idempotent_when_already_current(stub_server, tmp_path: Pa
     assert "nothing to do" in result.output
 
 
+def test_tui_update_with_explicit_version_never_touches_pypi(stub_server, tmp_path: Path) -> None:
+    """#2102: a `tui/`-only release publishes no PyPI wheel — PyPI's simple
+    index stays on the OLD version on purpose. `coord tui update --version
+    X.Y.Z` must still install X.Y.Z's coord-tui binary regardless, because
+    this whole command resolves the release from the GitHub Releases API
+    alone (`fetch_release_assets`) and never consults PyPI at all. Proven
+    here with a version that would never appear on any PyPI index (unlike
+    `__version__`, which happens to be this checkout's own dev version) —
+    if this ever grew a PyPI dependency, resolving THIS version would fail."""
+    version = "999.0.0-no-such-pypi-release"
+    body = _fake_binary(version)
+    server = stub_server
+    path, payload = _release_route(
+        version,
+        [{"name": ASSET_NAME, "browser_download_url": f"{_api_base(server)}/download/{ASSET_NAME}"}],
+    )
+    server.routes[path] = ("json", payload)
+    server.routes[f"/download/{ASSET_NAME}"] = ("bytes", body)
+
+    dest = tmp_path / "bin" / "coord-tui"
+    result = CliRunner().invoke(
+        main,
+        [
+            "tui", "update",
+            "--version", version,
+            "--repo", REPO,
+            "--api-base", _api_base(server),
+            "--dest", str(dest),
+            "--timeout", "5",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    out = os.popen(f"{dest} --version").read().strip()
+    assert out == f"coord-tui {version}"
+
+
 # ── interrupted download / atomic rename ───────────────────────────────────
 
 
