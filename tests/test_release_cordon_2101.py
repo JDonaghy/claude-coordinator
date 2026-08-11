@@ -346,6 +346,63 @@ def test_the_tick_command_launches_nothing_while_this_host_is_cordoned(
     assert "cordoned: draining for v0.5.31" in result.output
 
 
+@pytest.fixture()
+def daemon_db(tmp_path: Path) -> Path:
+    """An empty on-disk board DB for the daemon under test."""
+    import sqlite3
+
+    from coord.db import _ensure_schema
+
+    path = tmp_path / "coord.db"
+    conn = sqlite3.connect(str(path))
+    try:
+        _ensure_schema(conn)
+        conn.commit()
+    finally:
+        conn.close()
+    return path
+
+
+def test_the_daemon_serves_cordons_over_the_same_pause_endpoint(
+    daemon_db, valid_config_path, monkeypatch, tmp_path
+):
+    """A cordon set on a thin client has to reach the daemon that actually
+    governs dispatch — the whole reason #1563 made pause daemon-backed, and
+    the reason this is buildable at all. Same endpoint, different owner."""
+    from starlette.testclient import TestClient
+
+    from coord.config import load as load_config
+    from coord.dao import SqliteStore
+    from coord.serve_app import build_app
+
+    monkeypatch.setenv("HOME", str(tmp_path / "daemon_home"))
+    (tmp_path / "daemon_home" / ".coord").mkdir(parents=True)
+    app = build_app(SqliteStore(daemon_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        posted = cli.post(
+            "/pause",
+            json={"machine": "server", "action": "cordon",
+                  "target_version": "0.5.31", "ttl_seconds": 600},
+        )
+        assert posted.status_code == 200
+        assert posted.json()["cordoned"] == ["server"]
+        # A cordon IS a routing pause — that is how every dispatcher honours
+        # it — while staying separately identifiable.
+        assert posted.json()["paused"] == ["server"]
+
+        body = cli.get("/pause").json()
+        assert body["cordoned"] == ["server"]
+        assert body["cordons"][0]["target_version"] == "0.5.31"
+
+        # ...and an operator's `coord unpause` does not lift it.
+        cli.post("/pause", json={"machine": "server", "action": "unpause"})
+        assert cli.get("/pause").json()["cordoned"] == ["server"]
+
+        cleared = cli.post("/pause", json={"machine": "server", "action": "uncordon"})
+        assert cleared.json() == {**cleared.json(), "changed": True}
+        assert cli.get("/pause").json()["cordoned"] == []
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # Acceptance 4 / trap C: a host that will not drain escalates VISIBLY.
 # ══════════════════════════════════════════════════════════════════════════

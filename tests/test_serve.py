@@ -134,6 +134,21 @@ def test_serve_bearer_auth(file_db: Path, valid_config_path: Path):
 # routed through it and the daemon's own tick loop agree on one copy.
 
 
+def _pause_view(cli) -> dict:
+    """`GET /pause`, narrowed to the pause axes these tests are about.
+
+    #2101 added `cordoned`/`cordons` to the same payload (a release cordon is
+    the same routing decision with a different owner). They are asserted on in
+    `tests/test_release_cordon_2101.py`; here they would only make every
+    assertion about pause restate something it does not care about.
+    """
+    body = cli.get("/pause").json()
+    assert body.get("cordons") == [] and body.get("cordoned") == [], (
+        "no test in this module cordons anything — see #2101"
+    )
+    return {k: v for k, v in body.items() if k in ("paused", "quiet")}
+
+
 def test_pause_endpoints_roundtrip(
     file_db: Path, valid_config_path: Path, monkeypatch, tmp_path: Path
 ) -> None:
@@ -142,7 +157,7 @@ def test_pause_endpoints_roundtrip(
     cfg = load_config(valid_config_path)
     app = build_app(SqliteStore(file_db), cfg)
     with TestClient(app) as cli:
-        assert cli.get("/pause").json() == {"paused": [], "quiet": []}
+        assert _pause_view(cli) == {"paused": [], "quiet": []}
 
         resp = cli.post("/pause", json={"machine": "laptop", "action": "pause"})
         assert resp.status_code == 200
@@ -151,7 +166,7 @@ def test_pause_endpoints_roundtrip(
         # client (the TUI included) tell a hand pause apart from a
         # quiet-hours one from this same endpoint.
         assert resp.json() == {"paused": ["laptop"], "quiet": [], "changed": True}
-        assert cli.get("/pause").json() == {"paused": ["laptop"], "quiet": []}
+        assert _pause_view(cli) == {"paused": ["laptop"], "quiet": []}
 
         # Pausing an already-paused machine is idempotent: changed=False.
         resp = cli.post("/pause", json={"machine": "laptop", "action": "pause"})
@@ -224,7 +239,7 @@ def test_pause_endpoints_fold_in_quiet_hours(
         # `coord pause` ever having been called — and, #1862 review finding,
         # it's also named in "quiet" so a thin client (the TUI included)
         # can tell it apart from a hand pause without a second lookup.
-        assert cli.get("/pause").json() == {"paused": ["elitebook"], "quiet": ["elitebook"]}
+        assert _pause_view(cli) == {"paused": ["elitebook"], "quiet": ["elitebook"]}
 
         # `coord unpause elitebook` grants an override — not a silent no-op,
         # not a lie ("changed" is True and it SAYS what it did, #1563).
@@ -241,7 +256,7 @@ def test_pause_endpoints_fold_in_quiet_hours(
         # this closes: `coord unpause` reporting success and then having the
         # machine paused again on the next poll) — and it's no longer
         # reported as quiet-paused either.
-        assert cli.get("/pause").json() == {"paused": [], "quiet": []}
+        assert _pause_view(cli) == {"paused": [], "quiet": []}
 
         # A machine with no `quiet_hours:` block is never touched.
         assert "server" not in cli.get("/pause").json()["paused"]

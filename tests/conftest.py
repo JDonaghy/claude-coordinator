@@ -272,6 +272,55 @@ def _no_real_agent_venv(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_pause_store(monkeypatch, tmp_path):
+    """#2101: never let a test write the OPERATOR'S real
+    ``~/.coord/paused_machines.json``.
+
+    Exactly the ``_no_real_agent_venv`` hazard one file over, and it bit the
+    same way during #2101's development: `coord release propagate` grew a step
+    that cordons every host behind the release, `tests/test_cli_release_
+    propagate.py` drives that command for real, and nothing in that module
+    isolates ``$HOME`` — so one pytest run left two release cordons in the dev
+    machine's live pause store. Every subsequent test that asked
+    ``paused_set()`` for a dispatch target then got "everything is paused",
+    which is why ~290 tests across `test_review`/`test_test_author`/… failed
+    with nothing in their own diffs to explain it.
+
+    A machine-state file that a test can write is a machine-state file a test
+    WILL write. This redirects the store to a per-test tmp file whenever the
+    resolved path would land in the real home directory, and leaves it alone
+    for the tests that already point ``$HOME`` at their own tmp dir (which
+    keeps `test_machine_pause.py`'s and #2101's own on-disk assertions
+    meaningful).
+    """
+    import os  # noqa: PLC0415
+
+    from coord import machine_pause  # noqa: PLC0415
+
+    try:
+        import pwd  # noqa: PLC0415
+
+        real_home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+    except Exception:  # noqa: BLE001 — no pwd (Windows), or an odd uid
+        real_home = Path(os.path.expanduser("~")).resolve()
+
+    original = machine_pause._state_path
+    sandbox = tmp_path / "pause-store"
+
+    def _guarded() -> Path:
+        resolved = original()
+        try:
+            if real_home in resolved.resolve().parents:
+                sandbox.mkdir(parents=True, exist_ok=True)
+                return sandbox / resolved.name
+        except OSError:
+            pass
+        return resolved
+
+    monkeypatch.setattr(machine_pause, "_state_path", _guarded)
+
+
+@pytest.fixture(autouse=True)
 def _no_dispatch_target_validation(monkeypatch):
     """#2087: default the dispatch-target gate (`record_dispatched` /
     `record_dispatched_assignment` refusing an assignment whose repo/machine
