@@ -608,6 +608,94 @@ def _row_to_dispatched_dict(row: object) -> dict:
     }
 
 
+# ── Dispatch-target validation (#2087) ───────────────────────────────────────
+#
+# 2026-08-10: a scratch reproduction script called `record_dispatched` /
+# `record_dispatched_assignment` directly against the DEFAULT state path
+# (`~/.coord/coord.db`, the daemon host's canonical DB) with test-fixture
+# values (`machine=laptop`, `repo=api`/`acme/api`) that name no real machine
+# or repo. Nothing at the write layer objected: the CLI's own `coord assign`
+# validates machine/repo against `coordinator.yml` (coord/commands/dispatch.py),
+# but that is only ONE of many callers of these functions (mock_author.py,
+# milestone_dispatch.py, dispatch_workers.py, the daemon's own
+# `/dispatched-work` and `/dispatched` HTTP handlers below, ...) — a
+# validated call site is not a validated system. The phantom `running` row
+# then silently disabled `coord retry` for its (nonexistent) machine, read as
+# a live busy signal blocking `coord release propagate`, and corrupted
+# spend/time aggregates with fabricated token counts.
+#
+# `_validate_dispatch_target` is the single gate every writer now passes
+# through — called from `_record_dispatched_local` and
+# `_record_dispatched_assignment_local` (the "state._*_local waist" #33/#1041
+# already hooks for the audit trail), not duplicated at each call site.
+
+
+class UnknownDispatchTargetError(ValueError):
+    """Raised by :func:`_validate_dispatch_target` when an assignment names a
+    ``repo_name`` or ``machine_name`` that isn't in the loaded
+    ``coordinator.yml`` (#2087). A :class:`ValueError` subclass so existing
+    ``except ValueError`` handlers (e.g. the daemon's dispatch endpoints,
+    which already map ``ValueError`` from bad request bodies to HTTP 400)
+    treat this as the client-input error it is, not a server-side write
+    failure.
+    """
+
+
+def _dispatch_target_config():
+    """Seam: the :class:`~coord.config.Config` to validate a dispatch
+    write's ``repo_name``/``machine_name`` against, or ``None`` to skip
+    validation entirely.
+
+    Production (unmocked) always loads the real ``coordinator.yml`` via
+    :func:`coord.config.load` — never ``None`` — so a stray reproduction
+    script hitting the default state path gets the exact same refusal a real
+    dispatch would.
+
+    Tests default this to ``None`` (validation skipped) via conftest.py's
+    autouse ``_no_dispatch_target_validation`` fixture: without it, every
+    test in this suite that calls ``record_dispatched`` /
+    ``record_dispatched_assignment`` would depend on whichever real
+    ``~/.coord/coordinator.yml`` happens to exist on the machine running
+    pytest, instead of the ad hoc fixture repo/machine names the suite
+    actually uses — exactly the class of non-hermetic coupling
+    ``_no_board_service`` / ``_no_real_agent_venv`` already exist to
+    prevent. Tests exercising #2087's gate itself monkeypatch this seam
+    back to a real (or fixture) ``Config``.
+    """
+    from coord import config as _config  # noqa: PLC0415
+
+    return _config.load()
+
+
+def _validate_dispatch_target(*, repo_name: str, machine_name: str) -> None:
+    """Refuse to persist an assignment naming a repo/machine that isn't in
+    the loaded ``coordinator.yml`` (#2087). Raises
+    :class:`UnknownDispatchTargetError` naming the unknown value; a no-op
+    when :func:`_dispatch_target_config` opts out (``None``).
+
+    Deliberately checks against the loaded config rather than a hardcoded
+    machine/repo list — an ephemeral worker (e.g. an Azure box mid-provision)
+    is legitimate the moment it's added to ``coordinator.yml``, same as any
+    other machine. There is no bypass flag: if a real need to dispatch to an
+    unregistered host ever shows up, that should be a deliberate, explicit
+    opt-in added then — not a silently-permissive default now.
+    """
+    cfg = _dispatch_target_config()
+    if cfg is None:
+        return
+    if cfg.repo(repo_name) is None:
+        raise UnknownDispatchTargetError(
+            f"refusing to persist assignment: repo {repo_name!r} is not in "
+            f"coordinator.yml (have: {sorted(r.name for r in cfg.repos)})"
+        )
+    if not any(m.name == machine_name for m in cfg.machines):
+        raise UnknownDispatchTargetError(
+            f"refusing to persist assignment: machine {machine_name!r} is "
+            f"not a configured machine in coordinator.yml (have: "
+            f"{sorted(m.name for m in cfg.machines)})"
+        )
+
+
 # ── Daemon routing (#590 Phase 2) ────────────────────────────────────────────
 #
 # When ``board_service`` is set (a thin client over Tailscale), an assignment
@@ -736,6 +824,12 @@ def _record_dispatched_local(
             default precedence chain).  ``None`` for callers that predate
             #324 — the TUI shows the implicit default ("claude") when NULL.
     """
+    # #2087: refuse before any side effect — see _validate_dispatch_target's
+    # docstring for the incident this closes.
+    _validate_dispatch_target(
+        repo_name=proposal.repo_name, machine_name=proposal.machine_name
+    )
+
     # #706: compute the deterministic branch name at dispatch time so the row
     # is never branch=NULL.  Mirrors agent.py:1021 exactly:
     #   branch_name = existing_branch or f"issue-{issue_number}-{_slugify(issue_title)}"
@@ -827,6 +921,12 @@ def _record_dispatched_assignment_local(
     repo_github: str,
 ) -> None:
     """Record a dispatched assignment (review, smoke, retry) from an Assignment object."""
+    # #2087: refuse before any side effect — see _validate_dispatch_target's
+    # docstring for the incident this closes.
+    _validate_dispatch_target(
+        repo_name=assignment.repo_name, machine_name=assignment.machine_name
+    )
+
     conn = get_connection()
     conn.execute(
         """INSERT INTO assignments (

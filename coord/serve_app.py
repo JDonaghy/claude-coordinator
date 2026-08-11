@@ -4677,7 +4677,10 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                 repo_github=body["repo_github"],
                 provider_name=body.get("provider_name"),
             )
-        except (TypeError, KeyError) as e:
+        # #2087: ValueError covers state.UnknownDispatchTargetError — an
+        # unconfigured repo/machine is a client-input error (400), not a
+        # server-side write failure (503).
+        except (TypeError, KeyError, ValueError) as e:
             return JSONResponse({"error": f"bad dispatch: {e}"}, status_code=400)
         except Exception as e:  # noqa: BLE001
             return JSONResponse(
@@ -4841,7 +4844,10 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             state._record_dispatched_assignment_local(
                 assignment=assignment, repo_github=body["repo_github"]
             )
-        except (TypeError, KeyError) as e:
+        # #2087: ValueError covers state.UnknownDispatchTargetError — an
+        # unconfigured repo/machine is a client-input error (400), not a
+        # server-side write failure (503).
+        except (TypeError, KeyError, ValueError) as e:
             return JSONResponse({"error": f"bad dispatch: {e}"}, status_code=400)
         except Exception as e:  # noqa: BLE001
             return JSONResponse(

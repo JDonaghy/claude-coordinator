@@ -272,6 +272,33 @@ def _no_real_agent_venv(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _no_dispatch_target_validation(monkeypatch):
+    """#2087: default the dispatch-target gate (`record_dispatched` /
+    `record_dispatched_assignment` refusing an assignment whose repo/machine
+    isn't in `coordinator.yml`) to a no-op in tests.
+
+    Without this, every test in this suite that calls those functions (or the
+    `_local` writers directly) would depend on whatever REAL
+    `~/.coord/coordinator.yml` happens to exist on the machine running
+    pytest, instead of the fixture repo/machine names (`api`/`shared`/
+    `laptop`/`server`, plus dozens of test-local ad hoc names like
+    `dellserver`/`precision`/`m1`) the suite actually uses — exactly the
+    non-hermetic coupling `_no_board_service` / `_no_real_agent_venv` above
+    already exist to prevent. This is the same incident mechanism #2087
+    itself reports: a scratch script hitting the default, unmocked config
+    path landing on whatever real config happens to be there.
+
+    Production never monkeypatches this — `coord.state._dispatch_target_config`
+    always loads the real `coordinator.yml`. Tests exercising the gate itself
+    (`tests/test_dispatch_target_validation.py`) monkeypatch this seam back to
+    a real or fixture `Config`, which — since monkeypatch application order
+    means a test's own `monkeypatch.setattr` call always runs after (and so
+    wins over) this autouse fixture's — overrides the no-op default.
+    """
+    monkeypatch.setattr("coord.state._dispatch_target_config", lambda: None)
+
+
+@pytest.fixture(autouse=True)
 def coord_db():
     """Isolated in-memory SQLite database, active for every test automatically.
 
