@@ -238,6 +238,16 @@ jobs:
   # can do: a caller cannot grant a reusable workflow more than it holds, and
   # publish.yml's `release` job needs `contents: write` to create the Release.
   # Scoping it to this job keeps the rest of the run read-only.
+  #
+  # #2102: this job hands `publish.yml` a bare tag, nothing else — no
+  # "does this range ship a wheel?" flag. That is deliberate, not an
+  # oversight: `publish.yml`'s own `verify-tag` job re-derives the wheel
+  # decision from the tag and git history alone (`next_release_tag.py
+  # --wheel-for-tag`), so it gives the same answer regardless of which path
+  # got it a tag — this job's normal `decide` step, the `already_released_tag`
+  # recovery branch above (which never runs `decide` at all), or a human's
+  # hand-pushed `git tag && git push`. Threading the decision through this
+  # job's outputs instead would have left the recovery path silently wrong.
   publish:
     needs: [decide-and-tag]
     if: >-

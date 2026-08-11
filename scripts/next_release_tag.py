@@ -76,6 +76,28 @@ publish pipeline, not a path-filter tweak. `tui/` therefore stays in
 ``test_tui_only_still_ships`` in ``tests/test_next_release_tag.py`` — is that
 decision on the record rather than left implicit.
 
+#2102 REVISITS THE OTHER HALF: THE WHEEL, NOT THE TAG
+------------------------------------------------------
+The operator call above (2026-08-10) is that a `tui/`-only merge must still
+cut ONE tag and ONE GitHub Release — `coord tui update --version X.Y.Z` needs
+somewhere to fetch the binary from — but must publish no PyPI wheel, since the
+wheel a `tui/`-only range would build is byte-identical to its predecessor
+apart from the version string. That is deliberately *not* a change to
+:func:`ships_code`/:data:`SHIPPING_PREFIXES` above: the tag/release decision
+and the wheel decision are now two separate questions, answered by
+:func:`ships_code` and :func:`ships_wheel` respectively. Keeping them separate
+functions (rather than teaching one function two return values) is what lets
+each be pinned by its own tests without the two drifting apart — see
+``test_tui_only_still_ships`` (ships_code) and
+``test_tui_only_ships_no_wheel`` (ships_wheel) in
+``tests/test_next_release_tag.py``.
+
+:func:`ships_wheel` is computed independently inside `publish.yml` (via
+``--wheel-for-tag``), not threaded through from `auto-release.yml`'s merge-time
+decision — the same policy has to hold for a hand-pushed tag and for the
+`already_released_tag` recovery path, neither of which runs `decide()` at all,
+so the wheel question has to be answerable from the tag and git history alone.
+
 VERSION SELECTION
 -----------------
 Patch bump off the highest existing ``vX.Y.Z`` tag. ``[minor]`` / ``[major]``
@@ -147,6 +169,13 @@ NON_SHIPPING_PREFIXES: tuple[str, ...] = (
     ".github/workflows/",
 )
 
+#: SHIPPING_PREFIXES entries that ship a release (a tag, a GitHub Release)
+#: but never reach the PyPI wheel specifically (#2102). `tui/` is the only
+#: member: the coord-tui binaries live on the GitHub Release, never inside
+#: the wheel, so a range that touches nothing else has no wheel content to
+#: publish. See :func:`ships_wheel`.
+WHEEL_EXCLUDED_SHIPPING_PREFIXES: tuple[str, ...] = ("tui/",)
+
 #: Case-insensitive markers in the merge commit message that suppress the
 #: release entirely.
 SKIP_MARKERS: tuple[str, ...] = ("[no release]", "[skip release]", "[no-release]")
@@ -167,6 +196,12 @@ class Decision:
     release: bool
     tag: str | None
     reason: str
+    #: Should THIS range's wheel be uploaded to PyPI (#2102)? Only meaningful
+    #: when ``release`` is True — a merge that cuts no release obviously ships
+    #: no wheel either. Kept as its own field (not folded into ``release``)
+    #: because `publish.yml` must still cut the tag and the GitHub Release for
+    #: a `tui/`-only range; only the PyPI upload is conditional.
+    wheel: bool = True
 
 
 def parse_tag(tag: str) -> tuple[int, int, int] | None:
@@ -210,6 +245,57 @@ def ships_code(changed_files: list[str]) -> bool:
     return False
 
 
+def ships_wheel(changed_files: list[str]) -> bool:
+    """Does this change reach the PyPI wheel specifically? (#2102)
+
+    A `tui/`-only range still :func:`ships_code` — it still cuts a tag and a
+    GitHub Release carrying the coord-tui binaries — but the wheel that range
+    would build is byte-identical to its predecessor apart from the version
+    string, so uploading it is pure waste and moves the fleet's PyPI-derived
+    "expected version" for a change that reaches no wheel-installed lane.
+
+    Every other :data:`SHIPPING_PREFIXES` entry either lands inside the wheel
+    (`coord/`, `pyproject.toml`, the `deploy/*` package data) or is packaging
+    machinery whose own change legitimately wants a wheel built and verified
+    end to end (`scripts/`, `MANIFEST.in`, `install-agent.sh`) — so this is
+    :func:`ships_code`'s exact allow/deny walk, with `tui/` carved out as a
+    non-wheel shipping prefix rather than a non-shipping one. An empty change
+    list fails open for the same reason ``ships_code`` does: an undetectable
+    diff must never silently skip a wheel that should have shipped.
+    """
+    if not changed_files:
+        return True
+    for path in changed_files:
+        path = path.strip()
+        if not path:
+            continue
+        if any(path.startswith(prefix) for prefix in NON_SHIPPING_PREFIXES):
+            continue
+        if any(path.startswith(prefix) for prefix in WHEEL_EXCLUDED_SHIPPING_PREFIXES):
+            continue
+        # Recognised wheel-shipping prefix, or unrecognised (fail open): ship it.
+        return True
+    return False
+
+
+def previous_tag(tags: list[str], target: str) -> tuple[int, int, int] | None:
+    """The highest parseable ``vX.Y.Z`` strictly below *target*, or ``None``.
+
+    Used from the *publish* side, where a tag has already been chosen (by
+    ``decide()``, or by a human running ``git tag`` by hand) and the question
+    is "what range did this tag release?" — the mirror image of
+    :func:`latest_tag` + :func:`bump`, which pick a *new* tag from the merge
+    side. Filtering strictly-below handles *target* already being present in
+    *tags* (the normal case: by the time `publish.yml` runs, the tag it was
+    handed has already been pushed) without a special case.
+    """
+    target_parsed = parse_tag(target)
+    parsed = [p for p in (parse_tag(t) for t in tags) if p is not None]
+    if target_parsed is not None:
+        parsed = [p for p in parsed if p < target_parsed]
+    return max(parsed) if parsed else None
+
+
 def bump(current: tuple[int, int, int], message: str) -> tuple[int, int, int]:
     """Next version, honouring ``[major]``/``[minor]`` in the commit message."""
     major, minor, patch = current
@@ -226,7 +312,7 @@ def decide(*, tags: list[str], message: str, changed_files: list[str]) -> Decisi
     lowered = message.lower()
     for marker in SKIP_MARKERS:
         if marker in lowered:
-            return Decision(False, None, f"commit message carries {marker}")
+            return Decision(False, None, f"commit message carries {marker}", wheel=False)
 
     if not ships_code(changed_files):
         return Decision(
@@ -234,18 +320,22 @@ def decide(*, tags: list[str], message: str, changed_files: list[str]) -> Decisi
             None,
             "no shipping paths touched (docs/tests only) — a PyPI version is "
             "an immutable public name; not spending one on a no-op",
+            wheel=False,
         )
 
+    wheel = ships_wheel(changed_files)
     current = latest_tag(tags)
     if current is None:
-        return Decision(True, BOOTSTRAP_TAG, "no vX.Y.Z tag exists yet")
+        return Decision(True, BOOTSTRAP_TAG, "no vX.Y.Z tag exists yet", wheel=wheel)
 
     nxt = bump(current, message)
-    return Decision(
-        True,
-        "v%d.%d.%d" % nxt,
-        "shipping paths changed; patch/minor/major bump from v%d.%d.%d" % current,
-    )
+    reason = "shipping paths changed; patch/minor/major bump from v%d.%d.%d" % current
+    if not wheel:
+        reason += (
+            " (tui/-only — no PyPI wheel to publish; GitHub Release + "
+            "coord-tui binaries only, #2102)"
+        )
+    return Decision(True, "v%d.%d.%d" % nxt, reason, wheel=wheel)
 
 
 def _git_tags() -> list[str]:
@@ -253,6 +343,38 @@ def _git_tags() -> list[str]:
         ["git", "tag", "--list", "v*"], capture_output=True, text=True, check=False
     )
     return [line.strip() for line in out.stdout.splitlines() if line.strip()]
+
+
+def _git_diff_names(base: str | None, target: str) -> list[str]:
+    """Paths that changed in *target*'s release range, for ``--wheel-for-tag``.
+
+    Mirrors ``auto-release.yml``'s "Collect changed paths" step: diff from
+    the previous release tag when there is one, otherwise show *target*'s own
+    commit tree (a repo's very first release). Failures degrade to an empty
+    list, same as an unresolvable diff anywhere else in this script — which
+    :func:`ships_wheel` fails open on, publishing the wheel rather than
+    silently dropping one that should have shipped.
+    """
+    if base:
+        out = subprocess.run(
+            ["git", "diff", "--name-only", base, target],
+            capture_output=True, text=True, check=False,
+        )
+    else:
+        out = subprocess.run(
+            ["git", "show", "--pretty=format:", "--name-only", target],
+            capture_output=True, text=True, check=False,
+        )
+    return [line.strip() for line in out.stdout.splitlines() if line.strip()]
+
+
+def _write_output(lines: list[str]) -> None:
+    for line in lines:
+        print(line)
+    github_output = os.environ.get("GITHUB_OUTPUT")
+    if github_output:
+        with open(github_output, "a", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -277,26 +399,46 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Read newline-separated changed paths from stdin as well.",
     )
+    parser.add_argument(
+        "--wheel-for-tag",
+        default=None,
+        metavar="TAG",
+        help=(
+            "Instead of the merge-time release decision above, print whether "
+            "TAG's own release range (diffed against the previous vX.Y.Z tag, "
+            "found among --tag/git) ships PyPI wheel content (#2102). This is "
+            "how `publish.yml` decides, independent of how TAG was created — "
+            "a merge-triggered auto-release, the `already_released_tag` "
+            "recovery path, or a hand-pushed tag all resolve the same way."
+        ),
+    )
     args = parser.parse_args(argv)
 
     tags = args.tags or _git_tags()
+
+    if args.wheel_for_tag:
+        target = args.wheel_for_tag.strip()
+        base = previous_tag(tags, target)
+        base_str = ("v%d.%d.%d" % base) if base else None
+        changed = _git_diff_names(base_str, target)
+        wheel = ships_wheel(changed)
+        _write_output([f"wheel={'true' if wheel else 'false'}"])
+        return 0
+
     changed = list(args.changed_files)
     if args.changed_files_from_stdin:
         changed.extend(line.strip() for line in sys.stdin.read().splitlines())
 
     decision = decide(tags=tags, message=args.message, changed_files=changed)
 
-    lines = [
-        f"release={'true' if decision.release else 'false'}",
-        f"tag={decision.tag or ''}",
-        f"reason={decision.reason}",
-    ]
-    for line in lines:
-        print(line)
-    github_output = os.environ.get("GITHUB_OUTPUT")
-    if github_output:
-        with open(github_output, "a", encoding="utf-8") as fh:
-            fh.write("\n".join(lines) + "\n")
+    _write_output(
+        [
+            f"release={'true' if decision.release else 'false'}",
+            f"tag={decision.tag or ''}",
+            f"reason={decision.reason}",
+            f"wheel={'true' if decision.wheel else 'false'}",
+        ]
+    )
     return 0
 
 

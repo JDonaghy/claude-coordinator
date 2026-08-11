@@ -36,7 +36,9 @@ from next_release_tag import (  # noqa: E402
     decide,
     latest_tag,
     parse_tag,
+    previous_tag,
     ships_code,
+    ships_wheel,
 )
 
 
@@ -138,6 +140,81 @@ def test_tui_only_still_ships():
     assert ships_code(["tui/src/panels/queue.rs"])
 
 
+# ── ships_wheel (#2102) ──────────────────────────────────────────────────
+
+
+def test_tui_only_ships_no_wheel():
+    """#2102 revisits the half #2081 deferred: a `tui/`-only range still
+    cuts a release (see `test_tui_only_still_ships` above) but its wheel is
+    byte-identical to its predecessor apart from the version string, so
+    publishing it to PyPI is pure waste. Pinned alongside `ships_code`'s
+    `tui/`-still-ships test so the two decisions cannot silently drift back
+    together."""
+    assert not ships_wheel(["tui/src/panels/queue.rs"])
+    assert not ships_wheel(["tui/src/main.rs", "tui/Cargo.toml"])
+
+
+def test_a_mixed_tui_and_coord_range_still_ships_a_wheel():
+    """A range touching `coord/` as well as `tui/` publishes the wheel
+    exactly as today — the exclusion is `tui/`-ONLY, not `tui/`-present."""
+    assert ships_wheel(["coord/cli.py", "tui/src/panels/queue.rs"])
+
+
+def test_docs_and_tests_only_ships_no_wheel_either():
+    assert not ships_wheel(["docs/AGENT_OPERATIONS.md", "tests/test_foo.py"])
+
+
+def test_a_single_coord_file_ships_a_wheel():
+    assert ships_wheel(["coord/cli.py"])
+
+
+def test_the_deploy_lane_ships_a_wheel():
+    """`deploy/*` mirrors `coord/deploy/*`, which IS package data (see
+    pyproject.toml's `[tool.setuptools.package-data]`) — this is not a
+    `tui/`-shaped exemption."""
+    assert ships_wheel(["deploy/coord-agent.service"])
+    assert ships_wheel(["install-agent.sh"])
+
+
+def test_workflow_files_only_ship_no_wheel():
+    assert not ships_wheel([".github/workflows/test.yml"])
+
+
+def test_an_undetectable_diff_ships_a_wheel():
+    """Same fail-open reasoning as `ships_code`: an unresolvable diff must
+    never silently skip a wheel that should have shipped."""
+    assert ships_wheel([])
+
+
+def test_unrecognised_paths_ship_a_wheel_too():
+    assert ships_wheel(["some_new_toplevel_dir/thing.py"])
+
+
+# ── previous_tag ─────────────────────────────────────────────────────────
+
+
+def test_previous_tag_is_the_one_directly_below_the_target():
+    tags = ["v0.5.19", "v0.5.20", "v0.5.21"]
+    assert previous_tag(tags, "v0.5.21") == (0, 5, 20)
+
+
+def test_previous_tag_excludes_the_target_itself_when_present():
+    """By the time `publish.yml` runs, the tag it was handed has already
+    been pushed and is itself in the tag list — it must not be mistaken for
+    its own predecessor."""
+    tags = ["v0.5.20", "v0.5.21"]
+    assert previous_tag(tags, "v0.5.21") == (0, 5, 20)
+
+
+def test_previous_tag_of_the_first_release_is_none():
+    assert previous_tag(["v0.0.1"], "v0.0.1") is None
+    assert previous_tag([], "v0.0.1") is None
+
+
+def test_previous_tag_ignores_unparseable_tags():
+    assert previous_tag(["nightly", "v0.5.20", "v0.5.21"], "v0.5.21") == (0, 5, 20)
+
+
 # ── bump ─────────────────────────────────────────────────────────────────
 
 
@@ -168,6 +245,7 @@ def test_a_normal_code_merge_cuts_the_next_patch():
     )
     assert decision.release
     assert decision.tag == "v0.4.111"
+    assert decision.wheel
 
 
 def test_a_docs_merge_cuts_nothing():
@@ -205,6 +283,30 @@ def test_a_tui_only_merge_still_cuts_the_next_patch():
     )
     assert decision.release
     assert decision.tag == "v0.5.21"
+
+
+def test_a_tui_only_merge_cuts_a_tag_but_no_wheel():
+    """#2102: the half #2081 deferred. One tag, one GitHub Release — but the
+    wheel that range would build is a no-op, so it must not be published."""
+    decision = decide(
+        tags=["v0.5.20"],
+        message="fix(#2064): SSE 404 is terminal",
+        changed_files=["tui/src/panels/queue.rs"],
+    )
+    assert decision.release
+    assert decision.tag == "v0.5.21"
+    assert not decision.wheel
+    assert "no PyPI wheel" in decision.reason
+
+
+def test_a_mixed_merge_cuts_a_tag_and_a_wheel():
+    decision = decide(
+        tags=["v0.5.20"],
+        message="fix(#2100): also touch coord/",
+        changed_files=["coord/cli.py", "tui/src/panels/queue.rs"],
+    )
+    assert decision.release
+    assert decision.wheel
 
 
 @pytest.mark.parametrize("marker", ["[no release]", "[skip release]", "[NO RELEASE]"])
