@@ -444,24 +444,40 @@ def test_a_busy_host_is_visible_in_a_dry_run_plan(
 # ── the roll, the final gate, and the rollback on red ────────────────────
 
 
-def _stub_lanes(monkeypatch, *, python_ok=True, calls=None, tui_local=None):
+def _stub_lanes(monkeypatch, *, python_ok=True, serve_unit_ok=None, calls=None,
+                tui_local=None):
     """Replace the three per-lane executors with recorders.
 
     *python_ok* is either a single bool applied to every host, or a
     ``{host: bool}`` mapping for tests that need one host's python lane to
     fail while another's succeeds (e.g. the daemon-leads invariant).
+
+    *serve_unit_ok* (#2095 review) mirrors *python_ok*'s shape but answers
+    the narrower question `_roll_python` now reports separately: whether
+    THIS host's own coord-serve is confirmed on target_version, independent
+    of whether some OTHER sibling (coord-web, coord-drive-queue) also failed
+    to restart — see `_roll_python`'s docstring. Left as ``None`` it tracks
+    *python_ok* 1:1 host-for-host — "the lane failed because coord-serve
+    itself failed", the historical undifferentiated shape — so tests that
+    don't care about the distinction don't have to know about it.
     """
     log = calls if calls is not None else []
 
+    def _mapped(mapping, host: str, default: bool) -> bool:
+        if isinstance(mapping, dict):
+            return mapping.get(host, default)
+        if mapping is None:
+            return default
+        return mapping
+
     def _ok_for(host: str) -> bool:
-        if isinstance(python_ok, dict):
-            return python_ok.get(host, True)
-        return python_ok
+        return _mapped(python_ok, host, True)
 
     def _python(machine, **kwargs):
         log.append(("python", machine.name))
         ok = _ok_for(machine.name)
-        return ok, "now v0.4.111" if ok else "pip failed"
+        s_ok = _mapped(serve_unit_ok, machine.name, ok)
+        return ok, ("now v0.4.111" if ok else "pip failed"), s_ok
 
     def _units(machine, **kwargs):
         log.append(("units", machine.name))
@@ -587,6 +603,56 @@ def test_a_failed_daemon_python_roll_skips_other_hosts_python_lane(
     assert not any(
         l["lane"] == "python" and l["host"] == "laptop" and l["ok"] is True
         for l in record["lanes"]
+    )
+
+
+def test_a_daemon_coord_web_only_failure_does_not_skip_other_hosts_python_lane(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    """#2095 review: `daemon_python_failed` used to be set straight from the
+    python lane's own aggregate `ok` — which #2095 correctly made `False`
+    whenever ANY restarted sibling failed, coord-web included. But the
+    cascading skip this flag drives exists to stop other hosts calling into
+    a daemon whose own coord-serve hasn't reached target_version — it has
+    nothing to do with coord-web. Reusing the aggregate for that decision
+    meant a coord-web-only failure on the daemon host (coord-serve itself
+    restarts and reports target_version fine) ALSO halted every other
+    host's python lane for the rest of the run: a materially larger blast
+    radius than before #2095, and precisely the shape of the 2026-08-10
+    incident this issue is about (dellserver's coord-serve was fine;
+    coord-web was what failed). The daemon's own lane must still fail here
+    (no `✓` over a real outage) — but `laptop` must still be allowed to
+    roll forward, because coord-serve on the daemon is fine."""
+    calls = _stub_lanes(
+        monkeypatch,
+        python_ok={"server": False, "laptop": True},
+        serve_unit_ok={"server": True},
+    )
+    _stub_verify(monkeypatch, versions={"laptop": ["0.4.110"], "server": ["0.4.110"]})
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111", "--daemon-host", "server"],
+    )
+    assert result.exit_code == 0, result.output
+    # The daemon's own python lane was attempted and failed...
+    assert ("python", "server") in calls
+    # ...but unlike a coord-serve failure, laptop's python lane WAS still
+    # attempted — coord-serve on the daemon is confirmed fine, so nothing
+    # here should have blocked it.
+    assert ("python", "laptop") in calls
+
+    record = _records(state_dir)[0]
+    server_python = next(
+        l for l in record["lanes"] if l["lane"] == "python" and l["host"] == "server"
+    )
+    assert server_python["ok"] is False, "the lane itself still failed — never a ✓"
+    laptop_python = next(
+        l for l in record["lanes"] if l["lane"] == "python" and l["host"] == "laptop"
+    )
+    assert laptop_python["ok"] is True, (
+        "a coord-web-only failure on the daemon must not cascade into "
+        "skipping every other host's python lane"
     )
 
 
@@ -1070,12 +1136,13 @@ def test_roll_python_restarts_sibling_services_after_the_venv_swap(monkeypatch):
         },
     )
 
-    ok, detail = release_cmd._roll_python(
+    ok, detail, serve_unit_ok = release_cmd._roll_python(
         _machine(), target_version="0.4.111", agent_port=7433, timeout=5.0, force=False
     )
     assert ok
     assert "now v0.4.111" in detail
     assert "restarted coord-serve" in detail
+    assert serve_unit_ok is True
     urls = [u for u, _ in posts]
     assert urls == [
         "http://server.tailnet:7433/update",
@@ -1114,7 +1181,7 @@ def test_roll_python_fails_the_lane_when_a_sibling_restart_fails(monkeypatch):
         }}, ""
 
     monkeypatch.setattr(release_cmd, "_post", _fake_post)
-    ok, detail = release_cmd._roll_python(
+    ok, detail, serve_unit_ok = release_cmd._roll_python(
         _machine(), target_version="0.4.111", agent_port=7433, timeout=5.0, force=False
     )
     assert ok is False, (
@@ -1128,6 +1195,43 @@ def test_roll_python_fails_the_lane_when_a_sibling_restart_fails(monkeypatch):
         "must not claim `coord release verify` catches this — it has no "
         "liveness lane for these units at all (#2095)"
     )
+    assert serve_unit_ok is False, (
+        "coord-serve itself was the sibling that failed — the daemon's own "
+        "API-serving unit is not confirmed on target_version"
+    )
+
+
+def test_roll_python_reports_serve_unit_ok_when_only_a_non_daemon_sibling_fails(
+    monkeypatch,
+):
+    """#2095 review: a coord-web (or coord-drive-queue) restart failure must
+    still fail the lane's own `ok` (no `✓` over a real outage) — but must
+    NOT be indistinguishable from a coord-serve failure to a caller deciding
+    whether it's safe to let other hosts' python lanes proceed. coord-serve
+    itself restarted and reports target_version fine here; only coord-web
+    failed. See coord/commands/release.py's main roll loop, which uses
+    `serve_unit_ok` (not `ok`) to decide `daemon_python_failed`."""
+    _stub_agent_update_ok(monkeypatch)
+
+    def _fake_post(url, payload, *, timeout):
+        if url.endswith("/update"):
+            return 202, {}, ""
+        return 500, {"units": {
+            "coord-serve": {"restarted": True, "detail": "active"},
+            "coord-web": {"restarted": False, "detail": "still deactivating 10s after restart"},
+        }}, ""
+
+    monkeypatch.setattr(release_cmd, "_post", _fake_post)
+    ok, detail, serve_unit_ok = release_cmd._roll_python(
+        _machine(), target_version="0.4.111", agent_port=7433, timeout=5.0, force=False
+    )
+    assert ok is False, "coord-web is still down — the lane itself must not print a ✓"
+    assert "FAILED to restart" in detail
+    assert "coord-web" in detail
+    assert serve_unit_ok is True, (
+        "coord-serve itself is fine — only coord-web failed, which must not "
+        "block other hosts' python lanes from proceeding"
+    )
 
 
 def test_roll_python_tolerates_an_agent_that_predates_restart_services(monkeypatch):
@@ -1140,11 +1244,12 @@ def test_roll_python_tolerates_an_agent_that_predates_restart_services(monkeypat
             (202, {}, "") if url.endswith("/update") else (404, {}, "")
         ),
     )
-    ok, detail = release_cmd._roll_python(
+    ok, detail, serve_unit_ok = release_cmd._roll_python(
         _machine(), target_version="0.4.111", agent_port=7433, timeout=5.0, force=False
     )
     assert ok
     assert "now v0.4.111" in detail
+    assert serve_unit_ok is True
 
 
 def test_restart_sibling_services_reports_a_mix_of_outcomes(monkeypatch):
@@ -1162,7 +1267,7 @@ def test_restart_sibling_services_reports_a_mix_of_outcomes(monkeypatch):
         }}, ""
 
     monkeypatch.setattr(release_cmd, "_post", _fake_post)
-    ok, detail = release_cmd._restart_sibling_services(
+    ok, detail, failed = release_cmd._restart_sibling_services(
         _machine(), agent_port=7433, timeout=5.0
     )
     assert not ok
@@ -1170,6 +1275,9 @@ def test_restart_sibling_services_reports_a_mix_of_outcomes(monkeypatch):
     assert "not running here: coord-drive-queue" in detail
     assert "FAILED to restart: coord-web" in detail
     assert calls == ["http://server.tailnet:7433/restart-services"]
+    # #2095 review: the per-unit failed mapping is what `_roll_python` keys
+    # its `serve_unit_ok` off of — coord-web failed, coord-serve did not.
+    assert failed == {"coord-web": "still deactivating"}
 
 
 def test_restart_sibling_services_tolerates_a_pre_2069_agent(monkeypatch):
@@ -1182,8 +1290,9 @@ def test_restart_sibling_services_tolerates_a_pre_2069_agent(monkeypatch):
     monkeypatch.setattr(
         release_cmd, "_post", lambda url, payload, *, timeout: (404, {}, "")
     )
-    ok, detail = release_cmd._restart_sibling_services(
+    ok, detail, failed = release_cmd._restart_sibling_services(
         _machine(), agent_port=7433, timeout=5.0
     )
     assert ok is None
     assert "404" in detail
+    assert failed == {}

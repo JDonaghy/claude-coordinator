@@ -654,6 +654,21 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
     # with --no-verify, not at all. So this is an enforced precondition,
     # not just an ordering suggestion: once the daemon's own python roll
     # fails, every other host's python lane is skipped outright.
+    #
+    # #2095 review: this used to be set from `_roll_python`'s own overall
+    # `ok`, which #2095 correctly made `False` whenever ANY restarted
+    # sibling failed — including coord-web, which has nothing to do with the
+    # 405 hazard this flag exists to prevent (that hazard is specifically
+    # "a caller running ahead of a daemon whose coord-serve hasn't reached
+    # target_version yet"). Reusing that aggregate here meant a coord-web-
+    # only failure on the daemon host — coord-serve itself restarts and
+    # reports target_version fine — would ALSO halt every other host's
+    # python lane for the rest of the run: a materially larger blast radius
+    # than before #2095, and exactly the shape of the 2026-08-10 incident
+    # this issue is about (dellserver's coord-serve was fine; coord-web was
+    # what failed). `_roll_python` now reports `serve_unit_ok` separately —
+    # whether coord-serve ITSELF is confirmed on target_version — and that,
+    # not the lane's own `ok`, is what decides this.
     daemon_python_failed = False
 
     for roll in rolls:
@@ -687,13 +702,13 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
             continue
 
         if roll.lane == rp.LANE_PYTHON:
-            ok, detail = _roll_python(
+            ok, detail, serve_unit_ok = _roll_python(
                 machine, target_version=record.target_version,
                 agent_port=AGENT_PORT, timeout=timeout, force=force,
             )
             if ok:
                 updated_hosts.append(roll.host)
-            elif roll.host == daemon_name:
+            elif roll.host == daemon_name and not serve_unit_ok:
                 daemon_python_failed = True
         elif roll.lane == rp.LANE_UNITS:
             ok, detail = _roll_units(machine, agent_port=AGENT_PORT)
@@ -812,18 +827,41 @@ def _local_machine_name(config) -> str | None:
 
 
 def _roll_python(machine, *, target_version: str, agent_port: int, timeout: float,
-                 force: bool) -> tuple[bool, str]:
+                 force: bool) -> tuple[bool, str, bool]:
     """POST /update and wait for the agent to actually report the version.
 
     Success is judged by the version the agent reports, never by "the POST
     was accepted" (#1568: a stale pip index makes a no-op look like a
     success) — the wait loop is ``coord agent update``'s own, reused rather
     than reimplemented so the two can't drift.
+
+    Three-element return, ``(ok, detail, serve_unit_ok)`` (#2095 review):
+
+    * ``ok`` is the whole lane's own verdict, exactly as before — #2095
+      correctly made this ``False`` whenever ANY restarted sibling failed,
+      coord-web included, so the lane never prints a `✓` over a real
+      outage.
+    * ``serve_unit_ok`` is narrower and answers a different question: is
+      *coord-serve itself* — the unit whose version every other host's
+      caller depends on, and the entire reason the main roll loop's
+      ``daemon_python_failed`` cascade exists — confirmed to be on
+      ``target_version`` and running? It is ``False`` only when the venv
+      swap itself never completed (nothing downstream can be trusted
+      either) or coord-serve was itself the sibling that failed to
+      restart. A coord-web-only (or coord-drive-queue-only) failure
+      leaves it ``True``. Reusing ``ok`` for that cascade decision used to
+      mean a coord-web outage on the daemon host — coord-serve unaffected —
+      also halted every other host's python lane for the rest of the run:
+      a materially larger blast radius than before #2095, and exactly the
+      2026-08-10 incident's shape (dellserver's coord-serve was fine;
+      coord-web was what failed). Callers deciding whether it's safe to
+      let OTHER hosts proceed must key off ``serve_unit_ok``, not ``ok``.
     """
     from coord.commands.agent_ops import (  # noqa: PLC0415
         _fetch_pre_started_at,
         _wait_agents_updated,
     )
+    from coord.release_verify import DAEMON_UNIT  # noqa: PLC0415
 
     pre = _fetch_pre_started_at([machine])
     status, body, error = _post(
@@ -832,13 +870,13 @@ def _roll_python(machine, *, target_version: str, agent_port: int, timeout: floa
         timeout=15.0,
     )
     if error:
-        return False, error
+        return False, error, False
     if status == 409:
         # The agent refused: live sessions, or an editable install. Both are
         # correct refusals and neither is this command's to override.
-        return False, str(body.get("error") or "refused (409)")
+        return False, str(body.get("error") or "refused (409)"), False
     if status != 202:
-        return False, f"HTTP {status}"
+        return False, f"HTTP {status}", False
 
     outcomes = _wait_agents_updated(
         [machine], target_version=target_version, timeout=timeout,
@@ -850,7 +888,7 @@ def _roll_python(machine, *, target_version: str, agent_port: int, timeout: floa
             outcome.get("error")
             or f"still reporting v{outcome.get('version_now', '?')} after "
                f"{timeout:.0f}s (last update result: {outcome.get('result')})"
-        )
+        ), False
 
     # #2069: /update only ever restarted the agent — coord-serve, coord-web
     # and coord-drive-queue kept running the generation they started with
@@ -858,13 +896,13 @@ def _roll_python(machine, *, target_version: str, agent_port: int, timeout: floa
     # not a separate one: it runs against whichever of those three units the
     # freshly-restarted agent finds actually running on ITS host, so a run
     # that never touches coord-web anywhere still reports "now vX.Y.Z" clean.
-    sib_ok, sib_detail = _restart_sibling_services(machine, agent_port=agent_port)
+    sib_ok, sib_detail, sib_failed = _restart_sibling_services(machine, agent_port=agent_port)
     if sib_ok is not False:
         # True (nothing failed) and None (this agent predates
         # /restart-services entirely — no channel to have restarted anything
         # through, see `_restart_sibling_services`) both still count as a
         # lane success: neither one is a service THIS run took down.
-        return True, f"now v{target_version}; {sib_detail}"
+        return True, f"now v{target_version}; {sib_detail}", True
     # #2095: this used to return `True` here too — "the venv swap succeeded"
     # bleeding into "the lane succeeded", printed as a leading `✓` over a
     # line that itself said `FAILED to restart: coord-web`. That is exactly
@@ -877,12 +915,20 @@ def _roll_python(machine, *, target_version: str, agent_port: int, timeout: floa
     # that failed to (re)start — or restarted but never answered its own
     # liveness probe, see `agent_app._probe_liveness` — is not a lane
     # success, full stop, whatever the venv itself did.
-    return False, f"now v{target_version}, but {sib_detail}"
+    #
+    # `sib_failed` is only populated when the endpoint told us per-unit
+    # detail (a real 200/500-with-`units`-body); the opaque-failure branches
+    # in `_restart_sibling_services` (a network error reaching the endpoint
+    # at all, or a 500 with no body) return it empty because coord-serve's
+    # own fate is genuinely unknown there — treated conservatively as NOT
+    # confirmed, same as before #2095's per-unit distinction existed.
+    serve_unit_ok = (DAEMON_UNIT not in sib_failed) if sib_failed else False
+    return False, f"now v{target_version}, but {sib_detail}", serve_unit_ok
 
 
 def _restart_sibling_services(
     machine, *, agent_port: int, timeout: float = 120.0
-) -> tuple[bool | None, str]:
+) -> tuple[bool | None, str, dict[str, str]]:
     """``POST /restart-services`` — the rest of a python-lane roll (#2069).
 
     ``/update`` swaps the venv and re-execs *the agent* — and nothing else.
@@ -893,7 +939,8 @@ def _restart_sibling_services(
     it finds running on its own host (see the endpoint's docstring) — this
     function only reports what came back.
 
-    Tri-state return, same convention as the other lane executors below
+    Three-element return: ``(ok, detail, failed)``. ``ok``/``detail`` follow
+    the same tri-state convention as the other lane executors below
     (``_roll_units``/``_roll_tui``'s ``ok=None`` "no channel"):
 
     * ``True`` — the endpoint answered and no unit it touched failed.
@@ -908,18 +955,29 @@ def _restart_sibling_services(
       404): there is no channel here to have restarted anything through,
       the same "unrollable" shape as a lane with no executor at all, not a
       failure of this roll.
+
+    ``failed`` (#2095 review) is the ``{unit: detail}`` mapping of units
+    explicitly confirmed to have failed to restart — empty when ``ok`` is
+    not ``False``, and ALSO empty for the opaque-failure branches below (a
+    network error reaching the endpoint, or a 500 with no ``units`` body),
+    where no individual unit's fate is actually known. ``_roll_python`` uses
+    this — not the aggregate ``ok`` — to tell whether coord-serve itself is
+    the sibling that failed, which is the only thing its ``serve_unit_ok``
+    (and, through it, the main roll loop's daemon-python-failed cascade)
+    cares about: a coord-web-only failure must not be indistinguishable from
+    a coord-serve one to that caller.
     """
     status, body, error = _post(
         f"http://{machine.host}:{agent_port}/restart-services", {}, timeout=timeout,
     )
     if error:
-        return False, f"sibling service restart: {error}"
+        return False, f"sibling service restart: {error}", {}
     if status == 404:
         # Pre-#2069 agent build: /restart-services doesn't exist yet. Not
         # this run's failure to have restarted anything through a channel
         # that was never there — `coord agent update --all` is what closes
         # this gap, not a red python lane.
-        return None, "agent predates /restart-services (HTTP 404) — update the agent build"
+        return None, "agent predates /restart-services (HTTP 404) — update the agent build", {}
     # The endpoint (`agent_app.py`'s `restart_services`) returns HTTP 500 — with the
     # *same* `{"units": {...}}` body shape as 200 — whenever any single unit fails to
     # restart. That is the exact partial-failure path this function exists to report
@@ -930,7 +988,7 @@ def _restart_sibling_services(
     # short-circuit, or a real crash would be misread as "no sibling units to
     # restart" / a false-positive success.
     if status != 200 and not (status == 500 and "units" in body):
-        return False, f"sibling service restart: {body.get('error') or f'HTTP {status}'}"
+        return False, f"sibling service restart: {body.get('error') or f'HTTP {status}'}", {}
 
     units = body.get("units") or {}
     restarted = sorted(u for u, r in units.items() if isinstance(r, dict) and r.get("restarted"))
@@ -953,7 +1011,7 @@ def _restart_sibling_services(
         )
     if not parts:
         parts.append(body.get("detail") or "no sibling units to restart")
-    return not failed, "; ".join(parts)
+    return not failed, "; ".join(parts), failed
 
 
 def _roll_units(machine, *, agent_port: int) -> tuple[bool | None, str]:

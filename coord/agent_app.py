@@ -200,9 +200,13 @@ def _probe_liveness(unit: str, *, timeout: float = 5.0) -> tuple[bool, str] | No
         with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310
             status = resp.getcode()
     except Exception as exc:  # noqa: BLE001
+        # #2095 nit: urlopen() raises HTTPError (a subclass of Exception,
+        # caught above) for any response status >= 400 -- it never returns
+        # normally with such a status -- so a >=500 check after this except
+        # clause would be unreachable dead code. Any failure to answer,
+        # connection-level or an HTTP error status, is reported the same
+        # way: coord-web is active but not usably serving.
         return False, f"active, but not answering GET {path}: {type(exc).__name__}: {exc}"
-    if status is not None and status >= 500:
-        return False, f"active, but GET {path} returned HTTP {status}"
     return True, f"active and answering GET {path} (HTTP {status})"
 
 
@@ -248,6 +252,19 @@ def _restart_sibling_unit(unit: str, *, timeout: float = 30.0) -> tuple[bool, st
         return False, (result.stderr or result.stdout or "systemctl restart failed").strip()[:300]
 
     deadline = time.time() + max(timeout, 0.0)
+    # #2095 review: a unit whose stop was forced via `TimeoutStopSec` (added
+    # by this same PR, alongside `KillMode=process`, specifically to escalate
+    # to SIGKILL against a stuck SSE-holding stop) is commonly observed to
+    # transiently report `ActiveState=failed` (Result: timeout) for one
+    # `is-active` poll before the start half of the same `restart --no-block`
+    # job takes over and settles at `active` moments later. Trusting the
+    # FIRST sight of `failed` outright would misread that blip as a genuine
+    # failure on precisely the unit and mechanism this issue is about — so a
+    # single "failed" only counts once it is seen on two consecutive polls.
+    # A unit that is actually dead reports `failed` again immediately, so
+    # this still exits well before burning the rest of the deadline; it just
+    # no longer trusts a single sample.
+    saw_failed = False
     while True:
         try:
             probe = subprocess.run(
@@ -269,9 +286,14 @@ def _restart_sibling_unit(unit: str, *, timeout: float = 30.0) -> tuple[bool, st
             time.sleep(0.5)
             continue
         if state == "failed":
-            # systemd already knows the (re)start didn't take — no reason to
-            # burn the rest of the deadline finding that out the slow way.
-            return False, "unit failed to (re)start"
+            if saw_failed:
+                return False, "unit failed to (re)start"
+            saw_failed = True
+            if time.time() >= deadline:
+                return False, "unit failed to (re)start"
+            time.sleep(0.5)
+            continue
+        saw_failed = False
         if time.time() >= deadline:
             return False, f"still {state or 'unknown'} {timeout:.0f}s after restart"
         time.sleep(0.5)
