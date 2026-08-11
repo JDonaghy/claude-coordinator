@@ -859,17 +859,30 @@ def _roll_python(machine, *, target_version: str, agent_port: int, timeout: floa
     # freshly-restarted agent finds actually running on ITS host, so a run
     # that never touches coord-web anywhere still reports "now vX.Y.Z" clean.
     sib_ok, sib_detail = _restart_sibling_services(machine, agent_port=agent_port)
-    if sib_ok:
+    if sib_ok is not False:
+        # True (nothing failed) and None (this agent predates
+        # /restart-services entirely — no channel to have restarted anything
+        # through, see `_restart_sibling_services`) both still count as a
+        # lane success: neither one is a service THIS run took down.
         return True, f"now v{target_version}; {sib_detail}"
-    return True, (
-        f"now v{target_version}; {sib_detail} — `coord release verify` will "
-        "catch the resulting skew"
-    )
+    # #2095: this used to return `True` here too — "the venv swap succeeded"
+    # bleeding into "the lane succeeded", printed as a leading `✓` over a
+    # line that itself said `FAILED to restart: coord-web`. That is exactly
+    # what happened during the 2026-08-10 0.5.15 -> 0.5.26 roll: the phone
+    # dashboard went offline and the run reported success. The old comment
+    # here claimed `coord release verify` would catch the resulting skew as
+    # the justification for staying green — it does not: verify grades
+    # *versions*, and there is no coord-web lane in it at all, so a dead
+    # service is invisible to the thing named as its backstop. A sibling
+    # that failed to (re)start — or restarted but never answered its own
+    # liveness probe, see `agent_app._probe_liveness` — is not a lane
+    # success, full stop, whatever the venv itself did.
+    return False, f"now v{target_version}, but {sib_detail}"
 
 
 def _restart_sibling_services(
     machine, *, agent_port: int, timeout: float = 120.0
-) -> tuple[bool, str]:
+) -> tuple[bool | None, str]:
     """``POST /restart-services`` — the rest of a python-lane roll (#2069).
 
     ``/update`` swaps the venv and re-execs *the agent* — and nothing else.
@@ -880,17 +893,33 @@ def _restart_sibling_services(
     it finds running on its own host (see the endpoint's docstring) — this
     function only reports what came back.
 
-    ``ok=False`` here does not fail the python lane on its own (the venv DID
-    swap — that is still true and still worth recording as such); it means
-    the post-roll ``coord release verify`` gate — which #2069 also taught to
-    treat these units' lanes as ones this run attempted — will find the skew
-    and treat it as blocking, same as any other failed python lane would be.
+    Tri-state return, same convention as the other lane executors below
+    (``_roll_units``/``_roll_tui``'s ``ok=None`` "no channel"):
+
+    * ``True`` — the endpoint answered and no unit it touched failed.
+    * ``False`` (#2095) — a sibling this run took down and never brought
+      back: a real outage, not a cosmetic detail to carry forward under a
+      `✓`. DOES fail the python lane — see ``_roll_python``. This used to
+      defer to `coord release verify` catching the resulting skew; it
+      cannot — verify grades versions, not liveness, and carries no lane
+      for these units at all, so relying on it left exactly the outage this
+      issue is about invisible to its own named backstop.
+    * ``None`` — this host's agent predates the endpoint entirely (HTTP
+      404): there is no channel here to have restarted anything through,
+      the same "unrollable" shape as a lane with no executor at all, not a
+      failure of this roll.
     """
     status, body, error = _post(
         f"http://{machine.host}:{agent_port}/restart-services", {}, timeout=timeout,
     )
     if error:
         return False, f"sibling service restart: {error}"
+    if status == 404:
+        # Pre-#2069 agent build: /restart-services doesn't exist yet. Not
+        # this run's failure to have restarted anything through a channel
+        # that was never there — `coord agent update --all` is what closes
+        # this gap, not a red python lane.
+        return None, "agent predates /restart-services (HTTP 404) — update the agent build"
     # The endpoint (`agent_app.py`'s `restart_services`) returns HTTP 500 — with the
     # *same* `{"units": {...}}` body shape as 200 — whenever any single unit fails to
     # restart. That is the exact partial-failure path this function exists to report

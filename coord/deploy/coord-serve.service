@@ -68,6 +68,15 @@ Environment=PATH=%h/.cargo/bin:%h/.local/bin:%h/src/claude-coordinator/.venv/bin
 ExecStart=%h/.coord-venv/bin/coord serve --config %h/.coord/coordinator.yml --host 0.0.0.0 --port 7435
 Restart=on-failure
 RestartSec=3
+# #2095: coord-web (its sibling on the same host, restarted through the same
+# `_restart_sibling_unit` caller) went down for the length of a fleet roll
+# because nothing bounded how long systemd would wait on its stop — an SSE
+# client held it open indefinitely. coord-serve serves no `text/event-stream`
+# endpoint today so it was not the unit that actually hung, but nothing
+# structural stops a future one (a stuck DB write, a wedged client
+# connection) from doing the same thing here, uncapped, for up to systemd's
+# 90s default. Bounding it explicitly costs nothing on the fast path.
+TimeoutStopSec=10
 
 [Install]
 WantedBy=default.target

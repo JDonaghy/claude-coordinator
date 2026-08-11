@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from pathlib import Path
 from typing import Callable
 
@@ -166,9 +167,49 @@ def _restart_via_systemctl(unit: str = "coord-agent") -> bool:
     return True
 
 
+# Unit -> the HTTP path this process should GET, on localhost, once
+# `systemctl` reports the unit active, before believing the restart actually
+# worked (#2095). `is-active` proves the process exists; it does not prove a
+# freshly-started server has finished binding its socket, nor that it is not
+# about to crash-loop moments later. coord-web's entire job is answering
+# HTTP GETs — `/api/pipeline` is the exact endpoint the 2026-08-10 incident
+# report used by hand to confirm the dashboard was down — so a GET is the
+# honest check for it. Every other sibling unit gets no probe here, exactly
+# the pre-#2095 behaviour: `is-active` alone is still what decides them.
+_LIVENESS_PROBE_PATHS: dict[str, str] = {"coord-web": "/api/pipeline"}
+
+
+def _probe_liveness(unit: str, *, timeout: float = 5.0) -> tuple[bool, str] | None:
+    """GET ``_LIVENESS_PROBE_PATHS[unit]`` on localhost, or ``None`` if
+    *unit* has no configured probe — the caller then trusts ``is-active``
+    alone, same as every unit did before #2095.
+
+    Always localhost, never the unit's configured bind host: this only ever
+    runs from inside :func:`_restart_sibling_unit`, which only ever runs for
+    a unit this same host's ``/restart-services`` found actually running
+    HERE (see ``restart_services``'s docstring) — there is no other host to
+    reach, and a phone/tailnet address would just add a second way to fail
+    that has nothing to do with whether the process itself is answering.
+    """
+    path = _LIVENESS_PROBE_PATHS.get(unit)
+    if path is None:
+        return None
+    port = os.environ.get("COORD_WEB_PORT", "7434")
+    url = f"http://127.0.0.1:{port}{path}"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310
+            status = resp.getcode()
+    except Exception as exc:  # noqa: BLE001
+        return False, f"active, but not answering GET {path}: {type(exc).__name__}: {exc}"
+    if status is not None and status >= 500:
+        return False, f"active, but GET {path} returned HTTP {status}"
+    return True, f"active and answering GET {path} (HTTP {status})"
+
+
 def _restart_sibling_unit(unit: str, *, timeout: float = 30.0) -> tuple[bool, str]:
     """``systemctl --user restart <unit>`` for a UNIT OTHER THAN THIS ONE,
-    and wait for it to report active (#2069).
+    and wait for it to report active — and, for units with a liveness probe
+    configured above, actually answering (#2069, #2095).
 
     Unlike :func:`_restart_via_systemctl` — used for the agent's OWN restart,
     where the caller is about to exit and there is nothing left here to poll
@@ -178,12 +219,27 @@ def _restart_sibling_unit(unit: str, *, timeout: float = 30.0) -> tuple[bool, st
     1 is exactly what trusting that distinction cost on a self-restart, and
     there's no reason to reintroduce it here just because it's a neighbour's
     process instead of this one's.
+
+    #2095: the restart itself used to be issued with a hard 15s
+    ``subprocess.run`` timeout on a BLOCKING ``systemctl restart`` — which
+    waits for the unit to fully stop before returning. A unit serving
+    ``text/event-stream`` (coord-web, #700) does not stop on its own while a
+    browser or the phone PWA holds an SSE connection open, so that 15s cap
+    fired routinely, raised ``TimeoutExpired``, and left the unit abandoned
+    mid-stop: not restarted, STOPPED — worse than never having tried, and
+    reported as a failure that nonetheless printed a leading ``✓`` one layer
+    up (see ``coord/commands/release.py``'s ``_roll_python``). ``--no-block``
+    returns the instant the restart job is QUEUED, regardless of how long the
+    unit actually takes to stop and start — the ``is-active`` poll below,
+    which already existed and already had nothing to do with the abandoned
+    call, is what actually decides the outcome now, exactly as its own
+    docstring paragraph above argues it should.
     """
     env = dict(os.environ)
     env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
     try:
         result = subprocess.run(
-            ["systemctl", "--user", "restart", unit],
+            ["systemctl", "--user", "restart", "--no-block", unit],
             env=env, capture_output=True, text=True, timeout=15,
         )
     except Exception as exc:  # noqa: BLE001
@@ -202,7 +258,20 @@ def _restart_sibling_unit(unit: str, *, timeout: float = 30.0) -> tuple[bool, st
             return False, f"{type(exc).__name__}: {exc}"
         state = probe.stdout.strip()
         if state == "active":
-            return True, "active"
+            live = _probe_liveness(unit)
+            if live is None:
+                return True, "active"
+            live_ok, live_detail = live
+            if live_ok:
+                return True, live_detail
+            if time.time() >= deadline:
+                return False, live_detail
+            time.sleep(0.5)
+            continue
+        if state == "failed":
+            # systemd already knows the (re)start didn't take — no reason to
+            # burn the rest of the deadline finding that out the slow way.
+            return False, "unit failed to (re)start"
         if time.time() >= deadline:
             return False, f"still {state or 'unknown'} {timeout:.0f}s after restart"
         time.sleep(0.5)
