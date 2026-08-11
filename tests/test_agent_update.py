@@ -1289,6 +1289,46 @@ class TestRestartSiblingUnit:
         )
         assert detail == "active"
 
+    def test_a_non_failed_poll_between_two_blips_resets_the_failed_run(
+        self, monkeypatch
+    ) -> None:
+        """#2095 review: "two consecutive `failed` polls" has to mean
+        consecutive. `failed` (forced-stop blip) -> `active` (up, not yet
+        answering) -> `failed` (a second, separate blip) is not two
+        consecutive sightings — the run was broken by the `active` poll in
+        the middle — so the restart must keep polling and observe the
+        recovery on the next tick.
+
+        Fails against the pre-fix code, which reset `saw_failed` in the
+        catch-all branch but not in the `active` one, and so gave up on the
+        second poll's lone fresh `failed`."""
+        from coord.agent_app import _restart_sibling_unit
+
+        states = iter(["failed", "active", "failed", "active"])
+        probes = iter([
+            (False, "active, but not answering GET /api/pipeline: still binding"),
+            (True, "active and answering GET /api/pipeline (HTTP 200)"),
+        ])
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:3] == ["systemctl", "--user", "restart"]:
+                return MagicMock(returncode=0, stdout="", stderr="")
+            return MagicMock(returncode=0, stdout=f"{next(states)}\n", stderr="")
+
+        with (
+            patch("coord.agent_app.subprocess.run", side_effect=fake_run),
+            patch("coord.agent_app._probe_liveness", side_effect=lambda *a, **k: next(probes)),
+            patch("coord.agent_app.time.sleep"),
+        ):
+            ok, detail = _restart_sibling_unit("coord-web", timeout=300.0)
+
+        assert ok is True, (
+            "an `active` poll between two `failed` sightings breaks the run "
+            "of consecutive failures — the second `failed` is a first "
+            "sighting again, not a confirmation of the first"
+        )
+        assert "answering" in detail
+
 
 class TestSiblingLivenessProbe:
     """#2095: `is-active` proves the process exists, not that it is
@@ -1440,6 +1480,163 @@ class TestSiblingLivenessProbe:
 
         assert ok is False
         assert "not answering" in detail
+
+
+class TestLivenessProbePort:
+    """#2095 review: which port the probe GETs must be decided by the port
+    coord-web is actually configured to listen on — `--port` on the
+    `coord-web.service` ExecStart line — and by nothing else.
+
+    The first cut read a `COORD_WEB_PORT` env var declared on
+    `coord-web.service`. `_probe_liveness` runs inside the **coord-agent**
+    process (the Starlette handler behind `/restart-services`), and systemd
+    does not share `Environment=` across units, so that variable could never
+    reach the reader: the probe always fell through to a hardcoded `"7434"`
+    regardless of what the unit said — a check that cannot be influenced by
+    the thing it claims to track (epic #2096). It is only harmless while
+    both numbers happen to be 7434.
+
+    These tests pin the replacement: ask systemd what the unit's own
+    ExecStart says. `test_probe_port_follows_the_units_execstart` FAILS
+    against the pre-fix code (which answered `7434` for a unit configured on
+    9999).
+    """
+
+    def test_probe_port_follows_the_units_execstart(self, monkeypatch) -> None:
+        """The regression test proper: a coord-web unit configured on a
+        non-default port must be probed on THAT port."""
+        from coord.agent_app import _probe_port
+
+        monkeypatch.delenv("COORD_WEB_PORT", raising=False)
+        shown = (
+            "ExecStart={ path=/home/u/.coord-venv/bin/coord ; argv[]="
+            "/home/u/.coord-venv/bin/coord web --config /home/u/.coord/coordinator.yml "
+            "--host 0.0.0.0 --port 9999 --dist /home/u/coord-web-dist ; ignore_errors=no }\n"
+        )
+
+        def fake_run(cmd, **kwargs):
+            assert cmd[:3] == ["systemctl", "--user", "show"]
+            assert "coord-web" in cmd
+            return MagicMock(returncode=0, stdout=shown, stderr="")
+
+        with patch("coord.agent_app.subprocess.run", side_effect=fake_run):
+            assert _probe_port("coord-web") == "9999"
+
+    def test_probe_url_uses_the_units_port(self, monkeypatch) -> None:
+        """End of the same wire: the URL `_probe_liveness` actually opens."""
+        from coord.agent_app import _probe_liveness
+
+        monkeypatch.delenv("COORD_WEB_PORT", raising=False)
+        shown = "ExecStart={ argv[]=/x/coord web --host 0.0.0.0 --port=8123 ; }\n"
+        opened: list[str] = []
+
+        def fake_run(cmd, **kwargs):
+            return MagicMock(returncode=0, stdout=shown, stderr="")
+
+        def fake_urlopen(url, timeout=None):
+            opened.append(url)
+            raise OSError("connection refused")
+
+        with (
+            patch("coord.agent_app.subprocess.run", side_effect=fake_run),
+            patch("coord.agent_app.urllib.request.urlopen", side_effect=fake_urlopen),
+        ):
+            ok, _detail = _probe_liveness("coord-web", timeout=0.1)
+
+        assert ok is False
+        assert opened == ["http://127.0.0.1:8123/api/pipeline"]
+
+    def test_an_explicit_env_override_wins(self, monkeypatch) -> None:
+        """The env var is not dead — it is an explicit override for setups
+        systemd cannot answer for (a hand-started `coord web`, or a test
+        pointing the probe at an ephemeral server, as the two real-HTTP
+        tests above do). It just is not, and must not be, a second
+        declaration of the deployed port."""
+        from coord.agent_app import _probe_port
+
+        monkeypatch.setenv("COORD_WEB_PORT", "5555")
+
+        def fake_run(cmd, **kwargs):  # pragma: no cover - must not be reached
+            raise AssertionError("systemd must not be consulted when overridden")
+
+        with patch("coord.agent_app.subprocess.run", side_effect=fake_run):
+            assert _probe_port("coord-web") == "5555"
+
+    def test_falls_back_to_the_default_when_systemd_cannot_answer(
+        self, monkeypatch
+    ) -> None:
+        """No systemctl / no user bus / unit not installed: the probe still
+        has to GET *something*, and 7434 is what every shipped unit uses."""
+        from coord.agent_app import _probe_port
+
+        monkeypatch.delenv("COORD_WEB_PORT", raising=False)
+
+        with patch(
+            "coord.agent_app.subprocess.run",
+            side_effect=FileNotFoundError("no systemctl"),
+        ):
+            assert _probe_port("coord-web") == "7434"
+
+        with patch(
+            "coord.agent_app.subprocess.run",
+            return_value=MagicMock(returncode=1, stdout="", stderr="Unit not loaded."),
+        ):
+            assert _probe_port("coord-web") == "7434"
+
+        # Installed, loaded, but an ExecStart with no --port on it at all.
+        with patch(
+            "coord.agent_app.subprocess.run",
+            return_value=MagicMock(returncode=0, stdout="ExecStart={ argv[]=/x/coord web ; }\n"),
+        ):
+            assert _probe_port("coord-web") == "7434"
+
+    def test_the_shipped_unit_is_parseable_by_the_probes_own_regex(self) -> None:
+        """Guards the guard, against the real file: if `deploy/
+        coord-web.service`'s ExecStart is ever rewritten in a shape
+        `_unit_listen_port` cannot read (`-p 7434`, a port baked into a
+        config file, ...), the probe silently reverts to the hardcoded
+        fallback — the exact dead-configuration state this fix removes.
+        Reading the unit here is not the same code path (systemd reformats
+        ExecStart), but the flag spelling it depends on is the same."""
+        from pathlib import Path
+
+        from coord.agent_app import _EXEC_START_PORT_RE
+
+        unit = Path(__file__).resolve().parent.parent / "deploy" / "coord-web.service"
+        exec_start = [
+            line for line in unit.read_text().splitlines() if line.startswith("ExecStart=")
+        ]
+        assert len(exec_start) == 1
+        match = _EXEC_START_PORT_RE.search(exec_start[0])
+        assert match is not None, (
+            "deploy/coord-web.service's ExecStart no longer carries a `--port N` "
+            "the liveness probe can read back — see coord/agent_app._probe_port"
+        )
+        assert match.group(1) == "7434"
+
+    def test_no_unit_redeclares_the_port_in_the_environment(self) -> None:
+        """`COORD_WEB_PORT` must not come back as a unit `Environment=`
+        line. On `coord-web.service` it is unreadable by the process that
+        needs it (different unit); on `coord-agent.service` it is readable
+        but is a second surface that must agree with the ExecStart by hand —
+        which is what epic #2096 says to collapse, not relocate."""
+        from pathlib import Path
+
+        deploy_dir = Path(__file__).resolve().parent.parent / "deploy"
+        # Directive lines only — the units *comment* on why this must not
+        # come back, and that prose necessarily names the line it forbids.
+        offenders = [
+            path.name
+            for path in sorted(deploy_dir.glob("*.service"))
+            if any(
+                line.strip().startswith("Environment=COORD_WEB_PORT")
+                for line in path.read_text().splitlines()
+            )
+        ]
+        assert not offenders, (
+            f"{offenders} redeclare the dashboard port as an env var; the probe "
+            "reads it from coord-web.service's own ExecStart (agent_app._probe_port)"
+        )
 
 
 # ── CLI: coord agent update / restart ─────────────────────────────────────

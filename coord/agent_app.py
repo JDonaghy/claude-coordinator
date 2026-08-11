@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -178,6 +179,73 @@ def _restart_via_systemctl(unit: str = "coord-agent") -> bool:
 # the pre-#2095 behaviour: `is-active` alone is still what decides them.
 _LIVENESS_PROBE_PATHS: dict[str, str] = {"coord-web": "/api/pipeline"}
 
+# Unit -> (explicit-override env var, last-resort port) for the probe above.
+# The override exists for setups systemd cannot answer for (a hand-started
+# `coord web`, a test harness pointing the probe at an ephemeral server); the
+# last-resort value is only reached when BOTH the override and systemd itself
+# have nothing to say, and it is the only hardcoded port left in this path.
+_LIVENESS_PORT_SOURCES: dict[str, tuple[str, str]] = {"coord-web": ("COORD_WEB_PORT", "7434")}
+
+# `--port 7434` / `--port=7434` on a unit's ExecStart command line.
+_EXEC_START_PORT_RE = re.compile(r"--port[= ](\d+)")
+
+
+def _unit_listen_port(unit: str) -> str | None:
+    """The ``--port`` value on *unit*'s **installed** ``ExecStart``, or None.
+
+    #2095 review: the liveness probe below has to GET the port coord-web is
+    actually listening on, and the only authority on that is the unit file
+    systemd is running right now — ``deploy/coord-web.service``'s
+    ``ExecStart=... --port 7434``. Asking systemd for it (rather than
+    declaring the number a second time somewhere this process can read)
+    keeps the probe and the listener reading ONE source: change ``--port``
+    on the unit, restart it, and the probe follows on its own.
+
+    The first cut of this instead read a ``COORD_WEB_PORT`` env var declared
+    on ``coord-web.service`` — which this process, running under
+    ``coord-agent.service``, can never see (systemd does not share
+    ``Environment=`` across units), so the probe silently fell back to a
+    hardcoded ``7434`` no matter what the unit said. Declaring the same
+    number on ``coord-agent.service`` instead would make it *readable*, but
+    would still be a second surface that has to agree with the first by
+    hand — the exact shape epic #2096 rules out. Reading the live unit is
+    the version with only one surface.
+
+    Returns None (caller falls back) whenever systemd cannot answer: no
+    systemctl on PATH, no user bus, unit not installed, or an ExecStart with
+    no ``--port`` on it.
+    """
+    env = dict(os.environ)
+    env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "show", unit, "--property=ExecStart"],
+            env=env, capture_output=True, text=True, timeout=5,
+        )
+    except Exception:  # noqa: BLE001 - no systemctl, no bus, timeout: all "unknown"
+        return None
+    if result.returncode != 0:
+        return None
+    match = _EXEC_START_PORT_RE.search(result.stdout or "")
+    return match.group(1) if match else None
+
+
+def _probe_port(unit: str) -> str:
+    """Which local port :func:`_probe_liveness` should GET for *unit*.
+
+    Precedence: an explicit env override, then the live unit's own
+    ``ExecStart`` (:func:`_unit_listen_port`), then the last-resort default.
+    The override comes first so a deliberately-pointed probe (tests, a
+    hand-started server on another port) always wins over what systemd
+    happens to have installed; nothing in `deploy/` sets it, so on a real
+    host the unit's own ``--port`` is what decides.
+    """
+    env_var, default = _LIVENESS_PORT_SOURCES.get(unit, ("", "7434"))
+    override = os.environ.get(env_var) if env_var else None
+    if override:
+        return override
+    return _unit_listen_port(unit) or default
+
 
 def _probe_liveness(unit: str, *, timeout: float = 5.0) -> tuple[bool, str] | None:
     """GET ``_LIVENESS_PROBE_PATHS[unit]`` on localhost, or ``None`` if
@@ -194,7 +262,7 @@ def _probe_liveness(unit: str, *, timeout: float = 5.0) -> tuple[bool, str] | No
     path = _LIVENESS_PROBE_PATHS.get(unit)
     if path is None:
         return None
-    port = os.environ.get("COORD_WEB_PORT", "7434")
+    port = _probe_port(unit)
     url = f"http://127.0.0.1:{port}{path}"
     try:
         with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310
@@ -274,6 +342,14 @@ def _restart_sibling_unit(unit: str, *, timeout: float = 30.0) -> tuple[bool, st
         except Exception as exc:  # noqa: BLE001
             return False, f"{type(exc).__name__}: {exc}"
         state = probe.stdout.strip()
+        if state != "failed":
+            # Any non-`failed` sighting — `active` included — ends the run of
+            # consecutive failures the check below counts. Without this, a
+            # `failed` -> `active` (up, not yet answering) -> `failed`
+            # sequence would trip "two consecutive failed polls" on a single
+            # fresh sighting, after the blip it was written to tolerate had
+            # already resolved (#2095 review).
+            saw_failed = False
         if state == "active":
             live = _probe_liveness(unit)
             if live is None:
@@ -293,7 +369,7 @@ def _restart_sibling_unit(unit: str, *, timeout: float = 30.0) -> tuple[bool, st
                 return False, "unit failed to (re)start"
             time.sleep(0.5)
             continue
-        saw_failed = False
+        # (the reset for this branch happens at the top of the loop, above)
         if time.time() >= deadline:
             return False, f"still {state or 'unknown'} {timeout:.0f}s after restart"
         time.sleep(0.5)
