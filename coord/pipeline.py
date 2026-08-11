@@ -234,6 +234,21 @@ def compute_pipeline(
         current_stage = "coding"
     elif assignment.status == "failed":
         current_stage = "failed"
+    elif assignment.status == "merged":
+        # #2084: `coord.reconcile`'s GitHub-truth sweep (`work_is_terminal`)
+        # flips a work assignment's OWN `status` to "merged" independently of
+        # `merge_queue` — it catches PRs merged outside `coord merge` (a
+        # manual `gh pr merge`, or any path that never touched the queue) as
+        # well as queue entries reconcile confirmed landed. Before this
+        # branch existed, "merged" fell through to the bare `else` below and
+        # was indistinguishable from a work item that had never been
+        # dispatched anywhere — offering "Dispatch Review"/"Queue for
+        # Merge"/"Record Test Verdict" on code that was already reviewed,
+        # tested, and merged (the dominant share of #2084's false-positive
+        # `available_gates`). `mq_entry`-based MERGED detection below still
+        # covers the narrower window between a queue drain and reconcile
+        # catching up.
+        current_stage = "merged"
     elif assignment.status in ("done", "pending"):
         # Evaluate from most advanced to least advanced.
         if mq_entry is not None:
@@ -328,7 +343,18 @@ def compute_pipeline(
     _EP = "/api/pipeline/action"
     available_gates: list[PipelineGate] = []
 
-    if current_stage == "done":
+    # #2084: current_stage collapses to "done" for two different populations
+    # — a work assignment that genuinely just finished coding with nothing
+    # dispatched downstream yet (status in "done"/"pending" — the fresh case
+    # the gates below are written for), and any OTHER terminal status
+    # (chiefly "advisory": a 0-commit clean exit with no code to test,
+    # review, or merge; also a defensive catch-all for any status this
+    # module doesn't otherwise recognize) that fell through to the bare
+    # `else` above. The latter has nothing left to gate — a human can't
+    # meaningfully "Record Test Verdict" or "Dispatch Review" on a worker
+    # that made no changes — so only offer these gates for the genuinely
+    # fresh population.
+    if current_stage == "done" and assignment.status in ("done", "pending"):
         # Offer the human Test-gate so the phone can record a verdict before
         # review auto-dispatch fires (Test precedes Review in the pipeline).
         available_gates.append(PipelineGate("test-verdict", "Record Test Verdict", _EP))
