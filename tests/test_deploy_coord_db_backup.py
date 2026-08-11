@@ -1,0 +1,299 @@
+"""Behavioural tests for deploy/coord-db-backup.sh (#2098).
+
+Every other deploy/*.sh script has a dedicated test that drives it for real
+via `subprocess.run` against scratch directories -- see
+`tests/test_deploy_coord_web_rollback.py`'s own docstring ("exercised for
+real under pytest via subprocess... independent of the manual drill
+transcript"), and `tests/test_deploy_coord_web_dist.py`. This script had none
+despite being the single most safety-critical piece of #2098: the mountpoint
+guard is the only thing standing between an hourly timer and it overwriting
+its own protection with garbage the moment the external SSD is unplugged.
+
+The script is already parameterized via COORD_DB / COORD_BACKUP_DIR /
+COORD_BACKUP_RETAIN env vars specifically so it can be driven like this --
+see its own header comment.
+
+Two seams are faked with test doubles placed first on $PATH, both narrowly
+scoped and each justified on its own:
+
+- `mountpoint`: a real bind-mount needs root, and `tmp_path` itself may or
+  may not sit on a mount boundary depending on the host (e.g. tmpfs `/tmp`),
+  which would make a real-`mountpoint`-based "refuses" test flaky across
+  environments. The fake's result is controlled by $FAKE_MOUNTPOINT_EXIT so
+  both the mounted and not-mounted branches are deterministic.
+- `sqlite3` (one test only, `test_rejects_a_corrupt_snapshot_as_REJECTED`):
+  `VACUUM INTO` rebuilds a fresh, well-formed file from whatever it can
+  still read, so a genuinely corrupt *source* db almost always fails
+  `VACUUM INTO` itself (see `test_refuses_when_vacuum_into_fails`) rather
+  than producing a corrupt *output* that passes `VACUUM INTO` but fails the
+  subsequent `integrity_check` -- the real-world case this branch guards
+  against is I/O corruption on the destination between the two calls, which
+  isn't reproducible by feeding the script a bad source. Every other test in
+  this file uses the real `sqlite3` binary.
+"""
+
+from __future__ import annotations
+
+import os
+import sqlite3
+import stat
+import subprocess
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+BACKUP_SCRIPT = REPO_ROOT / "deploy" / "coord-db-backup.sh"
+
+
+def _write_executable(path: Path, contents: str) -> None:
+    path.write_text(contents)
+    path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def _fake_mountpoint(fakebin: Path) -> None:
+    _write_executable(
+        fakebin / "mountpoint",
+        "#!/usr/bin/env bash\n"
+        'exit "${FAKE_MOUNTPOINT_EXIT:-1}"\n',
+    )
+
+
+def _make_source_db(path: Path, *, rows: int = 3, with_assignments_table: bool = True) -> None:
+    conn = sqlite3.connect(str(path))
+    try:
+        if with_assignments_table:
+            conn.execute("CREATE TABLE assignments (id INTEGER PRIMARY KEY)")
+            for i in range(rows):
+                conn.execute("INSERT INTO assignments (id) VALUES (?)", (i,))
+        else:
+            conn.execute("CREATE TABLE unrelated (id INTEGER)")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _run(
+    tmp_path: Path,
+    *,
+    src: Path,
+    dest_dir: Path,
+    retain: int | None = None,
+    mounted: bool = True,
+    extra_path: Path | None = None,
+) -> subprocess.CompletedProcess:
+    fakebin = tmp_path / "fakebin"
+    fakebin.mkdir(exist_ok=True)
+    _fake_mountpoint(fakebin)
+
+    env = dict(os.environ)
+    path_entries = [str(fakebin)]
+    if extra_path is not None:
+        path_entries.append(str(extra_path))
+    path_entries.append(env.get("PATH", ""))
+    env["PATH"] = os.pathsep.join(path_entries)
+    env["FAKE_MOUNTPOINT_EXIT"] = "0" if mounted else "1"
+    env["COORD_DB"] = str(src)
+    env["COORD_BACKUP_DIR"] = str(dest_dir)
+    if retain is not None:
+        env["COORD_BACKUP_RETAIN"] = str(retain)
+    else:
+        env.pop("COORD_BACKUP_RETAIN", None)
+
+    return subprocess.run(
+        ["bash", str(BACKUP_SCRIPT)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+
+def _snapshots(dest_dir: Path) -> list[Path]:
+    return sorted(p for p in dest_dir.glob("coord.db.2*") if not p.name.endswith(".REJECTED"))
+
+
+def test_refuses_to_run_when_ssd_not_mounted(tmp_path: Path) -> None:
+    """The mountpoint guard the issue calls out by name: a plain directory
+    standing in for an unmounted external SSD must refuse the run, not
+    silently write "backups" onto the disk it exists to protect."""
+    src = tmp_path / "coord.db"
+    _make_source_db(src)
+    dest_dir = tmp_path / "media" / "crucial" / "coord-backups"
+
+    result = _run(tmp_path, src=src, dest_dir=dest_dir, mounted=False)
+
+    assert result.returncode != 0
+    assert "not a mountpoint" in result.stderr
+    assert not dest_dir.exists() or not list(dest_dir.glob("coord.db.2*"))
+
+
+def test_refuses_when_source_db_missing(tmp_path: Path) -> None:
+    src = tmp_path / "coord.db"  # never created
+    dest_dir = tmp_path / "backups"
+
+    result = _run(tmp_path, src=src, dest_dir=dest_dir, mounted=True)
+
+    assert result.returncode != 0
+    assert "source db not found" in result.stderr
+
+
+def test_successful_snapshot_matches_source_row_count(tmp_path: Path) -> None:
+    """The acceptance criterion from the issue: snapshot row counts must
+    match the live db exactly. VACUUM INTO, integrity_check and the
+    assignments sanity check all run for real here against real sqlite3."""
+    src = tmp_path / "coord.db"
+    _make_source_db(src, rows=5)
+    dest_dir = tmp_path / "backups"
+
+    result = _run(tmp_path, src=src, dest_dir=dest_dir, mounted=True)
+
+    assert result.returncode == 0, result.stderr
+    snapshots = _snapshots(dest_dir)
+    assert len(snapshots) == 1
+    latest = dest_dir / "coord.db.latest"
+    assert latest.is_symlink()
+    assert latest.resolve() == snapshots[0].resolve()
+
+    conn = sqlite3.connect(str(snapshots[0]))
+    try:
+        (count,) = conn.execute("SELECT COUNT(*) FROM assignments").fetchone()
+    finally:
+        conn.close()
+    assert count == 5
+    assert "5 assignments" in result.stdout
+
+
+def test_refuses_when_vacuum_into_fails(tmp_path: Path) -> None:
+    """A source that exists but isn't a real sqlite database (the
+    genuinely-corrupt-source case) must fail VACUUM INTO itself, cleanly,
+    rather than produce anything downstream."""
+    src = tmp_path / "coord.db"
+    src.write_text("this is not a sqlite database\n")
+    dest_dir = tmp_path / "backups"
+
+    result = _run(tmp_path, src=src, dest_dir=dest_dir, mounted=True)
+
+    assert result.returncode != 0
+    assert "VACUUM INTO failed" in result.stderr
+    assert not list(dest_dir.glob("coord.db.2*")) if dest_dir.exists() else True
+
+
+def test_rejects_a_corrupt_snapshot_as_REJECTED(tmp_path: Path) -> None:
+    """The integrity-check-and-.REJECTED path: when the snapshot fails
+    PRAGMA integrity_check after VACUUM INTO reports success, the script
+    must keep the bad file (renamed .REJECTED, not deleted) and fail loudly
+    rather than let a corrupt file masquerade as a good backup.
+
+    VACUUM INTO rebuilds a fresh well-formed file from whatever it can
+    read, so this specific ("vacuum succeeded, output still corrupt") case
+    isn't reachable by corrupting the source -- see the module docstring.
+    A fake `sqlite3` on $PATH simulates it directly: it fakes only the two
+    calls this path makes (VACUUM INTO, integrity_check) and would delegate
+    anything else to the real binary.
+    """
+    fake_sqlite_dir = tmp_path / "fake-sqlite"
+    fake_sqlite_dir.mkdir()
+    _write_executable(
+        fake_sqlite_dir / "sqlite3",
+        "#!/usr/bin/env bash\n"
+        "db=\"$1\"\n"
+        "sql=\"$2\"\n"
+        "case \"$sql\" in\n"
+        "  VACUUM\\ INTO*)\n"
+        "    out=\"${sql#*\\'}\"\n"
+        "    out=\"${out%\\'*}\"\n"
+        "    : > \"$out\"\n"
+        "    ;;\n"
+        "  *integrity_check*)\n"
+        "    echo malformed\n"
+        "    ;;\n"
+        "  *)\n"
+        "    exec /usr/bin/sqlite3 \"$@\"\n"
+        "    ;;\n"
+        "esac\n",
+    )
+
+    src = tmp_path / "coord.db"
+    _make_source_db(src)
+    dest_dir = tmp_path / "backups"
+
+    result = _run(tmp_path, src=src, dest_dir=dest_dir, mounted=True, extra_path=fake_sqlite_dir)
+
+    assert result.returncode != 0
+    assert "integrity_check on snapshot" in result.stderr
+    rejected = list(dest_dir.glob("coord.db.*.REJECTED"))
+    assert len(rejected) == 1
+    assert not _snapshots(dest_dir)
+    assert not (dest_dir / "coord.db.latest").exists()
+
+
+def test_refuses_when_assignments_table_missing(tmp_path: Path) -> None:
+    """Same .REJECTED contract as the integrity_check failure above: a
+    snapshot that fails the assignments sanity check must not survive under
+    its normal name (that would leave it indistinguishable from a good
+    backup to both an operator and retention pruning)."""
+    src = tmp_path / "coord.db"
+    _make_source_db(src, with_assignments_table=False)
+    dest_dir = tmp_path / "backups"
+
+    result = _run(tmp_path, src=src, dest_dir=dest_dir, mounted=True)
+
+    assert result.returncode != 0
+    assert "no assignments table" in result.stderr
+    assert not _snapshots(dest_dir)
+    rejected = list(dest_dir.glob("coord.db.*.REJECTED"))
+    assert len(rejected) == 1
+    assert not (dest_dir / "coord.db.latest").exists()
+
+
+def test_refuses_when_assignments_table_empty(tmp_path: Path) -> None:
+    """Guards against an empty file that happens to pass integrity_check --
+    zero assignments must not be allowed to count as a backup, and (like the
+    other rejection paths) must not survive under its normal, unmarked
+    name."""
+    src = tmp_path / "coord.db"
+    _make_source_db(src, rows=0)
+    dest_dir = tmp_path / "backups"
+
+    result = _run(tmp_path, src=src, dest_dir=dest_dir, mounted=True)
+
+    assert result.returncode != 0
+    assert "0 assignments" in result.stderr or "refusing to count" in result.stderr
+    assert not _snapshots(dest_dir)
+    rejected = list(dest_dir.glob("coord.db.*.REJECTED"))
+    assert len(rejected) == 1
+    assert not (dest_dir / "coord.db.latest").exists()
+
+
+def test_retention_prunes_oldest_beyond_RETAIN_and_never_touches_REJECTED(tmp_path: Path) -> None:
+    dest_dir = tmp_path / "backups"
+    dest_dir.mkdir(parents=True)
+    old_stamps = [
+        "20200101T000000Z",
+        "20200102T000000Z",
+        "20200103T000000Z",
+        "20200104T000000Z",
+        "20200105T000000Z",
+    ]
+    for stamp in old_stamps:
+        (dest_dir / f"coord.db.{stamp}").write_text("dummy old snapshot")
+    rejected = dest_dir / "coord.db.20200101T000000Z-oops.REJECTED"
+    rejected.write_text("must never be pruned")
+
+    src = tmp_path / "coord.db"
+    _make_source_db(src, rows=2)
+
+    result = _run(tmp_path, src=src, dest_dir=dest_dir, retain=3, mounted=True)
+
+    assert result.returncode == 0, result.stderr
+    remaining = _snapshots(dest_dir)
+    assert len(remaining) == 3
+    # The 3 kept must be the 3 newest: the two youngest fakes plus the
+    # brand-new real snapshot this run just wrote (its ISO-8601 stamp sorts
+    # after every 2020 fake).
+    assert remaining[0].name == "coord.db.20200104T000000Z"
+    assert remaining[1].name == "coord.db.20200105T000000Z"
+    assert remaining[2].name not in old_stamps
+    # .REJECTED is never touched by pruning, regardless of RETAIN.
+    assert rejected.exists()
+    assert "3 snapshots retained" in result.stdout

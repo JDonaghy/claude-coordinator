@@ -44,6 +44,22 @@ from coord.health.registry import check
 # section (it is either a timer or a persistent service), so an installed
 # manifest unit reporting `static` has lost that section relative to
 # `deploy/` — a real fault, not a unit that can't be enabled by design.
+#
+# `alias` means systemctl resolved the queried name to a *different* unit
+# via an `Alias=` in that other unit's `[Install]` section and reports the
+# alias target's own state — i.e. "enabled, under another name" — not a
+# distinct half-enabled state. None of the units this check reads out of
+# `deploy/` declare an `Alias=`, so this should not currently be reachable
+# in practice; it is kept in the accepted set (rather than omitted or
+# treated as WARN) because, per `systemd.unit`(5), it never means "this
+# will NOT run" — the one thing this check exists to catch — the opposite
+# would risk a false WARN on a legitimately-running unit.
+#
+# systemctl/`coord --version` are both fast, but a wedged one must not eat
+# the ~2s registry budget for the whole tick (mirrors
+# `coord.health.checks.spawned_coord`'s `_SYSTEMCTL_TIMEOUT`).
+_SYSTEMCTL_TIMEOUT = 5.0
+
 _ENABLED_STATES = {"enabled", "enabled-runtime", "alias"}
 
 
@@ -62,7 +78,7 @@ def _is_enabled(unit: str, *, runner=None) -> tuple[str | None, str | None]:
             ["systemctl", "--user", "is-enabled", unit],
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=_SYSTEMCTL_TIMEOUT,
         )
     except FileNotFoundError:
         return None, "systemctl not found (no systemd on this host)"

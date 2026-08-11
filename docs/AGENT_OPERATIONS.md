@@ -710,7 +710,11 @@ it runs `systemctl --user is-enabled` and WARNs if the answer isn't
 unit and a running one produced identical evidence. It does not guess
 whether a host *should* install a unit it lacks; that half stays a human
 decision, same boundary `unit_drift` and `coord release verify` already
-draw.
+draw. `coord doctor`'s printed report names the unit and the fix
+(`_unit_enablement_lines` in `coord/commands/status.py`, mirroring the
+`unit_drift` renderer already there) — not just the aggregate per-machine
+`severity` that rolls into the "FLEET: WARN" footer / coord-tui indicator;
+`coord health` also prints full per-unit detail.
 
 ## Fleet version propagation (`coord-release-propagate` timer, #1835/PKG-7)
 

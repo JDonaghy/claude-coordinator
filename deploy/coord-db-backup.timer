@@ -1,3 +1,10 @@
+# Fires coord-db-backup.service hourly. See that unit's header for the full
+# rationale, install steps and safety guarantees.
+#
+# Persistent=true: if the daemon host was down/rebooted when a fire was
+# missed, the next boot catches it up immediately rather than waiting up to
+# an hour for the next scheduled tick.
+
 [Unit]
 Description=Hourly coord.db snapshot to the external SSD (interim, pending #1822)
 
