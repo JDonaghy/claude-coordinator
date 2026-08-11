@@ -4024,7 +4024,11 @@ impl CoordApp {
                                 SpawnQueuedOutcome::Started => {
                                     // Optimistic local update so the badge
                                     // reflects the new state immediately.
-                                    if is_paused {
+                                    if is_paused && self.cordoned_machines.contains(&name) {
+                                        // #2101 trap A: `coord unpause` does
+                                        // not lift a release cordon, so this
+                                        // must not predict that it did.
+                                    } else if is_paused {
                                         self.paused_machines.remove(&name);
                                         // #1862: an unpause of a quiet-paused
                                         // machine grants an override — clear

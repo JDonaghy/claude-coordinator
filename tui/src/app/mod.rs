@@ -2260,6 +2260,16 @@ pub struct CoordApp {
     /// its doc comment for why the local-file fallback always leaves this
     /// empty. Never consulted for routing, display only.
     quiet_paused_machines: std::collections::HashSet<String>,
+    /// #2101: the subset of `paused_machines` under a *release cordon* —
+    /// draining so `coord release propagate` can roll them onto the released
+    /// version. Badged distinctly for the same reason `quiet_paused_machines`
+    /// is: a machine that stopped taking work because the fleet is upgrading
+    /// itself must not read as one a human paused, because the remedy an
+    /// operator would reach for (`coord unpause`) does not apply and would
+    /// not work. Only ever populated via the daemon's `GET /pause`
+    /// (`data::PausedFetch`'s `cordoned` field). Never consulted for
+    /// routing, display only.
+    cordoned_machines: std::collections::HashSet<String>,
     /// #1563: in-flight background fetch of the paused-machine set (local
     /// file read or daemon `GET /pause`, whichever `spawn_paused_machines_fetch`
     /// determined applies). Armed at startup and re-armed by `refresh()` on
@@ -3656,6 +3666,7 @@ impl CoordApp {
             chat_spinner_throttle: 0,
             paused_machines: read_paused_machines(),
             quiet_paused_machines: std::collections::HashSet::new(),
+            cordoned_machines: std::collections::HashSet::new(),
             pending_paused_machines: Some(spawn_paused_machines_fetch()),
             pending_force_merge: None,
             pending_merge_all_ready: None,
@@ -6773,7 +6784,19 @@ impl CoordApp {
                 // paused this" (maybe worth investigating) at a glance.
                 // Blue so it reads as scheduled/expected rather than the
                 // amber "someone did this" signal.
-                if self.quiet_paused_machines.contains(&m.name) {
+                //
+                // #2101: a release cordon gets the third badge, checked
+                // FIRST because it is the most specific claim about why the
+                // machine is excluded. "Work stopping with no stated reason
+                // is the thing this fleet keeps doing to itself" — a machine
+                // draining so the fleet can upgrade itself must not read as
+                // one a human paused, because `coord unpause` (the remedy
+                // that badge implies) neither applies nor works on it.
+                // Violet: neither the amber "someone did this" nor the blue
+                // "scheduled and will lift itself on the clock".
+                if self.cordoned_machines.contains(&m.name) {
+                    spans.push(StyledSpan::with_fg(" [DRAINING]", Color::rgb(170, 130, 240)));
+                } else if self.quiet_paused_machines.contains(&m.name) {
                     spans.push(StyledSpan::with_fg(" [QUIET]", Color::rgb(90, 160, 230)));
                 } else if self.paused_machines.contains(&m.name) {
                     spans.push(StyledSpan::with_fg(" [PAUSED]", Color::rgb(230, 180, 60)));

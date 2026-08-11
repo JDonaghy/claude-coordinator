@@ -2103,10 +2103,20 @@ pub(crate) fn spawn_paused_machines_fetch() -> std::sync::mpsc::Receiver<PausedF
 /// a pre-existing gap (the base `paused` fold from quiet hours is ALSO
 /// daemon-only, see the comments on `read_paused_machines`/
 /// `spawn_paused_machines_fetch`), not a regression introduced here.
+///
+/// #2101: `cordoned` is the third such subset — machines under a *release
+/// cordon*, i.e. draining so `coord release propagate` can roll them onto a
+/// released version. Same routing effect as a pause (which is why it is in
+/// `paused` too), different owner: an operator's `coord unpause` does not
+/// clear it and it lifts itself the moment the roll lands. Rendering it as
+/// `[PAUSED]` would tell an operator that a human stopped that machine and
+/// that `coord unpause` is the fix — both wrong. Like `quiet`, only the
+/// daemon's `GET /pause` can populate it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PausedFetch {
     pub(crate) paused: std::collections::HashSet<String>,
     pub(crate) quiet: std::collections::HashSet<String>,
+    pub(crate) cordoned: std::collections::HashSet<String>,
 }
 
 /// #1563: the synchronous half of [`spawn_paused_machines_fetch`] — daemon
@@ -2136,6 +2146,7 @@ fn fetch_paused_machines_resolved(resolved: Option<(String, Option<String>)>) ->
         return PausedFetch {
             paused: super::read_paused_machines(),
             quiet: std::collections::HashSet::new(),
+            cordoned: std::collections::HashSet::new(),
         };
     };
     let agent = ureq::AgentBuilder::new()
@@ -2160,13 +2171,15 @@ fn fetch_paused_machines_resolved(resolved: Option<(String, Option<String>)>) ->
                 .unwrap_or_default()
         }
         // `paused` must be present to trust the response at all (matches
-        // the pre-#1862 contract exactly); `quiet` is a newer, optional
-        // field — its absence (an older daemon) degrades to "no quiet
-        // distinction available" rather than discarding the whole response.
+        // the pre-#1862 contract exactly); `quiet` and `cordoned` (#2101)
+        // are newer, optional fields — their absence (an older daemon)
+        // degrades to "no such distinction available" rather than
+        // discarding the whole response.
         v.get("paused")?;
         Some(PausedFetch {
             paused: str_set(&v, "paused"),
             quiet: str_set(&v, "quiet"),
+            cordoned: str_set(&v, "cordoned"),
         })
     })()
     .unwrap_or_default()
