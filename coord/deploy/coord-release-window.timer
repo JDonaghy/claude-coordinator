@@ -1,0 +1,36 @@
+# coord release nightly-window — fires coord-release-window.service
+# (Type=oneshot) once a night. See that unit's header for the full
+# rationale (#2112).
+#
+# 03:00 local, inside the 22:00-08:00 quiet hours already used for
+# notifications (see coord-notify's own schedule) — an operator is least
+# likely to be mid-drive at 03:00, and the drain deadline
+# (coord/release_window.py's DEFAULT_DRAIN_DEADLINE_SECONDS, 1h by default)
+# leaves comfortable room to finish and restart the queue timer well before
+# the working day, even in the worst case where the drain times out.
+#
+# RandomizedDelaySec is small and exists only to avoid firing at the exact
+# same wall-clock instant `coord-drive-queue.timer`'s own OnCalendar-free
+# interval schedule might land on, not because two hosts might race this
+# unit — it belongs on the daemon host ONLY (same rule as
+# coord-release-propagate.timer; see that unit's header for why a second
+# copy elsewhere is the #1440 two-overseers failure in a new costume).
+#
+# Persistent=true (#2112 trap 4 / acceptance-adjacent): a host that was
+# asleep or rebooted through 03:00 still catches up on the next boot, rather
+# than silently skipping a whole night. `coord release nightly-window`
+# itself is idempotent — see its module docstring's `needs_roll`: a fleet
+# already current at whatever time this actually fires does not stop the
+# queue at all.
+
+[Unit]
+Description=Nightly release window on the daemon host (#2112)
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+RandomizedDelaySec=5min
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

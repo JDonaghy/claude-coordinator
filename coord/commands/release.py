@@ -1714,6 +1714,518 @@ def release_history(limit: int, verbose: bool, as_json: bool) -> None:
     click.echo(rp.render_history(records, verbose=verbose))
 
 
+# ── #2112: the nightly daemon-host release window ───────────────────────────
+#
+# `coord release propagate` waits for a quiescent window that may never
+# arrive on the daemon host specifically, because it both leads every roll
+# (the documented 405) and is the box that launches drive-queue work, so
+# almost any drive anywhere keeps it "busy" and defers the entire fleet
+# (see `coord/release_window.py`'s module docstring for the full mechanism
+# and the 2026-08-10 measurement). This section is the I/O shell over that
+# module's decisions: stop the queue timer, drain in-flight drives bounded
+# by a deadline, roll via `coord release propagate`, and ALWAYS restart the
+# timer — the pure judgement (`needs_roll`, the journal, the record shape)
+# lives in `coord/release_window.py`, same split as `release_propagate`'s
+# own I/O shell above.
+#
+# GATED ON #2110: the drain loop below calls `coord drive-queue tick
+# --reconcile-only` on every poll specifically because stopping the timer
+# also stops the ONLY thing that otherwise reconciles a finished drive's row
+# from `running` to `done` — without #2110 making that reconciliation safe to
+# call standalone, this whole mechanism would deadlock every night.
+
+
+def _systemctl(unit: str, action: str, *, runner=None, timeout: float = 30.0) -> tuple[bool, str]:
+    """``systemctl --user <action> <unit>``, tolerantly.
+
+    Mirrors `coord.deploy_units.enable_timers`'s own systemctl wrapper: same
+    injectable ``runner`` seam for tests (a fleet-free unit test never
+    spawns a real ``systemctl``), same "never raise" contract — a window run
+    must be able to report "could not stop the queue" as a normal, recorded
+    outcome rather than crash.
+    """
+    import subprocess  # noqa: PLC0415
+
+    run = runner or subprocess.run
+    try:
+        proc = run(
+            ["systemctl", "--user", action, unit],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except FileNotFoundError:
+        return False, "systemctl not found (no systemd on this host)"
+    except Exception as exc:  # noqa: BLE001
+        return False, f"{type(exc).__name__}: {exc}"
+    ok = getattr(proc, "returncode", 1) == 0
+    detail = (getattr(proc, "stderr", "") or getattr(proc, "stdout", "") or "").strip()
+    return ok, detail or (f"{action} ok" if ok else f"{action} failed")
+
+
+def _run_reconcile_tick(config_path: Path, *, runner=None) -> tuple[bool, str]:
+    """``coord drive-queue tick --reconcile-only`` — best effort, #2110.
+
+    Stopping `coord-drive-queue.timer` for the drain also stops the ONLY
+    thing that otherwise reconciles a finished drive's row from ``running``
+    to ``done``. Without calling this on every poll, a drive that finished
+    *after* the timer stopped would stay stuck ``running`` for the rest of
+    the drain no matter how generous the deadline is — the exact deadlock
+    #2110 fixed reconciliation to no longer require the timer for.
+    """
+    import subprocess  # noqa: PLC0415
+
+    run = runner or subprocess.run
+    try:
+        proc = run(
+            [sys.executable, "-m", "coord.cli", "drive-queue", "tick",
+             "--reconcile-only", "--config", str(config_path)],
+            capture_output=True, text=True, timeout=120,
+        )
+    except Exception as exc:  # noqa: BLE001 — best effort; the quiescence
+        # check right after this call is the real signal a stuck reconcile
+        # eventually clears on a later poll, not this one call's job to
+        # guarantee.
+        return False, f"{type(exc).__name__}: {exc}"
+    ok = getattr(proc, "returncode", 1) == 0
+    detail = (getattr(proc, "stderr", "") or getattr(proc, "stdout", "") or "").strip()
+    return ok, detail[:200]
+
+
+def _drain(
+    *,
+    daemon_host: str,
+    config_path: Path,
+    deadline: float,
+    poll_interval: float,
+    reconcile=None,
+    board_fetch=None,
+    now=None,
+    sleep=None,
+):
+    """Bounded wait for *daemon_host* to stop being busy (trap 2).
+
+    Reuses `release_propagate.assess_quiescence` — the SAME computation
+    `coord release propagate` itself uses to decide whether the daemon host
+    may lead a roll — rather than a second definition of "busy" (#2096's
+    "two surfaces, one function" rule). ``now``/``sleep`` are injectable so
+    this loop is unit-testable without a real clock; ``reconcile``/
+    ``board_fetch`` default to the real subprocess/board calls.
+    """
+    import time as _time  # noqa: PLC0415
+
+    from coord import release_propagate as rp  # noqa: PLC0415
+    from coord import release_window as rw  # noqa: PLC0415
+
+    now_fn = now or _time.time
+    sleep_fn = sleep or _time.sleep
+    reconcile_fn = reconcile or (lambda: _run_reconcile_tick(config_path))
+    fetch_fn = board_fetch or _fetch_board
+
+    start = now_fn()
+    while True:
+        reconcile_fn()
+        board, board_error = fetch_fn()
+        extra_busy = []
+        if board_error:
+            extra_busy.append(
+                rp.Busy(kind="board unreadable", subject="/board", detail=board_error)
+            )
+        quiescence = rp.assess_quiescence(
+            queue_entries=board.get("drive_queue") or [],
+            assignments=board.get("assignments") or [],
+            issues=board.get("issues") or [],
+            extra_busy=extra_busy,
+        )
+        busy = bool(quiescence.fleet_wide_busy) or daemon_host in quiescence.busy_hosts()
+        elapsed = now_fn() - start
+        if not busy:
+            return rw.DrainOutcome(drained=True, elapsed_seconds=elapsed, detail="drained")
+        detail = quiescence.busy_reason_for_host(daemon_host) or quiescence.reason
+        if elapsed >= deadline:
+            return rw.DrainOutcome(drained=False, elapsed_seconds=elapsed, detail=detail)
+        sleep_fn(max(0.0, min(poll_interval, deadline - elapsed)))
+
+
+def _run_propagate(
+    *, daemon_host: str, target_version: str, config_path: Path, runner=None,
+) -> tuple[str, int, str]:
+    """``coord release propagate --daemon-host ... --target ... --json``.
+
+    A real subprocess of THIS interpreter (matches `_roll_tui`/
+    `_release_hold` above), not an in-process call: `release_propagate` is a
+    click command that calls ``sys.exit()`` itself and is not meant to be
+    invoked as a plain function. ``--target`` is passed explicitly — not
+    left to re-resolve PyPI's "latest" a second time — so the version this
+    run decided was needed is the version that actually rolls, even if a new
+    release lands on PyPI mid-drain.
+
+    Returns ``(status, exit_code, combined_output)``. ``status`` is parsed
+    from the last JSON line of stdout (propagate's own record); parsing
+    failures fall back to ``f"exit {code}"`` rather than raising — a window
+    run must never crash because propagate's output was unexpected.
+    """
+    import json as _json  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
+
+    run = runner or subprocess.run
+    argv = [
+        sys.executable, "-m", "coord.cli", "release", "propagate",
+        "--daemon-host", daemon_host, "--target", target_version,
+        "--json", "--config", str(config_path),
+    ]
+    try:
+        proc = run(argv, capture_output=True, text=True, timeout=1800)
+    except Exception as exc:  # noqa: BLE001
+        detail = f"{type(exc).__name__}: {exc}"
+        return f"error: {detail}", 1, detail
+    code = getattr(proc, "returncode", 1)
+    stdout = getattr(proc, "stdout", "") or ""
+    stderr = getattr(proc, "stderr", "") or ""
+    status = f"exit {code}"
+    for line in reversed(stdout.strip().splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            payload = _json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(payload, dict) and payload.get("status"):
+            status = str(payload["status"])
+        break
+    return status, code, (stdout + ("\n" + stderr if stderr else "")).strip()
+
+
+#: Where a skipped/failed nightly window (trap 3) is recorded — same
+#: escalation channel #2101's drain-deadline escalation and `coord
+#: drive-queue`'s own alerts use, so it shows up in the TUI's escalations
+#: panel and `coord drive escalations` with no new surface to remember to
+#: look at. Mirrors `_escalate_drain`'s `DRAIN_ALERT_*` convention above.
+WINDOW_ALERT_REPO = "(release-window)"
+WINDOW_ALERT_ISSUE = 0
+WINDOW_ALERT_STAGE = "release-window"
+
+
+def _escalate_window(record, *, reason: str) -> None:
+    """Surface a skipped/failed nightly window loudly (trap 3).
+
+    #2112's whole point: a night propagation was supposed to happen and did
+    not is exactly the state #2082 exists to make loud elsewhere in this
+    fleet. Silence must not be the report here either.
+    """
+    click.echo(f"  ! {reason}", err=True)
+    try:
+        from coord.state import record_drive_escalation  # noqa: PLC0415
+
+        proposed = (
+            f"coord release propagate --daemon-host {record.daemon_host} "
+            f"--target {record.target_version}"
+            if record.daemon_host and record.target_version
+            else "coord release nightly-window --dry-run   # investigate first"
+        )
+        record_drive_escalation(
+            WINDOW_ALERT_REPO, WINDOW_ALERT_ISSUE, stage=WINDOW_ALERT_STAGE,
+            reason=reason,
+            gate_readings=(
+                f"daemon_host={record.daemon_host} | target={record.target_version} | "
+                f"daemon_version={record.daemon_version} | status={record.status}"
+            ),
+            proposed_command=proposed,
+        )
+    except Exception as exc:  # noqa: BLE001 — the stderr line above is the
+        # floor; an escalation table that cannot be written must not take
+        # the message down with it.
+        click.echo(f"  (could not record the window escalation: {exc})", err=True)
+
+
+@release_group.command(
+    "nightly-window",
+    help=(
+        "Guarantee the daemon host rolls at a nightly window instead of "
+        "waiting for a fleet-wide quiescent moment that may never come "
+        "(#2112). Stops the drive queue, drains in-flight drives (bounded), "
+        "rolls with `coord release propagate`, and ALWAYS restarts the "
+        "queue timer before exiting — whether or not anything rolled."
+    ),
+)
+@_CONFIG_OPTION
+@click.option("--target", default=None,
+              help="Version to propagate (leading 'v' optional). Default: PyPI's latest.")
+@click.option("--daemon-host", "daemon_host_override", default=None,
+              help="Machine name running coord-serve. Normally DERIVED from the "
+                   "fleet's own /health, same as `coord release propagate`.")
+@click.option("--queue-timer", default="coord-drive-queue.timer", show_default=True,
+              help="The systemd --user timer to stop for the duration of the drain.")
+@click.option("--drain-deadline", default=3600.0, show_default=True, type=float,
+              help="Bounded wait (seconds) for in-flight drives before giving up, "
+                   "restarting the queue and reporting failure (trap 2) — the "
+                   "queue is never left stopped past this.")
+@click.option("--poll-interval", default=30.0, show_default=True, type=float,
+              help="Seconds between drain re-checks.")
+@click.option("--dry-run", is_flag=True,
+              help="Print what this run would do; stop nothing, roll nothing.")
+@click.option("--ensure-queue-running", is_flag=True,
+              help="Do ONLY `systemctl --user start <queue-timer>` and exit — the "
+                   "SIGKILL-safe half of trap 4/acceptance 4. Wired as "
+                   "deploy/coord-release-window.service's ExecStopPost=, which "
+                   "systemd runs after the main process exits for ANY reason "
+                   "(success, failure, or a signal a Python `finally` cannot "
+                   "catch). Every other option is ignored with this flag.")
+@click.option("--json", "as_json", is_flag=True, help="Emit the window record as JSON.")
+def release_nightly_window(  # noqa: PLR0912, PLR0915 — a pipeline; see module docstring
+    config_path: Path,
+    target: str | None,
+    daemon_host_override: str | None,
+    queue_timer: str,
+    drain_deadline: float,
+    poll_interval: float,
+    dry_run: bool,
+    ensure_queue_running: bool,
+    as_json: bool,
+) -> None:
+    """One nightly-window attempt. Exit 0 on up-to-date/rolled/dry-run, 1+ otherwise.
+
+    #2112: `coord release propagate` cannot roll the daemon host past a busy
+    fleet on its own — the daemon leads every roll (the documented 405), and
+    dellserver's own drive-queue tick charges itself as busy for essentially
+    any queued drive (see `coord/release_window.py`'s module docstring). This
+    command manufactures the window propagate can't: stop the queue, drain
+    what's already running (bounded — trap 2), roll, restart the queue —
+    ALWAYS restart the queue (trap 4), whatever happened in between.
+
+    Never carries `--force` to the `coord release propagate` it shells out
+    to (trap 1) — a drain that did not finish is reported and declined, not
+    overridden.
+    """
+    import json as _json  # noqa: PLC0415
+    import time  # noqa: PLC0415
+
+    from coord import release_propagate as rp  # noqa: PLC0415
+    from coord import release_verify as rv  # noqa: PLC0415
+    from coord import release_window as rw  # noqa: PLC0415
+    from coord.commands._common import _load_config  # noqa: PLC0415
+
+    if ensure_queue_running:
+        ok, detail = _systemctl(queue_timer, "start")
+        click.echo(f"{'✓' if ok else '✗'} ensure {queue_timer} running: {detail}")
+        sys.exit(0 if ok else 1)
+
+    config = _load_config(config_path)
+    state_dir = _state_dir()
+    record = rw.WindowRecord(
+        started_at=time.time(), dry_run=dry_run, queue_timer=queue_timer
+    )
+
+    def _finish(status: str, exit_code: int = 0) -> None:
+        record.status = status
+        record.finished_at = time.time()
+        if not dry_run:
+            try:
+                rw.append_record(state_dir, record)
+                rw.trim_journal(state_dir)
+            except OSError as exc:
+                click.echo(f"warning: could not append the window journal: {exc}",
+                           err=True)
+        if as_json:
+            click.echo(_json.dumps(record.to_dict(), indent=2, sort_keys=True))
+        else:
+            click.echo("\n".join(rw.render_record(record)))
+        sys.exit(exit_code)
+
+    # ── 1. what version, and who leads? ───────────────────────────────────
+    index_url = getattr(getattr(config, "health", None), "pypi_index_url",
+                        "https://pypi.org/simple")
+    resolved, warning = _resolve_expected(
+        target, use_pypi=not target, index_url=index_url, timeout=10.0
+    )
+    if warning:
+        click.echo(f"warning: {warning}", err=True)
+    record.target_version = rp.normalize_version(resolved)
+    if not record.target_version:
+        record.error = (
+            "could not resolve a target version — pass --target, or fix "
+            "access to the PyPI simple index"
+        )
+        click.echo(f"error: {record.error}", err=True)
+        _escalate_window(record, reason=record.error)
+        _finish(rw.STATUS_ERROR, 1)
+
+    machine_health, unreachable, daemon_facts, daemon_label = rv.gather(config, timeout=10.0)
+    daemon_name = _daemon_machine_name(config, daemon_host_override, machine_health)
+    if daemon_name is None:
+        record.error = (
+            "could not identify which machine runs coord-serve — pass "
+            "--daemon-host, or fix its /health so the unit is visible "
+            "(same requirement as `coord release propagate`)"
+        )
+        click.echo(f"error: {record.error}", err=True)
+        _escalate_window(record, reason=record.error)
+        _finish(rw.STATUS_ERROR, 1)
+    record.daemon_host = daemon_name
+
+    report = rv.verify(
+        machine_health=machine_health, unreachable=unreachable,
+        daemon_host=daemon_facts, daemon_host_name=daemon_label,
+        expected=record.target_version,
+    )
+    record.daemon_version = _python_lane_versions(
+        report, [daemon_name], record.target_version
+    ).get(daemon_name)
+
+    # ── 2. acceptance 3 — already current, so the queue is never touched ──
+    if not rw.needs_roll(record.daemon_version, record.target_version):
+        _finish(rw.STATUS_UP_TO_DATE, 0)
+
+    if dry_run:
+        click.echo(
+            f"would stop {queue_timer}, drain up to {drain_deadline:.0f}s "
+            f"({daemon_name} currently reports v{record.daemon_version or '?'}, "
+            f"target v{record.target_version}), then `coord release propagate "
+            f"--daemon-host {daemon_name} --target {record.target_version}`, "
+            f"then restart {queue_timer}"
+        )
+        _finish(rw.STATUS_DRY_RUN, 0)
+
+    # ── 3. stop the queue — no new drives may launch for the rest of this
+    #      run — and from here on ALWAYS restart it before exiting ─────────
+    stop_ok, stop_detail = _systemctl(queue_timer, "stop")
+    record.queue_stopped = stop_ok
+    record.queue_stop_detail = stop_detail
+    click.echo(f"{'✓' if stop_ok else '✗'} stop {queue_timer}: {stop_detail}")
+
+    status = rw.STATUS_ERROR
+    exit_code = 1
+    try:
+        if not stop_ok:
+            record.error = (
+                f"could not stop {queue_timer} — refusing to drain or roll "
+                f"without a guaranteed no-new-launches window: {stop_detail}"
+            )
+            click.echo(f"error: {record.error}", err=True)
+            _escalate_window(record, reason=record.error)
+        else:
+            # ── 4. bounded drain (trap 2) ──────────────────────────────────
+            outcome = _drain(
+                daemon_host=daemon_name, config_path=config_path,
+                deadline=drain_deadline, poll_interval=poll_interval,
+            )
+            record.drained = outcome.drained
+            record.drain_seconds = outcome.elapsed_seconds
+            record.drain_detail = outcome.detail
+            click.echo(
+                f"{'✓' if outcome.drained else '✗'} drain: "
+                f"{'clean' if outcome.drained else 'TIMED OUT'} after "
+                f"{outcome.elapsed_seconds:.0f}s"
+                + (f" — {outcome.detail}" if outcome.detail else "")
+            )
+
+            if not outcome.drained:
+                record.error = (
+                    f"drain deadline ({drain_deadline:.0f}s) hit with "
+                    f"{daemon_name} still busy — {outcome.detail}; declining "
+                    "to roll (never --force from an unattended window)"
+                )
+                click.echo(f"error: {record.error}", err=True)
+                _escalate_window(record, reason=record.error)
+                status = rw.STATUS_DRAIN_TIMEOUT
+            else:
+                # ── 5. roll — the daemon host is now provably free ─────────
+                prop_status, prop_exit, prop_output = _run_propagate(
+                    daemon_host=daemon_name, target_version=record.target_version,
+                    config_path=config_path,
+                )
+                record.propagate_status = prop_status
+                record.propagate_exit_code = prop_exit
+                record.propagate_output = prop_output
+                if prop_output:
+                    click.echo(prop_output)
+
+                if prop_exit == 0 and prop_status in (
+                    rp.STATUS_VERIFIED, rp.STATUS_UP_TO_DATE, rp.STATUS_ROLLED,
+                ):
+                    status = (
+                        rw.STATUS_UP_TO_DATE if prop_status == rp.STATUS_UP_TO_DATE
+                        else rw.STATUS_ROLLED
+                    )
+                    exit_code = 0
+                elif prop_exit == 0 and prop_status == rp.STATUS_DEFERRED:
+                    # A drained daemon host still deferred: some OTHER host
+                    # (or an unattributable signal) is busy. Not this
+                    # command's #2110-shaped deadlock — that would show up
+                    # as the drain never clearing — but still a night that
+                    # did not roll, and just as loud (trap 3).
+                    record.error = (
+                        f"{daemon_name} drained clean but `coord release "
+                        f"propagate` still deferred (status={prop_status}) — "
+                        "see propagate_output for why"
+                    )
+                    click.echo(f"error: {record.error}", err=True)
+                    _escalate_window(record, reason=record.error)
+                    status = rw.STATUS_PROPAGATE_DEFERRED
+                else:
+                    record.error = (
+                        f"coord release propagate did not verify a roll "
+                        f"(status={prop_status}, exit={prop_exit}) despite a "
+                        f"drained daemon host"
+                    )
+                    click.echo(f"error: {record.error}", err=True)
+                    _escalate_window(record, reason=record.error)
+                    status = rw.STATUS_PROPAGATE_FAILED
+                    exit_code = prop_exit or 1
+    finally:
+        # Trap 4 / acceptance 4: ALWAYS restart the timer — whatever
+        # happened above, including an exception raised out of this block.
+        # This is the in-process half of the guarantee; --ensure-queue-running
+        # wired as ExecStopPost= (deploy/coord-release-window.service) is the
+        # SIGKILL-safe half, since a `finally` cannot run after SIGKILL.
+        # Leaving the fleet's work queue stopped is the worst outcome this
+        # mechanism exists to prevent, so this runs no matter what.
+        start_ok, start_detail = _systemctl(queue_timer, "start")
+        record.queue_restarted = start_ok
+        record.queue_restart_detail = start_detail
+        click.echo(f"{'✓' if start_ok else '✗'} restart {queue_timer}: {start_detail}")
+        if not start_ok:
+            _escalate_window(
+                record,
+                reason=(
+                    "queue timer restart FAILED after a nightly window run — "
+                    f"{queue_timer} may be stopped: {start_detail}. Run "
+                    f"`systemctl --user start {queue_timer}` by hand NOW."
+                ),
+            )
+
+    _finish(status, exit_code)
+
+
+@release_group.command(
+    "window-history",
+    help="What the nightly release window actually did, and when (#2112).",
+)
+@click.option("--limit", default=40, show_default=True,
+              help="Show at most this many recorded attempts (most recent last).")
+@click.option("--json", "as_json", is_flag=True, help="Emit the raw records as JSON.")
+def release_window_history(limit: int, as_json: bool) -> None:
+    """Read the `coord release nightly-window` journal.
+
+    Separate from `coord release history` (`release_propagate`'s journal):
+    this record carries fields — the queue stop/drain/restart outcome — a
+    plain propagate attempt does not have.
+    """
+    import json as _json  # noqa: PLC0415
+
+    from coord import release_window as rw  # noqa: PLC0415
+
+    records = rw.read_records(_state_dir(), limit=limit)
+    if as_json:
+        click.echo(_json.dumps(records, indent=2, sort_keys=True))
+        return
+    if not records:
+        click.echo("no nightly-window attempts recorded yet")
+        return
+    for rec in records:
+        click.echo("\n".join(rw.render_record(rec)))
+        click.echo("")
+
+
 # Same callback under the group, so `coord release preflight` and `coord
 # release verify` are one discoverable pair. The flat `coord
 # release-preflight` above keeps working unchanged.
