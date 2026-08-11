@@ -463,7 +463,7 @@ def _install_editable(repo_dir: Path, install_dir: Path) -> None:
     --no-deps`) the same way `_build_wheel` builds a regular wheel above.
 
     `--target` is what keeps this isolated from *this test process's own*
-    editable install of `claude-coordinator` (the `pip install -e
+    editable install of `code-coordinator` (the `pip install -e
     ".[dev]"` dev/CI setup these tests run under) — the finder pip writes
     resolves entirely from the `direct_url.json`/`.pth` it drops into
     *install_dir*, pointed at *repo_dir*, and nothing this call installs
