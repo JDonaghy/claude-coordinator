@@ -650,6 +650,15 @@ class Deferral:
     whose remaining entries are all waiting on their own repo's in-flight work
     is the queue working exactly as designed, so it raises no queue-level
     alert — the same posture the global at-capacity return takes.
+
+    ``cordoned=True`` is #2101's twin of that flag: the entry is pinned to a
+    machine that is draining for a release right now.  Same posture and same
+    reason — a drain is the fleet working, lasts minutes, and ends by itself,
+    so escalating it every tick is how an alert channel gets muted.  A
+    separate flag rather than reusing ``repo_limited`` because the two produce
+    different prose and different remedies, and a render that blames the
+    repo limit for a cordon is a render that sends the operator to the wrong
+    knob.
     """
 
     key: str
@@ -657,6 +666,17 @@ class Deferral:
     updates: Mapping[str, Any] = field(default_factory=dict)
     counted: bool = True
     repo_limited: bool = False
+    cordoned: bool = False
+
+    @property
+    def benign(self) -> bool:
+        """Is this a "the fleet is working" deferral rather than a stall?
+
+        The single predicate both the queue-level alert and `render_plan`
+        consult, so a future third benign cause cannot be added to one and
+        forgotten in the other.
+        """
+        return self.repo_limited or self.cordoned
 
 
 @dataclass(frozen=True)
@@ -740,6 +760,12 @@ class TickPlan:
     # original single-line capacity render.
     repo_occupied: Mapping[str, int] = field(default_factory=dict)
     repo_capacity: int = 0
+    # #2101: non-empty when THIS host is under a release cordon, in which case
+    # nothing launched this tick and `launch` is guaranteed None.  Carried as
+    # the cordon's own sentence ("cordoned: draining for v0.5.31") rather than
+    # a bool, because a queue that stops with no stated reason is the failure
+    # the cordon mechanism exists to stop repeating.
+    cordon_reason: str = ""
 
     @property
     def free_slots(self) -> int:
@@ -1449,6 +1475,49 @@ def _resolve_holds(
     return holds
 
 
+def _norm_host(name: str | None) -> str:
+    """#2101: the one host-identity normalisation this module compares by.
+
+    Machine names come from ``coordinator.yml`` (``dellserver``) and host
+    identities from ``socket.gethostname()`` (``dellserver.local``), and a
+    cordon that fails to match because of a domain suffix is a cordon that
+    silently does nothing — the exact class of failure #1563 closed for
+    pause. Same normalisation `coord/commands/drive_queue.py`'s
+    ``_local_host_id`` already applies: short hostname, lowercased.
+    """
+    return str(name or "").split(".")[0].strip().lower()
+
+
+def _normalized_cordons(cordons: Mapping[str, str] | None) -> dict[str, str]:
+    return {
+        _norm_host(name): str(reason)
+        for name, reason in (cordons or {}).items()
+        if _norm_host(name) and reason
+    }
+
+
+def _cordon_alert(host: str, reason: str) -> QueueAlert:
+    """The queue-level record for "this host is cordoned" (#2101 trap E).
+
+    Mirrors :func:`_hold_alert`: a queue that stops must say why, in the same
+    channel and with the same one-key remedy field, or "stopped" and "wedged"
+    look identical from the outside — which is how a fleet sits eleven
+    releases behind for a day with every readout silent.
+    """
+    return QueueAlert(
+        reason=(
+            f"no launch — {host} is {reason}. In-flight drives are draining; "
+            "the queue resumes automatically the moment this host is rolled "
+            "and uncordoned (#2101)."
+        ),
+        details=(
+            "release cordons expire on their own if the propagate run that "
+            "set one dies, so this can never wedge the queue permanently",
+        ),
+        command=f"coord release cordon --clear {host}",
+    )
+
+
 def _hold_alert(hold: Hold) -> QueueAlert:
     """The one queue-level record a closed gate raises.
 
@@ -1494,6 +1563,7 @@ def plan_tick(
     exit_refused: Mapping[str, bool] | None = None,
     exit_dead_end: Mapping[str, bool] | None = None,
     gate_a_pending: Mapping[str, bool] | None = None,
+    cordons: Mapping[str, str] | None = None,
 ) -> TickPlan:
     """Decide one tick.  Pure; the caller executes the returned plan.
 
@@ -1550,6 +1620,25 @@ def plan_tick(
     see that host at all.  ``None`` disables the check entirely, the
     pre-#1870 behaviour — the production shell always passes its own
     hostname.
+
+    *cordons* maps a machine name to the reason it is under a #2101 release
+    cordon ("cordoned: draining for v0.5.31").  Two distinct effects, because
+    a drive occupies two machines:
+
+    * this tick's own host (*local_host*) cordoned ⇒ launch NOTHING at all,
+      because ``coord drive --tmux`` starts its session HERE.  This is the
+      hole #2101 names outright: `coord/drive.py` checks pause only when
+      routing a *worker*, so before this the main launcher walked straight
+      through the cordon and the fleet could never drain.
+    * an entry pinned (``--machine``) to a cordoned host ⇒ that ENTRY defers,
+      position unchanged, no attempt spent; the walk moves on to the next
+      entry, which may well be launchable on an uncordoned machine.
+
+    Reconciliation (steps 1/1b) still runs under a cordon, and that is the
+    whole point: a cordon that also froze the queue's view of reality would
+    leave a finished drive's `running` row pinning propagation forever — the
+    #2110 deadlock, re-created by the very mechanism meant to end it.  A
+    cordoned tick is exactly `--reconcile-only`.
 
     The algorithm, from #1754, plus #1757's step 2, #1891's step 1b, and
     #2055's extension of it:
@@ -1782,6 +1871,24 @@ def plan_tick(
             launch=None,
         )
 
+    # #2101 step 2b: is THIS host cordoned?  Checked after reconciliation (so
+    # a cordoned host still drains its view of reality — see the docstring)
+    # and after the deploy gate (which is the older, narrower stop and keeps
+    # its own alert), but BEFORE capacity: a cordoned host launches nothing
+    # however many slots are free, which is the entire mechanism.
+    cordon_map = _normalized_cordons(cordons)
+    local_cordon = cordon_map.get(_norm_host(local_host)) if local_host else None
+    if local_cordon:
+        return TickPlan(
+            **plan_base,
+            reconciles=tuple(reconciles),
+            blocked=tuple(blocked),
+            deferrals=(),
+            alert=_cordon_alert(local_host or "this host", local_cordon),
+            launch=None,
+            cordon_reason=local_cordon,
+        )
+
     if capacity - occupied <= 0:
         return TickPlan(
             **plan_base,
@@ -1848,6 +1955,28 @@ def plan_tick(
             "deferring so a different repo can launch"
         )
 
+    def _cordon_reason(candidate: QueueEntry) -> str:
+        """#2101: '' unless this entry is PINNED to a cordoned machine.
+
+        A DEFER, never a block: nothing is wrong with the entry, its position
+        does not move and no attempt is spent — its destination is simply
+        draining for a release right now and will take work again in minutes.
+        Only an explicit ``--machine`` pin is checked here; an unpinned entry
+        auto-picks its host at dispatch time, where `coord.drive_state`'s
+        machine picker already skips paused machines (a cordon IS a routing
+        pause — see `coord.machine_pause`), so guessing a destination here
+        would be a second, weaker copy of that decision.
+        """
+        if not candidate.machine:
+            return ""
+        reason = cordon_map.get(_norm_host(candidate.machine))
+        if not reason:
+            return ""
+        return (
+            f"{candidate.machine} is {reason} — deferring rather than "
+            "dispatching into a host that is draining for a release (#2101)"
+        )
+
     launch: QueueEntry | None = None
     # #1873: keys that reconciled straight to `done` in the walk below —
     # landed under someone else's branch/PR, closed by hand as obsolete, or
@@ -1875,6 +2004,12 @@ def plan_tick(
             if not verdict.satisfied:
                 deferrals.append(
                     Deferral(entry.key, verdict.reason, counted=False)
+                )
+                continue
+            cordoned = _cordon_reason(entry)
+            if cordoned:
+                deferrals.append(
+                    Deferral(entry.key, cordoned, counted=False, cordoned=True)
                 )
                 continue
             repo_limit = _repo_limit_reason(entry)
@@ -1964,6 +2099,31 @@ def plan_tick(
                 )
             )
             continue
+        # #2101, checked with the same "facts about the ENTRY come first"
+        # rule #1972 states below: a landed entry still reconciles to `done`
+        # and a broken pre-req still blocks and escalates, whatever its
+        # pinned machine's cordon is doing this tick.  Only the LAUNCH is
+        # withheld.
+        cordoned = _cordon_reason(entry)
+        if cordoned:
+            deferrals.append(
+                Deferral(
+                    entry.key,
+                    cordoned,
+                    updates={
+                        "deferrals": entry.deferrals + 1,
+                        "last_reason": cordoned,
+                    },
+                    # Same posture as #1972's repo limit: this is the fleet
+                    # working as designed (a host draining so it can be
+                    # rolled), not a stalled queue, so it must not raise the
+                    # queue-level alert every tick for the duration of a
+                    # drain.  The cordon has its OWN alert when it is THIS
+                    # host that is stopped — see `_cordon_alert`.
+                    cordoned=True,
+                )
+            )
+            continue
         # #1972, checked LAST: everything above is a fact about the ENTRY (is
         # it still starting, has it already landed, are its pre-reqs sound),
         # and those verdicts must not change because some unrelated drive in
@@ -2003,8 +2163,11 @@ def plan_tick(
     # duration of the batch.  A MIXED tick still alerts: if even one entry is
     # deferred on a pre-req or blocked outright, something really is stuck and
     # the alert names all of it, repo-limit lines included.
-    repo_limited_keys = {item.key for item in deferrals if item.repo_limited}
-    stalled = [e for e in still_waiting if e.key not in repo_limited_keys]
+    # #2101 adds the release cordon to that same set: an entry pinned to a
+    # host that is draining for a release is waiting on the fleet working, not
+    # on something wedged. See `Deferral.benign`.
+    benign_keys = {item.key for item in deferrals if item.benign}
+    stalled = [e for e in still_waiting if e.key not in benign_keys]
     if launch is None and stalled:
         details = [f"{item.key}: {item.reason}" for item in deferrals]
         details += [f"{item.key}: BLOCKED — {item.reason}" for item in blocked]
@@ -2091,6 +2254,14 @@ def render_plan(plan: TickPlan, *, dry_run: bool = False) -> list[str]:
             f"  no launch — HELD by the deploy gate on {plan.held.key} "
             f"(release with `coord drive-queue resume`)"
         )
+    elif plan.cordon_reason:
+        # #2101 trap E: naming the cordon here is the difference between a
+        # journal that reads "the fleet is upgrading itself" and one that
+        # reads "the queue mysteriously stopped".
+        lines.append(
+            f"  no launch — this host is {plan.cordon_reason}; in-flight "
+            "drives are draining and the queue resumes once it is rolled"
+        )
     elif plan.capacity and plan.free_slots == 0:
         # Naming the reason matters more here than anywhere else in this
         # render: #1794 was diagnosed entirely from a journal, and "no launch"
@@ -2098,16 +2269,22 @@ def render_plan(plan: TickPlan, *, dry_run: bool = False) -> list[str]:
         lines.append(
             f"  no launch — at capacity ({plan.occupied}/{plan.capacity} occupied)"
         )
-    elif plan.deferrals and all(item.repo_limited for item in plan.deferrals):
+    elif plan.deferrals and all(item.benign for item in plan.deferrals):
         # Same reasoning as the at-capacity line above: with free GLOBAL slots
         # and no launch, a bare "no launch" reads as a stalled queue in a
-        # journal.  This one is saturated per repo, not stalled — and unlike
-        # the global case it raises no alert, so this line is the only place it
-        # is ever said.
-        lines.append(
-            f"  no launch — every waiting entry's repo is at its per-repo "
-            f"limit ({plan.repo_capacity}/repo)"
-        )
+        # journal.  This one is saturated per repo (or draining for a release
+        # — #2101), not stalled, and unlike the global case it raises no
+        # alert, so this line is the only place it is ever said.
+        if any(item.cordoned for item in plan.deferrals):
+            lines.append(
+                "  no launch — every waiting entry is pinned to a machine "
+                "under a release cordon (draining to be rolled)"
+            )
+        else:
+            lines.append(
+                f"  no launch — every waiting entry's repo is at its per-repo "
+                f"limit ({plan.repo_capacity}/repo)"
+            )
     else:
         lines.append("  no launch")
     for item in plan.deferrals:

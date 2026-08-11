@@ -548,6 +548,29 @@ def _local_host_id() -> str:
     return socket.gethostname().split(".")[0].lower()
 
 
+def _fetch_cordons() -> dict[str, str]:
+    """``{machine: "cordoned: draining for v0.5.31"}`` (#2101).
+
+    Daemon-aware (`coord.machine_pause.cordons()` routes to `GET /pause` on a
+    thin client) and fail-SOFT: an unreadable cordon store degrades to "no
+    cordons", the same posture `paused_set()` takes on every dispatch decision
+    in this codebase. That is the right trade here even though the board fetch
+    above fails CLOSED: a missed cordon costs one drive launched into a host
+    about to roll (which `coord agent update` then refuses, leaving the entry
+    to retry), whereas failing the whole tick closed on a cordon read would
+    stop the queue on a network blip — the outage this issue exists to end,
+    reintroduced by its own fix.
+    """
+    from coord.machine_pause import cordons as fetch_cordons  # noqa: PLC0415
+
+    try:
+        return {name: record.describe() for name, record in fetch_cordons().items()}
+    except Exception as exc:  # noqa: BLE001 — see docstring
+        click.echo(f"warning: could not read release cordons ({exc}) — "
+                   "treating the fleet as uncordoned", err=True)
+        return {}
+
+
 def _fetch_board_view() -> BoardView:
     """Board + live drive sessions, typed.
 
@@ -1025,6 +1048,13 @@ def drive_queue_tick(
         # tick when no entry is parked that way — which is the common case.
         gate_a_pending = _fetch_gate_a_pending(entries)
 
+        # #2101: release cordons. THIS is the hole the issue names — the
+        # queue's launcher had zero pause awareness (`coord/drive.py` checks
+        # pause only when routing a *worker*), so a cordoned host kept getting
+        # drive sessions launched on it and the fleet could never drain into
+        # a rollable state.
+        cordons = _fetch_cordons()
+
         # #1794: the clock is the shell's to read, never `coord.drive_queue`'s.
         # It powers the startup grace window on both sides of the tick — a
         # drive launched seconds ago is `starting`, not dead, and cannot be
@@ -1048,6 +1078,7 @@ def drive_queue_tick(
             exit_refused=exit_refused,
             exit_dead_end=exit_dead_end,
             gate_a_pending=gate_a_pending,
+            cordons=cordons,
         )
 
         if reconcile_only:
