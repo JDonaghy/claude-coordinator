@@ -283,10 +283,10 @@ def _make_wheel(
     *,
     extra: str | None = "server",
     webapp: bool = True,
-    name: str = "claude_coordinator",
+    name: str = "code_coordinator",
 ) -> Path:
     path = dist / f"{name}-{version}-py3-none-any.whl"
-    metadata = f"Metadata-Version: 2.1\nName: claude-coordinator\nVersion: {version}\n"
+    metadata = f"Metadata-Version: 2.1\nName: code-coordinator\nVersion: {version}\n"
     if extra:
         metadata += f"Provides-Extra: {extra}\n"
     with zipfile.ZipFile(path, "w") as zf:
@@ -297,7 +297,7 @@ def _make_wheel(
     return path
 
 
-def _make_sdist(dist: Path, version: str, name: str = "claude_coordinator") -> Path:
+def _make_sdist(dist: Path, version: str, name: str = "code_coordinator") -> Path:
     path = dist / f"{name}-{version}.tar.gz"
     path.write_bytes(b"")
     return path

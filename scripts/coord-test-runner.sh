@@ -19,7 +19,7 @@
 #
 # Four things it handles that a bare `pytest && cargo test` does not:
 #
-#  1. PATH ROUTING — claude-coordinator ONLY.  That repo is two codebases with
+#  1. PATH ROUTING — code-coordinator ONLY.  That repo is two codebases with
 #     two toolchains, and a single `test_command` in coordinator.yml cannot
 #     express that.  Changes under coord/** or tests/** run pytest; changes
 #     under tui/** run `cargo test`.  A docs-only diff runs neither and
@@ -27,13 +27,16 @@
 #     suite against a pure-Python diff adds flake risk for zero signal
 #     (observed: #1349's branch, a Python-only change, tripped a tui flake).
 #
-#     `--repo NAME` selects this behaviour; it defaults to "claude-coordinator"
-#     for back-compat with callers that omit it.  EVERY OTHER REPO has no
+#     `--repo NAME` selects this behaviour, and accepts either spelling of
+#     this repo's name — `code-coordinator` (since #2104) or the pre-rename
+#     `claude-coordinator`, because the fleet config that supplies it lives
+#     in a separate checkout and is updated out-of-band.  It defaults to
+#     "code-coordinator" for callers that omit it.  EVERY OTHER REPO has no
 #     hardcoded routing (#1408) — pass `--fallback-command CMD` (the repo's
 #     configured `test_command`, e.g. quadraui's `cargo test --features tui`)
 #     and the runner treats it as one suite: skip only on a genuinely
 #     doc/config-only diff, run it otherwise.  `--repo` given with NO
-#     `--fallback-command`, for any repo other than claude-coordinator, is a
+#     `--fallback-command`, for any repo other than this one, is a
 #     repo the runner has no rule for at all — it REFUSES (exit 1) rather than
 #     silently reporting SKIP.  A silent green Test gate on unrun tests is
 #     exactly the failure mode #1408 exists to close.
@@ -42,7 +45,7 @@
 #     `../../quadraui/quadraui`, which is resolved RELATIVE TO THE WORKTREE —
 #     so in a scratch worktree it dangles and the build fails outright.  A
 #     sibling symlink to the real checkout is required.  Verified: without it
-#     the path does not exist; with it, the build succeeds.  (claude-coordinator
+#     the path does not exist; with it, the build succeeds.  (code-coordinator
 #     routing only; a repo run via `--fallback-command` builds itself.)
 #
 #  3. FLAKE FILTERING.  The tui suite has known races under full-parallel
@@ -79,7 +82,7 @@ set -euo pipefail
 
 BASE_REF="origin/main"
 REPORT=""
-REPO_NAME="claude-coordinator"
+REPO_NAME="code-coordinator"
 FALLBACK_CMD=""
 PRINT_ROUTING=0
 QUADRAUI_SRC="${QUADRAUI_SRC:-$HOME/src/quadraui}"
@@ -141,20 +144,29 @@ changed_list() { printf '%s' "$CHANGED" | tr '\n' ' ' | sed 's/ *$//'; }
 
 # ── routing: decide what to run ─────────────────────────────────────────────
 #
-# claude-coordinator is two codebases in one repo (python under coord/**,
-# tests/**; rust under tui/**) with no single test_command that covers both,
-# so it gets its own hardcoded path routing (below). EVERY OTHER REPO has
-# exactly one configured test_command (coordinator.yml's `test_command`,
-# passed in here as --fallback-command) — the only question there is whether
-# THIS diff is doc/config-only (skip) or not (run the one command). A repo
-# that is neither claude-coordinator nor carrying a --fallback-command is one
-# this script has no rule for at all: REFUSE rather than silently SKIP (#1408
-# — a silent SKIP there means the merge gate is satisfied by tests that were
-# never run).
+# This repo is two codebases in one (python under coord/**, tests/**; rust
+# under tui/**) with no single test_command that covers both, so it gets its
+# own hardcoded path routing (below). EVERY OTHER REPO has exactly one
+# configured test_command (coordinator.yml's `test_command`, passed in here
+# as --fallback-command) — the only question there is whether THIS diff is
+# doc/config-only (skip) or not (run the one command). A repo that is
+# neither this one nor carrying a --fallback-command is one this script has
+# no rule for at all: REFUSE rather than silently SKIP (#1408 — a silent
+# SKIP there means the merge gate is satisfied by tests that were never
+# run).
+#
+# #2104: BOTH spellings of this repo's name route here. The rename
+# (`claude-coordinator` -> `code-coordinator`) lands in this repo, but the
+# `--repo NAME` that reaches this script comes from the FLEET's
+# coordinator.yml, which lives in a separate checkout and is updated
+# out-of-band. Accepting one name only would mean whichever of the two
+# changed second silently fell through to the REFUSE branch — a red Test
+# gate on every merge, for a config edit nobody had made yet. Accepting both
+# makes the two edits order-independent.
 RUN_PY=0; RUN_RS=0; RUN_FALLBACK=0
 ROUTE_MODE="unknown"
 
-if [[ "$REPO_NAME" == "claude-coordinator" ]]; then
+if [[ "$REPO_NAME" == "code-coordinator" || "$REPO_NAME" == "claude-coordinator" ]]; then
     ROUTE_MODE="coordinator"
     if [[ "$DIFF_FAILED" -eq 1 ]]; then
         RUN_PY=1; RUN_RS=1
@@ -417,7 +429,7 @@ run_rust() {
 # One suite, no flake filtering — this script does not know the failure-report
 # format of an arbitrary command, so a fallback failure is always reported as
 # genuine rather than flake-retried. The repo builds and tests itself; unlike
-# claude-coordinator's tui/ there is no known cross-repo path dep to wire up
+# code-coordinator's tui/ there is no known cross-repo path dep to wire up
 # here (if one shows up for a given repo, that repo earns its own case here).
 run_fallback() {
     local out="$WT/.fallback.out"

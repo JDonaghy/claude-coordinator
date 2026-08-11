@@ -225,7 +225,7 @@ def _newest_rust_source_mtime(source_dir):
     title="cli venv",
     order=42,
     description=(
-        "This machine's ~/.coord-cli-venv claude-coordinator version, when "
+        "This machine's ~/.coord-cli-venv coordinator version, when "
         "it has one — the operator's CLI venv lane of fleet_deploy_lanes (#1806)."
     ),
 )

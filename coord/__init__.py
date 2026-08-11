@@ -1,4 +1,4 @@
-"""claude-coordinator: multi-agent coordinator for Claude Code workers."""
+"""code-coordinator: multi-agent coordinator for Claude Code workers."""
 
 from __future__ import annotations
 

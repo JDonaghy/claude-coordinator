@@ -183,7 +183,7 @@ def _cli_venv_lanes(ctx: HealthContext) -> dict[str, str | None]:
     description=(
         "Every ~/.coord-venv (per agent), the daemon's own coord-serve "
         "install, ~/.coord-cli-venv, and the coord each running service "
-        "would actually spawn all report the same claude-coordinator version."
+        "would actually spawn all report the same coordinator version."
     ),
 )
 def probe_deploy_lanes(ctx: HealthContext) -> CheckResult:

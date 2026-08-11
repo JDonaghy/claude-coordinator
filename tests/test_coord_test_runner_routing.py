@@ -2,13 +2,13 @@
 
 Before this fix, the runner's path routing (coord/** -> pytest, tui/** ->
 cargo test) was the ONLY routing rule, and it was hardcoded for
-claude-coordinator's own layout. Driving any OTHER repo (quadraui, vimcode,
+this repo's own layout. Driving any OTHER repo (quadraui, vimcode,
 ...) meant no path ever matched, so the runner silently reported
 `SKIP: no test-bearing paths changed` even though real source files had
 changed -- a green Test gate on code that was never run through it, which is
 exactly the class of silent wrongness #1406 exists to eliminate.
 
-The fix: claude-coordinator keeps its hardcoded path routing; every other
+The fix: this repo keeps its hardcoded path routing; every other
 repo either gets a `--fallback-command` (its configured `test_command`) run
 as one suite, or -- if neither a path rule nor a fallback command applies --
 the runner REFUSES (non-zero exit) instead of reporting SKIP.
@@ -75,26 +75,38 @@ def _run(repo: Path, *extra_args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-# ── claude-coordinator: hardcoded path routing ──────────────────────────────
+# ── this repo: hardcoded path routing ───────────────────────────────────────
+#
+# #2104 renamed the distribution AND the repo `claude-coordinator` ->
+# `code-coordinator`, but the `--repo NAME` the runner receives comes from
+# the FLEET's coordinator.yml, which lives in a separate checkout updated
+# out-of-band. Both spellings must therefore route here: accepting only one
+# would mean whichever edit landed second left every Test gate REFUSE-ing.
+COORDINATOR_REPO_NAMES = ["code-coordinator", "claude-coordinator"]
 
 
-def test_coordinator_python_diff_routes_pytest_only(repo: Path) -> None:
+@pytest.mark.parametrize("repo_name", COORDINATOR_REPO_NAMES)
+def test_coordinator_python_diff_routes_pytest_only(repo: Path, repo_name: str) -> None:
     _commit(repo, {"coord/foo.py": "x\n"}, "py change")
-    result = _run(repo, "--repo", "claude-coordinator", "--print-routing")
+    result = _run(repo, "--repo", repo_name, "--print-routing")
     assert result.returncode == 0
     assert result.stdout.strip().splitlines()[-1] == "ROUTING mode=coordinator pytest=1 cargo=0"
 
 
-def test_coordinator_rust_diff_routes_cargo_only(repo: Path) -> None:
+@pytest.mark.parametrize("repo_name", COORDINATOR_REPO_NAMES)
+def test_coordinator_rust_diff_routes_cargo_only(repo: Path, repo_name: str) -> None:
     _commit(repo, {"tui/foo.rs": "x\n"}, "rs change")
-    result = _run(repo, "--repo", "claude-coordinator", "--print-routing")
+    result = _run(repo, "--repo", repo_name, "--print-routing")
     assert result.returncode == 0
     assert result.stdout.strip().splitlines()[-1] == "ROUTING mode=coordinator pytest=0 cargo=1"
 
 
-def test_coordinator_docs_only_diff_skips_with_named_paths(repo: Path) -> None:
+@pytest.mark.parametrize("repo_name", COORDINATOR_REPO_NAMES)
+def test_coordinator_docs_only_diff_skips_with_named_paths(
+    repo: Path, repo_name: str
+) -> None:
     _commit(repo, {"docs/notes.md": "x\n"}, "docs change")
-    result = _run(repo, "--repo", "claude-coordinator")
+    result = _run(repo, "--repo", repo_name)
     assert result.returncode == 0
     assert "SKIP:" in result.stdout
     assert "docs/notes.md" in result.stdout

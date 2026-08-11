@@ -27,7 +27,7 @@
 #   systemctl --user enable --now coord-web-dist-build.timer
 #
 # Prereqs on the dashboard host (== the DB host):
-#   - ~/.coord-venv has claude-coordinator installed via PyPI (`coord`
+#   - ~/.coord-venv has code-coordinator installed via PyPI (`coord`
 #     itself — the daemon/CLI binary; unrelated to the webapp bundle below).
 #   - ~/.coord/coordinator.yml exists (canonical location; same resolution as
 #     the daemon: $COORD_CONFIG → ~/.coord/coordinator.yml → ./coordinator.yml).

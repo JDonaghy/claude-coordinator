@@ -67,10 +67,10 @@ def pip_show(
     """Parse ``<python> -m pip show <name>`` into a field dict, trying each
     of *names* in order and returning the first that resolves (#2103).
 
-    The agent venv this probes may have either ``claude-coordinator`` or
-    ``code-coordinator`` installed depending which side of the #2096 rename
-    it's on — a bare single-name ``pip show`` would report "not installed"
-    for a fully-updated `code-coordinator` agent. The returned dict's
+    The agent venv this probes may have either ``code-coordinator`` (the
+    name since #2104) or the pre-rename ``claude-coordinator`` installed,
+    depending which side of the #2096 rename it's on — a bare single-name
+    ``pip show`` would report "not installed" for one of them. The dict's
     ``Name`` field (``pip show`` always prints one) tells the caller which
     one actually matched.
 
@@ -107,7 +107,7 @@ def _parse_pip_show(stdout: str) -> dict[str, str]:
     scope="machine",
     title="agent venv",
     order=40,
-    description="The agent's claude-coordinator install is a PyPI install, not editable.",
+    description="The agent's coordinator install is a PyPI install, not editable.",
 )
 def probe_agent_venv(ctx: HealthContext) -> CheckResult:
     python = resolve_agent_python(ctx)
@@ -180,7 +180,7 @@ def probe_agent_venv(ctx: HealthContext) -> CheckResult:
     title="agent version",
     order=41,
     cost=COST_NETWORK,
-    description="Installed claude-coordinator vs the latest release on PyPI's simple index.",
+    description="Installed coordinator version vs the latest release on PyPI's simple index.",
 )
 def probe_agent_version(ctx: HealthContext) -> CheckResult:
     from coord.health.pypi import latest_release, parse_version  # noqa: PLC0415

@@ -20,7 +20,7 @@ from coord.health.pypi import (
     split_distribution_filename,
 )
 
-PROJECT = "claude-coordinator"
+PROJECT = "code-coordinator"
 
 
 def _page(*anchors: str) -> str:
@@ -28,13 +28,13 @@ def _page(*anchors: str) -> str:
     return f'<!DOCTYPE html><html><head><title>Links</title></head><body>{body}</body></html>'
 
 
-def _wheel(version: str, *, yanked: bool = False, name: str = "claude_coordinator") -> str:
+def _wheel(version: str, *, yanked: bool = False, name: str = "code_coordinator") -> str:
     filename = f"{name}-{version}-py3-none-any.whl"
     attrs = ' data-yanked=""' if yanked else ""
     return f'<a href="https://files.pythonhosted.org/x/{filename}#sha256=ab"{attrs}>{filename}</a><br/>'
 
 
-def _sdist(version: str, name: str = "claude_coordinator") -> str:
+def _sdist(version: str, name: str = "code_coordinator") -> str:
     filename = f"{name}-{version}.tar.gz"
     return f'<a href="https://files.pythonhosted.org/x/{filename}#sha256=cd">{filename}</a><br/>'
 
@@ -45,10 +45,13 @@ def _sdist(version: str, name: str = "claude_coordinator") -> str:
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
+        ("code_coordinator", "code-coordinator"),
+        ("Code.Coordinator", "code-coordinator"),
+        ("code--coordinator", "code-coordinator"),
+        ("code-coordinator", "code-coordinator"),
+        # The pre-#2104 name still normalises — a mid-rename fleet has
+        # agents reporting it, and #2103's fallback resolves against it.
         ("claude_coordinator", "claude-coordinator"),
-        ("Claude.Coordinator", "claude-coordinator"),
-        ("claude--coordinator", "claude-coordinator"),
-        ("claude-coordinator", "claude-coordinator"),
     ],
 )
 def test_normalize_name(raw, expected) -> None:
@@ -61,14 +64,14 @@ def test_normalize_name(raw, expected) -> None:
 @pytest.mark.parametrize(
     ("filename", "expected"),
     [
-        ("claude_coordinator-0.4.91-py3-none-any.whl", ("claude_coordinator", "0.4.91")),
+        ("code_coordinator-0.4.91-py3-none-any.whl", ("code_coordinator", "0.4.91")),
         # With a build tag (6 components).
         ("foo-1.2.3-1-py3-none-any.whl", ("foo", "1.2.3")),
         # A non-pure wheel — the tag isn't "py*", which a naive regex misses.
         ("foo-1.2.3-cp312-cp312-linux_x86_64.whl", ("foo", "1.2.3")),
-        ("claude_coordinator-0.4.91.tar.gz", ("claude_coordinator", "0.4.91")),
+        ("code_coordinator-0.4.91.tar.gz", ("code_coordinator", "0.4.91")),
         # sdists may keep hyphens in the name, so they split from the right.
-        ("claude-coordinator-0.4.91.tar.gz", ("claude-coordinator", "0.4.91")),
+        ("code-coordinator-0.4.91.tar.gz", ("code-coordinator", "0.4.91")),
         ("foo-1.0.zip", ("foo", "1.0")),
     ],
 )
@@ -137,8 +140,8 @@ def test_parse_simple_index_ignores_other_projects() -> None:
 
 
 def test_parse_simple_index_matches_normalized_names() -> None:
-    """The index serves ``claude_coordinator-*`` files for ``claude-coordinator``."""
-    html = _page(_wheel("0.4.91", name="Claude.Coordinator"))
+    """The index serves ``code_coordinator-*`` files for ``code-coordinator``."""
+    html = _page(_wheel("0.4.91", name="Code.Coordinator"))
     assert [v.raw for v in parse_simple_index(html, PROJECT)] == ["0.4.91"]
 
 
@@ -189,7 +192,7 @@ def test_fetch_uses_the_simple_index_url_not_the_json_api(monkeypatch) -> None:
     from coord.health.pypi import fetch_simple_index
 
     fetch_simple_index(PROJECT, index_url="https://pypi.org/simple", timeout=1.5)
-    assert seen["url"] == "https://pypi.org/simple/claude-coordinator/"
+    assert seen["url"] == "https://pypi.org/simple/code-coordinator/"
     assert "/pypi/" not in str(seen["url"]), "that would be the JSON API"
     assert "json" not in str(seen["url"])
     assert seen["timeout"] == 1.5

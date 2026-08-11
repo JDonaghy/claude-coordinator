@@ -166,7 +166,7 @@ class TestPerformUpdateHappyPath:
         (venv_dir / "marker").write_text("gen0\n")
 
         with patch("coord.agent_update.subprocess.run", side_effect=_run_stub(version="1.2.3")):
-            result = perform_update(venv_dir, "claude-coordinator[server]", target_version="1.2.3")
+            result = perform_update(venv_dir, "code-coordinator[server]", target_version="1.2.3")
 
         assert result.ok is True
         assert result.swapped is True
@@ -203,11 +203,11 @@ class TestPerformUpdateHappyPath:
             "coord.agent_update.subprocess.run",
             side_effect=_run_stub(version="3.4.5", calls=calls),
         ):
-            perform_update(venv_dir, "claude-coordinator[server]", target_version="3.4.5")
+            perform_update(venv_dir, "code-coordinator[server]", target_version="3.4.5")
 
         pip_calls = [c for c in calls if c[0].endswith("/bin/pip")]
         assert len(pip_calls) == 1
-        assert "claude-coordinator[server]==3.4.5" in pip_calls[0]
+        assert "code-coordinator[server]==3.4.5" in pip_calls[0]
 
     def test_no_pin_when_target_version_omitted(self, tmp_path: Path) -> None:
         venv_dir = tmp_path / ".coord-venv"
@@ -218,10 +218,10 @@ class TestPerformUpdateHappyPath:
             "coord.agent_update.subprocess.run",
             side_effect=_run_stub(version="3.4.5", calls=calls),
         ):
-            perform_update(venv_dir, "claude-coordinator[server]")
+            perform_update(venv_dir, "code-coordinator[server]")
 
         pip_calls = [c for c in calls if c[0].endswith("/bin/pip")]
-        assert "claude-coordinator[server]" in pip_calls[0]
+        assert "code-coordinator[server]" in pip_calls[0]
         assert not any("==" in arg for arg in pip_calls[0])
 
 
