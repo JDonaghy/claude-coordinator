@@ -1034,6 +1034,121 @@ class TestPipelineActionAPI:
         assert r.json()["ok"] is True
         mock_save.assert_called_once()
 
+    # ── #2085: the dashboard enqueue path is the FIFTH raw-Assignment gate
+    # call site. The first #2085 round fixed four (`build_gate_report`,
+    # `enqueue_approved_work`, `coord.notify`'s stalled-dispatch recovery,
+    # `coord.diagnose`'s stage-work recovery) and missed this one. ────────
+
+    @staticmethod
+    def _approved_at(sha: str) -> tuple[Assignment, Assignment]:
+        """A done work row on `feat/x` plus an approving review that captured
+        *sha* as the head it reviewed — the shape `coord.review` records on
+        essentially every real review completion."""
+        work = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=1, issue_title="t",
+            assignment_id="a1", status="done", type="work",
+            branch="feat/x",
+        )
+        review = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=1, issue_title="[review] t",
+            assignment_id="rev-1", status="done", type="review",
+            review_of_assignment_id="a1", review_verdict="approve",
+        )
+        review.review_head_sha = sha
+        return work, review
+
+    def test_enqueue_action_confirms_a_fresh_approval_via_live_sha(self) -> None:
+        """#2085: pressing "Enqueue" in the Phone Control Center on fresh,
+        approved work must succeed — it must not demand `force: true`.
+
+        FAILS against the pre-fix code. Both `mq.passes_merge_gates(...)` and
+        `mq.enqueue(..., config=...)` were handed the raw work `Assignment`
+        with no `gh_ops`. An `Assignment` has no `branch_head_sha` attribute,
+        so `has_approved_review`'s #821 check read `current_sha is None` —
+        which #2085 made fail CLOSED — and refused every review carrying a
+        real `review_head_sha`, i.e. virtually every modern approval. The
+        result was a gate that could never pass on this path. The fix routes
+        both calls through `mq.live_gate_entry` with a live `gh_ops`, so the
+        review's captured SHA is compared against the branch's actual head.
+        """
+        work, review = self._approved_at("sha-current")
+        board = Board(completed=[work, review])
+        client = _dashboard_client(_config(default_gates=["review", "merge"]))
+        with (
+            patch("coord.dashboard.server.read_board", return_value=board),
+            patch("coord.merge_queue.load_queue", return_value=[]),
+            patch("coord.merge_queue.save_queue") as mock_save,
+            # The branch's LIVE head — identical to the SHA the review
+            # captured, i.e. nothing landed after the approval.
+            patch(
+                "coord.github_ops.get_branch_sha",
+                side_effect=lambda repo, branch: (
+                    "sha-current" if branch == "feat/x" else None
+                ),
+            ),
+        ):
+            r = client.post(
+                "/api/pipeline/action",
+                json={"assignment_id": "a1", "action": "enqueue"},
+            )
+        assert r.status_code == 200
+        assert r.json() == {"ok": True}, (
+            "a fresh approval whose review_head_sha matches the branch's live "
+            "head must enqueue from the dashboard without force: true"
+        )
+        mock_save.assert_called_once()
+
+    def test_enqueue_action_refuses_a_superseded_approval(self) -> None:
+        """#2085: the same path must still REFUSE the #1966 chain — an
+        approval captured at SHA A when the branch has since moved to SHA B.
+
+        The companion to the test above: threading live `gh_ops` through must
+        make the gate *confirmable*, not permissive. This is the case that
+        proves the gate can still fail.
+        """
+        work, review = self._approved_at("sha-old")
+        board = Board(completed=[work, review])
+        client = _dashboard_client(_config(default_gates=["review", "merge"]))
+        with (
+            patch("coord.dashboard.server.read_board", return_value=board),
+            patch("coord.merge_queue.load_queue", return_value=[]),
+            patch("coord.merge_queue.save_queue") as mock_save,
+            # Commits landed after the approval — live head has moved on.
+            patch("coord.github_ops.get_branch_sha", return_value="sha-new"),
+            patch("coord.github_ops.get_branch_patch_id", return_value=None),
+        ):
+            r = client.post(
+                "/api/pipeline/action",
+                json={"assignment_id": "a1", "action": "enqueue"},
+            )
+        assert r.status_code == 200
+        assert r.json()["ok"] is False
+        assert "review/smoke" in r.json()["error"]
+        mock_save.assert_not_called()
+
+    def test_enqueue_action_force_still_bypasses_the_gate(self) -> None:
+        """#2085: `force: true` must keep skipping the gate entirely — the
+        live-SHA rework must not start making gh calls on the override path
+        or, worse, let `enqueue`'s own internal gate re-refuse it."""
+        work, review = self._approved_at("sha-old")
+        board = Board(completed=[work, review])
+        client = _dashboard_client(_config(default_gates=["review", "merge"]))
+        with (
+            patch("coord.dashboard.server.read_board", return_value=board),
+            patch("coord.merge_queue.load_queue", return_value=[]),
+            patch("coord.merge_queue.save_queue") as mock_save,
+            patch("coord.github_ops.get_branch_sha", return_value="sha-new"),
+        ):
+            r = client.post(
+                "/api/pipeline/action",
+                json={"assignment_id": "a1", "action": "enqueue", "force": True},
+            )
+        assert r.status_code == 200
+        assert r.json() == {"ok": True}
+        mock_save.assert_called_once()
+
     def test_enqueue_action_rejects_when_gate_not_satisfied(self) -> None:
         """#946: without an approved review (or force), enqueue must be
         refused — this is the dashboard's third, previously-ungated path."""
