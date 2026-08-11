@@ -7956,9 +7956,16 @@ impl CoordApp {
                 // machine flipping from hand-paused to quiet-paused (or
                 // vice versa) with the same net `paused` membership still
                 // triggers a redraw of the sidebar badge.
-                if fresh.paused != self.paused_machines || fresh.quiet != self.quiet_paused_machines {
+                // #2101: `cordoned` rides in the same fetch for the same
+                // reason — a machine flipping from hand-paused to cordoned
+                // with unchanged `paused` membership must still redraw.
+                if fresh.paused != self.paused_machines
+                    || fresh.quiet != self.quiet_paused_machines
+                    || fresh.cordoned != self.cordoned_machines
+                {
                     self.paused_machines = fresh.paused;
                     self.quiet_paused_machines = fresh.quiet;
+                    self.cordoned_machines = fresh.cordoned;
                     return true;
                 }
                 false

@@ -40696,6 +40696,7 @@ Milestone tracking issue.
                 .into_iter()
                 .collect(),
             quiet: std::collections::HashSet::new(),
+            cordoned: std::collections::HashSet::new(),
         })
         .unwrap();
         app.pending_paused_machines = Some(rx);
@@ -40723,6 +40724,7 @@ Milestone tracking issue.
         tx.send(data::PausedFetch {
             paused: ["dellserver".to_string()].into_iter().collect(),
             quiet: std::collections::HashSet::new(),
+            cordoned: std::collections::HashSet::new(),
         })
         .unwrap();
         app.pending_paused_machines = Some(rx);
@@ -40881,6 +40883,76 @@ Milestone tracking issue.
         assert!(!row_text("elitebook").contains("[PAUSED]"));
         assert!(!row_text("precision").contains("[PAUSED]"));
         assert!(!row_text("precision").contains("[QUIET]"));
+    }
+
+    /// #2101 trap E: "work stopping with no stated reason is the thing this
+    /// fleet keeps doing to itself". A machine draining so the fleet can roll
+    /// onto a released version IS in `paused` (that is how routing honours a
+    /// cordon), so without its own badge it reads as `[PAUSED]` — telling the
+    /// operator a human stopped it and that `coord unpause` is the fix. Both
+    /// are wrong: nobody paused it, `coord unpause` does not clear it, and it
+    /// lifts itself the moment the roll lands.
+    #[test]
+    fn machines_list_badges_a_release_cordon_differently_from_a_pause() {
+        fn machine(name: &str) -> Machine {
+            Machine {
+                name: name.to_string(),
+                host: String::new(),
+                reachable: true,
+                active_count: 0,
+                repos: vec![],
+                version: None,
+                worktree_bytes: 0,
+            }
+        }
+        let data = BoardData {
+            machines: vec![machine("dellserver"), machine("elitebook")],
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+        // Both are in `paused` — the cordon is a routing pause. Only
+        // dellserver's is a release cordon.
+        app.paused_machines = ["dellserver".to_string(), "elitebook".to_string()]
+            .into_iter()
+            .collect();
+        app.cordoned_machines = ["dellserver".to_string()].into_iter().collect();
+
+        let list = app.machines_list(true);
+        let row_text = |name: &str| -> String {
+            list.items
+                .iter()
+                .zip(app.data.machines.iter())
+                .find(|(_, m)| m.name == name)
+                .map(|(item, _)| {
+                    item.text.spans.iter().map(|s| s.text.as_str()).collect::<String>()
+                })
+                .unwrap_or_default()
+        };
+
+        assert!(row_text("dellserver").contains("[DRAINING]"), "{}", row_text("dellserver"));
+        assert!(!row_text("dellserver").contains("[PAUSED]"));
+        assert!(row_text("elitebook").contains("[PAUSED]"), "{}", row_text("elitebook"));
+        assert!(!row_text("elitebook").contains("[DRAINING]"));
+    }
+
+    /// A cordon arriving with unchanged `paused` membership must still
+    /// redraw — otherwise a machine flips from hand-paused to cordoned and
+    /// the sidebar goes on claiming an operator did it.
+    #[test]
+    fn poll_paused_machines_reports_an_update_when_only_the_cordon_set_changed() {
+        let mut app = make_app_default();
+        app.paused_machines = ["dellserver".to_string()].into_iter().collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(data::PausedFetch {
+            paused: ["dellserver".to_string()].into_iter().collect(),
+            quiet: std::collections::HashSet::new(),
+            cordoned: ["dellserver".to_string()].into_iter().collect(),
+        })
+        .unwrap();
+        app.pending_paused_machines = Some(rx);
+
+        assert!(app.poll_paused_machines(), "a new cordon must trigger a redraw");
+        assert!(app.cordoned_machines.contains("dellserver"));
     }
 
     // ── #1553: oracle-loop slice work is attributed to the CHILD issue ──────

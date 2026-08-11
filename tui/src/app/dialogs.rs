@@ -6202,6 +6202,13 @@ impl CoordApp {
                         // edits.  Without this the badge would lag by ~1 s.
                         if action_id == "machine-pause" {
                             self.paused_machines.insert(name.clone());
+                        } else if self.cordoned_machines.contains(&name) {
+                            // #2101 trap A, at the optimism layer: `coord
+                            // unpause` does NOT lift a release cordon, so
+                            // predicting that it did would show the operator
+                            // a machine taking work again for one refresh
+                            // cycle when nothing changed. Leave both sets
+                            // alone; the next `GET /pause` confirms it.
                         } else {
                             self.paused_machines.remove(&name);
                             // #1862: `coord unpause` on a quiet-paused machine
