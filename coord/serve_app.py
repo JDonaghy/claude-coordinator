@@ -4676,6 +4676,10 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                 proposal=proposal,
                 repo_github=body["repo_github"],
                 provider_name=body.get("provider_name"),
+                # #2087 review, non-blocking finding 1: validate against the
+                # daemon's own already-loaded config, not an independent
+                # reload — see state._validate_dispatch_target's docstring.
+                config=config,
             )
         # #2087: ValueError covers state.UnknownDispatchTargetError — an
         # unconfigured repo/machine is a client-input error (400), not a
@@ -4842,7 +4846,12 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         try:
             assignment = Assignment(**_kwargs(Assignment, body.get("assignment") or {}))
             state._record_dispatched_assignment_local(
-                assignment=assignment, repo_github=body["repo_github"]
+                assignment=assignment,
+                repo_github=body["repo_github"],
+                # #2087 review, non-blocking finding 1: validate against the
+                # daemon's own already-loaded config, not an independent
+                # reload — see state._validate_dispatch_target's docstring.
+                config=config,
             )
         # #2087: ValueError covers state.UnknownDispatchTargetError — an
         # unconfigured repo/machine is a client-input error (400), not a
@@ -5143,8 +5152,18 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                 completed=assignments,
                 round_number=int(body.get("round_number") or 0),
             )
-            state.save_board(board)
-        except (TypeError, KeyError) as e:
+            # #2087 review, blocking finding: save_board() now validates
+            # repo_name/machine_name for genuinely-new rows too (see its
+            # docstring) — this generic whole-board endpoint is exactly the
+            # "buggy thin-client /board POST" gap the review called out.
+            # Pass the daemon's own already-loaded config rather than an
+            # independent reload (non-blocking finding 1).
+            state.save_board(board, config=config)
+        # #2087: ValueError covers state.UnknownDispatchTargetError — an
+        # unconfigured repo/machine named by a new row is a client-input
+        # error (400), not a server-side write failure (503). Mirrors
+        # post_dispatched_work/post_dispatched above.
+        except (TypeError, KeyError, ValueError) as e:
             return JSONResponse({"error": f"bad board payload: {e}"}, status_code=400)
         except Exception as e:  # noqa: BLE001
             return JSONResponse(

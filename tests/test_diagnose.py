@@ -344,6 +344,92 @@ def test_diagnose_stage_smoke_choice_accepted_by_cli(monkeypatch) -> None:
     assert "Invalid value for '--stage'" not in result.output
 
 
+def test_diagnose_stage_smoke_reset_clears_incident_row_via_real_cli(
+    monkeypatch, tmp_path, coord_db,
+) -> None:
+    """#2087 acceptance #3, black-box per CLAUDE.md's bar for an operator-
+    facing command that gains the ability to clear a phantom row.
+
+    Unlike `test_diagnose_stage_smoke_choice_accepted_by_cli` above — which
+    monkeypatches `diagnose_stage`/`_load_config`/`build_board` all the way
+    down to stubs, so it only proves Click's `--stage` Choice list accepts
+    "smoke" — this test drives the REAL `coord diagnose` CLI entry point
+    (`coord.cli.main`) with a REAL `coordinator.yml` on disk, the REAL
+    `build_board()`/`diagnose_stage()`/`_do_reset()` orchestration, and the
+    REAL DB write path (`issue_store.post_completion`, via the `coord_db`
+    fixture's in-memory SQLite) — then asserts the incident's `smoke-repro`
+    row actually leaves `running` IN THE DATABASE, not just that some
+    in-memory `DiagnoseResult` claims so.
+
+    The only stand-in: `dispatched_at` is left at its default `None`. Per
+    `_review_findings_from_transcript`'s own docstring ("only a caller that
+    can't bound the session (or a test) passes None"), that's the documented
+    way to make the transcript-recovery scan a no-op instead of it walking
+    this dev machine's real `~/.claude/projects` directory — every other
+    branch (push/commit-count/worktree-removal) is already a no-op on its
+    own because the row's machine is unconfigured (no repo_path to derive a
+    worktree from), matching the real incident exactly.
+    """
+    from click.testing import CliRunner
+
+    from coord.cli import main
+    from coord.models import Assignment
+    from coord.state import _record_dispatched_assignment_local
+
+    # #2087: daemon_reroute_target() consults resolve_board_service(), which
+    # would pick up a REAL ~/.coord/service.json on a machine that has one
+    # configured (this repo dogfoods coordinator on itself) — force local
+    # execution regardless of what's configured on the box running this test,
+    # same as test_diagnose_stage_smoke_choice_accepted_by_cli above.
+    monkeypatch.setattr("coord.board_service.daemon_reroute_target", lambda _: None)
+
+    cfg_file = tmp_path / "coordinator.yml"
+    cfg_file.write_text(
+        "repos:\n"
+        "  - name: api\n"
+        "    github: acme/api\n"
+        "    default_branch: main\n"
+        "machines:\n"
+        "  - name: precision\n"
+        "    host: precision.tailnet\n"
+        "    repos: [api]\n"
+    )
+
+    # The incident's smoke-repro row, inserted the same way a dispatch would
+    # (conftest's autouse `_no_dispatch_target_validation` fixture no-ops the
+    # #2087 write-time gate here, same as every other fixture-insert in this
+    # suite — this test is about the RECOVERY path, not the write-time gate,
+    # which test_dispatch_target_validation.py covers separately).
+    smoke = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=9999,
+        issue_title="Some work", assignment_id="smoke-repro", type="smoke",
+        status="running",
+    )
+    _record_dispatched_assignment_local(assignment=smoke, repo_github="acme/api")
+    assert coord_db.execute(
+        "SELECT status FROM assignments WHERE assignment_id='smoke-repro'"
+    ).fetchone()["status"] == "running"
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "diagnose", "--config", str(cfg_file),
+            "api", "9999", "--stage", "smoke", "--reset",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "not a configured machine" in result.output and "laptop" in result.output
+
+    row = coord_db.execute(
+        "SELECT status FROM assignments WHERE assignment_id='smoke-repro'"
+    ).fetchone()
+    assert row["status"] not in ("running", "pending"), (
+        f"--reset must clear the phantom row in the DB, got status={row['status']!r}"
+    )
+
+
 # ── review findings recovery (#607 class) ────────────────────────────────────
 
 
@@ -1054,6 +1140,55 @@ def test_cleanup_without_reset_only_recommends_does_not_write(monkeypatch, confi
         "would finalize phantom" in f and "w1" in f and "--reset" in f
         for f in res.findings
     )
+
+
+def test_cleanup_flags_sibling_row_on_unconfigured_machine(monkeypatch, config) -> None:
+    """#2087 fix-review nit: a sibling row on an unconfigured machine is a
+    phantom too, by the same reasoning `diagnose_stage` already applies to
+    the row it was explicitly asked about — but `_session_state` reports
+    "unknown" (not "dead") for it, since a machine that isn't in
+    `coordinator.yml` can't be probed at all. Before this fix that silently
+    skipped it: a milestone tracking issue with a `work` row *and* a sibling
+    `smoke` row, both on the same unconfigured machine, diagnosed with
+    `--stage work`, reported the `work` row correctly but said nothing about
+    the `smoke` sibling — reproduced here exactly."""
+    work = _assign(aid="work-repro", typ="work", status="running", issue=9999)
+    work.machine_name = "laptop"
+    smoke_sibling = _assign(aid="smoke-repro", typ="smoke", status="running", issue=9999)
+    smoke_sibling.machine_name = "laptop"
+    board = Board(active=[work, smoke_sibling])
+
+    res = diagnose.diagnose_stage(board, config, "api", 9999, "work")
+
+    assert any(
+        "smoke-repro" in f and "not a configured machine" in f and "laptop" in f
+        for f in res.findings
+    ), res.findings
+    assert res.needs_reset is True
+
+
+def test_cleanup_finalizes_sibling_row_on_unconfigured_machine_with_reset(
+    monkeypatch, config,
+) -> None:
+    """`--reset` clears the sibling phantom too, same as any other
+    cleanup-swept phantom row.
+
+    `session="unknown"` (not "dead"): this is what `_session_state` actually
+    returns for an unconfigured machine in production (it can't be probed at
+    all) — stubbing "dead" here would let the OLD, unfixed `_session_state
+    != "dead"` check pass too, defeating the point of this regression test.
+    The real gate this test exercises is the `machine_unconfigured` check,
+    which is independent of `_session_state`'s stubbed return value."""
+    calls = _stub(monkeypatch, session="unknown")
+    work = _assign(aid="work-repro", typ="work", status="running", issue=9999)
+    work.machine_name = "laptop"
+    smoke_sibling = _assign(aid="smoke-repro", typ="smoke", status="running", issue=9999)
+    smoke_sibling.machine_name = "laptop"
+    board = Board(active=[work, smoke_sibling])
+
+    diagnose.diagnose_stage(board, config, "api", 9999, "work", reset=True)
+
+    assert "smoke-repro" in calls["finalize"]
 
 
 # ── result trailer ───────────────────────────────────────────────────────────

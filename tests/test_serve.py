@@ -1705,7 +1705,10 @@ def test_serve_dispatched_records_assignment_row(
     from coord.models import Assignment
 
     a = Assignment(
-        machine_name="precision", repo_name="api", issue_number=11,
+        # #2087: must be a machine VALID_CONFIG actually configures — the
+        # daemon's dispatch endpoints now validate machine/repo against the
+        # `Config` `build_app` was given (see state._validate_dispatch_target).
+        machine_name="laptop", repo_name="api", issue_number=11,
         issue_title="thin-client dispatch", assignment_id="rev99", type="review",
         review_of_assignment_id="work1", branch="issue-11-x",
     )
@@ -1730,7 +1733,8 @@ def test_serve_dispatched_work_records_row(
     from coord.models import Proposal
 
     p = Proposal(
-        id=1, machine_name="precision", repo_name="api", issue_number=12,
+        # #2087: must be a machine VALID_CONFIG actually configures.
+        id=1, machine_name="laptop", repo_name="api", issue_number=12,
         issue_title="thin-client work", rationale="because",
     )
     app = build_app(SqliteStore(file_db), load_config(valid_config_path))
@@ -1764,7 +1768,10 @@ def test_serve_post_board_upserts_full_board(
         round_number=4,
         completed=[
             Assignment(
-                machine_name="precision", repo_name="api", issue_number=21,
+                # #2087: must be a machine VALID_CONFIG actually configures —
+                # save_board() now validates repo/machine for genuinely-new
+                # rows too (see state.save_board's docstring).
+                machine_name="laptop", repo_name="api", issue_number=21,
                 issue_title="thin-client board write", assignment_id="wb1",
                 status="done", branch="issue-21-x",
             ),

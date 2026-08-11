@@ -282,3 +282,250 @@ class TestDaemonDispatchEndpointsRefuseUnknownTarget:
             "SELECT * FROM assignments WHERE assignment_id='smoke-repro'"
         ).fetchone()
         assert row is None
+
+    def test_post_dispatched_work_uses_build_apps_config_not_an_independent_reload(
+        self, monkeypatch, file_db, rw_db,
+    ) -> None:
+        """#2087 review, non-blocking finding 1: the handler must validate
+        against the Config `build_app` was given, not fall back to
+        `_dispatch_target_config()`'s independent `coord.config.load()`
+        reload. Proven here by leaving the reload seam a no-op (as if no real
+        `coordinator.yml` were even reachable) — if the handler mistakenly
+        used it instead of threading through `config`, this dispatch would
+        go through unvalidated instead of being refused."""
+        _enable_validation(monkeypatch, None)  # the reload seam: a no-op
+        proposal = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=9999, issue_title="Some work", rationale="repro",
+        )
+        app = build_app(SqliteStore(file_db), FLEET_CONFIG)  # build_app's OWN config
+        with TestClient(app) as cli:
+            resp = cli.post(
+                "/dispatched-work",
+                json={
+                    "assignment_id": "work-repro",
+                    "proposal": dataclasses.asdict(proposal),
+                    "repo_github": "acme/api",
+                },
+            )
+        assert resp.status_code == 400, resp.text
+        row = rw_db.execute(
+            "SELECT * FROM assignments WHERE assignment_id='work-repro'"
+        ).fetchone()
+        assert row is None
+
+    def test_post_dispatched_uses_build_apps_config_not_an_independent_reload(
+        self, monkeypatch, file_db, rw_db,
+    ) -> None:
+        """Same proof as above, for /dispatched (the Assignment-based path)."""
+        _enable_validation(monkeypatch, None)  # the reload seam: a no-op
+        smoke = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=9999,
+            issue_title="Some work", assignment_id="smoke-repro", type="smoke",
+        )
+        app = build_app(SqliteStore(file_db), FLEET_CONFIG)
+        with TestClient(app) as cli:
+            resp = cli.post(
+                "/dispatched",
+                json={
+                    "assignment": dataclasses.asdict(smoke),
+                    "repo_github": "acme/api",
+                },
+            )
+        assert resp.status_code == 400, resp.text
+        row = rw_db.execute(
+            "SELECT * FROM assignments WHERE assignment_id='smoke-repro'"
+        ).fetchone()
+        assert row is None
+
+
+# ── save_board(): the SECOND write path (blocking review finding) ──────────
+#
+# `_record_dispatched_local` / `_record_dispatched_assignment_local` (above)
+# validate every INSERT they make, but `save_board()`'s `_UPSERT_SQL` is a
+# distinct path to the same `assignments` table — reached by the daemon's
+# generic `/board` thin-client endpoint (post_board, tested further below)
+# and by every CLI command that still read-modify-writes the whole board
+# locally. For a brand-new assignment_id its INSERT branch wrote whatever
+# repo_name/machine_name the caller supplied with no gate at all.
+
+
+class TestSaveBoardValidatesGenuinelyNewRows:
+    def test_new_row_unknown_target_raises_and_does_not_persist(
+        self, monkeypatch, coord_db,
+    ) -> None:
+        _enable_validation(monkeypatch, FLEET_CONFIG)
+        from coord.models import Board
+        from coord.state import save_board
+
+        a = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=9999,
+            issue_title="Some work", assignment_id="work-repro-board",
+            type="work", status="running",
+        )
+        with pytest.raises(UnknownDispatchTargetError):
+            save_board(Board(active=[a]))
+        row = coord_db.execute(
+            "SELECT * FROM assignments WHERE assignment_id='work-repro-board'"
+        ).fetchone()
+        assert row is None
+
+    def test_new_row_known_target_still_saves(self, monkeypatch, coord_db) -> None:
+        _enable_validation(monkeypatch, FLEET_CONFIG)
+        from coord.models import Board
+        from coord.state import save_board
+
+        a = Assignment(
+            machine_name="precision", repo_name="widgets", issue_number=2,
+            issue_title="t", assignment_id="real-board-1",
+            type="work", status="running",
+        )
+        save_board(Board(active=[a]))
+        row = coord_db.execute(
+            "SELECT status FROM assignments WHERE assignment_id='real-board-1'"
+        ).fetchone()
+        assert row["status"] == "running"
+
+    def test_existing_row_update_is_not_revalidated(self, monkeypatch, coord_db) -> None:
+        """`_UPSERT_SQL`'s `ON CONFLICT DO UPDATE` never touches
+        machine_name/repo_name, so an existing row can't be corrupted through
+        this path — and validating it anyway would wrongly block a
+        stale-snapshot `save_board()` from carrying forward a row's OTHER
+        columns after its repo/machine was legitimately dispatched earlier
+        and has since been trimmed from coordinator.yml."""
+        from coord.models import Board
+        from coord.state import save_board
+
+        # Insert with validation off — simulates a row dispatched before
+        # 'laptop'/'api' were trimmed out of the fleet config.
+        _enable_validation(monkeypatch, None)
+        a = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=1,
+            issue_title="t", assignment_id="existing1",
+            type="work", status="running",
+        )
+        save_board(Board(active=[a]))
+
+        # Now the config no longer knows 'laptop'/'api' — re-saving the SAME
+        # row (a later status update) must still succeed.
+        _enable_validation(monkeypatch, FLEET_CONFIG)
+        a.status = "done"
+        save_board(Board(completed=[a]))  # must not raise
+        row = coord_db.execute(
+            "SELECT status FROM assignments WHERE assignment_id='existing1'"
+        ).fetchone()
+        assert row["status"] == "done"
+
+
+# ── post_board: the daemon's generic thin-client whole-board endpoint ──────
+#
+# "backs assign/approve/stop/retry/resume/bounce/done/pr/…, the dashboard,
+# and auto_loop" per its own comment in serve_app.py — the review's other
+# named culprit: it builds an Assignment straight from client JSON and calls
+# save_board() with (before this fix) zero repo/machine validation.
+
+
+class TestDaemonPostBoardRefusesUnknownNewTarget:
+    @pytest.fixture
+    def rw_db(self, tmp_path):
+        import sqlite3
+        from coord import db
+        from coord.db import _ensure_schema
+
+        conn = sqlite3.connect(str(tmp_path / "rw.db"), check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        _ensure_schema(conn)
+        db.override_connection(conn)
+        yield conn
+
+    @pytest.fixture
+    def file_db(self, tmp_path):
+        import sqlite3
+        from coord.db import _ensure_schema
+
+        p = tmp_path / "coord.db"
+        conn = sqlite3.connect(str(p))
+        conn.row_factory = sqlite3.Row
+        _ensure_schema(conn)
+        conn.commit()
+        conn.close()
+        return p
+
+    def test_post_board_new_row_unknown_target_is_400_not_503(
+        self, monkeypatch, file_db, rw_db,
+    ) -> None:
+        """The exact 'buggy thin-client /board POST' gap the review named:
+        a client posting a brand-new work-repro row through the generic
+        whole-board endpoint must be refused with a 400, not silently
+        written or reported as a 503 server error."""
+        _enable_validation(monkeypatch, FLEET_CONFIG)
+        app = build_app(SqliteStore(file_db), FLEET_CONFIG)
+        with TestClient(app) as cli:
+            resp = cli.post(
+                "/board",
+                json={
+                    "assignments": [{
+                        "machine_name": "laptop", "repo_name": "api",
+                        "issue_number": 9999, "issue_title": "Some work",
+                        "assignment_id": "work-repro-board", "type": "work",
+                        "status": "running",
+                    }],
+                    "round_number": 0,
+                },
+            )
+        assert resp.status_code == 400, resp.text
+        assert "laptop" in resp.text or "api" in resp.text
+        row = rw_db.execute(
+            "SELECT * FROM assignments WHERE assignment_id='work-repro-board'"
+        ).fetchone()
+        assert row is None
+
+    def test_post_board_new_row_known_target_still_saves(
+        self, monkeypatch, file_db, rw_db,
+    ) -> None:
+        _enable_validation(monkeypatch, FLEET_CONFIG)
+        app = build_app(SqliteStore(file_db), FLEET_CONFIG)
+        with TestClient(app) as cli:
+            resp = cli.post(
+                "/board",
+                json={
+                    "assignments": [{
+                        "machine_name": "precision", "repo_name": "widgets",
+                        "issue_number": 2, "issue_title": "real work",
+                        "assignment_id": "real-board-2", "type": "work",
+                        "status": "running",
+                    }],
+                    "round_number": 0,
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        row = rw_db.execute(
+            "SELECT status FROM assignments WHERE assignment_id='real-board-2'"
+        ).fetchone()
+        assert row["status"] == "running"
+
+    def test_post_board_uses_build_apps_config_not_an_independent_reload(
+        self, monkeypatch, file_db, rw_db,
+    ) -> None:
+        """Same config-threading proof as the /dispatched-work /dispatched
+        tests above (#2087 review, non-blocking finding 1), for /board."""
+        _enable_validation(monkeypatch, None)  # the reload seam: a no-op
+        app = build_app(SqliteStore(file_db), FLEET_CONFIG)
+        with TestClient(app) as cli:
+            resp = cli.post(
+                "/board",
+                json={
+                    "assignments": [{
+                        "machine_name": "laptop", "repo_name": "api",
+                        "issue_number": 9999, "issue_title": "Some work",
+                        "assignment_id": "work-repro-board", "type": "work",
+                        "status": "running",
+                    }],
+                    "round_number": 0,
+                },
+            )
+        assert resp.status_code == 400, resp.text
+        row = rw_db.execute(
+            "SELECT * FROM assignments WHERE assignment_id='work-repro-board'"
+        ).fetchone()
+        assert row is None
