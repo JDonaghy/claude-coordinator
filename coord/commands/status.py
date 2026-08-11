@@ -125,8 +125,18 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
     # governs dispatch instead of a host-local file the daemon never reads.
     # #1862: passing `cfg.machines` folds quiet-hours windows into that same
     # set (a no-op on any machine with no `quiet_hours:` block).
-    from coord.machine_pause import describe_pause_state, paused_set  # noqa: PLC0415
+    # #2101: a release cordon is IN `paused` (that is how every dispatcher
+    # honours it), so without the cordon map alongside it this line would
+    # render "PAUSED" for a machine nobody paused and no `coord unpause` will
+    # free — work stopping with no stated reason, which is the exact failure
+    # the cordon mechanism is supposed to stop repeating.
+    from coord.machine_pause import (  # noqa: PLC0415
+        cordons as fetch_cordons,
+        describe_pause_state,
+        paused_set,
+    )
     paused = paused_set(cfg.machines)
+    cordons = fetch_cordons()
 
     statuses = check_all(machines, timeout=timeout)
     agent_completed: dict[str, dict] = {}
@@ -186,8 +196,13 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
         # pause — an operator debugging a stalled queue at 1AM needs to
         # know whether the machine will wake itself up or is waiting on
         # `coord unpause`.
-        pause_state = describe_pause_state(m, paused)
-        if pause_state is not None and pause_state.kind == "hand":
+        pause_state = describe_pause_state(m, paused, cordons=cordons)
+        if pause_state is not None and pause_state.kind == "cordon":
+            # #2101 trap E: name the version it is draining for, so a stopped
+            # machine reads as "the fleet is upgrading itself" rather than as
+            # a mystery.
+            label = f"{pause_state.detail.upper()} — {label}"
+        elif pause_state is not None and pause_state.kind == "hand":
             label = f"PAUSED — {label}"
         elif pause_state is not None and pause_state.kind == "quiet":
             label = f"QUIET ({pause_state.detail}) — {label}"

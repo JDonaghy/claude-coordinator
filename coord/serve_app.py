@@ -3242,7 +3242,9 @@ def _openapi_spec() -> dict:
             "get": {
                 "summary": (
                     "#1563: the daemon's own paused-machine set — the copy "
-                    "its dispatch tick actually reads."
+                    "its dispatch tick actually reads. #2101 adds `cordoned` "
+                    "(names) and `cordons` (full release-cordon records), "
+                    "both subsets of `paused`."
                 ),
                 "responses": {
                     "200": {"description": "OK"},
@@ -3252,7 +3254,10 @@ def _openapi_spec() -> dict:
                 "summary": (
                     "#1563: pause or unpause a machine on the daemon's "
                     "local-only store, so a thin client's `coord pause` "
-                    "reaches the same state the daemon's dispatch tick reads."
+                    "reaches the same state the daemon's dispatch tick reads. "
+                    "#2101: `cordon`/`uncordon` write the SEPARATE "
+                    "release-cordon store — same routing effect, different "
+                    "owner, so neither side can clear the other's flag."
                 ),
                 "requestBody": {
                     "required": True,
@@ -3264,8 +3269,16 @@ def _openapi_spec() -> dict:
                                     "machine": {"type": "string"},
                                     "action": {
                                         "type": "string",
-                                        "enum": ["pause", "unpause"],
+                                        "enum": [
+                                            "pause",
+                                            "unpause",
+                                            "cordon",
+                                            "uncordon",
+                                        ],
                                     },
+                                    "reason": {"type": "string"},
+                                    "target_version": {"type": "string"},
+                                    "ttl_seconds": {"type": "number"},
                                 },
                                 "required": ["machine", "action"],
                             }
@@ -5897,13 +5910,31 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         # `paused`. `_refresh_config()` first so a hand-edited
         # coordinator.yml's quiet_hours takes effect on the very next poll
         # rather than waiting for a daemon restart.
+        #
+        # #2101: `cordons` carries the full release-cordon records (owner,
+        # reason, target version, created_at, expires_at) and `cordoned` just
+        # their names. Both are subsets of `paused` — a cordon IS a routing
+        # pause, which is how every dispatcher honours it with no new check —
+        # but a caller that renders them identically is showing an operator
+        # "PAUSED" for a machine nobody paused, which is exactly the "work
+        # stopped and nothing said why" failure #2101 trap E names. The full
+        # records are published rather than a boolean because expiry and the
+        # drain deadline are decided by the CALLER (`coord release
+        # propagate`), which may be a thin client.
         _refresh_config()
-        from coord.machine_pause import local_paused_set, quiet_paused_names  # noqa: PLC0415
+        from coord.machine_pause import (  # noqa: PLC0415
+            local_cordons,
+            local_paused_set,
+            quiet_paused_names,
+        )
 
+        cordons = local_cordons()
         return JSONResponse(
             {
                 "paused": sorted(local_paused_set(config.machines)),
                 "quiet": sorted(quiet_paused_names(config.machines)),
+                "cordoned": sorted(cordons),
+                "cordons": [c.to_dict() for _, c in sorted(cordons.items())],
             }
         )
 
@@ -5916,8 +5947,11 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         # process happened to have its own board_service configured).
         _refresh_config()
         from coord.machine_pause import (  # noqa: PLC0415
+            local_clear_cordon,
+            local_cordons,
             local_pause,
             local_paused_set,
+            local_set_cordon,
             local_unpause_effective,
             quiet_paused_names,
         )
@@ -5929,6 +5963,46 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         action = body.get("action")
         if not machine or not isinstance(machine, str):
             return JSONResponse({"error": "missing field: machine"}, status_code=400)
+        if action in ("cordon", "uncordon"):
+            # #2101: a release cordon, NOT an operator pause. Deliberately the
+            # same endpoint (one routing decision, one place to be wrong about
+            # it) and deliberately a different store: `local_set_cordon` /
+            # `local_clear_cordon` never touch the `paused` list, so the
+            # post-roll uncordon cannot clear a pause an operator set by hand,
+            # and `coord unpause` cannot lift a cordon mid-drain (trap A).
+            if action == "cordon":
+                try:
+                    ttl = (
+                        float(body["ttl_seconds"])
+                        if body.get("ttl_seconds") is not None
+                        else None
+                    )
+                except (TypeError, ValueError):
+                    return JSONResponse(
+                        {"error": "ttl_seconds must be a number"}, status_code=400
+                    )
+                record = local_set_cordon(
+                    machine,
+                    reason=str(body.get("reason") or ""),
+                    target_version=(
+                        str(body["target_version"]) if body.get("target_version") else None
+                    ),
+                    ttl_seconds=ttl,
+                )
+                changed = True
+            else:
+                record = None
+                changed = local_clear_cordon(machine)
+            cordons = local_cordons()
+            return JSONResponse(
+                {
+                    "paused": sorted(local_paused_set(config.machines)),
+                    "cordoned": sorted(cordons),
+                    "cordons": [c.to_dict() for _, c in sorted(cordons.items())],
+                    "cordon": record.to_dict() if record is not None else None,
+                    "changed": changed,
+                }
+            )
         if action == "pause":
             changed = local_pause(machine)
             return JSONResponse(

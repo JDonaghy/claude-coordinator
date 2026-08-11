@@ -427,6 +427,24 @@ def _lane_versions_by_host(report) -> dict[str, list[str | None]]:
                    "(#1757) that were waiting for exactly this deploy.")
 @click.option("--timeout", default=180.0, show_default=True,
               help="Seconds to wait for each agent to report the new version.")
+@click.option("--cordon/--no-cordon", "do_cordon", default=True, show_default=True,
+              help="#2101: stop each behind host from starting NEW work until it "
+                   "is up to date, so it drains into a rollable state instead of "
+                   "waiting for a window that never comes. In-flight work is "
+                   "never killed. --no-cordon also CLEARS any cordon this "
+                   "mechanism already set — turning it off must release the "
+                   "fleet, not freeze it.")
+@click.option("--cordon-after", default=None, type=int,
+              help="Releases behind before a host is cordoned (default: 1, i.e. "
+                   "any drift). Raise it if release cadence ever makes one "
+                   "fleet drain per release too expensive — see #2101 trap F.")
+@click.option("--cordon-ttl", default=None, type=float,
+              help="Seconds a cordon stays effective without being renewed "
+                   "(default 3600). This is what stops a run killed mid-drain "
+                   "from cordoning the fleet forever.")
+@click.option("--drain-deadline", default=None, type=float,
+              help="Seconds a host may fail to drain before the cordon "
+                   "escalates loudly (default 5400).")
 @click.option("--json", "as_json", is_flag=True, help="Emit the propagation record as JSON.")
 def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions are elsewhere
     config_path: Path,
@@ -439,6 +457,10 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
     rollback_on_red: bool,
     release_holds: bool,
     timeout: float,
+    do_cordon: bool,
+    cordon_after: int | None,
+    cordon_ttl: float | None,
+    drain_deadline: float | None,
     as_json: bool,
 ) -> None:
     """One propagation attempt. Exit 0 on deferral, 1 on red, 2 on rollback.
@@ -467,6 +489,15 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
     lands, so the ``coord-serve process`` and ``<unit> spawns`` findings are
     graded like any other python-lane lane instead of being permanently
     advisory.
+
+    #2101: this command no longer only WAITS for a window, it CREATES one.
+    Every host that is behind the target is *cordoned* — no new agents route
+    there, in-flight work is untouched — so it drains itself into a rollable
+    state; the moment it is rolled it is uncordoned again. That is why the
+    version sweep below happens BEFORE the "fleet is busy, defer" branch: a
+    run that defers without cordoning is a run that will defer again in 20
+    minutes for exactly the same reason, which is how the fleet sat eleven
+    releases behind for a day with elitebook idle and rollable throughout.
     """
     import json as _json  # noqa: PLC0415
     import time  # noqa: PLC0415
@@ -543,17 +574,10 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
     # #2067: a signal that cannot be pinned to a host (the board itself
     # unreadable, a drive-queue entry with no recorded launch host) has to
     # block every host — and so does every configured host individually
-    # being occupied, which is the same outcome by a different route. Either
-    # way there is no window anywhere, so there is nothing to gain by
-    # spending a `gather()` sweep finding that out the slow way.
+    # being occupied, which is the same outcome by a different route.
     fully_busy = bool(quiescence.fleet_wide_busy) or (
         bool(hosts) and busy_hosts.issuperset(hosts)
     )
-    if fully_busy and not force:
-        # The single most important line in this command: a deferral is a
-        # normal, recorded, exit-0 outcome. A timer that defers all night
-        # must be visibly *working*, not visibly failing.
-        _finish(rp.STATUS_DEFERRED, 0)
     if quiescence.busy and force:
         click.echo(
             "warning: --force — rolling over a BUSY fleet; in-flight "
@@ -563,6 +587,14 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
         busy_hosts = set()  # --force overrides per-host busyness too
 
     # ── 3. who still needs it, and in what order? ────────────────────────
+    #
+    # #2101: this sweep used to sit BELOW the "fleet fully busy → defer"
+    # return, because a run that could roll nothing had nothing to learn from
+    # it. That is no longer true: a busy fleet is exactly the fleet that needs
+    # cordoning, and cordoning needs to know who is behind. The cost is one
+    # `/health` sweep (10s, parallel) on a tick that would otherwise have
+    # returned immediately — paid so a deferral can make the NEXT run
+    # different from this one instead of repeating it forever.
     machine_health, unreachable, daemon_facts, daemon_label = rv.gather(
         config, timeout=10.0
     )
@@ -571,6 +603,38 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
         daemon_host=daemon_facts, daemon_host_name=daemon_label,
         expected=record.target_version,
     )
+    current = rp.hosts_already_current(_lane_versions_by_host(before), record.target_version)
+
+    # ── 3b. cordon the hosts that are behind, so they DRAIN (#2101) ──────
+    #
+    # Before the deferral return below, on purpose: cordoning is the thing
+    # that turns "no window" into "a window in a few minutes". A run that
+    # defers without cordoning has changed nothing about why it deferred.
+    record.cordons = _apply_cordons(
+        hosts=hosts,
+        report=before,
+        target_version=record.target_version,
+        busy_reasons={h: quiescence.busy_reason_for_host(h) for h in hosts},
+        enabled=do_cordon,
+        threshold=cordon_after,
+        ttl_seconds=cordon_ttl,
+        drain_deadline=drain_deadline,
+        dry_run=dry_run,
+    )
+
+    if fully_busy and not force:
+        # The single most important line in this command: a deferral is a
+        # normal, recorded, exit-0 outcome. A timer that defers all night
+        # must be visibly *working*, not visibly failing. #2101: and now it
+        # has cordoned whatever is behind on the way past, so the next tick
+        # meets a fleet that is actually draining.
+        _finish(rp.STATUS_DEFERRED, 0)
+
+    # #2101: resolved AFTER the deferral above, deliberately. This refusal is
+    # about the ORDER a roll happens in; a run that is going to roll nothing
+    # has no order to get wrong, and turning "the fleet is busy" into a
+    # `failed` record (exit 1, systemd marks the unit failed) would teach an
+    # operator to ignore the one signal that matters.
     daemon_name = _daemon_machine_name(config, daemon_host_override, machine_health)
     if daemon_name is None and len(hosts) > 1:
         # #2052 fault 2: this used to warn and roll in coordinator.yml order.
@@ -589,7 +653,6 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
         )
         click.echo(f"error: {record.error}", err=True)
         _finish(rp.STATUS_FAILED, 1)
-    current = rp.hosts_already_current(_lane_versions_by_host(before), record.target_version)
 
     # #2067: the daemon must lead every python-lane roll (see the module
     # docstring's LANE ORDER section) — if it is itself occupied and not
@@ -730,6 +793,16 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
         click.echo(f"  {'·' if ok is None else ('✓' if ok else '✗')} "
                    f"{roll.label}: {detail}")
 
+    # ── 4b. uncordon what just rolled, immediately (#2101) ───────────────
+    #
+    # Immediately, and not after the verify gate below: the host is on the
+    # target version and its agent has re-execed, so there is nothing left to
+    # drain for and every extra second of cordon is work the fleet is not
+    # doing. If verification then comes back red and rolls the host back, the
+    # NEXT run re-cordons it — one loop, converging, rather than a cordon
+    # whose lifetime is coupled to an unrelated gate.
+    _uncordon_hosts(updated_hosts, record.cordons)
+
     # ── 5. the final gate ────────────────────────────────────────────────
     if not do_verify:
         _finish(rp.STATUS_ROLLED, 0)
@@ -811,6 +884,239 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
         click.echo(f"  {'✓' if ok else '✗'} release deploy gate {key}: {detail}")
 
     _finish(rp.STATUS_VERIFIED, 0)
+
+
+# ── #2101: the cordon loop's I/O half ───────────────────────────────────────
+#
+# The decisions live in `coord/release_cordon.py` (pure, clock passed in);
+# what lives here is the part that needs a fleet: reading each host's python
+# lane out of the `/health` sweep this command already did, writing the
+# daemon-backed cordon store, and surfacing a blown drain deadline where an
+# operator will actually see it.
+
+
+def _python_lane_versions(
+    report, hosts: list[str], target_version: str | None
+) -> dict[str, str | None]:
+    """``{host: the OLDEST version its python lane reports}`` (#2101).
+
+    "Python lane" is whatever :func:`coord.release_propagate.verify_lane_kind`
+    grades as one — the venv itself plus the live `coord-serve` process —
+    rather than a second list that could drift from the one the roll and the
+    gate already use.
+
+    Two deliberate readings:
+
+    * the OLDEST readable version wins, because a host is as behind as its
+      most stale python lane. A venv that swapped while `coord-serve` still
+      runs the old generation is #2069's exact defect, and it must read as
+      "behind", not as "done";
+    * a host with an unreadable lane and no readable lane BEHIND the target is
+      ``None`` — "no data", never "current" (#1834). `None` is what stops the
+      host being cordoned on a guess *and* what stops an existing cordon being
+      cleared on a failed HTTP call.
+    """
+    from coord import release_cordon as rc  # noqa: PLC0415
+    from coord import release_propagate as rp  # noqa: PLC0415
+
+    seen: dict[str, list[str | None]] = {}
+    for lane in report.lanes:
+        if rp.verify_lane_kind(lane.lane) != rp.LANE_PYTHON:
+            continue
+        seen.setdefault(lane.host, []).append(lane.version)
+
+    out: dict[str, str | None] = {}
+    for host in hosts:
+        versions = seen.get(host) or []
+        oldest = _oldest_version(versions)
+        if (
+            oldest is not None
+            and any(v is None for v in versions)
+            and rc.version_drift(oldest, target_version) == 0
+        ):
+            # Some lane could not be read at all, and every lane that COULD be
+            # read is already on the target. That is not proof of "current" —
+            # the unreadable lane is exactly the one #1834 says will be the
+            # one that bites — so report "no data" and leave any existing
+            # cordon exactly as it is. (A readable lane that IS behind is
+            # proof enough to cordon, and `_oldest_version` already
+            # surfaced it.)
+            oldest = None
+        out[host] = oldest
+    return out
+
+
+def _oldest_version(versions: list[str | None]) -> str | None:
+    """The lowest readable version in *versions*, or ``None``.
+
+    String comparison is wrong here (``0.5.9`` sorts above ``0.5.31``), so
+    this compares numerically component by component.
+    """
+    def _key(raw: str) -> tuple[int, ...]:
+        parts: list[int] = []
+        for chunk in raw.lstrip("vV").split("."):
+            digits = ""
+            for ch in chunk:
+                if not ch.isdigit():
+                    break
+                digits += ch
+            if not digits:
+                break
+            parts.append(int(digits))
+        return tuple(parts)
+
+    readable = [v for v in versions if v]
+    if not readable:
+        return None
+    return min(readable, key=_key)
+
+
+def _apply_cordons(
+    *,
+    hosts: list[str],
+    report,
+    target_version: str | None,
+    busy_reasons: dict[str, str],
+    enabled: bool,
+    threshold: int | None,
+    ttl_seconds: float | None,
+    drain_deadline: float | None,
+    dry_run: bool,
+) -> dict:
+    """Plan and apply this run's cordons. Returns the journal fragment.
+
+    Never raises: a cordon store this run cannot write is recorded as an
+    error and the roll continues on its existing (quiescence-based) rules.
+    Failing the whole propagation because the cordon could not be renewed
+    would make #2101's fix strictly worse than not having it.
+    """
+    import time  # noqa: PLC0415
+
+    from coord import release_cordon as rc  # noqa: PLC0415
+    from coord.machine_pause import (  # noqa: PLC0415
+        clear_cordon,
+        cordons as read_cordons,
+        set_cordon,
+    )
+
+    outcome = rc.CordonOutcome()
+    try:
+        existing = read_cordons()
+    except Exception as exc:  # noqa: BLE001 — see docstring
+        outcome.errors.append(f"could not read the cordon store: {exc}")
+        return outcome.to_dict()
+
+    plan = rc.plan_cordons(
+        target_version=target_version,
+        host_versions=_python_lane_versions(report, hosts, target_version),
+        existing=existing,
+        now=time.time(),
+        ttl_seconds=(
+            rc.DEFAULT_TTL_SECONDS if ttl_seconds is None else ttl_seconds
+        ),
+        drain_deadline=(
+            rc.DEFAULT_DRAIN_DEADLINE_SECONDS
+            if drain_deadline is None
+            else drain_deadline
+        ),
+        threshold=(
+            rc.DEFAULT_DRIFT_THRESHOLD if threshold is None else threshold
+        ),
+        busy_reasons=busy_reasons,
+        enabled=enabled,
+    )
+    for line in plan.render():
+        click.echo(line)
+    if dry_run:
+        # `--dry-run` promises to change nothing, cordon store included. The
+        # plan above is still printed, so a dry run answers "and what would
+        # this do to the fleet's routing?" rather than going silent on it.
+        outcome.errors.append("dry-run: cordon store not written")
+        return {**plan.to_dict(), **outcome.to_dict()}
+
+    outcome.expired = list(plan.expired)
+    for record in plan.cordon:
+        try:
+            set_cordon(
+                record.machine,
+                reason=record.reason,
+                target_version=record.target_version,
+                ttl_seconds=max(0.0, record.expires_at - record.renewed_at),
+            )
+            outcome.cordoned.append(record.machine)
+        except Exception as exc:  # noqa: BLE001 — see docstring
+            outcome.errors.append(f"cordon {record.machine}: {exc}")
+            click.echo(f"  ✗ cordon {record.machine}: {exc}", err=True)
+    for name in plan.uncordon:
+        try:
+            if clear_cordon(name):
+                outcome.uncordoned.append(name)
+        except Exception as exc:  # noqa: BLE001 — see docstring
+            outcome.errors.append(f"uncordon {name}: {exc}")
+            click.echo(f"  ✗ uncordon {name}: {exc}", err=True)
+
+    for escalation in plan.escalations:
+        _escalate_drain(escalation)
+        outcome.escalated.append(escalation.to_dict())
+
+    return outcome.to_dict()
+
+
+#: Where a blown drain deadline (#2101 trap C) is recorded, in the same
+#: escalation channel `coord drive-queue`'s own alerts use — so it shows up in
+#: the TUI's escalations panel and `coord drive escalations` with no new
+#: surface to remember to look at. Mirrors
+#: `coord.drive_queue.QUEUE_ALERT_REPO`'s pseudo-repo convention.
+DRAIN_ALERT_REPO = "(release-cordon)"
+DRAIN_ALERT_ISSUE = 0
+DRAIN_ALERT_STAGE = "release-cordon"
+
+
+def _escalate_drain(escalation) -> None:
+    """Surface a host that will not drain — loudly, in three places.
+
+    stderr (the timer's journal), the escalation table (the TUI and
+    `coord drive escalations`) and the propagation journal. #2101's acceptance
+    criterion 4 is explicitly about the surfaced MESSAGE rather than an
+    internal state change, because a silent forever-wait is the failure this
+    whole mechanism replaces.
+    """
+    click.echo(f"  ! {escalation.message}", err=True)
+    try:
+        from coord.state import record_drive_escalation  # noqa: PLC0415
+
+        record_drive_escalation(
+            DRAIN_ALERT_REPO,
+            DRAIN_ALERT_ISSUE,
+            stage=DRAIN_ALERT_STAGE,
+            reason=escalation.message,
+            gate_readings=(
+                f"machine={escalation.machine} | "
+                f"waited={escalation.waited_seconds:.0f}s | "
+                f"deadline={escalation.deadline_seconds:.0f}s"
+            ),
+            proposed_command=escalation.command,
+        )
+    except Exception as exc:  # noqa: BLE001 — the stderr line above is the
+        # floor; an escalation table that cannot be written must not take the
+        # message down with it.
+        click.echo(f"  (could not record the drain escalation: {exc})", err=True)
+
+
+def _uncordon_hosts(hosts: list[str], journal: dict) -> None:
+    """Clear the release cordon on every host in *hosts*, best effort."""
+    if not hosts:
+        return
+    from coord.machine_pause import clear_cordon  # noqa: PLC0415
+
+    for host in hosts:
+        try:
+            if clear_cordon(host):
+                journal.setdefault("uncordoned", []).append(host)
+                click.echo(f"  ✓ uncordon {host}: rolled, work may resume")
+        except Exception as exc:  # noqa: BLE001
+            journal.setdefault("errors", []).append(f"uncordon {host}: {exc}")
+            click.echo(f"  ✗ uncordon {host}: {exc}", err=True)
 
 
 def _local_machine_name(config) -> str | None:
@@ -1207,6 +1513,129 @@ def _release_hold(key: str) -> tuple[bool, str]:
     if proc.returncode == 0:
         return True, "queue released"
     return False, (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()[:200]
+
+
+@release_group.command(
+    "cordon",
+    help=(
+        "Inspect, set or clear release cordons (#2101). A cordoned machine "
+        "starts no NEW work — in-flight work is never touched — so it drains "
+        "into a state where `coord release propagate` can roll it. "
+        "`coord release propagate` manages these automatically; this command "
+        "is the operator's window into them and the documented override for a "
+        "host that will not drain."
+    ),
+)
+@click.argument("machines", nargs=-1)
+@click.option("--clear", "clear", is_flag=True,
+              help="Clear the named machines' cordons (or --all of them). "
+                   "This lets work resume and LEAVES THE HOST BEHIND — the "
+                   "next propagate run will cordon it again unless whatever "
+                   "was wedged has been fixed.")
+@click.option("--all", "all_machines", is_flag=True,
+              help="With --clear: clear every release cordon.")
+@click.option("--reason", default="", help="Free text stored with the cordon.")
+@click.option("--target", "target_version", default=None,
+              help="Version this cordon is draining for; shown in every "
+                   "surface that renders the cordon.")
+@click.option("--ttl", default=None, type=float,
+              help="Seconds before the cordon lapses on its own "
+                   "(default 3600). A cordon ALWAYS expires — see #2101.")
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
+def release_cordon(
+    machines: tuple[str, ...],
+    clear: bool,
+    all_machines: bool,
+    reason: str,
+    target_version: str | None,
+    ttl: float | None,
+    as_json: bool,
+) -> None:
+    """List (no args), set, or clear release cordons.
+
+    Every cordon carries an owner, a reason, a creation time and an expiry,
+    and is stored separately from `coord pause` — so this command can never
+    clear a pause an operator set by hand, and `coord unpause` can never lift
+    a cordon out from under a drain (#2101 trap A).
+    """
+    import json as _json  # noqa: PLC0415
+    import time  # noqa: PLC0415
+
+    from coord import release_cordon as rc  # noqa: PLC0415
+    from coord.machine_pause import (  # noqa: PLC0415
+        clear_cordon,
+        cordons as read_cordons,
+        set_cordon,
+    )
+
+    if clear:
+        targets = list(machines)
+        if all_machines:
+            targets = sorted(read_cordons())
+        if not targets:
+            raise click.ClickException(
+                "name at least one machine, or pass --all"
+            )
+        cleared = [name for name in targets if clear_cordon(name)]
+        if as_json:
+            click.echo(_json.dumps({"cleared": cleared}, indent=2, sort_keys=True))
+        elif cleared:
+            click.echo("uncordoned: " + ", ".join(cleared))
+            click.echo(
+                "note: these hosts are still BEHIND the released version — "
+                "the next `coord release propagate` will cordon them again "
+                "unless the thing that stopped them draining is fixed."
+            )
+        else:
+            click.echo("nothing to do — none of those machines was cordoned")
+        return
+
+    if machines:
+        written = [
+            set_cordon(
+                name,
+                reason=reason or "cordoned by hand",
+                target_version=target_version,
+                ttl_seconds=ttl,
+            )
+            for name in machines
+        ]
+        if as_json:
+            click.echo(
+                _json.dumps([c.to_dict() for c in written], indent=2, sort_keys=True)
+            )
+        else:
+            for record in written:
+                click.echo(f"⊘ {record.machine}: {record.describe()}")
+        return
+
+    now = time.time()
+    active = read_cordons(now=now)
+    if as_json:
+        click.echo(
+            _json.dumps(
+                [c.to_dict() for _, c in sorted(active.items())],
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return
+    if not active:
+        click.echo("no machines are cordoned — the fleet is free to take work")
+        return
+    for name, record in sorted(active.items()):
+        remaining = max(0.0, record.expires_at - now) / 60.0
+        overdue = " OVERDUE" if record.overdue(now) else ""
+        click.echo(
+            f"⊘ {name}: {record.describe()} "
+            f"[{record.age(now) / 60.0:.0f}m draining, lapses in "
+            f"{remaining:.0f}m, owner={record.owner}]{overdue}"
+        )
+    click.echo(
+        f"\nclear one with `coord release cordon --clear <machine>` "
+        f"(default lifetime {rc.DEFAULT_TTL_SECONDS / 60:.0f}m — a cordon "
+        "nobody renews lapses on its own)"
+    )
 
 
 @release_group.command(

@@ -226,6 +226,63 @@ def fetch_paused_machines(
     return {str(x) for x in items if isinstance(x, str) and x} if isinstance(items, list) else set()
 
 
+def fetch_cordons(
+    svc: ServiceConfig, *, timeout: float = _DEFAULT_TIMEOUT
+) -> list[dict]:
+    """GET /pause → the daemon's release-cordon records (#2101).
+
+    Returns the raw record dicts (``machine``/``owner``/``reason``/
+    ``target_version``/``created_at``/``expires_at``) so a caller can decide
+    expiry and drain deadlines for itself — the whole point of #2101 trap B is
+    that a cordon carries its own expiry rather than depending on some process
+    remembering to clean it up.
+
+    ``[]`` when the daemon predates #2101 (the key is simply absent), which is
+    the right read: a daemon with no cordon store has no cordons. Raises
+    ``httpx.HTTPError`` on transport/HTTP failure — `coord.machine_pause.
+    cordons()` catches that and degrades to "nothing is cordoned", same
+    fail-soft read posture as `fetch_paused_machines`.
+    """
+    resp = httpx.get(f"{svc.url}/pause", headers=_headers(svc), timeout=timeout)
+    resp.raise_for_status()
+    data = resp.json()
+    rows = data.get("cordons") if isinstance(data, dict) else None
+    return [dict(r) for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+
+
+def post_cordon(
+    svc: ServiceConfig,
+    machine: str,
+    action: str,
+    *,
+    reason: str = "",
+    target_version: str | None = None,
+    ttl_seconds: float | None = None,
+    timeout: float = _WRITE_TIMEOUT,
+) -> dict:
+    """POST /pause {machine, action: cordon|uncordon, ...} (#2101).
+
+    Deliberately the SAME endpoint as pause/unpause rather than a new one: a
+    cordon is the same routing decision with a different owner, and one
+    endpoint means one place a thin client can be wrong about it.
+
+    Raises ``httpx.HTTPError`` on transport/HTTP failure — a cordon that
+    silently fails to reach the daemon would let `coord release propagate`
+    restart agents believing it had stopped new work. A daemon that predates
+    #2101 answers 400 ``unknown action``, which surfaces here as an
+    ``HTTPStatusError`` rather than a silent no-op — deploy the daemon first
+    (the same server-first ordering every other endpoint here needs).
+    """
+    payload: dict = {"machine": machine, "action": action}
+    if reason:
+        payload["reason"] = reason
+    if target_version:
+        payload["target_version"] = target_version
+    if ttl_seconds is not None:
+        payload["ttl_seconds"] = float(ttl_seconds)
+    return post_record(svc, "/pause", payload, timeout=timeout)
+
+
 def post_pause(
     svc: ServiceConfig, machine: str, action: str, *, timeout: float = _WRITE_TIMEOUT
 ) -> dict:

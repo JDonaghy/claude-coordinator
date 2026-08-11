@@ -250,24 +250,40 @@ def test_stale_rows_are_carried_into_to_dict():
 # down to a per-host verdict a caller can actually roll against.
 
 
-def test_a_running_entry_is_attributed_to_its_launch_host():
-    """#1870's `launch_host` is the ground truth for where a running drive
-    queue entry actually occupies a host — not `machine`, which is only an
-    operator's pin."""
+def test_a_pinned_running_entry_is_attributed_to_its_worker_machine():
+    """#2101 trap D INVERTS #2067's precedence, and this is the test that
+    used to assert the opposite.
+
+    #2067 charged a running queue entry to its `launch_host` (#1870). Measured
+    on 2026-08-10, that host is *always* the timer host, because the
+    drive-queue tick spawns `coord drive --tmux` locally — and the timer host
+    is the daemon host, whose busyness defers every OTHER host's python lane.
+    Net effect: any drive anywhere pinned the entire fleet from rolling.
+
+    The worker is what an agent restart destroys, so a `--machine`-pinned
+    entry is charged to the machine that will run the worker. The launch host
+    is protected by the cordon instead (nothing NEW is launched there).
+    """
     q = rp.assess_quiescence(
         queue_entries=[
             {"repo_name": "vimcode", "issue_number": 634, "state": STATE_RUNNING,
-             "machine": "requested-host", "launch_host": "precision"},
+             "machine": "precision", "launch_host": "dellserver"},
         ],
     )
     assert q.busy[0].host == "precision"
+    # ...and the timer host is therefore NOT held hostage by it.
+    assert q.rollable_hosts(["dellserver", "elitebook"]) == ["dellserver", "elitebook"]
 
 
-def test_a_running_entry_falls_back_to_machine_when_launch_host_is_absent():
+def test_an_unpinned_running_entry_falls_back_to_its_launch_host():
+    """No `--machine` pin: the real worker machine was auto-picked and is
+    knowable only from the live assignment row (a busy signal in its own
+    right). `launch_host` is the only host this row can name, so it stays the
+    fallback rather than the row becoming unattributable."""
     q = rp.assess_quiescence(
         queue_entries=[
             {"repo_name": "r", "issue_number": 1, "state": STATE_RUNNING,
-             "machine": "dellserver"},
+             "launch_host": "dellserver"},
         ],
     )
     assert q.busy[0].host == "dellserver"

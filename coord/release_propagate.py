@@ -620,6 +620,39 @@ def _queue_key(entry: Mapping[str, Any]) -> str:
     return "?"
 
 
+def busy_host_for_entry(entry: Mapping[str, Any]) -> str | None:
+    """Which host a ``running`` drive-queue row actually occupies (#2101).
+
+    #2067 attributed this to ``launch_host`` (#1870) — the host whose tick
+    launched the session — falling back to ``machine``. Measured on
+    2026-08-10, that reading pins the WHOLE fleet on every drive:
+
+    * the drive-queue tick runs on the timer host, so ``coord drive --tmux``
+      is spawned there and ``launch_host`` is *always* that host;
+    * that host is the daemon host, and the daemon must lead every roll, so
+      the one host it charges is the one host whose busyness defers every
+      other host's python lane (see the module docstring's LANE ORDER).
+
+    Net effect: **any drive anywhere pinned the entire fleet from rolling**,
+    which is fact 2 of #2101 and half of why the fleet sat eleven releases
+    behind. So the precedence is inverted: an entry pinned with ``--machine``
+    is charged to the machine that will actually run the WORKER, because the
+    worker is what an agent restart destroys (``coord/agent_app.py``'s
+    ``/update`` refuses a host with live assignments for exactly that reason).
+    The launch host merely hosts an observer tmux session, and #2101's cordon
+    is what protects *it*: no new drive is launched onto a cordoned host at
+    all, so nothing new starts there while it waits to roll.
+
+    ``launch_host`` remains the fallback for an unpinned (auto-picked) entry,
+    whose real worker machine is knowable only from the live assignment row —
+    and that row is a busy signal in its own right, attributed correctly, a
+    few lines below. Neither field present means the signal cannot be pinned
+    to a host at all and must block every host rather than none — see
+    :attr:`Quiescence.fleet_wide_busy`.
+    """
+    return str(entry.get("machine") or entry.get("launch_host") or "") or None
+
+
 def assess_quiescence(
     *,
     queue_entries: Iterable[Mapping[str, Any]] = (),
@@ -680,19 +713,7 @@ def assess_quiescence(
                 # says. Not busy — and not silently dropped either.
                 stale.append(key)
             else:
-                # #2067: attribute to the host actually running the drive,
-                # so a continuously-busy queue blocks only its occupied
-                # hosts, not the whole fleet. `launch_host` (#1870) is the
-                # ground truth — the host whose tick launched THIS session;
-                # `machine` is a weaker fallback (an operator's pin, not
-                # necessarily where a legacy/hand-edited row is actually
-                # running). Neither present means this signal cannot be
-                # pinned to a host at all, and must block every host rather
-                # than none — see `Quiescence.fleet_wide_busy`.
-                host = (
-                    str(entry.get("launch_host") or entry.get("machine") or "")
-                    or None
-                )
+                host = busy_host_for_entry(entry)
                 busy.append(
                     Busy(
                         kind="drive-queue entry running",
@@ -920,6 +941,13 @@ class PropagationRecord:
     #: actually accountable for (#2052). This, not ``verification``, is what
     #: ``--rollback-on-red`` acts on.
     gate: dict | None = None
+    #: #2101: what this run did to the release-cordon store — which hosts it
+    #: cordoned so they would drain, which it uncordoned after rolling, which
+    #: cordons had lapsed on their own, and any drain-deadline escalation.
+    #: Journalled for the same reason everything else here is: a run that
+    #: cordoned the fleet and then died must leave a readable trace of having
+    #: done so, or the resulting quiet fleet is indistinguishable from #2082.
+    cordons: dict = field(default_factory=dict)
     rolled_back: list[str] = field(default_factory=list)
     released_holds: list[str] = field(default_factory=list)
     finished_at: float | None = None
@@ -1073,6 +1101,26 @@ def render_record(record: PropagationRecord | Mapping[str, Any]) -> list[str]:
                 "      ~ no channel from here: "
                 + ", ".join(gate["unrollable"])
             )
+
+    # #2101: the cordon is the thing that CREATED this run's window (or is
+    # still creating it), so it belongs in the record's headline lines, not
+    # only in the JSON. A deferral that also cordoned reads completely
+    # differently from one that just gave up.
+    cordons = data.get("cordons") or {}
+    if cordons.get("cordoned"):
+        lines.append(
+            "    cordoned (draining to roll): " + ", ".join(cordons["cordoned"])
+        )
+    if cordons.get("uncordoned"):
+        lines.append("    uncordoned: " + ", ".join(cordons["uncordoned"]))
+    if cordons.get("expired"):
+        lines.append(
+            "    cordons that lapsed on their own: " + ", ".join(cordons["expired"])
+        )
+    for esc in cordons.get("escalated") or []:
+        lines.append(f"    ! {esc.get('message') or esc}")
+    for err in cordons.get("errors") or []:
+        lines.append(f"    cordon error: {err}")
 
     if data.get("rolled_back"):
         lines.append(f"    rolled back: {', '.join(data['rolled_back'])}")
