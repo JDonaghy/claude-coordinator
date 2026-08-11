@@ -1,0 +1,119 @@
+# coord release nightly-window — guarantee the daemon host rolls instead of
+# waiting for a quiescent window that may never come (#2112).
+#
+# A systemd *user* unit (mirrors coord-drive-queue/coord-release-propagate),
+# paired with coord-release-window.timer. Each fire is one attempt:
+#
+#   1. resolve the released version and the daemon host's own python-lane
+#      version; if the daemon host is already current, STOP — the queue is
+#      never touched (#2112 acceptance 3);
+#   2. otherwise, `systemctl --user stop coord-drive-queue.timer` — no new
+#      drives may launch for the rest of this run;
+#   3. wait (bounded — see TimeoutStartSec below and
+#      `coord release nightly-window --drain-deadline`) for whatever is
+#      already running to finish, reconciling with `coord drive-queue tick
+#      --reconcile-only` on every poll (#2110 — this is what stops the
+#      drain from deadlocking now that the timer that normally does that
+#      reconciliation is stopped);
+#   4. roll with `coord release propagate --daemon-host <derived>
+#      --target <resolved>` — no --force, ever (trap 1);
+#   5. `systemctl --user start coord-drive-queue.timer` — ALWAYS, whatever
+#      happened in 1-4, including a crash;
+#   6. report the outcome: stdout (this unit's journal), the
+#      `~/.coord/release_window.jsonl` journal (`coord release
+#      window-history`), and — for anything short of a clean roll or a
+#      confirmed already-current fleet — the same escalation channel
+#      `coord drive escalations` and the TUI already surface #2101's
+#      drain-deadline escalation through.
+#
+# WHY THIS EXISTS SEPARATELY FROM coord-release-propagate.timer
+# ----------------------------------------------------------------
+# `coord release propagate` already rolls every OTHER host at its own
+# per-host quiescent window (#2067), and cordons a behind host so it drains
+# on its own (#2101). Neither mechanism reaches the daemon host itself: the
+# daemon must lead every roll (the documented 405), so if IT is busy the
+# whole run defers — and dellserver is both the daemon host and the box
+# whose drive-queue tick launches work fleet-wide, so almost any queued
+# drive anywhere keeps it "busy". Cordoning the daemon host would not help:
+# cordoning stops new work from ROUTING there, but does not stop the
+# daemon's own tick from LAUNCHING new drive-queue entries in the first
+# place. The only way to guarantee the daemon host reaches quiescence is to
+# stop the thing that launches work onto it — which is exactly what this
+# unit's `--ensure-queue-running` ExecStopPost= below makes safe to do
+# unattended. See coord/release_window.py's module docstring for the full
+# mechanism and the 2026-08-10 measurement (eleven releases behind, with
+# elitebook idle and rollable the whole time).
+#
+# GATED ON #2110 — HARD PREREQUISITE. Steps 2-3 above are exactly the
+# sequence that deadlocked on 2026-08-10: the reconciler that clears a
+# finished drive's `running` row lives INSIDE `coord drive-queue tick`, so
+# stopping the timer used to stop reconciliation too, and the last drive's
+# row would stay `running` forever — the daemon host would read as busy
+# permanently and this unit would defer every night, unattended, silently,
+# forever. Do not install this unit on a build that predates #2110.
+#
+# WHICH HOST
+# ----------
+# Install ONLY on the daemon host (dellserver in production — the same box
+# that runs coord-serve/coord-drive-queue/coord-release-propagate). This
+# unit stops and restarts coord-drive-queue.timer, which only exists on
+# that host; installing a second copy elsewhere has no queue to stop and
+# would just repeatedly fail `systemctl --user stop coord-drive-queue.timer`
+# — a locally-scoped, harmless-but-noisy failure, not the #1440
+# two-overseers hazard `coord-release-propagate.timer`'s header warns about,
+# but still pointless. Don't.
+#
+# COORD_BIN — same #1523 pinned-non-editable-install requirement as
+# coord-drive-queue.service/coord-release-propagate.service: the CLI this
+# unit runs must not be rewritable out from under a live run. See those
+# units' headers for the full rationale; on dellserver ~/.local/bin/coord
+# already satisfies it.
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/coord-release-window.service \
+#      deploy/coord-release-window.timer ~/.config/systemd/user/
+#   loginctl enable-linger "$USER"
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now coord-release-window.timer
+#
+# Read the journal it writes with `coord release window-history`, not just
+# `journalctl` — the JSONL record survives a half-installed venv, same
+# reason coord-release-propagate.service's does.
+
+[Unit]
+Description=Nightly release window on the daemon host (#2112)
+After=network-online.target coord-drive-queue.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# No --force, ever (trap 1) — coord/commands/release.py's
+# release_nightly_window never passes it to the `coord release propagate`
+# it shells out to. A drain that has not finished by the deadline is
+# reported and declined, not overridden.
+ExecStart=%h/.local/bin/coord release nightly-window --config %h/.coord/coordinator.yml
+# #2112 trap 4 / acceptance 4: "the queue timer is running after the job in
+# EVERY path, including the failure ones — test by killing the job
+# mid-window." A `finally` block inside ExecStart cannot survive SIGKILL
+# (TimeoutStartSec below, or an operator's own `systemctl --user kill`).
+# ExecStopPost= is systemd's OWN guarantee of exactly that: it runs after
+# the main process exits for ANY reason — clean exit, non-zero exit, or
+# killed by a signal — so this is the backstop the in-process `finally`
+# cannot be. `--ensure-queue-running` does nothing but
+# `systemctl --user start coord-drive-queue.timer` and is idempotent: on
+# the overwhelmingly common path where ExecStart already restarted the
+# timer cleanly, this is a harmless no-op assertion, not a second action.
+ExecStopPost=%h/.local/bin/coord release nightly-window --ensure-queue-running --config %h/.coord/coordinator.yml
+# The drain alone may wait up to its own --drain-deadline (default 1h) on
+# top of the roll+verify sweep `coord release propagate` performs
+# (generous relative to its own 1800s TimeoutStartSec — see
+# coord-release-propagate.service). 2.5h total leaves this unit's own
+# worst case well inside the 22:00-08:00 quiet-hours window even starting
+# at 03:00, per coord-release-window.timer's header.
+TimeoutStartSec=9000
+
+# This is a Type=oneshot service activated BY THE TIMER — do not
+# `systemctl --user enable coord-release-window.service` directly (it has
+# no [Install] section; the timer unit is what you enable — same pattern
+# as coord-release-propagate.service/coord-drive-queue.service).
