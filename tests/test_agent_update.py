@@ -1225,9 +1225,13 @@ class TestRestartSiblingUnit:
         self, monkeypatch
     ) -> None:
         """A small #2095 improvement alongside `--no-block`: once systemd
-        itself says `failed`, waiting out the rest of `timeout` learns
-        nothing new. Proven with a huge timeout that a slow test would
-        otherwise have to actually wait through."""
+        itself says `failed` on two consecutive polls, waiting out the rest
+        of `timeout` learns nothing new. Proven with a huge timeout that a
+        slow test would otherwise have to actually wait through.
+
+        Two consecutive polls, not one — see
+        `test_a_transient_failed_state_during_a_forced_stop_does_not_fail_the_restart`
+        below for why a single sighting is not trusted (#2095 review)."""
         from coord.agent_app import _restart_sibling_unit
 
         def fake_run(cmd, **kwargs):
@@ -1235,11 +1239,55 @@ class TestRestartSiblingUnit:
                 return MagicMock(returncode=0, stdout="", stderr="")
             return MagicMock(returncode=0, stdout="failed\n", stderr="")
 
-        with patch("coord.agent_app.subprocess.run", side_effect=fake_run):
+        with (
+            patch("coord.agent_app.subprocess.run", side_effect=fake_run),
+            patch("coord.agent_app.time.sleep"),
+        ):
             ok, detail = _restart_sibling_unit("coord-drive-queue", timeout=300.0)
 
         assert ok is False
         assert "failed" in detail
+
+    def test_a_transient_failed_state_during_a_forced_stop_does_not_fail_the_restart(
+        self, monkeypatch
+    ) -> None:
+        """#2095 review: `TimeoutStopSec`/`KillMode=process` (added by this
+        same PR, to the same units this function restarts) is exactly the
+        mechanism that force-SIGKILLs a stuck SSE-holding stop -- and it is
+        commonly observed systemd behaviour for a unit whose stop was forced
+        that way to transiently report `ActiveState=failed` for a single
+        poll before the start half of the same `restart --no-block` job
+        takes over and settles at `active`. If the very first `is-active`
+        poll after the restart lands in that window, the restart must not
+        be given up on immediately -- it must keep polling and observe the
+        recovery, exactly as it would for any other transient intermediate
+        state (`deactivating`, `activating`, ...)."""
+        from coord.agent_app import _restart_sibling_unit
+
+        polls = {"n": 0}
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:3] == ["systemctl", "--user", "restart"]:
+                return MagicMock(returncode=0, stdout="", stderr="")
+            polls["n"] += 1
+            # One transient `failed` blip, then the start half of the job
+            # lands and the unit is active for good.
+            state = "failed" if polls["n"] == 1 else "active"
+            return MagicMock(returncode=0, stdout=f"{state}\n", stderr="")
+
+        with (
+            # coord-serve: no liveness probe configured, isolates this test
+            # from the separate #2095 liveness-probe behaviour.
+            patch("coord.agent_app.subprocess.run", side_effect=fake_run),
+            patch("coord.agent_app.time.sleep"),
+        ):
+            ok, detail = _restart_sibling_unit("coord-serve", timeout=5.0)
+
+        assert ok is True, (
+            "a single transient `failed` poll, immediately followed by "
+            "`active`, must not be trusted as a real failure"
+        )
+        assert detail == "active"
 
 
 class TestSiblingLivenessProbe:
