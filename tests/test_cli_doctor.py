@@ -605,3 +605,85 @@ def test_doctor_defaults_to_pypi_resolution_without_a_flag(
     )
     assert result.exit_code == 1, result.output
     assert "expected 0.5.26" in result.output
+
+
+# ── unit_enablement (#2098) ─────────────────────────────────────────────────
+#
+# `coord doctor` projects the machine's own `unit_enablement` H-1 result
+# (coord/health/checks/unit_enablement.py) out of
+# `/health["health"]["results"]` — see `_unit_enablement_lines` in
+# coord/commands/status.py, which mirrors `_unit_drift_lines` immediately
+# above. Same convention: drive it end-to-end through the real `doctor`
+# command rather than unit-testing the helper directly.
+#
+# `_health_with_unit_drift` just wraps whatever `unit_results` it's given
+# into `health["health"]["results"]` regardless of `check_id` — reused here
+# rather than duplicated for a second check id.
+
+
+def test_doctor_reports_a_disabled_unit(valid_config_path, monkeypatch) -> None:
+    """The state that hid coord-release-propagate.timer for a day: an
+    installed, manifest-listed unit reporting anything other than enabled.
+    `coord doctor`'s own printed report — the thing docs/AGENT_OPERATIONS.md
+    points operators at — must name the unit and how to fix it, not just
+    roll the WARN into the aggregate FLEET severity."""
+    from coord.config import load
+
+    cfg = load(valid_config_path)
+    m = cfg.machines[0]
+    statuses = [
+        MachineStatus(
+            machine=m, state=ONLINE,
+            health=_health_with_unit_drift(
+                {"git": _ok_probe(), "gh": _ok_probe()}, m,
+                unit_results=[{
+                    "check_id": "unit_enablement",
+                    "subject": "coord-release-propagate.timer",
+                    "severity": "warn",
+                    "headroom": "installed but disabled — a disabled unit and a working one produce identical evidence until something needed it (#2098)",
+                    "detail": "systemctl --user daemon-reload && systemctl --user enable --now coord-release-propagate.timer",
+                }],
+            ),
+        ),
+        *[
+            MachineStatus(
+                machine=other, state=ONLINE,
+                health=_health({"git": _ok_probe(), "gh": _ok_probe()}, other),
+            )
+            for other in cfg.machines[1:]
+        ],
+    ]
+    result = _run_doctor(valid_config_path, monkeypatch, statuses)
+    assert result.exit_code == 1, result.output
+    assert "unit enablement coord-release-propagate.timer" in result.output
+    assert "installed but disabled" in result.output
+    assert "fix:" in result.output
+    assert "enable --now coord-release-propagate.timer" in result.output
+
+
+def test_doctor_is_silent_about_an_enabled_unit(valid_config_path, monkeypatch) -> None:
+    """A unit reporting `enabled` must not fire `coord doctor`, and must not
+    even print a line for it (mirrors test_doctor_is_silent_about_a_matching_unit
+    for unit_drift)."""
+    from coord.config import load
+
+    cfg = load(valid_config_path)
+    machines = cfg.machines
+    statuses = [
+        MachineStatus(
+            machine=m, state=ONLINE,
+            health=_health_with_unit_drift(
+                {"git": _ok_probe(), "gh": _ok_probe()}, m,
+                unit_results=[{
+                    "check_id": "unit_enablement",
+                    "subject": "coord-serve.service",
+                    "severity": "ok",
+                    "headroom": "enabled",
+                }],
+            ),
+        )
+        for m in machines
+    ]
+    result = _run_doctor(valid_config_path, monkeypatch, statuses)
+    assert result.exit_code == 0, result.output
+    assert "unit enablement" not in result.output

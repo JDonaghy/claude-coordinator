@@ -1,3 +1,49 @@
+# coord-db-backup — hourly coord.db snapshot to the external SSD, interim
+# stopgap pending #1822 (continuous backup + verified restore, tier:large,
+# unstarted), paired with coord-db-backup.timer.
+#
+# A systemd *user* unit (mirrors coord-serve/coord-web/coord-notify/
+# coord-drive-queue), Type=oneshot, timer-fired. Runs
+# ~/.local/bin/coord-db-backup.sh (deploy/coord-db-backup.sh), which:
+#   - refuses to run unless the destination directory's parent is an actual
+#     mountpoint (default /media/crucial) — the external SSD must be
+#     physically present, or it would otherwise write "backups" onto the
+#     very disk (the daemon host's root filesystem) it exists to protect
+#     against,
+#   - takes a live, WAL-safe snapshot via `sqlite3 ... VACUUM INTO`, never
+#     `cp` (a plain copy of a WAL-mode db under concurrent writes can capture
+#     a torn file — the failure you only discover at restore),
+#   - `PRAGMA integrity_check`s the snapshot and sanity-checks it has a
+#     non-empty `assignments` table before it counts; either failure keeps
+#     the bad file on disk renamed `.REJECTED` rather than deleting it or
+#     leaving it indistinguishable from a good backup,
+#   - prunes snapshots beyond `COORD_BACKUP_RETAIN` (default 168 ≈ 7 days
+#     hourly), never touching `.REJECTED` files.
+#
+# Install ONLY on the box that owns ~/.coord/coord.db (dellserver in
+# production — the same host that runs coord-serve/coord-web/coord-notify/
+# coord-drive-queue).
+#
+# NOT a substitute for off-box backup: this protects against db corruption,
+# a bad migration, accidental deletion and OS-disk failure. It does NOT
+# protect against the machine itself being lost, stolen or burned — see
+# #1822, which owns the real (continuous + verified-restore + off-box)
+# answer. This interim unit is deliberately small in scope.
+#
+# Install:
+#   mkdir -p ~/.local/bin ~/.config/systemd/user
+#   cp deploy/coord-db-backup.sh ~/.local/bin/ && chmod +x ~/.local/bin/coord-db-backup.sh
+#   cp deploy/coord-db-backup.service deploy/coord-db-backup.timer ~/.config/systemd/user/
+#   loginctl enable-linger "$USER"          # survive logout / reboot
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now coord-db-backup.timer
+#
+# This is a Type=oneshot service activated BY THE TIMER — do not
+# `systemctl --user enable coord-db-backup.service` directly (it has no
+# [Install] section; the timer unit is what you enable).
+#
+# See docs/AGENT_OPERATIONS.md → "coord.db backups to the external SSD".
+
 [Unit]
 Description=Snapshot coord.db to the external SSD (interim, pending #1822)
 Documentation=https://github.com/JDonaghy/claude-coordinator/issues/1822
@@ -5,3 +51,10 @@ Documentation=https://github.com/JDonaghy/claude-coordinator/issues/1822
 [Service]
 Type=oneshot
 ExecStart=%h/.local/bin/coord-db-backup.sh
+# `VACUUM INTO` on a live, busy coord.db can stall under lock contention.
+# Generous relative to a normal run (a snapshot this size takes seconds),
+# well below the timer's hourly cadence (coord-db-backup.timer) so a
+# genuinely wedged run can't run into the next fire indefinitely — same
+# pattern as every other oneshot unit in this directory (see
+# coord-drive-queue.service, coord-web-dist-build.service).
+TimeoutStartSec=600

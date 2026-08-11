@@ -782,6 +782,46 @@ def _unit_drift_lines(health: dict) -> list[tuple[bool, str]]:
     return out
 
 
+def _unit_enablement_lines(health: dict) -> list[tuple[bool, str]]:
+    """Render a machine's ``unit_enablement`` H-1 results (``coord/health/
+    checks/unit_enablement.py``, #2098) as ``coord doctor`` lines.
+
+    Mirrors ``_unit_drift_lines`` immediately above: ``unit_drift`` answers
+    "does an installed unit's content match ``deploy/``", this answers "is
+    an installed, manifest-listed unit actually ``systemctl --user
+    enable``d" — the state that hid ``coord-release-propagate.timer`` for a
+    day, because a disabled timer and a deferring one produce identical
+    evidence otherwise. Before this renderer existed, that WARN only
+    surfaced in the per-machine aggregate ``severity`` (the "FLEET: WARN"
+    footer / coord-tui indicator) and in ``coord health``'s own per-unit
+    detail — an operator reading ``coord doctor``'s printed report, which
+    ``docs/AGENT_OPERATIONS.md`` explicitly points to for this, saw nothing
+    naming which unit was disabled or how to fix it.
+
+    An agent predating #2098 simply has no ``unit_enablement`` entries here,
+    so this renders nothing for it — never a false "clean".
+
+    Pure function — no I/O — so it's testable without a live fleet.
+    """
+    out: list[tuple[bool, str]] = []
+    results = ((health.get("health") or {}).get("results") or [])
+    for r in results:
+        if r.get("check_id") != "unit_enablement":
+            continue
+        severity = r.get("severity")
+        subject = r.get("subject")
+        headroom = r.get("headroom", "")
+        label = f" {subject}" if subject else ""
+        if severity == "warn":
+            out.append((True, f"  ⚠ unit enablement{label}: {headroom}"))
+            detail = r.get("detail")
+            if detail:
+                out.append((True, f"        fix: {detail}"))
+        elif severity == "unknown":
+            out.append((False, f"  ? unit enablement{label}: {headroom}"))
+    return out
+
+
 def _dispatch_blocker_lines_for_config_free(machine, cfg) -> list[tuple[bool, str]]:
     """Real dispatch blockers on a **config-free** agent's machine (#1801).
 
@@ -971,6 +1011,15 @@ def doctor(
         # projected from the machine's own unit_drift H-1 check rather than
         # SSHing in to diff unit files by hand.
         for is_problem, line in _unit_drift_lines(health):
+            click.echo(line)
+            if is_problem:
+                any_problem = True
+
+        # #2098: same class of blind spot as unit_drift immediately above,
+        # but for enablement rather than content — an installed unit that
+        # the manifest says this host should run and that isn't actually
+        # `systemctl --user enable`d.
+        for is_problem, line in _unit_enablement_lines(health):
             click.echo(line)
             if is_problem:
                 any_problem = True
