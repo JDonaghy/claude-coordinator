@@ -1,9 +1,18 @@
 """Resolve which distribution name this install landed under (#2103).
 
 Part of the `claude-coordinator` -> `code-coordinator` rename (epic #2096).
-**This module renames nothing** — `pyproject.toml` still ships as
-`claude-coordinator` — it exists so the rename, whenever it ships, doesn't
-break every already-deployed agent's self-reported version.
+**This module renames nothing** — `pyproject.toml` owns that, and since
+#2104 it says `code-coordinator` — this exists so the rename does not break
+every already-deployed agent's self-reported version.
+
+Read the tense below as historical: the rename has now landed, which makes
+this module *more* load-bearing, not less. Every agent still running a
+pre-#2104 install reports its version out of a `claude-coordinator`
+`.dist-info` and will keep doing so until it has been updated past the
+rename — and `claude-coordinator` is a PyPI tombstone (PyPI cannot rename a
+project) that will never gain another release, so that state is permanent
+for any host nobody upgrades. Do not shorten :data:`CANDIDATE_NAMES` to the
+one name that is now published.
 
 The problem this closes: an agent reports its own version by reading its
 distribution metadata *by name* (`coord/agent_app.py`'s `_installed_version`,

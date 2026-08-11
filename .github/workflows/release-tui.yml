@@ -3,7 +3,7 @@ name: Release coord-tui binaries
 # #1239 (PKG-3): coord-tui is the single biggest "offer it to someone else"
 # gap in this project — today it is `version = "0.1.0"` hardcoded, hand-built
 # with `cargo build`, and copied to ~/.local/bin by hand. There is no
-# distribution channel, so a release of claude-coordinator silently excludes
+# distribution channel, so a release of code-coordinator silently excludes
 # the TUI. This workflow builds coord-tui for linux/mac/windows for a
 # `vX.Y.Z` release and stamps its version from that same tag (matching the
 # Python wheel's setuptools-scm-derived version — see pyproject.toml), so
