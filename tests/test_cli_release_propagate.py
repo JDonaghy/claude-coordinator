@@ -1083,11 +1083,22 @@ def test_roll_python_restarts_sibling_services_after_the_venv_swap(monkeypatch):
     ], "restart-services must be called AFTER update, on the same host"
 
 
-def test_roll_python_stays_ok_when_a_sibling_restart_fails(monkeypatch):
-    """A failed sibling restart does not fail the python lane outright — the
-    venv genuinely did swap. It stays discoverable: the detail says so, and
-    (per test_release_propagate.py's #2069 tests) `coord release verify`'s
-    gate now treats that host's `coord-serve spawns` finding as blocking."""
+def test_roll_python_fails_the_lane_when_a_sibling_restart_fails(monkeypatch):
+    """#2095: this used to stay `ok=True` — "the venv swap itself succeeded"
+    bleeding into "the lane succeeded" — and printed a leading `✓` over a
+    line that itself said `FAILED to restart: coord-serve`. That is what
+    happened for real during the 2026-08-10 0.5.15 -> 0.5.26 roll (coord-web,
+    not coord-serve, but the same code path): the phone dashboard went
+    offline and propagation reported success.
+
+    The venv swap is still named in the detail string — that part really did
+    happen and is still worth recording — but a sibling this run took down
+    and never brought back is a real outage, not a footnote under a `✓`. The
+    old justification for staying green was "`coord release verify` will
+    catch the resulting skew"; it cannot, because verify grades versions, not
+    liveness, and carries no lane for these units at all — see
+    `tests/test_release_propagate.py`'s coord-web-liveness-adjacent tests
+    (there is deliberately no such lane to test)."""
     _stub_agent_update_ok(monkeypatch)
 
     def _fake_post(url, payload, *, timeout):
@@ -1106,10 +1117,17 @@ def test_roll_python_stays_ok_when_a_sibling_restart_fails(monkeypatch):
     ok, detail = release_cmd._roll_python(
         _machine(), target_version="0.4.111", agent_port=7433, timeout=5.0, force=False
     )
-    assert ok, "the venv swap itself succeeded and must still be recorded as such"
+    assert ok is False, (
+        "a sibling this run took down and never brought back must not print "
+        "a `✓` over the lane — see coord/commands/release.py's _roll_python"
+    )
+    assert "now v0.4.111" in detail, "the venv swap itself still happened and is still named"
     assert "FAILED to restart" in detail
     assert "coord-serve" in detail
-    assert "verify" in detail
+    assert "verify" not in detail, (
+        "must not claim `coord release verify` catches this — it has no "
+        "liveness lane for these units at all (#2095)"
+    )
 
 
 def test_roll_python_tolerates_an_agent_that_predates_restart_services(monkeypatch):
@@ -1136,7 +1154,7 @@ def test_restart_sibling_services_reports_a_mix_of_outcomes(monkeypatch):
         calls.append(url)
         # #2069: a mixed outcome with any failed unit is a real HTTP 500 from the
         # endpoint (agent_app.py's restart_services), not a 200 — see the comment
-        # in test_roll_python_stays_ok_when_a_sibling_restart_fails above.
+        # in test_roll_python_fails_the_lane_when_a_sibling_restart_fails above.
         return 500, {"units": {
             "coord-serve": {"restarted": True, "detail": "active"},
             "coord-web": {"restarted": False, "detail": "still deactivating"},
@@ -1152,3 +1170,20 @@ def test_restart_sibling_services_reports_a_mix_of_outcomes(monkeypatch):
     assert "not running here: coord-drive-queue" in detail
     assert "FAILED to restart: coord-web" in detail
     assert calls == ["http://server.tailnet:7433/restart-services"]
+
+
+def test_restart_sibling_services_tolerates_a_pre_2069_agent(monkeypatch):
+    """#2095: HTTP 404 from `/restart-services` means this agent build
+    predates the endpoint (#2069) — there was never a channel here to have
+    restarted anything through, which is a different thing from a channel
+    that existed and failed. Tri-state `None`, not `False`, is what tells
+    `_roll_python` not to fail the lane over it (see
+    test_roll_python_tolerates_an_agent_that_predates_restart_services)."""
+    monkeypatch.setattr(
+        release_cmd, "_post", lambda url, payload, *, timeout: (404, {}, "")
+    )
+    ok, detail = release_cmd._restart_sibling_services(
+        _machine(), agent_port=7433, timeout=5.0
+    )
+    assert ok is None
+    assert "404" in detail

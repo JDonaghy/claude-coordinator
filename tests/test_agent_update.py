@@ -1118,12 +1118,67 @@ class TestRestartSiblingUnit:
             return MagicMock(returncode=0, stdout="active\n", stderr="")
 
         with patch("coord.agent_app.subprocess.run", side_effect=fake_run):
+            # coord-serve has no liveness probe configured (#2095) — "active"
+            # alone still decides it, same as every unit did before that fix.
             ok, detail = _restart_sibling_unit("coord-serve", timeout=5.0)
 
         assert ok is True
         assert detail == "active"
-        assert calls[0] == ["systemctl", "--user", "restart", "coord-serve"]
+        # --no-block (#2095): a BLOCKING `restart` here is the exact bug —
+        # see test_a_stop_that_outlives_the_old_hard_cap_still_succeeds below.
+        assert calls[0] == ["systemctl", "--user", "restart", "--no-block", "coord-serve"]
         assert calls[1] == ["systemctl", "--user", "is-active", "coord-serve"]
+
+    def test_a_stop_that_outlives_the_old_hard_cap_still_succeeds(self, monkeypatch) -> None:
+        """#2095 — pins the fix directly against the 2026-08-10 incident.
+
+        The OLD code ran a BLOCKING ``systemctl restart <unit>`` under a
+        hardcoded ``subprocess.run(..., timeout=15)``. coord-web (#700)
+        serves ``text/event-stream``, and a connected browser/phone PWA
+        holds systemd's stop open past 15s routinely — `subprocess.run`
+        raised ``TimeoutExpired``, and the caller reported failure with the
+        unit already abandoned mid-stop (worse than not touching it: it was
+        left STOPPED, not restarted).
+
+        This test FAILS against that code: the fake below raises
+        ``TimeoutExpired`` for exactly the call shape the old code made (a
+        blocking ``restart`` with no ``--no-block``), standing in for a stop
+        that outlives whatever timeout it's given. The fix must not make
+        that call at all — ``--no-block`` returns the instant the job is
+        QUEUED, and the ``is-active`` poll loop (already looping through a
+        couple of ``deactivating`` ticks below, simulating the SSE-holding
+        old process) is what actually decides the outcome now.
+        """
+        from coord.agent_app import _restart_sibling_unit
+
+        calls: list[list[str]] = []
+        polls = {"n": 0}
+
+        def fake_run(cmd, *, timeout=None, **kwargs):
+            calls.append(cmd)
+            if cmd[:3] == ["systemctl", "--user", "restart"] and "--no-block" not in cmd:
+                raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout)
+            if cmd[:4] == ["systemctl", "--user", "restart", "--no-block"]:
+                return MagicMock(returncode=0, stdout="", stderr="")
+            polls["n"] += 1
+            state = "deactivating" if polls["n"] <= 2 else "active"
+            return MagicMock(returncode=0, stdout=f"{state}\n", stderr="")
+
+        with (
+            patch("coord.agent_app.subprocess.run", side_effect=fake_run),
+            patch("coord.agent_app.time.sleep"),
+        ):
+            # coord-serve: no liveness probe configured, isolates this test
+            # from the separate #2095 liveness-probe behaviour pinned below.
+            ok, detail = _restart_sibling_unit("coord-serve", timeout=5.0)
+
+        assert ok is True, (
+            "a stop that outlives the old 15s hard cap must not fail the "
+            "restart — the fix is to stop imposing that cap in the first "
+            "place, not to raise it"
+        )
+        assert detail == "active"
+        assert calls[0] == ["systemctl", "--user", "restart", "--no-block", "coord-serve"]
 
     def test_a_restart_command_that_fails_never_polls(self, monkeypatch) -> None:
         from coord.agent_app import _restart_sibling_unit
@@ -1165,6 +1220,178 @@ class TestRestartSiblingUnit:
 
         assert ok is False
         assert "no systemctl" in detail
+
+    def test_a_unit_systemd_already_marked_failed_does_not_wait_out_the_deadline(
+        self, monkeypatch
+    ) -> None:
+        """A small #2095 improvement alongside `--no-block`: once systemd
+        itself says `failed`, waiting out the rest of `timeout` learns
+        nothing new. Proven with a huge timeout that a slow test would
+        otherwise have to actually wait through."""
+        from coord.agent_app import _restart_sibling_unit
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:3] == ["systemctl", "--user", "restart"]:
+                return MagicMock(returncode=0, stdout="", stderr="")
+            return MagicMock(returncode=0, stdout="failed\n", stderr="")
+
+        with patch("coord.agent_app.subprocess.run", side_effect=fake_run):
+            ok, detail = _restart_sibling_unit("coord-drive-queue", timeout=300.0)
+
+        assert ok is False
+        assert "failed" in detail
+
+
+class TestSiblingLivenessProbe:
+    """#2095: `is-active` proves the process exists, not that it is
+    answering. coord-web's whole job is answering HTTP GETs, so — for that
+    unit only — `_restart_sibling_unit` also requires a GET against it to
+    succeed before calling the restart a success. Every other sibling unit
+    has no probe configured and keeps the pre-#2095 `is-active`-only
+    behaviour (see `TestRestartSiblingUnit` above)."""
+
+    def test_a_unit_with_no_configured_probe_is_unaffected(self) -> None:
+        from coord.agent_app import _probe_liveness
+
+        assert _probe_liveness("coord-serve") is None
+        assert _probe_liveness("coord-drive-queue") is None
+
+    def test_active_but_not_answering_fails_the_restart(self, monkeypatch) -> None:
+        """The gate this closes: systemd can report `active` for a coord-web
+        process that is up but not yet serving (or crash-looping moments
+        later) — before #2095 that state alone was trusted outright, a
+        verdict nothing could make fail. Pinned here with a probe that never
+        recovers, so only the deadline — not a false `active` — decides."""
+        from coord.agent_app import _restart_sibling_unit
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:3] == ["systemctl", "--user", "restart"]:
+                return MagicMock(returncode=0, stdout="", stderr="")
+            return MagicMock(returncode=0, stdout="active\n", stderr="")
+
+        def fake_probe(unit, *, timeout=5.0):
+            assert unit == "coord-web"
+            return False, "active, but not answering GET /api/pipeline: boom"
+
+        with (
+            patch("coord.agent_app.subprocess.run", side_effect=fake_run),
+            patch("coord.agent_app._probe_liveness", side_effect=fake_probe),
+            patch("coord.agent_app.time.sleep"),
+        ):
+            ok, detail = _restart_sibling_unit("coord-web", timeout=0.01)
+
+        assert ok is False
+        assert "not answering" in detail
+
+    def test_active_and_answering_is_a_real_success(self, monkeypatch) -> None:
+        from coord.agent_app import _restart_sibling_unit
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:3] == ["systemctl", "--user", "restart"]:
+                return MagicMock(returncode=0, stdout="", stderr="")
+            return MagicMock(returncode=0, stdout="active\n", stderr="")
+
+        def fake_probe(unit, *, timeout=5.0):
+            assert unit == "coord-web"
+            return True, "active and answering GET /api/pipeline (HTTP 200)"
+
+        with (
+            patch("coord.agent_app.subprocess.run", side_effect=fake_run),
+            patch("coord.agent_app._probe_liveness", side_effect=fake_probe),
+        ):
+            ok, detail = _restart_sibling_unit("coord-web", timeout=5.0)
+
+        assert ok is True
+        assert "answering" in detail
+
+    def test_probe_retries_within_the_deadline_before_giving_up(self, monkeypatch) -> None:
+        """`active` but not yet answering is not necessarily terminal — a
+        freshly-started process may still be binding its socket. The probe
+        gets to run again on the next `is-active` tick, within the same
+        deadline `_restart_sibling_unit` already polls against."""
+        from coord.agent_app import _restart_sibling_unit
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:3] == ["systemctl", "--user", "restart"]:
+                return MagicMock(returncode=0, stdout="", stderr="")
+            return MagicMock(returncode=0, stdout="active\n", stderr="")
+
+        probes = [
+            (False, "active, but not answering GET /api/pipeline: still binding"),
+            (True, "active and answering GET /api/pipeline (HTTP 200)"),
+        ]
+
+        def fake_probe(unit, *, timeout=5.0):
+            return probes.pop(0)
+
+        with (
+            patch("coord.agent_app.subprocess.run", side_effect=fake_run),
+            patch("coord.agent_app._probe_liveness", side_effect=fake_probe),
+            patch("coord.agent_app.time.sleep"),
+        ):
+            ok, detail = _restart_sibling_unit("coord-web", timeout=5.0)
+
+        assert ok is True
+        assert "answering" in detail
+        assert probes == []
+
+    def test_probe_hits_a_real_http_server_on_the_configured_port(self, monkeypatch) -> None:
+        """Not everything above should be mocked all the way down — this
+        exercises `_probe_liveness`'s actual HTTP mechanics against a real
+        (if trivial) local server, so the mocked unit tests above aren't the
+        only evidence the GET itself works."""
+        import http.server
+        import threading
+
+        from coord.agent_app import _probe_liveness
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                if self.path == "/api/pipeline":
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b"{}")
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def log_message(self, *args):  # silence test output
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            monkeypatch.setenv("COORD_WEB_PORT", str(server.server_address[1]))
+            ok, detail = _probe_liveness("coord-web")
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+
+        assert ok is True
+        assert "HTTP 200" in detail
+
+    def test_probe_reports_a_real_connection_failure(self, monkeypatch) -> None:
+        """No server listening at all (the exact incident: `curl` refused
+        the connection outright) must be reported as a failed liveness
+        probe, not raise out of `_restart_sibling_unit`."""
+        import socket
+
+        from coord.agent_app import _probe_liveness
+
+        # A bound-then-closed port: nothing is listening there, and the
+        # connection is refused immediately rather than timing out — keeps
+        # this test fast without needing a fake unreachable host.
+        probe_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        probe_sock.bind(("127.0.0.1", 0))
+        port = probe_sock.getsockname()[1]
+        probe_sock.close()
+
+        monkeypatch.setenv("COORD_WEB_PORT", str(port))
+        ok, detail = _probe_liveness("coord-web", timeout=1.0)
+
+        assert ok is False
+        assert "not answering" in detail
 
 
 # ── CLI: coord agent update / restart ─────────────────────────────────────

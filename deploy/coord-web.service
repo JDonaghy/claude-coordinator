@@ -65,6 +65,29 @@
 # before/after version proof this was verified against.
 #
 # See docs/AGENT_OPERATIONS.md → "Web dashboard (coord web)".
+#
+# TimeoutStopSec / KillMode (#2095): coord-web serves `text/event-stream`
+# endpoints (coord/dashboard/server.py), and uvicorn's graceful shutdown
+# waits for every open connection to drain. An SSE stream does not close on
+# its own — a browser tab or the phone PWA left open holds the stop open
+# INDEFINITELY, past any timeout a restart caller is willing to wait. During
+# the 2026-08-10 0.5.15 -> 0.5.26 roll that left the unit `deactivating` for
+# the run's entire wait, which the caller (coord/agent_app.py's
+# `_restart_sibling_unit`, at the time a blocking `systemctl restart` under
+# a hard 15s subprocess timeout) turned into an abandoned mid-stop unit:
+# not restarted — STOPPED — while still being reported a success one layer
+# up. Bounding the stop HERE, at the unit, means systemd escalates to
+# SIGKILL on its own after TimeoutStopSec regardless of what any caller's
+# own timeout is doing, instead of leaving an open-ended wait for a client
+# that may never disconnect. KillMode=process (rather than the default
+# control-group) targets only the main uvicorn process — sidestepping the
+# same recovery failure the incident hit by hand afterwards
+# (`systemctl --user kill -s SIGKILL coord-web` refused with "Failed to send
+# signal SIGKILL to auxiliary processes: Invalid argument") — and follows
+# the KillMode precedent already established on coord-drive-queue.service
+# (#1830), even though the underlying reason differs (that one protects a
+# spawned tmux server from this unit's own cgroup teardown; this one avoids
+# ever having to signal a nonexistent auxiliary process group at all).
 
 [Unit]
 Description=coord web — phone/web control-center dashboard (#700)
@@ -82,6 +105,10 @@ ExecStart=%h/.coord-venv/bin/coord web --config %h/.coord/coordinator.yml --host
 Environment=TERM=xterm-256color
 Restart=on-failure
 RestartSec=3
+# #2095 — see the header comment above. Bounds the SSE-drain hang that took
+# the dashboard down during the 2026-08-10 fleet roll.
+TimeoutStopSec=10
+KillMode=process
 
 [Install]
 WantedBy=default.target
