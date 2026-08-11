@@ -255,13 +255,26 @@ def _resolved_from_installed_wheel(tmp_path: Path, clone: Path, slot: str) -> tu
     # as test_version_single_source.py's `_cli_version_from_wheel`:
     # sys.path[0] (the cwd `-c` adds) must not shadow the installed copy
     # with this checkout's own source tree.
+    #
+    # `-S` (skip the `site` module): the probe models a host whose ONLY
+    # coordinator install is the wheel in `install_dir`, but without `-S`
+    # the outer interpreter's site-packages stays on `sys.path` — and in CI
+    # that site-packages contains this checkout itself (`pip install -e
+    # ".[dev]"`), i.e. a `code-coordinator` dist-info that
+    # `resolve_installed()` rightly prefers over the legacy name. That
+    # leak made the `claude-coordinator` slot resolve the AMBIENT editable
+    # install (`code-coordinator <scm dev version>`) instead of the wheel
+    # just installed under test. PYTHONPATH is still honored under `-S`,
+    # so `install_dir` remains the only importable/discoverable install;
+    # the probe only needs stdlib beyond that (`coord/__init__.py`'s
+    # module-scope imports are stdlib-only by design — see its NOTE).
     neutral_cwd = tmp_path / f"cwd_{slot}"
     neutral_cwd.mkdir()
     env = dict(os.environ)
     env["PYTHONPATH"] = str(install_dir)
     result = _run(
         [
-            sys.executable, "-c",
+            sys.executable, "-S", "-c",
             "from coord.dist_name import resolve_installed\n"
             "r = resolve_installed()\n"
             "print(f'{r.name} {r.version}')\n",
