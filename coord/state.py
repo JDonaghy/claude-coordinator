@@ -667,11 +667,13 @@ def _dispatch_target_config():
     return _config.load()
 
 
-def _validate_dispatch_target(*, repo_name: str, machine_name: str) -> None:
+def _validate_dispatch_target(
+    *, repo_name: str, machine_name: str, config=None
+) -> None:
     """Refuse to persist an assignment naming a repo/machine that isn't in
     the loaded ``coordinator.yml`` (#2087). Raises
     :class:`UnknownDispatchTargetError` naming the unknown value; a no-op
-    when :func:`_dispatch_target_config` opts out (``None``).
+    when the resolved config opts out (``None``).
 
     Deliberately checks against the loaded config rather than a hardcoded
     machine/repo list — an ephemeral worker (e.g. an Azure box mid-provision)
@@ -679,8 +681,27 @@ def _validate_dispatch_target(*, repo_name: str, machine_name: str) -> None:
     other machine. There is no bypass flag: if a real need to dispatch to an
     unregistered host ever shows up, that should be a deliberate, explicit
     opt-in added then — not a silently-permissive default now.
+
+    ``config``, when given, is used AS-IS — no reload. This lets a caller
+    that already holds an authoritative, request-scoped
+    :class:`~coord.config.Config` (the daemon's HTTP handlers, which
+    `build_app` closes over one already-loaded `config`) pass it straight
+    through instead of this function falling back to
+    :func:`_dispatch_target_config`'s independent `coord.config.load()`
+    (#2087 review, non-blocking finding 1). Two reasons that matters beyond
+    the redundant disk I/O on every dispatch write: (1) `coordinator.yml`
+    edits require a `coord-serve` restart to take effect for the rest of the
+    daemon's request handling (documented deploy gotcha) — an independently
+    reloaded config here would see an edited file immediately, opening a
+    narrow window where the validation gate and the rest of the daemon
+    momentarily disagree about what's configured; (2) it's simply the
+    correct semantics — validate against the config that will actually
+    govern this request, not a freshly re-read one that might differ by the
+    time the read completes. Callers without a ready-loaded Config in scope
+    (CLI writers, tests) omit it and fall back to
+    :func:`_dispatch_target_config`'s seam, unchanged from before.
     """
-    cfg = _dispatch_target_config()
+    cfg = config if config is not None else _dispatch_target_config()
     if cfg is None:
         return
     if cfg.repo(repo_name) is None:
@@ -813,6 +834,7 @@ def _record_dispatched_local(
     proposal: Proposal,
     repo_github: str,
     provider_name: str | None = None,
+    config=None,
 ) -> None:
     """Record a newly dispatched assignment in the assignments table.
 
@@ -823,11 +845,17 @@ def _record_dispatched_local(
         provider_name: The *resolved* provider name (after the spec > repo >
             default precedence chain).  ``None`` for callers that predate
             #324 — the TUI shows the implicit default ("claude") when NULL.
+        config: optional already-loaded :class:`~coord.config.Config` to
+            validate against — see :func:`_validate_dispatch_target`'s
+            docstring. The daemon's ``/dispatched-work`` handler passes its
+            own in-scope config; other callers omit it.
     """
     # #2087: refuse before any side effect — see _validate_dispatch_target's
     # docstring for the incident this closes.
     _validate_dispatch_target(
-        repo_name=proposal.repo_name, machine_name=proposal.machine_name
+        repo_name=proposal.repo_name,
+        machine_name=proposal.machine_name,
+        config=config,
     )
 
     # #706: compute the deterministic branch name at dispatch time so the row
@@ -919,12 +947,21 @@ def _record_dispatched_assignment_local(
     *,
     assignment: Assignment,
     repo_github: str,
+    config=None,
 ) -> None:
-    """Record a dispatched assignment (review, smoke, retry) from an Assignment object."""
+    """Record a dispatched assignment (review, smoke, retry) from an Assignment object.
+
+    ``config``: optional already-loaded :class:`~coord.config.Config` to
+    validate against — see :func:`_validate_dispatch_target`'s docstring.
+    The daemon's ``/dispatched`` handler passes its own in-scope config;
+    other callers omit it.
+    """
     # #2087: refuse before any side effect — see _validate_dispatch_target's
     # docstring for the incident this closes.
     _validate_dispatch_target(
-        repo_name=assignment.repo_name, machine_name=assignment.machine_name
+        repo_name=assignment.repo_name,
+        machine_name=assignment.machine_name,
+        config=config,
     )
 
     conn = get_connection()
@@ -3084,22 +3121,57 @@ def load_plans() -> dict[str, dict]:
 
 # ── Board persistence ──────────────────────────────────────────────────────────
 
-def save_board(board: Board) -> Path:
+def save_board(board: Board, *, config=None) -> Path:
     """Persist the board to the database.
 
     Note: this function mutates assignments that lack an ``assignment_id``,
     generating a deterministic fallback ID and writing it back to the
     assignment object in-place.
+
+    #2087 (fix-review finding 1): validates ``repo_name``/``machine_name``
+    for genuinely NEW rows — an ``assignment_id`` not already present in the
+    ``assignments`` table — before writing. `_record_dispatched_local` /
+    `_record_dispatched_assignment_local` already validate every INSERT they
+    make, but `_UPSERT_SQL` (below) is a SECOND, distinct path to the same
+    table: the daemon's generic `/board` thin-client endpoint (backing
+    `assign`/`approve`/`stop`/`retry`/`resume`/`bounce`/`done`/`pr`/…, the
+    dashboard, and `auto_loop`) reaches it, and for a brand-new
+    `assignment_id` its `INSERT` branch writes whatever `repo_name`/
+    `machine_name` the caller's `Board` carries with no gate at all — an
+    unvalidated write straight through the "write every writer passes"
+    waist this issue's fix otherwise closed. Existing rows are deliberately
+    exempt from this check: `_UPSERT_SQL`'s `ON CONFLICT DO UPDATE` never
+    touches `machine_name`/`repo_name` (so a row already in the table can't
+    be corrupted through this path), and validating them anyway would wrongly
+    block a stale-snapshot `save_board()` call from carrying forward a row's
+    OTHER columns (status, pr_url, …) after its repo/machine was legitimately
+    dispatched earlier and has since been trimmed from `coordinator.yml`.
+
+    ``config``: optional already-loaded :class:`~coord.config.Config` to
+    validate against instead of an independent reload — see
+    :func:`_validate_dispatch_target`'s docstring. The daemon's `/board`
+    handler passes its own in-scope config; other callers omit it.
     """
     _thin_client_local_board_guard("save_board")
     conn = get_connection()
     with conn:
+        existing_ids = {
+            row[0] for row in conn.execute("SELECT assignment_id FROM assignments")
+        }
         for a in board.active + board.completed:
             if not a.assignment_id:
                 # Generate a deterministic fallback ID for assignments that were
                 # created without one (e.g. directly in tests).
                 a.assignment_id = (
                     f"anon-{a.machine_name}-{a.repo_name}-{a.issue_number}"
+                )
+            if a.assignment_id not in existing_ids:
+                # #2087: refuse before any side effect — a genuinely new row,
+                # same gate as the dispatch-time INSERT writers.
+                _validate_dispatch_target(
+                    repo_name=a.repo_name,
+                    machine_name=a.machine_name,
+                    config=config,
                 )
             conn.execute(_UPSERT_SQL, _assignment_upsert_params(a))
         # NOTE: we intentionally never DELETE here.  The assignments table is

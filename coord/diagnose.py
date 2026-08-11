@@ -1358,6 +1358,19 @@ def _cleanup_issue(
     only a *recommendation* — ``needs_reset=True`` plus a finding telling the
     operator to re-run with ``--reset`` — unless ``--reset`` was already
     passed, in which case the existing finalize behaviour is unchanged.
+
+    #2087 (fix-review nit): a sibling row on an unconfigured machine is a
+    phantom too, by the same reasoning ``diagnose_stage`` already applies to
+    the row it was explicitly asked about — but ``_session_state`` reports
+    "unknown" (not "dead") for it, since a machine that isn't in
+    ``coordinator.yml`` can't be probed at all. Before this, that "unknown"
+    made this sweep silently skip it: a milestone tracking issue with a
+    ``work`` row *and* a sibling ``smoke`` row, both on the same
+    unconfigured machine, diagnosed with ``--stage work``, reported the
+    ``work`` row correctly but said nothing about the ``smoke`` sibling.
+    Flag it the same way regardless of session probe result — reuses
+    ``_finalize_dead``, already safe for an unconfigured machine (no host to
+    probe/ssh into; see ``_do_reset``'s identical use for the targeted row).
     """
     skip = skip_ids or set()
     for a in (board.active + board.completed):
@@ -1367,9 +1380,19 @@ def _cleanup_issue(
             continue
         if a.status not in ("running", "pending"):
             continue
-        if _session_state(a, config) != "dead":
+        machine_unconfigured = (
+            bool(a.machine_name) and _resolve_machine(config, a.machine_name) is None
+        )
+        if not machine_unconfigured and _session_state(a, config) != "dead":
             continue
-        res.findings.append(f"cleanup: phantom {a.type} row {a.assignment_id} (session dead)")
+        if machine_unconfigured:
+            res.findings.append(
+                f"cleanup: phantom {a.type} row {a.assignment_id} — machine "
+                f"{a.machine_name!r} is not a configured machine (not in "
+                "coordinator.yml)"
+            )
+        else:
+            res.findings.append(f"cleanup: phantom {a.type} row {a.assignment_id} (session dead)")
         if not reset:
             res.findings.append(
                 f"cleanup: would finalize phantom {a.type} row {a.assignment_id} "
