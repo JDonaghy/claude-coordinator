@@ -28,11 +28,17 @@ import subprocess
 import sys
 from pathlib import Path
 
+from coord.dist_name import CANDIDATE_NAMES
 from coord.health.models import CheckResult, HealthContext, Severity
 from coord.health.registry import COST_NETWORK, check
 from coord.health.units import expand, shorten_path
 
-PROJECT = "claude-coordinator"
+#: #2103: kept only for messages that need "a name" rather than "the
+#: installed name" (e.g. the ``description=`` strings below, which are
+#: static and evaluated before any probe runs). Everything that actually
+#: probes the venv tries every name in :data:`CANDIDATE_NAMES`, preferring
+#: whichever the rename (#2096) is currently shipping.
+PROJECT = CANDIDATE_NAMES[0]
 
 # Where install-agent.sh puts the agent's venv.  Overridable via
 # `health.agent_venv_python`.
@@ -55,23 +61,41 @@ def resolve_agent_python(ctx: HealthContext) -> Path:
     return Path(sys.executable)
 
 
-def pip_show(python: Path, *, timeout: float = 8.0) -> dict[str, str]:
-    """Parse ``<python> -m pip show claude-coordinator`` into a field dict.
+def pip_show(
+    python: Path, names: tuple[str, ...] = CANDIDATE_NAMES, *, timeout: float = 8.0
+) -> dict[str, str]:
+    """Parse ``<python> -m pip show <name>`` into a field dict, trying each
+    of *names* in order and returning the first that resolves (#2103).
 
-    Returns ``{}`` when pip isn't there or the package isn't installed.
+    The agent venv this probes may have either ``claude-coordinator`` or
+    ``code-coordinator`` installed depending which side of the #2096 rename
+    it's on — a bare single-name ``pip show`` would report "not installed"
+    for a fully-updated `code-coordinator` agent. The returned dict's
+    ``Name`` field (``pip show`` always prints one) tells the caller which
+    one actually matched.
+
+    Returns ``{}`` when pip isn't there or neither name is installed.
     Raises only for genuinely unexpected conditions — the probe wrapping this
     fails soft either way.
     """
-    result = subprocess.run(
-        [str(python), "-m", "pip", "show", PROJECT],
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
-    if result.returncode != 0:
-        return {}
+    for name in names:
+        result = subprocess.run(
+            [str(python), "-m", "pip", "show", name],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if result.returncode != 0:
+            continue
+        fields = _parse_pip_show(result.stdout)
+        if fields:
+            return fields
+    return {}
+
+
+def _parse_pip_show(stdout: str) -> dict[str, str]:
     fields: dict[str, str] = {}
-    for line in result.stdout.splitlines():
+    for line in stdout.splitlines():
         key, sep, value = line.partition(":")
         if sep:
             fields[key.strip()] = value.strip()
@@ -100,11 +124,12 @@ def probe_agent_venv(ctx: HealthContext) -> CheckResult:
         )
 
     if not fields:
+        tried = " or ".join(CANDIDATE_NAMES)
         return CheckResult(
             check_id="agent_venv",
             scope="machine",
             severity=Severity.UNKNOWN,
-            headroom=f"{PROJECT} not installed for {shorten_path(str(python), str(ctx.home))}",
+            headroom=f"neither {tried} installed for {shorten_path(str(python), str(ctx.home))}",
             error="pip show returned nothing",
             values={"python": str(python)},
         )
@@ -182,9 +207,16 @@ def probe_agent_version(ctx: HealthContext) -> CheckResult:
             values={"python": str(python)},
         )
 
+    # #2103: query PyPI for whichever name `pip show` actually matched, not
+    # a hardcoded one — `code-coordinator` and `claude-coordinator` are
+    # separate PyPI projects with separate release histories, and comparing
+    # a `code-coordinator` install's version against `claude-coordinator`'s
+    # index would compute nonsense skew.
+    installed_project = fields.get("Name") or PROJECT
+
     try:
         latest, finals = latest_release(
-            PROJECT,
+            installed_project,
             index_url=th.pypi_index_url,
             timeout=th.network_timeout_secs,
         )
@@ -195,7 +227,11 @@ def probe_agent_version(ctx: HealthContext) -> CheckResult:
             severity=Severity.UNKNOWN,
             headroom=f"installed {installed_raw}, PyPI index unreachable",
             error=f"{type(exc).__name__}: {exc}",
-            values={"python": str(python), "installed": installed_raw},
+            values={
+                "python": str(python),
+                "installed": installed_raw,
+                "project": installed_project,
+            },
         )
 
     installed = parse_version(installed_raw)
@@ -234,6 +270,7 @@ def probe_agent_version(ctx: HealthContext) -> CheckResult:
         values={
             "python": str(python),
             "installed": installed_raw,
+            "project": installed_project,
             "latest": latest.raw,
             "releases_behind": behind,
             "index_url": th.pypi_index_url,

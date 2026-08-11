@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from importlib.metadata import Distribution, PackageNotFoundError
-from importlib.metadata import version as _pkg_version
+from importlib.metadata import Distribution
 from typing import TYPE_CHECKING
+
+from coord.dist_name import CANDIDATE_NAMES, DistributionNotFoundError, resolve_installed
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -115,13 +116,21 @@ def _live_scm_version(root: Path) -> str | None:
         return None
 
 
-def _resolve_version(dist_name: str) -> str:
+def _resolve_version(names: tuple[str, ...] = CANDIDATE_NAMES) -> str:
     """#1238: single-sourced from the installed package's metadata, which
     setuptools-scm stamps from the git tag at build time (see
     ``[tool.setuptools_scm]`` in pyproject.toml) — this is the ONLY place
     ``__version__`` is computed. No other source file may hardcode a
     version literal; a release is just ``git tag vX.Y.Z && git push origin
     vX.Y.Z``.
+
+    #2103: resolves through :func:`coord.dist_name.resolve_installed` rather
+    than a single hardcoded distribution name — ``__version__`` is what
+    ``/health``'s ``"version"`` field reports, which is the *only* field
+    ``coord agent update``'s polling loop keys off of to decide a machine
+    "came back". A bare ``claude-coordinator``-only lookup would degrade to
+    ``"0+unknown"`` forever on any machine that has ``code-coordinator``
+    installed instead, faking a fleet-wide "did not come back".
 
     #2010: for a wheel install that metadata is always correct — it's a
     frozen snapshot of a build that just happened. For an *editable*
@@ -148,20 +157,20 @@ def _resolve_version(dist_name: str) -> str:
     ``coord`` in a tight loop from such a checkout.
     """
     try:
-        installed_version = _pkg_version(dist_name)
-    except PackageNotFoundError:
-        # Not an installed package at all (e.g. `python -c "import coord"`
-        # run directly against a source checkout that was never
-        # `pip install`'d) — degrade to an obviously-not-a-release string
-        # rather than raising.
+        resolved = resolve_installed(names)
+    except DistributionNotFoundError:
+        # Neither candidate name is an installed package at all (e.g.
+        # `python -c "import coord"` run directly against a source
+        # checkout that was never `pip install`'d) — degrade to an
+        # obviously-not-a-release string rather than raising.
         return "0+unknown"
 
-    root = _editable_source_root(dist_name)
+    root = _editable_source_root(resolved.name)
     if root is not None:
         scm_version = _live_scm_version(root)
         if scm_version is not None:
             return scm_version
-    return installed_version
+    return resolved.version
 
 
-__version__ = _resolve_version("claude-coordinator")
+__version__ = _resolve_version()

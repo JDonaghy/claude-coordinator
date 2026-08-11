@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -19,10 +20,12 @@ from starlette.routing import Route
 
 from coord import __version__, agent_update
 from coord.agent import RUNNING, PENDING, AgentAssignment, AgentServer, AssignmentSpec
-from coord.dist_name import resolve_installed, resolve_installed_name
+from coord.dist_name import DistributionNotFoundError, resolve_installed, resolve_installed_name
 from coord.dist_name import pkg_spec as _dist_pkg_spec
 from coord.events import stream_assignment_log
 from coord.openapi import build_spec, dataclass_schema, openapi_and_docs_routes
+
+_log = logging.getLogger(__name__)
 
 
 def _agent_pkg_spec() -> str:
@@ -82,10 +85,21 @@ def _installed_version() -> str | None:
     under the name this process doesn't query used to make a fully-updated
     agent report ``None`` here, the exact false negative behind the
     fleet's most-recurring `✗ did not come back`.
+
+    This is a *report* site, not an *act* site (contrast `_agent_pkg_spec`,
+    which deliberately lets `DistributionNotFoundError` propagate): callers
+    already fall back to the literal string `"unknown"` when this returns
+    `None`, so "neither name resolved" isn't silently swallowed end to end
+    — but it's still logged here, naming both names tried, rather than
+    disappearing into a bare `None` with no trace of why.
     """
     try:
         return resolve_installed().version
+    except DistributionNotFoundError as exc:
+        _log.warning("could not determine installed version: %s", exc)
+        return None
     except Exception:
+        _log.exception("unexpected error resolving installed version")
         return None
 
 

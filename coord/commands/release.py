@@ -170,12 +170,10 @@ def _resolve_expected(expected: str | None, *, use_pypi: bool, index_url: str,
         return expected.lstrip("v"), None
     if not use_pypi:
         return None, None
-    from coord.health.pypi import latest_release  # noqa: PLC0415
+    from coord.health.pypi import latest_release_any  # noqa: PLC0415
 
     try:
-        latest, _all = latest_release(
-            "claude-coordinator", index_url=index_url, timeout=timeout
-        )
+        _project, latest, _all = latest_release_any(index_url=index_url, timeout=timeout)
     except Exception as exc:  # noqa: BLE001 — read-only, degrade to skew-only
         return None, f"could not read the PyPI simple index ({exc}); checking skew only"
     if latest is None:

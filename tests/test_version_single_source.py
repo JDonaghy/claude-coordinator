@@ -86,37 +86,63 @@ def _not_editable():
 class TestVersionMetadataFallback:
     """`coord.__version__` must be read from installed package metadata —
     never a hardcoded literal — and degrade to `"0+unknown"` rather than
-    raising when the package isn't installed at all."""
+    raising when neither candidate distribution is installed.
+
+    #2103: `__version__` now resolves via `coord.dist_name.resolve_installed`
+    (tries `code-coordinator` then falls back to `claude-coordinator`)
+    rather than a single hardcoded `importlib.metadata.version("claude-
+    coordinator")` call, so these patch `coord.dist_name._pkg_version` —
+    the one `importlib.metadata.version` call `resolve_installed` actually
+    makes — rather than `importlib.metadata.version` itself. Patching the
+    latter would silently no-op: `coord.dist_name` imported `version` as
+    `_pkg_version` at its own module-import time (`from importlib.metadata
+    import version as _pkg_version`), a separate reference to the same
+    function object that a patch of `importlib.metadata.version` does not
+    retroactively rebind.
+    """
 
     def teardown_method(self) -> None:
         # Every test here reloads `coord` with a patched
-        # `importlib.metadata.version`; put the real module state back so
+        # `coord.dist_name._pkg_version`; put the real module state back so
         # nothing later in the suite observes a mocked __version__.
         importlib.reload(coord)
 
     def test_version_comes_from_installed_metadata(self) -> None:
-        with patch("importlib.metadata.version", return_value="7.8.9"), _not_editable():
+        with patch("coord.dist_name._pkg_version", return_value="7.8.9"), _not_editable():
             importlib.reload(coord)
             assert coord.__version__ == "7.8.9"
 
-    def test_falls_back_when_package_not_installed(self) -> None:
+    def test_falls_back_when_neither_name_installed(self) -> None:
         from importlib.metadata import PackageNotFoundError
 
         def _raise(name: str) -> str:
             raise PackageNotFoundError(name)
 
-        with patch("importlib.metadata.version", side_effect=_raise), _not_editable():
+        with patch("coord.dist_name._pkg_version", side_effect=_raise), _not_editable():
             importlib.reload(coord)
             assert coord.__version__ == "0+unknown"
 
-    def test_queries_metadata_for_this_exact_package_name(self) -> None:
-        """A typo'd or renamed lookup key would silently always hit the
-        PackageNotFoundError fallback and no test would notice — pin the
-        argument, not just the outcome."""
-        with patch("importlib.metadata.version", return_value="1.2.3") as mock_version, \
-                _not_editable():
+    def test_queries_code_coordinator_before_claude_coordinator(self) -> None:
+        """#2103: `code-coordinator` (the name the eventual #2096 rename
+        publishes under) is tried first; `claude-coordinator` is the
+        fallback for an install that hasn't been renamed yet. Pin the
+        resolution order and which name actually won, not just the
+        outcome — a typo'd or reordered lookup would otherwise go
+        unnoticed here."""
+        from importlib.metadata import PackageNotFoundError
+
+        def _only_claude_coordinator_installed(name: str) -> str:
+            if name == "claude-coordinator":
+                return "1.2.3"
+            raise PackageNotFoundError(name)
+
+        with patch(
+            "coord.dist_name._pkg_version", side_effect=_only_claude_coordinator_installed,
+        ) as mock_version, _not_editable():
             importlib.reload(coord)
-            mock_version.assert_called_once_with("claude-coordinator")
+            assert coord.__version__ == "1.2.3"
+            mock_version.assert_any_call("code-coordinator")
+            mock_version.assert_called_with("claude-coordinator")
 
 
 class TestEditableSourceRoot:
@@ -226,25 +252,37 @@ def _run_git(args: list[str], cwd: Path) -> None:
 class TestResolveVersion:
     """#2010: `_resolve_version` end to end — editable installs prefer a
     live version over stale metadata; non-editable installs never
-    consult git at all."""
+    consult git at all.
+
+    #2103: `_resolve_version` now takes a tuple of candidate distribution
+    names (default `coord.dist_name.CANDIDATE_NAMES`) and resolves through
+    `coord.dist_name.resolve_installed` rather than a single hardcoded
+    name string — these pass a single-element tuple to keep exercising
+    the #2010 editable/live-version behavior in isolation from the
+    two-name resolution order, which `TestVersionMetadataFallback` and
+    `tests/test_dist_name.py` already cover directly. Patch
+    `coord.dist_name._pkg_version`, not `coord._pkg_version` — the latter
+    no longer exists in `coord/__init__.py`'s namespace since #2103 moved
+    the `importlib.metadata.version` call into `coord.dist_name`.
+    """
 
     def test_non_editable_install_ignores_live_version_entirely(self, tmp_path: Path) -> None:
         """A non-editable install must not even attempt a live lookup — if
         it did, this test's `_live_scm_version` stub returning a live
         value instead of the metadata would go unnoticed."""
-        with patch("coord._pkg_version", return_value="0.5.1"), _not_editable(), \
+        with patch("coord.dist_name._pkg_version", return_value="0.5.1"), _not_editable(), \
                 patch("coord._live_scm_version", return_value="9.9.9-should-not-be-used"):
-            assert _resolve_version("claude-coordinator") == "0.5.1"
+            assert _resolve_version(("claude-coordinator",)) == "0.5.1"
 
     def test_editable_install_prefers_live_version_over_stale_metadata(
         self, tmp_path: Path
     ) -> None:
         root = tmp_path / "checkout"
         root.mkdir()
-        with patch("coord._pkg_version", return_value="0.1.0"), \
+        with patch("coord.dist_name._pkg_version", return_value="0.1.0"), \
                 patch("coord._editable_source_root", return_value=root), \
                 patch("coord._live_scm_version", return_value="0.5.1"):
-            assert _resolve_version("claude-coordinator") == "0.5.1"
+            assert _resolve_version(("claude-coordinator",)) == "0.5.1"
 
     def test_editable_install_falls_back_to_metadata_when_live_lookup_fails(
         self, tmp_path: Path
@@ -254,10 +292,23 @@ class TestResolveVersion:
         *something* rather than raising, even though it may be stale."""
         root = tmp_path / "checkout"
         root.mkdir()
-        with patch("coord._pkg_version", return_value="0.1.0"), \
+        with patch("coord.dist_name._pkg_version", return_value="0.1.0"), \
                 patch("coord._editable_source_root", return_value=root), \
                 patch("coord._live_scm_version", return_value=None):
-            assert _resolve_version("claude-coordinator") == "0.1.0"
+            assert _resolve_version(("claude-coordinator",)) == "0.1.0"
+
+    def test_neither_candidate_installed_degrades_to_unknown(self) -> None:
+        """#2103: `_resolve_version` must never raise/propagate a bare
+        `DistributionNotFoundError` — a source checkout that was never
+        `pip install`'d degrades to the obviously-not-a-release sentinel,
+        same as pre-#2103 single-name behavior."""
+        from importlib.metadata import PackageNotFoundError
+
+        def _raise(name: str) -> str:
+            raise PackageNotFoundError(name)
+
+        with patch("coord.dist_name._pkg_version", side_effect=_raise):
+            assert _resolve_version() == "0+unknown"
 
 
 def _require_build_backend() -> None:

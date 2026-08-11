@@ -18,6 +18,7 @@ import httpx
 
 from coord import __version__
 from coord.config import Config
+from coord.dist_name import CANDIDATE_NAMES
 
 if TYPE_CHECKING:  # pragma: no cover — typing only
     from collections.abc import Callable
@@ -113,7 +114,8 @@ def _startup_diagnostic_lines(
 
 
 def _log_install_location() -> str:
-    """One line describing how *this* agent process's `claude-coordinator`
+    """One line describing how *this* agent process's coordinator distro
+    (whichever of :data:`coord.dist_name.CANDIDATE_NAMES` resolves — #2103)
     is installed — editable (a dev checkout, #1628's flagged risk) vs a
     normal PyPI/site-packages install — logged once at startup so it's
     visible without a separate `coord health` run.
@@ -130,17 +132,19 @@ def _log_install_location() -> str:
         return f"coord agent: install location unknown ({type(exc).__name__}: {exc})"
 
     if not fields:
-        return "coord agent: install location unknown (pip show returned nothing)"
+        tried = " or ".join(CANDIDATE_NAMES)
+        return f"coord agent: install location unknown (pip show returned nothing for {tried})"
 
+    name = fields.get("Name", "/".join(CANDIDATE_NAMES))
     version = fields.get("Version", "?")
     editable_location = fields.get("Editable project location") or ""
     if editable_location:
         return (
-            f"coord agent: claude-coordinator {version} — EDITABLE at "
+            f"coord agent: {name} {version} — EDITABLE at "
             f"{editable_location} (not a PyPI install — see #1628)"
         )
     location = fields.get("Location", "")
-    return f"coord agent: claude-coordinator {version} — pypi install at {location}"
+    return f"coord agent: {name} {version} — pypi install at {location}"
 
 
 @dataclass(frozen=True)
@@ -447,12 +451,10 @@ def _resolve_target_version(
     if explicit_version:
         return explicit_version, []
 
-    from coord.health.pypi import latest_release, parse_version  # noqa: PLC0415
+    from coord.health.pypi import latest_release_any, parse_version  # noqa: PLC0415
 
     try:
-        latest, _finals = latest_release(
-            "claude-coordinator", index_url=index_url, timeout=timeout
-        )
+        project, latest, _finals = latest_release_any(index_url=index_url, timeout=timeout)
     except Exception as exc:  # noqa: BLE001 — degrade, don't fail the update
         return own_version, [
             "⚠ could not resolve the latest release from PyPI's simple "
@@ -463,19 +465,20 @@ def _resolve_target_version(
 
     if latest is None:
         return own_version, [
-            "⚠ PyPI's simple index returned no parseable claude-coordinator "
-            f"releases — targeting this CLI's own version v{own_version} "
-            "instead. Pass --version to pin explicitly.",
+            "⚠ PyPI's simple index returned no parseable releases under "
+            f"{' or '.join(CANDIDATE_NAMES)} — targeting this CLI's own "
+            f"version v{own_version} instead. Pass --version to pin "
+            "explicitly.",
         ]
 
     own = parse_version(own_version)
     if own is None or latest > own:
         return latest.raw, [
             f"⚠ this operator CLI is v{own_version} but PyPI's latest "
-            f"release is v{latest.raw} — targeting v{latest.raw} (the PyPI "
-            "release), not this CLI's own version. This CLI's own "
-            "`claude-coordinator` install is stale; consider `pip install "
-            "--upgrade claude-coordinator` here too.",
+            f"release ({project}) is v{latest.raw} — targeting v{latest.raw} "
+            "(the PyPI release), not this CLI's own version. This CLI's own "
+            f"`{project}` install is stale; consider `pip install --upgrade "
+            f"{project}` here too.",
         ]
 
     return own_version, []
