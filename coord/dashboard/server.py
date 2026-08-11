@@ -1416,6 +1416,7 @@ def build_app(
             repo = config.repo(assignment.repo_name)
             if repo is None:
                 return JSONResponse({"error": "unknown repo"}, status_code=404)
+            from coord import github_ops as _gh_ops
             from coord import merge_queue as mq
 
             # #946: this was the third (dashboard-only) enqueue path left
@@ -1425,26 +1426,50 @@ def build_app(
             # unreviewed work must never enter the merge queue through any
             # path. `force: true` in the request body is the explicit
             # escape hatch, mirroring `--force-merge` at merge time.
+            #
+            # #2085: `assignment` is a raw work Assignment — it has no
+            # `branch_head_sha`/`branch_patch_id` attribute at all, so
+            # handing it straight to `passes_merge_gates` made
+            # `has_approved_review`'s #821 freshness check permanently
+            # UNCONFIRMABLE here: every review carrying a real
+            # `review_head_sha` (virtually every modern approval) failed
+            # closed, so pressing "Enqueue" in the Phone Control Center on
+            # perfectly fresh, approved work reported "has not passed the
+            # required review/smoke gates" and demanded `force: true`. This
+            # was the one raw-Assignment gate call site missed when the
+            # other four (`coord.gates.build_gate_report`,
+            # `enqueue_approved_work`, `coord.notify`'s stalled-dispatch
+            # recovery, `coord.diagnose`'s stage-work recovery) were routed
+            # through `mq.live_gate_entry`. Same target_branch that
+            # `enqueue` below merges into, so the gate is evaluated against
+            # exactly the branch pair the merge would use.
             force = bool(body.get("force"))
-            if not force and not mq.passes_merge_gates(assignment, config, board):
-                return JSONResponse({
-                    "ok": False,
-                    "error": (
-                        "assignment has not passed the required review/smoke "
-                        "gates — pass force: true to enqueue anyway"
-                    ),
-                })
+            target_branch = repo.default_branch
+            if not force:
+                gate_entry = mq.live_gate_entry(
+                    assignment, repo.github, target_branch, _gh_ops
+                )
+                if not mq.passes_merge_gates(
+                    gate_entry, config, board, gh_ops=_gh_ops
+                ):
+                    return JSONResponse({
+                        "ok": False,
+                        "error": (
+                            "assignment has not passed the required review/smoke "
+                            "gates — pass force: true to enqueue anyway"
+                        ),
+                    })
 
             try:
                 if force:
                     # Bypass the gate entirely — don't pass config/board, or
                     # enqueue()'s own (unconditional) gate check would still
                     # reject it despite the explicit override above.
-                    entry = mq.enqueue(assignment, repo.github, repo.default_branch)
+                    entry = mq.enqueue(assignment, repo.github, target_branch)
                 else:
                     entry = mq.enqueue(
-                        assignment, repo.github, repo.default_branch,
-                        config=config, board=board,
+                        assignment, repo.github, target_branch,
+                        config=config, board=board, gh_ops=_gh_ops,
                     )
             except Exception as exc:
                 return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)

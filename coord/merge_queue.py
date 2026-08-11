@@ -14,7 +14,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Protocol
+from typing import Iterable, NamedTuple, Protocol
 
 from coord.audit import record_audit
 from coord.ci_store import (
@@ -378,11 +378,36 @@ def _backfill_branch_patch_id(entry: "QueuedMerge", gh_ops: "GhOps | None") -> s
     return computed
 
 
+class ApprovalScan(NamedTuple):
+    """The result of one walk over *board*'s approving reviews for an entry.
+
+    #2085/#2096: two surfaces ask about the same walk and must not answer it
+    with two implementations that merely agree today —
+
+    - ``approved`` — the merge gate's verdict. :func:`has_approved_review`
+      is exactly this field, so every gate caller is unchanged.
+    - ``unknown_head`` — True when an approving review was refused *only*
+      because the entry's branch head SHA was unknown to this caller
+      (``branch_head_sha is None``), rather than because it was confirmed
+      to differ from ``review_head_sha``. The two are indistinguishable in
+      a bool, but they mean opposite things to a read-only display:
+      "confirmed superseded" vs "not yet checked". :func:`display_error`
+      needs that distinction (see its docstring); the gate deliberately
+      does not — both fail closed there.
+    """
+
+    approved: bool
+    unknown_head: bool
+
+
 def has_approved_review(
     entry: "QueuedMerge", board, gh_ops: "GhOps | None" = None
 ) -> bool:
     """True when a completed review with ``review_verdict='approve'`` exists
     on *board* for the work assignment behind *entry*.
+
+    Thin wrapper over :func:`scan_approved_reviews` — this is the merge
+    gate's verdict and nothing else. See that function for the walk itself.
 
     Scans both active and completed assignments — a review whose findings
     were just posted may still be on ``board.active`` for a tick before
@@ -407,12 +432,24 @@ def has_approved_review(
     computed on demand (#1506) rather than treated as an unrecoverable
     mismatch; see :func:`_backfill_branch_patch_id`.
     """
+    return scan_approved_reviews(entry, board, gh_ops).approved
+
+
+def scan_approved_reviews(
+    entry: "QueuedMerge", board, gh_ops: "GhOps | None" = None
+) -> ApprovalScan:
+    """Walk *board* for an approving review covering *entry*'s work chain.
+
+    The single implementation behind both :func:`has_approved_review` (the
+    merge gate) and :func:`display_error`'s read-only recompute — see
+    :class:`ApprovalScan` for why the second one needs more than the bool.
+    """
     pool = list(getattr(board, "completed", []) or []) + list(getattr(board, "active", []) or [])
 
     branch_work_ids = _chain_work_ids(entry, pool)
 
     if not branch_work_ids:
-        return False
+        return ApprovalScan(approved=False, unknown_head=False)
 
     # #821: commit-bound check.  If the entry has a branch_head_sha (set at
     # process() time from the live branch tip) and the review has a
@@ -436,6 +473,9 @@ def has_approved_review(
     current_sha = getattr(entry, "branch_head_sha", None)
     current_patch_id = getattr(entry, "branch_patch_id", None)
     patch_id_attempted = current_patch_id is not None
+    # #2085: set when an approval is refused *purely* because `current_sha`
+    # is unknown here — see `ApprovalScan.unknown_head`.
+    unknown_head = False
 
     for a in pool:
         if getattr(a, "type", None) != "review":
@@ -471,10 +511,16 @@ def has_approved_review(
                     current_patch_id = _backfill_branch_patch_id(entry, gh_ops)
                     patch_id_attempted = True
                 if current_patch_id is not None and review_patch_id == current_patch_id:
-                    return True  # content-identical rebase — approval still covers it
+                    # content-identical rebase — approval still covers it
+                    return ApprovalScan(approved=True, unknown_head=False)
+            if current_sha is None:
+                # Refused because we don't KNOW the head, not because we
+                # checked and it moved. Same (closed) gate verdict, but a
+                # display surface must not call this "not approved".
+                unknown_head = True
             continue  # stale/unconfirmed: cannot prove this approval covers the current head
-        return True
-    return False
+        return ApprovalScan(approved=True, unknown_head=False)
+    return ApprovalScan(approved=False, unknown_head=unknown_head)
 
 
 def find_scoped_review_candidate(
@@ -1974,6 +2020,13 @@ _STALE_GATE_ERRORS = frozenset({
 # without any merge attempt running), so it gets the same recomputation.
 _STALE_GATE_ERROR_PREFIXES = ("smoke test verdict is stale:",)
 
+# #2085: the honest third answer for the review gate on a read-only surface —
+# neither "not approved" (unconfirmed failure) nor cleared (unconfirmed
+# success). See `display_error`.
+REVIEW_UNCONFIRMED_ERROR = (
+    "review approved but not yet confirmed against the branch head"
+)
+
 
 def _is_recomputable_gate_error(err: str | None) -> bool:
     """True when *err* is a gate refusal :func:`display_error` may recompute."""
@@ -2008,9 +2061,25 @@ def display_error(entry: "QueuedMerge", board, config) -> str | None:
         # Can't recompute without both — fall back to the stored string.
         return entry.error
     if entry.error.startswith("review"):
-        if requires_review(entry, config) and not has_approved_review(entry, board):
-            return entry.error
-        return None
+        if not requires_review(entry, config):
+            return None
+        scan = scan_approved_reviews(entry, board)
+        if scan.approved:
+            return None
+        if scan.unknown_head:
+            # #2085 review follow-up: an approval exists and carries a
+            # `review_head_sha`, but this entry's `branch_head_sha` is still
+            # None — it's only populated once a live `process()`/`plan()`
+            # tick has touched the row, so a freshly-approved entry hasn't
+            # got one yet. This recompute is deliberately I/O-free (see
+            # above), so it cannot resolve the freshness question; the
+            # stored "review required but not approved" would be an
+            # unconfirmed *failure* verdict, and clearing it outright would
+            # be an unconfirmed *success* one (the #1640 trap in the smoke
+            # branch below). Say what is actually known instead — this
+            # self-heals to a definite answer on the next live tick.
+            return REVIEW_UNCONFIRMED_ERROR
+        return entry.error
     if entry.error.startswith("smoke"):
         if not requires_smoke(entry, config):
             return None
@@ -2375,6 +2444,7 @@ def enqueue(
     target_branch: str,
     config=None,
     board=None,
+    gh_ops: "GhOps | None" = None,
 ) -> QueuedMerge | None:
     """Add a completed assignment to the queue if it isn't already there.
 
@@ -2387,6 +2457,27 @@ def enqueue(
     failing closed, since without a config there's no way to know which
     gates apply.
 
+    #2085: when *config* IS supplied, the gate check runs against
+    :func:`live_gate_entry` — never against the raw *assignment*. An
+    ``Assignment`` has no ``branch_head_sha``/``branch_patch_id`` attribute
+    at all, so handing it straight to :func:`passes_merge_gates` made
+    :func:`has_approved_review`'s #821 freshness check permanently
+    *unconfirmable*: every review carrying a real ``review_head_sha`` (i.e.
+    virtually every modern approval) failed closed, turning this gate into
+    one that can never pass. ``repo_github`` and ``target_branch`` are
+    already parameters here, so the confirmation data is built rather than
+    demanded — a caller cannot reintroduce that regression by forgetting to
+    thread *gh_ops* through, which is exactly how the dashboard's enqueue
+    path was missed when the other four raw-``Assignment`` gate call sites
+    were fixed.
+
+    *gh_ops* defaults to the live :mod:`coord.github_ops` module (only
+    consulted when *config* is set, so a gate-less enqueue stays as
+    I/O-light as before, and only alongside the ``get_branch_diff_size``
+    call this function already makes). Pass an explicit stub to inject a
+    fake; a lookup failure degrades to the conservative "unconfirmed"
+    refusal, never a silent pass.
+
     Dedup is by ``(repo_github, branch)`` — the queue's natural key is the
     branch we'd merge, not the assignment_id.  Multiple work assignments
     routinely target the same branch (original + fix-1 in the auto-loop,
@@ -2395,8 +2486,14 @@ def enqueue(
     """
     if not assignment.branch:
         return None
-    if config is not None and not passes_merge_gates(assignment, config, board):
-        return None
+    if config is not None:
+        if gh_ops is None:
+            from coord import github_ops as _live_gh  # noqa: PLC0415
+
+            gh_ops = _live_gh
+        gate_entry = live_gate_entry(assignment, repo_github, target_branch, gh_ops)
+        if not passes_merge_gates(gate_entry, config, board, gh_ops=gh_ops):
+            return None
     items = load_queue()
     if any(
         x.assignment_id == assignment.assignment_id

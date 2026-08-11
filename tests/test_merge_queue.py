@@ -2201,6 +2201,68 @@ class TestPassesMergeGates:
         board = self._board(completed=[work])
         assert mq.passes_merge_gates(work, cfg, board) is True
 
+    # ── #2085: enqueue()'s own internal gate builds its confirmation data ──
+
+    def test_enqueue_gate_confirms_a_fresh_approval_itself(
+        self, monkeypatch, coord_db
+    ) -> None:
+        """#2085: `enqueue(..., config=...)` must gate against
+        `live_gate_entry`, never the raw `Assignment` it was handed.
+
+        FAILS against the pre-fix code: `enqueue` called
+        `passes_merge_gates(assignment, config, board)` internally with no
+        `gh_ops` and no way to accept one, so `has_approved_review` saw a
+        raw `Assignment` (no `branch_head_sha` attribute at all) and refused
+        every review carrying a real `review_head_sha`. `repo_github` and
+        `target_branch` are already parameters here, so the confirmation
+        data is BUILT rather than demanded — a caller cannot reintroduce the
+        regression by forgetting to thread `gh_ops` through, which is
+        exactly how the dashboard enqueue path was missed.
+        """
+        from coord import github_ops
+
+        monkeypatch.setattr(
+            github_ops, "get_branch_sha",
+            lambda repo, branch: "sha-current" if branch == "worker/w1" else None,
+        )
+
+        cfg = self._config()
+        work = self._work("w1", test_state="passed")
+        review = self._review("w1", verdict="approve")
+        review.review_head_sha = "sha-current"  # matches the live head
+        board = self._board(completed=[work, review])
+
+        entry = mq.enqueue(
+            work, repo_github="acme/api", target_branch="main",
+            config=cfg, board=board,
+        )
+        assert entry is not None, (
+            "a fresh approval whose review_head_sha matches the branch's "
+            "live head must pass enqueue()'s internal gate"
+        )
+
+    def test_enqueue_gate_still_refuses_a_superseded_approval(
+        self, monkeypatch, coord_db
+    ) -> None:
+        """The companion: the #1966 chain (approved at SHA A, branch since
+        moved to SHA B) must still be refused by enqueue()'s own gate — the
+        fix makes the gate confirmable, not permissive."""
+        from coord import github_ops
+
+        monkeypatch.setattr(github_ops, "get_branch_sha", lambda *a, **k: "sha-new")
+        monkeypatch.setattr(github_ops, "get_branch_patch_id", lambda *a, **k: None)
+
+        cfg = self._config()
+        work = self._work("w1", test_state="passed")
+        review = self._review("w1", verdict="approve")
+        review.review_head_sha = "sha-old"  # commits landed after approval
+        board = self._board(completed=[work, review])
+
+        assert mq.enqueue(
+            work, repo_github="acme/api", target_branch="main",
+            config=cfg, board=board,
+        ) is None
+
 
 class TestSmokeGate:
     """#465: process() must refuse to merge when interactive smoke is required
@@ -6394,6 +6456,80 @@ class TestDisplayError:
             self._work("w1"), self._review("w1", verdict="request-changes"),
         ])
         assert mq.display_error(entry, board, cfg) == "review required but not approved"
+
+    # ── #2085 review follow-up: "not approved" vs "not yet checked" ─────────
+
+    def test_unknown_branch_head_is_reported_as_unconfirmed_not_unapproved(
+        self,
+    ) -> None:
+        """#2085: a freshly-approved entry that no live `process()`/`plan()`
+        tick has touched yet has `branch_head_sha is None`, so this
+        deliberately I/O-free recompute cannot bind the review's
+        `review_head_sha` to anything.
+
+        FAILS against the pre-fix code, which called
+        `has_approved_review(entry, board)` and got a bare `False` — the same
+        answer a *confirmed* supersession gives — so it echoed the stale
+        "review required but not approved" indefinitely for work that
+        actually passes. That is an unconfirmed FAILURE verdict, the mirror
+        image of the unconfirmed-success shape epic #2096 is about; clearing
+        the string outright would be the unconfirmed-success one (the #1640
+        trap the smoke branch documents). The honest third answer is neither.
+        """
+        cfg = self._config()
+        entry = _q("w1")
+        entry.error = "review required but not approved"
+        entry.branch_head_sha = None  # never through a live tick
+        review = self._review("w1", verdict="approve")
+        review.review_head_sha = "sha-current"  # real reviews always set this
+        board = self._board(completed=[self._work("w1"), review])
+
+        assert mq.display_error(entry, board, cfg) == mq.REVIEW_UNCONFIRMED_ERROR
+        assert mq.display_error(entry, board, cfg) != entry.error
+
+    def test_confirmed_supersession_still_shows_the_real_refusal(self) -> None:
+        """The companion: when the branch head IS known and demonstrably
+        moved past the reviewed SHA (the #1966 chain), the refusal is
+        confirmed — it must keep reading as "not approved", not soften into
+        the unconfirmed wording."""
+        cfg = self._config()
+        entry = _q("w1")
+        entry.error = "review required but not approved"
+        entry.branch_head_sha = "sha-new"  # a live tick populated it
+        review = self._review("w1", verdict="approve")
+        review.review_head_sha = "sha-old"  # commits landed after approval
+        board = self._board(completed=[self._work("w1"), review])
+
+        assert mq.display_error(entry, board, cfg) == "review required but not approved"
+
+    def test_unknown_head_with_no_approval_at_all_is_still_unapproved(self) -> None:
+        """`unknown_head` must only be set when an approval was actually
+        refused for want of a head SHA — not merely because the entry has no
+        `branch_head_sha`. With no approving review anywhere, the stored
+        refusal is confirmed and stands."""
+        cfg = self._config()
+        entry = _q("w1")
+        entry.error = "review required but not approved"
+        entry.branch_head_sha = None
+        board = self._board(completed=[
+            self._work("w1"), self._review("w1", verdict="request-changes"),
+        ])
+
+        assert mq.display_error(entry, board, cfg) == "review required but not approved"
+
+    def test_legacy_review_without_a_sha_still_clears(self) -> None:
+        """A pre-#821 approval carrying no `review_head_sha` at all has
+        nothing to bind, takes the legacy skip path, and counts as approved —
+        so the stale error clears outright, exactly as before #2085."""
+        cfg = self._config()
+        entry = _q("w1")
+        entry.error = "review required but not approved"
+        entry.branch_head_sha = None
+        board = self._board(completed=[
+            self._work("w1"), self._review("w1", verdict="approve"),
+        ])
+
+        assert mq.display_error(entry, board, cfg) is None
 
     def test_clears_stale_smoke_error_once_verdict_recorded(self) -> None:
         cfg = self._config(review_enabled=False, gates=["test", "merge"])
