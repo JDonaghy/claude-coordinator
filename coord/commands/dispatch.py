@@ -33,7 +33,8 @@ from coord.commands.dispatch_workers import (
 
 
 def _stdin_is_tty() -> bool:
-    """Seam over ``sys.stdin.isatty()`` (#2086).
+    """Seam over ``sys.stdin.isatty()`` — see ``_require_interactive_tty``
+    for what this gates and why (#2086).
 
     ``click.testing.CliRunner.invoke()`` swaps in its own non-TTY stdin
     object for the duration of the call, so a test that monkeypatches
@@ -44,6 +45,48 @@ def _stdin_is_tty() -> bool:
     to patch directly instead.
     """
     return sys.stdin.isatty()
+
+
+def _require_interactive_tty(dry_run: bool) -> None:
+    """Refuse ``--interactive`` when stdin is not a TTY and this isn't a
+    dry run (#2086).
+
+    Every ``--interactive`` flavour hands the child session (and, for a
+    remote/tmux target, the final ``tmux attach-session``) the operator's
+    own terminal — there's no human at the keyboard to drive the
+    paste/attach handshake without one. Left unchecked, this used to fall
+    through to ``input()`` in interactive.py swallowing the resulting
+    ``EOFError``, the attach failing ("Pseudo-terminal will not be
+    allocated…" / "no sessions"), and the session never actually starting
+    — yet by then the assignment was already claimed + recorded as
+    dispatched, so the #466 git-floor backstop could go on to record a
+    false ``done`` and the auto-loop would dispatch real, metered
+    downstream stages (Test, Review, Merge) against work that never
+    happened. Same precedent as ``--skip-review`` refusing explicitly
+    rather than silently degrading when routed to the daemon (#821/#1489):
+    fail loudly, before any claim/board write, so a confusing multi-minute
+    cascade becomes one clear error instead.
+
+    Called from :func:`_build_interactive_launch_setup` — the single choke
+    point every ``--interactive`` flavour passes through in BOTH callers
+    (``assign()`` and ``coord.test_author.dispatch_test_author_interactive``)
+    — so neither can bypass it by construction. ``assign()`` also calls
+    this directly, before its own harmless read-only issue-title fetch,
+    purely so a no-TTY dispatch fails before that network round-trip too;
+    it is the exact same check reused, not a re-implementation of it.
+
+    A dry run never claims or writes anything (every ``_dispatch_*_of``
+    flavour short-circuits on ``dry_run`` before any claim/attach code
+    runs), so it's exempt from this gate too.
+    """
+    if dry_run or _stdin_is_tty():
+        return
+    raise RuntimeError(
+        "--interactive requires a TTY on stdin — it drives a "
+        "human-attended claude session (pre-filling the briefing and "
+        "attaching your terminal to it). Run this from an actual "
+        "terminal, or omit --interactive for headless dispatch."
+    )
 
 
 @click.command(help="Brain proposes assignments for idle machines.")
@@ -967,33 +1010,18 @@ def assign(
         )
         sys.exit(2)
 
-    # #2086: refuse --interactive up front when stdin is not a TTY, rather
-    # than silently degrading. Every --interactive flavour hands the child
-    # session (and, for a remote/tmux target, the final `tmux
-    # attach-session`) the operator's own terminal — there's no human at the
-    # keyboard to drive the paste/attach handshake without one. Left
-    # unchecked, this used to fall through to `input()` in interactive.py
-    # swallowing the resulting EOFError, the attach failing ("Pseudo-terminal
-    # will not be allocated…" / "no sessions"), and the session never
-    # actually starting — yet the assignment was already claimed + recorded
-    # as dispatched by the time any of that happened, so the git-floor
-    # backstop (see finalize_interactive_exit/finalize_remote_interactive_exit
-    # in coord/interactive.py) could go on to record a false `done` and the
-    # auto-loop would dispatch real, metered downstream stages (Test, Review,
-    # Merge) against work that never happened. Same precedent as --skip-review
-    # refusing explicitly rather than silently degrading when routed to the
-    # daemon (#821/#1489): fail loudly, before the issue fetch / claim /
-    # board write ever run, so a confusing multi-minute cascade becomes one
-    # clear error instead.
-    if interactive and not _stdin_is_tty():
-        click.echo(
-            "error: --interactive requires a TTY on stdin — it drives a "
-            "human-attended claude session (pre-filling the briefing and "
-            "attaching your terminal to it). Run this from an actual "
-            "terminal, or omit --interactive for headless dispatch.",
-            err=True,
-        )
-        sys.exit(2)
+    # #2086: fails fast, before the (harmless, read-only) issue-title fetch
+    # below — see _require_interactive_tty's docstring for the full
+    # rationale. This is the SAME check _build_interactive_launch_setup
+    # enforces further down for every --interactive flavour (here and in
+    # coord.test_author.dispatch_test_author_interactive), called again
+    # here only so a no-TTY dispatch fails before that network round-trip.
+    if interactive:
+        try:
+            _require_interactive_tty(dry_run)
+        except RuntimeError as e:
+            click.echo(f"error: {e}", err=True)
+            sys.exit(2)
 
     # Fetch the issue title from GitHub
     try:
@@ -1121,6 +1149,7 @@ def assign(
     if interactive:
         setup = _build_interactive_launch_setup(
             machine=machine, repo=repo, issue=issue, machine_obj=machine_obj,
+            dry_run=dry_run,
         )
         provider = setup.provider
         _is_local = setup.is_local
@@ -1255,7 +1284,15 @@ def _build_interactive_launch_setup(
     repo: str,
     issue: int,
     machine_obj: object,
+    dry_run: bool,
 ) -> _InteractiveLaunchSetup:
+    # #2086: the authoritative gate — see _require_interactive_tty's
+    # docstring. Every --interactive flavour in BOTH callers (assign()'s
+    # _dispatch_*_of flavours and dispatch_test_author_interactive) passes
+    # through here, so this is the one place neither caller can bypass by
+    # forgetting its own earlier check.
+    _require_interactive_tty(dry_run)
+
     # #466: The interactive launcher path now CLAIMS the issue and
     # RECORDS the dispatched assignment up front (it used to write
     # nothing then sys.exit), and on session exit invokes the

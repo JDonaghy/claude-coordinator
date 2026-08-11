@@ -615,7 +615,10 @@ def dispatch_test_author_interactive(
     * :func:`coord.commands.dispatch._build_interactive_launch_setup` for the
       shared ``ClaudePtyProvider`` / local-vs-remote detection / per-issue
       context digest (#603) that every ``coord assign --interactive`` flavour
-      shares.
+      shares — including its #2086 ``_require_interactive_tty`` gate, which
+      refuses to claim/record this assignment when stdin is not a TTY (and
+      this isn't a dry run), the same protection ``coord assign
+      --interactive`` gets.
     * :func:`coord.agent.setup_interactive_worktree` (local) / a raw
       ``git worktree add`` shell command over ssh+tmux (remote) — the same
       primitives :func:`~coord.commands.dispatch_workers._dispatch_rework_of`
@@ -808,6 +811,7 @@ def dispatch_test_author_interactive(
 
     setup = _build_interactive_launch_setup(
         machine=machine.name, repo=repo_name, issue=tracking_issue, machine_obj=machine,
+        dry_run=dry_run,
     )
     provider = setup.provider
     is_local = setup.is_local
