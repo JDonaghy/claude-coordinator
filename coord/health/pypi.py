@@ -24,6 +24,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
+from coord.dist_name import CANDIDATE_NAMES
+
 # PEP 503 normalisation: runs of -_. collapse to a single "-", lowercased.
 _NORMALIZE_RE = re.compile(r"[-_.]+")
 
@@ -183,3 +185,47 @@ def latest_release(
     html = fetch_simple_index(project, index_url=index_url, timeout=timeout)
     finals = [v for v in parse_simple_index(html, project) if not v.is_prerelease]
     return (finals[-1] if finals else None), finals
+
+
+def latest_release_any(
+    names: tuple[str, ...] = CANDIDATE_NAMES,
+    *,
+    index_url: str = "https://pypi.org/simple",
+    timeout: float = 3.0,
+) -> tuple[str, Version | None, list[Version]]:
+    """:func:`latest_release`, tried against each of *names* in turn (#2103).
+
+    `claude-coordinator` and `code-coordinator` (#2096) are separate PyPI
+    projects — a caller resolving "what's the latest fleet-wide release"
+    must not hardcode whichever name happened to be current when the code
+    was written, or it silently stops seeing new releases the moment #2096
+    actually ships and starts publishing under the new name.
+
+    Returns ``(project_name_used, latest_final_release,
+    all_final_releases_ascending)`` for the first name in *names* that has
+    any final release on the index — ``code-coordinator`` wins once it has
+    releases, mirroring :func:`coord.dist_name.resolve_installed`'s
+    preference. A name with no releases yet (including a 404 for "this
+    project doesn't exist on the index at all", which is the *expected*
+    state for ``code-coordinator`` until #2096 ships) is treated as "try
+    the next name", not as an error.
+
+    Raises only when every name in *names* fails to even resolve (network
+    down, index unreachable, ...) — re-raising the last error, since at
+    that point there is no meaningful "no releases" to fall back to and the
+    caller needs to know the lookup itself failed.
+    """
+    last_exc: Exception | None = None
+    for project in names:
+        try:
+            latest, finals = latest_release(project, index_url=index_url, timeout=timeout)
+        except Exception as exc:  # noqa: BLE001 — try the next candidate name
+            last_exc = exc
+            continue
+        if finals:
+            return project, latest, finals
+    if last_exc is not None:
+        raise last_exc
+    # Every name resolved (no network/index error) but none has a single
+    # final release — an honest "nothing here", not a failure.
+    return names[-1], None, []

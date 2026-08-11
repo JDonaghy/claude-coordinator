@@ -46,7 +46,8 @@ from __future__ import annotations
 
 import subprocess
 
-from coord.health.checks.agent_install import PROJECT, pip_show
+from coord.dist_name import CANDIDATE_NAMES
+from coord.health.checks.agent_install import pip_show
 from coord.health.models import CheckResult, HealthContext, Severity
 from coord.health.registry import check
 from coord.health.units import expand, shorten_path
@@ -257,11 +258,12 @@ def probe_cli_venv(ctx: HealthContext) -> CheckResult:
 
     version = fields.get("Version") or None
     if not version:
+        tried = " or ".join(CANDIDATE_NAMES)
         return CheckResult(
             check_id="cli_venv",
             scope="machine",
             severity=Severity.UNKNOWN,
-            headroom=f"{PROJECT} not installed in {shorten_path(str(python), str(ctx.home))}",
+            headroom=f"neither {tried} installed in {shorten_path(str(python), str(ctx.home))}",
             error="pip show returned nothing",
             values={"python": str(python), "present": True, "version": None},
         )

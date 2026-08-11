@@ -347,13 +347,22 @@ class TestUpdateEndpoint:
         """#2103: once `code-coordinator` is what's actually installed (the
         post-rename state), `/update` must reinstall THAT name — reinstalling
         the old `claude-coordinator` name would either 404 against PyPI or
-        silently resurrect the stale package."""
+        silently resurrect the stale package.
+
+        Patches BOTH `coord.dist_name.resolve_installed` (what
+        `pkg_spec()`/`_agent_pkg_spec()` resolves through, internal to
+        `coord.dist_name`) and `coord.agent_app.resolve_installed` (the
+        name `_installed_version()` was bound to at `agent_app` import
+        time) — patching only the former doesn't retroactively rebind the
+        latter's separate reference to the same function object, so
+        `version_before`/`version_after` would silently keep exercising
+        the real, unmocked resolver otherwise.
+        """
+        resolved = ResolvedDist(name="code-coordinator", version="9.9.8")
         with (
             patch("coord.agent_app._detect_install_mode", return_value=(False, None)),
-            patch(
-                "coord.dist_name.resolve_installed",
-                return_value=ResolvedDist(name="code-coordinator", version="9.9.8"),
-            ),
+            patch("coord.dist_name.resolve_installed", return_value=resolved),
+            patch("coord.agent_app.resolve_installed", return_value=resolved),
             patch(
                 "coord.agent_app.agent_update.perform_update",
                 return_value=UpdateResult(ok=True, swapped=True, new_version="9.9.9"),
@@ -362,25 +371,35 @@ class TestUpdateEndpoint:
             client, server = _make_client(tmp_path)
             client.post("/update", json={"target_version": "9.9.9"})
             assert _wait_until(lambda: mock_perform.called)
+            last = _wait_for_last_update(server)
 
         args, _kwargs = mock_perform.call_args
         assert args[1] == "code-coordinator[server]"
+        # #2103 non-blocking test-hygiene fix: exercises `_installed_version()`
+        # end-to-end at the `agent_app` layer, not just `coord.dist_name`'s.
+        assert last["version_before"] == "9.9.8"
         server.shutdown()
 
     def test_update_reports_explicit_failure_when_neither_name_installed(
         self, tmp_path: Path
     ) -> None:
         """#2103 acceptance #4: never a bare `None`/silent no-op — the
-        failure names both distribution names tried."""
+        failure names both distribution names tried.
+
+        Patches BOTH `coord.dist_name.resolve_installed` and
+        `coord.agent_app.resolve_installed` — see the docstring on
+        `test_update_pkg_spec_prefers_code_coordinator_when_installed` for
+        why the single-patch version doesn't actually exercise
+        `_installed_version()`'s "neither resolves" path at this layer.
+        """
+        not_found = DistributionNotFoundError(
+            "no coordinator distribution installed — tried: "
+            "code-coordinator, claude-coordinator"
+        )
         with (
             patch("coord.agent_app._detect_install_mode", return_value=(False, None)),
-            patch(
-                "coord.dist_name.resolve_installed",
-                side_effect=DistributionNotFoundError(
-                    "no coordinator distribution installed — tried: "
-                    "code-coordinator, claude-coordinator"
-                ),
-            ),
+            patch("coord.dist_name.resolve_installed", side_effect=not_found),
+            patch("coord.agent_app.resolve_installed", side_effect=not_found),
         ):
             client, server = _make_client(tmp_path)
             client.post("/update")
@@ -389,6 +408,10 @@ class TestUpdateEndpoint:
         assert last["result"] == "failed"
         assert "code-coordinator" in last["error"]
         assert "claude-coordinator" in last["error"]
+        # #2103 non-blocking test-hygiene fix: `_installed_version()` (used
+        # for `version_before`) degrades to `None` -> "unknown" rather than
+        # raising and taking the whole request down with it.
+        assert last["version_before"] == "unknown"
         server.shutdown()
 
     def test_update_omits_pin_when_no_target_version(self, tmp_path: Path) -> None:

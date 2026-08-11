@@ -160,11 +160,18 @@ def in_git_worktree(path: Path) -> bool:
 
 
 def installed_version() -> str | None:
-    """The version of the installed `claude-coordinator`, or None."""
-    try:
-        from importlib.metadata import version
+    """The version of the installed coordinator distribution, or None.
 
-        return version("claude-coordinator")
+    #2103: resolves via :func:`coord.dist_name.resolve_installed` — tries
+    `code-coordinator` then falls back to `claude-coordinator` — instead of
+    a single hardcoded name, so this (feeding the unit-drift health check)
+    doesn't start reporting a false "not installed" the moment a machine
+    lands on the new name.
+    """
+    try:
+        from coord.dist_name import resolve_installed
+
+        return resolve_installed().version
     except Exception:  # pragma: no cover - metadata missing in odd installs
         return None
 
