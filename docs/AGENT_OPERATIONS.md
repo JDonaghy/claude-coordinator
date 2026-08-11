@@ -684,7 +684,10 @@ a host runs is not derivable from the wheel: `deploy/` ships *all* of them and
 `coord release verify` deliberately refuses to infer intent from that
 (*"a release does not decide which services a host runs"* — it reports
 `10 packaged unit(s) NOT installed here` on workers and correctly does nothing
-about it). So the mapping lives here.
+about it). So the mapping lives here — and, since #2098, also in
+[`coord/deploy_manifest.py`](../coord/deploy_manifest.py) as
+`ROLE_UNITS`, which is what this table below is transcribed from. Keep the
+two in sync; `tests/test_deploy_manifest.py` cross-checks it.
 
 | Unit | Role | Enable step |
 |---|---|---|
@@ -699,7 +702,15 @@ about it). So the mapping lives here.
 
 Workers (precision, elitebook) run `coord-agent` **only**.
 
-Tracking issue for making this checkable rather than prose: **#2098**.
+**Checkable, not just prose (#2098).** `coord doctor` / `coord health` run
+`unit_enablement` (`coord/health/checks/unit_enablement.py`) on every
+machine: for each unit in `ROLE_UNITS` that this host has already installed,
+it runs `systemctl --user is-enabled` and WARNs if the answer isn't
+`enabled` — the exact state that hid the propagate timer, where an installed
+unit and a running one produced identical evidence. It does not guess
+whether a host *should* install a unit it lacks; that half stays a human
+decision, same boundary `unit_drift` and `coord release verify` already
+draw.
 
 ## Fleet version propagation (`coord-release-propagate` timer, #1835/PKG-7)
 
@@ -788,11 +799,16 @@ busy, rolls, and releases the hold.
 
 `~/.coord/coord.db` on the daemon host is the fleet's canonical state and had
 no backup at all until 2026-08-10. This is a stopgap while **#1822**
-(continuous backup + *verified restore*, `tier:large`) is unstarted. Installed
-on dellserver:
+(continuous backup + *verified restore*, `tier:large`) is unstarted. Ships in
+`deploy/` (#2098: `coord-db-backup.sh` + `.service` + `.timer`, the same lane
+as every other unit); install on the daemon host:
 
 ```bash
-# script: ~/.local/bin/coord-db-backup.sh   (also see #2098 — belongs in deploy/)
+mkdir -p ~/.local/bin ~/.config/systemd/user
+cp deploy/coord-db-backup.sh ~/.local/bin/ && chmod +x ~/.local/bin/coord-db-backup.sh
+cp deploy/coord-db-backup.service deploy/coord-db-backup.timer ~/.config/systemd/user/
+loginctl enable-linger "$USER"
+systemctl --user daemon-reload
 systemctl --user enable --now coord-db-backup.timer      # hourly, Persistent=true
 ```
 

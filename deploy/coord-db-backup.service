@@ -1,0 +1,7 @@
+[Unit]
+Description=Snapshot coord.db to the external SSD (interim, pending #1822)
+Documentation=https://github.com/JDonaghy/claude-coordinator/issues/1822
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/coord-db-backup.sh
