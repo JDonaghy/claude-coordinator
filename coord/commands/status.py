@@ -1134,7 +1134,12 @@ def _diagnose_via_daemon(svc, params: dict) -> None:
 @click.argument("issue", type=int, required=False, default=None)
 @click.option(
     "--stage",
-    type=click.Choice(["plan", "work", "review", "test", "merge"]),
+    # #2087: "smoke" added — it was previously unreachable via an explicit
+    # --stage (rejected here before ever reaching diagnose_stage()) even
+    # though an implicit (no --stage) pick could already land on a
+    # type="smoke" row and then dead-end inside diagnose_stage() with "no
+    # diagnosis available". See STAGE_ASSIGNMENT_TYPES["smoke"] (diagnose.py).
+    type=click.Choice(["plan", "work", "review", "test", "merge", "smoke"]),
     default=None,
     help="Which stage to diagnose (default: the issue's most-recent stage).",
 )

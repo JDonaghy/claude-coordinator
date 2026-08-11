@@ -209,6 +209,141 @@ def test_phantom_is_finalized_once_not_twice(monkeypatch, config) -> None:
     assert calls["finalize"].count("w1") == 1
 
 
+# ── #2087: a `running` row on an unconfigured machine is a phantom, not
+# "healthy" ────────────────────────────────────────────────────────────────
+#
+# 2026-08-10: a test-fixture assignment landed on the canonical board naming
+# `machine=laptop` — not a configured machine — with `status=running` for
+# ~9h. `_session_state()` already returns "unknown" for exactly this shape
+# ("machine_name set but unknown in config — can't probe safely"), but
+# before this fix no stage's recovery logic had a branch for
+# state=="unknown", so it fell through to that stage's "stage looks
+# healthy" catch-all — the textbook phantom `coord diagnose` exists to
+# find, reported as fine. These tests reproduce the exact `work-repro` /
+# `smoke-repro` shapes from the incident and fail against the pre-fix
+# code (which asserted "stage looks healthy" for both).
+
+
+def test_running_work_on_unconfigured_machine_is_not_reported_healthy(
+    monkeypatch, config,
+) -> None:
+    """The exact `work-repro` shape: machine='laptop' (not in `config`'s
+    machines — only 'precision' is configured), status='running'. Must be
+    named a phantom, not "healthy", and must offer --reset."""
+    _stub(monkeypatch, session="dead")  # unused: machine-unconfigured check
+    # short-circuits before _session_state's own liveness probe matters.
+    a = _assign(aid="work-repro", typ="work", status="running", issue=9999)
+    a.machine_name = "laptop"
+    board = Board(active=[a])
+
+    res = diagnose.diagnose_stage(board, config, "api", 9999, "work")
+
+    assert not any("looks healthy" in f for f in res.findings), res.findings
+    assert any(
+        "not a configured machine" in f and "laptop" in f for f in res.findings
+    ), res.findings
+    assert res.recovered is False
+    assert res.needs_reset is True
+
+
+def test_running_work_on_unconfigured_machine_reset_clears_it(monkeypatch, config) -> None:
+    """`--reset` (the existing, non-destructive, audited reset path) must
+    still be able to clear this row — the incident's complaint was that
+    NOTHING could ("the rows were ultimately removed with hand-written
+    SQL... because no supported command could touch them")."""
+    calls = _stub(monkeypatch, session="dead")
+    a = _assign(aid="work-repro", typ="work", status="running", issue=9999)
+    a.machine_name = "laptop"
+    board = Board(active=[a])
+
+    res = diagnose.diagnose_stage(board, config, "api", 9999, "work", reset=True)
+
+    assert "work-repro" in calls["finalize"]
+    assert res.recovered is True
+    assert res.branch_preserved is True
+
+
+def test_running_work_on_configured_machine_is_unaffected(monkeypatch, config) -> None:
+    """Sanity/no-regression: a live session on a REAL configured machine
+    ('precision', per the `config` fixture) must still report healthy —
+    this guard is specific to unconfigured machines, not every 'unknown'
+    liveness read."""
+    _stub(monkeypatch, session="live")
+    a = _assign(aid="w1", typ="work", status="running")  # machine="precision"
+    board = Board(active=[a])
+
+    res = diagnose.diagnose_stage(board, config, "api", 42, "work")
+
+    assert any("looks healthy" in f or "left running" in f for f in res.findings), (
+        res.findings
+    )
+    assert res.recovered is True
+
+
+def test_smoke_stage_is_now_diagnosable() -> None:
+    """#2087: 'smoke' was previously absent from STAGE_ASSIGNMENT_TYPES —
+    `--stage smoke` (or an implicit pick landing on a type='smoke' row)
+    dead-ended at 'no diagnosis available' with no recovery and no --reset
+    path, which is exactly why the `smoke-repro` phantom in the incident
+    could not be cleared through any supported command."""
+    assert "smoke" in diagnose.STAGE_ASSIGNMENT_TYPES
+    assert diagnose.STAGE_ASSIGNMENT_TYPES["smoke"] == ("smoke",)
+
+
+def test_smoke_running_on_unconfigured_machine_is_not_reported_healthy(
+    monkeypatch, config,
+) -> None:
+    """The exact `smoke-repro` shape: type='smoke', machine='laptop' (not
+    configured), status='done' per the incident report's board dump —
+    reproduced here as 'running' too, since the guard covers both
+    (`status in ("running", "pending")`); 'done' isn't itself wedged, only
+    'running'/'pending' phantom shapes are. Also proves --stage smoke
+    reaches real diagnosis instead of the pre-fix 'no diagnosis available'
+    dead end."""
+    a = _assign(aid="smoke-repro", typ="smoke", status="running", issue=9999)
+    a.machine_name = "laptop"
+    board = Board(active=[a])
+
+    res = diagnose.diagnose_stage(board, config, "api", 9999, "smoke")
+
+    assert not any("no diagnosis available" in f for f in res.findings), res.findings
+    assert not any("looks healthy" in f for f in res.findings), res.findings
+    assert any(
+        "not a configured machine" in f and "laptop" in f for f in res.findings
+    ), res.findings
+    assert res.needs_reset is True
+
+
+def test_diagnose_stage_smoke_choice_accepted_by_cli(monkeypatch) -> None:
+    """#2087: `--stage smoke` used to be rejected by click's Choice list
+    before ever reaching diagnose_stage()."""
+    from click.testing import CliRunner
+    from coord.commands.status import diagnose as diagnose_cmd
+    from coord.config import Config
+    from coord.diagnose import DiagnoseResult
+    from coord.models import Board, Repo, Machine
+    import coord.diagnose as diag_mod
+    import coord.state as state_mod
+
+    monkeypatch.setattr("coord.board_service.daemon_reroute_target", lambda _: None)
+    cfg = Config(
+        repos=[Repo(name="api", github="acme/api", default_branch="main")],
+        machines=[Machine(name="precision", host="p.tail", repos=["api"])],
+    )
+    fake_result = DiagnoseResult(repo_name="api", issue_number=9999, stage="smoke")
+    monkeypatch.setattr("coord.commands.status._load_config", lambda p: cfg)
+    monkeypatch.setattr(diag_mod, "diagnose_stage", lambda *a, **kw: fake_result)
+    monkeypatch.setattr(state_mod, "build_board", lambda: Board())
+
+    result = CliRunner().invoke(
+        diagnose_cmd, ["api", "9999", "--stage", "smoke", "--dry-run"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Invalid value for '--stage'" not in result.output
+
+
 # ── review findings recovery (#607 class) ────────────────────────────────────
 
 

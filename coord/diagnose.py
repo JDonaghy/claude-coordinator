@@ -72,6 +72,15 @@ STAGE_ASSIGNMENT_TYPES: dict[str, tuple[str, ...]] = {
     "review": ("review", "test-author", "mock-author"),
     "test": ("work", "plan"),
     "merge": ("work", "plan"),
+    # #2087: previously absent entirely — `--stage smoke` (or an implicit
+    # `current_stage()` pick landing on a `type="smoke"` row, e.g. a Test
+    # stage dispatched more recently than its parent `work` row) fell
+    # straight into the "no diagnosis available" dead end below with no
+    # recovery and no `--reset` path. Routed through the same work-like
+    # recovery as `work`/`plan` (`diagnose_stage`'s per-stage dispatch and
+    # `_do_reset` both fall back to that branch for any type not `review` or
+    # `test`) — a smoke row is a one-shot session exactly like a work row.
+    "smoke": ("smoke",),
 }
 
 
@@ -582,11 +591,47 @@ def diagnose_stage(
     if stage in ("work", "test", "merge"):
         _flag_contradictory_failed(latest, res)
 
+    # #2087: a `running`/`pending` row naming a machine that isn't a
+    # configured machine can never be probed — `_session_state` above
+    # already returns "unknown" for exactly that reason ("machine_name set
+    # but unknown in config — can't probe safely"). Before this,
+    # every stage's best-effort recovery below had no branch for
+    # state=="unknown", so it fell through to that recovery function's own
+    # "stage looks healthy" catch-all — the textbook phantom `coord
+    # diagnose` exists to find, reported as fine (the exact `work-repro`
+    # shape: `machine=laptop`, `status=running` for 9h, "stage looks
+    # healthy"). Flag it here, uniformly across every stage, BEFORE any
+    # stage-specific recovery gets a chance to fall through to its healthy
+    # catch-all — and reuse the existing non-destructive `--reset` path
+    # (branch/commits always preserved) as the supported way to clear it.
+    machine_unconfigured = (
+        bool(latest.machine_name) and _resolve_machine(config, latest.machine_name) is None
+    )
+    if latest.status in ("running", "pending") and machine_unconfigured:
+        res.findings.append(
+            f"{stage}: machine {latest.machine_name!r} is not a configured "
+            "machine (not in coordinator.yml) — a 'running' row with no "
+            "host to poll is a phantom, not healthy; re-run with --reset to "
+            "clear it (the branch and any commits are preserved)"
+        )
+        res.recovered = False
+        res.needs_reset = True
+
     if reset:
         _do_reset(
             board, config, assignments, res, stage=stage,
             repo_name=repo_name, issue_number=issue_number, dry_run=dry_run,
         )
+        _cleanup_issue(
+            board, config, repo_name, issue_number, res,
+            dry_run=dry_run, reset=reset, skip_ids=handled,
+        )
+        return res
+
+    if latest.status in ("running", "pending") and machine_unconfigured:
+        # Reported above; nothing safe to attempt without --reset (no host
+        # to probe/finalize against) and no stage-specific recovery below
+        # would do better than mis-file it as healthy.
         _cleanup_issue(
             board, config, repo_name, issue_number, res,
             dry_run=dry_run, reset=reset, skip_ids=handled,
