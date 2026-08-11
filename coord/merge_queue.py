@@ -2226,6 +2226,83 @@ class GhOps(Protocol):
         ...
 
 
+def live_gate_entry(
+    a: Assignment,
+    repo_github: str,
+    target_branch: str,
+    gh_ops: "GhOps | None",
+) -> QueuedMerge:
+    """Build a synthetic, never-persisted :class:`QueuedMerge` from a raw
+    work :class:`~coord.models.Assignment` *a*, with the #821/#1475/#1479
+    freshness anchors (``branch_head_sha``, ``branch_patch_id``,
+    ``target_branch_head_sha``) populated LIVE via *gh_ops* when supplied.
+
+    #2085: :func:`has_approved_review` / :func:`evaluate_smoke_verdict` read
+    those anchors straight off whatever *entry* they're handed — a real
+    ``QueuedMerge`` only carries them once :func:`process` has run at least
+    once. Any caller that needs to gate-check a raw work ``Assignment``
+    *before* it has gone through ``process()`` — the daemon's passive-tick
+    :func:`enqueue_approved_work`, ``coord.notify``'s stalled-dispatch
+    recovery, ``coord.diagnose``'s stage-work recovery, and ``coord.commands.
+    merge``'s auto-enqueue scan — used to hand ``has_approved_review`` the
+    bare ``Assignment`` directly. It has no ``branch_head_sha`` attribute at
+    all, so ``getattr(entry, "branch_head_sha", None)`` always read ``None``;
+    since #2085 made an unconfirmed SHA fail CLOSED (previously it fell
+    open), that made a review carrying a real ``review_head_sha`` —
+    virtually every modern approval — permanently unconfirmable from any of
+    those call sites, not just the superseded-approval case #2085 was filed
+    about. Routing through this helper first — mirroring the construction
+    :func:`coord.gates.build_gate_report` already used inline for the same
+    reason — gives those callers the same live SHA a real ``coord merge``
+    run would see, so a genuinely fresh approval can still confirm.
+
+    This is now the ONE place that construction happens — ``build_gate_report``
+    was refactored to call this too (#2096: two surfaces answering "is this
+    entry's approval still fresh" must call one function, not reimplement it
+    twice and risk drifting apart).
+
+    *gh_ops* ``None`` skips every live lookup (fails open on the freshness
+    anchors themselves, exactly as ``build_gate_report`` does with no live
+    client) — the resulting entry still lets a review with no
+    ``review_head_sha`` at all take the legacy no-SHA-to-compare path, but
+    correctly fails closed for one that has a SHA and can't be confirmed.
+    """
+    entry = QueuedMerge(
+        assignment_id=a.assignment_id or "",
+        repo_name=a.repo_name,
+        repo_github=repo_github,
+        branch=a.branch or "",
+        target_branch=target_branch,
+        issue_number=getattr(a, "issue_number", 0) or 0,
+        issue_title=getattr(a, "issue_title", None) or "",
+        assignment_type=getattr(a, "type", None) or "work",
+        required_gates=list(getattr(a, "required_gates", None) or []),
+    )
+    if gh_ops is not None and entry.branch:
+        try:
+            entry.branch_head_sha = gh_ops.get_branch_sha(entry.repo_github, entry.branch)
+        # #2085: NOT "fail-open, unknown SHA isn't blocking" — an unknown
+        # branch_head_sha now fails has_approved_review CLOSED (not open)
+        # for any review that carries a review_head_sha to compare against.
+        # A transient gh error here degrades to the same conservative
+        # refusal as gh_ops=None, never a silent pass.
+        except Exception:  # noqa: BLE001
+            entry.branch_head_sha = None
+        try:
+            entry.target_branch_head_sha = gh_ops.get_branch_sha(
+                entry.repo_github, entry.target_branch
+            )
+        except Exception:  # noqa: BLE001
+            entry.target_branch_head_sha = None
+        try:
+            entry.branch_patch_id = gh_ops.get_branch_patch_id(
+                entry.repo_github, entry.target_branch, entry.branch
+            )
+        except Exception:  # noqa: BLE001
+            entry.branch_patch_id = None
+    return entry
+
+
 # ── Persistence ──────────────────────────────────────────────────────────
 
 def load_queue() -> list[QueuedMerge]:
@@ -2367,7 +2444,10 @@ def enqueue_approved_work(config, board=None) -> list[str]:
     #930) and, for each that satisfies ALL three conditions:
 
     1. Review gate OK — ``requires_review(a, config)`` is False, **or** an
-       approved review exists on the board (``has_approved_review``).
+       approved review exists on the board (``has_approved_review``) that
+       still covers the branch's LIVE current head (#2085: confirmed via
+       :func:`live_gate_entry`, not the raw ``Assignment``, which has no SHA
+       to compare against).
     2. Smoke gate OK — ``requires_smoke(a, config)`` is False, **or** the
        work assignment carries a ``test_state in ('passed', 'skipped')``
        verdict (``has_smoke_verdict``).
@@ -2444,11 +2524,42 @@ def enqueue_approved_work(config, board=None) -> list[str]:
         if any(x.assignment_id == aid for x in existing_queue):
             continue
 
+        # #934: target the milestone's `feature/ms-NN` branch, not
+        # `default_branch`, when this issue belongs to a milestone and the
+        # repo opted into the develop + feature-branch-per-milestone git
+        # model. The milestone lookup itself is skipped entirely (no `gh`
+        # call) when the repo hasn't opted in — fails open to
+        # `default_branch`, today's behavior, unchanged.
+        # #2085: resolved BEFORE the gate check now (it used to run after) —
+        # `live_gate_entry` below needs a target_branch to populate the
+        # #821/#1479 freshness anchors live.
+        from coord.branch_model import resolve_base_branch_for_issue_number  # noqa: PLC0415
+
+        target_branch = resolve_base_branch_for_issue_number(
+            repo_cfg,
+            repo_cfg.github,
+            getattr(a, "issue_number", 0),
+            cache=milestone_cache,
+        )
+
         # Gates 1+2: review + smoke, via the shared predicate (#946) so this
         # path stays in lockstep with the `coord merge` auto-enqueue loop and
         # the raw `enqueue()` helper.  Only blocks when a gate is configured
         # AND not satisfied — passes_merge_gates itself no-ops a disabled gate.
-        if not passes_merge_gates(a, config, board):
+        #
+        # #2085: `a` is a raw work Assignment — it has no `branch_head_sha`/
+        # `branch_patch_id`/`repo_github`/`target_branch` attribute at all,
+        # so handing it straight to `passes_merge_gates` made
+        # `has_approved_review`'s #821 SHA-freshness check permanently
+        # unconfirmable (fails closed on every review that carries a real
+        # `review_head_sha` — i.e. virtually every modern approval, not just
+        # the superseded-approval case this gate exists to catch).
+        # `live_gate_entry` builds the same live-anchored synthetic entry
+        # `coord.gates.build_gate_report` uses, so a genuinely fresh approval
+        # can still be confirmed via `_gho` (already available in this
+        # function for the terminal-state check below).
+        gate_entry = live_gate_entry(a, repo_cfg.github, target_branch, _gho)
+        if not passes_merge_gates(gate_entry, config, board, gh_ops=_gho):
             continue
 
         # Gate 3: not already terminal on GitHub (merged / closed).  Fail OPEN
@@ -2460,21 +2571,6 @@ def enqueue_approved_work(config, board=None) -> list[str]:
             cache=terminal_cache,
         ):
             continue
-
-        # #934: target the milestone's `feature/ms-NN` branch, not
-        # `default_branch`, when this issue belongs to a milestone and the
-        # repo opted into the develop + feature-branch-per-milestone git
-        # model. The milestone lookup itself is skipped entirely (no `gh`
-        # call) when the repo hasn't opted in — fails open to
-        # `default_branch`, today's behavior, unchanged.
-        from coord.branch_model import resolve_base_branch_for_issue_number  # noqa: PLC0415
-
-        target_branch = resolve_base_branch_for_issue_number(
-            repo_cfg,
-            repo_cfg.github,
-            getattr(a, "issue_number", 0),
-            cache=milestone_cache,
-        )
 
         if refresh_entry_assignment(
             a,

@@ -338,27 +338,23 @@ def build_gate_report(
     # save_queue) — duck-typed identically to a real queue entry so it can be
     # handed straight to merge_queue's own gate functions instead of a
     # second, driftable reimplementation of the #1479 freshness math.
-    entry = mq.QueuedMerge(
-        assignment_id=winner.assignment_id or "",
-        repo_name=repo_name,
-        repo_github=repo_cfg.github,
-        branch=winner.branch,
-        target_branch=target_branch,
-        issue_number=issue_number,
-        issue_title=winner.issue_title or "",
-        assignment_type=winner.type or "work",
-        required_gates=list(winner.required_gates or []),
-    )
-
-    # #821/#1479: populate the freshness anchors LIVE — mirrors exactly what
+    #
+    # #821/#1479: `mq.live_gate_entry` also populates the freshness anchors
+    # LIVE (when *gh_ops* is supplied) — mirrors exactly what
     # merge_queue.process() does before evaluating the review/smoke gates.
     # This matters because has_approved_review does NOT itself backfill
     # branch_head_sha (only evaluate_smoke_verdict opportunistically
     # backfills base/branch SHAs and patch-id on demand) — without doing it
     # here, a row that never went through a live `coord merge`/auto-drain
     # tick would show every staleness check as a silent no-op.
-    # #2085: when *gh_ops* is None this block never runs, so `entry.
-    # branch_head_sha` stays at its default (None) — and, since #2085,
+    # #2085: this construction used to live inline here; it is now shared
+    # with every other caller that gate-checks a raw work Assignment
+    # (`merge_queue.enqueue_approved_work`, `coord.notify`'s stalled-dispatch
+    # recovery, `coord.diagnose`'s stage-work recovery, `coord.commands.
+    # merge`'s auto-enqueue scan) via `mq.live_gate_entry`, so this report
+    # can never drift from what those call sites decide (#2096: one function
+    # answering one question, not several that happen to agree today).
+    # When *gh_ops* is None the anchors stay unpopulated — and, since #2085,
     # `has_approved_review` treats an unset branch head as UNCONFIRMED
     # rather than "nothing to compare, trust the verdict": a review carrying
     # a `review_head_sha` reports the review gate BLOCKED, not READY, when
@@ -367,23 +363,7 @@ def build_gate_report(
     # something a real `coord merge --dry-run` (which always has `gh_ops`)
     # would refuse; see `tests/test_gates.py::
     # test_gh_ops_none_skips_live_lookups_fail_open`.
-    if gh_ops is not None:
-        try:
-            entry.branch_head_sha = gh_ops.get_branch_sha(entry.repo_github, entry.branch)
-        except Exception:  # noqa: BLE001 — fail-open: unknown SHA is not blocking
-            entry.branch_head_sha = None
-        try:
-            entry.target_branch_head_sha = gh_ops.get_branch_sha(
-                entry.repo_github, entry.target_branch
-            )
-        except Exception:  # noqa: BLE001
-            entry.target_branch_head_sha = None
-        try:
-            entry.branch_patch_id = gh_ops.get_branch_patch_id(
-                entry.repo_github, entry.target_branch, entry.branch
-            )
-        except Exception:  # noqa: BLE001
-            entry.branch_patch_id = None
+    entry = mq.live_gate_entry(winner, repo_cfg.github, target_branch, gh_ops)
 
     review_required = mq.requires_review(entry, config)
     review_ok = True

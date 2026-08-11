@@ -669,6 +669,7 @@ def detect_stalled_pipeline(
     from coord.merge_queue import (  # noqa: PLC0415
         CONFLICT,
         classify_conflict,
+        live_gate_entry,
         load_queue,
         passes_merge_gates,
     )
@@ -832,7 +833,31 @@ def detect_stalled_pipeline(
                 None,
             )
             if matching_entry is None:
-                if passes_merge_gates(work, config, board):
+                # #2085: `work` is a raw board Assignment — no
+                # `branch_head_sha`/`repo_github`/`target_branch` attribute,
+                # so handing it straight to `passes_merge_gates` made the
+                # #821 SHA-freshness check inside `has_approved_review`
+                # permanently unconfirmable (fails closed on every review
+                # carrying a real `review_head_sha`, i.e. virtually every
+                # modern approval). Build the same live-anchored synthetic
+                # entry `coord.gates.build_gate_report` uses so a genuinely
+                # fresh approval can still be confirmed via `github_ops`
+                # (already imported at module level). Falls back to the raw
+                # `work` row (still gh_ops-backed, just missing target_branch/
+                # repo_github) when the repo isn't configured — the gate
+                # then fails closed exactly as before, never open.
+                gate_entry = work
+                if repo is not None and repo_github:
+                    from coord.branch_model import (  # noqa: PLC0415
+                        resolve_base_branch_for_issue_number,
+                    )
+                    target_branch = resolve_base_branch_for_issue_number(
+                        repo, repo_github, work.issue_number,
+                    )
+                    gate_entry = live_gate_entry(
+                        work, repo_github, target_branch, github_ops
+                    )
+                if passes_merge_gates(gate_entry, config, board, gh_ops=github_ops):
                     reason = "approved_not_queued"
                     detail = (
                         "Work passes every merge gate (review + test) but has "

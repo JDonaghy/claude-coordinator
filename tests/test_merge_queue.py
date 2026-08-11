@@ -3951,6 +3951,59 @@ class TestEnqueueApprovedWork:
         # advanced to round2 behind an approval that doesn't cover it.
         assert items[0].assignment_id == "round1"
 
+    def test_enqueues_fresh_approval_confirmed_via_live_branch_sha(
+        self, coord_db, monkeypatch
+    ) -> None:
+        """#2085 (fix-iteration regression guard): the review panel on this
+        same issue found that #2085's own fix — folding "current SHA
+        unknown" into the fail-CLOSED branch of `has_approved_review` —
+        broke the ordinary case, not just the superseded-approval one this
+        test's sibling above covers. `enqueue_approved_work` used to call
+        `passes_merge_gates(a, config, board)` with NO `gh_ops` at all,
+        handing `has_approved_review` a raw work `Assignment` with no
+        `branch_head_sha` attribute. Since a review captures
+        `review_head_sha` on essentially every real completion
+        (`coord.review`), that made `current_sha is None` true for almost
+        every approval — not just superseded ones — which the #2085 fix
+        then refused unconditionally: the daemon's passive-tick auto-enqueue
+        path (#736) would never enqueue a normal, unsuperseded approval
+        again.
+
+        `enqueue_approved_work` must now thread a LIVE `gh_ops` (mirroring
+        `coord.gates.build_gate_report`'s construction, via
+        `mq.live_gate_entry`) so a review whose `review_head_sha` matches the
+        branch's live current head is recognized as fresh and the work is
+        enqueued — exactly what a real `coord merge` run would do.
+        """
+        from coord import github_ops
+
+        cfg = self._config()
+        work = self._work("w1", branch="issue-1-impl", test_state="passed")
+        review = self._review("w1", verdict="approve")
+        review.review_head_sha = "sha-current"  # captured when the review ran
+        board = self._board(completed=[work, review])
+
+        # The branch's CURRENT head, live from GitHub — matches the review's
+        # captured SHA, i.e. no commits landed after the review completed.
+        monkeypatch.setattr(
+            github_ops, "get_branch_sha",
+            lambda repo, branch: "sha-current" if branch == "issue-1-impl" else None,
+        )
+        monkeypatch.setattr(github_ops, "get_branch_patch_id", lambda *a, **k: None)
+        monkeypatch.setattr(github_ops, "work_is_terminal", lambda *a, **k: False)
+
+        changed = mq.enqueue_approved_work(cfg, board)
+
+        assert changed == ["w1"], (
+            "a fresh, unsuperseded approval whose review_head_sha matches "
+            "the branch's LIVE current head must still be auto-enqueued — "
+            "#736's daemon-tick guarantee must not regress into 'never "
+            "auto-enqueues a real approval again'"
+        )
+        items = load_queue()
+        assert len(items) == 1
+        assert items[0].assignment_id == "w1"
+
     # ── #934 milestone-aware target_branch ──────────────────────────────────
 
     @staticmethod

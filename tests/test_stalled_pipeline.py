@@ -535,6 +535,35 @@ class TestApprovedNotQueued:
         )
         assert results == []
 
+    def test_flags_fresh_approval_confirmed_via_live_branch_sha(
+        self, config: Config, monkeypatch
+    ) -> None:
+        """#2085 (fix-iteration regression guard): a review that DOES carry
+        a `review_head_sha` (essentially every real review completion,
+        `coord.review`) must still be recognized as `approved_not_queued`
+        when that SHA matches the branch's LIVE current head — not silently
+        swallowed. `detect_stalled_pipeline` used to call
+        `passes_merge_gates(work, config, board)` with no `gh_ops` at all,
+        handing `has_approved_review` a raw work `Assignment` with no
+        `branch_head_sha` attribute — since #2085 made an unconfirmed SHA
+        fail CLOSED, that made this arm permanently unreachable for any
+        review carrying a real SHA, i.e. `coord drive`'s own unattended
+        recovery loop could no longer recover a perfectly good approval.
+        """
+        monkeypatch.setattr(
+            "coord.github_ops.get_branch_sha",
+            lambda repo, branch: "sha-current" if branch == "issue-602-fix" else None,
+        )
+        work = _work("work-1", test_state="passed")
+        review = _review("work-1", aid="review-1", review_verdict="approve")
+        review.review_head_sha = "sha-current"  # matches the branch's live head
+        board = _board(work, review)
+        results = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        )
+        assert len(results) == 1
+        assert results[0][0].reason == "approved_not_queued"
+
 
 # ── Terminal-state guard (#522, reused not re-derived) ──────────────────────
 
