@@ -1,0 +1,114 @@
+"""Resolve which distribution name this install landed under (#2103).
+
+Part of the `claude-coordinator` -> `code-coordinator` rename (epic #2096).
+**This module renames nothing** — `pyproject.toml` still ships as
+`claude-coordinator` — it exists so the rename, whenever it ships, doesn't
+break every already-deployed agent's self-reported version.
+
+The problem this closes: an agent reports its own version by reading its
+distribution metadata *by name* (`coord/agent_app.py`'s `_installed_version`,
+`AGENT_PKG_NAME`, `_detect_install_mode`; `coord/agent_update.py`'s smoke
+check; `coord/cli.py`'s upgrade hint). Every one of those hardcoded
+`"claude-coordinator"`. Once some machine in the fleet has `code-coordinator`
+installed instead — the transient cutover state between "the rename lands on
+PyPI" and "every agent has been updated past it" — `importlib.metadata`
+raises/returns nothing for the hardcoded name, the agent reports an unknown
+version, and `coord agent update` surfaces the `✗ did not come back` false
+negative (already the single most-recurring fleet failure) even though the
+agent is online and fully updated.
+
+The fix: resolve tolerantly, in one place, used by every site above instead
+of five independent `try/except ImportError` blocks that could each drift.
+`code-coordinator` wins when both are installed (it's the name every future
+release publishes under); `claude-coordinator` is the fallback every
+not-yet-upgraded agent still needs.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
+
+#: Resolution order. `code-coordinator` first — it's the name #2096's rename
+#: eventually publishes under, so once both names resolve (a machine that
+#: still has the old `.dist-info` lying around after an in-place upgrade,
+#: or genuinely has both installed) the new one wins rather than the old
+#: one winning by accident of being listed/checked first.
+CANDIDATE_NAMES: tuple[str, ...] = ("code-coordinator", "claude-coordinator")
+
+
+class DistributionNotFoundError(LookupError):
+    """Neither name in :data:`CANDIDATE_NAMES` is an installed distribution.
+
+    #2103 acceptance #4: callers that need to *act* on the resolved name
+    (not just report it) should let this propagate rather than silently
+    coercing it to ``None`` — a bare ``None`` is exactly what downstream
+    renders as an unqualified "did not come back", the false negative this
+    module exists to kill. The message names every candidate tried.
+    """
+
+
+@dataclass(frozen=True)
+class ResolvedDist:
+    """Which of :data:`CANDIDATE_NAMES` is actually installed, and its
+    version — the pair, not just the version, so a caller can *report*
+    which name was found rather than silently picking one."""
+
+    name: str
+    version: str
+
+
+def resolve_installed(names: tuple[str, ...] = CANDIDATE_NAMES) -> ResolvedDist:
+    """Return the first of *names* that ``importlib.metadata`` knows about,
+    paired with its installed version.
+
+    Raises :class:`DistributionNotFoundError`, naming every candidate
+    tried, when none of them is installed. Callers that want a tolerant
+    "not installed" signal instead of an exception should catch that
+    explicitly (see :func:`resolve_installed_name`) — it is not swallowed
+    here.
+    """
+    tried: list[str] = []
+    for name in names:
+        try:
+            return ResolvedDist(name=name, version=_pkg_version(name))
+        except PackageNotFoundError:
+            tried.append(name)
+            continue
+    raise DistributionNotFoundError(
+        "no coordinator distribution installed — tried: " + ", ".join(tried)
+    )
+
+
+def resolve_installed_name(names: tuple[str, ...] = CANDIDATE_NAMES) -> str | None:
+    """Convenience wrapper over :func:`resolve_installed` for callers that
+    only need the name and are fine treating "neither installed" as
+    ``None`` (best-effort reporting sites — see module docstring for the
+    one site, the pip install target, that deliberately does NOT use this
+    and lets :class:`DistributionNotFoundError` propagate instead)."""
+    try:
+        return resolve_installed(names).name
+    except DistributionNotFoundError:
+        return None
+
+
+def pkg_spec(extra: str | None = None, names: tuple[str, ...] = CANDIDATE_NAMES) -> str:
+    """Return the pip install target for whichever distribution is
+    currently installed, with *extra* (e.g. ``"server"``) appended as
+    ``name[extra]`` when given.
+
+    #2103: the ``[server]`` extra must survive under whichever name
+    resolves — a bare upgrade without it leaves a fresh venv without
+    starlette/uvicorn and the agent dead on its next restart.
+
+    Deliberately raises :class:`DistributionNotFoundError` rather than
+    guessing when neither name is installed: this is the one call site
+    (``coord/agent_app.py``'s ``/update`` handler) that decides what pip
+    actually installs next, and silently defaulting there risks installing
+    the wrong (possibly no-longer-published) name instead of failing loudly
+    with both names named. The caller already has a "report failure"
+    lane (``/update``'s ``last_update.json``) for exactly this.
+    """
+    name = resolve_installed(names).name
+    return f"{name}[{extra}]" if extra else name

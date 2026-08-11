@@ -27,6 +27,7 @@ import click
 import httpx  # noqa: F401
 
 from coord import __version__
+from coord.dist_name import pkg_spec as _dist_pkg_spec
 
 from coord.commands.acceptance import acceptance_group
 from coord.commands.audit import audit
@@ -245,6 +246,20 @@ def _warn_if_source_install_drift() -> None:
                 if staleness["days_behind"] is not None
                 else ""
             )
+            # #2103: suggest an upgrade of whichever distribution name is
+            # actually installed (`code-coordinator` once the #2096 rename
+            # ships, `claude-coordinator` until then) — `_coord.__file__` is
+            # already confirmed above to be a real site-packages install, so
+            # one of the two names is guaranteed to resolve here; the
+            # literal fallback only guards a resolution race between that
+            # check and this one. `_dist_pkg_spec` is the module-level
+            # `coord.dist_name` import above (real module, independent of
+            # `_coord` here potentially being a test stand-in), so this
+            # doesn't depend on `coord.dist_name` already being cached.
+            try:
+                install_target = _dist_pkg_spec(extra="server")
+            except Exception:  # noqa: BLE001 — best-effort, never break the CLI
+                install_target = "claude-coordinator[server]"
             banner = "⚠" * 24
             click.echo(
                 f"{banner}\n"
@@ -254,7 +269,7 @@ def _warn_if_source_install_drift() -> None:
                 f"checkout at {local_init.parent} has moved past that release.\n"
                 "This install may be silently evaluating RETIRED logic (#1182 — this is "
                 "how a false merge-gate block slipped through).  Fix:\n"
-                "  pip install --upgrade 'claude-coordinator[server]'   "
+                f"  pip install --upgrade '{install_target}'   "
                 "(if a release covers those commits)\n"
                 "  pip install -e .                           (to run live source instead)\n"
                 f"{banner}",

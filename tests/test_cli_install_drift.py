@@ -169,6 +169,20 @@ def test_stale_banner_fires_past_commit_threshold(tmp_path: Path) -> None:
     assert "Edits to the source tree will NOT reach the CLI" not in text
 
 
+def test_stale_banner_suggests_whichever_dist_name_is_installed(tmp_path: Path) -> None:
+    """#2103: once `code-coordinator` is what's actually installed (the
+    post-#2096-rename state), the hint must say so — suggesting the old
+    `claude-coordinator` name would upgrade the wrong (possibly no-longer-
+    published) package."""
+    with patch("coord.cli._dist_pkg_spec", return_value="code-coordinator[server]"):
+        result = _run_with_git_checkout(tmp_path, installed_version="0.4.4", commits_ahead=5)
+    assert result.exit_code == 0
+    text = output_and_stderr(result)
+    assert "STALE INSTALL" in text
+    assert "pip install --upgrade 'code-coordinator[server]'" in text
+    assert "claude-coordinator" not in text
+
+
 def test_stale_banner_fires_past_days_threshold(tmp_path: Path) -> None:
     """Only 1 commit ahead (below the commit threshold) but the tag is 5 days
     old (>= threshold of 2 days) → still escalates."""

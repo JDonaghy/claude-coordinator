@@ -18,6 +18,7 @@ from coord.agent import AgentServer
 from coord.agent_app import _detect_install_mode, build_app
 from coord.agent_update import UpdateResult
 from coord.cli import main
+from coord.dist_name import DistributionNotFoundError, ResolvedDist
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -322,6 +323,10 @@ class TestUpdateEndpoint:
         with (
             patch("coord.agent_app._detect_install_mode", return_value=(False, None)),
             patch(
+                "coord.dist_name.resolve_installed",
+                return_value=ResolvedDist(name="claude-coordinator", version="0.3.0"),
+            ),
+            patch(
                 "coord.agent_app.agent_update.perform_update",
                 return_value=UpdateResult(ok=True, swapped=True, new_version="9.9.9"),
             ) as mock_perform,
@@ -334,6 +339,56 @@ class TestUpdateEndpoint:
         # #1237: the package spec carries the `[server]` extra.
         assert args[1] == "claude-coordinator[server]"
         assert kwargs.get("target_version") == "9.9.9"
+        server.shutdown()
+
+    def test_update_pkg_spec_prefers_code_coordinator_when_installed(
+        self, tmp_path: Path
+    ) -> None:
+        """#2103: once `code-coordinator` is what's actually installed (the
+        post-rename state), `/update` must reinstall THAT name — reinstalling
+        the old `claude-coordinator` name would either 404 against PyPI or
+        silently resurrect the stale package."""
+        with (
+            patch("coord.agent_app._detect_install_mode", return_value=(False, None)),
+            patch(
+                "coord.dist_name.resolve_installed",
+                return_value=ResolvedDist(name="code-coordinator", version="9.9.8"),
+            ),
+            patch(
+                "coord.agent_app.agent_update.perform_update",
+                return_value=UpdateResult(ok=True, swapped=True, new_version="9.9.9"),
+            ) as mock_perform,
+        ):
+            client, server = _make_client(tmp_path)
+            client.post("/update", json={"target_version": "9.9.9"})
+            assert _wait_until(lambda: mock_perform.called)
+
+        args, _kwargs = mock_perform.call_args
+        assert args[1] == "code-coordinator[server]"
+        server.shutdown()
+
+    def test_update_reports_explicit_failure_when_neither_name_installed(
+        self, tmp_path: Path
+    ) -> None:
+        """#2103 acceptance #4: never a bare `None`/silent no-op — the
+        failure names both distribution names tried."""
+        with (
+            patch("coord.agent_app._detect_install_mode", return_value=(False, None)),
+            patch(
+                "coord.dist_name.resolve_installed",
+                side_effect=DistributionNotFoundError(
+                    "no coordinator distribution installed — tried: "
+                    "code-coordinator, claude-coordinator"
+                ),
+            ),
+        ):
+            client, server = _make_client(tmp_path)
+            client.post("/update")
+            last = _wait_for_last_update(server)
+
+        assert last["result"] == "failed"
+        assert "code-coordinator" in last["error"]
+        assert "claude-coordinator" in last["error"]
         server.shutdown()
 
     def test_update_omits_pin_when_no_target_version(self, tmp_path: Path) -> None:
@@ -667,9 +722,14 @@ class TestDetectInstallMode:
             "Location: /src/claude-coordinator\n"
             "Editable project location: /src/claude-coordinator\n"
         )
-        with patch("coord.agent_app.subprocess.run") as mock_run:
+        with (
+            patch("coord.agent_app.resolve_installed_name", return_value="claude-coordinator"),
+            patch("coord.agent_app.subprocess.run") as mock_run,
+        ):
             mock_run.return_value = MagicMock(returncode=0, stdout=pip_output, stderr="")
             is_editable, path = _detect_install_mode()
+        mock_run.assert_called_once()
+        assert mock_run.call_args.args[0][-1] == "claude-coordinator"
         assert is_editable is True
         assert path == "/src/claude-coordinator"
 
@@ -679,15 +739,53 @@ class TestDetectInstallMode:
             "Version: 0.2.0\n"
             "Location: /usr/local/lib/python3.12/site-packages\n"
         )
-        with patch("coord.agent_app.subprocess.run") as mock_run:
+        with (
+            patch("coord.agent_app.resolve_installed_name", return_value="claude-coordinator"),
+            patch("coord.agent_app.subprocess.run") as mock_run,
+        ):
             mock_run.return_value = MagicMock(returncode=0, stdout=pip_output, stderr="")
             is_editable, path = _detect_install_mode()
         assert is_editable is False
         assert path is None
 
     def test_subprocess_failure_returns_non_editable(self) -> None:
-        with patch("coord.agent_app.subprocess.run", side_effect=Exception("boom")):
+        with (
+            patch("coord.agent_app.resolve_installed_name", return_value="claude-coordinator"),
+            patch("coord.agent_app.subprocess.run", side_effect=Exception("boom")),
+        ):
             is_editable, path = _detect_install_mode()
+        assert is_editable is False
+        assert path is None
+
+    def test_uses_code_coordinator_name_when_that_resolves(self) -> None:
+        """#2103: `pip show` must be asked about whichever name resolved —
+        not a hardcoded `claude-coordinator` — so this doesn't regress back
+        to always reporting non-editable once the fleet's mid-rename."""
+        pip_output = (
+            "Name: code-coordinator\n"
+            "Version: 1.0.0\n"
+            "Location: /src/code-coordinator\n"
+            "Editable project location: /src/code-coordinator\n"
+        )
+        with (
+            patch("coord.agent_app.resolve_installed_name", return_value="code-coordinator"),
+            patch("coord.agent_app.subprocess.run") as mock_run,
+        ):
+            mock_run.return_value = MagicMock(returncode=0, stdout=pip_output, stderr="")
+            is_editable, path = _detect_install_mode()
+        assert mock_run.call_args.args[0][-1] == "code-coordinator"
+        assert is_editable is True
+        assert path == "/src/code-coordinator"
+
+    def test_neither_name_installed_skips_pip_show_entirely(self) -> None:
+        """#2103 acceptance #4: nothing to ask pip about — short-circuit
+        rather than shelling out for a name we already know isn't there."""
+        with (
+            patch("coord.agent_app.resolve_installed_name", return_value=None),
+            patch("coord.agent_app.subprocess.run") as mock_run,
+        ):
+            is_editable, path = _detect_install_mode()
+        mock_run.assert_not_called()
         assert is_editable is False
         assert path is None
 

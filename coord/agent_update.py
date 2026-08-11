@@ -145,6 +145,18 @@ def _smoke_check(slot: Path, *, target_version: str | None) -> tuple[bool, str |
     out of the import-check's own ``importlib.metadata`` read (the same
     mechanism :func:`_installed_version` uses) so a single subprocess call
     covers both "does it import" and "what version is this."
+
+    #2103: the version print resolves via ``coord.dist_name.resolve_installed``
+    (tries `code-coordinator` then falls back to `claude-coordinator`) rather
+    than a hardcoded ``m.version('claude-coordinator')`` — *slot* was just
+    installed from a pkg spec that itself resolved tolerantly (see
+    ``coord.agent_app._agent_pkg_spec``), so a hardcoded name here would
+    raise inside the new slot's own interpreter the moment that pkg spec
+    picked the other name, failing every smoke check fleet-wide the instant
+    the rename lands. Raising when *neither* name is installed is still the
+    right behavior here (not caught) — that means the fresh install is
+    genuinely broken, which is exactly what a failed smoke check should
+    report.
     """
     python = slot / "bin" / "python"
     coord_bin = slot / "bin" / "coord"
@@ -156,8 +168,8 @@ def _smoke_check(slot: Path, *, target_version: str | None) -> tuple[bool, str |
                 str(python),
                 "-c",
                 f"import {_SMOKE_IMPORTS}\n"
-                "import importlib.metadata as m\n"
-                "print(m.version('claude-coordinator'))",
+                "from coord.dist_name import resolve_installed\n"
+                "print(resolve_installed().version)",
             ],
             capture_output=True,
             text=True,
