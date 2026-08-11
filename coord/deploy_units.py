@@ -313,3 +313,72 @@ def daemon_reload(*, runner=None, timeout: float = 30.0) -> tuple[bool, str]:
     ok = getattr(proc, "returncode", 1) == 0
     out = (getattr(proc, "stderr", "") or getattr(proc, "stdout", "") or "").strip()
     return ok, out or ("daemon-reload ok" if ok else "daemon-reload failed")
+
+
+#: Which of :func:`install_units`'s outcomes mean "this unit is actually
+#: present on this host right now" — the only units eligible to be enabled
+#: below. ``ACTION_NEW`` (never installed here — safety property 1: a
+#: release does not decide which services a host runs) and
+#: ``ACTION_SKIPPED``/``ACTION_FAILED`` (this write did not land) are
+#: deliberately excluded.
+_PRESENT_ACTIONS = frozenset({ACTION_UNCHANGED, ACTION_UPDATED})
+
+
+def enable_timers(
+    report: InstallReport, *, runner=None, timeout: float = 30.0,
+) -> dict[str, tuple[bool, str]]:
+    """``systemctl --user enable --now <unit>`` for every installed timer in
+    *report* (#2082).
+
+    #2082: ``coord-release-propagate.timer`` reached three hosts'
+    ``~/.config/systemd/user/`` and sat there — :func:`install_units`
+    refreshed its *content* on every release, but nothing ever ran
+    ``enable --now`` on it, and nothing noticed because a disabled timer's
+    file looks byte-for-byte identical to an active one's (see
+    :mod:`coord.health.checks.timer_active`, the detector for exactly this).
+
+    A ``.timer`` unit is different from a ``.service`` here: which
+    *services* a host runs is a one-time topology choice
+    (``install-agent.sh``, or a human at machine setup — see this module's
+    docstring), never something a routine refresh should override. A timer
+    that exists at all has no reason to exist disabled — its whole job is to
+    fire on a schedule with nobody watching, so "installed but not enabled"
+    is invisible from the outside and would otherwise self-heal never.
+    Applying this on every deploy makes enablement an assertion this lane
+    re-checks every time it runs, the same way :func:`install_units`
+    re-asserts content every time it runs.
+
+    Both ``enable`` and ``--now`` are idempotent — an already-enabled,
+    already-active timer is untouched — so calling this on every deploy is a
+    correctness check, not a state change, in the common case. Scoped to
+    units *this* report found actually installed (:data:`_PRESENT_ACTIONS`),
+    matching the deploy step's own "only touch what this host already runs"
+    rule.
+    """
+    import subprocess  # noqa: PLC0415
+
+    run = runner or subprocess.run
+    out: dict[str, tuple[bool, str]] = {}
+    timers = sorted(
+        u.name
+        for u in report.units
+        if u.name.endswith(".timer") and u.action in _PRESENT_ACTIONS
+    )
+    for name in timers:
+        try:
+            proc = run(
+                ["systemctl", "--user", "enable", "--now", name],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except FileNotFoundError:
+            out[name] = (False, "systemctl not found (no systemd on this host)")
+            continue
+        except Exception as exc:  # noqa: BLE001 — must never crash a deploy
+            out[name] = (False, f"{type(exc).__name__}: {exc}")
+            continue
+        ok = getattr(proc, "returncode", 1) == 0
+        detail = (getattr(proc, "stderr", "") or getattr(proc, "stdout", "") or "").strip()
+        out[name] = (ok, detail or ("enabled" if ok else "enable failed"))
+    return out

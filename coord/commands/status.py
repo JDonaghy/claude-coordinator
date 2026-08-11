@@ -842,6 +842,40 @@ def _dispatch_blocker_lines_for_config_free(machine, cfg) -> list[tuple[bool, st
     return out
 
 
+def _release_lag_lines(report) -> list[tuple[bool, str]]:
+    """Render a :class:`coord.release_verify.VerifyReport`'s findings as
+    ``coord doctor`` lines (#2082).
+
+    #2082's whole complaint: ``coord release verify`` already computes
+    whether the fleet's running version matches the released one, and
+    already returns CRIT when it doesn't — nothing *routine* ever called
+    it, so a fleet could sit eleven releases behind PyPI with every other
+    readout silent. This projects that SAME computation (not a second one —
+    see the epic's "two surfaces, one function" rule) into doctor's output,
+    the same way :func:`_unit_drift_lines` above projects ``unit_drift``.
+
+    Filters out ``unit `` findings: those are ``unit_drift`` results folded
+    into ``coord release verify`` (#1834), and doctor already renders that
+    same data via :func:`_unit_drift_lines` — showing it twice would be
+    noise, not a second opinion. UNKNOWN findings (an unreachable host, a
+    lane with no data yet, "no expected version to grade against") are
+    likewise not surfaced here: they never made a problem elsewhere in this
+    command either, and their causes are already visible above (the
+    "unreachable" line, tool_versions gaps).
+    """
+    out: list[tuple[bool, str]] = []
+    for f in report.findings:
+        if f.severity not in ("crit", "warn"):
+            continue
+        if f.lane.startswith("unit "):
+            continue
+        mark = "✗ CRIT" if f.severity == "crit" else "⚠ WARN"
+        out.append((True, f"  {mark} release version: {f.host}/{f.lane}: {f.summary}"))
+        if f.detail:
+            out.append((True, f"        {f.detail}"))
+    return out
+
+
 @click.command(
     help=(
         "Fleet-wide prereq report: is this machine fit to be routed work?\n\n"
@@ -861,7 +895,30 @@ def _dispatch_blocker_lines_for_config_free(machine, cfg) -> list[tuple[bool, st
     "--timeout", default=3.0, show_default=True, type=float,
     help="Per-machine /health timeout (seconds).",
 )
-def doctor(config_path: Path, machine_filter: str | None, timeout: float) -> None:
+@click.option(
+    "--expected", default=None,
+    help=(
+        "The version every lane should be on (leading 'v' optional) — same "
+        "semantics as `coord release verify --expected` (#2082)."
+    ),
+)
+@click.option(
+    "--pypi/--no-pypi", "use_pypi", default=True, show_default=True,
+    help=(
+        "Resolve --expected from the PyPI simple index when not given "
+        "explicitly, so a fleet that is uniformly behind the released "
+        "version reads as CRIT here rather than clean (#2052's lesson, "
+        "applied to doctor by #2082) — same default `coord release verify "
+        "--pypi` uses, and the same resolution (`_resolve_expected`)."
+    ),
+)
+def doctor(
+    config_path: Path,
+    machine_filter: str | None,
+    timeout: float,
+    expected: str | None,
+    use_pypi: bool,
+) -> None:
     from coord.network import check_all
     from coord.prereqs import ToolProbe, unmet_capabilities
 
@@ -956,6 +1013,42 @@ def doctor(config_path: Path, machine_filter: str | None, timeout: float) -> Non
             any_problem = True
             for reason in reasons:
                 click.echo(f"  ✗ capability {cap!r} claimed but unmet — {reason}")
+
+    # #2082: is the fleet actually running the released version? On
+    # 2026-08-10 it was eleven releases behind (v0.5.15 vs PyPI's v0.5.26)
+    # and nothing routine said so — `coord release verify` already computed
+    # this exact comparison and already returned CRIT, it was just never
+    # called anywhere an operator would see without being told to look.
+    # Reuses that SAME function (not a second comparison — #2096's "two
+    # surfaces, one function" rule) over the `/health` bodies this command
+    # already fetched above, so this costs no extra per-machine round trip —
+    # only the one-time PyPI resolution below.
+    from coord import release_verify as rv  # noqa: PLC0415
+    from coord.commands.release import _resolve_expected  # noqa: PLC0415
+
+    index_url = getattr(getattr(cfg, "health", None), "pypi_index_url",
+                        "https://pypi.org/simple")
+    resolved_expected, resolve_warning = _resolve_expected(
+        expected, use_pypi=use_pypi, index_url=index_url, timeout=timeout
+    )
+    if resolve_warning:
+        click.echo(f"⚠ {resolve_warning}")
+
+    machine_health = {s.machine.name: (s.health if s.is_online else None) for s in statuses}
+    unreachable = {
+        s.machine.name: (s.reason or "offline") for s in statuses if not s.is_online
+    }
+    release_report = rv.verify(
+        machine_health=machine_health, unreachable=unreachable, expected=resolved_expected,
+    )
+    lag_lines = _release_lag_lines(release_report)
+    if lag_lines:
+        click.echo("")
+        click.echo("release version (coord release verify):")
+        for is_problem, line in lag_lines:
+            click.echo(line)
+            if is_problem:
+                any_problem = True
 
     # #1862: a quiet-hours window that removes the only machine with a
     # capability makes matching work silently unroutable (`dispatch_smoke`

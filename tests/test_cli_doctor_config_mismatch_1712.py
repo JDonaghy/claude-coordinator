@@ -26,9 +26,11 @@ from coord.network import ONLINE, MachineStatus
 def _run_doctor(config_path, monkeypatch, statuses, *, extra_args=None):
     monkeypatch.setattr(network_mod, "check_all", lambda *a, **k: statuses)
     runner = CliRunner()
+    # #2082: default to --no-pypi so this stays hermetic — see the identical
+    # comment in tests/test_cli_doctor.py.
     return runner.invoke(
         doctor,
-        ["--config", str(config_path), *(extra_args or [])],
+        ["--config", str(config_path), "--no-pypi", *(extra_args or [])],
         catch_exceptions=False,
     )
 

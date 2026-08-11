@@ -19,8 +19,13 @@ from coord.network import ONLINE, OFFLINE, MachineStatus
 def _run_doctor(config_path, monkeypatch, statuses, *, extra_args=None):
     monkeypatch.setattr(network_mod, "check_all", lambda *a, **k: statuses)
     runner = CliRunner()
+    # #2082: doctor resolves --expected from PyPI by default now. Default
+    # these tests to --no-pypi so they stay hermetic (no real network call);
+    # a caller wanting the pypi-resolution path passes --pypi in extra_args,
+    # which — as the LAST occurrence of the --pypi/--no-pypi flag pair on
+    # the line — wins.
     result = runner.invoke(
-        doctor, ["--config", str(config_path), *(extra_args or [])],
+        doctor, ["--config", str(config_path), "--no-pypi", *(extra_args or [])],
         catch_exceptions=False,
     )
     return result
@@ -489,3 +494,114 @@ def test_doctor_reports_a_path_shadow_risk_as_crit(valid_config_path, monkeypatc
     assert result.exit_code == 1, result.output
     assert "CRIT unit drift coord-serve.service" in result.output
     assert "PATH shadow risk" in result.output
+
+
+# ── #2082: `coord release verify` wired into `coord doctor` ───────────────
+#
+# `coord release verify` already computes whether the fleet's running
+# version matches the released one, and already returns CRIT — nothing
+# routine called it, which is #2082's whole complaint. These drive that
+# wiring end-to-end through `coord doctor` itself, the same way the
+# unit_drift tests above do for #1831.
+
+
+def _health_with_agent_venv(tool_versions: dict, machine, *, version: str) -> dict:
+    h = _health(tool_versions, machine)
+    h["health"] = {
+        "results": [{
+            "check_id": "agent_venv",
+            "severity": "ok",
+            "headroom": f"~/.coord-venv is {version}",
+            "values": {"version": version, "editable": False},
+        }],
+    }
+    return h
+
+
+def test_doctor_flags_a_fleet_uniformly_behind_the_released_version(
+    valid_config_path, monkeypatch,
+) -> None:
+    """#2082's own evidence, reproduced: every lane agrees with every other
+    lane (no internal skew for #2052's trap to catch), but PyPI has moved
+    on. This is the test that FAILS against the pre-fix `doctor`: it never
+    called `coord release verify` at all, so this exact fleet state
+    (uniformly 0.5.15 while PyPI has 0.5.26) rendered as a clean exit 0.
+    """
+    from coord.config import load
+    from coord.health.pypi import parse_version
+
+    cfg = load(valid_config_path)
+    statuses = [
+        MachineStatus(
+            machine=m, state=ONLINE,
+            health=_health_with_agent_venv(
+                {"git": _ok_probe(), "gh": _ok_probe()}, m, version="0.5.15",
+            ),
+        )
+        for m in cfg.machines
+    ]
+    monkeypatch.setattr(
+        "coord.health.pypi.latest_release_any",
+        lambda *a, **k: ("claude-coordinator", parse_version("0.5.26"), []),
+    )
+    result = _run_doctor(valid_config_path, monkeypatch, statuses, extra_args=["--pypi"])
+    assert result.exit_code == 1, result.output
+    assert "release version" in result.output
+    assert "expected 0.5.26" in result.output
+
+
+def test_doctor_is_silent_about_release_lag_on_a_current_fleet(
+    valid_config_path, monkeypatch,
+) -> None:
+    from coord.config import load
+    from coord.health.pypi import parse_version
+
+    cfg = load(valid_config_path)
+    statuses = [
+        MachineStatus(
+            machine=m, state=ONLINE,
+            health=_health_with_agent_venv(
+                {"git": _ok_probe(), "gh": _ok_probe()}, m, version="0.5.26",
+            ),
+        )
+        for m in cfg.machines
+    ]
+    monkeypatch.setattr(
+        "coord.health.pypi.latest_release_any",
+        lambda *a, **k: ("claude-coordinator", parse_version("0.5.26"), []),
+    )
+    result = _run_doctor(valid_config_path, monkeypatch, statuses, extra_args=["--pypi"])
+    assert result.exit_code == 0, result.output
+    assert "release version" not in result.output
+
+
+def test_doctor_defaults_to_pypi_resolution_without_a_flag(
+    valid_config_path, monkeypatch,
+) -> None:
+    """`--pypi` is the DEFAULT (#2082) — this is the one test in the file
+    that does not pass `--no-pypi` (see `_run_doctor`'s comment), pinning
+    that the flag really does default on rather than merely being
+    available."""
+    from coord.config import load
+    from coord.health.pypi import parse_version
+
+    cfg = load(valid_config_path)
+    statuses = [
+        MachineStatus(
+            machine=m, state=ONLINE,
+            health=_health_with_agent_venv(
+                {"git": _ok_probe(), "gh": _ok_probe()}, m, version="0.5.15",
+            ),
+        )
+        for m in cfg.machines
+    ]
+    monkeypatch.setattr(
+        "coord.health.pypi.latest_release_any",
+        lambda *a, **k: ("claude-coordinator", parse_version("0.5.26"), []),
+    )
+    monkeypatch.setattr(network_mod, "check_all", lambda *a, **k: statuses)
+    result = CliRunner().invoke(
+        doctor, ["--config", str(valid_config_path)], catch_exceptions=False,
+    )
+    assert result.exit_code == 1, result.output
+    assert "expected 0.5.26" in result.output
