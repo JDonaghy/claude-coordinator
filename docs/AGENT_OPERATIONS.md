@@ -740,10 +740,57 @@ To force the window deliberately (hold, do not kill):
 
 ```bash
 systemctl --user stop coord-drive-queue.timer   # no NEW drives launch
-# let the running drive finish; then:
+# let the running drive finish, then see the DEADLOCK below before continuing
 coord release propagate --daemon-host dellserver
 systemctl --user start coord-drive-queue.timer
 ```
+
+> **DEADLOCK — read this before using the sequence above.** Stopping the timer
+> also stops the thing that notices a drive *finished*. The reconciler that
+> moves a completed entry from `running` to `done` runs inside
+> `coord drive-queue tick`; with the timer stopped, no tick runs, so the last
+> drive's row stays `running` forever. Because every drive-queue entry charges
+> the timer host via `launch_host`, that stale row keeps dellserver marked busy
+> and propagation defers indefinitely — on a drive that ended hours ago, with
+> every machine idle.
+>
+> Observed 2026-08-10: `#2085` merged at 01:57Z; its row still read `running`
+> an hour later with zero live assignments, zero `claude -p` processes and no
+> drive tmux session anywhere.
+>
+> **There is no reconcile-only tick.** `--max-parallel 0` is rejected
+> (*"must be at least 1"*), and a normal tick reconciles *and then launches the
+> next entry*, which re-blocks the roll you were trying to take.
+>
+> **The escape** is to confirm the fleet is genuinely idle and then override the
+> stale signal. Run all four checks — the queue row is the one piece of evidence
+> you cannot trust here:
+>
+> ```bash
+> coord sessions --remote                      # expect: none
+> coord drive-queue status                     # note WHICH entry claims running
+> ssh <daemon-host> 'tmux ls'                  # expect: no coord-drive-* session
+> ssh <host> 'pgrep -fa "claude -p"'           # expect: nothing (beware: the
+>                                              # pgrep pattern matches its own
+>                                              # command line — read the output,
+>                                              # do not just count lines)
+> gh issue view <N>                            # the claimed-running issue: merged?
+> ```
+>
+> Only if all of those are clear:
+>
+> ```bash
+> coord release propagate --daemon-host dellserver --force
+> ```
+>
+> `--force` normally means *"kill in-flight headless workers"* and the run will
+> print that warning naming the stale entry. When the checks above are clear
+> that warning is **wrong** — it is reading the same stale row — and the force
+> kills nothing. Do not skip the checks on the assumption it is always wrong.
+>
+> Restarting the timer afterwards is what finally reconciles the stale row: the
+> first tick marks it `done` and launches the next entry. Tracking issue for
+> removing this trap: **#2110**.
 
 A queued entry carrying `--hold-after` (#1757) also creates the gap by design:
 the queue stops itself, propagation sees a *fired* gate as the opposite of
