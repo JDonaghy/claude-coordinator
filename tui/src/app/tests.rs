@@ -460,6 +460,91 @@
         assert_eq!(d.machine_scroll, 0);
     }
 
+    // ── #2088: machine metrics ring-buffer wrap ───────────────────────────
+
+    /// The Machines panel's CPU/mem readout must track the newest sample
+    /// even after the ring buffer (`VecDeque<MetricSample>`, capped at
+    /// `METRICS_HISTORY`) has wrapped at least once.
+    ///
+    /// Before the fix, `render_machine_sparklines` read
+    /// `VecDeque::as_slices().0` — the front slice, which is the *whole*
+    /// buffer only pre-wrap. Once `pop_front` has run (buffer full), the
+    /// front slice is the *older* portion and `.last()` on it returns a
+    /// stale sample instead of the newest push — the panel showed a machine
+    /// at 100% CPU while it was actually idle at 14%.
+    ///
+    /// Seeds `METRICS_HISTORY + 20` samples so the deque wraps well past
+    /// its capacity — a test with <= `METRICS_HISTORY` samples passes
+    /// against the buggy code and proves nothing (see issue #2088). Early
+    /// samples read a distinctive 100%/100% (the regression's stale
+    /// reading); the final sample is a distinctive 14%/11%.
+    #[test]
+    fn machine_sparkline_tracks_newest_sample_after_ring_wrap_black_box() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = CoordApp {
+            data: BoardData {
+                machines: vec![mk_machine("dellserver", "dellserver.tail", true, &[])],
+                ..BoardData::default()
+            },
+            ..make_test_app(BoardData::default())
+        };
+        app.active_view = SidebarView::Machines;
+        app.machine_sel = 0;
+
+        {
+            let buf = app
+                .machine_metrics
+                .entry("dellserver".to_string())
+                .or_default();
+            for _ in 0..(METRICS_HISTORY + 20) {
+                buf.push_back(MetricSample {
+                    cpu: 100.0,
+                    mem: 100.0,
+                });
+                // Mirror the push-site cap in settings_ui.rs so the deque's
+                // shape (and internal ring offset) matches production once
+                // it's been full and wrapping for a while.
+                if buf.len() > METRICS_HISTORY {
+                    buf.pop_front();
+                }
+            }
+            buf.push_back(MetricSample { cpu: 14.0, mem: 11.0 });
+            if buf.len() > METRICS_HISTORY {
+                buf.pop_front();
+            }
+        }
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        driver.render();
+        let screen = driver.screen();
+
+        let (_, cpu_y) = driver
+            .find("CPU")
+            .expect("CPU sparkline label must render");
+        let cpu_row: String = screen_row(&screen, cpu_y).into_iter().collect();
+        assert!(
+            cpu_row.contains("14%"),
+            "#2088: after the ring wraps, the CPU readout must track the \
+             newest sample (14%), not a stale one:\n{cpu_row}\nfull screen:\n{screen}",
+        );
+        assert!(
+            !cpu_row.contains("100%"),
+            "#2088: the stale 100% reading from before the wrap must not \
+             still be displayed:\n{cpu_row}\nfull screen:\n{screen}",
+        );
+
+        let (_, mem_y) = driver
+            .find("Mem")
+            .expect("Mem sparkline label must render");
+        let mem_row: String = screen_row(&screen, mem_y).into_iter().collect();
+        assert!(
+            mem_row.contains("11%"),
+            "#2088: the Mem readout has the identical defect and must also \
+             track the newest sample (11%):\n{mem_row}\nfull screen:\n{screen}",
+        );
+    }
+
     // ── SidebarView ───────────────────────────────────────────────────────────
 
     #[test]

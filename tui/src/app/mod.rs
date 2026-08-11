@@ -7449,11 +7449,16 @@ impl CoordApp {
             None => return,
         };
 
-        let samples: &[MetricSample] = self
+        // #2088: iterate the deque in logical order (`iter()`/`back()`)
+        // rather than `as_slices().0`, which is only the whole buffer
+        // before the ring has wrapped. Once `pop_front` has run once,
+        // the front slice is the *older* portion and shrinks over time,
+        // making `.last()` on it a stale sample rather than the newest.
+        let empty = std::collections::VecDeque::new();
+        let samples: &std::collections::VecDeque<MetricSample> = self
             .machine_metrics
             .get(machine_name)
-            .map(|d| d.as_slices().0) // front slice; fine for display
-            .unwrap_or(&[]);
+            .unwrap_or(&empty);
 
         // Split area into top (CPU) and bottom (Mem) halves.
         let half_h = area.height / 2.0;
@@ -7462,7 +7467,7 @@ impl CoordApp {
 
         // Render CPU row.
         let cpu_data: Vec<f64> = samples.iter().map(|s| s.cpu as f64).collect();
-        let last_cpu = samples.last().map(|s| s.cpu).unwrap_or(0.0);
+        let last_cpu = samples.back().map(|s| s.cpu).unwrap_or(0.0);
         self.render_metric_sparkline(
             backend, cpu_area, lh,
             "CPU",
@@ -7473,7 +7478,7 @@ impl CoordApp {
 
         // Render memory row.
         let mem_data: Vec<f64> = samples.iter().map(|s| s.mem as f64).collect();
-        let last_mem = samples.last().map(|s| s.mem).unwrap_or(0.0);
+        let last_mem = samples.back().map(|s| s.mem).unwrap_or(0.0);
         self.render_metric_sparkline(
             backend, mem_area, lh,
             "Mem",
