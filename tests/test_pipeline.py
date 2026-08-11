@@ -251,6 +251,34 @@ class TestComputePipeline:
         merge = next(s for s in pv.stages if s.name == "merge")
         assert merge.status == "completed"
 
+    def test_status_merged_gives_merged_stage_with_no_gates(self) -> None:
+        """#2084: `coord.reconcile`'s GitHub-truth sweep flips a work
+        assignment's own `status` to "merged" independently of the merge
+        queue — no `QueuedMerge` entry at all here, unlike
+        test_merge_queue_merged_gives_merged. Before this fix, an assignment
+        in this state fell through to the generic "done" stage and was
+        offered "Dispatch Review"/"Queue for Merge"/"Record Test Verdict" on
+        code that had already been reviewed, tested, and merged."""
+        a = _work(status="merged")
+        pv = compute_pipeline(a, _board(a), [], _config())
+        assert pv.current_stage == "merged"
+        assert pv.progress_pct == 100
+        assert pv.available_gates == []
+        merge = next(s for s in pv.stages if s.name == "merge")
+        assert merge.status == "completed"
+
+    def test_status_advisory_gives_done_stage_with_no_gates(self) -> None:
+        """#2084: a status the "fresh work awaiting its first gate" branch
+        doesn't recognize (e.g. "advisory" — a 0-commit clean exit with no
+        code to test/review/merge) still displays as the "done" stage
+        (unchanged — #2066's api_pipeline recency cutoff already treats
+        "done" as quiescent/ageable) but must not offer any of the
+        gates that assume genuine unfinished downstream work."""
+        a = _work(status="advisory")
+        pv = compute_pipeline(a, _board(a), [], _config())
+        assert pv.current_stage == "done"
+        assert pv.available_gates == []
+
     def test_failed_assignment_gives_failed_stage(self) -> None:
         a = _work(status="failed")
         pv = compute_pipeline(a, _board(a), [], _config())

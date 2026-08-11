@@ -1,0 +1,139 @@
+{
+  "_comment": [
+    "#2084 — a board mixing genuinely-terminal work with one genuinely-live",
+    "item, for the black-box regression that a terminal assignment's",
+    "available_gates is empty (so it never inflates the 'Needs me' badge).",
+    "",
+    "'work-merged-direct' reproduces the dominant real-world defect: ",
+    "coord.reconcile's GitHub-truth sweep (work_is_terminal) flips a work",
+    "assignment's OWN status to 'merged' independently of the merge queue —",
+    "no QueuedMerge entry exists for it here at all, and its review already",
+    "landed an 'approve' verdict long before the fixture's frozen clock.",
+    "Before #2084, compute_pipeline had no branch for status=='merged' and",
+    "fell through to the generic 'done' stage, offering 'Dispatch",
+    "Review'/'Queue for Merge'/'Record Test Verdict' on code that was",
+    "already reviewed and merged.",
+    "",
+    "'work-advisory' is a 0-commit clean exit (#448) — status='advisory',",
+    "nothing to test/review/merge either.",
+    "",
+    "'work-needs-me' is the one genuinely fresh item: status='done', nothing",
+    "dispatched downstream yet — the single row the 'Needs me' badge should",
+    "count."
+  ],
+  "now": 1750000000.0,
+
+  "board": {
+    "round_number": 3,
+    "assignments": [
+      {
+        "assignment_id": "work-needs-me",
+        "machine_name": "precision",
+        "repo_name": "claude-coordinator",
+        "repo_github": "JDonaghy/claude-coordinator",
+        "issue_number": 5201,
+        "issue_title": "stage: needs me (fresh done, #2084)",
+        "status": "done",
+        "type": "work",
+        "branch": "issue-5201-needs-me",
+        "model": "sonnet",
+        "dispatched_at": 1749999000.0,
+        "finished_at": 1749999400.0,
+        "exit_code": 0,
+        "required_gates": ["test", "review", "merge"],
+        "is_interactive": 0
+      },
+      {
+        "assignment_id": "work-merged-direct",
+        "machine_name": "dellserver",
+        "repo_name": "claude-coordinator",
+        "repo_github": "JDonaghy/claude-coordinator",
+        "issue_number": 5202,
+        "issue_title": "stage: merged via reconcile status flip (#2084)",
+        "status": "merged",
+        "type": "work",
+        "branch": "issue-5202-merged-direct",
+        "model": "sonnet",
+        "dispatched_at": 1749900000.0,
+        "finished_at": 1749901000.0,
+        "exit_code": 0,
+        "test_state": "passed",
+        "required_gates": ["test", "review", "merge"],
+        "is_interactive": 0
+      },
+      {
+        "assignment_id": "rev-merged-direct",
+        "machine_name": "precision",
+        "repo_name": "claude-coordinator",
+        "repo_github": "JDonaghy/claude-coordinator",
+        "issue_number": 5202,
+        "issue_title": "stage: merged via reconcile status flip (#2084)",
+        "status": "done",
+        "type": "review",
+        "review_of_assignment_id": "work-merged-direct",
+        "dispatched_at": 1749901100.0,
+        "finished_at": 1749901600.0,
+        "review_verdict": "approve",
+        "review_posted_at": 1749901700.0,
+        "is_interactive": 0
+      },
+      {
+        "assignment_id": "work-advisory",
+        "machine_name": "dellserver",
+        "repo_name": "claude-coordinator",
+        "repo_github": "JDonaghy/claude-coordinator",
+        "issue_number": 5203,
+        "issue_title": "stage: advisory 0-commit exit (#2084)",
+        "status": "advisory",
+        "type": "work",
+        "dispatched_at": 1749800000.0,
+        "finished_at": 1749800300.0,
+        "exit_code": 0,
+        "required_gates": ["test", "review", "merge"],
+        "is_interactive": 0
+      }
+    ],
+    "plans": {},
+    "notifications": []
+  },
+
+  "merge_queue": [],
+
+  "proposals": [],
+
+  "machines": [
+    {
+      "name": "precision",
+      "host": "precision.tailnet",
+      "repos": ["claude-coordinator"],
+      "state": "online",
+      "reason": null,
+      "latency_ms": 12,
+      "assignments": {"active": [], "completed": []}
+    },
+    {
+      "name": "dellserver",
+      "host": "dellserver.tailnet",
+      "repos": ["claude-coordinator"],
+      "state": "online",
+      "reason": null,
+      "latency_ms": 8,
+      "assignments": {"active": [], "completed": []}
+    }
+  ],
+
+  "sessions": [],
+
+  "review_findings": {
+    "rev-merged-direct": {
+      "verdict": "approve",
+      "body": "## Findings\n\nApproved and merged before reconcile flipped work-merged-direct's own status."
+    }
+  },
+
+  "diffs": {},
+
+  "chat_reply": "fixture mode: no provider is contacted and no tokens are spent.",
+
+  "events": []
+}

@@ -94,20 +94,25 @@ async function waitForReady(baseUrl: string, timeoutMs = 15_000): Promise<void> 
 }
 
 /**
- * Starts a fresh `coord web --fixture tests/fixtures/board-pipeline-basic.json`
- * on a free port, serving the just-built `dist/`. Resolves `coord` on
- * `$PATH` exactly the way a real operator's shell (or the acceptance
- * driver's `run:` command) would — deliberately not hard-coded to any one
- * machine's venv path.
+ * Starts a fresh `coord web --fixture <fixturePath>` on a free port, serving
+ * the just-built `dist/`. Resolves `coord` on `$PATH` exactly the way a real
+ * operator's shell (or the acceptance driver's `run:` command) would —
+ * deliberately not hard-coded to any one machine's venv path.
+ *
+ * `fixturePath` defaults to `FIXTURE_PATH` (`board-pipeline-basic.json`, the
+ * #1538 reference board `live-update-fixture.spec.ts` uses) — pass a
+ * different fixture to drive the real server against other seeded scenarios
+ * (e.g. `available-gates-terminal.spec.ts`'s #2084 fixture) without
+ * duplicating the subprocess-management plumbing.
  */
-export async function startFixtureServer(): Promise<FixtureServerHandle> {
+export async function startFixtureServer(fixturePath: string = FIXTURE_PATH): Promise<FixtureServerHandle> {
   buildDist()
   const port = await freePort()
   const baseUrl = `http://127.0.0.1:${port}`
 
   const proc = spawn(
     'coord',
-    ['web', '--fixture', FIXTURE_PATH, '--dist', DIST_DIR, '--host', '127.0.0.1', '--port', String(port)],
+    ['web', '--fixture', fixturePath, '--dist', DIST_DIR, '--host', '127.0.0.1', '--port', String(port)],
     { cwd: REPO_ROOT, stdio: 'pipe' },
   )
   let output = ''
