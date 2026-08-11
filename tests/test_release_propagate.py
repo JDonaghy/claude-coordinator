@@ -149,6 +149,98 @@ def test_queue_key_falls_back_across_row_spellings():
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# #2110: a `running` row is re-checked against the board on READ, not just
+# on the tick's own cadence — a stopped timer must not make it unfalsifiable.
+# ──────────────────────────────────────────────────────────────────────────
+#
+# The exact #2085 shape: the queue row still said `running` an hour after
+# the issue closed and its PR merged, because the reconciler that would have
+# caught this lives inside `coord drive-queue tick`, and the timer was
+# stopped. `assess_quiescence` must not trust `state == "running"` blindly —
+# it has the same board it would need to disprove that on its own.
+
+
+def test_a_running_entry_whose_issue_closed_is_stale_not_busy():
+    q = rp.assess_quiescence(
+        queue_entries=[
+            {"repo_name": "claude-coordinator", "issue_number": 2085,
+             "state": STATE_RUNNING, "launch_host": "dellserver"},
+        ],
+        issues=[
+            {"repo_name": "claude-coordinator", "number": 2085, "state": "closed"},
+        ],
+    )
+    assert q.quiescent
+    assert q.busy == ()
+    assert q.stale == ("claude-coordinator#2085",)
+
+
+def test_a_running_entry_whose_pr_merged_is_stale_not_busy():
+    q = rp.assess_quiescence(
+        queue_entries=[
+            {"repo_name": "claude-coordinator", "issue_number": 2085,
+             "state": STATE_RUNNING, "launch_host": "dellserver"},
+        ],
+        assignments=[
+            {"repo_name": "claude-coordinator", "issue_number": 2085,
+             "type": "work", "status": "merged"},
+        ],
+    )
+    assert q.quiescent
+    assert q.busy == ()
+    assert q.stale == ("claude-coordinator#2085",)
+
+
+def test_the_exact_2085_shape_closed_and_merged_and_running_row():
+    """Both witnesses present at once, as they were on 2026-08-10: issue
+    closed, PR merged, the drive-queue row still `running`, no live session
+    anywhere (this function never had one to begin with — the point is it
+    does not need one). Must defer to nothing — the fleet reads quiescent."""
+    q = rp.assess_quiescence(
+        queue_entries=[
+            {"repo_name": "claude-coordinator", "issue_number": 2085,
+             "state": STATE_RUNNING, "launch_host": "dellserver"},
+        ],
+        assignments=[
+            {"repo_name": "claude-coordinator", "issue_number": 2085,
+             "type": "work", "status": "merged"},
+        ],
+        issues=[
+            {"repo_name": "claude-coordinator", "number": 2085, "state": "closed"},
+        ],
+    )
+    assert q.quiescent, q.reason
+    assert q.stale == ("claude-coordinator#2085",)
+    assert q.rollable_hosts(["dellserver", "precision"]) == ["dellserver", "precision"]
+
+
+def test_a_running_entry_whose_issue_is_still_open_stays_busy():
+    """The disproof only fires on real evidence — an open issue with no
+    merged work is genuinely indistinguishable from an in-flight drive, so
+    this must still block exactly as it always has."""
+    q = rp.assess_quiescence(
+        queue_entries=[
+            {"repo_name": "r", "issue_number": 1, "state": STATE_RUNNING,
+             "launch_host": "dellserver"},
+        ],
+        issues=[{"repo_name": "r", "number": 1, "state": "open"}],
+    )
+    assert not q.quiescent
+    assert q.stale == ()
+    assert len(q.busy) == 1
+
+
+def test_stale_rows_are_carried_into_to_dict():
+    q = rp.assess_quiescence(
+        queue_entries=[
+            {"repo_name": "r", "issue_number": 1, "state": STATE_RUNNING},
+        ],
+        issues=[{"repo_name": "r", "number": 1, "state": "closed"}],
+    )
+    assert q.to_dict()["stale"] == ["r#1"]
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # #2067: quiescence is per-host, not fleet-wide all-or-nothing
 # ──────────────────────────────────────────────────────────────────────────
 #

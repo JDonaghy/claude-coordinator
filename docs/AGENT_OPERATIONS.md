@@ -740,57 +740,45 @@ To force the window deliberately (hold, do not kill):
 
 ```bash
 systemctl --user stop coord-drive-queue.timer   # no NEW drives launch
-# let the running drive finish, then see the DEADLOCK below before continuing
+coord drive-queue tick --reconcile-only         # drain any row the timer would have caught
 coord release propagate --daemon-host dellserver
 systemctl --user start coord-drive-queue.timer
 ```
 
-> **DEADLOCK — read this before using the sequence above.** Stopping the timer
-> also stops the thing that notices a drive *finished*. The reconciler that
-> moves a completed entry from `running` to `done` runs inside
-> `coord drive-queue tick`; with the timer stopped, no tick runs, so the last
-> drive's row stays `running` forever. Because every drive-queue entry charges
-> the timer host via `launch_host`, that stale row keeps dellserver marked busy
-> and propagation defers indefinitely — on a drive that ended hours ago, with
-> every machine idle.
->
-> Observed 2026-08-10: `#2085` merged at 01:57Z; its row still read `running`
-> an hour later with zero live assignments, zero `claude -p` processes and no
-> drive tmux session anywhere.
->
-> **There is no reconcile-only tick.** `--max-parallel 0` is rejected
-> (*"must be at least 1"*), and a normal tick reconciles *and then launches the
-> next entry*, which re-blocks the roll you were trying to take.
->
-> **The escape** is to confirm the fleet is genuinely idle and then override the
-> stale signal. Run all four checks — the queue row is the one piece of evidence
-> you cannot trust here:
->
-> ```bash
-> coord sessions --remote                      # expect: none
-> coord drive-queue status                     # note WHICH entry claims running
-> ssh <daemon-host> 'tmux ls'                  # expect: no coord-drive-* session
-> ssh <host> 'pgrep -fa "claude -p"'           # expect: nothing (beware: the
->                                              # pgrep pattern matches its own
->                                              # command line — read the output,
->                                              # do not just count lines)
-> gh issue view <N>                            # the claimed-running issue: merged?
-> ```
->
-> Only if all of those are clear:
->
-> ```bash
-> coord release propagate --daemon-host dellserver --force
-> ```
->
-> `--force` normally means *"kill in-flight headless workers"* and the run will
-> print that warning naming the stale entry. When the checks above are clear
-> that warning is **wrong** — it is reading the same stale row — and the force
-> kills nothing. Do not skip the checks on the assumption it is always wrong.
->
-> Restarting the timer afterwards is what finally reconciles the stale row: the
-> first tick marks it `done` and launches the next entry. Tracking issue for
-> removing this trap: **#2110**.
+**#2110 (fixed 2026-08-11):** stopping the timer used to deadlock this
+sequence. The reconciler that moves a completed entry from `running` to
+`done` runs inside `coord drive-queue tick`; with the timer stopped, no tick
+ran, so the last drive's row stayed `running` forever, and because every
+drive-queue entry charges the timer host via `launch_host`, that stale row
+kept dellserver marked busy and `coord release propagate` deferred
+indefinitely — on a drive that had ended hours ago, with every machine idle.
+Observed 2026-08-10: `#2085` merged at 01:57Z; its row still read `running`
+an hour later with zero live assignments, zero `claude -p` processes and no
+drive tmux session anywhere. The only escape was `--force`, which is supposed
+to mean *"kill in-flight headless workers"* — overloading it to mean *"ignore
+a lying row"* is how an operator learns to distrust its warning.
+
+Two independent fixes closed the trap, and normal operation no longer needs
+either workaround:
+
+* **`coord drive-queue tick --reconcile-only`** (equivalently, `--max-parallel
+  0`) is the missing primitive named above: it reconciles every `running`
+  entry against the board exactly as a normal tick would — a finished one
+  moves to `done`, a permanently-refused one to `blocked`, a CI-pending one
+  parks — and then stops. No capacity walk, no queue-level alert, no launch.
+  Safe to run by hand with the timer stopped, which is what the sequence
+  above now does before calling `propagate`.
+* **`coord release propagate` itself no longer trusts a `running` row on
+  faith.** `assess_quiescence` re-derives the same disproof the tick uses
+  (the entry's own issue merged or closed) against the board it already read
+  for this run, so even a row nobody drained is excluded from `busy` — it
+  cannot be in flight if its issue has landed. A run that ignores a stale row
+  this way prints a `note: ignoring stale drive-queue row(s)...` line and
+  records it under `quiescence.stale` in the journal, so a self-corrected row
+  stays visible instead of just quietly not blocking.
+
+`--force` is back to meaning only what it always meant — kill in-flight
+workers — and should not be needed for this sequence anymore.
 
 A queued entry carrying `--hold-after` (#1757) also creates the gap by design:
 the queue stops itself, propagation sees a *fired* gate as the opposite of

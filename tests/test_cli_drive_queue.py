@@ -456,6 +456,82 @@ def test_a_finished_drive_is_reconciled_done_and_frees_its_slot(
     assert "1654" in " ".join(launches[0])
 
 
+# ── tick: --reconcile-only (#2110) ───────────────────────────────────────────
+#
+# The missing primitive the stop-the-timer-to-roll-the-fleet sequence needed:
+# update the queue's view of reality (a finished `running` row moves to
+# `done`) without ever starting a new `coord drive`. Both halves need a test,
+# since launching is the failure mode a bug here would reintroduce.
+
+
+def test_reconcile_only_marks_a_finished_entry_done_and_launches_nothing(
+    cli, seed, launches
+):
+    seed(
+        issues={1650: "closed", 1654: "open"},
+        assignments=[{"issue_number": 1650, "status": "merged"}],
+    )
+    cli("add", REPO, "1650")
+    cli("add", REPO, "1654")
+    state._update_drive_queue_entry_local(REPO, 1650, state="running")
+
+    result = cli("tick", "--reconcile-only")
+    assert result.exit_code == 0, result.output
+    assert "--reconcile-only" in result.output
+    assert queued(1650)["state"] == "done"
+    # The eligible successor is NOT launched — that is the entire point.
+    assert launches == []
+    assert queued(1654)["state"] == "waiting"
+
+
+def test_max_parallel_zero_behaves_exactly_like_reconcile_only(
+    cli, seed, launches
+):
+    seed(
+        issues={1650: "closed", 1654: "open"},
+        assignments=[{"issue_number": 1650, "status": "merged"}],
+    )
+    cli("add", REPO, "1650")
+    cli("add", REPO, "1654")
+    state._update_drive_queue_entry_local(REPO, 1650, state="running")
+
+    result = cli("tick", "--max-parallel", "0")
+    assert result.exit_code == 0, result.output
+    assert queued(1650)["state"] == "done"
+    assert launches == []
+
+
+def test_reconcile_only_leaves_a_genuinely_live_drive_running(
+    cli, seed, launches, live_sessions
+):
+    """A healthy in-flight drive must not be disturbed by a reconcile-only
+    run — this is "update the view of reality", not "clear every row"."""
+    seed(issues={1650: "open"})
+    cli("add", REPO, "1650")
+    state._update_drive_queue_entry_local(REPO, 1650, state="running")
+    live_sessions(1650)
+
+    result = cli("tick", "--reconcile-only")
+    assert result.exit_code == 0, result.output
+    assert queued(1650)["state"] == "running"
+    assert launches == []
+
+
+def test_reconcile_only_raises_no_queue_level_alert(cli, seed, launches):
+    """A stalled-looking queue under a normal tick would escalate (#1754);
+    a reconcile-only run must not, since it never even attempts the capacity
+    walk that decides whether anything is eligible to launch."""
+    seed(issues={1650: "open"})
+    cli("add", REPO, "1650")
+
+    result = cli("tick", "--reconcile-only")
+    assert result.exit_code == 0, result.output
+    assert (
+        state._get_drive_escalation_local(QUEUE_ALERT_REPO, QUEUE_ALERT_ISSUE)
+        is None
+    )
+
+
 # ── tick: per-repo capacity (#1972) ──────────────────────────────────────────
 
 
