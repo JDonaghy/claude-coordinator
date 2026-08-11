@@ -183,6 +183,106 @@ def test_a_dry_run_writes_nothing(reference, installed):
     assert not list(installed.glob("*.bak"))
 
 
+# ── enable_timers (#2082) ─────────────────────────────────────────────────
+#
+# #2082: `coord-release-propagate.timer` reached three hosts' installed
+# directory and sat there disabled for a day — `install_units` refreshed its
+# CONTENT every release; nothing ever ran `systemctl --user enable --now` on
+# it. These tests pin the fix: every *installed* (not merely packaged)
+# `.timer` unit gets `enable --now` asserted every deploy, regardless of
+# whether its content happened to change this run.
+
+
+class _FakeRun:
+    """Records every `systemctl` invocation `enable_timers` makes."""
+
+    def __init__(self, ok: bool = True):
+        self.ok = ok
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv, **_kwargs):
+        self.calls.append(list(argv))
+
+        class _Proc:
+            returncode = 0 if self.ok else 1
+            stdout = ""
+            stderr = "" if self.ok else "Failed to enable"
+
+        return _Proc()
+
+
+def test_enable_timers_touches_every_installed_timer(reference, installed):
+    """The dellserver repro: `coord-serve.timer` is installed (unchanged
+    content) — it must still get `enable --now`, because enable state is
+    independent of content and nothing else asserts it."""
+    (installed / "coord-serve.timer").write_text("[Timer]\nOnUnitActiveSec=1min\n")
+    report = du.install_units(target_dir=installed, reference_dir=reference,
+                              machine_name="dellserver", port=7433)
+    assert _by_name(report)["coord-serve.timer"].action == du.ACTION_UNCHANGED
+
+    fake = _FakeRun()
+    result = du.enable_timers(report, runner=fake)
+    assert result == {"coord-serve.timer": (True, "enabled")}
+    assert fake.calls == [
+        ["systemctl", "--user", "enable", "--now", "coord-serve.timer"]
+    ]
+
+
+def test_enable_timers_skips_a_unit_this_host_does_not_run(reference, installed):
+    """`coord-serve.timer` is packaged but was never installed here (safety
+    property 1: a release does not decide which services a host runs) —
+    `install_units` reports it ACTION_NEW, and enabling it would violate the
+    exact rule that makes the content-refresh side of this module safe."""
+    report = du.install_units(target_dir=installed, reference_dir=reference,
+                              machine_name="dellserver", port=7433)
+    assert _by_name(report)["coord-serve.timer"].action == du.ACTION_NEW
+
+    fake = _FakeRun()
+    result = du.enable_timers(report, runner=fake)
+    assert result == {}
+    assert fake.calls == []
+
+
+def test_enable_timers_ignores_service_units(reference, installed):
+    """Only `.timer` units are touched — a `.service`'s enablement is a
+    one-time topology choice (install-agent.sh, or a human at setup), not
+    something a routine content refresh should override."""
+    report = du.install_units(target_dir=installed, reference_dir=reference,
+                              machine_name="dellserver", port=7433)
+    fake = _FakeRun()
+    du.enable_timers(report, runner=fake)
+    assert all(not argv[-1].endswith(".service") for argv in fake.calls)
+
+
+def test_enable_timers_reports_a_failure_without_crashing(reference, installed):
+    (installed / "coord-serve.timer").write_text("[Timer]\nOnUnitActiveSec=1min\n")
+    report = du.install_units(target_dir=installed, reference_dir=reference,
+                              machine_name="dellserver", port=7433)
+    fake = _FakeRun(ok=False)
+    result = du.enable_timers(report, runner=fake)
+    ok, detail = result["coord-serve.timer"]
+    assert not ok
+    assert "Failed to enable" in detail
+
+
+def test_enable_timers_degrades_without_systemd():
+    def _boom(*_a, **_k):
+        raise FileNotFoundError("systemctl")
+
+    report = du.InstallReport(units=[du.UnitOutcome("x.timer", du.ACTION_UPDATED)])
+    result = du.enable_timers(report, runner=_boom)
+    ok, detail = result["x.timer"]
+    assert not ok
+    assert "no systemd" in detail
+
+
+def test_enable_timers_is_a_noop_with_no_timers_in_the_report(reference, installed):
+    (installed / "coord-web.service").write_text("[Service]\nExecStart=old\n")
+    report = du.install_units(target_dir=installed, reference_dir=reference,
+                              machine_name="dellserver", port=7433)
+    assert du.enable_timers(report, runner=_FakeRun()) == {}
+
+
 # ── degradation ──────────────────────────────────────────────────────────
 
 
