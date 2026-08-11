@@ -247,19 +247,24 @@ def _warn_if_source_install_drift() -> None:
                 else ""
             )
             # #2103: suggest an upgrade of whichever distribution name is
-            # actually installed (`code-coordinator` once the #2096 rename
-            # ships, `claude-coordinator` until then) — `_coord.__file__` is
-            # already confirmed above to be a real site-packages install, so
-            # one of the two names is guaranteed to resolve here; the
-            # literal fallback only guards a resolution race between that
-            # check and this one. `_dist_pkg_spec` is the module-level
+            # actually installed — `code-coordinator` since the #2104 rename,
+            # `claude-coordinator` on an agent that has not been updated past
+            # it yet. `_coord.__file__` is already confirmed above to be a
+            # real site-packages install, so one of the two names is
+            # guaranteed to resolve here; the literal fallback only guards a
+            # resolution race between that check and this one. It names the
+            # NEW distribution (#2104): the only way to reach it is "neither
+            # name resolved", and the one name guaranteed to still be
+            # publishable is the one every future release ships under —
+            # `claude-coordinator` is a tombstone that will never gain
+            # another version. `_dist_pkg_spec` is the module-level
             # `coord.dist_name` import above (real module, independent of
             # `_coord` here potentially being a test stand-in), so this
             # doesn't depend on `coord.dist_name` already being cached.
             try:
                 install_target = _dist_pkg_spec(extra="server")
             except Exception:  # noqa: BLE001 — best-effort, never break the CLI
-                install_target = "claude-coordinator[server]"
+                install_target = "code-coordinator[server]"
             banner = "⚠" * 24
             click.echo(
                 f"{banner}\n"

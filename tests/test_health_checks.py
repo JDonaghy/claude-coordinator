@@ -292,12 +292,12 @@ def _pip_show(monkeypatch, stdout: str, returncode: int = 0) -> None:
 
 
 PYPI_SHOW = (
-    "Name: claude-coordinator\n"
+    "Name: code-coordinator\n"
     "Version: 0.4.91\n"
     "Location: /home/x/.coord-venv/lib/python3.12/site-packages\n"
 )
 EDITABLE_SHOW = (
-    "Name: claude-coordinator\n"
+    "Name: code-coordinator\n"
     "Version: 0.4.92\n"
     "Location: /home/x/.coord-venv/lib/python3.12/site-packages\n"
     "Editable project location: /home/x/src/claude-coordinator\n"
@@ -351,7 +351,7 @@ def test_resolve_agent_python_falls_back_to_the_agent_venv(tmp_path) -> None:
     assert agent_install.resolve_agent_python(make_ctx(tmp_path)) == venv_python
 
 
-def _index(versions, project="claude-coordinator") -> str:
+def _index(versions, project="code-coordinator") -> str:
     stem = project.replace("-", "_")
     anchors = "".join(
         f'<a href="https://files.pythonhosted.org/x/{stem}-{v}-py3-none-any.whl'

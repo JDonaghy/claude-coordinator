@@ -10,8 +10,8 @@ the check into a source of confusion instead of a signal.
 
 The index is HTML (PEP 503) whose anchors are distribution filenames::
 
-    <a href="...">claude_coordinator-0.4.91-py3-none-any.whl</a>
-    <a href="...">claude_coordinator-0.4.91.tar.gz</a>
+    <a href="...">code_coordinator-0.4.91-py3-none-any.whl</a>
+    <a href="...">code_coordinator-0.4.91.tar.gz</a>
 
 Parsing is filename-based and defensive: anything unrecognised is skipped
 rather than raising.  Yanked releases carry ``data-yanked`` on the anchor and
@@ -75,7 +75,7 @@ _VERSION_RE = re.compile(
 
 
 def normalize_name(name: str) -> str:
-    """PEP 503 normalised project name (``claude_coordinator`` → ``claude-coordinator``)."""
+    """PEP 503 normalised project name (``code_coordinator`` → ``code-coordinator``)."""
     return _NORMALIZE_RE.sub("-", name).lower()
 
 

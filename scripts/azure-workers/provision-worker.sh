@@ -153,7 +153,7 @@ as_coord "python3 -m venv ~/.coord-venv"
 as_coord "~/.coord-venv/bin/pip install --upgrade pip -q"
 # #1237: the `[server]` extra is mandatory on an agent — the base package is a
 # client-only CLI and `coord agent` there refuses to boot.
-as_coord "~/.coord-venv/bin/pip install --upgrade 'claude-coordinator[server]' -q"
+as_coord "~/.coord-venv/bin/pip install --upgrade 'code-coordinator[server]' -q"
 as_coord "~/.coord-venv/bin/coord version"
 
 as_coord "mkdir -p ~/src"
@@ -171,7 +171,7 @@ done
 as_coord "cd ~/src/claude-coordinator/tui 2>/dev/null && cargo fetch --locked || true"
 
 # Warm pip + npm caches for the coordinator's own dev/test deps.
-as_coord "~/.coord-venv/bin/pip download -q -d /tmp/wheelwarm 'claude-coordinator[dev]' 2>/dev/null || true; rm -rf /tmp/wheelwarm"
+as_coord "~/.coord-venv/bin/pip download -q -d /tmp/wheelwarm 'code-coordinator[dev]' 2>/dev/null || true; rm -rf /tmp/wheelwarm"
 as_coord "cd ~/src/claude-coordinator/coord/dashboard/webapp && npm ci --prefer-offline 2>/dev/null || true"
 
 if [[ $SEED_CARGO_TARGET -eq 1 ]]; then

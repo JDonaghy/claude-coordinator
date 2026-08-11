@@ -21,7 +21,7 @@ each *silent* failures otherwise:
 
 2. **The ``[server]`` extra survived.**  PKG-1 (#1237) split the install into
    a small client base plus a ``server`` extra, and the whole
-   agent/daemon fleet installs ``claude-coordinator[server]``.  If that
+   agent/daemon fleet installs ``code-coordinator[server]``.  If that
    extra ever stops being declared in the built metadata, every
    ``install-agent.sh`` / ``coord agent update`` silently installs a
    *client* onto a server host.
@@ -153,7 +153,7 @@ def verify(dist: Path, tag: str, *, require_webapp: bool = True) -> Version:
                 problems.append(
                     f"{wheel.name} declares no `Provides-Extra: {REQUIRED_EXTRA}` — "
                     "every agent/daemon host installs "
-                    f"claude-coordinator[{REQUIRED_EXTRA}] and would silently get "
+                    f"code-coordinator[{REQUIRED_EXTRA}] and would silently get "
                     "a client-only install"
                 )
         if require_webapp and not wheel_contains_webapp(wheel):

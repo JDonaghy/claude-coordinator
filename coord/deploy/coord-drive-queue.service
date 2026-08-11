@@ -40,7 +40,7 @@
 # machine's `coord` is a non-editable install before trusting it unattended:
 #
 #   readlink -f ~/.local/bin/coord
-#   pip show claude-coordinator | grep -i editable   # must print NOTHING
+#   pip show code-coordinator | grep -i editable     # must print NOTHING
 #
 # An editable checkout (e.g. elitebook's dev box, where ~/.local/bin/coord
 # points at ~/src/claude-coordinator) lets a worker's branch churn rewrite the

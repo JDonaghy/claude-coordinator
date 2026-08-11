@@ -1,6 +1,6 @@
 """The base install is a *client* — no server stack (#1237, PKG-1).
 
-``pip install claude-coordinator`` must give a third party a working CLI for
+``pip install code-coordinator`` must give a third party a working CLI for
 driving a *remote* fleet without dragging in a web server. That means:
 
 1. ``[project].dependencies`` in pyproject.toml carries no server package;
@@ -103,7 +103,7 @@ def _requirement_names(specs: list[str]) -> set[str]:
 def test_server_dep_is_not_a_base_dependency(module: str) -> None:
     """The whole point of #1237: a client install must not carry the server
     stack. If someone re-adds one of these to ``[project].dependencies``,
-    every downstream `pip install claude-coordinator` silently grows a web
+    every downstream `pip install code-coordinator` silently grows a web
     server again."""
     base = _requirement_names(_pyproject()["project"]["dependencies"])
     assert module not in base, (
@@ -147,7 +147,7 @@ def test_dev_and_all_extras_pull_in_the_server_extra() -> None:
     extras = _pyproject()["project"]["optional-dependencies"]
     for name in ("dev", "all"):
         assert any(
-            "claude-coordinator[server]" in spec.replace(" ", "")
+            "code-coordinator[server]" in spec.replace(" ", "")
             for spec in extras[name]
         ), f"the {name!r} extra no longer pulls in [server] (#1237)"
 
@@ -221,7 +221,7 @@ def test_server_commands_explain_the_missing_extra(argv: list[str]) -> None:
     assert result.returncode == 0, result.stderr
     out = result.stdout
     assert "EXIT:1" in out, out
-    assert "pip install 'claude-coordinator[server]'" in out, out
+    assert "pip install 'code-coordinator[server]'" in out, out
     assert f"coord {argv[0]}" in out, out
     # The failure is presented as a packaging problem, not a crash.
     assert "Traceback" not in out, out

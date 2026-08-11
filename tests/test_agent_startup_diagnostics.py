@@ -82,7 +82,7 @@ class TestStartupDiagnosticLines:
 class TestLogInstallLocation:
     def test_pypi_install_reports_location(self) -> None:
         pip_show_output = (
-            "Name: claude-coordinator\n"
+            "Name: code-coordinator\n"
             "Version: 0.4.94\n"
             "Location: /home/john/.coord-venv/lib/python3.12/site-packages\n"
         )
@@ -98,7 +98,7 @@ class TestLogInstallLocation:
 
     def test_editable_install_flags_it(self) -> None:
         pip_show_output = (
-            "Name: claude-coordinator\n"
+            "Name: code-coordinator\n"
             "Version: 0.5.0\n"
             "Editable project location: /home/john/src/claude-coordinator\n"
             "Location: /home/john/.coord-venv/lib/python3.12/site-packages\n"

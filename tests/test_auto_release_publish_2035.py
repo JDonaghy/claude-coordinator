@@ -253,16 +253,16 @@ class TestAutoReleaseInvokesPublish:
 # layer 2: the post-condition script
 # ──────────────────────────────────────────────────────────────────────────
 
-PACKAGE = "claude-coordinator"
+PACKAGE = "code-coordinator"
 INDEX_URL = index_url_for(PACKAGE)
 
 
 def _index_html(*versions: str) -> str:
     rows = "\n".join(
-        f'<a href="/x/claude_coordinator-{v}-py3-none-any.whl#sha256=deadbeef">'
-        f"claude_coordinator-{v}-py3-none-any.whl</a><br/>\n"
-        f'<a href="/x/claude_coordinator-{v}.tar.gz#sha256=deadbeef">'
-        f"claude_coordinator-{v}.tar.gz</a><br/>"
+        f'<a href="/x/code_coordinator-{v}-py3-none-any.whl#sha256=deadbeef">'
+        f"code_coordinator-{v}-py3-none-any.whl</a><br/>\n"
+        f'<a href="/x/code_coordinator-{v}.tar.gz#sha256=deadbeef">'
+        f"code_coordinator-{v}.tar.gz</a><br/>"
         for v in versions
     )
     return f"<!DOCTYPE html><html><body>{rows}</body></html>"
@@ -296,7 +296,7 @@ class TestVersionParsing:
             version_from_tag("   ")
 
     def test_index_url_is_pep503_normalised(self) -> None:
-        assert index_url_for("Claude_Coordinator") == "https://pypi.org/simple/claude-coordinator/"
+        assert index_url_for("Code_Coordinator") == "https://pypi.org/simple/code-coordinator/"
 
     def test_index_has_version(self) -> None:
         html = _index_html("0.5.0", "0.5.1")
@@ -311,8 +311,8 @@ class TestVersionParsing:
         """pip will not resolve to a yanked file, so calling it released is a
         lie the fleet would then be measured against."""
         html = (
-            '<a href="/x/claude_coordinator-0.5.2-py3-none-any.whl" data-yanked="broken">'
-            "claude_coordinator-0.5.2-py3-none-any.whl</a>"
+            '<a href="/x/code_coordinator-0.5.2-py3-none-any.whl" data-yanked="broken">'
+            "code_coordinator-0.5.2-py3-none-any.whl</a>"
         )
         assert not index_has_version(html, PACKAGE, "0.5.2")
 

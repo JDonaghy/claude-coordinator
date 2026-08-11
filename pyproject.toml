@@ -3,7 +3,26 @@ requires = ["setuptools>=68", "setuptools-scm>=8", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "claude-coordinator"
+# #2104 (R-2, epic #2096): the DISTRIBUTION renamed `claude-coordinator` ->
+# `code-coordinator` here. Nothing else moved: the import package is still
+# `coord/`, the console script is still `coord`, the venvs are still
+# `~/.coord-venv` / `~/.coord-cli-venv`, and the systemd units are still
+# `coord-*`. Only the name pip resolves against changed.
+#
+# This is the single source of the dist name for the release path —
+# `scripts/verify_release_published.py` reads `[project] name` straight out
+# of this file rather than hardcoding one, so `verify-published`'s simple-
+# index poll follows the rename automatically instead of quietly polling the
+# old index page forever (which would fail every release rather than catch a
+# broken one).
+#
+# `claude-coordinator` on PyPI is now a permanent tombstone: PyPI cannot
+# rename a project, so the old name keeps its existing releases and gains no
+# new ones. Already-deployed agents that still have it installed are handled
+# by `coord/dist_name.py` (#2103, R-1), which resolves `code-coordinator`
+# first and falls back to `claude-coordinator` — that fallback is deliberate
+# and must outlive this rename until every agent has been updated past it.
+name = "code-coordinator"
 dynamic = ["version"]
 description = "Coordinate Claude Code workers across multiple machines and repos."
 readme = "README.md"
@@ -19,7 +38,7 @@ classifiers = [
     "Topic :: Software Development :: Build Tools",
 ]
 # #1237 (PKG-1): the BASE install is a *client*. It must stay small enough
-# that `pip install claude-coordinator` gives a third party a working CLI for
+# that `pip install code-coordinator` gives a third party a working CLI for
 # driving a remote fleet without dragging in a web server. Anything only the
 # agent/serve/web/brain runtime needs belongs in the `server` extra below, and
 # must be imported function-locally (never at module scope on a path
@@ -45,6 +64,12 @@ dependencies = [
 ]
 
 [project.urls]
+# #2104: deliberately still the OLD repo path. GitHub redirects a renamed
+# repo's old URL forever, so these keep resolving after the rename lands;
+# the reverse is not true — the new path 404s until it lands. A wheel is
+# immutable, so shipping a URL that is right only *after* an out-of-band
+# admin action would bake a dead link into a published release. Flip these
+# in the release that follows the repo rename, not the one that requests it.
 Homepage = "https://github.com/JDonaghy/claude-coordinator"
 Repository = "https://github.com/JDonaghy/claude-coordinator"
 Issues = "https://github.com/JDonaghy/claude-coordinator/issues"
@@ -52,10 +77,10 @@ Issues = "https://github.com/JDonaghy/claude-coordinator/issues"
 [project.optional-dependencies]
 # #1237 (PKG-1): the server runtime — `coord serve`, `coord web`, `coord
 # agent`. Every remote agent and the board daemon host need this; a pure
-# client does not. `pip install 'claude-coordinator[server]'`.
+# client does not. `pip install 'code-coordinator[server]'`.
 #
 # INVARIANT: every agent venv and the daemon host MUST install the extra —
-# `pip install 'claude-coordinator[server]'`, not the bare name. install-agent.sh,
+# `pip install 'code-coordinator[server]'`, not the bare name. install-agent.sh,
 # scripts/azure-workers/provision-worker.sh and `coord agent update`
 # (coord/agent_app.py) all carry the extra for this reason. A bare base
 # install on an agent still *imports* fine; it fails at `coord agent` with the
@@ -72,12 +97,12 @@ server = [
     "psutil>=5.9",
 ]
 # Convenience alias: "give me everything a full node runs".
-all = ["claude-coordinator[server]"]
+all = ["code-coordinator[server]"]
 dev = [
     # The test suite exercises serve_app/agent_app/dashboard end to end, so a
     # dev install is necessarily a full-fat install. Self-referential extra
     # (PEP 621) so there is exactly one list of server deps to keep current.
-    "claude-coordinator[server]",
+    "code-coordinator[server]",
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     # Parallel test execution. The suite is the dominant cost of the Test gate

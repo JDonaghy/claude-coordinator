@@ -46,12 +46,12 @@ def _pip_show(monkeypatch, stdout: str, returncode: int = 0) -> None:
 
 
 PYPI_SHOW = (
-    "Name: claude-coordinator\n"
+    "Name: code-coordinator\n"
     "Version: 0.4.91\n"
     "Location: /home/x/.coord-cli-venv/lib/python3.12/site-packages\n"
 )
 EDITABLE_SHOW = (
-    "Name: claude-coordinator\n"
+    "Name: code-coordinator\n"
     "Version: 0.4.92\n"
     "Location: /home/x/.coord-cli-venv/lib/python3.12/site-packages\n"
     "Editable project location: /home/x/src/claude-coordinator\n"

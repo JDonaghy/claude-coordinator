@@ -23,7 +23,12 @@ repos:
       - target/debug/examples/gtk_*
       - target/debug/coord-tui
 
-  - name: claude-coordinator
+  # #2104: the repo (and the PyPI distribution it publishes) is
+  # `code-coordinator`. `github:` still names the OLD path deliberately —
+  # GitHub redirects a renamed repo's old URL indefinitely, so this clones
+  # and `gh`-resolves correctly both before and after the repo rename,
+  # while the new path 404s until that rename lands.
+  - name: code-coordinator
     github: JDonaghy/claude-coordinator
     depends_on: []
     default_branch: main
@@ -47,7 +52,7 @@ repos:
     # to (see the `smoke_tests.capability_rules` rust rule below), so that
     # machine's repo_paths checkout needs a `quadraui` sibling directory —
     # true for every machine below (repo_paths list quadraui alongside it).
-    test_command: "scripts/coord-test-runner.sh . --base-ref origin/main --repo claude-coordinator"
+    test_command: "scripts/coord-test-runner.sh . --base-ref origin/main --repo code-coordinator"
     # artifact_paths: []  # no compiled binaries to stash for a Python package
 
 machines:
@@ -55,21 +60,21 @@ machines:
   - name: precision
     host: john-precision-3571
     capabilities: [gtk, rust, python]
-    repos: [vimcode, quadraui, claude-coordinator]
+    repos: [vimcode, quadraui, code-coordinator]
     repo_paths:
       vimcode: ~/src/vimcode
       quadraui: ~/src/quadraui
-      claude-coordinator: ~/src/claude-coordinator
+      code-coordinator: ~/src/code-coordinator
 
   # Desktop B — HP EliteBook, full GTK builds
   - name: elitebook
     host: john-hp-elitebook-830-g7-notebook-pc
     capabilities: [gtk, rust, python]
-    repos: [vimcode, quadraui, claude-coordinator]
+    repos: [vimcode, quadraui, code-coordinator]
     repo_paths:
       vimcode: ~/src/vimcode
       quadraui: ~/src/quadraui
-      claude-coordinator: ~/src/claude-coordinator
+      code-coordinator: ~/src/code-coordinator
     # #1862: a laptop shouldn't need its operator to remember `coord pause`
     # every night. `quiet_hours` is a RECURRING DAILY window — no new
     # dispatch inside it, unchanged behaviour outside it. It does NOT
@@ -88,19 +93,19 @@ machines:
   - name: dellserver
     host: dellserver
     capabilities: [rust, python]
-    repos: [vimcode, quadraui, claude-coordinator]
+    repos: [vimcode, quadraui, code-coordinator]
     repo_paths:
       vimcode: ~/src/vimcode
       quadraui: ~/src/quadraui
-      claude-coordinator: ~/src/claude-coordinator
+      code-coordinator: ~/src/code-coordinator
 
   # Azure VM — lightweight, small tasks only (needs Claude CLI setup)
   - name: azure-vm
     host: vm-acme-dev-platform
     capabilities: [python]
-    repos: [claude-coordinator]
+    repos: [code-coordinator]
     repo_paths:
-      claude-coordinator: ~/src/claude-coordinator
+      code-coordinator: ~/src/code-coordinator
 
 acceptance:
   # The oracle loop (docs/ORACLE_LOOP.md, #944) for this repo's own
@@ -112,7 +117,7 @@ acceptance:
   # listed before the `coord/**` route below, or every webapp change would
   # silently resolve to cli-pytest instead of web-playwright (#1540).
   drivers:
-    claude-coordinator:
+    code-coordinator:
       routes:
         - match: coord/dashboard/webapp/**
           kind: web-playwright

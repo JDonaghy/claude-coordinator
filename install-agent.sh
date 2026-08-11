@@ -8,8 +8,16 @@ PORT=7433
 # #1237: the `[server]` extra is MANDATORY on an agent. The base package is a
 # client-only CLI (no starlette/uvicorn), so `coord agent` on a bare install
 # refuses to boot with an "install the [server] extra" message.
-INSTALL_SOURCE="claude-coordinator[server]"  # PyPI package name + server extra
-# Fall back to GitHub install if PyPI isn't published yet
+# #2104: the distribution renamed `claude-coordinator` -> `code-coordinator`.
+# The venv, the `coord` entrypoint and the unit name below are all unchanged —
+# only the name pip resolves against moved. A host that already has the old
+# distribution in $VENV_DIR keeps it (pip installs the new name alongside);
+# `coord/dist_name.py` resolves whichever is present, preferring the new one.
+INSTALL_SOURCE="code-coordinator[server]"  # PyPI package name + server extra
+# Fall back to GitHub install if PyPI isn't published yet. Still the OLD repo
+# path on purpose: GitHub redirects a renamed repo's old URL indefinitely, so
+# this keeps working both before and after the repo rename (#2104), whereas
+# the new path 404s until that rename actually lands.
 GITHUB_REPO="https://github.com/JDonaghy/claude-coordinator.git"
 
 # Parse args
@@ -17,12 +25,12 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         --machine) MACHINE_NAME="$2"; shift 2 ;;
         --port) PORT="$2"; shift 2 ;;
-        --from-github) INSTALL_SOURCE="claude-coordinator[server] @ git+${GITHUB_REPO}"; shift ;;
+        --from-github) INSTALL_SOURCE="code-coordinator[server] @ git+${GITHUB_REPO}"; shift ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
 
-echo "=== claude-coordinator agent installer ==="
+echo "=== code-coordinator agent installer ==="
 
 # Check Python 3.12+
 python3 --version | grep -qE "3\.(1[2-9]|[2-9][0-9])" || {

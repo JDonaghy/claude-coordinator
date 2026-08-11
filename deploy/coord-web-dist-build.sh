@@ -5,7 +5,7 @@
 #
 # Why this exists: coord-web, coord-agent and coord-serve all `ExecStart`
 # from the SAME ~/.coord-venv, so "ship a webapp change" used to mean
-# `pip install --upgrade claude-coordinator` on that venv — which also
+# `pip install --upgrade code-coordinator` on that venv — which also
 # upgrades the board daemon and the agent runtime on that host, and
 # `coord agent update` is already known to kill running headless workers
 # (see the #1543 issue body). This script decouples the two: it keeps an

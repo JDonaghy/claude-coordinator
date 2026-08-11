@@ -1,7 +1,15 @@
 """Tests for coord.dist_name (#2103): resolve either distribution name
-*before* the `claude-coordinator` -> `code-coordinator` rename (epic #2096)
-lands, so a hardcoded `importlib.metadata` lookup doesn't go stale the
-moment some machine in the fleet has the new name installed instead.
+across the `claude-coordinator` -> `code-coordinator` rename (epic #2096),
+so a hardcoded `importlib.metadata` lookup doesn't go stale on a machine
+that has the other name installed.
+
+#2104 shipped the rename itself: `pyproject.toml` now says
+`code-coordinator`, and `claude-coordinator` is a PyPI tombstone that will
+never gain another release. The tolerant resolution these tests pin is
+therefore *more* load-bearing than before, not less — every agent that has
+not yet been updated past the rename still reports its version out of a
+`claude-coordinator` `.dist-info`, and reading `None` there is what renders
+as `coord agent update`'s "✗ did not come back" false negative.
 
 ``TestResolveInstalled`` / ``TestResolveInstalledName`` / ``TestPkgSpec``
 are fast unit tests, one per #2103 acceptance criterion (1-4), mocking only
@@ -9,9 +17,13 @@ are fast unit tests, one per #2103 acceptance criterion (1-4), mocking only
 this module makes) rather than the five call sites that use this module.
 
 ``TestBuildUnderNewName`` is acceptance #2 verbatim: build a real wheel
-under the *new* name and install it, then prove ``resolve_installed()``
-finds it for real — no ``importlib.metadata`` mocking anywhere in that
-class. Reuses the wheel-build harness from
+under each name and install it, then prove ``resolve_installed()`` finds it
+for real — no ``importlib.metadata`` mocking anywhere in that class. Since
+#2104 the "new name" case builds this repo's own unmodified
+``pyproject.toml``, which doubles as the check that the shipped dist name
+really is ``code-coordinator``; the legacy case rewrites it back to
+``claude-coordinator`` to prove the fallback still resolves a pre-rename
+agent. Reuses the wheel-build harness from
 ``tests/test_version_single_source.py`` (#1238's same "build for real,
 don't mock the build backend" approach).
 """
@@ -150,31 +162,63 @@ class TestPkgSpec:
 # new name, not a mock of importlib.metadata ────────────────────────────────
 
 
+def _dist_name_of(root: Path) -> str:
+    """The distribution ``root``'s ``pyproject.toml`` publishes as.
+
+    Read rather than restated: #2104 moved this name once, and the point of
+    these tests is that nothing hardcodes it a second time.
+    """
+    import tomllib
+
+    data = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    return str(data["project"]["name"])
+
+
 def _renamed_tagged_clone(tmp_path: Path, new_name: str, version: str) -> Path:
     """A throwaway local clone of this repo with `pyproject.toml`'s
     `[project].name` rewritten to *new_name* and tagged `v{version}` on
-    HEAD — models the exact post-#2096-rename PyPI artifact, built from
-    this repo's own build config rather than a synthetic stand-in."""
-    clone = tmp_path / "renamed_clone"
+    HEAD — built from this repo's own build config rather than a synthetic
+    stand-in, so the wheel it produces is the shape a real release has.
+
+    *new_name* may equal the name already in `pyproject.toml`, in which case
+    only the tag is stamped. Since #2104 that is the `code-coordinator` case:
+    the rename has landed, so "build under the new name" is now "build this
+    repo unmodified", and this function's other caller rewrites *backwards*
+    to `claude-coordinator` to model a not-yet-upgraded agent.
+    """
+    clone = tmp_path / f"renamed_clone_{new_name}"
     result = _run(
         ["git", "clone", "--quiet", "--local", "--no-tags", str(REPO_ROOT), str(clone)],
         cwd=tmp_path,
     )
     assert result.returncode == 0, result.stderr
 
+    # Read the name out of the CLONE, not out of REPO_ROOT's working tree:
+    # `git clone --local` copies committed HEAD, so a working tree with an
+    # uncommitted `[project] name` edit (exactly the state the #2104 rename
+    # was authored in) would otherwise make this look for a string that is
+    # not in the file it is about to rewrite.
     pyproject = clone / "pyproject.toml"
     text = pyproject.read_text()
-    old = 'name = "claude-coordinator"'
-    new_text = text.replace(old, f'name = "{new_name}"', 1)
-    assert new_text != text, f"{old!r} not found in pyproject.toml — update this test"
-    pyproject.write_text(new_text)
+    old = f'name = "{_dist_name_of(clone)}"'
+    assert old in text, f"{old!r} not found in pyproject.toml — update this test"
+    pyproject.write_text(text.replace(old, f'name = "{new_name}"', 1))
 
     env = {
         **os.environ,
         "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@example.com",
         "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@example.com",
     }
-    result = _run(["git", "commit", "-aqm", f"rename to {new_name}"], cwd=clone, env=env)
+    # `--allow-empty`: since #2104 the `code-coordinator` case rewrites the
+    # name to what it already is, so there is nothing to commit — and a
+    # commit is still needed, because setuptools-scm resolves the version
+    # from a tag on a commit and a bare `git commit` exits non-zero on an
+    # empty tree.
+    result = _run(
+        ["git", "commit", "-aqm", f"rename to {new_name}", "--allow-empty"],
+        cwd=clone,
+        env=env,
+    )
     assert result.returncode == 0, result.stderr
     result = _run(["git", "tag", f"v{version}"], cwd=clone)
     assert result.returncode == 0, result.stderr
@@ -192,40 +236,79 @@ def _install_wheel_to_target(wheel: Path, target_dir: Path) -> None:
     assert result.returncode == 0, f"wheel install failed:\n{result.stdout}\n{result.stderr}"
 
 
+def _resolved_from_installed_wheel(tmp_path: Path, clone: Path, slot: str) -> tuple[str, str]:
+    """Build *clone*, install the wheel into an isolated target dir, and
+    return ``(wheel filename, what resolve_installed() reports there)`` —
+    the latter as ``"<name> <version>"``.
+
+    Both halves come back from one build so a caller can assert on the
+    wheel's own filename (the PEP 427 normalisation of the dist name) without
+    paying for a second `python -m build`.
+    """
+    wheel = _build_wheel(clone, tmp_path / f"dist_{slot}")
+
+    install_dir = tmp_path / f"install_{slot}"
+    install_dir.mkdir()
+    _install_wheel_to_target(wheel, install_dir)
+
+    # Run from a directory with no `coord/` of its own, same reasoning
+    # as test_version_single_source.py's `_cli_version_from_wheel`:
+    # sys.path[0] (the cwd `-c` adds) must not shadow the installed copy
+    # with this checkout's own source tree.
+    neutral_cwd = tmp_path / f"cwd_{slot}"
+    neutral_cwd.mkdir()
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(install_dir)
+    result = _run(
+        [
+            sys.executable, "-c",
+            "from coord.dist_name import resolve_installed\n"
+            "r = resolve_installed()\n"
+            "print(f'{r.name} {r.version}')\n",
+        ],
+        cwd=neutral_cwd,
+        env=env,
+    )
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    return wheel.name, result.stdout.strip()
+
+
 class TestBuildUnderNewName:
-    """#2103 acceptance #2, verbatim: build a wheel named `code-coordinator`
-    (standing in for #2096's eventual PyPI artifact), install it, and prove
-    `coord.dist_name.resolve_installed()` finds it for real."""
+    """#2103 acceptance #2, verbatim: build a wheel under each distribution
+    name, install it, and prove `coord.dist_name.resolve_installed()` finds
+    it for real.
+
+    #2104 makes the first of these a check on the *shipped* config: the
+    `code-coordinator` build no longer rewrites `pyproject.toml` at all, so
+    it fails if this repo ever stops publishing under that name.
+    """
+
+    def test_this_repo_ships_as_code_coordinator(self) -> None:
+        """#2104 acceptance #1 and #4: the rename actually landed in the one
+        place the release path reads it from. Everything else that needs the
+        dist name — `verify-published`'s simple-index poll, the wheel
+        filename, `coord.dist_name`'s preference order — derives from here,
+        so pinning it here is what makes those derivations meaningful."""
+        assert _dist_name_of(REPO_ROOT) == "code-coordinator"
+        assert CANDIDATE_NAMES[0] == _dist_name_of(REPO_ROOT)
 
     def test_resolves_a_real_wheel_installed_under_the_new_name(self, tmp_path: Path) -> None:
         clone = _renamed_tagged_clone(tmp_path, "code-coordinator", "8.8.8")
-        wheel = _build_wheel(clone, tmp_path / "dist")
-        assert "code_coordinator" in wheel.name
+        wheel_name, resolved = _resolved_from_installed_wheel(tmp_path, clone, "new")
+        assert wheel_name.startswith("code_coordinator-8.8.8-"), wheel_name
+        assert resolved == "code-coordinator 8.8.8"
 
-        install_dir = tmp_path / "install"
-        install_dir.mkdir()
-        _install_wheel_to_target(wheel, install_dir)
-
-        # Run from a directory with no `coord/` of its own, same reasoning
-        # as test_version_single_source.py's `_cli_version_from_wheel`:
-        # sys.path[0] (the cwd `-c` adds) must not shadow the installed copy
-        # with this checkout's own source tree.
-        neutral_cwd = tmp_path / "cwd"
-        neutral_cwd.mkdir()
-        env = dict(os.environ)
-        env["PYTHONPATH"] = str(install_dir)
-        result = _run(
-            [
-                sys.executable, "-c",
-                "from coord.dist_name import resolve_installed\n"
-                "r = resolve_installed()\n"
-                "print(f'{r.name} {r.version}')\n",
-            ],
-            cwd=neutral_cwd,
-            env=env,
-        )
-        assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
-        assert result.stdout.strip() == "code-coordinator 8.8.8"
+    def test_resolves_a_real_wheel_installed_under_the_legacy_name(self, tmp_path: Path) -> None:
+        """#2104 acceptance #4's deliberate exception: `claude-coordinator`
+        is a PyPI tombstone, but it is still what every agent that has not
+        yet been updated past the rename has in its `.dist-info`. Resolution
+        must keep finding it, or those agents report an unknown version and
+        `coord agent update` renders the "✗ did not come back" false
+        negative for a host that is online and fine (#2103)."""
+        clone = _renamed_tagged_clone(tmp_path, "claude-coordinator", "7.7.7")
+        wheel_name, resolved = _resolved_from_installed_wheel(tmp_path, clone, "legacy")
+        assert wheel_name.startswith("claude_coordinator-7.7.7-"), wheel_name
+        assert resolved == "claude-coordinator 7.7.7"
 
 
 class TestAgentUpdateSmokeCheckUsesThisModule:

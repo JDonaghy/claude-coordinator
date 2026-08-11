@@ -47,14 +47,14 @@ SERVE_PORT = 7435
 SERVER_EXTRA_MODULES = frozenset({"starlette", "uvicorn", "websockets", "psutil"})
 
 #: What to tell a user who hit a server command on a client-only install.
-SERVER_EXTRA_INSTALL_HINT = "pip install 'claude-coordinator[server]'"
+SERVER_EXTRA_INSTALL_HINT = "pip install 'code-coordinator[server]'"
 
 
 @contextmanager
 def server_extra_guard(feature: str) -> "Iterator[None]":
     """Translate a missing ``[server]`` extra into an actionable CLI error.
 
-    ``pip install claude-coordinator`` installs a *client* (#1237): no
+    ``pip install code-coordinator`` installs a *client* (#1237): no
     starlette/uvicorn/websockets/psutil. Wrap the function-local imports that
     boot a server in this so the failure reads as "you need the extra" rather
     than a raw ``ModuleNotFoundError: No module named 'uvicorn'`` traceback::
@@ -80,7 +80,7 @@ def server_extra_guard(feature: str) -> "Iterator[None]":
             f"`coord {feature}` needs the server extra, which is not installed "
             f"(missing {missing!r}).\n"
             f"  Install it with:  {SERVER_EXTRA_INSTALL_HINT}\n"
-            "  The base `claude-coordinator` install is a client-only CLI — it "
+            "  The base `code-coordinator` install is a client-only CLI — it "
             "can drive a remote fleet, but not host one (#1237)."
         ) from exc
 

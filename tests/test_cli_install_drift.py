@@ -164,16 +164,21 @@ def test_stale_banner_fires_past_commit_threshold(tmp_path: Path) -> None:
     assert "5 commit(s)" in text
     # #1237: the hint names the `[server]` extra — a checkout stale enough to
     # trip this banner is a coordinator/agent host, which needs the full stack.
-    assert "pip install --upgrade 'claude-coordinator[server]'" in text
+    # Which *distribution* it names is deliberately not asserted here: that is
+    # resolved from whatever `importlib.metadata` sees in the interpreter
+    # running the suite, and is covered by the three tests below, which pin
+    # each branch explicitly instead of depending on the ambient venv.
+    assert "pip install --upgrade '" in text
+    assert "[server]'" in text
     # The escalated banner replaces the mild message, it doesn't stack with it.
     assert "Edits to the source tree will NOT reach the CLI" not in text
 
 
 def test_stale_banner_suggests_whichever_dist_name_is_installed(tmp_path: Path) -> None:
-    """#2103: once `code-coordinator` is what's actually installed (the
-    post-#2096-rename state), the hint must say so — suggesting the old
-    `claude-coordinator` name would upgrade the wrong (possibly no-longer-
-    published) package."""
+    """#2103: `code-coordinator` is what a post-#2104-rename host actually
+    has installed, and the hint must say so — suggesting the old
+    `claude-coordinator` name would upgrade a PyPI tombstone that will never
+    gain another release."""
     with patch("coord.cli._dist_pkg_spec", return_value="code-coordinator[server]"):
         result = _run_with_git_checkout(tmp_path, installed_version="0.4.4", commits_ahead=5)
     assert result.exit_code == 0
@@ -181,6 +186,35 @@ def test_stale_banner_suggests_whichever_dist_name_is_installed(tmp_path: Path) 
     assert "STALE INSTALL" in text
     assert "pip install --upgrade 'code-coordinator[server]'" in text
     assert "claude-coordinator" not in text
+
+
+def test_stale_banner_suggests_the_legacy_name_on_a_pre_rename_host(tmp_path: Path) -> None:
+    """The other side of #2103's tolerance, still load-bearing after #2104:
+    an agent that has not been updated past the rename has only
+    `claude-coordinator` installed, and telling it to upgrade a distribution
+    it does not have would leave the stale install exactly as stale."""
+    with patch("coord.cli._dist_pkg_spec", return_value="claude-coordinator[server]"):
+        result = _run_with_git_checkout(tmp_path, installed_version="0.4.4", commits_ahead=5)
+    assert result.exit_code == 0
+    text = output_and_stderr(result)
+    assert "pip install --upgrade 'claude-coordinator[server]'" in text
+
+
+def test_stale_banner_falls_back_to_the_new_name_when_nothing_resolves(tmp_path: Path) -> None:
+    """#2104: the last-resort literal in `coord/cli.py` names
+    `code-coordinator`, not the old name.
+
+    Reaching it means neither distribution resolved, so there is no installed
+    name to echo back — and the only name that can still be installed is the
+    one every future release publishes under. Naming the tombstone here would
+    hand the operator a command that resolves to a permanently-frozen version.
+    """
+    with patch("coord.cli._dist_pkg_spec", side_effect=RuntimeError("boom")):
+        result = _run_with_git_checkout(tmp_path, installed_version="0.4.4", commits_ahead=5)
+    assert result.exit_code == 0
+    text = output_and_stderr(result)
+    assert "STALE INSTALL" in text
+    assert "pip install --upgrade 'code-coordinator[server]'" in text
 
 
 def test_stale_banner_fires_past_days_threshold(tmp_path: Path) -> None:
