@@ -179,7 +179,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from coord.drive_queue import HOLD_FIRED, STATE_RUNNING, entry_key
+from coord.drive_queue import HOLD_FIRED, STATE_RUNNING, build_board_view, entry_key
 
 # ── lane kinds ───────────────────────────────────────────────────────────────
 #
@@ -522,6 +522,19 @@ class Quiescence:
     #: see the module docstring. Carried through so the caller can release
     #: them after a verified roll.
     fired_holds: tuple[str, ...] = ()
+    #: #2110: `running` queue entries this assessment could DISPROVE — the
+    #: entry's own issue is landed (merged or closed) per the SAME board read
+    #: used everywhere else here, so the row cannot possibly still be
+    #: in-flight, whatever its `state` column says. Not a busy signal (the
+    #: whole point is that it does NOT block); not silent either (#1616's
+    #: "the pipeline has no clock" lesson) — surfaced here so a caller can
+    #: log it and point at `coord drive-queue tick --reconcile-only`, the
+    #: thing that actually clears the row, rather than the stale state
+    #: quietly evaporating from the reasoning with no record it was ever
+    #: wrong. See `_reconcile_running` in `coord/drive_queue.py` for the tick
+    #: doing the same disproof on its own cadence; this is the same evidence,
+    #: re-checked on READ so a stopped timer cannot make it unfalsifiable.
+    stale: tuple[str, ...] = ()
 
     @property
     def reason(self) -> str:
@@ -581,6 +594,7 @@ class Quiescence:
             "reason": self.reason,
             "busy": [asdict(b) for b in self.busy],
             "fired_holds": list(self.fired_holds),
+            "stale": list(self.stale),
         }
 
 
@@ -610,44 +624,83 @@ def assess_quiescence(
     *,
     queue_entries: Iterable[Mapping[str, Any]] = (),
     assignments: Iterable[Mapping[str, Any]] = (),
+    issues: Iterable[Mapping[str, Any]] = (),
     extra_busy: Iterable[Busy] = (),
 ) -> Quiescence:
     """Is the fleet idle enough to restart every agent on it?
 
     *queue_entries* are ``drive_queue`` rows as they come off the board /
     ``coord drive-queue list --json``; *assignments* are board assignment
-    rows. Both are read as plain mappings — #1523 §2's "typed state, never
+    rows; *issues* are board issue rows (``repo_name``/``number``/``state``).
+    All three are read as plain mappings — #1523 §2's "typed state, never
     CLI prose", the rule both bugs in the ad-hoc overnight sequencer broke.
 
     ``extra_busy`` is the seam for host-local signals the board cannot see
     (an interactive tmux session, a machine paused by an operator); the
     shell passes them in rather than this module growing a way to look.
+
+    #2110: a ``running`` queue row is not, on its own, proof of anything —
+    the reconciler that would have moved it to ``done`` lives inside
+    ``coord drive-queue tick``, and a stopped timer means nothing ever runs
+    it. The 2026-08-10 incident deferred `coord release propagate` for over
+    an hour on a row describing a drive that had merged, closed and left no
+    trace anywhere on the fleet — the row was simply never re-examined. So
+    before trusting ``state == "running"`` this re-derives the SAME
+    disproof `coord.drive_queue._reconcile_running` uses on its own tick
+    (``coord.drive_queue.build_board_view(...).facts(key).landed`` — merged
+    or closed) against *this* read of the board, live at call time, rather
+    than only during a tick that may not be running right now. A row that
+    fails that check cannot possibly still be in flight, so it is excluded
+    from ``busy`` and reported in :attr:`Quiescence.stale` instead — visible,
+    not silently dropped (#1616).
+
+    This is deliberately narrower than the tick's own reconciliation: it has
+    no local tmux read (liveness is a LOCAL fact, #1870, and this may run on
+    any host) and no attempt-tracking, so it can only ever DISPROVE a
+    ``running`` row, never retry or block one — that stays the tick's job.
+    It closes exactly the gap that let a landed row block a roll forever
+    with no clock and no way to contradict it.
     """
+    queue_entries = list(queue_entries)
+    assignments = list(assignments)
+    issues = list(issues)
+    board = build_board_view({"assignments": assignments, "issues": issues})
+
     busy: list[Busy] = []
     fired: list[str] = []
+    stale: list[str] = []
 
     for entry in queue_entries:
         state = str(entry.get("state") or "")
         key = _queue_key(entry)
         if state == STATE_RUNNING:
-            # #2067: attribute to the host actually running the drive, so a
-            # continuously-busy queue blocks only its occupied hosts, not
-            # the whole fleet. `launch_host` (#1870) is the ground truth —
-            # the host whose tick launched THIS session; `machine` is a
-            # weaker fallback (an operator's pin, not necessarily where a
-            # legacy/hand-edited row is actually running). Neither present
-            # means this signal cannot be pinned to a host at all, and must
-            # block every host rather than none — see
-            # `Quiescence.fleet_wide_busy`.
-            host = str(entry.get("launch_host") or entry.get("machine") or "") or None
-            busy.append(
-                Busy(
-                    kind="drive-queue entry running",
-                    subject=key,
-                    detail="restarting agents now would kill it mid-flight",
-                    host=host,
+            if board.facts(key).landed:
+                # Disproved: this issue is merged or closed, so the row
+                # cannot still be in flight whatever its `state` column
+                # says. Not busy — and not silently dropped either.
+                stale.append(key)
+            else:
+                # #2067: attribute to the host actually running the drive,
+                # so a continuously-busy queue blocks only its occupied
+                # hosts, not the whole fleet. `launch_host` (#1870) is the
+                # ground truth — the host whose tick launched THIS session;
+                # `machine` is a weaker fallback (an operator's pin, not
+                # necessarily where a legacy/hand-edited row is actually
+                # running). Neither present means this signal cannot be
+                # pinned to a host at all, and must block every host rather
+                # than none — see `Quiescence.fleet_wide_busy`.
+                host = (
+                    str(entry.get("launch_host") or entry.get("machine") or "")
+                    or None
                 )
-            )
+                busy.append(
+                    Busy(
+                        kind="drive-queue entry running",
+                        subject=key,
+                        detail="restarting agents now would kill it mid-flight",
+                        host=host,
+                    )
+                )
         # A *fired* gate is the opposite of busy — the queue has stopped
         # itself waiting for precisely this deploy. Recorded, never counted.
         if str(entry.get("hold_state") or "") == HOLD_FIRED:
@@ -675,7 +728,10 @@ def assess_quiescence(
 
     busy.extend(extra_busy)
     return Quiescence(
-        quiescent=not busy, busy=tuple(busy), fired_holds=tuple(dict.fromkeys(fired))
+        quiescent=not busy,
+        busy=tuple(busy),
+        fired_holds=tuple(dict.fromkeys(fired)),
+        stale=tuple(dict.fromkeys(stale)),
     )
 
 

@@ -192,6 +192,56 @@ def test_a_fleet_already_on_the_target_is_up_to_date(valid_config_path, state_di
     assert rp.STATUS_UP_TO_DATE in result.output
 
 
+# ── #2110: a stale `running` row must not defer the roll ──────────────────
+#
+# The exact 2026-08-10 incident, reproduced through the real CLI: a
+# drive-queue row still reads `running` for an issue that has since closed
+# and whose PR has merged — the reconciler that would normally have caught
+# this lives inside `coord drive-queue tick`, and the timer can be stopped
+# (that is the whole scenario `docs/AGENT_OPERATIONS.md` documents). Before
+# #2110 this deferred every run, forever, on a row describing work that
+# ended hours ago. It must not anymore.
+
+
+def test_a_stale_running_row_does_not_defer_and_is_surfaced(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    monkeypatch.setattr(
+        release_cmd, "_fetch_board",
+        lambda: (
+            {
+                "drive_queue": [
+                    {"repo_name": "api", "issue_number": 7,
+                     "state": STATE_RUNNING, "launch_host": "server"},
+                ],
+                "assignments": [
+                    {"repo_name": "api", "issue_number": 7, "type": "work",
+                     "status": "merged"},
+                ],
+                "issues": [
+                    {"repo_name": "api", "number": 7, "state": "closed"},
+                ],
+            },
+            None,
+        ),
+    )
+    _stub_verify(monkeypatch, versions={"laptop": ["0.4.111"], "server": ["0.4.111"]})
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111"],
+    )
+    assert result.exit_code == 0, result.output
+    assert rp.STATUS_DEFERRED not in result.output
+    assert rp.STATUS_UP_TO_DATE in result.output
+    # Surfaced, not silently dropped — the operator can see the fleet
+    # self-corrected a stale row instead of it just quietly not blocking.
+    assert "stale" in result.output
+    assert "api#7" in result.output
+    records = _records(state_dir)
+    assert records[-1]["quiescence"]["stale"] == ["api#7"]
+
+
 # ── history ──────────────────────────────────────────────────────────────
 
 

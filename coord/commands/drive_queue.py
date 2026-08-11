@@ -887,11 +887,29 @@ def _requeue_command(entry: QueueEntry | None, key: str) -> str:
     default=False,
     help="Print the resolved plan and mutate nothing.",
 )
+@click.option(
+    "--reconcile-only",
+    is_flag=True,
+    default=False,
+    help=(
+        "Update the queue's view of reality and launch nothing (#2110). "
+        "Every `running` entry is still checked against the board "
+        "(done/blocked/parked/retry, exactly as a normal tick would), but no "
+        "new `coord drive` is ever started this run — equivalent to "
+        "`--max-parallel 0`. This is the missing primitive for the "
+        "stop-the-timer-to-roll-the-fleet sequence: with the timer stopped, "
+        "nothing reconciles a finished drive's `running` row, and that stale "
+        "row alone can pin `coord release propagate` indefinitely. Run this "
+        "once (by hand, timer still stopped) to drain it before propagating, "
+        "then restart the timer."
+    ),
+)
 @_CONFIG_OPTION
 def drive_queue_tick(
     max_parallel: int,
     max_parallel_per_repo: int,
     dry_run: bool,
+    reconcile_only: bool,
     config_path: Path,
 ) -> None:
     """Drain one step of the queue: reconcile, then launch at most one drive.
@@ -914,16 +932,35 @@ def drive_queue_tick(
     quadraui one — per-repo serialisation, cross-repo parallelism. `--dry-run`
     prints the per-repo breakdown so "why didn't item 2 go?" is answerable from
     the output alone.
+
+    `--max-parallel 0` (or `--reconcile-only`, the readable spelling of the
+    same thing — #2110) reconciles every `running` entry against the board and
+    then stops: no capacity walk, no deferrals, no queue-level alert, no
+    launch. Reconciliation (`plan_tick` step 1/1b: a finished entry moves to
+    `done`, a permanently-refused one to `blocked`, a CI-pending one parks) is
+    unconditional and runs regardless of capacity, which is what makes this
+    safe to run with the periodic timer stopped — see
+    `docs/AGENT_OPERATIONS.md`'s propagation section for why that combination
+    used to deadlock.
     """
     from coord.filelock import FileLock, LockBusy, drive_queue_lock_path  # noqa: PLC0415
     from coord.state import list_drive_queue, update_drive_queue_entry  # noqa: PLC0415
 
-    if max_parallel < 1:
-        raise click.ClickException("--max-parallel must be at least 1")
+    if max_parallel < 0:
+        raise click.ClickException(
+            "--max-parallel must be at least 0 (0 = reconcile-only, launch "
+            "nothing this run — see --reconcile-only)"
+        )
     if max_parallel_per_repo < 0:
         raise click.ClickException(
             "--max-parallel-per-repo must be 0 (no per-repo ceiling) or more"
         )
+
+    # #2110: `--reconcile-only` and `--max-parallel 0` are the same request —
+    # one flag is a mnemonic for the other rather than a second code path, so
+    # there is exactly one way this behaves, not two that could drift apart.
+    reconcile_only = reconcile_only or max_parallel == 0
+    effective_capacity = 0 if reconcile_only else max_parallel
 
     lock = FileLock(drive_queue_lock_path())
     try:
@@ -1002,7 +1039,7 @@ def drive_queue_tick(
         plan = plan_tick(
             entries,
             board,
-            max_parallel,
+            effective_capacity,
             max_parallel_per_repo=max_parallel_per_repo,
             probes=probes,
             now=time.time(),
@@ -1012,6 +1049,15 @@ def drive_queue_tick(
             exit_dead_end=exit_dead_end,
             gate_a_pending=gate_a_pending,
         )
+
+        if reconcile_only:
+            # #2110: capacity 0 already makes `plan_tick` return before its
+            # capacity walk (no deferrals, no queue-level alert, no launch —
+            # see its docstring's step 3), so `plan.launch` is guaranteed
+            # `None` below without any extra branching here. This line exists
+            # purely so the log reads as an intentional reconcile-only run
+            # rather than a queue that mysteriously stopped launching.
+            click.echo("(--reconcile-only: updating queue state, launching nothing)")
 
         for line in render_plan(plan, dry_run=dry_run):
             click.echo(line)

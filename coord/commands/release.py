@@ -521,9 +521,22 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
     quiescence = rp.assess_quiescence(
         queue_entries=board.get("drive_queue") or [],
         assignments=board.get("assignments") or [],
+        issues=board.get("issues") or [],
         extra_busy=extra_busy,
     )
     record.quiescence = quiescence.to_dict()
+    if quiescence.stale:
+        # #2110: a `running` row this assessment could disprove (its issue is
+        # merged/closed) — not a busy signal, but not silent either. Printed
+        # unconditionally, not just under `--json`, so a plain journal read
+        # shows the fleet self-corrected a stale row instead of that fact
+        # only ever existing inside `record.quiescence["stale"]`.
+        click.echo(
+            "note: ignoring stale drive-queue row(s) whose issue already "
+            f"landed: {', '.join(quiescence.stale)} (run `coord drive-queue "
+            "tick --reconcile-only` to clear them for good)",
+            err=True,
+        )
 
     hosts = [m.name for m in (getattr(config, "machines", ()) or ())]
     busy_hosts = quiescence.busy_hosts()

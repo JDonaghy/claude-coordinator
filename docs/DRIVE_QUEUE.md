@@ -242,6 +242,24 @@ one. `coord drive-sessions` lists every live `coord drive --tmux` session (with
 its own attach/stop hints) if you need to see what's actually running before
 deciding what to `drive-stop`.
 
+**Stopping the timer also stops reconciliation** — the thing that notices a
+drive *finished* and moves its row from `running` to `done` lives inside the
+same `coord drive-queue tick` the timer runs (#2110). With the timer stopped,
+the last drive's row stays `running` until something ticks again, which can
+wedge a caller that treats that row as evidence of in-flight work — see
+`docs/AGENT_OPERATIONS.md`'s propagation section for the incident this caused.
+If you need the queue's view of reality updated *without* launching anything
+— e.g. right before that caller reads it — run:
+
+```bash
+coord drive-queue tick --reconcile-only   # same as --max-parallel 0
+```
+
+It runs the same reconcile pass as a normal tick (finished → `done`,
+permanently-refused → `blocked`, CI-pending → `parked`) and then stops: no
+capacity walk, no queue-level alert, no launch. Safe with the timer stopped or
+running.
+
 ## 4. Read the alert — `QUEUE: STALLED` vs `QUEUE: BLOCKED`
 
 The TUI status bar always shows a `QUEUE: …` segment (never blank — silence
