@@ -1509,7 +1509,7 @@ class HealthConfig:
     # when the installed wheel ships no units of its own, and whatever they
     # point at is reported as an unverified working copy.
     # None -> `<checkout>/deploy` for the first configured local checkout
-    # that has one (normally the claude-coordinator checkout in repo_paths).
+    # that has one (normally the code-coordinator checkout in repo_paths).
     deploy_dir: str | None = None
     # Where systemd user units actually live. None -> ~/.config/systemd/user.
     systemd_user_dir: str | None = None

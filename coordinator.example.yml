@@ -28,6 +28,14 @@ repos:
   # GitHub redirects a renamed repo's old URL indefinitely, so this clones
   # and `gh`-resolves correctly both before and after the repo rename,
   # while the new path 404s until that rename lands.
+  #
+  # For the same reason the `repo_paths` VALUES below still say
+  # `~/src/claude-coordinator`: nothing renames the on-disk checkout, and
+  # `scripts/azure-workers/provision-worker.sh` still clones into that path.
+  # Only the `repo_paths` KEY tracks `name:` (the config loader rejects a key
+  # that names no configured repo). Renaming the value would break every
+  # operation that `cd`s into `Machine.repo_path()` — dispatch, smoke,
+  # conflict-fix — for anyone who copied this file.
   - name: code-coordinator
     github: JDonaghy/claude-coordinator
     depends_on: []
@@ -64,7 +72,7 @@ machines:
     repo_paths:
       vimcode: ~/src/vimcode
       quadraui: ~/src/quadraui
-      code-coordinator: ~/src/code-coordinator
+      code-coordinator: ~/src/claude-coordinator
 
   # Desktop B — HP EliteBook, full GTK builds
   - name: elitebook
@@ -74,7 +82,7 @@ machines:
     repo_paths:
       vimcode: ~/src/vimcode
       quadraui: ~/src/quadraui
-      code-coordinator: ~/src/code-coordinator
+      code-coordinator: ~/src/claude-coordinator
     # #1862: a laptop shouldn't need its operator to remember `coord pause`
     # every night. `quiet_hours` is a RECURRING DAILY window — no new
     # dispatch inside it, unchanged behaviour outside it. It does NOT
@@ -97,7 +105,7 @@ machines:
     repo_paths:
       vimcode: ~/src/vimcode
       quadraui: ~/src/quadraui
-      code-coordinator: ~/src/code-coordinator
+      code-coordinator: ~/src/claude-coordinator
 
   # Azure VM — lightweight, small tasks only (needs Claude CLI setup)
   - name: azure-vm
@@ -105,7 +113,7 @@ machines:
     capabilities: [python]
     repos: [code-coordinator]
     repo_paths:
-      code-coordinator: ~/src/code-coordinator
+      code-coordinator: ~/src/claude-coordinator
 
 acceptance:
   # The oracle loop (docs/ORACLE_LOOP.md, #944) for this repo's own
