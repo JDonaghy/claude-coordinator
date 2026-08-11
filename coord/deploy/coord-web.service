@@ -97,13 +97,17 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=%h/.coord-venv/bin/coord web --config %h/.coord/coordinator.yml --host 0.0.0.0 --port 7434 --dist %h/coord-web-dist
-# #2095: must track the --port value on the ExecStart line above -- this is
-# how `coord/agent_app.py`'s `_probe_liveness` (the post-restart liveness
-# check `_restart_sibling_unit` runs before trusting coord-web's restart)
-# knows which local port to GET. Set explicitly rather than left to that
-# function's "7434" fallback so changing the port here can never silently
-# desync the probe from the actual listener.
-Environment=COORD_WEB_PORT=7434
+# #2095: the `--port` above is the ONLY declaration of this dashboard's port.
+# `coord/agent_app.py`'s `_probe_liveness` — the post-restart liveness check
+# `_restart_sibling_unit` runs (from inside the coord-agent process) before
+# trusting coord-web's restart — reads it back off this very line via
+# `systemctl --user show coord-web --property=ExecStart`, so changing the port
+# here needs no matching edit anywhere else and cannot desync the probe from
+# the listener. An earlier revision declared `Environment=COORD_WEB_PORT=7434`
+# here instead; that could never work, because systemd does not share
+# `Environment=` across units and the process that reads it runs under
+# coord-agent.service. Do not re-add it (here or there): a second declaration
+# that has to agree with this one by hand is the failure mode, not the fix.
 # Belt-and-suspenders for #1229: systemd user units have no controlling TTY so
 # TERM is absent from the process environment.  The terminal bridge code now
 # calls env.setdefault("TERM", "xterm-256color") before spawning tmux, but
