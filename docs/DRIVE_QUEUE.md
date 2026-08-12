@@ -289,6 +289,14 @@ coord drive-queue remove REPO ISSUE && coord drive-queue add REPO ISSUE
 
 or, from the TUI overlay, select the blocked entry and press `u`.
 
+`last_reason` is a **snapshot**, taken the instant it was written and never
+re-validated (#2133) — the condition it names can resolve minutes or hours
+later while the text stays exactly as first written. `coord drive-queue
+list` shows its age next to it (`last (3h ago): checks_failed …`) precisely
+so it never reads as a live diagnosis; treat the reason as history and go
+check the board/CI/review state for what is *actually* blocking now,
+especially once the age climbs past a few minutes.
+
 ### 4a. Blocked *without* spending an attempt — permanent causes
 
 Two `blocked` reasons are **not** "died `attempts` times". They block on the

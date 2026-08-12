@@ -1069,10 +1069,12 @@ pub(crate) struct ContextMenuState {
 
 /// Format a Unix timestamp as a human-readable "X ago" string relative to `now`.
 ///
-/// Used in the Merge Queue panel (#777) to show `enqueued_at` and `last_attempt`.
+/// Used in the Merge Queue panel (#777) to show `enqueued_at` and `last_attempt`,
+/// and (#2133) in the Queue panel to age-stamp a drive-queue entry's
+/// `last_reason` so a snapshot taken hours ago never renders as current state.
 /// Returns `""` for `None` timestamps.  Precision caps at minutes for < 1h,
 /// hours for < 24h, days otherwise — keeps panel rows terse.
-fn format_age(ts: Option<f64>, now: f64) -> String {
+pub(crate) fn format_age(ts: Option<f64>, now: f64) -> String {
     let ts = match ts {
         Some(t) if t > 0.0 => t,
         _ => return String::new(),

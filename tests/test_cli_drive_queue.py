@@ -260,6 +260,98 @@ def test_list_json_emits_the_raw_rows(cli):
     assert rows[0]["after_json"] == []  # a real list on the wire, never a string
 
 
+# ── #2133: `last_reason` is a snapshot, never re-validated — its rendering
+# must carry its own age so it can never be mistaken for a current diagnosis.
+# Reproduces the shape of the #2104 incident: a `blocked` entry's reason was
+# captured once and then read, ~3 hours later, as if it still described the
+# present.
+
+
+def _backdate_reason(coord_db, issue: int, seconds: float) -> None:
+    """Age a queued entry's `reason_at` by *seconds* directly in SQLite —
+    simulating a `last_reason` snapshot captured that long ago. Bypasses
+    `update_drive_queue_entry` (which always stamps "now") on purpose: this
+    is standing in for the wall-clock time that has genuinely elapsed since
+    a real tick wrote the reason, exactly as `_backdate` does for
+    `launched_at` above.
+    """
+    coord_db.execute(
+        "UPDATE drive_queue SET reason_at = ? WHERE repo_name = ? AND issue_number = ?",
+        (time.time() - seconds, REPO, issue),
+    )
+    coord_db.commit()
+
+
+def test_list_shows_no_age_for_a_freshly_written_reason(cli):
+    cli("add", REPO, "1650")
+    state._update_drive_queue_entry_local(
+        REPO, 1650, state="blocked", last_reason="checks_failed: test (3.12)"
+    )
+    result = cli("list")
+    assert result.exit_code == 0, result.output
+    assert "checks_failed: test (3.12)" in result.output
+    assert "0s ago" in result.output, (
+        "a reason written this instant must still carry SOME age marker — "
+        "the point is that a reader never has to guess whether an age is "
+        "being shown at all:\n" + result.output
+    )
+
+
+def test_list_ages_a_stale_park_reason_instead_of_showing_it_bare(cli, coord_db):
+    """The #2104 reproduction: a `blocked` reason captured hours ago must
+    read as history, not as a live diagnosis of the current blocker."""
+    cli("add", REPO, "1650")
+    state._update_drive_queue_entry_local(
+        REPO, 1650, state="blocked", last_reason="checks_failed: test (3.12)"
+    )
+    _backdate_reason(coord_db, 1650, 3 * 3600 + 60)  # ~3h ago, clear of rounding
+
+    result = cli("list")
+    assert result.exit_code == 0, result.output
+    assert "checks_failed: test (3.12)" in result.output, (
+        "the reason text itself must still be legible:\n" + result.output
+    )
+    assert "(3h ago)" in result.output, (
+        "#2133: a stale `last_reason` rendered without its age is exactly "
+        "the trap that misdirected the #2104 diagnosis — the queue text "
+        "pointed at CI while the real, later blocker (a review verdict) "
+        "went unmentioned:\n" + result.output
+    )
+
+
+def test_list_json_carries_reason_at_for_a_client_to_render_its_own_age(cli, coord_db):
+    cli("add", REPO, "1650")
+    state._update_drive_queue_entry_local(
+        REPO, 1650, state="blocked", last_reason="checks_failed"
+    )
+    _backdate_reason(coord_db, 1650, 90.0)
+
+    rows = json.loads(cli("list", "--json").output)
+    assert rows[0]["last_reason"] == "checks_failed"
+    assert rows[0]["reason_at"] == pytest.approx(time.time() - 90.0, abs=5.0)
+
+
+def test_list_omits_age_for_a_reason_with_no_capture_time(cli, coord_db):
+    """A row predating #2133's migration (or written straight to the table by
+    hand) has `reason_at IS NULL` — the renderer must not fabricate an age
+    for it, just show the bare reason exactly as it always has."""
+    cli("add", REPO, "1650")
+    coord_db.execute(
+        "UPDATE drive_queue SET state = 'blocked', last_reason = 'legacy reason', "
+        "reason_at = NULL WHERE repo_name = ? AND issue_number = ?",
+        (REPO, 1650),
+    )
+    coord_db.commit()
+
+    result = cli("list")
+    assert result.exit_code == 0, result.output
+    assert "legacy reason" in result.output
+    assert "ago" not in result.output, (
+        "no `reason_at` means no age can be computed — inventing one would "
+        "be worse than showing nothing:\n" + result.output
+    )
+
+
 # ── remove / move ────────────────────────────────────────────────────────────
 
 

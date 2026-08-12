@@ -3150,6 +3150,84 @@ def test_drive_queue_local_rejects_non_updatable_field(coord_db):
         state._update_drive_queue_entry_local("api", 7, machine="laptop")
 
 
+def test_drive_queue_local_stamps_reason_at_when_last_reason_is_written(coord_db):
+    """#2133: `last_reason` is a point-in-time observation, so every write to
+    it is dated — the queue's ONE choke point for both the no-daemon local
+    path and the daemon's `/drive-queue` update handler
+    (`serve_app.post_drive_queue` calls this exact function), so no caller
+    can set a reason without also dating it.
+    """
+    import time as _time
+
+    from coord import state
+
+    state._enqueue_drive_queue_local("api", 7)
+    assert state._get_drive_queue_entry_local("api", 7)["reason_at"] is None
+
+    before = _time.time()
+    assert state._update_drive_queue_entry_local(
+        "api", 7, state="blocked", last_reason="checks_failed"
+    )
+    after = _time.time()
+    entry = state._get_drive_queue_entry_local("api", 7)
+    assert entry["reason_at"] is not None
+    assert before <= entry["reason_at"] <= after
+    first_stamp = entry["reason_at"]
+
+    # A write that never touches `last_reason` must not re-date it — the
+    # timestamp names when the REASON was captured, not when the row last
+    # changed for any reason.
+    assert state._update_drive_queue_entry_local("api", 7, attempts=1)
+    entry = state._get_drive_queue_entry_local("api", 7)
+    assert entry["reason_at"] == first_stamp
+    assert entry["last_reason"] == "checks_failed"
+
+    # Re-writing `last_reason` — even to the identical text — re-dates it: a
+    # fresh observation of the same condition is still a fresh observation.
+    _time.sleep(0.01)
+    assert state._update_drive_queue_entry_local(
+        "api", 7, last_reason="checks_failed"
+    )
+    entry = state._get_drive_queue_entry_local("api", 7)
+    assert entry["reason_at"] > first_stamp
+
+
+def test_drive_queue_daemon_update_handler_also_stamps_reason_at(
+    tmp_path: Path, valid_config_path: Path, rw_db,
+):
+    """The daemon's `/drive-queue` update action must date `last_reason` the
+    same way the local (no-daemon) path does — #2133's fix has to hold for a
+    thin client too, not just a standalone `coord` invocation. Mirrors
+    `test_board_projection_carries_drive_queue`'s use of `rw_db` (a
+    thread-safe file-backed override `TestClient`'s worker thread can
+    actually see) rather than the autouse `:memory:` `coord_db`.
+    """
+    import time as _time
+
+    from coord import state
+
+    db_path = tmp_path / "rw.db"
+    app = build_app(SqliteStore(db_path), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        cli.post(
+            "/drive-queue",
+            json={"action": "enqueue", "repo_name": "api", "issue_number": 7},
+        )
+        resp = cli.post(
+            "/drive-queue",
+            json={
+                "action": "update",
+                "repo_name": "api",
+                "issue_number": 7,
+                "fields": {"state": "blocked", "last_reason": "checks_failed"},
+            },
+        )
+    assert resp.status_code == 200, resp.text
+    entry = state._get_drive_queue_entry_local("api", 7)
+    assert entry["reason_at"] is not None
+    assert entry["reason_at"] <= _time.time()
+
+
 def test_drive_queue_local_move_clamps_out_of_range(coord_db):
     from coord import state
 

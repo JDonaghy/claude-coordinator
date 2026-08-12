@@ -643,6 +643,7 @@ def _dq_row(
     attempts: int = 0,
     deferrals: int = 0,
     last_reason: str = "",
+    reason_at: float | None = None,
     session_name: str = "",
     launched_at: float | None = None,
     enqueued_at: float = 100.0,
@@ -664,6 +665,7 @@ def _dq_row(
         "attempts": attempts,
         "deferrals": deferrals,
         "last_reason": last_reason,
+        "reason_at": reason_at,
         "session_name": session_name,
         "launched_at": launched_at,
         "enqueued_at": enqueued_at,
@@ -695,7 +697,7 @@ class TestFoldDriveQueueStatus:
         assert [m.id for m in result.column_meta] == result.columns
         assert result.columns == [
             "position", "repo", "issue", "title", "state", "machine",
-            "attempts", "deferrals", "last_reason", "enqueued_at",
+            "attempts", "deferrals", "last_reason", "reason_at", "enqueued_at",
             "launched_at", "hold_state", "after",
         ]
 
