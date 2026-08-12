@@ -485,6 +485,50 @@ def test_build_board_view_releases_a_ci_infra_park_once_the_rerun_lands_green():
     assert not view.facts(entry_key(REPO, 1892)).merge_ci_pending
 
 
+def test_build_board_view_flags_a_ci_infra_override_as_unrefreshable():
+    """The realistic #1892-override pairing (review finding on #2158's first
+    diff): `_entry_gate_status` re-derives a LIVE, non-infra "CI failed: ..."
+    reason on the SAME `checks` read that produced a red `ci_summary` — a
+    generic verdict is exactly what a still-failing CI-infra check looks like
+    from the plan's side, since the plan can never compute the infra
+    classification itself (#1892). The raw row still carries the frozen "CI
+    infra:" string from the live merge attempt that parked this entry, so the
+    #1892 override fires and `reason` ends up being that raw string — NOT the
+    live plan one.
+
+    `merge_ci_pending_live` must follow `reason`'s actual provenance, not
+    `bool(plan_reason)`: a non-empty plan reason lost the override fight here,
+    so this reading is exactly as unrefreshable as if the plan had been
+    silent, and `plan_tick`'s `PARK_STALE_SECONDS` ceiling must still apply to
+    it. Before the fix this asserted `merge_ci_pending_live=True` — the same
+    "held with no ceiling" bug #2158 was written to close, just reached via a
+    plan row that isn't empty."""
+    view = build_board_view(
+        {
+            "merge_plan": [
+                _plan_row(
+                    1892,
+                    reason="CI failed: test (3.12)",
+                    ci_summary=_rollup(passed=7, failed=1),
+                ),
+            ],
+            "merge_queue": [
+                {
+                    "repo_name": REPO, "issue_number": 1892,
+                    "error": "CI infra: e2e (cancelled) — no verdict about the code",
+                },
+            ],
+        },
+        [],
+    )
+    facts = view.facts(entry_key(REPO, 1892))
+    assert facts.merge_ci_pending
+    assert facts.merge_ci_pending_reason == (
+        "CI infra: e2e (cancelled) — no verdict about the code"
+    )
+    assert not facts.merge_ci_pending_live
+
+
 def test_build_board_view_never_lets_a_rollup_overrule_a_live_plan_objection():
     """A non-empty plan reason is the live gate still objecting. It wins
     outright — the override only ever applies where the plan is silent."""

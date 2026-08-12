@@ -623,6 +623,12 @@ def build_board_view(
         plan_reason = str((plan_row or {}).get("reason") or "")
         raw_reason = str(row.get("error") or "")
         reason = plan_reason or raw_reason
+        # #2158: provenance of `reason`, tracked AT the point it is decided
+        # rather than re-derived afterward as `bool(plan_reason)`. The two
+        # are NOT equivalent once the #1892 override just below can replace
+        # a non-empty `plan_reason` with the raw reading — `reason_is_live`
+        # must follow `reason` itself, not the variable that lost the fight.
+        reason_is_live = bool(plan_reason)
         # #1892: same recovery `drive_state._merge_entry` applies — the
         # plan's own reason is `_entry_gate_status`'s fresh re-derivation at
         # board-build time, which never computes the CI_INFRA_PREFIX
@@ -632,8 +638,19 @@ def build_board_view(
         # persists it onto the raw row. Prefer the raw reading whenever it
         # carries the classification and the plan's fresher one doesn't —
         # otherwise a verdictless failure would never park here at all.
+        #
+        # This can fire even when `plan_reason` is non-empty (e.g. a live,
+        # non-infra "CI failed: ..." reading that isn't itself the infra
+        # classification) — the raw CI-infra string still wins. When it
+        # does, `reason` ends up being the frozen raw string, not the live
+        # plan one, so `reason_is_live` must flip to `False` too: otherwise
+        # `merge_ci_pending_live` would be reporting on a `plan_reason` that
+        # isn't what `reason` actually is, and `_park_reading_expired`
+        # (which trusts `merge_ci_pending_live` to mean "self-refreshing, no
+        # ceiling needed") would never age this park out.
         if is_ci_infra_reason(raw_reason) and not is_ci_infra_reason(plan_reason):
             reason = raw_reason
+            reason_is_live = False
         if not (is_ci_pending_reason(reason) or is_ci_infra_reason(reason)):
             continue
         # #2158: the same plan row that came back with NO reason of its own
@@ -668,7 +685,7 @@ def build_board_view(
         got = slot(key)
         got["merge_ci_pending"] = True
         got["merge_ci_pending_reason"] = reason
-        got["merge_ci_pending_live"] = bool(plan_reason)
+        got["merge_ci_pending_live"] = reason_is_live
 
     sessions: set[str] = set()
     for item in live_sessions:
