@@ -495,7 +495,7 @@ def _parse_webapp_build_heartbeat(text: str):
     id="webapp_build_heartbeat",
     scope="machine",
     title="webapp build heartbeat",
-    order=48,
+    order=49,
     description=(
         "coord-web-dist-build.sh's heartbeat file, written on EVERY tick "
         "whether or not there was anything to build (#2122) — the only "
