@@ -1539,8 +1539,15 @@ def _release_hold(key: str) -> tuple[bool, str]:
               help="Version this cordon is draining for; shown in every "
                    "surface that renders the cordon.")
 @click.option("--ttl", default=None, type=float,
-              help="Seconds before the cordon lapses on its own "
-                   "(default 3600). A cordon ALWAYS expires — see #2101.")
+              help="Seconds before the cordon lapses on its own if nothing "
+                   "renews it (default 3600) — see #2101. That bounds a "
+                   "propagate run that crashed mid-drain; it does NOT bound "
+                   "a healthy one. `coord release propagate` renews this on "
+                   "every tick a host is still behind, so a driven issue "
+                   "stuck in a long fix loop can hold a cordon for as long "
+                   "as that loop runs — see the drain-deadline escalation "
+                   "(`coord release propagate --drain-deadline`, #2136) for "
+                   "the case this TTL does not cover.")
 @click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
 def release_cordon(
     machines: tuple[str, ...],

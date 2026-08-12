@@ -40,10 +40,16 @@ THE THREE TRAPS THIS MODULE IS SHAPED AROUND
    whole reason propagation is quiescence-scheduled — and an unattended
    nightly job must never carry it. If the drain does not finish, this
    module says so and declines; it does not reach for the escape hatch.
-2. **The drain is bounded.** :data:`DEFAULT_DRAIN_DEADLINE_SECONDS` is the
+2. **The drain is bounded.** :data:`DEFAULT_DRAIN_WAIT_SECONDS` is the
    deadline after which the caller must restart the timer and report
    failure rather than leave the queue stopped into the working day — the
    mirror image of "an expired deadline stops the observer, not the work."
+   Renamed from ``DEFAULT_DRAIN_DEADLINE_SECONDS`` (#2136): this module's
+   3600s bounded *wait* for its own drain loop and
+   :mod:`coord.release_cordon`'s 5400s cordon-escalation deadline are
+   different concepts that used to share one name across two release
+   modules — a readability trap that reads as one constant drifting in
+   value, when they were never the same constant.
 3. **A skipped night must be loud.** Every non-happy status here
    (:data:`STATUS_DRAIN_TIMEOUT`, :data:`STATUS_PROPAGATE_DEFERRED`,
    :data:`STATUS_PROPAGATE_FAILED`, :data:`STATUS_ERROR`) is something the
@@ -78,7 +84,12 @@ DEFAULT_QUEUE_TIMER = "coord-drive-queue.timer"
 #: gives up, restarts the queue and reports failure. An hour leaves ample
 #: room inside the 22:00-08:00 quiet-hours window even started as late as
 #: 03:00 — the queue is never stopped anywhere near the working day.
-DEFAULT_DRAIN_DEADLINE_SECONDS = 3600.0
+#:
+#: Formerly named ``DEFAULT_DRAIN_DEADLINE_SECONDS`` — the same name
+#: :mod:`coord.release_cordon` uses for a different value (5400.0, its
+#: cordon-escalation deadline). Renamed (#2136) so the two stop reading as
+#: one constant that drifted between modules.
+DEFAULT_DRAIN_WAIT_SECONDS = 3600.0
 
 #: How often the drain loop reconciles the queue and re-checks quiescence.
 #: `coord-drive-queue.timer` itself fires every 3 minutes in production —

@@ -51,6 +51,17 @@ the host is still behind, so a TTL comfortably longer than the propagate
 timer's interval is invisible in normal operation and self-healing after a
 crash.
 
+"Every cordon expires" is therefore a guarantee about the CRASHED-loop case
+only (trap B). While the loop stays healthy — the normal case — it is not a
+bound on how long a cordon can run at all: ``expires_at`` is pushed forward
+a full TTL on every renewal, so a host that stays behind for as long as the
+loop keeps ticking stays cordoned for just as long. #2136 hit exactly this:
+a driven issue in a multi-round `request-changes` fix loop (#1692) never
+reached the quiescent window `coord release propagate` waits for before
+rolling, so the fleet-wide cordon it had set on the way past renewed every
+20 minutes for the life of that loop — hours, not the ~1h TTL. See the
+escalation section below for the only mechanism that currently notices.
+
 A HOST THAT NEVER DRAINS IS AN ESCALATION, NEVER A SILENT WAIT
 ---------------------------------------------------------------
 A wedged worker means the cordon never lifts. :func:`plan_cordons` measures
@@ -59,6 +70,17 @@ a new cordon) and, past :data:`DEFAULT_DRAIN_DEADLINE_SECONDS`, emits a
 :class:`DrainEscalation`. The cordon is still renewed — the host really is
 behind, and lifting it would just start work that the next run has to drain
 again — but it is now loud, and its message names the override. Trap C.
+
+#2136: loud is *all* it currently does. Nothing here clears the cordon,
+bounds the drive loop that is keeping the host busy, or otherwise breaks a
+standoff between "the fix loop keeps the host non-quiescent" and "the
+cordon can only lift once the host is quiescent" — the fleet stays
+launch-blocked until an operator reads the escalation and runs the override
+command it names. Whether the deadline should act on its own (clear the
+cordon and defer the roll; roll idle hosts individually instead of gating
+the whole fleet on one busy one; evaluate quiescence per host rather than
+fleet-wide) is a policy call the issue deliberately leaves open rather than
+one this module has made unilaterally.
 
 THE TRIGGER IS COUPLED TO RELEASE FREQUENCY, SO IT IS A KNOB
 --------------------------------------------------------------
