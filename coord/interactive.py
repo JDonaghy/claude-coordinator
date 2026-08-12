@@ -2105,6 +2105,7 @@ def _tokens_from_transcript(
     *,
     worktree_path: str | None = None,
     projects_dir: Path | None = None,
+    ended_at: float | None = None,
 ) -> tuple[int, int, int, int]:
     """#546: sum token usage from Claude Code session transcripts for this session.
 
@@ -2120,6 +2121,30 @@ def _tokens_from_transcript(
     we fall back to scanning ALL project directories that were active since
     *started_at* — broader but still bounded by the time window.
 
+    Two corrections (#2129 — the transcript-token estimate was crediting
+    interactive legs with ~30x physically impossible token counts):
+
+    * **Per-line time bounding.**  A worktree's transcript file is
+      append-only and keeps growing across every leg that runs in that same
+      interactive session (smoke, review, ...).  The old code only checked
+      the *file's* mtime against *started_at* — once the file had been
+      touched after a leg's cutoff, the whole file (every earlier leg's
+      turns too) was summed into that leg's total.  Each JSONL line carries
+      its own ``timestamp``; we now only count lines whose own timestamp
+      falls inside ``[started_at, ended_at)`` (plus a small clock-skew
+      buffer on each side), so a leg only picks up the turns that actually
+      ran during its own window.
+    * **Message-level dedup.**  Claude Code writes one JSONL line per
+      *content block* of an assistant turn (e.g. a ``thinking`` block and a
+      ``tool_use`` block from the same API response land as two lines), and
+      every line for that turn repeats the SAME ``usage`` totals for the
+      whole response.  Summing every line double- (or triple-) counted a
+      single turn.  We now count each unique ``message.id`` at most once.
+
+    *ended_at* bounds the window from above; defaults to "now" (the moment
+    this function runs), which is accurate for callers that invoke this
+    synchronously right as the leg finishes — the normal call pattern.
+
     Returns ``(input_tokens, output_tokens, cache_creation_tokens,
     cache_read_tokens)``.  Returns ``(0, 0, 0, 0)`` when no tokens can be
     recovered — callers treat that as "no data" and skip the write rather
@@ -2127,6 +2152,8 @@ def _tokens_from_transcript(
     """
     if started_at is None:
         return 0, 0, 0, 0
+
+    from coord.usage_rollup import parse_timestamp  # noqa: PLC0415
 
     base = projects_dir if projects_dir is not None else (Path.home() / ".claude" / "projects")
     if not base.is_dir():
@@ -2151,8 +2178,12 @@ def _tokens_from_transcript(
         except OSError:
             return 0, 0, 0, 0
 
-    cutoff = started_at - 5.0  # small clock-skew buffer
+    end = ended_at if ended_at is not None else time.time()
+    skew = 5.0  # small clock-skew buffer, matching the pre-existing mtime cutoff
+    cutoff = started_at - skew
+    end_bound = end + skew
     input_tokens = output_tokens = cache_creation = cache_read = 0
+    seen_message_ids: set[str] = set()
 
     for proj_dir in search_dirs:
         try:
@@ -2175,7 +2206,15 @@ def _tokens_from_transcript(
                     continue
                 if obj.get("type") != "assistant":
                     continue
+                ts = parse_timestamp(obj.get("timestamp"))
+                if ts is None or ts < cutoff or ts >= end_bound:
+                    continue
                 msg = obj.get("message") or {}
+                msg_id = msg.get("id")
+                if msg_id:
+                    if msg_id in seen_message_ids:
+                        continue
+                    seen_message_ids.add(msg_id)
                 usage = msg.get("usage") or {}
                 input_tokens += int(usage.get("input_tokens") or 0)
                 output_tokens += int(usage.get("output_tokens") or 0)
@@ -2183,6 +2222,29 @@ def _tokens_from_transcript(
                 cache_read += int(usage.get("cache_read_input_tokens") or 0)
 
     return input_tokens, output_tokens, cache_creation, cache_read
+
+
+# #2129: a generous ceiling on real Claude output-generation throughput.  Real
+# sustained throughput is usually 30-80 tok/s; 120 tok/s is deliberately
+# generous headroom, not a measured average.  Used as a physical-plausibility
+# backstop on the transcript-derived token counts above — a defense-in-depth
+# check independent of the specific parsing bug it was added to catch, so a
+# *future* attribution bug in this path fails loud (a dropped write + a log
+# line) instead of silently re-inflating `coord usage`'s est(~) column.
+MAX_PLAUSIBLE_OUTPUT_TOKENS_PER_SECOND = 120
+
+
+def _output_tokens_physically_plausible(output_tokens: int, duration_secs: float) -> bool:
+    """Whether *output_tokens* could plausibly have been generated in
+    *duration_secs* wall-clock seconds.
+
+    ``duration_secs <= 0`` (a session with no measurable elapsed time) is
+    only plausible for zero output tokens — anything else is definitionally
+    impossible to have generated in no time.
+    """
+    if duration_secs <= 0:
+        return output_tokens <= 0
+    return output_tokens <= duration_secs * MAX_PLAUSIBLE_OUTPUT_TOKENS_PER_SECOND
 
 
 def _review_findings_from_transcript(
@@ -2551,10 +2613,25 @@ def _persist_interactive_tokens(
     if started_at is None:
         return
     try:
+        now = time.time()
         inp, out, cc, cr = _tokens_from_transcript(
-            started_at, worktree_path=worktree_path
+            started_at, worktree_path=worktree_path, ended_at=now
         )
         if inp + out + cc + cr > 0:
+            # #2129: physical-plausibility backstop — never persist a token
+            # count that couldn't have been generated in this leg's own
+            # wall-clock window. A leg that fails this is a parsing bug, not
+            # real usage; skip the write (matching _tokens_from_transcript's
+            # own "no data" contract) and log so it's visible, rather than
+            # silently feeding a fabricated number into `coord usage`.
+            duration = max(0.0, now - started_at)
+            if not _output_tokens_physically_plausible(out, duration):
+                logging.warning(
+                    "interactive: dropping physically-implausible token count for "
+                    "assignment %s: %d output tokens over %.0fs (> %d tok/s ceiling)",
+                    assignment_id, out, duration, MAX_PLAUSIBLE_OUTPUT_TOKENS_PER_SECOND,
+                )
+                return
             update_assignment_tokens(
                 assignment_id,
                 input_tokens=inp,
