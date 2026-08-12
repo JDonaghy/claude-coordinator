@@ -154,9 +154,24 @@ def _slot_backing_interpreter(venv_dir: Path, interpreter: Path) -> Path | None:
     actually running from" — regularly disagree for hours on a fleet where
     restarts are gated on a drain (#2138/#2136); this function answers the
     second question, which is the one that matters before deleting a slot.
+
+    #2140 review: this must NOT call ``.resolve()`` on *interpreter*
+    wholesale. ``bin/python3`` inside a real ``python -m venv`` slot is
+    itself a symlink chain (PEP 405) ending at the shared base
+    interpreter — e.g. ``~/.coord-venv.blue/bin/python3 -> ... ->
+    /usr/bin/python3.12``. Fully resolving that follows the chain straight
+    out of the slot to a path that is neither blue nor green, so the
+    comparison below would silently never match and this refuse-guard
+    would never fire against a real venv — verified empirically against
+    real ``python3 -m venv`` output. Only the *directory* the interpreter
+    lives in is resolved (to normalize e.g. a symlinked home directory
+    somewhere above the slot); the interpreter's own filename is kept
+    exactly as given, so the comparison stays anchored inside the slot
+    that path actually names instead of following through to whatever
+    that file ultimately points at.
     """
     try:
-        resolved = interpreter.resolve()
+        resolved = interpreter.parent.resolve() / interpreter.name
     except OSError:
         return None
     blue, green = _slots(venv_dir)

@@ -35,6 +35,49 @@ def _make_fake_slot(slot: Path) -> None:
         target.chmod(0o755)
 
 
+def _make_symlinked_fake_slot(slot: Path, base_interpreter: Path) -> None:
+    """Like :func:`_make_fake_slot`, but ``bin/python3`` is a symlink chain
+    that ends at *base_interpreter* — a path outside *slot* entirely —
+    instead of a plain regular file.
+
+    This is the shape a *real* ``python -m venv`` slot actually has (PEP
+    405): ``sys.executable`` reports the venv's own ``bin/python3`` path,
+    but that path is itself a symlink chain (``bin/python -> python3 ->
+    <base interpreter>``) ending at the shared system interpreter outside
+    the venv, e.g. ``~/.coord-venv.blue/bin/python3 -> ... ->
+    /usr/bin/python3.12``.
+
+    #2140 review: ``_make_fake_slot``'s plain-regular-file ``bin/python``
+    makes ``Path.resolve()`` a no-op, so every test built on it passed
+    even when ``_slot_backing_interpreter`` called ``.resolve()`` on the
+    whole interpreter path and followed straight out of the slot to the
+    base interpreter — the exact bug that made the refuse-guard
+    unreachable in production. Tests that exercise
+    ``_slot_backing_interpreter``'s/``perform_update``'s handling of a
+    *real* running interpreter must use this fixture, not the plain one.
+    """
+    (slot / "bin").mkdir(parents=True, exist_ok=True)
+    for name in ("pip", "coord"):
+        target = slot / "bin" / name
+        target.write_text("#!/bin/sh\n")
+        target.chmod(0o755)
+    python3 = slot / "bin" / "python3"
+    python = slot / "bin" / "python"
+    python3.symlink_to(base_interpreter)
+    python.symlink_to("python3")
+
+
+def _make_base_interpreter(tmp_path: Path) -> Path:
+    """A fake "system" interpreter living outside any blue/green slot, for
+    :func:`_make_symlinked_fake_slot` to symlink out to — standing in for
+    e.g. ``/usr/bin/python3.12``."""
+    base = tmp_path / "_system" / "python3.12"
+    base.parent.mkdir(parents=True, exist_ok=True)
+    base.write_text("#!/bin/sh\n")
+    base.chmod(0o755)
+    return base
+
+
 def _run_stub(
     *,
     venv_ok: bool = True,
@@ -309,6 +352,27 @@ class TestSlotBackingInterpreter:
         venv_dir = tmp_path / ".coord-venv"
         assert _slot_backing_interpreter(venv_dir, Path("/usr/bin/python3")) is None
 
+    def test_matches_slot_through_a_real_venv_style_symlink_chain(
+        self, tmp_path: Path
+    ) -> None:
+        """#2140 review: a real ``python -m venv`` slot's ``bin/python3``
+        is a symlink chain out to the shared base interpreter, not a plain
+        file (see :func:`_make_symlinked_fake_slot`). Resolving the whole
+        interpreter path follows that chain straight out of the slot —
+        this must still correctly identify the owning slot rather than
+        returning ``None``."""
+        venv_dir = tmp_path / ".coord-venv"
+        blue = tmp_path / ".coord-venv.blue"
+        green = tmp_path / ".coord-venv.green"
+        base_interpreter = _make_base_interpreter(tmp_path)
+        _make_symlinked_fake_slot(blue, base_interpreter)
+        _make_symlinked_fake_slot(green, base_interpreter)
+
+        assert _slot_backing_interpreter(venv_dir, blue / "bin" / "python3") == blue
+        assert _slot_backing_interpreter(venv_dir, green / "bin" / "python3") == green
+        # The shared base interpreter itself is outside both slots.
+        assert _slot_backing_interpreter(venv_dir, base_interpreter) is None
+
 
 class TestPerformUpdateRefusesOwnRunningSlot:
     """#2140's motivating incident: a swap flips the symlink without a
@@ -320,7 +384,13 @@ class TestPerformUpdateRefusesOwnRunningSlot:
 
     def test_refuses_and_leaves_everything_untouched(self, tmp_path: Path, monkeypatch) -> None:
         venv_dir = tmp_path / ".coord-venv"
-        _make_fake_slot(venv_dir)  # gives the pre-migration slot (-> blue) a bin/python
+        base_interpreter = _make_base_interpreter(tmp_path)
+        # #2140 review: use the realistic fixture — a real venv's
+        # bin/python3 is a symlink chain out to a shared base interpreter,
+        # not a plain file. The plain-file fixture made this test (and
+        # `_slot_backing_interpreter`'s naive `.resolve()`) pass without
+        # ever exercising the shape that actually broke in production.
+        _make_symlinked_fake_slot(venv_dir, base_interpreter)  # pre-migration slot (-> blue)
 
         with patch(
             "coord.agent_update.subprocess.run", side_effect=_run_stub(version="1.0.0")
@@ -335,7 +405,7 @@ class TestPerformUpdateRefusesOwnRunningSlot:
         # slot the symlink swapped away from, and the one the *next*
         # update would try to rebuild.
         monkeypatch.setattr(
-            "coord.agent_update.sys.executable", str(blue / "bin" / "python")
+            "coord.agent_update.sys.executable", str(blue / "bin" / "python3")
         )
 
         calls: list = []
@@ -351,7 +421,7 @@ class TestPerformUpdateRefusesOwnRunningSlot:
         # Nothing was even attempted: no subprocess calls, blue is intact,
         # venv_dir is still on green (the rollback generation survives).
         assert calls == []
-        assert (blue / "bin" / "python").exists()
+        assert (blue / "bin" / "python3").exists()
         assert current_slot(venv_dir) == green
 
     def test_proceeds_when_running_interpreter_is_outside_the_layout(
