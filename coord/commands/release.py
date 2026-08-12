@@ -840,13 +840,18 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
         # #1835: "a red post-deploy verification must roll back, not just
         # report." Only the hosts THIS run updated — rolling back a host we
         # never touched would undo somebody else's deliberate state.
+        from coord.agent_update import cli_initiator  # noqa: PLC0415
+
         down: list[str] = []
         for host in updated_hosts:
             machine = by_name.get(host)
             if machine is None:
                 continue
             ok, detail = _rollback_host(
-                machine, agent_port=AGENT_PORT, timeout=min(timeout, 120.0)
+                machine, agent_port=AGENT_PORT, timeout=min(timeout, 120.0),
+                initiator=cli_initiator(
+                    f"coord release propagate -> {machine.name} rollback (red gate)"
+                ),
             )
             record.rolled_back.append(f"{host}: {detail}")
             if not ok:
@@ -1163,13 +1168,12 @@ def _roll_python(machine, *, target_version: str, agent_port: int, timeout: floa
       coord-web was what failed). Callers deciding whether it's safe to
       let OTHER hosts proceed must key off ``serve_unit_ok``, not ``ok``.
     """
+    from coord.agent_update import cli_initiator  # noqa: PLC0415
     from coord.commands.agent_ops import (  # noqa: PLC0415
         _fetch_pre_started_at,
         _wait_agents_updated,
     )
     from coord.release_verify import DAEMON_UNIT  # noqa: PLC0415
-
-    from coord.agent_update import cli_initiator  # noqa: PLC0415
 
     pre = _fetch_pre_started_at([machine])
     status, body, error = _post(
@@ -1440,7 +1444,7 @@ def _wait_agent_back(machine, *, agent_port: int, timeout: float) -> tuple[bool,
 
 
 def _rollback_host(
-    machine, *, agent_port: int, timeout: float = 90.0
+    machine, *, agent_port: int, timeout: float = 90.0, initiator: str | None = None
 ) -> tuple[bool, str]:
     """POST /rollback — back to the previous blue/green generation (#1241) —
     and then put the service back on its feet.
@@ -1453,11 +1457,19 @@ def _rollback_host(
     coord-agent`` (#404/#1568 — ``os.execv`` self-restart does not always
     take under systemd), and only then gives up — loudly, naming the host as
     DOWN rather than reporting a tidy "rolling back".
+
+    #2121: *initiator* names this call on the target host's audit trail, the
+    same as ``_roll_python``'s own ``/update`` POST a few lines up — both are
+    automation that fires during a fleet roll with nobody at a keyboard, so
+    both callers below build one with :func:`coord.agent_update.cli_initiator`
+    rather than leaving it to the generic peer/user-agent fallback.
     """
     from coord.commands.agent_ops import _escalate_restart  # noqa: PLC0415
 
     status, body, error = _post(
-        f"http://{machine.host}:{agent_port}/rollback", {"force": True}, timeout=30.0
+        f"http://{machine.host}:{agent_port}/rollback",
+        {"force": True, "initiator": initiator} if initiator else {"force": True},
+        timeout=30.0,
     )
     if error:
         return False, error
@@ -1677,6 +1689,7 @@ def release_rollback(config_path: Path, machine_filter: str | None, yes: bool,
     fleet is broken, and refusing because a worker is running on a broken
     release would be the wrong tradeoff at exactly the wrong moment.
     """
+    from coord.agent_update import cli_initiator  # noqa: PLC0415
     from coord.commands._common import AGENT_PORT, _load_config  # noqa: PLC0415
 
     config = _load_config(config_path)
@@ -1695,7 +1708,10 @@ def release_rollback(config_path: Path, machine_filter: str | None, yes: bool,
         )
     failures = 0
     for machine in machines:
-        ok, detail = _rollback_host(machine, agent_port=AGENT_PORT, timeout=wait)
+        ok, detail = _rollback_host(
+            machine, agent_port=AGENT_PORT, timeout=wait,
+            initiator=cli_initiator(f"coord release rollback -> {machine.name}"),
+        )
         click.echo(f"  {'↩' if ok else '✗'} {machine.name}: {detail}")
         failures += 0 if ok else 1
     if failures:

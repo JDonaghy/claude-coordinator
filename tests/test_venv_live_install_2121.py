@@ -503,6 +503,37 @@ class TestTestsCannotReachTheLiveInstall:
         monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
         assert_not_live_install(Path.home() / ".coord-venv")
 
+    def test_rollback_refuses_before_touching_the_live_symlink(self) -> None:
+        """`rollback` is the other production-mutating entry point reachable
+        from `/rollback` with the same `_venv_dir()`-resolved path, and it
+        moves the same live symlink via the same `_atomic_swap` `perform_update`
+        uses — it must be guarded exactly like `perform_update`, not just
+        exempted on the "nothing is deleted" reasoning that only applies to
+        `processes_holding_slot`."""
+        live = Path.home() / ".coord-venv"
+
+        with pytest.raises(LiveInstallGuardError):
+            rollback(live, initiator="someone")
+
+    def test_a_differently_spelled_path_to_the_live_venv_still_trips_the_guard(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Same reasoning as `_other_slot`'s `_same_path` fix: the guard
+        compares against `Path.home() / ".coord-venv"` by string, and a
+        `venv_dir` that names the identical directory through a symlinked
+        `$HOME` (or any other alias) must not slip past a `!=` on the
+        unresolved spelling."""
+        real_home = tmp_path / "real-home"
+        real_home.mkdir()
+        alias_home = tmp_path / "alias-home"
+        alias_home.symlink_to(real_home, target_is_directory=True)
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: alias_home))
+
+        live_via_real_path = real_home / ".coord-venv"
+
+        with pytest.raises(LiveInstallGuardError):
+            assert_not_live_install(live_via_real_path)
+
 
 # ── the pre-existing migration path still works under the new guards ────
 

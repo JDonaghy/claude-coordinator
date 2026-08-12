@@ -1252,6 +1252,143 @@ def test_roll_python_tolerates_an_agent_that_predates_restart_services(monkeypat
     assert serve_unit_ok is True
 
 
+def test_roll_python_posts_a_meaningful_initiator(monkeypatch):
+    """#2121 item 2: `_roll_python`'s `/update` POST must carry a real
+    `cli_initiator`-built string naming the fleet roll, not leave the
+    target agent to fall back to its own generic peer/user-agent default."""
+    posts: list[tuple[str, dict]] = []
+
+    def _fake_post(url, payload, *, timeout):
+        posts.append((url, payload))
+        if url.endswith("/update"):
+            return 202, {}, ""
+        if url.endswith("/restart-services"):
+            return 200, {"units": {}}, ""
+        raise AssertionError(f"unexpected POST {url}")
+
+    monkeypatch.setattr(release_cmd, "_post", _fake_post)
+    monkeypatch.setattr(
+        "coord.commands.agent_ops._fetch_pre_started_at", lambda machines: {}
+    )
+    monkeypatch.setattr(
+        "coord.commands.agent_ops._wait_agents_updated",
+        lambda machines, *, target_version, timeout, pre_started_at: {
+            m.name: {"matched": True} for m in machines
+        },
+    )
+
+    release_cmd._roll_python(
+        _machine(), target_version="0.4.111", agent_port=7433, timeout=5.0, force=False
+    )
+
+    update_payload = next(p for u, p in posts if u.endswith("/update"))
+    initiator = update_payload.get("initiator")
+    assert isinstance(initiator, str)
+    assert initiator.startswith("coord release propagate -> server python lane (")
+
+
+def test_rollback_host_posts_the_caller_supplied_initiator(monkeypatch):
+    """#2121: `_rollback_host` is the sibling of `_roll_python` above — same
+    fleet-automation shape, same obligation to name itself on the target
+    host's audit trail via the `initiator` field."""
+    posts: list[tuple[str, dict]] = []
+
+    def _fake_post(url, payload, *, timeout):
+        posts.append((url, payload))
+        return 202, {}, ""
+
+    monkeypatch.setattr(release_cmd, "_post", _fake_post)
+    monkeypatch.setattr(
+        release_cmd, "_wait_agent_back", lambda *a, **k: (True, "0.4.110")
+    )
+
+    ok, detail = release_cmd._rollback_host(
+        _machine(), agent_port=7433, timeout=5.0,
+        initiator="coord release propagate -> server rollback (red gate) (john@laptop pid 1)",
+    )
+
+    assert ok
+    assert "rolled back" in detail
+    (url, payload), = posts
+    assert url == "http://server.tailnet:7433/rollback"
+    assert payload.get("initiator") == (
+        "coord release propagate -> server rollback (red gate) (john@laptop pid 1)"
+    )
+
+
+def test_rollback_host_without_an_initiator_omits_the_field(monkeypatch):
+    """No caller-supplied initiator must not send a falsy/empty value that
+    would shadow the target agent's own peer/user-agent fallback — the key
+    should simply be absent."""
+    posts: list[tuple[str, dict]] = []
+
+    def _fake_post(url, payload, *, timeout):
+        posts.append((url, payload))
+        return 202, {}, ""
+
+    monkeypatch.setattr(release_cmd, "_post", _fake_post)
+    monkeypatch.setattr(
+        release_cmd, "_wait_agent_back", lambda *a, **k: (True, "0.4.110")
+    )
+
+    release_cmd._rollback_host(_machine(), agent_port=7433, timeout=5.0)
+
+    (_url, payload), = posts
+    assert "initiator" not in payload
+
+
+def test_release_propagate_red_gate_rollback_names_itself(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    """The red-gate rollback inside `coord release propagate` is one of the
+    two live call sites of `_rollback_host` (the other is `coord release
+    rollback`) — it must build a real initiator, not leave the field off
+    and fall back to the generic per-agent default."""
+    _stub_lanes(monkeypatch)
+    _stub_verify(monkeypatch, versions={"laptop": ["0.4.110"], "server": ["0.4.110"]},
+                 severity="crit")
+    captured: list[dict] = []
+    monkeypatch.setattr(
+        release_cmd, "_rollback_host",
+        lambda machine, *, agent_port, timeout, initiator=None: (
+            captured.append({"machine": machine.name, "initiator": initiator}),
+            (True, "back up"),
+        )[1],
+    )
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111"],
+    )
+    assert result.exit_code == 2, result.output
+    assert captured, "the red gate must have rolled back at least one host"
+    for row in captured:
+        assert isinstance(row["initiator"], str)
+        assert row["initiator"].startswith("coord release propagate -> ")
+
+
+def test_release_rollback_cli_names_itself(valid_config_path, monkeypatch):
+    """`coord release rollback` is the other live call site of
+    `_rollback_host` — same obligation."""
+    captured: list[dict] = []
+    monkeypatch.setattr(
+        release_cmd, "_rollback_host",
+        lambda machine, *, agent_port, timeout, initiator=None: (
+            captured.append({"machine": machine.name, "initiator": initiator}),
+            (True, "back up"),
+        )[1],
+    )
+    result = CliRunner().invoke(
+        main,
+        ["release", "rollback", "--config", str(valid_config_path), "--yes"],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured
+    for row in captured:
+        assert isinstance(row["initiator"], str)
+        assert row["initiator"].startswith("coord release rollback -> ")
+
+
 def test_restart_sibling_services_reports_a_mix_of_outcomes(monkeypatch):
     calls = []
 
