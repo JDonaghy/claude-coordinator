@@ -1591,6 +1591,87 @@ class HealthConfig:
 
 
 @dataclass
+class NotificationsConfig:
+    """The phone-push channel (#1632, ``coord notifier``).
+
+    Fires when the pipeline **has stopped, or is stalled, and will not
+    advance without a human** — not when "something bad happened". The
+    auto-loop already handles failed tests, request-changes reviews and
+    mechanical merge conflicts; pushing those is the noise that trains an
+    operator to mute the channel. In normal operation this fires
+    approximately never.
+
+    ``enabled`` defaults to **False**: a coordinator that starts pushing to
+    a phone the moment it is upgraded, without anyone asking, is a worse
+    failure than one that stays silent. Every deployment with no
+    ``notifications:`` block behaves exactly as it did before.
+
+    The whole subsystem is advisory and isolated — an unreachable ntfy
+    server must not affect dispatch, routing, the board or any verdict.
+    That is enforced in :mod:`coord.notifier.transport` and
+    :mod:`coord.notifier.service`, not here, but it is the reason none of
+    these settings are consulted by anything on the dispatch path.
+    """
+
+    # Master switch. False makes the tick a no-op; the CLI stays available
+    # so `coord notifier status` can still explain why nothing is arriving.
+    enabled: bool = False
+
+    # ── transport ─────────────────────────────────────────────────────────
+    # "ntfy" (self-hosted, over Tailscale) or "none" (predicate runs, the
+    # ledger updates, nothing is delivered — useful for shaking out false
+    # positives before pointing it at a phone).
+    transport: str = "ntfy"
+    # Server root, e.g. "http://dellserver:7440". Nothing leaves the
+    # tailnet: event text carries repo names, issue titles and failure
+    # detail, which is exactly why the server is self-hosted.
+    ntfy_url: str | None = None
+    ntfy_topic: str | None = None
+    # Optional; a tailnet-only server often has nothing to authenticate.
+    ntfy_token: str | None = None
+    timeout_secs: float = 5.0
+
+    # Origin of the `coord web` PWA, e.g. "http://dellserver:7434".
+    # Notifications must be actionable from a phone, so every event that
+    # names an issue links straight to that issue's pipeline view.
+    web_base_url: str | None = None
+
+    # ── quiet hours ───────────────────────────────────────────────────────
+    # A DEFERRAL window, not a filter: events raised inside it are held,
+    # coalesced, and delivered as one digest when it closes. Nothing is
+    # discarded. No severity level pierces it — the only exception is a
+    # drive the operator explicitly marked `--urgent`, which is a deadline
+    # rather than a severity, and which expires with that drive.
+    quiet_hours: QuietHours | None = None
+    # How long a `coord drive --urgent` opt-out lasts. Scoped and expiring
+    # so a forgotten flag cannot make every future night loud.
+    urgent_ttl_hours: float = 12.0
+
+    # ── baselines ─────────────────────────────────────────────────────────
+    # Under this many completed legs a stratum has NO baseline and falls
+    # back to a generous absolute ceiling, which the notification text says
+    # out loud. Never fire off a population of one.
+    min_samples: int = 5
+    # Which percentile of the stratified population is "far too long".
+    # p90 is the #1632 proposal; 2x median is the documented alternative,
+    # reported alongside it by `coord notifier baselines` so the two can be
+    # compared against real fleet data before either is committed to.
+    percentile: float = 90.0
+    # Silence threshold as a fraction of the stratum's median leg (clamped
+    # in coord.notifier.baseline). A repo whose test suite takes 20 minutes
+    # legitimately goes quiet; a fixed value would either spam that repo or
+    # never fire on a fast one.
+    silence_fraction: float = 0.5
+    # How long a stall must survive `drive`'s nudge before the notifier
+    # believes it. `drive` owns the definition of "stalled" (#1593) — this
+    # only says how long to wait for the nudge to work.
+    stall_grace_mins: float = 20.0
+    # Cold-start ceilings, MINUTES, keyed by assignment type. Merged over
+    # coord.notifier.baseline.DEFAULT_COLD_CEILINGS.
+    cold_ceiling_mins: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
 class Config:
     repos: list[Repo]
     machines: list[Machine]
@@ -1612,6 +1693,8 @@ class Config:
     audit: AuditConfig = field(default_factory=AuditConfig)
     pricing: PricingConfig = field(default_factory=PricingConfig)
     health: HealthConfig = field(default_factory=HealthConfig)
+    # #1632 — absent block == disabled == today's behaviour (silence).
+    notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
     path: Path | None = None
 
     def repo(self, name: str) -> Repo | None:
@@ -1683,6 +1766,7 @@ def parse_mapping(raw: Any, *, path: Path | None = None) -> Config:
     audit = _parse_audit(raw.get("audit"))
     pricing = _parse_pricing(raw.get("pricing"))
     health = _parse_health(raw.get("health"))
+    notifications = _parse_notifications(raw.get("notifications"))
 
     return Config(
         repos=repos,
@@ -1704,6 +1788,7 @@ def parse_mapping(raw: Any, *, path: Path | None = None) -> Config:
         audit=audit,
         pricing=pricing,
         health=health,
+        notifications=notifications,
         path=p,
     )
 
@@ -1866,9 +1951,15 @@ def _parse_hhmm(raw: Any, *, field_path: str) -> time:
     return time(int(m.group(1)), int(m.group(2)))
 
 
-def _parse_quiet_hours(raw: Any, *, machine_index: int, machine_name: str) -> QuietHours | None:
-    """Parse ``machines[i].quiet_hours`` (#1862). ``None`` input → ``None``
-    (no window — the default, unchanged-behaviour case).
+def _parse_quiet_hours_block(raw: Any, *, prefix: str) -> QuietHours | None:
+    """Parse a ``{start, end, tz}`` quiet-hours mapping. ``None`` → ``None``.
+
+    Shared by ``machines[i].quiet_hours`` (#1862, a *dispatch* window) and
+    ``notifications.quiet_hours`` (#1632, a *deferral* window). The two
+    windows mean different things, but "what a quiet-hours block looks
+    like and which of its fields are mandatory" must not fork — a second,
+    independently-drifting parser is how a fleet ends up with two clocks
+    that disagree.
 
     ``tz`` is REQUIRED and validated against the IANA database: `coord
     serve` runs on UTC, so a naive time-of-day compared against the
@@ -1879,7 +1970,6 @@ def _parse_quiet_hours(raw: Any, *, machine_index: int, machine_name: str) -> Qu
     """
     if raw is None:
         return None
-    prefix = f"machines[{machine_index}] ({machine_name!r}).quiet_hours"
     if not isinstance(raw, dict):
         raise ConfigError(f"{prefix} must be a mapping")
 
@@ -1905,6 +1995,14 @@ def _parse_quiet_hours(raw: Any, *, machine_index: int, machine_name: str) -> Qu
         )
 
     return QuietHours(start=start, end=end, tz=tz)
+
+
+def _parse_quiet_hours(raw: Any, *, machine_index: int, machine_name: str) -> QuietHours | None:
+    """Parse ``machines[i].quiet_hours`` (#1862) — see
+    :func:`_parse_quiet_hours_block` for the shape and the ``tz`` rule."""
+    return _parse_quiet_hours_block(
+        raw, prefix=f"machines[{machine_index}] ({machine_name!r}).quiet_hours"
+    )
 
 
 def _parse_machines(raw: Any, repos: list[Repo]) -> list[Machine]:
@@ -2819,6 +2917,124 @@ def _parse_health(raw: Any) -> HealthConfig:
                 f"health.{warn_key} ({warn_value}) — otherwise the crit level "
                 f"is unreachable and a failing machine only ever reports WARN"
             )
+
+    return cfg
+
+
+#: Transports `notifications.transport` accepts.  Adding one here is not
+#: enough — `coord.notifier.transport.build_transport` must know it too.
+_NOTIFICATION_TRANSPORTS = ("ntfy", "none")
+
+_NOTIFICATIONS_STR_FIELDS = ("ntfy_url", "ntfy_topic", "ntfy_token", "web_base_url")
+_NOTIFICATIONS_FLOAT_FIELDS: dict[str, tuple[float, float | None]] = {
+    # name -> (minimum, maximum or None)
+    "timeout_secs": (0.1, 120.0),
+    "urgent_ttl_hours": (0.1, 24.0 * 14),
+    "percentile": (50.0, 100.0),
+    "silence_fraction": (0.05, 10.0),
+    "stall_grace_mins": (0.0, 24.0 * 60),
+}
+
+
+def _parse_notifications(raw: Any) -> NotificationsConfig:
+    """Parse the optional ``notifications:`` block from coordinator.yml (#1632).
+
+    An absent block returns a **disabled** :class:`NotificationsConfig` —
+    unchanged behaviour for every existing deployment.
+    """
+    if raw is None:
+        return NotificationsConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'notifications' must be a mapping")
+
+    cfg = NotificationsConfig()
+    known = {f.name for f in fields(NotificationsConfig)}
+    unknown = sorted(set(raw) - known)
+    if unknown:
+        raise ConfigError(
+            f"unknown notifications option(s): {', '.join(unknown)} "
+            f"(valid: {', '.join(sorted(known))})"
+        )
+
+    if "enabled" in raw:
+        if not isinstance(raw["enabled"], bool):
+            raise ConfigError("notifications.enabled must be a boolean")
+        cfg.enabled = raw["enabled"]
+
+    if "transport" in raw:
+        value = raw["transport"]
+        if value not in _NOTIFICATION_TRANSPORTS:
+            raise ConfigError(
+                f"notifications.transport must be one of "
+                f"{', '.join(_NOTIFICATION_TRANSPORTS)}, got {value!r}"
+            )
+        cfg.transport = value
+
+    for key in _NOTIFICATIONS_STR_FIELDS:
+        if key in raw:
+            value = raw[key]
+            if value is not None and not isinstance(value, str):
+                raise ConfigError(f"notifications.{key} must be a string or null")
+            # An empty string is an operator typo, not "unset": accepting it
+            # would produce an ntfy URL like "/topic" and a silent 404 on
+            # every send, which is the hardest possible failure to notice on
+            # a channel whose healthy state is silence.
+            if isinstance(value, str) and not value.strip():
+                raise ConfigError(f"notifications.{key} must be a non-empty string or null")
+            setattr(cfg, key, value.strip().rstrip("/") if isinstance(value, str) else None)
+
+    if "min_samples" in raw:
+        value = raw["min_samples"]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 2:
+            raise ConfigError(
+                "notifications.min_samples must be an integer >= 2 — a baseline "
+                "derived from a population of one is not a baseline"
+            )
+        cfg.min_samples = value
+
+    for key, (minimum, maximum) in _NOTIFICATIONS_FLOAT_FIELDS.items():
+        if key in raw:
+            value = raw[key]
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ConfigError(f"notifications.{key} must be a number")
+            if value < minimum or (maximum is not None and value > maximum):
+                bound = f">= {minimum}" if maximum is None else f"between {minimum} and {maximum}"
+                raise ConfigError(f"notifications.{key} must be {bound}")
+            setattr(cfg, key, float(value))
+
+    if "cold_ceiling_mins" in raw:
+        value = raw["cold_ceiling_mins"]
+        if not isinstance(value, dict):
+            raise ConfigError(
+                "notifications.cold_ceiling_mins must be a mapping of "
+                "assignment type -> minutes"
+            )
+        ceilings: dict[str, float] = {}
+        for atype, minutes in value.items():
+            if not isinstance(atype, str) or not atype.strip():
+                raise ConfigError(
+                    "notifications.cold_ceiling_mins keys must be assignment "
+                    "type names (strings)"
+                )
+            if isinstance(minutes, bool) or not isinstance(minutes, (int, float)) or minutes <= 0:
+                raise ConfigError(
+                    f"notifications.cold_ceiling_mins[{atype!r}] must be a positive number "
+                    "of minutes"
+                )
+            ceilings[atype.strip()] = float(minutes)
+        cfg.cold_ceiling_mins = ceilings
+
+    cfg.quiet_hours = _parse_quiet_hours_block(
+        raw.get("quiet_hours"), prefix="notifications.quiet_hours"
+    )
+
+    if cfg.enabled and cfg.transport == "ntfy" and not (cfg.ntfy_url and cfg.ntfy_topic):
+        raise ConfigError(
+            "notifications.enabled is true with transport 'ntfy' but "
+            "ntfy_url/ntfy_topic are not both set — a notifier that silently "
+            "delivers nothing is indistinguishable from a healthy fleet, which "
+            "is the one failure this feature exists to prevent"
+        )
 
     return cfg
 

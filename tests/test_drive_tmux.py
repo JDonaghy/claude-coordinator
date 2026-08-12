@@ -289,6 +289,8 @@ class TestRebuildDriveArgv:
             deadline_mins=240.0,
             stall_mins=20.0,
             notify=False,
+            # #1632: the notifier's quiet-hours opt-out for this drive.
+            urgent=False,
             accept_advisory=False,
             force_review=False,
             no_merge=False,
@@ -307,7 +309,7 @@ class TestRebuildDriveArgv:
         # numeric options.
         for flag in (
             "--machine", "--model", "--briefing-file", "--plan", "--skip-test",
-            "--repo-path", "--notify", "--accept-advisory", "--force-review",
+            "--repo-path", "--notify", "--urgent", "--accept-advisory", "--force-review",
             "--no-merge", "--dry-run", "--config",
         ):
             assert flag not in argv

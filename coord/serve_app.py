@@ -6665,6 +6665,21 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         # reproduce the bug for one more minute on every deploy.
         last_notify_drain = 0.0
 
+        # #1632: the fleet notifier's own (slower) cadence on the same
+        # clock.  Default 120 s: the conditions it detects — a halted
+        # drive, a stall that survived its nudge, a leg past its learned
+        # p90 — are all measured in tens of minutes, so a faster tick adds
+        # agent `/status` fan-out for no earlier warning.  0 disables.
+        try:
+            notifier_interval = float(os.environ.get("COORD_NOTIFIER_INTERVAL", "120"))
+        except ValueError:
+            notifier_interval = 120.0
+        # Unlike the drain above, start at NOW rather than 0: a daemon
+        # restart is not evidence that anything stalled, and firing the
+        # predicate against a board that has not been reconciled yet is how
+        # a redeploy turns into a burst of phone pushes.
+        last_notifier = _time.monotonic()
+
         # #1220: fleet-wide orphaned-worktree sweep on its own slow cadence
         # (default hourly; 0 disables).  Separate timer from housekeeping/
         # merges above since it's a different kind of maintenance (per-machine
@@ -6739,7 +6754,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
 
         async def _tick_loop() -> None:
             nonlocal last_housekeeping, last_merge_reconcile, last_worktree_clean, last_wal_checkpoint
-            nonlocal last_notify_drain
+            nonlocal last_notify_drain, last_notifier
             from coord.reconcile import reconcile_completed_assignments  # noqa: PLC0415
             from coord import merge_queue as _mq  # noqa: PLC0415
 
@@ -6808,6 +6823,39 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                             )
                     except Exception:  # noqa: BLE001
                         log.warning("notify drain tick failed", exc_info=True)
+                # Step 1c: #1632 — the fleet notifier.  Rides #1616's clock
+                # rather than shipping a second one; two independent clocks
+                # is exactly how a fleet ends up with two that disagree.
+                #
+                # Own (slower) cadence because the pass fans out to every
+                # busy machine's agent `/status`, and because the thing it
+                # detects is measured in tens of minutes — a 30 s cadence
+                # would buy nothing but load.  0 disables.
+                #
+                # ADVISORY AND ISOLATED (#1632 acceptance, #1485 precedent):
+                # `notifier.tick` is documented never to raise, and this
+                # try/except is the belt to that braces.  An unreachable
+                # ntfy server must not affect dispatch, routing, the board
+                # or any verdict — so a failure here is logged at debug and
+                # the tick moves on to the enqueue step below.
+                if notifier_interval > 0 and (
+                    _time.monotonic() - last_notifier >= notifier_interval
+                ):
+                    last_notifier = _time.monotonic()
+                    try:
+                        from coord.notifier import service as _notifier  # noqa: PLC0415
+
+                        notified = await run_in_threadpool(
+                            _notifier.tick,
+                            config,
+                            fleet_health=_fleet_health_refresher.snapshot().to_dict(),
+                        )
+                        if notified.delivered or notified.digest:
+                            log.info("notifier: %s", notified.summary())
+                        elif notified.error:
+                            log.debug("notifier: %s", notified.error)
+                    except Exception:  # noqa: BLE001 — advisory channel
+                        log.debug("notifier tick failed", exc_info=True)
                 # Step 2: enqueue approved work (#736 / #217 invisible limbo fix).
                 # Runs AFTER reconcile so freshly-completed work is on the board
                 # when we scan for approved assignments.  Independent try/except
