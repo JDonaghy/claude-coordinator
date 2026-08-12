@@ -72,9 +72,10 @@
 # script form (safer to type over ssh from a phone under stress) and the
 # full recovery runbook + timed drill transcript.
 #
-# NOT durable on its own against THIS timer: origin/main realistically
-# doesn't move within this timer's 1min cadence, so a rollback alone would
-# get silently republished (and undone) on the very next tick. That's what
+# NOT durable on its own against THIS timer: fixing/reverting a bad commit
+# on origin/main realistically takes longer than this timer's 10min cadence
+# (#2122), so a rollback alone would get silently republished (and undone)
+# on the very next tick. That's what
 # the "Rollback-sentinel guard" below is for — coord-web-rollback.sh writes
 # $RELEASES_DIR/.rollback-blocked-sha naming the bad SHA, and this script
 # refuses to republish exactly that SHA until main moves past it or the
@@ -111,12 +112,23 @@ LOCK_FILE="${LOCK_FILE:-$HOME/.coord-web-dist-build.lock}"
 # Sentinel written by coord-web-rollback.sh (#1560) naming the SHA an
 # operator just rolled back FROM. See the "Rollback-sentinel guard" block
 # below: without this, this timer re-publishes that exact SHA on its very
-# next tick (up to 1min later) whenever origin/$BRANCH hasn't moved past it
-# yet — silently undoing a manual rollback for precisely the bug class
+# next tick (up to 10min later, #2122) whenever origin/$BRANCH hasn't moved
+# past it yet — silently undoing a manual rollback for precisely the bug class
 # (client-side-only JS runtime errors) the manual path exists to catch. See
 # coord-web-rollback.sh's header and docs/PHONE_WEBAPP.md's "Rollback" and
 # "Recovery" sections for the full story.
 BLOCKED_SHA_FILE="${BLOCKED_SHA_FILE:-$RELEASES_DIR/.rollback-blocked-sha}"
+
+# Heartbeat (#2122): written on EVERY invocation, whether or not there was
+# anything to build — proof the timer is still firing, independent of the
+# journal. The up-to-date path below (by far the common case, now that the
+# timer polls instead of logging on a fixed short cadence) deliberately
+# stays SILENT in the journal, so this file is the only place that answers
+# "did this last actually run?" without grepping systemd's own fire history.
+# `coord.health.checks.deploy_lane_facts.probe_webapp_build_heartbeat` reads
+# it to distinguish "up to date" from "has not run since <time>" (a dead
+# trigger — timer disabled, wedged, or erroring before it gets here).
+HEARTBEAT_FILE="${HEARTBEAT_FILE:-$RELEASES_DIR/.last-run-at}"
 
 # ── Health-check-before-cutover config (#1560) ──────────────────────────────
 # 127.0.0.1-only, never $HEALTH_CHECK_HOST=0.0.0.0 — this is a throwaway
@@ -132,6 +144,18 @@ HEALTH_CHECK_TIMEOUT_SECS="${HEALTH_CHECK_TIMEOUT_SECS:-20}"
 HEALTH_CHECK_FIXTURE="${HEALTH_CHECK_FIXTURE:-}"
 
 say() { echo "[$(date -Is)] $*" >&2; }
+
+# Writes $HEARTBEAT_FILE unconditionally — called from every exit path below,
+# success or failure alike, and NEVER itself logged (that would defeat the
+# point: the up-to-date case must produce zero journal lines while still
+# leaving a durable, queryable "I was here" record). $1 is a short status
+# token (up-to-date / blocked / error / published); $2, if given, is the SHA
+# under consideration. Best-effort: a failure to write it (read-only $HOME,
+# races) must never be why this script exits non-zero.
+heartbeat() {
+  mkdir -p "$RELEASES_DIR" 2>/dev/null || true
+  printf '%s %s %s\n' "$(date +%s)" "$1" "${2:-}" > "$HEARTBEAT_FILE" 2>/dev/null || true
+}
 
 # Resolves the installed `coord` binary for a READ-ONLY health-check probe —
 # never installs, upgrades, or otherwise mutates ~/.coord-venv (see
@@ -236,28 +260,36 @@ fi
 
 if [[ ! -d "$BASE_CHECKOUT/.git" ]]; then
   say "ERROR: $BASE_CHECKOUT is not a git checkout (SRC_ROOT=$SRC_ROOT, REPO_NAME=$REPO_NAME)"
+  heartbeat error
   exit 1
 fi
 
 if ! git -C "$BASE_CHECKOUT" fetch origin "$BRANCH" --quiet; then
   say "ERROR: git fetch origin $BRANCH failed in $BASE_CHECKOUT"
+  heartbeat error
   exit 1
 fi
 NEW_SHA="$(git -C "$BASE_CHECKOUT" rev-parse "origin/$BRANCH")" || {
   say "ERROR: git rev-parse origin/$BRANCH failed in $BASE_CHECKOUT"
+  heartbeat error
   exit 1
 }
 if [[ -z "$NEW_SHA" ]]; then
   say "ERROR: resolved an empty SHA for origin/$BRANCH — refusing to proceed"
+  heartbeat error
   exit 1
 fi
 
-# ── Up-to-date check — cheap no-op when nothing merged since last run ──────
+# ── Up-to-date check — cheap, SILENT no-op when nothing merged since last
+# run (#2122): this is by far the common case at this timer's cadence, and a
+# journal line here is exactly what buried the host's log — see this
+# script's header. The heartbeat write below is the ONLY record of this
+# tick; it deliberately does not go through `say`/stderr/the journal.
 CURRENT_RELEASE="none"
 if [[ -L "$LIVE_LINK" ]]; then
   CURRENT_RELEASE="$(basename "$(readlink -f "$LIVE_LINK")")"
   if [[ "$CURRENT_RELEASE" == "$NEW_SHA" ]]; then
-    say "up to date at $NEW_SHA — nothing to build"
+    heartbeat up-to-date "$NEW_SHA"
     exit 0
   fi
 fi
@@ -267,24 +299,25 @@ fi
 # live. It does NOT protect an operator who just ran coord-web-rollback.sh:
 # after a rollback, $CURRENT_RELEASE is the GOOD sha they rolled back TO, so
 # $NEW_SHA (still the bad commit, since fixing/reverting main realistically
-# takes longer than this timer's 1min cadence) no longer matches it, and
-# this script would otherwise rebuild and republish the exact bad commit the
-# operator just rolled back away from — silently, within about a minute,
-# undoing their recovery. Refuse instead, until either main moves past that
-# SHA or the operator explicitly clears the sentinel.
+# takes longer than this timer's 10min cadence, #2122) no longer matches it,
+# and this script would otherwise rebuild and republish the exact bad commit
+# the operator just rolled back away from — silently, within about 10
+# minutes, undoing their recovery. Refuse instead, until either main moves
+# past that SHA or the operator explicitly clears the sentinel.
 if [[ -f "$BLOCKED_SHA_FILE" ]]; then
   BLOCKED_SHA="$(<"$BLOCKED_SHA_FILE")"
   BLOCKED_SHA="${BLOCKED_SHA//[$'\t\r\n ']/}"
   if [[ -n "$BLOCKED_SHA" && "$NEW_SHA" == "$BLOCKED_SHA" ]]; then
     say "REFUSING to build/publish $NEW_SHA: this is the exact SHA an operator rolled back FROM"
     say "(sentinel: $BLOCKED_SHA_FILE, written by coord-web-rollback.sh). Publishing it now would"
-    say "silently undo that rollback about a minute after they performed it, with no other warning."
+    say "silently undo that rollback within about 10 minutes of them performing it, with no other warning."
     say "Fix or revert the bad commit on origin/$BRANCH, or pause this timer entirely while you work on it:"
     say "  systemctl --user stop coord-web-dist-build.timer"
     say "  systemctl --user start coord-web-dist-build.timer   # resume once main is fixed"
     say "If you are certain $NEW_SHA is actually fine and the rollback was a false alarm, clear the"
     say "sentinel to allow it again:"
     say "  rm $BLOCKED_SHA_FILE"
+    heartbeat blocked "$NEW_SHA"
     exit 1
   fi
   if [[ -n "$BLOCKED_SHA" ]]; then
@@ -298,11 +331,13 @@ if [[ ! -d "$WEBAPP_CHECKOUT" ]]; then
   say "creating dedicated worktree at $WEBAPP_CHECKOUT"
   if ! git -C "$BASE_CHECKOUT" worktree add --detach "$WEBAPP_CHECKOUT" "origin/$BRANCH" --quiet; then
     say "ERROR: git worktree add failed"
+    heartbeat error "$NEW_SHA"
     exit 1
   fi
 else
   if ! git -C "$WEBAPP_CHECKOUT" checkout --detach "$NEW_SHA" --quiet; then
     say "ERROR: git checkout --detach $NEW_SHA failed in $WEBAPP_CHECKOUT"
+    heartbeat error "$NEW_SHA"
     exit 1
   fi
 fi
@@ -315,16 +350,19 @@ mkdir -p "$RELEASES_DIR"
 WEBAPP_DIR="$WEBAPP_CHECKOUT/coord/dashboard/webapp"
 if ! ( cd "$WEBAPP_DIR" && npm ci --no-audit --no-fund && npm run build ); then
   say "ERROR: npm build failed for $NEW_SHA — live dashboard unchanged (still $CURRENT_RELEASE)"
+  heartbeat error "$NEW_SHA"
   exit 1
 fi
 
 if [[ ! -f "$WEBAPP_DIR/dist/index.html" ]]; then
   say "ERROR: build produced no dist/index.html — refusing to publish $NEW_SHA"
+  heartbeat error "$NEW_SHA"
   exit 1
 fi
 
 if ! mv "$WEBAPP_DIR/dist" "$RELEASE_DIR"; then
   say "ERROR: could not move built dist/ into $RELEASE_DIR — live dashboard unchanged (still $CURRENT_RELEASE)"
+  heartbeat error "$NEW_SHA"
   exit 1
 fi
 
@@ -337,6 +375,7 @@ say "health-checking $NEW_SHA on $HEALTH_CHECK_HOST:$HEALTH_CHECK_PORT before cu
 if ! health_check_release "$RELEASE_DIR"; then
   say "ERROR: health check failed for $NEW_SHA — refusing to publish, live dashboard unchanged (still $CURRENT_RELEASE)"
   rm -rf "$RELEASE_DIR"
+  heartbeat error "$NEW_SHA"
   exit 1
 fi
 
@@ -346,6 +385,7 @@ fi
 ln -sfn "$RELEASE_DIR" "$LIVE_LINK.new"
 mv -Tf "$LIVE_LINK.new" "$LIVE_LINK"
 say "published $NEW_SHA -> $LIVE_LINK (no coord-web restart needed)"
+heartbeat published "$NEW_SHA"
 
 # ── Prune old releases, keep the newest $KEEP_RELEASES ─────────────────────
 # shellcheck disable=SC2012

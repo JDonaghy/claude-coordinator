@@ -25,15 +25,15 @@
 # full runbook and a timed drill transcript.
 #
 # NOT durable against coord-web-dist-build.timer on its own: that timer
-# re-fires every ~1min (deploy/coord-web-dist-build.timer) and re-resolves
-# origin/main, which — because fixing/reverting a bad commit on main
-# realistically takes longer than a minute — will still be the exact SHA
+# re-fires every ~10min (deploy/coord-web-dist-build.timer, #2122) and
+# re-resolves origin/main, which — because fixing/reverting a bad commit on
+# main realistically takes longer than that — will still be the exact SHA
 # just rolled back FROM. Without a guard, the timer would rebuild that same
 # bad commit, pass it through the identical health check it passed the
 # first time (a client-side-only JS runtime error is exactly the class of
 # bug that check cannot catch — see coord-web-dist-build.sh's "Why
 # fail-closed" note), and republish it live, silently undoing this rollback
-# about a minute after it ran. To close that gap, this script writes a
+# within about 10 minutes of when it ran. To close that gap, this script writes a
 # sentinel ($RELEASES_DIR/.rollback-blocked-sha) naming the bad SHA, and
 # coord-web-dist-build.sh refuses to build/publish that exact SHA again
 # until main moves past it or the sentinel is cleared by hand — see its
@@ -112,7 +112,7 @@ say "coord-serve (7435) and coord-agent (7433) were not touched by this script."
 if [[ "$CURRENT" != "none" ]]; then
   BLOCKED_SHA="$(basename "$CURRENT")"
   printf '%s\n' "$BLOCKED_SHA" > "$BLOCKED_SHA_FILE"
-  say "WARNING: coord-web-dist-build.timer fires again within about a minute. It will refuse to"
+  say "WARNING: coord-web-dist-build.timer fires again within about 10 minutes. It will refuse to"
   say "auto-republish $BLOCKED_SHA (the SHA you just rolled back FROM) thanks to the sentinel"
   say "just written to $BLOCKED_SHA_FILE — but that protection is scoped to that exact SHA: if"
   say "origin/main has ALREADY moved past it with more bad commits behind it, the timer will"

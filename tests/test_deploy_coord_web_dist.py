@@ -95,11 +95,28 @@ def test_dist_build_service_is_a_locked_oneshot() -> None:
     assert not unit.has_section("Install")
 
 
-def test_dist_build_timer_cadence_is_one_minute() -> None:
-    """#1543 acceptance target: a merged webapp change is live within about
-    a minute."""
+def test_dist_build_timer_cadence_is_ten_minutes() -> None:
+    """#2122: the original 1-minute cadence fired 53 times/hour and logged
+    an identical "nothing to build" line on every one of them, burying the
+    host journal. Retuned to 10 minutes -- see the timer's own header for
+    the measured merge-frequency evidence (webapp/-touching merges land at
+    most every ~39min in this repo's last 30 days) that justifies staying
+    well clear of that floor while cutting run volume ~9x."""
     unit = _parse_unit(BUILD_TIMER)
-    assert unit.get("Timer", "OnUnitActiveSec") == "1min"
+    assert unit.get("Timer", "OnUnitActiveSec") == "10min"
+
+
+def test_dist_build_timer_timeout_stays_below_its_own_cadence() -> None:
+    """TimeoutStartSec in the paired .service must stay a genuine ceiling
+    BELOW the timer's own cadence -- a wedged build that runs into the next
+    tick would defeat the flock's single-instance guard's whole purpose."""
+    service_unit = _parse_unit(BUILD_SERVICE)
+    timer_unit = _parse_unit(BUILD_TIMER)
+    timeout_secs = int(service_unit.get("Service", "TimeoutStartSec"))
+    cadence = timer_unit.get("Timer", "OnUnitActiveSec")
+    assert cadence.endswith("min")
+    cadence_secs = int(cadence[: -len("min")]) * 60
+    assert timeout_secs < cadence_secs
 
 
 def test_dist_build_script_is_executable_and_locked() -> None:
@@ -393,6 +410,88 @@ def test_build_script_clears_sentinel_once_main_moves_past_the_blocked_sha(
 
     assert "clearing sentinel" in result.stderr, result.stderr
     assert not blocked_sha_file.exists()
+
+
+def test_up_to_date_run_is_silent_and_writes_a_heartbeat(tmp_path: Path) -> None:
+    """#2122 acceptance #1: with main unchanged, the script must not emit a
+    log line -- assert on the actual journal-equivalent (subprocess stderr,
+    what systemd would forward to the journal), not on some internal flag.
+    This is the exact fix for the noise the issue is about: at the old
+    1-minute cadence this path fired 53 times/hour, each one logging an
+    identical "nothing to build" line. Acceptance #4 requires a surface
+    that still distinguishes "up to date" from "has not run since <time>"
+    once that logging is gone -- the heartbeat file is that surface, and
+    this pins that it is written on exactly this path."""
+    origin_repo = tmp_path / "origin-repo"
+    sha = _init_git_repo_with_commit(origin_repo, message="only commit")
+
+    base_checkout = tmp_path / "base-checkout"
+    _clone_as_base_checkout(origin_repo, base_checkout)
+
+    releases_dir = tmp_path / "releases"
+    releases_dir.mkdir()
+    live_release = releases_dir / sha
+    live_release.mkdir()
+    (live_release / "index.html").write_text('<div id="root">x</div>')
+    live_link = tmp_path / "live"
+    live_link.symlink_to(live_release)
+
+    webapp_checkout = tmp_path / "webapp-checkout"  # must never get created
+    heartbeat_file = releases_dir / ".last-run-at"
+
+    env = dict(os.environ)
+    env.update(
+        {
+            "BASE_CHECKOUT": str(base_checkout),
+            "BRANCH": "main",
+            "WEBAPP_CHECKOUT": str(webapp_checkout),
+            "RELEASES_DIR": str(releases_dir),
+            "LIVE_LINK": str(live_link),
+            "LOCK_FILE": str(tmp_path / "build.lock"),
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", str(BUILD_SCRIPT)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == "", (
+        "up-to-date tick must not log anything -- got: " + result.stderr
+    )
+    assert not webapp_checkout.exists()
+
+    assert heartbeat_file.exists(), "heartbeat must be written even on a no-op tick"
+    fields = heartbeat_file.read_text().split()
+    assert len(fields) == 3, heartbeat_file.read_text()
+    epoch_str, status, heartbeat_sha = fields
+    assert float(epoch_str) > 0
+    assert status == "up-to-date"
+    assert heartbeat_sha == sha
+
+
+def test_heartbeat_default_path_matches_the_health_check_default() -> None:
+    """The build script's $HEARTBEAT_FILE default and
+    coord.health.checks.deploy_lane_facts's default must resolve to the
+    identical path without either side needing an explicit env var / config
+    override -- same "share the default, don't just share the docs"
+    convention as test_rollback_and_build_scripts_share_the_same_sentinel_default
+    above."""
+    from coord.health.checks.deploy_lane_facts import _DEFAULT_WEBAPP_BUILD_HEARTBEAT
+
+    heartbeat_default = (
+        'HEARTBEAT_FILE="${HEARTBEAT_FILE:-$RELEASES_DIR/.last-run-at}"'
+    )
+    assert heartbeat_default in BUILD_SCRIPT.read_text()
+    # $RELEASES_DIR itself defaults to ~/.coord-web-releases (see
+    # RELEASES_DIR="${RELEASES_DIR:-$HOME/.coord-web-releases}" above) --
+    # the health-check default must expand to that same joined path.
+    assert _DEFAULT_WEBAPP_BUILD_HEARTBEAT == "~/.coord-web-releases/.last-run-at"
 
 
 def test_rollback_script_publishes_atomically() -> None:
