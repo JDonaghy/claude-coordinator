@@ -23,6 +23,7 @@ from coord.drive_queue import (
     HOLD_ARMED,
     HOLD_FIRED,
     HOLD_RELEASED,
+    PARK_STALE_SECONDS,
     ProbeResult,
     STATE_BLOCKED,
     STATE_DONE,
@@ -66,9 +67,10 @@ def board(
     active: tuple[int, ...] = (),
     sessions: tuple[int, ...] = (),
     ci_pending: tuple[int, ...] = (),
+    ci_pending_live: tuple[int, ...] = (),
 ) -> BoardView:
     facts: dict[str, IssueFacts] = {}
-    for issue in {*merged, *closed, *open_, *active, *ci_pending}:
+    for issue in {*merged, *closed, *open_, *active, *ci_pending, *ci_pending_live}:
         facts[entry_key(REPO, issue)] = IssueFacts(
             known=True,
             issue_state=(
@@ -78,7 +80,18 @@ def board(
             active_work=issue in active,
             # #1891: the board's current read of this issue's merge gate —
             # nothing stronger than "CI checks have not reported yet".
-            merge_ci_pending=issue in ci_pending,
+            merge_ci_pending=issue in ci_pending or issue in ci_pending_live,
+            # #2158: *ci_pending* is the un-refreshable reading (the raw
+            # `merge_queue` row's frozen `error`, which only a live `coord
+            # merge` rewrites); *ci_pending_live* is the self-refreshing one
+            # (the `merge_plan` row's own reason, re-derived every board
+            # build). Only the former ages out.
+            merge_ci_pending_live=issue in ci_pending_live,
+            merge_ci_pending_reason=(
+                "CI running: test (3.12)"
+                if issue in ci_pending or issue in ci_pending_live
+                else ""
+            ),
         )
     return BoardView(
         issues=facts,
@@ -333,6 +346,202 @@ def test_build_board_view_live_ci_infra_plan_reason_also_parks():
         [],
     )
     assert view.facts(entry_key(REPO, 1894)).merge_ci_pending
+
+
+# ── #2158: the frozen `error` string vs the live CI rollup ─────────────────
+#
+# The raw `merge_queue` row's `error` is written by a live `coord merge`
+# attempt and by NOTHING else. For a `parked` entry — which by construction
+# runs no merge — it is frozen at the attempt that parked it, so believing it
+# over the board's own fresh reading makes the predicate that RELEASES the
+# park refreshable only by the action the park WITHHOLDS.
+#
+# claude-coordinator#2138 (2026-08-12): CI run 31570947900 completed green at
+# 06:48:51; the park was written at 06:49:32 quoting "CI running: …"; the
+# entry then did not move for 7h25m, over a fully satisfied gate, until an
+# unrelated merge happened to rewrite the board.
+
+
+def _plan_row(issue: int, *, reason=None, ci_summary=None) -> dict:
+    """One `/board` `merge_plan` row, shaped as `serve_app` ships it
+    (`dataclasses.asdict` of a `PlannedMerge`, so `ci_summary` is a nested
+    dict of `coord.ci_store.CiCheckSummary`)."""
+    return {
+        "repo_name": REPO,
+        "issue_number": issue,
+        "reason": reason,
+        "ci_summary": ci_summary,
+    }
+
+
+def _rollup(passed: int = 0, failed: int = 0, running: int = 0) -> dict:
+    return {
+        "passed": passed,
+        "failed": failed,
+        "running": running,
+        "failed_names": [],
+        "first_failed_url": None,
+    }
+
+
+def test_build_board_view_drops_a_stale_ci_error_the_live_rollup_contradicts():
+    """THE #2158 regression, at the fact level.
+
+    The plan re-derived this entry clean (no reason of its own) AND its
+    `ci_summary` — `summarize_counts` over the very checks that re-derivation
+    consulted — says all 8 checks finished green. The raw row's "CI running:"
+    is therefore a frozen write-path string that CI has already outrun, and
+    must not hold the park.
+    """
+    view = build_board_view(
+        {
+            "merge_plan": [_plan_row(2138, reason=None, ci_summary=_rollup(passed=8))],
+            "merge_queue": [
+                {
+                    "repo_name": REPO, "issue_number": 2138,
+                    "error": (
+                        "CI running: no-gh-on-path, test (3.13), test (3.12)"
+                    ),
+                },
+            ],
+        },
+        [],
+    )
+    assert not view.facts(entry_key(REPO, 2138)).merge_ci_pending
+
+
+def test_build_board_view_keeps_the_park_while_the_rollup_shows_checks_in_flight():
+    """The other half: checks genuinely still running is NOT evidence against
+    the persisted reading — it agrees with it. Stays parked, no hot loop."""
+    view = build_board_view(
+        {
+            "merge_plan": [
+                _plan_row(2138, reason=None, ci_summary=_rollup(passed=5, running=3)),
+            ],
+            "merge_queue": [
+                {"repo_name": REPO, "issue_number": 2138, "error": "CI running: test"},
+            ],
+        },
+        [],
+    )
+    assert view.facts(entry_key(REPO, 2138)).merge_ci_pending
+
+
+def test_build_board_view_keeps_the_park_when_the_plan_carries_no_rollup():
+    """Fail closed, and leave #1891 exactly as it was: absence of a rollup
+    (no PR yet, no `ci_store`, a gate snapshot that has not fetched this PR)
+    is not evidence of anything. Only a POSITIVE all-green reading overrides
+    the persisted string."""
+    view = build_board_view(
+        {
+            "merge_plan": [_plan_row(2138, reason=None, ci_summary=None)],
+            "merge_queue": [
+                {"repo_name": REPO, "issue_number": 2138, "error": "CI running: test"},
+            ],
+        },
+        [],
+    )
+    assert view.facts(entry_key(REPO, 2138)).merge_ci_pending
+
+
+def test_build_board_view_keeps_a_ci_infra_park_while_the_rollup_shows_red():
+    """#1892's classification lives ONLY on the raw row — the plan can never
+    re-derive it. So a rollup that still shows a failed check is not evidence
+    the verdictless failure has cleared, and the #2158 override must not fire
+    on it. (An all-green rollup would; see the next test.)"""
+    view = build_board_view(
+        {
+            "merge_plan": [
+                _plan_row(1892, reason=None, ci_summary=_rollup(passed=7, failed=1)),
+            ],
+            "merge_queue": [
+                {
+                    "repo_name": REPO, "issue_number": 1892,
+                    "error": "CI infra: e2e (cancelled) — no verdict about the code",
+                },
+            ],
+        },
+        [],
+    )
+    assert view.facts(entry_key(REPO, 1892)).merge_ci_pending
+
+
+def test_build_board_view_releases_a_ci_infra_park_once_the_rerun_lands_green():
+    """The #1892 auto-rerun landing is exactly what un-parks that entry — and
+    an all-green rollup is how the read path can see it happen, without a
+    live `coord merge` to rewrite the raw row."""
+    view = build_board_view(
+        {
+            "merge_plan": [_plan_row(1892, reason=None, ci_summary=_rollup(passed=8))],
+            "merge_queue": [
+                {
+                    "repo_name": REPO, "issue_number": 1892,
+                    "error": "CI infra: e2e (cancelled) — no verdict about the code",
+                },
+            ],
+        },
+        [],
+    )
+    assert not view.facts(entry_key(REPO, 1892)).merge_ci_pending
+
+
+def test_build_board_view_never_lets_a_rollup_overrule_a_live_plan_objection():
+    """A non-empty plan reason is the live gate still objecting. It wins
+    outright — the override only ever applies where the plan is silent."""
+    view = build_board_view(
+        {
+            "merge_plan": [
+                _plan_row(
+                    2138,
+                    reason="CI running: test (3.12)",
+                    # Contradictory on purpose: a rollup that lagged the gate.
+                    ci_summary=_rollup(passed=8),
+                ),
+            ],
+            "merge_queue": [{"repo_name": REPO, "issue_number": 2138, "error": None}],
+        },
+        [],
+    )
+    facts = view.facts(entry_key(REPO, 2138))
+    assert facts.merge_ci_pending
+    assert facts.merge_ci_pending_live
+
+
+def test_build_board_view_marks_a_raw_only_ci_reading_as_unrefreshable():
+    """Provenance (#2158): a reading with no live plan reason behind it is
+    flagged `merge_ci_pending_live=False`, which is what lets `plan_tick` age
+    it out instead of trusting it forever."""
+    view = build_board_view(
+        {
+            "merge_plan": [],
+            "merge_queue": [
+                {"repo_name": REPO, "issue_number": 2138, "error": "CI running: test"},
+            ],
+        },
+        [],
+    )
+    facts = view.facts(entry_key(REPO, 2138))
+    assert facts.merge_ci_pending
+    assert not facts.merge_ci_pending_live
+
+
+def test_build_board_view_survives_a_malformed_ci_rollup():
+    """A rollup that is not a readable mapping of ints is not evidence — the
+    park stands, and nothing raises."""
+    for summary in ("green", 3, {"passed": "eight", "failed": 0, "running": 0}, []):
+        view = build_board_view(
+            {
+                "merge_plan": [_plan_row(2138, reason=None, ci_summary=summary)],
+                "merge_queue": [
+                    {
+                        "repo_name": REPO, "issue_number": 2138,
+                        "error": "CI running: test",
+                    },
+                ],
+            },
+            [],
+        )
+        assert view.facts(entry_key(REPO, 2138)).merge_ci_pending, summary
 
 
 def test_unknown_issues_report_nothing_rather_than_raising():
@@ -1065,6 +1274,121 @@ def test_a_still_parked_entry_is_not_relaunched_while_ci_is_still_pending():
     entries = [entry(1650, position=3, state="parked", attempts=0)]
     plan = plan_tick(entries, board(ci_pending=(1650,)), capacity=1)
     assert plan.reconciles == ()  # still gated — nothing to report or write
+    assert plan.launch is None
+
+
+# ── #2158: a park that cannot refresh itself must age out ──────────────────
+
+
+def test_a_park_on_an_unrefreshable_reading_ages_out_to_waiting():
+    """THE #2158 regression, at the decision level.
+
+    `merge_ci_pending` here is `merge_ci_pending_live=False` — it came only
+    from the raw `merge_queue` row's persisted `error`, which no read path
+    rewrites. Nothing on this tick's lane can ever refresh it (the board has
+    no `merge_plan` section — the daemon-host tick — or the plan carried no
+    rollup), so past `PARK_STALE_SECONDS` the tick stops believing it rather
+    than holding the entry forever.
+    """
+    entries = [
+        entry(
+            2138, position=3, state="parked", attempts=0,
+            last_reason="CI running: test (3.12) — parking without spending an attempt",
+            reason_at=NOW - PARK_STALE_SECONDS - 60,
+        )
+    ]
+    plan = plan_tick(entries, board(ci_pending=(2138,)), capacity=1, now=NOW)
+    resumed = [r for r in plan.reconciles if r.key == entry_key(REPO, 2138)]
+    assert [r.outcome for r in resumed] == ["resumed"]
+    assert resumed[0].updates["state"] == STATE_WAITING
+    assert "attempts" not in resumed[0].updates  # still free, per #1891
+    assert "#2158" in resumed[0].reason
+    # It does NOT claim CI reported — nothing here knows that.
+    assert "have reported" not in resumed[0].reason
+    # …and falls into this same tick's launch selection.
+    assert plan.launch is not None and plan.launch.issue == 2138
+
+
+def test_a_park_on_an_unrefreshable_reading_is_held_until_the_ceiling():
+    """No hot loop: the ceiling is a backstop, not a second CI timeout. A
+    park younger than it stays exactly where it is."""
+    entries = [
+        entry(
+            2138, position=3, state="parked", attempts=0,
+            reason_at=NOW - PARK_STALE_SECONDS + 60,
+        )
+    ]
+    plan = plan_tick(entries, board(ci_pending=(2138,)), capacity=1, now=NOW)
+    assert plan.reconciles == ()
+    assert plan.launch is None
+
+
+def test_a_park_on_a_live_plan_reason_never_ages_out():
+    """A reading the board re-derives on every build is not stale, however
+    old the park is — it will go false by itself the moment CI reports, and
+    resuming over a live objection is the hot loop #1891 exists to avoid."""
+    entries = [
+        entry(
+            2138, position=3, state="parked", attempts=0,
+            reason_at=NOW - 30 * 3600,  # 30 hours, far past the ceiling
+        )
+    ]
+    plan = plan_tick(entries, board(ci_pending_live=(2138,)), capacity=1, now=NOW)
+    assert plan.reconciles == ()
+    assert plan.launch is None
+
+
+def test_a_park_with_no_capture_time_stays_parked():
+    """Fail closed on an unmeasurable age: a row predating #2133's `reason_at`
+    (or one whose `last_reason` is still '') must degrade to today's
+    behaviour, not to a park that expires by accident."""
+    entries = [entry(2138, position=3, state="parked", attempts=0, reason_at=None)]
+    plan = plan_tick(entries, board(ci_pending=(2138,)), capacity=1, now=NOW)
+    assert plan.reconciles == ()
+    assert plan.launch is None
+
+
+def test_a_park_stamped_in_the_future_stays_parked():
+    """A clock that jumped backwards must not expire a park it cannot age."""
+    entries = [
+        entry(2138, position=3, state="parked", attempts=0, reason_at=NOW + 10_000)
+    ]
+    plan = plan_tick(entries, board(ci_pending=(2138,)), capacity=1, now=NOW)
+    assert plan.reconciles == ()
+    assert plan.launch is None
+
+
+def test_a_pure_logic_tick_with_no_clock_never_expires_a_park():
+    """`plan_tick` still reads no clock of its own — a caller that passes none
+    gets the pre-#2158 behaviour, not an entry aged against `None`."""
+    entries = [entry(2138, position=3, state="parked", attempts=0, reason_at=1.0)]
+    plan = plan_tick(entries, board(ci_pending=(2138,)), capacity=1)
+    assert plan.reconciles == ()
+    assert plan.launch is None
+
+
+def test_an_aged_gate_a_park_is_still_gated_on_the_human():
+    """#2063 stays fail-closed THROUGH the #2158 expiry: a Gate-A park waits
+    on a human, not on CI, so ageing the CI reading out must not release it.
+    """
+    from coord import gate_a
+
+    marker = f"parked ... {gate_a.park_marker('api', 37)}"
+    entries = [
+        entry(
+            2138, position=3, state="parked", attempts=0,
+            last_reason=marker,
+            reason_at=NOW - PARK_STALE_SECONDS - 60,
+        )
+    ]
+    plan = plan_tick(
+        entries,
+        board(ci_pending=(2138,)),
+        capacity=1,
+        now=NOW,
+        gate_a_pending={entry_key(REPO, 2138): True},
+    )
+    assert plan.reconciles == ()
     assert plan.launch is None
 
 
