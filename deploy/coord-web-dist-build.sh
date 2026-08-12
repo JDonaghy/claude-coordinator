@@ -382,8 +382,35 @@ fi
 # ── Atomic publish: create the new symlink under a temp name, then rename(2)
 # it over the live name. rename() on a symlink is a single syscall — there is
 # no window where $LIVE_LINK is missing or half-updated.
-ln -sfn "$RELEASE_DIR" "$LIVE_LINK.new"
-mv -Tf "$LIVE_LINK.new" "$LIVE_LINK"
+#
+# Every step here is checked, same as every other step above: a heartbeat of
+# "published" is a claim that $LIVE_LINK now actually points at $RELEASE_DIR,
+# not just that the commands to make it so were issued. `set -uo pipefail`
+# alone would NOT catch a failing `ln`/`mv` here (no `-e`), and a silent
+# failure would leave the live symlink on the OLD release while the
+# heartbeat — the one surface built to catch a dead/failed publish — reports
+# a fresh success. See the #2122 review that flagged this.
+if ! ln -sfn "$RELEASE_DIR" "$LIVE_LINK.new"; then
+  say "ERROR: ln -sfn $RELEASE_DIR $LIVE_LINK.new failed — refusing to publish, live dashboard unchanged (still $CURRENT_RELEASE)"
+  rm -f "$LIVE_LINK.new"
+  heartbeat error "$NEW_SHA"
+  exit 1
+fi
+if ! mv -Tf "$LIVE_LINK.new" "$LIVE_LINK"; then
+  say "ERROR: mv -Tf $LIVE_LINK.new $LIVE_LINK failed — live dashboard unchanged (still $CURRENT_RELEASE)"
+  rm -f "$LIVE_LINK.new"
+  heartbeat error "$NEW_SHA"
+  exit 1
+fi
+# Verify post-hoc, not just that the commands exited 0: confirm the live
+# symlink actually resolves to the release we just built before claiming
+# success (belt-and-braces against any exit-code/effect mismatch, e.g. an
+# `mv` that races an external actor touching $LIVE_LINK).
+if [[ "$(readlink -f "$LIVE_LINK")" != "$RELEASE_DIR" ]]; then
+  say "ERROR: $LIVE_LINK does not resolve to $RELEASE_DIR after publish — live dashboard state uncertain (was $CURRENT_RELEASE)"
+  heartbeat error "$NEW_SHA"
+  exit 1
+fi
 say "published $NEW_SHA -> $LIVE_LINK (no coord-web restart needed)"
 heartbeat published "$NEW_SHA"
 
