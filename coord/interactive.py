@@ -2247,6 +2247,41 @@ def _output_tokens_physically_plausible(output_tokens: int, duration_secs: float
     return output_tokens <= duration_secs * MAX_PLAUSIBLE_OUTPUT_TOKENS_PER_SECOND
 
 
+# #2129 review (non-blocking finding): the root-cause fix (per-line time
+# bounding + message-id dedup in _tokens_from_transcript) sums input/
+# cache_creation/cache_read the same way it sums output_tokens, so it fixes
+# all four fields together — the 1.24B cache-read figure from the bug report
+# shrinks along with the 5.0M output-token figure. But only output_tokens had
+# an independent physical-plausibility backstop; a *future* regression that
+# only affected the cache/input fields (e.g. a dedup key change that missed
+# one of them) would have no defense-in-depth check to catch it. This is a
+# generous ceiling on combined input+cache-creation+cache-read throughput: a
+# single turn can legitimately read/write on the order of a full context
+# window's worth of cache tokens, but each turn still takes multiple seconds
+# of real wall-clock time (network + generation), so even back-to-back
+# maximal-context turns can't sustain this rate. 1.24B tokens over 1365s
+# (the bug report's figures) is ~908k tok/s — this ceiling is ~18x more
+# generous than that and still catches it.
+MAX_PLAUSIBLE_CONTEXT_TOKENS_PER_SECOND = 50_000
+
+
+def _context_tokens_physically_plausible(
+    input_tokens: int, cache_creation_tokens: int, cache_read_tokens: int, duration_secs: float
+) -> bool:
+    """Whether the combined input/cache-creation/cache-read token count
+    could plausibly have been read/written in *duration_secs* wall-clock
+    seconds — the cache-side counterpart to
+    :func:`_output_tokens_physically_plausible`.
+
+    ``duration_secs <= 0`` is only plausible for zero tokens, same rule as
+    the output-token check.
+    """
+    total = input_tokens + cache_creation_tokens + cache_read_tokens
+    if duration_secs <= 0:
+        return total <= 0
+    return total <= duration_secs * MAX_PLAUSIBLE_CONTEXT_TOKENS_PER_SECOND
+
+
 def _review_findings_from_transcript(
     issue_number: int,
     started_at: float | None,
@@ -2630,6 +2665,15 @@ def _persist_interactive_tokens(
                     "interactive: dropping physically-implausible token count for "
                     "assignment %s: %d output tokens over %.0fs (> %d tok/s ceiling)",
                     assignment_id, out, duration, MAX_PLAUSIBLE_OUTPUT_TOKENS_PER_SECOND,
+                )
+                return
+            if not _context_tokens_physically_plausible(inp, cc, cr, duration):
+                logging.warning(
+                    "interactive: dropping physically-implausible token count for "
+                    "assignment %s: %d input + %d cache-creation + %d cache-read "
+                    "tokens over %.0fs (> %d tok/s ceiling)",
+                    assignment_id, inp, cc, cr, duration,
+                    MAX_PLAUSIBLE_CONTEXT_TOKENS_PER_SECOND,
                 )
                 return
             update_assignment_tokens(
