@@ -260,6 +260,41 @@ permanently-refused → `blocked`, CI-pending → `parked`) and then stops: no
 capacity walk, no queue-level alert, no launch. Safe with the timer stopped or
 running.
 
+### `parked` — and the two ways out of it (#1891 / #2158)
+
+`parked` is the queue's "not your problem" state: the drive died, but the only
+thing the board holds against the entry's merge is that CI has not reported
+(`CI running: …`) or reported without a verdict (`CI infra: …`, #1892).
+Relaunching would just observe the same silence, so the tick parks instead —
+**no attempt spent**, no escalation, no operator command needed. Unlike
+`blocked`, you are not expected to do anything about it.
+
+That promise needs the release predicate to be refreshable *without* the merge
+the park is withholding, which until #2158 it was not: the reading came from
+the raw `merge_queue` row's `error` column, which only a live `coord merge`
+attempt ever writes — and a parked entry runs none. claude-coordinator#2138
+(2026-08-12) sat parked **7h25m** over CI that had gone green 41 seconds
+*before* the park was written, and moved only when an unrelated merge happened
+to rewrite the board. There are now two exits, and a park always has at least
+one of them:
+
+1. **The board's own CI rollup.** When `/board`'s `merge_plan` row for the
+   entry re-derives clean and its `ci_summary` shows every check finished with
+   none failed, that outranks the persisted string and the entry resumes on
+   the next tick. Requires a daemon lane (`board_service` set) — the plan is
+   computed, not stored, so a tick reading the local DB directly has no
+   `merge_plan` section at all.
+2. **A ceiling on any reading that cannot refresh itself**
+   (`PARK_STALE_SECONDS`, 45 min). That covers the daemon-host lane above.
+   The entry returns to `waiting` and re-enters the normal walk; the resume
+   reason says only that the reading went unrefreshable, not that CI passed,
+   because nothing on that lane knows whether it did. A park founded on the
+   live plan's own objection is exempt — it re-derives every board build and
+   goes false by itself, so it is held with no ceiling however long CI takes.
+
+A Gate-A park (#2063) is gated on a human, not on CI, and neither exit
+releases it.
+
 ## 4. Read the alert — `QUEUE: STALLED` vs `QUEUE: BLOCKED`
 
 The TUI status bar always shows a `QUEUE: …` segment (never blank — silence
