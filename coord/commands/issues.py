@@ -213,7 +213,15 @@ def issue_reopen_cmd(
         "number on success.\n\n"
         "Use --body-file for long markdown bodies (avoids shell-quoting "
         "issues). '-' reads from stdin. Routes through the daemon seam so "
-        "agents never need to call `gh issue create` directly."
+        "agents never need to call `gh issue create` directly.\n\n"
+        "For a bug entering the test-first bug lane "
+        "(docs/TEST_FIRST_BUG_LANE.md, #1964), pass --expected/--actual/"
+        "--repro/--evidence instead of --body/--body-file — the four fields "
+        "land in the issue as addressable sections (coord.bug_intake) "
+        "instead of a single freeform paragraph, so a later contract.md "
+        "author (hand or agent) doesn't have to re-derive them from prose. "
+        "All four are required together, and mutually exclusive with "
+        "--body/--body-file."
     ),
 )
 @click.argument("repo")
@@ -231,6 +239,25 @@ def issue_reopen_cmd(
     multiple=True,
     help="Label to add (repeatable). The label must already exist in the repo.",
 )
+@click.option(
+    "--expected", default=None,
+    help="Bug-lane intake field: what should happen, in observable terms.",
+)
+@click.option(
+    "--actual", default=None,
+    help="Bug-lane intake field: what happens instead.",
+)
+@click.option(
+    "--repro", default=None,
+    help="Bug-lane intake field: the shortest path to see it.",
+)
+@click.option(
+    "--evidence", default=None,
+    help=(
+        "Bug-lane intake field: screenshot, wireframe, or a reference "
+        "implementation that behaves correctly."
+    ),
+)
 @_CONFIG_OPTION
 def issue_create_cmd(
     repo: str,
@@ -238,8 +265,36 @@ def issue_create_cmd(
     body: str | None,
     body_file: Path | None,
     labels: tuple[str, ...],
+    expected: str | None,
+    actual: str | None,
+    repro: str | None,
+    evidence: str | None,
     config_path: Path,
 ) -> None:
+    bug_fields = {"expected": expected, "actual": actual, "repro": repro, "evidence": evidence}
+    given_bug_fields = {k: v for k, v in bug_fields.items() if v is not None}
+    if given_bug_fields:
+        if body is not None or body_file is not None:
+            click.echo(
+                "error: --expected/--actual/--repro/--evidence are mutually "
+                "exclusive with --body/--body-file",
+                err=True,
+            )
+            sys.exit(2)
+        missing = [k for k, v in bug_fields.items() if v is None]
+        if missing:
+            click.echo(
+                "error: --expected/--actual/--repro/--evidence must all be "
+                f"given together (missing: {', '.join(f'--{m}' for m in missing)})",
+                err=True,
+            )
+            sys.exit(2)
+        from coord.bug_intake import format_bug_report  # noqa: PLC0415
+
+        body = format_bug_report(
+            expected=expected, actual=actual, repro=repro, evidence=evidence,
+        )
+
     cfg = _load_config(config_path)
     repo_entry = cfg.repo(repo)
     slug = repo_entry.github if repo_entry else repo

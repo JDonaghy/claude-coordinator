@@ -14,8 +14,10 @@ from coord.acceptance import (
     ManifestError,
     acceptance_capability_gap,
     build_verdict,
+    bug_contract_path,
     dump_manifest_error_hint,
     failure_summary,
+    issue_dirname,
     load_manifest,
     ms_dir_for_issue,
     oracle_loop_contract_block,
@@ -245,6 +247,45 @@ class TestOracleLoopContractBlock:
         assert "tests/acceptance/ms25/mocks/" in block
         assert "must satisfy" in block
         assert "not the other way around" in block
+
+
+class TestIssueDirnameAndBugContractPath:
+    """#1964 (docs/TEST_FIRST_BUG_LANE.md): the bug lane's single-issue
+    counterpart to ms_dirname/gate_a_contract_path — no milestone number
+    anywhere in the name."""
+
+    def test_issue_dirname(self) -> None:
+        assert issue_dirname(1234) == "issue-1234"
+
+    def test_bug_contract_path(self) -> None:
+        assert bug_contract_path(1234) == "tests/acceptance/issue-1234/contract.md"
+
+
+class TestBugLaneNeedsNoMilestone:
+    """#1964: end-to-end proof that a hand-authored `issue-NN/` slice —
+    with no `ms-NN/` directory anywhere in the tree, and no milestone
+    involved at any step — is discovered, scoped, and injected into the
+    worker briefing by the exact same machinery an `ms-NN/` slice uses.
+    This is the acceptance bar for "no milestone ceremony required"."""
+
+    def test_manifest_and_contract_block_work_with_only_an_issue_dir(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "tests" / "acceptance"
+        bug_dir = root / issue_dirname(1234)
+        bug_dir.mkdir(parents=True)
+        (bug_dir / "manifest.yml").write_text("tests:\n  issue_1234::popup_border: 1234\n")
+
+        assert ms_dir_for_issue(root, 1234) == "issue-1234"
+        manifest = load_manifest(root)
+        assert manifest == {"issue_1234::popup_border": 1234}
+
+        block = oracle_loop_contract_block(root, "vimcode", 1234)
+        assert bug_contract_path(1234) in block
+        assert "coord acceptance run --repo vimcode --issue 1234" in block
+        # No ms-* dir exists anywhere — confirm the fixture itself proves the
+        # negative, not just that the assertions above happened to pass.
+        assert not list(root.glob("ms-*"))
 
 
 class TestAcceptanceCapabilityGap:
