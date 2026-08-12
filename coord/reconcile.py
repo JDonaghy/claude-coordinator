@@ -237,11 +237,22 @@ def reconcile_completed_assignments(
         # `failure_reason` at all — invisible to `coord status`, the TUI,
         # and drive.py, which is the exact visibility gap #1797 exists to
         # close.
+        # #2131: `spend_ceiling_reason` is the SAME column again — stamped by
+        # `AgentServer._reap` when the per-leg spend ceiling killed the leg.
+        # It cannot coexist with the other three: the ceiling kill returns a
+        # non-zero `SPEND_CEILING_EXIT`, which rules out the `exit_code == 0`
+        # push-failure branch, and it fires only while the transcript has NO
+        # terminal `result` event (so no `api_error_reason`) on a leg that
+        # was killed for spending, not for hitting a usage limit. Stamping it
+        # here is what makes the kill distinguishable from a crash for
+        # `coord retry`, the auto-reassign skip below, and the escalation.
         _failure_reason = (
             entry.get("usage_limit_reason")
             or entry.get("api_error_reason")
             or entry.get("push_failure_reason")
+            or entry.get("spend_ceiling_reason")
         )
+        _escalate_spend_ceiling_best_effort(a, entry)
         update_state_fn(
             assignment_id=aid,
             terminal_status=terminal,
@@ -1001,6 +1012,58 @@ def describe_no_candidate_machines(
     return "no available machine to retry on:\n" + "\n".join(lines)
 
 
+def _escalate_spend_ceiling_best_effort(assignment, entry: dict) -> None:
+    """#2131: surface a spend-ceiling kill where a human will actually see it.
+
+    A ceiling kill is the one terminal state that must NOT be quietly retried
+    — the whole point is that the money is gone and somebody should decide
+    whether to spend more. So it goes onto the **drive-escalation** board
+    (``coord escalate list`` / the TUI), the same channel a merge entry's
+    ``HUMAN_REQUIRED`` surfaces through, alongside the GitHub failure comment
+    ``coord notify`` already posts from the stamped ``failure_reason``.
+
+    ``proposed_command`` deliberately names the acknowledged retry rather than
+    a bare ``coord retry``: the operator's next step is a decision ("is this
+    worth another $8?"), and the command should say so.
+
+    Best-effort and silent — an escalation write must never break a real
+    status transition. The record is keyed by (repo, issue) and *replaces*
+    any prior one, so a repeat can't flood the channel.
+    """
+    from coord.spend_ceiling import is_spend_ceiling_reason  # noqa: PLC0415
+
+    reason = entry.get("spend_ceiling_reason")
+    if not is_spend_ceiling_reason(reason):
+        return
+    repo_name = getattr(assignment, "repo_name", None)
+    issue_number = getattr(assignment, "issue_number", None)
+    if not repo_name or not issue_number:
+        return
+    assignment_id = getattr(assignment, "assignment_id", None)
+    try:
+        from coord.state import record_drive_escalation  # noqa: PLC0415
+
+        record_drive_escalation(
+            repo_name,
+            int(issue_number),
+            stage=str(getattr(assignment, "type", "work") or "work"),
+            reason=(
+                f"per-leg spend ceiling breached and the worker was killed: "
+                f"{reason}. Nothing will re-dispatch this automatically — "
+                f"decide whether the work is worth more spend before retrying."
+            ),
+            gate_readings=f"spend_ceiling=breached | exit_code={entry.get('exit_code')}",
+            proposed_command=(
+                f"coord retry {assignment_id} --acknowledge-cost"
+                if assignment_id
+                else "coord retry <assignment-id> --acknowledge-cost"
+            ),
+            assignment_id=assignment_id,
+        )
+    except Exception:  # noqa: BLE001 — never let escalation break a transition
+        pass
+
+
 def _record_usage_limit_reason(assignment_id: str | None, entry: dict) -> None:
     """#1461/#1584/#1797: stamp a usage-limit-kill, terminal-API-error, or
     auth-shaped-push-failure diagnostic (whichever the agent flagged on
@@ -1047,6 +1110,10 @@ def _record_usage_limit_reason(assignment_id: str | None, entry: dict) -> None:
         entry.get("usage_limit_reason")
         or entry.get("api_error_reason")
         or entry.get("push_failure_reason")
+        # #2131: the per-leg spend ceiling killed this leg. Same column, same
+        # mutual exclusivity as the three above (see the identical chain in
+        # `reconcile_completed_assignments`).
+        or entry.get("spend_ceiling_reason")
     )
     if not reason or not assignment_id:
         return
@@ -1255,6 +1322,9 @@ def reconcile(board: Board, config: Config) -> list[str]:
                         if orig is not None:
                             orig.review_state = "done"
                 _record_usage_limit_reason(a.assignment_id, entry)
+                # #2131: same escalation as the daemon's passive tick — this
+                # is `coord resume`'s path into the identical transition.
+                _escalate_spend_ceiling_best_effort(a, entry)
         changed.append(a.assignment_id)
 
     # Dispatch pending reviews for all completed work assignments.
@@ -1334,6 +1404,24 @@ def reconcile(board: Board, config: Config) -> list[str]:
                 failure_reason=getattr(failed_a, "failure_reason", None),
             )
             if classification.is_usage_limit:
+                continue
+            # #2131: a spend-ceiling kill must NEVER auto-reassign. The leg
+            # was killed precisely because it was burning money, and nothing
+            # about moving it to another machine makes it cheaper — an
+            # auto-retry here re-spends the whole ceiling, unattended, which
+            # is the exact failure this issue exists to prevent. It requires
+            # a human decision (`coord retry --acknowledge-cost`), and the
+            # escalation record written above is how they hear about it.
+            # Checked against both the just-seen agent entry (this pass) and
+            # the already-persisted `failure_reason` (a prior pass stamped
+            # it), mirroring the usage-limit skip above.
+            from coord.spend_ceiling import is_spend_ceiling_reason  # noqa: PLC0415
+
+            if is_spend_ceiling_reason(
+                (entry or {}).get("spend_ceiling_reason")
+            ) or is_spend_ceiling_reason(
+                getattr(failed_a, "failure_reason", None)
+            ):
                 continue
             reassigned = _reassign(failed_a, board, config)
             if reassigned is not None and reassigned.assignment_id is not None:

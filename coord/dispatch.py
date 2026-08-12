@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import Iterable
 
@@ -18,6 +19,8 @@ from coord.config import Config
 from coord.models import Proposal, Repo
 
 AGENT_PORT = 7433
+
+_log = logging.getLogger(__name__)
 
 
 class DispatchRefused(ValueError):
@@ -752,6 +755,16 @@ def dispatch(
     # field reject unknown payload keys with a 400.
     if getattr(proposal, "resume_session_id", None):
         payload["resume_session_id"] = proposal.resume_session_id
+    # #2131: per-leg spend ceiling, resolved here (CLI/daemon lane) and
+    # carried on the wire so a config-free agent is covered too. Sent ONLY
+    # when the operator has actually configured one — with no `budget:` block
+    # `ceiling_for` returns None, the key is omitted, and the payload stays
+    # byte-identical to pre-#2131 (so an agent predating the field, which
+    # 400s on any unrecognized kwarg, is unaffected until someone opts in).
+    _budget = getattr(config, "budget", None)
+    _cost_ceiling = _budget.ceiling_for(proposal.type) if _budget is not None else None
+    if _cost_ceiling:
+        payload["cost_ceiling_usd"] = _cost_ceiling
     # #324/#1711: send the resolved provider name unless it's the vanilla
     # (uncustomized) implicit "claude" default — see
     # _wire_payload_needs_provider_field's docstring for why a customized
@@ -817,6 +830,30 @@ def dispatch(
         definition = config.providers.definitions[effective_provider_name]
         retry_payload = dict(payload, provider_def=provider_def_to_wire(definition))
         resp = httpx.post(url, json=retry_payload, timeout=15)
+
+    if resp.status_code == 400 and "cost_ceiling_usd" in payload:
+        # #2131: the agent lane lags the CLI/daemon lane (a `coord/agent.py`
+        # change reaches agents only after a PyPI release plus `coord agent
+        # update` — docs/AGENT_OPERATIONS.md). An agent that predates
+        # `AssignmentSpec.cost_ceiling_usd` 400s on the unrecognized kwarg,
+        # so without this fallback the first operator to enable `budget:`
+        # would take the WHOLE FLEET's dispatch down until every agent was
+        # updated. Retry once without the ceiling: an uncapped leg is exactly
+        # today's behaviour, and is unambiguously better than no leg at all.
+        # Safe to retry unconditionally — `AgentServer.assign` validates
+        # every ValueError case before creating an assignment or touching
+        # git/worktree state, so this can never double-spawn a worker.
+        degraded_payload = {
+            k: v for k, v in payload.items() if k != "cost_ceiling_usd"
+        }
+        retried = httpx.post(url, json=degraded_payload, timeout=15)
+        if retried.status_code != 400:
+            _log.warning(
+                "agent %s rejected cost_ceiling_usd (#2131) — dispatched "
+                "UNCAPPED; run `coord agent update` on that machine",
+                machine.name,
+            )
+            resp = retried
 
     try:
         resp.raise_for_status()

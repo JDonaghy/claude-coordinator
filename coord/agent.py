@@ -235,6 +235,15 @@ _PTY_INJECT_RETRY_BACKOFF_S = 0.4
 _FIRST_OUTPUT_TIMEOUT = 600.0    # seconds of zero output before the watchdog kills
 NO_FIRST_OUTPUT_EXIT = 124       # exit code reported when the TTFT watchdog fires
 
+# #2131: distinct exit code for a leg killed by the per-leg spend ceiling. It
+# must NOT collide with NO_FIRST_OUTPUT_EXIT (or any plausible worker exit
+# code) — `_reap` keys the `spend_ceiling_reason` stamp off it, and that stamp
+# is the ONLY thing that makes a ceiling kill distinguishable from a crash for
+# `coord retry` and the auto-reassign skip. Any non-zero value still lands the
+# assignment on FAILED via the existing reap branch; the value only selects
+# which diagnostic gets attached.
+SPEND_CEILING_EXIT = 125
+
 
 def _append_log_line(log_path: str, line: str) -> None:
     """Best-effort append of a single line to the assignment log. Never raises."""
@@ -344,6 +353,8 @@ def _wait_for_proc_or_result(
     grace_after_result: float = _REAP_GRACE_AFTER_RESULT,
     max_wait: float = _REAP_MAX_WAIT,
     first_output_timeout: float = _FIRST_OUTPUT_TIMEOUT,
+    cost_ceiling_usd: float | None = None,
+    read_cost_usd: "Callable[[], float | None] | None" = None,
     killpg: Callable[[int, int], None] = _killpg_safe,
     log_has_result: Callable[[str], bool] = _log_has_result,
     log_has_output: Callable[[str], bool] = _log_has_output,
@@ -364,12 +375,39 @@ def _wait_for_proc_or_result(
     satisfied permanently — it never re-arms — so a slow-but-emitting (e.g.
     rate-limited) worker is never killed by it. See #299.
 
+    Per-leg spend ceiling (#2131): when ``cost_ceiling_usd`` is a positive
+    number and ``read_cost_usd`` is supplied, the worker's live spend is
+    sampled on every poll.  At :data:`coord.spend_ceiling.WARN_FRACTION` of
+    the ceiling a one-shot ``STATUS:`` warning is written to the worker's own
+    log — so a watching operator gets a chance to intervene, and the kill is
+    legible after the fact.  At or above the ceiling the process group is
+    killed and :data:`SPEND_CEILING_EXIT` is returned so ``_reap`` records a
+    ceiling kill rather than a generic failure.
+
+    Three properties of that check matter and are deliberate:
+
+    * **Fail open.** ``read_cost_usd`` returning ``None`` (unreadable log,
+      not stream-json, nothing priceable yet) never kills anything — killing
+      real work over a parse failure is worse than the overspend.
+    * **Never after the result event.** Once the worker has emitted its final
+      ``result`` the leg is logically finished and the money is already
+      spent; killing then would only mislabel a completed leg as a ceiling
+      kill. So the check is skipped once ``result_seen_at`` is set.
+    * **SIGKILL, not SIGTERM.** The whole point is to stop spending now; a
+      graceful shutdown that keeps talking to the API defeats it. Whatever
+      the worker committed is still on disk, and ``_reap``'s existing
+      safety-net push still runs afterwards.
+
     The keyword-only parameters exist for tests to inject short timeouts and
-    mock kill/clock behavior.
+    mock kill/clock/cost behavior.
     """
     start = clock()
     result_seen_at: float | None = None
     output_seen = False
+    cost_warned = False
+    ceiling_armed = bool(
+        cost_ceiling_usd and cost_ceiling_usd > 0 and read_cost_usd is not None
+    )
 
     while True:
         try:
@@ -405,6 +443,40 @@ def _wait_for_proc_or_result(
                 log_path,
                 "# reap: worker emitted result; awaiting clean exit\n",
             )
+
+        # #2131: per-leg spend ceiling. Only while the leg is still running
+        # (see the docstring for why a post-`result` kill is never useful),
+        # and only ever acting on a value the meter could actually read.
+        if ceiling_armed and result_seen_at is None:
+            assert cost_ceiling_usd is not None and read_cost_usd is not None
+            try:
+                spent = read_cost_usd()
+            except Exception:  # noqa: BLE001 — fail open, never break the reap
+                spent = None
+            if spent is not None:
+                from coord.spend_ceiling import WARN_FRACTION  # noqa: PLC0415
+
+                if not cost_warned and spent >= cost_ceiling_usd * WARN_FRACTION:
+                    cost_warned = True
+                    _append_log_line(
+                        log_path,
+                        f"STATUS: spend ${spent:.2f} has passed "
+                        f"{WARN_FRACTION:.0%} of the ${cost_ceiling_usd:.2f} "
+                        "per-leg ceiling → the leg will be killed if it "
+                        "reaches the ceiling → confidence: high (#2131)\n",
+                    )
+                if spent >= cost_ceiling_usd:
+                    _append_log_line(
+                        log_path,
+                        f"# reap: SIGKILL — spend ceiling breached "
+                        f"(${spent:.2f} of ${cost_ceiling_usd:.2f}) (#2131)\n",
+                    )
+                    killpg(proc.pid, signal.SIGKILL)
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    return SPEND_CEILING_EXIT
 
         if result_seen_at is not None and clock() - result_seen_at >= grace_after_result:
             # Worker logically done but process group still alive — force-kill.
@@ -517,6 +589,19 @@ class AssignmentSpec:
     # :meth:`AgentServer._resolve_provider` for the full resolution chain —
     # this field existing does not, on its own, get honoured anywhere else.
     provider_def: "dict[str, Any] | None" = None
+    # #2131: per-leg spend ceiling in USD, resolved coordinator-side from
+    # `budget.ceiling_for(type)` (coord/config.py) and carried here rather
+    # than read from the agent's own config — a config-free agent
+    # (docs/EPHEMERAL_WORKERS.md) has none to read. `None` (the default, and
+    # what every agent sees when the coordinator has no `budget:` block)
+    # means NO CEILING: the reap's watchdog never samples cost and behaves
+    # exactly as it did pre-#2131.
+    #
+    # `coord/dispatch.py` omits the key entirely when there is no ceiling, so
+    # an agent predating this field never sees an unrecognized kwarg (
+    # `AssignmentSpec(**body)` in agent_app.py 400s on those) unless the
+    # operator has actually configured one.
+    cost_ceiling_usd: float | None = None
 
 
 class _GitError(RuntimeError):
@@ -2685,6 +2770,21 @@ class AgentAssignment:
     # instead of leaving it to expand at push time) surfaced only as a line
     # in the worker log that nothing downstream ever read.
     push_failure_reason: str | None = None
+    # #2131: set when the reap's watchdog killed this leg because its live
+    # spend crossed `spec.cost_ceiling_usd`. Formatted with
+    # `coord.spend_ceiling.format_spend_ceiling_reason` (stable "spend
+    # ceiling — " prefix, recognised by `is_spend_ceiling_reason`). Only ever
+    # set alongside `status == FAILED` (the kill returns the non-zero
+    # `SPEND_CEILING_EXIT`), and `None` on every other outcome.
+    #
+    # This field is the WHOLE POINT of #2131's "not a generic failure"
+    # requirement: the coordinator stamps it onto the board's persisted
+    # `failure_reason` (coord/reconcile.py) so `coord retry` can refuse to
+    # silently re-spend, `auto_reassign` can decline to re-dispatch it, and
+    # the escalation record can name what actually happened. Without it a
+    # ceiling kill is indistinguishable from a crash and the money is spent
+    # again on the next pass.
+    spend_ceiling_reason: str | None = None
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -6823,6 +6923,25 @@ class AgentServer:
         else:
             _log_has_result_fn = _log_has_result
 
+        # #2131: arm the per-leg spend ceiling when the coordinator sent one.
+        # The meter is built here (not inside the wait loop) so the same
+        # instance survives the whole run and can be re-read afterwards for
+        # the reason string — it reads the log incrementally, so a full
+        # re-parse never happens on any poll.
+        _cost_ceiling: float | None = None
+        _cost_meter = None
+        if _reap_start is not None:
+            _raw_ceiling = getattr(_reap_start.spec, "cost_ceiling_usd", None)
+            if isinstance(_raw_ceiling, (int, float)) and _raw_ceiling > 0:
+                try:
+                    from coord.spend_ceiling import LiveCostMeter  # noqa: PLC0415
+
+                    _cost_ceiling = float(_raw_ceiling)
+                    _cost_meter = LiveCostMeter(log_path)
+                except Exception:  # noqa: BLE001 — fail open, never break reap
+                    _cost_ceiling = None
+                    _cost_meter = None
+
         # Use a polling wait that handles claude-cli's well-known habit of
         # not exiting after emitting its final result event (a child of the
         # process group keeps the session alive). See #228.
@@ -6830,8 +6949,30 @@ class AgentServer:
             proc, log_path,
             first_output_timeout=self.first_output_timeout,
             log_has_result=_log_has_result_fn,
+            cost_ceiling_usd=_cost_ceiling,
+            read_cost_usd=_cost_meter.read if _cost_meter is not None else None,
         )
         log_fh.close()
+
+        # #2131: turn the ceiling kill into the stable, greppable diagnostic
+        # every downstream consumer keys off. Uses the meter's LAST observed
+        # value rather than re-reading, so the number in the reason is
+        # exactly the one the kill decision was made on.
+        _spend_ceiling_reason: str | None = None
+        if exit_code == SPEND_CEILING_EXIT and _cost_ceiling is not None:
+            try:
+                from coord.spend_ceiling import (  # noqa: PLC0415
+                    format_spend_ceiling_reason,
+                )
+
+                _observed = (_cost_meter.last if _cost_meter is not None else None)
+                _spend_ceiling_reason = format_spend_ceiling_reason(
+                    _observed if _observed is not None else _cost_ceiling,
+                    _cost_ceiling,
+                    getattr(_reap_start.spec, "type", None) if _reap_start else None,
+                )
+            except Exception:  # noqa: BLE001 — best-effort, never break reap
+                _spend_ceiling_reason = None
 
         # #1461: detect a usage-limit kill from the tail of the transcript.
         # Done HERE — immediately after the worker's own process has exited
@@ -7103,6 +7244,13 @@ class AgentServer:
                 # checked independently of which branch set FAILED.
                 if _result_is_error and assignment.status == FAILED:
                     assignment.api_error_reason = _api_error_reason
+                # #2131: only ever attaches to a FAILED transition —
+                # `SPEND_CEILING_EXIT` is non-zero, so the `else` above has
+                # already set FAILED whenever `_spend_ceiling_reason` is set.
+                # Guarded anyway so a `POST /cancel` that raced the kill (and
+                # set CANCELLED before this block ran) is never relabelled.
+                if _spend_ceiling_reason is not None and assignment.status == FAILED:
+                    assignment.spend_ceiling_reason = _spend_ceiling_reason
             self._processes.pop(assignment_id, None)
 
         # #315/#324: parse the log for the worker's claude session_id (from the

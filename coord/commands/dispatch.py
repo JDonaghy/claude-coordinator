@@ -1667,12 +1667,25 @@ def stop(assignment_id: str, rescue: bool, config_path: Path) -> None:
         "real commits is refused; use `coord drive --accept-advisory` for "
         "that shape instead. A failed 'smoke' or 'review' assignment is "
         "refused with the command that re-runs its stage (#1636) — this "
-        "never silently re-dispatches one as a fresh work worker."
+        "never silently re-dispatches one as a fresh work worker. A leg "
+        "killed by the per-leg spend ceiling (#2131) needs "
+        "--acknowledge-cost: retrying it re-spends the whole ceiling, so "
+        "that has to be a decision, not a reflex."
     )
 )
 @click.argument("assignment_id")
+@click.option(
+    "--acknowledge-cost",
+    "acknowledge_cost",
+    is_flag=True,
+    default=False,
+    help=(
+        "Acknowledge that this leg was killed by the per-leg spend ceiling "
+        "(#2131) and retry it anyway, re-spending up to the ceiling again."
+    ),
+)
 @_CONFIG_OPTION
-def retry(assignment_id: str, config_path: Path) -> None:
+def retry(assignment_id: str, config_path: Path, acknowledge_cost: bool = False) -> None:
     from coord.board_service import read_board, write_board
     from coord.models import WORK_LIKE_TYPES
     from coord.reconcile import (
@@ -1697,6 +1710,31 @@ def retry(assignment_id: str, config_path: Path) -> None:
             err=True,
         )
         sys.exit(1)
+
+    # #2131: a leg killed by the per-leg spend ceiling is NOT an ordinary
+    # failure. Retrying it unchanged re-spends up to the full ceiling on work
+    # that was already judged to be running away, which is exactly the
+    # "coord retry will cheerfully spend the money again" hole the ceiling
+    # exists to close. Refuse until the operator says the words. Checked
+    # before the type/model checks so the refusal isn't preceded by a
+    # reassuring "escalating model" line for a retry that won't happen.
+    from coord.spend_ceiling import is_spend_ceiling_reason  # noqa: PLC0415
+
+    if is_spend_ceiling_reason(getattr(assignment, "failure_reason", None)):
+        if not acknowledge_cost:
+            click.echo(
+                f"error: assignment {assignment_id} was killed by the per-leg "
+                f"spend ceiling ({assignment.failure_reason}). Retrying it "
+                f"re-spends up to the ceiling again on work that was already "
+                f"burning money — usually it needs a tighter briefing or a "
+                f"smaller scope, not another run. If you have decided the "
+                f"spend is worth it, re-run with --acknowledge-cost.",
+                err=True,
+            )
+            sys.exit(1)
+        click.echo(
+            f"  acknowledged spend-ceiling kill: {assignment.failure_reason}"
+        )
 
     if assignment.status == "advisory":
         # #1606: an ADVISORY row is TERMINAL — nothing else on the board ever
@@ -1767,6 +1805,17 @@ def retry(assignment_id: str, config_path: Path) -> None:
         sys.exit(1)
 
     write_board(board)
+    if acknowledge_cost:
+        # #2131: the operator has answered the question the escalation asked,
+        # so clear it — an alert that stays lit after it has been acted on is
+        # how an alert channel gets muted. Best-effort: a failed dismissal
+        # must not make a successful retry look like it failed.
+        try:
+            from coord.state import dismiss_drive_escalation  # noqa: PLC0415
+
+            dismiss_drive_escalation(assignment.repo_name, assignment.issue_number)
+        except Exception as exc:  # noqa: BLE001
+            click.echo(f"  warning: could not dismiss the escalation: {exc}", err=True)
     click.echo(
         f"Retried: {result.machine_name} → {result.repo_name} "
         f"#{result.issue_number} (assignment {result.assignment_id}, "

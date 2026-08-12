@@ -210,6 +210,35 @@ concurrency:
   # Set to 0 to disable. Default: 12.
   # interactive_session_timeout_hours: 12
 
+# #2131 — per-leg spend ceiling. A single runaway leg is the fleet's most
+# expensive failure mode (over 2026-08-08 → 08-11 the twelve legs above $10
+# were 3% of all legs and 19% of the whole bill). When a leg's live spend
+# crosses its ceiling the worker is SIGKILLed, recorded with a distinct
+# `spend ceiling — ...` failure_reason (never a generic failure), escalated to
+# `coord escalate list`, and refused by `coord retry` until you pass
+# --acknowledge-cost.
+#
+# ABSENT BLOCK == NO CEILING == today's behaviour. Nothing below is on by
+# default. HEADLESS LEGS ONLY: the check reads the worker's stream-json
+# transcript, and interactive (`claude-pty`) sessions are precisely the logs
+# that are not stream-json (#1710) — an interactive session is NOT capped.
+# The mid-flight number is a list-price ESTIMATE from per-turn token usage,
+# not the invoice; calibrate against `coord usage`, which prices the same way.
+#
+# Calibration from the same window's medians: sonnet work leg $3.61, opus work
+# leg $6.61, review $1.61, smoke $0.44. This is a safety net, not a scheduler —
+# if it fires often, the ceiling is too low or the briefings are bad.
+#
+# budget:
+#   per_leg_ceiling_usd: 8.0   # applies to any type with no override below;
+#                              # 0 (the default) disables the ceiling entirely
+#   type_ceilings:             # an $8 ceiling is very wrong for a $0.44 smoke
+#     work: 8.0
+#     review: 4.0
+#     smoke: 2.0
+#     plan: 3.0
+#     # chat: 0                # 0 disables the ceiling for that type alone
+
 hooks:
   on_round_complete:
     - summary_report
