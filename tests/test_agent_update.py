@@ -350,6 +350,68 @@ class TestUpdateEndpoint:
         assert kwargs.get("target_version") == "9.9.9"
         server.shutdown()
 
+    def test_update_passes_initiator_through_to_perform_update(
+        self, tmp_path: Path
+    ) -> None:
+        """#2121 item 2: an explicit `initiator` in the POST body (what
+        `coord agent update` and `coord release propagate`'s `_roll_python`
+        both send via `cli_initiator`) must reach `perform_update` verbatim,
+        not get laundered into the generic peer/user-agent fallback."""
+        with (
+            patch("coord.agent_app._detect_install_mode", return_value=(False, None)),
+            patch(
+                "coord.dist_name.resolve_installed",
+                return_value=ResolvedDist(name="claude-coordinator", version="0.3.0"),
+            ),
+            patch(
+                "coord.agent_app.agent_update.perform_update",
+                return_value=UpdateResult(ok=True, swapped=True, new_version="9.9.9"),
+            ) as mock_perform,
+        ):
+            client, server = _make_client(tmp_path)
+            client.post(
+                "/update",
+                json={
+                    "target_version": "9.9.9",
+                    "initiator": "coord release propagate -> dellserver python lane (john@laptop pid 123)",
+                },
+            )
+            assert _wait_until(lambda: mock_perform.called)
+
+        _args, kwargs = mock_perform.call_args
+        assert kwargs.get("initiator") == (
+            "coord release propagate -> dellserver python lane (john@laptop pid 123)"
+        )
+        server.shutdown()
+
+    def test_update_falls_back_to_peer_and_user_agent_when_initiator_missing(
+        self, tmp_path: Path
+    ) -> None:
+        """No caller-supplied `initiator` still yields *something* legible
+        on the audit trail — the peer address and user-agent — rather than
+        `perform_update`'s own "unattributed" default, which is reserved for
+        an in-process call that named nobody at all."""
+        with (
+            patch("coord.agent_app._detect_install_mode", return_value=(False, None)),
+            patch(
+                "coord.dist_name.resolve_installed",
+                return_value=ResolvedDist(name="claude-coordinator", version="0.3.0"),
+            ),
+            patch(
+                "coord.agent_app.agent_update.perform_update",
+                return_value=UpdateResult(ok=True, swapped=True, new_version="9.9.9"),
+            ) as mock_perform,
+        ):
+            client, server = _make_client(tmp_path)
+            client.post("/update", json={"target_version": "9.9.9"})
+            assert _wait_until(lambda: mock_perform.called)
+
+        _args, kwargs = mock_perform.call_args
+        initiator = kwargs.get("initiator")
+        assert isinstance(initiator, str)
+        assert initiator.startswith("POST /update from ")
+        server.shutdown()
+
     def test_update_pkg_spec_prefers_code_coordinator_when_installed(
         self, tmp_path: Path
     ) -> None:
@@ -545,6 +607,53 @@ class TestRollbackEndpoint:
             r = client.post("/rollback")
             assert r.status_code == 202
             assert _wait_until(lambda: bool(restarted))
+        server.shutdown()
+
+    def test_rollback_passes_initiator_through_to_agent_update_rollback(
+        self, tmp_path: Path
+    ) -> None:
+        """#2121 item 2: same wiring as `/update` — an explicit `initiator`
+        in the POST body (what `_rollback_host` sends via `cli_initiator`)
+        must reach `coord.agent_update.rollback` verbatim."""
+        with patch(
+            "coord.agent_app.agent_update.rollback",
+            return_value=UpdateResult(
+                ok=True, swapped=True, slot=Path("/x/.coord-venv.blue"), new_version="0.3.0"
+            ),
+        ) as mock_rollback:
+            client, server = _make_client(tmp_path, exec_restart=lambda _argv: None)
+            r = client.post(
+                "/rollback",
+                json={
+                    "force": True,
+                    "initiator": "coord release rollback -> dellserver (john@laptop pid 123)",
+                },
+            )
+            assert r.status_code == 202
+
+        _args, kwargs = mock_rollback.call_args
+        assert kwargs.get("initiator") == (
+            "coord release rollback -> dellserver (john@laptop pid 123)"
+        )
+        server.shutdown()
+
+    def test_rollback_falls_back_to_peer_and_user_agent_when_initiator_missing(
+        self, tmp_path: Path
+    ) -> None:
+        with patch(
+            "coord.agent_app.agent_update.rollback",
+            return_value=UpdateResult(
+                ok=True, swapped=True, slot=Path("/x/.coord-venv.blue"), new_version="0.3.0"
+            ),
+        ) as mock_rollback:
+            client, server = _make_client(tmp_path, exec_restart=lambda _argv: None)
+            r = client.post("/rollback")
+            assert r.status_code == 202
+
+        _args, kwargs = mock_rollback.call_args
+        initiator = kwargs.get("initiator")
+        assert isinstance(initiator, str)
+        assert initiator.startswith("POST /rollback from ")
         server.shutdown()
 
     def test_rollback_404_when_no_previous_generation(self, tmp_path: Path) -> None:
@@ -1721,6 +1830,52 @@ class TestAgentUpdateCLI:
         assert "laptop" in result.output
         assert "accepted" in result.output
         assert __version__ in result.output
+
+    def test_update_posts_a_meaningful_initiator(
+        self, config_file: Path, coord_db
+    ) -> None:
+        """#2121 item 2: `coord agent update` is one of the two operator-
+        facing entry points into `/update` — the POST body it sends must
+        carry a real `initiator` (built by `cli_initiator`), not leave the
+        target agent to fall back to the generic peer/user-agent string."""
+        posted_bodies: list[dict] = []
+
+        def fake_post(url, *args, **kwargs):
+            posted_bodies.append(kwargs.get("json") or {})
+            r = MagicMock()
+            r.status_code = 202
+            r.json.return_value = {"status": "updating", "mode": "pip install --upgrade"}
+            return r
+
+        def fake_get(url, *args, **kwargs):
+            r = MagicMock()
+            r.status_code = 200
+            r.json.return_value = {
+                "machine": "laptop",
+                "version": __version__,
+                "last_update": {
+                    "result": "upgraded",
+                    "version_before": "0.0.1",
+                    "version_after": __version__,
+                },
+            }
+            return r
+
+        with (
+            patch("coord.cli.httpx.post", side_effect=fake_post),
+            patch("coord.cli.httpx.get", side_effect=fake_get),
+        ):
+            result = CliRunner().invoke(
+                main,
+                ["agent", "update", "--machine", "laptop", "--timeout", "5",
+                 "--config", str(config_file)],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert len(posted_bodies) == 1
+        initiator = posted_bodies[0].get("initiator")
+        assert isinstance(initiator, str)
+        assert initiator.startswith("coord agent update (")
 
     def test_update_all_machines(
         self, config_file: Path, coord_db

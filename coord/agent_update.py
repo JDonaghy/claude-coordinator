@@ -261,6 +261,11 @@ def assert_not_live_install(venv_dir: Path) -> None:
     Outside pytest this is a no-op — production upgrades are guarded by the
     active-colour and live-holder checks in :func:`perform_update`, not by
     this.
+
+    Compared with :func:`_same_path` (resolved, not a bare string compare):
+    a symlinked ``$HOME`` or an equivalently-but-differently-spelled
+    ``venv_dir`` must not let a test slip past this guard the same way
+    :func:`_other_slot` must not mistake it for "the other colour" (#2121).
     """
     marker = os.environ.get("PYTEST_CURRENT_TEST")
     if not marker:
@@ -269,7 +274,7 @@ def assert_not_live_install(venv_dir: Path) -> None:
     live = Path.home() / _LIVE_VENV_NAME
     blue, green = _slots(live)
     for candidate in (live, blue, green):
-        if str(venv_dir) != str(candidate):
+        if not _same_path(venv_dir, candidate):
             continue
         raise LiveInstallGuardError(
             f"Refusing to install into the live agent venv at {venv_dir} "
@@ -801,10 +806,19 @@ def rollback(venv_dir: Path, *, initiator: str | None = None) -> UpdateResult:
     trading one failure for another.
 
     Nothing is deleted here (only the symlink moves), so there is no
-    live-process hazard to guard — but the swap still changes which code
-    the machine's *next* process start runs, so it is audited on the same
-    waist as an install (#2121 item 2).
+    live-process *deletion* hazard to guard the way :func:`perform_update`
+    must — but :func:`assert_not_live_install` is a separate guard with a
+    separate job (per its own docstring: keep *any* test, destructive or
+    not, from reaching the machine's real ``~/.coord-venv``), and this
+    function is reachable the exact same way ``perform_update`` is — the
+    ``/rollback`` HTTP handler calls it with the same ``_venv_dir()``-
+    resolved path, and it mutates the live symlink via the same
+    :func:`_atomic_swap`. So it gets the same guard, first line, same as
+    ``perform_update``. The swap still changes which code the machine's
+    *next* process start runs, so it is audited on the same waist as an
+    install (#2121 item 2).
     """
+    assert_not_live_install(venv_dir)
     active = current_slot(venv_dir)
     if active is None:
         return UpdateResult(
