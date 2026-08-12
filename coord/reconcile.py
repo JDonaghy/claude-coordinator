@@ -1012,7 +1012,7 @@ def describe_no_candidate_machines(
     return "no available machine to retry on:\n" + "\n".join(lines)
 
 
-def _escalate_spend_ceiling_best_effort(assignment, entry: dict) -> None:
+def _escalate_spend_ceiling_best_effort(assignment: Assignment, entry: dict) -> None:
     """#2131: surface a spend-ceiling kill where a human will actually see it.
 
     A ceiling kill is the one terminal state that must NOT be quietly retried
