@@ -273,6 +273,21 @@ class DriveCounters:
     # attempt that produced it — one poll's staleness is the price of
     # keeping the I/O boundary in `Driver`, not in `decide()`.
     last_merge_diagnostic: str = ""
+    # #2149: consecutive polls spent waiting on `last_merge_diagnostic`'s
+    # CACHED gate reason (the `status == ""` arm of `_decide_merge`) without
+    # a fresh `coord merge --only` attempt in between. That cached text is a
+    # snapshot of the LAST real attempt — nothing re-validates it while this
+    # counter is the only thing advancing, so a gate that clears on its own
+    # is structurally invisible for as long as the wait continues unbounded.
+    # `_decide_merge` bounds the streak at `_MAX_GATE_WAIT_ROUNDS`: once
+    # reached, it resets this to 0 and falls through to a REAL attempt
+    # instead of reprinting the same frozen reason, which is what actually
+    # notices a cleared gate (coord-portal#50: 2h33m spent re-printing an
+    # identical "review required" line for a review that was never real).
+    # Reset to 0 whenever a real attempt refreshes the diagnostic — a fresh
+    # capture deserves its own full budget of cheap waits before the next
+    # forced retry.
+    gate_wait_rounds: int = 0
     # #2079: a SECOND, independent budget of exactly the same shape, spent
     # only on landing the oracle-mode JIT acceptance slice
     # (`_decide_acceptance_landing`). Separate rather than shared because the
@@ -1822,6 +1837,17 @@ _RETRYABLE_MERGE_STATUSES = frozenset({"", "PENDING", "READY", "MERGING", "CONFL
 # (rare — normally there is exactly one board row per (repo, issue)).
 _ENQUEUE_BLOCKED_RE = re.compile(r"enqueue blocked by (.+)$", re.MULTILINE)
 
+# #2149: how many consecutive polls `_decide_merge`'s `status == ""` arm may
+# wait on a CACHED gate reason (`counters.last_merge_diagnostic`, refreshed
+# only by a real `coord merge --only` attempt) before it is forced to spend
+# a real attempt instead. Keeps the cheap-wait behaviour #2078 wanted (don't
+# hammer a known-blocked gate every single poll) while guaranteeing the
+# reason is re-validated on a bounded cadence rather than echoed verbatim
+# until the drive's whole `--deadline` expires — the coord-portal#50
+# incident, where a review requirement that had already cleared was
+# reprinted ~145 times over 2h33m because nothing ever re-checked it.
+_MAX_GATE_WAIT_ROUNDS = 5
+
 _PR_NUMBER_RE = re.compile(r"/pull/(\d+)")
 
 
@@ -2248,21 +2274,40 @@ def _decide_merge(
     # (`Driver._loop`), so by the SECOND empty-status poll this driver
     # already knows, from its own prior attempt, whether the row is simply
     # not enqueued yet (self-heals — fall through to the bounded retry) or
-    # genuinely blocked on a review/smoke gate that a fourth identical
-    # `--only` cannot change (wait, like the BLOCKED arm above, instead of
-    # spending another attempt on a no-op). A CI-only block stays invisible
+    # apparently blocked on a review/smoke gate that an IMMEDIATE identical
+    # `--only` cannot change (wait a few cheap polls instead of spending
+    # another attempt on a likely no-op). A CI-only block stays invisible
     # here — CI is only evaluated once a row is enqueued — and falls through
     # to the retry below, where the die message now quotes whatever the
     # driver actually observed instead of echoing the board's empty fields.
+    #
+    # #2149: "apparently" and "likely", not "genuinely" and certain — unlike
+    # the live BLOCKED arm above, `gate_reason` here is a SNAPSHOT of the
+    # LAST real attempt, and nothing refreshes it while this arm just waits.
+    # coord-portal#50 spent 2h33m re-printing an identical "review required"
+    # reason for a review that had already cleared, because the wait never
+    # re-checked and never counted against any budget. So the wait is capped
+    # at `_MAX_GATE_WAIT_ROUNDS`: once reached, fall through to the SAME
+    # bounded retry every other retryable status uses below — a real
+    # attempt, which either lands (the gate cleared) or refreshes the
+    # diagnostic for the next `_MAX_GATE_WAIT_ROUNDS`-round wait.
     if status == "":
         gate_reason = _extract_gate_block_reason(counters.last_merge_diagnostic)
         if gate_reason:
-            return _wait(
-                label=(
-                    "MERGE: blocked (not yet enqueued) — "
-                    f"{gate_reason}; re-checking"
+            if counters.gate_wait_rounds < _MAX_GATE_WAIT_ROUNDS:
+                counters.gate_wait_rounds += 1
+                rounds_left = _MAX_GATE_WAIT_ROUNDS - counters.gate_wait_rounds
+                return _wait(
+                    label=(
+                        "MERGE: blocked (not yet enqueued) — "
+                        f"{gate_reason} (as of "
+                        f"{counters.gate_wait_rounds} check"
+                        f"{'s' if counters.gate_wait_rounds != 1 else ''} ago; "
+                        f"re-attempting for real in {rounds_left} more if "
+                        "still blocked then); re-checking"
+                    )
                 )
-            )
+            counters.gate_wait_rounds = 0
 
     # #2157: this driver's OWN last `coord merge --only <aid>` reported the
     # entry has already merged. That is the postcondition this whole stage is

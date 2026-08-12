@@ -2122,11 +2122,12 @@ def test_an_already_merged_slice_costs_the_slice_budget_nothing():
 
 def test_empty_status_with_a_known_gate_block_waits_instead_of_retrying_blind():
     """#2078 core fix: once a prior `coord merge --only` attempt's captured
-    diagnostic already names a genuine, un-satisfied review/smoke gate, a
+    diagnostic already names an apparently un-satisfied review/smoke gate, a
     board `merge_status` of "" (no queue entry at all) is no longer treated
     as blindly retryable — it behaves like a BLOCKED entry (wait, re-check),
     the same as if the board itself had rendered BLOCKED with this reason.
-    No further merge attempt is spent chasing a gate a retry cannot change."""
+    No merge attempt is spent on the FIRST few polls chasing a gate a retry
+    is unlikely to change (bounded by #2149 below — it isn't a wait forever)."""
     counters = DriveCounters()
     opts = DriveOptions(machine="precision", max_merge_attempts=3)
     counters.last_merge_diagnostic = (
@@ -2143,6 +2144,115 @@ def test_empty_status_with_a_known_gate_block_waits_instead_of_retrying_blind():
     assert "not yet enqueued" in action.label
     assert "test verdict stale" in action.label
     assert counters.merge_attempts == 0
+    assert counters.gate_wait_rounds == 1
+    assert "1 check" in action.label
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# #2149: a cached gate block reason is a snapshot, not live state — the wait
+# on it must be bounded and must eventually re-attempt for real, or a gate
+# that clears on its own (coord-portal#50: a stale "review required" line
+# reprinted ~145 times over 2h33m) is never noticed.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _blocked_diagnostic(gate: str = "review") -> str:
+    return (
+        "merge-queue: no entry found for 'w1', but 1 done work row(s) on the "
+        "board match it:\n"
+        "  claude-coordinator #1392 (assignment w1, branch fix-1392) — "
+        f"enqueue blocked by {gate} gate — review required but not approved "
+        "(waive with --skip-review)"
+    )
+
+
+def test_gate_wait_is_bounded_and_eventually_retries_for_real():
+    """The exact regression: a gate reason cached from a past attempt must
+    not be waited on forever. After `_MAX_GATE_WAIT_ROUNDS` cheap waits, the
+    driver must fall through to a REAL `coord merge --only` attempt instead
+    of reprinting the frozen reason again."""
+    from coord.drive import _MAX_GATE_WAIT_ROUNDS
+
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_merge_attempts=3)
+    counters.last_merge_diagnostic = _blocked_diagnostic()
+    s = approved_work()
+
+    for round_ in range(1, _MAX_GATE_WAIT_ROUNDS + 1):
+        action = step(s, opts, counters=counters)
+        assert action.kind == WAIT, f"round {round_} should still be a cheap wait"
+        assert counters.merge_attempts == 0
+        assert counters.gate_wait_rounds == round_
+
+    # The next poll must stop waiting and spend a real attempt — this is what
+    # notices a gate that has since cleared.
+    action = step(s, opts, counters=counters)
+    assert action.kind == RUN
+    assert counters.merge_attempts == 1
+    assert counters.gate_wait_rounds == 0
+
+
+def test_gate_wait_never_spins_to_the_deadline():
+    """coord-portal#50 in one assertion: many, many more polls than the
+    incident saw must never all come back WAIT — the drive has to actually
+    try the merge again well before any deadline."""
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_merge_attempts=3)
+    counters.last_merge_diagnostic = _blocked_diagnostic()
+    s = approved_work()
+
+    kinds = [step(s, opts, counters=counters).kind for _ in range(20)]
+    assert RUN in kinds, "must eventually re-attempt instead of waiting forever"
+
+
+def test_a_fresh_attempt_after_the_gate_wait_bound_resets_the_round_counter():
+    """Once the bounded wait forces a real attempt, and that attempt's fresh
+    diagnostic still names the same gate, the driver gets a fresh
+    `_MAX_GATE_WAIT_ROUNDS`-sized budget of cheap waits again — a persistent
+    but slow-clearing gate degrades to periodic re-checks, not a tight loop
+    of real attempts."""
+    from coord.drive import _MAX_GATE_WAIT_ROUNDS
+
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_merge_attempts=3)
+    counters.last_merge_diagnostic = _blocked_diagnostic()
+    s = approved_work()
+
+    for _ in range(_MAX_GATE_WAIT_ROUNDS):
+        step(s, opts, counters=counters)
+    retry_action = step(s, opts, counters=counters)
+    assert retry_action.kind == RUN
+    assert counters.merge_attempts == 1
+
+    # Simulate `Driver._loop` capturing the fresh attempt's output — still
+    # blocked by the same gate.
+    counters.last_merge_diagnostic = _blocked_diagnostic()
+    action = step(s, opts, counters=counters)
+    assert action.kind == WAIT
+    assert counters.gate_wait_rounds == 1
+
+
+def test_gate_wait_round_bound_lets_a_cleared_gate_merge_without_a_human():
+    """The acceptance criterion from #2149, directly: seed a refused `coord
+    merge --only`, then have the gate clear (the next real attempt lands),
+    and assert the drive proceeds — no operator intervention, no waiting to
+    a deadline."""
+    from coord.drive import _MAX_GATE_WAIT_ROUNDS
+
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_merge_attempts=3)
+    counters.last_merge_diagnostic = _blocked_diagnostic()
+    s = approved_work()
+
+    for _ in range(_MAX_GATE_WAIT_ROUNDS):
+        action = step(s, opts, counters=counters)
+        assert action.kind == WAIT
+
+    # The gate cleared in the meantime — the bounded wait forces a real
+    # attempt, which is what notices that.
+    retry_action = step(s, opts, counters=counters)
+    assert retry_action.kind == RUN
+    assert retry_action.command == ("merge", "--only", "w1", "--method", "rebase")
 
 
 def test_empty_status_still_retries_blind_when_the_diagnostic_names_no_gate():
