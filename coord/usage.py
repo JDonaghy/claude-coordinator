@@ -57,6 +57,16 @@ class AssignmentUsage:
     output_tokens: int = 0
     cache_creation_tokens: int = 0
     cache_read_tokens: int = 0
+    # #2128: True when this assignment's cost is genuinely *unknown* — no
+    # local log (e.g. it ran on another machine) and no remote data was
+    # supplied to fill the gap — as opposed to a real, captured $0.00. Only
+    # set for providers that actually report cost (see
+    # ``capabilities().cost_reporting``); a provider that never reports cost
+    # (subscription-billed ``claude-pty``) is legitimately silent, matching
+    # ``parse_usage_from_log``'s own #1710 signal. Lets
+    # ``format_usage_report`` warn that the total undercounts instead of
+    # silently rendering these as free.
+    cost_unknown: bool = False
 
     @property
     def total_tokens(self) -> int:
@@ -130,6 +140,11 @@ class SessionUsage:
             key = a.model or "(unknown)"
             result[key] = result.get(key, 0) + 1
         return result
+
+    def uncosted_count(self) -> int:
+        """Number of assignments whose cost is unknown rather than $0.00
+        (#2128) — no local log and no remote data covered them."""
+        return sum(1 for a in self.assignments if a.cost_unknown)
 
 
 # ── Log parsing ───────────────────────────────────────────────────────────────
@@ -259,6 +274,18 @@ def _assignment_to_usage(
         turns = remote_data.get("num_turns") or remote_data.get("turns")
         if isinstance(turns, int):
             usage.num_turns = turns
+        return usage
+
+    # #2128: neither a local log nor remote data covered this assignment —
+    # its $0.00 is a placeholder, not a captured fact. Flag it as such when
+    # the assignment's provider actually reports cost data (a provider with
+    # cost_reporting=False is genuinely free/uncosted and stays silent).
+    if a.assignment_id:
+        from coord.providers import get_provider  # noqa: PLC0415
+
+        provider = get_provider(a.provider_name)
+        if provider.capabilities().cost_reporting:
+            usage.cost_unknown = True
 
     return usage
 
@@ -496,6 +523,21 @@ def format_usage_report(session: SessionUsage, window_label: str | None = None) 
     if window_label is not None:
         lines.append("")
         lines.append(f"Σ  total {total_str}  •  {counts_str}")
+
+    # #2128: this view derives cost by re-parsing local log files, so a leg
+    # that ran on another machine (or whose remote data wasn't fetched)
+    # renders as $0.00 — indistinguishable from "actually free" without this
+    # line. Silence here is what turned a visible gap into a silent 2x
+    # undercount.
+    uncosted = session.uncosted_count()
+    if uncosted:
+        noun = "assignment" if uncosted == 1 else "assignments"
+        lines.append("")
+        lines.append(
+            f"⚠ {uncosted} {noun} could not be costed (no local log — "
+            f"likely ran on another machine). This total may undercount. "
+            f"Try `coord usage --by-issue` or `--remote` for full fleet cost."
+        )
 
     return "\n".join(lines)
 
