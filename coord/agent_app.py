@@ -1301,6 +1301,19 @@ def build_app(
         target_version = body.get("target_version") or None
         force = bool(body.get("force"))
 
+        # #2121 item 2: every install must name who asked for it. A caller
+        # that knows (`coord release propagate`, `coord agent update`) says
+        # so explicitly; anything else is attributed to the socket it
+        # arrived on, which is still a fact and still more than the
+        # 2026-08-11 upgrade left behind. Never silently "unattributed"
+        # here — that value is reserved for an in-process call that named
+        # nobody at all.
+        initiator = body.get("initiator") or None
+        if not isinstance(initiator, str) or not initiator.strip():
+            peer = request.client.host if request.client else "unknown peer"
+            agent_hdr = request.headers.get("user-agent") or "no user-agent"
+            initiator = f"POST /update from {peer} ({agent_hdr})"
+
         mode = "pip install (blue/green)"
 
         # Capture argv now — exec_restart replaces the process later.
@@ -1323,7 +1336,10 @@ def build_app(
             try:
                 venv_dir = _venv_dir()
                 result = agent_update.perform_update(
-                    venv_dir, _agent_pkg_spec(), target_version=target_version,
+                    venv_dir,
+                    _agent_pkg_spec(),
+                    target_version=target_version,
+                    initiator=initiator,
                 )
                 payload["finished_at"] = time.time()
                 # Persist the full venv/pip/smoke-check transcript to a log
@@ -1634,7 +1650,12 @@ def build_app(
 
         venv_dir = _venv_dir()
         version_before = _installed_version() or "unknown"
-        result = agent_update.rollback(venv_dir)
+        rb_initiator = body.get("initiator")
+        if not isinstance(rb_initiator, str) or not rb_initiator.strip():
+            peer = request.client.host if request.client else "unknown peer"
+            agent_hdr = request.headers.get("user-agent") or "no user-agent"
+            rb_initiator = f"POST /rollback from {peer} ({agent_hdr})"
+        result = agent_update.rollback(venv_dir, initiator=rb_initiator)
         if not result.ok:
             payload = {
                 "mode": "rollback",

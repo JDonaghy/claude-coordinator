@@ -17,6 +17,8 @@ import click
 import httpx
 
 from coord import __version__
+# Aliased: `agent_update` is also the name of this module's click command.
+from coord.agent_update import cli_initiator as _cli_initiator
 from coord.config import Config
 from coord.dist_name import CANDIDATE_NAMES
 
@@ -622,7 +624,15 @@ def agent_update(
         click.echo(f"  {machine.name}: POST {url} ...", nl=False)
         try:
             resp = httpx.post(
-                url, json={"target_version": target_version, "force": force}, timeout=10
+                url,
+                json={
+                    "target_version": target_version,
+                    "force": force,
+                    # #2121: name the invocation, so the audit row on the
+                    # target host points back at a person and a box.
+                    "initiator": _cli_initiator("coord agent update"),
+                },
+                timeout=10,
             )
             if resp.status_code == 202:
                 data = resp.json()

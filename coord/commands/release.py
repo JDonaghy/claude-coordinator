@@ -1169,10 +1169,19 @@ def _roll_python(machine, *, target_version: str, agent_port: int, timeout: floa
     )
     from coord.release_verify import DAEMON_UNIT  # noqa: PLC0415
 
+    from coord.agent_update import cli_initiator  # noqa: PLC0415
+
     pre = _fetch_pre_started_at([machine])
     status, body, error = _post(
         f"http://{machine.host}:{agent_port}/update",
-        {"target_version": target_version, "force": force},
+        {
+            "target_version": target_version,
+            "force": force,
+            # #2121: the roll names itself on the target host's audit trail.
+            "initiator": cli_initiator(
+                f"coord release propagate -> {machine.name} python lane"
+            ),
+        },
         timeout=15.0,
     )
     if error:
