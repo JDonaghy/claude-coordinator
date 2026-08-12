@@ -35,7 +35,12 @@ import pytest
 
 from coord import agent_app, agent_update
 from coord.agent import PENDING, RUNNING, AgentServer, AssignmentSpec
-from coord.agent_app import _IdleRestartWatcher, _daemon_runs_here, _idle_restart_target
+from coord.agent_app import (
+    _daemon_runs_here,
+    _host_has_live_interactive_session,
+    _idle_restart_target,
+    _IdleRestartWatcher,
+)
 
 
 def _wait_until(predicate, timeout: float = 10.0, interval: float = 0.02) -> bool:
@@ -117,6 +122,60 @@ class TestDaemonRunsHere:
         assert _daemon_runs_here() is True
 
 
+# ── _host_has_live_interactive_session ───────────────────────────────────
+
+
+class TestHostHasLiveInteractiveSession:
+    """#2139 blocking review fix: an interactive Test/Review/Merge/Work pane
+    is not an assignment — its tmux session must be consulted directly, the
+    same way `AgentServer.clean_worktrees` (#1295) does, rather than trusting
+    `self._assignments[...].status` alone (which can already be terminal
+    while the operator is still attached)."""
+
+    def test_no_live_sessions(self, monkeypatch):
+        from coord import interactive
+
+        monkeypatch.setattr(interactive, "list_coord_tmux_sessions", list)
+        assert _host_has_live_interactive_session() is False
+
+    def test_a_live_session_counts_as_busy(self, monkeypatch):
+        from coord import interactive
+
+        monkeypatch.setattr(
+            interactive, "list_coord_tmux_sessions",
+            lambda: [{"session_name": "coord-abc123", "pane_dead": "0", "attached": True}],
+        )
+        assert _host_has_live_interactive_session() is True
+
+    def test_a_session_with_a_dead_pane_still_counts_as_busy(self, monkeypatch):
+        """Mirrors `clean_worktrees`'s guard: a session that still EXISTS
+        (even with a dead pane — the detach-and-abandon case) is kept, not
+        just an attached one — presence, not attachment, is what matters."""
+        from coord import interactive
+
+        monkeypatch.setattr(
+            interactive, "list_coord_tmux_sessions",
+            lambda: [{"session_name": "coord-abc123", "pane_dead": "1", "attached": False}],
+        )
+        assert _host_has_live_interactive_session() is True
+
+    def test_query_failure_is_conservative(self, monkeypatch):
+        """Errs toward "busy" (skip this cycle, re-check next tick) the same
+        direction `_daemon_runs_here` errs when it can't determine an
+        answer — never toward restarting blind."""
+        import coord.agent_app as mod
+
+        def _boom():
+            raise RuntimeError("tmux query blew up")
+
+        # Patch the deferred import target itself.
+        monkeypatch.setattr(
+            "coord.interactive.list_coord_tmux_sessions",
+            _boom,
+        )
+        assert mod._host_has_live_interactive_session() is True
+
+
 # ── _idle_restart_target ─────────────────────────────────────────────────
 
 
@@ -128,6 +187,21 @@ class TestIdleRestartTarget:
     def test_daemon_colocated_vetoes_regardless_of_everything_else(self, tmp_path, monkeypatch):
         server = self._server(tmp_path)
         monkeypatch.setattr(agent_app, "_daemon_runs_here", lambda: True)
+        monkeypatch.setattr(agent_app, "_host_has_live_interactive_session", lambda: False)
+        monkeypatch.setattr(agent_update, "current_slot", lambda vd: tmp_path / "new")
+        monkeypatch.setattr(agent_update, "running_slot", lambda vd: tmp_path / "old")
+        assert _idle_restart_target(server, tmp_path / "venv") is None
+        server.shutdown()
+
+    def test_live_interactive_session_vetoes_even_with_zero_assignments(self, tmp_path, monkeypatch):
+        """The blocking finding this fixes: zero PENDING/RUNNING assignments
+        must NOT be enough on its own — a live `coord-*` tmux session (e.g.
+        an operator sitting in a Test/Review/Merge/Work pane whose backing
+        assignment already went terminal) must veto the restart exactly
+        like a RUNNING assignment does."""
+        server = self._server(tmp_path)
+        monkeypatch.setattr(agent_app, "_daemon_runs_here", lambda: False)
+        monkeypatch.setattr(agent_app, "_host_has_live_interactive_session", lambda: True)
         monkeypatch.setattr(agent_update, "current_slot", lambda vd: tmp_path / "new")
         monkeypatch.setattr(agent_update, "running_slot", lambda vd: tmp_path / "old")
         assert _idle_restart_target(server, tmp_path / "venv") is None
@@ -172,6 +246,7 @@ class TestIdleRestartTarget:
         server = self._server(tmp_path)
         new_slot = tmp_path / "new"
         monkeypatch.setattr(agent_app, "_daemon_runs_here", lambda: False)
+        monkeypatch.setattr(agent_app, "_host_has_live_interactive_session", lambda: False)
         monkeypatch.setattr(agent_update, "current_slot", lambda vd: new_slot)
         monkeypatch.setattr(agent_update, "running_slot", lambda vd: tmp_path / "old")
         assert _idle_restart_target(server, tmp_path / "venv") == new_slot
@@ -245,6 +320,7 @@ class TestIdleRestartWatcherEndToEnd:
         restarted: list = []
 
         monkeypatch.setattr(agent_app, "_daemon_runs_here", lambda: False)
+        monkeypatch.setattr(agent_app, "_host_has_live_interactive_session", lambda: False)
         monkeypatch.setattr(agent_update, "current_slot", lambda vd: tmp_path / "new-slot")
         monkeypatch.setattr(agent_update, "running_slot", lambda vd: tmp_path / "old-slot")
         monkeypatch.setattr(
@@ -281,6 +357,7 @@ class TestIdleRestartWatcherEndToEnd:
         restarted: list = []
 
         monkeypatch.setattr(agent_app, "_daemon_runs_here", lambda: True)
+        monkeypatch.setattr(agent_app, "_host_has_live_interactive_session", lambda: False)
         monkeypatch.setattr(agent_update, "current_slot", lambda vd: tmp_path / "new-slot")
         monkeypatch.setattr(agent_update, "running_slot", lambda vd: tmp_path / "old-slot")
 
@@ -293,6 +370,33 @@ class TestIdleRestartWatcherEndToEnd:
             watcher.stop()
             server.shutdown()
 
+    def test_no_restart_while_interactive_session_is_live(self, tmp_path, monkeypatch):
+        """#2139 blocking review fix, black-box shape: zero assignments is
+        not enough on its own — a live `coord-*` tmux session (operator
+        sitting in a Test/Review/Merge/Work pane whose backing assignment
+        record has already gone terminal) must veto the restart, however
+        long the debounce window is held."""
+        server, _ = _make_server(tmp_path)
+        restarted: list = []
+
+        monkeypatch.setattr(agent_app, "_daemon_runs_here", lambda: False)
+        monkeypatch.setattr(agent_app, "_host_has_live_interactive_session", lambda: True)
+        monkeypatch.setattr(agent_update, "current_slot", lambda vd: tmp_path / "new-slot")
+        monkeypatch.setattr(agent_update, "running_slot", lambda vd: tmp_path / "old-slot")
+        monkeypatch.setattr(
+            agent_update, "_smoke_check",
+            lambda slot, *, target_version: (True, "9.9.9", "ok"),
+        )
+
+        watcher = self._watcher(server, tmp_path, restarted)
+        watcher.start()
+        try:
+            time.sleep(0.6)
+            assert not restarted, "must not restart while a coord-* tmux session is live"
+        finally:
+            watcher.stop()
+            server.shutdown()
+
     def test_smoke_check_failure_does_not_restart(self, tmp_path, monkeypatch):
         """A staged slot that fails its (re-)smoke-check must never be
         exec'd into blindly."""
@@ -300,6 +404,7 @@ class TestIdleRestartWatcherEndToEnd:
         restarted: list = []
 
         monkeypatch.setattr(agent_app, "_daemon_runs_here", lambda: False)
+        monkeypatch.setattr(agent_app, "_host_has_live_interactive_session", lambda: False)
         monkeypatch.setattr(agent_update, "current_slot", lambda vd: tmp_path / "new-slot")
         monkeypatch.setattr(agent_update, "running_slot", lambda vd: tmp_path / "old-slot")
         monkeypatch.setattr(
@@ -315,6 +420,11 @@ class TestIdleRestartWatcherEndToEnd:
         finally:
             watcher.stop()
             server.shutdown()
+
+        last = json.loads((server.state_dir / "last_update.json").read_text())
+        assert last["result"] == "failed"
+        assert "idle self-restart" in last["mode"]
+        assert "boom" in (last["error"] or "")
 
 
 # ── build_app wiring ──────────────────────────────────────────────────────
