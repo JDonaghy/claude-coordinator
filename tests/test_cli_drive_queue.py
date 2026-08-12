@@ -33,6 +33,7 @@ from coord import state
 from coord.cli import main
 from coord.drive_queue import (
     DRIVE_STARTUP_GRACE_SECONDS,
+    PARK_STALE_SECONDS,
     QUEUE_ALERT_ISSUE,
     QUEUE_ALERT_REPO,
 )
@@ -1013,6 +1014,175 @@ def test_a_still_parked_entry_stays_parked_across_a_quiet_tick(
     assert entry["state"] == "parked"
     assert entry["attempts"] == 0
     assert len(launches) == 1, launches  # no second launch attempt
+
+
+# ── #2158: a park must have an exit that is not the merge it blocks ────────
+#
+# #1891's resume predicate was refreshable ONLY by a live `coord merge`
+# attempt — the raw `merge_queue.error` string above is written by
+# `merge_queue.process()` and by nothing else — and a parked entry by
+# definition runs none. So the predicate that RELEASES the park was refreshed
+# only by the action the park WITHHOLDS.
+#
+# claude-coordinator#2138, 2026-08-12 (UTC): CI run 31570947900 completed
+# green at 06:48:51; the park below was written at 06:49:32 quoting "CI
+# running: no-gh-on-path, test (3.13), test (3.12)"; the entry then held that
+# 41-second-stale reading for 7h25m over a fully satisfied gate, invisible in
+# every tick's output, until an unrelated merge happened to rewrite the board.
+# Both tests here are that entry — one per exit the fix gives it.
+
+
+@pytest.fixture
+def board_merge_plan(monkeypatch):
+    """Put a `merge_plan` section into the tick's `/board` payload.
+
+    This suite's lane is the standalone/local-DB one, which has none: the
+    plan is computed, not stored, so `_local_merge_queue_rows()` backfills the
+    raw table only (see its docstring). This stands in for the DAEMON lane,
+    where `GET /board` ships a `merge_plan[]` carrying `_entry_gate_status`'s
+    fresh re-derivation plus `summarize_counts`'s CI rollup on every build.
+
+    What it deliberately does NOT touch is `merge_queue.error` — that stays
+    exactly as the parking `coord merge` attempt left it, which is the whole
+    point: the entry must resume with no live merge having run in between.
+    """
+    from coord.drive_state import BoardFetcher
+
+    real_fetch = BoardFetcher.fetch
+    rows: list[dict] = []
+
+    def fetch_with_plan(self, *args, **kwargs):
+        payload = real_fetch(self, *args, **kwargs)
+        if isinstance(payload, dict):
+            payload = {**payload, "merge_plan": list(rows)}
+        return payload
+
+    monkeypatch.setattr(BoardFetcher, "fetch", fetch_with_plan, raising=True)
+
+    def _set(*plan_rows: dict) -> None:
+        rows[:] = list(plan_rows)
+
+    return _set
+
+
+def _plan_row(issue: int, *, reason=None, passed=0, failed=0, running=0) -> dict:
+    """One `/board` `merge_plan` row as `serve_app` ships it — `asdict` of a
+    `PlannedMerge`, so `ci_summary` is a nested `CiCheckSummary` dict."""
+    return {
+        "repo_name": REPO,
+        "issue_number": issue,
+        "reason": reason,
+        "ci_summary": {
+            "passed": passed,
+            "failed": failed,
+            "running": running,
+            "failed_names": [],
+            "first_failed_url": None,
+        },
+    }
+
+
+def _park(cli, seed, coord_db, issue: int = 2138) -> None:
+    """Drive a fresh entry all the way into `parked` on pending CI."""
+    seed(issues={issue: "open"})
+    cli("add", REPO, str(issue))
+    cli("tick")
+    _seed_ci_pending_merge_row(
+        coord_db,
+        issue,
+        reason="CI running: no-gh-on-path, test (3.13), test (3.12)",
+    )
+    _backdate(issue, DRIVE_STARTUP_GRACE_SECONDS + 60)
+    cli("tick")
+    assert queued(issue)["state"] == "parked"
+
+
+def test_a_parked_entry_resumes_when_the_boards_own_ci_rollup_reports_green(
+    cli, seed, launches, coord_db, board_merge_plan,
+):
+    """THE #2158 regression.
+
+    CI finishes and the board's next build sees it: the plan re-derives this
+    entry clean and its `ci_summary` shows all 8 checks green. The raw
+    `merge_queue.error` is UNCHANGED — no `coord merge` has run, and none can,
+    because the entry is parked. The very next `drive-queue tick` must resume
+    it anyway.
+    """
+    _park(cli, seed, coord_db)
+    assert len(launches) == 1, launches
+
+    # 06:48:51 — the run completes, all green. Nothing else happens: no
+    # operator, no merge, no other command. The raw row still says "CI
+    # running: ..." and will say so forever.
+    board_merge_plan(_plan_row(2138, reason=None, passed=8))
+    persisted = coord_db.execute(
+        "SELECT error FROM merge_queue WHERE issue_number = ?", (2138,)
+    ).fetchone()
+    assert persisted["error"].startswith("CI running:")
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    entry = queued(2138)
+    assert entry["state"] == "running"  # resumed straight into a fresh launch
+    assert entry["attempts"] == 0  # …and still free, per #1891
+    assert len(launches) == 2, launches
+
+    status = cli("status")
+    assert "parked" not in status.output
+
+
+def test_a_park_the_boards_rollup_still_calls_pending_does_not_hot_loop(
+    cli, seed, launches, coord_db, board_merge_plan,
+):
+    """The other half: CI genuinely still running is not evidence against the
+    park — it agrees with it. No resume, no relaunch, whatever the clock says
+    (this park is backdated 30h, far past `PARK_STALE_SECONDS`, and a reading
+    the board re-derives every build is never stale)."""
+    _park(cli, seed, coord_db)
+    board_merge_plan(_plan_row(2138, reason="CI running: test (3.12)", running=1))
+    _backdate_reason(coord_db, 2138, 30 * 3600)
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    assert queued(2138)["state"] == "parked"
+    assert len(launches) == 1, launches
+    assert "1 parked" in cli("status").output
+
+
+def test_a_park_that_can_never_refresh_itself_ages_out_and_relaunches(
+    cli, seed, launches, coord_db,
+):
+    """The second exit, for the lane where no rollup can ever arrive.
+
+    No `merge_plan` section at all — the daemon-host tick, this suite's own
+    default lane. The reading holding this park has no read-path writer in
+    existence, so past `PARK_STALE_SECONDS` the tick stops believing it rather
+    than holding a possibly-mergeable entry forever.
+    """
+    _park(cli, seed, coord_db)
+    _backdate_reason(coord_db, 2138, PARK_STALE_SECONDS + 60)
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    assert "#2158" in result.output
+    entry = queued(2138)
+    assert entry["state"] == "running"
+    assert entry["attempts"] == 0  # ageing out spends nothing either
+    assert len(launches) == 2, launches
+
+
+def test_a_park_younger_than_the_ceiling_is_left_alone(
+    cli, seed, launches, coord_db,
+):
+    """The ceiling is a backstop, not a second CI timeout — a park inside it
+    behaves exactly as it did before #2158."""
+    _park(cli, seed, coord_db)
+    _backdate_reason(coord_db, 2138, PARK_STALE_SECONDS - 120)
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    assert queued(2138)["state"] == "parked"
+    assert len(launches) == 1, launches
 
 
 def test_a_repeatedly_dead_drive_still_reaches_blocked_and_escalates(
