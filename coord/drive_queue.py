@@ -98,6 +98,38 @@ TERMINAL_QUEUE_STATES: frozenset[str] = frozenset(
     {STATE_DONE, STATE_BLOCKED, STATE_FAILED}
 )
 
+# #2158: how long a `parked` entry may hold a CI reading that CANNOT refresh
+# itself before the tick stops believing it and resumes the entry to
+# `waiting`.
+#
+# Only unrefreshable readings age out — `IssueFacts.merge_ci_pending_live`
+# is the discriminator. A park founded on the live `merge_plan` row's own
+# reason is re-derived on every board build and goes false by itself the
+# moment CI reports; that one is held for as long as it keeps saying so, with
+# no ceiling. A park founded ONLY on the raw `merge_queue` row's persisted
+# `error` has no read-path writer at all: that string is written by a live
+# `coord merge` attempt and by nothing else, and a parked entry by definition
+# runs none. Left alone it is a permanent verdict — claude-coordinator#2138
+# sat parked 7h25m on CI that had been green since 41 seconds BEFORE the park
+# was written, and only moved when an unrelated merge happened to rewrite the
+# board.
+#
+# Failing OPEN after the ceiling is the safe direction. Resuming spends no
+# attempt (that is #1891's whole design point) and asserts nothing about CI —
+# it just returns the entry to the walk, which re-checks every gate it owns.
+# If CI really is still running, the relaunched drive observes that and waits
+# on it exactly as the original one did, and the worst case is one relaunch
+# per ceiling-length. The opposite failure — trusting a frozen string forever
+# — costs an entry that is mergeable NOW and has no other actor: `coord merge`
+# does not run itself (`merge.auto_drain` is off by design since the
+# 2026-06-07 token-burn incident) and the drive that could have merged it has
+# already exited.
+#
+# 45 minutes is several times the ~10-minute CI runtime on this fleet, so a
+# genuinely-pending park is never cut short in practice; it is a backstop for
+# the unrefreshable case, not a second CI timeout.
+PARK_STALE_SECONDS = 45 * 60.0
+
 # ── deploy-gate states (#1757) ───────────────────────────────────────────────
 #
 # `hold_state` is the gate's LIFECYCLE, orthogonal to the entry's queue
@@ -447,6 +479,24 @@ class IssueFacts:
     # the SAME text an operator would see on `IssueState.merge_reason`
     # instead of a generic synthesised sentence.
     merge_ci_pending_reason: str = ""
+    # #2158: PROVENANCE of `merge_ci_pending` — `True` when it came from the
+    # live `merge_plan` row's own reason (a fresh re-derivation performed at
+    # board-render time, every board build), `False` when the ONLY witness
+    # was the raw `merge_queue` row's persisted `error`.
+    #
+    # That distinction is the whole of #2158. The raw `error` is written by a
+    # live `coord merge` attempt and by nothing else — so for a `parked`
+    # entry, which by construction runs no merge, it is frozen at the very
+    # attempt that parked it. The predicate that releases the park was
+    # refreshed only by the action the park withholds, and an entry could sit
+    # parked for hours (7h25m on claude-coordinator#2138, 2026-08-12) citing
+    # CI that finished 41 seconds before the park was even written.
+    #
+    # A `True` reading is self-refreshing and can be trusted indefinitely: the
+    # next board build re-derives it and it goes false the moment CI reports.
+    # A `False` reading cannot refresh itself at all, so `plan_tick` ages it
+    # out (:data:`PARK_STALE_SECONDS`) rather than trusting it forever.
+    merge_ci_pending_live: bool = False
 
     @property
     def open(self) -> bool:
@@ -477,6 +527,32 @@ class BoardView:
 
     def facts(self, key: str) -> IssueFacts:
         return self.issues.get(key, IssueFacts())
+
+
+def _ci_rollup_all_clear(summary: Any) -> bool:
+    """``True`` when a ``merge_plan`` row's ``ci_summary`` positively shows
+    every check on that PR has finished and none of them failed (#2158).
+
+    *summary* is the wire form of :class:`coord.ci_store.CiCheckSummary` —
+    ``asdict``'d into the ``/board`` payload by ``serve_app`` — or ``None``
+    (no PR, no ``ci_store``, or a gate snapshot that has not fetched this PR
+    yet).  Anything that is not a readable rollup, or a rollup with nothing
+    in it at all, returns ``False``: the caller uses this as evidence AGAINST
+    a persisted "CI running:" reading, and absence of a rollup is not
+    evidence.  ``passed > 0`` (rather than ``passed + failed > 0``) with
+    ``failed == 0`` is the same "all green" reading
+    ``coord.merge_queue._entry_gate_status`` arrives at when it returns
+    ``PLAN_READY``.
+    """
+    if not isinstance(summary, Mapping):
+        return False
+    try:
+        passed = int(summary.get("passed") or 0)
+        failed = int(summary.get("failed") or 0)
+        running = int(summary.get("running") or 0)
+    except (TypeError, ValueError):  # a malformed rollup is not evidence
+        return False
+    return running == 0 and failed == 0 and passed > 0
 
 
 def build_board_view(
@@ -529,13 +605,13 @@ def build_board_view(
     # dict up front the way every other fact in this function already does.
     # See `coord.merge_queue.CI_PENDING_PREFIX`'s docstring for why the raw
     # row is a required second read, not a belt-and-braces extra one.
-    plan_reasons: dict[str, str] = {}
+    plan_rows: dict[str, Mapping[str, Any]] = {}
     for row in payload.get("merge_plan") or []:
         repo = row.get("repo_name") or ""
         number = row.get("issue_number")
         if not repo or number is None:
             continue
-        plan_reasons[entry_key(repo, int(number))] = str(row.get("reason") or "")
+        plan_rows[entry_key(repo, int(number))] = row
 
     for row in payload.get("merge_queue") or []:
         repo = row.get("repo_name") or ""
@@ -543,7 +619,8 @@ def build_board_view(
         if not repo or number is None:
             continue
         key = entry_key(repo, int(number))
-        plan_reason = plan_reasons.get(key) or ""
+        plan_row = plan_rows.get(key)
+        plan_reason = str((plan_row or {}).get("reason") or "")
         raw_reason = str(row.get("error") or "")
         reason = plan_reason or raw_reason
         # #1892: same recovery `drive_state._merge_entry` applies — the
@@ -557,10 +634,41 @@ def build_board_view(
         # otherwise a verdictless failure would never park here at all.
         if is_ci_infra_reason(raw_reason) and not is_ci_infra_reason(plan_reason):
             reason = raw_reason
-        if is_ci_pending_reason(reason) or is_ci_infra_reason(reason):
-            got = slot(key)
-            got["merge_ci_pending"] = True
-            got["merge_ci_pending_reason"] = reason
+        if not (is_ci_pending_reason(reason) or is_ci_infra_reason(reason)):
+            continue
+        # #2158: the same plan row that came back with NO reason of its own
+        # also carries `ci_summary` — `summarize_counts` over the very checks
+        # `_entry_gate_status` just consulted, on the same board build. When
+        # that rollup positively shows every check finished and none failed,
+        # it is direct evidence AGAINST the raw row's frozen "CI running:" /
+        # "CI infra:" string, which no read path ever rewrites. Believing the
+        # write-path string over it is what wedged claude-coordinator#2138
+        # parked for 7h25m on CI that had gone green 41s before the park was
+        # written.
+        #
+        # The override is deliberately POSITIVE-evidence-only, and only where
+        # the plan itself is silent:
+        #
+        # * a non-empty `plan_reason` means the live gate still objects — it
+        #   wins outright, untouched (this branch never runs);
+        # * absence of a rollup (no `merge_plan` section at all — the
+        #   daemon-host tick, see `_local_merge_queue_rows`; no `ci_store`;
+        #   no PR; a gate snapshot that has not yet fetched this PR) is NOT
+        #   evidence of anything, so the #1891 fallback stands unchanged and
+        #   the entry still parks. That fail-closed half is what
+        #   `PARK_STALE_SECONDS` ages out instead — see `plan_tick`.
+        #
+        # `failed == 0` is required as well as `running == 0`: a still-failing
+        # check means the CI_INFRA_PREFIX classification the raw row carries
+        # may well still be the true reading of that failure (the plan can
+        # never re-derive it — #1892), so a rollup showing red is not evidence
+        # the infra park has cleared.
+        if not plan_reason and _ci_rollup_all_clear((plan_row or {}).get("ci_summary")):
+            continue
+        got = slot(key)
+        got["merge_ci_pending"] = True
+        got["merge_ci_pending_reason"] = reason
+        got["merge_ci_pending_live"] = bool(plan_reason)
 
     sessions: set[str] = set()
     for item in live_sessions:
@@ -965,6 +1073,54 @@ def _startup_age(entry: QueueEntry, now: float | None) -> float | None:
         return None
     age = now - entry.launched_at
     return age if age >= 0.0 else None
+
+
+def _park_reading_age(entry: QueueEntry, now: float | None) -> float | None:
+    """Seconds since *entry*'s park reason was written, or ``None`` when
+    unknowable (#2158).
+
+    ``reason_at`` is #2133's capture stamp, written by
+    ``coord.state._update_drive_queue_entry_local`` on every ``last_reason``
+    write — so for a ``parked`` entry, which by construction gets no further
+    writes while the gate stays shut, it is exactly the moment the park was
+    recorded.
+
+    ``None`` for the same three cases :func:`_startup_age` returns ``None``
+    for, and for the same reason — an unmeasurable age must degrade to
+    today's behaviour (hold the park), never to a park that expires by
+    accident: no clock was passed, the row predates the ``reason_at``
+    migration (or its ``last_reason`` is still ``''``), or the stamp is in the
+    future because a clock jumped backwards.
+    """
+    if now is None or entry.reason_at is None:
+        return None
+    age = now - entry.reason_at
+    return age if age >= 0.0 else None
+
+
+def _park_reading_expired(
+    entry: QueueEntry, facts: IssueFacts, now: float | None
+) -> float | None:
+    """The park's age when its CI reading has BOTH gone stale and no way to
+    refresh itself, else ``None`` (#2158).
+
+    Two conditions, both required:
+
+    * ``not facts.merge_ci_pending_live`` — the reading came only from the raw
+      ``merge_queue`` row's persisted ``error``, which no read path rewrites.
+      A live ``merge_plan`` reason re-derives itself on every board build and
+      is therefore never stale; it is held with no ceiling.
+    * the reading is older than :data:`PARK_STALE_SECONDS`.
+
+    Returns the age (not a bare bool) so the caller can put the real number in
+    the resume reason — same convention as :func:`_startup_cooldown`.
+    """
+    if not facts.merge_ci_pending or facts.merge_ci_pending_live:
+        return None
+    age = _park_reading_age(entry, now)
+    if age is None or age < PARK_STALE_SECONDS:
+        return None
+    return age
 
 
 def _startup_cooldown(
@@ -1804,7 +1960,15 @@ def plan_tick(
             # relaunch a gave-up entry outside the `blocked`/`failed`
             # attempt-tracking this function's docstring describes (#2055).
             continue
-        if facts.merge_ci_pending:
+        # #2158: a park whose CI reading can still refresh itself is held for
+        # as long as it keeps saying so. One that CANNOT — the reading came
+        # only from the raw `merge_queue` row's frozen `error`, which is
+        # written by a live `coord merge` attempt and by nothing else, and a
+        # parked entry runs none — expires, because otherwise the predicate
+        # that releases the park is refreshed only by the action the park
+        # withholds. See `PARK_STALE_SECONDS`.
+        park_expired = _park_reading_expired(entry, facts, now)
+        if facts.merge_ci_pending and park_expired is None:
             continue
         # #2063: a Gate-A park is gated on a HUMAN, not on the board, so the
         # `merge_ci_pending` predicate above says nothing about it. Without
@@ -1833,10 +1997,23 @@ def plan_tick(
             )
             states[entry.key] = STATE_WAITING
             continue
-        reason = (
-            f"CI checks for {entry.key} have reported — resuming from "
-            "parked without spending an attempt (#1891)"
-        )
+        if park_expired is not None:
+            # Deliberately does NOT claim CI has reported — nothing here knows
+            # that. It says only that the reading this park rests on has no
+            # writer left and has aged past the point of being worth
+            # believing, which is a different (and honest) fact (#2158).
+            reason = (
+                f"park reason for {entry.key} has not been refreshable for "
+                f"{park_expired / 60:.0f}m ({facts.merge_ci_pending_reason or 'CI'} "
+                "— written by a merge attempt, and a parked entry runs none) "
+                "— re-evaluating from waiting without spending an attempt "
+                "(#2158)"
+            )
+        else:
+            reason = (
+                f"CI checks for {entry.key} have reported — resuming from "
+                "parked without spending an attempt (#1891)"
+            )
         reconciles.append(
             Reconcile(
                 entry.key,
