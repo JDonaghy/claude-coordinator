@@ -275,30 +275,61 @@ def test_a_pinned_running_entry_is_attributed_to_its_worker_machine():
     assert q.rollable_hosts(["dellserver", "elitebook"]) == ["dellserver", "elitebook"]
 
 
-def test_an_unpinned_running_entry_falls_back_to_its_launch_host():
-    """No `--machine` pin: the real worker machine was auto-picked and is
-    knowable only from the live assignment row (a busy signal in its own
-    right). `launch_host` is the only host this row can name, so it stays the
-    fallback rather than the row becoming unattributable."""
+def test_an_unpinned_running_entry_is_attributed_to_its_live_assignment_host():
+    """#2138: no `--machine` pin, and NO production entry ever sets one — so
+    this is the shape that actually ships. `launch_host` is always the timer
+    host (the daemon), which is exactly the reading #2101 removed for the
+    pinned case; falling back to it here silently reopens the same bug via
+    the unpinned path. The real worker machine is knowable from the live
+    assignment row for the SAME issue, so that is what gets charged instead
+    — and the launch/daemon host is NOT charged at all.
+
+    This is quadraui#494's exact measured shape from the incident: worker on
+    elitebook, `launch_host` dellserver (the daemon)."""
     q = rp.assess_quiescence(
         queue_entries=[
-            {"repo_name": "r", "issue_number": 1, "state": STATE_RUNNING,
+            {"repo_name": "quadraui", "issue_number": 494, "state": STATE_RUNNING,
              "launch_host": "dellserver"},
         ],
+        assignments=[
+            {"repo_name": "quadraui", "issue_number": 494, "machine_name": "elitebook",
+             "status": "RUNNING"},
+        ],
     )
-    assert q.busy[0].host == "dellserver"
+    hosts = {b.host for b in q.busy}
+    assert "elitebook" in hosts
+    assert "dellserver" not in hosts
 
 
 def test_a_running_entry_with_no_recorded_host_is_unattributable():
     """Neither `launch_host` nor `machine` present — a legacy or hand-edited
-    row. This must NOT be silently dropped from consideration; it has to
-    block every host, since there is no way to know which one it actually
-    occupies."""
+    row, and no live assignment to resolve it from either. This must NOT be
+    silently dropped from consideration; it has to block every host, since
+    there is no way to know which one it actually occupies."""
     q = rp.assess_quiescence(
         queue_entries=[{"repo_name": "r", "issue_number": 1, "state": STATE_RUNNING}],
     )
     assert q.busy[0].host is None
     assert q.fleet_wide_busy == q.busy
+
+
+def test_an_unpinned_entry_between_legs_is_unattributable_not_launch_host():
+    """The genuine edge case #2138 names explicitly: a `running` row with no
+    live assignment for its issue right now (between legs — the previous
+    assignment closed out, the next has not landed) has no host this can
+    name. That must NOT silently resolve to `launch_host` (the daemon) —
+    the chosen semantics are the safe ones: unattributable, blocking every
+    host, exactly like a row with neither field recorded at all."""
+    q = rp.assess_quiescence(
+        queue_entries=[
+            {"repo_name": "r", "issue_number": 1, "state": STATE_RUNNING,
+             "launch_host": "dellserver"},
+        ],
+        assignments=[],
+    )
+    assert q.busy[0].host is None
+    assert q.fleet_wide_busy == q.busy
+    assert q.rollable_hosts(["dellserver", "elitebook"]) == []
 
 
 def test_a_live_assignment_is_attributed_to_its_machine():
@@ -311,16 +342,39 @@ def test_a_live_assignment_is_attributed_to_its_machine():
 
 def test_rollable_hosts_excludes_only_the_occupied_ones():
     """The whole point: three hosts busy on three different machines is not
-    a reason to roll none of the OTHER machines."""
+    a reason to roll none of the OTHER machines. The queue entry is unpinned
+    and its `launch_host` (dellserver) is resolved away by its live
+    assignment on precision — dellserver stays free."""
     q = rp.assess_quiescence(
         queue_entries=[
             {"repo_name": "a", "issue_number": 1, "state": STATE_RUNNING,
              "launch_host": "dellserver"},
         ],
-        assignments=[{"machine_name": "precision", "issue_number": 634,
+        assignments=[{"repo_name": "a", "issue_number": 1, "machine_name": "precision",
                       "status": "RUNNING"}],
     )
-    assert q.rollable_hosts(["precision", "dellserver", "elitebook"]) == ["elitebook"]
+    assert q.rollable_hosts(["precision", "dellserver", "elitebook"]) == ["dellserver", "elitebook"]
+
+
+def test_2026_08_12_tonights_shape_daemon_rolls_when_its_own_worker_is_elsewhere():
+    """#2138 acceptance: one unpinned running entry whose worker is on host A
+    (elitebook), launched from daemon host D (dellserver), plus a third idle
+    host (precision) with nothing against it at all. A propagate run must
+    roll every host that is not A — including D, since D itself has no live
+    assignment despite hosting the launch/observer session."""
+    q = rp.assess_quiescence(
+        queue_entries=[
+            {"repo_name": "quadraui", "issue_number": 494, "state": STATE_RUNNING,
+             "launch_host": "dellserver"},
+        ],
+        assignments=[
+            {"repo_name": "quadraui", "issue_number": 494, "machine_name": "elitebook",
+             "status": "RUNNING"},
+        ],
+    )
+    assert q.rollable_hosts(["dellserver", "elitebook", "precision"]) == [
+        "dellserver", "precision",
+    ]
 
 
 def test_rollable_hosts_is_empty_when_a_signal_cannot_be_pinned_to_a_host():

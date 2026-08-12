@@ -63,10 +63,11 @@ stay all-or-nothing — see below). A caller that wants to roll a
 partially-busy fleet uses :meth:`Quiescence.rollable_hosts` instead: a host
 with no busy signal against it is free to roll *now*, independent of
 whatever else is running elsewhere. A signal that cannot be pinned to one
-host (the board itself unreadable, a drive-queue row with no recorded
-``launch_host``) is the one thing that still has to block everything —
-see :attr:`Quiescence.fleet_wide_busy` — because there is no way to tell
-"busy everywhere" apart from "busy on some host we can't name".
+host (the board itself unreadable, a running drive-queue row with neither a
+``--machine`` pin nor a live assignment for its issue — see
+:func:`busy_host_for_entry`) is the one thing that still has to block
+everything — see :attr:`Quiescence.fleet_wide_busy` — because there is no
+way to tell "busy everywhere" apart from "busy on some host we can't name".
 
 Per-host quiescence does not repeal the daemon-leads invariant below: if
 the daemon host itself is occupied (and not already on the target), no
@@ -620,8 +621,32 @@ def _queue_key(entry: Mapping[str, Any]) -> str:
     return "?"
 
 
-def busy_host_for_entry(entry: Mapping[str, Any]) -> str | None:
-    """Which host a ``running`` drive-queue row actually occupies (#2101).
+def _live_assignment_hosts(assignments: Iterable[Mapping[str, Any]]) -> dict[str, str]:
+    """``repo#issue`` → machine, for every currently-live assignment row.
+
+    The lookup :func:`busy_host_for_entry` needs to resolve an *unpinned*
+    running queue entry's real worker host (#2138), built once per
+    :func:`assess_quiescence` call rather than re-scanned per entry. Keyed
+    the same way :func:`_queue_key` renders a queue row, so the two are
+    directly comparable.
+    """
+    hosts: dict[str, str] = {}
+    for row in assignments:
+        status = str(row.get("status") or "").upper()
+        if status not in LIVE_ASSIGNMENT_STATUSES:
+            continue
+        machine = str(row.get("machine_name") or row.get("machine") or "") or None
+        if not machine:
+            continue
+        hosts[_queue_key(row)] = machine
+    return hosts
+
+
+def busy_host_for_entry(
+    entry: Mapping[str, Any],
+    live_assignment_hosts: Mapping[str, str] | None = None,
+) -> str | None:
+    """Which host a ``running`` drive-queue row actually occupies (#2101, #2138).
 
     #2067 attributed this to ``launch_host`` (#1870) — the host whose tick
     launched the session — falling back to ``machine``. Measured on
@@ -635,22 +660,46 @@ def busy_host_for_entry(entry: Mapping[str, Any]) -> str | None:
 
     Net effect: **any drive anywhere pinned the entire fleet from rolling**,
     which is fact 2 of #2101 and half of why the fleet sat eleven releases
-    behind. So the precedence is inverted: an entry pinned with ``--machine``
-    is charged to the machine that will actually run the WORKER, because the
+    behind. #2101 inverted the precedence for a ``--machine``-pinned entry —
+    charged to the machine that will actually run the WORKER, because the
     worker is what an agent restart destroys (``coord/agent_app.py``'s
     ``/update`` refuses a host with live assignments for exactly that reason).
     The launch host merely hosts an observer tmux session, and #2101's cordon
     is what protects *it*: no new drive is launched onto a cordoned host at
     all, so nothing new starts there while it waits to roll.
 
-    ``launch_host`` remains the fallback for an unpinned (auto-picked) entry,
-    whose real worker machine is knowable only from the live assignment row —
-    and that row is a busy signal in its own right, attributed correctly, a
-    few lines below. Neither field present means the signal cannot be pinned
-    to a host at all and must block every host rather than none — see
-    :attr:`Quiescence.fleet_wide_busy`.
+    #2101 left the unpinned case reading ``launch_host`` — and measured
+    2026-08-12, NO production queue entry sets ``machine`` at all, so
+    *every* real entry hit that fallback. Since ``launch_host`` is always the
+    timer host, i.e. the daemon host, this was the exact reading #2101 set
+    out to remove, just reached by the unpinned path instead of the pinned
+    one: one drive anywhere (any repo, any worker) still pinned the daemon
+    "busy" and, via the daemon-first rule, deferred the whole fleet (#2138).
+
+    So for an unpinned entry this now resolves the real worker host from the
+    live assignment row for the SAME issue (``live_assignment_hosts``, built
+    by :func:`_live_assignment_hosts` from the same ``assignments`` read) —
+    the one place the auto-picked worker machine is actually recorded. That
+    row is a busy signal in its own right, attributed correctly, a few lines
+    below in :func:`assess_quiescence`; this just reuses its host instead of
+    inventing a second, wrong one. The launch host is never charged for an
+    unpinned entry: it hosts an observer tmux session an agent restart does
+    not destroy, and #2101's cordon already keeps new drives off it while it
+    waits to roll.
+
+    A ``running`` row with no live assignment for its issue — between legs,
+    where the previous leg's assignment has closed out and the next has not
+    landed yet — has no host this function can name. That is deliberately
+    NOT read as "free": the real worker is momentarily unknowable, not
+    provably elsewhere, so it must block every host exactly like a row with
+    neither field recorded — see :attr:`Quiescence.fleet_wide_busy`.
     """
-    return str(entry.get("machine") or entry.get("launch_host") or "") or None
+    machine = str(entry.get("machine") or "") or None
+    if machine:
+        return machine
+    if live_assignment_hosts:
+        return live_assignment_hosts.get(_queue_key(entry))
+    return None
 
 
 def assess_quiescence(
@@ -698,6 +747,7 @@ def assess_quiescence(
     assignments = list(assignments)
     issues = list(issues)
     board = build_board_view({"assignments": assignments, "issues": issues})
+    live_assignment_hosts = _live_assignment_hosts(assignments)
 
     busy: list[Busy] = []
     fired: list[str] = []
@@ -713,7 +763,7 @@ def assess_quiescence(
                 # says. Not busy — and not silently dropped either.
                 stale.append(key)
             else:
-                host = busy_host_for_entry(entry)
+                host = busy_host_for_entry(entry, live_assignment_hosts)
                 busy.append(
                     Busy(
                         kind="drive-queue entry running",
