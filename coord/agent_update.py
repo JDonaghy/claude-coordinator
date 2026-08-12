@@ -184,6 +184,23 @@ def _slot_backing_interpreter(venv_dir: Path, interpreter: Path) -> Path | None:
     return None
 
 
+def running_slot(venv_dir: Path) -> Path | None:
+    """Public wrapper: which blue/green slot is *this process* — the one
+    calling this function, via its own ``sys.executable`` — actually
+    running from (#2139).
+
+    Exists so callers outside this module (the idle self-restart watcher in
+    :mod:`coord.agent_app`) can ask the same question
+    :func:`_slot_backing_interpreter` already answers for
+    :func:`perform_update`'s own #2140 guard, without reaching into a
+    private helper. Compare the result against :func:`current_slot`: equal
+    means this process is already running the slot the symlink points at;
+    different means a swap landed since this process started and it has a
+    newer (or at least *other*) generation staged and waiting.
+    """
+    return _slot_backing_interpreter(venv_dir, Path(sys.executable))
+
+
 def _atomic_swap(venv_dir: Path, new_slot: Path) -> None:
     """Flip *venv_dir* to point at *new_slot* in one filesystem operation.
 

@@ -237,12 +237,17 @@ class TestUpdateEndpoint:
         assert last["result"] == "refused"
         server.shutdown()
 
-    def test_update_refuses_when_active_assignments_without_force(
+    def test_update_stages_but_defers_restart_with_active_assignments(
         self, tmp_path: Path
     ) -> None:
-        """#1241 requirement 3: live sessions block an update unless forced —
-        the same 'never restart during live sessions' operator rule
-        `/restart` already documents, enforced here too."""
+        """#2139: live sessions no longer block the SWAP — only the restart.
+
+        The swap never disturbs a running worker (its interpreter stays
+        pinned to whatever slot it started from), so it proceeds regardless
+        of active assignments; `exec_restart` is what would actually kill
+        them, and that's what stays deferred — to the idle self-restart
+        watcher, not to this request — until `{"force": true}` says
+        otherwise."""
         repo = _init_repo(tmp_path / "repo")
         server = AgentServer(
             machine_name="test",
@@ -266,16 +271,20 @@ class TestUpdateEndpoint:
 
         with (
             patch("coord.agent_app._detect_install_mode", return_value=(False, None)),
-            patch("coord.agent_app.agent_update.perform_update") as mock_perform,
+            patch("coord.agent_app._installed_version", return_value="0.3.0"),
+            patch(
+                "coord.agent_app.agent_update.perform_update",
+                return_value=UpdateResult(ok=True, swapped=True, new_version="0.4.0"),
+            ) as mock_perform,
         ):
             r = client.post("/update")
+            assert r.status_code == 202
+            last = _wait_for_last_update(server)
 
-        assert r.status_code == 409
-        body = r.json()
-        assert body["result"] == "refused"
-        assert "active assignment" in body["error"]
-        mock_perform.assert_not_called()
-        assert not restarted
+        assert last["result"] == "staged"
+        assert "active assignment" in last["error"]
+        mock_perform.assert_called_once()
+        assert not restarted, "swap staged with live work must not restart"
         server.shutdown(kill_running=True)
 
     def test_update_force_bypasses_active_assignment_guard(self, tmp_path: Path) -> None:
