@@ -440,6 +440,223 @@ def _detect_install_mode() -> tuple[bool, str | None]:
         return False, None
 
 
+# ── Idle self-restart (#2139) ────────────────────────────────────────────
+#
+# #1241 made `coord agent update` atomic and reversible but left "when does
+# the running process actually pick up a staged swap" to an external actor
+# that has to find a fleet-wide quiescent window — and a working overnight
+# queue keeps a host busy essentially always, so that window stopped
+# opening in practice (18 consecutive deferred `coord release propagate`
+# attempts on 2026-08-11). This section is the missing trigger: each agent
+# watches its OWN active-assignment count and, the moment it — and only
+# it — has none, re-execs onto whatever slot `~/.coord-venv` already
+# resolves to. No board read, no fleet-wide window, no coordination with
+# any other host: the whole point is that this is a decision one process
+# can make about itself.
+
+#: How often the watcher below re-checks "am I idle, and is a newer slot
+#: staged". Overridable for tests — production leaves this at its default.
+IDLE_RESTART_POLL_SECONDS = float(os.environ.get("COORD_AGENT_IDLE_RESTART_POLL") or 5.0)
+
+#: How long zero active (RUNNING/PENDING) assignments must hold
+#: *continuously* before the watcher actually restarts — the debounce the
+#: design calls for: a host that clears one leg and picks up the next a
+#: moment later must not restart out from under it, and this must never
+#: preempt a dispatch that has already been accepted (a PENDING assignment
+#: counts as active, same as RUNNING). Overridable for tests.
+IDLE_RESTART_DEBOUNCE_SECONDS = float(os.environ.get("COORD_AGENT_IDLE_RESTART_DEBOUNCE") or 20.0)
+
+
+def _daemon_runs_here() -> bool:
+    """True if `coord-serve` — the daemon every `coord` caller talks to —
+    is also a systemd unit on THIS host, or if that can't be determined.
+
+    The daemon-first invariant (`commands/release.py:640`'s documented
+    405: a caller must never reach an endpoint its daemon predates) is what
+    keeps a self-restarting agent from overtaking the daemon it calls. On a
+    host that does NOT run coord-serve, that invariant already holds
+    structurally, with no extra check needed here: `release_propagate.
+    plan_lanes` puts the daemon host's python lane first, and
+    `commands/release.py`'s `daemon_python_failed` gate refuses to roll ANY
+    other host until the daemon is confirmed on the target version — so by
+    the time a non-daemon host's OWN slot ever advances, the daemon has
+    already gone. The one case that invariant does NOT cover on its own is
+    a host that runs coord-agent and coord-serve side by side, sharing one
+    `~/.coord-venv`: `/update` there swaps the shared venv and restarts
+    coord-agent, but coord-serve keeps running the old slot until a
+    separate `/restart-services` call catches it up (#2069) — a coord-agent
+    that self-restarted in between would be a newer caller than the
+    coord-serve sitting right next to it. So: restrict this watcher to the
+    agent lane by simply never firing on a host where coord-serve is
+    present, and leave that host on the existing ordered
+    `/update`+`/restart-services` path (`commands/release.py`'s
+    `_roll_python`) instead. Purely local — `running_unit_pids` is the same
+    systemd query `/restart-services` already makes against THIS host, no
+    network call leaves it.
+
+    Errs toward "yes, treat as the daemon host" (i.e. stay quiet) whenever
+    the answer can't be determined at all (no systemd here — a dev box, a
+    container, a thin client) — a host this can't confirm is safe on is one
+    the existing ordered path should keep handling.
+    """
+    if not _running_under_systemd():
+        return True
+    try:
+        from coord.health.checks.spawned_coord import running_unit_pids  # noqa: PLC0415
+
+        return bool(running_unit_pids(("coord-serve",)))
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _idle_restart_target(server: "AgentServer", venv_dir: Path) -> Path | None:
+    """Return the slot the idle watcher should restart onto right now, or
+    ``None`` if it should not act.
+
+    A small, pure(ish) decision function — every branch below is a single
+    fact read fresh (no state of its own), so the debounce/threading
+    concerns in :class:`_IdleRestartWatcher` stay entirely in that class and
+    this stays trivially unit-testable without spinning a real thread.
+
+    Ordered cheapest-first on purpose: this runs on every poll tick
+    (default every 5s, for the life of the process), and :func:`_daemon_runs_here`
+    is the one check here that shells out (`systemctl --user show`). Every
+    other check is a path comparison or an in-memory lock/iteration, so
+    those run first and only pay for the subprocess call on the tick that
+    would otherwise actually restart.
+    """
+    live = agent_update.current_slot(venv_dir)
+    if live is None:
+        # Not a migrated blue/green venv (or it doesn't exist) — nothing to
+        # restart onto.
+        return None
+    running = agent_update.running_slot(venv_dir)
+    if running is None or running == live:
+        # Either this isn't a blue/green interpreter at all (dev/editable),
+        # or it's already running the slot the symlink points at — no swap
+        # is waiting.
+        return None
+    with server._lock:
+        active_count = sum(
+            1 for a in server._assignments.values() if a.status in (PENDING, RUNNING)
+        )
+    if active_count:
+        return None
+    if _daemon_runs_here():
+        return None
+    return live
+
+
+class _IdleRestartWatcher:
+    """Background poll loop implementing #2139's trigger.
+
+    Runs for the life of the agent process, polling
+    :func:`_idle_restart_target` every ``poll_seconds``. Once it returns a
+    non-``None`` slot for ``debounce_seconds`` *continuously* — not merely
+    on one poll — this restarts the process onto it via ``exec_restart``,
+    the same callable `/update`/`/restart`/`/rollback` already use (so
+    tests inject the same no-op/mock they always have, and production gets
+    the same systemd-aware `_default_exec_restart`).
+
+    Any poll that finds the agent busy, or the slot unchanged, resets the
+    debounce clock to "not idle yet" — there is no partial credit for a
+    host that flickers between busy and idle.
+    """
+
+    def __init__(
+        self,
+        server: "AgentServer",
+        *,
+        venv_dir: Path,
+        exec_restart: "Callable[[list[str]], None]",
+        poll_seconds: float | None = None,
+        debounce_seconds: float | None = None,
+    ) -> None:
+        self._server = server
+        self._venv_dir = venv_dir
+        self._exec_restart = exec_restart
+        self._poll_seconds = (
+            IDLE_RESTART_POLL_SECONDS if poll_seconds is None else poll_seconds
+        )
+        self._debounce_seconds = (
+            IDLE_RESTART_DEBOUNCE_SECONDS if debounce_seconds is None else debounce_seconds
+        )
+        self._stop = threading.Event()
+        self._idle_since: float | None = None
+        self._thread = threading.Thread(
+            target=self._run, name="agent-idle-restart", daemon=True
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stop polling. Does not interrupt a restart already in flight —
+        by the time that happens ``exec_restart`` has already replaced (or
+        is about to exit) this process, so there is nothing left to stop."""
+        self._stop.set()
+
+    def _run(self) -> None:
+        # `Event.wait` doubles as the sleep AND the stop signal, so `stop()`
+        # takes effect within one tick instead of up to `poll_seconds` late.
+        while not self._stop.wait(self._poll_seconds):
+            try:
+                self._tick()
+            except Exception:  # noqa: BLE001
+                _log.exception("idle self-restart watcher tick failed")
+
+    def _tick(self) -> None:
+        target = _idle_restart_target(self._server, self._venv_dir)
+        if target is None:
+            self._idle_since = None
+            return
+        now = time.time()
+        if self._idle_since is None:
+            self._idle_since = now
+        if now - self._idle_since < self._debounce_seconds:
+            return
+        self._restart_onto(target)
+
+    def _restart_onto(self, target: Path) -> None:
+        version_before = _installed_version() or "unknown"
+        # Re-confirm the target slot is actually a good one right before
+        # acting — it was smoke-checked once already, back when `/update`
+        # swapped it in, but re-checking here costs one subprocess call and
+        # means a slot that somehow went bad after the swap (disk issue,
+        # someone hand-editing `~/.coord-venv.*`) is refused instead of
+        # exec'd into blindly.
+        ok, new_version, log = agent_update._smoke_check(target, target_version=None)
+        if not ok:
+            _log.error(
+                "idle self-restart: smoke check failed for staged slot %s — "
+                "not restarting; will retry next debounce window.\n%s",
+                target, log,
+            )
+            # Don't retry on every poll tick against a slot that's already
+            # known bad this round — wait out a fresh debounce window first.
+            self._idle_since = None
+            return
+        now_ts = time.time()
+        payload = {
+            "mode": "idle self-restart (#2139)",
+            "started_at": now_ts,
+            "finished_at": now_ts,
+            "version_before": version_before,
+            "version_after": new_version or "unknown",
+            "target_version": None,
+            "result": "upgraded",
+            "error": None,
+            "log_excerpt": (
+                f"agent idle for >= {self._debounce_seconds:.0f}s with a "
+                f"staged slot ({target}) already resolved by ~/.coord-venv "
+                "— self-restarting onto it (#2139)"
+            ),
+        }
+        _write_last_update(self._server.state_dir, payload)
+        self._idle_since = None
+        self._exec_restart(list(sys.argv))
+
+
 def _path_param(name: str, description: str = "") -> dict:
     return {
         "name": name,
@@ -723,6 +940,7 @@ def build_app(
     server: AgentServer,
     *,
     exec_restart: Callable[[list[str]], None] | None = None,
+    idle_restart: bool = False,
 ) -> Starlette:
     """Build the Starlette app bound to a specific AgentServer instance.
 
@@ -736,6 +954,17 @@ def build_app(
         Defaults to :func:`_default_exec_restart` (calls ``os.execv``).
         Tests may inject a no-op or a mock to prevent the test process from
         being replaced.
+    idle_restart:
+        Start the #2139 idle self-restart watcher (:class:`_IdleRestartWatcher`)
+        as a background daemon thread bound to this app's ``server`` and
+        ``exec_restart``.  Defaults to ``False`` so building an app for a
+        short-lived test (or any embedding that manages its own process
+        lifecycle) never spins up a stray background thread; the real
+        `coord agent` entrypoint (``coord.commands.agent_ops.
+        _start_agent_server``) passes ``True``.  The watcher instance, when
+        started, is reachable at ``app.state.idle_restart_watcher`` — mainly
+        so tests can ``.stop()`` it deterministically instead of relying on
+        it being a daemon thread.
     """
     if exec_restart is None:
         exec_restart = _default_exec_restart
@@ -920,32 +1149,41 @@ def build_app(
         )
 
     async def update(request: Request) -> JSONResponse:
-        """Atomically install the target version and restart the agent (#1241).
+        """Atomically install the target version, restarting the agent onto
+        it now if idle, or staging it for the idle self-restart watcher to
+        apply once it is (#1241, #2139).
 
         Installs into a *fresh* venv slot next to the live one, smoke-checks
         it, then atomically flips ``~/.coord-venv`` onto it — see
         :mod:`coord.agent_update` for why an in-place ``pip install
         --upgrade`` isn't safe (it can leave a concurrent ``coord``
-        invocation observing a half-written ``site-packages``). The process
-        is restarted with ``exec_restart`` after a successful swap. Both the
-        install and the restart run in a daemon-less background thread so
-        the HTTP response reaches the caller before the process is
-        replaced.
+        invocation observing a half-written ``site-packages``). Runs in a
+        daemon-less background thread so the HTTP response reaches the
+        caller before this process is potentially replaced.
 
-        Refuses outright — HTTP 409, nothing touched, no restart — rather
-        than acting, in two cases:
+        Refuses outright — HTTP 409, nothing touched, no swap attempted —
+        only for an **editable install** (``pip install -e .``):
+        ``~/.coord-venv`` must stay a PyPI install (mirrors
+        ``coord.health.checks.agent_install``'s ``agent_venv`` check). An
+        editable checkout is reported as drift, never silently ``git
+        pull``ed — the operator switches it back by hand (see
+        ``docs/AGENT_OPERATIONS.md``'s editable → PyPI section).
 
-        - **Editable install** (``pip install -e .``): ``~/.coord-venv``
-          must stay a PyPI install (mirrors ``coord.health.checks.
-          agent_install``'s ``agent_venv`` check). An editable checkout is
-          reported as drift, never silently ``git pull``ed — the operator
-          switches it back by hand (see ``docs/AGENT_OPERATIONS.md``'s
-          editable → PyPI section).
-        - **Live sessions**: when this agent has active (RUNNING/PENDING)
-          assignments and the caller didn't pass ``{"force": true}`` — the
-          restart-after-swap kills any in-flight worker, the same "never
-          restart during live sessions" operator rule ``/restart`` already
-          documents, now enforced here too.
+        #2139: **live sessions no longer refuse the swap.** The swap itself
+        never touches a running process — a live worker's own interpreter
+        stays pinned to whichever slot it started from regardless of where
+        the symlink points (see :mod:`coord.agent_update`'s module
+        docstring) — so there is nothing unsafe about it landing while this
+        agent has active (RUNNING/PENDING) assignments. What DOES still need
+        gating is the *restart*, because that's what actually kills
+        in-flight workers. So: with no active assignments, or with
+        ``{"force": true}``, this restarts immediately after a successful
+        swap, exactly as before. With active assignments and no ``force``,
+        the swap still lands (``result: "staged"`` in ``last_update``,
+        surfaced via ``/health``) and the agent's own idle self-restart
+        watcher applies it the moment this agent's assignment count reaches
+        — and holds at — zero, with no operator action and no need for a
+        fleet-wide quiescent window.
 
         Request body (JSON, optional)::
 
@@ -986,30 +1224,6 @@ def build_app(
             body = {}
         target_version = body.get("target_version") or None
         force = bool(body.get("force"))
-
-        with server._lock:
-            active_count = sum(
-                1
-                for a in server._assignments.values()
-                if a.status in (PENDING, RUNNING)
-            )
-        if active_count and not force:
-            payload = {
-                "mode": "pip install (blue/green)",
-                "started_at": time.time(),
-                "finished_at": time.time(),
-                "target_version": target_version,
-                "result": "refused",
-                "error": (
-                    f"{active_count} active assignment(s) running — "
-                    "updating restarts the process and kills them "
-                    'mid-flight. Pass {"force": true} (CLI: `coord agent '
-                    "update --force`) to update anyway, or wait for them "
-                    "to finish."
-                ),
-            }
-            _write_last_update(server.state_dir, payload)
-            return JSONResponse(payload, status_code=409)
 
         mode = "pip install (blue/green)"
 
@@ -1079,6 +1293,28 @@ def build_app(
                         f"swap completed but resolved to {version_after} "
                         "(same as before) — unexpected for a successful "
                         "blue/green update"
+                    )
+                    _write_last_update(state_dir, payload)
+                    return
+
+                # #2139: the busy check moves HERE — right before the
+                # restart decision, not up front before the swap even
+                # started. Re-read fresh: `perform_update` above can take
+                # tens of seconds (venv creation, pip, smoke check), so the
+                # count at the top of this request is stale by now.
+                with server._lock:
+                    still_active = sum(
+                        1
+                        for a in server._assignments.values()
+                        if a.status in (PENDING, RUNNING)
+                    )
+                if still_active and not force:
+                    payload["result"] = "staged"
+                    payload["error"] = (
+                        f"swapped to v{version_after}; {still_active} active "
+                        "assignment(s) still running — restart deferred to "
+                        "this agent's idle self-restart watcher (#2139); "
+                        'pass {"force": true} to restart immediately instead'
                     )
                     _write_last_update(state_dir, payload)
                     return
@@ -1552,4 +1788,12 @@ def build_app(
     ]
     # #757: served OpenAPI 3 spec + Swagger UI docs page.
     routes.extend(openapi_and_docs_routes(_openapi_spec()))
-    return Starlette(routes=routes)
+    app = Starlette(routes=routes)
+    app.state.idle_restart_watcher = None
+    if idle_restart:
+        watcher = _IdleRestartWatcher(
+            server, venv_dir=_venv_dir(), exec_restart=exec_restart
+        )
+        watcher.start()
+        app.state.idle_restart_watcher = watcher
+    return app

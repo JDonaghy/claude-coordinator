@@ -390,7 +390,13 @@ def _start_agent_server(
         # capabilities went missing.
         config_free_reason=startup.config_free_reason,
     )
-    app = build_app(server)
+    # #2139: idle_restart=True turns on the background watcher that
+    # re-execs this process onto an already-staged blue/green slot the
+    # moment its own active-assignment count reaches (and holds at) zero —
+    # the real `coord agent` entrypoint is the one place that should own a
+    # background thread for the life of the process; tests build their own
+    # app via `build_app(server)` and get the pre-#2139 default (off).
+    app = build_app(server, idle_restart=True)
     # #1671: loud-by-default startup diagnostics — resolved PATH, install
     # location, and any declared capability this machine's own probe
     # contradicts — so the class of failure in #1671 shows up in
@@ -496,13 +502,17 @@ def _resolve_target_version(
         "in-flight update can never leave a torn/partial install for a "
         "concurrent `coord` invocation to observe.  An editable install "
         "(`pip install -e .`) is refused outright, never silently `git "
-        "pull`ed.  An agent with live (RUNNING/PENDING) assignments also "
-        "refuses unless --force is given, since the restart-after-swap "
-        "kills them mid-flight.  Polls each agent's self-reported "
-        "*running* version for up to --timeout seconds and reports "
-        "success only once it matches the requested version, escalating "
-        "to a `systemctl --user restart coord-agent` if the version is "
-        "stuck."
+        "pull`ed.  #2139: an agent with live (RUNNING/PENDING) assignments "
+        "still gets the swap — it never disturbs a running worker — but "
+        "the RESTART is deferred to that agent's own idle self-restart "
+        "watcher, which applies it the moment its assignment count reaches "
+        "zero, with no further operator action; pass --force to restart "
+        "immediately instead and kill in-flight workers.  Polls each "
+        "agent's self-reported *running* version for up to --timeout "
+        "seconds and reports success once it matches the requested "
+        "version (or, for a deferred host, reports it as staged rather "
+        "than waiting out the timeout), escalating to a `systemctl --user "
+        "restart coord-agent` if a forced restart's version is stuck."
     ),
 )
 
@@ -653,8 +663,19 @@ def agent_update(
                 click.echo(f"  {machine.name}: ✓ {vbefore} → {target_version}")
                 continue
 
-            all_matched = False
             result = outcome.get("result")
+            if result == "staged":
+                # #2139: the swap landed but the agent had live assignments
+                # when it did — restart is intentionally deferred to that
+                # agent's own idle self-restart watcher, not something this
+                # command needs to drive or wait out. Not a failure.
+                click.echo(
+                    f"  {machine.name}: ⧗ staged v{target_version} — "
+                    f"{outcome.get('error') or 'restart deferred until idle (#2139)'}"
+                )
+                continue
+
+            all_matched = False
             if result == "no_change":
                 click.echo(
                     f"  {machine.name}: ✗ no change (still {version_now}) — "
@@ -1147,6 +1168,16 @@ def _wait_agents_updated(
     while time.time() < deadline and pending:
         for name in list(pending):
             if _poll_once(pending[name]):
+                del pending[name]
+            elif out[name]["result"] == "staged":
+                # #2139: the swap landed but the agent had live assignments,
+                # so it deliberately deferred the restart to its own idle
+                # self-restart watcher — a healthy outcome on a schedule
+                # this poll loop has no way to predict (it fires whenever
+                # THAT host next goes idle, not on this loop's timeout).
+                # Stop burning the wait window on a host that isn't stuck;
+                # `_do_update`'s explanatory message is already in
+                # `info["error"]` for the caller to print.
                 del pending[name]
         if not pending:
             break
