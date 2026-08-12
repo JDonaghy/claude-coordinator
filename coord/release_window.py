@@ -4,12 +4,20 @@
 window — except the daemon host, which the daemon-first lane order (#1835's
 LANE ORDER, the documented 405) forces to gate the *whole run*: no lane may
 roll ahead of an unrolled daemon. dellserver is both the daemon host and a
-work machine, and every unpinned drive-queue entry charges it via
+work machine. Until #2138, every unpinned drive-queue entry charged it via
 ``launch_host`` (see :func:`coord.release_propagate.busy_host_for_entry`)
-regardless of where the worker actually lands — so almost any drive anywhere
-keeps the daemon "busy" and defers the entire fleet. Measured 2026-08-10: the
+regardless of where the worker actually landed — so almost any drive anywhere
+kept the daemon "busy" and deferred the entire fleet. Measured 2026-08-10: the
 fleet sat eleven releases behind for a day with elitebook idle and rollable
-throughout.
+throughout; measured again 2026-08-12 with the fleet stuck six hours the same
+way, because #2101 had only fixed the ``--machine``-pinned half of that
+attribution and production entries are unpinned. #2138 resolves an unpinned
+entry's real worker host from its live assignment row instead, so the daemon
+is charged only when it is genuinely running the work itself — but a row
+that is `running` with no live assignment right now (between legs) still
+reads as unattributable and blocks every host, the daemon included. This
+module remains the belt-and-braces answer for that residual case, and for
+the daemon host doing real work directly.
 
 #2101 (release cordons) answers this for every OTHER host: cordon it,
 drain it, roll it the moment it's free. It cannot answer it for the daemon
