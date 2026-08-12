@@ -53,6 +53,40 @@ def _mocks_dir(milestone_number: int) -> str:
     return f"{ACCEPTANCE_DIRNAME}/{ms_dirname(milestone_number)}/mocks"
 
 
+def issue_dirname(issue_number: int) -> str:
+    """The ``issue-NN`` directory name for a single-issue bug-lane contract
+    (docs/TEST_FIRST_BUG_LANE.md "The intake contract", #1964) — the bug
+    lane's counterpart to :func:`ms_dirname`, with no milestone in the name
+    because a bug has none.
+
+    This is purely a naming convention, not new plumbing: the manifest
+    scanner below (:func:`_manifest_paths`) globs ``*/manifest.*`` under
+    ``tests/acceptance/`` regardless of what the directory is called, so an
+    ``issue-NN/`` slice is discovered, run (``coord acceptance run --issue
+    N``), recorded (``coord acceptance record``), and injected into the
+    worker's briefing (:func:`oracle_loop_contract_block`) by the exact same
+    code path as an ``ms-NN/`` one — see ``TestOracleLoopContractBlock`` in
+    ``tests/test_acceptance.py``, which already proves the block is built
+    from whatever the owning directory happens to be named. Pinning the name
+    here just keeps every bug-lane contract in the same shape.
+    """
+    return f"issue-{issue_number}"
+
+
+def bug_contract_path(issue_number: int) -> str:
+    """Repo-relative path to *issue_number*'s single-issue bug-lane contract
+    (docs/TEST_FIRST_BUG_LANE.md "The intake contract").
+
+    Unlike :func:`gate_a_contract_path`, nothing gates dispatch on this
+    existing — a bug issue has no milestone, so there is no Gate A to block
+    on it. It is hand-authored (or agent-assisted) directly from the four
+    intake fields (:mod:`coord.bug_intake`); once it — and a
+    ``manifest.yml`` alongside it — exist, the issue behaves exactly like an
+    authored ``ms-NN`` slice to every downstream command.
+    """
+    return f"{ACCEPTANCE_DIRNAME}/{issue_dirname(issue_number)}/contract.md"
+
+
 # Mock-fixture file extension -> the driver ``kind`` it implies (the SAME
 # rule each ``AcceptanceDriverConfig.mock`` glob already encodes in
 # coordinator.yml / docs/ORACLE_LOOP.md: ``"*.screen"`` for ``tui-tuidriver``,

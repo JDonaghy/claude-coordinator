@@ -176,6 +176,62 @@ class TestIssueCreate:
         called_body = mock_create.call_args[0][2]
         assert "Long body" in called_body
 
+    def test_create_bug_report_renders_structured_body(self, config_file: Path) -> None:
+        """#1964: --expected/--actual/--repro/--evidence render the four
+        bug-lane intake fields as addressable sections via
+        coord.bug_intake.format_bug_report, instead of prose."""
+        with patch(
+            "coord.github_ops.create_issue",
+            return_value={"number": 8, "url": "https://github.com/acme/api/issues/8"},
+        ) as mock_create:
+            result = CliRunner().invoke(
+                main,
+                [
+                    "issue", "create", "api",
+                    "--title", "Help popup missing border",
+                    "--expected", "full box border, title centred",
+                    "--actual", "side-bars only, title demoted",
+                    "--repro", "open the extensions panel help popup",
+                    "--evidence", "screenshots of both, plus develop as reference",
+                    "--config", str(config_file),
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        assert "#8" in result.output
+        called_body = mock_create.call_args[0][2]
+        assert "## Expected behaviour" in called_body
+        assert "full box border, title centred" in called_body
+        assert "## Evidence" in called_body
+        assert "develop as reference" in called_body
+
+    def test_create_bug_report_requires_all_four_fields(self, config_file: Path) -> None:
+        result = CliRunner().invoke(
+            main,
+            [
+                "issue", "create", "api",
+                "--title", "Incomplete report",
+                "--expected", "x",
+                "--config", str(config_file),
+            ],
+        )
+        assert result.exit_code == 2
+        assert "must all be given together" in result.output
+        assert "--actual" in result.output
+
+    def test_create_bug_report_rejects_body_combo(self, config_file: Path) -> None:
+        result = CliRunner().invoke(
+            main,
+            [
+                "issue", "create", "api",
+                "--title", "Conflicting flags",
+                "--body", "freeform",
+                "--expected", "x", "--actual", "y", "--repro", "z", "--evidence", "w",
+                "--config", str(config_file),
+            ],
+        )
+        assert result.exit_code == 2
+        assert "mutually exclusive" in result.output
+
     def test_create_gh_failure_exits_nonzero(self, config_file: Path) -> None:
         """A gh RuntimeError surfaces as exit code 1 with an error message."""
         with patch(
