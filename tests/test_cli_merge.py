@@ -787,8 +787,14 @@ class TestMergeOnly:
     def test_only_errors_when_entry_not_pending(
         self, config_file: Path, coord_dir: Path
     ) -> None:
-        """--only on an already-merged entry exits non-zero with a clear message."""
-        _seed_queue([_entry("m1", state=mq.MERGED)])
+        """--only on an entry no retry can merge exits non-zero with a clear
+        message.
+
+        #2157 narrowed this arm: MERGED left it (a landed merge is the
+        caller's postcondition, not a failure), so the state under test is
+        HUMAN_REQUIRED — still genuinely unmergeable.
+        """
+        _seed_queue([_entry("m1", state=mq.HUMAN_REQUIRED)])
 
         result = CliRunner().invoke(
             main, ["merge", "--config", str(config_file), "--only", "m1"]
@@ -802,7 +808,7 @@ class TestMergeOnly:
         """#1251 (ask 3): the "not PENDING" --only failure must actually write
         to stderr, not just exit 1 with nothing visible there.  Regression for
         the repro in #1251 where this exact path printed nothing to stderr."""
-        _seed_queue([_entry("m1", state=mq.MERGED)])
+        _seed_queue([_entry("m1", state=mq.HUMAN_REQUIRED)])
 
         result = CliRunner().invoke(
             main, ["merge", "--config", str(config_file), "--only", "m1"]
@@ -810,6 +816,98 @@ class TestMergeOnly:
         assert result.exit_code != 0
         assert result.stderr.strip() != "", "expected a non-empty stderr message"
         assert "pending" in result.stderr.lower()
+
+
+class TestOnlyAlreadyMerged:
+    """#2157: `coord merge --only <aid>` on an entry that has ALREADY merged
+    is a SUCCESS, not a failure.
+
+    coord-portal#51: the slice's PR landed 12 seconds into the drive's second
+    attempt; every subsequent `--only` exited 1 with "is in state 'merged'
+    (not PENDING) — cannot merge", `coord drive` counted each as a failed
+    merge attempt, exhausted `--max-merge-attempts`, and the drive-queue
+    entry (plus the `after=`-dependent #55) sat `blocked` for 5h47m for an
+    issue whose merge had succeeded.
+    """
+
+    def test_merged_entry_exits_zero(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        entry = _entry("m1", state=mq.MERGED)
+        entry.pr_number = 60
+        _seed_queue([entry])
+
+        result = CliRunner().invoke(
+            main, ["merge", "--config", str(config_file), "--only", "m1"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "already merged" in result.output
+        # The output names the PR that carries the merge, so an operator
+        # reading the drive pane can go look at it.
+        assert "PR #60" in result.output
+        assert "cannot merge" not in result.output
+
+    def test_merged_entry_without_a_pr_number_still_exits_zero(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """An entry merged before `pr_number` was ever recorded (or by hand)
+        must not fall back to the exit-1 arm just because the PR is unknown."""
+        _seed_queue([_entry("m1", state=mq.MERGED)])
+
+        result = CliRunner().invoke(
+            main, ["merge", "--config", str(config_file), "--only", "m1"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "already merged" in result.output
+        assert "PR #" not in result.output
+
+    def test_merged_entry_is_left_untouched(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """Exit 0 must mean "nothing to do", not "merged again" — the entry's
+        state is unchanged and no second merge is attempted."""
+        _seed_queue([_entry("m1", state=mq.MERGED), _entry("p2")])
+
+        with patch("coord.github_ops.merge_pr") as merge_pr:
+            result = CliRunner().invoke(
+                main, ["merge", "--config", str(config_file), "--only", "m1"]
+            )
+
+        assert result.exit_code == 0, result.output
+        assert not merge_pr.called, "an already-merged entry must not be re-merged"
+        states = {e.assignment_id: e.state for e in mq.load_queue()}
+        assert states == {"m1": mq.MERGED, "p2": mq.PENDING}
+
+    def test_conflict_entry_still_exits_one_with_the_unchanged_message(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """The other non-PENDING states are untouched by #2157. CONFLICT is
+        the one that shares the incident's shape most closely — the comment
+        on the attempt cap in `drive._decide_merge` cites it explicitly as a
+        case that SHOULD spend an attempt.
+
+        A CONFLICT entry with no PR number never reaches the #1477
+        re-test/auto-fix path (it needs `entry.pr_number`), so this lands on
+        the not-PENDING guard exactly as it did pre-#2157.
+        """
+        _seed_queue([_entry("c1", state=mq.CONFLICT)])
+
+        result = CliRunner().invoke(
+            main, ["merge", "--config", str(config_file), "--only", "c1"]
+        )
+        assert result.exit_code == 1
+        assert "is in state 'conflict' (not PENDING) — cannot merge" in result.stderr
+
+    def test_human_required_entry_still_exits_one(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        _seed_queue([_entry("h1", state=mq.HUMAN_REQUIRED)])
+
+        result = CliRunner().invoke(
+            main, ["merge", "--config", str(config_file), "--only", "h1"]
+        )
+        assert result.exit_code == 1
+        assert "not PENDING" in result.stderr
 
 
 class TestMergeOverrideHumanRequired:

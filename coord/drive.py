@@ -1845,6 +1845,42 @@ def _extract_gate_block_reason(diagnostic: str) -> str | None:
     return match.group(1).strip() if match else None
 
 
+# #2157: the two wordings `coord merge --only <aid>` uses for "that entry has
+# ALREADY merged". The first is the post-#2157 success line (exit 0); the
+# second is the pre-#2157 failure line, still matched because the `coord`
+# binary this driver shells out to is whatever is installed on the box — a
+# drive running against an older install must reach the same conclusion, and
+# the fix is worthless if a version skew reintroduces the exact incident.
+_ALREADY_MERGED_RE = re.compile(
+    r"merge-queue: entry '(?P<aid>[^']*)' (?:"
+    r"already merged(?: \(PR #(?P<pr>\d+)\))?"
+    r"|is in state 'merged'"
+    r")"
+)
+
+
+def _extract_already_merged(diagnostic: str) -> str | None:
+    """Return a human-readable note when a captured `coord merge --only`
+    diagnostic says the entry has already merged, else ``None`` (#2157).
+
+    This is the driver's own most recent, first-hand read of the merge queue
+    — fresher than the board projection `IssueState.merge_status` comes from,
+    which is exactly the gap coord-portal#51 fell into: the slice's queue
+    entry read ``merged`` while the board still projected ``status=''``, so
+    :func:`_decide_merge` classified a landed merge as a retryable
+    empty-status miss, burned all three attempts on it, and died.
+
+    Returns a note (``"PR #60"`` when the wording carried one, ``""``
+    otherwise) rather than a bare bool so the wait label can name the PR;
+    callers must test against ``None``, never for truthiness.
+    """
+    match = _ALREADY_MERGED_RE.search(diagnostic or "")
+    if match is None:
+        return None
+    pr = match.group("pr")
+    return f"PR #{pr}" if pr else ""
+
+
 def _extract_pr_number(pr_url: str) -> int | None:
     """Best-effort PR number out of a GitHub PR URL, or ``None``."""
     if not pr_url:
@@ -2227,6 +2263,33 @@ def _decide_merge(
                     f"{gate_reason}; re-checking"
                 )
             )
+
+    # #2157: this driver's OWN last `coord merge --only <aid>` reported the
+    # entry has already merged. That is the postcondition this whole stage is
+    # waiting for, observed first-hand — and it is strictly fresher than
+    # `status`, which comes from the board projection and can still read `''`
+    # (coord-portal#51: the queue entry read `merged` while the board row had
+    # not reconciled yet). Treated exactly like the #1891/#1892 waits: the
+    # only thing that resolves it is more real time — the board catching up,
+    # after which `decide()`'s own terminal-merged arm (or, in the slice lane,
+    # `_decide_acceptance_author`'s `status == "merged"` pass-through) takes
+    # over — never another `coord merge` retry. So it costs ZERO attempts:
+    # counting a landed merge against `--max-merge-attempts` is what turned a
+    # success into an `exhausted` exit 1 and blocked the drive-queue entry.
+    #
+    # Checked BEFORE the `_RETRYABLE_MERGE_STATUSES` escalation below so a
+    # stale terminal-looking status (say NEEDS_ATTENTION left over from a
+    # conflict the merge then resolved) cannot escalate a merge that landed.
+    already_merged = _extract_already_merged(counters.last_merge_diagnostic)
+    if already_merged is not None:
+        detail = f" ({already_merged})" if already_merged else ""
+        return _wait(
+            label=(
+                f"MERGE: entry {state.merge_aid or state.work_aid} has ALREADY "
+                f"merged{detail} — waiting for the board to reconcile, not "
+                "retrying (#2157)"
+            )
+        )
 
     # #1505: a status no retry can fix (most commonly NEEDS_ATTENTION)
     # escalates immediately rather than falling into the bounded retry below

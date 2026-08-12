@@ -1997,6 +1997,129 @@ def test_exhausted_merge_attempts_says_so_when_nothing_was_ever_captured():
     assert "no output captured from the merge attempts" in exhausted.message
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# #2157: an ALREADY-MERGED entry costs zero attempts
+#
+# coord-portal#51: the acceptance slice's PR landed 12 seconds into the
+# drive's second attempt. Every `coord merge --only` after that exited 1 with
+# "entry '84b8207f9660' is in state 'merged' (not PENDING) — cannot merge"
+# while the board still projected `status=''`; the driver counted each as a
+# failed merge attempt, exhausted the cap, and blocked the drive-queue entry
+# (and the `after=`-dependent #55) for 5h47m. A successful merge reported as
+# a failure, and the failure hard-blocking the queue.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# The two `coord merge --only` wordings that mean "already merged": post-#2157
+# (exit 0) and pre-#2157 (exit 1, still emitted by an older installed `coord`).
+MERGED_DIAGNOSTIC = (
+    "merge-queue: entry 'w1' already merged (PR #60) — nothing to do"
+)
+LEGACY_MERGED_DIAGNOSTIC = (
+    "merge-queue: entry 'w1' is in state 'merged' (not PENDING) — cannot merge"
+)
+
+
+def test_an_already_merged_diagnostic_waits_instead_of_spending_an_attempt():
+    """The incident in one assertion: the merge landed, so the next poll must
+    not be attempt N+1 of `--max-merge-attempts`."""
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_merge_attempts=3)
+    s = approved_work()
+
+    assert step(s, opts, counters=counters).kind == RUN
+    assert counters.merge_attempts == 1
+    counters.last_merge_diagnostic = MERGED_DIAGNOSTIC
+
+    action = step(s, opts, counters=counters)
+    assert action.kind == WAIT
+    assert not action.is_exit
+    assert counters.merge_attempts == 1, "an already-merged entry must cost 0 attempts"
+    assert "ALREADY" in action.label
+    assert "PR #60" in action.label
+
+
+def test_an_already_merged_diagnostic_never_exhausts_the_cap():
+    """Ten more polls, still no `exhausted` exit — because none of them is an
+    attempt. Pre-#2157 the 2nd poll here died with `merge attempted 1 times
+    without landing` and the drive-queue entry went `blocked`."""
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_merge_attempts=1)
+    s = approved_work()
+
+    assert step(s, opts, counters=counters).kind == RUN
+    counters.last_merge_diagnostic = MERGED_DIAGNOSTIC
+
+    for _ in range(10):
+        action = step(s, opts, counters=counters)
+        assert action.kind == WAIT, action.message
+    assert counters.merge_attempts == 1
+
+
+def test_the_legacy_not_pending_merged_wording_is_recognised_too():
+    """`coord drive` shells out to whatever `coord` is installed on the box,
+    so a drive running against a pre-#2157 install must reach the same
+    conclusion from the old exit-1 wording — otherwise a version skew
+    reintroduces the exact incident."""
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_merge_attempts=1)
+    s = approved_work()
+
+    assert step(s, opts, counters=counters).kind == RUN
+    counters.last_merge_diagnostic = LEGACY_MERGED_DIAGNOSTIC
+
+    action = step(s, opts, counters=counters)
+    assert action.kind == WAIT
+    assert counters.merge_attempts == 1
+
+
+def test_a_conflict_diagnostic_still_spends_an_attempt():
+    """The narrowing is to MERGED only. A CONFLICT entry's identically-shaped
+    'not PENDING' refusal must keep counting against the cap — that is the
+    #1474 behaviour the attempt-cap comment calls out on purpose."""
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_merge_attempts=3)
+    s = approved_work()
+
+    assert step(s, opts, counters=counters).kind == RUN
+    counters.last_merge_diagnostic = (
+        "merge-queue: entry 'w1' is in state 'conflict' (not PENDING) "
+        "— cannot merge"
+    )
+    assert step(s, opts, counters=counters).kind == RUN
+    assert counters.merge_attempts == 2
+
+
+def test_an_already_merged_entry_does_not_escalate_on_a_terminal_status():
+    """Checked before the `_RETRYABLE_MERGE_STATUSES` escalation, so a stale
+    NEEDS_ATTENTION left on the board by a conflict the merge then resolved
+    cannot escalate a merge that landed."""
+    counters = DriveCounters(last_merge_diagnostic=MERGED_DIAGNOSTIC)
+    action = step(
+        approved_work(merge_status="NEEDS_ATTENTION"), counters=counters
+    )
+    assert action.kind == WAIT
+    assert not action.is_exit
+
+
+def test_an_already_merged_slice_costs_the_slice_budget_nothing():
+    """The slice lane goes through the same `_decide_merge`, so #2157 lands
+    there too — and the slice lane is where the incident actually happened."""
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_merge_attempts=1)
+
+    assert landing_step(landing_state(), opts, counters=counters).kind == RUN
+    assert counters.acceptance is not None
+    counters.acceptance.last_merge_diagnostic = (
+        "merge-queue: entry 'ta1' already merged (PR #60) — nothing to do"
+    )
+
+    action = landing_step(landing_state(), opts, counters=counters)
+    assert action.kind == WAIT
+    assert not action.is_exit
+    assert counters.acceptance.merge_attempts == 1
+    assert "ACCEPTANCE/" in action.label
+
+
 def test_empty_status_with_a_known_gate_block_waits_instead_of_retrying_blind():
     """#2078 core fix: once a prior `coord merge --only` attempt's captured
     diagnostic already names a genuine, un-satisfied review/smoke gate, a
@@ -3161,6 +3284,151 @@ def test_driver_captures_the_merge_attempts_own_diagnostic_into_the_die_message(
     err = capsys.readouterr().err
     assert "no entry found for 'w1'" in err
     assert "identifier did not resolve" in err
+
+
+def _oracle_slice_payload(*, author_status: str, work: dict | None = None) -> dict:
+    """#2157 fixture: an oracle-mode board whose JIT acceptance slice is
+    authored, tested, approved — with *author_status* deciding whether its
+    row has reconciled to 'merged' yet — and NO merge-queue entry visible at
+    all (`merge_status == ''`), which is exactly what coord-portal#51's board
+    reported while the slice's queue entry already read 'merged'."""
+    return {
+        "assignments": [
+            {
+                "repo_name": REPO,
+                "issue_number": 1120,          # the milestone TRACKING issue
+                "for_issue_number": ISSUE,     # ...scoped to THIS issue
+                "type": "test-author",
+                "assignment_id": "ta1",
+                "dispatched_at": 1.0,
+                "status": author_status,
+                "branch": "test-author-ms-38-slice-1392",
+                "machine_name": "precision",
+                "test_state": "passed",
+            },
+            {
+                "repo_name": REPO,
+                "issue_number": 1120,
+                "type": "review",
+                "assignment_id": "rv1",
+                "dispatched_at": 2.0,
+                "status": "done",
+                "review_of_assignment_id": "ta1",
+                "review_verdict": "approve",
+            },
+            *([work] if work else []),
+        ],
+        "issues": [{"repo_name": REPO, "number": ISSUE, "milestone_number": 38}],
+        "milestone_work_orders": [
+            {"repo_name": REPO, "tracking_issue": 1120, "nodes": [{"issue_number": ISSUE}]}
+        ],
+    }
+
+
+def test_driver_drives_on_when_the_slice_merges_mid_run(driver_factory, monkeypatch):
+    """#2157 end to end — the coord-portal#51 regression.
+
+    The slice's PR lands mid-drive, so `coord merge --only ta1` reports it as
+    already merged. Pre-#2157 that reading was a failed attempt: with the cap
+    at 1 the very next poll died `EXIT_TERMINAL_FAILURE` ("merge attempted 1
+    times without landing"), which `coord drive-queue` turns into a `blocked`
+    entry — for an issue whose merge had SUCCEEDED. It must instead wait out
+    the board reconciling and then dispatch the work it was gating.
+    """
+    payloads = [
+        # The preflight banner's own fetch.
+        _oracle_slice_payload(author_status="done"),
+        # Poll 1: the slice is authored/tested/approved with no visible queue
+        # entry — the driver spends its one attempt on `coord merge --only`,
+        # which reports the entry has already merged.
+        _oracle_slice_payload(author_status="done"),
+        # Poll 2: the board STILL has not reconciled. With max_merge_attempts=1
+        # this is exactly where the old code died with `exhausted`.
+        _oracle_slice_payload(author_status="done"),
+        # Poll 3: the board reconciles — the #1138 gate is satisfied and the
+        # work this whole run exists to dispatch finally goes out.
+        _oracle_slice_payload(author_status="merged"),
+        # Poll 4: that work lands.
+        _oracle_slice_payload(
+            author_status="merged",
+            work={
+                "repo_name": REPO,
+                "issue_number": ISSUE,
+                "type": "work",
+                "assignment_id": "w1",
+                "dispatched_at": 3.0,
+                "status": "merged",
+                "branch": "issue-1392-x",
+                "machine_name": "precision",
+            },
+        ),
+    ]
+    driver = driver_factory(
+        payloads,
+        opts=DriveOptions(
+            machine="precision", poll=1.0, max_merge_attempts=1, deadline_mins=1.0
+        ),
+        config=make_config_with_acceptance_driver(),
+        oracle_gate=FakeGateChecker(exists=True),
+    )
+
+    recorded: list[list[str]] = []
+
+    def fake_run(argv, **kw):
+        recorded.append(list(argv))
+        if "merge" in argv and "--only" in argv:
+            # Post-#2157 `coord merge --only` on a merged entry: exit 0.
+            return subprocess.CompletedProcess(
+                argv, 0,
+                "merge-queue: entry 'ta1' already merged (PR #60) "
+                "— nothing to do\n",
+                "",
+            )
+        return subprocess.CompletedProcess(argv, 0, "ok\n", "")
+
+    monkeypatch.setattr("coord.drive.subprocess.run", fake_run)
+
+    assert driver.run() == EXIT_OK
+    argvs = [" ".join(a) for a in recorded]
+    # It really did reach the work-dispatch step the slice was gating...
+    assert any("assign precision" in a for a in argvs), argvs
+    # ...and it spent exactly ONE merge attempt doing so, not the cap.
+    assert sum("merge --only ta1" in a for a in argvs) == 1, argvs
+
+
+def test_driver_still_gives_up_when_the_merge_genuinely_never_lands(
+    driver_factory, monkeypatch,
+):
+    """The other half of #2157: narrowing the guard to MERGED must not turn a
+    slice that never lands into an unbounded spin. A CONFLICT refusal still
+    burns the cap and still exits terminally."""
+    driver = driver_factory(
+        [_oracle_slice_payload(author_status="done")],
+        opts=DriveOptions(
+            machine="precision", poll=1.0, max_merge_attempts=1, deadline_mins=1.0
+        ),
+        config=make_config_with_acceptance_driver(),
+        oracle_gate=FakeGateChecker(exists=True),
+    )
+
+    recorded: list[list[str]] = []
+
+    def fake_run(argv, **kw):
+        recorded.append(list(argv))
+        if "merge" in argv and "--only" in argv:
+            return subprocess.CompletedProcess(
+                argv, 1,
+                "merge-queue: entry 'ta1' is in state 'conflict' (not PENDING) "
+                "— cannot merge\n",
+                "",
+            )
+        return subprocess.CompletedProcess(argv, 0, "ok\n", "")
+
+    monkeypatch.setattr("coord.drive.subprocess.run", fake_run)
+
+    assert driver.run() == EXIT_TERMINAL_FAILURE
+    argvs = [" ".join(a) for a in recorded]
+    assert not any("assign precision" in a for a in argvs), argvs
 
 
 def test_driver_escalates_and_writes_the_record_via_the_cli(driver_factory):

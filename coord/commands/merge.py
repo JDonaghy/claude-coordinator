@@ -1374,7 +1374,7 @@ def merge(
     from coord import github_ops as gh_ops
     from coord import merge_queue as mq
     from coord.ci_store import build_ci_store
-    from coord.merge_queue import CONFLICT, HUMAN_REQUIRED, PENDING
+    from coord.merge_queue import CONFLICT, HUMAN_REQUIRED, MERGED, PENDING
     from coord.state import load_board
 
     # #780: --only is a surgical single-entry merge that leaves all other queue
@@ -1492,6 +1492,23 @@ def merge(
             # gated on `not dry_run` in the save block further down.
             only_entry.state = PENDING
             only_entry.error = None
+        # #2157: MERGED is the one non-PENDING state that is not a failure.
+        # An exit code reports whether the CALLER's postcondition holds, and
+        # for `--only <aid>` that postcondition is "aid's branch is on the
+        # target branch" — which an already-merged entry satisfies outright.
+        # Lumping it in with CONFLICT/HUMAN_REQUIRED/DROPPED below cost
+        # coord-portal#51 5h47m `blocked`: `coord drive` counted the exit 1
+        # against `--max-merge-attempts`, exhausted, and blocked the
+        # drive-queue entry for an issue whose acceptance slice had merged 12
+        # seconds into the run. Every other non-PENDING state keeps exiting 1
+        # with the message unchanged — for those the goal genuinely is unmet.
+        if only_entry.state == MERGED:
+            pr = f" (PR #{only_entry.pr_number})" if only_entry.pr_number else ""
+            click.echo(
+                f"merge-queue: entry {only_assignment!r} already merged{pr} "
+                "— nothing to do"
+            )
+            sys.exit(0)
         if only_entry.state != PENDING:
             click.echo(
                 f"merge-queue: entry {only_assignment!r} is in state "
