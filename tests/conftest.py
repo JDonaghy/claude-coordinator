@@ -271,6 +271,36 @@ def _no_real_agent_venv(monkeypatch, tmp_path):
     monkeypatch.setenv("COORD_VENV_DIR", str(tmp_path / "unused-coord-venv"))
 
 
+@pytest.fixture
+def sacrificial_venv_root(monkeypatch, tmp_path):
+    """A throwaway blue/green root for tests that must drive the REAL
+    upgrade path (#2121 item 3).
+
+    ``_no_real_agent_venv`` above is a *default*: it protects tests that
+    forgot to isolate themselves, and — as its own docstring says — nothing
+    more. #2121 is what happens when that is the only control: a live
+    ``coord-agent``'s venv colour was rebuilt underneath it, and no deploy
+    path claimed responsibility. So ``coord.agent_update`` now *asserts*
+    the target is not the live install (``assert_not_live_install``, the
+    same shape as ``coord.db``'s ``ProductionDatabaseGuardError``, #1960),
+    That guard has no bypass, by design — so this fixture is not a way
+    *past* it, it is the alternative it exists to force: a real directory
+    tree, with real ``.blue``/``.green`` slots, that is emphatically not
+    ``~/.coord-venv``.
+
+    Returns the venv dir to pass as ``venv_dir``, and exports it as
+    ``COORD_VENV_DIR`` so code that resolves the path itself (the
+    ``/update`` and ``/rollback`` endpoints) lands here too. Work that
+    needs to exercise upgrade/restart behaviour end to end targets this,
+    never the daemon host's own runtime.
+    """
+    root = tmp_path / "sacrificial"
+    venv_dir = root / ".coord-venv"
+    venv_dir.mkdir(parents=True)
+    monkeypatch.setenv("COORD_VENV_DIR", str(venv_dir))
+    return venv_dir
+
+
 @pytest.fixture(autouse=True)
 def _no_real_pause_store(monkeypatch, tmp_path):
     """#2101: never let a test write the OPERATOR'S real

@@ -41,15 +41,51 @@ outright when the slot it would rebuild is the one backing its own
 and venv creation always uses the *symlinked* slot's python rather than
 ``sys.executable``, so the tool building the new environment is never the
 thing this update is about to delete.
+
+#2121: ``sys.executable`` only ever answers for *this* process, and on
+2026-08-11 that was not the process that mattered. ``coord-agent`` on
+dellserver had been executing from ``~/.coord-venv.green`` since 02:32;
+one update wrote blue and flipped onto it, and a second update — running
+from somewhere else entirely, so the ``sys.executable`` guard above saw
+nothing — then rebuilt **green**, the slot the live daemon was running
+out of, replacing its ``site-packages`` mid-flight. The agent spent the
+next six hours as a mixed-version process (0.5.32 in the modules it had
+already imported, 0.5.36 in everything it imported later), and both
+colours ended up on 0.5.36, so there was no rollback generation left
+either. Three things land here as a result:
+
+* :func:`processes_holding_slot` reads ``/proc`` for **any** live process
+  running out of a slot, not just this one, and :func:`perform_update`
+  refuses on a holder. "Nobody is running from the slot I am about to
+  delete" is a property of the machine, not of the caller.
+* :func:`_other_slot` compares *resolved* paths, so a ``venv_dir`` whose
+  symlink target spells the same slot differently (a symlinked ``$HOME``,
+  a relative link) can no longer be mistaken for "the other colour" and
+  hand back the **active** slot as the rebuild target. The active colour
+  is asserted immutable in :func:`perform_update` regardless.
+* Every install — swap, refusal, or failure — writes an audit row naming
+  its initiator (#1041). Reconstructing this incident took an hour of
+  ``stat`` and journal timestamps precisely because nothing recorded who
+  upgraded the box, when, or on whose behalf.
+
+And :func:`assert_not_live_install` keeps a *test* from reaching the live
+install at all, on the same principle (and with the same shape) as the
+production-database guard in :mod:`coord.db`: an automated run gets a
+sacrificial venv root or it gets an exception — not the daemon host's own
+``~/.coord-venv``.
 """
 
 from __future__ import annotations
 
+import logging
+import os
 import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+
+_log = logging.getLogger(__name__)
 
 #: Suffixes for the two blue/green slots, relative to the live venv dir
 #: (e.g. ``~/.coord-venv`` -> ``~/.coord-venv.blue`` / ``~/.coord-venv.green``).
@@ -60,6 +96,256 @@ _GREEN_SUFFIX = ".green"
 #: the two modules whose disagreement caused the ModuleNotFoundError this
 #: whole mechanism exists to prevent (state.py -> board_service.py).
 _SMOKE_IMPORTS = "coord.state, coord.commands.review"
+
+
+#: The one venv path that is never a legitimate target for an automated
+#: test: the path ``install-agent.sh`` creates and every
+#: ``deploy/coord-*.service`` unit hardcodes as its ``ExecStart`` venv. Kept
+#: as a bare name rather than a resolved Path so it follows ``$HOME`` in a
+#: fixture that relocates it.
+_LIVE_VENV_NAME = ".coord-venv"
+
+
+class LiveInstallGuardError(RuntimeError):
+    """A test tried to install into the live ``~/.coord-venv`` (#2121)."""
+
+
+@dataclass(frozen=True)
+class SlotHolder:
+    """One live process running out of a blue/green slot (#2121).
+
+    ``evidence`` is the literal ``/proc`` token that named the slot — an
+    ``argv`` entry (``~/.coord-venv.green/bin/python3.12 ...``, the shape
+    the 2026-08-11 incident was reconstructed from) or a ``VIRTUAL_ENV``
+    environment entry — so a refusal can quote the thing it saw rather
+    than asserting a conclusion.
+    """
+
+    pid: int
+    source: str
+    evidence: str
+    cmdline: str = ""
+
+    #: Max characters of ``cmdline`` to quote in a refusal message.
+    _MAX_CMDLINE = 200
+
+    def describe(self) -> str:
+        """``pid N (argv: ...)``, short enough to read in an error message.
+
+        Long command lines are elided in the *middle*, not truncated at the
+        end: both halves carry the information an operator needs — the head
+        names the slot and interpreter, the tail names the subcommand
+        (``... coord agent --config ...``), which is what says *which*
+        service is holding the slot. Cutting the tail throws that away
+        precisely when the paths are longest.
+        """
+        cmd = self.cmdline or self.evidence
+        if len(cmd) > self._MAX_CMDLINE:
+            keep = (self._MAX_CMDLINE - 5) // 2
+            cmd = f"{cmd[:keep]} ... {cmd[-keep:]}"
+        return f"pid {self.pid} ({self.source}: {cmd})"
+
+
+def _proc_tokens(entry: Path, name: str) -> list[str]:
+    """NUL-separated ``/proc/<pid>/{cmdline,environ}``, or ``[]``.
+
+    Best-effort by construction: a pid that exits mid-scan, or one owned by
+    another user whose ``environ`` we may not read, must not turn a version
+    upgrade into a traceback.
+    """
+    try:
+        raw = (entry / name).read_bytes()
+    except (OSError, ValueError):
+        return []
+    return [tok for tok in raw.decode("utf-8", "replace").split("\0") if tok]
+
+
+def processes_holding_slot(
+    slot: Path,
+    *,
+    proc_root: Path = Path("/proc"),
+    exclude_pids: tuple[int, ...] = (),
+) -> list[SlotHolder]:
+    """Every live process executing out of *slot*, newest pid last.
+
+    #2121: the question ``perform_update`` has to answer before it
+    ``rmtree``s a slot is "is anything running from this directory", and
+    ``sys.executable`` answers it only for the calling process. On
+    2026-08-11 the caller was not the victim — a long-lived ``coord-agent``
+    was — so the guard keyed on ``sys.executable`` never fired.
+
+    Detection reads ``argv`` and ``VIRTUAL_ENV``, deliberately **not**
+    ``/proc/<pid>/exe``: for a PEP 405 venv, ``bin/python3.12`` is a
+    symlink out to the shared base interpreter, and ``exe`` is the kernel's
+    fully-resolved path — ``/usr/bin/python3.12``, which names no slot at
+    all. ``argv[0]`` keeps the literal path the process was started with
+    (``/home/john/.coord-venv.green/bin/python3.12``), which is exactly the
+    evidence the incident was reconstructed from.
+
+    Returns ``[]`` — never raises — when ``/proc`` is absent or unreadable
+    (non-Linux, a container without ``hidepid`` access). That is a real
+    blind spot and is why it is not the only guard: :func:`perform_update`
+    still refuses on its own ``sys.executable`` and on the active colour.
+    """
+    try:
+        entries = sorted(
+            (p for p in proc_root.iterdir() if p.name.isdigit()),
+            key=lambda p: int(p.name),
+        )
+    except OSError:
+        return []
+
+    prefixes = {str(slot) + os.sep}
+    exact = {str(slot)}
+    try:
+        resolved = str(slot.resolve())
+    except OSError:
+        resolved = None
+    if resolved:
+        prefixes.add(resolved + os.sep)
+        exact.add(resolved)
+
+    def _hit(token: str) -> bool:
+        return token in exact or any(token.startswith(p) for p in prefixes)
+
+    holders: list[SlotHolder] = []
+    skip = set(exclude_pids)
+    for entry in entries:
+        pid = int(entry.name)
+        if pid in skip:
+            continue
+        argv = _proc_tokens(entry, "cmdline")
+        if not argv:
+            # Kernel threads have an empty cmdline; so does a pid that
+            # exited between the listdir and the read.
+            continue
+        cmdline = " ".join(argv)
+        found = next((tok for tok in argv if _hit(tok)), None)
+        source = "argv"
+        if found is None:
+            for env_entry in _proc_tokens(entry, "environ"):
+                key, sep, value = env_entry.partition("=")
+                if sep and key == "VIRTUAL_ENV" and _hit(value):
+                    found, source = env_entry, "environ"
+                    break
+        if found is not None:
+            holders.append(
+                SlotHolder(pid=pid, source=source, evidence=found, cmdline=cmdline)
+            )
+    return holders
+
+
+def assert_not_live_install(venv_dir: Path) -> None:
+    """Refuse, under pytest, to touch the machine's live ``~/.coord-venv``.
+
+    #2121 item 3: *"a test must not be able to reach the live install"*.
+    The mechanism is deliberately the one this repo already uses for the
+    same class of accident one layer down — :func:`coord.db._open`'s
+    ``ProductionDatabaseGuardError`` (#1960), which refuses to open the
+    real ``~/.coord/coord.db`` when ``PYTEST_CURRENT_TEST`` is set. Same
+    reasoning, same trigger, same shape of message: an automated run that
+    resolves the production artifact instead of an isolated one is a bug in
+    the test, and it should fail loudly at the moment it reaches for it
+    rather than after it has rewritten the daemon host's runtime.
+
+    There is deliberately **no** escape hatch on this path: a test never
+    has a legitimate reason to install into the daemon host's own runtime,
+    so the answer to "but my test needs a real venv" is a *sacrificial
+    target*, not a bypass — a throwaway blue/green root under ``tmp_path``,
+    which the ``sacrificial_venv_root`` fixture in ``tests/conftest.py``
+    builds and points ``COORD_VENV_DIR`` at. That is the mechanism #2121
+    item 3 asks to be named: the real code path runs against a real
+    directory tree that is not ``~/.coord-venv``, and reaching for
+    ``~/.coord-venv`` raises here instead of succeeding quietly.
+
+    Outside pytest this is a no-op — production upgrades are guarded by the
+    active-colour and live-holder checks in :func:`perform_update`, not by
+    this.
+    """
+    marker = os.environ.get("PYTEST_CURRENT_TEST")
+    if not marker:
+        return
+
+    live = Path.home() / _LIVE_VENV_NAME
+    blue, green = _slots(live)
+    for candidate in (live, blue, green):
+        if str(venv_dir) != str(candidate):
+            continue
+        raise LiveInstallGuardError(
+            f"Refusing to install into the live agent venv at {venv_dir} "
+            f"while running under pytest (PYTEST_CURRENT_TEST={marker!r}). "
+            "A test (or a subprocess it spawned) resolved this machine's "
+            "real ~/.coord-venv instead of an isolated one — that is how a "
+            "live coord-agent's site-packages got replaced underneath it on "
+            "2026-08-11 (#2121). Fix: use the `sacrificial_venv_root` "
+            "fixture (a throwaway blue/green root under tmp_path), or point "
+            "COORD_VENV_DIR at your own tmp_path."
+        )
+
+
+def cli_initiator(command: str) -> str:
+    """A self-describing initiator string for *command* (#2121 item 2).
+
+    Names the operator, the host they ran from and the pid, so an audit row
+    for a fleet roll points back at a specific invocation on a specific box
+    rather than at "something POSTed /update". Deliberately built from
+    cheap, always-available facts — a missing ``$USER`` or an unresolvable
+    hostname degrades a field, never raises.
+    """
+    try:
+        import getpass  # noqa: PLC0415
+
+        user = getpass.getuser()
+    except Exception:  # noqa: BLE001
+        user = os.environ.get("USER") or "unknown-user"
+    try:
+        import socket  # noqa: PLC0415
+
+        host = socket.gethostname()
+    except Exception:  # noqa: BLE001
+        host = "unknown-host"
+    return f"{command} ({user}@{host} pid {os.getpid()})"
+
+
+def _audit_install(
+    *,
+    initiator: str | None,
+    outcome: str,
+    venv_dir: Path,
+    summary: str,
+    details: dict[str, object],
+) -> None:
+    """Record one venv install attempt on the audit trail (#1041, #2121 item 2).
+
+    Best-effort, exactly like every other ``record_audit`` call site — a
+    version upgrade must not fail because the audit row could not be
+    written. But *every* outcome goes through here, including refusals and
+    failures: #2096's invariant is that no surface reports a roll it did
+    not confirm, and an audit trail that only records successes is a
+    surface that does exactly that.
+
+    ``actor`` is the initiator the caller named. When nobody named one it
+    is recorded as ``"unattributed"`` rather than guessed — "we do not know
+    who did this" is the finding #2121 is about, and it should be legible
+    in the row instead of laundered into a plausible-looking name.
+    """
+    from coord.audit import record_audit  # noqa: PLC0415 — avoid an import cycle
+
+    try:
+        import socket  # noqa: PLC0415
+
+        machine = socket.gethostname()
+    except Exception:  # noqa: BLE001
+        machine = None
+    record_audit(
+        tier="operational",
+        category="deploy",
+        event_type="venv_install",
+        actor=initiator or "unattributed",
+        machine=machine,
+        summary=summary,
+        details={"outcome": outcome, "venv_dir": str(venv_dir), **details},
+    )
 
 
 @dataclass
@@ -134,9 +420,30 @@ def ensure_symlink_layout(venv_dir: Path) -> Path:
     return blue
 
 
+def _same_path(a: Path, b: Path) -> bool:
+    """``a`` and ``b`` name the same directory, symlinks and all.
+
+    #2121: a plain ``==`` on ``Path`` is a *string* comparison, and the two
+    sides here do not come from the same place — ``active`` is whatever
+    ``~/.coord-venv``'s symlink literally says, while the slots are built
+    by string-appending ``.blue``/``.green`` to ``venv_dir``. A symlinked
+    ``$HOME``, a ``venv_dir`` passed with a trailing component that
+    resolves elsewhere, or a link written with a different but equivalent
+    spelling makes those disagree — and :func:`_other_slot` then hands back
+    the colour that is *already live* as the one to rebuild, which is the
+    exact mutation this whole module exists to prevent.
+    """
+    if str(a) == str(b):
+        return True
+    try:
+        return a.resolve() == b.resolve()
+    except OSError:
+        return False
+
+
 def _other_slot(venv_dir: Path, active: Path) -> Path:
     blue, green = _slots(venv_dir)
-    return green if active == blue else blue
+    return green if _same_path(active, blue) else blue
 
 
 def _slot_backing_interpreter(venv_dir: Path, interpreter: Path) -> Path | None:
@@ -295,6 +602,8 @@ def perform_update(
     *,
     target_version: str | None = None,
     pip_timeout: float = 180.0,
+    initiator: str | None = None,
+    proc_root: Path = Path("/proc"),
 ) -> UpdateResult:
     """Install ``pkg_spec`` (optionally pinned to *target_version*) into a
     fresh slot, smoke-check it, and atomically swap it into place.
@@ -313,24 +622,83 @@ def perform_update(
     caller's own running interpreter and site-packages, and destroy the
     rollback generation along with it. A refusal here is recoverable (the
     caller just needs restarting first); reaching into that slot is not.
+
+    #2121 widens that from "this process" to "any process on this machine",
+    and adds an explicit assertion that *next_slot* is never the colour
+    ``venv_dir`` currently resolves to. Both refusals are recorded on the
+    audit trail alongside the successes, named to *initiator*.
     """
     log_parts: list[str] = []
+    assert_not_live_install(venv_dir)
     active = ensure_symlink_layout(venv_dir)
     next_slot = _other_slot(venv_dir, active)
 
+    def _refuse(error: str, **details: object) -> UpdateResult:
+        _log.error("perform_update refused: %s", error)
+        _audit_install(
+            initiator=initiator,
+            outcome="refused",
+            venv_dir=venv_dir,
+            summary=f"venv install REFUSED: {error}",
+            details={
+                "pkg_spec": pkg_spec,
+                "target_version": target_version,
+                "active_slot": str(active),
+                "next_slot": str(next_slot),
+                **details,
+            },
+        )
+        return UpdateResult(ok=False, swapped=False, error=error)
+
+    # ── the active colour is immutable ───────────────────────────────────
+    # #2121 item 1. `_other_slot` is *supposed* to make this unreachable,
+    # but the whole incident is that the environment a live process was
+    # executing from got rebuilt anyway, so this is asserted rather than
+    # assumed: whatever path arithmetic happens above, the colour
+    # `venv_dir` resolves to right now is never the colour we rmtree.
+    if _same_path(next_slot, active):
+        return _refuse(
+            f"refusing to update: {next_slot} is the colour {venv_dir} "
+            f"currently resolves to ({active}). An upgrade writes the "
+            "INACTIVE colour and then moves the symlink — rebuilding the "
+            "active one replaces the environment live processes are "
+            "executing from and destroys the rollback generation (#2121)."
+        )
+
     running_slot = _slot_backing_interpreter(venv_dir, Path(sys.executable))
-    if running_slot is not None and running_slot == next_slot:
-        return UpdateResult(
-            ok=False,
-            swapped=False,
-            error=(
-                f"refusing to update: this process's own interpreter "
-                f"({sys.executable}) is running from {next_slot}, the slot "
-                "this update would delete and rebuild. venv_dir currently "
-                f"symlinks to {active}, so a prior swap flipped it without "
-                "this process restarting — restart the caller (or wait for "
-                "idle self-restart, #2139) and retry (#2140)."
-            ),
+    if running_slot is not None and _same_path(running_slot, next_slot):
+        return _refuse(
+            f"refusing to update: this process's own interpreter "
+            f"({sys.executable}) is running from {next_slot}, the slot "
+            "this update would delete and rebuild. venv_dir currently "
+            f"symlinks to {active}, so a prior swap flipped it without "
+            "this process restarting — restart the caller (or wait for "
+            "idle self-restart, #2139) and retry (#2140)."
+        )
+
+    # ── nothing else may be running from the slot either ─────────────────
+    # #2121: this is the guard that was missing on 2026-08-11. The victim
+    # was a `coord-agent` that had been executing from `~/.coord-venv.green`
+    # since 02:32; the updater was a different process entirely, so the
+    # `sys.executable` check above saw nothing to object to and green was
+    # rebuilt underneath a live daemon.
+    holders = processes_holding_slot(next_slot, proc_root=proc_root)
+    if holders:
+        listed = "; ".join(h.describe() for h in holders[:5])
+        if len(holders) > 5:
+            listed += f"; ... and {len(holders) - 5} more"
+        return _refuse(
+            f"refusing to update: {len(holders)} live process(es) are "
+            f"running out of {next_slot}, the slot this update would delete "
+            f"and rebuild — {listed}. Replacing a running process's "
+            "site-packages leaves it executing a mix of two versions (the "
+            "2026-08-11 dellserver incident, #2121). Restart or stop those "
+            "processes — `systemctl --user restart coord-agent` for the "
+            "agent — and retry.",
+            holders=[
+                {"pid": h.pid, "source": h.source, "cmdline": h.cmdline}
+                for h in holders[:20]
+            ],
         )
 
     # Always build fresh — a stale, possibly half-built slot left over from
@@ -340,6 +708,18 @@ def perform_update(
 
     def _fail(error: str) -> UpdateResult:
         shutil.rmtree(next_slot, ignore_errors=True)
+        _audit_install(
+            initiator=initiator,
+            outcome="failed",
+            venv_dir=venv_dir,
+            summary=f"venv install FAILED: {error}",
+            details={
+                "pkg_spec": pkg_spec,
+                "target_version": target_version,
+                "active_slot": str(active),
+                "next_slot": str(next_slot),
+            },
+        )
         return UpdateResult(ok=False, swapped=False, error=error, log="\n".join(log_parts))
 
     # #2140: build with the *symlinked* slot's python, not sys.executable —
@@ -385,6 +765,23 @@ def perform_update(
 
     previous = active
     _atomic_swap(venv_dir, next_slot)
+    _audit_install(
+        initiator=initiator,
+        outcome="swapped",
+        venv_dir=venv_dir,
+        summary=(
+            f"venv install: {pkg_spec} -> {new_version or target_version or '?'} "
+            f"into {next_slot.name}; {venv_dir.name} swapped "
+            f"{previous.name} -> {next_slot.name}"
+        ),
+        details={
+            "pkg_spec": pkg_spec,
+            "target_version": target_version,
+            "new_version": new_version,
+            "slot": str(next_slot),
+            "previous_slot": str(previous),
+        },
+    )
     return UpdateResult(
         ok=True,
         swapped=True,
@@ -395,13 +792,18 @@ def perform_update(
     )
 
 
-def rollback(venv_dir: Path) -> UpdateResult:
+def rollback(venv_dir: Path, *, initiator: str | None = None) -> UpdateResult:
     """Flip *venv_dir* back onto the previous generation, if one exists.
 
     The previous slot is smoke-checked before the swap — a rollback that
     would land on a broken install is refused, leaving the current
     (presumably also broken, but at least known) slot in place rather than
     trading one failure for another.
+
+    Nothing is deleted here (only the symlink moves), so there is no
+    live-process hazard to guard — but the swap still changes which code
+    the machine's *next* process start runs, so it is audited on the same
+    waist as an install (#2121 item 2).
     """
     active = current_slot(venv_dir)
     if active is None:
@@ -424,6 +826,20 @@ def rollback(venv_dir: Path) -> UpdateResult:
         )
 
     _atomic_swap(venv_dir, previous)
+    _audit_install(
+        initiator=initiator,
+        outcome="rolled_back",
+        venv_dir=venv_dir,
+        summary=(
+            f"venv rollback: {venv_dir.name} swapped {active.name} -> "
+            f"{previous.name} (now {version or '?'})"
+        ),
+        details={
+            "new_version": version,
+            "slot": str(previous),
+            "previous_slot": str(active),
+        },
+    )
     return UpdateResult(
         ok=True,
         swapped=True,

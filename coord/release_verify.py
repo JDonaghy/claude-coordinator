@@ -259,6 +259,48 @@ def findings_for_host(host: str, health: dict | None) -> list[Finding]:
     """
     out: list[Finding] = []
 
+    # ── the process whose code changed underneath it (#2121) ─────────────
+    # An agent publishes two different reads of its own version: `version`
+    # is the module it loaded at import time (fixed for the life of the
+    # process) and `installed_version` is a fresh `importlib.metadata` read
+    # of the site-packages that same process resolves through. A correct
+    # blue/green update cannot make those disagree — the swap moves the
+    # `~/.coord-venv` symlink, while a running process stays pinned to the
+    # slot it started from, so *both* reads stay on the old version until
+    # it restarts. They disagree only when the files under the running
+    # process's own sys.path were **replaced in place**.
+    #
+    # That is a different and worse condition than "this host is behind",
+    # and until now it graded identically: a routine `CRIT ... on 0.5.36,
+    # expected 0.5.37`, the same line a merely-lagging host gets. A host
+    # that is behind is running code that exists; this one is running code
+    # that no longer exists on disk, in a process that will load the *new*
+    # version for anything it imports from here on. It reads differently.
+    running = (health or {}).get("version")
+    installed = (health or {}).get("installed_version")
+    if running and installed and running != installed:
+        out.append(
+            Finding(
+                severity="crit",
+                host=host,
+                lane="coord-agent process",
+                summary=(
+                    f"MIXED-VERSION PROCESS: running v{running} from an "
+                    f"install that is now v{installed}"
+                ),
+                detail=(
+                    "this process's site-packages was REPLACED UNDERNEATH IT "
+                    "— it holds already-imported modules at the old version "
+                    "and loads anything imported later at the new one. This "
+                    "is not a host that is merely behind: a blue/green swap "
+                    "never produces this, so something wrote into the venv "
+                    "colour a live process was executing from (#2121). "
+                    "Restart it (`systemctl --user restart coord-agent`) and "
+                    "find the install in `coord audit --type venv_install`."
+                ),
+            )
+        )
+
     # ── editable installs ────────────────────────────────────────────────
     # #1834: "any editable install on a service PATH is a finding on its own,
     # independent of its current version — it is a drift amplifier that

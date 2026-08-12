@@ -1084,3 +1084,92 @@ def test_gather_labels_the_daemon_lane_with_the_real_machine_name(monkeypatch) -
         board_payload=lambda: {},
     )
     assert name == "dellserver"
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# #2121: a process whose code changed underneath it is not "behind"
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _mixed_health(*results: dict, running: str, installed: str) -> dict:
+    """An agent `/health` body reporting two different self-versions.
+
+    `version` is the module this process loaded at import time;
+    `installed_version` is a fresh `importlib.metadata` read of the
+    site-packages that same process resolves through (coord/agent_app.py).
+    """
+    body = _health(*results)
+    body["version"] = running
+    body["installed_version"] = installed
+    return body
+
+
+def test_mixed_version_process_reads_differently_from_merely_behind() -> None:
+    """#2121 acceptance 4. On 2026-08-11 `coord release verify` graded
+    dellserver's rewritten-underneath agent as a routine `CRIT ... on
+    0.5.36, expected 0.5.37` — the identical line a host that simply hasn't
+    been rolled yet gets. A process running code that no longer exists on
+    disk is a different and worse condition and must not be spelled the
+    same way."""
+    behind = rv.verify(
+        machine_health={"precision": _health(_agent_venv(STALE))},
+        expected=RELEASED,
+    )
+    mixed = rv.verify(
+        machine_health={
+            "dellserver": _mixed_health(
+                _agent_venv(RELEASED), running=STALE, installed=RELEASED,
+            )
+        },
+        expected=RELEASED,
+    )
+
+    behind_text = rv.render(behind)
+    mixed_text = rv.render(mixed)
+
+    # The lagging host says nothing about mixed versions...
+    assert "MIXED-VERSION PROCESS" not in behind_text
+    assert "REPLACED UNDERNEATH IT" not in behind_text
+    # ...and the rewritten one is unmistakable, naming both versions.
+    assert "MIXED-VERSION PROCESS" in mixed_text
+    assert f"running v{STALE}" in mixed_text
+    assert f"install that is now v{RELEASED}" in mixed_text
+    assert "REPLACED UNDERNEATH IT" in mixed_text
+    assert mixed.severity == "crit"
+
+
+def test_mixed_version_finding_survives_with_no_expected_version() -> None:
+    """The 2026-08-11 run had no `--expected` to grade against — the finding
+    must not depend on one, since the skew is inside a single host."""
+    report = rv.verify(
+        machine_health={
+            "dellserver": _mixed_health(
+                _agent_venv(RELEASED), running=STALE, installed=RELEASED,
+            )
+        },
+    )
+    mixed = [f for f in report.findings if "MIXED-VERSION PROCESS" in f.summary]
+    assert len(mixed) == 1
+    assert mixed[0].severity == "crit"
+    assert mixed[0].host == "dellserver"
+
+
+def test_agreeing_self_versions_produce_no_mixed_version_finding() -> None:
+    """A correct blue/green swap leaves a live process pinned to the slot it
+    started from, so BOTH reads stay on the old version until it restarts —
+    that must not be reported as a rewritten install."""
+    report = rv.verify(
+        machine_health={
+            "dellserver": _mixed_health(
+                _agent_venv(RELEASED), running=STALE, installed=STALE,
+            )
+        },
+    )
+    assert not [f for f in report.findings if "MIXED-VERSION" in f.summary]
+
+
+def test_an_agent_that_reports_only_one_self_version_is_not_a_finding() -> None:
+    """Older agents publish `version` but not `installed_version`; absence is
+    no data, never a mixed-version claim."""
+    report = rv.verify(machine_health={"old": _health(_agent_venv(RELEASED))})
+    assert not [f for f in report.findings if "MIXED-VERSION" in f.summary]
