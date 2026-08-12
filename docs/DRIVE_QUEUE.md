@@ -285,8 +285,10 @@ one of them:
    computed, not stored, so a tick reading the local DB directly has no
    `merge_plan` section at all.
 2. **A ceiling on any reading that cannot refresh itself**
-   (`PARK_STALE_SECONDS`, 45 min). That covers the daemon-host lane above.
-   The entry returns to `waiting` and re-enters the normal walk; the resume
+   (`PARK_STALE_SECONDS`, 45 min). That covers the local-DB / no-`merge_plan`
+   lane — a tick reading the DB directly (no `board_service`), where exit 1
+   above never applies because there is no `merge_plan` section to re-derive
+   from. The entry returns to `waiting` and re-enters the normal walk; the resume
    reason says only that the reading went unrefreshable, not that CI passed,
    because nothing on that lane knows whether it did. A park founded on the
    live plan's own objection is exempt — it re-derives every board build and
