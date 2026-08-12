@@ -451,3 +451,130 @@ def test_resolve_webapp_source_dir_falls_back_to_the_first_checkout_with_one(
 def test_resolve_webapp_source_dir_is_none_when_no_checkout_has_one(tmp_path) -> None:
     ctx = make_ctx(tmp_path, checkouts=())
     assert dlf.resolve_webapp_source_dir(ctx) is None
+
+
+# ── webapp_build_heartbeat (#2122) ─────────────────────────────────────────
+#
+# coord-web-dist-build.sh's up-to-date tick deliberately stopped logging
+# (see that script's header) so the timer's journal footprint doesn't grow
+# unbounded at its own cadence -- but that means the journal alone can no
+# longer answer "is the timer still firing?". This heartbeat file, written
+# on every tick regardless of outcome, is the surface that closes that gap.
+
+
+def _heartbeat_path(tmp_path: Path) -> Path:
+    return tmp_path / ".coord-web-releases" / ".last-run-at"
+
+
+def test_webapp_build_heartbeat_absent_is_ok_not_warn(tmp_path) -> None:
+    """The overwhelming common case: most machines never run
+    coord-web-dist-build.timer at all -- absent must read as OK, same
+    convention as every other lane in this module, not as a fault."""
+    ctx = make_ctx(tmp_path)
+    result = dlf.probe_webapp_build_heartbeat(ctx)
+    assert result.severity is Severity.OK
+    assert result.values["present"] is False
+
+
+def test_webapp_build_heartbeat_recent_up_to_date_is_ok(tmp_path) -> None:
+    path = _heartbeat_path(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text(f"{NOW - 60} up-to-date c339ced8\n")
+
+    ctx = make_ctx(tmp_path)
+    result = dlf.probe_webapp_build_heartbeat(ctx)
+    assert result.severity is Severity.OK
+    assert "1m ago" in result.headroom
+    assert result.values["status"] == "up-to-date"
+    assert result.values["sha"] == "c339ced8"
+
+
+def test_webapp_build_heartbeat_recent_published_is_ok(tmp_path) -> None:
+    path = _heartbeat_path(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text(f"{NOW - 30} published deadbeef\n")
+
+    ctx = make_ctx(tmp_path)
+    result = dlf.probe_webapp_build_heartbeat(ctx)
+    assert result.severity is Severity.OK
+    assert "published" in result.headroom
+
+
+def test_webapp_build_heartbeat_past_warn_threshold_is_warn(tmp_path) -> None:
+    path = _heartbeat_path(tmp_path)
+    path.parent.mkdir(parents=True)
+    # 45min old; default warn is 30min.
+    path.write_text(f"{NOW - 45 * 60} up-to-date c339ced8\n")
+
+    ctx = make_ctx(tmp_path)
+    result = dlf.probe_webapp_build_heartbeat(ctx)
+    assert result.severity is Severity.WARN
+    assert "coord-web-dist-build.timer" in result.detail
+
+
+def test_webapp_build_heartbeat_past_crit_threshold_is_crit(tmp_path) -> None:
+    path = _heartbeat_path(tmp_path)
+    path.parent.mkdir(parents=True)
+    # 4 hours old; default crit is 180min (3h).
+    path.write_text(f"{NOW - 4 * 3600} error c339ced8\n")
+
+    ctx = make_ctx(tmp_path)
+    result = dlf.probe_webapp_build_heartbeat(ctx)
+    assert result.severity is Severity.CRIT
+    assert "has not fired" in result.detail
+
+
+def test_webapp_build_heartbeat_respects_configured_thresholds(tmp_path) -> None:
+    """A dead trigger must be detectable on a schedule that matches
+    whatever cadence THIS install actually configured, not just the
+    shipped default -- an operator who widens the timer's own cadence
+    (or narrows it) needs the heartbeat thresholds to move with it."""
+    path = _heartbeat_path(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text(f"{NOW - 5 * 60} up-to-date c339ced8\n")
+
+    ctx = make_ctx(
+        tmp_path,
+        thresholds=HealthConfig(
+            webapp_build_heartbeat_warn_minutes=1.0,
+            webapp_build_heartbeat_crit_minutes=2.0,
+        ),
+    )
+    result = dlf.probe_webapp_build_heartbeat(ctx)
+    assert result.severity is Severity.CRIT
+
+
+def test_webapp_build_heartbeat_unparseable_is_unknown(tmp_path) -> None:
+    path = _heartbeat_path(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text("not a heartbeat line\n")
+
+    ctx = make_ctx(tmp_path)
+    result = dlf.probe_webapp_build_heartbeat(ctx)
+    assert result.severity is Severity.UNKNOWN
+
+
+def test_webapp_build_heartbeat_empty_file_is_unknown(tmp_path) -> None:
+    path = _heartbeat_path(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text("")
+
+    ctx = make_ctx(tmp_path)
+    result = dlf.probe_webapp_build_heartbeat(ctx)
+    assert result.severity is Severity.UNKNOWN
+
+
+def test_resolve_webapp_build_heartbeat_path_default(tmp_path) -> None:
+    ctx = make_ctx(tmp_path)
+    assert dlf.resolve_webapp_build_heartbeat_path(ctx) == _heartbeat_path(tmp_path)
+
+
+def test_resolve_webapp_build_heartbeat_path_prefers_the_configured_path(
+    tmp_path,
+) -> None:
+    configured = tmp_path / "elsewhere" / ".last-run-at"
+    ctx = make_ctx(
+        tmp_path,
+        thresholds=HealthConfig(webapp_build_heartbeat_path=str(configured)),
+    )
+    assert dlf.resolve_webapp_build_heartbeat_path(ctx) == configured

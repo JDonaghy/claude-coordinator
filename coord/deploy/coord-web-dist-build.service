@@ -37,7 +37,7 @@ Type=oneshot
 ExecStart=%h/.local/bin/coord-web-dist-build.sh
 # The script has its own flock (coord-web-dist-build.lock); this is a
 # generous ceiling for a wedged `npm ci`/`npm run build`, well below the
-# timer's 1-minute cadence so a genuinely stuck run can't run into the next
-# fire indefinitely.
+# timer's 10-minute cadence (#2122) so a genuinely stuck run can't run into
+# the next fire indefinitely.
 TimeoutStartSec=300
 Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin

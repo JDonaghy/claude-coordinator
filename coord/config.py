@@ -1494,6 +1494,23 @@ class HealthConfig:
     # reasoning as `tui_source_dir`: rooting at the webapp package root would
     # sweep `node_modules`/`dist` were they not already skipped by name.
     webapp_source_dir: str | None = None
+    # Absolute path to the heartbeat coord-web-dist-build.sh writes on EVERY
+    # invocation, whether or not there was anything to build (#2122). None →
+    # ~/.coord-web-releases/.last-run-at — the sibling of $BLOCKED_SHA_FILE
+    # in that same script. This is what lets `webapp_build_heartbeat`
+    # distinguish "up to date" from "has not run since <time>": the timer
+    # deliberately stopped logging its no-op tick to keep the journal quiet,
+    # so this file is the only remaining proof of a live trigger.
+    webapp_build_heartbeat_path: str | None = None
+    # Age (minutes) past which a stale heartbeat is worth a look — 3x
+    # coord-web-dist-build.timer's 10-minute cadence (#2122), so one or two
+    # missed/overlapping ticks (flock contention, a slow npm build) never
+    # trips this; a timer that is actually disabled or wedged does.
+    webapp_build_heartbeat_warn_minutes: float = 30.0
+    # Age (minutes) past which the timer has almost certainly stopped firing
+    # altogether, not just missed a tick or two — 3 hours, ~18 missed fires
+    # in a row at the 10-minute cadence.
+    webapp_build_heartbeat_crit_minutes: float = 180.0
 
     # ── systemd unit-file drift (#1831) ────────────────────────────────────
     # `deploy/*.service`/`*.timer` is version-controlled and reviewed but
@@ -2575,6 +2592,8 @@ _HEALTH_FLOAT_FIELDS: dict[str, float] = {
     "graph_stale_crit_hours": 0.0,
     "plan_usage_warn_pct": 0.0,
     "plan_usage_crit_pct": 0.0,
+    "webapp_build_heartbeat_warn_minutes": 0.0,
+    "webapp_build_heartbeat_crit_minutes": 0.0,
 }
 _HEALTH_INT_FIELDS: tuple[str, ...] = (
     "worktree_warn_count",
@@ -2600,6 +2619,7 @@ _HEALTH_OPT_STR_FIELDS: tuple[str, ...] = (
     "systemd_user_dir",
     "webapp_dist_path",
     "webapp_source_dir",
+    "webapp_build_heartbeat_path",
 )
 # Pairs that must not be inverted.  A config where warn is stricter than crit
 # silently makes the crit level unreachable — the check keeps reporting WARN
@@ -2612,6 +2632,11 @@ _HEALTH_ORDERED_PAIRS: tuple[tuple[str, str, str], ...] = (
     ("plan_usage_warn_pct", "plan_usage_crit_pct", "asc"),
     ("worktree_warn_count", "worktree_crit_count", "asc"),
     ("agent_version_warn_behind", "agent_version_crit_behind", "asc"),
+    (
+        "webapp_build_heartbeat_warn_minutes",
+        "webapp_build_heartbeat_crit_minutes",
+        "asc",
+    ),
     # Disk thresholds are *headroom* percentages, so crit must be the lower
     # number: warn at 15% free, crit at 7% free.
     ("disk_warn_free_pct", "disk_crit_free_pct", "desc"),

@@ -62,6 +62,9 @@ _DEFAULT_TUI_BINARY = "~/.local/bin/coord-tui"
 # Mirrors `deploy/coord-web-dist-build.sh`'s `$LIVE_LINK` — the symlink
 # `coord-web-dist-build.timer` atomically repoints at each new release.
 _DEFAULT_WEBAPP_DIST = "~/coord-web-dist"
+# Mirrors `deploy/coord-web-dist-build.sh`'s `$HEARTBEAT_FILE` (#2122) — its
+# default `$RELEASES_DIR` sibling to `$BLOCKED_SHA_FILE`.
+_DEFAULT_WEBAPP_BUILD_HEARTBEAT = "~/.coord-web-releases/.last-run-at"
 
 # Cap on the tui/ source walk, mirroring the old daemon-side walk: the tree
 # is a few hundred .rs files, so anything past this is a misconfigured
@@ -121,6 +124,17 @@ def resolve_webapp_dist_path(ctx: HealthContext):
     if configured:
         return expand(configured, ctx.home)
     return expand(_DEFAULT_WEBAPP_DIST, ctx.home)
+
+
+def resolve_webapp_build_heartbeat_path(ctx: HealthContext):
+    """This machine's ``coord-web-dist-build.sh`` heartbeat file, if any
+    (#2122). Written on EVERY invocation — including the up-to-date no-op
+    the script deliberately no longer logs — so its content answers "did
+    the timer actually fire recently?" independent of the journal."""
+    configured = getattr(ctx.thresholds, "webapp_build_heartbeat_path", None)
+    if configured:
+        return expand(configured, ctx.home)
+    return expand(_DEFAULT_WEBAPP_BUILD_HEARTBEAT, ctx.home)
 
 
 def resolve_webapp_source_dir(ctx: HealthContext):
@@ -454,5 +468,136 @@ def probe_webapp_bundle(ctx: HealthContext) -> CheckResult:
         scope="machine",
         severity=Severity.OK,
         headroom="up to date with webapp/ source",
+        values=values,
+    )
+
+
+def _parse_webapp_build_heartbeat(text: str):
+    """Parses ``"<epoch> <status> [<sha>]"``, the line
+    ``coord-web-dist-build.sh``'s ``heartbeat()`` helper writes. Returns
+    ``(epoch, status, sha)``, or ``None`` for anything that doesn't parse —
+    a partial/corrupt write (mid-``mv``, disk full) must degrade to
+    UNKNOWN, never crash the health tick or fabricate a timestamp.
+    """
+    parts = text.strip().split(None, 2)
+    if not parts:
+        return None
+    try:
+        epoch = float(parts[0])
+    except ValueError:
+        return None
+    status = parts[1] if len(parts) > 1 else ""
+    sha = parts[2] if len(parts) > 2 else ""
+    return epoch, status, sha
+
+
+@check(
+    id="webapp_build_heartbeat",
+    scope="machine",
+    title="webapp build heartbeat",
+    order=48,
+    description=(
+        "coord-web-dist-build.sh's heartbeat file, written on EVERY tick "
+        "whether or not there was anything to build (#2122) — the only "
+        "surface that distinguishes 'up to date' from 'has not run since "
+        "<time>', now that the up-to-date tick is deliberately silent in "
+        "the journal (see that script's header)."
+    ),
+)
+def probe_webapp_build_heartbeat(ctx: HealthContext) -> CheckResult:
+    """The freshness analogue of :func:`probe_webapp_bundle`, but answering
+    a different question. `webapp_bundle` only notices a dead trigger AFTER
+    `webapp/` source has moved past the published bundle — a host with no
+    pending webapp/ merges looks identically "OK" whether the timer fires
+    every 10 minutes or has been disabled for a week. This reads the
+    heartbeat directly, so a dead trigger is visible immediately, with no
+    dependency on there being unbuilt source to expose it.
+    """
+    path = resolve_webapp_build_heartbeat_path(ctx)
+    values: dict = {"path": str(path)}
+
+    try:
+        present = path.exists()
+    except OSError:
+        present = False
+
+    if not present:
+        # Same convention as every other lane in this module: most machines
+        # never run coord-web-dist-build.timer at all — absent, not stale.
+        return CheckResult(
+            check_id="webapp_build_heartbeat",
+            scope="machine",
+            severity=Severity.OK,
+            headroom="not present on this machine",
+            values={**values, "present": False},
+        )
+
+    values["present"] = True
+    try:
+        text = path.read_text()
+    except OSError as exc:
+        return CheckResult(
+            check_id="webapp_build_heartbeat",
+            scope="machine",
+            severity=Severity.UNKNOWN,
+            headroom=f"could not read heartbeat file ({type(exc).__name__})",
+            error=str(exc),
+            values=values,
+        )
+
+    parsed = _parse_webapp_build_heartbeat(text)
+    if parsed is None:
+        return CheckResult(
+            check_id="webapp_build_heartbeat",
+            scope="machine",
+            severity=Severity.UNKNOWN,
+            headroom="heartbeat file present but unparseable",
+            error=f"unparseable content: {text[:120]!r}",
+            values=values,
+        )
+
+    epoch, status, sha = parsed
+    age_minutes = max(0.0, (ctx.now - epoch) / 60.0)
+    values.update(
+        {"last_run_at": epoch, "status": status, "sha": sha, "age_minutes": age_minutes}
+    )
+
+    th = ctx.thresholds
+    warn_minutes = getattr(th, "webapp_build_heartbeat_warn_minutes", 30.0)
+    crit_minutes = getattr(th, "webapp_build_heartbeat_crit_minutes", 180.0)
+
+    if age_minutes >= crit_minutes:
+        return CheckResult(
+            check_id="webapp_build_heartbeat",
+            scope="machine",
+            severity=Severity.CRIT,
+            headroom=f"has not run in {age_minutes / 60.0:.1f}h (last: {status or 'unknown'})",
+            detail=(
+                "coord-web-dist-build.timer has not fired in a very long "
+                "time — check `systemctl --user status "
+                "coord-web-dist-build.timer` on this machine; a merged "
+                "webapp/ change could be sitting unpublished with no other "
+                "symptom until someone loads the dashboard"
+            ),
+            threshold=f"crit when the last heartbeat is older than {crit_minutes:.0f}min",
+            values=values,
+        )
+
+    if age_minutes >= warn_minutes:
+        return CheckResult(
+            check_id="webapp_build_heartbeat",
+            scope="machine",
+            severity=Severity.WARN,
+            headroom=f"has not run in {age_minutes:.0f}m (last: {status or 'unknown'})",
+            detail="check `systemctl --user status coord-web-dist-build.timer` on this machine",
+            threshold=f"warn when the last heartbeat is older than {warn_minutes:.0f}min",
+            values=values,
+        )
+
+    return CheckResult(
+        check_id="webapp_build_heartbeat",
+        scope="machine",
+        severity=Severity.OK,
+        headroom=f"last ran {age_minutes:.0f}m ago ({status or 'unknown'})",
         values=values,
     )

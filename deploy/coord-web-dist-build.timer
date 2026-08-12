@@ -2,14 +2,39 @@
 # a cadence. See that unit's header, and deploy/coord-web-dist-build.sh's
 # header, for the full rationale.
 #
-# 1 minute — the #1543 acceptance target ("live... within a minute").  This
-# is safe at a tight cadence for two reasons a 15-minute cadence (like
-# coord-drive-queue.timer) doesn't need to justify:
+# 10 minutes (was 1 minute — #2122). The #1543 acceptance target ("live...
+# within a minute") picked its cadence from a *desire*, not from how often
+# there was ever anything to do: at 1min this fired 53 times/hour on
+# dellserver, every single one logging "up to date ... nothing to build",
+# which is what buried the host journal (#2122's own investigation was
+# slowed by exactly this noise). This unit does not exist to react to every
+# commit on `main` — only to ones that touch coord/dashboard/webapp/, and
+# #2122 measured that directly against this repo's own history:
+#
+#   - ALL merges to main: median gap ~41min, but bursts land seconds apart
+#     (some measured 7s apart) — polling that tightly buys nothing, since a
+#     burst still resolves to one `origin/main` SHA by the time any one
+#     tick runs.
+#   - Merges that touch coord/dashboard/webapp/ specifically — the only
+#     ones this unit's build is *for* — over the trailing 30 days: ~1/day,
+#     median gap ~14.3h, and the SHORTEST gap between two such merges in
+#     that entire window was ~39min.
+#
+# 10 minutes stays well under that observed floor (39min), so this cadence
+# is never the reason a real webapp change sits unbuilt for anywhere close
+# to as long as merges to webapp/ actually take to arrive — while cutting
+# ticks from ~1,270/day to ~144/day (~8.8x). Still safe at a tight-ish
+# cadence for two reasons a much slower poll (like coord-drive-queue.timer's
+# 3min) doesn't need to justify:
 #
 #   1. Most fires are a no-op: the script compares origin/main's resolved SHA
 #      against the currently-published release and exits immediately if
 #      nothing merged since the last run — no npm invocation, no I/O beyond
-#      one `git fetch` + `rev-parse`.
+#      one `git fetch` + `rev-parse`, and (#2122) no journal line either; it
+#      only updates a heartbeat file (see coord-web-dist-build.sh's
+#      HEARTBEAT_FILE) so a dead trigger stays distinguishable from "quiet
+#      because nothing merged" — see
+#      coord.health.checks.deploy_lane_facts.probe_webapp_build_heartbeat.
 #   2. The script's own flock means a slow build (network hiccup during
 #      `npm ci`, etc.) can't stack with the next fire — a busy run is
 #      detected and the new invocation exits 0 immediately, exactly like
@@ -17,19 +42,19 @@
 #
 # A build that actually runs (something under coord/dashboard/webapp/**
 # merged) takes on the order of tens of seconds; that run and the next may
-# overlap the flock, in which case the next fire simply retries a minute
-# later — still within the acceptance target on average.
+# overlap the flock, in which case the next fire simply retries 10 minutes
+# later.
 #
 # Install: see deploy/coord-web-dist-build.sh's header, or
 # docs/PHONE_WEBAPP.md / docs/AGENT_OPERATIONS.md.
 
 [Unit]
-Description=Rebuild coord webapp dist from merged main every minute (#1543)
+Description=Rebuild coord webapp dist from merged main every 10 minutes (#1543, #2122)
 
 [Timer]
-OnBootSec=1min
-OnUnitActiveSec=1min
-AccuracySec=10s
+OnBootSec=2min
+OnUnitActiveSec=10min
+AccuracySec=30s
 Persistent=false
 
 [Install]
