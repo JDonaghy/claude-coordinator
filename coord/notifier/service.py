@@ -36,6 +36,7 @@ from coord.notifier.store import (
     NotifierState,
     load_state,
     record_delivered,
+    record_held,
     save_state,
 )
 from coord.notifier.transport import Transport, build_transport, safe_send
@@ -183,6 +184,13 @@ def _tick(
     send_now, hold = partition(fresh, window, now)
     if hold:
         state.deferred.extend(hold)
+        # Ledger held events at hold time, not only at delivery time — see
+        # `record_held`'s docstring.  Without this a persisting condition
+        # (halted drive, parked gate, stalled worker) looks "fresh" to
+        # `select_deliverable` on every tick for the rest of the quiet-hours
+        # window and duplicate-floods `state.deferred` (#1632 fix
+        # iteration 1).
+        record_held(state, hold, now=now)
         result.deferred = list(hold)
 
     delivered, failed = deliver(send_now, transport, state, now=now)

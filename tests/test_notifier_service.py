@@ -213,6 +213,54 @@ def test_quiet_hours_hold_then_one_digest_at_0800():
     assert len(transport.sent[0].body.splitlines()) == 2
 
 
+def test_a_persisting_condition_through_an_open_quiet_window_holds_once():
+    """A held event must be ledgered at hold time, not only at delivery
+    time (#1632 fix iteration 1).
+
+    Without that, `select_deliverable`'s "fire once per subject/condition"
+    dedupe — which only consults the ledger — treats the same persisting
+    condition (a halted drive, a parked gate, a stalled worker: exactly the
+    long-lived cases this feature targets) as fresh on every tick, and
+    `state.deferred` fills with duplicates of the one subject/condition for
+    as long as quiet hours and the condition both last, eventually evicting
+    older, genuinely distinct events once MAX_DEFERRED is reached.
+    """
+    transport = MemoryTransport()
+    config = quiet_config()
+
+    # 18 ticks, 30 minutes apart, every one of them inside the 22:00-08:00
+    # window, the same halted drive on every single one — the realistic
+    # overnight-halt scenario, not a one-off hold.
+    for step in range(18):
+        moment = at(23, 0) + step * 1800.0
+        snapshot = PipelineSnapshot(
+            now=moment,
+            halted=[HaltedDrive(repo="coord", issue=7, reason="FOREIGN")],
+        )
+        result = run(config, now=moment, snapshot=snapshot, transport=transport)
+        assert result.delivered == []
+        assert transport.sent == []
+
+    state = store.load_state()
+    assert len(state.deferred) == 1, (
+        "one persisting condition must be held once across the whole quiet "
+        "window, not re-appended on every tick"
+    )
+    assert state.overflow == 0
+    assert len(state.ledger) == 1
+
+    morning = at(8, 0, day=15)
+    flushed = run(
+        config,
+        now=morning,
+        snapshot=PipelineSnapshot(now=morning),
+        transport=transport,
+    )
+    assert flushed.digest is not None
+    assert flushed.digest.detail["count"] == 1
+    assert len(transport.sent) == 1, "no duplicate immediate send alongside the digest"
+
+
 def test_an_urgent_drive_delivers_at_2300():
     transport = MemoryTransport()
     night = at(23, 0)

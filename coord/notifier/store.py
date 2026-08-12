@@ -208,8 +208,20 @@ def save_state(state: NotifierState, *, now: float | None = None) -> bool:
     return True
 
 
-def record_delivered(state: NotifierState, events: Iterable[NotifyEvent], *, now: float) -> None:
-    """Mark *events* as told, so they never fire again for that subject."""
+def _mark_told(state: NotifierState, events: Iterable[NotifyEvent], *, now: float) -> None:
+    """Ledger *events* so ``select_deliverable`` treats them as already told.
+
+    Shared by :func:`record_delivered` (events actually sent) and
+    :func:`record_held` (events deferred into the 08:00 digest) — both call
+    sites must write here.  ``select_deliverable``'s "fire once per
+    subject/condition" dedupe only consults ``state.ledger``; if held events
+    were never ledgered, a persisting condition (a halted drive, a parked
+    gate, a stalled worker — exactly the long-lived cases this feature
+    targets) would be treated as fresh on every tick for as long as quiet
+    hours and the condition both last, re-appending to ``state.deferred``
+    until :data:`MAX_DEFERRED` overflows and evicts older, genuinely
+    distinct events (#1632 fix iteration 1).
+    """
     for event in events:
         if event.condition == "digest":
             continue  # a digest is a re-delivery of already-ledgered events
@@ -221,6 +233,22 @@ def record_delivered(state: NotifierState, events: Iterable[NotifyEvent], *, now
             "issue": event.issue,
             "escalated_from": event.escalated_from,
         }
+
+
+def record_delivered(state: NotifierState, events: Iterable[NotifyEvent], *, now: float) -> None:
+    """Mark *events* as told because they were actually sent."""
+    _mark_told(state, events, now=now)
+
+
+def record_held(state: NotifierState, events: Iterable[NotifyEvent], *, now: float) -> None:
+    """Mark *events* as told because they were held for the 08:00 digest.
+
+    The operator has been promised these — deferred, not discarded — so the
+    same condition on the same subject must not be treated as news again on
+    the next tick while quiet hours are still open.  See :func:`_mark_told`
+    for why this matters as much as the delivered-path call.
+    """
+    _mark_told(state, events, now=now)
 
 
 # ── urgent drives ─────────────────────────────────────────────────────────
