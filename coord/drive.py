@@ -2525,6 +2525,23 @@ def launch_drive_in_tmux(
     return session
 
 
+def _publish_stall_nudge(repo: str, issue: int, *, stalled_for: float) -> None:
+    """Tell the #1632 notifier that this drive just nudged a stalled stage.
+
+    Strictly one-way and strictly advisory: `drive` remains the single
+    definition of "stalled" (#1593) and the notifier is a reader of that
+    decision, never a second author of it. Import is function-local and the
+    whole call is swallowed on failure so a missing/renamed notifier cannot
+    perturb the drive loop.
+    """
+    try:
+        from coord.notifier.store import record_nudge  # noqa: PLC0415
+
+        record_nudge(repo, issue, at=time.time(), stalled_for=stalled_for)
+    except Exception:  # noqa: BLE001 — advisory channel, never breaks a drive
+        pass
+
+
 @dataclass
 class Driver:
     """The resumable state machine's I/O shell: poll → decide → execute → sleep."""
@@ -2993,6 +3010,16 @@ class Driver:
                 )
                 self.run_notify()
                 last_nudge = now
+                # #1632: publish the nudge so the phone notifier can ask
+                # whether the stall SURVIVED it, without defining "stalled"
+                # a second time. `now` here is `self.clock` (monotonic and
+                # process-local), so stamp the record with wall-clock time —
+                # a different process reads this file. Advisory: a failure
+                # to record must never affect the drive, which is why
+                # `record_nudge` swallows everything internally.
+                _publish_stall_nudge(
+                    self.repo, self.issue, stalled_for=now - last_change
+                )
 
             action = decide(
                 state, self.opts, counters, self.verifier,

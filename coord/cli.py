@@ -84,6 +84,9 @@ from coord.commands.tui import tui_group
 # coord/health/ so the whole feature — registry, probes, renderer, command —
 # stays in one package. Registered here like any other command.
 from coord.health.cli import health
+# #1632: same arrangement for the fleet notifier — predicate, baselines,
+# transport seam and CLI all live in coord/notifier/.
+from coord.notifier.cli import notifier_group
 from coord.commands.merge import (
     bounce,
     merge,
@@ -385,6 +388,7 @@ main.add_command(diagnose)
 main.add_command(gates)
 main.add_command(doctor)
 main.add_command(health)
+main.add_command(notifier_group)
 main.add_command(issue_group)
 main.add_command(context_group)
 main.add_command(audit)

@@ -352,3 +352,104 @@ models:
 # capability is refused up front (`coord.providers.
 # guard_provider_machine_capability`) rather than failing at spawn time.
 
+
+
+# ── notifications (#1632) — phone push when NOBODY IS COMING ────────────────
+#
+# You kick off an epic in the morning, hoping it is demo-ready tomorrow. You go
+# out. You have your phone and no terminal. The epic dies a quarter of the way
+# through and you find out at 6pm. This is the away-from-terminal channel for
+# exactly that — every other surface (`coord status`, the TUI, `coord diagnose`)
+# requires you to already be sitting at a terminal, which is precisely where you
+# are not.
+#
+# THE PREDICATE: "notify when the pipeline has stopped, or is stalled, and will
+# not advance without a human." Explicitly NOT "something bad happened" — a
+# failed test, a request-changes review, a mechanical merge conflict are all
+# handled by the auto-loop, and pushing them is the noise that trains you to
+# mute the channel. It does not ping progress either. In normal operation this
+# fires approximately never.
+#
+# Fires on: a drive halting; a gate parked HUMAN_REQUIRED; a worker emitting
+# `STUCK:`; a stall that survived `drive`'s nudge (#1593); a leg running far
+# longer than comparable work (learned, see `percentile` below); a fleet CRIT
+# that invalidates in-flight work.
+#
+# ADVISORY AND ISOLATED: an unreachable ntfy server can never affect dispatch,
+# routing, the board or any verdict (same rule and same reason as #1485). The
+# whole subsystem is off by default — omit this block entirely and nothing
+# changes.
+#
+# Inspect it with `coord notifier status` / `coord notifier baselines`, and
+# prove the transport with `coord notifier test`.
+#
+# notifications:
+#   enabled: true
+#
+#   # Self-hosted ntfy on the daemon host, reachable over Tailscale. Nothing
+#   # leaves the tailnet — event text carries repo names, issue titles and
+#   # failure detail. The Android client holds an instant-delivery connection
+#   # straight to this server; no relay, no third party. `transport: none` runs
+#   # the predicate and updates the ledger while delivering nothing, which is
+#   # the right setting for a week of shaking out false positives.
+#   transport: ntfy
+#   ntfy_url: http://dellserver:7440
+#   ntfy_topic: coord-fleet
+#   # ntfy_token: tk_...      # only needed if the server has auth enabled
+#   timeout_secs: 5
+#
+#   # `coord web` origin. Notifications must be actionable from a phone, so
+#   # every event that can name an issue links straight to its pipeline view
+#   # rather than expecting you to go find it.
+#   web_base_url: http://dellserver:7434
+#
+#   # QUIET HOURS ARE A DEFERRAL WINDOW, NOT A FILTER. Events raised inside it
+#   # are held, coalesced, and delivered as ONE digest when it closes. Nothing
+#   # is discarded — you are not disturbed, you are still told.
+#   #
+#   # NO SEVERITY LEVEL PIERCES THIS. Severity is assigned by the sender, and a
+#   # receiver who gets woken by things that did not warrant it mutes the
+#   # channel within a month — at which point the whole feature is dead. This is
+#   # a hard design rule, not a default. The ONE exception is a DEADLINE rather
+#   # than a severity: `coord drive --urgent` opts THAT drive out for its
+#   # duration (opt-in, scoped, self-expiring).
+#   #
+#   # `tz` is REQUIRED (IANA zone). `coord serve` runs on UTC, so a naive
+#   # "22:00" would defer at the wrong local hour — and a window that opens
+#   # early silently swallows daytime events.
+#   quiet_hours:
+#     start: "22:00"
+#     end: "08:00"
+#     tz: America/Chicago
+#   urgent_ttl_hours: 12       # how long a `--urgent` opt-out lasts
+#
+#   # "FAR TOO LONG" IS LEARNED, NEVER A FIXED TIMEOUT. A constant is wrong the
+#   # day it is written and rots silently as models, repos and hardware change.
+#   # The baseline is computed per (repo, assignment type, tier) over durations
+#   # milestone #37 already records — an unstratified fleet-wide mean would fire
+#   # constantly on the slow tail and never on the fast one.
+#   #
+#   # Under `min_samples` completed legs a stratum has NO baseline: it falls
+#   # back to a generous absolute ceiling and the notification says so. Never
+#   # fire off a population of one.
+#   min_samples: 5
+#   # p90 of the stratified population. `coord notifier baselines` prints the
+#   # 2x-median alternative alongside it so the two can be compared against real
+#   # fleet data before either is committed to permanently.
+#   percentile: 90
+#   # The output-silence threshold — the probe that catches failures whose only
+#   # symptom is duration — as a fraction of the stratum's median leg, clamped
+#   # to [10m, 45m]. A repo whose test suite takes 20 minutes legitimately goes
+#   # quiet; a fixed value would either spam that repo or never fire on a fast
+#   # one.
+#   silence_fraction: 0.5
+#   # How long a stall must survive `drive`'s nudge before this believes it.
+#   # `drive` owns the definition of "stalled" (#1593); this only says how long
+#   # to give the nudge to work.
+#   stall_grace_mins: 20
+#   # Cold-start ceilings (MINUTES) per assignment type, merged over the
+#   # built-in defaults. Deliberately loose — a cold ceiling exists to catch a
+#   # catastrophically wedged leg, not to be accurate.
+#   # cold_ceiling_mins:
+#   #   work: 240
+#   #   review: 90

@@ -351,6 +351,25 @@ def _no_real_pause_store(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_notifier_state(monkeypatch, tmp_path):
+    """#1632: never let a test write the OPERATOR'S real
+    ``~/.coord/notifier.json``.
+
+    Exactly the ``_no_real_pause_store`` (#2101) hazard one file over, and
+    with a nastier blast radius: the notifier's state file holds the
+    "already told you" ledger, so a leaked test write would either suppress
+    a real phone push (a ledger entry the operator never actually received)
+    or resurrect a stale one. A state file a test *can* write is a state
+    file a test *will* write.
+
+    ``coord.notifier.store.state_path`` reads ``$COORD_NOTIFIER_STATE``
+    first precisely so this redirect is a one-line env set rather than a
+    monkeypatched private function.
+    """
+    monkeypatch.setenv("COORD_NOTIFIER_STATE", str(tmp_path / "notifier-state.json"))
+
+
+@pytest.fixture(autouse=True)
 def _no_dispatch_target_validation(monkeypatch):
     """#2087: default the dispatch-target gate (`record_dispatched` /
     `record_dispatched_assignment` refusing an assignment whose repo/machine

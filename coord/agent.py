@@ -5036,6 +5036,18 @@ class AgentServer:
                     prog = None
                 if prog:
                     d["progress"] = prog
+                # #1632: when this worker last SAID anything, as Unix
+                # seconds.  The output-silence probe is the one that catches
+                # failures with no symptom except duration, and only this
+                # machine can see its own log file — the coordinator cannot
+                # stat a remote path.  A single `stat` on a file that is
+                # already open for append, wrapped so a vanished log can
+                # never break `/status`.
+                if a.log_path:
+                    try:
+                        d["last_output_at"] = os.path.getmtime(a.log_path)
+                    except OSError:
+                        pass
                 # Tail-read stream-json log for live summary fields.
                 if a.log_path and is_stream_json(a.log_path):
                     try:

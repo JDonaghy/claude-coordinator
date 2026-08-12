@@ -61,6 +61,7 @@ def _rebuild_drive_argv(
     deadline_mins: float,
     stall_mins: float,
     notify: bool,
+    urgent: bool,
     accept_advisory: bool,
     force_review: bool,
     no_merge: bool,
@@ -98,6 +99,8 @@ def _rebuild_drive_argv(
     argv += ["--stall", str(stall_mins)]
     if notify:
         argv.append("--notify")
+    if urgent:
+        argv.append("--urgent")
     if accept_advisory:
         argv.append("--accept-advisory")
     if force_review:
@@ -216,6 +219,18 @@ def _rebuild_drive_argv(
     ),
 )
 @click.option(
+    "--urgent",
+    is_flag=True,
+    help=(
+        "Opt THIS drive out of the notifier's quiet hours (#1632), so a "
+        "'nobody is coming' push for it arrives at 02:00 instead of waiting "
+        "for the 08:00 digest. The exception to quiet hours is a deadline, "
+        "not a severity: you know when something is time-critical and the "
+        "system does not. Scoped to this issue and expires on its own "
+        "(notifications.urgent_ttl_hours)."
+    ),
+)
+@click.option(
     "--accept-advisory",
     is_flag=True,
     help=(
@@ -295,6 +310,7 @@ def drive(
     deadline_mins: float,
     stall_mins: float,
     notify: bool,
+    urgent: bool,
     accept_advisory: bool,
     force_review: bool,
     no_merge: bool,
@@ -330,6 +346,7 @@ def drive(
             deadline_mins=deadline_mins,
             stall_mins=stall_mins,
             notify=notify,
+            urgent=urgent,
             accept_advisory=accept_advisory,
             force_review=force_review,
             no_merge=no_merge,
@@ -371,6 +388,15 @@ def drive(
         no_acceptance=no_acceptance,
         config_path=str(config_path) if config_path else "",
     )
+    # #1632: register the quiet-hours opt-out BEFORE the first tick, so a
+    # drive that dies in its own preflight still gets its failure pushed
+    # rather than held until 08:00. Scoped to this issue, carries its own
+    # expiry, and is cleared below when the drive ends — a forgotten flag
+    # must not be able to make every future night loud. Advisory: a
+    # notifier that cannot record this never affects the drive.
+    if urgent:
+        _set_drive_urgency(repo, issue, config, on=True)
+
     driver = Driver(repo=repo, issue=issue, opts=opts, config=config)
     try:
         code = driver.run()
@@ -380,7 +406,31 @@ def drive(
     except KeyboardInterrupt:
         click.echo("interrupted", err=True)
         raise SystemExit(130) from None
+    finally:
+        if urgent:
+            _set_drive_urgency(repo, issue, config, on=False)
     raise SystemExit(code)
+
+
+def _set_drive_urgency(repo: str, issue: int, config, *, on: bool) -> None:
+    """Add/remove this drive's #1632 quiet-hours opt-out, never raising."""
+    try:
+        import time as _time  # noqa: PLC0415
+
+        from coord.notifier import store as _notifier_store  # noqa: PLC0415
+
+        if on:
+            ttl_hours = float(
+                getattr(getattr(config, "notifications", None), "urgent_ttl_hours", 12.0)
+                or 12.0
+            )
+            _notifier_store.mark_urgent(
+                repo, issue, expires_at=_time.time() + ttl_hours * 3600.0
+            )
+        else:
+            _notifier_store.clear_urgent(repo, issue)
+    except Exception:  # noqa: BLE001 — advisory channel, never breaks a drive
+        pass
 
 
 # ── `--tmux` companions: list / attach / stop (#1398) ─────────────────────────
