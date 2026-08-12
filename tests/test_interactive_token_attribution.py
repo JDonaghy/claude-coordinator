@@ -25,11 +25,17 @@ as defense in depth.
 
 from __future__ import annotations
 
+import functools
 import json
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+from click.testing import CliRunner
+
 from coord import interactive
+from coord.cli import main
 
 _BASE = datetime(2026, 8, 9, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -181,6 +187,34 @@ class TestPhysicalPlausibility:
         assert interactive._output_tokens_physically_plausible(1, 0.0) is False
 
 
+class TestContextTokenPlausibility:
+    """#2129 review (non-blocking finding): output_tokens had an independent
+    physical-plausibility backstop but input/cache_creation/cache_read did
+    not — even though they're the more visually dramatic part of the bug
+    report (the 1.24B cache-read figure). Covers the added
+    ``_context_tokens_physically_plausible`` backstop for those three fields.
+    """
+
+    def test_realistic_rate_is_plausible(self) -> None:
+        # A generous-but-real turn: ~30k combined input/cache tokens over a
+        # minute.
+        assert interactive._context_tokens_physically_plausible(2, 7_000, 23_000, 60.0) is True
+
+    def test_generous_ceiling_boundary(self) -> None:
+        ceiling = interactive.MAX_PLAUSIBLE_CONTEXT_TOKENS_PER_SECOND
+        assert interactive._context_tokens_physically_plausible(0, 0, int(ceiling * 60), 60.0) is True
+        assert interactive._context_tokens_physically_plausible(0, 0, int(ceiling * 60) + 1, 60.0) is False
+
+    def test_issue_2129_reported_cache_figure_is_implausible(self) -> None:
+        # From the issue: a 22m45s (1365s) leg credited with a 1.24B
+        # cache-read figure.
+        assert interactive._context_tokens_physically_plausible(0, 0, 1_242_500_000, 1365) is False
+
+    def test_zero_duration_only_plausible_for_zero_tokens(self) -> None:
+        assert interactive._context_tokens_physically_plausible(0, 0, 0, 0.0) is True
+        assert interactive._context_tokens_physically_plausible(1, 0, 0, 0.0) is False
+
+
 class TestPersistInteractiveTokensSkipsImplausibleWrites:
     def test_implausible_result_is_not_persisted(self, tmp_path: Path, monkeypatch, caplog) -> None:
         import coord.state as state_mod
@@ -196,6 +230,34 @@ class TestPersistInteractiveTokensSkipsImplausibleWrites:
             lambda *a, **kw: (1, 5_000_000, 0, 0),
         )
         monkeypatch.setattr(interactive.time, "time", lambda: 1000.0)
+
+        with caplog.at_level("WARNING"):
+            interactive._persist_interactive_tokens("aid-1", 0.0, "/some/worktree")
+
+        assert calls == []
+        assert any("implausible" in r.message for r in caplog.records)
+
+    def test_implausible_cache_only_result_is_not_persisted(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """A regression that only inflates the cache/input fields (output
+        stays realistic) must still be caught -- the scenario the
+        ``_context_tokens_physically_plausible`` backstop exists for."""
+        import coord.state as state_mod
+
+        calls = []
+        monkeypatch.setattr(state_mod, "mark_assignment_interactive", lambda aid: None)
+        monkeypatch.setattr(
+            state_mod, "update_assignment_tokens",
+            lambda *a, **kw: calls.append((a, kw)),
+        )
+        monkeypatch.setattr(
+            interactive, "_tokens_from_transcript",
+            # Realistic output_tokens (would pass the output-only check) but
+            # the reported 1.24B cache-read figure from the bug report.
+            lambda *a, **kw: (2, 140, 0, 1_242_500_000),
+        )
+        monkeypatch.setattr(interactive.time, "time", lambda: 1365.0)
 
         with caplog.at_level("WARNING"):
             interactive._persist_interactive_tokens("aid-1", 0.0, "/some/worktree")
@@ -229,3 +291,173 @@ class TestPersistInteractiveTokensSkipsImplausibleWrites:
             "cache_creation_tokens": 6991,
             "cache_read_tokens": 22715,
         }
+
+
+class TestBlackBoxCliRendering:
+    """#2129 blocking review finding: a black-box test on the actual
+    ``coord usage`` CLI output — not just the unit-level helpers above.
+
+    Drives a synthetic multi-content-block, multi-leg transcript through the
+    REAL pipeline: ``_tokens_from_transcript`` -> ``_persist_interactive_tokens``
+    (real DB writes) -> ``fetch_usage_rows`` (real ``SqliteStore`` read, NOT
+    mocked) -> ``CliRunner().invoke(main, ["usage", ...])``. Reproduces the
+    vimcode #634 shape from the bug report (a ~22m45s interactive `smoke`
+    leg sharing an append-only transcript file with neighboring legs, whose
+    turns carry duplicate per-content-block JSONL lines) and asserts the
+    rendered ``est(~)`` figure is now physically plausible instead of the
+    ~30x-inflated ``~$505.5527`` / ``5.0M`` output-token figure the issue
+    reported.
+    """
+
+    @pytest.fixture
+    def real_file_db(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        """Point BOTH the state-write path (``coord.db.get_connection``,
+        used by ``_persist_interactive_tokens``) and the usage-read path
+        (``coord.dao.SqliteStore`` -> ``DB_PATH``, used by
+        ``fetch_usage_rows``) at the SAME real sqlite file.
+
+        The autouse ``coord_db`` fixture overrides ``get_connection`` with a
+        ``:memory:`` connection, which is fine for tests that only exercise
+        one side — but ``SqliteStore`` always opens its own separate
+        ``mode=ro`` connection, which can never see another connection's
+        ``:memory:`` database. A real file is the only way for a value
+        written via the state-write path to actually be visible to the
+        CLI's read path in the same test, which is the whole point of a
+        black-box test here.
+        """
+        import coord.dao as dao_mod
+        import coord.db as db_mod
+
+        db_path = tmp_path / "usage-blackbox.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        db_mod._ensure_schema(conn)
+        db_mod.override_connection(conn)
+        monkeypatch.setattr(dao_mod, "DB_PATH", db_path)
+        yield db_path
+        db_mod.close()
+
+    def test_interactive_leg_renders_plausible_est_not_30x_inflated(
+        self,
+        real_file_db: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        valid_config_yaml: str,
+    ) -> None:
+        from coord.db import get_connection
+
+        assignment_id = "aid-634-smoke"
+        worktree_path = "/home/john/.coord/worktrees/vimcode634"
+        started_at = _epoch(0)
+        duration = 1365.0  # 22m45s -- exactly the leg length from the bug report
+        finished_at = started_at + duration
+
+        conn = get_connection()
+        conn.execute(
+            "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+            "issue_number, issue_title, status, type, model, dispatched_at, "
+            "finished_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                assignment_id, "laptop", "vimcode", 634, "Fix the thing",
+                "done", "smoke", "sonnet", started_at, finished_at,
+            ),
+        )
+        conn.commit()
+
+        # A synthetic transcript reproducing BOTH original bugs at once:
+        # whole-session attribution (a previous leg's and a following leg's
+        # turns sharing this worktree's one append-only transcript file) and
+        # per-content-block double counting (two JSONL lines — a `thinking`
+        # block and a `tool_use` block -- for the same message id).
+        projects_dir = tmp_path / "claude-projects"
+        proj = projects_dir / worktree_path.replace("/", "-")
+        proj.mkdir(parents=True)
+        lines = [
+            # A previous leg's turn in the SAME file, well before this leg
+            # started -- must NOT be attributed to this leg.
+            _assistant_line(
+                msg_id="prev-leg", offset_secs=-100,
+                input_tokens=5, output_tokens=2_000_000,
+                cache_creation=500_000, cache_read=600_000_000,
+            ),
+            # This leg's own turn -- two JSONL lines (thinking + tool_use)
+            # for the SAME message id, as Claude Code actually writes them.
+            _assistant_line(
+                msg_id="mine-1", offset_secs=10, input_tokens=2, output_tokens=70,
+                cache_creation=6991, cache_read=22715, content_type="thinking",
+            ),
+            _assistant_line(
+                msg_id="mine-1", offset_secs=10.25, input_tokens=2, output_tokens=70,
+                cache_creation=6991, cache_read=22715, content_type="tool_use",
+            ),
+            _assistant_line(
+                msg_id="mine-2", offset_secs=800, input_tokens=3, output_tokens=90,
+                cache_creation=1000, cache_read=5000,
+            ),
+            # A following leg's turn, well after this leg ended -- must NOT
+            # be attributed to this leg either.
+            _assistant_line(
+                msg_id="next-leg", offset_secs=duration + 100,
+                input_tokens=4, output_tokens=3_000_000,
+                cache_creation=400_000, cache_read=700_000_000,
+            ),
+        ]
+        (proj / "sess.jsonl").write_text("\n".join(lines) + "\n")
+
+        # Run the REAL persist path (mark_assignment_interactive +
+        # _tokens_from_transcript + the physical-plausibility backstop +
+        # update_assignment_tokens), pointed at our synthetic transcript dir
+        # via a bound `projects_dir` in place of the real `~/.claude/projects`
+        # -- functools.partial binds one kwarg on the REAL function, it does
+        # not replace the parsing/dedup/time-bounding logic under test.
+        bound_tokens_from_transcript = functools.partial(
+            interactive._tokens_from_transcript, projects_dir=projects_dir
+        )
+        monkeypatch.setattr(interactive, "_tokens_from_transcript", bound_tokens_from_transcript)
+        monkeypatch.setattr(interactive.time, "time", lambda: finished_at)
+
+        interactive._persist_interactive_tokens(assignment_id, started_at, worktree_path)
+
+        # Sanity check on the DB row directly: one turn's worth of tokens
+        # per unique message id, only from this leg's own window -- NOT the
+        # 2M/3M neighboring-leg figures and NOT doubled by the duplicate
+        # content-block line.
+        row = conn.execute(
+            "SELECT output_tokens, is_interactive FROM assignments WHERE assignment_id = ?",
+            (assignment_id,),
+        ).fetchone()
+        assert row["is_interactive"] == 1
+        assert row["output_tokens"] == 160  # 70 (deduped) + 90
+
+        cfg_path = tmp_path / "coordinator.yml"
+        cfg_path.write_text(valid_config_yaml)
+
+        # ── the actual black-box assertion: real CLI output, real DB read ──
+        drill_result = CliRunner().invoke(
+            main, ["usage", "--config", str(cfg_path), "--issue", "634"]
+        )
+        assert drill_result.exit_code == 0, drill_result.output
+
+        smoke_line = next(
+            line for line in drill_result.output.splitlines() if line.startswith("smoke")
+        )
+        # The exact inflated figures from the #2129 bug report must be gone.
+        assert "5.0M" not in smoke_line
+        assert "1242" not in smoke_line
+        assert "$505" not in smoke_line
+
+        est_field = smoke_line.split()[4]
+        assert est_field.startswith("~$"), smoke_line
+        est_value = float(est_field.lstrip("~$"))
+        # 160 output + ~8k cache-creation + ~28k cache-read tokens at sonnet
+        # list pricing prices to a few cents -- nowhere near the physically
+        # impossible ~$505.55/leg the bug report showed.
+        assert est_value < 1.0, smoke_line
+
+        by_issue_result = CliRunner().invoke(
+            main, ["usage", "--config", str(cfg_path), "--by-issue"]
+        )
+        assert by_issue_result.exit_code == 0, by_issue_result.output
+        assert "#634" in by_issue_result.output
+        assert "$505" not in by_issue_result.output
+        assert "$2822" not in by_issue_result.output
