@@ -509,6 +509,42 @@ def _daemon_runs_here() -> bool:
         return True
 
 
+def _host_has_live_interactive_session() -> bool:
+    """True when a ``coord-<assignment_id>`` tmux session (an interactive
+    Test/Review/Merge/Work pane) is alive anywhere on this host.
+
+    Load-bearing guard for :func:`_idle_restart_target`, mirroring
+    ``AgentServer.clean_worktrees``'s tmux guard (#1295) — see that
+    method's docstring, and the hourly-worktree-sweep incident it cites,
+    for why this exists: an interactive session can outlive its
+    assignment record. The dispatch subprocess backing a Test/Review/
+    Merge/Work pane can finish (moving the assignment to a terminal
+    status in ``self._assignments``) while the operator is still sitting
+    in the pane. ``self._assignments[...].status`` alone therefore is
+    NOT a reliable "is this host busy" signal — exactly the gap that
+    incident exposed. Consulting tmux directly, the same way
+    ``clean_worktrees`` does before ever touching a worktree, is ground
+    truth: it is only "up" for as long as the session — and therefore the
+    operator's claim on this host — actually exists.
+
+    Deferred import for the same reason ``AgentServer._tmux_session_alive``
+    defers it: keep ``coord.interactive`` (which pulls in curses/tty
+    helpers) out of the agent process's top-level import graph.
+    :func:`~coord.interactive.list_coord_tmux_sessions` already swallows
+    "tmux not installed"/"no server running"/subprocess errors internally
+    and returns ``[]`` for all of them, so this only needs to guard the
+    import itself. Any exception here errs toward "busy" — i.e. skip this
+    restart cycle and re-evaluate next tick — the same fail-safe direction
+    :func:`_daemon_runs_here` takes when it can't determine an answer.
+    """
+    try:
+        from coord.interactive import list_coord_tmux_sessions  # noqa: PLC0415
+
+        return bool(list_coord_tmux_sessions())
+    except Exception:  # noqa: BLE001
+        return True
+
+
 def _idle_restart_target(server: "AgentServer", venv_dir: Path) -> Path | None:
     """Return the slot the idle watcher should restart onto right now, or
     ``None`` if it should not act.
@@ -518,12 +554,15 @@ def _idle_restart_target(server: "AgentServer", venv_dir: Path) -> Path | None:
     concerns in :class:`_IdleRestartWatcher` stay entirely in that class and
     this stays trivially unit-testable without spinning a real thread.
 
-    Ordered cheapest-first on purpose: this runs on every poll tick
-    (default every 5s, for the life of the process), and :func:`_daemon_runs_here`
-    is the one check here that shells out (`systemctl --user show`). Every
-    other check is a path comparison or an in-memory lock/iteration, so
-    those run first and only pay for the subprocess call on the tick that
-    would otherwise actually restart.
+    Ordered cheapest-first on purpose: the first three checks are a path
+    comparison or an in-memory lock/iteration; :func:`_host_has_live_interactive_session`
+    and :func:`_daemon_runs_here` both shell out (``tmux list-panes``,
+    ``systemctl --user show``) and only run once the cheap checks have
+    already established there's an actual swap waiting. Note this still
+    means both subprocess calls run on *every* poll tick (default every 5s)
+    for as long as the agent is idle with a different slot staged — not
+    merely on the one tick that ends up restarting — since neither check
+    has a way to know in advance which tick that will be.
     """
     live = agent_update.current_slot(venv_dir)
     if live is None:
@@ -541,6 +580,12 @@ def _idle_restart_target(server: "AgentServer", venv_dir: Path) -> Path | None:
             1 for a in server._assignments.values() if a.status in (PENDING, RUNNING)
         )
     if active_count:
+        return None
+    if _host_has_live_interactive_session():
+        # #2139 blocking review fix: an interactive pane is not an
+        # assignment (see docstring above) — a live one must veto a
+        # restart exactly like a RUNNING/PENDING assignment does, however
+        # long its backing assignment record has already gone terminal.
         return None
     if _daemon_runs_here():
         return None
@@ -632,6 +677,27 @@ class _IdleRestartWatcher:
                 "not restarting; will retry next debounce window.\n%s",
                 target, log,
             )
+            # #2139 review fix: a slot that fails the re-smoke-check must be
+            # visible somewhere an operator actually looks — `/health` —
+            # not just the raw agent log. Without this, a staged slot that
+            # keeps failing here (bad disk, someone hand-editing
+            # `~/.coord-venv.*`) restart-loops through debounce windows
+            # forever with zero signal outside `journalctl`/the agent log.
+            now_ts = time.time()
+            _write_last_update(
+                self._server.state_dir,
+                {
+                    "mode": "idle self-restart (#2139)",
+                    "started_at": now_ts,
+                    "finished_at": now_ts,
+                    "version_before": version_before,
+                    "version_after": version_before,
+                    "target_version": None,
+                    "result": "failed",
+                    "error": f"re-smoke-check failed for staged slot {target}: {log}",
+                    "log_excerpt": "\n".join((log or "").splitlines()[-20:]),
+                },
+            )
             # Don't retry on every poll tick against a slot that's already
             # known bad this round — wait out a fresh debounce window first.
             self._idle_since = None
@@ -654,6 +720,16 @@ class _IdleRestartWatcher:
         }
         _write_last_update(self._server.state_dir, payload)
         self._idle_since = None
+        # #2139 non-blocking review note: `update()`'s own background
+        # thread (`_do_update` below) can also call `exec_restart` directly
+        # when a swap completes with zero active assignments at that
+        # instant — this watcher polls the same "idle + newer slot staged"
+        # condition concurrently and could fire around the same moment.
+        # Harmless in practice: both paths only ever exec/restart onto the
+        # slot `~/.coord-venv` already resolves to, and `os.execv`/
+        # `systemctl restart` make a second call against an already-
+        # replaced process a no-op (there's nothing left to race with by
+        # the time it would run).
         self._exec_restart(list(sys.argv))
 
 
@@ -1323,6 +1399,13 @@ def build_app(
                 _write_last_update(state_dir, payload)
 
                 # Brief pause so the HTTP response reaches the client first.
+                #
+                # #2139 non-blocking review note: this is one of two paths
+                # that can call `exec_restart` — the other is
+                # `_IdleRestartWatcher._restart_onto`, polling the same
+                # "idle + newer slot staged" condition concurrently. See
+                # that method's comment for why a near-simultaneous double
+                # fire here is harmless.
                 time.sleep(0.5)
                 exec_restart(saved_argv)
             except Exception as e:
