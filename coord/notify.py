@@ -2357,10 +2357,17 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
         # stranded with the board reporting a plausible in-progress state.
         # #1797: `push_failure_reason` is the same column too — see the
         # identical `or` chain in `coord.reconcile.reconcile_completed_assignments`.
+        # #2131: `spend_ceiling_reason` is the same column again — the
+        # per-leg spend ceiling killed the worker. It must reach `error=`
+        # below as well as `mark_notified`, so the GitHub failure comment
+        # says "spend ceiling" instead of leaving an operator to guess why a
+        # leg died mid-task. Mutually exclusive with the other three (see
+        # `coord.reconcile.reconcile_completed_assignments`).
         _failure_reason = (
             entry.get("usage_limit_reason")
             or entry.get("api_error_reason")
             or entry.get("push_failure_reason")
+            or entry.get("spend_ceiling_reason")
         )
         post_failure(
             exit_code=transition.exit_code,
@@ -2416,10 +2423,17 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
         # `_failure_reason` also feeds `error=` below — otherwise the
         # posted GitHub failure comment's `error` field is blank for
         # exactly the failure #1797 exists to surface.
+        # #2131: `spend_ceiling_reason` is the same column again — the
+        # per-leg spend ceiling killed the worker. It must reach `error=`
+        # below as well as `mark_notified`, so the GitHub failure comment
+        # says "spend ceiling" instead of leaving an operator to guess why a
+        # leg died mid-task. Mutually exclusive with the other three (see
+        # `coord.reconcile.reconcile_completed_assignments`).
         _failure_reason = (
             entry.get("usage_limit_reason")
             or entry.get("api_error_reason")
             or entry.get("push_failure_reason")
+            or entry.get("spend_ceiling_reason")
         )
         post_failure(
             exit_code=transition.exit_code,

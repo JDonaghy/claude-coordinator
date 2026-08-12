@@ -649,6 +649,54 @@ class UsageGateConfig:
     week_threshold_pct: float = 90.0
 
 
+@dataclass
+class BudgetConfig:
+    """``budget:`` block (#2131) — the per-leg spend ceiling.
+
+    A single worker leg that runs away is the fleet's most expensive failure
+    mode: over 2026-08-08 → 08-11 the twelve legs costing more than $10 were
+    3% of all legs and 19% of the entire bill.  This block bounds that tail.
+
+    ``per_leg_ceiling_usd`` is the ceiling in dollars applied to every
+    assignment type that has no ``type_ceilings`` entry.  **``0.0`` — the
+    default, and what an absent ``budget:`` block yields — means NO CEILING**,
+    i.e. exactly today's behaviour, so upgrading can never start killing an
+    existing deployment's legs.
+
+    ``type_ceilings`` overrides it per assignment ``type``.  This matters:
+    the same window's medians were $3.61 for a sonnet work leg, $6.61 for an
+    opus one, $1.61 for a review and $0.44 for a smoke — an $8 ceiling that
+    is right for ``work`` is wildly wrong for ``smoke``.  An explicit ``0``
+    for a type disables the ceiling for that type alone.
+
+    Resolution is :meth:`ceiling_for`.  The value is carried to the agent on
+    the ``POST /assign`` wire (``AssignmentSpec.cost_ceiling_usd``) rather
+    than read from an agent's own config, so a config-free agent
+    (docs/EPHEMERAL_WORKERS.md) is covered too.
+
+    **Headless legs only.**  Enforcement reads the worker's stream-json
+    transcript, and interactive legs are precisely the logs that are not
+    stream-json (#1710) — see :mod:`coord.spend_ceiling` for the full
+    statement of that limit and of what the mid-flight number actually is.
+    """
+
+    per_leg_ceiling_usd: float = 0.0
+    type_ceilings: dict[str, float] = field(default_factory=dict)
+
+    def ceiling_for(self, assignment_type: str | None) -> float | None:
+        """Ceiling (USD) for *assignment_type*, or ``None`` for no ceiling.
+
+        A ``type_ceilings`` entry always wins — including an explicit ``0``,
+        which disables the ceiling for that type rather than falling back to
+        the global one.  Absent that, the global ``per_leg_ceiling_usd``
+        applies, and ``0`` there means no ceiling at all.
+        """
+        if assignment_type and assignment_type in self.type_ceilings:
+            value = self.type_ceilings[assignment_type]
+            return value if value > 0 else None
+        return self.per_leg_ceiling_usd if self.per_leg_ceiling_usd > 0 else None
+
+
 # #846: default wall-clock thresholds (seconds) an assignment of a given
 # `type` may run before `coord.notify.detect_needs_attention` flags it.
 # Deliberately generous — this is a "human should glance at this" signal,
@@ -1555,6 +1603,8 @@ class Config:
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
     dispatch: DispatchConfig = field(default_factory=DispatchConfig)
     usage_gate: UsageGateConfig = field(default_factory=UsageGateConfig)
+    # #2131 — absent block == no ceiling == today's behaviour.
+    budget: BudgetConfig = field(default_factory=BudgetConfig)
     ci_store: CiStoreConfig = field(default_factory=CiStoreConfig)
     merge: MergeConfig = field(default_factory=MergeConfig)
     milestone: MilestoneConfig = field(default_factory=MilestoneConfig)
@@ -1626,6 +1676,7 @@ def parse_mapping(raw: Any, *, path: Path | None = None) -> Config:
     pipeline = _parse_pipeline(raw.get("pipeline"))
     dispatch = _parse_dispatch(raw.get("dispatch"))
     usage_gate = _parse_usage_gate(raw.get("usage_gate"))
+    budget = _parse_budget(raw.get("budget"))
     ci_store = _parse_ci_store(raw.get("ci_store"))
     merge = _parse_merge(raw.get("merge"))
     milestone = _parse_milestone(raw.get("milestone"))
@@ -1645,6 +1696,7 @@ def parse_mapping(raw: Any, *, path: Path | None = None) -> Config:
         pipeline=pipeline,
         dispatch=dispatch,
         usage_gate=usage_gate,
+        budget=budget,
         ci_store=ci_store,
         merge=merge,
         milestone=milestone,
@@ -2571,6 +2623,49 @@ def _parse_usage_gate(raw: Any) -> UsageGateConfig:
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not (0 <= value <= 100):
                 raise ConfigError(f"usage_gate.{key} must be a number between 0 and 100")
             setattr(cfg, key, float(value))
+
+    return cfg
+
+
+def _parse_budget(raw: Any) -> BudgetConfig:
+    """Parse the optional ``budget:`` block (#2131).
+
+    An absent block yields the all-zero default, which
+    :meth:`BudgetConfig.ceiling_for` reports as "no ceiling" — so an existing
+    deployment upgrading into this release keeps today's behaviour exactly.
+    """
+    if raw is None:
+        return BudgetConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'budget' must be a mapping")
+
+    cfg = BudgetConfig()
+
+    if "per_leg_ceiling_usd" in raw:
+        value = raw["per_leg_ceiling_usd"]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+            raise ConfigError(
+                "budget.per_leg_ceiling_usd must be a non-negative number "
+                "(0 disables the ceiling)"
+            )
+        cfg.per_leg_ceiling_usd = float(value)
+
+    overrides = raw.get("type_ceilings", {}) or {}
+    if not isinstance(overrides, dict):
+        raise ConfigError(
+            "budget.type_ceilings must be a mapping of assignment type → USD ceiling"
+        )
+    parsed: dict[str, float] = {}
+    for type_name, value in overrides.items():
+        if not isinstance(type_name, str) or not type_name:
+            raise ConfigError("budget.type_ceilings keys must be assignment type names")
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+            raise ConfigError(
+                f"budget.type_ceilings[{type_name!r}] must be a non-negative "
+                "number (0 disables the ceiling for that type)"
+            )
+        parsed[type_name] = float(value)
+    cfg.type_ceilings = parsed
 
     return cfg
 
