@@ -366,6 +366,11 @@ def test_serve_merge_relays_stderr_usage_errors(
     output/error — indistinguishable from a crash, and exactly the #1251
     repro. Assert the message now survives the relay.
 
+    #2157 narrowed the not-PENDING guard: MERGED left it (an already-landed
+    merge is the caller's postcondition, not a usage error), so the seeded
+    state here is HUMAN_REQUIRED — still a genuine exit-1 usage error, which
+    is what this test is actually about.
+
     Uses ``rw_db`` (thread-safe, file-backed) rather than the default autouse
     ``coord_db`` (thread-bound ``:memory:``) because ``post_merge`` runs the
     callback in a worker thread via ``run_in_threadpool``, mirroring
@@ -383,7 +388,7 @@ def test_serve_merge_relays_stderr_usage_errors(
             issue_number=1,
             issue_title="t",
             size=None,
-            state=mq.MERGED,
+            state=mq.HUMAN_REQUIRED,
         )
     ])
     with TestClient(app) as cli:
@@ -393,6 +398,35 @@ def test_serve_merge_relays_stderr_usage_errors(
         assert "not PENDING" in body["output"], (
             f"stderr usage error did not reach the client: {body!r}"
         )
+
+
+def test_serve_merge_reports_an_already_merged_entry_as_success(
+    file_db: Path, valid_config_path: Path, rw_db
+):
+    """#2157, on the daemon-routed path: a thin client asking the daemon to
+    merge an entry that has already merged must get exit_code 0 back, not the
+    exit 1 that `coord drive` counted as a failed merge attempt."""
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(file_db), cfg)
+    mq.save_queue([
+        mq.QueuedMerge(
+            assignment_id="m1",
+            repo_name="api",
+            repo_github="acme/api",
+            branch="worker/m1",
+            target_branch="main",
+            issue_number=1,
+            issue_title="t",
+            size=None,
+            state=mq.MERGED,
+            pr_number=60,
+        )
+    ])
+    with TestClient(app) as cli:
+        body = cli.post("/merge", json={"only": "m1"}).json()
+        assert body["exit_code"] == 0, body
+        assert "already merged" in body["output"], body
+        assert "PR #60" in body["output"], body
 
 
 def test_serve_merge_concurrent_requests_do_not_cross_talk(
