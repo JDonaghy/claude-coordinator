@@ -4,8 +4,8 @@
 #
 # 03:00 local, inside the 22:00-08:00 quiet hours already used for
 # notifications (see coord-notify's own schedule) — an operator is least
-# likely to be mid-drive at 03:00, and the drain deadline
-# (coord/release_window.py's DEFAULT_DRAIN_DEADLINE_SECONDS, 1h by default)
+# likely to be mid-drive at 03:00, and the drain wait
+# (coord/release_window.py's DEFAULT_DRAIN_WAIT_SECONDS, 1h by default)
 # leaves comfortable room to finish and restart the queue timer well before
 # the working day, even in the worst case where the drain times out.
 #
