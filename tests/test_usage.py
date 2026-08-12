@@ -346,6 +346,34 @@ class TestCollectUsage:
         # Local log value wins.
         assert result[0].total_cost_usd == pytest.approx(0.50)
 
+    def test_flags_cost_unknown_when_no_log_and_no_remote(self, tmp_path: Path) -> None:
+        """#2128: a leg with no local log and no --remote fallback renders
+        $0.00, but that's a placeholder, not a captured fact — it must be
+        flagged so the report can warn instead of silently undercounting."""
+        logs_dir = tmp_path / "logs"  # empty — no local log
+        a = _assignment(assignment_id="ghost001")  # default provider: claude (cost_reporting=True)
+        result = collect_usage([a], logs_dir=logs_dir)
+        assert len(result) == 1
+        assert result[0].total_cost_usd == 0.0
+        assert result[0].cost_unknown is True
+
+    def test_no_cost_unknown_flag_when_remote_data_fills_it(self, tmp_path: Path) -> None:
+        logs_dir = tmp_path / "logs"
+        a = _assignment(assignment_id="xyz789")
+        remote_by_id = {"xyz789": {"total_cost_usd": 0.15}}
+        result = collect_usage([a], logs_dir=logs_dir, remote_by_id=remote_by_id)
+        assert result[0].cost_unknown is False
+
+    def test_no_cost_unknown_flag_when_local_log_present(self, tmp_path: Path) -> None:
+        logs_dir = tmp_path / "logs"
+        _make_log(
+            logs_dir / "abc123.log",
+            [_init_event("claude-sonnet-4-6"), _result_event(total_cost_usd=0.30)],
+        )
+        a = _assignment(assignment_id="abc123")
+        result = collect_usage([a], logs_dir=logs_dir)
+        assert result[0].cost_unknown is False
+
 
 class TestBuildSessionUsage:
     def test_derives_started_at_from_dispatch_time(self, tmp_path: Path) -> None:
@@ -479,6 +507,22 @@ class TestFormatUsageReport:
         report = format_usage_report(s)
         assert "⚠" in report
 
+    def test_uncosted_footer_shown_when_a_leg_cannot_be_costed(self) -> None:
+        """#2128 bonus: the default view must not silently render an
+        uncosted leg as if it were genuinely free."""
+        a = AssignmentUsage(
+            assignment_id="ghost001", repo_name="r", issue_number=1,
+            issue_title="t", status="done", cost_unknown=True,
+        )
+        s = SessionUsage(started_at=time.time() - 3600, assignments=[a])
+        report = format_usage_report(s)
+        assert "1 assignment could not be costed" in report
+        assert "--by-issue" in report
+
+    def test_no_uncosted_footer_when_all_legs_costed(self) -> None:
+        report = format_usage_report(self._session())
+        assert "could not be costed" not in report
+
 
 # ── CLI command: coord usage ──────────────────────────────────────────────────
 
@@ -532,6 +576,10 @@ class TestUsageCommand:
         result = runner.invoke(main, ["usage"])
         assert result.exit_code == 0
         assert "noLog99" in result.output
+        # #2128 bonus: a leg the default view cannot cost must say so, not
+        # render silently as if it were free.
+        assert "1 assignment could not be costed" in result.output
+        assert "--by-issue" in result.output
 
     def test_per_model_section_present(self, coord_dir: Path) -> None:
         logs_dir = coord_dir / "logs"
@@ -547,6 +595,103 @@ class TestUsageCommand:
         assert result.exit_code == 0
         assert "Per-model" in result.output
         assert "claude-haiku-4-5" in result.output
+
+
+# ── `coord usage --remote` (#2128) ──────────────────────────────────────────
+
+
+class TestUsageCommandRemoteFlag:
+    """``--remote`` fetches cost data from agent servers for legs with no
+    local log. Pre-#2128 this crashed 100% of the time: ``fetch_status``
+    returns a ``StatusResult`` dataclass (``.data``/``.ok``), not a dict, and
+    the old ``if not data: continue`` guard never fired (a dataclass with no
+    ``__bool__`` is always truthy), so an unreachable machine's
+    ``StatusResult(data=None, ...)`` sailed straight into ``data.get(...)``
+    and raised ``AttributeError``."""
+
+    @pytest.fixture
+    def coord_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, coord_db) -> Path:
+        import coord.usage as usage_mod
+        monkeypatch.setattr(usage_mod, "COORD_DIR", tmp_path)
+        monkeypatch.setattr(usage_mod, "LOGS_DIR", tmp_path / "logs")
+        return tmp_path
+
+    def _write_board(self, assignments: list[Assignment]) -> None:
+        from coord.models import Board
+        from coord.state import save_board
+        active = [a for a in assignments if a.status in ("running", "pending")]
+        completed = [a for a in assignments if a.status in ("done", "failed")]
+        save_board(Board(round_number=1, active=active, completed=completed))
+
+    def test_remote_fills_reachable_leg_and_skips_unreachable_machine(
+        self, coord_dir: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, valid_config_yaml: str
+    ) -> None:
+        from coord.network import StatusResult
+
+        cfg_path = tmp_path / "coordinator.yml"
+        cfg_path.write_text(valid_config_yaml)
+
+        # Two legs with no local log: one on a reachable machine ("laptop"),
+        # one on a machine that is down ("server"). Pre-fix, the *first*
+        # fetch_status() call (regardless of which machine) crashed the
+        # whole command with AttributeError.
+        a_laptop = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=1,
+            issue_title="t1", assignment_id="lap0001", status="done",
+        )
+        a_server = Assignment(
+            machine_name="server", repo_name="api", issue_number=2,
+            issue_title="t2", assignment_id="srv0001", status="done",
+        )
+        self._write_board([a_laptop, a_server])
+
+        def _fake_fetch_status(machine, timeout=3.0):
+            if machine.name == "laptop":
+                return StatusResult(data={
+                    "active": [],
+                    "completed": [
+                        {"id": "lap0001", "total_cost_usd": 0.42, "model_used": "claude-sonnet-4-6"},
+                    ],
+                })
+            # "server" is unreachable — StatusResult(data=None, error=...).
+            return StatusResult(error="connection refused")
+
+        monkeypatch.setattr("coord.network.fetch_status", _fake_fetch_status)
+
+        result = CliRunner().invoke(
+            main, ["usage", "--config", str(cfg_path), "--remote"], catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert "$0.42" in result.output  # laptop's leg, filled in via --remote
+        assert "srv0001" in result.output  # server's leg still renders...
+        # ...but its cost stays unknown (skipped, not crashed) and is
+        # called out rather than rendered as a silent $0.00.
+        assert "1 assignment could not be costed" in result.output
+
+    def test_all_machines_unreachable_does_not_crash(
+        self, coord_dir: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, valid_config_yaml: str
+    ) -> None:
+        from coord.network import StatusResult
+
+        cfg_path = tmp_path / "coordinator.yml"
+        cfg_path.write_text(valid_config_yaml)
+
+        a_server = Assignment(
+            machine_name="server", repo_name="api", issue_number=3,
+            issue_title="t3", assignment_id="srv0002", status="done",
+        )
+        self._write_board([a_server])
+
+        monkeypatch.setattr(
+            "coord.network.fetch_status",
+            lambda machine, timeout=3.0: StatusResult(error="timeout"),
+        )
+
+        result = CliRunner().invoke(
+            main, ["usage", "--config", str(cfg_path), "--remote"], catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert "srv0002" in result.output
 
 
 # ── `coord usage --limits` (#1466) ──────────────────────────────────────────

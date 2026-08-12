@@ -1878,11 +1878,17 @@ def usage(
             if machine.name not in by_machine:
                 continue
             try:
-                data = fetch_status(machine, timeout=timeout)
+                result = fetch_status(machine, timeout=timeout)
             except Exception:
                 continue
-            if not data:
+            # #2128: fetch_status returns a StatusResult dataclass, never a
+            # dict — it has no .get(). A dataclass instance is always
+            # truthy (no __bool__), so `if not result` never fired even for
+            # an unreachable machine's StatusResult(data=None, error=...);
+            # `.ok` (data is not None) is the actual reachability check.
+            if not result.ok:
                 continue
+            data = result.data
             for entry in (data.get("active") or []) + (data.get("completed") or []):
                 aid = entry.get("id") or entry.get("assignment_id")
                 if aid:
