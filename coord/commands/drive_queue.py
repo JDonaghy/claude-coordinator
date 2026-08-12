@@ -264,6 +264,7 @@ def drive_queue_list(repo: str | None, output_json: bool, config_path: Path) -> 
     if not rows:
         click.echo("(drive queue is empty)")
         return
+    now = time.time()
     for entry in entries_from_rows(rows):
         bits = [f"{entry.position:>2}  {entry.key:<28} {entry.state}"]
         if entry.machine:
@@ -278,9 +279,41 @@ def drive_queue_list(repo: str | None, output_json: bool, config_path: Path) -> 
             bits.append(f"hold={entry.hold_state or 'armed'}")
         click.echo("  ".join(bits))
         if entry.last_reason:
-            click.echo(f"      last: {entry.last_reason}")
+            click.echo(f"      last{_reason_age_suffix(entry, now)}: {entry.last_reason}")
         for line in _hold_lines(entry):
             click.echo(line)
+
+
+def _reason_age_suffix(entry: QueueEntry, now: float) -> str:
+    """`` (3h ago)`` / `` (42s ago)``, or ``''`` when the age is unknown.
+
+    #2133: a `last_reason` is a snapshot taken the instant the tick (or a
+    guard) wrote it — never re-validated — so displaying it bare lets an
+    hours-old, no-longer-true observation read as current state (that
+    misdirected a live diagnosis on #2104: `checks_failed` was still shown
+    ~3 hours after the named checks had gone green, while the actual
+    blocker — a later `request-changes` review — was nowhere in the
+    output). Stamping the age doesn't make the reason current, but it stops
+    it from being silently *mistaken* for current, which is the whole
+    defect. Empty for `entry.reason_at is None` — a row predating #2133's
+    migration, or an entry whose `last_reason` was never written through
+    `update_drive_queue_entry` (e.g. hand-built in a test) — rather than
+    guessing an age it doesn't have.
+    """
+    if entry.reason_at is None:
+        return ""
+    return f" ({_age_str(max(0.0, now - entry.reason_at))} ago)"
+
+
+def _age_str(delta_seconds: float) -> str:
+    """``42s`` / ``3h`` / ``5d`` — coarse, single-unit, matches #2133's ask."""
+    if delta_seconds < 60:
+        return f"{int(delta_seconds)}s"
+    if delta_seconds < 3600:
+        return f"{int(delta_seconds // 60)}m"
+    if delta_seconds < 86400:
+        return f"{int(delta_seconds // 3600)}h"
+    return f"{int(delta_seconds // 86400)}d"
 
 
 def _hold_lines(entry: QueueEntry) -> list[str]:

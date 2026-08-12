@@ -5096,8 +5096,9 @@ def _list_drive_escalations_local(repo_name: str | None = None) -> list[dict]:
 
 _DRIVE_QUEUE_COLUMNS = (
     "id, repo_name, issue_number, position, machine, after_json, state, "
-    "attempts, deferrals, last_reason, session_name, launched_at, enqueued_at, "
-    "hold_after, hold_reason, resume_when, hold_state, hold_probes, launch_host"
+    "attempts, deferrals, last_reason, reason_at, session_name, launched_at, "
+    "enqueued_at, hold_after, hold_reason, resume_when, hold_state, "
+    "hold_probes, launch_host"
 )
 
 # Fields `update_drive_queue_entry` may write. Deliberately excludes the
@@ -5338,7 +5339,10 @@ def update_drive_queue_entry(repo_name: str, issue_number: int, **fields) -> boo
     Accepts any of ``state`` / ``attempts`` / ``deferrals`` / ``last_reason`` /
     ``session_name`` / ``launched_at`` / ``launch_host``; anything else raises
     ``ValueError`` (the queue's order is owned by ``enqueue``/``move``, not by
-    a tick).
+    a tick). A ``last_reason`` update is stamped with its capture time
+    (``reason_at``, #2133) by ``_update_drive_queue_entry_local`` — the one
+    function both this local path and the daemon's ``/drive-queue`` handler
+    call, so no caller can write a reason without also dating it.
 
     Routes to the daemon when ``board_service`` is set. Returns whether a row
     was actually updated.
@@ -5370,6 +5374,17 @@ def _update_drive_queue_entry_local(
         raise ValueError(f"not updatable on drive_queue: {sorted(unknown)}")
     if not fields:
         return False
+    if "last_reason" in fields:
+        # #2133: `last_reason` is a point-in-time observation (the tick's
+        # gate reading at the moment it wrote it), not a live probe. Without
+        # a capture timestamp a `blocked` entry's displayed reason ages
+        # silently and a stale-but-plausible reason reads as current state
+        # — see coord/db.py's CREATE TABLE comment for the incident this
+        # closes. Stamped here, the single choke point every `last_reason`
+        # write passes through (both the no-daemon local path and the
+        # daemon's `/drive-queue` update handler call this same function),
+        # so no caller can set one without the other.
+        fields = {**fields, "reason_at": time.time()}
     conn = get_connection()
     assignments = ", ".join(f"{name} = ?" for name in fields)
     cur = conn.execute(

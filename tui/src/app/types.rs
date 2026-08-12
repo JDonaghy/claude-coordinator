@@ -863,6 +863,13 @@ pub(crate) struct BoardDriveQueueEntry {
     pub(crate) deferrals: i64,
     #[serde(default)]
     pub(crate) last_reason: String,
+    /// #2133: capture time of `last_reason` — `last_reason` is a
+    /// point-in-time observation, never re-validated, so the Queue panel
+    /// age-stamps it (`queue_row`) rather than rendering it bare as if it
+    /// were current state. `None` for a row predating the migration or one
+    /// whose `last_reason` is still the `""` default.
+    #[serde(default)]
+    pub(crate) reason_at: Option<f64>,
     #[allow(dead_code)] // wire parity; the Queue panel shows `state`, not the clock
     #[serde(default)]
     pub(crate) launched_at: Option<f64>,

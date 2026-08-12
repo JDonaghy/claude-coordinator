@@ -879,7 +879,7 @@ impl CoordApp {
                         .join(", "),
                 ),
                 queue_hold_cell(e),
-                or_dash(e.last_reason.clone()),
+                or_dash(queue_reason_cell(e)),
             ],
         }
     }
@@ -1875,6 +1875,36 @@ fn queue_hold_cell(e: &BoardDriveQueueEntry) -> String {
         "gate".to_string()
     } else {
         e.hold_state.clone()
+    }
+}
+
+/// The `Reason` cell for one entry — `last_reason` age-stamped with
+/// `reason_at` (#2133).
+///
+/// `last_reason` is a snapshot the tick (or a guard) wrote the instant it
+/// observed the condition, never re-validated afterwards. Rendering it bare
+/// lets an hours-old, no-longer-true observation read as a live diagnosis —
+/// the #2104 incident this closes: `checks_failed` was still shown roughly
+/// three hours after the named checks had gone green, while the actual
+/// blocker (a later `request-changes` review) was nowhere in the panel.
+/// Appending the age doesn't make the reason current, but it stops it from
+/// being silently mistaken for current. No suffix when `reason_at` is
+/// `None` — a row predating #2133's migration, or built without going
+/// through `update_drive_queue_entry` — rather than guessing an age it
+/// doesn't have.
+fn queue_reason_cell(e: &BoardDriveQueueEntry) -> String {
+    if e.last_reason.is_empty() {
+        return String::new();
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    let age = format_age(e.reason_at, now);
+    if age.is_empty() {
+        e.last_reason.clone()
+    } else {
+        format!("{} ({})", e.last_reason, age)
     }
 }
 

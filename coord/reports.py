@@ -814,6 +814,7 @@ DRIVE_QUEUE_STATUS_COLUMNS = [
     "attempts",
     "deferrals",
     "last_reason",
+    "reason_at",
     "enqueued_at",
     "launched_at",
     "hold_state",
@@ -831,6 +832,10 @@ DRIVE_QUEUE_STATUS_COLUMN_META = [
     ColumnMeta(id="attempts", label="Attempts", kind="int", align="right"),
     ColumnMeta(id="deferrals", label="Deferrals", kind="int", align="right"),
     ColumnMeta(id="last_reason", label="Last Reason", kind="text", weight=3.0),
+    # #2133: capture time of `last_reason` — a client renders it as an age
+    # next to the reason so a stale snapshot never reads as current state.
+    # `None`/absent for a row predating the migration.
+    ColumnMeta(id="reason_at", label="Reason At", kind="timestamp"),
     ColumnMeta(id="enqueued_at", label="Enqueued", kind="timestamp"),
     ColumnMeta(id="launched_at", label="Launched", kind="timestamp"),
     ColumnMeta(id="hold_state", label="Hold", kind="enum"),
@@ -876,6 +881,7 @@ def fold_drive_queue_status(
                 "attempts": int(entry.get("attempts") or 0),
                 "deferrals": int(entry.get("deferrals") or 0),
                 "last_reason": entry.get("last_reason") or "",
+                "reason_at": entry.get("reason_at"),
                 "enqueued_at": entry.get("enqueued_at"),
                 "launched_at": entry.get("launched_at"),
                 "hold_state": entry.get("hold_state") or "",

@@ -44200,6 +44200,60 @@ Milestone tracking issue.
         );
     }
 
+    /// #2133: `last_reason` is a snapshot taken the instant it was written,
+    /// never re-validated — the #2104 incident it names is a `checks_failed`
+    /// reason that outlived the CI failure it described by ~3 hours while
+    /// the real, later blocker went unmentioned. The Queue panel must show
+    /// the reason's age so it can never read as a live diagnosis.
+    #[test]
+    fn tuidriver_queue_panel_age_stamps_a_stale_reason() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        // 3h + 60s ago: comfortably inside the "3h ago" bucket
+        // (`format_age` truncates to whole hours) with slack on both sides
+        // so a few milliseconds of test execution can never flip the digit.
+        let reason_at = now - (3.0 * 3600.0 + 60.0);
+        let fixture = format!(
+            r#"[
+                {{"repo_name": "myrepo", "issue_number": 703, "position": 0,
+                 "state": "blocked", "attempts": 9,
+                 "last_reason": "checks_failed: test (3.12)",
+                 "reason_at": {reason_at}}}
+            ]"#
+        );
+        let driver = queue_driver(&fixture, 200, 30);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("checks_failed: test (3.12)"),
+            "the reason text itself must still be legible:\n{screen}"
+        );
+        assert!(
+            screen.contains("(3h ago)"),
+            "#2133: a stale `last_reason` must carry its age so it is never \
+             mistaken for a current diagnosis:\n{screen}"
+        );
+    }
+
+    /// A `reason_at`-less row (predates #2133's migration, or a fixture that
+    /// never set it) renders the bare reason — no fabricated age, and no
+    /// crash on the missing field.
+    #[test]
+    fn tuidriver_queue_panel_omits_age_when_reason_at_is_unknown() {
+        let driver = queue_driver(queue_fixture_json(), 160, 30);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("REASON-BLOCKED"),
+            "the reason still renders on its own:\n{screen}"
+        );
+        assert!(
+            !screen.contains("REASON-BLOCKED ("),
+            "#2133: no `reason_at` means no age can be computed — the cell \
+             must not invent one:\n{screen}"
+        );
+    }
+
     #[test]
     fn tuidriver_queue_panel_states_are_visually_distinguishable() {
         // Colour is asserted at the model layer (the screen dump is plain

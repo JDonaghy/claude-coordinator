@@ -321,6 +321,14 @@ class QueueEntry:
     attempts: int = 0
     deferrals: int = 0
     last_reason: str = ""
+    # #2133: wall-clock capture time of `last_reason`, stamped by
+    # `coord.state._update_drive_queue_entry_local` every time `last_reason`
+    # is written. `None` for a row predating the migration or whose
+    # `last_reason` is still the '' default — never treated as "just now".
+    # A rendering that shows `last_reason` without also showing (or at least
+    # consulting) this is exactly the bug #2133 closes: a point-in-time
+    # observation displayed as if it were current state.
+    reason_at: float | None = None
     session_name: str = ""
     launched_at: float | None = None
     # #1870: the short hostname of the machine whose tick launched THIS
@@ -382,6 +390,11 @@ class QueueEntry:
             attempts=int(row.get("attempts") or 0),
             deferrals=int(row.get("deferrals") or 0),
             last_reason=str(row.get("last_reason") or ""),
+            reason_at=(
+                None
+                if row.get("reason_at") is None
+                else float(row.get("reason_at"))
+            ),
             session_name=str(row.get("session_name") or ""),
             launched_at=None if launched_at is None else float(launched_at),
             launch_host=str(row.get("launch_host") or ""),

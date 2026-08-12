@@ -379,6 +379,18 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             attempts      INTEGER NOT NULL DEFAULT 0,
             deferrals     INTEGER NOT NULL DEFAULT 0,
             last_reason   TEXT    NOT NULL DEFAULT '',
+            -- #2133: wall-clock time `last_reason` was last WRITTEN, stamped
+            -- by `coord.state._update_drive_queue_entry_local` every time a
+            -- `last_reason` update lands (never by a caller — it is not in
+            -- `_DRIVE_QUEUE_UPDATABLE`). `last_reason` is a point-in-time
+            -- observation, not a live probe; without this a `blocked` entry's
+            -- displayed text ages silently and a stale-but-plausible reason
+            -- reads as current state (2026-08-11's #2104 incident: a 3-hour-
+            -- stale `checks_failed` outlived the CI failure it named while
+            -- the real, later blocker — a request-changes review — went
+            -- unmentioned). NULL for a row written before this migration or
+            -- for a fresh row whose `last_reason` is still the '' default.
+            reason_at     REAL,
             session_name  TEXT,
             launched_at   REAL,
             enqueued_at   REAL    NOT NULL,
@@ -693,6 +705,11 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         # "agent".
         "ALTER TABLE assignments ADD COLUMN verdict_source TEXT",
         "ALTER TABLE assignments ADD COLUMN verdict_source_reason TEXT",
+        # #2133: see the CREATE TABLE comment above — capture time of
+        # `drive_queue.last_reason`, so a `blocked` entry's displayed reason
+        # carries its age instead of rendering a stale snapshot as current
+        # state. NULL for every row predating this migration.
+        "ALTER TABLE drive_queue ADD COLUMN reason_at REAL",
     ]
     for sql in migrations:
         try:
