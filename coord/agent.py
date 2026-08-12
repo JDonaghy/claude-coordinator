@@ -408,6 +408,11 @@ def _wait_for_proc_or_result(
     ceiling_armed = bool(
         cost_ceiling_usd and cost_ceiling_usd > 0 and read_cost_usd is not None
     )
+    if ceiling_armed:
+        # Hoisted out of the poll loop — this runs every `poll_interval`.
+        from coord.spend_ceiling import WARN_FRACTION  # noqa: PLC0415
+
+        warn_at = cost_ceiling_usd * WARN_FRACTION
 
     while True:
         try:
@@ -448,15 +453,12 @@ def _wait_for_proc_or_result(
         # (see the docstring for why a post-`result` kill is never useful),
         # and only ever acting on a value the meter could actually read.
         if ceiling_armed and result_seen_at is None:
-            assert cost_ceiling_usd is not None and read_cost_usd is not None
             try:
                 spent = read_cost_usd()
             except Exception:  # noqa: BLE001 — fail open, never break the reap
                 spent = None
             if spent is not None:
-                from coord.spend_ceiling import WARN_FRACTION  # noqa: PLC0415
-
-                if not cost_warned and spent >= cost_ceiling_usd * WARN_FRACTION:
+                if not cost_warned and spent >= warn_at:
                     cost_warned = True
                     _append_log_line(
                         log_path,
