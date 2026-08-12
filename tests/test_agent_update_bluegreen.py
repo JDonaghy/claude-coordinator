@@ -10,12 +10,14 @@ real against the actual filesystem.
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
 from coord.agent_update import (
+    _slot_backing_interpreter,
     current_slot,
     ensure_symlink_layout,
     perform_update,
@@ -287,6 +289,134 @@ class TestPerformUpdateNeverTorn:
 
         assert result.ok is True
         assert not (stale / "half-written-junk").exists()
+
+
+# ── #2140: never delete the slot the caller is actually running from ────
+
+
+class TestSlotBackingInterpreter:
+    def test_matches_the_slot_the_interpreter_path_is_under(self, tmp_path: Path) -> None:
+        venv_dir = tmp_path / ".coord-venv"
+        blue = tmp_path / ".coord-venv.blue"
+        green = tmp_path / ".coord-venv.green"
+        _make_fake_slot(blue)
+        _make_fake_slot(green)
+
+        assert _slot_backing_interpreter(venv_dir, blue / "bin" / "python") == blue
+        assert _slot_backing_interpreter(venv_dir, green / "bin" / "python") == green
+
+    def test_none_when_interpreter_is_outside_both_slots(self, tmp_path: Path) -> None:
+        venv_dir = tmp_path / ".coord-venv"
+        assert _slot_backing_interpreter(venv_dir, Path("/usr/bin/python3")) is None
+
+
+class TestPerformUpdateRefusesOwnRunningSlot:
+    """#2140's motivating incident: a swap flips the symlink without a
+    restart following it, so the process's own ``sys.executable`` stays
+    pinned to the slot the symlink just moved *off of*. A later update
+    must not rebuild that slot — doing so deletes the running caller's own
+    interpreter and site-packages, and (since it's also the one-generation
+    rollback target) destroys the ability to roll back along with it."""
+
+    def test_refuses_and_leaves_everything_untouched(self, tmp_path: Path, monkeypatch) -> None:
+        venv_dir = tmp_path / ".coord-venv"
+        _make_fake_slot(venv_dir)  # gives the pre-migration slot (-> blue) a bin/python
+
+        with patch(
+            "coord.agent_update.subprocess.run", side_effect=_run_stub(version="1.0.0")
+        ):
+            perform_update(venv_dir, "pkg", target_version="1.0.0")
+        blue = tmp_path / ".coord-venv.blue"
+        green = tmp_path / ".coord-venv.green"
+        assert current_slot(venv_dir) == green
+        assert blue.exists()
+
+        # This process is (hypothetically) still running from blue — the
+        # slot the symlink swapped away from, and the one the *next*
+        # update would try to rebuild.
+        monkeypatch.setattr(
+            "coord.agent_update.sys.executable", str(blue / "bin" / "python")
+        )
+
+        calls: list = []
+        with patch(
+            "coord.agent_update.subprocess.run",
+            side_effect=_run_stub(version="2.0.0", calls=calls),
+        ):
+            result = perform_update(venv_dir, "pkg", target_version="2.0.0")
+
+        assert result.ok is False
+        assert result.swapped is False
+        assert "refus" in (result.error or "")
+        # Nothing was even attempted: no subprocess calls, blue is intact,
+        # venv_dir is still on green (the rollback generation survives).
+        assert calls == []
+        assert (blue / "bin" / "python").exists()
+        assert current_slot(venv_dir) == green
+
+    def test_proceeds_when_running_interpreter_is_outside_the_layout(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """A dev/editable interpreter (not under either blue/green slot)
+        must not be mistaken for a collision — only refuse on a real one."""
+        venv_dir = tmp_path / ".coord-venv"
+        venv_dir.mkdir()
+        monkeypatch.setattr("coord.agent_update.sys.executable", "/usr/bin/python3")
+
+        with patch(
+            "coord.agent_update.subprocess.run", side_effect=_run_stub(version="1.0.0")
+        ):
+            result = perform_update(venv_dir, "pkg", target_version="1.0.0")
+
+        assert result.ok is True
+
+
+class TestPerformUpdateBuildsWithSymlinkedSlotPython:
+    """#2140: venv creation must use the *symlinked* (active) slot's
+    python, never ``sys.executable`` — the calling process's own
+    interpreter can be pinned to whichever slot a stale symlink/process
+    divergence would pick as the one about to be deleted."""
+
+    def test_uses_active_slot_python_not_sys_executable(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        venv_dir = tmp_path / ".coord-venv"
+        _make_fake_slot(venv_dir)
+        active = ensure_symlink_layout(venv_dir)  # renames into blue, bin/ included
+
+        monkeypatch.setattr("coord.agent_update.sys.executable", "/some/unrelated/python3")
+
+        calls: list = []
+        with patch(
+            "coord.agent_update.subprocess.run",
+            side_effect=_run_stub(version="1.0.0", calls=calls),
+        ):
+            result = perform_update(venv_dir, "pkg", target_version="1.0.0")
+
+        assert result.ok is True
+        venv_calls = [c for c in calls if "-m" in c and "venv" in c]
+        assert len(venv_calls) == 1
+        assert venv_calls[0][0] == str(active / "bin" / "python")
+        assert venv_calls[0][0] != "/some/unrelated/python3"
+
+    def test_falls_back_to_sys_executable_when_active_slot_has_no_python(
+        self, tmp_path: Path
+    ) -> None:
+        """Pre-#1241 installs (and these tests' own bare-directory fixtures)
+        have no real venv underneath — fall back rather than fail."""
+        venv_dir = tmp_path / ".coord-venv"
+        venv_dir.mkdir()
+
+        calls: list = []
+        with patch(
+            "coord.agent_update.subprocess.run",
+            side_effect=_run_stub(version="1.0.0", calls=calls),
+        ):
+            result = perform_update(venv_dir, "pkg", target_version="1.0.0")
+
+        assert result.ok is True
+        venv_calls = [c for c in calls if "-m" in c and "venv" in c]
+        assert venv_calls[0][0] == sys.executable
 
 
 # ── rollback ─────────────────────────────────────────────────────────────

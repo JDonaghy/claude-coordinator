@@ -23,6 +23,24 @@ Using exactly two named slots (rather than a fresh directory per release)
 also gives rollback for free: the slot that was live before the swap is
 left untouched, so it's still there — one generation back — until the
 *next* update reuses it. See :func:`rollback`.
+
+#2140: "the slot that's live" means two different things that usually —
+but not always — agree: the slot ``venv_dir`` *symlinks to*, and the slot
+whatever process is *actually running perform_update* was started from
+(``sys.executable``). A swap flips the symlink without restarting anyone,
+so the moment that happens the two diverge — normal on a fleet where
+restarts are gated on a drain (#2138/#2136), not a rare race. If a second
+update then reuses the slot the symlink no longer points at, it is
+deleting the running caller's own interpreter and site-packages out from
+under it: the subprocess spawn of ``sys.executable`` fails because the
+path is now gone, cleanup deletes it a second time for good measure, and
+the generation that was the rollback target is destroyed along with it.
+Two independent guards below close this: :func:`perform_update` refuses
+outright when the slot it would rebuild is the one backing its own
+``sys.executable`` (recoverable — the caller just needs a restart first),
+and venv creation always uses the *symlinked* slot's python rather than
+``sys.executable``, so the tool building the new environment is never the
+thing this update is about to delete.
 """
 
 from __future__ import annotations
@@ -119,6 +137,36 @@ def ensure_symlink_layout(venv_dir: Path) -> Path:
 def _other_slot(venv_dir: Path, active: Path) -> Path:
     blue, green = _slots(venv_dir)
     return green if active == blue else blue
+
+
+def _slot_backing_interpreter(venv_dir: Path, interpreter: Path) -> Path | None:
+    """Return whichever blue/green slot *interpreter* physically lives under.
+
+    ``None`` if *interpreter* resolves to neither slot (e.g. a dev/editable
+    install not using the blue/green layout at all).
+
+    #2140: deliberately keyed off the slot *directories* themselves, not
+    off :func:`current_slot` — ``sys.executable`` is the literal path baked
+    into a process at start time (e.g. ``~/.coord-venv.blue/bin/python3``)
+    and stays pinned to that slot for the process's whole life, even after
+    a later swap moves the ``venv_dir`` symlink onto the other slot. Those
+    two — "what the symlink currently says" and "what this process is
+    actually running from" — regularly disagree for hours on a fleet where
+    restarts are gated on a drain (#2138/#2136); this function answers the
+    second question, which is the one that matters before deleting a slot.
+    """
+    try:
+        resolved = interpreter.resolve()
+    except OSError:
+        return None
+    blue, green = _slots(venv_dir)
+    for slot in (blue, green):
+        try:
+            resolved.relative_to(slot.resolve())
+        except (OSError, ValueError):
+            continue
+        return slot
+    return None
 
 
 def _atomic_swap(venv_dir: Path, new_slot: Path) -> None:
@@ -225,10 +273,33 @@ def perform_update(
     running the old code with no restart needed. Returns a failed
     :class:`UpdateResult` rather than raising, except for genuinely
     unexpected setup errors (e.g. *venv_dir* doesn't exist at all).
+
+    #2140: also refuses — before touching anything — if *next_slot* (the
+    one about to be rebuilt) is the slot backing this very process's own
+    ``sys.executable``. That happens when a previous swap flipped the
+    symlink without a restart following it; proceeding would delete the
+    caller's own running interpreter and site-packages, and destroy the
+    rollback generation along with it. A refusal here is recoverable (the
+    caller just needs restarting first); reaching into that slot is not.
     """
     log_parts: list[str] = []
     active = ensure_symlink_layout(venv_dir)
     next_slot = _other_slot(venv_dir, active)
+
+    running_slot = _slot_backing_interpreter(venv_dir, Path(sys.executable))
+    if running_slot is not None and running_slot == next_slot:
+        return UpdateResult(
+            ok=False,
+            swapped=False,
+            error=(
+                f"refusing to update: this process's own interpreter "
+                f"({sys.executable}) is running from {next_slot}, the slot "
+                "this update would delete and rebuild. venv_dir currently "
+                f"symlinks to {active}, so a prior swap flipped it without "
+                "this process restarting — restart the caller (or wait for "
+                "idle self-restart, #2139) and retry (#2140)."
+            ),
+        )
 
     # Always build fresh — a stale, possibly half-built slot left over from
     # an interrupted update two generations back must never be reused.
@@ -239,9 +310,17 @@ def perform_update(
         shutil.rmtree(next_slot, ignore_errors=True)
         return UpdateResult(ok=False, swapped=False, error=error, log="\n".join(log_parts))
 
+    # #2140: build with the *symlinked* slot's python, not sys.executable —
+    # `active` is guaranteed to differ from `next_slot` (they're the two
+    # distinct blue/green slots), so the interpreter doing the building can
+    # never be the thing this update is about to rmtree, regardless of
+    # which slot the calling process itself happens to be running from.
+    builder_python = active / "bin" / "python"
+    if not builder_python.exists():
+        builder_python = Path(sys.executable)
     try:
         result = subprocess.run(
-            [sys.executable, "-m", "venv", str(next_slot)],
+            [str(builder_python), "-m", "venv", str(next_slot)],
             capture_output=True,
             text=True,
             timeout=60,
