@@ -55,7 +55,7 @@ from coord.commands.setup import (
     install_skills,
     version,
 )
-from coord.commands.agent_ops import agent, pause, unpause
+from coord.commands.agent_ops import agent, pause, quiet_hours, unpause
 from coord.commands.gates import gates
 from coord.commands.status import diagnose, doctor, show_plan, status, usage
 from coord.commands.dispatch import (
@@ -376,6 +376,8 @@ main.add_command(bounce)
 main.add_command(sync)
 main.add_command(pause)
 main.add_command(unpause)
+# #2146: set a machine's quiet-hours window without a coordinator session.
+main.add_command(quiet_hours)
 main.add_command(refine_chat)
 main.add_command(test_chat)
 main.add_command(new_issue_chat)

@@ -1951,6 +1951,50 @@ def _parse_hhmm(raw: Any, *, field_path: str) -> time:
     return time(int(m.group(1)), int(m.group(2)))
 
 
+def parse_quiet_hours_window(
+    start: Any, end: Any, tz: Any, *, prefix: str = "quiet_hours"
+) -> QuietHours:
+    """Validate a raw ``start``/``end``/``tz`` triple into a `QuietHours`.
+
+    #2146: THE definition of "a valid quiet-hours window", shared by the
+    YAML path (`_parse_quiet_hours_block` below, i.e.
+    ``machines[i].quiet_hours`` and ``notifications.quiet_hours``) and by
+    the operator-set store path (`coord.machine_pause.local_set_quiet_hours`,
+    written by `coord quiet-hours` / the daemon's `/pause` endpoint).
+
+    The two sources must never diverge on what they accept: a window a
+    `coord quiet-hours` call takes but `coordinator.yml` rejects (or vice
+    versa) would make `--print-yaml`'s promotion path — the whole point of
+    which is "make this temporary window permanent" — emit a block that
+    fails to load. One validator, one answer.
+
+    Raises `ConfigError` (with *prefix* naming the offending field) on
+    anything invalid; the daemon endpoint relays that message verbatim in
+    its 400 so an operator sees the real reason, not "bad request".
+    """
+    parsed_start = _parse_hhmm(start, field_path=f"{prefix}.start")
+    parsed_end = _parse_hhmm(end, field_path=f"{prefix}.end")
+
+    if not tz or not isinstance(tz, str):
+        raise ConfigError(
+            f"{prefix}.tz is required (IANA zone name, e.g. 'America/Chicago') — "
+            "quiet hours never default to the daemon's own UTC clock, since that "
+            "would silently fire at the wrong local hour"
+        )
+    try:
+        ZoneInfo(tz)
+    except (ZoneInfoNotFoundError, ValueError, OSError) as e:
+        raise ConfigError(f"{prefix}.tz {tz!r} is not a known IANA zone name: {e}") from e
+
+    if parsed_start == parsed_end:
+        raise ConfigError(
+            f"{prefix}: start and end must differ ('always quiet' is ambiguous — "
+            "use `coord pause` to take a machine out of rotation indefinitely instead)"
+        )
+
+    return QuietHours(start=parsed_start, end=parsed_end, tz=tz)
+
+
 def _parse_quiet_hours_block(raw: Any, *, prefix: str) -> QuietHours | None:
     """Parse a ``{start, end, tz}`` quiet-hours mapping. ``None`` → ``None``.
 
@@ -1967,34 +2011,19 @@ def _parse_quiet_hours_block(raw: Any, *, prefix: str) -> QuietHours | None:
     operator wrote — a quiet-hours feature that activates early is worse
     than none, because it silently pulls the machine out of the fleet
     during the working day. Fail loudly here rather than default quietly.
+
+    #2146: the field-level rules themselves now live in
+    `parse_quiet_hours_window` above, so the operator-set store validates
+    identically to this YAML path.
     """
     if raw is None:
         return None
     if not isinstance(raw, dict):
         raise ConfigError(f"{prefix} must be a mapping")
 
-    start = _parse_hhmm(raw.get("start"), field_path=f"{prefix}.start")
-    end = _parse_hhmm(raw.get("end"), field_path=f"{prefix}.end")
-
-    tz = raw.get("tz")
-    if not tz or not isinstance(tz, str):
-        raise ConfigError(
-            f"{prefix}.tz is required (IANA zone name, e.g. 'America/Chicago') — "
-            "quiet hours never default to the daemon's own UTC clock, since that "
-            "would silently fire at the wrong local hour"
-        )
-    try:
-        ZoneInfo(tz)
-    except (ZoneInfoNotFoundError, ValueError, OSError) as e:
-        raise ConfigError(f"{prefix}.tz {tz!r} is not a known IANA zone name: {e}") from e
-
-    if start == end:
-        raise ConfigError(
-            f"{prefix}: start and end must differ ('always quiet' is ambiguous — "
-            "use `coord pause` to take a machine out of rotation indefinitely instead)"
-        )
-
-    return QuietHours(start=start, end=end, tz=tz)
+    return parse_quiet_hours_window(
+        raw.get("start"), raw.get("end"), raw.get("tz"), prefix=prefix
+    )
 
 
 def _parse_quiet_hours(raw: Any, *, machine_index: int, machine_name: str) -> QuietHours | None:
