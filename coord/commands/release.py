@@ -1877,9 +1877,82 @@ def _drain(
         sleep_fn(max(0.0, min(poll_interval, deadline - elapsed)))
 
 
+def _parse_trailing_json(stdout: str) -> dict | None:
+    """The last top-level JSON object printed to *stdout*, or ``None``.
+
+    #2187: this used to look only at the LAST LINE of stdout and try to
+    parse THAT LINE alone as JSON. `coord release propagate --json` (like
+    every ``--json`` command in this codebase) prints its record via
+    ``json.dumps(..., indent=2, ...)`` — pretty-printed, for a human running
+    it by hand — which means the payload spans many lines and its own last
+    line is just ``}``, never a complete object on its own. The old check
+    therefore never found the record for ANY propagate run, successful or
+    not, and every call fell back to the ``f"exit {code}"`` placeholder in
+    `_run_propagate` below — which is exactly the false "propagate-failed
+    (status=exit 0, exit=0)" #2187 reports for a verified, exit-0 roll.
+
+    This instead finds the LAST line that is the object's own unindented
+    ``{`` (json.dumps never indents the outermost brace) and parses
+    everything from there to the end of stdout as one document. A single
+    compact line (no ``indent=``) still works too, tried second.
+    """
+    import json as _json  # noqa: PLC0415
+
+    text = stdout.strip()
+    if not text:
+        return None
+    lines = text.splitlines()
+    for idx in range(len(lines) - 1, -1, -1):
+        if lines[idx].strip() != "{":
+            continue
+        try:
+            payload = _json.loads("\n".join(lines[idx:]))
+        except ValueError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    for line in reversed(lines):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            payload = _json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+def _latest_propagate_record_since(state_dir: Path, since: float) -> dict | None:
+    """The propagation journal's own record for the run started at/after
+    *since*, if any — the ground truth `coord release history` itself reads.
+
+    #2187 proposal 1: "read `coord release history` for the run it just
+    launched rather than inferring from a side-channel [stdout]." The
+    journal has no request id to join on, so this uses ``started_at``: the
+    subprocess `_run_propagate` shells out to is synchronous, so by the
+    time it has returned, a successful run has already appended its record
+    with a ``started_at`` at or after the moment this function's caller
+    launched it. Picks the OLDEST such record — the first thing written
+    after launch — in case some unrelated `coord release propagate` run
+    elsewhere raced it onto the same shared journal.
+    """
+    from coord import release_propagate as rp  # noqa: PLC0415
+
+    candidates = [
+        rec for rec in rp.read_records(state_dir)
+        if isinstance(rec.get("started_at"), (int, float)) and rec["started_at"] >= since
+    ]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda rec: rec["started_at"])
+
+
 def _run_propagate(
-    *, daemon_host: str, target_version: str, config_path: Path, runner=None,
-) -> tuple[str, int, str]:
+    *, daemon_host: str, target_version: str, config_path: Path, state_dir: Path,
+    runner=None, now_fn=None,
+) -> tuple[str, int, str, float | None]:
     """``coord release propagate --daemon-host ... --target ... --json``.
 
     A real subprocess of THIS interpreter (matches `_roll_tui`/
@@ -1890,15 +1963,26 @@ def _run_propagate(
     run decided was needed is the version that actually rolls, even if a new
     release lands on PyPI mid-drain.
 
-    Returns ``(status, exit_code, combined_output)``. ``status`` is parsed
-    from the last JSON line of stdout (propagate's own record); parsing
-    failures fall back to ``f"exit {code}"`` rather than raising — a window
-    run must never crash because propagate's output was unexpected.
+    Returns ``(status, exit_code, combined_output, propagate_started_at)``.
+    ``status`` is read from the propagation journal entry that run itself
+    wrote (:func:`_latest_propagate_record_since`) — the same ground truth
+    `coord release history` reads — not reparsed from stdout (#2187:
+    reparsing stdout was the false-negative bug). ``propagate_started_at``
+    is that record's own ``started_at``, stamped onto the window's own
+    record so `window-history` can be joined to `history` (#2187 proposal
+    2) instead of the two stores re-deciding the same outcome separately.
+    Only when no journal entry can be found — the subprocess died before
+    writing one, or the journal write itself failed — does this fall back
+    to `_parse_trailing_json` on stdout, and then to ``f"exit {code}"``;
+    either fallback returns ``None`` for ``propagate_started_at`` since
+    there is then nothing to join to.
     """
-    import json as _json  # noqa: PLC0415
     import subprocess  # noqa: PLC0415
+    import time  # noqa: PLC0415
 
     run = runner or subprocess.run
+    clock = now_fn or time.time
+    launched_at = clock()
     argv = [
         sys.executable, "-m", "coord.cli", "release", "propagate",
         "--daemon-host", daemon_host, "--target", target_version,
@@ -1908,23 +1992,22 @@ def _run_propagate(
         proc = run(argv, capture_output=True, text=True, timeout=1800)
     except Exception as exc:  # noqa: BLE001
         detail = f"{type(exc).__name__}: {exc}"
-        return f"error: {detail}", 1, detail
+        return f"error: {detail}", 1, detail, None
     code = getattr(proc, "returncode", 1)
     stdout = getattr(proc, "stdout", "") or ""
     stderr = getattr(proc, "stderr", "") or ""
-    status = f"exit {code}"
-    for line in reversed(stdout.strip().splitlines()):
-        line = line.strip()
-        if not line.startswith("{"):
-            continue
-        try:
-            payload = _json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(payload, dict) and payload.get("status"):
-            status = str(payload["status"])
-        break
-    return status, code, (stdout + ("\n" + stderr if stderr else "")).strip()
+    output = (stdout + ("\n" + stderr if stderr else "")).strip()
+
+    record = _latest_propagate_record_since(state_dir, launched_at)
+    if record is not None:
+        status = str(record.get("status") or f"exit {code}")
+        return status, code, output, record.get("started_at")
+
+    payload = _parse_trailing_json(stdout)
+    status = (
+        str(payload["status"]) if payload and payload.get("status") else f"exit {code}"
+    )
+    return status, code, output, None
 
 
 #: Where a skipped/failed nightly window (trap 3) is recorded — same
@@ -2161,13 +2244,14 @@ def release_nightly_window(  # noqa: PLR0912, PLR0915 — a pipeline; see module
                 status = rw.STATUS_DRAIN_TIMEOUT
             else:
                 # ── 5. roll — the daemon host is now provably free ─────────
-                prop_status, prop_exit, prop_output = _run_propagate(
+                prop_status, prop_exit, prop_output, prop_started_at = _run_propagate(
                     daemon_host=daemon_name, target_version=record.target_version,
-                    config_path=config_path,
+                    config_path=config_path, state_dir=state_dir,
                 )
                 record.propagate_status = prop_status
                 record.propagate_exit_code = prop_exit
                 record.propagate_output = prop_output
+                record.propagate_started_at = prop_started_at
                 if prop_output:
                     click.echo(prop_output)
 
@@ -2193,11 +2277,38 @@ def release_nightly_window(  # noqa: PLR0912, PLR0915 — a pipeline; see module
                     click.echo(f"error: {record.error}", err=True)
                     _escalate_window(record, reason=record.error)
                     status = rw.STATUS_PROPAGATE_DEFERRED
-                else:
+                elif prop_status.startswith("exit ") or prop_status.startswith("error:"):
+                    # #2187 proposal 3: this arm is reached only when NEITHER
+                    # ground truth was available — no matching entry in
+                    # `coord release history` (see
+                    # `_latest_propagate_record_since`) AND no parseable
+                    # `--json` payload on stdout (`_parse_trailing_json`).
+                    # `prop_status` here is one of those two functions'
+                    # placeholder fallbacks, never a real outcome — so the
+                    # message must say exactly what evidence is missing
+                    # instead of quoting the placeholder as if it were one
+                    # (the old text, "status=exit 0, exit=0", read as a
+                    # verification failure when exit 0 is what a VERIFIED
+                    # roll also produces).
                     record.error = (
-                        f"coord release propagate did not verify a roll "
-                        f"(status={prop_status}, exit={prop_exit}) despite a "
-                        f"drained daemon host"
+                        f"coord release propagate exited {prop_exit}, but its "
+                        "outcome could not be confirmed: no matching entry "
+                        "was found in `coord release history` for this run, "
+                        "and its --json stdout had no parseable status "
+                        "either — see propagate_output"
+                    )
+                    click.echo(f"error: {record.error}", err=True)
+                    _escalate_window(record, reason=record.error)
+                    status = rw.STATUS_PROPAGATE_FAILED
+                    exit_code = prop_exit or 1
+                else:
+                    # A real, ground-truth status from `coord release
+                    # history` — just not a verified roll (e.g. `failed` or
+                    # `rolled-back`).
+                    record.error = (
+                        f"coord release propagate did not verify a roll — "
+                        f"`coord release history` recorded status="
+                        f"{prop_status!r} (exit {prop_exit}) for this run"
                     )
                     click.echo(f"error: {record.error}", err=True)
                     _escalate_window(record, reason=record.error)
