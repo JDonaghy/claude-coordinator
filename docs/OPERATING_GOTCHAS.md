@@ -787,3 +787,88 @@ coord report-result --assignment 7c5a9fe11925 --status done --verdict approve \
 
 Until an operator runs these, `coord gates` / the audit trail will keep
 showing both as plain `agent`-sourced approvals.
+
+## 17. The review loop is the biggest-looking cost lever on the board, and both obvious cuts are measured-dead (#2132)
+
+Sooner or later someone reads the spend breakdown, sees that the
+`request-changes → fix → re-review` loop is **~29% of all fleet spend**, and
+reaches for the two levers sitting right next to it. Both are wrong, and
+#2132 measured why so nobody has to re-derive it.
+
+Measured 2026-08-08 → 08-11 (393 legs, $907.04):
+
+| | |
+|---|---|
+| review verdicts | 91 approve / **38 request-changes** / 4 none |
+| request-changes rate | **29%** |
+| fix legs triggered | 35 |
+| re-review legs (2nd+ on an issue) | 54, **$76.84** |
+| review legs total | 133 — *more than the 127 work legs* |
+
+That is several times larger than the sonnet-vs-opus gap everyone reaches for
+first ($7.30/leg opus work vs $4.64/leg sonnet). It is genuinely the biggest
+single line item. It is still not a lever.
+
+### Lever 1: `pipeline.max_review_iterations` — never binds
+
+Default is 5. Observed depth across the window:
+
+| review_iteration | work legs |
+|---|---|
+| 0 | 91 |
+| 1 | 29 |
+| 2 | 6 |
+
+Nothing ever got past 2. Lowering it to 3 saves **nothing**; lowering it to 2
+strands the 6 second-round fixes on a human, converting spend into your time.
+There is no setting of this knob that saves money.
+
+### Lever 2: "the reviewer is too strict" — measured false
+
+27 blocking verdicts from that window, classified:
+
+| Category | Count | % |
+|---|---|---|
+| Real behavioural defect | 20 | 74% |
+| Missing required black-box test only | 5 | 18.5% |
+| Unsubstantiated root-cause claim | 1 | 3.7% |
+| Escalation-judgment | 1 | 3.7% |
+| **Style/preference nit** | **0** | **0%** |
+| **False positive** | **0** | **0%** |
+
+Zero style nits and zero false positives. Weakening the reviewer does not
+remove waste here — it removes defect detection.
+
+### The part that argues *for* the gate
+
+Six of the 27 are the reviewer catching a **fresh regression introduced by a
+fix leg**, not the original bug persisting:
+
+- **#2062** — a fix for "unbounded briefing cost" dropped the local→remote log
+  fallback, breaking cross-machine liveness auditing.
+- **#2100** — a fix for "gate that cannot fail" over-corrected into "gate that
+  can never pass" for 4 of 5 call sites, then missed a 5th.
+- **#2119** — a fix set an env var on the wrong systemd unit.
+
+Fixes made under pressure introduce new defects at a measurable rate. The
+review catching them is the gate doing its job on a second target, and it is
+the strongest argument against trimming review depth as autonomy is reduced
+elsewhere.
+
+### The one real lever
+
+The 5 "missing required black-box test" cases are the only mechanically
+detectable pattern: the code was correct, and the rule requiring the test is
+already stated verbatim in `CLAUDE.md`. A free static check —
+*user-visible diff, zero new/modified test files* — catches them before the
+paid reviewer runs. Tracked in **#2192**. More prose in CLAUDE.md is not the
+fix; that rule already exists and was skipped anyway.
+
+### If you re-measure
+
+Use `coord usage --by-issue` or the DB directly. The default `coord usage`
+view undercounts (#2128), so a re-measurement taken from it will not reproduce
+these figures. Note also that #2132's classification covers 27 rows, not the
+38 the original count named — the worker could not reproduce the exact window
+boundary, and cross-validated instead against the `review_iteration=2 → 6 legs`
+figure, which matched exactly. Treat it as representative, not a literal audit.
