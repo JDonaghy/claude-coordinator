@@ -175,6 +175,37 @@ class TestBuildBriefing:
         assert "NEVER drop the registration line" in TEST_AUTHOR_SYSTEM_PROMPT
         assert "Do not rewrite, reorder, or delete" in TEST_AUTHOR_SYSTEM_PROMPT
 
+    # ── #2191: expected_red writer ──────────────────────────────────────────
+
+    def test_system_prompt_instructs_recording_expected_red_from_the_observed_run(
+        self,
+    ) -> None:
+        """#2191: #2164 shipped a reader/clearer/lister for `expected_red`
+        but nothing ever wrote it — every JIT slice landed with an empty
+        registry. Step 4b is the writer: record exactly what step 4's run
+        observed failing, not what the author intended."""
+        assert "expected_red" in TEST_AUTHOR_SYSTEM_PROMPT
+        assert "OBSERVED, not INTENDED" in TEST_AUTHOR_SYSTEM_PROMPT
+        assert "FAIL in step 4" in TEST_AUTHOR_SYSTEM_PROMPT
+
+    def test_system_prompt_excludes_control_and_ratchet_clauses_by_construction(
+        self,
+    ) -> None:
+        """A control clause (must stay green to prove a regression would be
+        caught) and a ratchet clause (existing behavior that must not
+        break) both exclude themselves from `expected_red` because they
+        never failed step 4 — the prompt must say so explicitly rather
+        than relying on the author to infer it."""
+        assert "control clause" in TEST_AUTHOR_SYSTEM_PROMPT
+        assert "ratchet clause" in TEST_AUTHOR_SYSTEM_PROMPT
+
+    def test_system_prompt_fails_loudly_on_a_vacuous_slice(self) -> None:
+        """#1965: a slice where nothing was observed red must not file an
+        empty `expected_red` entry — it must STOP instead."""
+        assert "vacuous" in TEST_AUTHOR_SYSTEM_PROMPT
+        assert "zero failures" in TEST_AUTHOR_SYSTEM_PROMPT
+        assert "#1965" in TEST_AUTHOR_SYSTEM_PROMPT
+
     # ── #1542: web-playwright mock shape ────────────────────────────────────
 
     def test_mocks_line_names_the_driver_mock_glob(self) -> None:

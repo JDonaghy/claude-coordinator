@@ -886,6 +886,75 @@ def find_ms_manifest_for_issue_via_api(
     return None
 
 
+def missing_expected_red_warning(
+    repo_github: str, branch: str, issue_number: int, *, gh_ops: Any = None,
+) -> str | None:
+    """#2191 — the writer/gate seam: is *issue_number* the signature of an
+    unwritten ``expected_red`` registry on *branch*'s manifest? That
+    signature is checkable without ever running the suite: the manifest
+    maps at least one test id to *issue_number* (a slice was authored for
+    it) but records ZERO ``expected_red`` entries for it, and the issue is
+    still open. #2164 shipped a reader (:func:`apply_expected_red`), a
+    clearer (:func:`clear_expected_red_via_pr`) and a lister
+    (:func:`list_expected_red_via_api`) for this registry but no writer —
+    :data:`coord.test_author.TEST_AUTHOR_SYSTEM_PROMPT` step 4b is the
+    writer (the test-author records what it observed FAIL in its step-4
+    run). This function is the gate half: it does not trust the prompt was
+    followed, so it re-derives "was anything recorded" from the manifest
+    itself at slice-PR-open time (:func:`coord.merge_queue.process`'s
+    "Open PRs first" loop, gated on ``assignment_type == "test-author"``)
+    and flags exactly the case a skipped step 4b produces.
+
+    Returns ``None`` — nothing to flag — when: *branch*'s manifest doesn't
+    reference *issue_number* at all (no slice authored yet, out of scope);
+    ``expected_red`` already has a non-empty entry for it (the writer did
+    its job, or the slice is genuinely all-green and needs none); the issue
+    is closed (its slice already served its purpose — flagging it now is
+    stale noise, not #2191's live deadlock); or any lookup fails. The last
+    case is deliberate fail-open, matching every other best-effort API
+    sweep in this module (:func:`find_ms_manifest_for_issue_via_api`,
+    :func:`coord.merge_queue._issue_has_expected_red_entries`) — this check
+    is advisory (see the "refused or warned" phrasing in #2191's acceptance
+    criteria; callers choose which), so an unreachable API must degrade to
+    "say nothing," never to blocking a PR the check itself couldn't
+    evaluate.
+
+    Otherwise returns a human-readable warning naming the missing ids.
+    """
+    ops = gh_ops or _default_github_ops()
+    found = find_ms_manifest_for_issue_via_api(
+        repo_github, branch, issue_number, gh_ops=ops,
+    )
+    if found is None:
+        return None
+    path, _text, _blob_sha, data = found
+    if data.expected_red.get(issue_number):
+        return None
+    test_ids = test_ids_for_issue(data.tests, issue_number)
+    if not test_ids:
+        return None
+    live_state = getattr(ops, "get_issues_live_state", None)
+    if live_state is None:
+        return None
+    try:
+        states = live_state(repo_github, [issue_number])
+    except Exception:  # noqa: BLE001 — best-effort, fail open (see docstring)
+        return None
+    if states.get(issue_number) != "open":
+        return None
+    return (
+        f"#{issue_number}: {path} maps {len(test_ids)} test-id(s) to this "
+        f"issue ({', '.join(sorted(test_ids))}) but records no "
+        "`expected_red` entries for it — the #2191 signature of an "
+        "unwritten registry (the test-author's step 4b never ran, or was "
+        "skipped). If this slice is genuinely all-green already, ignore; "
+        "otherwise every red id here fails CI with nothing telling "
+        "`coord acceptance run --all --ci` that's expected, and `coord "
+        "merge` will need `--force-merge` or a hand-edited manifest to "
+        "land it."
+    )
+
+
 def list_expected_red_via_api(
     repo_github: str, branch: str, *, gh_ops: Any = None,
 ) -> "dict[str, dict[int, frozenset[str]]]":

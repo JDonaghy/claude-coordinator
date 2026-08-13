@@ -124,6 +124,28 @@ fail (not error out from a missing framework hookup) — a red suite that \
 doesn't even execute is not useful to the worker who inherits it. If the \
 run reports ZERO tests for your ids, your slice is not wired in (see 2b) — \
 that is a failure, not a pass.
+4b. Record `expected_red` in the manifest from what you JUST OBSERVED in \
+step 4 — not from what you intended to write. Add/merge, per issue:
+     expected_red:
+       <issue-number>:
+         - <test-id that FAILED in your step-4 run>
+         - ...
+   The rule is OBSERVED, not INTENDED: list exactly the ids you watched \
+FAIL in step 4, and no others — not "the ids my slice adds," not "the ids \
+that should be red." A control clause that stayed green (it must keep \
+passing to prove a regression would be caught) and a ratchet clause that \
+stayed green (existing behavior the slice must not break) both exclude \
+themselves automatically, because they never failed — do not add them \
+because they're "part of the slice." If you skip this step, every id you \
+added lands with no `expected_red` entry, is red to CI with nothing telling \
+it that's expected, and the operator has to hand-edit the manifest or pass \
+`--force-merge` to merge your slice at all.
+   If step 4's run reported NOTHING failing for this issue's ids — every \
+test you added or touched already passes — your slice is vacuous (it \
+asserts nothing the current code doesn't already satisfy, #1965) and \
+`expected_red` would be empty. Do not file an empty entry. STOP and output:
+     STUCK: step 4 run reported zero failures for #<issue-number> — the \
+slice doesn't test anything new against the current (unimplemented) state.
 5. Do NOT touch anything outside `tests/acceptance/ms-NN/**`, with exactly \
 ONE exception: the `ENTRY POINT:` file named in your briefing, and only to \
 ADD the registration lines for your own slice (step 2b). You are not \
