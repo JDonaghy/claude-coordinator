@@ -892,10 +892,19 @@ def agent_clean_worktrees(
                 # #1402: the same endpoint GCs the shared cargo target cache.
                 cargo_mb = data.get("cargo_cache_bytes", 0) / (1024 * 1024)
                 evicted = data.get("cargo_caches_evicted", 0)
-                click.echo(
+                # #2137: pruned bytes and, above all, the GC's give-up signal.
+                pruned_mb = data.get("cargo_pruned_bytes", 0) / (1024 * 1024)
+                line = (
                     f" cleaned={cleaned} kept={kept} freed={freed_mb:.1f} MB "
-                    f"cargo-cache={cargo_mb:.1f} MB (evicted {evicted})"
+                    f"cargo-cache={cargo_mb:.1f} MB (evicted {evicted}, "
+                    f"pruned {pruned_mb:.1f} MB)"
                 )
+                click.echo(line)
+                if data.get("cargo_over_cap"):
+                    reason = data.get("cargo_over_cap_reason") or "cache over cap"
+                    click.echo(
+                        f"    WARN: cargo cache GC could not get under cap — {reason}"
+                    )
             else:
                 click.echo(f" HTTP {resp.status_code}")
                 any_error = True

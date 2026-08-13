@@ -270,6 +270,343 @@ def test_sweep_ignores_symlinks_in_the_cache_root(tmp_path: Path) -> None:
     assert r["cargo_evicted_repos"] == ["api"]
 
 
+# ── #2137: graduated intra-repo pruning ─────────────────────────────────────
+#
+# The all-or-nothing eviction these tests replace could not shrink a cache
+# root holding a single oversized repo: evict the whole 38G tree, or (because
+# a live worker protected it) evict nothing.  quadraui was the repo under
+# heaviest churn, so it was protected most often, so it was the one that
+# filled /home twice.
+
+
+def _repo_cache(
+    root: Path,
+    name: str,
+    *,
+    warm: int = 0,
+    incremental: int = 0,
+    profile: str = "debug",
+) -> Path:
+    """A realistic per-repo cache: a profile dir with ``.fingerprint``/``deps``
+    (what makes it a *profile* dir to the pruner), warm artifacts, and an
+    optional ``incremental/`` tier-1 cache."""
+    repo = root / name
+    prof = repo / profile
+    (prof / ".fingerprint").mkdir(parents=True, exist_ok=True)
+    if warm:
+        _fill(prof / "deps", warm, name="libwarm.rlib")
+    if incremental:
+        _fill(prof / "incremental", incremental, name="chunk.bin")
+    return repo
+
+
+def test_single_oversized_repo_is_pruned_not_evicted(tmp_path: Path) -> None:
+    """Acceptance: a repo that exceeds the cap *on its own* comes back under
+    it without an rmtree, and the warm artifacts outside the pruned tiers
+    survive."""
+    root = tmp_path / "cargo-target"
+    repo = _repo_cache(root, "quadraui", warm=1000, incremental=3000)
+
+    r = cargo_cache.sweep(tmp_path, cap=2000)
+
+    assert r["cargo_over_cap"] is False
+    assert r["cargo_evicted_repos"] == []  # nothing was destroyed wholesale
+    assert r["cargo_pruned_repos"] == ["quadraui"]
+    assert r["cargo_pruned_bytes"] == 3000
+    assert r["cargo_cache_bytes"] == 1000
+    assert [p["tier"] for p in r["cargo_pruned"]] == ["incremental"]
+    # The cache still exists and is still warm.
+    assert repo.exists()
+    assert (repo / "debug" / "deps" / "libwarm.rlib").exists()
+    assert not (repo / "debug" / "incremental").exists()
+
+
+def test_stale_profile_dirs_are_the_second_tier(tmp_path: Path) -> None:
+    """Tier 2 only runs when tier 1 wasn't enough, and takes whole profile
+    dirs (never individual files inside one)."""
+    root = tmp_path / "cargo-target"
+    repo = _repo_cache(root, "quadraui", warm=1000, incremental=500)
+    _repo_cache(root, "quadraui", warm=4000, profile="release")
+    _age(repo / "release", 30 * 86400)
+
+    r = cargo_cache.sweep(tmp_path, cap=2000, stale_after_secs=7 * 86400)
+
+    tiers = [p["tier"] for p in r["cargo_pruned"]]
+    assert tiers == ["incremental", "stale"]
+    assert r["cargo_cache_bytes"] == 1000
+    assert r["cargo_over_cap"] is False
+    assert not (repo / "release").exists()
+    assert (repo / "debug" / "deps" / "libwarm.rlib").exists()
+    assert repo.exists() and r["cargo_evicted_repos"] == []
+
+
+def test_recent_profile_dirs_are_not_stale(tmp_path: Path) -> None:
+    """A profile dir in active use is not a tier-2 candidate — the sweep falls
+    through to whole-directory eviction instead of pruning something warm."""
+    root = tmp_path / "cargo-target"
+    _repo_cache(root, "quadraui", warm=4000)
+
+    r = cargo_cache.sweep(tmp_path, cap=1000, stale_after_secs=7 * 86400)
+
+    assert [p["tier"] for p in r["cargo_pruned"]] == []
+    assert r["cargo_evicted_repos"] == ["quadraui"]
+
+
+def test_pruning_never_takes_a_subdirectory_of_a_profile(tmp_path: Path) -> None:
+    """``debug/deps`` is not a prunable unit: removing it while leaving
+    ``debug/.fingerprint`` behind is how a cold rebuild becomes a failed one."""
+    root = tmp_path / "cargo-target"
+    repo = _repo_cache(root, "quadraui", warm=4000)
+    _age(repo, 30 * 86400)
+
+    stale = cargo_cache.stale_profile_dirs(repo, 7 * 86400, time.time())
+
+    assert stale == [repo / "debug"]
+
+
+def test_protected_repo_is_pruned_when_nothing_is_compiling(tmp_path: Path) -> None:
+    """Protection exists to stop deleting a target dir out from under rustc —
+    which is much narrower than "this repo has an assignment"."""
+    root = tmp_path / "cargo-target"
+    repo = _repo_cache(root, "quadraui", warm=1000, incremental=3000)
+
+    r = cargo_cache.sweep(tmp_path, cap=2000, protect_repos={"quadraui"})
+
+    assert r["cargo_pruned_repos"] == ["quadraui"]
+    assert r["cargo_prune_blocked"] == []
+    assert r["cargo_over_cap"] is False
+    assert repo.exists()
+    assert (repo / "debug" / "deps" / "libwarm.rlib").exists()
+
+
+def test_protected_repo_with_a_live_build_is_left_alone_and_escalates(
+    tmp_path: Path,
+) -> None:
+    """The build lock is real: cargo holds an exclusive flock on
+    ``<target>/<profile>/.cargo-lock`` for the duration of a build, so a held
+    lock means "do not touch this tree" — and the sweep must then *report* the
+    overage rather than returning quietly the way it did while 38G piled up."""
+    import fcntl
+
+    root = tmp_path / "cargo-target"
+    repo = _repo_cache(root, "quadraui", warm=1000, incremental=3000)
+    lock = repo / "debug" / cargo_cache.BUILD_LOCK_NAME
+    lock.write_text("")
+    fd = os.open(str(lock), os.O_RDONLY)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        r = cargo_cache.sweep(tmp_path, cap=2000, protect_repos={"quadraui"})
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+    assert r["cargo_pruned"] == []
+    assert r["cargo_prune_blocked"] == ["quadraui"]
+    assert r["cargo_over_cap"] is True
+    assert "live build" in r["cargo_over_cap_reason"]
+    assert (repo / "debug" / "incremental").exists()
+
+
+def test_an_unprotected_repo_with_a_live_build_is_left_alone_too(
+    tmp_path: Path,
+) -> None:
+    """An operator's own ``cargo build`` against the shared cache holds no
+    coord assignment.  Refusing to reclaim costs disk (and says so); rmtree-ing
+    39G out from under their rustc costs them the build."""
+    import fcntl
+
+    root = tmp_path / "cargo-target"
+    repo = _repo_cache(root, "quadraui", warm=4000, incremental=1000)
+    lock = repo / "debug" / cargo_cache.BUILD_LOCK_NAME
+    lock.write_text("")
+    fd = os.open(str(lock), os.O_RDONLY)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        r = cargo_cache.sweep(tmp_path, cap=100)
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+    assert r["cargo_evicted_repos"] == []
+    assert r["cargo_pruned"] == []
+    assert r["cargo_prune_blocked"] == ["quadraui"]
+    assert r["cargo_over_cap"] is True
+    assert repo.exists()
+
+
+def test_build_active_is_false_for_an_idle_cache(tmp_path: Path) -> None:
+    root = tmp_path / "cargo-target"
+    repo = _repo_cache(root, "quadraui", warm=10)
+    (repo / "debug" / cargo_cache.BUILD_LOCK_NAME).write_text("")
+    assert cargo_cache.build_active(repo) is False
+
+
+def test_build_active_fails_safe_when_a_probe_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Refusing to prune costs disk; pruning mid-rustc costs a build."""
+    root = tmp_path / "cargo-target"
+    repo = _repo_cache(root, "quadraui", warm=10)
+
+    def _boom(_path):
+        raise RuntimeError("probe exploded")
+
+    monkeypatch.setattr(cargo_cache, "_build_lock_held", _boom)
+    assert cargo_cache.build_active(repo) is True
+
+
+def test_prune_then_still_over_cap_reports_the_overage(tmp_path: Path) -> None:
+    """Pruning helps but isn't enough, and the repo is protected so it can't
+    be evicted: `cargo_over_cap` must say so with a reason."""
+    root = tmp_path / "cargo-target"
+    repo = _repo_cache(root, "quadraui", warm=4000, incremental=500)
+
+    r = cargo_cache.sweep(tmp_path, cap=1000, protect_repos={"quadraui"})
+
+    assert r["cargo_pruned_bytes"] == 500
+    assert r["cargo_cache_bytes"] == 4000
+    assert r["cargo_over_cap"] is True
+    assert "protected" in r["cargo_over_cap_reason"]
+    assert "quadraui" in r["cargo_over_cap_reason"]
+    assert (repo / "debug" / "deps" / "libwarm.rlib").exists()
+
+
+def test_prune_falls_back_to_eviction_when_unprotected(tmp_path: Path) -> None:
+    """Tier 3 is still there: pruning first, whole-directory eviction only if
+    the cheaper tiers left us over the cap."""
+    root = tmp_path / "cargo-target"
+    _repo_cache(root, "quadraui", warm=4000, incremental=500)
+
+    r = cargo_cache.sweep(tmp_path, cap=1000)
+
+    assert r["cargo_pruned_bytes"] == 500
+    assert r["cargo_evicted_repos"] == ["quadraui"]
+    assert r["cargo_cache_bytes"] == 0
+    assert r["cargo_over_cap"] is False
+
+
+def test_prune_dry_run_mutates_nothing_on_disk(tmp_path: Path) -> None:
+    root = tmp_path / "cargo-target"
+    repo = _repo_cache(root, "quadraui", warm=1000, incremental=3000)
+    before = sorted(str(p) for p in repo.rglob("*"))
+
+    r = cargo_cache.sweep(tmp_path, cap=2000, dry_run=True)
+
+    assert r["cargo_pruned_bytes"] == 3000
+    assert r["cargo_cache_bytes"] == 1000  # what it *would* be
+    assert sorted(str(p) for p in repo.rglob("*")) == before
+
+
+def test_free_disk_floor_reclaims_even_under_the_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2137 item 4: what actually bit was 0 bytes free, not "over cap" — the
+    per-checkout target/ dirs the cap cannot see are what filled the disk."""
+    from types import SimpleNamespace
+
+    root = tmp_path / "cargo-target"
+    repo = _repo_cache(root, "quadraui", warm=1000, incremental=3000)
+    monkeypatch.setattr(
+        cargo_cache.shutil,
+        "disk_usage",
+        lambda _p: SimpleNamespace(total=100_000, used=99_000, free=1000),
+    )
+
+    r = cargo_cache.sweep(tmp_path, cap=1_000_000, free_floor=3000)
+
+    assert r["cargo_disk_low"] is True
+    assert r["cargo_disk_free_bytes"] == 1000
+    assert r["cargo_pruned_bytes"] == 3000  # the 2000-byte shortfall, tier 1
+    # The configured cap is reported unchanged; only the effective limit moved.
+    assert r["cargo_cap_bytes"] == 1_000_000
+    assert r["cargo_limit_bytes"] == 2000
+    assert (repo / "debug" / "deps" / "libwarm.rlib").exists()
+
+
+def test_free_disk_floor_is_quiet_when_there_is_headroom(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    root = tmp_path / "cargo-target"
+    _repo_cache(root, "quadraui", warm=1000, incremental=3000)
+    monkeypatch.setattr(
+        cargo_cache.shutil,
+        "disk_usage",
+        lambda _p: SimpleNamespace(total=100_000, used=1_000, free=99_000),
+    )
+
+    r = cargo_cache.sweep(tmp_path, cap=1_000_000, free_floor=3000)
+
+    assert r["cargo_disk_low"] is False
+    assert r["cargo_pruned"] == []
+
+
+def test_free_floor_and_stale_env_overrides() -> None:
+    assert cargo_cache.free_floor_bytes({}) == int(
+        cargo_cache.DEFAULT_FREE_FLOOR_GB * 1024**3
+    )
+    assert cargo_cache.free_floor_bytes({cargo_cache.FREE_FLOOR_ENV: "2"}) == 2 * 1024**3
+    assert cargo_cache.free_floor_bytes({cargo_cache.FREE_FLOOR_ENV: "0"}) is None
+    assert cargo_cache.free_floor_bytes({cargo_cache.FREE_FLOOR_ENV: "banana"}) == int(
+        cargo_cache.DEFAULT_FREE_FLOOR_GB * 1024**3
+    )
+    assert cargo_cache.stale_secs({cargo_cache.STALE_DAYS_ENV: "2"}) == 2 * 86400
+    assert cargo_cache.stale_secs({cargo_cache.STALE_DAYS_ENV: "0"}) is None
+
+
+def test_pruning_never_follows_a_symlink_out_of_the_cache(tmp_path: Path) -> None:
+    """The #1402 guard, re-asserted against the new tiers: an ``incremental``
+    symlink pointing outside the cache is not a prune candidate."""
+    root = tmp_path / "cargo-target"
+    repo = _repo_cache(root, "quadraui", warm=1000)
+    outside = tmp_path / "precious"
+    _fill(outside, 9000)
+    (repo / "debug" / "incremental").symlink_to(outside, target_is_directory=True)
+
+    r = cargo_cache.sweep(tmp_path, cap=100, protect_repos={"quadraui"})
+
+    assert cargo_cache.incremental_dirs(repo) == []
+    assert r["cargo_pruned"] == []
+    assert outside.exists() and (outside / "blob.bin").exists()
+
+
+# ── #2137: the GC's verdict reaches a reader ────────────────────────────────
+
+
+def test_gc_status_roundtrip(tmp_path: Path) -> None:
+    result = {"cargo_over_cap": True, "cargo_over_cap_reason": "38.0G of 20.0G cap"}
+    cargo_cache.write_gc_status(tmp_path, result, now=1234.0)
+
+    status = cargo_cache.read_gc_status(tmp_path)
+    assert status["cargo_over_cap"] is True
+    assert status["checked_at"] == 1234.0
+    assert status["cargo_over_cap_reason"] == "38.0G of 20.0G cap"
+
+
+def test_gc_status_absent_or_corrupt_is_none(tmp_path: Path) -> None:
+    assert cargo_cache.read_gc_status(tmp_path) is None
+    cargo_cache.gc_status_path(tmp_path).write_text("{not json")
+    assert cargo_cache.read_gc_status(tmp_path) is None
+
+
+def test_agent_gc_publishes_the_over_cap_verdict(tmp_path: Path) -> None:
+    """``cargo_over_cap`` used to be set by ``sweep`` and read by nothing at
+    all.  The agent now parks it where the health check finds it."""
+    server = _server(tmp_path)
+    root = server.state_dir / "cargo-target"
+    _repo_cache(root, "api", warm=5000)
+    try:
+        result = server._gc_cargo_cache()
+    finally:
+        server.shutdown()
+
+    status = cargo_cache.read_gc_status(server.state_dir)
+    assert status is not None
+    assert status["cargo_cache_bytes"] == result["cargo_cache_bytes"]
+    assert "checked_at" in status
+
+
 # ── agent wiring ────────────────────────────────────────────────────────────
 
 

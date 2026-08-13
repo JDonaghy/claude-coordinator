@@ -630,6 +630,8 @@ def _clean_worktrees_tick(config: Config) -> list[dict]:
     without wiring up the async ``_tick_loop`` infrastructure (mirrors
     ``_reconcile_merges_tick`` / ``_sync_issues_tick``).
     """
+    import logging  # noqa: PLC0415
+
     from coord import network  # noqa: PLC0415
 
     live_per_machine = _live_assignment_ids_per_machine(config)
@@ -639,6 +641,18 @@ def _clean_worktrees_tick(config: Config) -> list[dict]:
         protect = live_per_machine.get(machine.name)
         r = network.clean_worktrees(machine, protect=protect)
         results.append({"machine": machine.name, **r})
+
+    # #2137: an agent whose cargo GC could not get under cap is a state that
+    # only gets worse on its own — the 2026-08-11 incident ran this tick for
+    # days while `cargo-target/quadraui` grew to 38G, because nothing here
+    # looked at the one field that said so.
+    for r in results:
+        if r.get("ok") and r.get("cargo_over_cap"):
+            logging.getLogger("coord.serve").warning(
+                "%s: cargo cache GC could not get under cap — %s",
+                r.get("machine"),
+                r.get("cargo_over_cap_reason") or "cache over cap",
+            )
 
     swept = [r for r in results if r["ok"] and r["cleaned"] > 0]
     if swept:

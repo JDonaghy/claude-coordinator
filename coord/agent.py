@@ -4989,9 +4989,19 @@ class AgentServer:
         """Bound the shared cargo target cache (#1402).
 
         Repos with a pending/running assignment on this agent are protected
-        so the GC can never delete a target dir out from under a build in
-        flight.  Best-effort: any failure degrades to an empty dict rather
-        than aborting the worktree sweep that calls it.
+        from *eviction* so the GC can never delete a target dir out from
+        under a build in flight.  #2137: they are still eligible for
+        intra-repo *pruning* (incremental dirs, stale profile dirs) when
+        nothing is actually compiling against them — otherwise the busiest
+        repo on the machine is also the one whose cache can never be
+        reclaimed, which is how ``cargo-target/quadraui`` reached 38G against
+        a 20 GiB cap and filled ``/home``.
+
+        Also passes the absolute free-disk floor (#2137 item 4), and parks
+        the sweep's verdict where the ``cargo_targets`` health check can read
+        it so ``cargo_over_cap`` reaches an operator instead of dead-ending
+        in this dict.  Best-effort: any failure degrades to an empty dict
+        rather than aborting the worktree sweep that calls it.
         """
         with self._lock:
             live_repos = {
@@ -5000,10 +5010,21 @@ class AgentServer:
                 if a.status in (PENDING, RUNNING)
             }
         try:
-            return cargo_cache.sweep(self.state_dir, protect_repos=live_repos)
+            result = cargo_cache.sweep(
+                self.state_dir,
+                protect_repos=live_repos,
+                free_floor=cargo_cache.free_floor_bytes(),
+            )
         except OSError as e:  # pragma: no cover - defensive
             _log.warning("cargo cache GC failed: %s", e)
             return {}
+        if result.get("cargo_over_cap"):
+            _log.warning(
+                "cargo cache still over cap after GC: %s",
+                result.get("cargo_over_cap_reason") or "unknown reason",
+            )
+        cargo_cache.write_gc_status(self.state_dir, result)
+        return result
 
     def list_assignments(self) -> dict:
         from coord.worker_events import is_stream_json, parse_log
