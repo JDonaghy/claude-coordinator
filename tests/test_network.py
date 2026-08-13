@@ -183,6 +183,12 @@ class TestCleanWorktrees:
             # still yields the full wire shape, defaulted to 0.
             "cargo_cache_bytes": 0,
             "cargo_caches_evicted": 0,
+            # #2137: same rule for the pruning counter and the GC's give-up
+            # signal — an old agent reports neither, and False is the safe
+            # default ("no evidence the GC gave up"), never a spurious WARN.
+            "cargo_pruned_bytes": 0,
+            "cargo_over_cap": False,
+            "cargo_over_cap_reason": None,
             "error": None,
         }
         assert "/worktree-clean" in mock_post.call_args.args[0]
@@ -204,6 +210,28 @@ class TestCleanWorktrees:
             result = network.clean_worktrees(_m())
         assert result["cargo_cache_bytes"] == 4096
         assert result["cargo_caches_evicted"] == 2
+
+    def test_forwards_the_gc_over_cap_signal(self) -> None:
+        """#2137: "the GC ran and could not get under cap" is a different and
+        more urgent state than "the cache is large", and it has to survive the
+        wire to be actionable anywhere but the agent's own log."""
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "cleaned": 0,
+            "kept": 0,
+            "bytes_freed": 0,
+            "cargo_cache_bytes": 38 * 1024**3,
+            "cargo_caches_evicted": 0,
+            "cargo_pruned_bytes": 4096,
+            "cargo_over_cap": True,
+            "cargo_over_cap_reason": "38.0G of 20.0G cap — live build in quadraui",
+        }
+        with patch.object(network.httpx, "post", return_value=resp):
+            result = network.clean_worktrees(_m())
+        assert result["cargo_over_cap"] is True
+        assert "live build in quadraui" in result["cargo_over_cap_reason"]
+        assert result["cargo_pruned_bytes"] == 4096
 
     def test_passes_recent_secs(self) -> None:
         resp = MagicMock()

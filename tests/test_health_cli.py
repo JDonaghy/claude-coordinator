@@ -288,3 +288,42 @@ def test_render_report_widens_the_label_column_instead_of_truncating() -> None:
     assert "worktree clean claude-coordinator" in lines[1]
     # Both severity tokens start at the same column.
     assert lines[0].index("OK") == lines[1].index("OK")
+
+
+# ── #2137: the cargo GC's give-up signal reaches `coord health` ─────────────
+
+
+def test_coord_health_renders_the_cargo_gc_over_cap_verdict(tmp_path, monkeypatch):
+    """End-to-end through the real registry: the agent's last sweep said it
+    could not get the shared cache under its cap, and an operator running
+    ``coord health`` sees that — the whole defect in #2137 was a value the GC
+    computed and no surface ever showed."""
+    import time
+
+    from coord import cargo_cache
+
+    # Path.home() reads $HOME on POSIX, so this keeps the probe off the real
+    # machine: it totals a cargo-target tree we made, not this laptop's.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cache = tmp_path / ".coord" / "cargo-target" / "quadraui"
+    cache.mkdir(parents=True)
+    (cache / "blob").write_bytes(b"\0" * 4096)
+    cargo_cache.write_gc_status(
+        tmp_path / ".coord",
+        {
+            "cargo_cache_bytes": 38 * 1024**3,
+            "cargo_over_cap": True,
+            "cargo_over_cap_reason": "38.0G of 20.0G cap (18.0G over) — live build in quadraui",
+            "cargo_prune_blocked": ["quadraui"],
+        },
+        now=time.time(),
+    )
+
+    result = CliRunner().invoke(
+        health, ["--check", "cargo_targets", "--no-network", "--exit-code"]
+    )
+
+    assert "GC over cap" in result.output
+    assert "could not get under cap" in result.output
+    assert "HEALTH: WARN" in result.output
+    assert result.exit_code == EXIT_WARN

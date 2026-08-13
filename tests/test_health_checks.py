@@ -225,6 +225,81 @@ def test_cargo_targets_partial_scan_above_crit_is_still_crit(tmp_path, monkeypat
     assert result.severity is Severity.CRIT
 
 
+def _gc_status(coord_dir: Path, **fields) -> None:
+    from coord import cargo_cache
+
+    written_at = fields.pop("now", NOW)
+    payload = {
+        "cargo_cache_bytes": 38 * 1024**3,
+        "cargo_over_cap": True,
+        "cargo_over_cap_reason": "38.0G of 20.0G cap (18.0G over) — live build in quadraui",
+        "cargo_prune_blocked": ["quadraui"],
+        **fields,
+    }
+    cargo_cache.write_gc_status(coord_dir, payload, now=written_at)
+
+
+def test_cargo_targets_escalates_when_the_gc_could_not_get_under_cap(tmp_path) -> None:
+    """#2137: ``cargo_over_cap`` was written by the GC and read by nothing —
+    the single most actionable bit it produces, dead-ended, which is why 38G
+    accumulated in silence.  It must now reach an operator surface, and "the
+    GC gave up" outranks the size thresholds: the total here is nowhere near
+    WARN, and the line is a WARN anyway."""
+    from coord.health.render import render_report, render_result
+    from coord.health.registry import HealthReport
+
+    coord_dir = tmp_path / ".coord"
+    _write_bytes(coord_dir / "cargo-target" / "quadraui" / "blob", 4096)
+    _gc_status(coord_dir)
+
+    result = cargo_targets.probe_cargo_targets(make_ctx(tmp_path, coord_dir=coord_dir))
+
+    assert result.severity is Severity.WARN
+    assert result.values["gc_over_cap"] is True
+    # Assert on the *rendered* line, not just the dict — the whole defect was
+    # a value nothing rendered.
+    line = render_result(result)
+    assert "GC over cap" in line
+    body = render_report(HealthReport(results=[result]))
+    assert "could not get under cap" in body
+    assert "live build in quadraui" in body
+
+
+def test_cargo_targets_gc_verdict_does_not_downgrade_a_crit(tmp_path, monkeypatch) -> None:
+    coord_dir = tmp_path / ".coord"
+    _write_bytes(coord_dir / "cargo-target" / "quadraui" / "blob", 1)
+    _gc_status(coord_dir)
+    monkeypatch.setattr(
+        cargo_targets, "_dir_size_budgeted", lambda p, d: (int(78 * 1024**3), True)
+    )
+    result = cargo_targets.probe_cargo_targets(make_ctx(tmp_path, coord_dir=coord_dir))
+    assert result.severity is Severity.CRIT
+    assert "GC over cap" in result.headroom
+
+
+def test_cargo_targets_ignores_a_stale_gc_verdict(tmp_path) -> None:
+    """A status file older than the freshness window means the GC has not run
+    — not that the cache is over cap right now.  Reported, never escalated."""
+    coord_dir = tmp_path / ".coord"
+    _write_bytes(coord_dir / "cargo-target" / "quadraui" / "blob", 4096)
+    _gc_status(coord_dir, now=NOW - 48 * 3600)
+
+    result = cargo_targets.probe_cargo_targets(make_ctx(tmp_path, coord_dir=coord_dir))
+
+    assert result.severity is Severity.OK
+    assert "GC over cap" not in result.headroom
+    assert result.values["gc_stale"] is True
+
+
+def test_cargo_targets_is_unchanged_without_a_gc_verdict(tmp_path) -> None:
+    coord_dir = tmp_path / ".coord"
+    _write_bytes(coord_dir / "cargo-target" / "quadraui" / "blob", 4096)
+    result = cargo_targets.probe_cargo_targets(make_ctx(tmp_path, coord_dir=coord_dir))
+    assert result.severity is Severity.OK
+    assert result.values["gc_over_cap"] is False
+    assert result.detail == ""
+
+
 def test_cargo_targets_does_not_follow_symlinked_subdirs(tmp_path) -> None:
     coord_dir = tmp_path / ".coord"
     real = tmp_path / "elsewhere"

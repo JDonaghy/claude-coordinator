@@ -7,6 +7,16 @@ GiB cap), but nothing totals it together with the per-checkout ``target/``
 dirs a human created by building in a live checkout, and that sum is the
 number that fills a disk.
 
+#2137 adds the *GC's own verdict* to the same line.  ``cargo_cache.sweep``
+has always computed ``cargo_over_cap`` — "the GC ran and could not get the
+cache under its cap" — and nothing anywhere read it, which is why 38G of
+``cargo-target/quadraui`` accumulated in silence until ``/home`` hit 0 bytes
+free on 2026-08-11.  The agent now parks each sweep's result in
+``~/.coord/cargo-gc-status.json`` and this probe folds it in: over-cap is at
+least a WARN *regardless of the size thresholds*, because "we tried and
+failed to reclaim" is a different, more urgent state than "the total is
+large".
+
 Cost note: this is the one seed probe that can be genuinely slow, because
 "how big is 78G of small files" is a full tree walk.  It is therefore
 budgeted (``health.cargo_scan_budget_secs``, default 1.5s) and reports a
@@ -100,6 +110,27 @@ def _candidate_dirs(ctx: HealthContext) -> list[Path]:
     return out
 
 
+# A GC verdict older than this is not evidence about the machine right now —
+# the sweep runs on every worktree-clean pass, so a status file this stale
+# means the GC has not run, not that the cache is fine.  Reported, never used
+# to escalate.
+_GC_STATUS_MAX_AGE_SECS = 24 * 3600.0
+
+
+def _gc_verdict(ctx: HealthContext) -> tuple[dict | None, bool]:
+    """``(last sweep result, is_fresh)`` from ``~/.coord/cargo-gc-status.json``."""
+    from coord.cargo_cache import read_gc_status  # noqa: PLC0415
+
+    status = read_gc_status(ctx.coord_dir)
+    if not status:
+        return None, False
+    try:
+        age = ctx.now - float(status.get("checked_at") or 0.0)
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return status, False
+    return status, age <= _GC_STATUS_MAX_AGE_SECS
+
+
 @check(
     id="cargo_targets",
     scope="machine",
@@ -140,6 +171,23 @@ def probe_cargo_targets(ctx: HealthContext) -> CheckResult | None:
         # Below WARN but we stopped early: the real total could be anything.
         severity = Severity.UNKNOWN
 
+    # #2137: the GC's own verdict, which used to reach no surface at all.
+    gc_status, gc_fresh = _gc_verdict(ctx)
+    gc_over_cap = bool(gc_status and gc_status.get("cargo_over_cap"))
+    detail = ""
+    if gc_over_cap and gc_fresh:
+        # "The GC gave up" outranks the size thresholds: the cache is beyond
+        # what automatic reclamation can fix, so it only grows from here.
+        if severity.rank < Severity.WARN.rank:
+            severity = Severity.WARN
+        reason = gc_status.get("cargo_over_cap_reason") or "cache over cap"
+        detail = f"fix: cargo cache GC could not get under cap — {reason}"
+        blocked = gc_status.get("cargo_prune_blocked") or []
+        if blocked:
+            detail += (
+                f"; pruning blocked by a live build in {', '.join(map(str, blocked))}"
+            )
+
     biggest = sorted(sizes, key=lambda pair: pair[1], reverse=True)[:3]
     breakdown = ", ".join(
         f"{shorten_path(str(p), str(ctx.home))} {human_bytes(s)}" for p, s in biggest if s > 0
@@ -149,6 +197,11 @@ def probe_cargo_targets(ctx: HealthContext) -> CheckResult | None:
         headroom = f"{headroom}  ({breakdown})"
     if not complete:
         headroom = f"{headroom} [partial scan — {th.cargo_scan_budget_secs}s budget hit]"
+    if gc_over_cap and gc_fresh:
+        # Rendered into the headroom, not just `detail`: `coord health`
+        # without `--verbose` shows `detail` only for a non-OK row, and this
+        # phrase is the whole point of the escalation.
+        headroom = f"{headroom} [GC over cap]"
 
     return CheckResult(
         check_id="cargo_targets",
@@ -156,9 +209,16 @@ def probe_cargo_targets(ctx: HealthContext) -> CheckResult | None:
         severity=severity,
         headroom=headroom,
         threshold=f"crit at {th.cargo_target_crit_gb:.0f}G",
+        detail=detail,
         error=None if complete else "scan budget exhausted; total is a lower bound",
         values={
             "total_bytes": total,
+            # #2137: raw GC facts for machine consumers.  `gc_over_cap` is the
+            # escalating bit; `gc_stale` says the verdict predates the
+            # freshness window, so a reader knows not to act on it.
+            "gc_over_cap": gc_over_cap,
+            "gc_stale": bool(gc_status) and not gc_fresh,
+            "gc": gc_status or {},
             "total_gb": round(total_gb, 2),
             "complete": complete,
             "dirs": [
