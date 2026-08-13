@@ -5098,7 +5098,7 @@ _DRIVE_QUEUE_COLUMNS = (
     "id, repo_name, issue_number, position, machine, after_json, state, "
     "attempts, deferrals, last_reason, reason_at, session_name, launched_at, "
     "enqueued_at, hold_after, hold_reason, resume_when, hold_state, "
-    "hold_probes, launch_host"
+    "hold_probes, launch_host, hold_scope"
 )
 
 # Fields `update_drive_queue_entry` may write. Deliberately excludes the
@@ -5171,6 +5171,7 @@ def enqueue_drive_queue(
     hold_after: bool = False,
     hold_reason: str = "",
     resume_when: str = "",
+    hold_scope: str = "entry",
 ) -> int | None:
     """Add an issue to the drive queue (or update the entry already there).
 
@@ -5180,15 +5181,24 @@ def enqueue_drive_queue(
     renumbers the rest.
 
     ``hold_after`` (#1757) arms a DEPLOY GATE on the entry: when the tick
-    transitions it to ``done`` the queue stops launching until a human deploys
-    and runs ``coord drive-queue resume`` (or ``resume_when`` starts exiting
-    0). Arming happens HERE, at enqueue — ``hold_state`` goes ``armed`` — so
-    the gate is declared by the same operator write that declared the order.
+    transitions it to ``done`` the gate fires until a human deploys and runs
+    ``coord drive-queue resume`` (or ``resume_when`` starts exiting 0). Arming
+    happens HERE, at enqueue — ``hold_state`` goes ``armed`` — so the gate is
+    declared by the same operator write that declared the order.
+
+    ``hold_scope`` (#2186) is WHAT a fired gate holds: ``"entry"`` (the
+    default) holds only entries whose own ``after=`` names this one;
+    ``"fleet"`` is the whole-queue stop from before #2186, opt-in only. Any
+    value other than the literal string ``"fleet"`` is stored as ``"entry"``
+    — see ``coord.drive_queue.QueueEntry._normalize_hold_scope`` for why the
+    read side fails the same way, so a malformed value can never silently
+    become a fleet-wide stop from either direction.
 
     Routes to the daemon when ``board_service`` is set, else writes the local
     DB. Returns the local row id on the local path; the daemon's row id when
     routed.
     """
+    normalized_scope = "fleet" if str(hold_scope or "") == "fleet" else "entry"
     svc = _board_service()
     resp = _route_write(
         svc,
@@ -5203,6 +5213,7 @@ def enqueue_drive_queue(
             "hold_after": bool(hold_after),
             "hold_reason": hold_reason,
             "resume_when": resume_when,
+            "hold_scope": normalized_scope,
         },
     )
     if resp is not None:
@@ -5216,6 +5227,7 @@ def enqueue_drive_queue(
         hold_after=hold_after,
         hold_reason=hold_reason,
         resume_when=resume_when,
+        hold_scope=normalized_scope,
     )
 
 
@@ -5229,6 +5241,7 @@ def _enqueue_drive_queue_local(
     hold_after: bool = False,
     hold_reason: str = "",
     resume_when: str = "",
+    hold_scope: str = "entry",
 ) -> int:
     conn = get_connection()
     now = time.time()
@@ -5241,6 +5254,10 @@ def _enqueue_drive_queue_local(
     hold_state = "armed" if hold_after else ""
     hold_reason = str(hold_reason or "")
     resume_when = str(resume_when or "")
+    # #2186: normalized again here so a direct `_local` caller (a test, the
+    # daemon handler) gets the same fail-closed-to-`entry` guarantee as the
+    # public `enqueue_drive_queue` above, not just callers that went through it.
+    hold_scope = "fleet" if str(hold_scope or "") == "fleet" else "entry"
     existing = conn.execute(
         "SELECT id FROM drive_queue WHERE repo_name = ? AND issue_number = ?",
         (repo_name, issue_number),
@@ -5255,8 +5272,8 @@ def _enqueue_drive_queue_local(
         # declaration being withdrawn.
         conn.execute(
             "UPDATE drive_queue SET machine = ?, after_json = ?, hold_after = ?, "
-            "hold_reason = ?, resume_when = ?, hold_state = ?, hold_probes = 0 "
-            "WHERE id = ?",
+            "hold_reason = ?, resume_when = ?, hold_state = ?, hold_probes = 0, "
+            "hold_scope = ? WHERE id = ?",
             (
                 machine,
                 after_json,
@@ -5264,6 +5281,7 @@ def _enqueue_drive_queue_local(
                 hold_reason,
                 resume_when,
                 hold_state,
+                hold_scope,
                 existing["id"],
             ),
         )
@@ -5277,8 +5295,8 @@ def _enqueue_drive_queue_local(
         cur = conn.execute(
             "INSERT INTO drive_queue "
             "(repo_name, issue_number, position, machine, after_json, enqueued_at, "
-            " hold_after, hold_reason, resume_when, hold_state) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " hold_after, hold_reason, resume_when, hold_state, hold_scope) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 repo_name,
                 issue_number,
@@ -5290,6 +5308,7 @@ def _enqueue_drive_queue_local(
                 hold_reason,
                 resume_when,
                 hold_state,
+                hold_scope,
             ),
         )
         conn.commit()

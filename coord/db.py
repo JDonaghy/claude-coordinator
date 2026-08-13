@@ -401,6 +401,13 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             hold_state    TEXT    NOT NULL DEFAULT '',
             hold_probes   INTEGER NOT NULL DEFAULT 0,
             launch_host   TEXT    NOT NULL DEFAULT '',
+            -- #2186: how far a FIRED gate reaches. 'entry' (the default) holds
+            -- only entries whose own after_json names this row's key; 'fleet'
+            -- is the pre-#2186 whole-queue stop, kept for an explicit
+            -- --scope=fleet. NOT NULL DEFAULT 'entry' so a row written before
+            -- this column existed reads as the narrower scope, never a silent
+            -- fleet-wide one — see coord.drive_queue.QueueEntry.hold_scope.
+            hold_scope    TEXT    NOT NULL DEFAULT 'entry',
             UNIQUE(repo_name, issue_number)
         );
 
@@ -717,6 +724,13 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         # carries its age instead of rendering a stale snapshot as current
         # state. NULL for every row predating this migration.
         "ALTER TABLE drive_queue ADD COLUMN reason_at REAL",
+        # #2186: deploy-gate SCOPE — see the CREATE TABLE comment above and
+        # coord/drive_queue.py's HOLD_SCOPE_ENTRY/HOLD_SCOPE_FLEET. Every row
+        # predating this migration (and every armed-but-not-yet-fired gate)
+        # defaults to 'entry', the narrower reading — a fired gate on such a
+        # row holds only its own dependents rather than the whole queue, which
+        # is the #2186 fix itself, not just a schema detail.
+        "ALTER TABLE drive_queue ADD COLUMN hold_scope TEXT NOT NULL DEFAULT 'entry'",
     ]
     for sql in migrations:
         try:

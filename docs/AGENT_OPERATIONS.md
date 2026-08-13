@@ -796,8 +796,9 @@ either workaround:
 workers — and should not be needed for this sequence anymore.
 
 A queued entry carrying `--hold-after` (#1757) also creates the gap by design:
-the queue stops itself, propagation sees a *fired* gate as the opposite of
-busy, rolls, and releases the hold.
+the gate's dependents stop themselves (the whole queue too, if the entry was
+declared `--scope=fleet` — #2186), propagation sees a *fired* gate as the
+opposite of busy, rolls, and releases the hold.
 
 ## `coord.db` backups to the external SSD (interim — #1822 owns the real thing)
 
