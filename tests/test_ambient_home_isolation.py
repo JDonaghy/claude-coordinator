@@ -53,6 +53,10 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+#: The whole-suite sweep that applies the same three knobs to an arbitrary
+#: command, and which `.github/workflows/test.yml`'s `populated-home` job runs.
+POPULATED_HOME_SCRIPT = REPO_ROOT / "scripts" / "run_tests_in_populated_home.sh"
+
 #: The node ids that failed on `precision` and passed in CI, plus the thin-client
 #: contract test added alongside the fix. Spelled out one-by-one rather than as
 #: whole files so a future reader can map each to its mechanism, and so this
@@ -293,3 +297,96 @@ def test_ambient_sensitive_targets_pass_in_a_populated_home(tmp_path: Path) -> N
     # And nothing may have read the remote cache — if the fleet's fake config
     # leaked into an assertion, the isolation is not doing its job.
     assert "fleet-only-repo" not in proc.stdout
+
+
+# ── scripts/run_tests_in_populated_home.sh ──────────────────────────────────
+#
+# The Python knobs above are what runs on every machine on every run. The shell
+# script is the *whole-suite* sweep -- the thing a human (and CI's
+# `populated-home` job) runs to find the NEXT test of this class. It reimplements
+# the three knobs in bash because it has to wrap an arbitrary command, which a
+# pytest fixture cannot. Duplicated mechanism means it can silently drift into
+# masking nothing, so the two tests below drive it for real rather than trusting
+# its header -- the same reason
+# `test_the_hostile_environment_is_actually_hostile` exists for the Python side.
+
+_ENV_PROBE = (
+    'printf "HOME=%s\\n" "$HOME"; '
+    'printf "TMPDIR=%s\\n" "$TMPDIR"; '
+    'printf "SQLITE3=%s\\n" "$(command -v sqlite3 || echo NONE)"; '
+    'printf "GIT=%s\\n" "$(command -v git || echo NONE)"; '
+    'printf "BASH=%s\\n" "$(command -v bash || echo NONE)"; '
+    'printf "CLIENT_TOML=%s\\n" "$(test -f "$HOME/.coord/client.toml" '
+    '&& echo yes || echo no)"; '
+    'printf "REMOTE_CACHE=%s\\n" '
+    '"$(test -f "$HOME/.coord/coordinator.remote.yml" && echo yes || echo no)"; '
+    'printf "LOCAL_CONFIG=%s\\n" "$(test -e "$HOME/.coord/coordinator.yml" '
+    '&& echo yes || echo no)"; '
+    'printf "SHIFTER=%s\\n" "$(test -f "$HOME/pyproject.toml" && echo yes || echo no)"; '
+    'printf "SERVICE_URL=[%s]\\n" "${COORD_SERVICE_URL-unset}"'
+)
+
+
+def _probe_the_script() -> dict[str, str]:
+    """Run the sweep script with a command that just reports its environment."""
+    proc = subprocess.run(
+        [str(POPULATED_HOME_SCRIPT), "bash", "-c", _ENV_PROBE],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
+    return dict(
+        line.split("=", 1)
+        for line in proc.stdout.splitlines()
+        if "=" in line
+    )
+
+
+def test_sweep_script_is_executable_and_self_documenting() -> None:
+    """Committed +x and with a `--`-free contract: CI invokes it directly."""
+    assert POPULATED_HOME_SCRIPT.is_file()
+    assert os.access(POPULATED_HOME_SCRIPT, os.X_OK), (
+        f"{POPULATED_HOME_SCRIPT} is not executable -- CI runs it as a bare "
+        "command, so the mode bit is part of the contract"
+    )
+    header = POPULATED_HOME_SCRIPT.read_text()
+    # The three knobs must each stay named in the header. This is not
+    # prose-policing: a future edit that drops a knob but leaves the header
+    # intact is caught by the behavioural test below, whereas one that drops
+    # the *explanation* leaves the next reader unable to tell hostile-on-purpose
+    # from broken -- which is how a masking bug survives.
+    for knob in ("client.toml", "sqlite3", "TMPDIR"):
+        assert knob in header, knob
+
+
+def test_sweep_script_applies_all_three_knobs() -> None:
+    """Drive the script for real and check each knob landed (#2170).
+
+    A sweep that quietly stopped masking would report a green full suite that
+    proves nothing -- the identical silent-green failure mode this issue is
+    about -- so the script's own guard (`exit 2`) and this test both exist.
+    """
+    env = _probe_the_script()
+
+    # (1) the seeded $HOME is thin-client shaped, with no local config to be
+    #     shadowed by -- exactly `precision`.
+    assert env["CLIENT_TOML"] == "yes"
+    assert env["REMOTE_CACHE"] == "yes"
+    assert env["LOCAL_CONFIG"] == "no"
+    assert env["SERVICE_URL"] == "[unset]", (
+        "the thin client must come from the FILE, not the env var -- that is "
+        "the shape that forces the code under test to isolate $HOME"
+    )
+    assert env["HOME"] != str(Path.home()), "the real $HOME leaked through"
+
+    # (2) sqlite3 is gone; the shell and git are not.
+    assert env["SQLITE3"] == "NONE"
+    assert env["GIT"] != "NONE"
+    assert env["BASH"] != "NONE"
+
+    # (3) $TMPDIR sits below the rootdir shifter.
+    assert env["SHIFTER"] == "yes"
+    tmpdir = Path(env["TMPDIR"])
+    assert Path(env["HOME"]) in tmpdir.parents or Path(env["HOME"]) == tmpdir.parent
