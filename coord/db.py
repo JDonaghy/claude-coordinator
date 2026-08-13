@@ -188,7 +188,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             enqueued_at REAL,
             assignment_type TEXT DEFAULT 'work',
             required_gates TEXT,
-            ci_infra_reruns INTEGER NOT NULL DEFAULT 0
+            ci_infra_reruns INTEGER NOT NULL DEFAULT 0,
+            ci_stale_reruns INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS plans (
@@ -697,6 +698,12 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         # predating this column (no auto-reruns spent yet), same as the
         # column's own default for freshly-enqueued entries.
         "ALTER TABLE merge_queue ADD COLUMN ci_infra_reruns INTEGER NOT NULL DEFAULT 0",
+        # #2197: the CI-staleness auto-rerun's OWN counter — see
+        # `coord.merge_queue.MAX_CI_STALE_RERUNS` and
+        # `QueuedMerge.ci_stale_reruns`'s docstring for why it is kept
+        # separate from `ci_infra_reruns` rather than sharing it. 0 for
+        # every row predating this column, same as a freshly-enqueued entry.
+        "ALTER TABLE merge_queue ADD COLUMN ci_stale_reruns INTEGER NOT NULL DEFAULT 0",
         # #1956: verdict provenance — WHO recorded `review_verdict` and HOW
         # (see coord.models.Assignment.verdict_source for the three values
         # and why conflating them was the second half of #1956). NULL for
