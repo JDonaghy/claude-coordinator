@@ -3258,7 +3258,11 @@ def _openapi_spec() -> dict:
                     "#1563: the daemon's own paused-machine set — the copy "
                     "its dispatch tick actually reads. #2101 adds `cordoned` "
                     "(names) and `cordons` (full release-cordon records), "
-                    "both subsets of `paused`."
+                    "both subsets of `paused`. #2146 adds `quiet_hours`: the "
+                    "effective per-machine window map ({machine: {start, end, "
+                    "tz, source}}) for every machine that has one, covered "
+                    "right now or not, with `source` naming operator-set "
+                    "(`store`) vs `coordinator.yml` (`config`)."
                 ),
                 "responses": {
                     "200": {"description": "OK"},
@@ -3271,7 +3275,12 @@ def _openapi_spec() -> dict:
                     "reaches the same state the daemon's dispatch tick reads. "
                     "#2101: `cordon`/`uncordon` write the SEPARATE "
                     "release-cordon store — same routing effect, different "
-                    "owner, so neither side can clear the other's flag."
+                    "owner, so neither side can clear the other's flag. "
+                    "#2146: `set-quiet` (with `start`/`end` as 'HH:MM' and a "
+                    "REQUIRED IANA `tz`) / `clear-quiet` write the "
+                    "operator-set quiet-hours store, a fourth independent "
+                    "axis; a malformed window answers 400 carrying the "
+                    "config parser's own message."
                 ),
                 "requestBody": {
                     "required": True,
@@ -3288,11 +3297,16 @@ def _openapi_spec() -> dict:
                                             "unpause",
                                             "cordon",
                                             "uncordon",
+                                            "set-quiet",
+                                            "clear-quiet",
                                         ],
                                     },
                                     "reason": {"type": "string"},
                                     "target_version": {"type": "string"},
                                     "ttl_seconds": {"type": "number"},
+                                    "start": {"type": "string"},
+                                    "end": {"type": "string"},
+                                    "tz": {"type": "string"},
                                 },
                                 "required": ["machine", "action"],
                             }
@@ -3301,7 +3315,12 @@ def _openapi_spec() -> dict:
                 },
                 "responses": {
                     "200": {"description": "OK"},
-                    "400": {"description": "Missing field / unknown action"},
+                    "400": {
+                        "description": (
+                            "Missing field / unknown action / malformed "
+                            "quiet-hours window (#2146)"
+                        ),
+                    },
                 },
             },
         },
@@ -5935,9 +5954,20 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         # records are published rather than a boolean because expiry and the
         # drain deadline are decided by the CALLER (`coord release
         # propagate`), which may be a thin client.
+        #
+        # #2146: `quiet_hours` is the effective per-machine WINDOW map
+        # (`{machine: {start, end, tz, source}}`) for every machine that has
+        # one, whether or not it covers this instant — `quiet` (who is
+        # covered right now) stays exactly as it was, this is purely
+        # additive. `source` distinguishes an operator-set window (this
+        # host's own state file, flippable in seconds) from a
+        # `coordinator.yml` block (needs a commit), because a thin client
+        # cannot see the former any other way: its copy of coordinator.yml
+        # is a cache the next command overwrites.
         _refresh_config()
         from coord.machine_pause import (  # noqa: PLC0415
             local_cordons,
+            local_effective_quiet_hours,
             local_paused_set,
             quiet_paused_names,
         )
@@ -5949,6 +5979,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                 "quiet": sorted(quiet_paused_names(config.machines)),
                 "cordoned": sorted(cordons),
                 "cordons": [c.to_dict() for _, c in sorted(cordons.items())],
+                "quiet_hours": local_effective_quiet_hours(config.machines),
             }
         )
 
@@ -5961,11 +5992,15 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         # process happened to have its own board_service configured).
         _refresh_config()
         from coord.machine_pause import (  # noqa: PLC0415
+            SOURCE_STORE,
             local_clear_cordon,
+            local_clear_quiet_hours,
             local_cordons,
+            local_effective_quiet_hours,
             local_pause,
             local_paused_set,
             local_set_cordon,
+            local_set_quiet_hours,
             local_unpause_effective,
             quiet_paused_names,
         )
@@ -5977,6 +6012,48 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         action = body.get("action")
         if not machine or not isinstance(machine, str):
             return JSONResponse({"error": "missing field: machine"}, status_code=400)
+        if action in ("set-quiet", "clear-quiet"):
+            # #2146: an OPERATOR-SET quiet-hours window. Same reason as the
+            # cordon branch below for using the local-only writers: this
+            # handler runs *inside* the daemon, which is the one host whose
+            # store governs dispatch — routing back out over HTTP would be a
+            # loop, and writing a thin client's own copy is the bug #2146
+            # closes. Its own key too, so setting or clearing a window never
+            # disturbs a pause, a cordon or an unpause override.
+            window = None
+            if action == "set-quiet":
+                from coord.config import ConfigError  # noqa: PLC0415
+
+                try:
+                    stored = local_set_quiet_hours(
+                        machine,
+                        start=body.get("start"),
+                        end=body.get("end"),
+                        tz=body.get("tz"),
+                    )
+                except ConfigError as e:
+                    # Relay the parser's OWN message: "tz is required (IANA
+                    # zone name...)" tells an operator what to fix; a bare
+                    # 400 tells them nothing.
+                    return JSONResponse({"error": str(e)}, status_code=400)
+                window = {
+                    "start": stored.start.strftime("%H:%M"),
+                    "end": stored.end.strftime("%H:%M"),
+                    "tz": stored.tz,
+                    "source": SOURCE_STORE,
+                }
+                changed = True
+            else:
+                changed = local_clear_quiet_hours(machine)
+            return JSONResponse(
+                {
+                    "paused": sorted(local_paused_set(config.machines)),
+                    "quiet": sorted(quiet_paused_names(config.machines)),
+                    "quiet_hours": local_effective_quiet_hours(config.machines),
+                    "window": window,
+                    "changed": changed,
+                }
+            )
         if action in ("cordon", "uncordon"):
             # #2101: a release cordon, NOT an operator pause. Deliberately the
             # same endpoint (one routing decision, one place to be wrong about

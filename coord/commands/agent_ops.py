@@ -1387,3 +1387,252 @@ def unpause(config_path: Path, machine: str) -> None:
         )
     else:
         click.echo(f"not paused: {machine}")
+
+
+# ── #2146: `coord quiet-hours` ──────────────────────────────────────────────
+
+
+def _local_tz_name() -> str | None:
+    """The CLIENT's IANA zone name, or None if it can't be determined.
+
+    #2146: `--tz` must default to the operator's own zone — they mean "22:00
+    MY time", and the daemon runs UTC, so defaulting to the daemon's clock
+    would fire hours off. `datetime.now().astimezone().tzinfo` gives an
+    ABBREVIATION ("CDT"), not an IANA name `ZoneInfo` can resolve, so this
+    walks the usual POSIX sources first and only falls back to that.
+
+    Returning None (rather than guessing "UTC") is deliberate: the caller
+    turns it into "pass --tz explicitly", because a silently-UTC window is
+    exactly the wrong-hour failure #1862 made `tz` mandatory to prevent.
+    """
+    from zoneinfo import ZoneInfo  # noqa: PLC0415
+
+    def _ok(name: str | None) -> str | None:
+        if not name or name in ("localtime", "UTC0"):
+            return None
+        try:
+            ZoneInfo(name)
+        except Exception:  # noqa: BLE001 — not a resolvable zone, try the next source
+            return None
+        return name
+
+    candidates: list[str | None] = [os.environ.get("TZ")]
+    try:
+        candidates.append(Path("/etc/timezone").read_text(encoding="utf-8").strip())
+    except OSError:
+        pass
+    try:
+        parts = Path("/etc/localtime").resolve().parts
+        if "zoneinfo" in parts:
+            candidates.append("/".join(parts[parts.index("zoneinfo") + 1:]))
+    except OSError:
+        pass
+    from datetime import datetime as _dt  # noqa: PLC0415
+
+    candidates.append(_dt.now().astimezone().tzname())
+    for candidate in candidates:
+        resolved = _ok(candidate)
+        if resolved is not None:
+            return resolved
+    return None
+
+
+def _parse_window_arg(window: str) -> tuple[str, str]:
+    """``"22:00-08:00"`` → ``("22:00", "08:00")``. Shape only — the real
+    validation (HH:MM, IANA tz, start != end) is `coord.config`'s, so the
+    CLI can never accept a window `coordinator.yml` would reject."""
+    parts = window.split("-")
+    if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+        raise ValueError(
+            f"window must look like '22:00-08:00', got {window!r}"
+        )
+    return parts[0].strip(), parts[1].strip()
+
+
+def _quiet_hours_rows(machines: Any) -> dict[str, dict]:
+    from coord.machine_pause import effective_quiet_hours  # noqa: PLC0415
+
+    return effective_quiet_hours(machines)
+
+
+def _describe_source(source: str) -> str:
+    return "set here" if source == "store" else "coordinator.yml"
+
+
+@click.command(
+    "quiet-hours",
+    help=(
+        "Show or set a machine's recurring no-new-dispatch window (#2146).\n\n"
+        "\b\n"
+        "  coord quiet-hours MACHINE 22:00-08:00 [--tz America/Chicago]\n"
+        "  coord quiet-hours MACHINE --clear\n"
+        "  coord quiet-hours [MACHINE] --list\n"
+        "  coord quiet-hours MACHINE --print-yaml\n\n"
+        "A window set here is stored on the DAEMON (alongside pauses and "
+        "release cordons) and overrides that machine's coordinator.yml "
+        "`quiet_hours:` block entirely — it does not rewrite the YAML. "
+        "`--print-yaml` emits a paste-ready block for when a window should "
+        "become permanent and version-controlled.\n\n"
+        "--tz defaults to THIS machine's zone, never the daemon's UTC, and "
+        "the resolved zone is echoed back so a wrong default is visible "
+        "immediately."
+    ),
+)
+
+
+@_CONFIG_OPTION
+@click.argument("machine", required=False)
+@click.argument("window", required=False)
+@click.option("--tz", "tz", default=None, help="IANA zone (default: this machine's).")
+@click.option("--clear", "clear_", is_flag=True, help="Remove an operator-set window.")
+@click.option("--list", "list_", is_flag=True, help="Show windows and where they came from.")
+@click.option(
+    "--print-yaml",
+    "print_yaml",
+    is_flag=True,
+    help="Emit a coordinator.yml `quiet_hours:` block for MACHINE.",
+)
+def quiet_hours(
+    config_path: Path,
+    machine: str | None,
+    window: str | None,
+    tz: str | None,
+    clear_: bool,
+    list_: bool,
+    print_yaml: bool,
+) -> None:
+    from coord.machine_pause import clear_quiet_hours, set_quiet_hours  # noqa: PLC0415
+
+    # Best-effort config, exactly like `unpause` above: an unloadable config
+    # must not block the (fully functional) store path — it only means
+    # coordinator.yml-sourced windows can't be listed alongside store ones.
+    machines = None
+    try:
+        from coord.config import load as _load_yaml_config  # noqa: PLC0415
+
+        machines = _load_yaml_config(config_path).machines
+    except Exception:  # noqa: BLE001
+        pass
+
+    if list_ or (machine is None and not (clear_ or print_yaml or window)):
+        rows = _quiet_hours_rows(machines)
+        if machine is not None:
+            rows = {k: v for k, v in rows.items() if k == machine}
+        if not rows:
+            click.echo(
+                "no quiet hours set"
+                + (f" for {machine}" if machine else "")
+                + " (set one: coord quiet-hours MACHINE 22:00-08:00)"
+            )
+            return
+        width = max(len(name) for name in rows)
+        for name, row in sorted(rows.items()):
+            click.echo(
+                f"{name.ljust(width)}  {row.get('start')}-{row.get('end')}  "
+                f"{row.get('tz')}  [{_describe_source(str(row.get('source') or ''))}]"
+            )
+        return
+
+    if machine is None:
+        click.echo("error: MACHINE is required", err=True)
+        sys.exit(2)
+
+    if print_yaml:
+        # The promotion path: a window that has proved itself belongs in
+        # version control, where a daemon rebuild can't lose it.
+        if window is not None:
+            try:
+                start, end = _parse_window_arg(window)
+            except ValueError as e:
+                click.echo(f"error: {e}", err=True)
+                sys.exit(2)
+            zone = tz or _local_tz_name()
+        else:
+            row = _quiet_hours_rows(machines).get(machine)
+            if row is None:
+                click.echo(
+                    f"error: no quiet hours known for {machine!r} — pass a window "
+                    "(e.g. `coord quiet-hours MACHINE 22:00-08:00 --print-yaml`)",
+                    err=True,
+                )
+                sys.exit(1)
+            start, end, zone = row.get("start"), row.get("end"), tz or row.get("tz")
+        if not zone:
+            click.echo(
+                "error: could not determine a time zone — pass --tz "
+                "(e.g. --tz America/Chicago)",
+                err=True,
+            )
+            sys.exit(2)
+        click.echo(f"  # machines[] entry for {machine!r} in coordinator.yml")
+        click.echo("  quiet_hours:")
+        click.echo(f'    start: "{start}"')
+        click.echo(f'    end: "{end}"')
+        click.echo(f'    tz: "{zone}"')
+        return
+
+    if clear_:
+        # #2146 acceptance: "nothing set" is NOT success. A machine can still
+        # have a coordinator.yml block this cannot touch, and reporting
+        # "cleared" for a no-op is the failure class this feature exists to
+        # avoid.
+        try:
+            changed = clear_quiet_hours(machine)
+        except Exception as e:  # noqa: BLE001
+            click.echo(
+                f"error: could not confirm clearing quiet hours for {machine!r} "
+                f"with the daemon: {e}",
+                err=True,
+            )
+            sys.exit(1)
+        if not changed:
+            click.echo(f"nothing set: {machine} has no operator-set quiet hours")
+            return
+        click.echo(f"cleared: {machine} quiet hours")
+        row = _quiet_hours_rows(machines).get(machine)
+        if row is not None:
+            click.echo(
+                f"note: {machine} still has a coordinator.yml window "
+                f"{row.get('start')}-{row.get('end')} ({row.get('tz')})"
+            )
+        return
+
+    if window is None:
+        click.echo(
+            "error: pass a window (e.g. `coord quiet-hours MACHINE 22:00-08:00`), "
+            "--clear, --list or --print-yaml",
+            err=True,
+        )
+        sys.exit(2)
+    try:
+        start, end = _parse_window_arg(window)
+    except ValueError as e:
+        click.echo(f"error: {e}", err=True)
+        sys.exit(2)
+    zone = tz or _local_tz_name()
+    if not zone:
+        click.echo(
+            "error: could not determine this machine's time zone — pass --tz "
+            "(e.g. --tz America/Chicago). Quiet hours never default to the "
+            "daemon's UTC clock: it would fire at the wrong local hour.",
+            err=True,
+        )
+        sys.exit(2)
+
+    # #1563/#2146: fail loudly. A thin client's write that never reaches the
+    # daemon must not print a confirmation.
+    try:
+        stored = set_quiet_hours(machine, start=start, end=end, tz=zone)
+    except Exception as e:  # noqa: BLE001
+        click.echo(
+            f"error: could not set quiet hours for {machine!r}: {e}",
+            err=True,
+        )
+        sys.exit(1)
+    # Echo the RESOLVED zone: a wrong `--tz` default is otherwise invisible
+    # until the machine goes quiet at the wrong hour.
+    click.echo(
+        f"quiet hours set: {machine} {stored.get('start')}-{stored.get('end')} "
+        f"({stored.get('tz')}) — overrides any coordinator.yml block for this "
+        f"machine; `coord quiet-hours {machine} --print-yaml` to make it permanent"
+    )

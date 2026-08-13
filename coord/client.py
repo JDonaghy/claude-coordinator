@@ -283,6 +283,65 @@ def post_cordon(
     return post_record(svc, "/pause", payload, timeout=timeout)
 
 
+def fetch_quiet_hours(
+    svc: ServiceConfig, *, timeout: float = _DEFAULT_TIMEOUT
+) -> dict[str, dict]:
+    """GET /pause → the daemon's effective quiet-hours windows (#2146).
+
+    ``{machine: {start, end, tz, source}}`` for every machine with a window,
+    whether it currently covers "now" or not — a thin client needs the whole
+    map to render `coord quiet-hours --list` and to pre-fill a dialog, not
+    just the subset that happens to be active this minute.
+
+    ``{}`` when the daemon predates #2146 (the key is simply absent), which
+    is the right read for a daemon that has no operator-set store. Raises
+    ``httpx.HTTPError`` on transport/HTTP failure —
+    `coord.machine_pause.effective_quiet_hours()` catches that and degrades
+    to "no windows known", the same fail-soft read posture as
+    `fetch_paused_machines`.
+    """
+    resp = httpx.get(f"{svc.url}/pause", headers=_headers(svc), timeout=timeout)
+    resp.raise_for_status()
+    data = resp.json()
+    rows = data.get("quiet_hours") if isinstance(data, dict) else None
+    if not isinstance(rows, dict):
+        return {}
+    return {str(k): dict(v) for k, v in rows.items() if isinstance(v, dict)}
+
+
+def post_quiet_hours(
+    svc: ServiceConfig,
+    machine: str,
+    action: str,
+    *,
+    start: str | None = None,
+    end: str | None = None,
+    tz: str | None = None,
+    timeout: float = _WRITE_TIMEOUT,
+) -> dict:
+    """POST /pause {machine, action: set-quiet|clear-quiet, ...} (#2146).
+
+    Deliberately the SAME endpoint as pause/cordon: a quiet-hours window is
+    the same routing decision on a schedule, and one endpoint means one
+    place a thin client can be wrong about it.
+
+    Raises ``httpx.HTTPError`` on transport/HTTP failure — the whole point
+    of #2146 is that a thin client cannot edit `coordinator.yml` (its copy
+    is an overwritten cache), so a write that reported success and reached
+    nothing would rebuild the exact bug this closes. A daemon that predates
+    #2146 answers 400 ``unknown action``, which surfaces here as an
+    ``HTTPStatusError`` rather than a silent no-op: deploy the daemon first.
+    """
+    payload: dict = {"machine": machine, "action": action}
+    if start is not None:
+        payload["start"] = start
+    if end is not None:
+        payload["end"] = end
+    if tz is not None:
+        payload["tz"] = tz
+    return post_record(svc, "/pause", payload, timeout=timeout)
+
+
 def post_pause(
     svc: ServiceConfig, machine: str, action: str, *, timeout: float = _WRITE_TIMEOUT
 ) -> dict:
