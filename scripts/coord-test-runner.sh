@@ -17,7 +17,7 @@
 # parsers were extracted to tested Python in coord/test_report.py (#1436) —
 # that module is the reference behaviour; the grep/awk below still mirrors it.
 #
-# Four things it handles that a bare `pytest && cargo test` does not:
+# Six things it handles that a bare `pytest && cargo test` does not:
 #
 #  1. PATH ROUTING — code-coordinator ONLY.  That repo is two codebases with
 #     two toolchains, and a single `test_command` in coordinator.yml cannot
@@ -73,10 +73,30 @@
 #     infrastructure exit code that `coord merge --revalidate` renders as
 #     "could not run", never as "SUITE FAILED".
 #
+#  6. BASELINE COMPARISON (#2170).  "Did the suite pass?" is not the question
+#     the Test gate is asked — "did this branch make anything WORSE than
+#     $BASE_REF on this machine?" is.  Those answers differ exactly when the
+#     machine's own baseline is red, and nothing detected that: six tests failed
+#     on `origin/main` on any machine with a populated $HOME (invisible to CI,
+#     whose $HOME is empty), so the Test stage on `precision` could not produce
+#     a green verdict for this repo on ANY branch.  Every dispatch there was
+#     reported as the branch's failure and cost a human adjudication.
+#     So, when the python arm's failures survive flake filtering, they are
+#     re-run against the MERGE-BASE in a scratch worktree.  If every one of
+#     them fails there too, the result is `BASELINE-RED` at exit 4 — a distinct
+#     outcome that says the branch made nothing worse, not a branch failure.
+#     It downgrades a verdict, so it is deliberately unanimous-or-nothing: any
+#     test that passes on the base, any branch-new test file, any mechanical
+#     problem, and the run reports `FAIL` exactly as before.  Python arm only —
+#     see the long note above `ensure_baseline_worktree` for why the fallback
+#     arm is excluded rather than "not done yet".
+#
 # Exit codes: 0 pass (or skip — nothing to test), 1 genuine failure or refusal
 # (cannot determine what to test), 2 usage, 3 INFRASTRUCTURE — the suite could
 # not run at all (a required toolchain is missing); no verdict may be inferred
-# from it in either direction.
+# from it in either direction, 4 BASELINE-RED — the suite ran and failed, but
+# identically on $BASE_REF, so no verdict about the BRANCH may be inferred from
+# it (the machine's baseline needs fixing).
 
 set -euo pipefail
 
@@ -221,6 +241,171 @@ FLAKES=()
 # FAILED_SUITES on purpose: these are NOT verdicts (#1814).
 INFRA_SUITES=()
 EXIT_INFRA=3
+# Suites whose every failure reproduces on the merge-base: the machine's
+# baseline is red, so this is not a verdict on the branch either (#2170).
+BASELINE_RED_SUITES=()
+EXIT_BASELINE_RED=4
+
+# ── baseline comparison (#2170) ──────────────────────────────────────────────
+#
+# THE QUESTION THIS SCRIPT IS ACTUALLY ASKED. Everything above answers "did the
+# suite pass?". The Test gate needs "did this branch make anything WORSE than
+# $BASE_REF on this machine?". Those differ in exactly one situation — the
+# machine's baseline is already red — and until #2170 nothing anywhere detected
+# it.
+#
+# What that cost: six tests failed on `origin/main` on any machine with a
+# populated $HOME (a thin-client `~/.coord/`, no `sqlite3` on PATH, a $TMPDIR
+# under an ancestor pytest config — all three invisible to CI, whose $HOME is
+# empty). So the Test stage on `precision` could not produce a green verdict for
+# this repo on ANY branch. Every dispatch returned `SMOKE: fail`, the branch was
+# blamed for breakage it did not cause, and a human had to read the log and
+# adjudicate — 11m36s and $0.61 for zero signal, repeatedly, for months
+# (claude-coordinator#2158). Nothing declared "this machine's baseline is red";
+# the failure was indistinguishable from a real regression.
+#
+# The machinery was already here. Flake filtering re-runs failures serially, so
+# the runner ALREADY knows the failing set by name — the only thing missing was
+# somewhere to run it that isn't this branch.
+#
+# THIS IS A DOWNGRADE OF A VERDICT, SO IT IS DELIBERATELY HARD TO TRIGGER.
+# Turning a red branch into "not the branch's fault" is the dangerous direction
+# — the same direction `is_infrastructure_failure`'s docstring warns about — so
+# every ambiguity resolves to the existing `FAIL`:
+#
+#   * EVERY failing test must also fail on the merge-base. One that passes there
+#     is a genuine branch failure and the whole suite reports FAIL as before.
+#   * A test whose FILE does not exist on the merge-base is branch-new and can
+#     never be "already failing" — inconclusive, so FAIL.
+#   * A collection/import error in the baseline run is inconclusive (the base
+#     suite never ran) — FAIL.
+#   * Anything that goes wrong mechanically (no merge-base, `git worktree add`
+#     fails, the shared venv resolves `coord` from the wrong tree) — FAIL, with
+#     a warning saying the comparison was skipped rather than answered.
+#
+# PYTHON ARM ONLY, ON PURPOSE. The fallback arm (any other repo's own
+# `test_command`) deliberately gets no baseline check: this script does not know
+# an arbitrary command's failure-report format, so it could only compare whole
+# exit codes — and it would have to run that command in a bare worktree where
+# the repo's own provisioning (`npm ci`, a cargo target dir, a venv) never ran.
+# That fails for infrastructure reasons far more often than it detects a red
+# baseline, and every such failure would be a FALSE baseline-red, i.e. exactly
+# the laundering this guard is written to avoid. The python arm is safe because
+# it parses failures by name and can share the branch's already-built venv.
+BASELINE_WT=""
+BASELINE_SCRATCH=""
+BASELINE_DESC=""
+BASELINE_TRIED=0
+
+cleanup_baseline() {
+    if [[ -n "$BASELINE_WT" ]]; then
+        git -C "$WT" worktree remove --force "$BASELINE_WT" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$BASELINE_SCRATCH" ]]; then
+        rm -rf "$BASELINE_SCRATCH" || true
+    fi
+}
+trap cleanup_baseline EXIT
+
+# Lazily create a detached worktree at the merge-base, setting BASELINE_WT and
+# BASELINE_DESC. Non-zero (with a warning) when it cannot be created — callers
+# must then keep whatever verdict they already had. Created lazily because it is
+# only ever needed on the genuine-failure path, the already-expensive one.
+#
+# Communicates through globals and NOT by echoing the path, deliberately: a
+# `$(baseline_worktree)` call site would run this in a subshell, where the
+# BASELINE_* assignments (and therefore `cleanup_baseline`'s ability to remove
+# the worktree) are discarded, and where `log`'s stdout would be captured into
+# the caller's variable instead of the transcript.
+ensure_baseline_worktree() {
+    if [[ -n "$BASELINE_WT" ]]; then
+        return 0
+    fi
+    if [[ "$BASELINE_TRIED" -eq 1 ]]; then
+        return 1
+    fi
+    BASELINE_TRIED=1
+
+    local mb
+    if ! mb="$(git -C "$WT" merge-base HEAD "$BASE_REF" 2>/dev/null)" || [[ -z "$mb" ]]; then
+        warn "baseline: cannot resolve the merge-base of HEAD and $BASE_REF — reporting the failure as the branch's, uncompared"
+        return 1
+    fi
+    BASELINE_SCRATCH="$(mktemp -d)"
+    local path="$BASELINE_SCRATCH/baseline"
+    if ! git -C "$WT" worktree add --detach "$path" "$mb" >/dev/null 2>&1; then
+        warn "baseline: could not check out $mb in a scratch worktree — reporting the failure as the branch's, uncompared"
+        return 1
+    fi
+    BASELINE_WT="$path"
+    BASELINE_DESC="the merge-base (${mb:0:12}) of HEAD and $BASE_REF"
+    log "baseline: comparing against $BASELINE_DESC"
+    return 0
+}
+
+# 0 == every node id in $1 also fails on the merge-base (baseline is red).
+# Non-zero == the branch owns the failure, or the question could not be
+# answered. Never anything in between: see the "hard to trigger" note above.
+python_baseline_is_red() {
+    local failed="$1"
+    local venv="$WT/.venv"
+    local base_wt f file
+
+    ensure_baseline_worktree || return 1
+    base_wt="$BASELINE_WT"
+
+    while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        file="${f%%::*}"
+        if [[ ! -e "$base_wt/$file" ]]; then
+            log "baseline: $file does not exist on the merge-base — branch-new, so the baseline cannot be red for it"
+            return 1
+        fi
+    done <<<"$failed"
+
+    # The baseline run reuses the BRANCH's venv (building a second one would
+    # double a Test leg's cost, see #2169) and relies on `python -m pytest`
+    # putting the CWD first on sys.path so `import coord` resolves from the
+    # baseline worktree. That is true for this project's flat-layout editable
+    # install, but it is a property of how pip chose to write the install — not
+    # something to assume. Assert it, and skip the comparison rather than
+    # silently compare the BRANCH's `coord` against the base's tests.
+    if ! (cd "$base_wt" && "$venv/bin/python" -c "
+import pathlib, sys
+import coord
+sys.exit(0 if str(pathlib.Path(coord.__file__).resolve()).startswith('$base_wt') else 9)
+") >/dev/null 2>&1; then
+        warn "baseline: the branch venv does not resolve 'coord' from the baseline worktree — reporting the failure as the branch's, uncompared"
+        return 1
+    fi
+
+    local out="$WT/.pytest.baseline.out"
+    log "baseline: re-running the failing test(s) on the merge-base"
+    # shellcheck disable=SC2086  # node ids are intentionally word-split
+    if (cd "$base_wt" && "$venv/bin/python" -m pytest -q --tb=short $failed) >"$out" 2>&1; then
+        log "baseline: every failing test PASSES on the merge-base — the branch owns this failure"
+        return 1
+    fi
+    if grep -qE "^(ERROR|INTERNALERROR)" "$out"; then
+        warn "baseline: the merge-base run hit a collection/import error, so it says nothing about these tests — reporting the failure as the branch's, uncompared"
+        return 1
+    fi
+
+    local base_failed
+    base_failed="$(grep '^FAILED ' "$out" | awk '{print $2}' | sort -u || true)"
+    while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        if ! printf '%s\n' "$base_failed" | grep -qxF "$f"; then
+            log "baseline: $f PASSES on the merge-base — a genuine branch failure"
+            return 1
+        fi
+    done <<<"$failed"
+    return 0
+}
+
+mark_baseline_red() {
+    BASELINE_RED_SUITES+=("$1")
+}
 
 # ── toolchain resolution (#1814) ─────────────────────────────────────────────
 #
@@ -338,6 +523,22 @@ run_python() {
         return 0
     fi
 
+    # Not a flake. Before calling it the branch's fault, ask the question the
+    # Test gate is actually asked: is this worse than $BASE_REF on THIS machine?
+    # (#2170 — see the baseline section above for why this only ever downgrades
+    # on unanimous, positively-confirmed evidence.)
+    if python_baseline_is_red "$failed"; then
+        say "BASELINE-RED(python): all $count failing test(s) fail identically on $BASELINE_DESC — this machine's baseline is red and this is NOT a verdict on the branch"
+        printf '%s\n' "$failed" | sed 's/^/      /'
+        say "      The branch made nothing worse. Fix the BASELINE (or this machine's environment) — a machine whose suite cannot go green cannot produce a Test verdict for any branch (#2170). Reproduce the environment half with scripts/run_tests_in_populated_home.sh."
+        mark_baseline_red python
+        return 1
+    fi
+
+    # Deliberately NOT worded "and not reproducible on $BASE_REF": the baseline
+    # comparison may have been skipped (no merge-base, worktree add failed, …),
+    # and claiming a comparison that did not happen is how a runner earns
+    # distrust. The `[test] baseline: …` lines above say which of the two it was.
     say "FAIL(python): $count test(s) fail on re-run — genuine"
     printf '%s\n' "$failed" | sed 's/^/      /'
     tail -n 40 "$rerun" | sed 's/^/      /'
@@ -490,6 +691,16 @@ fi
 if [[ ${#INFRA_SUITES[@]} -gt 0 ]]; then
     say "RESULT: INFRA (${INFRA_SUITES[*]}) — the suite could not run; this is NOT a test failure and no verdict may be recorded from it"
     exit "$EXIT_INFRA"
+fi
+
+# Same precedence logic as INFRA, one rung lower: a suite that was already red
+# on the merge-base is not a suite this branch failed. Checked BEFORE the FAIL
+# branch, and only when NO suite failed for a branch-attributable reason — a
+# genuinely-broken rust arm alongside a baseline-red python arm is still a
+# branch FAIL, because the branch did break something (#2170).
+if [[ ${#BASELINE_RED_SUITES[@]} -gt 0 && ${#FAILED_SUITES[@]} -eq ${#BASELINE_RED_SUITES[@]} ]]; then
+    say "RESULT: BASELINE-RED (${BASELINE_RED_SUITES[*]}) — every failure reproduces on $BASE_REF in this environment; the branch made nothing worse, so this is NOT a branch failure and must not consume a fix attempt"
+    exit "$EXIT_BASELINE_RED"
 fi
 
 if [[ ${#FAILED_SUITES[@]} -gt 0 ]]; then

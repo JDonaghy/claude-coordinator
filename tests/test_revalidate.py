@@ -1765,3 +1765,203 @@ class TestThinClientTimeout:
             + 300.0
         )
         assert rv.client_timeout_seconds(False) == 900.0
+
+
+class TestBaselineRedClassification:
+    """A suite that was ALREADY red on the merge-base must not be reported as a
+    red suite for the branches (#2170).
+
+    Sibling of `TestInfrastructureFailureClassification` above, and the same
+    shape of mistake one rung along. #1814's case was "the suite never ran";
+    this one is "the suite ran, failed, and would have failed identically
+    without any of these branches". Both render as `SUITE FAILED` if nobody
+    distinguishes them, and both send the operator to debug a branch that is
+    fine.
+
+    What it cost while undistinguished: six tests failed on `origin/main` on
+    any machine with a populated `$HOME`, so the Test stage on `precision`
+    could not produce a green verdict for this repo on ANY branch — every
+    dispatch there was blamed on the branch and cost a human adjudication.
+
+    Reuses the composite tests' `_candidates` so these run against the same
+    real git fleet and the same all-or-nothing write contract.
+    """
+
+    _candidates = staticmethod(TestCompositeRevalidation._candidates)
+
+    @staticmethod
+    def _baseline_red_runner(command, cwd, timeout):
+        return _Run(
+            rv.RUNNER_BASELINE_RED_EXIT,
+            stdout=(
+                "FAIL(python): 6 test(s) fail on re-run — genuine\n"
+                "RESULT: BASELINE-RED (python) — every failure reproduces on "
+                "origin/main in this environment\n"
+            ),
+            stderr="",
+        )
+
+    def test_a_red_baseline_is_not_a_red_suite(
+        self, git_fleet: Path, coord_db,
+    ) -> None:
+        result = rv.revalidate(
+            self._candidates(), _live_config(git_fleet),
+            runner=self._baseline_red_runner,
+        )
+
+        assert result.kind == rv.KIND_BASELINE_RED
+        # The wording must not send the operator to the branch, and must not
+        # claim the suite never ran either — it ran, and told us something.
+        assert "SUITE FAILED" not in result.reason
+        assert "RED BASELINE" in result.reason
+        assert "COULD NOT RUN" not in result.reason
+        assert "made nothing worse" in result.reason
+
+    def test_operator_summary_says_no_branch_was_judged(
+        self, git_fleet: Path, coord_db,
+    ) -> None:
+        """`format_batch` is the stdout half of the report, and a red composite
+        with no explanation is how this bug stayed expensive."""
+        batch = rv.revalidate_group(
+            self._candidates(), _live_config(git_fleet),
+            runner=self._baseline_red_runner,
+        )
+        rendered = "\n".join(rv.format_batch(batch))
+
+        assert "RED BASELINE" in rendered
+        assert "no branch was judged" in rendered
+        assert "Fix the baseline" in rendered
+        assert "SUITE FAILED" not in rendered
+        assert "INFRASTRUCTURE FAILURE" not in rendered
+
+    def test_a_red_baseline_never_narrows_to_per_entry_runs(
+        self, git_fleet: Path, coord_db,
+    ) -> None:
+        """N solo re-runs would hit the identical pre-existing failures.
+
+        Narrowing would turn one red baseline into N branches that each look
+        individually broken — the precise impression this exists to remove —
+        and would pay N suite runs to learn nothing.
+        """
+        calls: list[str] = []
+
+        def runner(command, cwd, timeout):
+            calls.append(command)
+            return self._baseline_red_runner(command, cwd, timeout)
+
+        batch = rv.revalidate_group(
+            self._candidates(), _live_config(git_fleet), runner=runner,
+        )
+
+        assert batch.ok is False
+        assert batch.fell_back is False
+        assert batch.per_entry == []
+        assert batch.culprits == []
+        assert len(calls) == 1
+
+    def test_a_red_baseline_still_counts_as_one_suite_run(
+        self, git_fleet: Path, coord_db,
+    ) -> None:
+        """Unlike INFRA (0), the suite DID run here.
+
+        `suite_runs` answers "how many suites did that just run", so counting 0
+        would misreport the cost. The two outcomes agree that no verdict may be
+        recorded and disagree about what it cost — both halves matter.
+        """
+        batch = rv.revalidate_group(
+            self._candidates(), _live_config(git_fleet),
+            runner=self._baseline_red_runner,
+        )
+        assert batch.suite_runs == 1
+
+    def test_infra_wins_when_both_markers_are_present(
+        self, git_fleet: Path, coord_db,
+    ) -> None:
+        """A run that could not run says nothing about any baseline.
+
+        If both markers somehow appear, INFRA is the safer of the two claims:
+        it asserts less (no verdict, no cost) and does not imply that a
+        comparison against the merge-base actually happened.
+        """
+        def runner(command, cwd, timeout):
+            return _Run(
+                rv.RUNNER_INFRA_EXIT,
+                stdout="RESULT: INFRA (rust)\nRESULT: BASELINE-RED (python)\n",
+            )
+
+        result = rv.revalidate(
+            self._candidates(), _live_config(git_fleet), runner=runner,
+        )
+        assert result.kind == rv.KIND_INFRA
+
+
+class TestIsBaselineRedFailure:
+    """Unit coverage for the classifier itself (#2170)."""
+
+    @pytest.mark.parametrize(
+        ("rc", "output"),
+        [
+            (rv.RUNNER_BASELINE_RED_EXIT, "RESULT: BASELINE-RED (python)"),
+            (1, "RESULT: BASELINE-RED (python) — every failure reproduces"),
+            (4, "FAIL(python): ...\nRESULT: BASELINE-RED (python)\ntrailing\n"),
+        ],
+    )
+    def test_positive_signals(self, rc: int, output: str) -> None:
+        assert rv.is_baseline_red_failure(rc, output) is True
+
+    def test_the_runners_exit_code_alone_is_not_enough(self) -> None:
+        """A repo's own test command may legitimately exit 4 — pytest itself
+        uses 4 for a usage error. Keying on the number would excuse a genuinely
+        red suite as "not the branch's fault", which is the direction that could
+        eventually launder a merge, so the marker in the output is what decides.
+        """
+        assert rv.is_baseline_red_failure(rv.RUNNER_BASELINE_RED_EXIT, "boom") is False
+
+    @pytest.mark.parametrize(
+        ("rc", "output"),
+        [
+            (1, "RESULT: FAIL (python)"),
+            (1, "FAILED tests/test_x.py::test_y - AssertionError"),
+            (4, ""),
+            # This repo's own pytest arm contains tests whose assertion text and
+            # parametrize ids embed this marker verbatim (the class above, and
+            # tests/test_coord_test_runner_baseline.py). If one of them ever
+            # fails for an unrelated reason, pytest reproduces the marker in its
+            # output — but never at the start of a line. A bare substring match
+            # would excuse that genuine failure as a red baseline and hide it.
+            (1, "E       assert 'RESULT: BASELINE-RED' in out"),
+            (
+                1,
+                "FAILED tests/test_revalidate.py::test_x"
+                "[RESULT: BASELINE-RED (python)] - AssertionError",
+            ),
+            (
+                1,
+                "      RESULT: BASELINE-RED (python) — indented, as the runner's"
+                " own `tail -n 40 ... | sed 's/^/      /'` dump always is",
+            ),
+        ],
+    )
+    def test_negative_signals(self, rc: int, output: str) -> None:
+        assert rv.is_baseline_red_failure(rc, output) is False
+
+    def test_it_is_not_conflated_with_infrastructure(self) -> None:
+        """The two classifiers must not overlap: one means "never ran", the
+        other means "ran, and was already red"."""
+        baseline = "RESULT: BASELINE-RED (python)"
+        infra = "RESULT: INFRA (rust)"
+        assert rv.is_baseline_red_failure(4, baseline) is True
+        assert rv.is_infrastructure_failure(4, baseline) is False
+        assert rv.is_infrastructure_failure(3, infra) is True
+        assert rv.is_baseline_red_failure(3, infra) is False
+
+    def test_baseline_red_is_not_narrowable(self) -> None:
+        """Pinned as data, not just as behaviour: N solo re-runs would hit the
+        same pre-existing failures."""
+        assert rv.KIND_BASELINE_RED not in rv.NARROWABLE_KINDS
+
+    def test_baseline_red_did_run_a_suite(self) -> None:
+        """Deliberately NOT in `NO_SUITE_RAN_KINDS` — the suite ran (twice, in
+        fact: once on the branch and once on the merge-base)."""
+        assert rv.KIND_BASELINE_RED not in rv.NO_SUITE_RAN_KINDS
+        assert rv.KIND_INFRA in rv.NO_SUITE_RAN_KINDS

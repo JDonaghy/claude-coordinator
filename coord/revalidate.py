@@ -193,6 +193,12 @@ KIND_BUILD = "build"
 KIND_SUITE = "suite"
 KIND_TIMEOUT = "timeout"
 KIND_INFRA = "infra"
+#: The suite RAN and failed, but identically on the merge-base (#2170) — so it
+#: is a statement about the machine's baseline, not about any branch. Distinct
+#: from :data:`KIND_INFRA` (where the suite never ran at all) and from
+#: :data:`KIND_SUITE` (where the branch broke something): the operator action is
+#: "fix the baseline", not "fix the runner environment" or "fix the branch".
+KIND_BASELINE_RED = "baseline_red"
 
 #: Composite failure kinds a per-entry pass can actually narrow (#1715).
 NARROWABLE_KINDS = frozenset({
@@ -220,6 +226,20 @@ SHELL_NOT_FOUND_EXIT = 127
 #: a ``build_command = "exit 3"`` case), so keying on the number alone would
 #: relabel real red builds as infrastructure — the dangerous direction.
 INFRA_OUTPUT_MARKERS = ("TOOLCHAIN MISSING", "RESULT: INFRA")
+
+#: What ``coord-test-runner.sh`` prints when every failure in a suite reproduces
+#: on the merge-base (#2170), and the exit code it pairs with it.
+#:
+#: Same "the marker, not the number" discipline as :data:`INFRA_OUTPUT_MARKERS`
+#: above, and the same line-start anchoring: an arbitrary repo's command is free
+#: to exit 4 for a real failure (pytest itself uses 4 for a usage error), so the
+#: number alone must never be enough to excuse a red suite.
+BASELINE_RED_OUTPUT_MARKER = "RESULT: BASELINE-RED"
+
+#: Exit code ``scripts/coord-test-runner.sh`` reserves for baseline-red.
+#: Documented, and — like :data:`RUNNER_INFRA_EXIT` — deliberately not trusted
+#: on its own.
+RUNNER_BASELINE_RED_EXIT = 4
 
 
 def is_infrastructure_failure(returncode: int, output: str) -> bool:
@@ -267,6 +287,53 @@ def is_infrastructure_failure(returncode: int, output: str) -> bool:
     lines = (output or "").splitlines()
     return any(
         line.startswith(marker) for line in lines for marker in INFRA_OUTPUT_MARKERS
+    )
+
+
+def is_baseline_red_failure(returncode: int, output: str) -> bool:
+    """True when a test command failed but every failure also fails on the
+    merge-base (#2170) — i.e. the machine's baseline is red.
+
+    ONE signal only, and it is the runner's own explicit statement: a
+    :data:`BASELINE_RED_OUTPUT_MARKER` line. :data:`RUNNER_BASELINE_RED_EXIT` is
+    NOT a signal on its own, for the same reason exit 3 isn't for infrastructure
+    — an arbitrary repo's `test_command` may exit 4 for a perfectly genuine
+    failure (pytest's own usage-error code is 4), and keying on the number would
+    relabel real red suites as "not the branch's fault". That is the dangerous
+    direction: it is the one that could eventually launder a regression into a
+    merge, so it must require the runner to have said so in words.
+
+    Line-anchored rather than a bare substring search, exactly as
+    :func:`is_infrastructure_failure` documents at length: for this repo the
+    ``test_command`` IS that runner's pytest arm, so the suite contains tests
+    (``tests/test_coord_test_runner_baseline.py``, and this module's own) whose
+    assertion text and parametrize ids embed this marker verbatim. Those only
+    ever appear indented (``E   ``/spaces) or prefixed (``FAILED ``), never at
+    the start of a line.
+
+    ``returncode`` is accepted and ignored for signature symmetry with
+    :func:`is_infrastructure_failure`; callers pass what they have.
+    """
+    lines = (output or "").splitlines()
+    return any(line.startswith(BASELINE_RED_OUTPUT_MARKER) for line in lines)
+
+
+def _baseline_red_reason(stage: str, returncode: int) -> str:
+    """Operator-facing wording for a red baseline (#2170).
+
+    Must not say "SUITE FAILED" (the operator would debug a branch that is
+    fine), must not say "could not run" (it ran, and told us something), and
+    must name the BASELINE as the thing to fix. The failure that motivated it
+    read as a branch problem for months and was not one.
+    """
+    return (
+        f"revalidation reports a RED BASELINE — the {stage} command failed "
+        f"(exit {returncode}), but every failure reproduces on the merge-base "
+        "in this environment, so the branches made nothing worse and NONE of "
+        "them was judged. Nothing merged, nothing marked failed, no verdict "
+        "changed. Fix the baseline (or this machine's environment) and re-run: "
+        "a machine whose suite cannot go green cannot produce a Test verdict "
+        "for any branch (#2170)"
     )
 
 
@@ -698,12 +765,21 @@ def revalidate(
         if built.returncode != 0:
             build_output = (built.stdout or "") + "\n" + (built.stderr or "")
             infra = is_infrastructure_failure(built.returncode, build_output)
+            baseline_red = not infra and is_baseline_red_failure(
+                built.returncode, build_output
+            )
             return RevalidationResult(
                 ok=False,
-                kind=KIND_INFRA if infra else KIND_BUILD,
+                kind=(
+                    KIND_INFRA if infra
+                    else KIND_BASELINE_RED if baseline_red
+                    else KIND_BUILD
+                ),
                 reason=(
                     _infra_reason("build", built.returncode)
                     if infra
+                    else _baseline_red_reason("build", built.returncode)
+                    if baseline_red
                     else (
                         "revalidation BUILD FAILED against the current base "
                         f"(exit {built.returncode}) — every candidate stays "
@@ -729,12 +805,21 @@ def revalidate(
     if tested.returncode != 0:
         test_output = (tested.stdout or "") + "\n" + (tested.stderr or "")
         infra = is_infrastructure_failure(tested.returncode, test_output)
+        baseline_red = not infra and is_baseline_red_failure(
+            tested.returncode, test_output
+        )
         return RevalidationResult(
             ok=False,
-            kind=KIND_INFRA if infra else KIND_SUITE,
+            kind=(
+                KIND_INFRA if infra
+                else KIND_BASELINE_RED if baseline_red
+                else KIND_SUITE
+            ),
             reason=(
                 _infra_reason("suite", tested.returncode)
                 if infra
+                else _baseline_red_reason("suite", tested.returncode)
+                if baseline_red
                 else (
                     "revalidation SUITE FAILED against the current base "
                     f"(exit {tested.returncode}) — every candidate stays "
@@ -983,6 +1068,19 @@ def format_batch(batch: BatchRevalidationResult) -> list[str]:
         )
         return lines
 
+    if batch.composite.kind == KIND_BASELINE_RED:
+        # #2170: the OTHER failure mode that is not about the branches. Same
+        # stdout-as-well-as-stderr treatment as INFRA above and for the same
+        # reason — but a different instruction, because the fix is in the
+        # baseline (or this machine's environment), not the runner's toolchain.
+        lines.append(
+            "  --revalidate: RED BASELINE — the suite failed, but identically "
+            "on the merge-base, so no branch was judged. Nothing merged, "
+            "nothing marked failed, no verdict changed; every candidate is "
+            "exactly as it was. Fix the baseline, then re-run --revalidate."
+        )
+        return lines
+
     if not batch.fell_back:
         return lines
 
@@ -1075,6 +1173,7 @@ __all__ = [
     "DEFAULT_TIMEOUT_SECONDS",
     "KIND_BUILD",
     "KIND_COMPOSE",
+    "KIND_BASELINE_RED",
     "KIND_INFRA",
     "KIND_OK",
     "KIND_SETUP",
@@ -1083,6 +1182,7 @@ __all__ = [
     "MAX_REVALIDATION_BATCH",
     "NARROWABLE_KINDS",
     "NO_SUITE_RAN_KINDS",
+    "RUNNER_BASELINE_RED_EXIT",
     "RUNNER_INFRA_EXIT",
     "SHELL_NOT_FOUND_EXIT",
     "BatchRevalidationResult",
@@ -1093,6 +1193,7 @@ __all__ = [
     "format_batch",
     "format_failure",
     "group_candidates",
+    "is_baseline_red_failure",
     "is_infrastructure_failure",
     "local_repo_dir",
     "revalidate",
