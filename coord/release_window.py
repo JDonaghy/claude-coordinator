@@ -190,6 +190,14 @@ class WindowRecord:
     propagate_status: str | None = None
     propagate_exit_code: int | None = None
     propagate_output: str = ""
+    #: The propagation journal record's OWN ``started_at`` — the join key
+    #: (#2187 proposal 2) that lets `window-history` be correlated to
+    #: `coord release history` for the SAME run, instead of each store
+    #: independently re-deciding what happened. ``None`` when no matching
+    #: journal record could be found (see
+    #: `coord.commands.release._latest_propagate_record_since`) — there is
+    #: then nothing to join to.
+    propagate_started_at: float | None = None
     finished_at: float | None = None
     error: str | None = None
     dry_run: bool = False
@@ -327,9 +335,14 @@ def render_record(record: WindowRecord | Mapping[str, Any]) -> list[str]:
         if data.get("drain_detail"):
             lines.append(f"      {data['drain_detail']}")
     if data.get("propagate_status"):
+        joined = (
+            f" [history @ {_stamp(data['propagate_started_at'])}]"
+            if data.get("propagate_started_at")
+            else ""
+        )
         lines.append(
             f"    propagate: {data['propagate_status']} "
-            f"(exit {data.get('propagate_exit_code')})"
+            f"(exit {data.get('propagate_exit_code')}){joined}"
         )
     if data.get("queue_restarted") is not None:
         lines.append(

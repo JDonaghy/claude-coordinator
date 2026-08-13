@@ -120,12 +120,13 @@ def _stub_drain(monkeypatch, *, drained: bool, elapsed: float = 5.0, detail: str
     return calls
 
 
-def _stub_propagate(monkeypatch, *, status: str, exit_code: int, output: str = "ok"):
+def _stub_propagate(monkeypatch, *, status: str, exit_code: int, output: str = "ok",
+                    started_at: float | None = None):
     calls = []
 
     def _fake(**kwargs):
         calls.append(kwargs)
-        return status, exit_code, output
+        return status, exit_code, output, started_at
 
     monkeypatch.setattr(release_cmd, "_run_propagate", _fake)
     return calls
@@ -399,7 +400,7 @@ def test_a_propagate_subprocess_that_cannot_even_run_is_reported_not_a_success(
 
     monkeypatch.setattr(release_cmd, "_run_propagate",
                         lambda **k: ("error: TimeoutError: propagate subprocess timed out",
-                                    1, "TimeoutError: propagate subprocess timed out"))
+                                    1, "TimeoutError: propagate subprocess timed out", None))
     result = CliRunner().invoke(
         main,
         ["release", "nightly-window", "--config", str(valid_config_path),
@@ -594,3 +595,263 @@ def test_drain_treats_an_unreadable_board_as_fleet_wide_busy():
     )
     assert outcome.drained is False
     assert "board unreadable" in outcome.detail
+
+
+# ── #2187: a VERIFIED, exit-0 propagate must never be reported as
+#    `propagate-failed` — the whole bug this issue is about ─────────────────
+#
+# The tests above all stub `_run_propagate` wholesale via `_stub_propagate`,
+# which bypasses the exact code that was broken: parsing what a REAL
+# `coord release propagate --json` subprocess prints. These exercise
+# `_parse_trailing_json`, `_latest_propagate_record_since` and
+# `_run_propagate` itself directly, then drive the full CLI command with a
+# faked subprocess boundary (not `_run_propagate` itself) so the fix is
+# proven end to end, the same way the real bug reached production.
+
+
+def test_parse_trailing_json_reads_a_pretty_printed_indent2_payload():
+    """The exact shape `coord release propagate --json` prints
+    (`json.dumps(..., indent=2, sort_keys=True)`) — this is the shape the
+    old single-line heuristic never matched (#2187's root cause)."""
+    import json as _json
+
+    payload = {"status": "verified", "target_version": "0.5.50"}
+    stdout = (
+        "note: some warning on stdout\n"
+        + _json.dumps(payload, indent=2, sort_keys=True)
+        + "\n"
+    )
+    parsed = release_cmd._parse_trailing_json(stdout)
+    assert parsed == payload
+
+
+def test_parse_trailing_json_still_reads_a_compact_single_line_payload():
+    import json as _json
+
+    stdout = "some preamble\n" + _json.dumps({"status": "deferred"}, sort_keys=True)
+    assert release_cmd._parse_trailing_json(stdout) == {"status": "deferred"}
+
+
+def test_parse_trailing_json_on_no_json_at_all_is_none():
+    assert release_cmd._parse_trailing_json("just some plain log output\nnothing here") is None
+
+
+def test_parse_trailing_json_on_empty_stdout_is_none():
+    assert release_cmd._parse_trailing_json("") is None
+
+
+def test_latest_propagate_record_since_finds_the_run_just_launched(tmp_path, monkeypatch):
+    from coord import release_propagate as rp
+
+    rp.append_record(tmp_path, rp.PropagationRecord(started_at=100.0, status=rp.STATUS_FAILED))
+    rp.append_record(tmp_path, rp.PropagationRecord(started_at=200.0, status=rp.STATUS_VERIFIED))
+    record = release_cmd._latest_propagate_record_since(tmp_path, 150.0)
+    assert record["started_at"] == 200.0
+    assert record["status"] == rp.STATUS_VERIFIED
+
+
+def test_latest_propagate_record_since_ignores_older_runs(tmp_path):
+    from coord import release_propagate as rp
+
+    rp.append_record(tmp_path, rp.PropagationRecord(started_at=100.0, status=rp.STATUS_VERIFIED))
+    assert release_cmd._latest_propagate_record_since(tmp_path, 150.0) is None
+
+
+def test_latest_propagate_record_since_on_no_journal_is_none(tmp_path):
+    assert release_cmd._latest_propagate_record_since(tmp_path, 0.0) is None
+
+
+def test_run_propagate_prefers_the_journal_over_stdout(tmp_path):
+    """Ground truth (#2187 proposal 1): even if stdout were unparseable, a
+    matching journal entry is what decides the status — and it stamps
+    `propagate_started_at`, the join key (#2187 proposal 2)."""
+    from coord import release_propagate as rp
+
+    def _fake_runner(argv, **kwargs):
+        import subprocess as _subprocess
+
+        rp.append_record(
+            tmp_path,
+            rp.PropagationRecord(started_at=500.0, status=rp.STATUS_VERIFIED,
+                                 target_version="0.5.50", finished_at=505.0),
+        )
+        return _subprocess.CompletedProcess(argv, 0, stdout="not json at all", stderr="")
+
+    status, exit_code, output, started_at = release_cmd._run_propagate(
+        daemon_host="dellserver", target_version="0.5.50",
+        config_path=tmp_path / "coordinator.yml", state_dir=tmp_path,
+        runner=_fake_runner, now_fn=lambda: 499.0,
+    )
+    assert status == rp.STATUS_VERIFIED
+    assert exit_code == 0
+    assert started_at == 500.0
+
+
+def test_run_propagate_falls_back_to_pretty_printed_stdout_when_no_journal_entry(tmp_path):
+    """#2187's exact root-cause repro: no journal record can be found (the
+    write races or fails), but stdout carries the SAME pretty-printed
+    (`indent=2`) `--json` payload the real command emits. The old
+    single-line heuristic returned the `f"exit {code}"` placeholder here for
+    every successful, exit-0 roll — this must now read `verified` instead."""
+    import json as _json
+    import subprocess as _subprocess
+
+    def _fake_runner(argv, **kwargs):
+        payload = {"status": "verified", "target_version": "0.5.50"}
+        stdout = _json.dumps(payload, indent=2, sort_keys=True)
+        return _subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    status, exit_code, output, started_at = release_cmd._run_propagate(
+        daemon_host="dellserver", target_version="0.5.50",
+        config_path=tmp_path / "coordinator.yml", state_dir=tmp_path,
+        runner=_fake_runner, now_fn=lambda: 0.0,
+    )
+    assert status == "verified"
+    assert exit_code == 0
+    assert started_at is None  # nothing to join to — no journal entry found
+
+
+def test_run_propagate_with_no_journal_and_no_parseable_stdout_names_the_gap(tmp_path):
+    """Neither ground truth is available: falls back to the honest
+    `f"exit {code}"` placeholder — the CALLER (below) is responsible for
+    turning that into a message that names what's missing, not one that
+    misreports it as a real, examined status."""
+    import subprocess as _subprocess
+
+    def _fake_runner(argv, **kwargs):
+        return _subprocess.CompletedProcess(argv, 0, stdout="garbage, no json", stderr="")
+
+    status, exit_code, output, started_at = release_cmd._run_propagate(
+        daemon_host="dellserver", target_version="0.5.50",
+        config_path=tmp_path / "coordinator.yml", state_dir=tmp_path,
+        runner=_fake_runner, now_fn=lambda: 0.0,
+    )
+    assert status == "exit 0"
+    assert exit_code == 0
+    assert started_at is None
+
+
+def _fake_propagate_subprocess(monkeypatch, state_dir, *, status: str, exit_code: int,
+                               target_version: str = "0.5.50", write_journal: bool = True):
+    """Stands in for a REAL `python -m coord.cli release propagate --json`
+    subprocess: appends the same journal record `_finish` would (#2187's
+    ground truth) and returns the SAME pretty-printed (`indent=2`) --json
+    stdout shape the real command emits, so the whole `_run_propagate`
+    boundary — not just its already-stubbed replacement — is exercised."""
+    import json as _json
+    import subprocess as _subprocess
+    import time as _time
+
+    from coord import release_propagate as rp
+
+    calls = []
+
+    def _fake_run(argv, **kwargs):
+        calls.append(argv)
+        if write_journal:
+            # A REAL `started_at` — not a fixed constant — because
+            # `_run_propagate` compares this against `time.time()` captured
+            # right before launch (`_latest_propagate_record_since`'s
+            # `since`); a hardcoded past timestamp would look like an OLDER,
+            # unrelated run and be filtered out exactly like a real stale
+            # entry would be.
+            rp.append_record(
+                state_dir,
+                rp.PropagationRecord(
+                    started_at=_time.time(), target_version=target_version,
+                    status=status, finished_at=_time.time(),
+                ),
+            )
+        payload = {"status": status, "target_version": target_version}
+        stdout = _json.dumps(payload, indent=2, sort_keys=True)
+        return _subprocess.CompletedProcess(argv, exit_code, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(_subprocess, "run", _fake_run)
+    return calls
+
+
+def test_window_end_to_end_a_verified_roll_is_never_reported_as_failed(
+    valid_config_path, state_dir, no_network, escalations, monkeypatch
+):
+    """#2187 acceptance arm 1: a propagate that exits 0 and records
+    `verified` produces a clean window-history entry and a clean exit —
+    through the REAL `_run_propagate`, not a stub of it."""
+    _stub_verify(monkeypatch, daemon_version="0.5.49")
+    _stub_systemctl(monkeypatch)
+    _stub_drain(monkeypatch, drained=True)
+    _fake_propagate_subprocess(monkeypatch, state_dir, status=rp.STATUS_VERIFIED,
+                               exit_code=0, target_version="0.5.50")
+
+    result = CliRunner().invoke(
+        main,
+        ["release", "nightly-window", "--config", str(valid_config_path),
+         "--target", "0.5.50", "--daemon-host", "server"],
+    )
+    assert result.exit_code == 0, result.output
+    record = _records(state_dir)[0]
+    assert record["status"] == rw.STATUS_ROLLED
+    assert record["status"] in rw.OK_STATUSES
+    assert record["propagate_status"] == rp.STATUS_VERIFIED
+    # The join key (#2187 proposal 2): stamped from the propagation
+    # journal's OWN `started_at`, proving `window-history` can now be
+    # correlated to `history` for this exact run.
+    assert record["propagate_started_at"] is not None
+    assert record["propagate_started_at"] > 0
+    assert not record["error"]
+    assert not escalations
+
+
+def test_window_end_to_end_a_genuine_failure_is_still_reported_failed(
+    valid_config_path, state_dir, no_network, escalations, monkeypatch
+):
+    """#2187 acceptance arm 2: a propagate that genuinely fails still
+    produces `propagate-failed` and a non-zero exit — the fix must not turn
+    every outcome green."""
+    _stub_verify(monkeypatch, daemon_version="0.5.49")
+    _stub_systemctl(monkeypatch)
+    _stub_drain(monkeypatch, drained=True)
+    _fake_propagate_subprocess(monkeypatch, state_dir, status=rp.STATUS_FAILED,
+                               exit_code=1, target_version="0.5.50")
+
+    result = CliRunner().invoke(
+        main,
+        ["release", "nightly-window", "--config", str(valid_config_path),
+         "--target", "0.5.50", "--daemon-host", "server"],
+    )
+    assert result.exit_code == 1, result.output
+    record = _records(state_dir)[0]
+    assert record["status"] == rw.STATUS_PROPAGATE_FAILED
+    assert record["status"] not in rw.OK_STATUSES
+    assert record["propagate_status"] == rp.STATUS_FAILED
+    assert len(escalations) == 1
+
+
+def test_window_end_to_end_an_unconfirmable_exit_0_names_the_missing_evidence(
+    valid_config_path, state_dir, no_network, escalations, monkeypatch
+):
+    """No journal entry AND no parseable stdout, despite exit 0 (#2187
+    proposal 3): the error must name the specific missing artifacts, never
+    read as `status=exit 0, exit=0` with nothing further explained."""
+    import subprocess as _subprocess
+
+    _stub_verify(monkeypatch, daemon_version="0.5.49")
+    _stub_systemctl(monkeypatch)
+    _stub_drain(monkeypatch, drained=True)
+
+    def _fake_run(argv, **kwargs):
+        return _subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(_subprocess, "run", _fake_run)
+
+    result = CliRunner().invoke(
+        main,
+        ["release", "nightly-window", "--config", str(valid_config_path),
+         "--target", "0.5.50", "--daemon-host", "server"],
+    )
+    assert result.exit_code != 0, result.output
+    record = _records(state_dir)[0]
+    assert record["status"] == rw.STATUS_PROPAGATE_FAILED
+    assert "status=exit 0, exit=0" not in (record["error"] or "")
+    assert "no matching entry" in (record["error"] or "")
+    assert "no parseable" in (record["error"] or "")
+    assert len(escalations) == 1
