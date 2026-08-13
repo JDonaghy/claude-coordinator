@@ -100,6 +100,16 @@ coord approve --dry-run 1,2
 coord assign --dry-run precision claude-coordinator 42
 ```
 
+**Workers: scope your test run to your diff, never `pytest` bare (#2169).**
+The full suite exceeds Claude Code's 600s Bash ceiling on this repo and
+duplicates the Test stage + CI, which both run it against your pushed SHA
+regardless. Run just the file(s) that mirror what you changed — `pytest
+tests/test_<module>.py` for a `coord/<module>.py` change, `cargo test` from
+`tui/` scoped with a test-name filter for a `tui/**` change. To see what
+the Test stage itself would run for your diff (and confirm you're not
+missing a suite), `scripts/coord-test-runner.sh <worktree> --print-routing`
+computes the routing without actually building or testing anything.
+
 ## Key Design Decisions
 
 - **No API key needed.** Everything uses `claude -p` which runs on Max/Pro subscription via OAuth.
