@@ -87,6 +87,9 @@ from coord.health.cli import health
 # #1632: same arrangement for the fleet notifier — predicate, baselines,
 # transport seam and CLI all live in coord/notifier/.
 from coord.notifier.cli import notifier_group
+# #2179: coord-portal sync bridge client — coord/portal_bridge.py is the
+# client, coord/commands/portal.py is the CLI over it.
+from coord.commands.portal import portal_group
 from coord.commands.merge import (
     bounce,
     merge,
@@ -391,6 +394,7 @@ main.add_command(gates)
 main.add_command(doctor)
 main.add_command(health)
 main.add_command(notifier_group)
+main.add_command(portal_group)
 main.add_command(issue_group)
 main.add_command(context_group)
 main.add_command(audit)

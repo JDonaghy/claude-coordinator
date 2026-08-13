@@ -453,3 +453,32 @@ models:
 #   # cold_ceiling_mins:
 #   #   work: 240
 #   #   review: 90
+
+# ── portal (#2179) — coord-portal sync bridge client ─────────────────────────
+#
+# The outbound client to coord-portal's `/api/bridge/*` routes (push, pull,
+# heartbeat) — see coord/portal_bridge.py and docs/CUSTOMER_PORTAL.md. Off by
+# default: omit this block entirely and coord never talks to the portal.
+#
+# NOTHING in this module decides WHEN to push, or WHICH coord-side work a
+# portal submission_id maps to — that association and the trigger are
+# separate, harder design questions #2179 deliberately left to follow-up
+# work. This block only configures the client; `coord portal push`/`heartbeat`
+# exercise it by hand.
+#
+# The two secrets are a Cloudflare Access SERVICE TOKEN pair the portal
+# validates before a request even reaches its Worker (coord-portal's
+# `isBridgeAuthorized`, which requires a matched, non-empty pair and fails
+# closed). Never commit real values — use `${VAR}` expansion (same mechanism
+# as `providers.definitions[*].env`) so the actual secret lives only in the
+# environment.
+#
+# Inspect it with `coord portal status`, prove it with `coord portal heartbeat`.
+#
+# portal:
+#   enabled: true
+#   base_url: https://intake.heurontech.com
+#   bridge_client_id: "${BRIDGE_CLIENT_ID}"
+#   bridge_client_secret: "${BRIDGE_CLIENT_SECRET}"
+#   timeout_secs: 10
+#   max_retries: 2       # transient/5xx only — a 401 never retries
