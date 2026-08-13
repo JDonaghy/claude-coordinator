@@ -1378,6 +1378,79 @@ def test_an_unreadable_board_aborts_without_launching(
     assert state._list_drive_queue_local() == before
 
 
+# ── #2159: a transient board-read lock retries instead of failing the tick ──
+
+
+def test_a_transient_locked_board_read_retries_and_the_tick_still_launches(
+    cli, seed, launches, monkeypatch
+):
+    """Two `database is locked` reads followed by a real one must not abort
+    the tick — the read is idempotent, so the bounded retry recovers it and
+    the tick completes exactly as an unretried, first-try success would."""
+    import sqlite3
+
+    from coord.commands import drive_queue as drive_queue_cmd
+
+    seed(issues={1650: "open"})
+    cli("add", REPO, "1650", "--machine", "dellserver")
+
+    real_fetch = drive_queue_cmd._fetch_board_view
+    calls = {"n": 0}
+
+    def flaky() -> drive_queue_cmd.BoardView:
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise sqlite3.OperationalError("database is locked")
+        return real_fetch()
+
+    monkeypatch.setattr(drive_queue_cmd, "_fetch_board_view", flaky)
+    slept: list[float] = []
+    monkeypatch.setattr(drive_queue_cmd.time, "sleep", slept.append)
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    assert calls["n"] == 3
+    assert len(slept) == 2  # backed off between attempts 1→2 and 2→3
+    assert "recovered after 2 retry" in result.output
+
+    # The tick did real work — not a silent no-op — exactly like an unretried
+    # success would.
+    assert "launched" in result.output
+    assert launches and "1650" in " ".join(launches[0])
+    assert queued(1650)["state"] == "running"
+
+
+def test_a_board_read_still_locked_past_the_retry_budget_aborts_as_before(
+    cli, seed, launches, monkeypatch
+):
+    """The retry budget is bounded — a lock that never clears must still
+    abort the tick with the pre-#2159 message, not spin forever or no-op."""
+    import sqlite3
+
+    from coord.commands import drive_queue as drive_queue_cmd
+
+    seed(issues={1650: "open"})
+    cli("add", REPO, "1650")
+    before = state._list_drive_queue_local()
+
+    calls = {"n": 0}
+
+    def always_locked() -> drive_queue_cmd.BoardView:
+        calls["n"] += 1
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(drive_queue_cmd, "_fetch_board_view", always_locked)
+    monkeypatch.setattr(drive_queue_cmd.time, "sleep", lambda _s: None)
+
+    result = cli("tick")
+    assert result.exit_code != 0
+    assert "aborting without launching" in result.output
+    assert "database is locked" in result.output
+    assert calls["n"] == drive_queue_cmd._BOARD_READ_RETRY_ATTEMPTS
+    assert launches == []
+    assert state._list_drive_queue_local() == before
+
+
 def test_a_failed_launch_is_a_consumed_attempt_not_a_running_entry(
     cli, seed, launches
 ):
