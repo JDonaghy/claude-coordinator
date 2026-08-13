@@ -825,6 +825,17 @@ def dispatch_smoke(
             is_worker=choice.is_worker,
         )
 
+        # #2168: pin the Test stage's model to avoid the agent falling
+        # through to the machine's ambient `claude -p` default (Opus).
+        # Mirrors the review path (coord/review.py, coord/gate_b.py):
+        # deliberately `config.models.default`, NOT `config.models.labels`
+        # — the Test stage's job (checkout, run one command, read an exit
+        # code) is a property of the repo's test command, never of the
+        # issue's tier label, so label routing (#1798) must not leak in
+        # here either.
+        smoke_model_alias = config.models.default
+        smoke_model_wire = config.models.resolve(smoke_model_alias)
+
         payload = {
             "repo_name": completed.repo_name,
             "repo_path": repo_path,
@@ -840,6 +851,7 @@ def dispatch_smoke(
             # #255: smoke checks out the worker's PR branch but the agent still
             # consults `branch` as the integration base.
             "branch": repo.default_branch or "main",
+            "model": smoke_model_wire,
         }
 
         url = f"http://{choice.machine.host}:{AGENT_PORT}/assign"
@@ -894,6 +906,7 @@ def dispatch_smoke(
         type="smoke",
         review_target=completed.branch,
         review_of_assignment_id=completed.assignment_id,
+        model=smoke_model_alias,
     )
     board.active.append(smoke_assignment)
 
