@@ -114,11 +114,11 @@ class BridgeUpdate:
 
     def __post_init__(self) -> None:
         if not self.submission_id or not self.submission_id.strip():
-            raise ValueError("BridgeUpdate.submission_id must be non-empty")
+            raise PortalBridgeError("BridgeUpdate.submission_id must be non-empty")
         if self.revision < 0:
-            raise ValueError("BridgeUpdate.revision must be >= 0")
+            raise PortalBridgeError("BridgeUpdate.revision must be >= 0")
         if not self.fields:
-            raise ValueError("BridgeUpdate.fields must be non-empty")
+            raise PortalBridgeError("BridgeUpdate.fields must be non-empty")
 
     def to_wire(self) -> dict[str, Any]:
         return {
@@ -234,7 +234,7 @@ class PortalBridgeClient:
         if not updates:
             return []
         if len(updates) > MAX_PUSH_UPDATES:
-            raise ValueError(
+            raise PortalBridgeError(
                 f"push() got {len(updates)} updates; the portal caps a batch "
                 f"at {MAX_PUSH_UPDATES} (src/bridge/updates.ts MAX_PUSH_UPDATES) "
                 f"— split it into multiple calls"
@@ -262,7 +262,7 @@ class PortalBridgeClient:
         outbox row.
         """
         if status not in SUBMISSION_STATUSES:
-            raise ValueError(
+            raise PortalBridgeError(
                 f"{status!r} is not in the pinned portal status vocabulary: "
                 f"{SUBMISSION_STATUSES}"
             )
