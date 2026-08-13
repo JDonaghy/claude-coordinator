@@ -395,6 +395,31 @@ class TestRunDriverCliPytest:
         assert "cli-pytest" in SUPPORTED_KINDS
 
     def test_runs_real_pytest_and_parses_junit_xml(self, tmp_path) -> None:
+        """#2170: the inner pytest's rootdir is PINNED to ``tmp_path``.
+
+        The ids asserted below are derived from the JUnit XML ``classname``,
+        which pytest computes from the test's nodeid *relative to rootdir*,
+        with ``/`` → ``.`` (``_pytest.junitxml.mangle_test_address``). rootdir
+        is inferred by walking **upward** from the arg for ``pytest.ini`` /
+        ``pyproject.toml`` / ``tox.ini`` / ``setup.cfg`` / ``setup.py`` -- so on
+        a machine where any ancestor of ``$TMPDIR`` holds one of those, rootdir
+        lands above ``tmp_path`` and the classname grows a directory prefix:
+        ``inner.test_sample::test_pass`` instead of ``test_sample::test_pass``,
+        and this test dies with a ``KeyError``. Reproduced exactly that way,
+        and it is why this failed on `precision` but never in CI.
+
+        ``-c pytest.ini`` and ``--rootdir`` together make it environment-
+        independent: ``-c`` pins which ini file is loaded (so a stray ancestor
+        ``addopts`` -- ``--cov``, ``-n auto`` -- cannot leak into a run whose
+        exit code we assert), and ``--rootdir`` pins the path the nodeids are
+        relative to. Either alone fixes the observed KeyError; both together
+        also stop the *next* ambient-config surprise.
+
+        (The sibling ``{ms}`` test below asserts with ``endswith`` and so was
+        already immune -- which is the tell that the exact-id assertion here
+        was the environment-dependent one.)
+        """
+        (tmp_path / "pytest.ini").write_text("[pytest]\n")
         (tmp_path / "test_sample.py").write_text(
             "def test_pass():\n"
             "    assert True\n"
@@ -406,7 +431,8 @@ class TestRunDriverCliPytest:
         )
         result = run_driver(
             "cli-pytest",
-            f'"{sys.executable}" -m pytest test_sample.py -p no:cacheprovider',
+            f'"{sys.executable}" -m pytest test_sample.py -p no:cacheprovider '
+            f'-c pytest.ini --rootdir="{tmp_path}"',
             cwd=str(tmp_path),
         )
         assert result.exit_code == 1
@@ -431,9 +457,15 @@ class TestRunDriverCliPytest:
         (tmp_path / "ms-38" / "test_sample.py").write_text(
             "def test_pass():\n    assert False\n"
         )
+        # Same ambient-config pin as the test above (#2170). This one asserts
+        # `endswith`, so a shifted rootdir alone wouldn't break it -- but an
+        # ancestor ini's `addopts` still could (`--cov` with no pytest-cov ⇒
+        # exit 4, and this asserts exit 0), so `-c` earns its place here too.
+        (tmp_path / "pytest.ini").write_text("[pytest]\n")
         result = run_driver(
             "cli-pytest",
-            f'"{sys.executable}" -m pytest {{ms}} -p no:cacheprovider',
+            f'"{sys.executable}" -m pytest {{ms}} -p no:cacheprovider '
+            f'-c pytest.ini --rootdir="{tmp_path}"',
             cwd=str(tmp_path),
             ms="ms-37",
         )

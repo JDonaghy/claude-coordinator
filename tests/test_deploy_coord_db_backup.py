@@ -30,18 +30,55 @@ scoped and each justified on its own:
   against is I/O corruption on the destination between the two calls, which
   isn't reproducible by feeding the script a bad source. Every other test in
   this file uses the real `sqlite3` binary.
+
+#2170 -- THE `sqlite3` CLI IS A HARD, UNPROVISIONED DEPENDENCY OF THIS WHOLE
+FILE, AND IS SKIP-GUARDED.
+
+The paragraph above used to say the dependency was "one test only". That was
+wrong, and the wrongness was invisible in CI: `deploy/coord-db-backup.sh`
+shells out to `sqlite3` on *every* path that gets as far as taking a
+snapshot, so four of these tests die with `sqlite3: command not found` on a
+machine that doesn't have the binary. `sqlite3` is not a provisioned fleet
+dependency (absent on `precision`; present on `elitebook` only incidentally
+via the Android SDK's `platform-tools/sqlite3`), and `pyproject.toml`'s
+`[dev]` extras cannot install a system binary -- so there is no config change
+that makes this file runnable everywhere.
+
+Hence the module-level `pytestmark` below: `shutil.which("sqlite3")` or the
+file skips wholesale, with a reason that names the missing binary. A skip is
+the right verdict rather than a red suite because the thing being tested is
+a *shell script's* behaviour when the binary is present -- on a machine
+without it, this file has nothing to say, and saying nothing must not look
+like "the branch broke the backup script". The stdlib `sqlite3` *module* is
+always available, so the guard keys on the CLI only.
 """
 
 from __future__ import annotations
 
 import os
+import shutil
 import sqlite3
 import stat
 import subprocess
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BACKUP_SCRIPT = REPO_ROOT / "deploy" / "coord-db-backup.sh"
+
+#: The real `sqlite3` CLI, resolved once. `None` on a machine without it --
+#: see the "#2170" section of the module docstring.
+SQLITE3_CLI = shutil.which("sqlite3")
+
+pytestmark = pytest.mark.skipif(
+    SQLITE3_CLI is None,
+    reason=(
+        "the sqlite3 CLI is not on $PATH -- deploy/coord-db-backup.sh shells "
+        "out to it on every snapshot path, so this whole file needs it and no "
+        "[dev] extra can install a system binary (#2170)"
+    ),
+)
 
 
 def _write_executable(path: Path, contents: str) -> None:
@@ -208,7 +245,11 @@ def test_rejects_a_corrupt_snapshot_as_REJECTED(tmp_path: Path) -> None:
         "    echo malformed\n"
         "    ;;\n"
         "  *)\n"
-        "    exec /usr/bin/sqlite3 \"$@\"\n"
+        # Resolved via shutil.which rather than hardcoded to /usr/bin/sqlite3:
+        # the binary is not fleet-provisioned, so where it lives varies per
+        # machine (#2170) -- and it can't be spelled bare `sqlite3` here
+        # because this fake is itself on $PATH and would exec itself.
+        f"    exec {SQLITE3_CLI} \"$@\"\n"
         "    ;;\n"
         "esac\n",
     )
