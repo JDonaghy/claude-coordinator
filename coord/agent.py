@@ -2845,9 +2845,17 @@ This session is ONE-SHOT and non-interactive (#1394):
 completion notifications will NEVER reach you — nothing wakes you up.
 - NEVER start a long-running command in the background and then end your \
 turn waiting for it (no `run_in_background`, no `&`, no "I'll wait for the \
-test run to finish"). Run it in the FOREGROUND and block until it returns, \
-or raise the timeout, or skip it and say so. If you end your turn waiting, \
-the session is over and your work is thrown away.
+test run to finish") — there is no next turn for a notification to land \
+in, so ending your turn that way throws the work away. Prefer running it \
+in the FOREGROUND and blocking until it returns. If it genuinely cannot \
+finish inside one Bash call, you may background it and poll it yourself, \
+in bounded steps, from THIS SAME still-running session — `Monitor`, or \
+repeated `TaskOutput` calls with a bounded `timeout`, never a foreground \
+loop that blocks past the ceiling (`until ! pgrep ...; do sleep ...; done` \
+hits the identical 600s wall) and never a final message that leaves it \
+running unattended and relies on being woken back up. Otherwise, raise the \
+timeout or skip it and say so. If you end your turn waiting, the session \
+is over and your work is thrown away.
 - ALWAYS `git add`, `git commit`, and `git push origin HEAD` BEFORE your \
 final message — even if the build is broken, the tests are failing, or you \
 ran out of time. Uncommitted changes are destroyed when the session ends. \
@@ -2883,8 +2891,25 @@ intentional `#[allow]` with reason, a deferred refactor flagged \
 elsewhere), explicitly call it out in your final message with the \
 reason. Don't silently ship warnings.
 - Re-run the build after fixes to confirm clean output.
-- Run the project's test command (`cargo test`, `pytest`, etc.) and \
-confirm it passes before declaring done.
+- Run only the tests that cover your diff — never the project's whole \
+test suite. A full suite routinely exceeds this tool's 600-second Bash \
+ceiling, and a worker that tries to shepherd it past that wall (splitting \
+it into chunks, backgrounding it and blocking on a poll loop, ...) burns \
+most of a session on that instead of the fix, for no net-new signal: the \
+Test stage and CI both re-run the FULL suite against your pushed SHA right \
+after you, on a clean checkout, which is strictly better evidence than a \
+worker's own partial run (#2169). Find the test file(s)/module(s) whose \
+name or path mirrors what you changed (e.g. `tests/test_<module>.py` for \
+`coord/<module>.py`, the crate-local `#[cfg(test)]` block for a Rust file) \
+and run just those — confirm they pass before declaring done.
+- Exception: if this assignment IS an oracle-loop acceptance round (you \
+were told to run `coord acceptance run --issue N`), keep running that \
+sealed slice as many times as it takes to go green. It is the loop's \
+convergence signal, not duplicated effort, and the scoping rule above does \
+not apply to it.
+- If even the scoped run genuinely cannot finish in time, follow the \
+background-and-poll pattern in the ONE-SHOT section above — do not invent \
+a chunk-and-loop workaround.
 
 #252: before exiting, emit a SMOKE_TESTS block telling the human what to \
 manually verify.  You changed the code; you know what's worth poking.
@@ -3668,7 +3693,13 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
     else:
         system_prompt = spec.system_prompt if spec.system_prompt else WORKER_SYSTEM_PROMPT
         system_prompt += build_deny_prompt(spec.deny_commands)
-        allowed_tools = "Read,Edit,Write,Bash"
+        # #2169: `Monitor` is the sanctioned way to poll a backgrounded
+        # long-running command in bounded steps (see the ONE-SHOT section of
+        # WORKER_SYSTEM_PROMPT) instead of a foreground loop that blocks
+        # past the 600s Bash ceiling. `TaskOutput`/`TaskStop` were already
+        # reachable without being in this list; `Monitor` was the one
+        # observed denied.
+        allowed_tools = "Read,Edit,Write,Bash,Monitor"
 
     # NOTE: briefing is NOT passed as a positional arg — it is written to
     # stdin as the first stream-json user message by ``_spawn``.

@@ -173,7 +173,10 @@ class ClaudeProvider(Provider):
             else:
                 _sp = spec.system_prompt if spec.system_prompt else WORKER_SYSTEM_PROMPT
                 _sp += build_deny_prompt(spec.deny_commands)
-                _at = "Read,Edit,Write,Bash"
+                # #2169: keep in sync with default_worker_command's identical
+                # branch — Monitor is the sanctioned bounded-poll tool for a
+                # backgrounded long-running command.
+                _at = "Read,Edit,Write,Bash,Monitor"
 
             if system_prompt is None:
                 system_prompt = _sp
