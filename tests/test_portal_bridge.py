@@ -68,7 +68,7 @@ def test_push_sends_the_documented_wire_shape(monkeypatch):
 
 def test_push_status_rejects_a_status_outside_the_pinned_vocabulary():
     client = _client()
-    with pytest.raises(ValueError, match="pinned portal status vocabulary"):
+    with pytest.raises(PortalBridgeError, match="pinned portal status vocabulary"):
         client.push_status("sub_1", 1, "not-a-real-status")
 
 
@@ -101,7 +101,7 @@ def test_push_over_the_batch_cap_is_refused_locally_without_a_request(monkeypatc
         BridgeUpdate(submission_id=f"sub_{i}", revision=1, fields={"status": "shipped"})
         for i in range(51)
     ]
-    with pytest.raises(ValueError, match="caps a batch at 50"):
+    with pytest.raises(PortalBridgeError, match="caps a batch at 50"):
         _client().push(updates)
 
 
@@ -282,15 +282,15 @@ def test_client_from_config_builds_a_client_when_enabled():
 
 
 def test_bridge_update_rejects_empty_submission_id():
-    with pytest.raises(ValueError, match="submission_id"):
+    with pytest.raises(PortalBridgeError, match="submission_id"):
         BridgeUpdate(submission_id="", revision=1, fields={"status": "shipped"})
 
 
 def test_bridge_update_rejects_negative_revision():
-    with pytest.raises(ValueError, match="revision"):
+    with pytest.raises(PortalBridgeError, match="revision"):
         BridgeUpdate(submission_id="sub_1", revision=-1, fields={"status": "shipped"})
 
 
 def test_bridge_update_rejects_empty_fields():
-    with pytest.raises(ValueError, match="fields"):
+    with pytest.raises(PortalBridgeError, match="fields"):
         BridgeUpdate(submission_id="sub_1", revision=1, fields={})

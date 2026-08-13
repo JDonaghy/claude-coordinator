@@ -131,6 +131,17 @@ def test_push_sends_and_reports_applied(config_path, monkeypatch):
     }
 
 
+def test_push_rejects_a_whitespace_only_submission_id_cleanly(config_path):
+    """Regression for #2179 review: a caller-error submission_id must come
+    back as a clean 'push failed: ...' message via PortalBridgeError, not an
+    uncaught ValueError/traceback — portal_push only catches PortalBridgeError."""
+    result = run("portal", "push", "--config", config_path, "   ", "1", "shipped")
+    assert result.exit_code != 0
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "push failed" in result.output
+    assert "submission_id" in result.output
+
+
 def test_push_reports_rejection_as_failure(config_path, monkeypatch):
     def _post(url, json=None, headers=None, timeout=None):
         class _R:
