@@ -407,6 +407,25 @@ mark_baseline_red() {
     BASELINE_RED_SUITES+=("$1")
 }
 
+# #2170 review (non-blocking): CONTENTS, not lengths. `mark_baseline_red` is
+# only ever called with the literal "python" today, so
+# `${#BASELINE_RED_SUITES[@]} -eq ${#FAILED_SUITES[@]}` happens to be a valid
+# proxy for "every failed suite was confirmed baseline-red" — but only
+# because BASELINE_RED_SUITES can currently never be anything but `()` or
+# `("python")`. If baseline comparison is later extended to the rust/
+# fallback arms, a length-only match could silently misfire on a
+# genuinely-mixed failure set (one suite confirmed baseline-red, a
+# DIFFERENT suite genuinely broken, coincidentally the same count). Compare
+# sorted contents instead so that stays correct regardless of which arms
+# ever call `mark_baseline_red`.
+baseline_red_covers_all_failures() {
+    [[ ${#BASELINE_RED_SUITES[@]} -eq 0 || ${#FAILED_SUITES[@]} -eq 0 ]] && return 1
+    local sorted_failed sorted_baseline_red
+    sorted_failed="$(printf '%s\n' "${FAILED_SUITES[@]}" | sort)"
+    sorted_baseline_red="$(printf '%s\n' "${BASELINE_RED_SUITES[@]}" | sort)"
+    [[ "$sorted_failed" == "$sorted_baseline_red" ]]
+}
+
 # ── toolchain resolution (#1814) ─────────────────────────────────────────────
 #
 # `coord serve` is a systemd USER unit. Its PATH is systemd's
@@ -698,7 +717,7 @@ fi
 # branch, and only when NO suite failed for a branch-attributable reason — a
 # genuinely-broken rust arm alongside a baseline-red python arm is still a
 # branch FAIL, because the branch did break something (#2170).
-if [[ ${#BASELINE_RED_SUITES[@]} -gt 0 && ${#FAILED_SUITES[@]} -eq ${#BASELINE_RED_SUITES[@]} ]]; then
+if baseline_red_covers_all_failures; then
     say "RESULT: BASELINE-RED (${BASELINE_RED_SUITES[*]}) — every failure reproduces on $BASE_REF in this environment; the branch made nothing worse, so this is NOT a branch failure and must not consume a fix attempt"
     exit "$EXIT_BASELINE_RED"
 fi

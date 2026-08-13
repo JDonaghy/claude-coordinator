@@ -1509,6 +1509,118 @@ class TestSmokeCompletionVerdict:
         )
 
 
+class TestSmokeCompletionBaselineRedVerdict(TestSmokeCompletionVerdict):
+    """#2170: a non-zero smoke exit whose worker printed `SMOKE:
+    baseline-red <reason>` (SMOKE_SYSTEM_PROMPT step 4 — every failure
+    reproduces identically on the merge-base) must record test_state=
+    'skipped', not 'failed' — so the merge gate treats it as satisfied and
+    neither `coord fix` nor `coord drive` burns an attempt on breakage the
+    branch did not cause. Subclasses TestSmokeCompletionVerdict to reuse its
+    `_record_work`/`_record_smoke`/`_make_transition_and_entry` helpers."""
+
+    def test_baseline_red_verdict_sets_parent_test_state_skipped(
+        self, coord_db, tmp_path
+    ) -> None:
+        from coord.notify import post_transition  # noqa: PLC0415
+        from coord.state import get_connection  # noqa: PLC0415
+
+        self._record_work("work-4")
+        self._record_smoke("smoke-4", parent_id="work-4")
+        transition, record, entry = self._make_transition_and_entry(
+            "smoke-4", exit_code=4
+        )
+        record = dict(record)
+        record["review_of_assignment_id"] = "work-4"
+
+        log_path = tmp_path / "smoke-4.log"
+        log_path.write_text(
+            "Running tests: scripts/coord-test-runner.sh . --base-ref origin/main\n"
+            "RESULT: BASELINE-RED (python) — every failure reproduces on "
+            "origin/main in this environment\n"
+            "SMOKE: baseline-red all 6 failures reproduce on origin/main\n",
+            encoding="utf-8",
+        )
+        entry = dict(entry)
+        entry["log_path"] = str(log_path)
+
+        with (
+            patch("coord.notify.post_completion"),
+            patch("coord.notify.mark_notified"),
+            patch("coord.notify._capture_cost"),
+            patch("coord.notify._capture_smoke_tests"),
+            patch("coord.notify._capture_completion_summary"),
+            patch("coord.notify._capture_claude_session_id"),
+        ):
+            post_transition(transition, record, entry)
+
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT test_state, smoke_test, test_reason "
+            "FROM assignments WHERE assignment_id=?",
+            ("work-4",),
+        ).fetchone()
+        assert row is not None, "work assignment must exist in DB"
+        assert row["test_state"] == "skipped", (
+            "a baseline-red smoke exit must record test_state='skipped' "
+            f"(not a branch 'failed'), got {row['test_state']!r}"
+        )
+        # `skipped` leaves the legacy smoke_test mirror untouched (matches
+        # `coord test --skipped`'s own convention — see
+        # `_record_test_verdict_local`), so it must NOT be 'fail': that
+        # mirror is what `coord fix` gates on, and gating a fix attempt on
+        # breakage this branch did not cause is exactly what #2170 is about.
+        assert row["smoke_test"] != "fail"
+        assert "baseline-red" in (row["test_reason"] or "").lower()
+        assert "all 6 failures reproduce on origin/main" in row["test_reason"]
+
+    def test_nonzero_exit_without_baseline_red_line_still_fails(
+        self, coord_db, tmp_path
+    ) -> None:
+        """A generic non-zero exit (or a baseline comparison that never ran
+        — e.g. no log to parse) must still land on 'failed', exactly as
+        before #2170 — the skip path requires the agent to have actually
+        said so."""
+        from coord.notify import post_transition  # noqa: PLC0415
+        from coord.state import get_connection  # noqa: PLC0415
+
+        self._record_work("work-5")
+        self._record_smoke("smoke-5", parent_id="work-5")
+        transition, record, entry = self._make_transition_and_entry(
+            "smoke-5", exit_code=1
+        )
+        record = dict(record)
+        record["review_of_assignment_id"] = "work-5"
+
+        log_path = tmp_path / "smoke-5.log"
+        log_path.write_text(
+            "Running tests: pytest\n"
+            "FAILED tests/test_x.py::test_y\n"
+            "SMOKE: fail 1 test failed\n",
+            encoding="utf-8",
+        )
+        entry = dict(entry)
+        entry["log_path"] = str(log_path)
+
+        with (
+            patch("coord.notify.post_completion"),
+            patch("coord.notify.mark_notified"),
+            patch("coord.notify._capture_cost"),
+            patch("coord.notify._capture_smoke_tests"),
+            patch("coord.notify._capture_completion_summary"),
+            patch("coord.notify._capture_claude_session_id"),
+        ):
+            post_transition(transition, record, entry)
+
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT test_state, smoke_test FROM assignments WHERE assignment_id=?",
+            ("work-5",),
+        ).fetchone()
+        assert row is not None, "work assignment must exist in DB"
+        assert row["test_state"] == "failed"
+        assert row["smoke_test"] == "fail"
+
+
 # ── #1176 review: fix-completion → re-review handoff type coverage ─────────
 
 

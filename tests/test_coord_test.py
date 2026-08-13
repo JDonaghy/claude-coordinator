@@ -321,6 +321,83 @@ class TestRestoreDefaultBranch:
         assert "warning" in result.output.lower()
 
 
+# ── #2170: baseline-red is not a branch failure ─────────────────────────────
+
+
+class TestBaselineRedLocalTestCommand:
+    """The bare `coord test <id>` local worktree-prep path (no
+    --passed/--fail/--skipped) runs `test_command` directly and, on
+    failure, nudges the human towards `coord test --fail`. When
+    `test_command` is `scripts/coord-test-runner.sh` and it already
+    confirmed every failure reproduces identically on the merge-base
+    (`RESULT: BASELINE-RED`, exit 4), that nudge is wrong — the branch made
+    nothing worse, so the message must point at `--skipped` instead."""
+
+    @patch("subprocess.run")
+    def test_baseline_red_output_suggests_skipped_not_fail(
+        self, mock_run: MagicMock,
+        config_file: Path, board_with_done: Board, repo_dir: Path,
+        monkeypatch, tmp_path: Path,
+    ) -> None:
+        monkeypatch.setattr(
+            "coord.commands.test_gate._test_worktree_path",
+            lambda aid, repo: tmp_path / f"wt-{aid}",
+        )
+        baseline_red_output = (
+            "Running tests: scripts/coord-test-runner.sh . --base-ref origin/main\n"
+            "RESULT: BASELINE-RED (python) — every failure reproduces on "
+            "origin/main in this environment\n"
+        )
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="", stderr=""),  # git fetch --prune
+            MagicMock(returncode=0, stdout="", stderr=""),  # git worktree add
+            MagicMock(returncode=0, stdout="", stderr=""),  # echo build-ok
+            MagicMock(returncode=4, stdout=baseline_red_output, stderr=None),  # test_command
+        ]
+
+        result = CliRunner().invoke(main, [
+            "test", "abc123", "--config", str(config_file),
+        ])
+
+        assert result.exit_code == 1, result.output
+        assert "BASELINE" in result.output
+        assert "coord test --skipped" in result.output
+        assert "coord test --fail" not in result.output
+
+    @patch("subprocess.run")
+    def test_ordinary_test_failure_still_says_tests_failed(
+        self, mock_run: MagicMock,
+        config_file: Path, board_with_done: Board, repo_dir: Path,
+        monkeypatch, tmp_path: Path,
+    ) -> None:
+        """A genuine branch-caused failure (no `RESULT: BASELINE-RED` line)
+        must NOT be relabelled — the ordinary "Tests failed" message and
+        exit 1 are unchanged."""
+        monkeypatch.setattr(
+            "coord.commands.test_gate._test_worktree_path",
+            lambda aid, repo: tmp_path / f"wt-{aid}",
+        )
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="", stderr=""),  # git fetch --prune
+            MagicMock(returncode=0, stdout="", stderr=""),  # git worktree add
+            MagicMock(returncode=0, stdout="", stderr=""),  # echo build-ok
+            MagicMock(
+                returncode=1,
+                stdout="FAILED tests/test_x.py::test_y\n",
+                stderr=None,
+            ),  # test_command
+        ]
+
+        result = CliRunner().invoke(main, [
+            "test", "abc123", "--config", str(config_file),
+        ])
+
+        assert result.exit_code == 1, result.output
+        assert "Tests failed (exit 1)" in result.output
+        assert "BASELINE" not in result.output
+        assert "coord test --skipped" not in result.output
+
+
 # ── Branch checkout ─────────────────────────────────────────────────────────
 
 

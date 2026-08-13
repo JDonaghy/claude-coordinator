@@ -46,6 +46,17 @@ _SMOKE_NONE_RE = re.compile(
 )
 _SMOKE_BULLET_RE = re.compile(r"^\s*[-*]\s+(.+?)\s*$")
 
+# #2170: the headless Test-stage smoke agent (`coord.smoke.SMOKE_SYSTEM_PROMPT`)
+# prints this line instead of `SMOKE: fail` when the smoke command's own
+# failures reproduce identically on the merge-base — a red BASELINE, not a
+# branch failure. Line-anchored, mirroring `coord.revalidate`'s
+# `is_baseline_red_failure` marker discipline: never a bare substring search,
+# so an unrelated line that merely mentions "SMOKE: baseline-red" mid-sentence
+# doesn't false-positive.
+_SMOKE_BASELINE_RED_RE = re.compile(
+    r"^SMOKE:\s*baseline-red[ \t]*(.*)$", re.MULTILINE | re.IGNORECASE,
+)
+
 
 @dataclass
 class WorkerProgress:
@@ -409,6 +420,112 @@ def parse_completion_summary_from_agent(
         return _extract_completion_summary_from_text("\n".join(decoded))
 
     return _extract_completion_summary_from_text(text)
+
+
+def _extract_smoke_baseline_red_from_text(text: str) -> str | None:
+    """#2170: pull the last `SMOKE: baseline-red <reason>` line out of *text*.
+
+    Returns the reason string (possibly ``""`` if the agent gave none), or
+    ``None`` if no such line is present — the same "None means absent"
+    contract as :func:`_extract_completion_summary_from_text`. Picks the LAST
+    match, matching every other block-extraction parser in this module, in
+    case the agent restates its verdict.
+    """
+    matches = list(_SMOKE_BASELINE_RED_RE.finditer(text))
+    if not matches:
+        return None
+    return matches[-1].group(1).strip()
+
+
+def parse_smoke_baseline_red_from_log(
+    log_path: str | Path, tail_bytes: int = 65_536,
+) -> str | None:
+    """#2170: read the tail of *log_path* and extract a `SMOKE: baseline-red`
+    verdict line, if the worker printed one.
+
+    Handles both stream-json logs (decodes assistant text events first) and
+    legacy plain-text logs, exactly like :func:`parse_smoke_tests_from_log`.
+    """
+    p = Path(log_path)
+    if not p.exists():
+        return None
+
+    from coord.worker_events import is_stream_json  # noqa: PLC0415
+
+    if is_stream_json(p):
+        from coord.worker_events import _assistant_text, parse_event  # noqa: PLC0415
+        texts: list[str] = []
+        try:
+            with open(p, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    event = parse_event(line.rstrip("\n"))
+                    if event is None or event.type != "assistant":
+                        continue
+                    t = _assistant_text(event)
+                    if t:
+                        texts.append(t)
+        except OSError:
+            return None
+        return _extract_smoke_baseline_red_from_text("\n".join(texts))
+
+    try:
+        size = p.stat().st_size
+        with open(p, encoding="utf-8", errors="replace") as f:
+            if size > tail_bytes:
+                f.seek(size - tail_bytes)
+                f.readline()  # skip partial line
+            text = f.read()
+    except OSError:
+        return None
+    return _extract_smoke_baseline_red_from_text(text)
+
+
+def parse_smoke_baseline_red_from_agent(
+    host: str,
+    assignment_id: str,
+    port: int = 7433,
+    timeout: float = 15.0,
+) -> str | None:
+    """#2170: fetch a worker's log via the agent's ``/logs/<id>`` endpoint and
+    extract a `SMOKE: baseline-red` verdict line.
+
+    Use this instead of :func:`parse_smoke_baseline_red_from_log` when the
+    worker ran on a remote agent and the log isn't on the coordinator's local
+    filesystem. Mirrors :func:`parse_smoke_tests_from_agent`.
+    """
+    import httpx  # noqa: PLC0415
+
+    url = f"http://{host}:{port}/logs/{assignment_id}"
+    try:
+        resp = httpx.get(url, timeout=timeout)
+        resp.raise_for_status()
+        text = resp.text
+    except (httpx.HTTPError, httpx.TimeoutException):
+        return None
+    if not text:
+        return None
+
+    stream_json = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        stream_json = stripped.startswith("{")
+        break
+
+    if stream_json:
+        from coord.worker_events import _assistant_text, parse_event  # noqa: PLC0415
+        decoded: list[str] = []
+        for line in text.splitlines():
+            event = parse_event(line.rstrip("\n"))
+            if event is None or event.type != "assistant":
+                continue
+            t = _assistant_text(event)
+            if t:
+                decoded.append(t)
+        return _extract_smoke_baseline_red_from_text("\n".join(decoded))
+
+    return _extract_smoke_baseline_red_from_text(text)
 
 
 def _detect_warnings(progress: WorkerProgress, all_updates: list[str]) -> None:
