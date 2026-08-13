@@ -991,6 +991,154 @@ class TestProcessRealGithubOpsChokepoint:
         assert not [e for e in events if "epic_closing_keyword" in e.kind]
 
 
+class _ExpectedRedGh(FakeGh):
+    """#2164: FakeGh + the API-only surface
+    `coord.acceptance.clear_expected_red_via_pr` needs. Defaults to a
+    single ms-dir manifest mapping issue 1 (the default `_q()` issue
+    number) with one `expected_red` id — enough for the clearing sweep to
+    find something and succeed end-to-end unless a test overrides it.
+    """
+
+    def __init__(self, *, manifest_text: str | None = None, branch_sha: str | None = "cafesha", **kw):
+        super().__init__(**kw)
+        self.manifest_text = manifest_text if manifest_text is not None else (
+            "tests:\n  ms01::a: 1\nexpected_red:\n  1:\n    - ms01::a\n"
+        )
+        self._branch_sha = branch_sha
+        self.update_repo_file_calls: list[tuple[str, str]] = []
+
+    def get_branch_sha(self, repo: str, branch: str) -> str | None:
+        return self._branch_sha
+
+    def list_repo_subdirs(self, repo: str, path: str, branch: str = "develop") -> list[str]:
+        return ["ms01"]
+
+    def get_repo_file_with_sha(self, repo: str, path: str, branch: str = "develop") -> tuple[str, str]:
+        if path != "tests/acceptance/ms01/manifest.yml":
+            raise RuntimeError("not found")
+        return self.manifest_text, "blob-sha"
+
+    def get_default_branch_head(self, repo: str, branch: str) -> str:
+        return "default-tip-sha"
+
+    def create_remote_branch(self, repo: str, branch: str, sha: str) -> bool:
+        return True
+
+    def update_repo_file(
+        self, repo: str, path: str, branch: str, content: str, message: str, *, sha: str,
+    ) -> str:
+        self.update_repo_file_calls.append((path, content))
+        return "new-sha"
+
+
+class TestExpectedRedClearOnMerge:
+    """#2164 review (blocking finding 1): clearing `expected_red` must wait
+    for the fix's own PR to actually merge into the default branch, not
+    fire at `coord acceptance record` time. `process()` calls
+    `coord.acceptance.clear_expected_red_via_pr` right after `gh_ops.
+    merge_pr` succeeds for a `type="work"` entry whose acceptance was
+    recorded "passed" against the exact SHA that merged."""
+
+    @staticmethod
+    def _board(active=None, completed=None):
+        from coord.models import Board
+        return Board(active=list(active or []), completed=list(completed or []))
+
+    @staticmethod
+    def _work(aid: str = "w1", *, acceptance_state=None, acceptance_sha=None) -> Assignment:
+        return Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id=aid, type="work", status="done", branch=f"worker/{aid}",
+            acceptance_state=acceptance_state, acceptance_sha=acceptance_sha,
+        )
+
+    def test_clears_expected_red_after_a_passed_acceptance_merges(self) -> None:
+        work = self._work("w1", acceptance_state="passed", acceptance_sha="cafesha")
+        board = self._board(completed=[work])
+        gh = _ExpectedRedGh()
+
+        events = process([_q("w1", size=10)], gh, board=board)
+
+        assert events[-1].kind == "expected_red_clear"
+        assert "ms01::a" in events[-1].message
+        assert gh.update_repo_file_calls  # the manifest text was actually edited
+        assert "expected_red" not in gh.update_repo_file_calls[0][1]
+
+    def test_no_op_when_acceptance_was_never_recorded(self) -> None:
+        work = self._work("w1")  # acceptance_state=None
+        board = self._board(completed=[work])
+        gh = _ExpectedRedGh()
+
+        events = process([_q("w1", size=10)], gh, board=board)
+
+        assert not [e for e in events if e.kind.startswith("expected_red_clear")]
+        assert not gh.update_repo_file_calls
+
+    def test_no_op_when_acceptance_failed(self) -> None:
+        work = self._work("w1", acceptance_state="failed", acceptance_sha="cafesha")
+        board = self._board(completed=[work])
+        gh = _ExpectedRedGh()
+
+        events = process([_q("w1", size=10)], gh, board=board)
+
+        assert not [e for e in events if e.kind.startswith("expected_red_clear")]
+
+    def test_skips_and_warns_when_acceptance_sha_is_stale(self) -> None:
+        """The recorded verdict is for a different commit than what just
+        merged (branch moved after the last `record`) — must not clear on
+        a stale observation."""
+        work = self._work("w1", acceptance_state="passed", acceptance_sha="an-old-sha")
+        board = self._board(completed=[work])
+        gh = _ExpectedRedGh(branch_sha="cafesha")  # branch_head_sha != acceptance_sha
+
+        events = process([_q("w1", size=10)], gh, board=board)
+
+        assert events[-1].kind == "expected_red_clear_skipped"
+        assert not gh.update_repo_file_calls
+
+    def test_mock_author_entries_never_trigger_a_clear(self) -> None:
+        """`assignment_type="mock-author"` doesn't close an issue at all
+        (#1077) — issue_number there is the milestone tracking issue, not
+        a fix; must never attempt an expected_red clear for it."""
+        board = self._board(completed=[
+            self._work("w1", acceptance_state="passed", acceptance_sha="cafesha"),
+        ])
+        gh = _ExpectedRedGh()
+
+        events = process([_q("w1", size=10, assignment_type="mock-author")], gh, board=board)
+
+        assert not [e for e in events if e.kind.startswith("expected_red_clear")]
+
+    def test_no_board_is_a_no_op(self) -> None:
+        """board=None (a caller that can't supply one) must not crash —
+        best-effort, same posture as every other lookup in this sweep."""
+        gh = _ExpectedRedGh()
+        events = process([_q("w1", size=10)], gh, board=None)
+        assert not [e for e in events if e.kind.startswith("expected_red_clear")]
+
+    def test_gh_ops_lacking_the_api_surface_degrades_to_a_warning(self) -> None:
+        """An older GhOps stub (predates #2164) that doesn't implement the
+        new API-only methods must not crash process() — degrades to a
+        'not supported' message, same optional-attribute convention as
+        `branch_has_merge_commit`/`find_pr_for_branch`."""
+        work = self._work("w1", acceptance_state="passed", acceptance_sha="cafesha")
+        board = self._board(completed=[work])
+
+        class _PlainFakeGh(FakeGh):
+            def get_branch_sha(self, repo: str, branch: str) -> str | None:
+                return "cafesha"
+
+        events = process([_q("w1", size=10)], _PlainFakeGh(), board=board)
+
+        # Must not crash `process()` — degrades to a harmless "found
+        # nothing" event rather than an AttributeError, same fail-soft
+        # posture the rest of the sweep uses when the API surface is
+        # missing (`find_ms_manifest_for_issue_via_api` itself degrades to
+        # "nothing found" for the same reason).
+        assert events[-1].kind == "expected_red_clear"
+        assert events[-1].entry.state == MERGED
+
+
 class TestReviewGate:
     """#253: process() must refuse to merge when reviews are required and
     no approved review is on the board.

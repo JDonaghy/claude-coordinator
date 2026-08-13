@@ -17,10 +17,13 @@ from coord.acceptance import (
     build_verdict,
     bug_contract_path,
     clear_expected_red_entries,
+    clear_expected_red_via_pr,
     dump_manifest_error_hint,
     expected_red_failure_summary,
     failure_summary,
+    find_ms_manifest_for_issue_via_api,
     issue_dirname,
+    list_expected_red_via_api,
     load_expected_red,
     load_manifest,
     ms_dir_for_issue,
@@ -318,6 +321,24 @@ class TestApplyExpectedRed:
         result = apply_expected_red(verdict, {"a"})
         assert result["ci_green"] is False
 
+    def test_expected_red_id_that_never_ran_is_a_hard_failure(self) -> None:
+        """#2164 review (non-blocking finding): an expected_red-listed
+        test-id that vanishes from the driver's output entirely (broken
+        entry point, deleted test) is neither a pass nor a fail — must
+        still fail ci_green rather than silently not counting toward
+        anything, mirroring `_scoped_verdict`'s own `missing_ids`."""
+        verdict = build_verdict(
+            [{"id": "still_here", "status": "pass"}], scope="all",
+        )
+        result = apply_expected_red(verdict, {"still_here", "vanished_test"})
+        assert result["missing_expected_red_ids"] == ["vanished_test"]
+        assert result["ci_green"] is False
+
+    def test_no_missing_ids_when_all_expected_red_ids_ran(self) -> None:
+        verdict = build_verdict([{"id": "a", "status": "fail"}], scope="all")
+        result = apply_expected_red(verdict, {"a"})
+        assert result["missing_expected_red_ids"] == []
+
 
 class TestExpectedRedFailureSummary:
     def test_empty_when_no_unexpected_green(self) -> None:
@@ -419,6 +440,153 @@ class TestClearExpectedRedEntries:
 
     def test_untouched_when_manifest_has_no_expected_red_block(self) -> None:
         assert clear_expected_red_entries("tests:\n  a: 1\n", 1, {"a"}) is None
+
+
+class _FakeApiGhOps:
+    """Stub for the GitHub-API-only surface #2164's post-merge clearing
+    sweep needs — no `gh` subprocess, no local checkout. Mirrors
+    `coord.merge_queue.GhOps`'s "optional attribute" test-stub convention:
+    a test that wants to exercise the "gh_ops doesn't support this" path
+    can just not define one of these methods."""
+
+    def __init__(self, files: dict[str, str], subdirs: list[str] | None = None):
+        # path -> text. sha is derived deterministically from the path so
+        # assertions can check it without extra bookkeeping.
+        self.files = dict(files)
+        self.subdirs = subdirs if subdirs is not None else sorted({
+            p.split("/")[2] for p in files if p.startswith("tests/acceptance/")
+        })
+        self.default_branch_head = "base-sha"
+        self.created_branches: list[tuple[str, str]] = []
+        self.updated_files: list[tuple[str, str, str]] = []  # (path, branch, content)
+        self.created_prs: list[dict] = []
+        self.merge_results: dict[int, tuple[bool, str]] = {}
+        self._next_pr = 500
+
+    def list_repo_subdirs(self, repo: str, path: str, branch: str = "develop") -> list[str]:
+        return list(self.subdirs)
+
+    def get_repo_file_with_sha(self, repo: str, path: str, branch: str = "develop") -> tuple[str, str]:
+        if path not in self.files:
+            raise RuntimeError(f"not found: {path}")
+        return self.files[path], f"sha-{path}"
+
+    def get_default_branch_head(self, repo: str, branch: str) -> str:
+        return self.default_branch_head
+
+    def create_remote_branch(self, repo: str, branch: str, sha: str) -> bool:
+        self.created_branches.append((branch, sha))
+        return True
+
+    def update_repo_file(
+        self, repo: str, path: str, branch: str, content: str, message: str, *, sha: str,
+    ) -> str:
+        self.updated_files.append((path, branch, content))
+        self.files[path] = content
+        return "new-commit-sha"
+
+    def create_pr(self, repo: str, *, base: str, head: str, title: str, body: str) -> dict:
+        pr = {"number": self._next_pr, "url": f"https://gh/x/{self._next_pr}"}
+        self._next_pr += 1
+        self.created_prs.append({"base": base, "head": head, "title": title, "body": body, **pr})
+        return pr
+
+    def merge_pr(self, repo: str, number: int, method: str = "rebase") -> tuple[bool, str]:
+        return self.merge_results.get(number, (True, "merged"))
+
+
+MS01_MANIFEST = (
+    "tests:\n  ms01::a: 944\n  ms01::b: 944\n"
+    "expected_red:\n  944:\n    - ms01::a\n"
+)
+
+
+class TestFindMsManifestForIssueViaApi:
+    def test_finds_the_manifest_mapping_the_issue(self) -> None:
+        ops = _FakeApiGhOps({"tests/acceptance/ms01/manifest.yml": MS01_MANIFEST})
+        found = find_ms_manifest_for_issue_via_api("acme/x", "main", 944, gh_ops=ops)
+        assert found is not None
+        path, text, blob_sha, data = found
+        assert path == "tests/acceptance/ms01/manifest.yml"
+        assert data.expected_red == {944: frozenset({"ms01::a"})}
+
+    def test_none_when_no_manifest_maps_the_issue(self) -> None:
+        ops = _FakeApiGhOps({"tests/acceptance/ms01/manifest.yml": MS01_MANIFEST})
+        assert find_ms_manifest_for_issue_via_api("acme/x", "main", 12345, gh_ops=ops) is None
+
+    def test_none_when_gh_ops_lacks_the_api_methods(self) -> None:
+        class Bare:
+            pass
+
+        assert find_ms_manifest_for_issue_via_api("acme/x", "main", 944, gh_ops=Bare()) is None
+
+
+class TestListExpectedRedViaApi:
+    def test_merges_across_ms_dirs(self) -> None:
+        ops = _FakeApiGhOps({
+            "tests/acceptance/ms01/manifest.yml": MS01_MANIFEST,
+            "tests/acceptance/ms02/manifest.yml": (
+                "tests:\n  ms02::z: 945\nexpected_red:\n  945:\n    - ms02::z\n"
+            ),
+        })
+        result = list_expected_red_via_api("acme/x", "main", gh_ops=ops)
+        assert result == {
+            "ms01": {944: frozenset({"ms01::a"})},
+            "ms02": {945: frozenset({"ms02::z"})},
+        }
+
+    def test_empty_when_nothing_expected_red(self) -> None:
+        ops = _FakeApiGhOps({"tests/acceptance/ms01/manifest.yml": "tests:\n  a: 1\n"})
+        assert list_expected_red_via_api("acme/x", "main", gh_ops=ops) == {}
+
+
+class TestClearExpectedRedViaPr:
+    """#2164 review fix: clearing now goes through a real PR
+    (create_pr + merge_pr), fired post-merge — never a raw push at
+    record-time. See coord.merge_queue's TestExpectedRedClearOnMerge for
+    the caller side."""
+
+    def test_happy_path_opens_and_merges_a_clearing_pr(self) -> None:
+        ops = _FakeApiGhOps({"tests/acceptance/ms01/manifest.yml": MS01_MANIFEST})
+        msg = clear_expected_red_via_pr("acme/x", "coord-tui", "main", 944, gh_ops=ops)
+        assert "cleared expected_red for #944: ms01::a" in msg
+        assert ops.created_branches  # a throwaway branch was created off the default tip
+        assert ops.created_branches[0][1] == "base-sha"
+        [update] = ops.updated_files
+        path, branch, content = update
+        assert path == "tests/acceptance/ms01/manifest.yml"
+        assert "expected_red" not in content
+        assert ops.created_prs and ops.created_prs[0]["base"] == "main"
+
+    def test_no_entries_is_a_no_op(self) -> None:
+        ops = _FakeApiGhOps({"tests/acceptance/ms01/manifest.yml": "tests:\n  a: 944\n"})
+        msg = clear_expected_red_via_pr("acme/x", "coord-tui", "main", 944, gh_ops=ops)
+        assert "no expected_red" in msg
+        assert not ops.created_prs
+
+    def test_json_manifest_is_declined_with_an_explicit_warning(self) -> None:
+        import json as _json
+
+        ops = _FakeApiGhOps({
+            "tests/acceptance/ms01/manifest.json": _json.dumps(
+                {"tests": {"ms01::a": 944}, "expected_red": {"944": ["ms01::a"]}}
+            ),
+        })
+        msg = clear_expected_red_via_pr("acme/x", "coord-tui", "main", 944, gh_ops=ops)
+        assert "warning" in msg and "JSON" in msg
+        assert not ops.created_prs
+
+    def test_pr_that_does_not_merge_reports_a_retry_warning(self) -> None:
+        ops = _FakeApiGhOps({"tests/acceptance/ms01/manifest.yml": MS01_MANIFEST})
+        ops.merge_results[500] = (False, "required check pending")
+        msg = clear_expected_red_via_pr("acme/x", "coord-tui", "main", 944, gh_ops=ops)
+        assert "did not merge" in msg
+        assert "retry" in msg
+
+    def test_no_manifest_found_at_all(self) -> None:
+        ops = _FakeApiGhOps({})
+        msg = clear_expected_red_via_pr("acme/x", "coord-tui", "main", 944, gh_ops=ops)
+        assert "no expected_red entries found" in msg
 
 
 class TestOracleLoopContractBlock:

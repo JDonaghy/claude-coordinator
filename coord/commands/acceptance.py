@@ -37,14 +37,13 @@ from coord.acceptance import (
     acceptance_capability_gap,
     apply_expected_red,
     build_verdict,
-    clear_expected_red_entries,
     dump_manifest_error_hint,
     expected_red_failure_summary,
     failure_summary,
+    list_expected_red_via_api,
     load_expected_red,
     load_manifest,
     ms_dir_for_issue,
-    parse_manifest_text,
     test_ids_for_issue,
 )
 from coord.acceptance_drivers import DriverError, run_driver
@@ -312,6 +311,18 @@ def acceptance_run(
                 f"\n{len(verdict['expected_red_still_red'])} test(s) failed as "
                 "expected (listed in `expected_red`) — not a CI failure: "
                 f"{', '.join(verdict['expected_red_still_red'])}",
+                err=True,
+            )
+        if verdict.get("missing_expected_red_ids"):
+            click.echo(
+                f"\nHARD FAILURE: {len(verdict['missing_expected_red_ids'])} "
+                "test-id(s) listed in `expected_red` never appeared in the "
+                "driver output at all: "
+                f"{', '.join(verdict['missing_expected_red_ids'])}. Neither "
+                "a pass nor a fail was observed — the entry point may be "
+                "broken or the test deleted. This is NOT the same as an "
+                "ordinary failure; investigate before assuming the slice "
+                "is fine.",
                 err=True,
             )
         if not verdict["ci_green"]:
@@ -620,6 +631,53 @@ def acceptance_record(
     _acceptance_record_local(repo, issue_number, sha, config_path, route_path)
 
 
+@acceptance_group.command(
+    "expected-red",
+    help=(
+        "#2164 acceptance criterion 4: list every `expected_red:` entry "
+        "currently live on REPO's default branch, via the GitHub API — no "
+        "local checkout required. Flags an issue whose GitHub state is "
+        "already CLOSED but still carries entries as STUCK: the clearing "
+        "PR (coord.acceptance.clear_expected_red_via_pr, fired from `coord "
+        "merge` right after that issue's fix merges) may have failed, or "
+        "the fix landed by some other path. A long-lived expected_red "
+        "entry is exactly the invisible debt this command exists to "
+        "surface."
+    ),
+)
+@click.argument("repo")
+@_CONFIG_OPTION
+def acceptance_expected_red(repo: str, config_path: Path) -> None:
+    cfg = _load_config(config_path)
+    repo_entry = cfg.repo(repo)
+    if repo_entry is None:
+        click.echo(f"error: unknown repo {repo!r}", err=True)
+        sys.exit(2)
+
+    by_ms = list_expected_red_via_api(repo_entry.github, repo_entry.default_branch)
+    if not by_ms:
+        click.echo(f"no expected_red entries on {repo}@{repo_entry.default_branch}.")
+        return
+
+    total = 0
+    for ms, by_issue in sorted(by_ms.items()):
+        click.echo(f"{ms}:")
+        for issue_number, ids in sorted(by_issue.items()):
+            total += len(ids)
+            closed_note = ""
+            try:
+                issue_data = github_ops.get_issue(repo_entry.github, issue_number)
+                if str((issue_data or {}).get("state", "")).lower() == "closed":
+                    closed_note = "  [STUCK: issue is closed but entries remain]"
+            except Exception:  # noqa: BLE001 — a lookup hiccup shouldn't hide the entry itself
+                pass
+            click.echo(
+                f"  #{issue_number}: {', '.join(sorted(ids))}{closed_note}"
+            )
+    click.echo(f"\n{total} expected_red test-id(s) across "
+               f"{sum(len(v) for v in by_ms.values())} issue(s).")
+
+
 def _acceptance_record_local(
     repo: str,
     issue_number: int,
@@ -738,134 +796,24 @@ def _acceptance_record_local(
     click.echo(f"\nAcceptance {acceptance_state.upper()} for {repo} #{issue_number} @ {sha}")
 
     if acceptance_state == "passed":
-        # #2164: the trust gate just observed this slice green externally —
-        # clear any of its expected_red entries on the default branch.
-        _clear_expected_red_after_record(cfg, repo, repo_dir, ms, issue_number, verdict)
+        # #2164 review: clearing expected_red here (before Test/Review/the
+        # actual merge to the default branch have happened) was the bug —
+        # it could reopen "red default branch" for reasons unrelated to
+        # whatever CI run next observed this issue's still-unmerged fix.
+        # The clear now happens in `coord.merge_queue.process`, right after
+        # this SHA's PR actually merges — see
+        # `coord.acceptance.clear_expected_red_via_pr`'s docstring. Nothing
+        # to do here beyond pointing the operator at how to check.
+        if ms is not None:
+            click.echo(
+                f"  note: any expected_red entries for #{issue_number} clear "
+                f"automatically once its fix merges — see `coord acceptance "
+                f"expected-red {repo}` to check current state."
+            )
         _remove_acceptance_worktree(repo_dir, wt_path)
     else:
         click.echo(f"  worktree kept for inspection: {wt_path}")
         sys.exit(1)
-
-
-def _git_commit_with_fallback_identity(cwd: Path, *commit_args: str) -> subprocess.CompletedProcess:
-    """``git commit`` *commit_args*, retrying once with a ``-c``-scoped
-    fallback identity if the plain attempt fails (most likely: no committer
-    identity configured on this host). Mirrors
-    ``coord.agent.WorkerManager``'s own fallback-identity retry — `-c`
-    overrides only this invocation, it never touches repo config, so this
-    can never clobber an operator's own configured git identity."""
-    res = subprocess.run(
-        ["git", "commit", *commit_args], cwd=str(cwd), capture_output=True, text=True,
-    )
-    if res.returncode == 0:
-        return res
-    return subprocess.run(
-        [
-            "git", "-c", "user.name=coord", "-c", "user.email=coord@localhost",
-            "commit", *commit_args,
-        ],
-        cwd=str(cwd), capture_output=True, text=True,
-    )
-
-
-def _clear_expected_red_after_record(
-    cfg, repo: str, repo_dir: Path, ms: str | None, issue_number: int, verdict: dict,
-) -> None:
-    """#2164 trust-gate clearing: after an external ``coord acceptance
-    record`` GREEN, drop any of *issue_number*'s now-passing test-ids from
-    that ms-NN manifest's ``expected_red:`` registry — on the DEFAULT
-    branch, never the fix's own branch (a worker's checkout carries the
-    same sealed manifest untouched, since it may never edit
-    ``tests/acceptance/**`` — editing there would do nothing on the branch
-    that's about to merge). This is an *observation* the coordinator makes
-    externally, matching ``docs/ORACLE_LOOP.md``'s sealing posture: no
-    worker-side edit to the sealed suite is ever required or possible.
-
-    Best-effort / non-fatal by design: this is bookkeeping layered on top
-    of an already-successfully-recorded verdict, not the trust gate itself
-    — any failure here is a warning, never a reason to fail ``record``.
-    """
-    if ms is None:
-        return
-    passing_ids = {
-        t["id"] for t in verdict.get("tests", []) if t.get("status") == "pass"
-    }
-    if not passing_ids:
-        return
-
-    repo_entry = cfg.repo(repo)
-    default_branch = (
-        (getattr(repo_entry, "default_branch", None) or "main") if repo_entry else "main"
-    )
-
-    clear_wt = _acceptance_worktree_path(repo, issue_number).parent / (
-        f"{repo}-{issue_number}-clear-expected-red"
-    )
-    _remove_acceptance_worktree(repo_dir, clear_wt)
-    add_res = subprocess.run(
-        [
-            "git", "worktree", "add", "--force", "--detach", str(clear_wt),
-            f"origin/{default_branch}",
-        ],
-        cwd=str(repo_dir), capture_output=True, text=True,
-    )
-    if add_res.returncode != 0:
-        click.echo(
-            f"warning: could not check origin/{default_branch} for "
-            f"expected_red entries to clear: {add_res.stderr.strip()}",
-            err=True,
-        )
-        return
-
-    try:
-        manifest_path = clear_wt / ACCEPTANCE_DIRNAME / ms / "manifest.yml"
-        if not manifest_path.exists():
-            return  # manifest.json, or this ms-NN carries no expected_red at all.
-
-        text = manifest_path.read_text()
-        data = parse_manifest_text(text, source=str(manifest_path))
-        cleared = data.expected_red.get(issue_number, frozenset()) & passing_ids
-        if not cleared:
-            return
-
-        new_text = clear_expected_red_entries(text, issue_number, cleared)
-        if new_text is None:
-            return
-        manifest_path.write_text(new_text)
-
-        rel = str(manifest_path.relative_to(clear_wt))
-        subprocess.run(["git", "add", rel], cwd=str(clear_wt), check=True, capture_output=True, text=True)
-        commit_res = _git_commit_with_fallback_identity(
-            clear_wt, "-m",
-            f"coord acceptance: clear expected_red for {repo} #{issue_number} "
-            f"({', '.join(sorted(cleared))})",
-        )
-        if commit_res.returncode != 0:
-            click.echo(
-                f"warning: could not commit expected_red clear: {commit_res.stderr.strip()}",
-                err=True,
-            )
-            return
-
-        push_res = subprocess.run(
-            ["git", "push", "origin", f"HEAD:{default_branch}"],
-            cwd=str(clear_wt), capture_output=True, text=True,
-        )
-        if push_res.returncode != 0:
-            click.echo(
-                f"warning: expected_red cleared locally but the push to "
-                f"origin/{default_branch} failed — will retry on the next "
-                f"green record ({push_res.stderr.strip()})",
-                err=True,
-            )
-            return
-
-        click.echo(
-            f"cleared expected_red for {repo} #{issue_number}: "
-            f"{', '.join(sorted(cleared))} (pushed to {default_branch})"
-        )
-    finally:
-        _remove_acceptance_worktree(repo_dir, clear_wt)
 
 
 def _stall_push_wip_snapshot(cwd: Path) -> str:

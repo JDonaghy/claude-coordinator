@@ -2294,6 +2294,58 @@ class GhOps(Protocol):
         """
         ...
 
+    def get_default_branch_head(self, repo: str, branch: str) -> str:
+        """Return the full commit SHA at the tip of *branch*.
+
+        #2164: used by ``coord.acceptance.clear_expected_red_via_pr`` (the
+        post-merge ``expected_red`` clearing sweep, fired from
+        :func:`process` right after a `work` entry merges) to anchor the
+        throwaway clearing branch at the default branch's current tip.
+        Optional on stub ``GhOps`` implementations — same contract as
+        :meth:`branch_has_merge_commit`.
+        """
+        ...
+
+    def create_remote_branch(self, repo: str, branch: str, sha: str) -> bool:
+        """Create ``refs/heads/{branch}`` pointing at *sha*. Returns True on
+        success, False on failure (including "already exists").
+
+        #2164, same clearing sweep as :meth:`get_default_branch_head`.
+        Optional on stub ``GhOps`` implementations.
+        """
+        ...
+
+    def get_repo_file_with_sha(self, repo: str, path: str, branch: str = "develop") -> tuple[str, str]:
+        """Return (*content*, *blob_sha*) for *path* on *branch*.
+
+        #2164, same clearing sweep — also used to enumerate/read
+        ``tests/acceptance/ms-*/manifest.*`` without a local checkout, since
+        :func:`process` never assumes one exists (this is a pure ``gh``-API
+        wire layer, see the module docstring). Optional on stub ``GhOps``
+        implementations.
+        """
+        ...
+
+    def update_repo_file(
+        self, repo: str, path: str, branch: str, content: str, message: str, *, sha: str,
+    ) -> str:
+        """Commit *content* to *path* on *branch* via the Contents API.
+        Returns the new commit sha.
+
+        #2164, same clearing sweep. Optional on stub ``GhOps``
+        implementations.
+        """
+        ...
+
+    def list_repo_subdirs(self, repo: str, path: str, branch: str = "develop") -> list[str]:
+        """Directory names directly under *path* on *branch*.
+
+        #2164, same clearing sweep — enumerates ``tests/acceptance/ms-*/``
+        to find the manifest that maps a given issue. Optional on stub
+        ``GhOps`` implementations.
+        """
+        ...
+
 
 def live_gate_entry(
     a: Assignment,
@@ -3737,6 +3789,70 @@ def _briefing_body(entry: QueuedMerge) -> str:
     )
 
 
+def _work_assignment_for_entry(entry: QueuedMerge, board) -> Assignment | None:
+    """The ``type="work"`` :class:`Assignment` behind *entry*, or ``None``.
+
+    Thin lookup used by :func:`_maybe_clear_expected_red` to read the
+    acceptance verdict (``acceptance_state``/``acceptance_sha``) recorded
+    by ``coord acceptance record`` for this merge's originating work
+    assignment. Scans both ``board.active`` and ``board.completed`` — same
+    rationale as :func:`scan_approved_reviews`: by the time ``process()``
+    reaches the merge-success path the row may still be on ``active`` for a
+    tick before reconcile moves it.
+    """
+    if board is None:
+        return None
+    pool = list(getattr(board, "completed", []) or []) + list(getattr(board, "active", []) or [])
+    for a in pool:
+        if getattr(a, "assignment_id", None) == entry.assignment_id and getattr(a, "type", None) == "work":
+            return a
+    return None
+
+
+def _maybe_clear_expected_red(entry: QueuedMerge, board, gh_ops: GhOps) -> MergeEvent | None:
+    """#2164: right after *entry*'s PR has actually merged into
+    ``entry.target_branch``, clear any of its issue's ``expected_red``
+    entries that the trust gate (``coord acceptance record``) already
+    observed green — this is the ordering event the first cut of #2164 got
+    wrong (clearing at record-time, before the merge that's the whole
+    point had actually happened; see ``coord.acceptance.
+    clear_expected_red_via_pr``'s docstring). Returns ``None`` when there
+    is nothing to do (not a `work` entry, no recorded acceptance, or no
+    acceptance verdict at all — the overwhelmingly common case), else a
+    ``MergeEvent`` describing what happened. Never raises — every failure
+    mode inside ``clear_expected_red_via_pr`` degrades to a message, and
+    this wrapper's own lookups are read-only/best-effort.
+    """
+    if entry.assignment_type not in CLOSES_ISSUE_TYPES:
+        return None
+    work = _work_assignment_for_entry(entry, board)
+    if work is None or getattr(work, "acceptance_state", None) != "passed":
+        return None
+    acceptance_sha = getattr(work, "acceptance_sha", None)
+    if acceptance_sha is None or acceptance_sha != entry.branch_head_sha:
+        # The recorded trust-gate verdict isn't for the exact commit that
+        # just merged (acceptance never ran, or new commits landed after
+        # the last `record`) — skip rather than clear on a stale
+        # observation. Will pick back up once `record` runs again for the
+        # fresh SHA and this issue's fix merges again... though ordinarily
+        # a merge only happens once per issue, so a mismatch here more
+        # likely means acceptance was simply never recorded for this SHA.
+        return MergeEvent(
+            entry, "expected_red_clear_skipped",
+            "acceptance_sha does not match the merged commit — skipping "
+            "expected_red clear (re-run `coord acceptance record` against "
+            "the merged SHA if entries should have cleared)",
+        )
+
+    from coord.acceptance import clear_expected_red_via_pr  # noqa: PLC0415
+
+    msg = clear_expected_red_via_pr(
+        entry.repo_github, entry.repo_name, entry.target_branch, entry.issue_number,
+        gh_ops=gh_ops,
+    )
+    return MergeEvent(entry, "expected_red_clear", msg)
+
+
 def process(
     items: list[QueuedMerge],
     gh_ops: GhOps,
@@ -4590,6 +4706,17 @@ def process(
                         f"left open (assignment type {entry.assignment_type!r} "
                         f"does not close its tracking issue, #1077){bypass_note}",
                     ))
+                # #2164: the fix just landed on the default branch — the
+                # ordering event `expected_red` clearing must wait for
+                # (never `coord acceptance record` time, which can run long
+                # before Test/Review/this merge actually happen). Best
+                # effort, never blocks or fails the merge itself.
+                try:
+                    clear_event = _maybe_clear_expected_red(entry, board, gh_ops)
+                except Exception as e:  # noqa: BLE001 — bookkeeping, never undoes a real merge
+                    clear_event = MergeEvent(entry, "expected_red_clear_failed", str(e))
+                if clear_event is not None:
+                    events.append(clear_event)
                 continue
             entry.state = CONFLICT
             entry.error = msg
