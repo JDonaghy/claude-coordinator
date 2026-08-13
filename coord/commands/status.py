@@ -130,13 +130,21 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
     # render "PAUSED" for a machine nobody paused and no `coord unpause` will
     # free — work stopping with no stated reason, which is the exact failure
     # the cordon mechanism is supposed to stop repeating.
+    # #2146: an operator-SET quiet-hours window lives in the daemon's state
+    # file, not in coordinator.yml, so a thin client resolving it locally
+    # would see the machine in `paused` with no local explanation and print
+    # the flatly wrong "PAUSED". Fetch the effective window map (daemon-aware,
+    # fail-soft) and hand it to describe_pause_state, which also names where
+    # each window came from — "set here" vs "from coordinator.yml".
     from coord.machine_pause import (  # noqa: PLC0415
         cordons as fetch_cordons,
         describe_pause_state,
+        effective_quiet_hours,
         paused_set,
     )
     paused = paused_set(cfg.machines)
     cordons = fetch_cordons()
+    quiet_windows = effective_quiet_hours(cfg.machines)
 
     statuses = check_all(machines, timeout=timeout)
     agent_completed: dict[str, dict] = {}
@@ -196,7 +204,9 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
         # pause — an operator debugging a stalled queue at 1AM needs to
         # know whether the machine will wake itself up or is waiting on
         # `coord unpause`.
-        pause_state = describe_pause_state(m, paused, cordons=cordons)
+        pause_state = describe_pause_state(
+            m, paused, cordons=cordons, quiet_hours=quiet_windows
+        )
         if pause_state is not None and pause_state.kind == "cordon":
             # #2101 trap E: name the version it is draining for, so a stopped
             # machine reads as "the fleet is upgrading itself" rather than as
