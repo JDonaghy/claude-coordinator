@@ -23,6 +23,8 @@ Covers:
 
 from __future__ import annotations
 
+import pytest
+
 from coord.agent import (
     WORKER_SYSTEM_PROMPT,
     AssignmentSpec,
@@ -122,10 +124,11 @@ def test_default_worker_command_grants_monitor_for_work_type() -> None:
         assert tool in allowed.split(",")
 
 
-def test_default_worker_command_review_type_also_gets_monitor() -> None:
-    """`review`/`fix`/`smoke`/etc. all fall through the same `else` branch as
-    `work` — confirm the grant isn't accidentally work-only."""
-    argv = default_worker_command(_work_spec(type="fix"))
+@pytest.mark.parametrize("spec_type", ["review", "fix", "smoke", "conflict-fix"])
+def test_default_worker_command_other_write_types_also_get_monitor(spec_type: str) -> None:
+    """`review`/`fix`/`smoke`/`conflict-fix` all fall through the same `else`
+    branch as `work` — confirm the grant isn't accidentally work-only."""
+    argv = default_worker_command(_work_spec(type=spec_type))
     allowed = argv[argv.index("--allowedTools") + 1]
     assert "Monitor" in allowed.split(",")
 
