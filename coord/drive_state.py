@@ -84,6 +84,20 @@ class IssueState:
     work_review_iter: int = 0
     work_exit_code: int | None = None
     work_failure_reason: str = ""
+    # #2199: the trust-gate verdict `coord acceptance record --issue N --sha
+    # <sha>` writes onto THIS issue's own `work` row (see `coord.state.
+    # record_acceptance_verdict` — the same field `coord.merge_queue.
+    # _maybe_clear_expected_red` already reads via `getattr(work,
+    # "acceptance_state", None)`). "" | "passed" | "failed" — "" means no
+    # verdict has ever been recorded for this work row, which is exactly
+    # the ambiguity #2199 exists to resolve: nothing used to write this at
+    # all, so it was indistinguishable from "the gate ran and lied clean".
+    # `work_acceptance_sha` is the commit the last verdict was recorded
+    # against — a fresh push (fix round, rebase) invalidates it the same
+    # way `review_head_sha` invalidates a stale review approval.
+    work_acceptance_state: str = ""
+    work_acceptance_reason: str = ""
+    work_acceptance_sha: str = ""
 
     review_aid: str = ""
     review_status: str = ""
@@ -141,6 +155,12 @@ class IssueState:
     # member of any tracked work order — the "normal drive" case.
     milestone_number: int | None = None
     milestone_tracking_issue: int | None = None
+    # #2199: this issue's own GitHub labels — resolved from the same
+    # `/board` `issues` row `milestone_number` is (no extra I/O). Threaded
+    # through so `resolve_oracle_decision` can resolve per-issue
+    # `oracle:exempt`/`manifest.exempt` opt-out for the trust gate
+    # (`AcceptanceGateChecker.is_issue_exempt`) without a second board scan.
+    issue_labels: tuple[str, ...] = ()
 
     # The JIT slice's own `type="test-author"` assignment (#1171: keyed on
     # `for_issue_number == issue`, NOT `issue_number` — that field is the
@@ -224,6 +244,12 @@ class IssueState:
                 self.work_aid,
                 self.work_status,
                 self.work_test_state,
+                # #2199: the trust gate's own verdict is a real transition
+                # the same way work_test_state is — see the docstring above
+                # for why omitting an analogous field mutes the `state:`
+                # log line and fools the stall detector.
+                self.work_acceptance_state,
+                self.work_acceptance_sha,
                 self.work_review_state,
                 self.work_review_iter,
                 self.review_status,
@@ -402,6 +428,9 @@ def project(payload: dict, repo: str, issue: int, config: Any) -> IssueState:
         work_review_iter=int(g(work, "review_iteration", 0) or 0),
         work_exit_code=None if exit_code is None else int(exit_code),
         work_failure_reason=g(work, "failure_reason"),
+        work_acceptance_state=g(work, "acceptance_state"),
+        work_acceptance_reason=g(work, "acceptance_reason"),
+        work_acceptance_sha=g(work, "acceptance_sha"),
         review_aid=g(review, "assignment_id"),
         review_status=g(review, "status"),
         review_verdict=g(review, "review_verdict"),
@@ -421,6 +450,7 @@ def project(payload: dict, repo: str, issue: int, config: Any) -> IssueState:
         picked_machine_no_capable=_machine_pick.no_capable_machine,
         milestone_number=milestone_number,
         milestone_tracking_issue=milestone_tracking_issue,
+        issue_labels=tuple(issue_labels),
         # #2024: the per-issue Test-stage policy, off the labels already read
         # above (no extra I/O). `test_mode_from_labels` is the same function
         # `coord.state._get_issue_test_mode_local` uses, so the driver and the

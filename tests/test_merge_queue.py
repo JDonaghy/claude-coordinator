@@ -1064,24 +1064,34 @@ class TestExpectedRedClearOnMerge:
         assert gh.update_repo_file_calls  # the manifest text was actually edited
         assert "expected_red" not in gh.update_repo_file_calls[0][1]
 
-    def test_no_op_when_acceptance_was_never_recorded(self) -> None:
+    def test_names_the_skip_when_acceptance_was_never_recorded(self) -> None:
+        """#2199: this used to be a silent `return None` — and, before
+        #2199 gave `coord acceptance record` a call site at all, the
+        UNIVERSAL case. A quiet skip here is indistinguishable from a
+        clear that already happened, which is exactly how quadraui#542's
+        `expected_red` entries got stuck permanently red. Must now name
+        the reason instead."""
         work = self._work("w1")  # acceptance_state=None
         board = self._board(completed=[work])
         gh = _ExpectedRedGh()
 
         events = process([_q("w1", size=10)], gh, board=board)
 
-        assert not [e for e in events if e.kind.startswith("expected_red_clear")]
+        assert events[-1].kind == "expected_red_clear_skipped_no_acceptance"
+        assert "acceptance_state=None" in events[-1].message
+        assert "coord acceptance record" in events[-1].message
         assert not gh.update_repo_file_calls
 
-    def test_no_op_when_acceptance_failed(self) -> None:
+    def test_names_the_skip_when_acceptance_failed(self) -> None:
         work = self._work("w1", acceptance_state="failed", acceptance_sha="cafesha")
         board = self._board(completed=[work])
         gh = _ExpectedRedGh()
 
         events = process([_q("w1", size=10)], gh, board=board)
 
-        assert not [e for e in events if e.kind.startswith("expected_red_clear")]
+        assert events[-1].kind == "expected_red_clear_skipped_no_acceptance"
+        assert "acceptance_state='failed'" in events[-1].message
+        assert not gh.update_repo_file_calls
 
     def test_skips_and_warns_when_acceptance_sha_is_stale(self) -> None:
         """The recorded verdict is for a different commit than what just
@@ -1109,12 +1119,13 @@ class TestExpectedRedClearOnMerge:
 
         assert not [e for e in events if e.kind.startswith("expected_red_clear")]
 
-    def test_no_board_is_a_no_op(self) -> None:
+    def test_no_board_names_the_skip_instead_of_crashing(self) -> None:
         """board=None (a caller that can't supply one) must not crash —
-        best-effort, same posture as every other lookup in this sweep."""
+        best-effort, same posture as every other lookup in this sweep —
+        but #2199 still names it rather than staying silent."""
         gh = _ExpectedRedGh()
         events = process([_q("w1", size=10)], gh, board=None)
-        assert not [e for e in events if e.kind.startswith("expected_red_clear")]
+        assert events[-1].kind == "expected_red_clear_skipped_no_work"
 
     def test_gh_ops_lacking_the_api_surface_degrades_to_a_warning(self) -> None:
         """An older GhOps stub (predates #2164) that doesn't implement the

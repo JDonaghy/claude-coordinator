@@ -3817,17 +3817,41 @@ def _maybe_clear_expected_red(entry: QueuedMerge, board, gh_ops: GhOps) -> Merge
     wrong (clearing at record-time, before the merge that's the whole
     point had actually happened; see ``coord.acceptance.
     clear_expected_red_via_pr``'s docstring). Returns ``None`` when there
-    is nothing to do (not a `work` entry, no recorded acceptance, or no
-    acceptance verdict at all — the overwhelmingly common case), else a
-    ``MergeEvent`` describing what happened. Never raises — every failure
-    mode inside ``clear_expected_red_via_pr`` degrades to a message, and
-    this wrapper's own lookups are read-only/best-effort.
+    is nothing to do (not a `work` entry) — every other skip path names
+    itself with its own ``MergeEvent`` (see below), so ``coord merge``
+    output never implies a clear that didn't happen. Never raises — every
+    failure mode inside ``clear_expected_red_via_pr`` degrades to a
+    message, and this wrapper's own lookups are read-only/best-effort.
+
+    #2199 review: before the trust gate had a call site at all
+    (``coord acceptance record`` was never invoked by anything —
+    ``getattr(work, "acceptance_state", None) != "passed"`` was the
+    UNIVERSAL case), this branch returned bare ``None`` — silently. An
+    ``expected_red`` entry could then never clear, indistinguishable from
+    #1965's genuine vacuous-assertion alarm (quadraui#542). Now it names
+    which condition failed instead.
     """
     if entry.assignment_type not in CLOSES_ISSUE_TYPES:
         return None
     work = _work_assignment_for_entry(entry, board)
-    if work is None or getattr(work, "acceptance_state", None) != "passed":
-        return None
+    if work is None:
+        return MergeEvent(
+            entry, "expected_red_clear_skipped_no_work",
+            "no `work` assignment found for this merge entry — cannot read "
+            "an acceptance verdict; skipping expected_red clear",
+        )
+    acceptance_state = getattr(work, "acceptance_state", None)
+    if acceptance_state != "passed":
+        return MergeEvent(
+            entry, "expected_red_clear_skipped_no_acceptance",
+            f"no passing trust-gate verdict recorded on {work.assignment_id} "
+            f"(acceptance_state={acceptance_state!r}) — the external `coord "
+            "acceptance record` re-run either never happened or did not "
+            "pass; skipping expected_red clear. Run `coord acceptance "
+            f"record --repo {entry.repo_name} --issue {entry.issue_number} "
+            "--sha <merged sha>` by hand, or re-drive the issue, to clear "
+            "any listed entries.",
+        )
     acceptance_sha = getattr(work, "acceptance_sha", None)
     if acceptance_sha is None or acceptance_sha != entry.branch_head_sha:
         # The recorded trust-gate verdict isn't for the exact commit that
