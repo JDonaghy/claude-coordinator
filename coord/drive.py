@@ -288,6 +288,16 @@ class DriveCounters:
     # capture deserves its own full budget of cheap waits before the next
     # forced retry.
     gate_wait_rounds: int = 0
+    # #2199: bounded retry for the trust gate's OWN dispatch — distinct from
+    # `fix_rounds` (which bounds "the work needs another round" once a
+    # verdict, passed or failed, actually landed on the board). This counts
+    # attempts where `coord acceptance record` itself never got that far —
+    # a missing local checkout, a driver crash, GitHub unreachable — so a
+    # persistently broken environment reaches a named `_die()` instead of
+    # `coord drive` re-running a full git-worktree + suite invocation every
+    # poll forever. Bounded by `opts.max_work_retries`, the same "how many
+    # times do we retry a flaky infra thing" budget `work_retries` uses.
+    acceptance_gate_attempts: int = 0
     # #2079: a SECOND, independent budget of exactly the same shape, spent
     # only on landing the oracle-mode JIT acceptance slice
     # (`_decide_acceptance_landing`). Separate rather than shared because the
@@ -375,6 +385,14 @@ class AcceptanceGateChecker(Protocol):
 
     def resolve_for_path(self, repo_name: str, milestone_number: int) -> str | None: ...
 
+    def is_issue_exempt(
+        self,
+        repo_name: str,
+        milestone_number: int,
+        issue_number: int,
+        issue_labels: tuple[str, ...],
+    ) -> bool: ...
+
 
 @dataclass
 class GitHubAcceptanceGateChecker:
@@ -412,6 +430,34 @@ class GitHubAcceptanceGateChecker:
             return None
         return resolve_for_path(self.config, repo_cfg, milestone_number)
 
+    def is_issue_exempt(
+        self,
+        repo_name: str,
+        milestone_number: int,
+        issue_number: int,
+        issue_labels: tuple[str, ...],
+    ) -> bool:
+        """#2199: does *issue_number* opt out of the sealed suite — the
+        SAME ``manifest.exempt`` list / ``oracle:exempt`` label the #1138
+        hard gate (:func:`coord.milestone_dispatch.issue_oracle_ready`)
+        already reads. Reused rather than re-derived so the JIT-authoring
+        gate and the #2199 trust gate can never disagree about which
+        issues the oracle loop covers — see that function's own docstring
+        for why ``exempt`` says "doesn't consume the sealed suite" and
+        nothing about Gate A sign-off (already established True by the
+        time :func:`resolve_oracle_decision` calls this).
+        """
+        from coord.milestone_dispatch import issue_oracle_ready  # noqa: PLC0415
+
+        repo_cfg = self.config.repo(repo_name)
+        if repo_cfg is None:
+            return False
+        readiness = issue_oracle_ready(
+            repo_cfg, self.config, milestone_number, issue_number,
+            issue_labels=issue_labels,
+        )
+        return readiness.exempt
+
 
 @dataclass(frozen=True)
 class OracleDecision:
@@ -424,11 +470,23 @@ class OracleDecision:
     to guess which mode a run is in. ``tracking_issue`` is set iff ``active``
     — the argument :func:`_decide_acceptance_author` needs to build ``coord
     acceptance author <repo> <tracking_issue> --issue <N>``.
+
+    #2199: ``issue_exempt`` — resolved alongside ``active`` (same one-shot
+    GitHub fetch budget: ``AcceptanceGateChecker.is_issue_exempt`` reuses the
+    #1138 hard gate's own manifest read) — is *this issue*'s
+    ``manifest.exempt``/``oracle:exempt`` opt-out from the sealed suite.
+    :func:`_decide_acceptance_gate` (the trust gate) skips entirely when
+    this is ``True``: an exempt issue has no authored slice for `coord
+    acceptance record` to re-run, so treating its absence as a red verdict
+    would be exactly the "acquire a new blocking gate it never opted into"
+    regression #2199's acceptance criteria rule out. Always ``False`` when
+    ``active`` is ``False`` — meaningless outside the oracle loop.
     """
 
     active: bool
     reason: str
     tracking_issue: int | None = None
+    issue_exempt: bool = False
 
 
 def resolve_oracle_decision(
@@ -488,6 +546,13 @@ def resolve_oracle_decision(
             f"acceptance mock {state.repo} {state.milestone_tracking_issue}` "
             "first for the oracle loop, docs/ORACLE_LOOP.md)",
         )
+    # #2199: resolved here, alongside everything else `resolve_oracle_decision`
+    # already settles once per run — see `OracleDecision.issue_exempt`'s
+    # docstring for why the trust gate needs this and why it must reuse
+    # (not re-derive) the #1138 hard gate's own exemption check.
+    issue_exempt = gate_checker.is_issue_exempt(
+        state.repo, state.milestone_number, state.issue, state.issue_labels,
+    )
     return OracleDecision(
         True,
         f"ORACLE DRIVE — ms-{state.milestone_number}'s Gate-A contract is "
@@ -496,6 +561,7 @@ def resolve_oracle_decision(
         f"{state.milestone_tracking_issue} --issue {state.issue}`) before "
         "dispatching work",
         tracking_issue=state.milestone_tracking_issue,
+        issue_exempt=issue_exempt,
     )
 
 
@@ -851,11 +917,13 @@ def _acceptance_message(message: str, state: IssueState) -> str:
 
 
 class MergeVerifier(Protocol):
-    """The two git/GitHub questions the state machine cannot answer itself."""
+    """The git/GitHub questions the state machine cannot answer itself."""
 
     def branch_has_commits(self, state: IssueState) -> bool: ...
 
     def verify_merged(self, state: IssueState) -> bool: ...
+
+    def branch_head_sha(self, state: IssueState) -> str | None: ...
 
 
 @dataclass
@@ -964,6 +1032,23 @@ class GitMergeVerifier:
             return not unmerged
         finally:
             self._git(base, "update-ref", "-d", vref)
+
+    def branch_head_sha(self, state: IssueState) -> str | None:
+        """The exact commit `coord acceptance record --sha` (#2199) must be
+        pointed at — the trust gate re-runs the sealed suite against a
+        precise SHA, never a branch name that could move under a slow
+        drive loop. GitHub API, not a local checkout: same reasoning as
+        :meth:`verify_merged`'s primary path — authoritative for every
+        machine this driver might run on, no ``~/src/<repo>`` clone
+        required. Returns ``None`` (never raises) when the branch is gone
+        or GitHub is unreachable; callers treat that as "try again next
+        poll", never as a verdict.
+        """
+        if not state.work_branch or not state.repo_github:
+            return None
+        from coord import github_ops  # noqa: PLC0415
+
+        return github_ops.get_branch_sha(state.repo_github, state.work_branch)
 
 
 # ── preflight (pure) ─────────────────────────────────────────────────────────
@@ -1326,6 +1411,22 @@ def decide(
             _escalate_dead_end(state, dead_end), warnings=warnings
         )
 
+    # #2199: the oracle loop's TRUST GATE — docs/ORACLE_LOOP.md Phase-1 step
+    # 6, right here between the dead-end predicate and the Test gate,
+    # because this is the first point `coord drive` has observed the work
+    # assignment's branch head AFTER push. Before this, nothing ever called
+    # `coord acceptance record`: an issue driven end-to-end by `coord drive`
+    # completed with `acceptance_state = None` forever, so the sealed suite
+    # was never re-run externally and `_maybe_clear_expected_red` could
+    # never clear (quadraui#542).
+    acceptance_gate = _decide_acceptance_gate(
+        state, opts, counters, machine, oracle, verifier
+    )
+    if acceptance_gate is not None:
+        return replace(
+            acceptance_gate, warnings=warnings + acceptance_gate.warnings
+        )
+
     test = _decide_test(state, opts, counters, machine)
     if test is not None:
         return replace(test, warnings=warnings + test.warnings)
@@ -1464,6 +1565,119 @@ def _decide_advisory(
         warnings=(
             "ADVISORY with commits present — proceeding per --accept-advisory (#1357)",
         ),
+    )
+
+
+def _decide_acceptance_gate(
+    state: IssueState,
+    opts: DriveOptions,
+    counters: DriveCounters,
+    machine: str,
+    oracle: OracleDecision | None,
+    verifier: MergeVerifier,
+) -> Action | None:
+    """The #2199 oracle-loop TRUST GATE — ``coord acceptance record --repo
+    R --issue N --sha <pushed sha>``, run by the COORDINATOR (this process,
+    never inside the worker's own session) against the exact commit the
+    work assignment pushed. docs/ORACLE_LOOP.md's Phase-1 step 6, and the
+    reason it exists: a headless worker's in-session "green" claim
+    (``coord acceptance run``, Phase-1 step 5) can lie; it cannot fake the
+    coordinator re-running the sealed suite itself. ``None`` means "not
+    applicable, or already resolved for this SHA — fall through to Test".
+
+    Before #2199 NOTHING ever called this — an issue driven end-to-end by
+    ``coord drive`` completed with ``acceptance_state = None`` forever, so
+    ``coord.merge_queue._maybe_clear_expected_red`` could never clear an
+    ``expected_red`` entry either (quadraui#542, quadraui#492).
+
+    Only fires when ``oracle.active`` (a driver-configured repo, an issue
+    in a milestone whose Gate-A contract is merged — the same condition
+    that gated JIT-slice authoring) AND this issue is not
+    ``oracle.issue_exempt`` (``manifest.exempt`` / the ``oracle:exempt``
+    label — an issue that never consumed the sealed suite has nothing for
+    ``record`` to re-run, so gating on its absence would be a NEW blocking
+    gate an exempt issue never opted into, exactly what #2199's acceptance
+    criteria rule out). Every other issue — no driver, no milestone,
+    ``--no-acceptance`` — passes straight through unchanged.
+    """
+    if oracle is None or not oracle.active or oracle.issue_exempt:
+        return None
+
+    sha = verifier.branch_head_sha(state)
+    if sha is None:
+        # GitHub unreachable or the branch vanished between polls — don't
+        # let a transient lookup block a whole drive run; retry next poll.
+        return _wait(label="ACCEPTANCE: waiting to resolve the pushed SHA")
+
+    if state.work_acceptance_sha == sha:
+        if state.work_acceptance_state == "passed":
+            return None  # trust gate already green for this exact commit
+        if state.work_acceptance_state == "failed":
+            # Same shape as a failed Test verdict (#2199 acceptance: "a
+            # failed trust gate must block, not warn ... at the same place
+            # a failed Test verdict does") — a bounded fix-round retry,
+            # sharing the ONE fix budget `_decide_test` also spends from
+            # (#1692: a failed test and a failed trust gate are two shapes
+            # of the same "the work needs another round" loop).
+            if counters.fix_rounds >= opts.max_fix_rounds:
+                return _die(
+                    f"acceptance trust gate still failing after "
+                    f"{counters.fix_rounds} fix round(s) at {sha} — "
+                    "stopping.\n"
+                    f"   Reason: {state.work_acceptance_reason or 'none recorded'}\n"
+                    f"   Inspect: coord log {state.work_aid} --machine "
+                    f"{state.work_machine or machine}"
+                )
+            counters.fix_rounds += 1
+            return Action(
+                kind=RUN,
+                label=(
+                    "ACCEPTANCE: trust gate failed → fix round "
+                    f"{counters.fix_rounds}/{opts.max_fix_rounds} "
+                    f"(coord fix {state.work_aid})"
+                ),
+                command=("fix", state.work_aid),
+                error_message=(
+                    f"coord fix {state.work_aid} failed to dispatch after a "
+                    "failed acceptance trust gate."
+                ),
+            )
+
+    # No verdict recorded yet for this exact SHA — never run, or run
+    # against a now-stale one (a fix round, a rebase). Dispatch it.
+    #
+    # `on_error="warn"` is deliberate: `coord acceptance record` exits
+    # non-zero BOTH when it successfully records a red verdict (the board
+    # write already happened before it exits — the next poll's
+    # `work_acceptance_state == "failed"` branch above is what actually
+    # bounces to Fix) and when it errors out before ever reaching a verdict
+    # (no local checkout, a driver crash, a git fetch failure). Raising
+    # `DriveError` here on either would turn a routine red trust-gate round
+    # into a terminal drive failure — exactly the "must block [via Fix],
+    # not warn" the acceptance criteria ask for, achieved one poll later by
+    # observation rather than by inspecting this exit code directly.
+    if counters.acceptance_gate_attempts >= opts.max_work_retries:
+        return _die(
+            f"acceptance trust gate never produced a verdict for {sha} "
+            f"after {counters.acceptance_gate_attempts} attempt(s) — "
+            "`coord acceptance record` keeps failing before recording "
+            "anything (checkout/driver/environment problem, not a red "
+            "suite).\n"
+            f"   Inspect: coord acceptance record --repo {state.repo} "
+            f"--issue {state.issue} --sha {sha}"
+        )
+    counters.acceptance_gate_attempts += 1
+    return Action(
+        kind=RUN,
+        label=(
+            "ACCEPTANCE: trust gate → coord acceptance record --sha "
+            f"{sha[:12]}"
+        ),
+        command=(
+            "acceptance", "record", "--repo", state.repo, "--issue",
+            str(state.issue), "--sha", sha,
+        ),
+        on_error="warn",
     )
 
 

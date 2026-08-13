@@ -83,11 +83,19 @@ def state(**kw) -> IssueState:
 class FakeVerifier:
     """Stands in for git/gh so decision tests never touch the network."""
 
-    def __init__(self, *, has_commits: bool = True, merged: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        has_commits: bool = True,
+        merged: bool = True,
+        head_sha: str | None = "deadbeef" * 5,
+    ) -> None:
         self._has_commits = has_commits
         self._merged = merged
+        self._head_sha = head_sha
         self.commits_calls = 0
         self.merged_calls = 0
+        self.head_sha_calls = 0
 
     def branch_has_commits(self, s: IssueState) -> bool:
         self.commits_calls += 1
@@ -96,6 +104,10 @@ class FakeVerifier:
     def verify_merged(self, s: IssueState) -> bool:
         self.merged_calls += 1
         return self._merged
+
+    def branch_head_sha(self, s: IssueState) -> str | None:
+        self.head_sha_calls += 1
+        return self._head_sha
 
 
 def step(s: IssueState, opts: DriveOptions | None = None, **kw) -> Action:
@@ -442,12 +454,15 @@ class FakeGateChecker:
         exists: bool = True,
         for_path: str | None = None,
         for_path_error: Exception | None = None,
+        exempt: bool = False,
     ) -> None:
         self._exists = exists
         self._for_path = for_path
         self._for_path_error = for_path_error
+        self._exempt = exempt
         self.calls: list[tuple[str, int]] = []
         self.for_path_calls: list[tuple[str, int]] = []
+        self.exempt_calls: list[tuple[str, int, int, tuple[str, ...]]] = []
 
     def contract_exists(self, repo_name: str, milestone_number: int) -> bool:
         self.calls.append((repo_name, milestone_number))
@@ -458,6 +473,16 @@ class FakeGateChecker:
         if self._for_path_error is not None:
             raise self._for_path_error
         return self._for_path
+
+    def is_issue_exempt(
+        self,
+        repo_name: str,
+        milestone_number: int,
+        issue_number: int,
+        issue_labels: tuple[str, ...],
+    ) -> bool:
+        self.exempt_calls.append((repo_name, milestone_number, issue_number, issue_labels))
+        return self._exempt
 
 
 def oracle_state(**kw) -> IssueState:
@@ -533,6 +558,53 @@ def test_resolve_oracle_decision_is_active_when_everything_lines_up():
     assert decision.active is True
     assert decision.tracking_issue == 1120
     assert "ms-38" in decision.reason
+
+
+def test_resolve_oracle_decision_resolves_issue_exempt_when_active():
+    """#2199: `issue_exempt` is resolved alongside `active` — one GitHub
+    fetch budget, not a second one paid later by the trust gate."""
+    checker = FakeGateChecker(exists=True, exempt=True)
+    decision = resolve_oracle_decision(
+        oracle_state(issue_labels=("bug",)),
+        DriveOptions(),
+        make_config_with_acceptance_driver(),
+        checker,
+    )
+    assert decision.active is True
+    assert decision.issue_exempt is True
+    assert checker.exempt_calls == [(REPO, 38, ISSUE, ("bug",))]
+
+
+def test_resolve_oracle_decision_issue_exempt_defaults_false_when_not_exempt():
+    checker = FakeGateChecker(exists=True, exempt=False)
+    decision = resolve_oracle_decision(
+        oracle_state(), DriveOptions(), make_config_with_acceptance_driver(), checker
+    )
+    assert decision.active is True
+    assert decision.issue_exempt is False
+
+
+def test_resolve_oracle_decision_never_resolves_exempt_when_inactive():
+    """No point paying the fetch when the trust gate wouldn't consult it
+    anyway — every inactive branch returns before `is_issue_exempt` runs."""
+    checker = FakeGateChecker(exists=False)
+    decision = resolve_oracle_decision(
+        oracle_state(), DriveOptions(), make_config_with_acceptance_driver(), checker
+    )
+    assert decision.active is False
+    assert decision.issue_exempt is False
+    assert checker.exempt_calls == []
+
+
+def test_the_default_gate_checker_is_issue_exempt_reuses_the_1138_hard_gate():
+    """#2199: must not re-derive `manifest.exempt`/`oracle:exempt` — reuse
+    `coord.milestone_dispatch.issue_oracle_ready` (the #1138 hard gate)
+    exactly, so the JIT-authoring gate and the trust gate can never
+    disagree about which issues the oracle loop covers."""
+    import inspect
+
+    src = inspect.getsource(GitHubAcceptanceGateChecker.is_issue_exempt)
+    assert "issue_oracle_ready" in src
 
 
 def test_the_default_gate_checker_reuses_gate_a_status_not_a_reimplementation():
@@ -1343,6 +1415,173 @@ def done_work(**kw) -> IssueState:
     base = dict(work_aid="w1", work_status="done", work_branch="issue-1392-x")
     base.update(kw)
     return state(**base)
+
+
+# ── #2199: the oracle-loop TRUST GATE (`_decide_acceptance_gate`) ──────────
+#
+# Before #2199 nothing ever called `coord acceptance record` — an issue
+# driven end-to-end by `coord drive` completed with `acceptance_state =
+# None` forever, so `_maybe_clear_expected_red` could never clear
+# (quadraui#542). These tests are the call site: it must fire between the
+# dead-end predicate and the Test gate, run EXTERNALLY (this process, not
+# the worker's), block (not warn) on a genuinely failed verdict, and never
+# fire at all for an issue that opted out of the sealed suite.
+
+TRUST_GATE_SHA = "deadbeef" * 5  # FakeVerifier's own default head_sha
+
+
+def test_non_oracle_drive_never_touches_the_trust_gate():
+    """`oracle=None` — every pre-#2199 call site — behaves byte-identically:
+    straight through to the Test gate, `coord acceptance record` never
+    dispatched, the SHA never even resolved."""
+    verifier = FakeVerifier()
+    action = step(done_work(work_test_state=""), verifier=verifier)
+    assert action.kind == WAIT
+    assert action.command == ()
+    assert verifier.head_sha_calls == 0
+
+
+def test_oracle_inactive_never_touches_the_trust_gate():
+    """`oracle.active=False` (no driver, no milestone, `--no-acceptance`) —
+    same as `oracle=None`."""
+    verifier = FakeVerifier()
+    oracle = OracleDecision(False, "no driver configured — normal drive")
+    action = step(done_work(work_test_state=""), oracle=oracle, verifier=verifier)
+    assert action.kind == WAIT
+    assert action.command == ()
+    assert verifier.head_sha_calls == 0
+
+
+def test_oracle_active_but_issue_exempt_skips_the_gate():
+    """`manifest.exempt`/`oracle:exempt` — #2199 acceptance criterion:
+    exempt issues must not acquire a new blocking gate. Falls straight
+    through to Test; `coord acceptance record` is never dispatched because
+    there is no sealed slice for it to re-run."""
+    verifier = FakeVerifier()
+    oracle = OracleDecision(
+        True, "ORACLE DRIVE", tracking_issue=1120, issue_exempt=True,
+    )
+    action = step(done_work(work_test_state=""), oracle=oracle, verifier=verifier)
+    assert action.kind == WAIT
+    assert action.command == ()
+    assert verifier.head_sha_calls == 0
+
+
+def test_oracle_active_dispatches_the_trust_gate_when_no_verdict_recorded():
+    counters = DriveCounters()
+    verifier = FakeVerifier(head_sha=TRUST_GATE_SHA)
+    oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
+    action = step(
+        done_work(work_test_state=""), oracle=oracle, verifier=verifier,
+        counters=counters,
+    )
+    assert action.command == (
+        "acceptance", "record", "--repo", REPO, "--issue", str(ISSUE),
+        "--sha", TRUST_GATE_SHA,
+    )
+    # #2199: a red verdict must not crash the whole drive — see
+    # `_decide_acceptance_gate`'s docstring for why this specific RUN
+    # action is the one exception to the die-on-nonzero default.
+    assert action.on_error == "warn"
+    assert counters.acceptance_gate_attempts == 1
+
+
+def test_trust_gate_passed_for_current_sha_falls_through_to_test():
+    verifier = FakeVerifier(head_sha=TRUST_GATE_SHA)
+    oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
+    s = done_work(
+        work_test_state="",
+        work_acceptance_state="passed",
+        work_acceptance_sha=TRUST_GATE_SHA,
+    )
+    action = step(s, oracle=oracle, verifier=verifier)
+    # Falls through to the REAL Test gate: work_test_state == "" waits for
+    # coord's own dispatch, exactly like the non-oracle case.
+    assert action.kind == WAIT
+    assert action.command == ()
+
+
+def test_trust_gate_failed_for_current_sha_loops_through_coord_fix():
+    """#2199 acceptance: 'a failed trust gate must block, not warn ... at
+    the same place a failed Test verdict does' — the SAME bounded fix-round
+    loop `_decide_test` uses for a failed test."""
+    counters = DriveCounters()
+    verifier = FakeVerifier(head_sha=TRUST_GATE_SHA)
+    oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
+    s = done_work(
+        work_acceptance_state="failed",
+        work_acceptance_sha=TRUST_GATE_SHA,
+        work_acceptance_reason="2/4 acceptance red",
+    )
+    action = step(s, oracle=oracle, verifier=verifier, counters=counters)
+    assert action.command == ("fix", "w1")
+    assert counters.fix_rounds == 1
+
+
+def test_trust_gate_fix_loop_is_bounded_by_max_fix_rounds():
+    counters = DriveCounters()
+    verifier = FakeVerifier(head_sha=TRUST_GATE_SHA)
+    oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
+    opts = DriveOptions(machine="precision", max_fix_rounds=1)
+    s = done_work(
+        work_acceptance_state="failed",
+        work_acceptance_sha=TRUST_GATE_SHA,
+        work_acceptance_reason="2/4 acceptance red",
+    )
+    first = step(s, opts, oracle=oracle, verifier=verifier, counters=counters)
+    assert first.command == ("fix", "w1")
+    exhausted = step(s, opts, oracle=oracle, verifier=verifier, counters=counters)
+    assert exhausted.is_exit
+    assert exhausted.exit_code == EXIT_TERMINAL_FAILURE
+    assert "after 1 fix round(s)" in exhausted.message
+    assert "2/4 acceptance red" in exhausted.message
+
+
+def test_trust_gate_reruns_record_against_a_fresh_sha_after_a_fix_round():
+    """New commits landed (a fix round, a rebase) since the last recorded
+    verdict — re-dispatch against the CURRENT sha, not the stale one that
+    verdict was for (mirrors `review_head_sha` staleness detection)."""
+    verifier = FakeVerifier(head_sha=TRUST_GATE_SHA)
+    oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
+    s = done_work(
+        work_acceptance_state="passed",
+        work_acceptance_sha="stalestalestalestalestalestalestalestale",
+    )
+    action = step(s, oracle=oracle, verifier=verifier)
+    assert action.command == (
+        "acceptance", "record", "--repo", REPO, "--issue", str(ISSUE),
+        "--sha", TRUST_GATE_SHA,
+    )
+
+
+def test_trust_gate_waits_when_the_sha_cannot_be_resolved():
+    """GitHub unreachable or the branch vanished between polls — retry
+    next poll rather than blocking a whole drive run on a transient
+    lookup."""
+    verifier = FakeVerifier(head_sha=None)
+    oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
+    action = step(done_work(), oracle=oracle, verifier=verifier)
+    assert action.kind == WAIT
+    assert action.command == ()
+
+
+def test_trust_gate_dispatch_attempts_are_bounded_by_max_work_retries():
+    """A `coord acceptance record` that keeps erroring out before ever
+    recording a verdict (broken checkout, driver crash) must reach a named
+    terminal failure instead of re-running a full worktree + suite
+    invocation every poll forever."""
+    counters = DriveCounters()
+    verifier = FakeVerifier(head_sha=TRUST_GATE_SHA)
+    oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
+    opts = DriveOptions(machine="precision", max_work_retries=1)
+    s = done_work(work_test_state="")
+
+    first = step(s, opts, oracle=oracle, verifier=verifier, counters=counters)
+    assert first.command[:2] == ("acceptance", "record")
+    exhausted = step(s, opts, oracle=oracle, verifier=verifier, counters=counters)
+    assert exhausted.is_exit
+    assert exhausted.exit_code == EXIT_TERMINAL_FAILURE
+    assert "never produced a verdict" in exhausted.message
 
 
 def test_no_test_verdict_yet_waits_for_coord_to_dispatch_the_stage():

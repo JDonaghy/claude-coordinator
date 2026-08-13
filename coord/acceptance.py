@@ -574,6 +574,16 @@ def expected_red_failure_summary(verdict: dict[str, Any]) -> str:
     can't mistake this for "a test failed" — it is the opposite signal, and
     the fix is editorial (clear the manifest entry, or realize the
     assertion never exercised the bug), not code.
+
+    #2199: the guidance below used to send the operator to `coord
+    acceptance record`, on the claim that a green trust-gate run clears the
+    entry automatically. PR #2173 deliberately moved clearing OUT of
+    `record` and into the post-merge hook (`coord.merge_queue.
+    _maybe_clear_expected_red` / `coord.acceptance.
+    clear_expected_red_via_pr`, right after the fix's own PR actually
+    merges — see that function's docstring for the ordering bug this
+    fixed). Re-running `record` today clears nothing; an operator who
+    followed the old wording would watch it not work with no clue why.
     """
     ids = verdict.get("unexpected_green") or []
     if not ids:
@@ -583,10 +593,15 @@ def expected_red_failure_summary(verdict: dict[str, Any]) -> str:
         f"HARD FAILURE: {len(ids)} test(s) listed in `expected_red` now PASS:\n"
         f"{listed}\n"
         "An expected-red test that passes means either the fix already "
-        "landed silently (clear it — `coord acceptance record` does this "
-        "automatically on a green trust-gate run) or the assertion never "
-        "exercised the bug in the first place (#1965). This is NOT an "
-        "ordinary test failure — it is the opposite signal."
+        "landed silently — it clears automatically once ITS OWN PR actually "
+        "merges (the post-merge hook, not `coord acceptance record`; see "
+        "docs/ORACLE_LOOP.md). Still listed after that merge? Check `coord "
+        "merge`'s own output for an `expected_red_clear_skipped*` event "
+        "naming why (no work assignment found, no passing trust-gate "
+        "verdict recorded, or a stale acceptance SHA), or run `coord "
+        "acceptance expected-red <repo>` to see current state — or the "
+        "assertion never exercised the bug in the first place (#1965). "
+        "This is NOT an ordinary test failure — it is the opposite signal."
     )
 
 

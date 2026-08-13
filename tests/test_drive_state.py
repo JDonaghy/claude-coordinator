@@ -97,6 +97,51 @@ def test_project_reads_the_work_row_and_repo_config():
     assert state.repo_test_command == "pytest -q"
 
 
+def test_project_reads_the_acceptance_trust_gate_verdict_from_the_work_row():
+    """#2199: `coord acceptance record --issue N --sha <sha>` writes
+    `acceptance_state`/`acceptance_reason`/`acceptance_sha` onto the
+    issue's `work` row — the SAME field `coord.merge_queue.
+    _maybe_clear_expected_red` already reads via
+    `getattr(work, "acceptance_state", None)`."""
+    payload = {
+        "assignments": [
+            row(
+                assignment_id="w1",
+                branch="issue-1392-port",
+                acceptance_state="failed",
+                acceptance_reason="2/4 acceptance red",
+                acceptance_sha="cafesha",
+            )
+        ]
+    }
+    state = project(payload, REPO, 1392, make_config())
+    assert state.work_acceptance_state == "failed"
+    assert state.work_acceptance_reason == "2/4 acceptance red"
+    assert state.work_acceptance_sha == "cafesha"
+
+
+def test_project_defaults_the_acceptance_trust_gate_fields_empty():
+    """No verdict ever recorded — `""`, never `None`, matching every other
+    ``work_*`` string field's default so callers never have to special-case
+    it."""
+    payload = {"assignments": [row(assignment_id="w1")]}
+    state = project(payload, REPO, 1392, make_config())
+    assert state.work_acceptance_state == ""
+    assert state.work_acceptance_reason == ""
+    assert state.work_acceptance_sha == ""
+
+
+def test_project_resolves_issue_labels_from_the_issues_list():
+    payload = {
+        "assignments": [],
+        "issues": [
+            {"repo_name": REPO, "number": 1392, "labels": ["oracle:exempt", "bug"]},
+        ],
+    }
+    state = project(payload, REPO, 1392, make_config())
+    assert state.issue_labels == ("oracle:exempt", "bug")
+
+
 def test_project_refuses_an_unconfigured_repo():
     with pytest.raises(DriveStateError, match="not in coordinator.yml"):
         project({"assignments": []}, "nope", 1, make_config())
