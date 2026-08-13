@@ -1193,6 +1193,130 @@ class TestExpectedRedClearOnMerge:
         assert events[-1].entry.state == MERGED
 
 
+class _TestAuthorGateGh(FakeGh):
+    """#2191: FakeGh + the API-only manifest/issue-state surface
+    `coord.acceptance.missing_expected_red_warning` needs. Defaults to a
+    single ms-dir manifest mapping issue 944 with no `expected_red` block —
+    the "unwritten registry" signature — and issue 944 reporting "open",
+    so the warning fires unless a test overrides one of them."""
+
+    def __init__(
+        self,
+        *,
+        manifest_text: str | None = None,
+        issue_states: dict[int, str] | None = None,
+        **kw,
+    ):
+        super().__init__(**kw)
+        self.manifest_text = (
+            manifest_text if manifest_text is not None else "tests:\n  ms01::a: 944\n"
+        )
+        self.issue_states = issue_states or {}
+
+    def list_repo_subdirs(self, repo: str, path: str, branch: str = "develop") -> list[str]:
+        return ["ms01"]
+
+    def get_repo_file_with_sha(self, repo: str, path: str, branch: str = "develop") -> tuple[str, str]:
+        if path != "tests/acceptance/ms01/manifest.yml":
+            raise RuntimeError("not found")
+        return self.manifest_text, "blob-sha"
+
+    def get_issues_live_state(self, repo: str, numbers: list[int]) -> dict[int, str]:
+        return {n: self.issue_states.get(n, "open") for n in numbers}
+
+
+class TestExpectedRedMissingWarningOnSliceOpen:
+    """#2191: the coordinator-side gate half — a `type="test-author"`
+    slice's PR-open moment checks whether its manifest maps the child
+    issue's test ids with zero `expected_red` entries recorded, and
+    surfaces a non-blocking `MergeEvent` when it finds the unwritten-
+    registry signature. The slice PR still opens either way — this is
+    "warned", not "refused"."""
+
+    @staticmethod
+    def _board(assignments) -> "Board":
+        from coord.models import Board
+        return Board(active=[], completed=list(assignments))
+
+    @staticmethod
+    def _slice_assignment(
+        aid: str = "w1", *, tracking: int = 100, for_issue: int | None = 944,
+    ) -> Assignment:
+        return Assignment(
+            machine_name="m1", repo_name="api", issue_number=tracking, issue_title="t",
+            assignment_id=aid, type="test-author", status="done",
+            branch=f"worker/{aid}", for_issue_number=for_issue,
+        )
+
+    @staticmethod
+    def _entry(aid: str = "w1", *, issue: int = 100, assignment_type: str = "test-author") -> QueuedMerge:
+        return QueuedMerge(
+            assignment_id=aid, repo_name="api", repo_github="acme/api",
+            branch=f"worker/{aid}", target_branch="main", issue_number=issue,
+            issue_title="t", state=PENDING, pr_number=None,
+            assignment_type=assignment_type,
+        )
+
+    def test_warns_when_manifest_lacks_expected_red_for_the_open_child_issue(self) -> None:
+        board = self._board([self._slice_assignment()])
+        gh = _TestAuthorGateGh()
+
+        events = process([self._entry()], gh, board=board)
+
+        warnings = [e for e in events if e.kind == "expected_red_missing_warning"]
+        assert len(warnings) == 1
+        assert "#944" in warnings[0].message
+        assert "ms01::a" in warnings[0].message
+        # Advisory only — the PR still opened.
+        assert [e for e in events if e.kind == "opened"]
+
+    def test_no_warning_when_expected_red_is_already_recorded(self) -> None:
+        board = self._board([self._slice_assignment()])
+        gh = _TestAuthorGateGh(
+            manifest_text="tests:\n  ms01::a: 944\nexpected_red:\n  944:\n    - ms01::a\n",
+        )
+
+        events = process([self._entry()], gh, board=board)
+
+        assert not [e for e in events if e.kind == "expected_red_missing_warning"]
+
+    def test_no_warning_for_milestone_mode_authoring_with_no_for_issue_number(self) -> None:
+        """Gate-A (milestone-mode) authoring never sets `for_issue_number`
+        — `effective_issue_number` falls back to `issue_number` itself
+        (the tracking issue), which equals `entry.issue_number`, so the
+        gate is skipped entirely: no manifest ever maps a test id to the
+        tracking issue."""
+        board = self._board([self._slice_assignment(for_issue=None)])
+        gh = _TestAuthorGateGh()
+
+        events = process([self._entry()], gh, board=board)
+
+        assert not [e for e in events if e.kind == "expected_red_missing_warning"]
+
+    def test_no_warning_for_a_work_entry(self) -> None:
+        board = self._board([self._slice_assignment()])
+        gh = _TestAuthorGateGh()
+
+        events = process([self._entry(assignment_type="work")], gh, board=board)
+
+        assert not [e for e in events if e.kind == "expected_red_missing_warning"]
+
+    def test_no_warning_when_the_child_issue_is_closed(self) -> None:
+        board = self._board([self._slice_assignment()])
+        gh = _TestAuthorGateGh(issue_states={944: "closed"})
+
+        events = process([self._entry()], gh, board=board)
+
+        assert not [e for e in events if e.kind == "expected_red_missing_warning"]
+
+    def test_no_warning_when_no_originating_assignment_is_on_the_board(self) -> None:
+        gh = _TestAuthorGateGh()
+
+        events = process([self._entry()], gh, board=self._board([]))
+
+        assert not [e for e in events if e.kind == "expected_red_missing_warning"]
+
+
 class TestReviewGate:
     """#253: process() must refuse to merge when reviews are required and
     no approved review is on the board.

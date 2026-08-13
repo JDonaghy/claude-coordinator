@@ -26,6 +26,7 @@ from coord.acceptance import (
     list_expected_red_via_api,
     load_expected_red,
     load_manifest,
+    missing_expected_red_warning,
     ms_dir_for_issue,
     oracle_loop_contract_block,
     parse_manifest_text,
@@ -462,6 +463,14 @@ class _FakeApiGhOps:
         self.created_prs: list[dict] = []
         self.merge_results: dict[int, tuple[bool, str]] = {}
         self._next_pr = 500
+        # #2191: per-issue live open/closed override for
+        # `get_issues_live_state` — defaults every unlisted issue to "open"
+        # so a test exercising `missing_expected_red_warning`'s happy path
+        # needs no extra setup.
+        self.issue_states: dict[int, str] = {}
+
+    def get_issues_live_state(self, repo: str, numbers: list[int]) -> dict[int, str]:
+        return {n: self.issue_states.get(n, "open") for n in numbers}
 
     def list_repo_subdirs(self, repo: str, path: str, branch: str = "develop") -> list[str]:
         return list(self.subdirs)
@@ -519,6 +528,62 @@ class TestFindMsManifestForIssueViaApi:
             pass
 
         assert find_ms_manifest_for_issue_via_api("acme/x", "main", 944, gh_ops=Bare()) is None
+
+
+class TestMissingExpectedRedWarning:
+    """#2191: the gate half — flags the exact "manifest maps ids to an open
+    issue with no expected_red" signature an unwritten registry produces,
+    at slice-PR-open time."""
+
+    def test_warns_when_open_issue_has_tests_but_no_expected_red(self) -> None:
+        ops = _FakeApiGhOps({
+            "tests/acceptance/ms01/manifest.yml": "tests:\n  ms01::a: 944\n  ms01::b: 944\n",
+        })
+        warning = missing_expected_red_warning("acme/x", "main", 944, gh_ops=ops)
+        assert warning is not None
+        assert "#944" in warning
+        assert "ms01::a" in warning and "ms01::b" in warning
+        assert "expected_red" in warning
+
+    def test_none_when_expected_red_already_recorded(self) -> None:
+        ops = _FakeApiGhOps({"tests/acceptance/ms01/manifest.yml": MS01_MANIFEST})
+        assert missing_expected_red_warning("acme/x", "main", 944, gh_ops=ops) is None
+
+    def test_none_when_issue_not_referenced_by_any_manifest(self) -> None:
+        ops = _FakeApiGhOps({"tests/acceptance/ms01/manifest.yml": MS01_MANIFEST})
+        assert missing_expected_red_warning("acme/x", "main", 12345, gh_ops=ops) is None
+
+    def test_none_when_issue_is_closed(self) -> None:
+        ops = _FakeApiGhOps({
+            "tests/acceptance/ms01/manifest.yml": "tests:\n  ms01::a: 944\n",
+        })
+        ops.issue_states[944] = "closed"
+        assert missing_expected_red_warning("acme/x", "main", 944, gh_ops=ops) is None
+
+    def test_none_when_gh_ops_lacks_live_state_lookup(self) -> None:
+        """Fail-open: a gh_ops stub that can find the manifest but doesn't
+        support the live-state lookup must not warn — this check is
+        advisory, never a false positive from an incomplete stub/older
+        gh_ops."""
+
+        class NoLiveState:
+            def __init__(self, inner: _FakeApiGhOps):
+                self._inner = inner
+
+            def list_repo_subdirs(self, *a, **kw):
+                return self._inner.list_repo_subdirs(*a, **kw)
+
+            def get_repo_file_with_sha(self, *a, **kw):
+                return self._inner.get_repo_file_with_sha(*a, **kw)
+
+        inner = _FakeApiGhOps({"tests/acceptance/ms01/manifest.yml": "tests:\n  ms01::a: 944\n"})
+        assert missing_expected_red_warning("acme/x", "main", 944, gh_ops=NoLiveState(inner)) is None
+
+    def test_none_when_gh_ops_lacks_api_methods_at_all(self) -> None:
+        class Bare:
+            pass
+
+        assert missing_expected_red_warning("acme/x", "main", 944, gh_ops=Bare()) is None
 
 
 class TestListExpectedRedViaApi:

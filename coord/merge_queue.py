@@ -3835,6 +3835,39 @@ def _work_assignment_for_entry(entry: QueuedMerge, board) -> Assignment | None:
     return None
 
 
+def _test_author_effective_issue_number(entry: QueuedMerge, board) -> int | None:
+    """#2191: the child issue a ``type="test-author"`` merge entry's slice
+    is actually FOR — resolved via ``coord.models.effective_issue_number``
+    from the originating assignment's ``for_issue_number``, NOT
+    ``entry.issue_number``. For a test-author row, ``entry.issue_number``
+    (== ``Assignment.issue_number``) is always the milestone's TRACKING
+    issue: every JIT slice for one milestone shares a single branch/PR, so
+    ``issue_number`` alone can't tell "this is #1039's slice" from "this is
+    #1042's slice" apart (see ``Assignment.for_issue_number``'s docstring).
+    Mirrors :func:`_work_assignment_for_entry`'s board scan, just keyed on
+    ``type == "test-author"``.
+
+    Returns ``None`` when no originating assignment is found on the board
+    (best-effort — the PR-open path this feeds never blocks on it) or when
+    it's milestone-mode (Gate A) authoring, where ``for_issue_number`` is
+    unset and ``effective_issue_number`` falls back to the tracking issue
+    itself — deliberately inert downstream, since no manifest ever maps a
+    test id to the tracking issue.
+    """
+    if board is None:
+        return None
+    pool = list(getattr(board, "completed", []) or []) + list(getattr(board, "active", []) or [])
+    for a in pool:
+        if (
+            getattr(a, "assignment_id", None) == entry.assignment_id
+            and getattr(a, "type", None) == "test-author"
+        ):
+            from coord.models import effective_issue_number  # noqa: PLC0415
+
+            return effective_issue_number(a)
+    return None
+
+
 def _issue_has_expected_red_entries(entry: QueuedMerge, gh_ops: GhOps) -> bool:
     """#2199 review (blocking finding 2): whether *entry*'s issue has at
     least one ``expected_red`` entry recorded against it in some
@@ -4338,6 +4371,28 @@ def process(
                     entry, "opened",
                     f"PR #{entry.pr_number} ({'existed' if pr.get('existed') else 'created'}) for {entry.branch}",
                 ))
+                # #2191: at the exact moment a test-author slice's PR opens,
+                # check whether its writer (`TEST_AUTHOR_SYSTEM_PROMPT`
+                # step 4b) actually recorded `expected_red` — the gate half
+                # of #2191, since a prompt instruction is not a guarantee.
+                # Advisory only (a MergeEvent, never a `continue`/skip): the
+                # slice PR still opens and can still be reviewed/merged, it
+                # just carries a visible warning an operator (or a future
+                # hard gate) can act on.
+                if entry.assignment_type == "test-author":
+                    for_issue = _test_author_effective_issue_number(entry, board)
+                    if for_issue is not None and for_issue != entry.issue_number:
+                        from coord.acceptance import (  # noqa: PLC0415
+                            missing_expected_red_warning,
+                        )
+
+                        warning = missing_expected_red_warning(
+                            entry.repo_github, entry.branch, for_issue, gh_ops=gh_ops,
+                        )
+                        if warning:
+                            events.append(MergeEvent(
+                                entry, "expected_red_missing_warning", warning,
+                            ))
             if entry.pr_number and entry.size is None:
                 entry.size = gh_ops.get_pr_size(entry.repo_github, entry.pr_number)
                 events.append(MergeEvent(entry, "sized", f"size={entry.size}"))
