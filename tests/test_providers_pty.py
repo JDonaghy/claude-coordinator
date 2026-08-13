@@ -199,6 +199,28 @@ def test_pty_build_command_branches_match_claude_for_plan_type() -> None:
     assert argv[argv.index("--allowedTools") + 1] == legacy_at
 
 
+@pytest.mark.parametrize("spec_type", ["work", "review", "smoke", "conflict-fix", "fix"])
+def test_pty_build_command_branches_match_claude_for_work_type(spec_type: str) -> None:
+    """#2169: the generic-worker (``else``) branch must stay in parity too.
+
+    ``default_worker_command`` and ``ClaudeProvider.build_command`` both
+    grant ``Monitor`` alongside ``Read,Edit,Write,Bash`` for write-capable
+    spec types so a worker can bound-poll a backgrounded long-running
+    command. ``ClaudePtyProvider.build_command`` shares the same
+    system-prompt/allowed-tools logic and must not drift from it — this
+    regression-guards the drift where only two of the three call sites
+    were updated to add ``Monitor``.
+    """
+    spec = _make_spec(type=spec_type)
+    argv = ClaudePtyProvider().build_command(spec)
+    legacy = default_worker_command(spec)
+    legacy_sp = legacy[legacy.index("--system-prompt") + 1]
+    legacy_at = legacy[legacy.index("--allowedTools") + 1]
+    assert argv[argv.index("--system-prompt") + 1] == legacy_sp
+    assert argv[argv.index("--allowedTools") + 1] == legacy_at
+    assert "Monitor" in argv[argv.index("--allowedTools") + 1]
+
+
 # ── ClaudePtyProvider: capabilities ──────────────────────────────────────────
 
 
