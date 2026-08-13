@@ -1417,6 +1417,19 @@ def is_ci_infra_reason(reason: str | None) -> bool:
 # standing breakage.
 MAX_CI_INFRA_RERUNS = 2
 
+# #2197: same shape as MAX_CI_INFRA_RERUNS above, but for the OTHER CI
+# auto-rerun trigger `process()` supports — a PASSING check recorded against
+# a base that has since moved (:data:`CI_STALE_PREFIX`, #1851's staleness
+# signal), not a failure. Deliberately a SEPARATE constant/counter from
+# `ci_infra_reruns`: the two triggers answer opposite readings of CI ("this
+# failed and needs to prove itself again" vs. "this passed but predates the
+# base and needs a fresh answer") and must be independently capped and
+# independently legible in the audit trail. A base that keeps moving out
+# from under one PR (a busy queue, or a genuinely wedged branch) would
+# otherwise auto-rerun forever; two tries rides out an ordinary busy tick
+# without masking a PR that just isn't going to catch up unattended.
+MAX_CI_STALE_RERUNS = 2
+
 
 def _ci_infra_reason(
     ci: "CiStore", repo: str, number: int, failed: "list[CheckRun]"
@@ -2168,6 +2181,15 @@ class QueuedMerge:
     # forever. 0 for every entry that has never hit a verdictless failure,
     # and for rows predating this column.
     ci_infra_reruns: int = 0
+    # #2197: count of automatic `CiStore.rerun_for_pr` calls `process()` has
+    # issued for this entry's CURRENT run of CI staleness (#1851) — a
+    # PASSING check recorded against a base that has since moved. Kept
+    # separate from `ci_infra_reruns` above on purpose (see
+    # `MAX_CI_STALE_RERUNS`'s comment): the two triggers must be
+    # independently capped and independently legible in the audit trail.
+    # Capped at `MAX_CI_STALE_RERUNS`. 0 for every entry that has never gone
+    # CI-stale, and for rows predating this column.
+    ci_stale_reruns: int = 0
 
 
 class GhOps(Protocol):
@@ -2459,6 +2481,9 @@ def load_queue() -> list[QueuedMerge]:
             # #1892: column added via migration; NULL (pre-migration rows)
             # decodes to 0 — no auto-reruns spent yet, same as a fresh entry.
             ci_infra_reruns=row["ci_infra_reruns"] or 0,
+            # #2197: same NULL-to-0 decoding as ci_infra_reruns above, for
+            # rows predating this column.
+            ci_stale_reruns=row["ci_stale_reruns"] or 0,
         )
         for row in rows
     ]
@@ -2475,15 +2500,16 @@ def save_queue(items: list[QueuedMerge]) -> None:
                     assignment_id, repo_name, repo_github, branch,
                     target_branch, issue_number, issue_title, state,
                     pr_number, pr_url, size, last_attempt, error, enqueued_at,
-                    assignment_type, required_gates, ci_infra_reruns
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    assignment_type, required_gates, ci_infra_reruns,
+                    ci_stale_reruns
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     item.assignment_id, item.repo_name, item.repo_github,
                     item.branch, item.target_branch, item.issue_number,
                     item.issue_title, item.state, item.pr_number, item.pr_url,
                     item.size, item.last_attempt, item.error, item.enqueued_at,
                     item.assignment_type, json.dumps(list(item.required_gates or [])),
-                    item.ci_infra_reruns,
+                    item.ci_infra_reruns, item.ci_stale_reruns,
                 ),
             )
 
@@ -4503,16 +4529,69 @@ def process(
                 # distinctly (`checks_stale`) from checks_failed/
                 # checks_pending above so an operator (and `coord merge
                 # --revalidate`, the remedy) can tell the three apart.
+                #
+                # #2197: this used to always block here, escalating to a
+                # human (or, via `coord drive`, spending a merge attempt)
+                # for a condition a re-run resolves on its own — the exact
+                # #2170 regression (a docs-only base move stales a
+                # perfectly good green PR). Mirror #1892's shape exactly:
+                # auto-rerun via the SAME `CiStore.rerun_for_pr` this
+                # module already calls unattended for verdictless
+                # failures, up to `MAX_CI_STALE_RERUNS` — but track it
+                # with its OWN counter (`ci_stale_reruns`), never
+                # `ci_infra_reruns`, so a failed-then-stale (or
+                # stale-then-failed) PR does not have one trigger silently
+                # spend the other's budget, and so the audit trail can
+                # always tell which condition an auto-rerun was answering.
                 if checks and _ci_checks_are_stale(
                     checks, gh_ops, entry.repo_github, entry.target_branch, smoke,
                 ):
+                    if entry.ci_stale_reruns < MAX_CI_STALE_RERUNS:
+                        entry.ci_stale_reruns += 1
+                        reran = ci.rerun_for_pr(entry.repo_github, entry.pr_number)
+                        _log.info(
+                            "#2197 auto-rerun %d/%d for stale CI on %s#%d "
+                            "(PR #%s) (rerun_for_pr %s)",
+                            entry.ci_stale_reruns, MAX_CI_STALE_RERUNS,
+                            entry.repo_name, entry.issue_number,
+                            entry.pr_number,
+                            "triggered" if reran else "FAILED",
+                        )
+                        # #1891: same `CI_PENDING_PREFIX` wording the
+                        # genuinely-still-running case uses above — this is
+                        # what lets `coord drive`'s `is_ci_pending_reason`
+                        # check (coord/drive.py) treat a re-run THIS auto-
+                        # trigger just kicked off exactly like any other
+                        # in-flight CI: a bare wait, never a spent merge
+                        # attempt. The queue resumes it automatically once
+                        # the re-run reports, no operator needed.
+                        msg = (
+                            f"{CI_PENDING_PREFIX} re-run triggered for CI "
+                            "checks that predate the current base (#2197 "
+                            f"auto-rerun {entry.ci_stale_reruns}/"
+                            f"{MAX_CI_STALE_RERUNS} "
+                            f"{'triggered' if reran else 'failed to trigger'})"
+                        )
+                        entry.error = msg
+                        events.append(MergeEvent(entry, "checks_stale_rerun", msg))
+                        continue  # #292: skip, don't halt the group
                     msg = (
                         f"{CI_STALE_PREFIX} checks predate the current base "
-                        "— re-run CI (`coord merge --revalidate`) before merging"
+                        f"— auto-rerun budget exhausted ({entry.ci_stale_reruns}/"
+                        f"{MAX_CI_STALE_RERUNS}); re-run CI (`coord merge "
+                        "--revalidate`) before merging"
                     )
                     entry.error = msg
                     events.append(MergeEvent(entry, "checks_stale", msg))
                     continue  # #292: skip, don't halt the group
+                # #2197: reached only once the checks are genuinely fresh
+                # (or the smoke-side #1738/#1778/#1847 base-move exemption
+                # spared them) — mirrors the `ci_infra_reruns = 0` reset
+                # above and for the identical reason: whatever staleness
+                # streak the budget was tracking has now actually resolved,
+                # so a LATER base move starts its own budget from zero
+                # rather than inheriting an unrelated exhausted count.
+                entry.ci_stale_reruns = 0
             # #1318: cache is_epic_issue lookups for this entry — the same
             # referenced number can show up in both the PR body and one or
             # more commit messages below, and each lookup is a `gh` round

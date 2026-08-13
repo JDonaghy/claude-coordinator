@@ -2803,8 +2803,28 @@ class TestMergeRevalidateCiRerunCli:
             def __init__(self):
                 self.is_available = True
                 self.rerun_calls: list = []
+                self._checks_since_rerun = 0
 
             def list_checks_for_pr(self, repo, number):
+                # #2197: once --revalidate has triggered its own re-run,
+                # the read immediately after (inside `wait_for_ci_settle`)
+                # still reports the OLD stale-but-"completed" record — real
+                # GitHub can lag a beat before a rerun registers, and
+                # `wait_for_ci_settle` is specifically tolerant of a
+                # "completed" read regardless of content. Every read AFTER
+                # that one reflects the new run actually executing (real
+                # GitHub behaviour), which is what stops `process()`'s own
+                # #2197 auto-rerun from firing a REDUNDANT `gh run rerun`
+                # for the very run --revalidate just triggered and is
+                # already watching settle.
+                if self.rerun_calls:
+                    self._checks_since_rerun += 1
+                    if self._checks_since_rerun > 1:
+                        return [SimpleNamespace(
+                            name="build", status="in_progress",
+                            conclusion=None, started_at=None,
+                            completed_at=None,
+                        )]
                 # Green, but started well before the (mocked) base commit
                 # time below — the #1851 staleness signal.
                 return [SimpleNamespace(
