@@ -88,16 +88,37 @@ impl CoordApp {
     /// #pause: right-click menu for a Machines panel row.  One toggle
     /// item ("Pause routing" / "Resume routing") plus a separator so the
     /// menu reads as a "single verb" affordance rather than a junk drawer.
+    ///
+    /// #2147: `quiet_hours` is the machine's CURRENT effective window
+    /// (`self.quiet_hours_windows.get(name)` at the caller), so the label
+    /// can read the schedule back rather than always saying "Set…" — an
+    /// operator adjusting an existing window shouldn't have to remember
+    /// what it was. A "Clear quiet hours" item only appears when one is
+    /// actually set (mirrors the Pause/Resume toggle's "only offer the
+    /// verb that applies" shape). Both new items sit above the existing
+    /// separator, same slot the Pause/Resume toggle already occupies.
     pub(crate) fn context_menu_items_for_machine_row(
         &self,
         _name: &str,
         is_paused: bool,
+        quiet_hours: Option<&data::QuietHoursWindow>,
     ) -> Vec<ContextMenuItem> {
         let mut items: Vec<ContextMenuItem> = Vec::new();
         if is_paused {
             items.push(ContextMenuItem::action("machine-resume", "Resume routing"));
         } else {
             items.push(ContextMenuItem::action("machine-pause", "Pause routing"));
+        }
+        let quiet_label = match quiet_hours {
+            Some(w) => format!("Quiet hours: {}-{}…", w.start, w.end),
+            None => "Set quiet hours…".to_string(),
+        };
+        items.push(ContextMenuItem::action("machine-quiet-hours-set", &quiet_label));
+        if quiet_hours.is_some() {
+            items.push(ContextMenuItem::action(
+                "machine-quiet-hours-clear",
+                "Clear quiet hours",
+            ));
         }
         items.push(ContextMenuItem::separator());
         items.push(ContextMenuItem::action("refresh", "Refresh").with_shortcut("r"));
@@ -200,6 +221,7 @@ impl CoordApp {
             || self.pending_machine_picker.is_some()
             || self.pending_new_terminal_picker.is_some()
             || self.pending_new_terminal.is_some()
+            || self.pending_quiet_hours.is_some()
             || self.pending_repo_picker.is_some()
             || self.refinement_notes_modal.is_some()
             || self.pending_refinement_notes_synth.is_some()
@@ -249,6 +271,7 @@ impl CoordApp {
             || self.pty_panic_dialog.is_some()
             || self.gate_a_error_dialog.is_some()
             || self.pending_new_terminal.is_some()
+            || self.pending_quiet_hours.is_some()
         {
             return None;
         }

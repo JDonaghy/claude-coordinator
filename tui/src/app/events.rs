@@ -1225,6 +1225,37 @@ impl CoordApp {
             }
         }
 
+        // ── #2147: pending "Set quiet hours…" window input ────────────────────
+        // Armed by the Machines-panel right-click menu
+        // (`open_quiet_hours_dialog`). Enter validates + spawns via
+        // `submit_quiet_hours` — which re-arms `pending_quiet_hours` (buffer
+        // intact) on a parse error rather than closing, so malformed input
+        // keeps the dialog open with nothing spawned. Esc cancels outright.
+        if self.pending_quiet_hours.is_some() {
+            if let UiEvent::KeyPressed { key, .. } = &event {
+                match key {
+                    Key::Named(NamedKey::Enter) => {
+                        self.submit_quiet_hours();
+                    }
+                    Key::Named(NamedKey::Escape) => {
+                        self.pending_quiet_hours = None;
+                    }
+                    Key::Named(NamedKey::Backspace) => {
+                        if let Some(ref mut input) = self.pending_quiet_hours {
+                            input.buf.pop();
+                        }
+                    }
+                    Key::Char(ch) => {
+                        if let Some(ref mut input) = self.pending_quiet_hours {
+                            input.buf.push(*ch);
+                        }
+                    }
+                    _ => {}
+                }
+                return Reaction::Redraw;
+            }
+        }
+
         // ── #353: Pending repo picker for [Add] button ─────────────────────────
         // When multiple repos exist, this shows a numeric picker (1, 2, …).
         // Numeric keys select a repo, Enter dispatches, Esc cancels.

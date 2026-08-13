@@ -40697,6 +40697,7 @@ Milestone tracking issue.
                 .collect(),
             quiet: std::collections::HashSet::new(),
             cordoned: std::collections::HashSet::new(),
+            quiet_hours: std::collections::HashMap::new(),
         })
         .unwrap();
         app.pending_paused_machines = Some(rx);
@@ -40725,6 +40726,7 @@ Milestone tracking issue.
             paused: ["dellserver".to_string()].into_iter().collect(),
             quiet: std::collections::HashSet::new(),
             cordoned: std::collections::HashSet::new(),
+            quiet_hours: std::collections::HashMap::new(),
         })
         .unwrap();
         app.pending_paused_machines = Some(rx);
@@ -40947,12 +40949,486 @@ Milestone tracking issue.
             paused: ["dellserver".to_string()].into_iter().collect(),
             quiet: std::collections::HashSet::new(),
             cordoned: ["dellserver".to_string()].into_iter().collect(),
+            quiet_hours: std::collections::HashMap::new(),
         })
         .unwrap();
         app.pending_paused_machines = Some(rx);
 
         assert!(app.poll_paused_machines(), "a new cordon must trigger a redraw");
         assert!(app.cordoned_machines.contains("dellserver"));
+    }
+
+    // ── #2147: TUI half of "set a machine's quiet hours from the Machines
+    // panel" — right-click → "Set quiet hours…" opens a single-text-input
+    // dialog (`pending_quiet_hours`), pre-filled from `quiet_hours_windows`
+    // (populated from the daemon's `GET /pause` `quiet_hours` map, #2146).
+    // Submit spawns `coord quiet-hours <machine> <window> [--tz <tz>]`
+    // through the same `spawn_queued` seam `machine-pause` uses.
+
+    fn quiet_hours_machine(name: &str) -> Machine {
+        Machine {
+            name: name.to_string(),
+            host: String::new(),
+            reachable: true,
+            active_count: 0,
+            repos: vec![],
+            version: None,
+            worktree_bytes: 0,
+        }
+    }
+
+    /// Black-box: right-click a machine row with no window set must offer
+    /// "Set quiet hours…" (not the "Quiet hours: …" schedule label, and no
+    /// "Clear quiet hours" item — nothing to clear yet); activating it must
+    /// open the dialog pre-filled with the `22:00-08:00` default.
+    #[test]
+    fn tuidriver_right_click_machine_row_offers_set_quiet_hours() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = CoordApp {
+            data: BoardData {
+                machines: vec![quiet_hours_machine("dellserver")],
+                ..BoardData::default()
+            },
+            active_view: SidebarView::Machines,
+            ..make_test_app(BoardData::default())
+        };
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+
+        let (x, y) = driver.find("● dellserver").unwrap_or_else(|| {
+            panic!(
+                "#2147: could not find machine row 'dellserver':\n{}",
+                driver.screen()
+            )
+        });
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: MouseButton::Right,
+            position: Point::new(x, y),
+            modifiers: Modifiers::default(),
+        });
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Set quiet hours…"),
+            "#2147: right-click menu must offer 'Set quiet hours…' when none is set:\n{screen}",
+        );
+        assert!(
+            !screen.contains("Clear quiet hours"),
+            "#2147: 'Clear quiet hours' must not appear when no window is set:\n{screen}",
+        );
+
+        // Menu order: "Pause routing" (idx 0, initial selection), "Set
+        // quiet hours…" (idx 1). Keyboard nav, not a raw coordinate click —
+        // see `tuidriver_copy_issue_number_writes_clipboard_and_toasts_copied`
+        // for why: a click on a context-menu item's text doesn't reliably
+        // land on the popup's hit-test in these tests, only Dialog buttons do.
+        driver.press_named(quadraui::NamedKey::Down);
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Set quiet hours: dellserver"),
+            "#2147: activating the item must open the dialog:\n{screen}",
+        );
+        assert!(
+            screen.contains("22:00-08:00"),
+            "#2147: the dialog must pre-fill the 22:00-08:00 default when no \
+             window is set:\n{screen}",
+        );
+    }
+
+    /// Black-box: a machine that already has a window set must show the
+    /// schedule in the menu label itself (`Quiet hours: HH:MM-HH:MM…`) plus
+    /// a "Clear quiet hours" item, and activating the label must re-open the
+    /// dialog pre-filled with the CURRENT window (start, end and tz) rather
+    /// than the bare default — an operator adjusting a window shouldn't have
+    /// to remember what it was.
+    #[test]
+    fn tuidriver_right_click_machine_row_with_window_shows_schedule_and_prefill() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = CoordApp {
+            data: BoardData {
+                machines: vec![quiet_hours_machine("dellserver")],
+                ..BoardData::default()
+            },
+            active_view: SidebarView::Machines,
+            ..make_test_app(BoardData::default())
+        };
+        app.quiet_hours_windows.insert(
+            "dellserver".to_string(),
+            data::QuietHoursWindow {
+                start: "21:00".to_string(),
+                end: "07:30".to_string(),
+                tz: "America/Chicago".to_string(),
+                source: "store".to_string(),
+            },
+        );
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+
+        let (x, y) = driver.find("● dellserver").unwrap_or_else(|| {
+            panic!(
+                "#2147: could not find machine row 'dellserver':\n{}",
+                driver.screen()
+            )
+        });
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: MouseButton::Right,
+            position: Point::new(x, y),
+            modifiers: Modifiers::default(),
+        });
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Quiet hours: 21:00-07:30…"),
+            "#2147: the menu label must read back the current schedule:\n{screen}",
+        );
+        assert!(
+            screen.contains("Clear quiet hours"),
+            "#2147: 'Clear quiet hours' must appear once a window is set:\n{screen}",
+        );
+
+        // Menu order: "Pause routing" (idx 0), "Quiet hours: 21:00-07:30…"
+        // (idx 1) — see the keyboard-nav comment above.
+        driver.press_named(quadraui::NamedKey::Down);
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("21:00-07:30 America/Chicago"),
+            "#2147: the dialog must pre-fill the machine's CURRENT window, \
+             not the bare default:\n{screen}",
+        );
+    }
+
+    /// Black-box: typing a well-formed window and clicking Submit must run
+    /// the command and close the dialog — the visible proof that the
+    /// `submit_quiet_hours` path fires. The exact argv reaching
+    /// `command_runner` is asserted separately at the direct-app level
+    /// below (`driver_with_shell` wraps `CoordApp` in an opaque
+    /// `ShellAdapter` with no typed field access — same split the existing
+    /// `sessions_panel_stop_running_session_shows_feedback_toast` /
+    /// `stop_selected_fleet_session_queues_coord_stop` pair uses).
+    #[test]
+    fn tuidriver_quiet_hours_submit_closes_dialog_and_toasts() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = CoordApp {
+            data: BoardData {
+                machines: vec![quiet_hours_machine("dellserver")],
+                ..BoardData::default()
+            },
+            active_view: SidebarView::Machines,
+            ..make_test_app(BoardData::default())
+        };
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+
+        let (x, y) = driver.find("● dellserver").unwrap();
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: MouseButton::Right,
+            position: Point::new(x, y),
+            modifiers: Modifiers::default(),
+        });
+        // Menu order: "Pause routing" (idx 0, initial selection), "Set
+        // quiet hours…" (idx 1). Keyboard nav, not a raw coordinate click —
+        // see `tuidriver_copy_issue_number_writes_clipboard_and_toasts_copied`
+        // for why: a click on a context-menu item's text doesn't reliably
+        // land on the popup's hit-test in these tests, only Dialog buttons do.
+        driver.press_named(quadraui::NamedKey::Down);
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        // The dialog opens pre-filled with "22:00-08:00" — clear it first
+        // (Backspace × len) so the submitted window is exactly what this
+        // test types, not a leftover default.
+        for _ in 0.."22:00-08:00".len() {
+            driver.press_named(quadraui::NamedKey::Backspace);
+        }
+        for ch in "21:00-06:00".chars() {
+            driver.press(Key::Char(ch));
+        }
+        let (sx, sy) = driver.find("Submit").unwrap_or_else(|| {
+            panic!("#2147: dialog Submit button not found:\n{}", driver.screen())
+        });
+        driver.click(sx, sy);
+
+        let screen = driver.screen();
+        // The toast wraps/truncates at panel width ("...quiet hours set
+        // 21:00-06" in a 140-col terminal) — match the stable prefix rather
+        // than the full window text.
+        assert!(
+            screen.contains("quiet hours set 21:00-06"),
+            "#2147: a well-formed submit must toast confirmation:\n{screen}",
+        );
+        assert!(
+            !screen.contains("Set quiet hours: dellserver"),
+            "#2147: the dialog must close after a successful submit:\n{screen}",
+        );
+    }
+
+    /// Black-box (#2147 acceptance): malformed input must keep the dialog
+    /// open (buffer intact, so the operator can fix the typo) and must NOT
+    /// close it or report success — the "no confirmation, nothing spawned"
+    /// contract.
+    #[test]
+    fn tuidriver_quiet_hours_malformed_input_keeps_dialog_open() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = CoordApp {
+            data: BoardData {
+                machines: vec![quiet_hours_machine("dellserver")],
+                ..BoardData::default()
+            },
+            active_view: SidebarView::Machines,
+            ..make_test_app(BoardData::default())
+        };
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+
+        let (x, y) = driver.find("● dellserver").unwrap();
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: MouseButton::Right,
+            position: Point::new(x, y),
+            modifiers: Modifiers::default(),
+        });
+        // Menu order: "Pause routing" (idx 0, initial selection), "Set
+        // quiet hours…" (idx 1). Keyboard nav, not a raw coordinate click —
+        // see `tuidriver_copy_issue_number_writes_clipboard_and_toasts_copied`
+        // for why: a click on a context-menu item's text doesn't reliably
+        // land on the popup's hit-test in these tests, only Dialog buttons do.
+        driver.press_named(quadraui::NamedKey::Down);
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        for _ in 0.."22:00-08:00".len() {
+            driver.press_named(quadraui::NamedKey::Backspace);
+        }
+        for ch in "not-a-window".chars() {
+            driver.press(Key::Char(ch));
+        }
+        let (sx, sy) = driver.find("Submit").unwrap();
+        driver.click(sx, sy);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Set quiet hours: dellserver"),
+            "#2147: a malformed submit must NOT close the dialog:\n{screen}",
+        );
+        assert!(
+            screen.contains("not-a-window"),
+            "#2147: the buffer must survive a failed submit unchanged:\n{screen}",
+        );
+        assert!(
+            !screen.contains("quiet hours set"),
+            "#2147: a malformed submit must never report success:\n{screen}",
+        );
+    }
+
+    /// Direct-app: the exact argv `submit_quiet_hours` hands to
+    /// `command_runner.spawn_queued` — no tz typed ⇒ no `--tz` flag (the CLI
+    /// defaults to the operator's own machine zone, see
+    /// `coord.commands.agent_ops._local_tz_name`); a tz typed ⇒ `--tz`
+    /// appended.
+    #[test]
+    fn submit_quiet_hours_spawns_expected_argv() {
+        let mut app = make_test_app(BoardData {
+            machines: vec![quiet_hours_machine("dellserver")],
+            ..BoardData::default()
+        });
+        app.open_quiet_hours_dialog("dellserver".to_string());
+        app.pending_quiet_hours.as_mut().unwrap().buf = "22:00-08:00".to_string();
+        app.submit_quiet_hours();
+
+        assert_eq!(
+            app.command_runner.spawned_calls,
+            vec![vec![
+                "quiet-hours".to_string(),
+                "dellserver".to_string(),
+                "22:00-08:00".to_string(),
+            ]],
+        );
+        assert!(app.pending_quiet_hours.is_none(), "a clean submit must close the dialog");
+
+        let mut app = make_test_app(BoardData {
+            machines: vec![quiet_hours_machine("dellserver")],
+            ..BoardData::default()
+        });
+        app.open_quiet_hours_dialog("dellserver".to_string());
+        app.pending_quiet_hours.as_mut().unwrap().buf =
+            "22:00-08:00 America/Chicago".to_string();
+        app.submit_quiet_hours();
+
+        assert_eq!(
+            app.command_runner.spawned_calls,
+            vec![vec![
+                "quiet-hours".to_string(),
+                "dellserver".to_string(),
+                "22:00-08:00".to_string(),
+                "--tz".to_string(),
+                "America/Chicago".to_string(),
+            ]],
+        );
+    }
+
+    /// Direct-app (#2147 acceptance): malformed input must never reach
+    /// `spawn_queued` at all, and must re-arm `pending_quiet_hours` with the
+    /// buffer intact rather than clearing it.
+    #[test]
+    fn submit_quiet_hours_malformed_input_spawns_nothing() {
+        let mut app = make_test_app(BoardData {
+            machines: vec![quiet_hours_machine("dellserver")],
+            ..BoardData::default()
+        });
+        app.open_quiet_hours_dialog("dellserver".to_string());
+        app.pending_quiet_hours.as_mut().unwrap().buf = "garbage".to_string();
+        app.submit_quiet_hours();
+
+        assert!(
+            app.command_runner.spawned_calls.is_empty(),
+            "a malformed window must never spawn: {:?}",
+            app.command_runner.spawned_calls,
+        );
+        let pending = app
+            .pending_quiet_hours
+            .as_ref()
+            .expect("a parse error must keep the dialog open");
+        assert_eq!(pending.buf, "garbage", "the buffer must survive intact for a retry");
+    }
+
+    /// Direct-app (#2147 acceptance): Cancel — `dismiss_prompt_dialog`, the
+    /// same outside-click/Esc path every other single-buffer prompt in this
+    /// file uses (see `dismiss_prompt_dialog_clears_quit_confirm` etc.) —
+    /// must discard the pending dialog and spawn nothing.
+    #[test]
+    fn dismiss_prompt_dialog_clears_quiet_hours_and_spawns_nothing() {
+        let mut app = make_test_app(BoardData {
+            machines: vec![quiet_hours_machine("dellserver")],
+            ..BoardData::default()
+        });
+        app.open_quiet_hours_dialog("dellserver".to_string());
+        assert!(app.pending_quiet_hours.is_some());
+
+        app.dismiss_prompt_dialog();
+
+        assert!(app.pending_quiet_hours.is_none());
+        assert!(app.command_runner.spawned_calls.is_empty());
+    }
+
+    /// Direct-app: "Clear quiet hours" (the direct context-menu action, no
+    /// dialog) spawns `coord quiet-hours <name> --clear` and removes the
+    /// entry from `quiet_hours_windows` so the menu immediately reads "Set
+    /// quiet hours…" again rather than a stale schedule.
+    #[test]
+    fn dispatch_quiet_hours_clear_spawns_expected_argv_and_clears_map() {
+        let mut app = make_test_app(BoardData {
+            machines: vec![quiet_hours_machine("dellserver")],
+            ..BoardData::default()
+        });
+        app.quiet_hours_windows.insert(
+            "dellserver".to_string(),
+            data::QuietHoursWindow {
+                start: "21:00".to_string(),
+                end: "07:30".to_string(),
+                tz: "America/Chicago".to_string(),
+                source: "store".to_string(),
+            },
+        );
+
+        let handled = app.dispatch_quiet_hours_clear("dellserver");
+
+        assert!(handled);
+        assert_eq!(
+            app.command_runner.spawned_calls,
+            vec![vec![
+                "quiet-hours".to_string(),
+                "dellserver".to_string(),
+                "--clear".to_string(),
+            ]],
+        );
+        assert!(
+            !app.quiet_hours_windows.contains_key("dellserver"),
+            "clearing must drop the local schedule entry",
+        );
+    }
+
+    /// #2147 correctness trap: setting a window for LATER TONIGHT must not
+    /// badge the machine `[QUIET]` right now — `quiet_hours_windows` (the
+    /// schedule) and `quiet_paused_machines` (who is covered THIS INSTANT)
+    /// are independent fields, and only the latter drives the badge. A
+    /// machine that's merely scheduled must keep reading as available.
+    #[test]
+    fn machines_list_does_not_badge_quiet_for_a_window_that_has_not_started_yet() {
+        let mut app = make_test_app(BoardData {
+            machines: vec![quiet_hours_machine("dellserver")],
+            ..BoardData::default()
+        });
+        // A window IS set (source: store) but does not cover *now* — the
+        // daemon would not have included this machine in `quiet`, so
+        // `quiet_paused_machines` stays empty even though the schedule map
+        // has an entry.
+        app.quiet_hours_windows.insert(
+            "dellserver".to_string(),
+            data::QuietHoursWindow {
+                start: "22:00".to_string(),
+                end: "08:00".to_string(),
+                tz: "UTC".to_string(),
+                source: "store".to_string(),
+            },
+        );
+        assert!(app.quiet_paused_machines.is_empty());
+        assert!(app.paused_machines.is_empty());
+
+        let list = app.machines_list(true);
+        let row_text = list.items[0]
+            .text
+            .spans
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect::<String>();
+
+        assert!(
+            !row_text.contains("[QUIET"),
+            "#2147: a window scheduled for later must not badge the machine \
+             quiet right now:\n{row_text}",
+        );
+        assert!(!row_text.contains("[PAUSED]"));
+    }
+
+    /// The sidebar badge itself, once a window DOES cover *now*, must show
+    /// the schedule text (`[QUIET HH:MM-HH:MM]`), not the bare `[QUIET]` —
+    /// the whole point of #2147 wiring `quiet_hours_windows` through to
+    /// `machines_list`.
+    #[test]
+    fn machines_list_badges_quiet_with_schedule_when_currently_covered() {
+        let mut app = make_test_app(BoardData {
+            machines: vec![quiet_hours_machine("dellserver")],
+            ..BoardData::default()
+        });
+        app.paused_machines = ["dellserver".to_string()].into_iter().collect();
+        app.quiet_paused_machines = ["dellserver".to_string()].into_iter().collect();
+        app.quiet_hours_windows.insert(
+            "dellserver".to_string(),
+            data::QuietHoursWindow {
+                start: "22:00".to_string(),
+                end: "08:00".to_string(),
+                tz: "UTC".to_string(),
+                source: "config".to_string(),
+            },
+        );
+
+        let list = app.machines_list(true);
+        let row_text = list.items[0]
+            .text
+            .spans
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect::<String>();
+
+        assert!(
+            row_text.contains("[QUIET 22:00-08:00]"),
+            "#2147: a currently-covered window must badge with its schedule:\n{row_text}",
+        );
     }
 
     // ── #1553: oracle-loop slice work is attributed to the CHILD issue ──────

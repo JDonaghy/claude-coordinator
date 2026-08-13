@@ -7959,13 +7959,20 @@ impl CoordApp {
                 // #2101: `cordoned` rides in the same fetch for the same
                 // reason — a machine flipping from hand-paused to cordoned
                 // with unchanged `paused` membership must still redraw.
+                // #2147: `quiet_hours` too — a machine's schedule can
+                // change (an operator sets/clears a window, or edits one)
+                // with `paused`/`quiet`/`cordoned` membership all unchanged
+                // (the new window doesn't cover *now* either), and the
+                // sidebar badge/dialog pre-fill must still pick that up.
                 if fresh.paused != self.paused_machines
                     || fresh.quiet != self.quiet_paused_machines
                     || fresh.cordoned != self.cordoned_machines
+                    || fresh.quiet_hours != self.quiet_hours_windows
                 {
                     self.paused_machines = fresh.paused;
                     self.quiet_paused_machines = fresh.quiet;
                     self.cordoned_machines = fresh.cordoned;
+                    self.quiet_hours_windows = fresh.quiet_hours;
                     return true;
                 }
                 false

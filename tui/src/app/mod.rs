@@ -845,6 +845,23 @@ pub(crate) struct PendingNewTerminal {
     buf: String,
 }
 
+/// #2147: pending "Set quiet hours…" dialog for `machine`, armed by the
+/// Machines-panel right-click menu (`machine-quiet-hours-set`). Mirrors
+/// `PendingNewTerminal`'s single-buffer text-input shape exactly — ONE text
+/// field carries the whole window (`HH:MM-HH:MM [tz]`, tz optional and
+/// space-separated), pre-filled with the machine's current schedule (from
+/// `quiet_hours_windows`) or `22:00-08:00` when none is set. Enter/Submit
+/// hands the buffer to `submit_quiet_hours`, which re-arms this (buffer
+/// intact) on a parse error rather than closing the dialog. Esc/Cancel
+/// discards with no spawn.
+#[derive(Clone)]
+pub(crate) struct PendingQuietHours {
+    /// Coordinator machine NAME the window applies to.
+    machine: String,
+    /// Operator-typed buffer: "HH:MM-HH:MM" or "HH:MM-HH:MM Zone/Name".
+    buf: String,
+}
+
 /// #935 Part B: pending "Diagnose & fix stage…" results dialog.
 ///
 /// Populated from the `DIAGNOSE_JSON:` output of a `coord diagnose --json
@@ -2272,6 +2289,23 @@ pub struct CoordApp {
     /// (`data::PausedFetch`'s `cordoned` field). Never consulted for
     /// routing, display only.
     cordoned_machines: std::collections::HashSet<String>,
+    /// #2147: `{machine: QuietHoursWindow}` for every machine with an
+    /// effective quiet-hours schedule (operator-set OR `coordinator.yml`),
+    /// whether or not it covers *now* — unlike `quiet_paused_machines`
+    /// above, which is only the currently-covered subset. Feeds the
+    /// sidebar badge's schedule text (`[QUIET 22:00-08:00]`) and pre-fills
+    /// the "Set quiet hours…" dialog. Only ever populated via the daemon's
+    /// `GET /pause` (`data::PausedFetch`'s `quiet_hours` field); a
+    /// thin-client-less local-file fallback always leaves this empty, same
+    /// gap `quiet_paused_machines`/`cordoned_machines` document.
+    ///
+    /// Deliberately its own field rather than folded into
+    /// `quiet_paused_machines`: setting a window for later tonight must
+    /// update the schedule an operator sees on the next menu open without
+    /// predicting that the machine is paused right now (see the
+    /// `dispatch_context_menu_action`/`submit_quiet_hours` optimistic-update
+    /// comments — the #2101 "leave the sets alone" precedent).
+    quiet_hours_windows: std::collections::HashMap<String, data::QuietHoursWindow>,
     /// #1563: in-flight background fetch of the paused-machine set (local
     /// file read or daemon `GET /pause`, whichever `spawn_paused_machines_fetch`
     /// determined applies). Armed at startup and re-armed by `refresh()` on
@@ -2631,6 +2665,8 @@ pub struct CoordApp {
     /// #954: pending optional-name prompt for a terminal about to be
     /// created — see `PendingNewTerminal`.
     pending_new_terminal: Option<PendingNewTerminal>,
+    /// #2147: pending "Set quiet hours…" dialog — see `PendingQuietHours`.
+    pending_quiet_hours: Option<PendingQuietHours>,
     /// #935 Part B: parsed results from a `coord diagnose --json --dry-run`
     /// run, waiting for the user to choose Recover / Reset / Clear phantom /
     /// Dismiss in `build_prompt_dialog`.
@@ -3669,6 +3705,7 @@ impl CoordApp {
             paused_machines: read_paused_machines(),
             quiet_paused_machines: std::collections::HashSet::new(),
             cordoned_machines: std::collections::HashSet::new(),
+            quiet_hours_windows: std::collections::HashMap::new(),
             pending_paused_machines: Some(spawn_paused_machines_fetch()),
             pending_force_merge: None,
             pending_merge_all_ready: None,
@@ -3733,6 +3770,7 @@ impl CoordApp {
             pending_machine_picker: None,
             pending_new_terminal_picker: None,
             pending_new_terminal: None,
+            pending_quiet_hours: None,
             pending_diagnose_dialog: None,
             pending_diagnose_legacy_retry: None,
             pending_quit_confirm: false,
@@ -6799,7 +6837,26 @@ impl CoordApp {
                 if self.cordoned_machines.contains(&m.name) {
                     spans.push(StyledSpan::with_fg(" [DRAINING]", Color::rgb(170, 130, 240)));
                 } else if self.quiet_paused_machines.contains(&m.name) {
-                    spans.push(StyledSpan::with_fg(" [QUIET]", Color::rgb(90, 160, 230)));
+                    // #2147: append the schedule (and lighten the color for
+                    // a `coordinator.yml`-sourced window vs. an
+                    // operator-set one) when known; `quiet_hours_windows`
+                    // can lag `quiet_paused_machines` by up to one poll
+                    // (different fields of the same `GET /pause` fetch, but
+                    // an older daemon populates only the latter), so a bare
+                    // `[QUIET]` is still the correct fallback rather than
+                    // blocking the badge on it.
+                    let (label, color) = match self.quiet_hours_windows.get(&m.name) {
+                        Some(w) if w.source == "store" => (
+                            format!(" [QUIET {}-{}]", w.start, w.end),
+                            Color::rgb(120, 190, 255),
+                        ),
+                        Some(w) => (
+                            format!(" [QUIET {}-{}]", w.start, w.end),
+                            Color::rgb(90, 160, 230),
+                        ),
+                        None => (" [QUIET]".to_string(), Color::rgb(90, 160, 230)),
+                    };
+                    spans.push(StyledSpan::with_fg(label, color));
                 } else if self.paused_machines.contains(&m.name) {
                     spans.push(StyledSpan::with_fg(" [PAUSED]", Color::rgb(230, 180, 60)));
                 }
