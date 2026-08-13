@@ -1672,6 +1672,41 @@ class NotificationsConfig:
 
 
 @dataclass
+class PortalConfig:
+    """The outbound client to coord-portal's sync bridge (#2179, ``docs/CUSTOMER_PORTAL.md``).
+
+    Absent block == disabled == coord never talks to the portal — unchanged
+    behaviour for every existing deployment, and the correct default until
+    ``BRIDGE_CLIENT_ID``/``BRIDGE_CLIENT_SECRET`` actually exist in production
+    (they do not, as of #2179: ``wrangler secret list`` on the portal has no
+    entry for either).
+
+    The portal is a third party from coord's perspective — a push failure
+    must be retried and surfaced, never fatal to a merge or a dispatch.
+    Nothing in :mod:`coord.portal_bridge` sits on the dispatch path; it is a
+    client other code calls, not a check anything blocks on.
+    """
+
+    enabled: bool = False
+    # e.g. "https://intake.heurontech.com". No default: a client pointed at
+    # nothing by accident is worse than one that refuses to start.
+    base_url: str | None = None
+    # The Cloudflare Access service-token pair coord-portal's
+    # ``isBridgeAuthorized`` requires as a matched, non-empty pair (half a
+    # credential is not a credential, and it fails closed on exactly that).
+    # Support ``${VAR}`` expansion (mirrors ``providers.definitions[*].env``)
+    # so the real secret lives in the environment, never committed in
+    # coordinator.yml.
+    bridge_client_id: str | None = None
+    bridge_client_secret: str | None = None
+    timeout_secs: float = 10.0
+    # Retries are for transient/5xx failures only — see
+    # coord.portal_bridge.PortalBridgeClient. A 401 never retries: a bad
+    # credential does not become a good one on attempt two.
+    max_retries: int = 2
+
+
+@dataclass
 class Config:
     repos: list[Repo]
     machines: list[Machine]
@@ -1695,6 +1730,8 @@ class Config:
     health: HealthConfig = field(default_factory=HealthConfig)
     # #1632 — absent block == disabled == today's behaviour (silence).
     notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
+    # #2179 — absent block == disabled == coord never talks to coord-portal.
+    portal: PortalConfig = field(default_factory=PortalConfig)
     path: Path | None = None
 
     def repo(self, name: str) -> Repo | None:
@@ -1767,6 +1804,7 @@ def parse_mapping(raw: Any, *, path: Path | None = None) -> Config:
     pricing = _parse_pricing(raw.get("pricing"))
     health = _parse_health(raw.get("health"))
     notifications = _parse_notifications(raw.get("notifications"))
+    portal = _parse_portal(raw.get("portal"))
 
     return Config(
         repos=repos,
@@ -1789,6 +1827,7 @@ def parse_mapping(raw: Any, *, path: Path | None = None) -> Config:
         pricing=pricing,
         health=health,
         notifications=notifications,
+        portal=portal,
         path=p,
     )
 
@@ -3237,6 +3276,85 @@ def _expand_env_vars(value: str) -> str:
         return os.environ.get(var, m.group(0))
 
     return _ENV_VAR_RE.sub(_replace, value)
+
+
+_PORTAL_PLAIN_STR_FIELDS = ("base_url",)
+_PORTAL_SECRET_STR_FIELDS = ("bridge_client_id", "bridge_client_secret")
+
+
+def _parse_portal(raw: Any) -> PortalConfig:
+    """Parse the optional ``portal:`` block from coordinator.yml (#2179).
+
+    An absent block returns a **disabled** :class:`PortalConfig` — unchanged
+    behaviour for every existing deployment, and the correct default until
+    ``BRIDGE_CLIENT_ID``/``BRIDGE_CLIENT_SECRET`` exist in production.
+    """
+    if raw is None:
+        return PortalConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'portal' must be a mapping")
+
+    cfg = PortalConfig()
+    known = {f.name for f in fields(PortalConfig)}
+    unknown = sorted(set(raw) - known)
+    if unknown:
+        raise ConfigError(
+            f"unknown portal option(s): {', '.join(unknown)} "
+            f"(valid: {', '.join(sorted(known))})"
+        )
+
+    if "enabled" in raw:
+        if not isinstance(raw["enabled"], bool):
+            raise ConfigError("portal.enabled must be a boolean")
+        cfg.enabled = raw["enabled"]
+
+    for key in _PORTAL_PLAIN_STR_FIELDS:
+        if key in raw:
+            value = raw[key]
+            if value is not None and not isinstance(value, str):
+                raise ConfigError(f"portal.{key} must be a string or null")
+            if isinstance(value, str) and not value.strip():
+                raise ConfigError(f"portal.{key} must be a non-empty string or null")
+            setattr(cfg, key, value.strip().rstrip("/") if isinstance(value, str) else None)
+
+    for key in _PORTAL_SECRET_STR_FIELDS:
+        if key in raw:
+            value = raw[key]
+            if value is not None and not isinstance(value, str):
+                raise ConfigError(f"portal.{key} must be a string or null")
+            if isinstance(value, str):
+                # ${VAR} expansion (mirrors providers.definitions[*].env) so the
+                # real secret lives in the environment, never committed here —
+                # coordinator.yml is public-repo-adjacent operator config, and
+                # these two values are exactly what coord-portal is public
+                # about NOT holding on its own side of the boundary.
+                value = _expand_env_vars(value).strip()
+                if not value:
+                    raise ConfigError(f"portal.{key} must be a non-empty string or null")
+            setattr(cfg, key, value if isinstance(value, str) else None)
+
+    if "timeout_secs" in raw:
+        value = raw["timeout_secs"]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            raise ConfigError("portal.timeout_secs must be a positive number")
+        cfg.timeout_secs = float(value)
+
+    if "max_retries" in raw:
+        value = raw["max_retries"]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ConfigError("portal.max_retries must be a non-negative integer")
+        cfg.max_retries = value
+
+    if cfg.enabled and not (cfg.base_url and cfg.bridge_client_id and cfg.bridge_client_secret):
+        # Half a credential is not a credential — coord-portal's
+        # isBridgeAuthorized takes the identical position and fails closed on
+        # exactly this. Refuse at parse time rather than 401-looping forever.
+        raise ConfigError(
+            "portal.enabled is true but base_url/bridge_client_id/bridge_client_secret "
+            "are not all set"
+        )
+
+    return cfg
 
 
 def _parse_providers(raw: Any) -> ProvidersConfig:
