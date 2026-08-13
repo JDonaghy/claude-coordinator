@@ -1131,9 +1131,12 @@ impl CoordApp {
                 lifecycle,
                 repo_name.as_deref(),
             ),
-            ContextMenuTarget::MachineRow { name, is_paused } => {
-                self.context_menu_items_for_machine_row(name, *is_paused)
-            }
+            ContextMenuTarget::MachineRow { name, is_paused } => self
+                .context_menu_items_for_machine_row(
+                    name,
+                    *is_paused,
+                    self.quiet_hours_windows.get(name),
+                ),
             ContextMenuTarget::MilestoneHeader {
                 repo_name,
                 tracking_issue,
@@ -1597,6 +1600,56 @@ impl CoordApp {
                 input: Some(DialogInput::TextInput(DialogTextInput {
                     value: input.buf.clone(),
                     placeholder: "terminal name…".into(),
+                    cursor: Some(input.buf.len()),
+                })),
+            });
+        }
+
+        // ── #2147: "Set quiet hours…" window input ──────────────────────────
+        // Armed by the Machines-panel right-click menu
+        // (`machine-quiet-hours-set`), pre-filled with the machine's current
+        // window (or `22:00-08:00`) by `open_quiet_hours_dialog`. One text
+        // field carries the whole window — see `PendingQuietHours`'s doc
+        // comment for why this isn't a 3-field form. Submit/Clear both
+        // dispatch through `submit_quiet_hours`/`clear_quiet_hours_dialog`
+        // (mouse: `fire_dialog_button` below; keyboard: `events.rs`).
+        if let Some(ref input) = self.pending_quiet_hours {
+            return Some(Dialog {
+                table: None,
+                id: WidgetId::new("dialog:quiet-hours"),
+                title: StyledText::plain(format!("Set quiet hours: {}", input.machine)),
+                body: vec![StyledText::plain(
+                    "No new dispatch during this window each day (HH:MM-HH:MM, \
+                     optional trailing time zone):",
+                )],
+                buttons: vec![
+                    DialogButton {
+                        id: WidgetId::new("submit"),
+                        label: "Submit".into(),
+                        is_default: true,
+                        is_cancel: false,
+                        tint: None,
+                    },
+                    DialogButton {
+                        id: WidgetId::new("clear"),
+                        label: "Clear".into(),
+                        is_default: false,
+                        is_cancel: false,
+                        tint: None,
+                    },
+                    DialogButton {
+                        id: WidgetId::new("cancel"),
+                        label: "Cancel".into(),
+                        is_default: false,
+                        is_cancel: true,
+                        tint: None,
+                    },
+                ],
+                severity: None,
+                vertical_buttons: false,
+                input: Some(DialogInput::TextInput(DialogTextInput {
+                    value: input.buf.clone(),
+                    placeholder: "HH:MM-HH:MM [tz]".into(),
                     cursor: Some(input.buf.len()),
                 })),
             });
@@ -2961,6 +3014,8 @@ impl CoordApp {
             self.pending_new_terminal_picker = None;
         } else if self.pending_new_terminal.is_some() {
             self.pending_new_terminal = None;
+        } else if self.pending_quiet_hours.is_some() {
+            self.pending_quiet_hours = None;
         } else if self.pending_test_fix.is_some() {
             // #722: blocking-dialog guard for the test-fix offer.
             let blocked = self
@@ -3173,6 +3228,28 @@ impl CoordApp {
                 }
                 _ => {
                     self.pending_new_terminal = None;
+                }
+            }
+            *self.dialog_layout.borrow_mut() = None;
+            return;
+        }
+
+        // ── #2147: Quiet-hours window prompt (mouse) ──────────────────────
+        // "submit" validates + spawns (`submit_quiet_hours` re-arms the
+        // dialog itself on a parse error, so no early return here for
+        // that case — the dialog layout cache is cleared either way since
+        // the dialog CONTENT changes, not because it necessarily closes).
+        // "clear" spawns `--clear` directly; anything else discards.
+        if self.pending_quiet_hours.is_some() {
+            match id {
+                "submit" => self.submit_quiet_hours(),
+                "clear" => {
+                    if let Some(input) = self.pending_quiet_hours.take() {
+                        self.dispatch_quiet_hours_clear(&input.machine);
+                    }
+                }
+                _ => {
+                    self.pending_quiet_hours = None;
                 }
             }
             *self.dialog_layout.borrow_mut() = None;
@@ -6234,6 +6311,29 @@ impl CoordApp {
                 }
                 true
             }
+            // #2147: "Set quiet hours…" / "Quiet hours: HH:MM-HH:MM…" —
+            // arms the text-input dialog (`pending_quiet_hours`) rather
+            // than spawning directly; the window has to be typed first.
+            "machine-quiet-hours-set" => {
+                let name = match target {
+                    ContextMenuTarget::MachineRow { name, .. } => name.clone(),
+                    _ => return false,
+                };
+                self.open_quiet_hours_dialog(name);
+                true
+            }
+            // #2147: "Clear quiet hours" — direct action, no dialog needed
+            // (there's nothing to type). Mirrors the `machine-pause` arm
+            // above: same three-arm `SpawnQueuedOutcome` match, same toast
+            // shape, same "schedule map only, never the paused/quiet sets"
+            // optimistic-update trap (see `dispatch_quiet_hours_clear`).
+            "machine-quiet-hours-clear" => {
+                let name = match target {
+                    ContextMenuTarget::MachineRow { name, .. } => name.clone(),
+                    _ => return false,
+                };
+                self.dispatch_quiet_hours_clear(&name)
+            }
             // #956: Kill terminal — arms the confirm dialog rather than
             // killing directly (terminals are persistent and may hold live
             // work). Shares `pending_kill_terminal` with the `K` keybinding.
@@ -6737,6 +6837,165 @@ impl CoordApp {
             }
         }
     }
+
+    /// #2147: arm `pending_quiet_hours` for `machine`, pre-filled with its
+    /// current effective window (`quiet_hours_windows`, either an
+    /// operator-set or `coordinator.yml` schedule) or the `22:00-08:00`
+    /// default when none is set — so an operator adjusting an existing
+    /// window sees it rather than a blank field. `tz` is appended
+    /// space-separated only when known (`PendingQuietHours`'s single-buffer
+    /// shape).
+    pub(crate) fn open_quiet_hours_dialog(&mut self, machine: String) {
+        let buf = self
+            .quiet_hours_windows
+            .get(&machine)
+            .map(|w| {
+                if w.tz.is_empty() {
+                    format!("{}-{}", w.start, w.end)
+                } else {
+                    format!("{}-{} {}", w.start, w.end, w.tz)
+                }
+            })
+            .unwrap_or_else(|| "22:00-08:00".to_string());
+        self.pending_quiet_hours = Some(PendingQuietHours { machine, buf });
+    }
+
+    /// #2147: spawn `coord quiet-hours <name> --clear`. Mirrors the
+    /// `machine-pause` context-menu arm's three-outcome `SpawnQueuedOutcome`
+    /// match and toast shape exactly (same CLI/spawn seam, different argv)
+    /// — `Deduped` returns `false` ("not handled", same as that arm),
+    /// everything else returns `true`. Shared by the context menu's direct
+    /// "Clear quiet hours" item and the dialog's "Clear" button.
+    pub(crate) fn dispatch_quiet_hours_clear(&mut self, name: &str) -> bool {
+        use crate::commands::SpawnQueuedOutcome;
+        let outcome = self.command_runner.spawn_queued(&["quiet-hours", name, "--clear"]);
+        match outcome {
+            SpawnQueuedOutcome::Deduped => return false,
+            SpawnQueuedOutcome::Queued => {
+                self.push_toast(
+                    "Quiet hours",
+                    &format!("{name}: clear queued — will run after current command."),
+                    ToastSeverity::Info,
+                );
+            }
+            SpawnQueuedOutcome::Started => {
+                // #2147 trap: the SCHEDULE map only — never
+                // `paused_machines`/`quiet_paused_machines`. A window
+                // clearing does not un-pause a machine currently inside it;
+                // predicting that would flip a still-quiet machine's badge
+                // off for one refresh cycle (#2101 "leave the sets alone"
+                // precedent — see `mod.rs`'s `quiet_hours_windows` doc
+                // comment).
+                self.quiet_hours_windows.remove(name);
+                self.push_toast(
+                    "Quiet hours",
+                    &format!("{name}: quiet hours cleared"),
+                    ToastSeverity::Info,
+                );
+            }
+        }
+        true
+    }
+
+    /// #2147: validate + spawn `coord quiet-hours` for the pending dialog's
+    /// buffer (`pending_quiet_hours`, taken so a parse error can restore it
+    /// verbatim rather than leaving a half-consumed state). Mirrors the
+    /// `machine-pause` arm's three-outcome `SpawnQueuedOutcome` match and
+    /// toast shape (`dispatch_quiet_hours_clear` above); the only new step
+    /// is the client-side shape check before anything reaches
+    /// `spawn_queued` at all — a malformed window must never spawn.
+    pub(crate) fn submit_quiet_hours(&mut self) {
+        let Some(pending) = self.pending_quiet_hours.take() else {
+            return;
+        };
+        let (window, tz) = match parse_quiet_hours_buf(&pending.buf) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                self.push_toast("Quiet hours", &err, ToastSeverity::Warning);
+                // Keep the dialog open, buffer intact, so the operator can
+                // fix the typo rather than retyping the whole window.
+                self.pending_quiet_hours = Some(pending);
+                return;
+            }
+        };
+        let machine = pending.machine;
+        let mut args: Vec<&str> = vec!["quiet-hours", &machine, &window];
+        if let Some(ref tz) = tz {
+            args.push("--tz");
+            args.push(tz);
+        }
+        use crate::commands::SpawnQueuedOutcome;
+        let outcome = self.command_runner.spawn_queued(&args);
+        match outcome {
+            SpawnQueuedOutcome::Deduped => {}
+            SpawnQueuedOutcome::Queued => {
+                self.push_toast(
+                    "Quiet hours",
+                    &format!(
+                        "{machine}: quiet hours queued — will run after current command."
+                    ),
+                    ToastSeverity::Info,
+                );
+            }
+            SpawnQueuedOutcome::Started => {
+                // #2147 trap: the SCHEDULE map only — see
+                // `dispatch_quiet_hours_clear` above for why
+                // `paused_machines`/`quiet_paused_machines` stay untouched.
+                // A window set for later tonight does not pause the
+                // machine now.
+                self.quiet_hours_windows.insert(
+                    machine.clone(),
+                    data::QuietHoursWindow {
+                        start: window.split('-').next().unwrap_or_default().to_string(),
+                        end: window.split('-').nth(1).unwrap_or_default().to_string(),
+                        tz: tz.unwrap_or_default(),
+                        source: "store".to_string(),
+                    },
+                );
+                self.push_toast(
+                    "Quiet hours",
+                    &format!("{machine}: quiet hours set {window}"),
+                    ToastSeverity::Info,
+                );
+            }
+        }
+    }
+}
+
+/// #2147: parse the "Set quiet hours…" dialog buffer into `(window,
+/// Option<tz>)`, or a human-readable error. Accepts `"22:00-08:00"` or
+/// `"22:00-08:00 America/Chicago"` — the first whitespace-separated token
+/// is the window, everything after (trimmed) is an optional IANA zone.
+///
+/// Shape-only, mirroring `coord.commands.agent_ops._parse_window_arg`'s
+/// documented contract: real HH:MM/IANA-zone validation still happens
+/// server-side (`coord.config.parse_quiet_hours_window`, which the CLI
+/// answers a 400 for) — this just catches the "operator fat-fingered it"
+/// cases so a malformed submit never reaches `spawn_queued` at all (the
+/// #2147 acceptance criterion that malformed input keeps the dialog open
+/// and spawns nothing).
+fn parse_quiet_hours_buf(buf: &str) -> Result<(String, Option<String>), String> {
+    let trimmed = buf.trim();
+    if trimmed.is_empty() {
+        return Err("enter a window, e.g. 22:00-08:00".to_string());
+    }
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let window = parts.next().unwrap_or("").trim();
+    let tz = parts.next().map(str::trim).filter(|s| !s.is_empty());
+
+    fn valid_hhmm(s: &str) -> bool {
+        let bytes = s.as_bytes();
+        bytes.len() == 5
+            && bytes[2] == b':'
+            && matches!(s[0..2].parse::<u32>(), Ok(h) if h < 24)
+            && matches!(s[3..5].parse::<u32>(), Ok(m) if m < 60)
+    }
+
+    let halves: Vec<&str> = window.splitn(2, '-').collect();
+    if halves.len() != 2 || !valid_hhmm(halves[0]) || !valid_hhmm(halves[1]) {
+        return Err(format!("window must look like '22:00-08:00', got {window:?}"));
+    }
+    Ok((window.to_string(), tz.map(str::to_string)))
 }
 
 /// #876 / #1022: Derive a coloured status/verdict badge text from an assignment row.

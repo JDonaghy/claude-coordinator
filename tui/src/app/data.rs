@@ -2112,11 +2112,36 @@ pub(crate) fn spawn_paused_machines_fetch() -> std::sync::mpsc::Receiver<PausedF
 /// `[PAUSED]` would tell an operator that a human stopped that machine and
 /// that `coord unpause` is the fix — both wrong. Like `quiet`, only the
 /// daemon's `GET /pause` can populate it.
+///
+/// #2147: `quiet_hours` is a FOURTH, independent field — `{machine:
+/// QuietHoursWindow}` for every machine that has a window, whether or not
+/// it covers *now*. Unlike `quiet` (the currently-covered subset), this is
+/// what the sidebar badge's schedule text and the "Set quiet hours…" dialog's
+/// pre-fill read from. Deliberately never folded into `quiet`/`paused`
+/// membership — see `poll_paused_machines`'s optimistic-update comment for
+/// why a machine having a window does not mean it is paused right now.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PausedFetch {
     pub(crate) paused: std::collections::HashSet<String>,
     pub(crate) quiet: std::collections::HashSet<String>,
     pub(crate) cordoned: std::collections::HashSet<String>,
+    pub(crate) quiet_hours: std::collections::HashMap<String, QuietHoursWindow>,
+}
+
+/// #2147: one machine's effective quiet-hours schedule, parsed from the
+/// daemon's `GET /pause` `quiet_hours` map (`{start, end, tz, source}` —
+/// `coord.machine_pause.local_effective_quiet_hours` on the Python side).
+/// `start`/`end` are `"HH:MM"` strings, `tz` an IANA zone name, `source` is
+/// `"store"` (operator-set via `coord quiet-hours`/this dialog) or
+/// `"config"` (a `coordinator.yml` `quiet_hours:` block) — mirrors
+/// `coord.machine_pause.SOURCE_STORE`/`SOURCE_CONFIG` exactly so the badge
+/// and dialog never need a third vocabulary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QuietHoursWindow {
+    pub(crate) start: String,
+    pub(crate) end: String,
+    pub(crate) tz: String,
+    pub(crate) source: String,
 }
 
 /// #1563: the synchronous half of [`spawn_paused_machines_fetch`] — daemon
@@ -2147,6 +2172,11 @@ fn fetch_paused_machines_resolved(resolved: Option<(String, Option<String>)>) ->
             paused: super::read_paused_machines(),
             quiet: std::collections::HashSet::new(),
             cordoned: std::collections::HashSet::new(),
+            // #2147: the local `~/.coord/paused_machines.json` file has no
+            // notion of quiet-hours windows (that lives in `coordinator.yml`
+            // / the daemon's store) — same gap `quiet`/`cordoned` document
+            // above, not a regression here.
+            quiet_hours: std::collections::HashMap::new(),
         };
     };
     let agent = ureq::AgentBuilder::new()
@@ -2170,16 +2200,49 @@ fn fetch_paused_machines_resolved(resolved: Option<(String, Option<String>)>) ->
                 })
                 .unwrap_or_default()
         }
+        // #2147: `{machine: {start, end, tz, source}}` — absent entirely on
+        // a pre-#2146 daemon, and an individual malformed/incomplete record
+        // (an older daemon's differently-shaped row, a half-written key) is
+        // dropped rather than failing the whole map, exactly like
+        // `machine_pause._stored_quiet_windows`'s per-row `continue` on the
+        // Python side: this is read on every sidebar redraw, so one bad row
+        // must not blank every other machine's schedule.
+        fn quiet_hours_map(
+            v: &serde_json::Value,
+        ) -> std::collections::HashMap<String, QuietHoursWindow> {
+            v.get("quiet_hours")
+                .and_then(|x| x.as_object())
+                .map(|obj| {
+                    obj.iter()
+                        .filter_map(|(name, row)| {
+                            let start = row.get("start")?.as_str()?.to_string();
+                            let end = row.get("end")?.as_str()?.to_string();
+                            let tz = row.get("tz")?.as_str()?.to_string();
+                            let source = row
+                                .get("source")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("config")
+                                .to_string();
+                            Some((
+                                name.clone(),
+                                QuietHoursWindow { start, end, tz, source },
+                            ))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
         // `paused` must be present to trust the response at all (matches
-        // the pre-#1862 contract exactly); `quiet` and `cordoned` (#2101)
-        // are newer, optional fields — their absence (an older daemon)
-        // degrades to "no such distinction available" rather than
-        // discarding the whole response.
+        // the pre-#1862 contract exactly); `quiet`, `cordoned` (#2101) and
+        // `quiet_hours` (#2147) are newer, optional fields — their absence
+        // (an older daemon) degrades to "no such distinction available"
+        // rather than discarding the whole response.
         v.get("paused")?;
         Some(PausedFetch {
             paused: str_set(&v, "paused"),
             quiet: str_set(&v, "quiet"),
             cordoned: str_set(&v, "cordoned"),
+            quiet_hours: quiet_hours_map(&v),
         })
     })()
     .unwrap_or_default()
