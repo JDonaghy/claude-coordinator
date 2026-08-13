@@ -556,6 +556,64 @@ def test_dispatch_smoke_sends_to_capable_different_machine(
     assert "make test" in payload["briefing"]
 
 
+def test_dispatch_smoke_pins_model_to_models_default(
+    gtk_and_server_config: Config,
+) -> None:
+    """#2168: the Test stage used to dispatch with no `model` at all, so the
+    agent fell through to the machine's ambient `claude -p` default (Opus)
+    instead of the configured `models.default`. Mirrors the review path
+    (coord/review.py, coord/gate_b.py): the resolved alias lands on both the
+    wire payload (what the agent actually runs with) and the returned
+    `Assignment.model` (what `coord usage` reports)."""
+    cfg = replace(
+        gtk_and_server_config,
+        models=replace(gtk_and_server_config.models, default="haiku"),
+    )
+    client = _FakeClient({"id": "smoke-1"})
+    result = dispatch_smoke(
+        _completed(), Board(), cfg,
+        http_client=client,
+        diff_lookup=lambda repo, branch: ["src/gtk/window.c"],
+    )
+    assert result is not None
+    assert result.model == "haiku"
+
+    assert len(client.calls) == 1
+    _, payload = client.calls[0]
+    assert payload["model"] == "haiku"
+
+
+def test_dispatch_smoke_model_pin_ignores_models_labels(
+    gtk_and_server_config: Config,
+) -> None:
+    """#2168: the Test stage's difficulty is a property of the repo's test
+    command, never the issue's tier label — mirrors #1430's review-path
+    decision. A `models.labels` entry that would route a `type="work"`
+    dispatch to `opus` must NOT leak into the Test stage's model pin; it
+    must still resolve to `models.default`. Guards against re-introducing
+    the #1798 label leak through this new path."""
+    cfg = replace(
+        gtk_and_server_config,
+        models=replace(
+            gtk_and_server_config.models,
+            default="sonnet",
+            labels={"tier:large": "opus"},
+        ),
+    )
+    client = _FakeClient({"id": "smoke-1"})
+    result = dispatch_smoke(
+        _completed(), Board(), cfg,
+        http_client=client,
+        diff_lookup=lambda repo, branch: ["src/gtk/window.c"],
+    )
+    assert result is not None
+    assert result.model == "sonnet"
+
+    assert len(client.calls) == 1
+    _, payload = client.calls[0]
+    assert payload["model"] == "sonnet"
+
+
 def test_dispatch_smoke_refuses_machine_whose_probe_contradicts_its_capability(
     gtk_and_server_config: Config,
 ) -> None:
