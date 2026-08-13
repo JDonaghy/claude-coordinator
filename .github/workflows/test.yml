@@ -115,6 +115,55 @@ jobs:
       - run: pip install -e ".[dev]"
       - run: scripts/run_tests_without_gh.sh python -m pytest tests/ -q
 
+  # #2170: run the full suite in the environment of a REAL FLEET MACHINE — a
+  # populated `~/.coord/` (thin-client shaped), no `sqlite3` on PATH, and a
+  # `$TMPDIR` under an ancestor pytest config.
+  #
+  # This job exists because the `test` matrix above is structurally incapable
+  # of catching the class it covers. Six tests failed on `origin/main` on every
+  # fleet machine while `ubuntu-latest` stayed green on 3.12 AND 3.13 — the
+  # INVERSE of the familiar "passes locally, fails only in CI ⇒ ambient $HOME"
+  # pattern. They passed in CI *precisely because* CI's `$HOME` is empty, and a
+  # matrix whose only environment is the empty one can never see that.
+  #
+  # What it cost while invisible: the Test stage on `precision` could not
+  # produce a green verdict for this repo on ANY branch. Every dispatch there
+  # returned `SMOKE: fail`, the branch was blamed for breakage it did not
+  # cause, and a human read the log and adjudicated — 11m36s and $0.61 for zero
+  # signal about the branch, repeatedly, for months (claude-coordinator#2158).
+  #
+  # SAME SHAPE AS `no-gh-on-path` ABOVE, AND FOR THE SAME REASON. That job
+  # (#1484) exists because a host-dependent `gh` made the suite's result depend
+  # on the machine rather than the code; this one exists because a
+  # host-dependent `$HOME`/`$PATH`/`$TMPDIR` did the same thing in the opposite
+  # direction. Both mask by NAME rather than by dropping PATH directories — see
+  # `scripts/run_tests_in_populated_home.sh`'s header for why
+  # `PATH=/usr/bin:/bin` is the wrong recipe here.
+  #
+  # `tests/test_ambient_home_isolation.py` pins the specific affected targets
+  # on every run everywhere (including this job, and including a fleet
+  # machine's own Test leg) — that is the always-on gate, and it is what fails
+  # first if one of the three regresses. THIS job is the whole-suite sweep: it
+  # is what finds the NEXT test of this class before a fleet machine does.
+  # Verified at authoring time: 9590 passed, 13 skipped under these three knobs.
+  populated-home:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: scripts/run_tests_in_populated_home.sh python -m pytest tests/ -q
+      - name: What a red result here means
+        if: failure()
+        run: |
+          echo "::error::The suite is red under a POPULATED \$HOME (thin-client ~/.coord/, no sqlite3 on PATH, \$TMPDIR under an ancestor pytest config) while the plain 'test' job may well be green."
+          echo "That difference IS the finding, not noise: a test that needs an empty \$HOME cannot pass on any fleet machine, so the Test stage there can never go green and every dispatch costs a human adjudication (#2170)."
+          echo "Fix the TEST's isolation -- redirect \$HOME/XDG at tmp_path, drop COORD_SERVICE_URL/COORD_TOKEN/COORD_CONFIG, skip-guard an unprovisioned system binary, pin a nested pytest's --rootdir."
+          echo "Do NOT fix it by making the product trust an ambient path: 'coord config --config' is deliberately NOT authoritative on a thin client (CLAUDE.md, docs/EPHEMERAL_WORKERS.md)."
+          echo "Reproduce locally: scripts/run_tests_in_populated_home.sh python -m pytest tests/ -q"
+
   # #906: run the test suite in thin-client mode with COORD_STRICT_LOCAL_BOARD=1
   # so any board touch reachable from a thin-client path raises RuntimeError
   # instead of silently no-oping against an empty local DB.  This job catches
