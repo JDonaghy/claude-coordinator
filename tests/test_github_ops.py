@@ -1143,6 +1143,75 @@ class TestListRepoDir:
                 github_ops.list_repo_dir("acme/api", "tests/acceptance/ms-1/mocks")
 
 
+class TestListRepoSubdirs:
+    """#2164: the ``type == "dir"`` sibling of ``list_repo_dir`` — used to
+    enumerate ``tests/acceptance/ms-*/`` via the API alone (no local
+    checkout) when hunting for the manifest that maps a given issue."""
+
+    def test_returns_dir_names_only(self) -> None:
+        payload = json.dumps([
+            {"name": "ms01", "type": "dir"},
+            {"name": "ms02", "type": "dir"},
+            {"name": "README.md", "type": "file"},
+        ])
+        with patch("coord.github_ops._gh", return_value=payload):
+            names = github_ops.list_repo_subdirs("acme/api", "tests/acceptance", branch="main")
+        assert sorted(names) == ["ms01", "ms02"]
+
+    def test_a_single_file_path_returns_empty_list(self) -> None:
+        payload = json.dumps({"name": "contract.md", "type": "file"})
+        with patch("coord.github_ops._gh", return_value=payload):
+            assert github_ops.list_repo_subdirs("acme/api", "tests/acceptance/ms-1/contract.md") == []
+
+
+class TestGetRepoFileWithSha:
+    """#2164: get_repo_file's sha-returning sibling — the optimistic-
+    concurrency token update_repo_file needs to PUT an edit."""
+
+    def test_returns_content_and_sha(self) -> None:
+        import base64
+        payload = json.dumps({"content": base64.b64encode(b"hello\n").decode(), "sha": "abc123"})
+        with patch("coord.github_ops._gh", return_value=payload):
+            content, sha = github_ops.get_repo_file_with_sha("acme/api", "README.md", branch="main")
+        assert content == "hello\n"
+        assert sha == "abc123"
+
+    def test_get_repo_file_is_a_thin_wrapper(self) -> None:
+        import base64
+        payload = json.dumps({"content": base64.b64encode(b"hi\n").decode(), "sha": "xyz"})
+        with patch("coord.github_ops._gh", return_value=payload):
+            assert github_ops.get_repo_file("acme/api", "README.md") == "hi\n"
+
+    def test_missing_sha_is_treated_as_malformed(self) -> None:
+        payload = json.dumps({"content": "aGk="})  # no "sha" key
+        with patch("coord.github_ops._gh", return_value=payload):
+            with pytest.raises(RuntimeError):
+                github_ops.get_repo_file_with_sha("acme/api", "README.md")
+
+
+class TestUpdateRepoFile:
+    """#2164: the Contents-API write half of the post-merge expected_red
+    clearing sweep — a single commit directly on a branch, no local
+    checkout, no raw `git push`."""
+
+    def test_puts_base64_content_with_message_branch_and_sha(self) -> None:
+        payload = json.dumps({"commit": {"sha": "newsha"}})
+        with patch("coord.github_ops._gh", return_value=payload) as mock_gh:
+            result = github_ops.update_repo_file(
+                "acme/api", "tests/acceptance/ms01/manifest.yml", "coord/clear-1",
+                "tests:\n  a: 1\n", "coord acceptance: clear expected_red",
+                sha="blobsha",
+            )
+        assert result == "newsha"
+        args = mock_gh.call_args.args
+        assert args[:3] == ("api", "-X", "PUT")
+        assert args[3] == "repos/acme/api/contents/tests/acceptance/ms01/manifest.yml"
+        joined = " ".join(args)
+        assert "message=coord acceptance: clear expected_red" in joined
+        assert "branch=coord/clear-1" in joined
+        assert "sha=blobsha" in joined
+
+
 def _unified_diff(content: str) -> str:
     """A minimal single-file unified diff adding *content* as line 1 of ``foo``."""
     return (

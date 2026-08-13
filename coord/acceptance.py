@@ -512,13 +512,23 @@ def apply_expected_red(verdict: dict[str, Any], expected_red_ids: "set[str]") ->
       (#1965's "an assertion that never exercised the bug"). A single one
       of these is enough to fail ``ci_green`` even if every other test is
       green.
+    - ``missing_expected_red_ids``: ids in *expected_red_ids* that appeared
+      in neither the pass nor the fail set — i.e. the driver never emitted
+      a verdict for them at all (a broken entry point, an accidentally
+      deleted test — the same "wiring failure" :func:`build_verdict`'s
+      scoped-verdict sibling already detects via its own ``missing_ids``,
+      #1125 review finding 2; the ``--all``/``--ci`` path had no equivalent
+      until now). Also enough to fail ``ci_green`` — a vanished
+      expected-red test is invisible either way (neither
+      ``expected_red_still_red`` nor ``unexpected_green``) unless this is
+      checked explicitly.
     - ``ci_green``: true iff there are zero real (non-expected-red)
-      failures AND zero unexpected-green ids AND at least one test ran.
-      This — not the raw ``green`` — is what a CI gate should key off of;
-      ``green`` is left untouched so existing (non-CI) callers of
-      :func:`build_verdict` see no behavior change.
+      failures AND zero unexpected-green ids AND zero missing-expected-red
+      ids AND at least one test ran. This — not the raw ``green`` — is what
+      a CI gate should key off of; ``green`` is left untouched so existing
+      (non-CI) callers of :func:`build_verdict` see no behavior change.
 
-    A no-op (``ci_green == green``, both new lists empty) when
+    A no-op (``ci_green == green``, all three new lists empty) when
     *expected_red_ids* is empty — the overwhelmingly common case (most
     slices have nothing expected-red).
     """
@@ -526,22 +536,29 @@ def apply_expected_red(verdict: dict[str, Any], expected_red_ids: "set[str]") ->
     if not expected_red_ids:
         verdict["expected_red_still_red"] = []
         verdict["unexpected_green"] = []
+        verdict["missing_expected_red_ids"] = []
         verdict["ci_green"] = verdict["green"]
         return verdict
 
+    seen_ids = {t["id"] for t in tests}
     unexpected_green = sorted(
         t["id"] for t in tests if t.get("status") == "pass" and t["id"] in expected_red_ids
     )
     expected_red_still_red = sorted(
         t["id"] for t in tests if t.get("status") == "fail" and t["id"] in expected_red_ids
     )
+    missing_expected_red_ids = sorted(expected_red_ids - seen_ids)
     real_failures = sum(
         1 for t in tests if t.get("status") == "fail" and t["id"] not in expected_red_ids
     )
     verdict["unexpected_green"] = unexpected_green
     verdict["expected_red_still_red"] = expected_red_still_red
+    verdict["missing_expected_red_ids"] = missing_expected_red_ids
     verdict["ci_green"] = (
-        len(tests) > 0 and real_failures == 0 and not unexpected_green
+        len(tests) > 0
+        and real_failures == 0
+        and not unexpected_green
+        and not missing_expected_red_ids
     )
     return verdict
 
@@ -640,6 +657,16 @@ _EXPECTED_RED_KEY_RE = re.compile(r"^expected_red\s*:\s*(#.*)?$")
 
 
 def _issue_header_re(issue_number: int) -> re.Pattern[str]:
+    """Matches *issue_number*'s block-style ``554:`` (or ``"554":``) header
+    line, on a line of its own, with its test-id list on the lines that
+    follow — the documented/example ``expected_red:`` shape everywhere in
+    this codebase (see ``tests/acceptance/ms-33/manifest.yml``). A
+    flow-style single-line entry (``554: [a, b]``) does NOT match this
+    regex; :func:`clear_expected_red_entries` silently no-ops for it (its
+    own "nothing changed" contract) rather than clearing anything — low
+    risk since nothing else in this module authors or expects flow style,
+    but worth knowing if a manifest is ever hand-edited into that shape.
+    """
     return re.compile(rf"^(\s*)['\"]?{issue_number}['\"]?\s*:\s*(#.*)?$")
 
 
@@ -700,12 +727,14 @@ def clear_expected_red_entries(
     ``manifest.yml``'s raw *text*, preserving every other line — including
     comments — byte-for-byte.
 
-    Used by ``coord acceptance record``'s trust-gate clearing step (the
-    coordinator, never a worker, observes a previously-expected-red test go
-    green externally and drops it from the registry) — the manifest carries
-    hand-written commentary (see ``tests/acceptance/ms-33/manifest.yml``)
-    that a parse-and-``yaml.safe_dump`` round-trip would destroy, so this
-    edits the text directly instead of going through :mod:`yaml`.
+    Used by :func:`clear_expected_red_via_pr` — the coordinator's post-merge
+    clearing sweep (never a worker, and never before the fix that made these
+    ids green has actually landed on the default branch — see that
+    function's docstring for why record-time was the wrong moment) — the
+    manifest carries hand-written commentary (see
+    ``tests/acceptance/ms-33/manifest.yml``) that a parse-and-
+    ``yaml.safe_dump`` round-trip would destroy, so this edits the text
+    directly instead of going through :mod:`yaml`.
 
     Returns the updated text, or ``None`` when nothing changed (no matching
     id was found under *issue_number* — the caller should skip committing a
@@ -750,3 +779,245 @@ def clear_expected_red_entries(
     if not changed:
         return None
     return "".join(out)
+
+
+# ── #2164: post-merge, API-only clearing sweep ───────────────────────────
+#
+# The first cut of this feature cleared `expected_red` from inside `coord
+# acceptance record` via a raw `git push origin HEAD:{default_branch}`. A
+# review caught two problems with that: (1) `record` runs at the trust-gate
+# step, which can be steps (Test/Review/the actual merge) before the fix
+# has landed on the default branch at all — clearing that early reopens the
+# exact "red default branch" failure mode #2164 exists to prevent, just
+# relocated in time; (2) a raw push straight to the default branch is
+# rejected outright by any repo with branch protection (this one included
+# — see CLAUDE.md's "a plain `git push origin main` is rejected, even for
+# admins").
+#
+# The fix for both: never touch git directly, and never fire until the fix
+# has actually merged. `coord.merge_queue.process` calls
+# `clear_expected_red_via_pr` right after `gh_ops.merge_pr` succeeds for a
+# `type="work"` entry whose acceptance was recorded "passed" against the
+# exact SHA that just merged — i.e. after the ordering event the first cut
+# skipped. The mutation itself goes through a real PR
+# (`github_ops.create_pr` + `github_ops.merge_pr`), the same protected path
+# every other change to the default branch takes — and, since the merge
+# queue has no local checkout at all (see `coord.merge_queue.process`'s
+# docstring), everything here is pure GitHub-API calls, no `git` subprocess.
+
+
+def _default_github_ops():
+    from coord import github_ops  # noqa: PLC0415
+
+    return github_ops
+
+
+def _fetch_ms_manifest_via_api(
+    repo_github: str, branch: str, ms_dir: str, get_file: Callable[..., "tuple[str, str]"],
+) -> "tuple[str, str, str, ManifestData] | None":
+    """One ms-dir's ``manifest.(yml|yaml|json)`` via *get_file* (a
+    ``get_repo_file_with_sha``-shaped callable), trying each extension in
+    turn like :func:`_manifest_paths` does on local disk. Returns ``(path,
+    text, blob_sha, data)`` for the first extension that exists and parses,
+    or ``None`` if none does / the one that exists is malformed."""
+    for ext in (".yml", ".yaml", ".json"):
+        path = f"{ACCEPTANCE_DIRNAME}/{ms_dir}/manifest{ext}"
+        try:
+            text, blob_sha = get_file(repo_github, path, branch)
+        except Exception:  # noqa: BLE001 — this extension doesn't exist, or a transient gh hiccup
+            continue
+        try:
+            data = parse_manifest_text(text, source=path)
+        except ManifestError:
+            return None
+        return path, text, blob_sha, data
+    return None
+
+
+def find_ms_manifest_for_issue_via_api(
+    repo_github: str, branch: str, issue_number: int, *, gh_ops: Any = None,
+) -> "tuple[str, str, str, ManifestData] | None":
+    """API-only (no local checkout) equivalent of :func:`ms_dir_for_issue`:
+    search every ``tests/acceptance/ms-*/manifest.(yml|yaml|json)`` on
+    *branch* via the GitHub Contents API for the one whose ``tests``/
+    ``issues``/``expected_red`` mapping covers *issue_number*.
+
+    Returns ``(path, text, blob_sha, data)`` for the first match (ms-dirs
+    scanned in sorted-name order for determinism), or ``None`` when nothing
+    maps *issue_number* at all. *gh_ops* is any object exposing
+    ``list_repo_subdirs``/``get_repo_file_with_sha`` (defaults to
+    :mod:`coord.github_ops`; tests inject a stub) — mirrors
+    ``coord.merge_queue.GhOps``'s optional-attribute convention: a *gh_ops*
+    that lacks either method (an older stub) is treated as "nothing found"
+    rather than raising, since this whole sweep is best-effort.
+    """
+    ops = gh_ops or _default_github_ops()
+    list_subdirs = getattr(ops, "list_repo_subdirs", None)
+    get_file = getattr(ops, "get_repo_file_with_sha", None)
+    if list_subdirs is None or get_file is None:
+        return None
+    try:
+        subdirs = list_subdirs(repo_github, ACCEPTANCE_DIRNAME, branch)
+    except Exception:  # noqa: BLE001 — best-effort sweep, never raises
+        return None
+
+    for name in sorted(subdirs):
+        found = _fetch_ms_manifest_via_api(repo_github, branch, name, get_file)
+        if found is None:
+            continue
+        _path, _text, _blob_sha, data = found
+        if issue_number in data.expected_red or test_ids_for_issue(data.tests, issue_number):
+            return found
+    return None
+
+
+def list_expected_red_via_api(
+    repo_github: str, branch: str, *, gh_ops: Any = None,
+) -> "dict[str, dict[int, frozenset[str]]]":
+    """Every ``expected_red:`` entry across every ``ms-NN`` manifest on
+    *branch*, via the API alone — the read half of the #2164 visibility
+    story (acceptance criterion 4: "expected_red entries are visible
+    wherever gate state is read, so a long-lived one is not invisible
+    debt"). Backs ``coord acceptance expected-red``.
+
+    Returns ``{ms_dir: {issue_number: {test_id, ...}}}`` — only ms-dirs
+    with at least one expected_red entry are included. ``{}`` on any
+    listing failure or when nothing is expected-red anywhere (best-effort,
+    matches the rest of this module's read paths).
+    """
+    ops = gh_ops or _default_github_ops()
+    list_subdirs = getattr(ops, "list_repo_subdirs", None)
+    get_file = getattr(ops, "get_repo_file_with_sha", None)
+    if list_subdirs is None or get_file is None:
+        return {}
+    try:
+        subdirs = list_subdirs(repo_github, ACCEPTANCE_DIRNAME, branch)
+    except Exception:  # noqa: BLE001
+        return {}
+
+    out: dict[str, dict[int, frozenset[str]]] = {}
+    for name in sorted(subdirs):
+        found = _fetch_ms_manifest_via_api(repo_github, branch, name, get_file)
+        if found is None:
+            continue
+        _path, _text, _blob_sha, data = found
+        if data.expected_red:
+            out[name] = dict(data.expected_red)
+    return out
+
+
+def clear_expected_red_via_pr(
+    repo_github: str,
+    repo_name: str,
+    default_branch: str,
+    issue_number: int,
+    *,
+    gh_ops: Any = None,
+) -> str:
+    """#2164 trust-gate clearing, corrected: call this ONLY after the fix's
+    own PR has actually merged into *default_branch*
+    (``coord.merge_queue.process``, right after ``gh_ops.merge_pr``
+    succeeds) — never at ``coord acceptance record`` time. See this
+    module's "post-merge, API-only clearing sweep" section comment above
+    for the failure this replaces.
+
+    Applies the edit through a real PR + ``gh pr merge``
+    (``github_ops.create_pr`` / ``github_ops.merge_pr``), so a protected
+    default branch accepts it exactly like any other change, instead of a
+    raw push such a repo would reject outright.
+
+    Returns a short, human-readable status line — never raises. Every step
+    is best-effort/non-fatal by design (bookkeeping layered on top of an
+    already-successfully-recorded, already-merged fix): a failure anywhere
+    degrades to a ``"warning: ..."`` string the caller can log, not an
+    exception that could take down merge-queue processing.
+    """
+    ops = gh_ops or _default_github_ops()
+    found = find_ms_manifest_for_issue_via_api(
+        repo_github, default_branch, issue_number, gh_ops=ops,
+    )
+    if found is None:
+        return "no expected_red entries found for this issue"
+    path, text, blob_sha, data = found
+    ids = data.expected_red.get(issue_number, frozenset())
+    if not ids:
+        return "no expected_red entries for this issue"
+
+    if path.endswith(".json"):
+        # #2164 review (non-blocking finding): the text-surgery clearer
+        # below only understands block-style YAML. A JSON manifest parses
+        # and CI-gates correctly but would silently never get entries
+        # cleared this way — say so instead of quietly no-oping.
+        return (
+            f"warning: {path} is a JSON manifest — automatic expected_red "
+            "clearing only supports YAML manifests today; clear "
+            f"{', '.join(sorted(ids))} by hand"
+        )
+
+    new_text = clear_expected_red_entries(text, issue_number, ids)
+    if new_text is None:
+        return "expected_red text unchanged (nothing matched)"
+
+    get_head = getattr(ops, "get_default_branch_head", None)
+    create_branch = getattr(ops, "create_remote_branch", None)
+    update_file = getattr(ops, "update_repo_file", None)
+    create_pr = getattr(ops, "create_pr", None)
+    merge_pr = getattr(ops, "merge_pr", None)
+    if not all((get_head, create_branch, update_file, create_pr, merge_pr)):
+        return "warning: gh_ops does not support the expected_red clearing PR path"
+
+    try:
+        base_sha = get_head(repo_github, default_branch)
+    except Exception as exc:  # noqa: BLE001
+        return f"warning: could not resolve {default_branch} tip: {exc}"
+
+    ms_dir = path.split("/")[-2] if "/" in path else "ms"
+    branch_name = f"coord/clear-expected-red-{issue_number}-{ms_dir}"
+    # #944-style idempotency: a prior attempt may have already created this
+    # branch (e.g. a partial failure on a previous merge-queue tick) — a
+    # `False` return just means "already exists", not an error; the write
+    # below still targets it either way.
+    create_branch(repo_github, branch_name, base_sha)
+
+    message = (
+        f"coord acceptance: clear expected_red for {repo_name} #{issue_number} "
+        f"({', '.join(sorted(ids))})"
+    )
+    try:
+        update_file(repo_github, path, branch_name, new_text, message, sha=blob_sha)
+    except Exception as exc:  # noqa: BLE001
+        return f"warning: could not commit expected_red clear: {exc}"
+
+    try:
+        pr = create_pr(
+            repo_github, base=default_branch, head=branch_name,
+            title=f"coord acceptance: clear expected_red for #{issue_number}",
+            body=(
+                f"Automated (#2164 trust gate): {repo_name} #{issue_number}'s "
+                "fix merged and the sealed slice observed green — clearing "
+                f"{', '.join(sorted(ids))} from `{path}`'s `expected_red:`.\n\n"
+                "No worker edited the sealed suite — this is the "
+                "coordinator's own observation, applied through the normal "
+                "protected-branch PR path."
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return f"warning: could not open expected_red clear PR: {exc}"
+
+    try:
+        ok, msg = merge_pr(repo_github, pr["number"], method="squash")
+    except Exception as exc:  # noqa: BLE001
+        return (
+            f"warning: expected_red clear PR #{pr.get('number')} opened but "
+            f"could not merge: {exc}"
+        )
+    if not ok:
+        return (
+            f"expected_red clear PR #{pr['number']} opened but did not "
+            "merge (branch protection / required checks pending?) — will "
+            f"retry on the next merge ({msg})"
+        )
+    return (
+        f"cleared expected_red for #{issue_number}: {', '.join(sorted(ids))} "
+        f"(PR #{pr['number']})"
+    )

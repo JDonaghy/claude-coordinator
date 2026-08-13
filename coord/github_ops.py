@@ -1065,7 +1065,17 @@ def set_test_mode_label(
         pass  # cache update is best-effort
 
 
-def get_repo_file(repo: str, path: str, branch: str = "develop") -> str:
+def get_repo_file_with_sha(repo: str, path: str, branch: str = "develop") -> tuple[str, str]:
+    """Like :func:`get_repo_file` but also returns the blob's current
+    ``sha`` — the Contents API's optimistic-concurrency token
+    :func:`update_repo_file` needs to PUT an edit to this exact revision.
+
+    #2164: added for the post-merge ``expected_red`` clearing sweep
+    (``coord.acceptance.clear_expected_red_via_pr``), which reads-then-edits
+    a manifest purely through the GitHub API (no local checkout — the merge
+    queue is a ``gh``-only wire layer, see ``coord.merge_queue.process``'s
+    docstring). :func:`get_repo_file` is now a thin wrapper over this.
+    """
     import base64
     raw = _gh("api", f"repos/{repo}/contents/{path}?ref={branch}")
     data = _json_loads_or(raw, default=None)
@@ -1075,12 +1085,46 @@ def get_repo_file(repo: str, path: str, branch: str = "develop") -> str:
     # _default_fetch_repo_file) already catch RuntimeError to mean "file
     # doesn't exist" — raise that instead, so a `gh` hiccup degrades to the
     # same handled path as a real 404 rather than an uncaught crash.
-    if not isinstance(data, dict) or "content" not in data:
+    if not isinstance(data, dict) or "content" not in data or "sha" not in data:
         raise RuntimeError(
             f"gh api repos/{repo}/contents/{path}?ref={branch}: "
             "empty or malformed response"
         )
-    return base64.b64decode(data["content"]).decode()
+    return base64.b64decode(data["content"]).decode(), data["sha"]
+
+
+def get_repo_file(repo: str, path: str, branch: str = "develop") -> str:
+    return get_repo_file_with_sha(repo, path, branch)[0]
+
+
+def update_repo_file(
+    repo: str, path: str, branch: str, content: str, message: str, *, sha: str,
+) -> str:
+    """Commit *content* to *path* on *branch* via the Contents API (a single
+    commit, directly on that branch — no local checkout). Returns the new
+    commit sha.
+
+    #2164: the write half of the post-merge ``expected_red`` clearing
+    sweep. *branch* is expected to be a throwaway branch created off the
+    default branch's current tip (:func:`create_remote_branch`) — the
+    resulting commit is then opened as a PR (:func:`create_pr`) and merged
+    the normal way (:func:`merge_pr`), so a protected default branch (this
+    repo's own CLAUDE.md: "main requires passing status checks... a plain
+    `git push origin main` is rejected") accepts it exactly like any other
+    change, instead of a raw push such a repo would reject outright.
+    *sha* is the blob sha from :func:`get_repo_file_with_sha` — the API
+    refuses the write (409) if the file moved since it was read.
+    """
+    import base64
+    raw = _gh(
+        "api", "-X", "PUT", f"repos/{repo}/contents/{path}",
+        "-f", f"message={message}",
+        "-f", f"content={base64.b64encode(content.encode()).decode()}",
+        "-f", f"branch={branch}",
+        "-f", f"sha={sha}",
+    )
+    data = _json_loads_or(raw, default={})
+    return ((data or {}).get("commit") or {}).get("sha", "")
 
 
 def list_repo_dir(repo: str, path: str, branch: str = "develop") -> list[str]:
@@ -1097,6 +1141,21 @@ def list_repo_dir(repo: str, path: str, branch: str = "develop") -> list[str]:
     if not isinstance(data, list):
         return []
     return [entry["name"] for entry in data if entry.get("type") == "file"]
+
+
+def list_repo_subdirs(repo: str, path: str, branch: str = "develop") -> list[str]:
+    """Directory names (not full paths) directly under *path* on *branch* —
+    the ``type == "dir"`` sibling of :func:`list_repo_dir`.
+
+    #2164: used to enumerate ``tests/acceptance/ms-*/`` via the API alone
+    (no local checkout) when hunting for the ``ms-NN`` manifest that maps a
+    given issue — see ``coord.acceptance.find_ms_manifest_for_issue_via_api``.
+    """
+    raw = _gh("api", f"repos/{repo}/contents/{path}?ref={branch}")
+    data = _json_loads_or(raw, default=None)
+    if not isinstance(data, list):
+        return []
+    return [entry["name"] for entry in data if entry.get("type") == "dir"]
 
 
 def check_branch_exists(repo: str, branch: str) -> bool:

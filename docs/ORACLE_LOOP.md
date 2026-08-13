@@ -126,8 +126,9 @@ One command, framework-agnostic above the driver:
 | `coord acceptance run --issue N` | **worker, in-session** | Run issue N's slice via the repo driver; return **structured** per-test pass/fail. Sealed: verdicts only, no test source. |
 | `coord acceptance run --all` | coordinator (Gate C) | Run the full accumulated suite. |
 | `coord acceptance run --all --ci` | **repo CI** (#2164) | Same as `--all`, but honors each manifest's `expected_red:` registry — see below. Point your repo's ordinary acceptance test step at this instead of the raw driver command. |
-| `coord acceptance record --issue N --sha <sha>` | coordinator, **external** | Re-run the sealed slice against the pushed SHA; **write the verdict to the board** (the Acceptance box). The trust gate. Also clears any of issue N's now-passing ids from `expected_red:` on the default branch (#2164). |
+| `coord acceptance record --issue N --sha <sha>` | coordinator, **external** | Re-run the sealed slice against the pushed SHA; **write the verdict to the board** (the Acceptance box). The trust gate. Does **not** touch `expected_red:` itself (#2164 — see below for why and where that clear actually happens). |
 | `coord acceptance stall --issue N --tried … --stuck …` | worker, on non-convergence | Emit the structured stall report + push a WIP snapshot → raises `needs-attention` (#846). |
+| `coord acceptance expected-red <repo>` | anyone, read-only | List every live `expected_red:` entry on the default branch, via the GitHub API — no checkout needed. Flags an issue that's closed on GitHub but still carries entries as `STUCK` (#2164 acceptance criterion 4 — a long-lived entry is not invisible debt). |
 
 **Sealing — climb the ladder:**
 - **v1 (policy):** the acceptance dir is checked out in the worktree but listed in `files_forbidden`;
@@ -180,12 +181,40 @@ expected_red:
   that **passes** is the opposite signal: a hard, loud failure (`ci_green` goes false, with a
   distinct "HARD FAILURE" message naming the id) — the vacuous-assertion case #1965 cares about,
   caught mechanically instead of needing a human to eyeball it.
-- **`coord acceptance record`** — the external trust gate that already re-runs a fix's sealed slice
-  against its pushed SHA — clears an `expected_red` entry the moment it observes that id passing
-  externally. This is an **observation**, made by the coordinator, never a worker edit: no worker
-  ever touches `tests/acceptance/**`, sealing is unchanged. The clear lands as its own small commit
-  pushed straight to the default branch (never the fix's own branch, which carries the sealed
-  manifest untouched).
+- **The clear happens after the fix's own PR actually merges — never at `record` time.** The first
+  cut of this feature cleared `expected_red` straight out of `coord acceptance record`, the moment
+  it observed green. A review caught why that's wrong: `record` runs at Phase-1 step 6, and Test
+  (step 7), Review (step 8) and the actual Merge (step 9) all happen *after* it — real wall-clock
+  time in a fleet running many issues concurrently. Clearing at step 6 can land on the default
+  branch before the fix that earned it, so an unrelated PR's ordinary CI run (the very `--ci`
+  wrapper above) executes the sealed suite against code that's *still broken*, no longer covered by
+  `expected_red` — a HARD FAILURE indistinguishable from #1965's real vacuous-assertion signal,
+  reddening the default branch for a reason that has nothing to do with whatever triggered that CI
+  run. That's constraint (1) (Ordering) broken by the fix meant to satisfy it.
+
+  The corrected sequence: `coord.merge_queue.process` (`coord merge`) calls
+  `coord.acceptance.clear_expected_red_via_pr` **right after `gh_ops.merge_pr` succeeds** for the
+  fix's own `type="work"` entry — i.e. only once the merge that's the whole point has actually
+  happened — and only when the board's recorded `acceptance_state` is `"passed"` **at the exact SHA
+  that just merged** (a stale record, e.g. new commits pushed after the last `record`, is skipped
+  with a warning rather than cleared on faith).
+- **The clear goes through a real PR, never a raw push.** The first cut pushed the clearing commit
+  straight to `origin/{default_branch}` — this repo's own CLAUDE.md notes that `main` requires
+  passing status checks, so a plain `git push origin main` is rejected even for admins, and any repo
+  with equivalent branch protection would reject that push every time, silently leaving entries
+  stuck forever (a warning that "record" still reported as overall success). `clear_expected_red_via_pr`
+  instead opens a small PR (`github_ops.create_pr`) and merges it the normal way (`github_ops.merge_pr`)
+  — the same protected path every other change to the default branch takes. It's also pure GitHub-API
+  (no local checkout): `coord merge` is a `gh`-only wire layer with no guaranteed local clone, so the
+  whole sweep — enumerating `tests/acceptance/ms-*/`, reading/editing the manifest, opening/merging
+  the PR — goes through the Contents/PRs API alone.
+- **This is an observation, made by the coordinator, never a worker edit** — sealing is unchanged; no
+  worker ever touches `tests/acceptance/**`, and the fix's own branch carries the sealed manifest
+  untouched throughout.
+- **Visibility (acceptance criterion 4):** `coord acceptance expected-red <repo>` lists every live
+  entry — see the subcommand table above. Since clearing is now best-effort and can legitimately sit
+  pending (a required check not yet green on the clearing PR) or fail outright, this is how an
+  operator confirms an entry isn't stuck rather than just pending its next retry.
 - **Worker-scoped runs are unaffected.** `coord acceptance run --issue N` (the worker's own in-session
   loop) never applies `expected_red` — that command's whole point is converging *those exact tests*
   to green; suppressing their redness there would defeat the loop. `--ci` is refused without `--all`
@@ -195,7 +224,9 @@ Alternatives rejected: `#[ignore]`-style skip annotations require editing the se
 fix lands (a sealing violation traded for the deadlock); a separate non-blocking CI job trains
 everyone to ignore it (the Phase 0 disease) unless paired with exactly this registry anyway; dropping
 the acceptance target from CI reopens #1950; landing the slice and the fix in one PR destroys the
-independence the whole oracle loop depends on.
+independence the whole oracle loop depends on; clearing at `record` time (the first cut of this
+feature) reopens exactly the "red default branch" failure #2164 exists to prevent, just relocated
+in time — see above.
 
 ## The worker briefing contract
 
