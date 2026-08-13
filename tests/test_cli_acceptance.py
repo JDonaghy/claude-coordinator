@@ -278,6 +278,111 @@ class TestAcceptanceRun:
         assert "entrypoint" not in result.output
 
 
+def _write_manifest_with_expected_red(
+    acceptance_root: Path, tests: dict[str, int], expected_red: dict[int, list[str]],
+) -> None:
+    ms = acceptance_root / "ms01"
+    ms.mkdir(parents=True, exist_ok=True)
+    lines = ["tests:"]
+    lines += [f"  {k}: {v}" for k, v in tests.items()]
+    lines.append("expected_red:")
+    for issue, ids in expected_red.items():
+        lines.append(f"  {issue}:")
+        lines += [f"    - {i}" for i in ids]
+    (ms / "manifest.yml").write_text("\n".join(lines) + "\n")
+
+
+class TestAcceptanceRunCI:
+    """#2164: `coord acceptance run --all --ci` — the CI wrapper that
+    honours `expected_red:` so a sealed slice authored red can merge
+    without turning the default branch red."""
+
+    def test_ci_requires_all(self, tmp_path: Path) -> None:
+        cwd = tmp_path / "repo"
+        cwd.mkdir()
+        config_path = _write_config(tmp_path, repo_path=str(cwd), run_cmd="echo '{}'")
+        result = CliRunner().invoke(main, [
+            "acceptance", "run", "--repo", "coord-tui", "--issue", "944", "--ci",
+            "--path", str(cwd), "--config", str(config_path),
+        ])
+        assert result.exit_code == 1
+        assert "--ci requires --all" in result.output
+
+    def test_expected_red_failure_does_not_block_ci(self, tmp_path: Path) -> None:
+        """Acceptance criterion 1: a sealed slice authored red merges
+        without turning the default branch red."""
+        blob = json.dumps({"tests": [
+            {"id": "wide_label", "status": "fail", "message": "glyph dropped"},
+            {"id": "ascii_label_is_unchanged", "status": "pass"},
+        ]})
+        cwd = tmp_path / "repo"
+        cwd.mkdir()
+        _write_manifest_with_expected_red(
+            cwd / "tests" / "acceptance",
+            {"wide_label": 554, "ascii_label_is_unchanged": 554},
+            {554: ["wide_label"]},
+        )
+        config_path = _write_config(tmp_path, repo_path=str(cwd), run_cmd=f"echo '{blob}'")
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "run", "--repo", "coord-tui", "--all", "--ci",
+            "--path", str(cwd), "--config", str(config_path),
+        ])
+        assert result.exit_code == 0, result.output
+        assert "not a CI failure" in result.output
+
+    def test_expected_red_that_passes_hard_fails_ci(self, tmp_path: Path) -> None:
+        """Acceptance criterion 2: an expected_red entry that passes fails
+        the run, loudly and distinguishably from an ordinary failure."""
+        blob = json.dumps({"tests": [{"id": "wide_label", "status": "pass"}]})
+        cwd = tmp_path / "repo"
+        cwd.mkdir()
+        _write_manifest_with_expected_red(
+            cwd / "tests" / "acceptance", {"wide_label": 554}, {554: ["wide_label"]},
+        )
+        config_path = _write_config(tmp_path, repo_path=str(cwd), run_cmd=f"echo '{blob}'")
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "run", "--repo", "coord-tui", "--all", "--ci",
+            "--path", str(cwd), "--config", str(config_path),
+        ])
+        assert result.exit_code == 1
+        assert "HARD FAILURE" in result.output
+        assert "wide_label" in result.output
+
+    def test_real_failure_still_blocks_ci(self, tmp_path: Path) -> None:
+        blob = json.dumps({"tests": [
+            {"id": "wide_label", "status": "fail"},
+            {"id": "unrelated_regression", "status": "fail"},
+        ]})
+        cwd = tmp_path / "repo"
+        cwd.mkdir()
+        _write_manifest_with_expected_red(
+            cwd / "tests" / "acceptance", {"wide_label": 554}, {554: ["wide_label"]},
+        )
+        config_path = _write_config(tmp_path, repo_path=str(cwd), run_cmd=f"echo '{blob}'")
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "run", "--repo", "coord-tui", "--all", "--ci",
+            "--path", str(cwd), "--config", str(config_path),
+        ])
+        assert result.exit_code == 1
+
+    def test_no_expected_red_behaves_like_plain_all(self, tmp_path: Path) -> None:
+        blob = json.dumps({"tests": [{"id": "a", "status": "pass"}]})
+        cwd = tmp_path / "repo"
+        cwd.mkdir()
+        config_path = _write_config(tmp_path, repo_path=str(cwd), run_cmd=f"echo '{blob}'")
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "run", "--repo", "coord-tui", "--all", "--ci",
+            "--path", str(cwd), "--config", str(config_path),
+        ])
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert payload["ci_green"] is True
+
+
 def _git(cwd: Path, *args: str) -> None:
     subprocess.run(
         ["git", *args], cwd=str(cwd), check=True, capture_output=True, text=True,
@@ -889,6 +994,153 @@ acceptance:
 
         wt_path = tmp_path / "acceptance-worktrees" / "coord-tui-944"
         assert not wt_path.exists(), "worktree leaked on manifest-missing error path"
+
+
+def _init_git_repo_with_expected_red(
+    path: Path, *, tests: dict[str, int], expected_red: dict[int, list[str]],
+) -> tuple[Path, str]:
+    """#2164: like `_init_git_repo`, but on an explicit `main` branch (to
+    match `Repo.default_branch`'s "main" default the clearing step reads)
+    and seeded with an `expected_red:` block. Returns (bare origin path,
+    commit sha)."""
+    bare = path.parent / f"{path.name}-origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(bare)], check=True)
+
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=path, check=True)
+    subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=path, check=True)
+    (path / "README.md").write_text("hello\n")
+    _write_manifest_with_expected_red(
+        path / "tests" / "acceptance", tests, expected_red,
+    )
+    subprocess.run(["git", "add", "."], cwd=path, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=path, check=True)
+    subprocess.run(["git", "push", "-q", "origin", "main"], cwd=path, check=True)
+    sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=path, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    return bare, sha
+
+
+def _show_origin_file(bare: Path, ref: str, path: str) -> str:
+    res = subprocess.run(
+        ["git", "--git-dir", str(bare), "show", f"{ref}:{path}"],
+        capture_output=True, text=True,
+    )
+    assert res.returncode == 0, res.stderr
+    return res.stdout
+
+
+class TestAcceptanceRecordClearsExpectedRed:
+    """#2164 acceptance criterion 3: `coord acceptance record` clears an
+    entry on observed green; no worker-side edit to `tests/acceptance/**`
+    is ever required. This is the trust-gate half — a real git repo with a
+    real bare origin, no mocking of git itself."""
+
+    def test_green_record_clears_the_passing_id_on_the_default_branch(
+        self, tmp_path: Path, coord_db,
+    ) -> None:
+        from coord import state
+
+        repo_dir = tmp_path / "repo"
+        bare, sha = _init_git_repo_with_expected_red(
+            repo_dir,
+            tests={"ms01::a": 944, "ms01::b": 944},
+            expected_red={944: ["ms01::a"]},
+        )
+
+        blob = json.dumps({"tests": [
+            {"id": "ms01::a", "status": "pass"},
+            {"id": "ms01::b", "status": "pass"},
+        ]})
+        config_path = _write_config(tmp_path, repo_path=str(repo_dir), run_cmd=f"echo '{blob}'")
+
+        state.record_dispatched(
+            assignment_id="aid-clear-1",
+            proposal=Proposal(
+                id=1, machine_name="laptop", repo_name="coord-tui",
+                issue_number=944, issue_title="oracle loop runner", rationale="",
+            ),
+            repo_github="acme/coord-tui",
+        )
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "record", "--repo", "coord-tui", "--issue", "944",
+            "--sha", sha, "--config", str(config_path),
+        ])
+        assert result.exit_code == 0, result.output
+        assert "cleared expected_red for coord-tui #944: ms01::a" in result.output
+
+        manifest_text = _show_origin_file(bare, "main", "tests/acceptance/ms01/manifest.yml")
+        assert "expected_red" not in manifest_text
+        # The `tests:` mapping (untouched) still names both ids.
+        assert "ms01::a" in manifest_text and "ms01::b" in manifest_text
+
+    def test_green_record_leaves_other_issues_expected_red_alone(
+        self, tmp_path: Path, coord_db,
+    ) -> None:
+        from coord import state
+
+        repo_dir = tmp_path / "repo"
+        bare, sha = _init_git_repo_with_expected_red(
+            repo_dir,
+            tests={"ms01::a": 944},
+            expected_red={944: ["ms01::a"], 945: ["ms01::z"]},
+        )
+
+        blob = json.dumps({"tests": [{"id": "ms01::a", "status": "pass"}]})
+        config_path = _write_config(tmp_path, repo_path=str(repo_dir), run_cmd=f"echo '{blob}'")
+
+        state.record_dispatched(
+            assignment_id="aid-clear-2",
+            proposal=Proposal(
+                id=1, machine_name="laptop", repo_name="coord-tui",
+                issue_number=944, issue_title="oracle loop runner", rationale="",
+            ),
+            repo_github="acme/coord-tui",
+        )
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "record", "--repo", "coord-tui", "--issue", "944",
+            "--sha", sha, "--config", str(config_path),
+        ])
+        assert result.exit_code == 0, result.output
+
+        manifest_text = _show_origin_file(bare, "main", "tests/acceptance/ms01/manifest.yml")
+        assert "    - ms01::a" not in manifest_text  # 944's expected_red list item is gone...
+        assert "  945:" in manifest_text and "    - ms01::z" in manifest_text  # ...945's is not
+
+    def test_no_expected_red_entries_is_a_silent_no_op(
+        self, tmp_path: Path, coord_db,
+    ) -> None:
+        """The overwhelmingly common case — a slice with nothing
+        expected-red — must not push a no-op commit."""
+        from coord import state
+
+        repo_dir = tmp_path / "repo"
+        sha = _init_git_repo(repo_dir, manifest={"ms01::a": 944})
+
+        blob = json.dumps({"tests": [{"id": "ms01::a", "status": "pass"}]})
+        config_path = _write_config(tmp_path, repo_path=str(repo_dir), run_cmd=f"echo '{blob}'")
+
+        state.record_dispatched(
+            assignment_id="aid-clear-3",
+            proposal=Proposal(
+                id=1, machine_name="laptop", repo_name="coord-tui",
+                issue_number=944, issue_title="oracle loop runner", rationale="",
+            ),
+            repo_github="acme/coord-tui",
+        )
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "record", "--repo", "coord-tui", "--issue", "944",
+            "--sha", sha, "--config", str(config_path),
+        ])
+        assert result.exit_code == 0, result.output
+        assert "cleared expected_red" not in result.output
 
 
 class TestAcceptanceStall:
