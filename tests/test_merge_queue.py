@@ -1093,6 +1093,40 @@ class TestExpectedRedClearOnMerge:
         assert "acceptance_state='failed'" in events[-1].message
         assert not gh.update_repo_file_calls
 
+    def test_no_diagnostic_when_the_manifest_has_no_expected_red_for_this_issue(self) -> None:
+        """#2199 review (blocking finding 2): the loud "no passing
+        trust-gate verdict" diagnostic must only fire for an issue actually
+        in scope for the oracle trust gate. A manifest that covers this
+        issue's tests but records no `expected_red` entry for it (e.g. an
+        oracle-active issue whose sealed suite is already fully green, or
+        one the manifest's `exempt:` list opted out) has nothing here for
+        `coord acceptance record` to ever have cleared — the pre-#2199
+        silent `None` is still correct, not a regression."""
+        work = self._work("w1")  # acceptance_state=None
+        board = self._board(completed=[work])
+        gh = _ExpectedRedGh(manifest_text="tests:\n  ms01::a: 1\n")  # no expected_red: block
+
+        events = process([_q("w1", size=10)], gh, board=board)
+
+        assert not [e for e in events if e.kind.startswith("expected_red_clear")]
+
+    def test_no_diagnostic_for_a_driverless_repo_with_no_acceptance_dir_at_all(self) -> None:
+        """The overwhelmingly common case (#2199's issue): a repo with no
+        `tests/acceptance/` directory at all. Must degrade to the same
+        silent no-op as before #2199 — not the loud diagnostic, which
+        would tell the operator to run a `coord acceptance record` that
+        has no driver to run against."""
+        work = self._work("w1")  # acceptance_state=None
+        board = self._board(completed=[work])
+
+        class _NoAcceptanceDirGh(_ExpectedRedGh):
+            def list_repo_subdirs(self, repo: str, path: str, branch: str = "develop") -> list[str]:
+                raise RuntimeError("404: tests/acceptance not found")
+
+        events = process([_q("w1", size=10)], _NoAcceptanceDirGh(), board=board)
+
+        assert not [e for e in events if e.kind.startswith("expected_red_clear")]
+
     def test_skips_and_warns_when_acceptance_sha_is_stale(self) -> None:
         """The recorded verdict is for a different commit than what just
         merged (branch moved after the last `record`) — must not clear on
