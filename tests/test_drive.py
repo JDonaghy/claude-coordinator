@@ -1584,6 +1584,132 @@ def test_trust_gate_dispatch_attempts_are_bounded_by_max_work_retries():
     assert "never produced a verdict" in exhausted.message
 
 
+def test_trust_gate_attempts_reset_for_a_fresh_sha_after_a_fix_round():
+    """#2199 review (blocking finding 1): `acceptance_gate_attempts` must be
+    scoped to ONE sha, not a lifetime total shared across every sha a drive
+    ever sees. With default `opts` (`max_work_retries=1`), sharing one
+    un-reset counter meant the legitimate SECOND dispatch — for the FRESH
+    sha a fix round just pushed — inherited the first sha's already-spent
+    budget and died immediately with a false "environment broken"
+    diagnosis, even though the trust gate was working exactly as designed.
+    This is quadraui#542's actual shape: one fix round, then this."""
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision")  # max_work_retries defaults to 1
+    oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
+
+    sha1 = "a" * 40
+    first = step(
+        done_work(work_test_state=""), opts, oracle=oracle,
+        verifier=FakeVerifier(head_sha=sha1), counters=counters,
+    )
+    assert first.command == (
+        "acceptance", "record", "--repo", REPO, "--issue", str(ISSUE),
+        "--sha", sha1,
+    )
+    assert counters.acceptance_gate_attempts == 1
+
+    # A failed verdict recorded at sha1 spends the SHARED fix_rounds budget
+    # (not acceptance_gate_attempts) and dispatches `coord fix`.
+    s_failed = done_work(
+        work_acceptance_state="failed", work_acceptance_sha=sha1,
+        work_acceptance_reason="2/4 acceptance red",
+    )
+    fix = step(
+        s_failed, opts, oracle=oracle, verifier=FakeVerifier(head_sha=sha1),
+        counters=counters,
+    )
+    assert fix.command == ("fix", "w1")
+    assert counters.fix_rounds == 1
+
+    # coord fix pushed a new commit -> a fresh sha. The next poll must
+    # dispatch `coord acceptance record` against it — NOT die claiming the
+    # trust gate "never produced a verdict" — even though
+    # acceptance_gate_attempts already sat at opts.max_work_retries (1)
+    # from sha1's dispatch above.
+    sha2 = "b" * 40
+    second = step(
+        done_work(work_test_state=""), opts, oracle=oracle,
+        verifier=FakeVerifier(head_sha=sha2), counters=counters,
+    )
+    assert second.command == (
+        "acceptance", "record", "--repo", REPO, "--issue", str(ISSUE),
+        "--sha", sha2,
+    )
+    assert counters.acceptance_gate_attempts == 1
+    assert counters.acceptance_gate_attempts_sha == sha2
+
+
+def test_trust_gate_still_bounded_by_max_work_retries_for_the_same_sha():
+    """The reset above must not turn the budget into an unbounded retry —
+    two consecutive dispatch attempts for the SAME sha (never advancing to
+    failed/passed) still exhausts `opts.max_work_retries` and dies."""
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_work_retries=1)
+    oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
+    s = done_work(work_test_state="")
+
+    first = step(s, opts, oracle=oracle, verifier=FakeVerifier(head_sha=TRUST_GATE_SHA), counters=counters)
+    assert first.command[:2] == ("acceptance", "record")
+    exhausted = step(s, opts, oracle=oracle, verifier=FakeVerifier(head_sha=TRUST_GATE_SHA), counters=counters)
+    assert exhausted.is_exit
+    assert exhausted.exit_code == EXIT_TERMINAL_FAILURE
+    assert "never produced a verdict" in exhausted.message
+
+
+# ── #2199 review (blocking finding 3): --for-path resolution for the gate ──
+
+
+def test_trust_gate_appends_for_path_when_the_gate_checker_resolves_one():
+    """A ROUTED repo's `coord acceptance record` hard-refuses with no
+    --for-path (coord.commands.acceptance._resolve_driver's "no route
+    matched") — the trust gate must resolve and pass it, exactly like
+    `_decide_acceptance_author` already does, not dispatch blind."""
+    oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
+    checker = FakeGateChecker(for_path="tui/**")
+    action = step(
+        done_work(work_test_state="", milestone_number=38), oracle=oracle,
+        verifier=FakeVerifier(head_sha=TRUST_GATE_SHA), gate_checker=checker,
+    )
+    assert action.command == (
+        "acceptance", "record", "--repo", REPO, "--issue", str(ISSUE),
+        "--sha", TRUST_GATE_SHA, "--for-path", "tui/**",
+    )
+    assert checker.for_path_calls == [(REPO, 38)]
+
+
+def test_trust_gate_omits_for_path_for_an_unrouted_repo():
+    """resolve_for_path() returning None means "no --for-path needed" —
+    command is unchanged from before this fix."""
+    oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
+    action = step(
+        done_work(work_test_state=""), oracle=oracle,
+        verifier=FakeVerifier(head_sha=TRUST_GATE_SHA), gate_checker=FakeGateChecker(),
+    )
+    assert action.command == (
+        "acceptance", "record", "--repo", REPO, "--issue", str(ISSUE),
+        "--sha", TRUST_GATE_SHA,
+    )
+
+
+def test_trust_gate_dies_when_for_path_cannot_be_resolved():
+    """An ambiguous/unresolvable routed config must report and stop — not
+    dispatch a `coord acceptance record` the CLI will reject anyway
+    (coord.acceptance.ForPathResolutionError)."""
+    from coord.acceptance import ForPathResolutionError
+
+    oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
+    checker = FakeGateChecker(
+        for_path_error=ForPathResolutionError("no route matched")
+    )
+    action = step(
+        done_work(work_test_state=""), oracle=oracle,
+        verifier=FakeVerifier(head_sha=TRUST_GATE_SHA), gate_checker=checker,
+    )
+    assert action.is_exit
+    assert action.exit_code == EXIT_TERMINAL_FAILURE
+    assert "no route matched" in action.message
+
+
 def test_no_test_verdict_yet_waits_for_coord_to_dispatch_the_stage():
     """#1426: coord's own dispatch_pending_smoke runs the Test stage. Two
     drivers racing to dispatch the same thing is the #476/#477 incident."""

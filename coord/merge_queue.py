@@ -3835,6 +3835,42 @@ def _work_assignment_for_entry(entry: QueuedMerge, board) -> Assignment | None:
     return None
 
 
+def _issue_has_expected_red_entries(entry: QueuedMerge, gh_ops: GhOps) -> bool:
+    """#2199 review (blocking finding 2): whether *entry*'s issue has at
+    least one ``expected_red`` entry recorded against it in some
+    ``ms-*/manifest.yml`` on ``entry.target_branch`` — the scope check
+    that keeps :func:`_maybe_clear_expected_red`'s loud "no passing
+    trust-gate verdict" diagnostic from firing on every ordinary
+    ``CLOSES_ISSUE_TYPES`` merge fleet-wide (no driver configured, no
+    oracle-opted-in milestone, an ``oracle:exempt`` issue — none of which
+    ever populate ``expected_red`` for their issue, #2191). Those merges
+    have nothing here for ``coord acceptance record`` to ever have cleared
+    and never will; before this check, the diagnostic branch below could
+    not tell them apart from an issue that genuinely IS in scope and
+    genuinely IS stuck red, so it printed the same actionable-looking
+    (and, for a driverless repo, un-followable) advice on every single one.
+
+    Reuses the exact API-only lookup ``coord.acceptance.
+    clear_expected_red_via_pr`` already performs on the success path —
+    best-effort/read-only like the rest of this sweep: any lookup failure
+    (unreachable API, older ``gh_ops`` stub missing the list/get methods)
+    reads as "not in scope", matching :func:`coord.acceptance.
+    find_ms_manifest_for_issue_via_api`'s own fail-soft posture.
+    """
+    from coord.acceptance import find_ms_manifest_for_issue_via_api  # noqa: PLC0415
+
+    try:
+        found = find_ms_manifest_for_issue_via_api(
+            entry.repo_github, entry.target_branch, entry.issue_number, gh_ops=gh_ops,
+        )
+    except Exception:  # noqa: BLE001 — best-effort, same posture as callers
+        return False
+    if found is None:
+        return False
+    _path, _text, _blob_sha, data = found
+    return bool(data.expected_red.get(entry.issue_number))
+
+
 def _maybe_clear_expected_red(entry: QueuedMerge, board, gh_ops: GhOps) -> MergeEvent | None:
     """#2164: right after *entry*'s PR has actually merged into
     ``entry.target_branch``, clear any of its issue's ``expected_red``
@@ -3843,11 +3879,12 @@ def _maybe_clear_expected_red(entry: QueuedMerge, board, gh_ops: GhOps) -> Merge
     wrong (clearing at record-time, before the merge that's the whole
     point had actually happened; see ``coord.acceptance.
     clear_expected_red_via_pr``'s docstring). Returns ``None`` when there
-    is nothing to do (not a `work` entry) — every other skip path names
-    itself with its own ``MergeEvent`` (see below), so ``coord merge``
-    output never implies a clear that didn't happen. Never raises — every
-    failure mode inside ``clear_expected_red_via_pr`` degrades to a
-    message, and this wrapper's own lookups are read-only/best-effort.
+    is nothing to do (not a `work` entry, or this issue was never in scope
+    for the oracle trust gate at all) — every other skip path names itself
+    with its own ``MergeEvent`` (see below), so ``coord merge`` output
+    never implies a clear that didn't happen. Never raises — every failure
+    mode inside ``clear_expected_red_via_pr`` degrades to a message, and
+    this wrapper's own lookups are read-only/best-effort.
 
     #2199 review: before the trust gate had a call site at all
     (``coord acceptance record`` was never invoked by anything —
@@ -3855,7 +3892,12 @@ def _maybe_clear_expected_red(entry: QueuedMerge, board, gh_ops: GhOps) -> Merge
     UNIVERSAL case), this branch returned bare ``None`` — silently. An
     ``expected_red`` entry could then never clear, indistinguishable from
     #1965's genuine vacuous-assertion alarm (quadraui#542). Now it names
-    which condition failed instead.
+    which condition failed instead — but ONLY for an issue actually in
+    scope for the oracle loop (:func:`_issue_has_expected_red_entries`,
+    #2199 review finding 2): the first cut of this fix regressed to
+    printing that same loud, actionable-looking text on every ordinary
+    merge fleet-wide, contradicting the acceptance criterion that exempt
+    issues and driverless repos stay unaffected.
     """
     if entry.assignment_type not in CLOSES_ISSUE_TYPES:
         return None
@@ -3868,6 +3910,11 @@ def _maybe_clear_expected_red(entry: QueuedMerge, board, gh_ops: GhOps) -> Merge
         )
     acceptance_state = getattr(work, "acceptance_state", None)
     if acceptance_state != "passed":
+        if not _issue_has_expected_red_entries(entry, gh_ops):
+            # Not in scope for the oracle loop at all — the pre-#2199
+            # silent no-op is still correct here, not a regression (see
+            # the docstring above and #2199 review finding 2).
+            return None
         return MergeEvent(
             entry, "expected_red_clear_skipped_no_acceptance",
             f"no passing trust-gate verdict recorded on {work.assignment_id} "

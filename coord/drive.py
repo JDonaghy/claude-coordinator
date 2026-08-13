@@ -297,7 +297,26 @@ class DriveCounters:
     # `coord drive` re-running a full git-worktree + suite invocation every
     # poll forever. Bounded by `opts.max_work_retries`, the same "how many
     # times do we retry a flaky infra thing" budget `work_retries` uses.
+    #
+    # #2199 review (blocking finding 1): scoped to ONE sha via
+    # `acceptance_gate_attempts_sha` below — NOT a lifetime total. A fresh
+    # SHA (a fix round pushing a new commit) legitimately needs its own
+    # dispatch, and that dispatch is the entire point of the "same shape as
+    # `_decide_test`'s fix loop" design a few lines up in
+    # `_decide_acceptance_gate`; sharing one un-reset counter across every
+    # SHA a drive ever sees meant the SECOND round after the FIRST fix round
+    # already exhausted the default `max_work_retries=1` budget and died
+    # with a false "environment broken" diagnosis — even though the trust
+    # gate was working exactly as designed (quadraui#542's actual shape:
+    # one fix round, then this).
     acceptance_gate_attempts: int = 0
+    # #2199 review: the SHA `acceptance_gate_attempts` above is counting
+    # dispatch attempts FOR. `_decide_acceptance_gate` resets the counter to
+    # 0 whenever it sees a SHA that doesn't match this — a fresh commit (a
+    # fix round, a rebase) always gets its own full attempt budget, and only
+    # repeated failures to produce ANY verdict for the SAME commit reach
+    # `_die()`.
+    acceptance_gate_attempts_sha: str = ""
     # #2079: a SECOND, independent budget of exactly the same shape, spent
     # only on landing the oracle-mode JIT acceptance slice
     # (`_decide_acceptance_landing`). Separate rather than shared because the
@@ -1420,7 +1439,7 @@ def decide(
     # was never re-run externally and `_maybe_clear_expected_red` could
     # never clear (quadraui#542).
     acceptance_gate = _decide_acceptance_gate(
-        state, opts, counters, machine, oracle, verifier
+        state, opts, counters, machine, oracle, verifier, gate_checker
     )
     if acceptance_gate is not None:
         return replace(
@@ -1575,6 +1594,7 @@ def _decide_acceptance_gate(
     machine: str,
     oracle: OracleDecision | None,
     verifier: MergeVerifier,
+    gate_checker: AcceptanceGateChecker | None,
 ) -> Action | None:
     """The #2199 oracle-loop TRUST GATE — ``coord acceptance record --repo
     R --issue N --sha <pushed sha>``, run by the COORDINATOR (this process,
@@ -1599,9 +1619,20 @@ def _decide_acceptance_gate(
     gate an exempt issue never opted into, exactly what #2199's acceptance
     criteria rule out). Every other issue — no driver, no milestone,
     ``--no-acceptance`` — passes straight through unchanged.
+
+    *gate_checker* (#2199 review, blocking finding 3): resolves
+    ``--for-path`` for a ROUTED repo (``acceptance.drivers.<repo>.routes``)
+    exactly like :func:`_decide_acceptance_author` already does — without
+    it, ``coord commands/acceptance.py``'s ``_resolve_driver`` hard-refuses
+    every dispatch on a routed repo with "no route matched", so the trust
+    gate silently never functioned there at all.
     """
     if oracle is None or not oracle.active or oracle.issue_exempt:
         return None
+    assert gate_checker is not None, (
+        "oracle.active implies resolve_oracle_decision ran with a real "
+        "gate_checker; decide() always threads one through"
+    )
 
     sha = verifier.branch_head_sha(state)
     if sha is None:
@@ -1646,6 +1677,17 @@ def _decide_acceptance_gate(
     # No verdict recorded yet for this exact SHA — never run, or run
     # against a now-stale one (a fix round, a rebase). Dispatch it.
     #
+    # #2199 review (blocking finding 1): `acceptance_gate_attempts` is
+    # scoped to THIS sha, not a lifetime total — a fresh SHA (this branch
+    # runs again after a fix round pushed a new commit) gets its own full
+    # attempt budget. Without this reset, the legitimate re-dispatch for
+    # SHA2 inherited SHA1's already-spent count and died immediately with a
+    # false "environment broken" diagnosis on exactly the second round the
+    # docstring above says this mirrors `_decide_test` for.
+    if counters.acceptance_gate_attempts_sha != sha:
+        counters.acceptance_gate_attempts = 0
+        counters.acceptance_gate_attempts_sha = sha
+
     # `on_error="warn"` is deliberate: `coord acceptance record` exits
     # non-zero BOTH when it successfully records a red verdict (the board
     # write already happened before it exits — the next poll's
@@ -1667,16 +1709,35 @@ def _decide_acceptance_gate(
             f"--issue {state.issue} --sha {sha}"
         )
     counters.acceptance_gate_attempts += 1
+
+    # #2199 review (blocking finding 3): resolve `--for-path` exactly like
+    # `_decide_acceptance_author` does — a routed repo's `_resolve_driver`
+    # (coord/commands/acceptance.py) hard-refuses with "no route matched"
+    # when it's omitted, which made the trust gate structurally unable to
+    # ever record a verdict for such a repo.
+    from coord.acceptance import ForPathResolutionError  # noqa: PLC0415
+
+    try:
+        for_path = gate_checker.resolve_for_path(state.repo, state.milestone_number)
+    except ForPathResolutionError as exc:
+        return _die(
+            f"could not resolve --for-path for {state.repo}'s acceptance "
+            f"trust gate on #{state.issue}: {exc}"
+        )
+    command = [
+        "acceptance", "record", "--repo", state.repo, "--issue",
+        str(state.issue), "--sha", sha,
+    ]
+    if for_path:
+        command += ["--for-path", for_path]
+
     return Action(
         kind=RUN,
         label=(
             "ACCEPTANCE: trust gate → coord acceptance record --sha "
-            f"{sha[:12]}"
+            f"{sha[:12]}" + (f" --for-path {for_path}" if for_path else "")
         ),
-        command=(
-            "acceptance", "record", "--repo", state.repo, "--issue",
-            str(state.issue), "--sha", sha,
-        ),
+        command=tuple(command),
         on_error="warn",
     )
 
