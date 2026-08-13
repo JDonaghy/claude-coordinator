@@ -474,3 +474,76 @@ class TestSmokeTestsParser:
     def test_nonexistent_log_returns_none(self, tmp_path: Path) -> None:
         from coord.progress import parse_smoke_tests_from_log
         assert parse_smoke_tests_from_log(tmp_path / "ghost.log") is None
+
+
+class TestSmokeBaselineRedParser:
+    """#2170: coord/progress.py::parse_smoke_baseline_red_from_log extracts
+    the dispatched Test-stage agent's `SMOKE: baseline-red <reason>` verdict
+    line — the signal notify.py's EVENT_COMPLETION handler uses to record
+    `test_state="skipped"` instead of `"failed"` for a smoke run whose
+    failures reproduce identically on the merge-base."""
+
+    def test_extracts_reason(self, tmp_path: Path) -> None:
+        from coord.progress import parse_smoke_baseline_red_from_log
+        log = tmp_path / "worker.log"
+        log.write_text(
+            "Running tests: scripts/coord-test-runner.sh . --base-ref origin/main\n"
+            "RESULT: BASELINE-RED (python) — every failure reproduces on "
+            "origin/main in this environment\n"
+            "SMOKE: baseline-red every failure reproduces on origin/main\n",
+            encoding="utf-8",
+        )
+        result = parse_smoke_baseline_red_from_log(log)
+        assert result == "every failure reproduces on origin/main"
+
+    def test_no_verdict_line_returns_none(self, tmp_path: Path) -> None:
+        """An ordinary `SMOKE: fail` run (or a pass) has no baseline-red
+        line at all — must not be mistaken for one."""
+        from coord.progress import parse_smoke_baseline_red_from_log
+        log = tmp_path / "worker.log"
+        log.write_text(
+            "Running tests: pytest\n"
+            "FAILED tests/test_x.py::test_y\n"
+            "SMOKE: fail 1 test failed\n",
+            encoding="utf-8",
+        )
+        assert parse_smoke_baseline_red_from_log(log) is None
+
+    def test_not_fooled_by_mid_line_mention(self, tmp_path: Path) -> None:
+        """The marker must be anchored to the START of a line — an
+        assertion message or diff line that merely *contains* the phrase
+        (indented, or prefixed by other text) is not a verdict."""
+        from coord.progress import parse_smoke_baseline_red_from_log
+        log = tmp_path / "worker.log"
+        log.write_text(
+            "E   assert 'SMOKE: baseline-red' in some_unrelated_string\n"
+            "SMOKE: fail unrelated assertion failure\n",
+            encoding="utf-8",
+        )
+        assert parse_smoke_baseline_red_from_log(log) is None
+
+    def test_picks_last_line_when_multiple(self, tmp_path: Path) -> None:
+        from coord.progress import parse_smoke_baseline_red_from_log
+        log = tmp_path / "worker.log"
+        log.write_text(
+            "SMOKE: baseline-red first attempt reason\n"
+            "SMOKE: baseline-red final reason\n",
+            encoding="utf-8",
+        )
+        assert (
+            parse_smoke_baseline_red_from_log(log) == "final reason"
+        )
+
+    def test_empty_reason_returns_empty_string_not_none(
+        self, tmp_path: Path,
+    ) -> None:
+        """A bare `SMOKE: baseline-red` line with no trailing reason is
+        still a verdict (empty reason), distinct from no line at all."""
+        from coord.progress import parse_smoke_baseline_red_from_log
+        log = tmp_path / "worker.log"
+        log.write_text("SMOKE: baseline-red\n", encoding="utf-8")
+        assert parse_smoke_baseline_red_from_log(log) == ""
+
+    def test_nonexistent_log_returns_none(self, tmp_path: Path) -> None:
+        from coord.progress import parse_smoke_baseline_red_from_log
+        assert parse_smoke_baseline_red_from_log(tmp_path / "ghost.log") is None

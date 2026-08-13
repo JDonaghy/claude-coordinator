@@ -57,6 +57,12 @@ from coord import github_ops
 from coord.config import Config, SmokeRule, SmokeTestsConfig
 from coord.dispatch import AGENT_PORT
 from coord.models import WORK_LIKE_TYPES, Assignment, Board, Machine
+# #2170: the SAME marker/exit-code convention `scripts/coord-test-runner.sh`
+# and `coord.revalidate` use for a red baseline — imported (not re-literalled)
+# so the dispatched smoke agent's instructions can never drift from what the
+# runner actually emits, or from what `coord.notify` parses back out of the
+# agent's own transcript (see `_smoke_baseline_red_reason` there).
+from coord.revalidate import BASELINE_RED_OUTPUT_MARKER, RUNNER_BASELINE_RED_EXIT
 
 logger = logging.getLogger("coord.smoke")
 
@@ -75,7 +81,7 @@ logger = logging.getLogger("coord.smoke")
 _TEST_MODE_SKIP_LOGGED: set[str] = set()
 
 
-SMOKE_SYSTEM_PROMPT = """\
+SMOKE_SYSTEM_PROMPT = f"""\
 You are a smoke-test runner dispatched by the coordinator. \
 Your only job: pull the branch, run the smoke command, report pass/fail.
 
@@ -89,8 +95,9 @@ Rules:
 - Do NOT run `gh` commands. The coordinator owns GitHub interactions.
 - You MAY run git, build commands, and test commands.
 - Exit code is what the coordinator reads — exit 0 on pass, non-zero on \
-fail. Print a final line `SMOKE: pass` or `SMOKE: fail <one-line reason>` \
-before exiting so logs are readable.
+fail. Print a final line `SMOKE: pass`, `SMOKE: fail <one-line reason>`, or \
+`SMOKE: baseline-red <one-line reason>` (see step 4) before exiting so logs \
+are readable.
 
 Where you are:
 - You are in a dedicated git worktree created for this run. Every git command \
@@ -105,7 +112,19 @@ Steps:
 briefing) — in your worktree, never in the base checkout.
 2. Run the smoke command from the briefing. Capture stdout/stderr.
 3. If it exits 0 → print `SMOKE: pass` and exit 0.
-4. If it fails → print `SMOKE: fail <short reason>` and exit non-zero.
+4. If it exits {RUNNER_BASELINE_RED_EXIT} AND its output contains a line \
+starting with literal text `{BASELINE_RED_OUTPUT_MARKER}` (#2170) — the smoke \
+command already re-ran its own failures against the merge-base in this same \
+environment and found every one of them fails there too. That is a statement \
+about THIS MACHINE, not the branch: do NOT report it as `SMOKE: fail`, and do \
+NOT report it as `SMOKE: pass` either (that would hide a red baseline). Print \
+`SMOKE: baseline-red <one-line reason>` (reuse the runner's own \
+`{BASELINE_RED_OUTPUT_MARKER}` line as the reason) and exit \
+{RUNNER_BASELINE_RED_EXIT} yourself, matching the smoke command's own exit \
+code.
+5. Otherwise (any other non-zero exit, or a failure with no \
+`{BASELINE_RED_OUTPUT_MARKER}` line) → print `SMOKE: fail <short reason>` and \
+exit non-zero (any code other than 0 or {RUNNER_BASELINE_RED_EXIT}).
 """
 
 

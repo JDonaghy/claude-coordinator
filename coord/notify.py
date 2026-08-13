@@ -1705,6 +1705,50 @@ def _capture_smoke_tests(transition: Transition, entry: dict) -> None:
         )
 
 
+def _smoke_baseline_red_reason(transition: Transition, entry: dict) -> str | None:
+    """#2170: look for a `SMOKE: baseline-red <reason>` line in the smoke
+    worker's transcript and return its reason text, or ``None`` if absent.
+
+    Same local-log-first, agent-endpoint-fallback discipline as
+    :func:`_capture_smoke_tests` — this is read-only (nothing persisted here;
+    the caller decides what to do with the reason), and best-effort: any
+    lookup failure is logged and treated as "no baseline-red line found",
+    which routes the caller to the ordinary `failed` verdict rather than
+    silently swallowing a genuine branch failure.
+    """
+    from coord.progress import (  # noqa: PLC0415
+        parse_smoke_baseline_red_from_agent,
+        parse_smoke_baseline_red_from_log,
+    )
+
+    reason: str | None = None
+    log_path = entry.get("log_path")
+    if log_path:
+        try:
+            reason = parse_smoke_baseline_red_from_log(Path(log_path))
+        except Exception as exc:  # noqa: BLE001
+            log.debug(
+                "_smoke_baseline_red_reason: failed to parse local log for %s: %s",
+                transition.assignment_id, exc,
+            )
+
+    if reason is None:
+        host = _agent_host(transition.machine_name)
+        if host:
+            try:
+                reason = parse_smoke_baseline_red_from_agent(
+                    host, transition.assignment_id
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "_smoke_baseline_red_reason: failed to fetch from agent "
+                    "%s for %s: %s",
+                    host, transition.assignment_id, exc,
+                )
+
+    return reason
+
+
 def _capture_cost(transition: Transition, entry: dict, record: dict | None = None) -> None:
     """#208/#546: parse the worker's final cost+tokens and persist them.
 
@@ -2332,17 +2376,52 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
                 transition.repo_name, transition.issue_number
             )
             if test_mode != "smoke":
-                succeeded = (transition.exit_code or 0) == 0
-                # #1384: no `smoke_test=` argument needed — the writer
-                # (`state._record_test_verdict_local`) derives the legacy
-                # mirror from `test_state`, so a headless smoke FAILURE lands
-                # as test_state='failed' AND smoke_test='fail' and stays
-                # reachable from `coord fix`.
-                record_test_verdict(
-                    assignment_id=parent_id,
-                    test_state="passed" if succeeded else "failed",
-                    test_reason="headless smoke",
-                )
+                exit_code = transition.exit_code or 0
+                if exit_code == 0:
+                    record_test_verdict(
+                        assignment_id=parent_id,
+                        test_state="passed",
+                        test_reason="headless smoke",
+                    )
+                else:
+                    # #2170: a non-zero smoke exit is not automatically the
+                    # branch's fault — check whether the dispatched agent
+                    # reported that the machine's own BASELINE is red (every
+                    # failure reproduces identically on the merge-base; see
+                    # `SMOKE_SYSTEM_PROMPT` step 4 in `coord.smoke`). The
+                    # marker is the signal, not the exit code, mirroring
+                    # `coord.revalidate.is_baseline_red_failure`'s discipline
+                    # — an arbitrary non-zero exit proves nothing on its own.
+                    baseline_red_reason = _smoke_baseline_red_reason(
+                        transition, entry
+                    )
+                    if baseline_red_reason is not None:
+                        # `skipped`, not `failed`: the merge gate treats a
+                        # skipped Test stage as satisfied, and neither
+                        # `coord fix` nor `coord drive` burns an attempt on
+                        # breakage this branch did not cause.
+                        record_test_verdict(
+                            assignment_id=parent_id,
+                            test_state="skipped",
+                            test_reason=(
+                                f"baseline-red (#2170): {baseline_red_reason}"
+                                if baseline_red_reason
+                                else "baseline-red (#2170): every failure "
+                                "reproduces identically on the merge-base"
+                            ),
+                        )
+                    else:
+                        # #1384: no `smoke_test=` argument needed — the
+                        # writer (`state._record_test_verdict_local`)
+                        # derives the legacy mirror from `test_state`, so a
+                        # headless smoke FAILURE lands as
+                        # test_state='failed' AND smoke_test='fail' and
+                        # stays reachable from `coord fix`.
+                        record_test_verdict(
+                            assignment_id=parent_id,
+                            test_state="failed",
+                            test_reason="headless smoke",
+                        )
     elif transition.event == EVENT_FAILURE and assignment_type == "smoke":
         # #1605: the Test-stage WORKER itself died (a dead agent, a killed
         # process group, a terminal API error — anything short of the

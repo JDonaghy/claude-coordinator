@@ -379,6 +379,26 @@ def test_briefing_warns_when_run_on_worker_machine() -> None:
     assert "running on the same machine" in briefing
 
 
+# ── #2170: baseline-red is a third dispatch-time outcome, not folded into fail ─
+
+
+def test_smoke_system_prompt_documents_baseline_red_outcome() -> None:
+    """The dispatched headless smoke agent must be told about the third
+    outcome (#2170): a smoke command that exits with the runner's reserved
+    baseline-red code AND prints its marker is NOT a branch failure, and
+    must be reported distinctly (`SMOKE: baseline-red ...`, not `SMOKE:
+    fail`) so `coord.notify`'s completion handler can tell the two apart —
+    see `TestSmokeCompletionBaselineRedVerdict` in tests/test_notify.py."""
+    from coord.revalidate import BASELINE_RED_OUTPUT_MARKER, RUNNER_BASELINE_RED_EXIT
+
+    assert "SMOKE: baseline-red" in SMOKE_SYSTEM_PROMPT
+    assert BASELINE_RED_OUTPUT_MARKER in SMOKE_SYSTEM_PROMPT
+    assert f"exits {RUNNER_BASELINE_RED_EXIT}" in SMOKE_SYSTEM_PROMPT
+    # Still documents the ordinary two outcomes.
+    assert "SMOKE: pass" in SMOKE_SYSTEM_PROMPT
+    assert "SMOKE: fail" in SMOKE_SYSTEM_PROMPT
+
+
 # ── dispatch_smoke (HTTP mocked) ────────────────────────────────────────────
 
 

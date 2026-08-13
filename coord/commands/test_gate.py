@@ -649,8 +649,40 @@ def test(assignment_id: str, config_path: Path, verdict: str | None, reason: str
 
     if repo and repo.test_command:
         click.echo(f"Running tests: {repo.test_command}")
-        result = subprocess.run(repo.test_command, shell=True, cwd=str(wt_path))
+        # #2170: capture (stdout+stderr merged, same as an unpiped terminal
+        # would show) so a failure can be checked for the runner's `RESULT:
+        # BASELINE-RED` marker below — a failure the runner itself has
+        # already confirmed also reproduces on the merge-base is a
+        # statement about THIS MACHINE, not this branch, and must not be
+        # nudged towards `coord test --fail`. Relayed to the terminal after
+        # the run finishes rather than streamed live — the trade-off that
+        # buys the marker check `subprocess.run` (not `Popen`) keeps this
+        # call mockable exactly like every other one in this function.
+        result = subprocess.run(
+            repo.test_command, shell=True, cwd=str(wt_path),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        if result.stdout:
+            click.echo(result.stdout, nl=False)
         if result.returncode != 0:
+            from coord.revalidate import is_baseline_red_failure  # noqa: PLC0415
+
+            if is_baseline_red_failure(result.returncode, result.stdout or ""):
+                click.echo(
+                    f"\nTests failed (exit {result.returncode}) — but the "
+                    "runner already confirmed every failure reproduces "
+                    "identically on the merge-base (#2170): this machine's "
+                    "BASELINE is red, not this branch.",
+                    err=True,
+                )
+                click.echo(f"  worktree kept for inspection: {wt_path}")
+                click.echo(
+                    "  run: coord test --skipped "
+                    f"{assignment_id} --reason \"baseline-red (#2170): "
+                    "pre-existing failures on this machine\"   "
+                    "# NOT --fail — the branch made nothing worse"
+                )
+                sys.exit(1)
             click.echo(f"Tests failed (exit {result.returncode})", err=True)
             click.echo(f"  worktree kept for inspection: {wt_path}")
             sys.exit(1)
