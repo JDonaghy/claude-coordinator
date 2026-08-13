@@ -38,14 +38,30 @@ head of the queue stays the head until an operator moves it.
 
 #1757 (DEPLOY GATES) adds a third rule: **merged is not live.**  An entry may
 be marked ``--hold-after``, and when the tick transitions THAT entry to
-``done`` the queue stops launching — even with free capacity and a fully
-eligible successor — until a human deploys and releases it.  That is not a
-niche case; it is the shape of every change here that crosses a deploy lane
-(``docs/OPERATING_GOTCHAS.md`` opens with the matrix).  A queue that models
-merge but not deploy would confidently sequence work into that trap overnight.
-The gate's decision half is :func:`plan_tick`'s hold resolution below; running
-the optional ``resume_when`` probe is the shell's job, and its result comes
-back in as data (:class:`ProbeResult`) so this file stays pure.
+``done`` the gate fires and holds its DEPENDENTS — until a human deploys and
+releases it — even though the board now shows the gated entry itself as
+landed. That is not a niche case; it is the shape of every change here that
+crosses a deploy lane (``docs/OPERATING_GOTCHAS.md`` opens with the matrix).
+A queue that models merge but not deploy would confidently sequence work into
+that trap overnight. The gate's decision half is :func:`plan_tick`'s hold
+resolution below; running the optional ``resume_when`` probe is the shell's
+job, and its result comes back in as data (:class:`ProbeResult`) so this file
+stays pure.
+
+#2186 (GATE SCOPE) narrows the blast radius of a fired gate to **its own
+entry's dependents by default.**  Before this, ANY fired gate stopped the
+ENTIRE tick — nothing else in the queue was even evaluated, whatever repo it
+was in or however unrelated it was to the gated entry.  On 2026-08-13 that
+turned one issue's deploy dependency into an 8-hour fleet-wide idle: three
+machines, zero attempts on four unrelated entries, while the actual
+successor of the gate (the one entry that legitimately had to wait) was the
+only thing that needed to.  A gate now defaults to :data:`HOLD_SCOPE_ENTRY`:
+it keeps holding any entry whose own ``after=`` names the gated key (via
+:func:`_resolve_prereqs`), and every other entry in the queue is walked and
+launched normally in the SAME tick.  The old whole-queue stop is still
+expressible — :data:`HOLD_SCOPE_FLEET`, ``--scope=fleet`` at ``add`` time —
+for the genuine case (a rename, a schema migration) where nothing anywhere
+should launch until a human clears it, but it is opt-in, not the default.
 """
 
 from __future__ import annotations
@@ -145,6 +161,24 @@ HOLD_NONE = ""
 HOLD_ARMED = "armed"
 HOLD_FIRED = "fired"
 HOLD_RELEASED = "released"
+
+# ── deploy-gate scope (#2186) ────────────────────────────────────────────────
+#
+# ORTHOGONAL to `hold_state` above: `hold_state` is WHETHER the gate is
+# currently closed, `hold_scope` is WHAT it closes when it is.
+#
+# `entry` (the default) is the narrow, correct-by-default reading: the gate
+# holds only entries that name the gated key in their OWN `after=` — the
+# actual dependents, resolved by `_resolve_prereqs` below. Everything else in
+# the queue is evaluated and can launch in the same tick.
+#
+# `fleet` is the pre-#2186 behaviour, kept available for the genuine
+# whole-fleet case (a rename, a schema migration) where nothing anywhere may
+# launch until a human clears it — declared explicitly (`--scope=fleet` at
+# `add` time), never the default, because the default silently costing four
+# unrelated repos a day of idle is exactly the incident #2186 closes.
+HOLD_SCOPE_ENTRY = "entry"
+HOLD_SCOPE_FLEET = "fleet"
 
 # Wall-clock ceiling for one `resume_when` run.  The shell enforces it; it
 # lives here so the CLI's help text, the alert prose and the test all quote one
@@ -379,6 +413,13 @@ class QueueEntry:
     resume_when: str = ""
     hold_state: str = HOLD_NONE
     hold_probes: int = 0
+    # #2186: WHAT a fired gate holds — see the constants' own comment above.
+    # Operator-declared at enqueue time, same as `hold_after`/`hold_reason`.
+    # Normalised to exactly `HOLD_SCOPE_ENTRY` or `HOLD_SCOPE_FLEET` by
+    # `_normalize_hold_scope`; a row predating this column (or any other
+    # unrecognised value) reads as `HOLD_SCOPE_ENTRY` — the narrower, safer
+    # default — never as a silent fleet-wide stop.
+    hold_scope: str = HOLD_SCOPE_ENTRY
 
     @property
     def key(self) -> str:
@@ -393,6 +434,18 @@ class QueueEntry:
         only "HELD" is one the operator has to go and reconstruct.
         """
         return self.hold_reason or f"deploy gate declared on {self.key}"
+
+    @staticmethod
+    def _normalize_hold_scope(value: Any) -> str:
+        """Fail closed to the NARROWER scope, never the wider one (#2186).
+
+        Only the literal string ``"fleet"`` opts into the whole-queue stop.
+        Anything else — a row from before this column existed (``None`` /
+        ``''``), a hand-edited typo, a value a future version doesn't know —
+        reads as ``HOLD_SCOPE_ENTRY``, so a malformed value can never
+        silently escalate one entry's gate into a fleet-wide one.
+        """
+        return HOLD_SCOPE_FLEET if str(value or "") == HOLD_SCOPE_FLEET else HOLD_SCOPE_ENTRY
 
     @classmethod
     def from_row(cls, row: Mapping[str, Any]) -> "QueueEntry":
@@ -439,6 +492,7 @@ class QueueEntry:
             resume_when=str(row.get("resume_when") or ""),
             hold_state=str(row.get("hold_state") or HOLD_NONE),
             hold_probes=int(row.get("hold_probes") or 0),
+            hold_scope=cls._normalize_hold_scope(row.get("hold_scope")),
         )
 
 
@@ -844,8 +898,15 @@ class Hold:
       (either no probe is declared, or the probe ran and failed).
     * ``released`` — the probe exited 0; the walk continues in this same tick.
 
-    ``blocking`` is the single thing the tick acts on, so a future outcome
-    can be added without every caller re-deriving the rule.
+    ``blocking`` is the single thing that says the gate is currently closed
+    at all, so a future outcome can be added without every caller
+    re-deriving the rule. ``scope`` (#2186) says how FAR a closed gate
+    reaches: ``HOLD_SCOPE_ENTRY`` (the default) holds only entries whose own
+    ``after=`` names this gate's key; ``HOLD_SCOPE_FLEET`` holds the entire
+    tick, the pre-#2186 behaviour, kept for an explicitly-declared
+    whole-fleet stop. ``stops_fleet`` is what :func:`plan_tick` actually acts
+    on for the early-return branch — ``blocking`` alone is deliberately not
+    enough, or an entry-scoped gate would still halt the whole queue.
     """
 
     key: str
@@ -855,10 +916,16 @@ class Hold:
     probes: int = 0
     probe_detail: str = ""
     updates: Mapping[str, Any] = field(default_factory=dict)
+    scope: str = HOLD_SCOPE_ENTRY
 
     @property
     def blocking(self) -> bool:
         return self.outcome in ("fired", "held")
+
+    @property
+    def stops_fleet(self) -> bool:
+        """Whether THIS hold, if closed, must stop the entire tick (#2186)."""
+        return self.blocking and self.scope == HOLD_SCOPE_FLEET
 
 
 @dataclass(frozen=True)
@@ -911,7 +978,14 @@ class TickPlan:
 
     @property
     def held(self) -> Hold | None:
-        """The gate holding the queue shut, if any (lowest position wins)."""
+        """The first currently-closed gate, if any (lowest position wins).
+
+        Scope-agnostic (#2186) — this is "is SOME gate closed", not "is the
+        queue stopped"; for the latter check ``.stops_fleet`` on the result,
+        which is what :func:`render_plan` does before printing the whole-queue
+        "no launch — HELD" line. An entry-scoped gate still shows up here even
+        though it only holds its own dependents.
+        """
         for item in self.holds:
             if item.blocking:
                 return item
@@ -1010,6 +1084,30 @@ def validate_enqueue(
 # ── pre-req resolution ───────────────────────────────────────────────────────
 
 
+def _gate_defer_reason(dep: str, hold: Hold) -> str:
+    """The per-tick reason a dependent defers on an entry-scoped gate (#2186).
+
+    Mirrors ``_hold_alert``'s probe detail (attempt count, last failure) so
+    an operator reading ``coord drive-queue list`` gets the SAME picture for
+    an entry-scoped hold that the old fleet-wide alert gave for everything —
+    just attributed to the one entry actually waiting on it. Built fresh
+    every call, from THIS tick's ``Hold``, which is what keeps it live rather
+    than a frozen snapshot (see the #2186 incident's stale ``last:`` text).
+    """
+    reason = f"waiting on {dep}'s deploy gate — {hold.reason}"
+    if hold.resume_when:
+        if hold.probes:
+            reason += f" (resume-when attempt {hold.probes} failed"
+            if hold.probe_detail:
+                reason += f": {hold.probe_detail}"
+            reason += ")"
+        else:
+            reason += " (resume-when not probed yet)"
+    else:
+        reason += " (no --resume-when probe: release manually)"
+    return f"{reason} (#2186)"
+
+
 @dataclass(frozen=True)
 class _Verdict:
     satisfied: bool
@@ -1022,6 +1120,7 @@ def _resolve_prereqs(
     board: BoardView,
     states: Mapping[str, str],
     cycle_keys: Mapping[str, str],
+    held_gates: Mapping[str, Hold] | None = None,
 ) -> _Verdict:
     """Decide whether *entry* may launch now.
 
@@ -1030,11 +1129,25 @@ def _resolve_prereqs(
     the entry defers and keeps its position; an *unsatisfiable* one never
     will, so waiting forever is the silent-stall failure mode this feature
     exists to remove — it blocks and escalates instead.
+
+    *held_gates* (#2186) maps a key to its currently-closed :class:`Hold`,
+    for every gate blocking this tick regardless of scope — an ENTRY-scoped
+    gate never reaches this function's caller through `plan_tick`'s early
+    return (only a FLEET-scoped one does), so by the time a caller is asking
+    this question the only gates left standing are the entry-scoped ones this
+    check exists for. Checked BEFORE `facts.landed`, deliberately: the whole
+    point of a deploy gate is that its own entry reconciling to `done`
+    (merged) is NOT the same fact as "safe to launch a dependent" (live) — an
+    unconditional `facts.landed` short-circuit here would silently defeat the
+    gate the instant its entry finished, independent of hold_state entirely.
     """
     if entry.key in cycle_keys:
         return _Verdict(False, True, cycle_keys[entry.key])
 
     for dep in entry.after:
+        hold = (held_gates or {}).get(dep)
+        if hold is not None:
+            return _Verdict(False, False, _gate_defer_reason(dep, hold))
         facts = board.facts(dep)
         if facts.landed:
             continue
@@ -1607,6 +1720,7 @@ def _resolve_holds(
                     resume_when=entry.resume_when,
                     probes=0,
                     updates={"hold_state": HOLD_FIRED, "hold_probes": 0},
+                    scope=entry.hold_scope,
                 )
             )
             continue
@@ -1628,6 +1742,7 @@ def _resolve_holds(
                     reason=entry.gate_reason,
                     resume_when=entry.resume_when,
                     probes=entry.hold_probes,
+                    scope=entry.hold_scope,
                 )
             )
             continue
@@ -1642,6 +1757,7 @@ def _resolve_holds(
                     probes=entry.hold_probes,
                     probe_detail=probe.detail,
                     updates={"hold_state": HOLD_RELEASED, "hold_probes": 0},
+                    scope=entry.hold_scope,
                 )
             )
             continue
@@ -1656,6 +1772,7 @@ def _resolve_holds(
                 probes=attempts,
                 probe_detail=probe.detail,
                 updates={"hold_probes": attempts},
+                scope=entry.hold_scope,
             )
         )
     return holds
@@ -1705,14 +1822,22 @@ def _cordon_alert(host: str, reason: str) -> QueueAlert:
 
 
 def _hold_alert(hold: Hold) -> QueueAlert:
-    """The one queue-level record a closed gate raises.
+    """The one queue-level record a FLEET-scoped closed gate raises (#2186).
+
+    Only ever built for ``hold.stops_fleet`` — an entry-scoped gate holds its
+    dependents through ordinary deferrals instead (see
+    :func:`_resolve_prereqs`), which already report per-entry, so this text
+    is specifically "the WHOLE queue is stopped", not "one entry is".
 
     Carries the operator's own ``hold_reason`` verbatim in ``reason`` — that
     string is the entire point of the feature (it is the runbook line for the
     deploy the queue is waiting on), so it must survive into the alert without
     being summarised.
     """
-    details = [f"held after {hold.key} — nothing will launch until this is released"]
+    details = [
+        f"held after {hold.key} (--scope=fleet) — nothing in ANY repo will "
+        "launch until this is released"
+    ]
     if hold.resume_when:
         outcome = (
             f"attempt {hold.probes} failed"
@@ -1839,12 +1964,17 @@ def plan_tick(
         entirely — this never resurrects them for dispatch, only lets a
         finished one stop claiming to be unfinished. Never spends an
         attempt either way — a missing CI verdict is not a failed one.
-    2. Resolve deploy gates (:func:`_resolve_holds`).  ANY gate left closed
-       returns immediately with no launch and a HELD alert — before the
-       capacity check, and regardless of how eligible the rest of the queue
-       is.  That "even with free capacity and an eligible successor" clause is
-       the entire feature: the successor is exactly the thing that must not
-       run until the deploy lands.
+    2. Resolve deploy gates (:func:`_resolve_holds`).  A gate left closed with
+       ``scope=fleet`` returns immediately with no launch and a HELD alert —
+       before the capacity check, and regardless of how eligible the rest of
+       the queue is.  The DEFAULT scope, ``entry`` (#2186), does not: it holds
+       only entries whose own ``after=`` names the gated key, resolved inside
+       step 4's ``_resolve_prereqs`` call, and the walk continues past it —
+       an unrelated waiting entry launches in this same tick even while the
+       gate stays shut. That "even with free capacity and an eligible
+       successor" clause is the entire feature either way: the DEPENDENT is
+       exactly the thing that must not run until the deploy lands, whether or
+       not anything else in the queue also has to wait for it.
     3. ``free = capacity - occupied``; ``<= 0`` returns with no launch and no
        alert — being at capacity is the queue working, not a problem to
        report.
@@ -2063,12 +2193,21 @@ def plan_tick(
         "repo_capacity": repo_capacity,
     }
 
-    gate = next((h for h in holds if h.blocking), None)
+    # #2186: every currently-closed gate, keyed by the entry it was declared
+    # on — regardless of scope. `_resolve_prereqs` below consults this to
+    # hold a dependent even though its `after=` pre-req has already reconciled
+    # to `done` (merged is not live); an ENTRY-scoped gate stops there and
+    # nowhere else. A FLEET-scoped one is handled separately, immediately
+    # below, exactly as every gate was before #2186.
+    held_gates: dict[str, Hold] = {h.key: h for h in holds if h.blocking}
+
+    gate = next((h for h in holds if h.stops_fleet), None)
     if gate is not None:
-        # Launch NOTHING.  Not "launch if there is spare capacity", not
-        # "launch anything whose pre-reqs don't mention the held entry" — the
-        # deploy this gate is waiting on is invisible to the dependency graph,
-        # which is exactly why an explicit operator-declared gate exists.
+        # Launch NOTHING — the pre-#2186 behaviour, still available but only
+        # for a gate explicitly declared `--scope=fleet`. Not "launch if
+        # there is spare capacity", not "launch anything whose pre-reqs don't
+        # mention the held entry" — a fleet-scoped gate is a deliberate
+        # whole-queue stop, invisible to the dependency graph by design.
         return TickPlan(
             **plan_base,
             reconciles=tuple(reconciles),
@@ -2207,7 +2346,7 @@ def plan_tick(
             if cooldown:
                 deferrals.append(Deferral(entry.key, cooldown, counted=False))
                 continue
-            verdict = _resolve_prereqs(entry, board, states, cycle_keys)
+            verdict = _resolve_prereqs(entry, board, states, cycle_keys, held_gates)
             if not verdict.satisfied:
                 deferrals.append(
                     Deferral(entry.key, verdict.reason, counted=False)
@@ -2277,7 +2416,7 @@ def plan_tick(
             states[entry.key] = STATE_DONE
             landed_keys.add(entry.key)
             continue
-        verdict = _resolve_prereqs(entry, board, states, cycle_keys)
+        verdict = _resolve_prereqs(entry, board, states, cycle_keys, held_gates)
         if verdict.unsatisfiable:
             blocked.append(
                 Blocked(
@@ -2442,7 +2581,12 @@ def render_plan(plan: TickPlan, *, dry_run: bool = False) -> list[str]:
             if item.probe_detail:
                 probe += f" — {item.probe_detail}"
             probe += "]"
-        lines.append(f"  hold {item.key}: {item.outcome} — {item.reason}{probe}")
+        # #2186: only the non-default scope is worth a word — an unlabeled
+        # hold line is, as always, entry-scoped.
+        scope_tag = " [scope=fleet]" if item.stops_fleet else ""
+        lines.append(
+            f"  hold {item.key}: {item.outcome} — {item.reason}{probe}{scope_tag}"
+        )
     for item in plan.blocked:
         lines.append(f"  {prefix}block {item.key}: {item.reason}")
     # Counted deferrals come BEFORE the launch line and report-only ones after,
@@ -2456,10 +2600,15 @@ def render_plan(plan: TickPlan, *, dry_run: bool = False) -> list[str]:
         target = plan.launch
         pinned = f" on {target.machine}" if target.machine else ""
         lines.append(f"  {prefix}launch {target.key}{pinned}")
-    elif plan.held is not None:
+    elif plan.held is not None and plan.held.stops_fleet:
+        # #2186: only a FLEET-scoped hold explains "no launch" on its own —
+        # an entry-scoped one may have let something else launch, or may have
+        # left its dependent explained by an ordinary `defer` line above (and
+        # the "nothing eligible" alert below), so it falls through to the
+        # generic branches instead of this one.
         lines.append(
-            f"  no launch — HELD by the deploy gate on {plan.held.key} "
-            f"(release with `coord drive-queue resume`)"
+            f"  no launch — HELD by the fleet-wide deploy gate on "
+            f"{plan.held.key} (release with `coord drive-queue resume`)"
         )
     elif plan.cordon_reason:
         # #2101 trap E: naming the cordon here is the difference between a

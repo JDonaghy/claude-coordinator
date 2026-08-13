@@ -244,6 +244,104 @@ class TestDriveQueueDeployGateColumns:
         assert entry["hold_state"] == "armed"
 
 
+# ── drive_queue.hold_scope column (#2186) ───────────────────────────────────
+
+# DQ-1 + #1757's five gate columns, but predating #2186's `hold_scope` — the
+# real upgrade path for every ~/.coord/coord.db that already has a deploy
+# gate declared on it.
+_PRE_2186_TABLE_WITH_GATES = """
+    CREATE TABLE drive_queue (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo_name     TEXT    NOT NULL,
+        issue_number  INTEGER NOT NULL,
+        position      INTEGER NOT NULL,
+        machine       TEXT,
+        after_json    TEXT    NOT NULL DEFAULT '[]',
+        state         TEXT    NOT NULL DEFAULT 'waiting',
+        attempts      INTEGER NOT NULL DEFAULT 0,
+        deferrals     INTEGER NOT NULL DEFAULT 0,
+        last_reason   TEXT    NOT NULL DEFAULT '',
+        session_name  TEXT,
+        launched_at   REAL,
+        enqueued_at   REAL    NOT NULL,
+        hold_after    INTEGER NOT NULL DEFAULT 0,
+        hold_reason   TEXT    NOT NULL DEFAULT '',
+        resume_when   TEXT    NOT NULL DEFAULT '',
+        hold_state    TEXT    NOT NULL DEFAULT '',
+        hold_probes   INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(repo_name, issue_number)
+    )
+"""
+
+
+class TestDriveQueueHoldScopeColumn:
+    def test_fresh_database_has_it_from_the_create(
+        self, isolated_conn: sqlite3.Connection
+    ) -> None:
+        assert "hold_scope" in _drive_queue_columns(isolated_conn)
+
+    def test_existing_pre_2186_database_gains_it_in_place(self) -> None:
+        """The real path: a gate already declared before #2186 shipped.
+
+        Built with the pre-#2186 `CREATE TABLE` (gate columns present,
+        `hold_scope` absent) — including a row with a FIRED gate, the exact
+        shape the 2026-08-13 incident's queue was in — so the migration is
+        exercised the same way `_ensure_schema` will actually hit it in the
+        field, not just on an empty table.
+        """
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(_PRE_2186_TABLE_WITH_GATES)
+        conn.execute(
+            "INSERT INTO drive_queue "
+            "(repo_name, issue_number, position, after_json, enqueued_at, "
+            " hold_after, hold_reason, hold_state) "
+            "VALUES ('api', 2146, 0, '[]', 100.0, 1, 'deploy', 'fired')"
+        )
+        conn.commit()
+        assert "hold_scope" not in _drive_queue_columns(conn)
+
+        _ensure_schema(conn)
+
+        assert "hold_scope" in _drive_queue_columns(conn)
+        row = conn.execute(
+            "SELECT hold_scope FROM drive_queue WHERE issue_number = 2146"
+        ).fetchone()
+        # The whole point of #2186: a gate that predates the scope column
+        # upgrades to the NARROW reading, never to a silent fleet-wide stop.
+        assert row["hold_scope"] == "entry"
+        conn.close()
+
+    def test_migration_is_idempotent(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(_PRE_2186_TABLE_WITH_GATES)
+        conn.commit()
+        _ensure_schema(conn)
+        _ensure_schema(conn)
+        _ensure_schema(conn)
+        assert "hold_scope" in _drive_queue_columns(conn)
+        conn.close()
+
+    def test_state_accessor_reads_and_writes_the_upgraded_column(self) -> None:
+        from coord import state
+
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(_PRE_2186_TABLE_WITH_GATES)
+        conn.commit()
+        _ensure_schema(conn)
+        override_connection(conn)
+        try:
+            state._enqueue_drive_queue_local(
+                "api", 9, hold_after=True, hold_reason="deploy", hold_scope="fleet"
+            )
+            entry = state._get_drive_queue_entry_local("api", 9)
+        finally:
+            close()
+        assert entry["hold_scope"] == "fleet"
+
+
 # ── merge_queue.ci_infra_reruns column (#1892) ──────────────────────────────
 
 _PRE_1892_MERGE_QUEUE_TABLE = """

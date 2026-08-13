@@ -23,6 +23,8 @@ from coord.drive_queue import (
     HOLD_ARMED,
     HOLD_FIRED,
     HOLD_RELEASED,
+    HOLD_SCOPE_ENTRY,
+    HOLD_SCOPE_FLEET,
     PARK_STALE_SECONDS,
     ProbeResult,
     STATE_BLOCKED,
@@ -2127,15 +2129,17 @@ def test_render_plan_narrates_a_cross_host_entry_as_unknown():
     assert "retry" not in text
 
 
-# ── plan_tick: deploy gates (#1757) ──────────────────────────────────────────
+# ── plan_tick: deploy gates (#1757, scoped by #2186) ─────────────────────────
 #
 # `merged != live`. These pin the decision half of the gate: what fires it,
-# what does NOT fire it, and the fact that a fired gate outranks every other
-# reason the walk might have had to launch something.
+# what does NOT fire it, and — since #2186 — HOW FAR a fired gate reaches.
+# The default scope (`entry`, unset in `held()` below) holds only entries
+# that name the gated key in their own `after=`; `HOLD_SCOPE_FLEET` is the
+# pre-#2186 whole-queue stop, kept for an explicit `--scope=fleet`.
 
 
 def held(issue: int, **kw) -> QueueEntry:
-    """A `--hold-after` entry whose gate has already fired."""
+    """A `--hold-after` entry whose gate has already fired (default scope)."""
     base = {
         "state": STATE_DONE,
         "hold_after": True,
@@ -2156,7 +2160,7 @@ def test_a_gate_fires_the_tick_its_entry_reaches_done():
                 hold_reason="deploy",
                 hold_state=HOLD_ARMED,
             ),
-            entry(2),
+            entry(2, after=(entry_key(REPO, 1),)),
         ],
         board(merged=(1,), open_=(2,)),
         capacity=1,
@@ -2164,13 +2168,52 @@ def test_a_gate_fires_the_tick_its_entry_reaches_done():
     assert plan.launch is None
     assert plan.held is not None
     assert plan.held.outcome == "fired"
+    assert plan.held.scope == HOLD_SCOPE_ENTRY
     assert dict(plan.writes())[entry_key(REPO, 1)]["hold_state"] == HOLD_FIRED
 
 
-def test_a_fired_gate_blocks_a_fully_eligible_successor_with_free_capacity():
-    """The whole feature in one assertion."""
+def test_2186_a_fired_entry_scoped_gate_does_not_block_an_unrelated_successor():
+    """THE #2186 fix, in one assertion: entry-scoped is the default.
+
+    Black-box acceptance scenario from the issue: a fired gate on entry A
+    (position 0) and a fully eligible, UNRELATED entry B (position 1) — B
+    launches in the same tick, even though A's gate is still closed.
+    """
     plan = plan_tick(
         [held(1), entry(2)],
+        board(open_=(2,)),
+        capacity=4,
+    )
+    assert plan.free_slots == 4
+    assert plan.launch is not None and plan.launch.issue == 2
+    # The gate is still on record as closed — it just never stopped the tick.
+    assert plan.held is not None
+    assert plan.held.outcome == "held"
+    assert not plan.held.stops_fleet
+
+
+def test_a_fired_entry_scoped_gate_still_holds_its_own_dependent():
+    """The other half of #2186: scoping the hold must not mean removing it."""
+    plan = plan_tick(
+        [held(1), entry(2, after=(entry_key(REPO, 1),))],
+        board(),
+        capacity=4,
+    )
+    assert plan.launch is None
+    assert [d.key for d in plan.deferrals] == [entry_key(REPO, 2)]
+    reason = plan.deferrals[0].reason
+    assert "deploy gate" in reason
+    assert "restart coord-serve" in reason
+    # #2186 acceptance: the reason is written to the row every tick (via the
+    # ordinary deferral path), not frozen the way a queue-wide short-circuit
+    # would leave it — this is what keeps `coord drive-queue list` honest.
+    assert dict(plan.writes())[entry_key(REPO, 2)]["last_reason"] == reason
+
+
+def test_a_fired_fleet_scoped_gate_still_blocks_a_fully_eligible_successor():
+    """The pre-#2186 behaviour, preserved for an explicit `--scope=fleet`."""
+    plan = plan_tick(
+        [held(1, hold_scope=HOLD_SCOPE_FLEET), entry(2)],
         board(open_=(2,)),
         capacity=4,
     )
@@ -2179,6 +2222,7 @@ def test_a_fired_gate_blocks_a_fully_eligible_successor_with_free_capacity():
     assert plan.deferrals == ()
     assert "restart coord-serve" in plan.alert.reason
     assert plan.alert.command == "coord drive-queue resume"
+    assert plan.held.stops_fleet
 
 
 def test_an_armed_gate_on_an_unlanded_entry_holds_nothing():
@@ -2225,7 +2269,10 @@ def test_a_hold_after_entry_that_dies_out_of_attempts_blocks_and_never_fires():
 def test_a_failing_probe_stays_held_and_increments_a_typed_attempt_count():
     key = entry_key(REPO, 1)
     plan = plan_tick(
-        [held(1, resume_when="curl -sf x", hold_probes=2), entry(2)],
+        [
+            held(1, resume_when="curl -sf x", hold_probes=2),
+            entry(2, after=(key,)),
+        ],
         board(open_=(2,)),
         capacity=1,
         probes={key: ProbeResult(key, False, "exit 7")},
@@ -2233,7 +2280,14 @@ def test_a_failing_probe_stays_held_and_increments_a_typed_attempt_count():
     assert plan.launch is None
     assert plan.held.probes == 3
     assert dict(plan.writes())[key]["hold_probes"] == 3
-    assert "attempt 3 failed" in " ".join(plan.alert.details)
+    # #2186: the dependent's own deferral carries the probe detail now — the
+    # fleet-wide `QUEUE HELD` alert this used to come from only fires for an
+    # explicit `--scope=fleet` gate.
+    alert_text = " ".join(plan.alert.details) if plan.alert else ""
+    assert "attempt 3 failed" in alert_text
+    assert dict(plan.writes())[entry_key(REPO, 2)]["last_reason"] == (
+        plan.deferrals[0].reason
+    )
 
 
 def test_a_passing_probe_releases_and_launches_in_the_same_tick():
@@ -2252,12 +2306,32 @@ def test_a_passing_probe_releases_and_launches_in_the_same_tick():
     assert plan.alert is None
 
 
-def test_a_gate_with_no_probe_result_stays_held_and_writes_nothing():
+def test_a_fleet_scoped_gate_with_no_probe_result_stays_held_and_writes_nothing():
     """Manual-resume-only, and a probe the shell could not run. Fail closed."""
-    plan = plan_tick([held(1), entry(2)], board(open_=(2,)), capacity=1)
+    plan = plan_tick(
+        [held(1, hold_scope=HOLD_SCOPE_FLEET), entry(2)],
+        board(open_=(2,)),
+        capacity=1,
+    )
     assert plan.launch is None
     assert plan.writes() == []
     assert "release manually" in " ".join(plan.alert.details)
+
+
+def test_an_entry_scoped_gate_with_no_probe_result_defers_its_dependent_live():
+    """Same fail-closed rule, but scoped: only the dependent is affected, and
+    its reason is written fresh every tick rather than frozen."""
+    plan = plan_tick(
+        [held(1), entry(2, after=(entry_key(REPO, 1),))],
+        board(),
+        capacity=4,
+    )
+    assert plan.launch is None
+    assert len(plan.deferrals) == 1
+    d = plan.deferrals[0]
+    assert d.key == entry_key(REPO, 2)
+    assert "restart coord-serve" in d.reason
+    assert dict(plan.writes())[entry_key(REPO, 2)]["last_reason"] == d.reason
 
 
 def test_only_an_already_fired_gate_is_offered_for_probing():
@@ -2272,9 +2346,31 @@ def test_only_an_already_fired_gate_is_offered_for_probing():
     assert [e.issue for e in pending_probe_targets(entries)] == [2]
 
 
-def test_render_plan_says_why_nothing_launched():
-    plan = plan_tick([held(1), entry(2)], board(open_=(2,)), capacity=1)
+def test_render_plan_says_why_a_fleet_scoped_hold_stopped_everything():
+    plan = plan_tick(
+        [held(1, hold_scope=HOLD_SCOPE_FLEET), entry(2)],
+        board(open_=(2,)),
+        capacity=1,
+    )
     text = "\n".join(render_plan(plan))
     assert "hold claude-coordinator#1: held" in text
+    assert "[scope=fleet]" in text
     assert "no launch — HELD" in text
+    assert "fleet-wide" in text
     assert "coord drive-queue resume" in text
+
+
+def test_render_plan_narrates_an_entry_scoped_hold_as_a_defer_not_a_queue_stop():
+    plan = plan_tick(
+        [held(1), entry(2, after=(entry_key(REPO, 1),))],
+        board(),
+        capacity=1,
+    )
+    text = "\n".join(render_plan(plan))
+    assert "hold claude-coordinator#1: held" in text
+    assert "[scope=fleet]" not in text
+    assert "no launch — HELD" not in text
+    assert (
+        f"defer {entry_key(REPO, 2)}: waiting on {entry_key(REPO, 1)}'s deploy gate"
+        in text
+    )

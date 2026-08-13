@@ -5880,6 +5880,11 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                     hold_after=bool(body.get("hold_after")),
                     hold_reason=body.get("hold_reason") or "",
                     resume_when=body.get("resume_when") or "",
+                    # #2186: absent key means "no scope sent" (a client
+                    # predating this feature) — `_enqueue_drive_queue_local`
+                    # normalizes that to `entry`, same as every other
+                    # unrecognised value.
+                    hold_scope=body.get("hold_scope") or "entry",
                 )
                 return JSONResponse({"entry_id": entry_id})
             if action == "dequeue":

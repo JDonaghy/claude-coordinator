@@ -43,6 +43,8 @@ from coord.drive_queue import (
     DEFAULT_MAX_ATTEMPTS,
     DEFAULT_MAX_PARALLEL_PER_REPO,
     HOLD_RELEASED,
+    HOLD_SCOPE_ENTRY,
+    HOLD_SCOPE_FLEET,
     QUEUE_ALERT_ISSUE,
     QUEUE_ALERT_REPO,
     QUEUE_ALERT_STAGE,
@@ -155,6 +157,19 @@ def drive_queue_group() -> None:
         "treated as a failure. Requires --hold-after."
     ),
 )
+@click.option(
+    "--scope",
+    "hold_scope",
+    type=click.Choice([HOLD_SCOPE_ENTRY, HOLD_SCOPE_FLEET]),
+    default=HOLD_SCOPE_ENTRY,
+    show_default=True,
+    help=(
+        "How far a fired gate reaches (#2186). `entry` holds only entries "
+        "whose own --after names THIS one. `fleet` is the whole-queue stop — "
+        "launch NOTHING anywhere, for the rare case (a rename, a schema "
+        "migration) where that is really what's needed. Requires --hold-after."
+    ),
+)
 @_CONFIG_OPTION
 def drive_queue_add(
     repo: str,
@@ -165,6 +180,7 @@ def drive_queue_add(
     hold_after: bool,
     hold_reason: str,
     resume_when: str,
+    hold_scope: str,
     config_path: Path,
 ) -> None:
     """Queue REPO ISSUE for `coord drive`, or update it if already queued.
@@ -178,7 +194,7 @@ def drive_queue_add(
     try:
         after = parse_after_spec(after_specs, repo)
         validate_config_repo(config_path, repo)
-        validate_hold_flags(hold_after, hold_reason, resume_when)
+        validate_hold_flags(hold_after, hold_reason, resume_when, hold_scope)
         validate_enqueue(entries_from_rows(list_drive_queue()), repo, issue, after)
     except QueueError as exc:
         raise click.ClickException(str(exc)) from None
@@ -192,37 +208,51 @@ def drive_queue_add(
         hold_after=hold_after,
         hold_reason=hold_reason,
         resume_when=resume_when,
+        hold_scope=hold_scope,
     )
     suffix = f" after {', '.join(after)}" if after else ""
     pinned = f" on {machine}" if machine else ""
     gate = ""
     if hold_after:
         gate = " · holds the queue when done"
+        if hold_scope == HOLD_SCOPE_FLEET:
+            gate += " (fleet-wide — nothing anywhere launches)"
         if resume_when:
             gate += f" (auto-resume when `{resume_when}` passes)"
     click.echo(f"queued {entry_key(repo, issue)}{pinned}{suffix}{gate}")
 
 
-def validate_hold_flags(hold_after: bool, hold_reason: str, resume_when: str) -> None:
-    """Refuse gate detail without a gate (#1757).
+def validate_hold_flags(
+    hold_after: bool,
+    hold_reason: str,
+    resume_when: str,
+    hold_scope: str = HOLD_SCOPE_ENTRY,
+) -> None:
+    """Refuse gate detail without a gate (#1757, extended by #2186).
 
-    `--resume-when` / `--hold-reason` on an entry with no `--hold-after` would
-    be stored and then never read — a silent no-op on the ONE flag whose whole
-    job is to stop the queue.  An operator who mistyped that has no signal at
-    all that overnight sequencing will now blow straight through the deploy
-    step, so this is a usage error, not a warning.
+    `--resume-when` / `--hold-reason` / a non-default `--scope` on an entry
+    with no `--hold-after` would be stored and then never read — a silent
+    no-op on the ONE flag whose whole job is to stop the queue (or narrow
+    what it stops).  An operator who mistyped that has no signal at all that
+    overnight sequencing will now blow straight through the deploy step, so
+    this is a usage error, not a warning.
     """
     if hold_after:
         return
     offenders = [
         flag
-        for flag, value in (("--resume-when", resume_when), ("--hold-reason", hold_reason))
+        for flag, value in (
+            ("--resume-when", resume_when),
+            ("--hold-reason", hold_reason),
+        )
         if value
     ]
+    if hold_scope == HOLD_SCOPE_FLEET:
+        offenders.append("--scope=fleet")
     if offenders:
         raise QueueError(
             f"{' and '.join(offenders)} require --hold-after "
-            "(without it there is no gate to resume or explain)"
+            "(without it there is no gate to resume, explain, or scope)"
         )
 
 
@@ -277,6 +307,8 @@ def drive_queue_list(repo: str | None, output_json: bool, config_path: Path) -> 
             bits.append(f"deferrals={entry.deferrals}")
         if entry.hold_after:
             bits.append(f"hold={entry.hold_state or 'armed'}")
+            if entry.hold_scope == HOLD_SCOPE_FLEET:
+                bits.append("scope=fleet")
         click.echo("  ".join(bits))
         if entry.last_reason:
             click.echo(f"      last{_reason_age_suffix(entry, now)}: {entry.last_reason}")
@@ -325,7 +357,12 @@ def _hold_lines(entry: QueueEntry) -> list[str]:
     """
     if not entry.hold_after:
         return []
-    lines = [f"      hold-after: {entry.gate_reason}"]
+    scope_suffix = (
+        " [fleet-wide — holds everything, not just this entry's dependents]"
+        if entry.hold_scope == HOLD_SCOPE_FLEET
+        else ""
+    )
+    lines = [f"      hold-after: {entry.gate_reason}{scope_suffix}"]
     if entry.resume_when:
         probe = f"      resume-when: {entry.resume_when}"
         if entry.hold_probes:
@@ -416,6 +453,10 @@ def drive_queue_status(output_json: bool, config_path: Path) -> None:
                             "reason": e.gate_reason,
                             "resume_when": e.resume_when,
                             "probes": e.hold_probes,
+                            # #2186: typed, so a client reads what this gate
+                            # holds without parsing the `[fleet-wide ...]`
+                            # suffix back out of the rendered text.
+                            "scope": e.hold_scope,
                         }
                         for e in held
                     ],

@@ -1593,14 +1593,119 @@ def test_re_adding_without_hold_after_withdraws_the_gate(cli):
     assert entry["hold_state"] == ""
 
 
-# ── tick: the gate fires and blocks an eligible successor ────────────────────
+# ── add: --scope (#2186) ──────────────────────────────────────────────────────
 
 
-def test_a_fired_gate_launches_nothing_even_with_an_eligible_successor(
+def test_add_hold_after_defaults_to_entry_scope(cli):
+    result = cli("add", REPO, "1753", "--hold-after", "--hold-reason", "deploy")
+    assert result.exit_code == 0, result.output
+    assert queued(1753)["hold_scope"] == "entry"
+    # The default scope is quiet in `list` — only a non-default one is worth
+    # a word (see the fleet-scope test below).
+    assert "fleet" not in cli("list").output
+
+
+def test_add_hold_after_can_declare_fleet_scope(cli):
+    result = cli(
+        "add", REPO, "1753",
+        "--hold-after", "--hold-reason", "deploy", "--scope", "fleet",
+    )
+    assert result.exit_code == 0, result.output
+    assert "fleet-wide" in result.output
+    assert queued(1753)["hold_scope"] == "fleet"
+
+    listed = cli("list")
+    assert listed.exit_code == 0, listed.output
+    assert "scope=fleet" in listed.output
+    assert "fleet-wide" in listed.output
+
+
+def test_scope_fleet_without_hold_after_is_refused(cli):
+    result = cli("add", REPO, "1753", "--scope", "fleet")
+    assert result.exit_code != 0
+    assert "--hold-after" in result.output
+    assert state._list_drive_queue_local() == []
+
+
+def test_scope_rejects_a_value_other_than_entry_or_fleet(cli):
+    result = cli(
+        "add", REPO, "1753", "--hold-after", "--hold-reason", "d", "--scope", "queue",
+    )
+    assert result.exit_code != 0
+    assert state._list_drive_queue_local() == []
+
+
+# ── tick: the gate fires, and #2186 scopes what it blocks ────────────────────
+
+
+def test_2186_a_fired_gate_does_not_block_an_unrelated_eligible_entry(
     cli, seed, launches
 ):
-    """THE test. Free capacity, a fully eligible #1754 — and still no launch."""
+    """THE #2186 acceptance test: default scope is `entry`, not `fleet`.
+
+    Free capacity, a fully eligible #1754 that has NO `--after` relationship
+    to #1753 — it launches in the same tick, even though #1753's gate just
+    fired. This is the exact incident: one issue's deploy dependency must not
+    idle the rest of the fleet.
+    """
     cli("add", REPO, "1753", "--hold-after", "--hold-reason", "restart coord-serve")
+    cli("add", REPO, "1754")
+    state._update_drive_queue_entry_local(REPO, 1753, state="running")
+    seed(
+        issues={1753: "closed", 1754: "open"},
+        assignments=[{"issue_number": 1753, "status": "merged"}],
+    )
+
+    result = cli("tick", "--max-parallel", "1")
+    assert result.exit_code == 0, result.output
+    assert "1754" in " ".join(launches[0])
+    assert queued(1753)["state"] == "done"
+    assert queued(1753)["hold_state"] == "fired"
+    assert queued(1753)["hold_scope"] == "entry"
+    assert queued(1754)["state"] == "running"
+
+    # The gate fired, but scoped — no fleet-wide "QUEUE HELD" alert.
+    alert = state._get_drive_escalation_local(QUEUE_ALERT_REPO, QUEUE_ALERT_ISSUE)
+    assert alert is None
+    assert state._get_drive_escalation_local(REPO, 1753) is None
+
+
+def test_a_fired_gate_still_blocks_its_own_after_dependent(cli, seed, launches):
+    """The other half of #2186: scoping the hold must not remove it."""
+    cli("add", REPO, "1753", "--hold-after", "--hold-reason", "restart coord-serve")
+    cli("add", REPO, "1754", "--after", "1753")
+    state._update_drive_queue_entry_local(REPO, 1753, state="running")
+    seed(
+        issues={1753: "closed", 1754: "open"},
+        assignments=[{"issue_number": 1753, "status": "merged"}],
+    )
+
+    result = cli("tick", "--max-parallel", "1")
+    assert result.exit_code == 0, result.output
+    assert launches == []
+    assert queued(1753)["state"] == "done"
+    assert queued(1753)["hold_state"] == "fired"
+    # #1754 WAS touched — deferred, with a live reason, not silently frozen.
+    assert queued(1754)["state"] == "waiting"
+    assert queued(1754)["deferrals"] == 1
+    assert "restart coord-serve" in queued(1754)["last_reason"]
+
+    # Deferring #1754 is not itself the fleet-wide "QUEUE HELD" alert — it IS
+    # the queue's ordinary "nothing eligible" alert, since #1754 is the only
+    # entry left waiting.
+    alert = state._get_drive_escalation_local(QUEUE_ALERT_REPO, QUEUE_ALERT_ISSUE)
+    assert alert is not None
+    assert "restart coord-serve" in alert["gate_readings"]
+
+
+def test_a_fleet_scoped_gate_launches_nothing_even_with_an_eligible_successor(
+    cli, seed, launches
+):
+    """The pre-#2186 whole-queue stop, preserved for an explicit --scope=fleet."""
+    cli(
+        "add", REPO, "1753",
+        "--hold-after", "--hold-reason", "restart coord-serve", "--scope", "fleet",
+    )
     cli("add", REPO, "1754")
     state._update_drive_queue_entry_local(REPO, 1753, state="running")
     seed(
@@ -1613,6 +1718,7 @@ def test_a_fired_gate_launches_nothing_even_with_an_eligible_successor(
     assert launches == []
     assert queued(1753)["state"] == "done"
     assert queued(1753)["hold_state"] == "fired"
+    assert queued(1753)["hold_scope"] == "fleet"
     # 1754 was NOT touched — not launched, not deferred, not blocked.
     assert queued(1754)["state"] == "waiting"
     assert queued(1754)["deferrals"] == 0
@@ -1627,7 +1733,7 @@ def test_a_fired_gate_launches_nothing_even_with_an_eligible_successor(
 
 def test_a_hold_does_not_decay_across_ticks(cli, seed, launches):
     cli("add", REPO, "1753", "--hold-after", "--hold-reason", "deploy")
-    cli("add", REPO, "1754")
+    cli("add", REPO, "1754", "--after", "1753")
     state._update_drive_queue_entry_local(REPO, 1753, state="running")
     seed(
         issues={1753: "closed", 1754: "open"},
@@ -1663,7 +1769,7 @@ def test_resume_clears_the_hold_and_the_very_next_tick_launches(
     cli, seed, launches
 ):
     cli("add", REPO, "1753", "--hold-after", "--hold-reason", "deploy")
-    cli("add", REPO, "1754")
+    cli("add", REPO, "1754", "--after", "1753")
     state._update_drive_queue_entry_local(REPO, 1753, state="running")
     seed(
         issues={1753: "closed", 1754: "open"},
@@ -1716,7 +1822,7 @@ def test_a_failing_probe_keeps_the_gate_held_with_a_rising_attempt_count(
         "--hold-after", "--hold-reason", "deploy",
         "--resume-when", "curl -sf http://dellserver:7435/drive-queue",
     )
-    cli("add", REPO, "1754")
+    cli("add", REPO, "1754", "--after", "1753")
     state._update_drive_queue_entry_local(REPO, 1753, state="running")
     seed(
         issues={1753: "closed", 1754: "open"},
@@ -1731,11 +1837,19 @@ def test_a_failing_probe_keeps_the_gate_held_with_a_rising_attempt_count(
     for expected in (1, 2, 3):
         assert cli("tick").exit_code == 0
         assert queued(1753)["hold_probes"] == expected
+        # #2186: the gate is entry-scoped by default, so the queue-level
+        # alert is the ordinary "nothing eligible" one raised by #1754's own
+        # deferral (the only entry left waiting) — not a fleet-wide
+        # `QUEUE HELD`. Either way it carries the rising attempt count.
         alert = state._get_drive_escalation_local(QUEUE_ALERT_REPO, QUEUE_ALERT_ISSUE)
         assert f"attempt {expected} failed" in alert["gate_readings"]
+        assert f"attempt {expected} failed" in queued(1754)["last_reason"]
 
     assert launches == []
     assert len(probes.calls) == 3
+    # #2186: #1754 was re-evaluated (and its reason re-written) EVERY tick —
+    # the fix for the incident's stale, hours-old `last:` text.
+    assert queued(1754)["deferrals"] >= 3
     assert "failed 3×" in cli("status").output
 
 
@@ -1747,7 +1861,7 @@ def test_a_passing_probe_releases_and_launches_in_the_same_tick(
         "--hold-after", "--hold-reason", "deploy",
         "--resume-when", "curl -sf http://dellserver:7435/drive-queue",
     )
-    cli("add", REPO, "1754")
+    cli("add", REPO, "1754", "--after", "1753")
     state._update_drive_queue_entry_local(REPO, 1753, state="running")
     seed(
         issues={1753: "closed", 1754: "open"},
