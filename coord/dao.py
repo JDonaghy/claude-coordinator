@@ -260,6 +260,15 @@ class SqliteStore:
         conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA query_only=ON")
+        # #2159: without a busy_timeout SQLite fails a locked read INSTANTLY
+        # (the default is 0ms) instead of waiting out a writer's momentary
+        # hold — this is the daemon's `/board` read path, hit by every thin
+        # client's `coord drive-queue tick`, `coord notify`, and the web
+        # dashboard, so it is also the connection most exposed to lock
+        # contention scaling with the fleet. Same value as the writer
+        # connection's own `busy_timeout` (`coord.db._open`), so a read-only
+        # request waits out a writer exactly as long as another writer would.
+        conn.execute("PRAGMA busy_timeout=5000")
         return conn
 
     # ── internal builders (take an open connection) ────────────────────────────

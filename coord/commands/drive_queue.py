@@ -510,6 +510,79 @@ def _clear_queue_alert() -> None:
         pass
 
 
+# ── board-read retry (#2159) ─────────────────────────────────────────────────
+#
+# A transient SQLite "database is locked" / SQLITE_BUSY on the board read is
+# not evidence the board is broken — it is evidence something else (the
+# daemon's own tick loop, `coord notify`, the web dashboard, another machine's
+# drive-queue tick) was mid-write on the same DB at the exact instant this
+# tick asked to read it. The read is idempotent — nothing has been decided
+# yet — so retrying it a few times over a couple of seconds is strictly safer
+# than the alternative: aborting the whole tick and leaving
+# `coord-drive-queue.service` sitting `failed` over a one-off, millisecond-
+# wide race (2026-08-12, dellserver, one tick in a 14-hour window).
+#
+# `coord.db._open` already sets `PRAGMA busy_timeout=5000` on the connection
+# the local (daemon-host) board read goes through, so SQLite itself already
+# retries internally for up to 5s before ever raising — this loop is the
+# belt-and-braces layer above that: it also covers a thin client's board read
+# (an HTTP round trip to the daemon, which cannot be taught a SQLite pragma)
+# and the case where 5s of internal retry still wasn't enough. Any OTHER read
+# failure — the daemon is genuinely unreachable, a malformed payload, a real
+# non-transient error — does not match `_is_db_locked_error` and is re-raised
+# on the FIRST attempt: retrying those would only delay the fail-closed abort
+# this module's docstring requires.
+_BOARD_READ_RETRY_ATTEMPTS = 3
+_BOARD_READ_RETRY_BACKOFF_SECONDS = (0.5, 1.0)  # 2 sleeps across 3 attempts, ~2s total
+
+
+def _is_db_locked_error(exc: BaseException) -> bool:
+    """``True`` for the transient "database is locked" / SQLITE_BUSY class.
+
+    Matched on the exception's message rather than restricted to
+    ``sqlite3.OperationalError``: a thin client's board read goes through
+    ``httpx`` against the daemon's ``GET /board``, so a locked DB on the
+    daemon's end can surface here wrapped in whatever exception carries the
+    daemon's error detail, not necessarily a local ``sqlite3`` exception.
+    Every other read failure lacks this text and is unaffected.
+    """
+    return "database is locked" in str(exc).lower() or "sqlite_busy" in str(exc).lower()
+
+
+def _fetch_board_view_with_retry() -> BoardView:
+    """:func:`_fetch_board_view`, with a bounded retry for lock contention.
+
+    Up to :data:`_BOARD_READ_RETRY_ATTEMPTS` reads, backing off
+    :data:`_BOARD_READ_RETRY_BACKOFF_SECONDS` between them — but ONLY while
+    the failure matches :func:`_is_db_locked_error`; anything else is
+    re-raised immediately so the caller's existing fail-closed abort is
+    unchanged. Logs once, at the tick level, when a retry actually recovered
+    the read, so the contention stays visible rather than silently smoothed
+    over — never once when the very first attempt already succeeded.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(_BOARD_READ_RETRY_ATTEMPTS):
+        try:
+            board = _fetch_board_view()
+        except Exception as exc:  # noqa: BLE001 — re-raised below when not retryable
+            if not _is_db_locked_error(exc) or attempt == _BOARD_READ_RETRY_ATTEMPTS - 1:
+                raise
+            last_exc = exc
+            time.sleep(
+                _BOARD_READ_RETRY_BACKOFF_SECONDS[
+                    min(attempt, len(_BOARD_READ_RETRY_BACKOFF_SECONDS) - 1)
+                ]
+            )
+            continue
+        if last_exc is not None:
+            click.echo(
+                f"board read hit lock contention and recovered after {attempt} "
+                f"retry(ies) (last error: {last_exc})"
+            )
+        return board
+    raise AssertionError("unreachable — the loop above always returns or raises")
+
+
 # ── tick ─────────────────────────────────────────────────────────────────────
 
 
@@ -1035,7 +1108,7 @@ def drive_queue_tick(
         # "we do not know what is running", and launching on that assumption is
         # how a sequential batch becomes concurrent on the fleet.
         try:
-            board = _fetch_board_view()
+            board = _fetch_board_view_with_retry()
         except Exception as exc:  # noqa: BLE001 — every fetch failure is fatal here
             raise click.ClickException(
                 f"could not read the board — aborting without launching anything: {exc}"
