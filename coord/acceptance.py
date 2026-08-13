@@ -19,6 +19,7 @@ Layout this module expects (docs/ORACLE_LOOP.md "Layout"):
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -222,7 +223,15 @@ class ManifestData:
     reviewable opt-out from the Gate-A human sign-off gate, same posture as
     ``exempt:`` above — a milestone whose surface genuinely needs no human
     eye says so in the repo, in writing, rather than the gate quietly not
-    existing for everyone."""
+    existing for everyone.
+
+    #2164 adds ``expected_red``: ``{issue_number: {test_id, ...}}``, the
+    registry of test-ids a sealed slice is *known* to fail before its fix
+    exists. A test-id listed there that fails is not a CI failure
+    (:func:`apply_expected_red`); one that PASSES is a hard, loud failure —
+    the vacuous-assertion case #1965 cares about. Cleared only by ``coord
+    acceptance record`` observing green externally
+    (:func:`clear_expected_red_entries`), never by a worker edit."""
 
     tests: dict[str, int] = field(default_factory=dict)
     exempt: frozenset[int] = field(default_factory=frozenset)
@@ -230,6 +239,8 @@ class ManifestData:
     #: may be consumed without a recorded human verdict (#2063).
     gate_a_exempt: bool = False
     gate_a_exempt_reason: str = ""
+    #: #2164 — see the class docstring's ``expected_red`` paragraph.
+    expected_red: "dict[int, frozenset[str]]" = field(default_factory=dict)
 
 
 def parse_manifest_text(text: str, *, source: str = "<manifest>") -> ManifestData:
@@ -247,12 +258,18 @@ def parse_manifest_text(text: str, *, source: str = "<manifest>") -> ManifestDat
     - ``exempt: [<issue-number>, ...]`` — issues exempted from the #1138
       issue-level oracle gate (no slice required before Work dispatch).
 
-    Plus one milestone-level block:
+    Plus two milestone-level blocks:
 
     - ``gate_a: {exempt: true, reason: "..."}`` — this milestone's contract
       may be consumed without a recorded human sign-off (#2063). ``gate_a:
       true`` is accepted as shorthand. Anything else (including a missing
       key) leaves the gate on.
+    - ``expected_red: {<issue_number>: [<test-id>, ...], ...}`` (#2164) — the
+      test-ids a sealed slice is authored to fail *right now*, before its
+      fix exists. Non-dict/non-list entries are ignored rather than raising
+      — a malformed ``expected_red`` block degrades to "nothing is
+      expected-red" (fails toward the stricter, ordinary-CI behavior)
+      instead of blowing up the parse.
     """
     try:
         raw = yaml.safe_load(text)
@@ -291,11 +308,24 @@ def parse_manifest_text(text: str, *, source: str = "<manifest>") -> ManifestDat
     elif isinstance(gate_a_raw, bool):
         gate_a_exempt = gate_a_raw
 
+    expected_red: dict[int, frozenset[str]] = {}
+    expected_red_raw = raw.get("expected_red")
+    if isinstance(expected_red_raw, dict):
+        for issue, test_ids in expected_red_raw.items():
+            if not isinstance(test_ids, list):
+                continue
+            try:
+                issue_num = int(issue)
+            except (TypeError, ValueError):
+                continue
+            expected_red[issue_num] = frozenset(str(t) for t in test_ids)
+
     return ManifestData(
         tests=mapping,
         exempt=exempt,
         gate_a_exempt=gate_a_exempt,
         gate_a_exempt_reason=gate_a_reason,
+        expected_red=expected_red,
     )
 
 
@@ -328,6 +358,27 @@ def load_manifest(acceptance_root: Path) -> dict[str, int]:
     mapping: dict[str, int] = {}
     for path in _manifest_paths(acceptance_root):
         mapping.update(_parse_manifest_file(path))
+    return mapping
+
+
+def load_expected_red(acceptance_root: Path) -> dict[str, int]:
+    """Merge every ``ms-NN/manifest.(yml|json)``'s ``expected_red:`` block
+    under *acceptance_root* into one ``{test_id: issue_number}`` mapping
+    (#2164) — the flat shape :func:`apply_expected_red` and the ``coord
+    acceptance run --all --ci`` CI wrapper consume.
+
+    Mirrors :func:`load_manifest`'s merge/empty-dict/last-writer-wins
+    conventions exactly, just reading ``expected_red`` instead of ``tests``.
+    """
+    mapping: dict[str, int] = {}
+    for path in _manifest_paths(acceptance_root):
+        try:
+            data = parse_manifest_text(path.read_text(), source=str(path))
+        except OSError as e:
+            raise ManifestError(f"failed to parse manifest {path}: {e}") from e
+        for issue_number, test_ids in data.expected_red.items():
+            for test_id in test_ids:
+                mapping[test_id] = issue_number
     return mapping
 
 
@@ -445,6 +496,83 @@ def failure_summary(verdict: dict[str, Any], *, limit: int = 5) -> str:
     return "\n".join(lines)
 
 
+def apply_expected_red(verdict: dict[str, Any], expected_red_ids: "set[str]") -> dict[str, Any]:
+    """Mutate + return *verdict* (from :func:`build_verdict`) with the
+    #2164 expected-red accounting the CI wrapper (``coord acceptance run
+    --all --ci``) needs, on top of the raw ``green`` field callers already
+    relied on before this existed.
+
+    Adds:
+
+    - ``expected_red_still_red``: ids in *expected_red_ids* that failed —
+      the ordinary, designed-for case. Excluded from ``ci_green``'s failure
+      count.
+    - ``unexpected_green``: ids in *expected_red_ids* that PASSED — the
+      loud, distinguishable hard failure this registry exists to catch
+      (#1965's "an assertion that never exercised the bug"). A single one
+      of these is enough to fail ``ci_green`` even if every other test is
+      green.
+    - ``ci_green``: true iff there are zero real (non-expected-red)
+      failures AND zero unexpected-green ids AND at least one test ran.
+      This — not the raw ``green`` — is what a CI gate should key off of;
+      ``green`` is left untouched so existing (non-CI) callers of
+      :func:`build_verdict` see no behavior change.
+
+    A no-op (``ci_green == green``, both new lists empty) when
+    *expected_red_ids* is empty — the overwhelmingly common case (most
+    slices have nothing expected-red).
+    """
+    tests = verdict.get("tests", [])
+    if not expected_red_ids:
+        verdict["expected_red_still_red"] = []
+        verdict["unexpected_green"] = []
+        verdict["ci_green"] = verdict["green"]
+        return verdict
+
+    unexpected_green = sorted(
+        t["id"] for t in tests if t.get("status") == "pass" and t["id"] in expected_red_ids
+    )
+    expected_red_still_red = sorted(
+        t["id"] for t in tests if t.get("status") == "fail" and t["id"] in expected_red_ids
+    )
+    real_failures = sum(
+        1 for t in tests if t.get("status") == "fail" and t["id"] not in expected_red_ids
+    )
+    verdict["unexpected_green"] = unexpected_green
+    verdict["expected_red_still_red"] = expected_red_still_red
+    verdict["ci_green"] = (
+        len(tests) > 0 and real_failures == 0 and not unexpected_green
+    )
+    return verdict
+
+
+def expected_red_failure_summary(verdict: dict[str, Any]) -> str:
+    """Loud, distinguishable-from-an-ordinary-failure message for a verdict
+    whose ``unexpected_green`` (from :func:`apply_expected_red`) is
+    non-empty — a test-id the manifest says is ``expected_red`` but which
+    just PASSED. Returns ``""`` when there's nothing to report.
+
+    This is deliberately worded differently from :func:`failure_summary`'s
+    per-test failure lines: the point (#1965) is that a human/CI reader
+    can't mistake this for "a test failed" — it is the opposite signal, and
+    the fix is editorial (clear the manifest entry, or realize the
+    assertion never exercised the bug), not code.
+    """
+    ids = verdict.get("unexpected_green") or []
+    if not ids:
+        return ""
+    listed = "\n".join(f"  - {i}" for i in ids)
+    return (
+        f"HARD FAILURE: {len(ids)} test(s) listed in `expected_red` now PASS:\n"
+        f"{listed}\n"
+        "An expected-red test that passes means either the fix already "
+        "landed silently (clear it — `coord acceptance record` does this "
+        "automatically on a green trust-gate run) or the assertion never "
+        "exercised the bug in the first place (#1965). This is NOT an "
+        "ordinary test failure — it is the opposite signal."
+    )
+
+
 def dump_manifest_error_hint(acceptance_root: Path) -> str:
     """Human-facing hint for "no manifest found" — points at the authoring
     step (#931) rather than leaving the operator guessing."""
@@ -500,3 +628,125 @@ def acceptance_capability_gap(
     if not candidates:
         return None
     return candidates[0]
+
+
+def _is_content_line(line: str) -> bool:
+    """True when *line*, with any ``#`` comment stripped, still has
+    non-whitespace content — i.e. it's real YAML, not blank/comment-only."""
+    return bool(line.split("#", 1)[0].strip())
+
+
+_EXPECTED_RED_KEY_RE = re.compile(r"^expected_red\s*:\s*(#.*)?$")
+
+
+def _issue_header_re(issue_number: int) -> re.Pattern[str]:
+    return re.compile(rf"^(\s*)['\"]?{issue_number}['\"]?\s*:\s*(#.*)?$")
+
+
+def _strip_cleared_ids_from_issue_block(
+    body: "list[str]", issue_number: int, cleared_ids: "set[str]",
+) -> "tuple[list[str], bool]":
+    """Within one ``expected_red:`` block's lines (*body*), drop any list
+    item under *issue_number* whose id is in *cleared_ids*; drop the whole
+    ``<issue_number>:`` sub-block (header + remaining lines, including any
+    now-orphaned comments) if nothing but comments/blanks are left under it.
+
+    Returns ``(new_body, changed)``.
+    """
+    header_re = _issue_header_re(issue_number)
+    out: list[str] = []
+    changed = False
+    i, n = 0, len(body)
+    while i < n:
+        line = body[i]
+        m = header_re.match(line)
+        if not m:
+            out.append(line)
+            i += 1
+            continue
+        header_indent = len(m.group(1))
+        i += 1
+        sub: list[str] = []
+        while i < n:
+            sub_line = body[i]
+            sub_indent = len(sub_line) - len(sub_line.lstrip(" "))
+            if sub_line.strip() and sub_indent <= header_indent:
+                break
+            sub.append(sub_line)
+            i += 1
+        new_sub = []
+        for sub_line in sub:
+            code = sub_line.split("#", 1)[0].strip()
+            item_m = re.match(r"^-\s*(.+?)\s*$", code)
+            if item_m and item_m.group(1) in cleared_ids:
+                changed = True
+                continue
+            new_sub.append(sub_line)
+        if any(_is_content_line(sub_line) for sub_line in new_sub):
+            out.append(line)
+            out.extend(new_sub)
+        else:
+            # Nothing but comments/blanks left under this issue — drop the
+            # header too rather than leave a dangling `NNN:` with no items.
+            changed = True
+    return out, changed
+
+
+def clear_expected_red_entries(
+    text: str, issue_number: int, cleared_test_ids: "set[str]",
+) -> str | None:
+    """Pure text-surgery (#2164): remove *cleared_test_ids* from
+    *issue_number*'s list under the ``expected_red:`` block of a
+    ``manifest.yml``'s raw *text*, preserving every other line — including
+    comments — byte-for-byte.
+
+    Used by ``coord acceptance record``'s trust-gate clearing step (the
+    coordinator, never a worker, observes a previously-expected-red test go
+    green externally and drops it from the registry) — the manifest carries
+    hand-written commentary (see ``tests/acceptance/ms-33/manifest.yml``)
+    that a parse-and-``yaml.safe_dump`` round-trip would destroy, so this
+    edits the text directly instead of going through :mod:`yaml`.
+
+    Returns the updated text, or ``None`` when nothing changed (no matching
+    id was found under *issue_number* — the caller should skip committing a
+    no-op). If clearing empties an issue's whole list, that issue's
+    sub-block (header + any orphaned comments) is dropped; if that empties
+    the whole ``expected_red:`` block, the key itself is dropped too.
+    """
+    if not cleared_test_ids:
+        return None
+
+    lines = text.splitlines(keepends=True)
+    out: list[str] = []
+    i, n = 0, len(lines)
+    changed = False
+    while i < n:
+        line = lines[i]
+        if _EXPECTED_RED_KEY_RE.match(line.strip()):
+            i += 1
+            body: list[str] = []
+            while i < n:
+                body_line = lines[i]
+                indent = len(body_line) - len(body_line.lstrip(" "))
+                if body_line.strip() and indent == 0:
+                    break
+                body.append(body_line)
+                i += 1
+            new_body, body_changed = _strip_cleared_ids_from_issue_block(
+                body, issue_number, cleared_test_ids,
+            )
+            if body_changed:
+                changed = True
+            if any(_is_content_line(bl) for bl in new_body):
+                out.append(line)
+                out.extend(new_body)
+            else:
+                # Whole registry is now empty — drop the key too.
+                changed = True
+        else:
+            out.append(line)
+            i += 1
+
+    if not changed:
+        return None
+    return "".join(out)

@@ -125,7 +125,8 @@ One command, framework-agnostic above the driver:
 | `coord acceptance author --milestone NN [--issue N]` | Gate A / JIT (#931) | Dispatch the independent **`test-author`**: write/extend the red acceptance suite from the contract. |
 | `coord acceptance run --issue N` | **worker, in-session** | Run issue N's slice via the repo driver; return **structured** per-test pass/fail. Sealed: verdicts only, no test source. |
 | `coord acceptance run --all` | coordinator (Gate C) | Run the full accumulated suite. |
-| `coord acceptance record --issue N --sha <sha>` | coordinator, **external** | Re-run the sealed slice against the pushed SHA; **write the verdict to the board** (the Acceptance box). The trust gate. |
+| `coord acceptance run --all --ci` | **repo CI** (#2164) | Same as `--all`, but honors each manifest's `expected_red:` registry — see below. Point your repo's ordinary acceptance test step at this instead of the raw driver command. |
+| `coord acceptance record --issue N --sha <sha>` | coordinator, **external** | Re-run the sealed slice against the pushed SHA; **write the verdict to the board** (the Acceptance box). The trust gate. Also clears any of issue N's now-passing ids from `expected_red:` on the default branch (#2164). |
 | `coord acceptance stall --issue N --tried … --stuck …` | worker, on non-convergence | Emit the structured stall report + push a WIP snapshot → raises `needs-attention` (#846). |
 
 **Sealing — climb the ladder:**
@@ -141,7 +142,60 @@ tests/acceptance/ms-NN/
   mocks/               # the viewable mocks == the assertion fixtures (*.screen / *.html / …)
   <suite files>        # red at Gate A, extended JIT per issue; SEALED to the worker
   manifest.(yml|json)  # test-id → issue-slice mapping (drives --issue N)
+                        # + optional expected_red: {issue: [test-id, ...]} — see below
 ```
+
+## A sealed slice is red by design — the `expected_red` registry (#2164)
+
+A sealed acceptance slice is **red by design** the moment it's authored — its fix doesn't exist yet.
+Once its repo's CI runs the acceptance target as part of the *ordinary* test command (exactly what
+#1950 requires, so a closed milestone's suite doesn't rot unnoticed), that redness fails CI, and
+`coord merge` refuses to merge on a failed check. But the slice **must** land on the default branch
+before the fix can dispatch — `issue_oracle_ready` (#1138) reads the manifest from there. Three
+constraints, and only two are simultaneously satisfiable:
+
+1. **Ordering** — the slice merges to the default branch *before* Work dispatches for its issue.
+2. **Redness** — the slice fails before the fix exists, or it's a vacuous assertion (#1965's thesis).
+3. **Cadence** — the suite runs in the ordinary test command every time, or it silently rots (#1950).
+
+The fix relaxes **(3), narrowly**: keep running the suite on every push, but teach the runner which
+failures are *expected right now*. Each manifest may carry an `expected_red:` block alongside its
+`tests:` mapping:
+
+```yaml
+tests:
+  ms11_554_wide_tab_labels::wide_label_paints_every_glyph_in_its_own_columns: 554
+
+expected_red:
+  554:
+    - ms11_554_wide_tab_labels::wide_label_paints_every_glyph_in_its_own_columns
+    - ms11_554_wide_tab_labels::measured_tab_budget_matches_the_painted_width
+    # ascii_label_is_unchanged is deliberately absent — it is the control and must be green now
+```
+
+- **`coord acceptance run --all --ci`** is the CI-facing wrapper — point your repo's ordinary
+  acceptance-test CI step at it instead of the raw driver command (`cargo test --test acceptance`,
+  `npm run test:acceptance`, …). A test-id listed in `expected_red` that **fails** does not fail the
+  run (`ci_green` stays true) — that's the designed-in redness. A test-id listed in `expected_red`
+  that **passes** is the opposite signal: a hard, loud failure (`ci_green` goes false, with a
+  distinct "HARD FAILURE" message naming the id) — the vacuous-assertion case #1965 cares about,
+  caught mechanically instead of needing a human to eyeball it.
+- **`coord acceptance record`** — the external trust gate that already re-runs a fix's sealed slice
+  against its pushed SHA — clears an `expected_red` entry the moment it observes that id passing
+  externally. This is an **observation**, made by the coordinator, never a worker edit: no worker
+  ever touches `tests/acceptance/**`, sealing is unchanged. The clear lands as its own small commit
+  pushed straight to the default branch (never the fix's own branch, which carries the sealed
+  manifest untouched).
+- **Worker-scoped runs are unaffected.** `coord acceptance run --issue N` (the worker's own in-session
+  loop) never applies `expected_red` — that command's whole point is converging *those exact tests*
+  to green; suppressing their redness there would defeat the loop. `--ci` is refused without `--all`
+  for the same reason.
+
+Alternatives rejected: `#[ignore]`-style skip annotations require editing the sealed suite after the
+fix lands (a sealing violation traded for the deadlock); a separate non-blocking CI job trains
+everyone to ignore it (the Phase 0 disease) unless paired with exactly this registry anyway; dropping
+the acceptance target from CI reopens #1950; landing the slice and the fix in one PR destroys the
+independence the whole oracle loop depends on.
 
 ## The worker briefing contract
 

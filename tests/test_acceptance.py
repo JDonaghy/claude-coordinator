@@ -13,11 +13,15 @@ from coord.acceptance import (
     ManifestData,
     ManifestError,
     acceptance_capability_gap,
+    apply_expected_red,
     build_verdict,
     bug_contract_path,
+    clear_expected_red_entries,
     dump_manifest_error_hint,
+    expected_red_failure_summary,
     failure_summary,
     issue_dirname,
+    load_expected_red,
     load_manifest,
     ms_dir_for_issue,
     oracle_loop_contract_block,
@@ -203,6 +207,218 @@ class TestParseManifestText:
     def test_non_mapping_raises(self) -> None:
         with pytest.raises(ManifestError, match="must be a mapping"):
             parse_manifest_text("- a\n- b\n")
+
+
+class TestExpectedRedParsing:
+    """#2164: the ``expected_red:`` registry parsed off ManifestData."""
+
+    def test_no_key_is_empty_dict(self) -> None:
+        data = parse_manifest_text("tests:\n  a: 944\n")
+        assert data.expected_red == {}
+
+    def test_parses_issue_scoped_lists(self) -> None:
+        data = parse_manifest_text(
+            "tests:\n  a: 554\nexpected_red:\n  554:\n    - a\n    - b\n"
+        )
+        assert data.expected_red == {554: frozenset({"a", "b"})}
+
+    def test_non_dict_value_ignored(self) -> None:
+        data = parse_manifest_text("expected_red:\n  554: not-a-list\n")
+        assert data.expected_red == {}
+
+    def test_non_dict_expected_red_ignored(self) -> None:
+        data = parse_manifest_text("expected_red: [1, 2]\n")
+        assert data.expected_red == {}
+
+    def test_non_integer_issue_key_ignored(self) -> None:
+        data = parse_manifest_text("expected_red:\n  not-a-number:\n    - a\n")
+        assert data.expected_red == {}
+
+
+class TestLoadExpectedRed:
+    def test_missing_dir_returns_empty(self, tmp_path: Path) -> None:
+        assert load_expected_red(tmp_path / "tests" / "acceptance") == {}
+
+    def test_flattens_issue_to_test_ids(self, tmp_path: Path) -> None:
+        root = tmp_path / "tests" / "acceptance"
+        ms = root / "ms11"
+        ms.mkdir(parents=True)
+        (ms / "manifest.yml").write_text(
+            "tests:\n  a: 554\n  b: 554\nexpected_red:\n  554:\n    - a\n    - b\n"
+        )
+        assert load_expected_red(root) == {"a": 554, "b": 554}
+
+    def test_merges_across_slices(self, tmp_path: Path) -> None:
+        root = tmp_path / "tests" / "acceptance"
+        (root / "ms11").mkdir(parents=True)
+        (root / "ms12").mkdir(parents=True)
+        (root / "ms11" / "manifest.yml").write_text(
+            "expected_red:\n  554:\n    - a\n"
+        )
+        (root / "ms12" / "manifest.yml").write_text(
+            "expected_red:\n  600:\n    - c\n"
+        )
+        assert load_expected_red(root) == {"a": 554, "c": 600}
+
+    def test_no_expected_red_block_is_empty(self, tmp_path: Path) -> None:
+        root = tmp_path / "tests" / "acceptance"
+        (root / "ms11").mkdir(parents=True)
+        (root / "ms11" / "manifest.yml").write_text("tests:\n  a: 554\n")
+        assert load_expected_red(root) == {}
+
+
+class TestApplyExpectedRed:
+    def test_no_expected_red_ids_is_a_no_op(self) -> None:
+        verdict = build_verdict([{"id": "a", "status": "fail"}], scope="all")
+        result = apply_expected_red(verdict, set())
+        assert result["ci_green"] == result["green"] is False
+        assert result["unexpected_green"] == []
+        assert result["expected_red_still_red"] == []
+
+    def test_expected_red_failure_does_not_block_ci_green(self) -> None:
+        """The whole point (#2164 acceptance criterion 1): a sealed slice
+        authored red merges without turning the default branch red."""
+        verdict = build_verdict(
+            [
+                {"id": "wide_label_paints_every_glyph", "status": "fail"},
+                {"id": "ascii_label_is_unchanged", "status": "pass"},
+            ],
+            scope="all",
+        )
+        assert verdict["green"] is False
+        result = apply_expected_red(verdict, {"wide_label_paints_every_glyph"})
+        assert result["ci_green"] is True
+        assert result["expected_red_still_red"] == ["wide_label_paints_every_glyph"]
+        assert result["unexpected_green"] == []
+
+    def test_expected_red_that_passes_is_a_hard_failure(self) -> None:
+        """Acceptance criterion 2: an expected-red test that PASSES fails
+        the run, loudly and distinguishably from an ordinary failure."""
+        verdict = build_verdict(
+            [{"id": "wide_label_paints_every_glyph", "status": "pass"}], scope="all",
+        )
+        assert verdict["green"] is True  # raw verdict looks fine...
+        result = apply_expected_red(verdict, {"wide_label_paints_every_glyph"})
+        assert result["ci_green"] is False  # ...but the CI-facing one isn't.
+        assert result["unexpected_green"] == ["wide_label_paints_every_glyph"]
+
+    def test_real_failure_alongside_expected_red_still_blocks(self) -> None:
+        verdict = build_verdict(
+            [
+                {"id": "expected_red_id", "status": "fail"},
+                {"id": "unrelated_regression", "status": "fail"},
+            ],
+            scope="all",
+        )
+        result = apply_expected_red(verdict, {"expected_red_id"})
+        assert result["ci_green"] is False
+
+    def test_empty_test_list_is_not_ci_green_even_with_expected_red(self) -> None:
+        verdict = build_verdict([], scope="all")
+        result = apply_expected_red(verdict, {"a"})
+        assert result["ci_green"] is False
+
+
+class TestExpectedRedFailureSummary:
+    def test_empty_when_no_unexpected_green(self) -> None:
+        verdict = apply_expected_red(
+            build_verdict([{"id": "a", "status": "fail"}], scope="all"), {"a"},
+        )
+        assert expected_red_failure_summary(verdict) == ""
+
+    def test_names_the_hard_failure_distinctly(self) -> None:
+        verdict = apply_expected_red(
+            build_verdict([{"id": "a", "status": "pass"}], scope="all"), {"a"},
+        )
+        summary = expected_red_failure_summary(verdict)
+        assert "HARD FAILURE" in summary
+        assert "a" in summary
+        assert "NOT an ordinary test failure" in summary
+
+
+class TestClearExpectedRedEntries:
+    ISSUE_EXAMPLE_TEXT = (
+        "tests:\n"
+        "  ms11_554_wide_tab_labels::wide_label_paints_every_glyph_in_its_own_columns: 554\n"
+        "\n"
+        "expected_red:\n"
+        "  554:\n"
+        "    - ms11_554_wide_tab_labels::wide_label_paints_every_glyph_in_its_own_columns\n"
+        "    - ms11_554_wide_tab_labels::measured_tab_budget_matches_the_painted_width\n"
+        "    # ascii_label_is_unchanged is deliberately absent — it is the control and must be green now\n"
+    )
+
+    def test_no_op_when_id_not_present(self) -> None:
+        assert clear_expected_red_entries("tests:\n  a: 1\n", 1, {"nope"}) is None
+
+    def test_no_op_when_cleared_ids_empty(self) -> None:
+        assert clear_expected_red_entries(self.ISSUE_EXAMPLE_TEXT, 554, set()) is None
+
+    def test_partial_clear_keeps_the_other_id_and_the_comment(self) -> None:
+        result = clear_expected_red_entries(
+            self.ISSUE_EXAMPLE_TEXT,
+            554,
+            {"ms11_554_wide_tab_labels::wide_label_paints_every_glyph_in_its_own_columns"},
+        )
+        assert result is not None
+        # The cleared id's *list item* line is gone from expected_red — it
+        # legitimately still appears once, in the untouched `tests:` block.
+        assert result.count("wide_label_paints_every_glyph_in_its_own_columns") == 1
+        assert "    - ms11_554_wide_tab_labels::measured_tab_budget_matches_the_painted_width" in result
+        assert "deliberately absent" in result  # comment preserved
+        assert "  554:" in result  # issue header preserved (one id remains)
+        # Everything outside the expected_red block is untouched byte-for-byte.
+        assert result.startswith(
+            "tests:\n"
+            "  ms11_554_wide_tab_labels::wide_label_paints_every_glyph_in_its_own_columns: 554\n"
+        )
+
+    def test_full_clear_drops_the_issue_block(self) -> None:
+        result = clear_expected_red_entries(
+            self.ISSUE_EXAMPLE_TEXT,
+            554,
+            {
+                "ms11_554_wide_tab_labels::wide_label_paints_every_glyph_in_its_own_columns",
+                "ms11_554_wide_tab_labels::measured_tab_budget_matches_the_painted_width",
+            },
+        )
+        assert result is not None
+        assert "expected_red" not in result
+        assert "554:" not in result
+        # The id legitimately still appears once, in the untouched `tests:`
+        # block — only its expected_red list-item line is gone.
+        assert result.count("wide_label_paints_every_glyph_in_its_own_columns") == 1
+        # Unrelated content (the `tests:` block) is untouched.
+        assert "tests:\n  ms11_554_wide_tab_labels" in result
+
+    def test_result_is_parseable_and_reflects_the_clear(self) -> None:
+        """Round-trip through parse_manifest_text — the whole point is that
+        the coordinator can commit this text back as a valid manifest."""
+        result = clear_expected_red_entries(
+            self.ISSUE_EXAMPLE_TEXT,
+            554,
+            {"ms11_554_wide_tab_labels::wide_label_paints_every_glyph_in_its_own_columns"},
+        )
+        assert result is not None
+        data = parse_manifest_text(result)
+        assert data.expected_red == {
+            554: frozenset({"ms11_554_wide_tab_labels::measured_tab_budget_matches_the_painted_width"})
+        }
+        assert data.tests == {
+            "ms11_554_wide_tab_labels::wide_label_paints_every_glyph_in_its_own_columns": 554
+        }
+
+    def test_leaves_other_issues_alone(self) -> None:
+        text = "expected_red:\n  1:\n    - a\n  2:\n    - b\n"
+        result = clear_expected_red_entries(text, 1, {"a"})
+        assert result is not None
+        assert "2:" in result
+        assert "- b" in result
+        data = parse_manifest_text(result)
+        assert data.expected_red == {2: frozenset({"b"})}
+
+    def test_untouched_when_manifest_has_no_expected_red_block(self) -> None:
+        assert clear_expected_red_entries("tests:\n  a: 1\n", 1, {"a"}) is None
 
 
 class TestOracleLoopContractBlock:
