@@ -34,6 +34,19 @@ Three arms have since landed against it:
 * **#1738** — `coord drive` re-dispatches the Test stage once, automatically,
   on a STALE (not missing) verdict. Only fires while a **live drive** is
   watching the issue. Measured 2026-08-03: reached 1 of 4 real stalls.
+  **#2229** widened what it can see: the arm used to classify the gate from
+  the board's `merge_reason` alone, which `merge_queue.plan()` leaves *empty*
+  whenever its render-time freshness check has no live SHA data (the #1640
+  door / the #1566 "plan says READY, `--only` refuses" split) — so on an
+  already-enqueued entry the arm could not arm at all, and the drive spent
+  three blind retries and died *printing the refusal it had captured*
+  (quadraui#309: 11h blocked on a merge that then landed first try by hand).
+  It now falls back to the last `coord merge --only` diagnostic the drive
+  itself captured. Still only the STALE arm self-repairs — a *missing*
+  verdict is the #1640 lost-write shape and escalates to a human unchanged —
+  and, because that diagnostic is a snapshot rather than live state (#2149),
+  each capture buys at most one re-test before a real attempt has to
+  re-validate it.
 * **#1769** — `coord merge --revalidate` re-tests a stale-but-`passed` entry
   against the current base from the *merge* lane, which is where a branch with
   no live drive actually sits.
