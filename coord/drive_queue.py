@@ -1182,6 +1182,63 @@ def _resolve_prereqs(
     return _Verdict(True)
 
 
+@dataclass(frozen=True)
+class BlockedAfterDiagnosis:
+    """How #2183's rendering should treat a terminal row's `after=` graph.
+
+    ``unsatisfied`` is *entry*'s declared ``after=`` list with every
+    now-landed pre-req dropped. ``dependency_reason`` is the CURRENT
+    ``_resolve_prereqs`` verdict against that same graph — ``''`` when the
+    graph is not (or no longer) why the entry is stuck.
+    """
+
+    unsatisfied: tuple[str, ...] = ()
+    dependency_reason: str = ""
+
+
+def diagnose_blocked_after(
+    entry: QueueEntry,
+    board: BoardView,
+    states: Mapping[str, str],
+    cycle_keys: Mapping[str, str],
+) -> BlockedAfterDiagnosis:
+    """Re-check a `blocked`/`failed` row's `after=` graph against the CURRENT
+    board, fresh on every render (#2183).
+
+    ``entry.after`` is what ``add`` declared, frozen at enqueue time — and a
+    `blocked`/`failed` entry's own state never re-evaluates it again
+    (:data:`TERMINAL_QUEUE_STATES` is exactly "the tick will not look at this
+    row again"). By the time an operator reads the row, a pre-req that has
+    since merged is stale information still rendered as if current — the
+    quadraui#542 incident this closes: the row's `after=` named a pre-req
+    that had merged an hour earlier, reading as "blocked on a dependency
+    that is already satisfied" when the real cause was an unrelated red
+    slice PR.
+
+    Two things are recomputed, never read off the entry's own frozen
+    ``last_reason``:
+
+    * which of ``entry.after`` are still NOT landed — the merged ones drop
+      out entirely; a satisfied ``after=`` entry displayed on a terminal row
+      is not a dependency, it is a caption for a fact that no longer holds;
+    * whether the CURRENT pre-req graph is even a plausible cause —
+      delegated to :func:`_resolve_prereqs`, the exact function a live tick
+      uses to decide this, so a render can never disagree with what the tick
+      itself would conclude. An empty ``dependency_reason`` means the
+      answer is no: every named pre-req is now satisfied (or the entry
+      declared none), so whatever originally blocked this row — a red build,
+      an exhausted retry budget, a refused pre-dispatch guard — was NOT its
+      ``after=`` list, and the row's own ``last_reason`` is the real story.
+    """
+    unsatisfied = tuple(dep for dep in entry.after if not board.facts(dep).landed)
+    if not entry.after:
+        return BlockedAfterDiagnosis(unsatisfied)
+    verdict = _resolve_prereqs(entry, board, states, cycle_keys, held_gates={})
+    return BlockedAfterDiagnosis(
+        unsatisfied, "" if verdict.satisfied else verdict.reason
+    )
+
+
 # ── reconciliation ───────────────────────────────────────────────────────────
 
 
