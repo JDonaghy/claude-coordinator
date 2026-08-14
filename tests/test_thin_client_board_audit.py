@@ -169,6 +169,13 @@ COMMANDS_ALLOWLIST: dict[str, set[tuple[str, str]]] = {
         # runs on the daemon host / a standalone dev environment, exactly like
         # `merge`'s own `load_board` above.
         ("_apply_revalidation", "load_board"),
+        # #2143-routed: `_reload_board_after_wait` is likewise only called from
+        # the `merge` command body (both the whole-queue and `--only` paths),
+        # i.e. after the same `daemon_reroute_target("COORD_MERGE_ON_DAEMON")`
+        # early-return — so this post-wait re-read (the board snapshot can go
+        # stale across a minutes-long CI-settle poll) only ever runs on the
+        # daemon host / a standalone dev environment.
+        ("_reload_board_after_wait", "load_board"),
     },
     # #1337: `coord test` no longer calls save_board at all — the verdict is
     # recorded via the single-row `record_test_verdict` on both paths (it
