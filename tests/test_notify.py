@@ -206,6 +206,66 @@ class TestRun:
         assert row is not None, "assignment row must exist"
         assert row["failure_reason"] == "remote: Invalid username or token."
 
+    def test_analysis_deliverable_completion_posts_final_message(
+        self, coord_dir: Path, config: Config
+    ) -> None:
+        """#2188: a `deliverable:analysis` issue's 0-commit completion has no
+        diff to point at — the deliverable IS the worker's own final message
+        (`AgentAssignment.result_text`). It must be posted automatically as
+        the completion comment's summary, since the worker itself has no
+        `gh` access to post it."""
+        _record("an1")
+        agent_status = {
+            "active": [],
+            "completed": [
+                _agent_completed(
+                    "an1",
+                    "done",
+                    analysis_deliverable=True,
+                    result_text=(
+                        "Diagnosis: 74% of blocking review findings were "
+                        "real defects; zero were false positives or style "
+                        "nits."
+                    ),
+                )
+            ],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment") as mock_post:
+            posted, _stuck, _attn, _stalled, _liveness = notify_mod.run(config)
+        assert len(posted) == 1
+        mock_post.assert_called_once()
+        body = mock_post.call_args.args[2]
+        assert "Coordinator: Assignment Complete" in body
+        assert "### Summary" in body
+        assert "74% of blocking review findings were real defects" in body
+
+    def test_ordinary_completion_has_no_summary_section(
+        self, coord_dir: Path, config: Config
+    ) -> None:
+        """#2188 acceptance: an ordinary (non-analysis) completion must be
+        unaffected — `result_text` is only ever folded into the posted
+        comment when `analysis_deliverable` is set on the same entry."""
+        _record("ord1")
+        agent_status = {
+            "active": [],
+            "completed": [
+                _agent_completed(
+                    "ord1",
+                    "done",
+                    analysis_deliverable=False,
+                    result_text="some unrelated final message",
+                )
+            ],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment") as mock_post:
+            notify_mod.run(config)
+        body = mock_post.call_args.args[2]
+        assert "Coordinator: Assignment Complete" in body
+        assert "### Summary" not in body
+        assert "some unrelated final message" not in body
+
 
 # ── #448: advisory (0-commit clean exit) notify ─────────────────────────────
 

@@ -354,6 +354,22 @@ def test_mode_from_labels(labels) -> str | None:
     return None
 
 
+# #2188: the per-issue DELIVERABLE policy label — mirrors `TEST_MODE_*_LABEL`'s
+# shape (cheapest fit, no body parsing). An issue whose deliverable is a
+# written artifact (a diagnosis, an audit, a spike/investigation writeup)
+# rather than a diff cannot succeed in the default pipeline: a worker that
+# does exactly what was asked ends with 0 commits by design, which the reap
+# otherwise reads as the #448 "worker did nothing" ADVISORY and `coord drive`
+# gives up on — discarding the whole deliverable (#2188's own worked example,
+# #2132, lost $1.65 of correct, on-topic analysis this way). Labelling the
+# issue `deliverable:analysis` inverts that reading: a clean exit with 0
+# commits is `coord.agent.AgentServer._reap`'s SUCCESS condition for this
+# issue, not its anomaly — see `_ZERO_COMMIT_TYPES`/`AgentAssignment.
+# analysis_deliverable` in coord/agent.py and the `decide()` short-circuit in
+# coord/drive.py that skips Test/Review/Merge for it.
+DELIVERABLE_ANALYSIS_LABEL = "deliverable:analysis"
+
+
 @dataclass
 class Assignment:
     machine_name: str

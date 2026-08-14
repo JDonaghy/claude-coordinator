@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 from coord import cargo_cache
+from coord.models import DELIVERABLE_ANALYSIS_LABEL
 from coord.platform_paths import default_coord_dir
 
 if TYPE_CHECKING:
@@ -604,6 +605,19 @@ class AssignmentSpec:
     # `AssignmentSpec(**body)` in agent_app.py 400s on those) unless the
     # operator has actually configured one.
     cost_ceiling_usd: float | None = None
+    # #2188: the issue's GitHub label names, mirroring `Proposal.issue_labels`
+    # (#1430) — carried on the wire so a reap running on a config-free agent
+    # (docs/EPHEMERAL_WORKERS.md; no local DB or GitHub token to ask) can
+    # still see `coord.models.DELIVERABLE_ANALYSIS_LABEL` without an extra
+    # round-trip. Only `coord/dispatch.py`'s `dispatch()` populates this (from
+    # `proposal.issue_labels`, itself only set for `type="work"` dispatches —
+    # see #1430's `model_for_labels`/`provider_for_labels` gating), and only
+    # when non-empty — an agent predating this field 400s on an unrecognized
+    # kwarg (`AssignmentSpec(**body)` in agent_app.py), same discipline as
+    # every other optional wire field above. Empty by default: a spec with no
+    # labels (or dispatched by a caller that never populated
+    # `Proposal.issue_labels`) behaves exactly as before this field existed.
+    issue_labels: list[str] = field(default_factory=list)
 
 
 class _GitError(RuntimeError):
@@ -2700,6 +2714,11 @@ class AgentAssignment:
     # #448: advisory reason when the worker exited cleanly (exit_code==0) but
     # pushed 0 commits.  None on all other status values.
     #
+    # #2188: also None (never set) for an issue labelled `deliverable:
+    # analysis` — that shape lands on `status == DONE`/`analysis_deliverable
+    # = True` below instead, since 0 commits is its SUCCESS condition, not
+    # something advisory.
+    #
     # #1323 used to *also* reuse this field (for "work"-type assignments,
     # see _ADVISORY_TYPES) to hold a reason when a configured artifact_paths
     # glob matched 0 files, downgrading DONE -> ADVISORY in the process.
@@ -2787,6 +2806,26 @@ class AgentAssignment:
     # ceiling kill is indistinguishable from a crash and the money is spent
     # again on the next pass.
     spend_ceiling_reason: str | None = None
+    # #2188: True when `_reap` classified a clean (exit_code==0), 0-commit
+    # exit as a DELIVERABLE — the issue was labelled
+    # `coord.models.DELIVERABLE_ANALYSIS_LABEL` (`spec.issue_labels`) — rather
+    # than the #448 "worker did nothing" ADVISORY. Only ever set alongside
+    # `status == DONE`; `False` on every other outcome, including a normal
+    # zero-commit ADVISORY (the label wasn't present) and a labelled issue
+    # whose worker actually pushed commits (that's an ordinary DONE, handled
+    # by the ordinary Test/Review/Merge pipeline — this flag is specifically
+    # "the deliverable IS the message, there is no diff").
+    analysis_deliverable: bool = False
+    # #2188: the worker's own final message — `result` off the last
+    # stream-json `result` event (`coord.worker_events.WorkerSummary.
+    # result_text`), captured here so the coordinator can post the actual
+    # deliverable (a diagnosis/audit's prose) to the issue instead of a bare
+    # "assignment complete" comment. The worker itself has no `gh` access to
+    # post this — see coord.notify.post_transition's EVENT_COMPLETION arm.
+    # Populated only when `analysis_deliverable` is True; `None` otherwise
+    # (a normal work assignment's deliverable is the diff itself, already
+    # visible on the PR — restating the transcript there would be noise).
+    result_text: str | None = None
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -7209,6 +7248,16 @@ class AgentServer:
         # ("work",) to the full work-like set so `test-author`/`mock-author`
         # get the same downgrade; before that they could land on `done` with
         # an empty branch.
+        # #2188: an issue labelled `deliverable:analysis` inverts the #448
+        # reading — for it, a clean exit with 0 commits is the SUCCESS
+        # condition (the deliverable is the worker's own final message, not
+        # a diff), not the "worker did nothing" anomaly. Detected off
+        # `assignment.spec.issue_labels` (wire field, #2188) so this works on
+        # a config-free agent too — no DB or GitHub read required. Resolved
+        # in the SAME `_ahead == 0` branch as the advisory check below so
+        # the two can never disagree about what "0 commits" means for this
+        # assignment.
+        _analysis_deliverable = False
         _zero_commit_reason: str | None = None
         if (exit_code == 0 and assignment is not None
                 and assignment.worktree_path
@@ -7218,17 +7267,30 @@ class AgentServer:
                 _base = assignment.spec.branch or "main"
                 _ahead = self._commits_ahead(_wt_advisory, _base)
                 if _ahead == 0:
-                    _zero_commit_reason = (
-                        "worker exited cleanly but pushed 0 commits"
-                    )
-                    try:
-                        with open(assignment.log_path, "a") as reopen:
-                            reopen.write(
-                                "# reap: advisory — 0 commits ahead of "
-                                f"{_base}; status set to advisory\n"
-                            )
-                    except OSError:
-                        pass
+                    if DELIVERABLE_ANALYSIS_LABEL in (assignment.spec.issue_labels or []):
+                        _analysis_deliverable = True
+                        try:
+                            with open(assignment.log_path, "a") as reopen:
+                                reopen.write(
+                                    "# reap: analysis deliverable — 0 commits "
+                                    f"ahead of {_base}; issue labelled "
+                                    f"{DELIVERABLE_ANALYSIS_LABEL!r}, status "
+                                    "set to done (#2188)\n"
+                                )
+                        except OSError:
+                            pass
+                    else:
+                        _zero_commit_reason = (
+                            "worker exited cleanly but pushed 0 commits"
+                        )
+                        try:
+                            with open(assignment.log_path, "a") as reopen:
+                                reopen.write(
+                                    "# reap: advisory — 0 commits ahead of "
+                                    f"{_base}; status set to advisory\n"
+                                )
+                        except OSError:
+                            pass
 
         # This block MUST always run regardless of push outcome so that
         # the assignment transitions out of 'running'.
@@ -7296,6 +7358,22 @@ class AgentServer:
                         assignment.zero_commit_reason = _zero_commit_reason
                     else:
                         assignment.status = DONE
+                        if _analysis_deliverable:
+                            # #2188: 0 commits on a `deliverable:analysis`
+                            # issue is the success shape — capture the
+                            # worker's own final message (already parsed
+                            # into `_worker_summary` above) so the
+                            # coordinator can post the actual deliverable to
+                            # the issue instead of a bare "complete" comment.
+                            # Best-effort: a non-stream-json log (or one with
+                            # no terminal `result` event) just leaves
+                            # `result_text` `None` — the assignment is still
+                            # correctly `done`, only the auto-posted prose is
+                            # missing, same degradation as every other
+                            # best-effort log parse in this function.
+                            assignment.analysis_deliverable = True
+                            if _worker_summary is not None and _worker_summary.result_text:
+                                assignment.result_text = _worker_summary.result_text
                 else:
                     assignment.status = FAILED
                 # #1461: only ever attaches to a FAILED/ADVISORY transition —

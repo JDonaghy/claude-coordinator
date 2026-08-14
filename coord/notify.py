@@ -2470,7 +2470,24 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
                 failure_reason=_failure_reason,
             )
     elif transition.event == EVENT_COMPLETION:
-        post_completion(exit_code=transition.exit_code or 0, **common)
+        # #2188: a `deliverable:analysis` issue that legitimately ended with
+        # 0 commits has no diff to point at — the deliverable IS the
+        # worker's own final message (`AgentAssignment.result_text`, see
+        # `coord.agent.AgentServer._reap`). Post it as the completion
+        # comment's summary so it reaches the issue automatically; the
+        # worker itself has no `gh` access to post it. Every other
+        # completion (the overwhelming majority) is unaffected — `entry.get
+        # ("analysis_deliverable")` is only ever truthy for this one shape.
+        _analysis_summary = (
+            entry.get("result_text") or ""
+            if entry.get("analysis_deliverable")
+            else ""
+        )
+        post_completion(
+            exit_code=transition.exit_code or 0,
+            summary=_analysis_summary,
+            **common,
+        )
         mark_notified(
             transition.assignment_id,
             transition.event,

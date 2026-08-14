@@ -109,6 +109,7 @@ from coord.interactive import (
 )
 from coord.dead_end import DeadEnd, detect_dead_end
 from coord.failure_class import classify_failure, plan_usage_limit_resume
+from coord.models import DELIVERABLE_ANALYSIS_LABEL
 from coord.usage_limits import PlanLimits, evaluate_usage_gate, get_plan_limits
 # Lost in the #1584-onto-#1590 rebase: _decide_review() calls this, but the
 # import lived in a hunk #1590 rewrote, so the merge came out textually clean
@@ -1395,6 +1396,32 @@ def decide(
             f"{state.work_aid} —\n"
             f"   refusing to guess. Inspect: coord log {state.work_aid} --machine "
             f"{state.work_machine or machine}"
+        )
+
+    # ---- analysis deliverable: done + 0 commits is the SUCCESS shape (#2188)
+    #
+    # An issue labelled `deliverable:analysis` inverts the read on a 0-commit
+    # exit: the deliverable is the worker's own final message (already
+    # posted to the issue by the coordinator — see coord.notify.
+    # post_transition's EVENT_COMPLETION arm), not a diff. `coord.agent.
+    # AgentServer._reap` only ever produces this shape on `status == "done"`
+    # (never "advisory" — see `AgentAssignment.analysis_deliverable`), so
+    # this only needs to guard the `done` arm above, and it runs BEFORE the
+    # "no branch"/dead-end/Test/Review/Merge machinery below: none of that
+    # applies when there is nothing to test, review, or merge. A labelled
+    # issue whose worker DID push commits (the label describes the common
+    # case, not a hard rule) falls through unchanged — `branch_has_commits`
+    # is False only for the genuine 0-commit shape.
+    if (
+        state.work_status == "done"
+        and DELIVERABLE_ANALYSIS_LABEL in state.issue_labels
+        and (not state.work_branch or not verifier.branch_has_commits(state))
+    ):
+        return _succeed(
+            f"✓ ANALYSIS DELIVERABLE — {state.work_aid} completed with 0 "
+            f"commits (issue labelled `{DELIVERABLE_ANALYSIS_LABEL}`); the "
+            "worker's final message is the deliverable and was posted to "
+            "the issue automatically — nothing to test, review, or merge."
         )
 
     # A 'done' row with no branch never pushed anything either.

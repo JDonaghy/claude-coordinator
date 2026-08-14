@@ -1406,6 +1406,77 @@ def test_advisory_with_no_branch_at_all_is_terminal():
     assert "no commits on its branch" in action.message
 
 
+# ── analysis deliverable: done + 0 commits is a SUCCESS, not a dead end (#2188)
+
+
+def test_analysis_deliverable_done_with_no_commits_succeeds():
+    """#2188: `coord.agent.AgentServer._reap` never lands a `deliverable:
+    analysis` issue's 0-commit exit on `advisory` — it lands DONE. `coord
+    drive` must record that as a success instead of dying on 'no commits
+    on its branch'/'no branch' the way an ordinary work row would."""
+    action = step(
+        state(
+            work_aid="w1",
+            work_status="done",
+            work_branch="issue-2132-diagnose",
+            issue_labels=("deliverable:analysis",),
+        ),
+        verifier=FakeVerifier(has_commits=False),
+    )
+    assert action.is_exit
+    assert action.exit_code == EXIT_OK
+    assert "ANALYSIS" in action.message
+    assert "deliverable:analysis" in action.message
+
+
+def test_analysis_deliverable_done_with_no_branch_at_all_succeeds():
+    """Same as above when the reap never captured a branch name at all
+    (e.g. the worktree was already gone) — `not state.work_branch` alone
+    must be enough to take the analysis-deliverable exit, without ever
+    calling `verifier.branch_has_commits` on an empty branch."""
+    verifier = FakeVerifier(has_commits=True)
+    action = step(
+        state(
+            work_aid="w1",
+            work_status="done",
+            work_branch="",
+            issue_labels=("deliverable:analysis",),
+        ),
+        verifier=verifier,
+    )
+    assert action.is_exit
+    assert action.exit_code == EXIT_OK
+    assert verifier.commits_calls == 0
+
+
+def test_analysis_deliverable_done_with_commits_falls_through_unchanged():
+    """The label describes the common case, not a hard rule: a
+    `deliverable:analysis` issue whose worker DID push commits must reach
+    the ordinary Test/Review/Merge pipeline exactly like any other done
+    row, not the analysis short-circuit."""
+    action = step(
+        done_work(work_test_state="", issue_labels=("deliverable:analysis",)),
+        verifier=FakeVerifier(has_commits=True),
+    )
+    assert action.kind == WAIT  # waiting on coord to dispatch the Test stage
+
+
+def test_unlabelled_done_with_no_commits_is_unaffected_by_2188():
+    """#2188 acceptance: an ordinary (unlabelled) issue must be completely
+    unaffected by the analysis-deliverable short-circuit — `coord.agent.
+    AgentServer._reap` never puts an unlabelled 0-commit work row on
+    `done` in the first place (it stays `advisory`, covered by the tests
+    above), but this guards `decide()`'s own logic in case a `done` row
+    with no branch/commits reaches it some other way."""
+    action = step(
+        state(work_aid="w1", work_status="done", work_branch=""),
+        verifier=FakeVerifier(has_commits=False),
+    )
+    assert action.is_exit
+    assert "no branch" in action.message
+    assert "ANALYSIS" not in action.message
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # the TEST gate
 # ═══════════════════════════════════════════════════════════════════════════
