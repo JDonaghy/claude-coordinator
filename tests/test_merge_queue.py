@@ -8252,3 +8252,190 @@ class TestAbandonedRunningMarkerIsStaleNotMissing:
             candidates = mq.revalidation_candidates([entry], board, _Cfg())
 
         assert [c.work_assignment_id for c in candidates] == ["w1"]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# #2231: a conflict hiding behind a stale-verdict smoke block
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestStaleSmokeConflictProbe:
+    """#2231: gate evaluation short-circuits on the smoke gate, so an entry
+    whose branch does not merge AT ALL reports "test verdict stale" — the one
+    remedy that cannot work — and never reaches the merge attempt that would
+    have armed #241's conflict-fix.
+
+    quadraui #306/#309 sat 11h each in exactly that position: `mergeable:
+    false, mergeable_state: dirty`, four sibling branches appending to one
+    file, two of them stranded once the first two merged. `--revalidate`
+    diagnosed it perfectly and nothing acted; a human finally typed `coord fix
+    --force`, which is #241's own job description.
+    """
+
+    @staticmethod
+    def _config():
+        return TestSmokeGate._config()
+
+    @staticmethod
+    def _stale_setup(*, mergeable: bool | None):
+        """One PENDING entry whose passed verdict was staled by a base move,
+        plus a `gh` stub with a definite answer about mergeability."""
+        work = TestSmokeGate._work("w1", test_state="passed")
+        work.test_head_sha = "branch-sha-1"
+        work.test_patch_id = "patch-1"
+        work.test_base_sha = "main-sha-old"
+        board = TestSmokeGate._board(completed=[work])
+
+        entry = _q("w1", size=10, pr=100)
+        entry.branch_head_sha = "branch-sha-1"
+        entry.branch_patch_id = "patch-1"
+        entry.target_branch_head_sha = "main-sha-new"   # base moved under it
+        gh = FakeGh(mergeable_results={100: mergeable})
+        return entry, board, gh
+
+    # ── the predicate ──
+
+    def test_reason_names_the_conflict_when_github_says_not_mergeable(self) -> None:
+        entry, board, gh = self._stale_setup(mergeable=False)
+        smoke = mq.evaluate_smoke_verdict(entry, board)
+        assert smoke.kind == mq.SMOKE_STALE
+
+        reason = mq.stale_smoke_conflict_reason(entry, smoke, gh)
+
+        assert reason is not None
+        # The conflict leads; the stale verdict is named as downstream, not as
+        # the blocker (the acceptance criterion's "not (only) a stale verdict").
+        assert "merge conflict" in reason.lower()
+        assert "test verdict" in reason.lower()
+
+    def test_reason_classifies_as_rebaseable_and_not_as_stale_smoke(self) -> None:
+        """The wording is load-bearing in both directions: `classify_conflict`
+        decides whether #241 dispatches, and `is_stale_smoke_reason` decides
+        whether `coord drive` answers with a re-test. Getting either wrong
+        reproduces the bug with extra steps."""
+        entry, board, gh = self._stale_setup(mergeable=False)
+        reason = mq.stale_smoke_conflict_reason(
+            entry, mq.evaluate_smoke_verdict(entry, board), gh,
+        )
+
+        assert mq.classify_conflict(reason) == "rebaseable"
+        assert mq.is_stale_smoke_reason(reason) is False
+
+    def test_silent_when_the_pr_is_mergeable(self) -> None:
+        """Acceptance: a genuinely stale verdict on a cleanly-composing branch
+        still takes the #1738 path, unchanged."""
+        entry, board, gh = self._stale_setup(mergeable=True)
+        assert mq.stale_smoke_conflict_reason(
+            entry, mq.evaluate_smoke_verdict(entry, board), gh,
+        ) is None
+
+    def test_silent_when_mergeability_is_still_computing(self) -> None:
+        """`None` is "GitHub hasn't decided", not "conflict". Upgrading an
+        inconclusive read would point a rebase worker at a clean branch."""
+        entry, board, gh = self._stale_setup(mergeable=None)
+        assert mq.stale_smoke_conflict_reason(
+            entry, mq.evaluate_smoke_verdict(entry, board), gh,
+        ) is None
+
+    def test_silent_when_the_probe_raises(self) -> None:
+        entry, board, _gh = self._stale_setup(mergeable=False)
+
+        class _Boom:
+            def check_pr_mergeable(self, repo, number):
+                raise RuntimeError("gh exploded")
+
+        assert mq.stale_smoke_conflict_reason(
+            entry, mq.evaluate_smoke_verdict(entry, board), _Boom(),
+        ) is None
+
+    def test_silent_without_a_probe_at_all(self) -> None:
+        """The `/board` read path evaluates gates against a GateSnapshot, which
+        implements no `gh` calls (#1336 Invariant 1). Duck-typed, like the
+        #1877 CI-absent branch."""
+        entry, board, _gh = self._stale_setup(mergeable=False)
+
+        class _NoProbe:
+            pass
+
+        assert mq.stale_smoke_conflict_reason(
+            entry, mq.evaluate_smoke_verdict(entry, board), _NoProbe(),
+        ) is None
+
+    def test_silent_for_a_missing_verdict(self) -> None:
+        """SMOKE_MISSING is the #1640 lost-write shape and stays out of scope,
+        exactly as it is for `revalidation_candidates`."""
+        work = TestSmokeGate._work("w1", test_state=None)
+        board = TestSmokeGate._board(completed=[work])
+        entry = _q("w1", pr=100)
+        smoke = mq.evaluate_smoke_verdict(entry, board)
+
+        assert smoke.kind == mq.SMOKE_MISSING
+        assert mq.stale_smoke_conflict_reason(
+            entry, smoke, FakeGh(mergeable_results={100: False}),
+        ) is None
+
+    def test_silent_before_a_pr_exists(self) -> None:
+        entry, board, gh = self._stale_setup(mergeable=False)
+        entry.pr_number = None
+        assert mq.stale_smoke_conflict_reason(
+            entry, mq.evaluate_smoke_verdict(entry, board), gh,
+        ) is None
+
+    # ── process(): the event that arms #241 ──
+
+    def test_process_emits_a_conflict_event_not_smoke_required(self) -> None:
+        """The headline: the entry that used to park at PENDING/"stale" now
+        parks at CONFLICT with a `conflict` event — which is precisely what
+        `coord.commands.merge._dispatch_conflict_fixes` consumes."""
+        entry, board, gh = self._stale_setup(mergeable=False)
+        events = process([entry], gh, config=self._config(), board=board)
+
+        kinds = [e.kind for e in events]
+        assert "conflict" in kinds
+        assert "smoke_required" not in kinds
+        assert "merged" not in kinds
+        assert gh.merge_calls == []
+        assert entry.state == CONFLICT
+        assert mq.classify_conflict(entry.error) == "rebaseable"
+
+    def test_process_still_blocks_on_smoke_when_the_branch_is_clean(self) -> None:
+        entry, board, gh = self._stale_setup(mergeable=True)
+        events = process([entry], gh, config=self._config(), board=board)
+
+        kinds = [e.kind for e in events]
+        assert "smoke_required" in kinds
+        assert "conflict" not in kinds
+        assert entry.state == PENDING
+        assert mq.is_stale_smoke_reason(entry.error) is True
+
+    def test_process_unchanged_when_gh_reports_nothing(self) -> None:
+        """Every pre-#2231 test uses a `gh` stub whose `check_pr_mergeable`
+        answers `None`; none of them may change behaviour."""
+        entry, board, _gh = self._stale_setup(mergeable=None)
+        events = process([entry], FakeGh(), config=self._config(), board=board)
+
+        assert [e.kind for e in events].count("smoke_required") == 1
+        assert entry.state == PENDING
+
+    # ── _entry_gate_status(): what the plan/board reports ──
+
+    def test_plan_reason_names_the_conflict(self) -> None:
+        """Acceptance: "An entry whose branch does not compose onto its base
+        reports conflict as its blocking reason, not (only) a stale verdict."
+        """
+        entry, board, gh = self._stale_setup(mergeable=False)
+        status, reason = mq.entry_gate_status(
+            entry, board, self._config(), None, gh,
+        )
+
+        assert status == mq.PLAN_BLOCKED
+        assert "merge conflict" in reason.lower()
+        assert mq.is_stale_smoke_reason(reason) is False
+
+    def test_plan_reason_unchanged_for_a_clean_branch(self) -> None:
+        entry, board, gh = self._stale_setup(mergeable=True)
+        status, reason = mq.entry_gate_status(
+            entry, board, self._config(), None, gh,
+        )
+
+        assert status == mq.PLAN_BLOCKED
+        assert mq.is_stale_smoke_reason(reason) is True

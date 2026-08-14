@@ -1965,3 +1965,274 @@ class TestIsBaselineRedFailure:
         fact: once on the branch and once on the merge-base)."""
         assert rv.KIND_BASELINE_RED not in rv.NO_SUITE_RAN_KINDS
         assert rv.KIND_INFRA in rv.NO_SUITE_RAN_KINDS
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 7. #2231: the conflict verdict is HANDED OFF, not just printed
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.fixture
+def git_fleet_conflicting(tmp_path: Path):
+    """The quadraui #306/#309 shape: sibling branches appending to ONE file.
+
+    `main` already carries issue 101's append (it merged first — the sibling
+    that "won"), so:
+
+    * `issue-102-w2` appends a different line at the same spot → genuine
+      content conflict against the current base;
+    * `issue-103-w3` touches its own file → composes cleanly, and is here so
+      the batch fallback has an innocent branch to exonerate.
+
+    Same wiring as :func:`git_fleet` otherwise (bare origin + local checkout).
+    """
+    origin = tmp_path / "origin.git"
+    seed = tmp_path / "seed"
+    checkout = tmp_path / "checkout"
+
+    seed.mkdir()
+    _git(seed, "init", "-q", "-b", "main")
+    _git(seed, "config", "user.email", "t@example.com")
+    _git(seed, "config", "user.name", "t")
+    (seed / "shared.txt").write_text("base\n")
+    _git(seed, "add", ".")
+    _git(seed, "commit", "-q", "-m", "base")
+
+    for issue, aid in ((101, "w1"), (102, "w2")):
+        _git(seed, "checkout", "-q", "-b", f"issue-{issue}-{aid}", "main")
+        (seed / "shared.txt").write_text(f"base\nfrom {issue}\n")
+        _git(seed, "add", ".")
+        _git(seed, "commit", "-q", "-m", f"issue {issue}")
+
+    _git(seed, "checkout", "-q", "-b", "issue-103-w3", "main")
+    (seed / "f103.txt").write_text("issue 103\n")
+    _git(seed, "add", ".")
+    _git(seed, "commit", "-q", "-m", "issue 103")
+
+    # #101 merges first — this is the base move that stales every sibling
+    # verdict AND the content change the survivors now conflict with.
+    _git(seed, "checkout", "-q", "main")
+    _git(seed, "merge", "-q", "--ff-only", "issue-101-w1")
+
+    subprocess.run(
+        ["git", "clone", "-q", "--bare", str(seed), str(origin)],
+        check=True, capture_output=True, text=True,
+    )
+    subprocess.run(
+        ["git", "clone", "-q", str(origin), str(checkout)],
+        check=True, capture_output=True, text=True,
+    )
+    _git(checkout, "config", "user.email", "t@example.com")
+    _git(checkout, "config", "user.name", "t")
+    return checkout
+
+
+def _conflict_candidates(aids_issues):
+    out = []
+    for aid, issue in aids_issues:
+        entry = _entry(aid, issue=issue)
+        entry.target_branch_head_sha = "base-new"
+        out.append(mq.RevalidationCandidate(
+            entry=entry,
+            work_assignment_id=aid,
+            smoke=mq.SmokeVerdictStatus(
+                ok=False, kind=mq.SMOKE_STALE, assignment_id=aid,
+                anchor="base", recorded_sha="base-old", current_sha="base-new",
+            ),
+        ))
+    return out
+
+
+class TestComposeConflictIsAttributed:
+    """`revalidate_group` already composed the branch and watched `git merge`
+    fail. #2231: that verdict is now carried out as structured data (the
+    candidate, not a display label) so a caller can act on it."""
+
+    def test_single_candidate_conflict_is_attributed_to_it(
+        self, git_fleet_conflicting: Path, coord_db,
+    ) -> None:
+        def runner(command, cwd, timeout):  # pragma: no cover — must not run
+            raise AssertionError("the suite must never run for a branch that "
+                                 "does not even compose")
+
+        batch = rv.revalidate_group(
+            _conflict_candidates([("w2", 102)]),
+            _live_config(git_fleet_conflicting),
+            runner=runner,
+        )
+
+        assert batch.composite.kind == rv.KIND_COMPOSE
+        assert [c.work_assignment_id for c, _ in batch.conflicted] == ["w2"]
+        assert batch.per_entry == [], "N=1 never falls back (#1715)"
+
+    def test_batch_fallback_names_only_the_conflicting_branch(
+        self, git_fleet_conflicting: Path, coord_db,
+    ) -> None:
+        """The innocent sibling passes alone and merges; only the branch that
+        genuinely won't compose is handed to the conflict path."""
+        recorded: list = []
+        with patch(
+            "coord.state.record_test_verdict",
+            side_effect=lambda **kw: recorded.append(kw),
+        ):
+            batch = rv.revalidate_group(
+                _conflict_candidates([("w2", 102), ("w3", 103)]),
+                _live_config(git_fleet_conflicting),
+                runner=lambda command, cwd, timeout: _Run(0),
+            )
+
+        assert batch.composite.kind == rv.KIND_COMPOSE
+        assert [c.work_assignment_id for c, _ in batch.conflicted] == ["w2"]
+        assert batch.recorded == ["w3"]
+        assert [r["assignment_id"] for r in recorded] == ["w3"]
+
+    def test_a_red_suite_is_not_a_conflict(
+        self, git_fleet: Path, coord_db,
+    ) -> None:
+        """Only KIND_COMPOSE routes to the rebase worker. A branch that
+        composes and then fails its tests is a verdict problem, and handing it
+        to a conflict-fix would be nonsense."""
+        batch = rv.revalidate_group(
+            _conflict_candidates([("w1", 101)]),
+            _live_config(git_fleet),
+            runner=lambda command, cwd, timeout: _Run(1, stdout="E assert"),
+        )
+
+        assert batch.composite.kind == rv.KIND_SUITE
+        assert batch.conflicted == []
+
+
+class TestComposeConflictErrorWording:
+    """The text is load-bearing, not cosmetic: two string-matching consumers
+    read it and disagreeing with either one reproduces #2231."""
+
+    def test_classifies_as_rebaseable(self) -> None:
+        entry = _entry("w2", issue=102)
+        assert mq.classify_conflict(rv.compose_conflict_error(entry)) == "rebaseable"
+
+    def test_does_not_read_as_a_stale_smoke_reason(self) -> None:
+        entry = _entry("w2", issue=102)
+        error = rv.compose_conflict_error(entry)
+        assert mq.is_stale_smoke_reason(error) is False
+        # `coord drive` classifies off a superset of those markers — if it read
+        # "smoke", #1738 would answer a conflict with a re-test round.
+        from coord.drive import _merge_gate_kind
+        assert _merge_gate_kind(error) is None
+
+    def test_names_the_branch_and_its_base(self) -> None:
+        error = rv.compose_conflict_error(_entry("w2", issue=102))
+        assert "issue-102-w2" in error
+        assert "origin/main" in error
+
+
+class TestRevalidateConflictBlackBox:
+    """#2231 acceptance: "seed two branches that both append to one file, merge
+    the first, and assert the second is reported as conflicted and gets a
+    conflict-fix dispatch — not a re-test"."""
+
+    @staticmethod
+    def _seed(git_fleet_conflicting: Path, tmp_path: Path, *, test_command: str):
+        from coord.state import save_board
+
+        cfg = tmp_path / "coordinator.yml"
+        cfg.write_text(
+            CONFIG_YAML.format(repo_path=str(git_fleet_conflicting)).replace(
+                'test_command: "true"', f'test_command: "{test_command}"',
+            )
+        )
+        entry = _entry("w2", issue=102)
+        entry.branch_head_sha = "branch-sha-102"
+        mq.save_queue([entry])
+        save_board(Board(active=[], completed=[_tested_work("w2", issue=102)]))
+        _stamp_anchors(
+            "w2", head_sha="branch-sha-102", base_sha="base-old",
+            patch_id="patch-102",
+        )
+        return cfg
+
+    def test_conflicted_entry_is_dispatched_not_re_tested(
+        self, git_fleet_conflicting: Path, tmp_path: Path, coord_db,
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        ran = tmp_path / "suite-ran"
+        cfg = self._seed(
+            git_fleet_conflicting, tmp_path, test_command=f"touch {ran}",
+        )
+        fake_fix = MagicMock()
+        fake_fix.machine_name = "laptop"
+
+        with patch(
+            "coord.conflict_fix.dispatch_conflict_fix", return_value=fake_fix,
+        ) as dcf, patch("coord.state.record_test_verdict") as record:
+            result = _invoke(
+                ["merge", "--config", str(cfg), "--revalidate"],
+                git_fleet_conflicting,
+            )
+
+        assert result.exit_code == 0, result.output
+        # 1. The diagnosis is acted on — this is the whole issue.
+        assert dcf.called, "expected a conflict-fix dispatch for a branch that "
+        assert "conflict-fix dispatched to laptop" in result.output
+        # 2. ...and NOT as a re-test: no suite ran, no verdict was rewritten.
+        assert not ran.exists(), "the suite must not run for a conflicted branch"
+        record.assert_not_called()
+        # 3. The entry reports the conflict, not (only) a stale verdict.
+        assert _states() == {"w2": mq.CONFLICT}
+        error = {x.assignment_id: x.error for x in mq.load_queue()}["w2"]
+        assert mq.classify_conflict(error) == "rebaseable"
+        assert mq.is_stale_smoke_reason(error) is False
+        assert "does not compose" in result.output
+        assert "not a stale verdict" in result.output
+
+    def test_only_path_dispatches_too(
+        self, git_fleet_conflicting: Path, tmp_path: Path, coord_db,
+    ) -> None:
+        """`coord drive` merges through `--only`; the surgical lane must reach
+        the same handoff (the #1474 lesson, re-learned)."""
+        from unittest.mock import MagicMock
+
+        cfg = self._seed(git_fleet_conflicting, tmp_path, test_command="true")
+        fake_fix = MagicMock()
+        fake_fix.machine_name = "laptop"
+
+        with patch(
+            "coord.conflict_fix.dispatch_conflict_fix", return_value=fake_fix,
+        ) as dcf:
+            result = _invoke(
+                ["merge", "--config", str(cfg), "--only", "w2", "--revalidate"],
+                git_fleet_conflicting,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert dcf.called
+        assert _states() == {"w2": mq.CONFLICT}
+
+    def test_dry_run_dispatches_nothing(
+        self, git_fleet_conflicting: Path, tmp_path: Path, coord_db,
+    ) -> None:
+        cfg = self._seed(git_fleet_conflicting, tmp_path, test_command="true")
+
+        with patch("coord.conflict_fix.dispatch_conflict_fix") as dcf:
+            result = _invoke(
+                ["merge", "--config", str(cfg), "--revalidate", "--dry-run"],
+                git_fleet_conflicting,
+            )
+
+        assert result.exit_code == 0, result.output
+        dcf.assert_not_called()
+        assert _states() == {"w2": mq.PENDING}
+
+    def test_a_clean_branch_still_takes_the_re_test_path(
+        self, blackbox,
+    ) -> None:
+        """Acceptance: "A genuinely stale verdict on a cleanly-composing branch
+        still takes the #1738 path, unchanged." Here that means: revalidated,
+        merged, and never routed to a conflict-fix."""
+        cfg, checkout = blackbox
+
+        with patch("coord.conflict_fix.dispatch_conflict_fix") as dcf:
+            result = _invoke(["merge", "--config", str(cfg), "--revalidate"], checkout)
+
+        assert result.exit_code == 0, result.output
+        dcf.assert_not_called()
+        assert _states() == {"w1": mq.MERGED, "w2": mq.MERGED}

@@ -907,3 +907,60 @@ these figures. Note also that #2132's classification covers 27 rows, not the
 38 the original count named — the worker could not reproduce the exact window
 boundary, and cross-validated instead against the `review_iteration=2 → 6 legs`
 figure, which matched exactly. Treat it as representative, not a literal audit.
+
+## 18. "test verdict stale" on a branch that no longer merges is the wrong headline — the conflict is (#2231)
+
+Gate evaluation is ordered (review → smoke → CI → …) and every gate
+short-circuits. So an entry whose branch does not merge **at all** never
+reaches the merge attempt: it reports `smoke gate — test verdict stale`, which
+invites the one remedy that cannot possibly work, and neither repair mechanism
+can arm behind it —
+
+- **#1738**'s stale-smoke auto-repair answers a stale verdict, and the verdict
+  was never the problem;
+- **#241**'s `conflict-fix` worker is dispatched by `coord merge` *when the
+  merge attempt fails on a rebaseable conflict* — and no merge was attempted.
+
+quadraui **#306/#309** sat 11h each in exactly that position (`mergeable:
+false, mergeable_state: dirty`; four sibling driver-test backfills all
+appending to `quadraui/tests/tui_example_driver.rs`, two stranded once the
+first two merged). A human eventually ran `coord fix <aid> --force --guidance
+"<rebase, keep both sides, push --force-with-lease>"` — which is #241's own job
+description.
+
+Two things now close that gap, both keyed to a **STALE** verdict specifically
+(a genuinely missing verdict is the #1640 lost-write shape and still escalates
+to a human, unchanged):
+
+1. **The smoke gate asks whether the branch merges before it blocks.** When
+   the gate is about to refuse on a stale verdict, `merge_queue.
+   stale_smoke_conflict_reason` probes `check_pr_mergeable`. A confirmed
+   `mergeable: false` turns the refusal into a `conflict` event —
+   `entry.state = CONFLICT`, and `_dispatch_conflict_fixes` arms the rebase
+   worker exactly as a failed merge attempt would have. `coord merge --plan`
+   and the board's `merge_reason` name the conflict too, so `coord drive`
+   stops reading the entry as re-testable. An inconclusive probe (`None` —
+   GitHub still computing — or a `gh` error, or a caller with no live probe
+   at all, e.g. the `/board` read path's `GateSnapshot`) leaves today's
+   stale-verdict block exactly as it was.
+2. **`--revalidate` acts on the conflict it finds.** It already composes each
+   branch onto the live base in a throwaway worktree, so a `git merge`
+   conflict there is a stronger fact than GitHub's `mergeable` field. That
+   verdict used to be formatted for the operator and then dropped; it is now
+   carried out structurally (`BatchRevalidationResult.conflicted`) and routed
+   through the same `_dispatch_conflict_fixes` call. The suite never runs for
+   a branch that will not compose, and no verdict is rewritten.
+
+What you should see instead of an 11-hour park:
+
+```
+  --revalidate: api #102: the blocker is a CONFLICT, not a stale verdict — the
+      branch does not compose onto its base. Routing to the conflict-fix path
+      (#241) instead of re-testing (#2231).
+  api #102: conflict-fix dispatched to laptop
+```
+
+If the conflict-fix worker itself fails, the #241/#784 retry cap still flips
+the entry to `HUMAN_REQUIRED` on the second attempt — rule #10's escape hatch
+applies from there. Nothing here loosens that: this only removes the case
+where **no** mechanism ran at all.
