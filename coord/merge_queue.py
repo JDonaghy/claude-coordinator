@@ -3244,6 +3244,45 @@ def _entry_gate_status(
     return PLAN_READY, None
 
 
+def entry_gate_status(
+    entry: "QueuedMerge",
+    board,
+    config,
+    ci_store: "CiStore | None" = None,
+    gh_ops: "GhOps | None" = None,
+) -> tuple[str, str | None]:
+    """Public seam onto :func:`_entry_gate_status`, for callers outside this
+    module that need a fresh, SINGLE-entry re-derivation of the gate — not
+    the whole-queue :func:`plan`.
+
+    #2182: ``coord.drive_queue``'s park/resume machinery (#1891/#1892) used
+    to release a `parked` entry only two ways — the cached board's own
+    `merge_plan` reason re-deriving itself (only true off a live daemon
+    `/board`, never on the daemon-host tick itself, which reads the local DB
+    directly and never computes `merge_plan` at all — see
+    ``coord.commands.drive_queue._local_merge_queue_rows``), or
+    :data:`coord.drive_queue.PARK_STALE_SECONDS` ageing the frozen reading
+    out after 45 minutes. Both leave a genuinely-clear gate undetected for
+    up to the ceiling, even though ``coord merge --plan`` can answer correctly on
+    demand at any moment — the same disagreement claude-coordinator#2159
+    surfaced (the queue read `parked` while `--plan` read READY, at the SAME
+    instant, off the SAME board).
+
+    ``coord.commands.drive_queue._fetch_live_ci_gate`` calls this directly,
+    once per currently-`parked` entry, with a LIVE ``ci_store``/``gh_ops`` —
+    the same live backend ``coord merge --plan``'s local branch builds — so
+    the two readings can no longer disagree. Deliberately NOT routed through
+    :func:`plan`: that function evaluates *every* PENDING queue entry with a
+    PR, so handing it a live backend would pay for a `gh` call per entry in
+    the whole merge queue on every 3-minute tick, not just the bounded
+    handful currently parked — reintroducing the unbounded-`gh`-polling
+    shape #1344 removed from the read path. A single-entry call, made only
+    for entries already sitting in `parked`, keeps the cost exactly where
+    the issue says it should be: small and predictable.
+    """
+    return _entry_gate_status(entry, board, config, ci_store, gh_ops)
+
+
 # ── Merge plan (#776) ────────────────────────────────────────────────────────
 
 @dataclass

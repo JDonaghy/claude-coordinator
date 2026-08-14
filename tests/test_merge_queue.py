@@ -5499,6 +5499,32 @@ class TestPlan:
         assert status == mq.PLAN_READY
         assert reason is None
 
+    def test_entry_gate_status_public_wrapper_delegates_identically(
+        self, coord_db
+    ) -> None:
+        """#2182: `entry_gate_status` is the sanctioned cross-module seam onto
+        `_entry_gate_status` — `coord.commands.drive_queue._fetch_live_ci_gate`
+        calls it directly (a single-entry, bounded-cost re-check, unlike the
+        whole-queue `plan()`), so it must answer byte-for-byte what the
+        private function does, for both a READY and a BLOCKED verdict."""
+        board = self._board(completed=[
+            self._work("w1", test_state="passed"),
+            self._review("w1", verdict="approve"),
+        ])
+        entry = _q("w1")
+        cfg = self._config()
+        assert mq.entry_gate_status(entry, board, cfg) == mq._entry_gate_status(
+            entry, board, cfg
+        )
+
+        blocked_board = self._board(completed=[self._work("w1", test_state="passed")])
+        assert mq.entry_gate_status(
+            entry, blocked_board, cfg
+        ) == mq._entry_gate_status(entry, blocked_board, cfg)
+        status, reason = mq.entry_gate_status(entry, blocked_board, cfg)
+        assert status == mq.PLAN_BLOCKED
+        assert reason is not None
+
     def test_entry_gate_status_no_config_returns_ready(self) -> None:
         """Without config/board, gate evaluation is skipped → READY."""
         entry = _q("w1")

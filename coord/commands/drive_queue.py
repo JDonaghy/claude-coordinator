@@ -1006,6 +1006,105 @@ def _fetch_gate_a_pending(entries: list) -> dict[str, bool]:
     return pending
 
 
+def _fetch_live_ci_gate(
+    entries: list, config_path: Path | None
+) -> dict[str, bool]:
+    """``{entry_key: still_blocked}`` for every ``parked`` entry whose OWN
+    park reason is CI-shaped (#1891/#1892) — a FRESH, single-entry
+    re-derivation of the SAME gate ``coord merge --plan`` computes, taken
+    live, right now, this tick (#2182).
+
+    THE GAP THIS CLOSES. On the daemon host — the only machine that ever
+    runs this tick (``docs/AGENT_OPERATIONS.md``) — ``_fetch_board_view``
+    reads the local DB directly and never populates ``merge_plan`` at all
+    (see ``_local_merge_queue_rows``'s docstring): it is *computed*, not
+    stored, and computing it needs a live ``ci_store``/``gh_ops`` this
+    read-only board fetch deliberately does not build. So
+    ``IssueFacts.merge_ci_pending_live`` is unconditionally ``False`` on
+    every parked entry this tick ever sees, and the ONLY thing that used to
+    release such a park was :data:`coord.drive_queue.PARK_STALE_SECONDS` —
+    up to 45 minutes — even at the instant CI actually reports, because
+    nothing on the read path ever re-checked. claude-coordinator#2159 is
+    that gap caught live: at 03:25:46 UTC, ``coord merge --dry-run`` for the
+    entry read READY (no gate objection) while ``coord drive-queue list``,
+    reading the SAME board a moment later, still read ``parked`` — the two
+    surfaces disagreeing about the exact same fact.
+
+    THE FIX. Scoped to the bounded few entries actually sitting in
+    ``parked`` on a CI reason right now (typically 0-1, never the whole
+    merge queue — see :func:`coord.merge_queue.entry_gate_status`'s
+    docstring for why this deliberately does NOT call the whole-queue
+    :func:`coord.merge_queue.plan` instead), so paying for a live
+    ``gh``-backed check per entry, every ~3-minute tick, is the same
+    "small and predictable" cost an operator's own ``coord merge --plan``
+    already pays on demand — not the unbounded per-tick GitHub polling
+    #1344 removed from the read path.
+
+    Fails OPEN per entry and CLOSED overall in the sense that matters: a key
+    simply ABSENT from the returned dict (an unreadable config, a
+    ``ci_store`` that failed to build, an entry ``coord.merge_queue.
+    load_queue()`` no longer carries, or any other exception) leaves that
+    entry to :func:`coord.drive_queue.plan_tick`'s pre-#2182 fallback — the
+    #2158 :data:`~coord.drive_queue.PARK_STALE_SECONDS` ceiling — exactly as
+    if this function had never run. A transient failure here degrades to
+    the OLD (already-shipped, already-bounded) behaviour, never to a wedge
+    and never to a wrongly-forced resume.
+
+    Gated on ``resolve_board_service() is None`` (the daemon-host tick,
+    same guard :func:`_fetch_board_view` uses for its own local-DB top-up):
+    on a thin client the daemon's real ``GET /board`` already carries a live
+    ``merge_plan`` section, so ``build_board_view`` already resolves
+    ``merge_ci_pending_live=True`` there on its own and this function would
+    have nothing to add — worse, ``coord.state.load_board()`` guards against
+    being called from a thin client at all (#615).
+    """
+    from coord.merge_queue import is_ci_infra_reason, is_ci_pending_reason  # noqa: PLC0415
+
+    targets = [
+        e for e in entries
+        if e.state == STATE_PARKED
+        and (
+            is_ci_pending_reason(getattr(e, "last_reason", "") or "")
+            or is_ci_infra_reason(getattr(e, "last_reason", "") or "")
+        )
+    ]
+    if not targets:
+        return {}
+
+    from coord.board_service import resolve as resolve_board_service  # noqa: PLC0415
+
+    if resolve_board_service() is not None:
+        return {}
+
+    try:
+        from coord import github_ops as _gh_ops  # noqa: PLC0415
+        from coord import merge_queue as _mq  # noqa: PLC0415
+        from coord.ci_store import build_ci_store  # noqa: PLC0415
+        from coord.commands._common import _load_config  # noqa: PLC0415
+        from coord.state import load_board as _load_board  # noqa: PLC0415
+
+        cfg = _load_config(config_path)
+        board = _load_board()
+        ci_store = build_ci_store(cfg.ci_store.type)
+        queue_by_key = {
+            entry_key(q.repo_name, q.issue_number): q for q in _mq.load_queue()
+        }
+    except Exception:  # noqa: BLE001 — see the fail-soft note above
+        return {}
+
+    overrides: dict[str, bool] = {}
+    for e in targets:
+        q = queue_by_key.get(e.key)
+        if q is None or not q.pr_number:
+            continue
+        try:
+            status, _reason = _mq.entry_gate_status(q, board, cfg, ci_store, _gh_ops)
+        except Exception:  # noqa: BLE001 — leave this one entry to the ceiling
+            continue
+        overrides[e.key] = status != _mq.PLAN_READY
+    return overrides
+
+
 def _launch_argv(entry: QueueEntry, config_path: Path | None) -> list[str]:
     """The ``coord drive --tmux`` argv for *entry*.
 
@@ -1318,6 +1417,14 @@ def drive_queue_tick(
         # tick when no entry is parked that way — which is the common case.
         gate_a_pending = _fetch_gate_a_pending(entries)
 
+        # #2182: for every entry parked on a CI reason, a fresh single-entry
+        # re-derivation of its gate, taken live THIS tick — see
+        # `_fetch_live_ci_gate`'s docstring for the gap this closes (a park
+        # on the daemon-host tick could previously be released only by the
+        # #2158 45-minute ceiling, never by CI actually reporting, because
+        # this tick's board read never computes a live `merge_plan`).
+        live_ci_gate = _fetch_live_ci_gate(entries, config_path)
+
         # #2101: release cordons. THIS is the hole the issue names — the
         # queue's launcher had zero pause awareness (`coord/drive.py` checks
         # pause only when routing a *worker*), so a cordoned host kept getting
@@ -1349,6 +1456,7 @@ def drive_queue_tick(
             exit_dead_end=exit_dead_end,
             gate_a_pending=gate_a_pending,
             cordons=cordons,
+            live_ci_gate=live_ci_gate,
         )
 
         if reconcile_only:
