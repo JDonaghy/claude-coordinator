@@ -2,6 +2,14 @@
 
 CLI tool + per-machine agent server that coordinates Claude Code workers across multiple machines and repos over Tailscale.
 
+> **Scope of this file (#2195).** This is the **worker- and reviewer-facing** rulebook: it is
+> loaded into every worker leg, every review leg, and every coordinator session, so it holds
+> only what someone *editing this repo* must act on. Operator runbooks live in
+> [`docs/`](docs/) — see [Operational guides](#operational-guides--operator-facing) at the
+> bottom. Settled design rationale lives in
+> [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#design-decisions--the-settled-rationale).
+> Keep it that way: if a new rule does not change what a worker does, it belongs in `docs/`.
+
 ## Current Goal — read first
 
 **[`GOAL.md`](GOAL.md) holds the current north-star objective** — the living, cross-repo / cross-machine goal that should bias all planning, triage, and dispatch. It is meta-level (above any single issue, repo, or session) and changes as priorities evolve: read it first, plan against it, and keep it current. `coordinator.yml` is the source of truth for *topology*; `GOAL.md` is the source of truth for *intent*.
@@ -41,13 +49,7 @@ freshness instead — `GRAPH_REPORT.md` records its source commit, and
 flags an unset `core.hooksPath`). If it reports STALE, `graphify update .` in that
 checkout.
 
-**Setting this up on a new machine: [`docs/GRAPHIFY_SETUP.md`](docs/GRAPHIFY_SETUP.md).** Four
-layers (pipx CLI → built graph → machine-local `.git/hooks` → versioned `.githooks/` shims), all
-of which fail *silently* when missing — a half-installed machine looks identical to a working
-one, it just answers from grep. Includes the ordering constraint (`graphify hook install` before
-`core.hooksPath`), why `core.hooksPath` replacing `.git/hooks` wholesale needs a shim per hook,
-and why `.githooks/**` is a **fifth deploy surface** whose failure mode is the opposite of the
-other four — a merged hook is live on every machine at the next fetch, no release, no restart.
+Setting this up on a new machine: [`docs/GRAPHIFY_SETUP.md`](docs/GRAPHIFY_SETUP.md).
 
 ## Architecture
 
@@ -61,6 +63,9 @@ claude -p                  — The actual worker (runs locally on each machine)
 GitHub issues              — Work source + message bus (via issue comments)
 Tailscale                  — Networking between machines
 ```
+
+Full walkthrough — the agent HTTP API, where each subcommand actually runs, the auto-loop end
+to end: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Project Structure
 
@@ -82,9 +87,8 @@ coord merge [--dry-run] [--repo NAME] [--method rebase|squash|merge] [--order ID
 coord reconcile-merges     # Backfill missing branches + record out-of-band merges (#609/#611)
 coord retry|stop|resume <id>                    # Recovery; `coord done` ends the session
 ```
-Setup / diagnostics (discoverable via `--help`): `coord init`, `coord config`, `coord agent`, `coord serve`, `coord web`, `coord diagnose`, `coord sessions [--remote]`, `coord split`, `coord notifier` ([`docs/NOTIFIER.md`](docs/NOTIFIER.md)).
 
-**Onboarding a repo is five layers, and every one fails silently (#2220).** `coord repo add <name> --github <owner/repo> --machines a,b,c` does the safely-automatable parts (reads the *real* default branch from GitHub, writes the entry into the coord-settings checkout, adds it to each machine, creates the `coord`/tier labels) and then prints the residue it deliberately did **not** do. `coord repo doctor <name>` is the part that matters: it probes all five layers from **live state, not config** — each agent's `/health` repo list, the clone on each machine, the labels that exist, whether any workflow triggers on `pull_request`, `CLAUDE.md`, graph freshness — and exits non-zero on any CRIT. `coord doctor` folds in the live-state layer for every repo, so a half-onboarded one shows up in the fleet report without anyone remembering to ask. See [`docs/AGENT_OPERATIONS.md`](docs/AGENT_OPERATIONS.md).
+Setup / diagnostics (discoverable via `--help`): `coord init`, `coord config`, `coord agent`, `coord serve`, `coord web`, `coord diagnose`, `coord sessions [--remote]`, `coord split`, `coord notifier`, `coord repo add` / `coord repo doctor`.
 
 ## Development
 
@@ -112,27 +116,53 @@ the Test stage itself would run for your diff (and confirm you're not
 missing a suite), `scripts/coord-test-runner.sh <worktree> --print-routing`
 computes the routing without actually building or testing anything.
 
+## Working on `tui/` — the `quadraui` pin
+
+**`coord-tui` pins `quadraui` to a git rev in `tui/Cargo.toml`**
+(`quadraui = { git = "https://github.com/JDonaghy/quadraui", rev = "<sha>" }`, #1973). This
+replaced the old relative-path dependency (`../../quadraui/quadraui`), which built against
+whatever branch happened to be checked out in `~/src/quadraui` — a quadraui merge could break
+coord-tui's build/merge with **zero coord-tui commits and no warning** (it already happened
+once). `cargo build`/`cargo test` from `tui/` now fetch quadraui straight from GitHub at the
+pinned rev and never touch `~/src/quadraui`, so the local checkout's branch is irrelevant.
+
+- **Bumping the pin** (deliberate, reviewable, its own coord-tui commit): pick the target
+  quadraui rev — normally the tip of `origin/develop` (quadraui's default/integration branch,
+  per quadraui's CLAUDE.md) — edit the `rev = "..."` in `tui/Cargo.toml`, then run
+  `cargo build && cargo test` from `tui/` and confirm EXIT=0 before committing.
+  `cargo update -p quadraui` alone will **not** move a `rev`-pinned git dependency; the
+  `Cargo.toml` edit is the actual bump.
+- **Co-developing against an unmerged quadraui branch/PR:** if a `tui/` task consumes a
+  not-yet-merged quadraui feature, the briefing **must** name the quadraui PR/branch. The
+  worker builds against a local `~/src/quadraui` checkout **without editing
+  `tui/Cargo.toml`**, via cargo's local-paths override:
+  `cp tui/cargo-config-local-quadraui.toml.example tui/.cargo/config.toml` (git-ignored — see
+  the example file's header) after checking out the target branch in `~/src/quadraui`. Delete
+  `tui/.cargo/config.toml` (or don't create it) to build against the pinned rev again — this
+  is the default and what CI/other workers use. **Verify build EXIT=0 from `tui/` both with
+  the override active (proves the feature works) and, before finishing, confirm the committed
+  `tui/Cargo.toml` still points at the pinned rev** (the override file itself is never
+  committed).
+
 ## Key Design Decisions
 
-- **No API key needed.** Everything uses `claude -p` which runs on Max/Pro subscription via OAuth.
-- **Agent servers are dumb dispatchers.** They spawn `claude -p` and track the subprocess. All intelligence is in the coordinator brain.
-- **GitHub issue comments as message bus.** Briefings, completion notices, and failure reports are posted as comments — persistent, linkable, readable by any agent. Comments carry `<!-- coord:... -->` markers for machine-parseable metadata.
-- **coordinator.yml is the single source of truth** for repo topology, machine capabilities, dependencies, concurrency limits, review settings, smoke-test rules, and the pipeline gate order (`pipeline.default_gates`).
-- **coordinator.yml lives in `~/.coord/` — not the repo checkout.** Config-path resolution (`coord.config.resolve_config_path`) is `$COORD_CONFIG` → `~/.coord/coordinator.yml` → `./coordinator.yml` (first existing wins). The canonical home is `~/.coord/coordinator.yml`, mirroring `~/.coord/coord.db` + `~/.coord/client.toml`, so the tool runs on a machine with **no repo checkout**. `./coordinator.yml` is a development fallback only — relying on it makes the loaded file depend on your CWD (this bit us: a near-empty `~/src/<repo>/coordinator.yml` stub shadowed the real `~/coordinator.yml`). `coord config` and `coord serve` both print the resolved path so it's never ambiguous which file is loaded. **On a thin client, that resolved path is a CACHE, not the config** — `~/.coord/coordinator.remote.yml` (`coord.client.REMOTE_CONFIG_CACHE`) is re-fetched from the daemon's `GET /config` on essentially every command and overwritten wholesale, so edits to it silently revert, including from the `coord config` you run to check them. **Fleet config is never edited at the daemon host's `~/.coord/coordinator.yml` path directly** — that path is a symlink into the `coord-settings` checkout, and `sed -i`/most editors write-and-rename over it, silently replacing the symlink with a disconnected regular file that stops being version-controlled (#1832). Edit `~/src/coord-settings/coord/coordinator.yml` (commit + push there, then `git pull` on the daemon host), then `coord-serve` is restarted (with `coord sessions --remote` empty first). `coord diagnose --config-provenance` detects a broken symlink. See [`docs/OPERATING_GOTCHAS.md`](docs/OPERATING_GOTCHAS.md) (#8 and #14).
-- **User approves everything.** `coord plan` proposes, user reviews, `coord approve` dispatches. `coord assign` is the escape hatch for direct dispatch. No autonomous dispatch.
-- **Claim detection prevents duplicate work.** Before dispatching, the coordinator checks the board for active assignments and the remote for `issue-{N}-*` branches. If either exists, dispatch is refused with a clear message.
-- **Conflict rules are inferred, not configured.** The coordinator brain reads issue bodies and infers which files will be touched. No DSL for conflict zones — optional `file_groups` and `exclusive_files` in config for power users.
-- **Adversarial reviews are rule-enforcing, not rubber-stamping.** On worker completion, a fresh `claude -p` session on a *different* machine reviews the PR diff against the repo's CLAUDE.md and the review checklist. Zero shared context with the worker — that's the whole point.
-- **Merge queue sequences PRs safely.** Completed branches are enqueued on reconciliation. `coord merge` opens PRs and merges them in dependency-aware order, with conflict detection and size-based sequencing.
-- **Merge is gated on CI checks (#240).** Before merging a PR, `coord merge` calls `gh pr checks` via `coord.ci_store.CiStore` and refuses when any check has failed or is still running. Pass `--force-merge` to override (the failures are surfaced in the TUI and CLI output so the override is intentional). `ci_store: { type: none }` in `coordinator.yml` disables the gate entirely. **A PR with zero reported checks is not automatically clear to merge (#1904).** `checks == []` is ambiguous — "no CI configured" vs. "CI exists but never triggered" (a throttled webhook, a wedged run, a path-filtered-out workflow) — so the gate calls `CiStore.expects_checks(repo, pr)` to tell them apart: `NoOpCi` (the `type: none` opt-out) always answers `False`; `GitHubCi` answers based on whether the repo declares any GitHub Actions workflows at all, failing closed (`True`) on a read error. When checks are expected but absent, the entry blocks with a `checks_absent` event / `CI never ran:`-prefixed reason — distinct from `checks_pending`/`checks_stale` — at all three surfaces that read CI status (`--plan`, `--dry-run`, and the real merge), so they can never disagree with each other again.
-- **Mechanical merge conflicts auto-rebase (#241).** When `coord merge` fails because the worker's branch is out of date on a rebaseable conflict, the coordinator dispatches a `type="conflict-fix"` worker that rebases, resolves obvious additive merges, runs tests, and `git push --force-with-lease`. On success the merge re-enqueues automatically; on failure the entry is marked `HUMAN_REQUIRED` and surfaced in the TUI. Semantic conflicts (same function modified two ways) are not attempted — the worker exits and posts a comment for manual resolution. `gh` is denied for `conflict-fix` workers; only the coordinator drives merge retries.
-- **Smoke tests validate on capable hardware.** When a worker finishes, `capability_rules` in `smoke_tests` config map changed files to required machine capabilities (e.g. GTK changes → machine with GTK). A `type="smoke"` assignment runs build + tests on the right machine.
-- **Test precedes Review — the pipeline order is `Work → Test → Review → Merge`.** The smoke test runs *before* the PR/review (the natural order: smoke before PR), reversing the #520 "get the review over with first" workaround now that the agent-assisted Testing stage is smooth. This is enforced in two places that must stay in sync: (1) the **displayed** stage order comes from `pipeline.default_gates = ["test","review","merge"]` (`coord/config.py`; an old DB carrying the #520-era `["review","test","merge"]` is migrated in `coord/db.py`); (2) the **headless** auto-loop holds review dispatch until the work has a `passed`/`skipped` test verdict whenever `default_gates` orders test before review — `PipelineConfig.test_precedes_review()` drives `dispatch_pending_reviews` (`coord/review.py`). The explicit `coord review`/`coord pr` paths stay ungated so a human can always force a review. (The merge gate already required a test verdict — `requires_smoke` — so the human test touchpoint just moved earlier, and review cycles are no longer burned on untested code.)
-- **Interactive testing + merge agents drive the Test → Review → Merge handoff (leg 3c / A3, #350/#581/#306/#606).** From a Pipeline row's right-click menu, the TUI routes **board-driven** verdicts (never TTY-scraped, ToS §3.7) along `Work → Test → Review → Merge`: **Start testing** = `coord assign --interactive --smoke-of <work_aid>` (read-only testing agent in the live checkout; records the verdict via `coord test --passed|--fail`); a `passed`/`skipped` test → **pass→review** (launches the interactive review); an approved review → **Start merge** = `--merge-of <work_aid>` (worktrees + proactively rebases onto the default branch #306, resolves mechanical conflicts (semantic with the operator), runs tests, `git push --force-with-lease`, then `coord verify-merge` and — if clean — `coord merge` itself to complete it #606); a `failed` test **or** request-changes review → one-key **`--fix-of`** on the same branch (a test-fail takes the identical action as a request-changes; `--fix-of` accepts a review id **or** a test-failed work id, the #581 front door). The merge agent is still gated on CI/review/smoke (a gate failure is reported, not forced) and `verify-merge` (#604) runs first. Full walkthrough: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
-- **Progress streaming from workers.** Workers emit `STATUS:` and `STUCK:` lines in their logs. The coordinator parses these for real-time progress reporting in `coord status` and the dashboard.
-- **The notifier tells you when NOBODY IS COMING — and nothing else (#1632).** `coord/notifier/` pushes to a self-hosted ntfy on the daemon host (over Tailscale, so no event text leaves the tailnet) when the pipeline **has stopped or is stalled and will not advance without a human**: a halted drive, a gate parked `HUMAN_REQUIRED`, a worker's `STUCK:`, a stall that survived `drive`'s nudge (#1593), a leg running far past comparable work, a fleet CRIT that invalidates in-flight work. It is **not** an error channel and **not** a progress feed — a failed test, a request-changes review and a mechanical merge conflict are all things the auto-loop handles, and pushing them is what trains an operator to mute the channel; in normal operation this fires approximately never. "Far too long" is **learned, never a fixed timeout**: p90 of a `(repo, type, tier)`-stratified population built from the durations milestone #37 already records, with a cold-start state (<5 samples → a generous absolute ceiling, said out loud in the message) so it never fires off a population of one. Quiet hours (22:00–08:00, daemon-local, `notifications.quiet_hours`) are a **deferral window, not a filter** — events are held and delivered as one 08:00 digest, nothing is discarded, and **no severity pierces them**; the only exception is `coord drive --urgent`, which is a deadline rather than a severity and expires with the drive. The whole subsystem is **advisory and isolated** (#1485's lesson): `tick()` never raises, every collector source fails open, state lives in its own `~/.coord/notifier.json`, and an unreachable ntfy server cannot affect dispatch, routing, the board or any verdict. It rides #1616's daemon clock rather than shipping a second one, and reads `drive`'s stall decision rather than defining "stalled" again. Off by default. Full rationale: [`docs/NOTIFIER.md`](docs/NOTIFIER.md).
-- **Failure reassignment.** Failed assignments can be retried on a different machine via `coord retry`. With `concurrency.auto_reassign: true`, reconciliation auto-retries on a different machine.
-- **Dependency freshness checks.** Before dispatching, `coord approve` checks whether upstream repos are up-to-date on the target machine. Stale dependencies trigger warnings or auto-pull with `--auto-pull`.
+One line each — the reasoning behind them is in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#design-decisions--the-settled-rationale).
+
+- **No API key needed.** Everything uses `claude -p`, which runs on a Max/Pro subscription via OAuth.
+- **Agent servers are dumb dispatchers.** They spawn `claude -p` and track the subprocess; all intelligence is in the coordinator brain.
+- **GitHub issue comments are the message bus.** Briefings, completion notices and failure reports are comments, carrying `<!-- coord:... -->` markers for machine parsing.
+- **`coordinator.yml` is the single source of truth** for repo topology, machine capabilities, dependencies, concurrency limits, review settings, smoke-test rules, and the pipeline gate order (`pipeline.default_gates`). It lives in `~/.coord/`, **not** the repo checkout.
+- **User approves everything.** `coord plan` proposes, the user reviews, `coord approve` dispatches. No autonomous dispatch.
+- **Claim detection prevents duplicate work.** Before dispatching, the coordinator checks the board for active assignments and the remote for `issue-{N}-*` branches.
+- **Conflict rules are inferred, not configured.** The brain reads issue bodies and infers which files will be touched.
+- **Adversarial reviews are rule-enforcing, not rubber-stamping.** On worker completion a fresh `claude -p` session on a *different* machine reviews the PR diff against this file and the review checklist, with zero shared context with the worker — that's the whole point.
+- **The pipeline order is `Work → Test → Review → Merge`.** Test precedes Review; the headless auto-loop holds review dispatch until there is a `passed`/`skipped` test verdict.
+- **Merge is gated on CI checks (#240).** `coord merge` refuses when a check failed or is still running — and a PR with *zero* reported checks is not automatically clear either (#1904).
+- **Mechanical merge conflicts auto-rebase (#241).** A `type="conflict-fix"` worker rebases and resolves additive merges; semantic conflicts are left for a human.
+- **Smoke tests validate on capable hardware.** `smoke_tests.capability_rules` map changed files to required machine capabilities (e.g. GTK changes → a machine with GTK).
+- **Progress streaming from workers.** Workers emit `STATUS:` and `STUCK:` lines; the coordinator parses these for real-time progress in `coord status` and the dashboard.
+- **The notifier tells you when NOBODY IS COMING — and nothing else (#1632).** Advisory, isolated, off by default; it is not an error channel and not a progress feed.
 
 ## Review Prompt Assembly
 
@@ -145,19 +175,17 @@ The reviewer gets a prompt built from:
 
 The reviewer reads the rules and enforces them against the diff. It does not have the worker's session context — genuinely independent.
 
-## Cost Discipline
+## Rules for workers
 
-The coordinator session (typically Opus) costs ~10x more per token than Sonnet workers. Minimize direct code work in the coordinator — instead, write a good briefing and dispatch it.
+- **Only the coordinator writes docs.** Workers must **not** update README, CHANGELOG, or shared documentation files — parallel doc edits cause merge conflicts. If a briefing lists docs in `files_forbidden`, respect it. An issue whose *entire* deliverable is a doc edit is coordinator work and should never have been dispatched; say so and stop rather than editing the doc.
+- **Never edit `tests/acceptance/**`.** Those suites are sealed and delivered read-only / run-only. Write your own unit and internal tests instead.
+- **Stay in file scope.** If you must touch a file outside your briefing, note it in your final message.
+- **Commit and push before your final message** — even if the build is broken or you ran out of time. Uncommitted work is destroyed when the session ends.
+- **`gh` is on the deny-list.** The coordinator owns all GitHub interaction; use plain `git`.
 
-- **Dispatch, don't do.** If a task can be described in a briefing, send it to a worker. Reserve the coordinator session for triage, review, and decisions.
-- **Workers are cheap.** Sonnet workers typically cost $0.30-0.90 per task. An hour of Opus coordinator time costs $40+.
-- **Compact aggressively.** Long coordinator sessions balloon cache reads. Use `/compact` when switching topics or after completing a batch of work.
-- **Parallel workers, serial coordinator.** Dispatch multiple workers in parallel, then review results. Don't do two things at once in the coordinator session.
-- **Trust the adversarial review.** When a review completes, read only the review comment — do not re-read the full PR diff to form an independent opinion. Summarize the reviewer's findings and ask the user how to proceed. Only read the diff if the review seems wrong or incomplete.
-- **Audit before dispatching.** Include a step in briefings: "Before coding, verify this isn't already implemented." Workers have wasted full sessions building features that already existed.
-- **Only the coordinator writes docs.** Workers must not update README, CHANGELOG, or shared documentation files. Parallel doc edits cause merge conflicts. Add docs to `files_forbidden` in briefings; the coordinator handles doc updates at session end.
-- **Catch platform violations at review time.** The adversarial reviewer should check for platform-specific code in shared/cross-platform paths. Catching after merge costs an entire round-trip.
-- **Never dispatch reviews via `coord assign`.** Workers have `gh` on the deny-list, so a worker dispatched with `coord assign` cannot run `gh pr diff` or `gh pr review`. Reviews must go through the review pipeline (`coord review` or auto-dispatch on completion) which uses `type="review"` and grants GitHub access.
+The operator-side counterparts to these rules (dispatch economics, what to send to a worker
+versus keep in the coordinator session) are in
+[`docs/COST_DISCIPLINE.md`](docs/COST_DISCIPLINE.md).
 
 ## Testing — black-box coverage is the acceptance bar
 
@@ -196,25 +224,30 @@ The coordinator session (typically Opus) costs ~10x more per token than Sonnet w
 - Agent server port: 7433, dashboard port: 7434, board daemon port: 7435
 - GitHub issue comments carry `<!-- coord:event=... assignment=... -->` markers for machine parsing
 
-## Operational guides
+## Operational guides — operator-facing
 
-- **Operating gotchas — READ BEFORE OPERATING THE FLEET**: [`docs/OPERATING_GOTCHAS.md`](docs/OPERATING_GOTCHAS.md) — traps that each cost a real dispatch, real money, or real lost work, and are invisible from the code. **A merged fix is not a live fix** (agent-side needs a release + `coord agent update`; daemon-side needs a `coord-serve` restart; `tui/**` needs a local rebuild — #1394 sat undeployed and the next dispatch re-hit it for $3.44). Also: `--briefing-file` **replaces** the whole briefing (use `coord context add --pin` to *add* guidance); `merge-base --is-ancestor` is always wrong under `--method rebase`; Pipeline membership is `coord`-label-gated; phantom `running` rows silently disable `coord retry` fleet-wide; and the recurring shape behind three bugs — **`reconcile()` accretes behaviour the automatic drivers never invoke**. Ends with the unattended driver — `coord drive` plus `scripts/drive-batch.sh` for overnight batches — its ~120min/issue budget, and the trap that **an expired `--deadline` stops the observer, not the work**.
-- **The drive queue (`coord drive-queue`, #1750)**: [`docs/DRIVE_QUEUE.md`](docs/DRIVE_QUEUE.md) — the durable, board-backed replacement for a hand-typed `coord drive` or `scripts/drive-batch.sh`: enqueue (CLI + TUI, `--machine`/`--after`), install the `coord-drive-queue` systemd timer, the "hold, don't kill" split between stopping the timer and `coord drive-stop`, reading `QUEUE: STALLED` vs `QUEUE: BLOCKED`, and why the timer's pinned CLI rides the ordinary `coord agent update` lane on dellserver rather than a bespoke venv. **Read the top section before queuing more than ~2 issues on one repo** — until #1715 lands, each merge stales every other queued branch's Test verdict, so `coord drive` escalates instead of re-testing and *N* queued issues cost *N−1* human interventions.
-- **Architecture overview**: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — how the CLI, TUI, agent servers, and workers fit together; the agent HTTP API surface; where each `coord` subcommand actually runs; the auto-loop walked end-to-end.
-- **Phone Web Control Center (v1)**: [`docs/PHONE_WEBAPP.md`](docs/PHONE_WEBAPP.md) — full runbook: build the React bundle (`npm install && npm run build` in `coord/dashboard/webapp/`), start `coord web` on the daemon host, access from a phone via Tailscale MagicDNS URL, install as a PWA. Also: complete API surface (`GET /api/pipeline` field reference including `review_verdict`, `review_findings_body`, `test_verdict` added in #698; `POST /api/pipeline/action` action table), ToS posture (headless-only, no live terminal), and test-tier map.
-- **Ephemeral Azure workers (on-demand, per-epic)**: [`docs/EPHEMERAL_WORKERS.md`](docs/EPHEMERAL_WORKERS.md) — spin a worker VM up for an epic and destroy it after (`scripts/azure-workers/epic-up.sh` / `epic-down.sh`), with a self-contained VNet + NAT Gateway so nothing standing is billed. Workers run on the **metered Anthropic API**, not your Max subscription, so fleet usage never competes with your own rate limits. **The tailnet ACL is the security boundary** — `agent_app.py` has no authentication, so anything on the tailnet can `POST /assign` to any agent; `tag:coord-worker` restricts a worker to `dellserver:7435` only. Ends with the gotchas that each cost a real failure: a stale tailnet node silently burns a 15-min timeout, gallery image `DiskControllerTypes` is immutable (omit NVMe → v7 SKUs won't boot, discovered 30 min after the build "succeeded"), Key Vault private-endpoint DNS isn't ready at boot, `systemctl --user` needs `XDG_RUNTIME_DIR`, a user unit can't depend on a system unit, and **`coord config --config` is not a validator on a thin client** (it re-fetches from the daemon and "succeeds" against an invalid file).
-- **Adding a Mac mini to the fleet**: [`docs/MAC_MINI.md`](docs/MAC_MINI.md) — hardware sizing (16GB RAM is fine at `concurrency: 1` with `CARGO_BUILD_JOBS=6`; **256GB storage is not** — 57GB of Rust `target/` artifacts from one checkout each, before worktrees), buy-vs-rent (buy: break-even ~4–6 months, and GUI polish over VNC degrades the exact work it's for), the provisioning runbook (auto-login + Screen Sharing for GTK4 live smoke, Xcode CLT only, Homebrew gtk4, PyPI-not-editable `~/.coord-venv`, `os:macos` capability), and **what non-macOS work to route there** (tui/Rust + reviews + Python all route cleanly — `coord/` has zero Linux-isms and mac is already an intended agent platform, so the box is useful *before* milestone #39 lands; vimcode GTK4 is the exception). The port itself is [`docs/CROSS_PLATFORM.md`](docs/CROSS_PLATFORM.md) milestone #39.
-- **Forge independence — surviving an outage, and the cost of leaving**: [`docs/FORGE_MIGRATION.md`](docs/FORGE_MIGRATION.md) — the plan of record for milestone #58 / epic #1902, written after the 2026-08-06 GitHub Actions outage. Separates two goals that are easy to conflate and cost wildly different amounts: **surviving** a forge outage (cheap, unconditional) vs **leaving** a forge (20–40 issues, gated on measured availability data from #1896). Carries the measured coupling inventory — the good news is that **every `["gh", ...]` argv in the tree already lives inside `github_ops.py`** behind 71 named functions with a private `_gh()` and zero passthrough callers, so the issue-store split is a refactor and not a rewrite; the hard part is that **issues are the message bus and the audit trail**, issue numbers are load-bearing in branch names / `fix(#N)` subjects / `verify-merge`, and labels gate Pipeline membership. Note that the queue damage that outage caused was **forge-independent** (#1894) and is fixed there, not here.
-- **Why a merge/review isn't happening**: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#when-a-merge-isnt-happening) — the Test gate (manual `coord test --passed`/P-S verdict) that silently blocks review→merge, plus a gate-by-gate checklist (review approved? CI green? PR conflict? queue clog / `--order`? post-bounce keying?). **Check here first when "Go does nothing" or a story stalls with no review.**
-- **Why an issue is in the Pipeline you never dispatched**: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#when-an-issue-is-sitting-in-the-pipeline-you-never-dispatched) — Board vs Pipeline membership is **label-driven**: an open issue with a `status:ready` label (set by `coord ready`, and by the refinement / new-issue chat finalize step) shows as a Pipeline "ready" card even with zero assignments. **Drop it back with `coord backlog <repo> <issue>`** (strips `status:*`). This is the `status:ready` limbo → see #359.
-- **Releasing to PyPI is a tag push, not `twine upload`.** Bump `pyproject.toml` + `coord/__init__.py` (must match), land the bump via a PR (`main` requires passing status checks — #1525 — so a plain `git push origin main` is rejected, even for admins), then tag the **merged** commit and push the `vX.Y.Z` tag — `.github/workflows/publish.yml` builds and publishes with the `PYPI_API_TOKEN` repo secret (not available locally). Run `coord release-preflight` after the merge and before tagging (post-merge, pre-tag — not on the `release-v*` branch). **Agent-side changes (anything in `coord/agent.py`, e.g. worker prompts) only reach agents after a release + `coord agent update`;** coordinator-only code is live from the editable install immediately. **Deploying is FOUR lanes, not one:** (1) `~/.coord-venv` on each agent, (2) a `coord-serve` restart on the daemon host for any `serve_app.py`/`state.py`/`review.py`/`merge_queue.py` change, (3) a local `cargo build` for `tui/**`, and (4) **`~/.coord-cli-venv`** — the epic sequencer's pinned `COORD_BIN`, which nothing upgrades automatically and which was found **three releases stale** on 2026-07-29, silently driving without fixes everyone believed were live. Also: **poll PyPI's simple index, not the JSON API** — they flip independently in both directions and only the simple index is what `pip` resolves against. Full steps in [`docs/AGENT_OPERATIONS.md`](docs/AGENT_OPERATIONS.md#publishing-a-release-pypi).
-- **INVARIANT: every remote agent's `~/.coord-venv` MUST be a PyPI install (`pip install claude-coordinator`), never editable.** The single most-recurring fleet failure. PyPI → `coord agent update` does `pip install --upgrade` and a released `vX.Y.Z` lands cleanly; editable → update silently `git pull`s a local checkout instead, so version bumps never propagate and the agent often "did not come back." **Root cause:** someone ran `pip install -e .` into `~/.coord-venv` — the editable **install** is the problem, **not** the `~/src/<repo>` checkout. #402's PATH-strip only stops *workers*' bare-pip, not a deliberate editable install.
-  - **DO NOT delete `~/src/<repo>` to "fix" drift** — it's the **worker worktree base** (`git worktree add` runs from it; worktrees in `~/.coord/worktrees/` are worktrees *of* it), so deleting it breaks every task for that repo on that machine. Fix **only the install**.
-  - **Detect:** `ssh <host> '~/.coord-venv/bin/pip show claude-coordinator | grep -i "editable\|location"'` — any `Editable project location:` line ⇒ drift (PyPI shows only a site-packages `Location`).
-  - **Fix (keep the checkout):** in `~/.coord-venv`, `pip uninstall -y claude-coordinator && pip install --upgrade claude-coordinator`, then `XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart coord-agent` (the `/update` `os.execv` self-restart does **not** take under systemd — #404, leaves same PID + stale version).
-  - **`✗ did not come back` is usually a FALSE NEGATIVE** (agent online, restart just didn't take) — check the running version/PID first, then pick drift-fix vs. plain `systemctl --user restart coord-agent`. **Before touching any agent install, READ [`docs/AGENT_OPERATIONS.md`](docs/AGENT_OPERATIONS.md) end-to-end** (exact convert-to-PyPI commands, systemd restart, first-time install) — don't re-derive it.
-- **`coord-tui` pins `quadraui` to a git rev in `tui/Cargo.toml`** (`quadraui = { git = "https://github.com/JDonaghy/quadraui", rev = "<sha>" }`, #1973). This replaced the old relative-path dependency (`../../quadraui/quadraui`), which built against whatever branch happened to be checked out in `~/src/quadraui` — a quadraui merge could break coord-tui's build/merge with **zero coord-tui commits and no warning** (it already happened once). `cargo build`/`cargo test` from `tui/` now fetch quadraui straight from GitHub at the pinned rev and never touch `~/src/quadraui`, so the local checkout's branch is irrelevant.
-  - **Bumping the pin** (deliberate, reviewable, its own coord-tui commit): pick the target quadraui rev — normally the tip of `origin/develop` (quadraui's default/integration branch, per quadraui's CLAUDE.md) — edit the `rev = "..."` in `tui/Cargo.toml`, then run `cargo build && cargo test` from `tui/` and confirm EXIT=0 before committing. `cargo update -p quadraui` alone will **not** move a `rev`-pinned git dependency; the `Cargo.toml` edit is the actual bump.
-  - **Co-developing against an unmerged quadraui branch/PR:** if a `tui/` task consumes a not-yet-merged quadraui feature, the briefing **must** name the quadraui PR/branch. The worker builds against a local `~/src/quadraui` checkout **without editing `tui/Cargo.toml`**, via cargo's local-paths override: `cp tui/cargo-config-local-quadraui.toml.example tui/.cargo/config.toml` (git-ignored — see the example file's header) after checking out the target branch in `~/src/quadraui`. Delete `tui/.cargo/config.toml` (or don't create it) to build against the pinned rev again — this is the default and what CI/other workers use. **Verify build EXIT=0 from `tui/` both with the override active (proves the feature works) and, before finishing, confirm the committed `tui/Cargo.toml` still points at the pinned rev** (the override file itself is never committed).
-- **Turn off Claude Code's Agent View when driving the fleet.** Because you run several interactive Claude Code sessions at once, its cross-session roster (`N awaiting input · N working · N completed`) can pop up unprompted mid-type when *another* session changes stage. Disable it on the operator machine with `"disableAgentView": true` in `~/.claude/settings.json` (Claude-Code **client** config, not `~/.coord/`; restart to apply). Full note in [`docs/AGENT_OPERATIONS.md`](docs/AGENT_OPERATIONS.md#operator-claude-code-settings-driving-the-fleet).
-- **`coord-tui` ships as a locally-built binary, not via PyPI.** After a tui/ PR merges, the user needs to rebuild and reinstall locally: `cd tui && cargo build && cp target/debug/coord-tui ~/.local/bin/coord-tui`. The PyPI release flow above does not apply to coord-tui. Workers should not attempt to bump versions for tui-only changes.
+**Not needed to work on this repo.** These are runbooks for driving the fleet; a worker or
+reviewer can stop reading here.
+
+**Read before operating the fleet:**
+
+- [`docs/OPERATING_GOTCHAS.md`](docs/OPERATING_GOTCHAS.md) — **READ BEFORE OPERATING.** Traps that each cost a real dispatch, real money, or real lost work, and are invisible from the code. The headline: **a merged fix is not a live fix.**
+- [`docs/AGENT_OPERATIONS.md`](docs/AGENT_OPERATIONS.md) — releases, propagation, the deploy lanes, agent installs, and the **`~/.coord-venv` must-be-PyPI invariant**. **Read end-to-end before touching any agent install** — don't re-derive it.
+- [`docs/DRIVE_QUEUE.md`](docs/DRIVE_QUEUE.md) — the durable, board-backed driver (`coord drive-queue`, #1750). **Read the top section before queuing more than ~2 issues on one repo.**
+
+**Reference:**
+
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — how it all fits together, plus the settled design rationale. Two diagnostic entry points: [why a merge/review isn't happening](docs/ARCHITECTURE.md#when-a-merge-isnt-happening) (**check here first when "Go does nothing"**) and [why an issue is in the Pipeline you never dispatched](docs/ARCHITECTURE.md#when-an-issue-is-sitting-in-the-pipeline-you-never-dispatched).
+- [`docs/COST_DISCIPLINE.md`](docs/COST_DISCIPLINE.md) — dispatch economics; what to send to a worker versus keep in the coordinator session.
+- [`docs/NOTIFIER.md`](docs/NOTIFIER.md) — the "nobody is coming" push channel (`coord notifier`).
+- [`docs/ORACLE_LOOP.md`](docs/ORACLE_LOOP.md) — sealed acceptance suites, Gate-A contracts, the test-author agent.
+- [`docs/PHONE_WEBAPP.md`](docs/PHONE_WEBAPP.md) — Phone Control Center v1 runbook and the `/api/pipeline` surface.
+- [`docs/GRAPHIFY_SETUP.md`](docs/GRAPHIFY_SETUP.md) — installing the knowledge graph on a new machine (four layers, all of which fail *silently*).
+- [`docs/EPHEMERAL_WORKERS.md`](docs/EPHEMERAL_WORKERS.md) — on-demand Azure worker VMs per epic. **The tailnet ACL is the security boundary** — `agent_app.py` has no authentication.
+- [`docs/MAC_MINI.md`](docs/MAC_MINI.md) — adding a Mac mini; sizing, provisioning, and what non-macOS work routes there. The port itself is [`docs/CROSS_PLATFORM.md`](docs/CROSS_PLATFORM.md) (milestone #39).
+- [`docs/FORGE_MIGRATION.md`](docs/FORGE_MIGRATION.md) — surviving a forge outage (cheap) versus leaving a forge (expensive); milestone #58 / epic #1902.
+
+**Two deploy facts that bite most often:**
+
+- **`coord-tui` ships as a locally-built binary, not via PyPI.** After a `tui/` PR merges, rebuild and reinstall locally: `cd tui && cargo build && cp target/debug/coord-tui ~/.local/bin/coord-tui`. Workers should not bump versions for tui-only changes.
+- **Turn off Claude Code's Agent View when driving the fleet** — set `"disableAgentView": true` in `~/.claude/settings.json` (the Claude-Code *client* config, not `~/.coord/`; restart to apply), or its cross-session roster pops up mid-type when another session changes stage. Full note in [`docs/AGENT_OPERATIONS.md`](docs/AGENT_OPERATIONS.md#operator-claude-code-settings-driving-the-fleet).

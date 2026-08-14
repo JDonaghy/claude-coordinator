@@ -238,6 +238,162 @@ The CLI and the TUI are peer clients of the same state. They re-implement the sa
 
 **That next step has since shipped in part:** `coord serve` (#584) makes the daemon the canonical board holder with the CLI and TUI as thin clients — but the *gate logic* still lives in both languages (the daemon serves rows, it doesn't yet centralise the state-machine rules). Closing the remaining drift is now tracked as explicit tech debt: a `BoardService` facade (#749) and generating the wire types from one schema so the Rust/TS mirrors can't diverge — #748 hardens the `/board` parse (the blank-board class), #750 removes the hand-mirror. See the Tech Debt milestone (epic #751).
 
+## Design decisions — the settled rationale
+
+Moved out of `CLAUDE.md` by #2195. These are *settled* explanations: they document why the
+system has the shape it has. Nothing here changes what a worker editing this repo must do,
+which is why it lives here rather than in the file every worker leg loads. The one-line
+statements of these rules remain in `CLAUDE.md`'s "Key Design Decisions"; the reasoning is
+here.
+
+### Agent servers are dumb dispatchers
+
+They spawn `claude -p` and track the subprocess. All intelligence is in the coordinator
+brain. This is deliberate: the agent is a long-running daemon on someone else's machine, so
+every rule it enforces is a rule that needs a release plus `coord agent update` to change.
+Keeping it thin keeps the deploy lane cold.
+
+### Conflict rules are inferred, not configured
+
+The coordinator brain reads issue bodies and infers which files will be touched. There is no
+DSL for conflict zones — optional `file_groups` and `exclusive_files` in `coordinator.yml`
+exist for power users, but the default path is inference. A configuration language for
+conflicts would need maintaining in lockstep with the code it describes; inference degrades
+gracefully instead.
+
+### `coordinator.yml` lives in `~/.coord/`, not the repo checkout
+
+Config-path resolution (`coord.config.resolve_config_path`) is `$COORD_CONFIG` →
+`~/.coord/coordinator.yml` → `./coordinator.yml` (first existing wins). The canonical home is
+`~/.coord/coordinator.yml`, mirroring `~/.coord/coord.db` + `~/.coord/client.toml`, so the
+tool runs on a machine with **no repo checkout**. `./coordinator.yml` is a development
+fallback only — relying on it makes the loaded file depend on your CWD (this bit us: a
+near-empty `~/src/<repo>/coordinator.yml` stub shadowed the real `~/coordinator.yml`).
+`coord config` and `coord serve` both print the resolved path so it is never ambiguous which
+file is loaded.
+
+**On a thin client, that resolved path is a CACHE, not the config** —
+`~/.coord/coordinator.remote.yml` (`coord.client.REMOTE_CONFIG_CACHE`) is re-fetched from the
+daemon's `GET /config` on essentially every command and overwritten wholesale, so edits to it
+silently revert, including from the `coord config` you run to check them.
+
+**Fleet config is never edited at the daemon host's `~/.coord/coordinator.yml` path
+directly** — that path is a symlink into the `coord-settings` checkout, and `sed -i`/most
+editors write-and-rename over it, silently replacing the symlink with a disconnected regular
+file that stops being version-controlled (#1832). Edit
+`~/src/coord-settings/coord/coordinator.yml` (commit + push there, then `git pull` on the
+daemon host), then restart `coord-serve` (with `coord sessions --remote` empty first).
+`coord diagnose --config-provenance` detects a broken symlink. See
+[`OPERATING_GOTCHAS.md`](OPERATING_GOTCHAS.md) (#8 and #14).
+
+### Merge is gated on CI checks (#240), and an empty check list is not a pass (#1904)
+
+Before merging a PR, `coord merge` calls `gh pr checks` via `coord.ci_store.CiStore` and
+refuses when any check has failed or is still running. Pass `--force-merge` to override (the
+failures are surfaced in the TUI and CLI output so the override is intentional).
+`ci_store: { type: none }` in `coordinator.yml` disables the gate entirely.
+
+**A PR with zero reported checks is not automatically clear to merge.** `checks == []` is
+ambiguous — "no CI configured" vs. "CI exists but never triggered" (a throttled webhook, a
+wedged run, a path-filtered-out workflow) — so the gate calls
+`CiStore.expects_checks(repo, pr)` to tell them apart: `NoOpCi` (the `type: none` opt-out)
+always answers `False`; `GitHubCi` answers based on whether the repo declares any GitHub
+Actions workflows at all, failing closed (`True`) on a read error. When checks are expected
+but absent, the entry blocks with a `checks_absent` event / `CI never ran:`-prefixed reason —
+distinct from `checks_pending`/`checks_stale` — at all three surfaces that read CI status
+(`--plan`, `--dry-run`, and the real merge), so they can never disagree with each other
+again.
+
+### Mechanical merge conflicts auto-rebase (#241)
+
+When `coord merge` fails because the worker's branch is out of date on a rebaseable conflict,
+the coordinator dispatches a `type="conflict-fix"` worker that rebases, resolves obvious
+additive merges, runs tests, and `git push --force-with-lease`. On success the merge
+re-enqueues automatically; on failure the entry is marked `HUMAN_REQUIRED` and surfaced in
+the TUI. Semantic conflicts (same function modified two ways) are not attempted — the worker
+exits and posts a comment for manual resolution. `gh` is denied for `conflict-fix` workers;
+only the coordinator drives merge retries.
+
+### Why Test precedes Review (the #520 reversal)
+
+The pipeline order is `Work → Test → Review → Merge`: the smoke test runs *before* the
+PR/review (the natural order — smoke before PR). This reversed the #520-era "get the review
+over with first" workaround, which existed only because the Testing stage used to be painful;
+once the agent-assisted Testing stage became smooth, the workaround cost more than it saved
+(review cycles were being burned on untested code).
+
+It is enforced in two places that must stay in sync:
+
+1. The **displayed** stage order comes from `pipeline.default_gates = ["test","review","merge"]`
+   (`coord/config.py`). An old DB carrying the #520-era `["review","test","merge"]` is
+   migrated in `coord/db.py`.
+2. The **headless** auto-loop holds review dispatch until the work has a `passed`/`skipped`
+   test verdict whenever `default_gates` orders test before review —
+   `PipelineConfig.test_precedes_review()` drives `dispatch_pending_reviews`
+   (`coord/review.py`).
+
+The explicit `coord review` / `coord pr` paths stay ungated so a human can always force a
+review. The merge gate already required a test verdict (`requires_smoke`), so the human test
+touchpoint just moved earlier.
+
+### Interactive testing + merge agents (leg 3c / A3, #350/#581/#306/#606)
+
+From a Pipeline row's right-click menu, the TUI routes **board-driven** verdicts (never
+TTY-scraped, ToS §3.7) along `Work → Test → Review → Merge`:
+
+- **Start testing** = `coord assign --interactive --smoke-of <work_aid>` — a read-only testing
+  agent in the live checkout, recording its verdict via `coord test --passed|--fail`.
+- A `passed`/`skipped` test → **pass→review**, which launches the interactive review.
+- An approved review → **Start merge** = `--merge-of <work_aid>`, which worktrees and
+  proactively rebases onto the default branch (#306), resolves mechanical conflicts (semantic
+  ones with the operator), runs tests, `git push --force-with-lease`, then runs
+  `coord verify-merge` and — if clean — `coord merge` itself to complete it (#606).
+- A `failed` test **or** a request-changes review → one-key **`--fix-of`** on the same branch.
+  A test-fail takes the identical action as a request-changes; `--fix-of` accepts a review id
+  **or** a test-failed work id (the #581 front door).
+
+The merge agent is still gated on CI/review/smoke (a gate failure is reported, not forced) and
+`verify-merge` (#604) runs first.
+
+### The notifier tells you when NOBODY IS COMING — and nothing else (#1632)
+
+`coord/notifier/` pushes to a self-hosted ntfy on the daemon host (over Tailscale, so no event
+text leaves the tailnet) when the pipeline **has stopped or is stalled and will not advance
+without a human**: a halted drive, a gate parked `HUMAN_REQUIRED`, a worker's `STUCK:`, a
+stall that survived `drive`'s nudge (#1593), a leg running far past comparable work, a fleet
+CRIT that invalidates in-flight work.
+
+It is **not** an error channel and **not** a progress feed — a failed test, a request-changes
+review and a mechanical merge conflict are all things the auto-loop handles, and pushing them
+is what trains an operator to mute the channel. In normal operation this fires approximately
+never.
+
+"Far too long" is **learned, never a fixed timeout**: p90 of a `(repo, type, tier)`-stratified
+population built from the durations milestone #37 already records, with a cold-start state
+(<5 samples → a generous absolute ceiling, said out loud in the message) so it never fires off
+a population of one.
+
+Quiet hours (22:00–08:00 daemon-local, `notifications.quiet_hours`) are a **deferral window,
+not a filter** — events are held and delivered as one 08:00 digest, nothing is discarded, and
+**no severity pierces them**. The only exception is `coord drive --urgent`, which is a
+deadline rather than a severity and expires with the drive.
+
+The whole subsystem is **advisory and isolated** (#1485's lesson): `tick()` never raises,
+every collector source fails open, state lives in its own `~/.coord/notifier.json`, and an
+unreachable ntfy server cannot affect dispatch, routing, the board or any verdict. It rides
+#1616's daemon clock rather than shipping a second one, and reads `drive`'s stall decision
+rather than defining "stalled" again. Off by default. Full rationale:
+[`NOTIFIER.md`](NOTIFIER.md).
+
+### Recovery and freshness
+
+- **Failure reassignment.** Failed assignments can be retried on a different machine via
+  `coord retry`. With `concurrency.auto_reassign: true`, reconciliation auto-retries on a
+  different machine.
+- **Dependency freshness checks.** Before dispatching, `coord approve` checks whether upstream
+  repos are up-to-date on the target machine. Stale dependencies trigger warnings, or an
+  auto-pull with `--auto-pull`.
+
 ## File map
 
 | Path | What lives there |
