@@ -506,6 +506,17 @@ def _lane_versions_by_host(report) -> dict[str, list[str | None]]:
 @click.option("--drain-deadline", default=None, type=float,
               help="Seconds a host may fail to drain before the cordon "
                    "escalates loudly (default 5400).")
+@click.option("--cordon-max-deferrals", default=None, type=int,
+              help="#2240: consecutive DEFERRED runs that may hold a cordon "
+                   "for the same target before it is released outright "
+                   "(default 2). A cordon that has failed to produce a window "
+                   "twice running is not draining anything — it is blocking "
+                   "the review dispatch it is waiting for. 0 disables the "
+                   "bound and re-arms the deadlock.")
+@click.option("--cordon-cooldown", default=None, type=float,
+              help="Seconds after a #2240 release before cordoning may resume "
+                   "(default 1800). Without it the next run re-cordons — the "
+                   "hosts are still behind — and the deadlock re-arms.")
 @click.option("--json", "as_json", is_flag=True, help="Emit the propagation record as JSON.")
 def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions are elsewhere
     config_path: Path,
@@ -522,6 +533,8 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
     cordon_after: int | None,
     cordon_ttl: float | None,
     drain_deadline: float | None,
+    cordon_max_deferrals: int | None,
+    cordon_cooldown: float | None,
     as_json: bool,
 ) -> None:
     """One propagation attempt. Exit 0 on deferral, 1 on red, 2 on rollback.
@@ -559,6 +572,16 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
     run that defers without cordoning is a run that will defer again in 20
     minutes for exactly the same reason, which is how the fleet sat eleven
     releases behind for a day with elitebook idle and rollable throughout.
+
+    #2240: and a deferral is not passive either. The cordon it leaves behind
+    is what blocks the review dispatch that would let the between-legs entry
+    finish, and that unfinished entry is what defers the next run — four
+    cycles, 70 minutes, three idle machines. So the cordon now has a bound
+    that nothing else has to be running for: ``--cordon-max-deferrals``
+    consecutive deferrals for one target and every cordon is dropped, with
+    ``--cordon-cooldown`` seconds before any may be set again. The counter
+    lives in the propagation journal, because the process holding it is
+    restarted by the roll it gates.
     """
     import json as _json  # noqa: PLC0415
     import time  # noqa: PLC0415
@@ -686,6 +709,9 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
         ttl_seconds=cordon_ttl,
         drain_deadline=drain_deadline,
         dry_run=dry_run,
+        state_dir=state_dir,
+        max_deferrals=cordon_max_deferrals,
+        release_cooldown=cordon_cooldown,
     )
 
     if fully_busy and not force:
@@ -1042,7 +1068,7 @@ def _oldest_version(versions: list[str | None]) -> str | None:
     return min(readable, key=_key)
 
 
-def _apply_cordons(
+def _apply_cordons(  # noqa: PLR0912 — one linear apply-the-plan pass
     *,
     hosts: list[str],
     report,
@@ -1053,6 +1079,9 @@ def _apply_cordons(
     ttl_seconds: float | None,
     drain_deadline: float | None,
     dry_run: bool,
+    state_dir: Path | None = None,
+    max_deferrals: int | None = None,
+    release_cooldown: float | None = None,
 ) -> dict:
     """Plan and apply this run's cordons. Returns the journal fragment.
 
@@ -1060,16 +1089,27 @@ def _apply_cordons(
     error and the roll continues on its existing (quiescence-based) rules.
     Failing the whole propagation because the cordon could not be renewed
     would make #2101's fix strictly worse than not having it.
+
+    #2240: *state_dir* is where the propagation journal lives, and the journal
+    is where "how many runs in a row has this cordon now deferred?" is stored
+    — the process holding the answer in memory is restarted by the roll it is
+    gating, so an in-memory counter would reset exactly when the deadlock is
+    at its worst. An unreadable journal degrades to "no pressure" (the
+    pre-#2240 behaviour) rather than to a spurious release: dropping the
+    fleet's cordon because a file could not be read is the wrong direction to
+    fail in.
     """
     import time  # noqa: PLC0415
 
     from coord import release_cordon as rc  # noqa: PLC0415
+    from coord import release_propagate as rp  # noqa: PLC0415
     from coord.machine_pause import (  # noqa: PLC0415
         clear_cordon,
         cordons as read_cordons,
         set_cordon,
     )
 
+    now = time.time()
     outcome = rc.CordonOutcome()
     try:
         existing = read_cordons()
@@ -1077,11 +1117,21 @@ def _apply_cordons(
         outcome.errors.append(f"could not read the cordon store: {exc}")
         return outcome.to_dict()
 
+    pressure = rc.DeferralPressure()
+    if state_dir is not None:
+        try:
+            pressure = rc.deferral_pressure(
+                rp.read_records(state_dir), target_version=target_version
+            )
+        except Exception as exc:  # noqa: BLE001 — see docstring
+            outcome.errors.append(f"could not read the propagation journal: {exc}")
+    outcome.pressure = pressure.to_dict()
+
     plan = rc.plan_cordons(
         target_version=target_version,
         host_versions=_python_lane_versions(report, hosts, target_version),
         existing=existing,
-        now=time.time(),
+        now=now,
         ttl_seconds=(
             rc.DEFAULT_TTL_SECONDS if ttl_seconds is None else ttl_seconds
         ),
@@ -1095,9 +1145,25 @@ def _apply_cordons(
         ),
         busy_reasons=busy_reasons,
         enabled=enabled,
+        pressure=pressure,
+        max_deferrals=(
+            rc.DEFAULT_MAX_DEFERRALS if max_deferrals is None else max_deferrals
+        ),
+        release_cooldown=(
+            rc.DEFAULT_RELEASE_COOLDOWN_SECONDS
+            if release_cooldown is None
+            else release_cooldown
+        ),
     )
     for line in plan.render():
         click.echo(line)
+    outcome.cooling_seconds = plan.cooling_seconds
+    if plan.released is not None:
+        outcome.released = plan.released.to_dict()
+        # stderr as well as stdout: on the timer host this line IS the
+        # operator's only notice that the fleet just spent 40 minutes
+        # cordoned for nothing, and the timer's journal is stderr.
+        click.echo(f"warning: {plan.released.message}", err=True)
     if dry_run:
         # `--dry-run` promises to change nothing, cordon store included. The
         # plan above is still printed, so a dry run answers "and what would
@@ -1125,6 +1191,20 @@ def _apply_cordons(
         except Exception as exc:  # noqa: BLE001 — see docstring
             outcome.errors.append(f"uncordon {name}: {exc}")
             click.echo(f"  ✗ uncordon {name}: {exc}", err=True)
+
+    if plan.released is not None:
+        # #2240: stamped even when every clear_cordon() below fails or finds
+        # nothing — `released_at` is what resets the counter and starts the
+        # cooldown, and a release the journal does not record is a release
+        # that happens again on the very next tick, forever.
+        outcome.released_at = now
+        for name in plan.released.hosts:
+            try:
+                if clear_cordon(name):
+                    outcome.uncordoned.append(name)
+            except Exception as exc:  # noqa: BLE001 — see docstring
+                outcome.errors.append(f"release cordon {name}: {exc}")
+                click.echo(f"  ✗ release cordon {name}: {exc}", err=True)
 
     for escalation in plan.escalations:
         _escalate_drain(escalation)
@@ -1829,11 +1909,42 @@ def release_cordon(
             f"[{record.age(now) / 60.0:.0f}m draining, lapses in "
             f"{remaining:.0f}m, owner={record.owner}]{overdue}"
         )
+    # #2240: the same stall count `coord status` appends, on the surface an
+    # operator reaches for once they have noticed the fleet is quiet. The
+    # journal is a local file (the propagate timer's host); no journal → no
+    # line, never a fabricated one.
+    target = next(
+        (c.target_version for c in active.values() if c.target_version), None
+    )
+    try:
+        pressure = rc.deferral_pressure(
+            _read_propagation_records(), target_version=target
+        )
+    except Exception:  # noqa: BLE001 — a listing must not fail on the journal
+        pressure = rc.DeferralPressure()
+    if pressure.consecutive:
+        click.echo(
+            f"\n! {rc.describe_deferral_pressure(pressure)}: these cordons "
+            "have not produced a rollable window. A cordon that has failed "
+            "twice running is blocking the work it is waiting for (#2240) — "
+            f"`coord release propagate` releases it by itself after "
+            f"{rc.DEFAULT_MAX_DEFERRALS}."
+        )
     click.echo(
         f"\nclear one with `coord release cordon --clear <machine>` "
         f"(default lifetime {rc.DEFAULT_TTL_SECONDS / 60:.0f}m — a cordon "
         "nobody renews lapses on its own)"
     )
+
+
+def _read_propagation_records() -> list[dict]:
+    """The propagation journal, or ``[]`` when this host does not have one."""
+    from coord import release_propagate as rp  # noqa: PLC0415
+
+    try:
+        return rp.read_records(_state_dir())
+    except Exception:  # noqa: BLE001 — see every caller: never load-bearing
+        return []
 
 
 @release_group.command(

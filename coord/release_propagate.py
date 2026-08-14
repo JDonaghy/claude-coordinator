@@ -63,11 +63,19 @@ stay all-or-nothing — see below). A caller that wants to roll a
 partially-busy fleet uses :meth:`Quiescence.rollable_hosts` instead: a host
 with no busy signal against it is free to roll *now*, independent of
 whatever else is running elsewhere. A signal that cannot be pinned to one
-host (the board itself unreadable, a running drive-queue row with neither a
-``--machine`` pin nor a live assignment for its issue — see
+host (the board itself unreadable, or a running drive-queue row for which
+NOTHING names a machine — no ``--machine`` pin, no live assignment, and no
+assignment at all inside the board's retention window; see
 :func:`busy_host_for_entry`) is the one thing that still has to block
 everything — see :attr:`Quiescence.fleet_wide_busy` — because there is no
 way to tell "busy everywhere" apart from "busy on some host we can't name".
+
+#2240 narrowed that set once more. A row that is ``running`` between legs
+— previous assignment closed out, next one not dispatched yet — used to be
+unattributable and therefore fleet-blocking, and *that* is what deadlocked
+against a release cordon for 70 minutes: the cordon blocked the very review
+dispatch that would have ended the between-legs window. Such a row is now
+charged to the host that ran its last assignment.
 
 Per-host quiescence does not repeal the daemon-leads invariant below: if
 the daemon host itself is occupied (and not already on the target), no
@@ -642,9 +650,41 @@ def _live_assignment_hosts(assignments: Iterable[Mapping[str, Any]]) -> dict[str
     return hosts
 
 
+def _last_assignment_hosts(assignments: Iterable[Mapping[str, Any]]) -> dict[str, str]:
+    """``repo#issue`` → the machine that ran its MOST RECENT assignment (#2240).
+
+    Any status, terminal included — this is deliberately the "last known
+    host" lookup, used only when :func:`_live_assignment_hosts` has nothing
+    because the entry is between legs. ``/board`` publishes terminal
+    assignment rows within its retention window
+    (``coord.dao.board_projection``'s ``_capped_assignments``), so the
+    previous leg of a drive that finished minutes ago is right there; what is
+    NOT there is a drive whose every leg fell out of retention, and such an
+    entry keeps the old unattributable reading.
+
+    Ordered by ``dispatched_at``, with rows that carry no timestamp treated
+    as oldest — a row we cannot place in time must never displace one we can.
+    """
+    best: dict[str, tuple[float, str]] = {}
+    for row in assignments:
+        machine = str(row.get("machine_name") or row.get("machine") or "") or None
+        if not machine:
+            continue
+        try:
+            when = float(row.get("dispatched_at") or 0.0)
+        except (TypeError, ValueError):
+            when = 0.0
+        key = _queue_key(row)
+        previous = best.get(key)
+        if previous is None or when >= previous[0]:
+            best[key] = (when, machine)
+    return {key: machine for key, (_, machine) in best.items()}
+
+
 def busy_host_for_entry(
     entry: Mapping[str, Any],
     live_assignment_hosts: Mapping[str, str] | None = None,
+    last_assignment_hosts: Mapping[str, str] | None = None,
 ) -> str | None:
     """Which host a ``running`` drive-queue row actually occupies (#2101, #2138).
 
@@ -687,18 +727,40 @@ def busy_host_for_entry(
     not destroy, and #2101's cordon already keeps new drives off it while it
     waits to roll.
 
-    A ``running`` row with no live assignment for its issue — between legs,
-    where the previous leg's assignment has closed out and the next has not
-    landed yet — has no host this function can name. That is deliberately
-    NOT read as "free": the real worker is momentarily unknowable, not
-    provably elsewhere, so it must block every host exactly like a row with
-    neither field recorded — see :attr:`Quiescence.fleet_wide_busy`.
+    #2138 left one gap and named it: a ``running`` row with no live
+    assignment for its issue — between legs, where the previous leg's
+    assignment has closed out and the next has not landed yet — had no host
+    this function could name, and an unattributable signal blocks every host
+    (:attr:`Quiescence.fleet_wide_busy`). That was priced as a bounded cost:
+    some rolls defer. #2240 measured the real cost. The cordon a deferral
+    leaves standing is what stops the next leg (a review) from ever being
+    dispatched, so the "between legs" window — normally seconds — becomes
+    permanent, and the whole fleet sits idle behind it.
+
+    So the between-legs case now falls back to the host that ran the entry's
+    **last** assignment (*last_assignment_hosts*, any status). That is the
+    narrow version of #2138's own fix, extended to the gap it left open: the
+    previous leg's row names a machine, the next leg is overwhelmingly likely
+    to land on the same one, and being wrong costs one host held that need
+    not have been — versus the entire fleet held, which is what "unnameable"
+    costs. #2240's fixes 1 and 2 are what actually break the deadlock; this
+    one shrinks its blast radius from fleet-wide to one host.
+
+    ``None`` is still returned when NOTHING names a host — no ``machine``
+    pin, no live assignment and no assignment in the board's retention
+    window at all. That genuinely is "busy somewhere unknown", and it still
+    fails toward blocking everything.
     """
     machine = str(entry.get("machine") or "") or None
     if machine:
         return machine
+    key = _queue_key(entry)
     if live_assignment_hosts:
-        return live_assignment_hosts.get(_queue_key(entry))
+        host = live_assignment_hosts.get(key)
+        if host:
+            return host
+    if last_assignment_hosts:
+        return last_assignment_hosts.get(key)
     return None
 
 
@@ -752,6 +814,7 @@ def assess_quiescence(
     issues = list(issues)
     board = build_board_view({"assignments": assignments, "issues": issues})
     live_assignment_hosts = _live_assignment_hosts(assignments)
+    last_assignment_hosts = _last_assignment_hosts(assignments)
 
     busy: list[Busy] = []
     fired: list[str] = []
@@ -767,12 +830,29 @@ def assess_quiescence(
                 # says. Not busy — and not silently dropped either.
                 stale.append(key)
             else:
-                host = busy_host_for_entry(entry, live_assignment_hosts)
+                host = busy_host_for_entry(
+                    entry, live_assignment_hosts, last_assignment_hosts
+                )
+                # #2240: say WHICH reading named the host. "between legs,
+                # attributed to its last known host" is the difference
+                # between a signal holding one machine and one holding the
+                # fleet, and a deferral nobody can take apart is a deferral
+                # nobody can act on.
+                detail = "restarting agents now would kill it mid-flight"
+                if (
+                    host
+                    and not entry.get("machine")
+                    and key not in live_assignment_hosts
+                ):
+                    detail += (
+                        "; between legs — attributed to its last known host "
+                        "(#2240)"
+                    )
                 busy.append(
                     Busy(
                         kind="drive-queue entry running",
                         subject=key,
-                        detail="restarting agents now would kill it mid-flight",
+                        detail=detail,
                         host=host,
                     )
                 )
@@ -1170,6 +1250,19 @@ def render_record(record: PropagationRecord | Mapping[str, Any]) -> list[str]:
     if cordons.get("expired"):
         lines.append(
             "    cordons that lapsed on their own: " + ", ".join(cordons["expired"])
+        )
+    # #2240: the deadlock break is the single most important thing a history
+    # read can show — it means the fleet had been unable to work, not that it
+    # was upgrading. Never collapsed into the "N no-op attempts" summary,
+    # because `render_history` only collapses records it renders as a run and
+    # this line belongs to one it prints in full.
+    released = cordons.get("released")
+    if released:
+        lines.append(f"    ! {released.get('message') or released}")
+    if cordons.get("cooling_seconds"):
+        lines.append(
+            "    cordons held off (post-release cooldown, #2240): "
+            f"{float(cordons['cooling_seconds']) / 60.0:.0f}m left"
         )
     for esc in cordons.get("escalated") or []:
         lines.append(f"    ! {esc.get('message') or esc}")

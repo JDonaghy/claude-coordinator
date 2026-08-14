@@ -76,6 +76,26 @@ else:
   for a cordon to lapse; the live loop renews on every run while the host is
   still behind (#2101 trap B).
 
+#2240: A CORDON MEANS "NO NEW WORK", AND A FOLLOW-ON LEG IS NOT NEW WORK.
+Folding cordons into the one `paused_set()` is what made #2101 buildable, but
+it also gave a cordon a reach a *drain* must not have.  Observed 2026-08-14:
+the fleet cordoned to drain for v0.5.77; an entry that had finished Work and
+Test needed its REVIEW dispatched; `pick_reviewer_machine` filtered every
+cordoned host out of `paused_set()` and returned "no eligible reviewer
+machine configured"; the entry therefore stayed `running` forever; a
+perpetually-running entry defers the roll; a deferred roll leaves the cordon
+up.  Four cycles, 70 minutes, three idle machines, no exit without a human.
+
+The cordon was blocking the completion of the very work it was waiting to
+drain.  So `paused_set(..., include_cordons=False)` — reached through
+`follow_on_paused_set()` — is the set a dispatch consults when it is
+finishing work already in flight rather than starting new work.  It still
+honours explicit `coord pause` and quiet hours: those are an operator's or a
+policy's decision about a machine and mean what they say.  A cordon is this
+fleet's own drain asking a host to go idle, and refusing to dispatch the leg
+that would make it idle is self-defeating (a `--merge-of`/review dispatch
+onto a cordoned host is what the drain WANTS — it is what ends the work).
+
 #2146: OPERATOR-SET quiet hours.  #1862's window can only be declared in
 `coordinator.yml`, which on a thin client is a read-only cache that is
 re-fetched and overwritten on essentially every command, and on the daemon
@@ -142,7 +162,10 @@ def _state_path() -> Path:
 
 
 def paused_set(
-    machines: Sequence["Machine"] | None = None, *, now: datetime | None = None,
+    machines: Sequence["Machine"] | None = None,
+    *,
+    now: datetime | None = None,
+    include_cordons: bool = True,
 ) -> set[str]:
     """Read the current set of paused machine names (#1563: daemon-aware).
 
@@ -160,16 +183,54 @@ def paused_set(
     call site) to fold quiet hours into the LOCAL computation — the daemon's
     own in-process tick-loop calls (no board service configured for
     itself), and any solo/local use with no daemon at all.
+
+    *include_cordons* (#2240) is False only for a dispatch that FINISHES work
+    already in flight — see `follow_on_paused_set()`, which is the name every
+    caller should use, and the module docstring for the 70-minute fleet-wide
+    deadlock that made this necessary. It never widens the set: explicit
+    pauses and quiet hours are untouched, and a cordon read that fails is
+    left IN (a cordon we could not resolve stays a pause, the same direction
+    every other read here fails in).
     """
     svc = _resolve_service()
     if svc is not None:
         from coord.client import fetch_paused_machines  # noqa: PLC0415
 
         try:
-            return fetch_paused_machines(svc)
+            names = fetch_paused_machines(svc)
         except Exception:  # noqa: BLE001 — fail-soft read, see module docstring
             return set()
-    return local_paused_set(machines, now=now)
+        if include_cordons:
+            return names
+        # The daemon publishes ONE union (`local_paused_set`), so the cordon
+        # half has to be subtracted here from its own endpoint — a second
+        # round trip, paid only on the follow-on path, rather than a second
+        # union the daemon would have to learn to publish.
+        try:
+            return names - set(cordons())
+        except Exception:  # noqa: BLE001 — see docstring: cordons stay paused
+            return names
+    return local_paused_set(machines, now=now, include_cordons=include_cordons)
+
+
+def follow_on_paused_set(
+    machines: Sequence["Machine"] | None = None, *, now: datetime | None = None,
+) -> set[str]:
+    """The pause set for a dispatch that COMPLETES in-flight work (#2240).
+
+    `paused_set()` minus release cordons. Use this — and only this — for a
+    review / smoke / fix leg of an assignment that is already running: a
+    cordon means "route no NEW work here", and the tail of the work the
+    cordon is explicitly waiting to drain is not new work. Blocking it is
+    self-defeating in the precise way #2240 observed, because the entry can
+    then never finish, so the host never drains, so the cordon never lifts,
+    so the roll defers and re-cordons.
+
+    Everything else still applies: an explicit `coord pause` and a quiet-hours
+    window both mean "this machine is unavailable, full stop", and neither is
+    this fleet's own drain talking to itself.
+    """
+    return paused_set(machines, now=now, include_cordons=False)
 
 
 def is_paused(
@@ -259,7 +320,10 @@ def _resolve_service():  # -> coord.client.ServiceConfig | None
 
 
 def local_paused_set(
-    machines: Sequence["Machine"] | None = None, *, now: datetime | None = None,
+    machines: Sequence["Machine"] | None = None,
+    *,
+    now: datetime | None = None,
+    include_cordons: bool = True,
 ) -> set[str]:
     """The local, effective paused-machine set: explicit pauses UNION any
     machine currently inside its quiet-hours window (#1862) UNION any machine
@@ -279,8 +343,16 @@ def local_paused_set(
     the daemon's `/pause` endpoint handler calls (passing `config.machines`
     so quiet hours apply), and what `paused_set()` itself falls through to
     when no board service is configured.
+
+    *include_cordons* (#2240) drops the cordon half for a dispatch that
+    finishes work already in flight — see `follow_on_paused_set()`. The
+    daemon's own `/pause` handler must never pass it: what that endpoint
+    publishes is the full routing set, and the subtraction is the caller's
+    decision to make, per dispatch.
     """
-    effective = _explicit_paused_set() | cordoned_names(now=_epoch(now))
+    effective = _explicit_paused_set()
+    if include_cordons:
+        effective |= cordoned_names(now=_epoch(now))
     if not machines:
         return effective
     return effective | _quiet_covered_names(machines, now=now)

@@ -185,6 +185,11 @@ coord release propagate --dry-run          # window verdict + roll plan, changes
 coord release propagate --target v0.4.111  # pin the version instead of asking PyPI
 coord release propagate --lane units       # one lane only
 coord release propagate --force            # roll over a BUSY fleet — KILLS live workers
+coord release propagate --cordon-max-deferrals N   # #2240: consecutive deferrals a
+                                           # cordon may hold before it self-releases
+                                           # (default 2; 0 re-arms the deadlock)
+coord release propagate --cordon-cooldown S # #2240: seconds cordoning stays off after
+                                           # a self-release (default 1800)
 coord release rollback --yes               # one command: every agent back one generation
 ```
 
@@ -928,6 +933,51 @@ either workaround:
 
 `--force` is back to meaning only what it always meant — kill in-flight
 workers — and should not be needed for this sequence anymore.
+
+**#2240 (fixed 2026-08-14): the cordon deadlocked against the review it was
+waiting for.** The same family, one layer up, and the first one that took the
+*whole fleet* down: on 2026-08-14 the fleet was cordoned and unable to
+dispatch for 70 minutes with all three machines reading `online • idle`.
+
+1. `propagate` cordons all three hosts to drain them for v0.5.77;
+2. a cordoned host cannot accept new dispatch — **including a review**;
+3. an entry that had finished Work and Test was waiting for its review;
+   `coord review <aid>` answered `no eligible reviewer machine configured`;
+4. so its queue row stayed `running` with no live assignment (between legs),
+   which nothing could attribute to a host;
+5. an unattributable busy signal blocks every host, so the roll deferred;
+6. **a deferred run leaves the cordon in place** → back to (2).
+
+Four consecutive runs, 21 minutes apart, each cordoning all three hosts and
+uncordoning none. The `--ttl` safety net could not fire: the propagate timer
+renews every 20 minutes, which is shorter than any sane TTL. The only exit
+was `coord release cordon --clear --all` by hand, after which the identical
+`coord review` dispatched immediately.
+
+Three fixes, and the first is the one that guarantees no unattended repeat:
+
+* **a deferred roll no longer holds a cordon indefinitely.** After
+  `--cordon-max-deferrals` consecutive deferrals for one target (default 2,
+  i.e. ~40 minutes) `propagate` clears every cordon it set, says so loudly
+  (`CORDON RELEASED (#2240): ...`), and does not cordon again for
+  `--cordon-cooldown` seconds (default 1800) so the fleet gets a real window
+  to finish the work the drain is waiting for. The counter lives in
+  `~/.coord/release_propagation.jsonl`, because the process holding it is
+  restarted by the very roll it gates.
+* **a cordon no longer blocks the completion of work already in flight.** A
+  review/smoke/fix dispatch for a running entry is the *tail* of the work the
+  cordon is waiting to drain, not new work, so it routes onto a cordoned host
+  (`machine_pause.follow_on_paused_set()`). An explicit `coord pause` and a
+  quiet-hours window still block it — those are decisions about the machine.
+* **a between-legs row is charged to its last known host**, so it holds one
+  host instead of the fleet.
+
+**What this looks like now:** `coord status` and `coord release cordon`
+append `(deferred N runs — NOT DRAINING)` to a cordon that has stopped
+producing windows, so a 70-minute stall no longer renders identically to a
+30-second drain. If you see it, you do not need to do anything — the next
+`propagate` releases it — but it is the signal that something downstream is
+wedged, and the propagation journal names the entry.
 
 A queued entry carrying `--hold-after` (#1757) also creates the gap by design:
 the gate's dependents stop themselves (the whole queue too, if the entry was
