@@ -958,8 +958,16 @@ def _dispatch_fix(
     machine = next(
         (m for m in config.machines if m.name == work.machine_name), None
     )
-    from coord.machine_pause import paused_set
-    paused = paused_set(config.machines)
+    # #2240: the pause set here is `follow_on_paused_set()`, NOT `paused_set()`
+    # — a fix leg is the tail of work that is already running (dispatched
+    # after a `request-changes` review verdict on a row that has not gone
+    # anywhere new), so a release cordon ("route no NEW work here") must not
+    # filter its host out. This is the same fix as `coord/review.py`'s
+    # reviewer-selection change; leaving this call on `paused_set()` would
+    # reproduce the fleet-wide deadlock for the fix leg instead of the
+    # review leg. Explicit pauses and quiet hours still apply.
+    from coord.machine_pause import follow_on_paused_set
+    paused = follow_on_paused_set(config.machines)
     if (
         machine is None
         or not machine.can_work_on(work.repo_name)

@@ -1127,6 +1127,16 @@ def _apply_cordons(  # noqa: PLR0912 — one linear apply-the-plan pass
             outcome.errors.append(f"could not read the propagation journal: {exc}")
     outcome.pressure = pressure.to_dict()
 
+    # #2240 review: resolved once and journaled on every run (not just a
+    # releasing one) via `outcome.max_deferrals`, so `deferral_pressure()`
+    # can read the operator's actual `--cordon-max-deferrals` back out of
+    # the newest record instead of `describe_deferral_pressure()` callers
+    # silently assuming `DEFAULT_MAX_DEFERRALS`.
+    resolved_max_deferrals = (
+        rc.DEFAULT_MAX_DEFERRALS if max_deferrals is None else max_deferrals
+    )
+    outcome.max_deferrals = resolved_max_deferrals
+
     plan = rc.plan_cordons(
         target_version=target_version,
         host_versions=_python_lane_versions(report, hosts, target_version),
@@ -1146,9 +1156,7 @@ def _apply_cordons(  # noqa: PLR0912 — one linear apply-the-plan pass
         busy_reasons=busy_reasons,
         enabled=enabled,
         pressure=pressure,
-        max_deferrals=(
-            rc.DEFAULT_MAX_DEFERRALS if max_deferrals is None else max_deferrals
-        ),
+        max_deferrals=resolved_max_deferrals,
         release_cooldown=(
             rc.DEFAULT_RELEASE_COOLDOWN_SECONDS
             if release_cooldown is None
