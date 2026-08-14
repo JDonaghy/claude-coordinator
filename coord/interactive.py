@@ -90,7 +90,7 @@ from typing import TYPE_CHECKING, Sequence
 if TYPE_CHECKING:
     from coord.agent import MergeVerify
     from coord.config import Config
-    from coord.models import Board
+    from coord.models import Board, Machine
 
 from coord.providers.claude_pty import (
     BRACKETED_PASTE_ENABLE,
@@ -118,6 +118,7 @@ __all__ = [
     "tmux_session_alive",
     "tmux_pane_dead",
     "list_coord_tmux_sessions",
+    "gather_fleet_tmux_sessions",
     "TMUX_ATTACH_WARNING",
     "PTY_RELAY_NO_DETACH_WARNING",
 ]
@@ -467,6 +468,76 @@ def list_coord_tmux_sessions(
         ]
     except (subprocess.SubprocessError, OSError):
         return []
+
+
+def gather_fleet_tmux_sessions(
+    config: "Config",
+    *,
+    max_workers: int = 8,
+) -> tuple[list[dict], list[str]]:
+    """Enumerate live ``coord-*`` tmux sessions across every machine in *config*.
+
+    Mirrors the local+remote discovery ``coord sessions --remote`` renders
+    (#2228): local sessions via a plain :func:`list_coord_tmux_sessions`
+    call, remote sessions via one SSH probe per non-local configured
+    machine, run in parallel — bounded by :func:`list_coord_tmux_sessions`'s
+    own 5s per-host subprocess timeout so one unreachable host cannot stall
+    the caller.
+
+    Returns ``(sessions, probe_errors)``:
+
+    * ``sessions`` — one dict per tmux session found (dead or alive; the
+      caller filters), each carrying ``session_name``/``pane_dead``/
+      ``attached`` (see :func:`list_coord_tmux_sessions`) plus ``machine``
+      — the ``coordinator.yml`` machine name the session was found on. A
+      local session whose host has no ``coordinator.yml`` entry gets
+      ``machine=None``: there is no name to pin it to, and no configured
+      host it could block either.
+    * ``probe_errors`` — machine names whose remote probe *raised* (as
+      opposed to returning "no sessions", which is what an unreachable
+      host or a dead tmux server already look like —
+      :func:`list_coord_tmux_sessions` collapses both into ``[]`` with no
+      way to tell them apart). Callers must treat this the same as an
+      empty result for that host — never as a reason to defer everything
+      — but should still log it: an unreadable session list failing open
+      and failing *silently* are two different things (#2228).
+    """
+    import concurrent.futures as _cf  # noqa: PLC0415
+
+    local_hn = _get_local_short_hostname()
+
+    def _is_local(machine: "Machine") -> bool:
+        return (
+            machine.name.lower() == local_hn
+            or machine.host.split(".")[0].lower() == local_hn
+        )
+
+    local_machine = next((m.name for m in config.machines if _is_local(m)), None)
+
+    sessions: list[dict] = [
+        {**s, "machine": local_machine} for s in list_coord_tmux_sessions()
+    ]
+
+    remotes = [m for m in config.machines if not _is_local(m)]
+    errors: list[str] = []
+    if remotes:
+        def _probe(machine: "Machine") -> tuple[str, list[dict], BaseException | None]:
+            try:
+                found = list_coord_tmux_sessions(
+                    host=TmuxHost(ssh_target=machine.host, batch=True)
+                )
+                return machine.name, found, None
+            except Exception as exc:  # noqa: BLE001 — reported via probe_errors
+                return machine.name, [], exc
+
+        with _cf.ThreadPoolExecutor(max_workers=min(max_workers, len(remotes))) as ex:
+            for mname, found, err in ex.map(_probe, remotes):
+                if err is not None:
+                    errors.append(mname)
+                    continue
+                sessions.extend({**s, "machine": mname} for s in found)
+
+    return sessions, errors
 
 
 def _inject_briefing_into_tmux_session(
