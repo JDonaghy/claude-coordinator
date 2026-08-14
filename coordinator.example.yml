@@ -61,6 +61,23 @@ repos:
     # machine's repo_paths checkout needs a `quadraui` sibling directory —
     # true for every machine below (repo_paths list quadraui alongside it).
     test_command: "scripts/coord-test-runner.sh . --base-ref origin/main --repo code-coordinator"
+    # #2091: `ci_command` is the command THIS REPO'S CI actually runs. The
+    # Test stage prefers it over `test_command` (and over
+    # `smoke_tests.default_command`), so a green Test verdict means the same
+    # thing a green CI run does.
+    #
+    # Set it whenever CI runs a WIDER suite than `test_command` — that gap is
+    # a silent false green: coord-portal #14 recorded `test_passed` in 1m51s
+    # on a commit whose CI `npm run test:e2e` failed deterministically after
+    # 44m57s (36 mobile Playwright tests, every click ~70px off target). The
+    # Test verdict gates review and merge, so a gate running a strict subset
+    # of CI means "some tests passed", not "the branch is good".
+    #
+    # Leave it unset when `test_command` IS what CI runs — as here, where
+    # .github/workflows points at the same coord-test-runner.sh arms.
+    # `dispatch_smoke` logs a warning for any repo with a `github:` slug and
+    # no `ci_command`, naming the verdict as narrower than CI.
+    # ci_command: "npm run test:e2e"
     # artifact_paths: []  # no compiled binaries to stash for a Python package
 
 machines:

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import click
@@ -470,7 +471,69 @@ def review(assignment_id: str, config_path: Path) -> None:
         click.echo(f"  pr: {assignment.pr_url}")
 
 
-def _ci_failure_story(cfg: Config, assignment) -> str | None:
+@dataclass(frozen=True)
+class CiRead:
+    """#2091: the outcome of the live-CI read, with "did not read" separated
+    from "read it, it was green".
+
+    Before #2091 this path collapsed both into a bare ``None``, and the
+    refusal message told the operator only that no red CI was found.  In
+    coord-portal #14 the PR *was* red (``gh pr checks 42`` said so) — the
+    read had simply never happened, and the operator was left to guess which
+    of six silent short-circuits fired.  ``unread_reason`` names it.
+
+    Invariants:
+
+    * ``story`` set                          → CI was read and is RED.
+    * ``story is None`` and no ``unread_reason``  → CI was read, nothing red.
+    * ``unread_reason`` set                  → **no read happened**; this is
+      not evidence of green, and callers must say so out loud.
+    """
+
+    story: str | None = None
+    unread_reason: str | None = None
+    pr_number: int | None = None
+
+    @property
+    def is_red(self) -> bool:
+        return self.story is not None
+
+    @property
+    def was_read(self) -> bool:
+        return self.unread_reason is None
+
+
+def _resolve_pr_number(repo_github: str, assignment) -> int | None:
+    """PR number for *assignment*, from its ``pr_url`` or (#2091) its branch.
+
+    The stored ``pr_url`` is missing on any row whose PR was opened out of
+    band, or that predates PR creation — and that alone used to silently
+    disable the whole live-CI fallback.  Fall back to asking GitHub which PR
+    has this branch as its head, which is the same question ``gh pr checks``
+    answers from a checkout.
+    """
+    from coord.drive import _extract_pr_number
+
+    pr_number = _extract_pr_number(getattr(assignment, "pr_url", None) or "")
+    if pr_number is not None:
+        return pr_number
+
+    branch = getattr(assignment, "branch", None)
+    if not branch:
+        return None
+    try:
+        from coord import github_ops  # noqa: PLC0415
+
+        pr = github_ops.find_pr_for_branch(repo_github, branch)
+    except Exception:  # noqa: BLE001 — advisory lookup, never fatal
+        return None
+    if not isinstance(pr, dict):
+        return None
+    number = pr.get("number")
+    return number if isinstance(number, int) else None
+
+
+def _read_ci(cfg: Config, assignment) -> CiRead:
     """#1622 (part 3): a rendered summary of *assignment*'s FAILED CI checks.
 
     The third legitimate fix trigger, alongside a request-changes review and a
@@ -479,37 +542,70 @@ def _ci_failure_story(cfg: Config, assignment) -> str | None:
     checkout — and the fix has to land on the *existing* branch, because the
     thing being fixed is what gates the merge.
 
-    Read-only and fail-quiet: returns ``None`` when CI is not configured
-    (``ci_store.type: none`` ⇒ :class:`coord.ci_store.NoOpCi`, whose
-    ``is_available`` is False), when the branch has no PR to read checks for,
-    when the read raises, or when every completed check is affirmatively
-    passing.  ``None`` therefore means "no CI evidence of a failure", never
-    "CI is green" — the caller must not treat it as a verdict.
+    Read-only and fail-quiet, but no longer fail-*silent* (#2091): every path
+    that declines to read returns a :class:`CiRead` carrying the reason, so
+    the caller can distinguish "CI is green" from "nobody looked".
     """
     from coord.ci_store import build_ci_store, failed_checks, summarize
-    from coord.drive import _extract_pr_number
 
     repo = cfg.repo(assignment.repo_name)
-    if repo is None or not repo.github:
-        return None
+    if repo is None:
+        return CiRead(unread_reason=f"repo {assignment.repo_name!r} is not in coordinator.yml")
+    if not repo.github:
+        return CiRead(
+            unread_reason=f"repo {repo.name!r} has no `github:` slug configured"
+        )
 
-    pr_number = _extract_pr_number(assignment.pr_url or "")
-    if pr_number is None:
-        return None
-
+    # Availability first (#2091): `_resolve_pr_number`'s branch fallback can
+    # shell out to `gh`, and there is no point paying for that when the store
+    # will refuse to read anything anyway.
     store = build_ci_store(cfg.ci_store.type)
     if not store.is_available:
-        return None
+        return CiRead(
+            unread_reason=(
+                f"ci_store.type is {cfg.ci_store.type!r}, so live CI is never "
+                "read — set it to 'github' in coordinator.yml"
+            ),
+        )
+
+    pr_number = _resolve_pr_number(repo.github, assignment)
+    if pr_number is None:
+        return CiRead(
+            unread_reason=(
+                "no PR could be resolved for this row (its `pr_url` is empty "
+                f"and no open PR has head branch {getattr(assignment, 'branch', None)!r})"
+            )
+        )
 
     try:
         checks = store.list_checks_for_pr(repo.github, pr_number)
     except Exception as exc:  # noqa: BLE001 — CI read is advisory, never fatal
         click.echo(f"warning: could not read CI checks for PR #{pr_number}: {exc}", err=True)
-        return None
+        return CiRead(
+            pr_number=pr_number,
+            unread_reason=f"the CI read for PR #{pr_number} raised: {exc}",
+        )
+
+    if not checks:
+        return CiRead(
+            pr_number=pr_number,
+            unread_reason=f"PR #{pr_number} reported no checks at all",
+        )
 
     failed = failed_checks(checks)
     if not failed:
-        return None
+        # A genuine read that found nothing red. Note this still includes the
+        # case where every check is *pending* — `failed_checks` only considers
+        # completed ones — so say which, rather than implying a settled green.
+        if not any(c.status == "completed" for c in checks):
+            return CiRead(
+                pr_number=pr_number,
+                unread_reason=(
+                    f"every check on PR #{pr_number} is still running "
+                    f"({summarize(checks)}) — no completed verdict yet"
+                ),
+            )
+        return CiRead(pr_number=pr_number)
 
     lines = [
         f"CI on PR #{pr_number} is RED ({summarize(checks)}).",
@@ -525,7 +621,7 @@ def _ci_failure_story(cfg: Config, assignment) -> str | None:
         "reproduce locally where you can, and fix the root cause on THIS "
         "branch — a new branch would not carry the change CI is gating on.",
     ]
-    return "\n".join(lines)
+    return CiRead(story="\n".join(lines), pr_number=pr_number)
 
 
 def _fix_from_review(
@@ -695,8 +791,10 @@ def _fix_from_review(
         "work that ran under claude-pty, or (#2051) dispatch a WORK-row fix "
         "when neither the test verdict nor a live CI read shows a failure — "
         "for when the caller knows the PR is red but the check missed it "
-        "(ci_store not configured, a transient read error). Does NOT override "
-        "max_review_iterations or the #522 terminal-work guard."
+        "(ci_store not configured, a transient read error). Since #2091 the "
+        "refusal names which of those it was, so check the `note:` line "
+        "before reaching for this. Does NOT override max_review_iterations "
+        "or the #522 terminal-work guard."
     ),
 )
 def fix(assignment_id: str, config_path: Path, guidance: str, force: bool) -> None:
@@ -729,17 +827,37 @@ def fix(assignment_id: str, config_path: Path, guidance: str, force: bool) -> No
     # #1622 (part 3): red CI is the third trigger.  Only consulted when the
     # local test gate has NOT already failed, so the cheap in-DB path stays
     # zero-I/O and the existing failure story keeps priority.
-    ci_story = None if test_failed else _ci_failure_story(cfg, assignment)
+    ci_read = CiRead() if test_failed else _read_ci(cfg, assignment)
+    ci_story = ci_read.story
+
+    # #2091: the stored Test verdict says PASSED while the branch's live CI
+    # says RED — the coord-portal #14 shape.  Both are "the tests", and they
+    # disagree; that is a fact about the Test gate (it ran a narrower suite
+    # than CI), not a detail of this dispatch, so name it rather than
+    # quietly preferring one.
+    if ci_read.is_red and (
+        assignment.test_state == "passed" or assignment.smoke_test == "pass"
+    ):
+        stored_verdict = assignment.test_state or assignment.smoke_test
+        click.echo(
+            f"conflict (#2091): assignment {assignment_id} has a stored Test "
+            f"verdict of {stored_verdict!r} "
+            f"but CI on PR #{ci_read.pr_number} is RED on the same branch. "
+            "The Test stage ran a narrower suite than CI — set "
+            f"repos[{assignment.repo_name}].ci_command to what CI runs so "
+            "the gate stops reporting green on a red branch.",
+            err=True,
+        )
 
     # #2051: none of the three doors (failed test verdict, red CI, or the
-    # review-id door handled above) is open.  `_ci_failure_story` is
-    # read-only and fail-quiet (see its docstring) — it returns `None` for
-    # "no evidence of a failure", never "CI is green" — so a caller who
-    # KNOWS the PR is red (ci_store not configured for this repo, a
-    # transient GitHub API error, a check that hasn't reported yet) would
-    # otherwise be stranded with no headless door onto the ORIGINAL branch.
-    # `--force` is that caller's release valve; it is NOT a way to skip the
-    # #555 / #522 / max_review_iterations guards, which sit elsewhere.
+    # review-id door handled above) is open.  `_read_ci` is read-only and
+    # fail-quiet (see :class:`CiRead`) — a missing story means "no CI
+    # evidence of a failure", never "CI is green" — so a caller who KNOWS
+    # the PR is red (ci_store not configured for this repo, a transient
+    # GitHub API error, a check that hasn't reported yet) would otherwise be
+    # stranded with no headless door onto the ORIGINAL branch.  `--force` is
+    # that caller's release valve; it is NOT a way to skip the #555 / #522 /
+    # max_review_iterations guards, which sit elsewhere.
     forced_without_evidence = False
     if not test_failed and ci_story is None:
         if not force:
@@ -752,6 +870,23 @@ def fix(assignment_id: str, config_path: Path, guidance: str, force: bool) -> No
                 "with --force.",
                 err=True,
             )
+            # #2091: say WHY there is no CI evidence.  Before this, six
+            # distinct short-circuits (unconfigured ci_store, a row with no
+            # pr_url, an unknown repo, ...) were all indistinguishable from
+            # "CI is green", so an operator staring at a red `gh pr checks`
+            # had no way to tell that the documented fallback never ran.
+            if not ci_read.was_read:
+                click.echo(
+                    "  note: live CI was NOT read for this row, so this is "
+                    f"not a green-CI finding — {ci_read.unread_reason}.",
+                    err=True,
+                )
+            elif ci_read.pr_number is not None:
+                click.echo(
+                    f"  note: live CI on PR #{ci_read.pr_number} was read and "
+                    "reported no failing completed check.",
+                    err=True,
+                )
             sys.exit(1)
         if not guidance:
             # There's no failed verdict, CI read, or test-output file to

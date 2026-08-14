@@ -61,6 +61,7 @@ Every issue moves through four gated stages:
 
 Two rules shape the flow:
 
+- **A green Test verdict is only worth the suite behind it.** The Test stage runs `repos[].ci_command` when set, else `smoke_tests.default_command`, else `repos[].test_command`. If CI runs a *wider* suite than the gate does, "Test passed" means "some tests passed", not "the branch is good" — declare `ci_command` so the two agree (#2091). `dispatch_smoke` logs a warning for any GitHub-backed repo that hasn't.
 - **Test precedes Review.** The smoke test runs *before* the PR/review — the natural order. Review auto-dispatch is **held** until the work has a `passed`/`skipped` Test verdict. A work item left at *Pending Test* gets no review, so it never merges — this is the single most common reason a story silently stalls. Record the verdict with `coord test <id> --passed|--skipped|--fail`, or the **P / S / F** keys on the Test stage in the TUI. The displayed stage order and this gate both come from `pipeline.default_gates` in `coordinator.yml` (default `[test, review, merge]`).
 - **A failed test routes exactly like a request-changes review.** Both drop the issue back to a fix on the *same* branch (`coord fix`, or the interactive `--fix-of`), never an orphan.
 
@@ -387,6 +388,7 @@ repos:
     develop_branch: develop      # opt in to the milestone feature-branch model (see Milestones)
     build_command: "npm run build"
     test_command: "npm test"
+    ci_command: "npm run test:e2e" # what CI actually runs — the Test gate prefers this (#2091)
     artifact_paths:              # stash built binaries so `coord pull-artifact` can rsync them
       - dist/
 

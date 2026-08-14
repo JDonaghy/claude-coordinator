@@ -656,7 +656,20 @@ def revalidate(
             ok=False, kind=KIND_SETUP,
             reason=f"no repo config for {repo_name!r}",
         )
-    test_command = repo_cfg.test_command
+    # #2091: revalidation WRITES a test verdict, so it is bound by the same
+    # rule as the Test stage — a verdict is only worth what the suite behind
+    # it is worth. When the repo declares what CI runs, re-verify with THAT;
+    # otherwise nothing changes (`ci_command` is unset for every repo that
+    # has not opted in). Deliberately narrower than
+    # `coord.smoke.resolve_smoke_command`: this path has never consulted
+    # `smoke_tests.default_command` and #2091 is not the issue to change that.
+    # `getattr`: *config* here is duck-typed (`coord merge --revalidate` passes
+    # the real Config; tests and the daemon pass lighter stand-ins), so a
+    # hard attribute read would turn a missing shim into an AttributeError
+    # mid-revalidation.
+    test_command = (
+        getattr(repo_cfg, "ci_command", None) or ""
+    ).strip() or repo_cfg.test_command
     if not test_command:
         # Refusing here is the safe direction: with nothing to run, "passed"
         # would be a claim about a suite that never executed — the exact lie

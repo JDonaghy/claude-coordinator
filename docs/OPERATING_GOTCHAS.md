@@ -340,6 +340,41 @@ Two config keys are load-bearing for that, both on the **daemon host's**
   `scripts/coord-test-runner.sh`, because the repo is two codebases and a bare
   `pytest` or `cargo test` would run the wrong suite or miss half the diff.
 
+**The Test gate is only as good as the command it runs (#2091).** The gate does
+not discover a repo's CI; it runs whatever `coordinator.yml` names, and nothing
+previously checked that against what CI runs. coord-portal #14 is the worked
+example: the Test stage recorded `test_passed` in **1m51s** while CI's
+`npm run test:e2e` on the *same commit* failed after **44m57s** — 36 `[mobile]`
+Playwright tests, all deterministic, none of them in the suite the gate ran.
+Because `pipeline.default_gates` puts Test *before* Review, that false green
+green-lit broken code into review; only the separate CI check gate stopped the
+merge.
+
+Resolution order is now `repos[].ci_command` → `smoke_tests.default_command` →
+`repos[].test_command`. **Set `ci_command` to the command your CI workflow
+runs** whenever it is wider than `test_command` (which is legitimately a fast
+local subset). `dispatch_smoke` logs a warning naming the gap for any repo with
+a `github:` slug and no `ci_command`, and the smoke agent's briefing states
+whether the run is CI-equivalent, so a transcript answers the question on its
+own. `coord merge --revalidate` follows the same preference — a re-verify that
+overwrote a verdict with a *narrower* suite would reintroduce the same lie.
+
+The declaration is not proof: nothing diffs `ci_command` against
+`.github/workflows/**`, so it can drift. What it buys is that the undeclared
+case stops looking identical to the declared one.
+
+**`coord fix` used to say "no red CI" when it never looked (#2091, same
+episode).** The live-CI fallback short-circuits for six distinct reasons —
+`ci_store.type: none`, a row with no `pr_url`, an unconfigured repo, a repo with
+no `github:` slug, a read that raised, checks that are all still pending — and
+every one of them used to render as the same refusal text as a genuinely green
+PR. The refusal now names the short-circuit (`note: live CI was NOT read for
+this row … because …`) and distinguishes it from `note: live CI on PR #N was
+read and reported no failing completed check`. A row with no `pr_url` also falls
+back to resolving the PR from its branch. If the stored verdict says `passed`
+while the live read says RED, `coord fix` prints an explicit `conflict (#2091)`
+line rather than silently preferring one.
+
 **A systemd user unit's PATH is not a login shell's (#1814).** `coord serve`
 runs as a systemd *user* unit, and `coord merge --revalidate` runs its composed
 suite inside that daemon process. systemd never sources `~/.profile`, so
