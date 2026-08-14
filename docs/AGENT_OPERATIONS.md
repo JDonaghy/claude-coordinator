@@ -307,6 +307,69 @@ Since #1671 the agent also logs its **resolved PATH and install location** at st
 `journalctl --user -u coord-agent` answers "what can this agent actually see" without a `pip show` /
 `grep` expedition.
 
+## Onboard a new repo (`coord repo add` / `coord repo doctor`, #2220)
+
+Adding a repo to the fleet is ~14 steps across **five layers** — config, every
+machine that serves it, GitHub, the repo's own contents, and the graph — and
+every one of them fails silently. Nothing reports a half-onboarded repo; it
+just behaves like a working one that never quite gets anywhere. `stick-demo`
+sat two-thirds onboarded until `stick-demo#1` went terminally `blocked` having
+burned both drive attempts, while `coord config`, `coord status` and `coord
+assign --dry-run` all reported the dispatch as fine — because all three read
+*config*, and config was correct.
+
+**The verifier is the part that matters.** This section is deliberately short
+because a runbook is the weakest available answer: `docs/GRAPHIFY_SETUP.md` is
+exactly that shape and graphify has still fallen by the wayside more than once,
+because nothing checks it.
+
+```bash
+coord repo add <name> --github <owner/repo> --machines precision,elitebook,dellserver
+```
+
+Does only the mechanical, safely-automatable parts: reads the **real** default
+branch from GitHub (never trusts a flag — a wrong `default_branch` silently
+routes every worker PR to the wrong base), writes the `repos:` entry into the
+**coord-settings checkout** (`~/src/coord-settings/coord/coordinator.yml`, never
+the `~/.coord/` symlink — #1832), adds the repo to each named machine's `repos:`
+and `repo_paths:`, and creates the `coord` / `tier:small` / `tier:large` labels.
+It re-parses its own edit and refuses to write if the result would not load.
+
+Then it **prints the residue it deliberately did not do** — clone, agent
+restart, `CLAUDE.md`, CI workflow, `capability_rules` — rather than pretending
+completeness. Work through that list, then:
+
+```bash
+coord repo doctor <name>        # exits non-zero on any CRIT, so it can gate
+coord repo doctor <name> -v     # show the passing checks too
+```
+
+`coord repo doctor` probes all five layers from **live state, not config**:
+each agent's `/health` repo list, the clone on each machine, the labels that
+exist on GitHub, whether any workflow triggers on `pull_request`, whether a
+`CLAUDE.md` is present, and graph freshness. Each defect gets its own named
+finding and its own remedy — they are not interchangeable:
+
+| finding | what it means | fix |
+| --- | --- | --- |
+| `machines.agent_repo_skew` | config declares the repo for this machine; the live agent has never re-read it (#2219) | **restart `coord-agent` there** — and not while headless workers are live |
+| `machines.clone_missing` | the agent knows the repo and reports the path absent | clone it; a restart changes nothing |
+| `machines.repo_path_missing` | no `repo_paths` entry at all | a config repair |
+| `github.coord_label_missing` | issues are live but **invisible to the Pipeline** | `gh label create coord` |
+| `github.no_pull_request_trigger` | workflows exist but none triggers on a PR, so `expects_checks()` reads "CI exists" while zero checks arrive and `checks_absent` blocks **every** merge in that repo, forever | add `on: pull_request:` |
+| `contents.claude_md_missing` | the Test agent auto-loads `CLAUDE.md` and the adversarial review prompt is assembled from it — without one, reviews enforce nothing | add one |
+| `config.default_branch_mismatch` | `coordinator.yml` disagrees with the repo's real default | fix the entry |
+
+`coord doctor` folds in the **live layer only** (the `machines` findings above),
+so a half-onboarded repo shows up in the fleet report without anyone
+remembering to ask. It costs no extra round trip — it re-reads the `/health`
+bodies `coord doctor` already fetched. The GitHub, contents and graph layers
+need the dedicated command.
+
+Do not forget the two steps no config edit can do for you: **commit and push in
+`coord-settings`, then `git pull` on the daemon host**, and **restart each
+agent**. The repo list is frozen at agent process start.
+
 ## Install coordinator skills (`coord install-skills`, #319)
 
 Coordinator ships bundled **Claude Code skills** (slash commands available inside

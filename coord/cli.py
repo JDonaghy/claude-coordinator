@@ -141,6 +141,9 @@ from coord.commands.lifecycle import done, housekeeping, notify, resume, serve, 
 from coord.commands.milestone import milestone_group
 from coord.commands.plans import plans_cmd
 from coord.commands.release import release_group, release_preflight
+# #2220: `coord repo add` / `coord repo doctor` — onboarding a repo, and
+# verifying it actually happened across all five layers.
+from coord.commands.repo import repo_group
 from coord.commands.plan_followup import (
     _dispatch_followup,  # noqa: F401 — re-exported for tests
     approve_plan,
@@ -449,6 +452,8 @@ main.add_command(release_preflight)
 # the flat command above), grouped so the pre-tag and post-release halves of
 # the release story are discoverable together.
 main.add_command(release_group)
+# #2220: repo onboarding + its verifier.
+main.add_command(repo_group)
 main.add_command(tui_group)
 
 
