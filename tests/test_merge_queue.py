@@ -8416,6 +8416,40 @@ class TestStaleSmokeConflictProbe:
         assert [e.kind for e in events].count("smoke_required") == 1
         assert entry.state == PENDING
 
+    # ── process(dry_run=True): the preview must not disagree with --plan ──
+
+    def test_dry_run_reports_conflict_not_smoke_required(self) -> None:
+        """Review finding on iteration 1: the smoke gate's own `--dry-run`
+        preview block sat right next to the CI gate's #1877 dry-run conflict
+        check but wasn't updated for #2231, so `coord merge --dry-run`
+        (without `--revalidate`) kept printing the stale-verdict headline for
+        an entry `--plan`/a real run both correctly report as `conflict` —
+        the exact "two surfaces answer the same question differently"
+        split-brain this issue exists to fix."""
+        entry, board, gh = self._stale_setup(mergeable=False)
+        events = process([entry], gh, config=self._config(), board=board, dry_run=True)
+
+        kinds = [e.kind for e in events]
+        assert "conflict" in kinds
+        assert "smoke_required" not in kinds
+        assert gh.merge_calls == []
+        # dry-run never mutates state
+        assert entry.state == PENDING
+        conflict_event = next(e for e in events if e.kind == "conflict")
+        assert mq.classify_conflict(conflict_event.message) == "rebaseable"
+
+    def test_dry_run_still_shows_smoke_required_when_the_branch_is_clean(self) -> None:
+        """Acceptance: a genuinely stale verdict on a cleanly-composing
+        branch still takes the #1738 path, unchanged — including in the
+        dry-run preview."""
+        entry, board, gh = self._stale_setup(mergeable=True)
+        events = process([entry], gh, config=self._config(), board=board, dry_run=True)
+
+        kinds = [e.kind for e in events]
+        assert "smoke_required" in kinds
+        assert "conflict" not in kinds
+        assert entry.state == PENDING
+
     # ── _entry_gate_status(): what the plan/board reports ──
 
     def test_plan_reason_names_the_conflict(self) -> None:
