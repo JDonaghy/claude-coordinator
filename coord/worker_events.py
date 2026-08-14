@@ -67,6 +67,18 @@ _GRAPHIFY_CMD_MAX = 200
 _GRAPHIFY_COUNT_RE = re.compile(r"(\d+)\s+(?:nodes?|results?|matches?)\s+found", re.I)
 _GRAPHIFY_ROW_RE = re.compile(r"^(?:NODE|EDGE|PATH|COMMUNITY)\b", re.M)
 
+# graphify's real zero-match phrasing: `graphify query` prints the literal
+# "No matching nodes found." (graphify/serve.py:435, vs. the "{N} nodes
+# found" header on a hit, graphify/serve.py:445) and `graphify affected`
+# prints "No affected nodes found." (graphify/affected.py:132). Neither has a
+# leading digit, so `_GRAPHIFY_COUNT_RE` never matches it, and neither is
+# NODE/EDGE/PATH/COMMUNITY-prefixed, so `_GRAPHIFY_ROW_RE` doesn't either —
+# without this, a real "ran the query, graph doesn't cover that" result fell
+# through to `None` ("unknown") instead of `0` ("empty"), which is precisely
+# the "tried and got nothing must not look like never tried" case #2236
+# exists to fix.
+_GRAPHIFY_EMPTY_RE = re.compile(r"No (?:matching|affected) \w+ found\.?", re.I)
+
 
 def is_graphify_command(cmd: str | None) -> bool:
     """True iff *cmd* invokes the ``graphify`` CLI as a command token."""
@@ -77,13 +89,14 @@ def graphify_result_count(output: str | None) -> int | None:
     """Best-effort "how many results did this graphify call return".
 
     Reads the ``N nodes found`` traversal header graphify prints first; falls
-    back to counting ``NODE``/``EDGE``/``PATH``/``COMMUNITY`` result rows, and
-    then to "0 for empty output". Returns ``None`` when the output has
-    content but no recognisable result shape (e.g. ``graphify update .``,
-    whose output is a build log) — ``None`` means "not countable", which is
-    deliberately distinct from ``0`` ("ran, returned nothing"), because the
-    whole point of #2236 is to tell *tried and got nothing* apart from
-    *didn't try*.
+    back to counting ``NODE``/``EDGE``/``PATH``/``COMMUNITY`` result rows,
+    then to graphify's literal "No matching/affected ... found." zero-match
+    phrasing, and then to "0 for empty output". Returns ``None`` when the
+    output has content but no recognisable result shape (e.g. ``graphify
+    update .``, whose output is a build log) — ``None`` means "not
+    countable", which is deliberately distinct from ``0`` ("ran, returned
+    nothing"), because the whole point of #2236 is to tell *tried and got
+    nothing* apart from *didn't try*.
     """
     if output is None:
         return None
@@ -98,6 +111,8 @@ def graphify_result_count(output: str | None) -> int | None:
     rows = len(_GRAPHIFY_ROW_RE.findall(output))
     if rows:
         return rows
+    if _GRAPHIFY_EMPTY_RE.search(output):
+        return 0
     return None
 
 

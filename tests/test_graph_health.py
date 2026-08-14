@@ -24,6 +24,7 @@ import pytest
 from coord.graph_health import (
     GraphStatus,
     graph_status,
+    hooks_file_present,
     hooks_path_status,
     read_built_sha,
 )
@@ -547,6 +548,42 @@ def test_hooks_path_status_flags_a_missing_hook_file(tmp_path: Path) -> None:
     ok, detail = hooks_path_status(repo)
     assert ok is False
     assert "missing" in detail
+
+
+def test_hooks_file_present_true_when_hook_shipped(tmp_path: Path) -> None:
+    """#2236: the "does this repo ship .githooks/post-checkout" question has
+    exactly one implementation — hooks_path_status uses it internally, and
+    coord.repo_onboard.gather_graph_facts consumes this instead of
+    recomputing the same .is_file() check independently."""
+    repo = _make_repo(tmp_path / "repo", with_hooks=True)
+    assert hooks_file_present(repo) is True
+
+
+def test_hooks_file_present_false_when_never_shipped(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path / "repo", with_hooks=False)
+    assert hooks_file_present(repo) is False
+
+
+def test_gather_graph_facts_hooks_shipped_matches_hooks_file_present(
+    tmp_path: Path,
+) -> None:
+    """coord.repo_onboard.gather_graph_facts's `hooks_shipped` field used to
+    recompute the same `.githooks/post-checkout` `.is_file()` check that
+    `hooks_path_status` already does internally — two independent
+    implementations of one question (#2236 review). Now both read off
+    `hooks_file_present`; this pins them together against a real repo in
+    both states so they can't quietly drift again."""
+    from coord.repo_onboard import gather_graph_facts
+
+    shipped = _make_repo(tmp_path / "shipped", with_hooks=True)
+    facts = gather_graph_facts(shipped)
+    assert facts.hooks_shipped is True
+    assert facts.hooks_shipped == hooks_file_present(shipped)
+
+    unshipped = _make_repo(tmp_path / "unshipped", with_hooks=False)
+    facts = gather_graph_facts(unshipped)
+    assert facts.hooks_shipped is False
+    assert facts.hooks_shipped == hooks_file_present(unshipped)
 
 
 # ── the core.hooksPath replacement hazard ────────────────────────────────────
