@@ -3340,3 +3340,36 @@ class TestMergeSweepsSiblingsEndToEnd:
         rows = {x.assignment_id: x for x in mq.load_queue()}
         assert rows["a-309"].state == mq.PENDING
         assert rows["a-309"].error is None
+
+    def test_sibling_retry_cap_hit_persists_as_human_required(
+        self, tmp_path: Path, coord_db,
+    ) -> None:
+        """#2246 review: when the swept sibling already burned its one
+        conflict-fix attempt (`has_prior_conflict_fix`), `_dispatch_conflict_
+        fixes` escalates `ev.entry.state` to HUMAN_REQUIRED in memory. That
+        must reach disk even though `--only` never holds the sibling in its
+        own `items` (just the just-merged entry) — otherwise the audit log
+        records "manual resolution required" while the queue still reads
+        CONFLICT: the sibling is stranded with no automated retry (excluded
+        from re-sweep, no longer PENDING) and no HUMAN_REQUIRED flag either."""
+        from coord.models import Board
+        from coord.state import save_board
+        save_board(Board())  # the conflict-event block is gated on load_board() != None
+        cfg = self._config(tmp_path)
+        self._seed()
+
+        with patch("coord.github_ops.merge_pr", return_value=(True, "ok")), \
+             patch("coord.github_ops.check_pr_mergeable", return_value=False), \
+             patch("coord.conflict_fix.has_prior_conflict_fix", return_value=True):
+            result = CliRunner().invoke(
+                main, ["merge", "--config", str(cfg), "--only", "a-307"],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "conflict-fix retry cap hit" in result.output
+        rows = {x.assignment_id: x for x in mq.load_queue()}
+        assert rows["a-307"].state == mq.MERGED
+        assert rows["a-309"].state == mq.HUMAN_REQUIRED, (
+            f"expected HUMAN_REQUIRED, got {rows['a-309'].state!r} — the "
+            "retry-cap escalation was dropped on the floor"
+        )

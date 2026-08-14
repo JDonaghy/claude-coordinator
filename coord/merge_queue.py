@@ -3195,7 +3195,12 @@ def sweep_sibling_conflicts(
     clobbering them — the same convention
     ``coord.commands.merge._dispatch_conflict_fixes`` relies on. Siblings the
     caller does *not* hold (the ``--only`` path, where ``items`` is a single
-    entry) are persisted by this function's own write.
+    entry) are persisted by this function's own write, which reloads the
+    queue fresh and overrides **only** the entries this call itself moved to
+    ``CONFLICT`` (one per event in the return value) — never the full *rows*
+    snapshot this function built before its retry-sleep loop, which can be
+    stale by the time we get here and would otherwise clobber any concurrent
+    writer's changes to unrelated rows.
     """
     if not any(ev.kind == "merged" for ev in events):
         return []
@@ -3269,7 +3274,18 @@ def sweep_sibling_conflicts(
     if out and persist:
         try:
             fresh = load_queue()
-            by_id = {x.assignment_id: x for x in rows}
+            # Scope the override to the entries THIS call actually mutated
+            # (one per `out` event) — never the full `rows` snapshot. `rows`
+            # was built before the retry-sleep loop above (up to
+            # ``(attempts - 1) * interval``, longer under real GitHub
+            # latency), so by the time we get here it can be stale for every
+            # entry in the queue, not just the swept candidates. Building
+            # `by_id` from it and replacing the whole table would silently
+            # revert any concurrent writer's changes to unrelated rows made
+            # during that wait — exactly the convention this function's
+            # docstring promises to follow (mutate in place, override only
+            # what changed, default everything else to the fresh read).
+            by_id = {ev.entry.assignment_id: ev.entry for ev in out}
             save_queue([by_id.get(x.assignment_id, x) for x in fresh])
         except Exception:  # noqa: BLE001 — fail open
             _log.warning(

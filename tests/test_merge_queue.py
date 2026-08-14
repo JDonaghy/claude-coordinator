@@ -8745,6 +8745,51 @@ class TestSweepSiblingConflicts:
         assert reread["s"].state == CONFLICT
         assert mq.classify_conflict(reread["s"].error) == "rebaseable"
 
+    def test_concurrent_write_during_the_retry_sleep_is_not_reverted(
+        self, coord_db,
+    ) -> None:
+        """Reviewer repro (#2246 review): `rows` is snapshotted from disk
+        near the top of the function, *before* the retry-sleep loop (up to
+        ``(attempts - 1) * interval``, longer under real GitHub latency). If
+        the final persist step built its override dict from that stale
+        `rows` snapshot instead of from what THIS call actually mutated, an
+        unrelated concurrent writer's change made during the sleep — a
+        second `coord merge`, the daemon's own next tick, `coord
+        reconcile-merges` — would be silently reverted back to its
+        pre-sweep value. `unrelated` never enters `sibling_sweep_candidates`
+        (different repo, no involvement in the merge that triggered this)
+        and must read back exactly what the concurrent writer set."""
+        merged = _sweep_entry("m", pr=100, state=PENDING, issue=307)
+        sibling = _sweep_entry("s", pr=101, issue=309)
+        unrelated = _sweep_entry(
+            "u", pr=900, issue=5, repo_github="acme/other", target="develop",
+        )
+        save_queue([merged, sibling, unrelated])
+        merged.state = MERGED
+        # UNKNOWN on the first probe forces exactly one retry-sleep round.
+        gh = _SweepGh({101: [None, False]})
+
+        def fake_sleep(_seconds: float) -> None:
+            # Simulate a concurrent writer (a second `coord merge`, the
+            # daemon's own next tick) mutating an UNRELATED row while this
+            # sweep is asleep between retry rounds.
+            concurrent = {x.assignment_id: x for x in load_queue()}
+            concurrent["u"].state = mq.HUMAN_REQUIRED
+            concurrent["u"].error = "concurrent writer set this"
+            save_queue(list(concurrent.values()))
+
+        out = mq.sweep_sibling_conflicts(
+            [_merged_event(merged)], [merged], gh, sleep=fake_sleep,
+        )
+
+        assert [ev.entry.assignment_id for ev in out] == ["s"]
+        reread = {x.assignment_id: x for x in load_queue()}
+        assert reread["s"].state == CONFLICT
+        # The concurrent writer's change to the unrelated row must survive
+        # the sweep's own final persist, not get clobbered back to PENDING.
+        assert reread["u"].state == mq.HUMAN_REQUIRED
+        assert reread["u"].error == "concurrent writer set this"
+
     def test_callers_own_object_is_mutated_not_a_second_copy(
         self, coord_db,
     ) -> None:
