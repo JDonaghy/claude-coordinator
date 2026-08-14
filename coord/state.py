@@ -2656,6 +2656,30 @@ def mark_advisory_settled(assignment_id: str) -> None:
     conn.commit()
 
 
+def mark_refused_policy_settled(assignment_id: str) -> None:
+    """#2234: flip a refused_policy row to 'merged' when its issue is terminal.
+
+    Same shape as `mark_advisory_settled` above, for the same reason: a
+    `refused_policy` row (a worker's 0-commit clean exit citing a standing
+    repo-rule prohibition — `coord.agent.REFUSED_POLICY`) is never touched
+    by the #609 sweep (which only looks at status='done' work rows), so it
+    would otherwise linger on the board forever even after a human does the
+    coordinator-side work and the issue closes.
+
+    Idempotent: only transitions rows still carrying status='refused_policy'.
+    Silently no-ops when the row doesn't exist or is already settled.
+    """
+    if not assignment_id:
+        return
+    conn = get_connection()
+    conn.execute(
+        "UPDATE assignments SET status='merged' WHERE assignment_id=? "
+        "AND status='refused_policy'",
+        (assignment_id,),
+    )
+    conn.commit()
+
+
 def update_assignment_tokens(
     assignment_id: str,
     *,

@@ -1232,6 +1232,57 @@ class TestPollOnce:
             "worker exited cleanly but pushed 0 commits"
         )
 
+    def test_running_to_refused_policy_fires_assignment_refused_policy(self) -> None:
+        """#2234 regression: refused_policy must fire ASSIGNMENT_REFUSED_POLICY,
+        not FAILED.
+
+        Before this fix, refused_policy matched none of the named branches
+        ("done"/"cancelled"/"advisory") and fell into the `else` arm —
+        explicitly commented "'failed' and any other unexpected terminal
+        status" — publishing ASSIGNMENT_FAILED for a worker that correctly
+        refused a CLAUDE.md-prohibited task. That reproduces #2234's own
+        headline defect on the phone dashboard.
+        """
+        from coord.dashboard.server import (
+            ASSIGNMENT_REFUSED_POLICY,
+            _poll_once,
+        )
+        from coord.events import ASSIGNMENT_FAILED, EventSource
+
+        config = self._make_config()
+        es = EventSource()
+        seen: set[str] = set()
+        orphaned: dict[str, float] = {}
+        board = self._running_board("rp1")
+
+        agent_resp = {
+            "active": [],
+            "completed": [{
+                "id": "rp1",
+                "status": "refused_policy",
+                "policy_refusal_reason": (
+                    "CLAUDE.md line 156: only the coordinator writes docs"
+                ),
+            }],
+        }
+        with patch(
+            "coord.dashboard.server._fetch_agent_status",
+            return_value=agent_resp,
+        ):
+            asyncio.run(_poll_once(config, es, seen, orphaned, board=board, now=1000.0))
+
+        assert len(es._history) == 1
+        event = es._history[0]
+        assert event.type == ASSIGNMENT_REFUSED_POLICY, (
+            f"expected {ASSIGNMENT_REFUSED_POLICY}, got {event.type!r} — "
+            "refused_policy must not be routed to ASSIGNMENT_FAILED"
+        )
+        assert event.type != ASSIGNMENT_FAILED
+        # policy_refusal_reason should be carried through to the client.
+        assert event.data.get("policy_refusal_reason") == (
+            "CLAUDE.md line 156: only the coordinator writes docs"
+        )
+
     def test_absent_over_threshold_appears_in_possibly_stuck(self) -> None:
         """An assignment absent from agent data past the threshold is stuck."""
         from coord.dashboard.server import _poll_once

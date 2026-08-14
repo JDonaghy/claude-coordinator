@@ -2,9 +2,10 @@
  * The SSE wire vocabulary + which react-query keys each event type affects.
  *
  * NOT just a mirror of `coord/events.py`'s `KNOWN_EVENT_TYPES` — the
- * dashboard server publishes three more event types of its own
+ * dashboard server publishes four more event types of its own
  * (`coord/dashboard/server.py`: `ASSIGNMENT_CANCELLED`, `ASSIGNMENT_ADVISORY`,
- * `ASSIGNMENT_NEEDS_ATTENTION`, all pre-existing, not `coord.events`
+ * `ASSIGNMENT_REFUSED_POLICY`, `ASSIGNMENT_NEEDS_ATTENTION`, all pre-existing
+ * except `ASSIGNMENT_REFUSED_POLICY` (#2234), none of them `coord.events`
  * constants). `openSocket()` in `connection.ts` only registers a listener
  * for the `event:` names in `EVENT_TYPES`, so any real server event type
  * missing from this list is simply never delivered to a handler — it is
@@ -29,10 +30,17 @@
 export const ASSIGNMENT_STARTED = 'assignment_started'
 export const ASSIGNMENT_COMPLETED = 'assignment_completed'
 export const ASSIGNMENT_FAILED = 'assignment_failed'
-// The three below are dashboard-server-only (coord/dashboard/server.py),
+// The four below are dashboard-server-only (coord/dashboard/server.py),
 // not coord.events.KNOWN_EVENT_TYPES -- see the module doc comment above.
 export const ASSIGNMENT_CANCELLED = 'assignment_cancelled'
 export const ASSIGNMENT_ADVISORY = 'assignment_advisory'
+// #2234: a worker's 0-commit clean exit citing a standing repo-rule
+// prohibition — distinct from ASSIGNMENT_ADVISORY (an undecided outcome
+// needing human review): this worker did the CORRECT thing. Without this
+// entry, the server-side event would simply never reach a handler here
+// (see the module doc comment) — the same "reads as a failure" defect
+// #2234 exists to fix, one layer further down the stack.
+export const ASSIGNMENT_REFUSED_POLICY = 'assignment_refused_policy'
 export const ASSIGNMENT_NEEDS_ATTENTION = 'assignment_needs_attention'
 export const MACHINE_CONNECTED = 'machine_connected'
 export const MACHINE_DISCONNECTED = 'machine_disconnected'
@@ -45,6 +53,7 @@ export const EVENT_TYPES = [
   ASSIGNMENT_FAILED,
   ASSIGNMENT_CANCELLED,
   ASSIGNMENT_ADVISORY,
+  ASSIGNMENT_REFUSED_POLICY,
   ASSIGNMENT_NEEDS_ATTENTION,
   MACHINE_CONNECTED,
   MACHINE_DISCONNECTED,
@@ -61,7 +70,7 @@ const SESSIONS: QueryKey = ['sessions']
  * Event type -> the query keys it invalidates.
  *
  * - `assignment_*` (including the dashboard-server-only `_cancelled` /
- *   `_advisory` / `_needs_attention` variants) changes an item's
+ *   `_advisory` / `_refused_policy` / `_needs_attention` variants) changes an item's
  *   stage/verdict/needs-attention flag (-> pipeline) and can start/stop a
  *   live `coord-*` tmux session (-> sessions).
  * - `machine_*` only affects session reachability/attach state (-> sessions).
@@ -80,6 +89,7 @@ export const EVENT_QUERY_KEYS: Readonly<Record<string, readonly QueryKey[]>> = {
   [ASSIGNMENT_FAILED]: [PIPELINE, SESSIONS],
   [ASSIGNMENT_CANCELLED]: [PIPELINE, SESSIONS],
   [ASSIGNMENT_ADVISORY]: [PIPELINE, SESSIONS],
+  [ASSIGNMENT_REFUSED_POLICY]: [PIPELINE, SESSIONS],
   [ASSIGNMENT_NEEDS_ATTENTION]: [PIPELINE],
   [MACHINE_CONNECTED]: [SESSIONS],
   [MACHINE_DISCONNECTED]: [SESSIONS],

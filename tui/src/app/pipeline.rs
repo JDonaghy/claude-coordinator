@@ -5354,6 +5354,21 @@ impl CoordApp {
             // "merged" above: silently defaulting a terminal status to
             // Pending is exactly the bug class this issue fixed.
             "failed" | "cancelled" => StageStatus::Failed,
+            // #2234: "refused_policy" (`coord.agent.REFUSED_POLICY`) is
+            // drawn from `_ZERO_COMMIT_TYPES` = ("work", "mock-author",
+            // "test-author") in coord/agent.py — unlike "advisory" below
+            // (restricted to the narrower `_ADVISORY_TYPES` = ("work",)),
+            // it CAN land on the mock-author/test-author rows this function
+            // resolves: a JIT test-author track that correctly refuses a
+            // CLAUDE.md-prohibited task exits 0-commit exactly like a plain
+            // Work assignment would. Mapped to the same `StageStatus::Failed`
+            // as "cancelled"/"failed" above (terminal-but-not-Done) — this
+            // is the re-audit the "advisory" comment below asked for the
+            // next time a new terminal status was added for these types;
+            // without this arm, a track that fully ran and correctly
+            // refused falls through to Pending and renders "not started",
+            // reintroducing #1581 for this status.
+            "refused_policy" => StageStatus::Failed,
             // "advisory" is restricted to `type="work"` assignments
             // (`_ADVISORY_TYPES` in coord/agent.py) and never appears on the
             // mock-author/test-author rows this function resolves, so it (and

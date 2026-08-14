@@ -7703,6 +7703,31 @@
     }
 
     #[test]
+    fn gate_a_prereq_status_failed_not_pending_when_author_refused_policy() {
+        // #2234: a mock-author/test-author row can land on status=
+        // "refused_policy" (drawn from `_ZERO_COMMIT_TYPES` in coord/
+        // agent.py, unlike "advisory" which is restricted to `type="work"`
+        // and never reaches this function). Before the fix, the unhandled
+        // "refused_policy" string fell to `prereq_pipeline_status_from`'s
+        // `_ => StageStatus::Pending` arm — rendering "not started" for a
+        // track that actually ran and correctly refused, reintroducing
+        // #1581 for this status.
+        let mut app = make_pipeline_app_for_prereq_test();
+        let mut a = _stage_assignment("mock1", "mock-author", 100.0, "refused_policy");
+        a.issue_number = 751;
+        a.finished_at = Some(160.0);
+        app.data.assignments.push(a);
+        let epic = &app.pipeline_issues[0];
+        let status = app.gate_a_prereq_status(epic);
+        assert_eq!(status.author_id.as_deref(), Some("mock1"));
+        assert_eq!(
+            status.stages[0].status,
+            StageStatus::Failed,
+            "a refused_policy author row must not render as Pending/\"not started\""
+        );
+    }
+
+    #[test]
     fn gate_a_prereq_status_all_done_through_merge() {
         let mut app = make_pipeline_app_for_prereq_test();
         let mut author = _stage_assignment("mock1", "mock-author", 100.0, "done");

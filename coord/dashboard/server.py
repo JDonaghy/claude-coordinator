@@ -80,6 +80,15 @@ ASSIGNMENT_CANCELLED = "assignment_cancelled"
 # red failure — it's a "needs attention" state.  Route it to a distinct
 # event so the dashboard can style it appropriately (warning, not failure).
 ASSIGNMENT_ADVISORY = "assignment_advisory"
+# #2234: refused_policy (0-commit clean exit whose worker cited a standing
+# repo-rule prohibition — `coord.agent.REFUSED_POLICY`) is the same shape as
+# ASSIGNMENT_ADVISORY above but a distinct verdict: the worker did the
+# CORRECT thing, not an undecided one. Without a distinct event it fell
+# into the `else` branch below (commented "'failed' and any other
+# unexpected terminal status") and was published to the phone dashboard as
+# ASSIGNMENT_FAILED — reproducing, on this surface, the exact "worker that
+# refused reads as a worker that failed" defect #2234 exists to fix.
+ASSIGNMENT_REFUSED_POLICY = "assignment_refused_policy"
 # #846: an assignment running past its wall-clock threshold, or thrashing
 # through fix/review rounds without converging (coord.notify.attention_signal
 # — same detection core as the coordinator's GitHub-comment backstop).
@@ -226,6 +235,9 @@ async def _poll_once(
             # Bug 1 fix: three-way branch — cancelled must not fire FAILED.
             # #448: advisory routes to a distinct event so the dashboard does
             # not paint a 0-commit clean exit as a failure.
+            # #2234: refused_policy gets the same treatment as advisory —
+            # checked BEFORE the `else` catch-all, or it falls into
+            # ASSIGNMENT_FAILED like any other unrecognised terminal status.
             if status == "done":
                 event_source.publish(ASSIGNMENT_COMPLETED, payload)
             elif status == "cancelled":
@@ -233,6 +245,9 @@ async def _poll_once(
             elif status == "advisory":
                 payload["zero_commit_reason"] = entry.get("zero_commit_reason")
                 event_source.publish(ASSIGNMENT_ADVISORY, payload)
+            elif status == "refused_policy":
+                payload["policy_refusal_reason"] = entry.get("policy_refusal_reason")
+                event_source.publish(ASSIGNMENT_REFUSED_POLICY, payload)
             else:  # "failed" and any other unexpected terminal status
                 payload["exit_code"] = entry.get("exit_code")
                 event_source.publish(ASSIGNMENT_FAILED, payload)
