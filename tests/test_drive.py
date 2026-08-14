@@ -455,14 +455,17 @@ class FakeGateChecker:
         for_path: str | None = None,
         for_path_error: Exception | None = None,
         exempt: bool = False,
+        landed: bool = False,
     ) -> None:
         self._exists = exists
         self._for_path = for_path
         self._for_path_error = for_path_error
         self._exempt = exempt
+        self._landed = landed
         self.calls: list[tuple[str, int]] = []
         self.for_path_calls: list[tuple[str, int]] = []
         self.exempt_calls: list[tuple[str, int, int, tuple[str, ...]]] = []
+        self.landed_calls: list[tuple[str, int, int]] = []
 
     def contract_exists(self, repo_name: str, milestone_number: int) -> bool:
         self.calls.append((repo_name, milestone_number))
@@ -483,6 +486,12 @@ class FakeGateChecker:
     ) -> bool:
         self.exempt_calls.append((repo_name, milestone_number, issue_number, issue_labels))
         return self._exempt
+
+    def has_authored_slice(
+        self, repo_name: str, milestone_number: int, issue_number: int,
+    ) -> bool:
+        self.landed_calls.append((repo_name, milestone_number, issue_number))
+        return self._landed
 
 
 def oracle_state(**kw) -> IssueState:
@@ -604,6 +613,17 @@ def test_the_default_gate_checker_is_issue_exempt_reuses_the_1138_hard_gate():
     import inspect
 
     src = inspect.getsource(GitHubAcceptanceGateChecker.is_issue_exempt)
+    assert "issue_oracle_ready" in src
+
+
+def test_the_default_gate_checker_has_authored_slice_reuses_the_1138_hard_gate():
+    """#2061: "has the slice landed?" must be answered from the SAME
+    manifest-vs-default-branch read the #1138 hard gate performs
+    (`issue_oracle_ready`'s `has_slice`), not a fresh re-derivation that
+    could drift from it."""
+    import inspect
+
+    src = inspect.getsource(GitHubAcceptanceGateChecker.has_authored_slice)
     assert "issue_oracle_ready" in src
 
 
@@ -758,13 +778,34 @@ def test_oracle_active_authors_the_slice_before_dispatching_work():
     )
 
 
+def test_oracle_active_skips_dispatching_a_new_author_when_the_slice_already_landed():
+    """#2061 (coord-portal#13): a retry must not re-author a slice that
+    already merged from an earlier attempt — ask the manifest, not just
+    the (possibly missing/stale) assignment row, before dispatching."""
+    oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
+    checker = FakeGateChecker(landed=True)
+    action = step(oracle_state(), oracle=oracle, gate_checker=checker)
+    assert action.kind == RUN
+    assert action.command == (
+        "assign", "precision", REPO, "1392",
+        "--driven-by", f"drive:{REPO}#1392",
+    )
+    assert checker.landed_calls == [(REPO, 38, 1392)]
+
+
 def test_oracle_active_waits_while_the_slice_is_still_authoring():
     oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
+    checker = FakeGateChecker()
     action = step(
         state(acceptance_author_aid="ta1", acceptance_author_status="running"),
         oracle=oracle,
+        gate_checker=checker,
     )
     assert action.kind == WAIT
+    # #2061: "still authoring" never needs the authoritative manifest read —
+    # the slice cannot possibly be on the default branch yet, so this must
+    # not pay a GitHub fetch on every poll tick.
+    assert checker.landed_calls == []
 
 
 def test_oracle_active_dispatches_work_once_the_slice_has_merged():
@@ -792,6 +833,24 @@ def test_oracle_active_is_terminal_when_the_slice_authoring_fails():
     assert "--no-acceptance" in action.message
 
 
+def test_oracle_active_failed_row_is_not_terminal_when_the_slice_already_landed():
+    """#2061: a FAILED row describes what happened to THIS author, not
+    whether the issue's slice exists — a stale/retried row can fail (or
+    just be wrong) while an earlier attempt already merged the slice."""
+    oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
+    checker = FakeGateChecker(landed=True)
+    action = step(
+        oracle_state(acceptance_author_aid="ta1", acceptance_author_status="failed"),
+        oracle=oracle,
+        gate_checker=checker,
+    )
+    assert action.kind == RUN
+    assert action.command == (
+        "assign", "precision", REPO, "1392",
+        "--driven-by", f"drive:{REPO}#1392",
+    )
+
+
 def test_oracle_active_is_terminal_when_the_slice_authoring_is_cancelled():
     oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
     action = step(
@@ -801,6 +860,21 @@ def test_oracle_active_is_terminal_when_the_slice_authoring_is_cancelled():
     assert action.is_exit
     assert action.exit_code == EXIT_TERMINAL_FAILURE
     assert "cancelled" in action.message
+
+
+def test_oracle_active_cancelled_row_is_not_terminal_when_the_slice_already_landed():
+    oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
+    checker = FakeGateChecker(landed=True)
+    action = step(
+        oracle_state(acceptance_author_aid="ta1", acceptance_author_status="cancelled"),
+        oracle=oracle,
+        gate_checker=checker,
+    )
+    assert action.kind == RUN
+    assert action.command == (
+        "assign", "precision", REPO, "1392",
+        "--driven-by", f"drive:{REPO}#1392",
+    )
 
 
 def test_oracle_active_still_honours_do_plan_after_the_slice_has_landed():
@@ -879,6 +953,30 @@ def test_oracle_active_advisory_with_no_commits_is_terminal():
     assert action.is_exit
     assert action.exit_code == EXIT_TERMINAL_FAILURE
     assert "no commits" in action.message
+
+
+def test_oracle_active_advisory_with_no_commits_is_not_terminal_when_the_slice_already_landed():
+    """#2061: a commit-less ADVISORY row is exactly what a stale/retried
+    author's row looks like when an earlier attempt already merged the
+    slice — check the manifest before declaring failure."""
+    oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
+    verifier = FakeVerifier(has_commits=False)
+    checker = FakeGateChecker(landed=True)
+    action = step(
+        oracle_state(
+            acceptance_author_aid="ta1",
+            acceptance_author_status="advisory",
+            acceptance_author_branch="",
+        ),
+        oracle=oracle,
+        verifier=verifier,
+        gate_checker=checker,
+    )
+    assert action.kind == RUN
+    assert action.command == (
+        "assign", "precision", REPO, "1392",
+        "--driven-by", f"drive:{REPO}#1392",
+    )
 
 
 def test_oracle_active_advisory_with_commits_requires_accept_advisory():
@@ -964,6 +1062,33 @@ def test_oracle_active_done_with_no_commits_is_terminal():
     assert "test-author-ms-38-slice-1124" in action.message
     assert "no commits" in action.message
     assert "ta1" in action.message
+
+
+def test_oracle_active_done_with_no_commits_is_not_terminal_when_the_slice_already_landed():
+    """#2061 (coord-portal#13): the exact observed shape — a re-dispatched
+    author lands in a world where the slice is already merged from an
+    earlier attempt, correctly does nothing (DONE, zero commits), and
+    drive must read that as "already done", not re-diagnose it as a
+    failure and block the queue entry."""
+    oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
+    verifier = FakeVerifier(has_commits=False)
+    checker = FakeGateChecker(landed=True)
+    action = step(
+        oracle_state(
+            acceptance_author_aid="ta1",
+            acceptance_author_status="done",
+            acceptance_author_branch="test-author-ms-38-slice-1124",
+        ),
+        oracle=oracle,
+        verifier=verifier,
+        gate_checker=checker,
+    )
+    assert action.kind == RUN
+    assert action.command == (
+        "assign", "precision", REPO, "1392",
+        "--driven-by", f"drive:{REPO}#1392",
+    )
+    assert checker.landed_calls == [(REPO, 38, 1392)]
 
 
 def test_oracle_active_done_with_no_branch_is_terminal():
