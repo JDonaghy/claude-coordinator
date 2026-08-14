@@ -44,6 +44,95 @@ class WorkerEvent:
         return {"type": self.type, "subtype": self.subtype, "raw": self.raw}
 
 
+# #2212/#2236: recognise a `graphify` CLI call inside a Bash command string.
+# Separators recognized before the command token: `;`, `&`, `|` (covers `&&`
+# and `||` too, since `\s*` after the class soaks up the second char) and a
+# bare newline — Claude Code's Bash tool very commonly emits multi-line
+# command strings (e.g. `cd repo\ngraphify query "foo"`) that aren't joined
+# with `;`/`&&`, so newline must count as a separator or those legs
+# undercount to 0 (#2212 review).  Anchoring on a separator is what keeps a
+# path mention (`cat graphify-out/graph.json`) from counting as a query.
+# Canonical home is here rather than in coord/agent.py (#2236) because the
+# summary parser now needs it too — agent.py imports this symbol.
+GRAPHIFY_INVOCATION_RE = re.compile(r"(?:^|[\n;&|]\s*)graphify(?:\s|$)")
+
+# Longest command text kept per query.  The point is to tell one query apart
+# from another when reading logs, not to replay it — a multi-KB heredoc in the
+# same Bash call would otherwise bloat every reap line.
+_GRAPHIFY_CMD_MAX = 200
+
+# graphify query prints a `… | 81 nodes found` traversal header; when the
+# header is absent (other subcommands, older builds) we fall back to counting
+# result rows, which are line-prefixed with the record kind.
+_GRAPHIFY_COUNT_RE = re.compile(r"(\d+)\s+(?:nodes?|results?|matches?)\s+found", re.I)
+_GRAPHIFY_ROW_RE = re.compile(r"^(?:NODE|EDGE|PATH|COMMUNITY)\b", re.M)
+
+
+def is_graphify_command(cmd: str | None) -> bool:
+    """True iff *cmd* invokes the ``graphify`` CLI as a command token."""
+    return bool(cmd) and bool(GRAPHIFY_INVOCATION_RE.search(cmd or ""))
+
+
+def graphify_result_count(output: str | None) -> int | None:
+    """Best-effort "how many results did this graphify call return".
+
+    Reads the ``N nodes found`` traversal header graphify prints first; falls
+    back to counting ``NODE``/``EDGE``/``PATH``/``COMMUNITY`` result rows, and
+    then to "0 for empty output". Returns ``None`` when the output has
+    content but no recognisable result shape (e.g. ``graphify update .``,
+    whose output is a build log) — ``None`` means "not countable", which is
+    deliberately distinct from ``0`` ("ran, returned nothing"), because the
+    whole point of #2236 is to tell *tried and got nothing* apart from
+    *didn't try*.
+    """
+    if output is None:
+        return None
+    if not output.strip():
+        return 0
+    m = _GRAPHIFY_COUNT_RE.search(output)
+    if m:
+        try:
+            return int(m.group(1))
+        except ValueError:  # pragma: no cover - regex guarantees digits
+            return None
+    rows = len(_GRAPHIFY_ROW_RE.findall(output))
+    if rows:
+        return rows
+    return None
+
+
+@dataclass
+class GraphifyQuery:
+    """One ``graphify`` invocation by a worker, and what it returned (#2236).
+
+    ``graphify_invocations=N`` (#2212) counts attempts, which cannot separate
+    "queried and got a useful answer" from "queried, got nothing, fell back to
+    grep" — and those two imply opposite fixes (habit vs. graph coverage). So
+    each call is recorded with its command text and the outcome of its tool
+    result.
+
+    ``outcome`` is one of:
+
+    * ``"hit"`` — returned at least one countable result.
+    * ``"empty"`` — ran fine and returned nothing (graph coverage problem).
+    * ``"error"`` — the tool result was flagged as an error (e.g. no graph
+      built here, graphify not installed).
+    * ``"unknown"`` — no result was correlated (log truncated to a tail, or
+      output shape not countable, e.g. ``graphify update .``).
+    """
+
+    command: str
+    outcome: str = "unknown"
+    results: int | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "command": self.command,
+            "outcome": self.outcome,
+            "results": self.results,
+        }
+
+
 @dataclass
 class WorkerSummary:
     """Rolling summary built from a stream of WorkerEvents."""
@@ -60,6 +149,13 @@ class WorkerSummary:
     last_tool: str | None = None
     files_edited: list[str] = field(default_factory=list)
     bash_commands: list[str] = field(default_factory=list)
+    # #2236: one entry per `graphify` invocation, with the outcome of its tool
+    # result folded in when the log carries one.  See :class:`GraphifyQuery`.
+    graphify_queries: list[GraphifyQuery] = field(default_factory=list)
+    # tool_use_id -> index into `graphify_queries`, so a later `tool_result`
+    # can be attributed back to the call that produced it.  Internal bookkeeping
+    # for `update_summary`'s fold; deliberately excluded from `to_dict`.
+    pending_graphify: dict[str, int] = field(default_factory=dict, repr=False)
     duration_ms: int | None = None
     # Token counts from the result event (may be zero if the log predates
     # token reporting or the worker didn't emit usage data).
@@ -96,6 +192,7 @@ class WorkerSummary:
             "last_tool": self.last_tool,
             "files_edited": list(self.files_edited),
             "bash_commands": list(self.bash_commands),
+            "graphify_queries": [q.to_dict() for q in self.graphify_queries],
             "duration_ms": self.duration_ms,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
@@ -495,6 +592,87 @@ def _assistant_text(event: WorkerEvent) -> str:
 # ── Streaming summary update ───────────────────────────────────────────────
 
 
+def record_graphify_call(
+    summary: WorkerSummary,
+    cmd: str | None,
+    *,
+    tool_use_id: object = None,
+    output: str | None = None,
+    is_error: bool = False,
+) -> None:
+    """Record a graphify shell call on *summary*, if *cmd* is one (#2236).
+
+    Providers whose log carries the call and its output in one event (e.g.
+    opencode) pass ``output``/``is_error`` and the outcome is settled
+    immediately. Claude's stream-json splits the two across a ``tool_use``
+    block and a later ``tool_result``, so it passes ``tool_use_id`` instead
+    and the outcome is filled in by :func:`_resolve_graphify_result`. A call
+    with neither stays ``outcome="unknown"``, which is the honest reading: we
+    saw the attempt and never saw what came back.
+    """
+    if not is_graphify_command(cmd):
+        return
+    entry = GraphifyQuery(command=_truncate(cmd or "", _GRAPHIFY_CMD_MAX))
+    summary.graphify_queries.append(entry)
+    if output is not None or is_error:
+        _apply_graphify_outcome(entry, output, is_error)
+        return
+    if isinstance(tool_use_id, str) and tool_use_id:
+        summary.pending_graphify[tool_use_id] = len(summary.graphify_queries) - 1
+
+
+def _apply_graphify_outcome(
+    entry: GraphifyQuery, output: str | None, is_error: bool
+) -> None:
+    if is_error:
+        entry.outcome = "error"
+        return
+    count = graphify_result_count(output)
+    entry.results = count
+    entry.outcome = "unknown" if count is None else ("hit" if count > 0 else "empty")
+
+
+def _resolve_graphify_result(
+    summary: WorkerSummary, tool_use_id: object, output: str | None, is_error: bool
+) -> None:
+    """Attribute a tool result back to the graphify call that issued it."""
+    if not isinstance(tool_use_id, str):
+        return
+    idx = summary.pending_graphify.pop(tool_use_id, None)
+    if idx is None or idx >= len(summary.graphify_queries):
+        return
+    _apply_graphify_outcome(summary.graphify_queries[idx], output, is_error)
+
+
+def _tool_result_output(block: dict, raw: dict) -> str | None:
+    """Text of a tool_result block, across the shapes claude emits.
+
+    ``content`` is either a plain string or a list of ``{"type": "text",
+    "text": ...}`` blocks; the sibling ``tool_use_result.stdout`` on the
+    envelope is used as a fallback for Bash calls whose content came through
+    empty.
+    """
+    content = block.get("content")
+    text: str | None = None
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        parts = [
+            c.get("text")
+            for c in content
+            if isinstance(c, dict) and isinstance(c.get("text"), str)
+        ]
+        text = "\n".join(parts) if parts else None
+    if text:
+        return text
+    tur = raw.get("tool_use_result")
+    if isinstance(tur, dict):
+        stdout = tur.get("stdout")
+        if isinstance(stdout, str):
+            return stdout
+    return text
+
+
 def update_summary(summary: WorkerSummary, event: WorkerEvent) -> None:
     """Fold *event* into *summary* in-place."""
     raw = event.raw
@@ -525,6 +703,7 @@ def update_summary(summary: WorkerSummary, event: WorkerEvent) -> None:
                     cmd = _command_from_input(block.get("input"))
                     if cmd:
                         summary.bash_commands.append(cmd)
+                        record_graphify_call(summary, cmd, tool_use_id=block.get("id"))
                 elif name in ("Edit", "Write", "NotebookEdit"):
                     fp = _file_from_input(block.get("input"))
                     if fp:
@@ -540,10 +719,41 @@ def update_summary(summary: WorkerSummary, event: WorkerEvent) -> None:
             cmd = _bash_command_from_event(event)
             if cmd:
                 summary.bash_commands.append(cmd)
+                record_graphify_call(
+                    summary, cmd, tool_use_id=raw.get("id") or raw.get("tool_use_id")
+                )
         elif name in ("Edit", "Write", "NotebookEdit"):
             fp = _file_path_from_event(event)
             if fp:
                 summary.files_edited.append(fp)
+        return
+
+    # #2236: tool results arrive either as `user` messages carrying
+    # `tool_result` content blocks (claude's stream-json shape) or as
+    # standalone `tool_result` events (older/other providers). Both are
+    # folded here purely to attribute an outcome to a pending graphify call —
+    # nothing else in the summary depends on results, so an unrecognised
+    # shape just leaves the entry `"unknown"`.
+    if event.type == "user":
+        message = raw.get("message") or {}
+        for block in _iter_content_blocks(message):
+            if block.get("type") != "tool_result":
+                continue
+            _resolve_graphify_result(
+                summary,
+                block.get("tool_use_id"),
+                _tool_result_output(block, raw),
+                bool(block.get("is_error")),
+            )
+        return
+
+    if event.type == "tool_result":
+        _resolve_graphify_result(
+            summary,
+            raw.get("tool_use_id"),
+            _tool_result_output(raw, raw),
+            bool(raw.get("is_error")),
+        )
         return
 
     if event.type == "rate_limit_event":

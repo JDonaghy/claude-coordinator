@@ -2412,3 +2412,44 @@ def test_opencode_routing_pin_inert_without_openrouter_credential_end_to_end(
     error_events = [e for e in events if e.get("type") == "error"]
     assert not error_events, f"routing pin broke a non-OpenRouter run: {error_events}"
     assert any(e.get("type") == "step_finish" for e in events)
+
+
+def test_opencode_parse_log_records_graphify_query_outcome(tmp_path: Path) -> None:
+    """#2236: graph-usage instrumentation is provider-agnostic. opencode
+    carries a bash call's output on the same event, so the outcome settles
+    immediately instead of via a later tool_result."""
+    log = tmp_path / "graphify.log"
+    lines = [
+        json.dumps({
+            "type": "tool_use", "sessionID": "s1",
+            "part": {"type": "tool", "tool": "bash",
+                     "state": {"status": "completed",
+                               "input": {"command": 'graphify query "where is X handled"'},
+                               "output": "Traversal: BFS | 12 nodes found"}},
+        }),
+        json.dumps({
+            "type": "tool_use", "sessionID": "s1",
+            "part": {"type": "tool", "tool": "bash",
+                     "state": {"status": "completed",
+                               "input": {"command": "grep -rn foo ."},
+                               "output": "foo.py:1:foo"}},
+        }),
+    ]
+    log.write_text("\n".join(lines) + "\n")
+    summary = OpenCodeProvider().parse_log(log, tail_bytes=0)
+    assert [(q.outcome, q.results) for q in summary.graphify_queries] == [("hit", 12)]
+
+
+def test_opencode_parse_log_graphify_error_recorded(tmp_path: Path) -> None:
+    """A failed graphify call (e.g. no graph built in this repo) is an
+    `error` outcome, never a silent zero."""
+    log = tmp_path / "graphify_err.log"
+    log.write_text(json.dumps({
+        "type": "tool_use", "sessionID": "s1",
+        "part": {"type": "tool", "tool": "bash",
+                 "state": {"status": "error",
+                           "input": {"command": "graphify query x"},
+                           "error": "no graphify-out/graph.json"}},
+    }) + "\n")
+    summary = OpenCodeProvider().parse_log(log, tail_bytes=0)
+    assert [q.outcome for q in summary.graphify_queries] == ["error"]

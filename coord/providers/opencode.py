@@ -830,6 +830,19 @@ def _update_opencode_summary(summary: WorkerSummary, data: dict) -> None:
             cmd = tool_input.get("command")
             if isinstance(cmd, str) and cmd:
                 summary.bash_commands.append(cmd)
+                # #2236: same graph-usage instrumentation the claude parser
+                # does. opencode carries the call and its output in one event,
+                # so the outcome settles here instead of on a later
+                # `tool_result`.
+                from coord.worker_events import record_graphify_call  # noqa: PLC0415
+
+                _out = state.get("output")
+                record_graphify_call(
+                    summary,
+                    cmd,
+                    output=_out if isinstance(_out, str) else None,
+                    is_error=state.get("status") == "error",
+                )
         elif tool in ("edit", "write"):
             fp = tool_input.get("filePath")
             if isinstance(fp, str) and fp:
