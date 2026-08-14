@@ -150,6 +150,87 @@ def test_advisory_does_not_trigger_auto_reassign(config: Config) -> None:
     )
 
 
+# ── #2234: reconcile must not mark a policy refusal as failed ───────────────
+
+
+def test_refused_policy_status_moves_to_completed_not_failed(config: Config) -> None:
+    """A refused_policy entry from the agent must be moved to board.completed
+    with status='refused_policy', NOT 'failed' — without this branch it falls
+    into the `else` arm, which calls mark_failed_by_id and feeds
+    auto_reassign on a condition retrying can never fix (#2234)."""
+    board = _board()
+    fake_status = {
+        "active": [],
+        "completed": [{"id": "abc", "status": "refused_policy", "finished_at": 1.0}],
+    }
+    with patch("coord.reconcile._query_agent", return_value=fake_status):
+        changed = reconcile(board, config)
+
+    assert changed == ["abc"]
+    assert board.active == []
+    assert len(board.completed) == 1
+    refused = board.completed[0]
+    assert refused.status == "refused_policy", (
+        f"expected refused_policy, got {refused.status!r} — "
+        "reconcile() wrongly called mark_failed_by_id on it"
+    )
+
+
+def test_refused_policy_work_review_state_is_not_pending(config: Config) -> None:
+    """A refused_policy work assignment must not enter the review-dispatch
+    loop — there is no code to review."""
+    board = _board()
+    fake_status = {
+        "active": [],
+        "completed": [{"id": "abc", "status": "refused_policy", "finished_at": 1.0}],
+    }
+    dispatch_calls: list[str] = []
+
+    def _fake_dispatch_review(completed, board, config, **kwargs):
+        dispatch_calls.append(completed.assignment_id)
+        return None
+
+    with patch("coord.reconcile._query_agent", return_value=fake_status), \
+         patch("coord.review.dispatch_review", _fake_dispatch_review):
+        reconcile(board, config)
+
+    refused = board.completed[0]
+    assert refused.review_state == "advisory", (
+        "refused_policy work should skip review like advisory does, got "
+        f"{refused.review_state!r}"
+    )
+    assert dispatch_calls == [], (
+        "dispatch_review must not be called for a refused_policy assignment"
+    )
+
+
+def test_refused_policy_does_not_trigger_auto_reassign(config: Config) -> None:
+    """auto_reassign must not fire for a policy refusal — retrying reproduces
+    the identical, correct refusal every time (#2234's whole point)."""
+    cfg_with_reassign = Config(
+        repos=[Repo(name="api", github="acme/api")],
+        machines=[Machine(name="laptop", host="laptop.tailnet", repos=["api"])],
+    )
+    cfg_with_reassign.concurrency.auto_reassign = True  # type: ignore[attr-defined]
+
+    board = _board()
+    fake_status = {
+        "active": [],
+        "completed": [{"id": "abc", "status": "refused_policy", "finished_at": 1.0}],
+    }
+    reassign_calls: list[str] = []
+
+    with patch("coord.reconcile._query_agent", return_value=fake_status), \
+         patch("coord.reconcile._reassign", side_effect=reassign_calls.append) as mock_reassign:
+        mock_reassign.return_value = None
+        reconcile(board, cfg_with_reassign)
+
+    assert reassign_calls == [], (
+        "_reassign must not be called for refused_policy — retrying can "
+        "never change a standing rule"
+    )
+
+
 # ── #459: reconcile skips review dispatch when a work assignment is active ──
 
 
@@ -446,3 +527,85 @@ def test_cli_status_reconcile_advisory_sets_status_and_review_state(
         f"{done.review_state!r}); leaving it as None lets the notify "
         "review-dispatch loop fire a spurious review for a 0-commit branch"
     )
+
+
+def test_cli_status_reconcile_refused_policy_sets_status_and_review_state(
+    tmp_path, coord_db
+) -> None:
+    """#2234: mirrors the advisory test just above for `coord status`'s
+    thin-client inline reconcile. Without the matching branch in
+    `coord/commands/status.py`, a `refused_policy` completion falls into the
+    `else` arm there and is persisted as `status="failed"` — exactly the
+    "presents as a genuine failure needing triage" bug #2234 exists to fix,
+    on the ONE code path an operator running a thin client actually hits."""
+    from click.testing import CliRunner
+
+    from coord import state as state_mod
+    from coord.cli import main
+
+    config_file = tmp_path / "coordinator.yml"
+    config_file.write_text(
+        "repos:\n  - name: api\n    github: acme/api\n"
+        "machines:\n  - name: laptop\n    host: laptop.tail\n    repos: [api]\n"
+    )
+
+    active = Assignment(
+        machine_name="laptop", repo_name="api",
+        issue_number=2195, issue_title="Split CLAUDE.md by audience",
+        status="running", assignment_id="refpol-cli-1",
+        type="work",
+    )
+    state_mod.save_board(Board(active=[active]))
+
+    from coord.network import MachineStatus, StatusResult, ONLINE
+
+    status_data = {
+        "active": [],
+        "completed": [{
+            "id": "refpol-cli-1",
+            "status": "refused_policy",
+            "finished_at": 100.0,
+            "branch": None,
+            "policy_refusal_reason": (
+                "Confirmed: the rule exists verbatim at CLAUDE.md line 156"
+            ),
+            "spec": {
+                "type": "work",
+                "issue_number": 2195,
+                "issue_title": "Split CLAUDE.md by audience",
+                "repo_name": "api",
+            },
+        }],
+        "version": "0.0.0",
+    }
+
+    fake_machine_status = MachineStatus(
+        machine=Machine(name="laptop", host="laptop.tail", repos=["api"]),
+        state=ONLINE,
+        latency_ms=1.0,
+    )
+
+    with patch("coord.network.check_all", return_value=[fake_machine_status]), \
+         patch("coord.network.fetch_status", return_value=StatusResult(data=status_data)):
+        result = CliRunner().invoke(
+            main, ["status", "--config", str(config_file), "--timeout", "0.1"],
+        )
+
+    assert result.exit_code == 0, result.output
+
+    board = state_mod.load_board()
+    assert board is not None
+    assert board.active == []
+    completed = [a for a in board.completed if a.assignment_id == "refpol-cli-1"]
+    assert len(completed) == 1
+    done = completed[0]
+    assert done.status == "refused_policy", (
+        f"cli.py reconcile must set status='refused_policy' (got "
+        f"{done.status!r}), not 'failed' — that would feed auto_reassign on "
+        "a condition retrying can never fix"
+    )
+    assert done.review_state == "advisory", (
+        f"refused_policy work should skip review like advisory does (got "
+        f"{done.review_state!r})"
+    )
+    assert "Needs the coordinator" in result.output

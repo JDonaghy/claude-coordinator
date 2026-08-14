@@ -138,3 +138,23 @@ def test_test_mode_from_labels_fails_open(labels):
     from coord.models import test_mode_from_labels
 
     assert test_mode_from_labels(labels) is None
+
+
+# ── #2234: the policy-refusal park marker ────────────────────────────────────
+
+
+def test_is_policy_refusal_reason_matches_the_marker():
+    from coord.models import POLICY_REFUSAL_MARKER, is_policy_refusal_reason
+
+    reason = (
+        f"drive exited for api#1 (exit_code=1): refused on a standing "
+        f"repo-rule prohibition. {POLICY_REFUSAL_MARKER}"
+    )
+    assert is_policy_refusal_reason(reason) is True
+
+
+@pytest.mark.parametrize("text", [None, "", "drive session died", "a Gate A refusal"])
+def test_is_policy_refusal_reason_fails_open_on_anything_else(text):
+    from coord.models import is_policy_refusal_reason
+
+    assert is_policy_refusal_reason(text) is False

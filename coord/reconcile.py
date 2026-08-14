@@ -29,9 +29,21 @@ def _query_agent(host: str, port: int = AGENT_PORT, timeout: float = 5.0) -> dic
 
 # Terminal statuses an agent reports in its /status `completed` history,
 # mapped to the board terminal status we persist. (#625)
+#
+# #2234: "refused_policy" (coord.agent.REFUSED_POLICY) joins "advisory" as
+# its own pass-through entry — WITHOUT this, `reconcile_completed_
+# assignments` below (the daemon's passive tick, the primary production
+# path a completion is first observed on) reads `terminal = _AGENT_TERMINAL_
+# STATUS.get(...)` as `None` for an unrecognised status and just
+# `continue`s, leaving the board row on `status="running"` FOREVER — the
+# opposite of #2234's goal (the row would look perpetually in-flight,
+# `active_count` would never clear, and `coord drive` would wait forever
+# instead of ever reaching the terminal-status branch that avoids spending
+# an attempt).
 _AGENT_TERMINAL_STATUS = {
     "done": "done",
     "advisory": "advisory",
+    "refused_policy": "refused_policy",
     "failed": "failed",
     "cancelled": "failed",
 }
@@ -1278,6 +1290,30 @@ def reconcile(board: Board, config: Config) -> list[str]:
                     )
                 _record_usage_limit_reason(a.assignment_id, entry)
             # NOTE: do NOT add to newly_failed — prevents auto_reassign loop.
+        elif agent_status == "refused_policy":
+            # #2234: worker exited cleanly, pushed 0 commits, and its own
+            # final message cited a standing repo-rule prohibition — the
+            # #2195 shape. Mirrors the "advisory" branch immediately above
+            # (move to completed, skip review — there is no code to review),
+            # EXCEPT the status is preserved distinctly rather than folded
+            # into "advisory": the whole point is that this reads as a
+            # routing decision ("needs the coordinator"), not as "the worker
+            # got stuck or found nothing to do".
+            done = board.mark_done_by_id(
+                a.assignment_id,
+                finished_at=entry.get("finished_at"),
+                branch=branch,
+            )
+            if done is not None:
+                # mark_done_by_id sets status="done"; correct it.
+                done.status = "refused_policy"
+                if done.type in WORK_LIKE_TYPES:
+                    # No code pushed → nothing to review.
+                    done.review_state = "advisory"
+                _record_usage_limit_reason(a.assignment_id, entry)
+            # NOTE: do NOT add to newly_failed — a policy refusal is never a
+            # candidate for auto_reassign; retrying it reproduces the
+            # identical, correct refusal every time.
         else:
             # Defensive: don't downgrade a DB-done assignment to failed when
             # the agent reports cancelled (e.g. after POST /cancel cleanup

@@ -82,6 +82,21 @@ CANCELLED = "cancelled"
 # would loop forever on "already implemented" reports); not a clean DONE
 # either. Human should review and decide whether to re-dispatch or close.
 ADVISORY = "advisory"
+# #2234: a NARROWER shape of the #448 zero-commit exit — the worker's own
+# final message shows it stopped because a STANDING repo rule (CLAUDE.md's
+# "only the coordinator writes docs", or similar) makes the dispatched
+# deliverable something no worker can complete, ever, on any attempt (see
+# `_looks_like_policy_refusal`). This is deliberately a status distinct from
+# ADVISORY, not a sub-case reported through it: every downstream consumer of
+# ADVISORY (`coord drive`'s bounded retry, the queue's attempt budget, the
+# terminal `blocked` bucket a human must `remove`) exists to handle "the
+# worker got stuck or found nothing to do" — a condition retrying might fix.
+# A policy refusal is the OPPOSITE: the worker did exactly the right thing,
+# and retrying is guaranteed to reproduce the identical, correct refusal.
+# Landing it in ADVISORY's bucket is what #2234 exists to stop — the #2195
+# incident spent two drive attempts ($0.11 x 2, plus the overnight slot) and
+# a terminal `blocked` rediscovering a rule that was never going to change.
+REFUSED_POLICY = "refused_policy"
 
 # #448: spec types that are expected to push commits, so a clean exit with
 # zero commits is interesting (advisory).  Review/smoke workers commit
@@ -166,6 +181,54 @@ _COMPLETED_HISTORY_CAP = 25
 # entry agent-side (see module docstring for `_COMPLETED_HISTORY_CAP`) well
 # within an operator's normal polling cadence.
 _ADVISORY_TERMINAL_CHECK_COOLDOWN_S = 300.0
+
+# #2234: markers that show up when a worker's OWN final message explains
+# that it stopped because of a STANDING repo rule — not because it got stuck
+# or ran out of turns. Matched only against the worker's own account (see
+# `_looks_like_policy_refusal`), never against the briefing or issue body,
+# which quote the same rules on every single dispatch and would false-
+# positive on every assignment if matched directly. `claude.md` is the one
+# filename standing worker-facing rules live in across this repo (see
+# CLAUDE.md's own "Rules for workers" section, "Only the coordinator writes
+# docs"); the rest are lifted verbatim from that same rule's text, which is
+# the shape that triggered this issue (claude-coordinator#2195: an issue
+# whose entire deliverable was a doc edit, dispatched to a worker that
+# correctly refused and stopped). Deliberately permissive rather than
+# requiring an exact quote — a weak/cheap model's terse refusal ("Confirmed:
+# the rule exists verbatim at CLAUDE.md line 156...", the actual #2195
+# transcript) may cite the rule without repeating "must not"/"forbidden"
+# verbatim.
+_POLICY_REFUSAL_MARKERS = (
+    "claude.md",
+    "files_forbidden",
+    "repo rule",
+    "repo's rule",
+    "coordinator work",
+    "only the coordinator",
+    "coordinator-only",
+    "should never have been dispatched",
+)
+
+
+def _looks_like_policy_refusal(text: str | None) -> bool:
+    """#2234: does *text* — the worker's own final message — read as a
+    refusal grounded in a STANDING repo-rule prohibition, rather than a
+    stuck/incomplete session?
+
+    Only ever consulted on the zero-commit/clean-exit shape (`_reap` calls
+    this exactly where it would otherwise set `zero_commit_reason` — see
+    below): a worker that pushed real commits never reaches this check, so a
+    successful run that happens to mention `CLAUDE.md` in passing (e.g.
+    "per CLAUDE.md I ran the build before committing") carries no risk of
+    being reclassified. Within that already-narrow shape, an ordinary
+    `STUCK:`-style report (out of turns, couldn't find the code, a flaky
+    test) mentions none of :data:`_POLICY_REFUSAL_MARKERS`, so it is left
+    exactly as ADVISORY as it always was.
+    """
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(marker in lowered for marker in _POLICY_REFUSAL_MARKERS)
 
 
 # ── Reap tuning ───────────────────────────────────────────────────────────────
@@ -2941,6 +3004,16 @@ class AgentAssignment:
     # (a normal work assignment's deliverable is the diff itself, already
     # visible on the PR — restating the transcript there would be noise).
     result_text: str | None = None
+    # #2234: the worker's own final message when `_reap` classifies a clean
+    # (exit_code==0), 0-commit exit as a policy refusal (`status ==
+    # REFUSED_POLICY`) rather than the #448 ADVISORY default — see
+    # `_looks_like_policy_refusal`. `None` on every other outcome, including
+    # an ordinary zero-commit ADVISORY (no marker matched) and the #2188
+    # analysis-deliverable success shape (mutually exclusive with this one:
+    # both are decided in the same `_ahead == 0` branch of `_reap`, and only
+    # one of `analysis_deliverable`/`zero_commit_reason`/this field is ever
+    # set for a given assignment).
+    policy_refusal_reason: str | None = None
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -4163,7 +4236,7 @@ class AgentServer:
             completed = sum(
                 1
                 for a in self._assignments.values()
-                if a.status in (DONE, FAILED, CANCELLED, ADVISORY)
+                if a.status in (DONE, FAILED, CANCELLED, ADVISORY, REFUSED_POLICY)
             )
         worktree_bytes = self._cached_worktree_bytes()
         artifact_bytes = self._cached_artifact_bytes()
@@ -7379,6 +7452,11 @@ class AgentServer:
         # assignment.
         _analysis_deliverable = False
         _zero_commit_reason: str | None = None
+        # #2234: set alongside (never together with) `_zero_commit_reason` —
+        # both are decided in the SAME `_ahead == 0` branch below so the two
+        # readings of "0 commits" can never disagree about which one applies
+        # to this assignment.
+        _policy_refusal_reason: str | None = None
         if (exit_code == 0 and assignment is not None
                 and assignment.worktree_path
                 and assignment.spec.type in _ZERO_COMMIT_TYPES):
@@ -7396,6 +7474,30 @@ class AgentServer:
                                     f"ahead of {_base}; issue labelled "
                                     f"{DELIVERABLE_ANALYSIS_LABEL!r}, status "
                                     "set to done (#2188)\n"
+                                )
+                        except OSError:
+                            pass
+                    elif _worker_summary is not None and _looks_like_policy_refusal(
+                        _worker_summary.result_text
+                    ):
+                        # #2234: the worker's own final message cites a
+                        # standing repo-rule prohibition as the reason it
+                        # stopped — the #2195 shape. Distinct from the
+                        # ADVISORY fallback below: retrying this assignment
+                        # cannot change a rule that isn't going anywhere, so
+                        # it must not consume the queue's attempt budget or
+                        # land in the same bucket as a genuinely stuck
+                        # worker.
+                        _policy_refusal_reason = _worker_summary.result_text or (
+                            "worker cited a standing repo-rule prohibition"
+                        )
+                        try:
+                            with open(assignment.log_path, "a") as reopen:
+                                reopen.write(
+                                    "# reap: refused_policy — 0 commits ahead "
+                                    f"of {_base}; worker's final message cites "
+                                    "a standing repo-rule prohibition, status "
+                                    "set to refused_policy (#2234)\n"
                                 )
                         except OSError:
                             pass
@@ -7472,6 +7574,17 @@ class AgentServer:
                         # shrug.
                         assignment.status = FAILED
                         assignment.push_failure_reason = _push_failure_reason
+                    elif _policy_refusal_reason is not None:
+                        # #2234: clean exit, no commits, and the worker's own
+                        # final message cites a standing repo-rule
+                        # prohibition — a distinct, permanent shape of "0
+                        # commits", not the generic #448 ADVISORY. Checked
+                        # BEFORE `_zero_commit_reason` (the two are mutually
+                        # exclusive by construction — see the `_reap`
+                        # computation above — so the order is never actually
+                        # load-bearing, kept parallel to it for readability).
+                        assignment.status = REFUSED_POLICY
+                        assignment.policy_refusal_reason = _policy_refusal_reason
                     elif _zero_commit_reason is not None:
                         # #448: clean exit but no commits → advisory, not done.
                         assignment.status = ADVISORY

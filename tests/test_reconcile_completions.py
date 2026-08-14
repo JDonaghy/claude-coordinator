@@ -165,6 +165,27 @@ def test_maps_failed_and_advisory() -> None:
     assert by == {"w1": "failed", "w2": "advisory"}
 
 
+def test_refused_policy_is_persisted_not_downgraded_to_failed() -> None:
+    """#2234: without `_AGENT_TERMINAL_STATUS`'s `refused_policy` entry, this
+    is exactly the "unrecognised status" shape that used to leave the row on
+    `status="running"` forever — `_AGENT_TERMINAL_STATUS.get(...)` would
+    return `None` and the whole entry gets `continue`d past, never even
+    reaching `mark_failed_by_id`. This is the daemon's PASSIVE tick — the
+    primary production path a completion is first observed on — so this
+    regression guard matters more than the CLI-level ones."""
+    rec = _Recorder()
+    reconcile_completed_assignments(
+        _config(),
+        board=_board(_running("w1", atype="work")),
+        agent_status_fn=lambda host: {"completed": [
+            {"id": "w1", "status": "refused_policy"},
+        ]},
+        update_state_fn=rec, capture_plan=False,
+    )
+    by = {c["assignment_id"]: c["terminal_status"] for c in rec.calls}
+    assert by == {"w1": "refused_policy"}
+
+
 def test_usage_limit_reason_propagated_from_agent_entry() -> None:
     """#1461: a usage-limit kill is carried on the agent's completed entry
     (AgentServer._reap stamps ``usage_limit_reason``) and must be forwarded

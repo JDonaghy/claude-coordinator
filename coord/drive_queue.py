@@ -73,6 +73,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from coord.drive_state import TERMINAL_STATUSES, WORK_LIKE
 from coord.gate_a import is_gate_a_refusal_reason
 from coord.merge_queue import PLAN_READY, is_ci_infra_reason, is_ci_pending_reason
+from coord.models import is_policy_refusal_reason
 
 # ── queue states ─────────────────────────────────────────────────────────────
 #
@@ -1629,6 +1630,40 @@ def _reconcile_running(
             None,
         )
 
+    # #2234 rides the SAME evidence as `refused` below (the drive's own
+    # `drive_exited` reason) but, like #2063 above, reaches the OPPOSITE
+    # conclusion from a PLAIN `EXIT_TERMINAL_FAILURE` — `coord.drive.
+    # _decide` marks a `refused_policy` work row with `POLICY_REFUSAL_
+    # MARKER` (coord.models) rather than `EXIT_DISPATCH_REFUSED`, so this is
+    # checked purely off `own_reason` text, independent of `exit_refused`.
+    # Unlike #2063 this NEVER self-clears — a policy refusal names a
+    # STANDING rule, not a pending verdict — so it deliberately does not get
+    # the "queue resumes it automatically" wording Gate-A's park does; see
+    # `plan_tick`'s pre-pass below, which recognises this same marker and
+    # leaves the entry parked rather than falling through to the CI-park
+    # auto-resume. An operator clears it exactly like a `blocked` entry:
+    # handle it, then `coord drive-queue remove`.
+    if own_reason and is_policy_refusal_reason(own_reason):
+        reason = (
+            f"{own_reason} — parking without spending an attempt (#2234); "
+            "needs the coordinator, not a relaunch — `coord drive-queue "
+            "remove` once handled"
+        )
+        return (
+            Reconcile(
+                entry.key,
+                "parked",
+                reason,
+                occupies=False,
+                updates={
+                    "state": STATE_PARKED,
+                    "last_reason": reason,
+                    "session_name": None,
+                },
+            ),
+            None,
+        )
+
     permanent: tuple[str, str] | None = None
     if own_reason and (exit_refused or {}).get(entry.key):
         permanent = (
@@ -2515,6 +2550,18 @@ def plan_tick(
                 )
             )
             states[entry.key] = STATE_WAITING
+            continue
+        # #2234: a policy-refusal park has NO external verdict to poll for —
+        # the rule it names is standing, not pending — so unlike the Gate-A
+        # branch just above, this one never resumes itself. Without this
+        # check the entry would fall straight through to the CI-park
+        # "resume" default below (`facts.merge_ci_pending` reads False for
+        # it, exactly like a genuinely-cleared CI gate), flipping it back to
+        # `waiting` on the very next tick and relaunching `coord drive`
+        # straight into the identical refusal — the infinite park/relaunch
+        # bounce this check exists to prevent. Stays parked until a human
+        # clears it (`coord drive-queue remove`, same as `blocked`).
+        if is_policy_refusal_reason(entry.last_reason):
             continue
         if park_expired is not None:
             # Deliberately does NOT claim CI has reported — nothing here knows
