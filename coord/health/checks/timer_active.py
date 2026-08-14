@@ -65,7 +65,9 @@ _INACTIVE_STATES = frozenset(
 )
 
 
-def _timer_states(units: tuple[str, ...]) -> dict[str, dict[str, str]]:
+def _timer_states(
+    units: tuple[str, ...], *, runner=None, timeout: float = _SYSTEMCTL_TIMEOUT,
+) -> dict[str, dict[str, str]]:
     """One ``systemctl --user show`` call for every timer in *units*.
 
     Batched into a single subprocess the same way
@@ -74,6 +76,13 @@ def _timer_states(units: tuple[str, ...]) -> dict[str, dict[str, str]]:
     subprocess, not N. Returns ``{}`` when there is no systemd on this host
     (macOS, a container, a thin client) — that is "no data", handled by the
     caller, not a crash.
+
+    *runner*/*timeout* are injectable (default: ``subprocess.run`` and this
+    module's own budget) so :mod:`coord.deploy_units` can reuse this exact
+    query — rather than re-implementing "is this timer already enabled" a
+    second time — for its own ``enable --now`` vs. leave-it-alone decision
+    (#2124). Two independent readings of the same systemd state is how a
+    detector and its fixer end up disagreeing about what "enabled" means.
     """
     if not units:
         return {}
@@ -88,12 +97,13 @@ def _timer_states(units: tuple[str, ...]) -> dict[str, dict[str, str]]:
         "--property=SubState",
         *units,
     ]
+    run = runner or subprocess.run
     try:
-        proc = subprocess.run(
+        proc = run(
             argv,
             capture_output=True,
             text=True,
-            timeout=_SYSTEMCTL_TIMEOUT,
+            timeout=timeout,
             check=False,
         )
     except (OSError, subprocess.SubprocessError):

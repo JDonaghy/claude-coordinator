@@ -1339,6 +1339,13 @@ def _roll_units(machine, *, agent_port: int) -> tuple[bool | None, str]:
     Returns ``ok=None`` when this host offers no channel for the lane at all
     (see :func:`_roll_tui` and #2052): the run is not accountable for a lane
     it was structurally unable to roll.
+
+    Also names every timer whose *enablement* state this call changed
+    (#2124 item 3) — and, separately, every timer it deliberately left
+    alone because it was already enabled (see
+    :func:`coord.deploy_units.enable_timers`) — so "the queue came back
+    mid-roll" (or, after this fix, "it didn't") is legible in this output
+    rather than reconstructed afterwards from journal timestamps.
     """
     status, body, error = _post(
         f"http://{machine.host}:{agent_port}/deploy-units", {}, timeout=30.0
@@ -1352,7 +1359,16 @@ def _roll_units(machine, *, agent_port: int) -> tuple[bool | None, str]:
         # gate to revert everything else this run got right (#2052).
         return None, ("agent has no /deploy-units yet (predates #1835) — "
                       "the next propagation will roll this lane")
-    if status != 200:
+    # The endpoint (`agent_app.py`'s `deploy_units`) returns HTTP 500 — with
+    # the SAME body shape as 200 — whenever a daemon-reload or a single
+    # timer's enablement fails. That is exactly the partial-failure path
+    # this function exists to narrate in detail, so a 500 *with a `units`
+    # body* must still be parsed below rather than treated as opaque. A 500
+    # WITHOUT a `units` body is a different, genuinely-unexpected failure
+    # (an unhandled exception, a proxy error, ...) and must still
+    # short-circuit, or a real crash would be misread as "nothing to
+    # report" / a false-positive success.
+    if status != 200 and not (status == 500 and "units" in body):
         return False, str(body.get("error") or body.get("summary") or f"HTTP {status}")
     units = body.get("units") or []
     changed = [u.get("name") for u in units if u.get("action") == "updated"]
@@ -1366,7 +1382,32 @@ def _roll_units(machine, *, agent_port: int) -> tuple[bool | None, str]:
             f"{len(new)} packaged unit(s) NOT installed here ({', '.join(sorted(map(str, new)))}) "
             "— a release does not decide which services a host runs"
         )
-    return True, "; ".join(parts)
+
+    timers = body.get("timers_enabled") or {}
+    started = sorted(
+        name for name, r in timers.items()
+        if isinstance(r, dict) and r.get("ok") and r.get("changed")
+    )
+    held = sorted(
+        name for name, r in timers.items()
+        if isinstance(r, dict) and r.get("ok") and not r.get("changed")
+    )
+    failed_timers = {
+        name: (r.get("detail") or "?")
+        for name, r in timers.items() if isinstance(r, dict) and not r.get("ok")
+    }
+    if started:
+        parts.append(f"enabled timer(s): {', '.join(started)}")
+    if held:
+        # Confirmed already-enabled and deliberately left alone — the
+        # #2124 fix in one word: a timer an operator stopped is still here.
+        parts.append(f"left stopped as-is (already enabled, #2124): {', '.join(held)}")
+    if failed_timers:
+        parts.append(
+            "FAILED to enable timer(s): "
+            + ", ".join(f"{u} ({detail})" for u, detail in sorted(failed_timers.items()))
+        )
+    return not failed_timers, "; ".join(parts)
 
 
 def _roll_tui(

@@ -1287,6 +1287,116 @@ def test_roll_python_posts_a_meaningful_initiator(monkeypatch):
     assert initiator.startswith("coord release propagate -> server python lane (")
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# #2124: `_roll_units`'s output must name every timer whose state it
+# changed — and, distinctly, every one it confirmed already enabled and
+# deliberately left alone (the operator-stopped-it-on-purpose case) — so
+# "the queue came back mid-roll" (or, after this fix, didn't) is legible in
+# `coord release propagate`'s own printed output, not reconstructed
+# afterwards from journal timestamps.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def test_roll_units_names_a_timer_it_started(monkeypatch):
+    monkeypatch.setattr(
+        release_cmd, "_post",
+        lambda url, payload, *, timeout: (200, {
+            "ok": True, "units": [], "reloaded": False,
+            "timers_enabled": {
+                "coord-agent.timer": {"ok": True, "changed": True, "detail": "enabled"},
+            },
+        }, ""),
+    )
+    ok, detail = release_cmd._roll_units(_machine(), agent_port=7433)
+    assert ok
+    assert "enabled timer(s): coord-agent.timer" in detail
+
+
+def test_roll_units_names_a_timer_it_left_alone(monkeypatch):
+    """#2124's acceptance item 3: the exact text an operator greps for after
+    a roll to confirm the timer they stopped is still stopped."""
+    monkeypatch.setattr(
+        release_cmd, "_post",
+        lambda url, payload, *, timeout: (200, {
+            "ok": True, "units": [], "reloaded": False,
+            "timers_enabled": {
+                "coord-drive-queue.timer": {
+                    "ok": True, "changed": False,
+                    "detail": "already enabled (ActiveState=inactive) — left its "
+                              "current run state alone",
+                },
+            },
+        }, ""),
+    )
+    ok, detail = release_cmd._roll_units(_machine(), agent_port=7433)
+    assert ok
+    assert "left stopped as-is" in detail
+    assert "coord-drive-queue.timer" in detail
+    # And it must NOT also claim to have enabled it.
+    assert "enabled timer(s)" not in detail
+
+
+def test_roll_units_names_both_in_one_report(monkeypatch):
+    """Started and held timers are independent per-unit outcomes — a run
+    with one of each must name both, not collapse to whichever it saw last."""
+    monkeypatch.setattr(
+        release_cmd, "_post",
+        lambda url, payload, *, timeout: (200, {
+            "ok": True, "units": [], "reloaded": False,
+            "timers_enabled": {
+                "coord-release-propagate.timer": {
+                    "ok": True, "changed": True, "detail": "enabled",
+                },
+                "coord-drive-queue.timer": {
+                    "ok": True, "changed": False, "detail": "already enabled",
+                },
+            },
+        }, ""),
+    )
+    ok, detail = release_cmd._roll_units(_machine(), agent_port=7433)
+    assert ok
+    assert "coord-release-propagate.timer" in detail
+    assert "coord-drive-queue.timer" in detail
+
+
+def test_roll_units_fails_the_lane_on_a_failed_timer(monkeypatch):
+    """A 500 with a `units` body (agent_app.py's `deploy_units` returns
+    exactly this shape on any timer failure) must still be parsed for
+    per-timer detail, the same partial-failure convention `_roll_restart`
+    already uses for `/restart-services` — never an opaque 'HTTP 500' that
+    throws away which timer actually failed."""
+    monkeypatch.setattr(
+        release_cmd, "_post",
+        lambda url, payload, *, timeout: (500, {
+            "ok": False, "units": [], "reloaded": False,
+            "timers_enabled": {
+                "coord-agent.timer": {
+                    "ok": False, "changed": False, "detail": "enable failed",
+                },
+            },
+        }, ""),
+    )
+    ok, detail = release_cmd._roll_units(_machine(), agent_port=7433)
+    assert ok is False
+    assert "FAILED to enable timer(s)" in detail
+    assert "coord-agent.timer" in detail
+    assert "enable failed" in detail
+
+
+def test_roll_units_never_reports_a_timer_it_never_asked_about(monkeypatch):
+    """#2124 item 4: a run with no timers at all must not invent a report
+    about one — `timers_enabled` empty means nothing about timers is said."""
+    monkeypatch.setattr(
+        release_cmd, "_post",
+        lambda url, payload, *, timeout: (200, {
+            "ok": True, "units": [], "reloaded": False, "timers_enabled": {},
+        }, ""),
+    )
+    ok, detail = release_cmd._roll_units(_machine(), agent_port=7433)
+    assert ok
+    assert "timer" not in detail.lower()
+
+
 def test_rollback_host_posts_the_caller_supplied_initiator(monkeypatch):
     """#2121: `_rollback_host` is the sibling of `_roll_python` above — same
     fleet-automation shape, same obligation to name itself on the target
