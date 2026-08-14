@@ -963,12 +963,13 @@ def _repo_onboarding_lines(cfg, statuses) -> list[tuple[bool, str]]:
     two-thirds onboarded for days and the only thing that ever noticed was a
     queue entry dying of it.
 
-    Runs with ``probe_github=False`` and no graph probe, so it costs **zero**
-    extra round trips — it re-reads the ``/health`` bodies this command has
-    already fetched. That is enough for the finding that actually bit: the
-    #2219 agent/config repo skew is visible from ``/health`` alone. The GitHub
-    and repo-contents layers need ``coord repo doctor <name>``, which the
-    footer below points at.
+    Runs with ``probe_github=False`` and no local-disk graph probe, so it costs
+    **zero** extra round trips — it re-reads the ``/health`` bodies this
+    command has already fetched. That is enough for the two findings that
+    actually bit: the #2219 agent/config repo skew, and (since #2237) a repo
+    with no graph on any machine that runs workers — both visible from
+    ``/health`` alone. The GitHub and repo-contents layers need ``coord repo
+    doctor <name>``, which the footer below points at.
 
     Mirrors :func:`_unit_drift_lines`/:func:`_release_lag_lines`: same
     computation as the dedicated command (#2096's "two surfaces, one

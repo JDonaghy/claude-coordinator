@@ -1028,8 +1028,12 @@ def evaluate_contents(facts: RepoFacts) -> list[Finding]:
     return out
 
 
-def _evaluate_graph_fleet(facts: RepoFacts) -> list[Finding]:
+def _evaluate_graph_fleet(facts: RepoFacts, *, local_is_covered: bool = False) -> list[Finding]:
     """Layer 5, per machine that runs workers for this repo (#2237 items 2+4).
+
+    *local_is_covered* says the caller is about to suppress the local-clone
+    findings as a duplicate of one of these machines' — which decides who
+    reports the versioned-hooks gap when no agent is new enough to answer it.
 
     Severity rule, and the reason it differs from #2220's flat WARN:
 
@@ -1126,12 +1130,34 @@ def _evaluate_graph_fleet(facts: RepoFacts) -> list[Finding]:
     # The versioned half, reported once for the repo rather than per machine:
     # `.githooks/` is tracked, so its absence is identical everywhere and its
     # fix is a PR, not a command an operator runs per box.
-    if probed and all(m.hooks_shipped is False for m in probed):
+    #
+    # Only machines that actually answered the question get a vote: an agent
+    # older than #2237 publishes no `hooks_shipped`, and counting its silence
+    # as either answer would be inventing evidence. With no votes at all, the
+    # local clone (if there is one) is the only witness available.
+    votes = [m.hooks_shipped for m in probed if m.hooks_shipped is not None]
+    if votes:
+        not_ported = all(v is False for v in votes)
+        witnesses = ", ".join(
+            m.machine for m in probed if m.hooks_shipped is False
+        )
+    elif local_is_covered:
+        # Every agent is too old to answer and the local findings (which would
+        # otherwise carry this) are being suppressed as a duplicate of the
+        # fleet's — so the local clone's answer is reported here instead. When
+        # the local findings are NOT suppressed they report it themselves, and
+        # emitting it from both places would double-count it.
+        not_ported = bool(facts.graph.probed and not facts.graph.hooks_shipped)
+        witnesses = "this machine's clone"
+    else:
+        not_ported = False
+        witnesses = ""
+    if not_ported:
         out.append(Finding(
             layer="graph", check="graph.hooks_not_ported", severity=WARN,
             summary=(
                 "this repo ships no .githooks/post-checkout (confirmed on "
-                f"{', '.join(m.machine for m in probed)}) — worktrees get no "
+                f"{witnesses}) — worktrees get no "
                 "linked graph on ANY machine, so every worker on this repo "
                 "silently falls back to grep"
             ),
@@ -1193,13 +1219,16 @@ def evaluate_graph(facts: RepoFacts) -> list[Finding]:
     """
     out: list[Finding] = []
     g = facts.graph
-    out.extend(_evaluate_graph_fleet(facts))
     probed_paths = {
         str(Path(m.repo_path).expanduser())
         for m in g.machines
         if m.probed and m.repo_path
     }
-    if g.probed and g.repo_path and str(Path(g.repo_path).expanduser()) in probed_paths:
+    local_is_covered = bool(
+        g.probed and g.repo_path and str(Path(g.repo_path).expanduser()) in probed_paths
+    )
+    out.extend(_evaluate_graph_fleet(facts, local_is_covered=local_is_covered))
+    if local_is_covered:
         # The local clone IS one of the machines just reported on — saying it
         # twice, once per source, is how a report teaches people to skim it.
         return out
@@ -1351,9 +1380,19 @@ def summary_line(report: RepoDoctorReport) -> str:
     )
 
 
-# The layers ``coord doctor`` folds in. Deliberately just the one that reads
-# LIVE state (each agent's `/health`) — see :func:`doctor_summary_lines`.
-DOCTOR_LIVE_LAYERS: tuple[str, ...] = ("machines",)
+# The layers ``coord doctor`` folds in. Deliberately only the ones that read
+# LIVE state from each agent's `/health` — see :func:`doctor_summary_lines`.
+#
+# #2237 added `graph`: it now reads the same `/health` bodies `machines` does
+# (per-machine graph readiness, no extra round trip) and it CRITs at exactly
+# one condition — no machine that runs workers has a graph at all. That is the
+# state coord-portal and stick-demo sat in for weeks while `coord doctor`
+# reported the fleet clean, because layer 5 graded everything WARN and warnings
+# are aggregated into `ok=true`. A repo where the graph-first rule in every
+# worker prompt cannot be obeyed by anyone belongs in the fleet report; a
+# stale-or-missing graph on ONE machine still does not (it is WARN, and the
+# agent's self-heal is already rebuilding it).
+DOCTOR_LIVE_LAYERS: tuple[str, ...] = ("machines", "graph")
 
 
 def doctor_summary_lines(
