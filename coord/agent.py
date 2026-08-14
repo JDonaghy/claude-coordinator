@@ -756,17 +756,30 @@ def _graphify_update(repo_path: Path, *, timeout: float = 600.0) -> tuple[bool, 
 # across N consecutive legs means the prompt instruction isn't landing.
 # Deliberately NOT a DB column: this is a cheap, best-effort signal, not a
 # gate anything blocks on, so it stays out of the Assignment schema/migrations.
-_GRAPHIFY_INVOCATION_RE = re.compile(r"(?:^|[;&|]\s*)graphify(?:\s|$)")
+# Separators recognized before a command token: `;`, `&`, `|` (covers `&&`
+# and `||` too, since `\s*` after the class soaks up the second char) and a
+# bare newline — Claude Code's Bash tool very commonly emits multi-line
+# command strings (e.g. `cd repo\ngraphify query "foo"`) that aren't joined
+# with `;`/`&&`, so newline must count as a separator or those legs
+# undercount to 0 (#2212 review).
+_GRAPHIFY_INVOCATION_RE = re.compile(r"(?:^|[\n;&|]\s*)graphify(?:\s|$)")
 
 
 def _count_graphify_invocations(bash_commands: list[str]) -> int:
     """Count *bash_commands* entries that invoke the ``graphify`` CLI.
 
-    Matches ``graphify`` as a command token — at the start of the string or
-    after a shell separator (``;``, ``&&``, ``||``, ``|``) — so ``graphify
-    query "..."`` counts but a path or string that merely contains the
-    substring ``graphify`` (e.g. ``cat graphify-out/graph.json``, where
-    ``graphify`` is a path component rather than a command) does not.
+    Matches ``graphify`` as a command token — at the start of the string,
+    after a shell separator (``;``, ``&&``, ``||``, ``|``), or after a bare
+    newline (multi-line Bash tool calls, e.g. ``cd repo\\ngraphify query
+    "..."``) — so ``graphify query "..."`` counts but a path or string that
+    merely contains the substring ``graphify`` (e.g. ``cat
+    graphify-out/graph.json``, where ``graphify`` is a path component rather
+    than a command) does not.
+
+    Note this counts matching *entries* in ``bash_commands``, not individual
+    invocations: a single command like ``"graphify query a && graphify query
+    b"`` counts once, not twice. Treat the result as an "at least one graph
+    query this leg" signal, not an exact invocation tally.
     """
     return sum(1 for cmd in bash_commands if cmd and _GRAPHIFY_INVOCATION_RE.search(cmd))
 
@@ -2902,6 +2915,11 @@ absolute path outside your cwd). That shared checkout is not yours: edits \
 there are lost, or collide with other workers running at the same time. If \
 your worktree looks unexpectedly empty or unwritable, STOP and report it — \
 do not fall back to editing the base checkout and copying files over.
+- For "where is X handled" / "what calls this" / architecture questions, \
+query the codebase graph first: `graphify query "<question>"` via Bash. \
+Grep/Read are for confirming an exact string or line, not for discovering \
+structure. No `graphify-out/graph.json` in this worktree? Skip straight to \
+grep, silently — do not stop to build one (#2212).
 
 This session is ONE-SHOT and non-interactive (#1394):
 - There is no next turn and no human to reply to you. Background-task \
@@ -2927,11 +2945,6 @@ better than a perfect uncommitted diff, which is worth nothing.
 - Your final message is the LAST thing you will ever say. Never end it with \
 "I'll continue", "waiting for X", or "will follow up" — finish or report \
 the blocker.
-- For "where is X handled" / "what calls this" / architecture questions, \
-query the codebase graph first: `graphify query "<question>"` via Bash. \
-Grep/Read are for confirming an exact string or line, not for discovering \
-structure. No `graphify-out/graph.json` in this worktree? Skip straight to \
-grep, silently — do not stop to build one (#2212).
 
 Before writing any code, verify the feature or fix isn't already implemented. \
 Grep for relevant function names, check existing modules, and read related files. \
