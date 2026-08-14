@@ -4353,6 +4353,23 @@ def process(
                         else evaluate_smoke_verdict(entry, board, gh_ops)
                     )
                     if _smoke is None or not _smoke.ok:
+                        # #2231: mirror the live path (line ~4689) — before
+                        # previewing a block on a stale verdict, check whether
+                        # the branch is actually conflicted. A dry run that
+                        # skips this reports the misleading "test verdict
+                        # stale" headline for an entry a real run (or
+                        # `--plan`) would already report/dispatch as
+                        # `conflict`, which is precisely the split-brain this
+                        # issue exists to fix.
+                        _conflict_msg = stale_smoke_conflict_reason(
+                            entry, _smoke, gh_ops,
+                        )
+                        if _conflict_msg is not None:
+                            events.append(MergeEvent(
+                                entry, "conflict",
+                                f"(dry run) {_conflict_msg}",
+                            ))
+                            continue
                         _why = (
                             "board unavailable to confirm smoke verdict"
                             if _smoke is None
