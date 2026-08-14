@@ -107,6 +107,21 @@ Sync is cursor-based and idempotent. Every record carries a stable id and a mono
 daemon replays from its cursor on restart. A submission is never lost because the daemon was down —
 it queues, which is the entire point of an inbox.
 
+**Ordering is coord's problem, not the portal's** (#1982, learned from dogfood #835 in production).
+Some statuses do not merely display — `awaiting-signoff` *emails the customer* "your design is ready,
+go approve it", and `needs-input` announces a question. `status` and `design_round` are separate
+fields and **both are coord-owned**, so the portal accepts an announcement with nothing behind it and
+mails the customer toward an empty screen; there is nothing it could check. So the push half is a
+durable **outbox**, drained one row at a time in per-submission order, and an announcing row is not
+sent until the row it announces is *confirmed applied* — not enqueued, not attempted. A crash between
+the two retries the announcement; it can never overtake its content.
+
+**Implemented in** `coord/portal_sync.py` (the loop, on `_tick_loop`'s cadence —
+`COORD_PORTAL_SYNC_INTERVAL`, default 60 s), `coord/portal_store.py` (the `portal_*` tables), and
+`coord/portal_bridge.py` (the HTTP client). `coord portal sync | outbox | events | enqueue-*` is the
+operator surface; it is a daemon-host command group because the bridge's cursor lives in the daemon's
+`coord.db`.
+
 ## The customer loop
 
 ```

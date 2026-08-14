@@ -809,6 +809,33 @@ def _sync_issues_tick(config: Config) -> int:
     return total
 
 
+def _portal_sync_tick(config: Config):  # noqa: ANN201 — coord.portal_sync.SyncResult
+    """Run one pass of the customer-portal sync bridge (#1982, epic #836).
+
+    Called by ``_tick_loop`` on its own cadence (``COORD_PORTAL_SYNC_INTERVAL``,
+    default 60 s; 0 disables) and only when ``portal.enabled`` is set — an
+    absent ``portal:`` block means this never fires and no existing deployment
+    changes behaviour.
+
+    Delegates entirely to :func:`coord.portal_sync.sync_tick`, which is
+    documented never to raise: the portal is a third party on the public
+    internet and an outage there must never touch dispatch, merge, or any
+    verdict.  The caller's try/except is the belt to that braces.
+
+    Extracted as a module-level function so tests can call it directly without
+    wiring up the async ``_tick_loop`` infrastructure (mirrors
+    ``_passive_tick`` / ``_sync_issues_tick``).
+
+    Writes straight to the local DB via :mod:`coord.portal_store` for the same
+    reason ``_sync_issues_tick`` calls ``_upsert_open_issues_local``: this
+    function IS the daemon, so a daemon-routed write would be a
+    self-referential HTTP call.
+    """
+    from coord import portal_sync  # noqa: PLC0415
+
+    return portal_sync.sync_tick(config)
+
+
 def _reap_merged_sessions_tick(config: Config) -> list[str]:
     """Kill detached interactive MERGE sessions once their board row is 'merged'.
 
@@ -6794,6 +6821,23 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         # a redeploy turns into a burst of phone pushes.
         last_notifier = _time.monotonic()
 
+        # #1982: customer-portal sync bridge on its own cadence (default 60 s;
+        # 0 disables).  Slower than the 30 s tick because the portal is over
+        # the public internet and latency there is a product decision, not a
+        # bug (docs/CUSTOMER_PORTAL.md, "Risks") — and faster polling, never
+        # an inbound webhook, is the only lever this design allows.
+        try:
+            portal_sync_interval = float(
+                os.environ.get("COORD_PORTAL_SYNC_INTERVAL", "60")
+            )
+        except ValueError:
+            portal_sync_interval = 60.0
+        # Start at 0 so a freshly (re)started daemon syncs on its first tick:
+        # a submission made while the daemon was down has been sitting in the
+        # portal's queue, and the heartbeat the portal uses to decide whether
+        # to trust the status it is showing is stale by exactly the downtime.
+        last_portal_sync = 0.0
+
         # #1220: fleet-wide orphaned-worktree sweep on its own slow cadence
         # (default hourly; 0 disables).  Separate timer from housekeeping/
         # merges above since it's a different kind of maintenance (per-machine
@@ -6868,7 +6912,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
 
         async def _tick_loop() -> None:
             nonlocal last_housekeeping, last_merge_reconcile, last_worktree_clean, last_wal_checkpoint
-            nonlocal last_notify_drain, last_notifier
+            nonlocal last_notify_drain, last_notifier, last_portal_sync
             from coord.reconcile import reconcile_completed_assignments  # noqa: PLC0415
             from coord import merge_queue as _mq  # noqa: PLC0415
 
@@ -7089,6 +7133,45 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                         )
                 except Exception:  # noqa: BLE001
                     log.warning("milestone-progress tick failed", exc_info=True)
+                # Step 3d: #1982 (epic #836) — the customer-portal sync
+                # bridge: pull customer-authored events, push coord-owned
+                # facts, heartbeat.  THE loop the portal design hangs on.
+                #
+                # Placed after the pipeline-critical steps above and behind
+                # its own slower timer for two reasons: it talks to the public
+                # internet (three HTTP round-trips minimum, more with a
+                # backlog), and nothing above it may ever wait on a third
+                # party.  Gated on config.portal.enabled, so a deployment with
+                # no `portal:` block never fires it at all.
+                #
+                # OUTBOUND ONLY, and staying that way: if this feels slow, cut
+                # COORD_PORTAL_SYNC_INTERVAL.  Do not add an inbound webhook —
+                # the portal holding no path into the tailnet is the security
+                # boundary (docs/EPHEMERAL_WORKERS.md), and it is worth more
+                # than the latency.
+                #
+                # `sync_tick` is documented never to raise; this try/except is
+                # the belt to that braces, on the #1632/#1485 precedent that a
+                # third-party outage must not affect dispatch or any verdict.
+                if (
+                    portal_sync_interval > 0
+                    and getattr(config.portal, "enabled", False)
+                    and _time.monotonic() - last_portal_sync >= portal_sync_interval
+                ):
+                    last_portal_sync = _time.monotonic()
+                    try:
+                        portal_result = await run_in_threadpool(
+                            _portal_sync_tick, config
+                        )
+                        if portal_result.moved or portal_result.errors:
+                            log.info("%s", portal_result.summary())
+                        elif not portal_result.heartbeat_ok:
+                            # A quiet pass that could not even heartbeat is the
+                            # one thing worth saying out loud: the portal is
+                            # now showing a status nothing is refreshing.
+                            log.warning("%s", portal_result.summary())
+                    except Exception:  # noqa: BLE001
+                        log.warning("portal sync tick failed", exc_info=True)
                 # Step 4: #762 archival sweep on a slow cadence (default hourly).
                 # Independent try/except — a sweep failure must never crash the
                 # daemon or silence the reconcile/enqueue steps above.
