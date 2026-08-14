@@ -146,6 +146,17 @@ def test_count_graphify_invocations_empty_list() -> None:
     assert _count_graphify_invocations([]) == 0
 
 
+def test_count_graphify_invocations_counts_newline_separated_commands() -> None:
+    """Claude Code's Bash tool very commonly issues multi-line command
+    strings (`cd` then a command on the next line, multi-step scripts) not
+    joined with `&&`/`;`. A bare newline must count as a separator, or a
+    worker that genuinely queried the graph gets silently undercounted to
+    0 — undermining the "0 across N legs" landing signal (#2212 review)."""
+    assert _count_graphify_invocations(['cd repo\ngraphify query "foo"']) == 1
+    assert _count_graphify_invocations(["set -e\ngraphify update .\n"]) == 1
+    assert _count_graphify_invocations(["cd repo\n  graphify query x"]) == 1
+
+
 # ── Default ReviewsConfig checklist ─────────────────────────────────────────
 
 
