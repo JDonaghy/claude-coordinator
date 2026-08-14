@@ -413,6 +413,37 @@ class TestRefusedPolicyNotify:
             notify_mod.run(config)
         assert "rp-run3" in state_mod.load_notified()
 
+    def test_refused_policy_persists_status_column(
+        self, coord_dir: Path, config: Config
+    ) -> None:
+        """The `assignments.status` column must end up `refused_policy`, not
+        `failed`.
+
+        Before this fix, `_mark_notified_local` had no `EVENT_REFUSED_POLICY`
+        branch, so this write fell into the bare `else` (meant for
+        `EVENT_FAILURE` and anything unrecognized) and stamped
+        `status='failed'` right after `post_transition` posted the "Refused"
+        comment — silently reverting the correct classification one layer
+        below the notified ledger checked by
+        `test_refused_policy_marked_notified` above.
+        """
+        _record("rp-run6")
+        agent_status = {
+            "active": [],
+            "completed": [
+                _agent_completed("rp-run6", "refused_policy", exit_code=0)
+            ],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment"):
+            notify_mod.run(config)
+        row = state_mod.get_connection().execute(
+            "SELECT status FROM assignments WHERE assignment_id=?",
+            ("rp-run6",),
+        ).fetchone()
+        assert row is not None, "assignment row must exist"
+        assert row["status"] == "refused_policy"
+
     def test_refused_policy_idempotent(self, coord_dir: Path, config: Config) -> None:
         _record("rp-run4")
         agent_status = {

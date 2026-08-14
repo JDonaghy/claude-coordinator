@@ -778,6 +778,36 @@ def _decide_acceptance_author(
             "   or re-run coord drive with --no-acceptance."
         )
 
+    if status == "refused_policy":
+        # #2234 fix-1: `type="test-author"` is one of `_ZERO_COMMIT_TYPES`
+        # (coord.agent), so a JIT acceptance-author row goes through the
+        # identical `_looks_like_policy_refusal` classification as a plain
+        # `work` row and can reap `status="refused_policy"` exactly like
+        # `decide()`'s own `state.work_status == "refused_policy"` branch
+        # above handles. Before this branch existed, this status fell
+        # straight through every check here into the final catch-all
+        # `_wait(...)` below, treating a terminal, correctly-refused
+        # test-author row as "still authoring" — spinning until
+        # `--deadline` instead of parking. Mirror the `advisory` branch's
+        # #2061 check (a stale/retried refusal can still coexist with an
+        # earlier attempt's slice already landed) before dying, and embed
+        # `POLICY_REFUSAL_MARKER` so `coord/drive_queue.py`'s
+        # `_reconcile_running` parks the queue entry without spending an
+        # attempt, same as the work-status branch.
+        if _slice_already_landed():
+            return None
+        return _die(
+            f"acceptance author {aid} refused on a standing repo-rule "
+            "prohibition rather than authoring the JIT slice — the worker "
+            "did the CORRECT thing (#2234). Needs the coordinator: author "
+            "the slice directly (or re-scope so its deliverable isn't "
+            "coordinator-only), then `coord drive-queue remove "
+            f"{state.repo} {state.issue}` once handled.\n"
+            f"   inspect: coord log {aid} --machine "
+            f"{state.acceptance_author_machine or machine}\n"
+            f"   {POLICY_REFUSAL_MARKER}"
+        )
+
     if status == "advisory":
         # #1453 review finding 2: this is the #1386 bug class reborn — an
         # ``advisory`` row is TERMINAL (drive_state.TERMINAL_STATUSES) and

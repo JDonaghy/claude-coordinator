@@ -33,6 +33,7 @@ import coord.agent as agent_mod
 from coord.agent import (
     ADVISORY,
     DONE,
+    REFUSED_POLICY,
     WORKER_SYSTEM_PROMPT,
     AgentAssignment,
     AgentServer,
@@ -230,6 +231,33 @@ def test_dirty_advisory_is_not_a_bare_advisory(tmp_path: Path) -> None:
     assert a.zero_commit_reason == a.dirty_worktree_reason
     assert "0 commits" not in a.zero_commit_reason
     assert "UNVERIFIED" in a.zero_commit_reason
+
+
+def test_dirty_refused_policy_is_recorded_on_policy_refusal_reason(tmp_path: Path) -> None:
+    """#2234 fix-1 non-blocking finding: `_record_dirty_worktree` special-cased
+    ADVISORY to also rewrite `zero_commit_reason` (the field every surface
+    renders for that status) but had no equivalent for REFUSED_POLICY, whose
+    equivalent surfaced field is `policy_refusal_reason` — a dirty worktree
+    left behind by an otherwise-correct policy refusal must be visible on the
+    field `coord status` / the GitHub refused_policy comment actually read."""
+    repo = _init_local_repo(tmp_path / "repo")
+    wt = tmp_path / "wt"
+    _git(repo, "worktree", "add", "-b", "issue-1394-rp", str(wt), "HEAD")
+    (wt / "fix.py").write_text("real work\n")
+
+    server = _server(tmp_path, repo)
+    a = _make_assignment(repo, wt, status=REFUSED_POLICY, branch="issue-1394-rp")
+    # What the reap writes for a worker that correctly refused per #2234.
+    a.policy_refusal_reason = "CLAUDE.md: only the coordinator writes docs"
+    server._assignments[a.id] = a
+
+    server._cleanup_worktree(a)
+
+    assert a.dirty_worktree_reason is not None
+    assert a.policy_refusal_reason == a.dirty_worktree_reason
+    # The stale, now-superseded refusal-only line must not be what the
+    # operator sees once there's an unrecorded dirty worktree to explain.
+    assert "only the coordinator writes docs" not in a.policy_refusal_reason
 
 
 def test_wip_rescue_is_pushed_when_a_remote_exists(
