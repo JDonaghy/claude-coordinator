@@ -24,11 +24,13 @@ from __future__ import annotations
 
 import json
 import stat
+import sys
 from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
 
+from coord import __version__ as OWN_VERSION
 from coord import release_verify as rv
 from coord.config import HealthConfig, _DEFAULT_SPAWNED_COORD_UNITS
 from coord.health.checks import spawned_coord
@@ -343,6 +345,41 @@ def test_is_editable_is_unknown_not_false_without_a_module_path() -> None:
     assert spawned_coord.is_editable(None) is None
     assert spawned_coord.is_editable("/x/lib/python3.11/site-packages/coord/__init__.py") is False
     assert spawned_coord.is_editable("/home/j/src/claude-coordinator/coord/__init__.py") is True
+
+
+def test_spawned_identity_ignores_the_caller_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2227: ``python -c "import coord"`` prepends the *subprocess's* cwd to
+    ``sys.path`` before site-packages is ever consulted. With no ``cwd=`` (and
+    no ``-P``) on the ``subprocess.run`` call, that subprocess inherits
+    whatever directory the operator's shell happened to be in when they ran
+    ``coord health`` — so running it from inside a coord checkout made this
+    probe read ``./coord/__init__.py`` off the caller's cwd and report a
+    healthy, non-editable venv as an editable checkout.
+
+    Black-box per the issue: a real ``coord/`` package sitting in the
+    process's cwd must not change the verdict for a real interpreter's own
+    install. Uses the actual interpreter running this test (not a shim, like
+    :func:`_fake_coord_script`'s ``/bin/sh`` stand-in) so a regression back to
+    a bare ``[interpreter, "-c", code]`` call — with no ``-P`` — fails here.
+    """
+    decoy_root = tmp_path / "decoy-cwd"
+    decoy_pkg = decoy_root / "coord"
+    decoy_pkg.mkdir(parents=True)
+    (decoy_pkg / "__init__.py").write_text('__version__ = "999.999.999"\n')
+
+    binary = tmp_path / "coord"
+    binary.write_text(f"#!{sys.executable}\n# console script stub\n")
+    binary.chmod(binary.stat().st_mode | stat.S_IEXEC)
+
+    monkeypatch.chdir(decoy_root)
+    version, module_file, error = spawned_coord.spawned_identity(str(binary))
+
+    assert error is None
+    assert version == OWN_VERSION
+    assert module_file is not None
+    assert not Path(module_file).is_relative_to(decoy_root)
 
 
 def test_probe_is_registered_in_the_machine_scope_registry(

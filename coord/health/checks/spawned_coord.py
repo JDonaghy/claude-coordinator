@@ -227,8 +227,18 @@ def spawned_identity(binary: str) -> tuple[str | None, str | None, str | None]:
     if interpreter:
         code = "import coord;print(coord.__version__);print(coord.__file__)"
         try:
+            # -P (3.11+, this repo is 3.12+): suppress prepending the
+            # subprocess's cwd to sys.path. Without it, `python -c` resolves
+            # `import coord` against whatever directory the *health check's
+            # own caller* happens to be sitting in — so running `coord
+            # health` from inside a coord checkout makes this probe read
+            # ./coord/__init__.py instead of the spawned interpreter's real
+            # site-packages, and reports a healthy venv as editable (#2227).
+            # -P is the closer match to a real spawned worker than -I, which
+            # would also drop PYTHONPATH/user site and change what this
+            # measures.
             proc = subprocess.run(
-                [interpreter, "-c", code],
+                [interpreter, "-P", "-c", code],
                 capture_output=True,
                 text=True,
                 timeout=_VERSION_TIMEOUT,
