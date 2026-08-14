@@ -18,7 +18,33 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install -e ".[dev]"
-      - run: pytest
+      # #2180: `--ignore=tests/acceptance` — the sealed oracle-loop suite
+      # (tests/acceptance/ms-NN/) is split out of the ordinary suite and
+      # gated separately, through `coord acceptance run --all --ci` (see the
+      # `acceptance-cli` step below and the `acceptance` job further down),
+      # which honours each ms-NN/manifest.yml's `expected_red:` registry
+      # (#2164). Left in here, a red-by-design slice would fail this job
+      # outright — every ordinary PR in the repo, not just the one the slice
+      # belongs to — exactly the quadraui#554/#490 failure mode #2180 exists
+      # to close. ms-33/ms-38 (Rust, feature-gated behind test-support) and
+      # ms-51 (Playwright, not .py) were never swept in here; ms-37 (plain
+      # .py files under testpaths=["tests"]) was the one accidental gap.
+      - run: pytest --ignore=tests/acceptance
+      # #2180: the cli-pytest sealed route (acceptance.drivers routes
+      # "coord/**" -> cli-pytest -> tests/acceptance/ms-37) run through the
+      # #2164 CI wrapper instead of a raw `pytest tests/acceptance` call, so
+      # expected_red is honoured. One matrix leg only — the suite result
+      # doesn't depend on the Python version any differently than the
+      # ordinary suite above does, so running it twice would just double the
+      # cost for no new signal. See .github/coord-ci-acceptance.yml's header
+      # for why this points at a CI-local config rather than
+      # ~/.coord/coordinator.yml (unreachable from a runner).
+      - name: coord acceptance run --all --ci (cli-pytest route, ms-37)
+        if: matrix.python-version == '3.12'
+        run: >-
+          coord acceptance run --repo claude-coordinator --all --ci
+          --for-path coord/cli.py
+          --config .github/coord-ci-acceptance.yml --path .
 
   # #1895 (CP-4 slice of #1159): real Windows verification — the repo is
   # public, so `windows-latest` runners cost nothing.
@@ -83,7 +109,10 @@ jobs:
       # visible in the log as a failed test.
       - run: pip install -e ".[dev]"
         continue-on-error: true
-      - run: pytest
+      # #2180: same split as the `test` job above — the sealed acceptance
+      # suite is gated separately through the #2164 CI wrapper, not swept
+      # into this job's ordinary pytest run.
+      - run: pytest --ignore=tests/acceptance
         continue-on-error: true
 
   # #1484: run the full suite with `gh` made unresolvable on PATH.
@@ -113,7 +142,9 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -e ".[dev]"
-      - run: scripts/run_tests_without_gh.sh python -m pytest tests/ -q
+      # #2180: same split as the `test` job — the sealed acceptance suite is
+      # gated separately through the #2164 CI wrapper.
+      - run: scripts/run_tests_without_gh.sh python -m pytest tests/ -q --ignore=tests/acceptance
 
   # #2170: run the full suite in the environment of a REAL FLEET MACHINE — a
   # populated `~/.coord/` (thin-client shaped), no `sqlite3` on PATH, and a
@@ -154,7 +185,9 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -e ".[dev]"
-      - run: scripts/run_tests_in_populated_home.sh python -m pytest tests/ -q
+      # #2180: same split as the `test` job — the sealed acceptance suite is
+      # gated separately through the #2164 CI wrapper.
+      - run: scripts/run_tests_in_populated_home.sh python -m pytest tests/ -q --ignore=tests/acceptance
       - name: What a red result here means
         if: failure()
         run: |
@@ -271,6 +304,20 @@ jobs:
   # full path/title on failure, so the ms-NN + issue are already in the
   # job's own output; the failure-hint step below just spells out the two
   # possible causes so whoever triages it doesn't have to rediscover them.
+  #
+  # #2180: the `npm run test:acceptance` step now runs THROUGH `coord
+  # acceptance run --all --ci` (#2164) instead of calling Playwright
+  # directly. Same suite, same reporter under the hood — the wrapper's
+  # web-playwright driver shape appends `--reporter=json` and reads
+  # PLAYWRIGHT_JSON_OUTPUT_FILE itself (coord/acceptance_drivers.py) — but
+  # now a test-id listed in a manifest's `expected_red:` that fails does not
+  # redden this job (a sealed slice authored red before its fix exists,
+  # #2164's whole point), while one that unexpectedly PASSES does, loudly
+  # (#1965's vacuous-assertion case). Before this, ms-51 going red for any
+  # reason failed this job exactly the same as every other kind of red —
+  # there was no way to merge a red-by-design slice without `--force-merge`.
+  # .github/coord-ci-acceptance.yml's header explains why this points at a
+  # CI-local config instead of the fleet's real ~/.coord/coordinator.yml.
   acceptance:
     runs-on: ubuntu-latest
     defaults:
@@ -288,7 +335,12 @@ jobs:
           node-version: '20'
       - run: npm ci
       - run: npx playwright install chromium --with-deps
-      - run: npm run test:acceptance
+      - name: coord acceptance run --all --ci (web-playwright route, ms-51)
+        working-directory: .
+        run: >-
+          coord acceptance run --repo claude-coordinator --all --ci
+          --for-path coord/dashboard/webapp/src/App.tsx
+          --config .github/coord-ci-acceptance.yml --path .
       - name: A red result here is attributable, not a mystery
         if: failure()
         run: |
