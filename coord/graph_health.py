@@ -81,6 +81,16 @@ class GraphStatus:
     built_sha: str | None = None
     head_sha: str | None = None
     in_sync: bool = False
+    # HEAD vs origin/<default_branch> — the axis graph<->HEAD alone cannot see
+    # (#2211).  The base checkout is fetched but never pulled by design (see
+    # module docstring), so HEAD can sit arbitrarily far behind origin while
+    # graph == HEAD reports a clean bill of health.  ``default_branch`` is the
+    # branch name the comparison used; ``origin_sha`` / ``commits_behind_origin``
+    # are ``None`` when it could not be determined (no remote, ref never
+    # fetched, or the git call failed) rather than treated as "0 behind".
+    default_branch: str | None = None
+    origin_sha: str | None = None
+    commits_behind_origin: int | None = None
     age_seconds: float | None = None
     # mtime of graphify-out/manifest.json — the last time graphify *checked* the
     # graph against the working tree, whether or not it rewrote anything.
@@ -122,6 +132,19 @@ class GraphStatus:
         *unknown* — an unknown is reported separately, not counted as drift."""
         return self.stamp_behind and not self.verified_current
 
+    @property
+    def origin_behind(self) -> bool:
+        """HEAD (of the checkout that owns the graph) is behind
+        ``origin/<default_branch>`` by at least one commit — i.e. the graph
+        may match HEAD exactly and still describe stale code, because HEAD
+        itself is stale relative to the remote (#2211).
+
+        False — not True — when this could not be proven (no remote, the ref
+        was never fetched, or the git call failed): mirrors ``stale``'s rule
+        that an unknown must never be counted as drift.
+        """
+        return bool(self.commits_behind_origin)
+
 
 def read_built_sha(report_path: Path) -> str | None:
     """The commit ``GRAPH_REPORT.md`` says the graph was built from."""
@@ -161,6 +184,22 @@ def _head_committed_at(repo_path: Path) -> float | None:
         return None
 
 
+def _commits_ahead(repo_path: Path, base: str, ahead_of: str) -> int | None:
+    """Count of commits reachable from *ahead_of* that are not in *base*
+    (``git rev-list --count base..ahead_of``).
+
+    Best-effort like the rest of this module: ``None`` (never raised) when
+    git can't answer — an unproven comparison must not be reported as drift.
+    """
+    out = _git_out(repo_path, "rev-list", "--count", f"{base}..{ahead_of}")
+    if out is None:
+        return None
+    try:
+        return int(out)
+    except ValueError:
+        return None
+
+
 def _shas_agree(built: str, head: str) -> bool:
     """Compare on the shorter of the two — the report abbreviates (8 chars by
     default) while ``git rev-parse HEAD`` is full-length."""
@@ -170,12 +209,20 @@ def _shas_agree(built: str, head: str) -> bool:
     return built[:n].lower() == head[:n].lower()
 
 
-def graph_status(repo_path: Path) -> GraphStatus:
+def graph_status(repo_path: Path, default_branch: str = "main") -> GraphStatus:
     """Freshness of the graphify graph for the checkout at *repo_path*.
 
     Read-only and best-effort: a missing graph, a missing report, or a repo
     git can't read all return a populated :class:`GraphStatus` with
     ``unknown_reason`` set rather than raising.
+
+    *default_branch* names the branch to compare HEAD against on
+    ``origin`` (#2211) — pass the repo's configured default branch
+    (``coordinator.yml``'s ``default_branch``, "main" if unset).  Never
+    fetches: it only reads whatever ``origin/<default_branch>`` the last
+    ``git fetch`` left behind, so a checkout that was never fetched or has
+    no ``origin`` remote simply leaves ``origin_sha``/``commits_behind_origin``
+    unset rather than reporting drift it can't prove.
     """
     st = GraphStatus(repo_path=repo_path)
     out_dir = repo_path / "graphify-out"
@@ -213,6 +260,7 @@ def graph_status(repo_path: Path) -> GraphStatus:
     owner = st.link_target.parent if (st.is_symlink and st.link_target) else repo_path
     st.head_sha = _head_sha(owner)
     st.head_committed_at = _head_committed_at(owner)
+    st.default_branch = default_branch
 
     if not st.built_sha:
         st.unknown_reason = "GRAPH_REPORT.md has no 'Built from commit' line"
@@ -220,6 +268,15 @@ def graph_status(repo_path: Path) -> GraphStatus:
         st.unknown_reason = f"could not read HEAD of {owner}"
     else:
         st.in_sync = _shas_agree(st.built_sha, st.head_sha)
+
+    # HEAD vs origin/<default_branch> — independent of the graph<->HEAD
+    # comparison above.  Best-effort: no remote, or the ref not fetched yet,
+    # just leaves this unset (see docstring).
+    if st.head_sha:
+        origin_sha = _git_out(owner, "rev-parse", f"origin/{default_branch}")
+        if origin_sha:
+            st.origin_sha = origin_sha
+            st.commits_behind_origin = _commits_ahead(owner, st.head_sha, origin_sha)
     return st
 
 
@@ -326,17 +383,39 @@ def format_status_lines(st: GraphStatus) -> list[str]:
     if st.is_symlink:
         lines.append(f"↳ {where}/graphify-out → {st.link_target} (linked worktree)")
 
+    # #2211: graph == HEAD only proves the graph matches the checkout's own
+    # HEAD — it says nothing about whether that HEAD itself is stale relative
+    # to origin (the base checkout is fetched but never pulled, by design;
+    # see module docstring).  Shared by both "graph matches HEAD" branches
+    # below so a genuinely-current-but-unpushed-tracking checkout doesn't
+    # report a false ✓.
+    origin_note = ""
+    if st.origin_behind:
+        n = st.commits_behind_origin or 0
+        origin_note = (
+            f" — HEAD is {n} commit{'' if n == 1 else 's'} behind "
+            f"origin/{st.default_branch}; the graph describes stale code "
+            f"(fix: review + pull — not automatic, see #2211)"
+        )
+
     if st.unknown_reason:
         lines.append(f"? {where}: freshness unknown — {st.unknown_reason}")
     elif st.in_sync:
-        lines.append(f"✓ {where}: graph in sync (built from {st.built_sha})")
+        if origin_note:
+            lines.append(
+                f"⚠ {where}: graph matches HEAD (built from {st.built_sha}){origin_note}"
+            )
+        else:
+            lines.append(f"✓ {where}: graph in sync (built from {st.built_sha})")
     elif st.verified_current:
         # Stamp behind, but graphify has re-checked the tree since HEAD landed
         # and found no topology change — the graph content is current.
+        mark = "⚠" if origin_note else "✓"
         lines.append(
-            f"✓ {where}: graph content current — stamp says {st.built_sha} "
+            f"{mark} {where}: graph content current — stamp says {st.built_sha} "
             f"(HEAD {(st.head_sha or '')[:8]}), but verified against the tree "
-            f"since; graphify leaves outputs untouched when topology is unchanged"
+            f"since; graphify leaves outputs untouched when topology is "
+            f"unchanged{origin_note}"
         )
     else:
         lines.append(

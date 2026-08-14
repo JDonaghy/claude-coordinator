@@ -629,7 +629,9 @@ def _graph_status(**kwargs):
 
 
 def _fake_graph(monkeypatch, status, hooks: tuple[bool, str]) -> None:
-    monkeypatch.setattr("coord.graph_health.graph_status", lambda p: status)
+    monkeypatch.setattr(
+        "coord.graph_health.graph_status", lambda p, default_branch="main": status
+    )
     monkeypatch.setattr("coord.graph_health.hooks_path_status", lambda p: hooks)
 
 
@@ -783,6 +785,62 @@ def test_graph_in_sync_never_computes_commit_distance(tmp_path, monkeypatch) -> 
     ctx = make_ctx(tmp_path, checkouts=(_checkout(tmp_path),))
     (result,) = graph.probe_graph(ctx)
     assert result.values["commits_behind"] is None
+
+
+def test_graph_matches_head_but_head_behind_origin_is_warn(tmp_path, monkeypatch) -> None:
+    """#2211: graph == HEAD (in_sync True, stale False) alone used to render
+    OK/"in sync" — a confidently-correct-looking graph of stale code, because
+    the base checkout is fetched but never pulled. This axis is independent
+    of `stale` and must WARN even though the graph<->HEAD comparison is
+    clean."""
+    _fake_graph(
+        monkeypatch,
+        _graph_status(present=True, built_sha="abc12345", head_sha="abc12345",
+                      in_sync=True, age_seconds=3600.0,
+                      default_branch="main", commits_behind_origin=7),
+        (True, "core.hooksPath=.githooks"),
+    )
+    ctx = make_ctx(tmp_path, checkouts=(_checkout(tmp_path),))
+    (result,) = graph.probe_graph(ctx)
+    assert result.severity is Severity.WARN
+    assert "7 commit" in result.headroom
+    assert "origin/main" in result.headroom
+    assert "in sync" not in result.headroom
+    assert result.values["origin_behind"] is True
+    assert "pull" in result.detail
+
+
+def test_graph_in_sync_on_both_axes_stays_ok(tmp_path, monkeypatch) -> None:
+    """The companion case: HEAD matches both the graph and origin — still a
+    plain OK, no origin-drift warning."""
+    _fake_graph(
+        monkeypatch,
+        _graph_status(present=True, built_sha="abc12345", head_sha="abc12345",
+                      in_sync=True, age_seconds=3600.0,
+                      default_branch="main", commits_behind_origin=0),
+        (True, "core.hooksPath=.githooks"),
+    )
+    ctx = make_ctx(tmp_path, checkouts=(_checkout(tmp_path),))
+    (result,) = graph.probe_graph(ctx)
+    assert result.severity is Severity.OK
+    assert "in sync" in result.headroom
+
+
+def test_graph_stale_takes_precedence_over_origin_drift(tmp_path, monkeypatch) -> None:
+    """When the graph itself is stale (graph != HEAD), that's still reported
+    exactly as before — the origin axis is additive, never a replacement,
+    and must not soften or relabel an existing STALE/CRIT/WARN verdict."""
+    _fake_graph(
+        monkeypatch,
+        _graph_status(present=True, built_sha="aaaa1111", head_sha="bbbb2222",
+                      in_sync=False, age_seconds=100 * 3600.0,
+                      default_branch="main", commits_behind_origin=7),
+        (True, "core.hooksPath=.githooks"),
+    )
+    ctx = make_ctx(tmp_path, checkouts=(_checkout(tmp_path),))
+    (result,) = graph.probe_graph(ctx)
+    assert result.severity is Severity.CRIT
+    assert "stale" in result.headroom
 
 
 # ── plan usage ───────────────────────────────────────────────────────────────

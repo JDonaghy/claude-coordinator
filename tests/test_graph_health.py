@@ -433,6 +433,85 @@ def test_unknown_freshness_is_not_counted_as_stale(tmp_path: Path) -> None:
     assert st.stale is False
 
 
+# ── #2211: HEAD vs origin/<default_branch> ───────────────────────────────────
+
+
+def _repo_behind_origin(tmp_path: Path, *, behind_by: int) -> Path:
+    """A repo whose graph matches its OWN HEAD, but whose HEAD sits
+    *behind_by* commits behind ``origin/main`` — never fetched-and-pulled,
+    only fetched (the agent's own behaviour, see module docstring)."""
+    repo = _make_repo(tmp_path / "repo", with_hooks=False)
+    _seed_graph(repo, built_sha=_head(repo)[:8])
+    caught_up_at = _head(repo)
+    bare = tmp_path / "origin.git"
+    _git("init", "-q", "-b", "main", "--bare", str(bare), cwd=tmp_path)
+    _git("remote", "add", "origin", str(bare), cwd=repo)
+    _git("push", "-q", "origin", "HEAD:refs/heads/main", cwd=repo)
+    if behind_by:
+        for i in range(behind_by):
+            _git("commit", "-q", "--allow-empty", "-m", f"extra-{i}", cwd=repo)
+        _git("push", "-q", "origin", "HEAD:refs/heads/main", cwd=repo)
+        _git("reset", "-q", "--hard", caught_up_at, cwd=repo)
+    _git("fetch", "-q", "origin", cwd=repo)
+    return repo
+
+
+def test_graph_status_reports_origin_behind_when_head_matches_the_graph(
+    tmp_path: Path,
+) -> None:
+    """The exact #2211 regression: graph == HEAD (``in_sync`` True, ``stale``
+    False) tells you nothing about HEAD vs origin — that's a separate axis
+    this must expose, not fold into ``stale``."""
+    repo = _repo_behind_origin(tmp_path, behind_by=5)
+
+    st = graph_status(repo, "main")
+    assert st.in_sync is True, "graph really does match this checkout's own HEAD"
+    assert st.stale is False, "stale is strictly the graph<->HEAD comparison, unchanged"
+    assert st.commits_behind_origin == 5
+    assert st.origin_behind is True
+
+
+def test_graph_status_origin_in_sync_when_head_matches_origin_too(
+    tmp_path: Path,
+) -> None:
+    repo = _repo_behind_origin(tmp_path, behind_by=0)
+
+    st = graph_status(repo, "main")
+    assert st.in_sync is True
+    assert st.commits_behind_origin == 0
+    assert st.origin_behind is False
+
+
+def test_graph_status_origin_behind_is_unknown_not_false_without_a_remote(
+    tmp_path: Path,
+) -> None:
+    """No ``origin`` remote at all (a local-only repo, e.g. most fixtures in
+    this file) must not be reported as "0 commits behind" — that would be a
+    fabricated fact. It must stay unproven, hence ``origin_behind`` False for
+    a different reason: we simply couldn't check."""
+    repo = _make_repo(tmp_path / "repo", with_hooks=False)
+    _seed_graph(repo, built_sha=_head(repo)[:8])
+
+    st = graph_status(repo, "main")
+    assert st.origin_sha is None
+    assert st.commits_behind_origin is None
+    assert st.origin_behind is False
+
+
+def test_graph_status_makes_no_writes(tmp_path: Path) -> None:
+    """Read-only by design (#2211's acceptance bar): no fetch, no pull — HEAD
+    must be exactly what it was before the check ran."""
+    repo = _repo_behind_origin(tmp_path, behind_by=5)
+    before = _head(repo)
+
+    graph_status(repo, "main")
+
+    assert _head(repo) == before
+    # Working tree/index likewise untouched.
+    status = _git("status", "--porcelain", cwd=repo).stdout
+    assert status == ""
+
+
 def test_hooks_path_status_flags_an_unset_hooks_path(tmp_path: Path) -> None:
     """The repo ships the bootstrap but this checkout hasn't opted in."""
     repo = _make_repo(tmp_path / "repo", with_hooks=True)

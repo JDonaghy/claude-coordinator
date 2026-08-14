@@ -26,7 +26,9 @@ def _run(*args):
 
 def _stub(monkeypatch, tmp_path, *, status, hooks=(True, "core.hooksPath=.githooks")):
     """Wire ``coord health`` to one fake checkout and one scripted graph_status."""
-    monkeypatch.setattr("coord.graph_health.graph_status", lambda p: status)
+    monkeypatch.setattr(
+        "coord.graph_health.graph_status", lambda p, default_branch="main": status
+    )
     monkeypatch.setattr("coord.graph_health.hooks_path_status", lambda p: hooks)
 
     thresholds = HealthConfig()
