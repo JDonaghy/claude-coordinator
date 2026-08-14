@@ -317,6 +317,72 @@ def _dispatch_revalidation_conflicts(conflicted, config, *, dry_run: bool) -> No
     _dispatch_conflict_fixes(events, config, dry_run=False)
 
 
+def _sweep_sibling_conflicts(events, items, config, gh_ops, *, dry_run: bool) -> list:
+    """#2246: after a merge lands, ask GitHub which sibling PRs it just broke.
+
+    A merge into ``target_branch`` can invalidate every other open PR against
+    that same branch. GitHub computes exactly which ones, asynchronously and
+    for free, and until #2246 nothing asked at the moment it matters —
+    ``mergeable`` was consulted only at *merge* time, i.e. one drive attempt
+    too late. On 2026-08-14 that cost four terminal ``blocked`` entries across
+    two repos: quadraui #306/#309 presented as "smoke gate — test verdict
+    stale", claude-coordinator #2234 as "checks_failed … (unknown)" with
+    ``coord fix`` asserting "CI is RED" for a PR whose CI had never run at all
+    (GitHub builds ``pull_request`` workflows from ``refs/pull/N/merge``, which
+    cannot exist while the PR conflicts, so *zero* check-suites were queued and
+    the absence was read as failure — #2244). No surface said *conflict*.
+
+    Two things happen for each sibling GitHub now reports ``CONFLICTING``,
+    both inside :func:`coord.merge_queue.sweep_sibling_conflicts` and the
+    dispatch call below:
+
+    1. The entry is parked at ``CONFLICT`` with an error naming the merge that
+       broke it — so the next surface to read it says the true thing instead of
+       re-deriving whichever gate happened to be failing for an unrelated
+       reason, and ``coord drive``'s #1738 re-test arm stops answering a
+       conflict with a suite run.
+    2. It is handed to :func:`_dispatch_conflict_fixes` as an ordinary
+       ``conflict`` event — the SAME call the post-``process()`` path makes —
+       so #241's conflict-fix worker is dispatched with every guard intact:
+       :func:`coord.merge_queue.classify_conflict` must still read the error as
+       ``rebaseable``, the #241/#784 retry cap still flips a second failure to
+       ``HUMAN_REQUIRED``, and ``dispatch_conflict_fix``'s in-flight check
+       still refuses a duplicate. Routed through that function rather than
+       calling ``dispatch_conflict_fix`` directly for the reason #2231 gives:
+       a second dispatch site with its own copy of those guards is how they
+       drift apart.
+
+    Skipped entirely under ``--dry-run`` — ``process()`` emits ``merged``
+    events there too, but nothing actually landed, so no sibling's mergeability
+    can have changed and marking one would be a lie written to the queue.
+
+    Returns the conflict events so the caller can fold them into its summary;
+    never raises (the sweep itself fails open — see its docstring). The merge
+    that triggered this has already succeeded and must not be undone or
+    obscured by a failed read afterwards.
+    """
+    if dry_run:
+        return []
+    from coord import merge_queue as _mq  # noqa: PLC0415
+
+    try:
+        sweep_events = _mq.sweep_sibling_conflicts(events, items, gh_ops)
+    except Exception as e:  # noqa: BLE001 — never let the sweep undo a merge
+        click.echo(
+            f"  sibling-conflict sweep failed (merge itself is unaffected): {e!r}",
+            err=True,
+        )
+        return []
+    for ev in sweep_events:
+        e = ev.entry
+        click.echo(
+            f"  {e.repo_name} #{e.issue_number} ({e.branch}): {ev.kind} — "
+            f"{ev.message}"
+        )
+    _dispatch_conflict_fixes(sweep_events, config, dry_run=False)
+    return sweep_events
+
+
 def _dispatch_conflict_fixes(events, config, *, dry_run: bool) -> None:
     """#241: classify any conflict events and dispatch a conflict-fix worker
     for the eligible ones.  Mutates each conflict event's ``ev.entry.state``
@@ -1691,6 +1757,16 @@ def merge(
         # before the save below so a retry-cap/non-rebaseable HUMAN_REQUIRED
         # mutation on only_entry.state is persisted, not lost.
         _dispatch_conflict_fixes(events_only, cfg_only, dry_run=dry_run)
+        # #2246: `--only` merges one entry, but the branch it just moved is
+        # shared — every OTHER queued PR based on it may have become
+        # CONFLICTING a second ago. This is the drive-queue's path (`coord
+        # drive` and the TUI both merge via `--only`), so it is exactly where
+        # the 2026-08-14 collisions were minted. The sweep persists any
+        # sibling it parks itself: the save below deliberately writes back
+        # only `only_entry`.
+        _sweep_sibling_conflicts(
+            events_only, only_items, cfg_only, gh_ops, dry_run=dry_run,
+        )
         if not dry_run:
             # Save only the modified entry back; all other entries are untouched.
             all_items_only = mq.load_queue()
@@ -2002,6 +2078,13 @@ def merge(
     # for the eligible ones (extracted to _dispatch_conflict_fixes, #1474
     # review, so the --only path below can share it).
     _dispatch_conflict_fixes(events, cfg, dry_run=dry_run)
+
+    # #2246: whatever just landed may have invalidated its siblings — ask
+    # GitHub now, while the merge that caused it is still the obvious
+    # explanation, rather than letting the next drive attempt discover it as
+    # some unrelated gate failure. Entries it parks are in `items`, so the
+    # save below carries the mutation through naturally.
+    _sweep_sibling_conflicts(events, items, cfg, gh_ops, dry_run=dry_run)
 
     # Save state only when we actually moved
     if not dry_run:

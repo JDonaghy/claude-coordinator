@@ -1247,6 +1247,24 @@ def _auto_drain_tick(config: Config) -> "list":
             skip_smoke=False,
         )
 
+        # #2246: anything that just landed may have made a SIBLING PR
+        # CONFLICTING — GitHub knows exactly which, and auto-drain (unlike a
+        # human running `coord merge`) has no other moment to ask. Held inside
+        # the same lock as everything above: it is another full load->mutate->
+        # save of the queue table and would race a concurrent `/merge`
+        # otherwise. Best-effort — a sweep failure must not undo or obscure
+        # the merge that triggered it, nor disable the persist step below.
+        #
+        # Marks only. Auto-drain has never dispatched a conflict-fix (that
+        # lives in the `coord merge` CLI's `_dispatch_conflict_fixes`), and
+        # #2246's floor is that the entry report *conflict* as its blocking
+        # reason instead of whichever gate happened to be red — which is
+        # exactly what parking it at CONFLICT with an explanatory error does.
+        try:
+            events.extend(mq.sweep_sibling_conflicts(events, ready_items, github_ops))
+        except Exception:  # noqa: BLE001
+            log.warning("auto-drain: sibling-conflict sweep failed", exc_info=True)
+
         # Persist: merge the mutated rows back over the on-disk queue (same
         # pattern as ``coord merge`` in cli.py to avoid clobbering unrelated rows).
         fresh = mq.load_queue()

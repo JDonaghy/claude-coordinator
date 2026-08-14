@@ -964,3 +964,73 @@ If the conflict-fix worker itself fails, the #241/#784 retry cap still flips
 the entry to `HUMAN_REQUIRED` on the second attempt — rule #10's escape hatch
 applies from there. Nothing here loosens that: this only removes the case
 where **no** mechanism ran at all.
+
+## 19. A merge silently breaks its siblings, and until #2246 nothing asked GitHub which ones
+
+Rule #18 is about **gate ordering** — a conflict reported as a stale verdict
+because the smoke gate short-circuits first. This one is about **when we
+look**. Both present as "the surface says something that isn't the blocker",
+and they were filed the same day for a reason.
+
+When a PR merges, every other open PR against that same base can become
+unmergeable. GitHub computes exactly which ones, asynchronously and for free,
+and `GhOps.check_pr_mergeable` has always been able to read it — but it was
+consulted only at *merge* time, i.e. one drive attempt after the moment that
+mattered. The merge that invalidated the sibling is the event; nothing was
+listening to it.
+
+Measured on 2026-08-14, two independent collisions, both through the drive
+queue:
+
+| collision | trigger | how it presented | cost |
+|---|---|---|---|
+| quadraui #306, #309 | #307/#308 merged first; all four append to `quadraui/tests/tui_example_driver.rs` | `smoke gate — test verdict stale` | both terminal `blocked`, 2 attempts each, 3 wasted `--revalidate` suite runs, 2 `coord fix` dispatches |
+| claude-coordinator #2234 | #2230 merged; both touch `coord/drive_queue.py` | `checks_failed … (unknown)`, and `coord fix` reported *"CI is RED"* | terminal `blocked`, 2 attempts, a wasted empty commit, one `coord fix` dispatch |
+
+In neither case did any surface say *conflict* until a human went looking. In
+the second, **CI had never run at all**: GitHub builds `pull_request`
+workflows from the merge ref (`refs/pull/N/merge`), which cannot exist while
+the PR conflicts, so zero check-suites were queued and the absence was misread
+as failure (that misreading is #2244's arm of the same day).
+
+### What runs now
+
+Immediately after any merge lands, `merge_queue.sweep_sibling_conflicts` asks
+GitHub about the other queued PRs **in that repo, on the branch that just
+moved**. A sibling GitHub now reports `CONFLICTING` is parked at `CONFLICT`
+with an error naming the merge that broke it, and handed to the same
+`_dispatch_conflict_fixes` call a failed merge attempt makes — so #241's
+`conflict-fix` worker is dispatched with the retry cap, the in-flight guard,
+and the `HUMAN_REQUIRED` escalation all intact.
+
+Wired into `coord merge` (both the whole-queue path and `--only`, which is how
+`coord drive` and the TUI merge) and into the daemon's auto-drain tick. Never
+under `--dry-run`: nothing landed, so no sibling's mergeability can have
+changed and marking one would write a lie into the queue.
+
+### Four things to know when reading it
+
+- **`mergeable` is not instant.** GitHub recomputes it asynchronously and the
+  instant after a merge is when it is least likely to have settled — `UNKNOWN`
+  came back repeatedly on 2026-08-14. The probe retries (`SIBLING_SWEEP_ATTEMPTS`,
+  default 3) in **rounds**: everyone, then only the still-unresolved, so total
+  added wall-clock is bounded by the attempt budget however long the queue is.
+  A sibling still `UNKNOWN` when the budget runs out is left `PENDING` — an
+  inconclusive read is not evidence of a conflict.
+- **Only transitions.** An entry already at `CONFLICT` is never probed. That
+  state is the queue's own record of "we already know", so a PR that was
+  conflicting before the merge is somebody else's problem — #1477's
+  `reconcile_conflict_entries` is what unparks it when the fix lands. Without
+  that rule, every merge in the repo would re-dispatch a conflict-fix for it,
+  forever.
+- **Cost is one API call per queued sibling per merge**, not per tick. On this
+  fleet that is single digits, and it is exactly zero on the overwhelmingly
+  common tick where nothing merged.
+- **It fails open.** A `gh` error, an unreadable queue, a `gh_ops` without the
+  probe — every one yields "no sweep", never an exception. The merge that
+  triggered it has already succeeded and must not be undone or obscured by a
+  read that failed afterwards.
+
+Related: **#1894** — an unavailable CI must not consume retry budget, and a
+structurally-impossible CI (a conflicting PR has no merge ref, so no
+check-suite) is the same class.

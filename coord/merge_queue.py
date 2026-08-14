@@ -3017,6 +3017,267 @@ def reconcile_conflict_entries(gh_ops: "GhOps") -> list["MergeEvent"]:
     return events
 
 
+# ── Post-merge sibling conflict sweep (#2246) ───────────────────────────────
+
+#: How many times the sweep re-asks GitHub for a sibling's mergeability while
+#: it still reads ``UNKNOWN``. GitHub computes ``mergeable`` asynchronously and
+#: a merge that JUST landed is precisely the moment it is least likely to have
+#: settled — treating the first ``None`` as "clean" is the bug (#2246), so the
+#: probe is retried a bounded number of times before giving up.
+SIBLING_SWEEP_ATTEMPTS = 3
+
+#: Seconds between sweep probe rounds. Total added wall-clock is at most
+#: ``(SIBLING_SWEEP_ATTEMPTS - 1) * SIBLING_SWEEP_INTERVAL`` regardless of how
+#: many siblings are in the queue — see :func:`sweep_sibling_conflicts`, which
+#: probes in ROUNDS (everyone, then only the still-unresolved) rather than
+#: exhausting the retry budget per entry.
+SIBLING_SWEEP_INTERVAL = 2.0
+
+
+def merged_bases(events: Iterable["MergeEvent"]) -> set[tuple[str, str]]:
+    """The ``(repo_github, target_branch)`` pairs a batch of events just moved.
+
+    Scoped deliberately to ``kind == "merged"``: a base branch only invalidates
+    siblings when something actually landed on it. Every other event kind
+    (``opened``, ``sized``, ``conflict``, gate blocks) leaves the base exactly
+    where it was and must not trigger a sweep.
+    """
+    return {
+        (ev.entry.repo_github, ev.entry.target_branch)
+        for ev in events
+        if ev.kind == "merged" and ev.entry.repo_github and ev.entry.target_branch
+    }
+
+
+def sibling_sweep_candidates(
+    events: Iterable["MergeEvent"], items: Iterable["QueuedMerge"],
+) -> list["QueuedMerge"]:
+    """The queue entries a just-landed merge could plausibly have broken.
+
+    An entry qualifies when **all** of the following hold:
+
+    * Its ``(repo_github, target_branch)`` is one the batch actually moved
+      (:func:`merged_bases`) — #2246's "scope to the merged repo, and only to
+      PRs whose base is the branch that just moved".
+    * It is not itself one of the entries that merged.
+    * It has an open PR (``pr_number``) — GitHub can only compute
+      mergeability for a PR, and an entry with no PR has nothing to mark.
+    * It is still ``PENDING``. This is the **transition** filter #2246 asks
+      for, expressed in the state the queue already keeps: ``CONFLICT`` is the
+      durable record of "we already know this one is conflicting", so an entry
+      parked there was somebody else's problem before this merge and is left
+      alone (it is #1477's :func:`reconcile_conflict_entries` that unparks it).
+      ``HUMAN_REQUIRED``/``MERGED``/``SKIPPED`` are equally not ours to touch.
+    * Its cached ``error`` does not already read as a conflict. Belt-and-braces
+      for the same rule: an entry can be ``PENDING`` while carrying a conflict
+      error from a prior attempt (a re-enqueue, a #1477 unpark that raced),
+      and re-dispatching a conflict-fix for it on every merge is exactly the
+      loop #2246 says not to build.
+
+    Note what is deliberately *not* required: that the sibling be blocked on
+    some particular gate. The whole point is that the gate it is blocked on
+    (stale smoke verdict, "checks_failed (unknown)") is the WRONG reason — the
+    real blocker is the conflict, and it is only visible if we look regardless.
+    """
+    moved = merged_bases(events)
+    if not moved:
+        return []
+    merged_ids = {
+        ev.entry.assignment_id for ev in events if ev.kind == "merged"
+    }
+    out: list[QueuedMerge] = []
+    for entry in items:
+        if entry.assignment_id in merged_ids:
+            continue
+        if (entry.repo_github, entry.target_branch) not in moved:
+            continue
+        if entry.state != PENDING or not entry.pr_number:
+            continue
+        if classify_conflict(entry.error) == "rebaseable":
+            continue
+        out.append(entry)
+    return out
+
+
+def sibling_conflict_error(
+    entry: "QueuedMerge", events: Iterable["MergeEvent"],
+) -> str:
+    """The ``entry.error`` text a swept sibling is parked with.
+
+    Two hard requirements, both load-bearing:
+
+    1. It must contain wording :func:`classify_conflict` reads as
+       ``"rebaseable"`` (here: ``merge conflict``), because the whole value of
+       the sweep is that ``coord merge``'s existing ``_dispatch_conflict_fixes``
+       step then routes it to the #241 worker with every guard intact — the
+       retry cap, the in-flight check, the HUMAN_REQUIRED escalation.
+    2. It must NOT contain any ``_HUMAN_SIGNALS`` wording ("review required",
+       "permission", "protected branch", …), which would classify it as a
+       branch-protection problem and escalate straight to a human.
+
+    Beyond that it names the merge that caused it, because "which PR broke me"
+    was the fact a human had to reconstruct by hand in both 2026-08-14
+    collisions.
+    """
+    culprits = sorted({
+        f"{ev.entry.repo_name}#{ev.entry.issue_number}"
+        + (f" (PR #{ev.entry.pr_number})" if ev.entry.pr_number else "")
+        for ev in events
+        if ev.kind == "merged"
+        and ev.entry.repo_github == entry.repo_github
+        and ev.entry.target_branch == entry.target_branch
+    })
+    blame = ", ".join(culprits) if culprits else "a sibling merge"
+    return (
+        f"merge conflict: GitHub reports PR #{entry.pr_number} ({entry.branch}) "
+        f"as CONFLICTING against {entry.target_branch} immediately after "
+        f"{blame} landed on it. The blocker is a content conflict — not a "
+        "stale test verdict and not a CI failure (a conflicting PR has no "
+        f"{entry.target_branch} merge ref, so GitHub queues no pull_request "
+        "check-suites for it at all). Rebase the branch onto "
+        f"{entry.target_branch} and resolve (#2246)."
+    )
+
+
+def sweep_sibling_conflicts(
+    events: list["MergeEvent"],
+    items: list["QueuedMerge"],
+    gh_ops: "GhOps",
+    *,
+    attempts: int = SIBLING_SWEEP_ATTEMPTS,
+    interval: float = SIBLING_SWEEP_INTERVAL,
+    sleep=None,
+    persist: bool = True,
+) -> list["MergeEvent"]:
+    """Ask GitHub which siblings *events*' merges just broke (#2246).
+
+    When a PR merges it can silently invalidate every other open PR against
+    the same base. GitHub computes that for us exactly and for free, and
+    before this nothing asked at the one moment it matters — ``mergeable`` was
+    only consulted at merge time, i.e. after the next drive attempt was
+    already spent. On 2026-08-14 that cost four terminal ``blocked`` entries
+    across two repos, presented as "smoke gate — test verdict stale" and
+    "checks_failed … (unknown)", neither of which said *conflict*.
+
+    Called immediately after :func:`process` with the events it returned and
+    the item list the caller is about to persist. For every sibling that now
+    reads ``CONFLICTING`` (see :func:`sibling_sweep_candidates` for who
+    qualifies), the entry is moved to ``CONFLICT`` with a
+    :func:`sibling_conflict_error` explaining what happened, and a
+    ``conflict`` :class:`MergeEvent` is returned. The caller echoes those
+    events and hands them to its usual conflict-fix dispatch step — the sweep
+    itself never dispatches, so #241's retry cap and in-flight guards keep
+    living in exactly one place.
+
+    **UNKNOWN is not clean.** GitHub recomputes mergeability asynchronously,
+    and the instant after a merge is when it is most likely to still be
+    computing — the first read came back ``UNKNOWN`` repeatedly in the
+    2026-08-14 session. Probing is therefore retried up to *attempts* times,
+    in ROUNDS: every unresolved sibling is probed, then only the ones still
+    unresolved are probed again after *interval* seconds. Total added
+    wall-clock is bounded by ``(attempts - 1) * interval`` no matter how many
+    siblings there are, rather than growing per entry.
+
+    **Fails open, always.** A ``gh`` error, a ``gh_ops`` with no
+    ``check_pr_mergeable`` (the duck-typed stubs in older tests), an
+    unreadable queue — every one of them yields "no sweep", never an
+    exception. The merge that triggered this already succeeded; a read failure
+    afterwards must not undo or obscure it.
+
+    Cost is one API call per candidate sibling per merge — single digits on
+    this fleet — and zero when nothing merged, which is the overwhelmingly
+    common tick.
+
+    Persistence: mutations are written straight back to the queue (``persist``
+    is only turned off by tests). Entries the caller already holds in *items*
+    are mutated **in place**, so the caller's own subsequent
+    ``save_queue(merge_over_disk)`` step re-writes the same values rather than
+    clobbering them — the same convention
+    ``coord.commands.merge._dispatch_conflict_fixes`` relies on. Siblings the
+    caller does *not* hold (the ``--only`` path, where ``items`` is a single
+    entry) are persisted by this function's own write.
+    """
+    if not any(ev.kind == "merged" for ev in events):
+        return []
+    probe = getattr(gh_ops, "check_pr_mergeable", None)
+    if probe is None:
+        return []
+
+    try:
+        disk = load_queue()
+    except Exception:  # noqa: BLE001 — a queue read error must not undo a merge
+        _log.warning("sibling sweep: could not read the merge queue", exc_info=True)
+        return []
+
+    # Prefer the caller's live objects for any row it already holds: mutating
+    # a second copy loaded here would be silently reverted by the caller's own
+    # save-over-disk step a few lines later.
+    pool = {x.assignment_id: x for x in items}
+    rows = [pool.get(x.assignment_id, x) for x in disk]
+    known = {x.assignment_id for x in rows}
+    rows.extend(x for x in items if x.assignment_id not in known)
+
+    candidates = sibling_sweep_candidates(events, rows)
+    if not candidates:
+        return []
+
+    _sleep = sleep if sleep is not None else time.sleep
+    verdicts: dict[str, bool] = {}
+    unresolved = list(candidates)
+    for attempt in range(max(1, attempts)):
+        if not unresolved:
+            break
+        if attempt:
+            # Only ever paid when GitHub is genuinely still computing.
+            _sleep(interval)
+        still: list[QueuedMerge] = []
+        for entry in unresolved:
+            try:
+                verdict = probe(entry.repo_github, entry.pr_number)
+            except Exception:  # noqa: BLE001 — fail open, per entry
+                verdict = None
+            if verdict is None:
+                still.append(entry)
+            else:
+                verdicts[entry.assignment_id] = bool(verdict)
+        unresolved = still
+
+    for entry in unresolved:
+        # Never resolved inside the budget. Deliberately NOT marked: an
+        # inconclusive read is not evidence of a conflict, and #1477's
+        # reconcile pass plus the next ordinary merge attempt will both look
+        # again. Logged so a systematically-slow repo is attributable.
+        _log.info(
+            "sibling sweep: %s#%s (PR #%s) still UNKNOWN after %d attempt(s)"
+            " — left PENDING",
+            entry.repo_name, entry.issue_number, entry.pr_number, max(1, attempts),
+        )
+
+    out: list[MergeEvent] = []
+    for entry in candidates:
+        if verdicts.get(entry.assignment_id) is not False:
+            continue
+        entry.error = sibling_conflict_error(entry, events)
+        entry.state = CONFLICT
+        out.append(MergeEvent(
+            entry, "conflict",
+            f"became CONFLICTING when a sibling merged into "
+            f"{entry.target_branch} — parked as a conflict, not a gate "
+            "failure (#2246)",
+        ))
+
+    if out and persist:
+        try:
+            fresh = load_queue()
+            by_id = {x.assignment_id: x for x in rows}
+            save_queue([by_id.get(x.assignment_id, x) for x in fresh])
+        except Exception:  # noqa: BLE001 — fail open
+            _log.warning(
+                "sibling sweep: could not persist conflict markers", exc_info=True,
+            )
+    return out
+
+
 def resolve_entry_key(items: list["QueuedMerge"], key: str) -> "QueuedMerge | None":
     """Resolve *key* to a queue entry by whatever identifier the read path
     printed — ``assignment_id``, the durable ``repo#issue`` form, a bare
