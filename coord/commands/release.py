@@ -16,6 +16,7 @@ via setuptools-scm). It does not push, tag, or modify anything itself.
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -1346,7 +1347,19 @@ def _roll_units(machine, *, agent_port: int) -> tuple[bool | None, str]:
     :func:`coord.deploy_units.enable_timers`) — so "the queue came back
     mid-roll" (or, after this fix, "it didn't") is legible in this output
     rather than reconstructed afterwards from journal timestamps.
+
+    ``ok`` (#2124 review) reflects every way ``agent_app.py``'s
+    ``deploy_units`` endpoint can fail, not just a failed timer: a unit
+    whose install itself failed (``action == "failed"`` — e.g. an unreadable
+    installed unit file, :mod:`coord.deploy_units` lines ~249/264/284), a
+    top-level ``error``, or a ``daemon-reload`` that was attempted and
+    failed. Before this check existed, ``ok`` was derived from
+    ``failed_timers`` alone, so any of those three could return HTTP 500
+    with ``payload["ok"]=False`` and still be recorded here as a green
+    lane — exactly the "unconfirmed success" defect #2096 exists to catch.
     """
+    from coord.deploy_units import ACTION_FAILED  # noqa: PLC0415
+
     status, body, error = _post(
         f"http://{machine.host}:{agent_port}/deploy-units", {}, timeout=30.0
     )
@@ -1373,6 +1386,10 @@ def _roll_units(machine, *, agent_port: int) -> tuple[bool | None, str]:
     units = body.get("units") or []
     changed = [u.get("name") for u in units if u.get("action") == "updated"]
     new = [u.get("name") for u in units if u.get("action") == "new"]
+    failed_units = {
+        (u.get("name") or "?"): (u.get("detail") or "?")
+        for u in units if u.get("action") == ACTION_FAILED
+    }
     parts = []
     parts.append(f"{len(changed)} unit(s) refreshed" if changed else "units already current")
     if body.get("reloaded"):
@@ -1382,32 +1399,79 @@ def _roll_units(machine, *, agent_port: int) -> tuple[bool | None, str]:
             f"{len(new)} packaged unit(s) NOT installed here ({', '.join(sorted(map(str, new)))}) "
             "— a release does not decide which services a host runs"
         )
+    if failed_units:
+        parts.append(
+            "FAILED to install unit(s): "
+            + ", ".join(f"{u} ({detail})" for u, detail in sorted(failed_units.items()))
+        )
+
+    # A daemon-reload is only attempted when a unit's bytes actually
+    # changed (`agent_app.py`'s `deploy_units`); "not reloaded" is a
+    # failure only when the report itself says a reload was attempted
+    # (`body["changed"]`, `InstallReport.changed`) — absent that, "not
+    # reloaded" just means there was nothing to reload, never a failure.
+    reload_failed = bool(body.get("changed")) and not body.get("reloaded")
+    if reload_failed:
+        parts.append(
+            "daemon-reload FAILED: " + str(body.get("reload_detail") or "?")
+        )
+
+    top_level_error = body.get("error")
+    if top_level_error:
+        parts.append(f"deploy-units error: {top_level_error}")
 
     timers = body.get("timers_enabled") or {}
     started = sorted(
         name for name, r in timers.items()
         if isinstance(r, dict) and r.get("ok") and r.get("changed")
     )
-    held = sorted(
-        name for name, r in timers.items()
-        if isinstance(r, dict) and r.get("ok") and not r.get("changed")
-    )
+    # Held timers (confirmed already-enabled, left alone) split on the
+    # confirmed `ActiveState` carried in `enable_timers`'s own detail text
+    # (coord/deploy_units.py's `already enabled (ActiveState=...)` branch)
+    # — NOT on `changed` alone, which is equally true for the #2124 case
+    # (operator stopped it) and for the routine, overwhelmingly common case
+    # of a timer that was never touched because it is already enabled AND
+    # already running. Reporting "left stopped as-is" for the latter names
+    # a state (stopped) this call never confirmed — the #2124 review's
+    # reporting-accuracy fix.
+    held_stopped = []
+    held_other = []
+    for name, r in timers.items():
+        if not (isinstance(r, dict) and r.get("ok") and not r.get("changed")):
+            continue
+        match = re.search(r"ActiveState=(\w+)", r.get("detail") or "")
+        if match and match.group(1) == "inactive":
+            held_stopped.append(name)
+        else:
+            held_other.append(name)
+    held_stopped.sort()
+    held_other.sort()
     failed_timers = {
         name: (r.get("detail") or "?")
         for name, r in timers.items() if isinstance(r, dict) and not r.get("ok")
     }
     if started:
         parts.append(f"enabled timer(s): {', '.join(started)}")
-    if held:
-        # Confirmed already-enabled and deliberately left alone — the
-        # #2124 fix in one word: a timer an operator stopped is still here.
-        parts.append(f"left stopped as-is (already enabled, #2124): {', '.join(held)}")
+    if held_stopped:
+        # Confirmed inactive (ActiveState=inactive) and deliberately left
+        # alone — the #2124 fix in one word: a timer an operator stopped is
+        # still here.
+        parts.append(
+            f"left stopped as-is (already enabled, #2124): {', '.join(held_stopped)}"
+        )
+    if held_other:
+        # Already enabled and left alone, but NOT confirmed stopped — most
+        # commonly a timer that is already enabled and already running
+        # normally. Reported distinctly so it never gets read as "the
+        # timer I stopped is still stopped" for a timer nobody stopped.
+        parts.append(f"already enabled (unchanged): {', '.join(held_other)}")
     if failed_timers:
         parts.append(
             "FAILED to enable timer(s): "
             + ", ".join(f"{u} ({detail})" for u, detail in sorted(failed_timers.items()))
         )
-    return not failed_timers, "; ".join(parts)
+    ok = not (failed_units or reload_failed or top_level_error or failed_timers)
+    return ok, "; ".join(parts)
 
 
 def _roll_tui(
