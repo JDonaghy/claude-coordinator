@@ -1572,6 +1572,66 @@ def test_reap_captures_claude_session_id(tmp_path: Path) -> None:
     server.shutdown()
 
 
+def test_reap_logs_graphify_invocation_count(tmp_path: Path) -> None:
+    """#2212: `_reap` writes a plain `graphify_invocations=N` counter into
+    the worker's log alongside the existing "# reap: done" line — the
+    measurable half of the graph-first navigation rule in
+    WORKER_SYSTEM_PROMPT. A worker whose transcript shows one `graphify
+    query ...` Bash call and one unrelated Bash call must be counted 1, not
+    2 or 0, end-to-end through the real reap path (not just the
+    `_count_graphify_invocations` unit)."""
+    repo = _init_repo(tmp_path / "repo")
+
+    graphify_call = json.dumps({
+        "type": "assistant",
+        "message": {
+            "model": "claude-sonnet-4-6",
+            "content": [{
+                "type": "tool_use",
+                "name": "Bash",
+                "id": "tu_1",
+                "input": {"command": 'graphify query "where is X handled"'},
+            }],
+        },
+    })
+    unrelated_call = json.dumps({
+        "type": "assistant",
+        "message": {
+            "model": "claude-sonnet-4-6",
+            "content": [{
+                "type": "tool_use",
+                "name": "Bash",
+                "id": "tu_2",
+                "input": {"command": "grep -rn foo ."},
+            }],
+        },
+    })
+    result_line = json.dumps({"type": "result", "subtype": "success", "is_error": False})
+    worker_sh = (
+        f"echo '{graphify_call}'; echo '{unrelated_call}'; echo '{result_line}'; exit 0"
+    )
+    server = AgentServer(
+        machine_name="test",
+        repos=["api"],
+        repo_paths={"api": str(repo)},
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: ["/bin/sh", "-c", worker_sh],
+    )
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path=str(repo),
+        issue_number=2212,
+        issue_title="t",
+        briefing="b",
+    )
+    a = server.assign(spec)
+    final = server.wait_for(a.id, timeout=10)
+
+    log_text = Path(final.log_path).read_text()
+    assert "graphify_invocations=1" in log_text
+    server.shutdown()
+
+
 def test_assignment_spec_accepts_resume_session_id() -> None:
     """AssignmentSpec round-trips resume_session_id through to_dict / from dict."""
     spec = AssignmentSpec(
