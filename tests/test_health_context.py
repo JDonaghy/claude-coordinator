@@ -233,6 +233,10 @@ def test_seed_checks_cover_the_issues_table() -> None:
         "agent_venv",
         "agent_version",
         "claude_binary",
+        # #2237 item 6: layer 1 of graphify (the CLI itself). Without it every
+        # graph operation on the machine fails one-by-one for a reason only
+        # visible inside a per-HEAD failure record.
+        "graphify_cli",
         "repo_branch",
         "repo_dirty",
         "graph",

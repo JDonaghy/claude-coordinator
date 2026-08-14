@@ -110,6 +110,36 @@ GRAPH_HEALTH: checkouts=3 stale=0
 
 If it reports STALE, run `graphify update .` in that checkout.
 
+## Don't run this runbook — run the fixer (#2237)
+
+This document is a runbook, and a runbook is the weakest available answer: graphify fell by the
+wayside on two repos for weeks *while this file existed*. Prefer the checkable version.
+
+```bash
+coord repo doctor <repo>          # graph readiness PER MACHINE, from each agent's /health
+coord repo doctor <repo> --fix    # steps 3 and 5, on every machine that clones the repo
+```
+
+* `--fix` performs only the **machine-local, idempotent** half: `graphify update .` where there
+  is no graph, and `git config core.hooksPath .githooks` where it is unset. It never writes a
+  tracked file.
+* It **refuses** on a repo that has not ported `.githooks/` (layer 4) and says so — building a
+  graph whose hooks were never ported just swaps a loud absence for quiet staleness, and
+  pointing `core.hooksPath` at a directory that does not exist disables *every* hook in the
+  checkout. Port the hooks first; that is a PR against the repo, and one commit reaches every
+  machine.
+* A repo with **no graph on any machine that runs workers** is CRIT and fails the gate. One
+  machine missing its graph is a warning — the agent's self-heal is already rebuilding it.
+
+What you no longer have to do by hand:
+
+* **Layer 2 heals itself.** Each agent's health tick rebuilds a checkout whose graph is stale
+  *or absent* (#1729 + #2237), so `rm -rf graphify-out/` is repaired on the next idle poll —
+  guarded to idle machines, base checkouts only, once per HEAD, and never `--force`.
+* **Layer 1 is reported.** A machine with no `graphify` on `$PATH` produces one `graphify_cli`
+  finding in `coord doctor` / `coord health`, instead of every graph operation there failing
+  one-by-one for a reason only visible inside a per-HEAD failure record.
+
 ## Measuring whether workers actually use it (#2212 / #2236)
 
 Every reaped worker's log ends with a line the agent writes itself:

@@ -81,7 +81,11 @@ def _commits_behind(repo_path: str, built_sha: str, head_sha: str) -> int | None
     description="graphify graph freshness vs HEAD, and whether hooks can heal it.",
 )
 def probe_graph(ctx: HealthContext) -> list[CheckResult]:
-    from coord.graph_health import graph_status, hooks_path_status  # noqa: PLC0415
+    from coord.graph_health import (  # noqa: PLC0415
+        graph_status,
+        hooks_file_present,
+        hooks_path_status,
+    )
 
     th = ctx.thresholds
     results: list[CheckResult] = []
@@ -92,6 +96,7 @@ def probe_graph(ctx: HealthContext) -> list[CheckResult]:
         # reads whatever origin/<default_branch> the last `git fetch` left.
         status = graph_status(checkout.path, checkout.default_branch)
         hooks_ok, hooks_detail = hooks_path_status(checkout.path)
+        hooks_shipped = hooks_file_present(checkout.path)
 
         values = {
             "path": str(checkout.path),
@@ -113,6 +118,15 @@ def probe_graph(ctx: HealthContext) -> list[CheckResult]:
             "is_symlink": status.is_symlink,
             "hooks_ok": hooks_ok,
             "hooks_detail": hooks_detail,
+            # #2237: does the repo TRACK `.githooks/post-checkout`? `hooks_ok`
+            # collapses two failures that take opposite fixes — a checkout
+            # that never ran `git config core.hooksPath` (machine-local, one
+            # command, automatable) and a repo that never ported the hooks
+            # (versioned, a PR against that repo, never automatable). The
+            # fleet-wide layer-5 probe in `coord.repo_onboard` reads this to
+            # tell an operator which one they have, on machines it cannot
+            # stat directly.
+            "hooks_shipped": hooks_shipped,
             "unknown_reason": status.unknown_reason,
             "warn_hours": th.graph_stale_warn_hours,
             "crit_hours": th.graph_stale_crit_hours,

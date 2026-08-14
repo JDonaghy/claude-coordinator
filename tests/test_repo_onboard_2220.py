@@ -477,7 +477,15 @@ class TestGraphLayer:
         )
         report = ro.evaluate(facts)
         f = next(f for f in report.findings if f.check == "graph.not_built")
-        assert "graphify build" in (f.fix or "")
+        # #2237: the remedy used to read `graphify build`, which is not a
+        # subcommand graphify has — an operator following it verbatim got
+        # "Run 'graphify --help' for full usage." and no graph. The real
+        # build-from-nothing command is `graphify update .` (AST-only, no LLM;
+        # docs/GRAPHIFY_SETUP.md), and it is what the hooks, the agent's
+        # self-heal and `--fix` all run.
+        assert "graphify update ." in (f.fix or "")
+        assert "--fix" in (f.fix or "")
+        assert "graphify build" not in (f.fix or "")
 
     def test_missing_hooks_are_their_own_finding(self):
         facts = ro.RepoFacts(

@@ -272,8 +272,17 @@ def test_failed_rebuild_is_attempted_exactly_once_per_head(tmp_path: Path, monke
 def test_graphify_update_never_passes_force(monkeypatch, tmp_path: Path) -> None:
     """The actual command line the self-heal path shells out to — never
     ``--force``, the flag that exists solely to defeat graphify's own
-    node-count refusal guard (the guard the 2026-08-02 incident hit)."""
+    node-count refusal guard (the guard the 2026-08-02 incident hit).
+
+    #2237 moved the shell-out itself into ``coord.graph_health`` so that
+    ``coord repo doctor --fix`` runs the identical command on every machine
+    (two copies is how one of them quietly acquires ``--force``), hence the
+    patch target below. ``coord.agent._graphify_update`` is still the seam
+    every other test in this file patches, and still what the self-heal
+    calls.
+    """
     import coord.agent as agent_mod
+    import coord.graph_health as graph_health_mod
 
     captured: dict = {}
 
@@ -281,7 +290,7 @@ def test_graphify_update_never_passes_force(monkeypatch, tmp_path: Path) -> None
         captured["argv"] = argv
         return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
 
-    monkeypatch.setattr(agent_mod.subprocess, "run", _fake_run)
+    monkeypatch.setattr(graph_health_mod.subprocess, "run", _fake_run)
 
     ok, _detail = agent_mod._graphify_update(tmp_path)
     assert ok is True

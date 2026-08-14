@@ -42,12 +42,28 @@ bootstrap only runs where `core.hooksPath` is set: `git config core.hooksPath
 rebase/merge/cherry-pick (so the merge agent's proactive rebase never rebuilds),
 nothing fires at all for `git reset --hard`, every failure path is a silent
 `exit 0` behind a detached 600s-timeout background process, concurrent triggers
-coalesce, and their `[ ! -f graphify-out/graph.json ]` guard is a permanent
-off-switch once the graph is purged. Treat the hooks as an optimization and check
+coalesce, and their `[ ! -f graphify-out/graph.json ]` guard is an off-switch
+once the graph is purged. Treat the hooks as an optimization and check
 freshness instead — `GRAPH_REPORT.md` records its source commit, and
 **`coord diagnose --graph`** compares that to HEAD for every local checkout (and
 flags an unset `core.hooksPath`). If it reports STALE, `graphify update .` in that
 checkout.
+
+**It mostly heals itself now (#1729, #2237).** Each agent's health tick rebuilds
+a checkout whose graph is stale *or absent* — so `rm -rf graphify-out/` is no
+longer permanent — subject to four guards: idle machines only, base checkouts
+only (never a linked worktree), once per HEAD (a build that cannot succeed is
+never a retry loop), and never `--force`. What it cannot do is anything
+versioned: `.githooks/` are tracked files, so porting them to a repo is a PR
+against that repo.
+
+**`coord repo doctor <repo>`** reports graph readiness **per machine** (folded
+from each agent's `/health`, no extra round trip) — the operator's laptop is
+usually not where the workers run. `--fix` performs the machine-local half
+(`graphify update .` where absent, `core.hooksPath` where unset) on every
+machine that clones the repo; it is idempotent, never writes a tracked file,
+and refuses on a repo whose `.githooks/` were never ported. A repo with no
+graph on *any* machine that runs workers is CRIT and fails the gate.
 
 Setting this up on a new machine: [`docs/GRAPHIFY_SETUP.md`](docs/GRAPHIFY_SETUP.md).
 

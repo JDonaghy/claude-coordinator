@@ -715,36 +715,20 @@ def _is_linked_worktree(repo_path: Path) -> bool:
 def _graphify_update(repo_path: Path, *, timeout: float = 600.0) -> tuple[bool, str]:
     """Run ``graphify update .`` in *repo_path* (#1729, H-6's self-heal).
 
-    Deliberately the plain, no-flags command graphify's own hooks run (see
-    ``docs/GRAPHIFY_SETUP.md``) — **never** ``--force``: that flag exists
-    only to defeat graphify's node-count refusal guard, and defeating it
-    automatically is exactly what turns a visible stall into silent
-    corruption of the graph agents navigate by (#1729 guard 4).
+    Thin delegate to :func:`coord.graph_health.run_graphify_update` (#2237),
+    which is the single place that decides what command coord shells out to
+    and with which flags — ``coord repo doctor --fix`` repairs checkouts on
+    every machine through the same function, and two copies of "the command
+    graphify's hooks run, never ``--force``" is exactly the split-brain that
+    would let one of them quietly acquire the flag that caused the
+    2026-08-02 incident.
 
-    Returns ``(ok, detail)``. ``ok`` is False on a non-zero exit, a missing
-    ``graphify`` binary, or a timeout — the caller treats all three the
-    same way: surface the reason on the health check and remember this
-    HEAD as attempted so the next tick does not retry it (guard 3).
+    Kept as a module-level name here because it is the seam the self-heal
+    tests patch. Returns ``(ok, detail)``.
     """
-    try:
-        result = subprocess.run(
-            ["graphify", "update", "."],
-            cwd=str(repo_path),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-    except FileNotFoundError:
-        return False, "graphify: command not found on this machine's PATH"
-    except subprocess.TimeoutExpired:
-        return False, f"graphify update . timed out after {timeout:.0f}s"
-    except OSError as exc:
-        return False, f"graphify update . failed to start: {exc}"
+    from coord.graph_health import run_graphify_update  # noqa: PLC0415
 
-    if result.returncode != 0:
-        reason = (result.stderr or result.stdout or "").strip()
-        return False, reason or f"graphify update . exited {result.returncode}"
-    return True, (result.stdout or "").strip()
+    return run_graphify_update(repo_path, timeout=timeout)
 
 
 # #2212: count how many Bash commands in a worker's leg invoked `graphify` —
@@ -4151,6 +4135,21 @@ class AgentServer:
         # already follows.
         self._graph_rebuild_in_progress: set[str] = set()
 
+        # #2237 item 7: guard 1 (the idle-gate) skips the whole self-heal
+        # pass whenever this machine has a RUNNING assignment. Sensible —
+        # a rebuild during a worker's leg fights it for CPU — but it means
+        # the BUSIEST machine in the fleet gets the FEWEST heal windows,
+        # which is the opposite of where drift accumulates. Nothing recorded
+        # that, so "this machine never gets an idle window" was
+        # indistinguishable from "this machine never needed a heal".
+        # Measure before changing the guard: these two counters ride
+        # /health's `graph_self_heal` block so the ratio is observable, and
+        # only if it turns out to be common does the guard need replacing
+        # with a heal window.
+        self._graph_heal_skipped_active: int = 0
+        self._graph_heal_last_skip_at: float | None = None
+        self._graph_heal_passes: int = 0
+
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self._load_state()
@@ -4224,6 +4223,19 @@ class AgentServer:
             # block (`_cached_local_health`'s own try/except) rather than
             # omitting the key, so an old/new client can always find it.
             "health": self._cached_local_health(),
+            # #2237 item 7: how often the graph self-heal pass has actually
+            # run on this machine, and how often guard 1 (the idle-gate)
+            # turned it away because an assignment was RUNNING. The busiest
+            # host in the fleet is the one most likely to drift AND the least
+            # likely to be idle, so "never healed" and "never needed healing"
+            # were indistinguishable until this. Cheap, in-memory, resets on
+            # agent restart — it exists to answer "is the idle-gate starving
+            # this machine", not to be a durable metric.
+            "graph_self_heal": {
+                "passes": self._graph_heal_passes,
+                "skipped_active": self._graph_heal_skipped_active,
+                "last_skip_at": self._graph_heal_last_skip_at,
+            },
         }
 
     def _cached_local_health(self) -> dict:
@@ -4288,6 +4300,19 @@ class AgentServer:
         """React to the ``graph`` check's STATE verdict instead of chasing
         the git events that produced it (#1729, H-6).
 
+        Covers a **missing** graph as well as a stale one (#2237 item 5).
+        Ongoing drift was already handled here; absence was not, because
+        ``graph_status`` returns early for a checkout with no
+        ``graphify-out/graph.json`` and never computes ``stale`` — so this
+        pass skipped it, and so did the graphify hooks' own
+        ``[ ! -f graphify-out/graph.json ] && exit 0``. Two independent
+        mechanisms declining to rebuild a graph that is not there made a
+        single ``rm -rf graphify-out/`` (or a fresh clone on a machine that
+        never had one) permanent until a human intervened. The guards below
+        are unchanged and cover the absent case as-is — in particular guard
+        3, which is what stops a repo where ``graphify update .`` genuinely
+        cannot succeed from retrying every poll forever.
+
         The git hooks (`.githooks/`) are event-driven and structurally
         cannot cover every ref-moving operation — rebase/merge/cherry-pick
         `exit 0`, `git reset --hard` fires no hook at all, and every hook
@@ -4304,8 +4329,13 @@ class AgentServer:
         1. **Idle-gate.** Only when this machine has no RUNNING assignment.
            A rebuild is hundreds of files across many workers; running it
            while a worker is mid-build steals the CPU that worker was
-           dispatched for. This reads `self._assignments` under a brief
-           lock and releases it before the (possibly slow) rebuild runs —
+           dispatched for. Every skip is counted
+           (`_graph_heal_skipped_active`, surfaced as /health's
+           `graph_self_heal` block) because the guard's cost lands hardest
+           on the busiest machine — the one most likely to drift — and
+           #2237 item 7 asks for that to be measured before the guard is
+           traded for a heal window. This reads `self._assignments` under a
+           brief lock and releases it before the (possibly slow) rebuild runs —
            load-bearing for guard-adjacent requirement #1625 decision 3:
            health must stay advisory, so a dispatch landing mid-rebuild
            must never be delayed by it (see `_graphify_update`, called
@@ -4360,13 +4390,32 @@ class AgentServer:
         with self._lock:
             active = sum(1 for a in self._assignments.values() if a.status == RUNNING)
         if active:
+            # #2237 item 7: count the skip instead of returning silently, so
+            # "the busiest machine never heals" is a number an operator can
+            # read off /health rather than an inference from a graph that
+            # stays stale.
+            self._graph_heal_skipped_active += 1
+            self._graph_heal_last_skip_at = time.time()
             return
+        self._graph_heal_passes += 1
 
         for i, result in enumerate(report.results):
             if result.check_id != "graph":
                 continue
             values = result.values or {}
-            if not values.get("stale"):
+            # #2237 item 5: ABSENT counts, not just stale. `graph_status`
+            # returns early with `unknown_reason` when there is no
+            # graphify-out/graph.json, so `stale` is never even computed for a
+            # never-built (or `rm -rf`'d) checkout — which meant two
+            # independent mechanisms declined to rebuild a graph that is not
+            # there: this gate, and the graphify hooks' own
+            # `[ ! -f graphify-out/graph.json ] && exit 0`. Between them, a
+            # single `rm -rf graphify-out/` was permanent. Guard 3's
+            # once-per-HEAD bookkeeping below keys on `head_sha`, which a
+            # never-built checkout now carries (#2237 in `graph_health`), so a
+            # repo where the build genuinely cannot succeed still gets exactly
+            # one attempt per HEAD rather than one per poll.
+            if not values.get("stale") and values.get("present", True):
                 continue
             path_str = values.get("path")
             if not path_str:
@@ -5320,6 +5369,51 @@ class AgentServer:
                 continue
             servable.append(repo_name)
         return servable, degraded
+
+    def fix_graph(self, repo_name: str, *, timeout: float = 600.0) -> dict:
+        """Repair the machine-local half of graphify for *repo_name* here
+        (#2237 item 1 — the agent side of ``coord repo doctor --fix``).
+
+        The whole point of routing this through the agent is that the
+        operator's laptop is *not* where the workers run: layer 5 was the one
+        onboarding layer probed only on the machine running the command, so a
+        repo with a graph on the operator's box and none on dellserver
+        reported clean. Repairing it has the same shape — a fix that only
+        ever repairs the local clone fixes the machine that needed it least.
+
+        Idempotent and never touches a tracked file:
+        :func:`coord.graph_health.apply_local_graph_fix` sets
+        ``core.hooksPath`` and builds a missing graph, and refuses outright
+        when the repo does not ship ``.githooks/post-checkout`` (a versioned
+        change, which is a PR against that repo and must never be automated).
+
+        Returns the :meth:`~coord.graph_health.GraphFixResult.to_dict` shape
+        plus ``repo``. An unknown repo, or one with no checkout on this
+        machine, comes back as a ``refused`` result rather than an error —
+        the caller is sweeping every machine and wants a per-machine answer,
+        not an exception that hides the other machines' results.
+        """
+        from coord.graph_health import GraphFixResult, apply_local_graph_fix  # noqa: PLC0415
+
+        path_str = self.repo_paths.get(repo_name)
+        if not path_str:
+            result = GraphFixResult(
+                repo_path="",
+                refused=f"no repo_path configured for {repo_name!r} on this machine",
+            )
+            return {**result.to_dict(), "repo": repo_name}
+
+        repo_path = Path(path_str).expanduser()
+        result = apply_local_graph_fix(repo_path, timeout=timeout)
+        # A rebuild that succeeds here invalidates whatever this HEAD was
+        # last recorded as failing (guard 3's bookkeeping) — otherwise the
+        # self-heal would keep replaying a stale failure reason at an
+        # operator who just fixed it by hand.
+        if result.ok:
+            with self._lock:
+                self._graph_rebuild_failed.pop(str(repo_path), None)
+            self._local_health_cache = None
+        return {**result.to_dict(), "repo": repo_name}
 
     def list_repos(self) -> dict[str, dict]:
         """Return local HEAD / branch / dirty flag for each configured repo.

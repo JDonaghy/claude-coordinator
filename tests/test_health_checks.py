@@ -906,3 +906,77 @@ def test_plan_usage_goes_through_the_cached_wrapper(tmp_path, monkeypatch) -> No
     )
     plan_usage.probe_plan_usage(make_ctx(tmp_path))
     assert calls == [1]
+
+
+# ── graphify_cli (#2237 item 6) ──────────────────────────────────────────────
+
+
+def test_graphify_cli_absent_is_warn_with_the_install_command(tmp_path, monkeypatch) -> None:
+    """One finding per machine, instead of N silent per-HEAD failure records.
+
+    Without the CLI, the agent's self-heal fails with "command not found",
+    records that against the current HEAD so it will not retry (correct as a
+    retry policy), and then says nothing anyone reads — which is how a machine
+    can be graph-blind for every repo it serves with a clean-looking fleet
+    report.
+    """
+    from coord.health.checks import graphify_cli
+
+    monkeypatch.setattr("coord.graph_health.graphify_cli_path", lambda: None)
+    result = graphify_cli.probe_graphify_cli(make_ctx(tmp_path))
+
+    assert result.severity is Severity.WARN
+    assert "not installed" in result.headroom
+    assert "pipx install graphify" in result.detail
+    assert result.values["installed"] is False
+
+
+def test_graphify_cli_present_is_ok_and_reports_the_version(tmp_path, monkeypatch) -> None:
+    from coord.health.checks import graphify_cli
+
+    monkeypatch.setattr("coord.graph_health.graphify_cli_path", lambda: "/usr/bin/graphify")
+    monkeypatch.setattr(graphify_cli, "_version", lambda path: "0.8.35")
+    result = graphify_cli.probe_graphify_cli(make_ctx(tmp_path))
+
+    assert result.severity is Severity.OK
+    assert "0.8.35" in result.headroom
+    assert result.values == {
+        "path": "/usr/bin/graphify", "installed": True, "version": "0.8.35",
+    }
+
+
+def test_graphify_cli_that_will_not_answer_still_counts_as_installed(
+    tmp_path, monkeypatch
+) -> None:
+    """The check's question is "is it here", not "does it work" — a binary
+    that refuses `--version` must not be reported as missing."""
+    from coord.health.checks import graphify_cli
+
+    monkeypatch.setattr("coord.graph_health.graphify_cli_path", lambda: "/usr/bin/graphify")
+    monkeypatch.setattr(graphify_cli, "_version", lambda path: None)
+    result = graphify_cli.probe_graphify_cli(make_ctx(tmp_path))
+
+    assert result.severity is Severity.OK
+    assert result.values["installed"] is True
+
+
+def test_graph_check_publishes_whether_the_repo_ships_the_hooks(
+    tmp_path, monkeypatch
+) -> None:
+    """#2237: `hooks_ok=False` collapses two failures with opposite fixes —
+    a checkout that never ran `git config` (machine-local, automatable) and a
+    repo that never ported `.githooks/` (versioned, a PR). The fleet-wide
+    layer-5 probe reads this to tell an operator which one they have on a
+    machine it cannot stat directly."""
+    _fake_graph(
+        monkeypatch,
+        _graph_status(present=True, built_sha="abc12345", head_sha="abc12345",
+                      in_sync=True, age_seconds=60.0),
+        (False, "no .githooks/post-checkout in this repo"),
+    )
+    monkeypatch.setattr("coord.graph_health.hooks_file_present", lambda p: False)
+    ctx = make_ctx(tmp_path, checkouts=(_checkout(tmp_path),))
+    (result,) = graph.probe_graph(ctx)
+
+    assert result.values["hooks_shipped"] is False
+    assert result.values["hooks_ok"] is False
