@@ -253,6 +253,54 @@ is now "plus the next quiescent window".
   units, which must themselves be installed by hand **once**, on the daemon
   host, to bootstrap the loop.
 
+## INVARIANT: every remote agent's `~/.coord-venv` is a PyPI install, never editable
+
+Moved here from `CLAUDE.md` by #2195 so it sits with the rest of the install runbook. **Read
+this section end-to-end before touching any agent install — don't re-derive it.**
+
+This is the single most-recurring fleet failure.
+
+- **PyPI install** → `coord agent update` runs `pip install --upgrade` and a released
+  `vX.Y.Z` lands cleanly.
+- **Editable install** → the update silently `git pull`s a local checkout instead, so version
+  bumps never propagate and the agent often "did not come back."
+
+**Root cause:** someone ran `pip install -e .` into `~/.coord-venv`. The editable **install**
+is the problem, **not** the `~/src/<repo>` checkout. #402's PATH-strip only stops *workers'*
+bare-pip, not a deliberate editable install.
+
+### DO NOT delete `~/src/<repo>` to "fix" drift
+
+It is the **worker worktree base** — `git worktree add` runs from it, and the worktrees in
+`~/.coord/worktrees/` are worktrees *of* it. Deleting it breaks every task for that repo on
+that machine. Fix **only the install**.
+
+### Detect
+
+```bash
+ssh <host> '~/.coord-venv/bin/pip show code-coordinator | grep -i "editable\|location"'
+```
+
+Any `Editable project location:` line ⇒ drift. A PyPI install shows only a site-packages
+`Location:`.
+
+### Fix (keeping the checkout)
+
+```bash
+# in ~/.coord-venv on the affected host
+pip uninstall -y code-coordinator && pip install --upgrade code-coordinator
+XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart coord-agent
+```
+
+The restart is not optional: the `/update` endpoint's `os.execv` self-restart does **not**
+take under systemd (#404 — it leaves the same PID and a stale version).
+
+### `✗ did not come back` is usually a FALSE NEGATIVE
+
+The agent is generally online and the restart simply didn't take. Check the running
+version/PID first, then choose between a drift-fix and a plain
+`systemctl --user restart coord-agent`.
+
 ## Install a new agent (first time)
 
 On the target machine:
