@@ -293,9 +293,27 @@ def repo_add(  # noqa: PLR0913 — one option per thing the command can set
         "for this repo's paths, and (if it joins the oracle loop) "
         "`acceptance.drivers`."
     )
+    # #2237: layer 5 used to be one vague line here and nothing else — so
+    # every repo onboarded from this command started with no graph, and the
+    # only thing that would ever say so was a `repo doctor` nobody is obliged
+    # to run. Split into the two halves that have genuinely different owners:
+    # the versioned port (a PR against the repo, never automated) and the
+    # machine-local half (idempotent, and `--fix` does it on every machine).
     click.echo(
-        "  7. graphify build + `graphify hook install` + `core.hooksPath`, in "
-        "that order, per machine (docs/GRAPHIFY_SETUP.md)."
+        "  7. GRAPH, versioned half — port `.githooks/` (_lib.sh, "
+        "post-checkout, post-commit, post-merge) into the repo and commit "
+        "them. Tracked files, so one PR reaches every machine. Without them "
+        "worktrees get no linked graph and every worker falls back to grep "
+        "(docs/GRAPHIFY_SETUP.md)."
+    )
+    click.echo(
+        "  8. GRAPH, machine-local half — once the repo is cloned on each "
+        f"machine: `coord repo doctor {name} --fix` builds the graph "
+        "(`graphify update .`) and sets `core.hooksPath .githooks` on every "
+        "machine that runs workers. Idempotent; safe to re-run. Do it AFTER "
+        "step 7 — pointing core.hooksPath at a .githooks/ that does not "
+        "exist silently disables every hook in the checkout, so --fix refuses "
+        "until the hooks are ported."
     )
     click.echo("")
     click.echo(f"Then: coord repo doctor {name}")
@@ -306,8 +324,10 @@ def repo_add(  # noqa: PLR0913 — one option per thing the command can set
     help=(
         "Probe all five onboarding layers for a repo and report per-layer "
         "status. Reads LIVE state — each agent's /health repo list, the labels "
-        "that exist on GitHub, whether any workflow triggers on pull_request — "
-        "not config. Exits non-zero on any CRIT so it can gate."
+        "that exist on GitHub, whether any workflow triggers on pull_request, "
+        "and (since #2237) each machine's graph readiness rather than only "
+        "this one's — not config. Exits non-zero on any CRIT so it can gate. "
+        "Use --fix to repair the machine-local half of the graph layer."
     ),
 )
 @click.argument("name")
@@ -324,12 +344,28 @@ def repo_add(  # noqa: PLR0913 — one option per thing the command can set
     "--verbose", "-v", is_flag=True, default=False,
     help="Show passing checks too, not just the residue.",
 )
-def repo_doctor(
+@click.option(
+    "--fix", "do_fix", is_flag=True, default=False,
+    help=(
+        "Repair graphify's MACHINE-LOCAL half on every machine that clones "
+        "this repo: build a missing graph (`graphify update .`) and set "
+        "`core.hooksPath .githooks`. Idempotent, never touches a tracked "
+        "file, and refuses on a repo that has not ported `.githooks/` — that "
+        "port is a PR against the repo, reported here as remaining work."
+    ),
+)
+@click.option(
+    "--fix-timeout", default=900.0, show_default=True, type=float,
+    help="Per-machine timeout for --fix (a first graph build is minutes).",
+)
+def repo_doctor(  # noqa: PLR0913 — one option per thing the command can do
     name: str,
     config_path: Path,
     timeout: float,
     probe_github: bool,  # noqa: FBT001
     verbose: bool,  # noqa: FBT001
+    do_fix: bool,  # noqa: FBT001
+    fix_timeout: float,
 ) -> None:
     from coord import repo_onboard  # noqa: PLC0415
     from coord.network import check_all  # noqa: PLC0415
@@ -355,6 +391,14 @@ def repo_doctor(
     machines = [m for m in cfg.machines if name in (m.repos or [])]
     statuses = check_all(machines, timeout=timeout) if machines else []
 
+    if do_fix:
+        # Repair BEFORE reporting, so the report an operator reads is the
+        # state they are actually leaving behind — a --fix run that printed
+        # the pre-fix findings would be indistinguishable from one that did
+        # nothing.
+        _run_graph_fix(cfg, name, machines, statuses, timeout=fix_timeout)
+        statuses = check_all(machines, timeout=timeout) if machines else []
+
     facts = repo_onboard.gather_facts(
         cfg, name,
         statuses=statuses,
@@ -366,3 +410,85 @@ def repo_doctor(
         click.echo(line)
     if not report.ok:
         sys.exit(1)
+
+
+def _run_graph_fix(cfg, name: str, machines, statuses, *, timeout: float) -> None:
+    """``--fix``: graphify's machine-local half, on every machine (#2237).
+
+    Fans out to each machine's agent (``POST /graph-fix``) rather than
+    repairing the local clone, because the local clone is the one that
+    matters least: workers run on dellserver and precision, the operator runs
+    this on elitebook. A fixer that only ever fixed here would recreate
+    layer 5's original blind spot one level up.
+
+    The local clone is still repaired directly when this machine has one that
+    no agent covers — an operator's laptop is a legitimate place to want a
+    graph, it just isn't a place workers run.
+
+    Everything it does is idempotent and machine-local (``graphify update .``,
+    ``git config core.hooksPath``); the versioned ``.githooks/`` port is
+    reported as remaining work by the report that follows, never performed.
+    """
+    import httpx  # noqa: PLC0415
+    from coord.network import AGENT_PORT  # noqa: PLC0415
+
+    click.echo(f"--fix: repairing graphify's machine-local half for {name}")
+    online = {s.machine.name for s in statuses if s.is_online}
+    fixed_paths: set[str] = set()
+
+    for machine in machines:
+        if machine.name not in online:
+            click.echo(
+                f"  ⚠ {machine.name}: skipped — agent not reachable, so nothing "
+                f"here could be repaired (it is NOT known to be fine)"
+            )
+            continue
+        try:
+            resp = httpx.post(
+                f"http://{machine.host}:{AGENT_PORT}/graph-fix",
+                json={"repo": name, "timeout": timeout},
+                timeout=timeout + 30.0,
+            )
+            resp.raise_for_status()
+            result = resp.json()
+        except Exception as exc:  # noqa: BLE001 — one machine must not abort the sweep
+            click.echo(f"  ✗ {machine.name}: /graph-fix failed — {exc}")
+            continue
+        for line in _format_fix_result(machine.name, result):
+            click.echo(line)
+        if result.get("repo_path"):
+            fixed_paths.add(str(Path(result["repo_path"]).expanduser()))
+
+    # The local clone, when it is not one of the checkouts just repaired.
+    from coord import repo_onboard  # noqa: PLC0415
+    from coord.graph_health import apply_local_graph_fix  # noqa: PLC0415
+
+    local = repo_onboard.local_clone_path(cfg, name)
+    if local is not None and str(local.expanduser()) not in fixed_paths:
+        result = apply_local_graph_fix(local, timeout=timeout).to_dict()
+        for line in _format_fix_result("this machine", result):
+            click.echo(line)
+    click.echo("")
+
+
+def _format_fix_result(where: str, result: dict) -> list[str]:
+    """Render one machine's ``/graph-fix`` result.
+
+    A refusal reads as a refusal, not a failure and emphatically not a
+    success: "no `.githooks/` in this repo" means the fixer deliberately did
+    nothing, and the operator's next move is a PR, not a re-run.
+    """
+    if result.get("refused"):
+        return [f"  ⊘ {where}: refused — {result['refused']}"]
+    lines: list[str] = []
+    for step in result.get("steps") or []:
+        if step.get("ok") and step.get("changed"):
+            mark = "✓"
+        elif step.get("ok"):
+            mark = "·"  # already in the desired state — the idempotent no-op
+        else:
+            mark = "✗"
+        lines.append(f"  {mark} {where}: {step.get('action')} — {step.get('detail')}")
+    if not lines:
+        lines.append(f"  · {where}: nothing to do")
+    return lines

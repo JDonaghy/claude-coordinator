@@ -980,6 +980,48 @@ def _openapi_spec() -> dict:
                 "responses": {"200": {"description": "OK"}},
             }
         },
+        "/graph-fix": {
+            "post": {
+                "summary": (
+                    "Build a missing graphify graph and set core.hooksPath for "
+                    "one repo on this machine (#2237)"
+                ),
+                "description": (
+                    "The machine-local half of graphify onboarding only: "
+                    "`graphify update .` when no graph exists here, plus "
+                    "`git config core.hooksPath .githooks`. Idempotent. "
+                    "Refuses (200, `refused` set) when the repo does not ship "
+                    "`.githooks/post-checkout` — porting those is a versioned "
+                    "change and is never automated."
+                ),
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "required": ["repo"],
+                                "properties": {
+                                    "repo": {"type": "string"},
+                                    "timeout": {
+                                        "type": "number",
+                                        "description": (
+                                            "seconds for `graphify update .`; a "
+                                            "first build on a large repo is "
+                                            "minutes, so this defaults to 600."
+                                        ),
+                                    },
+                                },
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {"description": "OK (including a refusal)"},
+                    "400": {"description": "repo missing from the body"},
+                },
+            }
+        },
         "/artifact/{repo}/{branch}": {
             "get": {
                 "summary": "Manifest of stashed build artifacts for a (repo, branch) pair",
@@ -1874,6 +1916,40 @@ def build_app(
             }
         )
 
+    async def graph_fix(request: Request) -> JSONResponse:
+        """Repair graphify's machine-local half for one repo on THIS machine
+        (#2237) — ``coord repo doctor --fix`` fans this out to every machine
+        that clones the repo.
+
+        Body: ``{"repo": "<name>", "timeout": 600}``. ``repo`` is required;
+        anything else is ignored, so an older coordinator posting extra
+        fields and a newer one omitting optional ones both work.
+
+        Idempotent by construction (``git config core.hooksPath`` +
+        ``graphify update .``), and it **refuses** rather than acting when
+        the repo does not ship ``.githooks/post-checkout`` — see
+        :func:`coord.graph_health.apply_local_graph_fix`. Never writes a
+        tracked file, so this can never turn into "the tool silently
+        committed hooks into my repo".
+
+        Runs off the event loop: a first build is minutes of AST work, and
+        blocking the loop here would stall /health for the whole fleet.
+        """
+        body: dict = {}
+        try:
+            body = await request.json()
+        except Exception:
+            pass
+        repo = body.get("repo")
+        if not isinstance(repo, str) or not repo:
+            return JSONResponse({"error": "repo is required"}, status_code=400)
+        try:
+            timeout = float(body.get("timeout", 600.0))
+        except (TypeError, ValueError):
+            timeout = 600.0
+        result = await asyncio.to_thread(server.fix_graph, repo, timeout=timeout)
+        return JSONResponse(result)
+
     routes = [
         Route("/health", health, methods=["GET"]),
         Route("/status", status, methods=["GET"]),
@@ -1895,6 +1971,10 @@ def build_app(
         Route("/rollback", rollback, methods=["POST"]),
         Route("/restart", restart, methods=["POST"]),
         Route("/worktree-clean", worktree_clean, methods=["POST"]),
+        # #2237: `coord repo doctor --fix`'s per-machine leg — build a
+        # missing graph and set core.hooksPath, on the machines that
+        # actually run workers rather than only on the operator's laptop.
+        Route("/graph-fix", graph_fix, methods=["POST"]),
         # #305: artifact stash manifest (GET /artifact/<repo>/<branch>)
         Route("/artifact/{repo}/{branch}", artifact_manifest, methods=["GET"]),
         # #207: CPU + memory snapshot for TUI sparklines

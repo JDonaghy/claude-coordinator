@@ -30,8 +30,12 @@ best-effort and structurally cannot cover every ref-moving operation:
   reaped worktree all fail invisibly.
 * Concurrent triggers coalesce ("Rebuild already in progress — changes
   queued").
-* The hooks' own ``[ ! -f graphify-out/graph.json ] && exit 0`` guard is a
-  permanent off-switch: purge the graph once and they no-op forever.
+* The hooks' own ``[ ! -f graphify-out/graph.json ] && exit 0`` guard was a
+  permanent off-switch: purge the graph once and they no-op forever.  Since
+  #2237 the agent's health-tick self-heal rebuilds an **absent** graph as
+  well as a stale one, so a ``rm -rf graphify-out/`` heals itself on the next
+  idle poll — but the hooks themselves still no-op, which is why the heal
+  cannot be delegated back to them.
 
 So the hooks are an optimization, not the correctness mechanism.  Correctness
 comes from a cheap *check*, which is possible because ``GRAPH_REPORT.md``
@@ -49,7 +53,7 @@ from __future__ import annotations
 import re
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 # ``- Built from commit: `5be69d08` `` in GRAPH_REPORT.md.  This is the only
@@ -237,8 +241,23 @@ def graph_status(repo_path: Path, default_branch: str = "main") -> GraphStatus:
         except OSError:
             st.link_target = None
 
+    # Which checkout OWNS the graph — the base checkout for a symlinked
+    # worktree, this one otherwise. Hoisted above the absent-graph return
+    # (#2237) so the "never built" branch can still name a HEAD.
+    owner = st.link_target.parent if (st.is_symlink and st.link_target) else repo_path
+
     if not graph_file.is_file():
         st.unknown_reason = "no graphify-out/graph.json (graph never built here)"
+        # #2237: HEAD is perfectly knowable with no graph on disk, and the
+        # agent-side self-heal keys its once-per-HEAD "don't retry a build
+        # that cannot succeed" bookkeeping on exactly this field. Returning
+        # None here is what made an ABSENT graph un-healable: the heal would
+        # either loop forever or (with the guard) never run at all. The
+        # origin comparison is deliberately NOT done — it costs two more git
+        # calls to answer a freshness question about a graph that does not
+        # exist.
+        st.head_sha = _head_sha(owner)
+        st.default_branch = default_branch
         return st
     st.present = True
 
@@ -253,11 +272,11 @@ def graph_status(repo_path: Path, default_branch: str = "main") -> GraphStatus:
         st.verified_at = None
 
     st.built_sha = read_built_sha(out_dir / "GRAPH_REPORT.md")
-    # Freshness is always judged against the checkout that OWNS the graph.  For
-    # a symlinked worktree that's the base checkout, not the worktree's own
-    # HEAD — the worktree is on a feature branch by definition and comparing
-    # against it would report permanent, meaningless drift.
-    owner = st.link_target.parent if (st.is_symlink and st.link_target) else repo_path
+    # Freshness is always judged against the checkout that OWNS the graph (see
+    # `owner` above).  For a symlinked worktree that's the base checkout, not
+    # the worktree's own HEAD — the worktree is on a feature branch by
+    # definition and comparing against it would report permanent, meaningless
+    # drift.
     st.head_sha = _head_sha(owner)
     st.head_committed_at = _head_committed_at(owner)
     st.default_branch = default_branch
@@ -382,6 +401,248 @@ def orphaned_hooks(repo_path: Path) -> list[str]:
         if not (versioned / name).is_file():
             out.append(name)
     return sorted(out)
+
+
+# ── The machine-local half: install, build, wire up (#2237) ─────────────────
+#
+# graphify onboarding has four layers (docs/GRAPHIFY_SETUP.md) and they split
+# cleanly by owner:
+#
+#   VERSIONED   `.githooks/post-checkout` (+ `post-commit`, `post-merge`) are
+#               tracked files. Porting them to a repo is a PR against that
+#               repo. Report it; never automate it — a tool that silently
+#               commits hooks into someone's repo is not a tool anyone wants.
+#   MACHINE-LOCAL  `graphify update .` (writes gitignored `graphify-out/`) and
+#               `git config core.hooksPath .githooks` (a per-checkout git
+#               setting). Both are idempotent and re-runnable with no side
+#               effects, which is what makes them safe to automate.
+#
+# Everything below is the machine-local half, and nothing below writes a
+# tracked file.
+
+# The command that BUILDS a graph from nothing is the same one that refreshes
+# one: `graphify update .` (AST-only, no LLM, no API key — see
+# docs/GRAPHIFY_SETUP.md). There is no `graphify build` subcommand; fix strings
+# that named one (#2220's doctor output) told operators to run a command that
+# does not exist.
+GRAPHIFY_BUILD_HINT = "graphify update ."
+
+
+@dataclass
+class GraphFixStep:
+    """One machine-local repair attempt. ``changed=False`` with ``ok=True``
+    means "already in the desired state" — the idempotent no-op, which must
+    read differently from "repaired it just now"."""
+
+    action: str  # "hooks_path" | "build"
+    ok: bool
+    changed: bool
+    detail: str
+
+    def to_dict(self) -> dict:
+        return {
+            "action": self.action,
+            "ok": self.ok,
+            "changed": self.changed,
+            "detail": self.detail,
+        }
+
+
+@dataclass
+class GraphFixResult:
+    """Outcome of :func:`apply_local_graph_fix` for one checkout.
+
+    ``refused`` is not a failure and not a success: it is the machine-local
+    fixer declining to act because the *versioned* half is missing (see the
+    section comment above). Building a graph in a repo whose hooks were never
+    ported produces a graph that immediately starts going stale with nothing
+    to heal it — a worse state to be in than "obviously absent", because it
+    looks fixed.
+    """
+
+    repo_path: str
+    refused: str | None = None
+    steps: list[GraphFixStep] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return self.refused is None and all(s.ok for s in self.steps)
+
+    @property
+    def changed(self) -> bool:
+        return any(s.changed for s in self.steps)
+
+    def to_dict(self) -> dict:
+        return {
+            "repo_path": self.repo_path,
+            "refused": self.refused,
+            "ok": self.ok,
+            "changed": self.changed,
+            "steps": [s.to_dict() for s in self.steps],
+        }
+
+
+def graphify_cli_path() -> str | None:
+    """Absolute path to the ``graphify`` CLI on this machine, or ``None``.
+
+    Layer 1 of the four (pipx CLI -> built graph -> hooks -> ``core.hooksPath``)
+    and the only one whose absence makes every other layer unfixable here:
+    with no binary, both the self-heal and ``coord repo doctor --fix`` fail
+    per-checkout with "command not found", which is recorded once per HEAD and
+    then goes quiet (#2237 item 6). Asking once, at machine scope, turns that
+    into a single finding.
+    """
+    import shutil  # noqa: PLC0415 — one call, keep module import-light
+
+    return shutil.which("graphify")
+
+
+def run_graphify_update(
+    repo_path: Path, *, timeout: float = 600.0
+) -> tuple[bool, str]:
+    """Run ``graphify update .`` in *repo_path*; return ``(ok, detail)``.
+
+    The one place in coord that shells out to graphify to build or refresh a
+    graph — the agent's self-heal (:func:`coord.agent._graphify_update`) and
+    ``coord repo doctor --fix`` both come through here, so there is exactly
+    one answer to "what command does coord run, with what flags".
+
+    Deliberately the plain, no-flags command graphify's own hooks run —
+    **never** ``--force``: that flag exists only to defeat graphify's
+    node-count refusal guard, and defeating it automatically is what turns a
+    visible stall into silent corruption of the graph agents navigate by
+    (#1729 guard 4).
+
+    ``ok`` is False on a non-zero exit, a missing ``graphify`` binary, or a
+    timeout — callers treat all three the same way: surface the reason and
+    remember this HEAD as attempted, rather than retrying forever.
+    """
+    try:
+        result = subprocess.run(
+            ["graphify", "update", "."],
+            cwd=str(repo_path),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except FileNotFoundError:
+        return False, "graphify: command not found on this machine's PATH"
+    except subprocess.TimeoutExpired:
+        return False, f"graphify update . timed out after {timeout:.0f}s"
+    except OSError as exc:
+        return False, f"graphify update . failed to start: {exc}"
+
+    if result.returncode != 0:
+        reason = (result.stderr or result.stdout or "").strip()
+        return False, reason or f"graphify update . exited {result.returncode}"
+    return True, (result.stdout or "").strip()
+
+
+def apply_local_graph_fix(
+    repo_path: Path, *, build: bool = True, timeout: float = 600.0
+) -> GraphFixResult:
+    """Repair the machine-local half of graphify for the checkout at *repo_path*.
+
+    Two idempotent steps, in the order ``docs/GRAPHIFY_SETUP.md`` requires:
+
+    1. ``core.hooksPath`` -> ``.githooks``, so future commits/checkouts keep
+       the graph fresh and worktrees get their symlinked copy.
+    2. ``graphify update .`` when there is no graph here yet (or *build* is
+       forced), so the hooks have something to maintain — their own
+       ``[ ! -f graphify-out/graph.json ] && exit 0`` guard means a repo with
+       hooks and no graph stays graph-less forever.
+
+    **Refuses** — doing neither step — when the repo does not ship
+    ``.githooks/post-checkout``. Pointing ``core.hooksPath`` at a directory
+    that does not exist silently disables *all* hooks for the checkout, and
+    building a graph nothing will ever refresh just swaps a loud absence for a
+    quiet staleness. The versioned port is a PR against that repo; this
+    reports it as remaining work (see :class:`GraphFixResult`).
+
+    Never raises, never touches a tracked file, and safe to run repeatedly:
+    a checkout already in the desired state comes back ``ok`` with
+    ``changed=False``.
+    """
+    result = GraphFixResult(repo_path=str(repo_path))
+
+    if not (repo_path / ".git").exists():
+        result.refused = f"no git checkout at {repo_path}"
+        return result
+
+    if not hooks_file_present(repo_path):
+        result.refused = (
+            f"repo does not ship {HOOKS_PATH}/post-checkout — port the hooks "
+            f"first (a PR against that repo; `graphify hook install` then copy "
+            f"the shims into {HOOKS_PATH}/). Setting core.hooksPath at a "
+            f"directory that does not exist disables ALL hooks for this "
+            f"checkout, and a graph nothing refreshes just goes stale quietly."
+        )
+        return result
+
+    # Step 1 — core.hooksPath. Cheap, and ordered first so that even a failed
+    # build leaves the checkout ready to heal itself on the next commit.
+    hooks_ok, hooks_detail = hooks_path_status(repo_path)
+    if hooks_ok:
+        result.steps.append(
+            GraphFixStep("hooks_path", ok=True, changed=False, detail=hooks_detail)
+        )
+    else:
+        current = _git_out(repo_path, "config", "--get", "core.hooksPath")
+        if current and Path(current).name != Path(HOOKS_PATH).name:
+            # Someone pointed this checkout somewhere deliberate. Overwriting
+            # another tool's hooks directory is not a repair, it is a
+            # hijacking — report and move on.
+            result.steps.append(
+                GraphFixStep(
+                    "hooks_path", ok=False, changed=False,
+                    detail=(
+                        f"core.hooksPath is {current!r}, not {HOOKS_PATH!r} — left "
+                        f"alone (another tool may own it); fix by hand if intended"
+                    ),
+                )
+            )
+        else:
+            set_ok = _git_out(repo_path, "config", "core.hooksPath", HOOKS_PATH)
+            # `git config <k> <v>` prints nothing on success, so `_git_out`
+            # returns None either way — re-read to prove it took.
+            del set_ok
+            now_ok, now_detail = hooks_path_status(repo_path)
+            result.steps.append(
+                GraphFixStep(
+                    "hooks_path", ok=now_ok, changed=now_ok,
+                    detail=(
+                        f"set core.hooksPath={HOOKS_PATH}" if now_ok else now_detail
+                    ),
+                )
+            )
+
+    # Step 2 — the graph itself.
+    status = graph_status(repo_path)
+    if status.present and not build:
+        result.steps.append(
+            GraphFixStep(
+                "build", ok=True, changed=False,
+                detail=f"graph already present (built from {status.built_sha or '?'})",
+            )
+        )
+        return result
+    if status.present and not status.stale:
+        result.steps.append(
+            GraphFixStep(
+                "build", ok=True, changed=False,
+                detail=f"graph already current (built from {status.built_sha or '?'})",
+            )
+        )
+        return result
+
+    ok, detail = run_graphify_update(repo_path, timeout=timeout)
+    result.steps.append(
+        GraphFixStep(
+            "build", ok=ok, changed=ok,
+            detail=(detail or GRAPHIFY_BUILD_HINT) if not ok else f"ran {GRAPHIFY_BUILD_HINT}",
+        )
+    )
+    return result
 
 
 def format_status_lines(st: GraphStatus) -> list[str]:

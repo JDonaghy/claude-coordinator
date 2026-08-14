@@ -30,7 +30,7 @@ The five layers, and what each one silently costs when missed:
 4. **Repo contents** — a ``CLAUDE.md`` (the Test agent auto-loads it and the
    adversarial review prompt is assembled from it; without one, reviews enforce
    nothing) and a Test-stage command the runner can resolve.
-5. **Graph** — graphify build + hook install + ``core.hooksPath``, in that
+5. **Graph** — ``graphify update .`` + hook install + ``core.hooksPath``, in that
    order. A half-installed machine looks identical to a working one; it just
    answers from grep.
 
@@ -133,9 +133,64 @@ class GithubFacts:
 
 
 @dataclass
+class MachineGraphFacts:
+    """Graph readiness on ONE machine, read from that machine's ``/health``
+    (#2237 item 3).
+
+    Layer 5 used to be the only layer that looked at the machine running the
+    command instead of the fleet — which inverted the blind spot it exists to
+    close: workers run on dellserver and precision, the operator runs
+    ``repo doctor`` on elitebook, so a repo with a graph *here* and none
+    *there* reported "2 check(s) passed". The check was healthiest exactly
+    where it was least informative.
+
+    Nothing new is fetched for this: the H-1 ``graph`` check already runs on
+    every agent's ``/health`` tick (#1630) and its ``values`` carry the same
+    predicates :func:`coord.graph_health.graph_status` computes locally. This
+    is a fold of data ``coord repo doctor`` was already receiving and
+    throwing away.
+
+    ``probed=False`` (with ``reason`` set) is a skip, never a pass: an
+    offline machine, an agent too old to publish a health block, and a
+    machine with no checkout are three different unknowns, and none of them
+    is evidence of a working graph.
+    """
+
+    machine: str
+    # Declared for this repo in coordinator.yml — i.e. workers actually run
+    # here. This is the distinction #2237 item 4 asks for: "no graph on a
+    # machine that runs workers" is a different finding from "no graph on
+    # the operator's laptop", and only the former should gate.
+    runs_workers: bool = True
+    probed: bool = False
+    reason: str | None = None
+    repo_path: str | None = None
+    built: bool = False
+    fresh: bool = False
+    detail: str | None = None
+    hooks_installed: bool = False
+    hooks_detail: str | None = None
+    # None when this machine's agent predates the field (see #2237's addition
+    # to `coord/health/checks/graph.py`) — distinct from a proven False.
+    hooks_shipped: bool | None = None
+    # None when the machine's agent publishes no `graphify_cli` check result
+    # (an agent older than #2237) — again distinct from a proven "absent".
+    graphify_cli: bool | None = None
+    # Reason the agent's own self-heal last failed on this checkout, when it
+    # published one — the "why is it still broken after a heal ran" answer.
+    self_heal_failed_reason: str | None = None
+
+
+@dataclass
 class GraphFacts:
     """Graph readiness on the machine running the check. ``probed=False`` means
-    there is no local clone here to look at — a skip, not a pass."""
+    there is no local clone here to look at — a skip, not a pass.
+
+    #2237: ``machines`` carries the same question answered on every machine
+    that runs workers for this repo (see :class:`MachineGraphFacts`); the
+    fields below remain the *local* answer, which still matters when the
+    operator's box has a clone nothing else knows about.
+    """
 
     probed: bool = False
     repo_path: str | None = None
@@ -154,6 +209,10 @@ class GraphFacts:
     # checkout. Telling an operator the wrong one is worse than saying
     # nothing, so the fix line has to know which it is.
     hooks_shipped: bool = False
+    # #2237: per-machine readiness, folded from each agent's /health. Empty
+    # when no machine declared this repo, or when the caller passed no
+    # statuses (`coord repo doctor --no-github` style offline runs).
+    machines: list[MachineGraphFacts] = field(default_factory=list)
 
 
 @dataclass
@@ -346,6 +405,108 @@ def gather_graph_facts(repo_path: Path | None, default_branch: str = "main") -> 
     return facts
 
 
+def _graph_result_for(health: dict, repo_name: str, repo_path: str | None) -> dict | None:
+    """The ``graph`` check result for *repo_name* inside one machine's
+    ``/health`` payload, or ``None`` when that machine reported none.
+
+    Matched on the check's ``subject`` (which is the checkout's repo NAME —
+    see :func:`coord.health.context.local_checkouts`) and, failing that, on
+    the resolved path. Path matching is the fallback rather than the primary
+    key because ``coordinator.yml`` may spell a path with ``~`` while the
+    agent reports it expanded.
+    """
+    results = ((health or {}).get("health") or {}).get("results") or []
+    wanted_path = str(Path(repo_path).expanduser()) if repo_path else None
+    fallback: dict | None = None
+    for r in results:
+        if r.get("check_id") != "graph":
+            continue
+        if r.get("subject") == repo_name:
+            return r
+        values = r.get("values") or {}
+        if wanted_path and values.get("path") == wanted_path:
+            fallback = r
+    return fallback
+
+
+def _graphify_cli_installed(health: dict) -> bool | None:
+    """Whether the machine reported a ``graphify`` CLI (``None`` = didn't say).
+
+    #2237 item 6: a machine with no ``graphify`` on ``$PATH`` cannot build or
+    heal any graph, and until the ``graphify_cli`` check existed that failed
+    once per checkout, silently, inside a per-HEAD failure record.
+    """
+    results = ((health or {}).get("health") or {}).get("results") or []
+    for r in results:
+        if r.get("check_id") == "graphify_cli":
+            return bool((r.get("values") or {}).get("installed"))
+    return None
+
+
+def machine_graph_facts_from_statuses(cfg, repo_name: str, statuses) -> list[MachineGraphFacts]:
+    """Fold each machine's ``/health`` into per-machine graph readiness (#2237).
+
+    Costs no extra round trip: the caller already fetched these statuses for
+    layer 2, and every agent has been publishing its H-1 ``graph`` check
+    results in that same payload since #1630. Layer 5 was simply not reading
+    them — it stat'd the local disk instead, which is why two repos ran for
+    weeks with no graph on the machines that matter while ``repo doctor``
+    reported "✓ 2 check(s) passed".
+    """
+    by_name = {s.machine.name: s for s in statuses}
+    out: list[MachineGraphFacts] = []
+    for m in cfg.machines:
+        if repo_name not in (m.repos or []):
+            continue
+        repo_path = m.repo_path(repo_name)
+        mf = MachineGraphFacts(machine=m.name, repo_path=repo_path)
+        st = by_name.get(m.name)
+        if st is None:
+            mf.reason = "not probed"
+            out.append(mf)
+            continue
+        if not st.is_online:
+            mf.reason = st.reason or "offline"
+            out.append(mf)
+            continue
+
+        health = st.health or {}
+        mf.graphify_cli = _graphify_cli_installed(health)
+        result = _graph_result_for(health, repo_name, repo_path)
+        if result is None:
+            block = (health.get("health") or {}).get("results")
+            mf.reason = (
+                "agent published no health block — it predates #1630; "
+                "restart/update coord-agent there"
+                if block is None
+                else f"agent published no graph check for {repo_name} "
+                "(no checkout of this repo on that machine?)"
+            )
+            out.append(mf)
+            continue
+
+        values = result.get("values") or {}
+        mf.probed = True
+        mf.repo_path = values.get("path") or repo_path
+        mf.built = bool(values.get("present"))
+        # `stale` is only meaningful once `present` — see graph_status's early
+        # return for an absent graph, the classification boundary that made an
+        # absent graph un-healable (#2237 item 5).
+        mf.fresh = bool(mf.built and not values.get("stale"))
+        mf.detail = (
+            values.get("unknown_reason")
+            or result.get("headroom")
+            or None
+        )
+        mf.hooks_installed = bool(values.get("hooks_ok"))
+        mf.hooks_detail = values.get("hooks_detail")
+        shipped = values.get("hooks_shipped")
+        mf.hooks_shipped = None if shipped is None else bool(shipped)
+        mf.self_heal_failed_reason = values.get("self_heal_failed_reason")
+        out.append(mf)
+    return out
+
+
 def machine_facts_from_statuses(cfg, repo_name: str, statuses) -> list[MachineFacts]:
     """Fold ``coord.network.check_all`` results into :class:`MachineFacts`.
 
@@ -432,6 +593,13 @@ def gather_facts(
         facts.graph = gather_graph_facts(
             local_clone, facts.config_default_branch or "main"
         )
+
+    # #2237: the fleet-wide half of layer 5. Deliberately independent of
+    # `local_clone` — the whole point is that the machine running this command
+    # is usually NOT one of the machines that runs workers.
+    facts.graph.machines = machine_graph_facts_from_statuses(
+        cfg, repo_name, statuses or []
+    )
 
     return facts
 
@@ -860,12 +1028,185 @@ def evaluate_contents(facts: RepoFacts) -> list[Finding]:
     return out
 
 
+def _evaluate_graph_fleet(facts: RepoFacts) -> list[Finding]:
+    """Layer 5, per machine that runs workers for this repo (#2237 items 2+4).
+
+    Severity rule, and the reason it differs from #2220's flat WARN:
+
+    * **A machine missing its graph is WARN.** Its workers degrade to grep —
+      bad, measurable (#2236), not fatal. The agent's own self-heal now
+      rebuilds an absent graph unattended (#2237 item 5), so a single
+      machine's absence is often already on its way to fixed by the time
+      anyone reads this.
+    * **No graph on ANY probed worker machine is CRIT.** That is not residue,
+      it is a repo where the graph-first rule every worker prompt carries
+      cannot be obeyed by anyone, and it is exactly the state coord-portal
+      and stick-demo sat in for weeks while ``ok=true``.
+    * **An unprobed machine proves nothing** and must never do either — an
+      offline agent is not evidence of a missing graph, nor of a present one,
+      so a fleet where nothing could be probed is UNKNOWN, not CRIT.
+    """
+    out: list[Finding] = []
+    machines = facts.graph.machines
+    if not machines:
+        return out
+
+    probed = [m for m in machines if m.probed]
+    for m in machines:
+        if not m.probed:
+            out.append(Finding(
+                layer="graph", check="graph.machine_not_probed", severity=UNKNOWN,
+                summary=f"{m.machine}: graph readiness not probed — {m.reason or 'unknown'}",
+            ))
+            continue
+        if not m.built:
+            out.append(Finding(
+                layer="graph", check="graph.machine_not_built", severity=WARN,
+                summary=(
+                    f"{m.machine}: no graph at {m.repo_path} — "
+                    f"{m.detail or 'never built there'}; every worker dispatched "
+                    f"to {m.machine} for this repo answers from grep"
+                ),
+                fix=(
+                    f"coord repo doctor {facts.name} --fix  "
+                    f"(or on {m.machine}: cd {m.repo_path} && "
+                    f"{graph_health_build_hint()})"
+                ),
+            ))
+        elif not m.fresh:
+            out.append(Finding(
+                layer="graph", check="graph.machine_stale", severity=WARN,
+                summary=f"{m.machine}: graph is stale — {m.detail or 'built sha is behind HEAD'}",
+                fix=(
+                    f"nothing, if the agent is healthy — its self-heal rebuilds "
+                    f"stale graphs on the next idle health tick (#1729). "
+                    f"Force it: coord repo doctor {facts.name} --fix"
+                ),
+            ))
+        else:
+            out.append(Finding(
+                layer="graph", check="graph.machine_fresh", severity=OK,
+                summary=f"{m.machine}: graph current with HEAD",
+            ))
+
+        if m.probed and not m.hooks_installed and m.hooks_shipped is not False:
+            # `hooks_shipped is False` means the repo never ported the hooks —
+            # a versioned, repo-wide problem reported once below, not N times.
+            out.append(Finding(
+                layer="graph", check="graph.machine_hooks_missing", severity=WARN,
+                summary=(
+                    f"{m.machine}: {m.hooks_detail or 'core.hooksPath is unset'} — "
+                    f"worktrees there get no linked graph"
+                ),
+                fix=f"coord repo doctor {facts.name} --fix",
+            ))
+        if m.self_heal_failed_reason:
+            out.append(Finding(
+                layer="graph", check="graph.machine_self_heal_failed", severity=WARN,
+                summary=(
+                    f"{m.machine}: the agent's automatic rebuild failed — "
+                    f"{m.self_heal_failed_reason}"
+                ),
+                fix=(
+                    "it will not retry until HEAD moves (#1729 guard 3) — fix the "
+                    "underlying reason, then: coord repo doctor "
+                    f"{facts.name} --fix"
+                ),
+            ))
+        if m.graphify_cli is False:
+            out.append(Finding(
+                layer="graph", check="graph.machine_no_graphify_cli", severity=WARN,
+                summary=(
+                    f"{m.machine}: the graphify CLI is not installed — no graph on "
+                    f"that machine can be built or self-healed, for any repo"
+                ),
+                fix=f"on {m.machine}: pipx install graphify  (docs/GRAPHIFY_SETUP.md)",
+            ))
+
+    # The versioned half, reported once for the repo rather than per machine:
+    # `.githooks/` is tracked, so its absence is identical everywhere and its
+    # fix is a PR, not a command an operator runs per box.
+    if probed and all(m.hooks_shipped is False for m in probed):
+        out.append(Finding(
+            layer="graph", check="graph.hooks_not_ported", severity=WARN,
+            summary=(
+                "this repo ships no .githooks/post-checkout (confirmed on "
+                f"{', '.join(m.machine for m in probed)}) — worktrees get no "
+                "linked graph on ANY machine, so every worker on this repo "
+                "silently falls back to grep"
+            ),
+            fix=(
+                "port .githooks/ (_lib.sh, post-checkout, post-commit, post-merge) "
+                "from claude-coordinator into this repo, THEN "
+                "coord repo doctor --fix  (see docs/GRAPHIFY_SETUP.md)"
+            ),
+        ))
+
+    if not probed:
+        out.append(Finding(
+            layer="graph", check="graph.fleet_not_probed", severity=UNKNOWN,
+            summary=(
+                f"no machine that runs workers for {facts.name} could be probed "
+                "— graph readiness across the fleet is unknown, not proven"
+            ),
+        ))
+    elif not any(m.built for m in probed):
+        out.append(Finding(
+            layer="graph", check="graph.fleet_not_built", severity=CRIT,
+            summary=(
+                f"NO machine that runs workers for {facts.name} has a graph "
+                f"({', '.join(m.machine for m in probed)}) — the graph-first rule "
+                "in every worker prompt cannot be obeyed by anyone here, and "
+                "'ignored the rule' is indistinguishable from 'there was nothing "
+                "to query' (#2236)"
+            ),
+            fix=f"coord repo doctor {facts.name} --fix",
+        ))
+    return out
+
+
+def graph_health_build_hint() -> str:
+    """``graphify update .`` — the command that builds a graph from nothing.
+
+    Imported lazily through a function so this module stays import-light and
+    so the string has exactly one definition (``coord.graph_health``); #2220's
+    doctor told operators to run ``graphify build``, which is not a subcommand
+    graphify has.
+    """
+    from coord.graph_health import GRAPHIFY_BUILD_HINT  # noqa: PLC0415
+
+    return GRAPHIFY_BUILD_HINT
+
+
 def evaluate_graph(facts: RepoFacts) -> list[Finding]:
     """Layer 5 — graphify. Four sub-layers that all fail silently; a
     half-installed machine looks identical to a working one, it just answers
-    from grep."""
+    from grep.
+
+    Fleet-wide since #2237: every machine that declares this repo is judged
+    from its own ``/health``, and the local clone is only reported separately
+    when it is a machine no worker runs on (the operator's laptop). Severity
+    follows the same split — a graph missing on the box you happen to be
+    typing on is residue; a repo with **no** graph on **any** machine that
+    runs workers is a repo whose every worker silently answers from grep, and
+    that gates.
+    """
     out: list[Finding] = []
     g = facts.graph
+    out.extend(_evaluate_graph_fleet(facts))
+    probed_paths = {
+        str(Path(m.repo_path).expanduser())
+        for m in g.machines
+        if m.probed and m.repo_path
+    }
+    if g.probed and g.repo_path and str(Path(g.repo_path).expanduser()) in probed_paths:
+        # The local clone IS one of the machines just reported on — saying it
+        # twice, once per source, is how a report teaches people to skim it.
+        return out
+    if g.machines and not g.probed:
+        # No local clone and the fleet answered: "not probed here" would be
+        # noise, not news.
+        return out
     if not g.probed:
         out.append(Finding(
             layer="graph", check="graph.not_probed", severity=UNKNOWN,
@@ -885,13 +1226,20 @@ def evaluate_graph(facts: RepoFacts) -> list[Finding]:
                 f"{g.detail or 'graphify has never been built here'}; queries "
                 "silently degrade to grep"
             ),
-            fix="graphify build  (see docs/GRAPHIFY_SETUP.md)",
+            # #2237: `graphify build` is not a subcommand graphify has —
+            # `graphify update .` is the AST-only build-or-refresh command
+            # (docs/GRAPHIFY_SETUP.md), and it is what the hooks, the agent
+            # self-heal, and `--fix` all run.
+            fix=(
+                f"coord repo doctor {facts.name} --fix  "
+                f"(or here: cd {g.repo_path} && {graph_health_build_hint()})"
+            ),
         ))
     elif not g.fresh:
         out.append(Finding(
             layer="graph", check="graph.stale", severity=WARN,
             summary=f"graph is stale — {g.detail or 'built sha is behind HEAD'}",
-            fix="graphify build",
+            fix=f"cd {g.repo_path} && {graph_health_build_hint()}",
         ))
     else:
         out.append(Finding(
@@ -927,7 +1275,11 @@ def evaluate_graph(facts: RepoFacts) -> list[Finding]:
                 f"{g.hooks_detail or 'core.hooksPath is unset or points elsewhere'}; "
                 "the graph will silently stop tracking commits"
             ),
-            fix="graphify hook install  (then set core.hooksPath — order matters)",
+            fix=(
+                f"coord repo doctor {facts.name} --fix  (or by hand: graphify "
+                "hook install, THEN git config core.hooksPath .githooks — "
+                "order matters)"
+            ),
         ))
     else:
         out.append(Finding(
