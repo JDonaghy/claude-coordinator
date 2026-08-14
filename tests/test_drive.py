@@ -3413,6 +3413,277 @@ def test_is_stale_smoke_reason_distinguishes_stale_from_missing():
     assert not _is_stale_smoke_reason(None)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# #2229: the driver captured the exact merge refusal, printed it into its own
+# death message, and never classified it.
+#
+# quadraui#309 sat blocked for 11h on a merge that landed first try by hand.
+# `merge_queue.plan()` reported READY with NO reason (`_entry_gate_status`
+# re-derives freshness at board-build time and degrades to a no-op without
+# live SHA data — the #1640 door / #1566 "plan says ready, --only refuses"
+# split), so `_merge_gate_divergence` had nothing to classify. Meanwhile every
+# `coord merge --only` attempt captured "smoke test verdict is stale" into
+# `counters.last_merge_diagnostic` — the exact string the #1738 auto-repair
+# arm keys on — and used it for nothing but the give-up message.
+#
+# #2078's diagnostic fallback did not cover this: it lives inside the
+# `status == ""` arm (#309's entry WAS enqueued) and matches only the
+# not-yet-enqueued `enqueue blocked by <gate>` wording.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _stale_smoke_diagnostic() -> str:
+    """The quadraui#309 diagnostic, verbatim in shape: `coord merge --only`'s
+    own pre-`process()` gate line plus the `smoke_required` event."""
+    return (
+        "  gate smoke: test verdict stale (recorded against base f6216e4, "
+        "base now c50e30c) — will block this merge\n"
+        "  quadraui #309 (issue-309-drive-queue-bot): smoke_required — smoke "
+        "test verdict is stale: recorded against base f6216e4, base is now "
+        "c50e30c — re-verify against the current base, then `coord test "
+        "41ae4f893239 --passed`"
+    )
+
+
+def _missing_smoke_diagnostic() -> str:
+    return (
+        "  gate smoke: smoke test required but no verdict recorded — will "
+        "block this merge"
+    )
+
+
+def test_stale_smoke_only_in_the_captured_diagnostic_takes_the_retest_arm():
+    """THE #2229 regression test. Board: `merge_status='READY'`,
+    `merge_reason=''` — nothing to classify. Diagnostic: this driver's own
+    last `coord merge --only`, saying the smoke verdict is stale. The #1738
+    re-test must arm off that, instead of the three blind retries that ended
+    in `exit_code=1` and an 11h stall."""
+    counters = DriveCounters(last_merge_diagnostic=_stale_smoke_diagnostic())
+    action = step(
+        approved_work(merge_status="READY", merge_reason=""),
+        counters=counters,
+    )
+    assert action.kind == RUN
+    assert action.command == (
+        "diagnose", REPO, str(ISSUE), "--stage", "test", "--reset",
+    )
+    assert counters.fix_rounds == 1
+    assert counters.merge_attempts == 0  # no blind retry spent
+
+
+def test_missing_verdict_in_the_captured_diagnostic_escalates_and_never_repairs():
+    """`_STALE_SMOKE_MARKERS` stays a STRICT subset of `_SMOKE_GATE_MARKERS`
+    on the diagnostic path too: a MISSING verdict is the #1640 lost-write
+    shape, which a re-test cannot safely paper over. It escalates to a human
+    on first encounter, exactly as it does off a board reason."""
+    counters = DriveCounters(last_merge_diagnostic=_missing_smoke_diagnostic())
+    action = step(
+        approved_work(merge_status="READY", merge_reason=""),
+        counters=counters,
+    )
+    assert action.is_exit
+    assert action.exit_code == EXIT_ESCALATED
+    assert counters.fix_rounds == 0
+    assert "smoke" in action.message.lower()
+
+
+def test_diagnostic_derived_escalation_quotes_the_recovered_reason():
+    """An escalation that says `reports ''` is unactionable — the whole #2229
+    complaint. The recovered gate text has to reach the recorded reason."""
+    action = step(
+        approved_work(merge_status="READY", merge_reason=""),
+        counters=DriveCounters(last_merge_diagnostic=_missing_smoke_diagnostic()),
+    )
+    assert action.is_exit
+    assert "smoke test required but no verdict recorded" in " ".join(action.command)
+
+
+def test_diagnostic_derived_retest_fires_once_per_captured_snapshot():
+    """#2149's lesson as a latch: the diagnostic is a SNAPSHOT that nothing
+    but a real attempt refreshes. `coord diagnose --stage test --reset` clears
+    `test_state`, but the board needs a beat to show it — until then the state
+    is byte-for-byte identical. One re-test per snapshot, then a REAL attempt
+    has to re-validate; otherwise a lagging board burns the whole
+    `max_fix_rounds` budget off one frozen line."""
+    counters = DriveCounters(last_merge_diagnostic=_stale_smoke_diagnostic())
+    opts = DriveOptions(machine="precision", max_fix_rounds=3)
+    s = approved_work(merge_status="READY", merge_reason="")
+
+    first = step(s, opts, counters=counters)
+    assert first.command[0] == "diagnose"
+    assert counters.fix_rounds == 1
+
+    # Same frozen diagnostic, same board — must NOT spend a second fix round.
+    second = step(s, opts, counters=counters)
+    assert second.kind == RUN
+    assert second.command == ("merge", "--only", "w1", "--method", "rebase")
+    assert counters.fix_rounds == 1
+    assert counters.merge_attempts == 1
+
+
+def test_diagnostic_derived_retest_is_bounded_by_max_fix_rounds():
+    """The re-test arm shares the same `fix_rounds` budget when it arms off
+    the diagnostic — a board that never catches up must converge on an
+    escalation, never spin to the deadline."""
+    counters = DriveCounters(last_merge_diagnostic=_stale_smoke_diagnostic())
+    opts = DriveOptions(machine="precision", max_fix_rounds=2, max_merge_attempts=99)
+    s = approved_work(merge_status="READY", merge_reason="")
+
+    actions = []
+    for _ in range(12):
+        action = step(s, opts, counters=counters)
+        actions.append(action)
+        if action.is_exit:
+            break
+
+    assert actions[-1].is_exit
+    assert actions[-1].exit_code == EXIT_ESCALATED
+    assert counters.fix_rounds == 2
+    retests = [a for a in actions if a.command and a.command[0] == "diagnose"]
+    assert len(retests) == 2
+
+
+def test_a_board_reason_still_wins_over_the_captured_diagnostic():
+    """The fallback is a fallback: `merge_reason` is live and re-read every
+    poll, the diagnostic is only as fresh as the last attempt. When the board
+    names a gate, that is what gets classified."""
+    counters = DriveCounters(last_merge_diagnostic=_stale_smoke_diagnostic())
+    action = step(
+        approved_work(
+            merge_status="READY",
+            merge_reason="review required but not approved",
+        ),
+        counters=counters,
+    )
+    assert action.is_exit
+    assert action.exit_code == EXIT_ESCALATED
+    assert "review-reaffirm w1" in " ".join(action.command)
+    assert counters.fix_rounds == 0
+
+
+def test_an_enqueued_status_with_no_gate_in_the_diagnostic_still_retries_blind():
+    """The companion case: an enqueued entry whose captured diagnostic names
+    no gate at all has nothing to classify — the bounded `--only` retry is
+    still the right move, unchanged."""
+    counters = DriveCounters(
+        last_merge_diagnostic="merge-queue: 1 entry processed; 0 merged"
+    )
+    action = step(
+        approved_work(merge_status="READY", merge_reason=""),
+        counters=counters,
+    )
+    assert action.kind == RUN
+    assert action.command == ("merge", "--only", "w1", "--method", "rebase")
+    assert counters.merge_attempts == 1
+
+
+def test_the_first_merge_poll_never_classifies_off_an_empty_diagnostic():
+    """Before any attempt has run there is no diagnostic, so #2229 can never
+    escalate (or re-test) a merge this drive has not even tried once."""
+    counters = DriveCounters()
+    action = step(
+        approved_work(merge_status="READY", merge_reason=""), counters=counters
+    )
+    assert action.kind == RUN
+    assert action.command[0] == "merge"
+
+
+def test_the_empty_status_enqueue_blocked_path_is_unchanged_by_2229():
+    """`status == ""` is #2078's shape and keeps #2078's bounded-wait arm:
+    "no queue entry at all" is a different fact from "enqueued and refused",
+    and the cheap wait is what lets a not-yet-enqueued row self-heal without
+    spending a re-test on it."""
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_merge_attempts=3)
+    counters.last_merge_diagnostic = (
+        "merge-queue: no entry found for 'w1', but 1 done work row(s) on the "
+        "board match it:\n"
+        "  claude-coordinator #1392 (assignment w1, branch fix-1392) — "
+        "enqueue blocked by smoke gate — test verdict stale (recorded "
+        "against base 5f34a46, base now ff1bd1f) (waive with --skip-smoke)"
+    )
+    action = step(approved_work(merge_status=""), opts, counters=counters)
+    assert action.kind == WAIT
+    assert "not yet enqueued" in action.label
+    assert counters.fix_rounds == 0
+    assert counters.gate_wait_rounds == 1
+
+
+def test_a_live_ci_wait_still_wins_over_a_captured_gate_line():
+    """#1891/#1892's bare waits sit right after the divergence check and must
+    keep winning: `merge_reason` carries a live, recognised signal whose only
+    resolution is more real time. A snapshot from an older attempt must not
+    divert the drive into a re-test while CI is still reporting."""
+    counters = DriveCounters(last_merge_diagnostic=_stale_smoke_diagnostic())
+    action = step(
+        approved_work(
+            merge_status="READY",
+            merge_reason="CI running: build, windows",
+        ),
+        counters=counters,
+    )
+    assert action.kind == WAIT
+    assert counters.fix_rounds == 0
+    assert counters.merge_attempts == 0
+
+
+def test_a_conflict_status_still_reaches_its_own_conflict_fix_dispatch():
+    """CONFLICT is a live merge-mechanics block with its own resolution path
+    (#1474/#241, reached through the bounded `--only` retry). A re-test does
+    not rebase a branch — diverting to one is this issue's stall, inverted."""
+    counters = DriveCounters(last_merge_diagnostic=_stale_smoke_diagnostic())
+    action = step(
+        approved_work(merge_status="CONFLICT", merge_reason=""),
+        counters=counters,
+    )
+    assert action.kind == RUN
+    assert action.command == ("merge", "--only", "w1", "--method", "rebase")
+    assert counters.fix_rounds == 0
+
+
+def test_extract_gate_refusal_reason_reads_either_wording():
+    from coord.drive import _extract_gate_refusal_reason
+
+    assert "test verdict stale" in _extract_gate_refusal_reason(
+        _stale_smoke_diagnostic()
+    )
+    assert _extract_gate_refusal_reason(
+        "  gate review: review required but not approved — will block this merge"
+    ) == "gate review: review required but not approved — will block this merge"
+    # No gate named — nothing to classify.
+    assert _extract_gate_refusal_reason("merge-queue: 1 merged") == ""
+    assert _extract_gate_refusal_reason("") == ""
+    assert _extract_gate_refusal_reason(None) == ""
+
+
+def test_extract_gate_refusal_reason_ignores_a_gate_this_run_waived():
+    """`coord merge --only --skip-smoke` prints the SAME gate line with
+    "waived by this run" instead of "will block this merge". A waived gate
+    refused nothing and must never be read back as a refusal."""
+    from coord.drive import _extract_gate_refusal_reason
+
+    waived = (
+        "  gate smoke: test verdict stale (base moved) — waived by this run\n"
+        "  --skip-smoke: interactive smoke-test gate bypassed (#465)"
+    )
+    assert _extract_gate_refusal_reason(waived) == ""
+
+
+def test_a_waived_gate_in_the_diagnostic_leaves_the_merge_retryable():
+    """End to end: the waiver guard above must not turn a merge that this run
+    explicitly un-gated into an escalation or a re-test."""
+    counters = DriveCounters(
+        last_merge_diagnostic=(
+            "  gate smoke: test verdict stale (base moved) — waived by this run"
+        )
+    )
+    action = step(
+        approved_work(merge_status="READY", merge_reason=""), counters=counters
+    )
+    assert action.kind == RUN
+    assert action.command[0] == "merge"
+
+
 # ── terminal: merged, verified ───────────────────────────────────────────────
 
 

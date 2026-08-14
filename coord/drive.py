@@ -289,6 +289,21 @@ class DriveCounters:
     # capture deserves its own full budget of cheap waits before the next
     # forced retry.
     gate_wait_rounds: int = 0
+    # #2229: the value `merge_attempts` held when the #1738 stale-smoke
+    # re-test last fired off a reason read out of `last_merge_diagnostic`
+    # rather than off the board (`-1` = never). A de-duplication latch in the
+    # same spirit as `review_fix_dispatched_for` above, for the same reason:
+    # `coord diagnose --stage test --reset` clears `test_state`, but the board
+    # this driver polls needs a beat to show it, and until it does the state
+    # is byte-for-byte identical to the one that triggered the re-test —
+    # except that, unlike a board `merge_reason`, the captured diagnostic is
+    # frozen and CANNOT change on its own. Without the latch a lagging board
+    # would burn the whole `max_fix_rounds` budget re-testing off one stale
+    # snapshot. Releases when `merge_attempts` advances, i.e. when a real
+    # `coord merge --only` attempt has re-captured the diagnostic — which is
+    # #2149's rule (act on the snapshot, then go re-validate it for real)
+    # expressed as a latch rather than a wait counter.
+    stale_smoke_diagnostic_attempt: int = -1
     # #2199: bounded retry for the trust gate's OWN dispatch — distinct from
     # `fix_rounds` (which bounds "the work needs another round" once a
     # verdict, passed or failed, actually landed on the board). This counts
@@ -2377,19 +2392,112 @@ def _merge_gate_kind(reason: str) -> str | None:
 _STALE_SMOKE_MARKERS = _mq_stale_smoke_markers
 _is_stale_smoke_reason = _mq_is_stale_smoke_reason
 
+# #2229: `coord merge --only` prints a gate line per REFUSED gate, and the
+# same run prints a "waived by this run" variant of that line for a gate the
+# invocation's own `--skip-review`/`--skip-smoke` disarmed
+# (`coord.commands.merge`, the `_status` ternary). A waived gate did not
+# refuse anything, so its line must never be read back as a refusal.
+_GATE_WAIVED_MARKER = "waived by this run"
 
-def _merge_gate_divergence(state: IssueState) -> str | None:
+
+def _extract_gate_refusal_reason(diagnostic: str | None) -> str:
+    """The first smoke/review gate refusal named anywhere in a captured
+    `coord merge --only` *diagnostic*, or ``""`` (#2229).
+
+    Unlike :func:`_extract_gate_block_reason` — which matches only
+    `_explain_missing_only_entry`'s "enqueue blocked by <gate>" wording, i.e.
+    the NOT-YET-ENQUEUED shape — this reads the refusal out of a run where
+    the entry *did* resolve. `coord merge --only` echoes one
+    ``  gate <name>: <reason> — will block this merge`` line per failing gate
+    before `process()` runs, and `process()`'s own events (``smoke_required
+    — …``) name it again; both are ordinary lines carrying the same gate
+    vocabulary :func:`_merge_gate_kind` already classifies, so this scans
+    lines rather than pinning one exact format that would silently stop
+    matching the day either message is reworded.
+
+    quadraui#309: that text is the ONLY place the refusal existed. The board
+    plan reported ``READY`` with an empty reason (``merge_queue.plan()``'s
+    `_entry_gate_status` degrades to a no-op without live SHA data — the
+    #1640 door, the #1566 "plan says ready, ``--only`` refuses" split), so
+    `_merge_gate_divergence` saw nothing to classify and the drive spent
+    three blind retries and died — printing this very text in its own death
+    message.
+    """
+    for line in (diagnostic or "").splitlines():
+        if _GATE_WAIVED_MARKER in line.lower():
+            continue
+        if _merge_gate_kind(line) is not None:
+            return line.strip()
+    return ""
+
+
+def _effective_merge_gate_reason(
+    state: IssueState, counters: DriveCounters
+) -> tuple[str, bool]:
+    """The reason to classify the merge gate from, and whether it came from
+    the captured diagnostic rather than the board (#2229).
+
+    Prefers `state.merge_reason` — live, re-read on every poll. Falls back to
+    `counters.last_merge_diagnostic` only when the board reason names no gate
+    this module knows an action for, because that is exactly the quadraui#309
+    shape: the board is silent while this driver's OWN last `coord merge
+    --only` attempt already captured the refusal verbatim.
+
+    The fallback is a LAST resort, taken only when the board offers no
+    competing live signal — a snapshot must never outrank something being
+    re-read every poll. Three cases keep the board's own reading:
+
+    - ``merge_status == ""`` — "no queue entry at all" is #2078's shape, with
+      its own `_extract_gate_block_reason` bounded-wait arm in
+      :func:`_decide_merge`. #2229 is about the case #2078 skips wholesale:
+      an entry that IS enqueued (READY, PENDING, …) whose refusal only a
+      live attempt ever saw.
+    - ``merge_status == "CONFLICT"`` — a live merge-mechanics block with its
+      own resolution path (#1474/#241's conflict-fix dispatch, reached
+      through the bounded retry below). A re-test does not rebase a branch,
+      and diverting to one is the same stall this issue is about, inverted.
+    - a CI reason (#1891/#1892) — `merge_reason` already carries a live,
+      recognised signal whose only resolution is more real time. Those two
+      bare waits sit right after the divergence check and must keep winning.
+
+    The bool is the caller's warning label: a diagnostic-derived reason is a
+    SNAPSHOT of the last real attempt, refreshed by nothing but another
+    attempt (#2149's lesson — coord-portal#50 waited 2h33m on a cached
+    "review required" that had already cleared). It is strictly fresher than
+    an empty board reason, but it must not be re-acted on indefinitely; see
+    `DriveCounters.stale_smoke_diagnostic_attempt`.
+    """
+    if _merge_gate_kind(state.merge_reason) is not None:
+        return state.merge_reason, False
+    if state.merge_status == "" or state.merge_status.upper() == "CONFLICT":
+        return state.merge_reason, False
+    if is_ci_pending_reason(state.merge_reason) or is_ci_infra_reason(
+        state.merge_reason
+    ):
+        return state.merge_reason, False
+    fallback = _extract_gate_refusal_reason(counters.last_merge_diagnostic)
+    if fallback:
+        return fallback, True
+    return state.merge_reason, False
+
+
+def _merge_gate_divergence(state: IssueState, reason: str | None = None) -> str | None:
     """``"smoke"``/``"review"`` when *state* shows the #1526 divergence,
     else ``None``.
 
-    The divergence: `state.merge_reason` names a smoke/review block while
-    this SAME state's `work_test_state`/`review_verdict` says the opposite.
-    That contradiction can only come from `coord merge` checking something
-    this driver's view does not (freshness against the CURRENT branch/base,
-    not just the terminal verdict) — never from a retry, since neither
-    input changes by running `coord merge` again unchanged.
+    The divergence: the merge gate's *reason* names a smoke/review block
+    while this SAME state's `work_test_state`/`review_verdict` says the
+    opposite. That contradiction can only come from `coord merge` checking
+    something this driver's view does not (freshness against the CURRENT
+    branch/base, not just the terminal verdict) — never from a retry, since
+    neither input changes by running `coord merge` again unchanged.
+
+    *reason* (#2229) defaults to `state.merge_reason`, the board's own text.
+    :func:`_decide_merge` passes :func:`_effective_merge_gate_reason`'s
+    result instead so a refusal that exists ONLY in the last captured
+    `coord merge --only` diagnostic still classifies.
     """
-    kind = _merge_gate_kind(state.merge_reason)
+    kind = _merge_gate_kind(state.merge_reason if reason is None else reason)
     if kind == "smoke" and state.work_test_state in ("passed", "skipped"):
         return "smoke"
     if kind == "review" and state.review_verdict == "approve":
@@ -2398,7 +2506,11 @@ def _merge_gate_divergence(state: IssueState) -> str | None:
 
 
 def _escalate_merge(
-    state: IssueState, status: str, *, gate_kind: str | None = None
+    state: IssueState,
+    status: str,
+    *,
+    gate_kind: str | None = None,
+    gate_reason: str | None = None,
 ) -> Action:
     """Build the EXIT action for a merge status retrying cannot fix (#1505).
 
@@ -2421,6 +2533,16 @@ def _escalate_merge(
     proposed command in that case names the specific, safe corrective action
     (re-confirm the test verdict, or a scoped/full re-review) rather than the
     generic "inspect the plan" fallback below.
+
+    *gate_reason* (#2229) is the text that gate_kind was classified from,
+    when it is NOT `state.merge_reason` — i.e. when the board carried no
+    reason and :func:`_effective_merge_gate_reason` recovered the refusal
+    from the last captured `coord merge --only` diagnostic instead. The
+    escalation narrative quotes it, because ``reports ''`` is exactly the
+    unactionable escalation quadraui#309 would otherwise have produced. The
+    recorded ``--gate merge_reason=…`` pair still reports the BOARD's own
+    (empty) value — the gates block is a snapshot of board state, and
+    overwriting it here would hide the very divergence being escalated.
 
     Otherwise, the proposed command mirrors the #1477 resolution this issue
     was opened over: when a PR is known, ``gh pr merge --rebase`` + ``coord
@@ -2468,9 +2590,10 @@ def _escalate_merge(
             if gate_kind == "smoke"
             else f"review_verdict={state.review_verdict!r}"
         )
+        reported = state.merge_reason if gate_reason is None else gate_reason
         reason = (
             f"{gate_kind}_required — coord merge's own gate reports "
-            f"{state.merge_reason!r}, but this driver's OWN view already "
+            f"{reported!r}, but this driver's OWN view already "
             f"shows {driver_view} — the two cannot converge by retrying the "
             "identical `coord merge` command (#1526); a human must "
             "reconcile them"
@@ -2562,8 +2685,30 @@ def _decide_merge(
     readings; retrying the identical ``coord merge`` command changes neither
     side of the disagreement.
     """
-    divergence = _merge_gate_divergence(state)
-    if divergence == "smoke" and _is_stale_smoke_reason(state.merge_reason):
+    # #2229: classify from the board's `merge_reason` when it names a gate,
+    # and otherwise from this driver's OWN last `coord merge --only` output.
+    # quadraui#309 sat blocked for 11h on a merge that landed first try by
+    # hand because the board reason was empty (#1566/#1640) while the
+    # captured diagnostic said, in as many words, "smoke test verdict is
+    # stale" — the exact string the #1738 auto-repair arm below keys on. It
+    # was used for one thing: being printed into the give-up message.
+    gate_reason, gate_reason_from_diagnostic = _effective_merge_gate_reason(
+        state, counters
+    )
+    divergence = _merge_gate_divergence(state, reason=gate_reason)
+    if (
+        gate_reason_from_diagnostic
+        and divergence == "smoke"
+        and _is_stale_smoke_reason(gate_reason)
+        and counters.stale_smoke_diagnostic_attempt == counters.merge_attempts
+    ):
+        # A re-test already fired off THIS snapshot and no real attempt has
+        # re-captured it since, so re-firing would spend a second fix round
+        # on evidence that literally cannot have changed. Drop to the bounded
+        # retry below instead: that attempt refreshes the diagnostic, which
+        # either lands the merge or re-arms this arm against fresh evidence.
+        divergence = None
+    if divergence == "smoke" and _is_stale_smoke_reason(gate_reason):
         # #1738: a STALE (not missing) smoke verdict has a safe, bounded
         # self-service fix this driver can take without a human — re-run the
         # Test stage against the current base via the same non-destructive
@@ -2575,8 +2720,17 @@ def _decide_merge(
         # going stale (e.g. a base that keeps moving under it) still
         # converges to an escalation instead of spinning forever.
         if counters.fix_rounds >= opts.max_fix_rounds:
-            return _escalate_merge(state, state.merge_status, gate_kind=divergence)
+            return _escalate_merge(
+                state,
+                state.merge_status,
+                gate_kind=divergence,
+                gate_reason=gate_reason,
+            )
         counters.fix_rounds += 1
+        if gate_reason_from_diagnostic:
+            # #2229: arm the latch above — one re-test per captured
+            # diagnostic, then a real attempt has to re-validate it.
+            counters.stale_smoke_diagnostic_attempt = counters.merge_attempts
         return Action(
             kind=RUN,
             label=(
@@ -2597,7 +2751,9 @@ def _decide_merge(
             ),
         )
     if divergence is not None:
-        return _escalate_merge(state, state.merge_status, gate_kind=divergence)
+        return _escalate_merge(
+            state, state.merge_status, gate_kind=divergence, gate_reason=gate_reason
+        )
 
     # #1891: a CI verdict that has not arrived is not a CI verdict of "no" —
     # checked BEFORE the `status` switch below (and regardless of what
