@@ -663,10 +663,51 @@ def test_artifact_manifest_404_reason_worktree_present_no_config(
     assert r.status_code == 404
     error = r.json()["error"]
     assert "no artifact_paths configured" in error
-    assert "GC" not in error
+    # #2251: this used to be `assert "GC" not in error`, checked against a
+    # message that interpolates the live worktree's path. `mktemp -d` (used
+    # by the populated-home CI job) can legally draw a directory name that
+    # happens to contain "GC" — it did, once: `tmp.bWORN7PGCT`. A bare
+    # two-letter substring guard against an interpolated path is vacuous
+    # (no production branch ever emits the literal string "GC") and can
+    # only ever fail falsely. Assert on the wording that actually
+    # distinguishes this branch from the other three instead.
+    assert "no stash and no live worktree" not in error
+    assert "did not produce any files matching" not in error
 
     reason = server.artifact_absence_reason("api", "issue-1-noconfig")
     assert "no artifact_paths configured" in reason
+
+
+def test_artifact_manifest_404_reason_worktree_present_no_config_path_has_gc(
+    tmp_path: Path,
+) -> None:
+    """Regression for #2251: the 404 reason must still read correctly when
+    the interpolated worktree path happens to contain the old "GC" sentinel
+    — proving the assertion above no longer keys on that substring."""
+    gc_root = tmp_path / "tmp.bWORN7PGCT"  # the exact draw that broke #2251
+    gc_root.mkdir()
+    client, server = _client(gc_root)  # no artifact_paths configured
+    repo_path = gc_root / "repo"
+
+    wt_path = gc_root / "state" / "worktrees" / "asgn-noconfig-gc"
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "issue-1-noconfig-gc", str(wt_path)],
+        cwd=str(repo_path),
+        check=True,
+        capture_output=True,
+    )
+    assert "GC" in str(wt_path)  # sanity: the sentinel really is in the path
+
+    r = client.get("/artifact/api/issue-1-noconfig-gc")
+    assert r.status_code == 404
+    error = r.json()["error"]
+    assert "no artifact_paths configured" in error
+    # The interpolated path (and thus "GC") legitimately appears in the
+    # message; only the wording that distinguishes the four branches matters.
+    assert "GC" in error
+    assert "no stash and no live worktree" not in error
+    assert "did not produce any files matching" not in error
 
 
 def test_artifact_manifest_404_reason_genuinely_absent(tmp_path: Path) -> None:
