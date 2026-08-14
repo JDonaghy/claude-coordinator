@@ -1,0 +1,94 @@
+# #2180: a minimal, CI-ONLY coordinator.yml so `.github/workflows/*.yml` can
+# invoke `coord acceptance run --all --ci` (#2164's CI wrapper, PR #2173).
+#
+# This is deliberately NOT the fleet's real coordinator.yml. That file lives
+# outside this repo (~/.coord/coordinator.yml on the coordinator host,
+# "updated out-of-band" per scripts/coord-test-runner.sh's own header) and is
+# unreachable from a GitHub Actions runner. `coord acceptance run` needs
+# SOME coordinator.yml to resolve `acceptance.drivers.claude-coordinator`
+# (and, being the same parser as the fleet config, a non-empty `repos:` /
+# `machines:` list even though nothing here is a real machine) — this file
+# is that, scoped to exactly what CI needs and nothing else.
+#
+# The three routes below mirror the fleet's real
+# `acceptance.drivers.claude-coordinator.routes` (#1125 in-repo path
+# routing: coord/dashboard/webapp/** -> web-playwright, coord/** ->
+# cli-pytest, tui/** -> tui-tuidriver) with ONE deliberate difference: none
+# of these `run:` commands reference the `{ms}` template.
+#
+# `{ms}` only gets substituted when `coord acceptance run` is scoped to one
+# issue (`--issue N`, resolved via the issue's manifest-mapped ms-NN dir,
+# coord/commands/acceptance.py). `--all` (Gate C, what `--ci` requires)
+# always passes `ms=None` — coord.acceptance_drivers.render_run_command
+# documents that it leaves `{ms}` UNSUBSTITUTED (literal) in that case,
+# by design, for a driver whose `run:` never references it at all (like
+# tui-tuidriver's below). A route written for `--issue` scoping, like the
+# fleet's real `pytest tests/acceptance/{ms}`, would try to literally
+# collect a path named `tests/acceptance/{ms}` under `--all` and crash
+# outright — confirmed locally 2026-08-14 authoring this file:
+#   $ pytest 'tests/acceptance/{ms}' -q
+#   ERROR: file or directory not found: tests/acceptance/{ms}
+# So the two use cases need different `run:` commands over the SAME
+# underlying suite: the fleet config's per-issue routes stay as they are
+# (a worker's own `--issue N` self-check, unaffected by this file), and
+# this file's routes are written to always cover every ms-NN under that
+# route in one pass — exactly what the accumulated Gate C suite needs.
+repos:
+  - name: claude-coordinator
+    github: JDonaghy/claude-coordinator
+    default_branch: main
+
+# Not a real fleet machine — just enough for coord.config.load() to parse.
+# `coord.acceptance.acceptance_capability_gap` gives an unrecognized host
+# (any GitHub Actions runner, which will never match `host:` below) the
+# benefit of the doubt and proceeds rather than refusing, so this entry is
+# never actually matched against anything at run time.
+machines:
+  - name: ci-runner
+    host: ci-runner
+
+acceptance:
+  drivers:
+    claude-coordinator:
+      routes:
+        # #1540: coord/dashboard/webapp/** MUST stay above coord/** below —
+        # driver_for() resolves the first matching route (fnmatch,
+        # first-match not most-specific), and coord/dashboard/webapp/** is a
+        # strict subset of coord/**.
+        - match: coord/dashboard/webapp/**
+          kind: web-playwright
+          # No `setup:` here — the CI job that uses this route provisions
+          # explicitly (npm ci, playwright install chromium --with-deps)
+          # before invoking the wrapper, matching the shape that job already
+          # had before #2180 wired the wrapper in.
+          # The trailing `--` matters: _run_web_playwright appends
+          # ` --reporter=json` verbatim (coord/acceptance_drivers.py), so
+          # without it npm would try to interpret --reporter=json as an npm
+          # CLI flag instead of forwarding it to the playwright binary.
+          run: "cd coord/dashboard/webapp && npm run test:acceptance --"
+          mock: "*.html"
+          capability: browser
+        - match: coord/**
+          kind: cli-pytest
+          # Whole tree, not one ms-NN dir -- see the file header.
+          run: "pytest tests/acceptance"
+          mock: "*.out"
+          capability: python
+        - match: tui/**
+          kind: tui-tuidriver
+          # Unlike the two routes above, this one is identical to the
+          # fleet's real route: it never referenced `{ms}` even for
+          # `--issue` scoping, since `cargo test --test acceptance` always
+          # runs the whole tui/tests/acceptance.rs entrypoint (which
+          # `include!`s every ms-NN/*.rs slice) regardless of `{ms}`.
+          # RUSTC_BOOTSTRAP=1 + -Z unstable-options: --format json is
+          # nightly-gated; verified working on stable rustc (#1042).
+          # --features test-support: tui/Cargo.toml's `acceptance` test
+          # target has `required-features = ["test-support"]`, so a plain
+          # `cargo test` (no flag) silently skips building/running it
+          # altogether -- that gap is exactly what made this route
+          # unreachable from CI before #2180.
+          run: "cd tui && RUSTC_BOOTSTRAP=1 cargo test --test acceptance --features test-support -- -Z unstable-options --format json"
+          mock: "*.screen"
+          capability: rust
+          entrypoint: tui/tests/acceptance.rs

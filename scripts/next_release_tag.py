@@ -167,6 +167,12 @@ NON_SHIPPING_PREFIXES: tuple[str, ...] = (
     # range was one file, `.github/workflows/test.yml`: a release that shipped
     # nothing and moved the fleet's expected version for no payload.
     ".github/workflows/",
+    # #2180: a CI-only coordinator.yml fragment (see its own header) that
+    # `.github/workflows/*.yml` steps pass to `coord acceptance run --config`
+    # — same reasoning as `.github/workflows/` immediately above: it's read
+    # by a workflow step, not shipped to any wheel, binary, or host's unit
+    # directory. A tag changes nothing about what a CI run sees.
+    ".github/coord-ci-acceptance.yml",
 )
 
 #: SHIPPING_PREFIXES entries that ship a release (a tag, a GitHub Release)

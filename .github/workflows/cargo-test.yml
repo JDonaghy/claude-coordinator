@@ -23,14 +23,26 @@ on:
     branches: [main]
     paths:
       - 'tui/**'
+      # #2180: tui/tests/acceptance.rs (the sealed oracle's crate root,
+      # `include!`d into `cargo test --test acceptance`) is under tui/** and
+      # already covered above, but the JIT-authored slices it `include!`s
+      # live at the REPO ROOT (tests/acceptance/ms-33/, ms-38/), outside
+      # tui/**. Without this, a worker's fix to a red-by-design slice would
+      # never re-trigger this workflow at all.
+      - 'tests/acceptance/**'
       # Self-trigger so edits to this workflow are exercised by their own PR.
       - '.github/workflows/cargo-test.yml'
+      # Same reasoning as tests/acceptance/** above, for the CI-local config
+      # the new acceptance step (below) reads its driver command from.
+      - '.github/coord-ci-acceptance.yml'
   pull_request:
     branches: [main]
     paths:
       - 'tui/**'
+      - 'tests/acceptance/**'
       # Self-trigger so edits to this workflow are exercised by their own PR.
       - '.github/workflows/cargo-test.yml'
+      - '.github/coord-ci-acceptance.yml'
   # Manual re-run convenience — no longer a "check tui/ against quadraui
   # develop" canary (see #1973 note above); it now just builds tui/ at
   # whatever ref is checked out, same as push/pull_request.
@@ -62,3 +74,49 @@ jobs:
       - name: cargo test (tui)
         working-directory: tui
         run: cargo test
+
+      # #2180: the tui-tuidriver sealed acceptance route (acceptance.drivers
+      # routes "tui/**" -> tui-tuidriver -> tui/tests/acceptance.rs, which
+      # `include!`s tests/acceptance/ms-33/ and ms-38/) run through the
+      # #2164 CI wrapper. Plain `cargo test` above does NOT exercise this —
+      # the `acceptance` test target has `required-features = ["test-
+      # support"]` (tui/Cargo.toml), so cargo silently skips building it
+      # without that flag. Before #2180 nothing in CI ran this route at all.
+      # Working directory is the repo root (not `tui`, unlike the step
+      # above): the driver's own `run:` command does its own `cd tui`.
+      #
+      # TEMPORARILY continue-on-error (STEP level only — same reasoning and
+      # same shape as the `windows` job in test.yml, see its header comment
+      # for why step-level and not job-level): running this route for the
+      # very first time (verified locally, 2026-08-14, authoring this PR)
+      # surfaced SIX pre-existing failures that predate #2180 and are not
+      # yet declared in either manifest's `expected_red:` —
+      #   - ms-38/manifest.yml's own comment already documents all five
+      #     `plans_detail_1122::*` tests as blocked on a harness gap (no
+      #     public fixture seam for a seeded plan row) — #2164's
+      #     `expected_red:` mechanism didn't exist when that comment was
+      #     written; it's the natural home for these now.
+      #   - ms-33's `audit_1039::populated_list_rows_are_relative_time` is a
+      #     newly-discovered ticking-time-bomb regression: its fixture pins
+      #     timestamps "~1 year in the past" (a fixed epoch, ts~=1752156191)
+      #     so `format_unix_time()` always renders an "... ago" suffix — true
+      #     when ms-33 was authored, false today (now >13 months stale) now
+      #     that format_unix_time() has crossed whatever threshold stops
+      #     appending "ago" for very old timestamps. This one is NOT already
+      #     documented as expected — it looks like a genuine, ordinary bug a
+      #     test-author/fix session should look at, not just declare red.
+      # Both `tests/acceptance/` and its `manifest.yml` files are SEALED
+      # (coord.config.AcceptanceConfig.sealed_paths) — a `type="work"`
+      # session (this one) editing them trips the oracle-tamper gate at
+      # review, so this PR deliberately does not add `expected_red:` entries
+      # itself. REVISIT: once a test-author/fix session addresses the six
+      # failures above (declaring the five documented ones in
+      # `expected_red:`, fixing or re-baselining the sixth), drop this
+      # continue-on-error and this becomes a real, blocking gate like the
+      # `acceptance` (ms-51) and cli-pytest (ms-37) routes already are.
+      - name: coord acceptance run --all --ci (tui-tuidriver route, ms-33/ms-38)
+        run: >-
+          coord acceptance run --repo claude-coordinator --all --ci
+          --for-path tui/src/main.rs
+          --config .github/coord-ci-acceptance.yml --path .
+        continue-on-error: true

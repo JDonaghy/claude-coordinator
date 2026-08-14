@@ -509,9 +509,21 @@ run_python() {
 
     local out="$WT/.pytest.out"
     log "running: pytest -q ${par[*]:-(serial)} (full suite)"
+    # #2180: --ignore=tests/acceptance — the sealed oracle-loop suite
+    # (tests/acceptance/ms-NN/) is gated by CI's `coord acceptance run --all
+    # --ci` (#2164) instead, which honours each ms-NN/manifest.yml's
+    # `expected_red:` registry. Left in here, a red-by-design slice would
+    # fail the Test stage for every concurrent branch in the repo, not just
+    # the one the slice belongs to (the quadraui#554/#490 failure mode #2180
+    # exists to close). Matches CI's own .github/workflows/test.yml split —
+    # same reasoning applies verbatim, see that file's comments. ms-33/ms-38
+    # (Rust) and ms-51 (Playwright) were already outside this pytest arm's
+    # reach; ms-37 (plain .py files under testpaths=["tests"]) was the one
+    # accidental gap.
+    #
     # ${par[@]+...} so an empty array is not an unbound-variable error under
     # `set -u` on older bash.
-    if (cd "$WT" && "$venv/bin/python" -m pytest -q --tb=short ${par[@]+"${par[@]}"}) >"$out" 2>&1; then
+    if (cd "$WT" && "$venv/bin/python" -m pytest -q --tb=short --ignore=tests/acceptance ${par[@]+"${par[@]}"}) >"$out" 2>&1; then
         say "PASS(python): $(grep -oE '[0-9]+ passed[^)]*' "$out" | tail -1)"
         return 0
     fi
@@ -598,6 +610,13 @@ run_rust() {
     export CARGO_TARGET_DIR="$CARGO_TARGET"
     local out="$WT/.cargo.out"
     log "running: cargo test (cold ~3m, warm ~30s)"
+    # #2180: plain `cargo test` (no `--features test-support`) already
+    # excludes the sealed tui-tuidriver acceptance target — its `acceptance`
+    # test has `required-features = ["test-support"]` in tui/Cargo.toml, so
+    # cargo silently skips building it without that flag. That suite is
+    # gated separately, through CI's `coord acceptance run --all --ci`
+    # (.github/workflows/cargo-test.yml) — deliberately not duplicated here,
+    # same reasoning as the pytest --ignore=tests/acceptance above.
     if (cd "$WT/tui" && "$cargo" test) >"$out" 2>&1; then
         say "PASS(rust): $(grep -oE '[0-9]+ passed[^;]*' "$out" | head -1)"
         return 0
