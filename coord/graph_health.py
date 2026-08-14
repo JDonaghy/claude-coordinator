@@ -280,6 +280,18 @@ def graph_status(repo_path: Path, default_branch: str = "main") -> GraphStatus:
     return st
 
 
+def hooks_file_present(repo_path: Path) -> bool:
+    """Does this repo TRACK ``.githooks/post-checkout`` at all?
+
+    Split out of :func:`hooks_path_status` (#2236) so callers that only need
+    "does the repo ship the hook file" — as opposed to the full
+    ``core.hooksPath`` configuration story — have one place to ask, instead
+    of independently re-running the same ``.is_file()`` check (a split-brain
+    the two would otherwise be one edit away from disagreeing on).
+    """
+    return (repo_path / HOOKS_PATH / "post-checkout").is_file()
+
+
 def hooks_path_status(repo_path: Path) -> tuple[bool, str]:
     """``(ok, detail)`` for this checkout's ``core.hooksPath``.
 
@@ -298,7 +310,7 @@ def hooks_path_status(repo_path: Path) -> tuple[bool, str]:
     except (subprocess.SubprocessError, OSError) as exc:
         return False, f"could not read core.hooksPath ({exc})"
     value = r.stdout.strip()
-    have_hook = (repo_path / HOOKS_PATH / "post-checkout").is_file()
+    have_hook = hooks_file_present(repo_path)
     if not value:
         if not have_hook:
             # The repo doesn't ship the bootstrap at all — telling the operator

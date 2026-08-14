@@ -337,9 +337,10 @@ def gather_graph_facts(repo_path: Path | None, default_branch: str = "main") -> 
     facts.hooks_installed = bool(ok)
     facts.hooks_detail = detail
     try:
-        facts.hooks_shipped = (
-            repo_path / graph_health.HOOKS_PATH / "post-checkout"
-        ).is_file()
+        # Same question `hooks_path_status` already answers internally —
+        # consume its `hooks_file_present` helper rather than re-running the
+        # `.is_file()` check independently (#2236 review: split-brain risk).
+        facts.hooks_shipped = graph_health.hooks_file_present(repo_path)
     except OSError:
         facts.hooks_shipped = False
     return facts

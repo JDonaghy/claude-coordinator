@@ -132,6 +132,15 @@ Every reaped worker's log ends with a line the agent writes itself:
   from *"queried, got nothing, fell back to grep"* — opposite fixes: `empty` points at graph
   coverage/quality, and no amount of prompting helps there.
 
+  `unknown` is honest, not a bug bucket — don't read it as "worker got no answer". Only
+  `graphify query` output is reliably countable (its `N nodes found` header, or a fallback
+  count of `NODE`/`EDGE`/`PATH`/`COMMUNITY` result rows, or graphify's own zero-match
+  phrasing, `"No matching/affected ... found."`). `graphify explain` and `graphify path` print
+  differently-shaped output with no countable header at all, so calls to those land in
+  `unknown` even when they returned a perfectly good answer. Skimming
+  `grep -c outcome=unknown` and reading it as "workers not getting answers" over-reads that
+  number — it may just mean "workers ran `explain`/`path`, not `query`".
+
 Count them straight off the fleet's logs:
 
 ```bash

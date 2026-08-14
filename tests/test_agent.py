@@ -1815,6 +1815,31 @@ def test_worktree_graph_present_follows_symlinks(tmp_path: Path) -> None:
     assert _worktree_graph_present(str(dangling)) is False
 
 
+def test_worktree_graph_present_falls_back_to_repo_path_for_legacy_assignments(
+    tmp_path: Path,
+) -> None:
+    """#2236 review: a legacy/non-worktree assignment has no `worktree_path`
+    at all, but its worker still ran against `spec.repo_path` directly — which
+    may have a fully built graph. Mirrors the branch-capture fallback a few
+    hundred lines up in `_reap` ("for legacy assignments (no worktree_path) we
+    fall back to the main repo clone")."""
+    from coord.agent import _worktree_graph_present
+
+    repo = tmp_path / "main_checkout" / "graphify-out"
+    repo.mkdir(parents=True)
+    (repo / "graph.json").write_text("{}")
+    repo_path = str(tmp_path / "main_checkout")
+
+    # No worktree_path at all: falls back to repo_path_fallback.
+    assert _worktree_graph_present(None, repo_path) is True
+    # No worktree_path and no graph at the fallback either.
+    assert _worktree_graph_present(None, str(tmp_path / "no_graph_here")) is False
+    # A real worktree_path still takes priority over the fallback.
+    blind_worktree = tmp_path / "blind_worktree" / "graphify-out"
+    blind_worktree.mkdir(parents=True)
+    assert _worktree_graph_present(str(blind_worktree.parent), repo_path) is False
+
+
 def test_assignment_spec_accepts_resume_session_id() -> None:
     """AssignmentSpec round-trips resume_session_id through to_dict / from dict."""
     spec = AssignmentSpec(

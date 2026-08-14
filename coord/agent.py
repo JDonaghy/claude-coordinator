@@ -784,8 +784,10 @@ def _count_graphify_invocations(bash_commands: list[str]) -> int:
     return sum(1 for cmd in bash_commands if is_graphify_command(cmd))
 
 
-def _worktree_graph_present(worktree_path: str | None) -> bool:
-    """True iff *worktree_path* has a **resolvable** ``graphify-out/graph.json``.
+def _worktree_graph_present(
+    worktree_path: str | None, repo_path_fallback: str | None = None
+) -> bool:
+    """True iff the worker's checkout has a **resolvable** ``graphify-out/graph.json``.
 
     #2236: ``graphify_invocations=0`` is ambiguous on its own. Two of five
     repos ship no graph and no ``.githooks/post-checkout``, so their worktrees
@@ -795,15 +797,24 @@ def _worktree_graph_present(worktree_path: str | None) -> bool:
     the counter cannot tell them apart from a worker that had a graph and
     never asked. Recording this alongside the count is what disambiguates.
 
+    *repo_path_fallback* mirrors the branch-capture logic a few hundred
+    lines up in ``_reap`` ("for legacy assignments (no worktree_path) we
+    fall back to the main repo clone"): a legacy/non-worktree assignment has
+    no ``worktree_path`` at all, but its worker still ran against
+    ``spec.repo_path`` directly, which may have a perfectly good graph.
+    Without this fallback, every legacy assignment logs ``graph_present=0``
+    regardless — conflating "no worktree" with "no graph".
+
     ``exists()`` follows symlinks deliberately: a linked worktree's
     ``graph.json`` is a symlink into the base checkout (see
     ``coord/graph_health.py``), and a *dangling* symlink is exactly as
     graph-blind as no file at all — so both must read as absent.
     """
-    if not worktree_path:
+    path = worktree_path or repo_path_fallback
+    if not path:
         return False
     try:
-        return (Path(worktree_path) / "graphify-out" / "graph.json").exists()
+        return (Path(path) / "graphify-out" / "graph.json").exists()
     except OSError:
         return False
 
@@ -821,7 +832,9 @@ def _format_graphify_query_lines(queries: Iterable[Any]) -> list[str]:
     lines: list[str] = []
     for q in queries:
         results = getattr(q, "results", None)
-        command = str(getattr(q, "command", "")).replace("\n", " ").strip()
+        # `worker_events._truncate` already newline-strips and trims this
+        # when the `GraphifyQuery` entry is built — no need to redo it here.
+        command = str(getattr(q, "command", ""))
         lines.append(
             f"# graphify_query: outcome={getattr(q, 'outcome', 'unknown')} "
             f"results={results if results is not None else '?'} "
@@ -7564,7 +7577,8 @@ class AgentServer:
                 # answer the second. Read while the worktree still exists —
                 # `_cleanup_worktree` runs further down this same function.
                 _graph_present = _worktree_graph_present(
-                    getattr(assignment, "worktree_path", None) if assignment else None
+                    getattr(assignment, "worktree_path", None) if assignment else None,
+                    getattr(assignment.spec, "repo_path", None) if assignment else None,
                 )
                 reopen.write(
                     f"# reap: done (exit_code={exit_code} status={final_status} "

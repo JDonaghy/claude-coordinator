@@ -17,6 +17,7 @@ from coord.worker_events import (
     format_api_error_reason,
     format_important_event,
     format_usage_limit_reason,
+    graphify_result_count,
     is_stream_json,
     is_usage_limit_reason,
     iter_events,
@@ -883,6 +884,48 @@ class TestGraphifyQueryOutcomes:
         summary = parse_log(p, tail_bytes=0)
         assert [(q.outcome, q.results) for q in summary.graphify_queries] == [("empty", 0)]
 
+    def test_real_graphify_zero_match_phrasing_is_empty_not_unknown(
+        self, tmp_path: Path
+    ) -> None:
+        """The real `graphify` CLI (pipx `graphifyy`) doesn't print whitespace
+        on a miss — it exits 0 and prints the literal `No matching nodes
+        found.` (`graphify/serve.py:435`), distinct from the `"{N} nodes
+        found"` header on a hit (`graphify/serve.py:445`). That string has no
+        leading digit and no NODE/EDGE/PATH/COMMUNITY prefix, so it must be
+        recognised explicitly or it falls through to `unknown` — exactly the
+        "tried and got nothing looks like never tried" bug #2236 exists to
+        fix."""
+        p = tmp_path / "log.log"
+        p.write_text(
+            _ndjson(
+                [
+                    _init_event(),
+                    self._bash('graphify query "no such thing"', "tu_kk"),
+                    self._result("tu_kk", "No matching nodes found.\n"),
+                ]
+            )
+        )
+        summary = parse_log(p, tail_bytes=0)
+        assert [(q.outcome, q.results) for q in summary.graphify_queries] == [("empty", 0)]
+
+    def test_real_graphify_affected_zero_match_phrasing_is_empty(
+        self, tmp_path: Path
+    ) -> None:
+        """`graphify affected` uses the analogous `No affected nodes found.`
+        (`graphify/affected.py:132`)."""
+        p = tmp_path / "log.log"
+        p.write_text(
+            _ndjson(
+                [
+                    _init_event(),
+                    self._bash("graphify affected some/path.py", "tu_ll"),
+                    self._result("tu_ll", "No affected nodes found.\n"),
+                ]
+            )
+        )
+        summary = parse_log(p, tail_bytes=0)
+        assert [(q.outcome, q.results) for q in summary.graphify_queries] == [("empty", 0)]
+
     def test_failed_call_is_an_error(self, tmp_path: Path) -> None:
         p = tmp_path / "log.log"
         p.write_text(
@@ -985,3 +1028,22 @@ class TestGraphifyQueryOutcomes:
         assert d["graphify_queries"] == [
             {"command": "graphify query x", "outcome": "hit", "results": 3}
         ]
+
+
+class TestGraphifyResultCount:
+    """Direct unit tests for the output classifier (#2236 review)."""
+
+    def test_real_query_zero_match_string_counts_as_zero(self) -> None:
+        assert graphify_result_count("No matching nodes found.") == 0
+
+    def test_real_affected_zero_match_string_counts_as_zero(self) -> None:
+        assert graphify_result_count("No affected nodes found.") == 0
+
+    def test_zero_match_string_without_trailing_period(self) -> None:
+        assert graphify_result_count("No matching nodes found") == 0
+
+    def test_hit_header_still_takes_priority(self) -> None:
+        assert graphify_result_count("81 nodes found | ...") == 81
+
+    def test_uncountable_output_stays_none(self) -> None:
+        assert graphify_result_count("Rebuilding graph...\ndone.") is None
