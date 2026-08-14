@@ -808,3 +808,180 @@ class TestFormatApiErrorReason:
             terminal_reason=None, api_error_status=None, result_text=None
         )
         assert reason == "api_error"
+
+
+class TestGraphifyQueryOutcomes:
+    """#2236: `graphify_invocations=N` counts attempts and stops there, so it
+    cannot separate "queried and got a useful answer" from "queried, got
+    nothing, fell back to grep" — and those imply opposite fixes (a habit
+    problem the prompt can move, vs. a graph coverage problem no prompting
+    helps). The parser therefore records each call's command text and the
+    outcome of its tool result."""
+
+    @staticmethod
+    def _bash(cmd: str, tool_use_id: str) -> dict:
+        return {
+            "type": "assistant",
+            "message": {
+                "model": "claude-sonnet-4-6",
+                "content": [
+                    {"type": "tool_use", "name": "Bash", "id": tool_use_id, "input": {"command": cmd}}
+                ],
+            },
+        }
+
+    @staticmethod
+    def _result(tool_use_id: str, content, *, is_error: bool = False) -> dict:
+        return {
+            "type": "user",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": content,
+                        "is_error": is_error,
+                    }
+                ]
+            },
+        }
+
+    def test_query_with_results_is_a_hit(self, tmp_path: Path) -> None:
+        p = tmp_path / "log.log"
+        p.write_text(
+            _ndjson(
+                [
+                    _init_event(),
+                    self._bash('graphify query "where is X handled"', "tu_a"),
+                    self._result(
+                        "tu_a",
+                        "Traversal: BFS depth=2 | Start: ['x'] | 81 nodes found\nNODE a\nNODE b",
+                    ),
+                ]
+            )
+        )
+        summary = parse_log(p, tail_bytes=0)
+        assert len(summary.graphify_queries) == 1
+        q = summary.graphify_queries[0]
+        assert q.outcome == "hit"
+        assert q.results == 81
+        assert "where is X handled" in q.command
+
+    def test_query_returning_nothing_is_empty_not_missing(self, tmp_path: Path) -> None:
+        """The distinction the whole issue turns on: a worker that tried and
+        got nothing must NOT look like a worker that never tried."""
+        p = tmp_path / "log.log"
+        p.write_text(
+            _ndjson(
+                [
+                    _init_event(),
+                    self._bash("graphify query nothing-matches-this", "tu_b"),
+                    self._result("tu_b", "   \n"),
+                ]
+            )
+        )
+        summary = parse_log(p, tail_bytes=0)
+        assert [(q.outcome, q.results) for q in summary.graphify_queries] == [("empty", 0)]
+
+    def test_failed_call_is_an_error(self, tmp_path: Path) -> None:
+        p = tmp_path / "log.log"
+        p.write_text(
+            _ndjson(
+                [
+                    _init_event(),
+                    self._bash("graphify query x", "tu_c"),
+                    self._result("tu_c", "graphify: command not found", is_error=True),
+                ]
+            )
+        )
+        summary = parse_log(p, tail_bytes=0)
+        assert summary.graphify_queries[0].outcome == "error"
+        assert summary.graphify_queries[0].results is None
+
+    def test_row_counting_when_no_traversal_header(self, tmp_path: Path) -> None:
+        p = tmp_path / "log.log"
+        p.write_text(
+            _ndjson(
+                [
+                    _init_event(),
+                    self._bash("graphify query x", "tu_d"),
+                    self._result("tu_d", [{"type": "text", "text": "NODE a\nNODE b\nEDGE a->b"}]),
+                ]
+            )
+        )
+        summary = parse_log(p, tail_bytes=0)
+        assert summary.graphify_queries[0].results == 3
+        assert summary.graphify_queries[0].outcome == "hit"
+
+    def test_uncountable_output_stays_unknown(self, tmp_path: Path) -> None:
+        """`graphify update .` emits a build log, not results — reporting 0
+        there would fake an "empty graph" signal that isn't real."""
+        p = tmp_path / "log.log"
+        p.write_text(
+            _ndjson(
+                [
+                    _init_event(),
+                    self._bash("graphify update .", "tu_e"),
+                    self._result("tu_e", "rebuilding graph...\ndone in 4.2s"),
+                ]
+            )
+        )
+        summary = parse_log(p, tail_bytes=0)
+        assert summary.graphify_queries[0].outcome == "unknown"
+        assert summary.graphify_queries[0].results is None
+
+    def test_uncorrelated_call_stays_unknown(self, tmp_path: Path) -> None:
+        """A call whose result never appears in the log (tail-truncated, or a
+        worker killed mid-query) is recorded as an attempt with no outcome —
+        never silently promoted to a hit."""
+        p = tmp_path / "log.log"
+        p.write_text(_ndjson([_init_event(), self._bash("graphify query x", "tu_f")]))
+        summary = parse_log(p, tail_bytes=0)
+        assert summary.graphify_queries[0].outcome == "unknown"
+
+    def test_path_mention_is_not_a_query(self, tmp_path: Path) -> None:
+        p = tmp_path / "log.log"
+        p.write_text(
+            _ndjson(
+                [
+                    _init_event(),
+                    self._bash("cat graphify-out/graph.json", "tu_g"),
+                    self._result("tu_g", "{}"),
+                ]
+            )
+        )
+        summary = parse_log(p, tail_bytes=0)
+        assert summary.graphify_queries == []
+
+    def test_stdout_fallback_when_content_block_empty(self, tmp_path: Path) -> None:
+        p = tmp_path / "log.log"
+        event = self._result("tu_h", "")
+        event["tool_use_result"] = {"stdout": "5 nodes found", "stderr": ""}
+        p.write_text(
+            _ndjson([_init_event(), self._bash("graphify query x", "tu_h"), event])
+        )
+        summary = parse_log(p, tail_bytes=0)
+        assert summary.graphify_queries[0].results == 5
+
+    def test_long_command_is_truncated(self, tmp_path: Path) -> None:
+        long_cmd = 'graphify query "' + "x" * 500 + '"'
+        p = tmp_path / "log.log"
+        p.write_text(_ndjson([_init_event(), self._bash(long_cmd, "tu_i")]))
+        summary = parse_log(p, tail_bytes=0)
+        assert len(summary.graphify_queries[0].command) <= 200
+
+    def test_to_dict_includes_queries(self, tmp_path: Path) -> None:
+        p = tmp_path / "log.log"
+        p.write_text(
+            _ndjson(
+                [
+                    _init_event(),
+                    self._bash("graphify query x", "tu_j"),
+                    self._result("tu_j", "3 nodes found"),
+                ]
+            )
+        )
+        d = parse_log(p, tail_bytes=0).to_dict()
+        assert d["graphify_queries"] == [
+            {"command": "graphify query x", "outcome": "hit", "results": 3}
+        ]

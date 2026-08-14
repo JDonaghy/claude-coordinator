@@ -485,11 +485,34 @@ class TestGraphLayer:
             graph=ro.GraphFacts(
                 probed=True, repo_path="/srv/r", built=True, fresh=True,
                 hooks_installed=False, hooks_detail="core.hooksPath unset",
+                hooks_shipped=True,
             ),
         )
         report = ro.evaluate(facts)
         assert "graph.hooks_missing" in _checks(report)
         assert "graph.fresh" in _checks(report)
+
+    def test_repo_that_never_ported_the_hook_gets_the_porting_remedy(self):
+        """#2236: `hooks_installed=False` hides two different failures.  A repo
+        that never ported `.githooks/post-checkout` (coord-portal, stick-demo)
+        must NOT be told to set `core.hooksPath` — pointing git at a directory
+        that does not exist silently disables every hook in the checkout."""
+        facts = ro.RepoFacts(
+            name="r", configured=True, github="acme/r", smoke_command="t",
+            graph=ro.GraphFacts(
+                probed=True, repo_path="/srv/r", built=False,
+                hooks_installed=False, hooks_shipped=False,
+                hooks_detail="no .githooks/post-checkout in this repo",
+            ),
+        )
+        report = ro.evaluate(facts)
+        checks = _checks(report)
+        assert "graph.hooks_not_ported" in checks
+        assert "graph.hooks_missing" not in checks
+        f = next(f for f in report.findings if f.check == "graph.hooks_not_ported")
+        assert "port .githooks/" in (f.fix or "")
+        # The one-git-config remedy must not leak into this branch.
+        assert not (f.fix or "").strip().startswith("git config")
 
 
 class TestDoctorFolding:

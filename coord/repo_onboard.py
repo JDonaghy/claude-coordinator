@@ -144,6 +144,16 @@ class GraphFacts:
     detail: str | None = None
     hooks_installed: bool = False
     hooks_detail: str | None = None
+    # #2236: does the repo TRACK `.githooks/post-checkout` at all? Two
+    # distinct failures hide behind `hooks_installed=False`, and they take
+    # opposite fixes: a repo that ships the hook but hasn't pointed
+    # `core.hooksPath` at it needs one `git config`; a repo that never ported
+    # the hook (coord-portal, stick-demo) needs the files first — running
+    # `git config core.hooksPath .githooks` there points git at a directory
+    # that does not exist, which silently disables ALL hooks for that
+    # checkout. Telling an operator the wrong one is worse than saying
+    # nothing, so the fix line has to know which it is.
+    hooks_shipped: bool = False
 
 
 @dataclass
@@ -326,6 +336,12 @@ def gather_graph_facts(repo_path: Path | None, default_branch: str = "main") -> 
         ok, detail = False, f"hooks probe failed: {exc}"
     facts.hooks_installed = bool(ok)
     facts.hooks_detail = detail
+    try:
+        facts.hooks_shipped = (
+            repo_path / graph_health.HOOKS_PATH / "post-checkout"
+        ).is_file()
+    except OSError:
+        facts.hooks_shipped = False
     return facts
 
 
@@ -882,7 +898,27 @@ def evaluate_graph(facts: RepoFacts) -> list[Finding]:
             summary="graph artifact is current with HEAD",
         ))
 
-    if not g.hooks_installed:
+    if not g.hooks_installed and not g.hooks_shipped:
+        # #2236: the repo never ported the hook. `git config core.hooksPath
+        # .githooks` here would point git at a directory that does not exist
+        # and disable every hook in the checkout, so the fix is to bring the
+        # files over FIRST — worktrees of this repo get no linked graph until
+        # then, however the machine is configured.
+        out.append(Finding(
+            layer="graph", check="graph.hooks_not_ported", severity=WARN,
+            summary=(
+                f"this repo ships no .githooks/post-checkout — "
+                f"{g.hooks_detail or 'the worktree graph bootstrap does not exist here'}; "
+                "worktrees get no linked graph, so every worker on this repo "
+                "silently falls back to grep"
+            ),
+            fix=(
+                "port .githooks/ (_lib.sh, post-checkout, post-commit, post-merge) "
+                "from claude-coordinator into this repo, THEN "
+                "git config core.hooksPath .githooks  (see docs/GRAPHIFY_SETUP.md)"
+            ),
+        ))
+    elif not g.hooks_installed:
         out.append(Finding(
             layer="graph", check="graph.hooks_missing", severity=WARN,
             summary=(

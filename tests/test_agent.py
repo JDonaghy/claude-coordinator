@@ -1696,6 +1696,125 @@ def test_reap_logs_graphify_invocation_count(tmp_path: Path) -> None:
     server.shutdown()
 
 
+def test_reap_logs_graphify_query_outcome(tmp_path: Path) -> None:
+    """#2236: the count alone cannot separate "queried and got a useful
+    answer" from "queried, got nothing, fell back to grep" — opposite fixes.
+    `_reap` must therefore also write one `# graphify_query:` line per call,
+    carrying the outcome, the result count and the command text, plus a
+    `graph_present=` flag on the reap line so a leg with no graph to query
+    (the prompt's own escape hatch, which fires silently) is distinguishable
+    from a leg that had one and never asked."""
+    repo = _init_repo(tmp_path / "repo")
+
+    hit_call = json.dumps({
+        "type": "assistant",
+        "message": {
+            "model": "claude-sonnet-4-6",
+            "content": [{
+                "type": "tool_use",
+                "name": "Bash",
+                "id": "tu_hit",
+                "input": {"command": 'graphify query "where is X handled"'},
+            }],
+        },
+    })
+    hit_result = json.dumps({
+        "type": "user",
+        "message": {
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "tu_hit",
+                # Single line on purpose: the fake worker echoes these through
+                # `/bin/sh`, whose `echo` expands `\n` and would split the JSON.
+                "content": "Traversal: BFS depth=2 | Start: [x] | 7 nodes found",
+            }],
+        },
+    })
+    empty_call = json.dumps({
+        "type": "assistant",
+        "message": {
+            "model": "claude-sonnet-4-6",
+            "content": [{
+                "type": "tool_use",
+                "name": "Bash",
+                "id": "tu_empty",
+                "input": {"command": "graphify query nothing-here"},
+            }],
+        },
+    })
+    empty_result = json.dumps({
+        "type": "user",
+        "message": {
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "tu_empty",
+                "content": "",
+            }],
+        },
+    })
+    result_line = json.dumps({"type": "result", "subtype": "success", "is_error": False})
+    worker_sh = "; ".join(
+        f"echo '{line}'"
+        for line in (hit_call, hit_result, empty_call, empty_result, result_line)
+    ) + "; exit 0"
+
+    server = AgentServer(
+        machine_name="test",
+        repos=["api"],
+        repo_paths={"api": str(repo)},
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: ["/bin/sh", "-c", worker_sh],
+    )
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path=str(repo),
+        issue_number=2236,
+        issue_title="t",
+        briefing="b",
+    )
+    a = server.assign(spec)
+    final = server.wait_for(a.id, timeout=10)
+
+    log_text = Path(final.log_path).read_text()
+    assert "graphify_invocations=2" in log_text
+    # No graph was ever built in this throwaway repo, so the worktree has none
+    # — exactly the coord-portal/stick-demo shape #2236 is about.
+    assert "graph_present=0" in log_text
+    assert "# graphify_query: outcome=hit results=7 cmd=" in log_text
+    assert "# graphify_query: outcome=empty results=0 cmd=" in log_text
+    assert "where is X handled" in log_text
+    server.shutdown()
+
+
+def test_worktree_graph_present_follows_symlinks(tmp_path: Path) -> None:
+    """#2236: a linked worktree borrows the base checkout's graph by symlink,
+    so `graph_present` must follow links — and a DANGLING link is as
+    graph-blind as no file at all, so it must read as absent."""
+    from coord.agent import _worktree_graph_present
+
+    assert _worktree_graph_present(None) is False
+    assert _worktree_graph_present(str(tmp_path / "nope")) is False
+
+    # Bare worktree with an empty graphify-out/ (the coord-portal case).
+    blind = tmp_path / "blind"
+    (blind / "graphify-out").mkdir(parents=True)
+    assert _worktree_graph_present(str(blind)) is False
+
+    base = tmp_path / "base" / "graphify-out"
+    base.mkdir(parents=True)
+    (base / "graph.json").write_text("{}")
+
+    linked = tmp_path / "linked"
+    (linked / "graphify-out").mkdir(parents=True)
+    (linked / "graphify-out" / "graph.json").symlink_to(base / "graph.json")
+    assert _worktree_graph_present(str(linked)) is True
+
+    dangling = tmp_path / "dangling"
+    (dangling / "graphify-out").mkdir(parents=True)
+    (dangling / "graphify-out" / "graph.json").symlink_to(tmp_path / "gone.json")
+    assert _worktree_graph_present(str(dangling)) is False
+
+
 def test_assignment_spec_accepts_resume_session_id() -> None:
     """AssignmentSpec round-trips resume_session_id through to_dict / from dict."""
     spec = AssignmentSpec(

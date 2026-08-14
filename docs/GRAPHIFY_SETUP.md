@@ -110,6 +110,41 @@ GRAPH_HEALTH: checkouts=3 stale=0
 
 If it reports STALE, run `graphify update .` in that checkout.
 
+## Measuring whether workers actually use it (#2212 / #2236)
+
+Every reaped worker's log ends with a line the agent writes itself:
+
+```
+# reap: done (exit_code=0 status=DONE graphify_invocations=1 graph_present=1)
+# graphify_query: outcome=hit results=81 cmd='graphify query "where is X handled"'
+```
+
+* **`graphify_invocations=N`** (#2212) — how many Bash calls this leg invoked the CLI in.
+* **`graph_present=0|1`** (#2236) — whether the worktree had a **resolvable**
+  `graphify-out/graph.json` at reap time. Without it, `graphify_invocations=0` is ambiguous:
+  the worker prompt tells workers with no graph to *"skip straight to grep, silently"*, so a
+  repo that never onboarded (no graph, no `.githooks/post-checkout` — coord-portal and
+  stick-demo, as of this writing) produces zero-invocation legs that were **obeying** the rule,
+  not ignoring it. `graphify_invocations=0 graph_present=0` is a coverage gap; `=0` with
+  `graph_present=1` is a habit gap. Only the second is something prompt wording can move.
+* **`# graphify_query:`** (#2236) — one line per call, with `outcome=hit|empty|error|unknown`,
+  the result count, and the command. `hit` vs `empty` separates *"queried and got an answer"*
+  from *"queried, got nothing, fell back to grep"* — opposite fixes: `empty` points at graph
+  coverage/quality, and no amount of prompting helps there.
+
+Count them straight off the fleet's logs:
+
+```bash
+grep -ho 'graphify_invocations=[0-9]* graph_present=[01]' ~/.coord/logs/*.log | sort | uniq -c
+grep -ho 'graphify_query: outcome=[a-z]*' ~/.coord/logs/*.log | sort | uniq -c
+```
+
+**`outcome=hit` means non-empty, not useful.** The counter cannot see relevance: a query
+against a graph that indexed the wrong things returns rows and scores as a hit. A run of `hit`
+outcomes that workers still abandon after one query is the signal that the graph's *content*,
+not the worker's habit, is what needs work — cross-check with `coord diagnose --graph` for a
+graph built from a stale SHA.
+
 ## Traps
 
 **`core.hooksPath` REPLACES `.git/hooks` wholesale.** Git stops looking in `.git/hooks`

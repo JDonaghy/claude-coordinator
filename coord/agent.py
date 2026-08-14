@@ -756,13 +756,11 @@ def _graphify_update(repo_path: Path, *, timeout: float = 600.0) -> tuple[bool, 
 # across N consecutive legs means the prompt instruction isn't landing.
 # Deliberately NOT a DB column: this is a cheap, best-effort signal, not a
 # gate anything blocks on, so it stays out of the Assignment schema/migrations.
-# Separators recognized before a command token: `;`, `&`, `|` (covers `&&`
-# and `||` too, since `\s*` after the class soaks up the second char) and a
-# bare newline — Claude Code's Bash tool very commonly emits multi-line
-# command strings (e.g. `cd repo\ngraphify query "foo"`) that aren't joined
-# with `;`/`&&`, so newline must count as a separator or those legs
-# undercount to 0 (#2212 review).
-_GRAPHIFY_INVOCATION_RE = re.compile(r"(?:^|[\n;&|]\s*)graphify(?:\s|$)")
+# #2236: the pattern itself now lives in `coord.worker_events`, which grew a
+# need for it when the summary parser started recording each query's OUTCOME
+# and not just the count. Imported lazily (like every other
+# `coord.worker_events` use in this module) rather than duplicated, so the two
+# halves of the measurement can never drift apart on what counts as a query.
 
 
 def _count_graphify_invocations(bash_commands: list[str]) -> int:
@@ -781,7 +779,55 @@ def _count_graphify_invocations(bash_commands: list[str]) -> int:
     b"`` counts once, not twice. Treat the result as an "at least one graph
     query this leg" signal, not an exact invocation tally.
     """
-    return sum(1 for cmd in bash_commands if cmd and _GRAPHIFY_INVOCATION_RE.search(cmd))
+    from coord.worker_events import is_graphify_command  # noqa: PLC0415
+
+    return sum(1 for cmd in bash_commands if is_graphify_command(cmd))
+
+
+def _worktree_graph_present(worktree_path: str | None) -> bool:
+    """True iff *worktree_path* has a **resolvable** ``graphify-out/graph.json``.
+
+    #2236: ``graphify_invocations=0`` is ambiguous on its own. Two of five
+    repos ship no graph and no ``.githooks/post-checkout``, so their worktrees
+    get an empty ``graphify-out/`` — and the worker prompt's own escape hatch
+    ("no graph? skip straight to grep, silently") then fires correctly and
+    says nothing. Those workers were *obeying* the rule, not ignoring it, and
+    the counter cannot tell them apart from a worker that had a graph and
+    never asked. Recording this alongside the count is what disambiguates.
+
+    ``exists()`` follows symlinks deliberately: a linked worktree's
+    ``graph.json`` is a symlink into the base checkout (see
+    ``coord/graph_health.py``), and a *dangling* symlink is exactly as
+    graph-blind as no file at all — so both must read as absent.
+    """
+    if not worktree_path:
+        return False
+    try:
+        return (Path(worktree_path) / "graphify-out" / "graph.json").exists()
+    except OSError:
+        return False
+
+
+def _format_graphify_query_lines(queries: Iterable[Any]) -> list[str]:
+    """Render per-query ``# graphify_query …`` log lines (#2236).
+
+    ``graphify_invocations=N`` counts attempts but cannot distinguish
+    "queried and got a useful answer" from "queried, got nothing, fell back to
+    grep" — and those imply opposite fixes (a habit problem the prompt can
+    move, vs. a graph coverage/quality problem no amount of prompting helps).
+    One line per query, ``grep``-able on ``outcome=``, with the command text
+    last because it is the only free-form field.
+    """
+    lines: list[str] = []
+    for q in queries:
+        results = getattr(q, "results", None)
+        command = str(getattr(q, "command", "")).replace("\n", " ").strip()
+        lines.append(
+            f"# graphify_query: outcome={getattr(q, 'outcome', 'unknown')} "
+            f"results={results if results is not None else '?'} "
+            f"cmd={command!r}\n"
+        )
+    return lines
 
 
 def _infer_repo_github_slug(repo_path: str) -> str | None:
@@ -7511,9 +7557,26 @@ class AgentServer:
                 _graphify_invocations = _count_graphify_invocations(
                     _worker_summary.bash_commands if _worker_summary is not None else []
                 )
+                # #2236: the count alone can't separate "didn't try" from
+                # "couldn't try" (no graph in this worktree — the prompt's own
+                # escape hatch fires silently) or from "tried, got nothing".
+                # `graph_present` answers the first; the per-query lines below
+                # answer the second. Read while the worktree still exists —
+                # `_cleanup_worktree` runs further down this same function.
+                _graph_present = _worktree_graph_present(
+                    getattr(assignment, "worktree_path", None) if assignment else None
+                )
                 reopen.write(
                     f"# reap: done (exit_code={exit_code} status={final_status} "
-                    f"graphify_invocations={_graphify_invocations})\n"
+                    f"graphify_invocations={_graphify_invocations} "
+                    f"graph_present={int(_graph_present)})\n"
+                )
+                reopen.writelines(
+                    _format_graphify_query_lines(
+                        _worker_summary.graphify_queries
+                        if _worker_summary is not None
+                        else []
+                    )
                 )
         except (OSError, AttributeError):
             pass
