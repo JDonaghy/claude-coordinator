@@ -254,3 +254,9 @@ def test_events_reports_nothing_by_default():
     result = run("portal", "events")
     assert result.exit_code == 0
     assert "no unhandled portal events" in result.output
+
+
+def test_requeue_reports_an_unknown_row_cleanly():
+    result = run("portal", "requeue", "sub_1", "1")
+    assert result.exit_code != 0
+    assert "no outbox row" in result.output

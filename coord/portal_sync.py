@@ -42,9 +42,17 @@ there is no window in which the mail goes out ahead of its content.
 
 **Idempotency and replay.** Inbound events dedupe on the portal's own event
 id; the cursor advances only after a page commits. Outbound rows allocate
-``(seq, revision)`` once and keep it across every retry, and the portal
-ignores any revision at or below its watermark. A daemon that dies mid-pass
-replays; it does not skip and it does not double-write.
+``(seq, revision)`` once and keep it across every retry. A daemon that dies
+mid-pass replays; it does not skip and it does not double-write.
+
+The one place that is subtler than it looks: the portal answers
+``already_applied`` both for a row it really did store and for a row whose
+revision fell at or below its watermark — i.e. one it *discarded*. Believing
+the second kind would mark a design round confirmed that the portal never
+took, and release the mail behind it. So a first-attempt ``already_applied``
+is treated as evidence that coord's allocator is stale: the row is
+re-numbered above it and retried, and only a row that has actually been sent
+before can be confirmed that way.
 """
 
 from __future__ import annotations
@@ -109,6 +117,13 @@ MAX_PULL_PAGES = 10
 PULL_PAGE_LIMIT = 50
 #: Outbox rows sent per pass, for the same reason.
 MAX_PUSH_PER_TICK = 25
+#: Failed sends of one row before it is retired to `rejected`. Deliberately
+#: generous — at a 60 s cadence this is ~8 minutes of portal outage before
+#: anything is given up on — but finite, because `PortalBridgeError` covers a
+#: permanent 4xx as well as a transient one and an infinite retry of the
+#: former freezes a customer's queue forever behind a request that will never
+#: succeed.
+MAX_PUSH_ATTEMPTS = 8
 
 
 @dataclass(frozen=True)
@@ -329,10 +344,18 @@ def sync_tick(
         errors.append(f"heartbeat: {exc}")
         logger.warning("portal sync: heartbeat failed", exc_info=True)
 
-    if errors:
-        portal_store.note_error("; ".join(errors)[:500])
-    else:
-        portal_store.clear_error()
+    # Guarded like every other DB touch in this function: `note_error` writes
+    # to SQLite, and a momentarily locked DB (the daemon shares one connection
+    # with a CLI process on the same host) must not turn "the pass finished"
+    # into a raised exception. `sync_tick` promises never to raise; the
+    # bookkeeping write is not allowed to be the one that breaks that.
+    try:
+        if errors:
+            portal_store.note_error("; ".join(errors)[:500])
+        else:
+            portal_store.clear_error()
+    except Exception:  # noqa: BLE001
+        logger.warning("portal sync: could not record pass state", exc_info=True)
 
     return SyncResult(
         enabled=True,
@@ -364,9 +387,27 @@ def _pull(client: Any, *, pages: int, now: float | None) -> int:
         saw_any_page = True
         events = data.get("events") if isinstance(data, dict) else None
         if not isinstance(events, list):
-            events = []
+            # A page whose `events` is not a list is not a page we can store
+            # any of. Stop WITHOUT advancing: whatever it held is still behind
+            # this cursor, and advancing past an unreadable page is the one
+            # way the inbox can silently lose a submission.
+            raise PortalBridgeError(
+                f"pull returned a page whose 'events' was "
+                f"{type(events).__name__}, not a list — cursor left at "
+                f"{cursor!r}"
+            )
 
-        total_new += portal_store.record_events(events, now=now)
+        stored, unidentified = portal_store.record_events(events, now=now)
+        total_new += stored
+        if unidentified:
+            # Stored under a content hash rather than dropped (see
+            # record_events), but the portal not giving an event an id is a
+            # contract violation and must not pass quietly.
+            logger.warning(
+                "portal sync: %d pulled event(s) carried no id — stored under a "
+                "content hash; the portal's event contract has drifted",
+                unidentified,
+            )
         for ev in events:
             if isinstance(ev, dict):
                 _mirror_event(ev, now=now)
@@ -419,8 +460,16 @@ def _mirror_event(event: dict[str, Any], *, now: float | None) -> None:
     # Keep the revision allocator at or above whatever the portal reports.
     # Without this, the first push for a submission the portal already has at
     # revision N comes back `already_applied` — a "success" that silently
-    # drops the fact.
-    revision = event.get("revision")
+    # drops the fact (the drain re-numbers and retries on exactly that, but
+    # seeding from a pull is how it converges in one step instead of several).
+    #
+    # Read from the MERGED payload, not the raw event: the portal may carry
+    # the revision at the top level or nested alongside the record's fields,
+    # and the version of this that only checked the top level would silently
+    # never seed at all for the nested shape.
+    revision = payload.get("revision")
+    if isinstance(revision, bool):
+        revision = None  # bool is an int in Python; a flag is not a revision
     if isinstance(revision, int) and revision > 0:
         portal_store.seed_revision(submission_id, revision, now=now)
 
@@ -472,21 +521,48 @@ def _push(
                 ]
             )
         except PortalBridgeError as exc:
-            # Transient by assumption: the row stays pending with its same
-            # (seq, revision) and is retried next tick.
-            portal_store.note_attempt(row, str(exc))
-            errors.append(f"push {row.submission_id}@{row.revision}: {exc}")
+            # The row stays pending with its same (seq, revision) and is
+            # retried next tick — UP TO A POINT. `PortalBridgeError` covers
+            # both a transient outage and a permanent 4xx (a malformed
+            # payload the portal will refuse identically forever), and this
+            # side cannot reliably tell them apart. Retrying the permanent
+            # kind forever would freeze this submission's queue behind it and
+            # re-issue a known-bad request every tick, so the attempt count is
+            # the tiebreaker: past the budget the row goes terminal, the
+            # submission's later rows unfreeze, and an operator sees why.
+            _fail_attempt(row, str(exc), errors, now=now)
             stalled.add(row.submission_id)
             continue
 
         sent += 1
         result = results[0] if results else None
         if result is None:
-            portal_store.note_attempt(row, "portal returned no result for this update")
-            errors.append(
-                f"push {row.submission_id}@{row.revision}: portal returned no result"
+            _fail_attempt(
+                row, "portal returned no result for this update", errors, now=now
             )
             stalled.add(row.submission_id)
+            continue
+
+        if result.outcome == "already_applied" and row.attempts == 0:
+            # NOT a confirmation. `already_applied` means "at or below my
+            # watermark, so I ignored it" — which on a row's FIRST attempt is
+            # far more likely to mean coord's revision allocator is behind the
+            # portal than that a previous send of this exact row landed
+            # (there was no previous send). Believing it would mark a design
+            # round confirmed that the portal never stored, and release the
+            # `awaiting-signoff` mail behind it — #835 exactly, arrived at
+            # from the other side. So: re-number above the allocator and try
+            # again next tick.
+            revision = portal_store.reallocate_revision(
+                row, "already_applied on first attempt — revision was stale", now=now
+            )
+            held += 1
+            stalled.add(row.submission_id)
+            logger.info(
+                "portal sync: %s seq %d came back already_applied on its first "
+                "attempt; re-numbered %d → %d and will retry",
+                row.submission_id, row.seq, row.revision, revision,
+            )
             continue
 
         if result.ok:
@@ -509,3 +585,34 @@ def _push(
     if applied or rejected:
         portal_store.note_push(now=now)
     return applied, rejected, held, errors
+
+
+def _fail_attempt(
+    row: portal_store.OutboxRow,
+    reason: str,
+    errors: list[str],
+    *,
+    now: float | None,
+) -> None:
+    """Count one failed send, retiring the row once it has had enough tries.
+
+    A row that has burned :data:`MAX_PUSH_ATTEMPTS` is not transient any
+    more, whatever the error said. Retiring it is what keeps one bad payload
+    from holding a customer's whole timeline hostage — and because
+    retirement is `rejected`, anything that *announces* this row stays held
+    by the ordering guard rather than escaping. Failing forward here is safe
+    precisely because failing closed there is not negotiable.
+    """
+    errors.append(f"push {row.submission_id}@{row.revision}: {reason}")
+    if row.attempts + 1 >= MAX_PUSH_ATTEMPTS:
+        portal_store.mark_rejected(
+            row,
+            f"gave up after {row.attempts + 1} attempts: {reason}",
+            now=now,
+        )
+        logger.warning(
+            "portal sync: %s seq %d retired after %d failed attempts: %s",
+            row.submission_id, row.seq, row.attempts + 1, reason,
+        )
+        return
+    portal_store.note_attempt(row, reason)
