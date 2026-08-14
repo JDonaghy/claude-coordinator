@@ -6178,17 +6178,28 @@ class AgentServer:
         ``zero_commit_reason`` when the reap already flagged ADVISORY, since
         that is the string `coord status`, the dashboard and the GitHub
         advisory comment all render) is what makes the loss visible.
+
+        #2234 fix-1: mirrors the same rewrite for a REFUSED_POLICY reap —
+        ``policy_refusal_reason`` (not ``zero_commit_reason``) is the string
+        the refused_policy GitHub comment and `coord status` render for that
+        status, so a dirty worktree left behind by an otherwise-correct
+        policy refusal needs the same visibility, on the field that surface
+        actually reads.
         """
         with self._lock:
             live = self._assignments.get(assignment.id, assignment)
             live.dirty_worktree_reason = reason
             if live.status == ADVISORY:
                 live.zero_commit_reason = reason
+            elif live.status == REFUSED_POLICY:
+                live.policy_refusal_reason = reason
             # Keep the caller's object in sync when it isn't the live one, so
             # a caller holding a detached copy still sees the outcome.
             assignment.dirty_worktree_reason = reason
             if assignment.status == ADVISORY:
                 assignment.zero_commit_reason = reason
+            elif assignment.status == REFUSED_POLICY:
+                assignment.policy_refusal_reason = reason
         self._persist()
 
     def _rescue_uncommitted_work(

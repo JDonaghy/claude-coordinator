@@ -877,6 +877,45 @@ def test_oracle_active_cancelled_row_is_not_terminal_when_the_slice_already_land
     )
 
 
+# ── refused_policy: #2234 fix-1 — the acceptance-author half ────────────────
+#
+# `type="test-author"` is one of `_ZERO_COMMIT_TYPES` (coord.agent), so a JIT
+# acceptance-author row goes through the identical `_looks_like_policy_
+# refusal` classification as a plain `work` row and can reap
+# `status="refused_policy"` just like it. Mirrors the `work_status ==
+# "refused_policy"` tests above.
+
+
+def test_oracle_active_is_terminal_when_the_slice_authoring_refuses_on_policy():
+    oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
+    action = step(
+        state(acceptance_author_aid="ta1", acceptance_author_status="refused_policy"),
+        oracle=oracle,
+    )
+    assert action.is_exit
+    assert action.exit_code == EXIT_TERMINAL_FAILURE
+    assert POLICY_REFUSAL_MARKER in action.message
+    assert "needs the coordinator" in action.message.lower()
+
+
+def test_oracle_active_refused_policy_row_is_not_terminal_when_the_slice_already_landed():
+    """#2061: a stale/retried refusal row can still coexist with an earlier
+    attempt's slice already landed — check the manifest before dying, same
+    as the `failed`/`cancelled`/`advisory` branches above."""
+    oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
+    checker = FakeGateChecker(landed=True)
+    action = step(
+        oracle_state(acceptance_author_aid="ta1", acceptance_author_status="refused_policy"),
+        oracle=oracle,
+        gate_checker=checker,
+    )
+    assert action.kind == RUN
+    assert action.command == (
+        "assign", "precision", REPO, "1392",
+        "--driven-by", f"drive:{REPO}#1392",
+    )
+
+
 def test_oracle_active_still_honours_do_plan_after_the_slice_has_landed():
     oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
     action = step(

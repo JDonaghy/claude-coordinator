@@ -691,7 +691,7 @@ def format_refused_policy(
         "## Coordinator: Refused — Standing Repo-Rule Prohibition",
         marker,
         f"**Machine:** {machine_name}",
-        f"**Status:** refused_policy",
+        "**Status:** refused_policy",
         f"**Duration:** {_fmt_duration(duration_seconds)}",
     ]
     if log_path:

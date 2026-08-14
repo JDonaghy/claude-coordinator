@@ -1655,6 +1655,7 @@ def _mark_notified_local(
         EVENT_LIVENESS_STALL,
         EVENT_NEEDS_ATTENTION,
         EVENT_PLAN,
+        EVENT_REFUSED_POLICY,
         EVENT_STALLED,
         EVENT_STUCK,
     )
@@ -1689,6 +1690,17 @@ def _mark_notified_local(
         # mislabel, not a real terminal failure.
         conn.execute(
             "UPDATE assignments SET status='advisory', finished_at=? WHERE assignment_id=?",
+            (now, assignment_id),
+        )
+    elif event == EVENT_REFUSED_POLICY:
+        # #2234 fix-1: mirrors the EVENT_ADVISORY branch above. Without this,
+        # `coord.notify.post_transition` posts the "Refused — Standing
+        # Repo-Rule Prohibition" GitHub comment and then this same call
+        # falls into the bare `else` below, unconditionally overwriting the
+        # just-posted classification back to `status='failed'` — reproducing
+        # #2234's own headline defect one layer further down the stack.
+        conn.execute(
+            "UPDATE assignments SET status='refused_policy', finished_at=? WHERE assignment_id=?",
             (now, assignment_id),
         )
     else:
