@@ -1166,6 +1166,88 @@ def check_branch_exists(repo: str, branch: str) -> bool:
         return False
 
 
+def get_repo_default_branch(repo: str) -> str:
+    """The repo's REAL default branch, from GitHub (#2220).
+
+    ``coord repo add`` reads this rather than trusting a ``--default-branch``
+    flag, and ``coord repo doctor`` compares it against the configured value:
+    a ``default_branch`` that disagrees with the repo's actual default routes
+    every worker PR to the wrong base, and nothing else in the fleet notices.
+
+    Raises (``RuntimeError``/:class:`GhError`) on any read failure rather than
+    guessing ``"main"`` — a caller that cannot tell "the default is main" from
+    "I could not ask" must not treat the second as the first.
+    """
+    data = _gh_json("api", f"repos/{repo}", default=None)
+    if not isinstance(data, dict) or not data.get("default_branch"):
+        raise RuntimeError(f"gh api repos/{repo}: no default_branch in response")
+    return str(data["default_branch"])
+
+
+def list_repo_labels(repo: str) -> list[str]:
+    """Every label name defined in *repo* (#2220).
+
+    Backs the ``coord`` / ``tier:*`` label checks in ``coord repo doctor``:
+    without the ``coord`` label an issue is live on GitHub but invisible to
+    the Pipeline, which is indistinguishable from "nobody has filed anything
+    yet". Raises on read failure — see :func:`get_repo_default_branch`.
+    """
+    data = _gh_json(
+        "api", "--paginate", "--slurp", f"repos/{repo}/labels", default=None
+    )
+    # `--paginate --slurp` yields a list of per-page arrays; a single
+    # unpaginated read yields a flat array. Accept both rather than depending
+    # on how many labels the repo happens to have.
+    if not isinstance(data, list):
+        raise RuntimeError(f"gh api repos/{repo}/labels: malformed response")
+    out: list[str] = []
+    for entry in data:
+        if isinstance(entry, list):
+            out.extend(str(e.get("name")) for e in entry if isinstance(e, dict) and e.get("name"))
+        elif isinstance(entry, dict) and entry.get("name"):
+            out.append(str(entry["name"]))
+    return out
+
+
+def list_repo_workflows(repo: str) -> list[dict]:
+    """The GitHub Actions workflow definitions GitHub knows about for *repo*.
+
+    Sibling of :func:`get_repo_workflow_count` (which only needs the count for
+    ``expects_checks``); this returns the entries themselves so ``coord repo
+    doctor`` can go on and read each one's ``on:`` triggers. Each dict carries
+    at least ``name`` and ``path``.
+
+    Raises on read failure rather than returning ``[]`` — same reasoning as
+    :func:`get_repo_workflow_count`: "no workflows" and "couldn't check" have
+    opposite consequences for the merge gate.
+    """
+    data = _gh_json("api", f"repos/{repo}/actions/workflows", default=None)
+    if not isinstance(data, dict) or not isinstance(data.get("workflows"), list):
+        raise RuntimeError(
+            f"gh api repos/{repo}/actions/workflows: malformed response"
+        )
+    return [w for w in data["workflows"] if isinstance(w, dict)]
+
+
+def repo_file_exists(repo: str, path: str, branch: str) -> bool:
+    """True when *path* exists on *branch* of *repo* (#2220).
+
+    Thin, explicitly-branch-taking wrapper over the Contents API —
+    :func:`get_repo_file` defaults to ``develop``, which is wrong for the
+    majority of repos this is asked about. Returns ``False`` only for a real
+    "not found"; every other failure propagates, so a caller never reads an
+    auth error as a missing ``CLAUDE.md``.
+    """
+    try:
+        _gh("api", f"repos/{repo}/contents/{path}?ref={branch}")
+        return True
+    except RuntimeError as exc:
+        msg = str(exc).lower()
+        if "not found" in msg or "404" in msg:
+            return False
+        raise
+
+
 def list_remote_branch_names(repo: str) -> set[str]:
     """Return the set of branch names that currently exist on `repo` (owner/name).
 

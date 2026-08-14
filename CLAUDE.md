@@ -84,6 +84,8 @@ coord retry|stop|resume <id>                    # Recovery; `coord done` ends th
 ```
 Setup / diagnostics (discoverable via `--help`): `coord init`, `coord config`, `coord agent`, `coord serve`, `coord web`, `coord diagnose`, `coord sessions [--remote]`, `coord split`, `coord notifier` ([`docs/NOTIFIER.md`](docs/NOTIFIER.md)).
 
+**Onboarding a repo is five layers, and every one fails silently (#2220).** `coord repo add <name> --github <owner/repo> --machines a,b,c` does the safely-automatable parts (reads the *real* default branch from GitHub, writes the entry into the coord-settings checkout, adds it to each machine, creates the `coord`/tier labels) and then prints the residue it deliberately did **not** do. `coord repo doctor <name>` is the part that matters: it probes all five layers from **live state, not config** — each agent's `/health` repo list, the clone on each machine, the labels that exist, whether any workflow triggers on `pull_request`, `CLAUDE.md`, graph freshness — and exits non-zero on any CRIT. `coord doctor` folds in the live-state layer for every repo, so a half-onboarded one shows up in the fleet report without anyone remembering to ask. See [`docs/AGENT_OPERATIONS.md`](docs/AGENT_OPERATIONS.md).
+
 ## Development
 
 Always work in a virtualenv. Agent workers are spawned with the agent's own

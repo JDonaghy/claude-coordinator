@@ -954,6 +954,42 @@ def _dispatch_blocker_lines_for_config_free(machine, cfg) -> list[tuple[bool, st
     return out
 
 
+def _repo_onboarding_lines(cfg, statuses) -> list[tuple[bool, str]]:
+    """Render every configured repo's onboarding residue as ``coord doctor``
+    lines (:mod:`coord.repo_onboard`, #2220).
+
+    This is the wiring #2220 asks for: a half-onboarded repo shows up in the
+    fleet report *without anyone remembering to ask*. ``stick-demo`` sat
+    two-thirds onboarded for days and the only thing that ever noticed was a
+    queue entry dying of it.
+
+    Runs with ``probe_github=False`` and no graph probe, so it costs **zero**
+    extra round trips — it re-reads the ``/health`` bodies this command has
+    already fetched. That is enough for the finding that actually bit: the
+    #2219 agent/config repo skew is visible from ``/health`` alone. The GitHub
+    and repo-contents layers need ``coord repo doctor <name>``, which the
+    footer below points at.
+
+    Mirrors :func:`_unit_drift_lines`/:func:`_release_lag_lines`: same
+    computation as the dedicated command (#2096's "two surfaces, one
+    function" rule), projected into doctor's output. Best-effort — a repo whose
+    facts can't be gathered is skipped rather than breaking the fleet report.
+    """
+    from coord import repo_onboard  # noqa: PLC0415
+
+    out: list[tuple[bool, str]] = []
+    for repo in getattr(cfg, "repos", None) or []:
+        try:
+            facts = repo_onboard.gather_facts(
+                cfg, repo.name, statuses=statuses, probe_github=False
+            )
+            report = repo_onboard.evaluate(facts)
+        except Exception:  # noqa: BLE001 — never break the fleet report
+            continue
+        out.extend(repo_onboard.doctor_summary_lines(report))
+    return out
+
+
 def _release_lag_lines(report) -> list[tuple[bool, str]]:
     """Render a :class:`coord.release_verify.VerifyReport`'s findings as
     ``coord doctor`` lines (#2082).
@@ -1134,6 +1170,26 @@ def doctor(
             any_problem = True
             for reason in reasons:
                 click.echo(f"  ✗ capability {cap!r} claimed but unmet — {reason}")
+
+    # #2220: is any repo only half-onboarded? Costs nothing extra — reuses the
+    # `/health` bodies fetched above. Skipped under `--machine`, where the
+    # per-machine slice would report every OTHER machine's repos as
+    # "unreachable" purely because this run never probed them.
+    if not machine_filter:
+        onboarding_lines = _repo_onboarding_lines(cfg, statuses)
+        if onboarding_lines:
+            click.echo("")
+            click.echo("repo onboarding (coord repo doctor):")
+            for is_problem, line in onboarding_lines:
+                click.echo(line)
+                if is_problem:
+                    any_problem = True
+            click.echo(
+                "  → this is the LIVE-state layer only. GitHub labels, the "
+                "pull_request trigger, CLAUDE.md, the Test-stage command and "
+                "graph freshness are NOT checked here: run "
+                "`coord repo doctor <name>`"
+            )
 
     # #2082: is the fleet actually running the released version? On
     # 2026-08-10 it was eleven releases behind (v0.5.15 vs PyPI's v0.5.26)
