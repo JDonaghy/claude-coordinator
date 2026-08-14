@@ -211,3 +211,47 @@ class TestHealthVsConfigLines:
             )
             == []
         )
+
+    def test_partial_repo_drift_is_a_problem_even_when_health_is_nonempty(self) -> None:
+        """#2219: stick-demo's actual shape — /health still publishes
+        something (unlike the all-repos-missing #1485 case above), just not
+        the ONE repo added to coordinator.yml after this agent process
+        started. The `not published_repos` branch above never fires here,
+        so this needs its own check."""
+        lines = _health_vs_config_lines(
+            self._machine(repos=["vimcode", "quadraui", "stick-demo"]),
+            {
+                "capabilities": ["gtk", "rust", "python"],
+                "repos": ["vimcode", "quadraui"],
+            },
+        )
+        assert any(is_problem for is_problem, _ in lines)
+        assert any(
+            "CRIT repos" in text and "stick-demo" in text for _, text in lines
+        )
+
+    def test_partial_repo_drift_is_silent_when_agent_is_config_free(self) -> None:
+        """A config-free agent's repos come from the dispatch payload, not
+        its own coordinator.yml (#1801) — a mismatch against the
+        coordinator's OWN machine entry for it is not a capability gap."""
+        lines = _health_vs_config_lines(
+            self._machine(repos=["vimcode", "quadraui", "stick-demo"]),
+            {
+                "capabilities": [],
+                "repos": ["vimcode", "quadraui"],
+                "config_free": "no local coordinator.yml and no board service",
+            },
+        )
+        assert not any("stick-demo" in text for _, text in lines)
+
+    def test_no_partial_drift_line_when_published_repos_match_declared(self) -> None:
+        assert (
+            _health_vs_config_lines(
+                self._machine(repos=["vimcode", "quadraui"]),
+                {
+                    "capabilities": ["gtk", "rust", "python"],
+                    "repos": ["vimcode", "quadraui", "extra-repo-agent-also-serves"],
+                },
+            )
+            == []
+        )
