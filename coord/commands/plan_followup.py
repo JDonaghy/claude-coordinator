@@ -832,9 +832,19 @@ def fix(assignment_id: str, config_path: Path, guidance: str, force: bool) -> No
 
     # #2091: the stored Test verdict says PASSED while the branch's live CI
     # says RED — the coord-portal #14 shape.  Both are "the tests", and they
-    # disagree; that is a fact about the Test gate (it ran a narrower suite
-    # than CI), not a detail of this dispatch, so name it rather than
-    # quietly preferring one.
+    # disagree; that is a fact about the Test gate, not a detail of this
+    # dispatch, so name it rather than quietly preferring one.
+    #
+    # #2244: this used to ASSERT the cause ("the Test stage ran a narrower
+    # suite than CI — set ci_command") without ever having measured it. On
+    # #2230 that diagnosis was simply wrong: the Test stage ran the FULL
+    # suite, CI ran the same tests, the same five failed in both — and the
+    # green verdict came from the headless smoke's unwired verdict channel
+    # (a `claude -p` session exits 0 whatever the suite did, so `SMOKE: fail`
+    # was recorded as `passed`). Acting on the old message would have changed
+    # nothing and buried the real defect under config. So: state the conflict,
+    # list the candidate causes, and point at the evidence that distinguishes
+    # them, rather than naming one.
     if ci_read.is_red and (
         assignment.test_state == "passed" or assignment.smoke_test == "pass"
     ):
@@ -843,9 +853,13 @@ def fix(assignment_id: str, config_path: Path, guidance: str, force: bool) -> No
             f"conflict (#2091): assignment {assignment_id} has a stored Test "
             f"verdict of {stored_verdict!r} "
             f"but CI on PR #{ci_read.pr_number} is RED on the same branch. "
-            "The Test stage ran a narrower suite than CI — set "
-            f"repos[{assignment.repo_name}].ci_command to what CI runs so "
-            "the gate stops reporting green on a red branch.",
+            "Trusting CI. Which of the two is wrong is not determined here — "
+            "check, in this order: (1) what the Test stage actually ran and "
+            f"reported (`coord log {assignment_id}` → its `SMOKE:` verdict "
+            "line and suite summary); (2) whether that suite is narrower than "
+            f"CI's (if so, set repos[{assignment.repo_name}].ci_command to "
+            "what CI runs); (3) whether the failures are environmental on the "
+            "Test machine but not in CI.",
             err=True,
         )
 

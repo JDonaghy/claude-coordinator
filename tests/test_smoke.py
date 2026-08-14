@@ -399,6 +399,49 @@ def test_smoke_system_prompt_documents_baseline_red_outcome() -> None:
     assert "SMOKE: fail" in SMOKE_SYSTEM_PROMPT
 
 
+# ── #2244: the printed marker is the verdict, not the exit code ─────────────
+
+
+def test_smoke_system_prompt_says_the_marker_is_the_verdict() -> None:
+    """A `claude -p` worker cannot signal through its exit code (an `exit 1`
+    inside a tool call ends the tool call, not the session), so the prompt
+    must not tell it the coordinator reads that code — the printed `SMOKE:`
+    line is the verdict. See tests/test_notify.py::TestSmokeVerdictFailsClosed.
+    """
+    assert "NOT YOUR EXIT CODE" in SMOKE_SYSTEM_PROMPT
+    # No line of the prompt may itself start with the marker, or a transcript
+    # that quotes the prompt back would parse as a verdict.
+    assert not any(
+        line.startswith("SMOKE:") for line in SMOKE_SYSTEM_PROMPT.splitlines()
+    )
+
+
+def test_briefing_tells_the_worker_to_record_the_verdict_itself() -> None:
+    """#2244 belt (the #2217 fix applied to the Test stage): the worker gets
+    the PARENT work assignment id and the exact `coord test` command, so the
+    authoritative board write doesn't depend on a transcript parse."""
+    briefing = build_smoke_briefing(
+        repo_github="acme/api", repo_name="api", branch="b",
+        issue_number=1, issue_title="X", smoke_command="cmd",
+        required_caps=[], timeout_seconds=60, is_worker=False,
+        parent_assignment_id="884e2fe6eb5b",
+    )
+    assert "coord test --passed 884e2fe6eb5b" in briefing
+    assert "coord test --fail" in briefing
+    assert "884e2fe6eb5b" in briefing
+    assert not any(line.startswith("SMOKE:") for line in briefing.splitlines())
+
+
+def test_briefing_omits_the_coord_test_command_without_a_parent_id() -> None:
+    briefing = build_smoke_briefing(
+        repo_github="acme/api", repo_name="api", branch="b",
+        issue_number=1, issue_title="X", smoke_command="cmd",
+        required_caps=[], timeout_seconds=60, is_worker=False,
+    )
+    assert "coord test" not in briefing
+    assert "SMOKE: pass" in briefing
+
+
 # ── dispatch_smoke (HTTP mocked) ────────────────────────────────────────────
 
 

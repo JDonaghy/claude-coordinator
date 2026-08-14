@@ -397,8 +397,15 @@ class TestStoredPassedVsLiveRedIsAConflict:
         self, ci_config: Path, coord_dir: Path, monkeypatch
     ) -> None:
         """A stored `passed` verdict on a branch whose CI is red is not a
-        detail of this dispatch — it means the Test gate ran a narrower suite
-        than CI. Name it instead of silently preferring the CI read."""
+        detail of this dispatch — the two "the tests" disagree. Name the
+        conflict instead of silently preferring the CI read.
+
+        #2244: the message must NOT assert a cause it hasn't measured. It
+        used to state flatly that "the Test stage ran a narrower suite than
+        CI"; on #2230 the Test stage ran the FULL suite and the same five
+        tests failed in both — the green verdict came from the headless
+        smoke's unwired verdict channel. `ci_command` stays in the message as
+        one candidate to check, not as the diagnosis."""
         state_mod.save_board(Board(completed=[_work(test_state="passed", smoke_test="pass")]))
 
         fake_store = MagicMock()
@@ -418,6 +425,9 @@ class TestStoredPassedVsLiveRedIsAConflict:
         assert "conflict (#2091)" in result.output
         assert "CI on PR #7 is RED" in result.output
         assert "repos[api].ci_command" in result.output
+        # #2244: no unmeasured diagnosis, and it points at the evidence.
+        assert "ran a narrower suite than CI" not in result.output
+        assert "coord log work-abc" in result.output
 
     def test_no_conflict_line_when_the_stored_verdict_already_failed(
         self, ci_config: Path, coord_dir: Path, monkeypatch

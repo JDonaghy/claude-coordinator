@@ -94,10 +94,14 @@ Rules:
   command itself does when run locally, so do it without asking.
 - Do NOT run `gh` commands. The coordinator owns GitHub interactions.
 - You MAY run git, build commands, and test commands.
-- Exit code is what the coordinator reads — exit 0 on pass, non-zero on \
-fail. Print a final line `SMOKE: pass`, `SMOKE: fail <one-line reason>`, or \
-`SMOKE: baseline-red <one-line reason>` (see step 4) before exiting so logs \
-are readable.
+- THE VERDICT IS THE LINE YOU PRINT, NOT YOUR EXIT CODE (#2244). Print \
+exactly one final line at the start of a line: `SMOKE: pass`, \
+`SMOKE: fail <one-line reason>`, or `SMOKE: baseline-red <one-line reason>` \
+(see step 4). An `exit 1` inside a tool call ends that tool call, not this \
+session — the coordinator sees exit 0 either way, so a run whose suite failed \
+and whose marker is missing is recorded as NO verdict (never a pass) and the \
+Test stage has to be re-run. Exit with the matching code as well, for the \
+non-headless lanes that do read it.
 
 Where you are:
 - You are in a dedicated git worktree created for this run. Every git command \
@@ -125,6 +129,10 @@ code.
 5. Otherwise (any other non-zero exit, or a failure with no \
 `{BASELINE_RED_OUTPUT_MARKER}` line) → print `SMOKE: fail <short reason>` and \
 exit non-zero (any code other than 0 or {RUNNER_BASELINE_RED_EXIT}).
+6. If your briefing gives you a `coord test ...` command, run it as your LAST \
+step with the flag matching your verdict (#2244). That writes the verdict \
+straight to the board and is authoritative; the printed marker is the backup. \
+A `baseline-red` verdict has no `coord test` flag — print the marker only.
 """
 
 
@@ -462,7 +470,18 @@ def build_smoke_briefing(
     timeout_seconds: int,
     is_worker: bool,
     command_source: SmokeCommand | None = None,
+    parent_assignment_id: str | None = None,
 ) -> str:
+    """Build the smoke worker's briefing.
+
+    *parent_assignment_id* (#2244) is the WORK assignment this Test stage
+    certifies. When given, the briefing tells the worker to record its own
+    verdict with ``coord test --passed|--fail <parent>`` — the authoritative
+    board write, now reachable from a headless worker since #2217 — with the
+    printed ``SMOKE:`` marker as the parseable backup. Omitted (``None``) the
+    briefing asks for the marker alone, which is what every caller predating
+    this got.
+    """
     lines: list[str] = []
     lines.append(f"# Smoke test: {repo_github} branch `{branch}`")
     lines.append("")
@@ -506,10 +525,52 @@ def build_smoke_briefing(
     lines.append("```")
     lines.append("")
     lines.append(
-        "Report `SMOKE: pass` on exit 0, or "
-        "`SMOKE: fail <one-line reason>` on non-zero. The coordinator reads "
-        "the final exit code."
+        "## Reporting the verdict (#2244)"
     )
+    lines.append("")
+    lines.append(
+        "Print ONE of these as a final line, at the start of the line — this "
+        "line IS the verdict the coordinator reads:"
+    )
+    lines.append("")
+    lines.append("- `SMOKE: pass` — the smoke command exited 0")
+    lines.append("- `SMOKE: fail <one-line reason>` — it failed")
+    lines.append(
+        "- `SMOKE: baseline-red <one-line reason>` — every failure reproduces "
+        "identically on the merge-base (#2170)"
+    )
+    lines.append("")
+    lines.append(
+        "Your process exit code is NOT a verdict: an `exit 1` inside a tool "
+        "call ends that tool call, not this session, so the coordinator sees "
+        "exit 0 whatever the suite did. A run with no marker line is recorded "
+        "as NO verdict (never a pass) and the Test stage gets re-run."
+    )
+    if parent_assignment_id:
+        lines.append("")
+        lines.append(
+            "Then write the verdict to the board yourself — this is the "
+            "authoritative record, the printed marker is the backup:"
+        )
+        lines.append("")
+        lines.append("```bash")
+        lines.append(
+            f"coord test --passed {parent_assignment_id}"
+            "                      # if the suite passed"
+        )
+        lines.append(
+            f'coord test --fail --reason "<one-line reason>" '
+            f"{parent_assignment_id}   # if it failed"
+        )
+        lines.append("```")
+        lines.append("")
+        lines.append(
+            "That id is the WORK assignment being tested, not your own. Skip "
+            "this command entirely for a `baseline-red` verdict (it has no "
+            "flag — the marker line is the whole signal), and if `coord` "
+            "isn't on your PATH or errors, just make sure the marker line is "
+            "printed."
+        )
     return "\n".join(lines)
 
 
@@ -920,6 +981,7 @@ def dispatch_smoke(
             timeout_seconds=smoke_cfg.timeout_seconds,
             is_worker=choice.is_worker,
             command_source=resolved,
+            parent_assignment_id=completed.assignment_id,
         )
 
         # #2168: pin the Test stage's model to avoid the agent falling

@@ -547,3 +547,120 @@ class TestSmokeBaselineRedParser:
     def test_nonexistent_log_returns_none(self, tmp_path: Path) -> None:
         from coord.progress import parse_smoke_baseline_red_from_log
         assert parse_smoke_baseline_red_from_log(tmp_path / "ghost.log") is None
+
+
+class TestSmokeVerdictParser:
+    """#2244: `SMOKE: pass` / `SMOKE: fail` are parsed the way `SMOKE:
+    baseline-red` already was. Until this they had NO parser at all — three
+    modules' comments described them as the worker's verdict signal while the
+    verdict was silently taken from the session exit code, which a `claude -p`
+    worker cannot control."""
+
+    def _log(self, tmp_path: Path, text: str) -> Path:
+        log = tmp_path / "worker.log"
+        log.write_text(text, encoding="utf-8")
+        return log
+
+    def test_parses_pass(self, tmp_path: Path) -> None:
+        from coord.progress import parse_smoke_verdict_from_log
+        v = parse_smoke_verdict_from_log(
+            self._log(tmp_path, "9911 passed in 662s\nSMOKE: pass\n")
+        )
+        assert v is not None and v.kind == "pass" and v.reason == ""
+
+    def test_parses_fail_with_reason(self, tmp_path: Path) -> None:
+        from coord.progress import parse_smoke_verdict_from_log
+        v = parse_smoke_verdict_from_log(
+            self._log(tmp_path, "SMOKE: fail 5 failed + 3 errors\n")
+        )
+        assert v is not None and v.kind == "fail"
+        assert v.reason == "5 failed + 3 errors"
+
+    def test_parses_baseline_red(self, tmp_path: Path) -> None:
+        from coord.progress import parse_smoke_verdict_from_log
+        v = parse_smoke_verdict_from_log(
+            self._log(tmp_path, "SMOKE: baseline-red all 6 reproduce on main\n")
+        )
+        assert v is not None and v.kind == "baseline-red"
+        assert v.reason == "all 6 reproduce on main"
+
+    def test_accepts_inflections(self, tmp_path: Path) -> None:
+        """The marker is written by a language model; `SMOKE: failed` must
+        not silently degrade a real failure to 'no verdict'."""
+        from coord.progress import parse_smoke_verdict_from_log
+        v = parse_smoke_verdict_from_log(
+            self._log(tmp_path, "SMOKE: failed one test broke\n")
+        )
+        assert v is not None and v.kind == "fail"
+        v = parse_smoke_verdict_from_log(
+            self._log(tmp_path, "SMOKE: passed\n")
+        )
+        assert v is not None and v.kind == "pass"
+
+    def test_no_marker_returns_none_not_pass(self, tmp_path: Path) -> None:
+        """Absent is absent. The caller fails closed on it — this is the
+        whole point of #2244."""
+        from coord.progress import parse_smoke_verdict_from_log
+        assert parse_smoke_verdict_from_log(
+            self._log(tmp_path, "9911 passed, 18 skipped in 662.70s\n")
+        ) is None
+
+    def test_not_fooled_by_mid_line_mention(self, tmp_path: Path) -> None:
+        from coord.progress import parse_smoke_verdict_from_log
+        assert parse_smoke_verdict_from_log(
+            self._log(
+                tmp_path,
+                "The instructions say to print `SMOKE: pass` when green.\n"
+                "E   assert 'SMOKE: fail' in prompt\n",
+            )
+        ) is None
+
+    def test_last_verdict_wins_across_kinds(self, tmp_path: Path) -> None:
+        """A worker that corrects itself means its FINAL line."""
+        from coord.progress import parse_smoke_verdict_from_log
+        v = parse_smoke_verdict_from_log(
+            self._log(
+                tmp_path,
+                "SMOKE: baseline-red looked environmental\n"
+                "SMOKE: fail re-ran on the merge-base: only ours fail\n",
+            )
+        )
+        assert v is not None and v.kind == "fail"
+
+    def test_reads_marker_echoed_from_a_bash_tool_call(
+        self, tmp_path: Path,
+    ) -> None:
+        """The #2230 shape: the verdict never appears in an assistant TEXT
+        block — the worker echoes it from a Bash tool call, so it lives in
+        the tool_use input and the tool_result. An assistant-text-only decode
+        (what every other parser here does) sees an empty transcript."""
+        from coord.progress import parse_smoke_verdict_from_log
+        log = self._log(
+            tmp_path,
+            '{"type":"assistant","message":{"content":[{"type":"tool_use",'
+            '"name":"Bash","input":{"command":"echo \\"SMOKE: fail 5 failed'
+            '\\" >&2; exit 1"}}]}}\n'
+            '{"type":"user","message":{"content":[{"type":"tool_result",'
+            '"content":"SMOKE: fail 5 failed"}]}}\n',
+        )
+        v = parse_smoke_verdict_from_log(log)
+        assert v is not None and v.kind == "fail"
+        assert v.reason == "5 failed"
+
+    def test_briefing_echo_in_a_user_prompt_cannot_forge_a_verdict(
+        self, tmp_path: Path,
+    ) -> None:
+        """The initial prompt quotes all three marker names. Reading a user
+        event's plain-string content back would let the coordinator's own
+        briefing certify the branch."""
+        from coord.progress import parse_smoke_verdict_from_log
+        log = self._log(
+            tmp_path,
+            '{"type":"user","message":{"content":"Report your verdict:\\n'
+            'SMOKE: pass\\nor\\nSMOKE: fail <reason>"}}\n',
+        )
+        assert parse_smoke_verdict_from_log(log) is None
+
+    def test_nonexistent_log_returns_none(self, tmp_path: Path) -> None:
+        from coord.progress import parse_smoke_verdict_from_log
+        assert parse_smoke_verdict_from_log(tmp_path / "ghost.log") is None

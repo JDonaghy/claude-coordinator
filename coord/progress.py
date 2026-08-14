@@ -46,16 +46,54 @@ _SMOKE_NONE_RE = re.compile(
 )
 _SMOKE_BULLET_RE = re.compile(r"^\s*[-*]\s+(.+?)\s*$")
 
-# #2170: the headless Test-stage smoke agent (`coord.smoke.SMOKE_SYSTEM_PROMPT`)
-# prints this line instead of `SMOKE: fail` when the smoke command's own
-# failures reproduce identically on the merge-base — a red BASELINE, not a
-# branch failure. Line-anchored, mirroring `coord.revalidate`'s
-# `is_baseline_red_failure` marker discipline: never a bare substring search,
-# so an unrelated line that merely mentions "SMOKE: baseline-red" mid-sentence
-# doesn't false-positive.
-_SMOKE_BASELINE_RED_RE = re.compile(
-    r"^SMOKE:\s*baseline-red[ \t]*(.*)$", re.MULTILINE | re.IGNORECASE,
+# The three verdict markers the headless Test-stage smoke agent is told to
+# print (`coord.smoke.SMOKE_SYSTEM_PROMPT`):
+#
+#   * `SMOKE: pass`
+#   * `SMOKE: fail <reason>`
+#   * `SMOKE: baseline-red <reason>` — #2170: the smoke command's own failures
+#     reproduce identically on the merge-base, so this is a statement about
+#     the MACHINE, not the branch.
+#
+# #2170 parsed only `baseline-red`; #2244 parses all three. Before that, the
+# pass/fail verdict was taken from the session exit code instead — but a
+# `claude -p` worker CANNOT signal through its exit code (an `exit 1` inside a
+# Bash tool call ends that tool call, not the session, which still ends
+# `end_turn` and exits 0). So a smoke run that found five real failures and
+# printed `SMOKE: fail` was recorded as `test_state=passed`: the whole
+# Test-green/CI-red class (#2091, #2182, #2143, #2230).
+#
+# Line-anchored, mirroring `coord.revalidate`'s `is_baseline_red_failure`
+# marker discipline: never a bare substring search, so an assertion message,
+# a briefing quote, or a prose sentence that merely mentions "SMOKE: fail"
+# mid-line can't forge a verdict. Common inflections (`passed`, `failed`) are
+# accepted because the marker is written by a language model, and rejecting
+# `SMOKE: failed` would silently downgrade a real failure to "no verdict".
+_SMOKE_VERDICT_RE = re.compile(
+    r"^SMOKE:[ \t]*(baseline-red|pass(?:ed)?|fail(?:ed|ure|ing)?)\b[ \t]*(.*)$",
+    re.MULTILINE | re.IGNORECASE,
 )
+
+
+#: #2244: `echo "SMOKE: fail <reason>"` inside a Bash tool call — the way the
+#: marker is most often actually emitted. Captures the quoted literal so it
+#: can be re-anchored as its own line (see `_smoke_verdict_texts_from_event`).
+_ECHOED_SMOKE_RE = re.compile(
+    r"""(?:^|[\n;&|]\s*)(?:echo|printf)\s+(?:-[eEn]+\s+)?["'](SMOKE:[^"']*)["']""",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class SmokeVerdict:
+    """#2244: a smoke worker's self-reported verdict line.
+
+    ``kind`` is normalised to exactly one of ``"pass"``, ``"fail"`` or
+    ``"baseline-red"``; ``reason`` is the (possibly empty) trailing text.
+    """
+
+    kind: str
+    reason: str = ""
 
 
 @dataclass
@@ -422,30 +460,108 @@ def parse_completion_summary_from_agent(
     return _extract_completion_summary_from_text(text)
 
 
-def _extract_smoke_baseline_red_from_text(text: str) -> str | None:
-    """#2170: pull the last `SMOKE: baseline-red <reason>` line out of *text*.
+def _extract_smoke_verdict_from_text(text: str) -> "SmokeVerdict | None":
+    """#2244: pull the last `SMOKE: pass|fail|baseline-red <reason>` line out
+    of *text*.
 
-    Returns the reason string (possibly ``""`` if the agent gave none), or
-    ``None`` if no such line is present — the same "None means absent"
-    contract as :func:`_extract_completion_summary_from_text`. Picks the LAST
-    match, matching every other block-extraction parser in this module, in
-    case the agent restates its verdict.
+    Returns ``None`` when the worker printed no verdict line at all — the same
+    "None means absent" contract as every other extractor here. Absent is NOT
+    a pass: the caller (`coord.notify`) fails closed on it.
+
+    Picks the LAST match of ANY kind, matching every other block-extraction
+    parser in this module: a worker that restates its verdict (or corrects
+    itself — "I said baseline-red, but re-running shows a real failure")
+    means the final line, not the first.
     """
-    matches = list(_SMOKE_BASELINE_RED_RE.finditer(text))
+    matches = list(_SMOKE_VERDICT_RE.finditer(text))
     if not matches:
         return None
-    return matches[-1].group(1).strip()
+    raw_kind = matches[-1].group(1).lower()
+    if raw_kind.startswith("baseline"):
+        kind = "baseline-red"
+    elif raw_kind.startswith("pass"):
+        kind = "pass"
+    else:
+        kind = "fail"
+    return SmokeVerdict(kind=kind, reason=matches[-1].group(2).strip())
 
 
-def parse_smoke_baseline_red_from_log(
-    log_path: str | Path, tail_bytes: int = 65_536,
-) -> str | None:
-    """#2170: read the tail of *log_path* and extract a `SMOKE: baseline-red`
-    verdict line, if the worker printed one.
+def _smoke_verdict_texts_from_event(event: object) -> list[str]:
+    """#2244: every place a `SMOKE:` verdict line can appear in ONE
+    stream-json event.
 
-    Handles both stream-json logs (decodes assistant text events first) and
-    legacy plain-text logs, exactly like :func:`parse_smoke_tests_from_log`.
+    A smoke worker rarely says its verdict in prose — the log this issue was
+    filed from ends with the worker running
+
+        echo "SMOKE: fail 5 failed + 3 errors ..." >&2; exit 1
+
+    in a Bash **tool call**. That text lives in the assistant event's
+    ``tool_use`` input and again in the following ``tool_result``; it is in no
+    assistant *text* block at all, so the assistant-text-only decode every
+    other parser in this module uses would see an empty transcript and report
+    "no verdict" for a run that clearly stated one. Hence all four sources:
+
+    * assistant ``text`` blocks (the worker states the verdict in prose),
+    * assistant ``tool_use`` Bash ``command`` strings (it echoes it),
+    * ``tool_result`` payloads (what the command actually printed),
+    * the final ``result`` event's text.
+
+    Deliberately NOT included: a ``user`` event's plain-string content. That
+    is the initial briefing, which quotes the marker names as instructions —
+    reading it back would let the coordinator's own prompt forge a verdict.
+    (Backtick-quoting in the prompt already defeats the line anchor, but not
+    depending on that is cheaper than depending on it.)
     """
+    from coord.worker_events import _iter_content_blocks  # noqa: PLC0415
+
+    raw = getattr(event, "raw", None) or {}
+    etype = getattr(event, "type", "")
+    out: list[str] = []
+
+    if etype == "result":
+        result = raw.get("result")
+        if isinstance(result, str):
+            out.append(result)
+        return out
+
+    if etype not in ("assistant", "user"):
+        return out
+
+    message = raw.get("message") or {}
+    for block in _iter_content_blocks(message):
+        btype = block.get("type")
+        if btype == "text":
+            txt = block.get("text")
+            if isinstance(txt, str):
+                out.append(txt)
+        elif btype == "tool_use":
+            command = (block.get("input") or {}).get("command") \
+                if isinstance(block.get("input"), dict) else None
+            if isinstance(command, str):
+                out.append(command)
+                # `echo "SMOKE: fail ..."` puts the marker mid-line inside a
+                # shell command, where the line anchor can't see it. The
+                # command's own OUTPUT (the tool_result above) normally
+                # carries it properly anchored, but stderr redirection and
+                # truncated results make that less than certain — so lift the
+                # echoed literal out too. Only a quoted argument to
+                # echo/printf qualifies; nothing else in a command line can be
+                # mistaken for the worker's own verdict.
+                out.extend(_ECHOED_SMOKE_RE.findall(command))
+        elif btype == "tool_result":
+            content = block.get("content")
+            if isinstance(content, str):
+                out.append(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        out.append(part["text"])
+    return out
+
+
+def _smoke_text_from_log(log_path: str | Path, tail_bytes: int) -> str | None:
+    """Read a worker log as plain text, decoding stream-json events first when
+    that's what it is. ``None`` on any read failure."""
     p = Path(log_path)
     if not p.exists():
         return None
@@ -453,20 +569,18 @@ def parse_smoke_baseline_red_from_log(
     from coord.worker_events import is_stream_json  # noqa: PLC0415
 
     if is_stream_json(p):
-        from coord.worker_events import _assistant_text, parse_event  # noqa: PLC0415
+        from coord.worker_events import parse_event  # noqa: PLC0415
         texts: list[str] = []
         try:
             with open(p, encoding="utf-8", errors="replace") as f:
                 for line in f:
                     event = parse_event(line.rstrip("\n"))
-                    if event is None or event.type != "assistant":
+                    if event is None:
                         continue
-                    t = _assistant_text(event)
-                    if t:
-                        texts.append(t)
+                    texts.extend(_smoke_verdict_texts_from_event(event))
         except OSError:
             return None
-        return _extract_smoke_baseline_red_from_text("\n".join(texts))
+        return "\n".join(texts)
 
     try:
         size = p.stat().st_size
@@ -474,25 +588,16 @@ def parse_smoke_baseline_red_from_log(
             if size > tail_bytes:
                 f.seek(size - tail_bytes)
                 f.readline()  # skip partial line
-            text = f.read()
+            return f.read()
     except OSError:
         return None
-    return _extract_smoke_baseline_red_from_text(text)
 
 
-def parse_smoke_baseline_red_from_agent(
-    host: str,
-    assignment_id: str,
-    port: int = 7433,
-    timeout: float = 15.0,
+def _smoke_text_from_agent(
+    host: str, assignment_id: str, port: int, timeout: float,
 ) -> str | None:
-    """#2170: fetch a worker's log via the agent's ``/logs/<id>`` endpoint and
-    extract a `SMOKE: baseline-red` verdict line.
-
-    Use this instead of :func:`parse_smoke_baseline_red_from_log` when the
-    worker ran on a remote agent and the log isn't on the coordinator's local
-    filesystem. Mirrors :func:`parse_smoke_tests_from_agent`.
-    """
+    """Fetch a worker log through the agent's ``/logs/<id>`` endpoint and
+    return it as plain text (stream-json decoded). ``None`` on any failure."""
     import httpx  # noqa: PLC0415
 
     url = f"http://{host}:{port}/logs/{assignment_id}"
@@ -513,19 +618,91 @@ def parse_smoke_baseline_red_from_agent(
         stream_json = stripped.startswith("{")
         break
 
-    if stream_json:
-        from coord.worker_events import _assistant_text, parse_event  # noqa: PLC0415
-        decoded: list[str] = []
-        for line in text.splitlines():
-            event = parse_event(line.rstrip("\n"))
-            if event is None or event.type != "assistant":
-                continue
-            t = _assistant_text(event)
-            if t:
-                decoded.append(t)
-        return _extract_smoke_baseline_red_from_text("\n".join(decoded))
+    if not stream_json:
+        return text
 
-    return _extract_smoke_baseline_red_from_text(text)
+    from coord.worker_events import parse_event  # noqa: PLC0415
+    decoded: list[str] = []
+    for line in text.splitlines():
+        event = parse_event(line.rstrip("\n"))
+        if event is None:
+            continue
+        decoded.extend(_smoke_verdict_texts_from_event(event))
+    return "\n".join(decoded)
+
+
+def parse_smoke_verdict_from_log(
+    log_path: str | Path, tail_bytes: int = 65_536,
+) -> "SmokeVerdict | None":
+    """#2244: read the tail of *log_path* and extract the worker's
+    `SMOKE: pass|fail|baseline-red` verdict line, if it printed one.
+
+    Handles both stream-json logs (decoded by
+    :func:`_smoke_verdict_texts_from_event`, which looks in tool calls and
+    tool results as well as assistant prose) and legacy plain-text logs.
+    ``None`` means "no verdict in the transcript" — never "passed".
+    """
+    text = _smoke_text_from_log(log_path, tail_bytes)
+    if text is None:
+        return None
+    return _extract_smoke_verdict_from_text(text)
+
+
+def parse_smoke_verdict_from_agent(
+    host: str,
+    assignment_id: str,
+    port: int = 7433,
+    timeout: float = 15.0,
+) -> "SmokeVerdict | None":
+    """#2244: fetch a worker's log via the agent's ``/logs/<id>`` endpoint and
+    extract its `SMOKE:` verdict line.
+
+    Use this instead of :func:`parse_smoke_verdict_from_log` when the worker
+    ran on a remote agent and the log isn't on the coordinator's local
+    filesystem. Mirrors :func:`parse_smoke_tests_from_agent`.
+    """
+    text = _smoke_text_from_agent(host, assignment_id, port, timeout)
+    if text is None:
+        return None
+    return _extract_smoke_verdict_from_text(text)
+
+
+def _extract_smoke_baseline_red_from_text(text: str) -> str | None:
+    """#2170: the baseline-red reason from *text*, or ``None`` if the last
+    `SMOKE:` verdict line wasn't a baseline-red one.
+
+    Kept as the narrow #2170 accessor on top of the #2244 general parser, so
+    the two can never disagree about which line is the verdict.
+    """
+    verdict = _extract_smoke_verdict_from_text(text)
+    if verdict is None or verdict.kind != "baseline-red":
+        return None
+    return verdict.reason
+
+
+def parse_smoke_baseline_red_from_log(
+    log_path: str | Path, tail_bytes: int = 65_536,
+) -> str | None:
+    """#2170: read the tail of *log_path* and extract a `SMOKE: baseline-red`
+    verdict line, if the worker printed one."""
+    verdict = parse_smoke_verdict_from_log(log_path, tail_bytes)
+    if verdict is None or verdict.kind != "baseline-red":
+        return None
+    return verdict.reason
+
+
+def parse_smoke_baseline_red_from_agent(
+    host: str,
+    assignment_id: str,
+    port: int = 7433,
+    timeout: float = 15.0,
+) -> str | None:
+    """#2170: fetch a worker's log via the agent's ``/logs/<id>`` endpoint and
+    extract a `SMOKE: baseline-red` verdict line."""
+    verdict = parse_smoke_verdict_from_agent(host, assignment_id, port, timeout)
+    if verdict is None or verdict.kind != "baseline-red":
+        return None
+    return verdict.reason
 
 
 def _detect_warnings(progress: WorkerProgress, all_updates: list[str]) -> None:
