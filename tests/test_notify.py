@@ -1586,9 +1586,15 @@ class TestSmokeCompletionVerdict:
         return transition, record, entry
 
     def test_passing_smoke_sets_parent_test_state_passed(
-        self, coord_db
+        self, coord_db, tmp_path
     ) -> None:
-        """Exit code 0 → parent work row test_state='passed'."""
+        """`SMOKE: pass` → parent work row test_state='passed'.
+
+        #2244: the marker is what certifies, not the exit code — see
+        :meth:`TestSmokeVerdictFailsClosed
+        .test_clean_exit_without_verdict_records_no_verdict` for the other
+        half of that contract.
+        """
         from coord.notify import post_transition  # noqa: PLC0415
         from coord.state import get_connection  # noqa: PLC0415
 
@@ -1597,6 +1603,12 @@ class TestSmokeCompletionVerdict:
         transition, record, entry = self._make_transition_and_entry(
             "smoke-1", exit_code=0
         )
+        log_path = tmp_path / "smoke-1.log"
+        log_path.write_text(
+            "9911 passed, 18 skipped in 662.70s\nSMOKE: pass\n", encoding="utf-8",
+        )
+        entry = dict(entry)
+        entry["log_path"] = str(log_path)
 
         with (
             patch("coord.notify.post_completion"),
@@ -1615,7 +1627,8 @@ class TestSmokeCompletionVerdict:
         ).fetchone()
         assert row is not None, "work assignment must exist in DB"
         assert row["test_state"] == "passed", (
-            f"expected test_state='passed' for exit_code=0, got {row['test_state']!r}"
+            "expected test_state='passed' for a `SMOKE: pass` marker, got "
+            f"{row['test_state']!r}"
         )
         # #1384: the legacy smoke_test mirror is derived by the writer.
         assert row["smoke_test"] == "pass", (
@@ -1814,6 +1827,209 @@ class TestSmokeCompletionBaselineRedVerdict(TestSmokeCompletionVerdict):
         assert row is not None, "work assignment must exist in DB"
         assert row["test_state"] == "failed"
         assert row["smoke_test"] == "fail"
+
+
+class TestSmokeVerdictFailsClosed(TestSmokeCompletionVerdict):
+    """#2244: the headless smoke verdict comes from the worker's `SMOKE:`
+    marker and FAILS CLOSED — a `claude -p` session exits 0 whatever the
+    suite did, so `exit_code == 0` must never mean "the suite passed".
+
+    Subclasses ``TestSmokeCompletionVerdict`` for its
+    ``_record_work``/``_record_smoke``/``_make_transition_and_entry``
+    helpers, like the #2170 class above.
+    """
+
+    #: The shape of assignment 8de33c80fcd0's transcript (2026-08-14,
+    #: claude-coordinator#2230): the full suite ran, five tests really failed,
+    #: the worker echoed `SMOKE: fail` from a Bash tool call and "exited 1" —
+    #: and the session still ended `end_turn`, so `claude -p` exited 0 and the
+    #: parent was recorded `test_state=passed`. CI then found the identical
+    #: five failures and blocked the merge.
+    _REAL_FAILURE_LOG = (
+        '# agent=elitebook argv=claude -p\n'
+        '{"type":"assistant","message":{"content":[{"type":"text",'
+        '"text":"Running the full suite now."}]}}\n'
+        '{"type":"assistant","message":{"content":[{"type":"tool_use",'
+        '"name":"Bash","input":{"command":"pytest -q -n auto"}}]}}\n'
+        '{"type":"user","message":{"content":[{"type":"tool_result",'
+        '"content":"FAILED tests/test_board_fixture.py::test_board_sample'
+        '_fixture_is_up_to_date\\nFAILED tests/test_openapi.py::test_serve'
+        '_openapi_board_schema_validates_golden_fixture\\n5 failed, 9911 '
+        'passed, 18 skipped, 3 errors in 662.70s\\nRESULT: FAIL (python)"}]}}\n'
+        '{"type":"assistant","message":{"content":[{"type":"tool_use",'
+        '"name":"Bash","input":{"command":"echo \\"SMOKE: fail 5 failed + 3 '
+        'errors in the full suite\\" >&2; exit 1"}}]}}\n'
+        '{"type":"user","message":{"content":[{"type":"tool_result",'
+        '"content":"SMOKE: fail 5 failed + 3 errors in the full suite",'
+        '"is_error":true}]}}\n'
+        '{"type":"result","subtype":"success","result":"The suite failed."}\n'
+    )
+
+    def _reap(self, transition, record, entry) -> None:
+        from coord.notify import post_transition  # noqa: PLC0415
+
+        with (
+            patch("coord.notify.post_completion"),
+            patch("coord.notify.mark_notified"),
+            patch("coord.notify._capture_cost"),
+            patch("coord.notify._capture_smoke_tests"),
+            patch("coord.notify._capture_completion_summary"),
+            patch("coord.notify._capture_claude_session_id"),
+        ):
+            post_transition(transition, record, entry)
+
+    def _setup(self, work_id: str, smoke_id: str, *, exit_code: int, log: str | None,
+               tmp_path=None) -> tuple:
+        self._record_work(work_id)
+        self._record_smoke(smoke_id, parent_id=work_id)
+        transition, record, entry = self._make_transition_and_entry(
+            smoke_id, exit_code=exit_code
+        )
+        record = dict(record)
+        record["review_of_assignment_id"] = work_id
+        entry = dict(entry)
+        if log is not None:
+            log_path = tmp_path / f"{smoke_id}.log"
+            log_path.write_text(log, encoding="utf-8")
+            entry["log_path"] = str(log_path)
+        return transition, record, entry
+
+    @staticmethod
+    def _row(work_id: str):
+        from coord.state import get_connection  # noqa: PLC0415
+
+        return get_connection().execute(
+            "SELECT test_state, smoke_test, test_reason FROM assignments "
+            "WHERE assignment_id=?",
+            (work_id,),
+        ).fetchone()
+
+    def test_replayed_2230_log_records_failed_despite_zero_exit(
+        self, coord_db, tmp_path
+    ) -> None:
+        """THE regression: a real full-suite failure whose session exited 0.
+
+        End-to-end through the reap path, not a unit test of the parser.
+        """
+        transition, record, entry = self._setup(
+            "work-2244a", "smoke-2244a", exit_code=0,
+            log=self._REAL_FAILURE_LOG, tmp_path=tmp_path,
+        )
+        self._reap(transition, record, entry)
+
+        row = self._row("work-2244a")
+        assert row is not None
+        assert row["test_state"] == "failed", (
+            "a smoke worker that printed `SMOKE: fail` must record "
+            f"test_state='failed' even on session exit 0, got {row['test_state']!r}"
+        )
+        # #1384: `coord fix` gates on this mirror — without it the fail→fix
+        # path is a dead end.
+        assert row["smoke_test"] == "fail"
+        assert "5 failed" in (row["test_reason"] or "")
+
+    def test_clean_exit_without_verdict_records_no_verdict(
+        self, coord_db, tmp_path
+    ) -> None:
+        """No parseable marker + exit 0 → NO verdict. Never 'passed'."""
+        transition, record, entry = self._setup(
+            "work-2244b", "smoke-2244b", exit_code=0,
+            log='{"type":"assistant","message":{"content":[{"type":"text",'
+                '"text":"I ran the suite and it looked fine."}]}}\n',
+            tmp_path=tmp_path,
+        )
+        with patch("coord.notify._agent_host", return_value=None):
+            self._reap(transition, record, entry)
+
+        row = self._row("work-2244b")
+        assert row is not None
+        assert row["test_state"] is None, (
+            "a mute smoke run must leave the gate unsatisfied, got "
+            f"{row['test_state']!r}"
+        )
+        assert row["smoke_test"] is None
+        assert "no-verdict (#2244)" in (row["test_reason"] or "")
+
+    def test_missing_log_records_no_verdict(self, coord_db) -> None:
+        """No transcript to read at all is also NOT a pass — the pre-#2244
+        default (`exit_code == 0` → passed) fired hardest exactly here."""
+        transition, record, entry = self._setup(
+            "work-2244c", "smoke-2244c", exit_code=0, log=None,
+        )
+        with patch("coord.notify._agent_host", return_value=None):
+            self._reap(transition, record, entry)
+
+        row = self._row("work-2244c")
+        assert row is not None
+        assert row["test_state"] is None
+        assert "no-verdict (#2244)" in (row["test_reason"] or "")
+
+    def test_second_mute_smoke_parks_the_row(self, coord_db, tmp_path) -> None:
+        """One mute run clears for a re-dispatch; a second parks 'blocked' so
+        the auto-queue can't re-dispatch forever."""
+        transition, record, entry = self._setup(
+            "work-2244d", "smoke-2244d", exit_code=0, log=None,
+        )
+        with patch("coord.notify._agent_host", return_value=None):
+            self._reap(transition, record, entry)
+            assert self._row("work-2244d")["test_state"] is None
+
+            # A second Test stage on the same work row, equally mute.
+            self._record_smoke("smoke-2244d2", parent_id="work-2244d")
+            transition2, record2, entry2 = self._make_transition_and_entry(
+                "smoke-2244d2", exit_code=0
+            )
+            record2 = dict(record2)
+            record2["review_of_assignment_id"] = "work-2244d"
+            self._reap(transition2, record2, entry2)
+
+        row = self._row("work-2244d")
+        assert row["test_state"] == "blocked", (
+            "a second consecutive mute Test stage must park the row, got "
+            f"{row['test_state']!r}"
+        )
+        assert row["smoke_test"] is None
+
+    def test_baseline_red_marker_with_zero_exit_still_skips(
+        self, coord_db, tmp_path
+    ) -> None:
+        """#2170 keeps working on the exit-0 path too — before #2244 the
+        baseline-red marker was only consulted for a NON-zero exit, which a
+        `claude -p` worker can never produce."""
+        transition, record, entry = self._setup(
+            "work-2244e", "smoke-2244e", exit_code=0,
+            log="RESULT: BASELINE-RED (python)\n"
+                "SMOKE: baseline-red all 6 failures reproduce on origin/main\n",
+            tmp_path=tmp_path,
+        )
+        self._reap(transition, record, entry)
+
+        row = self._row("work-2244e")
+        assert row["test_state"] == "skipped"
+        assert row["smoke_test"] != "fail"
+        assert "baseline-red" in (row["test_reason"] or "").lower()
+
+    def test_worker_recorded_verdict_is_not_clobbered(
+        self, coord_db, tmp_path
+    ) -> None:
+        """#2217 belt: the worker's own `coord test --fail <parent>` write is
+        authoritative — a mute transcript must not overwrite (or clear) it."""
+        from coord.state import record_test_verdict  # noqa: PLC0415
+
+        transition, record, entry = self._setup(
+            "work-2244f", "smoke-2244f", exit_code=0, log=None,
+        )
+        record_test_verdict(
+            assignment_id="work-2244f",
+            test_state="failed",
+            test_reason="worker: 5 failed",
+        )
+        with patch("coord.notify._agent_host", return_value=None):
+            self._reap(transition, record, entry)
+
+        row = self._row("work-2244f")
+        assert row["test_state"] == "failed"
+        assert row["test_reason"] == "worker: 5 failed"
 
 
 # ── #1176 review: fix-completion → re-review handoff type coverage ─────────

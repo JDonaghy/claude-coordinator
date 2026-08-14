@@ -2256,6 +2256,46 @@ def load_assignment_test_reason(assignment_id: str) -> str | None:
     return row["test_reason"] if hasattr(row, "keys") else row[0]
 
 
+def load_assignment_test_state(assignment_id: str) -> str | None:
+    """#2244: the current ``test_state`` for one assignment.
+
+    The single-row read that lets `coord notify`'s smoke reap tell "the
+    Test-stage worker already recorded its own verdict through `coord test`
+    (#2217)" from "nothing has resolved this row yet" — without pulling the
+    whole board (a `/board` read is the #2211 latency trap).
+
+    Same daemon-first, local-fallback routing as
+    :func:`load_assignment_test_reason`. Returns ``None`` when the row is
+    absent, the column is NULL (no verdict yet), or a remote read failed — all
+    three mean "no verdict I can see", and every caller must treat that as
+    "not certified", never as a pass.
+    """
+    if not assignment_id:
+        return None
+    svc = _board_service()
+    if svc is not None:
+        try:
+            from coord.client import fetch_assignment  # noqa: PLC0415
+
+            row = fetch_assignment(svc, assignment_id)
+            if row is not None:
+                return row.get("test_state")
+            return None
+        except Exception:  # noqa: BLE001 — degraded fallback, never blocking
+            return None
+    try:
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT test_state FROM assignments WHERE assignment_id=?",
+            (assignment_id,),
+        ).fetchone()
+    except Exception:  # noqa: BLE001
+        return None
+    if row is None:
+        return None
+    return row["test_state"] if hasattr(row, "keys") else row[0]
+
+
 def _load_assignment_review_findings_local(
     assignment_id: str,
 ) -> tuple[str, str] | None:

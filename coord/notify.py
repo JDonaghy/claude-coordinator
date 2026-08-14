@@ -12,6 +12,7 @@ import httpx
 
 if TYPE_CHECKING:
     from coord.models import Assignment, Board
+    from coord.progress import SmokeVerdict
 
 log = logging.getLogger(__name__)
 
@@ -1721,48 +1722,214 @@ def _capture_smoke_tests(transition: Transition, entry: dict) -> None:
         )
 
 
-def _smoke_baseline_red_reason(transition: Transition, entry: dict) -> str | None:
-    """#2170: look for a `SMOKE: baseline-red <reason>` line in the smoke
-    worker's transcript and return its reason text, or ``None`` if absent.
+def _smoke_worker_verdict(
+    transition: Transition, entry: dict,
+) -> SmokeVerdict | None:
+    """#2244: the smoke worker's own `SMOKE: pass|fail|baseline-red` verdict
+    line, or ``None`` if it never printed one.
 
     Same local-log-first, agent-endpoint-fallback discipline as
-    :func:`_capture_smoke_tests` — this is read-only (nothing persisted here;
-    the caller decides what to do with the reason), and best-effort: any
-    lookup failure is logged and treated as "no baseline-red line found",
-    which routes the caller to the ordinary `failed` verdict rather than
-    silently swallowing a genuine branch failure.
+    :func:`_capture_smoke_tests` — read-only (nothing persisted here; the
+    caller decides what the verdict means), and best-effort: any lookup
+    failure is logged and treated as "no verdict line found", which routes the
+    caller to its fail-CLOSED default rather than a fabricated pass.
+
+    This is the PRIMARY verdict channel for a headless Test stage. The session
+    exit code cannot be one: `claude -p` exits 0 whenever the session ends
+    normally, no matter what the suite did (an `exit 1` inside a Bash tool
+    call ends that tool call, not the session) — see #2244.
     """
     from coord.progress import (  # noqa: PLC0415
-        parse_smoke_baseline_red_from_agent,
-        parse_smoke_baseline_red_from_log,
+        parse_smoke_verdict_from_agent,
+        parse_smoke_verdict_from_log,
     )
 
-    reason: str | None = None
+    verdict: SmokeVerdict | None = None
     log_path = entry.get("log_path")
     if log_path:
         try:
-            reason = parse_smoke_baseline_red_from_log(Path(log_path))
+            verdict = parse_smoke_verdict_from_log(Path(log_path))
         except Exception as exc:  # noqa: BLE001
             log.debug(
-                "_smoke_baseline_red_reason: failed to parse local log for %s: %s",
+                "_smoke_worker_verdict: failed to parse local log for %s: %s",
                 transition.assignment_id, exc,
             )
 
-    if reason is None:
+    if verdict is None:
         host = _agent_host(transition.machine_name)
         if host:
             try:
-                reason = parse_smoke_baseline_red_from_agent(
+                verdict = parse_smoke_verdict_from_agent(
                     host, transition.assignment_id
                 )
             except Exception as exc:  # noqa: BLE001
                 log.debug(
-                    "_smoke_baseline_red_reason: failed to fetch from agent "
+                    "_smoke_worker_verdict: failed to fetch from agent "
                     "%s for %s: %s",
                     host, transition.assignment_id, exc,
                 )
 
-    return reason
+    return verdict
+
+
+#: #2244: the marker `_record_smoke_verdict` leaves in the parent's
+#: ``test_reason`` when a headless smoke produced no parseable verdict. Read
+#: back on the NEXT such reap to decide between "park for one automatic
+#: re-dispatch" and "block, an operator has to look" — see below.
+NO_SMOKE_VERDICT_MARKER = "no-verdict (#2244)"
+
+
+def _record_smoke_verdict(
+    transition: Transition, entry: dict, parent_id: str,
+) -> None:
+    """#2244: record the parent work row's Test verdict from a completed
+    headless smoke run — from the worker's `SMOKE:` marker, failing CLOSED.
+
+    Before this, the verdict was ``"passed"`` whenever the session exit code
+    was 0. For a `claude -p` smoke worker that exit code is not a signal at
+    all: `exit 1` inside a Bash tool call ends the tool call, the session
+    still ends ``end_turn``, and `claude -p` exits 0. Assignment
+    ``8de33c80fcd0`` ran the full suite, hit 5 real failures, printed
+    ``SMOKE: fail`` — and was recorded ``test_state=passed``. CI then found
+    the identical five failures and blocked the merge (#2230, and the same
+    shape in #2091/#2182/#2143).
+
+    Precedence, most authoritative first:
+
+    1. **A terminal verdict already on the row.** #2217 made
+       ``COORD_ASSIGNMENT_ID`` reachable from headless workers, so the smoke
+       worker is now told to call ``coord test --passed|--fail <parent>``
+       itself (`coord.smoke.build_smoke_briefing`). That write is
+       authoritative and this must never clobber it — `dispatch_smoke` stamps
+       ``"running"`` at dispatch, so anything terminal here came from the
+       worker.
+    2. **The worker's `SMOKE:` marker** — pass / fail / baseline-red (#2170).
+    3. **A non-zero session exit with no marker** — still ``failed``. Only
+       reachable for a non-`claude -p` smoke lane where the exit code IS the
+       signal; it stays fail-closed there.
+    4. **Nothing parseable at all** — record NO verdict. Never ``passed``:
+       that fallback is the whole defect. The row is cleared to ``NULL`` so
+       `dispatch_pending_smoke` re-dispatches a fresh Test stage (the #1605
+       environmental-death path does exactly this), and if a SECOND smoke
+       also comes back mute the row is parked ``"blocked"`` instead — the
+       same value `dispatch_smoke` uses for an unroutable stage, which stops
+       the auto-queue and waits for `coord diagnose --stage test --reset`
+       rather than re-dispatching forever.
+    """
+    from coord.state import (  # noqa: PLC0415
+        load_assignment_test_reason,
+        load_assignment_test_state,
+        record_test_verdict,
+    )
+
+    current_state = load_assignment_test_state(parent_id)
+    if current_state in ("passed", "failed", "skipped"):
+        log.info(
+            "smoke %s: parent %s already carries an authoritative test_state="
+            "%r (the worker recorded it via `coord test`, #2217) — leaving it "
+            "untouched.",
+            transition.assignment_id, parent_id, current_state,
+        )
+        return
+
+    verdict = _smoke_worker_verdict(transition, entry)
+    exit_code = transition.exit_code or 0
+
+    if verdict is not None and verdict.kind == "baseline-red":
+        # #2170: `skipped`, not `failed` — the merge gate treats a skipped
+        # Test stage as satisfied, and neither `coord fix` nor `coord drive`
+        # burns an attempt on breakage this branch did not cause.
+        record_test_verdict(
+            assignment_id=parent_id,
+            test_state="skipped",
+            test_reason=(
+                f"baseline-red (#2170): {verdict.reason}"
+                if verdict.reason
+                else "baseline-red (#2170): every failure reproduces "
+                "identically on the merge-base"
+            ),
+        )
+        return
+
+    if verdict is not None and verdict.kind == "fail":
+        # #1384: no `smoke_test=` argument needed — the writer
+        # (`state._record_test_verdict_local`) derives the legacy mirror from
+        # `test_state`, so a headless smoke FAILURE lands as
+        # test_state='failed' AND smoke_test='fail' and stays reachable from
+        # `coord fix`.
+        record_test_verdict(
+            assignment_id=parent_id,
+            test_state="failed",
+            test_reason=(
+                f"headless smoke: {verdict.reason}"
+                if verdict.reason
+                else "headless smoke reported SMOKE: fail"
+            ),
+        )
+        return
+
+    if verdict is not None and verdict.kind == "pass":
+        record_test_verdict(
+            assignment_id=parent_id,
+            test_state="passed",
+            test_reason="headless smoke",
+        )
+        return
+
+    if exit_code != 0:
+        record_test_verdict(
+            assignment_id=parent_id,
+            test_state="failed",
+            test_reason="headless smoke",
+        )
+        return
+
+    # No verdict line, clean session exit. NOT a pass.
+    previous_reason = load_assignment_test_reason(parent_id) or ""
+    already_mute_once = NO_SMOKE_VERDICT_MARKER in previous_reason
+    reason = (
+        f"{NO_SMOKE_VERDICT_MARKER}: the Test-stage worker "
+        f"{transition.assignment_id} ended without printing a verdict marker "
+        "line, and a `claude -p` exit code says only that the session ended — "
+        "it is not a suite result."
+    )
+    if already_mute_once:
+        # The same park value `dispatch_smoke` uses for an unroutable stage
+        # (#1672): every gate that wants "passed"/"skipped" keeps the merge
+        # shut, `dispatch_pending_smoke` stops re-dispatching, and no fix
+        # round is burned on a branch nothing has found fault with.
+        from coord.smoke import TEST_STATE_BLOCKED  # noqa: PLC0415
+
+        record_test_verdict(
+            assignment_id=parent_id,
+            test_state=TEST_STATE_BLOCKED,
+            test_reason=(
+                f"{reason} Second consecutive mute Test stage — parked instead "
+                "of re-dispatched. Recover with `coord diagnose <repo> <issue> "
+                "--stage test --reset`, or record the verdict by hand with "
+                f"`coord test --passed|--fail {parent_id}`."
+            ),
+        )
+        log.warning(
+            "smoke %s: no SMOKE: verdict in the transcript for the SECOND "
+            "time on parent %s — parking test_state='blocked' (#2244).",
+            transition.assignment_id, parent_id,
+        )
+        return
+
+    record_test_verdict(
+        assignment_id=parent_id,
+        test_state=None,
+        test_reason=(
+            f"{reason} Cleared for one automatic Test-stage re-dispatch; a "
+            "second mute run parks the row instead."
+        ),
+    )
+    log.warning(
+        "smoke %s: no SMOKE: verdict in the transcript — recording NO verdict "
+        "for parent %s (cleared for re-dispatch), never 'passed' (#2244).",
+        transition.assignment_id, parent_id,
+    )
 
 
 def _capture_cost(transition: Transition, entry: dict, record: dict | None = None) -> None:
@@ -2374,8 +2541,9 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
                 succeeded=True,
             )
     elif transition.event == EVENT_COMPLETION and assignment_type == "smoke":
-        # #1021: propagate the headless smoke exit code to the parent work
-        # row's Test verdict so the merge gate is satisfied automatically.
+        # #1021: propagate the headless smoke result to the parent work row's
+        # Test verdict so the merge gate is satisfied automatically. #2244:
+        # the RESULT is the worker's `SMOKE:` marker, not its exit code.
         post_completion(exit_code=transition.exit_code or 0, **common)
         mark_notified(
             transition.assignment_id,
@@ -2387,57 +2555,12 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
             # Guard: only auto-certify when the issue's test-mode is "auto"
             # or unset (no label).  A "smoke" label means the TUI offers an
             # interactive smoke agent — do NOT auto-certify here.
-            from coord.state import get_issue_test_mode, record_test_verdict  # noqa: PLC0415
+            from coord.state import get_issue_test_mode  # noqa: PLC0415
             test_mode = get_issue_test_mode(
                 transition.repo_name, transition.issue_number
             )
             if test_mode != "smoke":
-                exit_code = transition.exit_code or 0
-                if exit_code == 0:
-                    record_test_verdict(
-                        assignment_id=parent_id,
-                        test_state="passed",
-                        test_reason="headless smoke",
-                    )
-                else:
-                    # #2170: a non-zero smoke exit is not automatically the
-                    # branch's fault — check whether the dispatched agent
-                    # reported that the machine's own BASELINE is red (every
-                    # failure reproduces identically on the merge-base; see
-                    # `SMOKE_SYSTEM_PROMPT` step 4 in `coord.smoke`). The
-                    # marker is the signal, not the exit code, mirroring
-                    # `coord.revalidate.is_baseline_red_failure`'s discipline
-                    # — an arbitrary non-zero exit proves nothing on its own.
-                    baseline_red_reason = _smoke_baseline_red_reason(
-                        transition, entry
-                    )
-                    if baseline_red_reason is not None:
-                        # `skipped`, not `failed`: the merge gate treats a
-                        # skipped Test stage as satisfied, and neither
-                        # `coord fix` nor `coord drive` burns an attempt on
-                        # breakage this branch did not cause.
-                        record_test_verdict(
-                            assignment_id=parent_id,
-                            test_state="skipped",
-                            test_reason=(
-                                f"baseline-red (#2170): {baseline_red_reason}"
-                                if baseline_red_reason
-                                else "baseline-red (#2170): every failure "
-                                "reproduces identically on the merge-base"
-                            ),
-                        )
-                    else:
-                        # #1384: no `smoke_test=` argument needed — the
-                        # writer (`state._record_test_verdict_local`)
-                        # derives the legacy mirror from `test_state`, so a
-                        # headless smoke FAILURE lands as
-                        # test_state='failed' AND smoke_test='fail' and
-                        # stays reachable from `coord fix`.
-                        record_test_verdict(
-                            assignment_id=parent_id,
-                            test_state="failed",
-                            test_reason="headless smoke",
-                        )
+                _record_smoke_verdict(transition, entry, parent_id)
     elif transition.event == EVENT_FAILURE and assignment_type == "smoke":
         # #1605: the Test-stage WORKER itself died (a dead agent, a killed
         # process group, a terminal API error — anything short of the
