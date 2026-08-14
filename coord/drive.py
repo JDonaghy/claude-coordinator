@@ -413,6 +413,10 @@ class AcceptanceGateChecker(Protocol):
         issue_labels: tuple[str, ...],
     ) -> bool: ...
 
+    def has_authored_slice(
+        self, repo_name: str, milestone_number: int, issue_number: int,
+    ) -> bool: ...
+
 
 @dataclass
 class GitHubAcceptanceGateChecker:
@@ -477,6 +481,35 @@ class GitHubAcceptanceGateChecker:
             issue_labels=issue_labels,
         )
         return readiness.exempt
+
+    def has_authored_slice(
+        self, repo_name: str, milestone_number: int, issue_number: int,
+    ) -> bool:
+        """#2061: the AUTHORITATIVE answer to "has this issue's JIT slice
+        landed?" — the manifest on the repo's default branch, read via the
+        identical ``test_ids_for_issue`` check the #1138 hard gate
+        (:func:`coord.milestone_dispatch.issue_oracle_ready`) already
+        performs, exposed here as ``OracleReadiness.has_slice``.
+
+        :func:`_decide_acceptance_author` calls this — instead of trusting
+        the `type="test-author"` assignment row alone — at every point
+        where the row is about to be read as "nothing was authored": no
+        row yet, or a terminal (``failed``/``cancelled``/``advisory``/
+        ``done``) status with no branch commits. The assignment row is a
+        PROXY for this question; it can be stale (a drive that died
+        mid-run, a retry, or a #2020-mangled row) while an EARLIER attempt
+        already merged the slice. The manifest cannot lie about that: if
+        the slice is there, it landed, whatever the row says.
+        """
+        from coord.milestone_dispatch import issue_oracle_ready  # noqa: PLC0415
+
+        repo_cfg = self.config.repo(repo_name)
+        if repo_cfg is None:
+            return False
+        readiness = issue_oracle_ready(
+            repo_cfg, self.config, milestone_number, issue_number,
+        )
+        return readiness.has_slice
 
 
 @dataclass(frozen=True)
@@ -623,11 +656,47 @@ def _decide_acceptance_author(
     Landing that last step is what :func:`_decide_acceptance_landing` does,
     with the same bounded ``coord merge --only <aid>`` call
     :func:`_decide_merge` already makes for the work row.
+
+    **#2061 — the assignment row is a proxy, the manifest is the answer.**
+    Every branch below that would otherwise treat "no row" or "a terminal
+    row with no branch commits" as "nothing was authored" first asks
+    :func:`_slice_already_landed`, which reads the manifest on the repo's
+    default branch — the same ``test_ids_for_issue`` check the #1138 hard
+    gate performs. A drive retry re-dispatches this gate without knowing
+    whether an EARLIER attempt already merged the slice; the second author
+    then correctly does nothing (``DONE`` with zero commits, or a stale
+    row that never even started) and, pre-#2061, that correct no-op was
+    read as a terminal failure — killing a run whose slice was already
+    landed and whose real work was ready to dispatch (coord-portal#13).
     """
     aid = state.acceptance_author_aid
     status = state.acceptance_author_status
 
+    def _slice_already_landed() -> bool:
+        """#2061: the `type="test-author"` row above is a PROXY for "has
+        this issue's slice landed?" — a drive that died mid-run, a retry,
+        or a #2020-mangled row can leave it pointing at nothing (or at a
+        genuine failure) while an EARLIER attempt already merged the slice
+        from a previous run. Ask the AUTHORITATIVE question — the manifest
+        on the default branch, via :meth:`AcceptanceGateChecker.
+        has_authored_slice` — whenever the row is about to be read as
+        "nothing was authored": right before dispatching a fresh author,
+        and right before declaring a terminal, commit-less row a failure.
+        Never consulted for "" / "running" (still authoring — the slice
+        cannot be on the default branch yet) or "merged" (already the
+        strongest signal there is), so this costs one extra fetch at a
+        decision point, not one per poll tick.
+        """
+        return gate_checker.has_authored_slice(
+            state.repo, state.milestone_number, state.issue,
+        )
+
     if not aid:
+        # #2061: a retry (or a drive resuming after this run's own board
+        # row went missing/stale) must not re-dispatch an author for a
+        # slice that already landed from an earlier attempt.
+        if _slice_already_landed():
+            return None
         command = [
             "acceptance", "author", state.repo, str(oracle.tracking_issue),
             "--issue", str(state.issue),
@@ -671,6 +740,12 @@ def _decide_acceptance_author(
         return None
 
     if status == "failed":
+        # #2061: this row's FAILED status describes what happened to THIS
+        # author, not whether the issue's slice exists — a retry's row can
+        # fail (or simply be stale) while an earlier attempt already merged
+        # the slice it was about to re-author.
+        if _slice_already_landed():
+            return None
         return _die(
             f"acceptance author {aid} failed — inspect: coord log {aid} "
             f"--machine {state.acceptance_author_machine or machine}\n"
@@ -679,6 +754,8 @@ def _decide_acceptance_author(
         )
 
     if status == "cancelled":
+        if _slice_already_landed():
+            return None
         return _die(
             f"acceptance author {aid} was cancelled — re-dispatch by hand: "
             f"coord acceptance author {state.repo} {oracle.tracking_issue} "
@@ -700,6 +777,11 @@ def _decide_acceptance_author(
         branch = state.acceptance_author_branch
         probe = replace(state, work_branch=branch) if branch else state
         if not branch or not verifier.branch_has_commits(probe):
+            # #2061: a commit-less ADVISORY row IS what an earlier-landed
+            # slice's stale/retried author row looks like — check the
+            # manifest before declaring failure.
+            if _slice_already_landed():
+                return None
             return _die(
                 f"acceptance author {aid} exited ADVISORY with no commits on "
                 "its branch — nothing was authored, so there is no slice to "
@@ -741,6 +823,13 @@ def _decide_acceptance_author(
         branch = state.acceptance_author_branch
         probe = replace(state, work_branch=branch) if branch else state
         if not branch or not verifier.branch_has_commits(probe):
+            # #2061 (coord-portal#13): a re-dispatched author that lands in
+            # a world where the slice is ALREADY on the default branch
+            # correctly does nothing — DONE with zero commits — and that is
+            # not a failure to re-diagnose, it's the terminal case this
+            # whole gate exists to detect. Check the manifest before dying.
+            if _slice_already_landed():
+                return None
             branch_display = repr(branch) if branch else "(none)"
             return _die(
                 f"acceptance author {aid} exited DONE, but its branch "
