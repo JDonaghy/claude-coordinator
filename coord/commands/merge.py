@@ -76,6 +76,7 @@ def _apply_revalidation(items, board, config, gh_ops, *, dry_run: bool):
 
     recorded_any = False
     total_runs = 0
+    conflicted: list = []
     groups = _rv.group_candidates(candidates)
     for (repo_name, target_branch), group in groups:
         click.echo(
@@ -85,6 +86,7 @@ def _apply_revalidation(items, board, config, gh_ops, *, dry_run: bool):
         batch = _rv.revalidate_group(group, config, echo=click.echo)
         total_runs += batch.suite_runs
         recorded_any = recorded_any or bool(batch.recorded)
+        conflicted.extend(batch.conflicted)
         if not batch.composite.ok:
             # The composite's own failure report — stderr, as before.
             for line in _rv.format_failure(batch.composite):
@@ -99,6 +101,13 @@ def _apply_revalidation(items, board, config, gh_ops, *, dry_run: bool):
             f"  --revalidate: {total_runs} suite run(s) for "
             f"{len(candidates)} entry(ies)"
         )
+
+    # #2231: the composed run just PROVED these branches don't merge. That is
+    # not a staleness problem and re-testing can never resolve it — hand it to
+    # the mechanism built for it instead of formatting a diagnosis nobody acts
+    # on.
+    if conflicted:
+        _dispatch_revalidation_conflicts(conflicted, config, dry_run=dry_run)
 
     if not recorded_any:
         return board
@@ -247,6 +256,65 @@ def _reload_board_after_wait(board, *, dry_run: bool):
 
     refreshed = _load_board()
     return refreshed if refreshed is not None else _Board(active=[], completed=[])
+
+
+def _dispatch_revalidation_conflicts(conflicted, config, *, dry_run: bool) -> None:
+    """#2231: turn ``--revalidate``'s conflict verdict into a #241 dispatch.
+
+    *conflicted* is :attr:`coord.revalidate.BatchRevalidationResult.conflicted`
+    — the candidates whose revalidation run died composing the branch onto its
+    current base. ``--revalidate`` already did the expensive, authoritative
+    part: it fetched, built a worktree at the live base, ran ``git merge`` and
+    watched it fail. That is strictly better evidence than the failed ``gh pr
+    merge`` that normally arms this path, and it was being spent on an
+    operator-facing paragraph and then discarded (quadraui #306/#309 sat 11h
+    each behind a "test verdict stale" gate whose real blocker was a content
+    conflict; a human eventually typed ``coord fix --force`` by hand, which is
+    #241's own job description).
+
+    Two things happen per entry, in this order:
+
+    1. The entry is moved to ``CONFLICT`` with an ``entry.error`` that names
+       the conflict (:func:`coord.revalidate.compose_conflict_error`). This is
+       the reporting half: the gate reason stops reading (only) "stale
+       verdict", so ``coord drive``'s #1738 arm no longer sees a shape it
+       would answer with a re-test, and ``merge_queue.process()`` — which acts
+       only on ``PENDING`` — leaves the entry alone this pass instead of
+       re-deriving the same smoke block. The caller persists the mutation with
+       the rest of the queue; nothing is written here.
+    2. The entry is handed to :func:`_dispatch_conflict_fixes` as a synthetic
+       ``conflict`` event, which is the SAME call the whole-queue and
+       ``--only`` paths make after a live merge attempt. Every guard it owns
+       still applies unchanged: :func:`coord.merge_queue.classify_conflict`
+       must read the error as ``rebaseable``, the #241/#784 retry cap still
+       flips a second failure to ``HUMAN_REQUIRED``, and
+       ``dispatch_conflict_fix``'s own in-flight check still refuses a
+       duplicate. Deliberately routed through that function rather than
+       calling ``dispatch_conflict_fix`` directly — a second dispatch site
+       with its own copy of those guards is how they drift apart.
+
+    Under ``--dry-run`` nothing is mutated and nothing is dispatched (the
+    revalidation itself never ran either — see :func:`_apply_revalidation`).
+    """
+    if dry_run or not conflicted:
+        return
+
+    from coord.merge_queue import CONFLICT, MergeEvent  # noqa: PLC0415
+    from coord.revalidate import compose_conflict_error  # noqa: PLC0415
+
+    events = []
+    for candidate, _result in conflicted:
+        entry = candidate.entry
+        entry.error = compose_conflict_error(entry)
+        entry.state = CONFLICT
+        click.echo(
+            f"  --revalidate: {entry.repo_name} #{entry.issue_number}: "
+            "the blocker is a CONFLICT, not a stale verdict — the branch does "
+            "not compose onto its base. Routing to the conflict-fix path "
+            "(#241) instead of re-testing (#2231)."
+        )
+        events.append(MergeEvent(entry, "conflict", entry.error))
+    _dispatch_conflict_fixes(events, config, dry_run=False)
 
 
 def _dispatch_conflict_fixes(events, config, *, dry_run: bool) -> None:

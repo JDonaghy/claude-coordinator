@@ -1906,6 +1906,67 @@ def evaluate_smoke_verdict(
     )
 
 
+def stale_smoke_conflict_reason(entry, smoke, gh_ops) -> str | None:
+    """#2231: the conflict hiding behind a stale-verdict smoke block, if any.
+
+    Gate evaluation is ordered (review → smoke → CI → …) and every gate
+    short-circuits, so an entry whose branch does not merge AT ALL never gets
+    that far: it reports "test verdict stale", which invites exactly the one
+    remedy that cannot work. Worse, the two mechanisms that could fix it are
+    both downstream of a step that never runs — #1738's auto-repair answers a
+    stale verdict (there wasn't one) and #241's conflict-fix is dispatched off
+    a failed *merge attempt* (the smoke gate returned before one happened).
+    quadraui #306/#309 spent 11h there apiece.
+
+    So: when the smoke gate is about to block on a **stale** verdict
+    specifically, ask GitHub whether the PR merges at all. A confirmed
+    ``mergeable: false`` means the stale verdict is not the blocker, and this
+    returns a reason naming the conflict — the caller turns that into a
+    ``conflict`` event, which is what arms :func:`classify_conflict` and #241.
+
+    Returns ``None`` — leaving today's stale-verdict block exactly as it was —
+    whenever the answer isn't a definite yes:
+
+    * the verdict is MISSING rather than stale (the #1640 lost-write shape,
+      deliberately out of scope here as in :func:`revalidation_candidates`);
+    * there is no PR yet, so there is nothing to ask about;
+    * ``gh_ops`` has no ``check_pr_mergeable`` — the same duck-typed probe the
+      #1877 CI-absent branch uses, and for the same reason: this function also
+      runs against a :class:`~coord.gate_snapshot.GateSnapshot` on the
+      ``/board`` read path (#1336 Invariant 1, no third-party I/O), which
+      doesn't implement it;
+    * the probe returns ``None`` (GitHub still computing mergeability) or
+      raises. An inconclusive read must never be upgraded to "conflict": that
+      would replace a recoverable staleness block with one that dispatches a
+      rebase worker at a branch which merges fine.
+
+    The wording is load-bearing in both directions — see
+    :func:`coord.revalidate.compose_conflict_error`, whose docstring explains
+    the same constraint for the local-compose variant of this fact.
+    """
+    if smoke is None or smoke.ok or smoke.kind != SMOKE_STALE:
+        return None
+    pr_number = getattr(entry, "pr_number", None)
+    if not pr_number:
+        return None
+    probe = getattr(gh_ops, "check_pr_mergeable", None)
+    if probe is None:
+        return None
+    try:
+        conflicted = probe(entry.repo_github, pr_number) is False
+    except Exception:  # noqa: BLE001 — inconclusive, never a block upgrade
+        return None
+    if not conflicted:
+        return None
+    return (
+        f"merge conflict: PR #{pr_number} does not merge into "
+        f"{entry.target_branch} — GitHub reports it as not mergeable. Its "
+        "test verdict is out of date against the current base too, but that "
+        "is downstream: no re-test can clear a branch that will not merge "
+        "(#2231)"
+    )
+
+
 @dataclass(frozen=True)
 class RevalidationCandidate:
     """One queue entry that ``coord merge --revalidate`` may re-test (#1769).
@@ -3184,6 +3245,19 @@ def _entry_gate_status(
             # write instead of re-verifying against the moved base.
             smoke = evaluate_smoke_verdict(entry, board, gh_ops)
             if not smoke.ok:
+                # #2231: name the conflict when there is one — the plan view
+                # is where an operator (and `coord drive`, via the board's
+                # `merge_reason`) reads WHY an entry is stuck, and "test
+                # verdict stale" on a branch that doesn't compose sends both
+                # of them at a remedy that cannot work. Costs one `gh` call,
+                # only for an entry already blocked on a STALE verdict, and
+                # only where a live probe exists (never on the `/board` read
+                # path — see `stale_smoke_conflict_reason`).
+                conflict_reason = stale_smoke_conflict_reason(
+                    entry, smoke, gh_ops,
+                )
+                if conflict_reason is not None:
+                    return PLAN_BLOCKED, conflict_reason
                 return PLAN_BLOCKED, smoke.short_reason
     if ci_store is not None and ci_store.is_available and entry.pr_number:
         checks = ci_store.list_checks_for_pr(entry.repo_github, entry.pr_number)
@@ -4606,6 +4680,22 @@ def process(
                     None if board is None else evaluate_smoke_verdict(entry, board, gh_ops)
                 )
                 if smoke is None or not smoke.ok:
+                    # #2231: before parking this entry behind a gate whose
+                    # stated cause invites a re-test, check whether the branch
+                    # merges at all. A confirmed conflict is the real blocker
+                    # and a re-test can never clear it — emit the `conflict`
+                    # event so `_dispatch_conflict_fixes` arms #241's rebase
+                    # worker, exactly as a failed merge attempt would have.
+                    conflict_msg = stale_smoke_conflict_reason(
+                        entry, smoke, gh_ops,
+                    )
+                    if conflict_msg is not None:
+                        entry.state = CONFLICT
+                        entry.error = conflict_msg
+                        events.append(
+                            MergeEvent(entry, "conflict", conflict_msg)
+                        )
+                        continue
                     msg = (
                         "smoke test required but board unavailable to confirm verdict"
                         if smoke is None

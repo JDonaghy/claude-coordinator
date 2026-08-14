@@ -379,6 +379,15 @@ class BatchRevalidationResult:
     A red composite fills ``per_entry`` with one solo result per candidate.
     ``recorded`` then holds only the survivors' assignment ids, and
     ``culprits`` names the branches whose own run failed.
+
+    ``conflicted`` (#2231) is the subset of the culprits whose run died at
+    :data:`KIND_COMPOSE` — the branch does not merge onto its current base at
+    all. That is categorically different from every other culprit: no verdict
+    is wrong, no suite is red, and no amount of re-testing can change it. It
+    carries the *candidate* (not just its label) precisely so a caller can act
+    on it — see :func:`coord.commands.merge._dispatch_revalidation_conflicts`,
+    which turns it into #241's ``conflict-fix`` dispatch. Before #2231 this
+    diagnosis was formatted for a human and then dropped on the floor.
     """
 
     composite: RevalidationResult
@@ -386,6 +395,9 @@ class BatchRevalidationResult:
     recorded: list[str] = field(default_factory=list)
     culprits: list[str] = field(default_factory=list)
     suite_runs: int = 0
+    conflicted: list[tuple[RevalidationCandidate, RevalidationResult]] = field(
+        default_factory=list,
+    )
 
     @property
     def ok(self) -> bool:
@@ -1000,6 +1012,16 @@ def revalidate_group(
     )
 
     if composite.ok or len(candidates) == 1 or not composite.narrowable:
+        # #2231: a single-candidate composite IS that candidate's own run, so
+        # a COMPOSE failure here names it as surely as a solo run would. The
+        # N>1 case is attributed in the per-entry loop below instead — the
+        # composite stops at the FIRST branch that won't merge, which says
+        # nothing about the ones after it.
+        if (
+            len(candidates) == 1
+            and composite.kind == KIND_COMPOSE
+        ):
+            batch.conflicted.append((candidates[0], composite))
         return batch
 
     echo(
@@ -1027,6 +1049,12 @@ def revalidate_group(
         else:
             batch.culprits.append(label)
             echo(f"  --revalidate: {label} FAILS alone — {solo.reason}")
+            if solo.kind == KIND_COMPOSE:
+                # #2231: not a verdict problem at all — this branch cannot
+                # merge. Recorded structurally so the caller can dispatch
+                # #241's conflict-fix instead of leaving the entry parked
+                # behind a stale-verdict gate it can never clear.
+                batch.conflicted.append((c, solo))
 
     if not batch.culprits:
         # Every branch is green by itself, yet together they are not. That is a
@@ -1044,6 +1072,36 @@ def revalidate_group(
         )
 
     return batch
+
+
+def compose_conflict_error(entry) -> str:
+    """The ``entry.error`` text for a branch that will not compose (#2231).
+
+    Deliberately worded to be classified correctly by the two consumers that
+    read merge prose rather than structured state:
+
+    * :func:`coord.merge_queue.classify_conflict` must return ``"rebaseable"``
+      — it is what decides whether ``coord merge`` dispatches #241's
+      conflict-fix worker — so the text carries the ``merge conflict`` signal
+      that function already keys on.
+    * :func:`coord.merge_queue.is_stale_smoke_reason` (and ``coord drive``'s
+      ``_SMOKE_GATE_MARKERS``) must NOT match, or the driver would read this
+      as the #1738 stale-verdict shape and spend a fix round re-testing a
+      branch that cannot merge — the exact loop #2231 reports. So the stale
+      verdict is *described* here in wording that matches none of
+      :data:`coord.merge_queue.STALE_SMOKE_MARKERS` (this module must not
+      carry a copy of those strings either — see
+      ``TestSingleStaleDetector``). ``tests/test_revalidate.py`` asserts both
+      classifications directly, since the wording is load-bearing rather than
+      cosmetic.
+    """
+    return (
+        f"merge conflict: branch {entry.branch!r} does not compose onto "
+        f"origin/{entry.target_branch} — `git merge` reported a content "
+        "conflict when --revalidate composed it against the current base, so "
+        "no test verdict (fresh or otherwise) can clear this entry until the "
+        "branch is rebased (#2231)"
+    )
 
 
 def format_batch(batch: BatchRevalidationResult) -> list[str]:
@@ -1201,6 +1259,7 @@ __all__ = [
     "BatchRevalidationResult",
     "RevalidationResult",
     "client_timeout_seconds",
+    "compose_conflict_error",
     "describe_batches",
     "describe_candidates",
     "format_batch",
