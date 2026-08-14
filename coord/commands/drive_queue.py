@@ -39,6 +39,7 @@ from typing import Any, Mapping
 import click
 
 from coord.commands._common import _CONFIG_OPTION
+from coord.drive_state import WORK_LIKE
 from coord.drive_queue import (
     DEFAULT_MAX_ATTEMPTS,
     DEFAULT_MAX_PARALLEL_PER_REPO,
@@ -55,6 +56,7 @@ from coord.drive_queue import (
     STATE_PARKED,
     STATE_RUNNING,
     STATE_WAITING,
+    TERMINAL_QUEUE_STATES,
     BoardView,
     ProbeResult,
     QueueEntry,
@@ -73,6 +75,20 @@ from coord.drive_queue import (
     plan_tick,
     render_plan,
     validate_enqueue,
+)
+from coord.overlap_predict import (
+    AUDIT_CATEGORY,
+    EVENT_PREDICTED,
+    EVENT_SCORED,
+    OUTCOME_UNKNOWN,
+    Prediction,
+    classify_outcome,
+    collect_candidate_files,
+    declared_footprints,
+    inflight_footprints,
+    predict_overlap,
+    predictions_from_audit,
+    tally,
 )
 
 # Wall-clock ceiling for the `coord drive --tmux` launch subprocess.  The
@@ -163,6 +179,16 @@ def drive_queue_group() -> None:
     ),
 )
 @click.option(
+    "--no-predict-overlap",
+    is_flag=True,
+    default=False,
+    help=(
+        "Skip #2247's predicted file-overlap ordering for this add — queue it "
+        "exactly where the flags say, even if its declared files collide with "
+        "work already in flight."
+    ),
+)
+@click.option(
     "--scope",
     "hold_scope",
     type=click.Choice([HOLD_SCOPE_ENTRY, HOLD_SCOPE_FLEET]),
@@ -185,6 +211,7 @@ def drive_queue_add(
     hold_after: bool,
     hold_reason: str,
     resume_when: str,
+    no_predict_overlap: bool,
     hold_scope: str,
     config_path: Path,
 ) -> None:
@@ -193,6 +220,11 @@ def drive_queue_add(
     Validation happens BEFORE the write, the same posture `coord milestone
     write-order` takes for `## Work order`: a self-edge or a dependency cycle
     exits non-zero and leaves the queue exactly as it was.
+
+    #2247: when this issue's DECLARED files (a `## Files` block in its body)
+    collide with work already in flight in the same repo, the entry is chained
+    `--after` that work automatically and the reason is recorded. That is an
+    ORDER change, never a refusal — see `coord.overlap_predict`.
     """
     from coord.state import enqueue_drive_queue, list_drive_queue  # noqa: PLC0415
 
@@ -226,6 +258,19 @@ def drive_queue_add(
             "(entries-only). Pass --scope fleet again if the fleet-wide stop was still needed."
         )
 
+    # #2247: predicted file overlap ORDERS, never refuses. Anything that goes
+    # wrong in here (unreadable body, unreachable board, a failed compare)
+    # yields an empty prediction and this add behaves exactly as it did before
+    # the feature existed.
+    prediction = Prediction()
+    auto_after: list[str] = []
+    if not no_predict_overlap:
+        prediction = _predict_overlap(config_path, repo, issue, existing_entries)
+        auto_after = _applicable_auto_after(
+            existing_entries, repo, issue, after, prediction
+        )
+        after = [*after, *auto_after]
+
     enqueue_drive_queue(
         repo,
         issue,
@@ -237,6 +282,8 @@ def drive_queue_add(
         resume_when=resume_when,
         hold_scope=hold_scope,
     )
+    if auto_after:
+        _record_overlap_prediction(repo, issue, prediction, auto_after)
     suffix = f" after {', '.join(after)}" if after else ""
     pinned = f" on {machine}" if machine else ""
     gate = ""
@@ -246,7 +293,169 @@ def drive_queue_add(
             gate += " (fleet-wide — nothing anywhere launches)"
         if resume_when:
             gate += f" (auto-resume when `{resume_when}` passes)"
-    click.echo(f"queued {entry_key(repo, issue)}{pinned}{suffix}{gate}{scope_downgrade_warning}")
+    overlap_note = f"\n{prediction.reason}" if auto_after else ""
+    click.echo(
+        f"queued {entry_key(repo, issue)}{pinned}{suffix}{gate}"
+        f"{scope_downgrade_warning}{overlap_note}"
+    )
+
+
+# ── #2247: predicted file-overlap ordering ───────────────────────────────────
+
+
+def _issue_body(repo_name: str, issue_number: int) -> str:
+    """This issue's body from the coordinator's OWN issue store, or ``""``.
+
+    Daemon (a thin client's canonical copy) first, then the local ``issues``
+    cache. Deliberately NO GitHub leg: `add` is an interactive command, the
+    overwhelmingly common case is an issue with no `## Files` block at all,
+    and putting a live `gh` round-trip on every one of those to learn nothing
+    is a bad trade against a feature whose whole design premise is that no
+    prediction is a fine answer. An issue the board has never synced simply
+    gets today's behaviour — and #2246's post-merge sweep is what catches the
+    collisions prediction misses.
+
+    Fail-open at every layer — a body we cannot read means no prediction.
+    """
+    try:
+        from coord.client import fetch_issue, resolve_board_service  # noqa: PLC0415
+
+        svc = resolve_board_service()
+        if svc is not None:
+            row = fetch_issue(svc, repo_name, int(issue_number))
+            if row is not None:
+                return str(row.get("body") or "")
+    except Exception:  # noqa: BLE001 — see docstring
+        pass
+    try:
+        from coord.db import get_connection  # noqa: PLC0415
+
+        row = get_connection().execute(
+            "SELECT body FROM issues WHERE repo_name = ? AND number = ?",
+            (repo_name, int(issue_number)),
+        ).fetchone()
+        return "" if row is None else str(row["body"] or "")
+    except Exception:  # noqa: BLE001 — see docstring
+        return ""
+
+
+def _repo_coordinates(config_path: Path, repo: str) -> tuple[str, str] | None:
+    """``(github slug, default branch)`` for *repo*, or ``None``."""
+    try:
+        from coord.commands._common import _load_config  # noqa: PLC0415
+
+        repo_cfg = _load_config(config_path).repo(repo)
+    except Exception:  # noqa: BLE001 — a config that won't load means no prediction
+        return None
+    if repo_cfg is None:
+        return None
+    return str(repo_cfg.github or ""), str(getattr(repo_cfg, "default_branch", "") or "main")
+
+
+def _predict_overlap(
+    config_path: Path, repo: str, issue: int, existing_entries: list[QueueEntry],
+) -> Prediction:
+    """Compare this issue's declared files against work already in flight.
+
+    Same-repo only: two repos' paths cannot collide, and comparing them would
+    manufacture overlaps out of a shared filename. In-flight branches are
+    checked first (ground truth); a queued entry with no branch yet is
+    compared declaration-to-declaration, and only when it has one.
+    """
+    coordinates = _repo_coordinates(config_path, repo)
+    if coordinates is None:
+        return Prediction()
+    repo_github, base_branch = coordinates
+
+    def body_fetcher(repo_name: str, number: int) -> str:
+        return _issue_body(repo_name, number)
+
+    candidate = collect_candidate_files(repo, issue, body_fetcher)
+    if not candidate:
+        # Rule 3: no prediction is a valid answer. Nothing is fetched, nothing
+        # is compared, and the add is byte-identical to the pre-#2247 one.
+        return Prediction()
+
+    key = entry_key(repo, issue)
+    footprints = inflight_footprints(
+        repo, repo_github, base_branch, exclude_issue_number=issue,
+    )
+    covered = {key, *(f.key for f in footprints)}
+    queued = [
+        (e.repo, e.issue)
+        for e in existing_entries
+        if e.repo == repo
+        and e.key not in covered
+        and e.state not in TERMINAL_QUEUE_STATES
+    ]
+    footprints.extend(declared_footprints(queued, body_fetcher, exclude_keys=covered))
+    return predict_overlap(candidate, footprints, exclude_keys={key})
+
+
+def _applicable_auto_after(
+    existing_entries: list[QueueEntry],
+    repo: str,
+    issue: int,
+    after: list[str],
+    prediction: Prediction,
+) -> list[str]:
+    """The predicted pre-reqs that are actually safe to add.
+
+    An INFERRED edge must never be able to fail an add the operator's own
+    flags would have allowed, so each one is validated on its own and simply
+    dropped if it would self-edge or close a cycle — the opposite posture to
+    `validate_enqueue`'s treatment of an operator-declared `--after`, which is
+    a typo worth reporting.
+    """
+    applied: list[str] = []
+    for candidate_key in prediction.after_keys:
+        if candidate_key in after or candidate_key in applied:
+            continue
+        try:
+            validate_enqueue(
+                existing_entries, repo, issue, [*after, *applied, candidate_key]
+            )
+        except QueueError:
+            continue
+        applied.append(candidate_key)
+    return applied
+
+
+def _record_overlap_prediction(
+    repo: str, issue: int, prediction: Prediction, applied: list[str],
+) -> None:
+    """Persist WHY this entry was ordered — on the row and in the audit log.
+
+    Two sinks, deliberately. `last_reason` is what an operator reading `coord
+    drive-queue list` sees immediately, but the tick owns that column and will
+    overwrite it on the entry's first attempt. The audit row is the durable
+    one, and it carries both sides' file lists so the claim can be scored
+    later (`coord drive-queue overlap-report`) — without that, nobody can tell
+    a working predictor from a lucky one.
+    """
+    details = prediction.audit_details()
+    details["applied_after"] = list(applied)
+    try:
+        from coord.audit import record_audit  # noqa: PLC0415
+
+        record_audit(
+            tier="business",
+            category=AUDIT_CATEGORY,
+            event_type=EVENT_PREDICTED,
+            actor="drive-queue",
+            summary=prediction.reason,
+            repo=repo,
+            issue=issue,
+            details=details,
+        )
+    except Exception:  # noqa: BLE001 — recording must never fail the enqueue
+        pass
+    try:
+        from coord.state import update_drive_queue_entry  # noqa: PLC0415
+
+        update_drive_queue_entry(repo, issue, last_reason=prediction.reason)
+    except Exception:  # noqa: BLE001 — same
+        pass
 
 
 def validate_hold_flags(
@@ -639,6 +848,153 @@ def drive_queue_status(output_json: bool, config_path: Path) -> None:
                 click.echo(f"  {detail}")
     else:
         click.echo("alert: (none)")
+
+
+# ── overlap-report (#2247) ───────────────────────────────────────────────────
+
+
+def _branch_index(board: Any, repo: str) -> dict[int, str]:
+    """``issue number -> branch`` for every work-like assignment in *repo*.
+
+    Reads ``completed`` as well as ``active``: scoring happens AFTER the work
+    landed, which is precisely when its assignment is no longer active.
+    """
+    index: dict[int, str] = {}
+    for bucket in ("active", "completed"):
+        for a in list(getattr(board, bucket, ()) or []):
+            if getattr(a, "type", "") not in WORK_LIKE:
+                continue
+            if getattr(a, "repo_name", "") != repo or not getattr(a, "branch", ""):
+                continue
+            index.setdefault(int(a.issue_number), str(a.branch))
+    return index
+
+
+@drive_queue_group.command("overlap-report")
+@click.option("--repo", "repo", default=None, help="Restrict to one repo (default: every repo).")
+@click.option("--limit", type=int, default=200, show_default=True, help="How many prediction rows to read back.")
+@click.option("--json", "output_json", is_flag=True, default=False, help="Emit the scored rows as JSON.")
+@_CONFIG_OPTION
+def drive_queue_overlap_report(
+    repo: str | None, limit: int, output_json: bool, config_path: Path,
+) -> None:
+    """Score #2247's file-overlap predictions against what the branches DID touch.
+
+    Every auto-`--after` this feature applied is a checkable claim ("these two
+    file sets will intersect"). This reads those claims back out of the audit
+    log and compares them to the real diffs, recording each verdict so a
+    FALSE POSITIVE — an entry serialized for nothing — is a number rather than
+    an anecdote. A prediction whose branches cannot be diffed yet is left
+    unscored, not counted against the predictor.
+    """
+    from coord.audit import query_audit_log, record_audit  # noqa: PLC0415
+
+    try:
+        predicted = query_audit_log(
+            event_type=EVENT_PREDICTED, category=AUDIT_CATEGORY, repo=repo, limit=limit,
+        )
+        already = query_audit_log(
+            event_type=EVENT_SCORED, category=AUDIT_CATEGORY, repo=repo, limit=limit,
+        )
+    except Exception as exc:  # noqa: BLE001 — a read-only report never crashes
+        raise click.ClickException(f"could not read the audit log: {exc}") from None
+
+    scored_before = {
+        (str((e.get("details") or {}).get("key") or ""),
+         str((e.get("details") or {}).get("other_key") or ""))
+        for e in already.get("entries") or []
+    }
+    records = predictions_from_audit(predicted.get("entries") or [])
+    if not records:
+        click.echo("overlap predictions: (none recorded)")
+        return
+
+    boards: dict[str, Any] = {}
+    diffs: dict[tuple[str, str], list[str] | None] = {}
+
+    def actual_files(repo_name: str, issue_number: int) -> list[str] | None:
+        coordinates = _repo_coordinates(config_path, repo_name)
+        if coordinates is None:
+            return None
+        repo_github, base_branch = coordinates
+        if repo_name not in boards:
+            try:
+                from coord.board_service import read_board  # noqa: PLC0415
+
+                boards[repo_name] = read_board()
+            except Exception:  # noqa: BLE001 — unknown, never "no overlap"
+                boards[repo_name] = None
+        board = boards[repo_name]
+        if board is None:
+            return None
+        branch = _branch_index(board, repo_name).get(int(issue_number))
+        if not branch:
+            return None
+        cache_key = (repo_github, branch)
+        if cache_key not in diffs:
+            try:
+                from coord import github_ops  # noqa: PLC0415
+
+                diffs[cache_key] = github_ops.get_compare_files(
+                    repo_github, base_branch, branch
+                )
+            except Exception:  # noqa: BLE001 — unknown, never "no overlap"
+                diffs[cache_key] = None
+        return diffs[cache_key]
+
+    rows: list[dict[str, Any]] = []
+    for record in records:
+        other = parse_key(record["other_key"])
+        outcome = OUTCOME_UNKNOWN
+        if other is not None:
+            outcome = classify_outcome(
+                record["files"],
+                actual_files(record["repo"], record["issue"]),
+                actual_files(other[0], other[1]),
+            )
+        rows.append({**record, "outcome": outcome})
+        if outcome == OUTCOME_UNKNOWN:
+            continue
+        if (record["key"], record["other_key"]) in scored_before:
+            continue
+        record_audit(
+            tier="business",
+            category=AUDIT_CATEGORY,
+            event_type=EVENT_SCORED,
+            actor="drive-queue",
+            summary=f"{record['key']} ordered after {record['other_key']}: {outcome}",
+            repo=record["repo"],
+            issue=record["issue"],
+            details={
+                "key": record["key"],
+                "other_key": record["other_key"],
+                "outcome": outcome,
+                "predicted_files": record["files"],
+                "source": record["source"],
+            },
+        )
+
+    accuracy = tally(r["outcome"] for r in rows)
+    if output_json:
+        click.echo(
+            _json.dumps(
+                {
+                    "rows": rows,
+                    "confirmed": accuracy.confirmed,
+                    "false_positive": accuracy.false_positive,
+                    "unknown": accuracy.unknown,
+                    "precision": accuracy.precision,
+                }
+            )
+        )
+        return
+    click.echo(f"overlap predictions: {accuracy.render()}")
+    for row in rows:
+        files = ", ".join(row["files"][:3]) or "(none)"
+        click.echo(
+            f"  {row['key']} after {row['other_key']} [{row['source']}] "
+            f"{row['outcome']} — {files}"
+        )
 
 
 # ── resume (#1757) ───────────────────────────────────────────────────────────

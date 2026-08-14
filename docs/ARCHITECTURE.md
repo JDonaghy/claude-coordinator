@@ -272,20 +272,48 @@ Two consequences worth stating plainly, because both have cost real work:
   dispatch for file overlap.
 - **It only runs on the `coord plan` → `coord approve` path.** The drive queue dispatches
   through `coord drive` → `coord assign` and never consults the brain, so unattended work —
-  which is most work — gets no overlap check at all. Both same-file collisions on
+  which is most work — got no overlap check at all. Both same-file collisions on
   2026-08-14 (quadraui #306/#309 against #307/#308, and claude-coordinator #2234 against
   #2230, all four appending to a single file) arrived through the queue.
 
 `claim.py` does not close this gap: it is issue-level only (an active board assignment, or
 an existing `issue-{N}-*` remote branch), with no file awareness.
 
+**What DOES cover the queue now (#2247): `coord/overlap_predict.py`.** At `coord
+drive-queue add`, the candidate issue's own declared file list — an explicit `## Files` /
+`files:` block in its body, never an inference from prose — is compared against the **real
+diffs** of every in-flight branch in that repo (`GhOps.get_compare_files`, the same compare
+call #1720's advisory fence uses). Only one side of that comparison is a guess, which is
+what makes it worth doing. Three properties are load-bearing and should not be "improved"
+away:
+
+- **It ORDERS, never refuses.** An overlap chains the newcomer `--after` the incumbent (a
+  flag the queue already had) and records why. A false-positive prediction that blocked a
+  dispatch would be worse than the conflict it prevents; a false negative merely returns
+  you to the pre-#2247 behaviour. `--no-predict-overlap` opts out per add.
+- **No prediction is a valid answer.** No `## Files` block, an unreachable board, a branch
+  whose compare fails — each degrades to exactly today's enqueue, never to a bad guess.
+  Two *queued* entries with no branches yet are compared declaration-to-declaration only,
+  because that is two authors' statements rather than two guesses.
+- **Its accuracy is measured.** Every auto-`--after` is a checkable claim ("these two file
+  sets will intersect"), recorded in the audit log with both sides' file lists. `coord
+  drive-queue overlap-report` scores those claims against the branches' real diffs and
+  records each verdict, so a **false positive** — an entry serialized for nothing — is a
+  number. Nobody can safely loosen an unmeasured predictor.
+
+Known gap, deliberate: the prediction runs at ENQUEUE, not at tick-launch time. Work that
+goes in flight after an entry was queued does not retroactively reorder it — #2246's
+post-merge sibling sweep is the exact, zero-prediction backstop for those.
+
 **`file_groups` and `exclusive_files` do not exist.** Earlier revisions of this note offered
 them as optional power-user config; no such keys are read anywhere in `coord/`, and none
 appear in any `coordinator.yml`. Treat any reference to them as stale.
 
 The exact, zero-prediction signal that *is* available is GitHub's own `mergeable` field
-(`GhOps.check_pr_mergeable`), but today it is consulted only at merge time — after the leg
-is already spent. See #2231.
+(`GhOps.check_pr_mergeable`). #2246 put it on the post-merge sweep, where it catches the
+collisions prediction cannot foresee; #2231 covers the merge-time reading that still
+short-circuits before the merge is attempted. Prediction reduces how often that sweep has
+to fire; it does not replace it.
 
 ### `coordinator.yml` lives in `~/.coord/`, not the repo checkout
 

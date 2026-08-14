@@ -190,6 +190,7 @@ def test_drive_queue_is_registered_with_every_verb():
     assert "drive-queue" in main.commands
     assert set(main.commands["drive-queue"].commands) == {
         "add", "list", "remove", "move", "status", "tick", "resume",
+        "overlap-report",
     }
 
 
@@ -244,6 +245,209 @@ def test_add_refuses_a_malformed_after_entry(cli):
     assert result.exit_code != 0
     assert "malformed" in result.output
     assert state._list_drive_queue_local() == []
+
+
+# ── #2247: predicted file-overlap ordering ───────────────────────────────────
+#
+# The acceptance bar from the issue, driven end to end through the real CLI:
+# two issues declaring the same file are ORDERED (never refused), an unrelated
+# pair still runs in parallel, and an issue that declares nothing behaves
+# exactly as it did before the feature existed.
+
+
+@pytest.fixture
+def declare(coord_db):
+    """Give an issue a `## Files` block in the local issue cache."""
+
+    def _declare(number: int, *files: str, repo: str = REPO) -> None:
+        body = "## Files\n" + "".join(f"- `{f}`\n" for f in files)
+        coord_db.execute(
+            "INSERT OR REPLACE INTO issues (repo_name, number, title, body, state) "
+            "VALUES (?, ?, ?, ?, 'open')",
+            (repo, number, f"issue {number}", body),
+        )
+        coord_db.commit()
+
+    return _declare
+
+
+@pytest.fixture
+def branch_diff(monkeypatch):
+    """Stub the ONE process boundary the predictor's ground-truth leg uses."""
+
+    def _set(mapping: dict[str, list[str]]) -> None:
+        monkeypatch.setattr(
+            "coord.github_ops.get_compare_files",
+            lambda repo, base, head: mapping.get(head),
+        )
+
+    return _set
+
+
+def test_two_issues_declaring_the_same_file_are_ordered_not_refused(cli, declare):
+    declare(306, "quadraui/tests/tui_example_driver.rs")
+    declare(307, "quadraui/tests/tui_example_driver.rs")
+
+    assert cli("add", REPO, "306").exit_code == 0
+    result = cli("add", REPO, "307")
+
+    assert result.exit_code == 0, result.output
+    assert queued(307)["after_json"] == [f"{REPO}#306"]
+    # The REASON is recorded, not just the edge — an unexplained auto-`--after`
+    # is one an operator deletes.
+    assert "predicted file overlap (#2247)" in result.output
+    assert "tui_example_driver.rs" in result.output
+    assert "predicted file overlap (#2247)" in queued(307)["last_reason"]
+    # ORDER, never REFUSE: the incumbent is untouched and both rows are queued.
+    assert queued(306)["after_json"] == []
+    assert len(state._list_drive_queue_local()) == 2
+
+
+def test_an_unrelated_pair_still_runs_in_parallel(cli, declare):
+    declare(306, "coord/drive_queue.py")
+    declare(307, "tui/src/main.rs")
+
+    assert cli("add", REPO, "306").exit_code == 0
+    result = cli("add", REPO, "307")
+
+    assert result.exit_code == 0, result.output
+    assert queued(307)["after_json"] == []
+    assert "overlap" not in result.output
+
+
+def test_an_issue_that_declares_nothing_behaves_exactly_as_before(cli, declare):
+    declare(306, "coord/drive_queue.py")
+    assert cli("add", REPO, "306").exit_code == 0
+
+    result = cli("add", REPO, "307")  # no issue row at all → no prediction
+    assert result.exit_code == 0, result.output
+    assert queued(307)["after_json"] == []
+
+
+def test_overlap_ordering_can_be_opted_out_of(cli, declare):
+    declare(306, "coord/drive_queue.py")
+    declare(307, "coord/drive_queue.py")
+    assert cli("add", REPO, "306").exit_code == 0
+
+    result = cli("add", REPO, "307", "--no-predict-overlap")
+    assert result.exit_code == 0, result.output
+    assert queued(307)["after_json"] == []
+
+
+def test_a_declared_file_is_checked_against_a_live_branchs_real_diff(
+    cli, declare, seed, branch_diff,
+):
+    # Ground truth, not a second guess: #2230 has a branch, so its footprint is
+    # the compare API's answer — #2234 never declared anything.
+    seed(
+        issues={2230: "open"},
+        assignments=[{"issue_number": 2230, "status": "running"}],
+    )
+    from coord.db import get_connection
+
+    get_connection().execute(
+        "UPDATE assignments SET branch = 'issue-2230' WHERE issue_number = 2230"
+    )
+    get_connection().commit()
+    branch_diff({"issue-2230": ["coord/drive_queue.py", "tests/test_drive_queue.py"]})
+    declare(2234, "coord/drive_queue.py")
+
+    result = cli("add", REPO, "2234")
+    assert result.exit_code == 0, result.output
+    assert queued(2234)["after_json"] == [f"{REPO}#2230"]
+    assert "[branch]" in result.output
+
+
+def test_an_inferred_edge_never_fails_an_add_it_would_cycle(cli, declare):
+    declare(306, "coord/drive_queue.py")
+    declare(307, "coord/drive_queue.py")
+    assert cli("add", REPO, "306").exit_code == 0
+    # Operator declares the reverse edge explicitly; the inferred one would
+    # close a cycle, so it is DROPPED — the add still succeeds.
+    result = cli("add", REPO, "307", "--after", "306")
+    assert result.exit_code == 0, result.output
+    assert cli("add", REPO, "306", "--after", "307").exit_code != 0
+
+    result = cli("add", REPO, "306")
+    assert result.exit_code == 0, result.output
+    assert queued(306)["after_json"] == []
+
+
+def test_overlap_report_scores_a_prediction_against_the_real_diffs(
+    cli, declare, seed, branch_diff,
+):
+    declare(306, "coord/drive_queue.py")
+    declare(307, "coord/drive_queue.py")
+    assert cli("add", REPO, "306").exit_code == 0
+    assert cli("add", REPO, "307").exit_code == 0
+
+    # Before either branch exists the claim is unscoreable — which is NOT a
+    # false positive.
+    unknown = cli("overlap-report", "--json")
+    assert unknown.exit_code == 0, unknown.output
+    payload = json.loads(unknown.output)
+    assert payload["unknown"] == 1
+    assert payload["precision"] is None
+
+    seed(
+        issues={306: "open", 307: "open"},
+        assignments=[
+            {"issue_number": 306, "status": "running"},
+            {"issue_number": 307, "status": "running"},
+        ],
+    )
+    from coord.db import get_connection
+
+    conn = get_connection()
+    conn.execute("UPDATE assignments SET branch = 'issue-306' WHERE issue_number = 306")
+    conn.execute("UPDATE assignments SET branch = 'issue-307' WHERE issue_number = 307")
+    conn.commit()
+    branch_diff({
+        "issue-306": ["coord/drive_queue.py"],
+        "issue-307": ["coord/drive_queue.py"],
+    })
+
+    scored = cli("overlap-report", "--json")
+    assert scored.exit_code == 0, scored.output
+    payload = json.loads(scored.output)
+    assert payload["confirmed"] == 1
+    assert payload["false_positive"] == 0
+    assert payload["precision"] == 1.0
+
+
+def test_overlap_report_records_a_false_positive_when_the_diffs_disagree(
+    cli, declare, seed, branch_diff,
+):
+    declare(306, "coord/drive_queue.py")
+    declare(307, "coord/drive_queue.py")
+    assert cli("add", REPO, "306").exit_code == 0
+    assert cli("add", REPO, "307").exit_code == 0
+
+    seed(
+        issues={306: "open", 307: "open"},
+        assignments=[
+            {"issue_number": 306, "status": "running"},
+            {"issue_number": 307, "status": "running"},
+        ],
+    )
+    from coord.db import get_connection
+
+    conn = get_connection()
+    conn.execute("UPDATE assignments SET branch = 'issue-306' WHERE issue_number = 306")
+    conn.execute("UPDATE assignments SET branch = 'issue-307' WHERE issue_number = 307")
+    conn.commit()
+    # Neither branch actually touched what its issue declared.
+    branch_diff({"issue-306": ["coord/a.py"], "issue-307": ["coord/b.py"]})
+
+    result = cli("overlap-report")
+    assert result.exit_code == 0, result.output
+    assert "false-positive" in result.output
+    # The verdict is durable, not just printed — that is what makes the
+    # predictor's accuracy measurable rather than assumed.
+    from coord.audit import query_audit_log
+
+    scored = query_audit_log(event_type="overlap_scored")["entries"]
+    assert [e["details"]["outcome"] for e in scored] == ["false-positive"]
 
 
 def test_list_is_empty_before_anything_is_queued(cli):
