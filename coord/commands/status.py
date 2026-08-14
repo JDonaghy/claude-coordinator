@@ -349,6 +349,23 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
                     done.status = "advisory"
                     if done.type == "work":
                         done.review_state = "advisory"
+            elif agent_status == "refused_policy":
+                # #2234: worker exited cleanly, pushed 0 commits, and its own
+                # final message cited a standing repo-rule prohibition (the
+                # #2195 shape). Mirror reconcile.py's `reconcile()`: preserve
+                # the distinct status rather than folding it into "advisory"
+                # — without this branch it falls to the `else` below and gets
+                # recorded FAILED, feeding `auto_reassign` on a condition
+                # retrying can never fix.
+                done = board.mark_done_by_id(
+                    a.assignment_id,
+                    finished_at=entry.get("finished_at"),
+                    branch=branch,
+                )
+                if done is not None:
+                    done.status = "refused_policy"
+                    if done.type == "work":
+                        done.review_state = "advisory"
             else:
                 board.mark_failed_by_id(
                     a.assignment_id,
@@ -429,6 +446,32 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
         for e in advisory_entries:
             spec = e.get("spec", {})
             reason = e.get("zero_commit_reason") or "0 commits pushed"
+            click.echo(
+                f"  #{spec.get('issue_number', '?')}: "
+                f"{spec.get('issue_title', '?')} "
+                f"[{spec.get('repo_name', '?')}]  — {reason}"
+            )
+
+    # #2234: surface a policy refusal in its OWN section rather than folding
+    # it into Advisory above — same #1472 "still live on GitHub" filter, but
+    # distinct wording: this is a routing decision for the coordinator, not
+    # a "did the worker get stuck" question.
+    policy_refusal_entries = _live_advisory_entries(
+        [
+            e for e in agent_completed.values()
+            if e.get("status") == "refused_policy" and not e.get("usage_limit_reason")
+        ],
+        cfg,
+    )
+    if policy_refusal_entries:
+        click.echo("")
+        click.echo(
+            "🚫 Needs the coordinator (worker refused on a standing repo-rule "
+            "prohibition):"
+        )
+        for e in policy_refusal_entries:
+            spec = e.get("spec", {})
+            reason = e.get("policy_refusal_reason") or "cited a repo-rule prohibition"
             click.echo(
                 f"  #{spec.get('issue_number', '?')}: "
                 f"{spec.get('issue_title', '?')} "

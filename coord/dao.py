@@ -36,7 +36,11 @@ SCHEMA_VERSION = 1
 
 # #762: terminal assignment statuses.  Anything NOT in this set (running /
 # pending) is "in-flight" and always kept on the board projection.
-TERMINAL_STATUSES = frozenset({"done", "merged", "failed", "cancelled", "advisory"})
+# #2234: "refused_policy" is terminal exactly like "advisory" — see
+# coord.agent.REFUSED_POLICY.
+TERMINAL_STATUSES = frozenset(
+    {"done", "merged", "failed", "cancelled", "advisory", "refused_policy"}
+)
 
 # #762: how many days of *terminal* assignment history the /board projection
 # carries.  The board grew unbounded (1209 assignments / 4.37 MB) and overran

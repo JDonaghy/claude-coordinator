@@ -529,7 +529,8 @@ def test_active_count_counts_non_terminal_rows_only():
 
 
 @pytest.mark.parametrize(
-    "status", ["done", "failed", "cancelled", "merged", "advisory"]
+    "status",
+    ["done", "failed", "cancelled", "merged", "advisory", "refused_policy"],
 )
 def test_every_terminal_status_is_inactive(status):
     payload = {"assignments": [row(status=status)]}

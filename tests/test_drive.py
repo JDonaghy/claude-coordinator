@@ -59,7 +59,7 @@ from coord.drive import (
     resolve_oracle_decision,
 )
 from coord.drive_state import IssueState
-from coord.models import Machine, Repo
+from coord.models import POLICY_REFUSAL_MARKER, Machine, Repo
 from coord.usage_limits import PlanLimits
 
 
@@ -1441,6 +1441,24 @@ def test_cancelled_work_is_terminal_and_says_how_to_re_dispatch():
     action = step(state(work_aid="w1", work_status="cancelled"))
     assert action.is_exit
     assert "--force" in action.message
+
+
+# ── refused_policy: #2234's distinct terminal shape ─────────────────────────
+
+
+def test_refused_policy_work_is_terminal_and_carries_the_2234_marker():
+    """`coord.agent.REFUSED_POLICY` reaches here as `work_status ==
+    "refused_policy"` and must exit — never wait, never treat it like a
+    bounded-retry failure. The message embeds `POLICY_REFUSAL_MARKER` so
+    `coord/drive_queue.py`'s `_reconcile_running` can recognise it out of
+    this run's own `drive_exited` audit summary and park the queue entry
+    (STATE_PARKED) instead of spending an attempt or landing in `blocked`
+    — see tests/test_drive_queue.py's #2234 section for that half."""
+    action = step(state(work_aid="w1", work_status="refused_policy"))
+    assert action.is_exit
+    assert action.exit_code == EXIT_TERMINAL_FAILURE
+    assert POLICY_REFUSAL_MARKER in action.message
+    assert "needs the coordinator" in action.message.lower()
 
 
 def test_an_unknown_terminal_status_refuses_to_guess():

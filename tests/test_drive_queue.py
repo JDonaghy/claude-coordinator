@@ -1447,6 +1447,110 @@ def test_a_parked_entry_that_lands_while_parked_reconciles_to_done():
     assert plan.launch is None
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# #2234: a policy refusal — a worker that reaped `coord.agent.REFUSED_POLICY`
+# (clean exit, 0 commits, its own final message cites a standing repo-rule
+# prohibition) — parks like Gate-A (#2063) rather than blocking like a
+# genuine #1844 pre-dispatch refusal. UNLIKE Gate-A it never resumes itself:
+# a Gate-A park waits on a human VERDICT that can arrive; this waits on a
+# human doing coordinator-side work that nothing on the board signals when
+# it's done, so the only symmetry with Gate-A is "park instead of blocked,
+# no attempt spent" — see coord.models.is_policy_refusal_reason's docstring.
+# ═══════════════════════════════════════════════════════════════════════════
+
+POLICY_REFUSAL_REASON = (
+    "drive exited for claude-coordinator#2195 (exit_code=1): work "
+    "b1a090a5e011 refused on a standing repo-rule prohibition rather than "
+    "doing the dispatched work — the worker did the CORRECT thing (#2234). "
+    "[refused-by-policy #2234]"
+)
+
+
+def test_a_policy_refusal_parks_without_spending_an_attempt():
+    """The #2234 acceptance criterion, asserted the way #1844's sibling test
+    does: on the attempt counter AND the terminal bucket, not just the verb."""
+    entries = [entry(2195, position=3, state=STATE_RUNNING, attempts=0)]
+    plan = plan_tick(
+        entries, board(), capacity=1,
+        exit_reasons={entry_key(REPO, 2195): POLICY_REFUSAL_REASON},
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "parked"
+    assert reconcile.updates["state"] == "parked"
+    assert "attempts" not in reconcile.updates
+    assert plan.blocked == ()  # NOT terminal `blocked`
+    assert plan.launch is None
+    assert POLICY_REFUSAL_REASON in reconcile.reason
+    assert POLICY_REFUSAL_REASON in reconcile.updates["last_reason"]
+
+
+def test_a_policy_refusal_parks_even_on_a_fresh_entrys_first_tick():
+    entries = [entry(2195, state=STATE_RUNNING, attempts=0)]
+    plan = plan_tick(
+        entries, board(), capacity=1,
+        exit_reasons={entry_key(REPO, 2195): POLICY_REFUSAL_REASON},
+    )
+    assert plan.reconciles[0].outcome == "parked"
+    assert plan.blocked == ()
+    assert plan.launch is None
+
+
+def test_a_policy_refusal_deep_into_the_attempt_budget_still_spends_none():
+    entries = [
+        entry(2195, state=STATE_RUNNING, attempts=DEFAULT_MAX_ATTEMPTS - 1)
+    ]
+    plan = plan_tick(
+        entries, board(), capacity=1,
+        exit_reasons={entry_key(REPO, 2195): POLICY_REFUSAL_REASON},
+    )
+    assert plan.reconciles[0].outcome == "parked"  # not "exhausted"
+    assert plan.blocked == ()
+
+
+def test_a_parked_policy_refusal_does_not_auto_resume_next_tick():
+    """The bug this fix exists to prevent: a parked entry with no
+    `merge_ci_pending` reads exactly like a CI park whose gate has cleared,
+    and the pre-#2234 pre-pass would flip it straight back to `waiting` —
+    relaunching `coord drive` into the identical refusal every tick,
+    forever, without ever spending an attempt or ever stopping either."""
+    entries = [
+        entry(2195, position=3, state="parked", attempts=0,
+              last_reason=POLICY_REFUSAL_REASON)
+    ]
+    plan = plan_tick(entries, board(), capacity=1)
+    assert plan.reconciles == ()  # left alone — still parked
+    assert plan.launch is None
+
+
+def test_a_parked_policy_refusal_stays_parked_through_the_2158_ceiling():
+    """Unlike a CI park, this never ages out — there is no refreshable
+    reading; the standing rule it names does not get less standing with
+    time, so #2158's staleness ceiling must not apply to it."""
+    entries = [
+        entry(
+            2195, position=3, state="parked", attempts=0,
+            last_reason=POLICY_REFUSAL_REASON,
+            reason_at=NOW - PARK_STALE_SECONDS - 60,
+        )
+    ]
+    plan = plan_tick(entries, board(), capacity=1, now=NOW)
+    assert plan.reconciles == ()
+    assert plan.launch is None
+
+
+def test_a_policy_refusal_still_reconciles_to_done_if_it_lands_by_hand():
+    """The #2055 landed-check still applies on top of #2234: a human doing
+    the coordinator-side work and merging it out of band must not leave the
+    entry parked forever — it is re-checked against the board like every
+    other parked entry."""
+    entries = [entry(2195, position=3, state="parked", attempts=0,
+                      last_reason=POLICY_REFUSAL_REASON)]
+    plan = plan_tick(entries, board(merged=(2195,)), capacity=1)
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "done"
+    assert reconcile.updates["state"] == STATE_DONE
+
+
 # ── #2055: `blocked`/`failed` re-checked against the board too ─────────────
 #
 # #1891's landed re-check above was `parked`-only. `blocked`/`failed` got no

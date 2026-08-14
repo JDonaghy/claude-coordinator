@@ -385,6 +385,46 @@ def test_mode_from_labels(labels) -> str | None:
 DELIVERABLE_ANALYSIS_LABEL = "deliverable:analysis"
 
 
+# #2234: the machine-readable tag `coord.drive.decide` embeds in its
+# `_die()` message when a work row reaps as `coord.agent.
+# REFUSED_POLICY` — a worker that exited cleanly (exit_code==0), pushed 0
+# commits, and whose OWN final message cited a standing repo-rule
+# prohibition as the reason it stopped (`coord.agent._looks_like_policy_
+# refusal`; the #2195 shape: "only the coordinator writes docs"). That is a
+# PERMANENT property of the issue, not a property of the attempt — nothing
+# about waiting and relaunching changes a standing rule — so it must never
+# be treated as a transient death.
+#
+# Text-marker matching (not a dedicated exit code) mirrors `coord.gate_a.
+# park_marker`/`is_gate_a_refusal_reason` (#2063): `coord/drive_queue.py`'s
+# `_reconcile_running` recognises this straight out of the drive's own
+# `drive_exited` audit summary (`own_reason`), independent of the run's exit
+# code, and routes it to `STATE_PARKED` rather than burning one of the
+# queue's two launch attempts rediscovering a rule that cannot change
+# on retry (#1844's same principle, applied post-dispatch) — and rather than
+# `STATE_BLOCKED`, which nothing re-evaluates and reads, at a glance, exactly
+# like a genuine crash (the whole complaint #2234 exists to fix). Hoisted
+# here — import-light, no DB — so `coord/drive.py` (which writes the marker)
+# and `coord/drive_queue.py` (which reads it back, on every subsequent tick
+# too — see its parked-entry pre-pass) share one literal string.
+POLICY_REFUSAL_MARKER = "[refused-by-policy #2234]"
+
+
+def is_policy_refusal_reason(text: str | None) -> bool:
+    """Whether *text* is a #2234 policy-refusal park reason.
+
+    Unlike a Gate-A park (#2063), a policy refusal has no external verdict
+    that can arrive and clear it — the rule it names is standing, not
+    pending — so nothing auto-resumes an entry parked for this reason (see
+    the pre-pass in `coord.drive_queue.plan_tick`, which checks this
+    predicate and deliberately leaves the entry alone rather than falling
+    through to the CI-park "resume" default). An operator clears it the same
+    way they clear a `blocked` entry: do the coordinator-side work (or
+    re-scope the issue), then `coord drive-queue remove`.
+    """
+    return bool(text) and POLICY_REFUSAL_MARKER in text
+
+
 @dataclass
 class Assignment:
     machine_name: str
@@ -395,7 +435,7 @@ class Assignment:
     files_forbidden: list[str] = field(default_factory=list)
     briefing: str = ""
     assignment_id: str | None = None
-    status: str = "pending"  # pending | running | done | failed | advisory
+    status: str = "pending"  # pending | running | done | failed | advisory | refused_policy
     branch: str | None = None
     pr_url: str | None = None
     dispatched_at: float | None = None

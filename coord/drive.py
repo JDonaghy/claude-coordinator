@@ -109,7 +109,7 @@ from coord.interactive import (
 )
 from coord.dead_end import DeadEnd, detect_dead_end
 from coord.failure_class import classify_failure, plan_usage_limit_resume
-from coord.models import DELIVERABLE_ANALYSIS_LABEL
+from coord.models import DELIVERABLE_ANALYSIS_LABEL, POLICY_REFUSAL_MARKER
 from coord.usage_limits import PlanLimits, evaluate_usage_gate, get_plan_limits
 # Lost in the #1584-onto-#1590 rebase: _decide_review() calls this, but the
 # import lived in a hunk #1590 rewrote, so the merge came out textually clean
@@ -1489,6 +1489,33 @@ def decide(
         if advisory.is_exit:
             return advisory
         warnings = advisory.warnings
+    elif state.work_status == "refused_policy":
+        # #2234: the worker exited cleanly, pushed 0 commits, and its own
+        # final message cited a standing repo-rule prohibition (`coord.agent.
+        # REFUSED_POLICY` — the #2195 shape: an issue whose entire
+        # deliverable was a doc edit, which CLAUDE.md itself tells a worker
+        # to refuse and stop rather than attempt). Unlike an ADVISORY 0-commit
+        # exit, retrying changes nothing — the rule this worker cited is not
+        # going anywhere — so this is a `_die()` exactly like every other
+        # terminal branch here, but the message embeds
+        # `POLICY_REFUSAL_MARKER`: `coord/drive_queue.py`'s
+        # `_reconcile_running` recognises that marker in this run's own
+        # `drive_exited` audit summary and parks the queue entry
+        # (`STATE_PARKED`) WITHOUT spending an attempt, rather than treating
+        # this exit as a transient death — the same "cannot change on retry"
+        # principle #1844 already applies pre-dispatch, applied here
+        # post-dispatch.
+        return _die(
+            f"work {state.work_aid} refused on a standing repo-rule "
+            "prohibition rather than doing the dispatched work — the worker "
+            "did the CORRECT thing (#2234). Needs the coordinator: do the "
+            "work directly (or re-scope the issue so its deliverable isn't "
+            f"coordinator-only), then `coord drive-queue remove {state.repo} "
+            f"{state.issue}` once handled.\n"
+            f"   inspect: coord log {state.work_aid} --machine "
+            f"{state.work_machine or machine}\n"
+            f"   {POLICY_REFUSAL_MARKER}"
+        )
     elif state.work_status == "cancelled":
         return _die(
             f"work {state.work_aid} was cancelled — re-dispatch with: "

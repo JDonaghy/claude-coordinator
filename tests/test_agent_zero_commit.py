@@ -20,8 +20,10 @@ from coord.agent import (
     ADVISORY,
     DONE,
     FAILED,
+    REFUSED_POLICY,
     AgentServer,
     AssignmentSpec,
+    _looks_like_policy_refusal,
 )
 
 
@@ -582,3 +584,271 @@ def test_analysis_deliverable_survives_persist_load(
     assert a2.analysis_deliverable is True
     assert a2.result_text == "the diagnosis"
     assert a2.spec.issue_labels == ["deliverable:analysis"]
+
+
+# ── a policy refusal is its own status, not ADVISORY (#2234) ─────────────────
+#
+# A worker that exits cleanly, pushes 0 commits, AND whose own final message
+# cites a standing repo-rule prohibition (the #2195 shape — CLAUDE.md's
+# "only the coordinator writes docs") did the CORRECT thing: retrying it
+# reproduces the identical, correct refusal every time, because the rule it
+# cited is not going anywhere. Landing that in the same ADVISORY bucket as a
+# genuinely stuck worker is what burned two drive attempts and a terminal
+# `blocked` rediscovering a rule that could never change (#2234's incident).
+
+_POLICY_REFUSAL_RESULT_LINE = (
+    '{"type": "result", "subtype": "success", "is_error": false, '
+    '"result": "Confirmed: the rule exists verbatim at CLAUDE.md line 156, '
+    'and the issue itself explicitly says this. Only the coordinator '
+    'writes docs, so I am stopping rather than editing the doc."}'
+)
+
+_STUCK_RESULT_LINE = (
+    '{"type": "result", "subtype": "success", "is_error": false, '
+    '"result": "STUCK: could not locate the relevant module after two '
+    'approaches (grep for the symbol, then a graphify query); ran out of '
+    'turns before finding it."}'
+)
+
+
+def test_policy_refusal_zero_commit_is_refused_policy_not_advisory(
+    tmp_path: Path, repo_local_only: Path
+) -> None:
+    """#2234's core regression guard: 0 commits + clean exit + a final
+    message citing CLAUDE.md → REFUSED_POLICY, not ADVISORY."""
+    server = AgentServer(
+        machine_name="t",
+        repos=["api"],
+        repo_paths={"api": str(repo_local_only)},
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: [
+            "/bin/sh", "-c", f"printf '%s\\n' '{_POLICY_REFUSAL_RESULT_LINE}'"
+        ],
+    )
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path=str(repo_local_only),
+        issue_number=2195,
+        issue_title="Split CLAUDE.md by audience",
+        briefing="b",
+        branch="main",
+    )
+    a = server.assign(spec)
+    final = server.wait_for(a.id, timeout=10)
+
+    assert final.status == REFUSED_POLICY, (
+        f"expected REFUSED_POLICY for a CLAUDE.md-citing 0-commit exit, got "
+        f"{final.status!r}"
+    )
+    assert final.exit_code == 0
+    assert final.zero_commit_reason is None, (
+        "must not ALSO carry the #448 advisory reason — mutually exclusive"
+    )
+    assert final.policy_refusal_reason is not None
+    assert "CLAUDE.md" in final.policy_refusal_reason
+    server.shutdown()
+
+
+def test_policy_refusal_reason_appears_in_log(
+    tmp_path: Path, repo_local_only: Path
+) -> None:
+    """The policy-refusal diagnosis is written to the assignment log,
+    mirroring the existing advisory-reason log guarantee."""
+    server = AgentServer(
+        machine_name="t",
+        repos=["api"],
+        repo_paths={"api": str(repo_local_only)},
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: [
+            "/bin/sh", "-c", f"printf '%s\\n' '{_POLICY_REFUSAL_RESULT_LINE}'"
+        ],
+    )
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path=str(repo_local_only),
+        issue_number=2196,
+        issue_title="doc-only issue",
+        briefing="b",
+        branch="main",
+    )
+    a = server.assign(spec)
+    final = server.wait_for(a.id, timeout=10)
+
+    assert final.status == REFUSED_POLICY
+    assert final.log_path is not None
+    log_text = Path(final.log_path).read_text()
+    assert "refused_policy" in log_text.lower(), (
+        f"expected 'refused_policy' in log, got:\n{log_text}"
+    )
+    server.shutdown()
+
+
+def test_stuck_zero_commit_without_policy_markers_is_still_advisory(
+    tmp_path: Path, repo_local_only: Path
+) -> None:
+    """#2234 acceptance: a worker that genuinely got stuck (out of turns, no
+    repo-rule citation) must be COMPLETELY unaffected — same ADVISORY status
+    as before this feature existed. This is the regression guard against
+    `_looks_like_policy_refusal` over-matching."""
+    server = AgentServer(
+        machine_name="t",
+        repos=["api"],
+        repo_paths={"api": str(repo_local_only)},
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: [
+            "/bin/sh", "-c", f"printf '%s\\n' '{_STUCK_RESULT_LINE}'"
+        ],
+    )
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path=str(repo_local_only),
+        issue_number=2197,
+        issue_title="genuinely hard issue",
+        briefing="b",
+        branch="main",
+    )
+    a = server.assign(spec)
+    final = server.wait_for(a.id, timeout=10)
+
+    assert final.status == ADVISORY, (
+        f"a stuck (non-policy) 0-commit exit must stay ADVISORY, got "
+        f"{final.status!r}"
+    )
+    assert final.zero_commit_reason is not None
+    assert final.policy_refusal_reason is None
+    server.shutdown()
+
+
+def test_nonzero_commit_with_claude_md_mention_is_still_done(
+    tmp_path: Path, repo_with_remote: tuple[Path, Path],
+) -> None:
+    """A worker that pushed real commits AND happens to mention CLAUDE.md in
+    its final message (e.g. "per CLAUDE.md I ran the build first") must
+    never be reclassified — this check only ever fires on the 0-commit
+    shape."""
+    clone, _origin = repo_with_remote
+    worker_sh = (
+        "git config user.email w@w.com && "
+        "git config user.name Worker && "
+        "echo change > change.txt && "
+        "git add change.txt && "
+        "git commit -m 'real work' && "
+        f"printf '%s\\n' '{_POLICY_REFUSAL_RESULT_LINE}'"
+    )
+    server = AgentServer(
+        machine_name="t",
+        repos=["api"],
+        repo_paths={"api": str(clone)},
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: ["/bin/sh", "-c", worker_sh],
+    )
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path=str(clone),
+        issue_number=2198,
+        issue_title="real work that happens to cite CLAUDE.md",
+        briefing="b",
+        branch="main",
+    )
+    a = server.assign(spec)
+    final = server.wait_for(a.id, timeout=15)
+
+    assert final.status == DONE, (
+        f"expected DONE for a non-zero commit exit regardless of message "
+        f"content, got {final.status!r}"
+    )
+    assert final.policy_refusal_reason is None
+    server.shutdown()
+
+
+def test_policy_refusal_survives_persist_load(
+    tmp_path: Path, repo_local_only: Path
+) -> None:
+    """`policy_refusal_reason` round-trips through the agent state JSON
+    (persist → load), mirroring the existing advisory round-trip guarantee."""
+    from coord.agent import AgentAssignment  # noqa: PLC0415
+
+    a = AgentAssignment(
+        id="refused-policy-001",
+        spec=AssignmentSpec(
+            repo_name="api",
+            repo_path="/tmp",
+            issue_number=2195,
+            issue_title="t",
+            briefing="b",
+        ),
+        status=REFUSED_POLICY,
+        policy_refusal_reason="Confirmed: the rule exists verbatim at CLAUDE.md line 156",
+        exit_code=0,
+        finished_at=1234567890.0,
+    )
+    d = a.to_dict()
+    assert d["status"] == REFUSED_POLICY
+    assert "CLAUDE.md" in d["policy_refusal_reason"]
+
+    spec_data = d.pop("spec")
+    spec = AssignmentSpec(**spec_data)
+    a2 = AgentAssignment(spec=spec, **d)
+    assert a2.status == REFUSED_POLICY
+    assert a2.policy_refusal_reason == a.policy_refusal_reason
+
+
+def test_health_counts_refused_policy_as_completed(
+    tmp_path: Path, repo_local_only: Path
+) -> None:
+    """health() must count REFUSED_POLICY assignments as completed, not
+    active — mirrors the existing ADVISORY guarantee."""
+    server = AgentServer(
+        machine_name="t",
+        repos=["api"],
+        repo_paths={"api": str(repo_local_only)},
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: [
+            "/bin/sh", "-c", f"printf '%s\\n' '{_POLICY_REFUSAL_RESULT_LINE}'"
+        ],
+    )
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path=str(repo_local_only),
+        issue_number=2199,
+        issue_title="doc-only issue",
+        briefing="b",
+        branch="main",
+    )
+    a = server.assign(spec)
+    final = server.wait_for(a.id, timeout=10)
+    assert final.status == REFUSED_POLICY
+
+    h = server.health()
+    assert h["active"] == 0, "REFUSED_POLICY must not count as active"
+    assert h["completed"] >= 1, "REFUSED_POLICY must count as completed"
+    server.shutdown()
+
+
+# ── `_looks_like_policy_refusal` unit tests — the pure detector itself ───────
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Confirmed: the rule exists verbatim at CLAUDE.md line 156.",
+        "This is coordinator work per files_forbidden in the briefing.",
+        "Only the coordinator writes docs — stopping here.",
+        "This issue should never have been dispatched to a worker.",
+    ],
+)
+def test_looks_like_policy_refusal_matches_rule_citations(text: str) -> None:
+    assert _looks_like_policy_refusal(text) is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        None,
+        "",
+        "STUCK: could not find the relevant module after two approaches.",
+        "Implemented the feature and pushed the branch.",
+    ],
+)
+def test_looks_like_policy_refusal_does_not_match_ordinary_text(text) -> None:
+    assert _looks_like_policy_refusal(text) is False
