@@ -241,6 +241,29 @@ class TestFleetWideProbe:
         assert "port .githooks/" in (ported[0].fix or "")
         assert "graph.machine_hooks_missing" not in _checks(report)
 
+    def test_an_agent_too_old_to_answer_gets_no_vote_on_the_hooks(self, config_path):
+        """`hooks_shipped` is new in #2237. An agent that does not publish it
+        has said nothing — and counting silence as either answer would be
+        inventing evidence (#1525's rule). With no votes the finding is not
+        asserted from the fleet at all."""
+        from coord.config import load
+
+        cfg = load(config_path)
+        statuses = []
+        for m in cfg.machines:
+            graph = _graph_result("api", "/home/u/src/api", hooks_ok=False,
+                                  hooks_detail="core.hooksPath is unset")
+            del graph["values"]["hooks_shipped"]  # pre-#2237 agent
+            statuses.append(_status(m, graph=graph))
+
+        facts = ro.gather_facts(cfg, "api", statuses=statuses, probe_github=False)
+        report = ro.evaluate(facts)
+
+        assert "graph.hooks_not_ported" not in _checks(report)
+        # ...and the machine-local reading is still offered, since that is the
+        # one an operator can act on without knowing which failure it is.
+        assert "graph.machine_hooks_missing" in _checks(report)
+
     def test_hooks_unset_on_one_machine_is_that_machine_s_problem(self, config_path):
         """The other side of the split: the repo ships the hooks, one machine
         never ran the `git config`. That one IS automatable, and --fix does it."""
@@ -264,6 +287,46 @@ class TestFleetWideProbe:
         f = next(f for f in report.findings if f.check == "graph.machine_hooks_missing")
         assert "dellserver" in f.summary
         assert "--fix" in (f.fix or "")
+
+
+class TestFleetReportFoldIn:
+    """#2237 item 4's other consequence: `coord doctor` folds repo doctor in,
+    so a WARN-forever layer 5 never escalated there either — which is *why*
+    two repos ran for weeks with no graph and nothing said so out loud."""
+
+    def test_a_graph_blind_repo_reaches_the_fleet_report(self, config_path):
+        from coord.config import load
+
+        cfg = load(config_path)
+        statuses = [
+            _status(m, graph=_graph_result("api", "/home/u/src/api", present=False))
+            for m in cfg.machines
+        ]
+        facts = ro.gather_facts(cfg, "api", statuses=statuses, probe_github=False)
+        lines = ro.doctor_summary_lines(ro.evaluate(facts))
+
+        assert any("graph.fleet_not_built" in line for _, line in lines)
+        assert all(is_problem for is_problem, _ in lines)
+
+    def test_one_machine_missing_its_graph_stays_out_of_the_fleet_report(
+        self, config_path
+    ):
+        """A report that is always red is a report nobody reads. The self-heal
+        is already rebuilding this one."""
+        from coord.config import load
+
+        cfg = load(config_path)
+        laptop, dellserver = cfg.machines
+        statuses = [
+            _status(laptop, graph=_graph_result("api", "/home/u/src/api")),
+            _status(
+                dellserver,
+                graph=_graph_result("api", "/home/u/src/api", present=False),
+            ),
+        ]
+        facts = ro.gather_facts(cfg, "api", statuses=statuses, probe_github=False)
+
+        assert ro.doctor_summary_lines(ro.evaluate(facts)) == []
 
 
 # ── the machine-local repair itself ─────────────────────────────────────────
