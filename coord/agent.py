@@ -1118,6 +1118,7 @@ def _worker_subprocess_env(
     prefix: str | None = None,
     base_prefix: str | None = None,
     cwd: "str | Path | None" = None,
+    assignment_id: str | None = None,
 ) -> dict[str, str]:
     """Environment for worker `claude -p` subprocesses, with the agent's own
     venv removed (#402).
@@ -1150,6 +1151,21 @@ def _worker_subprocess_env(
     ``provider.env()`` on top of this result may still override ``PWD``
     deliberately; that ordering is preserved since we only set it here, not
     after.
+
+    #2217: ``assignment_id``, when given, is written to
+    ``COORD_ASSIGNMENT_ID``. The headless worker prompt (built in
+    ``review.py`` and elsewhere) tells every worker that if this variable is
+    set it should call ``coord report-result --assignment
+    "$COORD_ASSIGNMENT_ID" ...`` directly as the *authoritative* verdict
+    path, with the transcript-parsed ``END_REVIEW`` block as a fallback only.
+    Before this, nothing in the headless ``claude -p`` dispatch lane (this
+    function is the only place that lane's subprocess environment is built)
+    ever set the variable, so that "primary" path was dead on arrival for
+    every headless review — the fragile transcript parse was silently the
+    *only* path, not a backup. Both spawn call sites below pass
+    ``assignment_id=assignment.id`` so it's set for every worker type (review,
+    smoke, work), matching what ``coord/commands/review.py`` already reads as
+    its ``--assignment`` default.
     """
     env = dict(os.environ if base_env is None else base_env)
     pfx = sys.prefix if prefix is None else prefix
@@ -1171,6 +1187,9 @@ def _worker_subprocess_env(
 
     if cwd is not None:
         env["PWD"] = str(cwd)
+
+    if assignment_id is not None:
+        env["COORD_ASSIGNMENT_ID"] = assignment_id
 
     return env
 
@@ -6494,7 +6513,7 @@ class AgentServer:
         # daemon happened to start in — worktree confinement for those
         # providers must not depend on `bash_wrap_spawn` recomputing PWD as
         # a side effect (see `_maybe_bash_wrap`).
-        _spawn_env = _worker_subprocess_env(cwd=repo_path)
+        _spawn_env = _worker_subprocess_env(cwd=repo_path, assignment_id=assignment.id)
         # #1402: shared per-repo cargo target dir (see coord.cargo_cache).
         # Must stay in sync with the PTY path in ``_spawn_pty``.
         _spawn_env.update(
@@ -6668,7 +6687,7 @@ class AgentServer:
             # docstring above), so unlike the headless path it never got an
             # incidental PWD correction — confinement here must not depend
             # on a provider trusting $PWD over getcwd() by accident.
-            env = _worker_subprocess_env(cwd=repo_path)
+            env = _worker_subprocess_env(cwd=repo_path, assignment_id=assignment.id)
             env.setdefault("TERM", "xterm-256color")
             # #1402: point cargo at this machine's shared per-repo target dir
             # so the build cache survives worktree cleanup and is reused by

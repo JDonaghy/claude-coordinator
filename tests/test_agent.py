@@ -146,6 +146,36 @@ def test_worker_env_no_cwd_leaves_pwd_untouched() -> None:
     assert env["PWD"] == "/whatever"
 
 
+def test_worker_env_sets_coord_assignment_id() -> None:
+    """#2217: the headless worker prompt (review.py) tells every worker that
+    if $COORD_ASSIGNMENT_ID is set, it must report its verdict straight to
+    the coordinator board via `coord report-result` as the *authoritative*
+    path — with the transcript-parsed END_REVIEW block as a fallback only.
+    Nothing set the variable for the headless `claude -p` dispatch lane, so
+    that "primary" instruction was dead on arrival for every review and the
+    fragile transcript parse was silently the only path. Both `_spawn` call
+    sites must pass assignment_id= so this is set for every worker type."""
+    env = _worker_subprocess_env(
+        {"PATH": "/usr/bin"},
+        prefix="/usr",
+        base_prefix="/usr",
+        assignment_id="abc123",
+    )
+    assert env["COORD_ASSIGNMENT_ID"] == "abc123"
+
+
+def test_worker_env_no_assignment_id_leaves_var_unset() -> None:
+    """When assignment_id isn't passed, COORD_ASSIGNMENT_ID must not appear
+    at all (not even empty) — callers that don't have an assignment yet
+    (e.g. standalone helper use) shouldn't leak a stale/empty value."""
+    env = _worker_subprocess_env(
+        {"PATH": "/usr/bin"},
+        prefix="/usr",
+        base_prefix="/usr",
+    )
+    assert "COORD_ASSIGNMENT_ID" not in env
+
+
 def test_health_reports_machine(tmp_path: Path) -> None:
     server = _server(tmp_path)
     h = server.health()
@@ -428,6 +458,40 @@ def test_spawn_sets_pwd_to_worktree_bash_wrap_enabled(tmp_path: Path) -> None:
     assert captured_env, "Popen was not called"
     assert final.worktree_path is not None
     assert captured_env[0]["PWD"] == final.worktree_path
+    server.shutdown()
+
+
+def test_spawn_sets_coord_assignment_id(tmp_path: Path) -> None:
+    """#2217: the headless `_spawn` path must set COORD_ASSIGNMENT_ID to the
+    assignment's own id — this is the variable the review prompt tells every
+    worker to use for `coord report-result --assignment "$COORD_ASSIGNMENT_ID"
+    ...`, the "authoritative" primary verdict path. Before #2217 nothing set
+    it anywhere in this dispatch lane, so that instruction was silently
+    unreachable for every headless review; only the fragile transcript-parsed
+    END_REVIEW fallback ever ran. This test must fail against pre-#2217 code.
+    """
+    import coord.agent as agent_mod
+
+    repo = _init_repo(tmp_path / "repo")
+    server = _server(tmp_path, repo_path=repo)
+
+    captured_env: list[dict[str, str]] = []
+    real_popen = agent_mod.subprocess.Popen
+
+    def recording_popen(spawn_argv, *args, **kwargs):
+        if kwargs.get("start_new_session"):
+            captured_env.append(dict(kwargs.get("env") or {}))
+        return real_popen(spawn_argv, *args, **kwargs)
+
+    agent_mod.subprocess.Popen = recording_popen  # type: ignore[assignment]
+    try:
+        a = server.assign(_spec(repo, type="review"))
+        final = server.wait_for(a.id)
+    finally:
+        agent_mod.subprocess.Popen = real_popen  # type: ignore[assignment]
+
+    assert captured_env, "Popen was not called"
+    assert captured_env[0]["COORD_ASSIGNMENT_ID"] == final.id == a.id
     server.shutdown()
 
 
