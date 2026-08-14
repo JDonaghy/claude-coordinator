@@ -774,21 +774,44 @@ def _health_vs_config_lines(machine, health: dict) -> list[tuple[bool, str]]:
         # perfectly healthy. `coord config`/`coord status` both read
         # config, so both still advertised it; only the live agent —
         # and, at dispatch cost, the drive queue that burned both retry
-        # attempts on it — knew better. Same repair as the total-mismatch
-        # case: restart coord-agent on that machine to make it re-read
-        # coordinator.yml.
+        # attempts on it — knew better.
+        #
+        # `published_repos` (``/health``'s ``repos``) is
+        # ``AgentServer._servable_repos()``'s FILTERED list (#1527) — it
+        # also drops any repo that IS configured on that machine but is
+        # DEGRADED (no ``repo_paths`` entry, or the configured path is
+        # missing on disk). A drifted repo that's actually degraded is not
+        # the #2219 stale-config story: `AgentServer.assign()` gates on the
+        # UNFILTERED `self.repos`, so it would still accept that repo and
+        # fail later with a distinct "repo path does not exist" error —
+        # restarting coord-agent cannot repair a missing/misconfigured
+        # `repo_paths` entry. Split on `degraded` so each drifted repo gets
+        # the accurate story and remedy.
         drifted = [r for r in declared_repos if r not in published_repos]
-        if drifted:
+        stale = [r for r in drifted if r not in degraded]
+        if stale:
             out.append((
                 True,
                 f"  ✗ CRIT repos: coordinator.yml declares {declared_repos} "
-                f"but /health only advertises {published_repos} — {drifted} "
+                f"but /health only advertises {published_repos} — {stale} "
                 "were added to config after this agent process started and "
                 "it hasn't re-read them; a dispatch to any of "
-                f"{drifted} on this machine will be refused despite `coord "
+                f"{stale} on this machine will be refused despite `coord "
                 "config`/`coord status` showing it as supported (#2219). "
                 "Restart coord-agent on this machine to pick it up.",
             ))
+        for repo in drifted:
+            if repo in degraded:
+                out.append((
+                    True,
+                    f"  ✗ CRIT repos: coordinator.yml declares {repo!r} for "
+                    "this machine and the live agent agrees it's "
+                    f"configured, but it's DEGRADED there, not just "
+                    f"unrefreshed: {degraded[repo]} (#1527). This is not "
+                    "the #2219 stale-config case — restarting coord-agent "
+                    f"will not fix it; repair repo_paths[{repo!r}] on this "
+                    "machine instead.",
+                ))
 
     return out
 

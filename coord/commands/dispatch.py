@@ -9,6 +9,7 @@ import dataclasses
 import socket
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import click
 import httpx
@@ -30,6 +31,9 @@ from coord.commands.dispatch_workers import (
     _dispatch_smoke_of,
     _dispatch_troubleshoot,
 )
+
+if TYPE_CHECKING:
+    from coord.models import Machine
 
 
 def _stdin_is_tty() -> bool:
@@ -90,7 +94,7 @@ def _require_interactive_tty(dry_run: bool) -> None:
 
 
 def _repo_capability_refusal(
-    machine_obj: object, repo: str, *, timeout: float = 3.0
+    machine_obj: Machine, repo: str, *, timeout: float = 3.0
 ) -> str | None:
     """Cross-check *repo* against the target agent's LIVE ``/health`` repo
     list, returning a refusal message when the two disagree — or ``None``
@@ -110,21 +114,35 @@ def _repo_capability_refusal(
     outright, and a drive queue burned both retry attempts discovering that
     by trial before landing terminally ``blocked`` (#2219). This is the
     same ``/health`` read ``coord status``/``coord doctor`` already make
-    (``coord.network.check_machine``) — reused, not duplicated — compared
-    against *repo* the same way ``AgentServer.assign()`` itself does
-    (``coord/agent.py``), so the CLI message matches the one the agent
-    would have produced, just BEFORE any claim/worktree/network work runs
-    instead of after.
+    (``coord.network.check_machine``) — reused, not duplicated.
 
-    Deliberately narrow: only refuses when the agent is reachable, ANSWERED
-    with a real ``/health`` body, is not running config-free (#1801 — a
-    config-free agent's repos come from the dispatch payload, not its own
-    config, so an empty/mismatched list there is not a capability gap), and
-    published a NON-empty repo list that plainly excludes *repo*. Every
-    other case (offline, timeout, old agent with no ``repos`` key, empty
-    list) falls through to ``None`` — today's behavior, where the POST
-    itself is left to surface a real problem — so this never turns a
-    transient network hiccup into a new dispatch failure mode.
+    ``/health``'s ``repos`` field is NOT what ``AgentServer.assign()``
+    itself gates on, though — it's ``AgentServer._servable_repos()``'s
+    FILTERED list (``coord/agent.py``, #1527), which drops any repo with no
+    ``repo_paths`` entry or whose configured path is missing on disk.
+    ``assign()``'s own gate (``coord/agent.py``: ``if self.repos and
+    spec.repo_name not in self.repos``) checks the UNFILTERED
+    ``self.repos``. The two disagree exactly when a repo is configured on
+    that machine but degraded (``/health``'s ``degraded`` dict, #1527): in
+    that case ``assign()`` would NOT reject with "does not handle repo" —
+    it proceeds and fails later with the distinct "repo path does not
+    exist" — so this helper checks ``degraded`` FIRST and reports that
+    reason (with no restart advice, since restarting coord-agent cannot
+    repair a missing/misconfigured ``repo_paths`` entry) before ever
+    falling back to the "hasn't re-read config since *repo* was added"
+    story, which is only accurate when *repo* is absent from ``/health``
+    entirely — not merely degraded.
+
+    Deliberately narrow otherwise: only refuses when the agent is
+    reachable, ANSWERED with a real ``/health`` body, is not running
+    config-free (#1801 — a config-free agent's repos come from the dispatch
+    payload, not its own config, so an empty/mismatched list there is not a
+    capability gap), and either lists *repo* as degraded or published a
+    NON-empty repo list that plainly excludes it. Every other case
+    (offline, timeout, old agent with no ``repos`` key, empty list) falls
+    through to ``None`` — today's behavior, where the POST itself is left
+    to surface a real problem — so this never turns a transient network
+    hiccup into a new dispatch failure mode.
     """
     from coord.network import check_machine
 
@@ -134,6 +152,17 @@ def _repo_capability_refusal(
     health = status.health
     if health.get("config_free"):
         return None
+    degraded = health.get("degraded") or {}
+    if repo in degraded:
+        return (
+            f"{machine_obj.name!r} lists {repo!r} in coordinator.yml, and "
+            f"the live agent agrees it's configured, but the repo is "
+            f"DEGRADED there, not just unrefreshed: {degraded[repo]} "
+            f"(#1527). This is not the #2219 stale-config case — "
+            f"restarting coord-agent will not fix a missing or "
+            f"misconfigured repo_paths entry. Repair repo_paths[{repo!r}] "
+            f"on {machine_obj.name!r} instead, then retry."
+        )
     live_repos = health.get("repos")
     if not live_repos or repo in live_repos:
         return None

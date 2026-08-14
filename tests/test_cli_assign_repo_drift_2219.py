@@ -124,6 +124,38 @@ class TestRepoCapabilityRefusalUnit:
         )
         assert _repo_capability_refusal(_machine(), "stick-demo") is None
 
+    def test_degraded_repo_gets_its_own_reason_not_the_stale_config_story(
+        self, monkeypatch
+    ) -> None:
+        """A repo missing from /health's `repos` because it's DEGRADED
+        (#1527 — no repo_path entry, or the configured path doesn't exist)
+        is not the #2219 stale-config shape: `AgentServer.assign()` gates
+        on the UNFILTERED `self.repos`, which still contains a degraded
+        repo, so it would NOT reject with "does not handle repo" — it
+        would proceed and fail later with a distinct "repo path does not
+        exist" error. The refusal message must say so and must not tell
+        the operator to restart coord-agent, which cannot fix a missing
+        repo_paths entry."""
+        monkeypatch.setattr(
+            "coord.network.check_machine",
+            lambda *a, **k: MachineStatus(
+                machine=_machine(), state=ONLINE, latency_ms=5.0,
+                health={
+                    "machine": "dellserver",
+                    "repos": ["api"],
+                    "degraded": {
+                        "stick-demo": "no repo_path configured for this machine",
+                    },
+                },
+            ),
+        )
+        reason = _repo_capability_refusal(_machine(), "stick-demo")
+        assert reason is not None
+        assert "no repo_path configured for this machine" in reason
+        assert "does not handle repo" not in reason
+        assert "hasn't re-read its config" not in reason
+        assert "Restart coord-agent" not in reason
+
     def test_none_when_agent_is_config_free(self, monkeypatch) -> None:
         """#1801: a config-free agent's repos come from the dispatch
         payload, not its own config — a mismatch there is not a capability
