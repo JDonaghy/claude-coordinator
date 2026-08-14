@@ -230,6 +230,62 @@ class TestHealthVsConfigLines:
             "CRIT repos" in text and "stick-demo" in text for _, text in lines
         )
 
+    def test_partial_repo_drift_is_degraded_not_stale_when_in_degraded_dict(
+        self,
+    ) -> None:
+        """#2219 follow-up: a repo missing from `/health`'s `repos` because
+        it's DEGRADED (#1527 — no repo_path entry, or the configured path
+        doesn't exist) is not the "hasn't re-read config" story —
+        `AgentServer.assign()` gates on the UNFILTERED `self.repos`, which
+        still contains a degraded repo, so it would NOT reject with "does
+        not handle repo"; it would proceed and fail later with a distinct
+        "repo path does not exist" error. `coord doctor` must say so and
+        must not tell the operator to restart coord-agent, which cannot fix
+        a missing/misconfigured repo_paths entry."""
+        lines = _health_vs_config_lines(
+            self._machine(repos=["vimcode", "quadraui", "stick-demo"]),
+            {
+                "capabilities": ["gtk", "rust", "python"],
+                "repos": ["vimcode", "quadraui"],
+                "degraded": {
+                    "stick-demo": "no repo_path configured for this machine",
+                },
+            },
+        )
+        assert any(is_problem for is_problem, _ in lines)
+        assert any(
+            "stick-demo" in text and "no repo_path configured" in text
+            for _, text in lines
+        )
+        joined = "\n".join(text for _, text in lines)
+        assert "hasn't re-read them" not in joined
+        assert "Restart coord-agent" not in joined
+
+    def test_partial_repo_drift_mixed_stale_and_degraded_repos(self) -> None:
+        """One repo genuinely stale (missing from /health, not degraded)
+        and one degraded (missing from /health, present in `degraded`) —
+        each must get its own accurate story, not be lumped together."""
+        lines = _health_vs_config_lines(
+            self._machine(repos=["vimcode", "quadraui", "stick-demo", "tui"]),
+            {
+                "capabilities": ["gtk", "rust", "python"],
+                "repos": ["vimcode", "quadraui"],
+                "degraded": {
+                    "tui": "repo_path /home/x/src/tui does not exist",
+                },
+            },
+        )
+        joined = "\n".join(text for _, text in lines)
+        assert "stick-demo" in joined and "hasn't re-read them" in joined
+        assert "tui" in joined and "repo_path /home/x/src/tui does not exist" in joined
+        # The stale-config CRIT's *drifted-repos* list — the part actually
+        # blamed on staleness — must name only the truly-stale repo, not
+        # the degraded one (which `declared_repos` also mentions, harmlessly,
+        # in the same line's leading "coordinator.yml declares [...]" clause).
+        stale_lines = [t for _, t in lines if "hasn't re-read them" in t]
+        assert len(stale_lines) == 1
+        assert "['stick-demo'] were added to config" in stale_lines[0]
+
     def test_partial_repo_drift_is_silent_when_agent_is_config_free(self) -> None:
         """A config-free agent's repos come from the dispatch payload, not
         its own coordinator.yml (#1801) — a mismatch against the
