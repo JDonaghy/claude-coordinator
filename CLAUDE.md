@@ -155,7 +155,7 @@ One line each — the reasoning behind them is in
 - **`coordinator.yml` is the single source of truth** for repo topology, machine capabilities, dependencies, concurrency limits, review settings, smoke-test rules, and the pipeline gate order (`pipeline.default_gates`). It lives in `~/.coord/`, **not** the repo checkout.
 - **User approves everything.** `coord plan` proposes, the user reviews, `coord approve` dispatches. No autonomous dispatch.
 - **Claim detection prevents duplicate work.** Before dispatching, the coordinator checks the board for active assignments and the remote for `issue-{N}-*` branches.
-- **Conflict rules are inferred, not configured.** The brain reads issue bodies and infers which files will be touched.
+- **Conflict rules are inferred, not configured** — and only on the `coord plan` path. Overlap avoidance is a line in the planning brain's *prompt*, not a mechanism; the drive queue bypasses the brain entirely, so unattended work gets no file-overlap check. There is no `file_groups`/`exclusive_files` config.
 - **Adversarial reviews are rule-enforcing, not rubber-stamping.** On worker completion a fresh `claude -p` session on a *different* machine reviews the PR diff against this file and the review checklist, with zero shared context with the worker — that's the whole point.
 - **The pipeline order is `Work → Test → Review → Merge`.** Test precedes Review; the headless auto-loop holds review dispatch until there is a `passed`/`skipped` test verdict.
 - **Merge is gated on CI checks (#240).** `coord merge` refuses when a check failed or is still running — and a PR with *zero* reported checks is not automatically clear either (#1904).

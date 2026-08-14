@@ -253,13 +253,39 @@ brain. This is deliberate: the agent is a long-running daemon on someone else's 
 every rule it enforces is a rule that needs a release plus `coord agent update` to change.
 Keeping it thin keeps the deploy lane cold.
 
-### Conflict rules are inferred, not configured
+### Conflict rules are inferred, not configured — and the inference runs on ONE path only
 
-The coordinator brain reads issue bodies and infers which files will be touched. There is no
-DSL for conflict zones — optional `file_groups` and `exclusive_files` in `coordinator.yml`
-exist for power users, but the default path is inference. A configuration language for
-conflicts would need maintaining in lockstep with the code it describes; inference degrades
-gracefully instead.
+The deliberate choice is that there is **no DSL for conflict zones**. A configuration
+language for conflicts would need maintaining in lockstep with the code it describes;
+inference degrades gracefully instead.
+
+What that inference actually is, precisely: a line in the planning brain's **prompt**
+(`coord/brain.py:34`) —
+
+> If two issues would touch overlapping files in the same repo, do NOT assign them
+> simultaneously — flag the conflict and pick the higher-priority one.
+
+Two consequences worth stating plainly, because both have cost real work:
+
+- **It is a prompt instruction, not a mechanism.** Nothing computes a file set or compares
+  one; the planning model is asked to notice. There is no code path that can refuse a
+  dispatch for file overlap.
+- **It only runs on the `coord plan` → `coord approve` path.** The drive queue dispatches
+  through `coord drive` → `coord assign` and never consults the brain, so unattended work —
+  which is most work — gets no overlap check at all. Both same-file collisions on
+  2026-08-14 (quadraui #306/#309 against #307/#308, and claude-coordinator #2234 against
+  #2230, all four appending to a single file) arrived through the queue.
+
+`claim.py` does not close this gap: it is issue-level only (an active board assignment, or
+an existing `issue-{N}-*` remote branch), with no file awareness.
+
+**`file_groups` and `exclusive_files` do not exist.** Earlier revisions of this note offered
+them as optional power-user config; no such keys are read anywhere in `coord/`, and none
+appear in any `coordinator.yml`. Treat any reference to them as stale.
+
+The exact, zero-prediction signal that *is* available is GitHub's own `mergeable` field
+(`GhOps.check_pr_mergeable`), but today it is consulted only at merge time — after the leg
+is already spent. See #2231.
 
 ### `coordinator.yml` lives in `~/.coord/`, not the repo checkout
 
