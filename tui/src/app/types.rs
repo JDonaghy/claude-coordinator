@@ -895,6 +895,17 @@ pub(crate) struct BoardDriveQueueEntry {
     /// silent, so it is carried on the wire rather than re-derived.
     #[serde(default)]
     pub(crate) hold_probes: i64,
+    /// #2186: how FAR a fired gate reaches — `"entry"` (the default) holds
+    /// only entries whose own `after` names this gate's key; `"fleet"` is
+    /// the pre-#2186 whole-queue stop, now opt-in only.
+    ///
+    /// Fail-closed, mirroring `coord.drive_queue.QueueEntry.
+    /// _normalize_hold_scope`: `""` (a row predating this column, or any
+    /// other server this build has never heard of) reads as entry-scoped,
+    /// the narrower/safer reading — NEVER as fleet-wide. See
+    /// `drive_queue::stops_fleet`, the one place this is consulted.
+    #[serde(default)]
+    pub(crate) hold_scope: String,
 }
 
 impl BoardDriveQueueEntry {

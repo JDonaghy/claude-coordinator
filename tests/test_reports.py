@@ -650,6 +650,7 @@ def _dq_row(
     hold_state: str = "",
     hold_reason: str = "",
     resume_when: str = "",
+    hold_scope: str = "entry",
 ) -> dict:
     """One row in the exact shape ``coord.state.list_drive_queue`` returns —
     raw column names (``repo_name``/``issue_number``/``state``), ``after_json``
@@ -674,6 +675,7 @@ def _dq_row(
         "resume_when": resume_when,
         "hold_state": hold_state,
         "hold_probes": 0,
+        "hold_scope": hold_scope,
     }
 
 
@@ -812,6 +814,29 @@ class TestFoldDriveQueueStatus:
         assert row["session_name"] == "s1"
         assert row["hold_reason"] == "deploy gate"
         assert row["resume_when"] == "ready"
+
+    def test_hold_scope_is_present_and_defaults_to_entry(self) -> None:
+        """#2186: a report consumer needs to tell "this entry alone is
+        held" from "the whole queue stopped" — the same blind spot the TUI
+        had before its own #2186 fix."""
+        result = fold_drive_queue_status([_dq_row(1)], 1000.0)
+        assert result.rows[0]["hold_scope"] == "entry"
+
+    def test_hold_scope_fleet_passes_through(self) -> None:
+        result = fold_drive_queue_status(
+            [_dq_row(1, hold_scope="fleet")], 1000.0
+        )
+        assert result.rows[0]["hold_scope"] == "fleet"
+
+    def test_hold_scope_fails_closed_to_entry_on_garbage(self) -> None:
+        """Mirrors `QueueEntry._normalize_hold_scope`: anything other than
+        the literal `"fleet"` — a row predating the column, or a value this
+        build has never heard of — reads as the narrower `"entry"`, never
+        silently as a fleet-wide stop."""
+        result = fold_drive_queue_status(
+            [_dq_row(1, hold_scope="something-unexpected")], 1000.0
+        )
+        assert result.rows[0]["hold_scope"] == "entry"
 
     def test_standing_queue_escalation_surfaced_in_notes_when_present(self) -> None:
         result = fold_drive_queue_status(

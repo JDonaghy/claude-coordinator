@@ -1620,6 +1620,48 @@ def test_add_hold_after_can_declare_fleet_scope(cli):
     assert "fleet-wide" in listed.output
 
 
+def test_readd_without_repeating_scope_fleet_warns_of_the_downgrade(cli):
+    """A silent narrowing of an already-fleet-scoped gate must not be
+    silent (review non-blocking finding on #2186): re-adding #1753 with
+    `--hold-after` but no `--scope fleet` writes `hold_scope=entry` again
+    (fail-closed to the narrower scope is correct), but the operator gets a
+    warning rather than discovering the downgrade later."""
+    first = cli(
+        "add", REPO, "1753",
+        "--hold-after", "--hold-reason", "deploy", "--scope", "fleet",
+    )
+    assert first.exit_code == 0, first.output
+    assert queued(1753)["hold_scope"] == "fleet"
+
+    second = cli("add", REPO, "1753", "--hold-after", "--hold-reason", "deploy")
+    assert second.exit_code == 0, second.output
+    assert queued(1753)["hold_scope"] == "entry"
+    assert "warning" in second.output
+    assert "fleet" in second.output
+
+
+def test_readd_repeating_scope_fleet_does_not_warn(cli):
+    first = cli(
+        "add", REPO, "1753",
+        "--hold-after", "--hold-reason", "deploy", "--scope", "fleet",
+    )
+    assert first.exit_code == 0, first.output
+
+    second = cli(
+        "add", REPO, "1753",
+        "--hold-after", "--hold-reason", "deploy", "--scope", "fleet",
+    )
+    assert second.exit_code == 0, second.output
+    assert queued(1753)["hold_scope"] == "fleet"
+    assert "warning" not in second.output
+
+
+def test_first_add_with_default_scope_does_not_warn(cli):
+    result = cli("add", REPO, "1753", "--hold-after", "--hold-reason", "deploy")
+    assert result.exit_code == 0, result.output
+    assert "warning" not in result.output
+
+
 def test_scope_fleet_without_hold_after_is_refused(cli):
     result = cli("add", REPO, "1753", "--scope", "fleet")
     assert result.exit_code != 0
