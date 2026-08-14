@@ -463,6 +463,110 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             raised              INTEGER NOT NULL DEFAULT 0
         );
 
+        -- #1982 (epic #836): the coord-side half of the portal sync bridge —
+        -- see coord/portal_sync.py for the loop that reads/writes these three
+        -- tables and docs/CUSTOMER_PORTAL.md ("The sync bridge") for why the
+        -- bridge is outbound-only.
+        --
+        -- OWNERSHIP, which is the whole reason there are two tables and not
+        -- one: the portal is the SOLE WRITER of customer-authored facts
+        -- (intake text, sign-off verdicts, answers) and coord is the SOLE
+        -- WRITER of engineer-authored facts (status, design rounds,
+        -- questions).  `portal_events` below is a read-only MIRROR of the
+        -- former — nothing in coord ever pushes a row of it back — and
+        -- `portal_outbox` is the queue of the latter.  Nothing is co-written,
+        -- so there is no merge problem and no split-brain.
+
+        -- Inbound mirror: one row per event pulled from
+        -- `GET /api/bridge/pull`, keyed on the portal's own stable event id
+        -- so a replay from a stale cursor is a no-op (`INSERT OR IGNORE`,
+        -- coord/portal_store.py `record_events`).  The cursor only advances
+        -- AFTER the page's rows commit, so a crash mid-page replays the page
+        -- rather than skipping it — a submission made while the daemon was
+        -- down queues, it does not vanish.  `payload_json` is the raw event
+        -- verbatim: this table is an inbox, and parsing an event into
+        -- coord-side work is a separate (downstream) concern that must be
+        -- able to re-read the original.  `handled_at` is NULL until
+        -- something downstream consumes the event.
+        CREATE TABLE IF NOT EXISTS portal_events (
+            event_id      TEXT    PRIMARY KEY,
+            submission_id TEXT    NOT NULL DEFAULT '',
+            kind          TEXT    NOT NULL DEFAULT '',
+            occurred_at   TEXT    NOT NULL DEFAULT '',
+            payload_json  TEXT    NOT NULL DEFAULT '{}',
+            received_at   REAL    NOT NULL,
+            handled_at    REAL
+        );
+
+        -- Outbound queue: one row per coord-owned fact waiting to be pushed.
+        --
+        -- `seq` is a DENSE per-submission FIFO order and `revision` the
+        -- monotonic counter the portal dedupes on (its `applyUpdate`
+        -- watermark ignores anything at or below what it already stored, so
+        -- re-pushing an unconfirmed row is safe).  Both are allocated at
+        -- ENQUEUE time and never rewritten, which is what makes a retry
+        -- idempotent rather than a second write at a new revision.
+        --
+        -- `announces` is the ordering safety belt and the reason this is a
+        -- queue instead of a direct call.  A status like `awaiting-signoff`
+        -- does not merely display — the portal EMAILS the customer "your
+        -- design is ready, go look at it".  Pushing it before the design
+        -- round it announces lands the customer on an empty screen (measured
+        -- in production on 2026-08-14, dogfood #835).  status and
+        -- design_round are separate coord-owned fields and the portal
+        -- enforces no ordering between them because it cannot — both are
+        -- ours.  So an announcing row names the `requires_kind` row that
+        -- must be CONFIRMED applied first, and coord/portal_sync.py refuses
+        -- to send it until that is true.  '' for a row that announces
+        -- nothing.
+        CREATE TABLE IF NOT EXISTS portal_outbox (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            submission_id TEXT    NOT NULL,
+            seq           INTEGER NOT NULL,
+            revision      INTEGER NOT NULL,
+            kind          TEXT    NOT NULL,
+            fields_json   TEXT    NOT NULL DEFAULT '{}',
+            announces     TEXT    NOT NULL DEFAULT '',
+            requires_kind TEXT    NOT NULL DEFAULT '',
+            state         TEXT    NOT NULL DEFAULT 'pending',
+            reason        TEXT    NOT NULL DEFAULT '',
+            attempts      INTEGER NOT NULL DEFAULT 0,
+            enqueued_at   REAL    NOT NULL,
+            sent_at       REAL,
+            UNIQUE(submission_id, seq)
+        );
+
+        -- Per-submission bookkeeping: the revision/seq allocators, plus what
+        -- coord has CONFIRMED the portal applied (not what it hoped to
+        -- send).  `design_round` is the highest round number confirmed
+        -- applied, which is exactly what the `awaiting-signoff` guard above
+        -- consults.  `customer_json` is the mirrored, read-only customer
+        -- half — written only from pulled events, never pushed back.
+        CREATE TABLE IF NOT EXISTS portal_submissions (
+            submission_id TEXT    PRIMARY KEY,
+            last_revision INTEGER NOT NULL DEFAULT 0,
+            last_seq      INTEGER NOT NULL DEFAULT 0,
+            last_status   TEXT    NOT NULL DEFAULT '',
+            design_round  INTEGER NOT NULL DEFAULT 0,
+            open_question TEXT    NOT NULL DEFAULT '',
+            customer_json TEXT    NOT NULL DEFAULT '{}',
+            first_seen_at REAL    NOT NULL,
+            updated_at    REAL    NOT NULL
+        );
+
+        -- Single-row cursor + liveness bookkeeping for the bridge (the
+        -- CHECK pins it to one row so "which cursor?" can never be a
+        -- question).  `pull_cursor` is opaque to coord — it is whatever the
+        -- portal handed back — and is the replay point on daemon restart.
+        CREATE TABLE IF NOT EXISTS portal_sync_state (
+            id                INTEGER PRIMARY KEY CHECK (id = 1),
+            pull_cursor       TEXT,
+            last_pull_at      REAL,
+            last_push_at      REAL,
+            last_heartbeat_at REAL,
+            last_error        TEXT NOT NULL DEFAULT ''
+        );
+
         CREATE INDEX IF NOT EXISTS idx_assignments_status ON assignments(status);
         CREATE INDEX IF NOT EXISTS idx_assignments_machine ON assignments(machine_name);
         CREATE INDEX IF NOT EXISTS idx_merge_queue_state ON merge_queue(state);
@@ -476,6 +580,12 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             ON drive_escalations(repo_name, issue_number);
         CREATE INDEX IF NOT EXISTS idx_drive_queue_state
             ON drive_queue(state, position);
+        -- #1982: the push loop's hot read is "pending rows, oldest first,
+        -- grouped by submission" — see coord.portal_store.pending_outbox.
+        CREATE INDEX IF NOT EXISTS idx_portal_outbox_pending
+            ON portal_outbox(state, submission_id, seq);
+        CREATE INDEX IF NOT EXISTS idx_portal_events_submission
+            ON portal_events(submission_id);
 
         INSERT OR IGNORE INTO schema_version VALUES (1);
     """)

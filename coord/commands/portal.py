@@ -1,18 +1,24 @@
-"""``coord portal`` — exercise the coord-portal sync bridge client (#2179).
+"""``coord portal`` — operate the coord-portal sync bridge (#2179, #1982).
 
-Everything that automatically decides *when* to push a status, and *which*
-coord-side work a portal submission maps to, is out of scope here (see
-``coord/portal_bridge.py``'s module docstring — that is follow-up work this
-issue deliberately did not take on). What exists today is the thin client
-plus enough CLI surface to:
+#2179 shipped the thin HTTP client (``coord/portal_bridge.py``) and the three
+commands that prove a credential pair works by hand: ``status``,
+``heartbeat``, ``push``.
 
-* prove the credential pair actually works (``coord portal heartbeat``),
-  which is also how an operator manually verifies #2179's acceptance shape
-  end to end once ``BRIDGE_CLIENT_ID``/``BRIDGE_CLIENT_SECRET`` are set — a
-  submission's ``/deliveries`` row going ``queued`` → ``sent`` in production
-  is only reachable at all once something has pushed a status; and
-* push one status update by hand (``coord portal push``), so a submission's
-  status can be moved even before anything automatic drives it.
+#1982 added the loop those calls were missing — ``coord/portal_sync.py``,
+running on the daemon's ``_tick_loop`` — and with it the commands that let an
+operator see and drive it without waiting for a tick:
+
+* ``sync`` runs one full pass now (pull → push → heartbeat);
+* ``outbox`` shows what is queued, held, or rejected, and why;
+* ``events`` shows what has been pulled in;
+* ``enqueue-*`` puts a coord-owned fact on the queue, which is the supported
+  way to push one — unlike ``push``, the queue enforces the ordering rule
+  that keeps a customer from being emailed toward an empty screen (#835).
+
+The state-touching commands (``sync``, ``outbox``, ``events``, ``enqueue-*``)
+read and write the daemon's own ``~/.coord/coord.db`` and are therefore
+**daemon-host commands**. Run from a thin client they operate on that box's
+empty local DB, which is not where the bridge lives.
 """
 
 from __future__ import annotations
@@ -97,6 +103,13 @@ def portal_push(config_path, submission_id: str, revision: int, status: str) -> 
     REVISION must be strictly greater than whatever the portal last accepted
     for this submission, or the push comes back `already_applied` (a
     success, not an error — see coord-portal's src/bridge/updates.ts).
+
+    ESCAPE HATCH: this sends immediately and bypasses the outbox, so it also
+    bypasses the ordering guard `coord portal enqueue-status` applies.
+    Pushing `awaiting-signoff` or `needs-input` this way emails the customer
+    whether or not the thing it announces exists (#835). It also leaves the
+    local revision allocator behind the portal's watermark until the next
+    pull re-seeds it. Prefer `enqueue-status` for anything a customer sees.
     """
     cfg = _load_config(config_path).portal
     client = client_from_config(cfg)
@@ -118,3 +131,242 @@ def portal_push(config_path, submission_id: str, revision: int, status: str) -> 
         f"rejected: {submission_id}@{revision} -> {status} ({result.reason})", fg="red"
     )
     raise SystemExit(1)
+
+
+# ── #1982: the sync loop's operator surface ─────────────────────────────────
+
+
+@portal_group.command("sync")
+@_CONFIG_OPTION
+@click.option("--json", "as_json", is_flag=True, default=False)
+def portal_sync_once(config_path, as_json: bool) -> None:
+    """Run one full sync pass now: pull, then push, then heartbeat.
+
+    The same pass the daemon runs on its tick — this just does not wait for
+    it. Exits non-zero if the pass reported any error, so it can be used as a
+    smoke check; the pass itself never raises, and a failure in one phase
+    does not stop the other two.
+
+    Daemon-host command: it reads and writes the daemon's ~/.coord/coord.db.
+    """
+    from coord import portal_sync as _sync  # noqa: PLC0415
+
+    config = _load_config(config_path)
+    if not config.portal.enabled:
+        click.secho(
+            "portal is not enabled — nothing to do (see `coord portal status`)",
+            fg="yellow",
+        )
+        raise SystemExit(1)
+    result = _sync.sync_tick(config)
+    if as_json:
+        click.echo(
+            json.dumps(
+                {
+                    "enabled": result.enabled,
+                    "pulled": result.pulled,
+                    "applied": result.applied,
+                    "rejected": result.rejected,
+                    "held": result.held,
+                    "heartbeat_ok": result.heartbeat_ok,
+                    "errors": result.errors,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    else:
+        click.echo(result.summary())
+        for err in result.errors:
+            click.secho(f"  {err}", fg="red")
+    if result.errors:
+        raise SystemExit(1)
+
+
+@portal_group.command("outbox")
+@click.option("--json", "as_json", is_flag=True, default=False)
+@click.option(
+    "--all", "show_all", is_flag=True, default=False,
+    help="Include applied/rejected rows, not just what is still queued.",
+)
+def portal_outbox(as_json: bool, show_all: bool) -> None:
+    """List queued coord-owned pushes and why any of them are held.
+
+    A `pending` row with a reason is HELD, not failing: the ordering guard is
+    refusing to announce something to the customer before the thing it
+    announces has been confirmed applied.
+    """
+    from coord import portal_store  # noqa: PLC0415
+    from coord.portal_sync import ordering_block_reason  # noqa: PLC0415
+
+    if show_all:
+        rows = [
+            row
+            for sub in portal_store.list_submissions()
+            for row in portal_store.outbox_for_submission(sub.submission_id)
+        ]
+    else:
+        rows = portal_store.pending_outbox()
+
+    state = portal_store.get_sync_state()
+    if as_json:
+        click.echo(
+            json.dumps(
+                {
+                    "cursor": state.pull_cursor,
+                    "last_pull_at": state.last_pull_at,
+                    "last_push_at": state.last_push_at,
+                    "last_heartbeat_at": state.last_heartbeat_at,
+                    "last_error": state.last_error,
+                    "rows": [
+                        {
+                            "submission_id": r.submission_id,
+                            "seq": r.seq,
+                            "revision": r.revision,
+                            "kind": r.kind,
+                            "state": r.state,
+                            "announces": r.announces,
+                            "attempts": r.attempts,
+                            "reason": r.reason,
+                            "held_because": (
+                                ordering_block_reason(r)
+                                if r.state == portal_store.STATE_PENDING
+                                else None
+                            ),
+                        }
+                        for r in rows
+                    ],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return
+
+    click.echo(
+        f"cursor={state.pull_cursor or '-'}  "
+        f"last_heartbeat_at={state.last_heartbeat_at or '-'}"
+    )
+    if state.last_error:
+        click.secho(f"last error: {state.last_error}", fg="red")
+    if not rows:
+        click.echo("outbox: empty")
+        return
+    for r in rows:
+        held = (
+            ordering_block_reason(r)
+            if r.state == portal_store.STATE_PENDING
+            else None
+        )
+        line = (
+            f"{r.submission_id} seq={r.seq} rev={r.revision} "
+            f"{r.kind:<13} {r.state}"
+        )
+        if held:
+            click.secho(f"{line}  HELD — {held}", fg="yellow")
+        elif r.state == portal_store.STATE_REJECTED:
+            click.secho(f"{line}  {r.reason}", fg="red")
+        else:
+            click.echo(line)
+
+
+@portal_group.command("events")
+@click.option("--json", "as_json", is_flag=True, default=False)
+@click.option("--limit", type=int, default=20, show_default=True)
+def portal_events(as_json: bool, limit: int) -> None:
+    """List pulled, not-yet-consumed customer events (the inbound half)."""
+    from coord import portal_store  # noqa: PLC0415
+
+    events = portal_store.unhandled_events(limit=limit)
+    if as_json:
+        click.echo(
+            json.dumps(
+                [
+                    {
+                        "event_id": e.event_id,
+                        "submission_id": e.submission_id,
+                        "kind": e.kind,
+                        "occurred_at": e.occurred_at,
+                        "payload": e.payload,
+                    }
+                    for e in events
+                ],
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return
+    if not events:
+        click.echo("no unhandled portal events")
+        return
+    for e in events:
+        click.echo(f"{e.occurred_at or '-'}  {e.submission_id}  {e.kind}  {e.event_id}")
+
+
+@portal_group.command("enqueue-status")
+@click.argument("submission_id")
+@click.argument("status", type=click.Choice(SUBMISSION_STATUSES))
+def portal_enqueue_status(submission_id: str, status: str) -> None:
+    """Queue an up-mapped status for SUBMISSION_ID (sent on the next sync).
+
+    Unlike `push`, this allocates the revision for you and refuses a status
+    that would summon the customer to an empty screen — `awaiting-signoff`
+    with no design round queued, `needs-input` with no question (#835).
+    """
+    from coord.portal_sync import PortalSyncError, enqueue_status  # noqa: PLC0415
+
+    try:
+        row = enqueue_status(submission_id, status)
+    except PortalSyncError as exc:
+        click.secho(str(exc), fg="red")
+        raise SystemExit(1) from exc
+    click.secho(
+        f"queued: {row.submission_id} seq={row.seq} rev={row.revision} status={status}",
+        fg="green",
+    )
+
+
+@portal_group.command("enqueue-design-round")
+@click.argument("submission_id")
+@click.argument("payload_json")
+def portal_enqueue_design_round(submission_id: str, payload_json: str) -> None:
+    """Queue a design round for SUBMISSION_ID. PAYLOAD_JSON is the D1 metadata.
+
+    The mock bundle is an R2 object uploaded out of band; PAYLOAD_JSON is
+    expected to carry whatever reference the customer's browser follows, plus
+    a `round` number if this is not the first.
+    """
+    from coord.portal_sync import PortalSyncError, enqueue_design_round  # noqa: PLC0415
+
+    try:
+        payload = json.loads(payload_json)
+    except ValueError as exc:
+        click.secho(f"PAYLOAD_JSON is not valid JSON: {exc}", fg="red")
+        raise SystemExit(1) from exc
+    try:
+        row = enqueue_design_round(submission_id, payload)
+    except PortalSyncError as exc:
+        click.secho(str(exc), fg="red")
+        raise SystemExit(1) from exc
+    click.secho(
+        f"queued: {row.submission_id} seq={row.seq} rev={row.revision} design_round",
+        fg="green",
+    )
+
+
+@portal_group.command("enqueue-question")
+@click.argument("submission_id")
+@click.argument("question")
+def portal_enqueue_question(submission_id: str, question: str) -> None:
+    """Queue an open question for SUBMISSION_ID (sent on the next sync)."""
+    from coord.portal_sync import PortalSyncError, enqueue_question  # noqa: PLC0415
+
+    try:
+        row = enqueue_question(submission_id, question)
+    except PortalSyncError as exc:
+        click.secho(str(exc), fg="red")
+        raise SystemExit(1) from exc
+    click.secho(
+        f"queued: {row.submission_id} seq={row.seq} rev={row.revision} question",
+        fg="green",
+    )
