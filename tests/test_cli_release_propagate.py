@@ -1397,6 +1397,111 @@ def test_roll_units_never_reports_a_timer_it_never_asked_about(monkeypatch):
     assert "timer" not in detail.lower()
 
 
+def test_roll_units_holding_a_running_timer_is_not_reported_as_stopped(monkeypatch):
+    """#2124 review: `held` (a timer `enable_timers` left alone because it
+    was already enabled) covers two very different cases — the operator
+    deliberately stopped it (ActiveState=inactive), and the overwhelmingly
+    common case of a timer that is enabled and already running fine
+    (ActiveState=active). Only the first may say "left stopped as-is" —
+    saying it for the second reports a state ("stopped") this call never
+    confirmed."""
+    monkeypatch.setattr(
+        release_cmd, "_post",
+        lambda url, payload, *, timeout: (200, {
+            "ok": True, "units": [], "reloaded": False,
+            "timers_enabled": {
+                "coord-agent.timer": {
+                    "ok": True, "changed": False,
+                    "detail": "already enabled (ActiveState=active) — left its "
+                              "current run state alone",
+                },
+            },
+        }, ""),
+    )
+    ok, detail = release_cmd._roll_units(_machine(), agent_port=7433)
+    assert ok
+    assert "left stopped as-is" not in detail
+    assert "already enabled (unchanged): coord-agent.timer" in detail
+
+
+def test_roll_units_fails_the_lane_on_a_failed_unit_install(monkeypatch):
+    """#2124 review: before this fix, `_roll_units`'s `ok` was derived only
+    from `failed_timers`, so a unit whose install itself failed
+    (`action == "failed"`, e.g. an unreadable installed unit file) was
+    silently reported as a green lane — `changed`/`new` are the only things
+    counted for the narrative, and nothing inspected `units[i]["action"]`
+    for `"failed"`. This is the exact HTTP-500-with-a-`units`-body shape
+    `agent_app.py`'s `deploy_units` returns for that failure."""
+    monkeypatch.setattr(
+        release_cmd, "_post",
+        lambda url, payload, *, timeout: (500, {
+            "ok": False,
+            "units": [
+                {"name": "coord-drive-queue.timer", "action": "failed",
+                 "detail": "unreadable installed unit: PermissionError"},
+            ],
+            "reloaded": False, "timers_enabled": {},
+        }, ""),
+    )
+    ok, detail = release_cmd._roll_units(_machine(), agent_port=7433)
+    assert ok is False
+    assert "FAILED to install unit(s)" in detail
+    assert "coord-drive-queue.timer" in detail
+    assert "PermissionError" in detail
+
+
+def test_roll_units_fails_the_lane_on_a_top_level_error(monkeypatch):
+    """A `body["error"]` (e.g. `InstallReport.error` — the reference itself
+    couldn't be read) must fail the lane even with an empty `units` list and
+    no timer failures."""
+    monkeypatch.setattr(
+        release_cmd, "_post",
+        lambda url, payload, *, timeout: (500, {
+            "ok": False, "error": "no reference build found",
+            "units": [], "reloaded": False, "timers_enabled": {},
+        }, ""),
+    )
+    ok, detail = release_cmd._roll_units(_machine(), agent_port=7433)
+    assert ok is False
+    assert "no reference build found" in detail
+
+
+def test_roll_units_fails_the_lane_on_a_failed_reload(monkeypatch):
+    """A daemon-reload that was actually attempted (a unit's bytes changed)
+    and failed must fail the lane, decoupled from any timer outcome —
+    before this fix, `ok` was `not failed_timers` alone, so a reload
+    failure with zero timer failures was reported as a green lane."""
+    monkeypatch.setattr(
+        release_cmd, "_post",
+        lambda url, payload, *, timeout: (500, {
+            "ok": False,
+            "units": [{"name": "coord-agent.service", "action": "updated", "detail": ""}],
+            "changed": True, "reloaded": False, "reload_detail": "reload timed out",
+            "timers_enabled": {},
+        }, ""),
+    )
+    ok, detail = release_cmd._roll_units(_machine(), agent_port=7433)
+    assert ok is False
+    assert "daemon-reload FAILED" in detail
+    assert "reload timed out" in detail
+
+
+def test_roll_units_reload_never_attempted_is_not_a_failure(monkeypatch):
+    """`reloaded=False` with no `changed` units means a reload was never
+    attempted — nothing to reload, not a failure. Guards against the
+    reload-failure check above over-firing on the routine no-op case."""
+    monkeypatch.setattr(
+        release_cmd, "_post",
+        lambda url, payload, *, timeout: (200, {
+            "ok": True, "units": [], "changed": False, "reloaded": False,
+            "timers_enabled": {},
+        }, ""),
+    )
+    ok, detail = release_cmd._roll_units(_machine(), agent_port=7433)
+    assert ok
+    assert "daemon-reload FAILED" not in detail
+
+
 def test_rollback_host_posts_the_caller_supplied_initiator(monkeypatch):
     """#2121: `_rollback_host` is the sibling of `_roll_python` above — same
     fleet-automation shape, same obligation to name itself on the target
