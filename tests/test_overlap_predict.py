@@ -1,0 +1,339 @@
+"""Unit tests for :mod:`coord.overlap_predict` — #2247's queue-ordering predictor.
+
+The decision half only: parsing a declared file block, intersecting it with
+in-flight footprints, and scoring the resulting claim. The CLI half (an
+enqueue that actually chains `--after`) is black-box tested in
+``tests/test_cli_drive_queue.py``.
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+from coord.overlap_predict import (
+    OUTCOME_CONFIRMED,
+    OUTCOME_FALSE_POSITIVE,
+    OUTCOME_UNKNOWN,
+    SOURCE_BRANCH,
+    SOURCE_DECLARED,
+    Footprint,
+    Overlap,
+    Prediction,
+    classify_outcome,
+    collect_candidate_files,
+    declared_footprints,
+    inflight_assignments,
+    inflight_footprints,
+    parse_declared_files,
+    paths_overlap,
+    predict_overlap,
+    predictions_from_audit,
+    tally,
+)
+
+REPO = "claude-coordinator"
+GITHUB = "john/claude-coordinator"
+
+
+# ── parse_declared_files ─────────────────────────────────────────────────────
+
+
+def test_parses_a_markdown_files_heading_with_bullets():
+    body = (
+        "Some intro.\n\n"
+        "## Files\n"
+        "- `coord/drive_queue.py` — the queue\n"
+        "- coord/state.py\n"
+        "* tests/test_drive_queue.py\n\n"
+        "## Acceptance\n"
+        "- something else entirely\n"
+    )
+    assert parse_declared_files(body) == [
+        "coord/drive_queue.py",
+        "coord/state.py",
+        "tests/test_drive_queue.py",
+    ]
+
+
+def test_parses_a_fenced_block_under_the_heading():
+    body = "### Files touched\n```\ncoord/a.py\ncoord/b.py\n```\n"
+    assert parse_declared_files(body) == ["coord/a.py", "coord/b.py"]
+
+
+def test_parses_an_inline_files_line():
+    assert parse_declared_files("files: a/b.py, c.py") == ["a/b.py", "c.py"]
+
+
+def test_a_prose_mention_is_not_a_declaration():
+    body = "This will probably touch coord/drive_queue.py, among other things."
+    assert parse_declared_files(body) == []
+
+
+def test_a_files_section_does_not_swallow_the_paragraph_after_it():
+    body = "## Files\n- coord/a.py\n\nThis paragraph explains why, at length.\n"
+    assert parse_declared_files(body) == ["coord/a.py"]
+
+
+def test_issue_references_and_urls_are_not_paths():
+    body = "## Files\n- #2247\n"
+    assert parse_declared_files(body) == []
+    assert parse_declared_files("files: https://example.com/x.py") == []
+
+
+def test_a_missing_or_malformed_body_yields_no_prediction():
+    assert parse_declared_files(None) == []
+    assert parse_declared_files("") == []
+    assert parse_declared_files("## Files\n") == []
+
+
+def test_duplicate_declarations_collapse_in_declaration_order():
+    body = "## Files\n- coord/a.py\n- coord/a.py\n- coord/b.py\n"
+    assert parse_declared_files(body) == ["coord/a.py", "coord/b.py"]
+
+
+# ── overlap ──────────────────────────────────────────────────────────────────
+
+
+def test_paths_overlap_is_exact_plus_declared_directories():
+    assert paths_overlap("coord/a.py", "coord/a.py")
+    assert not paths_overlap("coord/a.py", "coord/b.py")
+    assert paths_overlap("coord/dashboard/", "coord/dashboard/app.py")
+    assert paths_overlap("coord/dashboard/app.py", "coord/dashboard/")
+    assert not paths_overlap("coord/a.py", "")
+
+
+def test_predicts_an_overlap_against_a_live_branch_footprint():
+    footprint = Footprint(
+        key=f"{REPO}#2230",
+        issue_number=2230,
+        files=("coord/drive_queue.py", "tests/test_drive_queue.py"),
+        source=SOURCE_BRANCH,
+        branch="issue-2230",
+    )
+    prediction = predict_overlap(["coord/drive_queue.py"], [footprint])
+    assert prediction
+    assert prediction.after_keys == (f"{REPO}#2230",)
+    assert prediction.overlaps[0].files == ("coord/drive_queue.py",)
+    assert "coord/drive_queue.py" in prediction.reason
+    assert f"{REPO}#2230" in prediction.reason
+
+
+def test_no_intersection_predicts_nothing():
+    footprint = Footprint(
+        key=f"{REPO}#1", issue_number=1, files=("coord/other.py",), source=SOURCE_BRANCH,
+    )
+    assert not predict_overlap(["coord/drive_queue.py"], [footprint])
+
+
+def test_an_empty_candidate_list_is_no_prediction_at_all():
+    footprint = Footprint(
+        key=f"{REPO}#1", issue_number=1, files=("coord/a.py",), source=SOURCE_BRANCH,
+    )
+    prediction = predict_overlap([], [footprint])
+    assert not prediction
+    assert prediction.predicted_files == ()
+
+
+def test_excluded_keys_never_become_pre_reqs():
+    footprint = Footprint(
+        key=f"{REPO}#7", issue_number=7, files=("coord/a.py",), source=SOURCE_BRANCH,
+    )
+    prediction = predict_overlap(
+        ["coord/a.py"], [footprint], exclude_keys={f"{REPO}#7"}
+    )
+    assert not prediction
+
+
+def test_audit_details_carry_both_sides_of_the_claim():
+    prediction = Prediction(
+        predicted_files=("coord/a.py",),
+        overlaps=(
+            Overlap(key=f"{REPO}#7", source=SOURCE_BRANCH, files=("coord/a.py",), branch="b"),
+        ),
+    )
+    details = prediction.audit_details()
+    assert details["predicted_files"] == ["coord/a.py"]
+    assert details["after"] == [f"{REPO}#7"]
+    assert details["overlaps"][0]["files"] == ["coord/a.py"]
+    assert details["overlaps"][0]["source"] == SOURCE_BRANCH
+
+
+# ── gathering footprints ─────────────────────────────────────────────────────
+
+
+def _assignment(**kw):
+    base = {
+        "type": "work",
+        "status": "running",
+        "repo_name": REPO,
+        "branch": "issue-1",
+        "issue_number": 1,
+    }
+    base.update(kw)
+    return SimpleNamespace(**base)
+
+
+def test_inflight_includes_finished_but_unmerged_work():
+    board = SimpleNamespace(
+        active=[
+            _assignment(issue_number=1, status="running", branch="issue-1"),
+            # Worker done, PR still open — the exact case #1720's running-only
+            # fence misses and both 2026-08-14 collisions actually hit.
+            _assignment(issue_number=2, status="done", branch="issue-2"),
+            _assignment(issue_number=3, status="merged", branch="issue-3"),
+            _assignment(issue_number=4, type="review", branch="issue-4"),
+            _assignment(issue_number=5, branch=""),
+            _assignment(issue_number=6, repo_name="quadraui", branch="issue-6"),
+        ],
+    )
+    numbers = {a.issue_number for a in inflight_assignments(board, REPO)}
+    assert numbers == {1, 2}
+
+
+def test_inflight_scans_the_completed_bucket_where_open_prs_actually_live():
+    # `board.active` is running/pending ONLY (`_board_mapping._ACTIVE_STATUSES`),
+    # so a finished worker whose PR is still open is in `completed`. Missing
+    # that bucket would mean missing every collision this feature exists for.
+    board = SimpleNamespace(
+        active=[],
+        completed=[
+            _assignment(issue_number=2, status="done", branch="issue-2"),
+            _assignment(issue_number=3, status="merged", branch="issue-3"),
+            _assignment(issue_number=4, status="failed", branch="issue-4"),
+        ],
+    )
+    assert [a.issue_number for a in inflight_assignments(board, REPO)] == [2]
+
+
+def test_inflight_excludes_the_issue_being_queued():
+    board = SimpleNamespace(active=[_assignment(issue_number=9, branch="issue-9")])
+    assert inflight_assignments(board, REPO, exclude_issue_number=9) == []
+
+
+def test_inflight_footprints_read_the_real_diff():
+    board = SimpleNamespace(active=[_assignment(issue_number=9, branch="issue-9")])
+    prints = inflight_footprints(
+        REPO, GITHUB, "main",
+        board=board,
+        diff_files_fetcher=lambda repo, base, head: ["coord/drive_queue.py"],
+    )
+    assert [(f.key, f.files, f.source) for f in prints] == [
+        (f"{REPO}#9", ("coord/drive_queue.py",), SOURCE_BRANCH)
+    ]
+
+
+def test_one_undiffable_branch_is_skipped_not_fatal():
+    board = SimpleNamespace(
+        active=[
+            _assignment(issue_number=1, branch="issue-1"),
+            _assignment(issue_number=2, branch="issue-2"),
+        ],
+    )
+
+    def fetcher(repo, base, head):
+        if head == "issue-1":
+            raise RuntimeError("gh exploded")
+        return ["coord/b.py"]
+
+    prints = inflight_footprints(REPO, GITHUB, "main", board=board, diff_files_fetcher=fetcher)
+    assert [f.key for f in prints] == [f"{REPO}#2"]
+
+
+def test_an_unreadable_board_yields_no_footprints_rather_than_raising():
+    class Exploding:
+        @property
+        def active(self):
+            raise RuntimeError("board unreachable")
+
+    assert inflight_footprints(REPO, GITHUB, "main", board=Exploding()) == []
+
+
+def test_declared_footprints_only_cover_issues_that_declared_something():
+    bodies = {1: "## Files\n- coord/a.py\n", 2: "no declaration here"}
+    prints = declared_footprints(
+        [(REPO, 1), (REPO, 2)], lambda repo, number: bodies.get(number)
+    )
+    assert [(f.key, f.files, f.source) for f in prints] == [
+        (f"{REPO}#1", ("coord/a.py",), SOURCE_DECLARED)
+    ]
+
+
+def test_collect_candidate_files_prefers_the_declaration_over_extra_sources():
+    files = collect_candidate_files(
+        REPO, 1,
+        lambda repo, number: "## Files\n- coord/declared.py\n",
+        extra_sources=[lambda repo, number: ["coord/guessed.py"]],
+    )
+    assert files == ["coord/declared.py"]
+
+
+def test_collect_candidate_files_falls_back_to_an_extra_source():
+    files = collect_candidate_files(
+        REPO, 1,
+        lambda repo, number: "nothing declared",
+        extra_sources=[lambda repo, number: ["`coord/guessed.py`"]],
+    )
+    assert files == ["coord/guessed.py"]
+
+
+def test_collect_candidate_files_fails_open_when_the_body_cannot_be_read():
+    def explode(repo, number):
+        raise RuntimeError("no body")
+
+    assert collect_candidate_files(REPO, 1, explode) == []
+
+
+# ── measuring the predictor ──────────────────────────────────────────────────
+
+
+def test_a_prediction_borne_out_by_the_real_diffs_is_confirmed():
+    assert classify_outcome(
+        ["coord/a.py"], ["coord/a.py", "coord/z.py"], ["coord/a.py"],
+    ) == OUTCOME_CONFIRMED
+
+
+def test_a_prediction_the_diffs_contradict_is_a_false_positive():
+    assert classify_outcome(
+        ["coord/a.py"], ["coord/x.py"], ["coord/y.py"],
+    ) == OUTCOME_FALSE_POSITIVE
+
+
+def test_an_unreadable_diff_is_unknown_never_a_false_positive():
+    assert classify_outcome(["coord/a.py"], None, ["coord/a.py"]) == OUTCOME_UNKNOWN
+    assert classify_outcome(["coord/a.py"], ["coord/a.py"], None) == OUTCOME_UNKNOWN
+
+
+def test_precision_counts_only_scored_predictions():
+    accuracy = tally([
+        OUTCOME_CONFIRMED, OUTCOME_CONFIRMED, OUTCOME_FALSE_POSITIVE, OUTCOME_UNKNOWN,
+    ])
+    assert (accuracy.confirmed, accuracy.false_positive, accuracy.unknown) == (2, 1, 1)
+    assert accuracy.precision == 2 / 3
+    assert "false-positive" in accuracy.render()
+
+
+def test_precision_is_unknown_before_anything_is_scoreable():
+    accuracy = tally([OUTCOME_UNKNOWN])
+    assert accuracy.precision is None
+    assert "precision unknown" in accuracy.render()
+
+
+def test_audit_rows_flatten_to_one_record_per_predicted_overlap():
+    rows = predictions_from_audit([
+        {
+            "ts": 1.0,
+            "repo": REPO,
+            "issue": 2247,
+            "details": {
+                "overlaps": [
+                    {"key": f"{REPO}#1", "source": SOURCE_BRANCH, "files": ["coord/a.py"]},
+                    {"key": f"{REPO}#2", "source": SOURCE_DECLARED, "files": ["coord/b.py"]},
+                ]
+            },
+        },
+        {"ts": 2.0, "repo": REPO, "issue": None, "details": {}},
+    ])
+    assert [(r["key"], r["other_key"]) for r in rows] == [
+        (f"{REPO}#2247", f"{REPO}#1"),
+        (f"{REPO}#2247", f"{REPO}#2"),
+    ]
