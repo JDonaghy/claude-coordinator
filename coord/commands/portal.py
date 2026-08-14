@@ -13,9 +13,11 @@ operator see and drive it without waiting for a tick:
 * ``events`` shows what has been pulled in;
 * ``enqueue-*`` puts a coord-owned fact on the queue, which is the supported
   way to push one — unlike ``push``, the queue enforces the ordering rule
-  that keeps a customer from being emailed toward an empty screen (#835).
+  that keeps a customer from being emailed toward an empty screen (#835);
+* ``requeue`` revives a row the drain retired after burning its retry budget.
 
-The state-touching commands (``sync``, ``outbox``, ``events``, ``enqueue-*``)
+The state-touching commands (``sync``, ``outbox``, ``events``, ``enqueue-*``,
+``requeue``)
 read and write the daemon's own ``~/.coord/coord.db`` and are therefore
 **daemon-host commands**. Run from a thin client they operate on that box's
 empty local DB, which is not where the bridge lives.
@@ -368,5 +370,36 @@ def portal_enqueue_question(submission_id: str, question: str) -> None:
         raise SystemExit(1) from exc
     click.secho(
         f"queued: {row.submission_id} seq={row.seq} rev={row.revision} question",
+        fg="green",
+    )
+
+
+@portal_group.command("requeue")
+@click.argument("submission_id")
+@click.argument("seq", type=int)
+def portal_requeue(submission_id: str, seq: int) -> None:
+    """Put a retired outbox row (SUBMISSION_ID SEQ) back in the queue.
+
+    The drain retires a row that has burned its retry budget — a payload the
+    portal keeps refusing, or an outage that outlasted the budget. That state
+    is terminal by design (it also keeps any announcement behind it held,
+    which is the fail-closed half of #835), so this is the lever that clears
+    it once the underlying problem is fixed. The row gets a fresh revision,
+    since the old one may be below the portal's watermark by now.
+
+    Find the seq with `coord portal outbox --all`.
+    """
+    from coord import portal_store  # noqa: PLC0415
+
+    row = portal_store.requeue(submission_id, seq)
+    if row is None:
+        click.secho(
+            f"no outbox row for {submission_id} seq={seq} "
+            f"(list them with `coord portal outbox --all`)",
+            fg="red",
+        )
+        raise SystemExit(1)
+    click.secho(
+        f"requeued: {row.submission_id} seq={row.seq} rev={row.revision} {row.kind}",
         fg="green",
     )

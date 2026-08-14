@@ -20,8 +20,14 @@ Nothing is co-written, so there is no merge and no split-brain.
 inserted with ``INSERT OR IGNORE``, so replaying a page from a stale cursor
 is a no-op. Outbound rows allocate their ``(seq, revision)`` once, at
 enqueue, and keep it across every retry — the portal dedupes on
-``(submission_id, revision)`` against a watermark, so re-sending an
-unconfirmed row can only ever come back ``already_applied``.
+``(submission_id, revision)`` against a watermark, so re-sending a row it
+already stored is harmless.
+
+That watermark cuts both ways, which is why :func:`reallocate_revision`
+exists: a revision at or *below* it is silently discarded and reported as
+``already_applied``, indistinguishable on the wire from a real
+acknowledgement. See that function for how a stale allocator is detected and
+climbed out of rather than believed.
 
 This module runs on the **daemon host**, where the local DB is canonical. It
 is deliberately not daemon-routed: the sync loop is a daemon-side tick, and a
@@ -31,16 +37,18 @@ thin client has no business writing the bridge's cursor. See
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import time
 from dataclasses import dataclass
 from typing import Any
 
-# Outbox row states. `pending` rows are retried forever (a portal outage is
-# transient by assumption); `rejected` rows are terminal and need an operator,
-# because the portal rejecting a field is a statement about the request, not
-# about the network — retrying reproduces it exactly.
+# Outbox row states. `pending` rows are retried each pass, up to
+# coord.portal_sync.MAX_PUSH_ATTEMPTS; `rejected` rows are terminal and need
+# an operator (`coord portal requeue`), either because the portal refused the
+# field outright — a statement about the request, not the network, which
+# retrying reproduces exactly — or because the row burned its budget.
 STATE_PENDING = "pending"
 STATE_APPLIED = "applied"
 STATE_REJECTED = "rejected"
@@ -94,32 +102,40 @@ def _event_from_row(row: sqlite3.Row) -> PortalEvent:
     )
 
 
-def record_events(events: list[dict[str, Any]], *, now: float | None = None) -> int:
+def record_events(
+    events: list[Any], *, now: float | None = None
+) -> tuple[int, int]:
     """Persist a pulled page of events; return how many were NEW.
 
     ``INSERT OR IGNORE`` on the portal's own event id, so replaying a page
     (daemon restarted before the cursor advanced) inserts nothing and returns
     0 rather than duplicating the inbox.
 
-    An event with no usable id is skipped rather than stored under a
-    synthesised key: a synthetic id would defeat the dedupe on the *next*
-    replay and silently double-count. It is counted in neither total.
+    Returns ``(inserted, unidentified)``. An event the portal sent without a
+    usable id is **still stored**, under a CONTENT HASH of the event
+    (:func:`_synthetic_event_id`) — an inbox that drops a row it could not
+    parse is not an inbox, and the cursor is about to advance past it either
+    way. A content hash keeps that safe: replaying the same page derives the
+    same id and dedupes exactly as a real one would. The second element of
+    the return value is how many took that path, so the caller can say so out
+    loud rather than let a malformed contract go by silently.
 
     All rows commit in ONE transaction. The caller advances the cursor only
     after this returns, which is what makes a mid-page crash replay the page
     instead of skipping it.
     """
     if not events:
-        return 0
+        return (0, 0)
     stamp = time.time() if now is None else now
     conn = _conn()
     inserted = 0
+    unidentified = 0
     for ev in events:
-        if not isinstance(ev, dict):
-            continue
-        event_id = str(ev.get("id") or ev.get("event_id") or "").strip()
+        record = ev if isinstance(ev, dict) else {"raw": ev}
+        event_id = _event_id_of(record)
         if not event_id:
-            continue
+            event_id = _synthetic_event_id(record)
+            unidentified += 1
         cur = conn.execute(
             """
             INSERT OR IGNORE INTO portal_events
@@ -129,16 +145,51 @@ def record_events(events: list[dict[str, Any]], *, now: float | None = None) -> 
             """,
             (
                 event_id,
-                str(ev.get("submission_id") or ""),
-                str(ev.get("type") or ev.get("kind") or ""),
-                str(ev.get("at") or ev.get("occurred_at") or ""),
-                json.dumps(ev, sort_keys=True),
+                str(record.get("submission_id") or ""),
+                str(record.get("type") or record.get("kind") or ""),
+                str(record.get("at") or record.get("occurred_at") or ""),
+                _stable_json(record),
                 stamp,
             ),
         )
         inserted += cur.rowcount or 0
     conn.commit()
-    return inserted
+    return (inserted, unidentified)
+
+
+def _event_id_of(event: dict[str, Any]) -> str:
+    """The portal's own id for *event*, or '' if it did not give one.
+
+    Explicitly tests for ``None`` rather than using ``or``: an integer id of
+    ``0`` is a perfectly good id and ``or`` would throw it away, which is the
+    kind of falsy-zero bug that shows up once, in production, on the first
+    event the portal ever emits.
+    """
+    for key in ("id", "event_id"):
+        value = event.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ""
+
+
+def _stable_json(payload: Any) -> str:
+    """JSON that never raises on an unexpected type (``default=str``)."""
+    return json.dumps(payload, sort_keys=True, default=str)
+
+
+def _synthetic_event_id(event: dict[str, Any]) -> str:
+    """A deterministic, content-addressed id for an event that carries none.
+
+    Deterministic is the whole point: an id derived from the clock or a
+    counter would make every replay of the same page look like a new event
+    and duplicate the inbox — which is why storing these at all is only safe
+    with a hash.
+    """
+    digest = hashlib.sha256(_stable_json(event).encode("utf-8")).hexdigest()
+    return f"sha256:{digest[:32]}"
 
 
 def unhandled_events(limit: int = 100) -> list[PortalEvent]:
@@ -514,6 +565,94 @@ def mark_rejected(row: OutboxRow, reason: str, *, now: float | None = None) -> N
         (STATE_REJECTED, reason[:500], time.time() if now is None else now, row.id),
     )
     conn.commit()
+
+
+def reallocate_revision(row: OutboxRow, reason: str, *, now: float | None = None) -> int:
+    """Give a still-pending row a FRESH revision above the allocator; return it.
+
+    The one escape from a silent drop. The portal ignores any revision at or
+    below its watermark and answers ``already_applied`` — which is
+    indistinguishable, from the wire, from "I stored this the first time you
+    sent it". If coord's allocator has fallen behind the portal's watermark
+    (a hand ``coord portal push``, a restored DB, a submission the portal
+    created before coord ever saw it), every push lands in that hole: the
+    fact is dropped and reported as a success.
+
+    So when a row's FIRST attempt comes back ``already_applied``, coord does
+    not believe it — it re-numbers the row above everything it has allocated
+    and tries again. The row keeps its ``seq``, so ordering is untouched; only
+    the dedupe key moves. Repeated calls strictly increase, so this converges
+    on the portal's watermark from below rather than guessing at it.
+    """
+    stamp = time.time() if now is None else now
+    conn = _conn()
+    with conn:
+        current = conn.execute(
+            "SELECT last_revision FROM portal_submissions WHERE submission_id = ?",
+            (row.submission_id,),
+        ).fetchone()
+        base = int(current["last_revision"]) if current else row.revision
+        revision = max(base, row.revision) + 1
+        conn.execute(
+            "UPDATE portal_submissions SET last_revision = ?, updated_at = ? "
+            "WHERE submission_id = ?",
+            (revision, stamp, row.submission_id),
+        )
+        conn.execute(
+            """
+            UPDATE portal_outbox
+               SET revision = ?, attempts = attempts + 1, reason = ?
+             WHERE id = ?
+            """,
+            (revision, reason[:500], row.id),
+        )
+    return revision
+
+
+def requeue(submission_id: str, seq: int, *, now: float | None = None) -> OutboxRow | None:
+    """Put a retired row back in the queue with a fresh revision and 0 attempts.
+
+    The operator's lever for the one state nothing else can leave: a row the
+    drain gave up on (a malformed payload the portal 4xx'd, an outage that
+    outlasted the retry budget). Without this, `rejected` is a dead end that
+    also holds every announcement behind it forever — correct, but only if a
+    human can act on it.
+
+    A fresh revision, because the old one may well be below the portal's
+    watermark by now. Returns ``None`` if there is no such row.
+    """
+    conn = _conn()
+    row = conn.execute(
+        "SELECT * FROM portal_outbox WHERE submission_id = ? AND seq = ?",
+        (submission_id, seq),
+    ).fetchone()
+    if row is None:
+        return None
+    stamp = time.time() if now is None else now
+    with conn:
+        current = conn.execute(
+            "SELECT last_revision FROM portal_submissions WHERE submission_id = ?",
+            (submission_id,),
+        ).fetchone()
+        base = int(current["last_revision"]) if current else int(row["revision"])
+        revision = max(base, int(row["revision"])) + 1
+        conn.execute(
+            "UPDATE portal_submissions SET last_revision = ?, updated_at = ? "
+            "WHERE submission_id = ?",
+            (revision, stamp, submission_id),
+        )
+        conn.execute(
+            """
+            UPDATE portal_outbox
+               SET state = ?, revision = ?, attempts = 0, reason = '', sent_at = NULL
+             WHERE id = ?
+            """,
+            (STATE_PENDING, revision, row["id"]),
+        )
+    updated = conn.execute(
+        "SELECT * FROM portal_outbox WHERE id = ?", (row["id"],)
+    ).fetchone()
+    return _outbox_from_row(updated)
 
 
 def note_attempt(row: OutboxRow, reason: str) -> None:

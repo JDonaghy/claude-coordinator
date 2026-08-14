@@ -167,16 +167,57 @@ def test_announcement_stays_held_when_its_design_round_is_rejected():
     assert result2.held == 1
 
 
-def test_already_applied_counts_as_confirmed_and_releases_the_announcement():
-    """`already_applied` is a success, not a no-op (coord-portal updates.ts)."""
+def test_already_applied_on_a_first_attempt_is_not_confirmation():
+    """#835 from the other side: the portal ignored it, so nothing landed.
+
+    `already_applied` means "at or below my watermark, discarded". On a
+    row's FIRST attempt there was no earlier send it could be acknowledging,
+    so it means coord's revision allocator is behind the portal — the design
+    round was NOT stored, and treating it as confirmed would release the
+    `awaiting-signoff` mail toward an empty screen.
+    """
     enqueue_design_round(SUB, _design())
     enqueue_status(SUB, "awaiting-signoff")
     client = FakeClient(push_outcomes={"design_round": "already_applied"})
 
     result = sync_tick(client=client)
 
+    assert client.pushed_kinds == ["design_round"]  # the mail never went
+    assert result.applied == 0
+    assert portal_store.get_submission(SUB).design_round == 0
+
+    # ...and the row was re-numbered above the allocator so the retry can
+    # clear the portal's watermark.
+    row = portal_store.outbox_for_submission(SUB)[0]
+    assert row.state == portal_store.STATE_PENDING
+    assert row.revision > 1
+
+
+def test_already_applied_on_a_retry_is_confirmation():
+    """A resend of a row we really did send: the lost-response case."""
+    enqueue_design_round(SUB, _design())
+    enqueue_status(SUB, "awaiting-signoff")
+
+    # Attempt 1 fails in transport — the portal may well have stored it.
+    sync_tick(client=FakeClient(push_error=PortalBridgeError("timeout")))
+    # Attempt 2 comes back already_applied, which now means what it says.
+    client = FakeClient(push_outcomes={"design_round": "already_applied"})
+    result = sync_tick(client=client)
+
     assert client.pushed_kinds == ["design_round", "status"]
     assert result.applied == 2
+
+
+def test_reallocation_converges_and_then_the_announcement_goes():
+    enqueue_design_round(SUB, _design())
+    enqueue_status(SUB, "awaiting-signoff")
+    sync_tick(client=FakeClient(push_outcomes={"design_round": "already_applied"}))
+
+    client = FakeClient()  # the re-numbered revision now clears the watermark
+    result = sync_tick(client=client)
+    assert client.pushed_kinds == ["design_round", "status"]
+    assert result.applied == 2
+    assert portal_store.get_submission(SUB).last_status == "awaiting-signoff"
 
 
 def test_second_question_cannot_ride_on_the_first_questions_confirmation():
@@ -408,7 +449,8 @@ def test_mirror_merges_rather_than_clobbers_across_events():
     assert record.customer == {"intake": "the original ask", "verdict": "approved"}
 
 
-def test_events_without_an_id_are_skipped_not_stored_under_a_synthetic_key():
+def test_an_id_less_event_does_not_stop_the_rest_of_the_page_landing():
+    """Both are stored — see the content-hash test below for why."""
     client = FakeClient(
         pages=[
             {
@@ -422,8 +464,8 @@ def test_events_without_an_id_are_skipped_not_stored_under_a_synthetic_key():
         ]
     )
     result = sync_tick(client=client)
-    assert result.pulled == 1
-    assert [e.event_id for e in portal_store.unhandled_events()] == ["e2"]
+    assert result.pulled == 2
+    assert "e2" in [e.event_id for e in portal_store.unhandled_events()]
 
 
 # ── heartbeat and failure posture ───────────────────────────────────────────
@@ -541,3 +583,134 @@ def test_a_misconfigured_portal_block_does_not_read_as_merely_disabled():
     assert result.errors
     assert "NOT RUNNING" in result.summary()
     assert portal_store.get_sync_state().last_error
+
+
+# ── review round 2: retry budget, malformed pages, nested revisions ─────────
+
+
+def test_a_permanently_failing_row_is_retired_instead_of_freezing_the_queue():
+    """A 4xx raises the same PortalBridgeError a timeout does — and repeats
+    forever. Without a budget it would block every later row for this
+    customer, re-issuing a known-bad request every tick."""
+    enqueue_design_round(SUB, _design())
+    enqueue_status(SUB, "in-progress")  # a later, innocent row
+
+    for _ in range(portal_sync.MAX_PUSH_ATTEMPTS):
+        sync_tick(client=FakeClient(push_error=PortalBridgeError("400 malformed")))
+
+    rows = portal_store.outbox_for_submission(SUB)
+    assert rows[0].state == portal_store.STATE_REJECTED
+    assert "gave up after" in rows[0].reason
+
+    # The innocent row behind it is now free to go.
+    client = FakeClient()
+    result = sync_tick(client=client)
+    assert client.pushed_kinds == ["status"]
+    assert result.applied == 1
+
+
+def test_retiring_a_prerequisite_still_never_releases_its_announcement():
+    """Failing forward on the retry budget must not fail OPEN on the mail."""
+    enqueue_design_round(SUB, _design())
+    enqueue_status(SUB, "awaiting-signoff")
+
+    for _ in range(portal_sync.MAX_PUSH_ATTEMPTS + 2):
+        sync_tick(client=FakeClient(push_error=PortalBridgeError("400 malformed")))
+
+    rows = portal_store.outbox_for_submission(SUB)
+    assert rows[0].state == portal_store.STATE_REJECTED
+    assert rows[1].state == portal_store.STATE_PENDING  # held, never sent
+
+    client = FakeClient()
+    sync_tick(client=client)
+    assert client.pushes == []
+
+
+def test_an_event_with_no_id_is_stored_not_dropped_and_still_dedupes():
+    """The cursor advances past it either way — dropping it would lose it."""
+    page = {
+        "events": [{"submission_id": SUB, "type": "submission.created"}],
+        "cursor": "c1",
+        "has_more": False,
+    }
+    first = sync_tick(client=FakeClient(pages=[dict(page)]))
+    assert first.pulled == 1
+    stored = portal_store.unhandled_events()
+    assert len(stored) == 1
+    assert stored[0].event_id.startswith("sha256:")
+
+    # A replay of the same page derives the same content-hash id.
+    portal_store.set_pull_cursor(None)
+    second = sync_tick(client=FakeClient(pages=[dict(page)]))
+    assert second.pulled == 0
+    assert len(portal_store.unhandled_events()) == 1
+
+
+def test_an_integer_zero_event_id_is_not_treated_as_missing():
+    client = FakeClient(
+        pages=[
+            {"events": [{"id": 0, "submission_id": SUB, "type": "x"}],
+             "cursor": "c1", "has_more": False}
+        ]
+    )
+    sync_tick(client=client)
+    assert [e.event_id for e in portal_store.unhandled_events()] == ["0"]
+
+
+def test_a_malformed_page_does_not_advance_the_cursor():
+    client = FakeClient(
+        pages=[{"events": "not-a-list", "cursor": "c1", "has_more": False}]
+    )
+    result = sync_tick(client=client)
+    assert result.errors
+    assert portal_store.get_sync_state().pull_cursor is None
+
+
+def test_a_nested_revision_seeds_the_allocator_too():
+    """The mirror reads the nested shape, so the seed must as well."""
+    client = FakeClient(
+        pages=[
+            {
+                "events": [
+                    {"id": "e1", "submission_id": SUB, "type": "created",
+                     "data": {"revision": 4, "intake": "x"}}
+                ],
+                "cursor": "c1",
+                "has_more": False,
+            }
+        ]
+    )
+    sync_tick(client=client)
+    assert enqueue_status(SUB, "in-design").revision == 5
+
+
+def test_sync_tick_returns_even_when_recording_pass_state_fails(monkeypatch):
+    """The bookkeeping write must not be the thing that breaks 'never raises'."""
+    def _boom(*_a, **_kw):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(portal_store, "clear_error", _boom)
+    monkeypatch.setattr(portal_store, "note_error", _boom)
+    result = sync_tick(client=FakeClient())
+    assert result.enabled is True
+    assert result.heartbeat_ok is True
+
+
+def test_requeue_revives_a_retired_row_with_a_fresh_revision():
+    enqueue_design_round(SUB, _design())
+    for _ in range(portal_sync.MAX_PUSH_ATTEMPTS):
+        sync_tick(client=FakeClient(push_error=PortalBridgeError("400 malformed")))
+    retired = portal_store.outbox_for_submission(SUB)[0]
+    assert retired.state == portal_store.STATE_REJECTED
+
+    revived = portal_store.requeue(SUB, retired.seq)
+    assert revived.state == portal_store.STATE_PENDING
+    assert revived.attempts == 0
+    assert revived.revision > retired.revision
+
+    client = FakeClient()
+    assert sync_tick(client=client).applied == 1
+
+
+def test_requeue_of_an_unknown_row_is_a_clean_none():
+    assert portal_store.requeue("nope", 1) is None
