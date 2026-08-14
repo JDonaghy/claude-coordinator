@@ -213,7 +213,7 @@ def test_vimcode_graph_128h_stale_with_hooks_disabled_is_crit_at_defaults(
 ) -> None:
     monkeypatch.setattr(
         "coord.graph_health.graph_status",
-        lambda p: _stale_graph_status(VIMCODE_GRAPH_STALE_HOURS),
+        lambda p, default_branch="main": _stale_graph_status(VIMCODE_GRAPH_STALE_HOURS),
     )
     monkeypatch.setattr(
         "coord.graph_health.hooks_path_status",
@@ -249,7 +249,9 @@ def test_hooks_disabled_makes_a_stale_graph_crit_at_any_age(
     clears. With them disabled it is a permanent wrong answer, so age is
     irrelevant — this is the distinction the incident turned on.
     """
-    monkeypatch.setattr("coord.graph_health.graph_status", lambda p: _stale_graph_status(1.0))
+    monkeypatch.setattr(
+        "coord.graph_health.graph_status", lambda p, default_branch="main": _stale_graph_status(1.0)
+    )
     monkeypatch.setattr(
         "coord.graph_health.hooks_path_status", lambda p: (False, "core.hooksPath is unset")
     )

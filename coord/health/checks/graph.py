@@ -23,6 +23,14 @@ longer HEAD.  That is the 2026-07-30 vimcode incident: 128.8h stale, hooks
 disabled, and nothing in the fleet said so.  Age escalates a
 hooks-working checkout from WARN to CRIT at ``graph_stale_crit_hours``;
 hooks-disabled skips straight to CRIT because time cannot fix it.
+
+**graph == HEAD is not the whole story (#2211).** ``status.stale`` only
+compares the graph to this checkout's OWN HEAD. The base checkout is fetched
+but never pulled (see ``coord.graph_health``'s module docstring), so HEAD can
+sit arbitrarily far behind ``origin/<default_branch>`` while the graph
+matches it exactly — a confidently-correct-looking graph of stale code. This
+module reports that as its own WARN (``status.origin_behind``), independent
+of and never overriding ``status.stale``'s verdict.
 """
 
 from __future__ import annotations
@@ -79,7 +87,10 @@ def probe_graph(ctx: HealthContext) -> list[CheckResult]:
     results: list[CheckResult] = []
 
     for checkout in ctx.checkouts:
-        status = graph_status(checkout.path)
+        # #2211: default_branch drives the HEAD-vs-origin comparison
+        # alongside the existing graph-vs-HEAD one. Never fetches — only
+        # reads whatever origin/<default_branch> the last `git fetch` left.
+        status = graph_status(checkout.path, checkout.default_branch)
         hooks_ok, hooks_detail = hooks_path_status(checkout.path)
 
         values = {
@@ -91,6 +102,10 @@ def probe_graph(ctx: HealthContext) -> list[CheckResult]:
             "verified_current": status.verified_current,
             "built_sha": status.built_sha,
             "head_sha": status.head_sha,
+            "default_branch": status.default_branch,
+            "origin_sha": status.origin_sha,
+            "commits_behind_origin": status.commits_behind_origin,
+            "origin_behind": status.origin_behind,
             "age_seconds": status.age_seconds,
             "age_hours": (
                 round(status.age_seconds / 3600.0, 1) if status.age_seconds is not None else None
@@ -153,11 +168,35 @@ def probe_graph(ctx: HealthContext) -> list[CheckResult]:
             else f", {commits_behind} commit{'' if commits_behind == 1 else 's'} behind"
         )
 
+        # #2211: graph == HEAD only proves the graph matches this checkout's
+        # OWN HEAD — it says nothing about whether HEAD itself is behind
+        # origin. The base checkout is fetched but never pulled by design
+        # (see coord.graph_health module docstring), so this must be judged
+        # independently of `status.stale`, not folded into it.
+        origin_suffix = (
+            ""
+            if not status.origin_behind
+            else (
+                f", {status.commits_behind_origin} commit"
+                f"{'' if status.commits_behind_origin == 1 else 's'} behind "
+                f"origin/{status.default_branch}"
+            )
+        )
+
         if not status.stale:
-            severity = Severity.OK
-            headroom = f"in sync ({(status.built_sha or '')[:8]}), {age_text} old"
-            if status.verified_current and status.stamp_behind:
-                headroom = f"content current (stamp {(status.built_sha or '')[:8]}), {age_text} old"
+            if status.origin_behind:
+                severity = Severity.WARN
+                headroom = (
+                    f"graph matches HEAD ({(status.built_sha or '')[:8]}){origin_suffix} "
+                    "— describes stale code"
+                )
+            else:
+                severity = Severity.OK
+                headroom = f"in sync ({(status.built_sha or '')[:8]}), {age_text} old"
+                if status.verified_current and status.stamp_behind:
+                    headroom = (
+                        f"content current (stamp {(status.built_sha or '')[:8]}), {age_text} old"
+                    )
         elif not hooks_ok:
             severity = Severity.CRIT
             headroom = f"{age_text} stale{commits_suffix}, hooks disabled -> will not self-heal"
@@ -172,7 +211,17 @@ def probe_graph(ctx: HealthContext) -> list[CheckResult]:
             headroom = f"stale, {age_text} old{commits_suffix} (HEAD {(status.head_sha or '')[:8]})"
 
         detail = ""
-        if severity is not Severity.OK:
+        if not status.stale and status.origin_behind:
+            # Not a graph problem — `graphify update` would rebuild from the
+            # same stale HEAD. Naming a `git pull` here deliberately, but not
+            # running one: automatic pulls are unsafe for a base checkout
+            # (see coord.graph_health module docstring — deliberately-parked
+            # branches, stale .git/index.lock, etc).
+            detail = (
+                f"fix: review, then pull {checkout.path} to catch it up to "
+                f"origin/{status.default_branch} (not automatic)"
+            )
+        elif severity is not Severity.OK:
             detail = f"fix: graphify update {checkout.path}"
             if not hooks_ok:
                 detail = f"{detail}  —  {hooks_detail}"

@@ -47,6 +47,36 @@ def _repo_with_graph(root: Path, *, built_sha: str | None = None) -> Path:
     return root
 
 
+def _add_empty_commits(repo: Path, n: int, *, prefix: str = "extra") -> None:
+    for i in range(n):
+        _git("commit", "-q", "--allow-empty", "-m", f"{prefix}-{i}", cwd=repo)
+
+
+def _repo_behind_origin(root: Path, tmp_path: Path, *, behind_by: int) -> Path:
+    """A repo whose graph matches its OWN HEAD, but whose HEAD sits
+    *behind_by* commits behind ``origin/main`` — the exact shape a base
+    checkout accumulates over time, because the agent fetches but
+    deliberately never pulls it (``coord/agent.py``, see
+    ``coord.graph_health``'s module docstring for why).
+
+    ``behind_by=0`` gives a checkout that is in sync on both axes.
+    """
+    repo = _repo_with_graph(root)
+    caught_up_at = _git("rev-parse", "HEAD", cwd=repo).stdout.strip()
+    bare = tmp_path / "origin.git"
+    _git("init", "-q", "-b", "main", "--bare", str(bare), cwd=tmp_path)
+    _git("remote", "add", "origin", str(bare), cwd=repo)
+    _git("push", "-q", "origin", "HEAD:refs/heads/main", cwd=repo)
+    if behind_by:
+        _add_empty_commits(repo, behind_by)
+        _git("push", "-q", "origin", "HEAD:refs/heads/main", cwd=repo)
+        _git("reset", "-q", "--hard", caught_up_at, cwd=repo)
+    # The agent's own behaviour (fetch, never pull) — populates
+    # refs/remotes/origin/main without moving HEAD.
+    _git("fetch", "-q", "origin", cwd=repo)
+    return repo
+
+
 def _config_for(tmp_path: Path, repo_path: Path) -> Path:
     cfg = tmp_path / "coordinator.yml"
     cfg.write_text(
@@ -123,3 +153,64 @@ def test_handles_a_machine_whose_checkout_is_absent(tmp_path: Path) -> None:
     out = _run(cfg)
 
     assert "no local checkouts" in out
+
+
+# ── #2211: graph == HEAD says nothing about HEAD == origin ──────────────────
+#
+# The agent fetches the base checkout but deliberately never pulls it (see
+# coord.graph_health's module docstring) — worktrees always branch from a
+# freshly-fetched origin/<default>, so a stale base never breaks dispatch.
+# But graphify indexes the base checkout's working tree, not origin, so a
+# graph that matches a stale HEAD used to report a clean '✓ in sync' with no
+# way to tell the checkout was ever behind the remote at all.
+
+
+def test_reports_stale_relative_to_origin_when_graph_matches_a_stale_head(
+    tmp_path: Path,
+) -> None:
+    """The exact regression: graph == HEAD, but HEAD is behind origin/main.
+    Must NOT render as '✓ in sync' — that is the confidently-correct-looking-
+    graph-of-the-past failure mode the issue is about. Must also make no
+    writes: HEAD is unchanged after the check runs."""
+    repo = _repo_behind_origin(tmp_path / "api", tmp_path, behind_by=3)
+    head_before = _git("rev-parse", "HEAD", cwd=repo).stdout.strip()
+
+    out = _run(_config_for(tmp_path, repo))
+
+    assert "graph in sync" not in out, (
+        "graph == HEAD must not be reported as fully in sync when HEAD "
+        "itself is behind origin"
+    )
+    assert "3 commits behind origin/main" in out
+    assert "STALE" not in out, "the graph really does match HEAD — not today's drift"
+
+    head_after = _git("rev-parse", "HEAD", cwd=repo).stdout.strip()
+    assert head_after == head_before, "the check must never write to the checkout"
+
+
+def test_reports_in_sync_when_head_matches_both_graph_and_origin(
+    tmp_path: Path,
+) -> None:
+    """A checkout in sync on both axes — graph == HEAD == origin — still
+    reports the plain '✓ in sync' with no origin-drift warning."""
+    repo = _repo_behind_origin(tmp_path / "api", tmp_path, behind_by=0)
+
+    out = _run(_config_for(tmp_path, repo))
+
+    assert "graph in sync" in out
+    assert "behind origin" not in out
+    assert "GRAPH_HEALTH: checkouts=1 stale=0 origin_behind=0" in out
+
+
+def test_graph_vs_head_drift_still_reports_stale_regardless_of_origin(
+    tmp_path: Path,
+) -> None:
+    """graph != HEAD must still render as today's STALE, unchanged — the
+    origin axis is additive, never a replacement for the existing check."""
+    repo = _repo_behind_origin(tmp_path / "api", tmp_path, behind_by=0)
+    _git("commit", "-q", "--allow-empty", "-m", "moves HEAD past the graph", cwd=repo)
+
+    out = _run(_config_for(tmp_path, repo))
+
+    assert "STALE" in out
+    assert "GRAPH_HEALTH: checkouts=1 stale=1" in out

@@ -1464,6 +1464,15 @@ def _diagnose_graph_health(config_path: Path) -> None:
     checks ``core.hooksPath``, the one-time per-machine setting that decides
     whether worktrees on this box get a linked graph at all.
 
+    #2211: also reports HEAD vs ``origin/<default_branch>``, alongside the
+    existing graph-vs-HEAD comparison.  The base checkout is fetched but
+    never pulled by design (worktrees always branch from a fresh
+    ``origin/<default>``, so a stale base never breaks dispatch) — which
+    means a graph can match HEAD exactly while HEAD itself sits arbitrarily
+    far behind the remote, and the graph-vs-HEAD check alone reports a clean
+    ``✓ in sync`` for it. This never fetches or pulls; it only reads whatever
+    ``origin/<default_branch>`` the last fetch left behind.
+
     Local-machine only, same scope as ``--orphan-worktrees``: it inspects the
     checkouts named in ``coordinator.yml`` that actually exist here.
     """
@@ -1476,7 +1485,7 @@ def _diagnose_graph_health(config_path: Path) -> None:
     cfg = _load_config(config_path)
 
     seen: set[Path] = set()
-    checkouts: list[tuple[str, Path]] = []
+    checkouts: list[tuple[str, Path, str]] = []
     for machine in cfg.machines:
         for repo_cfg in cfg.repos:
             rp = machine.repo_path(repo_cfg.name)
@@ -1486,16 +1495,20 @@ def _diagnose_graph_health(config_path: Path) -> None:
             if path in seen or not (path / ".git").exists():
                 continue
             seen.add(path)
-            checkouts.append((repo_cfg.name, path))
+            checkouts.append((repo_cfg.name, path, repo_cfg.default_branch or "main"))
 
     if not checkouts:
         click.echo("no local checkouts from coordinator.yml exist on this machine.")
         return
 
     stale_count = 0
-    for repo_name, path in checkouts:
+    origin_behind_count = 0
+    for repo_name, path, default_branch in checkouts:
         click.echo(f"── {repo_name}")
-        st = graph_status(path)
+        # #2211: default_branch drives the HEAD-vs-origin comparison
+        # alongside the existing graph-vs-HEAD one — never fetches, only
+        # reads whatever `origin/<default_branch>` the last fetch left.
+        st = graph_status(path, default_branch)
         for line in format_status_lines(st):
             click.echo(f"  {line}")
         if st.stale:
@@ -1504,11 +1517,20 @@ def _diagnose_graph_health(config_path: Path) -> None:
                 "    fix: run `graphify update .` in the checkout "
                 "(the hooks skip rebase/merge/cherry-pick and reset --hard)"
             )
+        if st.origin_behind:
+            origin_behind_count += 1
+            click.echo(
+                f"    fix: HEAD is behind origin/{default_branch} — the base "
+                "checkout is fetched but never auto-pulled (by design; "
+                "checkouts are sometimes deliberately parked). Review and "
+                "pull by hand if it isn't."
+            )
         ok, detail = hooks_path_status(path)
         click.echo(f"  {'✓' if ok else '⚠'} {detail}")
 
     click.echo(
-        f"GRAPH_HEALTH: checkouts={len(checkouts)} stale={stale_count}"
+        f"GRAPH_HEALTH: checkouts={len(checkouts)} stale={stale_count} "
+        f"origin_behind={origin_behind_count}"
     )
 
 
