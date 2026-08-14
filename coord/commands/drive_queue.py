@@ -191,13 +191,35 @@ def drive_queue_add(
     """
     from coord.state import enqueue_drive_queue, list_drive_queue  # noqa: PLC0415
 
+    existing_entries = entries_from_rows(list_drive_queue())
     try:
         after = parse_after_spec(after_specs, repo)
         validate_config_repo(config_path, repo)
         validate_hold_flags(hold_after, hold_reason, resume_when, hold_scope)
-        validate_enqueue(entries_from_rows(list_drive_queue()), repo, issue, after)
+        validate_enqueue(existing_entries, repo, issue, after)
     except QueueError as exc:
         raise click.ClickException(str(exc)) from None
+
+    # #2186: the UPDATE path in `_enqueue_drive_queue_local` always writes
+    # whatever `hold_scope` THIS call passed (default `entry`) — so re-adding
+    # an already fleet-scoped gate without repeating `--scope fleet` silently
+    # narrows it. That fails toward the safer/narrower scope, not a
+    # correctness bug, but it is a real behaviour change an operator who only
+    # meant to touch `--machine`/`--after` would not expect, so it is echoed
+    # rather than left silent.
+    previous = next((e for e in existing_entries if e.key == entry_key(repo, issue)), None)
+    scope_downgrade_warning = ""
+    if (
+        previous is not None
+        and previous.hold_scope == HOLD_SCOPE_FLEET
+        and hold_after
+        and hold_scope != HOLD_SCOPE_FLEET
+    ):
+        scope_downgrade_warning = (
+            f"\nwarning: {entry_key(repo, issue)} was scope=fleet — this add did not "
+            f"repeat --scope {HOLD_SCOPE_FLEET}, so its gate is now scope={hold_scope} "
+            "(entries-only). Pass --scope fleet again if the fleet-wide stop was still needed."
+        )
 
     enqueue_drive_queue(
         repo,
@@ -219,7 +241,7 @@ def drive_queue_add(
             gate += " (fleet-wide — nothing anywhere launches)"
         if resume_when:
             gate += f" (auto-resume when `{resume_when}` passes)"
-    click.echo(f"queued {entry_key(repo, issue)}{pinned}{suffix}{gate}")
+    click.echo(f"queued {entry_key(repo, issue)}{pinned}{suffix}{gate}{scope_downgrade_warning}")
 
 
 def validate_hold_flags(

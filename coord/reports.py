@@ -891,6 +891,14 @@ def fold_drive_queue_status(
                 "session_name": entry.get("session_name") or "",
                 "hold_reason": entry.get("hold_reason") or "",
                 "resume_when": entry.get("resume_when") or "",
+                # #2186: without this, a report consumer (or `coord reports
+                # drive-queue-status`) has the same blind spot the TUI had —
+                # a fired gate with no way to tell "this entry alone is
+                # held" from "the whole queue stopped". Fail-closed exactly
+                # like `coord.state.list_drive_queue`'s own normalisation
+                # (and `QueueEntry._normalize_hold_scope`): anything other
+                # than the literal `"fleet"` reads as the narrower `"entry"`.
+                "hold_scope": "fleet" if str(entry.get("hold_scope") or "") == "fleet" else "entry",
             }
         )
 

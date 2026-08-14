@@ -50,6 +50,13 @@ pub(crate) const QUEUE_STATE_DONE: &str = "done";
 /// Mirrors `HOLD_*` in `coord/drive_queue.py`.
 pub(crate) const HOLD_STATE_FIRED: &str = "fired";
 
+/// #2186: wire values of `drive_queue.hold_scope` — how far a FIRED gate
+/// reaches. `entry` (the default) holds only entries whose own `after` names
+/// the gate's key; `fleet` is the deliberately-opt-in whole-queue stop.
+/// Mirrors `HOLD_SCOPE_ENTRY`/`HOLD_SCOPE_FLEET` in `coord/drive_queue.py`.
+pub(crate) const HOLD_SCOPE_ENTRY: &str = "entry";
+pub(crate) const HOLD_SCOPE_FLEET: &str = "fleet";
+
 /// #1755: pending "Add to drive queue after…" text input. Mirrors
 /// `PendingMilestoneRowInput`'s single-buffer shape (Enter submits, Esc
 /// cancels) rather than a full form — the whole payload is a short list of
@@ -79,9 +86,16 @@ pub(crate) enum DriveQueueLevel {
     /// alert case: the queue looks busy but nothing will ever move without
     /// the operator.
     Stalled,
-    /// #1757: an entry's DEPLOY GATE has fired. The queue is deliberately
-    /// stopped and will not launch anything — including a fully eligible
-    /// successor — until a human deploys and releases it.
+    /// #1757/#2186: a FLEET-scoped DEPLOY GATE has fired. The queue is
+    /// deliberately stopped and will not launch anything — including a fully
+    /// eligible, unrelated entry — until a human deploys and releases it.
+    ///
+    /// Deliberately NOT raised for an entry-scoped gate (the default since
+    /// #2186): that only holds its own dependents, and the rest of the queue
+    /// keeps launching in the same tick — see `coord/drive_queue.py`'s
+    /// `Hold.stops_fleet`, which this mirrors, and the #2186 incident this
+    /// level exists to stop repeating (one gate silently reading as a
+    /// fleet-wide stop on the one always-visible surface).
     ///
     /// Outranks `Stalled` (this is a definite stop, not "nothing happens to
     /// be eligible right now") and ranks below `Blocked` (a gate is the
@@ -117,7 +131,7 @@ fn is_pending(e: &BoardDriveQueueEntry) -> bool {
     e.state != QUEUE_STATE_DONE
 }
 
-/// #1757: is this row's deploy gate currently holding the queue shut?
+/// #1757: is this row's OWN deploy gate currently fired?
 ///
 /// Read straight off `hold_state`, which the tick owns — the TUI never
 /// re-derives "should this be held" from `hold_after` + `state`, for the same
@@ -127,8 +141,26 @@ fn is_pending(e: &BoardDriveQueueEntry) -> bool {
 /// Deliberately NOT gated on `is_pending`: a fired gate lives on a `done`
 /// entry by construction (the gate fires when the entry lands), so filtering
 /// `done` rows out here would hide every hold that exists.
+///
+/// Scope-agnostic (#2186) — this only says "this entry's own gate is
+/// closed", the same thing `Hold.blocking` says in `coord/drive_queue.py`.
+/// It does NOT say the queue is stopped; for that, see [`stops_fleet`].
 pub(crate) fn is_holding(e: &BoardDriveQueueEntry) -> bool {
     e.hold_state == HOLD_STATE_FIRED
+}
+
+/// #2186: does this row's fired gate stop the WHOLE queue?
+///
+/// Mirrors `Hold.stops_fleet` in `coord/drive_queue.py` exactly: `blocking
+/// and scope == fleet`. An armed-not-fired gate never stops anything
+/// (`is_holding` is `false`); a fired gate stops only its own dependents
+/// unless it was explicitly declared `--scope=fleet` at `add` time. This is
+/// the one predicate [`summarize_drive_queue`] and [`drive_queue_status_text`]
+/// consult before claiming "nothing will launch" — consulting `is_holding`
+/// alone here is exactly the bug #2186 fixes: every future entry-scoped gate
+/// firing would read as a fleet-wide stop on the always-visible status bar.
+pub(crate) fn stops_fleet(e: &BoardDriveQueueEntry) -> bool {
+    is_holding(e) && e.hold_scope == HOLD_SCOPE_FLEET
 }
 
 /// The sentence shown for a held gate — the operator's own `hold_reason`
@@ -148,13 +180,22 @@ fn hold_headline(e: &BoardDriveQueueEntry) -> String {
 /// decision belongs to DQ-2's tick (which also weighs board state, capacity
 /// and machine routing). All this answers is the question the operator can
 /// verify by eye — "is a pre-req of mine still sitting in this same queue,
-/// unfinished?" — which is the only stall cause the TUI can name without
-/// re-implementing the tick. A pre-req that isn't in the queue at all is
-/// treated as satisfied (it may have landed long ago).
+/// unfinished, OR gated shut?" — which is the only stall cause the TUI can
+/// name without re-implementing the tick. A pre-req that isn't in the queue
+/// at all is treated as satisfied (it may have landed long ago).
+///
+/// #2186: a pre-req whose OWN gate has fired is unsatisfied even though its
+/// row has by then reconciled to `done` — mirroring `_resolve_prereqs` in
+/// `coord/drive_queue.py`, which checks `held_gates` BEFORE `facts.landed`
+/// for exactly this reason (an entry merging is not the same fact as its
+/// gate having released). Checked regardless of the gate's own scope: an
+/// entry-scoped gate still holds ITS dependents, which is precisely the case
+/// this local read must not call eligible.
 fn after_satisfied(entry: &BoardDriveQueueEntry, all: &[BoardDriveQueueEntry]) -> bool {
     entry.after.iter().all(|key| {
-        !all.iter()
-            .any(|other| other.key() == *key && other.state != QUEUE_STATE_DONE)
+        !all.iter().any(|other| {
+            other.key() == *key && (other.state != QUEUE_STATE_DONE || is_holding(other))
+        })
     })
 }
 
@@ -170,9 +211,20 @@ pub(crate) struct DriveQueueSummary {
     /// Waiting rows whose in-queue pre-reqs are all satisfied — i.e. rows a
     /// tick could plausibly pick up. Zero-with-waiting-rows is the stall.
     pub(crate) eligible: usize,
-    /// #1757: rows whose deploy gate has fired. Non-zero means the tick will
-    /// launch nothing at all, whatever `eligible` says.
+    /// #1757: rows whose OWN deploy gate has fired, any scope. Purely
+    /// informational (e.g. the Queue panel sidebar's "N held" line) — it
+    /// does NOT by itself mean the tick will launch nothing; an entry-scoped
+    /// gate (the default since #2186) only holds its own dependents. See
+    /// [`DriveQueueSummary::fleet_held`] for the count that actually stops
+    /// the queue.
     pub(crate) held: usize,
+    /// #2186: rows whose FLEET-scoped deploy gate has fired. Non-zero means
+    /// the tick will launch nothing at all, whatever `eligible` says — the
+    /// one count [`summarize_drive_queue`]'s `level` and
+    /// [`drive_queue_status_text`]'s HELD branch actually act on. Zero even
+    /// while `held` is non-zero is the entry-scoped case #2186 exists for:
+    /// one gate fired, the rest of the queue keeps moving.
+    pub(crate) fleet_held: usize,
 }
 
 /// Summarise the queue. Pure over the board rows — no clock, no self.
@@ -181,6 +233,7 @@ pub(crate) fn summarize_drive_queue(entries: &[BoardDriveQueueEntry]) -> DriveQu
     // Counted over ALL entries, not just pending ones: a fired gate sits on a
     // `done` row by construction.
     s.held = entries.iter().filter(|e| is_holding(e)).count();
+    s.fleet_held = entries.iter().filter(|e| stops_fleet(e)).count();
     for e in entries.iter().filter(|e| is_pending(e)) {
         match e.state.as_str() {
             QUEUE_STATE_RUNNING => s.running += 1,
@@ -201,11 +254,14 @@ pub(crate) fn summarize_drive_queue(entries: &[BoardDriveQueueEntry]) -> DriveQu
         // Blocked outranks stalled — a hard stop is worse news than a queue
         // that is merely waiting for capacity.
         DriveQueueLevel::Blocked
-    } else if s.held > 0 {
-        // #1757: a fired gate outranks a stall, and it outranks it even when
-        // the stall is REAL — "3 waiting, none eligible" is a symptom here,
-        // and "you have a deploy to do" is the cause. Showing the symptom
-        // would send the operator looking for a dependency bug.
+    } else if s.fleet_held > 0 {
+        // #1757/#2186: a FLEET-scoped fired gate outranks a stall, and it
+        // outranks it even when the stall is REAL — "3 waiting, none
+        // eligible" is a symptom here, and "you have a deploy to do" is the
+        // cause. Showing the symptom would send the operator looking for a
+        // dependency bug. Deliberately `fleet_held`, not `held`: an
+        // entry-scoped gate does not stop the queue, so it must not force
+        // this level either — that was the #2186 incident.
         DriveQueueLevel::Held
     } else if s.waiting > 0 && s.eligible == 0 && s.running == 0 {
         // Nothing running AND nothing that could start: the epic's "if
@@ -236,9 +292,13 @@ pub(crate) fn drive_queue_status_text(entries: &[BoardDriveQueueEntry]) -> Strin
     match s.level {
         DriveQueueLevel::Empty => "QUEUE: empty".to_string(),
         DriveQueueLevel::Held => {
+            // #2186: this branch is only reached when `fleet_held > 0`, but
+            // the queue may ALSO carry an entry-scoped fired gate (lower
+            // position, say) — `find` must land on the fleet-scoped one
+            // specifically, or the bar would name the wrong gate.
             let gate = entries
                 .iter()
-                .find(|e| is_holding(e))
+                .find(|e| stops_fleet(e))
                 .map(hold_headline)
                 .unwrap_or_else(|| "deploy gate".to_string());
             let mut out = format!("QUEUE: HELD — {gate}");
@@ -247,7 +307,7 @@ pub(crate) fn drive_queue_status_text(entries: &[BoardDriveQueueEntry]) -> Strin
             // second is the one that needs a human, so it must be on the bar.
             if let Some(p) = entries
                 .iter()
-                .find(|e| is_holding(e))
+                .find(|e| stops_fleet(e))
                 .map(|e| e.hold_probes)
                 .filter(|p| *p > 0)
             {
@@ -971,9 +1031,25 @@ impl CoordApp {
                 dq_state_colors(QUEUE_STATE_BLOCKED).0,
             ));
         }
-        if s.held > 0 {
+        // #2186: the two counts are kept on separate lines rather than
+        // folded into one "N held" figure — an operator scanning this
+        // sidebar needs to tell "one entry is waiting on its own gate" from
+        // "the whole queue has stopped" at a glance, the same distinction
+        // `render_plan`'s `[scope=fleet]` tag draws in `coord drive-queue
+        // plan`'s CLI output.
+        let entry_held = s.held.saturating_sub(s.fleet_held);
+        if entry_held > 0 {
             items.push(activity_item(
-                &format!("  {} held (deploy gate)", s.held),
+                &format!("  {entry_held} held (deploy gate, {HOLD_SCOPE_ENTRY}-scoped)"),
+                Color::rgb(255, 210, 100),
+            ));
+        }
+        if s.fleet_held > 0 {
+            items.push(activity_item(
+                &format!(
+                    "  {} held (deploy gate, fleet-wide — nothing will launch)",
+                    s.fleet_held
+                ),
                 Color::rgb(255, 210, 100),
             ));
         }
@@ -1864,9 +1940,18 @@ pub(crate) fn alias_queue_key(key: &str) -> String {
 /// `hold_state` (never re-derived, same posture as `state`).
 fn queue_hold_cell(e: &BoardDriveQueueEntry) -> String {
     if is_holding(e) {
-        // Upper-case because this is the one value that stops the queue
-        // dead: nothing launches, however eligible, until a human releases.
-        return "FIRED".to_string();
+        // Upper-case because this row's own launch is dead: whatever this
+        // entry's gate holds, IT will not launch until a human releases it.
+        // #2186: that is no longer "the queue is dead" in general — only a
+        // `[fleet]`-tagged row stops everything else too — so the scope is
+        // spelled out here exactly the way `render_plan`'s `scope_tag` spells
+        // it out in `coord/drive_queue.py`: silent for the default (`entry`),
+        // named for the deliberately-opted-into case.
+        return if stops_fleet(e) {
+            "FIRED [fleet]".to_string()
+        } else {
+            "FIRED".to_string()
+        };
     }
     if e.hold_after == 0 {
         return QUEUE_EMPTY_CELL.to_string();
@@ -2724,15 +2809,27 @@ mod tests {
     // through `driver_with_shell` + `make_test_app`, so per this repo's
     // CLAUDE.md they belong HERE, in-crate, not in a SMOKE_TESTS bullet.
 
-    /// A held entry, as the wire delivers it: the gate fires when the entry
-    /// lands, so the row is `done` AND `hold_state == "fired"` at once.
-    fn held_entry(issue: i64, position: i64, reason: &str) -> BoardDriveQueueEntry {
+    /// A fired-gate entry, as the wire delivers it: the gate fires when the
+    /// entry lands, so the row is `done` AND `hold_state == "fired"` at
+    /// once. `scope` is `HOLD_SCOPE_ENTRY` or `HOLD_SCOPE_FLEET` (#2186).
+    fn fired_entry(issue: i64, position: i64, reason: &str, scope: &str) -> BoardDriveQueueEntry {
         BoardDriveQueueEntry {
             hold_after: 1,
             hold_reason: reason.to_string(),
             hold_state: HOLD_STATE_FIRED.to_string(),
+            hold_scope: scope.to_string(),
             ..entry(issue, position, QUEUE_STATE_DONE, &[])
         }
+    }
+
+    /// A FLEET-scoped fired gate — the pre-#2186 "stops the whole queue"
+    /// case. Kept under this name deliberately: every test below that was
+    /// written before #2186 and calls `held_entry` is specifically
+    /// exercising "the queue reads as stopped", which post-#2186 only a
+    /// fleet-scoped gate does — see `fired_entry` for the entry-scoped
+    /// counterpart the #2186 tests further down use.
+    fn held_entry(issue: i64, position: i64, reason: &str) -> BoardDriveQueueEntry {
+        fired_entry(issue, position, reason, HOLD_SCOPE_FLEET)
     }
 
     #[test]
@@ -2793,6 +2890,119 @@ mod tests {
         assert_eq!(s.eligible, 0, "precondition: this board is stalled too");
         assert_eq!(s.level, DriveQueueLevel::Held);
         assert!(drive_queue_status_text(&rows).starts_with("QUEUE: HELD"));
+    }
+
+    // ── #2186: a fired gate no longer stops the fleet by default ───────────
+
+    /// The issue's own black-box acceptance bar, in the TUI: a fired gate on
+    /// entry A (entry-scoped, the default) must not stop unrelated entry B
+    /// from reading as a normally-running/eligible row — the #2186 incident
+    /// was exactly this read on the always-visible status bar for 8 hours
+    /// while 3 machines sat idle.
+    #[test]
+    fn an_entry_scoped_fired_gate_does_not_hold_an_unrelated_eligible_entry() {
+        let rows = vec![
+            fired_entry(2146, 0, "", HOLD_SCOPE_ENTRY),
+            entry(2170, 1, QUEUE_STATE_WAITING, &[]),
+        ];
+        let s = summarize_drive_queue(&rows);
+        assert_eq!(s.held, 1, "the gate itself is still counted as fired…");
+        assert_eq!(s.fleet_held, 0, "…but it never stops the fleet");
+        assert_eq!(
+            s.level,
+            DriveQueueLevel::Normal,
+            "an unrelated entry must read as ordinary queue activity, not HELD"
+        );
+        assert_eq!(s.eligible, 1, "the unrelated entry stays eligible");
+        assert_eq!(
+            drive_queue_status_text(&rows),
+            "QUEUE: 1 waiting",
+            "the status bar must not claim the whole queue is stopped"
+        );
+    }
+
+    /// The dependent that actually names the fired gate in its own `after`
+    /// is NOT eligible, even though the gate's entry has by then reconciled
+    /// to `done` — `after_satisfied` must check `is_holding`, not just
+    /// `state != done`, mirroring `_resolve_prereqs`' `held_gates` check in
+    /// `coord/drive_queue.py` (checked before `facts.landed` there for the
+    /// same reason).
+    #[test]
+    fn a_fired_gates_own_dependent_is_not_eligible_even_though_the_gate_is_done() {
+        let rows = vec![
+            fired_entry(2146, 0, "", HOLD_SCOPE_ENTRY),
+            entry(2147, 1, QUEUE_STATE_WAITING, &["myrepo#2146"]),
+            entry(2170, 2, QUEUE_STATE_WAITING, &[]),
+        ];
+        let s = summarize_drive_queue(&rows);
+        assert_eq!(
+            s.eligible, 1,
+            "only the unrelated entry is eligible — the gated dependent is not"
+        );
+        assert_eq!(s.waiting, 2);
+        assert_eq!(
+            s.level,
+            DriveQueueLevel::Normal,
+            "the unrelated entry launching keeps this a normal tick, not a stall"
+        );
+    }
+
+    /// A FLEET-scoped gate (`--scope=fleet`, explicitly opted into) still
+    /// stops everything — the deliberate whole-queue case #2186 keeps
+    /// available, distinct from the entry-scoped default above.
+    #[test]
+    fn a_fleet_scoped_fired_gate_still_holds_an_unrelated_entry() {
+        let rows = vec![
+            fired_entry(2146, 0, "deploy the release", HOLD_SCOPE_FLEET),
+            entry(2170, 1, QUEUE_STATE_WAITING, &[]),
+        ];
+        let s = summarize_drive_queue(&rows);
+        assert_eq!(s.fleet_held, 1);
+        assert_eq!(s.level, DriveQueueLevel::Held);
+        assert_eq!(
+            drive_queue_status_text(&rows),
+            "QUEUE: HELD — deploy the release"
+        );
+    }
+
+    /// A malformed/absent `hold_scope` (a row predating the #2186 column, or
+    /// a wire value this build has never heard of) fails CLOSED to
+    /// entry-scope — never silently escalates to a fleet-wide stop.
+    /// Mirrors `QueueEntry._normalize_hold_scope` in `coord/drive_queue.py`.
+    #[test]
+    fn an_unrecognised_hold_scope_fails_closed_to_entry_scope() {
+        let rows = vec![
+            BoardDriveQueueEntry {
+                hold_scope: "".to_string(),
+                ..fired_entry(2146, 0, "", HOLD_SCOPE_FLEET)
+            },
+            entry(2170, 1, QUEUE_STATE_WAITING, &[]),
+        ];
+        assert!(!stops_fleet(&rows[0]));
+        assert_eq!(summarize_drive_queue(&rows).level, DriveQueueLevel::Normal);
+    }
+
+    /// The Hold cell names the scope only when it's the non-default,
+    /// deliberately-opted-into one — mirrors `render_plan`'s `[scope=fleet]`
+    /// tag in `coord/drive_queue.py`, which is silent for the default too.
+    #[test]
+    fn queue_hold_cell_names_fleet_scope_but_not_the_default() {
+        let app = make_test_app(BoardData {
+            drive_queue: vec![
+                fired_entry(2146, 0, "", HOLD_SCOPE_ENTRY),
+                fired_entry(2200, 1, "", HOLD_SCOPE_FLEET),
+            ],
+            ..BoardData::default()
+        });
+        let rows = app.queue_rows();
+        let cell_for = |issue: i64| {
+            rows.iter()
+                .find(|r| r.issue_number == issue)
+                .map(|r| r.cells[7].clone())
+                .unwrap_or_else(|| panic!("row {issue} not found"))
+        };
+        assert_eq!(cell_for(2146), "FIRED");
+        assert_eq!(cell_for(2200), "FIRED [fleet]");
     }
 
     /// …and BLOCKED still outranks HELD: a gate is the system working as
