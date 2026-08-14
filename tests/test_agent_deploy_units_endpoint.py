@@ -139,15 +139,40 @@ def test_the_endpoint_enables_installed_timers(client, lane_with_timer, monkeypa
 
     def _fake_enable(report, **_kwargs):
         calls.append(sorted(u.name for u in report.units if u.name.endswith(".timer")))
-        return {"coord-agent.timer": (True, "enabled")}
+        return {"coord-agent.timer": (True, True, "enabled")}
 
     monkeypatch.setattr(du, "enable_timers", _fake_enable)
 
     resp = client.post("/deploy-units", json={})
     assert resp.status_code == 200
     body = resp.json()
-    assert body["timers_enabled"] == {"coord-agent.timer": {"ok": True, "detail": "enabled"}}
+    assert body["timers_enabled"] == {
+        "coord-agent.timer": {"ok": True, "changed": True, "detail": "enabled"}
+    }
     assert calls == [["coord-agent.timer"]]
+
+
+def test_the_endpoint_reports_a_timer_it_left_alone(client, lane_with_timer, monkeypatch):
+    """#2124: a timer `enable_timers` found already enabled (e.g. stopped by
+    an operator on purpose) is reported with `changed: False` — the signal
+    `coord release propagate`'s own output (`_roll_units`) uses to name it
+    as held rather than started."""
+    monkeypatch.setattr(
+        du, "enable_timers",
+        lambda report, **k: {
+            "coord-agent.timer": (True, False, "already enabled (ActiveState=inactive)"),
+        },
+    )
+    resp = client.post("/deploy-units", json={})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["timers_enabled"] == {
+        "coord-agent.timer": {
+            "ok": True, "changed": False,
+            "detail": "already enabled (ActiveState=inactive)",
+        }
+    }
 
 
 def test_a_dry_run_never_enables_timers(client, lane_with_timer, monkeypatch):
@@ -164,20 +189,25 @@ def test_a_dry_run_never_enables_timers(client, lane_with_timer, monkeypatch):
 def test_a_failed_timer_enable_fails_the_response(client, lane_with_timer, monkeypatch):
     monkeypatch.setattr(
         du, "enable_timers",
-        lambda report, **k: {"coord-agent.timer": (False, "enable failed")},
+        lambda report, **k: {"coord-agent.timer": (False, False, "enable failed")},
     )
     resp = client.post("/deploy-units", json={})
     assert resp.status_code == 500
     body = resp.json()
     assert body["ok"] is False
     assert body["timers_enabled"]["coord-agent.timer"]["ok"] is False
+    assert body["timers_enabled"]["coord-agent.timer"]["changed"] is False
 
 
 def test_the_real_enable_timers_is_exercised_end_to_end(client, lane_with_timer, monkeypatch):
     """No monkeypatch of `enable_timers` itself here — only the subprocess
     boundary — so this exercises the real wiring from HTTP request through
     `install_units` to the actual `systemctl --user enable --now` argv,
-    which is the thing that was silently never happening before #2082."""
+    which is the thing that was silently never happening before #2082.
+    `coord-agent.timer` has no prior state as far as this fake is
+    concerned (empty `show` output), which `enable_timers` (#2124) must
+    read the same way it reads genuinely never-enabled: go ahead and
+    enable it."""
     calls: list = []
 
     def _fake_run(argv, **_kwargs):
@@ -193,8 +223,47 @@ def test_the_real_enable_timers_is_exercised_end_to_end(client, lane_with_timer,
     monkeypatch.setattr(subprocess, "run", _fake_run)
     resp = client.post("/deploy-units", json={})
     assert resp.status_code == 200
-    assert resp.json()["timers_enabled"] == {"coord-agent.timer": {"ok": True, "detail": "enabled"}}
-    assert calls == [["systemctl", "--user", "enable", "--now", "coord-agent.timer"]]
+    assert resp.json()["timers_enabled"] == {
+        "coord-agent.timer": {"ok": True, "changed": True, "detail": "enabled"}
+    }
+    assert calls[0][:3] == ["systemctl", "--user", "show"]
+    assert calls[-1] == ["systemctl", "--user", "enable", "--now", "coord-agent.timer"]
+
+
+def test_the_real_enable_timers_leaves_a_stopped_timer_stopped_end_to_end(
+    client, lane_with_timer, monkeypatch
+):
+    """#2124's acceptance shape, exercised through the same real wiring as
+    the test above: `coord-agent.timer` is already enabled but its
+    `ActiveState` is `inactive` — exactly what `systemctl --user stop`
+    leaves behind. No `enable`/`start` call may reach systemd for it."""
+    calls: list = []
+
+    def _fake_run(argv, **_kwargs):
+        calls.append(list(argv))
+
+        class _Proc:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        if len(argv) > 2 and argv[2] == "show":
+            _Proc.stdout = (
+                "Id=coord-agent.timer\n"
+                "UnitFileState=enabled\n"
+                "ActiveState=inactive\n"
+                "SubState=dead\n"
+            )
+        return _Proc()
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    resp = client.post("/deploy-units", json={})
+    assert resp.status_code == 200
+    body = resp.json()["timers_enabled"]["coord-agent.timer"]
+    assert body["ok"] is True
+    assert body["changed"] is False
+    assert "ActiveState=inactive" in body["detail"]
+    assert all(argv[2] != "enable" for argv in calls)
 
 
 def test_a_bodyless_post_is_accepted(client, lane):

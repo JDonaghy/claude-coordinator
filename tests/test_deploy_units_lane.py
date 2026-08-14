@@ -183,18 +183,31 @@ def test_a_dry_run_writes_nothing(reference, installed):
     assert not list(installed.glob("*.bak"))
 
 
-# ── enable_timers (#2082) ─────────────────────────────────────────────────
+# ── enable_timers (#2082 + #2124) ──────────────────────────────────────────
 #
 # #2082: `coord-release-propagate.timer` reached three hosts' installed
 # directory and sat there disabled for a day — `install_units` refreshed its
-# CONTENT every release; nothing ever ran `systemctl --user enable --now` on
-# it. These tests pin the fix: every *installed* (not merely packaged)
-# `.timer` unit gets `enable --now` asserted every deploy, regardless of
-# whether its content happened to change this run.
+# CONTENT every release; nothing ever ran `systemctl --user enable` on it.
+# The fix that shipped was `enable --now` on every *installed* `.timer`,
+# every deploy, regardless of whether content changed this run.
+#
+# #2124: `--now` also **starts** a timer, and an operator who ran `systemctl
+# --user stop coord-drive-queue.timer` to open a deploy window got it
+# restarted by the very deploy running inside that window. `enable` and
+# `--now` had to be pulled apart: persistent enablement (`UnitFileState`,
+# untouched by `stop`) is what #2082 needed asserted; current run state
+# (`ActiveState`, exactly what `stop` changes) is what #2124 says a deploy
+# must never override.
+#
+# Both defects get tests in this one file, deliberately, so a future change
+# to one cannot silently regress the other.
 
 
 class _FakeRun:
-    """Records every `systemctl` invocation `enable_timers` makes."""
+    """Records every `systemctl` invocation `enable_timers` makes. Answers
+    every call — including the `show` state query `enable_timers` issues
+    first — with an empty, no-data result, i.e. "this test does not model
+    prior state"; see `_FakeSystemd` below for tests that do."""
 
     def __init__(self, ok: bool = True):
         self.ok = ok
@@ -211,10 +224,56 @@ class _FakeRun:
         return _Proc()
 
 
+class _FakeSystemd:
+    """A minimal in-memory systemd, keyed by unit name — just enough to
+    answer `systemctl --user show` (the state query `enable_timers` makes
+    first, #2124) and to actually apply an `enable`/`enable --now` call to
+    its own state, the same two operations the real systemd exposes.
+
+    Construct with each unit's starting `UnitFileState`/`ActiveState` — the
+    two real, independent facts that separate the #2082 case (never
+    enabled: `UnitFileState=disabled`) from the #2124 one (enabled, but an
+    operator ran `stop`: `UnitFileState=enabled`, `ActiveState=inactive`).
+    """
+
+    def __init__(self, states: dict[str, dict[str, str]]):
+        self.states = {name: dict(fields) for name, fields in states.items()}
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv, **_kwargs):
+        self.calls.append(list(argv))
+
+        class _Proc:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        if len(argv) > 2 and argv[2] == "show":
+            names = [a for a in argv[3:] if not a.startswith("--")]
+            blocks = []
+            for name in names:
+                fields = self.states.get(name, {})
+                lines = [f"Id={name}"]
+                lines += [f"{k}={v}" for k, v in fields.items()]
+                blocks.append("\n".join(lines))
+            _Proc.stdout = "\n\n".join(blocks)
+        elif len(argv) > 2 and argv[2] == "enable":
+            name = argv[-1]
+            state = self.states.setdefault(name, {})
+            state["UnitFileState"] = "enabled"
+            if "--now" in argv:
+                state["ActiveState"] = "active"
+                state["SubState"] = "running"
+        return _Proc()
+
+
 def test_enable_timers_touches_every_installed_timer(reference, installed):
     """The dellserver repro: `coord-serve.timer` is installed (unchanged
     content) — it must still get `enable --now`, because enable state is
-    independent of content and nothing else asserts it."""
+    independent of content and nothing else asserts it. `_FakeRun`'s state
+    query answers "no data", which this function must treat the same as
+    "never enabled" (#2082) — see `_FakeSystemd` tests below for the
+    state-aware #2124 behaviour."""
     (installed / "coord-serve.timer").write_text("[Timer]\nOnUnitActiveSec=1min\n")
     report = du.install_units(target_dir=installed, reference_dir=reference,
                               machine_name="dellserver", port=7433)
@@ -222,10 +281,76 @@ def test_enable_timers_touches_every_installed_timer(reference, installed):
 
     fake = _FakeRun()
     result = du.enable_timers(report, runner=fake)
-    assert result == {"coord-serve.timer": (True, "enabled")}
-    assert fake.calls == [
-        ["systemctl", "--user", "enable", "--now", "coord-serve.timer"]
-    ]
+    assert result == {"coord-serve.timer": (True, True, "enabled")}
+    # A state query precedes the actual enable call (#2124) — the point is
+    # asking before acting, not acting blind the way #2082's fix did.
+    assert fake.calls[0][:3] == ["systemctl", "--user", "show"]
+    assert fake.calls[-1] == ["systemctl", "--user", "enable", "--now", "coord-serve.timer"]
+
+
+def test_enable_timers_leaves_an_operator_stopped_timer_stopped(reference, installed):
+    """#2124's exact shape: an operator ran `systemctl --user stop
+    coord-serve.timer` to open a deploy window. `UnitFileState` stays
+    `enabled` — `stop` never touches persistent enablement — so that is the
+    signal this function must read, not `ActiveState`, to know this is not
+    the #2082 case. The timer must come out of this call still inactive."""
+    (installed / "coord-serve.timer").write_text("[Timer]\nOnUnitActiveSec=1min\n")
+    report = du.install_units(target_dir=installed, reference_dir=reference,
+                              machine_name="dellserver", port=7433)
+    fake = _FakeSystemd({
+        "coord-serve.timer": {
+            "UnitFileState": "enabled", "ActiveState": "inactive", "SubState": "dead",
+        },
+    })
+
+    result = du.enable_timers(report, runner=fake)
+
+    ok, changed, detail = result["coord-serve.timer"]
+    assert ok
+    assert not changed
+    assert "already enabled" in detail
+    assert "ActiveState=inactive" in detail
+    # The load-bearing assertion: nothing this call did moved the timer out
+    # of the state the operator put it in.
+    assert fake.states["coord-serve.timer"]["ActiveState"] == "inactive"
+    assert all(argv[2] != "enable" for argv in fake.calls)
+
+
+def test_enable_timers_still_enables_a_never_enabled_timer(reference, installed):
+    """#2082 regression guard, pinned in the same file as the #2124 test
+    above so the two cannot silently drift apart: a timer that has never
+    been enabled at all (`install_units` just wrote its content for the
+    first time this deploy) still gets `enable --now` — there is no
+    operator intent to preserve for a timer that has never run."""
+    (installed / "coord-serve.timer").write_text("[Timer]\nOnUnitActiveSec=1min\n")
+    report = du.install_units(target_dir=installed, reference_dir=reference,
+                              machine_name="dellserver", port=7433)
+    fake = _FakeSystemd({
+        "coord-serve.timer": {"UnitFileState": "disabled", "ActiveState": "inactive"},
+    })
+
+    result = du.enable_timers(report, runner=fake)
+
+    ok, changed, detail = result["coord-serve.timer"]
+    assert ok
+    assert changed
+    assert fake.states["coord-serve.timer"]["UnitFileState"] == "enabled"
+    assert fake.states["coord-serve.timer"]["ActiveState"] == "active"
+    assert ["systemctl", "--user", "enable", "--now", "coord-serve.timer"] in fake.calls
+
+
+def test_enable_timers_treats_a_masked_timer_as_never_enabled(reference, installed):
+    """`masked` is one of the states `enable --now` must still be tried
+    against (systemd itself refuses and reports the failure) — it must not
+    be misread as "already enabled" just because it is not `disabled`."""
+    (installed / "coord-serve.timer").write_text("[Timer]\nOnUnitActiveSec=1min\n")
+    report = du.install_units(target_dir=installed, reference_dir=reference,
+                              machine_name="dellserver", port=7433)
+    fake = _FakeSystemd({
+        "coord-serve.timer": {"UnitFileState": "masked", "ActiveState": "inactive"},
+    })
+    du.enable_timers(report, runner=fake)
+    assert ["systemctl", "--user", "enable", "--now", "coord-serve.timer"] in fake.calls
 
 
 def test_enable_timers_skips_a_unit_this_host_does_not_run(reference, installed):
@@ -260,8 +385,11 @@ def test_enable_timers_reports_a_failure_without_crashing(reference, installed):
                               machine_name="dellserver", port=7433)
     fake = _FakeRun(ok=False)
     result = du.enable_timers(report, runner=fake)
-    ok, detail = result["coord-serve.timer"]
+    ok, changed, detail = result["coord-serve.timer"]
     assert not ok
+    # A failed attempt is not a confirmed change (#2124 item 3/4) — the
+    # deploy's own output must never claim to have moved a state it didn't.
+    assert not changed
     assert "Failed to enable" in detail
 
 
@@ -271,8 +399,9 @@ def test_enable_timers_degrades_without_systemd():
 
     report = du.InstallReport(units=[du.UnitOutcome("x.timer", du.ACTION_UPDATED)])
     result = du.enable_timers(report, runner=_boom)
-    ok, detail = result["x.timer"]
+    ok, changed, detail = result["x.timer"]
     assert not ok
+    assert not changed
     assert "no systemd" in detail
 
 

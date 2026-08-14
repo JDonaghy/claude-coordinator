@@ -760,6 +760,29 @@ coord release propagate --daemon-host dellserver
 systemctl --user start coord-drive-queue.timer
 ```
 
+**#2124 (fixed 2026-08-13):** step 3 used to undo step 1. `coord release
+propagate`'s own `deploy/**` lane (`POST /deploy-units`) asserts every
+installed timer is enabled (#2082 — a *different* bug: a timer nobody ever
+ran `systemctl --user enable` on at all). #2082's fix was `enable --now`,
+and `--now` **starts** a timer unconditionally — so step 3 restarted the
+timer step 1 had just stopped, on dellserver first (the daemon-leads
+invariant), while precision and elitebook were still mid-roll: the exact
+gap this sequence exists to hold open. `enable` and `--now` are idempotent,
+so this was invisible for every roll where nobody had deliberately stopped
+a timer, and only bit the one sequence documented above.
+
+Fixed: `coord.deploy_units.enable_timers` now asks systemd whether a timer
+is already enabled *before* deciding what to do. `systemctl --user stop`
+never changes a unit's persistent enablement, only its current run state —
+so a timer already `enabled` is left exactly as it is, whatever its run
+state, and only a timer that was never enabled at all still gets `enable
+--now`. Reaching for `systemctl --user mask` instead of `stop` is no longer
+necessary; the sequence above is safe to run literally as written. The
+`deploy/**` lane's own output now names which timers it started and which
+it left alone (`coord release propagate`'s per-lane line for this host), so
+"did step 3 leave my stopped timer alone" is directly checkable in the run
+output rather than something to reconstruct from journal timestamps.
+
 **#2110 (fixed 2026-08-11):** stopping the timer used to deadlock this
 sequence. The reconciler that moves a completed entry from `running` to
 `done` runs inside `coord drive-queue tick`; with the timer stopped, no tick

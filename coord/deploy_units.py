@@ -65,6 +65,13 @@ from coord.health.checks.unit_drift import (
     packaged_unit_dir,
 )
 
+# Same reuse rule as above, one module over: `timer_active` is the DETECTOR
+# for "is this timer actually enabled" (#2082); `enable_timers` below is the
+# FIXER for the identical question (#2124). Querying state through its own
+# `_timer_states` — rather than a second `systemctl --user show` parser here
+# — is what keeps those two answers from being able to drift apart.
+from coord.health.checks.timer_active import _INACTIVE_STATES, _timer_states
+
 #: Placeholder -> how to fill it, given the host facts we actually know.
 #: ``unit_drift`` renders these as *shell* text for a copy-pasteable remedy
 #: (``$(hostname -s)``); here they must be real values, so the mapping is
@@ -326,45 +333,102 @@ _PRESENT_ACTIONS = frozenset({ACTION_UNCHANGED, ACTION_UPDATED})
 
 def enable_timers(
     report: InstallReport, *, runner=None, timeout: float = 30.0,
-) -> dict[str, tuple[bool, str]]:
-    """``systemctl --user enable --now <unit>`` for every installed timer in
-    *report* (#2082).
+) -> dict[str, tuple[bool, bool, str]]:
+    """Assert every installed timer in *report* is *enabled* (#2082) —
+    without forcing a *stopped* one back to running (#2124).
 
     #2082: ``coord-release-propagate.timer`` reached three hosts'
     ``~/.config/systemd/user/`` and sat there — :func:`install_units`
     refreshed its *content* on every release, but nothing ever ran
-    ``enable --now`` on it, and nothing noticed because a disabled timer's
-    file looks byte-for-byte identical to an active one's (see
-    :mod:`coord.health.checks.timer_active`, the detector for exactly this).
+    ``systemctl --user enable`` on it, and nothing noticed because a
+    disabled timer's file looks byte-for-byte identical to an active one's
+    (see :mod:`coord.health.checks.timer_active`, the detector for exactly
+    this). The fix that shipped for #2082 was ``enable --now`` on every
+    installed timer, every deploy — and ``--now`` is the collision #2124
+    reports: it also **starts** a timer an operator deliberately stopped,
+    five minutes earlier, to create the very quiescence window the deploy
+    calling this function is running inside of. The daemon host rolls
+    first, so that operator's window closes mid-roll, not after it.
 
-    A ``.timer`` unit is different from a ``.service`` here: which
-    *services* a host runs is a one-time topology choice
-    (``install-agent.sh``, or a human at machine setup — see this module's
-    docstring), never something a routine refresh should override. A timer
-    that exists at all has no reason to exist disabled — its whole job is to
-    fire on a schedule with nobody watching, so "installed but not enabled"
-    is invisible from the outside and would otherwise self-heal never.
-    Applying this on every deploy makes enablement an assertion this lane
-    re-checks every time it runs, the same way :func:`install_units`
-    re-asserts content every time it runs.
+    #2082 and #2124 turn out to be two different questions systemd already
+    answers separately, and this function's whole fix is asking the right
+    one of them *first*:
 
-    Both ``enable`` and ``--now`` are idempotent — an already-enabled,
-    already-active timer is untouched — so calling this on every deploy is a
-    correctness check, not a state change, in the common case. Scoped to
-    units *this* report found actually installed (:data:`_PRESENT_ACTIONS`),
-    matching the deploy step's own "only touch what this host already runs"
-    rule.
+    * **Persistent enablement** (``UnitFileState`` — ``enabled`` vs.
+      ``disabled``/``linked``/``masked``, :data:`_INACTIVE_STATES`) is what
+      #2082 was actually missing. It is a one-time fact that only becomes
+      false again if something explicitly disables the unit — ``systemctl
+      --user stop`` never touches it.
+    * **Current run state** (``ActiveState``) is what an operator's
+      deliberate ``stop`` changes, and it is *never* this function's business
+      to override: a timer already carrying ``UnitFileState=enabled`` has
+      already had its #2082 assertion satisfied by some earlier deploy (or
+      this one), so nothing here re-starts it. ``enable`` alone is not even
+      called in that case — no subprocess invocation touches the unit at
+      all, so there is no risk of this idempotent-by-design call itself
+      having a side effect an operator did not ask for.
+
+    So: a timer whose queried ``UnitFileState`` is *not* one of
+    :data:`_INACTIVE_STATES` is left completely alone, whatever its
+    ``ActiveState`` — that is the acceptance case "a timer stopped by an
+    operator is still down after a deploy". A timer that *is* in one of
+    those states (never enabled at all, or masked) is the actual #2082
+    defect and gets ``enable --now`` exactly as before — there is no
+    operator intent to preserve for a timer that has never run, and leaving
+    it disabled is the invisible-self-heals-never failure #2082 closed.
+
+    State is queried once, in a single batched ``systemctl --user show``
+    (:func:`coord.health.checks.timer_active._timer_states` — the same
+    query the detector itself uses, so the detector and this fixer cannot
+    silently disagree about what "enabled" means), scoped to units *this*
+    report found actually installed (:data:`_PRESENT_ACTIONS`), matching the
+    deploy step's own "only touch what this host already runs" rule.
+
+    Returns ``{unit: (ok, changed, detail)}``. ``changed`` is true only when
+    this call is confirmed to have moved the unit's state — never true for
+    the "already enabled, left alone" branch (no subprocess call was made to
+    confirm anything), and never true for a failed ``enable --now`` either
+    (an attempt that failed is not a confirmed change) — the deploy's
+    caller uses this to name, precisely, which timers it actually touched
+    (#2124 item 3) rather than reporting a state it did not confirm.
     """
     import subprocess  # noqa: PLC0415
 
     run = runner or subprocess.run
-    out: dict[str, tuple[bool, str]] = {}
+    out: dict[str, tuple[bool, bool, str]] = {}
     timers = sorted(
         u.name
         for u in report.units
         if u.name.endswith(".timer") and u.action in _PRESENT_ACTIONS
     )
+    if not timers:
+        return out
+
+    states = _timer_states(tuple(timers), runner=run, timeout=timeout)
+
     for name in timers:
+        fields = states.get(name) or {}
+        file_state = fields.get("UnitFileState", "")
+        if file_state and file_state not in _INACTIVE_STATES:
+            # Already enabled (#2082's assertion already holds for this
+            # unit) — leave its run state exactly as it is. No systemctl
+            # call at all, so the report below can only ever say what was
+            # actually queried, never what this call assumed.
+            active = fields.get("ActiveState") or "unknown"
+            out[name] = (
+                True,
+                False,
+                f"already enabled (ActiveState={active}) — left its current "
+                "run state alone; a timer an operator stopped stays stopped "
+                "across a deploy (#2124)",
+            )
+            continue
+
+        # Never enabled at all — disabled/linked/masked, or unreadable (no
+        # systemd, or the batched query above failed and this unit simply
+        # has no entry). This is the actual #2082 defect: no operator ever
+        # ran `stop` on a timer that was never running, so forcing a start
+        # here has no operator intent to override.
         try:
             proc = run(
                 ["systemctl", "--user", "enable", "--now", name],
@@ -373,12 +437,12 @@ def enable_timers(
                 timeout=timeout,
             )
         except FileNotFoundError:
-            out[name] = (False, "systemctl not found (no systemd on this host)")
+            out[name] = (False, False, "systemctl not found (no systemd on this host)")
             continue
         except Exception as exc:  # noqa: BLE001 — must never crash a deploy
-            out[name] = (False, f"{type(exc).__name__}: {exc}")
+            out[name] = (False, False, f"{type(exc).__name__}: {exc}")
             continue
         ok = getattr(proc, "returncode", 1) == 0
         detail = (getattr(proc, "stderr", "") or getattr(proc, "stdout", "") or "").strip()
-        out[name] = (ok, detail or ("enabled" if ok else "enable failed"))
+        out[name] = (ok, ok, detail or ("enabled" if ok else "enable failed"))
     return out

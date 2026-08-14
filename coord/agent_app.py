@@ -1463,13 +1463,23 @@ def build_app(
         installed, and keeps a ``.bak`` of each — see
         :mod:`coord.deploy_units` for why both are deliberate.
 
-        Also asserts every installed *timer* is enabled and running
+        Also asserts every installed *timer* is enabled
         (:func:`coord.deploy_units.enable_timers`, #2082): refreshing a
         timer's content has never implied enabling it, and that gap is
         exactly how ``coord-release-propagate.timer`` reached this host with
         matching content and sat disabled for a day with nothing noticing.
-        ``enable --now`` is idempotent, so this runs on every call, not just
-        when content changed — an already-enabled timer is untouched.
+        This runs on every non-dry-run call, not just when content changed —
+        an already-enabled timer's *enablement* is untouched (idempotent).
+
+        It does **not**, as of #2124, force a start (``--now``) on a timer
+        that is already enabled: that used to restart a timer an operator
+        had deliberately stopped moments earlier — the exact window the
+        documented manual-roll sequence exists to create — because ``enable
+        --now`` cannot tell "never enabled" (#2082's actual bug) apart from
+        "enabled, but stopped on purpose" (never a bug at all). See
+        :func:`coord.deploy_units.enable_timers` for how it now tells the
+        two apart, and ``timers_enabled[<unit>]["changed"]`` below for
+        which case each timer landed in.
         """
         from coord import deploy_units as du  # noqa: PLC0415
         from coord.brain import AGENT_PORT  # noqa: PLC0415
@@ -1504,10 +1514,10 @@ def build_app(
         if not dry_run:
             timer_results = du.enable_timers(report)
             payload["timers_enabled"] = {
-                name: {"ok": ok, "detail": detail}
-                for name, (ok, detail) in timer_results.items()
+                name: {"ok": ok, "changed": changed, "detail": detail}
+                for name, (ok, changed, detail) in timer_results.items()
             }
-            if any(not ok for ok, _ in timer_results.values()):
+            if any(not ok for ok, _changed, _detail in timer_results.values()):
                 payload["ok"] = False
         return JSONResponse(payload, status_code=200 if payload.get("ok") else 500)
 
