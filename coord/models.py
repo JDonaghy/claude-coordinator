@@ -56,6 +56,21 @@ class Repo:
     develop_branch: str | None = None
     build_command: str | None = None
     test_command: str | None = None
+    # #2091: the command this repo's CI actually runs — the "CI-equivalent"
+    # suite.  The Test stage (`coord.smoke`) prefers this over
+    # `test_command`/`smoke_tests.default_command`, so a green Test verdict
+    # means the same thing a green CI run does.
+    #
+    # Why this is a SEPARATE field and not just "set test_command to the CI
+    # command": `test_command` is also what a human runs locally and what
+    # several narrower call sites use; it is routinely (and legitimately) a
+    # fast subset — coord-portal's was a ~2 min slice while CI ran a 45 min
+    # `npm run test:e2e` across two Playwright projects.  That divergence is
+    # fine as long as the Test GATE runs the wider one, which is what this
+    # field declares.  Leave it unset and the gate falls back to the old
+    # behaviour, but `dispatch_smoke` logs that the verdict it is about to
+    # produce is narrower than CI (see `resolve_smoke_command`).
+    ci_command: str | None = None
     # #296: optional shell command to interactively run the app for manual
     # smoke testing.  Surfaced in the TUI Test stage detail panel so the
     # tester knows exactly what to launch.

@@ -378,6 +378,75 @@ def _capability_probe_reasons(
     return unmet_capabilities(required_caps, probes)
 
 
+# ── CI-equivalence of the Test-stage command (#2091) ────────────────────────
+
+
+@dataclass(frozen=True)
+class SmokeCommand:
+    """Which command the Test stage will run, and how faithful it is to CI.
+
+    #2091: the Test verdict is what gates review and merge, so what it
+    *means* depends entirely on which suite produced it.  coord-portal #14
+    recorded ``test_passed`` in 1m51s on a commit whose CI failed
+    deterministically after 44m57s — the gate simply never ran the suite
+    (``npm run test:e2e``) that catches it.  Resolution is therefore no
+    longer an anonymous ``a or b``: the chosen command carries its
+    provenance so callers can say out loud whether a green verdict is
+    CI-equivalent or merely "some tests passed".
+
+    ``ci_equivalent`` is a *declaration*, not a proof — it is True exactly
+    when the operator pointed ``repos[].ci_command`` at what CI runs.  It
+    can still be a lie if the config drifts from the workflow file; what it
+    buys is that the un-declared case stops looking identical to the
+    declared one.
+    """
+
+    command: str | None
+    source: str
+    ci_equivalent: bool
+
+    def briefing_note(self) -> str:
+        """One line for the smoke agent's briefing naming the command's origin."""
+        if self.ci_equivalent:
+            return (
+                f"- Suite: `{self.source}` — this is the repo's declared "
+                "CI-equivalent command, so this verdict carries the same "
+                "weight as a CI run."
+            )
+        return (
+            f"- Suite: `{self.source}` — this repo has not declared a "
+            "`ci_command`, so this run may be NARROWER than CI (#2091). "
+            "Passing here does not prove CI is green."
+        )
+
+
+def resolve_smoke_command(repo, smoke_cfg: SmokeTestsConfig) -> SmokeCommand:
+    """Pick the Test-stage command for *repo*, best (most CI-faithful) first.
+
+    Precedence, deliberately with the per-repo CI declaration on top:
+
+    1. ``repos[].ci_command`` — what this repo's CI actually runs (#2091).
+    2. ``smoke_tests.default_command`` — the fleet-wide fallback.
+    3. ``repos[].test_command`` — the local/quick suite.
+
+    ``smoke_tests.default_command`` outranking ``test_command`` is the
+    pre-existing #1021 behaviour and is preserved; ``ci_command`` is inserted
+    *above* both because a global default cannot possibly be more faithful to
+    one repo's CI than that repo's own declaration.
+    """
+    ci_command = (getattr(repo, "ci_command", None) or "").strip() or None
+    if ci_command:
+        return SmokeCommand(ci_command, f"repos[{repo.name}].ci_command", True)
+    if smoke_cfg.default_command:
+        return SmokeCommand(
+            smoke_cfg.default_command, "smoke_tests.default_command", False
+        )
+    test_command = getattr(repo, "test_command", None)
+    if test_command:
+        return SmokeCommand(test_command, f"repos[{repo.name}].test_command", False)
+    return SmokeCommand(None, "unconfigured", False)
+
+
 # ── Briefing ────────────────────────────────────────────────────────────────
 
 
@@ -392,6 +461,7 @@ def build_smoke_briefing(
     required_caps: list[str],
     timeout_seconds: int,
     is_worker: bool,
+    command_source: SmokeCommand | None = None,
 ) -> str:
     lines: list[str] = []
     lines.append(f"# Smoke test: {repo_github} branch `{branch}`")
@@ -403,6 +473,11 @@ def build_smoke_briefing(
     lines.append("## Context")
     lines.append(f"- Repo: {repo_github} (local name: {repo_name})")
     lines.append(f"- Branch: {branch}")
+    if command_source is not None:
+        # #2091: name the suite's provenance so a reader of the transcript can
+        # tell a CI-equivalent green from a narrower one without going back to
+        # coordinator.yml.
+        lines.append(command_source.briefing_note())
     if required_caps:
         lines.append(f"- Required capabilities: {', '.join(required_caps)}")
     if is_worker:
@@ -716,7 +791,10 @@ def dispatch_smoke(
 
     touched = diff_lookup(repo.github, completed.branch)
     required_caps = match_rules(touched, smoke_cfg.capability_rules)
-    smoke_command = smoke_cfg.default_command or repo.test_command
+    # #2091: resolve *with* provenance — the Test verdict this dispatch will
+    # produce is only as meaningful as the suite behind it.
+    resolved = resolve_smoke_command(repo, smoke_cfg)
+    smoke_command = resolved.command
 
     if not required_caps:
         # #1426: a capability-rule miss used to mean "skip silently" — the
@@ -746,12 +824,30 @@ def dispatch_smoke(
     if smoke_command is None:
         logger.warning(
             "dispatch_smoke: %s#%s needs capabilities %s but no smoke "
-            "command is configured (smoke_tests.default_command or this "
-            "repo's test_command) — skipping. Configure one so the Test "
-            "stage stops silently no-oping for this repo.",
+            "command is configured (repos[].ci_command, "
+            "smoke_tests.default_command, or this repo's test_command) — "
+            "skipping. Configure one so the Test stage stops silently "
+            "no-oping for this repo.",
             completed.repo_name, completed.issue_number, required_caps,
         )
         return None
+
+    if not resolved.ci_equivalent and repo.github:
+        # #2091: the repo HAS CI (it has a `github:` slug, so a PR gets
+        # checks) but has not declared what CI runs, so the verdict this
+        # dispatch produces is "some tests passed", not "the branch is
+        # good".  That is exactly the coord-portal #14 shape — a 1m51s green
+        # Test verdict on a commit whose 44m57s CI run was red — so say it
+        # once per dispatch rather than letting the gap stay invisible.
+        logger.warning(
+            "dispatch_smoke: %s#%s Test verdict will NOT be CI-equivalent — "
+            "running %s (%s) while CI runs whatever %s's workflows say. Set "
+            "repos[%s].ci_command to the command CI runs so a green Test "
+            "verdict means the branch is good, not just that a subset "
+            "passed (#2091).",
+            completed.repo_name, completed.issue_number,
+            smoke_command, resolved.source, repo.github, repo.name,
+        )
 
     # #1672: the FULL capability-matched candidate list, best first. Picking
     # one machine and giving up on it meant a single bad candidate ended the
@@ -823,6 +919,7 @@ def dispatch_smoke(
             required_caps=required_caps,
             timeout_seconds=smoke_cfg.timeout_seconds,
             is_worker=choice.is_worker,
+            command_source=resolved,
         )
 
         # #2168: pin the Test stage's model to avoid the agent falling

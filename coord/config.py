@@ -1880,6 +1880,17 @@ def _parse_repos(raw: Any) -> list[Repo]:
         test_command = entry.get("test_command")
         if test_command is not None and not isinstance(test_command, str):
             raise ConfigError(f"repos[{i}].test_command must be a string")
+        # #2091: ci_command — the command this repo's CI actually runs.  The
+        # Test stage prefers it over `test_command` so a green Test verdict
+        # is CI-equivalent instead of "some subset of CI passed".
+        ci_command = entry.get("ci_command")
+        if ci_command is not None and not isinstance(ci_command, str):
+            raise ConfigError(f"repos[{i}].ci_command must be a string")
+        if isinstance(ci_command, str) and not ci_command.strip():
+            raise ConfigError(
+                f"repos[{i}].ci_command must be a non-empty string (omit the "
+                "key entirely to fall back to test_command)"
+            )
         # #296: run_cmd — optional shell command to launch the app for manual
         # smoke testing.  Surfaced in the TUI Test stage detail panel.
         run_cmd = entry.get("run_cmd")
@@ -1933,6 +1944,7 @@ def _parse_repos(raw: Any) -> list[Repo]:
                 develop_branch=develop_branch,
                 build_command=build_command,
                 test_command=test_command,
+                ci_command=ci_command,
                 run_cmd=run_cmd,
                 worker_permissions=worker_permissions,
                 housekeeping=housekeeping,
