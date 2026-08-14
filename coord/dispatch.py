@@ -14,6 +14,7 @@ from coord.comments import (
     format_briefing,
     format_completion,
     format_failure,
+    format_refused_policy,
 )
 from coord.config import Config
 from coord.models import Proposal, Repo
@@ -1043,6 +1044,29 @@ def post_advisory(
     reason: str = "",
 ) -> None:
     body = format_advisory(
+        assignment_id=assignment_id,
+        machine_name=machine_name,
+        repo_name=repo_name,
+        issue_number=issue_number,
+        duration_seconds=duration_seconds,
+        log_path=log_path,
+        reason=reason,
+    )
+    github_ops.post_issue_comment(repo_github, issue_number, body)
+
+
+def post_refused_policy(
+    *,
+    assignment_id: str,
+    machine_name: str,
+    repo_github: str,
+    repo_name: str,
+    issue_number: int,
+    duration_seconds: float | None = None,
+    log_path: str | None = None,
+    reason: str = "",
+) -> None:
+    body = format_refused_policy(
         assignment_id=assignment_id,
         machine_name=machine_name,
         repo_name=repo_name,

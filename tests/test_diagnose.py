@@ -1712,6 +1712,48 @@ def test_advisory_with_real_commits_is_the_1357_shape_and_recovered(
     assert res.recovered is True
 
 
+# ── #2234: REFUSED_POLICY work row must never report "stage looks healthy" ─
+
+
+def test_refused_policy_is_not_reported_healthy(monkeypatch, config) -> None:
+    """A REFUSED_POLICY row must not fall through to the same 'stage looks
+    healthy' catch-all a real done row gets — the same false-healthy read
+    the ADVISORY branch above exists to close. Must name the refusal and
+    point at the coordinator, not `coord retry` (which refuses this status
+    on purpose)."""
+    _stub(monkeypatch, session="dead")
+
+    a = _assign(aid="w-refused-policy", status="refused_policy", branch="issue-42-empty")
+    board = Board(completed=[a])
+    res = diagnose.diagnose_stage(board, config, "api", 42, "work")
+
+    assert not any("looks healthy" in f for f in res.findings), res.findings
+    assert any("refused_policy" in f for f in res.findings), res.findings
+    assert any("coordinator" in f for f in res.findings), res.findings
+    assert res.recovered is False
+
+
+def test_refused_policy_on_a_plan_row_is_not_reported_healthy(
+    monkeypatch, config
+) -> None:
+    """`STAGE_ASSIGNMENT_TYPES["work"] == ("work", "plan")`, so `latest` for
+    `--stage work` can be a `type="plan"` row carrying `refused_policy` too
+    — must be named exactly like the work-row case, not silently fall
+    through to 'stage looks healthy'."""
+    _stub(monkeypatch, session="dead")
+
+    a = _assign(
+        aid="p-refused-policy", typ="plan", status="refused_policy",
+        branch="issue-42-empty",
+    )
+    board = Board(completed=[a])
+    res = diagnose.diagnose_stage(board, config, "api", 42, "work")
+
+    assert not any("looks healthy" in f for f in res.findings), res.findings
+    assert any("refused_policy" in f for f in res.findings), res.findings
+    assert res.recovered is False
+
+
 # ── #618: _prune_orphan_for_failed integration ──────────────────────────────
 
 

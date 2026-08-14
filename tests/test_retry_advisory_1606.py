@@ -138,3 +138,25 @@ class TestRetryAcceptsZeroCommitAdvisory:
         # statuses ('failed' and 'advisory') instead of just 'failed', since
         # a genuine zero-commit advisory is retryable too.
         assert "not 'failed' or 'advisory'" in out
+
+    def test_refused_policy_status_gets_a_bespoke_message(
+        self, valid_config_path: Path
+    ) -> None:
+        """#2234 review nit: `coord retry` on a `refused_policy` row must
+        name the reason (like the drive-queue park message does) rather
+        than reusing the generic "not 'failed' or 'advisory'" refusal —
+        retrying a policy refusal is exactly what #2234 says never to do,
+        and the operator shouldn't need a trip to the docs/code to learn
+        why."""
+        a = _advisory()
+        a.status = "refused_policy"
+        board = Board(completed=[a])
+        with patch("coord.board_service.read_board", return_value=board):
+            result = CliRunner().invoke(
+                main, ["retry", "0256c844edfb", "--config", str(valid_config_path)],
+            )
+        out = output_and_stderr(result)
+        assert result.exit_code == 1
+        assert "refused_policy" in out
+        assert "coordinator" in out
+        assert "not 'failed' or 'advisory'" not in out

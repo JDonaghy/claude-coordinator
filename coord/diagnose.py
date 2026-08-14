@@ -1023,6 +1023,33 @@ def _recover_work_like(
                 "proceed"
             )
             res.recovered = True
+    elif latest.type in ("work", "plan") and latest.status == "refused_policy":
+        # #2234: a REFUSED_POLICY row is TERMINAL exactly like ADVISORY
+        # above — no session is running and nothing else on the board will
+        # move it forward — so this must NOT fall through to "stage looks
+        # healthy" either; that's the same false-healthy read the ADVISORY
+        # branch exists to close, and `coord diagnose` is called out in
+        # CLAUDE.md as a first-line triage tool.
+        #
+        # Unlike ADVISORY, `refused_policy` is only ever set when the
+        # worker's own zero-commit exit cited a standing repo-rule
+        # prohibition (`coord.agent.REFUSED_POLICY`, set from the same
+        # `_ZERO_COMMIT_TYPES` gate as advisory in `_reap`) — there is no
+        # #1357 false-positive shape to disambiguate here (a refused_policy
+        # row is ALWAYS 0 commits by construction, see `coord.agent.
+        # AgentServer._reap`), so this doesn't need the ahead-count probe
+        # the ADVISORY branch above does.
+        stage_label = "work" if latest.type == "work" else "plan"
+        res.findings.append(
+            f"{stage_label} stage is 'refused_policy' — the worker correctly "
+            "refused the dispatched work on a standing repo-rule "
+            "prohibition; `coord retry` refuses to touch it on purpose "
+            "(retrying reproduces the identical refusal, since the rule "
+            "isn't going anywhere) — needs the coordinator: do the work "
+            "directly, or re-scope the issue so its deliverable isn't "
+            "coordinator-only"
+        )
+        res.recovered = False
     else:
         res.findings.append("stage looks healthy")
         res.recovered = True

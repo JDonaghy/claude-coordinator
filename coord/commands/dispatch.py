@@ -1800,6 +1800,22 @@ def retry(assignment_id: str, config_path: Path, acknowledge_cost: bool = False)
     if assignment is None:
         click.echo(f"error: assignment {assignment_id!r} not found in board", err=True)
         sys.exit(1)
+    if assignment.status == "refused_policy":
+        # #2234: name the reason instead of falling into the generic
+        # "not 'failed' or 'advisory'" message below — a policy refusal is
+        # correct behavior (the worker did the right thing refusing a
+        # CLAUDE.md-prohibited task), and retrying would just reproduce the
+        # identical refusal since the rule it cited isn't going anywhere.
+        click.echo(
+            f"error: assignment {assignment_id} is 'refused_policy' — the "
+            "worker correctly refused this work on a standing repo-rule "
+            "prohibition. Retrying cannot change that verdict. Needs the "
+            "coordinator: do the work directly, or re-scope the issue so "
+            "its deliverable isn't coordinator-only, then `coord "
+            "drive-queue remove` once handled (#2234).",
+            err=True,
+        )
+        sys.exit(1)
     if assignment.status not in ("failed", "advisory"):
         click.echo(
             f"error: assignment {assignment_id} is {assignment.status!r}, not "

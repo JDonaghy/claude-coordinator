@@ -350,6 +350,110 @@ class TestAdvisoryNotify:
         assert reason in body, "zero_commit_reason must appear in advisory comment"
 
 
+# ── #2234: refused_policy (0-commit clean exit citing a repo-rule) notify ──
+
+
+class TestRefusedPolicyNotify:
+    """A policy refusal must post a distinctive GitHub comment, not be dropped.
+
+    Before this fix, `refused_policy` matched none of the `entry_status`
+    branches in `_collect_transitions`'s loop and fell into the final
+    `else: continue` — no comment was ever posted, unlike every other
+    terminal status (including the `advisory` case this status is modeled
+    on).
+    """
+
+    def test_refused_policy_posts_comment(self, coord_dir: Path, config: Config) -> None:
+        _record("rp-run1")
+        agent_status = {
+            "active": [],
+            "completed": [
+                _agent_completed("rp-run1", "refused_policy", exit_code=0)
+            ],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment") as mock_post:
+            posted, _stuck, _attn, _stalled, _liveness = notify_mod.run(config)
+        assert len(posted) == 1, "refused_policy transition must appear in posted list"
+        mock_post.assert_called_once()
+        body = mock_post.call_args.args[2]
+        assert "Refused" in body, "comment must be clearly labelled as a refusal"
+        assert "coordinator" in body.lower()
+
+    def test_refused_policy_not_failure_comment(
+        self, coord_dir: Path, config: Config
+    ) -> None:
+        """The refused_policy comment must NOT say 'Assignment Failed' or use ❌."""
+        _record("rp-run2")
+        agent_status = {
+            "active": [],
+            "completed": [
+                _agent_completed("rp-run2", "refused_policy", exit_code=0)
+            ],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment") as mock_post:
+            notify_mod.run(config)
+        body = mock_post.call_args.args[2]
+        assert "Assignment Failed" not in body
+        assert "❌" not in body
+
+    def test_refused_policy_marked_notified(
+        self, coord_dir: Path, config: Config
+    ) -> None:
+        _record("rp-run3")
+        agent_status = {
+            "active": [],
+            "completed": [
+                _agent_completed("rp-run3", "refused_policy", exit_code=0)
+            ],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment"):
+            notify_mod.run(config)
+        assert "rp-run3" in state_mod.load_notified()
+
+    def test_refused_policy_idempotent(self, coord_dir: Path, config: Config) -> None:
+        _record("rp-run4")
+        agent_status = {
+            "active": [],
+            "completed": [
+                _agent_completed("rp-run4", "refused_policy", exit_code=0)
+            ],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment") as mock_post:
+            notify_mod.run(config)
+            posted_again, _, _attn, _stalled, _liveness = notify_mod.run(config)
+        assert mock_post.call_count == 1, "refused_policy comment must post exactly once"
+        assert posted_again == []
+
+    def test_refused_policy_includes_policy_refusal_reason(
+        self, coord_dir: Path, config: Config
+    ) -> None:
+        """When policy_refusal_reason is set, it appears in the comment."""
+        _record("rp-run5")
+        reason = "CLAUDE.md line 156: only the coordinator writes docs"
+        agent_status = {
+            "active": [],
+            "completed": [
+                _agent_completed(
+                    "rp-run5",
+                    "refused_policy",
+                    exit_code=0,
+                    policy_refusal_reason=reason,
+                )
+            ],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment") as mock_post:
+            notify_mod.run(config)
+        body = mock_post.call_args.args[2]
+        assert reason in body, (
+            "policy_refusal_reason must appear in the refused_policy comment"
+        )
+
+
 class TestBranchCapture:
     def test_branch_stored_in_notified_ledger(self, coord_dir: Path, config: Config) -> None:
         _record("abc")

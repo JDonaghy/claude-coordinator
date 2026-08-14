@@ -20,6 +20,16 @@ EVENT_FAILURE = "failure"
 EVENT_STUCK = "stuck"
 EVENT_PLAN = "plan"
 EVENT_ADVISORY = "advisory"
+# #2234: a worker exited cleanly (exit_code 0), pushed 0 commits, AND its
+# own final message cited a standing repo-rule prohibition (the #2195
+# shape — a doc-only deliverable CLAUDE.md tells every worker to refuse).
+# Modeled directly on EVENT_ADVISORY (same "0-commit clean exit" trigger)
+# but deliberately distinct: an advisory needs a human to look and decide;
+# a policy refusal already has its answer — retrying cannot change a rule
+# that isn't going anywhere. Posting a separate event (rather than folding
+# this into EVENT_ADVISORY) keeps the two legible on GitHub the same way
+# `coord.agent.REFUSED_POLICY` keeps them distinct on the board.
+EVENT_REFUSED_POLICY = "refused_policy"
 # #846: an assignment running past its wall-clock threshold, or thrashing
 # through fix/review rounds without converging. Distinct from EVENT_STUCK
 # (a worker self-reported STATUS/STUCK line) — this fires from time/round
@@ -641,6 +651,60 @@ def format_advisory(
         "The worker exited cleanly (exit code 0) but pushed **no commits**. "
         "This typically means the feature was already implemented or no change "
         "was needed. Human review is required to decide the next step."
+    )
+    if reason.strip():
+        lines.append("")
+        lines.append("### Worker note")
+        lines.append(reason.strip())
+    return "\n".join(lines)
+
+
+def format_refused_policy(
+    *,
+    assignment_id: str,
+    machine_name: str,
+    repo_name: str,
+    issue_number: int,
+    duration_seconds: float | None = None,
+    log_path: str | None = None,
+    reason: str = "",
+) -> str:
+    """Format a comment for a #2234 policy refusal — a 0-commit clean exit
+    whose worker cited a standing repo-rule prohibition (e.g. "only the
+    coordinator writes docs").
+
+    Distinct from `format_advisory`: an advisory means "a human needs to
+    look and decide"; this means "the worker already found the answer —
+    retrying will reproduce the identical refusal, because the rule isn't
+    going anywhere." No re-dispatch suggestion, and no ADVISORY framing —
+    this names the routing decision (needs the coordinator) rather than
+    presenting as an unresolved outcome.
+    """
+    marker = _marker(
+        EVENT_REFUSED_POLICY,
+        assignment=assignment_id,
+        machine=machine_name,
+        repo=repo_name,
+        issue=issue_number,
+    )
+    lines = [
+        "## Coordinator: Refused — Standing Repo-Rule Prohibition",
+        marker,
+        f"**Machine:** {machine_name}",
+        f"**Status:** refused_policy",
+        f"**Duration:** {_fmt_duration(duration_seconds)}",
+    ]
+    if log_path:
+        lines.append(f"**Log:** `{log_path}`")
+    lines.append("")
+    lines.append(
+        "The worker exited cleanly (exit code 0) and pushed **no commits** "
+        "because it correctly refused work that a standing repo rule (e.g. "
+        "CLAUDE.md's \"only the coordinator writes docs\") prohibits it from "
+        "doing. This is not a failure — retrying will reproduce the same "
+        "refusal, since the rule it cited isn't going anywhere. Needs the "
+        "coordinator: do the work directly, or re-scope the issue so its "
+        "deliverable isn't coordinator-only."
     )
     if reason.strip():
         lines.append("")

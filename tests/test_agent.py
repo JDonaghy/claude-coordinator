@@ -20,6 +20,7 @@ from coord.agent import (
     DONE,
     FAILED,
     PENDING,
+    REFUSED_POLICY,
     RUNNING,
     MOCK_AUTHOR_SYSTEM_PROMPT,
     WORKER_SYSTEM_PROMPT,
@@ -5189,3 +5190,88 @@ class TestSupersededAdvisoryPrune:
 
         state = json.loads(server.state_path.read_text())
         assert all(entry["id"] != "adv-6" for entry in state["assignments"])
+
+
+# ── #2234: REFUSED_POLICY gets the same agent-side pruning as ADVISORY ──────
+
+
+class TestRefusedPolicyPrune:
+    """`_prune_terminal_advisory`/`_prune_superseded_advisory` only ever
+    scanned `status == ADVISORY` — a `refused_policy` entry (`coord.agent.
+    REFUSED_POLICY`, the #2234 shape) was never pruned, so the agent would
+    keep serving it indefinitely on `/status` even after it went terminal
+    on GitHub or was superseded by a later retry, same root cause as the
+    two ADVISORY prune bugs above.
+    """
+
+    def _make_spec(self, repo_path: Path, **overrides) -> AssignmentSpec:
+        base = dict(
+            repo_name="api",
+            repo_path=str(repo_path),
+            issue_number=2234,
+            issue_title="t",
+            briefing="b",
+            branch="issue-2234-fix",
+        )
+        base.update(overrides)
+        return AssignmentSpec(**base)
+
+    def _add_github_remote(self, repo_path: Path, slug: str = "acme/widgets") -> None:
+        subprocess.run(
+            ["git", "remote", "add", "origin", f"git@github.com:{slug}.git"],
+            cwd=str(repo_path), check=True, capture_output=True,
+        )
+
+    def test_terminal_prune_drops_refused_policy_when_work_is_terminal(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """`_prune_terminal_advisory` must also drop a REFUSED_POLICY entry
+        once GitHub confirms the work is terminal."""
+        repo = _init_repo(tmp_path / "repo")
+        self._add_github_remote(repo)
+        server = _server(tmp_path, repo_path=repo)
+        spec = self._make_spec(repo)
+
+        a = AgentAssignment(
+            id="rp-1", spec=spec, status=REFUSED_POLICY, finished_at=1.0,
+            exit_code=0, branch="issue-2234-fix",
+        )
+        server._assignments[a.id] = a
+
+        from coord import github_ops
+        monkeypatch.setattr(github_ops, "work_is_terminal", lambda *args, **kwargs: True)
+
+        server._prune_terminal_advisory()
+
+        assert "rp-1" not in server._assignments
+        listing = server.list_assignments()
+        assert listing["completed"] == []
+
+    def test_superseded_prune_drops_refused_policy_when_later_done_same_issue(
+        self, tmp_path: Path,
+    ) -> None:
+        """`_prune_superseded_advisory` must also drop a REFUSED_POLICY entry
+        superseded by a later DONE retry for the same issue — e.g. the
+        coordinator re-scopes the issue so a later dispatch's deliverable is
+        no longer coordinator-only, and that later attempt reaches DONE."""
+        repo = _init_repo(tmp_path / "repo")
+        server = _server(tmp_path, repo_path=repo)
+
+        refused = AgentAssignment(
+            id="rp-2", spec=self._make_spec(repo, branch="issue-2234-fix"),
+            status=REFUSED_POLICY, finished_at=1.0, exit_code=0,
+            branch="issue-2234-fix",
+        )
+        server._assignments[refused.id] = refused
+
+        done = AgentAssignment(
+            id="done-rp", spec=self._make_spec(repo, branch="issue-2234-fix-retry"),
+            status=DONE, finished_at=2.0, exit_code=0,
+            branch="issue-2234-fix-retry",
+        )
+        server._assignments[done.id] = done
+
+        server._prune_superseded_advisory()
+
+        assert "rp-2" not in server._assignments
+        assert "done-rp" in server._assignments

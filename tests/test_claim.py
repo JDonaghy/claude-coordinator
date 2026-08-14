@@ -727,6 +727,24 @@ def test_superseding_work_row_ignores_advisory_later_rows() -> None:
     assert superseding_work_row(board, old) is None
 
 
+def test_superseding_work_row_ignores_refused_policy_later_rows() -> None:
+    """#2234: a `--fix-of` round whose worker exits 0-commit citing a
+    standing repo-rule prohibition is `status=refused_policy` — drawn from
+    the same `_ZERO_COMMIT_TYPES` gate as `advisory` in coord/agent.py's
+    `_reap`. It must not supersede the row it was fixing, for the identical
+    reason `advisory` doesn't: a `refused_policy` row is itself never a
+    valid Test-stage dispatch target (`dispatch_smoke` requires `status ==
+    "done"`), so treating it as superseding would leave the branch with NO
+    dispatch target at all."""
+    old = _work_row(aid="w1", branch="issue-16-fix", at=100.0)
+    refused = _work_row(
+        aid="w2", branch="issue-16-fix", at=200.0, status="refused_policy"
+    )
+    board = Board(completed=[old, refused])
+
+    assert superseding_work_row(board, old) is None
+
+
 def test_superseding_work_row_ignores_non_work_types() -> None:
     """The review and smoke of a branch are not its author."""
     row = _work_row(aid="w1", branch="issue-16-fix", at=100.0)

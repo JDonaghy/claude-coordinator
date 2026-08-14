@@ -32,6 +32,7 @@ from coord.comments import (
     EVENT_LIVENESS_STALL,
     EVENT_NEEDS_ATTENTION,
     EVENT_PLAN,
+    EVENT_REFUSED_POLICY,
     EVENT_STALLED,
     EVENT_STUCK,
     format_liveness_stall,
@@ -42,7 +43,13 @@ from coord.comments import (
     format_stuck,
 )
 from coord.config import Config
-from coord.dispatch import AGENT_PORT, post_advisory, post_completion, post_failure
+from coord.dispatch import (
+    AGENT_PORT,
+    post_advisory,
+    post_completion,
+    post_failure,
+    post_refused_policy,
+)
 from coord.progress import parse_progress
 from coord.state import (
     load_dispatched,
@@ -1477,6 +1484,15 @@ def detect_transitions(config: Config) -> list[tuple[Transition, dict, dict]]:
                 # coord status) know the worker finished with no code change
                 # and that human review is needed.
                 event = EVENT_ADVISORY
+            elif entry_status == "refused_policy":
+                # #2234: the worker exited cleanly, pushed 0 commits, and its
+                # own final message cited a standing repo-rule prohibition
+                # (`coord.agent.REFUSED_POLICY`). Modeled on the ADVISORY arm
+                # above — same "post so GitHub-only readers see it" reasoning
+                # — but a distinct event so the comment doesn't ask for human
+                # review of an undecided outcome; the worker already found
+                # the answer.
+                event = EVENT_REFUSED_POLICY
             else:
                 continue
             transitions.append(
@@ -2499,6 +2515,23 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
         # state on GitHub so operators not watching coord status are informed.
         post_advisory(
             reason=entry.get("zero_commit_reason") or "",
+            **common,
+        )
+        mark_notified(
+            transition.assignment_id,
+            transition.event,
+            branch=entry.get("branch"),
+        )
+    elif transition.event == EVENT_REFUSED_POLICY:
+        # #2234: 0-commit clean exit whose worker cited a standing repo-rule
+        # prohibition — post a distinctive comment naming the routing
+        # decision (needs the coordinator), not an advisory "human review
+        # needed" framing. Without this arm the event fell into the
+        # catch-all `else` below, which requires a failure_reason-shaped
+        # signal to post anything and silently drops everything else —
+        # exactly the "no comment at all" regression #2234's review caught.
+        post_refused_policy(
+            reason=entry.get("policy_refusal_reason") or "",
             **common,
         )
         mark_notified(

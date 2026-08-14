@@ -2192,6 +2192,11 @@ def reconcile_board_merges(
                 and a.review_state == "pending"
             )
             or a.status == "advisory"
+            # #2234: a refused_policy row is the same "ghost sibling" shape
+            # as advisory above — a terminal, zero-commit no-op that should
+            # auto-settle to `merged` once GitHub confirms the issue went
+            # terminal, rather than sitting on `refused_policy` forever.
+            or a.status == "refused_policy"
             or (
                 a.type == "work"
                 and a.status == "merged"
@@ -2230,6 +2235,18 @@ def reconcile_board_merges(
             if not dry_run:
                 a.status = "merged"
                 state.mark_advisory_settled(a.assignment_id or "")
+        elif a.status == "refused_policy":
+            # #2234: same settling as advisory above — once GitHub confirms
+            # the issue went terminal, a refused_policy row auto-settles to
+            # 'merged' rather than sitting on the board forever.
+            actions.append(
+                f"settle refused_policy {a.assignment_id} "
+                f"({a.repo_name} #{a.issue_number})"
+                + (" [dry-run]" if dry_run else "")
+            )
+            if not dry_run:
+                a.status = "merged"
+                state.mark_refused_policy_settled(a.assignment_id or "")
         elif a.type == "work":
             # #951: type=work, status=merged, review_state=pending — a row
             # that already fell out of sweep (b)'s status=='done' candidates

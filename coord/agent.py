@@ -7939,8 +7939,16 @@ class AgentServer:
             ):
                 return
             self._last_advisory_terminal_check = now
+            # #2234: REFUSED_POLICY joins ADVISORY here for the same reason
+            # — both are terminal, zero-commit statuses the agent would
+            # otherwise keep serving indefinitely from its own `/status`
+            # feed once GitHub confirms the work is done, forcing every
+            # downstream consumer (dashboard, TUI, any future client) to
+            # reimplement the same GitHub-terminality filter this method
+            # exists to spare them.
             candidates = [
-                a for a in self._assignments.values() if a.status == ADVISORY
+                a for a in self._assignments.values()
+                if a.status in (ADVISORY, REFUSED_POLICY)
             ]
         if not candidates:
             return
@@ -8012,7 +8020,14 @@ class AgentServer:
             ordered = list(self._assignments.values())
             superseded_ids: list[str] = []
             for i, a in enumerate(ordered):
-                if a.status != ADVISORY:
+                # #2234: REFUSED_POLICY joins ADVISORY here too — a refusal
+                # for issue X can be superseded the same way an advisory can
+                # (e.g. the coordinator re-scopes the issue so a later
+                # dispatch's deliverable is no longer coordinator-only, and
+                # that later attempt reaches DONE). Same in-memory
+                # comparison, same root cause as `_prune_terminal_advisory`
+                # above.
+                if a.status not in (ADVISORY, REFUSED_POLICY):
                     continue
                 key = (a.spec.repo_name, a.spec.issue_number)
                 for later in ordered[i + 1 :]:
