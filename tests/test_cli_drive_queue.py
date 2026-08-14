@@ -353,6 +353,118 @@ def test_list_omits_age_for_a_reason_with_no_capture_time(cli, coord_db):
     )
 
 
+# ── #2183: a blocked row's `after=` must not misreport its cause ────────────
+#
+# quadraui#542, 2026-08-13: a `blocked` row led with `after=<merged pre-req>`,
+# reading as "blocked on a dependency that already merged" (stale, self-
+# resolving) when the real, unrelated cause — a red slice PR — sat on a `last:`
+# line beneath it. The sibling row (the quadraui#492 shape) was genuinely
+# blocked BY its pre-req and rendered identically, so nothing on either row
+# distinguished the two very different remedies.
+
+
+def _row_for(output: str, key: str) -> str:
+    """The `list` summary line for *key* (not its `last:`/`remedy:` lines)."""
+    match = re.search(rf"^\s*\d+\s+{re.escape(key)}\s+.*$", output, re.MULTILINE)
+    assert match, f"no row for {key} in:\n{output}"
+    return match.group(0)
+
+
+def test_blocked_row_drops_a_merged_prereq_and_leads_with_its_own_cause(
+    cli, seed
+):
+    """The exact #2183 regression: `after=` named a merged pre-req while the
+    real block was an unrelated drive failure. Must fail before the fix."""
+    seed(
+        issues={1650: "closed", 1654: "open"},
+        assignments=[{"issue_number": 1650, "status": "merged"}],
+    )
+    cli("add", REPO, "1654", "--after", "1650")
+    own_reason = (
+        f"drive exited for {REPO}#1654 (exit_code=1): the JIT acceptance "
+        "slice could not be landed — no work can be dispatched until it "
+        "merges: merge attempted 3 times without landing"
+    )
+    state._update_drive_queue_entry_local(
+        REPO, 1654, state="blocked", last_reason=own_reason, attempts=2
+    )
+
+    result = cli("list")
+    assert result.exit_code == 0, result.output
+    row = _row_for(result.output, f"{REPO}#1654")
+
+    # Rule 1: the merged pre-req is gone from the row entirely — showing it
+    # is the exact misinformation #2183 reports.
+    assert "after=" not in row, row
+    assert f"{REPO}#1650" not in row, row
+
+    # Rule 2: the row itself leads with the REAL (own) cause, not a bare
+    # "blocked" that sends the reader hunting for the reason.
+    assert "blocked:" in row, row
+    assert "JIT acceptance slice" in row, row
+
+    # The full reason is still available on its own line, unabridged.
+    assert own_reason in result.output
+
+    # Rule 4: blocked's terminality is stated on the row's own output, not
+    # buried in an unrelated entry's hand-written note.
+    assert "is terminal" in result.output
+    assert "remove" in result.output and "add" in result.output
+
+
+def test_blocked_row_purely_by_an_unsatisfiable_prereq_is_unchanged(cli, seed):
+    """The #492 control case: genuinely blocked BY an unsatisfiable pre-req
+    must keep showing that pre-req and its "will never satisfy" reason —
+    and must NOT get the own-cause treatment #542's row gets."""
+    seed(
+        issues={1650: "closed", 1654: "open"},
+        assignments=[{"issue_number": 1650, "status": "merged"}],
+    )
+    # 1654 (the #542 shape): blocked for its own, unrelated reason.
+    cli("add", REPO, "1654", "--after", "1650")
+    state._update_drive_queue_entry_local(
+        REPO, 1654, state="blocked", last_reason="drive exited: unrelated own failure"
+    )
+    # 1660 (the #492 shape): declares BOTH the merged pre-req and the
+    # now-blocked 1654 as pre-reqs — its only real blocker is 1654.
+    cli("add", REPO, "1660", "--after", "1650,1654")
+    dep_reason = f"pre-req {REPO}#1654 is queued but blocked — it will never satisfy"
+    state._update_drive_queue_entry_local(
+        REPO, 1660, state="blocked", last_reason=dep_reason
+    )
+
+    result = cli("list")
+    assert result.exit_code == 0, result.output
+    row = _row_for(result.output, f"{REPO}#1660")
+
+    # The merged pre-req (1650) still drops out (rule 1 applies everywhere)…
+    assert f"{REPO}#1650" not in row, row
+    # …but the genuinely-unsatisfiable one (1654) still renders, unchanged.
+    assert f"after={REPO}#1654" in row, row
+    # This row is dependency-caused: no own-cause colon on the state token.
+    assert "blocked:" not in row, row
+    assert f"      last" in result.output
+    assert dep_reason in result.output
+
+
+def test_list_with_no_after_is_unaffected_by_the_2183_diagnosis(cli):
+    """A `blocked` entry that never declared any `after=` at all keeps
+    rendering exactly as it always has — no board dependency, no remedy
+    line, no own-cause relabeling."""
+    cli("add", REPO, "1650")
+    state._update_drive_queue_entry_local(
+        REPO, 1650, state="blocked", last_reason="exhausted retries"
+    )
+
+    result = cli("list")
+    assert result.exit_code == 0, result.output
+    row = _row_for(result.output, f"{REPO}#1650")
+    assert row.strip().endswith("blocked"), row
+    assert "after=" not in row
+    assert "remedy:" not in result.output
+    assert "exhausted retries" in result.output
+
+
 # ── remove / move ────────────────────────────────────────────────────────────
 
 

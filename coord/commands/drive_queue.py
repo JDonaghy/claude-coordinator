@@ -50,6 +50,7 @@ from coord.drive_queue import (
     QUEUE_ALERT_STAGE,
     RESUME_PROBE_TIMEOUT_SECONDS,
     STATE_BLOCKED,
+    STATE_FAILED,
     STATE_PARKED,
     STATE_RUNNING,
     STATE_WAITING,
@@ -59,8 +60,10 @@ from coord.drive_queue import (
     QueueError,
     TickPlan,
     build_board_view,
+    diagnose_blocked_after,
     entries_from_rows,
     entry_key,
+    find_cycle,
     fired_holds,
     parse_after_spec,
     parse_key,
@@ -300,6 +303,50 @@ def validate_config_repo(config_path: Path, repo: str) -> None:
 
 # ── list ─────────────────────────────────────────────────────────────────────
 
+# `blocked`/`failed` are the two states #2183's re-diagnosis applies to: both
+# are in `TERMINAL_QUEUE_STATES` (the tick will never look at this row's
+# `after=` graph again), so both are exactly where a stale `after=` reading
+# can survive indefinitely. `done` is also terminal but carries no live
+# "why is this stuck" question — nothing to re-diagnose.
+_DIAGNOSABLE_STATES = (STATE_BLOCKED, STATE_FAILED)
+
+# How much of a (possibly multi-line, possibly paragraph-length) `last_reason`
+# fits on the summary row itself, next to `attempts=`/`deferrals=`, without
+# wrapping a normal terminal. The FULL text always still prints on the `last:`
+# continuation line right below — this is only the on-row teaser.
+_ROW_CAUSE_MAX_CHARS = 88
+
+_BLOCKED_REMEDY = (
+    "remedy: {state} is terminal — the queue will not re-check this row "
+    "on its own; `coord drive-queue remove` + `add` only helps once the "
+    "cause above is actually fixed, not merely because a pre-req merged"
+)
+
+
+def _row_cause(reason: str) -> str:
+    """The first line of *reason*, clipped to fit the summary row (#2183)."""
+    first_line = reason.strip().splitlines()[0] if reason.strip() else ""
+    if len(first_line) > _ROW_CAUSE_MAX_CHARS:
+        return first_line[: _ROW_CAUSE_MAX_CHARS - 1].rstrip() + "…"
+    return first_line
+
+
+def _board_for_list_diagnosis() -> BoardView | None:
+    """The board, for `list`'s #2183 re-diagnosis — ``None`` when unreachable.
+
+    Unlike `tick`, `list` is a read-only inspection command an operator runs
+    often and expects to be fast and always available, so an unreachable
+    board must never make it fail or hang the way `tick`'s fail-closed abort
+    does. ``None`` here means "skip the re-diagnosis" — every row falls back
+    to exactly today's rendering (the `after=` list unfiltered, no cause on
+    the row itself), never a crash or a misleading empty board's worth of
+    "everything is unsatisfied".
+    """
+    try:
+        return _fetch_board_view()
+    except Exception:  # noqa: BLE001 — see docstring: this must never fail `list`
+        return None
+
 
 @drive_queue_group.command("list")
 @click.option("--repo", "repo", default=None, help="Restrict to one repo (default: every repo).")
@@ -317,12 +364,61 @@ def drive_queue_list(repo: str | None, output_json: bool, config_path: Path) -> 
         click.echo("(drive queue is empty)")
         return
     now = time.time()
-    for entry in entries_from_rows(rows):
-        bits = [f"{entry.position:>2}  {entry.key:<28} {entry.state}"]
+    entries = entries_from_rows(rows)
+
+    # #2183: a `blocked`/`failed` row's `after=` graph needs to be re-checked
+    # against the FULL queue (cross-repo pre-reqs), not just whatever `--repo`
+    # filtered down to — otherwise a `--repo` view would misdiagnose an
+    # out-of-repo pre-req as "unknown to the queue" purely from the filter,
+    # not from anything actually true.
+    all_entries = entries if repo is None else entries_from_rows(list_drive_queue())
+    # A row with no `after=` at all has nothing for #2183's re-diagnosis to
+    # do — criterion "entries with no after= are unaffected" — so both the
+    # board fetch and the per-row diagnosis below are gated on `entry.after`
+    # being non-empty, not just on the state being terminal.
+    needs_diagnosis = any(
+        e.state in _DIAGNOSABLE_STATES and e.after for e in entries
+    )
+    board = _board_for_list_diagnosis() if needs_diagnosis else None
+    states = {e.key: e.state for e in all_entries}
+    cycle_keys: dict[str, str] = {}
+    cycle = find_cycle({e.key: list(e.after) for e in all_entries})
+    if cycle is not None:
+        message = "dependency cycle: " + " -> ".join(cycle)
+        for key in cycle:
+            cycle_keys[key] = message
+
+    for entry in entries:
+        diagnosed = (
+            board is not None and entry.state in _DIAGNOSABLE_STATES and bool(entry.after)
+        )
+        unsatisfied = entry.after
+        dependency_reason = ""
+        if diagnosed:
+            diagnosis = diagnose_blocked_after(entry, board, states, cycle_keys)
+            unsatisfied = diagnosis.unsatisfied
+            dependency_reason = diagnosis.dependency_reason
+
+        # A diagnosed row whose block is NOT (or no longer) caused by its
+        # `after=` graph gets its own cause on the state token itself — #2183
+        # point 2: the terminal reason leads, not a dependency list that may
+        # have nothing to do with it. A row that IS dependency-caused (or
+        # wasn't diagnosed at all) keeps the plain state token unchanged.
+        state_label = entry.state
+        if diagnosed and not dependency_reason and entry.last_reason:
+            state_label = f"{entry.state}: {_row_cause(entry.last_reason)}"
+
+        bits = [f"{entry.position:>2}  {entry.key:<28} {state_label}"]
         if entry.machine:
             bits.append(f"machine={entry.machine}")
-        if entry.after:
-            bits.append(f"after={','.join(entry.after)}")
+        # Suppress `after=` entirely on a diagnosed row that is NOT
+        # dependency-caused: every named pre-req is either satisfied or was
+        # never the reason this row is stuck, so showing it invites exactly
+        # the misreading #2183 exists to stop. Otherwise (not diagnosed, or
+        # genuinely dependency-caused) show whatever is still unsatisfied.
+        show_after = () if (diagnosed and not dependency_reason) else unsatisfied
+        if show_after:
+            bits.append(f"after={','.join(show_after)}")
         if entry.attempts:
             bits.append(f"attempts={entry.attempts}")
         if entry.deferrals:
@@ -334,6 +430,11 @@ def drive_queue_list(repo: str | None, output_json: bool, config_path: Path) -> 
         click.echo("  ".join(bits))
         if entry.last_reason:
             click.echo(f"      last{_reason_age_suffix(entry, now)}: {entry.last_reason}")
+        if diagnosed:
+            # #2183 point 4: `blocked`/`failed` is terminal — say so where the
+            # operator is already reading the row, not just in an unrelated
+            # operator's hand-written `--hold-after` note.
+            click.echo(f"      {_BLOCKED_REMEDY.format(state=entry.state)}")
         for line in _hold_lines(entry):
             click.echo(line)
 
