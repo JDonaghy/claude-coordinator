@@ -13,7 +13,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from coord.agent import WORKER_SYSTEM_PROMPT, AssignmentSpec, default_worker_command
+from coord.agent import (
+    WORKER_SYSTEM_PROMPT,
+    AssignmentSpec,
+    _count_graphify_invocations,
+    default_worker_command,
+)
 from coord.config import ConfigError, ReviewsConfig, load
 from coord.models import Machine, Proposal, Repo
 
@@ -45,6 +50,100 @@ def test_worker_system_prompt_requires_clean_build_before_done() -> None:
     # Escape hatch for genuinely unfixable warnings — workers must call them
     # out explicitly, not silently leave them.
     assert "explicitly call it out" in WORKER_SYSTEM_PROMPT
+
+
+# ── #2212: graph-first navigation instruction ───────────────────────────────
+
+
+def test_worker_system_prompt_contains_graph_first_instruction() -> None:
+    """#2212: the rule that workers should query the graphify graph before
+    grepping for structure lived only in CLAUDE.md (39.9KB, one paragraph)
+    and never survived contact with a real task — #2180's leg ran 48 greps
+    and 0 graph queries. The rule must live in the short, always-read
+    worker system prompt, name the concrete CLI entry point, and say what
+    grep/read ARE still for (exact-string/line confirmation) so this isn't
+    read as a blanket grep ban."""
+    assert 'graphify query "<question>"' in WORKER_SYSTEM_PROMPT
+    assert "query the codebase graph first" in WORKER_SYSTEM_PROMPT
+    assert "confirming an exact string or line" in WORKER_SYSTEM_PROMPT
+
+
+def test_worker_system_prompt_states_no_graph_fallback() -> None:
+    """A repo/worktree with no built graph must not stall or STUCK a
+    worker — the instruction must say what to do when the graph is
+    absent: fall back to grep, silently."""
+    assert "graphify-out/graph.json" in WORKER_SYSTEM_PROMPT
+    assert "Skip straight to grep" in WORKER_SYSTEM_PROMPT
+
+
+def test_worker_system_prompt_graph_instruction_present_regardless_of_repo() -> None:
+    """The instruction is baked into the static system prompt, not derived
+    per-repo — assert it survives `default_worker_command` for two
+    differently-named repos/specs, the same shape a real dispatch uses."""
+    for repo_name in ("api", "some-other-repo"):
+        spec = AssignmentSpec(
+            repo_name=repo_name,
+            repo_path=f"/tmp/{repo_name}",
+            issue_number=1,
+            issue_title="t",
+            briefing="b",
+        )
+        argv = default_worker_command(spec)
+        idx = argv.index("--system-prompt")
+        assert 'graphify query "<question>"' in argv[idx + 1]
+
+
+def test_default_worker_command_allowed_tools_permits_graph_query_path() -> None:
+    """The graph is queried via `graphify query ...` over Bash — the
+    worker's --allowedTools must still include Bash so that path is
+    reachable (today's allowlist is Read,Edit,Write,Bash,Monitor)."""
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path="/tmp/repo",
+        issue_number=1,
+        issue_title="t",
+        briefing="b",
+    )
+    argv = default_worker_command(spec)
+    idx = argv.index("--allowedTools")
+    assert "Bash" in argv[idx + 1].split(",")
+
+
+def test_worker_system_prompt_hard_rules_unchanged_by_graph_instruction() -> None:
+    """The #2212 addition must not displace any of the existing hard
+    rules — assert each is still present so a future prompt edit can't
+    silently drop one of these while touching the nearby graph bullet."""
+    assert "Do NOT run gh commands" in WORKER_SYSTEM_PROMPT
+    assert "Work only inside your current working directory" in WORKER_SYSTEM_PROMPT
+    assert "NEVER commit or push to main or develop directly" in WORKER_SYSTEM_PROMPT
+    assert "This session is ONE-SHOT and non-interactive (#1394)" in WORKER_SYSTEM_PROMPT
+    assert (
+        "Background-task completion notifications will NEVER reach you"
+        in WORKER_SYSTEM_PROMPT
+    )
+    assert "ALWAYS `git add`, `git commit`, and `git push origin HEAD` BEFORE your" in (
+        WORKER_SYSTEM_PROMPT
+    )
+
+
+# ── #2212: graphify-invocation counter (measurability) ──────────────────────
+
+
+def test_count_graphify_invocations_counts_command_tokens() -> None:
+    assert _count_graphify_invocations(['graphify query "where is X handled"']) == 1
+    assert _count_graphify_invocations(["cd repo && graphify update ."]) == 1
+    assert _count_graphify_invocations(["grep -rn foo .", "rg bar ."]) == 0
+
+
+def test_count_graphify_invocations_ignores_path_substring() -> None:
+    """A command that merely mentions `graphify-out/` as a path (not the
+    `graphify` binary as a command token) must not be counted — otherwise
+    the counter over-reports and the "0 across N legs" signal is unreliable."""
+    assert _count_graphify_invocations(["cat graphify-out/graph.json"]) == 0
+
+
+def test_count_graphify_invocations_empty_list() -> None:
+    assert _count_graphify_invocations([]) == 0
 
 
 # ── Default ReviewsConfig checklist ─────────────────────────────────────────

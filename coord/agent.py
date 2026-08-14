@@ -747,6 +747,30 @@ def _graphify_update(repo_path: Path, *, timeout: float = 600.0) -> tuple[bool, 
     return True, (result.stdout or "").strip()
 
 
+# #2212: count how many Bash commands in a worker's leg invoked `graphify` —
+# the measurable half of the graph-first navigation rule in
+# WORKER_SYSTEM_PROMPT above. The rule has lapsed into disuse before (see
+# #2212's issue body) because nothing tracked whether workers actually
+# queried the graph; this is written into every reaped worker's log (see
+# the "# reap: done" line in `_reap`) as a plain `grep`-able counter — zero
+# across N consecutive legs means the prompt instruction isn't landing.
+# Deliberately NOT a DB column: this is a cheap, best-effort signal, not a
+# gate anything blocks on, so it stays out of the Assignment schema/migrations.
+_GRAPHIFY_INVOCATION_RE = re.compile(r"(?:^|[;&|]\s*)graphify(?:\s|$)")
+
+
+def _count_graphify_invocations(bash_commands: list[str]) -> int:
+    """Count *bash_commands* entries that invoke the ``graphify`` CLI.
+
+    Matches ``graphify`` as a command token — at the start of the string or
+    after a shell separator (``;``, ``&&``, ``||``, ``|``) — so ``graphify
+    query "..."`` counts but a path or string that merely contains the
+    substring ``graphify`` (e.g. ``cat graphify-out/graph.json``, where
+    ``graphify`` is a path component rather than a command) does not.
+    """
+    return sum(1 for cmd in bash_commands if cmd and _GRAPHIFY_INVOCATION_RE.search(cmd))
+
+
 def _infer_repo_github_slug(repo_path: str) -> str | None:
     """Best-effort ``owner/repo`` slug for *repo_path*'s ``origin`` remote (#1492).
 
@@ -2903,6 +2927,11 @@ better than a perfect uncommitted diff, which is worth nothing.
 - Your final message is the LAST thing you will ever say. Never end it with \
 "I'll continue", "waiting for X", or "will follow up" — finish or report \
 the blocker.
+- For "where is X handled" / "what calls this" / architecture questions, \
+query the codebase graph first: `graphify query "<question>"` via Bash. \
+Grep/Read are for confirming an exact string or line, not for discovering \
+structure. No `graphify-out/graph.json` in this worktree? Skip straight to \
+grep, silently — do not stop to build one (#2212).
 
 Before writing any code, verify the feature or fix isn't already implemented. \
 Grep for relevant function names, check existing modules, and read related files. \
@@ -7440,7 +7469,20 @@ class AgentServer:
         try:
             with open(assignment.log_path, "a") as reopen:
                 final_status = assignment.status if assignment else "unknown"
-                reopen.write(f"# reap: done (exit_code={exit_code} status={final_status})\n")
+                # #2212: log a plain `graphify_invocations=N` counter alongside
+                # the existing reap line — this is the measurable half of the
+                # graph-first navigation rule (see WORKER_SYSTEM_PROMPT and
+                # `_count_graphify_invocations`). `_worker_summary` is `None`
+                # for a non-stream-json log or a parse failure; counting 0 in
+                # that case is the honest answer, not a lie — best-effort like
+                # everything else in this function.
+                _graphify_invocations = _count_graphify_invocations(
+                    _worker_summary.bash_commands if _worker_summary is not None else []
+                )
+                reopen.write(
+                    f"# reap: done (exit_code={exit_code} status={final_status} "
+                    f"graphify_invocations={_graphify_invocations})\n"
+                )
         except (OSError, AttributeError):
             pass
 
