@@ -248,6 +248,41 @@ class TestDispatch:
         assert "target_branch" not in payload
 
     @patch("coord.dispatch.httpx.post")
+    def test_payload_carries_issue_labels_when_set(
+        self, mock_post: MagicMock, config: Config,
+    ) -> None:
+        """#2188: `proposal.issue_labels` flows onto the wire so the agent's
+        own reap can see `deliverable:analysis` without a DB/GitHub round
+        trip (config-free agent)."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=2132, issue_title="Diagnose the 29% rate",
+            rationale="analysis",
+            issue_labels=["deliverable:analysis", "priority:high"],
+        )
+        dispatch(p, config)
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["issue_labels"] == ["deliverable:analysis", "priority:high"]
+
+    @patch("coord.dispatch.httpx.post")
+    def test_payload_omits_issue_labels_when_unset(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal,
+    ) -> None:
+        """Older agents (pre-#2188) reject unknown kwargs in
+        AssignmentSpec(**body), so the field must be omitted when the
+        proposal carries no labels — matches `target_branch`'s discipline."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+        dispatch(proposal, config)
+        payload = mock_post.call_args.kwargs["json"]
+        assert "issue_labels" not in payload
+
+    @patch("coord.dispatch.httpx.post")
     def test_payload_carries_coordinator_only_files(
         self, mock_post: MagicMock, proposal: Proposal,
     ) -> None:

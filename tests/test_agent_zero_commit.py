@@ -416,3 +416,169 @@ def test_advisory_counted_as_completed_in_health(
     assert h["active"] == 0, "ADVISORY must not count as active"
     assert h["completed"] >= 1, "ADVISORY must count as completed"
     server.shutdown()
+
+
+# ── `deliverable:analysis` inverts the 0-commit reading (#2188) ──────────────
+#
+# An issue whose deliverable is a written artifact (a diagnosis, an audit, a
+# spike) — not a diff — legitimately ends with 0 commits: that is the SUCCESS
+# condition, not the #448 "worker did nothing" anomaly. Labelling the issue
+# `deliverable:analysis` tells the reap to record `done`, not `advisory`, for
+# exactly that shape. An unlabelled issue with 0 commits must be completely
+# unaffected — this is the other half of the acceptance test the issue asks
+# for ("a normal (code) issue with zero commits still reports advisory
+# exactly as it does today").
+
+_RESULT_LINE = (
+    '{"type": "result", "subtype": "success", "is_error": false, '
+    '"result": "Diagnosis: 74 percent of blocking review findings were '
+    'real defects; zero were false positives or style nits."}'
+)
+
+
+def test_analysis_deliverable_zero_commit_is_done_not_advisory(
+    tmp_path: Path, repo_local_only: Path
+) -> None:
+    """#2188: `deliverable:analysis` + 0 commits + clean exit → DONE, not
+    ADVISORY — the core regression guard for the issue's acceptance
+    criteria."""
+    server = AgentServer(
+        machine_name="t",
+        repos=["api"],
+        repo_paths={"api": str(repo_local_only)},
+        state_dir=tmp_path / "state",
+        # Worker exits cleanly, writes nothing, but DOES emit a stream-json
+        # `result` event carrying its final diagnosis — exactly what
+        # `claude -p --output-format stream-json` produces.
+        worker_command=lambda spec: ["/bin/sh", "-c", f"printf '%s\\n' '{_RESULT_LINE}'"],
+    )
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path=str(repo_local_only),
+        issue_number=2132,
+        issue_title="Diagnose the 29% request-changes rate",
+        briefing="b",
+        branch="main",
+        issue_labels=["deliverable:analysis"],
+    )
+    a = server.assign(spec)
+    final = server.wait_for(a.id, timeout=10)
+
+    assert final.status == DONE, (
+        f"expected DONE for a labelled analysis deliverable, got {final.status!r}"
+    )
+    assert final.exit_code == 0
+    assert final.zero_commit_reason is None, (
+        "must not carry the #448 advisory reason once relabelled done"
+    )
+    assert final.analysis_deliverable is True
+    assert final.result_text is not None
+    assert "74 percent" in final.result_text
+    server.shutdown()
+
+
+def test_analysis_deliverable_label_appears_in_log(
+    tmp_path: Path, repo_local_only: Path
+) -> None:
+    """The analysis-deliverable diagnosis is written to the assignment log,
+    mirroring the existing advisory-reason log guarantee."""
+    server = AgentServer(
+        machine_name="t",
+        repos=["api"],
+        repo_paths={"api": str(repo_local_only)},
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: ["/bin/true"],
+    )
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path=str(repo_local_only),
+        issue_number=2133,
+        issue_title="noop analysis",
+        briefing="b",
+        branch="main",
+        issue_labels=["deliverable:analysis"],
+    )
+    a = server.assign(spec)
+    final = server.wait_for(a.id, timeout=10)
+
+    assert final.status == DONE
+    assert final.log_path is not None
+    log_text = Path(final.log_path).read_text()
+    assert "analysis deliverable" in log_text.lower(), (
+        f"expected 'analysis deliverable' in log, got:\n{log_text}"
+    )
+    server.shutdown()
+
+
+def test_unlabelled_zero_commit_is_still_advisory_exactly_as_before(
+    tmp_path: Path, repo_local_only: Path
+) -> None:
+    """#2188 acceptance: an ORDINARY (unlabelled) issue with 0 commits must
+    be completely unaffected by the new label — same ADVISORY status, same
+    reason, same `analysis_deliverable=False`/`result_text=None` as every
+    zero-commit work assignment before this feature existed."""
+    server = AgentServer(
+        machine_name="t",
+        repos=["api"],
+        repo_paths={"api": str(repo_local_only)},
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: ["/bin/sh", "-c", f"printf '%s\\n' '{_RESULT_LINE}'"],
+    )
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path=str(repo_local_only),
+        issue_number=2134,
+        issue_title="ordinary no-op work",
+        briefing="b",
+        branch="main",
+        # No issue_labels at all — the common case.
+    )
+    a = server.assign(spec)
+    final = server.wait_for(a.id, timeout=10)
+
+    assert final.status == ADVISORY, (
+        f"unlabelled 0-commit issue must stay ADVISORY, got {final.status!r}"
+    )
+    assert final.zero_commit_reason is not None
+    assert "0 commits" in final.zero_commit_reason
+    assert final.analysis_deliverable is False
+    assert final.result_text is None
+    server.shutdown()
+
+
+def test_analysis_deliverable_survives_persist_load(
+    tmp_path: Path, repo_local_only: Path
+) -> None:
+    """`analysis_deliverable`/`result_text` round-trip through the agent
+    state JSON (persist → load), mirroring the existing advisory round-trip
+    guarantee."""
+    from coord.agent import AgentAssignment  # noqa: PLC0415
+
+    a = AgentAssignment(
+        id="analysis-001",
+        spec=AssignmentSpec(
+            repo_name="api",
+            repo_path="/tmp",
+            issue_number=1,
+            issue_title="t",
+            briefing="b",
+            issue_labels=["deliverable:analysis"],
+        ),
+        status=DONE,
+        analysis_deliverable=True,
+        result_text="the diagnosis",
+        exit_code=0,
+        finished_at=1234567890.0,
+    )
+    d = a.to_dict()
+    assert d["status"] == DONE
+    assert d["analysis_deliverable"] is True
+    assert d["result_text"] == "the diagnosis"
+
+    spec_data = d.pop("spec")
+    spec = AssignmentSpec(**spec_data)
+    a2 = AgentAssignment(spec=spec, **d)
+    assert a2.status == DONE
+    assert a2.analysis_deliverable is True
+    assert a2.result_text == "the diagnosis"
+    assert a2.spec.issue_labels == ["deliverable:analysis"]

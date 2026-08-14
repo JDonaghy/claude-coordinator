@@ -755,6 +755,14 @@ def dispatch(
     # field reject unknown payload keys with a 400.
     if getattr(proposal, "resume_session_id", None):
         payload["resume_session_id"] = proposal.resume_session_id
+    # #2188: the issue's GitHub labels, so the agent's own reap can see
+    # `coord.models.DELIVERABLE_ANALYSIS_LABEL` without a DB/GitHub round
+    # trip (config-free agent — docs/EPHEMERAL_WORKERS.md). Only sent when
+    # non-empty, same discipline as every optional wire field above — an
+    # agent predating `AssignmentSpec.issue_labels` 400s on an unrecognized
+    # kwarg.
+    if proposal.issue_labels:
+        payload["issue_labels"] = list(proposal.issue_labels)
     # #2131: per-leg spend ceiling, resolved here (CLI/daemon lane) and
     # carried on the wire so a config-free agent is covered too. Sent ONLY
     # when the operator has actually configured one — with no `budget:` block
