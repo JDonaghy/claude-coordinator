@@ -416,6 +416,14 @@ class DeferralPressure:
     #: of deferrals). Starts the cooldown in :func:`plan_cordons`.
     last_release_at: float = 0.0
     target_version: str | None = None
+    #: The ``--cordon-max-deferrals`` value the most recent matched run
+    #: actually used, read back out of that run's journal record. #2240
+    #: review: `describe_deferral_pressure()` used to only ever see
+    #: `DEFAULT_MAX_DEFERRALS`, so an operator running with a non-default
+    #: `--cordon-max-deferrals` got a "NOT DRAINING" label at the wrong
+    #: count. Defaults to `DEFAULT_MAX_DEFERRALS` for a record written before
+    #: this field existed, or when there is no matched run at all.
+    max_deferrals: int = DEFAULT_MAX_DEFERRALS
 
     def cooling_for(self, now: float, cooldown: float) -> float:
         """Seconds of cooldown left at *now*; 0 when cordoning may resume."""
@@ -427,6 +435,7 @@ class DeferralPressure:
         return {
             "consecutive": self.consecutive,
             "last_release_at": self.last_release_at,
+            "max_deferrals": self.max_deferrals,
             "target_version": self.target_version,
         }
 
@@ -495,10 +504,19 @@ def deferral_pressure(
     run that held no cordon cannot be blocking anything. It does not break
     the walk either — a transient cordon-store write error in the middle of a
     standoff must not silently reset the counter.
+
+    #2240 review: also reads back the ``--cordon-max-deferrals`` value the
+    *newest* matched run actually used (from that run's own journal record,
+    written by :func:`coord.commands.release._apply_cordons`), rather than
+    leaving every caller of :func:`describe_deferral_pressure` to assume
+    :data:`DEFAULT_MAX_DEFERRALS` — an operator running propagate with a
+    non-default ``--cordon-max-deferrals`` was otherwise shown "NOT DRAINING"
+    at the wrong count.
     """
     want = normalize_version(target_version)
     consecutive = 0
     last_release_at = 0.0
+    max_deferrals: int | None = None
     for raw in reversed(list(records)):
         if not isinstance(raw, Mapping):
             break
@@ -508,6 +526,18 @@ def deferral_pressure(
             break
         cordons = raw.get("cordons")
         cordons = cordons if isinstance(cordons, Mapping) else {}
+        if max_deferrals is None:
+            # Only the newest matched record's value counts — a record
+            # written before this field existed (or holding a non-numeric
+            # value) falls back to the default.
+            raw_max_deferrals = cordons.get("max_deferrals")
+            try:
+                max_deferrals = (
+                    DEFAULT_MAX_DEFERRALS if raw_max_deferrals is None
+                    else int(raw_max_deferrals)
+                )
+            except (TypeError, ValueError):
+                max_deferrals = DEFAULT_MAX_DEFERRALS
         try:
             released_at = float(cordons.get("released_at") or 0.0)
         except (TypeError, ValueError):
@@ -521,13 +551,16 @@ def deferral_pressure(
         consecutive=consecutive,
         last_release_at=last_release_at,
         target_version=want,
+        max_deferrals=(
+            DEFAULT_MAX_DEFERRALS if max_deferrals is None else max_deferrals
+        ),
     )
 
 
 def describe_deferral_pressure(
     pressure: DeferralPressure,
     *,
-    max_deferrals: int = DEFAULT_MAX_DEFERRALS,
+    max_deferrals: int | None = None,
 ) -> str:
     """The short suffix every cordon surface appends (#2240 acceptance 4).
 
@@ -536,11 +569,22 @@ def describe_deferral_pressure(
     observability finding is that those two states read identically: one is
     a fleet upgrading itself, the other is a fleet that has been unable to
     work for an hour.
+
+    *max_deferrals* defaults to ``pressure.max_deferrals`` — the value the
+    newest matched propagate run actually used, read back out of the journal
+    by :func:`deferral_pressure` — rather than :data:`DEFAULT_MAX_DEFERRALS`.
+    Review finding on #2240: both of this function's callers
+    (`coord status` and `coord release cordon`) used to pass nothing and
+    silently get the hardcoded default, so an operator running propagate
+    with a non-default ``--cordon-max-deferrals`` saw "NOT DRAINING" at the
+    wrong count. Pass an explicit value only when *pressure* predates this
+    field (e.g. a hand-built `DeferralPressure` in a test).
     """
     if pressure.consecutive <= 0:
         return ""
+    effective = pressure.max_deferrals if max_deferrals is None else max_deferrals
     plural = "" if pressure.consecutive == 1 else "s"
-    stalled = " — NOT DRAINING" if pressure.consecutive >= max(1, max_deferrals) else ""
+    stalled = " — NOT DRAINING" if pressure.consecutive >= max(1, effective) else ""
     return f"deferred {pressure.consecutive} run{plural}{stalled}"
 
 
@@ -832,6 +876,13 @@ class CordonOutcome:
     #: What :func:`deferral_pressure` read, so the journal shows the input to
     #: the release decision and not just its output.
     pressure: dict = field(default_factory=dict)
+    #: The ``--cordon-max-deferrals`` this run actually resolved to (the flag
+    #: value, or :data:`DEFAULT_MAX_DEFERRALS` when unset). #2240 review:
+    #: recorded on EVERY run, not just a releasing one, so
+    #: :func:`deferral_pressure` can read the operator's real setting back
+    #: out of the newest record instead of every caller of
+    #: :func:`describe_deferral_pressure` assuming the default.
+    max_deferrals: int = DEFAULT_MAX_DEFERRALS
 
     def to_dict(self) -> dict:
         return {
@@ -844,4 +895,5 @@ class CordonOutcome:
             "released": dict(self.released) if self.released else None,
             "cooling_seconds": self.cooling_seconds,
             "pressure": dict(self.pressure),
+            "max_deferrals": self.max_deferrals,
         }

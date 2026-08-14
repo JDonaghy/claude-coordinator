@@ -75,16 +75,25 @@ def tmp_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 # ── journal fixtures ────────────────────────────────────────────────────────
 
 
-def _deferred(target="0.5.77", *, cordoned=("server",), released_at=0.0):
-    """One journalled `deferred` propagation attempt."""
+def _deferred(target="0.5.77", *, cordoned=("server",), released_at=0.0, max_deferrals=None):
+    """One journalled `deferred` propagation attempt.
+
+    *max_deferrals* is omitted from ``cordons`` by default — matching a
+    record written before #2240's fix-review made `_apply_cordons` journal
+    it on every run — so existing fixtures built without the kwarg keep
+    exercising the "no field at all" fallback path.
+    """
+    cordons = {
+        "cordoned": list(cordoned),
+        "uncordoned": [],
+        "released_at": released_at,
+    }
+    if max_deferrals is not None:
+        cordons["max_deferrals"] = max_deferrals
     return {
         "status": rp.STATUS_DEFERRED,
         "target_version": target,
-        "cordons": {
-            "cordoned": list(cordoned),
-            "uncordoned": [],
-            "released_at": released_at,
-        },
+        "cordons": cordons,
     }
 
 
@@ -180,6 +189,47 @@ def test_an_empty_or_junk_journal_reads_as_no_pressure() -> None:
     assert rc.deferral_pressure(
         [{"status": "deferred", "cordons": "nonsense"}]
     ).consecutive == 0
+
+
+def test_deferral_pressure_reads_back_the_runs_own_max_deferrals() -> None:
+    """Fix-review finding on #2240: `describe_deferral_pressure()`'s two
+    callers (`coord status`, `coord release cordon`) passed nothing and
+    silently got `DEFAULT_MAX_DEFERRALS`, so an operator running propagate
+    with a non-default `--cordon-max-deferrals` saw "NOT DRAINING" at the
+    wrong count. The newest matched record's own value must win."""
+    pressure = rc.deferral_pressure(
+        [_deferred(max_deferrals=5), _deferred(max_deferrals=5)],
+        target_version="0.5.77",
+    )
+    assert pressure.consecutive == 2
+    assert pressure.max_deferrals == 5
+    # Below the operator's real bound of 5 — must not read as stalled yet.
+    assert rc.describe_deferral_pressure(pressure) == "deferred 2 runs"
+
+
+def test_deferral_pressure_max_deferrals_falls_back_on_an_old_record() -> None:
+    """A record written before this field existed (or the daemon mid-roll to
+    a version that doesn't write it yet) must fall back to the documented
+    default, not crash or silently read as `0` (which would mean 'never
+    release')."""
+    pressure = rc.deferral_pressure([_deferred()], target_version="0.5.77")
+    assert pressure.max_deferrals == rc.DEFAULT_MAX_DEFERRALS
+
+
+def test_describe_deferral_pressure_defaults_to_the_pressures_own_value() -> None:
+    """`describe_deferral_pressure(pressure)` — the exact no-kwarg call both
+    `coord status` and `coord release cordon` make — must honor a
+    `DeferralPressure` carrying a non-default `max_deferrals`, not silently
+    substitute `DEFAULT_MAX_DEFERRALS`."""
+    not_yet = rc.DeferralPressure(consecutive=2, max_deferrals=5)
+    assert rc.describe_deferral_pressure(not_yet) == "deferred 2 runs"
+    stalled = rc.DeferralPressure(consecutive=5, max_deferrals=5)
+    assert rc.describe_deferral_pressure(stalled) == "deferred 5 runs — NOT DRAINING"
+    # An explicit override still wins, for a caller with its own value.
+    assert (
+        rc.describe_deferral_pressure(not_yet, max_deferrals=2)
+        == "deferred 2 runs — NOT DRAINING"
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -360,6 +410,59 @@ def test_a_review_dispatches_onto_a_wholly_cordoned_fleet(tmp_home) -> None:
     assert [m.name for m, _ in _ranked_reviewer_candidates(
         "laptop", "api", Board(), config
     )] == ["server", "laptop"]
+
+
+def test_a_fix_dispatches_onto_a_wholly_cordoned_fleet(tmp_home) -> None:
+    """The same regression, one leg later (#2240 fix-review finding):
+    `_dispatch_fix` (reached via `_dispatch_fix_for_review` after a
+    `request-changes` verdict) is the tail of work already running, exactly
+    like the review dispatch above — so a release cordon must not filter its
+    candidate machines either. Before this fix `_dispatch_fix` still resolved
+    machines with `machine_pause.paused_set()` (cordons included): with the
+    worker's own machine cordoned, the primary pick was excluded, and the
+    fallback candidate list excluded every cordoned host too — so a wholly
+    cordoned fleet left the fix leg permanently un-dispatched, reproducing
+    the same 'running with no live assignment' deadlock shape for the fix
+    leg instead of the review leg."""
+    from unittest.mock import MagicMock, patch
+
+    from coord.auto_loop import _dispatch_fix
+    from coord.models import Assignment, Board
+
+    config = _review_config()
+    for name in ("laptop", "server"):
+        mp.local_set_cordon(name, target_version="0.5.77")
+
+    work = Assignment(
+        machine_name="laptop",
+        repo_name="api",
+        issue_number=2240,
+        issue_title="Deadlock",
+        briefing="Original briefing.",
+        assignment_id="work-2240",
+        status="done",
+        branch="issue-2240-fix",
+        dispatched_at=0.0,
+        finished_at=1.0,
+        type="work",
+    )
+    board = Board(completed=[work])
+    mock_http = MagicMock()
+    mock_http.post.return_value.json.return_value = {"id": "fix-2240"}
+    mock_http.post.return_value.raise_for_status = MagicMock()
+
+    with patch("coord.auto_loop.record_dispatched_assignment"):
+        result = _dispatch_fix(
+            work, "Fix briefing.", board, config, iteration=1,
+            http_client=mock_http,
+        )
+
+    assert result is not None, (
+        "this returned None pre-fix — a wholly cordoned fleet left the fix "
+        "leg permanently un-dispatched, the same shape as the review-leg "
+        "deadlock this whole issue is about"
+    )
+    assert result.machine_name == "laptop", "the original worker's own machine"
 
 
 def test_a_cordoned_host_still_refuses_NEW_work(tmp_home) -> None:
@@ -808,6 +911,30 @@ def test_the_status_surface_reads_the_journal(tmp_home, monkeypatch, tmp_path) -
     assert _cordon_stall_suffix({}) == ""
 
 
+def test_the_status_surface_honors_a_non_default_max_deferrals(
+    tmp_home, monkeypatch, tmp_path
+) -> None:
+    """Same non-blocking fix-review finding as the `release cordon` listing,
+    for `coord status`'s copy of the suffix: 4 deferrals journalled at the
+    operator's own `--cordon-max-deferrals 10` must not read as "NOT
+    DRAINING" just because `DEFAULT_MAX_DEFERRALS` is 2."""
+    from coord.commands.status import _cordon_stall_suffix
+
+    state_dir = _stub_state_dir(monkeypatch, tmp_path)
+    for _ in range(4):
+        rp.append_record(
+            state_dir,
+            rp.PropagationRecord(
+                started_at=1.0, target_version="0.5.77",
+                status=rp.STATUS_DEFERRED,
+                cordons={"cordoned": ["laptop", "server"], "max_deferrals": 10},
+            ),
+        )
+    mp.local_set_cordon("server", target_version="0.5.77")
+
+    assert _cordon_stall_suffix(mp.local_cordons()) == " (deferred 4 runs)"
+
+
 def test_the_cordon_listing_names_the_stall_and_the_self_release(
     tmp_home, monkeypatch, tmp_path
 ) -> None:
@@ -831,6 +958,37 @@ def test_the_cordon_listing_names_the_stall_and_the_self_release(
     assert listed.exit_code == 0, listed.output
     assert "deferred 3 runs — NOT DRAINING" in listed.output
     assert "#2240" in listed.output
+
+
+def test_the_cordon_listing_honors_a_non_default_max_deferrals(
+    tmp_home, monkeypatch, tmp_path
+) -> None:
+    """Non-blocking fix-review finding on #2240: `coord release cordon`'s
+    stall line (and `coord status`'s `_cordon_stall_suffix`, sharing the same
+    helper) used to always compare against the hardcoded
+    `DEFAULT_MAX_DEFERRALS` (2), regardless of the `--cordon-max-deferrals`
+    an operator actually ran propagate with. Three consecutive deferrals
+    journalled at the operator's own bound of 5 must NOT read as "NOT
+    DRAINING" — `plan_cordons` will not actually release for two more runs."""
+    state_dir = _stub_state_dir(monkeypatch, tmp_path)
+    for _ in range(3):
+        rp.append_record(
+            state_dir,
+            rp.PropagationRecord(
+                started_at=1.0, target_version="0.5.77",
+                status=rp.STATUS_DEFERRED,
+                cordons={"cordoned": ["laptop", "server"], "max_deferrals": 5},
+            ),
+        )
+    mp.local_set_cordon("server", target_version="0.5.77")
+
+    listed = CliRunner().invoke(main, ["release", "cordon"])
+    assert listed.exit_code == 0, listed.output
+    assert "deferred 3 runs" in listed.output
+    assert "NOT DRAINING" not in listed.output, (
+        "this read as stalled pre-fix — describe_deferral_pressure() always "
+        "used DEFAULT_MAX_DEFERRALS (2) instead of the run's own 5"
+    )
 
 
 def test_the_cordon_listing_is_quiet_during_a_normal_drain(
