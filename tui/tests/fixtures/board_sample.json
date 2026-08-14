@@ -240,6 +240,7 @@
       "reason_at": null,
       "repo_name": "claude-coordinator",
       "resume_when": "",
+      "resumes": 0,
       "session_name": null,
       "state": "waiting"
     },
@@ -265,6 +266,7 @@
       "reason_at": null,
       "repo_name": "claude-coordinator",
       "resume_when": "",
+      "resumes": 0,
       "session_name": null,
       "state": "waiting"
     }

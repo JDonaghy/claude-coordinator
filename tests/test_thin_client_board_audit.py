@@ -188,7 +188,20 @@ COMMANDS_ALLOWLIST: dict[str, set[tuple[str, str]]] = {
     # else, #1870) ever reaches the local read. Read-only: no save_board, and
     # the whole block is wrapped in a fail-soft `except Exception: return {}`
     # that degrades to the pre-#2182 ceiling rather than to a wedge.
-    "drive_queue.py": {("_fetch_live_ci_gate", "load_board")},
+    # #2230-guarded: `_fetch_live_blocked_gate` is the same shape for the same
+    # reason, one queue state over — it re-derives a `blocked` entry's merge
+    # gate live so a gate that has since cleared can resume the entry, instead
+    # of leaving `blocked` terminal (quadraui#309 sat there ~11h on a merge
+    # that read READY). Identical guard, identical placement: the
+    # `if resolve_board_service() is not None: return {}` early return sits
+    # ABOVE the `from coord.state import load_board` import, so a thin client
+    # returns before the module-level read is even imported, let alone called.
+    # Also read-only and wrapped in the same fail-soft `except Exception:
+    # return {}`, which degrades to `plan_tick`'s board-only fallback.
+    "drive_queue.py": {
+        ("_fetch_live_ci_gate", "load_board"),
+        ("_fetch_live_blocked_gate", "load_board"),
+    },
     # #1337: `coord test` no longer calls save_board at all — the verdict is
     # recorded via the single-row `record_test_verdict` on both paths (it
     # self-routes to the daemon when board_service is set), so test_gate.py
