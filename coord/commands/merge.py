@@ -350,7 +350,12 @@ def _sweep_sibling_conflicts(events, items, config, gh_ops, *, dry_run: bool) ->
        still refuses a duplicate. Routed through that function rather than
        calling ``dispatch_conflict_fix`` directly for the reason #2231 gives:
        a second dispatch site with its own copy of those guards is how they
-       drift apart.
+       drift apart. That dispatch call can advance ``ev.entry.state`` a
+       second time (e.g. to ``HUMAN_REQUIRED`` on a retry-cap hit) — this
+       function persists that too, scoped to just the swept entries, so a
+       sibling this caller doesn't hold in ``items`` (the ``--only`` path)
+       doesn't have its escalation silently dropped on the floor while the
+       audit log claims it happened (#2246 review).
 
     Skipped entirely under ``--dry-run`` — ``process()`` emits ``merged``
     events there too, but nothing actually landed, so no sibling's mergeability
@@ -380,6 +385,30 @@ def _sweep_sibling_conflicts(events, items, config, gh_ops, *, dry_run: bool) ->
             f"{ev.message}"
         )
     _dispatch_conflict_fixes(sweep_events, config, dry_run=False)
+    # #2246 review: `_dispatch_conflict_fixes` can advance a swept sibling's
+    # state a second time in place — e.g. `entry.state = HUMAN_REQUIRED` when
+    # `has_prior_conflict_fix` finds this sibling already burned a
+    # conflict-fix attempt against an earlier conflict. `mq.sweep_sibling_
+    # conflicts` above already persisted its own CONFLICT write, but for a
+    # sibling this caller doesn't hold in `items` (the `--only` path, the
+    # exact one #2246 targets), nothing after that dispatch call ever writes
+    # the newer HUMAN_REQUIRED back — `merge()`'s own final save keys only on
+    # `only_entry`. Without this, the audit log records "manual resolution
+    # required" while the board/queue still say CONFLICT: the split-brain
+    # class this repo's CLAUDE.md calls out (#1832/#2085). Persist here,
+    # scoped to just the entries this sweep touched — never the full queue —
+    # so a fresh conflict elsewhere isn't clobbered.
+    if sweep_events:
+        try:
+            fresh = _mq.load_queue()
+            by_id = {ev.entry.assignment_id: ev.entry for ev in sweep_events}
+            _mq.save_queue([by_id.get(x.assignment_id, x) for x in fresh])
+        except Exception as e:  # noqa: BLE001 — fail open, per the sweep's own contract
+            click.echo(
+                "  sibling-conflict fix-dispatch state failed to persist "
+                f"(merge itself is unaffected): {e!r}",
+                err=True,
+            )
     return sweep_events
 
 
