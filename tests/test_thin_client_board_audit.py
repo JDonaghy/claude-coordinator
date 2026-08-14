@@ -170,6 +170,18 @@ COMMANDS_ALLOWLIST: dict[str, set[tuple[str, str]]] = {
         # `merge`'s own `load_board` above.
         ("_apply_revalidation", "load_board"),
     },
+    # #2182-guarded: `_fetch_live_ci_gate` re-derives a `parked` entry's merge
+    # gate live on the drive-queue tick (instead of waiting out the 45-minute
+    # PARK_STALE_SECONDS ceiling), and needs a board to hand
+    # `merge_queue.entry_gate_status`. The call is behind an explicit
+    # `if resolve_board_service() is not None: return {}` early return —
+    # the inverted form of dispatch_workers.py's `if svc is None:` guard
+    # below — so a thin client returns before importing or calling it, and
+    # only the daemon host (`coord drive-queue tick` runs there and nowhere
+    # else, #1870) ever reaches the local read. Read-only: no save_board, and
+    # the whole block is wrapped in a fail-soft `except Exception: return {}`
+    # that degrades to the pre-#2182 ceiling rather than to a wedge.
+    "drive_queue.py": {("_fetch_live_ci_gate", "load_board")},
     # #1337: `coord test` no longer calls save_board at all — the verdict is
     # recorded via the single-row `record_test_verdict` on both paths (it
     # self-routes to the daemon when board_service is set), so test_gate.py
