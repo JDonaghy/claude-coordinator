@@ -129,6 +129,16 @@ def test_workflow_and_docs_together_still_ship_nothing():
     assert not ships_code([".github/workflows/test.yml", "docs/AGENT_OPERATIONS.md"])
 
 
+def test_ci_acceptance_config_only_ships_nothing():
+    """#2180: `.github/coord-ci-acceptance.yml` is a CI-only coordinator.yml
+    fragment read by a `.github/workflows/*.yml` step's `coord acceptance
+    run --config` — same reasoning as the sibling `.github/workflows/` and
+    `.githooks/` prefixes immediately above: it's consumed by a workflow
+    run, never shipped to any wheel, binary, or host's unit directory, so a
+    tag changes nothing about what a CI run sees."""
+    assert not ships_code([".github/coord-ci-acceptance.yml"])
+
+
 def test_tui_only_still_ships():
     """#2081 asked, explicitly, whether a `tui/`-only merge should keep
     driving a PyPI/expected-version bump given coord-tui has no remote

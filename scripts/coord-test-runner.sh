@@ -480,6 +480,50 @@ CARGO_SEARCHED='PATH, ${CARGO_HOME:-$HOME/.cargo}/bin/cargo, `rustup which cargo
 
 # ── python ───────────────────────────────────────────────────────────────────
 
+# #2180 (review fix): run the sealed cli-pytest acceptance route (ms-37)
+# through the SAME #2164 `--ci` wrapper CI's `test` job uses
+# (.github/workflows/test.yml's "coord acceptance run --all --ci
+# (cli-pytest route, ms-37)" step), instead of just excluding it. Excluding
+# it outright (the original #2180 change) left a gap the reviewer caught:
+# an `expected_red`-listed test that unexpectedly PASSES (the #1965
+# vacuous-assertion case #2164 exists to catch) would be silently waved
+# through by the Test stage — it never ran that suite at all — while CI's
+# `test` job (no continue-on-error on this step) correctly reddens for the
+# same branch. That is exactly the "Test stage tolerates what CI rejects"
+# split the issue's acceptance criteria forbid. The wrapper is what closes
+# it: `--ci` still tolerates a red-by-design slice (so a concurrent branch
+# isn't punished for someone else's in-flight fix, the quadraui#554/#490
+# failure mode #2180 exists to close) while turning a test that passes when
+# it shouldn't into a hard failure.
+#
+# Deliberately no `--config`: unlike CI (a GitHub Actions runner with no
+# access to the fleet's coordinator.yml, hence the CI-only
+# .github/coord-ci-acceptance.yml fragment), this script runs ON the
+# daemon host, whose real ~/.coord/coordinator.yml already declares
+# `acceptance.drivers.claude-coordinator`'s routes — the CI-only fragment's
+# own header says it mirrors them verbatim. `coord acceptance run`'s
+# default `--config` resolution ($COORD_CONFIG -> ~/.coord/coordinator.yml
+# -> ./coordinator.yml) picks that up the same way every other `coord`
+# invocation on this host does.
+#
+# Called only after the ordinary suite above has already passed (or been
+# judged a tolerated flake) — same order CI enforces implicitly by running
+# this as a later, unguarded step: a genuinely broken ordinary suite must
+# not be masked by (or additionally blamed on) the acceptance route.
+run_python_acceptance_ci() {
+    local venv="$1"
+    local acc_out="$WT/.pytest-acceptance.out"
+    log "running: coord acceptance run --all --ci (cli-pytest route, ms-37)"
+    if ("$venv/bin/coord" acceptance run --repo claude-coordinator --all --ci \
+            --for-path coord/cli.py --path "$WT") >"$acc_out" 2>&1; then
+        say "PASS(python): ordinary suite + sealed acceptance suite (ms-37, cli-pytest) both green"
+        return 0
+    fi
+    say "FAIL(python): sealed acceptance suite (cli-pytest route, ms-37) failed under --ci — either a test-id NOT listed in expected_red failed for real, or one listed in expected_red unexpectedly passed (see .github/workflows/test.yml's 'A red result here is attributable, not a mystery' step for the two-cause triage)"
+    tail -n 40 "$acc_out" | sed 's/^/      /'
+    return 1
+}
+
 run_python() {
     local venv="$WT/.venv"
     if [[ ! -x "$venv/bin/python" ]]; then
@@ -510,22 +554,26 @@ run_python() {
     local out="$WT/.pytest.out"
     log "running: pytest -q ${par[*]:-(serial)} (full suite)"
     # #2180: --ignore=tests/acceptance — the sealed oracle-loop suite
-    # (tests/acceptance/ms-NN/) is gated by CI's `coord acceptance run --all
-    # --ci` (#2164) instead, which honours each ms-NN/manifest.yml's
-    # `expected_red:` registry. Left in here, a red-by-design slice would
-    # fail the Test stage for every concurrent branch in the repo, not just
-    # the one the slice belongs to (the quadraui#554/#490 failure mode #2180
-    # exists to close). Matches CI's own .github/workflows/test.yml split —
-    # same reasoning applies verbatim, see that file's comments. ms-33/ms-38
+    # (tests/acceptance/ms-NN/) is split out of the ORDINARY suite here and
+    # gated separately, below, through `coord acceptance run --all --ci`
+    # (#2164, run_python_acceptance_ci — see its header comment), which
+    # honours each ms-NN/manifest.yml's `expected_red:` registry. Left in
+    # this plain `pytest` invocation, a red-by-design slice would fail the
+    # Test stage for every concurrent branch in the repo, not just the one
+    # the slice belongs to (the quadraui#554/#490 failure mode #2180 exists
+    # to close). Matches CI's own .github/workflows/test.yml split — same
+    # reasoning applies verbatim, see that file's comments. ms-33/ms-38
     # (Rust) and ms-51 (Playwright) were already outside this pytest arm's
     # reach; ms-37 (plain .py files under testpaths=["tests"]) was the one
-    # accidental gap.
+    # accidental gap — and the one this arm still covers, just through the
+    # wrapper instead of directly.
     #
     # ${par[@]+...} so an empty array is not an unbound-variable error under
     # `set -u` on older bash.
     if (cd "$WT" && "$venv/bin/python" -m pytest -q --tb=short --ignore=tests/acceptance ${par[@]+"${par[@]}"}) >"$out" 2>&1; then
-        say "PASS(python): $(grep -oE '[0-9]+ passed[^)]*' "$out" | tail -1)"
-        return 0
+        log "ordinary suite: $(grep -oE '[0-9]+ passed[^)]*' "$out" | tail -1)"
+        run_python_acceptance_ci "$venv"
+        return $?
     fi
 
     # A collection/import error is never a flake — the suite could not even run.
@@ -551,7 +599,8 @@ run_python() {
         say "FLAKE(python): $count test(s) failed in the full run but PASS in isolation"
         printf '%s\n' "$failed" | sed 's/^/      /'
         FLAKES+=("python:$count")
-        return 0
+        run_python_acceptance_ci "$venv"
+        return $?
     fi
 
     # Not a flake. Before calling it the branch's fault, ask the question the
@@ -577,6 +626,43 @@ run_python() {
 }
 
 # ── rust / coord-tui ─────────────────────────────────────────────────────────
+
+# #2180 (review fix): attempt the sealed tui-tuidriver acceptance route
+# (ms-33/ms-38) through the #2164 `--ci` wrapper, same shape as
+# run_python_acceptance_ci above — but NON-BLOCKING, deliberately, to match
+# .github/workflows/cargo-test.yml's own step, which carries
+# `continue-on-error: true` (STEP level, not job level — see that file's
+# comment for why). That workflow's continue-on-error is itself temporary:
+# running this route for the first time (2026-08-14) surfaced six
+# pre-existing failures that predate #2180 and aren't yet declared in
+# either manifest's `expected_red:` — writing that is the test-author
+# role's job (#2191), not this fix's, since tests/acceptance/ and its
+# manifest.yml files are sealed paths.
+#
+# NOTE(follow-up needed): unlike the `windows` job's non-blocking gap
+# (tracked as #1156), this one has no tracking issue yet — file one so
+# "REVISIT" doesn't quietly become permanent (review nit on #2180).
+#
+# Until that lands, blocking the Test stage on this route while CI itself
+# doesn't block on it would be the OPPOSITE split from the one #2180 exists
+# to close (Test stage rejecting what CI tolerates) — so this call reports
+# its result visibly but never fails the suite. Once the six failures above
+# are triaged (declared expected_red or fixed), both this function and
+# cargo-test.yml's continue-on-error should be dropped together.
+run_rust_acceptance_ci() {
+    local acc_out="$WT/.cargo-acceptance.out"
+    log "running: coord acceptance run --all --ci (tui-tuidriver route, ms-33/ms-38) — non-blocking, see comment above"
+    # RUSTC_BOOTSTRAP=1 is set by the driver's own `run:` command (see
+    # .github/coord-ci-acceptance.yml's tui-tuidriver route) — not needed
+    # here.
+    if (coord acceptance run --repo claude-coordinator --all --ci \
+            --for-path tui/src/main.rs --path "$WT") >"$acc_out" 2>&1; then
+        say "ACCEPTANCE(rust, non-blocking): sealed suite (ms-33/ms-38, tui-tuidriver) green under --ci"
+    else
+        say "ACCEPTANCE(rust, non-blocking): sealed suite (ms-33/ms-38, tui-tuidriver) red under --ci — NOT failing the Test stage (matches cargo-test.yml's continue-on-error, see run_rust_acceptance_ci's header comment)"
+        tail -n 40 "$acc_out" | sed 's/^/      /'
+    fi
+}
 
 run_rust() {
     # Resolve the toolchain BEFORE the symlink/build work: a missing cargo is
@@ -614,11 +700,13 @@ run_rust() {
     # excludes the sealed tui-tuidriver acceptance target — its `acceptance`
     # test has `required-features = ["test-support"]` in tui/Cargo.toml, so
     # cargo silently skips building it without that flag. That suite is
-    # gated separately, through CI's `coord acceptance run --all --ci`
-    # (.github/workflows/cargo-test.yml) — deliberately not duplicated here,
-    # same reasoning as the pytest --ignore=tests/acceptance above.
+    # attempted separately below, through run_rust_acceptance_ci — see its
+    # header comment for why that call is non-blocking (matches
+    # cargo-test.yml's continue-on-error) rather than duplicated here as a
+    # hard gate.
     if (cd "$WT/tui" && "$cargo" test) >"$out" 2>&1; then
         say "PASS(rust): $(grep -oE '[0-9]+ passed[^;]*' "$out" | head -1)"
+        run_rust_acceptance_ci
         return 0
     fi
 
@@ -654,6 +742,7 @@ run_rust() {
         say "FLAKE(rust): $count test(s) failed under full parallelism but PASS isolated (#1260 class)"
         printf '%s\n' "$failed" | sed 's/^/      /'
         FLAKES+=("rust:$count")
+        run_rust_acceptance_ci
         return 0
     fi
 

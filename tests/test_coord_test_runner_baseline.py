@@ -119,6 +119,24 @@ fi
 exit 0
 """
 
+#: A bash stand-in for `coord`, placed at `$WT/.venv/bin/coord` — exactly
+#: where `run_python_acceptance_ci` (#2180 review fix) looks for it after a
+#: green (or flake-tolerated) pytest run, to run the sealed cli-pytest
+#: acceptance route through `coord acceptance run --all --ci`. Without this
+#: stub every test below that reaches a PASS/FLAKE verdict would fail with
+#: "No such file or directory" the moment that call fires, since the fake
+#: venv planted by the `repo` fixture is bash, not a real `pip install -e
+#: .[dev]`. Records its argv (one line per invocation) to
+#: `$FAKE_COORD_ARGV_LOG` when set, so tests can assert on the exact
+#: `coord acceptance run` invocation shape, and exits `$FAKE_ACCEPTANCE_EXIT`
+#: (default 0 — green) to simulate the sealed suite's `--ci` verdict.
+_FAKE_COORD = r"""#!/usr/bin/env bash
+if [[ -n "${FAKE_COORD_ARGV_LOG:-}" ]]; then
+    printf '%s\n' "$*" >> "$FAKE_COORD_ARGV_LOG"
+fi
+exit "${FAKE_ACCEPTANCE_EXIT:-0}"
+"""
+
 
 def _git(cwd: Path, *args: str) -> str:
     return subprocess.run(
@@ -159,6 +177,10 @@ def repo(tmp_path: Path) -> Path:
     fake = venv_bin / "python"
     fake.write_text(_FAKE_PYTHON)
     fake.chmod(fake.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+    fake_coord = venv_bin / "coord"
+    fake_coord.write_text(_FAKE_COORD)
+    fake_coord.chmod(fake_coord.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     return r
 
 
@@ -362,3 +384,64 @@ def test_a_flake_is_still_a_flake_and_never_consults_the_baseline(repo: Path) ->
     assert "FLAKE(python)" in result.stdout
     assert "RESULT: PASS" in result.stdout
     assert "baseline:" not in result.stdout + result.stderr
+
+
+# ── #2180 review fix: the Test stage must agree with CI on tests/acceptance ─
+#
+# Before this fix, `--ignore=tests/acceptance` dropped the sealed cli-pytest
+# route (ms-37) from the Test stage entirely, with nothing replacing it —
+# so a test-id listed in some ms-NN/manifest.yml's `expected_red:` that
+# unexpectedly PASSED (the #1965 vacuous-assertion case) would be silently
+# waved through here while CI's `test` job (which does run the #2164 `--ci`
+# wrapper, no continue-on-error) correctly reddened for the identical
+# branch. These two tests pin that the Test stage now runs the SAME wrapper
+# CI does, and that its result actually gates the python arm.
+
+
+def test_a_passing_python_suite_also_runs_the_acceptance_ci_wrapper(repo: Path, tmp_path: Path) -> None:
+    """Any path through `run_python` that reaches a PASS/FLAKE verdict must
+    invoke `coord acceptance run --all --ci` for this repo's cli-pytest
+    route (ms-37) — not just the ordinary `--ignore=tests/acceptance` suite
+    — with the same `--repo`/`--all`/`--ci` contract CI's own `test` job
+    step uses (tests/test_ci_acceptance_gate_1950.py pins that contract for
+    the workflow file; this pins it for the Test stage's engine).
+
+    Uses the same `FAKE_RERUN_PASSES` flake path as the precedence test
+    above to reach a PASS — the fake `python` stub's full (non-targeted)
+    run always reports failures first, same as a real flaky suite; only
+    the isolated re-run can report green."""
+    argv_log = tmp_path / "coord-argv.log"
+    result = _run(repo, FAKE_RERUN_PASSES="1", FAKE_COORD_ARGV_LOG=str(argv_log))
+
+    assert result.returncode == 0
+    assert "RESULT: PASS" in result.stdout
+
+    assert argv_log.exists(), (
+        "the python arm never invoked the fake `coord` at all — "
+        "run_python_acceptance_ci did not run"
+    )
+    invocation = argv_log.read_text().strip()
+    assert "acceptance run" in invocation
+    assert "--repo claude-coordinator" in invocation
+    assert "--all" in invocation
+    assert "--ci" in invocation
+
+
+def test_a_red_acceptance_ci_wrapper_fails_the_python_arm(repo: Path) -> None:
+    """The whole point of wiring the wrapper in: when `coord acceptance run
+    --all --ci` reports non-green (a test NOT in `expected_red` failed, or
+    one listed in it unexpectedly passed), that must fail the Test stage —
+    exactly as it fails CI's `test` job, which carries no
+    continue-on-error on this step. Excluding tests/acceptance with no
+    replacement call (the pre-fix state) could never produce this result no
+    matter what the sealed suite did.
+
+    `FAKE_RERUN_PASSES=1` gets the ordinary suite to green first, so the
+    FAIL asserted below is attributable to the acceptance wrapper alone,
+    not to the ordinary suite's own (unrelated) failure path."""
+    result = _run(repo, FAKE_RERUN_PASSES="1", FAKE_ACCEPTANCE_EXIT="1")
+
+    assert result.returncode == 1
+    assert "RESULT: FAIL (python)" in result.stdout
+    assert "FAIL(python)" in result.stdout
+    assert "acceptance" in result.stdout.lower()
