@@ -3197,3 +3197,146 @@ class TestMergeGateChecksAbsent:
         assert real_result.exit_code == 0, real_result.output
         merge_fn.assert_called_once()
         assert mq.load_queue()[0].state == mq.MERGED
+
+
+# ── #2246: the CLI's post-merge sibling sweep wrapper ────────────────────────
+
+class TestSweepSiblingConflictsWrapper:
+    """`coord merge`'s half of #2246: echo what the sweep found and route it
+    into the SAME `_dispatch_conflict_fixes` call a live merge failure makes,
+    so #241's retry cap / in-flight guard keep living in one place."""
+
+    def _entry(self, aid: str = "s", *, pr: int = 101) -> mq.QueuedMerge:
+        return mq.QueuedMerge(
+            assignment_id=aid,
+            repo_name="api",
+            repo_github="acme/api",
+            branch=f"worker/{aid}",
+            target_branch="main",
+            issue_number=309,
+            issue_title="t",
+            state=mq.CONFLICT,
+            pr_number=pr,
+            error="merge conflict: GitHub reports PR #101 as CONFLICTING",
+        )
+
+    def test_sweep_events_are_echoed_and_dispatched(self) -> None:
+        from coord.commands import merge as merge_cmd
+
+        entry = self._entry()
+        sweep_events = [mq.MergeEvent(entry, "conflict", "became CONFLICTING")]
+
+        with patch.object(
+            merge_cmd, "_dispatch_conflict_fixes"
+        ) as dispatch, patch.object(
+            mq, "sweep_sibling_conflicts", return_value=sweep_events
+        ):
+            out = merge_cmd._sweep_sibling_conflicts(
+                ["merged-event"], [entry], object(), object(), dry_run=False,
+            )
+
+        assert out == sweep_events
+        dispatch.assert_called_once()
+        assert dispatch.call_args[0][0] == sweep_events
+        assert dispatch.call_args[1]["dry_run"] is False
+
+    def test_dry_run_never_sweeps(self) -> None:
+        """`process()` emits `merged` events under --dry-run too, but nothing
+        landed — so no sibling's mergeability can have changed and marking one
+        would write a lie into the queue."""
+        from coord.commands import merge as merge_cmd
+
+        with patch.object(mq, "sweep_sibling_conflicts") as sweep, \
+             patch.object(merge_cmd, "_dispatch_conflict_fixes") as dispatch:
+            out = merge_cmd._sweep_sibling_conflicts(
+                ["merged-event"], [], object(), object(), dry_run=True,
+            )
+
+        assert out == []
+        sweep.assert_not_called()
+        dispatch.assert_not_called()
+
+    def test_a_sweep_failure_never_propagates(self) -> None:
+        """#2246: "Fail open: a read error must not block the merge that
+        triggered the sweep." The merge already succeeded by this point."""
+        from coord.commands import merge as merge_cmd
+
+        with patch.object(
+            mq, "sweep_sibling_conflicts", side_effect=RuntimeError("boom")
+        ), patch.object(merge_cmd, "_dispatch_conflict_fixes") as dispatch:
+            out = merge_cmd._sweep_sibling_conflicts(
+                ["merged-event"], [], object(), object(), dry_run=False,
+            )
+
+        assert out == []
+        dispatch.assert_not_called()
+
+
+class TestMergeSweepsSiblingsEndToEnd:
+    """Black-box acceptance (#2246): two branches on one base; merge the
+    first; the second is reported conflicted immediately — the exact shape
+    that cost four terminal `blocked` entries on 2026-08-14."""
+
+    def _config(self, tmp_path: Path) -> Path:
+        cfg = tmp_path / "coordinator.yml"
+        cfg.write_text(CONFIG_YAML)
+        return cfg
+
+    def _seed(self) -> tuple[mq.QueuedMerge, mq.QueuedMerge]:
+        first = mq.QueuedMerge(
+            assignment_id="a-307", repo_name="api", repo_github="acme/api",
+            branch="worker/307", target_branch="main", issue_number=307,
+            issue_title="first", state=mq.PENDING, pr_number=307, size=10,
+        )
+        second = mq.QueuedMerge(
+            assignment_id="a-309", repo_name="api", repo_github="acme/api",
+            branch="worker/309", target_branch="main", issue_number=309,
+            issue_title="second", state=mq.PENDING, pr_number=309, size=20,
+        )
+        mq.save_queue([first, second])
+        return first, second
+
+    def test_sibling_is_reported_conflicted_right_after_the_merge(
+        self, tmp_path: Path, coord_db
+    ) -> None:
+        cfg = self._config(tmp_path)
+        self._seed()
+
+        # Only #307 merges this pass (#309 is held back by `--only`), and
+        # GitHub reports #309 CONFLICTING the moment it does.
+        with patch("coord.github_ops.merge_pr", return_value=(True, "ok")), \
+             patch("coord.github_ops.check_pr_mergeable", return_value=False), \
+             patch("coord.commands.merge._dispatch_conflict_fixes") as dispatch:
+            result = CliRunner().invoke(
+                main, ["merge", "--config", str(cfg), "--only", "a-307"],
+            )
+
+        assert result.exit_code == 0, result.output
+        rows = {x.assignment_id: x for x in mq.load_queue()}
+        assert rows["a-307"].state == mq.MERGED
+        # The sibling now says CONFLICT — not "smoke gate — test verdict
+        # stale", not "checks_failed … (unknown)".
+        assert rows["a-309"].state == mq.CONFLICT
+        assert mq.classify_conflict(rows["a-309"].error) == "rebaseable"
+        assert "#307" in rows["a-309"].error
+        # ...and it was handed to #241's dispatch path, not left for a human
+        # to find with `coord fix --force`.
+        dispatched = dispatch.call_args_list[-1][0][0]
+        assert [ev.entry.assignment_id for ev in dispatched] == ["a-309"]
+
+    def test_clean_sibling_is_untouched_by_the_merge(
+        self, tmp_path: Path, coord_db
+    ) -> None:
+        cfg = self._config(tmp_path)
+        self._seed()
+
+        with patch("coord.github_ops.merge_pr", return_value=(True, "ok")), \
+             patch("coord.github_ops.check_pr_mergeable", return_value=True):
+            result = CliRunner().invoke(
+                main, ["merge", "--config", str(cfg), "--only", "a-307"],
+            )
+
+        assert result.exit_code == 0, result.output
+        rows = {x.assignment_id: x for x in mq.load_queue()}
+        assert rows["a-309"].state == mq.PENDING
+        assert rows["a-309"].error is None

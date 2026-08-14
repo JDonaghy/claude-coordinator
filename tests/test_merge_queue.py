@@ -8473,3 +8473,321 @@ class TestStaleSmokeConflictProbe:
 
         assert status == mq.PLAN_BLOCKED
         assert mq.is_stale_smoke_reason(reason) is True
+
+
+# ── #2246: post-merge sibling conflict sweep ─────────────────────────────────
+
+class _SweepGh:
+    """A `gh_ops` whose `check_pr_mergeable` answers per PR, per ROUND.
+
+    `verdicts` maps PR number -> list of verdicts, consumed one per probe; the
+    last element repeats once exhausted. That's the only shape `FakeGh` can't
+    express and it's the one #2246 turns on: GitHub returns UNKNOWN (`None`)
+    for a few seconds after a merge and only then settles to CONFLICTING, so a
+    sweep that believes the first read is a sweep that reports nothing.
+    """
+
+    def __init__(self, verdicts: dict[int, list[bool | None]] | None = None,
+                 raises: bool = False) -> None:
+        self.verdicts = verdicts or {}
+        self.raises = raises
+        self.calls: list[tuple[str, int]] = []
+
+    def check_pr_mergeable(self, repo: str, number: int) -> bool | None:
+        self.calls.append((repo, number))
+        if self.raises:
+            raise RuntimeError("gh exploded")
+        seq = self.verdicts.get(number)
+        if not seq:
+            return None
+        return seq.pop(0) if len(seq) > 1 else seq[0]
+
+
+def _sweep_entry(aid: str, *, pr: int, state: str = PENDING, issue: int = 1,
+                 repo_github: str = "acme/api", target: str = "main",
+                 error: str | None = None) -> QueuedMerge:
+    e = _q(aid, repo_github=repo_github, target=target, state=state, pr=pr)
+    e.issue_number = issue
+    e.error = error
+    return e
+
+
+def _merged_event(entry: QueuedMerge) -> mq.MergeEvent:
+    return mq.MergeEvent(entry, "merged", "merged via rebase")
+
+
+class TestSweepSiblingConflicts:
+    """#2246: nothing re-checked sibling PRs after a merge, so a branch that
+    GitHub *already knew* was CONFLICTING presented as "smoke gate — test
+    verdict stale" (quadraui #306/#309) or "checks_failed … (unknown)"
+    (claude-coordinator #2234) and burned two drive attempts each."""
+
+    def test_sibling_broken_by_the_merge_is_parked_as_a_conflict(self) -> None:
+        """The black-box acceptance: two branches on one base, merge the
+        first, the second is reported conflicted immediately — no drive
+        attempt spent discovering it as some other gate's failure."""
+        merged = _sweep_entry("m", pr=100, state=MERGED, issue=307)
+        sibling = _sweep_entry("s", pr=101, issue=309)
+        gh = _SweepGh({101: [False]})
+
+        out = mq.sweep_sibling_conflicts(
+            [_merged_event(merged)], [merged, sibling], gh, persist=False,
+        )
+
+        assert [ev.kind for ev in out] == ["conflict"]
+        assert out[0].entry is sibling
+        assert sibling.state == CONFLICT
+        # The whole point of the error text: #241's classifier must route it.
+        assert mq.classify_conflict(sibling.error) == "rebaseable"
+        assert "CONFLICTING" in sibling.error
+        # ...and it must name the merge that broke it, the fact a human had
+        # to reconstruct by hand in both 2026-08-14 collisions.
+        assert "#307" in sibling.error
+        assert gh.calls == [("acme/api", 101)]
+
+    def test_a_clean_sibling_is_left_alone(self) -> None:
+        merged = _sweep_entry("m", pr=100, state=MERGED)
+        sibling = _sweep_entry("s", pr=101, issue=2)
+        gh = _SweepGh({101: [True]})
+
+        out = mq.sweep_sibling_conflicts(
+            [_merged_event(merged)], [merged, sibling], gh, persist=False,
+        )
+
+        assert out == []
+        assert sibling.state == PENDING
+        assert sibling.error is None
+
+    def test_already_conflicting_entry_is_untouched(self) -> None:
+        """#2246: "A PR already conflicting before the merge is untouched."
+        CONFLICT is the queue's durable record of exactly that, so the entry
+        is never even probed — otherwise every merge in the repo would
+        re-dispatch a conflict-fix for it forever."""
+        merged = _sweep_entry("m", pr=100, state=MERGED)
+        parked = _sweep_entry("s", pr=101, issue=2, state=CONFLICT,
+                              error="merge conflict from an earlier attempt")
+        gh = _SweepGh({101: [False]})
+
+        out = mq.sweep_sibling_conflicts(
+            [_merged_event(merged)], [merged, parked], gh, persist=False,
+        )
+
+        assert out == []
+        assert gh.calls == []
+        assert parked.error == "merge conflict from an earlier attempt"
+
+    def test_pending_entry_already_carrying_a_conflict_error_is_not_redispatched(
+        self,
+    ) -> None:
+        """Belt-and-braces for the same transition rule: an entry can be
+        PENDING while still carrying a conflict error (a re-enqueue, a #1477
+        unpark that raced). Re-marking it on every sibling merge would be the
+        re-dispatch loop #2246 explicitly forbids."""
+        merged = _sweep_entry("m", pr=100, state=MERGED)
+        sibling = _sweep_entry("s", pr=101, issue=2,
+                              error="merge conflict: could not be rebased")
+        gh = _SweepGh({101: [False]})
+
+        out = mq.sweep_sibling_conflicts(
+            [_merged_event(merged)], [merged, sibling], gh, persist=False,
+        )
+
+        assert out == []
+        assert gh.calls == []
+
+    def test_unknown_is_retried_until_github_settles(self) -> None:
+        """#2246: "`mergeable` is not instant." GitHub computes it
+        asynchronously and returns UNKNOWN until it settles — treating the
+        first UNKNOWN as clean is the whole bug."""
+        merged = _sweep_entry("m", pr=100, state=MERGED)
+        sibling = _sweep_entry("s", pr=101, issue=2)
+        gh = _SweepGh({101: [None, None, False]})
+        slept: list[float] = []
+
+        out = mq.sweep_sibling_conflicts(
+            [_merged_event(merged)], [merged, sibling], gh,
+            sleep=slept.append, persist=False,
+        )
+
+        assert [ev.kind for ev in out] == ["conflict"]
+        assert sibling.state == CONFLICT
+        assert len(gh.calls) == 3
+        # One sleep per retry round, never before the first probe.
+        assert len(slept) == 2
+
+    def test_persistent_unknown_leaves_the_entry_pending(self) -> None:
+        """An inconclusive read is not evidence of a conflict — the retry
+        budget is bounded and running it out marks nothing (#1477's
+        fail-closed posture, pointed the other way)."""
+        merged = _sweep_entry("m", pr=100, state=MERGED)
+        sibling = _sweep_entry("s", pr=101, issue=2)
+        gh = _SweepGh({101: [None]})
+
+        out = mq.sweep_sibling_conflicts(
+            [_merged_event(merged)], [merged, sibling], gh,
+            sleep=lambda _s: None, persist=False,
+        )
+
+        assert out == []
+        assert sibling.state == PENDING
+        assert len(gh.calls) == mq.SIBLING_SWEEP_ATTEMPTS
+
+    def test_retry_budget_is_per_round_not_per_entry(self) -> None:
+        """Rounds, not per-entry loops: N unresolved siblings cost N probes
+        per round and ONE sleep, so total added wall-clock is bounded by the
+        attempt budget however long the queue is."""
+        merged = _sweep_entry("m", pr=100, state=MERGED)
+        sibs = [_sweep_entry(f"s{i}", pr=200 + i, issue=10 + i) for i in range(4)]
+        gh = _SweepGh({200 + i: [None] for i in range(4)})
+        slept: list[float] = []
+
+        mq.sweep_sibling_conflicts(
+            [_merged_event(merged)], [merged, *sibs], gh,
+            sleep=slept.append, persist=False,
+        )
+
+        assert len(slept) == mq.SIBLING_SWEEP_ATTEMPTS - 1
+        assert len(gh.calls) == 4 * mq.SIBLING_SWEEP_ATTEMPTS
+
+    def test_scoped_to_the_repo_and_base_that_actually_moved(self) -> None:
+        """#2246: "Scope to the merged repo, and only to PRs whose base is
+        the branch that just moved." """
+        merged = _sweep_entry("m", pr=100, state=MERGED)
+        other_repo = _sweep_entry("o", pr=101, issue=2, repo_github="acme/web")
+        other_base = _sweep_entry("b", pr=102, issue=3, target="develop")
+        same_base = _sweep_entry("s", pr=103, issue=4)
+        gh = _SweepGh({101: [False], 102: [False], 103: [False]})
+
+        out = mq.sweep_sibling_conflicts(
+            [_merged_event(merged)],
+            [merged, other_repo, other_base, same_base], gh, persist=False,
+        )
+
+        assert [ev.entry.assignment_id for ev in out] == ["s"]
+        assert gh.calls == [("acme/api", 103)]
+        assert other_repo.state == PENDING
+        assert other_base.state == PENDING
+
+    def test_nothing_merged_means_no_api_calls_at_all(self) -> None:
+        """Cost is one call per open PR per MERGE, not per tick — the
+        overwhelmingly common tick merges nothing and must cost nothing."""
+        entry = _sweep_entry("a", pr=100)
+        sibling = _sweep_entry("s", pr=101, issue=2)
+        gh = _SweepGh({101: [False]})
+
+        out = mq.sweep_sibling_conflicts(
+            [mq.MergeEvent(entry, "smoke_required", "stale verdict")],
+            [entry, sibling], gh, persist=False,
+        )
+
+        assert out == []
+        assert gh.calls == []
+
+    def test_entry_without_a_pr_is_skipped(self) -> None:
+        merged = _sweep_entry("m", pr=100, state=MERGED)
+        no_pr = _q("s", state=PENDING)
+        gh = _SweepGh()
+
+        out = mq.sweep_sibling_conflicts(
+            [_merged_event(merged)], [merged, no_pr], gh, persist=False,
+        )
+
+        assert out == []
+        assert gh.calls == []
+
+    def test_a_read_error_fails_open(self) -> None:
+        """#2246: "Fail open: a read error must not block the merge that
+        triggered the sweep." """
+        merged = _sweep_entry("m", pr=100, state=MERGED)
+        sibling = _sweep_entry("s", pr=101, issue=2)
+        gh = _SweepGh(raises=True)
+
+        out = mq.sweep_sibling_conflicts(
+            [_merged_event(merged)], [merged, sibling], gh,
+            sleep=lambda _s: None, persist=False,
+        )
+
+        assert out == []
+        assert sibling.state == PENDING
+
+    def test_gh_ops_without_the_probe_is_inert(self) -> None:
+        """`check_pr_mergeable` is duck-typed on GhOps — a stub predating it
+        must not crash the merge that just succeeded."""
+        class _Bare:
+            pass
+
+        merged = _sweep_entry("m", pr=100, state=MERGED)
+        sibling = _sweep_entry("s", pr=101, issue=2)
+
+        out = mq.sweep_sibling_conflicts(
+            [_merged_event(merged)], [merged, sibling], _Bare(), persist=False,
+        )
+
+        assert out == []
+        assert sibling.state == PENDING
+
+    def test_sibling_the_caller_does_not_hold_is_persisted(self, coord_db) -> None:
+        """The `--only` shape: `coord merge --only` writes back exactly one
+        entry, so a sibling this sweep parks would be lost unless the sweep
+        persists it itself."""
+        merged = _sweep_entry("m", pr=100, state=PENDING, issue=307)
+        sibling = _sweep_entry("s", pr=101, issue=309)
+        save_queue([merged, sibling])
+        merged.state = MERGED
+        gh = _SweepGh({101: [False]})
+
+        out = mq.sweep_sibling_conflicts(
+            [_merged_event(merged)], [merged], gh,
+        )
+
+        assert [ev.entry.assignment_id for ev in out] == ["s"]
+        reread = {x.assignment_id: x for x in load_queue()}
+        assert reread["s"].state == CONFLICT
+        assert mq.classify_conflict(reread["s"].error) == "rebaseable"
+
+    def test_callers_own_object_is_mutated_not_a_second_copy(
+        self, coord_db,
+    ) -> None:
+        """The caller saves its own `items` over the on-disk queue right
+        after this runs. Mutating a freshly-loaded second copy here would be
+        silently reverted by that save — the entry would read CONFLICT for
+        exactly as long as it took to write it."""
+        merged = _sweep_entry("m", pr=100, state=PENDING)
+        sibling = _sweep_entry("s", pr=101, issue=2)
+        save_queue([merged, sibling])
+        merged.state = MERGED
+        gh = _SweepGh({101: [False]})
+
+        mq.sweep_sibling_conflicts(
+            [_merged_event(merged)], [merged, sibling], gh,
+        )
+
+        assert sibling.state == CONFLICT
+        # Simulate the caller's save-over-disk step and confirm it sticks.
+        fresh = load_queue()
+        by_id = {merged.assignment_id: merged, sibling.assignment_id: sibling}
+        save_queue([by_id.get(x.assignment_id, x) for x in fresh])
+        assert {x.assignment_id: x.state for x in load_queue()}["s"] == CONFLICT
+
+    def test_error_text_never_reads_as_a_permission_problem(self) -> None:
+        """`classify_conflict` checks `_HUMAN_SIGNALS` first — an error that
+        happened to say "review required" or "permission" would escalate
+        straight to a human instead of dispatching #241's worker."""
+        merged = _sweep_entry("m", pr=100, state=MERGED, issue=307)
+        sibling = _sweep_entry("s", pr=101, issue=309)
+
+        text = mq.sibling_conflict_error(sibling, [_merged_event(merged)])
+
+        assert mq.classify_conflict(text) == "rebaseable"
+        assert mq.is_rebase_refusal(text) is False
+
+    def test_merged_bases_only_counts_actual_merges(self) -> None:
+        merged = _sweep_entry("m", pr=100, state=MERGED)
+        conflicted = _sweep_entry("c", pr=102, issue=3, target="develop")
+
+        bases = mq.merged_bases([
+            _merged_event(merged),
+            mq.MergeEvent(conflicted, "conflict", "nope"),
+        ])
+
+        assert bases == {("acme/api", "main")}

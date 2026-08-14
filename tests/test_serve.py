@@ -6671,3 +6671,115 @@ def test_wal_checkpoint_tick_honours_zero_interval(
     result = _wal_checkpoint_tick(cfg)
     assert result.get("skipped") is not True
     assert result.get("error") is not True
+
+
+# ── #2246: auto-drain sweeps siblings the drain itself just broke ────────────
+
+
+def test_auto_drain_marks_a_sibling_the_merge_just_conflicted(
+    tmp_path: "Path", rw_db, monkeypatch
+) -> None:
+    """#2246: auto-drain lands a PR, which makes a sibling PR on the same base
+    CONFLICTING — GitHub knows immediately and, before this, nothing asked.
+
+    Auto-drain (unlike a human running `coord merge`) has no other moment to
+    look: `process()` only ever touches PENDING entries the plan marks READY,
+    so the sibling would sit on whatever gate reason happened to be red until
+    a human went digging. #2246's floor is that the entry report *conflict* as
+    its blocking reason; that's what parking it at CONFLICT does.
+    """
+    from coord.config import load as load_config
+    from coord import merge_queue as mq
+    from coord.serve_app import _auto_drain_tick
+
+    monkeypatch.setattr(
+        "coord.github_ops.create_pr",
+        lambda repo, *, base, head, title, body: {
+            "number": 201, "url": "https://gh/201", "existed": False
+        },
+    )
+    monkeypatch.setattr("coord.github_ops.get_pr_size", lambda repo, number: 42)
+    monkeypatch.setattr(
+        "coord.github_ops.merge_pr",
+        lambda repo, number, method="rebase": (True, "merged"),
+    )
+    # The sibling (PR 309) is what GitHub now reports CONFLICTING.
+    monkeypatch.setattr(
+        "coord.github_ops.check_pr_mergeable", lambda repo, number: number == 201,
+    )
+    from coord.ci_store import NoOpCi as _NoOpCi
+    monkeypatch.setattr("coord.ci_store.build_ci_store", lambda t: _NoOpCi())
+
+    _seed_queued_ready_entry(rw_db)
+    # A sibling on the SAME base with an open PR, blocked on something else
+    # (no approved review) so the drain itself never touches it.
+    rw_db.execute(
+        "INSERT INTO merge_queue "
+        "(assignment_id, repo_name, repo_github, branch, target_branch, "
+        " issue_number, issue_title, state, pr_number) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        ("work-sib", "api", "acme/api", "issue-309-impl", "main", 309,
+         "Sibling", "pending", 309),
+    )
+    rw_db.commit()
+
+    drain_config_path = _make_drain_config(tmp_path, auto_drain=True)
+    monkeypatch.setenv("COORD_CONFIG", str(drain_config_path))
+    cfg = load_config(drain_config_path)
+
+    events = _auto_drain_tick(cfg)
+
+    rows = {x.assignment_id: x for x in mq.load_queue()}
+    assert rows["work-drain1"].state == mq.MERGED
+    assert rows["work-sib"].state == mq.CONFLICT
+    assert mq.classify_conflict(rows["work-sib"].error) == "rebaseable"
+    assert "#55" in rows["work-sib"].error
+    # The sweep's event joins the tick's stream, so it gets an audit row too.
+    assert any(
+        ev.kind == "conflict" and ev.entry.assignment_id == "work-sib"
+        for ev in events
+    )
+
+
+def test_auto_drain_leaves_a_clean_sibling_alone(
+    tmp_path: "Path", rw_db, monkeypatch
+) -> None:
+    """The sweep only ever acts on an explicit CONFLICTING verdict — a clean
+    sibling (and an inconclusive read) stays exactly where it was."""
+    from coord.config import load as load_config
+    from coord import merge_queue as mq
+    from coord.serve_app import _auto_drain_tick
+
+    monkeypatch.setattr(
+        "coord.github_ops.create_pr",
+        lambda repo, *, base, head, title, body: {
+            "number": 201, "url": "https://gh/201", "existed": False
+        },
+    )
+    monkeypatch.setattr("coord.github_ops.get_pr_size", lambda repo, number: 42)
+    monkeypatch.setattr(
+        "coord.github_ops.merge_pr",
+        lambda repo, number, method="rebase": (True, "merged"),
+    )
+    monkeypatch.setattr("coord.github_ops.check_pr_mergeable", lambda repo, number: True)
+    from coord.ci_store import NoOpCi as _NoOpCi
+    monkeypatch.setattr("coord.ci_store.build_ci_store", lambda t: _NoOpCi())
+
+    _seed_queued_ready_entry(rw_db)
+    rw_db.execute(
+        "INSERT INTO merge_queue "
+        "(assignment_id, repo_name, repo_github, branch, target_branch, "
+        " issue_number, issue_title, state, pr_number) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        ("work-sib", "api", "acme/api", "issue-309-impl", "main", 309,
+         "Sibling", "pending", 309),
+    )
+    rw_db.commit()
+
+    drain_config_path = _make_drain_config(tmp_path, auto_drain=True)
+    monkeypatch.setenv("COORD_CONFIG", str(drain_config_path))
+    _auto_drain_tick(load_config(drain_config_path))
+
+    rows = {x.assignment_id: x for x in mq.load_queue()}
+    assert rows["work-sib"].state == mq.PENDING
+    assert rows["work-sib"].error is None
