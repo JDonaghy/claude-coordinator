@@ -765,6 +765,30 @@ def _health_vs_config_lines(machine, health: dict) -> list[tuple[bool, str]]:
             ))
             for repo, reason in sorted(degraded.items()):
                 out.append((True, f"        {repo}: {reason}"))
+    elif declared_repos and published_repos and not config_free:
+        # #2219: the ABOVE branch only fires when /health publishes NOTHING
+        # — it silently missed the partial-drift shape that actually bit
+        # stick-demo#1: a repo added to coordinator.yml after the agent
+        # process started stays off /health's list while everything ELSE
+        # the agent publishes (including all its OTHER repos) looks
+        # perfectly healthy. `coord config`/`coord status` both read
+        # config, so both still advertised it; only the live agent —
+        # and, at dispatch cost, the drive queue that burned both retry
+        # attempts on it — knew better. Same repair as the total-mismatch
+        # case: restart coord-agent on that machine to make it re-read
+        # coordinator.yml.
+        drifted = [r for r in declared_repos if r not in published_repos]
+        if drifted:
+            out.append((
+                True,
+                f"  ✗ CRIT repos: coordinator.yml declares {declared_repos} "
+                f"but /health only advertises {published_repos} — {drifted} "
+                "were added to config after this agent process started and "
+                "it hasn't re-read them; a dispatch to any of "
+                f"{drifted} on this machine will be refused despite `coord "
+                "config`/`coord status` showing it as supported (#2219). "
+                "Restart coord-agent on this machine to pick it up.",
+            ))
 
     return out
 

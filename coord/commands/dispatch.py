@@ -89,6 +89,63 @@ def _require_interactive_tty(dry_run: bool) -> None:
     )
 
 
+def _repo_capability_refusal(
+    machine_obj: object, repo: str, *, timeout: float = 3.0
+) -> str | None:
+    """Cross-check *repo* against the target agent's LIVE ``/health`` repo
+    list, returning a refusal message when the two disagree — or ``None``
+    when they agree, the agent is unreachable, or the agent is config-free
+    (#2219).
+
+    ``assign()``'s ``machine_obj.can_work_on(repo)`` check (just above this
+    call site) only ever reads ``coordinator.yml`` — which the operator can
+    edit any time — never the agent process actually running on that
+    machine. A repo added to config after the agent started stays invisible
+    to it until a full ``systemctl --user restart coord-agent`` (there is no
+    partial re-read today). Every pre-flight surface an operator would
+    check before spending a dispatch reads config too: ``coord config``,
+    ``coord status``, and — worst of all — ``coord assign ... --dry-run``,
+    which is the documented way to sanity-check a dispatch before paying
+    for it. All three said this was fine while the live agent rejected it
+    outright, and a drive queue burned both retry attempts discovering that
+    by trial before landing terminally ``blocked`` (#2219). This is the
+    same ``/health`` read ``coord status``/``coord doctor`` already make
+    (``coord.network.check_machine``) — reused, not duplicated — compared
+    against *repo* the same way ``AgentServer.assign()`` itself does
+    (``coord/agent.py``), so the CLI message matches the one the agent
+    would have produced, just BEFORE any claim/worktree/network work runs
+    instead of after.
+
+    Deliberately narrow: only refuses when the agent is reachable, ANSWERED
+    with a real ``/health`` body, is not running config-free (#1801 — a
+    config-free agent's repos come from the dispatch payload, not its own
+    config, so an empty/mismatched list there is not a capability gap), and
+    published a NON-empty repo list that plainly excludes *repo*. Every
+    other case (offline, timeout, old agent with no ``repos`` key, empty
+    list) falls through to ``None`` — today's behavior, where the POST
+    itself is left to surface a real problem — so this never turns a
+    transient network hiccup into a new dispatch failure mode.
+    """
+    from coord.network import check_machine
+
+    status = check_machine(machine_obj, timeout=timeout)
+    if not status.is_online or status.health is None:
+        return None
+    health = status.health
+    if health.get("config_free"):
+        return None
+    live_repos = health.get("repos")
+    if not live_repos or repo in live_repos:
+        return None
+    return (
+        f"{machine_obj.name!r} rejected the assignment: this agent does "
+        f"not handle repo {repo!r} (supported: {live_repos}) — "
+        f"coordinator.yml lists it, but the live agent process hasn't "
+        f"re-read its config since {repo!r} was added (#2219). Restart "
+        f"coord-agent on {machine_obj.name!r} to pick it up, then retry."
+    )
+
+
 @click.command(help="Brain proposes assignments for idle machines.")
 @_CONFIG_OPTION
 @click.option("--dry-run", is_flag=True, help="Plan without saving proposals.")
@@ -949,6 +1006,18 @@ def assign(
             f"(has: {machine_obj.repos})",
             err=True,
         )
+        sys.exit(2)
+
+    # #2219: config says this machine handles `repo` — but the LIVE agent
+    # process may not (yet) agree, if `repo` was added to coordinator.yml
+    # after that agent started. Refuse with the agent's real reason here,
+    # before any claim/worktree/network work — including under --dry-run,
+    # which is exactly the surface that used to green-light this. See
+    # _repo_capability_refusal's docstring for the full rationale and what
+    # it deliberately does NOT block on (offline/unreachable/config-free).
+    capability_refusal = _repo_capability_refusal(machine_obj, repo)
+    if capability_refusal is not None:
+        click.echo(f"error: {capability_refusal}", err=True)
         sys.exit(2)
 
     # Refuse direct assignment to a paused machine — `coord pause` exists

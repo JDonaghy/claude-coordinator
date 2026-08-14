@@ -69,6 +69,24 @@ def _no_agent_health_probe(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_assign_repo_drift_probe(monkeypatch):
+    """#2219: default `coord assign`'s live-agent repo-capability cross-check
+    (``coord.commands.dispatch._repo_capability_refusal``) to fail-open
+    (``None`` — never refuse) so tests that don't care about it don't make a
+    real ``httpx.get(".../health")`` call keyed off whatever bogus
+    ``host.tailnet`` hostnames the fixture configs use. Mirrors
+    ``_no_agent_health_probe`` (#904) for the same reason: the suite's
+    default behavior must not depend on network/DNS timing. Tests exercising
+    the drift check itself monkeypatch this function to return a message
+    (or call the real one against a stubbed ``coord.network.check_machine``),
+    which takes priority over this default and is unaffected by it.
+    """
+    monkeypatch.setattr(
+        "coord.commands.dispatch._repo_capability_refusal", lambda *a, **k: None
+    )
+
+
+@pytest.fixture(autouse=True)
 def _no_worktree_writable_deny_scan(monkeypatch):
     """#1445 review: keep `check_worktree_writable`'s deny-rule scan from
     reading whatever `~/.claude/settings.json` happens to exist on the
