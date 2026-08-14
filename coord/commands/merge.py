@@ -218,6 +218,37 @@ def _apply_ci_revalidation(
     return deferred
 
 
+def _reload_board_after_wait(board, *, dry_run: bool):
+    """#2143: force a fresh board read after ``_apply_ci_revalidation``'s
+    ``wait_for_ci_settle`` poll — which, like ``_apply_revalidation``'s
+    composite/solo suite runs, can hold the caller for minutes.
+
+    ``_apply_revalidation`` already refreshes the board it hands back, but
+    only when *it* recorded a new verdict; it has no way to know a CI-settle
+    wait ran afterwards. Real state can change on GitHub during that wait —
+    most dangerously a review approval landing, or a concurrent merge driver
+    (the drive-queue timer, another operator) merging the exact branch this
+    run is about to act on — and `merge_queue.process()` must not evaluate
+    review/smoke gates against a *board* snapshot that predates any of it
+    (the 2026-08-12 incident: a review approved 89s into the wait was still
+    reported as unapproved because the pre-wait board was never re-read).
+
+    Unconditional (not "only when something looks stale"): the risk here is
+    a stale *read*, and there's no cheap way to tell "nothing changed" from
+    "something changed but we didn't notice" without just re-reading. One
+    extra ``load_board()`` is a rounding error next to the suite run(s) or
+    the CI-settle poll that just happened. Under ``--dry-run`` nothing was
+    triggered (no wait actually ran), so the board is left untouched.
+    """
+    if dry_run:
+        return board
+    from coord.models import Board as _Board  # noqa: PLC0415
+    from coord.state import load_board as _load_board  # noqa: PLC0415
+
+    refreshed = _load_board()
+    return refreshed if refreshed is not None else _Board(active=[], completed=[])
+
+
 def _dispatch_conflict_fixes(events, config, *, dry_run: bool) -> None:
     """#241: classify any conflict events and dispatch a conflict-fix worker
     for the eligible ones.  Mutates each conflict event's ``ev.entry.state``
@@ -1564,6 +1595,10 @@ def merge(
                 only_items, board_only, cfg_only, ci_store_only, gh_ops,
                 dry_run=dry_run,
             )
+            # #2143: the CI-settle wait just above can run for minutes —
+            # re-read the board so the gates `process()` runs below see
+            # whatever landed on GitHub during it, not the pre-wait snapshot.
+            board_only = _reload_board_after_wait(board_only, dry_run=dry_run)
         # #1925: an entry deferred by the CI-settle wait above must not go
         # through process() this pass — that would immediately re-derive the
         # exact self-triggered "unknown" reading the wait was just trying to
@@ -1870,6 +1905,10 @@ def merge(
         deferred_ci = _apply_ci_revalidation(
             pending, board, cfg, ci_store, gh_ops, dry_run=dry_run,
         )
+        # #2143: the CI-settle wait just above can run for minutes —
+        # re-read the board so the gates `process()` runs below see
+        # whatever landed on GitHub during it, not the pre-wait snapshot.
+        board = _reload_board_after_wait(board, dry_run=dry_run)
     # #1925: entries the CI-settle wait above gave up on while still only
     # seeing the registration-gap symptom must not go through process() this
     # pass — see `_apply_ci_revalidation`'s docstring. They keep their

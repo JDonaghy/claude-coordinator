@@ -2885,6 +2885,169 @@ class TestMergeRevalidateCiRerunCli:
         assert "triggered a CI re-run" in result.output
 
 
+class TestMergeRevalidateRereadsBoardAfterWait:
+    """#2143 black-box: a review approval that lands *during* the
+    ``--revalidate`` CI-settle wait must be seen by the gate that runs right
+    after — not the board snapshot loaded before the wait started.
+
+    Reproduces the 2026-08-12 incident's shape with two sibling queue
+    entries sharing one repo-wide `coord merge --revalidate` run: entry
+    ``ci1`` is blocked solely on stale CI (the thing `--revalidate` actually
+    re-runs and waits on) and entry ``rv1`` is a completely unrelated
+    PENDING entry whose review approval only exists on the board that gets
+    saved *while* the ``ci1`` wait is in flight. Before #2143 the board was
+    loaded once at the top of `coord merge` and never re-read, so `rv1`
+    would be reported `review_required` for an approval that, by the time
+    `process()` ran, had already landed.
+    """
+
+    @staticmethod
+    def _config(tmp_path: Path) -> Path:
+        p = tmp_path / "coordinator.yml"
+        p.write_text(
+            "repos:\n"
+            "  - name: api\n"
+            "    github: acme/api\n"
+            "    default_branch: main\n"
+            "machines:\n"
+            "  - name: laptop\n"
+            "    host: laptop.tailnet\n"
+            "    repos: [api]\n"
+            "    repo_paths:\n"
+            "      api: /tmp/api\n"
+            "pipeline:\n"
+            "  default_gates: [review]\n"
+            "ci_store:\n"
+            "  type: github\n"
+        )
+        return p
+
+    @staticmethod
+    def _fake_ci():
+        from types import SimpleNamespace
+
+        class _Ci:
+            is_available = True
+
+            def __init__(self):
+                self.rerun_calls: list = []
+
+            def list_checks_for_pr(self, repo, number):
+                if number == 501:
+                    # Green, but started well before the (mocked) base
+                    # commit time below — the #1851 CI-staleness signal
+                    # `--revalidate` re-runs for. Returned unchanged on
+                    # every read (including the post-rerun settle read),
+                    # so ``wait_for_ci_settle`` sees an immediately-resolved
+                    # (not in-flight) result and never actually sleeps.
+                    return [SimpleNamespace(
+                        name="build", status="completed", conclusion="success",
+                        started_at=500.0, completed_at=None,
+                    )]
+                # 502 (rv1): fresh and green — started well AFTER the mocked
+                # base commit time, so the CI gate never blocks rv1; the
+                # only thing standing between rv1 and a merge is the review
+                # gate this test is about.
+                return [SimpleNamespace(
+                    name="build", status="completed", conclusion="success",
+                    started_at=5000.0, completed_at=None,
+                )]
+
+            def rerun_for_pr(self, repo, number):
+                self.rerun_calls.append((repo, number))
+                return True
+
+        return _Ci()
+
+    @staticmethod
+    def _seed() -> None:
+        from coord.merge_queue import PENDING, QueuedMerge, save_queue
+
+        ci1 = QueuedMerge(
+            assignment_id="ci1", repo_name="api", repo_github="acme/api",
+            branch="worker/ci1", target_branch="main", issue_number=501,
+            issue_title="t", state=PENDING, pr_number=501,
+        )
+        rv1 = QueuedMerge(
+            assignment_id="rv1", repo_name="api", repo_github="acme/api",
+            branch="worker/rv1", target_branch="main", issue_number=502,
+            issue_title="t", state=PENDING, pr_number=502,
+        )
+        save_queue([ci1, rv1])
+
+    @staticmethod
+    def _board(*, rv1_approved: bool):
+        """`ci1`'s review is always approved (so it qualifies as a
+        CI-staleness-only `--revalidate` candidate); `rv1`'s approval is the
+        one that only shows up once ``rv1_approved`` — i.e. only on the
+        *second*, post-wait ``load_board()`` read once #2143's fix is in
+        place."""
+        from coord.models import Assignment, Board
+
+        reviews = [
+            Assignment(
+                machine_name="laptop", repo_name="api", issue_number=501,
+                issue_title="r", assignment_id="ci1-review", type="review",
+                status="done", review_of_assignment_id="ci1",
+                review_verdict="approve",
+            ),
+        ]
+        if rv1_approved:
+            reviews.append(Assignment(
+                machine_name="laptop", repo_name="api", issue_number=502,
+                issue_title="r", assignment_id="rv1-review", type="review",
+                status="done", review_of_assignment_id="rv1",
+                review_verdict="approve",
+            ))
+        return Board(active=[], completed=reviews)
+
+    def test_review_approved_during_the_wait_is_not_reported_stale(
+        self, tmp_path: Path, coord_db,
+    ) -> None:
+        cfg = self._config(tmp_path)
+        self._seed()
+        ci = self._fake_ci()
+        board_before = self._board(rv1_approved=False)
+        board_after = self._board(rv1_approved=True)
+
+        merge_calls: list[int] = []
+
+        def fake_merge(repo, number, method="rebase"):
+            merge_calls.append(number)
+            return True, "ok"
+
+        with patch("coord.ci_store.build_ci_store", return_value=ci), \
+             patch(
+                 "coord.github_ops.get_branch_commit_timestamp",
+                 return_value=1000.0,
+             ), \
+             patch("coord.github_ops.get_branch_patch_id", return_value=None), \
+             patch("coord.github_ops.get_pr_size", return_value=10), \
+             patch("coord.github_ops.merge_pr", side_effect=fake_merge), \
+             patch("coord.github_ops.close_issue"), \
+             patch(
+                 "coord.state.load_board",
+                 side_effect=[board_before, board_after],
+             ):
+            result = CliRunner().invoke(
+                main, ["merge", "--config", str(cfg), "--revalidate"],
+            )
+
+        assert result.exit_code == 0, result.output
+        # The CI-settle wait for ci1 actually ran (proves the repro shape —
+        # rv1's fresh approval is only visible because *something* re-read
+        # the board after this). `--revalidate`'s own trigger is the first
+        # call; `process()`'s independent #2197 auto-rerun (still-stale
+        # after the settle read) may add a second — irrelevant to this test.
+        assert ("acme/api", 501) in ci.rerun_calls
+        # The core #2143 assertion: rv1 must never be reported blocked on a
+        # stale review read, and must actually merge on the fresh one.
+        assert "review required but not approved" not in result.output
+        assert 502 in merge_calls
+        persisted = {x.assignment_id: x.state for x in mq.load_queue()}
+        assert persisted["rv1"] == mq.MERGED
+
+
 class TestMergeGateChecksAbsent:
     """#1904 black-box: `checks == []` is ambiguous — "no CI configured"
     (merge is correct) vs. "CI exists but never triggered for this PR" (a

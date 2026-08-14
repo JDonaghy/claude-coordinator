@@ -2316,6 +2316,29 @@ class GhOps(Protocol):
         """
         ...
 
+    def pr_is_merged(self, repo: str, branch: str) -> bool:
+        """True when *branch*'s current tip is a commit that already merged.
+
+        Used by :func:`process` (#2143) as the last check before opening a
+        PR for an entry with no ``pr_number`` yet — right before the
+        mutating ``create_pr`` call, not at snapshot time, so a branch
+        another merge driver (the drive-queue timer, a concurrent
+        ``coord merge``) merged out from under a long-running ``--revalidate``
+        wait is never handed a second, purposeless PR.  Unlike
+        :meth:`find_pr_for_branch` (open PRs only — ``gh pr list --state
+        open``), this resolves regardless of PR state, so "no open PR" is
+        never misread as "no PR at all".
+
+        Optional on stub ``GhOps`` implementations, same contract as
+        :meth:`branch_has_merge_commit`: callers detect support via
+        ``getattr(gh_ops, "pr_is_merged", None)`` and treat a missing method
+        (or a lookup failure) as "not merged" — fail *open* here, since the
+        cost of a false negative is the pre-#2143 status quo (an extra PR
+        that a human or the next pass closes) while a false positive would
+        silently strand real, unmerged work in a MERGED state.
+        """
+        ...
+
     def get_default_branch_head(self, repo: str, branch: str) -> str:
         """Return the full commit SHA at the tip of *branch*.
 
@@ -4105,6 +4128,29 @@ def process(
                         entry, "opened",
                         f"PR #{entry.pr_number} (existed) for {entry.branch}",
                     ))
+                    continue
+                # #2143: mirror the real path's already-merged check so a
+                # dry-run preview never claims "would open PR" for a branch
+                # another driver already merged — `find_pr_for_branch` above
+                # only ever looks at OPEN PRs, so a merged-and-closed PR is
+                # otherwise indistinguishable here from "never opened".
+                _pr_is_merged = getattr(gh_ops, "pr_is_merged", None)
+                already_merged = False
+                if _pr_is_merged is not None:
+                    try:
+                        already_merged = _pr_is_merged(
+                            entry.repo_github, entry.branch
+                        )
+                    except Exception:  # noqa: BLE001 — fail open, same
+                        # contract as the real path's check.
+                        already_merged = False
+                if already_merged:
+                    events.append(MergeEvent(
+                        entry, "already_merged",
+                        f"(dry run) {entry.branch} was already merged by "
+                        "another merge driver — would skip PR creation "
+                        "(#2143)",
+                    ))
                 else:
                     events.append(MergeEvent(
                         entry, "opened",
@@ -4354,6 +4400,37 @@ def process(
         # Open PRs first so every entry has a pr_number when we sort & merge.
         for entry in group:
             if entry.pr_number is None:
+                # #2143: re-check right here, immediately before the
+                # mutating create_pr call — not against whatever snapshot
+                # this entry was resolved from — whether another merge
+                # driver already merged this exact branch while this run
+                # was doing something else (a `--revalidate` CI-settle
+                # wait, a composite suite run, simply queueing behind a
+                # concurrent merge). `create_pr` internally only ever looks
+                # for an OPEN PR (`find_pr_for_branch`), so a branch that
+                # was merged (and its PR closed) in the meantime reads as
+                # "no PR" and would otherwise get a second, purposeless PR
+                # opened against it — the 2026-08-12 incident this closes.
+                _pr_is_merged = getattr(gh_ops, "pr_is_merged", None)
+                if _pr_is_merged is not None:
+                    try:
+                        already_merged = _pr_is_merged(
+                            entry.repo_github, entry.branch
+                        )
+                    except Exception:  # noqa: BLE001 — fail open: never
+                        # block a legitimate merge on a transient lookup
+                        # failure; worst case is the pre-#2143 status quo.
+                        already_merged = False
+                    if already_merged:
+                        entry.state = MERGED
+                        entry.error = None
+                        events.append(MergeEvent(
+                            entry, "already_merged",
+                            f"{entry.branch} was already merged by another "
+                            "merge driver while this run was in progress — "
+                            "skipping duplicate PR creation (#2143)",
+                        ))
+                        continue
                 try:
                     pr = gh_ops.create_pr(
                         entry.repo_github,

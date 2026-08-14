@@ -297,10 +297,22 @@ class FakeGh:
     # matching pre-#1624 behavior.
     existing_prs: dict[str, dict] = field(default_factory=dict)
     find_pr_calls: list[tuple[str, str]] = field(default_factory=list)
+    # #2143: branch names already merged by "another driver" — checked
+    # immediately before `create_pr` so a duplicate PR is never opened
+    # against a branch that merged while this run was mid-flight (e.g. a
+    # `--revalidate` CI-settle wait). Defaults keep every prior test (none
+    # of which set this) inert — `pr_is_merged` returns False for every
+    # branch, matching pre-#2143 behavior.
+    merged_branches: set[str] = field(default_factory=set)
+    pr_is_merged_calls: list[tuple[str, str]] = field(default_factory=list)
 
     def find_pr_for_branch(self, repo: str, branch: str) -> dict | None:
         self.find_pr_calls.append((repo, branch))
         return self.existing_prs.get(branch)
+
+    def pr_is_merged(self, repo: str, branch: str) -> bool:
+        self.pr_is_merged_calls.append((repo, branch))
+        return branch in self.merged_branches
 
     def create_pr(self, repo: str, *, base: str, head: str, title: str, body: str) -> dict:
         self.create_calls.append((repo, {"base": base, "head": head, "title": title}))
@@ -377,6 +389,59 @@ class TestProcess:
         assert merge_seq == [101, 102, 100]
         # All entries left in MERGED state
         assert {x.state for x in items} == {MERGED}
+
+    def test_skips_pr_creation_when_branch_already_merged(self) -> None:
+        # #2143: an entry with no pr_number yet (e.g. a stale in-memory
+        # snapshot resolved before another merge driver merged this exact
+        # branch, or a full `--revalidate` CI-settle wait that ran long
+        # enough for a sibling driver to land it) must not get a second,
+        # purposeless PR opened against it.
+        items = [_q("a", branch="issue-1-done")]
+        gh = FakeGh(merged_branches={"issue-1-done"})
+        events = process(items, gh)
+
+        assert gh.create_calls == []
+        assert items[0].state == MERGED
+        assert items[0].error is None
+        already_merged = [e for e in events if e.kind == "already_merged"]
+        assert len(already_merged) == 1
+        assert "issue-1-done" in already_merged[0].message
+        # No merge attempted either — nothing to merge, it's already done.
+        assert gh.merge_calls == []
+
+    def test_pr_is_merged_check_is_optional_on_gh_ops_stub(self) -> None:
+        # #2143: `pr_is_merged` is optional on GhOps, same contract as
+        # `find_pr_for_branch`/`branch_has_merge_commit` — a stub predating
+        # #2143 must keep opening PRs exactly as before.
+        @dataclass
+        class _NoMergedCheckGh(FakeGh):
+            # Shadow the inherited method with plain `None`, so
+            # `getattr(gh_ops, "pr_is_merged", None)` sees the same
+            # "missing method" shape a pre-#2143 stub would.
+            pr_is_merged = None
+
+        items = [_q("a")]
+        gh = _NoMergedCheckGh()
+        events = process(items, gh)
+        assert len(gh.create_calls) == 1
+        assert items[0].state == MERGED
+        assert any(e.kind == "opened" for e in events)
+
+    def test_dry_run_previews_already_merged_instead_of_would_open(self) -> None:
+        # #2143: the dry-run preview mirrors the real path's check so it
+        # never claims "would open PR" for a branch another driver already
+        # merged.
+        items = [_q("a", branch="issue-1-done")]
+        gh = FakeGh(merged_branches={"issue-1-done"})
+        events = process(items, gh, dry_run=True)
+
+        assert gh.create_calls == []
+        already_merged = [e for e in events if e.kind == "already_merged"]
+        assert len(already_merged) == 1
+        assert "(dry run)" in already_merged[0].message
+        assert not any(
+            e.kind == "opened" and "would open PR" in e.message for e in events
+        )
 
     def test_closes_linked_issue_on_merge(self) -> None:
         # #806: a successful merge must close the linked issue deterministically,
