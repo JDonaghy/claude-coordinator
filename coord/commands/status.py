@@ -18,6 +18,43 @@ if TYPE_CHECKING:
     from coord.config import Config
 
 
+def _cordon_stall_suffix(cordons: dict) -> str:
+    """The " (deferred N runs — NOT DRAINING)" tag for a stalled cordon (#2240).
+
+    `coord status` renders "CORDONED: DRAINING FOR V0.5.77" for a fleet that
+    is upgrading itself in thirty seconds and for one that has been unable to
+    dispatch anything for seventy minutes, identically. That is the whole
+    observability half of #2240: "nothing surfaced it either — `coord status`
+    shows `CORDONED: DRAINING FOR V0.5.77`, which reads as normal in-progress
+    behaviour rather than a 70-minute stall."
+
+    The count lives in the propagation journal, which is a file on whichever
+    host runs the propagate timer. A thin client has no such file, so this
+    degrades to "" — a missing journal must never turn a normal drain into a
+    reported stall, and the surface it is missing from is precisely the one
+    that is not running the loop.
+    """
+    if not cordons:
+        return ""
+    from coord import release_cordon as rc  # noqa: PLC0415
+    from coord import release_propagate as rp  # noqa: PLC0415
+    from coord.commands.release import _state_dir  # noqa: PLC0415
+
+    target = next(
+        (getattr(c, "target_version", None) for c in cordons.values()
+         if getattr(c, "target_version", None)),
+        None,
+    )
+    try:
+        pressure = rc.deferral_pressure(
+            rp.read_records(_state_dir()), target_version=target
+        )
+    except Exception:  # noqa: BLE001 — a status render must never fail on this
+        return ""
+    described = rc.describe_deferral_pressure(pressure)
+    return f" ({described})" if described else ""
+
+
 def _live_advisory_entries(
     entries: list[dict],
     cfg: "Config",
@@ -144,6 +181,11 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
     )
     paused = paused_set(cfg.machines)
     cordons = fetch_cordons()
+    # #2240: how many consecutive propagate runs this cordon has now failed to
+    # produce a window for. Computed once, appended to every cordoned
+    # machine's label below — "draining" and "deadlocked" must not render the
+    # same, which is why the 70-minute stall was invisible.
+    cordon_stall = _cordon_stall_suffix(cordons)
     quiet_windows = effective_quiet_hours(cfg.machines)
 
     statuses = check_all(machines, timeout=timeout)
@@ -211,7 +253,9 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
             # #2101 trap E: name the version it is draining for, so a stopped
             # machine reads as "the fleet is upgrading itself" rather than as
             # a mystery.
-            label = f"{pause_state.detail.upper()} — {label}"
+            # #2240: ...and say when it has stopped being that, so it does
+            # not read as normal in-progress behaviour for an hour.
+            label = f"{pause_state.detail.upper()}{cordon_stall} — {label}"
         elif pause_state is not None and pause_state.kind == "hand":
             label = f"PAUSED — {label}"
         elif pause_state is not None and pause_state.kind == "quiet":

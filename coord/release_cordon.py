@@ -82,6 +82,55 @@ the whole fleet on one busy one; evaluate quiescence per host rather than
 fleet-wide) is a policy call the issue deliberately leaves open rather than
 one this module has made unilaterally.
 
+A DEFERRAL IS NOT PASSIVE — IT LEAVES THE CORDON STANDING (#2240)
+------------------------------------------------------------------
+The escalation above is loud, and loud was enough only while rolls were
+manual. On 2026-08-14, with `coord-release-propagate.timer` enabled, the
+mechanism closed a loop on itself and took the whole fleet down for 70
+minutes with all three machines idle:
+
+1. `propagate` cordons all three hosts to drain them;
+2. a cordoned host cannot accept new dispatch — **including a review**;
+3. a drive-queue entry that has finished Work and Test is waiting for its
+   review to be dispatched, and cannot get one;
+4. its queue row therefore stays ``running`` with no live assignment (it is
+   between legs), which :func:`coord.release_propagate.busy_host_for_entry`
+   cannot attribute to any host;
+5. an unattributable busy signal blocks *every* host by design, so the roll
+   **defers**;
+6. a deferred run leaves the cordon in place, and we are back at (2).
+
+:mod:`coord.release_window` had already predicted the input — "a row that is
+``running`` with no live assignment right now (between legs) still reads as
+unattributable and blocks every host" — but priced it as a *bounded* cost:
+some rolls defer. What that misses is that the deferral is not passive. The
+"between legs" window is normally seconds; a standing cordon makes it
+permanent, because the cordon is what prevents the next leg from ever being
+dispatched. An unattributable row is then not a delay, it is a trap.
+
+The TTL (trap B) is the obvious escape hatch and it cannot fire: the
+propagate timer runs every 20 minutes and every run renews, so the renewal
+interval is shorter than any sane TTL. The safety net is real and
+unreachable.
+
+So a cordon now has a second bound, one that does not depend on anything
+else running: :data:`DEFAULT_MAX_DEFERRALS` consecutive *deferred* runs for
+the same target version and the cordons are **released outright**
+(:class:`DeadlockRelease`), with cordoning held off for
+:data:`DEFAULT_RELEASE_COOLDOWN_SECONDS` afterwards so the fleet gets a real
+window in which to finish the work the drain is waiting for. The counter and
+the cooldown are both read back out of the propagation journal
+(:func:`deferral_pressure`), so this survives the process being restarted by
+the very roll it gates — the same reason ``expires_at`` is stored rather
+than held in memory.
+
+The reasoning is deliberately blunt: **a cordon that has failed to produce
+quiescence twice running is not draining anything; it is blocking the work
+whose completion it is waiting for.** Trading two cordoned ticks for one
+uncordoned window costs at worst one deferred release cycle. Not trading
+costs the entire fleet, indefinitely, until a human runs
+``coord release cordon --clear --all``.
+
 THE TRIGGER IS COUPLED TO RELEASE FREQUENCY, SO IT IS A KNOB
 --------------------------------------------------------------
 Cordon-on-any-drift costs one fleet drain per release. Before #2081 landed,
@@ -130,6 +179,30 @@ DEFAULT_DRAIN_DEADLINE_SECONDS = 5400.0
 #: How many releases behind a host must be before it is cordoned. 1 = any
 #: drift. See the module docstring's trap-F section for why this is a knob.
 DEFAULT_DRIFT_THRESHOLD = 1
+
+#: How many consecutive DEFERRED propagate runs may hold a cordon for the same
+#: target version before it is released outright (#2240). 2, at the propagate
+#: timer's 20-minute interval, is ~40 minutes of a cordoned fleet — long enough
+#: that a normal drain finishes inside it, short enough that the deadlock in
+#: the module docstring is a blip rather than a night. Emphatically NOT derived
+#: from :data:`DEFAULT_DRAIN_DEADLINE_SECONDS`: that deadline only makes noise,
+#: and the whole finding of #2240 is that noise does not break a cycle which
+#: sustains itself.
+DEFAULT_MAX_DEFERRALS = 2
+
+#: How long cordoning stays OFF after a deadlock release (#2240). Without a
+#: cooldown the very next run re-cordons — the hosts are still behind — and
+#: the deadlock re-arms 20 minutes later, so the release would buy exactly one
+#: tick. Longer than the propagate interval on purpose: the released window has
+#: to be long enough for the between-legs entry to actually get its next leg
+#: dispatched and run.
+DEFAULT_RELEASE_COOLDOWN_SECONDS = 1800.0
+
+#: ``coord.release_propagate.STATUS_DEFERRED``, re-spelled rather than imported
+#: to keep this module import-free of the propagation shell (same seam, and the
+#: same reason, as ``_SEVERITY_RANK`` there). One string, asserted equal by the
+#: tests.
+_STATUS_DEFERRED = "deferred"
 
 #: Returned by :func:`version_drift` when a host's version cannot be compared
 #: to the target at all (unreadable lane, or a different minor series). A host
@@ -327,6 +400,151 @@ class DrainEscalation:
 
 
 @dataclass(frozen=True)
+class DeferralPressure:
+    """How long the cordon has been failing to produce a window (#2240).
+
+    Read back out of the propagation journal by :func:`deferral_pressure`,
+    not held in memory: the process that set the cordon is restarted by the
+    very roll it gates, so an in-memory counter would reset exactly when the
+    deadlock is worst. Same reasoning as ``Cordon.expires_at``.
+    """
+
+    #: Consecutive deferred runs for this target that HELD a cordon, counted
+    #: back from the newest journal record and stopping at the last release.
+    consecutive: int = 0
+    #: When the last deadlock release happened (0.0 = never / not in this run
+    #: of deferrals). Starts the cooldown in :func:`plan_cordons`.
+    last_release_at: float = 0.0
+    target_version: str | None = None
+
+    def cooling_for(self, now: float, cooldown: float) -> float:
+        """Seconds of cooldown left at *now*; 0 when cordoning may resume."""
+        if not self.last_release_at or cooldown <= 0:
+            return 0.0
+        return max(0.0, self.last_release_at + cooldown - now)
+
+    def to_dict(self) -> dict:
+        return {
+            "consecutive": self.consecutive,
+            "last_release_at": self.last_release_at,
+            "target_version": self.target_version,
+        }
+
+
+@dataclass(frozen=True)
+class DeadlockRelease:
+    """The cordon being dropped because deferring is no longer passive (#2240).
+
+    Distinct from :class:`DrainEscalation` on purpose: an escalation is a
+    *message* and changes nothing, which is precisely why the fleet sat
+    cordoned for 70 minutes. This one is an ACTION, and the message merely
+    describes it.
+    """
+
+    hosts: tuple[str, ...] = ()
+    consecutive_deferrals: int = 0
+    max_deferrals: int = DEFAULT_MAX_DEFERRALS
+    cooldown_seconds: float = DEFAULT_RELEASE_COOLDOWN_SECONDS
+    target_version: str | None = None
+
+    @property
+    def message(self) -> str:
+        version = f"v{self.target_version}" if self.target_version else "the release"
+        who = ", ".join(self.hosts) if self.hosts else "no host (already clear)"
+        minutes = self.cooldown_seconds / 60.0
+        return (
+            f"CORDON RELEASED (#2240): {self.consecutive_deferrals} consecutive "
+            f"propagate runs deferred {version} while holding a cordon, so the "
+            f"cordon is not draining anything — it is blocking the work whose "
+            f"completion it is waiting for (a review cannot be dispatched onto "
+            f"a cordoned host). Uncordoning {who} and not cordoning again for "
+            f"{minutes:.0f}m, so the fleet can finish that work; the roll will "
+            f"be retried after that."
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "hosts": list(self.hosts),
+            "consecutive_deferrals": self.consecutive_deferrals,
+            "max_deferrals": self.max_deferrals,
+            "cooldown_seconds": self.cooldown_seconds,
+            "target_version": self.target_version,
+            "message": self.message,
+        }
+
+
+def deferral_pressure(
+    records: Iterable[Mapping[str, Any]],
+    *,
+    target_version: str | None = None,
+) -> DeferralPressure:
+    """How many consecutive deferrals have held a cordon (#2240). Pure.
+
+    *records* are propagation-journal objects oldest-first, exactly as
+    :func:`coord.release_propagate.read_records` returns them. Walked
+    newest-first and stopped at the first record that is:
+
+    * not a deferral — a roll, a rollback or an "already up to date" means
+      the mechanism is working and the count is meaningless;
+    * for a different target version — a new release restarts the clock;
+    * the last deadlock release — everything before it has already been paid
+      for, so the count restarts from there and the cooldown takes over.
+
+    A deferral that cordoned NOTHING does not increment: the deadlock is
+    specifically "the cordon is blocking the work it is waiting for", and a
+    run that held no cordon cannot be blocking anything. It does not break
+    the walk either — a transient cordon-store write error in the middle of a
+    standoff must not silently reset the counter.
+    """
+    want = normalize_version(target_version)
+    consecutive = 0
+    last_release_at = 0.0
+    for raw in reversed(list(records)):
+        if not isinstance(raw, Mapping):
+            break
+        if str(raw.get("status") or "") != _STATUS_DEFERRED:
+            break
+        if want is not None and normalize_version(raw.get("target_version")) != want:
+            break
+        cordons = raw.get("cordons")
+        cordons = cordons if isinstance(cordons, Mapping) else {}
+        try:
+            released_at = float(cordons.get("released_at") or 0.0)
+        except (TypeError, ValueError):
+            released_at = 0.0
+        if released_at:
+            last_release_at = released_at
+            break
+        if cordons.get("cordoned"):
+            consecutive += 1
+    return DeferralPressure(
+        consecutive=consecutive,
+        last_release_at=last_release_at,
+        target_version=want,
+    )
+
+
+def describe_deferral_pressure(
+    pressure: DeferralPressure,
+    *,
+    max_deferrals: int = DEFAULT_MAX_DEFERRALS,
+) -> str:
+    """The short suffix every cordon surface appends (#2240 acceptance 4).
+
+    Empty string while the drain is normal. `coord status` renders
+    "CORDONED: DRAINING FOR V0.5.77" either way, and #2240's whole
+    observability finding is that those two states read identically: one is
+    a fleet upgrading itself, the other is a fleet that has been unable to
+    work for an hour.
+    """
+    if pressure.consecutive <= 0:
+        return ""
+    plural = "" if pressure.consecutive == 1 else "s"
+    stalled = " — NOT DRAINING" if pressure.consecutive >= max(1, max_deferrals) else ""
+    return f"deferred {pressure.consecutive} run{plural}{stalled}"
+
+
+@dataclass(frozen=True)
 class CordonPlan:
     """What one propagate run wants the cordon store to look like.
 
@@ -346,10 +564,26 @@ class CordonPlan:
     #: (unreadable version, or drift under the threshold). Left exactly as
     #: they are — see :func:`plan_cordons` for why neither direction is safe.
     unknown: tuple[str, ...] = ()
+    #: #2240: the deadlock break. Set when this run is dropping the cordon
+    #: because deferring has stopped being passive. Its ``hosts`` are cleared
+    #: IN ADDITION to ``uncordon`` (which stays what it always was: hosts
+    #: proven to be on the target already).
+    released: "DeadlockRelease | None" = None
+    #: #2240: seconds of post-release cooldown still to run. Non-zero means
+    #: this run deliberately cordoned nothing even though hosts are behind —
+    #: recorded rather than silent, because "no cordons planned" and "cordons
+    #: suppressed on purpose" are the same output otherwise.
+    cooling_seconds: float = 0.0
 
     @property
     def empty(self) -> bool:
-        return not (self.cordon or self.uncordon or self.escalations or self.expired)
+        return not (
+            self.cordon
+            or self.uncordon
+            or self.escalations
+            or self.expired
+            or self.released
+        )
 
     def to_dict(self) -> dict:
         return {
@@ -358,6 +592,8 @@ class CordonPlan:
             "escalations": [e.to_dict() for e in self.escalations],
             "expired": list(self.expired),
             "unknown": list(self.unknown),
+            "released": self.released.to_dict() if self.released else None,
+            "cooling_seconds": self.cooling_seconds,
         }
 
     def render(self) -> list[str]:
@@ -377,6 +613,15 @@ class CordonPlan:
                 f"  ? {name}: cordoned, but this run could neither prove it "
                 "current nor prove it behind — left as-is, and it will lapse "
                 "on its own if no later run renews it"
+            )
+        if self.released is not None:
+            lines.append(f"  ! {self.released.message}")
+        if self.cooling_seconds > 0:
+            lines.append(
+                "  · cordons held off for another "
+                f"{self.cooling_seconds / 60.0:.0f}m — a recent deadlock "
+                "release (#2240) is still letting the fleet work; nothing was "
+                "cordoned this run"
             )
         for esc in self.escalations:
             lines.append(f"  ! {esc.message}")
@@ -456,6 +701,9 @@ def plan_cordons(
     threshold: int = DEFAULT_DRIFT_THRESHOLD,
     busy_reasons: Mapping[str, str] | None = None,
     enabled: bool = True,
+    pressure: DeferralPressure | None = None,
+    max_deferrals: int = DEFAULT_MAX_DEFERRALS,
+    release_cooldown: float = DEFAULT_RELEASE_COOLDOWN_SECONDS,
 ) -> CordonPlan:
     """Decide this run's cordon writes. Pure.
 
@@ -467,6 +715,19 @@ def plan_cordons(
     cordons but STILL clears the ones this owner already set: turning the
     mechanism off must release the fleet, not freeze it in whatever state the
     last run left behind.
+
+    *pressure* (#2240) is :func:`deferral_pressure` over the propagation
+    journal. Two things come out of it, in this order:
+
+    * an unexpired **cooldown** from a previous release suppresses all new
+      cordons — without it the next run re-cordons (the hosts really are
+      still behind) and the deadlock re-arms 20 minutes later;
+    * ``consecutive >= max_deferrals`` **releases** every live cordon
+      (:class:`DeadlockRelease`) and starts that cooldown.
+
+    Proven-current hosts are uncordoned in every one of these branches: that
+    is never the wrong move, and skipping it during a cooldown would leave a
+    rolled host cordoned for the length of the cooldown.
     """
     records = _as_records(existing)
     live = {name: c for name, c in records.items() if c.active(now)}
@@ -476,6 +737,35 @@ def plan_cordons(
 
     if not enabled:
         return CordonPlan(uncordon=tuple(sorted(live)), expired=expired)
+
+    # Uncordon: PROVEN current, and nothing else. A host whose version could
+    # not be read keeps whatever cordon it has until that cordon EXPIRES —
+    # clearing on "we couldn't read the version" would open the fleet up
+    # mid-roll on the strength of one failed HTTP call.
+    to_uncordon = tuple(sorted(name for name in live if name in drift.current))
+
+    # ── #2240: the deadlock bound ────────────────────────────────────────
+    pressure = pressure or DeferralPressure()
+    cooling = pressure.cooling_for(now, release_cooldown)
+    if cooling > 0:
+        return CordonPlan(
+            uncordon=to_uncordon,
+            expired=expired,
+            cooling_seconds=cooling,
+            unknown=tuple(sorted(drift.undecided & set(live))),
+        )
+    if max_deferrals > 0 and pressure.consecutive >= max_deferrals:
+        return CordonPlan(
+            uncordon=to_uncordon,
+            expired=expired,
+            released=DeadlockRelease(
+                hosts=tuple(sorted(set(live) - set(to_uncordon))),
+                consecutive_deferrals=pressure.consecutive,
+                max_deferrals=max_deferrals,
+                cooldown_seconds=release_cooldown,
+                target_version=target_version,
+            ),
+        )
 
     to_cordon: list[Cordon] = []
     escalations: list[DrainEscalation] = []
@@ -504,12 +794,6 @@ def plan_cordons(
                 )
             )
 
-    # Uncordon: PROVEN current, and nothing else. A host whose version could
-    # not be read keeps whatever cordon it has until that cordon EXPIRES —
-    # clearing on "we couldn't read the version" would open the fleet up
-    # mid-roll on the strength of one failed HTTP call.
-    to_uncordon = tuple(sorted(name for name in live if name in drift.current))
-
     return CordonPlan(
         cordon=tuple(to_cordon),
         uncordon=to_uncordon,
@@ -536,6 +820,18 @@ class CordonOutcome:
     expired: list[str] = field(default_factory=list)
     escalated: list[dict] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    #: #2240: when this run broke the cordon deadlock. THE field the next
+    #: run's :func:`deferral_pressure` looks for — it is both the counter
+    #: reset and the cooldown's start, so a run that releases and fails to
+    #: journal it would release again on the very next tick.
+    released_at: float = 0.0
+    #: :meth:`DeadlockRelease.to_dict`, when there was one.
+    released: dict | None = None
+    #: Seconds of cooldown left when this run decided not to cordon (#2240).
+    cooling_seconds: float = 0.0
+    #: What :func:`deferral_pressure` read, so the journal shows the input to
+    #: the release decision and not just its output.
+    pressure: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -544,4 +840,8 @@ class CordonOutcome:
             "expired": list(self.expired),
             "escalated": [dict(e) for e in self.escalated],
             "errors": list(self.errors),
+            "released_at": self.released_at,
+            "released": dict(self.released) if self.released else None,
+            "cooling_seconds": self.cooling_seconds,
+            "pressure": dict(self.pressure),
         }

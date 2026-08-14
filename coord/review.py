@@ -1064,9 +1064,17 @@ def pick_reviewer_machine(
     useful review — but we warn the caller via `same_as_worker=True`.
 
     Returns None when no machine can handle this repo.
+
+    #2240: the pause set here is `follow_on_paused_set()`, NOT `paused_set()`
+    — a review is the tail of work that is already running, so a release
+    cordon ("route no NEW work here") must not filter its host out. It did,
+    on 2026-08-14, and the result was a fleet-wide 70-minute deadlock: the
+    cordon blocked the review, the unreviewable entry stayed `running`, the
+    running entry deferred the roll, and the deferred roll left the cordon
+    up. Explicit pauses and quiet hours still apply.
     """
-    from coord.machine_pause import paused_set
-    paused = paused_set(config.machines)
+    from coord.machine_pause import follow_on_paused_set
+    paused = follow_on_paused_set(config.machines)
     candidates = [
         m for m in config.machines
         if m.can_work_on(repo_name) and m.name not in paused
@@ -1138,10 +1146,16 @@ def _ranked_reviewer_candidates(
     Used by ``dispatch_review`` to iterate candidates instead of committing to
     a single pick, so a rejected agent (e.g. a 400 from config drift) can
     fall through to the next rather than silently failing (#904).
-    """
-    from coord.machine_pause import paused_set  # noqa: PLC0415
 
-    paused = paused_set(config.machines)
+    #2240: cordon-blind, like ``pick_reviewer_machine`` above and for the
+    same reason — this is the function whose empty return produced the
+    literal "no eligible reviewer machine configured for repo
+    'claude-coordinator'" that a cordoned fleet answered every review
+    dispatch with for 70 minutes.
+    """
+    from coord.machine_pause import follow_on_paused_set  # noqa: PLC0415
+
+    paused = follow_on_paused_set(config.machines)
     candidates = [
         m for m in config.machines
         if m.can_work_on(repo_name) and m.name not in paused
@@ -1995,8 +2009,12 @@ def dispatch_review(
                 "to original worker machine %s to avoid cross-machine fetch failure",
                 completed.branch, completed.assignment_id, completed.machine_name,
             )
-            from coord.machine_pause import paused_set  # noqa: PLC0415
-            paused = paused_set(config.machines)
+            # #2240: same cordon-blind set as the candidate ranking above —
+            # this branch NARROWS to the worker machine, so reading a
+            # cordoned worker as "unavailable" here would strand the review
+            # at `branch_not_on_remote` for exactly the reason #2240 names.
+            from coord.machine_pause import follow_on_paused_set  # noqa: PLC0415
+            paused = follow_on_paused_set(config.machines)
             worker_machine = next(
                 (m for m in config.machines if m.name == completed.machine_name),
                 None,
