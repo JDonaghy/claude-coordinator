@@ -1185,6 +1185,233 @@ def test_a_park_younger_than_the_ceiling_is_left_alone(
     assert len(launches) == 1, launches
 
 
+# ── #2182: a park is bounded (#2158) but was never RE-CHECKED — a cleared
+# gate waited up to the 45-minute ceiling even though `coord merge --plan`
+# could answer correctly on demand the whole time.
+#
+# claude-coordinator#2159, 2026-08-13: at 03:25:46 UTC, `coord merge
+# --dry-run` for a parked entry read READY (no gate objection) while `coord
+# drive-queue list`, reading the SAME board a moment later, still read
+# `parked`. The root cause (confirmed by reading the tick's own board-fetch
+# path, not merely suspected): the daemon host — the ONLY machine that ever
+# runs this tick (`docs/AGENT_OPERATIONS.md`) — reads the local DB directly
+# and never computes a `merge_plan` section at all (see
+# `coord.commands.drive_queue._local_merge_queue_rows`'s docstring), so
+# `IssueFacts.merge_ci_pending_live` is unconditionally `False` there and
+# only the #2158 ceiling could ever have released the park — never CI
+# actually reporting.
+#
+# These tests exercise the REAL live re-check (`coord.merge_queue.
+# entry_gate_status`, called by `_fetch_live_ci_gate`), not a pre-injected
+# `merge_plan` row the way `board_merge_plan` above stands in for the
+# daemon-fronted lane — this suite's default lane (no daemon, no
+# `board_service`) IS the exact lane #2159 hit.
+
+
+_NO_GATES_CONFIG_YAML = f"""\
+repos:
+  - name: {REPO}
+    github: john/claude-coordinator
+    default_branch: main
+  - name: {OTHER_REPO}
+    github: john/quadraui
+    default_branch: main
+machines:
+  - name: dellserver
+    host: dellserver
+    repos: [{REPO}, {OTHER_REPO}]
+reviews:
+  enabled: false
+pipeline:
+  default_gates: []
+"""
+
+
+@pytest.fixture
+def cli_no_gates(tmp_path: Path):
+    """Same shape as `cli` above, but review/smoke are OFF.
+
+    #2182's live re-check calls the REAL `coord.merge_queue.
+    entry_gate_status` — the same function `coord merge --plan` uses — which
+    evaluates review/smoke BEFORE it ever reaches the CI gate under test
+    here. `config_file`'s default gate list (`["test", "review", "merge"]`,
+    `reviews.enabled: true` by default) would block every re-check on a
+    verdict these tests never seed — a different, real gate, just not the
+    one #2182 is about. A genuinely-parked entry in production already
+    cleared review/smoke to reach the CI block in the first place (that is
+    the gate order `entry_gate_status` evaluates in); these tests start
+    past that point on purpose, same as `_seed_ci_pending_merge_row` above
+    already does for the pre-#2182 machinery.
+    """
+    path = tmp_path / "coordinator-no-gates.yml"
+    path.write_text(_NO_GATES_CONFIG_YAML)
+
+    def run(*args: str):
+        return CliRunner().invoke(main, ["drive-queue", *args, "--config", str(path)])
+
+    return run
+
+
+class _FakeLiveCi:
+    """Stands in for the live backend `coord.ci_store.build_ci_store` would
+    normally construct (`coord.ci_github.GitHubCi`) — a real `gh` client,
+    which these tests must never touch."""
+
+    def __init__(self, state: dict) -> None:
+        self._state = state
+
+    @property
+    def is_available(self) -> bool:
+        return True
+
+    def list_checks_for_pr(self, repo: str, number: int) -> list:
+        return list(self._state["checks"])
+
+    def expects_checks(self, repo: str, number: int) -> bool:
+        return True
+
+
+@pytest.fixture
+def live_ci_backend(monkeypatch):
+    """Fake the live `ci_store`/`github_ops` seam #2182's re-check calls.
+
+    Patches `coord.ci_store.build_ci_store` (what constructs the live
+    backend) and the two `coord.github_ops` functions the CI gate reaches
+    for once the checks themselves resolve (`get_branch_commit_timestamp`
+    for the #1851 staleness check, `get_pr_commit_messages` for the #1318
+    epic-closing-keyword gate) — the same seams `tests/test_board_read_
+    path.py` fakes for the equivalent `/board`-side gate. Returns a setter,
+    `live_ci_backend(checks)`.
+    """
+    import coord.ci_store as ci_store_module
+    import coord.github_ops as github_ops
+
+    state: dict = {"checks": []}
+    monkeypatch.setattr(
+        ci_store_module, "build_ci_store", lambda t: _FakeLiveCi(state)
+    )
+    # A small, fixed base-commit timestamp: every check below starts well
+    # after it, so the #1851 staleness gate reads "fresh", not "stale".
+    monkeypatch.setattr(
+        github_ops, "get_branch_commit_timestamp", lambda repo, branch: 1.0
+    )
+    monkeypatch.setattr(github_ops, "get_pr_commit_messages", lambda repo, n: [])
+
+    def _set(checks: list) -> None:
+        state["checks"] = checks
+
+    return _set
+
+
+def _green_check(name: str = "test (3.12)"):
+    from coord.ci_store import CheckRun
+
+    return CheckRun(
+        name=name, status="completed", conclusion="success",
+        url="", run_id="1", started_at=100.0, completed_at=160.0,
+    )
+
+
+def _running_check(name: str = "test (3.12)"):
+    from coord.ci_store import CheckRun
+
+    return CheckRun(
+        name=name, status="in_progress", conclusion=None,
+        url="", run_id="1", started_at=100.0, completed_at=None,
+    )
+
+
+def _park_with_pr(
+    cli, seed, coord_db, issue: int = 2159, pr_number: int = 42
+) -> None:
+    """`_park` above, plus a `pr_number` on the raw row.
+
+    #2182's live re-check (unlike the pre-#2182 machinery it falls back to)
+    needs a PR to ask the CI backend about — exactly what a real `coord
+    merge` attempt would already have set on this row before ever parking
+    it (the CI gate only writes a `CI running:`/`CI infra:` error when
+    `entry.pr_number` is truthy in the first place).
+    """
+    seed(issues={issue: "open"})
+    cli("add", REPO, str(issue))
+    cli("tick")
+    _seed_ci_pending_merge_row(coord_db, issue, reason="CI running: test (3.12)")
+    coord_db.execute(
+        "UPDATE merge_queue SET pr_number = ? WHERE issue_number = ?",
+        (pr_number, issue),
+    )
+    coord_db.commit()
+    _backdate(issue, DRIVE_STARTUP_GRACE_SECONDS + 60)
+    cli("tick")
+    assert queued(issue)["state"] == "parked"
+
+
+def test_a_parked_entry_resumes_on_a_live_gate_recheck_well_inside_the_ceiling(
+    cli_no_gates, seed, launches, coord_db, live_ci_backend,
+):
+    """THE #2182 regression, reproduced rather than injected.
+
+    CI reports green seconds after the park — nowhere near
+    `PARK_STALE_SECONDS` — and no live `coord merge` runs in between. Before
+    #2182 this entry would sit `parked` until the 45-minute ceiling; now the
+    very next tick asks the live gate itself (the same call `coord merge
+    --plan` makes) and resumes immediately.
+    """
+    _park_with_pr(cli_no_gates, seed, coord_db)
+    assert len(launches) == 1, launches
+
+    live_ci_backend([_green_check()])
+
+    result = cli_no_gates("tick")
+    assert result.exit_code == 0, result.output
+    entry = queued(2159)
+    assert entry["state"] == "running"  # resumed straight into a fresh launch
+    assert entry["attempts"] == 0  # #1891: still free — no attempt spent
+    assert len(launches) == 2, launches
+
+    status = cli_no_gates("status")
+    assert "parked" not in status.output
+
+
+def test_a_parked_entry_with_ci_still_genuinely_running_stays_parked(
+    cli_no_gates, seed, launches, coord_db, live_ci_backend,
+):
+    """The #1891 property must survive #2182 unchanged: CI genuinely still
+    running is not evidence against the park — the live re-check agrees
+    with it, every tick, with no hot-loop relaunch."""
+    _park_with_pr(cli_no_gates, seed, coord_db)
+    live_ci_backend([_running_check()])
+
+    for _ in range(3):
+        result = cli_no_gates("tick")
+        assert result.exit_code == 0, result.output
+        assert queued(2159)["state"] == "parked"
+        assert len(launches) == 1, launches  # no second launch, ever
+
+    assert "1 parked" in cli_no_gates("status").output
+
+
+def test_a_live_ready_wins_even_over_a_stale_cached_plan_reading(
+    cli_no_gates, seed, launches, coord_db, live_ci_backend, board_merge_plan,
+):
+    """#2182's acceptance bar, stated directly: the live re-check is
+    authoritative over the CACHED board reading, not merely over its
+    absence. The board's own `merge_plan` section here still says pending
+    (not yet refreshed since the park — the #2158 unrefreshable case this
+    suite's `board_merge_plan` fixture stands in for), which pre-#2182
+    would hold the park for the full ceiling regardless of what a live
+    check would say. The live gate — the same one `coord merge --plan`
+    reads on demand — wins anyway: the queue must never report `parked`
+    once it agrees."""
+    _park_with_pr(cli_no_gates, seed, coord_db)
+    board_merge_plan(_plan_row(2159, reason="CI running: test (3.12)", running=1))
+    live_ci_backend([_green_check()])
+
+    result = cli_no_gates("tick")
+    assert result.exit_code == 0, result.output
+    assert queued(2159)["state"] == "running"
+
+
 def test_a_repeatedly_dead_drive_still_reaches_blocked_and_escalates(
     cli, seed, launches
 ):

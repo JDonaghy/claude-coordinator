@@ -1875,6 +1875,7 @@ def plan_tick(
     exit_dead_end: Mapping[str, bool] | None = None,
     gate_a_pending: Mapping[str, bool] | None = None,
     cordons: Mapping[str, str] | None = None,
+    live_ci_gate: Mapping[str, bool] | None = None,
 ) -> TickPlan:
     """Decide one tick.  Pure; the caller executes the returned plan.
 
@@ -1950,6 +1951,21 @@ def plan_tick(
     leave a finished drive's `running` row pinning propagation forever — the
     #2110 deadlock, re-created by the very mechanism meant to end it.  A
     cordoned tick is exactly `--reconcile-only`.
+
+    *live_ci_gate* maps a `parked` entry's key to whether a FRESH,
+    single-entry re-derivation of its gate — computed by the shell THIS
+    tick, via :func:`coord.merge_queue.entry_gate_status` with a live
+    ``ci_store``/``gh_ops``, the same backend ``coord merge --plan`` builds
+    — still finds it blocked (#2182). A key present here is authoritative
+    over both the cached board's `merge_ci_pending` and the #2158 staleness
+    ceiling below: there is no ceiling to apply to a reading taken just now.
+    A key ABSENT (the entry isn't CI-parked, or the shell's live check
+    itself couldn't be made — no PR yet, an unreadable config, a `ci_store`
+    that failed to build) falls through unchanged to the pre-#2182 path,
+    the #2158 ceiling included — see
+    :func:`coord.commands.drive_queue._fetch_live_ci_gate` for the shell
+    side, which computes this ONLY for the bounded set of entries currently
+    `parked` on a CI reason, never the whole queue.
 
     The algorithm, from #1754, plus #1757's step 2, #1891's step 1b, and
     #2055's extension of it:
@@ -2106,6 +2122,39 @@ def plan_tick(
             # through to the parked-only CI resume below — that would
             # relaunch a gave-up entry outside the `blocked`/`failed`
             # attempt-tracking this function's docstring describes (#2055).
+            continue
+        # #2182: a FRESH, single-entry re-derivation of this exact entry's
+        # gate, taken by the shell THIS tick (see the `live_ci_gate`
+        # parameter doc above) — authoritative over both the cached board
+        # reading below and the #2158 staleness ceiling, because there is no
+        # staleness to a reading computed just now. Bypasses that whole
+        # apparatus entirely rather than layering on top of it: a `True`
+        # here means the SAME check `coord merge --plan` would run still
+        # finds this entry blocked (stay parked, no ceiling needed — held
+        # for as long as the live check keeps saying so, exactly like a
+        # live `merge_plan` reason always was); a `False` means the plan
+        # reads READY right now (resume immediately). A MISSING key — the
+        # entry isn't CI-parked, or the shell's live check itself could not
+        # be made — falls through unchanged to the pre-#2182 path.
+        live_override = (live_ci_gate or {}).get(entry.key)
+        if live_override is not None:
+            if live_override:
+                continue
+            reason = (
+                f"live re-check of {entry.key}'s gate this tick reads READY "
+                "(coord merge --plan agrees) — resuming from parked without "
+                "spending an attempt (#1891, #2182)"
+            )
+            reconciles.append(
+                Reconcile(
+                    entry.key,
+                    "resumed",
+                    reason,
+                    occupies=False,
+                    updates={"state": STATE_WAITING, "last_reason": reason},
+                )
+            )
+            states[entry.key] = STATE_WAITING
             continue
         # #2158: a park whose CI reading can still refresh itself is held for
         # as long as it keeps saying so. One that CANNOT — the reading came
