@@ -45,6 +45,7 @@ from coord.drive_queue import (
     HOLD_RELEASED,
     HOLD_SCOPE_ENTRY,
     HOLD_SCOPE_FLEET,
+    MAX_BLOCKED_RESUMES,
     QUEUE_ALERT_ISSUE,
     QUEUE_ALERT_REPO,
     QUEUE_ALERT_STAGE,
@@ -65,6 +66,7 @@ from coord.drive_queue import (
     entry_key,
     find_cycle,
     fired_holds,
+    is_permanent_block_reason,
     parse_after_spec,
     parse_key,
     pending_probe_targets,
@@ -317,9 +319,23 @@ _DIAGNOSABLE_STATES = (STATE_BLOCKED, STATE_FAILED)
 _ROW_CAUSE_MAX_CHARS = 88
 
 _BLOCKED_REMEDY = (
-    "remedy: {state} is terminal — the queue will not re-check this row "
-    "on its own; `coord drive-queue remove` + `add` only helps once the "
-    "cause above is actually fixed, not merely because a pre-req merged"
+    "remedy: {state}'s `after=` graph above is never re-checked on its own "
+    "— `coord drive-queue remove` + `add` only helps once the cause is "
+    "actually fixed, not merely because a pre-req merged"
+)
+
+# #2230: `blocked`'s MERGE GATE (as opposed to its `after=` graph, which
+# `_BLOCKED_REMEDY` above still correctly calls never-re-checked) is no
+# longer unconditionally terminal — see `coord.drive_queue.
+# is_permanent_block_reason`/`_reconcile_blocked`. Shown only for `blocked`
+# (never `failed`, which #2230 does not touch at all) so an operator reading
+# `list` right after this ships doesn't have to go read the issue to learn
+# their remove+add might be about to race an automatic resume.
+_BLOCKED_GATE_NOTE = (
+    "note: a re-evaluable blocked cause (i.e. not a #1844/#2019 permanent "
+    "refusal) IS re-checked against the merge gate automatically (#2230) — "
+    "see `resumes=` above if this row has already self-resumed and "
+    "re-blocked"
 )
 
 
@@ -423,6 +439,11 @@ def drive_queue_list(repo: str | None, output_json: bool, config_path: Path) -> 
             bits.append(f"attempts={entry.attempts}")
         if entry.deferrals:
             bits.append(f"deferrals={entry.deferrals}")
+        if entry.resumes:
+            # #2230: how many times the merge-gate sweep has auto-resumed
+            # THIS row from `blocked` — the churn signal the issue asks to be
+            # visible, not just logged in a tick's journal.
+            bits.append(f"resumes={entry.resumes}/{MAX_BLOCKED_RESUMES}")
         if entry.hold_after:
             bits.append(f"hold={entry.hold_state or 'armed'}")
             if entry.hold_scope == HOLD_SCOPE_FLEET:
@@ -435,6 +456,13 @@ def drive_queue_list(repo: str | None, output_json: bool, config_path: Path) -> 
             # operator is already reading the row, not just in an unrelated
             # operator's hand-written `--hold-after` note.
             click.echo(f"      {_BLOCKED_REMEDY.format(state=entry.state)}")
+        # #2230: independent of the `after=` diagnosis above (most `blocked`
+        # rows have no `after=` at all — they blocked on attempts, not a
+        # pre-req), so gated on the row's OWN state and cause, not `diagnosed`.
+        if entry.state == STATE_BLOCKED and not is_permanent_block_reason(
+            entry.last_reason
+        ):
+            click.echo(f"      {_BLOCKED_GATE_NOTE}")
         for line in _hold_lines(entry):
             click.echo(line)
 
@@ -1105,6 +1133,91 @@ def _fetch_live_ci_gate(
     return overrides
 
 
+def _fetch_live_blocked_gate(
+    entries: list, config_path: Path | None
+) -> dict[str, bool]:
+    """``{entry_key: still_blocked}`` for every RE-EVALUABLE ``blocked``
+    entry (#2230) — the counterpart of :func:`_fetch_live_ci_gate` above:
+    same mechanism, same bound, a different queue state.
+
+    THE GAP THIS CLOSES. `blocked` used to be terminal: once
+    `_reconcile_running` exhausted an entry's attempts, nothing ever asked
+    again whether the gate it kept dying against had since cleared — even
+    minutes later, even when `coord merge --only` would land it on the first
+    try with no objection. quadraui#309 sat `blocked attempts=2` for ~11h on
+    exactly that: `coord gates quadraui 309` read `merge: READY` for most of
+    the window, and nothing in the queue ever looked again.
+
+    NOT EVERY BLOCKED ENTRY QUALIFIES. `coord.drive_queue.
+    is_permanent_block_reason` excludes #1844 (a pre-dispatch guard's
+    refusal — deterministic, cannot change on retry) and #2019 (a dead-end
+    row — also cannot change): paying for a live `gh`-backed call on either
+    would be spending real cost to re-confirm an answer this function
+    already knows without asking. Everything else that reached `blocked` —
+    chiefly `exhausted`, a drive that died `max_attempts` times for whatever
+    reason — is a candidate.
+
+    THE COST. One `coord.merge_queue.entry_gate_status` call — the same live
+    backend `coord merge --plan`/`--only` build — per QUALIFYING blocked
+    entry, mirroring `_fetch_live_ci_gate`'s exact justification: bounded to
+    the (typically 0-2) entries actually sitting in `blocked` right now, not
+    the whole queue and not forever — an entry that resumes leaves `blocked`
+    and stops costing anything; one confirmed still-shut is untouched and
+    re-pays this same bounded cost next tick, identical to how a
+    still-CI-pending `parked` entry already does.
+
+    Same fail-open-per-entry, fail-closed-overall contract as
+    `_fetch_live_ci_gate`: a key ABSENT from the result (no queue row, no PR
+    yet, a `ci_store` that failed to build, any exception) leaves that entry
+    to `plan_tick`'s cheap board-only fallback
+    (`IssueFacts.merge_gate_status`, populated for free on a thin client's
+    live `/board`) — which on the daemon-host tick (the only host this
+    actually runs on, `docs/DRIVE_QUEUE.md` §2) has no `merge_plan` section
+    to read at all, so an absent key there means simply "no evidence, stays
+    blocked" (`_reconcile_blocked` never guesses).
+    """
+    targets = [
+        e for e in entries
+        if e.state == STATE_BLOCKED
+        and not is_permanent_block_reason(getattr(e, "last_reason", "") or "")
+    ]
+    if not targets:
+        return {}
+
+    from coord.board_service import resolve as resolve_board_service  # noqa: PLC0415
+
+    if resolve_board_service() is not None:
+        return {}
+
+    try:
+        from coord import github_ops as _gh_ops  # noqa: PLC0415
+        from coord import merge_queue as _mq  # noqa: PLC0415
+        from coord.ci_store import build_ci_store  # noqa: PLC0415
+        from coord.commands._common import _load_config  # noqa: PLC0415
+        from coord.state import load_board as _load_board  # noqa: PLC0415
+
+        cfg = _load_config(config_path)
+        board = _load_board()
+        ci_store = build_ci_store(cfg.ci_store.type)
+        queue_by_key = {
+            entry_key(q.repo_name, q.issue_number): q for q in _mq.load_queue()
+        }
+    except Exception:  # noqa: BLE001 — see the fail-soft note above
+        return {}
+
+    overrides: dict[str, bool] = {}
+    for e in targets:
+        q = queue_by_key.get(e.key)
+        if q is None or not q.pr_number:
+            continue
+        try:
+            status, _reason = _mq.entry_gate_status(q, board, cfg, ci_store, _gh_ops)
+        except Exception:  # noqa: BLE001 — leave this one entry to the fallback
+            continue
+        overrides[e.key] = status != _mq.PLAN_READY
+    return overrides
+
+
 def _launch_argv(entry: QueueEntry, config_path: Path | None) -> list[str]:
     """The ``coord drive --tmux`` argv for *entry*.
 
@@ -1425,6 +1538,12 @@ def drive_queue_tick(
         # this tick's board read never computes a live `merge_plan`).
         live_ci_gate = _fetch_live_ci_gate(entries, config_path)
 
+        # #2230: the same live re-derivation, for RE-EVALUABLE `blocked`
+        # entries — see `_fetch_live_blocked_gate`'s docstring for the gap
+        # this closes (quadraui#309 sat `blocked` ~11h on a merge that was
+        # landable for most of that window, and nothing ever looked again).
+        live_blocked_gate = _fetch_live_blocked_gate(entries, config_path)
+
         # #2101: release cordons. THIS is the hole the issue names — the
         # queue's launcher had zero pause awareness (`coord/drive.py` checks
         # pause only when routing a *worker*), so a cordoned host kept getting
@@ -1457,6 +1576,7 @@ def drive_queue_tick(
             gate_a_pending=gate_a_pending,
             cordons=cordons,
             live_ci_gate=live_ci_gate,
+            live_blocked_gate=live_blocked_gate,
         )
 
         if reconcile_only:
@@ -1489,6 +1609,33 @@ def drive_queue_tick(
                     f"queue_state=blocked | position="
                     f"{entry.position if entry else '?'} | after="
                     f"{','.join(entry.after) if entry and entry.after else '(none)'}"
+                ),
+                command=_requeue_command(entry, item.key),
+            )
+
+        # #2230: an entry #2230's sweep would have resumed, but has already
+        # oscillated blocked/waiting :data:`MAX_BLOCKED_RESUMES` times — the
+        # "say so out loud" half of the issue. This is a SEPARATE record from
+        # the `plan.blocked` loop above (that one only fires the tick an
+        # entry FIRST reaches `blocked`; this one fires on every tick the
+        # ceiling stays hit, same posture the queue-level alert already takes
+        # for an ongoing stall) so the escalation names the oscillation
+        # itself, not just "still blocked".
+        for item in plan.reconciles:
+            if item.outcome != "oscillating":
+                continue
+            parsed = parse_key(item.key)
+            if parsed is None:
+                continue
+            entry = by_key.get(item.key)
+            _escalate(
+                parsed[0],
+                parsed[1],
+                reason=item.reason,
+                gates=(
+                    f"queue_state=blocked | resumes={entry.resumes if entry else '?'}"
+                    f"/{MAX_BLOCKED_RESUMES} | position="
+                    f"{entry.position if entry else '?'}"
                 ),
                 command=_requeue_command(entry, item.key),
             )
@@ -1547,7 +1694,24 @@ def drive_queue_tick(
         # #1606: `--tmux` only exits 0 once the session is live and writing its
         # run log, so a non-zero exit means nothing is running — record a
         # consumed attempt, never a running entry.
-        attempts = target.attempts + 1
+        #
+        # #2230: `target` is `plan_tick`'s PRE-tick snapshot — its internal
+        # `by_key` is never refreshed after step 1b's writes (see
+        # `coord.drive_queue.plan_tick`'s own note on why `by_key` stays
+        # frozen). An entry #2230's sweep just resumed from `blocked` had its
+        # `attempts` reset to 0 by `_apply_writes` above; reading
+        # `target.attempts` here would silently undo that reset the moment
+        # the launch subprocess itself fails (before ever reaching tmux) —
+        # rare, but exactly the "resumed only to give up again immediately"
+        # failure the issue calls out by name. `plan.writes()` carries the
+        # freshest resolved value for this key, the same one `_apply_writes`
+        # already persisted; fall back to `target.attempts` only when this
+        # tick wrote nothing for it (the common case — no reconcile touched
+        # this entry's `attempts`).
+        base_attempts = dict(plan.writes()).get(target.key, {}).get(
+            "attempts", target.attempts
+        )
+        attempts = base_attempts + 1
         reason = (
             f"launch failed (exit {returncode}): {message}"
             if message

@@ -342,6 +342,106 @@ class TestDriveQueueHoldScopeColumn:
         assert entry["hold_scope"] == "fleet"
 
 
+# ── drive_queue.resumes column (#2230) ──────────────────────────────────────
+
+# Everything up to and including #2186's `hold_scope` — the real upgrade path
+# for every ~/.coord/coord.db in the field right now, since #2230 is the
+# first migration to add a column after it.
+_PRE_2230_TABLE = """
+    CREATE TABLE drive_queue (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo_name     TEXT    NOT NULL,
+        issue_number  INTEGER NOT NULL,
+        position      INTEGER NOT NULL,
+        machine       TEXT,
+        after_json    TEXT    NOT NULL DEFAULT '[]',
+        state         TEXT    NOT NULL DEFAULT 'waiting',
+        attempts      INTEGER NOT NULL DEFAULT 0,
+        deferrals     INTEGER NOT NULL DEFAULT 0,
+        last_reason   TEXT    NOT NULL DEFAULT '',
+        reason_at     REAL,
+        session_name  TEXT,
+        launched_at   REAL,
+        enqueued_at   REAL    NOT NULL,
+        hold_after    INTEGER NOT NULL DEFAULT 0,
+        hold_reason   TEXT    NOT NULL DEFAULT '',
+        resume_when   TEXT    NOT NULL DEFAULT '',
+        hold_state    TEXT    NOT NULL DEFAULT '',
+        hold_probes   INTEGER NOT NULL DEFAULT 0,
+        launch_host   TEXT    NOT NULL DEFAULT '',
+        hold_scope    TEXT    NOT NULL DEFAULT 'entry',
+        UNIQUE(repo_name, issue_number)
+    )
+"""
+
+
+class TestDriveQueueResumesColumn:
+    def test_fresh_database_has_it_from_the_create(
+        self, isolated_conn: sqlite3.Connection
+    ) -> None:
+        assert "resumes" in _drive_queue_columns(isolated_conn)
+
+    def test_existing_pre_2230_database_gains_it_in_place(self) -> None:
+        """The real path: a `blocked` row written before #2230 shipped —
+        including one that is currently `blocked`, the exact shape #2230's
+        sweep must be able to read `resumes=0` off without raising.
+        """
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(_PRE_2230_TABLE)
+        conn.execute(
+            "INSERT INTO drive_queue "
+            "(repo_name, issue_number, position, after_json, enqueued_at, "
+            " state, attempts, last_reason) "
+            "VALUES ('quadraui', 309, 0, '[]', 100.0, 'blocked', 2, "
+            "'drive session died without landing the work 2/2 times')"
+        )
+        conn.commit()
+        assert "resumes" not in _drive_queue_columns(conn)
+
+        _ensure_schema(conn)
+
+        assert "resumes" in _drive_queue_columns(conn)
+        row = conn.execute(
+            "SELECT resumes FROM drive_queue WHERE issue_number = 309"
+        ).fetchone()
+        # A row predating this column has never been auto-resumed — 0, not
+        # NULL, so `QueueEntry.from_row`'s `int(row.get('resumes') or 0)`
+        # never has to guess.
+        assert row["resumes"] == 0
+        conn.close()
+
+    def test_migration_is_idempotent(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(_PRE_2230_TABLE)
+        conn.commit()
+        _ensure_schema(conn)
+        _ensure_schema(conn)
+        _ensure_schema(conn)
+        assert "resumes" in _drive_queue_columns(conn)
+        conn.close()
+
+    def test_state_accessor_reads_and_writes_the_upgraded_column(self) -> None:
+        from coord import state
+
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(_PRE_2230_TABLE)
+        conn.commit()
+        _ensure_schema(conn)
+        override_connection(conn)
+        try:
+            state._enqueue_drive_queue_local("quadraui", 309)
+            state._update_drive_queue_entry_local(
+                "quadraui", 309, state="waiting", attempts=0, resumes=1
+            )
+            entry = state._get_drive_queue_entry_local("quadraui", 309)
+        finally:
+            close()
+        assert entry["resumes"] == 1
+
+
 # ── merge_queue.ci_infra_reruns column (#1892) ──────────────────────────────
 
 _PRE_1892_MERGE_QUEUE_TABLE = """

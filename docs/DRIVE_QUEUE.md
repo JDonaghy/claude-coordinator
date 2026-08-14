@@ -269,9 +269,9 @@ coord drive-queue tick --reconcile-only   # same as --max-parallel 0
 ```
 
 It runs the same reconcile pass as a normal tick (finished → `done`,
-permanently-refused → `blocked`, CI-pending → `parked`) and then stops: no
-capacity walk, no queue-level alert, no launch. Safe with the timer stopped or
-running.
+permanently-refused → `blocked`, CI-pending → `parked`, a `blocked` entry
+whose gate cleared → `waiting`, #2230 — see §4b) and then stops: no capacity
+walk, no queue-level alert, no launch. Safe with the timer stopped or running.
 
 ### `parked` — and the two ways out of it (#1891 / #2158)
 
@@ -325,12 +325,21 @@ Entries deferred **only** because their repo is at `--max-parallel-per-repo`
 (§9) deliberately raise no alert at all — that is the queue working, not a
 stall. A mixed tick (something also deferred on a pre-req, or blocked) still
 alerts, and lists the repo-limit deferrals alongside.
-| `QUEUE: BLOCKED 2 · 1 waiting` (warn/crit, **outranks a simultaneous stall**) | one or more entries are unsatisfiable and will never launch on their own: a dependency cycle, an `--after` pre-req that can't resolve, or a drive session that died `attempts` times in a row (default `DEFAULT_MAX_ATTEMPTS = 2`) | needs an operator action — see below |
+| `QUEUE: BLOCKED 2 · 1 waiting` (warn/crit, **outranks a simultaneous stall**) | one or more entries are `blocked`: a dependency cycle, an `--after` pre-req that can't resolve, or a drive session that died `attempts` times in a row (default `DEFAULT_MAX_ATTEMPTS = 2`). Since #2230 (§4b) this is no longer necessarily permanent — a `blocked` entry whose cause is its own merge gate may resume on its own before you get to it | usually needs an operator action — see below, and §4b for the cases that resolve themselves |
 
 `coord drive-queue status` (or the TUI overlay) shows the reason for both.
-Each `blocked` entry's fix is remove-and-re-add — there is deliberately no
-`coord drive-queue reset`, because a fresh row is already `waiting` with
-`attempts=0` and no stale `--after`:
+
+**Since #2230, not every `blocked` entry needs a human.** Every tick
+re-checks a `blocked` entry's own merge gate (unless it blocked for one of
+the two PERMANENT causes in §4a, or a cycle/broken `--after`) and, the moment
+that gate reads clear, moves it straight back to `waiting` with `attempts`
+reset — no remove+add, no operator action. See §4b below for the detail and
+the churn bound. If a row is STILL `blocked` by the time you're reading this,
+either it never had a re-evaluable cause, its gate is genuinely still shut, or
+it has already oscillated past `MAX_BLOCKED_RESUMES` — `coord drive-queue
+list` says which. For that entry, the fix is remove-and-re-add — there is
+deliberately no `coord drive-queue reset`, because a fresh row is already
+`waiting` with `attempts=0` and no stale `--after`:
 
 ```bash
 coord drive-queue remove REPO ISSUE && coord drive-queue add REPO ISSUE
@@ -367,6 +376,58 @@ that has merely not been dispatched *yet* is indistinguishable from one that
 never will be, so it is left alone rather than escalated). Elapsed time is not
 an input: the predicate refuses to fire while anything is active, so a
 legitimately quiet long-running stage can never trip it however long it runs.
+
+### 4b. `blocked` self-heals when the gate clears (#2230)
+
+Before #2230, `blocked` was terminal in the strongest sense: nothing ever
+asked again whether the condition that blocked an entry had since cleared on
+its own, even when it plainly had — quadraui#309 sat `blocked attempts=2` for
+~11h while `coord gates quadraui 309` read `merge: READY` for most of that
+window, and the driver had simply exhausted its two attempts against a gate
+reading that was no longer true by the time anyone looked.
+
+Every tick now re-examines every `blocked` entry, EXCEPT:
+
+* the two permanent causes in §4a (`refused`/`dead_end`) — a relaunch cannot
+  change either outcome, so re-checking would just burn a live gate call to
+  re-confirm an answer already on record;
+* an entry blocked on a broken `--after` graph (a cycle, a pre-req that is
+  itself `blocked`/`failed`, an unknown issue) — that is a QUEUE-graph
+  problem, not a merge-gate one, and is not what this sweep re-checks (see
+  `coord drive-queue list`'s "unsatisfied" line, refreshed on every read by
+  #2183, for that diagnosis instead);
+* an entry with no evidence either way — one that never reached the merge
+  queue at all has nothing this sweep can cheaply check, and guessing would
+  re-burn attempts on entries that provably cannot change, exactly the "worse
+  than nothing" sweep the issue that added this warns against.
+
+For everything else — overwhelmingly the `exhausted` outcome, a drive that
+died `attempts` times in a row for whatever reason — the tick asks the SAME
+question `coord merge --plan`/`--only` would answer right now: is this
+entry's merge gate still objecting? A CONFIRMED-clear reading moves the entry
+straight back to `waiting`, `attempts` reset to 0, and it re-enters the walk
+on this same tick (it can launch immediately if a slot is free). A confirmed
+or unreadable "still shut" reading changes nothing — no write, no line in the
+render, the row looks exactly as it would have before this feature existed.
+
+**The churn bound.** An entry that gets auto-resumed and reblocked
+`MAX_BLOCKED_RESUMES` (3) times in a row stops being auto-resumed — that
+pattern (a gate that clears and reblocks repeatedly) is itself the
+interesting fact, not something a fourth retry is likely to fix. Once the
+ceiling is hit the row stays `blocked`, its `last_reason` is rewritten to say
+so explicitly, and a `coord escalate` record is written the same as any other
+blocked entry — `coord drive-queue list` shows the running count as
+`resumes=N/3` next to `attempts=`/`deferrals=`.
+
+**Where the evidence comes from.** On the daemon host — the only machine
+`coord drive-queue tick` ever runs on — the tick reads the local DB directly
+and has no live `merge_plan` section to consult for free, so it pays for one
+`coord.merge_queue.entry_gate_status` call (the same live backend `coord
+merge --plan`/`--only` build) per QUALIFYING blocked entry — bounded to the
+entries actually sitting in `blocked` right now (typically 0-2), never the
+whole queue. See `coord.commands.drive_queue._fetch_live_blocked_gate`'s
+docstring for the full justification; it is the exact same mechanism #2182
+already uses to release a `parked` entry on the same lane.
 
 ## 5. The pinned-CLI trap
 

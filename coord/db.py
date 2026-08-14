@@ -408,6 +408,17 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             -- this column existed reads as the narrower scope, never a silent
             -- fleet-wide one — see coord.drive_queue.QueueEntry.hold_scope.
             hold_scope    TEXT    NOT NULL DEFAULT 'entry',
+            -- #2230: count of times the tick's blocked-reconciliation sweep
+            -- has auto-resumed THIS row from 'blocked' back to 'waiting' —
+            -- see coord.drive_queue.MAX_BLOCKED_RESUMES / _reconcile_blocked.
+            -- `blocked` used to be genuinely terminal (nothing ever asked
+            -- again whether the gate that blocked an entry had since
+            -- cleared); this bounds how many times the sweep will requeue
+            -- the SAME entry before it stops and leaves it blocked for an
+            -- operator, so a gate that itself flaps cannot oscillate the
+            -- entry forever. 0 for every row predating this column, same as
+            -- a freshly-enqueued entry that has never been auto-resumed.
+            resumes       INTEGER NOT NULL DEFAULT 0,
             UNIQUE(repo_name, issue_number)
         );
 
@@ -731,6 +742,11 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         # row holds only its own dependents rather than the whole queue, which
         # is the #2186 fix itself, not just a schema detail.
         "ALTER TABLE drive_queue ADD COLUMN hold_scope TEXT NOT NULL DEFAULT 'entry'",
+        # #2230: see the CREATE TABLE comment above — count of times the
+        # blocked-reconciliation sweep has auto-resumed a row from 'blocked'.
+        # 0 for every row predating this migration, same as the column's own
+        # default for a freshly-enqueued entry.
+        "ALTER TABLE drive_queue ADD COLUMN resumes INTEGER NOT NULL DEFAULT 0",
     ]
     for sql in migrations:
         try:

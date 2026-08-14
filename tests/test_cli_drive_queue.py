@@ -406,9 +406,13 @@ def test_blocked_row_drops_a_merged_prereq_and_leads_with_its_own_cause(
     # The full reason is still available on its own line, unabridged.
     assert own_reason in result.output
 
-    # Rule 4: blocked's terminality is stated on the row's own output, not
-    # buried in an unrelated entry's hand-written note.
-    assert "is terminal" in result.output
+    # Rule 4: the fact that the `after=` graph above won't self-heal is
+    # stated on the row's own output, not buried in an unrelated entry's
+    # hand-written note. (#2230 changed the wording from an unqualified
+    # "is terminal" — the row's MERGE GATE, unlike its `after=` graph, now
+    # can self-heal — but the remove+add remedy for a genuinely-dead `after=`
+    # graph is unchanged.)
+    assert "never re-checked on its own" in result.output
     assert "remove" in result.output and "add" in result.output
 
 

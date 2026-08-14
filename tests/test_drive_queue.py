@@ -1502,6 +1502,175 @@ def test_a_still_failed_entry_is_left_untouched():
     assert plan.launch is None
 
 
+# ── #2230: `blocked` reconciliation — re-evaluable vs permanent ────────────
+#
+# quadraui#309 sat `blocked attempts=2` for ~11h while its merge was landable
+# for most of that window. These pin the split: a `blocked` entry whose cause
+# is a re-evaluable gate reading resumes, with attempts reset, the moment
+# that reading clears; a PERMANENTLY-blocked entry (#1844/#2019) never does,
+# however clear the gate reads; and an entry with no evidence either way is
+# left exactly as untouched as #2055 already pinned above.
+
+
+def _blocked_entry(issue: int, **kw) -> QueueEntry:
+    kw.setdefault("state", STATE_BLOCKED)
+    kw.setdefault("attempts", DEFAULT_MAX_ATTEMPTS)
+    kw.setdefault(
+        "last_reason",
+        "drive session died without landing the work, launched 90s ago "
+        f"(attempt {DEFAULT_MAX_ATTEMPTS}/{DEFAULT_MAX_ATTEMPTS}) — giving up",
+    )
+    return entry(issue, **kw)
+
+
+def test_a_blocked_entry_whose_live_gate_reads_clear_resumes_with_attempts_reset():
+    entries = [_blocked_entry(309, position=3, resumes=0)]
+    plan = plan_tick(
+        entries, board(), capacity=1, live_blocked_gate={entry_key(REPO, 309): False}
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "resumed"
+    assert reconcile.updates["state"] == STATE_WAITING
+    assert reconcile.updates["attempts"] == 0
+    assert reconcile.updates["resumes"] == 1
+    # …and it falls straight into this SAME tick's launch selection, exactly
+    # like a released `parked`/deploy-gate entry already does.
+    assert plan.launch is not None and plan.launch.issue == 309
+
+
+def test_a_blocked_entry_whose_live_gate_still_reads_blocked_stays_blocked():
+    entries = [_blocked_entry(309, position=3)]
+    plan = plan_tick(
+        entries, board(), capacity=1, live_blocked_gate={entry_key(REPO, 309): True}
+    )
+    assert plan.reconciles == ()
+    assert plan.launch is None
+
+
+def test_a_blocked_entry_with_no_gate_evidence_stays_blocked_untouched():
+    """No live override, no cached board signal: #2230's sweep never
+    guesses — same outcome as pre-#2230 (`test_a_still_blocked_entry_is_left_
+    untouched_not_resumed_to_waiting` above), now pinned with the new
+    parameter wired in and explicitly empty."""
+    entries = [_blocked_entry(309, position=3)]
+    plan = plan_tick(entries, board(), capacity=1, live_blocked_gate={})
+    assert plan.reconciles == ()
+    assert plan.launch is None
+
+
+def test_a_permanently_refused_blocked_entry_is_never_resumed():
+    """#1844: even a live gate reading of 'clear now' must not resume a
+    permanent refusal — relaunching a deterministic guard refusal changes
+    nothing, so this sweep must not even ask."""
+    entries = [
+        _blocked_entry(
+            70,
+            position=1,
+            last_reason=(
+                "dispatch failed: ... (exit_code=5) — refused by a "
+                "pre-dispatch guard, which cannot change on retry (#1844); "
+                "blocking without spending an attempt"
+            ),
+        )
+    ]
+    plan = plan_tick(
+        entries, board(), capacity=1, live_blocked_gate={entry_key(REPO, 70): False}
+    )
+    assert plan.reconciles == ()
+    assert plan.launch is None
+
+
+def test_a_dead_end_blocked_entry_is_never_resumed():
+    """#2019: same posture as the #1844 refusal above."""
+    entries = [
+        _blocked_entry(
+            88,
+            position=1,
+            last_reason=(
+                "the board row is terminal and unactionable (nothing "
+                "active, no gate transition available), which cannot "
+                "change on retry (#2019); blocking without spending an "
+                "attempt"
+            ),
+        )
+    ]
+    plan = plan_tick(
+        entries, board(), capacity=1, live_blocked_gate={entry_key(REPO, 88): False}
+    )
+    assert plan.reconciles == ()
+    assert plan.launch is None
+
+
+def test_a_blocked_entry_that_has_hit_the_resume_ceiling_stays_blocked_and_says_so():
+    """#2230's churn bound: an entry already resumed MAX_BLOCKED_RESUMES times
+    must not oscillate forever — it stays `blocked`, but `last_reason` is
+    rewritten so the oscillation itself is visible, not silently swallowed."""
+    from coord.drive_queue import MAX_BLOCKED_RESUMES
+
+    entries = [_blocked_entry(309, position=3, resumes=MAX_BLOCKED_RESUMES)]
+    plan = plan_tick(
+        entries, board(), capacity=1, live_blocked_gate={entry_key(REPO, 309): False}
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "oscillating"
+    assert "state" not in reconcile.updates  # stays blocked — no state write
+    assert "resumes" not in reconcile.updates  # ceiling hit: not bumped again
+    assert str(MAX_BLOCKED_RESUMES) in reconcile.reason
+    assert plan.launch is None
+
+
+def test_a_blocked_entry_that_lands_still_reconciles_to_done_before_any_gate_check():
+    """#2055's landed check runs BEFORE #2230's gate re-check — a merged
+    issue reconciles to `done` even if a live override would say 'blocked'."""
+    entries = [_blocked_entry(309, position=3)]
+    plan = plan_tick(
+        entries,
+        board(merged=(309,)),
+        capacity=1,
+        live_blocked_gate={entry_key(REPO, 309): True},
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "done"
+    assert reconcile.updates["state"] == STATE_DONE
+
+
+def test_a_blocked_entry_resumes_from_the_cheap_cached_board_signal_too():
+    """No live override at all (the thin-client lane, where `/board` already
+    carries a `merge_plan` section for free) — `IssueFacts.merge_gate_status`
+    alone is enough evidence to resume."""
+    key = entry_key(REPO, 309)
+    view = BoardView(issues={key: IssueFacts(known=True, merge_gate_status="READY")})
+    entries = [_blocked_entry(309, position=3)]
+    plan = plan_tick(entries, view, capacity=1)
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "resumed"
+    assert reconcile.updates["state"] == STATE_WAITING
+    assert reconcile.updates["attempts"] == 0
+
+
+def test_a_blocked_entry_stays_blocked_on_a_cached_still_blocked_board_signal():
+    key = entry_key(REPO, 309)
+    view = BoardView(
+        issues={key: IssueFacts(known=True, merge_gate_status="BLOCKED")}
+    )
+    entries = [_blocked_entry(309, position=3)]
+    plan = plan_tick(entries, view, capacity=1)
+    assert plan.reconciles == ()
+    assert plan.launch is None
+
+
+def test_is_permanent_block_reason_recognises_both_markers_and_nothing_else():
+    from coord.drive_queue import is_permanent_block_reason
+
+    assert is_permanent_block_reason("... (#1844); blocking without spending an attempt")
+    assert is_permanent_block_reason("... (#2019); blocking without spending an attempt")
+    assert not is_permanent_block_reason(
+        "drive session died without landing the work 2/2 times — giving up"
+    )
+    assert not is_permanent_block_reason("")
+    assert not is_permanent_block_reason(None)
+
+
 def test_a_genuinely_dead_drive_without_ci_pending_still_retries_normally():
     """No regression: without `merge_ci_pending`, a dead drive takes the
     EXACT pre-#1891 path — this is byte-for-byte

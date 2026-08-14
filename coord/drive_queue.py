@@ -72,7 +72,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from coord.drive_state import TERMINAL_STATUSES, WORK_LIKE
 from coord.gate_a import is_gate_a_refusal_reason
-from coord.merge_queue import is_ci_infra_reason, is_ci_pending_reason
+from coord.merge_queue import PLAN_READY, is_ci_infra_reason, is_ci_pending_reason
 
 # ── queue states ─────────────────────────────────────────────────────────────
 #
@@ -80,6 +80,16 @@ from coord.merge_queue import is_ci_infra_reason, is_ci_pending_reason
 # terminal and stay in the table until an operator removes them, so
 # `coord drive-queue list` doubles as a short run history (coord/db.py's
 # drive_queue comment states that contract).
+#
+# #2230 qualifies "terminal" for `blocked` specifically: it still means "no
+# `coord drive` launches from this row again on its own" and "stays in the
+# table for history" for a PERMANENT cause (#1844/#2019) or one the sweep has
+# no evidence about. It no longer means "nothing ever writes to this row
+# again" — a `blocked` entry whose cause was a re-evaluable gate reading may
+# be moved straight back to `waiting` by `plan_tick`'s own reconcile pass,
+# with no operator action, the moment that reading clears. See
+# `is_permanent_block_reason` and `_reconcile_blocked` below for exactly
+# which `blocked` rows still get the old, fully-terminal treatment.
 
 STATE_WAITING = "waiting"
 STATE_RUNNING = "running"
@@ -145,6 +155,67 @@ TERMINAL_QUEUE_STATES: frozenset[str] = frozenset(
 # genuinely-pending park is never cut short in practice; it is a backstop for
 # the unrefreshable case, not a second CI timeout.
 PARK_STALE_SECONDS = 45 * 60.0
+
+# ── `blocked` reconciliation (#2230) ─────────────────────────────────────────
+#
+# `blocked` used to be genuinely terminal: nothing ever asked again whether
+# the condition that blocked an entry had since cleared, even when it plainly
+# had. quadraui#309 sat `blocked attempts=2` for ~11h while `coord gates
+# quadraui 309` read `merge: READY` for most of that window — the driver had
+# exhausted its attempts against a gate reading that was, by the time anyone
+# looked, no longer true. #1616 names the general shape: a stage that stops on
+# a transient condition and is never re-examined stays stopped forever.
+#
+# NOT EVERY `blocked` REASON IS RE-EVALUABLE, and a sweep that cannot tell the
+# two apart is worse than the terminal state it replaces — it re-burns
+# attempts on an entry that provably cannot change and buries the real,
+# recoverable entries in churn. #1844 already drew this exact line for a
+# DIFFERENT queue transition (a permanent pre-dispatch guard refusal skips
+# straight to `blocked` WITHOUT spending an attempt, because nothing about
+# waiting and relaunching can change a deterministic refusal); #2019 rides the
+# same branch for a dead-end row. Both stamp a recognisable marker into their
+# own `last_reason` — see `_reconcile_running`'s `refused`/`dead_end`
+# branches — which is what :func:`is_permanent_block_reason` below reuses
+# rather than inventing a second classification.
+#
+# Everything else that reaches `blocked` — overwhelmingly `exhausted`, a drive
+# that died `max_attempts` times in a row for whatever reason, #309's shape
+# exactly — is a CANDIDATE for re-checking, never a guarantee: the sweep only
+# ever acts on POSITIVE evidence that the entry's own merge gate now reads
+# clear (see `_reconcile_blocked` and the `live_blocked_gate` parameter of
+# `plan_tick`). No evidence either way leaves the entry exactly as untouched
+# as it was before this feature existed.
+_PERMANENT_BLOCK_MARKERS: tuple[str, ...] = ("(#1844)", "(#2019)")
+
+
+def is_permanent_block_reason(text: str | None) -> bool:
+    """Whether *text* names a PERMANENT cause of `blocked` — #2230's sweep
+    must never re-check these; relaunching cannot change either outcome.
+
+    Marker-based, the same convention `coord.gate_a.is_gate_a_refusal_reason`
+    uses for the analogous Gate-A classification: cheap, and correct even
+    though neither `_reconcile_running` branch persists a typed "why" column
+    of its own — the prose those two branches write into `last_reason` is the
+    only durable record a later tick has to go on.
+    """
+    if not text:
+        return False
+    return any(marker in text for marker in _PERMANENT_BLOCK_MARKERS)
+
+
+# How many times #2230's sweep may resume the SAME blocked entry back to
+# `waiting` before it stops trying and leaves the entry blocked for an
+# operator. Without a ceiling, an entry whose gate reading itself flaps (CI
+# genuinely green, then genuinely red, then green again; a live re-check
+# racing an in-flight `coord merge` attempt) would oscillate blocked/waiting
+# forever — spending a fresh `coord drive` launch each cycle and burying any
+# real signal in churn, exactly the failure mode the issue warns a naive
+# "retry everything" sweep would create. 3 is deliberately small: a gate that
+# clears and then reblocks three separate times is itself the interesting
+# fact, not something more retries will resolve — see `QueueEntry.resumes`
+# and the `oscillating` reconcile outcome `_reconcile_blocked` produces once
+# the ceiling is reached.
+MAX_BLOCKED_RESUMES = 3
 
 # ── deploy-gate states (#1757) ───────────────────────────────────────────────
 #
@@ -420,6 +491,15 @@ class QueueEntry:
     # unrecognised value) reads as `HOLD_SCOPE_ENTRY` — the narrower, safer
     # default — never as a silent fleet-wide stop.
     hold_scope: str = HOLD_SCOPE_ENTRY
+    # #2230: count of times the `blocked`-reconciliation sweep has resumed
+    # THIS entry from `blocked` back to `waiting` — see `MAX_BLOCKED_RESUMES`
+    # and `_reconcile_blocked`. 0 for every row predating this column and for
+    # any entry that has never been auto-resumed, which is the common case;
+    # it is never reset by a normal launch/retry cycle, only by an operator's
+    # `remove && add` (a fresh row), so a gate that keeps flapping across
+    # several give-ups is still visible as a rising number rather than
+    # restarting its count each time.
+    resumes: int = 0
 
     @property
     def key(self) -> str:
@@ -493,6 +573,7 @@ class QueueEntry:
             hold_state=str(row.get("hold_state") or HOLD_NONE),
             hold_probes=int(row.get("hold_probes") or 0),
             hold_scope=cls._normalize_hold_scope(row.get("hold_scope")),
+            resumes=int(row.get("resumes") or 0),
         )
 
 
@@ -551,6 +632,23 @@ class IssueFacts:
     # A `False` reading cannot refresh itself at all, so `plan_tick` ages it
     # out (:data:`PARK_STALE_SECONDS`) rather than trusting it forever.
     merge_ci_pending_live: bool = False
+    # #2230: this issue's merge-plan STATUS — `coord.merge_queue.PLAN_READY`/
+    # `PLAN_BLOCKED`/`PLAN_MERGING`/`PLAN_MERGED`/`PLAN_NEEDS_ATTENTION` — as
+    # of the LIVE `merge_plan` section of a `/board` fetch, i.e. served off
+    # the tick-refreshed gate snapshot (#1336 Invariant 1: no `gh` call on
+    # this read path). `''` when the entry has no merge-queue row at all
+    # right now (never enqueued, already drained out of PENDING, or this
+    # board fetch has no `merge_plan` section — see
+    # `_local_merge_queue_rows`'s docstring for the one lane that doesn't:
+    # the daemon-host tick, which reads the local DB directly). Unlike
+    # `merge_ci_pending`, which only ever says "still shut", this is the
+    # general READY/BLOCKED reading `_reconcile_blocked` needs to release a
+    # `blocked` entry whose gate cleared for a reason OTHER than CI — a
+    # review approval, a smoke verdict, a staleness re-run — not just CI.
+    merge_gate_status: str = ""
+    # The plan's own `reason` alongside `merge_gate_status`, carried purely
+    # for diagnostics — same posture as `merge_ci_pending_reason` above.
+    merge_gate_reason: str = ""
 
     @property
     def open(self) -> bool:
@@ -665,7 +763,19 @@ def build_board_view(
         number = row.get("issue_number")
         if not repo or number is None:
             continue
-        plan_rows[entry_key(repo, int(number))] = row
+        key = entry_key(repo, int(number))
+        plan_rows[key] = row
+        # #2230: the plan's own STATUS, stashed for EVERY entry with a
+        # merge-plan row — not just a CI-pending one, unlike the
+        # `merge_ci_pending` loop below. This is what lets `_reconcile_blocked`
+        # tell "cleared" from "still shut" for a `blocked` entry on the cheap
+        # lane (a live `/board` fetch): a plan reading `PLAN_READY` is
+        # positive evidence the gate cleared for ANY reason (review, smoke,
+        # CI, staleness), where `merge_ci_pending` can only ever confirm
+        # "still shut on CI specifically".
+        got = slot(key)
+        got["merge_gate_status"] = str(row.get("status") or "")
+        got["merge_gate_reason"] = str(row.get("reason") or "")
 
     for row in payload.get("merge_queue") or []:
         repo = row.get("repo_name") or ""
@@ -1707,6 +1817,128 @@ def _reconcile_running(
     )
 
 
+# ── `blocked` reconciliation (#2230) ─────────────────────────────────────────
+
+
+def _blocked_gate_reading(
+    entry: QueueEntry,
+    facts: IssueFacts,
+    live_blocked_gate: Mapping[str, bool] | None,
+) -> bool | None:
+    """Whether #2230's sweep currently has evidence about *entry*'s gate.
+
+    ``True``  — confirmed still shut, leave it alone.
+    ``False`` — confirmed clear now, resume it.
+    ``None``  — no evidence either way; leave it alone (never guess).
+
+    Two sources, checked in order, the first one present wins:
+
+    * *live_blocked_gate* — a FRESH, single-entry re-derivation the shell
+      took THIS tick, via the same ``coord.merge_queue.entry_gate_status``
+      ``coord merge --plan``/``--only`` call, against the SAME live backend
+      (see ``coord.commands.drive_queue._fetch_live_blocked_gate``). This is
+      what actually fires in production: the daemon-host tick — the only
+      host `coord drive-queue tick` ever runs on — reads the local DB
+      directly and never computes a ``merge_plan`` section at all (mirrors
+      exactly the gap #2182 closed for ``parked``; see
+      ``_fetch_live_ci_gate``'s docstring), so without this override the
+      sweep would have no evidence whatsoever on the one lane that matters.
+    * ``facts.merge_gate_status`` — the passive board reading, free on any
+      lane that DOES serve a ``merge_plan`` section (a thin client's live
+      ``/board``). ``PLAN_READY`` reads as cleared; any other non-empty
+      status (``BLOCKED``/``MERGING``/``MERGED``/``NEEDS_ATTENTION``) reads
+      as still shut; ``''`` (no merge-queue row at all right now) is no
+      evidence.
+    * ``facts.merge_ci_pending`` — #1891's narrower CI-only signal, consulted
+      last as a final "still shut" fallback for a board that populated that
+      field but not (yet) `merge_gate_status` (e.g. an older payload shape in
+      a test, or a partial section). It can only ever confirm "still shut",
+      never "cleared" — it was never designed to answer the general question.
+    """
+    live = (live_blocked_gate or {}).get(entry.key)
+    if live is not None:
+        return live
+    if facts.merge_gate_status:
+        return facts.merge_gate_status != PLAN_READY
+    if facts.merge_ci_pending:
+        return True
+    return None
+
+
+def _reconcile_blocked(
+    entry: QueueEntry,
+    facts: IssueFacts,
+    live_blocked_gate: Mapping[str, bool] | None,
+) -> Reconcile | None:
+    """Re-examine ONE `blocked` entry against the current gate reading.
+
+    Returns ``None`` — nothing to report, nothing to write — in every case
+    except a CONFIRMED-clear reading, which is deliberate: a `blocked` entry
+    this sweep cannot say anything new about must render EXACTLY as it did
+    before #2230 existed. Three ways to land there:
+
+    * the block is PERMANENT (:func:`is_permanent_block_reason`) — #1844's
+      guard refusal or #2019's dead end — neither of which any amount of
+      re-checking can ever change;
+    * there is no evidence either way (:func:`_blocked_gate_reading` returns
+      ``None``) — an entry that never reached the merge queue at all (a
+      dispatch-time failure, an unsatisfiable ``after=``) has nothing this
+      sweep can cheaply re-check, and guessing would be exactly the "worse
+      than nothing" sweep the issue warns a naive "retry everything" pass
+      would be;
+    * the gate is CONFIRMED still shut — the common, honest outcome for a
+      `blocked` entry that has not in fact recovered yet.
+
+    Only a confirmed-clear reading does anything, and even then only up to
+    :data:`MAX_BLOCKED_RESUMES` — past that ceiling the entry stays
+    `blocked`, but its `last_reason` is rewritten to say so out loud (the
+    issue's explicit ask), which is also what feeds the oscillation signal
+    into `coord drive-queue list`/`status` without inventing a second alert
+    channel for it.
+    """
+    if is_permanent_block_reason(entry.last_reason):
+        return None
+    reading = _blocked_gate_reading(entry, facts, live_blocked_gate)
+    if reading is None or reading:
+        return None
+
+    if entry.resumes >= MAX_BLOCKED_RESUMES:
+        reason = (
+            f"{entry.key}'s merge gate reads clear again "
+            f"({facts.merge_gate_reason or facts.merge_ci_pending_reason or 'no gate objection'}), "
+            f"but this entry has already been auto-resumed {entry.resumes} "
+            "time(s) and reblocked every time — staying blocked rather than "
+            "oscillating (#2230); look at what keeps reblocking it, not just "
+            "the gate reading"
+        )
+        return Reconcile(
+            entry.key,
+            "oscillating",
+            reason,
+            occupies=False,
+            updates={"last_reason": reason},
+        )
+
+    reason = (
+        f"{entry.key}'s merge gate reads clear now "
+        f"({facts.merge_gate_reason or facts.merge_ci_pending_reason or 'no gate objection'}) "
+        f"— resuming from blocked without an operator remove+add, attempt "
+        f"budget reset (resume {entry.resumes + 1}/{MAX_BLOCKED_RESUMES}) (#2230)"
+    )
+    return Reconcile(
+        entry.key,
+        "resumed",
+        reason,
+        occupies=False,
+        updates={
+            "state": STATE_WAITING,
+            "attempts": 0,
+            "resumes": entry.resumes + 1,
+            "last_reason": reason,
+        },
+    )
+
+
 # ── deploy gates (#1757) ─────────────────────────────────────────────────────
 
 
@@ -1933,6 +2165,7 @@ def plan_tick(
     gate_a_pending: Mapping[str, bool] | None = None,
     cordons: Mapping[str, str] | None = None,
     live_ci_gate: Mapping[str, bool] | None = None,
+    live_blocked_gate: Mapping[str, bool] | None = None,
 ) -> TickPlan:
     """Decide one tick.  Pure; the caller executes the returned plan.
 
@@ -2024,19 +2257,36 @@ def plan_tick(
     side, which computes this ONLY for the bounded set of entries currently
     `parked` on a CI reason, never the whole queue.
 
-    The algorithm, from #1754, plus #1757's step 2, #1891's step 1b, and
-    #2055's extension of it:
+    *live_blocked_gate* is #2230's counterpart, for `blocked` instead of
+    `parked`: maps a RE-EVALUABLE `blocked` entry's key (never one
+    :func:`is_permanent_block_reason` recognises — the shell never even
+    computes a reading for those, see
+    :func:`coord.commands.drive_queue._fetch_live_blocked_gate`) to whether a
+    fresh single-entry `entry_gate_status` re-derivation, taken THIS tick,
+    still finds it blocked. Same authority rule as *live_ci_gate*: present
+    beats the cached board's `IssueFacts.merge_gate_status`; absent falls
+    through to it. See :func:`_blocked_gate_reading`.
+
+    The algorithm, from #1754, plus #1757's step 2, #1891's step 1b, #2055's
+    extension of it, and #2230's further extension for `blocked`:
 
     1. Reconcile every ``running`` entry (:func:`_reconcile_running`).
     1b. Re-check every ``parked``/``blocked``/``failed`` entry against the
         CURRENT board: landed ⇒ ``done`` (#1891 for ``parked``, #2055 for
-        ``blocked``/``failed``). For ``parked`` only, not-yet-landed then
-        also checks the gate: cleared ⇒ ``waiting`` (falls into step 4 on
-        this SAME tick); still shut ⇒ untouched, no write, nothing to
-        report. ``blocked``/``failed`` that haven't landed are left alone
-        entirely — this never resurrects them for dispatch, only lets a
-        finished one stop claiming to be unfinished. Never spends an
-        attempt either way — a missing CI verdict is not a failed one.
+        ``blocked``/``failed``). Not-yet-landed then also checks the gate,
+        for ``parked`` and (#2230) for RE-EVALUABLE ``blocked`` entries
+        alike: cleared ⇒ ``waiting`` (falls into step 4 on this SAME tick,
+        `blocked`'s `attempts` reset to 0 — see :func:`_reconcile_blocked`);
+        still shut, or no evidence either way ⇒ untouched, no write, nothing
+        to report. A PERMANENTLY-blocked entry (#1844/#2019) and a `blocked`
+        entry re-cleared and re-blocked :data:`MAX_BLOCKED_RESUMES` times
+        already are never resumed — the former can never change, the latter
+        is oscillation, a signal in its own right (see the `oscillating`
+        reconcile outcome). ``failed`` gets the landed check only, same as
+        before #2230 — this never resurrects an entry for dispatch on its
+        own, only lets a finished one stop claiming to be unfinished. Never
+        spends an attempt either way (beyond the reset above) — a missing
+        verdict is not a failed one.
     2. Resolve deploy gates (:func:`_resolve_holds`).  A gate left closed with
        ``scope=fleet`` returns immediately with no launch and a HELD alert —
        before the capacity check, and regardless of how eligible the rest of
@@ -2173,13 +2423,29 @@ def plan_tick(
             )
             states[entry.key] = STATE_DONE
             continue
-        if entry.state != STATE_PARKED:
-            # `blocked`/`failed` entries are terminal for dispatch: the
-            # landed check above is the only re-check they get. Never fall
-            # through to the parked-only CI resume below — that would
-            # relaunch a gave-up entry outside the `blocked`/`failed`
-            # attempt-tracking this function's docstring describes (#2055).
+        if entry.state == STATE_FAILED:
+            # `failed` is terminal for dispatch: the landed check above is
+            # the only re-check it gets (#2055). #2230's sweep is scoped to
+            # `blocked` only — `failed` is not a state anything in this
+            # module writes any more; nothing here is entitled to invent a
+            # gate re-check for it without a reason to believe it needs one.
             continue
+        if entry.state == STATE_BLOCKED:
+            # #2230: re-examine a `blocked` entry against the CURRENT gate
+            # reading before falling through to the `parked`-only machinery
+            # below, which must never run for `blocked` — resurrecting a
+            # gave-up entry via the CI-pending resume was explicitly not the
+            # #2055 fix and is not this one either; see
+            # :func:`_reconcile_blocked` for the full decision.
+            blocked_reconcile = _reconcile_blocked(entry, facts, live_blocked_gate)
+            if blocked_reconcile is not None:
+                reconciles.append(blocked_reconcile)
+                new_state = blocked_reconcile.updates.get("state")
+                if new_state:
+                    states[entry.key] = str(new_state)
+            continue
+        # entry.state == STATE_PARKED falls through to the #1891/#2182/
+        # #2158/#2063 machinery below.
         # #2182: a FRESH, single-entry re-derivation of this exact entry's
         # gate, taken by the shell THIS tick (see the `live_ci_gate`
         # parameter doc above) — authoritative over both the cached board
