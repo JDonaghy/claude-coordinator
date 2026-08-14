@@ -31,6 +31,14 @@ from coord.cli import main
 from coord.commands import release as release_cmd
 from coord.drive_queue import HOLD_FIRED, STATE_RUNNING
 
+# Captured at import time, before any fixture has a chance to monkeypatch
+# `release_cmd._interactive_session_busy` (the `no_network` fixture below
+# stubs it to `lambda config: []` for every test by default) — the one test
+# that needs the REAL function (`test_a_failing_session_probe_does_not_defer
+# _the_fleet`) restores this reference rather than re-importing, which would
+# just re-read whatever monkeypatch currently has installed.
+_REAL_INTERACTIVE_SESSION_BUSY = release_cmd._interactive_session_busy
+
 
 @pytest.fixture()
 def state_dir(tmp_path, monkeypatch):
@@ -43,12 +51,21 @@ def state_dir(tmp_path, monkeypatch):
 
 @pytest.fixture()
 def no_network(monkeypatch):
-    """No PyPI lookup, no /board read, no agent POST unless a test says so."""
+    """No PyPI lookup, no /board read, no agent POST, no tmux/ssh session
+    probe unless a test says so.
+
+    #2228: `_interactive_session_busy` is real network I/O (an ssh probe
+    per configured machine) — `valid_config_path` names hosts
+    (`laptop.tailnet`/`server.tailnet`) that don't exist, so without this
+    every test below would pay a real (if fast-failing) ssh attempt per
+    machine.  Tests that actually exercise the seam override it back.
+    """
     monkeypatch.setattr(release_cmd, "_fetch_board", lambda: ({}, None))
     monkeypatch.setattr(
         release_cmd, "_post",
         lambda *a, **k: pytest.fail("no test should POST without saying so"),
     )
+    monkeypatch.setattr(release_cmd, "_interactive_session_busy", lambda config: [])
 
 
 def _records(state_dir):
@@ -439,6 +456,156 @@ def test_a_busy_host_is_visible_in_a_dry_run_plan(
         l for l in result.output.splitlines() if "would roll" in l
     )
     assert "laptop:9" in result.output
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# #2228: a live interactive session is host-local activity the board cannot
+# see (`coord assign --interactive` never POSTs `/assign`) — it must defer a
+# roll exactly like a live headless assignment does.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def test_a_live_interactive_session_defers_its_host_alone(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    """`laptop` has a live interactive session; `server` (the daemon) does
+    not. `server` must roll and verify while `laptop`'s lane is recorded as
+    a per-host deferral naming the session, not attempted — the same shape
+    as a live headless assignment (#2067)."""
+    monkeypatch.setattr(
+        release_cmd, "_interactive_session_busy",
+        lambda config: [
+            rp.Busy(kind="interactive session", subject="laptop:coord-abc123",
+                    host="laptop")
+        ],
+    )
+    calls = _stub_lanes(monkeypatch)
+    _stub_verify(monkeypatch, versions={"laptop": ["0.4.110"], "server": ["0.4.110"]},
+                 daemon="server")
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111"],
+    )
+    assert result.exit_code == 0, result.output
+    assert any(host == "server" for _lane, host in calls)
+    assert not any(host == "laptop" for _lane, host in calls)
+
+    record = _records(state_dir)[0]
+    assert record["status"] == rp.STATUS_VERIFIED
+    laptop_lane = next(l for l in record["lanes"] if l["host"] == "laptop")
+    assert laptop_lane["lane"] == "-"
+    assert laptop_lane["ok"] is None
+    assert "deferred" in laptop_lane["detail"]
+    assert "interactive session" in laptop_lane["detail"]
+    assert "laptop:coord-abc123" in laptop_lane["detail"]
+
+
+def test_a_live_interactive_session_is_visible_in_a_dry_run_plan(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    """Acceptance: `coord release propagate --dry-run` reports the session's
+    host as not rollable, naming the session as the reason."""
+    monkeypatch.setattr(
+        release_cmd, "_interactive_session_busy",
+        lambda config: [
+            rp.Busy(kind="interactive session", subject="laptop:coord-abc123",
+                    host="laptop")
+        ],
+    )
+    _stub_verify(monkeypatch, versions={"laptop": ["0.4.110"], "server": ["0.4.110"]},
+                 daemon="server")
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111", "--dry-run"],
+    )
+    assert result.exit_code == 0, result.output
+    would_roll_lines = "\n".join(
+        l for l in result.output.splitlines() if "would roll" in l
+    )
+    assert "server" in would_roll_lines
+    assert "laptop" not in would_roll_lines
+    assert "laptop:coord-abc123" in result.output
+
+
+def test_a_live_interactive_session_on_the_daemon_host_defers_the_whole_run(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    """The daemon-first invariant applies here too: a session on `server`
+    (the daemon) must defer the whole run, not just that one host — rolling
+    `laptop` ahead of an unrolled daemon is the documented 405."""
+    monkeypatch.setattr(
+        release_cmd, "_interactive_session_busy",
+        lambda config: [
+            rp.Busy(kind="interactive session", subject="server:coord-def456",
+                    host="server")
+        ],
+    )
+    monkeypatch.setattr(
+        release_cmd, "_roll_python",
+        lambda *a, **k: pytest.fail("a busy daemon must roll nothing, anywhere"),
+    )
+    _stub_verify(monkeypatch, versions={"laptop": ["0.4.110"], "server": ["0.4.110"]},
+                 daemon="server")
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111"],
+    )
+    assert result.exit_code == 0, result.output
+    record = _records(state_dir)[0]
+    assert record["status"] == rp.STATUS_DEFERRED
+    assert record["lanes"] == []
+
+
+def test_no_live_session_rolls_exactly_as_before(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    """No interactive session anywhere -> no new deferral; both hosts roll.
+    (The `no_network` fixture's default `_interactive_session_busy` stub
+    already returns `[]` — this test pins that "no signal, no change"
+    behaviour explicitly.)"""
+    calls = _stub_lanes(monkeypatch)
+    _stub_verify(monkeypatch, versions={"laptop": ["0.4.110"], "server": ["0.4.110"]},
+                 daemon="server")
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111"],
+    )
+    assert result.exit_code == 0, result.output
+    assert {host for _lane, host in calls} == {"laptop", "server"}
+    assert _records(state_dir)[0]["status"] == rp.STATUS_VERIFIED
+
+
+def test_a_failing_session_probe_does_not_defer_the_fleet(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    """#2228 acceptance: a failing/unavailable session probe must fail
+    OPEN — never synthesise an unpinned `Busy` (which would read as
+    `fleet_wide_busy` and defer everything forever). Exercises the REAL
+    `_interactive_session_busy`, with the underlying tmux/ssh sweep
+    stubbed to raise, rather than the `no_network` fixture's blanket stub."""
+    monkeypatch.setattr(
+        release_cmd, "_interactive_session_busy", _REAL_INTERACTIVE_SESSION_BUSY,
+    )
+    monkeypatch.setattr(
+        "coord.interactive.gather_fleet_tmux_sessions",
+        lambda config: (_ for _ in ()).throw(RuntimeError("ssh sweep blew up")),
+    )
+    calls = _stub_lanes(monkeypatch)
+    _stub_verify(monkeypatch, versions={"laptop": ["0.4.110"], "server": ["0.4.110"]},
+                 daemon="server")
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "warning: could not probe interactive sessions" in result.output
+    assert {host for _lane, host in calls} == {"laptop", "server"}
+    assert _records(state_dir)[0]["status"] == rp.STATUS_VERIFIED
 
 
 # ── the roll, the final gate, and the rollback on red ────────────────────

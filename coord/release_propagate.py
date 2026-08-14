@@ -720,6 +720,10 @@ def assess_quiescence(
     ``extra_busy`` is the seam for host-local signals the board cannot see
     (an interactive tmux session, a machine paused by an operator); the
     shell passes them in rather than this module growing a way to look.
+    #2228: the interactive-session half is wired from
+    ``coord.commands.release._interactive_session_busy``, fed by the same
+    fleet-wide tmux sweep ``coord sessions --remote`` renders — until then
+    this half of the seam existed but nothing ever fed it.
 
     #2110: a ``running`` queue row is not, on its own, proof of anything —
     the reconciler that would have moved it to ``done`` lives inside

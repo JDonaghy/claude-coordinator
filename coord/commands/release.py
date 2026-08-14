@@ -311,6 +311,66 @@ def _fetch_board() -> tuple[dict, str | None]:
         return {}, f"{type(exc).__name__}: {exc}"
 
 
+def _interactive_session_busy(config) -> list:
+    """Live interactive tmux sessions as host-pinned `Busy` signals (#2228).
+
+    `release_propagate.assess_quiescence`'s ``extra_busy`` seam was built
+    for exactly this — its own docstring names "an interactive tmux
+    session" as the seam's purpose — but until now nothing ever fed it one.
+    An interactive session is invisible to the board *by construction*
+    (``coord assign --interactive`` launches into tmux; the tmux session
+    never POSTs ``/assign``), so without this a host running one reads as
+    idle and rolls out from under a human, restarting `coord-serve` on the
+    daemon host mid-session.
+
+    Reuses the same discovery `coord sessions --remote` renders
+    (:func:`coord.interactive.gather_fleet_tmux_sessions`) rather than
+    inventing a second way to look.
+
+    Fails OPEN, not closed: a probe error is logged and DROPPED, never
+    turned into a host-less `Busy` — an unattributable signal blocks EVERY
+    host by design (`Quiescence.fleet_wide_busy`), and an unreadable
+    session list must not silently escalate into that.
+    """
+    from coord import release_propagate as rp  # noqa: PLC0415
+    from coord.interactive import gather_fleet_tmux_sessions  # noqa: PLC0415
+
+    try:
+        sessions, errors = gather_fleet_tmux_sessions(config)
+    except Exception as exc:  # noqa: BLE001 — fail open, see docstring
+        click.echo(
+            f"warning: could not probe interactive sessions ({exc}) — "
+            "quiescence is blind to them this run",
+            err=True,
+        )
+        return []
+
+    for machine in errors:
+        click.echo(
+            f"warning: could not probe {machine} for live interactive "
+            "sessions — quiescence is blind to that host this run",
+            err=True,
+        )
+
+    busy = []
+    for s in sessions:
+        if s.get("pane_dead") == "1":
+            continue  # claude exited; tmux is up but nobody is driving it
+        machine = s.get("machine")
+        if not machine:
+            continue  # no coordinator.yml host to pin it to (#2228: never invent one)
+        busy.append(
+            rp.Busy(
+                kind="interactive session",
+                subject=f"{machine}:{s['session_name']}",
+                detail="`coord assign --interactive` never POSTs /assign, "
+                "so the board cannot see this",
+                host=machine,
+            )
+        )
+    return busy
+
+
 def _daemon_machine_name(
     config, override: str | None, machine_health: dict | None = None
 ) -> str | None:
@@ -550,6 +610,11 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
         extra_busy.append(
             rp.Busy(kind="board unreadable", subject="/board", detail=board_error)
         )
+    # #2228: the board can't see an interactive session (no /assign POST) —
+    # feed assess_quiescence's extra_busy seam from the same fleet-wide tmux
+    # probe `coord sessions --remote` uses, so a live session defers a roll
+    # exactly like a live headless assignment does.
+    extra_busy.extend(_interactive_session_busy(config))
     quiescence = rp.assess_quiescence(
         queue_entries=board.get("drive_queue") or [],
         assignments=board.get("assignments") or [],
@@ -1933,8 +1998,10 @@ def _drain(
     config_path: Path,
     deadline: float,
     poll_interval: float,
+    config=None,
     reconcile=None,
     board_fetch=None,
+    extra_busy_fetch=None,
     now=None,
     sleep=None,
 ):
@@ -1945,7 +2012,21 @@ def _drain(
     may lead a roll — rather than a second definition of "busy" (#2096's
     "two surfaces, one function" rule). ``now``/``sleep`` are injectable so
     this loop is unit-testable without a real clock; ``reconcile``/
-    ``board_fetch`` default to the real subprocess/board calls.
+    ``board_fetch``/``extra_busy_fetch`` default to the real subprocess/
+    board/tmux-probe calls.
+
+    #2228: ``extra_busy_fetch`` re-probes live interactive sessions on
+    every poll (not just once) — a session that ends mid-drain should let
+    the daemon host clear within THIS wait, not only on the next `coord
+    release propagate` tick. Deliberately keyed off the explicit *config*
+    param, never an implicit ``_load_config(config_path)`` fallback: this
+    function is called with ``config_path=None`` from unit tests that
+    inject their own clock/board — silently resolving a real
+    ``coordinator.yml`` (and then SSH-probing whatever machines it names)
+    the moment ``config`` is omitted would make this loop non-hermetic by
+    default. No *config* simply means "no interactive-session signal this
+    call" — the caller opts in by passing one, as the real
+    ``coord release nightly-window`` call site does.
     """
     import time as _time  # noqa: PLC0415
 
@@ -1956,6 +2037,11 @@ def _drain(
     sleep_fn = sleep or _time.sleep
     reconcile_fn = reconcile or (lambda: _run_reconcile_tick(config_path))
     fetch_fn = board_fetch or _fetch_board
+    if extra_busy_fetch is None:
+        if config is not None:
+            extra_busy_fetch = lambda: _interactive_session_busy(config)  # noqa: E731
+        else:
+            extra_busy_fetch = lambda: []  # noqa: E731
 
     start = now_fn()
     while True:
@@ -1966,6 +2052,7 @@ def _drain(
             extra_busy.append(
                 rp.Busy(kind="board unreadable", subject="/board", detail=board_error)
             )
+        extra_busy.extend(extra_busy_fetch())
         quiescence = rp.assess_quiescence(
             queue_entries=board.get("drive_queue") or [],
             assignments=board.get("assignments") or [],
@@ -2327,6 +2414,7 @@ def release_nightly_window(  # noqa: PLR0912, PLR0915 — a pipeline; see module
             outcome = _drain(
                 daemon_host=daemon_name, config_path=config_path,
                 deadline=drain_deadline, poll_interval=poll_interval,
+                config=config,
             )
             record.drained = outcome.drained
             record.drain_seconds = outcome.elapsed_seconds
