@@ -3042,3 +3042,24 @@ def test_diagnose_on_a_quiet_queue_says_so_rather_than_printing_nothing(
     result = cli("diagnose")
     assert result.exit_code == 0, result.output
     assert "nothing to diagnose" in result.output
+
+
+def test_diagnose_does_not_silently_cap_what_an_operator_asked_for(
+    cli, seed, block_log, gh_world
+):
+    """The per-pass cap protects `coord serve`'s 30s tick. This is not on it.
+
+    A cap here would diagnose four of six and print "4 diagnosed", which reads
+    as "that was all of them" — a silent truncation.
+    """
+    from coord.queue_diagnose import MAX_DIAGNOSES_PER_PASS
+
+    issues = list(range(1770, 1770 + MAX_DIAGNOSES_PER_PASS + 2))
+    seed(issues={n: "open" for n in issues})
+    for n in issues:
+        cli("add", REPO, str(n))
+        _stall(n, "blocked: CI red", block_log)
+
+    result = cli("diagnose")
+    assert result.exit_code == 0, result.output
+    assert f"{len(issues)} diagnosed" in result.output

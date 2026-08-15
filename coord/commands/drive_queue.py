@@ -1131,9 +1131,14 @@ def drive_queue_diagnose(output_json: bool, dry_run: bool, config_path: Path) ->
     probe = queue_diagnose.GhLiveProbe(config=config, board=build_board())
     # `keys=None` — an operator asking directly wants every open episode
     # looked at, not just the ones the notifier happens to have raised this
-    # minute. The per-episode budget still applies, so this cannot become a
-    # way to spend `gh` calls in a loop.
-    diagnoses = queue_diagnose.run_pass(entries, episodes, probe=probe, keys=None)
+    # minute. `limit=None` for the same reason, and because the per-pass cap
+    # exists to protect `coord serve`'s 30 s tick, which this is not on: a cap
+    # here would silently diagnose four of ten and print "4 diagnosed", which
+    # reads as "that was all of them". The per-episode budget still applies,
+    # so this cannot become a way to spend `gh` calls in a loop.
+    diagnoses = queue_diagnose.run_pass(
+        entries, episodes, probe=probe, keys=None, limit=None
+    )
 
     if diagnoses and not dry_run:
         _record_block_log(
