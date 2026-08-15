@@ -186,6 +186,31 @@ class DriveError(Exception):
         self.exit_code = exit_code
 
 
+# #2274: bound on `Driver._last_run_output` — the captured stdout+stderr of
+# whatever `coord` subcommand `_spawn` just ran. Before this, a non-refusal
+# RUN-action failure (e.g. `coord assign` dying for a reason that is not
+# EXIT_DISPATCH_REFUSED — an API blip, a bad briefing file, a stack trace)
+# discarded that text entirely and raised a bare "coord assign ... exited 1",
+# which is the SAME string that ends up in `drive_queue.last_reason` and
+# `drive_escalations.reason` — the two places an operator goes to diagnose a
+# parked/blocked entry once the tmux session and its scrollback are gone
+# (quadraui#508, coord-portal#83). A FEW KB is plenty to answer "why", and
+# keeping this bounded matters because it lands in a DB column the tick reads
+# on every poll, not a log file — `_append_run_log` still gets the full,
+# untruncated bytes for local, on-host debugging.
+_CAPTURED_OUTPUT_LIMIT = 4000
+
+
+def _bounded_tail(text: str, limit: int = _CAPTURED_OUTPUT_LIMIT) -> str:
+    """*text*, or its last *limit* characters if longer — the tail, because
+    the actionable line (a traceback's final "raise ...", a guard's remedy)
+    is overwhelmingly the END of stdout+stderr, not the start."""
+    if len(text) <= limit:
+        return text
+    dropped = len(text) - limit
+    return f"…[{dropped} chars truncated]…{text[-limit:]}"
+
+
 # ── options ──────────────────────────────────────────────────────────────────
 
 
@@ -3407,8 +3432,11 @@ class Driver:
         combined = (proc.stdout or "") + (proc.stderr or "")
         if combined:
             print(combined.rstrip("\n"), file=self.out, flush=True)
-        self._append_run_log(combined)
-        self._last_run_output = combined.strip()
+        self._append_run_log(combined)  # unbounded — the full bytes, on disk
+        # #2274: bounded — this copy is what ends up in a DB column
+        # (`drive_queue.last_reason`/`drive_escalations.reason`) via
+        # `_drive_exit_summary`, not a log file.
+        self._last_run_output = _bounded_tail(combined.strip())
         return proc.returncode
 
     def run_notify(self) -> None:
@@ -3852,8 +3880,27 @@ class Driver:
                             f"(exit {rc})"
                         )
                         raise DriveError(msg, EXIT_DISPATCH_REFUSED)
-                    msg = action.error_message or (
+                    # #2274: a non-refusal failure used to discard the
+                    # child's captured stdout+stderr entirely — the message
+                    # was `action.error_message` (a static string chosen
+                    # when the Action was built) or, absent that, a bare
+                    # "coord assign ... exited 1" with zero diagnostic
+                    # content. `_last_run_output` (bounded, see
+                    # `_bounded_tail`) is the ONLY place the real reason a
+                    # subprocess like `coord assign` failed still exists
+                    # once it has exited — append it so the DriveError's own
+                    # message (what `_drive_exit_summary` folds into the
+                    # `drive_exited` audit summary, and what
+                    # `coord/drive_queue.py`'s tick copies verbatim into
+                    # `last_reason`/`drive_escalations.reason`) is actually
+                    # actionable rather than a status with no reason.
+                    base_msg = action.error_message or (
                         f"coord {' '.join(action.command)} exited {rc}"
+                    )
+                    msg = (
+                        f"{base_msg}\n   output: {self._last_run_output}"
+                        if self._last_run_output
+                        else base_msg
                     )
                     if action.on_error == "warn":
                         self.warn(msg)
