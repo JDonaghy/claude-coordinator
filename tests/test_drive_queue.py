@@ -1224,7 +1224,16 @@ def test_a_dead_drive_is_requeued_at_the_same_position_with_an_attempt_spent():
 
 
 def test_a_dead_drive_with_a_launch_stamp_still_dies_once_the_window_passes():
-    """The `launched_at` path, not just the "no stamp to measure" one."""
+    """The `launched_at` path, not just the "no stamp to measure" one.
+
+    #2273 superseded the OLD same-tick-relaunch assertion this test used to
+    make: dying past #1794's startup window is no longer enough to relaunch
+    in the SAME tick with a real clock — see
+    `test_a_dead_drive_with_a_real_clock_paces_its_next_attempt_2273` right
+    below for the backoff itself. This test now pins the earlier half only:
+    the death is still correctly detected as `retry` (not `starting`, not
+    `unknown`) once the window is past.
+    """
     entries = [
         entry(
             1650,
@@ -1237,8 +1246,180 @@ def test_a_dead_drive_with_a_launch_stamp_still_dies_once_the_window_passes():
     plan = plan_tick(entries, board(), capacity=1, now=NOW)
     assert plan.reconciles[0].outcome == "retry"
     assert plan.reconciles[0].updates["attempts"] == 1
-    # …and the relaunch is allowed, because the window is demonstrably past.
+
+
+# ── plan_tick: post-death retry spacing (#2273) ──────────────────────────────
+#
+# 2026-08-15: quadraui#508 and coord-portal#83 each burned their entire
+# two-attempt budget inside ~6 minutes — nothing paced the SECOND attempt
+# beyond ordinary tick cadence, so a transient dispatch blip converted
+# straight into a permanently-parked entry. These tests pin the fix: a
+# `retry`-reconciled entry (or one already sitting `waiting` from an earlier
+# one) is not relaunched until real wall-clock time — not just another tick —
+# has passed.
+
+
+def test_a_dead_drive_with_a_real_clock_paces_its_next_attempt_2273():
+    """The regression: WITH a real clock, a `retry` this tick must NOT
+    relaunch in the same tick — that immediate relaunch is exactly what let
+    quadraui#508's two attempts land six minutes apart."""
+    entries = [
+        entry(
+            1650,
+            position=3,
+            state=STATE_RUNNING,
+            attempts=0,
+            launched_at=NOW - DRIVE_STARTUP_GRACE_SECONDS - 1,
+        )
+    ]
+    plan = plan_tick(entries, board(), capacity=1, now=NOW)
+    assert plan.reconciles[0].outcome == "retry"
+    assert plan.launch is None
+    backoff = [d for d in plan.deferrals if d.key == entry_key(REPO, 1650)]
+    assert len(backoff) == 1
+    assert backoff[0].backing_off is True
+    assert "retry backoff" in backoff[0].reason
+    # Benign — this is the fleet pacing itself, not a stall an operator needs
+    # to see paged for every tick of the wait.
+    assert backoff[0].benign is True
+
+
+def test_a_dead_drive_relaunches_once_the_backoff_elapses():
+    """A SECOND tick, comfortably past `RETRY_BACKOFF_SECONDS[0]` (60s),
+    launches normally — the backoff paces the retry, it does not cancel it."""
+    entries = [
+        entry(
+            1650,
+            position=3,
+            state=STATE_WAITING,
+            attempts=1,
+            launched_at=NOW - DRIVE_STARTUP_GRACE_SECONDS - 200.0,
+            reason_at=NOW - 61.0,
+        )
+    ]
+    plan = plan_tick(entries, board(), capacity=1, now=NOW)
     assert plan.launch is not None and plan.launch.issue == 1650
+
+
+def test_the_backoff_widens_with_the_attempt_number():
+    """`RETRY_BACKOFF_SECONDS[1]` (5 min) applies before a SECOND retry, not
+    just the first — 61s (enough for attempt 1) is not enough for attempt 2."""
+    entries = [
+        entry(
+            1650,
+            position=3,
+            state=STATE_WAITING,
+            attempts=2,
+            launched_at=NOW - DRIVE_STARTUP_GRACE_SECONDS - 400.0,
+            reason_at=NOW - 61.0,
+        )
+    ]
+    plan = plan_tick(entries, board(), capacity=1, max_attempts=3, now=NOW)
+    assert plan.launch is None
+    assert any(d.backing_off for d in plan.deferrals)
+
+
+def test_omitting_the_clock_disables_the_backoff_entirely():
+    """`now=None` is the pure-logic caller's opt-out — same posture #1794's
+    own window already takes (`test_omitting_the_clock_disables_the_window_
+    entirely`)."""
+    entries = [entry(1650, position=3, state=STATE_RUNNING, attempts=0)]
+    plan = plan_tick(entries, board(), capacity=1)
+    assert plan.reconciles[0].outcome == "retry"
+    assert plan.launch is not None and plan.launch.issue == 1650
+
+
+def test_a_2230_resume_is_never_backed_off():
+    """A `blocked` entry #2230 resumes on POSITIVE gate evidence must launch
+    in the SAME tick, unpaced — its `attempts` reset to 0 is real evidence
+    the condition cleared, unlike a plain `retry`, which has none."""
+    entries = [
+        entry(
+            1650,
+            position=3,
+            state=STATE_BLOCKED,
+            attempts=DEFAULT_MAX_ATTEMPTS,
+            last_reason="checks failed: lint",
+            reason_at=NOW - 5.0,
+        )
+    ]
+    plan = plan_tick(
+        entries,
+        board(),
+        capacity=1,
+        now=NOW,
+        live_blocked_gate={entry_key(REPO, 1650): False},
+    )
+    assert [r.outcome for r in plan.reconciles] == ["resumed"]
+    assert plan.launch is not None and plan.launch.issue == 1650
+
+
+def test_a_dispatch_failure_that_created_no_assignment_backs_off_longer():
+    """#2273 direction 2: a died launch with NO board-visible assignment gets
+    at least `DISPATCH_FAILURE_MIN_BACKOFF_SECONDS`, wider than the plain
+    `RETRY_BACKOFF_SECONDS[0]` a code-side death would get."""
+    launched_at = NOW - DRIVE_STARTUP_GRACE_SECONDS - 400.0
+    entries = [
+        entry(
+            1650,
+            position=3,
+            state=STATE_WAITING,
+            attempts=1,
+            launched_at=launched_at,
+            # Comfortably past RETRY_BACKOFF_SECONDS[0] (60s) but nowhere
+            # near DISPATCH_FAILURE_MIN_BACKOFF_SECONDS (300s).
+            reason_at=NOW - 90.0,
+        )
+    ]
+    facts = IssueFacts(known=True, issue_state="open")  # no assignment at all
+    view = BoardView(issues={entry_key(REPO, 1650): facts})
+    plan = plan_tick(entries, view, capacity=1, now=NOW)
+    assert plan.launch is None
+    backoff = [d for d in plan.deferrals if d.key == entry_key(REPO, 1650)]
+    assert len(backoff) == 1 and backoff[0].backing_off is True
+
+
+def test_a_dispatched_run_that_died_later_gets_the_plain_backoff_only():
+    """The counterpart: a launch that DID dispatch (an assignment exists,
+    created after `launched_at`) is NOT treated as a pure dispatch failure —
+    90s already clears the plain 60s backoff even though it would not clear
+    the widened one."""
+    launched_at = NOW - DRIVE_STARTUP_GRACE_SECONDS - 400.0
+    entries = [
+        entry(
+            1650,
+            position=3,
+            state=STATE_WAITING,
+            attempts=1,
+            launched_at=launched_at,
+            reason_at=NOW - 90.0,
+        )
+    ]
+    facts = IssueFacts(
+        known=True, issue_state="open", last_dispatched_at=launched_at + 5.0
+    )
+    view = BoardView(issues={entry_key(REPO, 1650): facts})
+    plan = plan_tick(entries, view, capacity=1, now=NOW)
+    assert plan.launch is not None and plan.launch.issue == 1650
+
+
+def test_exhausted_reason_names_a_dispatch_only_failure():
+    """The give-up escalation text itself must say "no assignment" plainly —
+    the point of #2273 direction 3 is that a human reading it does not need
+    to reconstruct that from a bare exit code."""
+    entries = [
+        entry(
+            1650,
+            state=STATE_RUNNING,
+            attempts=DEFAULT_MAX_ATTEMPTS - 1,
+            launched_at=NOW - DRIVE_STARTUP_GRACE_SECONDS - 1,
+        )
+    ]
+    facts = IssueFacts(known=True, issue_state="open")
+    view = BoardView(issues={entry_key(REPO, 1650): facts})
+    plan = plan_tick(entries, view, capacity=1, now=NOW)
+    assert plan.reconciles[0].outcome == "exhausted"
+    assert "no assignment was ever created for this run" in plan.blocked[0].reason
 
 
 def test_a_dead_drive_out_of_attempts_blocks_and_escalates():
