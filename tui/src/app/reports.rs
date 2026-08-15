@@ -107,8 +107,32 @@
 //! No sealed acceptance contract exists for this panel (there is no
 //! `tests/acceptance/**` slice for #1741) — the in-crate `TuiDriver` tests in
 //! `app/tests.rs` are the gate.
+//!
+//! **#2271 — a result can also declare a chart.** `ReportResult.chart` names
+//! *columns*, never values, so the chart is built from the very rows the
+//! table renders. See the `#2271` block below `reports_footer_row` for the
+//! three-outcome compatibility rule (`ChartPlan`) that keeps a chart-bearing
+//! report readable on a coord-tui that predates the field, predates the
+//! declared kind, or predates quadraui#584.
 #[allow(unused_imports)]
 use super::*;
+
+/// #2271: what the Reports panel does with a result's chart declaration.
+///
+/// The three variants are the compatibility contract, not an implementation
+/// detail — see the `#2271` comment block in this module.
+#[derive(Debug)]
+pub(crate) enum ChartPlan {
+    /// Nothing declared, or nothing worth plotting. Render the table exactly
+    /// as before: **no chart and no reserved space**.
+    None,
+    /// Draw this above the table. `title` is the declaration's own caption
+    /// (empty when it declared none) — quadraui's `Chart` has no title
+    /// field, so the panel paints it as a row above the chart body.
+    Render { chart: Box<Chart>, title: String },
+    /// Table only, plus one line saying why there is no chart.
+    Degrade(String),
+}
 
 impl CoordApp {
     // ── Catalogue / parameter accessors ──────────────────────────────────
@@ -875,6 +899,320 @@ impl CoordApp {
         Some(DataRow { cells, decoration: Decoration::Header })
     }
 
+    // ── #2271: the chart half of a result ────────────────────────────────
+    //
+    // A report may declare that its rows also read as a chart. The
+    // declaration names COLUMNS, never values, so this builds the series out
+    // of the very `rows` the table below renders — there is nothing to keep
+    // in sync, and the table remains the fallback rendering in every case
+    // where a chart cannot be drawn.
+    //
+    // Three outcomes, and the difference between them is the whole
+    // compatibility story (`ChartPlan`):
+    //
+    // * `None` — no declaration at all (an older daemon, or a report with
+    //   nothing worth plotting). The panel renders EXACTLY as it did before
+    //   this change: no chart, no explanatory line, and critically no
+    //   reserved blank space where a chart would have gone.
+    // * `Degrade(reason)` — a declaration this build cannot honour. One
+    //   subdued line says why, and the table gets the rest. Never a chart
+    //   that is silently missing data.
+    // * `Render(chart)` — draw it above the table, keeping both visible: the
+    //   numbers are what get quoted, the chart is what gets scanned.
+    //
+    // Nothing here knows any report's name or any column's meaning — the
+    // same generic-client rule the rest of this module follows (#1741/#1762).
+
+    /// Rows the chart body gets when there is room for it.
+    const REPORTS_CHART_ROWS: usize = 9;
+
+    /// Below this many rows in the main panel the chart is dropped entirely
+    /// (silently — it is a scan aid, and stealing the table's last rows to
+    /// draw a two-pixel-tall chart helps nobody). The floor leaves the table
+    /// a usable header + several data rows after the chart and the notes
+    /// block have taken their slices.
+    const REPORTS_CHART_MIN_PANEL_ROWS: f32 = 18.0;
+
+    /// A legend is one row of text. Past this many series it cannot label
+    /// them, so the declaration degrades to the table rather than drawing a
+    /// chart whose colours mean nothing — and, per this repo's "no silent
+    /// caps" rule, it says so instead of quietly plotting the first twelve.
+    const REPORTS_MAX_CHART_SERIES: usize = 12;
+
+    /// A single unbordered row of subdued text.
+    ///
+    /// `plain_list` is `bordered: true`, which is right for the full-panel
+    /// messages it was written for and wrong for a one-row caption: in a
+    /// 1-row rect the border IS the whole row and the text never appears.
+    fn reports_caption_list(id: &str, text: &str) -> ListView {
+        ListView {
+            id: WidgetId::new(id),
+            title: None,
+            items: vec![ListItem {
+                text: StyledText {
+                    spans: vec![StyledSpan::with_fg(text, Color::rgb(170, 170, 185))],
+                },
+                icon: None,
+                detail: None,
+                decoration: Decoration::Normal,
+            }],
+            selected_idx: 0,
+            scroll_offset: 0,
+            has_focus: false,
+            bordered: false,
+            h_scroll: 0,
+            max_content_width: None,
+            show_v_scrollbar: false,
+        }
+    }
+
+    /// One row's value for a chart series' column, as a number.
+    ///
+    /// Looked up **by column name** for the same reason cells are: `rows`
+    /// may carry keys beyond `columns`. A non-numeric cell yields `None`,
+    /// which the callers read as "no contribution" rather than as `0.0` —
+    /// the difference matters for deciding whether a series has any data at
+    /// all.
+    fn reports_chart_value(row: &serde_json::Value, column: &str) -> Option<f64> {
+        match row.get(column) {
+            Some(serde_json::Value::Number(n)) => n.as_f64().filter(|v| v.is_finite()),
+            Some(serde_json::Value::Bool(b)) => Some(if *b { 1.0 } else { 0.0 }),
+            // A daemon sending numbers as strings still charts. Cheap, and
+            // the alternative is a blank chart next to a populated table.
+            Some(serde_json::Value::String(s)) => s.trim().parse::<f64>().ok(),
+            _ => None,
+        }
+    }
+
+    /// `"#rrggbb"` → a `Color`, or `None` for anything else. A malformed
+    /// colour hint falls back to the backend palette; it never blocks the
+    /// chart, because a colour is the least important thing on it.
+    fn reports_chart_color(raw: &str) -> Option<Color> {
+        let hex = raw.trim().strip_prefix('#')?;
+        if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+        Some(Color::rgb(byte(0)?, byte(2)?, byte(4)?))
+    }
+
+    /// Resolve a declaration's series against the result's own rows.
+    ///
+    /// Two shapes, exactly as `coord/reports.py`'s `ChartSpec` documents:
+    ///
+    /// * **no `group_by`** — one data point per row in the report's canonical
+    ///   order, each declared series reading its own column straight off the
+    ///   row.
+    /// * **`group_by` set** — a pivot: the x-axis is the distinct values of
+    ///   `x` in first-appearance order, one output series per distinct group
+    ///   value, and rows landing in the same `(group, x)` cell are summed.
+    ///   Per-series colour hints are dropped here on purpose — one declared
+    ///   colour cannot describe N groups, so the backend palette picks.
+    ///
+    /// A declared series whose column yields no numeric value in any row is
+    /// dropped rather than plotted as a flat zero line: a mistyped column id
+    /// must look like a missing series, not like a real run of zeros.
+    fn reports_chart_series(result: &ReportResult, spec: &ReportChart) -> Vec<Series> {
+        let declared: Vec<&ReportChartSeries> = spec
+            .series
+            .iter()
+            .filter(|s| {
+                !s.column.is_empty()
+                    && result
+                        .rows
+                        .iter()
+                        .any(|r| Self::reports_chart_value(r, &s.column).is_some())
+            })
+            .collect();
+        if declared.is_empty() {
+            return Vec::new();
+        }
+
+        let Some(group_col) = spec.group_by.as_deref().filter(|c| !c.is_empty()) else {
+            return declared
+                .iter()
+                .map(|s| Series {
+                    label: s.label.clone(),
+                    data: result
+                        .rows
+                        .iter()
+                        .map(|r| Self::reports_chart_value(r, &s.column).unwrap_or(0.0))
+                        .collect(),
+                    color: s.color.as_deref().and_then(Self::reports_chart_color),
+                    fill: false,
+                })
+                .collect();
+        };
+
+        // The pivot. `x` absent (or naming a column no row carries) collapses
+        // every row into a single x slot, which is a legitimate degenerate
+        // answer — one bar per group — rather than an error.
+        let x_col = spec.x.as_deref().unwrap_or("");
+        let mut x_keys: Vec<String> = Vec::new();
+        let mut group_keys: Vec<String> = Vec::new();
+        // (group_idx, x_idx) -> summed value, per declared series.
+        let mut cells: Vec<std::collections::HashMap<(usize, usize), f64>> =
+            vec![std::collections::HashMap::new(); declared.len()];
+
+        for row in &result.rows {
+            let x_text = Self::reports_chart_axis_text(result, row, x_col);
+            let x_idx = match x_keys.iter().position(|k| *k == x_text) {
+                Some(i) => i,
+                None => {
+                    x_keys.push(x_text);
+                    x_keys.len() - 1
+                }
+            };
+            let g_text = Self::reports_chart_axis_text(result, row, group_col);
+            let g_idx = match group_keys.iter().position(|k| *k == g_text) {
+                Some(i) => i,
+                None => {
+                    group_keys.push(g_text);
+                    group_keys.len() - 1
+                }
+            };
+            for (si, s) in declared.iter().enumerate() {
+                if let Some(v) = Self::reports_chart_value(row, &s.column) {
+                    *cells[si].entry((g_idx, x_idx)).or_insert(0.0) += v;
+                }
+            }
+        }
+
+        let multi = declared.len() > 1;
+        let mut out = Vec::with_capacity(group_keys.len() * declared.len());
+        for (gi, group) in group_keys.iter().enumerate() {
+            for (si, s) in declared.iter().enumerate() {
+                out.push(Series {
+                    label: if multi {
+                        format!("{group} · {}", s.label)
+                    } else {
+                        group.clone()
+                    },
+                    data: (0..x_keys.len())
+                        .map(|xi| *cells[si].get(&(gi, xi)).unwrap_or(&0.0))
+                        .collect(),
+                    color: None,
+                    fill: false,
+                });
+            }
+        }
+        out
+    }
+
+    /// The text identity of a row's value in an axis/group column.
+    ///
+    /// Rendered through the column's declared `kind` (#1760) so a
+    /// `timestamp` group reads as a time rather than `1785780878.155` — the
+    /// same formatting the table uses, keyed on `kind` and never on column
+    /// id. An empty column id (or a column no row carries) collapses to one
+    /// bucket, which is what makes an absent `x` degenerate rather than
+    /// fatal.
+    fn reports_chart_axis_text(
+        result: &ReportResult,
+        row: &serde_json::Value,
+        column: &str,
+    ) -> String {
+        if column.is_empty() {
+            return String::new();
+        }
+        Self::reports_cell_text(row, column, Self::reports_column_kind(result, column))
+    }
+
+    /// Decide what to do with `result`'s chart declaration.
+    ///
+    /// `multi_series_bars` is threaded in rather than read from the constant
+    /// so the degraded branch stays testable on a build whose pin *does*
+    /// carry quadraui#584 — otherwise the "degrade instead of drawing a
+    /// chart missing most of its data" guarantee would be untestable exactly
+    /// when it is satisfied, and would rot the first time someone touched it.
+    pub(crate) fn reports_chart_plan(
+        result: &ReportResult,
+        multi_series_bars: bool,
+    ) -> ChartPlan {
+        let Some(spec) = result.chart.as_ref() else {
+            return ChartPlan::None;
+        };
+        if result.rows.is_empty() {
+            // The empty-window message owns the panel; an empty axis over it
+            // would read as a measured zero.
+            return ChartPlan::None;
+        }
+
+        // The open-vocabulary fallback, same rule as `ColumnMeta.kind`: a
+        // kind this binary predates renders the table, not an error.
+        let is_bar = spec.kind == "bar";
+        let kind = match spec.kind.as_str() {
+            "line" => ChartKind::Line,
+            "sparkline" => ChartKind::Sparkline,
+            "bar" if spec.stacked => ChartKind::Bar,
+            "bar" => ChartKind::BarGrouped,
+            other => {
+                return ChartPlan::Degrade(format!(
+                    "Chart not shown: this build does not understand chart kind \
+                     '{other}'. The table below carries the same numbers."
+                ));
+            }
+        };
+
+        let series = Self::reports_chart_series(result, spec);
+        if series.is_empty() {
+            return ChartPlan::Degrade(
+                "Chart not shown: the declared series name no numeric column in \
+                 this result."
+                    .to_string(),
+            );
+        }
+        if series.len() > Self::REPORTS_MAX_CHART_SERIES {
+            return ChartPlan::Degrade(format!(
+                "Chart not shown: {} series is more than a one-row legend can \
+                 label. The table below has all of them.",
+                series.len()
+            ));
+        }
+        // quadraui#584. Before it, `paint_bar` drew `series[0]` and silently
+        // dropped the rest — a chart that looks right and is missing most of
+        // its data is strictly worse than no chart, so this degrades instead.
+        if is_bar && series.len() > 1 && !multi_series_bars {
+            return ChartPlan::Degrade(format!(
+                "Chart not shown: a {}-series bar chart needs quadraui#584, \
+                 which this build's pinned quadraui predates (it would draw \
+                 only the first series). The table below has every series.",
+                series.len()
+            ));
+        }
+
+        let x_label = spec
+            .x
+            .as_deref()
+            .filter(|c| !c.is_empty())
+            .map(|c| {
+                Self::reports_column_meta(result, c)
+                    .map(|m| m.label.clone())
+                    .filter(|l| !l.is_empty())
+                    .unwrap_or_else(|| c.to_string())
+            });
+        ChartPlan::Render {
+            title: spec.title.clone(),
+            chart: Box::new(Chart {
+                id: WidgetId::new("reports-chart"),
+                kind,
+                // A legend is the only place a series name can appear in a
+                // terminal chart, so it is on whenever there is more than
+                // one — and off for a single series, where it would just
+                // repeat the title.
+                show_legend: series.len() > 1,
+                series,
+                x_label,
+                y_label: Some(spec.y_label.clone()).filter(|l| !l.is_empty()),
+                y_range: None,
+                x_range: None,
+                y_ticks: None,
+                x_ticks: None,
+                show_grid: !matches!(kind, ChartKind::Sparkline),
+            }),
+        }
+    }
+
     // ── Render ───────────────────────────────────────────────────────────
 
     /// Render the Reports main panel: **only** the last run's result — the
@@ -972,8 +1310,65 @@ impl CoordApp {
             (note_lines.len() + 2).min(Self::REPORTS_NOTES_MAX_ROWS)
         };
         let notes_h = (notes_rows as f32 * lh).min(rect.height * 0.5);
-        let table_h = (rect.height - notes_h).max(0.0);
-        let table_rect = Rect::new(rect.x, rect.y, rect.width, table_h);
+
+        // #2271: the chart, when the report declares one this build can draw
+        // and the panel is tall enough that giving it rows does not gut the
+        // table. Both stay visible — the numbers are what get quoted, the
+        // chart is what gets scanned — and a `ChartPlan::None` costs exactly
+        // zero rows, which is what makes a chart-free (or older-daemon)
+        // report render byte-identically to before.
+        let plan = Self::reports_chart_plan(result, QUADRAUI_MULTI_SERIES_BARS);
+        let body_h = (rect.height - notes_h).max(0.0);
+        let roomy = rect.height >= Self::REPORTS_CHART_MIN_PANEL_ROWS * lh;
+        let (chart_h, degrade_h) = match &plan {
+            ChartPlan::Render { .. } if roomy => {
+                ((Self::REPORTS_CHART_ROWS as f32 * lh).min(body_h * 0.45), 0.0)
+            }
+            // The reason line is one row and is worth it even when cramped:
+            // "no chart, and here is why" is the whole point of degrading.
+            ChartPlan::Degrade(_) if body_h > lh * 2.0 => (0.0, lh),
+            _ => (0.0, 0.0),
+        };
+        match &plan {
+            ChartPlan::Render { chart, title } if chart_h > 0.0 => {
+                // The caption row comes out of the chart's own allotment, so
+                // a titled chart never steals a row from the table.
+                let title_h = if title.is_empty() { 0.0 } else { lh };
+                if title_h > 0.0 {
+                    backend.draw_list(
+                        Rect::new(rect.x, rect.y, rect.width, title_h),
+                        &Self::reports_caption_list("reports-chart-title", &format!("  {title}")),
+                    );
+                }
+                // No hover point and no crosshair: the chart is a scan aid
+                // sitting above the table that carries the exact numbers, so
+                // there is nothing a tooltip would add that a glance down
+                // does not already give. The returned `ChartLayout` is
+                // discarded for the same reason — nothing hit-tests it.
+                backend.draw_chart(
+                    Rect::new(
+                        rect.x,
+                        rect.y + title_h,
+                        rect.width,
+                        chart_h - title_h,
+                    ),
+                    chart,
+                    None,
+                    None,
+                );
+            }
+            ChartPlan::Degrade(reason) if degrade_h > 0.0 => {
+                backend.draw_list(
+                    Rect::new(rect.x, rect.y, rect.width, degrade_h),
+                    &Self::reports_caption_list("reports-chart-degraded", &format!("  {reason}")),
+                );
+            }
+            _ => {}
+        }
+
+        let top_h = chart_h + degrade_h;
+        let table_h = (body_h - top_h).max(0.0);
+        let table_rect = Rect::new(rect.x, rect.y + top_h, rect.width, table_h);
 
         if result.rows.is_empty() {
             // An empty table renders as a bare header row, which reads like
@@ -1049,7 +1444,7 @@ impl CoordApp {
                 .map(|n| activity_item(&format!(" {n}"), Color::rgb(210, 200, 160)))
                 .collect();
             backend.draw_list(
-                Rect::new(rect.x, rect.y + table_h, rect.width, notes_h),
+                Rect::new(rect.x, rect.y + body_h, rect.width, notes_h),
                 &ListView {
                     id: WidgetId::new("reports-notes"),
                     title: Some(StyledText::plain(" Notes ")),

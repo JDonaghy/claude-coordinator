@@ -1753,6 +1753,61 @@ pub struct ReportResult {
     /// this binary must not know.
     #[serde(default)]
     pub totals: Option<serde_json::Value>,
+    /// #2271: optional declaration that this result also reads as a chart.
+    /// `#[serde(default)]` is the whole forward-compatibility story in the
+    /// other direction: a daemon that predates the field sends nothing and
+    /// this stays `None`, so the panel renders the table exactly as before.
+    #[serde(default)]
+    pub chart: Option<ReportChart>,
+}
+
+/// #2271: a report's chart declaration, deserialised from the wire block
+/// `coord/reports.py`'s `ChartSpec` emits.
+///
+/// It carries **no numbers** — every series names a `columns[]` id and the
+/// renderer reads the same `rows` the table renders. That is what keeps the
+/// table the fallback rendering and keeps CSV export (#1765) untouched.
+///
+/// Every field is `#[serde(default)]`: a daemon may add one, and a partial
+/// block must degrade rather than fail the whole `ReportResult` deserialise
+/// (which would take the table down with it — the exact "a report must never
+/// become unreadable on an older coord-tui" failure this issue rules out).
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct ReportChart {
+    /// Open vocabulary — `bar` | `line` | `sparkline` today. A kind this
+    /// binary predates degrades to the table; see `chart_support`.
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub series: Vec<ReportChartSeries>,
+    /// Column id supplying each point's category/time label.
+    #[serde(default)]
+    pub x: Option<String>,
+    /// Column id to pivot on: one output series per distinct value, x-axis
+    /// deduped, `(group, x)` cells summed. `None` = one point per row.
+    #[serde(default)]
+    pub group_by: Option<String>,
+    /// Bar only; ignored by every other kind.
+    #[serde(default)]
+    pub stacked: bool,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub y_label: String,
+}
+
+/// One declared series of a [`ReportChart`].
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct ReportChartSeries {
+    #[serde(default)]
+    pub label: String,
+    /// The `columns[]` id whose per-row value supplies the y-values.
+    #[serde(default)]
+    pub column: String,
+    /// `"#rrggbb"` hint. Ignored under `group_by` — one declared colour
+    /// cannot describe N groups, so the backend palette picks there.
+    #[serde(default)]
+    pub color: Option<String>,
 }
 
 /// #1853: identity of the column set a Reports result-table width override
