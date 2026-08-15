@@ -597,6 +597,36 @@ def test_drain_treats_an_unreadable_board_as_fleet_wide_busy():
     assert "board unreadable" in outcome.detail
 
 
+def test_drain_is_blocked_by_a_paused_daemon_host(valid_config_path, monkeypatch):
+    """#2174: `_drain`'s default `extra_busy_fetch` — the one the real
+    `coord release nightly-window` call site uses (it passes `config=`) —
+    must also see `coord pause`/quiet-hours state, not just tmux. A paused
+    daemon host must never read as 'drained' just because the board and
+    tmux are both quiet; before the fix nothing here ever consulted the
+    pause store at all."""
+    from coord import machine_pause as mp
+    from coord.config import load as load_config
+
+    config = load_config(str(valid_config_path))
+    monkeypatch.setattr(release_cmd, "_interactive_session_busy", lambda config: [])
+    mp.local_pause("server")
+
+    outcome = release_cmd._drain(
+        daemon_host="server",
+        config_path=None,
+        config=config,
+        deadline=10.0,
+        poll_interval=5.0,
+        reconcile=lambda: None,
+        board_fetch=lambda: ({}, None),
+        now=(lambda ts=[0.0]: (ts.__setitem__(0, ts[0] + 5.0), ts[0])[1]),
+        sleep=lambda s: None,
+    )
+    assert outcome.drained is False
+    assert "machine paused" in outcome.detail
+    assert "server" in outcome.detail
+
+
 # ── #2187: a VERIFIED, exit-0 propagate must never be reported as
 #    `propagate-failed` — the whole bug this issue is about ─────────────────
 #
