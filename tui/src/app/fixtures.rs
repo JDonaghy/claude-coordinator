@@ -385,6 +385,197 @@ pub fn make_app_with_assignments(assignments: Vec<Assignment>) -> CoordApp {
     app
 }
 
+/// #2281 data-model seam: build a [`CoordApp`] whose entire board — open
+/// issues, assignments, machines, pipeline_repos, pipeline_default_gates,
+/// plan_roster, etc. — is seeded from a raw JSON object shaped exactly like
+/// the daemon's `GET /board` response body (the same wire contract
+/// [`super::types::BoardPayload`] deserializes on the real
+/// `load_data_remote` path), rather than the empty `BoardData::default()`
+/// every other fixture in this module starts from.
+///
+/// `BoardData`'s fields (and `OpenIssue`) are `pub(crate)` — see the note on
+/// `BoardData` itself: "external callers only ever need
+/// `BoardData::default()`". That left an external `--test acceptance` crate
+/// able to build exactly one board: an empty one — no tree rows in the
+/// Board sidebar, nothing feeding the Pipeline tracked-issue list. This is
+/// the seam that removes that ceiling (#2281), and the prerequisite for
+/// every ms-65 slice (clicking Board/Pipeline sidebar rows).
+///
+/// Deliberately takes JSON rather than a `BoardData`/`OpenIssue`/`Machine` —
+/// same reasoning [`make_app_with_drive_queue`]'s doc comment already
+/// records: those types are `pub(crate)`, so a `pub fn` accepting one
+/// wouldn't compile (E0446), and going through the wire shape means a
+/// fixture that drifts from the daemon's real payload fails to parse here
+/// instead of rendering a plausible lie.
+///
+/// Skips the machine reachability/health TCP probes the real load path runs
+/// in `assemble_board_data` (`tcp_probe` / `spawn_machine_health` dialing
+/// `machines[*].host:7433`) — a fixture must stay pure/offline like every
+/// other helper in this module, so seeded machines always come back
+/// `reachable: false`, `version: None`, `worktree_bytes: 0`. `active_count`
+/// is still derived from the seeded `assignments` (a pure local
+/// computation, same as the real path).
+///
+/// Also rebuilds both sidebars and the Pipeline tracked-issue list
+/// (`pipeline_issues_from_cache`) before returning, mirroring the exact
+/// sequence the real data-apply tick runs (`rebuild_board_sidebar` →
+/// `pipeline_issues_from_cache` → `rebuild_pipeline_sidebar`) — so a caller
+/// gets a board that already renders, not one that needs to know which
+/// private rebuild methods to invoke itself.
+///
+/// Malformed JSON is a silent no-op — `make_test_app(BoardData::default())`,
+/// the empty-board render — matching every other JSON seam in this module
+/// (`make_app_with_audit_json`, `make_app_with_drive_queue`,
+/// `make_app_with_reports`). Callers assert on the resulting screen, not on
+/// this function's return.
+pub fn make_app_with_board_json(board_json: &str) -> CoordApp {
+    let data = match serde_json::from_str::<BoardPayload>(board_json) {
+        Ok(payload) => board_data_from_payload(payload),
+        Err(_) => BoardData::default(),
+    };
+    let mut app = make_test_app(data);
+    app.rebuild_board_sidebar();
+    app.pipeline_issues = app.pipeline_issues_from_cache();
+    app.rebuild_pipeline_sidebar(None);
+    app
+}
+
+/// Shared conversion behind [`make_app_with_board_json`]: turn a decoded
+/// [`BoardPayload`] into [`BoardData`] without the real load path's network
+/// probes (see that function's doc comment for why). Mirrors
+/// `load_data_remote` (`app/data.rs`) field-for-field, minus
+/// `assemble_board_data`'s probing tail — and minus the merge-queue
+/// milestone-title join `assemble_board_data` also runs, which no
+/// acceptance criterion for this seam needs and which a caller can still
+/// exercise directly on `app.data.open_issues` / `app.data.merge_queue` if
+/// a future test needs it.
+fn board_data_from_payload(payload: BoardPayload) -> BoardData {
+    let mut assignments = payload.assignments;
+    // Same ordering `load_data_remote` applies: running, then failed, then
+    // done (most recent first within each group) — so a fixture-built board
+    // sorts identically to a real one instead of surprising a test that
+    // asserts on row order.
+    assignments.sort_by(|a, b| {
+        let rank = |s: &str| match s {
+            "running" => 0u8,
+            "failed" => 1,
+            "done" => 2,
+            _ => 3,
+        };
+        rank(&a.status).cmp(&rank(&b.status)).then_with(|| {
+            b.dispatched_at
+                .partial_cmp(&a.dispatched_at)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    });
+
+    let machines: Vec<Machine> = payload
+        .machines
+        .into_iter()
+        .map(|m| {
+            let active_count = assignments
+                .iter()
+                .filter(|a| a.machine == m.name && a.status == "running")
+                .count();
+            Machine {
+                name: m.name,
+                host: m.host,
+                reachable: false,
+                active_count,
+                repos: m.repos,
+                version: None,
+                worktree_bytes: 0,
+            }
+        })
+        .collect();
+
+    let plans: std::collections::HashMap<String, PlanData> = payload
+        .plans
+        .iter()
+        .map(|(aid, v)| (aid.clone(), parse_plan_data(v)))
+        .collect();
+
+    let (
+        pipeline_default_gates,
+        pipeline_tracked_labels,
+        pipeline_repos,
+        pipeline_require_plan,
+        pipeline_repo_run_cmds,
+        pipeline_repo_paths,
+        pipeline_models,
+        pipeline_acceptance_routes,
+    ) = parse_pipeline_meta_from_map(&payload.board_meta);
+
+    let merge_staging = if payload.merge_staging.is_empty() {
+        compute_staging_local(&assignments, &payload.merge_queue, &pipeline_default_gates)
+    } else {
+        payload.merge_staging
+    };
+
+    BoardData {
+        // No wire equivalent worth deriving here: the real path matches the
+        // OS hostname against `machines[*].host`, which is meaningless for a
+        // fixture that never "runs" on any of the seeded machines. Leave it
+        // empty, same as `BoardData::default()`.
+        local_machine: String::new(),
+        assignments,
+        open_issues: payload.issues,
+        machines,
+        merge_queue: payload.merge_queue,
+        merge_plan: payload.merge_plan,
+        proposals: payload.proposals,
+        pipeline_default_gates,
+        pipeline_tracked_labels,
+        pipeline_repos,
+        pipeline_require_plan,
+        pipeline_repo_run_cmds,
+        pipeline_repo_paths,
+        pipeline_acceptance_routes,
+        plans,
+        merge_staging,
+        pipeline_models,
+        issue_stage_projection: payload.issue_stage_projection,
+        milestone_work_orders: payload.milestone_work_orders,
+        epic_children: payload.epic_children,
+        plan_roster: payload.plan_roster,
+        plan_roster_supported: payload.plan_roster_supported,
+        goal_header: payload.goal_header,
+        audit_recent_count: payload.audit_recent_count,
+        escalations: payload.escalations,
+        fleet_health: payload.fleet_health,
+        drive_queue: payload.drive_queue,
+    }
+}
+
+/// #2281 (ms-38 follow-on) data-model seam: build a [`CoordApp`] with the
+/// Plans panel's `plan_roster` pre-seeded from a raw JSON array shaped
+/// exactly like `/board`'s own `plan_roster` field (`Vec<PlanRosterEntry>`)
+/// — no live daemon, no `make_app_with_board_json`'s full board-payload
+/// shape required when a test only cares about plan-roster rows.
+///
+/// Falls out of the same [`BoardPayload`]/`PlanRosterEntry` deserialization
+/// [`make_app_with_board_json`] uses, mirroring the existing
+/// [`make_app_with_audit_json`] shape exactly (`BoardData` + one JSON
+/// blob) — this is the seam ms-38's `plans_detail_1122` /
+/// `plans_rightclick_1123` slices were blocked on (`tests/acceptance/ms-38/
+/// manifest.yml`'s HARNESS BLOCKER comment names this exact function).
+///
+/// Sets `plan_roster_supported = true` on success — matching what a real
+/// daemon that emits `plan_roster` at all always sends — so the Plans panel
+/// renders the seeded rows rather than its "not connected to a daemon that
+/// computes this" placeholder. Malformed JSON is a silent no-op (both
+/// fields stay whatever `data` implied) rather than a panic — callers
+/// should assert on the resulting screen, not on this function's return.
+pub fn make_app_with_plan_roster_json(data: BoardData, plan_roster_json: &str) -> CoordApp {
+    let mut app = make_test_app(data);
+    if let Ok(roster) = serde_json::from_str::<Vec<super::types::PlanRosterEntry>>(plan_roster_json)
+    {
+        app.data.plan_roster = roster;
+        app.data.plan_roster_supported = true;
+    }
+    app
+}
+
 /// #1039 data-model seam: build a [`CoordApp`] with the Audit panel's cache
 /// (`audit_page`) pre-seeded from a raw JSON string shaped exactly like the
 /// `GET /audit` response body (contract §6, `tests/acceptance/ms-33/
