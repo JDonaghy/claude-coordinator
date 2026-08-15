@@ -421,6 +421,26 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             -- entry forever. 0 for every row predating this column, same as
             -- a freshly-enqueued entry that has never been auto-resumed.
             resumes       INTEGER NOT NULL DEFAULT 0,
+            -- #2273 (post-review): the wall-clock moment a `retry` reconcile
+            -- recorded a death, and ONLY that — see coord.drive_queue's
+            -- `_retry_backoff_reason` docstring. Deliberately a SEPARATE
+            -- column from `reason_at` above: `reason_at` is re-stamped by
+            -- EVERY `last_reason` write, including the backoff-deferral's
+            -- own per-tick status refresh (`deferrals`/`last_reason`,
+            -- written every tick an entry is still backing off) — keying the
+            -- backoff window off a field the backoff mechanism itself
+            -- rewrites made the window's own clock reset every tick it was
+            -- checked, so an entry whose backoff exceeded the tick interval
+            -- could never finish waiting (the "moving target" bug: age
+            -- computed at any later tick was always ~one tick interval, never
+            -- the true elapsed time). `retry_backoff_at` is written ONLY by
+            -- the `retry` reconcile in `_reconcile_running` and never
+            -- touched by the deferral write, so it stays fixed for the whole
+            -- backoff window, the same way `launched_at` stays fixed for
+            -- #1794's grace window. NULL for every row predating this column
+            -- and for any entry that has never died — `_retry_backoff_reason`
+            -- treats that identically to `attempts <= 0` (no backoff yet).
+            retry_backoff_at REAL,
             UNIQUE(repo_name, issue_number)
         );
 
@@ -868,6 +888,14 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         # columns' own defaults for a freshly-enqueued entry.
         "ALTER TABLE merge_queue ADD COLUMN ci_flaky_reruns INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE merge_queue ADD COLUMN ci_flaky_pending TEXT NOT NULL DEFAULT ''",
+        # #2273 (post-review): see the CREATE TABLE comment above — a
+        # backoff-window anchor the deferral's own per-tick status write
+        # never touches, fixing the "moving target" bug where re-stamping
+        # `reason_at` every backing-off tick reset the very clock it fed.
+        # NULL for every row predating this migration, same as the column's
+        # own default and identical in effect to `attempts <= 0` (no backoff
+        # window active).
+        "ALTER TABLE drive_queue ADD COLUMN retry_backoff_at REAL",
     ]
     for sql in migrations:
         try:
