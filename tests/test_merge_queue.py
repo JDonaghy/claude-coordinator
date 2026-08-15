@@ -1151,6 +1151,21 @@ class TestExpectedRedClearOnMerge:
         assert gh.update_repo_file_calls  # the manifest text was actually edited
         assert "expected_red" not in gh.update_repo_file_calls[0][1]
 
+    def test_a_successful_clear_writes_a_durable_audit_row(self, coord_db) -> None:
+        """#2266 scope 2: a clear isn't just a `coord merge` output line
+        that scrolls past — it lands a queryable `audit_log` row too."""
+        work = self._work("w1", acceptance_state="passed", acceptance_sha="cafesha")
+        board = self._board(completed=[work])
+        gh = _ExpectedRedGh()
+
+        process([_q("w1", size=10)], gh, board=board)
+
+        rows = coord_db.execute(
+            "SELECT issue, repo FROM audit_log WHERE event_type = 'expected_red_clear'",
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["issue"] == 1
+
     def test_names_the_skip_when_acceptance_was_never_recorded(self) -> None:
         """#2199: this used to be a silent `return None` — and, before
         #2199 gave `coord acceptance record` a call site at all, the
@@ -1168,6 +1183,26 @@ class TestExpectedRedClearOnMerge:
         assert "acceptance_state=None" in events[-1].message
         assert "coord acceptance record" in events[-1].message
         assert not gh.update_repo_file_calls
+
+    def test_no_acceptance_skip_writes_a_distinct_durable_audit_row(self, coord_db) -> None:
+        """#2266 scope 3: "acceptance never recorded" is a different
+        problem from a stale SHA (below) — it must be queryable as such,
+        not just another line that scrolled past in `coord merge` output."""
+        work = self._work("w1")  # acceptance_state=None
+        board = self._board(completed=[work])
+        gh = _ExpectedRedGh()
+
+        process([_q("w1", size=10)], gh, board=board)
+
+        rows = coord_db.execute(
+            "SELECT issue FROM audit_log "
+            "WHERE event_type = 'expected_red_clear_skipped_no_acceptance'",
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["issue"] == 1
+        assert not coord_db.execute(
+            "SELECT 1 FROM audit_log WHERE event_type = 'expected_red_clear_skipped_sha_mismatch'",
+        ).fetchall()
 
     def test_names_the_skip_when_acceptance_failed(self) -> None:
         work = self._work("w1", acceptance_state="failed", acceptance_sha="cafesha")
@@ -1227,6 +1262,26 @@ class TestExpectedRedClearOnMerge:
         assert events[-1].kind == "expected_red_clear_skipped"
         assert not gh.update_repo_file_calls
 
+    def test_sha_mismatch_skip_writes_a_distinct_durable_audit_row(self, coord_db) -> None:
+        """#2266 scope 3: the SHA-mismatch guard is a different problem
+        from "acceptance never recorded" (above) — a distinct, queryable
+        event_type, not the same silence either guard reached before."""
+        work = self._work("w1", acceptance_state="passed", acceptance_sha="an-old-sha")
+        board = self._board(completed=[work])
+        gh = _ExpectedRedGh(branch_sha="cafesha")  # branch_head_sha != acceptance_sha
+
+        process([_q("w1", size=10)], gh, board=board)
+
+        rows = coord_db.execute(
+            "SELECT issue FROM audit_log "
+            "WHERE event_type = 'expected_red_clear_skipped_sha_mismatch'",
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["issue"] == 1
+        assert not coord_db.execute(
+            "SELECT 1 FROM audit_log WHERE event_type = 'expected_red_clear_skipped_no_acceptance'",
+        ).fetchall()
+
     def test_mock_author_entries_never_trigger_a_clear(self) -> None:
         """`assignment_type="mock-author"` doesn't close an issue at all
         (#1077) — issue_number there is the milestone tracking issue, not
@@ -1269,6 +1324,29 @@ class TestExpectedRedClearOnMerge:
         # "nothing found" for the same reason).
         assert events[-1].kind == "expected_red_clear"
         assert events[-1].entry.state == MERGED
+
+    def test_a_failed_clear_writes_a_distinct_durable_audit_row(self, coord_db) -> None:
+        """#2266 scope 2: `clear_expected_red_via_pr` never raises — every
+        failure degrades to a `warning: ...` string the caller can log.
+        That must still be durable, with an event_type distinct from a
+        real clear, so a repeat failure is queryable as "still stuck"."""
+        work = self._work("w1", acceptance_state="passed", acceptance_sha="cafesha")
+        board = self._board(completed=[work])
+
+        class _CommitFailsGh(_ExpectedRedGh):
+            def update_repo_file(self, repo, path, branch, content, message, *, sha):
+                raise RuntimeError("boom")
+
+        process([_q("w1", size=10)], _CommitFailsGh(), board=board)
+
+        rows = coord_db.execute(
+            "SELECT issue FROM audit_log WHERE event_type = 'expected_red_clear_failed'",
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["issue"] == 1
+        assert not coord_db.execute(
+            "SELECT 1 FROM audit_log WHERE event_type = 'expected_red_clear'",
+        ).fetchall()
 
 
 class _TestAuthorGateGh(FakeGh):

@@ -4423,6 +4423,30 @@ def _issue_has_expected_red_entries(entry: QueuedMerge, gh_ops: GhOps) -> bool:
     return bool(data.expected_red.get(entry.issue_number))
 
 
+def _record_expected_red_audit(entry: QueuedMerge, event_type: str, message: str) -> None:
+    """#2266: durable half of an `expected_red` clear/skip/failure — a
+    `MergeEvent` alone only reaches the operator as a `coord merge` output
+    line that scrolls past (issue #2266's framing: "nothing durable,
+    nothing re-checked"). ``record_audit`` gives the same three outcomes
+    (cleared, skipped for one of two distinct reasons, or attempted-and-
+    failed) a queryable row (`coord audit` / `query_audit_log`) so a repo
+    with a stuck registry is discoverable without re-reading merge output.
+    Best-effort like every other audit call site in this module —
+    ``record_audit`` itself never raises.
+    """
+    record_audit(
+        tier="business",
+        category="acceptance",
+        event_type=event_type,
+        actor="system",
+        summary=f"{entry.repo_name}#{entry.issue_number}: {message}",
+        repo=entry.repo_name,
+        issue=entry.issue_number,
+        assignment_id=entry.assignment_id,
+        details={"pr_number": entry.pr_number, "target_branch": entry.target_branch},
+    )
+
+
 def _maybe_clear_expected_red(entry: QueuedMerge, board, gh_ops: GhOps) -> MergeEvent | None:
     """#2164: right after *entry*'s PR has actually merged into
     ``entry.target_branch``, clear any of its issue's ``expected_red``
@@ -4467,16 +4491,21 @@ def _maybe_clear_expected_red(entry: QueuedMerge, board, gh_ops: GhOps) -> Merge
             # silent no-op is still correct here, not a regression (see
             # the docstring above and #2199 review finding 2).
             return None
-        return MergeEvent(
-            entry, "expected_red_clear_skipped_no_acceptance",
+        msg = (
             f"no passing trust-gate verdict recorded on {work.assignment_id} "
             f"(acceptance_state={acceptance_state!r}) — the external `coord "
             "acceptance record` re-run either never happened or did not "
             "pass; skipping expected_red clear. Run `coord acceptance "
             f"record --repo {entry.repo_name} --issue {entry.issue_number} "
             "--sha <merged sha>` by hand, or re-drive the issue, to clear "
-            "any listed entries.",
+            "any listed entries."
         )
+        # #2266: distinct from the SHA-mismatch guard below — "acceptance
+        # never recorded" and "recorded SHA is stale" are different
+        # problems with different fixes, so they get distinct event types
+        # rather than reaching the operator as the same silence.
+        _record_expected_red_audit(entry, "expected_red_clear_skipped_no_acceptance", msg)
+        return MergeEvent(entry, "expected_red_clear_skipped_no_acceptance", msg)
     acceptance_sha = getattr(work, "acceptance_sha", None)
     if acceptance_sha is None or acceptance_sha != entry.branch_head_sha:
         # The recorded trust-gate verdict isn't for the exact commit that
@@ -4486,18 +4515,28 @@ def _maybe_clear_expected_red(entry: QueuedMerge, board, gh_ops: GhOps) -> Merge
         # fresh SHA and this issue's fix merges again... though ordinarily
         # a merge only happens once per issue, so a mismatch here more
         # likely means acceptance was simply never recorded for this SHA.
-        return MergeEvent(
-            entry, "expected_red_clear_skipped",
+        msg = (
             "acceptance_sha does not match the merged commit — skipping "
             "expected_red clear (re-run `coord acceptance record` against "
-            "the merged SHA if entries should have cleared)",
+            "the merged SHA if entries should have cleared)"
         )
+        _record_expected_red_audit(entry, "expected_red_clear_skipped_sha_mismatch", msg)
+        return MergeEvent(entry, "expected_red_clear_skipped", msg)
 
     from coord.acceptance import clear_expected_red_via_pr  # noqa: PLC0415
 
     msg = clear_expected_red_via_pr(
         entry.repo_github, entry.repo_name, entry.target_branch, entry.issue_number,
         gh_ops=gh_ops,
+    )
+    # #2266: `clear_expected_red_via_pr` never raises — every failure mode
+    # degrades to a "warning: ..." (or "... did not merge ...") string.
+    # Make that durable too, not just a merge-output line: a repeated
+    # `expected_red_clear_failed` for the same issue is exactly the signal
+    # `coord acceptance expected-red --clear` (the re-fire path) exists for.
+    cleared = msg.startswith("cleared expected_red")
+    _record_expected_red_audit(
+        entry, "expected_red_clear" if cleared else "expected_red_clear_failed", msg,
     )
     return MergeEvent(entry, "expected_red_clear", msg)
 
