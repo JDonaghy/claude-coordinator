@@ -59,6 +59,9 @@ __all__ = [
     "ReportParam",
     "ReportDef",
     "ColumnMeta",
+    "ChartSeries",
+    "ChartSpec",
+    "CHART_KINDS",
     "ReportResult",
     "REPORTS",
     "catalogue",
@@ -78,6 +81,7 @@ __all__ = [
     "QUEUE_OUTCOMES_WINDOW_CHOICES",
     "resolve_queue_outcomes_window",
     "fold_queue_outcomes",
+    "queue_outcomes_chart",
     "run_queue_outcomes",
     "parse_duration",
     "result_to_csv",
@@ -190,6 +194,90 @@ class ColumnMeta:
         }
 
 
+# ── chart declaration (#2271) ──────────────────────────────────────────────
+#
+# A report says "this table also reads as a chart"; it does NOT ship a second
+# copy of the numbers.  Every series names a `columns[]` id and the renderer
+# reads the same `rows` the table renders, so there is exactly one source of
+# truth, the table stays the fallback rendering, and `result_to_csv` (#1765)
+# needs no change at all — it is driven by `columns`/`rows`/`totals` and never
+# looks at this block.
+#
+# THE COMPATIBILITY RULE, same as `ColumnMeta.kind`'s (#1760): a client that
+# does not understand this block, or meets a `kind` it predates, **renders the
+# table and ignores the chart**.  It must never fail to parse and must never
+# leave a hole where the chart would have gone.  That matters more than usual
+# here because coord-tui ships as a per-host locally-built binary, outside
+# propagation's reach, so the fleet routinely runs mixed versions.
+
+#: Open vocabulary — the kinds a client is *expected* to know today.  A newer
+#: daemon may name one that is not here; see the compatibility rule above.
+CHART_KINDS = ("bar", "line", "sparkline")
+
+
+@dataclass(frozen=True)
+class ChartSeries:
+    """One series of a :class:`ChartSpec`, derived from an existing column.
+
+    ``column`` is a ``ReportResult.columns`` id whose per-row value supplies
+    the y-values; ``label`` is what the legend shows.  ``color`` is an
+    optional ``"#rrggbb"`` hint — when :attr:`ChartSpec.group_by` is set the
+    series are generated per group and the backend palette picks the colours
+    instead, because one declared colour cannot describe N groups.
+    """
+
+    label: str
+    column: str
+    color: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"label": self.label, "column": self.column, "color": self.color}
+
+
+@dataclass(frozen=True)
+class ChartSpec:
+    """An optional chart rendering of a :class:`ReportResult`'s own rows.
+
+    Two shapes, and which one you get depends on ``group_by``:
+
+    * **``group_by is None`` — one data point per row, in the report's
+      canonical row order.**  ``x`` names the column supplying each point's
+      category/time label; each :class:`ChartSeries` reads its own column
+      straight off the row.  This is the "one bar per category" shape.
+    * **``group_by`` set — a pivot.**  The x-axis is the *distinct* values of
+      ``x`` in first-appearance order, and one output series is produced per
+      distinct ``group_by`` value.  Rows landing in the same ``(group, x)``
+      cell are **summed**, and an empty cell is ``0`` — so this shape is for
+      magnitudes (counts, totals), not for averages or rates.  This is the
+      "one trendline per bucket" shape that a long-form result needs.
+
+    ``stacked`` is bar-only and ignored by every other kind.  Rendering a
+    multi-series bar chart at all needs quadraui#584; a client whose pinned
+    build predates it must degrade the section to a table with a stated
+    reason rather than draw a chart that silently omits every series but the
+    first.
+    """
+
+    kind: str
+    series: tuple[ChartSeries, ...]
+    x: str | None = None
+    group_by: str | None = None
+    stacked: bool = False
+    title: str = ""
+    y_label: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "series": [s.to_dict() for s in self.series],
+            "x": self.x,
+            "group_by": self.group_by,
+            "stacked": self.stacked,
+            "title": self.title,
+            "y_label": self.y_label,
+        }
+
+
 @dataclass
 class ReportResult:
     """The wire contract (#1741 renders against these exact field names).
@@ -210,6 +298,12 @@ class ReportResult:
     before.  Identity columns are deliberately *absent* from the dict rather
     than filled with a placeholder — a renderer that wants a ``Σ`` marker
     picks one itself, and one that doesn't leaves the cell blank.
+
+    ``chart`` (#2271) is an optional declaration that this result also reads
+    as a chart, derived from the very columns the table renders — see
+    :class:`ChartSpec`.  **Additive and defaulting to ``None``**, and a
+    client that ignores the key (or meets a ``kind`` it predates) renders the
+    table exactly as it did before.
     """
 
     report_id: str
@@ -220,6 +314,7 @@ class ReportResult:
     notes: list[str]
     column_meta: list[ColumnMeta] = field(default_factory=list)
     totals: dict[str, Any] | None = None
+    chart: ChartSpec | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -231,6 +326,7 @@ class ReportResult:
             "rows": list(self.rows),
             "notes": list(self.notes),
             "totals": None if self.totals is None else dict(self.totals),
+            "chart": None if self.chart is None else self.chart.to_dict(),
         }
 
 
@@ -1677,6 +1773,45 @@ def fold_queue_outcomes(
         rows=rows,
         notes=notes,
         totals=totals,
+        chart=queue_outcomes_chart(rows, n_periods),
+    )
+
+
+def queue_outcomes_chart(
+    rows: Sequence[Mapping[str, Any]], n_periods: int
+) -> ChartSpec | None:
+    """The chart declaration for a ``queue-outcomes`` fold (#2271).
+
+    Exactly the two views the report's own description already promises:
+    ``24h`` is a single period, so it is **one stacked bar per bucket** over
+    the categories in it; ``7d``/``4w`` are the same arithmetic in 7 daily /
+    4 weekly points, so they are **one trendline per bucket** over
+    ``period_start``.  Both derive from ``count`` — the column the table
+    renders — so there is nothing to keep in sync.
+
+    ``None`` when there is nothing to plot: an empty fold is an EMPTY result,
+    and an axis with no marks on it reads as a zero score rather than as no
+    measurement.
+    """
+    if not rows:
+        return None
+    if n_periods > 1:
+        return ChartSpec(
+            kind="line",
+            series=(ChartSeries(label="Entries", column="count"),),
+            x="period_start",
+            group_by="bucket",
+            title="Outcomes per period",
+            y_label="Entries",
+        )
+    return ChartSpec(
+        kind="bar",
+        series=(ChartSeries(label="Entries", column="count"),),
+        x="category",
+        group_by="bucket",
+        stacked=True,
+        title="Outcomes by bucket",
+        y_label="Entries",
     )
 
 
