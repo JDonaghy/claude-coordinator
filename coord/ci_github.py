@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from coord import github_ops
-from coord.ci_store import CheckRun, JobRun, JobStep
+from coord.ci_store import CheckRun, JobRun, JobStep, failed_checks
 
 
 def _parse_ts(raw: str | None) -> float | None:
@@ -227,6 +227,40 @@ class GitHubCi:
             # #1483: route through the single `gh` sink instead of shelling
             # out here directly.
             if github_ops.rerun_workflow_run(repo, run_id):
+                any_ok = True
+            else:
+                all_ok = False
+        if any_ok:
+            self.invalidate(repo, number)
+            for run_id in run_ids:
+                self._jobs_cache.pop((repo, str(run_id)), None)
+        return all_ok and any_ok
+
+    def rerun_failed_for_pr(self, repo: str, number: int) -> bool:
+        """Re-run only the FAILING job(s) behind *repo*#*number*'s current
+        checks via ``gh run rerun <id> --failed`` (#2252).
+
+        Same shape as :meth:`rerun_for_pr` above, narrowed to the run ids
+        behind :func:`coord.ci_store.failed_checks` rather than every run id
+        among the PR's checks — a passing check's run is left untouched, so
+        the caller's #2252 flake re-check can't accidentally spend CI
+        minutes re-proving a check that already reported green, and the
+        green evidence itself (timestamps, logs) survives intact for the
+        board to keep showing.
+
+        Same best-effort / return-value / cache-invalidation contract as
+        `rerun_for_pr`: ``True`` only when at least one run id was found
+        among the currently-failing checks *and* every ``gh run rerun
+        --failed`` call issued exited zero.
+        """
+        checks = self.list_checks_for_pr(repo, number)
+        run_ids = sorted({c.run_id for c in failed_checks(checks) if c.run_id})
+        if not run_ids:
+            return False
+        all_ok = True
+        any_ok = False
+        for run_id in run_ids:
+            if github_ops.rerun_workflow_run_failed(repo, run_id):
                 any_ok = True
             else:
                 all_ok = False

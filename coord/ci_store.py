@@ -195,6 +195,31 @@ class CiStore(Protocol):
         """
         ...
 
+    def rerun_failed_for_pr(self, repo: str, number: int) -> bool:
+        """Re-run ONLY the currently-failing job(s) behind *repo*#*number*'s
+        checks (#2252). Returns whether it worked.
+
+        Narrower than :meth:`rerun_for_pr`, which reruns every distinct
+        Actions run id behind ALL of a PR's checks — passing ones included.
+        Re-running the whole run would also re-trigger jobs that already
+        reported green, discarding that first-pass evidence for nothing:
+        #2252 asks "is the RED one flaky?", not "run the suite again", and
+        wants the answer without paying for (or risking a second read of)
+        checks that already settled.
+
+        This is the mechanism behind :mod:`coord.merge_queue`'s one-shot
+        flake re-check (``MAX_CI_FLAKY_RERUNS`` — deliberately ONE re-run,
+        not a retry loop: two independent observations is the whole ask).
+        Call sites duck-type via ``getattr(ci, "rerun_failed_for_pr",
+        None)`` so a `CiStore` stand-in that predates this capability (most
+        duck-typed test stubs, :class:`coord.gate_snapshot.GateSnapshot`)
+        simply doesn't offer it — read as "could not trigger a re-run",
+        the same fail-safe fallback an actual `gh` failure produces (#2252:
+        "if the re-run cannot be triggered, fall back to today's
+        behaviour").
+        """
+        ...
+
 
 class NoOpCi:
     """Always-available fallback that returns no checks and reruns nothing.
@@ -225,6 +250,11 @@ class NoOpCi:
         """No-op: CI gating is disabled entirely, so there is no job/step
         detail to fetch (#1892)."""
         return []
+
+    def rerun_failed_for_pr(self, repo: str, number: int) -> bool:
+        """No-op: CI gating is disabled entirely, so there is nothing to
+        re-run (#2252)."""
+        return False
 
 
 # ── Classification helpers ──────────────────────────────────────────────────

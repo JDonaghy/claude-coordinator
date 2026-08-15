@@ -277,7 +277,10 @@ walk, no queue-level alert, no launch. Safe with the timer stopped or running.
 
 `parked` is the queue's "not your problem" state: the drive died, but the only
 thing the board holds against the entry's merge is that CI has not reported
-(`CI running: …`) or reported without a verdict (`CI infra: …`, #1892).
+(`CI running: …`), reported without a verdict (`CI infra: …`, #1892), or
+reported a real failure that `coord merge` is re-checking once before
+believing it (`CI re-checking: …`, #2252 — a failed check is re-run exactly
+once to rule out a flake before a drive attempt is spent on it).
 Relaunching would just observe the same silence, so the tick parks instead —
 **no attempt spent**, no escalation, no operator command needed. Unlike
 `blocked`, you are not expected to do anything about it.

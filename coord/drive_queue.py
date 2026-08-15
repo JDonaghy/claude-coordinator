@@ -72,7 +72,12 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from coord.drive_state import TERMINAL_STATUSES, WORK_LIKE
 from coord.gate_a import is_gate_a_refusal_reason
-from coord.merge_queue import PLAN_READY, is_ci_infra_reason, is_ci_pending_reason
+from coord.merge_queue import (
+    PLAN_READY,
+    is_ci_flaky_reason,
+    is_ci_infra_reason,
+    is_ci_pending_reason,
+)
 from coord.models import is_policy_refusal_reason
 
 # ── queue states ─────────────────────────────────────────────────────────────
@@ -119,6 +124,17 @@ STATE_FAILED = "failed"
 # relaunching a fresh `coord drive` right now would just observe the same
 # rerun-in-progress and wait again, so this parks instead of spending an
 # attempt. See `build_board_view`'s population of `merge_ci_pending` below.
+#
+# #2252 extends the SAME state to a THIRD trigger:
+# `coord.merge_queue.is_ci_flaky_reason` — a CI verdict that DID arrive AND
+# said something real about the code, but has only been observed failing
+# ONCE so far. The "more real time" that un-parks the entry is the one
+# scoped re-run (`MAX_CI_FLAKY_RERUNS`) landing — a coin-flip flake clears
+# and the entry resumes having spent zero attempts, a confirmed-real failure
+# reverts to a plain `checks_failed` block (spends the attempt exactly like
+# today) on the very next tick. Same reasoning as #1892 for why this parks
+# rather than spends: relaunching right now would just observe the same
+# re-run-in-progress and wait again.
 STATE_PARKED = "parked"
 
 TERMINAL_QUEUE_STATES: frozenset[str] = frozenset(
@@ -816,17 +832,34 @@ def build_board_view(
         if is_ci_infra_reason(raw_reason) and not is_ci_infra_reason(plan_reason):
             reason = raw_reason
             reason_is_live = False
-        if not (is_ci_pending_reason(reason) or is_ci_infra_reason(reason)):
+        # #2252: same recovery, for the sibling CI_FLAKY_PREFIX
+        # classification — a `checks_failed` streak currently mid its one
+        # #2252 re-run to rule out a flake. `_entry_gate_status` re-derives
+        # this identically to a plain "checks failed: ..." block (it has no
+        # notion of the raw row's `ci_flaky_reruns`/`ci_flaky_pending`
+        # state), so the raw reading must win here too or this entry would
+        # never park — it would instead sit `checks_failed` and burn a
+        # drive-queue launch attempt for the exact transient #2252 exists
+        # to catch. `elif`: the two classifications are mutually exclusive
+        # per entry (see the identical `elif` in `drive_state._merge_entry`).
+        elif is_ci_flaky_reason(raw_reason) and not is_ci_flaky_reason(plan_reason):
+            reason = raw_reason
+            reason_is_live = False
+        if not (
+            is_ci_pending_reason(reason)
+            or is_ci_infra_reason(reason)
+            or is_ci_flaky_reason(reason)
+        ):
             continue
         # #2158: the same plan row that came back with NO reason of its own
         # also carries `ci_summary` — `summarize_counts` over the very checks
         # `_entry_gate_status` just consulted, on the same board build. When
         # that rollup positively shows every check finished and none failed,
         # it is direct evidence AGAINST the raw row's frozen "CI running:" /
-        # "CI infra:" string, which no read path ever rewrites. Believing the
-        # write-path string over it is what wedged claude-coordinator#2138
-        # parked for 7h25m on CI that had gone green 41s before the park was
-        # written.
+        # "CI infra:" / "CI re-checking:" string, which no read path ever
+        # rewrites. Believing the write-path string over it is what wedged
+        # claude-coordinator#2138 parked for 7h25m on CI that had gone green
+        # 41s before the park was written.
         #
         # The override is deliberately POSITIVE-evidence-only, and only where
         # the plan itself is silent:

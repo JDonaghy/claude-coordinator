@@ -1630,6 +1630,32 @@ def rerun_workflow_run(repo: str, run_id: str) -> bool:
     return result.returncode == 0
 
 
+def rerun_workflow_run_failed(repo: str, run_id: str) -> bool:
+    """Re-run only the FAILING job(s) of Actions workflow run *run_id* on
+    *repo* via ``gh run rerun <id> --failed`` (#2252).
+
+    The single ``gh`` sink for :meth:`coord.ci_github.GitHubCi.
+    rerun_failed_for_pr` — the narrower sibling of
+    :func:`rerun_workflow_run` (#1851/#1892), which restarts the WHOLE run
+    including jobs that already reported green. ``--failed`` is exactly
+    #2252's own scoping ask: cheaper, and it keeps the first pass's green
+    evidence intact instead of discarding it for no reason.
+
+    Returns ``True`` only on a clean (exit 0) rerun; any subprocess failure
+    (missing ``gh``, timeout, non-zero exit — e.g. the run is already in
+    progress, or the id is stale/invalid) returns ``False`` rather than
+    raising, matching :func:`rerun_workflow_run`'s own best-effort contract.
+    """
+    try:
+        result = subprocess.run(
+            ["gh", "run", "rerun", str(run_id), "--repo", repo, "--failed"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
 def truncate_diff_text(diff: str, max_chars: int = 60000) -> str:
     """Truncate *diff* to *max_chars* with a trailing note, if it's over.
 

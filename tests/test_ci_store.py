@@ -45,6 +45,10 @@ class TestNoOpCi:
         rerun_for_pr must not pretend to do anything."""
         assert NoOpCi().rerun_for_pr("acme/api", 1) is False
 
+    def test_rerun_failed_for_pr_is_a_noop(self) -> None:
+        """#2252: same opt-out for the narrower failed-jobs-only rerun."""
+        assert NoOpCi().rerun_failed_for_pr("acme/api", 1) is False
+
     def test_expects_checks_is_false(self) -> None:
         """#1904: `ci_store: { type: none }` is the supported "this repo has
         no CI" opt-out — an empty check list from `NoOpCi` must never read
@@ -894,6 +898,104 @@ class TestGitHubCiRerunForPr:
         assert run.call_count == 3
 
 
+class TestGitHubCiRerunFailedForPr:
+    """#2252: the narrower ``--failed`` sibling of `rerun_for_pr` — reruns
+    only the run ids behind currently-FAILING checks, leaving passing ones
+    (and their run ids) untouched."""
+
+    def _payload(self, *, failing: list[str], passing: list[str]) -> str:
+        checks = [
+            {
+                "name": f"fail-{rid}", "state": "FAILURE", "bucket": "fail",
+                "link": f"https://github.com/acme/api/actions/runs/{rid}",
+                "startedAt": "2026-05-24T12:00:00Z", "completedAt": "2026-05-24T12:05:00Z",
+            }
+            for rid in failing
+        ] + [
+            {
+                "name": f"pass-{rid}", "state": "SUCCESS", "bucket": "pass",
+                "link": f"https://github.com/acme/api/actions/runs/{rid}",
+                "startedAt": "2026-05-24T12:00:00Z", "completedAt": "2026-05-24T12:05:00Z",
+            }
+            for rid in passing
+        ]
+        return json.dumps(checks)
+
+    def test_reruns_only_the_failing_run_ids(self) -> None:
+        store = GitHubCi()
+        payload = self._payload(failing=["1"], passing=["2"])
+        with patch("coord.ci_github.subprocess.run") as run:
+            run.side_effect = [
+                _gh_result(payload),  # list_checks_for_pr
+                _gh_result(""),  # gh run rerun 1 --failed
+            ]
+            ok = store.rerun_failed_for_pr("acme/api", 42)
+        assert ok is True
+        assert run.call_count == 2  # never touches run id 2 (the passing one)
+        rerun_call = run.call_args_list[1].args[0]
+        assert rerun_call == [
+            "gh", "run", "rerun", "1", "--repo", "acme/api", "--failed",
+        ]
+
+    def test_multiple_failing_run_ids_all_rerun_scoped_to_failed(self) -> None:
+        store = GitHubCi()
+        payload = self._payload(failing=["1", "2"], passing=["3"])
+        with patch("coord.ci_github.subprocess.run") as run:
+            run.side_effect = [
+                _gh_result(payload),
+                _gh_result(""),
+                _gh_result(""),
+            ]
+            ok = store.rerun_failed_for_pr("acme/api", 42)
+        assert ok is True
+        rerun_calls = [
+            c for c in run.call_args_list if c.args[0][:3] == ["gh", "run", "rerun"]
+        ]
+        assert len(rerun_calls) == 2
+        rerun_ids = {c.args[0][3] for c in rerun_calls}
+        assert rerun_ids == {"1", "2"}
+        for c in rerun_calls:
+            assert c.args[0][4:] == ["--repo", "acme/api", "--failed"]
+
+    def test_all_green_returns_false_without_reruning_anything(self) -> None:
+        store = GitHubCi()
+        payload = self._payload(failing=[], passing=["1", "2"])
+        with patch("coord.ci_github.subprocess.run", return_value=_gh_result(payload)) as run:
+            ok = store.rerun_failed_for_pr("acme/api", 42)
+        assert ok is False
+        assert run.call_count == 1  # only the list_checks_for_pr call
+
+    def test_no_checks_returns_false(self) -> None:
+        store = GitHubCi()
+        with patch("coord.ci_github.subprocess.run", return_value=_gh_result("[]")):
+            assert store.rerun_failed_for_pr("acme/api", 42) is False
+
+    def test_partial_failure_reports_false(self) -> None:
+        store = GitHubCi()
+        payload = self._payload(failing=["1", "2"], passing=[])
+        with patch("coord.ci_github.subprocess.run") as run:
+            run.side_effect = [
+                _gh_result(payload),
+                _gh_result("", returncode=0),
+                _gh_result("", returncode=1, stderr="run already in progress"),
+            ]
+            ok = store.rerun_failed_for_pr("acme/api", 42)
+        assert ok is False
+
+    def test_success_invalidates_cache(self) -> None:
+        store = GitHubCi(cache_ttl=60.0)
+        payload = self._payload(failing=["1"], passing=[])
+        with patch("coord.ci_github.subprocess.run") as run:
+            run.side_effect = [
+                _gh_result(payload),
+                _gh_result(""),
+                _gh_result(payload),  # re-fetched after invalidate
+            ]
+            store.rerun_failed_for_pr("acme/api", 42)
+            store.list_checks_for_pr("acme/api", 42)
+        assert run.call_count == 3
+
+
 class TestGitHubCiListJobsForRun:
     """#1892: `gh api repos/{repo}/actions/runs/{id}/jobs` job/step detail —
     the extra call the CI-failure classification path pays for. Fixture
@@ -1391,6 +1493,13 @@ class TestMergeGateThroughGitHubCi:
         assert items[0].state == MERGED
 
     def test_red_refuses_and_names_failing_check(self) -> None:
+        """#2252: a red check with a real verdict gets ONE scoped re-run
+        (`GitHubCi.rerun_failed_for_pr`, `gh run rerun ... --failed`) before
+        `process()` treats it as broken — the first call re-checks instead
+        of refusing outright (`ci_flaky_rerun`, still not merged). This mock
+        always returns the same failing payload (a real flake would come
+        back green), so the second call observes it red again and confirms
+        it: the pre-#2252 single-call refusal, naming the failing check."""
         items = [_entry("a")]
         gh = FakeGh()
         payload = json.dumps([
@@ -1400,6 +1509,14 @@ class TestMergeGateThroughGitHubCi:
         ])
         ci = GitHubCi()
         with patch("coord.ci_github.subprocess.run", return_value=_gh_result(payload)):
+            first_events = process(items, gh, ci_store=ci)
+            first_kinds = [e.kind for e in first_events]
+            assert "ci_flaky_rerun" in first_kinds
+            assert "checks_failed" not in first_kinds
+            assert "merged" not in first_kinds
+            assert gh.merge_calls == []
+            assert items[0].state == PENDING
+
             events = process(items, gh, ci_store=ci)
         assert gh.merge_calls == []
         assert items[0].state == PENDING

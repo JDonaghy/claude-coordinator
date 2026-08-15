@@ -34,7 +34,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from coord.merge_queue import is_ci_infra_reason
+from coord.merge_queue import is_ci_flaky_reason, is_ci_infra_reason
 from coord.models import WORK_LIKE_TYPES, test_mode_from_labels
 
 # Assignment types that can carry the Test/Review gates for an issue.  Sourced
@@ -581,6 +581,21 @@ def _merge_entry(
     if raw_entry is not None:
         raw_reason = raw_entry.get("error")
         if is_ci_infra_reason(raw_reason) and not is_ci_infra_reason(reason):
+            reason = raw_reason
+        # #2252: same recovery, for the SAME reason, for the sibling
+        # CI_FLAKY_PREFIX classification — `_entry_gate_status`'s fresh
+        # re-derivation has no notion of "this entry already spent its one
+        # #2252 re-run and is waiting on the answer" (that state lives only
+        # in `QueuedMerge.ci_flaky_reruns`/`ci_flaky_pending`, updated by
+        # the live `merge_queue.process()` path and persisted onto the raw
+        # row's `error`), so it would otherwise re-derive the SAME failing
+        # checks as the plain "checks failed: ..." wording every tick,
+        # shadowing the more specific CI-re-checking reading the raw row
+        # already has. `elif` — the two classifications are mutually
+        # exclusive per entry (one failure streak is either infra or
+        # flaky-pending, never both at once), so only one raw-preference
+        # branch can ever legitimately fire for a given raw_reason.
+        elif is_ci_flaky_reason(raw_reason) and not is_ci_flaky_reason(reason):
             reason = raw_reason
 
     return {

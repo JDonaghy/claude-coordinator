@@ -189,7 +189,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             assignment_type TEXT DEFAULT 'work',
             required_gates TEXT,
             ci_infra_reruns INTEGER NOT NULL DEFAULT 0,
-            ci_stale_reruns INTEGER NOT NULL DEFAULT 0
+            ci_stale_reruns INTEGER NOT NULL DEFAULT 0,
+            ci_flaky_reruns INTEGER NOT NULL DEFAULT 0,
+            ci_flaky_pending TEXT NOT NULL DEFAULT ''
         );
 
         CREATE TABLE IF NOT EXISTS plans (
@@ -857,6 +859,15 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         # 0 for every row predating this migration, same as the column's own
         # default for a freshly-enqueued entry.
         "ALTER TABLE drive_queue ADD COLUMN resumes INTEGER NOT NULL DEFAULT 0",
+        # #2252: the flake-recheck auto-rerun's OWN counter/pending-state —
+        # see `coord.merge_queue.MAX_CI_FLAKY_RERUNS` and
+        # `QueuedMerge.ci_flaky_reruns`/`ci_flaky_pending`'s docstrings for
+        # why they're kept separate from `ci_infra_reruns`/`ci_stale_reruns`
+        # above rather than sharing either. 0/'' for every row predating
+        # this migration — no flake re-run ever spent/pending — same as the
+        # columns' own defaults for a freshly-enqueued entry.
+        "ALTER TABLE merge_queue ADD COLUMN ci_flaky_reruns INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE merge_queue ADD COLUMN ci_flaky_pending TEXT NOT NULL DEFAULT ''",
     ]
     for sql in migrations:
         try:

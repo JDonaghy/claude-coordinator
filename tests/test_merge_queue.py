@@ -162,6 +162,19 @@ class TestPersistence:
         again = {x.assignment_id: x.ci_stale_reruns for x in load_queue()}
         assert again == {"a": 2, "b": 0}
 
+    def test_roundtrip_preserves_ci_flaky_reruns_and_pending(self, coord_db) -> None:
+        # #2252: same durability requirement as ci_infra_reruns/
+        # ci_stale_reruns above — a daemon restart mid-way through a
+        # pending flake re-check must not lose track of the failure it's
+        # waiting on (ci_flaky_pending) or reset the one-shot budget
+        # (ci_flaky_reruns), which would let the re-run fire again.
+        a = _q("a")
+        a.ci_flaky_reruns = 1
+        a.ci_flaky_pending = '{"checks": [{"name": "e2e", "conclusion": "failure"}], "sha": "abc123"}'
+        save_queue([a, _q("b")])
+        again = {x.assignment_id: (x.ci_flaky_reruns, x.ci_flaky_pending) for x in load_queue()}
+        assert again == {"a": (1, a.ci_flaky_pending), "b": (0, "")}
+
 
 class TestEnqueue:
     def _assignment(self, *, branch: str | None = "worker/foo") -> Assignment:
@@ -6455,6 +6468,220 @@ class TestProcessCiInfraAutoRerun:
         process(items, gh, ci_store=ci)
 
         assert items[0].ci_infra_reruns == 0
+
+
+class TestProcessCiFlakyAutoRerun:
+    """#2252: `process()`'s live merge path re-runs a genuinely-verdicted
+    (non-infra) failure's failed job(s) ONCE — via `CiStore.
+    rerun_failed_for_pr`, scoped so passing checks are left untouched —
+    before spending a drive attempt on it. Passes on the second read: merge
+    proceeds, zero attempts spent, the flake is recorded. Fails again:
+    attempt spent, entry blocks — identical to today."""
+
+    class _Ci:
+        is_available = True
+
+        def __init__(self, *, checks, rerun_ok=True):
+            self._checks = checks
+            self.rerun_ok = rerun_ok
+            self.rerun_failed_calls: list[tuple[str, int]] = []
+
+        def list_checks_for_pr(self, repo, number):
+            return self._checks
+
+        def rerun_failed_for_pr(self, repo, number):
+            self.rerun_failed_calls.append((repo, number))
+            return self.rerun_ok
+
+    class _CiPredatingTheFeature:
+        """A CiStore stand-in with no `rerun_failed_for_pr` at all — most
+        duck-typed test stubs elsewhere in this file, and
+        `coord.gate_snapshot.GateSnapshot`. Call sites duck-type via
+        `getattr(ci, "rerun_failed_for_pr", None)`, so this must degrade to
+        today's plain `checks_failed` block, not raise."""
+
+        is_available = True
+
+        def __init__(self, *, checks):
+            self._checks = checks
+
+        def list_checks_for_pr(self, repo, number):
+            return self._checks
+
+    @staticmethod
+    def _genuine_failure():
+        c = _check("build", conclusion="failure")
+        c.run_id = "999"
+        return [c]
+
+    @staticmethod
+    def _audit_rows(coord_db, event_type: str = "ci_flake_detected") -> list:
+        return coord_db.execute(
+            "SELECT * FROM audit_log WHERE event_type = ?", (event_type,)
+        ).fetchall()
+
+    def test_first_genuine_failure_triggers_one_re_check_not_a_plain_block(
+        self, caplog
+    ) -> None:
+        import logging
+        caplog.set_level(logging.INFO, logger="coord.merge_queue")
+        items = [_q("w1", pr=99)]
+        gh = FakeGh()
+        ci = self._Ci(checks=self._genuine_failure())
+
+        events = process(items, gh, ci_store=ci)
+
+        assert items[0].state == PENDING
+        assert items[0].ci_flaky_reruns == 1
+        assert ci.rerun_failed_calls == [("acme/api", 99)]
+        kinds = [e.kind for e in events]
+        assert "ci_flaky_rerun" in kinds
+        assert "checks_failed" not in kinds
+        assert items[0].error is not None
+        assert items[0].error.startswith("CI re-checking:")
+        assert items[0].ci_flaky_pending  # stashed for the eventual audit row
+        assert any("#2252 flake re-check" in r.message for r in caplog.records)
+
+    def test_pass_on_second_read_merges_spends_zero_attempts_and_records_flake(
+        self, coord_db
+    ) -> None:
+        """The issue's own black-box acceptance: red once, green on re-run
+        -> merges, `ci_flaky_reruns` resets to 0 (never counted as a spent
+        drive attempt), and the flake is durably recorded."""
+        items = [_q("w1", pr=99)]
+
+        class _Gh(FakeGh):
+            def get_branch_commit_timestamp(self, repo, branch):
+                return 1000.0  # #2197: keep the unrelated staleness gate green
+
+        gh = _Gh()
+        ci = self._Ci(checks=self._genuine_failure())
+
+        # Tick 1: red -> one scoped re-run triggered, not yet blocked.
+        process(items, gh, ci_store=ci)
+        assert items[0].ci_flaky_reruns == 1
+        assert items[0].ci_flaky_pending
+        assert gh.merge_calls == []
+
+        # Tick 2: the re-run landed green.
+        passing = _check("build", conclusion="success")
+        passing.run_id = "999"
+        passing.started_at = 1500.0  # after the mocked base — fresh, not stale
+        ci._checks = [passing]
+        events = process(items, gh, ci_store=ci)
+
+        assert items[0].state == MERGED
+        assert gh.merge_calls == [("acme/api", 99, "rebase")]
+        kinds = [e.kind for e in events]
+        assert "checks_failed" not in kinds
+        assert "ci_flaky_rerun" not in kinds
+        assert items[0].ci_flaky_reruns == 0
+        assert items[0].ci_flaky_pending == ""
+
+        rows = self._audit_rows(coord_db)
+        assert len(rows) == 1
+        assert rows[0]["tier"] == "operational"
+        assert rows[0]["category"] == "ci"
+        assert rows[0]["repo"] == "api"
+        details = json.loads(rows[0]["details_json"])
+        assert details["pr_number"] == 99
+        assert details["checks"] == [{"name": "build", "conclusion": "failure"}]
+
+    def test_fails_again_spends_the_attempt_identical_to_today(self) -> None:
+        """Acceptance: a check that fails twice behaves exactly like today
+        — no third re-run, plain `checks_failed`, entry stays blocked."""
+        from coord.merge_queue import MAX_CI_FLAKY_RERUNS
+        items = [_q("w1", pr=99)]
+        gh = FakeGh()
+        ci = self._Ci(checks=self._genuine_failure())
+
+        # Tick 1: red -> one scoped re-run triggered.
+        process(items, gh, ci_store=ci)
+        assert items[0].ci_flaky_reruns == MAX_CI_FLAKY_RERUNS
+        assert ci.rerun_failed_calls == [("acme/api", 99)]
+
+        # Tick 2: still red (a real, repeatable failure) -> confirmed,
+        # budget exhausted, no second re-run call.
+        events = process(items, gh, ci_store=ci)
+
+        assert gh.merge_calls == []
+        assert items[0].ci_flaky_reruns == MAX_CI_FLAKY_RERUNS  # unchanged
+        assert ci.rerun_failed_calls == [("acme/api", 99)]  # unchanged — no 2nd call
+        assert items[0].ci_flaky_pending == ""  # confirmed real, nothing to record
+        kinds = [e.kind for e in events]
+        assert "checks_failed" in kinds
+        assert "ci_flaky_rerun" not in kinds
+        assert items[0].error == "checks failed: build (failure)"
+
+    def test_a_check_that_never_reported_is_untouched_by_this_path(self) -> None:
+        """#1904/#2244: zero reported checks is a DIFFERENT condition — a
+        re-run of nothing produces nothing but latency, so this path must
+        never fire for it."""
+        items = [_q("w1", pr=99)]
+        ci = self._Ci(checks=[])
+        gh = FakeGh(mergeable_results={99: True})
+
+        events = process(items, gh, ci_store=ci)
+
+        assert ci.rerun_failed_calls == []
+        assert items[0].ci_flaky_reruns == 0
+        kinds = [e.kind for e in events]
+        assert "checks_absent" in kinds
+        assert "ci_flaky_rerun" not in kinds
+
+    def test_rerun_capability_missing_falls_back_to_todays_behaviour(self) -> None:
+        """#2252 fail-safe: a `CiStore` that can't trigger a re-run at all
+        (predates the capability) must degrade to spending the attempt
+        exactly as if #2252 did not exist — never treat "could not re-run"
+        as "passed"."""
+        items = [_q("w1", pr=99)]
+        gh = FakeGh()
+        ci = self._CiPredatingTheFeature(checks=self._genuine_failure())
+
+        events = process(items, gh, ci_store=ci)
+
+        assert gh.merge_calls == []
+        assert items[0].ci_flaky_reruns == 0
+        assert items[0].ci_flaky_pending == ""
+        kinds = [e.kind for e in events]
+        assert "checks_failed" in kinds
+        assert "ci_flaky_rerun" not in kinds
+        assert items[0].error == "checks failed: build (failure)"
+
+    def test_rerun_call_that_fails_to_trigger_falls_back_to_todays_behaviour(
+        self,
+    ) -> None:
+        """Same fail-safe, the OTHER way a re-run can fail to happen: the
+        capability exists but the `gh` call itself came back non-zero."""
+        items = [_q("w1", pr=99)]
+        gh = FakeGh()
+        ci = self._Ci(checks=self._genuine_failure(), rerun_ok=False)
+
+        events = process(items, gh, ci_store=ci)
+
+        assert gh.merge_calls == []
+        assert items[0].ci_flaky_reruns == 0  # never incremented — no rerun happened
+        assert items[0].ci_flaky_pending == ""
+        kinds = [e.kind for e in events]
+        assert "checks_failed" in kinds
+        assert "ci_flaky_rerun" not in kinds
+        assert items[0].error == "checks failed: build (failure)"
+
+    def test_dry_run_never_triggers_a_rerun_or_mutates_anything(self) -> None:
+        """Mirrors #1892's own dry-run guarantee: `--dry-run` previews the
+        gate, it never mutates CI or persisted counters."""
+        items = [_q("w1", pr=99)]
+        gh = FakeGh()
+        ci = self._Ci(checks=self._genuine_failure())
+
+        events = process(items, gh, ci_store=ci, dry_run=True)
+
+        assert items[0].state == PENDING
+        assert items[0].ci_flaky_reruns == 0
+        assert ci.rerun_failed_calls == []
+        kinds = [e.kind for e in events]
+        assert "checks_failed" in kinds
+        assert "ci_flaky_rerun" not in kinds
 
 
 # ── #778: staging_items() ─────────────────────────────────────────────────────
