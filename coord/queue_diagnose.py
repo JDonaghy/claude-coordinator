@@ -56,7 +56,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 from coord.drive_queue import QueueEntry
@@ -605,7 +605,6 @@ class GhLiveProbe:
     #: Session names the local host can see, when the caller knows them.
     #: ``None`` disables the dead-leg rule rather than guessing.
     live_sessions: frozenset[str] | None = None
-    _gate_cache: dict[str, Any] = field(default_factory=dict)
 
     def probe(self, entry: QueueEntry) -> LiveState:
         errors: list[str] = []
