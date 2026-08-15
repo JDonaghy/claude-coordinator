@@ -241,6 +241,7 @@
       "repo_name": "claude-coordinator",
       "resume_when": "",
       "resumes": 0,
+      "retry_backoff_at": null,
       "session_name": null,
       "state": "waiting"
     },
@@ -267,6 +268,7 @@
       "repo_name": "claude-coordinator",
       "resume_when": "",
       "resumes": 0,
+      "retry_backoff_at": null,
       "session_name": null,
       "state": "waiting"
     }
