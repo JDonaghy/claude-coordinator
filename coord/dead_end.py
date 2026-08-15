@@ -232,26 +232,55 @@ def detect_dead_end(state, *, can_waive_test_gate: bool = False) -> DeadEnd | No
             gates=_gates(state),
         )
 
-    # ── shape 2: the Test stage is BLOCKED (#1672) ─────────────────────────
+    # ── shape 2: the Test stage is BLOCKED (#1672/#2272) ───────────────────
     # `dispatch_smoke` stamps `test_state="blocked"` when no capability-
     # matched machine could run the suite, and then REFUSES to re-probe on
     # every tick — deliberately, that spin is what #1672 closed.  So the
     # driver polling for a verdict is polling for something the dispatcher
     # has already decided not to produce.  vimcode#635's shape, in the one
     # variant the board makes provable.
+    #
+    # #2272 parks the SAME value for a second, unrelated cause: N Test-stage
+    # legs in a row finished without printing a `SMOKE:` marker and the retry
+    # budget ran out.  Both are "no verdict is coming", which is why they
+    # share a state — but the recovery is completely different (fix the fleet
+    # vs. find out why the worker went mute, usually the 600s Bash ceiling),
+    # so they must not share a REASON.  Telling the operator "no capability-
+    # matched machine" about a row whose machines were fine all along is the
+    # symptom-not-cause failure #2235 exists to measure, and it is one
+    # `mute_smoke_legs` call away from being avoided.
     if state.work_test_state == TEST_STATE_BLOCKED:
-        return DeadEnd(
-            kind="test_stage_blocked",
-            stage="test",
-            reason=(
-                f"the Test stage for {state.work_aid} is BLOCKED: "
-                f"{state.work_test_reason or 'no reason recorded'} — "
+        from coord.smoke import mute_smoke_legs  # noqa: PLC0415
+
+        mute_legs = mute_smoke_legs(state.work_test_reason)
+        if mute_legs:
+            cause = (
+                f"{mute_legs} Test-stage leg(s) in a row finished without "
+                "printing a `SMOKE:` verdict marker, exhausting the retry "
+                "budget, so coord.notify parked the row rather than "
+                "re-dispatching a cause that had already repeated identically "
+                "every lap (#2272). Nothing is known to be wrong with the "
+                "BRANCH — the commonest cause is the smoke command exceeding "
+                "the worker's 600s Bash ceiling, which backgrounds the run "
+                "and leaves the session with no exit status to report. Check "
+                "the last Test-stage transcript for a backgrounded command "
+                "before you blame the diff."
+            )
+        else:
+            cause = (
                 "coord.smoke.dispatch_smoke found no capability-matched "
                 "machine and recorded 'blocked' rather than re-probing a "
                 "broken fleet on every tick (#1672). It will not try again "
                 "on its own, so waiting for a verdict here waits forever "
                 "(#2019). Fix the fleet (or the capability rules), then "
                 "clear the marker."
+            )
+        return DeadEnd(
+            kind="test_stage_blocked",
+            stage="test",
+            reason=(
+                f"the Test stage for {state.work_aid} is BLOCKED: "
+                f"{state.work_test_reason or 'no reason recorded'} — {cause}"
             ),
             recovery=(
                 f"coord diagnose {state.repo} {state.issue} --stage test --reset"

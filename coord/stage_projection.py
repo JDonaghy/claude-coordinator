@@ -276,6 +276,16 @@ def test_stage_status_for(
     # blocked reason reaches the operator through `test_reason` instead —
     # rendered by `coord gates` and, since no smoke row exists in this case,
     # by the TUI Summary tab's `board_assignment_reason` on the work row.
+    #
+    # #2272 parks the same ``"blocked"`` for a second cause — N Test-stage
+    # legs finished without printing a `SMOKE:` marker and the retry budget
+    # ran out — and it maps here for the identical reason: a mute leg says
+    # nothing about the branch, so FAILED would be a lie about the diff and
+    # would offer the operator a Work re-dispatch that fixes nothing. The
+    # count and the cause travel in `test_reason` (`coord.smoke.
+    # mute_smoke_legs` reads them back), which is what keeps a row on its
+    # last retry distinguishable from one whose Test stage never started —
+    # the confusion that let five identical mute laps look like progress.
     return PENDING
 
 
