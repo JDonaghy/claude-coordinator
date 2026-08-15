@@ -91,6 +91,24 @@
 #     see the long note above `ensure_baseline_worktree` for why the fallback
 #     arm is excluded rather than "not done yet".
 #
+#  7. THE POPULATED-$HOME ARM (#2269).  A branch can be green here and red in
+#     CI's `populated-home` job, and until #2269 whether that was caught
+#     depended on WHICH MACHINE the Test stage landed on.  That job's
+#     environment is SYNTHESIZED by scripts/run_tests_in_populated_home.sh (a
+#     thin-client ~/.coord with no coordinator.yml, no `sqlite3` on PATH, a
+#     $TMPDIR under an ancestor pytest config); this runner otherwise inherits
+#     whatever environment the assigned machine happens to have.  dellserver —
+#     the daemon host — is structurally incapable of reproducing knob 1, so
+#     #2174 passed the Test gate, spent a full adversarial review, and was
+#     caught only when `coord fix` noticed CI disagreed.  So once the ordinary
+#     python arm is green, the test files THE DIFF TOUCHED are re-run through
+#     that same harness.  Diff-scoped because running the suite twice is not
+#     affordable (#2169).  This arm can only ever FAIL, never downgrade: the
+#     harness's own `exit 2` ("a knob failed to take effect") is a
+#     FAIL-with-warning, never a skip.  Python arm only, and it names itself
+#     (`python-populated-home`) in every verdict line it emits, so a red result
+#     is attributable rather than a mystery.
+#
 # Exit codes: 0 pass (or skip — nothing to test), 1 genuine failure or refusal
 # (cannot determine what to test), 2 usage, 3 INFRASTRUCTURE — the suite could
 # not run at all (a required toolchain is missing); no verdict may be inferred
@@ -215,9 +233,77 @@ else
     log "routing: repo=$REPO_NAME — no path rule and no --fallback-command"
 fi
 
+# ── populated-$HOME arm scoping (#2269) ─────────────────────────────────────
+#
+# WHICH FILES. Only the python test files THIS DIFF touched, and only ones that
+# still exist in the worktree (a diff that DELETES a test file must not hand
+# pytest a path that is not there). `tests/acceptance/**` is excluded for the
+# same reason the ordinary arm passes `--ignore=tests/acceptance`: that sealed
+# suite is gated separately through the #2164 `--ci` wrapper, and a
+# red-by-design slice must not fail every concurrent branch.
+#
+# WHY DIFF-SCOPED AND NOT THE WHOLE SUITE. The full suite already exceeds
+# Claude Code's 600s Bash ceiling (#2169); running it a second time under the
+# harness is not on the table. Diff-scoping is what makes this arm affordable —
+# it costs roughly one test FILE's runtime, paid only by branches that touch
+# python tests at all. The always-on cover for the rest of the suite is
+# tests/test_ambient_home_isolation.py (which runs everywhere, on every branch);
+# this arm exists for the case that file cannot cover, a NEWLY WRITTEN test of
+# this class (#2174 was exactly that).
+#
+# Computed HERE, beside the routing decision, rather than inside `run_python`,
+# because `--print-routing` must be able to name the arm before a worker pushes.
+POPULATED_TESTS=""
+POPULATED_COUNT=0
+POPULATED_ARM=0
+POPULATED_SKIP_REASON=""
+
+is_python_test_file() {
+    case "$1" in
+        tests/acceptance/*) return 1 ;;
+        tests/*)            ;;
+        *)                  return 1 ;;
+    esac
+    case "${1##*/}" in
+        test_*.py) return 0 ;;
+        *)         return 1 ;;
+    esac
+}
+
+if [[ "$ROUTE_MODE" == "coordinator" && "$RUN_PY" -eq 1 ]]; then
+    if [[ "$DIFF_FAILED" -eq 1 ]]; then
+        POPULATED_SKIP_REASON="the diff against $BASE_REF could not be computed, so the arm has no scope to run over"
+    else
+        while IFS= read -r f; do
+            [[ -z "$f" ]] && continue
+            is_python_test_file "$f" || continue
+            # Deleted-by-the-diff files are still listed by `git diff --name-only`.
+            [[ -f "$WT/$f" ]] || continue
+            POPULATED_TESTS="${POPULATED_TESTS:+$POPULATED_TESTS }$f"
+            POPULATED_COUNT=$((POPULATED_COUNT + 1))
+        done <<<"$CHANGED"
+        [[ "$POPULATED_COUNT" -gt 0 ]] && POPULATED_ARM=1
+        [[ "$POPULATED_ARM" -eq 0 ]] && \
+            POPULATED_SKIP_REASON="the diff touches no python test files under tests/ (outside the sealed tests/acceptance/)"
+    fi
+elif [[ "$ROUTE_MODE" == "coordinator" ]]; then
+    POPULATED_SKIP_REASON="the python arm is not routed for this diff"
+else
+    POPULATED_SKIP_REASON="the populated-\$HOME arm is this repo's python arm only"
+fi
+
+if [[ "$ROUTE_MODE" == "coordinator" ]]; then
+    if [[ "$POPULATED_ARM" -eq 1 ]]; then
+        log "routing: populated-\$HOME arm (#2269) will re-run $POPULATED_COUNT diff-scoped test file(s): $POPULATED_TESTS"
+    else
+        log "routing: populated-\$HOME arm (#2269) SKIPPED — $POPULATED_SKIP_REASON"
+    fi
+fi
+
 if [[ "$PRINT_ROUTING" -eq 1 ]]; then
     case "$ROUTE_MODE" in
-        coordinator) printf 'ROUTING mode=coordinator pytest=%s cargo=%s\n' "$RUN_PY" "$RUN_RS" ;;
+        coordinator) printf 'ROUTING mode=coordinator pytest=%s cargo=%s populated-home=%s\n' \
+                        "$RUN_PY" "$RUN_RS" "$POPULATED_ARM" ;;
         fallback)    printf 'ROUTING mode=fallback run=%s\n' "$RUN_FALLBACK" ;;
         unknown)     printf 'ROUTING mode=unknown\n' ;;
     esac
@@ -245,6 +331,8 @@ EXIT_INFRA=3
 # baseline is red, so this is not a verdict on the branch either (#2170).
 BASELINE_RED_SUITES=()
 EXIT_BASELINE_RED=4
+# See the note at the dispatch site below.
+PY_FAIL_SUITE="python"
 
 # ── baseline comparison (#2170) ──────────────────────────────────────────────
 #
@@ -570,6 +658,93 @@ run_python_acceptance_ci() {
     return 1
 }
 
+# ── the populated-$HOME arm (#2269) ─────────────────────────────────────────
+#
+# Re-run the diff's own python test files in the environment of a REAL FLEET
+# MACHINE instead of this machine's, using the SAME harness CI's
+# `populated-home` job uses (scripts/run_tests_in_populated_home.sh, from the
+# BRANCH's tree — so a branch that changes the harness is tested against its own
+# version, exactly like CI). See item 7 in the header for why this is not
+# optional: without it, catching this failure class is a property of which
+# machine the Test stage was routed to.
+#
+# THIS ARM ONLY EVER FAILS. It is the mirror image of #2170's baseline check,
+# which only ever downgrades and is therefore deliberately hard to trigger. This
+# one is the STRICT direction, so every ambiguity resolves the other way:
+#
+#   * The harness's own `exit 2` — "a knob failed to take effect", i.e. the
+#     environment it claims to synthesize was not synthesized — is a FAIL with a
+#     warning, NOT a skip. A guard that cannot guard reporting green is the exact
+#     failure mode #2170 exists to prevent, and a Test gate that silently
+#     tolerates it is back to routing luck.
+#   * Any other non-zero exit is a FAIL naming this arm.
+#
+# There is no flake filter here on purpose: these same files went green in the
+# ordinary arm moments ago, so a failure here is by construction environmental,
+# and re-running would only launder it.
+#
+# The two SKIPs it can report (no python test files in the diff; the harness
+# absent from this branch's tree) are announced in the verdict stream and by
+# `--print-routing`, never silent.
+run_python_populated_home() {
+    local venv="$1"
+    local rel="scripts/run_tests_in_populated_home.sh"
+    local script="$WT/$rel"
+
+    if [[ "$POPULATED_ARM" -eq 0 ]]; then
+        say "SKIP(python-populated-home): not run — $POPULATED_SKIP_REASON (#2269)"
+        return 0
+    fi
+    if [[ ! -f "$script" ]]; then
+        # A branch (or a checkout) predating the harness. Skipping is the only
+        # option that does not redden every such branch, but it is stated out
+        # loud rather than inferred from silence.
+        warn "populated-home: $rel is not present in this worktree — the arm cannot run"
+        say "SKIP(python-populated-home): not run — the harness $rel is absent from this branch's tree (#2269)"
+        return 0
+    fi
+
+    local out="$WT/.pytest-populated-home.out"
+    local started=$SECONDS
+    local rc=0
+    log "running: $rel over $POPULATED_COUNT diff-scoped test file(s): $POPULATED_TESTS"
+    # shellcheck disable=SC2086  # the file list is intentionally word-split
+    (cd "$WT" && bash "$script" "$venv/bin/python" -m pytest -q --tb=short $POPULATED_TESTS) \
+        >"$out" 2>&1 || rc=$?
+    local elapsed=$((SECONDS - started))
+
+    if [[ "$rc" -eq 0 ]]; then
+        say "PASS(python-populated-home): $POPULATED_COUNT diff-scoped test file(s) green in a synthesized fleet \$HOME (+${elapsed}s)"
+        return 0
+    fi
+
+    # The harness's own guard failures, by their exact messages. Distinguished
+    # from a test failure because the two need different fixes — but BOTH are a
+    # FAIL, so mis-classifying one as the other can only ever mis-word a red
+    # verdict, never hide one.
+    if grep -qE "the guard itself is broken|the guard is too broad|is not thin-client shaped" "$out"; then
+        say "FAIL(python-populated-home): the harness $rel exited $rc because A KNOB FAILED TO TAKE EFFECT — the environment it claims to synthesize (thin-client ~/.coord, no sqlite3, \$TMPDIR under an ancestor pytest config) was not the environment the tests ran in, so a green here would have meant nothing. This is reported as a FAILURE, not a skip, on purpose (#2269)."
+        tail -n 20 "$out" | sed 's/^/      /'
+        return 1
+    fi
+
+    say "FAIL(python-populated-home): $POPULATED_COUNT diff-scoped test file(s) PASS in this machine's ambient environment but FAIL in a synthesized fleet \$HOME (thin-client ~/.coord with no coordinator.yml, no sqlite3 on PATH, \$TMPDIR under an ancestor pytest config) — this is CI's populated-home job's failure class, caught here instead of at the merge gate (#2269). Reproduce with: $rel python -m pytest $POPULATED_TESTS"
+    printf '%s\n' "$POPULATED_TESTS" | tr ' ' '\n' | sed 's/^/      /'
+    tail -n 40 "$out" | sed 's/^/      /'
+    return 1
+}
+
+# The arms that run AFTER the ordinary pytest suite has gone green (or been
+# judged a tolerated flake), in cost order. Short-circuiting on the first
+# failure is deliberate: the verdict is already attributable to a named arm, and
+# there is nothing to learn from paying for the next one.
+run_python_post_arms() {
+    local venv="$1"
+    run_python_acceptance_ci "$venv" || return 1
+    run_python_populated_home "$venv" || { PY_FAIL_SUITE="python-populated-home"; return 1; }
+    return 0
+}
+
 run_python() {
     local venv="$WT/.venv"
     if [[ ! -x "$venv/bin/python" ]]; then
@@ -618,7 +793,7 @@ run_python() {
     # `set -u` on older bash.
     if (cd "$WT" && "$venv/bin/python" -m pytest -q --tb=short --ignore=tests/acceptance ${par[@]+"${par[@]}"}) >"$out" 2>&1; then
         log "ordinary suite: $(grep -oE '[0-9]+ passed[^)]*' "$out" | tail -1)"
-        run_python_acceptance_ci "$venv"
+        run_python_post_arms "$venv"
         return $?
     fi
 
@@ -645,7 +820,7 @@ run_python() {
         say "FLAKE(python): $count test(s) failed in the full run but PASS in isolation"
         printf '%s\n' "$failed" | sed 's/^/      /'
         FLAKES+=("python:$count")
-        run_python_acceptance_ci "$venv"
+        run_python_post_arms "$venv"
         return $?
     fi
 
@@ -843,8 +1018,13 @@ mark_failed() {
     FAILED_SUITES+=("$suite")
 }
 
+# Which name a failing python arm books itself under. "python" for every arm
+# that existed before #2269; the populated-$HOME arm overwrites it with its own
+# name so `RESULT: FAIL (python-populated-home)` says which environment went
+# red, not merely that pytest did (#2269's "a red result is attributable"
+# requirement). It is only ever read after `run_python` returns non-zero.
 if [[ "$RUN_PY" -eq 1 ]]; then
-    run_python || mark_failed python
+    run_python || mark_failed "$PY_FAIL_SUITE"
 fi
 if [[ "$RUN_RS" -eq 1 ]]; then
     run_rust || mark_failed rust
