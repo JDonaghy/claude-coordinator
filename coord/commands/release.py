@@ -371,6 +371,66 @@ def _interactive_session_busy(config) -> list:
     return busy
 
 
+def _paused_machine_busy(config) -> list:
+    """Operator pause / quiet-hours state as host-pinned `Busy` signals (#2174).
+
+    `release_propagate.assess_quiescence`'s ``extra_busy`` docstring has
+    named "a machine paused by an operator" as a seam producer since
+    #1835, but until now nothing fed it one: `coord pause <machine>` said
+    "leave this box alone" and `coord release propagate` read the machine
+    as quiescent anyway, restarting `coord-agent` (and, on the daemon
+    host, `coord-serve`) on it regardless.
+
+    `coord.machine_pause.follow_on_paused_set()` is explicit `coord pause`
+    UNION any quiet-hours window currently covering the machine — both
+    genuine "an operator or an operator-set policy said stay off this
+    box" facts — MINUS #2101 release cordons. Cordons are deliberately
+    excluded: a cordon is THIS command's own drain mechanism, set to make
+    a behind host quiescent, not a sign that it already is one; feeding a
+    cordon back in here as "busy" would make it defer the very roll it
+    exists to unblock.
+
+    Thin-client aware for free: `follow_on_paused_set` routes through the
+    daemon's `/pause` endpoint when a board service is configured (#1563),
+    so this reads the one copy of pause state that actually governs
+    dispatch — same as every other pause-aware call site in the fleet.
+    """
+    from coord.machine_pause import (  # noqa: PLC0415
+        describe_pause_state,
+        effective_quiet_hours,
+        follow_on_paused_set,
+    )
+    from coord import release_propagate as rp  # noqa: PLC0415
+
+    machines = list(getattr(config, "machines", ()) or ())
+    if not machines:
+        return []
+    paused = follow_on_paused_set(machines)
+    if not paused:
+        return []
+    quiet_hours = effective_quiet_hours(machines)
+    busy = []
+    for machine in machines:
+        if machine.name not in paused:
+            continue
+        state = describe_pause_state(machine, paused, quiet_hours=quiet_hours)
+        if state is None:
+            continue  # defensive: membership in `paused` implies a reason
+        detail = (
+            f"quiet hours {state.detail}" if state.kind == "quiet"
+            else "explicit `coord pause`"
+        )
+        busy.append(
+            rp.Busy(
+                kind="machine paused",
+                subject=machine.name,
+                detail=detail,
+                host=machine.name,
+            )
+        )
+    return busy
+
+
 def _daemon_machine_name(
     config, override: str | None, machine_health: dict | None = None
 ) -> str | None:
@@ -638,6 +698,10 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
     # probe `coord sessions --remote` uses, so a live session defers a roll
     # exactly like a live headless assignment does.
     extra_busy.extend(_interactive_session_busy(config))
+    # #2174: nor can it see `coord pause`/quiet-hours state — feed the same
+    # seam from the daemon-aware pause store, so an operator-paused machine
+    # defers exactly like a live assignment does instead of reading idle.
+    extra_busy.extend(_paused_machine_busy(config))
     quiescence = rp.assess_quiescence(
         queue_entries=board.get("drive_queue") or [],
         assignments=board.get("assignments") or [],
@@ -2163,14 +2227,19 @@ def _drain(
     #2228: ``extra_busy_fetch`` re-probes live interactive sessions on
     every poll (not just once) — a session that ends mid-drain should let
     the daemon host clear within THIS wait, not only on the next `coord
-    release propagate` tick. Deliberately keyed off the explicit *config*
-    param, never an implicit ``_load_config(config_path)`` fallback: this
-    function is called with ``config_path=None`` from unit tests that
-    inject their own clock/board — silently resolving a real
-    ``coordinator.yml`` (and then SSH-probing whatever machines it names)
+    release propagate` tick. #2174: the same default also re-reads
+    `coord pause`/quiet-hours state on every poll, for the same reason —
+    an operator pausing the daemon host mid-drain must stop the drain from
+    ever reporting "clear", and an operator lifting a pause mid-drain
+    should let it clear within THIS wait rather than the next tick.
+    Deliberately keyed off the explicit *config* param, never an implicit
+    ``_load_config(config_path)`` fallback: this function is called with
+    ``config_path=None`` from unit tests that inject their own clock/board
+    — silently resolving a real ``coordinator.yml`` (and then SSH-probing
+    whatever machines it names, or reading this host's own pause store)
     the moment ``config`` is omitted would make this loop non-hermetic by
-    default. No *config* simply means "no interactive-session signal this
-    call" — the caller opts in by passing one, as the real
+    default. No *config* simply means "no interactive-session or pause
+    signal this call" — the caller opts in by passing one, as the real
     ``coord release nightly-window`` call site does.
     """
     import time as _time  # noqa: PLC0415
@@ -2184,7 +2253,12 @@ def _drain(
     fetch_fn = board_fetch or _fetch_board
     if extra_busy_fetch is None:
         if config is not None:
-            extra_busy_fetch = lambda: _interactive_session_busy(config)  # noqa: E731
+            # #2174: paused/quiet-hours state, same as the top-level
+            # `propagate` call site — a paused daemon host must keep the
+            # drain from ever reading "clear" just because tmux is quiet.
+            extra_busy_fetch = lambda: (  # noqa: E731
+                _interactive_session_busy(config) + _paused_machine_busy(config)
+            )
         else:
             extra_busy_fetch = lambda: []  # noqa: E731
 
