@@ -363,22 +363,38 @@ class TestGuardsSurviveTheCliDoor:
         assert "no structured review findings" in result.output
         http.post.assert_not_called()
 
-    def test_guidance_on_a_review_id_warns(
+    def test_guidance_on_a_review_id_is_pinned_above_the_findings(
         self, config_file: Path, coord_dir: Path
     ) -> None:
-        """The reviewer's findings are the briefing — say so rather than
-        silently dropping the operator's text."""
-        _seed(_work(), _review())
+        """#2092: the reviewer's findings are the briefing, but the operator's
+        guidance is the only source of maintainer decisions the reviewer
+        cannot have — it must reach the worker, not vanish behind a warning.
+        Routed through the #603 pinned per-issue context store, it lands
+        ABOVE the reviewer's findings in the fix briefing."""
+        _seed(_work(), _review(), body="## Blocking\n- 1. GET /outbox is undocumented\n")
         http = _http_mock()
 
         with patch("coord.auto_loop.httpx", http), \
              patch("coord.auto_loop.record_dispatched_assignment"), \
              patch("coord.github_ops.post_issue_comment"):
-            result = _run(config_file, "review-xyz", "--guidance", "try harder")
+            result = _run(
+                config_file, "review-xyz",
+                "--guidance", "MAINTAINER DECISION: keep GET /outbox.",
+            )
 
         assert result.exit_code == 0, result.output
-        assert "--guidance is ignored" in result.output
-        assert "try harder" not in http.post.call_args.kwargs["json"]["briefing"]
+        assert "pinned to issue #42 context" in result.output
+
+        briefing = http.post.call_args.kwargs["json"]["briefing"]
+        assert "MAINTAINER DECISION: keep GET /outbox." in briefing
+        assert briefing.index("MAINTAINER DECISION") < briefing.index(
+            "GET /outbox is undocumented"
+        )
+
+        # It also outlives this one dispatch — it's a durable per-issue entry.
+        from coord.state import issue_context_block
+
+        assert "MAINTAINER DECISION: keep GET /outbox." in issue_context_block("api", 42)
 
 
 # ── Part 3: red CI as the third trigger ──────────────────────────────────────

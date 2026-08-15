@@ -655,16 +655,7 @@ def _fix_from_review(
     """
     from coord import auto_loop
     from coord.board_service import write_board
-    from coord.state import COORD_DIR
-
-    if guidance:
-        click.echo(
-            "warning: --guidance is ignored for a review id — the reviewer's "
-            "findings ARE the fix briefing. To brief a fix in your own words "
-            f"use `coord assign <machine> <repo> <issue> --fix-of "
-            f"{review.assignment_id} --interactive --briefing ...`.",
-            err=True,
-        )
+    from coord.state import COORD_DIR, add_issue_context_entry
 
     work = None
     if review.review_of_assignment_id:
@@ -677,6 +668,28 @@ def _fix_from_review(
             err=True,
         )
         sys.exit(1)
+
+    # #2092: --guidance used to be silently discarded here — a warning was
+    # printed immediately above a success line the operator often doesn't
+    # read past the tail of, so a maintainer decision could be lost with no
+    # visible trace. Route it through the #603 pinned per-issue context store
+    # instead of dropping it OR bolting a second implementation of fix-
+    # briefing assembly onto this CLI door: `_dispatch_fix_for_review`
+    # already prepends `issue_context_block(...)` to the TOP of every fix
+    # briefing it builds, ABOVE the reviewer's findings, so a pinned entry
+    # written here lands exactly where the operator's guidance belongs — and
+    # (unlike a one-shot parameter) it also survives into every later
+    # briefing for this issue, not just this one dispatch.
+    if guidance:
+        add_issue_context_entry(
+            work.repo_name, work.issue_number, guidance,
+            pinned=True, source="coord fix --guidance",
+        )
+        click.echo(
+            f"guidance pinned to issue #{work.issue_number} context (#603) — "
+            "it will be prepended above the reviewer's findings in the fix "
+            "briefing.",
+        )
 
     # #555: an INTERACTIVE work completion must never be silently followed by a
     # headless fix.  The human at the tmux pane owns that branch and may still
