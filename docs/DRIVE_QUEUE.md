@@ -534,6 +534,47 @@ and then to `blocked` at `max_attempts`. The failure signature to watch for
 is `retry — drive session died without landing the work` appearing **within
 seconds** of a launch; that must never happen again.
 
+## 7a. Retry spacing (#2273)
+
+A `retry` reconcile used to relaunch in the SAME tick — "died and came back"
+was one event, by design (§7's whole point is not idling a full interval on
+a confidently-dead drive). On 2026-08-15 that same-tick relaunch is exactly
+what let quadraui#508 and coord-portal#83 each burn their entire two-attempt
+budget inside **six minutes** — a transient `coord assign` failure that had
+cleared by the time a human noticed, 18 minutes later. Two attempts fired
+minutes apart is not a retry policy against a transient; it is two samples
+of the same short window.
+
+So a died entry's NEXT launch is now paced by real wall-clock time, not just
+by tick cadence: 1 minute after the first attempt, 5 minutes after the
+second, 20 minutes after the third and beyond. Widened further — 5 minutes
+minimum — when the died launch never produced a board-visible assignment at
+all (`assignment_id` never existed for that run): the cheap, already-recorded
+approximation of "this was infrastructure, not a code failure" that does not
+need the full transient-vs-real classification (blocked on a stderr-capture
+prerequisite this queue does not have yet).
+
+What this looks like in the journal — a died entry that is still pacing its
+next attempt, not stalled:
+
+```
+  reconcile claude-coordinator#1762: retry — drive session died without
+      landing the work, launched 320s ago (attempt 1/2) — requeued at
+      position 0
+  defer claude-coordinator#1762: retry backoff: the previous attempt failed
+      4s ago, next attempt permitted in 56s (60s spacing after 1 attempt(s)
+      — #2273, so a transient dispatch failure cannot spend the whole retry
+      budget inside one tick cadence)
+  no launch — every waiting entry is pacing a retry after a recent failure
+      (#2273); it resumes once the backoff elapses
+```
+
+This raises no `QUEUE: STALLED` alert (same posture §9's per-repo ceiling
+already takes): nothing is wrong with the entry, no operator can make the
+clock move faster, and it resumes on its own the moment the backoff elapses.
+`coord drive-queue list`/`status` show the pacing directly in `last_reason`
+if you want to confirm it is working rather than wedged.
+
 ## 8. The cross-host trap (#1870)
 
 Liveness (`coord.drive.list_drive_sessions()`) is always a **local** `tmux

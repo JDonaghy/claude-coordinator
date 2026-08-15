@@ -1060,10 +1060,48 @@ def test_a_negative_per_repo_ceiling_is_refused(cli):
 
 
 def _backdate(issue: int, seconds: float) -> None:
-    """Age a queued entry's `launched_at` by *seconds*, as if time had passed."""
+    """Age a queued entry's `launched_at` by *seconds*, as if time had passed.
+
+    #2273: also ages `reason_at` by the same *seconds* — a died entry's next
+    attempt is now paced by real wall-clock time since its `retry` reconcile
+    was recorded (`_retry_backoff_reason`), not just by tick cadence, so a
+    test simulating "this much time has genuinely passed" before its NEXT
+    tick has to age both fields together or the tick under test would see a
+    fresh `reason_at` and defer instead of proceeding. `reason_at` is not
+    one of `update_drive_queue_entry`'s whitelisted fields (it is
+    auto-stamped, never directly settable — see `_backdate_reason` above,
+    which this mirrors) so it goes through raw SQL rather than
+    `_update_drive_queue_entry_local`. Harmless for a fresh entry that has
+    never retried (`reason_at` is not consulted until `attempts >= 1`).
+    """
     state._update_drive_queue_entry_local(
         REPO, issue, launched_at=time.time() - seconds
     )
+    conn = state.get_connection()
+    conn.execute(
+        "UPDATE drive_queue SET reason_at = ? WHERE repo_name = ? "
+        "AND issue_number = ?",
+        (time.time() - seconds, REPO, issue),
+    )
+    conn.commit()
+
+
+def _die_and_relaunch(cli, coord_db, issue: int) -> None:
+    """Simulate one full #2273 retry cycle against a currently-`running`
+    entry: the drive is detected dead (one attempt spent, the entry backs
+    off) and, once the backoff elapses, a fresh drive comes back up — the
+    entry ends this call `running` again, one attempt heavier.
+
+    Before #2273 "died and relaunched" was ONE tick; a test that needs a
+    SECOND death detected against a genuinely live session (not just a
+    spent attempt sitting `waiting`) now needs two — this is that pair,
+    factored out because several existing regression tests simulate more
+    than one death in sequence.
+    """
+    _backdate(issue, DRIVE_STARTUP_GRACE_SECONDS + 60)
+    cli("tick")  # retry: attempt spent, backs off
+    _backdate_reason(coord_db, issue, DRIVE_STARTUP_GRACE_SECONDS + 60)
+    cli("tick")  # backoff cleared: relaunches
 
 
 def test_back_to_back_ticks_launch_exactly_one_drive(cli, seed, launches):
@@ -1111,7 +1149,14 @@ def test_a_still_starting_drive_is_reported_not_escalated(cli, seed, launches):
 
 
 def test_a_drive_genuinely_dead_past_the_window_still_retries(cli, seed, launches):
-    """The window delays death detection by one interval; it never removes it."""
+    """The window delays death detection by one interval; it never removes it.
+
+    #2273 changed what happens immediately after: a `retry` reconciled THIS
+    tick no longer relaunches in the SAME tick (see
+    `test_a_relaunch_after_retry_waits_out_the_2273_backoff` right below for
+    that spacing itself) — it still gets requeued and its attempt is still
+    spent, which is what this test now pins.
+    """
     seed(issues={1762: "open"})
     cli("add", REPO, "1762")
     cli("tick")
@@ -1120,14 +1165,43 @@ def test_a_drive_genuinely_dead_past_the_window_still_retries(cli, seed, launche
     result = cli("tick")
     assert result.exit_code == 0, result.output
     assert "died without landing the work" in result.output
-    # It relaunches on the same tick, as it did before #1794.
+    # No relaunch THIS tick — #2273's backoff paces it (see below).
+    assert len(launches) == 1, launches
+    entry = queued(1762)
+    assert entry["state"] == "waiting"
+    assert entry["attempts"] == 1
+
+
+def test_a_relaunch_after_retry_waits_out_the_2273_backoff(
+    cli, seed, launches, coord_db
+):
+    """The spacing itself, end to end: a THIRD tick, run before the backoff
+    has elapsed, still does not relaunch; ageing `reason_at` past it lets a
+    FOURTH tick relaunch normally."""
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    cli("tick")
+    _backdate(1762, DRIVE_STARTUP_GRACE_SECONDS + 60)
+    cli("tick")  # retries; does not relaunch (pinned above)
+    assert len(launches) == 1, launches
+
+    still_backing_off = cli("tick")
+    assert still_backing_off.exit_code == 0, still_backing_off.output
+    assert len(launches) == 1, launches  # still paced
+    assert queued(1762)["state"] == "waiting"
+
+    _backdate_reason(coord_db, 1762, DRIVE_STARTUP_GRACE_SECONDS + 60)
+    relaunched = cli("tick")
+    assert relaunched.exit_code == 0, relaunched.output
     assert len(launches) == 2, launches
     entry = queued(1762)
     assert entry["state"] == "running"
     assert entry["attempts"] == 1
 
 
-def test_a_dead_drives_own_exit_reason_reaches_the_queue_row(cli, seed, launches):
+def test_a_dead_drives_own_exit_reason_reaches_the_queue_row(
+    cli, seed, launches, coord_db
+):
     """#1845/#1844, end-to-end: when the drive itself recorded why it
     stopped — a `drive_exited` audit row written before `coord drive`
     returned — the tick must carry THAT reason forward instead of
@@ -1140,6 +1214,11 @@ def test_a_dead_drives_own_exit_reason_reaches_the_queue_row(cli, seed, launches
     `test_back_to_back_ticks_launch_exactly_one_drive`) and on the FINAL
     blocked row's `last_reason`, which is the one an operator actually goes
     looking at afterwards.
+
+    #2273 inserts a real relaunch step between the two deaths: a `retry`
+    no longer relaunches in the same tick, so the SECOND death has to be
+    simulated against a session that came back up AFTER the #2273 backoff
+    cleared, not the same tick as the first.
     """
     from coord.audit import record_audit
 
@@ -1164,6 +1243,15 @@ def test_a_dead_drives_own_exit_reason_reaches_the_queue_row(cli, seed, launches
     assert first_retry.exit_code == 0, first_retry.output
     assert _own_reason(1) in first_retry.output
     assert "died without landing the work" not in first_retry.output
+    assert queued(1762)["attempts"] == 1
+    assert queued(1762)["state"] == "waiting"  # backing off, not relaunched yet
+
+    # Wait out #2273's backoff, then relaunch — attempts stays 1, a fresh
+    # session comes up.
+    _backdate_reason(coord_db, 1762, DRIVE_STARTUP_GRACE_SECONDS + 60)
+    relaunch = cli("tick")
+    assert relaunch.exit_code == 0, relaunch.output
+    assert queued(1762)["state"] == "running"
     assert queued(1762)["attempts"] == 1
 
     launched_at = queued(1762)["launched_at"]
@@ -1754,16 +1842,18 @@ def test_a_live_ready_wins_even_over_a_stale_cached_plan_reading(
 
 
 def test_a_repeatedly_dead_drive_still_reaches_blocked_and_escalates(
-    cli, seed, launches
+    cli, seed, launches, coord_db
 ):
     seed(issues={1762: "open"})
     cli("add", REPO, "1762")
     cli("tick")
-    _backdate(1762, DRIVE_STARTUP_GRACE_SECONDS + 60)
-    cli("tick")
+    _die_and_relaunch(cli, coord_db, 1762)  # attempt 1: dies, waits out the
+    # #2273 backoff, relaunches
+    assert queued(1762)["state"] == "running"
+    assert queued(1762)["attempts"] == 1
     _backdate(1762, DRIVE_STARTUP_GRACE_SECONDS + 60)
 
-    result = cli("tick")
+    result = cli("tick")  # attempt 2: dies again, exhausted -> blocked
     assert result.exit_code == 0, result.output
     entry = queued(1762)
     assert entry["state"] == "blocked"
@@ -1833,8 +1923,11 @@ def test_a_tick_on_the_launching_host_still_detects_a_genuine_death(
     result = cli("tick")
     assert result.exit_code == 0, result.output
     assert "died without landing the work" in result.output
-    assert len(launches) == 2, launches
+    # #2273: the attempt is spent, but the relaunch is paced — no SECOND
+    # launch in this same tick (see `_die_and_relaunch` for that half).
+    assert len(launches) == 1, launches
     assert queued(1811)["attempts"] == 1
+    assert queued(1811)["state"] == "waiting"
 
 
 def test_an_entry_launched_before_1870_keeps_the_pre_1870_behaviour(
@@ -2581,16 +2674,17 @@ def test_a_hold_after_entry_that_ends_blocked_raises_no_second_alert(
 
 
 def test_an_entry_that_reaches_blocked_lands_in_the_stall_log(
-    cli, seed, launches, block_log
+    cli, seed, launches, block_log, coord_db
 ):
     seed(issues={1762: "open"})
     cli("add", REPO, "1762")
     cli("tick")
-    _backdate(1762, DRIVE_STARTUP_GRACE_SECONDS + 60)
-    cli("tick")
+    _die_and_relaunch(cli, coord_db, 1762)  # attempt 1: dies, relaunches —
+    # neither `waiting` nor `running` is a STALL_STATE, so this adds no
+    # block-log record of its own (see `coord.block_log.STALL_STATES`).
     _backdate(1762, DRIVE_STARTUP_GRACE_SECONDS + 60)
 
-    result = cli("tick")
+    result = cli("tick")  # attempt 2: dies again, exhausted -> blocked
     assert result.exit_code == 0, result.output
     assert queued(1762)["state"] == "blocked"
 
@@ -2707,7 +2801,7 @@ def test_a_quiet_tick_writes_nothing_to_the_stall_log(cli, seed, launches, block
 
 
 def test_the_stall_log_changes_no_queue_decision(
-    cli, seed, launches, block_log, monkeypatch
+    cli, seed, launches, block_log, monkeypatch, coord_db
 ):
     """Phase 0's hard constraint, asserted directly.
 
@@ -2723,11 +2817,10 @@ def test_the_stall_log_changes_no_queue_decision(
     seed(issues={1762: "open"})
     cli("add", REPO, "1762")
     cli("tick")
-    _backdate(1762, DRIVE_STARTUP_GRACE_SECONDS + 60)
-    cli("tick")
+    _die_and_relaunch(cli, coord_db, 1762)  # attempt 1: dies, relaunches
     _backdate(1762, DRIVE_STARTUP_GRACE_SECONDS + 60)
 
-    result = cli("tick")
+    result = cli("tick")  # attempt 2: dies again, exhausted -> blocked
     assert result.exit_code == 0, result.output
     entry = queued(1762)
     assert entry["state"] == "blocked"

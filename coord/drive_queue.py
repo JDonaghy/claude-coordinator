@@ -62,6 +62,25 @@ launched normally in the SAME tick.  The old whole-queue stop is still
 expressible — :data:`HOLD_SCOPE_FLEET`, ``--scope=fleet`` at ``add`` time —
 for the genuine case (a rename, a schema migration) where nothing anywhere
 should launch until a human clears it, but it is opt-in, not the default.
+
+#2273 (RETRY SPACING) is the DISPATCH-site sibling of #1891/#1892/#2252:
+those taught the queue that a missing MERGE verdict is not a failed one; this
+teaches it that two attempts fired minutes apart is not a retry policy
+against a transient DISPATCH failure, it is two samples of the same short
+window. On 2026-08-15 quadraui#508 and coord-portal#83 each burned their
+entire attempt budget inside ~6 minutes, and a hand re-run of the identical
+``coord assign`` command 18 minutes later succeeded first try. Before this, a
+died launch's next attempt was paced ONLY by tick cadence — see
+:func:`_retry_backoff_reason`, which now enforces real wall-clock spacing
+(:data:`RETRY_BACKOFF_SECONDS`) before a `retry`-reconciled entry is eligible
+to launch again, widened further (:data:`DISPATCH_FAILURE_MIN_BACKOFF_SECONDS`)
+when the died launch never produced a board-visible assignment at all
+(:func:`_dispatch_produced_nothing`) — the cheap, already-recorded
+approximation of "this was infrastructure, not code" the full classification
+(blocked on a stderr-capture prerequisite this queue does not have yet)
+cannot give directly. See ``RETRY_BACKOFF_SECONDS``'s own comment for the
+full incident writeup and why this is additive to #1794's grace window, not
+a replacement for it.
 """
 
 from __future__ import annotations
@@ -279,6 +298,46 @@ RESUME_PROBE_TIMEOUT_SECONDS = 5.0
 # — a deferral (pre-req not satisfied yet) never touches it, and neither does
 # an unsatisfiable pre-req.
 DEFAULT_MAX_ATTEMPTS = 2
+
+# ── retry spacing (#2273) ────────────────────────────────────────────────────
+#
+# 2026-08-15: quadraui#508 and coord-portal#83 each spent their ENTIRE
+# two-attempt budget inside a ~6-minute window (`launched_at` 16:19:21Z,
+# gave-up 16:25:28Z) — a hand re-run of the identical `coord assign` command
+# 18 minutes later succeeded first try. Nothing about the transient was
+# unusually long; what failed was the queue's own pacing. Before this, the
+# ONLY thing standing between a `retry` reconcile and the very next tick
+# relaunching the SAME entry was #1794's startup grace window — and that
+# guard exists to let a CONFIDENTLY-dead drive relaunch fast (see this
+# module's docstring and `DRIVE_STARTUP_GRACE_SECONDS`'s comment), not to
+# pace a plain `exit_code=1` with no distinguishing evidence at all. Two
+# attempts fired minutes apart is not a retry policy against a transient —
+# it is two samples of the same short window. #1894's asymmetry applies
+# unchanged: a wasted retry costs latency, a prematurely parked entry costs a
+# human.
+#
+# So a died entry's NEXT launch is now paced by wall-clock spacing, not just
+# by tick cadence — see `_retry_backoff_reason`. Indexed by how many attempts
+# have already died (1-based: the backoff BEFORE attempt N+1, spent after N
+# attempts), clamped to the last entry for any `--max-attempts` larger than
+# this table. 1 minute is comfortably longer than a single poll/tick cycle,
+# so the same blip cannot be sampled twice in a row; 20 minutes is the same
+# order of magnitude `PARK_STALE_SECONDS` uses for "give a transient more
+# real time before trusting a frozen reading" — a related judgment call about
+# how long is long enough to stop blaming the clock.
+RETRY_BACKOFF_SECONDS: tuple[float, ...] = (60.0, 300.0, 1200.0)
+
+# #2273 direction 2: a died launch that never produced a board-visible
+# assignment for this issue at all gets AT LEAST this much backoff, whatever
+# `RETRY_BACKOFF_SECONDS` alone would have said — see
+# `_dispatch_produced_nothing`. This is the "assignment_id IS NULL" signal
+# the issue names: a launch that never got as far as creating an assignment
+# has no code-derived evidence behind its failure whatsoever (the
+# transient-vs-real classification the issue also asks for needs stderr
+# capture this queue does not have yet — a separate, harder prerequisite);
+# widening the spacing is the cheap, available approximation of "treat this
+# as infrastructure, not a work failure" that does not require it.
+DISPATCH_FAILURE_MIN_BACKOFF_SECONDS = 300.0
 
 # ── the per-repo ceiling (#1972) ─────────────────────────────────────────────
 #
@@ -666,6 +725,16 @@ class IssueFacts:
     # The plan's own `reason` alongside `merge_gate_status`, carried purely
     # for diagnostics — same posture as `merge_ci_pending_reason` above.
     merge_gate_reason: str = ""
+    # #2273: the newest `dispatched_at` across EVERY work-like assignment
+    # `build_board_view` has ever seen for this issue, whatever its current
+    # `status` — unlike `merged`/`active_work` this is a HIGH-WATER MARK, not
+    # a "right now" reading, because `_dispatch_produced_nothing` needs to
+    # tell "nothing was ever dispatched during THIS launch" apart from "the
+    # assignment this launch dispatched already went terminal" — the latter
+    # still proves dispatch itself succeeded. `None` when this issue has no
+    # assignment carrying a `dispatched_at` at all (never dispatched, or
+    # every row predates that column).
+    last_dispatched_at: float | None = None
 
     @property
     def open(self) -> bool:
@@ -756,6 +825,20 @@ def build_board_view(
             entry["merged"] = True
         if status not in TERMINAL_STATUSES:
             entry["active_work"] = True
+        # #2273: high-water mark of `dispatched_at`, regardless of `status` —
+        # see `IssueFacts.last_dispatched_at`'s docstring for why this is
+        # deliberately not scoped to non-terminal rows the way `active_work`
+        # is.
+        dispatched_at = row.get("dispatched_at")
+        if dispatched_at is not None:
+            try:
+                dispatched_at = float(dispatched_at)
+            except (TypeError, ValueError):
+                dispatched_at = None
+        if dispatched_at is not None:
+            prior = entry.get("last_dispatched_at")
+            if prior is None or dispatched_at > prior:
+                entry["last_dispatched_at"] = dispatched_at
 
     for row in payload.get("issues") or []:
         repo = row.get("repo_name") or ""
@@ -995,6 +1078,16 @@ class Deferral:
     different prose and different remedies, and a render that blames the
     repo limit for a cordon is a render that sends the operator to the wrong
     knob.
+
+    ``backing_off=True`` is #2273's twin: the entry died at least once and is
+    inside the post-death spacing :func:`_retry_backoff_reason` enforces
+    before its next attempt.  Same posture again — nothing is wrong with the
+    entry, no human can do anything about it faster than the clock can, and
+    it ends by itself the moment the backoff elapses.  quadraui#508 spent its
+    entire two-attempt budget six minutes apart, well inside a single tick
+    cadence, because nothing paced the SECOND attempt; alerting on every tick
+    of the pacing that now exists would just be a slower version of the same
+    noise the repo-limit/cordon flags above already learned to suppress.
     """
 
     key: str
@@ -1003,6 +1096,7 @@ class Deferral:
     counted: bool = True
     repo_limited: bool = False
     cordoned: bool = False
+    backing_off: bool = False
 
     @property
     def benign(self) -> bool:
@@ -1012,7 +1106,7 @@ class Deferral:
         consult, so a future third benign cause cannot be added to one and
         forgotten in the other.
         """
-        return self.repo_limited or self.cordoned
+        return self.repo_limited or self.cordoned or self.backing_off
 
 
 @dataclass(frozen=True)
@@ -1469,6 +1563,95 @@ def _startup_cooldown(
     return age
 
 
+def _dispatch_produced_nothing(entry: QueueEntry, facts: IssueFacts) -> bool:
+    """#2273: did *entry*'s most recent launch ever get as far as creating a
+    board-visible assignment?
+
+    Compares ``facts.last_dispatched_at`` — the newest ``dispatched_at``
+    across every assignment ``build_board_view`` has ever seen for this
+    issue, whatever a PRIOR launch dispatched — against ``entry.launched_at``,
+    which a `retry` reconcile does NOT clear (see `_reconcile_running`'s
+    `retry`/`exhausted` branches), so it still names the launch that just
+    died. ``True`` only when nothing was dispatched on or after that moment:
+    the drive died somewhere before or during `coord assign` itself, never
+    creating the row the rest of the fleet's machinery (merge, review, CI)
+    would otherwise have consumed — the "assignment_id IS NULL" signal the
+    issue names, read off data `build_board_view` already collects.
+
+    ``False`` — never treated as evidence of a pure dispatch-layer failure —
+    for a row with no `launched_at` at all (nothing to scope the comparison
+    against), for `facts.known is False` (the board has never heard of this
+    issue at all — absence of evidence about the ISSUE is not evidence about
+    the DISPATCH, and guessing would be exactly the "worse than nothing"
+    sweep #2230's own docstring warns a naive re-check would be), and for the
+    common case, a launch that dispatched fine and died at a LATER stage
+    (test, review, merge): that failure has real board state behind it,
+    which is exactly what `RETRY_BACKOFF_SECONDS` alone already paces.
+    """
+    if entry.launched_at is None:
+        return False
+    if not facts.known:
+        return False
+    if facts.last_dispatched_at is None:
+        return True
+    return facts.last_dispatched_at < entry.launched_at
+
+
+def _retry_backoff_reason(
+    entry: QueueEntry,
+    facts: IssueFacts,
+    now: float | None,
+    attempts: int,
+    reason_at: float | None,
+) -> str:
+    """#2273's launch-side guard: ``''`` unless *entry* is still inside its
+    post-death backoff window.
+
+    *attempts* and *reason_at* are passed in explicitly rather than read off
+    *entry* because both can be STALE by the time the walk reaches this
+    entry: `plan_tick`'s `by_key`/`ordered` are the pre-tick snapshot, so an
+    entry reconciled `running` → `retry` earlier in this SAME tick still
+    shows its pre-tick `attempts`/`reason_at` on `entry` itself, and an entry
+    #2230 just resumed from `blocked` had its `attempts` reset to 0 by a
+    write this function must not miss either. The caller
+    (`plan_tick`'s `_backoff_reason` closure) resolves both against THIS
+    tick's own reconciles before calling in — see its comment for exactly
+    which two maps it consults.
+
+    Deliberately keyed on ``reason_at`` — the wall-clock moment the death was
+    RECORDED — not on ``launched_at``, the moment the drive that died was
+    STARTED: the backoff paces the gap between attempts, not the drive's own
+    runtime, and a long-running drive that eventually dies should not get
+    LESS backoff before its retry just because it ran for longer first.
+
+    ``''`` for ``attempts <= 0`` (nothing has died yet — the very first
+    launch is never paced, same as today) and for ``now is None`` or
+    ``reason_at is None`` (a pure-logic caller with no clock, or a row
+    predating the #2133 `reason_at` migration — both degrade to the
+    pre-#2273 behaviour exactly, the same posture every other clock-gated
+    check in this module takes).
+    """
+    if now is None or attempts <= 0 or reason_at is None:
+        return ""
+    age = now - reason_at
+    if age < 0.0:
+        return ""
+    idx = min(attempts - 1, len(RETRY_BACKOFF_SECONDS) - 1)
+    backoff = RETRY_BACKOFF_SECONDS[idx]
+    if _dispatch_produced_nothing(entry, facts):
+        backoff = max(backoff, DISPATCH_FAILURE_MIN_BACKOFF_SECONDS)
+    if age >= backoff:
+        return ""
+    remaining = backoff - age
+    return (
+        f"retry backoff: the previous attempt failed {age:.0f}s ago, next "
+        f"attempt permitted in {remaining:.0f}s ({backoff:.0f}s spacing "
+        f"after {attempts} attempt(s) — #2273, so a transient dispatch "
+        "failure cannot spend the whole retry budget inside one tick "
+        "cadence)"
+    )
+
+
 def _reconcile_running(
     entry: QueueEntry,
     board: BoardView,
@@ -1832,18 +2015,35 @@ def _reconcile_running(
             None,
         )
 
+    # #2273: was there ever a board-visible assignment for THIS launch? A
+    # `True` here does not change whether an attempt is spent (see
+    # RETRY_BACKOFF_SECONDS's comment for why exempting this class outright
+    # was considered and deferred) — it widens the SPACING before the next
+    # attempt (`_retry_backoff_reason`, applied by `plan_tick`'s waiting
+    # walk) and names the fact plainly in both the `retry` and `exhausted`
+    # wording, so an operator reading `last_reason` — or the escalation this
+    # produces once the budget IS exhausted — sees "no assignment was ever
+    # created" instead of a bare exit code that could mean anything.
+    dispatch_only = _dispatch_produced_nothing(entry, facts)
+    dispatch_note = (
+        " — no assignment was ever created for this run (#2273): likely an "
+        "infrastructure/dispatch-layer failure, not a code defect"
+        if dispatch_only
+        else ""
+    )
+
     attempts = entry.attempts + 1
     if attempts < max_attempts:
         if own_reason:
             reason = (
                 f"{own_reason} (attempt {attempts}/{max_attempts}) — "
-                f"requeued at position {entry.position}"
+                f"requeued at position {entry.position}{dispatch_note}"
             )
         else:
             reason = (
                 f"drive session died without landing the work"
                 f"{launched} (attempt {attempts}/{max_attempts}) — requeued at "
-                f"position {entry.position}"
+                f"position {entry.position}{dispatch_note}"
             )
         return (
             Reconcile(
@@ -1864,11 +2064,13 @@ def _reconcile_running(
     if own_reason:
         reason = (
             f"{own_reason} ({attempts}/{max_attempts} attempts) — giving up"
+            f"{dispatch_note}"
         )
     else:
         reason = (
             f"drive session died without landing the work"
             f"{launched} {attempts}/{max_attempts} times — giving up"
+            f"{dispatch_note}"
         )
     return (
         Reconcile(entry.key, "exhausted", reason, occupies=False),
@@ -2391,23 +2593,45 @@ def plan_tick(
        is how an alert channel gets muted (same reasoning as step 3).
 
     An entry reconciled from ``running`` back to ``waiting`` in step 1 IS
-    walked in step 4 — its attempt was already consumed, so a drive that died
-    early relaunches on the same tick instead of idling a whole interval.  A
-    gate RELEASED in step 2 likewise falls straight through into step 4, so a
-    probe that starts passing launches in the same tick rather than costing
-    the queue a whole interval.
+    walked in step 4 — its attempt was already consumed — but #2273 puts a
+    SECOND bound on that same-tick relaunch, distinct from #1794's below: a
+    ``retry`` this tick (or one still inside its window from a prior tick) is
+    also checked against :func:`_retry_backoff_reason`, which now usually
+    defers it rather than launching it immediately. Before #2273 that
+    relaunch happened unconditionally the instant a death was confident
+    enough to call ``retry`` at all — the entire point being "don't idle a
+    whole interval" — which is exactly how quadraui#508 fit both of its
+    attempts into six minutes on 2026-08-15 and gave up before a genuinely
+    transient condition had time to clear. A gate RELEASED in step 2, or a
+    ``parked``/``blocked`` entry step 1b resumes on POSITIVE evidence the
+    gate cleared, still falls straight through into step 4 with NO backoff —
+    :func:`_retry_backoff_reason` only fires for ``attempts > 0``, and #2230
+    resets those to 0 on resume — because that class already has real
+    evidence the condition is gone; only a plain ``retry``, which has none,
+    needs pacing at all.
 
-    #1794 puts one bound on that same-tick relaunch, and it is the reason the
-    grace window is checked TWICE.  Step 1 can only produce a ``retry`` for an
-    entry whose launch is older than *grace_seconds*, so the relaunch is only
-    ever of a drive the tick is confident is gone; and step 4 refuses the
-    launch outright for anything launched more recently, whatever put it back
-    in ``waiting``.  Between them, no single tick can start a second ``coord
-    drive`` for an issue whose first one may still be coming up.
+    #1794 puts a further bound on same-tick relaunch, and it is the reason
+    the grace window is checked TWICE.  Step 1 can only produce a ``retry``
+    for an entry whose launch is older than *grace_seconds*, so the relaunch
+    is only ever of a drive the tick is confident is gone; and step 4 refuses
+    the launch outright for anything launched more recently, whatever put it
+    back in ``waiting``.  Between them, no single tick can start a second
+    ``coord drive`` for an issue whose first one may still be coming up.
     """
     ordered = sorted(entries, key=lambda e: (e.position, e.key))
     states: dict[str, str] = {e.key: e.state for e in ordered}
     by_key = {e.key: e for e in ordered}
+    # #2273: `states` above already follows "prefer this tick's fresh write
+    # over the frozen `ordered` snapshot" for `state`; the backoff check
+    # needs the SAME rule for `attempts` (a #2230 resume this tick resets it
+    # to 0, and `entry.attempts` on the frozen snapshot would still show the
+    # pre-reset value) and for the wall-clock moment the most recent death
+    # was recorded (only known fresh for an entry THIS tick reconciled
+    # `running` → `retry` — everything else falls back to the entry's own,
+    # already-persisted `reason_at`). See `_retry_backoff_reason`'s
+    # docstring for why both are passed in rather than read off `entry`.
+    effective_attempts: dict[str, int] = {e.key: e.attempts for e in ordered}
+    retry_reason_at: dict[str, float] = {}
 
     reconciles: list[Reconcile] = []
     blocked: list[Blocked] = []
@@ -2440,6 +2664,16 @@ def plan_tick(
         new_state = reconcile.updates.get("state")
         if new_state:
             states[entry.key] = str(new_state)
+        new_attempts = reconcile.updates.get("attempts")
+        if new_attempts is not None:
+            effective_attempts[entry.key] = int(new_attempts)
+        if reconcile.outcome == "retry" and now is not None:
+            # #2273: this IS the moment the death got recorded — the state
+            # layer will stamp `reason_at` to (production) wall-clock time
+            # the instant `_apply_writes` persists `last_reason` below, so
+            # `now` is the truthful value for a backoff check reached later
+            # in this SAME tick, not the entry's stale pre-tick `reason_at`.
+            retry_reason_at[entry.key] = now
         if block is not None:
             blocked.append(block)
             states[entry.key] = STATE_BLOCKED
@@ -2511,6 +2745,14 @@ def plan_tick(
                 new_state = blocked_reconcile.updates.get("state")
                 if new_state:
                     states[entry.key] = str(new_state)
+                # #2273: a `resumed` reconcile resets `attempts` to 0 (the
+                # whole point of #2230's budget reset) — `effective_attempts`
+                # must see that reset THIS tick, same reasoning as step 1's
+                # own bookkeeping above, or a freshly-reset entry would be
+                # backed off using the budget it no longer has.
+                new_attempts = blocked_reconcile.updates.get("attempts")
+                if new_attempts is not None:
+                    effective_attempts[entry.key] = int(new_attempts)
             continue
         # entry.state == STATE_PARKED falls through to the #1891/#2182/
         # #2158/#2063 machinery below.
@@ -2726,6 +2968,24 @@ def plan_tick(
             f"grace window, so a second `coord drive` is refused (#1794)"
         )
 
+    def _backoff_reason(candidate: QueueEntry) -> str:
+        """#2273's launch-side guard: '' unless *candidate* is still inside
+        its post-death backoff window.
+
+        Resolves the two "prefer this tick's fresh write" maps
+        (`effective_attempts`/`retry_reason_at`) against the entry's own
+        persisted fields before delegating to :func:`_retry_backoff_reason` —
+        see that function's docstring for why neither can be read straight
+        off `candidate`.
+        """
+        return _retry_backoff_reason(
+            candidate,
+            board.facts(candidate.key),
+            now,
+            effective_attempts.get(candidate.key, candidate.attempts),
+            retry_reason_at.get(candidate.key, candidate.reason_at),
+        )
+
     # #1972's projection of per-repo occupancy AS THE WALK SEES IT: the board
     # reading above, plus this tick's own launch once one is chosen.  Kept
     # separate from `repo_occupied` (reported in the plan) so the launch's own
@@ -2798,6 +3058,12 @@ def plan_tick(
             if cooldown:
                 deferrals.append(Deferral(entry.key, cooldown, counted=False))
                 continue
+            backoff = _backoff_reason(entry)
+            if backoff:
+                deferrals.append(
+                    Deferral(entry.key, backoff, counted=False, backing_off=True)
+                )
+                continue
             verdict = _resolve_prereqs(entry, board, states, cycle_keys, held_gates)
             if not verdict.satisfied:
                 deferrals.append(
@@ -2828,6 +3094,20 @@ def plan_tick(
                         "deferrals": entry.deferrals + 1,
                         "last_reason": cooldown,
                     },
+                )
+            )
+            continue
+        backoff = _backoff_reason(entry)
+        if backoff:
+            deferrals.append(
+                Deferral(
+                    entry.key,
+                    backoff,
+                    updates={
+                        "deferrals": entry.deferrals + 1,
+                        "last_reason": backoff,
+                    },
+                    backing_off=True,
                 )
             )
             continue
@@ -3081,17 +3361,26 @@ def render_plan(plan: TickPlan, *, dry_run: bool = False) -> list[str]:
         # Same reasoning as the at-capacity line above: with free GLOBAL slots
         # and no launch, a bare "no launch" reads as a stalled queue in a
         # journal.  This one is saturated per repo (or draining for a release
-        # — #2101), not stalled, and unlike the global case it raises no
-        # alert, so this line is the only place it is ever said.
+        # — #2101, or pacing a retry — #2273), not stalled, and unlike the
+        # global case it raises no alert, so this line is the only place it
+        # is ever said.  Checked in this order — not "else" for the last one
+        # — because a MIXED benign set (e.g. one cordoned entry, one backing
+        # off) must not have the earlier branch's message stand in for the
+        # later one's cause.
         if any(item.cordoned for item in plan.deferrals):
             lines.append(
                 "  no launch — every waiting entry is pinned to a machine "
                 "under a release cordon (draining to be rolled)"
             )
-        else:
+        elif any(item.repo_limited for item in plan.deferrals):
             lines.append(
                 f"  no launch — every waiting entry's repo is at its per-repo "
                 f"limit ({plan.repo_capacity}/repo)"
+            )
+        else:
+            lines.append(
+                "  no launch — every waiting entry is pacing a retry after a "
+                "recent failure (#2273); it resumes once the backoff elapses"
             )
     else:
         lines.append("  no launch")
