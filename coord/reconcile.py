@@ -365,15 +365,33 @@ def propagate_smoke_terminal_failure(
     if not parent_assignment_id:
         return
     from coord.failure_class import classify_failure  # noqa: PLC0415
-    from coord.state import record_test_verdict  # noqa: PLC0415
+    from coord.smoke import mute_smoke_legs, mute_smoke_tally  # noqa: PLC0415
+    from coord.state import (  # noqa: PLC0415
+        load_assignment_test_reason,
+        record_test_verdict,
+    )
 
     classification = classify_failure(failure_reason=failure_reason)
     if classification.is_environmental:
+        # #2272: this clear must CARRY the mute-leg tally, for exactly the
+        # reason `dispatch_smoke`'s `running` stamp must. `test_reason` is the
+        # only field that survives between Test-stage legs, so any writer that
+        # replaces it wholesale silently hands the row a fresh retry budget —
+        # and a row that alternates "mute leg" / "worker died environmentally"
+        # would then never reach the bound from either side. The tally is not
+        # incremented here (an environmental death is a different, genuinely
+        # self-healing cause and #1605's unbounded re-dispatch of it is
+        # deliberate) — it is only preserved, so mute legs keep counting
+        # across it.
+        carried = mute_smoke_legs(
+            load_assignment_test_reason(parent_assignment_id)
+        )
+        prefix = f"{mute_smoke_tally(carried)} — " if carried else ""
         record_test_verdict(
             assignment_id=parent_assignment_id,
             test_state=None,
             test_reason=(
-                "Test stage worker died environmentally "
+                f"{prefix}Test stage worker died environmentally "
                 f"({classification.reason}) — cleared for automatic "
                 "re-dispatch, not recorded as a work failure (#1605)"
             ),

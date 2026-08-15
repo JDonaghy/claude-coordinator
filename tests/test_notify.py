@@ -1990,6 +1990,47 @@ class TestSmokeVerdictFailsClosed(TestSmokeCompletionVerdict):
         )
         assert row["smoke_test"] is None
 
+    def test_exhausted_budget_names_the_count_and_the_cause(
+        self, coord_db, tmp_path
+    ) -> None:
+        """#2272: the terminal state must NAME "N smoke legs produced no
+        verdict".
+
+        The five-lap incident presented as "the branch is slow" because
+        nothing on the row ever said how many legs had gone mute, or that the
+        legs were mute at all — `coord gates` read the same
+        "BLOCKED — smoke test required but no verdict recorded" throughout.
+        """
+        from coord.smoke import MUTE_SMOKE_LEG_BUDGET  # noqa: PLC0415
+
+        transition, record, entry = self._setup(
+            "work-2272a", "smoke-2272a", exit_code=0, log=None,
+        )
+        with patch("coord.notify._agent_host", return_value=None):
+            self._reap(transition, record, entry)
+            for lap in range(2, MUTE_SMOKE_LEG_BUDGET + 1):
+                self._record_smoke(f"smoke-2272a{lap}", parent_id="work-2272a")
+                t2, r2, e2 = self._make_transition_and_entry(
+                    f"smoke-2272a{lap}", exit_code=0
+                )
+                r2 = dict(r2)
+                r2["review_of_assignment_id"] = "work-2272a"
+                self._reap(t2, r2, e2)
+
+        row = self._row("work-2272a")
+        reason = row["test_reason"] or ""
+        assert row["test_state"] == "blocked"
+        assert f"{MUTE_SMOKE_LEG_BUDGET} smoke legs produced no verdict" in reason, (
+            f"the terminal reason must name the count and the cause, got {reason!r}"
+        )
+        assert "retry budget" in reason
+        # And it must not read as a statement about the branch — a mute leg
+        # found no fault, so no fix round should be provoked by it.
+        assert row["smoke_test"] is None
+        assert "600s Bash ceiling" in reason, (
+            "name the commonest cause so the operator doesn't blame the diff"
+        )
+
     def test_baseline_red_marker_with_zero_exit_still_skips(
         self, coord_db, tmp_path
     ) -> None:
@@ -2127,3 +2168,251 @@ class TestFixCompletionDispatchTypes:
             notify_mod.run(config)
 
         mock_fix.assert_not_called()
+
+
+# ── #2272: the dispatch↔reap loop must terminate ────────────────────────────
+
+
+class TestMuteSmokeLegLoopTerminates:
+    """Black-box: drive the REAL dispatch→reap→dispatch cycle and assert it
+    stops paying.
+
+    Every component of #2272 was individually "correct" — `_record_smoke_
+    verdict` refused to invent a pass (#2244), `dispatch_pending_smoke`
+    re-dispatched a row with no verdict (#1605), and the intended bound was
+    already written down ("a SECOND mute run parks the row"). The defect only
+    exists BETWEEN them: `dispatch_smoke`'s `running` stamp overwrote the
+    `test_reason` that carried the counter, so the bound never fired and the
+    Test stage re-dispatched forever. Five legs against work row
+    ``68b67685532f`` on 2026-08-15, ~$0.12 and ~10 minutes each, stopped by
+    hand.
+
+    A unit test of either half passes with the bug present. Only running the
+    two against each other, repeatedly, catches it — so that is what this
+    does, with a hard iteration cap standing in for the operator who
+    eventually noticed.
+    """
+
+    #: The observed shape (assignment ``9214dcb25204``, turns 10 and 13): the
+    #: agent starts the suite, the harness backgrounds it for exceeding the
+    #: 600s ceiling, and the agent narrates that it kicked the suite off and
+    #: ends its turn. Exit 0, status done, no `SMOKE:` marker anywhere.
+    CEILING_TRANSCRIPT = (
+        '# agent=dellserver argv=claude -p\n'
+        '{"type":"assistant","message":{"content":[{"type":"tool_use",'
+        '"name":"Bash","input":{"command":"scripts/coord-test-runner.sh . '
+        '--base-ref origin/main"}}]}}\n'
+        '{"type":"user","message":{"content":[{"type":"tool_result",'
+        '"content":"Command running in background (ID: bpcwo3773)"}]}}\n'
+        '{"type":"assistant","message":{"content":[{"type":"text",'
+        '"text":"The task was already moved to background by the harness "'
+        '"(ID: bpcwo3773) since it exceeded 600s. I\'ve kicked off the smoke '
+        'test suite."}]}}\n'
+        '{"type":"result","subtype":"success",'
+        '"result":"Smoke test suite started."}\n'
+    )
+
+    @staticmethod
+    def _config() -> Config:
+        from coord.config import SmokeTestsConfig  # noqa: PLC0415
+        from coord.models import Machine, Repo  # noqa: PLC0415
+
+        return Config(
+            repos=[Repo(
+                name="api", github="acme/api", depends_on=[],
+                default_branch="main", test_command="make test",
+            )],
+            machines=[Machine(
+                name="laptop", host="laptop.tail", capabilities=["python"],
+                repos=["api"], repo_paths={"api": "/w/api"},
+            )],
+            smoke_tests=SmokeTestsConfig(auto_queue=True, capability_rules=[]),
+        )
+
+    @staticmethod
+    def _work_row():
+        from coord.models import Assignment  # noqa: PLC0415
+
+        return Assignment(
+            machine_name="laptop", repo_name="api", issue_number=2269,
+            issue_title="Branch whose suite outruns the ceiling",
+            briefing="b", assignment_id="68b67685532f", status="done",
+            branch="issue-2269-fix", dispatched_at=0.0, finished_at=1.0,
+            type="work",
+        )
+
+    def test_ceiling_shaped_mute_legs_stop_within_the_budget(
+        self, coord_db, tmp_path
+    ) -> None:
+        from coord.models import Board  # noqa: PLC0415
+        from coord.smoke import (  # noqa: PLC0415
+            MUTE_SMOKE_LEG_BUDGET,
+            TEST_STATE_BLOCKED,
+            dispatch_smoke,
+            mute_smoke_legs,
+        )
+        from coord.state import (  # noqa: PLC0415
+            _record_dispatched_assignment_local,
+            get_connection,
+        )
+
+        reaper = TestSmokeVerdictFailsClosed()
+        config = self._config()
+        work = self._work_row()
+        _record_dispatched_assignment_local(assignment=work, repo_github="acme/api")
+        board = Board(completed=[work])
+
+        log_path = tmp_path / "ceiling.log"
+        log_path.write_text(self.CEILING_TRANSCRIPT, encoding="utf-8")
+
+        # Stands in for the operator who eventually killed it by hand. Set
+        # well above the budget so an unbounded loop is a FAILURE here, not a
+        # hang: with the bug present this runs the cap out every time.
+        HARD_CAP = MUTE_SMOKE_LEG_BUDGET + 6
+        legs_dispatched = 0
+
+        with patch("coord.notify._agent_host", return_value=None):
+            for lap in range(HARD_CAP):
+                smoke = dispatch_smoke(
+                    work, board, config,
+                    http_client=_FakeAssignClient(f"smoke-lap{lap}"),
+                    diff_lookup=lambda repo, branch: ["coord/agent.py"],
+                )
+                if smoke is None:
+                    break
+                legs_dispatched += 1
+
+                # The leg runs, hits the ceiling, and ends mute.
+                _record_dispatched_assignment_local(
+                    assignment=smoke, repo_github="acme/api"
+                )
+                transition, record, entry = reaper._make_transition_and_entry(
+                    smoke.assignment_id, exit_code=0
+                )
+                record = dict(record)
+                record["review_of_assignment_id"] = work.assignment_id
+                entry = dict(entry)
+                entry["log_path"] = str(log_path)
+                reaper._reap(transition, record, entry)
+
+                # The daemon re-reads the board between ticks; mirror that,
+                # and retire the finished leg so the in-flight dedupe
+                # (`has_active_followup`) doesn't do the bounding for us —
+                # this test must exercise the BUDGET, not the dedupe.
+                board.active.remove(smoke)
+                smoke.status = "done"
+                board.completed.append(smoke)
+                row = get_connection().execute(
+                    "SELECT test_state, test_reason FROM assignments "
+                    "WHERE assignment_id=?",
+                    (work.assignment_id,),
+                ).fetchone()
+                work.test_state = row["test_state"]
+                work.test_reason = row["test_reason"]
+
+        assert legs_dispatched <= MUTE_SMOKE_LEG_BUDGET, (
+            f"the Test stage dispatched {legs_dispatched} mute legs against "
+            f"one work row — the retry budget is {MUTE_SMOKE_LEG_BUDGET}. "
+            "This is #2272: a deterministic cause (the 600s Bash ceiling) "
+            "re-dispatched indefinitely, billing every lap."
+        )
+        assert work.test_state == TEST_STATE_BLOCKED, (
+            "the loop must end in an explicit terminal state, not merely stop "
+            f"— got {work.test_state!r}"
+        )
+        reason = work.test_reason or ""
+        assert mute_smoke_legs(reason) == MUTE_SMOKE_LEG_BUDGET
+        assert "smoke legs produced no verdict" in reason
+        # It must never resolve as a pass, and never as a statement about the
+        # branch: nothing here found fault with the diff.
+        assert work.test_state not in ("passed", "failed")
+
+    def test_a_leg_that_does_report_clears_the_tally(
+        self, coord_db, tmp_path
+    ) -> None:
+        """The budget must not leak into healthy rows: one mute leg followed
+        by a real verdict resolves normally, with no trace of the tally."""
+        from coord.models import Board  # noqa: PLC0415
+        from coord.smoke import dispatch_smoke, mute_smoke_legs  # noqa: PLC0415
+        from coord.state import (  # noqa: PLC0415
+            _record_dispatched_assignment_local,
+            get_connection,
+        )
+
+        reaper = TestSmokeVerdictFailsClosed()
+        config = self._config()
+        work = self._work_row()
+        _record_dispatched_assignment_local(assignment=work, repo_github="acme/api")
+        board = Board(completed=[work])
+
+        mute_log = tmp_path / "mute.log"
+        mute_log.write_text(self.CEILING_TRANSCRIPT, encoding="utf-8")
+        pass_log = tmp_path / "pass.log"
+        pass_log.write_text(
+            '{"type":"assistant","message":{"content":[{"type":"text",'
+            '"text":"SMOKE: pass"}]}}\n',
+            encoding="utf-8",
+        )
+
+        with patch("coord.notify._agent_host", return_value=None):
+            for lap, log_file in enumerate((mute_log, pass_log)):
+                smoke = dispatch_smoke(
+                    work, board, config,
+                    http_client=_FakeAssignClient(f"smoke-ok{lap}"),
+                    diff_lookup=lambda repo, branch: ["coord/agent.py"],
+                )
+                assert smoke is not None, f"lap {lap} must dispatch"
+                _record_dispatched_assignment_local(
+                    assignment=smoke, repo_github="acme/api"
+                )
+                transition, record, entry = reaper._make_transition_and_entry(
+                    smoke.assignment_id, exit_code=0
+                )
+                record = dict(record)
+                record["review_of_assignment_id"] = work.assignment_id
+                entry = dict(entry)
+                entry["log_path"] = str(log_file)
+                reaper._reap(transition, record, entry)
+
+                board.active.remove(smoke)
+                smoke.status = "done"
+                board.completed.append(smoke)
+                row = get_connection().execute(
+                    "SELECT test_state, test_reason FROM assignments "
+                    "WHERE assignment_id=?",
+                    (work.assignment_id,),
+                ).fetchone()
+                work.test_state = row["test_state"]
+                work.test_reason = row["test_reason"]
+
+        assert work.test_state == "passed"
+        assert mute_smoke_legs(work.test_reason) == 0, (
+            "a real verdict must clear the tally, or the next mute leg on a "
+            f"later re-test starts with a used budget — got {work.test_reason!r}"
+        )
+
+
+class _FakeAssignClient:
+    """Minimal agent stand-in for `dispatch_smoke`: /health has no
+    `tool_versions` (the #1570 D probe fails open) and /assign returns an id."""
+
+    def __init__(self, assignment_id: str) -> None:
+        self._id = assignment_id
+        self.calls: list[str] = []
+
+    class _Resp:
+        def __init__(self, payload: dict) -> None:
+            self._p = payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return self._p
+
+    def post(self, url, *, json, timeout):
+        self.calls.append(url)
+        return self._Resp({"id": self._id})
+
+    def get(self, url, *, timeout):
+        return self._Resp({})

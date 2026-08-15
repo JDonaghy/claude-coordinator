@@ -10,11 +10,15 @@ import pytest
 from coord.config import Config, SmokeRule, SmokeTestsConfig, load
 from coord.models import Assignment, Board, Machine, Repo
 from coord.smoke import (
+    MUTE_SMOKE_LEG_BUDGET,
+    NO_SMOKE_VERDICT_MARKER,
     SMOKE_SYSTEM_PROMPT,
     build_smoke_briefing,
     dispatch_pending_smoke,
     dispatch_smoke,
     match_rules,
+    mute_smoke_legs,
+    mute_smoke_tally,
     pick_smoke_machine,
 )
 
@@ -440,6 +444,236 @@ def test_briefing_omits_the_coord_test_command_without_a_parent_id() -> None:
     )
     assert "coord test" not in briefing
     assert "SMOKE: pass" in briefing
+
+
+# ── #2272: the 600s Bash ceiling, and the mute-leg retry budget ─────────────
+
+
+def test_smoke_system_prompt_tells_the_worker_to_poll_a_backgrounded_run() -> None:
+    """#2272 half 1. The ceiling is the one outcome the prompt never covered.
+
+    It told the worker what to do for exit 0, for the #2170 baseline-red exit,
+    and for any other non-zero — but not for "your Bash call did not return a
+    result at all", which is exactly what Claude Code's ~600s ceiling
+    produces: the call is moved to the background and the agent gets a task
+    id. On 2026-08-15 the smoke worker narrated that it had kicked the suite
+    off and ended its turn, five times in a row.
+    """
+    prompt = SMOKE_SYSTEM_PROMPT
+    assert "600s" in prompt, "the prompt must name the ceiling it has to survive"
+    assert "NEVER END YOUR TURN WITH THE SUITE STILL RUNNING" in prompt
+    # The instruction has to be actionable, not just a warning: say to poll,
+    # and say what to print if polling genuinely can't produce a status.
+    lowered = prompt.lower()
+    assert "poll" in lowered
+    assert "background" in lowered
+    assert "exit status" in lowered
+    # The escape hatch: a stated verdict beats silence.
+    assert "rather than ending mute" in lowered
+    # Same invariant as #2244 — no prompt line may itself parse as a verdict.
+    assert not any(line.startswith("SMOKE:") for line in prompt.splitlines())
+
+
+def test_briefing_tells_the_worker_to_poll_a_backgrounded_run() -> None:
+    """The briefing carries the same instruction as the system prompt — it is
+    what the worker re-reads while deciding what to do next."""
+    briefing = build_smoke_briefing(
+        repo_github="acme/api", repo_name="api", branch="b",
+        issue_number=1, issue_title="X", smoke_command="pytest -q",
+        required_caps=[], timeout_seconds=60, is_worker=False,
+        parent_assignment_id="884e2fe6eb5b",
+    )
+    assert "600s" in briefing
+    assert "background" in briefing.lower()
+    assert "Do not end your turn there" in briefing
+    assert not any(line.startswith("SMOKE:") for line in briefing.splitlines())
+
+
+@pytest.mark.parametrize(
+    "reason, expected",
+    [
+        (None, 0),
+        ("", 0),
+        ("dispatched: Test stage running (#1426)", 0),
+        ("headless smoke: 5 failed", 0),
+        # Bare marker — what a pre-#2272 coordinator wrote. Reads back as ONE
+        # leg, never zero: an upgrade mid-loop must not hand the row a fresh
+        # budget and let the loop run the whole way again.
+        ("no-verdict (#2244): the Test-stage worker abc ended without…", 1),
+        ("no-verdict (#2244) x2: …", 2),
+        ("no-verdict (#2244) x7 — parked", 7),
+        # Case/spacing tolerance, so a hand-edited reason still counts.
+        ("NO-VERDICT (#2244) X3", 3),
+    ],
+)
+def test_mute_smoke_legs_reads_the_tally_back(reason, expected) -> None:
+    assert mute_smoke_legs(reason) == expected
+
+
+def test_mute_smoke_tally_round_trips_through_mute_smoke_legs() -> None:
+    """The writer and the reader must agree, or the budget silently resets."""
+    for count in range(1, 8):
+        assert mute_smoke_legs(mute_smoke_tally(count)) == count
+    # One leg renders bare — a count is only shown once there's one worth
+    # seeing — but still reads back as one.
+    assert mute_smoke_tally(1) == NO_SMOKE_VERDICT_MARKER
+
+
+def test_dispatch_smoke_carries_the_mute_leg_tally_across_the_running_stamp(
+    gtk_and_server_config: Config,
+) -> None:
+    """THE #2272 regression, and the reason #2244's bound never fired.
+
+    `test_reason` is the ONLY field that survives from one Test-stage leg to
+    the next, so it is where the "this leg came back mute" evidence lives.
+    This stamp used to overwrite it with a flat literal — the counter was
+    erased by the very retry it existed to count, so `already_mute_once` read
+    False on every lap and the row re-dispatched forever (five legs observed,
+    ~$0.12 each, stopped by hand).
+    """
+    parent = _completed(machine="server")
+    parent.test_reason = f"{NO_SMOKE_VERDICT_MARKER}: worker abc ended mute"
+    board = Board(completed=[parent])
+
+    result = dispatch_smoke(
+        parent, board, gtk_and_server_config,
+        http_client=_FakeClient({"id": "smoke-run"}),
+        diff_lookup=lambda repo, branch: ["src/gtk/window.c"],
+    )
+
+    assert result is not None
+    assert parent.test_state == "running"
+    # The tally survived...
+    assert mute_smoke_legs(parent.test_reason) == 1, (
+        "the mute-leg tally must survive the `running` stamp, or the retry "
+        f"budget can never fire — got {parent.test_reason!r}"
+    )
+    # ...and the row says, on the board, that it is a RETRY. Before this, a
+    # row on its fifth mute lap rendered identically to one whose Test stage
+    # had just started for the first time — which is why five identical laps
+    # looked like progress.
+    assert f"retry 2 of {MUTE_SMOKE_LEG_BUDGET}" in parent.test_reason
+    assert "no verdict" in parent.test_reason
+
+
+def test_dispatch_smoke_running_stamp_stays_plain_on_a_first_dispatch(
+    gtk_and_server_config: Config,
+) -> None:
+    """The ordinary path is untouched: no mute history, no retry wording."""
+    parent = _completed(machine="server")
+    board = Board(completed=[parent])
+
+    result = dispatch_smoke(
+        parent, board, gtk_and_server_config,
+        http_client=_FakeClient({"id": "smoke-run"}),
+        diff_lookup=lambda repo, branch: ["src/gtk/window.c"],
+    )
+
+    assert result is not None
+    assert parent.test_state == "running"
+    assert parent.test_reason == "dispatched: Test stage running (#1426)"
+    assert mute_smoke_legs(parent.test_reason) == 0
+
+
+def test_dispatch_smoke_refuses_a_row_parked_by_the_mute_budget(
+    gtk_and_server_config: Config,
+) -> None:
+    """Once the budget parks the row, the dispatcher must not pick it back up
+    — that refusal is what actually stops the billing."""
+    from coord.smoke import TEST_STATE_BLOCKED  # noqa: PLC0415
+
+    parent = _completed(machine="server")
+    parent.test_state = TEST_STATE_BLOCKED
+    parent.test_reason = f"{mute_smoke_tally(MUTE_SMOKE_LEG_BUDGET)}: parked"
+    client = _FakeClient({"id": "smoke-run"})
+
+    result = dispatch_smoke(
+        parent, Board(completed=[parent]), gtk_and_server_config,
+        http_client=client,
+        diff_lookup=lambda repo, branch: ["src/gtk/window.c"],
+    )
+
+    assert result is None
+    assert client.calls == [], "a parked row must not dispatch another leg"
+
+
+def test_environmental_death_preserves_the_mute_leg_tally(coord_db) -> None:
+    """#2272: reconcile's #1605 environmental clear is the OTHER writer that
+    replaces `test_reason` wholesale, and it must carry the tally too.
+
+    `test_reason` is the only field that survives between Test-stage legs, so
+    any writer that overwrites it hands the row a fresh retry budget. A row
+    alternating "leg went mute" / "worker died environmentally" would then
+    never reach the bound from either side — the same defect as the `running`
+    stamp, one module over.
+    """
+    from coord.models import Assignment  # noqa: PLC0415
+    from coord.reconcile import propagate_smoke_terminal_failure  # noqa: PLC0415
+    from coord.state import (  # noqa: PLC0415
+        _record_dispatched_assignment_local,
+        get_connection,
+        record_test_verdict,
+    )
+
+    work = Assignment(
+        assignment_id="w-env", machine_name="laptop", repo_name="api",
+        issue_number=7, issue_title="X", type="work", status="done",
+        branch="issue-7",
+    )
+    _record_dispatched_assignment_local(assignment=work, repo_github="acme/api")
+    record_test_verdict(
+        assignment_id="w-env",
+        test_state="running",
+        test_reason=f"{mute_smoke_tally(1)} — dispatched: Test stage running",
+    )
+
+    propagate_smoke_terminal_failure(
+        parent_assignment_id="w-env",
+        failure_reason="api error 529",
+    )
+
+    row = get_connection().execute(
+        "SELECT test_state, test_reason FROM assignments WHERE assignment_id=?",
+        ("w-env",),
+    ).fetchone()
+    # #1605's semantics are unchanged: cleared for automatic re-dispatch.
+    assert row["test_state"] is None
+    assert "died environmentally" in row["test_reason"]
+    # ...but the mute count survives it.
+    assert mute_smoke_legs(row["test_reason"]) == 1, (
+        "the environmental clear must preserve the mute-leg tally, or a row "
+        f"can ping-pong past the budget forever — got {row['test_reason']!r}"
+    )
+
+
+def test_environmental_death_adds_no_tally_when_there_is_none(coord_db) -> None:
+    """The ordinary #1605 case is untouched — an environmental death is NOT a
+    mute leg, and must not start the counter."""
+    from coord.models import Assignment  # noqa: PLC0415
+    from coord.reconcile import propagate_smoke_terminal_failure  # noqa: PLC0415
+    from coord.state import (  # noqa: PLC0415
+        _record_dispatched_assignment_local,
+        get_connection,
+    )
+
+    work = Assignment(
+        assignment_id="w-env2", machine_name="laptop", repo_name="api",
+        issue_number=8, issue_title="X", type="work", status="done",
+        branch="issue-8",
+    )
+    _record_dispatched_assignment_local(assignment=work, repo_github="acme/api")
+
+    propagate_smoke_terminal_failure(
+        parent_assignment_id="w-env2",
+        failure_reason="api error 529",
+    )
+
+    row = get_connection().execute(
+        "SELECT test_state, test_reason FROM assignments WHERE assignment_id=?",
+        ("w-env2",),
+    ).fetchone()
+    assert row["test_state"] is None
+    assert mute_smoke_legs(row["test_reason"]) == 0
 
 
 # ── dispatch_smoke (HTTP mocked) ────────────────────────────────────────────

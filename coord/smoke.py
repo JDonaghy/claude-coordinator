@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -102,6 +103,21 @@ session — the coordinator sees exit 0 either way, so a run whose suite failed 
 and whose marker is missing is recorded as NO verdict (never a pass) and the \
 Test stage has to be re-run. Exit with the matching code as well, for the \
 non-headless lanes that do read it.
+- NEVER END YOUR TURN WITH THE SUITE STILL RUNNING (#2272). Your smoke \
+command can easily exceed the ~600s Bash ceiling; when it does, the harness \
+moves it to the BACKGROUND and hands you a task id instead of an exit status. \
+That is not a result — it is "no answer yet". Narrating that you kicked the \
+suite off and stopping there prints no marker, so the Test stage records NO \
+verdict and re-dispatches; because the ceiling is deterministic, every \
+re-dispatch does exactly the same thing, which is why this loop bills \
+indefinitely. Instead: POLL the backgrounded task to completion from THIS \
+same session, in bounded steps (`BashOutput`/`TaskOutput` with the id, or \
+`Monitor`), and read its REAL exit status before you report anything. Do NOT \
+use a foreground `until ! pgrep ...; do sleep ...; done` wait — it hits the \
+identical 600s wall. If you genuinely cannot obtain an exit status before you \
+run out of room, print `SMOKE: fail <the smoke command never returned an exit \
+status within this session>` rather than ending mute: a stated verdict is \
+recoverable, silence is not.
 
 Where you are:
 - You are in a dedicated git worktree created for this run. Every git command \
@@ -114,7 +130,10 @@ fail (#1694).
 Steps:
 1. `git fetch origin && git checkout <branch>` (the branch is in your \
 briefing) — in your worktree, never in the base checkout.
-2. Run the smoke command from the briefing. Capture stdout/stderr.
+2. Run the smoke command from the briefing. Capture stdout/stderr. If the \
+harness backgrounds it for exceeding the 600s Bash ceiling, poll that task to \
+completion and use ITS exit status below — "I started it" is not an outcome \
+(#2272).
 3. If it exits 0 → print `SMOKE: pass` and exit 0.
 4. If it exits {RUNNER_BASELINE_RED_EXIT} AND its output contains a line \
 starting with literal text `{BASELINE_RED_OUTPUT_MARKER}` (#2170) — the smoke \
@@ -524,6 +543,33 @@ def build_smoke_briefing(
     lines.append(smoke_command)
     lines.append("```")
     lines.append("")
+    # #2272: the ceiling is the deterministic cause of a mute Test stage. A
+    # suite this size routinely runs past 600s, the harness backgrounds it,
+    # and an agent that narrates "I kicked it off" and stops prints no marker
+    # — so the stage records NO verdict and re-dispatches, forever, at ~$0.12
+    # a lap. Say it in the briefing as well as the system prompt: the briefing
+    # is what the worker re-reads while it is deciding what to do next.
+    lines.append("## If the suite runs past the 600s Bash ceiling (#2272)")
+    lines.append("")
+    lines.append(
+        "Claude Code moves any Bash call past ~600s to the **background** and "
+        "hands you a task id instead of an exit status. That is not a result. "
+        "**Do not end your turn there** — poll the backgrounded task to "
+        "completion from this same session (`BashOutput`/`TaskOutput` with "
+        "the id, in bounded steps) and read its real exit status before "
+        "reporting. A foreground `until ! pgrep ...; do sleep ...; done` wait "
+        "hits the identical wall, so don't."
+    )
+    lines.append("")
+    lines.append(
+        "A turn that ends with the suite still running prints no marker, the "
+        "Test stage records NO verdict, and it re-dispatches — and since the "
+        "ceiling is deterministic, every re-dispatch stalls identically. If "
+        "you truly cannot get an exit status, print `SMOKE: fail <the smoke "
+        "command never returned an exit status within this session>` rather "
+        "than ending mute."
+    )
+    lines.append("")
     lines.append(
         "## Reporting the verdict (#2244)"
     )
@@ -617,6 +663,91 @@ def _fetch_touched_files(repo_github: str, branch: str) -> list[str]:
 #: and every gate that asks for ``"passed"``/``"skipped"`` keeps the merge shut
 #: exactly as it did while the state was NULL.
 TEST_STATE_BLOCKED = "blocked"
+
+
+# ── Mute Test-stage legs: the retry budget (#2244/#2272) ────────────────────
+#
+# A Test-stage leg that finishes without printing a `SMOKE:` marker records NO
+# verdict — never a pass (#2244). That is the right call, and it assumes
+# re-running is USEFUL. #2272 is the case where it is not: on 2026-08-15 five
+# consecutive legs against one work row each ran the suite past Claude Code's
+# 600s Bash ceiling, got backgrounded, and ended mute. Deterministic cause,
+# identical every lap, ~$0.12 and ~10 minutes each, and the board showed a
+# healthy `running` Test stage throughout. It was stopped by hand.
+#
+# #2244 already intended a bound — "a SECOND mute run parks the row" — but it
+# stored the evidence in the parent's `test_reason` and `dispatch_smoke`'s own
+# `running` stamp overwrote that field on the very next dispatch. The counter
+# was reset by the retry it was supposed to be counting, so the bound never
+# fired. Hence two things here rather than one:
+#
+#   * a TALLY that is explicit and parseable (`no-verdict (#2244) x2`) rather
+#     than a bare marker whose presence is the whole signal, and
+#   * `dispatch_smoke` carrying that tally ACROSS its `running` stamp, so the
+#     count survives the thing that kept destroying it.
+#
+# The generalisation matters more than the ceiling: whatever future cause
+# leaves a Test stage mute — a dead harness, a machine that reboots mid-run, a
+# prompt regression — it now costs a bounded number of legs and then names
+# itself on the row, instead of billing forever. A cause the system cannot
+# diagnose must still be a cause the system stops paying for.
+
+#: The marker left in the parent work row's ``test_reason`` when a headless
+#: Test stage produced no parseable verdict. Suffixed with `` xN`` from the
+#: second leg on (see :func:`mute_smoke_tally`).
+NO_SMOKE_VERDICT_MARKER = "no-verdict (#2244)"
+
+#: How many CONSECUTIVE mute Test-stage legs one work row may burn before the
+#: row is parked terminally instead of re-dispatched (#2272). Two — one lap of
+#: genuine self-heal (the #1605 environmental-death shape really does clear on
+#: a retry), then stop. Pinned by test: raising it raises the unattended spend
+#: ceiling for every no-verdict cause at once, which is exactly the decision
+#: that should be deliberate.
+MUTE_SMOKE_LEG_BUDGET = 2
+
+#: Matches the marker with or without its `` xN`` tally, so a reason written by
+#: a pre-#2272 coordinator (bare marker, no count) still reads back as one leg
+#: rather than zero — an upgrade mid-loop must not hand the row a fresh budget.
+_MUTE_TALLY_RE = re.compile(
+    re.escape(NO_SMOKE_VERDICT_MARKER) + r"(?:\s*x\s*(\d+))?", re.IGNORECASE
+)
+
+
+def mute_smoke_legs(test_reason: str | None) -> int:
+    """How many mute Test-stage legs *test_reason* records (0 if none).
+
+    Reads the tally back out of the parent work row's ``test_reason`` — the
+    one field that survives from one Test-stage leg to the next. Tolerates:
+
+    * ``None``/empty — no legs (the ordinary first dispatch),
+    * the bare pre-#2272 marker with no count — one leg,
+    * a truncated ``test_reason`` — the ``/board`` wire carries only a bounded
+      preview (:func:`coord.state.load_assignment_test_reason`), so the tally
+      is written at the FRONT of the reason where a preview still shows it.
+    """
+    if not test_reason:
+        return 0
+    match = _MUTE_TALLY_RE.search(test_reason)
+    if match is None:
+        return 0
+    raw = match.group(1)
+    if raw is None:
+        return 1
+    try:
+        return max(1, int(raw))
+    except ValueError:  # pragma: no cover — regex only matches digits
+        return 1
+
+
+def mute_smoke_tally(count: int) -> str:
+    """The marker for *count* mute legs — ``"no-verdict (#2244) x2"``.
+
+    A single leg renders as the bare marker, so an operator reading a row
+    mid-loop sees a count only once there is a count worth seeing.
+    """
+    if count <= 1:
+        return NO_SMOKE_VERDICT_MARKER
+    return f"{NO_SMOKE_VERDICT_MARKER} x{count}"
 
 
 #: Soft (transient) unroutable reports already logged this process, keyed by
@@ -1095,17 +1226,46 @@ def dispatch_smoke(
     # `running` → the merge never fires → repeat. Dispatching a *fresh* run
     # must never, by itself, retract the previous answer; the new verdict
     # replaces the old one when it actually lands.
+    #
+    # #2272: ...and this stamp must CARRY THE MUTE-LEG TALLY FORWARD. That is
+    # the whole bug behind the five-lap loop: `test_reason` is the only field
+    # that survives between Test-stage legs, `_record_smoke_verdict` stores the
+    # "this leg came back mute" evidence there, and this write used to replace
+    # it with a flat literal. So the counter was erased by the very retry it
+    # existed to count, `already_mute_once` read False forever, and #2244's
+    # "a second mute run parks the row" bound could never fire. Re-reading and
+    # re-stating the tally here also keeps the retry VISIBLE on the board:
+    # before this, a row on its fifth mute lap rendered identically to one
+    # whose Test stage had just started for the first time, which is why five
+    # identical laps looked like progress.
     if completed.assignment_id is not None and completed.test_state not in (
         "passed", "skipped", "failed",
     ):
-        from coord.state import record_test_verdict
+        from coord.state import load_assignment_test_reason, record_test_verdict
+
+        # Belt and braces: the authoritative single-row read, falling back to
+        # the board-carried value when it is unavailable (thin client, remote
+        # read failure). Both are bounded previews at worst and the tally is
+        # written at the front of the reason, so either still carries it.
+        prior_legs = max(
+            mute_smoke_legs(load_assignment_test_reason(completed.assignment_id)),
+            mute_smoke_legs(getattr(completed, "test_reason", None)),
+        )
+        running_reason = "dispatched: Test stage running (#1426)"
+        if prior_legs:
+            running_reason = (
+                f"{mute_smoke_tally(prior_legs)} — {running_reason}; "
+                f"retry {prior_legs + 1} of {MUTE_SMOKE_LEG_BUDGET} after "
+                f"{prior_legs} Test-stage leg(s) produced no verdict (#2272)"
+            )
 
         record_test_verdict(
             assignment_id=completed.assignment_id,
             test_state="running",
-            test_reason="dispatched: Test stage running (#1426)",
+            test_reason=running_reason,
         )
         completed.test_state = "running"
+        completed.test_reason = running_reason
 
     return smoke_assignment
 
