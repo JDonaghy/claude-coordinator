@@ -23,6 +23,18 @@ criteria verbatim:
 3. A thin client still never writes (the #584 guard is preserved).
 4. The ``machines`` table after a ``--config`` override still lists the
    real fleet — a plain follow-up run (no override) repairs it either way.
+
+The note is deliberately **scoped to skips that actually withheld a
+change** (:func:`coord.commands._common._note_withheld_snapshot`). A first
+cut printed it on every non-canonical ``--config``, which broke 21 tests
+across this suite: ``--config <tmpfile>`` is how essentially every CLI test
+here (and CI, and the config *validator* in
+``scripts/azure-workers/coordinator-machine.py``) runs coord, and Click's
+``CliRunner`` folds stderr into ``result.output`` — so a per-invocation nag
+corrupted the machine-readable stdout of ``coord plans --json`` /
+``coord scorecard --json`` for anyone parsing combined output.
+``TestTheNoteIsScopedToConsequentialSkips`` below is the regression gate for
+that.
 """
 
 from __future__ import annotations
@@ -129,6 +141,11 @@ class TestNonCanonicalConfigLeavesMachinesUnchanged:
         err = capsys.readouterr().err
         assert "non-canonical" in err
         assert str(scratch_config_path) in err
+        # The note names the fleet it protected, so the operator does not
+        # have to go and ask the DB what it just declined to overwrite —
+        # silence about *that* is what cost an hour in the original
+        # incident.
+        assert "laptop, server" in err
 
     def test_cli_config_command_with_scratch_override_does_not_wipe_machines(
         self, coord_db, canonical_config_path, scratch_config_path
@@ -189,6 +206,81 @@ class TestThinClientStillNeverWrites:
         _load_config(canonical_config_path)
 
         assert _machine_names(coord_db) == []
+
+
+class TestTheNoteIsScopedToConsequentialSkips:
+    """The guard must be *silent* when the skip withheld nothing.
+
+    Regression gate for the first cut of this fix, which echoed the note on
+    every non-canonical ``--config`` and thereby broke 21 tests across this
+    suite — including every command that emits JSON, because Click's
+    ``CliRunner`` folds stderr into ``result.output``.
+    """
+
+    def test_no_note_when_the_machines_table_is_empty(
+        self, coord_db, canonical_config_path, scratch_config_path, capsys
+    ):
+        """A fresh host / CI runner has nothing to protect, so there is
+        nothing to say. This is the shape of ~110 CLI test modules here and
+        of every `coord ... --config` step in `.github/workflows/`."""
+        assert _machine_names(coord_db) == []
+
+        _load_config(scratch_config_path)
+
+        assert capsys.readouterr().err == ""
+
+    def test_no_note_when_the_override_names_the_same_fleet(
+        self, coord_db, canonical_config_path, tmp_path, capsys
+    ):
+        """The write would have been a no-op, so the skip cost nothing and
+        warrants no words."""
+        _save_config_snapshot(_real_fleet_config())
+
+        same_fleet = tmp_path / "copy-of-the-real-fleet.yml"
+        same_fleet.write_text(REAL_FLEET_YAML)
+
+        _load_config(same_fleet)
+
+        assert _machine_names(coord_db) == ["laptop", "server"]
+        assert capsys.readouterr().err == ""
+
+    def test_json_command_output_stays_parseable_under_an_override(
+        self, coord_db, canonical_config_path, scratch_config_path
+    ):
+        """The concrete breakage: `coord plans --json --config <tmpfile>`
+        must emit JSON and nothing else, even though `CliRunner` merges
+        stderr into `result.output`."""
+        import json
+        from unittest.mock import patch
+
+        with (
+            patch("coord.github_ops.get_repo_milestones", return_value=[]),
+            patch("coord.github_ops.get_open_issues", return_value=[]),
+            patch("coord.github_ops.get_closed_epics", return_value=[]),
+        ):
+            result = CliRunner().invoke(
+                main, ["plans", "--json", "--config", str(scratch_config_path)]
+            )
+
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output) == []
+
+    def test_a_db_failure_never_breaks_the_command(
+        self, canonical_config_path, scratch_config_path, monkeypatch, capsys
+    ):
+        """The note is advisory. If the DB cannot be read at all, the guard
+        still skips the write and the command still succeeds."""
+        import coord.db as dbmod
+
+        def _boom():
+            raise RuntimeError("no database here")
+
+        monkeypatch.setattr(dbmod, "get_connection", _boom)
+
+        cfg = _load_config(scratch_config_path)
+
+        assert [m.name for m in cfg.machines] == ["ci-runner"]
+        assert capsys.readouterr().err == ""
 
 
 class TestOverrideThenRepairRestoresRealFleet:
