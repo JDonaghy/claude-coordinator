@@ -981,10 +981,15 @@ def drive_queue_block_log(output_json: bool, days: float, config_path: Path) -> 
     how often did a human have to act?" is answered from two weeks of evidence
     rather than from one morning's triage.
 
-    Nothing here diagnoses. `cause` is derived from the release the queue
-    itself performed (a #2230 gate-clear, a #1891 CI resume, an operator's
-    `remove`), never from a live re-check — that is Phase 1, and its scope is
-    supposed to be decided BY this data, not assumed ahead of it.
+    This command itself does not diagnose — it renders what other passes
+    recorded. For a *resolved* episode, `cause` is still derived from the
+    release the queue itself performed (a #2230 gate-clear, a #1891 CI
+    resume, an operator's `remove`), never from a live re-check. For a
+    still-open episode, `cause` may instead be a Phase 1 (#2276) live
+    re-check's verdict — `coord drive-queue diagnose` or the notifier tick's
+    `diagnose_pass` recorded it as a `diagnosis` event, and `_episode_line`
+    renders it with a `(diagnosed, confidence ...)` tag so it reads distinct
+    from a resolution-derived cause.
 
     Read the two summary numbers together: `human_acted` is the count #2235
     wants to see fall, but a queue that stops needing interventions by leaving
@@ -1118,6 +1123,12 @@ def drive_queue_diagnose(output_json: bool, dry_run: bool, config_path: Path) ->
     dispatched worker: a diagnosis needs `gh`, and `gh` is denied to workers
     (#1483). The trigger in the daemon is #1632's own stall detector — there is
     deliberately no second definition of "stalled" anywhere in this path.
+
+    That notifier-tick trigger only fires when `notifications.enabled` is
+    true (`coord.notifier.service._tick` returns before `diagnose_pass` runs
+    otherwise) — notifications are off by default in this repo, so on a
+    fleet that has not turned them on, THIS command is the only live entry
+    point into Phase 1.
     """
     from coord import block_log, queue_diagnose  # noqa: PLC0415
     from coord.board_service import is_remote  # noqa: PLC0415
@@ -1136,6 +1147,8 @@ def drive_queue_diagnose(output_json: bool, dry_run: bool, config_path: Path) ->
             "thin client would diagnose an empty queue)."
         )
 
+    from coord.drive import list_drive_sessions  # noqa: PLC0415
+    from coord.health.aggregate import local_fleet_health_block  # noqa: PLC0415
     from coord.state import build_board, list_drive_queue  # noqa: PLC0415
 
     config = _load_config(config_path)
@@ -1143,7 +1156,27 @@ def drive_queue_diagnose(output_json: bool, dry_run: bool, config_path: Path) ->
         ep for ep in block_log.episodes(block_log.read_events()) if not ep.get("resolved")
     ]
     entries = entries_from_rows(list_drive_queue())
-    probe = queue_diagnose.GhLiveProbe(config=config, board=build_board())
+    # #2276 review: without these two, `GhLiveProbe._health()` short-circuits
+    # to `(None, None, [])` for every entry — `agent_reachable` and
+    # `agent_has_session` are permanently unknown, which makes `dead-leg` and
+    # `agent-unreachable` structurally unreachable verdicts from this command.
+    # Same local-DB read `coord status` uses in host mode (status.py's own
+    # `local_fleet_health_block` call) — no fresh /health round trip, just
+    # the last tick's reported state; and the same `list_drive_sessions()`
+    # this file already calls elsewhere (`_fetch_board_view`) for live tmux
+    # session names.
+    fleet_health = local_fleet_health_block([m.name for m in config.machines])
+    live_sessions = frozenset(
+        str(row["session_name"])
+        for row in list_drive_sessions()
+        if row.get("session_name")
+    )
+    probe = queue_diagnose.GhLiveProbe(
+        config=config,
+        board=build_board(),
+        fleet_health=fleet_health,
+        live_sessions=live_sessions,
+    )
     # `keys=None` — an operator asking directly wants every open episode
     # looked at, not just the ones the notifier happens to have raised this
     # minute. `limit=None` for the same reason, and because the per-pass cap

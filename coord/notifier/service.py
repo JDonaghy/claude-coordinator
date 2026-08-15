@@ -195,7 +195,8 @@ def diagnose_pass(
         # only some of those are drive-queue entries at all.  Nothing below
         # this line runs on a tick that raised events for work the queue does
         # not own — no log parse, no board build, no `gh`.
-        entries = [e for e in entries_from_rows(list_drive_queue()) if e.key in set(keys)]
+        wanted = set(keys)
+        entries = [e for e in entries_from_rows(list_drive_queue()) if e.key in wanted]
         if not entries:
             return []
         episodes = [

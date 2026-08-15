@@ -3080,3 +3080,47 @@ def test_diagnose_does_not_silently_cap_what_an_operator_asked_for(
     result = cli("diagnose")
     assert result.exit_code == 0, result.output
     assert f"{len(issues)} diagnosed" in result.output
+
+
+def test_diagnose_wires_fleet_health_and_live_sessions_into_the_probe(
+    cli, seed, block_log, gh_world, monkeypatch
+):
+    """#2276 review: the CLI entry point used to leave `fleet_health` and
+    `live_sessions` at their `None` defaults, which makes `GhLiveProbe._health()`
+    short-circuit to `(None, None, [])` for every entry — `dead-leg` and
+    `agent-unreachable` were structurally unreachable verdicts from here.
+
+    Assert the probe actually receives both, rather than trusting the
+    docstring's claim that it asks the agent's `/health`.
+    """
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    _stall(1762, "blocked: CI red, 2/2 attempts", block_log)
+
+    monkeypatch.setattr(
+        "coord.drive.list_drive_sessions",
+        lambda *a, **k: [
+            {
+                "repo": REPO,
+                "issue": 1762,
+                "session_name": "coord-drive-dellserver-1762",
+                "attached": True,
+            }
+        ],
+    )
+
+    from coord import queue_diagnose as qd
+
+    captured: dict = {}
+    real_cls = qd.GhLiveProbe
+
+    def spy(*a, **k):
+        captured.update(k)
+        return real_cls(*a, **k)
+
+    monkeypatch.setattr("coord.queue_diagnose.GhLiveProbe", spy)
+
+    result = cli("diagnose")
+    assert result.exit_code == 0, result.output
+    assert captured.get("fleet_health") is not None
+    assert captured.get("live_sessions") == frozenset({"coord-drive-dellserver-1762"})
