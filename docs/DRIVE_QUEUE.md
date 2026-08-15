@@ -632,12 +632,63 @@ Two things to know:
   the same machine with `--machine` are both eligible here and can still
   contend downstream. The per-repo counter says nothing about hosts.
 
-## 10. #1715
+## 10. The stall log — `coord drive-queue block-log` (#2235 Phase 0)
+
+Every time an entry moves **into** `blocked`/`parked`, or **out of** it, one
+JSON line is appended to `~/.coord/queue-block-log.jsonl`. `coord drive-queue
+block-log` reads it back as episodes.
+
+**Why it exists.** 2026-08-14's triage found seven stalled entries and, in
+*five* of them, the reason the queue stated named a symptom rather than the
+cause — "stale test verdict" for what was really a four-branch conflict, "CI
+red, 2/2 attempts" for a build that went green 23 minutes later. That single
+finding is what #2235's whole plan is built on, and it came from one morning
+of hand-querying live state. This log measures it continuously instead.
+
+```bash
+coord drive-queue block-log            # last 14 days, stated reason vs. cause
+coord drive-queue block-log --json     # same, machine-readable
+```
+
+Read the summary line as a **pair**:
+
+```
+3 stall(s) in 14d — 1 needed a human · 2 released themselves · 0 still stalled
+```
+
+`needed a human` is the number #2235 wants to see fall. `still stalled` is
+there because a queue that stops needing interventions by leaving everything
+blocked forever would otherwise look like success. `repeats` — the same repo
+stalling twice on the same stated reason — is the tripwire: *a repeat is a bug
+report, not a rescue.*
+
+**What it does NOT do, on purpose.**
+
+* **It does not diagnose.** No `gh` call, no gate re-derivation, nothing the
+  tick had not already fetched for its own reasons. The `cause` column is
+  derived from the release the queue itself performed (a #2230 gate-clear, a
+  #1891 CI resume, an operator's `remove`) — never from a second opinion. The
+  read-only diagnostician is Phase 1, and its scope is meant to be decided
+  *by* this data rather than assumed ahead of it.
+* **It does not change any decision.** Recording happens strictly after the
+  tick has applied its writes, in a file no decision path reads, through a
+  writer that swallows its own errors (`coord/block_log.py`). An unwritable
+  log costs the measurement and nothing else.
+* **It records "true cause" only when something reveals one.** An operator
+  `remove` logs `operator-intervened` and explicitly says what was actually
+  fixed is *not* recorded here. That honest gap is the point — a guessed
+  column would poison the dataset Phase 1 sizes itself from.
+
+**It is per-host**, because ticks are per-host. Reading two weeks off two
+machines is a `cat` of both files; the file rotates once past 4 MiB, keeping
+one `.1` generation.
+
+## 11. #1715
 
 See "Read this before queuing more than ~2 issues" above, at the top of this
 document.
 
-## 11. #1738
+## 12. #1738
 
 See the same section — it's the smaller, already-partially-fixed version of
 the same class of problem (a content-irrelevant base move staling a Test
