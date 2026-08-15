@@ -928,7 +928,26 @@ def _episode_line(item: Mapping[str, Any]) -> str:
     if len(stated) > 90:
         stated = stated[:87] + "..."
     if not item.get("resolved"):
-        return f"{key:<28} {state:<8} STILL STALLED  stated: {stated}"
+        line = f"{key:<28} {state:<8} STILL STALLED  stated: {stated}"
+        # #2276 Phase 1.  An open episode used to have nothing in the `cause`
+        # column at all — `summarize` bucketed it as `(unresolved)`. When the
+        # diagnostician has been round, it does, and the CONTRADICTS marker is
+        # what makes #2235's five-of-seven finding legible at a glance instead
+        # of requiring the reader to hold both strings in their head.
+        cause = " ".join(str(item.get("true_cause") or "").split())
+        if cause:
+            flag = (
+                "  ← CONTRADICTS the stated reason"
+                if item.get("diagnosis_contradicts_stated")
+                else ""
+            )
+            confidence = str(item.get("diagnosis_confidence") or "?")
+            line += (
+                f"\n{'':<28} {'':<8}               cause:  {cause}"
+                f"\n{'':<28} {'':<8}               "
+                f"(diagnosed, confidence {confidence}){flag}"
+            )
+        return line
     mark = "HUMAN" if item.get("human_acted") else "auto "
     held = item.get("stalled_seconds")
     age = _age_str(float(held)) if held is not None else "?"
@@ -1014,6 +1033,171 @@ def drive_queue_block_log(output_json: bool, days: float, config_path: Path) -> 
             stats["repeat_causes"].items(), key=lambda kv: (-kv[1], kv[0])
         ):
             click.echo(f"  {count}× {label}")
+    for line in _diagnosis_summary_lines(stats.get("diagnosis") or {}):
+        click.echo(line)
+
+
+def _diagnosis_summary_lines(diag: Mapping[str, Any]) -> list[str]:
+    """#2276's success criterion, rendered as a measurement.
+
+    The disagreement rate is printed as ``(not yet measurable)`` rather than
+    ``0%`` until something scorable has resolved, because #2276 is explicit
+    that the number must be *measured, not assumed* — and "0% wrong out of
+    nothing" is the most flattering way there is to assume it.
+    """
+    if not diag.get("diagnosed"):
+        return []
+    lines = [
+        f"diagnosed {diag['diagnosed']} stall(s) — "
+        f"{diag.get('contradicted_stated_reason', 0)} contradicted the stated reason"
+    ]
+    rate = diag.get("disagreement_rate")
+    scored = f"{diag.get('agreed', 0)} agreed · {diag.get('disagreed', 0)} disagreed"
+    tail = (
+        f"{rate * 100:.0f}% disagreement"
+        if rate is not None
+        else "disagreement rate: (not yet measurable — nothing scorable has resolved)"
+    )
+    lines.append(f"  vs. how they actually resolved: {scored} — {tail}")
+    lines.append(
+        f"  {diag.get('abstained', 0)} abstained (said unknown, which is not a "
+        f"failure) · {diag.get('undecided', 0)} unscorable"
+    )
+    return lines
+
+
+# ── diagnose (#2276 Phase 1) ─────────────────────────────────────────────────
+
+
+def _diagnosis_lines(diagnosis: Any) -> list[str]:
+    """One diagnosis, rendered.  ``stated`` and ``cause`` adjacent, as ever."""
+    flag = " ← CONTRADICTS the stated reason" if diagnosis.contradicts_stated else ""
+    trigger = f"  (triggered by: {diagnosis.trigger})" if diagnosis.trigger else ""
+    lines = [
+        f"{diagnosis.key} [{diagnosis.state}]{trigger}",
+        f"  stated: {' '.join((diagnosis.stated_reason or '(none)').split())}",
+        f"  cause:  {diagnosis.cause} (confidence {diagnosis.confidence}){flag}",
+    ]
+    if diagnosis.abstained:
+        lines.append(
+            "          unknown is a verdict, not a failure — the evidence "
+            "below was too thin to name a cause"
+        )
+    lines.append("  evidence:")
+    lines.extend(f"    - {line}" for line in diagnosis.evidence)
+    return lines
+
+
+@drive_queue_group.command("diagnose")
+@click.option("--json", "output_json", is_flag=True, default=False, help="Emit diagnoses as JSON.")
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Derive and print, but do not append the diagnosis to the block log.",
+)
+@_CONFIG_OPTION
+def drive_queue_diagnose(output_json: bool, dry_run: bool, config_path: Path) -> None:
+    """Re-derive the REAL blocker of every still-stalled entry (#2276 Phase 1).
+
+    Read-only. It runs no `coord merge`, dispatches nothing, and writes nothing
+    to the board or the queue — its single output is a `diagnosis` record in
+    the Phase-0 block log, which no decision path reads.
+
+    The queue's stated reason is an INPUT TO BE CONTRADICTED, never a starting
+    hypothesis: #2235 found that five of seven overnight stalls named a symptom
+    rather than a cause, so this asks GitHub, the live gate report and the
+    agent's /health what is actually true right now, and only then checks
+    whether the evidence still supports what the queue said.
+
+    `unknown` is a first-class verdict. Thin evidence gets an abstention, not a
+    guess — a confidently wrong cause is worse than no cause, because #2268's
+    Phase 2 would inherit the confidence.
+
+    It runs here, and in `coord serve`'s notifier tick, rather than as a
+    dispatched worker: a diagnosis needs `gh`, and `gh` is denied to workers
+    (#1483). The trigger in the daemon is #1632's own stall detector — there is
+    deliberately no second definition of "stalled" anywhere in this path.
+    """
+    from coord import block_log, queue_diagnose  # noqa: PLC0415
+    from coord.commands._common import _load_config  # noqa: PLC0415
+    from coord.state import build_board, list_drive_queue  # noqa: PLC0415
+
+    config = _load_config(config_path)
+    episodes = [
+        ep for ep in block_log.episodes(block_log.read_events()) if not ep.get("resolved")
+    ]
+    entries = entries_from_rows(list_drive_queue())
+    probe = queue_diagnose.GhLiveProbe(config=config, board=build_board())
+    # `keys=None` — an operator asking directly wants every open episode
+    # looked at, not just the ones the notifier happens to have raised this
+    # minute. The per-episode budget still applies, so this cannot become a
+    # way to spend `gh` calls in a loop.
+    diagnoses = queue_diagnose.run_pass(entries, episodes, probe=probe, keys=None)
+
+    if diagnoses and not dry_run:
+        _record_block_log(
+            [
+                block_log.diagnosis_event(
+                    key=d.key,
+                    state=d.state,
+                    stated_reason=d.stated_reason,
+                    true_cause=d.true_cause,
+                    cause=d.cause,
+                    confidence=d.confidence,
+                    evidence=d.evidence,
+                    contradicts_stated=d.contradicts_stated,
+                    trigger=d.trigger,
+                    host=_local_host_id(),
+                )
+                for d in diagnoses
+            ]
+        )
+
+    if output_json:
+        click.echo(
+            _json.dumps(
+                {
+                    "recorded": bool(diagnoses) and not dry_run,
+                    "diagnoses": [
+                        {
+                            "key": d.key,
+                            "state": d.state,
+                            "stated_reason": d.stated_reason,
+                            "cause": d.cause,
+                            "true_cause": d.true_cause,
+                            "confidence": d.confidence,
+                            "evidence": list(d.evidence),
+                            "contradicts_stated": d.contradicts_stated,
+                            "trigger": d.trigger,
+                        }
+                        for d in diagnoses
+                    ],
+                }
+            )
+        )
+        return
+
+    if not diagnoses:
+        click.echo(
+            "nothing to diagnose: no open stall episode is both unexplained and "
+            "still within its diagnosis budget"
+        )
+        return
+    for diagnosis in diagnoses:
+        for line in _diagnosis_lines(diagnosis):
+            click.echo(line)
+        click.echo("")
+    contradicted = sum(1 for d in diagnoses if d.contradicts_stated)
+    abstained = sum(1 for d in diagnoses if d.abstained)
+    click.echo(
+        f"{len(diagnoses)} diagnosed — {contradicted} contradicted the stated "
+        f"reason · {abstained} abstained (unknown)"
+    )
+    click.echo(
+        "nothing was mutated; read the outcome later with "
+        "`coord drive-queue block-log`"
+    )
 
 
 # ── overlap-report (#2247) ───────────────────────────────────────────────────

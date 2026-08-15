@@ -16,12 +16,24 @@ So this module records, for every entry that reaches ``blocked`` or
   Phase-0 read on its *true* cause — and
 * whether a **human had to act** to get it out.
 
-**What this is emphatically NOT.**  It does not diagnose.  It runs no ``gh``
-call, re-derives no gate, and consults no live state that the tick has not
-already fetched for its own purposes.  Phase 1's read-only diagnostician is a
-separate, later thing whose scope this log exists to *decide*; building it now
-would be guessing at failure modes that #2230/#2229/#2231/#2234 have just
-stopped producing.
+**What the RECORDER is emphatically NOT.**  The writer above does not
+diagnose.  It runs no ``gh`` call, re-derives no gate, and consults no live
+state that the tick has not already fetched for its own purposes.
+
+**Phase 1 (#2276) fills the column Phase 0 cannot.**  ``true_cause`` is empty
+on every ``enter`` record — at that instant nobody knows it — and on ``exit``
+it is derived from *the release the queue itself performed*, which is still
+the queue talking about itself.  #2235's finding is that the queue is wrong
+about this five times out of seven.  So :mod:`coord.queue_diagnose` re-derives
+the cause from live state and appends a third record shape here,
+:data:`EVENT_DIAGNOSIS`, which :func:`episodes` folds onto the open episode as
+its ``true_cause``.  That module owns the *deriving*; this one owns the
+*record*, the pairing, and the honesty accounting — how often the derived
+cause later agreed with how the episode actually resolved
+(:func:`agreement_for`), reported as a rate rather than assumed
+(:func:`summarize`).  A diagnostician that is confidently wrong is worse than
+one that abstains, which is why ``unknown`` is counted separately from
+``disagreed`` and never folded into it.
 
 **Recording must never change a decision.**  Every public entry point here is
 best-effort and swallows its own exceptions (:func:`record`), for the same
@@ -65,10 +77,17 @@ from coord.drive_queue import (
 _log = logging.getLogger(__name__)
 
 __all__ = [
+    "AGREEMENT_ABSTAINED",
+    "AGREEMENT_AGREED",
+    "AGREEMENT_DISAGREED",
+    "AGREEMENT_UNDECIDED",
+    "EVENT_DIAGNOSIS",
     "EVENT_ENTER",
     "EVENT_RESOLVE",
     "STALL_STATES",
+    "agreement_for",
     "block_log_path",
+    "diagnosis_event",
     "enter_event",
     "episodes",
     "operator_resolution_event",
@@ -86,6 +105,13 @@ STALL_STATES: frozenset[str] = frozenset({STATE_BLOCKED, STATE_PARKED})
 
 EVENT_ENTER = "enter"
 EVENT_RESOLVE = "resolve"
+#: #2276 Phase 1.  A read-only re-derivation of an OPEN episode's cause, from
+#: live state rather than from the queue's own stated reason.  Appended to the
+#: same file rather than a new store for the same reason `enter`/`resolve` are
+#: two records and not one mutated row: the writer stays an O(1) append with
+#: no read-modify-write race, and a later diagnosis that contradicts an earlier
+#: one stays visible instead of overwriting it.
+EVENT_DIAGNOSIS = "diagnosis"
 
 # Rotate at 4 MiB — comfortably more than two weeks at this fleet's rate
 # (single-digit stalls a night, ~400 bytes a record), and small enough that
@@ -444,6 +470,109 @@ def operator_resolution_event(
     return record
 
 
+# ── #2276 Phase 1: the diagnosis record, and scoring it ──────────────────────
+
+
+def diagnosis_event(
+    *,
+    key: str,
+    state: str,
+    stated_reason: str,
+    true_cause: str,
+    cause: str,
+    confidence: str,
+    evidence: Sequence[str] = (),
+    contradicts_stated: bool = False,
+    trigger: str = "",
+    host: str = "",
+    now: float | None = None,
+) -> dict[str, Any]:
+    """A ``diagnosis`` record for one still-open stall.
+
+    Deliberately NOT a ``resolve``: the entry is still stalled, and a record
+    that closed the episode would make an observation look like an outcome —
+    which is the exact conflation (*a stated reason read as a cause*) this
+    whole plan exists to undo.  :func:`episodes` folds it onto the open
+    episode instead, so ``coord drive-queue block-log`` shows a populated
+    ``true_cause`` where it previously showed ``(unresolved)`` while the
+    episode itself stays open.
+
+    ``human_acted`` is absent on purpose rather than ``False``: Phase 1 acts on
+    nothing and knows nothing about what a human did, and a ``False`` here
+    would be counted by :func:`summarize` as an auto-release that never
+    happened.
+
+    Every argument is a plain scalar so this module needs no import from
+    :mod:`coord.queue_diagnose` — the recorder must not depend on the thing it
+    records.
+    """
+    return {
+        "event": EVENT_DIAGNOSIS,
+        "ts": time.time() if now is None else now,
+        "key": key,
+        "state": state,
+        # VERBATIM, same contract as `_enter_record`: the comparison between
+        # this and `true_cause` below IS the deliverable.
+        "stated_reason": stated_reason,
+        "true_cause": true_cause,
+        "cause": cause,
+        "confidence": confidence,
+        "evidence": [str(line) for line in evidence],
+        "contradicts_stated": bool(contradicts_stated),
+        "trigger": trigger,
+        "host": host,
+        "source": "diagnostician",
+    }
+
+
+AGREEMENT_AGREED = "agreed"
+AGREEMENT_DISAGREED = "disagreed"
+#: The diagnosis said ``unknown``.  A first-class verdict with NO penalty:
+#: #2276 is explicit that a diagnostician which abstains is better than one
+#: that guesses, so this is counted apart from `disagreed` and kept out of the
+#: disagreement rate's denominator entirely.
+AGREEMENT_ABSTAINED = "abstained"
+#: The RESOLUTION is the unknown one.  `operator-intervened` says in as many
+#: words that what the human fixed is not recorded, so scoring a diagnosis
+#: against it would be scoring it against noise.
+AGREEMENT_UNDECIDED = "undecided"
+
+#: ``resolve``-side cause slug -> the diagnosis causes that agree with it.
+#: Keyed on the slug before the first " — ", the same split
+#: :func:`summarize` buckets on.  A resolution absent from this table is
+#: undecidable, not a disagreement — see :data:`AGREEMENT_UNDECIDED`.
+_AGREEING_CAUSES: dict[str, frozenset[str]] = {
+    "already-landed": frozenset({"pr-merged", "pr-closed"}),
+    "gate-cleared-after-giveup": frozenset(
+        {"nothing-blocking", "ci-green", "ci-pending"}
+    ),
+    "ci-reported": frozenset({"nothing-blocking", "ci-green", "ci-pending"}),
+    "unrefreshable-reading": frozenset({"nothing-blocking", "ci-green", "no-pr"}),
+}
+
+
+def agreement_for(diagnosed_cause: str, resolution_cause: str) -> str:
+    """Did Phase 1's derived cause match how the episode actually ended?
+
+    #2235's stated route to Phase 2 is *"run it read-only and check whether
+    its diagnosis matches what the human actually did"*, so this comparison
+    is a deliverable, not a follow-up.  It is deliberately conservative in
+    both directions: an unrecognised resolution scores ``undecided`` rather
+    than being counted as a win, and an ``unknown`` diagnosis scores
+    ``abstained`` rather than being counted as a loss.
+    """
+    diagnosed = str(diagnosed_cause or "").split(" — ")[0]
+    resolved = str(resolution_cause or "").split(" — ")[0]
+    if not diagnosed:
+        return ""
+    if diagnosed == "unknown":
+        return AGREEMENT_ABSTAINED
+    agreeing = _AGREEING_CAUSES.get(resolved)
+    if agreeing is None:
+        return AGREEMENT_UNDECIDED
+    return AGREEMENT_AGREED if diagnosed in agreeing else AGREEMENT_DISAGREED
+
+
 # ── persistence (best-effort, never raises) ──────────────────────────────────
 
 
@@ -543,6 +672,17 @@ def episodes(events: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     A ``resolve`` with no preceding ``enter`` (the log started mid-stall) is
     dropped rather than synthesised: an episode whose stated reason is
     unknown cannot answer the one question this log exists to answer.
+
+    A ``diagnosis`` (#2276 Phase 1) folds onto the open episode: it fills
+    ``true_cause`` — the column Phase 0 leaves empty and ``summarize`` buckets
+    as ``(unresolved)`` — without closing the episode, because the entry is
+    still stalled.  A diagnosis for a key with no open episode is dropped for
+    the same reason an orphan ``resolve`` is: there is nothing to attach it
+    to, and inventing the episode would fabricate a stated reason to compare
+    against.  Once the episode resolves, ``true_cause`` reverts to the
+    resolution's own account of what happened and the derived one is kept
+    beside it as ``diagnosed_cause``, so ``agreement`` scores two independent
+    claims rather than one claim against itself.
     """
     open_by_key: dict[str, dict[str, Any]] = {}
     out: list[dict[str, Any]] = []
@@ -571,21 +711,54 @@ def episodes(events: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
                 "human_acted": None,
                 "resolved_at": None,
                 "stalled_seconds": None,
+                # #2276 Phase 1.  `diagnoses` is what `needs_diagnosis` spends
+                # against the attempt budget, so it has to survive a restart —
+                # which it does, being recounted from the log every read
+                # rather than held in memory.
+                "diagnoses": 0,
+                "diagnosed_cause": "",
+                "diagnosis_confidence": "",
+                "diagnosis_evidence": [],
+                "diagnosis_contradicts_stated": False,
+                "agreement": "",
             }
+        elif kind == EVENT_DIAGNOSIS:
+            episode = open_by_key.get(key)
+            if episode is None:
+                continue
+            cause = str(event.get("cause") or "")
+            episode.update(
+                {
+                    "diagnoses": int(episode.get("diagnoses") or 0) + 1,
+                    "diagnosed_cause": cause,
+                    "diagnosis_confidence": str(event.get("confidence") or ""),
+                    "diagnosis_evidence": list(event.get("evidence") or []),
+                    "diagnosis_contradicts_stated": bool(
+                        event.get("contradicts_stated")
+                    ),
+                    # The whole point of the column: an OPEN episode now has a
+                    # cause where it used to have "".
+                    "true_cause": str(event.get("true_cause") or ""),
+                }
+            )
         elif kind == EVENT_RESOLVE:
             episode = open_by_key.pop(key, None)
             if episode is None:
                 continue
             resolved_at = float(event.get("ts") or 0.0)
+            resolution_cause = str(event.get("true_cause") or "")
             episode.update(
                 {
                     "resolved": True,
                     "resolution": event.get("resolution", ""),
-                    "true_cause": event.get("true_cause", ""),
+                    "true_cause": resolution_cause,
                     "human_acted": bool(event.get("human_acted")),
                     "resolved_at": resolved_at,
                     "stalled_seconds": max(0.0, resolved_at - episode["entered_at"]),
                     "source": event.get("source", ""),
+                    "agreement": agreement_for(
+                        str(episode.get("diagnosed_cause") or ""), resolution_cause
+                    ),
                 }
             )
             out.append(episode)
@@ -608,6 +781,17 @@ def summarize(items: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     than once.  The issue's framing — *a repeat is a bug report, not a
     success* — needs that count visible from day one, or the trend line has
     nothing to be checked against.
+
+    ``diagnosis`` is #2276's own success criterion, and it is reported as a
+    measurement rather than an assertion.  ``disagreement_rate`` is
+    ``disagreed / (agreed + disagreed)`` and is ``None`` — not ``0.0`` — when
+    nothing scorable has resolved yet, because a rate of zero out of zero
+    reads as a perfect record.  ``abstained`` sits outside that fraction
+    entirely: #2276 makes ``unknown`` a first-class verdict with no penalty,
+    and putting it in the denominator would penalise it.  ``contradicted``
+    counts the episodes where the live evidence positively ruled the queue's
+    stated reason out — the five-of-seven number, finally measured instead of
+    reconstructed by hand.
     """
     by_state: dict[str, int] = {}
     by_cause: dict[str, int] = {}
@@ -615,7 +799,17 @@ def summarize(items: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     human = 0
     auto = 0
     still_open = 0
+    diagnosed = 0
+    contradicted = 0
+    agreement_counts: dict[str, int] = {}
     for item in items:
+        if item.get("diagnosed_cause"):
+            diagnosed += 1
+            if item.get("diagnosis_contradicts_stated"):
+                contradicted += 1
+            verdict = str(item.get("agreement") or "")
+            if verdict:
+                agreement_counts[verdict] = agreement_counts.get(verdict, 0) + 1
         state = str(item.get("state") or "?")
         by_state[state] = by_state.get(state, 0) + 1
         if not item.get("resolved"):
@@ -639,6 +833,9 @@ def summarize(items: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         for (repo, stated), count in sorted(seen_pairs.items())
         if count > 1
     }
+    agreed = agreement_counts.get(AGREEMENT_AGREED, 0)
+    disagreed = agreement_counts.get(AGREEMENT_DISAGREED, 0)
+    scored = agreed + disagreed
     return {
         "episodes": len(items),
         "by_state": by_state,
@@ -647,4 +844,13 @@ def summarize(items: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "auto_released": auto,
         "open": still_open,
         "repeat_causes": repeats,
+        "diagnosis": {
+            "diagnosed": diagnosed,
+            "contradicted_stated_reason": contradicted,
+            "agreed": agreed,
+            "disagreed": disagreed,
+            "abstained": agreement_counts.get(AGREEMENT_ABSTAINED, 0),
+            "undecided": agreement_counts.get(AGREEMENT_UNDECIDED, 0),
+            "disagreement_rate": (disagreed / scored) if scored else None,
+        },
     }
