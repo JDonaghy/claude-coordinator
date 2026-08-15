@@ -1804,10 +1804,15 @@ def queue_outcomes_chart(
             title="Outcomes per period",
             y_label="Entries",
         )
+    # `x` and `group_by` are deliberately the same column. A terminal chart
+    # has a legend but no per-tick category text, so the legend is the only
+    # place a bucket NAME can appear — grouping on the axis column is what
+    # puts "succeeded / auto_resolved_* / human / open" on screen next to its
+    # own colour, instead of five anonymous bars.
     return ChartSpec(
         kind="bar",
         series=(ChartSeries(label="Entries", column="count"),),
-        x="category",
+        x="bucket",
         group_by="bucket",
         stacked=True,
         title="Outcomes by bucket",

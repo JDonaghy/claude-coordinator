@@ -3326,7 +3326,7 @@ class TestChartDeclaration:
 
 
 class TestQueueOutcomesChart:
-    def test_24h_declares_a_stacked_bar_over_categories(self) -> None:
+    def test_24h_declares_a_stacked_bar_over_buckets(self) -> None:
         result = fold_queue_outcomes(
             _qo_fixture(), (QO_END - QO_DAY, QO_END), merged=[]
         )
@@ -3334,7 +3334,10 @@ class TestQueueOutcomesChart:
         assert chart is not None
         assert chart.kind == "bar"
         assert chart.stacked is True
-        assert chart.x == "category"
+        # Same column twice, on purpose: a terminal chart has no per-tick
+        # category text, so grouping on the axis column is what puts the
+        # bucket names in the legend instead of five anonymous bars.
+        assert chart.x == "bucket"
         assert chart.group_by == "bucket"
         assert [s.column for s in chart.series] == ["count"]
 
