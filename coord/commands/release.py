@@ -694,11 +694,25 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
     )
     current = rp.hosts_already_current(_lane_versions_by_host(before), record.target_version)
 
+    # #2176: resolved here, ahead of cordoning, so the cordon plan can honour
+    # the same daemon-leads invariant the roll itself is bound by (see below).
+    # Purely a derivation from data already in hand (`machine_health`) — this
+    # does not move the "unorderable fleet" REFUSAL, which stays below the
+    # deferral branch on purpose (see its own comment).
+    daemon_name = _daemon_machine_name(config, daemon_host_override, machine_health)
+
     # ── 3b. cordon the hosts that are behind, so they DRAIN (#2101) ──────
     #
     # Before the deferral return below, on purpose: cordoning is the thing
     # that turns "no window" into "a window in a few minutes". A run that
     # defers without cordoning has changed nothing about why it deferred.
+    #
+    # #2176: a non-daemon host with no busy signal of its own is exempted
+    # while the daemon host is itself busy and behind — see `plan_cordons`'s
+    # `daemon_host` handling. It cannot roll ahead of a busy daemon host
+    # regardless of its own drain state (the daemon-leads invariant below),
+    # so cordoning it protects nothing and just spends fleet capacity for an
+    # unbounded wait.
     record.cordons = _apply_cordons(
         hosts=hosts,
         report=before,
@@ -712,6 +726,7 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
         state_dir=state_dir,
         max_deferrals=cordon_max_deferrals,
         release_cooldown=cordon_cooldown,
+        daemon_host=daemon_name,
     )
 
     if fully_busy and not force:
@@ -722,12 +737,12 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
         # meets a fleet that is actually draining.
         _finish(rp.STATUS_DEFERRED, 0)
 
-    # #2101: resolved AFTER the deferral above, deliberately. This refusal is
-    # about the ORDER a roll happens in; a run that is going to roll nothing
-    # has no order to get wrong, and turning "the fleet is busy" into a
-    # `failed` record (exit 1, systemd marks the unit failed) would teach an
-    # operator to ignore the one signal that matters.
-    daemon_name = _daemon_machine_name(config, daemon_host_override, machine_health)
+    # #2101: this refusal is checked AFTER the deferral above, deliberately.
+    # This refusal is about the ORDER a roll happens in; a run that is going
+    # to roll nothing has no order to get wrong, and turning "the fleet is
+    # busy" into a `failed` record (exit 1, systemd marks the unit failed)
+    # would teach an operator to ignore the one signal that matters.
+    # (`daemon_name` itself was resolved earlier, before cordoning — #2176.)
     if daemon_name is None and len(hosts) > 1:
         # #2052 fault 2: this used to warn and roll in coordinator.yml order.
         # It then briefly put the daemon host BEHIND both its callers during a
@@ -1082,6 +1097,7 @@ def _apply_cordons(  # noqa: PLR0912 — one linear apply-the-plan pass
     state_dir: Path | None = None,
     max_deferrals: int | None = None,
     release_cooldown: float | None = None,
+    daemon_host: str | None = None,
 ) -> dict:
     """Plan and apply this run's cordons. Returns the journal fragment.
 
@@ -1089,6 +1105,13 @@ def _apply_cordons(  # noqa: PLR0912 — one linear apply-the-plan pass
     error and the roll continues on its existing (quiescence-based) rules.
     Failing the whole propagation because the cordon could not be renewed
     would make #2101's fix strictly worse than not having it.
+
+    *daemon_host* (#2176) lets :func:`~coord.release_cordon.plan_cordons`
+    exempt a non-daemon host with no busy signal of its own from cordoning
+    while the daemon host is itself busy and behind — see that function's
+    docstring for the reasoning. ``None`` (an unorderable fleet) disables
+    the exemption and falls back to cordoning every behind host, same as
+    before #2176.
 
     #2240: *state_dir* is where the propagation journal lives, and the journal
     is where "how many runs in a row has this cordon now deferred?" is stored
@@ -1162,10 +1185,13 @@ def _apply_cordons(  # noqa: PLR0912 — one linear apply-the-plan pass
             if release_cooldown is None
             else release_cooldown
         ),
+        daemon_host=daemon_host,
     )
     for line in plan.render():
         click.echo(line)
     outcome.cooling_seconds = plan.cooling_seconds
+    outcome.collateral_spared = list(plan.collateral_spared)
+    outcome.blocked_behind = plan.blocked_behind
     if plan.released is not None:
         outcome.released = plan.released.to_dict()
         # stderr as well as stdout: on the timer host this line IS the

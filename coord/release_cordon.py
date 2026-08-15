@@ -142,6 +142,35 @@ and #2082 is the cost of tolerating that. The threshold is a knob
 (``coord release propagate --cordon-after N``) precisely so a future cadence
 change does not need a code change. Trap F.
 
+CORDON-EVERY-BEHIND-HOST DOES NOT COVER A HOST THAT CANNOT ROLL EITHER WAY
+----------------------------------------------------------------------------
+Observed 2026-08-13 00:18 UTC: one busy signal, on dellserver, and the fleet
+cordoned all three machines anyway. elitebook and precision reported
+``online • idle`` throughout and stayed cordoned — launch-blocked — for
+34+ minutes, unable to accept the very review dispatch #2240 needed.
+
+The cordon-every-behind-host rule above is correct for a host whose OWN
+draining is what a run is waiting on: skip it and it never drains, and a run
+that defers without cordoning defers again in 20 minutes for the same
+reason. It does not cover a host that has no busy signal against it AND is
+blocked from rolling by the daemon-leads invariant (see
+:mod:`coord.release_propagate`'s LANE ORDER section) rather than by its own
+work — nothing may roll ahead of a busy daemon host, so such a host cannot
+roll regardless of how drained it gets. Cordoning it protects nothing: its
+drained state cannot be consumed until the daemon host rolls first, which
+may be unbounded (any drive on the daemon host reproduces this, not just a
+wedged one).
+
+:func:`plan_cordons`'s *daemon_host* parameter is the fix: while the daemon
+host is itself busy and behind, only it (and any host with its own busy
+signal) is cordoned. Everyone else stays uncordoned and dispatchable —
+released immediately if a previous run already cordoned them — until the
+daemon host becomes rollable, at which point ordinary drain-everyone-behind
+resumes. :attr:`CordonPlan.collateral_spared` /
+:attr:`CordonPlan.blocked_behind` name exactly who was spared and why, so
+the next puzzle like this one is one line of output, not a 40-minute read of
+`/board`.
+
 PURITY
 ------
 Nothing here reads the clock, the filesystem, the network or the DB — same
@@ -618,6 +647,17 @@ class CordonPlan:
     #: recorded rather than silent, because "no cordons planned" and "cordons
     #: suppressed on purpose" are the same output otherwise.
     cooling_seconds: float = 0.0
+    #: #2176: behind hosts this run deliberately did NOT cordon (and, if
+    #: already cordoned, released) because they have no busy signal of their
+    #: own and cannot roll ahead of `blocked_behind` anyway. Reported
+    #: separately from `uncordon` (which is "proven current") so the journal
+    #: and CLI output can name them as collateral rather than as a drain that
+    #: completed.
+    collateral_spared: tuple[str, ...] = ()
+    #: #2176: the daemon host these hosts are spared on account of — set
+    #: exactly when `collateral_spared` is non-empty. The single fact that
+    #: would have turned a 40-minute puzzle into one line of output.
+    blocked_behind: str | None = None
 
     @property
     def empty(self) -> bool:
@@ -627,6 +667,7 @@ class CordonPlan:
             or self.escalations
             or self.expired
             or self.released
+            or self.collateral_spared
         )
 
     def to_dict(self) -> dict:
@@ -638,6 +679,8 @@ class CordonPlan:
             "unknown": list(self.unknown),
             "released": self.released.to_dict() if self.released else None,
             "cooling_seconds": self.cooling_seconds,
+            "collateral_spared": list(self.collateral_spared),
+            "blocked_behind": self.blocked_behind,
         }
 
     def render(self) -> list[str]:
@@ -645,6 +688,14 @@ class CordonPlan:
         lines: list[str] = []
         for item in self.cordon:
             lines.append(f"  ⊘ cordon {item.machine}: {item.describe()}")
+        if self.collateral_spared:
+            lines.append(
+                "  · "
+                + ", ".join(sorted(self.collateral_spared))
+                + f": left uncordoned — blocked behind daemon host "
+                f"{self.blocked_behind} either way, cordoning would not help "
+                "(#2176)"
+            )
         for name in self.uncordon:
             lines.append(f"  ✓ uncordon {name}: up to date, work may resume")
         for name in self.expired:
@@ -748,12 +799,15 @@ def plan_cordons(
     pressure: DeferralPressure | None = None,
     max_deferrals: int = DEFAULT_MAX_DEFERRALS,
     release_cooldown: float = DEFAULT_RELEASE_COOLDOWN_SECONDS,
+    daemon_host: str | None = None,
 ) -> CordonPlan:
     """Decide this run's cordon writes. Pure.
 
     *existing* is the store as read (expired records included — this function
     is what notices they lapsed). *busy_reasons* maps a host to why it is not
-    yet drained, purely so an escalation can say what is holding it.
+    yet drained, purely so an escalation can say what is holding it — and
+    (#2176) so this function can tell a genuinely busy host from an idle one
+    when deciding who is collateral.
 
     ``enabled=False`` (``coord release propagate --no-cordon``) plans no new
     cordons but STILL clears the ones this owner already set: turning the
@@ -772,6 +826,21 @@ def plan_cordons(
     Proven-current hosts are uncordoned in every one of these branches: that
     is never the wrong move, and skipping it during a cooldown would leave a
     rolled host cordoned for the length of the cooldown.
+
+    *daemon_host* (#2176) is the machine `coord release propagate` will roll
+    first (see `coord.release_propagate`'s LANE ORDER section) — the
+    daemon-leads invariant means no OTHER host's python lane may roll ahead
+    of it while it is itself busy and behind. A behind host with no busy
+    signal of its own is therefore collateral, not protected, by a cordon
+    while that holds: it cannot roll either way, so draining it buys nothing
+    and just spends fleet capacity for a wait that is unbounded from its own
+    perspective (#2067 made quiescence per-host; this closes the cordon's
+    matching gap). Such a host is left uncordoned — and released immediately
+    if a previous run already cordoned it — until the daemon host is
+    rollable (quiescent, or already on the target), at which point ordinary
+    drain-everyone-behind resumes exactly as before #2176. A host that is
+    itself busy is cordoned regardless: its own drain is still the thing
+    being waited on, whatever the daemon host is doing.
     """
     records = _as_records(existing)
     live = {name: c for name, c in records.items() if c.active(now)}
@@ -782,11 +851,30 @@ def plan_cordons(
     if not enabled:
         return CordonPlan(uncordon=tuple(sorted(live)), expired=expired)
 
-    # Uncordon: PROVEN current, and nothing else. A host whose version could
-    # not be read keeps whatever cordon it has until that cordon EXPIRES —
-    # clearing on "we couldn't read the version" would open the fleet up
-    # mid-roll on the strength of one failed HTTP call.
-    to_uncordon = tuple(sorted(name for name in live if name in drift.current))
+    # ── #2176: who is collateral to a busy, behind daemon host ────────────
+    daemon_blocked = bool(
+        daemon_host
+        and (busy_reasons or {}).get(daemon_host)
+        and daemon_host not in drift.current
+    )
+    collateral = frozenset(
+        host
+        for host in drift.behind
+        if daemon_blocked and host != daemon_host and not (busy_reasons or {}).get(host)
+    )
+    blocked_behind = daemon_host if collateral else None
+
+    # Uncordon: PROVEN current, plus (#2176) any collateral host a previous
+    # run already cordoned — "spared" means dispatchable now, not "merely not
+    # renewed". A host whose version could not be read otherwise keeps
+    # whatever cordon it has until that cordon EXPIRES — clearing on "we
+    # couldn't read the version" would open the fleet up mid-roll on the
+    # strength of one failed HTTP call.
+    to_uncordon = tuple(
+        sorted(
+            {name for name in live if name in drift.current} | (collateral & set(live))
+        )
+    )
 
     # ── #2240: the deadlock bound ────────────────────────────────────────
     pressure = pressure or DeferralPressure()
@@ -797,6 +885,8 @@ def plan_cordons(
             expired=expired,
             cooling_seconds=cooling,
             unknown=tuple(sorted(drift.undecided & set(live))),
+            collateral_spared=tuple(sorted(collateral)),
+            blocked_behind=blocked_behind,
         )
     if max_deferrals > 0 and pressure.consecutive >= max_deferrals:
         return CordonPlan(
@@ -809,11 +899,13 @@ def plan_cordons(
                 cooldown_seconds=release_cooldown,
                 target_version=target_version,
             ),
+            collateral_spared=tuple(sorted(collateral)),
+            blocked_behind=blocked_behind,
         )
 
     to_cordon: list[Cordon] = []
     escalations: list[DrainEscalation] = []
-    for host in sorted(drift.behind):
+    for host in sorted(drift.behind - collateral):
         previous = live.get(host)
         created = previous.created_at if previous and previous.created_at else now
         to_cordon.append(
@@ -844,6 +936,8 @@ def plan_cordons(
         escalations=tuple(escalations),
         expired=expired,
         unknown=tuple(sorted(drift.undecided & set(live))),
+        collateral_spared=tuple(sorted(collateral)),
+        blocked_behind=blocked_behind,
     )
 
 
@@ -883,6 +977,13 @@ class CordonOutcome:
     #: out of the newest record instead of every caller of
     #: :func:`describe_deferral_pressure` assuming the default.
     max_deferrals: int = DEFAULT_MAX_DEFERRALS
+    #: #2176: behind hosts this run spared (or actively released) because
+    #: they have no busy signal of their own and cannot roll ahead of a busy,
+    #: behind daemon host anyway. Mirrors `CordonPlan.collateral_spared`.
+    collateral_spared: list[str] = field(default_factory=list)
+    #: #2176: the daemon host `collateral_spared` was spared on account of.
+    #: Mirrors `CordonPlan.blocked_behind`.
+    blocked_behind: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -896,4 +997,6 @@ class CordonOutcome:
             "cooling_seconds": self.cooling_seconds,
             "pressure": dict(self.pressure),
             "max_deferrals": self.max_deferrals,
+            "collateral_spared": list(self.collateral_spared),
+            "blocked_behind": self.blocked_behind,
         }
