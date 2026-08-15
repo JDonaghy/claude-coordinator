@@ -1818,6 +1818,47 @@ class TestRerunWorkflowRun:
             assert github_ops.rerun_workflow_run("acme/api", "12345") is False
 
 
+class TestRerunWorkflowRunFailed:
+    """#2252: the single gh sink for coord.ci_github.GitHubCi.
+    rerun_failed_for_pr — the narrower ``--failed`` sibling of
+    ``rerun_workflow_run`` above."""
+
+    def test_success_returns_true_and_passes_failed_flag(self) -> None:
+        class _FakeResult:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        with patch(
+            "coord.github_ops.subprocess.run", return_value=_FakeResult()
+        ) as mock_run:
+            assert github_ops.rerun_workflow_run_failed("acme/api", "12345") is True
+        args = mock_run.call_args.args[0]
+        assert args == [
+            "gh", "run", "rerun", "12345", "--repo", "acme/api", "--failed",
+        ]
+
+    def test_nonzero_exit_returns_false(self) -> None:
+        class _FakeResult:
+            returncode = 1
+            stdout = ""
+            stderr = "run already in progress"
+
+        with patch("coord.github_ops.subprocess.run", return_value=_FakeResult()):
+            assert github_ops.rerun_workflow_run_failed("acme/api", "12345") is False
+
+    def test_gh_missing_returns_false(self) -> None:
+        with patch("coord.github_ops.subprocess.run", side_effect=FileNotFoundError):
+            assert github_ops.rerun_workflow_run_failed("acme/api", "12345") is False
+
+    def test_gh_timeout_returns_false(self) -> None:
+        with patch(
+            "coord.github_ops.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="gh", timeout=30),
+        ):
+            assert github_ops.rerun_workflow_run_failed("acme/api", "12345") is False
+
+
 class TestGetBranchCommitTimestamp:
     """#1851: the base-side half of the CI-staleness comparison."""
 

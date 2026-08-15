@@ -590,6 +590,87 @@ class TestMergeQueueCiStaleRerunsColumn:
         conn.close()
 
 
+# ── merge_queue.ci_flaky_reruns / ci_flaky_pending columns (#2252) ──────────
+
+# Same pre-migration shape as _PRE_2197_MERGE_QUEUE_TABLE, plus the #2197
+# column — exercises the #2252 migration landing on a DB that already
+# picked up ci_infra_reruns/ci_stale_reruns but predates ci_flaky_reruns/
+# ci_flaky_pending.
+_PRE_2252_MERGE_QUEUE_TABLE = """
+    CREATE TABLE merge_queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        assignment_id TEXT NOT NULL,
+        repo_name TEXT NOT NULL,
+        repo_github TEXT NOT NULL,
+        branch TEXT NOT NULL,
+        target_branch TEXT NOT NULL,
+        issue_number INTEGER NOT NULL,
+        issue_title TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'pending',
+        pr_number INTEGER,
+        pr_url TEXT,
+        size INTEGER,
+        last_attempt REAL,
+        error TEXT,
+        enqueued_at REAL,
+        assignment_type TEXT DEFAULT 'work',
+        required_gates TEXT,
+        ci_infra_reruns INTEGER NOT NULL DEFAULT 0,
+        ci_stale_reruns INTEGER NOT NULL DEFAULT 0
+    )
+"""
+
+
+class TestMergeQueueCiFlakyRerunsColumn:
+    def test_fresh_database_has_it_from_the_create(
+        self, isolated_conn: sqlite3.Connection
+    ) -> None:
+        assert "ci_flaky_reruns" in _merge_queue_columns(isolated_conn)
+        assert "ci_flaky_pending" in _merge_queue_columns(isolated_conn)
+
+    def test_existing_database_gains_it_in_place(self) -> None:
+        """The real path: a coord.db created before #2252 (but after
+        #2197), upgraded by _ensure_schema."""
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(_PRE_2252_MERGE_QUEUE_TABLE)
+        conn.execute(
+            "INSERT INTO merge_queue "
+            "(assignment_id, repo_name, repo_github, branch, target_branch, "
+            "issue_number, issue_title) "
+            "VALUES ('w1', 'api', 'acme/api', 'b', 'main', 7, 't')"
+        )
+        conn.commit()
+        assert "ci_flaky_reruns" not in _merge_queue_columns(conn)
+        assert "ci_flaky_pending" not in _merge_queue_columns(conn)
+
+        _ensure_schema(conn)
+
+        assert "ci_flaky_reruns" in _merge_queue_columns(conn)
+        assert "ci_flaky_pending" in _merge_queue_columns(conn)
+        # A pre-existing row survives and reads as "no flake re-run ever
+        # spent/pending" — the same defaults a freshly-enqueued entry gets.
+        row = conn.execute(
+            "SELECT ci_flaky_reruns, ci_flaky_pending FROM merge_queue "
+            "WHERE issue_number = 7"
+        ).fetchone()
+        assert row["ci_flaky_reruns"] == 0
+        assert row["ci_flaky_pending"] == ""
+        conn.close()
+
+    def test_migration_is_idempotent(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(_PRE_2252_MERGE_QUEUE_TABLE)
+        conn.commit()
+        _ensure_schema(conn)
+        _ensure_schema(conn)
+        _ensure_schema(conn)
+        assert "ci_flaky_reruns" in _merge_queue_columns(conn)
+        assert "ci_flaky_pending" in _merge_queue_columns(conn)
+        conn.close()
+
+
 # ── override_connection ────────────────────────────────────────────────────────
 
 class TestOverrideConnection:

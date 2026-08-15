@@ -350,6 +350,65 @@ def test_build_board_view_live_ci_infra_plan_reason_also_parks():
     assert view.facts(entry_key(REPO, 1894)).merge_ci_pending
 
 
+# ── #2252: the OTHER sibling trigger — a genuinely-verdicted failure mid its
+# one #2252 re-check ────────────────────────────────────────────────────────
+
+def test_build_board_view_reads_merge_ci_pending_from_a_ci_flaky_raw_row():
+    """#2252: same recovery as the #1892 test above — `_entry_gate_status`
+    has no notion of the raw row's `ci_flaky_reruns`/`ci_flaky_pending`
+    state (only a LIVE `coord merge` attempt tracks it), so the live
+    `merge_plan` reason for the SAME entry still reads the generic "checks
+    failed: ..." wording while the raw row carries the more specific
+    CI_FLAKY_PREFIX one. `build_board_view` must prefer the raw reading or
+    a pending flake re-check would never park — it would sit as a plain
+    `checks_failed` block and burn a drive-queue launch attempt on the
+    exact transient #2252 exists to catch."""
+    view = build_board_view(
+        {
+            "merge_plan": [
+                {
+                    "repo_name": REPO, "issue_number": 2252,
+                    "reason": "checks failed: build (failure)",
+                },
+            ],
+            "merge_queue": [
+                {
+                    "repo_name": REPO, "issue_number": 2252,
+                    "error": (
+                        "CI re-checking: build (failure) — re-running once "
+                        "before treating as broken (1/1, #2252)"
+                    ),
+                },
+            ],
+        },
+        [],
+    )
+    facts = view.facts(entry_key(REPO, 2252))
+    assert facts.merge_ci_pending
+    assert facts.merge_ci_pending_reason.startswith("CI re-checking:")
+
+
+def test_build_board_view_live_ci_flaky_plan_reason_also_parks():
+    """If a future refactor DOES let the plan itself carry the #2252
+    wording, `build_board_view` must still recognise it directly — the raw-
+    row cross-check is a fallback, not the only path."""
+    view = build_board_view(
+        {
+            "merge_plan": [
+                {
+                    "repo_name": REPO, "issue_number": 2253,
+                    "reason": "CI re-checking: build (failure)",
+                },
+            ],
+            "merge_queue": [
+                {"repo_name": REPO, "issue_number": 2253, "error": None},
+            ],
+        },
+        [],
+    )
+    assert view.facts(entry_key(REPO, 2253)).merge_ci_pending
+
+
 # ── #2158: the frozen `error` string vs the live CI rollup ─────────────────
 #
 # The raw `merge_queue` row's `error` is written by a live `coord merge`

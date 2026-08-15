@@ -130,6 +130,7 @@ from coord.worker_events import is_usage_limit_reason
 # See `_STALE_SMOKE_MARKERS` / `_is_stale_smoke_reason` below.
 from coord.merge_queue import (
     STALE_SMOKE_MARKERS as _mq_stale_smoke_markers,
+    is_ci_flaky_reason,
     is_ci_infra_reason,
     is_ci_pending_reason,
     is_stale_smoke_reason as _mq_is_stale_smoke_reason,
@@ -2513,9 +2514,10 @@ def _effective_merge_gate_reason(
       own resolution path (#1474/#241's conflict-fix dispatch, reached
       through the bounded retry below). A re-test does not rebase a branch,
       and diverting to one is the same stall this issue is about, inverted.
-    - a CI reason (#1891/#1892) — `merge_reason` already carries a live,
-      recognised signal whose only resolution is more real time. Those two
-      bare waits sit right after the divergence check and must keep winning.
+    - a CI reason (#1891/#1892/#2252) — `merge_reason` already carries a
+      live, recognised signal whose only resolution is more real time.
+      These bare waits sit right after the divergence check and must keep
+      winning.
 
     The bool is the caller's warning label: a diagnostic-derived reason is a
     SNAPSHOT of the last real attempt, refreshed by nothing but another
@@ -2528,8 +2530,10 @@ def _effective_merge_gate_reason(
         return state.merge_reason, False
     if state.merge_status == "" or state.merge_status.upper() == "CONFLICT":
         return state.merge_reason, False
-    if is_ci_pending_reason(state.merge_reason) or is_ci_infra_reason(
-        state.merge_reason
+    if (
+        is_ci_pending_reason(state.merge_reason)
+        or is_ci_infra_reason(state.merge_reason)
+        or is_ci_flaky_reason(state.merge_reason)
     ):
         return state.merge_reason, False
     fallback = _extract_gate_refusal_reason(counters.last_merge_diagnostic)
@@ -2848,6 +2852,27 @@ def _decide_merge(
             label=(
                 "MERGE: CI failed with no verdict about the code — "
                 f"auto-rerunning, not retrying (#1892): {state.merge_reason}"
+            )
+        )
+
+    # #2252: the OTHER sibling case — a CI verdict DID arrive AND said
+    # something real about the code, but `coord merge`'s own live attempt
+    # has only observed it fail ONCE so far and is already re-running the
+    # failed job(s) to rule out a flake (see
+    # `coord.merge_queue.MAX_CI_FLAKY_RERUNS`) before spending a drive
+    # attempt on it. Retrying `coord merge` here would just re-observe the
+    # same in-flight re-run and spend an attempt for nothing — same bare
+    # wait as #1891/#1892 above, for the identical reason: only more real
+    # time (the re-run landing) resolves it, never another `coord merge`
+    # retry. Once the re-run's answer is in, this reason either clears
+    # (flake — merge proceeds, zero attempts spent) or reverts to the plain
+    # "checks failed" wording (confirmed real — spends the attempt exactly
+    # like today), so this wait is bounded by construction, never open-ended.
+    if is_ci_flaky_reason(state.merge_reason):
+        return _wait(
+            label=(
+                "MERGE: CI failed — re-running once to rule out a flake, "
+                f"not retrying (#2252): {state.merge_reason}"
             )
         )
 

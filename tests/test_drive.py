@@ -3142,6 +3142,75 @@ def test_a_genuinely_failed_check_is_not_read_as_ci_infra():
     assert counters.merge_attempts == 1
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# #2252: the OTHER sibling case — a CI verdict DID arrive AND said something
+# real about the code, but `coord merge`'s own live attempt has only
+# observed it fail ONCE so far and is already re-running the failed job(s)
+# to rule out a flake before spending a drive attempt. The drive must wait
+# for that re-run, not retry `coord merge` itself.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.parametrize("status", ["", "PENDING", "READY", "BLOCKED"])
+def test_ci_flaky_recheck_waits_regardless_of_which_status_the_board_shows(status):
+    action = step(
+        approved_work(
+            merge_status=status,
+            merge_reason=(
+                "CI re-checking: build (failure) — re-running once before "
+                "treating as broken (1/1, #2252)"
+            ),
+        )
+    )
+    assert action.kind == WAIT
+    assert "rule out a flake" in action.label
+    assert "not retrying" in action.label
+
+
+def test_ci_flaky_recheck_never_spends_an_attempt_across_several_polls():
+    """Acceptance (#2252): a PR whose one re-check is still pending an
+    answer does not consume a drive merge attempt, mirroring the identical
+    #1891/#1892 guarantees above."""
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_merge_attempts=2)
+    s = approved_work(
+        merge_status="",
+        merge_reason="CI re-checking: build (failure) — re-running once (1/1, #2252)",
+    )
+
+    for _ in range(5):
+        action = step(s, opts, counters=counters)
+        assert action.kind == WAIT
+        assert counters.merge_attempts == 0
+
+
+def test_ci_flaky_reason_is_recognised_via_the_shared_predicate_not_ad_hoc_text():
+    from coord.merge_queue import CI_FLAKY_PREFIX, is_ci_flaky_reason
+
+    assert is_ci_flaky_reason(f"{CI_FLAKY_PREFIX} build (failure)")
+    assert not is_ci_flaky_reason("checks failed: build (failure)")
+    assert not is_ci_flaky_reason("CI running: build")
+    assert not is_ci_flaky_reason("CI infra: build (cancelled)")
+    assert not is_ci_flaky_reason("")
+    assert not is_ci_flaky_reason(None)
+
+
+def test_a_confirmed_failure_after_the_recheck_walks_the_bounded_retry_path():
+    """Regression guard (acceptance criterion): a check that fails TWICE
+    behaves exactly as today once #2252's one re-check is exhausted — a
+    plain 'checks failed: ...' reason (no CI_FLAKY_PREFIX) still walks the
+    bounded retry path."""
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_merge_attempts=2)
+    s = approved_work(
+        merge_status="",
+        merge_reason="checks failed: build (failure)",
+    )
+
+    assert step(s, opts, counters=counters).kind == RUN
+    assert counters.merge_attempts == 1
+
+
 # ── #1505: escalate on a status retrying can't fix ──────────────────────────
 
 

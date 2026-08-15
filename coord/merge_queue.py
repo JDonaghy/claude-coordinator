@@ -801,6 +801,52 @@ def _record_gate_bypass_audit(entry: "QueuedMerge", config) -> list[str]:
     return bypassed
 
 
+def _record_ci_flake_audit(entry: "QueuedMerge", pending_json: str) -> None:
+    """Emit one ``ci_flake_detected`` operational audit row (#2252): a check
+    that failed once, was re-run exactly once, and came back clean.
+
+    *pending_json* is the JSON blob :func:`process` stashed on
+    ``entry.ci_flaky_pending`` at the moment it triggered the re-run — the
+    failing check names/conclusions and the branch SHA they failed against,
+    captured then because ``branch_head_sha`` is transient (recomputed every
+    tick, never persisted) and the checks themselves may already read
+    differently on ``gh`` by the time the re-run resolves.
+
+    This audit row is the thing #2252 asks for explicitly: without a durable
+    record, a check that is flaky 30% of the time gets silently waved
+    through every time instead of surfacing as a repeat offender someone
+    should fix — ``record_audit`` (queryable via ``coord audit`` /
+    ``query_audit_log``) is that durable record. Best-effort like every
+    other audit call site in this module: ``record_audit`` never raises,
+    and a malformed/missing blob (should not happen — this module is the
+    only writer of ``ci_flaky_pending``) degrades to an empty ``checks``
+    list rather than raising into the merge loop.
+    """
+    try:
+        payload = json.loads(pending_json) if pending_json else {}
+    except (TypeError, ValueError):
+        payload = {}
+    record_audit(
+        tier="operational",
+        category="ci",
+        event_type="ci_flake_detected",
+        actor="system",
+        summary=(
+            f"CI flake on {entry.repo_name}#{entry.issue_number} "
+            f"(PR #{entry.pr_number}): failed once, passed on re-run — "
+            "zero drive attempts spent (#2252)"
+        ),
+        repo=entry.repo_name,
+        issue=entry.issue_number,
+        assignment_id=entry.assignment_id,
+        details={
+            "pr_number": entry.pr_number,
+            "sha": payload.get("sha"),
+            "checks": payload.get("checks", []),
+        },
+    )
+
+
 @dataclass(frozen=True)
 class MergeGateFailure:
     """One un-satisfied merge gate for a work row / queue entry (#1695).
@@ -1408,6 +1454,32 @@ def is_ci_infra_reason(reason: str | None) -> bool:
     return (reason or "").startswith(CI_INFRA_PREFIX)
 
 
+# #2252: the reason string prefix for a `checks_failed` entry whose failing
+# check(s) carry a REAL verdict about the code — unlike `CI_INFRA_PREFIX`
+# above — but have only been observed failing ONCE so far. `process()` has
+# triggered exactly one scoped re-run of the failed job(s) (#2252's whole
+# ask: "before a failed check consumes a drive attempt, re-run the failed
+# job(s) once and re-read" — a 1-in-N flaky test reports the identical
+# completed/failure verdict a genuine regression does, so the verdict alone
+# can't tell them apart; a second, independent observation can) and is
+# waiting on its answer.
+#
+# Distinctly named from the plain "checks failed: ..." wording a CONFIRMED
+# failure produces (this entry's one-shot re-run budget already spent,
+# still red on the second read) so `coord.drive`'s retry accounting and
+# `coord.drive_queue`'s `parked` state can extend the SAME "self-refreshing,
+# no attempt yet" treatment #1891/#1892 already give
+# `CI_PENDING_PREFIX`/`CI_INFRA_PREFIX` to this one — see
+# :func:`is_ci_flaky_reason` and `MAX_CI_FLAKY_RERUNS`.
+CI_FLAKY_PREFIX = "CI re-checking:"
+
+
+def is_ci_flaky_reason(reason: str | None) -> bool:
+    """True when *reason* names a `checks_failed` block currently mid its
+    ONE #2252 re-run to rule out a flake — see :data:`CI_FLAKY_PREFIX`."""
+    return (reason or "").startswith(CI_FLAKY_PREFIX)
+
+
 # #1892: auto-reruns `process()` will trigger for a single entry's verdictless
 # CI failure (via `CiStore.rerun_for_pr`) before giving up and parking it for
 # a human instead of the queue's own #1891 machinery. A workflow genuinely
@@ -1429,6 +1501,15 @@ MAX_CI_INFRA_RERUNS = 2
 # otherwise auto-rerun forever; two tries rides out an ordinary busy tick
 # without masking a PR that just isn't going to catch up unattended.
 MAX_CI_STALE_RERUNS = 2
+
+# #2252: at most one auto-rerun per failure streak before a genuinely-
+# verdicted (non-infra) `checks_failed` spends the drive attempt exactly as
+# it does today. "One re-run, not a retry loop" is the issue's own bound:
+# two independent observations (the original run and this one re-run) is
+# enough to tell "broken" from "flaky" without starting to mask code that is
+# genuinely, repeatedly broken — a higher cap here would blur back into the
+# thing #1892's own cap already guards against for the verdictless case.
+MAX_CI_FLAKY_RERUNS = 1
 
 
 def _ci_infra_reason(
@@ -2251,6 +2332,26 @@ class QueuedMerge:
     # Capped at `MAX_CI_STALE_RERUNS`. 0 for every entry that has never gone
     # CI-stale, and for rows predating this column.
     ci_stale_reruns: int = 0
+    # #2252: count of automatic `CiStore.rerun_failed_for_pr` calls
+    # `process()` has issued for this entry's CURRENT streak of genuinely-
+    # verdicted (non-infra) CI failures — capped at `MAX_CI_FLAKY_RERUNS`.
+    # Kept separate from `ci_infra_reruns`/`ci_stale_reruns` above for the
+    # same reason those two are kept apart from each other: independently
+    # capped, independently legible in the audit trail. 0 for every entry
+    # that has never hit a genuine-verdict failure, and for rows predating
+    # this column.
+    ci_flaky_reruns: int = 0
+    # #2252: JSON blob of the failing check names/conclusions and the
+    # branch SHA they failed against, captured at the moment `process()`
+    # triggered this entry's one flake-checking re-run. `branch_head_sha`
+    # itself is transient (recomputed from GitHub every tick, never
+    # persisted) — this is the only durable record of WHAT failed once the
+    # re-run's answer arrives on a later tick. `""` (falsy) means no re-run
+    # is currently pending an answer; set only while `ci_flaky_reruns`
+    # reflects an in-flight re-run, cleared the moment its answer (pass ->
+    # flake recorded via `record_audit`, fail -> confirmed real, no flake)
+    # is known.
+    ci_flaky_pending: str = ""
 
 
 class GhOps(Protocol):
@@ -2568,6 +2669,10 @@ def load_queue() -> list[QueuedMerge]:
             # #2197: same NULL-to-0 decoding as ci_infra_reruns above, for
             # rows predating this column.
             ci_stale_reruns=row["ci_stale_reruns"] or 0,
+            # #2252: same NULL-to-0/'' decoding as the other rerun counters
+            # above, for rows predating these columns.
+            ci_flaky_reruns=row["ci_flaky_reruns"] or 0,
+            ci_flaky_pending=row["ci_flaky_pending"] or "",
         )
         for row in rows
     ]
@@ -2585,8 +2690,8 @@ def save_queue(items: list[QueuedMerge]) -> None:
                     target_branch, issue_number, issue_title, state,
                     pr_number, pr_url, size, last_attempt, error, enqueued_at,
                     assignment_type, required_gates, ci_infra_reruns,
-                    ci_stale_reruns
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    ci_stale_reruns, ci_flaky_reruns, ci_flaky_pending
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     item.assignment_id, item.repo_name, item.repo_github,
                     item.branch, item.target_branch, item.issue_number,
@@ -2594,6 +2699,7 @@ def save_queue(items: list[QueuedMerge]) -> None:
                     item.size, item.last_attempt, item.error, item.enqueued_at,
                     item.assignment_type, json.dumps(list(item.required_gates or [])),
                     item.ci_infra_reruns, item.ci_stale_reruns,
+                    item.ci_flaky_reruns, item.ci_flaky_pending,
                 ),
             )
 
@@ -5110,6 +5216,69 @@ def process(
                         entry.error = msg
                         events.append(MergeEvent(entry, "checks_failed", msg))
                         continue  # #292: skip, don't halt the group
+                    # #2252: reached only when `infra_reason is None` —
+                    # every failing check carries a REAL verdict about the
+                    # code (#1892's verdictless case is handled/exhausted
+                    # above). A real verdict is still not enough to tell
+                    # "broken" from "flaky": a 1-in-N random-tempdir
+                    # collision reports exactly the same completed/failure
+                    # conclusion a genuine regression does. Re-run the
+                    # failed job(s) once — scoped via `rerun_failed_for_pr`
+                    # so the green evidence from checks that already passed
+                    # is never touched — and re-read before spending the
+                    # drive attempt this failure would otherwise cost.
+                    if entry.ci_flaky_reruns < MAX_CI_FLAKY_RERUNS:
+                        rerun_failed_for_pr = getattr(
+                            ci, "rerun_failed_for_pr", None
+                        )
+                        reran = (
+                            rerun_failed_for_pr(entry.repo_github, entry.pr_number)
+                            if rerun_failed_for_pr is not None
+                            else False
+                        )
+                        if reran:
+                            entry.ci_flaky_reruns += 1
+                            entry.ci_flaky_pending = json.dumps({
+                                "checks": [
+                                    {"name": c.name, "conclusion": c.conclusion}
+                                    for c in failed
+                                ],
+                                "sha": entry.branch_head_sha,
+                            })
+                            msg = (
+                                f"{CI_FLAKY_PREFIX} {summary} — re-running "
+                                "once before treating as broken "
+                                f"({entry.ci_flaky_reruns}/"
+                                f"{MAX_CI_FLAKY_RERUNS}, #2252)"
+                            )
+                            entry.error = msg
+                            _log.info(
+                                "#2252 flake re-check %d/%d for %s#%d "
+                                "(PR #%s): %s (rerun_failed_for_pr triggered)",
+                                entry.ci_flaky_reruns, MAX_CI_FLAKY_RERUNS,
+                                entry.repo_name, entry.issue_number,
+                                entry.pr_number, summary,
+                            )
+                            events.append(MergeEvent(entry, "ci_flaky_rerun", msg))
+                            continue  # #292: skip, don't halt the group
+                        # #2252 fail-safe: the re-run could not be
+                        # triggered (no `rerun_failed_for_pr` capability, or
+                        # the `gh` call itself failed) — fall straight
+                        # through to the plain `checks_failed` block below,
+                        # spending the attempt exactly as if this feature
+                        # did not exist. Never treat "could not re-run" as
+                        # "passed", and never increment `ci_flaky_reruns`
+                        # for a re-run that never actually happened.
+                    elif entry.ci_flaky_pending:
+                        # Budget already spent for this failure streak and
+                        # it is STILL red on the second read — confirmed
+                        # real, not a flake (#2252's other acceptance
+                        # criterion: "a check that fails twice: attempt
+                        # consumed, entry blocks — identical to today").
+                        # Nothing to record; clear the pending marker so a
+                        # later, unrelated resolution doesn't misattribute
+                        # this already-confirmed streak as a flake.
+                        entry.ci_flaky_pending = ""
                     msg = f"checks failed: {summary}"
                     entry.error = msg
                     events.append(MergeEvent(entry, "checks_failed", msg))
@@ -5150,6 +5319,19 @@ def process(
                 # that case is harmless since such an entry can never have
                 # accrued a nonzero `ci_infra_reruns` to begin with.
                 entry.ci_infra_reruns = 0
+                # #2252: this same "genuinely resolved" point is also where
+                # a suspected-flaky failure gets its answer: nothing failed
+                # and nothing is pending, so the one re-run this entry spent
+                # (see the `ci_flaky_reruns`/`CI_FLAKY_PREFIX` branch above)
+                # came back clean. Record it — the audit trail is what keeps
+                # this from quietly becoming a "just retry until green"
+                # button: a check that is flaky 30% of the time should show
+                # up as thirty recorded flakes, not thirty invisible free
+                # passes.
+                if entry.ci_flaky_pending:
+                    _record_ci_flake_audit(entry, entry.ci_flaky_pending)
+                    entry.ci_flaky_pending = ""
+                entry.ci_flaky_reruns = 0
                 # #1851: a green CI result can itself be stale relative to the
                 # base — see `_ci_checks_are_stale`'s docstring. Named
                 # distinctly (`checks_stale`) from checks_failed/

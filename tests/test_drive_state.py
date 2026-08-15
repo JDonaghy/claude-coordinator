@@ -671,6 +671,43 @@ def test_merge_entry_leaves_a_genuine_checks_failed_reason_alone():
     assert state.merge_reason == "checks failed: build (failure)"
 
 
+def test_merge_entry_prefers_the_raw_rows_ci_flaky_reason_over_the_plans_generic_one():
+    """#2252: same recovery as the #1892 test above, for the sibling
+    CI_FLAKY_PREFIX classification — `_entry_gate_status` has no notion of
+    the raw row's `ci_flaky_reruns`/`ci_flaky_pending` state (only a LIVE
+    `coord merge` attempt tracks it), so it always re-derives a pending
+    flake re-check as the plan's generic "checks failed: ..." wording.
+    Without this recovery, `coord.drive`/`coord.drive_queue` would never
+    see the #2252 classification and would burn a drive attempt on the
+    exact transient it exists to catch."""
+    payload = {
+        "assignments": [row(assignment_id="w1")],
+        "merge_plan": [
+            {
+                "repo_name": REPO,
+                "issue_number": 1392,
+                "status": "BLOCKED",
+                "reason": "checks failed: build (failure)",
+                "assignment_id": "w1",
+            }
+        ],
+        "merge_queue": [
+            {
+                "repo_name": REPO,
+                "issue_number": 1392,
+                "state": "pending",
+                "error": (
+                    "CI re-checking: build (failure) — re-running once "
+                    "before treating as broken (1/1, #2252)"
+                ),
+                "assignment_id": "w1",
+            }
+        ],
+    }
+    state = project(payload, REPO, 1392, make_config())
+    assert state.merge_reason.startswith("CI re-checking:")
+
+
 def test_needs_attention_plan_entry_recovers_a_retryable_conflict_from_the_raw_queue():
     """#1505 review fix: `merge_queue.plan()` collapses CONFLICT into
     NEEDS_ATTENTION for display, and `merge_plan` is what a normal
