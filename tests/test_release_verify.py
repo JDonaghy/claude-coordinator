@@ -23,6 +23,7 @@ its-own, unreachable-is-never-OK, and read-only.
 from __future__ import annotations
 
 import json
+import os
 import stat
 import sys
 from pathlib import Path
@@ -380,6 +381,120 @@ def test_spawned_identity_ignores_the_caller_cwd(
     assert version == OWN_VERSION
     assert module_file is not None
     assert not Path(module_file).is_relative_to(decoy_root)
+
+
+def _real_coord_script(root: Path, *, editable: bool, version: str) -> tuple[Path, Path]:
+    """A genuine console script whose shebang is the real interpreter
+    (``sys.executable``), paired with a fake ``coord`` install reachable only
+    via ``PYTHONPATH`` — not a ``/bin/sh`` shim, so ``-P`` actually has
+    something to suppress.
+
+    Returns ``(script, install_dir)``; the caller sets ``PYTHONPATH`` to
+    *install_dir* so the real interpreter's ``import coord`` resolves *this*
+    package rather than whatever (if anything) is actually installed for
+    ``sys.executable``.
+    """
+    install_dir = root / ("release" if not editable else "checkout")
+    site_dir = install_dir if editable else install_dir / "lib" / "site-packages"
+    (site_dir / "coord").mkdir(parents=True)
+    (site_dir / "coord" / "__init__.py").write_text(f'__version__ = "{version}"\n')
+
+    script = root / "coord"
+    script.write_text(f"#!{sys.executable}\n# console script stub\n")
+    script.chmod(script.stat().st_mode | stat.S_IEXEC)
+    return script, site_dir
+
+
+def _probe_from_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    cwd: Path,
+    script: Path,
+    pythonpath: Path,
+    version: str,
+):
+    """Run the real `spawned_coord` machine-scope check with the process cwd
+    set to *cwd* and a fake install pinned via `PYTHONPATH`, and return the
+    single `spawned_coord` `CheckResult` it produces."""
+    fake_pid = os.getpid() + 1
+    proc_root = _fake_proc(tmp_path, fake_pid, f"{script.parent}:/usr/bin")
+    monkeypatch.setattr(spawned_coord, "_PROC_ROOT", proc_root)
+    monkeypatch.setattr(spawned_coord, "running_unit_pids", lambda u: {"coord-agent": fake_pid})
+    monkeypatch.setattr(spawned_coord, "OWN_VERSION", version)
+    monkeypatch.setenv("PYTHONPATH", str(pythonpath))
+    monkeypatch.chdir(cwd)
+    (result,) = spawned_coord.probe_spawned_coord(_ctx(tmp_path))
+    return result
+
+
+def test_full_check_ignores_the_callers_cwd_for_a_clean_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2190, end to end through the real probe: a genuinely non-editable
+    install must read ``OK`` regardless of whether the operator happened to
+    invoke ``coord health`` from inside a directory that itself contains a
+    ``coord/`` package (e.g. a checkout of this repo). Before `-P` this
+    reported CRIT — a false positive that depends entirely on the caller's
+    shell cwd, not on anything the venv actually contains.
+    """
+    version = "7.7.7"
+    script, pythonpath = _real_coord_script(tmp_path / "install", editable=False, version=version)
+
+    plain_cwd = tmp_path / "plain-cwd"
+    plain_cwd.mkdir()
+    decoy_cwd = tmp_path / "decoy-cwd"
+    (decoy_cwd / "coord").mkdir(parents=True)
+    (decoy_cwd / "coord" / "__init__.py").write_text('__version__ = "0.0.1-decoy"\n')
+
+    result_plain = _probe_from_cwd(
+        tmp_path, monkeypatch, cwd=plain_cwd, script=script, pythonpath=pythonpath, version=version
+    )
+    assert result_plain.severity is Severity.OK
+    assert result_plain.values["editable"] is False
+    assert result_plain.values["version"] == version
+
+    result_decoy = _probe_from_cwd(
+        tmp_path, monkeypatch, cwd=decoy_cwd, script=script, pythonpath=pythonpath, version=version
+    )
+    assert result_decoy.severity is Severity.OK
+    assert result_decoy.values["editable"] is False
+    assert result_decoy.values["version"] == version
+
+    assert result_plain.severity == result_decoy.severity
+    assert result_plain.values == result_decoy.values
+
+
+def test_full_check_editable_crit_survives_the_callers_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half of #2190's acceptance criteria: `-P` must not weaken
+    genuine #1834 detection. A real editable install reads CRIT no matter
+    what the operator's shell cwd is — including a cwd with no `coord/`
+    package in it at all, and one that happens to have one."""
+    version = "7.7.7"
+    script, pythonpath = _real_coord_script(tmp_path / "install", editable=True, version=version)
+
+    plain_cwd = tmp_path / "plain-cwd"
+    plain_cwd.mkdir()
+    decoy_cwd = tmp_path / "decoy-cwd"
+    (decoy_cwd / "coord").mkdir(parents=True)
+    (decoy_cwd / "coord" / "__init__.py").write_text('__version__ = "0.0.1-decoy"\n')
+
+    result_plain = _probe_from_cwd(
+        tmp_path, monkeypatch, cwd=plain_cwd, script=script, pythonpath=pythonpath, version=version
+    )
+    assert result_plain.severity is Severity.CRIT
+    assert result_plain.values["editable"] is True
+
+    result_decoy = _probe_from_cwd(
+        tmp_path, monkeypatch, cwd=decoy_cwd, script=script, pythonpath=pythonpath, version=version
+    )
+    assert result_decoy.severity is Severity.CRIT
+    assert result_decoy.values["editable"] is True
+
+    assert result_plain.severity == result_decoy.severity
+    assert result_plain.values == result_decoy.values
 
 
 def test_probe_is_registered_in_the_machine_scope_registry(
