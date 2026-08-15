@@ -1247,6 +1247,14 @@ def render_record(record: PropagationRecord | Mapping[str, Any]) -> list[str]:
         )
     if cordons.get("uncordoned"):
         lines.append("    uncordoned: " + ", ".join(cordons["uncordoned"]))
+    # #2176: name the collateral hosts AND the single host they're collateral
+    # to — the fact that would have turned a 40-minute puzzle into one line.
+    if cordons.get("collateral_spared"):
+        lines.append(
+            "    spared (blocked behind daemon host "
+            f"{cordons.get('blocked_behind')} anyway): "
+            + ", ".join(cordons["collateral_spared"])
+        )
     if cordons.get("expired"):
         lines.append(
             "    cordons that lapsed on their own: " + ", ".join(cordons["expired"])

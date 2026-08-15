@@ -842,7 +842,15 @@ def test_a_normal_drain_still_rolls_without_ever_releasing(
     """#2101's happy path, unchanged. The bound must cost nothing when the
     cordon is doing its job — a fix that made every normal roll take three
     extra ticks would be worse than the bug on all the days it does not
-    happen."""
+    happen.
+
+    #2176: `server` here is both the daemon host and the one with the busy
+    signal, so `laptop` — idle, behind, and unable to roll ahead of a busy
+    daemon host regardless — is collateral and spared, not cordoned. Before
+    #2176 this asserted `{"laptop", "server"}`; that was the bug (#2176's own
+    incident: two idle hosts held launch-blocked for 34+ minutes by a busy
+    daemon host neither of them could roll ahead of anyway).
+    """
     _stub_state_dir(monkeypatch, tmp_path)
     rolled: list[str] = []
     monkeypatch.setattr(
@@ -859,7 +867,7 @@ def test_a_normal_drain_still_rolls_without_ever_releasing(
     first = _propagate(valid_config_path)
     assert first.exit_code == 0, first.output
     assert "CORDON RELEASED" not in first.output
-    assert mp.cordoned_names() == {"laptop", "server"}
+    assert mp.cordoned_names() == {"server"}
 
     # The drive finishes; the host has drained; the roll lands and releases.
     _stub_board(monkeypatch, drive_queue=[])
