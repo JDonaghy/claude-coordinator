@@ -484,9 +484,18 @@ _RULES = (
     _rule_ci_red,
     _rule_ci_pending,
     _rule_gate_blocked,
+    # #2276 review: this sits ABOVE `nothing-blocking` deliberately.  Every
+    # rule above it names a positive blocker (a conflict, a red check, a
+    # refused gate) and is the more actionable answer even on a machine that
+    # is down.  `nothing-blocking` is the opposite: it means "we looked and
+    # found no reason", and "the machine that owns this entry is not
+    # answering" IS a reason — reporting "nothing blocking" over a known-down
+    # agent is precisely the confidently-wrong verdict Phase 1 exists to
+    # avoid.  (`agent_reachable is False` is a positive reading; `None` —
+    # never polled, or stale — falls straight through.)
+    _rule_agent_unreachable,
     _rule_nothing_blocking,
     _rule_ci_green,
-    _rule_agent_unreachable,
 )
 
 
@@ -574,6 +583,44 @@ def diagnose(
 # ── probing (the only impure part) ───────────────────────────────────────────
 
 
+def _row_reachable(row: Mapping[str, Any]) -> bool | None:
+    """Is the machine this ``machine_health`` row describes answering?
+
+    #2276 review: there is no ``reachable`` key on these rows and never was.
+    Both producers — :func:`coord.health.aggregate.local_fleet_health_block`
+    (the CLI path) and ``FleetHealthRefresher.snapshot().to_dict()`` (the
+    notifier tick) — build rows via
+    :func:`coord.health.fleet_snapshot._machine_health_rows`, whose
+    reachability signal is ``state`` (``coord.network``'s ``online`` /
+    ``offline`` / ``timeout`` / ``dns_error`` / ``http_error`` /
+    ``rate_limited`` / ``unknown``).  Reading a key that does not exist made
+    every configured machine read "reachable", which is worse than useless
+    here: it left ``agent-unreachable`` structurally unreachable AND let
+    ``_rule_dead_leg`` fire at high confidence on a machine that is merely
+    down, which is the "confidently wrong" failure mode Phase 1 exists to
+    avoid.
+
+    Three answers, and the abstention is load-bearing:
+
+    * ``None`` — no usable reading.  ``unknown`` (never polled, or an
+      unclassifiable error), a missing/blank ``state``, or a ``stale`` row
+      (nothing has polled inside ``STALE_AFTER_SECONDS``, i.e. no tick loop
+      is running on this host).  Stale is deliberately ``None`` for a
+      *non-online* state too: an "offline" reading from an hour ago is not
+      evidence about now, in either direction.
+    * ``True`` — a fresh ``online``.
+    * ``False`` — a fresh, recognised, non-online state.
+    """
+    from coord import network  # noqa: PLC0415
+
+    state = str(row.get("state") or "").strip().lower()
+    if not state or state == network.UNKNOWN:
+        return None
+    if row.get("stale"):
+        return None
+    return state == network.ONLINE
+
+
 class LiveProbe(Protocol):
     """Gathers :class:`LiveState` for one entry.  Read-only, by contract."""
 
@@ -605,6 +652,13 @@ class GhLiveProbe:
     #: Session names the local host can see, when the caller knows them.
     #: ``None`` disables the dead-leg rule rather than guessing.
     live_sessions: frozenset[str] | None = None
+    #: Which host ``live_sessions`` was read on (short hostname, lowercased).
+    #: ``live_sessions`` is always a LOCAL ``tmux`` read, so an entry whose
+    #: ``launch_host`` names a DIFFERENT machine is invisible to it and its
+    #: absence there is not evidence — #1870, the same rule
+    #: ``coord.drive_queue._reconcile_running`` already enforces.  ``''``
+    #: means the caller did not say, which keeps the pre-#1870 behaviour.
+    local_host: str = ""
 
     def probe(self, entry: QueueEntry) -> LiveState:
         errors: list[str] = []
@@ -721,12 +775,35 @@ class GhLiveProbe:
         return str(getattr(found, "github", "") or "")
 
     # -- agent `/health` ---------------------------------------------------
+    def _foreign(self, entry: QueueEntry) -> bool:
+        """Was this entry launched by a host whose tmux we cannot read?
+
+        #1870: ``live_sessions`` is a LOCAL ``tmux list-sessions``.  For an
+        entry another machine launched, "not in that set" means *"not my
+        session to see"*, not *"dead"* — and feeding that to
+        ``_rule_dead_leg`` would manufacture a high-confidence ``dead-leg``
+        for a perfectly healthy remote session.  Leave ``agent_has_session``
+        at ``None`` instead, which disables the rule.
+        """
+        if not self.local_host or not entry.launch_host:
+            return False
+        # Same normalisation `_local_host_id()` documents: short hostname,
+        # lowercased, domain suffix dropped — so a machine addressed as
+        # `dellserver` in the queue row and `dellserver.local` by DNS still
+        # compares equal to itself and does NOT read as foreign.
+        def short(name: str) -> str:
+            return name.split(".")[0].strip().lower()
+
+        return short(entry.launch_host) != short(self.local_host)
+
     def _health(
         self, entry: QueueEntry
     ) -> tuple[bool | None, bool | None, list[str]]:
         machine = entry.launch_host or entry.machine
         has_session: bool | None = None
-        if self.live_sessions is not None and entry.session_name:
+        if self.live_sessions is not None and entry.session_name and not self._foreign(
+            entry
+        ):
             has_session = entry.session_name in self.live_sessions
         if not self.fleet_health or not machine:
             return None, has_session, []
@@ -736,15 +813,18 @@ class GhLiveProbe:
         for row in rows:
             if not isinstance(row, dict) or str(row.get("machine") or "") != machine:
                 continue
-            reachable = row.get("reachable")
             crits = [
                 str(r.get("check_id") or "")
                 for r in (row.get("results") or [])
                 if isinstance(r, dict) and str(r.get("severity") or "") == "crit"
             ]
-            return (True if reachable is None else bool(reachable)), has_session, crits
-        # The machine has no row at all: the fold could not reach it.
-        return False, has_session, []
+            return _row_reachable(row), has_session, crits
+        # The machine has no row at all.  Every producer of `machine_health`
+        # emits one row per *configured* machine, so this means the entry
+        # names a machine that is not in `config.machines` (decommissioned,
+        # renamed, or hand-written) — we have no reading for it, which is
+        # `None` ("could not tell"), never `False` ("it is down").
+        return None, has_session, []
 
 
 # ── trigger + budget + the pass ──────────────────────────────────────────────

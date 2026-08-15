@@ -3122,5 +3122,75 @@ def test_diagnose_wires_fleet_health_and_live_sessions_into_the_probe(
 
     result = cli("diagnose")
     assert result.exit_code == 0, result.output
-    assert captured.get("fleet_health") is not None
     assert captured.get("live_sessions") == frozenset({"coord-drive-dellserver-1762"})
+    # Not just "not None": the probe reads specific keys off these rows, so
+    # pin the shape it is handed. `state` is the reachability signal — the
+    # first cut of `_health()` looked for a `reachable` key that has never
+    # existed here, and read every configured machine as reachable.
+    rows = captured["fleet_health"]["machine_health"]
+    assert [r["machine"] for r in rows] == ["dellserver"]
+    assert "state" in rows[0] and "reachable" not in rows[0]
+
+
+def test_diagnose_names_an_unreachable_machine_instead_of_nothing_blocking(
+    cli, seed, block_log, gh_world
+):
+    """#2276 review, end to end: the machine that owns this entry is down.
+
+    Every GitHub read comes back clean (`gh_world`'s defaults: OPEN,
+    mergeable, green checks, clear gates), so before the `machine_health` row
+    was actually read this rendered a confident `nothing-blocking` — "we
+    looked and found no reason" — while the reason was sitting in the local
+    health table. It must name the unreachable agent instead, and must NOT
+    call it a `dead-leg`: no session is visible because nothing on that host
+    is answering, not because the leg died on a healthy machine.
+    """
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    _stall(1762, "blocked: CI red, 2/2 attempts", block_log)
+    state._update_drive_queue_entry_local(
+        REPO,
+        1762,
+        session_name="coord-drive-dellserver-1762",
+        launch_host="dellserver",
+    )
+    state.save_machine_health(
+        "dellserver",
+        state="offline",
+        reason="connection refused (agent not running?)",
+        latency_ms=None,
+        health=None,
+        received_at=time.time(),
+    )
+
+    result = cli("diagnose")
+    assert result.exit_code == 0, result.output
+    assert "cause:  agent-unreachable" in result.output
+    assert "dead-leg" not in result.output
+    assert "nothing-blocking" not in result.output
+    assert "/health dellserver: NOT ANSWERING" in result.output
+
+
+def test_diagnose_does_not_call_a_never_polled_machine_unreachable(
+    cli, seed, block_log, gh_world
+):
+    """The abstention half. Nothing has ever written a `machine_health` row
+    for `dellserver` here, so `_machine_health_rows` still emits one — with
+    `state="unknown"`. That is "we have no reading", not "it is down", and it
+    must not manufacture an `agent-unreachable` verdict.
+    """
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    _stall(1762, "blocked: CI red, 2/2 attempts", block_log)
+    state._update_drive_queue_entry_local(
+        REPO,
+        1762,
+        session_name="coord-drive-dellserver-1762",
+        launch_host="dellserver",
+    )
+
+    result = cli("diagnose")
+    assert result.exit_code == 0, result.output
+    assert "agent-unreachable" not in result.output
+    assert "dead-leg" not in result.output
+    assert "/health dellserver: not read" in result.output
