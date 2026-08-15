@@ -16,6 +16,7 @@ from coord.acceptance import (
     apply_expected_red,
     build_verdict,
     bug_contract_path,
+    classify_expected_red_clear_result,
     clear_expected_red_entries,
     clear_expected_red_via_pr,
     dump_manifest_error_hint,
@@ -652,6 +653,59 @@ class TestClearExpectedRedViaPr:
         ops = _FakeApiGhOps({})
         msg = clear_expected_red_via_pr("acme/x", "coord-tui", "main", 944, gh_ops=ops)
         assert "no expected_red entries found" in msg
+
+
+class TestClassifyExpectedRedClearResult:
+    """#2266 review (blocking findings 1 & 2): the single shared
+    classifier both `coord.merge_queue._maybe_clear_expected_red` and
+    `coord.commands.acceptance._clear_stuck_expected_red` call, instead of
+    each independently re-deriving "did this succeed?" via its own
+    `msg.startswith("cleared expected_red")` check. Exercised here against
+    every message shape `clear_expected_red_via_pr` actually returns (see
+    `TestClearExpectedRedViaPr` above), so the two can never silently
+    desync on a message-wording change."""
+
+    def test_cleared(self) -> None:
+        assert classify_expected_red_clear_result(
+            "cleared expected_red for #944: ms01::a (PR #501)"
+        ) == "cleared"
+
+    def test_no_manifest_found_is_a_no_op_not_a_failure(self) -> None:
+        assert classify_expected_red_clear_result(
+            "no expected_red entries found for this issue"
+        ) == "no_op"
+
+    def test_no_entries_for_issue_is_a_no_op_not_a_failure(self) -> None:
+        """#2266 review blocking finding 1: this is the *common* case for
+        an ordinary oracle-loop merge whose issue was never part of a
+        deliberately-red slice — it must never classify as a failure."""
+        assert classify_expected_red_clear_result(
+            "no expected_red entries for this issue"
+        ) == "no_op"
+
+    def test_pr_that_did_not_merge_is_pending_retry_not_a_hard_failure(self) -> None:
+        assert classify_expected_red_clear_result(
+            "expected_red clear PR #501 opened but did not merge (branch "
+            "protection / required checks pending?) — will retry on the "
+            "next merge (required check pending)"
+        ) == "pending_retry"
+
+    def test_json_manifest_warning_is_a_failure(self) -> None:
+        assert classify_expected_red_clear_result(
+            "warning: tests/acceptance/ms01/manifest.json is a JSON "
+            "manifest — automatic expected_red clearing only supports "
+            "YAML manifests today; clear ms01::a by hand"
+        ) == "failed"
+
+    def test_generic_warning_is_a_failure(self) -> None:
+        assert classify_expected_red_clear_result(
+            "warning: could not open expected_red clear PR: boom"
+        ) == "failed"
+
+    def test_unchanged_text_is_a_failure(self) -> None:
+        assert classify_expected_red_clear_result(
+            "expected_red text unchanged (nothing matched)"
+        ) == "failed"
 
 
 class TestOracleLoopContractBlock:

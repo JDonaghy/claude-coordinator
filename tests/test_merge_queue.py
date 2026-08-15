@@ -1166,6 +1166,29 @@ class TestExpectedRedClearOnMerge:
         assert len(rows) == 1
         assert rows[0]["issue"] == 1
 
+    def test_an_ordinary_merge_with_nothing_to_clear_writes_no_audit_row(
+        self, coord_db,
+    ) -> None:
+        """#2266 review (blocking finding 1): both guards passing
+        (acceptance recorded "passed" against the exact merged SHA) but
+        the issue has no `expected_red` entries at all is the *common*
+        case for an ordinary oracle-loop merge — not a failure. Before
+        this fix, `clear_expected_red_via_pr`'s "no expected_red entries
+        for this issue" message classified as "not cleared" just like a
+        genuine failure, so every such merge wrote a persisted
+        `expected_red_clear_failed` row."""
+        work = self._work("w1", acceptance_state="passed", acceptance_sha="cafesha")
+        board = self._board(completed=[work])
+        gh = _ExpectedRedGh(manifest_text="tests:\n  ms01::a: 1\n")  # no expected_red: block
+
+        events = process([_q("w1", size=10)], gh, board=board)
+
+        assert events[-1].kind == "expected_red_clear_noop"
+        assert not gh.update_repo_file_calls
+        assert not coord_db.execute(
+            "SELECT 1 FROM audit_log WHERE event_type LIKE 'expected_red_clear%'",
+        ).fetchall()
+
     def test_names_the_skip_when_acceptance_was_never_recorded(self) -> None:
         """#2199: this used to be a silent `return None` — and, before
         #2199 gave `coord acceptance record` a call site at all, the
@@ -1318,11 +1341,12 @@ class TestExpectedRedClearOnMerge:
         events = process([_q("w1", size=10)], _PlainFakeGh(), board=board)
 
         # Must not crash `process()` — degrades to a harmless "found
-        # nothing" event rather than an AttributeError, same fail-soft
-        # posture the rest of the sweep uses when the API surface is
-        # missing (`find_ms_manifest_for_issue_via_api` itself degrades to
+        # nothing" event (classified "no_op", #2266 review blocking
+        # finding 1) rather than an AttributeError, same fail-soft posture
+        # the rest of the sweep uses when the API surface is missing
+        # (`find_ms_manifest_for_issue_via_api` itself degrades to
         # "nothing found" for the same reason).
-        assert events[-1].kind == "expected_red_clear"
+        assert events[-1].kind == "expected_red_clear_noop"
         assert events[-1].entry.state == MERGED
 
     def test_a_failed_clear_writes_a_distinct_durable_audit_row(self, coord_db) -> None:
