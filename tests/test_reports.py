@@ -1098,10 +1098,12 @@ class TestCli:
         body = json.loads(result.output)
         assert set(body) == {
             "report_id", "generated_at", "window", "columns", "column_meta",
-            "rows", "notes", "totals",
+            "rows", "notes", "totals", "chart",
         }
         # #1763: additive and None for every report that has no meaningful sum.
         assert body["totals"] is None
+        # #2271: same posture for the chart declaration.
+        assert body["chart"] is None
         assert body["report_id"] == "issue-activity"
         assert body["window"] == [WINDOW[1] - 13 * 3600, WINDOW[1]]
 
@@ -1320,10 +1322,12 @@ class TestCliDriveQueueStatus:
         body = json.loads(result.output)
         assert set(body) == {
             "report_id", "generated_at", "window", "columns", "column_meta",
-            "rows", "notes", "totals",
+            "rows", "notes", "totals", "chart",
         }
         # #1763: additive and None for every report that has no meaningful sum.
         assert body["totals"] is None
+        # #2271: same posture for the chart declaration.
+        assert body["chart"] is None
         assert body["report_id"] == "drive-queue-status"
         assert body["window"][0] == body["window"][1]
         assert [m["id"] for m in body["column_meta"]] == body["columns"]
@@ -2180,7 +2184,7 @@ class TestUsageTotals:
             "column_meta", "rows", "notes",
         }
         payload = fold_issue_activity([], WINDOW).to_dict()
-        assert set(payload) == before | {"totals"}
+        assert set(payload) == before | {"totals", "chart"}
 
     def test_cli_table_renders_the_totals_row(self) -> None:
         from coord.commands.report import _render_table
@@ -3206,3 +3210,180 @@ class TestQueueOutcomesPartialWindow:
         )
         note = next(n for n in result.notes if n.startswith("PARTIAL WINDOW"))
         assert _abs_iso(QO_END - 3 * QO_DAY) in note
+
+
+# ── #2271: the chart declaration ───────────────────────────────────────────
+
+
+class TestChartDeclaration:
+    """The additive chart block on `ReportResult` (#2271).
+
+    The whole contract is "additive, and a client that does not understand it
+    renders the table" — so these tests are mostly about what did NOT change.
+    """
+
+    def test_chart_defaults_to_none_and_serialises_as_none(self) -> None:
+        result = ReportResult(
+            report_id="r",
+            generated_at=1.0,
+            window=(0.0, 1.0),
+            columns=["a"],
+            rows=[{"a": 1}],
+            notes=[],
+        )
+        assert result.chart is None
+        assert result.to_dict()["chart"] is None
+
+    def test_the_chart_key_is_additive_and_nothing_else_moved(self) -> None:
+        """The already-shipped #1741/#1763 panel deserialises the other eight
+        keys; adding `chart` must not disturb one of them."""
+        from coord.reports import ChartSeries, ChartSpec
+
+        plain = fold_issue_activity([], WINDOW).to_dict()
+        charted = fold_issue_activity([], WINDOW)
+        charted.chart = ChartSpec(
+            kind="line", series=(ChartSeries(label="L", column="issue"),), x="issue"
+        )
+        charted_payload = charted.to_dict()
+        assert set(charted_payload) == set(plain)
+        for key in plain:
+            if key != "chart":
+                assert charted_payload[key] == plain[key], key
+
+    def test_series_and_spec_wire_shape_is_pinned(self) -> None:
+        from coord.reports import ChartSeries, ChartSpec
+
+        spec = ChartSpec(
+            kind="bar",
+            series=(ChartSeries(label="Entries", column="count", color="#50a0f0"),),
+            x="category",
+            group_by="bucket",
+            stacked=True,
+            title="T",
+            y_label="Y",
+        )
+        assert spec.to_dict() == {
+            "kind": "bar",
+            "series": [
+                {"label": "Entries", "column": "count", "color": "#50a0f0"}
+            ],
+            "x": "category",
+            "group_by": "bucket",
+            "stacked": True,
+            "title": "T",
+            "y_label": "Y",
+        }
+
+    def test_series_defaults_leave_colour_unset(self) -> None:
+        from coord.reports import ChartSeries, ChartSpec
+
+        spec = ChartSpec(kind="line", series=(ChartSeries(label="L", column="c"),))
+        assert spec.to_dict() == {
+            "kind": "line",
+            "series": [{"label": "L", "column": "c", "color": None}],
+            "x": None,
+            "group_by": None,
+            "stacked": False,
+            "title": "",
+            "y_label": "",
+        }
+
+    def test_every_declared_series_column_exists_in_columns(self) -> None:
+        """The one invariant that makes "derive from existing columns" true:
+        a series naming a column the table does not carry would be a parallel
+        data block with extra steps."""
+        result = fold_queue_outcomes(
+            _qo_fixture(), (QO_END - QO_DAY, QO_END), merged=[]
+        )
+        assert result.chart is not None
+        for series in result.chart.series:
+            assert series.column in result.columns
+        assert result.chart.x in result.columns
+        assert result.chart.group_by in result.columns
+
+    def test_csv_export_of_a_chart_bearing_report_is_unchanged(self) -> None:
+        """#1765's serializer is driven by columns/rows/totals and must not
+        grow a chart column, a chart comment, or anything else."""
+        from coord.reports import ChartSeries, ChartSpec
+
+        charted = fold_queue_outcomes(
+            _qo_fixture(), (QO_END - QO_DAY, QO_END), merged=[]
+        )
+        assert charted.chart is not None
+        plain = fold_queue_outcomes(
+            _qo_fixture(), (QO_END - QO_DAY, QO_END), merged=[]
+        )
+        plain.chart = None
+        assert result_to_csv(charted) == result_to_csv(plain)
+
+        # And a chart on a report that has none also changes nothing.
+        activity = fold_issue_activity([], WINDOW)
+        before = result_to_csv(activity)
+        activity.chart = ChartSpec(
+            kind="line", series=(ChartSeries(label="L", column="issue"),)
+        )
+        assert result_to_csv(activity) == before
+
+
+class TestQueueOutcomesChart:
+    def test_24h_declares_a_stacked_bar_over_categories(self) -> None:
+        result = fold_queue_outcomes(
+            _qo_fixture(), (QO_END - QO_DAY, QO_END), merged=[]
+        )
+        chart = result.chart
+        assert chart is not None
+        assert chart.kind == "bar"
+        assert chart.stacked is True
+        assert chart.x == "category"
+        assert chart.group_by == "bucket"
+        assert [s.column for s in chart.series] == ["count"]
+
+    def test_7d_declares_a_trendline_per_bucket(self) -> None:
+        result = fold_queue_outcomes(
+            _qo_fixture(),
+            (QO_END - 7 * QO_DAY, QO_END),
+            period_seconds=QO_DAY,
+            merged=[],
+        )
+        chart = result.chart
+        assert chart is not None
+        assert chart.kind == "line"
+        assert chart.stacked is False
+        assert chart.x == "period_start"
+        assert chart.group_by == "bucket"
+
+    def test_4w_declares_a_trendline_too(self) -> None:
+        result = run_queue_outcomes(
+            window="4w",
+            now=QO_END,
+            location={"path": "p", "host": "h", "exists": True},
+            episode_source=_qo_fixture,
+            fetch=lambda **kw: {"entries": [], "has_more": False},
+        )
+        assert result.chart is not None
+        assert result.chart.kind == "line"
+
+    def test_an_empty_fold_declares_no_chart(self) -> None:
+        """An EMPTY result is not a zero score — an axis with no marks on it
+        reads as one, so there must be no chart to draw."""
+        result = fold_queue_outcomes([], (QO_END - QO_DAY, QO_END), merged=[])
+        assert result.rows == []
+        assert result.chart is None
+        assert result.to_dict()["chart"] is None
+
+    def test_the_chart_reaches_the_cli_json(self) -> None:
+        result = fold_queue_outcomes(
+            _qo_fixture(), (QO_END - QO_DAY, QO_END), merged=[]
+        )
+        payload = json.loads(json.dumps(result.to_dict()))
+        assert payload["chart"]["kind"] == "bar"
+        assert payload["chart"]["series"][0]["column"] == "count"
+
+    def test_the_chart_never_carries_its_own_numbers(self) -> None:
+        """One source of truth: the block names columns, never values."""
+        result = fold_queue_outcomes(
+            _qo_fixture(), (QO_END - QO_DAY, QO_END), merged=[]
+        )
+        blob = json.dumps(result.to_dict()["chart"])
+        assert "data" not in blob
+        assert "values" not in blob

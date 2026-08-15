@@ -3566,6 +3566,10 @@ def _openapi_spec() -> dict:
                                             "type": ["object", "null"],
                                             "description": "#1763: optional grand-total row keyed by the same column ids as `rows`. `null` for reports with no meaningful sum (issue-activity, drive-queue-status); a client that ignores it renders exactly as before.",
                                         },
+                                        "chart": {
+                                            "type": ["object", "null"],
+                                            "description": "#2271: optional chart declaration — `kind` (open vocabulary: bar/line/sparkline), `series[]` each naming a `columns[]` id, `x`, `group_by`, `stacked`. It carries NO numbers of its own; the renderer reads the same `rows` the table does. A client that ignores the key, or meets a `kind` it predates, renders the table and no chart.",
+                                        },
                                     },
                                     "required": [
                                         "report_id", "generated_at", "window",
