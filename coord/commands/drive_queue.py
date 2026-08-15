@@ -2123,11 +2123,25 @@ def drive_queue_tick(
         # Derived entirely from `entries` (the pre-tick snapshot) and `plan`
         # (already decided, already applied); nothing is re-read and nothing
         # here feeds back into the tick.
-        from coord.block_log import plan_events  # noqa: PLC0415
+        #
+        # `_record_block_log` -> `block_log.record` already swallows its own
+        # I/O errors, but `plan_events` itself is NOT wrapped there — it is a
+        # pure function over `entries`/`plan` with no I/O to fail, but the
+        # module's own invariant ("recording must never change a decision"
+        # / "an observability append that can fail a tick is strictly worse
+        # than no observability" — see `coord/block_log.py`'s docstring) means
+        # even an unanticipated edge case here must not turn an
+        # already-applied, already-successful tick into a reported CLI
+        # failure. Broad and silent to match `_record_operator_release`'s own
+        # defensive read above.
+        try:
+            from coord.block_log import plan_events  # noqa: PLC0415
 
-        _record_block_log(
-            plan_events(entries, plan, host=_local_host_id(), now=time.time())
-        )
+            _record_block_log(
+                plan_events(entries, plan, host=_local_host_id(), now=time.time())
+            )
+        except Exception:  # noqa: BLE001 — observability only, never blocks the tick
+            pass
 
         by_key = {e.key: e for e in entries}
         for item in plan.blocked:
