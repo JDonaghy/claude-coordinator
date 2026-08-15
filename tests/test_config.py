@@ -498,6 +498,54 @@ def test_load_with_no_arg_resolves_default(tmp_path, monkeypatch) -> None:
     assert [r.name for r in cfg.repos] == ["api"]
 
 
+# ── is_canonical_config_path (#2208) ─────────────────────────────────────────
+
+
+def test_is_canonical_config_path_true_for_the_resolved_default(tmp_path, monkeypatch) -> None:
+    from coord import config as cfgmod
+
+    monkeypatch.delenv("COORD_CONFIG", raising=False)
+    home_cfg = tmp_path / "home.yml"
+    home_cfg.write_text("x")
+    monkeypatch.setattr(cfgmod, "USER_CONFIG_PATH", home_cfg)
+    monkeypatch.setattr(cfgmod, "DEFAULT_CONFIG_PATH", tmp_path / "absent-cwd.yml")
+
+    assert cfgmod.is_canonical_config_path(home_cfg) is True
+    # An equivalent (non-normalized) spelling of the same file still counts.
+    assert cfgmod.is_canonical_config_path(tmp_path / "." / "home.yml") is True
+
+
+def test_is_canonical_config_path_false_for_a_scratch_override(tmp_path, monkeypatch) -> None:
+    """#2208: a throwaway --config pointed elsewhere is NOT canonical, even
+    though coord.config.load() parses it fine."""
+    from coord import config as cfgmod
+
+    monkeypatch.delenv("COORD_CONFIG", raising=False)
+    home_cfg = tmp_path / "home.yml"
+    home_cfg.write_text("x")
+    monkeypatch.setattr(cfgmod, "USER_CONFIG_PATH", home_cfg)
+    monkeypatch.setattr(cfgmod, "DEFAULT_CONFIG_PATH", tmp_path / "absent-cwd.yml")
+
+    scratch = tmp_path / "mini2.yml"
+    scratch.write_text("machines:\n  - name: ci-runner\n    host: ci-runner\n")
+
+    assert cfgmod.is_canonical_config_path(scratch) is False
+
+
+def test_is_canonical_config_path_respects_coord_config_env(tmp_path, monkeypatch) -> None:
+    """When $COORD_CONFIG is set, THAT is the canonical path for this
+    environment — matching it counts as canonical, same as any other
+    ordinary (non-override) resolution."""
+    from coord import config as cfgmod
+
+    env_file = tmp_path / "env.yml"
+    env_file.write_text("x")
+    monkeypatch.setenv("COORD_CONFIG", str(env_file))
+
+    assert cfgmod.is_canonical_config_path(env_file) is True
+    assert cfgmod.is_canonical_config_path(tmp_path / "other.yml") is False
+
+
 # ── PipelineConfig helpers ──────────────────────────────────────────────────
 
 

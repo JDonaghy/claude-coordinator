@@ -27,7 +27,13 @@ from typing import TYPE_CHECKING
 
 import click
 
-from coord.config import Config, ConfigError, load, resolve_config_path
+from coord.config import (
+    Config,
+    ConfigError,
+    is_canonical_config_path,
+    load,
+    resolve_config_path,
+)
 
 if TYPE_CHECKING:  # pragma: no cover — typing only
     from collections.abc import Iterator
@@ -100,7 +106,55 @@ _CONFIG_OPTION = click.option(
 )
 
 
-def _save_config_snapshot(config: Config) -> None:
+def _note_withheld_snapshot(config: Config, config_path: Path) -> None:
+    """Tell the operator that the #2208 guard just withheld a snapshot — but
+    only when withholding it actually changed the outcome.
+
+    Silence is what turned the original incident into an hour of
+    misdiagnosis: the fleet's ``machines`` table said ``ci-runner`` and
+    nothing anywhere said why. So when a non-canonical ``--config`` would
+    have *replaced a populated table with a different fleet* — the exact
+    shape of that incident — say so on stderr.
+
+    Everything else stays quiet, and that restraint is load-bearing rather
+    than cosmetic. ``--config <tmpfile>`` is the normal way to run coord
+    against a scratch config: CI stubs, the config *validator* in
+    ``scripts/azure-workers/coordinator-machine.py``, and every one of this
+    repo's ~110 CLI test modules. Emitting a note on each of those would
+    have made the guard a per-invocation nag, and — because Click's
+    ``CliRunner`` folds stderr into ``result.output`` — would have corrupted
+    the machine-readable stdout of commands like ``coord plans --json`` and
+    ``coord scorecard --json`` for anyone parsing combined output.
+
+    A skip with nothing to clobber (empty table, or a table that already
+    matches) withheld nothing observable, so it warrants no words.
+    """
+    try:
+        from coord.db import get_connection
+        conn = get_connection()
+        existing = [
+            str(row[0])
+            for row in conn.execute("SELECT name FROM machines ORDER BY name")
+        ]
+    except Exception:  # noqa: BLE001 — advisory only; never break the command
+        return
+    if not existing:
+        # Nothing to protect: no snapshot has ever landed here (a fresh
+        # host, or a CI runner whose DB only exists for this one command).
+        return
+    if existing == sorted(m.name for m in config.machines):
+        # The override names the same fleet — the write would have been a
+        # no-op, so the skip cost the operator nothing.
+        return
+    click.echo(
+        f"note: --config points at a non-canonical path ({config_path}); "
+        f"leaving the shared machines/pipeline snapshot untouched (#2208). "
+        f"Fleet machines on record: {', '.join(existing)}.",
+        err=True,
+    )
+
+
+def _save_config_snapshot(config: Config, config_path: Path | None = None) -> None:
     """Persist machine + pipeline metadata to the DB so dashboards can read it.
 
     Writes:
@@ -111,12 +165,27 @@ def _save_config_snapshot(config: Config) -> None:
 
     The pipeline keys let the TUI Pipeline panel pick up coordinator.yml
     settings without having to parse YAML itself.
+
+    *config_path* is the file *config* was actually loaded from. When given
+    and it is not the canonical resolution (see
+    ``coord.config.is_canonical_config_path``), the write is skipped
+    entirely — see the #2208 guard below. Callers that omit it (mainly
+    direct unit tests exercising the write itself) get the pre-#2208
+    behavior: always write.
     """
     # #584: a thin client (board_service configured) must not create/write a
     # local DB — the daemon/host owns the config snapshot.  On the host
     # board_service is unset, so the snapshot is written as before.
     from coord.client import resolve_board_service
     if resolve_board_service() is not None:
+        return
+    # #2208: an explicit `--config <file>` pointed away from the fleet's real
+    # config (a scratch fixture, a CI-only stub) must not be treated as a
+    # request to redefine the shared `machines` table — that table is global
+    # state every client's `/board` and the TUI read, not something a single
+    # throwaway invocation should own.
+    if config_path is not None and not is_canonical_config_path(config_path):
+        _note_withheld_snapshot(config, config_path)
         return
     conn = None
     try:
@@ -270,7 +339,7 @@ def _load_config(path: Path | None) -> Config:
     except ConfigError as e:
         click.echo(f"error: {e}", err=True)
         sys.exit(2)
-    _save_config_snapshot(cfg)
+    _save_config_snapshot(cfg, path)
     return cfg
 
 

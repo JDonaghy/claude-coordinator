@@ -342,10 +342,19 @@ def tagged_clone(tmp_path: Path) -> Path:
     """A throwaway local clone of this repo, cloned with no tags and then
     given exactly one synthetic `v9.9.9` tag on HEAD — models a tagged
     release checkout without depending on this repo's real (and
-    ever-changing) tag history."""
+    ever-changing) tag history.
+
+    `--no-hardlinks`: `git clone --local` hardlinks `.git/objects` by
+    default, which fails with "Invalid cross-device link" whenever pytest's
+    tmp_path (/tmp) and the checkout live on different filesystems — the
+    normal shape of a worker worktree under ~/.coord/worktrees on a box with
+    a separate /home. Copying instead keeps this fixture independent of the
+    runner's disk layout.
+    """
     clone = tmp_path / "tagged_clone"
     result = _run(
-        ["git", "clone", "--quiet", "--local", "--no-tags", str(REPO_ROOT), str(clone)],
+        ["git", "clone", "--quiet", "--local", "--no-hardlinks", "--no-tags",
+         str(REPO_ROOT), str(clone)],
         cwd=tmp_path,
     )
     assert result.returncode == 0, result.stderr
@@ -357,10 +366,12 @@ def tagged_clone(tmp_path: Path) -> Path:
 @pytest.fixture
 def tagless_clone(tmp_path: Path) -> Path:
     """A throwaway local clone of this repo with no tags reachable at
-    all — models a shallow/tagless CI checkout."""
+    all — models a shallow/tagless CI checkout. See `tagged_clone` for why
+    the clone is `--no-hardlinks`."""
     clone = tmp_path / "tagless_clone"
     result = _run(
-        ["git", "clone", "--quiet", "--local", "--no-tags", str(REPO_ROOT), str(clone)],
+        ["git", "clone", "--quiet", "--local", "--no-hardlinks", "--no-tags",
+         str(REPO_ROOT), str(clone)],
         cwd=tmp_path,
     )
     assert result.returncode == 0, result.stderr

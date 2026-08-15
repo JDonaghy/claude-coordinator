@@ -187,8 +187,15 @@ def _renamed_tagged_clone(tmp_path: Path, new_name: str, version: str) -> Path:
     to `claude-coordinator` to model a not-yet-upgraded agent.
     """
     clone = tmp_path / f"renamed_clone_{new_name}"
+    # `--no-hardlinks`: `git clone --local` hardlinks `.git/objects` by
+    # default, which dies with "Invalid cross-device link" whenever pytest's
+    # tmp_path (/tmp) and the checkout sit on different filesystems — the
+    # normal shape of a worker worktree under ~/.coord/worktrees on a box
+    # with a separate /home. Copying the objects costs a fraction of a
+    # second here and makes the test filesystem-layout independent.
     result = _run(
-        ["git", "clone", "--quiet", "--local", "--no-tags", str(REPO_ROOT), str(clone)],
+        ["git", "clone", "--quiet", "--local", "--no-hardlinks", "--no-tags",
+         str(REPO_ROOT), str(clone)],
         cwd=tmp_path,
     )
     assert result.returncode == 0, result.stderr

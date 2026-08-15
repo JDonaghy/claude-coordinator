@@ -51,6 +51,27 @@ def resolve_config_path() -> Path:
             return candidate
     return USER_CONFIG_PATH
 
+
+def is_canonical_config_path(path: Path) -> bool:
+    """Whether *path* is what :func:`resolve_config_path` resolves to *right now*.
+
+    #2208: a coord command run with an explicit ``--config <file>`` pointed
+    somewhere other than the fleet's real config — a scratch fixture, a
+    CI-only stub someone wrote specifically so ``coord.config.load()`` has
+    something to parse — is not a request to redefine the fleet. This gates
+    the shared machines/pipeline DB snapshot (``_save_config_snapshot`` in
+    ``coord/commands/_common.py``): only a *path* that matches the ordinary
+    resolution order ($COORD_CONFIG → ``~/.coord/coordinator.yml`` →
+    ``./coordinator.yml``) counts as canonical and is allowed to overwrite
+    that shared table. An explicit ``--config`` that happens to name the
+    same file the default resolution would have picked still counts as
+    canonical — this only catches a genuine *override*.
+    """
+    candidate = Path(path).expanduser().resolve()
+    canonical = resolve_config_path().expanduser().resolve()
+    return candidate == canonical
+
+
 # Safety-by-default: repos without explicit worker_permissions get this deny-list.
 DEFAULT_DENY_COMMANDS: list[str] = [
     "Bash(gh *)",

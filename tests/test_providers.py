@@ -2259,6 +2259,37 @@ def _edit_tool_calls(events: list[dict]) -> list[dict]:
     ]
 
 
+def _require_attempt(events: list[dict], calls: list[dict], expectation: str) -> None:
+    """Skip (never fail) when the model refused to even ATTEMPT the
+    forbidden call.
+
+    The DENY tests below prove opencode's *permission system* blocks a
+    call — which requires the model to actually emit the tool_use event.
+    work.md's own system-prompt text ALSO forbids the same actions, and a
+    reasoning-capable free-tier model sometimes refuses in prose without
+    ever calling a tool, e.g. (observed live, 2026-08-14, against the
+    `gh --version` wording that was specifically chosen to avoid this):
+    "I can't run that — my session rules explicitly prohibit running `gh`
+    commands". That outcome exercised the *advisory*, not the enforcement
+    under test; per ``_run_real_opencode_work``'s contract ("skips on any
+    problem that isn't permission enforcement itself") it is skip
+    territory, not a failure — no coord-side change can force a live model
+    to attempt a call its instructions forbid, so a hard assert here is a
+    coin-flip red on every branch (~2 in 4 local runs)."""
+    if calls:
+        return
+    texts = " | ".join(
+        e.get("part", {}).get("text", "")
+        for e in events
+        if e.get("type") == "text"
+    ).strip()
+    pytest.skip(
+        f"model never attempted {expectation} (no matching tool_use event) — "
+        f"the system-prompt advisory preempted it, so permission enforcement "
+        f"was not exercised this run; model said: {texts[:300]!r}"
+    )
+
+
 @_requires_real_opencode
 def test_opencode_work_agent_blocks_gh_end_to_end(tmp_path: Path) -> None:
     """PROOF for capabilities().enforces_deny_list=True: a real `work`-agent
@@ -2279,6 +2310,11 @@ def test_opencode_work_agent_blocks_gh_end_to_end(tmp_path: Path) -> None:
     GitHub interaction" to the model (verified: it reliably attempts it),
     while still matching work.md's `"gh *": "deny"` pattern, which is
     genuinely what's under test here.
+
+    "Reliably" decayed: by 2026-08-14 the live model refuses even
+    `gh --version` on the advisory alone in roughly half of runs. When
+    that happens there is no enforcement to observe — see
+    ``_require_attempt``, which skips instead of failing.
     """
     repo = _init_oc_throwaway_repo(tmp_path)
     events = _run_real_opencode_work(
@@ -2291,7 +2327,7 @@ def test_opencode_work_agent_blocks_gh_end_to_end(tmp_path: Path) -> None:
         if e["part"].get("state", {}).get("input", {}).get("command", "").strip()
         == "gh --version"
     ]
-    assert gh_calls, f"expected the model to attempt 'gh --version': {events}"
+    _require_attempt(events, gh_calls, "'gh --version' via bash")
     for call in gh_calls:
         state = call["part"]["state"]
         assert state.get("status") == "error", f"gh call was not blocked: {call}"
@@ -2334,7 +2370,7 @@ def test_opencode_work_agent_blocks_external_directory_access_end_to_end(
         if e.get("type") == "tool_use"
         and str(victim) in json.dumps(e.get("part", {}).get("state", {}).get("input", {}))
     ]
-    assert outside_calls, f"expected the model to attempt a tool call against {victim}: {events}"
+    _require_attempt(events, outside_calls, f"a tool call against {victim}")
     for call in outside_calls:
         assert call["part"]["state"].get("status") == "error", (
             f"call against the external path was not blocked: {call}"
@@ -2363,7 +2399,7 @@ def test_opencode_work_agent_blocks_tests_acceptance_edit_end_to_end(
         for e in edit_calls
         if "tests/acceptance/" in e["part"].get("state", {}).get("input", {}).get("filePath", "")
     ]
-    assert acceptance_edits, f"expected the model to attempt the edit: {events}"
+    _require_attempt(events, acceptance_edits, "the edit under tests/acceptance/")
     for call in acceptance_edits:
         assert call["part"]["state"].get("status") == "error", (
             f"edit under tests/acceptance/ was not blocked: {call}"
