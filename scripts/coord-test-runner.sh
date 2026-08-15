@@ -496,15 +496,52 @@ CARGO_SEARCHED='PATH, ${CARGO_HOME:-$HOME/.cargo}/bin/cargo, `rustup which cargo
 # failure mode #2180 exists to close) while turning a test that passes when
 # it shouldn't into a hard failure.
 #
-# Deliberately no `--config`: unlike CI (a GitHub Actions runner with no
-# access to the fleet's coordinator.yml, hence the CI-only
-# .github/coord-ci-acceptance.yml fragment), this script runs ON the
-# daemon host, whose real ~/.coord/coordinator.yml already declares
-# `acceptance.drivers.claude-coordinator`'s routes — the CI-only fragment's
-# own header says it mirrors them verbatim. `coord acceptance run`'s
-# default `--config` resolution ($COORD_CONFIG -> ~/.coord/coordinator.yml
-# -> ./coordinator.yml) picks that up the same way every other `coord`
-# invocation on this host does.
+# `--config` points at the SAME in-repo .github/coord-ci-acceptance.yml
+# fragment CI's own steps use — NOT the daemon host's real
+# ~/.coord/coordinator.yml, even though this script runs on that host and
+# every other `coord` invocation there resolves it by default. The first
+# version of this function did exactly that ("the fleet config's routes
+# mirror the fragment verbatim") and the assumption was wrong in the one
+# way the fragment's own header warns about: the fleet's cli-pytest route
+# is written for `--issue` scoping (`pytest tests/acceptance/{ms}`), and
+# `--all` always passes `ms=None`, which render_run_command documents as
+# leaving `{ms}` UNSUBSTITUTED — so pytest tried to collect a path
+# literally named `tests/acceptance/{ms}`, collected 0 tests, and this arm
+# reported the sealed suite red for every branch touching coord/**
+# (first bitten: issue-2235's Test leg, 2026-08-15). The fragment's routes
+# are written to cover the whole accumulated suite with no `{ms}`
+# reference at all, which is exactly the `--all` contract; it ships in the
+# same tree as this script, so the copy in $WT always matches the branch
+# under test.
+#
+# The PATH prefix matters for the same reason: the fragment's route is a
+# bare `pytest tests/acceptance`, resolved from PATH by the driver's
+# shell. CI activates its job venv so `pytest` lands on the right
+# interpreter; here `coord` is invoked by absolute path from a venv whose
+# bin/ was never put ON the PATH, and the daemon's own PATH (a systemd
+# user unit — see the #1814 toolchain notes above) has no pytest with this
+# repo's deps, or none at all.
+#
+# The scratch $HOME + cleared COORD_SERVICE_URL/COORD_TOKEN/COORD_CONFIG
+# are what make the `--config` above actually STICK. `_load_config`
+# (coord/commands/_common.py, #1080) treats "is a board service
+# configured" as the PRIMARY branch, checked BEFORE the explicit --config
+# path: on any machine with ~/.coord/client.toml or $COORD_SERVICE_URL
+# set (a thin client — or a daemon host whose client.toml points at its
+# own board service), it fetches the fleet's remote coordinator.yml and
+# silently overwrites the path we just passed. That remote config's
+# cli-pytest route is the {ms}-templated one this whole function exists
+# to avoid — the first --config-only version of this fix went red on
+# exactly that (`tests/acceptance/{ms}`: 0 collected, 2026-08-15,
+# issue-2235's second Test leg). #2208 is fixing the override-discard in
+# _load_config itself; until then — and even after, as hermeticity —
+# this invocation must look like a CI runner: no client.toml in $HOME
+# (a scratch dir inside $WT, same lifecycle as .pytest-acceptance.out),
+# no service env vars, so `resolve_board_service` returns None and the
+# explicit --config is honoured. Nothing in this codepath needs the real
+# $HOME: config comes from --config, the checkout from --path, and the
+# board-snapshot side-write is best-effort into $HOME/.coord (now the
+# scratch dir, exactly like a GitHub Actions runner's blank home).
 #
 # Called only after the ordinary suite above has already passed (or been
 # judged a tolerated flake) — same order CI enforces implicitly by running
@@ -513,8 +550,17 @@ CARGO_SEARCHED='PATH, ${CARGO_HOME:-$HOME/.cargo}/bin/cargo, `rustup which cargo
 run_python_acceptance_ci() {
     local venv="$1"
     local acc_out="$WT/.pytest-acceptance.out"
+    # Scratch home so `coord`'s thin-client branch can't see a real
+    # ~/.coord/client.toml and hijack --config (see header). Left in place
+    # like .pytest-acceptance.out — $WT is a disposable worktree.
+    local ci_home="$WT/.coord-ci-home"
+    mkdir -p "$ci_home"
     log "running: coord acceptance run --all --ci (cli-pytest route, ms-37)"
-    if ("$venv/bin/coord" acceptance run --repo claude-coordinator --all --ci \
+    if (env -u COORD_SERVICE_URL -u COORD_TOKEN -u COORD_CONFIG \
+            HOME="$ci_home" PATH="$venv/bin:$PATH" \
+            "$venv/bin/coord" acceptance run \
+            --repo claude-coordinator --all --ci \
+            --config "$WT/.github/coord-ci-acceptance.yml" \
             --for-path coord/cli.py --path "$WT") >"$acc_out" 2>&1; then
         say "PASS(python): ordinary suite + sealed acceptance suite (ms-37, cli-pytest) both green"
         return 0

@@ -1,5 +1,9 @@
-# #2180: a minimal, CI-ONLY coordinator.yml so `.github/workflows/*.yml` can
-# invoke `coord acceptance run --all --ci` (#2164's CI wrapper, PR #2173).
+# #2180: a minimal coordinator.yml so `.github/workflows/*.yml` can invoke
+# `coord acceptance run --all --ci` (#2164's CI wrapper, PR #2173). The Test
+# stage's engine (scripts/coord-test-runner.sh, run_python_acceptance_ci)
+# points its own `--all --ci` invocation at this same file — the fleet's
+# real config routes are `--issue`-scoped (`{ms}`-templated) and cannot
+# serve `--all`; see that function's header comment.
 #
 # This is deliberately NOT the fleet's real coordinator.yml. That file lives
 # outside this repo (~/.coord/coordinator.yml on the coordinator host,

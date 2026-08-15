@@ -32,6 +32,7 @@ from click.testing import CliRunner
 from coord import state
 from coord.cli import main
 from coord.drive_queue import (
+    DEFAULT_MAX_ATTEMPTS,
     DRIVE_STARTUP_GRACE_SECONDS,
     PARK_STALE_SECONDS,
     QUEUE_ALERT_ISSUE,
@@ -142,6 +143,26 @@ def tick_lock(monkeypatch, tmp_path) -> Path:
     return path
 
 
+@pytest.fixture(autouse=True)
+def block_log(monkeypatch, tmp_path) -> Path:
+    """Give every test its own #2235 Phase-0 stall log.
+
+    Same hazard, same fix as `tick_lock` above: `block_log_path()` resolves
+    under the REAL `~/.coord`, so without this the suite would append test
+    fixtures into the operator's actual two-week evidence file — the one whose
+    whole value is that every row in it really happened.
+    """
+    path = tmp_path / "queue-block-log.jsonl"
+    monkeypatch.setenv("COORD_BLOCK_LOG", str(path))
+    return path
+
+
+def block_log_records(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
 @pytest.fixture
 def live_sessions(monkeypatch):
     def _set(*issues: int) -> None:
@@ -190,7 +211,7 @@ def test_drive_queue_is_registered_with_every_verb():
     assert "drive-queue" in main.commands
     assert set(main.commands["drive-queue"].commands) == {
         "add", "list", "remove", "move", "status", "tick", "resume",
-        "overlap-report",
+        "overlap-report", "block-log",
     }
 
 
@@ -2545,3 +2566,222 @@ def test_a_hold_after_entry_that_ends_blocked_raises_no_second_alert(
     # …and the queue-level record is the ordinary stall line, not a HELD one.
     alert = state._get_drive_escalation_local(QUEUE_ALERT_REPO, QUEUE_ALERT_ISSUE)
     assert alert is None or "HELD" not in alert["reason"]
+
+
+# ── #2235 Phase 0: the stall log ─────────────────────────────────────────────
+#
+# 2026-08-14's triage found seven blocked/parked entries and, in FIVE of them,
+# a stated block reason that named a symptom rather than the cause. That
+# finding gates Phase 1's entire scope, and it was reconstructed by hand from
+# one morning. These tests pin the recorder that measures it continuously.
+#
+# The recorder is instrumentation and nothing else: every assertion below that
+# checks queue state (`attempts`, `state`, escalations) is there to prove the
+# log changed no decision, which is Phase 0's hard constraint.
+
+
+def test_an_entry_that_reaches_blocked_lands_in_the_stall_log(
+    cli, seed, launches, block_log
+):
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    cli("tick")
+    _backdate(1762, DRIVE_STARTUP_GRACE_SECONDS + 60)
+    cli("tick")
+    _backdate(1762, DRIVE_STARTUP_GRACE_SECONDS + 60)
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    assert queued(1762)["state"] == "blocked"
+
+    records = block_log_records(block_log)
+    assert [r["event"] for r in records] == ["enter"]
+    assert records[0]["key"] == f"{REPO}#1762"
+    assert records[0]["state"] == "blocked"
+    # Verbatim: the comparison against what the release later reveals IS the
+    # measurement, so the reason must not be normalised on the way in.
+    assert records[0]["stated_reason"]
+    assert records[0]["true_cause"] == ""
+
+
+def test_a_parked_entry_and_its_own_release_are_both_recorded(
+    cli, seed, launches, coord_db, block_log
+):
+    """One episode, two records — the #1891 shape, start to finish.
+
+    This is the category #2235 predicts is already handled by mechanism (the
+    park costs no attempt and releases itself), so the log has to be able to
+    show it costing zero interventions rather than merely not complaining.
+    """
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    cli("tick")
+    _seed_ci_pending_merge_row(coord_db, 1762)
+    _backdate(1762, DRIVE_STARTUP_GRACE_SECONDS + 60)
+    cli("tick")
+    assert queued(1762)["state"] == "parked"
+
+    coord_db.execute(
+        "UPDATE merge_queue SET error = NULL WHERE issue_number = ?", (1762,)
+    )
+    coord_db.commit()
+    cli("tick")
+    assert queued(1762)["state"] == "running"
+
+    records = block_log_records(block_log)
+    assert [r["event"] for r in records] == ["enter", "resolve"]
+    assert records[0]["state"] == "parked"
+    assert records[1]["human_acted"] is False
+    assert records[1]["resolution"] == "auto_resumed"
+    assert "ci-reported" in records[1]["true_cause"]
+
+
+def test_removing_a_blocked_entry_is_recorded_as_a_human_intervention(
+    cli, seed, launches, block_log
+):
+    """`remove && add` is the documented one-key fix, so it IS the metric.
+
+    #2235's success measure is interventions per night; without this record
+    the only interventions the log could ever see are the ones the queue
+    performed on itself, and the number would trend to zero by omission.
+    """
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    state._update_drive_queue_entry_local(
+        REPO, 1762, state="blocked", attempts=2, last_reason="advisory — 0 commits"
+    )
+
+    result = cli("remove", REPO, "1762")
+    assert result.exit_code == 0, result.output
+
+    records = block_log_records(block_log)
+    assert [r["event"] for r in records] == ["resolve"]
+    assert records[0]["human_acted"] is True
+    assert records[0]["source"] == "operator"
+    assert records[0]["stated_reason"] == "advisory — 0 commits"
+
+
+def test_removing_a_healthy_entry_is_not_counted_as_an_intervention(
+    cli, seed, launches, block_log
+):
+    """Housekeeping is not a rescue.
+
+    Counting every `remove` would inflate the one number the plan wants to
+    watch fall, and an inflated baseline makes any later improvement
+    unfalsifiable.
+    """
+    cli("add", REPO, "1762")
+    result = cli("remove", REPO, "1762")
+    assert result.exit_code == 0, result.output
+    assert block_log_records(block_log) == []
+
+
+def test_a_launch_that_never_reaches_tmux_is_recorded_too(
+    cli, seed, launches, block_log
+):
+    """stick-demo#1's row: "dispatch failed", blocked OUTSIDE the tick plan."""
+    launches.outcome = {"returncode": 1, "stderr": "agent repo list frozen"}
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    state._update_drive_queue_entry_local(REPO, 1762, attempts=DEFAULT_MAX_ATTEMPTS - 1)
+
+    result = cli("tick")
+    assert result.exit_code != 0  # the branch re-raises, as it always has
+    assert queued(1762)["state"] == "blocked"
+
+    records = block_log_records(block_log)
+    assert [r["event"] for r in records] == ["enter"]
+    assert records[0]["outcome"] == "launch_failed"
+    assert "agent repo list frozen" in records[0]["stated_reason"]
+    # The recomputed post-write count, not the stale pre-tick snapshot.
+    assert records[0]["attempts"] == DEFAULT_MAX_ATTEMPTS
+
+
+def test_a_quiet_tick_writes_nothing_to_the_stall_log(cli, seed, launches, block_log):
+    """A log that grows on healthy ticks is a log nobody reads by week two."""
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    cli("tick")
+    assert queued(1762)["state"] == "running"
+    assert block_log_records(block_log) == []
+
+
+def test_the_stall_log_changes_no_queue_decision(
+    cli, seed, launches, block_log, monkeypatch
+):
+    """Phase 0's hard constraint, asserted directly.
+
+    An unwritable log must cost the measurement and nothing else — the tick
+    still blocks the entry, still spends exactly the attempts it would have,
+    and still escalates.
+    """
+    # A path whose parent is a regular file: every filesystem call blows up.
+    wall = block_log.parent / "wall"
+    wall.write_text("x")
+    monkeypatch.setenv("COORD_BLOCK_LOG", str(wall / "log.jsonl"))
+
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    cli("tick")
+    _backdate(1762, DRIVE_STARTUP_GRACE_SECONDS + 60)
+    cli("tick")
+    _backdate(1762, DRIVE_STARTUP_GRACE_SECONDS + 60)
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    entry = queued(1762)
+    assert entry["state"] == "blocked"
+    assert entry["attempts"] == 2
+    assert state._get_drive_escalation_local(REPO, 1762) is not None
+
+
+def test_block_log_reports_the_stated_reason_beside_the_true_cause(
+    cli, seed, launches, coord_db, block_log
+):
+    """The report's whole job: put the two columns next to each other."""
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    cli("tick")
+    _seed_ci_pending_merge_row(coord_db, 1762)
+    _backdate(1762, DRIVE_STARTUP_GRACE_SECONDS + 60)
+    cli("tick")
+    coord_db.execute(
+        "UPDATE merge_queue SET error = NULL WHERE issue_number = ?", (1762,)
+    )
+    coord_db.commit()
+    cli("tick")
+
+    result = cli("block-log")
+    assert result.exit_code == 0, result.output
+    assert f"{REPO}#1762" in result.output
+    assert "stated:" in result.output
+    assert "cause:" in result.output
+    # The pair that only means anything together.
+    assert "0 needed a human" in result.output
+    assert "0 still stalled" in result.output
+
+
+def test_block_log_json_carries_the_summary_and_every_episode(
+    cli, seed, launches, block_log
+):
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    state._update_drive_queue_entry_local(
+        REPO, 1762, state="blocked", attempts=2, last_reason="stale test verdict"
+    )
+    cli("remove", REPO, "1762")
+
+    result = cli("block-log", "--json")
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["summary"]["human_acted"] == 0  # no `enter` was ever logged…
+    assert payload["episodes"] == []  # …so the orphan `resolve` is dropped
+    assert payload["days"] == 14.0
+
+
+def test_block_log_on_an_empty_log_says_so_rather_than_printing_nothing(
+    cli, block_log
+):
+    result = cli("block-log")
+    assert result.exit_code == 0, result.output
+    assert "no stalls recorded" in result.output
