@@ -10,7 +10,7 @@ import httpx
 
 from typing import TYPE_CHECKING
 
-from coord.config import Config
+from coord.config import INTERACTIVE_SESSION_TYPES, Config
 from coord.dispatch import AGENT_PORT
 from coord.models import WORK_LIKE_TYPES, Assignment, Board, Machine
 
@@ -47,6 +47,120 @@ _AGENT_TERMINAL_STATUS = {
     "failed": "failed",
     "cancelled": "failed",
 }
+
+
+# ── #2275: the agent has no record of this assignment ──────────────────────
+#
+# Pinned reason string, written verbatim to `assignments.failure_reason` when
+# the no-record arm below reconciles a row.  Asserted on by
+# `tests/test_reconcile_no_agent_record.py` and (deliberately) the only thing
+# a human or a downstream reader has to grep for to understand why a row went
+# terminal without a worker verdict.
+NO_AGENT_RECORD_REASON = (
+    "agent has no record of this assignment (present in neither its /status "
+    "`active` nor `completed` list) — the worker process is gone: the agent "
+    "restarted with its state lost, the machine rebooted, or the completion "
+    "rolled off the capped history before anything observed it (#2275)"
+)
+
+# Minimum age (seconds since `dispatched_at`) before the no-record arm will
+# reconcile a row.
+#
+# The positive disproof — "in neither list" — is what makes this arm safe;
+# this window is the belt to its braces, and exists for exactly one shape:
+# `AgentServer.assign()` builds the worktree BEFORE taking `self._lock` to
+# insert into `self._assignments` (see the identical race window called out in
+# `clean_worktrees`).  Any dispatch path that learns an assignment id and
+# writes a `running` board row without waiting for that insert would otherwise
+# hand this arm a row the agent genuinely will know about a moment later.  Two
+# minutes is orders of magnitude longer than that window and orders of
+# magnitude shorter than the 11 hours #2208 burned, so it costs nothing real.
+#
+# It is NOT a restart grace window — see `reconcile_completed_assignments`'
+# docstring for why an agent restart does not produce a mass reap.
+_NO_RECORD_GRACE_SECONDS = 120.0
+
+
+def is_attended_session(a: object) -> bool:
+    """True when *a* is a human-attended session, not an agent subprocess (#2275).
+
+    The exclusion that keeps the no-record arm in
+    :func:`reconcile_completed_assignments` from reaping live work.  An
+    attended session is launched into tmux/a PTY by ``coord assign
+    --interactive`` — it is not an agent subprocess, so it appears in NEITHER
+    the agent's ``active`` list NOR its ``completed`` list, for its whole
+    life.  Without this check the no-record arm would reap every attended
+    session the moment it started, which is the #1658 failure mode (reaping
+    live headless workers) pointed at a human's own terminal.
+
+    Two independent discriminators, either of which is sufficient — this is a
+    reaping path, so it is deliberately over-inclusive:
+
+    * ``provider_name == "claude-pty"`` — stamped by every ``--interactive``
+      dispatch (the same discriminator :func:`is_interactive_merge_session`
+      and :meth:`coord.config.PipelineConfig.attention_threshold_for` use).
+      This is the load-bearing one: an interactive ``--fix-of``/
+      ``--review-of``/``--smoke-of`` session shares its ``type`` with a
+      headless counterpart, so only ``provider_name`` tells them apart.
+    * ``type in`` :data:`coord.config.INTERACTIVE_SESSION_TYPES` — the
+      chat/troubleshoot/audit/refinement family, which has no headless
+      counterpart at all and never goes near an agent.
+
+    Dead attended sessions are reaped by their own path
+    (:func:`coord.interactive.reap_stale_interactive_sessions`, called from
+    :func:`reconcile`), which probes the actual tmux server rather than
+    inferring death from an agent's silence.  That is the correct instrument
+    for them; this one must stay out of the way.
+    """
+    if getattr(a, "provider_name", None) == "claude-pty":
+        return True
+    return getattr(a, "type", None) in INTERACTIVE_SESSION_TYPES
+
+
+def agent_has_no_record(status: dict, assignment_id: str) -> bool:
+    """True when *status* positively shows the agent knows nothing of *assignment_id*.
+
+    #2275's whole point: ``/status`` carries ``active`` (everything the agent
+    has a live subprocess for) and ``completed`` (its capped terminal
+    history).  An id in NEITHER is a **positive statement** about the agent's
+    state — "no record" — not an inference from silence, which is what the
+    old ``entry is None → continue`` conflated with "still running".
+
+    Fail-open on a payload that doesn't carry both keys.  A response missing
+    ``active`` cannot support the disproof (we would be inferring from
+    absence again, exactly the bug), so it is treated as "cannot tell" and
+    the caller leaves the row alone.  This also means an older agent build,
+    or any future ``/status`` variant, degrades to today's behaviour rather
+    than to a reap.
+    """
+    if not isinstance(status, dict):
+        return False
+    active = status.get("active")
+    completed = status.get("completed")
+    if not isinstance(active, list) or not isinstance(completed, list):
+        return False
+    for entries in (active, completed):
+        for e in entries:
+            if isinstance(e, dict) and e.get("id") == assignment_id:
+                return False
+    return True
+
+
+def _no_record_grace_elapsed(a: Assignment, *, now: float | None = None) -> bool:
+    """True when *a* is old enough for the no-record arm (:data:`_NO_RECORD_GRACE_SECONDS`).
+
+    A row with no ``dispatched_at`` at all is eligible: the grace window
+    guards a dispatch-time race, and a row that never recorded a dispatch
+    time is not in one.
+    """
+    dispatched_at = getattr(a, "dispatched_at", None)
+    if not dispatched_at:
+        return True
+    try:
+        dispatched = float(dispatched_at)
+    except (TypeError, ValueError):
+        return True
+    return (time.time() if now is None else now) - dispatched >= _NO_RECORD_GRACE_SECONDS
 
 
 def effective_agent_status(entry: dict) -> str:
@@ -143,7 +257,49 @@ def reconcile_completed_assignments(
 
     Interactive sessions are tmux launches, not agent subprocesses, so they
     never appear in the agent's ``completed`` list — a live attended session
-    can't be reaped by this path.
+    can't be reaped by this path.  #2275 made that a CHECKED property rather
+    than an emergent one: see :func:`is_attended_session`.
+
+    **#2275 — the second reconcile arm: "the agent has no record of it".**
+    Until #2275 this function only ever acted on a row it found in the agent's
+    ``completed`` history.  Anything else hit a bare ``continue`` whose comment
+    read *"still active on the agent (or rolled off history) → leave it"* —
+    two cases with opposite correct handling, conflated, both left.  That is
+    not a race: ``_COMPLETED_HISTORY_CAP`` is 25, so a leg that dies needs only
+    25 further completions on its machine before its id is gone from
+    ``/status``, after which nothing on the daemon's 30s clock would ever look
+    at that row again.  It cost claude-coordinator#2208 8 hours and both drive
+    attempts on an already-green branch; a human running ``coord status``
+    cleared it, and the branch was merge-READY 14 minutes later.
+
+    The fix is a positive disproof: ``/status`` carries both ``active`` and
+    ``completed``, and an id in NEITHER is a statement about the agent's state,
+    not an inference from its silence.  Those — and only those — are
+    reconciled, to ``failed`` (never ``done``) with :data:`NO_AGENT_RECORD_
+    REASON`.  See :func:`agent_has_no_record` and
+    :func:`_reconcile_no_agent_record`.
+
+    Three guards, because **this arm reaps** and #1658 is what getting that
+    wrong looks like in production:
+
+    1. :func:`is_attended_session` — attended sessions appear in neither list
+       for their whole life.  Reaping them is the regression that costs real
+       work; :func:`coord.interactive.reap_stale_interactive_sessions` owns
+       them, and it probes tmux rather than guessing.
+    2. An unreachable agent still short-circuits at ``if not status`` above,
+       unweakened.  **No record and no answer are different things.**
+    3. :data:`_NO_RECORD_GRACE_SECONDS` since ``dispatched_at``.
+
+    On **agent restart** (the ``coord agent update`` roll) this is deliberately
+    NOT a mass reap, and not because of the grace window: ``AgentServer.
+    _load_state`` restores the persisted assignments and rewrites every
+    ``pending``/``running`` one to ``failed`` with *"agent restarted;
+    subprocess lost"* before the first ``/status`` is served.  Those rows are
+    therefore IN ``completed``, and the ordinary path above handles them with a
+    real reason.  Genuinely-empty ``active`` + ``completed`` means the agent
+    lost its state file too (fresh install, corrupt state moved aside by
+    #1421's handler) — and there the workers really are gone, so reconciling
+    every row on that machine is the correct answer rather than an accident.
 
     Returns one dict per reconciled assignment (empty when nothing changed).
     """
@@ -182,7 +338,22 @@ def reconcile_completed_assignments(
             None,
         )
         if entry is None:
-            continue  # still active on the agent (or rolled off history) → leave it
+            # #2275: NOT in `completed` has two causes with OPPOSITE correct
+            # handling — "still running on the agent" (leave it) and "the
+            # agent has no record of it at all" (reconcile it).  This used to
+            # be a bare `continue` that named both cases in a comment and
+            # then left both, so a row in the second case was re-skipped every
+            # 30s forever while `status` read `running` (#2208: 8 hours and
+            # both drive attempts burned on an already-green branch).
+            # `agent_has_no_record` tells them apart from the `active` list —
+            # a positive disproof, not an inference from silence.
+            if (
+                agent_has_no_record(status, aid)
+                and not is_attended_session(a)
+                and _no_record_grace_elapsed(a)
+            ):
+                _reconcile_no_agent_record(a, aid, update_state_fn, reconciled)
+            continue
         # #1534: `effective_agent_status` refuses an agent-reported `done`
         # that also carries a usage-limit-kill reason — the daemon's passive
         # tick is the FIRST place most completions are observed, so without
@@ -325,8 +496,83 @@ def reconcile_completed_assignments(
     return reconciled
 
 
+def _reconcile_no_agent_record(
+    a: Assignment,
+    aid: str,
+    update_state_fn,
+    reconciled: list[dict],
+) -> None:
+    """#2275: flip a ``running`` row the agent has no record of to ``failed``.
+
+    Called from :func:`reconcile_completed_assignments` only, and only once
+    all three guards there have passed (positive disproof, not attended, past
+    the grace window).
+
+    **``failed``, never ``done``.** This leg never reported a verdict, so the
+    one thing that must not happen is a silent flip to ``done`` — that
+    manufactures a pass and every downstream gate (review dispatch, the
+    acceptance gate, the merge queue) then behaves as if a slice exists that
+    nobody ever produced.  A stall is bad; a manufactured pass is worse.
+    ``failure_reason`` is the pinned :data:`NO_AGENT_RECORD_REASON`, so
+    ``coord status``/the TUI/``coord drive`` all name the cause rather than
+    showing a failure with no explanation.
+
+    ``exit_code`` is deliberately left ``None``: there is no reap, so there is
+    no exit code, and writing a fake one would be the same class of lie as
+    writing ``done``.
+
+    Kept passive, per this module's #1616 contract — it writes state through
+    the same ``update_state_fn`` seam and dispatches nothing.  The ONE thing
+    it does beyond the write is the #1605 Test-stage propagation, which is not
+    a new side effect: it is the same call the ordinary ``terminal ==
+    "failed"`` path already makes, and skipping it would leave the parent
+    work row's ``test_state="running"`` forever — i.e. it would fix half of
+    #2208 and leave the other half stranded.
+    """
+    update_state_fn(
+        assignment_id=aid,
+        terminal_status="failed",
+        branch=a.branch,
+        review_state=None,
+        failure_reason=NO_AGENT_RECORD_REASON,
+        exit_code=None,
+    )
+
+    if a.type == "smoke":
+        # #2275: environmental by construction, so state it rather than
+        # letting `classify_failure` guess.  `NO_AGENT_RECORD_REASON` is
+        # coordinator-authored prose with no wire token in it, so the
+        # classifier would (correctly, by its own "default to work" rule)
+        # call it a WORK failure and record `test_state="failed"` — which
+        # spends a bounded `coord fix` round chasing a code defect that never
+        # existed, on a branch that in #2208's case was already green.  A
+        # vanished worker is the machine's fault, not the work's; clearing
+        # the verdict lets `dispatch_pending_smoke` re-run the Test stage on
+        # its next tick, which is exactly what a human did in 14 minutes.
+        propagate_smoke_terminal_failure(
+            parent_assignment_id=a.review_of_assignment_id,
+            failure_reason=NO_AGENT_RECORD_REASON,
+            environmental=True,
+        )
+
+    reconciled.append(
+        {
+            "assignment_id": aid,
+            "issue_number": a.issue_number,
+            "repo": a.repo_name,
+            "type": a.type,
+            "to_status": "failed",
+            "plan_captured": False,
+            "reason": NO_AGENT_RECORD_REASON,
+        }
+    )
+
+
 def propagate_smoke_terminal_failure(
-    *, parent_assignment_id: str | None, failure_reason: str | None,
+    *,
+    parent_assignment_id: str | None,
+    failure_reason: str | None,
+    environmental: bool | None = None,
 ) -> None:
     """#1605: resolve a work row's ``test_state`` when its Test-stage
     (``type="smoke"``) child dies without ever reporting pass/fail.
@@ -358,6 +604,17 @@ def propagate_smoke_terminal_failure(
       completion already does (`coord/notify.py`'s completion handler), so
       the existing bounded `coord fix` loop picks it up from there.
 
+    *environmental* (#2275) overrides that classification when the CALLER
+    already knows the answer.  Default ``None`` means "classify from
+    *failure_reason*", i.e. every pre-#2275 caller is unchanged.  Pass
+    ``True`` only when the reason is coordinator-authored prose describing a
+    lost worker rather than a worker's own terminal output — the classifier's
+    vocabulary is deliberately restricted to named API/network wire tokens
+    (see :mod:`coord.failure_class`) and correctly defaults everything else to
+    WORK, so a call site that *knows* the machine ate the worker has to say
+    so rather than smuggle a token into its prose.  The only such caller today
+    is :func:`_reconcile_no_agent_record`.
+
     A no-op when *parent_assignment_id* is falsy (a smoke row somehow
     missing its ``review_of_assignment_id`` — should not happen in practice,
     but this must never raise on it).
@@ -372,7 +629,13 @@ def propagate_smoke_terminal_failure(
     )
 
     classification = classify_failure(failure_reason=failure_reason)
-    if classification.is_environmental:
+    if environmental is None:
+        is_environmental = classification.is_environmental
+        cause = classification.reason
+    else:
+        is_environmental = bool(environmental)
+        cause = failure_reason or classification.reason
+    if is_environmental:
         # #2272: this clear must CARRY the mute-leg tally, for exactly the
         # reason `dispatch_smoke`'s `running` stamp must. `test_reason` is the
         # only field that survives between Test-stage legs, so any writer that
@@ -392,7 +655,7 @@ def propagate_smoke_terminal_failure(
             test_state=None,
             test_reason=(
                 f"{prefix}Test stage worker died environmentally "
-                f"({classification.reason}) — cleared for automatic "
+                f"({cause}) — cleared for automatic "
                 "re-dispatch, not recorded as a work failure (#1605)"
             ),
         )
