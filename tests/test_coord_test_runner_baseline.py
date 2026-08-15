@@ -137,6 +137,10 @@ fi
 if [[ -n "${FAKE_COORD_PATH_LOG:-}" ]]; then
     printf '%s\n' "$PATH" >> "$FAKE_COORD_PATH_LOG"
 fi
+if [[ -n "${FAKE_COORD_ENV_LOG:-}" ]]; then
+    printf 'HOME=%s\nCOORD_SERVICE_URL=%s\n' \
+        "${HOME:-}" "${COORD_SERVICE_URL:-<unset>}" >> "$FAKE_COORD_ENV_LOG"
+fi
 exit "${FAKE_ACCEPTANCE_EXIT:-0}"
 """
 
@@ -415,11 +419,19 @@ def test_a_passing_python_suite_also_runs_the_acceptance_ci_wrapper(repo: Path, 
     the isolated re-run can report green."""
     argv_log = tmp_path / "coord-argv.log"
     path_log = tmp_path / "coord-path.log"
+    env_log = tmp_path / "coord-env.log"
     result = _run(
         repo,
         FAKE_RERUN_PASSES="1",
         FAKE_COORD_ARGV_LOG=str(argv_log),
         FAKE_COORD_PATH_LOG=str(path_log),
+        FAKE_COORD_ENV_LOG=str(env_log),
+        # Simulate a board_service-configured host (thin client, or a daemon
+        # host whose client.toml points at its own board service): the
+        # runner must strip this before invoking `coord`, or _load_config's
+        # #1080 thin-client branch fetches the fleet's remote config and
+        # silently discards the --config we assert on above.
+        COORD_SERVICE_URL="http://board.example:7435",
     )
 
     assert result.returncode == 0
@@ -456,6 +468,32 @@ def test_a_passing_python_suite_also_runs_the_acceptance_ci_wrapper(repo: Path, 
         "run_python_acceptance_ci did not prepend the venv's bin/ to PATH — "
         "the cli-pytest route's bare `pytest` would resolve outside the "
         f"branch venv: PATH={recorded_path!r}"
+    )
+    # --config is necessary but NOT sufficient: `_load_config`'s #1080
+    # thin-client branch (coord/commands/_common.py) checks "is a board
+    # service configured" BEFORE honouring the explicit path, so on any
+    # host with $COORD_SERVICE_URL or a real ~/.coord/client.toml the flag
+    # is silently discarded in favour of the fleet's remote
+    # {ms}-templated config — the exact `tests/acceptance/{ms}` 0-collected
+    # failure the --config-only version of this fix still produced
+    # (issue-2235's second Test leg, 2026-08-15). The runner must invoke
+    # `coord` like a CI runner: scratch $HOME (no client.toml) and the
+    # service env vars stripped.
+    recorded_env = env_log.read_text()
+    assert "COORD_SERVICE_URL=<unset>" in recorded_env, (
+        "run_python_acceptance_ci leaked COORD_SERVICE_URL through to "
+        "`coord` — _load_config's thin-client branch will fetch the remote "
+        f"fleet config and discard --config: {recorded_env!r}"
+    )
+    env_home = next(
+        (line.removeprefix("HOME=") for line in recorded_env.splitlines()
+         if line.startswith("HOME=")),
+        "",
+    )
+    assert env_home == str(repo / ".coord-ci-home"), (
+        "run_python_acceptance_ci did not point $HOME at the scratch "
+        "in-worktree home — a real ~/.coord/client.toml would re-arm the "
+        f"thin-client branch even with the env vars stripped: {recorded_env!r}"
     )
 
 
