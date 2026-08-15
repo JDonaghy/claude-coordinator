@@ -3044,6 +3044,23 @@ def test_diagnose_on_a_quiet_queue_says_so_rather_than_printing_nothing(
     assert "nothing to diagnose" in result.output
 
 
+def test_diagnose_refuses_on_a_thin_client_rather_than_reading_an_empty_board(
+    cli, monkeypatch
+):
+    """#615/#906 audit guard: everything diagnose reads lives on the daemon host.
+
+    With a board service configured (thin client), the local block log, queue
+    rows and board are all empty — a "diagnosis" of that would be a confident
+    report about a queue that isn't there. The command must refuse loudly
+    before touching any of them.
+    """
+    monkeypatch.setattr("coord.board_service.is_remote", lambda: True)
+
+    result = cli("diagnose")
+    assert result.exit_code != 0
+    assert "run it there" in result.output
+
+
 def test_diagnose_does_not_silently_cap_what_an_operator_asked_for(
     cli, seed, block_log, gh_world
 ):

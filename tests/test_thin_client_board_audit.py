@@ -198,9 +198,19 @@ COMMANDS_ALLOWLIST: dict[str, set[tuple[str, str]]] = {
     # returns before the module-level read is even imported, let alone called.
     # Also read-only and wrapped in the same fail-soft `except Exception:
     # return {}`, which degrades to `plan_tick`'s board-only fallback.
+    # #2276-guarded: `drive_queue_diagnose` (the read-only queue
+    # diagnostician) sits behind an explicit `if is_remote(): raise
+    # click.ClickException(...)` early-exit placed ABOVE the
+    # `from coord.state import build_board` import — everything the command
+    # reads (Phase-0 block log, queue rows, the board handed to GhLiveProbe)
+    # lives on the daemon host, and its probes need `gh` (#1483), so a thin
+    # client fails loud instead of confidently diagnosing an empty queue.
+    # Read-only with respect to the board: build_board only, no save_board —
+    # its single write is a `diagnosis` record in the Phase-0 block log.
     "drive_queue.py": {
         ("_fetch_live_ci_gate", "load_board"),
         ("_fetch_live_blocked_gate", "load_board"),
+        ("drive_queue_diagnose", "build_board"),
     },
     # #1337: `coord test` no longer calls save_board at all — the verdict is
     # recorded via the single-row `record_test_verdict` on both paths (it

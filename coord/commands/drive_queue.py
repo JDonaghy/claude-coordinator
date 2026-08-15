@@ -1120,7 +1120,22 @@ def drive_queue_diagnose(output_json: bool, dry_run: bool, config_path: Path) ->
     deliberately no second definition of "stalled" anywhere in this path.
     """
     from coord import block_log, queue_diagnose  # noqa: PLC0415
+    from coord.board_service import is_remote  # noqa: PLC0415
     from coord.commands._common import _load_config  # noqa: PLC0415
+
+    # #615/#906 guard: everything this command reads — the Phase-0 block log,
+    # the queue rows, the board handed to GhLiveProbe — lives on the daemon
+    # host, and the probes need `gh` (denied to workers, #1483). On a thin
+    # client all three reads would be silently empty, so the "diagnosis"
+    # would be a confident report about a queue that isn't there. Fail loud
+    # instead (the exact #615 failure mode this audit exists to prevent).
+    if is_remote():
+        raise click.ClickException(
+            "drive-queue diagnose reads the daemon host's block log, queue "
+            "and board directly — run it there (a board_service-configured "
+            "thin client would diagnose an empty queue)."
+        )
+
     from coord.state import build_board, list_drive_queue  # noqa: PLC0415
 
     config = _load_config(config_path)
