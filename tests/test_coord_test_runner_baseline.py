@@ -134,6 +134,9 @@ _FAKE_COORD = r"""#!/usr/bin/env bash
 if [[ -n "${FAKE_COORD_ARGV_LOG:-}" ]]; then
     printf '%s\n' "$*" >> "$FAKE_COORD_ARGV_LOG"
 fi
+if [[ -n "${FAKE_COORD_PATH_LOG:-}" ]]; then
+    printf '%s\n' "$PATH" >> "$FAKE_COORD_PATH_LOG"
+fi
 exit "${FAKE_ACCEPTANCE_EXIT:-0}"
 """
 
@@ -411,7 +414,13 @@ def test_a_passing_python_suite_also_runs_the_acceptance_ci_wrapper(repo: Path, 
     run always reports failures first, same as a real flaky suite; only
     the isolated re-run can report green."""
     argv_log = tmp_path / "coord-argv.log"
-    result = _run(repo, FAKE_RERUN_PASSES="1", FAKE_COORD_ARGV_LOG=str(argv_log))
+    path_log = tmp_path / "coord-path.log"
+    result = _run(
+        repo,
+        FAKE_RERUN_PASSES="1",
+        FAKE_COORD_ARGV_LOG=str(argv_log),
+        FAKE_COORD_PATH_LOG=str(path_log),
+    )
 
     assert result.returncode == 0
     assert "RESULT: PASS" in result.stdout
@@ -425,6 +434,29 @@ def test_a_passing_python_suite_also_runs_the_acceptance_ci_wrapper(repo: Path, 
     assert "--repo claude-coordinator" in invocation
     assert "--all" in invocation
     assert "--ci" in invocation
+    # The in-repo CI fragment, NOT the daemon host's default-resolved
+    # ~/.coord/coordinator.yml: the fleet's cli-pytest route is
+    # `--issue`-scoped (`pytest tests/acceptance/{ms}`), and `--all` leaves
+    # `{ms}` literal — pytest collects 0 tests and this arm goes red for
+    # every branch touching coord/** (issue-2235's Test leg, 2026-08-15).
+    assert "--config" in invocation, (
+        "run_python_acceptance_ci passed no --config — `coord acceptance "
+        "run --all` would resolve the fleet's ~/.coord/coordinator.yml, "
+        "whose {ms}-templated cli-pytest route collects 0 tests under --all"
+    )
+    assert ".github/coord-ci-acceptance.yml" in invocation, (
+        f"--config does not point at the in-repo CI fragment: {invocation!r}"
+    )
+    # The fragment's route is a bare `pytest tests/acceptance`, resolved
+    # from PATH by the driver's shell — the branch venv's bin/ must be
+    # prepended, or the daemon's systemd-user PATH supplies a pytest with
+    # none of this repo's deps (or none at all).
+    recorded_path = path_log.read_text().strip()
+    assert recorded_path.startswith(str(repo / ".venv" / "bin") + os.pathsep), (
+        "run_python_acceptance_ci did not prepend the venv's bin/ to PATH — "
+        "the cli-pytest route's bare `pytest` would resolve outside the "
+        f"branch venv: PATH={recorded_path!r}"
+    )
 
 
 def test_a_red_acceptance_ci_wrapper_fails_the_python_arm(repo: Path) -> None:
