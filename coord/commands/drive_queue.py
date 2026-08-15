@@ -38,6 +38,7 @@ from typing import Any, Mapping
 
 import click
 
+from coord.block_log import STALL_STATES
 from coord.commands._common import _CONFIG_OPTION
 from coord.drive_state import WORK_LIKE
 from coord.drive_queue import (
@@ -731,6 +732,54 @@ def _hold_lines(entry: QueueEntry) -> list[str]:
     return lines
 
 
+# ── #2235 Phase 0 stall log ──────────────────────────────────────────────────
+
+
+def _record_block_log(events: list[dict[str, Any]]) -> None:
+    """Append #2235's Phase-0 stall records.  Observability only.
+
+    Best-effort by construction (:func:`coord.block_log.record` swallows its
+    own errors) and, in the tick, called only AFTER ``_apply_writes`` — so the
+    recording can neither precede nor influence the writes it describes.
+    #2235's Phase 0 is explicitly *instrumentation*: it must change no merge,
+    dispatch or attempt-accounting decision, and the cheapest way to guarantee
+    that is for the log to sit downstream of every decision and be read by
+    none of them.
+    """
+    if not events:
+        return
+    from coord import block_log  # noqa: PLC0415
+
+    block_log.record(events)
+
+
+def _record_operator_release(row: Mapping[str, Any] | None, *, resolution: str) -> None:
+    """Log a stall a HUMAN just cleared, if the row was actually stalled.
+
+    Called with the PRE-mutation row, since the whole record is about the
+    state that is being destroyed.  A row that was not ``blocked``/``parked``
+    logs nothing: removing a ``done`` entry is housekeeping, and counting it
+    as an intervention would inflate the one number #2235 wants to watch fall.
+    """
+    if row is None:
+        return
+    try:
+        entry = entries_from_rows([row])[0]
+    except (IndexError, KeyError, TypeError, ValueError):  # pragma: no cover
+        return
+    if entry.state not in STALL_STATES:
+        return
+    from coord.block_log import operator_resolution_event  # noqa: PLC0415
+
+    _record_block_log(
+        [
+            operator_resolution_event(
+                entry, resolution=resolution, host=_local_host_id()
+            )
+        ]
+    )
+
+
 # ── remove / move ────────────────────────────────────────────────────────────
 
 
@@ -740,11 +789,24 @@ def _hold_lines(entry: QueueEntry) -> list[str]:
 @_CONFIG_OPTION
 def drive_queue_remove(repo: str, issue: int, config_path: Path) -> None:
     """Drop REPO ISSUE from the queue (positions are renumbered dense)."""
-    from coord.state import dequeue_drive_queue  # noqa: PLC0415
+    from coord.state import dequeue_drive_queue, get_drive_queue_entry  # noqa: PLC0415
+
+    # #2235 Phase 0: read the row BEFORE deleting it, because `remove` on a
+    # `blocked`/`parked` entry IS the intervention the plan's success metric
+    # counts — it is the documented one-key fix (`_requeue_command`), and the
+    # only signal this fleet has that a human had to act. Read first or the
+    # state and the stated reason are gone with the row. Failure to read is
+    # silently tolerated: instrumentation must never be able to stop an
+    # operator removing an entry.
+    try:
+        before = get_drive_queue_entry(repo, issue)
+    except Exception:  # noqa: BLE001 — observability only, never blocks the remove
+        before = None
 
     removed = dequeue_drive_queue(repo, issue)
     if not removed:
         raise click.ClickException(f"{entry_key(repo, issue)} is not in the drive queue")
+    _record_operator_release(before, resolution="operator_removed")
     click.echo(f"removed {entry_key(repo, issue)} from the drive queue")
 
 
@@ -848,6 +910,110 @@ def drive_queue_status(output_json: bool, config_path: Path) -> None:
                 click.echo(f"  {detail}")
     else:
         click.echo("alert: (none)")
+
+
+# ── block-log (#2235 Phase 0) ────────────────────────────────────────────────
+
+
+def _episode_line(item: Mapping[str, Any]) -> str:
+    """One episode, one line, ordered so the interesting column is first.
+
+    ``stated`` and ``cause`` sit adjacent on purpose: #2235's whole finding is
+    that they disagree five times out of seven, and a render that separates
+    them makes the reader hold both in their head to notice.
+    """
+    key = str(item.get("key") or "?")
+    state = str(item.get("state") or "?")
+    stated = " ".join(str(item.get("stated_reason") or "(none)").split())
+    if len(stated) > 90:
+        stated = stated[:87] + "..."
+    if not item.get("resolved"):
+        return f"{key:<28} {state:<8} STILL STALLED  stated: {stated}"
+    mark = "HUMAN" if item.get("human_acted") else "auto "
+    held = item.get("stalled_seconds")
+    age = _age_str(float(held)) if held is not None else "?"
+    cause = " ".join(str(item.get("true_cause") or "").split())
+    return (
+        f"{key:<28} {state:<8} {mark} {age:>6}  stated: {stated}\n"
+        f"{'':<28} {'':<8}              cause:  {cause}"
+    )
+
+
+@drive_queue_group.command("block-log")
+@click.option("--json", "output_json", is_flag=True, default=False, help="Emit episodes + summary as JSON.")
+@click.option(
+    "--days",
+    type=float,
+    default=14.0,
+    show_default=True,
+    help=(
+        "Only episodes that STARTED within this many days. The default is "
+        "#2235's own window — Phase 1's scope is gated on two weeks of this "
+        "log, so two weeks is what the default report shows."
+    ),
+)
+@_CONFIG_OPTION
+def drive_queue_block_log(output_json: bool, days: float, config_path: Path) -> None:
+    """Every stall this host recorded: stated reason vs. true cause (#2235).
+
+    Phase 0 of the queue-rescue plan, and *only* Phase 0. Each `blocked`/
+    `parked` transition is recorded as it happens, together with how the entry
+    eventually got out, so the question "what actually stalls this queue, and
+    how often did a human have to act?" is answered from two weeks of evidence
+    rather than from one morning's triage.
+
+    Nothing here diagnoses. `cause` is derived from the release the queue
+    itself performed (a #2230 gate-clear, a #1891 CI resume, an operator's
+    `remove`), never from a live re-check — that is Phase 1, and its scope is
+    supposed to be decided BY this data, not assumed ahead of it.
+
+    Read the two summary numbers together: `human_acted` is the count #2235
+    wants to see fall, but a queue that stops needing interventions by leaving
+    everything stalled forever shows up as `open` climbing, not as success.
+    `repeats` is the tripwire — the same repo stalling on the same stated
+    reason twice is a bug report, not a rescue.
+    """
+    from coord.block_log import block_log_path, episodes, read_events, summarize  # noqa: PLC0415
+
+    since = time.time() - days * 86400.0 if days > 0 else None
+    events = read_events(since=since)
+    items = episodes(events)
+    stats = summarize(items)
+
+    if output_json:
+        click.echo(
+            _json.dumps(
+                {
+                    "path": str(block_log_path()),
+                    "days": days,
+                    "summary": stats,
+                    "episodes": items,
+                }
+            )
+        )
+        return
+
+    if not items:
+        click.echo(
+            f"no stalls recorded in the last {days:g}d "
+            f"({block_log_path()})"
+        )
+        return
+    for item in items:
+        click.echo(_episode_line(item))
+    click.echo("")
+    click.echo(
+        f"{stats['episodes']} stall(s) in {days:g}d — "
+        f"{stats['human_acted']} needed a human · "
+        f"{stats['auto_released']} released themselves · "
+        f"{stats['open']} still stalled"
+    )
+    if stats["repeat_causes"]:
+        click.echo("repeats (a repeat is a bug report, not a success):")
+        for label, count in sorted(
+            stats["repeat_causes"].items(), key=lambda kv: (-kv[1], kv[0])
+        ):
+            click.echo(f"  {count}× {label}")
 
 
 # ── overlap-report (#2247) ───────────────────────────────────────────────────
@@ -1951,6 +2117,18 @@ def drive_queue_tick(
 
         _apply_writes(plan)
 
+        # #2235 Phase 0: record every entry this tick moved INTO or OUT OF
+        # `blocked`/`parked`, with the reason the queue stated and — for a
+        # release — what the release itself reveals about the true cause.
+        # Derived entirely from `entries` (the pre-tick snapshot) and `plan`
+        # (already decided, already applied); nothing is re-read and nothing
+        # here feeds back into the tick.
+        from coord.block_log import plan_events  # noqa: PLC0415
+
+        _record_block_log(
+            plan_events(entries, plan, host=_local_host_id(), now=time.time())
+        )
+
         by_key = {e.key: e for e in entries}
         for item in plan.blocked:
             parsed = parse_key(item.key)
@@ -2095,6 +2273,22 @@ def drive_queue_tick(
                 reason=reason,
                 gates=f"queue_state=blocked | attempts={attempts}",
                 command=_requeue_command(target, target.key),
+            )
+            # #2235 Phase 0: a launch that never reached tmux is #2235's own
+            # `stick-demo#1` row. It blocks OUTSIDE the plan (the subprocess
+            # exits after `_apply_writes`), so `plan_events` cannot see it.
+            from coord.block_log import enter_event  # noqa: PLC0415
+
+            _record_block_log(
+                [
+                    enter_event(
+                        target,
+                        state=STATE_BLOCKED,
+                        reason=reason,
+                        attempts=attempts,
+                        host=_local_host_id(),
+                    )
+                ]
             )
         raise click.ClickException(reason)
     finally:
