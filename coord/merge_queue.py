@@ -4387,26 +4387,36 @@ def _test_author_effective_issue_number(entry: QueuedMerge, board) -> int | None
     return None
 
 
-def _issue_has_expected_red_entries(entry: QueuedMerge, gh_ops: GhOps) -> bool:
-    """#2199 review (blocking finding 2): whether *entry*'s issue has at
-    least one ``expected_red`` entry recorded against it in some
-    ``ms-*/manifest.yml`` on ``entry.target_branch`` — the scope check
-    that keeps :func:`_maybe_clear_expected_red`'s loud "no passing
-    trust-gate verdict" diagnostic from firing on every ordinary
-    ``CLOSES_ISSUE_TYPES`` merge fleet-wide (no driver configured, no
-    oracle-opted-in milestone, an ``oracle:exempt`` issue — none of which
-    ever populate ``expected_red`` for their issue, #2191). Those merges
-    have nothing here for ``coord acceptance record`` to ever have cleared
-    and never will; before this check, the diagnostic branch below could
-    not tell them apart from an issue that genuinely IS in scope and
-    genuinely IS stuck red, so it printed the same actionable-looking
-    (and, for a driverless repo, un-followable) advice on every single one.
+def _expected_red_ids_for_entry(entry: QueuedMerge, gh_ops: GhOps) -> frozenset[str]:
+    """#2199 review (blocking finding 2) / #2266 review (non-blocking
+    finding): the ``expected_red`` test ids, if any, recorded against
+    *entry*'s issue in some ``ms-*/manifest.yml`` on ``entry.target_branch``.
+
+    Two call sites need this:
+
+    * :func:`_issue_has_expected_red_entries` — the scope check that keeps
+      :func:`_maybe_clear_expected_red`'s loud "no passing trust-gate
+      verdict" diagnostic from firing on every ordinary
+      ``CLOSES_ISSUE_TYPES`` merge fleet-wide (no driver configured, no
+      oracle-opted-in milestone, an ``oracle:exempt`` issue — none of which
+      ever populate ``expected_red`` for their issue, #2191). Those merges
+      have nothing here for ``coord acceptance record`` to ever have
+      cleared and never will; before this check, the diagnostic branch
+      below could not tell them apart from an issue that genuinely IS in
+      scope and genuinely IS stuck red, so it printed the same
+      actionable-looking (and, for a driverless repo, un-followable)
+      advice on every single one.
+    * :func:`_maybe_clear_expected_red`'s clear branch, to put the actual
+      test ids (not just a pr/branch pair) into the durable audit row —
+      matching ``coord acceptance expected-red --clear``'s
+      ``details["test_ids"]`` so a merge-queue-triggered clear is just as
+      correlatable back to specific stuck tests as a CLI-triggered one.
 
     Reuses the exact API-only lookup ``coord.acceptance.
     clear_expected_red_via_pr`` already performs on the success path —
     best-effort/read-only like the rest of this sweep: any lookup failure
     (unreachable API, older ``gh_ops`` stub missing the list/get methods)
-    reads as "not in scope", matching :func:`coord.acceptance.
+    reads as "nothing recorded", matching :func:`coord.acceptance.
     find_ms_manifest_for_issue_via_api`'s own fail-soft posture.
     """
     from coord.acceptance import find_ms_manifest_for_issue_via_api  # noqa: PLC0415
@@ -4416,24 +4426,48 @@ def _issue_has_expected_red_entries(entry: QueuedMerge, gh_ops: GhOps) -> bool:
             entry.repo_github, entry.target_branch, entry.issue_number, gh_ops=gh_ops,
         )
     except Exception:  # noqa: BLE001 — best-effort, same posture as callers
-        return False
+        return frozenset()
     if found is None:
-        return False
+        return frozenset()
     _path, _text, _blob_sha, data = found
-    return bool(data.expected_red.get(entry.issue_number))
+    return frozenset(data.expected_red.get(entry.issue_number, frozenset()))
 
 
-def _record_expected_red_audit(entry: QueuedMerge, event_type: str, message: str) -> None:
+def _issue_has_expected_red_entries(entry: QueuedMerge, gh_ops: GhOps) -> bool:
+    """Whether *entry*'s issue has at least one ``expected_red`` entry
+    recorded against it. See :func:`_expected_red_ids_for_entry` for why
+    this scope check exists."""
+    return bool(_expected_red_ids_for_entry(entry, gh_ops))
+
+
+def _record_expected_red_audit(
+    entry: QueuedMerge,
+    event_type: str,
+    message: str,
+    *,
+    test_ids: frozenset[str] | None = None,
+) -> None:
     """#2266: durable half of an `expected_red` clear/skip/failure — a
     `MergeEvent` alone only reaches the operator as a `coord merge` output
     line that scrolls past (issue #2266's framing: "nothing durable,
-    nothing re-checked"). ``record_audit`` gives the same three outcomes
-    (cleared, skipped for one of two distinct reasons, or attempted-and-
-    failed) a queryable row (`coord audit` / `query_audit_log`) so a repo
-    with a stuck registry is discoverable without re-reading merge output.
-    Best-effort like every other audit call site in this module —
-    ``record_audit`` itself never raises.
+    nothing re-checked"). ``record_audit`` gives the same outcomes
+    (cleared, skipped for one of two distinct reasons, pending retry, or
+    attempted-and-failed) a queryable row (`coord audit` / `query_audit_log`)
+    so a repo with a stuck registry is discoverable without re-reading
+    merge output. Best-effort like every other audit call site in this
+    module — ``record_audit`` itself never raises.
+
+    *test_ids*, when given, lands in ``details["test_ids"]`` — matching the
+    CLI path's (`coord.commands.acceptance._clear_stuck_expected_red`)
+    audit payload, per #2266 review non-blocking finding: without it,
+    merge-queue-triggered audit rows were harder to correlate back to the
+    specific stuck test ids than CLI-triggered ones.
     """
+    details: dict[str, object] = {
+        "pr_number": entry.pr_number, "target_branch": entry.target_branch,
+    }
+    if test_ids:
+        details["test_ids"] = sorted(test_ids)
     record_audit(
         tier="business",
         category="acceptance",
@@ -4443,7 +4477,7 @@ def _record_expected_red_audit(entry: QueuedMerge, event_type: str, message: str
         repo=entry.repo_name,
         issue=entry.issue_number,
         assignment_id=entry.assignment_id,
-        details={"pr_number": entry.pr_number, "target_branch": entry.target_branch},
+        details=details,
     )
 
 
@@ -4486,7 +4520,8 @@ def _maybe_clear_expected_red(entry: QueuedMerge, board, gh_ops: GhOps) -> Merge
         )
     acceptance_state = getattr(work, "acceptance_state", None)
     if acceptance_state != "passed":
-        if not _issue_has_expected_red_entries(entry, gh_ops):
+        ids = _expected_red_ids_for_entry(entry, gh_ops)
+        if not ids:
             # Not in scope for the oracle loop at all — the pre-#2199
             # silent no-op is still correct here, not a regression (see
             # the docstring above and #2199 review finding 2).
@@ -4504,7 +4539,9 @@ def _maybe_clear_expected_red(entry: QueuedMerge, board, gh_ops: GhOps) -> Merge
         # never recorded" and "recorded SHA is stale" are different
         # problems with different fixes, so they get distinct event types
         # rather than reaching the operator as the same silence.
-        _record_expected_red_audit(entry, "expected_red_clear_skipped_no_acceptance", msg)
+        _record_expected_red_audit(
+            entry, "expected_red_clear_skipped_no_acceptance", msg, test_ids=ids,
+        )
         return MergeEvent(entry, "expected_red_clear_skipped_no_acceptance", msg)
     acceptance_sha = getattr(work, "acceptance_sha", None)
     if acceptance_sha is None or acceptance_sha != entry.branch_head_sha:
@@ -4520,25 +4557,51 @@ def _maybe_clear_expected_red(entry: QueuedMerge, board, gh_ops: GhOps) -> Merge
             "expected_red clear (re-run `coord acceptance record` against "
             "the merged SHA if entries should have cleared)"
         )
-        _record_expected_red_audit(entry, "expected_red_clear_skipped_sha_mismatch", msg)
+        _record_expected_red_audit(
+            entry, "expected_red_clear_skipped_sha_mismatch", msg,
+            test_ids=_expected_red_ids_for_entry(entry, gh_ops),
+        )
         return MergeEvent(entry, "expected_red_clear_skipped", msg)
 
-    from coord.acceptance import clear_expected_red_via_pr  # noqa: PLC0415
+    from coord.acceptance import (  # noqa: PLC0415
+        classify_expected_red_clear_result,
+        clear_expected_red_via_pr,
+    )
 
+    # Captured *before* the clear attempt: a successful clear edits the
+    # manifest, so looking this up afterwards would just find the ids the
+    # clear itself just removed (#2266 review non-blocking finding).
+    ids = _expected_red_ids_for_entry(entry, gh_ops)
     msg = clear_expected_red_via_pr(
         entry.repo_github, entry.repo_name, entry.target_branch, entry.issue_number,
         gh_ops=gh_ops,
     )
-    # #2266: `clear_expected_red_via_pr` never raises — every failure mode
-    # degrades to a "warning: ..." (or "... did not merge ...") string.
-    # Make that durable too, not just a merge-output line: a repeated
-    # `expected_red_clear_failed` for the same issue is exactly the signal
-    # `coord acceptance expected-red --clear` (the re-fire path) exists for.
-    cleared = msg.startswith("cleared expected_red")
-    _record_expected_red_audit(
-        entry, "expected_red_clear" if cleared else "expected_red_clear_failed", msg,
-    )
-    return MergeEvent(entry, "expected_red_clear", msg)
+    # #2266 review (blocking finding 1): a binary "did the message start
+    # with 'cleared expected_red'" conflated a genuine failure with "there
+    # was nothing to clear in the first place" — the *common* case for an
+    # ordinary oracle-loop merge whose issue was never part of a
+    # deliberately-red slice. `classify_expected_red_clear_result` (shared
+    # with the CLI `--clear` path, review blocking finding 2) tells those
+    # apart; the "no_op" case is reported back via `MergeEvent` for `coord
+    # merge` output but never gets a durable audit row — recording one for
+    # every ordinary passing merge would drown the genuinely actionable
+    # `expected_red_clear_failed` rows this audit trail exists to surface.
+    status = classify_expected_red_clear_result(msg)
+    if status == "no_op":
+        return MergeEvent(entry, "expected_red_clear_noop", msg)
+    event_type = {
+        "cleared": "expected_red_clear",
+        "pending_retry": "expected_red_clear_pending",
+        "failed": "expected_red_clear_failed",
+    }[status]
+    # #2266 review (non-blocking finding): `clear_expected_red_via_pr`
+    # never raises — every genuine failure degrades to a "warning: ..."
+    # string. Make that durable too, not just a merge-output line: a
+    # repeated `expected_red_clear_failed` for the same issue is exactly
+    # the signal `coord acceptance expected-red --clear` (the re-fire
+    # path) exists for.
+    _record_expected_red_audit(entry, event_type, msg, test_ids=ids)
+    return MergeEvent(entry, event_type, msg)
 
 
 def process(

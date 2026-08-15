@@ -22,7 +22,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import yaml
 
@@ -1105,3 +1105,46 @@ def clear_expected_red_via_pr(
         f"cleared expected_red for #{issue_number}: {', '.join(sorted(ids))} "
         f"(PR #{pr['number']})"
     )
+
+
+ExpectedRedClearStatus = Literal["cleared", "no_op", "pending_retry", "failed"]
+
+
+def classify_expected_red_clear_result(msg: str) -> ExpectedRedClearStatus:
+    """#2266 review (blocking finding 2): the single source of truth for
+    interpreting :func:`clear_expected_red_via_pr`'s return string.
+
+    Before this, ``coord.merge_queue._maybe_clear_expected_red`` and
+    ``coord.commands.acceptance._clear_stuck_expected_red`` each carried
+    their own ``msg.startswith("cleared expected_red")`` check — two
+    independent implementations of "did the clear succeed?" that agreed
+    today but could silently desync the moment either
+    :func:`clear_expected_red_via_pr`'s wording changed (the exact "One
+    question, one answer" split-brain the epic #2096 review checklist
+    warns about). Both call sites now classify through this function.
+
+    Returns one of four outcomes, not a bare bool — a binary
+    cleared/not-cleared collapsed two very different "not cleared" cases
+    into one (#2266 review, blocking finding 1):
+
+    * ``"cleared"`` — the PR opened *and* merged; entries are gone.
+    * ``"no_op"`` — there was nothing to clear in the first place (no
+      manifest found for this issue, or the issue has no ``expected_red``
+      entries at all). This is the *common* case for an ordinary
+      oracle-loop merge whose issue was never part of a deliberately-red
+      slice — it must never read as a failure.
+    * ``"pending_retry"`` — the clearing PR opened but did not merge yet
+      (branch protection / required checks pending); the caller already
+      knows this will retry on the next merge, not a hard failure.
+    * ``"failed"`` — a genuine failure: everything ``clear_expected_red_via_pr``'s
+      docstring says degrades to a ``"warning: ..."``-prefixed string
+      (unresolvable branch tip, a commit/PR-open/PR-merge exception, an
+      unsupported ``gh_ops``, a JSON manifest, or unchanged text).
+    """
+    if msg.startswith("cleared expected_red"):
+        return "cleared"
+    if msg.startswith("no expected_red entries"):
+        return "no_op"
+    if "did not merge" in msg and "will retry on the next merge" in msg:
+        return "pending_retry"
+    return "failed"

@@ -50,6 +50,7 @@ from coord.acceptance_drivers import DriverError, run_driver
 from coord.commands._common import _CONFIG_OPTION, _load_config
 from coord.comments import format_needs_attention
 from coord.dispatch import DispatchRefused
+from coord.models import Repo
 
 
 @click.group("acceptance")
@@ -668,6 +669,16 @@ def acceptance_record(
 def acceptance_expected_red(
     repo: str, config_path: Path, do_clear: bool, only_issue: int | None,  # noqa: FBT001
 ) -> None:
+    if only_issue is not None and not do_clear:
+        # #2266 review nit: `--issue` only narrows what `--clear` acts on
+        # (per its own help text) — silently accepting it without `--clear`
+        # looks like it did something when it didn't.
+        click.echo(
+            "warning: --issue has no effect without --clear; the listing "
+            "below covers every issue.",
+            err=True,
+        )
+
     cfg = _load_config(config_path)
     repo_entry = cfg.repo(repo)
     if repo_entry is None:
@@ -712,7 +723,7 @@ def acceptance_expected_red(
 
 
 def _clear_stuck_expected_red(
-    repo: str, repo_entry, stuck: list[tuple[str, int, frozenset[str]]],
+    repo: str, repo_entry: Repo, stuck: list[tuple[str, int, frozenset[str]]],
     only_issue: int | None,
 ) -> None:
     """#2266: the remedy half of `coord acceptance expected-red --clear`.
@@ -723,8 +734,16 @@ def _clear_stuck_expected_red(
     issue but does not widen scope: naming an open issue's number here
     finds nothing to clear, same as naming one that isn't in *stuck* at
     all.
+
+    Exits non-zero when at least one entry hard-fails to clear (#2266
+    review, non-blocking finding: without this, a caller scripting this
+    command in CI/cron could only detect a fully-failed run by reading
+    stdout or separately querying the audit log).
     """
-    from coord.acceptance import clear_expected_red_via_pr  # noqa: PLC0415
+    from coord.acceptance import (  # noqa: PLC0415
+        classify_expected_red_clear_result,
+        clear_expected_red_via_pr,
+    )
     from coord.audit import record_audit  # noqa: PLC0415
 
     if only_issue is not None:
@@ -741,26 +760,47 @@ def _clear_stuck_expected_red(
         return
 
     click.echo(f"\nclearing {len(stuck)} STUCK issue(s)...")
+    # #2266 review (blocking finding 2): classify through the same shared
+    # helper `coord.merge_queue._maybe_clear_expected_red` uses, instead of
+    # each surface independently re-deriving "did this succeed?" from the
+    # message text — a split-brain waiting to happen if the message
+    # wording ever changes (epic #2096's "one question, one answer").
+    any_failed = False
     for ms, issue_number, ids in stuck:
         msg = clear_expected_red_via_pr(
             repo_entry.github, repo, repo_entry.default_branch, issue_number,
             gh_ops=github_ops,
         )
         click.echo(f"  #{issue_number}: {msg}")
-        cleared = msg.startswith("cleared expected_red")
+        status = classify_expected_red_clear_result(msg)
+        if status == "no_op":
+            # These entries were just listed as STUCK, so this should be
+            # rare (e.g. a race — another process already cleared them) —
+            # but it's still not a failure worth a durable audit row.
+            continue
+        if status == "failed":
+            any_failed = True
+        event_type = {
+            "cleared": "expected_red_clear",
+            "pending_retry": "expected_red_clear_pending",
+            "failed": "expected_red_clear_failed",
+        }[status]
         # #2266 scope 2: a failed clear must land somewhere durable — the
         # audit log — so the next pass over this repo can say "this
         # registry is still stuck" without anyone re-reading this output.
         record_audit(
             tier="business",
             category="acceptance",
-            event_type="expected_red_clear" if cleared else "expected_red_clear_failed",
+            event_type=event_type,
             actor="user",
             summary=f"coord acceptance expected-red --clear {repo} #{issue_number}: {msg}",
             repo=repo,
             issue=issue_number,
             details={"ms": ms, "test_ids": sorted(ids), "result": msg},
         )
+
+    if any_failed:
+        sys.exit(1)
 
 
 def _acceptance_record_local(
