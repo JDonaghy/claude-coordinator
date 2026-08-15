@@ -642,12 +642,32 @@ def acceptance_record(
         "merge` right after that issue's fix merges) may have failed, or "
         "the fix landed by some other path. A long-lived expected_red "
         "entry is exactly the invisible debt this command exists to "
-        "surface."
+        "surface. #2266: `--clear` acts on it — for every STUCK entry this "
+        "listing finds, invoke the same `clear_expected_red_via_pr` PR "
+        "path `coord merge` uses, so a registry stuck because the merge-"
+        "time trust-gate guards never fired (acceptance never recorded, or "
+        "the PR merged out of band) has a re-fire path instead of only a "
+        "detector. Never touches an entry whose issue is still open — "
+        "those are read as legitimately red, not stuck."
     ),
 )
 @click.argument("repo")
 @_CONFIG_OPTION
-def acceptance_expected_red(repo: str, config_path: Path) -> None:
+@click.option(
+    "--clear", "do_clear", is_flag=True, default=False,
+    help=(
+        "Open+merge the expected_red-clearing PR for every STUCK entry "
+        "this listing finds (issue closed, entries still live). Skips — "
+        "never clears — any entry whose issue is still open."
+    ),
+)
+@click.option(
+    "--issue", "only_issue", type=int, default=None,
+    help="With --clear, restrict clearing to this issue number.",
+)
+def acceptance_expected_red(
+    repo: str, config_path: Path, do_clear: bool, only_issue: int | None,  # noqa: FBT001
+) -> None:
     cfg = _load_config(config_path)
     repo_entry = cfg.repo(repo)
     if repo_entry is None:
@@ -660,22 +680,87 @@ def acceptance_expected_red(repo: str, config_path: Path) -> None:
         return
 
     total = 0
+    # #2266: STUCK entries found while rendering the listing above — the
+    # exact set `--clear` acts on, so the remedy can never drift from the
+    # detector that names the debt.
+    stuck: list[tuple[str, int, frozenset[str]]] = []
     for ms, by_issue in sorted(by_ms.items()):
         click.echo(f"{ms}:")
         for issue_number, ids in sorted(by_issue.items()):
             total += len(ids)
             closed_note = ""
+            is_stuck = False
             try:
                 issue_data = github_ops.get_issue(repo_entry.github, issue_number)
                 if str((issue_data or {}).get("state", "")).lower() == "closed":
                     closed_note = "  [STUCK: issue is closed but entries remain]"
+                    is_stuck = True
             except Exception:  # noqa: BLE001 — a lookup hiccup shouldn't hide the entry itself
                 pass
             click.echo(
                 f"  #{issue_number}: {', '.join(sorted(ids))}{closed_note}"
             )
+            if is_stuck:
+                stuck.append((ms, issue_number, ids))
     click.echo(f"\n{total} expected_red test-id(s) across "
                f"{sum(len(v) for v in by_ms.values())} issue(s).")
+
+    if not do_clear:
+        return
+
+    _clear_stuck_expected_red(repo, repo_entry, stuck, only_issue)
+
+
+def _clear_stuck_expected_red(
+    repo: str, repo_entry, stuck: list[tuple[str, int, frozenset[str]]],
+    only_issue: int | None,
+) -> None:
+    """#2266: the remedy half of `coord acceptance expected-red --clear`.
+
+    Acts ONLY on *stuck* — the STUCK (issue closed, entries still live) set
+    the listing above already computed — never on an issue whose entries
+    are legitimately still red (still open). `--issue` narrows to one
+    issue but does not widen scope: naming an open issue's number here
+    finds nothing to clear, same as naming one that isn't in *stuck* at
+    all.
+    """
+    from coord.acceptance import clear_expected_red_via_pr  # noqa: PLC0415
+    from coord.audit import record_audit  # noqa: PLC0415
+
+    if only_issue is not None:
+        stuck = [s for s in stuck if s[1] == only_issue]
+        if not stuck:
+            click.echo(
+                f"\n--issue {only_issue}: not STUCK (open, or no "
+                "expected_red entries recorded for it) — nothing to clear."
+            )
+            return
+
+    if not stuck:
+        click.echo("\nno STUCK entries to clear.")
+        return
+
+    click.echo(f"\nclearing {len(stuck)} STUCK issue(s)...")
+    for ms, issue_number, ids in stuck:
+        msg = clear_expected_red_via_pr(
+            repo_entry.github, repo, repo_entry.default_branch, issue_number,
+            gh_ops=github_ops,
+        )
+        click.echo(f"  #{issue_number}: {msg}")
+        cleared = msg.startswith("cleared expected_red")
+        # #2266 scope 2: a failed clear must land somewhere durable — the
+        # audit log — so the next pass over this repo can say "this
+        # registry is still stuck" without anyone re-reading this output.
+        record_audit(
+            tier="business",
+            category="acceptance",
+            event_type="expected_red_clear" if cleared else "expected_red_clear_failed",
+            actor="user",
+            summary=f"coord acceptance expected-red --clear {repo} #{issue_number}: {msg}",
+            repo=repo,
+            issue=issue_number,
+            details={"ms": ms, "test_ids": sorted(ids), "result": msg},
+        )
 
 
 def _acceptance_record_local(
