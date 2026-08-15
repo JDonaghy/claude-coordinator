@@ -1176,6 +1176,12 @@ def drive_queue_diagnose(output_json: bool, dry_run: bool, config_path: Path) ->
         board=build_board(),
         fleet_health=fleet_health,
         live_sessions=live_sessions,
+        # #1870: that `list_drive_sessions()` above is a LOCAL tmux read, so
+        # the probe has to know whose tmux it is. Without this an entry some
+        # OTHER machine launched reads as "session absent" here and lands a
+        # high-confidence `dead-leg` on a session that is very much alive —
+        # the same trap `_reconcile_running` already sidesteps.
+        local_host=_local_host_id(),
     )
     # `keys=None` — an operator asking directly wants every open episode
     # looked at, not just the ones the notifier happens to have raised this

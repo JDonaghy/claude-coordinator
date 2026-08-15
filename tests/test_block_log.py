@@ -1038,3 +1038,190 @@ def test_a_stated_reason_is_classified_on_word_boundaries_not_substrings():
     )
     assert got.cause == qd.CAUSE_GATE_BLOCKED
     assert got.contradicts_stated is False
+
+
+# ── the real probe's /health translation (#2276 review) ─────────────────────
+#
+# Every other diagnose test above builds `LiveState` by hand, which skips the
+# one piece of the probe that has to agree with a schema it does not own:
+# `GhLiveProbe._health()` reading a `machine_health` row. The first cut of it
+# read a `reachable` key that has never existed on those rows, so every
+# configured machine came back "reachable" — `agent-unreachable` was a
+# structurally unreachable verdict, and a genuinely-down machine got a
+# high-confidence `dead-leg` instead. These tests build rows with the REAL
+# row assembler both producers route through, so a rename there fails here
+# rather than silently degrading the diagnostician again.
+
+
+def _machine_rows(raw: dict, *, names: list[str] | None = None) -> dict:
+    """A `fleet_health` block built exactly the way both producers build it."""
+    from coord.health.fleet_snapshot import _machine_health_rows
+
+    rows = _machine_health_rows(list(names or raw), raw, now=NOW)
+    return {"machine_health": rows, "fleet_checks": []}
+
+
+def _polled(state: str, *, age: float = 0.0, crit: str = "") -> dict:
+    health = None
+    if crit:
+        health = {
+            "severity": "crit",
+            "checked_at": NOW - age,
+            "results": [{"check_id": crit, "severity": "crit"}],
+        }
+    return {
+        "state": state,
+        "reason": "",
+        "latency_ms": 4.0,
+        "received_at": NOW - age,
+        "health": health,
+    }
+
+
+def _probe(
+    raw: dict,
+    *,
+    sessions: frozenset[str] | None = None,
+    names=None,
+    local_host: str = "",
+):
+    return qd.GhLiveProbe(
+        fleet_health=_machine_rows(raw, names=names),
+        live_sessions=frozenset() if sessions is None else sessions,
+        local_host=local_host,
+    )
+
+
+def test_the_probe_reads_reachability_off_state_not_a_key_that_never_existed():
+    """`machine_health` rows carry `state`, never `reachable`."""
+    from coord.health.fleet_snapshot import _machine_health_rows
+
+    row = _machine_health_rows(["dellserver"], {"dellserver": _polled("online")}, now=NOW)[0]
+    assert "reachable" not in row, "row schema changed; _row_reachable must follow"
+    assert qd._row_reachable(row) is True
+
+    for down in ("offline", "timeout", "dns_error", "http_error", "rate_limited"):
+        rows = _machine_health_rows(["dellserver"], {"dellserver": _polled(down)}, now=NOW)
+        assert qd._row_reachable(rows[0]) is False, down
+
+
+def test_a_never_polled_or_stale_machine_is_could_not_tell_not_reachable():
+    """`unknown` and staleness are abstentions in BOTH directions.
+
+    `_machine_health_rows` emits a row for every configured machine whether or
+    not anything ever polled it, so "there is a row" is not evidence.
+    """
+    never = _machine_rows({}, names=["dellserver"])["machine_health"][0]
+    assert never["state"] == "unknown"
+    assert qd._row_reachable(never) is None
+
+    stale_online = _machine_rows(
+        {"dellserver": _polled("online", age=100_000.0)}
+    )["machine_health"][0]
+    assert stale_online["stale"] is True
+    assert qd._row_reachable(stale_online) is None
+
+    stale_offline = _machine_rows(
+        {"dellserver": _polled("offline", age=100_000.0)}
+    )["machine_health"][0]
+    assert qd._row_reachable(stale_offline) is None
+
+
+def test_an_unreachable_machine_is_diagnosed_unreachable_not_a_dead_leg():
+    """The whole point: "the machine is down" and "the session died on a
+    machine that is up" are different causes, and confusing them is the
+    confidently-wrong failure mode #2276 exists to prevent.
+
+    `live_sessions` is empty here because a machine that will not answer
+    naturally has no visible sessions either — the exact shape that used to
+    read as a high-confidence `dead-leg`.
+    """
+    e = stalled(80, "dispatch failed: no session",
+                session_name="coord-drive-dellserver-80", machine="dellserver")
+    state = _probe({"dellserver": _polled("offline")}).probe(e)
+
+    assert state.agent_reachable is False
+    assert state.agent_has_session is False
+    got = qd.diagnose(e, state)
+    assert got.cause == qd.CAUSE_AGENT_UNREACHABLE
+    assert got.cause != qd.CAUSE_DEAD_LEG
+    assert got.confidence != qd.CONFIDENCE_HIGH
+
+
+def test_a_dead_leg_still_lands_when_the_machine_really_is_answering():
+    """The other side of the same coin — narrowing `reachable` must not have
+    cost the `dead-leg` verdict on a machine that IS up."""
+    e = stalled(81, "dispatch failed: no session",
+                session_name="coord-drive-dellserver-81", machine="dellserver")
+    state = _probe({"dellserver": _polled("online")}).probe(e)
+
+    assert state.agent_reachable is True
+    assert qd.diagnose(e, state).cause == qd.CAUSE_DEAD_LEG
+
+
+def test_a_machine_with_no_reading_at_all_abstains_rather_than_guessing():
+    """A stale row, or an entry naming a machine that is not configured at
+    all, is `None` — and with nothing else read, the pass abstains."""
+    e = stalled(82, "dispatch failed: no session",
+                session_name="coord-drive-ghost-82", machine="ghost")
+    state = _probe({"dellserver": _polled("online")}).probe(e)
+
+    assert state.agent_reachable is None
+    got = qd.diagnose(e, state)
+    assert got.cause == qd.CAUSE_UNKNOWN
+    assert got.confidence == qd.CONFIDENCE_NONE
+
+
+def test_machine_crits_still_come_through_the_row():
+    e = stalled(83, "blocked: CI red", machine="dellserver")
+    state = _probe({"dellserver": _polled("online", crit="disk_free")}).probe(e)
+    assert state.machine_crits == ("disk_free",)
+
+
+def test_the_launching_host_is_what_gets_asked_not_the_assigned_machine():
+    """#1870: `launch_host` is the machine whose tick actually started this
+    session; `machine` is only where the queue *meant* to run it."""
+    e = stalled(84, "dispatch failed: no session",
+                session_name="coord-drive-macmini-84",
+                machine="dellserver", launch_host="macmini")
+    state = _probe(
+        {"dellserver": _polled("online"), "macmini": _polled("offline")}
+    ).probe(e)
+    assert state.agent_reachable is False
+
+
+def test_a_session_another_host_launched_is_unknown_here_not_a_dead_leg():
+    """#1870, carried into the probe: `live_sessions` is a LOCAL tmux read.
+
+    An entry macmini launched is invisible to dellserver's `tmux
+    list-sessions`, so "not in the set" means *"not my session to see"*. Left
+    unguarded that reads as a high-confidence `dead-leg` for a session that is
+    very much alive — a confidently wrong verdict manufactured out of a
+    process boundary.
+    """
+    e = stalled(85, "dispatch failed: no session",
+                session_name="coord-drive-macmini-85",
+                machine="macmini", launch_host="macmini")
+    state = _probe(
+        {"macmini": _polled("online")},
+        sessions=frozenset({"coord-drive-dellserver-9"}),
+        local_host="dellserver",
+    ).probe(e)
+
+    assert state.agent_has_session is None
+    assert qd.diagnose(e, state).cause != qd.CAUSE_DEAD_LEG
+
+
+def test_a_session_this_host_launched_is_still_read_normally():
+    e = stalled(86, "dispatch failed: no session",
+                session_name="coord-drive-dellserver-86",
+                machine="dellserver", launch_host="dellserver")
+    probe = _probe({"dellserver": _polled("online")}, local_host="DellServer.local")
+
+    assert probe.probe(e).agent_has_session is False
+    seen = _probe(
+        {"dellserver": _polled("online")},
+        sessions=frozenset({"coord-drive-dellserver-86"}),
+        local_host="dellserver",
+    )
+    assert seen.probe(e).agent_has_session is True
