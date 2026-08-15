@@ -42,6 +42,42 @@ from coord.drive_queue import HOLD_FIRED, STATE_RUNNING
 _REAL_INTERACTIVE_SESSION_BUSY = release_cmd._interactive_session_busy
 
 
+@pytest.fixture(autouse=True)
+def _own_pause_store(tmp_path, monkeypatch):
+    """Give every test in this module its own pause store (#2174).
+
+    `coord release propagate` both READS the pause store (#2174's
+    `_paused_machine_busy`) and WRITES it (#2101's cordons), and several
+    tests below seed it with `mp.local_pause()` / `mp.local_set_cordon()`.
+    That store is per-`$HOME`, not per-test — so without this, one test's
+    pause leaks into every test that runs after it in the same session.
+
+    `conftest._no_real_pause_store` does not cover this: it redirects only
+    when the resolved path lands under the REAL home, on the assumption
+    that a redirected `$HOME` was redirected BY THE TEST, per test. That
+    assumption is false under `scripts/run_tests_in_populated_home.sh`
+    (#2170), where `$HOME` is one throwaway thin-client directory shared by
+    the WHOLE run: the guard stands down and the store becomes session
+    state. That is exactly how this module went green on `ubuntu-latest`
+    and red on the `populated-home` job — a phantom `machine paused:
+    server` in tests that never paused anything, deferring rolls that
+    should have proceeded.
+
+    Redirecting `$HOME` (rather than patching `_state_path`) is what every
+    other pause-touching module here already does — `test_machine_pause`,
+    `test_quiet_hours`, `test_release_cordon_2101`,
+    `test_release_cordon_deadlock_2240` — and it also pins the thin-client
+    decision: a tmp `$HOME` has no `client.toml`, so this module resolves
+    board-service the same way in both CI jobs instead of inheriting
+    whichever shape the ambient home happens to have.
+    """
+    home = tmp_path / "home"
+    (home / ".coord").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    return home
+
+
 @pytest.fixture()
 def state_dir(tmp_path, monkeypatch):
     """Point the propagation journal at a tmp dir, never the real ~/.coord."""

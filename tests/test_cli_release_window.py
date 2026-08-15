@@ -36,6 +36,28 @@ from coord.cli import main
 from coord.commands import release as release_cmd
 
 
+@pytest.fixture(autouse=True)
+def _own_pause_store(tmp_path, monkeypatch):
+    """Give every test in this module its own pause store (#2174).
+
+    `test_drain_is_blocked_by_a_paused_daemon_host` calls
+    `mp.local_pause("server")`, and that store is per-`$HOME`, not
+    per-test. `conftest._no_real_pause_store` redirects only when the
+    resolved path lands under the REAL home, so under
+    `scripts/run_tests_in_populated_home.sh` (#2170) — where `$HOME` is one
+    throwaway directory shared by the whole run — the pause survives this
+    test and every later one reads a machine it never paused. See
+    `tests/test_cli_release_propagate.py::_own_pause_store` for the full
+    write-up; this is the same hazard in the sibling module that shares the
+    seam.
+    """
+    home = tmp_path / "home"
+    (home / ".coord").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    return home
+
+
 @pytest.fixture()
 def state_dir(tmp_path, monkeypatch):
     """Point the window journal at a tmp dir, never the real ~/.coord."""
