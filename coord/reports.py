@@ -19,13 +19,18 @@ Three layers, deliberately separated so the interesting one is testable:
    window is covered and reports ``truncated=True`` if it genuinely could
    not finish.  Never silently drops the tail (#1742: "no silent caps").
 3. :data:`REPORTS` + :func:`run_report` — the registry and its parameter
-   validation.  Three entries: ``issue-activity``; ``drive-queue-status``
+   validation.  Four entries: ``issue-activity``; ``drive-queue-status``
    (#1805), a **live snapshot** of ``drive_queue`` (no window, no audit
    trail, no clock beyond ``generated_at``) rather than a fold over history;
    and ``usage`` (#1763), a cost/token fold over board assignment rows that
    delegates every number to :mod:`coord.usage_rollup` priced with the
    daemon's own loaded ``pricing:`` config — the report that replaced
-   coord-tui's ``panel:usage`` and its hardcoded pricing snapshot.
+   coord-tui's ``panel:usage`` and its hardcoded pricing snapshot; and
+   ``queue-outcomes`` (#2270), the one number the morning report is for —
+   *what fraction of the queue got over the line without a human* — folded
+   from #2235's per-host block log rather than from the audit trail, and the
+   only report here that refuses to answer at all when its input file is not
+   on this host.
 
 The :class:`ReportResult` field names are the **wire contract** the coord-tui
 Reports panel (#1741) renders against, and the CLI's ``--json`` and the
@@ -68,6 +73,12 @@ __all__ = [
     "resolve_usage_window",
     "fold_usage",
     "run_usage",
+    "QUEUE_OUTCOMES_COLUMNS",
+    "QUEUE_OUTCOMES_COLUMN_META",
+    "QUEUE_OUTCOMES_WINDOW_CHOICES",
+    "resolve_queue_outcomes_window",
+    "fold_queue_outcomes",
+    "run_queue_outcomes",
     "parse_duration",
     "result_to_csv",
     "csv_filename",
@@ -324,6 +335,8 @@ def fetch_audit_window(
     fetch: Callable[..., Mapping[str, Any]] | None = None,
     page_limit: int | None = None,
     max_pages: int = MAX_PAGES,
+    category: str | None = None,
+    event_type: str | None = None,
 ) -> tuple[list[dict], bool]:
     """Walk the keyset cursor until the whole ``[since, until]`` window is
     covered.  Returns ``(entries, truncated)``.
@@ -332,6 +345,14 @@ def fetch_audit_window(
     outstanding (page cap hit, or a page claimed ``has_more`` but handed
     back no cursor) — the caller turns that into an explicit note rather
     than shipping a silently short answer.
+
+    ``category``/``event_type`` push the filter down into
+    :func:`coord.audit.query_audit_log` rather than filtering the pages
+    afterwards — a four-week window (``queue-outcomes``) is exactly where
+    reading every row to keep a handful of ``merged`` ones would hit the page
+    cap and report itself truncated for no reason.  They are passed to
+    ``fetch`` **only when set**, so an injected fetch that predates them keeps
+    receiving byte-identical kwargs.
     """
     if fetch is None:
         fetch = _default_fetch
@@ -339,6 +360,12 @@ def fetch_audit_window(
         from coord.audit import MAX_LIMIT  # noqa: PLC0415
 
         page_limit = MAX_LIMIT
+
+    filters: dict[str, Any] = {}
+    if category:
+        filters["category"] = category
+    if event_type:
+        filters["event_type"] = event_type
 
     entries: list[dict] = []
     cursor: str | None = None
@@ -350,6 +377,7 @@ def fetch_audit_window(
             repo=repo or None,
             limit=page_limit,
             cursor=cursor,
+            **filters,
         ) or {}
         entries.extend(page.get("entries") or [])
         if not page.get("has_more"):
@@ -1352,6 +1380,533 @@ def run_usage(
     )
 
 
+# ── queue-outcomes: the morning number (#2270) ─────────────────────────────
+#
+# One question: **what fraction of the queue got over the line without me?**
+# The operator's target is `(succeeded + auto_resolved_mechanism +
+# auto_resolved_rescue) / total` trending to ~100%.
+#
+# This is the view over #2235's Phase-0 recorder (`coord.block_log`), which is
+# the only durable record of a stall *and how it ended*.  `drive-queue-status`
+# cannot answer it and says so in its own description ("a snapshot, not a
+# history: `drive_queue` has no `completed_at`"), so nothing here reads the
+# queue table.
+#
+# TWO SOURCES, and the seam between them is deliberate:
+#
+# * every bucket except `succeeded` folds out of block-log EPISODES, because a
+#   stall is the only thing that log records; and
+# * `succeeded` — merged with no stall at all — has no episode by
+#   construction, so it is counted from `merged` audit events in the same
+#   window, minus any key that already has an episode there (a stall that
+#   later landed is auto_resolved, not succeeded, and must not be counted
+#   twice).  The report says which number came from where in its notes; a
+#   headline whose denominator is silently half-sourced is worse than none.
+
+QUEUE_OUTCOMES_WINDOW_CHOICES = ("24h", "7d", "4w")
+
+#: window -> (span, period).  The bar view is one period; the trend views are
+#: 7 daily and 4 weekly points of the same arithmetic, so a client renders a
+#: trendline by grouping rows on `period_start` and needs no second report.
+_QUEUE_OUTCOMES_WINDOWS: dict[str, tuple[float, float]] = {
+    "24h": (86400.0, 86400.0),
+    "7d": (7 * 86400.0, 86400.0),
+    "4w": (28 * 86400.0, 7 * 86400.0),
+}
+
+QUEUE_OUTCOMES_COLUMNS = [
+    "period_start",
+    "bucket",
+    "category",
+    "by_design",
+    "count",
+    "share_pct",
+    "issues",
+]
+
+# One entry per QUEUE_OUTCOMES_COLUMNS entry, same order (#1760).
+QUEUE_OUTCOMES_COLUMN_META = [
+    ColumnMeta(id="period_start", label="Period", kind="timestamp"),
+    ColumnMeta(id="bucket", label="Bucket", kind="enum", weight=1.6),
+    ColumnMeta(id="category", label="Category", kind="text", weight=3.0),
+    ColumnMeta(id="by_design", label="By Design", kind="text"),
+    ColumnMeta(id="count", label="Count", kind="int", align="right", weight=0.6),
+    ColumnMeta(id="share_pct", label="Share %", kind="text", align="right", weight=0.7),
+    # Attributability (#2270 acceptance): every count drills to the exact
+    # `(repo, issue)` list behind it. Truncated in a terminal table, whole in
+    # --format json / csv.
+    ColumnMeta(id="issues", label="Issues", kind="list", weight=3.0),
+]
+
+_MERGE_AUDIT_CATEGORY = "merge"
+_MERGE_AUDIT_EVENT = "merged"
+
+
+def resolve_queue_outcomes_window(
+    window: str, end: float
+) -> tuple[float, float, float]:
+    """``(start, end, period_seconds)`` for a ``window`` preset.
+
+    Periods are aligned to ``end``, not to the civil calendar: the report has
+    to be reproducible from ``until`` alone, and a calendar alignment would
+    make the same ``until`` produce different buckets in different timezones.
+    """
+    try:
+        span, period = _QUEUE_OUTCOMES_WINDOWS[window]
+    except KeyError:
+        raise ReportError(
+            f"invalid value for 'window': {window!r} — "
+            f"allowed values: {', '.join(QUEUE_OUTCOMES_WINDOW_CHOICES)}"
+        ) from None
+    return float(end) - span, float(end), period
+
+
+def _period_bounds(start: float, end: float, period: float) -> list[float]:
+    """The start timestamp of each period in ``[start, end)``, ascending."""
+    if period <= 0:
+        return [start]
+    count = max(1, int(round((end - start) / period)))
+    return [start + i * period for i in range(count)]
+
+
+def _period_index(ts: float, start: float, period: float, count: int) -> int:
+    if period <= 0:
+        return 0
+    return min(count - 1, max(0, int((ts - start) // period)))
+
+
+def _episode_period_ts(episode: Mapping[str, Any]) -> tuple[float, bool]:
+    """``(the timestamp this episode is bucketed on, is_open)``.
+
+    A resolved episode belongs to the period it *ended* in — that is when it
+    got over the line (or didn't).  An open one has no such moment, so it
+    belongs to the period it stalled in: "still stalled" is a fact about the
+    day the queue stopped, not about today.
+    """
+    if episode.get("resolved"):
+        return float(episode.get("resolved_at") or 0.0), False
+    return float(episode.get("entered_at") or 0.0), True
+
+
+def fold_queue_outcomes(
+    episodes: Iterable[Mapping[str, Any]],
+    window: tuple[float, float],
+    *,
+    period_seconds: float | None = None,
+    merged: Iterable[tuple[str, float]] = (),
+    generated_at: float | None = None,
+    log_location: Mapping[str, Any] | None = None,
+    log_starts_at: float | None = None,
+    extra_notes: Sequence[str] = (),
+) -> ReportResult:
+    """Fold block-log episodes (+ merge events) into outcome buckets.
+
+    **Pure** — no log read, no DB, no daemon, no clock: *episodes* is whatever
+    :func:`coord.block_log.episodes` returned, *merged* is a sequence of
+    ``(key, ts)`` pairs for issues that merged in the window, and
+    ``generated_at`` defaults to the window end so a frozen-clock test is
+    deterministic.
+
+    Every category comes out of :func:`coord.block_log.episode_category`, an
+    **open vocabulary** read from the data — a cause this build has never seen
+    appears in the report as itself.  Every bucket comes out of
+    :func:`coord.block_log.episode_bucket`, and the ``by_design`` split out of
+    :func:`coord.block_log.is_by_design`; none of the three is re-derived here,
+    so the report and ``coord drive-queue block-log`` cannot drift.
+
+    An episode that entered before the window and is **still open** is folded
+    into the first period rather than dropped.  Dropping it would be the
+    single most flattering bug available to this report: the longest-running
+    unresolved stalls are exactly the ones whose ``entered_at`` has fallen off
+    the back of the window.
+    """
+    from coord.block_log import (  # noqa: PLC0415
+        AUTO_BUCKETS,
+        BUCKET_OPEN,
+        BUCKET_SUCCEEDED,
+        OUTCOME_BUCKETS,
+        UNCLASSIFIED_CATEGORY,
+        episode_bucket,
+        episode_category,
+        is_by_design,
+    )
+
+    start, end = float(window[0]), float(window[1])
+    period = float(period_seconds) if period_seconds else max(1.0, end - start)
+    period_starts = _period_bounds(start, end, period)
+    n_periods = len(period_starts)
+
+    # (period, bucket, category, by_design) -> [key, ...]
+    tally: dict[tuple[int, str, str, bool], list[str]] = {}
+    windowed_keys: set[str] = set()
+    open_before_window = 0
+
+    for episode in episodes:
+        key = str(episode.get("key") or "")
+        ts, is_open = _episode_period_ts(episode)
+        if is_open:
+            if ts >= end:
+                continue  # stalled after this window closed
+            if ts < start:
+                open_before_window += 1
+        elif not (start <= ts < end):
+            continue
+        idx = _period_index(max(ts, start), start, period, n_periods)
+        cell = (
+            idx,
+            episode_bucket(episode),
+            episode_category(episode),
+            is_by_design(episode),
+        )
+        tally.setdefault(cell, []).append(key)
+        windowed_keys.add(key)
+
+    for key, ts in merged:
+        key = str(key)
+        ts = float(ts)
+        if not (start <= ts < end):
+            continue
+        if key in windowed_keys:
+            # It stalled first. That episode already counted it in an
+            # auto_resolved/human bucket; counting the merge again would
+            # inflate the numerator with the very entries that needed help.
+            continue
+        idx = _period_index(ts, start, period, n_periods)
+        tally.setdefault((idx, BUCKET_SUCCEEDED, "merged", False), []).append(key)
+
+    bucket_order = {name: i for i, name in enumerate(OUTCOME_BUCKETS)}
+    per_period_total: dict[int, int] = {}
+    for (idx, _bucket, _cat, _bd), keys in tally.items():
+        per_period_total[idx] = per_period_total.get(idx, 0) + len(keys)
+
+    rows: list[dict[str, Any]] = []
+    for (idx, bucket, category, by_design), keys in tally.items():
+        total = per_period_total.get(idx, 0)
+        rows.append(
+            {
+                "period_start": period_starts[idx],
+                "period_end": period_starts[idx] + period,
+                "bucket": bucket,
+                "category": category,
+                "by_design": by_design,
+                "count": len(keys),
+                "share_pct": round(100.0 * len(keys) / total, 1) if total else 0.0,
+                "issues": sorted(set(keys)),
+            }
+        )
+    rows.sort(
+        key=lambda r: (
+            r["period_start"],
+            bucket_order.get(r["bucket"], len(bucket_order)),
+            -r["count"],
+            r["category"],
+        )
+    )
+
+    grand_total = sum(per_period_total.values())
+    grand_auto = sum(r["count"] for r in rows if r["bucket"] in AUTO_BUCKETS)
+    grand_by_design = sum(r["count"] for r in rows if r["by_design"])
+
+    notes: list[str] = list(extra_notes)
+    notes.extend(_queue_outcomes_location_notes(log_location))
+    if not rows:
+        notes.append(
+            "No queue entry reached a terminal state in this window — neither "
+            "a recorded stall nor a merge. That is an EMPTY result, not a "
+            "100% score."
+        )
+    else:
+        notes.append(
+            "headline: "
+            + _headline_note(grand_auto, grand_total, grand_by_design)
+            + " over the whole window."
+        )
+        if n_periods > 1:
+            for idx, period_start in enumerate(period_starts):
+                total = per_period_total.get(idx, 0)
+                auto = sum(
+                    r["count"]
+                    for r in rows
+                    if r["period_start"] == period_start and r["bucket"] in AUTO_BUCKETS
+                )
+                by_design = sum(
+                    r["count"]
+                    for r in rows
+                    if r["period_start"] == period_start and r["by_design"]
+                )
+                notes.append(
+                    f"  {_iso(period_start)}: "
+                    + _headline_note(auto, total, by_design)
+                )
+    notes.extend(
+        _queue_outcomes_caveats(
+            rows,
+            open_before_window=open_before_window,
+            unclassified_label=UNCLASSIFIED_CATEGORY,
+            open_bucket=BUCKET_OPEN,
+        )
+    )
+    if rows and log_starts_at is not None and log_starts_at > start:
+        # The recorder (#2235) landed in v0.5.90 and the fleet was on v0.5.88
+        # when this report was written, so EVERY early window will hit this.
+        # It is the same failure as a missing log, one granularity down: with
+        # no stall records but a complete merge history, a period scores 100%
+        # because nothing was measured — the most flattering possible way to
+        # read an instrument that was switched off.
+        notes.append(
+            "PARTIAL WINDOW: the block log's oldest record is "
+            f"{_iso(log_starts_at)}, after this window opened at "
+            f"{_iso(start)}. Every period before that has merges but NO stall "
+            "records, so its score is unmeasured, not perfect — the recorder "
+            "was not running yet. Trust the periods from "
+            f"{_iso(log_starts_at)} onward."
+        )
+
+    totals = (
+        {"count": grand_total, "share_pct": 100.0 if grand_total else 0.0}
+        if rows
+        else None
+    )
+
+    return ReportResult(
+        report_id="queue-outcomes",
+        generated_at=end if generated_at is None else float(generated_at),
+        window=(start, end),
+        columns=list(QUEUE_OUTCOMES_COLUMNS),
+        column_meta=list(QUEUE_OUTCOMES_COLUMN_META),
+        rows=rows,
+        notes=notes,
+        totals=totals,
+    )
+
+
+def _headline_note(auto: int, total: int, by_design: int) -> str:
+    """``(succeeded + auto_*) / total``, with the by-design-excluded variant.
+
+    Both, always, because they answer different questions: the raw fraction is
+    the operator's stated target, and the adjusted one is the only fraction
+    that CAN reach 100% — a Gate-A sign-off and a policy refusal are supposed
+    to stop for a human, so counting them as misses would make a working queue
+    read as permanent failure (#2270).
+    """
+    if total <= 0:
+        return "no terminal entries"
+    pct = 100.0 * auto / total
+    out = f"{pct:.1f}% got over the line without a human ({auto}/{total})"
+    remaining = total - by_design
+    if by_design:
+        adjusted = (100.0 * auto / remaining) if remaining > 0 else 100.0
+        out += (
+            f" · excluding {by_design} that stop for a human BY DESIGN "
+            f"(Gate A, policy): {adjusted:.1f}% ({auto}/{remaining})"
+        )
+    return out
+
+
+def _queue_outcomes_location_notes(
+    location: Mapping[str, Any] | None,
+) -> list[str]:
+    """Say where the log was read — and shout when it was not there (#1806).
+
+    The block log is a per-host file and only the host that runs the tick
+    writes one, so a reader that quietly reports zeros from the wrong machine
+    has produced a *perfect score* out of a missing file.  That is the exact
+    thin-client trap #1806 documents, and the one thing this report must never
+    do silently.
+    """
+    if not location:
+        return []
+    path = location.get("path") or "?"
+    host = location.get("host") or "?"
+    if location.get("exists"):
+        return [f"source: the block log on {host} ({path})."]
+    return [
+        f"NO BLOCK LOG ON THIS HOST: {path} does not exist on {host}, so this "
+        "report has no input and the table above is EMPTY — not a clean "
+        "sweep. The log is written by the drive-queue tick and is per-host "
+        "(#2235), so run this on the tick host, or point a board_service "
+        "thin client at that host's daemon and let it answer.",
+    ]
+
+
+def _queue_outcomes_caveats(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    open_before_window: int,
+    unclassified_label: str,
+    open_bucket: str,
+) -> list[str]:
+    from coord.block_log import BUCKET_AUTO_RESCUE  # noqa: PLC0415
+
+    notes: list[str] = []
+    if not rows:
+        return notes
+    if not any(r["bucket"] == BUCKET_AUTO_RESCUE for r in rows):
+        notes.append(
+            f"`{BUCKET_AUTO_RESCUE}` is 0 because nothing writes it yet — the "
+            "rescue agent (#2268) does not exist. It is modelled as its own "
+            "series from day one so this report does not change shape when it "
+            "lands, and so 'a deterministic arm fixed it' never quietly "
+            "becomes 'an agent judged it'."
+        )
+    unclassified = sum(
+        r["count"] for r in rows if r["category"] == unclassified_label
+    )
+    if unclassified:
+        notes.append(
+            f"{unclassified} episode(s) have no cause at all and are grouped "
+            f"as '{unclassified_label}' — a stall nobody has diagnosed. Run "
+            "`coord drive-queue diagnose` (#2276) to fill that column; until "
+            "then the category breakdown under-reports every real cause."
+        )
+    still_open = sum(r["count"] for r in rows if r["bucket"] == open_bucket)
+    if still_open:
+        notes.append(
+            f"{still_open} entr(y/ies) are still stalled. Read this beside the "
+            "headline: a queue that stops needing interventions by leaving "
+            "everything blocked forever scores well on `human` and badly here."
+        )
+    if open_before_window:
+        notes.append(
+            f"{open_before_window} of those stalled before this window opened "
+            "and are folded into its first period — they are counted, not "
+            "dropped, because the oldest unresolved stalls are exactly the "
+            "ones a window would otherwise hide."
+        )
+    return notes
+
+
+def _default_block_log_episodes() -> list[dict]:
+    """Every episode in this host's block log, oldest first.
+
+    The WHOLE log, never a windowed read: :func:`coord.block_log.read_events`
+    filters raw records, and an episode whose `enter` fell before the window
+    would arrive as an orphan `resolve` that
+    :func:`coord.block_log.episodes` correctly drops — silently deleting
+    exactly the long stalls this report exists to count.  Windowing happens on
+    the paired episode, in :func:`fold_queue_outcomes`.  A whole-file parse is
+    the shape that module already commits to (it rotates at 4 MiB for this
+    reason).
+    """
+    from coord.block_log import episodes, read_events  # noqa: PLC0415
+
+    return episodes(read_events())
+
+
+def _fetch_merged_keys(
+    *,
+    since: float,
+    until: float,
+    repo: str | None,
+    fetch: Callable[..., Mapping[str, Any]],
+) -> tuple[list[tuple[str, float]], list[str]]:
+    """``merged`` audit events in the window, as ``[(key, ts)]`` + notes.
+
+    Fails **soft**: a report whose `succeeded` count is missing under-states
+    the headline (never over-states it), so a broken audit read is worth a
+    loud note rather than a dead report.
+    """
+    try:
+        entries, truncated = fetch_audit_window(
+            since=since,
+            until=until,
+            repo=repo,
+            fetch=fetch,
+            category=_MERGE_AUDIT_CATEGORY,
+            event_type=_MERGE_AUDIT_EVENT,
+        )
+    except Exception as exc:  # noqa: BLE001 — surfaced as a note, not a crash
+        return [], [
+            "WARNING: the audit trail could not be read "
+            f"({type(exc).__name__}: {exc}) — the `succeeded` bucket (merged "
+            "with no stall) is MISSING from this run, so the headline is a "
+            "lower bound, not the real number."
+        ]
+
+    out: list[tuple[str, float]] = []
+    for entry in entries:
+        if entry.get("event_type") != _MERGE_AUDIT_EVENT:
+            continue
+        repo_name, issue = entry.get("repo"), entry.get("issue")
+        if not repo_name or issue is None:
+            continue
+        out.append((f"{repo_name}#{int(issue)}", float(entry.get("ts") or 0.0)))
+    notes: list[str] = []
+    if truncated:
+        notes.append(
+            "TRUNCATED: the audit trail's merge events could not be fully "
+            "fetched for this window, so the `succeeded` bucket is a lower "
+            "bound. Use a shorter window for a complete answer."
+        )
+    return out, notes
+
+
+def run_queue_outcomes(
+    *,
+    window: str = "24h",
+    until: str = "",
+    repo: str = "",
+    now: float | None = None,
+    episode_source: Callable[[], Sequence[Mapping[str, Any]]] | None = None,
+    fetch: Callable[..., Mapping[str, Any]] | None = None,
+    location: Mapping[str, Any] | None = None,
+) -> ReportResult:
+    """Read this host's block log (+ the merge events) and fold it.
+
+    ``now``/``episode_source``/``fetch``/``location`` are test seams; the
+    report's own parameters are ``window``/``until``/``repo``.
+
+    Refuses to invent a score when the log is not here: on a host with no
+    ``queue-block-log.jsonl`` this returns an EMPTY result — columns intact,
+    zero rows — with a note naming the host and the path, rather than a table
+    of zeros that reads as a perfect week (#1806, and this issue's own
+    acceptance).
+    """
+    from coord.block_log import log_location as _log_location  # noqa: PLC0415
+
+    generated_at = time.time() if now is None else float(now)
+    end = parse_timestamp(until) if until else generated_at
+    start, end, period = resolve_queue_outcomes_window(window, end)
+
+    where = dict(_log_location() if location is None else location)
+    if not where.get("exists"):
+        return fold_queue_outcomes(
+            (), (start, end), period_seconds=period,
+            generated_at=generated_at, log_location=where,
+        )
+
+    source = _default_block_log_episodes if episode_source is None else episode_source
+    episodes = list(source() or [])
+    # Before the repo filter: "when did this log start recording?" is a fact
+    # about the FILE, and a repo that happens to have stalled late must not
+    # make the whole log look younger than it is.
+    entered = [float(ep.get("entered_at") or 0.0) for ep in episodes]
+    log_starts_at = min((t for t in entered if t > 0), default=None)
+    if repo:
+        episodes = [
+            ep for ep in episodes
+            if str(ep.get("key") or "").split("#")[0] == repo
+        ]
+
+    merged, notes = _fetch_merged_keys(
+        since=start,
+        until=end,
+        repo=repo or None,
+        fetch=_default_fetch if fetch is None else fetch,
+    )
+
+    return fold_queue_outcomes(
+        episodes,
+        (start, end),
+        period_seconds=period,
+        merged=merged,
+        generated_at=generated_at,
+        log_location=where,
+        log_starts_at=log_starts_at,
+        extra_notes=notes,
+    )
+
+
 # ── the catalogue ──────────────────────────────────────────────────────────
 
 SINCE_PRESETS = ("1h", "6h", "24h", "3d", "7d")
@@ -1485,6 +2040,58 @@ USAGE = ReportDef(
         ),
     ),
     run=run_usage,
+)
+
+
+QUEUE_OUTCOMES = ReportDef(
+    id="queue-outcomes",
+    title="Queue Outcomes",
+    description=(
+        "What fraction of the queue got over the line without a human. Every "
+        "entry that reached a terminal state in the window, bucketed as "
+        "succeeded / auto_resolved_mechanism / auto_resolved_rescue / human / "
+        "open, with the human bucket broken down by cause and split again by "
+        "`by_design` (a Gate-A sign-off and a policy refusal are SUPPOSED to "
+        "stop for a person). Folded from the drive-queue block log (#2235), "
+        "which is per-host — run it where the tick runs, or let that host's "
+        "daemon answer. `24h` is one bar per category; `7d`/`4w` are the same "
+        "arithmetic in 7 daily / 4 weekly periods, so a client trends it by "
+        "grouping rows on `period_start`."
+    ),
+    params=(
+        ReportParam(
+            id="window",
+            label="Window",
+            kind="choice",
+            choices=QUEUE_OUTCOMES_WINDOW_CHOICES,
+            default="24h",
+            help=(
+                "Span and bucket size together: 24h is a single period, 7d is "
+                "7 daily periods, 4w is 4 weekly ones. Periods are aligned to "
+                "`until`, not to the civil calendar."
+            ),
+        ),
+        # Same name, same semantics and the same validator as
+        # `issue-activity`'s (#2270: follow the existing convention rather
+        # than inventing one). `since` is deliberately absent — `window` sets
+        # the span, and two ways to say it would let them disagree.
+        ReportParam(
+            id="until",
+            label="Window end",
+            kind="text",
+            default="",
+            help="Epoch seconds or ISO-8601. Empty means now.",
+            validate=_validate_until,
+        ),
+        ReportParam(
+            id="repo",
+            label="Repo",
+            kind="text",
+            default="",
+            help="Restrict to one repo by name. Empty means all repos.",
+        ),
+    ),
+    run=run_queue_outcomes,
 )
 
 
@@ -1631,6 +2238,7 @@ REPORTS: dict[str, ReportDef] = {
     ISSUE_ACTIVITY.id: ISSUE_ACTIVITY,
     DRIVE_QUEUE_STATUS.id: DRIVE_QUEUE_STATUS,
     USAGE.id: USAGE,
+    QUEUE_OUTCOMES.id: QUEUE_OUTCOMES,
 }
 
 
