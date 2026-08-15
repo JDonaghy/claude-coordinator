@@ -44577,6 +44577,349 @@ Milestone tracking issue.
     }
 
 
+    // ── #2271: a report that also declares a chart ──────────────────────
+    //
+    // Black-box `TuiDriver` tests, in-crate per CLAUDE.md, over the existing
+    // `make_app_with_reports` fixture. Targets are located with `find(...)`,
+    // never a hardcoded coordinate.
+    //
+    // The compatibility rule is the point of most of these: a report must
+    // never become unreadable on a coord-tui that predates the field, the
+    // declared kind, or quadraui#584 — coord-tui is a per-host binary
+    // outside propagation's reach, so mixed versions are normal.
+
+    /// A long-form result — one row per (period, bucket) — carrying a chart
+    /// declaration. `chart_json` is spliced in verbatim so a test can send a
+    /// kind this build has never met, an absent block, or a null one.
+    fn reports_chart_result_json(chart_json: &str) -> String {
+        let chart_field = if chart_json.is_empty() {
+            String::new()
+        } else {
+            format!(r#","chart": {chart_json}"#)
+        };
+        format!(
+            r#"{{
+                "report_id": "queue-outcomes",
+                "generated_at": 1000.0,
+                "window": [0.0, 1000.0],
+                "columns": ["period", "bucket", "count"],
+                "column_meta": [
+                    {{"id": "period", "label": "Period", "kind": "text",
+                      "align": "left", "weight": 1.0}},
+                    {{"id": "bucket", "label": "Bucket", "kind": "enum",
+                      "align": "left", "weight": 1.0}},
+                    {{"id": "count", "label": "Count", "kind": "int",
+                      "align": "right", "weight": 1.0}}
+                ],
+                "rows": [
+                    {{"period": "P1", "bucket": "BUCKALPHA", "count": 3}},
+                    {{"period": "P1", "bucket": "BUCKBETA", "count": 1}},
+                    {{"period": "P2", "bucket": "BUCKALPHA", "count": 5}},
+                    {{"period": "P2", "bucket": "BUCKALPHA", "count": 2}},
+                    {{"period": "P2", "bucket": "BUCKBETA", "count": 4}}
+                ],
+                "notes": []
+                {chart_field}
+            }}"#
+        )
+    }
+
+    /// The line declaration the 7d/4w `queue-outcomes` view emits: one
+    /// trendline per bucket over the period column.
+    const REPORTS_LINE_CHART_JSON: &str = r#"{
+        "kind": "line",
+        "series": [{"label": "Entries", "column": "count", "color": null}],
+        "x": "period", "group_by": "bucket", "stacked": false,
+        "title": "CHART-CAPTION", "y_label": "Entries"
+    }"#;
+
+    /// Deserialise a chart-bearing body straight into the wire type — the
+    /// seam `reports_chart_plan` is a pure function over.
+    fn reports_chart_result(chart_json: &str) -> crate::app::types::ReportResult {
+        serde_json::from_str(&reports_chart_result_json(chart_json))
+            .expect("#2271: a chart-bearing ReportResult must deserialise")
+    }
+
+    #[test]
+    fn reports_line_chart_declaration_renders_a_chart_and_its_legend() {
+        let mut driver = reports_driver(
+            &reports_chart_result_json(REPORTS_LINE_CHART_JSON),
+            140,
+            40,
+        );
+        driver.render();
+        let screen = driver.screen();
+
+        assert!(
+            driver.find("CHART-CAPTION").is_some(),
+            "#2271: the declaration's title must render above the chart:\n{screen}"
+        );
+        // The legend is the only place a series name appears in a terminal
+        // chart, and under `group_by` the series ARE the groups — so seeing
+        // both bucket names proves the pivot produced two series and that
+        // `paint_line` drew them both.
+        for needle in ["BUCKALPHA", "BUCKBETA"] {
+            assert!(
+                driver.find(needle).is_some(),
+                "#2271: {needle:?} must appear as a chart legend entry:\n{screen}"
+            );
+        }
+        // Both halves stay visible: the numbers are what get quoted.
+        assert!(
+            driver.find("Count").is_some(),
+            "#2271: the table must still render under the chart:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn reports_chart_does_not_displace_the_table_or_the_notes() {
+        let charted = reports_driver(
+            &reports_chart_result_json(REPORTS_LINE_CHART_JSON),
+            140,
+            40,
+        )
+        .screen();
+        // The table header still renders, below where the chart was drawn.
+        let plain = reports_driver(&reports_chart_result_json(""), 140, 40).screen();
+        assert!(
+            plain.contains("Bucket") && charted.contains("Bucket"),
+            "#2271: the table header must render with and without a chart\
+                 \nplain:\n{plain}\ncharted:\n{charted}"
+        );
+        let plain_row = plain.lines().position(|l| l.contains("Bucket"));
+        let charted_row = charted.lines().position(|l| l.contains("Bucket"));
+        assert!(
+            charted_row > plain_row,
+            "#2271: the chart takes rows from the top of the result area, so \
+                 the table must start LOWER when one is drawn (plain \
+                 {plain_row:?}, charted {charted_row:?})"
+        );
+    }
+
+    #[test]
+    fn reports_result_with_no_chart_key_renders_exactly_as_before() {
+        // The older-daemon case, which is the acceptance criterion that
+        // matters most: a payload that predates the field must render the
+        // table with no error AND no blank space. Compared against an
+        // explicit `"chart": null` because that is the same wire fact said
+        // two ways, and the two must be pixel-identical.
+        let absent = reports_driver(&reports_chart_result_json(""), 140, 40).screen();
+        let explicit_null =
+            reports_driver(&reports_chart_result_json("null"), 140, 40).screen();
+        assert_eq!(
+            absent, explicit_null,
+            "#2271: an absent `chart` key and an explicit null must render \
+                 identically — no chart, no reason line, no reserved \
+                 space\nabsent:\n{absent}\nnull:\n{explicit_null}"
+        );
+        assert!(
+            !absent.contains("Chart not shown"),
+            "#2271: a report that declares no chart must say nothing about \
+                 charts:\n{absent}"
+        );
+    }
+
+    #[test]
+    fn reports_unknown_chart_kind_falls_back_to_the_table() {
+        let json = r#"{
+            "kind": "sunburst",
+            "series": [{"label": "Entries", "column": "count", "color": null}],
+            "x": "period", "group_by": "bucket", "stacked": false,
+            "title": "CHART-CAPTION", "y_label": ""
+        }"#;
+        let mut driver = reports_driver(&reports_chart_result_json(json), 140, 40);
+        driver.render();
+        let screen = driver.screen();
+
+        assert!(
+            driver.find("Bucket").is_some() && driver.find("BUCKALPHA").is_some(),
+            "#2271: a chart kind this build predates must still render the \
+                 table:\n{screen}"
+        );
+        assert!(
+            screen.contains("sunburst"),
+            "#2271: the fallback must NAME the kind it did not understand — \
+                 a silently missing chart is undiagnosable:\n{screen}"
+        );
+        assert!(
+            driver.find("CHART-CAPTION").is_none(),
+            "#2271: no chart means no chart caption either:\n{screen}"
+        );
+    }
+
+    /// #2271 acceptance: bar rendering is gated on the pin actually carrying
+    /// quadraui#584, and the degraded branch is pinned here so it cannot rot
+    /// on a build whose pin *does* carry it. `reports_chart_plan` takes the
+    /// capability as an argument precisely so both branches stay testable.
+    #[test]
+    fn reports_multi_series_bar_degrades_when_the_pin_predates_quadraui_584() {
+        let json = r#"{
+            "kind": "bar",
+            "series": [{"label": "Entries", "column": "count", "color": null}],
+            "x": "bucket", "group_by": "bucket", "stacked": true,
+            "title": "CHART-CAPTION", "y_label": "Entries"
+        }"#;
+        let result = reports_chart_result(json);
+
+        match CoordApp::reports_chart_plan(&result, false) {
+            crate::app::reports::ChartPlan::Degrade(reason) => {
+                assert!(
+                    reason.contains("quadraui#584"),
+                    "#2271: the degraded section must state the reason and \
+                         name the blocker, got {reason:?}"
+                );
+            }
+            other => panic!(
+                "#2271: a 2-series bar on a pin without quadraui#584 must \
+                     degrade to the table, not draw a chart missing most of \
+                     its data — got {other:?}"
+            ),
+        }
+
+        match CoordApp::reports_chart_plan(&result, true) {
+            crate::app::reports::ChartPlan::Render { chart, .. } => {
+                assert_eq!(
+                    chart.series.len(),
+                    2,
+                    "#2271: with #584 in the pin, both buckets are plotted"
+                );
+            }
+            other => panic!(
+                "#2271: with #584 in the pin the same declaration must \
+                     render — got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn reports_single_series_bar_renders_on_any_pin() {
+        // One series is exactly what pre-#584 `paint_bar` drew correctly,
+        // so the gate must not refuse it.
+        let json = r#"{
+            "kind": "bar",
+            "series": [{"label": "Entries", "column": "count", "color": null}],
+            "x": "period", "stacked": true, "title": "", "y_label": ""
+        }"#;
+        let result = reports_chart_result(json);
+        assert!(
+            matches!(
+                CoordApp::reports_chart_plan(&result, false),
+                crate::app::reports::ChartPlan::Render { .. }
+            ),
+            "#2271: a single-series bar predates #584's problem entirely"
+        );
+    }
+
+    #[test]
+    fn reports_chart_pivot_sums_cells_and_keeps_row_order() {
+        let result = reports_chart_result(REPORTS_LINE_CHART_JSON);
+        let plan = CoordApp::reports_chart_plan(&result, true);
+        let crate::app::reports::ChartPlan::Render { chart, title } = plan else {
+            panic!("#2271: the line declaration must render");
+        };
+        assert_eq!(title, "CHART-CAPTION");
+        let labels: Vec<&str> = chart.series.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["BUCKALPHA", "BUCKBETA"],
+            "#2271: one series per distinct group, in first-appearance order"
+        );
+        // P1/P2 are the distinct x values; BUCKALPHA has two P2 rows (5 + 2)
+        // that must SUM into one point, not overwrite each other.
+        assert_eq!(chart.series[0].data, vec![3.0, 7.0]);
+        assert_eq!(chart.series[1].data, vec![1.0, 4.0]);
+    }
+
+    #[test]
+    fn reports_chart_naming_a_column_this_result_lacks_degrades_not_flatlines() {
+        // A mistyped/renamed column must look like a missing series, never
+        // like a real run of zeros — the most flattering possible bug.
+        let json = r#"{
+            "kind": "line",
+            "series": [{"label": "Entries", "column": "no_such_column", "color": null}],
+            "x": "period", "group_by": "bucket", "stacked": false,
+            "title": "", "y_label": ""
+        }"#;
+        let result = reports_chart_result(json);
+        assert!(
+            matches!(
+                CoordApp::reports_chart_plan(&result, true),
+                crate::app::reports::ChartPlan::Degrade(_)
+            ),
+            "#2271: a series naming no numeric column must degrade"
+        );
+    }
+
+    #[test]
+    fn reports_empty_result_declaring_a_chart_draws_neither() {
+        // Zero rows already render an explicit "no activity in this window"
+        // body; an axis with no marks over it would read as a measured zero.
+        let json = format!(
+            r#"{{
+                "report_id": "queue-outcomes", "generated_at": 1000.0,
+                "window": [0.0, 1000.0],
+                "columns": ["period", "count"], "rows": [], "notes": [],
+                "chart": {REPORTS_LINE_CHART_JSON}
+            }}"#
+        );
+        let result: crate::app::types::ReportResult =
+            serde_json::from_str(&json).expect("must deserialise");
+        assert!(matches!(
+            CoordApp::reports_chart_plan(&result, true),
+            crate::app::reports::ChartPlan::None
+        ));
+
+        let mut driver = reports_driver(&json, 140, 40);
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("No activity in this window"),
+            "#2271: the empty-window body still owns the panel:\n{screen}"
+        );
+        assert!(
+            !screen.contains("CHART-CAPTION"),
+            "#2271: no rows means no chart and no caption:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn reports_partial_chart_block_does_not_take_the_table_down_with_it() {
+        // Every field is `#[serde(default)]` on purpose: a daemon shipping a
+        // half-built block must degrade the chart, never fail the whole
+        // `ReportResult` deserialise and blank the report.
+        let mut driver =
+            reports_driver(&reports_chart_result_json(r#"{"kind": "line"}"#), 140, 40);
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            driver.find("BUCKALPHA").is_some(),
+            "#2271: a chart block with no series must still render the \
+                 table:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn reports_chart_is_dropped_rather_than_gutting_a_short_panel() {
+        // A chart is a scan aid; stealing a short panel's last rows for a
+        // two-row chart helps nobody. The table wins, silently.
+        let mut driver = reports_driver(
+            &reports_chart_result_json(REPORTS_LINE_CHART_JSON),
+            140,
+            14,
+        );
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            driver.find("CHART-CAPTION").is_none(),
+            "#2271: too short for a useful chart — it must be dropped:\n{screen}"
+        );
+        assert!(
+            driver.find("Bucket").is_some(),
+            "#2271: ...and the table must still be there:\n{screen}"
+        );
+    }
+
+
     // ── #1866 (Q-1): the Queue panel ────────────────────────────────────
     //
     // Black-box `TuiDriver` tests, in-crate because the fixtures are
@@ -47145,3 +47488,4 @@ Milestone tracking issue.
              must keep every repo's rows contiguous:\n{repos:?}"
         );
     }
+
