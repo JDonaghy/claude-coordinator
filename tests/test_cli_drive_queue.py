@@ -494,16 +494,32 @@ def test_list_json_emits_the_raw_rows(cli):
 
 
 def _backdate_reason(coord_db, issue: int, seconds: float) -> None:
-    """Age a queued entry's `reason_at` by *seconds* directly in SQLite —
-    simulating a `last_reason` snapshot captured that long ago. Bypasses
+    """Age a queued entry's `reason_at` (and, since #2273's post-review fix,
+    its `retry_backoff_at`) by *seconds* directly in SQLite — simulating a
+    `last_reason`/backoff-window snapshot captured that long ago. Bypasses
     `update_drive_queue_entry` (which always stamps "now") on purpose: this
     is standing in for the wall-clock time that has genuinely elapsed since
     a real tick wrote the reason, exactly as `_backdate` does for
     `launched_at` above.
+
+    Both columns are aged together rather than adding a second helper:
+    `retry_backoff_at` is the column `_retry_backoff_reason` (#2273) actually
+    measures its window from — `reason_at` alone stopped being enough the
+    moment the backoff-deferral's own per-tick status write started
+    re-stamping it every tick (the "moving target" bug this fix closes) — but
+    every existing caller of this helper wants "time has passed since the
+    last write" for ONE of the two concerns `reason_at`/`retry_backoff_at`
+    now split, and ageing the other one too is inert for callers that don't
+    care about it (a `blocked`/`parked` entry with `attempts == 0` is never
+    consulted by `_retry_backoff_reason` at all; a `waiting` entry backing
+    off after a real death has no reason to want `reason_at`'s display age
+    and its backoff window at different ages).
     """
+    aged = time.time() - seconds
     coord_db.execute(
-        "UPDATE drive_queue SET reason_at = ? WHERE repo_name = ? AND issue_number = ?",
-        (time.time() - seconds, REPO, issue),
+        "UPDATE drive_queue SET reason_at = ?, retry_backoff_at = ? "
+        "WHERE repo_name = ? AND issue_number = ?",
+        (aged, aged, REPO, issue),
     )
     coord_db.commit()
 
@@ -1062,26 +1078,29 @@ def test_a_negative_per_repo_ceiling_is_refused(cli):
 def _backdate(issue: int, seconds: float) -> None:
     """Age a queued entry's `launched_at` by *seconds*, as if time had passed.
 
-    #2273: also ages `reason_at` by the same *seconds* — a died entry's next
-    attempt is now paced by real wall-clock time since its `retry` reconcile
-    was recorded (`_retry_backoff_reason`), not just by tick cadence, so a
-    test simulating "this much time has genuinely passed" before its NEXT
-    tick has to age both fields together or the tick under test would see a
-    fresh `reason_at` and defer instead of proceeding. `reason_at` is not
-    one of `update_drive_queue_entry`'s whitelisted fields (it is
-    auto-stamped, never directly settable — see `_backdate_reason` above,
-    which this mirrors) so it goes through raw SQL rather than
+    #2273: also ages `reason_at` AND (post-review fix) `retry_backoff_at` by
+    the same *seconds* — a died entry's next attempt is now paced by real
+    wall-clock time since its `retry` reconcile was recorded
+    (`_retry_backoff_reason`, keyed on `retry_backoff_at` — see that
+    function's docstring for why NOT `reason_at`), not just by tick cadence,
+    so a test simulating "this much time has genuinely passed" before its
+    NEXT tick has to age every field together or the tick under test would
+    see a fresh anchor and defer instead of proceeding. Neither column is one
+    of `update_drive_queue_entry`'s whitelisted-for-arbitrary-values fields
+    (both are auto-stamped/tick-owned — see `_backdate_reason` above, which
+    this mirrors) so it goes through raw SQL rather than
     `_update_drive_queue_entry_local`. Harmless for a fresh entry that has
-    never retried (`reason_at` is not consulted until `attempts >= 1`).
+    never retried (neither column is consulted until `attempts >= 1`).
     """
     state._update_drive_queue_entry_local(
         REPO, issue, launched_at=time.time() - seconds
     )
     conn = state.get_connection()
+    aged = time.time() - seconds
     conn.execute(
-        "UPDATE drive_queue SET reason_at = ? WHERE repo_name = ? "
-        "AND issue_number = ?",
-        (time.time() - seconds, REPO, issue),
+        "UPDATE drive_queue SET reason_at = ?, retry_backoff_at = ? "
+        "WHERE repo_name = ? AND issue_number = ?",
+        (aged, aged, REPO, issue),
     )
     conn.commit()
 

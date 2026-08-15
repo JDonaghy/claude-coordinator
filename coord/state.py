@@ -5174,7 +5174,7 @@ _DRIVE_QUEUE_COLUMNS = (
     "id, repo_name, issue_number, position, machine, after_json, state, "
     "attempts, deferrals, last_reason, reason_at, session_name, launched_at, "
     "enqueued_at, hold_after, hold_reason, resume_when, hold_state, "
-    "hold_probes, launch_host, hold_scope, resumes"
+    "hold_probes, launch_host, hold_scope, resumes, retry_backoff_at"
 )
 
 # Fields `update_drive_queue_entry` may write. Deliberately excludes the
@@ -5187,6 +5187,10 @@ _DRIVE_QUEUE_COLUMNS = (
 # with the LAUNCHING host's identity at the moment the launch subprocess
 # reports success, never operator-declared. `resumes` (#2230) joins it too —
 # only `plan_tick`'s blocked-reconciliation sweep ever increments it.
+# `retry_backoff_at` (#2273 post-review) joins it too, written ONLY by a
+# `retry` reconcile — never by the backoff-deferral's own `deferrals`/
+# `last_reason` status write, which is the whole point: that write must not
+# move the anchor the backoff window is measured from.
 _DRIVE_QUEUE_UPDATABLE = frozenset(
     {
         "state",
@@ -5199,6 +5203,7 @@ _DRIVE_QUEUE_UPDATABLE = frozenset(
         "hold_probes",
         "launch_host",
         "resumes",
+        "retry_backoff_at",
     }
 )
 
