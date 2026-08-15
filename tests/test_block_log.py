@@ -26,12 +26,25 @@ from __future__ import annotations
 import json
 
 from coord.block_log import (
+    AUTO_BUCKETS,
+    BUCKET_AUTO_MECHANISM,
+    BUCKET_AUTO_RESCUE,
+    BUCKET_HUMAN,
+    BUCKET_OPEN,
+    BUCKET_SUCCEEDED,
+    BY_DESIGN_CAUSES,
     EVENT_ENTER,
     EVENT_RESOLVE,
     MAX_LOG_BYTES,
+    RESCUE_SOURCES,
+    UNCLASSIFIED_CATEGORY,
     block_log_path,
     enter_event,
+    episode_bucket,
+    episode_category,
     episodes,
+    is_by_design,
+    log_location,
     operator_resolution_event,
     plan_events,
     read_events,
@@ -48,6 +61,8 @@ from coord.drive_queue import (
     Reconcile,
     TickPlan,
 )
+from coord.gate_a import park_marker
+from coord.models import POLICY_REFUSAL_MARKER
 
 REPO = "claude-coordinator"
 NOW = 1_800_000_000.0
@@ -1225,3 +1240,163 @@ def test_a_session_this_host_launched_is_still_read_normally():
         local_host="dellserver",
     )
     assert seen.probe(e).agent_has_session is True
+
+
+# ── #2270: the outcome vocabulary the queue-outcomes report buckets on ───────
+#
+# One episode -> one bucket, one category, one `by_design` flag. These three
+# derivations live here rather than next to the renderer for a reason worth
+# pinning: `coord drive-queue block-log`'s `by_cause` and the report's
+# `category` must be the SAME string, or a morning number and the evidence
+# under it quietly stop describing each other.
+
+
+def _ep(**kw) -> dict:
+    """A paired episode, minus the fields these derivations never read."""
+    base = {
+        "key": "api#1",
+        "state": STATE_BLOCKED,
+        "stated_reason": "exhausted",
+        "resolved": False,
+        "true_cause": "",
+        "human_acted": None,
+    }
+    base.update(kw)
+    return base
+
+
+def test_the_category_is_the_cause_slug_and_the_vocabulary_is_open():
+    # A cause nothing in this codebase defines. #2270 is explicit that the
+    # category set is the `true_cause` vocabulary two weeks of Phase 0 exists
+    # to DISCOVER, so it must survive as itself rather than as "other".
+    assert (
+        episode_category(_ep(true_cause="solar-flare — never seen before"))
+        == "solar-flare"
+    )
+    assert episode_category(_ep(true_cause="ci-reported")) == "ci-reported"
+    assert episode_category(_ep()) == UNCLASSIFIED_CATEGORY
+
+
+def test_the_category_is_the_same_string_summarize_buckets_on():
+    items = [_ep(true_cause="solar-flare — x"), _ep()]
+    stats = summarize(items)
+    assert set(stats["by_cause"]) == {episode_category(i) for i in items}
+
+
+def test_an_unresolved_episode_is_open_however_it_was_stalled():
+    assert episode_bucket(_ep()) == BUCKET_OPEN
+    assert episode_bucket(_ep(state=STATE_PARKED)) == BUCKET_OPEN
+
+
+def test_an_auto_release_is_the_mechanism_bucket():
+    assert (
+        episode_bucket(_ep(resolved=True, human_acted=False))
+        == BUCKET_AUTO_MECHANISM
+    )
+
+
+def test_the_rescue_agents_release_is_its_own_series():
+    # #2268 does not exist, so this shape is structurally unreachable today.
+    # Modelled anyway: the report must not change shape when it lands, and
+    # "an agent judged it" must never quietly merge into "a deterministic arm
+    # fixed it".
+    for source in sorted(RESCUE_SOURCES):
+        assert (
+            episode_bucket(_ep(resolved=True, human_acted=False, source=source))
+            == BUCKET_AUTO_RESCUE
+        )
+
+
+def test_a_gate_a_release_is_human_even_though_the_tick_performed_it():
+    # #2063 is recorded as an auto-resume by the tick that did it, but a
+    # person signed the gate. Reading the mechanism first would file the one
+    # release a human definitely caused under "resolved itself".
+    episode = _ep(
+        resolved=True,
+        human_acted=True,
+        source="tick",
+        true_cause="gate-a-signed — released only because a human recorded the sign-off",
+    )
+    assert episode_bucket(episode) == BUCKET_HUMAN
+
+
+def test_the_rescue_source_never_overrides_a_human_release():
+    episode = _ep(resolved=True, human_acted=True, source="rescue")
+    assert episode_bucket(episode) == BUCKET_HUMAN
+
+
+def test_succeeded_is_not_a_shape_this_log_can_produce():
+    # An episode IS a stall, so "merged without ever stalling" has no episode.
+    # The report counts that bucket from a different source and says so; this
+    # pins that no episode can quietly fall into it.
+    shapes = [
+        _ep(),
+        _ep(resolved=True, human_acted=False),
+        _ep(resolved=True, human_acted=True),
+        _ep(resolved=True, human_acted=False, source="rescue"),
+    ]
+    assert BUCKET_SUCCEEDED not in {episode_bucket(s) for s in shapes}
+
+
+def test_the_headline_numerator_is_the_three_auto_buckets():
+    assert AUTO_BUCKETS == {
+        BUCKET_SUCCEEDED, BUCKET_AUTO_MECHANISM, BUCKET_AUTO_RESCUE
+    }
+    assert BUCKET_HUMAN not in AUTO_BUCKETS
+    assert BUCKET_OPEN not in AUTO_BUCKETS
+
+
+def test_a_gate_a_stall_is_by_design_from_the_queues_own_marker():
+    # Both before a diagnosis (the marker is in the reason the queue stamped)
+    # and after the release (the slug).
+    parked = _ep(stated_reason="Gate A not approved " + park_marker("api", 51))
+    assert is_by_design(parked) is True
+    released = _ep(
+        resolved=True,
+        human_acted=True,
+        true_cause="gate-a-signed — a human recorded the sign-off",
+        stated_reason="Gate A not approved",
+    )
+    assert is_by_design(released) is True
+    assert "gate-a-signed" in BY_DESIGN_CAUSES
+
+
+def test_a_policy_refusal_is_by_design():
+    episode = _ep(
+        state=STATE_PARKED,
+        stated_reason=f"coordinator-owned docs {POLICY_REFUSAL_MARKER}",
+    )
+    assert is_by_design(episode) is True
+
+
+def test_an_ordinary_stall_is_not_by_design():
+    # The allow-list is deliberately incomplete, and an unknown category is
+    # False — a by_design flag that defaults to True would let the target
+    # metric flatter itself with every cause this build has not met.
+    assert is_by_design(_ep(stated_reason="CI red, 2/2 attempts")) is False
+    assert is_by_design(_ep(true_cause="solar-flare — invented")) is False
+    assert is_by_design(_ep(stated_reason="")) is False
+
+
+def test_log_location_reports_the_path_the_host_and_whether_it_is_there(tmp_path):
+    absent = tmp_path / "nope.jsonl"
+    where = log_location(absent)
+    assert where["path"] == str(absent)
+    assert where["exists"] is False
+    assert where["size"] == 0
+    assert where["host"]
+
+    present = tmp_path / "queue-block-log.jsonl"
+    record([{"event": EVENT_ENTER, "ts": 1.0, "key": "api#1"}], path=present)
+    where = log_location(present)
+    assert where["exists"] is True
+    assert where["size"] > 0
+
+
+def test_log_location_follows_the_env_override_like_the_path_itself(monkeypatch, tmp_path):
+    # The log is per-host and only the tick host writes one, so a reader that
+    # cannot say WHERE it read is indistinguishable from one that found
+    # nothing — and "found nothing" over a stall log reads as a perfect score.
+    target = tmp_path / "elsewhere.jsonl"
+    monkeypatch.setenv("COORD_BLOCK_LOG", str(target))
+    assert log_location()["path"] == str(block_log_path()) == str(target)

@@ -62,6 +62,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import socket
 import time
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
@@ -73,6 +74,8 @@ from coord.drive_queue import (
     QueueEntry,
     TickPlan,
 )
+from coord.gate_a import is_gate_a_refusal_reason
+from coord.models import is_policy_refusal_reason
 
 _log = logging.getLogger(__name__)
 
@@ -81,15 +84,29 @@ __all__ = [
     "AGREEMENT_AGREED",
     "AGREEMENT_DISAGREED",
     "AGREEMENT_UNDECIDED",
+    "AUTO_BUCKETS",
+    "BUCKET_AUTO_MECHANISM",
+    "BUCKET_AUTO_RESCUE",
+    "BUCKET_HUMAN",
+    "BUCKET_OPEN",
+    "BUCKET_SUCCEEDED",
+    "BY_DESIGN_CAUSES",
     "EVENT_DIAGNOSIS",
     "EVENT_ENTER",
     "EVENT_RESOLVE",
+    "OUTCOME_BUCKETS",
+    "RESCUE_SOURCES",
     "STALL_STATES",
+    "UNCLASSIFIED_CATEGORY",
     "agreement_for",
     "block_log_path",
     "diagnosis_event",
     "enter_event",
+    "episode_bucket",
+    "episode_category",
     "episodes",
+    "is_by_design",
+    "log_location",
     "operator_resolution_event",
     "plan_events",
     "read_events",
@@ -131,6 +148,31 @@ def block_log_path() -> Path:
     if override:
         return Path(override)
     return Path.home() / ".coord" / "queue-block-log.jsonl"
+
+
+def log_location(path: Path | None = None) -> dict[str, Any]:
+    """Where this process would read the log, and whether it is actually there.
+
+    The log is **per-host** and only the host that runs the tick writes one, so
+    a reader that cannot say *where it read* is indistinguishable from a reader
+    that found nothing — and "found nothing" over a stall log reads as a
+    perfect score.  #1806 is the same trap in the fleet checks: a measurement
+    taken on the wrong machine's filesystem, reported as if it were the right
+    one's.  Every consumer of this dict is expected to surface ``exists=False``
+    loudly rather than fold it into a zero (see
+    :func:`coord.reports.run_queue_outcomes`).
+    """
+    target = block_log_path() if path is None else path
+    try:
+        exists = target.is_file()
+        size = target.stat().st_size if exists else 0
+    except OSError:  # pragma: no cover — defensive
+        exists, size = False, 0
+    try:
+        host = socket.gethostname()
+    except OSError:  # pragma: no cover — defensive
+        host = ""
+    return {"path": str(target), "host": host, "exists": exists, "size": size}
 
 
 # ── classification (derived, never probed) ───────────────────────────────────
@@ -818,7 +860,7 @@ def summarize(items: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             human += 1
         else:
             auto += 1
-        cause = str(item.get("true_cause") or "").split(" — ")[0] or "(unresolved)"
+        cause = episode_category(item)
         by_cause[cause] = by_cause.get(cause, 0) + 1
         repo = str(item.get("key") or "").split("#")[0]
         stated = " ".join(str(item.get("stated_reason") or "").split())[:60]
@@ -854,3 +896,133 @@ def summarize(items: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             "disagreement_rate": (disagreed / scored) if scored else None,
         },
     }
+
+
+# ── #2270: the outcome vocabulary the queue-outcomes report buckets on ───────
+#
+# One question — *what fraction of the queue got over the line without me?* —
+# needs exactly two derivations over an episode, and both belong here rather
+# than in `coord.reports`: this module owns what an episode MEANS, and a
+# second opinion living next to the renderer is how `by_cause` and a report's
+# categories drift apart.
+
+#: Merged with no stall recorded at all.  Structurally **never** produced from
+#: an episode — an episode IS a stall — so :func:`episode_bucket` cannot
+#: return it.  The queue-outcomes report counts this bucket from the merge
+#: events on the audit trail and says so in its notes; naming the constant
+#: here keeps the five-bucket vocabulary in one place.
+BUCKET_SUCCEEDED = "succeeded"
+#: Stalled, then released by a deterministic arm that already exists (#1891
+#: park auto-resume, #2230 blocked re-check, #2197 CI re-run, #2252 flaky
+#: re-run) — i.e. a `resolve` whose ``human_acted`` is false.
+BUCKET_AUTO_MECHANISM = "auto_resolved_mechanism"
+#: Stalled, then released by the rescue AGENT (#2268).  **Structurally zero
+#: today** — nothing writes a `resolve` with one of :data:`RESCUE_SOURCES` —
+#: and modelled anyway, from day one, for two reasons #2270 is explicit
+#: about: the report does not change shape when #2268 lands, and "a
+#: deterministic arm fixed it" stays visibly distinct from "an agent judged
+#: it" instead of being merged into one flattering number.
+BUCKET_AUTO_RESCUE = "auto_resolved_rescue"
+#: Stalled and a human acted.  Broken down by category, and split again by
+#: :func:`is_by_design` — see that function for why the split is load-bearing.
+BUCKET_HUMAN = "human"
+#: Still stalled at the end of the window.  Reported beside the others rather
+#: than dropped: a queue that stops needing interventions by leaving
+#: everything blocked forever is the failure mode, not the goal.
+BUCKET_OPEN = "open"
+
+#: Display / iteration order — worst-case last.
+OUTCOME_BUCKETS: tuple[str, ...] = (
+    BUCKET_SUCCEEDED,
+    BUCKET_AUTO_MECHANISM,
+    BUCKET_AUTO_RESCUE,
+    BUCKET_HUMAN,
+    BUCKET_OPEN,
+)
+
+#: The headline metric's numerator: ``(succeeded + auto_resolved_mechanism +
+#: auto_resolved_rescue) / total``, the fraction the operator wants trending
+#: to ~100%.
+AUTO_BUCKETS: frozenset[str] = frozenset(
+    {BUCKET_SUCCEEDED, BUCKET_AUTO_MECHANISM, BUCKET_AUTO_RESCUE}
+)
+
+#: ``source`` values on a `resolve` record that mean *the rescue agent did
+#: this*.  Two spellings because #2268 has not landed and cannot be asked;
+#: whichever it stamps, this report already counts it in its own series
+#: rather than silently flattering :data:`BUCKET_AUTO_MECHANISM`.
+RESCUE_SOURCES: frozenset[str] = frozenset({"rescue", "rescue-agent"})
+
+#: What :func:`episode_category` returns for an episode with no cause at all —
+#: an open stall nobody has diagnosed yet.  Deliberately the same label
+#: :func:`summarize` has always used for that case, so the two agree.
+UNCLASSIFIED_CATEGORY = "(unresolved)"
+
+#: Cause slugs that mean *a human was SUPPOSED to be the one who acted*.  This
+#: is not an enum over the category vocabulary — that vocabulary is open and
+#: read from the data (see :func:`episode_category`) — it is a small,
+#: deliberately incomplete allow-list, and an unknown category is `False`.
+BY_DESIGN_CAUSES: frozenset[str] = frozenset({"gate-a-signed"})
+
+
+def episode_category(episode: Mapping[str, Any]) -> str:
+    """One episode's category — the cause slug, as an OPEN vocabulary.
+
+    The slug before the first ``" — "`` of ``true_cause``, which is whatever
+    the resolution (or, for a still-open episode, #2276's diagnosis) named.
+    Deliberately not an enum and deliberately not validated: #2270's category
+    set is the ``true_cause`` vocabulary that two weeks of Phase 0 exists to
+    *discover*, so a cause this build has never seen must appear in the report
+    as itself rather than as "other".  Same contract
+    :class:`coord.reports.ColumnMeta`'s ``kind`` already states — a client that
+    meets a value it predates falls back, never fails.
+    """
+    return str(episode.get("true_cause") or "").split(" — ")[0] or UNCLASSIFIED_CATEGORY
+
+
+def episode_bucket(episode: Mapping[str, Any]) -> str:
+    """Which outcome bucket one episode lands in.
+
+    Never :data:`BUCKET_SUCCEEDED`: an episode is a stall by construction, so
+    "merged without ever stalling" is not a shape this log can produce — the
+    report counts that bucket from a different source and says so.
+
+    The ``human_acted`` test precedes the rescue test on purpose.  A Gate-A
+    release (#2063) is recorded as an auto-resume by the tick that performed
+    it, yet its ``human_acted`` is true because a person signed the gate; a
+    bucketing that read the mechanism first would file the one release a human
+    definitely caused under "resolved itself".
+    """
+    if not episode.get("resolved"):
+        return BUCKET_OPEN
+    if episode.get("human_acted"):
+        return BUCKET_HUMAN
+    if str(episode.get("source") or "") in RESCUE_SOURCES:
+        return BUCKET_AUTO_RESCUE
+    return BUCKET_AUTO_MECHANISM
+
+
+def is_by_design(episode: Mapping[str, Any]) -> bool:
+    """Was a human *supposed* to be the thing that unblocked this?
+
+    Two stalls in this fleet stop for a person on purpose: an unsigned Gate A
+    (#2063 — a sign-off is a human judgement and automating it would defeat
+    the gate) and a policy refusal (#2234 — the rule it names is standing, and
+    nothing will arrive to clear it).  Without this flag both land in the
+    ``human`` bucket, the target metric can never reach 100%, and a working
+    queue reads as permanent failure.
+
+    Derived from the queue's own predicates
+    (:func:`coord.gate_a.is_gate_a_refusal_reason`,
+    :func:`coord.models.is_policy_refusal_reason`) over the reason the queue
+    itself stamped, plus :data:`BY_DESIGN_CAUSES` for the resolution-side slug
+    — never from a second classification invented here.  That also means an
+    UNDIAGNOSED open Gate-A park still flags correctly: its category is
+    ``(unresolved)``, but its stated reason still carries the marker.
+    """
+    if episode_category(episode) in BY_DESIGN_CAUSES:
+        return True
+    reason = str(episode.get("stated_reason") or "")
+    if not reason:
+        return False
+    return is_gate_a_refusal_reason(reason) or is_policy_refusal_reason(reason)
