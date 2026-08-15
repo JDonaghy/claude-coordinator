@@ -27,7 +27,13 @@ from typing import TYPE_CHECKING
 
 import click
 
-from coord.config import Config, ConfigError, load, resolve_config_path
+from coord.config import (
+    Config,
+    ConfigError,
+    is_canonical_config_path,
+    load,
+    resolve_config_path,
+)
 
 if TYPE_CHECKING:  # pragma: no cover — typing only
     from collections.abc import Iterator
@@ -100,7 +106,7 @@ _CONFIG_OPTION = click.option(
 )
 
 
-def _save_config_snapshot(config: Config) -> None:
+def _save_config_snapshot(config: Config, config_path: Path | None = None) -> None:
     """Persist machine + pipeline metadata to the DB so dashboards can read it.
 
     Writes:
@@ -111,12 +117,33 @@ def _save_config_snapshot(config: Config) -> None:
 
     The pipeline keys let the TUI Pipeline panel pick up coordinator.yml
     settings without having to parse YAML itself.
+
+    *config_path* is the file *config* was actually loaded from. When given
+    and it is not the canonical resolution (see
+    ``coord.config.is_canonical_config_path``), the write is skipped
+    entirely — see the #2208 guard below. Callers that omit it (mainly
+    direct unit tests exercising the write itself) get the pre-#2208
+    behavior: always write.
     """
     # #584: a thin client (board_service configured) must not create/write a
     # local DB — the daemon/host owns the config snapshot.  On the host
     # board_service is unset, so the snapshot is written as before.
     from coord.client import resolve_board_service
     if resolve_board_service() is not None:
+        return
+    # #2208: an explicit `--config <file>` pointed away from the fleet's real
+    # config (a scratch fixture, a CI-only stub) must not be treated as a
+    # request to redefine the shared `machines` table — that table is global
+    # state every client's `/board` and the TUI read, not something a single
+    # throwaway invocation should own. Skip the write and say so; silence
+    # here is exactly what turned one worker's scoped `--config` override
+    # into an hour of misdiagnosis (#2208).
+    if config_path is not None and not is_canonical_config_path(config_path):
+        click.echo(
+            f"note: --config points at a non-canonical path ({config_path}); "
+            "leaving the shared machines/pipeline snapshot untouched (#2208).",
+            err=True,
+        )
         return
     conn = None
     try:
@@ -270,7 +297,7 @@ def _load_config(path: Path | None) -> Config:
     except ConfigError as e:
         click.echo(f"error: {e}", err=True)
         sys.exit(2)
-    _save_config_snapshot(cfg)
+    _save_config_snapshot(cfg, path)
     return cfg
 
 
