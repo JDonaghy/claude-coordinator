@@ -1489,6 +1489,15 @@ class HealthConfig:
     worktree_warn_count: int = 3
     worktree_crit_count: int = 10
 
+    # ── stale .git/index.lock in a known checkout (#2206) ──────────────────
+    # A few minutes is generous: real git index operations are sub-second,
+    # so a lock this old is either a live operation on an enormous repo (rare
+    # and worth a look anyway) or, far more often, a killed git process that
+    # will never clean up after itself.  A lock younger than this is never
+    # flagged regardless of holder; a lock held by a live process is never
+    # flagged regardless of age.
+    index_lock_stale_minutes: float = 10.0
+
     # ── agent install ─────────────────────────────────────────────────────
     # Absolute path to the agent venv's python.  None → autodetect
     # (~/.coord-venv/bin/python3, else the running interpreter).
@@ -2860,6 +2869,7 @@ _HEALTH_FLOAT_FIELDS: dict[str, float] = {
     "cargo_target_crit_gb": 0.0,
     "cargo_scan_budget_secs": 0.0,
     "worktree_stale_hours": 0.0,
+    "index_lock_stale_minutes": 0.0,
     "network_timeout_secs": 0.0,
     "graph_stale_warn_hours": 0.0,
     "graph_stale_crit_hours": 0.0,

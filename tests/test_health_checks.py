@@ -20,6 +20,7 @@ from coord.health.checks import (
     claude_binary,
     disk,
     graph,
+    index_lock,
     plan_usage,
     repo_state,
     worktrees,
@@ -354,6 +355,121 @@ def test_worktrees_crit_above_ten_stale(tmp_path) -> None:
     assert result.severity is Severity.CRIT
     assert "oldest" in result.headroom
     assert "coord diagnose --orphan-worktrees" in result.detail
+
+
+# ── index lock (#2206) ───────────────────────────────────────────────────────
+
+
+def _lock_checkout(
+    tmp_path: Path, name: str, *, age_seconds: float | None, now: float = NOW
+) -> tuple[Checkout, Path]:
+    """A checkout whose ``.git/index.lock`` is *age_seconds* old, or absent
+    if *age_seconds* is ``None``."""
+    repo = tmp_path / name
+    lock = repo / ".git" / "index.lock"
+    lock.parent.mkdir(parents=True)
+    if age_seconds is not None:
+        lock.write_bytes(b"")
+        stamp = now - age_seconds
+        import os
+
+        os.utime(lock, (stamp, stamp))
+    return Checkout(name=name, path=repo), lock
+
+
+def _fake_proc_holder(tmp_path: Path, pid: int, target: Path) -> Path:
+    """A ``/proc`` fixture where *pid* holds an fd open on *target*."""
+    proc_root = tmp_path / "proc"
+    fd_dir = proc_root / str(pid) / "fd"
+    fd_dir.mkdir(parents=True)
+    import os
+
+    os.symlink(str(target), fd_dir / "5")
+    return proc_root
+
+
+def test_index_lock_no_checkouts_reports_nothing(tmp_path) -> None:
+    assert index_lock.probe_index_lock(make_ctx(tmp_path)) is None
+
+
+def test_index_lock_absent_is_ok(tmp_path) -> None:
+    checkout, _lock = _lock_checkout(tmp_path, "vimcode", age_seconds=None)
+    result = index_lock.probe_index_lock(make_ctx(tmp_path, checkouts=(checkout,)))
+    assert result.severity is Severity.OK
+    assert result.headroom == "no stale locks"
+
+
+def test_index_lock_younger_than_threshold_is_not_flagged(tmp_path) -> None:
+    checkout, _lock = _lock_checkout(tmp_path, "vimcode", age_seconds=30.0)
+    result = index_lock.probe_index_lock(make_ctx(tmp_path, checkouts=(checkout,)))
+    assert result.severity is Severity.OK
+
+
+def test_index_lock_stale_with_no_holder_is_reported(tmp_path, monkeypatch) -> None:
+    """The exact elitebook condition: present, no holder, older than the
+    threshold — must be reported, naming the path. This must fail before
+    the #2206 fix exists."""
+    checkout, lock = _lock_checkout(tmp_path, "claude-coordinator", age_seconds=3600.0)
+    # An empty (but readable) /proc fixture -> the scan actually ran and
+    # legitimately found nothing holding it, not "couldn't check".
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()
+    monkeypatch.setattr(index_lock, "_PROC_ROOT", proc_root)
+    result = index_lock.probe_index_lock(make_ctx(tmp_path, checkouts=(checkout,)))
+    assert result.severity is Severity.CRIT
+    assert str(lock) in result.headroom
+    assert f"rm -f {lock}" in result.detail
+    assert result.values["stale"][0]["confidence"] == "high"
+
+
+def test_index_lock_held_by_live_process_is_never_flagged(tmp_path, monkeypatch) -> None:
+    """A lock a live process holds must not be flagged, at any age."""
+    checkout, lock = _lock_checkout(tmp_path, "vimcode", age_seconds=999_999.0)
+    proc_root = _fake_proc_holder(tmp_path, pid=4242, target=lock)
+    monkeypatch.setattr(index_lock, "_PROC_ROOT", proc_root)
+    result = index_lock.probe_index_lock(make_ctx(tmp_path, checkouts=(checkout,)))
+    assert result.severity is Severity.OK
+    assert "vimcode" in result.headroom
+
+
+def test_index_lock_no_proc_access_falls_back_to_age_with_reduced_confidence(
+    tmp_path, monkeypatch
+) -> None:
+    checkout, _lock = _lock_checkout(tmp_path, "vimcode", age_seconds=3600.0)
+    # Point at a /proc that doesn't exist at all.
+    monkeypatch.setattr(index_lock, "_PROC_ROOT", tmp_path / "no-such-proc")
+    result = index_lock.probe_index_lock(make_ctx(tmp_path, checkouts=(checkout,)))
+    assert result.severity is Severity.CRIT
+    assert result.values["stale"][0]["confidence"].startswith("reduced")
+    assert "holder check unavailable" in result.headroom
+
+
+def test_index_lock_never_modifies_the_filesystem(tmp_path, monkeypatch) -> None:
+    checkout, lock = _lock_checkout(tmp_path, "vimcode", age_seconds=3600.0)
+    monkeypatch.setattr(index_lock, "_PROC_ROOT", tmp_path / "proc")
+    index_lock.probe_index_lock(make_ctx(tmp_path, checkouts=(checkout,)))
+    assert lock.exists()
+
+
+def test_has_open_holder_matches_an_open_fd(tmp_path) -> None:
+    target = tmp_path / "repo" / ".git" / "index.lock"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"")
+    proc_root = _fake_proc_holder(tmp_path, pid=99, target=target)
+    assert index_lock.has_open_holder(target, proc_root=proc_root) is True
+
+
+def test_has_open_holder_returns_false_when_scan_completes_clean(tmp_path) -> None:
+    target = tmp_path / "repo" / ".git" / "index.lock"
+    proc_root = tmp_path / "proc"
+    (proc_root / "1" / "fd").mkdir(parents=True)
+    assert index_lock.has_open_holder(target, proc_root=proc_root) is False
+
+
+def test_has_open_holder_returns_none_when_proc_is_unreadable(tmp_path) -> None:
+    proc_root = tmp_path / "does-not-exist"
+    target = tmp_path / "repo" / ".git" / "index.lock"
+    assert index_lock.has_open_holder(target, proc_root=proc_root) is None
 
 
 # ── agent install ────────────────────────────────────────────────────────────
