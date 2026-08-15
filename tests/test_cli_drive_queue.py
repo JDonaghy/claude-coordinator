@@ -211,7 +211,7 @@ def test_drive_queue_is_registered_with_every_verb():
     assert "drive-queue" in main.commands
     assert set(main.commands["drive-queue"].commands) == {
         "add", "list", "remove", "move", "status", "tick", "resume",
-        "overlap-report", "block-log",
+        "overlap-report", "block-log", "diagnose",
     }
 
 
@@ -2785,3 +2785,260 @@ def test_block_log_on_an_empty_log_says_so_rather_than_printing_nothing(
     result = cli("block-log")
     assert result.exit_code == 0, result.output
     assert "no stalls recorded" in result.output
+
+
+# ── #2276 Phase 1: the read-only diagnostician, end to end ───────────────────
+#
+# Phase 0's `block-log` above shows what the queue SAID. These drive
+# `coord drive-queue diagnose` — the real Click command, the real sqlite
+# board, the real block log — and assert on the rendered diagnosis.
+#
+# The stubbed boundary is `gh` and the live gate report, i.e. "the world",
+# per this file's opening note. Every stub RECORDS its verb, so the
+# zero-mutation test can assert that not one write verb was reached.
+
+
+class _Check:
+    def __init__(self, name: str, conclusion, status: str = "completed") -> None:
+        self.name = name
+        self.conclusion = conclusion
+        self.status = status
+
+
+class _Gate:
+    def __init__(self, gate: str, ok: bool, reason=None) -> None:
+        self.gate = gate
+        self.required = True
+        self.ok = ok
+        self.reason = reason
+
+
+class _GateReport:
+    def __init__(self, branch: str, decisions: list) -> None:
+        self.branch = branch
+        self.decisions = decisions
+
+
+@pytest.fixture
+def gh_world(monkeypatch):
+    """Stub every live read the diagnostician makes, recording each verb."""
+
+    world: dict[str, Any] = {
+        "pr_state": "OPEN",
+        "pr": {"number": 77},
+        "mergeable": True,
+        "checks": [_Check("test", "success")],
+        "gates": [_Gate("merge", True)],
+        "branch": "issue-1762",
+        "calls": [],
+    }
+
+    def _record(verb: str):
+        world["calls"].append(verb)
+
+    monkeypatch.setattr(
+        "coord.github_ops.get_pr_state_for_branch",
+        lambda repo, branch: (_record("gh pr view --json state"), world["pr_state"])[1],
+    )
+    monkeypatch.setattr(
+        "coord.github_ops.find_pr_for_branch",
+        lambda repo, branch: (_record("gh pr list --state open"), world["pr"])[1],
+    )
+    monkeypatch.setattr(
+        "coord.github_ops.check_pr_mergeable",
+        lambda repo, number: (_record("gh pr view --json mergeable"), world["mergeable"])[1],
+    )
+    monkeypatch.setattr(
+        "coord.ci_github.GitHubCi.list_checks_for_pr",
+        lambda self, repo, number: (_record("gh pr checks"), world["checks"])[1],
+    )
+    monkeypatch.setattr(
+        "coord.gates.build_gate_report",
+        lambda *a, **k: (
+            _record("coord gates"),
+            _GateReport(world["branch"], world["gates"]),
+        )[1],
+    )
+    return world
+
+
+def _stall(issue: int, reason: str, block_log_path: Path) -> None:
+    """Put a real row in `blocked` and open its Phase-0 episode."""
+    from coord import block_log as bl
+
+    state._update_drive_queue_entry_local(
+        REPO, issue, state="blocked", attempts=2, last_reason=reason
+    )
+    bl.record(
+        [
+            {
+                "event": bl.EVENT_ENTER,
+                "ts": time.time() - 3600,
+                "key": f"{REPO}#{issue}",
+                "state": "blocked",
+                "stated_reason": reason,
+                "true_cause": "",
+                "human_acted": None,
+            }
+        ],
+        path=block_log_path,
+    )
+
+
+def test_diagnose_contradicts_the_reason_the_queue_stated(
+    cli, seed, block_log, gh_world
+):
+    """#2235's own row, driven end to end.
+
+    The queue says "stale test verdict". GitHub says the branch is
+    conflicting. The rendered diagnosis has to say so, out loud, rather than
+    quietly agreeing with the queue.
+    """
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    _stall(1762, "merge blocked: stale test verdict (2/2 attempts)", block_log)
+    gh_world["mergeable"] = False
+
+    result = cli("diagnose")
+    assert result.exit_code == 0, result.output
+    assert f"{REPO}#1762 [blocked]" in result.output
+    assert "stated: merge blocked: stale test verdict (2/2 attempts)" in result.output
+    assert "cause:  merge-conflict (confidence high)" in result.output
+    assert "CONTRADICTS the stated reason" in result.output
+    # The evidence each conclusion rests on, named.
+    assert "gh pr view #77: state=OPEN mergeable=NO" in result.output
+    assert "1 contradicted the stated reason" in result.output
+    assert "nothing was mutated" in result.output
+
+
+def test_diagnose_says_unknown_rather_than_guessing_when_the_probes_fail(
+    cli, seed, block_log, gh_world, monkeypatch
+):
+    """`unknown` is a first-class verdict with no penalty attached (#2276)."""
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    _stall(1762, "blocked: CI red, 2/2 attempts", block_log)
+
+    def boom(*a, **k):
+        raise RuntimeError("gh: could not resolve host github.com")
+
+    monkeypatch.setattr("coord.github_ops.get_pr_state_for_branch", boom)
+    monkeypatch.setattr("coord.gates.build_gate_report", boom)
+
+    result = cli("diagnose")
+    assert result.exit_code == 0, result.output
+    assert "cause:  unknown (confidence none)" in result.output
+    assert "unknown is a verdict, not a failure" in result.output
+    assert "CONTRADICTS" not in result.output
+    assert "1 abstained (unknown)" in result.output
+
+
+def test_the_diagnosis_lands_on_the_episode_the_block_log_reports(
+    cli, seed, block_log, gh_world
+):
+    """The acceptance criterion, literally: `true_cause` where it used to read
+    `(unresolved)`."""
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    _stall(1762, "blocked: CI red, 2/2 attempts", block_log)
+
+    before = json.loads(cli("block-log", "--json").output)
+    assert before["episodes"][0]["true_cause"] == ""
+    assert before["summary"]["by_cause"] == {"(unresolved)": 1}
+
+    assert cli("diagnose").exit_code == 0
+
+    after = json.loads(cli("block-log", "--json").output)
+    episode = after["episodes"][0]
+    assert episode["true_cause"].startswith("nothing-blocking — ")
+    assert episode["diagnosed_cause"] == "nothing-blocking"
+    assert episode["resolved"] is False  # an observation, not an outcome
+    assert after["summary"]["by_cause"] == {"nothing-blocking": 1}
+    assert after["summary"]["diagnosis"]["diagnosed"] == 1
+    assert after["summary"]["diagnosis"]["contradicted_stated_reason"] == 1
+
+    rendered = cli("block-log").output
+    assert "STILL STALLED" in rendered
+    assert "cause:  nothing-blocking" in rendered
+    assert "← CONTRADICTS the stated reason" in rendered
+    assert "not yet measurable" in rendered  # nothing scorable has resolved
+
+
+def test_a_full_diagnosis_pass_leaves_the_board_the_queue_and_github_untouched(
+    cli, seed, block_log, gh_world, coord_db
+):
+    """#2276: *"Zero mutation is proven, not asserted."*
+
+    Every table in the real schema is dumped before and after, and every `gh`
+    verb the pass reached is checked against a read-only allowlist.
+    """
+    seed(issues={1762: "open"}, assignments=[{"issue_number": 1762, "status": "done"}])
+    cli("add", REPO, "1762")
+    cli("add", REPO, "1763")
+    _stall(1762, "merge blocked: stale test verdict", block_log)
+    _stall(1763, "blocked: CI red, 2/2 attempts", block_log)
+    gh_world["mergeable"] = False
+
+    before = list(coord_db.iterdump())
+    result = cli("diagnose")
+    after = list(coord_db.iterdump())
+
+    assert result.exit_code == 0, result.output
+    assert "2 diagnosed" in result.output
+    # The board AND the queue, byte for byte. `iterdump` covers every table,
+    # so this catches an attempt-counter bump or a `last_reason` rewrite just
+    # as surely as a state flip.
+    assert after == before
+
+    # GitHub: only reads were reached. Asserting the allowlist rather than
+    # "no writes happened" means a NEW verb added later fails this test until
+    # someone has looked at it.
+    assert set(gh_world["calls"]) <= {
+        "gh pr view --json state",
+        "gh pr list --state open",
+        "gh pr view --json mergeable",
+        "gh pr checks",
+        "coord gates",
+    }
+    assert gh_world["calls"], "the pass did not actually probe anything"
+
+
+def test_diagnose_dry_run_does_not_even_write_its_own_record(
+    cli, seed, block_log, gh_world
+):
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    _stall(1762, "blocked: CI red", block_log)
+    before = block_log_records(block_log)
+
+    result = cli("diagnose", "--dry-run")
+    assert result.exit_code == 0, result.output
+    assert "cause:" in result.output
+    assert block_log_records(block_log) == before
+
+
+def test_diagnose_spends_its_budget_once_and_then_declines(
+    cli, seed, block_log, gh_world
+):
+    """#2272's shape: a diagnosis that concluded is not re-derived, so the
+    command is safe to run in a loop."""
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    _stall(1762, "blocked: CI red", block_log)
+
+    assert "1 diagnosed" in cli("diagnose").output
+    second = cli("diagnose")
+    assert second.exit_code == 0, second.output
+    assert "nothing to diagnose" in second.output
+    diagnoses = [
+        r for r in block_log_records(block_log) if r.get("event") == "diagnosis"
+    ]
+    assert len(diagnoses) == 1
+
+
+def test_diagnose_on_a_quiet_queue_says_so_rather_than_printing_nothing(
+    cli, block_log, gh_world
+):
+    result = cli("diagnose")
+    assert result.exit_code == 0, result.output
+    assert "nothing to diagnose" in result.output

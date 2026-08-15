@@ -363,3 +363,115 @@ def test_tick_result_summary_is_human_readable(condition_secs):
         transport=MemoryTransport(),
     )
     assert "delivered" in result.summary()
+
+
+# ── #2276 Phase 1: the diagnostician's trigger ───────────────────────────
+#
+# #2235 is explicit that Phase 1 must *"consume that detector, not build a
+# second one"*. These pin the seam: the diagnosis pass is fed the notifier's
+# own raised events, and it cannot take the tick down with it.
+
+
+def test_the_diagnosis_pass_is_fed_the_detectors_raised_events(monkeypatch):
+    """Not `fresh` — `raised`.
+
+    `select_deliverable` is a notification-noise filter ("the operator already
+    knows"), and evidence is not noise: the live state that explains a stall
+    expires nightly, so a stall suppressed as a duplicate is still one whose
+    cause is only derivable now.
+    """
+    seen: list = []
+    monkeypatch.setattr(
+        service, "diagnose_pass", lambda events, config, **kw: (seen.append(list(events)), ["d"])[1]
+    )
+    now = at(10)
+    result = run(
+        FakeConfig(),
+        now=now,
+        snapshot=slow_snapshot(now),
+        transport=MemoryTransport(),
+    )
+    assert result.diagnoses == ["d"]
+    assert "1 diagnosed" in result.summary()
+    assert [e.repo for e in seen[0]] == ["coord"]
+
+
+def test_a_broken_diagnosis_cannot_take_the_notifier_tick_down(monkeypatch):
+    """#1485's lesson, restated: an advisory read that can throw is one that
+    can take reconciliation, dispatch and the merge drain with it."""
+
+    def boom(*a, **k):
+        raise RuntimeError("gh exploded")
+
+    monkeypatch.setattr("coord.state.list_drive_queue", boom)
+    now = at(10)
+    transport = MemoryTransport()
+    result = run(
+        FakeConfig(),
+        now=now,
+        snapshot=slow_snapshot(now),
+        transport=transport,
+    )
+    assert result.error is None
+    assert result.diagnoses == []
+    assert len(transport.sent) == 1  # the notification still went out
+
+
+def test_the_pass_declines_before_touching_the_log_when_nothing_is_queued():
+    """The notifier raises on assignments, drives and gates; only some of
+    those are drive-queue entries. A tick that raised none must cost no log
+    parse, no board build and no `gh` call."""
+    now = at(10)
+    events = service.evaluate(slow_snapshot(now), {})
+    assert events, "fixture no longer raises anything"
+    assert service.diagnose_pass(events, FakeConfig()) == []
+
+
+def test_the_pass_records_the_true_cause_a_phase_0_entry_row_could_not(
+    tmp_path, monkeypatch, coord_db
+):
+    """The whole reason #2276 was ungated from #2268.
+
+    Phase 0 writes `true_cause: ""` on entry and cannot fill it — so two weeks
+    of Phase 0 alone is two weeks of the labels #2235 already proved
+    misleading. This drives the notifier's own trigger through to a populated
+    column, with the `gh` layer stubbed by an injected probe.
+    """
+    from coord import block_log as bl
+    from coord import queue_diagnose as qd
+    from coord.state import enqueue_drive_queue, _update_drive_queue_entry_local
+
+    log = tmp_path / "queue-block-log.jsonl"
+    monkeypatch.setenv("COORD_BLOCK_LOG", str(log))
+    enqueue_drive_queue("coord", 42)
+    _update_drive_queue_entry_local(
+        "coord", 42, state="blocked", last_reason="blocked: CI red, 2/2 attempts"
+    )
+    bl.record([
+        {"event": bl.EVENT_ENTER, "ts": 1.0, "key": "coord#42", "state": "blocked",
+         "stated_reason": "blocked: CI red, 2/2 attempts", "true_cause": ""},
+    ])
+    assert bl.episodes(bl.read_events())[0]["true_cause"] == ""
+
+    class Probe:
+        def probe(self, entry):
+            return qd.LiveState(
+                pr_number=7, pr_state="OPEN", mergeable=False,
+                checks=(qd.CheckReading("test", "success"),), gate_ready=True,
+            )
+
+    now = at(10)
+    diagnoses = service.diagnose_pass(
+        service.evaluate(slow_snapshot(now), {}), FakeConfig(), probe=Probe()
+    )
+
+    assert [d.cause for d in diagnoses] == ["merge-conflict"]
+    assert diagnoses[0].contradicts_stated is True
+    # The notifier condition that triggered the look rides along, so the
+    # corpus can be joined back to #1632's detector.
+    assert diagnoses[0].trigger == "over_baseline"
+
+    episode = bl.episodes(bl.read_events())[0]
+    assert episode["true_cause"].startswith("merge-conflict — ")
+    assert episode["resolved"] is False
+    assert bl.summarize([episode])["by_cause"] == {"merge-conflict": 1}

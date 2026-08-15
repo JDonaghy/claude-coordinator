@@ -451,6 +451,19 @@ def test_the_summary_reports_human_and_open_counts_together():
         "auto_released": 1,
         "open": 1,
         "repeat_causes": {},
+        # #2276: always present, even when nothing has been diagnosed, so
+        # #2270's report reads one stable shape instead of branching on
+        # whether Phase 1 has run on this host yet. `disagreement_rate` is
+        # None rather than 0.0 for the same reason — see `summarize`.
+        "diagnosis": {
+            "diagnosed": 0,
+            "contradicted_stated_reason": 0,
+            "agreed": 0,
+            "disagreed": 0,
+            "abstained": 0,
+            "undecided": 0,
+            "disagreement_rate": None,
+        },
     }
 
 
@@ -467,3 +480,561 @@ def test_the_same_repo_stalling_twice_on_the_same_reason_shows_up_as_a_repeat():
          "human_acted": True, "stated_reason": "stale test verdict"},
     ])
     assert stats["repeat_causes"] == {f"{REPO}: stale test verdict": 2}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# #2276 Phase 1 — the read-only diagnostician
+#
+# Phase 0 above records what the queue SAID. Everything below pins the thing
+# that re-derives what was actually true, because #2235's finding is that the
+# two disagree five times out of seven — and because Phase 0 structurally
+# cannot fill its own `true_cause` column (`enter` writes "", `resolve` derives
+# from the queue's own release). These tests are the contract that column now
+# has a writer, that the writer abstains rather than guesses, that it is scored
+# against reality rather than trusted, and that it mutates nothing.
+# ═══════════════════════════════════════════════════════════════════════════
+
+import dataclasses
+
+import pytest
+
+from coord import queue_diagnose as qd
+from coord.block_log import (
+    AGREEMENT_ABSTAINED,
+    AGREEMENT_AGREED,
+    AGREEMENT_DISAGREED,
+    AGREEMENT_UNDECIDED,
+    agreement_for,
+    diagnosis_event,
+)
+
+
+def live(**kw) -> qd.LiveState:
+    """A LiveState with a complete, unremarkable picture unless overridden."""
+    base: dict = {
+        "pr_number": 4242,
+        "pr_state": "OPEN",
+        "mergeable": True,
+        "checks": (qd.CheckReading("test", "success"),),
+        "gate_ready": True,
+        "agent_reachable": True,
+    }
+    base.update(kw)
+    return qd.LiveState(**base)
+
+
+def stalled(issue: int, reason: str, **kw) -> QueueEntry:
+    kw.setdefault("state", STATE_BLOCKED)
+    return entry(issue, last_reason=reason, **kw)
+
+
+def open_episode(key: str, **kw) -> dict:
+    base: dict = {
+        "key": key,
+        "state": STATE_BLOCKED,
+        "stated_reason": "",
+        "entered_at": NOW,
+        "resolved": False,
+        "diagnoses": 0,
+        "diagnosed_cause": "",
+    }
+    base.update(kw)
+    return base
+
+
+class RecordingProbe:
+    """A probe that answers from a script and remembers who asked."""
+
+    def __init__(self, answers: dict[str, qd.LiveState] | None = None) -> None:
+        self.answers = answers or {}
+        self.asked: list[str] = []
+
+    def probe(self, entry_: QueueEntry) -> qd.LiveState:
+        self.asked.append(entry_.key)
+        return self.answers.get(entry_.key, live())
+
+
+# ── the verdicts, pinned ────────────────────────────────────────────────────
+
+
+def test_a_live_conflict_contradicts_a_stale_test_verdict():
+    """#2235's own row, and the entire point of Phase 1.
+
+    The queue said "stale test verdict"; the truth was a four-branch conflict.
+    A diagnostician that anchored on the stated reason would have gone looking
+    at the test gate and found nothing wrong with it.
+    """
+    got = qd.diagnose(
+        stalled(1, "merge blocked: stale test verdict (2/2 attempts)"),
+        live(mergeable=False),
+    )
+    assert got.cause == qd.CAUSE_MERGE_CONFLICT
+    assert got.confidence == qd.CONFIDENCE_HIGH
+    assert got.contradicts_stated is True
+    # The decisive reading leads the evidence, and it is a READ.
+    assert got.evidence[0] == "gh pr view #4242: state=OPEN mergeable=NO"
+
+
+def test_a_green_build_contradicts_ci_red_2_of_2_attempts():
+    """#2235's other row: "CI red, 2/2 attempts" for a build that went green.
+
+    Nothing is blocking this entry at all — every gate reads clear — which is
+    a far stronger statement than "CI happens to be green" and is exactly the
+    #2230 shape the queue kept giving up on.
+    """
+    got = qd.diagnose(stalled(2, "blocked: CI red, 2/2 attempts"), live())
+    assert got.cause == qd.CAUSE_NOTHING_BLOCKING
+    assert got.contradicts_stated is True
+    assert got.true_cause.startswith("nothing-blocking — ")
+
+
+def test_a_merged_pr_means_the_stated_reason_outlived_its_subject():
+    got = qd.diagnose(
+        stalled(3, "blocked: review required but not approved"),
+        live(pr_state="MERGED", mergeable=None, checks=None, gate_ready=None),
+    )
+    assert got.cause == qd.CAUSE_PR_MERGED
+    assert got.confidence == qd.CONFIDENCE_HIGH
+    assert got.contradicts_stated is True
+
+
+def test_a_genuinely_failing_check_does_not_contradict_a_ci_shaped_reason():
+    """Agreement has to be possible, or `contradicts_stated` measures nothing."""
+    got = qd.diagnose(
+        stalled(4, "blocked: CI red, 2/2 attempts"),
+        live(checks=(qd.CheckReading("test", "failure"),), gate_ready=False,
+             gate_blockers=("merge: CI failed",)),
+    )
+    assert got.cause == qd.CAUSE_CI_RED
+    assert got.confidence == qd.CONFIDENCE_HIGH
+    assert got.contradicts_stated is False
+    assert got.evidence[0] == "gh pr checks: failing — test"
+
+
+def test_a_dead_leg_is_diagnosed_even_though_fixing_it_is_out_of_scope():
+    """#2276 is explicit: Phase 1 must be able to NAME this shape, and must
+    not be the thing that fixes it — mechanism before agent."""
+    got = qd.diagnose(
+        stalled(5, "dispatch failed: no session", session_name="drive-x",
+                machine="dellserver"),
+        live(agent_has_session=False),
+    )
+    assert got.cause == qd.CAUSE_DEAD_LEG
+    assert got.contradicts_stated is False  # the queue was right, for once
+
+
+def test_no_pr_rules_out_every_ci_shaped_reason():
+    got = qd.diagnose(
+        stalled(6, "blocked: CI red"),
+        live(pr_number=None, pr_state="none", mergeable=None, checks=None),
+    )
+    assert got.cause == qd.CAUSE_NO_PR
+    assert got.contradicts_stated is True
+
+
+def test_an_unreadable_check_is_never_promoted_to_a_failure():
+    """#1525's fail-closed rule is about whether to MERGE. Phase 1 never
+    merges, so calling an unreadable check a failure would manufacture a
+    `ci-red` verdict out of a `gh` hiccup."""
+    got = qd.diagnose(
+        stalled(7, "blocked: something"),
+        live(checks=(qd.CheckReading("test", "unknown"),), gate_ready=None),
+    )
+    assert got.cause != qd.CAUSE_CI_RED
+
+
+# ── abstention is a first-class verdict ─────────────────────────────────────
+
+
+def test_thin_evidence_is_unknown_rather_than_a_guess():
+    """A confidently wrong cause is worse than no cause: #2268's Phase 2 would
+    inherit the confidence."""
+    got = qd.diagnose(
+        stalled(8, "blocked: CI red, 2/2 attempts"),
+        qd.LiveState(probe_errors=("gh pr view: RuntimeError: gh: not found",)),
+    )
+    assert got.cause == qd.CAUSE_UNKNOWN
+    assert got.confidence == qd.CONFIDENCE_NONE
+    assert got.abstained is True
+    # And it does NOT claim to have contradicted anything.
+    assert got.contradicts_stated is False
+    assert "probe failed: gh pr view: RuntimeError: gh: not found" in got.evidence
+
+
+def test_a_probe_that_raises_becomes_an_abstention_not_an_exception():
+    class Exploding:
+        def probe(self, entry_):
+            raise RuntimeError("boom")
+
+    got = qd.run_pass(
+        [stalled(9, "blocked: whatever")],
+        [open_episode(f"{REPO}#9")],
+        probe=Exploding(),
+    )
+    assert [d.cause for d in got] == [qd.CAUSE_UNKNOWN]
+    assert "probe raised RuntimeError: boom" in got[0].evidence[-1]
+
+
+def test_a_partial_picture_downgrades_a_medium_verdict_but_not_a_high_one():
+    partial = {"probe_errors": ("coord gates: TimeoutError: 30s",)}
+    medium = qd.diagnose(
+        stalled(10, "x"),
+        live(gate_ready=None, checks=(qd.CheckReading("test", "pending"),), **partial),
+    )
+    high = qd.diagnose(stalled(10, "x"), live(mergeable=False, **partial))
+    assert (medium.cause, medium.confidence) == (
+        qd.CAUSE_CI_PENDING,
+        qd.CONFIDENCE_LOW,
+    )
+    # `mergeable: false` is one authoritative field; a second probe failing
+    # does not make it less true.
+    assert (high.cause, high.confidence) == (
+        qd.CAUSE_MERGE_CONFLICT,
+        qd.CONFIDENCE_HIGH,
+    )
+
+
+def test_an_unclassifiable_stated_reason_is_never_declared_contradicted():
+    """Asserting that evidence contradicts a sentence you did not parse is a
+    confidently-wrong verdict wearing a different hat."""
+    got = qd.diagnose(stalled(11, "the vibes were off"), live(mergeable=False))
+    assert got.cause == qd.CAUSE_MERGE_CONFLICT
+    assert qd.stated_family("the vibes were off") == ""
+    assert got.contradicts_stated is False
+
+
+# ── the stated reason is an input, never a hypothesis ───────────────────────
+
+
+def test_the_stated_reason_never_selects_the_cause():
+    """Two entries, opposite stated reasons, identical live state.
+
+    If the stated reason leaked into rule selection at all, these would
+    diverge — which is precisely how the five-of-seven failure reproduces.
+    """
+    evidence = live(mergeable=False)
+    a = qd.diagnose(stalled(12, "blocked: CI red, 2/2 attempts"), evidence)
+    b = qd.diagnose(stalled(12, "blocked: merge conflict on four branches"), evidence)
+    assert a.cause == b.cause == qd.CAUSE_MERGE_CONFLICT
+    assert a.confidence == b.confidence
+    # Only the contradiction flag — a statement ABOUT the stated reason —
+    # differs between them.
+    assert (a.contradicts_stated, b.contradicts_stated) == (True, False)
+
+
+# ── the column Phase 0 could not fill ───────────────────────────────────────
+
+
+def test_a_diagnosis_fills_the_true_cause_an_open_episode_never_had():
+    """Before: `summarize` buckets an open episode as `(unresolved)`. After:
+    it has a cause, and the episode is still open."""
+    events = [
+        {"event": EVENT_ENTER, "ts": NOW, "key": f"{REPO}#13",
+         "state": STATE_BLOCKED, "stated_reason": "stale test verdict",
+         "true_cause": ""},
+    ]
+    before = episodes(events)[0]
+    assert before["true_cause"] == ""
+    assert summarize([before])["by_cause"] == {"(unresolved)": 1}
+
+    events.append(
+        diagnosis_event(
+            key=f"{REPO}#13", state=STATE_BLOCKED,
+            stated_reason="stale test verdict",
+            true_cause="merge-conflict — GitHub reports the PR as conflicting",
+            cause="merge-conflict", confidence="high",
+            evidence=["gh pr view #1: state=OPEN mergeable=NO"],
+            contradicts_stated=True, now=NOW + 60,
+        )
+    )
+    after = episodes(events)[0]
+    assert after["true_cause"].startswith("merge-conflict — ")
+    assert after["diagnosed_cause"] == "merge-conflict"
+    assert after["diagnosis_confidence"] == "high"
+    assert after["diagnosis_contradicts_stated"] is True
+    assert after["diagnoses"] == 1
+    # Still stalled. A diagnosis is an observation, not an outcome.
+    assert after["resolved"] is False
+    stats = summarize([after])
+    assert stats["by_cause"] == {"merge-conflict": 1}
+    assert stats["open"] == 1
+    assert stats["diagnosis"]["diagnosed"] == 1
+    assert stats["diagnosis"]["contradicted_stated_reason"] == 1
+
+
+def test_a_diagnosis_carries_no_human_acted_claim():
+    """`False` would be counted by `summarize` as an auto-release that never
+    happened. Phase 1 acts on nothing and knows nothing about what a human
+    did."""
+    assert "human_acted" not in diagnosis_event(
+        key=f"{REPO}#14", state=STATE_BLOCKED, stated_reason="x",
+        true_cause="unknown — y", cause="unknown", confidence="none",
+    )
+
+
+def test_a_diagnosis_for_a_key_with_no_open_episode_is_dropped():
+    """Same rule as an orphan `resolve`: there is no stated reason to compare
+    against, so synthesising the episode would invent the evidence."""
+    assert episodes([
+        diagnosis_event(key=f"{REPO}#15", state=STATE_BLOCKED, stated_reason="x",
+                        true_cause="ci-green — y", cause="ci-green",
+                        confidence="medium", now=NOW),
+    ]) == []
+
+
+# ── scored against reality, not trusted ─────────────────────────────────────
+
+
+def test_the_resolution_scores_the_diagnosis_that_preceded_it():
+    def episode_for(cause: str, resolve_cause: str) -> dict:
+        return episodes([
+            {"event": EVENT_ENTER, "ts": NOW, "key": f"{REPO}#16",
+             "state": STATE_BLOCKED, "stated_reason": "CI red"},
+            diagnosis_event(key=f"{REPO}#16", state=STATE_BLOCKED,
+                            stated_reason="CI red", true_cause=f"{cause} — z",
+                            cause=cause, confidence="medium", now=NOW + 10),
+            {"event": EVENT_RESOLVE, "ts": NOW + 20, "key": f"{REPO}#16",
+             "resolution": "auto_resumed", "true_cause": resolve_cause},
+        ])[0]
+
+    agreed = episode_for("ci-green", "ci-reported — a live re-check found READY")
+    assert agreed["agreement"] == AGREEMENT_AGREED
+    # The diagnosis said the branch was conflicting; it released because CI
+    # reported. That is a miss, and it is reported as one.
+    missed = episode_for("merge-conflict", "ci-reported — a live re-check")
+    assert missed["agreement"] == AGREEMENT_DISAGREED
+    # Both keep the resolution's own account as `true_cause` — the derived one
+    # sits beside it rather than overwriting it, so the two claims stay
+    # independent.
+    assert missed["true_cause"].startswith("ci-reported")
+    assert missed["diagnosed_cause"] == "merge-conflict"
+
+
+def test_an_abstention_is_scored_apart_from_a_disagreement():
+    """#2276: `unknown` is a first-class verdict with NO penalty attached."""
+    assert agreement_for("unknown", "ci-reported — x") == AGREEMENT_ABSTAINED
+    assert agreement_for("", "ci-reported — x") == ""
+
+
+def test_an_operator_resolution_leaves_the_diagnosis_unscored():
+    """`operator-intervened` says in as many words that what the human fixed
+    is not recorded, so scoring against it would be scoring against noise."""
+    assert (
+        agreement_for("merge-conflict", "operator-intervened — a human cleared it")
+        == AGREEMENT_UNDECIDED
+    )
+
+
+def test_the_disagreement_rate_is_none_until_something_scorable_resolved():
+    """0% wrong out of nothing is the most flattering way there is to assume
+    the number #2276 insists must be measured."""
+    unscored = summarize([
+        {"key": f"{REPO}#17", "state": STATE_BLOCKED, "resolved": False,
+         "diagnosed_cause": "unknown", "agreement": ""},
+    ])
+    assert unscored["diagnosis"]["disagreement_rate"] is None
+    assert unscored["diagnosis"]["diagnosed"] == 1
+
+    scored = summarize([
+        {"key": f"{REPO}#18", "state": STATE_BLOCKED, "resolved": True,
+         "diagnosed_cause": "ci-green", "agreement": AGREEMENT_AGREED},
+        {"key": f"{REPO}#19", "state": STATE_BLOCKED, "resolved": True,
+         "diagnosed_cause": "merge-conflict", "agreement": AGREEMENT_DISAGREED},
+        {"key": f"{REPO}#20", "state": STATE_BLOCKED, "resolved": True,
+         "diagnosed_cause": "unknown", "agreement": AGREEMENT_ABSTAINED},
+    ])
+    # The abstention is NOT in the denominator.
+    assert scored["diagnosis"]["disagreement_rate"] == pytest.approx(0.5)
+    assert scored["diagnosis"]["abstained"] == 1
+
+
+# ── the budget (#2272's shape) ──────────────────────────────────────────────
+
+
+def test_a_diagnosis_that_cannot_conclude_cannot_loop():
+    exhausted = open_episode(
+        f"{REPO}#21",
+        diagnoses=qd.MAX_DIAGNOSES_PER_EPISODE,
+        diagnosed_cause=qd.CAUSE_UNKNOWN,
+    )
+    assert qd.needs_diagnosis(exhausted) is False
+    probe = RecordingProbe()
+    assert qd.run_pass([stalled(21, "x")], [exhausted], probe=probe) == []
+    assert probe.asked == []  # not one `gh` call was spent
+
+
+def test_only_an_abstention_is_retried():
+    """A concluded diagnosis is not re-derived: re-running it would spend the
+    budget re-confirming, and would let a later probe failure downgrade an
+    answer that was already earned."""
+    assert qd.needs_diagnosis(open_episode("a", diagnoses=1,
+                                           diagnosed_cause=qd.CAUSE_UNKNOWN)) is True
+    assert qd.needs_diagnosis(open_episode("b", diagnoses=1,
+                                           diagnosed_cause="merge-conflict")) is False
+    assert qd.needs_diagnosis(open_episode("c")) is True
+
+
+def test_a_resolved_episode_is_never_diagnosed():
+    assert qd.needs_diagnosis({"key": "x", "resolved": True, "diagnoses": 0}) is False
+
+
+def test_one_pass_is_bounded_and_defers_the_rest_rather_than_dropping_them(caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="coord.queue_diagnose")
+    entries = [stalled(n, "blocked: x") for n in range(30, 40)]
+    open_eps = [open_episode(e.key) for e in entries]
+    probe = RecordingProbe()
+    got = qd.run_pass(entries, open_eps, probe=probe, limit=4)
+    assert len(got) == 4
+    assert len(probe.asked) == 4  # the cap is on WORK, not just on output
+    # Never a silent truncation.
+    assert "deferred to the next pass" in caplog.text
+
+
+# ── the trigger is #1632's detector, and there is only one ──────────────────
+
+
+def test_the_trigger_is_the_notifiers_own_stall_detector():
+    from coord.notifier.models import (
+        CONDITION_HUMAN_REQUIRED,
+        CONDITION_STALL_NUDGED,
+        NotifyEvent,
+    )
+
+    events = [
+        NotifyEvent(subject="a1", condition=CONDITION_STALL_NUDGED, title="t",
+                    body="b", created_at=NOW, repo=REPO, issue=42),
+        NotifyEvent(subject=f"gate:{REPO}#43:merge", condition=CONDITION_HUMAN_REQUIRED,
+                    title="t", body="b", created_at=NOW, repo=REPO, issue=43),
+        # A fleet CRIT names no issue and therefore no queue entry.
+        NotifyEvent(subject="fleet:dellserver:disk", condition="fleet_crit",
+                    title="t", body="b", created_at=NOW),
+    ]
+    assert qd.stalled_keys(events) == [f"{REPO}#42", f"{REPO}#43"]
+    assert qd.trigger_conditions(events)[f"{REPO}#42"] == CONDITION_STALL_NUDGED
+
+
+def test_no_second_definition_of_stalled_was_introduced():
+    """#2235: *"consume that detector, not build a second one"*.
+
+    Two competing definitions of "stalled" is the defect class #1440 names, so
+    this is asserted structurally rather than by review: the diagnostician must
+    hold no clock, no threshold and no age comparison of its own.
+    """
+    import inspect
+    import re
+
+    source = inspect.getsource(qd)
+    for banned in ("time.time(", "import time", "from time import", "datetime("):
+        assert banned not in source, f"{banned!r} is a clock this module must not own"
+    # No duration-shaped knob of its own either: a grace window, a silence
+    # threshold or a timeout here would BE the second definition, whatever it
+    # was named.
+    durations = [
+        name
+        for name in dir(qd)
+        if name.isupper() and re.search(r"SEC|MIN|HOUR|GRACE|TIMEOUT|THRESHOLD", name)
+    ]
+    assert durations == [], f"duration knobs found: {durations}"
+    # And the trigger really is the notifier's: `stalled_keys` reads events, it
+    # does not measure anything.
+    assert "now" not in inspect.signature(qd.stalled_keys).parameters
+
+
+# ── zero mutation, proven ───────────────────────────────────────────────────
+
+
+def test_a_full_pass_derives_without_writing_anything(tmp_path, monkeypatch):
+    """#2276: *"Zero mutation is proven, not asserted."*
+
+    The unit-level half: `run_pass` returns diagnoses and touches nothing —
+    not the log, not the entries it was handed, not the episodes. (The
+    board/queue/`gh` half is `tests/test_cli_drive_queue.py`, which drives the
+    real CLI against a real sqlite board.)
+    """
+    log = tmp_path / "queue-block-log.jsonl"
+    monkeypatch.setenv("COORD_BLOCK_LOG", str(log))
+    seeded = [
+        stalled(50, "blocked: CI red, 2/2 attempts"),
+        stalled(51, "blocked: stale test verdict"),
+    ]
+    before = [dataclasses.asdict(e) for e in seeded]
+    open_eps = [open_episode(e.key) for e in seeded]
+    episodes_before = [dict(ep) for ep in open_eps]
+
+    got = qd.run_pass(
+        seeded,
+        open_eps,
+        probe=RecordingProbe({f"{REPO}#51": live(mergeable=False)}),
+    )
+
+    assert len(got) == 2
+    assert [dataclasses.asdict(e) for e in seeded] == before
+    assert open_eps == episodes_before
+    assert not log.exists(), "run_pass appended to the log; persistence is the caller's"
+
+
+# ── the fixture table (#2276's acceptance) ──────────────────────────────────
+
+
+def test_a_fixture_of_stalled_entries_diagnoses_to_a_pinned_table():
+    """One pass, seven stalls, every verdict pinned.
+
+    Three of these deliberately CONTRADICT the stated reason — #2235's whole
+    finding — and one abstains. If a rule's ordering ever changes, this table
+    is what says so.
+    """
+    fixture = [
+        # (issue, stated reason, live state, expected cause, contradicts)
+        (60, "merge blocked: stale test verdict (2/2)", live(mergeable=False),
+         qd.CAUSE_MERGE_CONFLICT, True),
+        (61, "blocked: CI red, 2/2 attempts", live(),
+         qd.CAUSE_NOTHING_BLOCKING, True),
+        (62, "blocked: CI red, 2/2 attempts",
+         live(checks=(qd.CheckReading("cargo-test", "failure"),), gate_ready=False,
+              gate_blockers=("merge: CI failed",)),
+         qd.CAUSE_CI_RED, False),
+        (63, "blocked: review required but not approved",
+         live(pr_state="MERGED", mergeable=None, checks=None, gate_ready=None),
+         qd.CAUSE_PR_MERGED, True),
+        (64, "blocked: review required but not approved",
+         live(gate_ready=False, gate_blockers=("review: not approved",)),
+         qd.CAUSE_GATE_BLOCKED, False),
+        (65, "parked: CI checks have not reported yet (#1891)",
+         live(checks=(qd.CheckReading("test", "pending"),), gate_ready=None),
+         qd.CAUSE_CI_PENDING, False),
+        (66, "blocked: dispatch failed", qd.LiveState(),
+         qd.CAUSE_UNKNOWN, False),
+    ]
+    entries = [stalled(issue, reason) for issue, reason, *_ in fixture]
+    answers = {f"{REPO}#{issue}": state for issue, _, state, *_ in fixture}
+    open_eps = [open_episode(e.key) for e in entries]
+
+    got = qd.run_pass(entries, open_eps, probe=RecordingProbe(answers), limit=None)
+
+    assert [(d.key, d.cause, d.contradicts_stated) for d in got] == [
+        (f"{REPO}#{issue}", cause, contradicts)
+        for issue, _, _, cause, contradicts in fixture
+    ]
+    # Two of seven contradicted. The number is the deliverable; that it is
+    # measured at all is the point.
+    assert sum(1 for d in got if d.contradicts_stated) == 3
+    assert sum(1 for d in got if d.abstained) == 1
+
+
+def test_a_stated_reason_is_classified_on_word_boundaries_not_substrings():
+    """"review requi**red** but not approved" is not a CI claim.
+
+    Bare substring matching classified it as one, and the live gate then
+    agreeing with the queue read as a CONTRADICTION — a confidently wrong
+    verdict manufactured out of five letters.
+    """
+    assert qd.stated_family("blocked: review required but not approved") == qd.FAMILY_GATE
+    assert qd.stated_family("blocked: CI red, 2/2 attempts") == qd.FAMILY_CI
+    got = qd.diagnose(
+        stalled(70, "blocked: review required but not approved"),
+        live(gate_ready=False, gate_blockers=("review: not approved",)),
+    )
+    assert got.cause == qd.CAUSE_GATE_BLOCKED
+    assert got.contradicts_stated is False
