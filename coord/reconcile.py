@@ -1028,21 +1028,140 @@ def describe_unsupported_retry_type(exc: UnsupportedRetryType) -> str:
     )
 
 
+class RetryProviderMismatch(ValueError):
+    """Raised by :func:`_reassign` when a retry would resolve to a
+    different provider than the failed run it is replacing (#2323).
+
+    A retry that consults ``providers.labels`` can legitimately land on a
+    different provider than *this exact assignment row* if the issue's
+    labels or ``coordinator.yml`` changed between the original dispatch and
+    the retry — but silently substituting the provider is exactly the #1796
+    failure mode one level up: an operator (or an unattended `coord drive`)
+    asking to retry a `harness:opencode` leg is not asking to move it to
+    `claude`, even if that is where today's precedence chain would land.
+    Refuse instead, the same way the #437 TOS gate refuses rather than
+    substitutes a human-attended provider.
+    """
+
+    def __init__(self, failed_provider: str, resolved_provider: str):
+        self.failed_provider = failed_provider
+        self.resolved_provider = resolved_provider
+        super().__init__(
+            f"retry would move this assignment from provider "
+            f"{failed_provider!r} to {resolved_provider!r}"
+        )
+
+
+def describe_retry_provider_mismatch(exc: RetryProviderMismatch) -> str:
+    """Human-readable refusal message for :class:`RetryProviderMismatch`
+    (#2323).
+
+    Mirrors :func:`describe_unsupported_retry_type`'s shape — names both
+    providers and points at the deliberate override an operator who
+    actually wants the move can use.
+    """
+    return (
+        f"refusing retry: the failed run dispatched through provider "
+        f"{exc.failed_provider!r}, but this retry resolves to "
+        f"{exc.resolved_provider!r} — retrying would silently move the "
+        "work onto a different provider (and, for a claude provider, walk "
+        "a model-escalation ladder that has no meaning for the other one). "
+        "If the issue's labels or `providers.labels` changed since the "
+        "original dispatch and the move is intentional, dispatch by hand "
+        "instead: `coord assign --interactive`."
+    )
+
+
+def _resolve_retry_provider(
+    failed: Assignment, config: Config, issue_labels: list[str] | None,
+) -> str:
+    """Resolve (and #437 TOS-guard) the provider a retry of *failed* would
+    dispatch through, refusing if it differs from the provider the failed
+    run itself used (#2323).
+
+    Mirrors a first work dispatch's resolution precedence exactly
+    (``coord.dispatch.dispatch``, ``coord/dispatch.py:548``): spec (always
+    ``None`` here — a retry never carries a fresh per-spec override) ->
+    ``providers.labels`` (gated to ``failed.type == "work"``, the same
+    restriction the first dispatch applies) -> repo default ->
+    ``providers.default``.
+
+    Args:
+        failed: The failed/advisory assignment being retried.
+        config: The coordinator config.
+        issue_labels: The target issue's current GitHub label names, or
+            ``None``/empty when unavailable — falls back to no label match,
+            reproducing pre-#2323 (label-blind) resolution for that one
+            issue rather than raising.
+
+    Returns:
+        The resolved (and TOS-cleared) provider name.
+
+    Raises:
+        ValueError: the #437 TOS gate refuses (the resolved provider is
+            ``human_attended_only``) — same contract
+            :func:`coord.providers.guard_unattended_dispatch` uses.
+        RetryProviderMismatch: the resolved provider differs from
+            ``failed.provider_name`` (falling back to ``"claude"`` for a
+            row dispatched before #324 started recording it).
+    """
+    from coord.providers import guard_unattended_dispatch  # noqa: PLC0415
+
+    repo_for_provider = config.repo(failed.repo_name)
+    # #1889/#2323: providers.labels routes work dispatches by the issue's
+    # harness-eval label — gated to type="work" exactly as the first
+    # dispatch gates it (coord/dispatch.py:548) so a label meant for the
+    # eventual work dispatch never leaks into mock-author/test-author
+    # retries that never saw it on their original dispatch either.
+    provider_issue_labels = issue_labels if failed.type == "work" else None
+    resolved = guard_unattended_dispatch(
+        spec_provider=None,
+        repo_provider=(
+            repo_for_provider.provider if repo_for_provider is not None else None
+        ),
+        providers_cfg=config.providers,
+        models_cfg=config.models,
+        where="auto-reassign (reconcile)",
+        issue_labels=provider_issue_labels,
+    )
+    # #324: None means "dispatched before #324 landed or via a path that
+    # doesn't set this field" — the documented implicit default is "claude".
+    failed_provider = failed.provider_name or "claude"
+    if resolved != failed_provider:
+        raise RetryProviderMismatch(failed_provider, resolved)
+    return resolved
+
+
 def _reassign(
     failed: Assignment, board: Board, config: Config,
     *,
     model: str | None = None,
+    issue_labels: list[str] | None = None,
 ) -> Assignment | None:
     """Re-dispatch a failed assignment to a machine with spare capacity.
 
     *model* overrides the model tier on the retry. When None, the
     original assignment's model is reused (escalation happens at the call
-    site).
+    site — and must only be requested when the retry resolves to the same
+    claude-family provider the failed run used, #2323: the claude
+    escalation ladder means nothing to another provider).
+
+    *issue_labels* (#2323) is the target issue's current GitHub label
+    names, threaded into provider resolution via
+    :func:`_resolve_retry_provider` so ``providers.labels`` is honoured on
+    a retry the same way it is on a first dispatch — without this, every
+    retry fell through to the repo/global default regardless of which
+    label originally routed the issue.
 
     Raises :class:`UnsupportedRetryType` when ``failed.type`` is not in
     :data:`coord.models.WORK_LIKE_TYPES` — a ``smoke``/``review``/other
     non-work row must not be silently re-dispatched as a fresh
     ``type="work"`` worker (#1636).
+
+    Raises :class:`RetryProviderMismatch` (#2323) when the resolved
+    provider differs from the one the failed run actually used — refuses
+    rather than silently moving the work onto a different provider, the
+    #1796 rule applied at dispatch.
     """
     if failed.type not in WORK_LIKE_TYPES:
         raise UnsupportedRetryType(failed.type, failed.review_of_assignment_id)
@@ -1087,26 +1206,19 @@ def _reassign(
 
     # #437: STRUCTURAL TOS-COMPLIANCE GATE — auto-reassign is an
     # unattended dispatch path; refuse to retry through a provider that
-    # opts out of unattended use.  Resolve precedence with per-repo
-    # override and the global default (the failed assignment doesn't
-    # carry a spec-level provider into this path).  On refusal: skip the
-    # reassignment — the failed assignment stays failed for human
-    # attention rather than getting silently re-tried on the wrong
-    # provider.
-    from coord.providers import guard_unattended_dispatch  # noqa: PLC0415
-    repo_for_provider = config.repo(failed.repo_name)
+    # opts out of unattended use.  #2323: also resolves through
+    # `providers.labels` (gated to type="work", exactly as a first
+    # dispatch gates it) instead of skipping straight to the repo/global
+    # default, and refuses outright — RetryProviderMismatch, NOT a silent
+    # `return None` — when the resolution disagrees with the provider the
+    # failed run actually used.  A plain TOS ValueError still resolves to
+    # `return None`: skip the reassignment, leaving the failed assignment
+    # for human attention rather than getting silently re-tried on the
+    # wrong provider.
     try:
-        guard_unattended_dispatch(
-            spec_provider=None,
-            repo_provider=(
-                repo_for_provider.provider
-                if repo_for_provider is not None
-                else None
-            ),
-            providers_cfg=config.providers,
-            models_cfg=config.models,
-            where="auto-reassign (reconcile)",
-        )
+        resolved_provider_name = _resolve_retry_provider(failed, config, issue_labels)
+    except RetryProviderMismatch:
+        raise
     except ValueError:
         return None
 
@@ -1156,6 +1268,18 @@ def _reassign(
         # worker's integration base (the start point / rebase target).
         "branch": retry_default_branch,
     }
+    # #2323: name the resolved provider on the wire the same way a first
+    # dispatch does (`coord.dispatch._wire_payload_needs_provider_field`) —
+    # omitted only for the vanilla, uncustomized "claude" definition so
+    # byte-identical payloads survive for every deployment that never
+    # touches `providers:`. Without this, `resolved_provider_name` above
+    # was resolved (and TOS-guarded, and matched against the failed run)
+    # purely for bookkeeping, and the wire payload silently fell back to
+    # the agent's hardcoded legacy claude spawn path regardless — the exact
+    # bug #2323 reported.
+    from coord.dispatch import _wire_payload_needs_provider_field  # noqa: PLC0415
+    if _wire_payload_needs_provider_field(resolved_provider_name, config):
+        payload["provider"] = resolved_provider_name
     # #1101: continue the failed assignment's actual branch instead of
     # silently forking a fresh one off the repo default — any real work it
     # already committed and pushed must not be orphaned by a retry. Mirrors
@@ -1187,6 +1311,12 @@ def _reassign(
         dispatched_at=time.time(),
         type=failed.type,
         model=retry_model,
+        # #2323: record the resolved provider the same way a first dispatch
+        # does (`response.get("_provider_name")` in coord/commands/
+        # dispatch.py) — so the board/TUI and the next retry's own
+        # `_resolve_retry_provider` mismatch check see the provider this
+        # retry actually ran under, not the one the failed row ran under.
+        provider_name=resolved_provider_name,
         # #1101: record the continued branch on the board immediately
         # instead of waiting for a later reconcile backfill from agent
         # /status — the retry payload above already told the agent to
@@ -1787,7 +1917,26 @@ def reconcile(board: Board, config: Config) -> list[str]:
                 getattr(failed_a, "failure_reason", None)
             ):
                 continue
-            reassigned = _reassign(failed_a, board, config)
+            # #2323: thread the issue's cached labels through so
+            # auto-reassign resolves `providers.labels` the same way a
+            # first dispatch (and `coord retry`) does — best-effort local
+            # cache read (never a GitHub call from this passive tick); an
+            # uncached issue falls back to label-blind resolution, same as
+            # passing `None`.
+            from coord.state import get_cached_issue_labels  # noqa: PLC0415
+
+            cached_labels = get_cached_issue_labels(
+                failed_a.repo_name, failed_a.issue_number,
+            )
+            try:
+                reassigned = _reassign(
+                    failed_a, board, config, issue_labels=cached_labels,
+                )
+            except RetryProviderMismatch:
+                # Refuse rather than substitute (#2323) — leave the failed
+                # assignment for human attention (`coord retry`) instead of
+                # silently auto-moving it to a different provider.
+                continue
             if reassigned is not None and reassigned.assignment_id is not None:
                 changed.append(reassigned.assignment_id)
 

@@ -1797,9 +1797,12 @@ def retry(assignment_id: str, config_path: Path, acknowledge_cost: bool = False)
     from coord.board_service import read_board, write_board
     from coord.models import WORK_LIKE_TYPES
     from coord.reconcile import (
+        RetryProviderMismatch,
         UnsupportedRetryType,
         _reassign,
+        _resolve_retry_provider,
         describe_no_candidate_machines,
+        describe_retry_provider_mismatch,
         describe_unsupported_retry_type,
     )
 
@@ -1903,20 +1906,72 @@ def retry(assignment_id: str, config_path: Path, acknowledge_cost: bool = False)
         click.echo(f"error: {describe_unsupported_retry_type(exc)}", err=True)
         sys.exit(1)
 
-    # Determine escalated model for the retry.
+    # #2323: resolve (and #437 TOS-guard) the provider this retry would
+    # dispatch through BEFORE deciding anything about the model — printed
+    # up front so it's never left for the drive's own header to contradict
+    # four seconds later, and checked before the escalation message so a
+    # refusal is never preceded by a reassuring "escalating model" line for
+    # a retry that's about to be refused. `providers.labels` is consulted
+    # the same way a first work dispatch consults it (gated to
+    # `type="work"`, coord/dispatch.py:548); a genuine `harness:opencode`
+    # label match here means retry lands back on `opencode`, not the
+    # claude default that a label-blind resolution used to fall through to.
+    from coord.state import get_cached_issue_labels  # noqa: PLC0415
+
+    issue_labels = get_cached_issue_labels(
+        assignment.repo_name, assignment.issue_number,
+    )
+    try:
+        resolved_provider_name = _resolve_retry_provider(assignment, cfg, issue_labels)
+    except RetryProviderMismatch as exc:
+        click.echo(f"error: {describe_retry_provider_mismatch(exc)}", err=True)
+        sys.exit(1)
+    except ValueError as exc:
+        click.echo(f"error: {exc}", err=True)
+        sys.exit(1)
+    click.echo(f"  provider: {resolved_provider_name}")
+
+    # Determine escalated model for the retry. #2323: `cfg.models.
+    # next_model` walks the claude tier ladder — only meaningful when this
+    # retry actually resolves to a claude-family provider. The precheck
+    # above already guarantees `resolved_provider_name` matches the failed
+    # run's own provider (else it would have refused), so gating on the
+    # resolved provider's TYPE here is equivalent to gating on the failed
+    # run's, without a second lookup.
+    from coord.config import IMPLICIT_PROVIDER_TYPES  # noqa: PLC0415
+    from coord.providers import provider_type_for  # noqa: PLC0415
+
     original_model = assignment.model or cfg.models.default
-    escalated = cfg.models.next_model(original_model)
-    if escalated != original_model:
-        click.echo(f"  escalating model: {original_model} → {escalated}")
+    if provider_type_for(resolved_provider_name, cfg.providers) in IMPLICIT_PROVIDER_TYPES:
+        escalated = cfg.models.next_model(original_model)
+        if escalated != original_model:
+            click.echo(f"  escalating model: {original_model} → {escalated}")
+        retry_model = escalated
+    else:
+        # Not a claude-family provider — the escalation ladder doesn't
+        # apply; reuse the failed run's own model field exactly (`None`
+        # tells `_reassign` to reuse `assignment.model` verbatim, rather
+        # than stamping `original_model`'s `cfg.models.default` fallback
+        # onto a provider that fallback means nothing to).
+        retry_model = None
 
     try:
-        result = _reassign(assignment, board, cfg, model=escalated)
+        result = _reassign(
+            assignment, board, cfg, model=retry_model, issue_labels=issue_labels,
+        )
     except UnsupportedRetryType as exc:
         # Defense in depth — the precheck above already covers this, but
         # `_reassign` is shared with `auto_reassign` and must never silently
         # downgrade a non-work retry even if a future caller skips the
         # precheck.
         click.echo(f"error: {describe_unsupported_retry_type(exc)}", err=True)
+        sys.exit(1)
+    except RetryProviderMismatch as exc:
+        # Defense in depth — the precheck above already covers this, but
+        # `_reassign` is shared with `auto_reassign` and must never
+        # silently substitute the provider even if a future caller skips
+        # the precheck.
+        click.echo(f"error: {describe_retry_provider_mismatch(exc)}", err=True)
         sys.exit(1)
     if result is None:
         # #1396: name the blocking machines and their apparent load instead
@@ -1943,7 +1998,7 @@ def retry(assignment_id: str, config_path: Path, acknowledge_cost: bool = False)
     click.echo(
         f"Retried: {result.machine_name} → {result.repo_name} "
         f"#{result.issue_number} (assignment {result.assignment_id}, "
-        f"type={result.type})"
+        f"type={result.type}, provider={resolved_provider_name})"
     )
     # #1101: surface the continued branch so it's obvious the retry picked
     # up existing work instead of forking a fresh branch off the default.
