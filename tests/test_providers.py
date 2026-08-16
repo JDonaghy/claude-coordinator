@@ -242,6 +242,52 @@ def test_custom_binary() -> None:
     assert result[0] == "my-claude"
 
 
+# ── #2301: the smoke branch, across every call site of the same logic ────────
+
+
+def test_claude_build_command_smoke_matches_legacy_and_withholds_monitor() -> None:
+    """#2301: ``spec.type == "smoke"`` gets ``SMOKE_SYSTEM_PROMPT`` and
+    ``Read,Bash`` only.
+
+    ``Monitor`` is deliberately withheld: it is an await-a-notification tool,
+    so calling it ends the turn — and a smoke leg is a one-shot ``claude -p``
+    session (#1394), where ending the turn ends the session permanently,
+    before any wake-up can arrive. Edit/Write are withheld too (a smoke leg
+    validates; it never mutates). This must stay in parity with
+    ``default_worker_command`` — the same logic lives at three call sites and
+    #2169 already shipped a drift where only some were updated.
+    """
+    from coord.smoke import SMOKE_SYSTEM_PROMPT
+
+    spec = _make_spec(type="smoke")
+    argv = ClaudeProvider().build_command(spec)
+    legacy = default_worker_command(spec)
+    sp = argv[argv.index("--system-prompt") + 1]
+    at = argv[argv.index("--allowedTools") + 1]
+    assert sp == legacy[legacy.index("--system-prompt") + 1]
+    assert at == legacy[legacy.index("--allowedTools") + 1]
+    # Pin the values too, so a *matched* regression on both sides still fails.
+    assert sp.startswith(SMOKE_SYSTEM_PROMPT)
+    assert at == "Read,Bash"
+    assert "Monitor" not in at.split(",")
+
+
+def test_claude_build_command_smoke_honours_explicit_system_prompt() -> None:
+    """#2301: the smoke branch still respects ``spec.system_prompt`` (the
+    dispatcher's per-run prompt) instead of always forcing the default."""
+    argv = ClaudeProvider().build_command(
+        _make_spec(type="smoke", system_prompt="custom smoke prompt")
+    )
+    assert argv[argv.index("--system-prompt") + 1].startswith("custom smoke prompt")
+
+
+def test_claude_build_command_work_still_grants_monitor() -> None:
+    """Scope check for #2301: withholding Monitor from smoke must not have
+    taken it away from the generic worker branch (#2169's grant)."""
+    argv = ClaudeProvider().build_command(_make_spec(type="work"))
+    assert "Monitor" in argv[argv.index("--allowedTools") + 1].split(",")
+
+
 # ── #1706: definition model / env / extra_args threading ──────────────────────
 
 
