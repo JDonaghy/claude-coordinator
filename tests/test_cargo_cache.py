@@ -83,6 +83,24 @@ def _strip_ambient_cargo_target_dir(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(cargo_cache.CARGO_ENV, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _disable_free_disk_floor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Isolate this module from the host's real free-disk state (#2316).
+
+    ``AgentServer._gc_cargo_cache`` passes ``free_floor_bytes()`` — read from
+    the real environment — into ``sweep()``, and the floor is compared against
+    the *actual* free space of the filesystem holding the pytest ``tmp_path``.
+    On a host whose disk has less than ``DEFAULT_FREE_FLOOR_GB`` (10 GiB)
+    free, every ``clean_worktrees()`` call in this module would reclaim the
+    tiny test caches to chase an unreachable shortfall, failing e.g.
+    ``test_two_assignments_share_one_target_dir_that_survives_cleanup`` on
+    any branch.  Turning the floor off (``0`` = disabled, see
+    ``free_floor_bytes``) keeps these tests about the code, not the host.
+    Tests that exercise the floor itself pass an explicit ``free_floor=`` or
+    an explicit env dict, so they are unaffected."""
+    monkeypatch.setenv(cargo_cache.FREE_FLOOR_ENV, "0")
+
+
 def test_module_is_isolated_from_ambient_cargo_target_dir() -> None:
     """Regression for #1773. The module fixture above always exports an
     ambient CARGO_TARGET_DIR before this test body runs. If
