@@ -4210,6 +4210,56 @@ class TestProviderLayerDispatch:
         assert "legacy-SHOULD-NOT-RUN" not in log
         server.shutdown()
 
+    def test_local_wins_over_wire_provider_def_is_logged(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """#2326 item 3: when `_resolve_provider` takes the local-registry
+        branch over an available `spec.provider_def`, it must say so in the
+        agent log, naming both — this decision used to leave no trace,
+        which is why a stale local override took a live-process probe to
+        catch instead of a `journalctl` grep."""
+        from coord.config import ProviderDef
+        from coord.providers import build_provider
+
+        repo = _init_repo(tmp_path / "repo")
+        defn = ProviderDef(type="claude", env={"LOCAL_ONLY": "1"})
+        provider = build_provider("myprovider", defn, None)
+
+        server = AgentServer(
+            machine_name="test",
+            repos=["api"],
+            state_dir=tmp_path / "state",
+            worker_command=lambda spec: ["/bin/sh", "-c", "echo legacy-SHOULD-NOT-RUN"],
+            repo_paths={"api": str(repo)},
+            providers={"myprovider": provider},
+            bash_wrap_spawn=False,
+        )
+        spec = _spec(
+            repo,
+            provider="myprovider",
+            provider_def={
+                "type": "claude",
+                "binary": None,
+                "model": None,
+                "attach_url": None,
+                "env": {"FROM_WIRE": "1"},
+                "extra_args": [],
+            },
+        )
+        try:
+            with caplog.at_level("INFO", logger="coord.agent"):
+                resolved = server._resolve_provider(spec)
+        finally:
+            server.shutdown()
+
+        assert resolved is provider
+        assert "myprovider" in caplog.text
+        assert "local providers.definitions" in caplog.text
+        assert "wire-carried provider_def" in caplog.text
+        # Env KEYS only — never the values (secrets commonly live here).
+        assert "LOCAL_ONLY" in caplog.text
+        assert "FROM_WIRE" in caplog.text
+
 
 class TestCapabilityGates:
     """#324/#425: assign() enforces capability gates before spawning."""
@@ -5563,6 +5613,45 @@ def _bump_mtime(path: Path, seconds_ahead: float = 5.0) -> None:
     os.utime(path, (new_time, new_time))
 
 
+def _write_config_with_provider(
+    path: Path,
+    *,
+    repos: list[str],
+    repo_paths: dict[str, str],
+    provider_binary: str,
+    provider_env: dict[str, str] | None = None,
+    machine_name: str = "test",
+) -> Path:
+    """Write a minimal coordinator.yml with one `providers.definitions`
+    entry named "myprovider" (#2326 hot-reload coverage)."""
+    provider_env = provider_env or {}
+    lines = ["repos:"]
+    for name in repos:
+        lines.append(f"  - name: {name}")
+        lines.append(f"    github: acme/{name}")
+    lines.append("")
+    lines.append("providers:")
+    lines.append("  definitions:")
+    lines.append("    myprovider:")
+    lines.append("      type: claude")
+    lines.append(f"      binary: {provider_binary!r}")
+    if provider_env:
+        lines.append("      env:")
+        for k, v in provider_env.items():
+            lines.append(f"        {k}: {v!r}")
+    lines.append("")
+    lines.append("machines:")
+    lines.append(f"  - name: {machine_name}")
+    lines.append(f"    host: {machine_name}.tailnet")
+    lines.append("    capabilities: [python]")
+    lines.append(f"    repos: [{', '.join(repos)}]")
+    lines.append("    repo_paths:")
+    for name, p in repo_paths.items():
+        lines.append(f"      {name}: {p!r}")
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
 class TestConfigHotReload:
     """#2299: `coordinator.yml` edits land within one health tick, no restart.
 
@@ -5887,14 +5976,17 @@ class TestConfigHotReload:
             server.shutdown()
 
     def test_restart_only_fields_are_not_reloaded(self, tmp_path: Path) -> None:
-        """`providers`, `bash_wrap_spawn` and `first_output_timeout` are
-        documented restart-only — a live worker holds a resolved provider, and
-        the other two are process tuning uvicorn/`_spawn` already committed
-        to. A reload must leave all three exactly as they were."""
-        sentinel = object()
+        """`bash_wrap_spawn` and `first_output_timeout` are documented
+        restart-only process tuning that uvicorn/`_spawn` already committed
+        to at startup. A reload must leave both exactly as they were.
+
+        #2326: `providers` used to be on this list too — a sibling test,
+        `test_provider_registry_is_hot_reloaded_when_not_in_flight` below,
+        now covers that it IS reloaded (a live worker's OWN resolved
+        provider is still protected, just via in-flight pinning rather than
+        blanket restart-only-ness — see `_apply_reloaded_config`)."""
         server, cfg_path, api, web = self._build(
             tmp_path,
-            providers={"stub": sentinel},
             bash_wrap_spawn=False,
             first_output_timeout=12.5,
         )
@@ -5907,10 +5999,185 @@ class TestConfigHotReload:
             _bump_mtime(cfg_path)
             assert server._maybe_reload_config() is True
 
-            assert server._providers == {"stub": sentinel}
             assert server.bash_wrap_spawn is False
             assert server.first_output_timeout == 12.5
         finally:
+            server.shutdown()
+
+    # ── #2326: providers.definitions is hot too ─────────────────────────────
+
+    def test_provider_registry_is_hot_reloaded_when_not_in_flight(
+        self, tmp_path: Path
+    ) -> None:
+        """An agent with its own local `coordinator.yml` must not pin
+        `providers.definitions` at startup (#2326) — a provider config
+        change (new env, new binary, ...) must apply on the NEXT dispatch,
+        no restart, exactly like `repos`/`capabilities`/etc already do.
+
+        Verifies the resolution itself: the env dict a fresh dispatch's
+        provider carries, not a re-read of the config file."""
+        from coord.config import load as load_config
+        from coord.providers import build_provider
+
+        api = _init_repo(tmp_path / "api")
+        stub = tmp_path / "fake-claude.sh"
+        stub.write_text('#!/bin/sh\necho "SPAWN_ENV_FOO=$SPAWN_ENV_FOO"\n')
+        stub.chmod(0o755)
+
+        cfg_path = _write_config_with_provider(
+            tmp_path / "coordinator.yml",
+            repos=["api"],
+            repo_paths={"api": str(api)},
+            provider_binary=str(stub),
+        )
+        cfg = load_config(cfg_path)
+
+        server = AgentServer(
+            machine_name="test",
+            capabilities=["python"],
+            repos=["api"],
+            state_dir=tmp_path / "state",
+            worker_command=lambda spec: [
+                "/bin/sh", "-c", "echo legacy-SHOULD-NOT-RUN"
+            ],
+            repo_paths={"api": str(api)},
+            providers={
+                "myprovider": build_provider(
+                    "myprovider",
+                    cfg.providers.definitions["myprovider"],
+                    cfg.models,
+                )
+            },
+            health_config=cfg,
+            worktree_writable_settings_files=[],
+            bash_wrap_spawn=False,
+        )
+        try:
+            a1 = server.assign(_spec(api, provider="myprovider"))
+            final1 = server.wait_for(a1.id, timeout=5)
+            log1 = Path(final1.log_path).read_text()
+            assert "SPAWN_ENV_FOO=bar" not in log1
+            assert "legacy-SHOULD-NOT-RUN" not in log1
+
+            _write_config_with_provider(
+                cfg_path,
+                repos=["api"],
+                repo_paths={"api": str(api)},
+                provider_binary=str(stub),
+                provider_env={"SPAWN_ENV_FOO": "bar"},
+            )
+            _bump_mtime(cfg_path)
+
+            a2 = server.assign(_spec(api, provider="myprovider"))
+            final2 = server.wait_for(a2.id, timeout=5)
+            log2 = Path(final2.log_path).read_text()
+            assert "SPAWN_ENV_FOO=bar" in log2, (
+                f"providers.definitions edit did not reach the next "
+                f"dispatch: {log2!r}"
+            )
+            # An implicit "claude" entry is always materialised alongside
+            # whatever's explicitly configured (see `ProvidersConfig`).
+            assert server.health()["config_reload"]["provider_names"] == [
+                "claude",
+                "myprovider",
+            ]
+        finally:
+            server.shutdown()
+
+    def test_in_flight_provider_is_pinned_across_a_reload(
+        self, tmp_path: Path
+    ) -> None:
+        """The #2299 in-flight invariant applies to providers too (#2326): a
+        RUNNING assignment must keep resolving to the provider instance it
+        started with, even though a reload landed while it was running —
+        `_reap` re-resolves the SAME spec afterwards to pick a log parser,
+        and must get back the SAME identity `_spawn` used, not one a reload
+        swapped underneath it."""
+        from coord.config import load as load_config
+        from coord.providers import build_provider
+
+        api = _init_repo(tmp_path / "api")
+        go = tmp_path / "go"
+        stub = tmp_path / "fake-claude.sh"
+        stub.write_text(
+            "#!/bin/sh\n"
+            f"while [ ! -f {go} ]; do sleep 0.05; done\n"
+            'echo "SPAWN_ENV_FOO=$SPAWN_ENV_FOO"\n'
+        )
+        stub.chmod(0o755)
+
+        cfg_path = _write_config_with_provider(
+            tmp_path / "coordinator.yml",
+            repos=["api"],
+            repo_paths={"api": str(api)},
+            provider_binary=str(stub),
+        )
+        cfg = load_config(cfg_path)
+        server = AgentServer(
+            machine_name="test",
+            capabilities=["python"],
+            repos=["api"],
+            state_dir=tmp_path / "state",
+            worker_command=lambda spec: ["/bin/sh", "-c", "echo legacy"],
+            repo_paths={"api": str(api)},
+            providers={
+                "myprovider": build_provider(
+                    "myprovider",
+                    cfg.providers.definitions["myprovider"],
+                    cfg.models,
+                )
+            },
+            health_config=cfg,
+            worktree_writable_settings_files=[],
+            bash_wrap_spawn=False,
+        )
+        try:
+            a = server.assign(_spec(api, provider="myprovider"))
+            deadline = time.time() + 10
+            while server.get(a.id).status != RUNNING and time.time() < deadline:
+                time.sleep(0.05)
+            assert server.get(a.id).status == RUNNING
+            pre_reload_provider = server._providers["myprovider"]
+
+            # Edit lands WHILE the worker above is running.
+            _write_config_with_provider(
+                cfg_path,
+                repos=["api"],
+                repo_paths={"api": str(api)},
+                provider_binary=str(stub),
+                provider_env={"SPAWN_ENV_FOO": "bar"},
+            )
+            _bump_mtime(cfg_path)
+            assert server._maybe_reload_config() is True
+
+            # The RUNNING assignment's own provider identity must survive
+            # the reload untouched — asserted directly (object identity),
+            # not just inferred from behaviour.
+            in_flight_provider = server._resolve_provider(server.get(a.id).spec)
+            assert in_flight_provider is pre_reload_provider
+            assert in_flight_provider.env().get("SPAWN_ENV_FOO") is None
+
+            go.write_text("done")
+            final = server.wait_for(a.id, timeout=10)
+            log = Path(final.log_path).read_text()
+            assert "SPAWN_ENV_FOO=bar" not in log, (
+                "a reload must not retarget an in-flight worker's provider "
+                f"mid-run: {log!r}"
+            )
+
+            # The pin lifts once the assignment is terminal AND the next
+            # reload runs (a pin is only re-evaluated when a reload actually
+            # happens — an unchanged file triggers no reload at all, so it
+            # takes one more on-disk change, exactly like a genuine second
+            # `coordinator.yml` edit would).
+            _bump_mtime(cfg_path)
+            assert server._maybe_reload_config() is True
+            a2 = server.assign(_spec(api, provider="myprovider"))
+            final2 = server.wait_for(a2.id, timeout=10)
+            log2 = Path(final2.log_path).read_text()
+            assert "SPAWN_ENV_FOO=bar" in log2
+        finally:
+            server._assignments.clear()
             server.shutdown()
 
     def test_reload_busts_the_local_health_cache(self, tmp_path: Path) -> None:

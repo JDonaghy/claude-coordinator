@@ -333,9 +333,12 @@ def _resolve_agent_startup(
     if cfg.path is not None:
         notices.append(
             f"coord agent: watching {cfg.path} for edits — repos, repo_paths, "
-            "capabilities, artifact_paths and build_command are re-read on the "
-            "next /health poll, no restart needed (#2299). RESTART-ONLY: "
-            "providers, concurrency (bash_wrap_spawn/first_output_timeout), "
+            "capabilities, artifact_paths, build_command and (#2326) "
+            "providers.definitions are re-read on the next /health poll or "
+            "dispatch, no restart needed (#2299). providers.definitions "
+            "changes apply to the NEXT dispatch of that provider name — an "
+            "in-flight assignment keeps the definition it started with. "
+            "RESTART-ONLY: concurrency (bash_wrap_spawn/first_output_timeout) "
             "and the bind host/port."
         )
     else:
