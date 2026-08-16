@@ -92,16 +92,22 @@ def _seed_issue(
 
 
 def _cfg_with_opencode_label(*, repo_provider: str | None = None) -> Config:
+    # #1711: both machines declare `provider:opencode` — `_reassign`'s
+    # capability gate (mirroring a first dispatch's
+    # `guard_provider_machine_capability`) excludes any machine that
+    # doesn't; the gate itself is covered by TestReassignCapabilityGate.
     return Config(
         repos=[Repo(name="api", github="acme/api", provider=repo_provider)],
         machines=[
             Machine(
                 name="laptop", host="laptop.tailnet", repos=["api"],
                 repo_paths={"api": "/tmp/api"},
+                capabilities=["provider:opencode"],
             ),
             Machine(
                 name="server", host="server.tailnet", repos=["api"],
                 repo_paths={"api": "/tmp/api"},
+                capabilities=["provider:opencode"],
             ),
         ],
         models=ModelsConfig(default="sonnet"),
@@ -257,6 +263,115 @@ class TestReassignThreadsProvider:
         assert "provider" not in payload
 
 
+# ── #1711: the provider-availability gate, applied to retry routing ────────
+
+
+class TestReassignCapabilityGate:
+    """`_reassign` must apply the same #1711 structural
+    provider-availability gate a first dispatch applies
+    (`coord.dispatch.dispatch` → `guard_provider_machine_capability`): an
+    `opencode` retry must never route to a machine that hasn't declared
+    `provider:opencode` in coordinator.yml `machines[].capabilities` — that
+    combination only failed at spawn time inside the agent, minutes in."""
+
+    def _cfg(self, server_caps: list[str], laptop_caps: list[str]) -> Config:
+        return Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[
+                Machine(
+                    name="laptop", host="l", repos=["api"],
+                    repo_paths={"api": "/tmp/api"}, capabilities=laptop_caps,
+                ),
+                Machine(
+                    name="server", host="s", repos=["api"],
+                    repo_paths={"api": "/tmp/api"}, capabilities=server_caps,
+                ),
+            ],
+            models=ModelsConfig(default="sonnet"),
+            providers=ProvidersConfig(
+                default="claude",
+                definitions={
+                    "claude": ProviderDef(type="claude"),
+                    "opencode": ProviderDef(type="opencode"),
+                },
+                labels={"harness:opencode": "opencode"},
+            ),
+        )
+
+    @patch("coord.reconcile.httpx.post")
+    def test_skips_machine_lacking_the_capability(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """server can't run opencode, laptop (the machine that failed) can
+        — the fallback pass lands the retry back on laptop rather than
+        routing to server for an ENOENT at spawn time."""
+        resp = MagicMock()
+        resp.json.return_value = {"id": "newid"}
+        mock_post.return_value = resp
+        cfg = self._cfg(server_caps=[], laptop_caps=["provider:opencode"])
+        failed = _failed(provider_name="opencode", model="opencode/glm-5.2")
+
+        result = _reassign(
+            failed, Board(), cfg, issue_labels=["harness:opencode"],
+        )
+
+        assert result is not None
+        assert result.machine_name == "laptop"
+        assert result.provider_name == "opencode"
+
+    @patch("coord.reconcile.httpx.post")
+    def test_returns_none_when_no_machine_declares_the_capability(
+        self, mock_post: MagicMock,
+    ) -> None:
+        cfg = self._cfg(server_caps=[], laptop_caps=[])
+        failed = _failed(provider_name="opencode", model="opencode/glm-5.2")
+
+        result = _reassign(
+            failed, Board(), cfg, issue_labels=["harness:opencode"],
+        )
+
+        assert result is None
+        mock_post.assert_not_called()
+
+    def test_no_candidate_diagnostic_names_the_missing_capability(
+        self,
+    ) -> None:
+        """describe_no_candidate_machines mirrors the filter: a machine
+        excluded for lacking the provider capability is named as such
+        instead of reading as free (which would misdirect the operator to
+        the network-error explanation)."""
+        from coord.reconcile import describe_no_candidate_machines
+
+        cfg = self._cfg(server_caps=[], laptop_caps=[])
+        failed = _failed(provider_name="opencode", model="opencode/glm-5.2")
+
+        msg = describe_no_candidate_machines(
+            failed, Board(), cfg, issue_labels=["harness:opencode"],
+        )
+
+        assert "cannot run provider 'opencode'" in msg
+        assert "laptop" in msg and "server" in msg
+
+    @patch("coord.reconcile.httpx.post")
+    def test_claude_family_retry_needs_no_declared_capability(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """Control: claude/claude-pty are IMPLICIT_PROVIDER_TYPES — every
+        machine supports them without declaring anything, so an ordinary
+        claude retry still routes exactly as before #1711 was applied
+        here."""
+        resp = MagicMock()
+        resp.json.return_value = {"id": "newid"}
+        mock_post.return_value = resp
+        cfg = self._cfg(server_caps=[], laptop_caps=[])
+        failed = _failed()  # provider_name=None -> implicit claude
+
+        result = _reassign(failed, Board(), cfg)
+
+        assert result is not None
+        assert result.machine_name == "server"
+
+
 # ── CLI: `coord retry` ───────────────────────────────────────────────────
 
 
@@ -267,8 +382,10 @@ def _config_file_with_opencode_label(tmp_path: Path) -> Path:
         "machines:\n"
         "  - name: laptop\n    host: l\n    repos: [api]\n"
         "    repo_paths:\n      api: /tmp/api\n"
+        "    capabilities: [provider:opencode]\n"
         "  - name: server\n    host: s\n    repos: [api]\n"
         "    repo_paths:\n      api: /tmp/api\n"
+        "    capabilities: [provider:opencode]\n"
         "models:\n  default: sonnet\n  escalation: [haiku, sonnet, opus]\n"
         "providers:\n"
         "  default: claude\n"

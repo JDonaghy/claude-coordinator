@@ -1180,30 +1180,6 @@ def _reassign(
     def has_room(m: Machine) -> bool:
         return len(running.get(m.name, [])) < _machine_capacity(m, config)
 
-    candidates = [
-        m for m in config.machines
-        if m.can_work_on(failed.repo_name)
-        and m.repo_path(failed.repo_name) is not None
-        and has_room(m)
-        and m.name != failed.machine_name
-        and m.name not in paused
-    ]
-    if not candidates:
-        # Fall back to including the same machine that failed last time —
-        # paused machines stay excluded even from the fallback.
-        candidates = [
-            m for m in config.machines
-            if m.can_work_on(failed.repo_name)
-            and m.repo_path(failed.repo_name) is not None
-            and has_room(m)
-            and m.name not in paused
-        ]
-    if not candidates:
-        return None
-
-    machine = candidates[0]
-    repo_path = machine.repo_path(failed.repo_name)
-
     # #437: STRUCTURAL TOS-COMPLIANCE GATE — auto-reassign is an
     # unattended dispatch path; refuse to retry through a provider that
     # opts out of unattended use.  #2323: also resolves through
@@ -1214,13 +1190,56 @@ def _reassign(
     # failed run actually used.  A plain TOS ValueError still resolves to
     # `return None`: skip the reassignment, leaving the failed assignment
     # for human attention rather than getting silently re-tried on the
-    # wrong provider.
+    # wrong provider.  Resolved BEFORE machine selection so the #1711
+    # capability filter below can key off it.
     try:
         resolved_provider_name = _resolve_retry_provider(failed, config, issue_labels)
     except RetryProviderMismatch:
         raise
     except ValueError:
         return None
+
+    # #1711: STRUCTURAL PROVIDER-AVAILABILITY GATE, applied as a candidate
+    # filter — a retry must never route to a machine that hasn't declared
+    # it can run the resolved provider (e.g. an `opencode` retry landing on
+    # a machine with no `provider:opencode` capability), exactly as a first
+    # dispatch refuses that combination (`coord.dispatch.dispatch` →
+    # `guard_provider_machine_capability`). Filtering (rather than raising
+    # on `candidates[0]`) means a fleet where SOME machine declares the
+    # capability still retries there; a fleet where none does falls through
+    # to the "no candidates" `return None`, leaving the row for human
+    # attention — `describe_no_candidate_machines` names the reason.
+    from coord.providers import machine_supports_provider  # noqa: PLC0415
+
+    def can_run_provider(m: Machine) -> bool:
+        return machine_supports_provider(m, resolved_provider_name, config.providers)
+
+    candidates = [
+        m for m in config.machines
+        if m.can_work_on(failed.repo_name)
+        and m.repo_path(failed.repo_name) is not None
+        and has_room(m)
+        and can_run_provider(m)
+        and m.name != failed.machine_name
+        and m.name not in paused
+    ]
+    if not candidates:
+        # Fall back to including the same machine that failed last time —
+        # paused machines (and #1711 capability-lacking machines) stay
+        # excluded even from the fallback.
+        candidates = [
+            m for m in config.machines
+            if m.can_work_on(failed.repo_name)
+            and m.repo_path(failed.repo_name) is not None
+            and has_room(m)
+            and can_run_provider(m)
+            and m.name not in paused
+        ]
+    if not candidates:
+        return None
+
+    machine = candidates[0]
+    repo_path = machine.repo_path(failed.repo_name)
 
     retry_model = model if model is not None else failed.model
     # The Assignment keeps the alias for legibility; the wire payload is
@@ -1352,6 +1371,7 @@ def _reassign(
 
 def describe_no_candidate_machines(
     failed: Assignment, board: Board, config: Config,
+    issue_labels: list[str] | None = None,
 ) -> str:
     """Explain why :func:`_reassign` found no candidate machine (#1396).
 
@@ -1365,15 +1385,39 @@ def describe_no_candidate_machines(
     reaped, still counted against the machine's capacity.
 
     Mirrors ``_reassign``'s exact candidate filter (repo capability, repo
-    path, pause set, capacity check, same-machine exclusion — #1417 replaced
-    the old binary "any running assignment = busy" rule with a per-machine
-    capacity count against ``machines[].max_workers``/``concurrency.
-    max_workers``) but keeps a reason per excluded machine instead of
-    discarding it, so the message names the blocking machines and what
-    they're apparently running — including the age, which makes a
-    400-hour-old phantom obvious at a glance.
+    path, pause set, capacity check, #1711 provider-capability check,
+    same-machine exclusion — #1417 replaced the old binary "any running
+    assignment = busy" rule with a per-machine capacity count against
+    ``machines[].max_workers``/``concurrency.max_workers``) but keeps a
+    reason per excluded machine instead of discarding it, so the message
+    names the blocking machines and what they're apparently running —
+    including the age, which makes a 400-hour-old phantom obvious at a
+    glance.
+
+    *issue_labels* (#2323) threads the same label list the caller handed
+    ``_reassign``, so the provider this diagnostic resolves (for the #1711
+    capability lines) matches the one the retry actually resolved.
     """
     from coord.machine_pause import paused_set  # noqa: PLC0415
+    from coord.providers import (  # noqa: PLC0415
+        machine_supports_provider,
+        resolve_provider_name,
+    )
+
+    # #1711: resolve the provider the retry would use, so machines that
+    # can't run it are named as such instead of reading as "free". A
+    # resolution failure (unknown provider name in config) degrades to
+    # skipping the capability lines — this is a diagnostic, not a gate.
+    repo_for_capability = config.repo(failed.repo_name)
+    try:
+        provider_for_capability: str | None = resolve_provider_name(
+            None,
+            repo_for_capability.provider if repo_for_capability is not None else None,
+            config.providers,
+            issue_labels=issue_labels if failed.type == "work" else None,
+        )
+    except ValueError:
+        provider_for_capability = None
 
     paused = paused_set(config.machines)
     now = time.time()
@@ -1400,6 +1444,18 @@ def describe_no_candidate_machines(
     for m in relevant_machines:
         if m.name in paused:
             lines.append(f"  {m.name}: paused")
+            continue
+        if provider_for_capability is not None and not machine_supports_provider(
+            m, provider_for_capability, config.providers,
+        ):
+            # #1711: mirrors `_reassign`'s capability filter — this machine
+            # never declared it can run the resolved provider, so it was
+            # excluded regardless of load.
+            lines.append(
+                f"  {m.name}: cannot run provider {provider_for_capability!r} "
+                "(no matching capability in coordinator.yml "
+                "machines[].capabilities)"
+            )
             continue
         running = running_by_machine.get(m.name, [])
         cap = _machine_capacity(m, config)
