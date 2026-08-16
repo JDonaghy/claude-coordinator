@@ -4622,9 +4622,9 @@ class AgentServer:
             self.artifact_paths = new_artifact_paths
             self.build_commands = new_build_commands
 
-            providers_changed = False
             providers_added: list[str] = []
             providers_removed: list[str] = []
+            providers_pinned: list[str] = []
             if new_providers is not None:
                 in_flight_providers = {
                     a.spec.provider
@@ -4633,10 +4633,18 @@ class AgentServer:
                 }
                 old_providers = self._providers
                 _pin(old_providers, new_providers, in_flight_providers)
+                # Deliberately NOT trying to report "changed vs unchanged" per
+                # provider: `build_provider` mints a fresh instance every call
+                # and the provider classes carry no value equality, so any such
+                # comparison is really just "was it rebuilt", which is always
+                # true for every non-pinned entry. Report what IS knowable —
+                # the resulting registry, which names appeared/disappeared, and
+                # which kept their pre-reload instance because a PENDING/
+                # RUNNING assignment pinned them.
                 providers_added = [p for p in new_providers if p not in old_providers]
                 providers_removed = [p for p in old_providers if p not in new_providers]
-                providers_changed = bool(providers_added or providers_removed) or any(
-                    new_providers[p] is not old_providers.get(p) for p in new_providers
+                providers_pinned = sorted(
+                    p for p in in_flight_providers if p in old_providers
                 )
                 self._providers = new_providers
 
@@ -4667,9 +4675,10 @@ class AgentServer:
                 # #2326: separate clause so a provider-only edit (the #2321
                 # incident this issue describes) shows up even when no repo
                 # changed at all.
-                f" providers={'unchanged' if not providers_changed else sorted(self._providers)}"
+                f" providers={sorted(self._providers)}"
                 f"{f' (added={providers_added})' if providers_added else ''}"
                 f"{f' (removed={providers_removed})' if providers_removed else ''}"
+                f"{f' (pinned in-flight={providers_pinned})' if providers_pinned else ''}"
                 if new_providers is not None
                 else " providers=rebuild failed, kept previous registry"
             ),
