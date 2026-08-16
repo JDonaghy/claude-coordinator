@@ -1053,7 +1053,13 @@ def dispatch_stalled_pipeline_action(
 
     Gated by ``config.pipeline.auto_dispatch_stalled`` (default ``False`` —
     detection/narration via :func:`post_stalled_pipeline` is unconditional;
-    this is the opt-in action half). Mutates *board* in place exactly like
+    this is the opt-in action half) — EXCEPT for a ``review_request_changes_
+    no_fix`` stall on a :data:`coord.models.SEALED_PATH_AUTHOR_TYPES` row
+    (``test-author``/``mock-author``), which dispatches regardless of the
+    flag: no loop owns that row (#2302), so the flag would only leave it
+    stalled forever with no alternative dispatcher to race. ``work`` rows
+    under the same reason keep the opt-in gate — ``coord drive`` owns those.
+    Mutates *board* in place exactly like
     the auto-loop / review-dispatch helpers it delegates to — the caller is
     responsible for persisting it.
 
@@ -1096,7 +1102,23 @@ def dispatch_stalled_pipeline_action(
     mirroring the one-shot comment (#1441's own guardrail, reused rather
     than re-derived per #1478's own request).
     """
-    if not config.pipeline.auto_dispatch_stalled:
+    # #2302: `pipeline.auto_dispatch_stalled` exists to bound blast radius on
+    # rows another loop already owns (`coord drive`'s request-changes → fix
+    # arm for `work` rows, #1692) — a second dispatcher racing that loop
+    # would duplicate or clobber its fix. A `request-changes` stall on a
+    # SEALED_PATH_AUTHOR_TYPES row (`test-author`/`mock-author`, Gate A/JIT
+    # acceptance slices) has no such owner: `coord drive` explicitly `_die()`s
+    # on those, and `coord acceptance mock` dispatches Gate A standalone with
+    # no drive run over it at all (see #2289). So this one reason+type
+    # combination bypasses the flag — every other reason, and `work` rows
+    # under this same reason, keep the opt-in gate unchanged.
+    from coord.models import SEALED_PATH_AUTHOR_TYPES  # noqa: PLC0415
+
+    sealed_author_stall = (
+        detection.reason == "review_request_changes_no_fix"
+        and work.type in SEALED_PATH_AUTHOR_TYPES
+    )
+    if not config.pipeline.auto_dispatch_stalled and not sealed_author_stall:
         return StalledDispatchAction(
             kind="disabled", detail="pipeline.auto_dispatch_stalled is False",
         )

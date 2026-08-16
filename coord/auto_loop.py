@@ -43,7 +43,7 @@ import httpx
 from coord.config import Config
 from coord.dispatch import AGENT_PORT
 from coord import github_ops
-from coord.models import Assignment, Board
+from coord.models import SEALED_PATH_AUTHOR_TYPES, Assignment, Board
 from coord.review import (
     ReviewFindings,
     blocking_findings_confirmed_absent,
@@ -64,7 +64,16 @@ log = logging.getLogger(__name__)
 # ``coord.notify``'s fix-completion detector doesn't hardcode ``"work"`` and
 # silently miss a newer fix-dispatch type — the same class of bug as #1141
 # ("test-author was never added to WORK_LIKE_TYPES").
-FIX_DISPATCH_TYPES: frozenset[str] = frozenset({"work", "test-author"})
+#
+# #2302: "mock-author" (Gate A) is the same class of bug repeating — a
+# request-changes fix for a mock-author row dispatched as plain "work",
+# which trips coord/review.py's sealed-path tamper rule on every round
+# (the fix worker isn't authorized to write tests/acceptance/ms-NN/, but
+# that's exactly where the diff has to land) until max_review_iterations
+# burns out. `_dispatch_fix` derives `fix_type` from
+# ``coord.models.SEALED_PATH_AUTHOR_TYPES`` rather than a hardcoded string
+# so this set — and this one — never drift from it again.
+FIX_DISPATCH_TYPES: frozenset[str] = frozenset({"work"}) | SEALED_PATH_AUTHOR_TYPES
 
 
 # Every :class:`LoopAction` kind whose production means the in-memory board was
@@ -816,9 +825,16 @@ def _build_fix_briefing(
     instructions instead — "make the acceptance suite pass" is actively
     wrong guidance for an oracle that must stay RED until the real
     implementation lands.
+
+    #2302: a ``type="mock-author"`` source row (Gate A) gets its own
+    variant for the same reason one level up the pipeline — the diff is a
+    specification (``contract.md`` + rendered mocks), not an
+    implementation, so "run tests, make them pass" is equally wrong there.
     """
     if work.type == "test-author":
         return _build_test_author_fix_briefing(work, findings, iteration, max_iter)
+    if work.type == "mock-author":
+        return _build_mock_author_fix_briefing(work, findings, iteration, max_iter)
 
     lines: list[str] = [
         f"# Fix assignment (iteration {iteration}/{max_iter}): {work.issue_title}",
@@ -929,6 +945,93 @@ def _build_test_author_fix_briefing(
     return "\n".join(lines)
 
 
+def _build_mock_author_fix_briefing(
+    work: Assignment,
+    findings,
+    iteration: int,
+    max_iter: int,
+) -> str:
+    """Fix briefing for a ``type="mock-author"`` slice (#2302, Gate A).
+
+    The diff here is a SPECIFICATION — ``contract.md`` plus rendered
+    ``tests/acceptance/ms-NN/mocks/*`` — not an implementation. There is no
+    suite to run, so "run the tests and make them pass" (the generic fix
+    instruction) is actively wrong guidance, the same shape #1176 already
+    fixed for ``test-author``. Findings on a Gate A review are almost
+    always an internal-consistency defect: a mock depicting an end state
+    that the contract's own stated rules cannot produce from the narrated
+    input sequence — so the contract and the mocks must be reconciled to
+    agree with each other in BOTH directions, not just patched locally.
+    The dispatcher pairs this briefing with a bare ``type="mock-author"``
+    dispatch (see ``_dispatch_fix``) — ``agent.py``'s own
+    ``elif spec.type == "mock-author"`` branch supplies
+    ``MOCK_AUTHOR_SYSTEM_PROMPT`` and its deny-list on its own, so no
+    explicit ``system_prompt``/``deny_commands`` injection is needed here
+    the way ``test-author`` (which has no such branch) requires.
+    """
+    lines: list[str] = [
+        f"# Gate A fix (iteration {iteration}/{max_iter}): {work.issue_title}",
+        "",
+        (
+            f"You are the independent mock-author fixing review findings "
+            f"against the Gate A contract and mocks for issue "
+            f"#{work.issue_number}."
+        ),
+        (
+            f"Work on branch `{work.branch or '(check your git branches)'}` — "
+            "**do not change the branch name**."
+        ),
+        "",
+        "## Reviewer findings to address",
+        "",
+        findings.body.strip(),
+        "",
+        "## Instructions",
+        "",
+        (
+            "1. Read the reviewer findings above carefully. Your diff is a "
+            "SPECIFICATION (`contract.md` + rendered `mocks/*`), not an "
+            "implementation — there is no suite to run and nothing to make "
+            "pass. Findings on a Gate A review are almost always an "
+            "internal-consistency defect: a mock depicting an end state "
+            "that the contract's own stated rules cannot produce from the "
+            "narrated input sequence."
+        ),
+        (
+            "2. Fix **every** issue identified by the reviewer so the "
+            "contract and the mocks agree with each other in BOTH "
+            "directions — every rule the contract states must be reachable "
+            "from the mocks' narrated sequence, and every state the mocks "
+            "depict must be producible by the contract's stated rules."
+        ),
+        "3. Stay on the **same branch** — push your fixes to the existing branch.",
+        (
+            "4. Do NOT touch any file outside `tests/acceptance/ms-NN/`. "
+            "Touching anything outside that directory is a mandatory "
+            "`request-changes` for this assignment type — you are pinning "
+            "the milestone's contract, not implementing it."
+        ),
+        (
+            f"5. This is fix iteration {iteration} of {max_iter} allowed. "
+            "Address all findings completely so the next review can approve."
+        ),
+        "",
+        (
+            "STATUS: reading review findings → reconciling contract and mocks "
+            "→ confidence: high"
+        ),
+        "",
+    ]
+    if work.briefing and work.briefing.strip():
+        lines += [
+            "## Original mock-author briefing",
+            "",
+            work.briefing.strip(),
+            "",
+        ]
+    return "\n".join(lines)
+
+
 def _dispatch_fix(
     work: Assignment,
     briefing: str,
@@ -945,11 +1048,18 @@ def _dispatch_fix(
     Prefers the same machine as the original worker (the branch is already
     checked out there).  Falls back to any capable machine.
 
-    #1176: the dispatched type mirrors ``work.type`` for ``"test-author"``
-    (with ``TEST_AUTHOR_SYSTEM_PROMPT`` + its deny-list, since the fix needs
-    the same acceptance-path authorization and independence rules as the
-    original test-author dispatch); every other source type still gets the
-    long-standing plain ``"work"`` fix.
+    #1176/#2302: the dispatched type mirrors ``work.type`` for any
+    :data:`coord.models.SEALED_PATH_AUTHOR_TYPES` member (``"test-author"``,
+    ``"mock-author"``) — those types are the ones ``coord/review.py``
+    inverts its sealed-path tamper rule for, so a fix that needs to write
+    back into ``tests/acceptance/ms-NN/`` must carry the same type as the
+    row it's fixing or every round trips "TAMPER DETECTED" until the
+    iteration cap burns out. ``test-author`` additionally needs
+    ``TEST_AUTHOR_SYSTEM_PROMPT`` + its deny-list injected explicitly since
+    ``agent.py`` has no dispatch-table branch for it; ``mock-author``
+    doesn't — ``agent.py``'s own ``elif spec.type == "mock-author"`` branch
+    supplies its system prompt and deny-list unconditionally. Every other
+    source type still gets the long-standing plain ``"work"`` fix.
 
     Returns the new Assignment (already added to ``board.active``), or None
     on failure.
@@ -1016,12 +1126,16 @@ def _dispatch_fix(
     if repo is None:
         return None
 
-    # #1176: preserve the source row's type for a test-author slice fix —
-    # dispatching `type="work"` sends a plain worker that is forbidden from
-    # (and never given the system prompt authorizing) exactly the
-    # `tests/acceptance/**` path it needs to fix. Every other source type
-    # (including today's "work") keeps the long-standing "work" fix.
-    fix_type = "test-author" if work.type == "test-author" else "work"
+    # #1176/#2302: preserve the source row's type for a sealed-path-author
+    # slice fix (test-author, mock-author) — dispatching `type="work"`
+    # sends a plain worker that is forbidden from (and never given the
+    # system prompt authorizing) exactly the `tests/acceptance/**` path it
+    # needs to fix. Derived from SEALED_PATH_AUTHOR_TYPES rather than a
+    # hardcoded string so this stays in sync with that set — see the
+    # FIX_DISPATCH_TYPES comment above for the class of bug that guards
+    # against. Every other source type (including today's "work") keeps
+    # the long-standing "work" fix.
+    fix_type = work.type if work.type in SEALED_PATH_AUTHOR_TYPES else "work"
 
     payload = {
         "repo_name": work.repo_name,
@@ -1054,6 +1168,12 @@ def _dispatch_fix(
         # stay-RED rules a test-author session needs.
         payload["system_prompt"] = TEST_AUTHOR_SYSTEM_PROMPT
         payload["deny_commands"] = test_author_deny_commands(config, work.repo_name)
+    # #2302: no analogous branch for `fix_type == "mock-author"` — unlike
+    # test-author, `agent.py`'s `elif spec.type == "mock-author"` branch
+    # already supplies `MOCK_AUTHOR_SYSTEM_PROMPT` and unconditionally
+    # appends `MOCK_AUTHOR_DENY_COMMANDS` regardless of `spec.deny_commands`,
+    # so injecting either here would be redundant with what the agent-side
+    # dispatch table already does purely from `type="mock-author"`.
     # Escalated model per bounce iteration (None when pipeline
     # .escalate_fix_model is disabled — preserves today's no-model behaviour).
     # The board record keeps the alias for legibility; the wire payload is
