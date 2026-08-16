@@ -9,7 +9,7 @@
 # here rather than several successful steps into a merge.
 set -uo pipefail
 
-REPOS=(claude-coordinator quadraui vimcode)
+REPOS=(code-coordinator quadraui vimcode)
 OWNER=JDonaghy
 PASS=0; FAIL=0
 ok()  { printf '  \033[32mPASS\033[0m  %s\n' "$*"; PASS=$((PASS+1)); }
@@ -28,7 +28,7 @@ if who="$(gh api user --jq .login 2>/dev/null)"; then
 else
     # Fine-grained PATs without account permissions can't read /user; that is
     # expected and not a failure. Fall back to a repo-scoped probe.
-    if gh api "repos/$OWNER/claude-coordinator" --jq .full_name >/dev/null 2>&1; then
+    if gh api "repos/$OWNER/code-coordinator" --jq .full_name >/dev/null 2>&1; then
         ok "authenticates (no /user access — normal for a fine-grained PAT)"
     else
         bad "token cannot reach the API at all — wrong value, expired, or no repo access"
@@ -142,7 +142,7 @@ hdr "7. Not over-scoped  (negative test)"
 # Reading Actions secrets requires an admin-tier permission we deliberately did
 # not grant. A 403/404 here is the PASS: it proves the token is narrower than
 # the account behind it. (Checking .permissions.admin does not work — see above.)
-if gh api "repos/$OWNER/claude-coordinator/actions/secrets" >/dev/null 2>&1; then
+if gh api "repos/$OWNER/code-coordinator/actions/secrets" >/dev/null 2>&1; then
     bad "token can read Actions secrets — far broader than intended, regenerate it"
 else
     ok "cannot read Actions secrets (correctly scoped)"

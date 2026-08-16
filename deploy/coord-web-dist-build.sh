@@ -25,7 +25,7 @@
 # once, THEN start/enable coord-web.
 #
 # Safe to run unattended on a timer (see coord-web-dist-build.timer): it
-# never touches ~/.coord-venv, ~/src/claude-coordinator's own checkout (it
+# never touches ~/.coord-venv, ~/src/code-coordinator's own checkout (it
 # uses a DEDICATED `git worktree`, so it can't collide with whatever branch
 # an operator has that checkout parked on — same reasoning as `coord drive`'s
 # worktree isolation), or any running coord-agent/coord-serve/coord-web
@@ -97,7 +97,7 @@
 set -uo pipefail
 
 SRC_ROOT="${SRC_ROOT:-$HOME/src}"
-REPO_NAME="${REPO_NAME:-claude-coordinator}"
+REPO_NAME="${REPO_NAME:-code-coordinator}"
 BASE_CHECKOUT="${BASE_CHECKOUT:-$SRC_ROOT/$REPO_NAME}"
 BRANCH="${BRANCH:-main}"
 

@@ -45,7 +45,7 @@ Type=simple
 #   error rather than a red suite — because a PATH= line here fixes this
 #   host and leaves the next one broken silently, which is the same failure
 #   shape as the bug. Keep both.
-# - #1117 added the repo venv (%h/src/claude-coordinator/.venv/bin) so
+# - #1117 added the repo venv (%h/src/code-coordinator/.venv/bin) so
 #   acceptance.drivers subprocesses shelled out via
 #   subprocess.run(shell=True) (e.g. the cli-pytest driver's `pytest
 #   tests/acceptance/{ms}`) resolve `pytest`/`python3` with the repo's
@@ -64,7 +64,7 @@ Type=simple
 # the structural fix — see the `coord health`/`coord doctor` unit_drift
 # check (#1831), which flags any unit whose PATH puts a `.venv/bin` entry
 # ahead of ~/.local/bin or ~/.coord-venv/bin.
-Environment=PATH=%h/.cargo/bin:%h/.local/bin:%h/src/claude-coordinator/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
+Environment=PATH=%h/.cargo/bin:%h/.local/bin:%h/src/code-coordinator/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
 ExecStart=%h/.coord-venv/bin/coord serve --config %h/.coord/coordinator.yml --host 0.0.0.0 --port 7435
 Restart=on-failure
 RestartSec=3

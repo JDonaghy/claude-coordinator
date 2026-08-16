@@ -5,7 +5,7 @@
 # A systemd *user* unit, Type=oneshot, mirroring coord-drive-queue.service's
 # tick pattern (timer-fired, its own flock so a slow run can't stack).  Runs
 # deploy/coord-web-dist-build.sh, which:
-#   - fetches origin/main into ~/src/claude-coordinator (read-only — only
+#   - fetches origin/main into ~/src/code-coordinator (read-only — only
 #     `git fetch` + `rev-parse`, never touches that checkout's working tree
 #     or whatever branch an operator has it parked on),
 #   - builds coord/dashboard/webapp from that SHA inside a DEDICATED worktree

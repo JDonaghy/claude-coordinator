@@ -43,7 +43,7 @@
 #   pip show code-coordinator | grep -i editable     # must print NOTHING
 #
 # An editable checkout (e.g. elitebook's dev box, where ~/.local/bin/coord
-# points at ~/src/claude-coordinator) lets a worker's branch churn rewrite the
+# points at ~/src/code-coordinator) lets a worker's branch churn rewrite the
 # runner's own code out from under a live tick. Do not install this unit
 # there. See docs/DRIVE_QUEUE.md.
 #

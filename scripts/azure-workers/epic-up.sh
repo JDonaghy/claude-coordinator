@@ -170,7 +170,7 @@ RG="rg-coord-epic${EPIC}"
 
 # --------------------------------------------------------------------------
 # The Bicep module ships in the easy-azure repo; these scripts ship in
-# claude-coordinator. Keep EASY_AZURE_DIR in epic.env pointing at that checkout.
+# code-coordinator. Keep EASY_AZURE_DIR in epic.env pointing at that checkout.
 TEMPLATE="${EASY_AZURE_DIR:-$HOME/src/easy-azure}/modules/coord-worker-vm/main.bicep"
 [[ -f "$TEMPLATE" ]] || { echo "template not found: $TEMPLATE (set EASY_AZURE_DIR in $EPIC_ENV)" >&2; exit 1; }
 
