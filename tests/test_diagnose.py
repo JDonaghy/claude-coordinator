@@ -1651,6 +1651,43 @@ def test_zero_commit_advisory_is_not_reported_healthy(monkeypatch, config) -> No
     assert res.recovered is False
 
 
+def test_zero_commit_advisory_with_deleted_branch_is_not_reported_healthy(
+    monkeypatch, config
+) -> None:
+    """#2324: space-invaders#1's exact shape — a genuine zero-commit
+    advisory whose branch has already been deleted. Unlike the other tests
+    in this section, `_work_advisory_commits_ahead` is deliberately NOT
+    stubbed here — this exercises the real call into
+    `github_ops.branch_commits_ahead_for_assignment`, mocking only `gh`
+    itself, to prove the full chain (not just the diagnose-side branching)
+    reads a confirmed-404 head branch as 0, not None. Before #2324 this
+    reported "could not be confirmed" and steered toward `coord drive
+    --accept-advisory`, which assumes commits exist."""
+    _stub(monkeypatch, session="dead")
+
+    def _gh_dispatch(*args, **kwargs):
+        path = args[1] if len(args) > 1 else ""
+        if path == "repos/acme/api/compare/main...issue-42-deleted":
+            raise RuntimeError("gh: Not Found (HTTP 404)")
+        if path == "repos/acme/api/git/refs/heads/issue-42-deleted":
+            raise RuntimeError("gh: Not Found (HTTP 404)")
+        if path == "repos/acme/api/git/refs/heads/main":
+            return "{}"
+        raise AssertionError(f"unexpected _gh call: {args!r}")
+
+    monkeypatch.setattr("coord.github_ops._gh", _gh_dispatch)
+
+    a = _assign(aid="w-advisory-deleted", status="advisory", branch="issue-42-deleted")
+    board = Board(completed=[a])
+    res = diagnose.diagnose_stage(board, config, "api", 42, "work")
+
+    assert not any("looks healthy" in f for f in res.findings), res.findings
+    assert not any("could not be confirmed" in f for f in res.findings), res.findings
+    assert any("0 commits" in f for f in res.findings), res.findings
+    assert any("coord retry w-advisory-deleted" in f for f in res.findings), res.findings
+    assert res.recovered is False
+
+
 def test_zero_commit_advisory_on_a_plan_row_is_not_reported_healthy(
     monkeypatch, config
 ) -> None:
