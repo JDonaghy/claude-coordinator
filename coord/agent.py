@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 from coord import cargo_cache
+from coord.config_reload import reload_config_if_stale
 from coord.models import DELIVERABLE_ANALYSIS_LABEL
 from coord.platform_paths import default_coord_dir
 
@@ -4010,6 +4011,25 @@ WRITE_CAPABLE_SPEC_TYPES: frozenset[str] = frozenset({
 })
 
 
+def _config_mtime_of(config: "Any | None") -> float | None:
+    """mtime of *config*'s backing ``coordinator.yml``, or None (#2299).
+
+    None whenever there is nothing to watch: config-free mode (no config at
+    all), thin-client mode (the config came from the daemon's ``GET /config``
+    and has no local ``path``), or a file that vanished between load and now.
+    Every one of those cases makes :meth:`AgentServer._maybe_reload_config` a
+    no-op, which is the correct degradation — an agent with no local file has
+    nothing to re-read.
+    """
+    path = getattr(config, "path", None) if config is not None else None
+    if path is None:
+        return None
+    try:
+        return Path(path).stat().st_mtime
+    except OSError:
+        return None
+
+
 class AgentServer:
     """Owns assignment state and subprocesses. Thread-safe."""
 
@@ -4022,6 +4042,14 @@ class AgentServer:
         state_dir: Path = DEFAULT_STATE_DIR,
         worker_command: WorkerCommandBuilder | None = None,
         repo_paths: dict[str, str] | None = None,
+        # RESTART-ONLY (#2299). These two are read by `_spawn` for every
+        # worker, but they are *process* tuning (how the daemon forks and how
+        # long it waits for first output), not fleet topology — they are NOT
+        # refreshed by the config reload below. Changing
+        # `concurrency.bash_wrap_spawn` / `concurrency.first_output_timeout`
+        # in coordinator.yml still requires `systemctl --user restart
+        # coord-agent`, as do the bind host/port (owned by uvicorn, which has
+        # already bound the socket by the time any reload could run).
         bash_wrap_spawn: bool = True,
         first_output_timeout: float = _FIRST_OUTPUT_TIMEOUT,
         # #305: per-repo artifact glob patterns; repo_name → list of globs.
@@ -4091,10 +4119,50 @@ class AgentServer:
         # :mod:`coord.providers` at module load time — concrete instances
         # are duck-typed (``build_command``, ``initial_input``,
         # ``capabilities``, ``env``) at call sites.
+        #
+        # RESTART-ONLY (#2299): the registry is deliberately NOT refreshed by
+        # the config reload. A running worker holds a provider resolved at
+        # dispatch time (`_resolve_provider`), and `_reap` re-resolves the
+        # SAME spec afterwards to pick a log parser — swapping the registry
+        # underneath would let a live session's provider silently change
+        # identity mid-flight (retargeting its model / log format), which is
+        # exactly the "never mutate state a running worker depends on"
+        # invariant this feature is bounded by. Adding or editing a provider
+        # still needs a restart.
         self._providers: dict[str, object] = dict(providers or {})
         self._worktree_writable_settings_files = worktree_writable_settings_files
         self._health_config = health_config
         self.config_free_reason = config_free_reason
+
+        # ── #2299: hot config reload ────────────────────────────────────────
+        # The agent used to freeze every config-derived field above at process
+        # start, so adding a repo to coordinator.yml required `systemctl --user
+        # restart coord-agent` on every machine that should serve it — the one
+        # action that also kills live workers, which in practice meant waiting
+        # for the whole fleet to go quiet before a repo could be onboarded at
+        # all. Worse, the skew was silent and asymmetric: `coord config`,
+        # `coord status` and `coord assign --dry-run` all read the *file* and
+        # reported the repo as supported while `assign()` refused every single
+        # dispatch for it.
+        #
+        # `_maybe_reload_config` closes that, driven off the existing /health
+        # poll and the dispatch path (no new timer, no background thread).
+        # `_config_mtime` is seeded here from the file we were built from so
+        # the first poll after startup is a no-op stat(), not a redundant
+        # reparse.
+        self._config_mtime: float | None = _config_mtime_of(health_config)
+        # Serializes reload attempts so two concurrent /health polls (or a
+        # poll racing a dispatch) can't both parse the file and apply
+        # overlapping swaps. Held across stat + parse + apply. Lock order is
+        # always `_config_reload_lock` → `_lock`; nothing takes them the other
+        # way round.
+        self._config_reload_lock = threading.Lock()
+        # Observability for /health: how many times the on-disk config was
+        # successfully re-read into this process, and when. In-memory only —
+        # it exists to answer "did this agent pick up my edit?" without an
+        # SSH + journalctl, which is the question #2299 was really about.
+        self._config_reloads: int = 0
+        self._config_reloaded_at: float | None = None
 
         self._lock = threading.Lock()
         self._assignments: dict[str, AgentAssignment] = {}
@@ -4227,9 +4295,198 @@ class AgentServer:
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self._load_state()
 
+    # ── #2299: hot config reload ────────────────────────────────────────────
+
+    #: Config-derived state that a reload refreshes, versus the state it must
+    #: leave alone. Kept as a docstring-adjacent constant so the *decision*
+    #: (issue #2299's "needs a decision, not an assumption" list) is recorded
+    #: in the code rather than only in the issue thread.
+    #:
+    #: HOT (refreshed on the next health poll / dispatch):
+    #:   * ``repos``          — the point of the feature; gates ``assign()``
+    #:                          and is what ``/health`` advertises.
+    #:   * ``repo_paths``     — resolved per dispatch.
+    #:   * ``artifact_paths`` — read when a finished worker's artifacts are
+    #:                          stashed.
+    #:   * ``build_commands`` — read just before that stash.
+    #:   * ``capabilities``   — published in ``/health``; the coordinator does
+    #:                          smoke/review routing from that published list,
+    #:                          and nothing in the *worker* path reads it, so a
+    #:                          capability that disappears simply stops
+    #:                          attracting new work (degrade) instead of
+    #:                          stranding anything in flight.
+    #:
+    #: RESTART-ONLY (documented at their assignment sites in ``__init__``):
+    #:   * ``providers``      — a live worker holds a resolved provider.
+    #:   * ``bash_wrap_spawn`` / ``first_output_timeout`` — process tuning.
+    #:   * bind host/port     — uvicorn has already bound the socket.
+    _RELOADABLE_FIELDS = (
+        "repos",
+        "repo_paths",
+        "artifact_paths",
+        "build_commands",
+        "capabilities",
+    )
+
+    def _maybe_reload_config(self) -> bool:
+        """Re-read ``coordinator.yml`` if it changed on disk; return True if applied.
+
+        This is #2299's whole mechanism. It reuses the board daemon's #1081
+        helper (:func:`coord.config_reload.reload_config_if_stale`) rather than
+        inventing a second one, so the malformed-edit behaviour is identical by
+        construction: a bad hand-edit is logged and swallowed, the agent keeps
+        running on the last-good config, and the tracked mtime still advances
+        so the bad edit is not re-parsed on every subsequent poll.
+
+        Cheap enough to call on the hot paths that already exist (``health()``
+        and ``assign()``): the steady-state cost is one ``stat()`` under an
+        uncontended lock — no new timer and no background thread.
+
+        Fail-soft in every direction. A missing/thin-client config, a vanished
+        file, a malformed edit, or a config whose ``machines:`` list no longer
+        contains this machine all leave the agent exactly as it was.
+        """
+        cfg = self._health_config
+        if cfg is None or getattr(cfg, "path", None) is None:
+            # Config-free (docs/EPHEMERAL_WORKERS.md) or thin-client mode —
+            # there is no local file to watch. Both are legitimate; neither
+            # can drift against a file it doesn't have.
+            return False
+
+        with self._config_reload_lock:
+            # Re-read under the lock: a concurrent caller may already have
+            # applied this same edit while we waited, in which case
+            # `_config_mtime` has moved past it and the helper no-ops.
+            cfg = self._health_config
+            reloaded, mtime = reload_config_if_stale(
+                cfg,
+                self._config_mtime,
+                log_name=__name__,
+                label="coord agent",
+            )
+            self._config_mtime = mtime
+            if reloaded is cfg:
+                return False
+
+            machine = next(
+                (m for m in reloaded.machines if m.name == self.machine_name), None
+            )
+            if machine is None:
+                # The edit removed/renamed this machine. Adopting a config
+                # that doesn't describe us would mean publishing an empty repo
+                # list and refusing every dispatch — a far worse outcome than
+                # staying on the last-good snapshot until an operator notices.
+                # `_config_mtime` has still advanced, so this logs once per
+                # edit rather than once per poll.
+                _log.warning(
+                    "coord agent: %s reloaded but no longer declares machine "
+                    "%r (has: %s); keeping the previous config",
+                    reloaded.path,
+                    self.machine_name,
+                    [m.name for m in reloaded.machines],
+                )
+                return False
+
+            self._apply_reloaded_config(reloaded, machine)
+            return True
+
+    def _apply_reloaded_config(self, cfg: "Any", machine: "Any") -> None:
+        """Swap the reloadable fields in place, pinning anything in flight.
+
+        The invariant from #2299: *a reload must never mutate state a running
+        worker depends on.* In-flight assignments keep the values they started
+        with; the new config governs the next dispatch onward.
+
+        Concretely, any repo with a PENDING or RUNNING assignment is "pinned":
+        its ``repo_paths`` / ``artifact_paths`` / ``build_commands`` entries
+        keep their pre-reload values (including *absence* — a repo that had no
+        build command before must not acquire one halfway through a worker's
+        leg, or the pre-stash build would run a command the worker never
+        expected). The pin lifts as soon as that assignment reaches a terminal
+        state and the next reload runs.
+
+        ``repos`` and ``capabilities`` are replaced wholesale: they gate and
+        advertise *new* work only, so removing a repo correctly means "take no
+        more dispatches for it", not "abandon the worker already running".
+
+        Every field is *rebound* to a freshly-built list/dict rather than
+        mutated in place, so the many unsynchronized readers elsewhere in this
+        class (``_servable_repos``, ``_stash_artifacts``, ``assign``, ...) see
+        either the whole old value or the whole new one — never a half-updated
+        dict.
+        """
+        new_repos = list(machine.repos)
+        new_capabilities = list(machine.capabilities)
+        new_repo_paths = dict(machine.repo_paths or {})
+        new_artifact_paths: dict[str, list[str]] = {
+            r.name: list(r.artifact_paths) for r in cfg.repos if r.artifact_paths
+        }
+        new_build_commands: dict[str, str] = {
+            r.name: r.build_command for r in cfg.repos if r.build_command
+        }
+
+        def _pin(old: dict, new: dict, keys: "Iterable[str]") -> None:
+            """Restore *old*'s entry for each pinned key — including absence."""
+            for key in keys:
+                if key in old:
+                    new[key] = old[key]
+                else:
+                    new.pop(key, None)
+
+        with self._lock:
+            in_flight = {
+                a.spec.repo_name
+                for a in self._assignments.values()
+                if a.status in (PENDING, RUNNING)
+            }
+            _pin(self.repo_paths, new_repo_paths, in_flight)
+            _pin(self.artifact_paths, new_artifact_paths, in_flight)
+            _pin(self.build_commands, new_build_commands, in_flight)
+
+            added = [r for r in new_repos if r not in self.repos]
+            removed = [r for r in self.repos if r not in new_repos]
+            caps_changed = new_capabilities != self.capabilities
+
+            self.repos = new_repos
+            self.capabilities = new_capabilities
+            self.repo_paths = new_repo_paths
+            self.artifact_paths = new_artifact_paths
+            self.build_commands = new_build_commands
+            self._health_config = cfg
+            self._config_reloads += 1
+            self._config_reloaded_at = time.time()
+
+        # The H-1 block in /health is built from `_health_config`'s checkouts,
+        # so a stale cache would keep reporting the pre-reload repo set for up
+        # to a full TTL after the swap — exactly the skew this issue is about,
+        # just moved one layer down.
+        self._local_health_cache = None
+
+        _log.info(
+            "coord agent: applied config reload from %s — repos=%s "
+            "(added=%s removed=%s) capabilities=%s%s",
+            getattr(cfg, "path", None),
+            new_repos,
+            added or "[]",
+            removed or "[]",
+            new_capabilities if caps_changed else "unchanged",
+            (
+                f" (pinned in-flight repos: {sorted(in_flight)})"
+                if in_flight
+                else ""
+            ),
+        )
+
     # ── Public API ──────────────────────────────────────────────────────────
 
     def health(self) -> dict:
+        # #2299: the health poll IS the reload tick. The coordinator polls
+        # every agent's /health continuously, so piggybacking here means a
+        # coordinator.yml edit lands within one poll with no new timer, and —
+        # critically — the `repos` list published below is the post-reload one,
+        # so `coord repo doctor`'s `machines.agent_repo_skew` clears itself
+        # instead of instructing an operator to restart a busy agent.
+        self._maybe_reload_config()
         with self._lock:
             active = sum(1 for a in self._assignments.values() if a.status == RUNNING)
             completed = sum(
@@ -4240,6 +4497,9 @@ class AgentServer:
         worktree_bytes = self._cached_worktree_bytes()
         artifact_bytes = self._cached_artifact_bytes()
         servable_repos, degraded_repos = self._servable_repos()
+        # #2299: the coordinator.yml this agent re-reads on every poll, or
+        # None when there is nothing local to watch (config-free / thin-client).
+        watched_config = getattr(self._health_config, "path", None)
         return {
             "machine": self.machine_name,
             "capabilities": self.capabilities,
@@ -4308,6 +4568,18 @@ class AgentServer:
                 "passes": self._graph_heal_passes,
                 "skipped_active": self._graph_heal_skipped_active,
                 "last_skip_at": self._graph_heal_last_skip_at,
+            },
+            # #2299: is this agent actually watching a coordinator.yml, and
+            # has it picked anything up? `watching` is None for a
+            # config-free/thin-client agent (nothing local to re-read), which
+            # is the one case where a restart IS still the only way to change
+            # the repo list. Lets an operator answer "did my edit land?"
+            # from `coord doctor` instead of SSH + journalctl — the whole
+            # complaint in #2299 was that the skew was invisible from outside.
+            "config_reload": {
+                "watching": str(watched_config) if watched_config else None,
+                "reloads": self._config_reloads,
+                "last_reload_at": self._config_reloaded_at,
             },
         }
 
@@ -5614,6 +5886,13 @@ class AgentServer:
 
     def assign(self, spec: AssignmentSpec) -> AgentAssignment:
         """Accept an assignment and spawn the worker. Returns immediately."""
+        # #2299: refresh from coordinator.yml before the repo gate below.
+        # /health already reloads on every poll, but gating dispatch on
+        # "someone happened to poll first" would make repo onboarding depend
+        # on poll timing; this costs one stat() in the steady state and makes
+        # the guarantee unconditional — the dispatch that arrives after the
+        # edit is served, full stop.
+        self._maybe_reload_config()
         if self.repos and spec.repo_name not in self.repos:
             raise ValueError(
                 f"this agent does not handle repo {spec.repo_name!r} "

@@ -730,9 +730,12 @@ def evaluate_machines(facts: RepoFacts) -> list[Finding]:
 
     * ``machines.agent_repo_skew`` — the repo is in this machine's
       ``coordinator.yml`` ``repos:`` list, the agent is up, and ``/health``
-      neither serves it nor calls it degraded. That means the agent has not
-      re-read config since the repo was added (#2219). **This is the
-      stick-demo#1 finding.** Fix: restart ``coord-agent`` there.
+      neither serves it nor calls it degraded. **This is the stick-demo#1
+      finding.** Since #2299 the agent re-reads its own ``coordinator.yml``
+      on the next ``/health`` poll, so the ordinary cure is to *wait a poll
+      and re-run*; a persistent skew means that machine's file is stale
+      (``git pull`` the settings checkout **there**), the edit is malformed
+      (the journal says ``failed to reload``), or the agent predates #2299.
     * ``machines.clone_missing`` — the agent knows about the repo and reports
       it degraded because the configured path is not on disk. Restarting
       changes nothing; the machine needs the clone.
@@ -799,12 +802,20 @@ def evaluate_machines(facts: RepoFacts) -> list[Finding]:
                 summary=(
                     f"{m.name}: coordinator.yml declares {facts.name!r} for this "
                     f"machine but its live /health advertises {sorted(published)} "
-                    "and does not call it degraded — the agent has not re-read "
-                    "config since the repo was added (#2219). Every dispatch "
-                    "here is refused while `coord config`/`coord status`/"
-                    "`coord assign --dry-run` all still show it as supported."
+                    "and does not call it degraded — the agent is running on a "
+                    "different repo list than the config being read here. Every "
+                    "dispatch there is refused while `coord config`/`coord "
+                    "status`/`coord assign --dry-run` all still show it as "
+                    "supported."
                 ),
-                fix=f"restart coord-agent on {m.name} (it freezes its repo list at start)",
+                fix=(
+                    f"agents re-read coordinator.yml themselves since #2299 — "
+                    f"wait one /health poll and re-run. If it persists on "
+                    f"{m.name}: `git pull` the settings checkout THERE (an agent "
+                    f"can only re-read its own disk), check `journalctl --user "
+                    f"-u coord-agent` for `failed to reload` (malformed edit), "
+                    f"or `coord agent update` if it predates #2299"
+                ),
             ))
         elif "does not exist" in reason:
             out.append(Finding(

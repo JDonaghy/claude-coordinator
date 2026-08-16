@@ -119,7 +119,10 @@ class TestRepoDoctorCommand:
         assert result.exit_code == 1, result.output
         assert "machines.agent_repo_skew" in result.output
         assert "dellserver" in result.output
-        assert "restart coord-agent" in result.output
+        # #2299: the remedy is no longer "restart coord-agent" — agents
+        # re-read coordinator.yml themselves, so the first move is to wait a
+        # poll, not to kill every live worker on that machine.
+        assert "wait one /health poll" in result.output
         # The healthy machine must not be dragged in with it.
         assert result.output.count("machines.agent_repo_skew") == 1
         assert "REPO_DOCTOR: repo=api" in result.output
@@ -241,7 +244,11 @@ class TestRepoAddCommand:
 
         # The residue is the point — it must name the steps it did NOT do.
         assert "NOT DONE" in result.output
-        assert "RESTART coord-agent" in result.output
+        # #2299: the per-machine residue is a `git pull` of the settings
+        # checkout, NOT an agent restart — an agent re-reads its own file, but
+        # only the copy that is actually on its disk.
+        assert "git pull" in result.output
+        assert "RESTART coord-agent" not in result.output
         assert "CLAUDE.md" in result.output
         assert "pull_request" in result.output
         assert "coord repo doctor newrepo" in result.output

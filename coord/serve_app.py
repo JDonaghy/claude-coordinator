@@ -63,6 +63,7 @@ from starlette.routing import Route
 
 from coord import __version__
 from coord.config import Config
+from coord.config_reload import reload_config_if_stale
 from coord.dao import _DROP_COLUMNS, _JSON_COLUMNS, SCHEMA_VERSION, CoordStore
 from coord.db import _ensure_schema
 from coord.openapi import build_spec, dataclass_schema, openapi_and_docs_routes, sqlite_table_schema
@@ -287,65 +288,19 @@ class _BearerAuthMiddleware(BaseHTTPMiddleware):
 def _reload_config_if_stale(
     current: Config, last_mtime: float | None
 ) -> tuple[Config, float | None]:
-    """Re-parse *current*'s backing ``coordinator.yml`` if it changed on disk (#1081).
+    """Daemon-side binding of :func:`coord.config_reload.reload_config_if_stale`.
 
-    The daemon's in-memory ``Config`` is otherwise fixed at process startup, so
-    a hand-edit to ``coordinator.yml`` on the daemon host silently diverges
-    from the file until a restart — even though ``GET /config`` (which serves
-    the raw bytes fresh every request) shows the new content immediately. This
-    closes that gap for the daemon's *own* gating decisions (review/pipeline/
-    merge-auto-drain/milestone-auto-dispatch) by tracking the file's mtime and
-    swapping in a freshly-parsed ``Config`` whenever a caller notices it moved.
-
-    Returns ``(config, mtime)`` — either *current* unchanged (no backing path,
-    a ``stat()`` failure, or no on-disk change since *last_mtime*) or a
-    freshly-loaded ``Config`` paired with its new mtime. A malformed hand-edit
-    (invalid YAML, a validation error, a permissions change, a TOCTOU race
-    where the file vanishes between our ``stat()`` and ``load()``'s read, or a
-    bad-encoding write caught mid-edit) is logged and swallowed rather than
-    raised into a request handler or the tick loop — the daemon keeps serving
-    the last-good config. *last_mtime* still advances past a bad edit so it
-    isn't re-parsed (and re-logged) on every subsequent call; it will be
-    retried once the file changes again (e.g. the edit is fixed).
+    The body used to live here (#1081); #2299 lifted it verbatim into
+    :mod:`coord.config_reload` so ``coord agent`` could reuse the exact same
+    mtime-guard + last-good-fallback semantics instead of growing a second,
+    subtly-different copy. This wrapper is behaviour-preserving: same
+    signature, same return shape, same ``coord.serve`` logger, same
+    ``"coord serve: ..."`` journal lines. See the shared helper's docstring
+    for the contract.
     """
-    path = current.path
-    if path is None:
-        return current, last_mtime
-    try:
-        mtime = path.stat().st_mtime
-    except OSError:
-        return current, last_mtime
-    if last_mtime is not None and mtime <= last_mtime:
-        return current, last_mtime
-
-    import logging  # noqa: PLC0415
-
-    from coord.config import load as _load_coordinator_config  # noqa: PLC0415
-
-    log = logging.getLogger("coord.serve")
-    try:
-        reloaded = _load_coordinator_config(path)
-    except Exception as e:  # noqa: BLE001 — a tick must never crash the daemon
-        # Broad on purpose (#1081 review): load() isn't guaranteed to only raise
-        # ConfigError — a TOCTOU race (file deleted/replaced between our stat()
-        # and load()'s own read), a permissions change (OSError), a bad-encoding
-        # write caught mid-edit (UnicodeDecodeError), or a malformed structure
-        # tripping an un-validated code path deeper in the parser (AttributeError/
-        # TypeError/KeyError) can all surface here. Swallowing them matches every
-        # other tick-loop guard in this file — an uncaught exception from this
-        # helper would otherwise either 500 a /board request or, worse,
-        # permanently kill the bare `asyncio.create_task(_tick_loop())` task with
-        # no supervisor to restart it.
-        log.warning(
-            "coord serve: %s changed on disk but failed to reload (%s: %s); "
-            "keeping last-good config until the file is fixed",
-            path,
-            type(e).__name__,
-            e,
-        )
-        return current, mtime
-    log.info("coord serve: reloaded %s (on-disk change detected)", path)
-    return reloaded, mtime
+    return reload_config_if_stale(
+        current, last_mtime, log_name="coord.serve", label="coord serve"
+    )
 
 
 def _passive_tick(config: Config) -> tuple[list[dict], list[str]]:

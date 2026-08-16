@@ -5275,3 +5275,423 @@ class TestRefusedPolicyPrune:
 
         assert "rp-2" not in server._assignments
         assert "done-rp" in server._assignments
+
+
+# ── #2299: hot config reload (adding a repo must not need a restart) ─────────
+
+def _write_config(
+    path: Path,
+    *,
+    repos: list[str],
+    repo_paths: dict[str, str],
+    capabilities: list[str] | None = None,
+    artifact_paths: dict[str, list[str]] | None = None,
+    build_commands: dict[str, str] | None = None,
+    machine_name: str = "test",
+) -> Path:
+    """Write a minimal coordinator.yml declaring *machine_name* with *repos*."""
+    artifact_paths = artifact_paths or {}
+    build_commands = build_commands or {}
+    lines = ["repos:"]
+    for name in repos:
+        lines.append(f"  - name: {name}")
+        lines.append(f"    github: acme/{name}")
+        if name in build_commands:
+            lines.append(f"    build_command: {build_commands[name]!r}")
+        if name in artifact_paths:
+            lines.append("    artifact_paths:")
+            lines.extend(f"      - {p!r}" for p in artifact_paths[name])
+    lines.append("")
+    lines.append("machines:")
+    lines.append(f"  - name: {machine_name}")
+    lines.append(f"    host: {machine_name}.tailnet")
+    lines.append(f"    capabilities: [{', '.join(capabilities or ['python'])}]")
+    lines.append(f"    repos: [{', '.join(repos)}]")
+    lines.append("    repo_paths:")
+    for name, p in repo_paths.items():
+        lines.append(f"      {name}: {p!r}")
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def _bump_mtime(path: Path, seconds_ahead: float = 5.0) -> None:
+    """Force the on-disk mtime forward so a same-second rewrite is still seen.
+
+    Some filesystems have 1s mtime resolution, so a write immediately followed
+    by another write inside one test can produce an identical mtime — which
+    the reload guard would (correctly) treat as unchanged. Mirrors the helper
+    of the same name in ``tests/test_serve.py`` for #1081.
+    """
+    new_time = path.stat().st_mtime + seconds_ahead
+    os.utime(path, (new_time, new_time))
+
+
+class TestConfigHotReload:
+    """#2299: `coordinator.yml` edits land within one health tick, no restart.
+
+    The pre-#2299 agent froze `repos`/`repo_paths`/`capabilities`/... at
+    process start, so adding a repo to the fleet required `systemctl --user
+    restart coord-agent` on every machine that should serve it — the same
+    action that kills live workers. Worse, the resulting skew was invisible
+    from the operator's side: `coord config`, `coord status` and `coord assign
+    --dry-run` all read the file and reported the repo as supported while
+    `assign()` refused every dispatch for it.
+    """
+
+    def _build(self, tmp_path: Path, **kwargs):
+        """A server whose config declares only `api`, plus a `web` repo on disk."""
+        from coord.config import load as load_config
+
+        api = _init_repo(tmp_path / "api")
+        web = _init_repo(tmp_path / "web")
+        cfg_path = _write_config(
+            tmp_path / "coordinator.yml",
+            repos=["api"],
+            repo_paths={"api": str(api)},
+        )
+        cfg = load_config(cfg_path)
+        server = AgentServer(
+            machine_name="test",
+            capabilities=["python"],
+            repos=["api"],
+            state_dir=tmp_path / "state",
+            worker_command=lambda spec: ["/bin/sh", "-c", "echo worker-output"],
+            repo_paths={"api": str(api)},
+            health_config=cfg,
+            worktree_writable_settings_files=[],
+            **kwargs,
+        )
+        return server, cfg_path, api, web
+
+    # ── the acceptance case ─────────────────────────────────────────────────
+
+    def test_repo_added_on_disk_is_dispatchable_without_restart(
+        self, tmp_path: Path
+    ) -> None:
+        """Black-box acceptance: agent serving {api}, config edited to
+        {api, web} on disk, dispatch for `web` succeeds — no restart."""
+        server, cfg_path, api, web = self._build(tmp_path)
+        try:
+            with pytest.raises(ValueError, match="does not handle repo 'web'"):
+                server.assign(_spec(web, repo_name="web"))
+
+            _write_config(
+                cfg_path,
+                repos=["api", "web"],
+                repo_paths={"api": str(api), "web": str(web)},
+            )
+            _bump_mtime(cfg_path)
+
+            a = server.assign(_spec(web, repo_name="web"))
+            final = server.wait_for(a.id)
+            assert final.exit_code == 0
+            assert server.repos == ["api", "web"]
+            assert server.repo_paths["web"] == str(web)
+        finally:
+            server.shutdown()
+
+    def test_health_advertises_new_repo_after_reload(self, tmp_path: Path) -> None:
+        """`/health` must publish the post-reload repo list, so `coord repo
+        doctor` stops reporting `machines.agent_repo_skew` on its own."""
+        server, cfg_path, api, web = self._build(tmp_path)
+        try:
+            assert server.health()["repos"] == ["api"]
+
+            _write_config(
+                cfg_path,
+                repos=["api", "web"],
+                repo_paths={"api": str(api), "web": str(web)},
+            )
+            _bump_mtime(cfg_path)
+
+            health = server.health()
+            assert health["repos"] == ["api", "web"]
+            assert health["degraded"] == {}
+            assert health["config_reload"]["reloads"] == 1
+            assert health["config_reload"]["watching"] == str(cfg_path)
+            assert health["config_reload"]["last_reload_at"] is not None
+        finally:
+            server.shutdown()
+
+    def test_unchanged_config_is_not_reparsed(self, tmp_path: Path) -> None:
+        """Steady state is a single stat(): no on-disk change → no reparse."""
+        server, cfg_path, _api, _web = self._build(tmp_path)
+        try:
+            import coord.config as coord_config_module
+
+            calls: list[Path] = []
+            original = coord_config_module.load
+
+            def _counting_load(path):
+                calls.append(path)
+                return original(path)
+
+            coord_config_module.load = _counting_load
+            try:
+                for _ in range(3):
+                    server.health()
+            finally:
+                coord_config_module.load = original
+
+            assert calls == []
+            assert server.health()["config_reload"]["reloads"] == 0
+        finally:
+            server.shutdown()
+
+    # ── malformed edits ─────────────────────────────────────────────────────
+
+    def test_malformed_config_keeps_last_good_and_does_not_loop(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A broken hand-edit must leave the agent running on the last-good
+        config, and must not be re-parsed (or re-logged) on every poll —
+        matching the board daemon's #1081 behaviour."""
+        server, cfg_path, api, _web = self._build(tmp_path)
+        try:
+            cfg_path.write_text("machines: [[[ not: valid: yaml")
+            _bump_mtime(cfg_path)
+
+            with caplog.at_level("WARNING", logger="coord.agent"):
+                first = server.health()
+                second = server.health()
+                third = server.health()
+
+            # Still serving what it served before the bad edit.
+            assert first["repos"] == ["api"]
+            assert third["repos"] == ["api"]
+            assert server.repo_paths == {"api": str(api)}
+            assert third["config_reload"]["reloads"] == 0
+            assert second["config_reload"]["reloads"] == 0
+
+            # Logged exactly once across three polls — the tracked mtime
+            # advances past a bad edit so it isn't retried in a loop.
+            assert caplog.text.count("failed to reload") == 1
+
+            # ...and a *fixed* edit is picked up on the next poll.
+            _write_config(
+                cfg_path,
+                repos=["api", "web"],
+                repo_paths={"api": str(api), "web": str(_web)},
+            )
+            _bump_mtime(cfg_path)
+            assert server.health()["repos"] == ["api", "web"]
+        finally:
+            server.shutdown()
+
+    def test_config_dropping_this_machine_keeps_last_good(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An edit that removes/renames this machine must not be adopted —
+        doing so would publish an empty repo list and refuse every dispatch."""
+        server, cfg_path, api, web = self._build(tmp_path)
+        try:
+            _write_config(
+                cfg_path,
+                repos=["api", "web"],
+                repo_paths={"api": str(api), "web": str(web)},
+                machine_name="someone-else",
+            )
+            _bump_mtime(cfg_path)
+
+            with caplog.at_level("WARNING", logger="coord.agent"):
+                health = server.health()
+
+            assert health["repos"] == ["api"]
+            assert health["config_reload"]["reloads"] == 0
+            assert "no longer declares machine 'test'" in caplog.text
+        finally:
+            server.shutdown()
+
+    def test_no_local_config_is_a_no_op(self, tmp_path: Path) -> None:
+        """Config-free / thin-client agents have no local file to watch —
+        the reload must degrade to nothing rather than raising."""
+        repo = _init_repo(tmp_path / "repo")
+        server = _server(tmp_path, repo_path=repo)  # health_config=None
+        try:
+            assert server._maybe_reload_config() is False
+            health = server.health()
+            assert health["config_reload"]["watching"] is None
+            assert health["config_reload"]["reloads"] == 0
+            assert health["repos"] == ["api"]
+        finally:
+            server.shutdown()
+
+    # ── the in-flight invariant ─────────────────────────────────────────────
+
+    def test_reload_does_not_disturb_a_live_worker(self, tmp_path: Path) -> None:
+        """A reload must never mutate state a *running* worker depends on:
+        in-flight assignments keep the values they started with, and the new
+        config governs the next dispatch onward."""
+        from coord.config import load as load_config
+
+        api = _init_repo(tmp_path / "api")
+        web = _init_repo(tmp_path / "web")
+        cfg_path = _write_config(
+            tmp_path / "coordinator.yml",
+            repos=["api"],
+            repo_paths={"api": str(api)},
+            artifact_paths={"api": ["target/release/api"]},
+            build_commands={"api": "make api"},
+        )
+        cfg = load_config(cfg_path)
+        server = AgentServer(
+            machine_name="test",
+            capabilities=["python"],
+            repos=["api"],
+            state_dir=tmp_path / "state",
+            # Blocks until the sentinel appears, so the assignment is
+            # genuinely RUNNING while the config changes underneath it.
+            worker_command=lambda spec: [
+                "/bin/sh", "-c",
+                f"while [ ! -f {tmp_path / 'go'} ]; do sleep 0.05; done; echo done",
+            ],
+            repo_paths={"api": str(api)},
+            artifact_paths={"api": ["target/release/api"]},
+            build_commands={"api": "make api"},
+            health_config=cfg,
+            worktree_writable_settings_files=[],
+        )
+        try:
+            a = server.assign(_spec(api))
+            deadline = time.time() + 10
+            while server.get(a.id).status != RUNNING and time.time() < deadline:
+                time.sleep(0.05)
+            assert server.get(a.id).status == RUNNING
+            worktree_before = server.get(a.id).worktree_path
+
+            # Hostile edit: repoint api's checkout, swap its build command and
+            # artifact globs, drop it from this machine, and add web.
+            moved = _init_repo(tmp_path / "api-moved")
+            _write_config(
+                cfg_path,
+                repos=["web"],
+                repo_paths={"web": str(web)},
+                artifact_paths={"web": ["target/release/web"]},
+                build_commands={"web": "make web"},
+            )
+            _bump_mtime(cfg_path)
+            assert server._maybe_reload_config() is True
+
+            # The live worker's repo keeps every value it started with...
+            assert server.repo_paths["api"] == str(api)
+            assert server.artifact_paths["api"] == ["target/release/api"]
+            assert server.build_commands["api"] == "make api"
+            assert str(moved) not in server.repo_paths.values()
+            # ...its process and worktree are untouched...
+            assert server.get(a.id).status == RUNNING
+            assert server.get(a.id).worktree_path == worktree_before
+            # ...while the *next* dispatch follows the new config.
+            assert server.repos == ["web"]
+            assert server.repo_paths["web"] == str(web)
+            assert server.build_commands["web"] == "make web"
+
+            (tmp_path / "go").write_text("go\n")
+            final = server.wait_for(a.id)
+            assert final.exit_code == 0
+            assert "done" in Path(final.log_path).read_text()
+
+            # Once the pin lifts (assignment terminal), the next reload drops
+            # the stale api entries entirely.
+            _bump_mtime(cfg_path)
+            server._config_mtime = None
+            assert server._maybe_reload_config() is True
+            assert "api" not in server.repo_paths
+            assert "api" not in server.build_commands
+            assert "api" not in server.artifact_paths
+        finally:
+            (tmp_path / "go").write_text("go\n")
+            server.shutdown()
+
+    def test_pin_restores_absence_not_just_values(self, tmp_path: Path) -> None:
+        """A repo that had NO build command must not acquire one mid-flight:
+        the pre-stash build would run a command the live worker never saw."""
+        server, cfg_path, api, web = self._build(tmp_path)
+        try:
+            a = AgentAssignment(
+                id="live-1", spec=_spec(api), status=RUNNING, branch="main",
+            )
+            server._assignments[a.id] = a
+
+            _write_config(
+                cfg_path,
+                repos=["api", "web"],
+                repo_paths={"api": str(api), "web": str(web)},
+                artifact_paths={"api": ["target/release/api"]},
+                build_commands={"api": "make api"},
+            )
+            _bump_mtime(cfg_path)
+            assert server._maybe_reload_config() is True
+
+            assert "api" not in server.build_commands
+            assert "api" not in server.artifact_paths
+            assert server.repos == ["api", "web"]
+        finally:
+            server._assignments.clear()
+            server.shutdown()
+
+    # ── hot vs restart-only ─────────────────────────────────────────────────
+
+    def test_capabilities_are_hot(self, tmp_path: Path) -> None:
+        """`capabilities` gates coordinator-side smoke/review routing off the
+        published /health list; nothing in the worker path reads it, so a
+        capability that disappears simply stops attracting new work."""
+        server, cfg_path, api, _web = self._build(tmp_path)
+        try:
+            _write_config(
+                cfg_path,
+                repos=["api"],
+                repo_paths={"api": str(api)},
+                capabilities=["python", "rust"],
+            )
+            _bump_mtime(cfg_path)
+
+            assert server.health()["capabilities"] == ["python", "rust"]
+        finally:
+            server.shutdown()
+
+    def test_restart_only_fields_are_not_reloaded(self, tmp_path: Path) -> None:
+        """`providers`, `bash_wrap_spawn` and `first_output_timeout` are
+        documented restart-only — a live worker holds a resolved provider, and
+        the other two are process tuning uvicorn/`_spawn` already committed
+        to. A reload must leave all three exactly as they were."""
+        sentinel = object()
+        server, cfg_path, api, web = self._build(
+            tmp_path,
+            providers={"stub": sentinel},
+            bash_wrap_spawn=False,
+            first_output_timeout=12.5,
+        )
+        try:
+            _write_config(
+                cfg_path,
+                repos=["api", "web"],
+                repo_paths={"api": str(api), "web": str(web)},
+            )
+            _bump_mtime(cfg_path)
+            assert server._maybe_reload_config() is True
+
+            assert server._providers == {"stub": sentinel}
+            assert server.bash_wrap_spawn is False
+            assert server.first_output_timeout == 12.5
+        finally:
+            server.shutdown()
+
+    def test_reload_busts_the_local_health_cache(self, tmp_path: Path) -> None:
+        """The H-1 block in /health is built from the loaded Config's
+        checkouts — a cache left in place would keep republishing the
+        pre-reload repo set for a full TTL, i.e. the same skew one layer
+        down."""
+        server, cfg_path, api, web = self._build(tmp_path)
+        try:
+            server._local_health_cache = (time.time(), {"stale": True})
+            _write_config(
+                cfg_path,
+                repos=["api", "web"],
+                repo_paths={"api": str(api), "web": str(web)},
+            )
+            _bump_mtime(cfg_path)
+            assert server._maybe_reload_config() is True
+            assert server._local_health_cache is None
+            assert server._health_config.path == cfg_path
+        finally:
+            server.shutdown()
