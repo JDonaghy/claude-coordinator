@@ -4416,9 +4416,26 @@ class AgentServer:
     #:                          capability that disappears simply stops
     #:                          attracting new work (degrade) instead of
     #:                          stranding anything in flight.
+    #:   * ``providers``      — #2326: rebuilt from ``providers.definitions``
+    #:                          at DISPATCH time (``assign()``, before
+    #:                          ``_resolve_provider``), not on a timer — that
+    #:                          is the only moment the answer matters. Before
+    #:                          #2326 this dict was parsed once at startup and
+    #:                          never invalidated, so an agent with its own
+    #:                          local ``coordinator.yml`` silently ran on a
+    #:                          days-stale provider definition (wrong model,
+    #:                          missing env) even though every coordinator-
+    #:                          side surface (``coord config``, the daemon's
+    #:                          own ``build_provider(...)``) showed the edit
+    #:                          as live. Any provider name in use by a
+    #:                          PENDING/RUNNING assignment is pinned to its
+    #:                          pre-reload entry (present or absent) —
+    #:                          swapping a live worker's provider identity
+    #:                          mid-flight (model, env, log-parser shape)
+    #:                          remains forbidden; only the NEXT dispatch
+    #:                          sees the new definition.
     #:
     #: RESTART-ONLY (documented at their assignment sites in ``__init__``):
-    #:   * ``providers``      — a live worker holds a resolved provider.
     #:   * ``bash_wrap_spawn`` / ``first_output_timeout`` — process tuning.
     #:   * bind host/port     — uvicorn has already bound the socket.
     _RELOADABLE_FIELDS = (
@@ -4427,6 +4444,7 @@ class AgentServer:
         "artifact_paths",
         "build_commands",
         "capabilities",
+        "providers",
     )
 
     def _maybe_reload_config(self) -> bool:
@@ -4491,6 +4509,40 @@ class AgentServer:
             self._apply_reloaded_config(reloaded, machine)
             return True
 
+    def _rebuild_providers(self, cfg: "Any") -> "dict[str, object] | None":
+        """Build a fresh provider registry from *cfg*'s ``providers.definitions``.
+
+        Mirrors the startup-time loop in
+        ``coord.commands.agent_ops._resolve_agent_startup`` (``build_provider``
+        for every entry), but — unlike startup — must never raise. A typo'd
+        ``providers.definitions`` entry reaching this agent via a hot reload
+        must not take a running daemon down; ``reload_config_if_stale``
+        already applies that same fail-soft contract to a malformed YAML
+        edit, and a config that parses fine but names an unknown provider
+        ``type`` deserves the identical treatment. Returns ``None`` (rather
+        than a partial dict) on any failure, so the caller keeps the
+        entire previous registry until the edit is fixed — matching the
+        "keep last-good config" behaviour for a bad ``coordinator.yml``.
+        """
+        from coord.providers import build_provider  # noqa: PLC0415
+
+        fresh: dict[str, object] = {}
+        try:
+            for name, defn in cfg.providers.definitions.items():
+                fresh[name] = build_provider(name, defn, cfg.models)
+        except Exception as exc:  # noqa: BLE001 — never let a bad edit kill the agent
+            _log.warning(
+                "coord agent: %s's providers.definitions failed to rebuild "
+                "(%s: %s); keeping the previous provider registry (%s) "
+                "until the edit is fixed",
+                cfg.path,
+                type(exc).__name__,
+                exc,
+                sorted(self._providers) if self._providers else "none configured",
+            )
+            return None
+        return fresh
+
     def _apply_reloaded_config(self, cfg: "Any", machine: "Any") -> None:
         """Swap the reloadable fields in place, pinning anything in flight.
 
@@ -4510,6 +4562,17 @@ class AgentServer:
         advertise *new* work only, so removing a repo correctly means "take no
         more dispatches for it", not "abandon the worker already running".
 
+        #2326: ``providers`` gets the exact same pin treatment, keyed by
+        provider *name* instead of repo name. A provider name in use by a
+        PENDING/RUNNING assignment keeps its pre-reload instance (including
+        absence) — ``_reap`` re-resolves the same ``spec`` after the worker
+        exits (to pick a log parser), and it must get back the SAME provider
+        identity ``assign()``/``_spawn()`` resolved, not one a reload swapped
+        underneath it (different model/env/log-parser shape). Any provider
+        name with no in-flight assignment is free to pick up the new
+        definition immediately — that is the entire point of #2326: the next
+        *dispatch*, not the next restart, sees a config edit.
+
         Every field is *rebound* to a freshly-built list/dict rather than
         mutated in place, so the many unsynchronized readers elsewhere in this
         class (``_servable_repos``, ``_stash_artifacts``, ``assign``, ...) see
@@ -4525,6 +4588,11 @@ class AgentServer:
         new_build_commands: dict[str, str] = {
             r.name: r.build_command for r in cfg.repos if r.build_command
         }
+        # #2326: built outside the lock — `build_provider` is pure
+        # construction (no I/O), but there is no reason to hold `self._lock`
+        # across it. `None` means "rebuild failed, keep the old registry
+        # verbatim" (see `_rebuild_providers`'s docstring).
+        new_providers = self._rebuild_providers(cfg)
 
         def _pin(old: dict, new: dict, keys: "Iterable[str]") -> None:
             """Restore *old*'s entry for each pinned key — including absence."""
@@ -4553,6 +4621,25 @@ class AgentServer:
             self.repo_paths = new_repo_paths
             self.artifact_paths = new_artifact_paths
             self.build_commands = new_build_commands
+
+            providers_changed = False
+            providers_added: list[str] = []
+            providers_removed: list[str] = []
+            if new_providers is not None:
+                in_flight_providers = {
+                    a.spec.provider
+                    for a in self._assignments.values()
+                    if a.status in (PENDING, RUNNING) and a.spec.provider is not None
+                }
+                old_providers = self._providers
+                _pin(old_providers, new_providers, in_flight_providers)
+                providers_added = [p for p in new_providers if p not in old_providers]
+                providers_removed = [p for p in old_providers if p not in new_providers]
+                providers_changed = bool(providers_added or providers_removed) or any(
+                    new_providers[p] is not old_providers.get(p) for p in new_providers
+                )
+                self._providers = new_providers
+
             self._health_config = cfg
             self._config_reloads += 1
             self._config_reloaded_at = time.time()
@@ -4565,7 +4652,7 @@ class AgentServer:
 
         _log.info(
             "coord agent: applied config reload from %s — repos=%s "
-            "(added=%s removed=%s) capabilities=%s%s",
+            "(added=%s removed=%s) capabilities=%s%s%s",
             getattr(cfg, "path", None),
             new_repos,
             added or "[]",
@@ -4575,6 +4662,16 @@ class AgentServer:
                 f" (pinned in-flight repos: {sorted(in_flight)})"
                 if in_flight
                 else ""
+            ),
+            (
+                # #2326: separate clause so a provider-only edit (the #2321
+                # incident this issue describes) shows up even when no repo
+                # changed at all.
+                f" providers={'unchanged' if not providers_changed else sorted(self._providers)}"
+                f"{f' (added={providers_added})' if providers_added else ''}"
+                f"{f' (removed={providers_removed})' if providers_removed else ''}"
+                if new_providers is not None
+                else " providers=rebuild failed, kept previous registry"
             ),
         )
 
@@ -4681,6 +4778,29 @@ class AgentServer:
                 "watching": str(watched_config) if watched_config else None,
                 "reloads": self._config_reloads,
                 "last_reload_at": self._config_reloaded_at,
+                # #2326: this agent's own last-observed mtime of `watching`
+                # (seeded from the file at startup, advanced on every
+                # reload attempt — including a swallowed bad edit, see
+                # `reload_config_if_stale`). `coord status` can diff this
+                # against the coordinator's own mtime for the SAME path to
+                # flag an agent whose config — and therefore whose
+                # `provider_names` below — predates the edit, without
+                # needing to probe `/proc/<pid>/environ` on the worker to
+                # notice (the failure mode that made #2326 a live-process
+                # investigation instead of a one-line `coord status` read).
+                # `None` for a config-free/thin-client agent, same as
+                # `watching`.
+                "config_mtime": self._config_mtime,
+                # #2326: the provider names THIS process would actually
+                # resolve `spec.provider` against right now — i.e. the keys
+                # of `self._providers`, refreshed at dispatch time (see
+                # `_apply_reloaded_config`). Lets `coord status` compare this
+                # list (or `config_mtime` above) against the coordinator's
+                # `providers.definitions` and flag drift directly, instead of
+                # every surface short of the worker's own process agreeing
+                # while the running registry is actually stale — exactly the
+                # split-brain #2326 describes.
+                "provider_names": sorted(self._providers) if self._providers else [],
             },
         }
 
@@ -5940,7 +6060,36 @@ class AgentServer:
         if spec.provider is None:
             return None
         if spec.provider in self._providers:
-            return self._providers[spec.provider]
+            local = self._providers[spec.provider]
+            if spec.provider_def is not None:
+                # #2326: step 2 (local override) is winning over a wire
+                # provider_def the coordinator DID send — the precedence is
+                # deliberate (see docstring), but before this the decision
+                # left no trace, which is why a days-stale local registry
+                # silently shadowing a fresh coordinator edit took a live
+                # `/proc/<pid>/environ` probe to catch instead of a log
+                # line. Env keys only (not values) — provider env commonly
+                # carries API keys/tokens, and the point here is "does this
+                # instance carry the key the coordinator's does", not the
+                # secret itself.
+                try:
+                    local_env_keys = sorted(local.env())  # type: ignore[attr-defined]
+                except Exception:  # noqa: BLE001 — logging must never break dispatch
+                    local_env_keys = None
+                wire_env_keys = sorted((spec.provider_def or {}).get("env") or {})
+                _log.info(
+                    "coord agent: provider %r resolved from this agent's "
+                    "local providers.definitions (env keys=%s), overriding "
+                    "the coordinator's wire-carried provider_def (env "
+                    "keys=%s) — local-wins-over-wire is deliberate "
+                    "precedence (#1796); if that's not what you expected, "
+                    "check this agent's own coordinator.yml for a stale "
+                    "definition (#2326)",
+                    spec.provider,
+                    local_env_keys,
+                    wire_env_keys,
+                )
+            return local
         if spec.provider_def is not None:
             from coord.providers import build_provider_from_wire  # noqa: PLC0415
 
