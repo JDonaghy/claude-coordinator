@@ -1873,18 +1873,35 @@ def retry(assignment_id: str, config_path: Path, acknowledge_cost: bool = False)
         # an independent inline copy of the same "branch empty → 0, repo
         # missing → None, else ask GitHub" logic.
         ahead = github_ops.branch_commits_ahead_for_assignment(assignment, cfg)
-        if ahead != 0:
-            detail = (
-                "its commit count could not be confirmed (gh lookup failed)"
-                if ahead is None
-                else f"{ahead} commit(s) present on its branch"
-            )
+        if ahead is None:
+            # #2324: a genuine lookup failure (network error, auth, rate
+            # limit, repo missing) is NOT evidence that commits exist — it's
+            # just an unanswered question. Don't assert the #1357
+            # false-positive shape or point at `--accept-advisory`, which
+            # assumes real commits are sitting on the branch; nothing here
+            # established that. Say the lookup failed and name what to
+            # check instead. (A confirmed 404 on the head branch is handled
+            # above this `is None` check — `branch_commits_ahead_for_assignment`
+            # reads that as 0, not None.)
             click.echo(
-                f"error: assignment {assignment_id} is 'advisory', and {detail} "
-                "— coord retry only re-dispatches a GENUINE zero-commit "
-                "advisory. This looks like the #1357 false-positive "
-                "signature instead; use `coord drive --accept-advisory` to "
-                "proceed with the existing commits, or inspect by hand.",
+                f"error: assignment {assignment_id} is 'advisory', and its "
+                "commit count could not be confirmed (gh lookup failed) — "
+                "coord retry only re-dispatches a GENUINE zero-commit "
+                "advisory, and a failed lookup isn't confirmation either "
+                "way. Check `gh api` access and the recorded branch/repo, "
+                "then retry; or inspect by hand: coord log "
+                f"{assignment_id}.",
+                err=True,
+            )
+            sys.exit(1)
+        if ahead != 0:
+            click.echo(
+                f"error: assignment {assignment_id} is 'advisory', and "
+                f"{ahead} commit(s) are present on its branch — coord retry "
+                "only re-dispatches a GENUINE zero-commit advisory. This is "
+                "the #1357 false-positive signature instead; use `coord "
+                "drive --accept-advisory` to proceed with the existing "
+                "commits, or inspect by hand.",
                 err=True,
             )
             sys.exit(1)
