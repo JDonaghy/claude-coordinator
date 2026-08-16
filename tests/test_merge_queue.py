@@ -1118,6 +1118,23 @@ class _ExpectedRedGh(FakeGh):
         return "new-sha"
 
 
+class _PatchIdGh(_ExpectedRedGh):
+    """#2298: `_ExpectedRedGh` + a controllable `get_branch_patch_id`, keyed
+    by the *branch* arg (either the live PR branch name or a bare
+    acceptance_sha) so a test can simulate "same content, different SHA"
+    (a pure rebase) independently of `get_branch_sha`/`branch_head_sha`.
+    """
+
+    def __init__(self, *, patch_ids: dict[str, str | None], **kw):
+        super().__init__(**kw)
+        self._patch_ids = patch_ids
+        self.patch_id_calls: list[tuple[str, str, str]] = []
+
+    def get_branch_patch_id(self, repo: str, base: str, branch: str) -> str | None:
+        self.patch_id_calls.append((repo, base, branch))
+        return self._patch_ids.get(branch)
+
+
 class TestExpectedRedClearOnMerge:
     """#2164 review (blocking finding 1): clearing `expected_red` must wait
     for the fix's own PR to actually merge into the default branch, not
@@ -1371,6 +1388,98 @@ class TestExpectedRedClearOnMerge:
         assert not coord_db.execute(
             "SELECT 1 FROM audit_log WHERE event_type = 'expected_red_clear'",
         ).fetchall()
+
+    # ── #2298: SHA mismatch ≠ content change ────────────────────────────
+
+    def test_clears_when_sha_mismatches_but_patch_id_confirms_a_pure_rebase(
+        self,
+    ) -> None:
+        """#2298: `checks_stale`/`smoke_required` force a rebase before a
+        PR sitting behind a moved base can merge at all — which rewrites
+        `branch_head_sha` even when nothing about the PR's own diff
+        changed. A patch-id match (the branch's current diff against
+        target == the diff `acceptance_sha` introduced against target)
+        must clear exactly like an exact-SHA match does, not skip."""
+        work = self._work("w1", acceptance_state="passed", acceptance_sha="old-sha")
+        board = self._board(completed=[work])
+        gh = _PatchIdGh(
+            branch_sha="new-sha",  # branch_head_sha != acceptance_sha
+            patch_ids={"worker/w1": "same-patch", "old-sha": "same-patch"},
+        )
+
+        events = process([_q("w1", size=10)], gh, board=board)
+
+        assert events[-1].kind == "expected_red_clear"
+        assert "ms01::a" in events[-1].message
+        assert "patch-id" in events[-1].message  # names the arm it took
+        assert gh.update_repo_file_calls  # the manifest text was actually edited
+
+    def test_still_skips_when_sha_mismatches_and_patch_id_also_differs(self) -> None:
+        """The counterpart: content genuinely changed after the verdict
+        was recorded (a conflict resolved differently, an extra commit) —
+        must still skip, same named event as a bare SHA mismatch."""
+        work = self._work("w1", acceptance_state="passed", acceptance_sha="old-sha")
+        board = self._board(completed=[work])
+        gh = _PatchIdGh(
+            branch_sha="new-sha",
+            patch_ids={"worker/w1": "patch-new", "old-sha": "patch-old"},
+        )
+
+        events = process([_q("w1", size=10)], gh, board=board)
+
+        assert events[-1].kind == "expected_red_clear_skipped"
+        assert not gh.update_repo_file_calls
+
+    def test_still_skips_when_patch_id_is_unavailable(self) -> None:
+        """Fail closed: a SHA mismatch with no patch-id on either side
+        (an older `gh_ops`, or a lookup failure) must skip exactly like
+        before #2298 — "cannot confirm identical" is never "confirmed"."""
+        work = self._work("w1", acceptance_state="passed", acceptance_sha="old-sha")
+        board = self._board(completed=[work])
+        gh = _PatchIdGh(branch_sha="new-sha", patch_ids={})  # every lookup -> None
+
+        events = process([_q("w1", size=10)], gh, board=board)
+
+        assert events[-1].kind == "expected_red_clear_skipped"
+        assert not gh.update_repo_file_calls
+
+    def test_patch_id_verified_clear_writes_a_distinct_durable_audit_row(
+        self, coord_db,
+    ) -> None:
+        """The rebase-not-content-change arm is queryable on its own —
+        not just implied by the eventual `expected_red_clear` row — the
+        same "name every branch" posture #2199/#2266 already established
+        for the other arms of this function."""
+        work = self._work("w1", acceptance_state="passed", acceptance_sha="old-sha")
+        board = self._board(completed=[work])
+        gh = _PatchIdGh(
+            branch_sha="new-sha",
+            patch_ids={"worker/w1": "same-patch", "old-sha": "same-patch"},
+        )
+
+        process([_q("w1", size=10)], gh, board=board)
+
+        rows = coord_db.execute(
+            "SELECT issue FROM audit_log "
+            "WHERE event_type = 'expected_red_sha_mismatch_patch_id_verified'",
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["issue"] == 1
+
+    def test_skip_remedy_points_at_a_command_that_works_post_merge(self) -> None:
+        """#2298 (also worth fixing here): the pre-#2298 advice —
+        `coord acceptance record --sha <merged sha>` — targets an open
+        issue's live work assignment. By the time this guard skips, the
+        issue this entry closed is already closed (`gh_ops.close_issue`
+        ran just before this), so that advice leads nowhere. Point at the
+        remedy that actually works from the state the operator is in."""
+        work = self._work("w1", acceptance_state="passed", acceptance_sha="an-old-sha")
+        board = self._board(completed=[work])
+        gh = _ExpectedRedGh(branch_sha="cafesha")  # branch_head_sha != acceptance_sha
+
+        events = process([_q("w1", size=10)], gh, board=board)
+
+        assert "coord acceptance expected-red api --clear --issue 1" in events[-1].message
 
 
 class _TestAuthorGateGh(FakeGh):
