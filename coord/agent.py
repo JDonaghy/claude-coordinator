@@ -3500,10 +3500,14 @@ MILESTONE_CHAT_DENY_COMMANDS: list[str] = [
     "Bash(git push *)",
     "Bash(git commit *)",
     "Bash(git reset --hard *)",
+    "Bash(git reset * --hard *)",
     "Bash(git branch -D *)",
+    "Bash(git branch * -D *)",
     "Bash(git checkout -- .)",
     "Bash(git clean -f *)",
+    "Bash(git clean * -f *)",
     "Bash(rm -rf *)",
+    "Bash(rm -fr *)",
     "Bash(coord approve *)",
     "Bash(coord merge *)",
     "Bash(coord assign *)",
@@ -3575,11 +3579,19 @@ manually verify in the rendered mock.
 MOCK_AUTHOR_DENY_COMMANDS: list[str] = [
     "Bash(gh *)",
     "Bash(git push --force*)",
+    # #2314: the entry above only matches `--force` IMMEDIATELY after
+    # `push` — a `git push --quiet --force ...` with another flag pushed
+    # in first would evade it.
+    "Bash(git push * --force*)",
     "Bash(git reset --hard *)",
+    "Bash(git reset * --hard *)",
     "Bash(git branch -D *)",
+    "Bash(git branch * -D *)",
     "Bash(git checkout -- .)",
     "Bash(git clean -f *)",
+    "Bash(git clean * -f *)",
     "Bash(rm -rf *)",
+    "Bash(rm -fr *)",
     "Bash(coord approve *)",
     "Bash(coord merge *)",
     "Bash(coord assign *)",
@@ -3599,10 +3611,14 @@ NEW_ISSUE_CHAT_DENY_COMMANDS: list[str] = [
     "Bash(git push *)",
     "Bash(git commit *)",
     "Bash(git reset --hard *)",
+    "Bash(git reset * --hard *)",
     "Bash(git branch -D *)",
+    "Bash(git branch * -D *)",
     "Bash(git checkout -- .)",
     "Bash(git clean -f *)",
+    "Bash(git clean * -f *)",
     "Bash(rm -rf *)",
+    "Bash(rm -fr *)",
 ]
 
 
@@ -3635,6 +3651,46 @@ def build_deny_prompt(deny_commands: list[str]) -> str:
         + "If you need to do something that resembles a forbidden command, STOP and output:\n"
         + "  STUCK: need to run [command] but it's on the deny-list"
     )
+
+
+def bash_deny_pattern_matches(pattern: str, command: str) -> bool:
+    """Whether *command* (a raw shell command string) is caught by a single
+    ``Bash(...)`` deny *pattern*, using the same shell-glob semantics those
+    patterns are written in throughout this module (``*`` matches any run of
+    characters, including none, and including across what would look like an
+    argv token boundary — this is a whole-string glob, not an argv-aware
+    parse).
+
+    #2314: a worker evaded ``Bash(pip install -e *)`` simply by inserting
+    another flag first (``pip install --user -e .``) — the pattern only
+    matched ``-e`` IMMEDIATELY after ``install``. This function exists so
+    that claim ("this deny list actually catches that evasion") is a
+    testable fact rather than something read off the pattern text by eye —
+    see the ``Bash(...)`` entries :data:`coord.config.DEFAULT_DENY_COMMANDS`
+    pairs for exactly this reason, and ``tests/test_worker_safety.py`` for
+    the regression tests built on top of this function.
+
+    Returns ``False`` for a *pattern* that isn't a ``Bash(...)`` rule at all
+    (e.g. an ``Edit(...)``/``Write(...)`` path rule) — those constrain a
+    different tool and never match a shell command string.
+    """
+    if not (pattern.startswith("Bash(") and pattern.endswith(")")):
+        return False
+    inner = pattern[5:-1]
+    return fnmatch.fnmatchcase(command.strip(), inner)
+
+
+def find_denying_bash_pattern(command: str, deny_commands: list[str]) -> str | None:
+    """The first pattern in *deny_commands* that blocks *command*, or ``None``.
+
+    Thin fold over :func:`bash_deny_pattern_matches` — a worker's own deny
+    list is small (single digits to low tens of entries), so a linear scan
+    needs no index.
+    """
+    for pattern in deny_commands:
+        if bash_deny_pattern_matches(pattern, command):
+            return pattern
+    return None
 
 
 # #1315: sealed-oracle path prefix that only an independent authoring type

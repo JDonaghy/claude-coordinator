@@ -516,4 +516,13 @@ def test_mock_author_deny_list_blocks_gh_and_dangerous_git():
     assert "coord merge" in denies
     # Unlike milestone-chat, mock-author DOES commit/push.
     assert "git commit" not in denies
-    assert "git push *" not in denies
+    # An ORDINARY push must stay allowed — only a force push is denied (see
+    # the two `git push ... force ...` entries below). A naive substring
+    # check for "git push *" would false-positive on #2314's reordering-safe
+    # `Bash(git push * --force*)` entry (which legitimately contains that
+    # substring as a prefix of its own, narrower pattern), so assert on the
+    # actual list membership instead: no entry is the blanket "deny every
+    # push" pattern milestone-chat/new-issue-chat use.
+    assert "Bash(git push *)" not in MOCK_AUTHOR_DENY_COMMANDS
+    assert "Bash(git push --force*)" in MOCK_AUTHOR_DENY_COMMANDS
+    assert "Bash(git push * --force*)" in MOCK_AUTHOR_DENY_COMMANDS

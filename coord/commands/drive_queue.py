@@ -1634,6 +1634,42 @@ def _fetch_cordons() -> dict[str, str]:
         return {}
 
 
+def _fetch_editable_drift() -> tuple[str, str] | None:
+    """``(repo_root, shown)`` when THIS host's own `coord` is an editable
+    checkout that has drifted off its default branch, else ``None`` (#2314).
+
+    Thin wrapper around ``coord.cli._editable_checkout_drift`` — the exact
+    same read `coord.cli._warn_if_editable_checkout_moved` uses for its
+    CLI-startup warning — reshaped to a plain ``(str, str)`` tuple so
+    :func:`coord.drive_queue.plan_tick` (a pure function; see its module
+    docstring) never has to import ``coord.cli`` or touch a ``Path``.
+    Already fail-soft/best-effort at the source (see that function's
+    docstring); this wrapper adds nothing on top beyond the reshape and the
+    ``str(repo_root)`` conversion.
+
+    Same ``"pytest" in sys.modules`` guard as
+    ``_warn_if_editable_checkout_moved`` — for the identical reason: this
+    repo's OWN test suite runs from an editable checkout on a feature
+    branch as a matter of course (that is what a worker's worktree is), so
+    without the guard every CLI-level `drive-queue tick` test would trip
+    this exact gate on itself. `coord.drive_queue.plan_tick`'s own tests
+    (tests/test_drive_queue.py) exercise the real gate logic directly via
+    its ``editable_drift`` parameter, unaffected by this guard.
+    """
+    import sys as _sys  # noqa: PLC0415
+
+    if "pytest" in _sys.modules:
+        return None
+
+    from coord.cli import _editable_checkout_drift  # noqa: PLC0415
+
+    drift = _editable_checkout_drift()
+    if drift is None:
+        return None
+    repo_root, shown = drift
+    return (str(repo_root), shown)
+
+
 def _fetch_board_view() -> BoardView:
     """Board + live drive sessions, typed.
 
@@ -2316,6 +2352,13 @@ def drive_queue_tick(
         # a rollable state.
         cordons = _fetch_cordons()
 
+        # #2314: is THIS host's own `coord` a drifted editable checkout?
+        # Escalates `coord.cli._warn_if_editable_checkout_moved` from an
+        # advisory-only startup warning (nothing unattended ever reads) to
+        # an actual refusal — see `_editable_drift_alert` and `plan_tick`'s
+        # `editable_drift` parameter for the gate itself.
+        editable_drift = _fetch_editable_drift()
+
         # #1794: the clock is the shell's to read, never `coord.drive_queue`'s.
         # It powers the startup grace window on both sides of the tick — a
         # drive launched seconds ago is `starting`, not dead, and cannot be
@@ -2342,6 +2385,7 @@ def drive_queue_tick(
             cordons=cordons,
             live_ci_gate=live_ci_gate,
             live_blocked_gate=live_blocked_gate,
+            editable_drift=editable_drift,
         )
 
         if reconcile_only:

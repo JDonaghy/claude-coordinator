@@ -2991,3 +2991,81 @@ def test_render_plan_narrates_an_entry_scoped_hold_as_a_defer_not_a_queue_stop()
         f"defer {entry_key(REPO, 2)}: waiting on {entry_key(REPO, 1)}'s deploy gate"
         in text
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# #2314: the tick refuses to launch when THIS host's own `coord` is a
+# drifted editable checkout — escalating `coord.cli`'s advisory-only
+# `_warn_if_editable_checkout_moved` warning into an actual refusal. Mirrors
+# the #2101 cordon tests in tests/test_release_cordon_2101.py: same shape
+# (host-scoped, reconciliation still runs, launch is refused before
+# capacity), different trigger.
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_the_tick_refuses_to_launch_when_this_hosts_coord_has_drifted():
+    plan = plan_tick(
+        [entry(1)],
+        board(open_=(1,)),
+        capacity=1,
+        editable_drift=("/home/dev/src/code-coordinator", "'issue-9999-scratch'"),
+    )
+
+    assert plan.launch is None
+    assert plan.drift_reason == (
+        "drifted onto 'issue-9999-scratch' (/home/dev/src/code-coordinator)"
+    )
+    # Same "say why" contract the #2101 cordon alert carries.
+    assert plan.alert is not None
+    assert "issue-9999-scratch" in plan.alert.reason
+    assert plan.alert.command == "git -C /home/dev/src/code-coordinator checkout main"
+    assert any("issue-9999-scratch" in line for line in render_plan(plan))
+
+
+def test_a_clean_checkout_launches_normally():
+    """`editable_drift=None` (the default, and what a release install or a
+    checkout still cleanly on `main` produces) must not change behaviour at
+    all — this is the overwhelming common case."""
+    plan = plan_tick(
+        [entry(1)],
+        board(open_=(1,)),
+        capacity=1,
+        editable_drift=None,
+    )
+
+    assert plan.launch is not None
+    assert plan.drift_reason == ""
+
+
+def test_a_drifted_tick_still_reconciles_so_the_drift_can_actually_be_fixed():
+    """Same #2110 reasoning the cordon gate already relies on: a refusal
+    that also froze the queue's view of reality would leave a finished
+    drive's `running` row pinning propagation forever. A drifted tick is
+    exactly `--reconcile-only`, not a frozen one."""
+    b = board(closed=(1,))
+    plan = plan_tick(
+        [entry(1, state=STATE_RUNNING, launch_host="dellserver")],
+        b,
+        capacity=1,
+        local_host="dellserver",
+        editable_drift=("/home/dev/src/code-coordinator", "'stale-branch'"),
+    )
+
+    assert plan.launch is None
+    assert [r.outcome for r in plan.reconciles] == ["done"]
+    assert plan.writes(), "the drained row must still be written back"
+
+
+def test_drift_is_checked_even_when_no_cordon_is_present():
+    """The drift gate must not accidentally be wired as cordon-only —
+    exercising it with `cordons=None`/no `local_host` (the shape a
+    single-machine dev fleet actually passes) still refuses to launch."""
+    plan = plan_tick(
+        [entry(1)],
+        board(open_=(1,)),
+        capacity=1,
+        cordons=None,
+        editable_drift=("/home/dev/src/code-coordinator", "(detached HEAD)"),
+    )
+    assert plan.launch is None
+    assert "detached HEAD" in plan.drift_reason

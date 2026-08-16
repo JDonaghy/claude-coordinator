@@ -9,8 +9,10 @@ import pytest
 from coord.agent import (
     AssignmentSpec,
     WORKER_SYSTEM_PROMPT,
+    bash_deny_pattern_matches,
     build_deny_prompt,
     default_worker_command,
+    find_denying_bash_pattern,
 )
 from coord.config import DEFAULT_DENY_COMMANDS, load
 from coord.models import WorkerPermissionsConfig
@@ -384,3 +386,150 @@ class TestNewIssueGuidanceSystemPrompt:
         assert "FORBIDDEN COMMANDS" in system_prompt
         assert guidance in system_prompt
         assert "gh issue create" in system_prompt
+
+
+# ── #2314: flag-position-insensitive deny matching ──────────────────────────
+#
+# `Bash(pip install -e *)` only matched `-e` IMMEDIATELY after `install` — a
+# worker evaded it just by putting another flag first. These tests use the
+# real matcher (`coord.agent.bash_deny_pattern_matches` /
+# `find_denying_bash_pattern`) against `DEFAULT_DENY_COMMANDS` so "this deny
+# list actually catches that evasion" is a checked fact, not a claim read off
+# the pattern text.
+
+
+class TestPipDenyEvasion:
+    def test_editable_flag_immediately_after_install_is_denied(self) -> None:
+        """The original, never-evaded case: nothing inserted before `-e`."""
+        assert find_denying_bash_pattern(
+            "pip install -e .", DEFAULT_DENY_COMMANDS
+        ) is not None
+
+    def test_break_system_packages_before_editable_flag_is_denied(self) -> None:
+        """#2314's named evasion 1: a flag pushed in BEFORE `-e` broke the
+        old pattern's immediate-adjacency requirement."""
+        assert find_denying_bash_pattern(
+            "pip install --break-system-packages -e .", DEFAULT_DENY_COMMANDS
+        ) is not None
+
+    def test_user_before_editable_flag_is_denied(self) -> None:
+        """#2314's named evasion 2."""
+        assert find_denying_bash_pattern(
+            "pip install --user -e .", DEFAULT_DENY_COMMANDS
+        ) is not None
+
+    def test_break_system_packages_after_editable_flag_is_denied(self) -> None:
+        """#2314's named evasion 3: a flag pushed in AFTER `-e` — this one
+        never actually broke the original adjacent pattern (the `-e` is
+        still right after `install`), but is pinned as a regression test
+        since it is the third form the issue names explicitly."""
+        assert find_denying_bash_pattern(
+            "pip install -e --break-system-packages .", DEFAULT_DENY_COMMANDS
+        ) is not None
+
+    def test_editable_flag_non_adjacent_to_install_generically_denied(self) -> None:
+        """Not just the two named flags — ANY flag inserted before `-e`
+        must not create a gap in coverage."""
+        assert find_denying_bash_pattern(
+            "pip install --quiet --no-cache-dir -e .", DEFAULT_DENY_COMMANDS
+        ) is not None
+
+    def test_long_editable_flag_spelling_non_adjacent_is_denied(self) -> None:
+        assert find_denying_bash_pattern(
+            "pip install --user --editable .", DEFAULT_DENY_COMMANDS
+        ) is not None
+
+    def test_python_dash_m_pip_prefix_is_still_denied(self) -> None:
+        """`python -m pip install -e .` reaches the exact same installer as
+        `pip install -e .` and must be denied identically, including with a
+        flag inserted first."""
+        assert find_denying_bash_pattern(
+            "python -m pip install --user -e .", DEFAULT_DENY_COMMANDS
+        ) is not None
+        assert find_denying_bash_pattern(
+            "python3 -m pip install --user -e .", DEFAULT_DENY_COMMANDS
+        ) is not None
+
+    def test_break_system_packages_denied_even_without_editable(self) -> None:
+        """`--break-system-packages` is independently dangerous — a plain,
+        non-editable `pip install` with it must still be denied."""
+        assert find_denying_bash_pattern(
+            "pip install --break-system-packages requests", DEFAULT_DENY_COMMANDS
+        ) is not None
+
+    def test_user_denied_even_without_editable(self) -> None:
+        assert find_denying_bash_pattern(
+            "pip install --user requests", DEFAULT_DENY_COMMANDS
+        ) is not None
+
+    def test_ordinary_pip_install_is_not_denied(self) -> None:
+        """Positive control: the new patterns must not collaterally block a
+        completely unrelated, ordinary install."""
+        assert find_denying_bash_pattern(
+            "pip install requests", DEFAULT_DENY_COMMANDS
+        ) is None
+
+    def test_package_name_containing_dash_e_is_not_denied(self) -> None:
+        """The `* -e *`/`* --editable *` forms require `-e`/`--editable` as
+        their OWN space-delimited token — a package spec that merely
+        contains the substring `-e` inside a longer name must not
+        collaterally trip the deny list."""
+        assert find_denying_bash_pattern(
+            "pip install django-extensions", DEFAULT_DENY_COMMANDS
+        ) is None
+
+
+class TestGitPushFlagReorderingEvasion:
+    """#2314's audit ask: other `Bash(...)` deny patterns have the identical
+    positional weakness whenever a real CLI lets its flags be reordered."""
+
+    def test_force_immediately_after_push_is_denied(self) -> None:
+        assert find_denying_bash_pattern(
+            "git push --force origin main", DEFAULT_DENY_COMMANDS
+        ) is not None
+
+    def test_force_after_an_inserted_flag_is_denied(self) -> None:
+        assert find_denying_bash_pattern(
+            "git push --quiet --force origin main", DEFAULT_DENY_COMMANDS
+        ) is not None
+
+    def test_dash_f_after_an_inserted_flag_is_denied(self) -> None:
+        assert find_denying_bash_pattern(
+            "git push --quiet -f origin main", DEFAULT_DENY_COMMANDS
+        ) is not None
+
+    def test_force_with_lease_is_not_denied(self) -> None:
+        """The intentional non-match: `--force-with-lease` is the sanctioned
+        safe alternative (see coord/conflict_fix.py) and must stay allowed —
+        the reordering fix must not widen the pattern into matching it."""
+        assert find_denying_bash_pattern(
+            "git push --force-with-lease origin main", DEFAULT_DENY_COMMANDS
+        ) is None
+
+    def test_rm_rf_letter_swap_is_denied(self) -> None:
+        """`rm -fr` is byte-for-byte equivalent to `rm -rf` to the real
+        `rm` binary; the deny list must not care about the letter order."""
+        assert find_denying_bash_pattern(
+            "rm -fr /tmp/scratch", DEFAULT_DENY_COMMANDS
+        ) is not None
+
+
+class TestBashDenyPatternMatcher:
+    """Direct unit tests for the matcher itself, independent of any
+    particular deny list."""
+
+    def test_non_bash_pattern_never_matches(self) -> None:
+        assert not bash_deny_pattern_matches("Edit(secrets/**)", "pip install -e .")
+
+    def test_exact_prefix_match(self) -> None:
+        assert bash_deny_pattern_matches("Bash(rm -rf *)", "rm -rf /tmp/x")
+
+    def test_no_match_returns_false(self) -> None:
+        assert not bash_deny_pattern_matches("Bash(rm -rf *)", "ls -la")
+
+    def test_find_denying_bash_pattern_returns_none_when_nothing_matches(self) -> None:
+        assert find_denying_bash_pattern("ls -la", DEFAULT_DENY_COMMANDS) is None
+
+    def test_find_denying_bash_pattern_returns_the_matching_pattern(self) -> None:
+        pattern = find_denying_bash_pattern("gh issue list", DEFAULT_DENY_COMMANDS)
+        assert pattern == "Bash(gh *)"
