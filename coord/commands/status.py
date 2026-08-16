@@ -885,7 +885,13 @@ def _health_vs_config_lines(machine, health: dict) -> list[tuple[bool, str]]:
                 "it hasn't re-read them; a dispatch to any of "
                 f"{stale} on this machine will be refused despite `coord "
                 "config`/`coord status` showing it as supported (#2219). "
-                "Restart coord-agent on this machine to pick it up.",
+                "Agents re-read coordinator.yml on their own /health poll "
+                "since #2299, so re-check in a moment before doing anything: "
+                "a gap that persists means this machine's copy of the config "
+                "is stale (`git pull` the settings checkout HERE), the edit "
+                "is malformed (`journalctl --user -u coord-agent` will say "
+                "`failed to reload`), or this agent predates #2299 "
+                "(`coord agent update`).",
             ))
         for repo in drifted:
             if repo in degraded:

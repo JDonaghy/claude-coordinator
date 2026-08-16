@@ -323,6 +323,28 @@ def _resolve_agent_startup(
         f"coord agent: config source={source} machine={machine.name} "
         f"capabilities={list(machine.capabilities)}"
     )
+    # #2299: say up front whether this process will notice a coordinator.yml
+    # edit, because the answer differs by deployment and the failure mode of
+    # guessing wrong is silent. An agent with a local file re-reads it on the
+    # next /health poll; a thin client has no local file to watch and its repo
+    # list really is fixed for the life of the process. Naming the
+    # restart-only fields here means the journal answers "do I need to
+    # restart?" without anyone having to remember the issue thread.
+    if cfg.path is not None:
+        notices.append(
+            f"coord agent: watching {cfg.path} for edits — repos, repo_paths, "
+            "capabilities, artifact_paths and build_command are re-read on the "
+            "next /health poll, no restart needed (#2299). RESTART-ONLY: "
+            "providers, concurrency (bash_wrap_spawn/first_output_timeout), "
+            "and the bind host/port."
+        )
+    else:
+        notices.append(
+            "coord agent: NOTICE config came from the daemon, not a local "
+            "file — there is nothing on this machine to re-read, so this "
+            "agent's repo list IS fixed until it restarts (#2299)."
+        )
+
     if not machine.capabilities:
         # Declaring no capabilities is legal, but it means dispatch_smoke can
         # never pick this machine for capability-gated work — say so once at

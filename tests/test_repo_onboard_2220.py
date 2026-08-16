@@ -217,8 +217,15 @@ class TestSeededHalfOnboardedFleet:
 
         skew = by_check["machines.agent_repo_skew"]
         assert skew.subject == "dellserver"
-        assert "#2219" in skew.summary
-        assert "restart coord-agent" in (skew.fix or "")
+        assert "does not call it degraded" in skew.summary
+        # #2299: agents re-read coordinator.yml on their own /health tick, so
+        # the remedy leads with "wait a poll", then the three things that can
+        # actually keep a reload from landing (stale file on THAT machine, a
+        # malformed edit, an agent too old to reload at all). Restarting a busy
+        # agent — which kills its live workers — is no longer step one.
+        assert "wait one /health poll" in (skew.fix or "")
+        assert "git pull" in (skew.fix or "")
+        assert "restart coord-agent" not in (skew.fix or "")
 
         # The two machine findings must not share a remedy — that is the whole
         # reason they are separate checks.

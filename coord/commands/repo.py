@@ -273,10 +273,13 @@ def repo_add(  # noqa: PLR0913 — one option per thing the command can set
             f"{machine} — this is the worker WORKTREE BASE"
         )
     click.echo(
-        "  3. RESTART coord-agent on each of those machines. The repo list is "
-        "frozen at process start (#2219), so a running agent will refuse every "
-        "dispatch for this repo while config says it is supported. This cannot "
-        "run while headless workers are live."
+        "  3. `git pull` the settings checkout on each of those machines. "
+        "Since #2299 a running coord-agent re-reads its own coordinator.yml "
+        "on the next /health poll and serves the repo with NO restart — but "
+        "it can only re-read the file that is actually on ITS disk. No "
+        "restart needed (and none wanted: it kills live workers). If "
+        "`coord repo doctor` still flags agent_repo_skew a poll later, check "
+        "`journalctl --user -u coord-agent` for a `failed to reload` line."
     )
     click.echo(
         "  4. add a CLAUDE.md to the repo — the Test agent auto-loads it and "

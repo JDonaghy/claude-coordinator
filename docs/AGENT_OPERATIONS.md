@@ -388,9 +388,9 @@ the `~/.coord/` symlink — #1832), adds the repo to each named machine's `repos
 and `repo_paths:`, and creates the `coord` / `tier:small` / `tier:large` labels.
 It re-parses its own edit and refuses to write if the result would not load.
 
-Then it **prints the residue it deliberately did not do** — clone, agent
-restart, `CLAUDE.md`, CI workflow, `capability_rules` — rather than pretending
-completeness. Work through that list, then:
+Then it **prints the residue it deliberately did not do** — clone, `CLAUDE.md`,
+CI workflow, `capability_rules` — rather than pretending completeness. Work
+through that list, then:
 
 ```bash
 coord repo doctor <name>        # exits non-zero on any CRIT, so it can gate
@@ -405,7 +405,7 @@ finding and its own remedy — they are not interchangeable:
 
 | finding | what it means | fix |
 | --- | --- | --- |
-| `machines.agent_repo_skew` | config declares the repo for this machine; the live agent has never re-read it (#2219) | **restart `coord-agent` there** — and not while headless workers are live |
+| `machines.agent_repo_skew` | config declares the repo for this machine; the live agent's `/health` still doesn't serve it | since #2299 agents re-read `coordinator.yml` themselves — **wait one `/health` poll and re-run**. If it persists: that agent's file is stale (`git pull` in `coord-settings` on *that* machine), the edit is malformed (check `journalctl --user -u coord-agent` for `failed to reload`), or the agent predates #2299 (`coord agent update`). A restart is the last resort, not the first |
 | `machines.clone_missing` | the agent knows the repo and reports the path absent | clone it; a restart changes nothing |
 | `machines.repo_path_missing` | no `repo_paths` entry at all | a config repair |
 | `github.coord_label_missing` | issues are live but **invisible to the Pipeline** | `gh label create coord` |
@@ -419,9 +419,53 @@ remembering to ask. It costs no extra round trip — it re-reads the `/health`
 bodies `coord doctor` already fetched. The GitHub, contents and graph layers
 need the dedicated command.
 
-Do not forget the two steps no config edit can do for you: **commit and push in
-`coord-settings`, then `git pull` on the daemon host**, and **restart each
-agent**. The repo list is frozen at agent process start.
+Do not forget the step no config edit can do for you: **commit and push in
+`coord-settings`, then `git pull` on every machine that serves the repo** — the
+fleet runs the committed config, and an agent can only re-read the file that
+actually exists on its own disk.
+
+### Agents re-read `coordinator.yml` themselves (#2299) — what is hot, what is not
+
+Adding a repo used to require `systemctl --user restart coord-agent` on every
+machine that should serve it. That is the one action that also **kills live
+workers**, so in practice a repo could only be onboarded once the whole fleet
+had gone quiet. Worse, the skew was silent and asymmetric: `coord config`,
+`coord status` and `coord assign --dry-run` all read the *file* and agreed the
+repo was supported, while the agent refused every dispatch for it.
+
+Agents now carry the same mtime-guarded reload the board daemon has had since
+#1081 (`coord.config_reload.reload_config_if_stale`), driven off the existing
+`/health` poll and the dispatch path — no new timer, no background thread.
+
+| field | behaviour |
+| --- | --- |
+| `machines[].repos` | **hot** — next `/health` poll or next dispatch |
+| `machines[].repo_paths` | **hot** |
+| `machines[].capabilities` | **hot** — routing reads the published `/health` list, so a removed capability degrades (stops attracting work) rather than stranding anything |
+| `repos[].artifact_paths` | **hot** |
+| `repos[].build_command` | **hot** |
+| `providers:` | **restart-only** — a live worker holds a provider resolved at dispatch time; swapping the registry underneath would retarget a running session |
+| `concurrency.bash_wrap_spawn`, `concurrency.first_output_timeout` | **restart-only** — process tuning `_spawn` has already committed to |
+| agent bind host/port | **restart-only** — uvicorn bound the socket at startup |
+
+Two invariants worth knowing when reading `journalctl --user -u coord-agent`:
+
+* **A malformed hand-edit does not take the agent down.** It logs `failed to
+  reload ... keeping last-good config until the file is fixed` **once** (the
+  tracked mtime advances, so a bad edit is not retried on every poll) and the
+  agent keeps serving the pre-edit config. Fix the file and the next poll picks
+  it up.
+* **A reload never disturbs a running worker.** Any repo with a PENDING or
+  RUNNING assignment keeps the `repo_paths` / `artifact_paths` /
+  `build_command` values it started with — including their *absence* — until
+  that assignment is terminal. The new config governs the next dispatch onward.
+
+`/health` publishes a `config_reload` block (`watching`, `reloads`,
+`last_reload_at`) so "did my edit land?" is answerable from `coord doctor`
+rather than an SSH. `watching: null` means that agent has no local
+`coordinator.yml` at all (config-free / thin-client, `docs/EPHEMERAL_WORKERS.md`)
+— for those, a restart *is* still the only way to change the repo list, and
+their repos come from the coordinator at dispatch time anyway.
 
 ## Install coordinator skills (`coord install-skills`, #319)
 

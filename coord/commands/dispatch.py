@@ -104,9 +104,14 @@ def _repo_capability_refusal(
     ``assign()``'s ``machine_obj.can_work_on(repo)`` check (just above this
     call site) only ever reads ``coordinator.yml`` — which the operator can
     edit any time — never the agent process actually running on that
-    machine. A repo added to config after the agent started stays invisible
-    to it until a full ``systemctl --user restart coord-agent`` (there is no
-    partial re-read today). Every pre-flight surface an operator would
+    machine. A repo added to config used to stay invisible to a running
+    agent until a full ``systemctl --user restart coord-agent``; since #2299
+    the agent re-reads its own ``coordinator.yml`` on the next ``/health``
+    poll, so the remaining ways the two can disagree are a *stale file* on
+    that machine, a malformed edit the agent refused to adopt, or an agent
+    too old to reload — all of which this refusal still catches, because it
+    compares against live ``/health`` rather than trusting either side.
+    Every pre-flight surface an operator would
     check before spending a dispatch reads config too: ``coord config``,
     ``coord status``, and — worst of all — ``coord assign ... --dry-run``,
     which is the documented way to sanity-check a dispatch before paying
@@ -169,9 +174,14 @@ def _repo_capability_refusal(
     return (
         f"{machine_obj.name!r} rejected the assignment: this agent does "
         f"not handle repo {repo!r} (supported: {live_repos}) — "
-        f"coordinator.yml lists it, but the live agent process hasn't "
-        f"re-read its config since {repo!r} was added (#2219). Restart "
-        f"coord-agent on {machine_obj.name!r} to pick it up, then retry."
+        f"coordinator.yml lists it, but the live agent process is running "
+        f"on a different repo list (#2219). Agents re-read coordinator.yml "
+        f"on their own /health poll since #2299, so retry in a moment "
+        f"first; if it persists, that machine's own copy of the config is "
+        f"stale (`git pull` the settings checkout on "
+        f"{machine_obj.name!r}), the edit is malformed (its journal will "
+        f"say `failed to reload`), or the agent predates #2299 "
+        f"(`coord agent update`)."
     )
 
 
