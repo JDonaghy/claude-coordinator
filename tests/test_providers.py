@@ -2153,6 +2153,64 @@ def test_resolve_default_provider_opencode_allowed() -> None:
     assert isinstance(provider, OpenCodeProvider)
 
 
+# ── #2317: incremental-write instructions in work.md ────────────────────────
+#
+# opencode hard-caps every request at 32,000 output tokens, shared with the
+# model's own reasoning on reasoning models — and that cap is not
+# configurable (verified against the running binary, see the issue). A
+# worker that designs the whole change before its first `write` can burn the
+# entire budget on reasoning and be truncated before it emits a single tool
+# call: a clean exit, zero commits, nothing on disk (space-invaders#1,
+# `8c95182b0749`). These are plain static-content checks on work.md's own
+# text — no real opencode binary required — that pin the instructions added
+# to head this off at the pass.
+
+
+def _opencode_work_md_text() -> str:
+    return (AGENTS_ROOT / "agents" / "work.md").read_text()
+
+
+def test_opencode_work_md_instructs_incremental_writes() -> None:
+    """work.md must tell the worker to write each file as soon as its
+    content is decided, instead of planning the whole change first — the
+    core fix for #2317."""
+    text = _opencode_work_md_text()
+    assert "incrementally" in text.lower()
+    assert "32,000 output tokens" in text
+    assert "do not" in text.lower() or "do NOT" in text
+
+
+def test_opencode_work_md_explains_truncation_loses_unwritten_work() -> None:
+    """The instruction must say *why* — a truncated turn emits no tool
+    call, so unwritten work is lost outright, not just delayed. #2317 asked
+    for this reasoning to be spelled out, not just asserted as a bare rule,
+    on the theory that a model that understands the mechanism holds the
+    line better than one following a rule it doesn't understand."""
+    text = _opencode_work_md_text()
+    assert "truncat" in text.lower()
+    assert "tool call" in text.lower()
+
+
+def test_opencode_work_md_forbids_compound_bash_commands() -> None:
+    """work.md's own permission block prefix-matches the whole bash command
+    string, so a compound command like `pwd && git status` matches no
+    `allow` entry and is denied outright (this burned the first turn of
+    claude-coordinator space-invaders#1). The instructions must tell the
+    worker to issue one command per `bash` call."""
+    text = _opencode_work_md_text()
+    assert "one command per" in text.lower()
+    assert "&&" in text
+
+
+def test_opencode_work_md_warns_denial_reprints_full_ruleset() -> None:
+    """A denied bash/edit call returns the entire permission ruleset back
+    to the model — noisy and more than it needs. work.md should tell the
+    worker not to probe for what's allowed and instead work within the
+    documented allow list the first time."""
+    text = _opencode_work_md_text()
+    assert "ruleset" in text.lower() or "permission list" in text.lower()
+
+
 # ── #1705: real end-to-end enforcement proof ────────────────────────────────
 #
 # Everything above this line tests coord's OWN code (argv construction, env

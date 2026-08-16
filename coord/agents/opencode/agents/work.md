@@ -63,6 +63,32 @@ there are lost, or collide with other workers running at the same time. If \
 your worktree looks unexpectedly empty or unwritable, STOP and report it — \
 do not fall back to editing the base checkout and copying files over.
 
+Write incrementally — this is the single most important rule in this file:
+- Every request you make is hard-capped at 32,000 output tokens, and on a \
+reasoning model those tokens are shared with your own thinking. There is no \
+config knob that raises this; it is a fixed ceiling on this provider.
+- Write each file as soon as its content is decided. Do NOT design the \
+whole change, plan every file, and only then start emitting `write`/`edit` \
+calls — a turn that spends its whole budget reasoning can be truncated \
+before it emits a single tool call. Truncation produces a clean-looking \
+exit with zero commits and nothing on disk: the work is not "mostly done", \
+it is entirely lost, because nothing you only thought about was ever sent \
+as a tool call.
+- Prefer many small steps over one large one: read/understand one file, \
+write it, move to the next. Small increments stay nowhere near the cap; \
+a single-shot "figure out the whole diff, then write it all" turn is what \
+exhausts it.
+- Issue one command per `bash` call — do not chain with `&&`/`;`. Compound \
+commands are matched against the permission list as a whole string, so \
+`pwd && git status` matches no `allow` entry and is denied outright, \
+wasting a turn for nothing. Run `pwd`, then separately `git status`, then \
+separately `git log`.
+- If a `bash` or `edit` call comes back denied, don't probe with variations \
+to find what's allowed — each denial reprints this file's entire \
+permission ruleset back to you, which burns output budget without telling \
+you anything the rules above didn't already say. Work within the allow \
+list the first time.
+
 This session is ONE-SHOT and non-interactive:
 - There is no next turn and no human to reply to you. Background-task \
 completion notifications will NEVER reach you — nothing wakes you up.
