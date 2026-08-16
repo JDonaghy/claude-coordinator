@@ -1,7 +1,7 @@
-▎B│  ⋮ 4 more above                   [ [A]dd ]  [ [N]otify ]  [ [R]etry ]  [ [P]urge ]                                 
- M│ ⌕ Filter issues…                  #101 Fix login race… ×  #102 Auth token ref… ×  [#103 Race condition… ×]          
- ▶│                                   [Board]   Issue    Chat    Terminal                                               
- >│▾ claude-coordinator                                                                                                 
+▎B│ ⌕ Filter issues…                  [ [A]dd ]  [ [N]otify ]  [ [R]etry ]  [ [P]urge ]                                 
+ M│                                   #101 Fix login race… ×  #102 Auth token ref… ×  [#103 Race condition… ×]          
+ ▶│▾ claude-coordinator               [Board]   Issue    Chat    Terminal                                               
+ >│  ⋮ 1 more above                                                                                                     
  ▦│  #102 Auth token refresh bug       claude-coordinator #103                                                          
  ≣│▸ #103 Race condition in poller      Race condition in poller                                                        
  ◆│  #104 Flaky CI on macOS runners                                                                                     

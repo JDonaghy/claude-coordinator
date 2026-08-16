@@ -95,6 +95,10 @@ A preview tab's label is additionally prefixed `"∘ "` (§1), pushing the same
 20-column budget out by those 2 columns (i.e. `"∘ #<N> <title>"` truncates at 22
 total columns) — the marker is never itself truncated away.
 
+**This 20/22-column budget applies to a single, undivided doc-tab strip
+(§§2–4, 7, 8). A split pane (§9) uses its own, narrower, separately-pinned
+14/16-column budget** — see §9 for the split-pane value and why it differs.
+
 **Testable:** `driver.screen_contains("#101")`, `driver.screen_contains("#102")`,
 `driver.screen_contains("#103")` are all `true` in `mocks/board-pinned-3-tabs.screen`.
 
@@ -134,18 +138,40 @@ since it is the black-box behaviour `mocks/board-preview-tab.screen` and
 - Single-click row #103 next (#102 still a preview) → strip **still** contains
   exactly one `×` and now shows `#103`, not `#102` — the replace-in-place case.
 - Double-click row #101, then single-click row #102 → strip contains **two** `×`
-  occurrences (`#101` pinned, `#102` preview) — see `mocks/board-pinned-3-tabs.screen`
-  for the 3-pinned-tab end state of this sequence extended one row further (#103
-  double-clicked too).
+  occurrences (`#101` pinned, `#102` preview) — a distinct 2-tab intermediate
+  state, **not** depicted in any mock; do not confuse it with the bullet below.
+- Double-click row #101, then double-click row #102, then double-click row #103
+  (each row not yet open at the moment it is clicked) → strip contains **three**
+  `×` occurrences, all pinned, none carrying the `∘ ` marker, `#103` active —
+  see `mocks/board-pinned-3-tabs.screen` for this exact end state. Tracing it
+  through rules 1/3/4: dbl-click `#101` → not open, no preview exists yet →
+  append `#101` as preview, activate, then promote to pinned
+  (`[#101 pinned]`). dbl-click `#102` → not open; no preview exists (the only
+  open tab, `#101`, is already pinned) → append `#102` as preview, activate,
+  promote to pinned (`[#101 pinned, #102 pinned]`). dbl-click `#103` → same
+  reasoning (no preview exists) → append, activate, promote
+  (`[#101 pinned, #102 pinned, #103 pinned]`, `#103` active) — matching the
+  mock's bracketed `[#103 … ×]`. **This is a different sequence from the
+  single/double bullet above and does not extend it** — starting from
+  `[#101 pinned, #102 preview]` and double-clicking not-yet-open `#103` would
+  instead hit rule 1's preview-exists branch (a preview tab, `#102`, already
+  exists) and **replace `#102` in place** before promoting, landing on
+  `[#101 pinned, #103 pinned]` (2 tabs, `#102` evicted) — not the 3-tab mock.
+  Only three separate double-clicks, each landing while no preview tab is open,
+  reach the state `mocks/board-pinned-3-tabs.screen` depicts.
 
 ### 2f. Reveal-on-activate
 
 Activating a tab (by any path — click, `Ctrl-Tab`, promote) selects the matching
 sidebar row **and scrolls it into view**. `mocks/board-pinned-3-tabs.screen`
 depicts this concretely: the sidebar's issue list has 5 rows total, but the
-visible window starts at `#102` (not `#101`) with a `"⋮ 4 more above"` marker row
-at the very top and `▸ #103` (the active tab's issue) visible and marked — proof
-the scroll position moved, not just that a `▸` glyph appeared somewhere off-screen.
+visible window starts at `#102` (not `#101`) with a `"⋮ 1 more above"` marker row
+(one row, since only the single issue `#101` is scrolled out) rendered within
+the scrollable list area, directly below the `▾ claude-coordinator` tree header
+and above `#102` — **not** above the `⌕ Filter issues…` search box, which stays
+fixed at the top of the sidebar regardless of scroll state — and `▸ #103` (the
+active tab's issue) visible and marked — proof the scroll position moved, not
+just that a `▸` glyph appeared somewhere off-screen.
 
 **Testable:** with 5 issues in the fixture and the viewport short enough that not
 all 5 fit, activating the tab for the issue nearest the bottom must make
@@ -199,17 +225,28 @@ a screen grid alone proves.
 ## 4. Close, navigate, overflow, empty state (#2283)
 
 `mocks/board-tabs-overflow.screen` — 5 Board tabs open, only 4 fit the strip
-width; the active tab (`#105`) is kept on-screen; `‹` renders at the strip's left
-edge (tabs before the scroll offset exist) and `›` at the right edge (more tabs
-beyond). Reuse `TabBar::fit_active_scroll_offset` / `correct_scroll_offset` per
-the issue's own design note — **do not** hand-roll a second fit-to-width
-algorithm; this contract does not re-derive that algorithm's math, it only pins
-that `‹`/`›` are the rendered overflow glyphs and that the active tab is never
-scrolled off both ends simultaneously.
+width; the active tab (`#105`, also the fixture's last/highest issue) is kept
+on-screen. Because `#105` is both the active tab *and* the actual rightmost tab
+in the fixture (there is no 6th tab beyond it), the strip scrolls to show
+`#102`–`#105`: `#101` is scrolled out to the left, so `‹` renders at the strip's
+left edge, but nothing is scrolled out to the right, so **`›` is absent** — per
+the rule stated two paragraphs below, `›` only renders when tabs exist beyond
+the rightmost visible one, which is not the case here. Reuse
+`TabBar::fit_active_scroll_offset` / `correct_scroll_offset` per the issue's own
+design note — **do not** hand-roll a second fit-to-width algorithm; this
+contract does not re-derive that algorithm's math, it only pins that `‹`/`›` are
+the rendered overflow glyphs and that the active tab is never scrolled off both
+ends simultaneously. (`›` is exercised the same way `‹` is here, just from the
+other direction — e.g. activating `#101` instead of `#105` in this same fixture
+would scroll to show `#101`–`#104` with `›` present and `‹` absent — no separate
+mock is needed to pin that symmetry, but a test-author asserting `›` should
+drive that case, not this mock.)
 
 **Testable:**
 - `driver.screen_contains("‹")` is `true` when the leftmost open tab is scrolled
-  out; `driver.screen_contains("›")` is `true` when the rightmost is.
+  out; `driver.screen_contains("›")` is `true` when the rightmost is. In
+  `mocks/board-tabs-overflow.screen` specifically, `‹` is present and `›` is
+  **absent** (see above) — do not assert `›` against this mock.
 - The active tab's `#<N>` substring is always present in the strip row while that
   tab is active, regardless of scroll offset.
 - Clicking a tab's `×` closes exactly that tab (verify via the `#<N>` count in the
@@ -410,6 +447,20 @@ everything below it is duplicated per pane). Each pane owns its own doc-tab
 strip, active tab and preview slot — the §2/§3 model applied one level deeper,
 per-pane-within-scope rather than per-scope.
 
+**Split-pane tab label truncation is a separate, narrower, pinned constant: 14
+columns (16 for a preview tab, i.e. the same `+2` marker rule as §2b, just
+applied to the smaller base) — not the §2b single-pane 20/22 budget.** At the
+default 50/50 split of the 82-column main panel (minus 1 column for the `║`
+divider itself), each pane gets roughly 40 columns of content width; 14/16 is
+picked, following the same reasoning as Notes §10.4, to keep 2 tabs visible per
+pane at that width without early truncation on the fixture's ~25-char titles.
+This is **not** derived by halving 20/22 (which would be 10/11) — it is its own
+pinned value, chosen for on-screen legibility, exactly as §2b's 20/22 is its own
+pinned value rather than a derived one. `mocks/board-split-side-by-side.screen`
+row 2 (the doc-tab strip row) is the truthful rendering of this budget: left
+pane `"#101 Fix logi… ×  [#102 Auth tok… ×]"` (two 14-col labels) and right
+pane `"[∘ #103 Race con… ×]"` (one 16-col preview label, `"∘ "` + 14-col base).
+
 **Pinned key bindings** (the issue lists the *verbs* — split right, split down,
 focus-pane movement, close pane — without pinning keys; this contract pins them,
 following this app's existing `Ctrl-W`-as-pane-leader convention already shipped
@@ -418,7 +469,7 @@ for the Terminal panel, `"Ctrl-W h = side panel"` etc.):
 | Key | Action |
 |---|---|
 | `Ctrl-W v` | split the focused pane right |
-| `Ctrl-W s` | split the focused pane down *(reserved for a future non-side-by-side layout; ms-65 only ships side-by-side / `v`, see Notes §10.3)* |
+| `Ctrl-W s` | split the focused pane down *(reserved for a future non-side-by-side layout; ms-65 only ships side-by-side / `v`, see Notes §10.2)* |
 | `Ctrl-W w` | move focus to the next pane |
 | `Ctrl-W x` | close the focused pane (if it is not the last pane in the scope) |
 
@@ -468,7 +519,11 @@ for the Terminal panel, `"Ctrl-W h = side panel"` etc.):
    no existing `TAB_LABEL_MAX` or similar). Picked to keep 3–4 tabs visible in
    the 82-column main panel without early truncation on short titles; revisit if
    real issue titles in this repo run meaningfully longer than the ~25-char
-   fixture titles used here.
+   fixture titles used here. **The split-pane variant (14 / 16 columns, §9) is
+   a second, independently-picked constant for the same reason, scaled to each
+   pane's roughly-40-column width rather than derived from the 20/22 value** —
+   both are this contract's proposals, not codebase constants, and either may
+   need revisiting together if real titles run longer.
 
 5. **§6's `tabs.json` shape is likewise this contract's proposal**, not lifted
    from an existing file — `workspace.json` and `settings.toml` are each
@@ -498,7 +553,7 @@ for the Terminal panel, `"Ctrl-W h = side panel"` etc.):
 | `mocks/board-preview-tab.screen` | Single click opens one preview tab (`∘` marker, bracketed active) | #2282 §2b–2e, §8a present-hint reference |
 | `mocks/board-pinned-3-tabs.screen` | Headline: 3 pinned Board tabs, reveal-on-activate scrolls the sidebar | #2282 §2c/§2f, #2284 §3b (left half of the independence pair) |
 | `mocks/pipeline-tabs-independent.screen` | Pipeline's own 2-tab set (disjoint issue numbers), no toolbar row so the strip is first | #2284 §3a/§3b (right half of the independence pair) |
-| `mocks/board-tabs-overflow.screen` | 5 tabs, only 4 fit — `‹ ›` overflow arrows, active tab always visible | #2283 §4 |
+| `mocks/board-tabs-overflow.screen` | 5 tabs, only 4 fit — `‹` overflow arrow (rightmost tab is the fixture's actual last tab, so `›` does not apply in this mock, see §4), active tab always visible | #2283 §4 |
 | `mocks/board-tab-context-menu.screen` | Right-click a tab — Close / Close others / Close all / Pin tab | #2287 §8c |
 | `mocks/board-tabs-help-overlay.screen` | `?` overlay — tab + split key bindings | #2287 §8b |
 | `mocks/board-split-side-by-side.screen` | Panel split into two tab groups, `║` divider, shared toolbar | #2288 §9 |
