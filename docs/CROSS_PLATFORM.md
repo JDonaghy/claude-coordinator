@@ -1,7 +1,7 @@
 # Cross-Platform — porting coord to macOS & Windows
 
 > **Status:** design draft / RFC (2026-07-13). Captures the target architecture for running
-> claude-coordinator natively on macOS and Windows, and for the single-machine "just my laptop"
+> code-coordinator natively on macOS and Windows, and for the single-machine "just my laptop"
 > topology. Not committed direction — a thinking artifact to react to, decomposable into a milestone
 > when we pick it up.
 >

@@ -15,7 +15,7 @@
 A small, authenticated, public web site where a customer describes what they want, and later comes
 back to **review a design and sign off on it**. Sign-off produces an **outcome definition** — a
 plain-language acceptance contract — plus an epic/milestone decomposition, which is handed to
-claude-coordinator and driven by the existing `Work → Test → Review → Merge` pipeline. Progress
+code-coordinator and driven by the existing `Work → Test → Review → Merge` pipeline. Progress
 reports back in git-free language.
 
 The customer never sees git, never sees an issue number, and never talks to a live agent.
@@ -223,7 +223,7 @@ be resisted: it would buy obscurity in exchange for a second release lane.
 live in GitHub Actions secrets and `wrangler secret put` — never in `wrangler.toml`, never in a
 committed `.dev.vars`.
 
-**MIT.** Note the asymmetry, and that it is deliberate: `claude-coordinator` is **FSL-1.1-MIT**
+**MIT.** Note the asymmetry, and that it is deliberate: `code-coordinator` is **FSL-1.1-MIT**
 (source-available, no competing service for two years, then MIT), while the portal is permissive from
 day one. The portal is an intake and sign-off surface for a coordinator fleet — without one it is a
 form that talks to nothing. The defensible part is the pipeline it feeds (gates, oracle, review), and

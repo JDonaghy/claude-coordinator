@@ -1,7 +1,7 @@
 # Platform Evolution — Component Boundaries & Migration Sequence
 
 > **Status:** design draft / RFC (2026-06-29). Captures the target architecture for evolving
-> claude-coordinator from a single-fleet local tool into a cloud-coordinated, multi-engineer
+> code-coordinator from a single-fleet local tool into a cloud-coordinated, multi-engineer
 > platform with an eventual non-technical **customer portal**. Not committed direction — a
 > thinking artifact to react to.
 >

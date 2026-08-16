@@ -122,7 +122,7 @@ Order matters loosely; the coord agent goes last.
    `~/src/<repo>` is the **worker worktree base**; never delete it to "fix" drift.
 8. **coord agent last.** Follow [`AGENT_OPERATIONS.md`](AGENT_OPERATIONS.md) end-to-end — do not
    re-derive it. **INVARIANT: `~/.coord-venv` must be a PyPI install
-   (`pip install claude-coordinator`), never editable.** Service supervision on mac is launchd, not
+   (`pip install code-coordinator`), never editable.** Service supervision on mac is launchd, not
    systemd (also #1158 / CP-3) — so `install-agent.sh` and `deploy/coord-agent.service`, which are
    the Linux fleet's source of truth for the agent's PATH (#1671), **do not apply here**. There is
    no checked-in launchd plist yet; writing one, with the PATH entry from step 5, is part of #1158 /
@@ -155,7 +155,7 @@ route to it — and **it is useful before milestone #39 lands**, which is not ob
 |---|---|
 | **coord-tui / quadraui TUI-side Rust** | `TuiDriver` renders to ratatui's `TestBackend` — no TTY, no display, fully portable |
 | **Reviews** | `claude -p` + `gh pr diff`; zero platform surface |
-| **`claude-coordinator` Python** | portable in principle (finding 1) — but unverified in practice, see below |
+| **`code-coordinator` Python** | portable in principle (finding 1) — but unverified in practice, see below |
 | **webapp (React / Vite / vitest)** | portable; Playwright too, once a `browser` capability is staged |
 
 The tui case is where the mac relieves a *current* bottleneck rather than just adding a body.

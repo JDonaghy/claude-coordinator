@@ -227,7 +227,7 @@ Neither one leads reliably. Ask "can pip resolve it?", not "is it
 published?":
 
 ```bash
-curl -s https://pypi.org/simple/claude-coordinator/ | grep -q 'claude_coordinator-X\.Y\.Z' && echo installable
+curl -s https://pypi.org/simple/code-coordinator/ | grep -q 'code_coordinator-X\.Y\.Z' && echo installable
 ```
 
 Expect per-machine variation even after that: a mirror/resolver on one
@@ -311,10 +311,10 @@ version/PID first, then choose between a drift-fix and a plain
 On the target machine:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/JDonaghy/claude-coordinator/main/install-agent.sh | bash -s -- --machine <name> --port 7433
+curl -sSL https://raw.githubusercontent.com/JDonaghy/code-coordinator/main/install-agent.sh | bash -s -- --machine <name> --port 7433
 ```
 
-This creates `~/.coord-venv`, installs `claude-coordinator` from **PyPI**, writes a `coord-agent` systemd user unit, and starts it. The agent does NOT need a git clone of the repo — the `~/src/claude-coordinator` directory should only exist on the machine where you actually develop the coordinator itself.
+This creates `~/.coord-venv`, installs `code-coordinator` from **PyPI**, writes a `coord-agent` systemd user unit, and starts it. The agent does NOT need a git clone of the repo — the `~/src/claude-coordinator` directory should only exist on the machine where you actually develop the coordinator itself.
 
 Verify:
 
@@ -1116,7 +1116,7 @@ From the coordinator machine:
 coord agent update --all
 ```
 
-This POSTs to `/update` on every machine in `coordinator.yml`, telling each agent exactly which version the coordinator wants (`target_version`). Each agent pins its pip install to that exact release (`pip install --upgrade --no-cache-dir claude-coordinator==<target_version>`) and restarts.
+This POSTs to `/update` on every machine in `coordinator.yml`, telling each agent exactly which version the coordinator wants (`target_version`). Each agent pins its pip install to that exact release (`pip install --upgrade --no-cache-dir code-coordinator==<target_version>`) and restarts.
 
 **#1886: `target_version` is resolved from PyPI's simple index — the same source `pip install -U` itself resolves against — NOT from this CLI's own `__version__`.** A stale operator install (PyPI already has a newer release than the CLI running `coord agent update`) used to silently pin the whole fleet to that stale, older version while still printing a clean `✓` on every machine. If this CLI's own version is behind PyPI's latest, the command now prints a loud warning and targets the *newer* PyPI release instead — never its own age. Pass `--version X.Y.Z` to pin to something else on purpose (a rollback, a pre-release); that skips the PyPI lookup entirely.
 
@@ -1171,7 +1171,7 @@ same machine *and* from the editable CLI in `~/src/claude-coordinator`. It is
 upgraded by exactly one thing: someone remembering to do it.
 
 ```bash
-~/.coord-cli-venv/bin/pip install --upgrade --no-cache-dir claude-coordinator==X.Y.Z
+~/.coord-cli-venv/bin/pip install --upgrade --no-cache-dir code-coordinator==X.Y.Z
 ~/.coord-cli-venv/bin/coord --version    # verify — never infer from pip's exit code
 ```
 
@@ -1631,7 +1631,7 @@ echo "agent is on <new-version>"
 Behaviour worth knowing:
 
 - The endpoint **runs `pip install --upgrade --no-cache-dir
-  claude-coordinator`** (or `git pull --ff-only` for an editable
+  code-coordinator`** (or `git pull --ff-only` for an editable
   install) in a daemon-less background thread, then `os.execv`-restarts
   **only if the version actually changed**.
 - If the installed version is already current it records
@@ -1674,8 +1674,8 @@ When `last_update.mode` is `editable (git pull)`, the agent's venv has a `pip in
 
 ```bash
 ssh <host>
-~/.coord-venv/bin/pip uninstall -y claude-coordinator
-~/.coord-venv/bin/pip install --upgrade claude-coordinator
+~/.coord-venv/bin/pip uninstall -y code-coordinator
+~/.coord-venv/bin/pip install --upgrade code-coordinator
 XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart coord-agent
 ```
 
@@ -1714,7 +1714,7 @@ If you have several editable installs to convert, you can script it (assumes SSH
 
 ```bash
 for host in precision elitebook dellserver; do
-  ssh $host '~/.coord-venv/bin/pip uninstall -y claude-coordinator && ~/.coord-venv/bin/pip install --upgrade claude-coordinator && XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart coord-agent'
+  ssh $host '~/.coord-venv/bin/pip uninstall -y code-coordinator && ~/.coord-venv/bin/pip install --upgrade code-coordinator && XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart coord-agent'
 done
 ```
 
@@ -1815,4 +1815,4 @@ chmod 600 ~/.ssh/authorized_keys   # on each agent
 
 For background on why rsync-over-SSH was chosen over direct HTTP download
 (signed URL vs key-auth tradeoffs, GC behaviour, TTL defaults), see the
-original design in [GitHub issue #305](https://github.com/JDonaghy/claude-coordinator/issues/305).
+original design in [GitHub issue #305](https://github.com/JDonaghy/code-coordinator/issues/305).
