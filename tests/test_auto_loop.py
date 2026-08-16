@@ -958,6 +958,61 @@ class TestBuildFixBriefingTestAuthor:
         assert "ensure all tests pass" in briefing.lower()
 
 
+class TestBuildFixBriefingMockAuthor:
+    """#2302: a type="mock-author" source row (Gate A) gets its own
+    fix-briefing variant instead of the generic "implement + make tests
+    pass" briefing — the diff is a specification (contract.md + rendered
+    mocks), there is no suite to run, and the diff must stay confined to
+    tests/acceptance/ms-NN/."""
+
+    def test_contains_reviewer_findings(self) -> None:
+        work = _work_assignment(type="mock-author")
+        findings = _request_changes_findings()
+        briefing = _build_fix_briefing(work, findings, iteration=1, max_iter=3)
+        assert "Missing test coverage for edge case X" in briefing
+
+    def test_does_not_instruct_making_tests_pass(self) -> None:
+        """The generic fix briefing's "ensure all tests pass" is wrong
+        guidance for a specification diff with no suite behind it — must
+        not leak into the mock-author variant."""
+        work = _work_assignment(type="mock-author")
+        findings = _request_changes_findings()
+        briefing = _build_fix_briefing(work, findings, iteration=1, max_iter=3)
+        assert "ensure all tests pass" not in briefing.lower()
+        assert "make them pass" not in briefing.lower()
+
+    def test_instructs_confining_diff_to_acceptance_dir(self) -> None:
+        work = _work_assignment(type="mock-author")
+        findings = _request_changes_findings()
+        briefing = _build_fix_briefing(work, findings, iteration=1, max_iter=3)
+        assert "tests/acceptance/ms-nn" in briefing.lower()
+        assert "request-changes" in briefing.lower()
+
+    def test_instructs_contract_and_mocks_agree_both_ways(self) -> None:
+        work = _work_assignment(type="mock-author")
+        findings = _request_changes_findings()
+        briefing = _build_fix_briefing(work, findings, iteration=1, max_iter=3)
+        assert "both directions" in briefing.lower()
+
+    def test_contains_branch_name(self) -> None:
+        work = _work_assignment(type="mock-author", branch="ms-65-gate-a")
+        findings = _request_changes_findings()
+        briefing = _build_fix_briefing(work, findings, iteration=1, max_iter=3)
+        assert "ms-65-gate-a" in briefing
+
+    def test_contains_do_not_change_branch_instruction(self) -> None:
+        work = _work_assignment(type="mock-author")
+        findings = _request_changes_findings()
+        briefing = _build_fix_briefing(work, findings, iteration=1, max_iter=3)
+        assert "do not change the branch name" in briefing.lower()
+
+    def test_contains_original_briefing(self) -> None:
+        work = _work_assignment(type="mock-author")
+        findings = _request_changes_findings()
+        briefing = _build_fix_briefing(work, findings, iteration=1, max_iter=3)
+        assert "Original briefing text." in briefing
+
+
 # ── Unit tests: _fix_model_for_iteration ─────────────────────────────────────
 
 
@@ -2424,6 +2479,87 @@ class TestDispatchFixTestAuthorType:
         assert "deny_commands" not in payload
 
 
+# ── #2302: mock-author bounce gets a type="mock-author" fix, not "work" ─────
+
+
+class TestDispatchFixMockAuthorType:
+    """A review bounce of a type="mock-author" (Gate A) row must dispatch a
+    type="mock-author" fix, not a plain type="work" fix — `coord/review.py`
+    only inverts the sealed-path tamper rule for
+    `coord.models.SEALED_PATH_AUTHOR_TYPES`, so a "work"-typed fix confined
+    to `tests/acceptance/ms-NN/**` trips "TAMPER DETECTED" on every round."""
+
+    def _dispatch(
+        self, config: Config, *, work_type: str, for_issue_number: int | None = None
+    ) -> tuple[dict, Assignment]:
+        work = _work_assignment(
+            assignment_id="ma-work-1",
+            branch="ms-65-gate-a",
+            type=work_type,
+            for_issue_number=for_issue_number,
+        )
+        board = Board(completed=[work])
+        mock_http = MagicMock()
+        mock_http.post.return_value.json.return_value = {"id": "fix-ma-1"}
+        mock_http.post.return_value.raise_for_status = MagicMock()
+
+        with patch("coord.auto_loop.record_dispatched_assignment"):
+            result = _dispatch_fix(
+                work, "Fix briefing.", board, config, iteration=1,
+                http_client=mock_http,
+            )
+
+        assert result is not None
+        sent_payload = mock_http.post.call_args.kwargs["json"]
+        return sent_payload, result
+
+    def test_payload_type_is_mock_author(self, config: Config) -> None:
+        payload, _ = self._dispatch(config, work_type="mock-author")
+        assert payload["type"] == "mock-author"
+
+    def test_assignment_type_is_mock_author(self, config: Config) -> None:
+        _, fix = self._dispatch(config, work_type="mock-author")
+        assert fix.type == "mock-author"
+
+    def test_files_forbidden_does_not_block_acceptance_path(
+        self, config: Config
+    ) -> None:
+        """The source mock-author row carries files_forbidden=[] — confirm
+        the fix dispatch doesn't add tests/acceptance/ to it."""
+        payload, _ = self._dispatch(config, work_type="mock-author")
+        assert not any(
+            "tests/acceptance" in f for f in payload["files_forbidden"]
+        )
+
+    def test_for_issue_number_carried_over(self, config: Config) -> None:
+        _, fix = self._dispatch(config, work_type="mock-author", for_issue_number=65)
+        assert fix.for_issue_number == 65
+
+    def test_work_type_bounce_is_unchanged(self, config: Config) -> None:
+        """Regression guard: a type="work" bounce still gets a plain "work"
+        fix — untouched by the mock-author addition."""
+        payload, fix = self._dispatch(config, work_type="work")
+        assert payload["type"] == "work"
+        assert fix.type == "work"
+
+
+class TestFixDispatchTypesIncludesMockAuthor:
+    """#2302: FIX_DISPATCH_TYPES must include every type `_dispatch_fix` can
+    actually emit — this is the same drift class as #1141
+    ("test-author was never added to WORK_LIKE_TYPES")."""
+
+    def test_mock_author_is_a_member(self) -> None:
+        from coord.auto_loop import FIX_DISPATCH_TYPES
+
+        assert "mock-author" in FIX_DISPATCH_TYPES
+
+    def test_all_sealed_path_author_types_are_members(self) -> None:
+        from coord.auto_loop import FIX_DISPATCH_TYPES
+        from coord.models import SEALED_PATH_AUTHOR_TYPES
+
+        assert SEALED_PATH_AUTHOR_TYPES <= FIX_DISPATCH_TYPES
+
+
 class TestProcessReviewCompletionTestAuthorType:
     """End-to-end: a `coord bounce` (via process_review_completion) of a
     request-changes review on a type="test-author" work row dispatches a
@@ -2468,3 +2604,51 @@ class TestProcessReviewCompletionTestAuthorType:
         assert "Dead monkeypatch.setattr" in sent_payload["briefing"]
         assert "Fragile assertion" in sent_payload["briefing"]
         assert "ensure all tests pass" not in sent_payload["briefing"].lower()
+
+
+class TestProcessReviewCompletionMockAuthorType:
+    """End-to-end: a `coord bounce` (via process_review_completion) of a
+    request-changes review on a type="mock-author" (Gate A) work row
+    dispatches a type="mock-author" fix carrying the reviewer's findings —
+    the #2289 shape this issue exists to fix."""
+
+    def test_full_cycle_dispatches_mock_author_fix(
+        self, config: Config, tmp_path
+    ) -> None:
+        log_file = tmp_path / "review.log"
+        log_file.write_text(
+            "REVIEW_VERDICT: request-changes\n"
+            "REVIEW_BODY:\n"
+            "- Mock depicts a state the contract's own rules can't reach\n"
+            "- Contract names a field the mocks never render\n"
+            "END_REVIEW\n"
+        )
+        work = _work_assignment(
+            assignment_id="ma-work-2",
+            branch="ms-65-gate-a",
+            type="mock-author",
+        )
+        review = _review_assignment(assignment_id="ma-review-2", review_of="ma-work-2")
+        board = _board_with(work, review)
+
+        mock_http = MagicMock()
+        mock_http.post.return_value.json.return_value = {"id": "fix-ma-2"}
+        mock_http.post.return_value.raise_for_status = MagicMock()
+
+        with patch("coord.auto_loop.record_dispatched_assignment"):
+            actions = process_review_completion(
+                review, board, config,
+                log_path=str(log_file),
+                http_client=mock_http,
+            )
+
+        assert any(a.kind == "fix_dispatched" for a in actions)
+        sent_payload = mock_http.post.call_args.kwargs["json"]
+        fix = board.active[0]
+
+        assert sent_payload["type"] == "mock-author"
+        assert fix.type == "mock-author"
+        assert "Mock depicts a state" in sent_payload["briefing"]
+        assert "Contract names a field" in sent_payload["briefing"]
+        assert "ensure all tests pass" not in sent_payload["briefing"].lower()
+        assert "make them pass" not in sent_payload["briefing"].lower()
