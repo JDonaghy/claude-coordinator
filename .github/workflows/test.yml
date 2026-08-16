@@ -56,35 +56,44 @@ jobs:
   # 2026-08-08 stall (`parked — CI running: windows`): each drive parked on it
   # and handed off, which is how five PRs piled up unmerged.
   #
-  # What that latency bought per-PR was ~nothing. The job is deliberately red
-  # and non-blocking (see below), so nothing gates on its result; its output
-  # is one number (`368 failed, ...`) that only moves when someone works on
-  # #1156. Running it per-merge keeps that baseline just as current.
+  # What that latency bought per-PR was ~nothing while the job was red by
+  # design; running it per-merge keeps the baseline just as current. Now that
+  # it is a real gate (below), per-PR coverage is worth revisiting — and the
+  # right move there is probably to keep it per-PR but shrink it to the import
+  # smoke #1895's own title describes, rather than the full suite.
   #
-  # REVISIT WHEN #1156 LANDS. Once the suite is genuinely green and blocking,
-  # per-PR coverage is worth its duration again — and at that point the right
-  # move is probably to keep it per-PR but shrink it to the import smoke
-  # #1895's own title describes, rather than the full suite.
+  # NO `continue-on-error` — THIS IS A REAL GATE NOW (#2000).
   #
-  # This job is EXPECTED TO BE RED when it lands: `coord.cli` cannot import
-  # on Windows today (`cli.py` -> `coord/interactive.py`'s unconditional
-  # `import fcntl`, a POSIX-only stdlib module). #1156 (CP-1, the import
-  # guards) is what makes this suite green — and #1156 is the one that
-  # removes the `continue-on-error` below. Until then this is a
-  # visible-but-non-blocking signal, not a real gate.
+  # History: when #1895 landed this job this was EXPECTED TO BE RED, because
+  # `coord.cli` could not import on Windows (`cli.py` -> `coord/interactive.py`
+  # unconditionally `import fcntl`, a POSIX-only stdlib module), so both steps
+  # carried `continue-on-error: true` and the job was a visible-but-
+  # non-blocking signal. Two things closed that out:
   #
-  # `continue-on-error` MUST stay on the *step*, not the job (#2026).
-  # At job level it only softens the *workflow run* conclusion; the `windows`
-  # **check** still reports `failure` to the Checks API. GitHub's own branch
-  # protection tolerates that, but `coord merge`'s CI gate does not —
-  # `coord.ci_store._PASSING_CONCLUSIONS` is {success, skipped, neutral} with
-  # no notion of a non-blocking check, so a job-level flag left every
-  # claude-coordinator PR unmergeable and stalled the drive queue overnight
-  # on 2026-08-08 (four finished PRs, everything else green). At step level
-  # the step's failure is recorded but the job exits 0, so the check is
-  # `success` and #1895's actual acceptance criterion — "it does not block
-  # merges while red" — finally holds. The failures stay fully visible in the
-  # job log; that log IS the #1156 specification and the pass/fail baseline.
+  #   1. #1156 (CP-1) landed the import guards, killing the `fcntl` failure.
+  #   2. #2000 put `tzdata; sys_platform == 'win32'` in the BASE `[project]
+  #      dependencies` (NOT a CI-only `pip install`) — Windows ships no IANA
+  #      time-zone database, so `zoneinfo` could not resolve `America/Chicago`
+  #      and the suite died during *collection*. coord/config.py,
+  #      coord/models.py, coord/failure_class.py and coord/machine_pause.py all
+  #      resolve named zones at runtime, so that was a shipped defect for every
+  #      `pip install code-coordinator` Windows user, not a test artefact.
+  #      tests/test_client_base_install.py pins it in the base deps.
+  #
+  # With both fixed the flags are gone and a Windows failure reddens this job
+  # for real. tests/test_windows_job_is_a_real_gate_2000.py is the regression
+  # guard against them creeping back.
+  #
+  # Why re-arming this cannot re-block the repo: `if: github.event_name ==
+  # 'push'` (below) means the job is SKIPPED on every `pull_request` event, and
+  # `skipped` is already in `coord.ci_store._PASSING_CONCLUSIONS` — so a red
+  # Windows run shows up on main, never on a PR's merge gate. That guard is
+  # what makes removing `continue-on-error` safe; it did not exist during the
+  # 2026-08-08 stall, when a *job-level* flag (#2026) left every
+  # claude-coordinator PR unmergeable overnight because the `windows` **check**
+  # still reported `failure` to the Checks API even though the workflow run's
+  # conclusion was softened. If this job is ever made per-PR again, that
+  # interaction is the thing to re-check first.
   #
   # Python 3.12 only, deliberately not the 3.12/3.13 matrix `test` runs above
   # — the matrix axis there is Python versions on Linux; this job's axis is
@@ -102,18 +111,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      # Both steps carry the flag, not just pytest: a Windows-only *install*
-      # failure would otherwise redden the job and re-block the whole repo
-      # exactly as a test failure did. Until #1156, this job's contract is
-      # "always report, never block" — and a failed install is every bit as
-      # visible in the log as a failed test.
+      # #2000: no `continue-on-error` on either step any more — a Windows-only
+      # install failure (a base dep that does not resolve on win32, say) is
+      # exactly as much of a real defect as a test failure, and this job now
+      # exists to fail on it. See the header for why re-arming it is safe.
       - run: pip install -e ".[dev]"
-        continue-on-error: true
       # #2180: same split as the `test` job above — the sealed acceptance
       # suite is gated separately through the #2164 CI wrapper, not swept
       # into this job's ordinary pytest run.
       - run: pytest --ignore=tests/acceptance
-        continue-on-error: true
 
   # #1484: run the full suite with `gh` made unresolvable on PATH.
   #
