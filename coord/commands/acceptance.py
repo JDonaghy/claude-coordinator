@@ -28,6 +28,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import click
 
@@ -51,6 +52,9 @@ from coord.commands._common import _CONFIG_OPTION, _load_config
 from coord.comments import format_needs_attention
 from coord.dispatch import DispatchRefused
 from coord.models import Repo
+
+if TYPE_CHECKING:  # avoid an import cycle at module load
+    from coord.models import Board
 
 
 @click.group("acceptance")
@@ -803,6 +807,75 @@ def _clear_stuck_expected_red(
         sys.exit(1)
 
 
+def _no_work_row_message(board: "Board", repo: str, issue_number: int) -> str:
+    """Build the scope-limit error for ``coord acceptance record`` when the
+    target issue has no ``work``/``plan`` assignment to stamp the verdict on
+    (#1833).
+
+    ``record``'s whole purpose is to write the external trust-gate verdict
+    onto a ``work`` row's Acceptance box (#944); without one there is no
+    work to gate and no row to record against. The refusal is a **scope
+    limit, not a fault** — the sealed slice already ran in the throwaway
+    worktree, there is just nowhere to write the result — so the message
+    names the constraint, lists what the issue *does* have on the board,
+    and points at the remedy instead of reading like a crash
+    ("cannot record verdict").
+
+    Design decision (#1833, "should a work-row-less slice be recordable at
+    all"): **no.** A recorded verdict with no work row to live on would be
+    an orphan — the Acceptance box is a field *on* the work assignment, not
+    a freestanding row, so there is literally nowhere to persist it. And
+    the trust gate exists to gate *work*; with no work in flight there is
+    nothing to gate. The operator's remedy is to dispatch the work first,
+    not to record a verdict against thin air. Gate C
+    (``coord acceptance run --all``) is a different command that only
+    *prints* a verdict and never writes to the board, so it is unaffected
+    by this guard — and ``record`` has no ``--all`` mode for exactly this
+    reason (an all-scope verdict has no single work row to stamp).
+    """
+    all_rows = [
+        a
+        for a in (board.active + board.completed)
+        if a.issue_number == issue_number and a.repo_name == repo
+    ]
+    all_rows.sort(key=lambda a: (a.dispatched_at or 0.0), reverse=True)
+
+    lines = [
+        f"error: cannot record an acceptance verdict for {repo} "
+        f"#{issue_number}: no `work` (or `plan`) assignment exists for it.",
+        "",
+        "`coord acceptance record` writes the trust-gate verdict onto a "
+        "`work` assignment's Acceptance box (#944) — that is the whole "
+        "point of the external re-run. Without a `work`/`plan` row there is "
+        "no work to gate and no row to stamp the verdict on, so this is a "
+        "scope limit, not a fault: the sealed slice ran in the throwaway "
+        "worktree, but there is nowhere to record the result.",
+        "",
+    ]
+    if all_rows:
+        lines.append(f"This issue's actual assignments ({len(all_rows)}):")
+        for a in all_rows:
+            atype = a.type or "work"
+            aid = a.assignment_id or "(no id)"
+            lines.append(
+                f"  - type={atype} status={a.status} "
+                f"machine={a.machine_name} assignment={aid}"
+            )
+    else:
+        lines.append(
+            "This issue has no assignments of any type on the board."
+        )
+    lines.append("")
+    lines.append(
+        "Next step: dispatch a `work` assignment for "
+        f"#{issue_number} (`coord assign <machine> {repo} {issue_number}`), "
+        "push its SHA, then re-run this command against that SHA. Gate C "
+        "(`coord acceptance run --all`) is unaffected — it prints a "
+        "verdict only and never writes to a work row."
+    )
+    return "\n".join(lines)
+
+
 def _acceptance_record_local(
     repo: str,
     issue_number: int,
@@ -892,11 +965,10 @@ def _acceptance_record_local(
     work_rows = stage_assignments(board, repo, issue_number, "work")
     if not work_rows:
         click.echo(
-            f"error: no work assignment found for {repo} #{issue_number}; "
-            "cannot record verdict",
+            _no_work_row_message(board, repo, issue_number),
             err=True,
         )
-        # Same rationale: a lookup error, not a failing-verdict "kept for
+        # Same rationale: a scope limit, not a failing-verdict "kept for
         # inspection" case — don't leak the worktree.
         _remove_acceptance_worktree(repo_dir, wt_path)
         sys.exit(1)

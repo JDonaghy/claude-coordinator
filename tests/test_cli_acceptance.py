@@ -954,6 +954,12 @@ acceptance:
         assert row["acceptance_state"] == "passed"
 
     def test_record_no_work_assignment_errors(self, tmp_path: Path, coord_db) -> None:
+        # #1833: the refusal when there is no `work` row is a scope limit,
+        # not a fault — the message must name the constraint (record writes
+        # to a work row's Acceptance box), say the issue has no assignments
+        # of any type here, and point at the next step. The old wording read
+        # like a crash ("cannot record verdict") and gave the operator
+        # nothing to do.
         repo_dir = tmp_path / "repo"
         sha = _init_git_repo(repo_dir, manifest={"ms01::a": 944})
 
@@ -965,13 +971,80 @@ acceptance:
             "--sha", sha, "--config", str(config_path),
         ])
         assert result.exit_code == 1
-        assert "no work assignment found" in result.output
+        # Names the constraint — a `work`/`plan` row is what record stamps.
+        assert "no `work` (or `plan`) assignment" in result.output
+        # Reads as a scope limit, not a fault.
+        assert "scope limit, not a fault" in result.output
+        # Reports the issue's actual (empty) board state.
+        assert "no assignments of any type" in result.output
+        # Gives the operator a next step.
+        assert "Next step" in result.output
+        assert "coord assign" in result.output
+        # Gate C is called out as unaffected.
+        assert "Gate C" in result.output
 
-        # #944 review: this is a lookup error (no `work` assignment for the
+        # #944 review: this is a scope limit (no `work` assignment for the
         # repo/issue), not a real failing-verdict "kept for inspection" case
         # — the throwaway worktree must not be left behind.
         wt_path = tmp_path / "acceptance-worktrees" / "coord-tui-944"
         assert not wt_path.exists(), "worktree leaked on no-work-assignment error path"
+
+    def test_record_no_work_row_lists_other_assignments(
+        self, tmp_path: Path, coord_db,
+    ) -> None:
+        # #1833 acceptance criterion: the error "list[s] what assignments it
+        # does have". When the issue has non-`work` rows (here a `review` and
+        # a `test-author`) but no `work`/`plan` row, the message must enumerate
+        # them so the operator can see why record has nothing to stamp —
+        # instead of only being told what is missing.
+        from coord import state
+
+        repo_dir = tmp_path / "repo"
+        sha = _init_git_repo(repo_dir, manifest={"ms01::a": 944})
+
+        blob = json.dumps({"tests": [{"id": "ms01::a", "status": "pass"}]})
+        config_path = _write_config(tmp_path, repo_path=str(repo_dir), run_cmd=f"echo '{blob}'")
+
+        # A `review` row and a `test-author` row for the same issue — neither
+        # is in STAGE_ASSIGNMENT_TYPES["work"] == ("work", "plan"), so
+        # `record`'s work-row lookup finds nothing.
+        state.record_dispatched(
+            assignment_id="aid-review",
+            proposal=Proposal(
+                id=1, machine_name="laptop", repo_name="coord-tui",
+                issue_number=944, issue_title="oracle loop runner", rationale="",
+                type="review",
+            ),
+            repo_github="acme/coord-tui",
+        )
+        state.record_dispatched(
+            assignment_id="aid-test-author",
+            proposal=Proposal(
+                id=2, machine_name="laptop", repo_name="coord-tui",
+                issue_number=944, issue_title="oracle loop runner", rationale="",
+                type="test-author",
+            ),
+            repo_github="acme/coord-tui",
+        )
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "record", "--repo", "coord-tui", "--issue", "944",
+            "--sha", sha, "--config", str(config_path),
+        ])
+        assert result.exit_code == 1
+        # Still names the constraint and the next step.
+        assert "no `work` (or `plan`) assignment" in result.output
+        assert "Next step" in result.output
+        # Lists the issue's actual (non-work) assignments — both rows appear,
+        # so the operator sees the issue is not empty, just work-less.
+        assert "actual assignments (2)" in result.output
+        assert "type=review" in result.output
+        assert "type=test-author" in result.output
+        assert "aid-review" in result.output
+        assert "aid-test-author" in result.output
+
+        wt_path = tmp_path / "acceptance-worktrees" / "coord-tui-944"
+        assert not wt_path.exists(), "worktree leaked on no-work-row error path"
 
     def test_record_manifest_missing_cleans_up_worktree(
         self, tmp_path: Path, coord_db,
