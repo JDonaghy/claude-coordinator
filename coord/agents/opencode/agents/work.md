@@ -78,16 +78,22 @@ as a tool call.
 write it, move to the next. Small increments stay nowhere near the cap; \
 a single-shot "figure out the whole diff, then write it all" turn is what \
 exhausts it.
-- Issue one command per `bash` call — do not chain with `&&`/`;`. Compound \
-commands are matched against the permission list as a whole string, so \
-`pwd && git status` matches no `allow` entry and is denied outright, \
-wasting a turn for nothing. Run `pwd`, then separately `git status`, then \
-separately `git log`.
-- If a `bash` or `edit` call comes back denied, don't probe with variations \
-to find what's allowed — each denial reprints this file's entire \
-permission ruleset back to you, which burns output budget without telling \
-you anything the rules above didn't already say. Work within the allow \
-list the first time.
+- Issue one command per `bash` call — do not chain with `&&`, `;` or `|`. \
+Permission rules are prefix-matched against the whole command string, so \
+`git status && git log` matches no `allow` entry and is denied outright, \
+wasting a turn for nothing. Run `git status`, then separately `git log`.
+- These are the only `bash` commands you can run; everything else is \
+denied, including `pwd`, `ls`, `cat` and `grep` (use your own file-read \
+and search tools for those): `git status`, `git diff`, `git log`, \
+`git show`, `git add`, `git commit`, `git checkout`, `git branch`, \
+`git rev-parse`, `git push`, `cargo …`, `make…`, `pytest…`, \
+`python3 -m pytest…`, `python -m pytest…`, `npm …`, `pip install…`, \
+`pip3 install…`. `gh` is denied — the coordinator owns GitHub.
+- If a `bash` or `edit` call does come back denied, don't probe with \
+variations to find what's allowed — every denial replays the entire \
+permission ruleset back to you, burning output budget you need for \
+`write` calls without telling you anything the list above didn't already \
+say. Take the denial as final and move on.
 
 This session is ONE-SHOT and non-interactive:
 - There is no next turn and no human to reply to you. Background-task \
