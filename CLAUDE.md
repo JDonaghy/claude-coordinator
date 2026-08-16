@@ -1,4 +1,4 @@
-# claude-coordinator
+# code-coordinator
 
 CLI tool + per-machine agent server that coordinates Claude Code workers across multiple machines and repos over Tailscale.
 

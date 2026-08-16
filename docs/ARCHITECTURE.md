@@ -77,7 +77,7 @@ The `coord agent` server exposes a small, JSON-only HTTP API on port 7433. Any c
 | `GET  /stream/<id>` | Server-sent events: tails the worker log |
 | `POST /cancel/<id>` | Send SIGTERM to a running worker |
 | `POST /restart` | Restart the agent process (waits for active workers up to `cancel_timeout`) |
-| `POST /update` | `pip install --upgrade claude-coordinator` then re-exec |
+| `POST /update` | `pip install --upgrade code-coordinator` then re-exec |
 | `POST /worktree-clean` | Prune stale worktrees for completed assignments |
 
 Example: dispatch a worker with curl.
@@ -273,7 +273,7 @@ Two consequences worth stating plainly, because both have cost real work:
 - **It only runs on the `coord plan` → `coord approve` path.** The drive queue dispatches
   through `coord drive` → `coord assign` and never consults the brain, so unattended work —
   which is most work — got no overlap check at all. Both same-file collisions on
-  2026-08-14 (quadraui #306/#309 against #307/#308, and claude-coordinator #2234 against
+  2026-08-14 (quadraui #306/#309 against #307/#308, and code-coordinator #2234 against
   #2230, all four appending to a single file) arrived through the queue.
 
 `claim.py` does not close this gap: it is issue-level only (an active board assignment, or

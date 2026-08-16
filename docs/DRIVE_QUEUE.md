@@ -285,7 +285,7 @@ Relaunching would just observe the same silence, so the tick parks instead —
 That promise needs the release predicate to be refreshable *without* the merge
 the park is withholding, which until #2158 it was not: the reading came from
 the raw `merge_queue` row's `error` column, which only a live `coord merge`
-attempt ever writes — and a parked entry runs none. claude-coordinator#2138
+attempt ever writes — and a parked entry runs none. code-coordinator#2138
 (2026-08-12) sat parked **7h25m** over CI that had gone green 41 seconds
 *before* the park was written, and moved only when an unrelated merge happened
 to rewrite the board. There are now two exits, and a park always has at least
@@ -463,7 +463,7 @@ host, verify first that its `coord` resolves to a non-editable install:**
 
 ```bash
 readlink -f ~/.local/bin/coord                   # which venv it resolves to
-pip show claude-coordinator | grep -i editable   # must print NOTHING
+pip show code-coordinator | grep -i editable   # must print NOTHING
 ```
 
 The topology is **per-machine, not universal** — on a dev box (e.g.
@@ -629,7 +629,7 @@ parallelism is safe: within a repo is the risky case, across repos is nearly
 free.
 
 One global counter conflated the two. With `--max-parallel 3` and a queue of 39
-claude-coordinator entries followed by one quadraui entry, a tick launched the
+code-coordinator entries followed by one quadraui entry, a tick launched the
 same-repo neighbours most likely to stale each other and never reached the
 quadraui entry that could have run alongside for free. The only way to get the
 wanted behaviour was hand-chaining `--after` across 38 entries — tedious,

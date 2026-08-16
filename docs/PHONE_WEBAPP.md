@@ -99,7 +99,7 @@ The phone webapp calls the same `GET /api/pipeline` + `POST /api/pipeline/action
 
 ## Setup: no manual build needed (PyPI ≥ 0.4.71)
 
-As of **0.4.71** the compiled React bundle (`dist/`) is bundled into the PyPI wheel by the release workflow (`npm ci && npm run build` runs before `python -m build`). A plain `pip install claude-coordinator` or `coord agent update` is all you need — no Node.js, no checkout, no `npm run build` on the dashboard host.
+As of **0.4.71** the compiled React bundle (`dist/`) is bundled into the PyPI wheel by the release workflow (`npm ci && npm run build` runs before `python -m build`). A plain `pip install code-coordinator` or `coord agent update` is all you need — no Node.js, no checkout, no `npm run build` on the dashboard host.
 
 **In production (dellserver) this is the *fallback* path, not the primary one.** `coord-web.service` runs `coord web --dist ~/coord-web-dist`, which tracks merged `main` on a 1-minute timer — see "Going live automatically (#1543)" below. The bundled-wheel path above only matters if `~/coord-web-dist` is ever absent.
 
@@ -137,7 +137,7 @@ same venv `coord-agent` and `coord-serve` `ExecStart` from on that host.
 
 `coord-web`, `coord-agent`, and `coord-serve` all `ExecStart` from
 `~/.coord-venv` (see `deploy/*.service`). Before #1543, "ship a webapp
-change" meant `pip install --upgrade claude-coordinator` on that venv — which
+change" meant `pip install --upgrade code-coordinator` on that venv — which
 also upgrades the board daemon and the agent runtime on that host, and
 `coord agent update` is already known to kill running headless workers
 (#1543's issue body). During a program that merges dozens of webapp PRs while

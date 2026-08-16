@@ -1,8 +1,8 @@
-# claude-coordinator
+# code-coordinator
 
 Coordinate a fleet of Claude Code workers — and human-attended interactive `claude` sessions — from a single board.
 
-Claude Code is great at one task at a time. Real projects have dozens of issues, spread across repos, that each want their own session, their own scoping, and their own review. `claude-coordinator` runs many workers in parallel — on one machine or across several over Tailscale — behind a coordinator that picks the model, avoids file conflicts, routes by capability, and drives the full **Work → Test → Review → Merge** pipeline. Each stage can run as a cheap `claude -p` worker *or* as a human-attended interactive session you launch and steer from the board.
+Claude Code is great at one task at a time. Real projects have dozens of issues, spread across repos, that each want their own session, their own scoping, and their own review. `code-coordinator` runs many workers in parallel — on one machine or across several over Tailscale — behind a coordinator that picks the model, avoids file conflicts, routes by capability, and drives the full **Work → Test → Review → Merge** pipeline. Each stage can run as a cheap `claude -p` worker *or* as a human-attended interactive session you launch and steer from the board.
 
 ## The problem
 
@@ -70,7 +70,7 @@ Two rules shape the flow:
 ## Quick demo
 
 ```bash
-pip install claude-coordinator     # from PyPI
+pip install code-coordinator     # from PyPI
 coord init                         # interactive setup: detects repos, writes coordinator.yml
 coord agent &                      # start the agent server (port 7433) — see Quick Start for the systemd setup
 
@@ -99,7 +99,7 @@ Prefer to drive it by hand? Launch any stage as an interactive session from `coo
 ### 1. Install
 
 ```bash
-pip install claude-coordinator
+pip install code-coordinator
 ```
 
 The `coord` CLI is now on your PATH. The same package provides the agent server (`coord agent`), so the coordinator side and the worker side share one install.
@@ -128,7 +128,7 @@ coord agent &     # port 7433; auto-detects the machine from hostname
 For anything beyond a trial, use the installer (systemd user service, auto-restart, survives reboots, separate worker logs):
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/JDonaghy/claude-coordinator/main/install-agent.sh | bash
+curl -sSL https://raw.githubusercontent.com/JDonaghy/code-coordinator/main/install-agent.sh | bash
 ```
 
 The same script sets up remote worker machines — see [Worker node setup](#worker-node-setup).
@@ -509,7 +509,7 @@ The tool encodes a pattern from real multi-agent sessions: **separate the tech l
 
 1. On the new machine, run the installer (venv + systemd service in one shot):
    ```bash
-   curl -sSL https://raw.githubusercontent.com/JDonaghy/claude-coordinator/main/install-agent.sh | bash -s -- --machine <name>
+   curl -sSL https://raw.githubusercontent.com/JDonaghy/code-coordinator/main/install-agent.sh | bash -s -- --machine <name>
    ```
    No git clone needed — `install-agent.sh` pulls from PyPI.
 2. Add the machine to `coordinator.yml` under `machines:` with its Tailscale hostname and capabilities.
@@ -522,9 +522,9 @@ For Tailscale setup, see [tailscale.com/kb](https://tailscale.com/kb/). The agen
 To add a worker machine (no repo checkout needed):
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/JDonaghy/claude-coordinator/main/install-agent.sh | bash
+curl -sSL https://raw.githubusercontent.com/JDonaghy/code-coordinator/main/install-agent.sh | bash
 # or with options:
-curl -sSL https://raw.githubusercontent.com/JDonaghy/claude-coordinator/main/install-agent.sh | bash -s -- --machine myserver --port 7433
+curl -sSL https://raw.githubusercontent.com/JDonaghy/code-coordinator/main/install-agent.sh | bash -s -- --machine myserver --port 7433
 ```
 
 This installs coord, sets up a systemd service with auto-restart, and starts the agent. Then add the machine to `coordinator.yml` and run `coord status` to verify connectivity.

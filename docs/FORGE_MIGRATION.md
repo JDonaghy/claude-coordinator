@@ -178,7 +178,7 @@ half-own this — `## Work order` is a coord-parsed representation of ordering.
 
 The point of no return. Numbering decision first, dry-run to a scratch project second,
 full marker-parse verification third, one repo at a time — `quadraui` first,
-`claude-coordinator` last, and never while a drive queue is live.
+`code-coordinator` last, and never while a drive queue is live.
 
 ### P6 — the long tail
 

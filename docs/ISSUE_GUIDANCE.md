@@ -1,4 +1,4 @@
-# Issue guidance for claude-coordinator
+# Issue guidance for code-coordinator
 
 This file is the source of truth for what a refined issue in this repo should contain. It is read at `new-issue-chat` time (per `Repo.resolve_new_issue_guidance` in `coord/models.py`) and used to shape the agent's questions and the finalised issue body.
 
