@@ -76,6 +76,12 @@ Differences from :class:`~.claude.ClaudeProvider`:
 * ``env()`` always sets ``OPENCODE_CONFIG_DIR`` (agent-file discovery, see
   above) and ``OPENCODE_CONFIG`` (the OpenRouter upstream-routing pin, see
   ``coord/agents/opencode/routing.jsonc`` and :data:`ROUTING_PIN_PATH`).
+* ``env()`` also seeds ``OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX`` to
+  :data:`OUTPUT_TOKEN_MAX_DEFAULT` (#2321) — unlike the two variables
+  above, this one *is* operator-overridable (it's a tuning knob, not a
+  safety mechanism); see :meth:`env`'s docstring for why it sits on the
+  opposite side of ``self._env`` from ``OPENCODE_CONFIG_DIR``/
+  ``OPENCODE_CONFIG``.
 """
 
 from __future__ import annotations
@@ -147,6 +153,46 @@ AGENTS_ROOT = Path(__file__).resolve().parent.parent / "agents" / "opencode"
 #: file's own header comment for the full mechanism citation.  Threaded
 #: onto the worker's environment as ``OPENCODE_CONFIG`` by :meth:`env`.
 ROUTING_PIN_PATH = AGENTS_ROOT / "routing.jsonc"
+
+#: Default value for ``OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX`` (#2321).
+#:
+#: opencode caps every request's output tokens at 32,000 (its internal
+#: ``OY = 32000`` default) unless this environment variable overrides it —
+#: and on a reasoning model that 32,000-token budget is *shared* with the
+#: model's own reasoning, so a long reasoning block can consume the whole
+#: cap before a single tool call is emitted.  This is not hypothetical:
+#: space-invaders#1 (``8c95182b0749``) spent all 32,000 tokens on one
+#: 113 KB reasoning block, was truncated (``"reason":"length"``), emitted
+#: no tool call, and exited 0 with nothing on disk — the run this issue is
+#: named for.
+#:
+#: opencode computes the *effective* cap as
+#: ``min(model.limit.output, $OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX)`` —
+#: it is a ceiling suggestion, not a per-model override.  Raising it can
+#: never push a model's output above what that model's own
+#: ``limit.output`` allows; it can only stop opencode's own 32,000
+#: default from clamping a model that allows more.  That makes a single
+#: generous constant safe across every model dispatched through this
+#: provider — no need to look up ``limit.output`` per model at dispatch
+#: time.
+#:
+#: Chosen as 384,000 — the largest ``limit.output`` among the opencode
+#: model definitions coord currently routes through (``oc-cheap`` /
+#: ``opencode/deepseek-v4-flash`` and ``oc-heavy`` /
+#: ``opencode/deepseek-v4-pro``, both 384,000; ``oc-mid`` /
+#: ``opencode/glm-5.2`` is lower at 131,072 and is naturally clamped to
+#: its own true ceiling by the ``min()`` above — never pushed past it).
+#:
+#: Both fleet binaries already read this variable (1.18.11 on dellserver —
+#: the machine that hit the space-invaders#1 truncation — and 1.18.12 on
+#: precision), and it is not gated behind ``OPENCODE_EXPERIMENTAL`` the
+#: way other ``experimental*``-named flags are (that gating uses a
+#: different internal helper; this flag's parser reads the env var
+#: directly, unconditionally). No version-floor probe is needed here and
+#: none should be added later on speculation: on a binary that predates
+#: this flag it is simply inert and the cap silently stays at 32,000 —
+#: never a hard failure.
+OUTPUT_TOKEN_MAX_DEFAULT = 384_000
 
 
 class OpenCodeAgentNotFoundError(RuntimeError):
@@ -641,35 +687,62 @@ class OpenCodeProvider(Provider):
     def env(self) -> dict[str, str]:
         """Extra environment variables for the worker subprocess.
 
-        Two parts:
+        Three parts, deliberately split across **both sides** of
+        ``self._env`` — that asymmetry is the whole point, see below:
 
-        1. ``ProviderDef.env`` (already ``${VAR}``-expanded by config
+        1. **#2321, seeded BEFORE ``self._env``, operator-overridable:**
+           ``OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX`` defaults to
+           :data:`OUTPUT_TOKEN_MAX_DEFAULT` (see that constant for the
+           full rationale). Unlike part 3 below, this is a *tuning knob*,
+           not a safety mechanism — an operator has a legitimate reason to
+           pin it lower (e.g. to cap cost) or higher (a future model with
+           a larger ``limit.output``), so it is seeded first and then
+           allowed to be shadowed by ``self._env`` like any other
+           ``ProviderDef.env`` entry.  ``coord/config.py``'s
+           ``_parse_providers`` rejects a value at config-parse time that
+           opencode's own parser would silently discard (non-integer,
+           ``<= 0``, or containing whitespace/underscores) — see that
+           function for the validation opencode itself performs.
+        2. ``ProviderDef.env`` (already ``${VAR}``-expanded by config
            parsing, #1706) — how an operator points a named ``opencode``
            provider definition at a specific set of credentials without
-           baking them into the machine's agent unit.
-        2. **#1705, always set, not operator-overridable:**
-           ``OPENCODE_CONFIG_DIR`` (:data:`AGENTS_ROOT` — where the
-           committed per-spec-type agent files live, see the module
-           docstring for why an env var rather than a worktree file copy)
-           and ``OPENCODE_CONFIG`` (:data:`ROUTING_PIN_PATH` — the
-           OpenRouter routing pin, see ``coord/agents/opencode/routing.jsonc``).
-           These are applied **after** ``self._env`` so a
-           ``ProviderDef.env`` entry cannot accidentally (or maliciously,
-           via a compromised ``coordinator.yml`` edit that isn't the
-           security-reviewed agent-file path) shadow the deny-list
-           discovery mechanism — see :class:`OpenCodeAgentNotFoundError`'s
-           docstring for why silently losing this would be bad.  Verified
-           empirically that ``OPENCODE_CONFIG_DIR`` is inert for a provider
-           the operator hasn't configured credentials for (real opencode
-           1.18.11 run against a non-OpenRouter model with both variables
-           set completed normally) — see
+           baking them into the machine's agent unit.  This is also where
+           an operator's override of part 1 above lands, since dict
+           ``.update()`` here happens after the default is seeded.
+        3. **#1705, always set AFTER ``self._env``, NOT
+           operator-overridable:** ``OPENCODE_CONFIG_DIR``
+           (:data:`AGENTS_ROOT` — where the committed per-spec-type agent
+           files live, see the module docstring for why an env var rather
+           than a worktree file copy) and ``OPENCODE_CONFIG``
+           (:data:`ROUTING_PIN_PATH` — the OpenRouter routing pin, see
+           ``coord/agents/opencode/routing.jsonc``).  These are applied
+           **after** ``self._env`` so a ``ProviderDef.env`` entry cannot
+           accidentally (or maliciously, via a compromised
+           ``coordinator.yml`` edit that isn't the security-reviewed
+           agent-file path) shadow the deny-list discovery mechanism —
+           see :class:`OpenCodeAgentNotFoundError`'s docstring for why
+           silently losing this would be bad.  Verified empirically that
+           ``OPENCODE_CONFIG_DIR`` is inert for a provider the operator
+           hasn't configured credentials for (real opencode 1.18.11 run
+           against a non-OpenRouter model with both variables set
+           completed normally) — see
            ``test_opencode_routing_pin_inert_without_openrouter_credential_end_to_end``.
+
+        The asymmetry: part 1 is a default an operator must be able to
+        override (seeded *before* the merge, operator wins); part 3 is a
+        safety mechanism an operator must never be able to override (set
+        *after* the merge, coord wins).  Do not "fix" this into a single
+        consistent ordering — the two groups need opposite precedence on
+        purpose.
 
         Returns a fresh dict each call.
         """
-        merged = dict(self._env)
-        merged["OPENCODE_CONFIG_DIR"] = str(AGENTS_ROOT)
-        merged["OPENCODE_CONFIG"] = str(ROUTING_PIN_PATH)
+        merged: dict[str, str] = {
+            "OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX": str(OUTPUT_TOKEN_MAX_DEFAULT),
+        }
+        merged.update(self._env)  # operator wins over the tuning-knob default
+        merged["OPENCODE_CONFIG_DIR"] = str(AGENTS_ROOT)  # coord wins, unchanged
+        merged["OPENCODE_CONFIG"] = str(ROUTING_PIN_PATH)  # coord wins, unchanged
         return merged
 
     def parse_log(

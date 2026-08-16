@@ -3321,6 +3321,51 @@ def _expand_env_vars(value: str) -> str:
     return _ENV_VAR_RE.sub(_replace, value)
 
 
+#: Matches exactly what opencode's own ``OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX``
+#: parser (#2321) accepts as a *string form* of a number: one or more ASCII
+#: digits, nothing else — no sign, no decimal point, no whitespace, no
+#: underscore digit-grouping. Combined with the ``> 0`` check below this
+#: mirrors opencode's own rule (integer, ``> 0``) closely enough to reject
+#: every value opencode is documented to silently discard: ``"131072 "``
+#: (trailing whitespace), ``"131_072"`` (underscore grouping — Python's
+#: ``int()`` would accept this but JS ``Number()`` coercion does not),
+#: ``"0"`` (fails ``> 0``), ``"1.5"`` (decimal point), and ``"unlimited"``
+#: (non-numeric).
+_OPENCODE_OUTPUT_TOKEN_MAX_RE = re.compile(r"[0-9]+")
+
+#: The env var name gated by :data:`_OPENCODE_OUTPUT_TOKEN_MAX_RE` — kept as
+#: a constant rather than a literal so config.py and opencode.py can be
+#: grepped for the exact same string (deliberately NOT imported from
+#: coord.providers.opencode: config.py must not depend on provider modules).
+OPENCODE_OUTPUT_TOKEN_MAX_ENV_VAR = "OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX"
+
+
+def _validate_opencode_output_token_max_env(value: str, *, context: str) -> None:
+    """Reject an ``OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX`` override that
+    opencode's own parser would silently discard (#2321).
+
+    opencode's env-var parser demands an integer ``> 0``; anything else
+    (a non-numeric string, a decimal, a value with surrounding whitespace
+    or underscore digit-grouping, zero or negative) maps to ``undefined``
+    internally, which silently restores opencode's 32,000-token default
+    with **no warning anywhere** — exactly the failure mode #2321 exists
+    to end. Config-parse time is the only point where "silently reverted
+    to 32,000" can be turned into a loud, actionable error instead of a
+    truncated worker run discovered hours later.
+
+    Raises:
+        ConfigError: when *value* is not a bare positive-integer string.
+    """
+    if not _OPENCODE_OUTPUT_TOKEN_MAX_RE.fullmatch(value) or int(value) <= 0:
+        raise ConfigError(
+            f"{context} must be a positive integer string with no "
+            "surrounding whitespace, sign, decimal point, or underscores "
+            "(opencode's OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX parser "
+            "silently discards anything else and reverts to its 32000 "
+            f"default) — got {value!r}"
+        )
+
+
 _PORTAL_PLAIN_STR_FIELDS = ("base_url",)
 _PORTAL_SECRET_STR_FIELDS = ("bridge_client_id", "bridge_client_secret")
 
@@ -3470,6 +3515,20 @@ def _parse_providers(raw: Any) -> ProvidersConfig:
                 )
         # Expand ${VAR} in env values.
         env: dict[str, str] = {k: _expand_env_vars(v) for k, v in env_raw.items()}
+
+        # #2321: an operator override of opencode's output-token-cap knob
+        # must be a value opencode's own parser will actually honour — see
+        # _validate_opencode_output_token_max_env for why a bad value here
+        # (e.g. a trailing space) is worse than a normal type error: it
+        # doesn't fail, it silently reverts to the 32000 default.
+        if OPENCODE_OUTPUT_TOKEN_MAX_ENV_VAR in env:
+            _validate_opencode_output_token_max_env(
+                env[OPENCODE_OUTPUT_TOKEN_MAX_ENV_VAR],
+                context=(
+                    f"providers.definitions[{def_name!r}].env"
+                    f"[{OPENCODE_OUTPUT_TOKEN_MAX_ENV_VAR!r}]"
+                ),
+            )
 
         extra_args_raw = def_raw.get("extra_args", []) or []
         if not isinstance(extra_args_raw, list) or not all(
