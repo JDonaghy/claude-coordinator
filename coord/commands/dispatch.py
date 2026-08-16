@@ -1978,7 +1978,7 @@ def retry(assignment_id: str, config_path: Path, acknowledge_cost: bool = False)
         # of a bare "no available machine" — the usual cause is a phantom
         # `running` row from a dead interactive session nothing reaped.
         click.echo(
-            f"error: {describe_no_candidate_machines(assignment, board, cfg)}",
+            f"error: {describe_no_candidate_machines(assignment, board, cfg, issue_labels)}",
             err=True,
         )
         sys.exit(1)
