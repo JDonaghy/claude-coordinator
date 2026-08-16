@@ -2,35 +2,31 @@
 
 Part of the `claude-coordinator` -> `code-coordinator` rename (epic #2096).
 **This module renames nothing** — `pyproject.toml` owns that, and since
-#2104 it says `code-coordinator` — this exists so the rename does not break
-every already-deployed agent's self-reported version.
+#2104 it says `code-coordinator`.
 
-Read the tense below as historical: the rename has now landed, which makes
-this module *more* load-bearing, not less. Every agent still running a
-pre-#2104 install reports its version out of a `claude-coordinator`
-`.dist-info` and will keep doing so until it has been updated past the
-rename — and `claude-coordinator` is a PyPI tombstone (PyPI cannot rename a
-project) that will never gain another release, so that state is permanent
-for any host nobody upgrades. Do not shorten :data:`CANDIDATE_NAMES` to the
-one name that is now published.
+The problem this originally closed: an agent reports its own version by
+reading its distribution metadata *by name* (`coord/agent_app.py`'s
+`_installed_version`, `AGENT_PKG_NAME`, `_detect_install_mode`;
+`coord/agent_update.py`'s smoke check; `coord/cli.py`'s upgrade hint). Every
+one of those hardcoded `"claude-coordinator"`. During the #2096 cutover,
+some machines had `code-coordinator` installed instead, and a hardcoded
+lookup raised/returned nothing for them, reporting an unknown version and
+surfacing `coord agent update`'s `✗ did not come back` false negative even
+though the agent was online and fully updated. #2103 fixed that by
+resolving tolerantly against both names, in one place, instead of five
+independent `try/except ImportError` blocks that could each drift.
 
-The problem this closes: an agent reports its own version by reading its
-distribution metadata *by name* (`coord/agent_app.py`'s `_installed_version`,
-`AGENT_PKG_NAME`, `_detect_install_mode`; `coord/agent_update.py`'s smoke
-check; `coord/cli.py`'s upgrade hint). Every one of those hardcoded
-`"claude-coordinator"`. Once some machine in the fleet has `code-coordinator`
-installed instead — the transient cutover state between "the rename lands on
-PyPI" and "every agent has been updated past it" — `importlib.metadata`
-raises/returns nothing for the hardcoded name, the agent reports an unknown
-version, and `coord agent update` surfaces the `✗ did not come back` false
-negative (already the single most-recurring fleet failure) even though the
-agent is online and fully updated.
-
-The fix: resolve tolerantly, in one place, used by every site above instead
-of five independent `try/except ImportError` blocks that could each drift.
-`code-coordinator` wins when both are installed (it's the name every future
-release publishes under); `claude-coordinator` is the fallback every
-not-yet-upgraded agent still needs.
+**#2106 (R-4): the fallback is gone.** The fleet-wide cutover (#2105) is
+done — every venv resolves `code-coordinator` and nothing resolves
+`claude-coordinator` anymore, so a lookup that still needs the old name to
+succeed is exactly the failure this module should now surface loudly rather
+than mask. `claude-coordinator` is also a permanent PyPI tombstone (PyPI
+cannot rename a project) that will never gain another release, so keeping
+it as a live fallback target forever would only ever hide a genuinely
+broken install. What #2103 still buys, and this keeps: every call site
+below resolves through one place, and a miss is a named
+:class:`DistributionNotFoundError`, never a bare ``None`` that downstream
+renders as an unqualified "did not come back".
 """
 
 from __future__ import annotations
@@ -39,12 +35,11 @@ from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 
-#: Resolution order. `code-coordinator` first — it's the name #2096's rename
-#: eventually publishes under, so once both names resolve (a machine that
-#: still has the old `.dist-info` lying around after an in-place upgrade,
-#: or genuinely has both installed) the new one wins rather than the old
-#: one winning by accident of being listed/checked first.
-CANDIDATE_NAMES: tuple[str, ...] = ("code-coordinator", "claude-coordinator")
+#: The one distribution name coord now ships under. Still a tuple — every
+#: call site below is written against "however many candidates there are"
+#: rather than a single hardcoded string, so a future rename only has to
+#: change this line (see #2103's history for why that property matters).
+CANDIDATE_NAMES: tuple[str, ...] = ("code-coordinator",)
 
 
 class DistributionNotFoundError(LookupError):

@@ -1174,7 +1174,7 @@ def _evaluate_graph_fleet(facts: RepoFacts, *, local_is_covered: bool = False) -
             ),
             fix=(
                 "port .githooks/ (_lib.sh, post-checkout, post-commit, post-merge) "
-                "from claude-coordinator into this repo, THEN "
+                "from code-coordinator into this repo, THEN "
                 "coord repo doctor --fix  (see docs/GRAPHIFY_SETUP.md)"
             ),
         ))
@@ -1303,7 +1303,7 @@ def evaluate_graph(facts: RepoFacts) -> list[Finding]:
             ),
             fix=(
                 "port .githooks/ (_lib.sh, post-checkout, post-commit, post-merge) "
-                "from claude-coordinator into this repo, THEN "
+                "from code-coordinator into this repo, THEN "
                 "git config core.hooksPath .githooks  (see docs/GRAPHIFY_SETUP.md)"
             ),
         ))

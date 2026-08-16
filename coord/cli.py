@@ -255,21 +255,17 @@ def _warn_if_source_install_drift() -> None:
                 if staleness["days_behind"] is not None
                 else ""
             )
-            # #2103: suggest an upgrade of whichever distribution name is
-            # actually installed — `code-coordinator` since the #2104 rename,
-            # `claude-coordinator` on an agent that has not been updated past
-            # it yet. `_coord.__file__` is already confirmed above to be a
-            # real site-packages install, so one of the two names is
-            # guaranteed to resolve here; the literal fallback only guards a
-            # resolution race between that check and this one. It names the
-            # NEW distribution (#2104): the only way to reach it is "neither
-            # name resolved", and the one name guaranteed to still be
-            # publishable is the one every future release ships under —
-            # `claude-coordinator` is a tombstone that will never gain
-            # another version. `_dist_pkg_spec` is the module-level
-            # `coord.dist_name` import above (real module, independent of
-            # `_coord` here potentially being a test stand-in), so this
-            # doesn't depend on `coord.dist_name` already being cached.
+            # #2103/#2106: suggest an upgrade of the installed distribution
+            # name (`code-coordinator`), resolved via `coord.dist_name`
+            # rather than hardcoded. `_coord.__file__` is already confirmed
+            # above to be a real site-packages install, so resolution is
+            # guaranteed to succeed here; the literal fallback only guards a
+            # resolution race between that check and this one — the only
+            # way to reach it is "the distribution vanished between the two
+            # checks". `_dist_pkg_spec` is the module-level `coord.dist_name`
+            # import above (real module, independent of `_coord` here
+            # potentially being a test stand-in), so this doesn't depend on
+            # `coord.dist_name` already being cached.
             try:
                 install_target = _dist_pkg_spec(extra="server")
             except Exception:  # noqa: BLE001 — best-effort, never break the CLI

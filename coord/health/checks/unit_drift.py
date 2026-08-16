@@ -162,11 +162,10 @@ def in_git_worktree(path: Path) -> bool:
 def installed_version() -> str | None:
     """The version of the installed coordinator distribution, or None.
 
-    #2103: resolves via :func:`coord.dist_name.resolve_installed` — tries
-    `code-coordinator` then falls back to `claude-coordinator` — instead of
-    a single hardcoded name, so this (feeding the unit-drift health check)
-    doesn't start reporting a false "not installed" the moment a machine
-    lands on the new name.
+    #2103/#2106: resolves via :func:`coord.dist_name.resolve_installed`
+    instead of a hardcoded name, so this (feeding the unit-drift health
+    check) doesn't need to know the distribution name to stay correct
+    across a future rename.
     """
     try:
         from coord.dist_name import resolve_installed
