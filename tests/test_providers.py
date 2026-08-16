@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -2245,6 +2246,78 @@ def test_opencode_work_md_warns_denial_reprints_full_ruleset() -> None:
     assert "ruleset" in text.lower() or "permission list" in text.lower()
 
 
+def _opencode_work_md_bash_allow_prefixes() -> list[str]:
+    """The ``allow``-ed ``bash`` rule keys from work.md's frontmatter, with
+    the trailing ``*`` glob stripped.
+
+    Parsed with a line regex rather than a YAML load so the test keeps
+    working without pulling PyYAML into the test module's imports — the
+    block is a flat ``  "<pattern>": <decision>`` mapping, so nothing
+    subtler is warranted.
+    """
+    text = _opencode_work_md_text()
+    frontmatter = text.split("---")[1]
+    bash_block = frontmatter.split("bash:", 1)[1].split("edit:", 1)[0]
+    prefixes = []
+    for line in bash_block.splitlines():
+        match = re.match(r'\s*"(.+?)"\s*:\s*allow\s*$', line)
+        if match:
+            prefixes.append(match.group(1).rstrip("*").strip())
+    return prefixes
+
+
+def _opencode_work_md_allow_prefixes_sanity() -> list[str]:
+    prefixes = _opencode_work_md_bash_allow_prefixes()
+    # If this trips, the frontmatter parse broke, not the prose — without it
+    # the "documented" assertion below would pass vacuously on zero rules.
+    assert len(prefixes) >= 10, prefixes
+    return prefixes
+
+
+def test_opencode_work_md_documents_the_bash_allow_list() -> None:
+    """#2317: the cheapest way to stop denials from replaying the whole
+    ruleset back into a 32k budget is to stop the worker from *earning* a
+    denial — so the prompt body must name every allowed command up front
+    rather than leaving the agent to discover the list by probing.
+
+    Every ``allow``-ed rule in the frontmatter has to be mentioned in the
+    prose below it. Guards the two halves from drifting apart: adding a
+    carve-out to the permission block without telling the agent it exists
+    wastes the carve-out.
+    """
+    prefixes = _opencode_work_md_allow_prefixes_sanity()
+    body = _opencode_work_md_text().split("---", 2)[2]
+    missing = [p for p in prefixes if p not in body]
+    assert not missing, f"allow rules not documented in the prompt body: {missing}"
+
+
+def test_opencode_work_md_run_separately_examples_are_actually_allowed() -> None:
+    """The "one command per bash call" rule demonstrates itself with a
+    ``Run `x`, then separately `y`.`` example. Those example commands must
+    themselves survive the frontmatter allow list.
+
+    This is a real regression: the first draft of the #2317 text used
+    ``Run `pwd`, then separately `git status``` — but ``pwd`` matches no
+    allow rule and is swallowed by the ``"*": deny`` baseline, so following
+    the example verbatim earns exactly the denial the rule exists to
+    prevent, and replays the whole ruleset into the worker's budget.
+    """
+    body = _opencode_work_md_text().split("---", 2)[2]
+    sentence = re.search(r"Run `.+?\.\s", body, re.DOTALL)
+    assert sentence, "work.md lost its 'Run `x`, then separately `y`' example"
+    examples = re.findall(r"`([^`]+)`", sentence.group(0))
+    assert examples, "the example sentence names no commands"
+
+    prefixes = _opencode_work_md_allow_prefixes_sanity()
+    for command in examples:
+        assert any(
+            command.startswith(prefix) for prefix in prefixes
+        ), (
+            f"work.md tells the worker to run {command!r}, "
+            f"which its own permission block denies"
+        )
+
+
 # ── #1705: real end-to-end enforcement proof ────────────────────────────────
 #
 # Everything above this line tests coord's OWN code (argv construction, env
@@ -2469,6 +2542,60 @@ def test_opencode_work_agent_blocks_gh_end_to_end(tmp_path: Path) -> None:
     for call in gh_calls:
         state = call["part"]["state"]
         assert state.get("status") == "error", f"gh call was not blocked: {call}"
+        assert "permission" in str(state.get("error", "")).lower()
+
+
+@_requires_real_opencode
+def test_opencode_work_agent_deny_baseline_blocks_offlist_git_end_to_end(
+    tmp_path: Path,
+) -> None:
+    """PROOF for the ``"*": deny`` baseline itself: an off-allow-list
+    command is blocked inside a real opencode process even when nothing in
+    work.md's prose singles it out as forbidden.
+
+    Companion to ``test_opencode_work_agent_blocks_gh_end_to_end``, added
+    with #2317. That test probes with ``gh --version``, which work.md's
+    prose *also* forbids in as many words ("Do NOT run gh commands"), so
+    the model increasingly refuses on the advisory alone and the run
+    observes no enforcement — ``_require_attempt`` skips. #2317 made that
+    worse on purpose: documenting the allow list up front (so the worker
+    stops burning its 32k budget earning denials that replay the whole
+    ruleset) means the model can now rule ``gh`` out without trying it.
+
+    ``git fetch origin`` restores an observable probe. It is denied purely
+    by the catch-all — ``git fetch*`` is on no ``allow`` line, while ten
+    other ``git *`` rules are — but reads as an ordinary, sanctioned step
+    rather than something the instructions call out, so the model attempts
+    it. If a future edit adds ``"git fetch*": allow``, this test's premise
+    is gone; the assertion below fails loudly rather than skipping, so
+    that edit can't pass unnoticed.
+    """
+    assert not any(
+        "git fetch".startswith(prefix)
+        for prefix in _opencode_work_md_bash_allow_prefixes()
+    ), "work.md now allows `git fetch` — this test needs a different off-list probe"
+
+    repo = _init_oc_throwaway_repo(tmp_path)
+    events = _run_real_opencode_work(
+        repo,
+        "Run 'git fetch origin' via bash and tell me the output.",
+    )
+    fetch_calls = [
+        e
+        for e in _bash_tool_calls(events)
+        if e["part"]
+        .get("state", {})
+        .get("input", {})
+        .get("command", "")
+        .strip()
+        .startswith("git fetch")
+    ]
+    _require_attempt(events, fetch_calls, "'git fetch origin' via bash")
+    for call in fetch_calls:
+        state = call["part"]["state"]
+        assert (
+            state.get("status") == "error"
+        ), f"off-list git call was not blocked: {call}"
         assert "permission" in str(state.get("error", "")).lower()
 
 
