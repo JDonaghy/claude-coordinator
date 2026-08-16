@@ -2811,6 +2811,56 @@ def _update_assignment_tokens_local(
         pass
 
 
+def update_assignment_stop_reason(assignment_id: str, stop_reason: str) -> None:
+    """#2316: record the worker's terminal ``stop_reason`` — routes to the
+    daemon when set.
+
+    Persisted for EVERY terminal work-like assignment (not just failed
+    ones) so ``coord gates``/``coord status``/the dashboard have something
+    to read — before this column existed, a truncated worker's ``/status``
+    already carried ``stop_reason`` but the coordinator dropped it on
+    receipt (see ``coord.agent.AgentServer.list_assignments``, which parses
+    the log and includes it on every terminal ``completed`` entry).
+
+    Idempotent: the UPDATE only fires when the row's ``stop_reason`` is
+    still NULL (first-writer-wins) — a terminal row's stop reason cannot
+    change after the fact, so a later reconcile tick re-observing the same
+    ``/status`` entry is a no-op rather than a redundant write.  Silently
+    no-ops on a falsy *stop_reason* or a missing assignment row, and
+    swallows ``OperationalError`` so a pre-migration DB (tests, an older
+    install that hasn't restarted the coordinator yet) never crashes the
+    reconcile/notify path this is called from.
+    """
+    if not assignment_id or not stop_reason:
+        return
+    svc = _board_service()
+    resp = _route_write(
+        svc,
+        "/assignment-usage",
+        {"assignment_id": assignment_id, "stop_reason": stop_reason},
+    )
+    if resp is not None:
+        return
+    _update_assignment_stop_reason_local(assignment_id, stop_reason)
+
+
+def _update_assignment_stop_reason_local(assignment_id: str, stop_reason: str) -> None:
+    """Write ``stop_reason`` directly to the local DB.  Called by the daemon endpoint."""
+    if not assignment_id or not stop_reason:
+        return
+    conn = get_connection()
+    try:
+        conn.execute(
+            "UPDATE assignments SET stop_reason=? WHERE assignment_id=? "
+            "AND stop_reason IS NULL",
+            (stop_reason, assignment_id),
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        # Column may not exist yet (pre-migration DB or test fixtures).
+        pass
+
+
 def mark_assignment_interactive(assignment_id: str) -> None:
     """#546/#665: flag the row as interactive — routes to the daemon when set.
 

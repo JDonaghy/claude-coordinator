@@ -429,11 +429,23 @@ def reconcile_completed_assignments(
         # was killed for spending, not for hitting a usage limit. Stamping it
         # here is what makes the kill distinguishable from a crash for
         # `coord retry`, the auto-reassign skip below, and the escalation.
+        # #2316: `truncation_reason` is the SAME column again — stamped by
+        # `AgentServer._reap` when a 0-commit clean exit's `stop_reason`
+        # shows the worker was cut off by its output-token ceiling
+        # (`coord.agent._TRUNCATION_STOP_REASONS`) rather than genuinely
+        # finding nothing to do. Never coexists with the other three: it is
+        # only ever set on the SAME `_ahead == 0` branch as the #448 ADVISORY
+        # default (see `AgentServer._reap`'s `elif` chain), which the other
+        # three all preempt before that branch even runs. Without this, a
+        # truncated run lands FAILED with no `failure_reason` recorded —
+        # exactly the "advisory looks the same as this" gap #2316 exists to
+        # close.
         _failure_reason = (
             entry.get("usage_limit_reason")
             or entry.get("api_error_reason")
             or entry.get("push_failure_reason")
             or entry.get("spend_ceiling_reason")
+            or entry.get("truncation_reason")
         )
         _escalate_spend_ceiling_best_effort(a, entry)
         update_state_fn(
@@ -481,6 +493,14 @@ def reconcile_completed_assignments(
         # includes them there after parsing its own log).  Best-effort — any
         # failure is swallowed so it can't break the reconcile.
         _capture_tokens_best_effort(aid, entry)
+
+        # #2316: capture the raw stop_reason from the /status entry for
+        # EVERY terminal assignment (not just failed ones) — the enabling
+        # persistence step; `_failure_reason` above already carries the
+        # human-readable classification for a truncated run specifically.
+        # Best-effort — any failure is swallowed so it can't break the
+        # reconcile.
+        _capture_stop_reason_best_effort(aid, entry)
 
         reconciled.append(
             {
@@ -744,6 +764,29 @@ def _capture_tokens_best_effort(assignment_id: str, entry: dict) -> None:
             cache_read_tokens=cache_read_tokens,
         )
     except Exception:  # noqa: BLE001 — never let token capture break the reconcile
+        pass
+
+
+def _capture_stop_reason_best_effort(assignment_id: str, entry: dict) -> None:
+    """#2316: persist the raw ``stop_reason`` from a /status completed entry.
+
+    The agent parses its own log and includes ``stop_reason`` on every
+    terminal ``completed`` entry (``coord.agent.AgentServer.list_assignments``
+    — this predates #2316, only the write path is new). Captured for EVERY
+    terminal assignment, not gated on status, so the column reflects the
+    worker's own last word (``"end_turn"``, ``"length"``, ``"max_tokens"``,
+    ...) regardless of how ``_failure_reason``/the board's ``status``
+    classified the run. Best-effort — any failure is swallowed so it can't
+    break the reconcile.
+    """
+    try:
+        stop_reason = entry.get("stop_reason")
+        if not stop_reason:
+            return
+        from coord.state import update_assignment_stop_reason  # noqa: PLC0415
+
+        update_assignment_stop_reason(assignment_id, stop_reason)
+    except Exception:  # noqa: BLE001 — never let this capture break the reconcile
         pass
 
 
@@ -1407,6 +1450,10 @@ def _record_usage_limit_reason(assignment_id: str | None, entry: dict) -> None:
         # mutual exclusivity as the three above (see the identical chain in
         # `reconcile_completed_assignments`).
         or entry.get("spend_ceiling_reason")
+        # #2316: a truncated (output-token-ceiling) 0-commit run. Same
+        # column, same mutual exclusivity — see the identical chain in
+        # `reconcile_completed_assignments`.
+        or entry.get("truncation_reason")
     )
     if not reason or not assignment_id:
         return

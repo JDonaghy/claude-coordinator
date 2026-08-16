@@ -2638,11 +2638,20 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
         # says "spend ceiling" instead of leaving an operator to guess why a
         # leg died mid-task. Mutually exclusive with the other three (see
         # `coord.reconcile.reconcile_completed_assignments`).
+        # #2316: `truncation_reason` is the same column again — the worker's
+        # output-token ceiling cut it off before it committed anything. It
+        # must reach `error=` below too, so the GitHub failure comment reads
+        # "the model was cut off at its output limit before writing
+        # anything" instead of the misleading "exited cleanly but pushed 0
+        # commits" the #448 ADVISORY default would otherwise have produced.
+        # Mutually exclusive with the other four (see
+        # `coord.reconcile.reconcile_completed_assignments`).
         _failure_reason = (
             entry.get("usage_limit_reason")
             or entry.get("api_error_reason")
             or entry.get("push_failure_reason")
             or entry.get("spend_ceiling_reason")
+            or entry.get("truncation_reason")
         )
         post_failure(
             exit_code=transition.exit_code,
@@ -2738,11 +2747,20 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
         # says "spend ceiling" instead of leaving an operator to guess why a
         # leg died mid-task. Mutually exclusive with the other three (see
         # `coord.reconcile.reconcile_completed_assignments`).
+        # #2316: `truncation_reason` is the same column again — the worker's
+        # output-token ceiling cut it off before it committed anything. It
+        # must reach `error=` below too, so the GitHub failure comment reads
+        # "the model was cut off at its output limit before writing
+        # anything" instead of the misleading "exited cleanly but pushed 0
+        # commits" the #448 ADVISORY default would otherwise have produced.
+        # Mutually exclusive with the other four (see
+        # `coord.reconcile.reconcile_completed_assignments`).
         _failure_reason = (
             entry.get("usage_limit_reason")
             or entry.get("api_error_reason")
             or entry.get("push_failure_reason")
             or entry.get("spend_ceiling_reason")
+            or entry.get("truncation_reason")
         )
         post_failure(
             exit_code=transition.exit_code,

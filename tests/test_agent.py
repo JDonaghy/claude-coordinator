@@ -5028,6 +5028,80 @@ class TestListAssignmentsTokens:
         assert entry.get("input_tokens", 0) == 0
 
 
+# ── #2316: stop_reason / truncation_reason reach /status ───────────────────────
+
+
+class TestStopReasonInCompletedEntry:
+    """`list_assignments()['completed']` must carry `stop_reason` (parsed
+    fresh from the log on every /status call, same as `num_turns`/
+    `total_cost_usd` above) so `coord.reconcile._capture_stop_reason_best_
+    effort` has something to persist — this is the wire half of #2316's
+    "the information is already there and is thrown away" gap."""
+
+    def _make_spec(self, repo_path: Path) -> AssignmentSpec:
+        return AssignmentSpec(
+            repo_name="api",
+            repo_path=str(repo_path),
+            issue_number=2316,
+            issue_title="t",
+            briefing="b",
+            branch="main",
+        )
+
+    def test_stop_reason_appears_in_completed_entry(self, tmp_path: Path) -> None:
+        import json as _json
+
+        repo = _init_repo(tmp_path / "repo")
+        server = _server(tmp_path, repo_path=repo)
+        spec = self._make_spec(repo)
+
+        log_path = tmp_path / "trunc1.log"
+        log_path.write_text(
+            _json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "stop_reason": "max_tokens",
+                    "result": "",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        a = AgentAssignment(
+            id="trunc1",
+            spec=spec,
+            status=FAILED,
+            finished_at=1.0,
+            exit_code=0,
+            log_path=str(log_path),
+            truncation_reason=(
+                "the model was cut off at its output limit before writing "
+                "anything (stop_reason='max_tokens')"
+            ),
+            error=(
+                "the model was cut off at its output limit before writing "
+                "anything (stop_reason='max_tokens')"
+            ),
+        )
+        server._assignments[a.id] = a
+
+        listing = server.list_assignments()
+        completed = listing["completed"]
+        assert len(completed) == 1
+        entry = completed[0]
+        # `stop_reason`: freshly parsed from the log on every /status call.
+        assert entry.get("stop_reason") == "max_tokens"
+        # `truncation_reason`/`error`: plain dataclass fields, already on the
+        # assignment — `to_status_dict()`'s `asdict` carries them through
+        # exactly like `usage_limit_reason`/`api_error_reason` do.
+        assert entry.get("truncation_reason") is not None
+        assert "cut off at its output limit" in entry["truncation_reason"]
+        assert entry.get("error") == entry["truncation_reason"]
+
+
 # ── #1492: agent-side clearing of terminal ADVISORY entries ────────────────────
 
 
