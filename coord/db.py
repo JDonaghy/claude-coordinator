@@ -896,6 +896,19 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         # own default and identical in effect to `attempts <= 0` (no backoff
         # window active).
         "ALTER TABLE drive_queue ADD COLUMN retry_backoff_at REAL",
+        # #2316: the worker's own terminal `stop_reason` (e.g. `"end_turn"`,
+        # opencode's `"length"`, claude's `"max_tokens"`) — see
+        # `coord.agent.AgentServer._reap`'s `/status` `completed` entry
+        # (already sent by every agent build) and `coord.reconcile._capture_
+        # stop_reason_best_effort`, which persists it here for EVERY terminal
+        # assignment, not just failed ones. Previously this value reached the
+        # agent's own `/status` response and nothing else — `coord gates`,
+        # `coord status` and the dashboard had no column to read it from and
+        # a truncated (`stop_reason == "length"`/`"max_tokens"`), 0-commit
+        # run was recorded `advisory` with no trace of WHY. NULL for every
+        # row predating this migration and for a non-stream-json / PTY
+        # worker whose log carries no such field.
+        "ALTER TABLE assignments ADD COLUMN stop_reason TEXT",
     ]
     for sql in migrations:
         try:

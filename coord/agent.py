@@ -232,6 +232,51 @@ def _looks_like_policy_refusal(text: str | None) -> bool:
     return any(marker in lowered for marker in _POLICY_REFUSAL_MARKERS)
 
 
+# #2316: `WorkerSummary.stop_reason` values that mean the model was CUT OFF
+# by an output-token ceiling before it could finish — as opposed to a normal
+# stop (`end_turn`/`stop_sequence`, see `coord.progress`'s identical "unusual
+# stop" allowlist). `"length"` is opencode's `step_finish` reason
+# (`coord.providers.opencode.OpenCodeProvider.parse_log`, gated on opencode's
+# `OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX`); `"max_tokens"` is Anthropic's own
+# `stop_reason` for the same shape. Either one on a 0-commit clean exit means
+# the worker never got a turn to write anything — the space-invaders#1
+# incident (13 successful tool calls, then one reasoning block burned the
+# entire 32k-token budget and exited 0 with nothing on disk) is exactly this:
+# `exit_code == 0` looked like "worker exited cleanly but pushed 0 commits"
+# (the #448 ADVISORY reading) when it was actually a truncation nobody could
+# have acted on differently. See `_reap`, which checks this BEFORE the #448
+# zero-commit downgrade.
+_TRUNCATION_STOP_REASONS = frozenset({"length", "max_tokens"})
+
+# #2321: the opencode-specific knob named in the GitHub comment so an
+# operator reading "cut off at its output limit" doesn't have to go
+# rediscover — as the #2316 investigation had to — that the ceiling is
+# adjustable per provider definition.
+_OPENCODE_OUTPUT_TOKEN_MAX_ENV = "OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX"
+
+
+def _format_truncation_reason(stop_reason: str, provider_name: str | None) -> str:
+    """#2316: human-readable diagnostic for a 0-commit run truncated by an
+    output-token ceiling — used for both `AgentAssignment.truncation_reason`
+    (persisted `failure_reason`) and `AgentAssignment.error` (the GitHub
+    completion comment's `error=` text, see `coord.notify`'s FAILED arms).
+
+    Deliberately says "cut off" rather than "exited cleanly" — `exit_code ==
+    0` is what a truncated run looks like, not evidence the worker finished.
+    Names :data:`_OPENCODE_OUTPUT_TOKEN_MAX_ENV` for an opencode worker
+    (#2321: the ceiling is raisable per provider definition) so an operator
+    doesn't have to rediscover that from scratch.
+    """
+    base = "the model was cut off at its output limit before writing anything"
+    if provider_name == "opencode":
+        return (
+            f"{base} (stop_reason={stop_reason!r}; opencode's output-token "
+            f"ceiling is set by {_OPENCODE_OUTPUT_TOKEN_MAX_ENV} and is "
+            "raisable per provider definition — #2321)"
+        )
+    return f"{base} (stop_reason={stop_reason!r})"
+
+
 # ── Reap tuning ───────────────────────────────────────────────────────────────
 # claude-cli sometimes does not exit after emitting its final
 # `{"type":"result"}` message — a child process (MCP server, tool subprocess)
@@ -2999,6 +3044,20 @@ class AgentAssignment:
     # one of `analysis_deliverable`/`zero_commit_reason`/this field is ever
     # set for a given assignment).
     policy_refusal_reason: str | None = None
+    # #2316: set when `_reap` classifies a clean (exit_code==0), 0-commit
+    # exit as a TRUNCATION — the worker's last `result`/`step_finish` event
+    # carries a `stop_reason` in `_TRUNCATION_STOP_REASONS` (opencode's
+    # `"length"`, claude's `"max_tokens"`) — rather than the #448 ADVISORY
+    # default. Formatted with `_format_truncation_reason`. Only ever set
+    # alongside `status == FAILED` (never ADVISORY: a truncated run is not a
+    # "worker looked and found nothing to do", it is a cut-off nobody chose),
+    # and `None` on every other outcome — including a genuine clean-exit-no-
+    # commits run (no truncation marker matched) and a truncated run that DID
+    # push commits (`_ahead != 0` never reaches this check at all). Mutually
+    # exclusive with `zero_commit_reason`/`analysis_deliverable`/
+    # `policy_refusal_reason`: all four are decided in the SAME `_ahead == 0`
+    # branch of `_reap`, and this one is checked first — see that method.
+    truncation_reason: str | None = None
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -7897,6 +7956,13 @@ class AgentServer:
         # readings of "0 commits" can never disagree about which one applies
         # to this assignment.
         _policy_refusal_reason: str | None = None
+        # #2316: checked FIRST in the `_ahead == 0` branch below, ahead of
+        # `_analysis_deliverable`/`_policy_refusal_reason`/`_zero_commit_
+        # reason` — a truncated run's `result_text` is whatever the model
+        # managed to emit before the ceiling cut it off, not a considered
+        # final message, so it must not be read as a positive "deliverable"
+        # or "policy refusal" signal just because it happens to match one.
+        _truncation_reason: str | None = None
         if (exit_code == 0 and assignment is not None
                 and assignment.worktree_path
                 and assignment.spec.type in _ZERO_COMMIT_TYPES):
@@ -7905,7 +7971,28 @@ class AgentServer:
                 _base = assignment.spec.branch or "main"
                 _ahead = self._commits_ahead(_wt_advisory, _base)
                 if _ahead == 0:
-                    if DELIVERABLE_ANALYSIS_LABEL in (assignment.spec.issue_labels or []):
+                    if (_worker_summary is not None
+                            and _worker_summary.stop_reason in _TRUNCATION_STOP_REASONS):
+                        # #2316: the model was guillotined by its own
+                        # output-token ceiling before it could act — exit
+                        # code 0 here is what a truncated run looks like, NOT
+                        # evidence of a clean "nothing to do" finish. Must be
+                        # re-driven, not parked in the advisory bucket
+                        # nobody re-drives (space-invaders#1).
+                        _truncation_reason = _format_truncation_reason(
+                            _worker_summary.stop_reason, assignment.spec.provider
+                        )
+                        try:
+                            with open(assignment.log_path, "a") as reopen:
+                                reopen.write(
+                                    "# reap: truncated — 0 commits ahead of "
+                                    f"{_base}; stop_reason="
+                                    f"{_worker_summary.stop_reason!r}, status "
+                                    "set to failed (#2316)\n"
+                                )
+                        except OSError:
+                            pass
+                    elif DELIVERABLE_ANALYSIS_LABEL in (assignment.spec.issue_labels or []):
                         _analysis_deliverable = True
                         try:
                             with open(assignment.log_path, "a") as reopen:
@@ -8014,6 +8101,22 @@ class AgentServer:
                         # shrug.
                         assignment.status = FAILED
                         assignment.push_failure_reason = _push_failure_reason
+                    elif _truncation_reason is not None:
+                        # #2316: the worker's own output-token ceiling cut it
+                        # off before it committed anything — checked BEFORE
+                        # `_policy_refusal_reason`/`_zero_commit_reason` (the
+                        # `_reap` computation above already guarantees the
+                        # four are mutually exclusive; kept parallel here for
+                        # readability). FAILED, not ADVISORY: exit_code==0 is
+                        # not evidence of a clean finish for a truncated run,
+                        # and nobody re-drives an advisory. `error` is set
+                        # too (not just `truncation_reason`) so the existing
+                        # generic `entry.get("error")` fallback in
+                        # `coord.notify`'s FAILED comment arms carries this
+                        # text without needing its own dedicated wiring.
+                        assignment.status = FAILED
+                        assignment.truncation_reason = _truncation_reason
+                        assignment.error = _truncation_reason
                     elif _policy_refusal_reason is not None:
                         # #2234: clean exit, no commits, and the worker's own
                         # final message cites a standing repo-rule

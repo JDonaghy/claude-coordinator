@@ -702,6 +702,27 @@ class Assignment:
     # `coord/drive.py`'s work-stage `Action` sets on every `coord assign` it
     # shells out to.
     driven_by: str | None = None
+    # #2316: the worker's own terminal `stop_reason` (e.g. `"end_turn"`,
+    # opencode's `"length"`, claude's `"max_tokens"`) — persisted for EVERY
+    # terminal work-like assignment, not just failed ones, so `coord gates`/
+    # `coord status`/the dashboard can show it and a future gate can act on
+    # it. Captured from the agent's own `/status` `completed` entry (already
+    # sent by every agent build — `coord.agent.AgentServer.list_assignments`
+    # parses the worker's log and includes it there) by
+    # `coord.reconcile._capture_stop_reason_best_effort`. `None` for rows
+    # predating this column and for a non-stream-json / PTY worker whose log
+    # carries no such field.
+    #
+    # This is the raw diagnostic value, distinct from `failure_reason`: a
+    # truncated (`stop_reason` in `coord.agent._TRUNCATION_STOP_REASONS`),
+    # 0-commit run is separately classified FAILED by `AgentServer._reap`
+    # with a human-readable `failure_reason` naming the truncation — see
+    # `coord.agent.AgentAssignment.truncation_reason`. Before #2316 that same
+    # shape (space-invaders#1: the model spent its whole output budget on one
+    # reasoning block and hit opencode's 32k-token ceiling) landed on
+    # `advisory` — the same bucket as a worker that looked and correctly
+    # found nothing to do — so nobody re-drove it.
+    stop_reason: str | None = None
 
 
 def effective_issue_number(assignment: "Assignment | dict") -> int:

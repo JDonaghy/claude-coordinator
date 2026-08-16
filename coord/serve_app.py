@@ -2636,6 +2636,7 @@ def _openapi_spec() -> dict:
                                         "items": {"type": "string"},
                                         "nullable": True,
                                     },
+                                    "stop_reason": {"type": "string", "nullable": True},
                                 },
                                 "required": ["assignment_id"],
                             }
@@ -5257,6 +5258,10 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                 state._update_assignment_smoke_tests_local(aid, body["smoke_tests"])
             if "completion_summary" in body and body["completion_summary"]:
                 state._update_assignment_completion_summary_local(aid, body["completion_summary"])
+            if body.get("stop_reason"):
+                # #2316: same endpoint, same reason as the fields above —
+                # one round-trip covers the diagnostic capture too.
+                state._update_assignment_stop_reason_local(aid, body["stop_reason"])
         except Exception as e:  # noqa: BLE001
             return JSONResponse(
                 {"error": "assignment-usage write failed", "detail": str(e)},

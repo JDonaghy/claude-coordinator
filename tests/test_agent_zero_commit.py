@@ -852,3 +852,203 @@ def test_looks_like_policy_refusal_matches_rule_citations(text: str) -> None:
 )
 def test_looks_like_policy_refusal_does_not_match_ordinary_text(text) -> None:
     assert _looks_like_policy_refusal(text) is False
+
+
+# ── a truncated run is FAILED, not ADVISORY (#2316) ──────────────────────────
+#
+# A worker cut off by its own output-token ceiling mid-turn (opencode's
+# `stop_reason: "length"`, claude's `"max_tokens"`) can still exit 0 with 0
+# commits pushed — the wrapper never sees an error, it just never got another
+# turn. Before this, that shape landed in the same #448 ADVISORY bucket as a
+# worker that correctly looked and found nothing to do, and nobody re-drives
+# an advisory (space-invaders#1: 13 successful tool calls, then the entire
+# 32k-token output budget spent on one reasoning block).
+
+_TRUNCATED_RESULT_LINE = (
+    '{"type": "result", "subtype": "success", "is_error": false, '
+    '"stop_reason": "%s", "result": ""}'
+)
+
+
+def test_truncated_zero_commit_is_failed_not_advisory(
+    tmp_path: Path, repo_local_only: Path
+) -> None:
+    """The core #2316 regression guard: exit_code==0, 0 commits, and a
+    `stop_reason` of `max_tokens` must record FAILED with a
+    `truncation_reason`, never ADVISORY."""
+    server = AgentServer(
+        machine_name="t",
+        repos=["api"],
+        repo_paths={"api": str(repo_local_only)},
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: [
+            "/bin/sh", "-c",
+            f"printf '%s\\n' '{_TRUNCATED_RESULT_LINE % 'max_tokens'}'",
+        ],
+    )
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path=str(repo_local_only),
+        issue_number=2316,
+        issue_title="reasoning burned the whole output budget",
+        briefing="b",
+        branch="main",
+    )
+    a = server.assign(spec)
+    final = server.wait_for(a.id, timeout=10)
+
+    assert final.status == FAILED, (
+        f"expected FAILED for a truncated 0-commit exit, got {final.status!r}"
+    )
+    assert final.exit_code == 0, "exit_code must still be 0 for a truncated run"
+    assert final.zero_commit_reason is None, (
+        "must not ALSO carry the #448 advisory reason — mutually exclusive"
+    )
+    assert final.truncation_reason is not None
+    assert "cut off at its output limit" in final.truncation_reason
+    assert "max_tokens" in final.truncation_reason
+    assert final.error == final.truncation_reason, (
+        "error must mirror truncation_reason so the existing generic "
+        "entry.get('error') fallback carries it to the GitHub comment"
+    )
+    server.shutdown()
+
+
+def test_truncation_reason_appears_in_log(
+    tmp_path: Path, repo_local_only: Path
+) -> None:
+    """The truncation diagnosis is written to the assignment log so operators
+    can find it in `coord log <id>` without querying the agent."""
+    server = AgentServer(
+        machine_name="t",
+        repos=["api"],
+        repo_paths={"api": str(repo_local_only)},
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: [
+            "/bin/sh", "-c",
+            f"printf '%s\\n' '{_TRUNCATED_RESULT_LINE % 'length'}'",
+        ],
+    )
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path=str(repo_local_only),
+        issue_number=2317,
+        issue_title="truncated",
+        briefing="b",
+        branch="main",
+    )
+    a = server.assign(spec)
+    final = server.wait_for(a.id, timeout=10)
+
+    assert final.status == FAILED
+    assert final.log_path is not None
+    log_text = Path(final.log_path).read_text()
+    assert "truncated" in log_text.lower(), (
+        f"expected 'truncated' in log, got:\n{log_text}"
+    )
+    assert "length" in log_text
+    server.shutdown()
+
+
+def test_opencode_truncation_names_the_env_var() -> None:
+    """#2321: for an opencode worker specifically, the reason must name the
+    ceiling's env var so an operator doesn't have to go rediscover that it's
+    adjustable — the whole point of the #2316 investigation's own friction.
+
+    Unit-tests `_format_truncation_reason` directly (mirroring the
+    `_looks_like_policy_refusal` unit tests below) rather than driving a full
+    `AgentServer.assign()` — spawning a real "opencode" worker would require
+    registering a resolvable provider (#1796's refuse-not-substitute rule),
+    which is orthogonal to what this reason-formatting helper does."""
+    from coord.agent import _format_truncation_reason  # noqa: PLC0415
+
+    generic = _format_truncation_reason("max_tokens", None)
+    assert "cut off at its output limit" in generic
+    assert "OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX" not in generic
+
+    opencode = _format_truncation_reason("length", "opencode")
+    assert "cut off at its output limit" in opencode
+    assert "OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX" in opencode
+    assert "#2321" in opencode
+    assert "length" in opencode
+
+
+def test_nonzero_commit_with_truncated_stop_reason_is_still_done(
+    tmp_path: Path, repo_with_remote: tuple[Path, Path],
+) -> None:
+    """A worker that pushed real commits despite ending on a truncated
+    `stop_reason` (e.g. it committed early, then got cut off summarising)
+    must never be reclassified — this check only ever fires on the 0-commit
+    shape, exactly like the policy-refusal and analysis-deliverable checks."""
+    clone, _origin = repo_with_remote
+    worker_sh = (
+        "git config user.email w@w.com && "
+        "git config user.name Worker && "
+        "echo change > change.txt && "
+        "git add change.txt && "
+        "git commit -m 'real work' && "
+        f"printf '%s\\n' '{_TRUNCATED_RESULT_LINE % 'max_tokens'}'"
+    )
+    server = AgentServer(
+        machine_name="t",
+        repos=["api"],
+        repo_paths={"api": str(clone)},
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: ["/bin/sh", "-c", worker_sh],
+    )
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path=str(clone),
+        issue_number=2,
+        issue_title="real work that happens to end truncated",
+        briefing="b",
+        branch="main",
+    )
+    a = server.assign(spec)
+    final = server.wait_for(a.id, timeout=15)
+
+    assert final.status == DONE, (
+        f"expected DONE for a non-zero commit exit regardless of stop_reason, "
+        f"got {final.status!r}"
+    )
+    assert final.truncation_reason is None
+    server.shutdown()
+
+
+def test_truncation_survives_persist_load(
+    tmp_path: Path, repo_local_only: Path
+) -> None:
+    """`truncation_reason` round-trips through the agent state JSON
+    (persist → load), mirroring the existing advisory round-trip guarantee."""
+    from coord.agent import AgentAssignment  # noqa: PLC0415
+
+    a = AgentAssignment(
+        id="truncated-001",
+        spec=AssignmentSpec(
+            repo_name="api",
+            repo_path="/tmp",
+            issue_number=1,
+            issue_title="t",
+            briefing="b",
+        ),
+        status=FAILED,
+        truncation_reason=(
+            "the model was cut off at its output limit before writing "
+            "anything (stop_reason='max_tokens')"
+        ),
+        error=(
+            "the model was cut off at its output limit before writing "
+            "anything (stop_reason='max_tokens')"
+        ),
+        exit_code=0,
+        finished_at=1234567890.0,
+    )
+    d = a.to_dict()
+    assert d["status"] == FAILED
+    assert "cut off at its output limit" in d["truncation_reason"]
+
+    spec_data = d.pop("spec")
+    spec = AssignmentSpec(**spec_data)
+    a2 = AgentAssignment(spec=spec, **d)
+    assert a2.status == FAILED
+    assert a2.truncation_reason == a.truncation_reason
