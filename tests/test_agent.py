@@ -4408,6 +4408,111 @@ class TestCapabilityGates:
         assert final.status == ADVISORY
         server.shutdown()
 
+    def test_stdin_closed_after_spawn_when_provider_inject_is_false(
+        self, tmp_path: Path
+    ) -> None:
+        """#2306: a provider with capabilities().inject=False (e.g. opencode,
+        which takes its briefing on argv, not stdin) must have its stdin
+        pipe closed right after the initial (possibly empty) write.
+
+        Before the fix, stdin was held open for the process's entire
+        lifetime regardless of provider.  A worker that never writes to or
+        reads more from stdin itself (opencode) then blocked forever on its
+        own read of an unclosed pipe that would never see EOF, and was
+        killed by the 600s TTFT watchdog having emitted zero bytes.  ``cat``
+        reproduces that shape exactly: it blocks reading stdin until EOF.
+        With stdin closed after the initial write, ``cat`` sees EOF
+        immediately and the assignment finishes well within the test
+        timeout instead of hanging.
+        """
+        repo = _init_repo(tmp_path / "repo")
+        no_inject_provider = _make_provider(
+            inject=False,
+            # argv-only briefing (like opencode) — nothing more is ever
+            # written to stdin by the harness for this provider.
+            build_argv=["/bin/sh", "-c", "cat >/dev/null; echo done"],
+            initial_input_bytes=b"",
+        )
+        server = AgentServer(
+            machine_name="test",
+            repos=["api"],
+            state_dir=tmp_path / "state",
+            repo_paths={"api": str(repo)},
+            providers={"no-inject": no_inject_provider},
+        )
+        a = server.assign(_spec(repo, provider="no-inject"))
+        # The Popen object is available synchronously once assign() returns
+        # for the non-PTY, no-pull path used here.
+        proc = server._processes.get(a.id)
+        assert proc is not None, "process not recorded"
+        assert proc.stdin is not None and proc.stdin.closed, (
+            "stdin must be closed immediately after spawn for a provider "
+            "with capabilities().inject=False"
+        )
+        # And the worker actually completes — proof the closed pipe gave it
+        # an EOF rather than leaving it to hang until the watchdog kills it.
+        final = server.wait_for(a.id, timeout=5)
+        assert final.status == ADVISORY  # no commits made
+        server.shutdown()
+
+    def test_stdin_left_open_after_spawn_when_provider_inject_is_true(
+        self, tmp_path: Path
+    ) -> None:
+        """#2306 regression guard: a provider with capabilities().inject=True
+        (e.g. ClaudeProvider) must still have its stdin left open after
+        spawn — this is the behaviour ``inject_message`` depends on, and it
+        must be bit-for-bit unchanged by the #2306 fix."""
+        repo = _init_repo(tmp_path / "repo")
+        inject_provider = _make_provider(
+            inject=True,
+            build_argv=["/bin/sh", "-c", "read a; read b; echo $b"],
+        )
+        server = AgentServer(
+            machine_name="test",
+            repos=["api"],
+            state_dir=tmp_path / "state",
+            repo_paths={"api": str(repo)},
+            providers={"yes-inject": inject_provider},
+        )
+        a = server.assign(_spec(repo, provider="yes-inject"))
+        proc = server._processes.get(a.id)
+        assert proc is not None, "process not recorded"
+        assert proc.stdin is not None and not proc.stdin.closed, (
+            "stdin must stay open after spawn for a provider with "
+            "capabilities().inject=True"
+        )
+        # inject_message must still work over that open pipe.
+        server.inject_message(a.id, "injected")
+        final = server.wait_for(a.id, timeout=5)
+        assert final.status == ADVISORY
+        server.shutdown()
+
+    def test_stdin_left_open_after_spawn_on_legacy_no_provider_path(
+        self, tmp_path: Path
+    ) -> None:
+        """#2306: when spec.provider is None, ``_spawn`` takes the legacy
+        path where ``provider_obj`` is ``None``.  That must be treated as
+        claude/inject-capable (stdin left open), matching
+        ``inject_message``'s existing "no provider info => allow" fallback
+        — not closed, which would regress every no-config deployment."""
+        repo = _init_repo(tmp_path / "repo")
+        server = _server(
+            tmp_path,
+            argv=["/bin/sh", "-c", "read a; read b; echo $b"],
+            repo_path=repo,
+        )
+        a = server.assign(_spec(repo))  # no provider → legacy path
+        proc = server._processes.get(a.id)
+        assert proc is not None, "process not recorded"
+        assert proc.stdin is not None and not proc.stdin.closed, (
+            "stdin must stay open after spawn on the legacy (provider_obj "
+            "is None) path"
+        )
+        server.inject_message(a.id, "injected")
+        final = server.wait_for(a.id, timeout=5)
+        assert final.status == ADVISORY
+        server.shutdown()
+
 
 # ── #452: Completed-assignment history cap ─────────────────────────────────────
 
