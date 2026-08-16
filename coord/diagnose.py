@@ -1069,6 +1069,12 @@ def _work_advisory_commits_ahead(assignment: "Assignment", config: "Config") -> 
     zero-commit gate uses) rather than a local git checkout — `coord
     diagnose` runs on the daemon host, which has no guarantee of a local
     clone of every worker's branch.
+
+    #2324: ``None`` here means the lookup genuinely couldn't be confirmed
+    (network/auth/rate-limit/repo-missing) — a head branch GitHub positively
+    404s, with the base branch still resolving, comes back as ``0`` instead
+    (see :func:`coord.github_ops.branch_commits_ahead`), since a deleted
+    branch is proof nothing was pushed, not an unknown.
     """
     from coord import github_ops  # noqa: PLC0415
 

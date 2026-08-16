@@ -1277,6 +1277,167 @@ class TestComputePatchId:
             assert github_ops.compute_patch_id(_unified_diff("hello")) is None
 
 
+def _gh_ref_dispatch(repo: str, base: str, branch: str, *, head_error=None, base_error=None):
+    """Build a ``_gh`` ``side_effect`` for :func:`branch_commits_ahead`'s
+    #2324 fallback path: the initial ``compare`` call always fails (the
+    caller supplies that via a separate ``side_effect``/``compare_error``),
+    and this answers the two follow-up ``git/refs/heads/<ref>`` lookups —
+    raising *head_error*/*base_error* when given, succeeding otherwise.
+    """
+    head_path = f"repos/{repo}/git/refs/heads/{branch}"
+    base_path = f"repos/{repo}/git/refs/heads/{base}"
+
+    def _dispatch(*args, **kwargs):
+        path = args[1] if len(args) > 1 else ""
+        if path == head_path:
+            if head_error is not None:
+                raise head_error
+            return "{}"
+        if path == base_path:
+            if base_error is not None:
+                raise base_error
+            return "{}"
+        raise AssertionError(f"unexpected _gh call: {args!r}")
+
+    return _dispatch
+
+
+class TestGhRefConfirmedMissing:
+    """#2324: distinguishes a confirmed 404 (GitHub positively saying a ref
+    doesn't exist) from an auth/rate-limit/network failure that merely
+    looks like one — the exact conflation that made a deleted branch read
+    as "unconfirmed" instead of "confirmed empty"."""
+
+    def test_true_on_explicit_404(self) -> None:
+        assert github_ops._gh_ref_confirmed_missing(
+            RuntimeError("gh api branches: 404 not found")
+        ) is True
+
+    def test_true_on_not_found_message(self) -> None:
+        assert github_ops._gh_ref_confirmed_missing(
+            RuntimeError("gh: Not Found (HTTP 404)")
+        ) is True
+
+    def test_false_on_auth_failure(self) -> None:
+        assert github_ops._gh_ref_confirmed_missing(
+            RuntimeError("gh: HTTP 403: Bad credentials")
+        ) is False
+
+    def test_false_on_rate_limit(self) -> None:
+        assert github_ops._gh_ref_confirmed_missing(
+            RuntimeError("gh: API rate limit exceeded")
+        ) is False
+
+    def test_false_on_network_timeout(self) -> None:
+        assert github_ops._gh_ref_confirmed_missing(
+            RuntimeError("gh: connection timed out")
+        ) is False
+
+
+class TestBranchCommitsAhead:
+    """#2324: a compare-API failure that turns out to be a *confirmed* 404 on
+    the head branch — with the base branch still resolving — must read as 0
+    commits ahead, not None. A deleted branch is the strongest possible
+    evidence nothing was pushed; treating it as "unconfirmed" steered `coord
+    retry` toward refusing a genuine zero-commit advisory."""
+
+    def test_head_confirmed_deleted_base_resolves_is_zero(self) -> None:
+        repo, base, branch = "acme/api", "main", "issue-1-x"
+
+        def _dispatch(*args, **kwargs):
+            path = args[1] if len(args) > 1 else ""
+            if path == f"repos/{repo}/compare/{base}...{branch}":
+                raise RuntimeError("gh: Not Found (HTTP 404)")
+            return _gh_ref_dispatch(
+                repo, base, branch,
+                head_error=RuntimeError("gh: Not Found (HTTP 404)"),
+            )(*args, **kwargs)
+
+        with patch("coord.github_ops._gh", side_effect=_dispatch):
+            assert github_ops.branch_commits_ahead(repo, base, branch) == 0
+
+    def test_head_resolves_fine_compare_failure_is_none(self) -> None:
+        """The compare call fails for some reason other than the head branch
+        being gone (e.g. a transient blip) — the head ref lookup itself
+        succeeds, so there is nothing to trust. Must stay None."""
+        repo, base, branch = "acme/api", "main", "issue-1-x"
+
+        def _dispatch(*args, **kwargs):
+            path = args[1] if len(args) > 1 else ""
+            if path == f"repos/{repo}/compare/{base}...{branch}":
+                raise RuntimeError("gh: connection timed out")
+            return _gh_ref_dispatch(repo, base, branch)(*args, **kwargs)
+
+        with patch("coord.github_ops._gh", side_effect=_dispatch):
+            assert github_ops.branch_commits_ahead(repo, base, branch) is None
+
+    def test_head_lookup_inconclusive_is_none(self) -> None:
+        """Compare fails, and the head-ref lookup fails too but for a
+        non-404 (auth/network) reason -- not a confirmed deletion, so this
+        must not be guessed as zero."""
+        repo, base, branch = "acme/api", "main", "issue-1-x"
+
+        def _dispatch(*args, **kwargs):
+            path = args[1] if len(args) > 1 else ""
+            if path == f"repos/{repo}/compare/{base}...{branch}":
+                raise RuntimeError("gh: Not Found (HTTP 404)")
+            return _gh_ref_dispatch(
+                repo, base, branch,
+                head_error=RuntimeError("gh: HTTP 403: Bad credentials"),
+            )(*args, **kwargs)
+
+        with patch("coord.github_ops._gh", side_effect=_dispatch):
+            assert github_ops.branch_commits_ahead(repo, base, branch) is None
+
+    def test_head_deleted_but_base_unconfirmable_is_none(self) -> None:
+        """Head 404s, but the base ref itself can't be confirmed (e.g. the
+        whole repo is having an outage) — not the conclusive "head gone,
+        base fine" shape, so this must stay None rather than guess."""
+        repo, base, branch = "acme/api", "main", "issue-1-x"
+
+        def _dispatch(*args, **kwargs):
+            path = args[1] if len(args) > 1 else ""
+            if path == f"repos/{repo}/compare/{base}...{branch}":
+                raise RuntimeError("gh: Not Found (HTTP 404)")
+            return _gh_ref_dispatch(
+                repo, base, branch,
+                head_error=RuntimeError("gh: Not Found (HTTP 404)"),
+                base_error=RuntimeError("gh: connection timed out"),
+            )(*args, **kwargs)
+
+        with patch("coord.github_ops._gh", side_effect=_dispatch):
+            assert github_ops.branch_commits_ahead(repo, base, branch) is None
+
+    def test_head_deleted_base_also_deleted_is_none(self) -> None:
+        """Both refs 404 -- e.g. the whole repo was renamed/deleted -- so
+        there is no confirmed base to compare against. Must not read as
+        zero."""
+        repo, base, branch = "acme/api", "main", "issue-1-x"
+
+        def _dispatch(*args, **kwargs):
+            path = args[1] if len(args) > 1 else ""
+            if path == f"repos/{repo}/compare/{base}...{branch}":
+                raise RuntimeError("gh: Not Found (HTTP 404)")
+            return _gh_ref_dispatch(
+                repo, base, branch,
+                head_error=RuntimeError("gh: Not Found (HTTP 404)"),
+                base_error=RuntimeError("gh: Not Found (HTTP 404)"),
+            )(*args, **kwargs)
+
+        with patch("coord.github_ops._gh", side_effect=_dispatch):
+            assert github_ops.branch_commits_ahead(repo, base, branch) is None
+
+    def test_successful_compare_unaffected(self) -> None:
+        """The happy path (compare succeeds) never touches the new fallback
+        -- unchanged from before #2324."""
+        with patch(
+            "coord.github_ops._gh",
+            return_value=json.dumps({"ahead_by": 3}),
+        ) as gh:
+            assert github_ops.branch_commits_ahead("acme/api", "main", "issue-1-x") == 3
+        gh.assert_called_once()
+
+
 class TestBranchCommitsAheadForAssignment:
     """#1606: the one shared implementation of "branch empty -> 0, repo
     missing -> None, else ask GitHub" — `coord retry`'s advisory gate
@@ -1344,6 +1505,32 @@ class TestBranchCommitsAheadForAssignment:
         with patch("coord.github_ops._gh", side_effect=RuntimeError("gh boom")):
             result = github_ops.branch_commits_ahead_for_assignment(assignment, config)
         assert result is None
+
+    def test_deleted_head_branch_with_resolving_base_is_zero(self) -> None:
+        """#2324: `coord retry` on space-invaders#1's exact shape — a
+        zero-commit advisory whose branch was already deleted. The compare
+        call 404s because the head branch is gone; the base branch
+        (default_branch) still resolves. That must read as a genuine
+        zero-commit advisory (0), not "could not be confirmed" (None) —
+        the None reading is what steered the operator toward the wrong
+        remedy (`coord drive --accept-advisory`, which assumes commits
+        exist)."""
+        assignment = self._Assignment(branch="issue-1-fix")
+        config = self._Config(self._RepoCfg("acme/api", default_branch="main"))
+
+        def _dispatch(*args, **kwargs):
+            path = args[1] if len(args) > 1 else ""
+            if path == "repos/acme/api/compare/main...issue-1-fix":
+                raise RuntimeError("gh: Not Found (HTTP 404)")
+            if path == "repos/acme/api/git/refs/heads/issue-1-fix":
+                raise RuntimeError("gh: Not Found (HTTP 404)")
+            if path == "repos/acme/api/git/refs/heads/main":
+                return "{}"
+            raise AssertionError(f"unexpected _gh call: {args!r}")
+
+        with patch("coord.github_ops._gh", side_effect=_dispatch):
+            result = github_ops.branch_commits_ahead_for_assignment(assignment, config)
+        assert result == 0
 
 
 class TestGetBranchPatchId:
