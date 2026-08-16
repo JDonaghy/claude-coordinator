@@ -48,7 +48,7 @@ import time
 from pathlib import Path
 
 CLAUDE_BIN = str(Path("~/.local/bin/claude").expanduser())
-TRUSTED_CWD = str(Path("~/src/claude-coordinator").expanduser())
+TRUSTED_CWD = str(Path("~/src/code-coordinator").expanduser())
 TUI_LOG = Path("/tmp/smoke_437_tui.log")
 WRITES_LOG = Path("/tmp/smoke_437_writes.log")
 BRIEFING = "PRE_FILL_SMOKE_437_MARKER_XYZ"

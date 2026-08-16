@@ -61,7 +61,7 @@ done
 [[ -s /etc/machine-id ]] && { echo "  LEAK: /etc/machine-id is non-empty"; leaked=1; }
 # The venv is what makes this image worth building -- fail loudly if the scrub ate it.
 [[ -x "$COORD_HOME/.coord-venv/bin/coord" ]] || { echo "  BROKEN: ~/.coord-venv destroyed"; leaked=1; }
-[[ -d "$COORD_HOME/src/claude-coordinator" ]] || { echo "  BROKEN: ~/src clones destroyed"; leaked=1; }
+[[ -d "$COORD_HOME/src/code-coordinator" ]] || { echo "  BROKEN: ~/src clones destroyed"; leaked=1; }
 [[ $leaked -eq 0 ]] || { echo "SCRUB FAILED -- do not generalize" >&2; exit 1; }
 echo "  clean"
 
