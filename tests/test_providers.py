@@ -2279,9 +2279,9 @@ def _opencode_work_md_allow_prefixes_sanity() -> list[str]:
 
 def test_opencode_work_md_documents_the_bash_allow_list() -> None:
     """#2317: the cheapest way to stop denials from replaying the whole
-    ruleset back into a 32k budget is to stop the worker from *earning* a
-    denial — so the prompt body must name every allowed command up front
-    rather than leaving the agent to discover the list by probing.
+    ruleset back into the output-token budget is to stop the worker from
+    *earning* a denial — so the prompt body must name every allowed command
+    up front rather than leaving the agent to discover the list by probing.
 
     Every ``allow``-ed rule in the frontmatter has to be mentioned in the
     prose below it. Guards the two halves from drifting apart: adding a
@@ -2562,7 +2562,7 @@ def test_opencode_work_agent_deny_baseline_blocks_offlist_git_end_to_end(
     the model increasingly refuses on the advisory alone and the run
     observes no enforcement — ``_require_attempt`` skips. #2317 made that
     worse on purpose: documenting the allow list up front (so the worker
-    stops burning its 32k budget earning denials that replay the whole
+    stops burning output-token budget earning denials that replay the whole
     ruleset) means the model can now rule ``gh`` out without trying it.
 
     ``git fetch origin`` restores an observable probe. It is denied purely
