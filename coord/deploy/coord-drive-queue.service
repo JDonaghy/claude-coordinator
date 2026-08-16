@@ -20,14 +20,21 @@
 #
 # COORD_BIN — the runner's own CLI must be a PINNED, NON-EDITABLE install
 # (#1523): worker branch churn must never be able to rewrite the tool that is
-# driving it, mid-run. On dellserver, ~/.local/bin/coord is a symlink into
-# ~/.coord-venv — the SAME venv deploy/coord-agent.service runs `coord agent`
-# from (see install-agent.sh) — so that already satisfies #1523, and it rides
-# the ordinary agent-venv upgrade lane rather than needing its own. Before
-# relying on a fix landing on this host:
+# driving it, mid-run. #2314: ExecStart below points at ~/.coord-venv/bin/coord
+# DIRECTLY, the same way deploy/coord-agent.service, coord-serve.service,
+# coord-notify.service and coord-web.service already do — NOT at
+# ~/.local/bin/coord. On dellserver ~/.local/bin/coord is normally a symlink
+# into that same venv, but it is still just an ordinary path on disk: a
+# worker running `pip install --user` (or an editable `pip install -e .`
+# that lands its own console-script shim there) can silently overwrite it
+# with something that no longer points at the pinned venv at all, and the
+# first this tick would know about that is the next `coord drive-queue tick`
+# running whatever the worker just wrote. Pointing ExecStart at the venv path
+# directly makes that overwrite structurally irrelevant to this unit —
+# nothing a worker does to ~/.local/bin/coord can change what systemd execs.
 #
 #   coord agent update --machine dellserver   # or --all; the standard lane
-#   ~/.local/bin/coord --version              # VERIFY it took — an upgrade
+#   ~/.coord-venv/bin/coord --version         # VERIFY it took — an upgrade
 #                                              # silently no-ops more often
 #                                              # than you would think
 #
@@ -37,15 +44,21 @@
 # stale on 2026-07-29. This unit intentionally does not use that pattern.
 #
 # If you ever install this timer on a DIFFERENT machine, first confirm THAT
-# machine's `coord` is a non-editable install before trusting it unattended:
+# machine actually has a `~/.coord-venv` — the same pinned, non-editable
+# install every other daemon lane already depends on — before trusting it
+# unattended:
 #
-#   readlink -f ~/.local/bin/coord
-#   pip show code-coordinator | grep -i editable     # must print NOTHING
+#   readlink -f ~/.coord-venv/bin/coord                  # must resolve INTO
+#                                                         # the venv, not out
+#                                                         # to a checkout
+#   ~/.coord-venv/bin/pip show code-coordinator | grep -i editable
+#                                                         # must print NOTHING
 #
-# An editable checkout (e.g. elitebook's dev box, where ~/.local/bin/coord
-# points at ~/src/code-coordinator) lets a worker's branch churn rewrite the
-# runner's own code out from under a live tick. Do not install this unit
-# there. See docs/DRIVE_QUEUE.md.
+# An editable ~/.coord-venv (rare, but possible on a dev box someone
+# repointed by hand) lets a worker's branch churn rewrite the runner's own
+# code out from under a live tick just as badly as the ~/.local/bin/coord
+# symlink-overwrite case this fix closes — do not install this unit on a
+# machine whose ~/.coord-venv is editable. See docs/DRIVE_QUEUE.md.
 #
 # Install:
 #   mkdir -p ~/.config/systemd/user
@@ -109,7 +122,7 @@ KillMode=process
 # ceiling (>= the release carrying #1972). A higher global ceiling on an
 # older coord launches two same-repo drives, which stale each other's
 # Test verdicts (#1479) — the exact collision #1972 exists to prevent.
-ExecStart=%h/.local/bin/coord drive-queue tick --max-parallel 4 --config %h/.coord/coordinator.yml
+ExecStart=%h/.coord-venv/bin/coord drive-queue tick --max-parallel 4 --config %h/.coord/coordinator.yml
 # Generous relative to the tick's own ~120s launch-subprocess timeout
 # (_LAUNCH_TIMEOUT_SECONDS in coord/commands/drive_queue.py), but well below
 # the timer's 15-minute cadence (coord-drive-queue.timer) so a genuinely

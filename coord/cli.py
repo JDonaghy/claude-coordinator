@@ -300,49 +300,80 @@ def _warn_if_source_install_drift() -> None:
         pass
 
 
-def _warn_if_editable_checkout_moved() -> None:
-    """#561/#601 backstop: when running from an EDITABLE checkout, warn loudly if
-    its branch was moved off the default.
+def _editable_checkout_drift() -> tuple[Path, str] | None:
+    """Pure query behind both #561/#601's CLI warning and #2314's
+    drive-queue tick refusal (:mod:`coord.drive_queue`): is THIS process an
+    EDITABLE checkout of coord, and if so, is it on a branch other than the
+    default one?
 
-    A Build/`coord test`/smoke that git-checkout'd the base — or an interactive
-    agent inspecting a branch in the live checkout — silently puts the running
-    coordinator on that branch's code until restored (#561 incident: disabled
-    guards; #601 incident: old code + retired local DB). This makes that state
-    visible on every command instead of waiting for a verdict or manual restore.
+    A Build/`coord test`/smoke that git-checkout'd the base — or an
+    interactive agent inspecting a branch in the live checkout — silently
+    puts the running coordinator on that branch's code until restored (#561
+    incident: disabled guards; #601 incident: old code + retired local DB).
+
+    Returns ``(repo_root, shown)`` when drifted — ``shown`` is the branch
+    name formatted the way both callers print it (quoted, or
+    ``"(detached HEAD)"``) — or ``None`` when this is a non-editable/
+    site-packages install, isn't a git checkout at all, is cleanly on
+    ``main``/``master``, or the check itself couldn't be completed (git not
+    on PATH, no ``.git``, a timeout). Every failure mode here is read-only
+    and best-effort, so it degrades to "no drift detected" rather than
+    raising — a flaky read must never itself block a tick or crash a
+    command.
     """
     import subprocess  # noqa: PLC0415
-    import sys as _sys  # noqa: PLC0415
 
-    if "pytest" in _sys.modules:
-        return  # don't add startup noise to the test suite
     try:
         import coord as _coord  # noqa: PLC0415
 
         coord_file = _coord.__file__ or ""
         if "site-packages" in coord_file:
-            return  # PyPI/snapshot install — moving a checkout can't affect it.
+            return None  # PyPI/snapshot install — moving a checkout can't affect it.
         repo_root = Path(coord_file).resolve().parents[1]
         if not (repo_root / ".git").exists():
-            return
+            return None
         head = subprocess.run(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
             cwd=str(repo_root), capture_output=True, text=True, timeout=3,
         )
         if head.returncode != 0:
-            return
+            return None
         branch = head.stdout.strip()
         if branch in ("main", "master"):
-            return
+            return None
         shown = "(detached HEAD)" if branch == "HEAD" else f"'{branch}'"
-        click.echo(
-            f"⚠ coord: editable checkout {repo_root} is on {shown}, not the "
-            "default branch — the running coordinator is on THAT code. A "
-            "Build/smoke/test may have checked it out. Restore with:  "
-            f"git -C {repo_root} checkout main",
-            err=True,
-        )
-    except Exception:  # noqa: BLE001 — best-effort, never break the CLI
-        pass
+        return (repo_root, shown)
+    except Exception:  # noqa: BLE001 — best-effort, never break the caller
+        return None
+
+
+def _warn_if_editable_checkout_moved() -> None:
+    """#561/#601 backstop: when running from an EDITABLE checkout, warn loudly if
+    its branch was moved off the default.
+
+    This makes that state visible on every command instead of waiting for a
+    verdict or manual restore. #2314 escalated the SAME underlying reading
+    (:func:`_editable_checkout_drift`) from advisory-only here to a hard
+    refusal inside the drive-queue tick gate — see
+    ``coord.drive_queue.plan_tick``'s ``editable_drift`` parameter — because
+    a warning nobody is watching an unattended tick's log for is not a gate.
+    This function stays as the interactive/human-facing half of that fix.
+    """
+    import sys as _sys  # noqa: PLC0415
+
+    if "pytest" in _sys.modules:
+        return  # don't add startup noise to the test suite
+    drift = _editable_checkout_drift()
+    if drift is None:
+        return
+    repo_root, shown = drift
+    click.echo(
+        f"⚠ coord: editable checkout {repo_root} is on {shown}, not the "
+        "default branch — the running coordinator is on THAT code. A "
+        "Build/smoke/test may have checked it out. Restore with:  "
+        f"git -C {repo_root} checkout main",
+        err=True,
+    )
 
 
 @click.group(help="Multi-agent coordinator for Claude Code workers.")

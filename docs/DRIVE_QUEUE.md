@@ -432,22 +432,31 @@ already uses to release a `parked` entry on the same lane.
 ## 5. The pinned-CLI trap
 
 The timer runs a **specific installed `coord`**, not a checkout — it does not
-notice a merged fix on `main` until that `coord` is upgraded. On dellserver,
-`~/.local/bin/coord` is a symlink into `~/.coord-venv`, a pinned, non-editable
-PyPI install — the very same venv `deploy/coord-agent.service` runs `coord
-agent` from (`%h/.coord-venv/bin/coord`, see `install-agent.sh`). That already
-satisfies #1523's "the runner's own CLI must not be rewritable by worker
-branch churn" requirement, **and** it means this venv is upgraded by the
-ordinary, already-documented fleet procedure. It is deliberately **not** a
-bespoke pinned venv like the epic sequencer's `~/.coord-cli-venv`
-(`docs/AGENT_OPERATIONS.md`'s "fourth lane"), which only a human remembering
-to run the upgrade keeps current, and which was found three releases stale
-on 2026-07-29.
+notice a merged fix on `main` until that `coord` is upgraded. `ExecStart`
+points at `%h/.coord-venv/bin/coord` **directly** (#2314 — not
+`~/.local/bin/coord`, even though on dellserver that is normally a symlink
+into the very same venv): the same venv `deploy/coord-agent.service`,
+`coord-serve.service`, `coord-notify.service` and `coord-web.service` already
+run from (see `install-agent.sh`). Pointing at the venv path directly, rather
+than through `~/.local/bin/coord`, closes the gap that path left open: a
+worker running `pip install --user` (or an editable `pip install -e .` that
+lands its own console-script shim there) can silently overwrite
+`~/.local/bin/coord` with something that no longer points at the pinned venv
+at all, and the first this tick would know about that is the next `coord
+drive-queue tick` running whatever the worker just wrote. Going straight to
+`~/.coord-venv/bin/coord` makes that overwrite structurally irrelevant to
+this unit. That already satisfies #1523's "the runner's own CLI must not be
+rewritable by worker branch churn" requirement, **and** it means this venv is
+upgraded by the ordinary, already-documented fleet procedure. It is
+deliberately **not** a bespoke pinned venv like the epic sequencer's
+`~/.coord-cli-venv` (`docs/AGENT_OPERATIONS.md`'s "fourth lane"), which only
+a human remembering to run the upgrade keeps current, and which was found
+three releases stale on 2026-07-29.
 
 ```bash
 coord agent update --machine dellserver   # or --all; upgrades ~/.coord-venv
                                            # in place and restarts coord-agent
-~/.local/bin/coord --version              # VERIFY it took — an upgrade
+~/.coord-venv/bin/coord --version         # VERIFY it took — an upgrade
                                            # silently no-ops more often than
                                            # you would think
 ```
@@ -459,19 +468,31 @@ currently running on dellserver — check for active assignments first (see
 drive` process tree, independent of `coord-agent`.
 
 **If you ever install this timer on a machine other than the current daemon
-host, verify first that its `coord` resolves to a non-editable install:**
+host, verify first that its `~/.coord-venv` is a non-editable install:**
 
 ```bash
-readlink -f ~/.local/bin/coord                   # which venv it resolves to
-pip show code-coordinator | grep -i editable   # must print NOTHING
+readlink -f ~/.coord-venv/bin/coord              # must resolve INTO the venv,
+                                                  # not out to a checkout
+~/.coord-venv/bin/pip show code-coordinator | grep -i editable
+                                                  # must print NOTHING
 ```
 
-The topology is **per-machine, not universal** — on a dev box (e.g.
-elitebook) `~/.local/bin/coord` is commonly an *editable* install pointing at
-a checkout, which would let a worker's own branch churn rewrite the runner
-mid-run. That is fine for interactive use; it is not safe under an unattended
-timer. Install `coord-drive-queue.timer` only where the verify step above
-comes back non-editable.
+The topology is **per-machine, not universal** — a dev box's `~/.coord-venv`
+(or, on a box with no such venv at all, whatever a hand-edited unit points
+at instead) can be repointed at a checkout, which would let a worker's own
+branch churn rewrite the runner mid-run. That is fine for interactive use; it
+is not safe under an unattended timer. Install `coord-drive-queue.timer` only
+where the verify step above comes back non-editable.
+
+**Belt and suspenders (#2314):** even on a correctly-pinned host, the tick
+itself now refuses to launch anything if `coord`'s OWN process happens to be
+running from an editable checkout that has drifted off its default branch —
+see `coord.drive_queue.plan_tick`'s `editable_drift` parameter and
+`coord.cli._editable_checkout_drift`. This used to be an advisory-only
+warning printed at CLI startup that nothing unattended ever reads; it is now
+a hard refusal, rendered the same way a release cordon is (`no launch — this
+host's coord is drifted onto ...`), with reconciliation still running
+underneath it exactly as a cordon leaves it.
 
 ## 6. The deadline trap (#1660)
 

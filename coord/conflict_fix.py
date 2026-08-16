@@ -70,6 +70,13 @@ CONFLICT_FIX_DENY_COMMANDS = [
     "Bash(gh *)",
     "Bash(git push --force *)",
     "Bash(git push -f *)",
+    # #2314: the two entries above only match `--force`/`-f` IMMEDIATELY
+    # after `push` — a `--force-with-lease` push (the sanctioned, allowed
+    # form, see this module's own guidance above) must stay clear, but
+    # `git push --quiet --force ...` / `git push --quiet -f ...` (the flag
+    # pushed after some other one) must not evade the ban either.
+    "Bash(git push * --force *)",
+    "Bash(git push * -f *)",
 ]
 
 

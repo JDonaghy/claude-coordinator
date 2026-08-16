@@ -1240,6 +1240,14 @@ class TickPlan:
     # a bool, because a queue that stops with no stated reason is the failure
     # the cordon mechanism exists to stop repeating.
     cordon_reason: str = ""
+    # #2314: non-empty when THIS host's own `coord` is an editable checkout
+    # that has drifted off its default branch (see `editable_drift` on
+    # `plan_tick` and `coord.cli._editable_checkout_drift`), in which case
+    # nothing launched this tick and `launch` is guaranteed None — same
+    # shape as `cordon_reason` and for the same reason: a queue that stops
+    # must say why in a field the shell can render, not just a log line
+    # nobody is watching an unattended tick for.
+    drift_reason: str = ""
 
     @property
     def free_slots(self) -> int:
@@ -2412,6 +2420,37 @@ def _normalized_cordons(cordons: Mapping[str, str] | None) -> dict[str, str]:
     }
 
 
+def _editable_drift_alert(repo_root: str, shown: str) -> QueueAlert:
+    """The queue-level record for "this host's own coord has drifted" (#2314).
+
+    Mirrors :func:`_cordon_alert`: a queue that stops must say why, in the
+    same channel and with the same one-key remedy field. Unlike a cordon
+    (an operator-declared, self-expiring pause) this is an *accident* —
+    something (a Build, a `coord test`/smoke run, an interactive agent
+    poking at the live checkout) git-checked-out this host's editable
+    ``coord`` install onto a non-default branch, and every tick since has
+    been reconciling and launching under whatever code that branch happens
+    to carry. #2314: this used to be advisory-only (a warning at CLI
+    startup nobody unattended is watching for); now it is a hard refusal —
+    a worker branch that silently swaps out the tool driving it is exactly
+    the #561/#601 failure class this whole module exists to avoid adding
+    to.
+    """
+    return QueueAlert(
+        reason=(
+            f"no launch — this host's coord ({repo_root}) is an editable "
+            f"checkout on {shown}, not its default branch — the tick would "
+            "be reconciling and launching under whatever code that branch "
+            "carries. Restore it before anything launches here again."
+        ),
+        details=(
+            "reconciliation (steps 1/1b) still runs — this only refuses to "
+            "launch NEW work, the same posture a release cordon takes",
+        ),
+        command=f"git -C {repo_root} checkout main",
+    )
+
+
 def _cordon_alert(host: str, reason: str) -> QueueAlert:
     """The queue-level record for "this host is cordoned" (#2101 trap E).
 
@@ -2490,6 +2529,7 @@ def plan_tick(
     cordons: Mapping[str, str] | None = None,
     live_ci_gate: Mapping[str, bool] | None = None,
     live_blocked_gate: Mapping[str, bool] | None = None,
+    editable_drift: tuple[str, str] | None = None,
 ) -> TickPlan:
     """Decide one tick.  Pure; the caller executes the returned plan.
 
@@ -2565,6 +2605,20 @@ def plan_tick(
     leave a finished drive's `running` row pinning propagation forever — the
     #2110 deadlock, re-created by the very mechanism meant to end it.  A
     cordoned tick is exactly `--reconcile-only`.
+
+    *editable_drift* is ``(repo_root, shown)`` (a rendered branch label —
+    see :func:`coord.cli._editable_checkout_drift`) when THIS host's own
+    ``coord`` is an editable checkout that has drifted off its default
+    branch, or ``None`` when it hasn't (the overwhelming common case — a
+    release install, or an editable one still cleanly on `main`). #2314:
+    this used to be advisory-only — a warning printed at CLI startup
+    (`coord.cli._warn_if_editable_checkout_moved`) that nothing unattended
+    ever reads. Non-``None`` here launches NOTHING this tick, same posture
+    and same position as a local cordon (checked immediately after it,
+    before capacity) — reconciliation still runs, for the identical #2110
+    reason a cordon doesn't freeze it either. Deliberately host-scoped, not
+    fleet-scoped: a drifted checkout only makes THIS host's tick
+    untrustworthy, not every host's.
 
     *live_ci_gate* maps a `parked` entry's key to whether a FRESH,
     single-entry re-derivation of its gate — computed by the shell THIS
@@ -3018,6 +3072,25 @@ def plan_tick(
             cordon_reason=local_cordon,
         )
 
+    # #2314 step 2c: is THIS host's own `coord` a drifted editable checkout?
+    # Checked right after the cordon (same reasoning: reconciliation must
+    # still run — see the docstring) and, like the cordon, before capacity —
+    # a drifted checkout launches nothing however many slots are free. This
+    # is the escalation of `coord.cli._warn_if_editable_checkout_moved` from
+    # advisory-only to an actual refusal.
+    if editable_drift is not None:
+        drift_repo_root, drift_shown = editable_drift
+        drift_text = f"drifted onto {drift_shown} ({drift_repo_root})"
+        return TickPlan(
+            **plan_base,
+            reconciles=tuple(reconciles),
+            blocked=tuple(blocked),
+            deferrals=(),
+            alert=_editable_drift_alert(drift_repo_root, drift_shown),
+            launch=None,
+            drift_reason=drift_text,
+        )
+
     if capacity - occupied <= 0:
         return TickPlan(
             **plan_base,
@@ -3440,6 +3513,11 @@ def render_plan(plan: TickPlan, *, dry_run: bool = False) -> list[str]:
             f"  no launch — this host is {plan.cordon_reason}; in-flight "
             "drives are draining and the queue resumes once it is rolled"
         )
+    elif plan.drift_reason:
+        # #2314: same "name it or it reads as a mystery" reasoning as the
+        # cordon branch above — this host's own `coord` is untrustworthy
+        # right now, not the queue.
+        lines.append(f"  no launch — this host's coord is {plan.drift_reason}")
     elif plan.capacity and plan.free_slots == 0:
         # Naming the reason matters more here than anywhere else in this
         # render: #1794 was diagnosed entirely from a journal, and "no launch"
