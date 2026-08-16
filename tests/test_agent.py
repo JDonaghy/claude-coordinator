@@ -1134,6 +1134,64 @@ def test_default_worker_command_resume_flag_present() -> None:
     assert argv[idx + 1] == "ses-abc123"
 
 
+# ── #2301: smoke legs must not hold Monitor (or Edit/Write) ────────────────
+#
+# Root cause: smoke fell through to the generic `else` branch and inherited
+# the #2169 `Monitor` grant meant for *work*-shaped legs. `Monitor` is an
+# await-a-notification tool — calling it ends the current turn to wait for a
+# wake-up condition, which only resumes anything in an INTERACTIVE session.
+# Every coord leg, smoke included, is a one-shot `claude -p` session (#1394):
+# ending the turn ends the session itself, permanently, before any
+# notification can arrive. Two real smoke legs did exactly this — reached
+# `Monitor` via ToolSearch to poll a backgrounded `cargo test`, ended their
+# turn to "wait" for it, and died 16-24s later with no verdict printed, while
+# the backgrounded suite was reaped out from under them ~30s after that.
+
+
+def _smoke_spec(**overrides) -> AssignmentSpec:
+    base = dict(
+        repo_name="api",
+        repo_path="/tmp/repo",
+        issue_number=2301,
+        issue_title="[smoke] t",
+        briefing="b",
+        branch="main",
+        type="smoke",
+    )
+    base.update(overrides)
+    return AssignmentSpec(**base)
+
+
+def test_default_worker_command_smoke_type_does_not_grant_monitor() -> None:
+    argv = default_worker_command(_smoke_spec())
+    allowed = argv[argv.index("--allowedTools") + 1].split(",")
+    assert "Monitor" not in allowed
+
+
+def test_default_worker_command_smoke_type_gets_read_bash_only() -> None:
+    """A smoke leg validates; it never mutates — no Edit/Write either."""
+    argv = default_worker_command(_smoke_spec())
+    allowed = argv[argv.index("--allowedTools") + 1]
+    assert allowed == "Read,Bash"
+
+
+def test_default_worker_command_smoke_type_uses_smoke_system_prompt() -> None:
+    """Confirms the smoke branch's default system prompt is
+    coord.smoke.SMOKE_SYSTEM_PROMPT, not the generic WORKER_SYSTEM_PROMPT
+    the old fall-through `else` branch would have used."""
+    from coord.smoke import SMOKE_SYSTEM_PROMPT
+
+    argv = default_worker_command(_smoke_spec())
+    system_prompt = argv[argv.index("--system-prompt") + 1]
+    assert system_prompt.startswith(SMOKE_SYSTEM_PROMPT)
+
+
+def test_default_worker_command_smoke_type_honours_explicit_system_prompt() -> None:
+    argv = default_worker_command(_smoke_spec(system_prompt="custom smoke prompt"))
+    system_prompt = argv[argv.index("--system-prompt") + 1]
+    assert system_prompt.startswith("custom smoke prompt")
+
+
 # ── #1315: structural sealing enforcement (write-guard) ─────────────────────
 
 

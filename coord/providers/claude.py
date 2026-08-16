@@ -120,6 +120,7 @@ class ClaudeProvider(Provider):
             _sealed_write_guard_tools,
             build_deny_prompt,
         )
+        from coord.smoke import SMOKE_SYSTEM_PROMPT  # noqa: PLC0415
 
         binary = self._binary if self._binary is not None else DEFAULT_WORKER_BINARY
 
@@ -170,12 +171,22 @@ class ClaudeProvider(Provider):
                 _sp = spec.system_prompt if spec.system_prompt else MOCK_AUTHOR_SYSTEM_PROMPT
                 _sp += build_deny_prompt(MOCK_AUTHOR_DENY_COMMANDS)
                 _at = "Read,Edit,Write,Bash"
+            elif spec.type == "smoke":
+                # #2301: keep in sync with default_worker_command's identical
+                # branch — smoke gets Read,Bash only, deliberately WITHOUT
+                # Monitor (an await-a-notification tool that ends a smoke
+                # leg's one-shot session before any wake-up can arrive) or
+                # Edit/Write (a smoke leg validates; it never mutates).
+                _sp = spec.system_prompt if spec.system_prompt else SMOKE_SYSTEM_PROMPT
+                _sp += build_deny_prompt(spec.deny_commands)
+                _at = "Read,Bash"
             else:
                 _sp = spec.system_prompt if spec.system_prompt else WORKER_SYSTEM_PROMPT
                 _sp += build_deny_prompt(spec.deny_commands)
                 # #2169: keep in sync with default_worker_command's identical
                 # branch — Monitor is the sanctioned bounded-poll tool for a
-                # backgrounded long-running command.
+                # backgrounded long-running command. #2301: this grant is for
+                # work-shaped legs only — smoke has its own branch above.
                 _at = "Read,Edit,Write,Bash,Monitor"
 
             if system_prompt is None:
