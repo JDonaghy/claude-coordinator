@@ -173,4 +173,5 @@ export interface Assignment {
   audit_run_number: number | null
   for_issue_number: number | null
   driven_by: string | null
+  stop_reason: string | null
 }
