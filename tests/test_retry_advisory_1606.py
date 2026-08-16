@@ -121,6 +121,15 @@ class TestRetryAcceptsZeroCommitAdvisory:
         out = output_and_stderr(result)
         assert result.exit_code == 1
         assert "could not be confirmed" in out
+        # #2324: a genuine lookup failure is not confirmation that commits
+        # exist. The message must not assert the #1357 false-positive shape
+        # or steer the operator at a remedy (--accept-advisory) that assumes
+        # real commits are sitting on the branch — nothing here established
+        # that. It should instead say what to check.
+        assert "#1357" not in out
+        assert "--accept-advisory" not in out
+        assert "existing commits" not in out
+        assert "coord log 0256c844edfb" in out
 
     def test_done_status_is_still_refused(self, valid_config_path: Path) -> None:
         """Control: only `failed` and `advisory` are retryable — every other
