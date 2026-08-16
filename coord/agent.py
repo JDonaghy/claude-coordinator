@@ -7079,6 +7079,20 @@ class AgentServer:
             assert proc.stdin is not None
             proc.stdin.write(initial_input)
             proc.stdin.flush()
+            # #2306: a provider that does not support stdin message injection
+            # (``capabilities().inject == False``, e.g. OpenCodeProvider,
+            # which takes its briefing on argv) never writes to or closes
+            # this pipe again.  Leaving it open blocks the worker forever —
+            # it never sees an EOF on stdin — until the 600s TTFT watchdog
+            # kills it having emitted zero bytes.  Close it here so such a
+            # worker gets its EOF immediately after the (empty) initial
+            # write.  ``provider_obj`` is ``None`` on the legacy path
+            # (``spec.provider is None``, pre-#324 behaviour) — treat that
+            # as claude/inject-capable and leave stdin open, matching
+            # ``inject_message``'s existing "no provider info => allow"
+            # fallback.
+            if provider_obj is not None and not provider_obj.capabilities().inject:  # type: ignore[attr-defined]
+                proc.stdin.close()
         except (BrokenPipeError, OSError) as e:
             log_fh.write(f"\n# failed to send initial briefing: {e}\n")
 
