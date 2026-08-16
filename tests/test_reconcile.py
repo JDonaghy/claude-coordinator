@@ -444,3 +444,78 @@ class TestAutoReassignProviderMismatch:
         assert "a1" in changed  # the failure itself is still recorded
         assert not any("[retry]" in a.issue_title for a in board.active)
         mock_post.assert_not_called()
+
+
+# ── the drive-queue entry point (#2323's unattended path) ─────────────────
+
+
+class TestDriveResumeOfAFailedWorkRow:
+    """#2323 acceptance, second entry point: `coord drive` resuming a
+    `failed` work row.
+
+    Drive has no retry implementation of its own — `decide()` returns an
+    `Action(kind=RUN, command=("retry", <aid>))` and `Driver.run_coord`
+    shells that straight out as `coord retry <aid> --config …`. This test
+    stitches the two halves together rather than asserting them apart:
+    take the command drive actually decided on, run *that* through the
+    CLI, and assert the dispatch payload names `opencode`. Without the
+    fix this is the transcript in the issue — drive's own header prints
+    `provider: opencode` and four seconds later dispatches claude.
+    """
+
+    @patch("coord.reconcile.httpx.post")
+    def test_drives_failed_work_row_retry_dispatches_through_opencode(
+        self, mock_post: MagicMock, tmp_path: Path, coord_db,
+    ) -> None:
+        from coord.drive import RUN, DriveCounters, DriveOptions, decide
+        from coord.drive_state import IssueState
+
+        # 1. What does `coord drive` do with a failed work row?
+        action = decide(
+            IssueState(
+                repo="api", issue=1, repo_github="acme/api",
+                work_aid="workid", work_status="failed",
+                work_failure_reason="boom",
+            ),
+            DriveOptions(machine="laptop", max_work_retries=2),
+            DriveCounters(),
+            MagicMock(),
+            machine="laptop",
+            oracle=None,
+            gate_checker=MagicMock(),
+        )
+        assert action.kind == RUN
+        assert action.command == ("retry", "workid")
+
+        # 2. Run exactly that command — the same argv `Driver.run_coord`
+        #    builds — and assert on the resolved provider in the payload.
+        config_file = _config_file_with_opencode_label(tmp_path)
+        _seed_issue(number=1, labels=["harness:opencode"])
+        board = Board(completed=[
+            _failed(
+                assignment_id="workid", provider_name="opencode",
+                model="opencode/glm-5.2",
+            ),
+        ])
+        resp = MagicMock()
+        resp.json.return_value = {"id": "retry1"}
+        resp.raise_for_status = lambda: None
+        mock_post.return_value = resp
+
+        with (
+            patch("coord.board_service.read_board", return_value=board),
+            patch("coord.board_service.write_board"),
+        ):
+            result = CliRunner().invoke(
+                main, [*action.command, "--config", str(config_file)],
+            )
+
+        out = output_and_stderr(result)
+        assert result.exit_code == 0, out
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["provider"] == "opencode"
+        # The drive transcript's compounding defect: each unattended
+        # failure walked the claude ladder one more rung (sonnet -> opus
+        # -> fable) for a run that never used a claude model.
+        assert "escalating model" not in out
+        assert payload["model"] == "opencode/glm-5.2"
