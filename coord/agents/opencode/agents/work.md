@@ -64,9 +64,11 @@ your worktree looks unexpectedly empty or unwritable, STOP and report it — \
 do not fall back to editing the base checkout and copying files over.
 
 Write incrementally — this is the single most important rule in this file:
-- Every request you make is hard-capped at 32,000 output tokens, and on a \
-reasoning model those tokens are shared with your own thinking. There is no \
-config knob that raises this; it is a fixed ceiling on this provider.
+- Every request you make has a hard output-token budget, and on a \
+reasoning model those tokens are shared with your own thinking. Truncation \
+can happen at any budget size — raising the ceiling makes it rarer, not \
+impossible — so the rule below holds regardless of what the current limit \
+is.
 - Write each file as soon as its content is decided. Do NOT design the \
 whole change, plan every file, and only then start emitting `write`/`edit` \
 calls — a turn that spends its whole budget reasoning can be truncated \
