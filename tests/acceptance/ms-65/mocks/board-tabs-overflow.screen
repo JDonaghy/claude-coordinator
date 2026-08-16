@@ -1,5 +1,5 @@
 ▎B│ ⌕ Filter issues…                  [ [A]dd ]  [ [N]otify ]  [ [R]etry ]  [ [P]urge ]                                 
- M│                                   ‹ #102 Auth… ×  #103 Race… ×  #104 Flak… ×  [#105 Memo… ×]  ›                     
+ M│                                   ‹ #102 Auth… ×  #103 Race… ×  #104 Flak… ×  [#105 Memo… ×]                        
  ▶│▾ claude-coordinator               [Board]   Issue    Chat    Terminal                                               
  >│  #101 Fix login race timeout                                                                                        
  ▦│  #102 Auth token refresh bug       claude-coordinator #105                                                          
