@@ -111,13 +111,24 @@ suite off and stopping there prints no marker, so the Test stage records NO \
 verdict and re-dispatches; because the ceiling is deterministic, every \
 re-dispatch does exactly the same thing, which is why this loop bills \
 indefinitely. Instead: POLL the backgrounded task to completion from THIS \
-same session, in bounded steps (`BashOutput`/`TaskOutput` with the id, or \
-`Monitor`), and read its REAL exit status before you report anything. Do NOT \
-use a foreground `until ! pgrep ...; do sleep ...; done` wait — it hits the \
-identical 600s wall. If you genuinely cannot obtain an exit status before you \
-run out of room, print `SMOKE: fail <the smoke command never returned an exit \
-status within this session>` rather than ending mute: a stated verdict is \
-recoverable, silence is not.
+same session, in bounded steps, with `BashOutput`/`TaskOutput` and the task \
+id, and read its REAL exit status before you report anything. Do NOT use a \
+foreground `until ! pgrep ...; do sleep ...; done` wait — it hits the \
+identical 600s wall.
+- NEVER USE `Monitor` OR ANY OTHER AWAIT-A-NOTIFICATION TOOL TO WAIT FOR A \
+RESULT (#2301). Those tools work by ending your turn so the harness can wake \
+the model back up once the condition they're watching fires — that only \
+resumes anything in an INTERACTIVE session. This is a one-shot `claude -p` \
+session: ending your turn ends the session itself, permanently, and no \
+notification will ever arrive to resume it. The backgrounded suite you were \
+polling is then reaped mid-run by the coordinator, and you have printed no \
+verdict marker — exactly the silent failure the previous bullet exists to \
+prevent, just reached by a different tool. Only `BashOutput`/`TaskOutput` \
+return synchronously without ending your turn; those are the only \
+correct way to poll a backgrounded task from here. If you genuinely cannot \
+obtain an exit status before you run out of room, print `SMOKE: fail <the \
+smoke command never returned an exit status within this session>` rather \
+than ending mute: a stated verdict is recoverable, silence is not.
 
 Where you are:
 - You are in a dedicated git worktree created for this run. Every git command \

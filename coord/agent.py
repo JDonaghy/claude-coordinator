@@ -3849,6 +3849,12 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
     For ``type="plan"`` specs the worker gets :data:`WORKER_PLAN_PROMPT` as
     its system prompt and only ``Read,Bash`` in ``--allowedTools`` — no
     Edit/Write tools so it cannot modify the repository.
+
+    For ``type="smoke"`` specs the worker gets ``Read,Bash`` only — no
+    Edit/Write, and deliberately no ``Monitor`` (#2301): a smoke leg is a
+    one-shot ``claude -p`` session, and ``Monitor`` ends the turn to await a
+    notification that can never arrive in time to resume it, which silently
+    kills a backgrounded smoke suite mid-run and leaves no verdict printed.
     """
     if spec.type == "plan":
         system_prompt = spec.system_prompt if spec.system_prompt else WORKER_PLAN_PROMPT
@@ -3906,6 +3912,33 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
         system_prompt = spec.system_prompt if spec.system_prompt else MOCK_AUTHOR_SYSTEM_PROMPT
         system_prompt += build_deny_prompt(MOCK_AUTHOR_DENY_COMMANDS)
         allowed_tools = "Read,Edit,Write,Bash"
+    elif spec.type == "smoke":
+        # #2301: smoke gets its own branch instead of falling through to the
+        # generic `else` below (which is where it used to land, and where
+        # it inherited the #2169 `Monitor` grant meant for *work* legs).
+        # A smoke runner's whole job is "pull the branch, run the smoke
+        # command, report pass/fail" (see SMOKE_SYSTEM_PROMPT) — it edits
+        # nothing and pushes nothing, so it has no business holding
+        # Edit/Write either.
+        #
+        # `Monitor` is deliberately withheld: it is an await-a-notification
+        # tool — calling it ends the current turn so the harness can wake
+        # the model back up once the condition it's watching fires. That
+        # only resumes anything in an INTERACTIVE session. A smoke leg is a
+        # one-shot `claude -p` session like every coord leg (#1394): ending
+        # the turn ends the session itself, permanently, before any
+        # notification can arrive. The agent was observed reaching for
+        # `Monitor` via ToolSearch to poll a backgrounded smoke suite, then
+        # ending its turn to "wait" — the session (and the backgrounded
+        # suite, reaped ~30s later) died silently with no verdict printed,
+        # burning a Test dispatch for zero signal every single retry.
+        # `BashOutput`/`TaskOutput` (already reachable without an explicit
+        # grant — see the #2169 comment above) return synchronously and are
+        # the correct way to poll a backgrounded task from here.
+        from coord.smoke import SMOKE_SYSTEM_PROMPT  # noqa: PLC0415
+        system_prompt = spec.system_prompt if spec.system_prompt else SMOKE_SYSTEM_PROMPT
+        system_prompt += build_deny_prompt(spec.deny_commands)
+        allowed_tools = "Read,Bash"
     else:
         system_prompt = spec.system_prompt if spec.system_prompt else WORKER_SYSTEM_PROMPT
         system_prompt += build_deny_prompt(spec.deny_commands)
@@ -3915,6 +3948,15 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
         # past the 600s Bash ceiling. `TaskOutput`/`TaskStop` were already
         # reachable without being in this list; `Monitor` was the one
         # observed denied.
+        #
+        # #2301: this grant is for *work*-shaped legs (work/review/fix/
+        # conflict-fix) whose system prompt (WORKER_SYSTEM_PROMPT, the
+        # ONE-SHOT section) explicitly teaches the bounded-poll pattern and
+        # explains why an await-a-notification tool is safe to reach for
+        # ONLY with that guidance attached. `smoke` used to fall through to
+        # this branch and inherit `Monitor` with none of that context — see
+        # the dedicated `elif spec.type == "smoke"` branch above, which
+        # deliberately withholds it instead.
         allowed_tools = "Read,Edit,Write,Bash,Monitor"
 
     # NOTE: briefing is NOT passed as a positional arg — it is written to

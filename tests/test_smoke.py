@@ -474,6 +474,45 @@ def test_smoke_system_prompt_tells_the_worker_to_poll_a_backgrounded_run() -> No
     assert not any(line.startswith("SMOKE:") for line in prompt.splitlines())
 
 
+# ── #2301: Monitor is an await-a-notification tool — it ends a headless leg ─
+
+
+def test_smoke_system_prompt_does_not_recommend_monitor_for_polling() -> None:
+    """#2272's own fix text used to name `Monitor` as a sanctioned polling
+    option alongside `BashOutput`/`TaskOutput`. Two real smoke legs took that
+    literally on 2026-08-15: reached `Monitor` via ToolSearch, called it to
+    "wait" for a backgrounded `cargo test`, and ended their turn — which IS
+    the end of a one-shot `claude -p` session (#1394). Both legs died in
+    16-24s, before the suite even finished compiling, with no verdict ever
+    printed; the backgrounded suite was reaped ~30s later by the coordinator.
+    `Monitor` must not appear as a recommended polling tool in this prompt
+    any more — `BashOutput`/`TaskOutput` still do the job without ending the
+    turn."""
+    prompt = SMOKE_SYSTEM_PROMPT
+    assert "BashOutput" in prompt
+    assert "TaskOutput" in prompt
+    # The old phrasing offered Monitor as an alternative poll mechanism
+    # ("...with the id, or `Monitor`)") right next to BashOutput/TaskOutput
+    # — that specific recommendation must be gone.
+    assert "or `Monitor`" not in prompt
+
+
+def test_smoke_system_prompt_states_monitor_ends_a_headless_session() -> None:
+    """Positive statement, not just an absence: the prompt must explain WHY
+    Monitor (and tools like it) are wrong here, or the next worker reaches
+    for it again under a different name — mirrors the #2158 lesson that
+    WORKER_SYSTEM_PROMPT's ONE-SHOT section bakes in for work legs."""
+    prompt = SMOKE_SYSTEM_PROMPT
+    assert "#2301" in prompt
+    assert "Monitor" in prompt
+    lowered = prompt.lower()
+    assert "await-a-notification" in lowered
+    assert "one-shot" in lowered
+    # The actual mechanism, not just "don't do this": ending the turn to
+    # await a notification ends the whole headless session, permanently.
+    assert "ending your turn ends the session itself" in lowered
+
+
 def test_briefing_tells_the_worker_to_poll_a_backgrounded_run() -> None:
     """The briefing carries the same instruction as the system prompt — it is
     what the worker re-reads while deciding what to do next."""

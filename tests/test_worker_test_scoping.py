@@ -124,13 +124,28 @@ def test_default_worker_command_grants_monitor_for_work_type() -> None:
         assert tool in allowed.split(",")
 
 
-@pytest.mark.parametrize("spec_type", ["review", "fix", "smoke", "conflict-fix"])
+@pytest.mark.parametrize("spec_type", ["review", "fix", "conflict-fix"])
 def test_default_worker_command_other_write_types_also_get_monitor(spec_type: str) -> None:
-    """`review`/`fix`/`smoke`/`conflict-fix` all fall through the same `else`
-    branch as `work` — confirm the grant isn't accidentally work-only."""
+    """`review`/`fix`/`conflict-fix` all fall through the same `else` branch
+    as `work` — confirm the grant isn't accidentally work-only.
+
+    `smoke` used to be in this list too, but #2301 gave it its own branch
+    (see test_default_worker_command_smoke_type_withholds_monitor below) —
+    smoke legs are one-shot sessions where an await-a-notification tool
+    like `Monitor` ends the session before any wake-up can arrive."""
     argv = default_worker_command(_work_spec(type=spec_type))
     allowed = argv[argv.index("--allowedTools") + 1]
     assert "Monitor" in allowed.split(",")
+
+
+def test_default_worker_command_smoke_type_withholds_monitor() -> None:
+    """#2301: a smoke leg is a one-shot `claude -p` session (#1394) — calling
+    `Monitor` there ends the session permanently before any notification can
+    arrive, silently killing a backgrounded smoke suite mid-run. Smoke must
+    not hold Monitor, or Edit/Write (it validates; it never mutates)."""
+    argv = default_worker_command(_work_spec(type="smoke"))
+    allowed = argv[argv.index("--allowedTools") + 1]
+    assert allowed == "Read,Bash"
 
 
 def test_mock_author_type_does_not_gain_monitor() -> None:
