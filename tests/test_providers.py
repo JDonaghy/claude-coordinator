@@ -52,6 +52,7 @@ from coord.providers.claude import ClaudeProvider
 from coord.providers.opencode import (
     AGENTS_ROOT,
     DEFAULT_OPENCODE_BINARY,
+    OUTPUT_TOKEN_MAX_DEFAULT,
     RESULT_MARKER,
     ROUTING_PIN_PATH,
     OpenCodeAgentNotFoundError,
@@ -1534,6 +1535,39 @@ def test_opencode_env_definition_cannot_shadow_config_dir() -> None:
         }
     )
     env = provider.env()
+    assert env["OPENCODE_CONFIG_DIR"] == str(AGENTS_ROOT)
+    assert env["OPENCODE_CONFIG"] == str(ROUTING_PIN_PATH)
+
+
+def test_opencode_env_sets_output_token_max_default() -> None:
+    """#2321: env() always seeds OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX to
+    OUTPUT_TOKEN_MAX_DEFAULT, even with no ProviderDef.env configured —
+    without this every opencode worker is silently capped at opencode's
+    32,000-token default, shared with reasoning-model thinking tokens."""
+    env = OpenCodeProvider().env()
+    assert env["OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX"] == str(OUTPUT_TOKEN_MAX_DEFAULT)
+
+
+def test_opencode_env_output_token_max_is_positive_integer_string() -> None:
+    """Sanity: the default itself must satisfy opencode's own parser rule
+    (integer, > 0, no extra characters) or every dispatch would silently
+    fall back to 32000 — the exact failure mode #2321 exists to end."""
+    value = OpenCodeProvider().env()["OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX"]
+    assert value.isdigit()
+    assert int(value) > 0
+
+
+def test_opencode_env_output_token_max_operator_override_wins() -> None:
+    """#2321: unlike OPENCODE_CONFIG_DIR/OPENCODE_CONFIG, this variable IS
+    operator-overridable — it's a tuning knob (e.g. to cap cost), not a
+    safety mechanism, so a ProviderDef.env entry must win over the
+    built-in default."""
+    provider = OpenCodeProvider(
+        env={"OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX": "50000"}
+    )
+    env = provider.env()
+    assert env["OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX"] == "50000"
+    # And the non-overridable variables are still coord-controlled.
     assert env["OPENCODE_CONFIG_DIR"] == str(AGENTS_ROOT)
     assert env["OPENCODE_CONFIG"] == str(ROUTING_PIN_PATH)
 

@@ -1349,6 +1349,93 @@ def test_providers_definition_env_non_string_value_raises(tmp_path: Path) -> Non
         load(p)
 
 
+# ── providers.definitions[*].env OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX (#2321) ─
+
+
+def test_providers_output_token_max_valid_value_accepted(tmp_path: Path) -> None:
+    """A bare positive-integer string is accepted and stored verbatim."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        _MIN_CONFIG
+        + "providers:\n"
+        "  definitions:\n"
+        "    oc:\n"
+        "      type: opencode\n"
+        "      env:\n"
+        "        OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX: '131072'\n"
+    )
+    cfg = load(p)
+    env = cfg.providers.definitions["oc"].env
+    assert env["OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX"] == "131072"
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        "131072 ",  # trailing whitespace — opencode's parser silently discards
+        " 131072",  # leading whitespace
+        "131_072",  # underscore digit-grouping — Number() coercion rejects
+        "0",  # not > 0
+        "-1",  # not > 0, has a sign
+        "1.5",  # decimal point
+        "unlimited",  # non-numeric
+        "",  # empty
+    ],
+)
+def test_providers_output_token_max_bad_value_raises(
+    tmp_path: Path, bad_value: str
+) -> None:
+    """A value opencode's own parser would silently discard is rejected
+    loudly at config-parse time (#2321) instead of silently reverting to
+    the 32000 default with no warning."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        _MIN_CONFIG
+        + "providers:\n"
+        "  definitions:\n"
+        "    oc:\n"
+        "      type: opencode\n"
+        "      env:\n"
+        f"        OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX: {bad_value!r}\n"
+    )
+    with pytest.raises(ConfigError, match="OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX"):
+        load(p)
+
+
+def test_providers_output_token_max_absent_does_not_raise(tmp_path: Path) -> None:
+    """Not setting the key at all is fine — env() supplies its own default."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        _MIN_CONFIG
+        + "providers:\n"
+        "  definitions:\n"
+        "    oc:\n"
+        "      type: opencode\n"
+    )
+    cfg = load(p)
+    assert "OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX" not in cfg.providers.definitions["oc"].env
+
+
+def test_providers_output_token_max_validated_after_var_expansion(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The value is validated AFTER ${VAR} expansion — an expanded bad
+    value is caught, not just a literal one."""
+    monkeypatch.setenv("COORD_TEST_BAD_TOKEN_MAX", "not-a-number")
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        _MIN_CONFIG
+        + "providers:\n"
+        "  definitions:\n"
+        "    oc:\n"
+        "      type: opencode\n"
+        "      env:\n"
+        "        OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX: '${COORD_TEST_BAD_TOKEN_MAX}'\n"
+    )
+    with pytest.raises(ConfigError, match="OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX"):
+        load(p)
+
+
 def test_providers_extra_args_non_string_element_raises(tmp_path: Path) -> None:
     """extra_args elements must be strings."""
     p = tmp_path / "coordinator.yml"
