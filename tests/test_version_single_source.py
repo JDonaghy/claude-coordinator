@@ -11,7 +11,7 @@ Three layers:
   regression guard for "someone reintroduces a hardcoded `__version__`
   literal" or "the `PackageNotFoundError` fallback gets deleted". These
   also stub out `Distribution.from_name` so the test is isolated from
-  whether *this* interpreter happens to have `claude-coordinator` installed
+  whether *this* interpreter happens to have `code-coordinator` installed
   editable (the normal `pip install -e ".[dev]"` dev/CI setup) — without
   that stub, `_resolve_version`'s #2010 editable-override path would kick
   in for real and clobber the mocked metadata version being tested here.
@@ -72,14 +72,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 def _not_editable():
     """Patch `Distribution.from_name` so `_editable_source_root` sees "no
     metadata for this package" — isolates a test from whatever install
-    mode *this* interpreter's `claude-coordinator` actually happens to be
+    mode *this* interpreter's `code-coordinator` actually happens to be
     in (editable dev/CI setups are common and would otherwise make the
     #2010 override kick in for real during these metadata-only tests)."""
     from importlib.metadata import PackageNotFoundError
 
     return patch(
         "importlib.metadata.Distribution.from_name",
-        side_effect=PackageNotFoundError("claude-coordinator"),
+        side_effect=PackageNotFoundError("code-coordinator"),
     )
 
 
@@ -88,17 +88,16 @@ class TestVersionMetadataFallback:
     never a hardcoded literal — and degrade to `"0+unknown"` rather than
     raising when neither candidate distribution is installed.
 
-    #2103: `__version__` now resolves via `coord.dist_name.resolve_installed`
-    (tries `code-coordinator` then falls back to `claude-coordinator`)
-    rather than a single hardcoded `importlib.metadata.version("claude-
-    coordinator")` call, so these patch `coord.dist_name._pkg_version` —
-    the one `importlib.metadata.version` call `resolve_installed` actually
-    makes — rather than `importlib.metadata.version` itself. Patching the
-    latter would silently no-op: `coord.dist_name` imported `version` as
-    `_pkg_version` at its own module-import time (`from importlib.metadata
-    import version as _pkg_version`), a separate reference to the same
-    function object that a patch of `importlib.metadata.version` does not
-    retroactively rebind.
+    #2103/#2106: `__version__` now resolves via
+    `coord.dist_name.resolve_installed` rather than a hardcoded
+    `importlib.metadata.version("code-coordinator")` call, so these patch
+    `coord.dist_name._pkg_version` — the one `importlib.metadata.version`
+    call `resolve_installed` actually makes — rather than
+    `importlib.metadata.version` itself. Patching the latter would silently
+    no-op: `coord.dist_name` imported `version` as `_pkg_version` at its own
+    module-import time (`from importlib.metadata import version as
+    _pkg_version`), a separate reference to the same function object that a
+    patch of `importlib.metadata.version` does not retroactively rebind.
     """
 
     def teardown_method(self) -> None:
@@ -122,13 +121,24 @@ class TestVersionMetadataFallback:
             importlib.reload(coord)
             assert coord.__version__ == "0+unknown"
 
-    def test_queries_code_coordinator_before_claude_coordinator(self) -> None:
-        """#2103: `code-coordinator` (the name the eventual #2096 rename
-        publishes under) is tried first; `claude-coordinator` is the
-        fallback for an install that hasn't been renamed yet. Pin the
-        resolution order and which name actually won, not just the
-        outcome — a typo'd or reordered lookup would otherwise go
-        unnoticed here."""
+    def test_queries_only_code_coordinator(self) -> None:
+        """#2106: the pre-#2106 fallback is gone — pin which name is
+        actually queried, not just the outcome, so a reintroduced fallback
+        (accidental or not) is caught here rather than only showing up as a
+        legacy-only install quietly resolving again."""
+        with patch(
+            "coord.dist_name._pkg_version", return_value="1.2.3",
+        ) as mock_version, _not_editable():
+            importlib.reload(coord)
+            assert coord.__version__ == "1.2.3"
+            mock_version.assert_called_once_with("code-coordinator")
+
+    def test_legacy_name_only_degrades_to_unknown_not_the_legacy_version(self) -> None:
+        """#2106 acceptance #2: a venv carrying only the pre-rename
+        `claude-coordinator` metadata is a genuinely broken install now,
+        not a not-yet-upgraded agent — `__version__` must degrade to
+        `"0+unknown"` exactly as the fully-uninstalled case does, never
+        silently report the legacy `.dist-info`'s version."""
         from importlib.metadata import PackageNotFoundError
 
         def _only_claude_coordinator_installed(name: str) -> str:
@@ -138,11 +148,9 @@ class TestVersionMetadataFallback:
 
         with patch(
             "coord.dist_name._pkg_version", side_effect=_only_claude_coordinator_installed,
-        ) as mock_version, _not_editable():
+        ), _not_editable():
             importlib.reload(coord)
-            assert coord.__version__ == "1.2.3"
-            mock_version.assert_any_call("code-coordinator")
-            mock_version.assert_called_with("claude-coordinator")
+            assert coord.__version__ == "0+unknown"
 
 
 class TestEditableSourceRoot:
@@ -257,13 +265,14 @@ class TestResolveVersion:
     #2103: `_resolve_version` now takes a tuple of candidate distribution
     names (default `coord.dist_name.CANDIDATE_NAMES`) and resolves through
     `coord.dist_name.resolve_installed` rather than a single hardcoded
-    name string — these pass a single-element tuple to keep exercising
-    the #2010 editable/live-version behavior in isolation from the
-    two-name resolution order, which `TestVersionMetadataFallback` and
-    `tests/test_dist_name.py` already cover directly. Patch
-    `coord.dist_name._pkg_version`, not `coord._pkg_version` — the latter
-    no longer exists in `coord/__init__.py`'s namespace since #2103 moved
-    the `importlib.metadata.version` call into `coord.dist_name`.
+    name string — these pass an explicit single-element tuple to keep
+    exercising the #2010 editable/live-version behavior in isolation from
+    whatever `CANDIDATE_NAMES` itself currently resolves, which
+    `TestVersionMetadataFallback` and `tests/test_dist_name.py` already
+    cover directly. Patch `coord.dist_name._pkg_version`, not
+    `coord._pkg_version` — the latter no longer exists in
+    `coord/__init__.py`'s namespace since #2103 moved the
+    `importlib.metadata.version` call into `coord.dist_name`.
     """
 
     def test_non_editable_install_ignores_live_version_entirely(self, tmp_path: Path) -> None:

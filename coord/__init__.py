@@ -124,13 +124,13 @@ def _resolve_version(names: tuple[str, ...] = CANDIDATE_NAMES) -> str:
     version literal; a release is just ``git tag vX.Y.Z && git push origin
     vX.Y.Z``.
 
-    #2103: resolves through :func:`coord.dist_name.resolve_installed` rather
-    than a single hardcoded distribution name — ``__version__`` is what
-    ``/health``'s ``"version"`` field reports, which is the *only* field
-    ``coord agent update``'s polling loop keys off of to decide a machine
-    "came back". A bare ``claude-coordinator``-only lookup would degrade to
-    ``"0+unknown"`` forever on any machine that has ``code-coordinator``
-    installed instead, faking a fleet-wide "did not come back".
+    #2103/#2106: resolves through :func:`coord.dist_name.resolve_installed`
+    rather than a hardcoded distribution name literal — ``__version__`` is
+    what ``/health``'s ``"version"`` field reports, which is the *only*
+    field ``coord agent update``'s polling loop keys off of to decide a
+    machine "came back". A hardcoded literal here would need editing at the
+    next rename and would degrade to ``"0+unknown"`` on every machine in
+    between, faking a fleet-wide "did not come back".
 
     #2010: for a wheel install that metadata is always correct — it's a
     frozen snapshot of a build that just happened. For an *editable*

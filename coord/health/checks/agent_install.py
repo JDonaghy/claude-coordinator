@@ -1,4 +1,4 @@
-"""How the agent's ``claude-coordinator`` is installed, and how current (#1628).
+"""How the agent's ``code-coordinator`` is installed, and how current (#1628).
 
 Two checks, one shared ``pip show`` call:
 
@@ -33,11 +33,11 @@ from coord.health.models import CheckResult, HealthContext, Severity
 from coord.health.registry import COST_NETWORK, check
 from coord.health.units import expand, shorten_path
 
-#: #2103: kept only for messages that need "a name" rather than "the
+#: #2103/#2106: kept only for messages that need "a name" rather than "the
 #: installed name" (e.g. the ``description=`` strings below, which are
 #: static and evaluated before any probe runs). Everything that actually
-#: probes the venv tries every name in :data:`CANDIDATE_NAMES`, preferring
-#: whichever the rename (#2096) is currently shipping.
+#: probes the venv resolves through :data:`CANDIDATE_NAMES` instead of
+#: hardcoding this.
 PROJECT = CANDIDATE_NAMES[0]
 
 # Where install-agent.sh puts the agent's venv.  Overridable via
@@ -65,17 +65,15 @@ def pip_show(
     python: Path, names: tuple[str, ...] = CANDIDATE_NAMES, *, timeout: float = 8.0
 ) -> dict[str, str]:
     """Parse ``<python> -m pip show <name>`` into a field dict, trying each
-    of *names* in order and returning the first that resolves (#2103).
+    of *names* in order and returning the first that resolves (#2103/#2106).
 
-    The agent venv this probes may have either ``code-coordinator`` (the
-    name since #2104) or the pre-rename ``claude-coordinator`` installed,
-    depending which side of the #2096 rename it's on — a bare single-name
-    ``pip show`` would report "not installed" for one of them. The dict's
-    ``Name`` field (``pip show`` always prints one) tells the caller which
-    one actually matched.
+    Resolves through :data:`CANDIDATE_NAMES` rather than a hardcoded
+    literal, so a future rename only has to change that one tuple. The
+    dict's ``Name`` field (``pip show`` always prints one) tells the caller
+    which name actually matched.
 
-    Returns ``{}`` when pip isn't there or neither name is installed.
-    Raises only for genuinely unexpected conditions — the probe wrapping this
+    Returns ``{}`` when pip isn't there or the name isn't installed. Raises
+    only for genuinely unexpected conditions — the probe wrapping this
     fails soft either way.
     """
     for name in names:
@@ -207,10 +205,10 @@ def probe_agent_version(ctx: HealthContext) -> CheckResult:
             values={"python": str(python)},
         )
 
-    # #2103: query PyPI for whichever name `pip show` actually matched, not
-    # a hardcoded one — `code-coordinator` and `claude-coordinator` are
-    # separate PyPI projects with separate release histories, and comparing
-    # a `code-coordinator` install's version against `claude-coordinator`'s
+    # #2103/#2106: query PyPI for whichever name `pip show` actually
+    # matched, not a hardcoded one — a rename mid-flight can leave a
+    # `.dist-info` under a different project than the one currently
+    # published, and comparing its version against the wrong project's
     # index would compute nonsense skew.
     installed_project = fields.get("Name") or PROJECT
 

@@ -18,7 +18,7 @@ export default defineConfig({
       manifest: {
         name: 'coord — dashboard',
         short_name: 'coord',
-        description: 'Phone control center for claude-coordinator',
+        description: 'Phone control center for code-coordinator',
         theme_color: '#1f6feb',
         background_color: '#0d1117',
         display: 'standalone',

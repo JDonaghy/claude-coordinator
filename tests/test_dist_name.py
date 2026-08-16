@@ -1,29 +1,29 @@
-"""Tests for coord.dist_name (#2103): resolve either distribution name
-across the `claude-coordinator` -> `code-coordinator` rename (epic #2096),
-so a hardcoded `importlib.metadata` lookup doesn't go stale on a machine
-that has the other name installed.
+"""Tests for coord.dist_name (#2103/#2106): resolve the coordinator's
+distribution name across the `claude-coordinator` -> `code-coordinator`
+rename (epic #2096).
 
 #2104 shipped the rename itself: `pyproject.toml` now says
-`code-coordinator`, and `claude-coordinator` is a PyPI tombstone that will
-never gain another release. The tolerant resolution these tests pin is
-therefore *more* load-bearing than before, not less — every agent that has
-not yet been updated past the rename still reports its version out of a
-`claude-coordinator` `.dist-info`, and reading `None` there is what renders
-as `coord agent update`'s "✗ did not come back" false negative.
+`code-coordinator`. #2105 finished the fleet-wide cutover — every venv
+resolves `code-coordinator` and none resolve `claude-coordinator` anymore.
+#2106 (R-4) is this file's current shape: the fallback that made a
+mid-cutover install survivable is gone, `CANDIDATE_NAMES` is
+`code-coordinator` only, and a lookup that only finds the legacy name must
+now fail loudly and say so — the exact inverse of what #2103's tests
+originally pinned.
 
 ``TestResolveInstalled`` / ``TestResolveInstalledName`` / ``TestPkgSpec``
-are fast unit tests, one per #2103 acceptance criterion (1-4), mocking only
-``coord.dist_name._pkg_version`` (the one `importlib.metadata.version` call
-this module makes) rather than the five call sites that use this module.
+are fast unit tests, mocking only ``coord.dist_name._pkg_version`` (the one
+`importlib.metadata.version` call this module makes) rather than the call
+sites that use this module.
 
-``TestBuildUnderNewName`` is acceptance #2 verbatim: build a real wheel
-under each name and install it, then prove ``resolve_installed()`` finds it
-for real — no ``importlib.metadata`` mocking anywhere in that class. Since
-#2104 the "new name" case builds this repo's own unmodified
-``pyproject.toml``, which doubles as the check that the shipped dist name
-really is ``code-coordinator``; the legacy case rewrites it back to
-``claude-coordinator`` to prove the fallback still resolves a pre-rename
-agent. Reuses the wheel-build harness from
+``TestBuildUnderNewName`` builds a real wheel under each name and installs
+it, then proves ``resolve_installed()`` finds — or, for the legacy name,
+correctly fails to find — it for real, no ``importlib.metadata`` mocking
+anywhere in that class. The `code-coordinator` case builds this repo's own
+unmodified ``pyproject.toml``, which doubles as the check that the shipped
+dist name really is ``code-coordinator``; the legacy case rewrites it back
+to ``claude-coordinator`` to prove a stray pre-rename install is now
+rejected rather than silently accepted. Reuses the wheel-build harness from
 ``tests/test_version_single_source.py`` (#1238's same "build for real,
 don't mock the build backend" approach).
 """
@@ -65,52 +65,55 @@ def _fake_pkg_version(available: dict):
 
 
 class TestResolveInstalled:
-    def test_preference_order_is_new_name_first(self) -> None:
-        """Pinned so a reordering (accidental or not) is caught here rather
-        than only showing up as "both installed" behavior changing."""
-        assert CANDIDATE_NAMES == ("code-coordinator", "claude-coordinator")
+    def test_candidate_names_is_code_coordinator_only(self) -> None:
+        """#2106 (R-4): pinned so a reintroduced fallback entry is caught
+        here rather than only showing up as a legacy install quietly
+        resolving again."""
+        assert CANDIDATE_NAMES == ("code-coordinator",)
 
-    def test_resolves_claude_coordinator_when_only_that_is_installed(self) -> None:
-        """#2103 acceptance #1: with only `claude-coordinator` installed,
-        resolution matches pre-fix behavior exactly."""
-        with patch(
-            "coord.dist_name._pkg_version",
-            side_effect=_fake_pkg_version({"claude-coordinator": "1.2.3"}),
-        ):
-            assert resolve_installed() == ResolvedDist(name="claude-coordinator", version="1.2.3")
-
-    def test_resolves_code_coordinator_when_only_that_is_installed(self) -> None:
-        """#2103 acceptance #2 (unit half — see TestBuildUnderNewName below
-        for the real-wheel black-box version of this same criterion)."""
+    def test_resolves_code_coordinator_when_installed(self) -> None:
+        """The one supported case post-#2106 (unit half — see
+        TestBuildUnderNewName below for the real-wheel black-box version)."""
         with patch(
             "coord.dist_name._pkg_version",
             side_effect=_fake_pkg_version({"code-coordinator": "4.5.6"}),
         ):
             assert resolve_installed() == ResolvedDist(name="code-coordinator", version="4.5.6")
 
-    def test_prefers_code_coordinator_when_both_installed(self) -> None:
-        """#2103 acceptance #3: the transient cutover state — the new name
-        wins, and the *readout says so*: callers get a name back, not just
-        a version string that hides which distribution it came from."""
+    def test_resolves_code_coordinator_even_when_legacy_name_also_present(self) -> None:
+        """A machine mid-cutover that hasn't uninstalled the old dist-info
+        yet must still resolve cleanly against the new name — `dist_name`
+        never even looks at `claude-coordinator` anymore, so a leftover
+        `.dist-info` for it can't shadow or confuse this."""
         with patch(
             "coord.dist_name._pkg_version",
             side_effect=_fake_pkg_version(
                 {"code-coordinator": "4.5.6", "claude-coordinator": "1.2.3"}
             ),
         ):
-            resolved = resolve_installed()
-        assert resolved.name == "code-coordinator"
-        assert resolved.version == "4.5.6"
+            assert resolve_installed() == ResolvedDist(name="code-coordinator", version="4.5.6")
 
-    def test_raises_naming_both_when_neither_installed(self) -> None:
-        """#2103 acceptance #4: never a bare `None` — the failure is
-        explicit and names every candidate tried."""
+    def test_raises_naming_code_coordinator_when_only_legacy_name_installed(self) -> None:
+        """#2106 acceptance #2: a venv with only `claude-coordinator`
+        installed now fails loudly and names what it expected, rather than
+        silently falling back to the tombstoned name."""
+        with patch(
+            "coord.dist_name._pkg_version",
+            side_effect=_fake_pkg_version({"claude-coordinator": "1.2.3"}),
+        ):
+            with pytest.raises(DistributionNotFoundError) as exc_info:
+                resolve_installed()
+        message = str(exc_info.value)
+        assert "code-coordinator" in message
+
+    def test_raises_naming_code_coordinator_when_neither_installed(self) -> None:
+        """Never a bare `None` — the failure is explicit and names the one
+        candidate tried."""
         with patch("coord.dist_name._pkg_version", side_effect=_fake_pkg_version({})):
             with pytest.raises(DistributionNotFoundError) as exc_info:
                 resolve_installed()
         message = str(exc_info.value)
         assert "code-coordinator" in message
-        assert "claude-coordinator" in message
 
 
 class TestResolveInstalledName:
@@ -120,12 +123,23 @@ class TestResolveInstalledName:
     def test_returns_the_resolved_name(self) -> None:
         with patch(
             "coord.dist_name._pkg_version",
-            side_effect=_fake_pkg_version({"claude-coordinator": "1.2.3"}),
+            side_effect=_fake_pkg_version({"code-coordinator": "4.5.6"}),
         ):
-            assert resolve_installed_name() == "claude-coordinator"
+            assert resolve_installed_name() == "code-coordinator"
 
     def test_returns_none_rather_than_raising_when_neither_installed(self) -> None:
         with patch("coord.dist_name._pkg_version", side_effect=_fake_pkg_version({})):
+            assert resolve_installed_name() is None
+
+    def test_returns_none_rather_than_raising_when_only_legacy_name_installed(self) -> None:
+        """#2106: a lookup that only finds `claude-coordinator` is "neither
+        of the supported names", not a resolved name — this must degrade to
+        `None` here exactly as the fully-uninstalled case does, not resolve
+        to the tombstoned name."""
+        with patch(
+            "coord.dist_name._pkg_version",
+            side_effect=_fake_pkg_version({"claude-coordinator": "1.2.3"}),
+        ):
             assert resolve_installed_name() is None
 
 
@@ -143,9 +157,9 @@ class TestPkgSpec:
     def test_no_extra_returns_bare_name(self) -> None:
         with patch(
             "coord.dist_name._pkg_version",
-            side_effect=_fake_pkg_version({"claude-coordinator": "1.2.3"}),
+            side_effect=_fake_pkg_version({"code-coordinator": "4.5.6"}),
         ):
-            assert pkg_spec() == "claude-coordinator"
+            assert pkg_spec() == "code-coordinator"
 
     def test_raises_rather_than_guessing_when_neither_installed(self) -> None:
         """#2103: this is the one call site that must NOT silently default
@@ -243,10 +257,18 @@ def _install_wheel_to_target(wheel: Path, target_dir: Path) -> None:
     assert result.returncode == 0, f"wheel install failed:\n{result.stdout}\n{result.stderr}"
 
 
-def _resolved_from_installed_wheel(tmp_path: Path, clone: Path, slot: str) -> tuple[str, str]:
+def _resolved_from_installed_wheel(
+    tmp_path: Path, clone: Path, slot: str, *, expect_error: bool = False
+) -> tuple[str, str]:
     """Build *clone*, install the wheel into an isolated target dir, and
-    return ``(wheel filename, what resolve_installed() reports there)`` —
-    the latter as ``"<name> <version>"``.
+    return ``(wheel filename, what resolve_installed() reports there)``.
+
+    With *expect_error* False (the default) the second element is
+    ``"<name> <version>"``. With *expect_error* True, `resolve_installed()`
+    is expected to raise `DistributionNotFoundError` — the probe catches it
+    itself (rather than letting the subprocess crash with a traceback) and
+    the second element is ``"RAISED: <message>"``, so a caller can assert on
+    the exact error text without parsing stderr.
 
     Both halves come back from one build so a caller can assert on the
     wheel's own filename (the PEP 427 normalisation of the dist name) without
@@ -279,13 +301,24 @@ def _resolved_from_installed_wheel(tmp_path: Path, clone: Path, slot: str) -> tu
     neutral_cwd.mkdir()
     env = dict(os.environ)
     env["PYTHONPATH"] = str(install_dir)
-    result = _run(
-        [
-            sys.executable, "-S", "-c",
+    if expect_error:
+        probe = (
+            "from coord.dist_name import DistributionNotFoundError, resolve_installed\n"
+            "try:\n"
+            "    r = resolve_installed()\n"
+            "except DistributionNotFoundError as exc:\n"
+            "    print(f'RAISED: {exc}')\n"
+            "else:\n"
+            "    print(f'DID NOT RAISE: {r.name} {r.version}')\n"
+        )
+    else:
+        probe = (
             "from coord.dist_name import resolve_installed\n"
             "r = resolve_installed()\n"
-            "print(f'{r.name} {r.version}')\n",
-        ],
+            "print(f'{r.name} {r.version}')\n"
+        )
+    result = _run(
+        [sys.executable, "-S", "-c", probe],
         cwd=neutral_cwd,
         env=env,
     )
@@ -294,23 +327,27 @@ def _resolved_from_installed_wheel(tmp_path: Path, clone: Path, slot: str) -> tu
 
 
 class TestBuildUnderNewName:
-    """#2103 acceptance #2, verbatim: build a wheel under each distribution
-    name, install it, and prove `coord.dist_name.resolve_installed()` finds
-    it for real.
+    """Build a wheel under a distribution name, install it, and prove
+    `coord.dist_name.resolve_installed()` does the right thing for real —
+    no `importlib.metadata` mocking anywhere in this class.
 
-    #2104 makes the first of these a check on the *shipped* config: the
-    `code-coordinator` build no longer rewrites `pyproject.toml` at all, so
-    it fails if this repo ever stops publishing under that name.
+    The `code-coordinator` build doesn't rewrite `pyproject.toml` at all:
+    it builds this repo's own shipped config, so it fails if this repo ever
+    stops publishing under that name. The `claude-coordinator` build is
+    #2106's real-wheel version of "a venv with only the legacy name
+    installed now fails loudly" — #2103's `test_resolves_a_real_wheel_
+    installed_under_the_legacy_name` asserted the opposite before the
+    fallback was removed; this replaces it.
     """
 
     def test_this_repo_ships_as_code_coordinator(self) -> None:
-        """#2104 acceptance #1 and #4: the rename actually landed in the one
-        place the release path reads it from. Everything else that needs the
-        dist name — `verify-published`'s simple-index poll, the wheel
-        filename, `coord.dist_name`'s preference order — derives from here,
-        so pinning it here is what makes those derivations meaningful."""
+        """The rename actually landed in the one place the release path
+        reads it from. Everything else that needs the dist name —
+        `verify-published`'s simple-index poll, the wheel filename,
+        `coord.dist_name.CANDIDATE_NAMES` — derives from here, so pinning
+        it here is what makes those derivations meaningful."""
         assert _dist_name_of(REPO_ROOT) == "code-coordinator"
-        assert CANDIDATE_NAMES[0] == _dist_name_of(REPO_ROOT)
+        assert CANDIDATE_NAMES == (_dist_name_of(REPO_ROOT),)
 
     def test_resolves_a_real_wheel_installed_under_the_new_name(self, tmp_path: Path) -> None:
         clone = _renamed_tagged_clone(tmp_path, "code-coordinator", "8.8.8")
@@ -318,17 +355,20 @@ class TestBuildUnderNewName:
         assert wheel_name.startswith("code_coordinator-8.8.8-"), wheel_name
         assert resolved == "code-coordinator 8.8.8"
 
-    def test_resolves_a_real_wheel_installed_under_the_legacy_name(self, tmp_path: Path) -> None:
-        """#2104 acceptance #4's deliberate exception: `claude-coordinator`
-        is a PyPI tombstone, but it is still what every agent that has not
-        yet been updated past the rename has in its `.dist-info`. Resolution
-        must keep finding it, or those agents report an unknown version and
-        `coord agent update` renders the "✗ did not come back" false
-        negative for a host that is online and fine (#2103)."""
+    def test_rejects_a_real_wheel_installed_under_the_legacy_name(self, tmp_path: Path) -> None:
+        """#2106 acceptance #2, real-wheel version: `claude-coordinator` is
+        a PyPI tombstone, and the fleet-wide cutover (#2105) is done, so a
+        venv carrying only that `.dist-info` is a genuinely broken install,
+        not a not-yet-upgraded agent — resolution must now fail loudly and
+        name what it expected, rather than quietly resolving the tombstoned
+        name the way #2103's fallback used to."""
         clone = _renamed_tagged_clone(tmp_path, "claude-coordinator", "7.7.7")
-        wheel_name, resolved = _resolved_from_installed_wheel(tmp_path, clone, "legacy")
+        wheel_name, resolved = _resolved_from_installed_wheel(
+            tmp_path, clone, "legacy", expect_error=True
+        )
         assert wheel_name.startswith("claude_coordinator-7.7.7-"), wheel_name
-        assert resolved == "claude-coordinator 7.7.7"
+        assert resolved.startswith("RAISED:"), resolved
+        assert "code-coordinator" in resolved
 
 
 class TestAgentUpdateSmokeCheckUsesThisModule:

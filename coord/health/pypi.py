@@ -193,13 +193,14 @@ def latest_release_any(
     index_url: str = "https://pypi.org/simple",
     timeout: float = 3.0,
 ) -> tuple[str, Version | None, list[Version]]:
-    """:func:`latest_release`, tried against each of *names* in turn (#2103).
+    """:func:`latest_release`, tried against each of *names* in turn
+    (#2103/#2106).
 
-    `claude-coordinator` and `code-coordinator` (#2096) are separate PyPI
-    projects — a caller resolving "what's the latest fleet-wide release"
-    must not hardcode whichever name happened to be current when the code
-    was written, or it silently stops seeing new releases the moment #2096
-    actually ships and starts publishing under the new name.
+    A rename (like #2096's `claude-coordinator` -> `code-coordinator`)
+    publishes under a new, separate PyPI project — a caller resolving
+    "what's the latest fleet-wide release" must not hardcode whichever name
+    happened to be current when the code was written, or it silently stops
+    seeing new releases the moment a future rename ships.
 
     Returns ``(project_name_used, latest_final_release,
     all_final_releases_ascending)`` for the first name in *names* that has
