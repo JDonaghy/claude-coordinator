@@ -2156,10 +2156,12 @@ def test_resolve_default_provider_opencode_allowed() -> None:
 
 # ── #2317: incremental-write instructions in work.md ────────────────────────
 #
-# opencode hard-caps every request at 32,000 output tokens, shared with the
-# model's own reasoning on reasoning models — and that cap is not
-# configurable (verified against the running binary, see the issue). A
-# worker that designs the whole change before its first `write` can burn the
+# opencode hard-caps every request's output tokens, shared with the model's
+# own reasoning on reasoning models. The exact ceiling is an
+# operator-tunable environment variable (see #2321) rather than a fixed
+# number, so these checks deliberately avoid pinning one — truncation can
+# happen at any budget size, it's just rarer at a higher ceiling. A worker
+# that designs the whole change before its first `write` can burn the
 # entire budget on reasoning and be truncated before it emits a single tool
 # call: a clean exit, zero commits, nothing on disk (space-invaders#1,
 # `8c95182b0749`). These are plain static-content checks on work.md's own
@@ -2177,7 +2179,8 @@ def test_opencode_work_md_instructs_incremental_writes() -> None:
     core fix for #2317."""
     text = _opencode_work_md_text()
     assert "incrementally" in text.lower()
-    assert "32,000 output tokens" in text
+    assert "output-token budget" in text.lower() or "output budget" in text.lower()
+    assert "32,000" not in text
     assert "do not" in text.lower() or "do NOT" in text
 
 
