@@ -462,7 +462,15 @@ def _tool_name_from_event(event: WorkerEvent) -> str | None:
     """Try a few plausible field paths for the tool name."""
     raw = event.raw
     if event.type == "tool_use":
-        return raw.get("name") or raw.get("tool") or raw.get("tool_name")
+        name = raw.get("name") or raw.get("tool") or raw.get("tool_name")
+        if name:
+            return name
+        # #2315: opencode's `tool_use` events carry the name one level down,
+        # at `part.tool` — {"type":"tool_use","part":{"tool":"bash",...}} —
+        # not at any of the top-level keys above, which is why every opencode
+        # tool call used to render `[tool] ?`.
+        tool, _ = _opencode_tool_input(raw)
+        return tool
     # Assistant events may embed a tool_use block in `message.content[*]`.
     if event.type == "assistant":
         message = raw.get("message") or {}
@@ -470,6 +478,29 @@ def _tool_name_from_event(event: WorkerEvent) -> str | None:
             if block.get("type") == "tool_use":
                 return block.get("name")
     return None
+
+
+def _opencode_tool_input(raw: dict) -> tuple[str | None, dict | None]:
+    """Pull ``(tool_name, input_dict)`` out of an opencode ``tool_use``
+    event's nested ``part`` (#2315).
+
+    opencode's wire shape is ``{"type":"tool_use","part":{"tool":"bash",
+    "state":{"input":{"command":"..."},...}}}`` — see
+    :meth:`coord.providers.opencode.OpenCodeProvider.parse_log`'s docstring,
+    which this mirrors (the provider's own parser already reads this
+    correctly; this is the same lookup for the render side). Returns
+    ``(None, None)`` for anything else — missing/malformed ``part``, or a
+    ``state.input`` that isn't a dict.
+    """
+    part = raw.get("part")
+    if not isinstance(part, dict):
+        return None, None
+    tool = part.get("tool")
+    tool = tool if isinstance(tool, str) and tool else None
+    state = part.get("state")
+    input_obj = state.get("input") if isinstance(state, dict) else None
+    input_obj = input_obj if isinstance(input_obj, dict) else None
+    return tool, input_obj
 
 
 def _iter_content_blocks(message: dict) -> Iterable[dict]:
@@ -493,6 +524,12 @@ def _bash_command_from_event(event: WorkerEvent) -> str | None:
         for block in _iter_content_blocks(message):
             if block.get("type") == "tool_use" and block.get("name") == "Bash":
                 return _command_from_input(block.get("input"))
+    if event.type == "tool_use":
+        # #2315: opencode's bash call — command lives at `part.state.input.
+        # command`, tool name (lowercase) at `part.tool`.
+        tool, input_obj = _opencode_tool_input(raw)
+        if tool == "bash":
+            return _command_from_input(input_obj)
     return None
 
 
@@ -506,13 +543,24 @@ def _command_from_input(input_obj: object) -> str | None:
 
 
 def _file_path_from_event(event: WorkerEvent) -> str | None:
-    """Pull file_path out of an Edit/Write tool_use, if present."""
+    """Pull file_path out of an Edit/Write tool_use, if present.
+
+    Name matching is case-insensitive so this covers both claude's
+    ``Edit``/``Write``/``NotebookEdit`` and opencode's lowercase ``edit``/
+    ``write`` (#2315).
+    """
     raw = event.raw
     name = _tool_name_from_event(event)
-    if name not in ("Edit", "Write", "NotebookEdit"):
+    if not name or name.lower() not in ("edit", "write", "notebookedit"):
         return None
     if event.type == "tool_use":
-        return _file_from_input(raw.get("input"))
+        input_obj = raw.get("input")
+        if input_obj is not None:
+            return _file_from_input(input_obj)
+        # #2315: opencode carries the input nested under `part.state.input`
+        # rather than a top-level `input` key.
+        _, opencode_input = _opencode_tool_input(raw)
+        return _file_from_input(opencode_input)
     if event.type == "assistant":
         message = raw.get("message") or {}
         for block in _iter_content_blocks(message):
@@ -528,7 +576,8 @@ def _file_path_from_event(event: WorkerEvent) -> str | None:
 def _file_from_input(input_obj: object) -> str | None:
     if not isinstance(input_obj, dict):
         return None
-    for key in ("file_path", "path", "notebook_path"):
+    # `filePath` is opencode's key (#2315); the rest are claude's.
+    for key in ("file_path", "path", "notebook_path", "filePath"):
         v = input_obj.get(key)
         if isinstance(v, str):
             return v
@@ -1012,10 +1061,15 @@ def render_event(event: WorkerEvent, *, turn_counter: list[int] | None = None) -
 
     if event.type == "tool_use":
         name = _tool_name_from_event(event) or "?"
-        if name == "Bash":
+        # Case-insensitive: claude's tool names are `Bash`/`Edit`/`Write`/
+        # `NotebookEdit`; opencode's equivalents are lowercase (#2315). The
+        # original casing from *name* is kept in the rendered line either
+        # way — only the branch dispatch is case-insensitive.
+        name_lower = name.lower()
+        if name_lower == "bash":
             cmd = _bash_command_from_event(event) or ""
-            return f"[tool] Bash: {_truncate(cmd, 100)}"
-        if name in ("Edit", "Write", "NotebookEdit"):
+            return f"[tool] {name}: {_truncate(cmd, 100)}"
+        if name_lower in ("edit", "write", "notebookedit"):
             fp = _file_path_from_event(event)
             return f"[tool] {name}: {fp or '?'}"
         return f"[tool] {name}"
@@ -1026,6 +1080,44 @@ def render_event(event: WorkerEvent, *, turn_counter: list[int] | None = None) -
         is_error = raw.get("is_error")
         tag = " error" if is_error else ""
         return f"[tool_result{tag}] {tool_use_id}"
+
+    if event.type == "step_finish":
+        # opencode's per-turn completion event (#2315) — claude has no
+        # equivalent. `part.reason` is `"tool-calls"` for every turn but the
+        # last one (which is always followed by another `step_start`);
+        # anything else — `"stop"` (normal completion), `"length"` (ran out
+        # of output budget mid-turn), `"error"`, or any other value — means
+        # the run ended on THIS step, because opencode never emits a
+        # terminal event of its own the way claude's `result` event above
+        # does (see OpenCodeProvider.parse_log's docstring). So a
+        # non-"tool-calls" reason also gets an appended `[result]` line —
+        # the only place `coord log` ever prints a stop reason for an
+        # opencode run. Cost/tokens here are this step's own figures (there
+        # is no cumulative-total field anywhere in opencode's stream, so a
+        # single event can't report a running total — see the same
+        # docstring), which is still the diagnostic fact that matters: e.g.
+        # `reason=length out=32000 $0.145` says outright that the model
+        # spent its whole output budget on one turn and got cut off.
+        part = raw.get("part")
+        part = part if isinstance(part, dict) else {}
+        # `reason_raw` (as opposed to `reason`, the display value with the
+        # `?` placeholder substituted in) drives the terminality check below
+        # — a genuinely absent/malformed reason must NOT be treated as
+        # terminal just because the placeholder string happens to differ
+        # from `"tool-calls"`.
+        reason_raw = part.get("reason")
+        reason_raw = reason_raw if isinstance(reason_raw, str) and reason_raw else None
+        reason = reason_raw or "?"
+        tokens = part.get("tokens")
+        tokens = tokens if isinstance(tokens, dict) else {}
+        out_tok = tokens.get("output")
+        out_str = str(out_tok) if isinstance(out_tok, int) else "?"
+        cost = part.get("cost")
+        cost_str = f"${float(cost):.3f}" if isinstance(cost, (int, float)) else "$?"
+        line = f"[step_finish] reason={reason} out={out_str} {cost_str}"
+        if reason_raw is not None and reason_raw != "tool-calls":
+            line += f"\n[result] stop={reason_raw}, {cost_str}"
+        return line
 
     if event.type == "rate_limit_event":
         status, resets = _rate_limit_info(raw)
