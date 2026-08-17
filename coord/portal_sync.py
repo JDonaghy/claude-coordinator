@@ -93,6 +93,11 @@ ANNOUNCING_STATUSES: dict[str, str] = {
     "awaiting-signoff": "design_round",
     # "we need an answer before we can carry on"
     "needs-input": "question",
+    # "here's a real preview build — approve it or tell us what to change"
+    # (#2359, coord-portal#107): the same #835 ordering rule applied to the
+    # preview-approval gate — a quality-check push must not summon the
+    # customer to a sign-off screen with no preview URL to look at.
+    "quality-check": "preview",
 }
 
 #: Outbox row kinds. The kind is not sent over the wire (the portal sees only
@@ -101,6 +106,7 @@ ANNOUNCING_STATUSES: dict[str, str] = {
 KIND_STATUS = "status"
 KIND_DESIGN_ROUND = "design_round"
 KIND_QUESTION = "question"
+KIND_PREVIEW = "preview"
 
 #: Event keys that are bookkeeping rather than customer-authored content —
 #: excluded from the mirror because they describe the envelope, not the
@@ -183,6 +189,26 @@ def enqueue_design_round(
         submission_id,
         KIND_DESIGN_ROUND,
         {"design_round": design_round},
+        now=now,
+    )
+
+
+def enqueue_preview(
+    submission_id: str, preview_url: str, *, now: float | None = None
+) -> portal_store.OutboxRow:
+    """Queue a preview build URL (#2359, coord-portal#107) for *submission_id*.
+
+    A real, pre-merge Cloudflare Pages Preview deployment for the PR — never
+    the Production deployment for ``main``, which must never show unapproved
+    work (see #107). What this function guarantees is the ordering — see
+    :func:`enqueue_status`.
+    """
+    if not isinstance(preview_url, str) or not preview_url.strip():
+        raise PortalSyncError("preview_url must be a non-empty string")
+    return portal_store.enqueue(
+        submission_id,
+        KIND_PREVIEW,
+        {"preview_url": preview_url},
         now=now,
     )
 

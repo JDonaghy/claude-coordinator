@@ -87,6 +87,7 @@ COORD_OWNED_FIELDS = (
     "design_round",
     "artifacts",
     "onhold_since",
+    "preview_url",
 )
 
 

@@ -572,6 +572,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             last_status   TEXT    NOT NULL DEFAULT '',
             design_round  INTEGER NOT NULL DEFAULT 0,
             open_question TEXT    NOT NULL DEFAULT '',
+            preview_url   TEXT    NOT NULL DEFAULT '',
             customer_json TEXT    NOT NULL DEFAULT '{}',
             first_seen_at REAL    NOT NULL,
             updated_at    REAL    NOT NULL
@@ -918,6 +919,13 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         # predating this column, same as the column's own default for a
         # freshly-enqueued entry.
         "ALTER TABLE merge_queue ADD COLUMN ci_unreadable_reruns INTEGER NOT NULL DEFAULT 0",
+        # #2359: the preview-approval gate's coord-owned preview URL, mirroring
+        # `design_round` — the highest-confirmed preview build's URL, written
+        # only by `coord.portal_store.mark_applied`'s `kind == "preview"`
+        # branch. '' for every row predating this migration and for a
+        # submission with no preview queued yet, same as `open_question`'s
+        # own default.
+        "ALTER TABLE portal_submissions ADD COLUMN preview_url TEXT NOT NULL DEFAULT ''",
     ]
     for sql in migrations:
         try:

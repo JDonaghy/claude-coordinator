@@ -274,6 +274,7 @@ class SubmissionRecord:
     last_status: str
     design_round: int
     open_question: str
+    preview_url: str
     customer: dict[str, Any]
     first_seen_at: float
     updated_at: float
@@ -291,6 +292,7 @@ def _submission_from_row(row: sqlite3.Row) -> SubmissionRecord:
         last_status=row["last_status"],
         design_round=row["design_round"],
         open_question=row["open_question"],
+        preview_url=row["preview_url"],
         customer=customer if isinstance(customer, dict) else {},
         first_seen_at=row["first_seen_at"],
         updated_at=row["updated_at"],
@@ -528,6 +530,12 @@ def mark_applied(row: OutboxRow, *, now: float | None = None) -> None:
                 "UPDATE portal_submissions SET open_question = ?, updated_at = ? "
                 "WHERE submission_id = ?",
                 (str(row.fields.get("question", "")), stamp, row.submission_id),
+            )
+        elif row.kind == "preview":
+            conn.execute(
+                "UPDATE portal_submissions SET preview_url = ?, updated_at = ? "
+                "WHERE submission_id = ?",
+                (str(row.fields.get("preview_url", "")), stamp, row.submission_id),
             )
 
 
