@@ -60,12 +60,18 @@ def _refuse_if_thin_client(cmd_name: str) -> None:
     unnoticed on the daemon host for over an hour because every portal
     command run from a thin client reported nothing pending).
 
-    Mirrors the identical guard already used for the same reason in
-    ``coord.commands.drive_queue``'s ``diagnose`` command (#615/#906).
+    Mirrors the guard already used for the same reason in
+    ``coord.commands.drive_queue``'s ``diagnose`` command (#615/#906), which
+    refuses rather than "diagnose an empty queue" on a thin client. The
+    local-vs-daemon decision goes through ``coord.board_service`` — the #749
+    facade that exists precisely so call sites stop hand-rolling
+    ``resolve_board_service()`` — rather than importing ``coord.client``
+    directly. ``resolve()`` and not ``is_remote()`` because the error names
+    the host the operator should ssh to, which needs the resolved URL.
     """
-    from coord.client import resolve_board_service  # noqa: PLC0415
+    from coord.board_service import resolve  # noqa: PLC0415
 
-    svc = resolve_board_service()
+    svc = resolve()
     if svc is None:
         return
     from urllib.parse import urlparse  # noqa: PLC0415
