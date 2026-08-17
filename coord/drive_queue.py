@@ -1579,6 +1579,104 @@ def diagnose_blocked_after(
     )
 
 
+# Substring unique to `_resolve_prereqs`'s "queued but blocked/failed"
+# unsatisfiable verdict (the f-string a few lines up, in the `dep_state in
+# (STATE_BLOCKED, STATE_FAILED)` branch) — the ONE unsatisfiable shape #2362's
+# blocked-sweep resume check (`_reconcile_blocked_after` below) may act on.
+# Deliberately does NOT match the cycle verdict ("dependency cycle: ...") or
+# the "not queued, not merged and not open on the board" verdict: neither of
+# those can be undone by a pre-req later reaching `facts.landed` — a cycle is
+# a structural fact about the queue's edges, and an unknown/unsynced issue
+# needs a human (or `coord sync`), not a re-check here. Matching either would
+# be exactly the "no evidence, guessing" mistake `_blocked_gate_reading`
+# refuses to make.
+_UNSATISFIABLE_PREREQ_MARKER = "it will never satisfy"
+
+
+def _is_unsatisfiable_prereq_reason(text: str | None) -> bool:
+    """Whether *text* is `_resolve_prereqs`'s "queued but blocked/failed"
+    verdict — see :data:`_UNSATISFIABLE_PREREQ_MARKER`.
+    """
+    return bool(text) and _UNSATISFIABLE_PREREQ_MARKER in text
+
+
+def _reconcile_blocked_after(
+    entry: QueueEntry,
+    board: BoardView,
+    states: Mapping[str, str],
+    cycle_keys: Mapping[str, str],
+) -> Reconcile | None:
+    """#2362: resume a `blocked` entry whose ONLY cause was an unsatisfiable
+    `after=` pre-req, once every named pre-req has since landed.
+
+    `_resolve_prereqs` (called from step 4's launch walk) blocks a `waiting`
+    entry the instant one of its pre-reqs is itself `blocked`/`failed` —
+    correctly, since waiting forever on a dead pre-req is the silent-stall
+    failure mode that check exists to prevent. But once blocked, the entry is
+    terminal for dispatch (:data:`TERMINAL_QUEUE_STATES`) and drops out of
+    step 4 entirely — nothing calls `_resolve_prereqs` for it again, so even
+    after the pre-req itself reaches `done` the entry stays `blocked` forever
+    with a now-stale "it will never satisfy" reason. This closes that gap by
+    giving `blocked` entries the SAME re-check `_reconcile_blocked` gives a
+    merge-gate block, scoped to the `after=` cause specifically.
+
+    Returns ``None`` — nothing to report, nothing to write — unless ALL of:
+
+    * *entry* declared a non-empty ``after=`` (nothing to re-derive
+      otherwise);
+    * *entry*'s own ``last_reason`` IS `_resolve_prereqs`'s "queued but
+      blocked/failed — it will never satisfy" verdict
+      (:func:`_is_unsatisfiable_prereq_reason`) — never a permanent block
+      (:func:`is_permanent_block_reason`: #1844's guard refusal or #2019's
+      dead end), a dispatch-time failure, or any other cause. This is the
+      guard against the false-resume the issue explicitly warns against: an
+      entry that merely HAS an `after=` list but was blocked for an unrelated
+      reason must be left exactly as `_reconcile_blocked` would leave it;
+    * re-deriving the verdict fresh against the CURRENT board — via
+      :func:`diagnose_blocked_after`, the SAME function #2183's `coord
+      drive-queue list`/`status` rendering already uses, so this can never
+      disagree with what an operator is shown — comes back satisfied (every
+      named pre-req now reads `facts.landed`). Anything else (still
+      unsatisfied, or unsatisfiable for a fresh reason, including a
+      DIFFERENT pre-req going bad in the meantime) leaves the entry blocked.
+
+    On resume: `state` flips to `waiting`, `attempts` resets to 0 (a fresh
+    start, exactly like #2230's gate-cleared resume — nothing about being
+    blocked on a now-landed pre-req should cost this entry its launch
+    budget), and `resumes` increments for the SAME `coord drive-queue
+    list`/`status` "resumes=N/MAX" display #2230 already renders — though,
+    unlike a merge-gate reading, "landed" cannot un-land, so this path does
+    not gate on :data:`MAX_BLOCKED_RESUMES`: there is no oscillation risk to
+    cap.
+    """
+    if not entry.after:
+        return None
+    if is_permanent_block_reason(entry.last_reason):
+        return None
+    if not _is_unsatisfiable_prereq_reason(entry.last_reason):
+        return None
+    diagnosis = diagnose_blocked_after(entry, board, states, cycle_keys)
+    if diagnosis.dependency_reason:
+        return None
+    reason = (
+        f"{entry.key}'s pre-req(s) ({', '.join(entry.after)}) now show "
+        "facts.landed — resuming from blocked without an operator "
+        "remove+add, attempt budget reset (#2362)"
+    )
+    return Reconcile(
+        entry.key,
+        "resumed",
+        reason,
+        occupies=False,
+        updates={
+            "state": STATE_WAITING,
+            "attempts": 0,
+            "resumes": entry.resumes + 1,
+            "last_reason": reason,
+        },
+    )
+
+
 # ── reconciliation ───────────────────────────────────────────────────────────
 
 
@@ -2836,7 +2934,8 @@ def plan_tick(
     to today's behaviour, never to a wrongly-skipped relaunch.
 
     The algorithm, from #1754, plus #1757's step 2, #1891's step 1b, #2055's
-    extension of it, and #2230's further extension for `blocked`:
+    extension of it, #2230's further extension for `blocked`, and #2362's
+    narrower extension of THAT:
 
     1. Reconcile every ``running`` entry (:func:`_reconcile_running`).
     1b. Re-check every ``parked``/``blocked``/``failed`` entry against the
@@ -2854,7 +2953,17 @@ def plan_tick(
         before #2230 — this never resurrects an entry for dispatch on its
         own, only lets a finished one stop claiming to be unfinished. Never
         spends an attempt either way (beyond the reset above) — a missing
-        verdict is not a failed one.
+        verdict is not a failed one. Before #2230's gate re-check even runs,
+        a `blocked` entry whose OWN `last_reason` is `_resolve_prereqs`'s
+        "queued but blocked/failed — it will never satisfy" verdict gets ITS
+        `after=` graph re-derived fresh instead (:func:`_reconcile_blocked_
+        after`) — #2230's `_blocked_gate_reading` has no evidence at all for
+        an entry that never reached the merge queue, so without this an
+        entry blocked purely on a dead pre-req would never notice that
+        pre-req later landing. Every named pre-req now `facts.landed` ⇒
+        ``waiting``, attempts reset, same shape as #2230's resume; anything
+        else (a different cause, a still-unsatisfied/unsatisfiable graph)
+        falls straight through to #2230's check unchanged.
     2. Resolve deploy gates (:func:`_resolve_holds`).  A gate left closed with
        ``scope=fleet`` returns immediately with no launch and a HELD alert —
        before the capacity check, and regardless of how eligible the rest of
@@ -2946,6 +3055,19 @@ def plan_tick(
     repo_occupied: dict[str, int] = {}
     repo_capacity = max(0, int(max_parallel_per_repo))
 
+    # Cycles are re-checked here, not just at `add` time: `remove` can leave
+    # the surviving edges in a shape `add` never validated, and a hand-edited
+    # DB row is always possible.  A cycle makes every member unsatisfiable.
+    # Computed up front (not just before step 4's launch walk, which used to
+    # be the only consumer) because #2362's `blocked`-entry re-check below
+    # also needs it — both call sites want the SAME cycle read for THIS tick.
+    cycle_keys: dict[str, str] = {}
+    cycle = find_cycle({e.key: list(e.after) for e in ordered})
+    if cycle is not None:
+        message = "dependency cycle: " + " -> ".join(cycle)
+        for key in cycle:
+            cycle_keys[key] = message
+
     for entry in ordered:
         if entry.state != STATE_RUNNING:
             continue
@@ -3036,15 +3158,28 @@ def plan_tick(
             # gate re-check for it without a reason to believe it needs one.
             continue
         if entry.state == STATE_BLOCKED:
-            # #2230: re-examine a `blocked` entry against the CURRENT gate
-            # reading before falling through to the `parked`-only machinery
-            # below, which must never run for `blocked` — resurrecting a
-            # gave-up entry via the CI-pending resume was explicitly not the
-            # #2055 fix and is not this one either; see
-            # :func:`_reconcile_blocked` for the full decision.
-            blocked_reconcile = _reconcile_blocked(
-                entry, facts, live_blocked_gate, merge_only_ready
+            # #2362: re-derive an unsatisfiable `after=` verdict against the
+            # CURRENT board FIRST — before #2230's merge-gate re-check, which
+            # has nothing to say about an entry that was blocked before ever
+            # reaching the merge queue (`_blocked_gate_reading` returns
+            # `None`, "no evidence", for exactly that entry, so
+            # `_reconcile_blocked` alone would leave it blocked forever even
+            # after its named pre-req lands). Scoped tightly enough that it
+            # only ever fires for the "queued but blocked/failed — it will
+            # never satisfy" shape — see :func:`_reconcile_blocked_after`.
+            blocked_reconcile = _reconcile_blocked_after(
+                entry, board, states, cycle_keys
             )
+            if blocked_reconcile is None:
+                # #2230: re-examine a `blocked` entry against the CURRENT gate
+                # reading before falling through to the `parked`-only
+                # machinery below, which must never run for `blocked` —
+                # resurrecting a gave-up entry via the CI-pending resume was
+                # explicitly not the #2055 fix and is not this one either;
+                # see :func:`_reconcile_blocked` for the full decision.
+                blocked_reconcile = _reconcile_blocked(
+                    entry, facts, live_blocked_gate, merge_only_ready
+                )
             if blocked_reconcile is not None:
                 reconciles.append(blocked_reconcile)
                 if blocked_reconcile.outcome == "merge_only":
@@ -3354,15 +3489,9 @@ def plan_tick(
             launch=None,
         )
 
-    # Cycles are re-checked here, not just at `add` time: `remove` can leave
-    # the surviving edges in a shape `add` never validated, and a hand-edited
-    # DB row is always possible.  A cycle makes every member unsatisfiable.
-    cycle_keys: dict[str, str] = {}
-    cycle = find_cycle({e.key: list(e.after) for e in ordered})
-    if cycle is not None:
-        message = "dependency cycle: " + " -> ".join(cycle)
-        for key in cycle:
-            cycle_keys[key] = message
+    # `cycle_keys` is computed once, near the top of this function (see the
+    # comment there) — #2362's `blocked`-entry re-check needs it before this
+    # point, so it is no longer (re-)derived here.
 
     def _cooldown_reason(candidate: QueueEntry) -> str:
         """#1794's launch-side guard: '' unless this entry was just launched.
