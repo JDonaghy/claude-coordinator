@@ -132,17 +132,6 @@ the Test stage itself would run for your diff (and confirm you're not
 missing a suite), `scripts/coord-test-runner.sh <worktree> --print-routing`
 computes the routing without actually building or testing anything.
 
-**If your diff touches a python test file, the Test stage re-runs those files
-in a synthesized fleet `$HOME` (#2269).** `--print-routing` reports it as
-`populated-home=1` and names the files. That arm re-runs your test files under
-`scripts/run_tests_in_populated_home.sh` — a thin-client `~/.coord` with no
-`coordinator.yml`, no `sqlite3` on `$PATH`, a `$TMPDIR` under an ancestor
-pytest config — which is what CI's `populated-home` job does and what no
-fleet machine's ambient environment reproduces on its own. A test that passes
-here and fails there is red at the Test gate now instead of at the merge gate.
-Reproduce it yourself with `scripts/run_tests_in_populated_home.sh python -m
-pytest tests/test_<module>.py` before pushing; it costs a few seconds.
-
 ## Working on `tui/` — the `quadraui` pin
 
 **`coord-tui` pins `quadraui` to a git rev in `tui/Cargo.toml`**
@@ -272,6 +261,7 @@ reviewer can stop reading here.
 - [`docs/GRAPHIFY_SETUP.md`](docs/GRAPHIFY_SETUP.md) — installing the knowledge graph on a new machine (four layers, all of which fail *silently*).
 - [`docs/EPHEMERAL_WORKERS.md`](docs/EPHEMERAL_WORKERS.md) — on-demand Azure worker VMs per epic. **The tailnet ACL is the security boundary** — `agent_app.py` has no authentication.
 - [`docs/MAC_MINI.md`](docs/MAC_MINI.md) — adding a Mac mini; sizing, provisioning, and what non-macOS work routes there. The port itself is [`docs/CROSS_PLATFORM.md`](docs/CROSS_PLATFORM.md) (milestone #39).
+- [`docs/WSL_WINDOWS_WORKER.md`](docs/WSL_WINDOWS_WORKER.md) — using a Tailscale-connected WSL2 box as the Windows worker for quadraui/vimcode's Win-GUI ports. Not the coord-itself Windows port.
 - [`docs/FORGE_MIGRATION.md`](docs/FORGE_MIGRATION.md) — surviving a forge outage (cheap) versus leaving a forge (expensive); milestone #58 / epic #1902.
 
 **Two deploy facts that bite most often:**

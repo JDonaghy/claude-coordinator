@@ -718,11 +718,16 @@ run_python_populated_home() {
         return 0
     fi
 
-    # The harness's own guard failures, by their exact messages. Distinguished
-    # from a test failure because the two need different fixes — but BOTH are a
-    # FAIL, so mis-classifying one as the other can only ever mis-word a red
-    # verdict, never hide one.
-    if grep -qE "the guard itself is broken|the guard is too broad|is not thin-client shaped" "$out"; then
+    # The harness's own guard failures. `run_tests_in_populated_home.sh`
+    # reserves exit 2 for exactly this case, so check `rc` directly first —
+    # it can't drift out of sync with itself. The message grep is a second,
+    # belt-and-braces signal for a harness that fails this way but exits with
+    # some other code (or an older/forked copy of the script); if the exact
+    # wording ever changes, `rc -eq 2` alone still catches the exit-2 case.
+    # Distinguished from a test failure because the two need different fixes
+    # — but BOTH are a FAIL, so mis-classifying one as the other can only
+    # ever mis-word a red verdict, never hide one.
+    if [[ "$rc" -eq 2 ]] || grep -qE "the guard itself is broken|the guard is too broad|is not thin-client shaped" "$out"; then
         say "FAIL(python-populated-home): the harness $rel exited $rc because A KNOB FAILED TO TAKE EFFECT — the environment it claims to synthesize (thin-client ~/.coord, no sqlite3, \$TMPDIR under an ancestor pytest config) was not the environment the tests ran in, so a green here would have meant nothing. This is reported as a FAILURE, not a skip, on purpose (#2269)."
         tail -n 20 "$out" | sed 's/^/      /'
         return 1

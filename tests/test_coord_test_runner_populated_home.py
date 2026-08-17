@@ -448,6 +448,32 @@ def test_harness_exit_2_is_a_fail_with_warning_not_a_skip(repo: Path) -> None:
     assert "RESULT: PASS" not in result.stdout
 
 
+def test_harness_exit_2_is_a_fail_even_if_the_wording_changes(repo: Path) -> None:
+    """The exit-2 classification checks ``rc -eq 2`` directly, not only the
+    grep against the harness's exact wording — belt-and-braces (#2269 review).
+
+    A harness that exits 2 (or a fork/older copy of it that reserves exit 2 for
+    the same "a knob failed to take effect" meaning but phrases it differently)
+    must still be classified as the specific knob-failure FAIL, not silently
+    fall through to the generic "FAIL in a synthesized fleet $HOME" message.
+    """
+    _plant_harness(
+        repo,
+        "#!/usr/bin/env bash\n"
+        "echo 'totally different wording, still exit 2' >&2\n"
+        "exit 2\n",
+    )
+
+    result = _run(repo)
+
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert "FAIL(python-populated-home)" in result.stdout
+    assert "A KNOB FAILED TO TAKE EFFECT" in result.stdout
+    assert "RESULT: FAIL (python-populated-home)" in result.stdout
+    assert "SKIP(python-populated-home)" not in result.stdout
+    assert "RESULT: PASS" not in result.stdout
+
+
 def test_an_unrecognised_nonzero_harness_exit_is_still_a_fail(repo: Path) -> None:
     """Exit 2 is also pytest's "interrupted", and a harness could grow new exit
     codes. Anything non-zero this arm does not specifically recognise still fails
