@@ -2040,7 +2040,6 @@ def _fetch_live_blocked_gate(
 
 def _fetch_merge_only_ready(
     entries: list,
-    config_path: Path | None,
     live_ci_gate: Mapping[str, bool],
     live_blocked_gate: Mapping[str, bool],
 ) -> dict[str, bool]:
@@ -2061,10 +2060,14 @@ def _fetch_merge_only_ready(
     :func:`coord.merge_queue.has_passed_test`) against the SAME local board
     those callers already loaded.
 
+    Takes no *config_path*, unlike both siblings: neither board-only read
+    needs a :class:`~coord.config.Config` (no ``ci_store``, no live gate
+    re-derivation), so there is nothing to load here.
+
     Same fail-open-per-entry, fail-closed-overall contract as its siblings:
-    a key ABSENT from the result (no queue row, an unreadable config, any
-    exception) simply takes the pre-#2350 `resumed` path — never a wrongly
-    skipped relaunch.
+    a key ABSENT from the result (no queue row, an unreadable board or
+    merge queue, any exception) simply takes the pre-#2350 `resumed` path —
+    never a wrongly skipped relaunch.
     """
     targets = [
         e for e in entries
@@ -2572,7 +2575,7 @@ def drive_queue_tick(
         # `plan_tick` can attempt it directly this tick instead of spending
         # a relaunch. See `_fetch_merge_only_ready`'s docstring.
         merge_only_ready = _fetch_merge_only_ready(
-            entries, config_path, live_ci_gate, live_blocked_gate
+            entries, live_ci_gate, live_blocked_gate
         )
 
         # #2101: release cordons. THIS is the hole the issue names — the
