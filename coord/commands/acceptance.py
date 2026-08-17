@@ -420,6 +420,37 @@ def _acceptance_worktree_path(repo_name: str, issue_number: int) -> Path:
     return COORD_DIR / "acceptance-worktrees" / f"{repo_name}-{issue_number}"
 
 
+def _acceptance_worktree_lock_path(repo_name: str, issue_number: int) -> Path:
+    """The ``flock`` guarding :func:`_acceptance_worktree_path` (#2352).
+
+    That path is deliberately ONE per ``(repo, issue)``, reused across every
+    SHA/round for that issue (same incremental-build rationale as `coord
+    test`'s #561) — but nothing serialised *access* to it. Two concurrent
+    ``coord acceptance record`` calls for the same issue (an orphaned drive
+    process — #1660 — racing a fresh queue relaunch, or a by-hand re-run
+    overlapping an in-flight one) each did an unconditional ``git worktree
+    remove --force`` + ``add --force`` on the SAME directory: the second
+    invocation's remove ripped the tree out from under the first's
+    in-flight build/test, mid-compile. The corrupted build then printed
+    ordinary-looking compiler errors and exited non-zero having run zero
+    tests — indistinguishable from a genuinely red suite to
+    ``_scoped_verdict``, so it landed on the board as a real
+    ``acceptance_state=failed`` and burned a drive's fix-round budget on a
+    PR that was never actually broken.
+
+    A sibling ``.lock`` file next to the worktree directory itself (not one
+    global lock for the whole ``acceptance-worktrees/`` tree) so unrelated
+    ``(repo, issue)`` pairs never wait on each other.
+
+    Derived from :func:`_acceptance_worktree_path` (module-level lookup, so
+    a test monkeypatching that name — e.g. to redirect it under
+    ``tmp_path`` — redirects this lock alongside it) rather than
+    re-deriving ``COORD_DIR`` independently, which would silently drift the
+    two apart the moment either one's path scheme changes."""
+    wt_path = _acceptance_worktree_path(repo_name, issue_number)
+    return wt_path.with_name(wt_path.name + ".lock")
+
+
 def _remove_acceptance_worktree(repo_dir: Path, wt_path: Path) -> None:
     if not wt_path.exists():
         return
@@ -819,6 +850,7 @@ def _acceptance_record_local(
     config_path: Path,
     route_path: str | None = None,
 ) -> None:
+    from coord.filelock import FileLock  # noqa: PLC0415
     from coord.test_orchestrator import find_local_repo_path  # noqa: PLC0415
 
     cfg = _load_config(config_path)
@@ -835,119 +867,140 @@ def _acceptance_record_local(
         sys.exit(1)
 
     wt_path = _acceptance_worktree_path(repo, issue_number)
-    click.echo(
-        f"Fetching origin and preparing acceptance worktree at {sha!r} "
-        f"(base checkout {repo_dir} stays untouched)..."
-    )
-    try:
-        subprocess.run(
-            ["git", "fetch", "origin", "--prune"], cwd=str(repo_dir),
-            check=True, capture_output=True, text=True,
-        )
-    except subprocess.CalledProcessError as e:
-        click.echo(f"error: git fetch failed: {e.stderr.strip()}", err=True)
-        sys.exit(1)
 
-    _remove_acceptance_worktree(repo_dir, wt_path)
-    wt_path.parent.mkdir(parents=True, exist_ok=True)
-    res = subprocess.run(
-        ["git", "worktree", "add", "--force", "--detach", str(wt_path), sha],
-        cwd=str(repo_dir), capture_output=True, text=True,
-    )
-    if res.returncode != 0:
+    # #2352: everything from here down touches the ONE worktree this
+    # (repo, issue) reuses across every SHA/round — remove+add it, build in
+    # it, read its results. A second concurrent `coord acceptance record`
+    # for the same issue (an orphaned drive racing a fresh queue relaunch,
+    # or a by-hand re-run overlapping an in-flight one — see
+    # _acceptance_worktree_lock_path's docstring) must never interleave
+    # with this, or its `git worktree remove --force` clobbers whatever the
+    # first invocation is mid-build on. Blocking (not fail-fast) is
+    # deliberate: `flock` is released by the kernel even if the holder is
+    # killed, so there is no stale-lock deadlock risk to trade away, and
+    # blocking needs no change to `_decide_acceptance_gate`'s error
+    # handling — the second invocation just waits its turn and then records
+    # its own (correct) verdict, same as if it had been dispatched later.
+    with FileLock(_acceptance_worktree_lock_path(repo, issue_number)):
         click.echo(
-            f"error: could not create acceptance worktree at {sha!r}: "
-            f"{res.stderr.strip()}",
-            err=True,
+            f"Fetching origin and preparing acceptance worktree at {sha!r} "
+            f"(base checkout {repo_dir} stays untouched)..."
         )
-        sys.exit(1)
-
-    # #1125 review finding 2: resolve `{ms}` from the issue's manifest-mapped
-    # ms-NN dir (the worktree just checked out at `sha`) before running —
-    # same fail-soft-to-None rationale as `acceptance_run` above.
-    ms: str | None = None
-    try:
-        ms = ms_dir_for_issue(wt_path / ACCEPTANCE_DIRNAME, issue_number)
-    except Exception:  # noqa: BLE001
-        ms = None
-
-    try:
-        result = run_driver(
-            driver_cfg.kind, driver_cfg.run, cwd=str(wt_path), ms=ms,
-            setup_command=driver_cfg.setup,
-        )
-    except DriverError as e:
-        click.echo(f"error: {e}", err=True)
-        _remove_acceptance_worktree(repo_dir, wt_path)
-        sys.exit(1)
-
-    # #944 review: _scoped_verdict exits(1) internally for a manifest that
-    # hasn't been authored yet / has no slice for this issue — a
-    # configuration error, not a real (kept-for-inspection) test failure, so
-    # the throwaway worktree must still be cleaned up on the way out.
-    try:
-        verdict = _scoped_verdict(
-            result.tests, wt_path / ACCEPTANCE_DIRNAME, issue_number,
-            entrypoint=driver_cfg.entrypoint,
-        )
-    except SystemExit:
-        _remove_acceptance_worktree(repo_dir, wt_path)
-        raise
-
-    from coord.board_service import read_board  # noqa: PLC0415
-    from coord.diagnose import stage_assignments  # noqa: PLC0415
-
-    board = read_board()
-    work_rows = stage_assignments(board, repo, issue_number, "work")
-    if not work_rows:
-        click.echo(
-            f"error: no work assignment found for {repo} #{issue_number}; "
-            "cannot record verdict",
-            err=True,
-        )
-        # Same rationale: a lookup error, not a failing-verdict "kept for
-        # inspection" case — don't leak the worktree.
-        _remove_acceptance_worktree(repo_dir, wt_path)
-        sys.exit(1)
-    assignment_id = work_rows[0].assignment_id
-
-    from coord.state import record_acceptance_verdict  # noqa: PLC0415
-
-    acceptance_state = "passed" if verdict["green"] else "failed"
-    reason = failure_summary(verdict) or None
-    record_acceptance_verdict(
-        assignment_id=assignment_id,
-        acceptance_state=acceptance_state,
-        acceptance_reason=reason,
-        acceptance_sha=sha,
-        # #932: per-test counts so the Acceptance box can show partial
-        # progress ("3/7 acceptance green") instead of a bare verdict.
-        acceptance_total=verdict["total"],
-        acceptance_passed=verdict["passed"],
-    )
-
-    click.echo(json.dumps(verdict, indent=2))
-    click.echo(f"\nAcceptance {acceptance_state.upper()} for {repo} #{issue_number} @ {sha}")
-
-    if acceptance_state == "passed":
-        # #2164 review: clearing expected_red here (before Test/Review/the
-        # actual merge to the default branch have happened) was the bug —
-        # it could reopen "red default branch" for reasons unrelated to
-        # whatever CI run next observed this issue's still-unmerged fix.
-        # The clear now happens in `coord.merge_queue.process`, right after
-        # this SHA's PR actually merges — see
-        # `coord.acceptance.clear_expected_red_via_pr`'s docstring. Nothing
-        # to do here beyond pointing the operator at how to check.
-        if ms is not None:
-            click.echo(
-                f"  note: any expected_red entries for #{issue_number} clear "
-                f"automatically once its fix merges — see `coord acceptance "
-                f"expected-red {repo}` to check current state."
+        try:
+            subprocess.run(
+                ["git", "fetch", "origin", "--prune"], cwd=str(repo_dir),
+                check=True, capture_output=True, text=True,
             )
+        except subprocess.CalledProcessError as e:
+            click.echo(f"error: git fetch failed: {e.stderr.strip()}", err=True)
+            sys.exit(1)
+
         _remove_acceptance_worktree(repo_dir, wt_path)
-    else:
-        click.echo(f"  worktree kept for inspection: {wt_path}")
-        sys.exit(1)
+        wt_path.parent.mkdir(parents=True, exist_ok=True)
+        res = subprocess.run(
+            ["git", "worktree", "add", "--force", "--detach", str(wt_path), sha],
+            cwd=str(repo_dir), capture_output=True, text=True,
+        )
+        if res.returncode != 0:
+            click.echo(
+                f"error: could not create acceptance worktree at {sha!r}: "
+                f"{res.stderr.strip()}",
+                err=True,
+            )
+            sys.exit(1)
+
+        # #1125 review finding 2: resolve `{ms}` from the issue's
+        # manifest-mapped ms-NN dir (the worktree just checked out at
+        # `sha`) before running — same fail-soft-to-None rationale as
+        # `acceptance_run` above.
+        ms: str | None = None
+        try:
+            ms = ms_dir_for_issue(wt_path / ACCEPTANCE_DIRNAME, issue_number)
+        except Exception:  # noqa: BLE001
+            ms = None
+
+        try:
+            result = run_driver(
+                driver_cfg.kind, driver_cfg.run, cwd=str(wt_path), ms=ms,
+                setup_command=driver_cfg.setup,
+            )
+        except DriverError as e:
+            click.echo(f"error: {e}", err=True)
+            _remove_acceptance_worktree(repo_dir, wt_path)
+            sys.exit(1)
+
+        # #944 review: _scoped_verdict exits(1) internally for a manifest
+        # that hasn't been authored yet / has no slice for this issue — a
+        # configuration error, not a real (kept-for-inspection) test
+        # failure, so the throwaway worktree must still be cleaned up on
+        # the way out.
+        try:
+            verdict = _scoped_verdict(
+                result.tests, wt_path / ACCEPTANCE_DIRNAME, issue_number,
+                entrypoint=driver_cfg.entrypoint,
+            )
+        except SystemExit:
+            _remove_acceptance_worktree(repo_dir, wt_path)
+            raise
+
+        from coord.board_service import read_board  # noqa: PLC0415
+        from coord.diagnose import stage_assignments  # noqa: PLC0415
+
+        board = read_board()
+        work_rows = stage_assignments(board, repo, issue_number, "work")
+        if not work_rows:
+            click.echo(
+                f"error: no work assignment found for {repo} #{issue_number}; "
+                "cannot record verdict",
+                err=True,
+            )
+            # Same rationale: a lookup error, not a failing-verdict "kept
+            # for inspection" case — don't leak the worktree.
+            _remove_acceptance_worktree(repo_dir, wt_path)
+            sys.exit(1)
+        assignment_id = work_rows[0].assignment_id
+
+        from coord.state import record_acceptance_verdict  # noqa: PLC0415
+
+        acceptance_state = "passed" if verdict["green"] else "failed"
+        reason = failure_summary(verdict) or None
+        record_acceptance_verdict(
+            assignment_id=assignment_id,
+            acceptance_state=acceptance_state,
+            acceptance_reason=reason,
+            acceptance_sha=sha,
+            # #932: per-test counts so the Acceptance box can show partial
+            # progress ("3/7 acceptance green") instead of a bare verdict.
+            acceptance_total=verdict["total"],
+            acceptance_passed=verdict["passed"],
+        )
+
+        click.echo(json.dumps(verdict, indent=2))
+        click.echo(
+            f"\nAcceptance {acceptance_state.upper()} for {repo} #{issue_number} @ {sha}"
+        )
+
+        if acceptance_state == "passed":
+            # #2164 review: clearing expected_red here (before
+            # Test/Review/the actual merge to the default branch have
+            # happened) was the bug — it could reopen "red default branch"
+            # for reasons unrelated to whatever CI run next observed this
+            # issue's still-unmerged fix. The clear now happens in
+            # `coord.merge_queue.process`, right after this SHA's PR
+            # actually merges — see
+            # `coord.acceptance.clear_expected_red_via_pr`'s docstring.
+            # Nothing to do here beyond pointing the operator at how to
+            # check.
+            if ms is not None:
+                click.echo(
+                    f"  note: any expected_red entries for #{issue_number} clear "
+                    f"automatically once its fix merges — see `coord acceptance "
+                    f"expected-red {repo}` to check current state."
+                )
+            _remove_acceptance_worktree(repo_dir, wt_path)
+        else:
+            click.echo(f"  worktree kept for inspection: {wt_path}")
+            sys.exit(1)
 
 
 def _stall_push_wip_snapshot(cwd: Path) -> str:
