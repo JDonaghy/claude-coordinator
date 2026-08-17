@@ -261,6 +261,7 @@ reviewer can stop reading here.
 - [`docs/GRAPHIFY_SETUP.md`](docs/GRAPHIFY_SETUP.md) — installing the knowledge graph on a new machine (four layers, all of which fail *silently*).
 - [`docs/EPHEMERAL_WORKERS.md`](docs/EPHEMERAL_WORKERS.md) — on-demand Azure worker VMs per epic. **The tailnet ACL is the security boundary** — `agent_app.py` has no authentication.
 - [`docs/MAC_MINI.md`](docs/MAC_MINI.md) — adding a Mac mini; sizing, provisioning, and what non-macOS work routes there. The port itself is [`docs/CROSS_PLATFORM.md`](docs/CROSS_PLATFORM.md) (milestone #39).
+- [`docs/WSL_WINDOWS_WORKER.md`](docs/WSL_WINDOWS_WORKER.md) — using a Tailscale-connected WSL2 box as the Windows worker for quadraui/vimcode's Win-GUI ports. Not the coord-itself Windows port.
 - [`docs/FORGE_MIGRATION.md`](docs/FORGE_MIGRATION.md) — surviving a forge outage (cheap) versus leaving a forge (expensive); milestone #58 / epic #1902.
 
 **Two deploy facts that bite most often:**
