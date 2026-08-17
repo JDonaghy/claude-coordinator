@@ -145,6 +145,10 @@ pub(crate) mod drive;
 pub(crate) mod escalation;
 pub(crate) mod fleet_health;
 pub(crate) mod drive_queue;
+// #2282 (ms-65): per-panel document tabs with VS Code preview/pin semantics.
+pub(crate) mod doc_tabs;
+#[allow(unused_imports)]
+use self::doc_tabs::{doc_tab_label, DocKey, DocTabs, PanelScope};
 #[allow(unused_imports)]
 use self::types::*;
 #[allow(unused_imports)]
@@ -2051,6 +2055,33 @@ pub struct CoordApp {
     /// `rebuild_board_sidebar` pass — the Board-panel counterpart of
     /// `pipeline_epic_row_keys`.
     board_epic_row_keys: std::collections::HashMap<(usize, TreePath), (String, u64)>,
+    /// #2282 (ms-65 §2): per-panel document tabs — the ordered set of open
+    /// issues, which one is active, and which (at most one) is the preview.
+    ///
+    /// This, not the sidebar cursor, is what the detail pane follows once a
+    /// tab is open (see `board_detail_issue_group`). With zero tabs open the
+    /// panel behaves exactly as it did pre-ms-65: no strip row is rendered
+    /// and selection-follows-tree is restored.
+    doc_tabs: DocTabs,
+    /// #2282 (ms-65 §2f): row shape of the last `rebuild_board_sidebar` pass,
+    /// indexed by sidebar section — for every emitted row, its `TreePath` and
+    /// whether it is a `Decoration::Header` row (which quadraui's MSV measures
+    /// at `lh * 1.2` rather than `lh * 1.4`).
+    ///
+    /// `SidebarSystem` exposes no `rows()` getter, so reveal-on-activate has
+    /// no other way to work out how far down the panel a given row sits.
+    /// Sections whose body is a `Form` (the FILTER box) hold an empty vec —
+    /// their height comes from the form's field count instead.
+    board_section_rows: Vec<Vec<(TreePath, bool)>>,
+    /// #2282 (ms-65 §2f): the Board sidebar tree's last-painted geometry —
+    /// `(rect, line_height, msv_header_size)`.
+    ///
+    /// Reveal-on-activate is driven from the event path, which has no
+    /// `Backend` handle and no layout; this is the same render-then-act stash
+    /// the panel already uses for `last_main_visible_rows` and friends. The
+    /// backend's own `msv_metrics().header_size` is captured rather than
+    /// assumed so the arithmetic stays exact on GTK/macOS, not just TUI.
+    last_sidebar_geom: std::cell::Cell<Option<(Rect, f32, f32)>>,
     // ── Pipeline panel state ────────────────────────────────────────────
     /// SidebarSystem listing tracked issues grouped by state → (optionally) repo.
     pipeline_sidebar: SidebarSystem,
@@ -3680,6 +3711,9 @@ impl CoordApp {
             board_milestone_expanded: std::collections::HashMap::new(),
             board_epic_expanded: std::collections::HashMap::new(),
             board_epic_row_keys: std::collections::HashMap::new(),
+            doc_tabs: DocTabs::default(),
+            board_section_rows: Vec::new(),
+            last_sidebar_geom: std::cell::Cell::new(None),
             pipeline_sidebar,
             pipeline_repo_names: Vec::new(),
             pipeline_state_section_names: Vec::new(),
@@ -6031,6 +6065,10 @@ impl CoordApp {
 
         self.board_repo_names = grouped.iter().map(|(r, _)| r.clone()).collect();
 
+        // #2282: captured before `defs` is moved into the new SidebarSystem —
+        // `board_section_rows` is indexed by section, so it has to cover every
+        // section, form sections included.
+        let defs_len = defs.len();
         self.board_sidebar = SidebarSystem::new(defs);
         self.board_sidebar
             .set_navigation_mode(NavigationMode::Selection);
@@ -6104,6 +6142,17 @@ impl CoordApp {
         let mut epic_row_keys: std::collections::HashMap<(usize, TreePath), (String, u64)> =
             std::collections::HashMap::new();
 
+        // #2282 (ms-65 §2f): the issue whose document tab is active. Its
+        // sidebar row carries the `▸` marker so "which document am I looking
+        // at" is legible in the tree, not only in the tab strip. `None` when
+        // no tab is open, which is what keeps the zero-tab render byte-identical
+        // to pre-ms-65 Board.
+        let active_doc: Option<DocKey> = self.board_doc_tabs().active_key().cloned();
+        // #2282 (ms-65 §2f): per-section row shape, for reveal-on-activate's
+        // offset arithmetic. Grown to `defs.len()` up front so a Form section
+        // (the FILTER box, section 0) still occupies its slot.
+        let mut section_rows: Vec<Vec<(TreePath, bool)>> = vec![Vec::new(); defs_len];
+
         // #410: Build per-repo milestone > issue rows (status sub-group removed).
         //
         // Two-phase loop to satisfy the borrow checker:
@@ -6174,10 +6223,25 @@ impl CoordApp {
                             if Self::board_is_globally_nested(repo, g, &globally_nested) {
                                 continue;
                             }
-                            let mut spans = vec![StyledSpan::with_fg(
+                            // #2282 (ms-65 §2f): mark the row whose document
+                            // tab is active. `▸` (U+25B8) is the milestone's
+                            // pinned marker — distinct from `▶` (the Pipeline
+                            // activity-bar icon) and from the doc-tab strip's
+                            // `[...]` active-tab bracket.
+                            let is_active_doc = active_doc
+                                .as_ref()
+                                .is_some_and(|(r, n)| r == repo && *n == g.issue_number);
+                            let mut spans = Vec::new();
+                            if is_active_doc {
+                                spans.push(StyledSpan::with_fg(
+                                    "▸ ".to_string(),
+                                    Color::rgb(220, 220, 120),
+                                ));
+                            }
+                            spans.push(StyledSpan::with_fg(
                                 format!("#{:<5}", g.issue_number),
                                 Color::rgb(150, 150, 240),
-                            )];
+                            ));
                             // #1270: epic marker, label-driven — see
                             // `epic_badge_span_for_labels` (shared with the
                             // Pipeline panel's `epic_badge_span`). Spliced
@@ -6258,9 +6322,19 @@ impl CoordApp {
             if total == 0 {
                 self.board_sidebar.set_collapsed(section_idx, true);
             }
+            // #2282 (ms-65 §2f): remember this section's row shape before the
+            // rows are handed to the sidebar (which offers no way to read them
+            // back) so reveal-on-activate can work out a row's panel offset.
+            if let Some(slot) = section_rows.get_mut(section_idx) {
+                *slot = rows
+                    .iter()
+                    .map(|r| (r.path.clone(), matches!(r.decoration, Decoration::Header)))
+                    .collect();
+            }
             self.board_sidebar.set_rows(section_idx, rows);
         }
         self.board_epic_row_keys = epic_row_keys;
+        self.board_section_rows = section_rows;
 
         // Activate first non-empty repo section.
         if self.board_sidebar.active_section().is_none() {
@@ -6615,6 +6689,245 @@ impl CoordApp {
         let group = self.board_selected_issue_group()?;
         let repo = self.board_active_repo()?;
         Some((repo.to_string(), group.issue_number))
+    }
+
+    // ── #2282 (ms-65 §2): Board document tabs ────────────────────────────
+
+    /// The Board panel's document-tab set.
+    fn board_doc_tabs(&self) -> &doc_tabs::DocTabGroup {
+        self.doc_tabs.group(PanelScope::Board)
+    }
+
+    /// The active Board document's key, or `None` when no tab is open.
+    fn board_doc_active_key(&self) -> Option<&DocKey> {
+        self.board_doc_tabs().active_key()
+    }
+
+    /// Look one issue up in the Board cache by `(repo, number)`.
+    ///
+    /// Returns `None` for a document whose issue is no longer on the board
+    /// (e.g. it was purged between the tab being opened and this frame) —
+    /// callers fall back to the tree selection rather than rendering a stale
+    /// document.
+    fn board_issue_group_for(&self, repo: &str, number: u64) -> Option<&IssueGroup> {
+        let (_, issues) = self.board_issues_cache.iter().find(|(r, _)| r == repo)?;
+        issues.iter().find(|g| g.issue_number == number)
+    }
+
+    /// The issue the Board **detail pane** is showing.
+    ///
+    /// Contract §2: with a document tab open the pane follows the **active
+    /// tab**, not the tree cursor — that is the whole point of the milestone,
+    /// and the reason moving the sidebar selection no longer loses what you
+    /// were reading. With zero tabs open (or an active tab whose issue has
+    /// left the board) this is exactly `board_selected_issue_group`, i.e.
+    /// pre-ms-65 selection-follows-tree.
+    ///
+    /// Deliberately *not* folded into `board_selected_issue_group` itself:
+    /// that accessor also drives the sidebar context menu, the `P` purge
+    /// guard and the notify/retry verbs, which must keep acting on the row
+    /// the user has highlighted.
+    fn board_detail_issue_group(&self) -> Option<&IssueGroup> {
+        if let Some((repo, number)) = self.board_doc_active_key() {
+            if let Some(group) = self.board_issue_group_for(repo, *number) {
+                return Some(group);
+            }
+        }
+        self.board_selected_issue_group()
+    }
+
+    /// The repo the Board detail pane's issue belongs to — the active tab's
+    /// repo when one is open, else the sidebar's active repo. Paired with
+    /// [`Self::board_detail_issue_group`]; the two must agree or the pane
+    /// renders one issue's body under another repo's heading.
+    fn board_detail_repo(&self) -> Option<&str> {
+        if let Some((repo, number)) = self.board_doc_active_key() {
+            if self.board_issue_group_for(repo, *number).is_some() {
+                return Some(repo.as_str());
+            }
+        }
+        self.board_active_repo()
+    }
+
+    /// Open `key` in the Board tab strip.
+    ///
+    /// `pin == false` is the single-click path (contract §2e rules 1/2/4);
+    /// `pin == true` is the double-click path (rule 3: open-or-activate, then
+    /// promote). Reveals the newly-active document in the sidebar (§2f) when
+    /// activation actually moved.
+    fn open_board_doc_tab(&mut self, key: DocKey, pin: bool) {
+        let before = self.board_doc_active_key().cloned();
+        {
+            let group = self.doc_tabs.group_mut(PanelScope::Board);
+            if pin {
+                group.pin(key);
+            } else {
+                group.open_preview(key);
+            }
+        }
+        if self.board_doc_active_key().cloned() != before {
+            self.reveal_board_active_doc();
+        }
+    }
+
+    /// Activate the Board tab at strip index `idx` (a click on the strip
+    /// itself). Returns `true` when anything changed.
+    fn activate_board_doc_tab(&mut self, idx: usize) -> bool {
+        if idx >= self.board_doc_tabs().tabs().len() {
+            return false;
+        }
+        let changed = self.doc_tabs.group_mut(PanelScope::Board).activate_index(idx);
+        // Reveal unconditionally, not just when the active index moved:
+        // contract §2f says activating a tab "by any path" reveals its row,
+        // and re-activating the already-active tab is exactly how a user asks
+        // to be taken back to a document they have navigated away from in the
+        // tree. Gating on `changed` would make that click a silent no-op.
+        self.reveal_board_active_doc();
+        changed
+    }
+
+    /// Contract §2f — reveal-on-activate.
+    ///
+    /// Activating a tab selects the matching sidebar row **and scrolls it into
+    /// view**, expanding its milestone group first when that group is
+    /// collapsed (otherwise the row it is meant to select does not exist in
+    /// the tree at all).
+    fn reveal_board_active_doc(&mut self) {
+        let Some((repo, number)) = self.board_doc_active_key().cloned() else {
+            return;
+        };
+        self.expand_board_milestone_for(&repo, number);
+        // The `▸` active-document marker is baked into the row text, so the
+        // tree has to be rebuilt for the marker to move.
+        self.rebuild_board_sidebar();
+        self.select_issue(&repo, number);
+        self.scroll_board_selection_into_view();
+    }
+
+    /// Force the milestone group containing `(repo, number)` open, so that
+    /// issue's row is actually emitted by the next `rebuild_board_sidebar`.
+    fn expand_board_milestone_for(&mut self, repo: &str, number: u64) {
+        let milestone_key = {
+            let cache = &self.board_issues_cache;
+            let milestones = self.board_milestones_for_repo(cache, repo);
+            milestones
+                .iter()
+                .find(|(_, _, group_issues)| {
+                    group_issues.iter().any(|(_, g)| g.issue_number == number)
+                })
+                .map(|(m_key, _, _)| m_key.clone())
+        };
+        if let Some(m_key) = milestone_key {
+            self.board_milestone_expanded
+                .insert((repo.to_string(), m_key), true);
+        }
+    }
+
+    /// Height, in main-axis units, of one Board sidebar row.
+    ///
+    /// Mirrors quadraui's `sidebar_system::body_measure`: a
+    /// `Decoration::Header` row measures `lh * 1.2`, everything else
+    /// `lh * 1.4`, both rounded. Getting this wrong does not misplace the row
+    /// visually — quadraui still owns the paint — it just makes
+    /// reveal-on-activate scroll to the wrong offset.
+    fn board_row_height(lh: f32, is_header: bool) -> f32 {
+        if is_header {
+            (lh * 1.2).round()
+        } else {
+            (lh * 1.4).round()
+        }
+    }
+
+    /// Content height of Board sidebar section `s` (excluding its own header
+    /// row), as quadraui's `ScrollMode::WholePanel` sizing computes it.
+    fn board_section_content_height(&self, s: usize, lh: f32) -> f32 {
+        if self.board_sidebar.is_collapsed(s) {
+            return 0.0;
+        }
+        if let Some(form) = self.board_sidebar.form(s) {
+            return form.fields.len() as f32 * Self::board_row_height(lh, false);
+        }
+        self.board_section_rows
+            .get(s)
+            .map(|rows| {
+                rows.iter()
+                    .map(|(_, is_header)| Self::board_row_height(lh, *is_header))
+                    .sum()
+            })
+            .unwrap_or(0.0)
+    }
+
+    /// Contract §2f, the half a selection marker alone does not prove: scroll
+    /// the Board sidebar so the currently-selected row is inside the viewport.
+    ///
+    /// The Board sidebar runs in `ScrollMode::WholePanel`, so the whole
+    /// section stack scrolls as one and `SidebarSystem::set_panel_scroll` is
+    /// the only lever — there is no per-tree scroll setter on `SidebarSystem`
+    /// (that is quadraui#595's `SidebarSystem::reveal`, which is not landed at
+    /// any pushed quadraui rev; when it is, this method becomes a delegation).
+    /// The offset is therefore reconstructed here from the panel's own row
+    /// model plus the backend metrics stashed at paint time.
+    ///
+    /// Scrolls the minimum distance that makes the row visible — down to the
+    /// row's bottom edge when it is below the fold, up to its top edge when it
+    /// is above — and is a no-op when the row is already on screen. quadraui
+    /// clamps the stored value to `[0, total - viewport]` when it lays out, so
+    /// an over-shot value can never scroll the panel past its own end.
+    fn scroll_board_selection_into_view(&mut self) {
+        let Some((rect, lh, header_size)) = self.last_sidebar_geom.get() else {
+            return;
+        };
+        if rect.height <= 0.0 || lh <= 0.0 {
+            return;
+        }
+        let Some(section) = self.board_sidebar.active_section() else {
+            return;
+        };
+        let Some(path) = self.board_sidebar.selected_path(section).cloned() else {
+            return;
+        };
+
+        // Walk the section stack down to the target section's body. Hidden
+        // sections are dropped from the view entirely (`build_view` skips
+        // them), so they cost nothing.
+        let mut y = 0.0_f32;
+        for s in 0..section {
+            if !self.board_sidebar.is_section_visible(s) {
+                continue;
+            }
+            y += header_size + self.board_section_content_height(s, lh);
+        }
+        if !self.board_sidebar.is_section_visible(section) {
+            return;
+        }
+        y += header_size;
+
+        // …then across the rows above the target inside that section.
+        let Some(rows) = self.board_section_rows.get(section) else {
+            return;
+        };
+        let mut row_h = None;
+        for (row_path, is_header) in rows {
+            let h = Self::board_row_height(lh, *is_header);
+            if *row_path == path {
+                row_h = Some(h);
+                break;
+            }
+            y += h;
+        }
+        let Some(row_h) = row_h else {
+            return;
+        };
+
+        let scroll = self.board_sidebar.panel_scroll();
+        let new = if y < scroll {
+            y
+        } else if y + row_h > scroll + rect.height {
+            y + row_h - rect.height
+        } else {
+            return;
+        };
+        self.board_sidebar.set_panel_scroll(new.max(0.0));
     }
 
     /// Return the Proposal currently selected in the sidebar's PROPOSALS section.
@@ -7000,12 +7313,16 @@ impl CoordApp {
             };
         }
 
-        match self.board_selected_issue_group() {
+        // #2282 (ms-65 §2): the detail pane follows the ACTIVE DOCUMENT TAB,
+        // not the tree cursor — moving the sidebar selection no longer loses
+        // the issue you were reading. With zero tabs open this is exactly the
+        // pre-ms-65 selection-follows-tree behaviour.
+        match self.board_detail_issue_group() {
             None => {
                 items.push(kv_item("", " No issue selected", None));
             }
             Some(group) => {
-                let repo = self.board_active_repo().unwrap_or("?");
+                let repo = self.board_detail_repo().unwrap_or("?");
 
                 // Section header
                 let header_text = format!(" {} #{} ", repo, group.issue_number);
@@ -7134,9 +7451,9 @@ impl CoordApp {
             }
         }
 
-        let title = match self.board_selected_issue_group() {
+        let title = match self.board_detail_issue_group() {
             Some(group) => {
-                let repo = self.board_active_repo().unwrap_or("?");
+                let repo = self.board_detail_repo().unwrap_or("?");
                 format!(" {} #{} ", repo, group.issue_number)
             }
             None => " DETAIL ".to_string(),
