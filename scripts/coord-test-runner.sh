@@ -756,8 +756,19 @@ run_rust() {
         return 0
     fi
 
-    # A compile error is never a flake.
-    if grep -qE "^error(\[E[0-9]+\])?:|could not compile" "$out"; then
+    # A compile error is never a flake. But cargo's runtime-failure banner
+    # (`error: test failed, to rerun pass '--lib'`) also starts with
+    # `error:` — it is NOT rustc output, and matching it here misreported a
+    # #1260-class lib-test race as "compile error" and skipped the serial
+    # flake filter below (#2347 fallout). Exclude it; a genuine compile
+    # failure always carries rustc `error[E...]`/`error:` diagnostics plus
+    # cargo's closing `error: could not compile ...` line, which still match.
+    # (Two independent greps, not a `| grep -v` pipeline: the two banners are
+    # mutually exclusive in one `cargo test` run — every target builds before
+    # any test runs — and `grep -qv` on empty input is implementation-defined,
+    # e.g. ugrep exits 0 where GNU grep exits 1.)
+    if grep -qE "^error(\[E[0-9]+\])?:|could not compile" "$out" \
+            && ! grep -qE "^error: test failed" "$out"; then
         say "FAIL(rust): compile error"
         grep -E "^error(\[E[0-9]+\])?:|^  -->" "$out" | head -n 20 | sed 's/^/      /'
         return 1

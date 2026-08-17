@@ -597,6 +597,14 @@ def _merge_entry(
         # branch can ever legitimately fire for a given raw_reason.
         elif is_ci_flaky_reason(raw_reason) and not is_ci_flaky_reason(reason):
             reason = raw_reason
+        # #2347: deliberately NO third `elif` here for
+        # `is_ci_unreadable_reason` — unlike CI_INFRA_PREFIX/CI_FLAKY_PREFIX
+        # above, that classification needs no extra `CiStore` I/O (see
+        # `coord.merge_queue._ci_unreadable_reason`'s docstring), so
+        # `_entry_gate_status` already computes it directly at board-build
+        # time. `plan_entry["reason"]` (i.e. `reason` here) already carries
+        # it whenever it applies — there is nothing for the raw row to
+        # recover that the fresh plan reading doesn't already have.
 
     return {
         "status": status,

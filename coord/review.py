@@ -1273,6 +1273,108 @@ def _diff_paths_outside_sealed(diff_text: str, sealed_paths: list[str]) -> list[
     )
 
 
+# ── #2192: free pre-review "missing test" nudge ─────────────────────────────
+#
+# #2132 classified 27 request-changes verdicts on this repo and found 5/27
+# (18.5%) were "missing required black-box test only" — the code was correct,
+# but the diff changed user-visible behavior and shipped no test, which
+# CLAUDE.md's "Testing — black-box coverage is the acceptance bar" section
+# already requires. Each one cost a full paid review leg plus a fix +
+# re-review round trip to catch a pattern a static check can see for free.
+#
+# This is intentionally a coarse, path-only heuristic — no diff semantics, no
+# ``claude -p`` call, no LLM judgment, just the same cheap file-path
+# inspection ``_diff_file_paths``/``_diff_touched_sealed_paths`` already do
+# above. It is a NUDGE, not a gate: callers only ever log it, never act on it
+# to change dispatch behavior, so a false positive costs nothing (the
+# reviewer remains the sole authority and, per CLAUDE.md, already honors a
+# PR that says it's a pure refactor / internal-only change).
+#
+# The caller (``dispatch_review``) logs the result at ``log.warning``, not
+# ``log.info`` — this repo has no ``logging.basicConfig`` anywhere outside
+# tests, so the root logger stays at the default WARNING floor with no
+# handler attached and an INFO record never reaches anyone. WARNING clears
+# that floor and reaches Python's handler-of-last-resort (stderr) with zero
+# configuration. See the comment at the call site for the empirical check.
+
+_TEST_BASENAME_PREFIXES = ("test_",)
+_TEST_BASENAME_SUFFIXES = (
+    "_test.py", "_test.rs",
+    ".test.ts", ".test.tsx", ".spec.ts", ".spec.tsx",
+)
+_TEST_BASENAME_EXACT = ("conftest.py",)
+# Matched against the path with a leading "/" prepended, so both a
+# repo-root prefix ("tests/foo.py" -> "/tests/foo.py") and a nested
+# directory ("tui/tests/foo.rs" -> "/tui/tests/foo.rs") are caught by the
+# same substring check.
+_TEST_PATH_SEGMENTS = ("/tests/", "/test/", "/__tests__/", "/e2e/")
+
+# Paths under these prefixes are internal tooling/docs, never shipped
+# product behavior — CLAUDE.md's "internal-only changes are exempt" carve-out,
+# expressed as the only thing a pure diff inspection can see: file location.
+_NON_USER_VISIBLE_PATH_PREFIXES = (
+    "docs/", "scripts/", "deploy/", ".github/", ".claude/", "graphify-out/",
+)
+_USER_VISIBLE_SUFFIXES = (".py", ".rs", ".ts", ".tsx", ".js", ".jsx")
+
+
+def _is_test_path(path: str) -> bool:
+    """Does *path* look like a test file, by name/location alone?
+
+    NOTE (#2192 review follow-up): ``coord/split_work.py``'s ``_is_test_file``
+    answers a similarly-shaped question with a narrower, Python-only rule
+    set, for chunk-splitting rather than this module's review nudge. See
+    that function's docstring for why the two aren't unified yet.
+    """
+    lower = path.lower()
+    base = lower.rsplit("/", 1)[-1]
+    if base in _TEST_BASENAME_EXACT:
+        return True
+    if any(base.startswith(p) for p in _TEST_BASENAME_PREFIXES):
+        return True
+    if any(base.endswith(s) for s in _TEST_BASENAME_SUFFIXES):
+        return True
+    return any(seg in f"/{lower}" for seg in _TEST_PATH_SEGMENTS)
+
+
+def _is_user_visible_path(path: str) -> bool:
+    """Does *path* look like shipped source (not test, not internal tooling)?"""
+    lower = path.lower()
+    if _is_test_path(lower):
+        return False
+    if any(lower.startswith(p) for p in _NON_USER_VISIBLE_PATH_PREFIXES):
+        return False
+    return any(lower.endswith(s) for s in _USER_VISIBLE_SUFFIXES)
+
+
+def diff_missing_test_coverage(diff_text: str | None) -> bool:
+    """#2192: True when *diff_text* touches user-visible source and zero
+    test files, the pattern behind 18.5% of #2132's blocking reviews.
+
+    Pure, free, deterministic path inspection — reuses :func:`_diff_file_paths`.
+    Returns False (never flags) when the diff is empty, touches no recognized
+    source file (docs-only/internal-tooling-only diffs — CLAUDE.md's
+    internal-only exemption), or already includes a test-file change.
+
+    The CLAUDE.md exemption is honored only at the granularity a path-only
+    heuristic can see: whole file *types/locations* (``docs/``, ``scripts/``,
+    non-source suffixes, ...), not genuine behavior-preserving refactors of
+    shipped source. A true pure refactor of a ``.py``/``.rs``/``.ts`` file
+    (e.g. renaming a local variable) with no test changes still flags —
+    harmless today since the caller only ever logs this, never gates on it,
+    but worth knowing if a caller ever starts acting on the result: at that
+    point this function would honor a narrower exemption than CLAUDE.md's
+    own text, which is about intent ("pure refactor / internal-only"), not
+    file location.
+    """
+    if not diff_text or not diff_text.strip():
+        return False
+    paths = _diff_file_paths(diff_text)
+    if not any(_is_user_visible_path(p) for p in paths):
+        return False
+    return not any(_is_test_path(p) for p in paths)
+
+
 def build_review_briefing(
     *,
     pr_number: int | None,
@@ -2063,6 +2165,30 @@ def dispatch_review(
     fetch_body = issue_body_fetcher or _fetch_issue_body
     issue_body = fetch_body(repo.github, completed.issue_number)
 
+    # #2192: free pre-review nudge (see diff_missing_test_coverage docstring).
+    # Logged only, ahead of the paid reviewer dispatch below — never gates,
+    # never denies, never mutates `completed`. A false positive here must
+    # never cost a round trip, so nothing downstream reads this.
+    #
+    # Deliberately `log.warning`, not `log.info` (#2192 review follow-up):
+    # this repo has zero `logging.basicConfig`/`setLevel`/`addHandler` calls
+    # outside tests (see coord/interactive.py:888-898's #865 note on the same
+    # trap), so the root logger sits at Python's default WARNING floor with
+    # no handler attached — an `INFO` record is filtered before it reaches
+    # anywhere and is a silent no-op under every real entry point (`coord
+    # serve`, `coord notify`, `reconcile()`). `WARNING` clears that floor and
+    # is picked up by `logging`'s handler-of-last-resort, which prints
+    # straight to stderr with zero configuration — confirmed empirically:
+    # `logging.getLogger("coord.review").warning(...)` in a bare subprocess
+    # writes to stderr; `.info(...)` writes nothing.
+    if diff_missing_test_coverage(full_diff_text):
+        log.warning(
+            "[review] %s: diff touches user-visible source with zero test "
+            "files changed — matches #2132's 'missing test only' pattern "
+            "(free static check, non-blocking; dispatching review as normal)",
+            completed.assignment_id,
+        )
+
     # #1811: does the resolved review provider share the worker's model
     # family? ``completed.provider_name`` is the *resolved* name recorded at
     # work-dispatch time (spec > repo > providers.default); ``None`` means a
@@ -2834,6 +2960,13 @@ def dispatch_scoped_review(
     not the prior reviewer) so the scoped review stays independent of the
     code it's judging, mirroring :func:`dispatch_review`'s
     ``completed.machine_name`` contract.
+
+    Does NOT run the #2192 "missing test coverage" nudge that
+    :func:`dispatch_review` does ahead of its dispatch — intentional, not an
+    oversight: this path only fires after a conflict-fix rebase where a full
+    review (nudge included) already happened against the whole PR, and the
+    delta reviewed here is scoped to just the rebase's own resolution, not
+    the PR's original feature diff.
     """
     if not config.reviews.enabled or not config.reviews.auto_dispatch:
         return None

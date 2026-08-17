@@ -787,8 +787,9 @@ def _fix_from_review(
 @click.command(
     help=(
         "Dispatch a headless same-branch fix worker.\n\n"
-        "ASSIGNMENT_ID is either a WORK assignment whose test gate FAILED (or "
-        "whose PR has red CI), or a REVIEW assignment whose verdict was "
+        "ASSIGNMENT_ID is either a WORK assignment whose test gate FAILED "
+        "(or whose PR has red CI, or whose oracle-loop acceptance trust "
+        "gate FAILED — #2344), or a REVIEW assignment whose verdict was "
         "request-changes. Either way the fix lands on the ORIGINAL branch and "
         "updates the ORIGINAL PR — no new issue-N-* branch, no orphan PR."
     )
@@ -802,12 +803,12 @@ def _fix_from_review(
     help=(
         "Override the #555 interactive-work exclusion when fixing a review of "
         "work that ran under claude-pty, or (#2051) dispatch a WORK-row fix "
-        "when neither the test verdict nor a live CI read shows a failure — "
-        "for when the caller knows the PR is red but the check missed it "
-        "(ci_store not configured, a transient read error). Since #2091 the "
-        "refusal names which of those it was, so check the `note:` line "
-        "before reaching for this. Does NOT override max_review_iterations "
-        "or the #522 terminal-work guard."
+        "when neither the test verdict, a live CI read, nor the acceptance "
+        "trust gate shows a failure — for when the caller knows the PR is red "
+        "but the check missed it (ci_store not configured, a transient read "
+        "error). Since #2091 the refusal names which of those it was, so "
+        "check the `note:` line before reaching for this. Does NOT override "
+        "max_review_iterations or the #522 terminal-work guard."
     ),
 )
 def fix(assignment_id: str, config_path: Path, guidance: str, force: bool) -> None:
@@ -837,10 +838,27 @@ def fix(assignment_id: str, config_path: Path, guidance: str, force: bool) -> No
     # `smoke_test=NULL` and must still be fixable.
     test_failed = assignment.test_state == "failed" or assignment.smoke_test == "fail"
 
+    # #2344: the oracle-loop TRUST GATE (docs/ORACLE_LOOP.md, #2199) is a
+    # fourth door onto this command. `_decide_acceptance_gate`
+    # (coord/drive.py) dispatches `coord fix <work_aid>` the instant the
+    # gate's coordinator-run re-run of the sealed suite comes back red — the
+    # same shape as `_decide_test` dispatching on a failed Test verdict.
+    # Before this, nothing here recognized that door: a milestone whose
+    # trust gate failed in isolation (Test not yet run, or already passed;
+    # CI green) hit the #2051 "expected a failed test verdict" refusal on
+    # every attempt — structurally unwinnable, not a transient miss — until
+    # the drive-queue entry parked after burning its retry budget (ms-65 /
+    # #2282, observed live 2026-08-17).
+    acceptance_failed = assignment.acceptance_state == "failed"
+
     # #1622 (part 3): red CI is the third trigger.  Only consulted when the
     # local test gate has NOT already failed, so the cheap in-DB path stays
-    # zero-I/O and the existing failure story keeps priority.
-    ci_read = CiRead() if test_failed else _read_ci(cfg, assignment)
+    # zero-I/O and the existing failure story keeps priority. #2344: same
+    # treatment for a failed trust gate — it is definitive evidence on its
+    # own, so skip the live CI read entirely rather than let a green CI read
+    # (which says nothing about the trust gate's sealed-suite re-run) shadow
+    # it below.
+    ci_read = CiRead() if (test_failed or acceptance_failed) else _read_ci(cfg, assignment)
     ci_story = ci_read.story
 
     # #2091: the stored Test verdict says PASSED while the branch's live CI
@@ -876,8 +894,9 @@ def fix(assignment_id: str, config_path: Path, guidance: str, force: bool) -> No
             err=True,
         )
 
-    # #2051: none of the three doors (failed test verdict, red CI, or the
-    # review-id door handled above) is open.  `_read_ci` is read-only and
+    # #2051 (extended by #2344): none of the four doors (failed test
+    # verdict, red CI, a failed acceptance trust gate, or the review-id door
+    # handled above) is open.  `_read_ci` is read-only and
     # fail-quiet (see :class:`CiRead`) — a missing story means "no CI
     # evidence of a failure", never "CI is green" — so a caller who KNOWS
     # the PR is red (ci_store not configured for this repo, a transient
@@ -886,15 +905,16 @@ def fix(assignment_id: str, config_path: Path, guidance: str, force: bool) -> No
     # that caller's release valve; it is NOT a way to skip the #555 / #522 /
     # max_review_iterations guards, which sit elsewhere.
     forced_without_evidence = False
-    if not test_failed and ci_story is None:
+    if not test_failed and not acceptance_failed and ci_story is None:
         if not force:
             click.echo(
                 f"error: assignment {assignment_id} test_state is "
                 f"{assignment.test_state!r} / smoke_test is "
-                f"{assignment.smoke_test!r}, expected a failed test verdict "
-                "(or red CI on its PR, or a request-changes review id). If "
-                "the PR is actually red and this check missed it, re-run "
-                "with --force.",
+                f"{assignment.smoke_test!r} / acceptance_state is "
+                f"{assignment.acceptance_state!r}, expected a failed test "
+                "verdict (or red CI on its PR, a failed acceptance trust "
+                "gate, or a request-changes review id). If the PR is "
+                "actually red and this check missed it, re-run with --force.",
                 err=True,
             )
             # #2091: say WHY there is no CI evidence.  Before this, six
@@ -940,6 +960,14 @@ def fix(assignment_id: str, config_path: Path, guidance: str, force: bool) -> No
     test_output_file = COORD_DIR / "test_output" / f"{assignment_id}.txt"
     if ci_story is not None:
         test_output = ci_story
+    elif acceptance_failed and not test_failed:
+        # #2344: the trust gate's own recorded reason is the evidence for
+        # this door — `coord acceptance record` writes it to
+        # `acceptance_reason` at the same time it flips `acceptance_state`
+        # to "failed" (coord/state.py). Neither the CI-story nor the
+        # smoke/test-reason fallbacks below apply here: this door fires
+        # precisely when Test/CI are NOT what's red.
+        test_output = assignment.acceptance_reason or ""
     elif test_output_file.exists():
         test_output = test_output_file.read_text()
     elif assignment.smoke_test_reason or assignment.test_reason:
@@ -965,6 +993,9 @@ def fix(assignment_id: str, config_path: Path, guidance: str, force: bool) -> No
             "red)"
         )
         _failure_heading = "Reported failure (--force, unverified)"
+    elif acceptance_failed and not test_failed and ci_story is None:
+        _what = "a failed oracle-loop acceptance trust gate (#2199)"
+        _failure_heading = "Acceptance trust-gate failure"
     else:
         _what = "red CI" if ci_story is not None else "a failed smoke test"
         _failure_heading = "CI failure" if ci_story is not None else "Test failure"

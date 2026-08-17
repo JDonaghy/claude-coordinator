@@ -45,6 +45,8 @@ from coord.block_log import (
     episodes,
     is_by_design,
     log_location,
+    merge_only_event,
+    merge_only_fallback_event,
     operator_resolution_event,
     plan_events,
     read_events,
@@ -322,6 +324,54 @@ def test_a_launch_failure_blocks_outside_the_plan_and_is_still_recorded():
     # The branch recomputes `attempts` because the row has already moved on;
     # the record must show the post-write value, not the stale snapshot.
     assert event["attempts"] == 2
+
+
+def test_a_merge_only_success_is_recorded_distinctly_from_auto_released():
+    """#2350: the queue itself landed the merge directly from the tick — a
+    DIFFERENT cause from #2230's `gate-cleared-after-giveup` or the generic
+    `auto-released` fallback, both of which mean "state flipped, cause
+    unclear" rather than "the mechanism finished this itself". Constructed
+    OUTSIDE the plan, same reason `enter_event` is: the shell only knows the
+    merge landed AFTER `_apply_writes` has already run for the rest of the
+    tick, so this transition can never appear in `plan.writes()`.
+    """
+    event = merge_only_event(
+        entry(2350, state=STATE_PARKED), host="dellserver", now=NOW
+    )
+    assert event["event"] == EVENT_RESOLVE
+    assert event["resolution"] == "auto_merged"
+    assert event["human_acted"] is False
+    assert event["state"] == STATE_DONE
+    assert event["from_state"] == STATE_PARKED
+    assert event["true_cause"].startswith("auto-merged")
+    assert "#2350" in event["true_cause"]
+    # Distinct from the landed/auto-released causes it must never collapse into.
+    assert not event["true_cause"].startswith("already-landed")
+    assert not event["true_cause"].startswith("auto-released")
+
+
+def test_a_merge_only_race_is_recorded_as_an_ordinary_resume_not_a_new_cause():
+    """The failure/race half: the gate read clear enough to attempt the fast
+    path, but the live attempt did not confirm a landed merge — this is
+    honestly "state flipped, cause a plain gate re-clear", not the #2350
+    mechanism actually finishing the work, so it takes the generic
+    `auto-released` classification (#2350 names no new marker for it),
+    exactly like a bare board-signal resume would.
+    """
+    reason = (
+        f"merge-only attempt for {REPO}#2350 did not land it this tick — "
+        "falling back to an ordinary relaunch (#2350)"
+    )
+    event = merge_only_fallback_event(
+        entry(2350, state=STATE_BLOCKED), reason=reason, host="dellserver", now=NOW
+    )
+    assert event["event"] == EVENT_RESOLVE
+    assert event["resolution"] == "auto_resumed"
+    assert event["human_acted"] is False
+    assert event["state"] == STATE_WAITING
+    assert event["from_state"] == STATE_BLOCKED
+    assert event["true_cause"].startswith("auto-released")
+    assert event["release_reason"] == reason
 
 
 # ── persistence ──────────────────────────────────────────────────────────────

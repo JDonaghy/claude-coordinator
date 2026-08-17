@@ -324,7 +324,7 @@ CI_RERUN_POLL_INTERVAL_SECONDS = 10.0
 CI_RERUN_MAX_WAIT_SECONDS = 360.0
 
 
-def _is_unreadable_check(check) -> bool:
+def is_unreadable_check(check) -> bool:
     """True for the #1525 synthetic "could not read CI status" / "gh too
     old" stand-ins (``coord.ci_github._unreadable_check`` /
     ``_gh_too_old_check``) — the read itself failed, so this says nothing
@@ -332,10 +332,33 @@ def _is_unreadable_check(check) -> bool:
     importing ``coord.ci_github`` — this module must stay backend-agnostic,
     and every stub/fake ``CheckRun``-alike in the test suite already has
     both attributes.
+
+    Public (#2347) — :mod:`coord.merge_queue` reuses this directly to
+    classify a ``checks_failed`` block whose failures are ALL this stand-in
+    as a bare check-list *fetch* failure (``CI_UNREADABLE_PREFIX``), distinct
+    from both a real "still running" and a real "ran and failed" verdict; see
+    that module's docstring for the classification this feeds.
+
+    Deliberately narrower than "any ``coord: ``-named synthetic check with
+    ``conclusion == "unknown"``": :class:`coord.gate_snapshot.GateSnapshot`
+    (the board *read* path's ``CiStore`` — :mod:`coord.merge_queue`'s
+    ``_entry_gate_status`` can be, and in production is, called with one —
+    see ``coord.serve_app``'s ``/board`` handler) emits its OWN such
+    stand-in, ``_stale_check`` (``"coord: gate snapshot stale (...)"``), for
+    a completely different local condition — the daemon's own refresh loop
+    fell behind, not a GitHub read failure — and #2347's classification must
+    not relabel that as "GitHub unreachable". Both `coord.ci_github` stand-ins
+    share the phrase "read CI status" in their name; `_stale_check` does not,
+    so requiring it is what keeps the two apart without this module having
+    to import `coord.gate_snapshot` (which itself imports `coord.ci_store` —
+    the reverse import would cycle) or duck-type on anything less stable
+    than the prose these three call sites already commit to.
     """
+    name = str(getattr(check, "name", ""))
     return (
         getattr(check, "conclusion", None) == "unknown"
-        and str(getattr(check, "name", "")).startswith("coord: ")
+        and name.startswith("coord: ")
+        and "read CI status" in name
     )
 
 
@@ -381,7 +404,7 @@ def wait_for_ci_settle(
 
     A "registering" read — no checks at all yet, or every check present is
     one of the #1525 synthetic unreadable stand-ins (see
-    :func:`_is_unreadable_check`) — never counts as settled, however many
+    :func:`is_unreadable_check`) — never counts as settled, however many
     times it's observed; only real, resolved checks do. Genuinely in-flight
     real checks (a run that registered and is now actually executing) also
     keep polling — that's the ordinary "wait for CI to finish" case this
@@ -409,7 +432,7 @@ def wait_for_ci_settle(
             except Exception:  # noqa: BLE001 — best-effort cache-bust only
                 pass
         checks = ci_store.list_checks_for_pr(repo, number)
-        registering = not checks or all(_is_unreadable_check(c) for c in checks)
+        registering = not checks or all(is_unreadable_check(c) for c in checks)
         if not registering and not in_flight_checks(checks):
             return CiSettleResult(
                 settled=True, checks=checks, waited_seconds=clock() - start,

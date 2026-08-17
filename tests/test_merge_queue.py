@@ -175,6 +175,17 @@ class TestPersistence:
         again = {x.assignment_id: (x.ci_flaky_reruns, x.ci_flaky_pending) for x in load_queue()}
         assert again == {"a": (1, a.ci_flaky_pending), "b": (0, "")}
 
+    def test_roundtrip_preserves_ci_unreadable_reruns(self, coord_db) -> None:
+        # #2347: same durability requirement as ci_infra_reruns/
+        # ci_stale_reruns/ci_flaky_reruns above — a daemon restart mid-way
+        # through a run of GitHub-unreachable reads must not lose track of
+        # the count and let the "escalate the wording" ceiling never fire.
+        a = _q("a")
+        a.ci_unreadable_reruns = 2
+        save_queue([a, _q("b")])
+        again = {x.assignment_id: x.ci_unreadable_reruns for x in load_queue()}
+        assert again == {"a": 2, "b": 0}
+
 
 class TestEnqueue:
     def _assignment(self, *, branch: str | None = "worker/foo") -> Assignment:
@@ -2879,6 +2890,63 @@ class TestPassesMergeGates:
         ) is None
 
 
+class TestHasPassedTest:
+    """#2350: :func:`has_passed_test` — the Merge-only fast path's bare
+    recorded-state read, deliberately narrower than :func:`has_smoke_verdict`
+    (no staleness re-derivation, no ``skipped`` short-circuit, no *gh_ops*)."""
+
+    @staticmethod
+    def _board(active=None, completed=None):
+        from coord.models import Board
+        return Board(active=list(active or []), completed=list(completed or []))
+
+    @staticmethod
+    def _work(aid: str = "w1", *, test_state: str | None = None) -> Assignment:
+        return Assignment(
+            machine_name="m1",
+            repo_name="api",
+            issue_number=1,
+            issue_title="t",
+            assignment_id=aid,
+            type="work",
+            status="done",
+            branch=f"worker/{aid}",
+            test_state=test_state,
+        )
+
+    def test_finds_a_passed_verdict_on_the_chained_work_assignment(self) -> None:
+        work = self._work("w1", test_state="passed")
+        board = self._board(completed=[work])
+        assert mq.has_passed_test(_q("w1"), board) is True
+
+    def test_missing_verdict_reads_false(self) -> None:
+        work = self._work("w1", test_state=None)
+        board = self._board(completed=[work])
+        assert mq.has_passed_test(_q("w1"), board) is False
+
+    def test_failed_verdict_reads_false(self) -> None:
+        work = self._work("w1", test_state="failed")
+        board = self._board(completed=[work])
+        assert mq.has_passed_test(_q("w1"), board) is False
+
+    def test_skipped_verdict_reads_false_unlike_the_smoke_gate(self) -> None:
+        """The deliberate narrowing vs. :func:`has_smoke_verdict`: a
+        `skipped` verdict is a true smoke-gate pass but not literally "Test
+        passed", so #2350's fast path must not treat it as one."""
+        work = self._work("w1", test_state="skipped")
+        board = self._board(completed=[work])
+        assert mq.has_passed_test(_q("w1"), board) is False
+
+    def test_ignores_an_unrelated_work_assignments_verdict(self) -> None:
+        work = self._work("w99", test_state="passed")
+        board = self._board(completed=[work])
+        assert mq.has_passed_test(_q("w1"), board) is False
+
+    def test_no_matching_work_at_all_reads_false(self) -> None:
+        board = self._board(completed=[])
+        assert mq.has_passed_test(_q("w1"), board) is False
+
+
 class TestSmokeGate:
     """#465: process() must refuse to merge when interactive smoke is required
     and no passing/skipped verdict is recorded on the work assignment.
@@ -5382,6 +5450,71 @@ class TestPlan:
         assert plan[0].status == mq.PLAN_BLOCKED
         assert "CI running" in (plan[0].reason or "")
 
+    def test_blocked_ci_unreadable(self, coord_db) -> None:
+        """#2347: a check-list FETCH failure (the #1525 synthetic "could not
+        read CI status" stand-in) must appear as BLOCKED with a
+        CI_UNREADABLE_PREFIX reason — distinct from both "CI failed" (a real
+        red verdict) and "CI running" (a real pending verdict), since this
+        is neither: GitHub could not even be asked the question."""
+        from types import SimpleNamespace
+
+        class FakeCi:
+            is_available = True
+            def list_checks_for_pr(self, repo, number):
+                return [SimpleNamespace(
+                    name="coord: could not read CI status for acme/api#99 "
+                         "(HTTP 503: No server is currently available)",
+                    status="completed", conclusion="unknown",
+                )]
+
+        items = [_q("w1", size=50, pr=99)]
+        save_queue(items)
+        board = self._board(completed=[
+            self._work("w1", test_state="passed"),
+            self._review("w1", verdict="approve"),
+        ])
+        cfg = self._config()
+        plan = mq.plan(board, cfg, ci_store=FakeCi())
+        assert plan[0].status == mq.PLAN_BLOCKED
+        assert mq.is_ci_unreadable_reason(plan[0].reason)
+        assert not mq.is_ci_pending_reason(plan[0].reason)
+        assert "GitHub could not be reached" in (plan[0].reason or "")
+        assert "CI failed" not in (plan[0].reason or "")
+
+    def test_blocked_ci_unreadable_not_confused_with_gate_snapshot_stale(
+        self, coord_db
+    ) -> None:
+        """#2347 regression guard: `coord.gate_snapshot.GateSnapshot`'s OWN
+        synthetic "could not trust this snapshot" stand-in
+        (``_stale_check``) also carries ``conclusion="unknown"`` and a
+        ``"coord: "``-prefixed name — but names a completely different local
+        condition (the daemon's own refresh loop fell behind), not a
+        GitHub read failure, and must NOT be relabeled CI_UNREADABLE_PREFIX.
+        `is_unreadable_check` requires the "read CI status" phrase the two
+        real ci_github stand-ins share and this one doesn't — see its
+        docstring."""
+        from types import SimpleNamespace
+
+        class FakeCi:
+            is_available = True
+            def list_checks_for_pr(self, repo, number):
+                return [SimpleNamespace(
+                    name="coord: gate snapshot stale (999s old, max 180s)",
+                    status="completed", conclusion="unknown",
+                )]
+
+        items = [_q("w1", size=50, pr=99)]
+        save_queue(items)
+        board = self._board(completed=[
+            self._work("w1", test_state="passed"),
+            self._review("w1", verdict="approve"),
+        ])
+        cfg = self._config()
+        plan = mq.plan(board, cfg, ci_store=FakeCi())
+        assert plan[0].status == mq.PLAN_BLOCKED
+        assert not mq.is_ci_unreadable_reason(plan[0].reason)
+        assert "CI failed" in (plan[0].reason or "")
+
     def test_blocked_ci_absent_when_repo_declares_ci(self, coord_db) -> None:
         """#1904: an empty check list for a repo that declares CI must show
         BLOCKED with a `checks_absent`-style reason — not READY, the
@@ -6679,6 +6812,154 @@ class TestProcessCiInfraAutoRerun:
         process(items, gh, ci_store=ci)
 
         assert items[0].ci_infra_reruns == 0
+
+
+class TestProcessCiUnreadableAutoRetry:
+    """#2347: `process()`'s live merge path classifies a bare check-list
+    FETCH failure (GitHub unreachable — the #1525 synthetic "could not read
+    CI status" stand-in) distinctly from both a real "still running" verdict
+    and a real "ran and failed" one — with its own bounded retry count,
+    mirroring `MAX_CI_INFRA_RERUNS`'s shape, but — unlike #1892's own
+    exhaustion — NEVER falling back to the generic "checks failed" wording
+    even once that budget is exhausted: see `_ci_unreadable_reason`'s
+    docstring for why a fetch failure is never a real CI verdict no matter
+    how many times it repeats."""
+
+    class _Ci:
+        is_available = True
+
+        def __init__(self, checks):
+            self._checks = checks
+
+        def list_checks_for_pr(self, repo, number):
+            return self._checks
+
+    @staticmethod
+    def _unreadable_checks(
+        detail: str = "HTTP 503: No server is currently available",
+    ):
+        from coord.ci_github import _unreadable_check
+        return [_unreadable_check("acme/api", 99, detail)]
+
+    def test_first_failure_is_classified_distinctly_not_as_checks_failed(
+        self,
+    ) -> None:
+        items = [_q("w1", pr=99)]
+        gh = FakeGh()
+        ci = self._Ci(self._unreadable_checks())
+
+        events = process(items, gh, ci_store=ci)
+
+        assert items[0].state == PENDING
+        assert items[0].ci_unreadable_reruns == 1
+        kinds = [e.kind for e in events]
+        assert "checks_unreadable" in kinds
+        assert "checks_failed" not in kinds
+        assert items[0].error is not None
+        assert items[0].error.startswith("CI unreadable:")
+        assert "GitHub could not be reached" in items[0].error
+        assert "retrying automatically (1/2)" in items[0].error
+        assert "no attempt spent" in items[0].error
+
+    def test_never_collapses_into_checks_failed_even_after_budget_exhausted(
+        self,
+    ) -> None:
+        from coord.merge_queue import MAX_CI_UNREADABLE_RERUNS
+
+        items = [_q("w1", pr=99)]
+        gh = FakeGh()
+        ci = self._Ci(self._unreadable_checks())
+
+        for expected in range(1, MAX_CI_UNREADABLE_RERUNS + 1):
+            process(items, gh, ci_store=ci)
+            assert items[0].ci_unreadable_reruns == expected
+
+        # One (and several) more ticks past the cap: still bounded (pegged,
+        # never incremented past the cap) AND still CI_UNREADABLE_PREFIX —
+        # never the generic "checks failed" wording, #2347's whole point.
+        for _ in range(2):
+            events = process(items, gh, ci_store=ci)
+            assert items[0].ci_unreadable_reruns == MAX_CI_UNREADABLE_RERUNS
+            kinds = [e.kind for e in events]
+            assert "checks_unreadable" in kinds
+            assert "checks_failed" not in kinds
+            assert items[0].error.startswith("CI unreadable:")
+            assert "checks failed:" not in items[0].error
+            assert "worth a human glance" in items[0].error
+
+    def test_no_attempt_spent_never_calls_rerun_or_jobs_api(self) -> None:
+        """Unlike #1892, there is no remedy action to trigger for a bare
+        fetch failure — this stub deliberately does not implement
+        `rerun_for_pr`/`list_jobs_for_run`/`rerun_failed_for_pr`, so a stray
+        call to any of them would raise `AttributeError` and fail the test."""
+        items = [_q("w1", pr=99)]
+        gh = FakeGh()
+        ci = self._Ci(self._unreadable_checks())
+
+        process(items, gh, ci_store=ci)  # would raise if it touched any of them
+
+    def test_a_genuine_failure_is_never_classified_as_unreadable(self) -> None:
+        items = [_q("w1", pr=99)]
+        gh = FakeGh()
+        real_failure = _check("build", conclusion="failure")
+        ci = self._Ci([real_failure])
+
+        events = process(items, gh, ci_store=ci)
+
+        kinds = [e.kind for e in events]
+        assert "checks_unreadable" not in kinds
+        assert "checks_failed" in kinds
+        assert items[0].error == "checks failed: build (failure)"
+        assert items[0].ci_unreadable_reruns == 0
+
+    def test_a_pending_check_is_never_classified_as_unreadable(self) -> None:
+        items = [_q("w1", pr=99)]
+        gh = FakeGh()
+        pending = _check("e2e", status="in_progress", conclusion=None)
+        ci = self._Ci([pending])
+
+        events = process(items, gh, ci_store=ci)
+
+        kinds = [e.kind for e in events]
+        assert "checks_unreadable" not in kinds
+        assert "checks_pending" in kinds
+        assert items[0].ci_unreadable_reruns == 0
+
+    def test_resets_after_a_clean_read_so_a_later_failure_starts_fresh(
+        self,
+    ) -> None:
+        """A later, unrelated fetch failure must get its own budget — not
+        inherit an exhausted count from an earlier, already-resolved one."""
+        from coord.merge_queue import MAX_CI_UNREADABLE_RERUNS
+
+        class _Gh(FakeGh):
+            def get_branch_commit_timestamp(self, repo, branch):
+                return 1000.0
+
+        items = [_q("w1", pr=99)]
+        items[0].ci_unreadable_reruns = MAX_CI_UNREADABLE_RERUNS
+        gh = _Gh()
+        passing = _check("e2e", conclusion="success")
+        passing.started_at = 1500.0  # after the mocked base — fresh, not stale
+        ci = self._Ci([passing])
+
+        process(items, gh, ci_store=ci)
+
+        assert items[0].ci_unreadable_reruns == 0
+
+    def test_dry_run_previews_without_mutating_anything(self) -> None:
+        items = [_q("w1", pr=99)]
+        gh = FakeGh()
+        ci = self._Ci(self._unreadable_checks())
+
+        events = process(items, gh, ci_store=ci, dry_run=True)
+
+        assert items[0].ci_unreadable_reruns == 0  # dry-run never mutates
+        kinds = [e.kind for e in events]
+        assert "checks_failed" in kinds
+        msg = next(e.message for e in events if e.kind == "checks_failed")
+        assert "CI unreadable:" in msg
+        assert "GitHub could not be reached" in msg
 
 
 class TestProcessCiFlakyAutoRerun:

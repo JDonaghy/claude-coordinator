@@ -326,6 +326,7 @@
       "ci_flaky_reruns": 0,
       "ci_infra_reruns": 0,
       "ci_stale_reruns": 0,
+      "ci_unreadable_reruns": 0,
       "enqueued_at": 1000000950.0,
       "error": null,
       "id": 1,

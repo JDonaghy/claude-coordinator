@@ -3143,6 +3143,82 @@ def test_a_genuinely_failed_check_is_not_read_as_ci_infra():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# #2347: a THIRD sibling case, checked right after #1891 — the check-list
+# FETCH itself failed (GitHub unreachable: a transient `gh pr checks` HTTP
+# 5xx, an auth blip), so there is no CI verdict of ANY shape yet, not even a
+# genuine "still running" one. `coord merge`'s own live attempt tracks a
+# bounded count of consecutive fetch failures for this and keeps waiting
+# either way — there is no CI to rerun and no gate to re-test, only more real
+# time (GitHub answering again). The drive must wait, not retry `coord
+# merge` itself or burn its merge-attempt budget on a no-op observation.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.parametrize("status", ["", "PENDING", "READY", "BLOCKED"])
+def test_ci_unreadable_waits_regardless_of_which_status_the_board_shows(status):
+    action = step(
+        approved_work(
+            merge_status=status,
+            merge_reason=(
+                "CI unreadable: coord: could not read CI status for "
+                "acme/api#99 (HTTP 503) (unknown) — GitHub could not be "
+                "reached to read CI status; this is not a CI result"
+            ),
+        )
+    )
+    assert action.kind == WAIT
+    assert "GitHub could not be reached" in action.label
+    assert "not retrying" in action.label
+
+
+def test_ci_unreadable_never_spends_an_attempt_across_several_polls():
+    """Acceptance (#2347): a PR whose CI status could not be read from
+    GitHub does not consume a drive merge attempt, mirroring the identical
+    #1891/#1892 guarantees above."""
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_merge_attempts=2)
+    s = approved_work(
+        merge_status="",
+        merge_reason=(
+            "CI unreadable: coord: could not read CI status for "
+            "acme/api#99 (HTTP 503) (unknown) — GitHub could not be "
+            "reached to read CI status; this is not a CI result"
+        ),
+    )
+
+    for _ in range(5):
+        action = step(s, opts, counters=counters)
+        assert action.kind == WAIT
+        assert counters.merge_attempts == 0
+
+
+def test_ci_unreadable_reason_is_recognised_via_the_shared_predicate_not_ad_hoc_text():
+    from coord.merge_queue import CI_UNREADABLE_PREFIX, is_ci_unreadable_reason
+
+    assert is_ci_unreadable_reason(f"{CI_UNREADABLE_PREFIX} build (unknown)")
+    assert not is_ci_unreadable_reason("checks failed: build (failure)")
+    assert not is_ci_unreadable_reason("CI running: build")
+    assert not is_ci_unreadable_reason("CI infra: build (cancelled)")
+    assert not is_ci_unreadable_reason("")
+    assert not is_ci_unreadable_reason(None)
+
+
+def test_a_genuinely_failed_check_is_not_read_as_ci_unreadable():
+    """Regression guard: a plain 'checks failed: ...' reason (no
+    CI_UNREADABLE_PREFIX) still walks the bounded retry path, exactly like
+    test_a_genuinely_failed_check_still_walks_the_bounded_retry_path."""
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_merge_attempts=2)
+    s = approved_work(
+        merge_status="",
+        merge_reason="checks failed: build (failure)",
+    )
+
+    assert step(s, opts, counters=counters).kind == RUN
+    assert counters.merge_attempts == 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # #2252: the OTHER sibling case — a CI verdict DID arrive AND said something
 # real about the code, but `coord merge`'s own live attempt has only
 # observed it fail ONCE so far and is already re-running the failed job(s)
@@ -3745,6 +3821,23 @@ def test_a_live_ci_wait_still_wins_over_a_captured_gate_line():
         approved_work(
             merge_status="READY",
             merge_reason="CI running: build, windows",
+        ),
+        counters=counters,
+    )
+    assert action.kind == WAIT
+    assert counters.fix_rounds == 0
+    assert counters.merge_attempts == 0
+
+
+def test_a_live_ci_unreadable_wait_still_wins_over_a_captured_gate_line():
+    """#2347's bare wait gets the SAME treatment as #1891/#1892 above: a
+    snapshot from an older attempt must not divert the drive into a re-test
+    while GitHub itself could not be reached to read CI status."""
+    counters = DriveCounters(last_merge_diagnostic=_stale_smoke_diagnostic())
+    action = step(
+        approved_work(
+            merge_status="READY",
+            merge_reason="CI unreadable: coord: could not read CI status (unknown)",
         ),
         counters=counters,
     )
