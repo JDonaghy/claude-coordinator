@@ -2234,6 +2234,121 @@ def test_a_blocked_entry_stays_blocked_on_a_cached_still_blocked_board_signal():
     assert plan.launch is None
 
 
+def test_a_blocked_entry_takes_the_merge_only_path_when_test_review_are_also_clear():
+    """#2350: Merge is the only remaining gate — the board already shows
+    Test passed and Review approved — so the tick attempts `coord merge
+    --only` directly instead of writing `STATE_WAITING` for a relaunch."""
+    key = entry_key(REPO, 309)
+    entries = [_blocked_entry(309, position=3, resumes=0)]
+    plan = plan_tick(
+        entries,
+        board(),
+        capacity=1,
+        live_blocked_gate={key: False},
+        merge_only_ready={key: True},
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "merge_only"
+    # No state write here — the shell decides the entry's real next state
+    # from the live outcome of the merge attempt (see `Reconcile`'s
+    # `merge_only` outcome docstring).
+    assert reconcile.updates == {}
+    assert plan.merge_only == (entries[0],)
+    # No capacity spent, no relaunch competing for a slot.
+    assert plan.launch is None
+
+
+def test_a_blocked_entry_with_review_still_pending_falls_through_to_the_ordinary_resume():
+    """The negative case: the gate reads clear, but `merge_only_ready` is
+    False (Test not yet run, or Review not yet in) — the shortcut must not
+    fire early; this takes EXACTLY the pre-#2350 `resumed` path."""
+    key = entry_key(REPO, 309)
+    entries = [_blocked_entry(309, position=3, resumes=0)]
+    plan = plan_tick(
+        entries,
+        board(),
+        capacity=1,
+        live_blocked_gate={key: False},
+        merge_only_ready={key: False},
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "resumed"
+    assert reconcile.updates["state"] == STATE_WAITING
+    assert reconcile.updates["resumes"] == 1
+    assert plan.merge_only == ()
+    assert plan.launch is not None and plan.launch.issue == 309
+
+
+def test_a_blocked_entry_with_no_merge_only_signal_at_all_also_falls_through():
+    """Absence (the shell's `_fetch_merge_only_ready` never computed a
+    reading for this key — no PR yet, an unreadable config, etc.) must
+    degrade to today's behaviour too, not just an explicit `False`."""
+    key = entry_key(REPO, 309)
+    entries = [_blocked_entry(309, position=3, resumes=0)]
+    plan = plan_tick(
+        entries, board(), capacity=1, live_blocked_gate={key: False}
+    )
+    assert plan.reconciles[0].outcome == "resumed"
+    assert plan.merge_only == ()
+
+
+def test_a_blocked_entry_past_the_resume_ceiling_never_takes_the_merge_only_path():
+    """The #2230 oscillation ceiling outranks #2350: an entry that has
+    already cycled MAX_BLOCKED_RESUMES times stays blocked — whether the
+    next chance would have been a relaunch or a direct merge attempt."""
+    from coord.drive_queue import MAX_BLOCKED_RESUMES
+
+    key = entry_key(REPO, 309)
+    entries = [_blocked_entry(309, position=3, resumes=MAX_BLOCKED_RESUMES)]
+    plan = plan_tick(
+        entries,
+        board(),
+        capacity=1,
+        live_blocked_gate={key: False},
+        merge_only_ready={key: True},
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "oscillating"
+    assert plan.merge_only == ()
+    assert plan.launch is None
+
+
+def test_a_parked_entry_takes_the_merge_only_path_on_a_live_gate_recheck():
+    """The `parked` counterpart (#1891/#2182's live re-check), via the SAME
+    `live_ci_gate`-clear branch a `resumed` reconcile would otherwise take."""
+    key = entry_key(REPO, 2350)
+    entries = [entry(2350, position=3, state="parked", attempts=0)]
+    plan = plan_tick(
+        entries,
+        board(),
+        capacity=1,
+        live_ci_gate={key: False},
+        merge_only_ready={key: True},
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "merge_only"
+    assert reconcile.updates == {}
+    assert plan.merge_only == (entries[0],)
+    assert plan.launch is None
+
+
+def test_a_parked_entry_with_review_still_pending_falls_through_to_the_ordinary_resume():
+    key = entry_key(REPO, 2350)
+    entries = [entry(2350, position=3, state="parked", attempts=0)]
+    plan = plan_tick(
+        entries,
+        board(),
+        capacity=1,
+        live_ci_gate={key: False},
+        merge_only_ready={key: False},
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "resumed"
+    assert reconcile.updates["state"] == STATE_WAITING
+    assert plan.merge_only == ()
+    assert plan.launch is not None and plan.launch.issue == 2350
+
+
 def test_is_permanent_block_reason_recognises_both_markers_and_nothing_else():
     from coord.drive_queue import is_permanent_block_reason
 

@@ -1088,10 +1088,23 @@ class Reconcile:
       startup grace window.  Costs one attempt.
     * ``exhausted`` — as ``retry``, but out of attempts; pairs with a
       :class:`Blocked`.
+    * ``merge_only`` — #2350: a ``parked``/``blocked`` entry whose live gate
+      re-check reads clear AND whose board-recorded Test/Review verdicts
+      already show Merge is the only remaining gate (*merge_only_ready*).
+      Writes NO state here — unlike ``resumed``, this does not fall through
+      to step 4's launch walk at all. The key is instead carried on
+      :attr:`TickPlan.merge_only` for the shell to attempt a direct
+      ``coord merge --only`` from THIS tick, no relaunch, no capacity slot
+      spent. The shell decides the entry's real next state from the live
+      outcome of that attempt (straight to ``done`` on success; falls back
+      to exactly today's ``resumed``-shaped ``STATE_WAITING`` on failure —
+      see :func:`coord.commands.drive_queue._run_merge_only_candidates`),
+      which is why this Reconcile's own ``updates`` stays empty: neither
+      outcome is knowable at the moment :func:`plan_tick` returns.
     """
 
     key: str
-    outcome: str  # alive | starting | held | unknown | done | refused | parked | retry | exhausted
+    outcome: str  # alive | starting | held | unknown | done | refused | parked | retry | exhausted | merge_only
     reason: str
     occupies: bool = False
     updates: Mapping[str, Any] = field(default_factory=dict)
@@ -1243,6 +1256,11 @@ class TickPlan:
 
     reconciles: tuple[Reconcile, ...] = ()
     launch: QueueEntry | None = None
+    # #2350: entries the walk above marked ``merge_only`` — the shell attempts
+    # `coord merge --only` for each directly, no relaunch, no capacity spent.
+    # Unlike `launch` (one slot, one entry), every eligible entry gets one:
+    # nothing here competes for capacity, so there is nothing to ration.
+    merge_only: tuple[QueueEntry, ...] = ()
     blocked: tuple[Blocked, ...] = ()
     deferrals: tuple[Deferral, ...] = ()
     holds: tuple[Hold, ...] = ()
@@ -2226,6 +2244,7 @@ def _reconcile_blocked(
     entry: QueueEntry,
     facts: IssueFacts,
     live_blocked_gate: Mapping[str, bool] | None,
+    merge_only_ready: Mapping[str, bool] | None = None,
 ) -> Reconcile | None:
     """Re-examine ONE `blocked` entry against the current gate reading.
 
@@ -2252,6 +2271,17 @@ def _reconcile_blocked(
     issue's explicit ask), which is also what feeds the oscillation signal
     into `coord drive-queue list`/`status` without inventing a second alert
     channel for it.
+
+    *merge_only_ready* (#2350) is consulted only once a confirmed-clear
+    reading has already survived the oscillation-ceiling check above — the
+    ceiling's "stop giving this entry more chances" verdict applies whether
+    the next chance would have been a relaunch or a direct merge attempt.
+    A ``True`` entry there means Merge is the ONLY gate left (the board's
+    own recorded Test/Review verdicts already show `passed`/`approve` — see
+    :func:`coord.commands.drive_queue._fetch_merge_only_ready`), so this
+    returns a ``merge_only`` :class:`Reconcile` instead of the ordinary
+    ``resumed`` one below — see that outcome's docstring on :class:`Reconcile`
+    for why it writes no state here.
     """
     if is_permanent_block_reason(entry.last_reason):
         return None
@@ -2275,6 +2305,16 @@ def _reconcile_blocked(
             occupies=False,
             updates={"last_reason": reason},
         )
+
+    if (merge_only_ready or {}).get(entry.key):
+        reason = (
+            f"{entry.key}'s merge gate reads clear now "
+            f"({facts.merge_gate_reason or facts.merge_ci_pending_reason or 'no gate objection'}) "
+            "and the board already shows Test passed and Review approved — "
+            "attempting `coord merge --only` directly from this tick instead "
+            "of relaunching a fresh drive session (#2350)"
+        )
+        return Reconcile(entry.key, "merge_only", reason, occupies=False)
 
     reason = (
         f"{entry.key}'s merge gate reads clear now "
@@ -2556,6 +2596,7 @@ def plan_tick(
     live_ci_gate_reason: Mapping[str, str] | None = None,
     live_blocked_gate: Mapping[str, bool] | None = None,
     editable_drift: tuple[str, str] | None = None,
+    merge_only_ready: Mapping[str, bool] | None = None,
 ) -> TickPlan:
     """Decide one tick.  Pure; the caller executes the returned plan.
 
@@ -2686,6 +2727,22 @@ def plan_tick(
     beats the cached board's `IssueFacts.merge_gate_status`; absent falls
     through to it. See :func:`_blocked_gate_reading`.
 
+    *merge_only_ready* (#2350) maps a key to whether — GIVEN this SAME tick
+    already found its live gate clear (*live_ci_gate* reading `False` for a
+    `parked` entry, *live_blocked_gate* reading `False` for a `blocked` one)
+    — the board's own recorded pipeline state ALSO shows Test `passed` and
+    Review `approve` already, i.e. Merge is the only gate that was ever
+    still shut. `True` there swaps what would have been today's `resumed`
+    reconcile (write `STATE_WAITING`, compete for next tick's launch slot)
+    for a `merge_only` one instead (write nothing; the shell attempts
+    `coord merge --only` directly, this tick, no relaunch, no capacity
+    spent) — see :class:`Reconcile`'s `merge_only` outcome and
+    :func:`coord.commands.drive_queue._fetch_merge_only_ready` for how the
+    shell computes it. A key ABSENT or `False` changes nothing: the entry
+    takes exactly the pre-#2350 `resumed` path, so an unreadable board, a
+    missing PR, or Test/Review genuinely not both satisfied yet all degrade
+    to today's behaviour, never to a wrongly-skipped relaunch.
+
     The algorithm, from #1754, plus #1757's step 2, #1891's step 1b, #2055's
     extension of it, and #2230's further extension for `blocked`:
 
@@ -2787,6 +2844,9 @@ def plan_tick(
     reconciles: list[Reconcile] = []
     blocked: list[Blocked] = []
     deferrals: list[Deferral] = []
+    # #2350: entries this tick decided to attempt `coord merge --only` on
+    # directly rather than relaunch — see `Reconcile`'s `merge_only` outcome.
+    merge_only_candidates: list[QueueEntry] = []
     occupied = 0
     # #1972: the same count, keyed by repo.  Populated from the SAME
     # `reconcile.occupies` verdict as `occupied` above — one source of truth, so
@@ -2890,9 +2950,16 @@ def plan_tick(
             # gave-up entry via the CI-pending resume was explicitly not the
             # #2055 fix and is not this one either; see
             # :func:`_reconcile_blocked` for the full decision.
-            blocked_reconcile = _reconcile_blocked(entry, facts, live_blocked_gate)
+            blocked_reconcile = _reconcile_blocked(
+                entry, facts, live_blocked_gate, merge_only_ready
+            )
             if blocked_reconcile is not None:
                 reconciles.append(blocked_reconcile)
+                if blocked_reconcile.outcome == "merge_only":
+                    # #2350: no state write — the shell decides the entry's
+                    # real next state from the live merge attempt's outcome.
+                    merge_only_candidates.append(entry)
+                    continue
                 new_state = blocked_reconcile.updates.get("state")
                 if new_state:
                     states[entry.key] = str(new_state)
@@ -2953,6 +3020,24 @@ def plan_tick(
                             updates={"last_reason": reason},
                         )
                     )
+                continue
+            if (merge_only_ready or {}).get(entry.key):
+                # #2350: Merge is the only gate left — the board already
+                # shows Test passed and Review approved. Attempt the merge
+                # directly this tick instead of paying for a relaunch; see
+                # `Reconcile`'s `merge_only` outcome for why no state is
+                # written here.
+                reason = (
+                    f"live re-check of {entry.key}'s gate this tick reads "
+                    "READY (coord merge --plan agrees) and the board already "
+                    "shows Test passed and Review approved — attempting "
+                    "`coord merge --only` directly from this tick instead of "
+                    "relaunching a fresh drive session (#2350)"
+                )
+                reconciles.append(
+                    Reconcile(entry.key, "merge_only", reason, occupies=False)
+                )
+                merge_only_candidates.append(entry)
                 continue
             reason = (
                 f"live re-check of {entry.key}'s gate this tick reads READY "
@@ -3099,6 +3184,11 @@ def plan_tick(
         # report the reading that `occupied` was taken from.
         "repo_occupied": dict(repo_occupied),
         "repo_capacity": repo_capacity,
+        # #2350: fixed by the time reconciliation (steps 1/1b) finishes —
+        # nothing below this point (holds, capacity, the launch walk) ever
+        # adds to it — so, unlike `reconciles`, every return site can share
+        # this one tuple via `**plan_base` instead of re-taking it fresh.
+        "merge_only": tuple(merge_only_candidates),
     }
 
     # #2186: every currently-closed gate, keyed by the entry it was declared
@@ -3535,6 +3625,11 @@ def render_plan(plan: TickPlan, *, dry_run: bool = False) -> list[str]:
         )
     for item in plan.reconciles:
         lines.append(f"  reconcile {item.key}: {item.outcome} — {item.reason}")
+    # #2350: printed right after the reconciles, same reasoning as the hold
+    # line below — "merge_only" and "attempting the merge directly" are one
+    # thought, not two lines an operator has to correlate by key.
+    for item in plan.merge_only:
+        lines.append(f"  {prefix}merge --only {item.key}")
     # #1757: the gate line goes directly under its reconcile, because "1753
     # done" immediately followed by "and therefore nothing launches" is the
     # sentence an operator reading a timer log needs to read as one thought.
