@@ -20,6 +20,7 @@ import pytest
 from coord.drive_queue import (
     DEFAULT_MAX_ATTEMPTS,
     DRIVE_STARTUP_GRACE_SECONDS,
+    EMPTY_BRANCH_MAX_ATTEMPTS,
     HOLD_ARMED,
     HOLD_FIRED,
     HOLD_RELEASED,
@@ -1634,6 +1635,136 @@ def test_no_exit_reason_falls_back_to_the_synthesised_death_wording():
         "drive session died without landing the work"
         in plan.reconciles[0].reason
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# #2363: the "claimed success, wrote nothing" signature — an acceptance-author
+# or plain work session that exited DONE/ADVISORY claiming success while its
+# branch carried zero commits (`coord/drive.py:850-865`, `:887-918`, and
+# `_decide_advisory`) — gets a WIDER attempt budget than
+# `DEFAULT_MAX_ATTEMPTS` before blocking. Every recorded instance of this
+# shape in `~/.coord/queue-block-log.jsonl` self-healed 0% of the time inside
+# the default ceiling (the issue's own evidence table); this is additive —
+# every OTHER death reason keeps today's flat ceiling unchanged.
+# ═══════════════════════════════════════════════════════════════════════════
+
+ACCEPTANCE_ADVISORY_EMPTY_BRANCH_REASON = (
+    "acceptance author api#42 exited ADVISORY with no commits on its branch "
+    "— nothing was authored, so there is no slice to land.\n"
+    "   inspect: coord log api#42 --machine dellserver\n"
+    "   Continue by hand, or re-run coord drive with --no-acceptance to "
+    "skip JIT authoring."
+)
+ACCEPTANCE_DONE_EMPTY_BRANCH_REASON = (
+    "acceptance author api#42 exited DONE, but its branch 'work/api-1650' "
+    "carries no commits — nothing was authored, so there is no slice to "
+    "land, and DONE is terminal: it will never change on its own.\n"
+    "   inspect: coord log api#42 --machine dellserver\n"
+    "   Re-author by hand: coord acceptance author claude-coordinator "
+    "1600 --issue 1650\n"
+    "   or re-run coord drive with --no-acceptance to skip JIT authoring."
+)
+WORK_ADVISORY_EMPTY_BRANCH_REASON = (
+    "work api#42 exited ADVISORY with no commits on its branch —\n"
+    "   nothing was pushed, so there is nothing to test, review, or merge.\n"
+    "   inspect: coord log api#42 --machine dellserver"
+)
+
+
+@pytest.mark.parametrize(
+    "own_reason",
+    [
+        ACCEPTANCE_ADVISORY_EMPTY_BRANCH_REASON,
+        ACCEPTANCE_DONE_EMPTY_BRANCH_REASON,
+        WORK_ADVISORY_EMPTY_BRANCH_REASON,
+    ],
+)
+def test_empty_branch_death_survives_past_the_default_attempt_ceiling(own_reason):
+    """#2363 acceptance: a `DEFAULT_MAX_ATTEMPTS`-th death of this shape must
+    NOT yet be blocked — the whole point is a wider budget than the flat
+    ceiling every other death reason gets."""
+    entries = [
+        entry(1650, state=STATE_RUNNING, attempts=DEFAULT_MAX_ATTEMPTS - 1)
+    ]
+    plan = plan_tick(
+        entries, board(), capacity=1,
+        exit_reasons={entry_key(REPO, 1650): own_reason},
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "retry"
+    assert plan.blocked == ()
+    assert reconcile.updates["state"] == STATE_WAITING
+    assert reconcile.updates["attempts"] == DEFAULT_MAX_ATTEMPTS
+    assert f"{DEFAULT_MAX_ATTEMPTS}/{EMPTY_BRANCH_MAX_ATTEMPTS}" in reconcile.reason
+    assert "#2363" in reconcile.reason
+    assert own_reason in reconcile.reason
+
+
+def test_empty_branch_death_still_blocks_once_its_own_wider_budget_is_exhausted():
+    """No silent infinite retry: once `EMPTY_BRANCH_MAX_ATTEMPTS` is itself
+    hit, the entry blocks with the same diagnosis-and-recovery text the
+    drive itself wrote (`own_reason`, verbatim — the `coord log`/`coord
+    acceptance author` instructions an operator would otherwise have to
+    reconstruct by hand)."""
+    entries = [
+        entry(
+            1650,
+            state=STATE_RUNNING,
+            attempts=EMPTY_BRANCH_MAX_ATTEMPTS - 1,
+        )
+    ]
+    plan = plan_tick(
+        entries, board(), capacity=1,
+        exit_reasons={entry_key(REPO, 1650): ACCEPTANCE_DONE_EMPTY_BRANCH_REASON},
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "exhausted"
+    assert plan.blocked[0].updates["state"] == STATE_BLOCKED
+    assert plan.blocked[0].updates["attempts"] == EMPTY_BRANCH_MAX_ATTEMPTS
+    assert ACCEPTANCE_DONE_EMPTY_BRANCH_REASON in plan.blocked[0].reason
+    assert "coord acceptance author claude-coordinator 1600" in plan.blocked[0].reason
+
+
+def test_a_non_empty_branch_death_keeps_the_default_attempt_ceiling():
+    """Additive, not a global increase: an ordinary drive death (a genuine
+    code-defect exit) must still block at the plain `DEFAULT_MAX_ATTEMPTS`,
+    unaffected by #2363."""
+    entries = [
+        entry(1650, state=STATE_RUNNING, attempts=DEFAULT_MAX_ATTEMPTS - 1)
+    ]
+    own_reason = "drive exited for api#1650 (exit_code=1): a genuine test failure"
+    plan = plan_tick(
+        entries, board(), capacity=1,
+        exit_reasons={entry_key(REPO, 1650): own_reason},
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "exhausted"
+    assert plan.blocked[0].updates["attempts"] == DEFAULT_MAX_ATTEMPTS
+    assert "#2363" not in plan.blocked[0].reason
+
+
+def test_finished_with_no_branch_reason_is_not_classified_as_empty_branch_death():
+    """The `_decide` 'done'-status-with-no-branch shape (`work ... finished
+    with no branch — nothing was pushed (0-commit advisory)`) is a THIRD,
+    narrower reading `coord/drive.py` can produce — it is not one of the two
+    shapes #2363's acceptance criteria name, has no evidence of its own in
+    `queue-block-log.jsonl`, and must keep the default ceiling rather than
+    being silently folded into the wider one."""
+    entries = [
+        entry(1650, state=STATE_RUNNING, attempts=DEFAULT_MAX_ATTEMPTS - 1)
+    ]
+    own_reason = (
+        "work api#1650 finished with no branch — nothing was pushed "
+        "(0-commit advisory).\n"
+        "   inspect: coord log api#1650 --machine dellserver"
+    )
+    plan = plan_tick(
+        entries, board(), capacity=1,
+        exit_reasons={entry_key(REPO, 1650): own_reason},
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "exhausted"
+    assert plan.blocked[0].updates["attempts"] == DEFAULT_MAX_ATTEMPTS
 
 
 # ═══════════════════════════════════════════════════════════════════════════
