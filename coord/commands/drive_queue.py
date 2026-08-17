@@ -1837,11 +1837,21 @@ def _fetch_gate_a_pending(entries: list) -> dict[str, bool]:
 
 def _fetch_live_ci_gate(
     entries: list, config_path: Path | None
-) -> dict[str, bool]:
-    """``{entry_key: still_blocked}`` for every ``parked`` entry whose OWN
-    park reason is CI-shaped (#1891/#1892) — a FRESH, single-entry
-    re-derivation of the SAME gate ``coord merge --plan`` computes, taken
-    live, right now, this tick (#2182).
+) -> tuple[dict[str, bool], dict[str, str]]:
+    """``({entry_key: still_blocked}, {entry_key: reason})`` for every
+    ``parked`` entry whose OWN park reason is CI-shaped
+    (#1891/#1892/#2347) — a FRESH, single-entry re-derivation of the SAME
+    gate ``coord merge --plan`` computes, taken live, right now, this tick
+    (#2182).
+
+    The second dict (#2347) carries the reason text
+    :func:`coord.merge_queue.entry_gate_status` returned alongside each
+    still-blocked verdict — used ONLY to let :func:`coord.drive_queue.
+    plan_tick` rewrite a still-``parked`` entry's ``last_reason`` when the
+    fresh reading is specifically "GitHub unreachable"
+    (``is_ci_unreadable_reason``) and differs from what is currently stored;
+    see that function's ``live_ci_gate_reason`` parameter. Never consulted
+    to decide whether to resume — that remains the first dict's job alone.
 
     THE GAP THIS CLOSES. On the daemon host — the only machine that ever
     runs this tick (``docs/AGENT_OPERATIONS.md``) — ``_fetch_board_view``
@@ -1887,7 +1897,11 @@ def _fetch_live_ci_gate(
     have nothing to add — worse, ``coord.state.load_board()`` guards against
     being called from a thin client at all (#615).
     """
-    from coord.merge_queue import is_ci_infra_reason, is_ci_pending_reason  # noqa: PLC0415
+    from coord.merge_queue import (  # noqa: PLC0415
+        is_ci_infra_reason,
+        is_ci_pending_reason,
+        is_ci_unreadable_reason,
+    )
 
     targets = [
         e for e in entries
@@ -1895,15 +1909,16 @@ def _fetch_live_ci_gate(
         and (
             is_ci_pending_reason(getattr(e, "last_reason", "") or "")
             or is_ci_infra_reason(getattr(e, "last_reason", "") or "")
+            or is_ci_unreadable_reason(getattr(e, "last_reason", "") or "")
         )
     ]
     if not targets:
-        return {}
+        return {}, {}
 
     from coord.board_service import resolve as resolve_board_service  # noqa: PLC0415
 
     if resolve_board_service() is not None:
-        return {}
+        return {}, {}
 
     try:
         from coord import github_ops as _gh_ops  # noqa: PLC0415
@@ -1919,19 +1934,22 @@ def _fetch_live_ci_gate(
             entry_key(q.repo_name, q.issue_number): q for q in _mq.load_queue()
         }
     except Exception:  # noqa: BLE001 — see the fail-soft note above
-        return {}
+        return {}, {}
 
     overrides: dict[str, bool] = {}
+    reasons: dict[str, str] = {}
     for e in targets:
         q = queue_by_key.get(e.key)
         if q is None or not q.pr_number:
             continue
         try:
-            status, _reason = _mq.entry_gate_status(q, board, cfg, ci_store, _gh_ops)
+            status, reason = _mq.entry_gate_status(q, board, cfg, ci_store, _gh_ops)
         except Exception:  # noqa: BLE001 — leave this one entry to the ceiling
             continue
         overrides[e.key] = status != _mq.PLAN_READY
-    return overrides
+        if reason:
+            reasons[e.key] = reason
+    return overrides, reasons
 
 
 def _fetch_live_blocked_gate(
@@ -2337,7 +2355,11 @@ def drive_queue_tick(
         # on the daemon-host tick could previously be released only by the
         # #2158 45-minute ceiling, never by CI actually reporting, because
         # this tick's board read never computes a live `merge_plan`).
-        live_ci_gate = _fetch_live_ci_gate(entries, config_path)
+        # #2347: the reason half — lets a still-parked entry's `last_reason`
+        # be rewritten when the real cause is "GitHub unreachable" rather
+        # than whatever it originally parked on; see `plan_tick`'s
+        # `live_ci_gate_reason` parameter.
+        live_ci_gate, live_ci_gate_reason = _fetch_live_ci_gate(entries, config_path)
 
         # #2230: the same live re-derivation, for RE-EVALUABLE `blocked`
         # entries — see `_fetch_live_blocked_gate`'s docstring for the gap
@@ -2384,6 +2406,7 @@ def drive_queue_tick(
             gate_a_pending=gate_a_pending,
             cordons=cordons,
             live_ci_gate=live_ci_gate,
+            live_ci_gate_reason=live_ci_gate_reason,
             live_blocked_gate=live_blocked_gate,
             editable_drift=editable_drift,
         )

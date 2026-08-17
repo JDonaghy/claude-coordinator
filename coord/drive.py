@@ -133,6 +133,7 @@ from coord.merge_queue import (
     is_ci_flaky_reason,
     is_ci_infra_reason,
     is_ci_pending_reason,
+    is_ci_unreadable_reason,
     is_stale_smoke_reason as _mq_is_stale_smoke_reason,
 )
 
@@ -2539,8 +2540,8 @@ def _effective_merge_gate_reason(
       own resolution path (#1474/#241's conflict-fix dispatch, reached
       through the bounded retry below). A re-test does not rebase a branch,
       and diverting to one is the same stall this issue is about, inverted.
-    - a CI reason (#1891/#1892/#2252) — `merge_reason` already carries a
-      live, recognised signal whose only resolution is more real time.
+    - a CI reason (#1891/#1892/#2252/#2347) — `merge_reason` already carries
+      a live, recognised signal whose only resolution is more real time.
       These bare waits sit right after the divergence check and must keep
       winning.
 
@@ -2559,6 +2560,7 @@ def _effective_merge_gate_reason(
         is_ci_pending_reason(state.merge_reason)
         or is_ci_infra_reason(state.merge_reason)
         or is_ci_flaky_reason(state.merge_reason)
+        or is_ci_unreadable_reason(state.merge_reason)
     ):
         return state.merge_reason, False
     fallback = _extract_gate_refusal_reason(counters.last_merge_diagnostic)
@@ -2861,6 +2863,24 @@ def _decide_merge(
             label=(
                 "MERGE: CI checks have not reported yet — waiting, not "
                 f"retrying (#1891): {state.merge_reason}"
+            )
+        )
+
+    # #2347: the sibling case checked right after #1891 — the check-list
+    # FETCH itself failed (GitHub unreachable: a transient `gh pr checks`
+    # HTTP 5xx, an auth blip), so there is no CI verdict of ANY shape yet,
+    # not even a real "still running" one. `coord merge`'s own live attempt
+    # already tracks a bounded count of consecutive fetch failures for this
+    # (`coord.merge_queue.MAX_CI_UNREADABLE_RERUNS`) and keeps waiting
+    # either way — there is no CI to rerun and no gate to re-test, only more
+    # real time (GitHub answering again). Retrying `coord merge` here would
+    # just re-observe the identical transport failure and spend an attempt
+    # for nothing.
+    if is_ci_unreadable_reason(state.merge_reason):
+        return _wait(
+            label=(
+                "MERGE: GitHub could not be reached to read CI status — "
+                f"waiting, not retrying (#2347): {state.merge_reason}"
             )
         )
 

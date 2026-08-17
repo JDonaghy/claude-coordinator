@@ -191,7 +191,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             ci_infra_reruns INTEGER NOT NULL DEFAULT 0,
             ci_stale_reruns INTEGER NOT NULL DEFAULT 0,
             ci_flaky_reruns INTEGER NOT NULL DEFAULT 0,
-            ci_flaky_pending TEXT NOT NULL DEFAULT ''
+            ci_flaky_pending TEXT NOT NULL DEFAULT '',
+            ci_unreadable_reruns INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS plans (
@@ -909,6 +910,14 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         # row predating this migration and for a non-stream-json / PTY
         # worker whose log carries no such field.
         "ALTER TABLE assignments ADD COLUMN stop_reason TEXT",
+        # #2347: count of automatic checks `merge_queue.process()` has made
+        # against this entry's CURRENT streak of bare check-list FETCH
+        # failures (GitHub unreachable, not a real CI verdict) — see
+        # `coord.merge_queue.MAX_CI_UNREADABLE_RERUNS` and
+        # `QueuedMerge.ci_unreadable_reruns`'s docstring. 0 for every row
+        # predating this column, same as the column's own default for a
+        # freshly-enqueued entry.
+        "ALTER TABLE merge_queue ADD COLUMN ci_unreadable_reruns INTEGER NOT NULL DEFAULT 0",
     ]
     for sql in migrations:
         try:

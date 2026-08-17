@@ -96,6 +96,7 @@ from coord.merge_queue import (
     is_ci_flaky_reason,
     is_ci_infra_reason,
     is_ci_pending_reason,
+    is_ci_unreadable_reason,
 )
 from coord.models import is_policy_refusal_reason
 
@@ -154,6 +155,15 @@ STATE_FAILED = "failed"
 # today) on the very next tick. Same reasoning as #1892 for why this parks
 # rather than spends: relaunching right now would just observe the same
 # re-run-in-progress and wait again.
+#
+# #2347 extends the SAME state to a FOURTH trigger:
+# `coord.merge_queue.is_ci_unreadable_reason` — the check-list FETCH itself
+# failed (GitHub unreachable: a transient `gh pr checks` HTTP 5xx, an auth
+# blip), not a CI verdict of any shape. The "more real time" that un-parks
+# the entry is simply GitHub answering again on a later read — there is no
+# in-flight rerun to wait on, unlike #1892/#2252, only another attempt to
+# read. Same queue-level treatment as the other three: relaunching right now
+# would just observe the identical transport failure and wait again.
 STATE_PARKED = "parked"
 
 TERMINAL_QUEUE_STATES: frozenset[str] = frozenset(
@@ -959,10 +969,18 @@ def build_board_view(
         elif is_ci_flaky_reason(raw_reason) and not is_ci_flaky_reason(plan_reason):
             reason = raw_reason
             reason_is_live = False
+        # #2347: NO raw-row recovery needed here, unlike #1892/#2252 above —
+        # `coord.merge_queue._ci_unreadable_reason` needs no extra `CiStore`
+        # call (see that function's docstring), so `_entry_gate_status`
+        # computes the CI_UNREADABLE_PREFIX classification directly at
+        # board-build time. `plan_reason` already carries it whenever it
+        # applies; the live plan reading and a live `coord merge` attempt's
+        # raw reading can never disagree about this one.
         if not (
             is_ci_pending_reason(reason)
             or is_ci_infra_reason(reason)
             or is_ci_flaky_reason(reason)
+            or is_ci_unreadable_reason(reason)
         ):
             continue
         # #2158: the same plan row that came back with NO reason of its own
@@ -1059,6 +1077,13 @@ class Reconcile:
       every tick by the pre-pass in :func:`plan_tick`, which flips it back
       to ``waiting`` — no human, no escalation — the moment the board shows
       the gate has cleared.
+    * ``reparked``  — #2347: an ALREADY-``parked`` entry, still CONFIRMED
+      blocked by this tick's own fresh re-check — but that fresh check found
+      the real cause has become "GitHub could not be reached", distinct from
+      whatever reason the entry originally parked on. State does not change
+      (stays :data:`STATE_PARKED`), no attempt spent — only ``last_reason``
+      is rewritten, so an operator reading ``coord drive-queue list``/
+      ``status`` sees the true cause instead of a frozen, misleading one.
     * ``retry``     — genuinely dead: no session, no active work, and past the
       startup grace window.  Costs one attempt.
     * ``exhausted`` — as ``retry``, but out of attempts; pairs with a
@@ -2528,6 +2553,7 @@ def plan_tick(
     gate_a_pending: Mapping[str, bool] | None = None,
     cordons: Mapping[str, str] | None = None,
     live_ci_gate: Mapping[str, bool] | None = None,
+    live_ci_gate_reason: Mapping[str, str] | None = None,
     live_blocked_gate: Mapping[str, bool] | None = None,
     editable_drift: tuple[str, str] | None = None,
 ) -> TickPlan:
@@ -2634,6 +2660,21 @@ def plan_tick(
     :func:`coord.commands.drive_queue._fetch_live_ci_gate` for the shell
     side, which computes this ONLY for the bounded set of entries currently
     `parked` on a CI reason, never the whole queue.
+
+    *live_ci_gate_reason* (#2347) is *live_ci_gate*'s companion: the reason
+    text the SAME fresh `entry_gate_status` call returned, for entries whose
+    reading is STILL blocked. Never used to decide whether to resume (that
+    remains `live_ci_gate`'s job) — only to rewrite a still-parked entry's
+    `last_reason` when the fresh reading is `CI_UNREADABLE_PREFIX`-shaped and
+    differs from what is currently stored, so `coord drive-queue list`/
+    `status` shows "GitHub could not be reached" the moment that becomes the
+    real cause, instead of silently keeping whatever reason the entry
+    happened to park on originally (which #1891/#1892/#2252's "still shut ⇒
+    no reconcile, no write" rule would otherwise leave frozen indefinitely —
+    see the issue for the observed incident: a stale "CI running: ..."
+    reason surviving a run of transient GitHub API 503s for most of
+    `PARK_STALE_SECONDS` with no operator-visible signal of the real cause).
+    A key ABSENT here changes nothing — same as an absent `live_ci_gate` key.
 
     *live_blocked_gate* is #2230's counterpart, for `blocked` instead of
     `parked`: maps a RE-EVALUABLE `blocked` entry's key (never one
@@ -2882,6 +2923,36 @@ def plan_tick(
         live_override = (live_ci_gate or {}).get(entry.key)
         if live_override is not None:
             if live_override:
+                # #2347: CONFIRMED still blocked — but if the FRESH reading
+                # taken THIS tick says the real cause is "GitHub could not
+                # be reached" (not a real CI verdict) and that differs from
+                # whatever reason is currently stored, rewrite `last_reason`
+                # so `coord drive-queue list`/`status` says so — rather than
+                # silently re-confirming whatever reason this entry
+                # happened to park on originally, unboundedly, the way
+                # #1891/#1892/#2252's "still shut ⇒ no reconcile, no write"
+                # rule does for every other still-blocked reading. State
+                # stays `parked`, no attempt spent — this changes only what
+                # the operator is told, never the decision.
+                live_reason = (live_ci_gate_reason or {}).get(entry.key)
+                if (
+                    live_reason
+                    and is_ci_unreadable_reason(live_reason)
+                    and live_reason != entry.last_reason
+                ):
+                    reason = (
+                        f"{live_reason} — still parked; the live re-check "
+                        "this tick could not reach GitHub either (#2347)"
+                    )
+                    reconciles.append(
+                        Reconcile(
+                            entry.key,
+                            "reparked",
+                            reason,
+                            occupies=False,
+                            updates={"last_reason": reason},
+                        )
+                    )
                 continue
             reason = (
                 f"live re-check of {entry.key}'s gate this tick reads READY "

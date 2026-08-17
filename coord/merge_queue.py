@@ -26,6 +26,7 @@ from coord.ci_store import (
     checks_are_stale,
     failed_checks,
     in_flight_checks,
+    is_unreadable_check,
     is_verdictless_job,
     summarize,
     summarize_counts,
@@ -1389,6 +1390,37 @@ def is_ci_pending_reason(reason: str | None) -> bool:
     return (reason or "").startswith(CI_PENDING_PREFIX)
 
 
+# #2347: the reason string prefix for a `checks_failed` block whose failing
+# check(s) are ALL the #1525 synthetic "could not read CI status"/"gh too
+# old" stand-ins (`coord.ci_store.is_unreadable_check`) — the check-list
+# FETCH itself failed (a transient `gh pr checks` HTTP 5xx, an auth blip,
+# a rate limit), never a real CI verdict of any shape. Before this existed,
+# such a failure fell all the way through to the plain "checks failed: ..."
+# wording — indistinguishable from a genuine red suite — and, because
+# `coord.drive_queue`'s #1891/#2182 park machinery keys off exactly
+# `CI_PENDING_PREFIX`/`CI_INFRA_PREFIX` and nothing else, never got their
+# "still shut, self-refreshing, no attempt spent" treatment either. The
+# observed incident (see the issue): a fully green, already-mergeable PR
+# sat `parked` for most of `PARK_STALE_SECONDS` behind a run of transient
+# GitHub API 503s, showing a stale "CI running: ..." reason the whole time
+# because nothing ever recomputed it.
+#
+# Distinct from BOTH siblings it could otherwise be confused with:
+# `CI_PENDING_PREFIX` ("checks exist on GitHub and are genuinely still
+# running") and `CI_INFRA_PREFIX` ("a check DID complete on GitHub, but said
+# nothing about the code") — this one means GitHub could not even be asked
+# the question. See :func:`_ci_unreadable_reason` for the classification.
+CI_UNREADABLE_PREFIX = "CI unreadable:"
+
+
+def is_ci_unreadable_reason(reason: str | None) -> bool:
+    """True when *reason* names a `checks_failed` block whose failing
+    check(s) are ALL the #1525 synthetic "could not read CI status"
+    stand-in — GitHub could not be reached, not a real CI verdict (#2347).
+    See :data:`CI_UNREADABLE_PREFIX`."""
+    return (reason or "").startswith(CI_UNREADABLE_PREFIX)
+
+
 # #1904: every CI gate predicate — `failed_checks`, `in_flight_checks`,
 # `_ci_checks_are_stale` — is a filter *over* `checks`, so `checks == []`
 # satisfies all three vacuously and the pre-#1904 gate fell all the way
@@ -1510,6 +1542,50 @@ MAX_CI_STALE_RERUNS = 2
 # genuinely, repeatedly broken — a higher cap here would blur back into the
 # thing #1892's own cap already guards against for the verdictless case.
 MAX_CI_FLAKY_RERUNS = 1
+
+# #2347: bounded count of consecutive LIVE `process()` attempts that have
+# observed a bare check-list FETCH failure for a single entry — mirrors
+# `MAX_CI_INFRA_RERUNS`'s shape (same cap: a queue-timeout-shaped GitHub
+# blip clears in a couple of ticks, not ten). Unlike `MAX_CI_INFRA_RERUNS`
+# there is no remedy action to spend this budget on — `CiStore.rerun_for_pr`
+# reruns a CI *workflow*, and nothing about a transport failure reading
+# GitHub is fixed by re-running one — so reaching the cap does not fall back
+# to the generic "checks failed" wording the way #1892's own cap does (that
+# collapse back into a plain CI verdict is exactly what #2347 exists to
+# stop). It only escalates the WORDING from "retrying automatically" to
+# "this has been failing for a while, worth a human glance" — the entry
+# stays a bare, no-attempt-spent wait either side of the cap, because there
+# is genuinely nothing else `coord merge`/`coord drive` can do about it but
+# wait for GitHub to answer again.
+MAX_CI_UNREADABLE_RERUNS = 2
+
+
+def _ci_unreadable_reason(failed: "list[CheckRun]") -> str | None:
+    """The :data:`CI_UNREADABLE_PREFIX` reason when EVERY check in *failed*
+    is the #1525 synthetic "could not read CI status" stand-in (#2347),
+    else ``None``.
+
+    Unlike :func:`_ci_infra_reason`, this needs no extra `CiStore` call —
+    :func:`coord.ci_store.is_unreadable_check` reads straight off the
+    `CheckRun` objects `list_checks_for_pr` already returned. That means
+    (unlike the #1892 infra classifier, deliberately confined to the live
+    merge path — see that function's docstring) BOTH `_entry_gate_status`
+    (the board/plan *read* path, `coord.gate_snapshot`'s Invariant 1: no
+    third-party I/O) and `process()` (the live merge path) can call this
+    directly with identical results, so the board's own fresh reading and a
+    live `coord merge` attempt's reading never disagree about whether this
+    is "GitHub unreachable" — no raw-row reason recovery needed the way
+    #1892/#2252 require for `coord.drive_state`/`coord.drive_queue`.
+    """
+    if not failed:
+        return None
+    if not all(is_unreadable_check(c) for c in failed):
+        return None
+    summary = ", ".join(f"{c.name} ({c.conclusion})" for c in failed)
+    return (
+        f"{CI_UNREADABLE_PREFIX} {summary} — GitHub could not be reached to "
+        "read CI status; this is not a CI result"
+    )
 
 
 def _ci_infra_reason(
@@ -2352,6 +2428,16 @@ class QueuedMerge:
     # flake recorded via `record_audit`, fail -> confirmed real, no flake)
     # is known.
     ci_flaky_pending: str = ""
+    # #2347: count of consecutive LIVE `process()` attempts that have
+    # observed a bare check-list FETCH failure (GitHub unreachable) for this
+    # entry's CURRENT streak — capped at `MAX_CI_UNREADABLE_RERUNS`. Kept
+    # separate from `ci_infra_reruns`/`ci_stale_reruns`/`ci_flaky_reruns` for
+    # the same reason those are kept apart from each other: independently
+    # capped, independently legible in the audit trail — a fetch failure
+    # answers a different question ("could GitHub be reached at all?") than
+    # any of the other three ("what did CI say?"). 0 for every entry that
+    # has never hit a fetch failure, and for rows predating this column.
+    ci_unreadable_reruns: int = 0
 
 
 class GhOps(Protocol):
@@ -2673,6 +2759,9 @@ def load_queue() -> list[QueuedMerge]:
             # above, for rows predating these columns.
             ci_flaky_reruns=row["ci_flaky_reruns"] or 0,
             ci_flaky_pending=row["ci_flaky_pending"] or "",
+            # #2347: same NULL-to-0 decoding as ci_infra_reruns above, for
+            # rows predating this column.
+            ci_unreadable_reruns=row["ci_unreadable_reruns"] or 0,
         )
         for row in rows
     ]
@@ -2690,8 +2779,9 @@ def save_queue(items: list[QueuedMerge]) -> None:
                     target_branch, issue_number, issue_title, state,
                     pr_number, pr_url, size, last_attempt, error, enqueued_at,
                     assignment_type, required_gates, ci_infra_reruns,
-                    ci_stale_reruns, ci_flaky_reruns, ci_flaky_pending
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    ci_stale_reruns, ci_flaky_reruns, ci_flaky_pending,
+                    ci_unreadable_reruns
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     item.assignment_id, item.repo_name, item.repo_github,
                     item.branch, item.target_branch, item.issue_number,
@@ -2700,6 +2790,7 @@ def save_queue(items: list[QueuedMerge]) -> None:
                     item.assignment_type, json.dumps(list(item.required_gates or [])),
                     item.ci_infra_reruns, item.ci_stale_reruns,
                     item.ci_flaky_reruns, item.ci_flaky_pending,
+                    item.ci_unreadable_reruns,
                 ),
             )
 
@@ -3684,6 +3775,16 @@ def _entry_gate_status(
                 )
         failed = failed_checks(checks)
         if failed:
+            # #2347: classify a bare check-list FETCH failure (GitHub
+            # unreachable) before the generic "CI failed" wording below —
+            # see :func:`_ci_unreadable_reason`. No extra I/O needed (unlike
+            # the #1892 infra classifier, which is why THAT one is confined
+            # to the live merge path only), so the board/plan read path can
+            # apply it directly and stay byte-for-byte in sync with
+            # `process()`'s own live reading.
+            unreadable_reason = _ci_unreadable_reason(failed)
+            if unreadable_reason is not None:
+                return PLAN_BLOCKED, unreadable_reason
             summary = ", ".join(f"{c.name} ({c.conclusion})" for c in failed)
             return PLAN_BLOCKED, f"CI failed: {summary}"
         pending = in_flight_checks(checks)
@@ -5031,17 +5132,25 @@ def process(
                             continue
                         failed = failed_checks(checks)
                         if failed:
-                            # #1892: preview-only — never mutates, never
-                            # reruns; just shows the same classification a
-                            # live attempt would compute so `--dry-run`
-                            # doesn't undersell what's actually blocking.
-                            infra_reason = _ci_infra_reason(
+                            # #1892/#2347: preview-only — never mutates,
+                            # never reruns; just shows the same
+                            # classification a live attempt would compute so
+                            # `--dry-run` doesn't undersell what's actually
+                            # blocking. Unreadable (bare fetch failure) is
+                            # checked first, mirroring the live path's
+                            # ordering — see `_ci_unreadable_reason`.
+                            unreadable_reason = _ci_unreadable_reason(failed)
+                            infra_reason = None if unreadable_reason else _ci_infra_reason(
                                 ci, entry.repo_github, entry.pr_number, failed
                             )
                             summary = ", ".join(
                                 f"{c.name} ({c.conclusion})" for c in failed
                             )
-                            msg = infra_reason or f"checks failed: {summary}"
+                            msg = (
+                                unreadable_reason
+                                or infra_reason
+                                or f"checks failed: {summary}"
+                            )
                             events.append(MergeEvent(
                                 entry, "checks_failed",
                                 f"(dry run) would be blocked: {msg}",
@@ -5370,6 +5479,62 @@ def process(
                     summary = ", ".join(
                         f"{c.name} ({c.conclusion})" for c in failed
                     )
+                    # #2347: classify a bare check-list FETCH failure
+                    # BEFORE #1892's infra classifier gets a chance — a
+                    # synthetic unreadable check always carries `run_id ==
+                    # ""`, which `_ci_infra_reason` (via `is_verdictless_job`'s
+                    # documented false-negative bias for "no job data") would
+                    # read as "carries a verdict about the code", so without
+                    # this it falls all the way through to the plain "checks
+                    # failed: coord: could not read CI status ..." wording —
+                    # exactly the collapse #2347 exists to stop. No
+                    # `CiStore` call needed (unlike #1892), so this is safe
+                    # to evaluate unconditionally, every time.
+                    unreadable_reason = _ci_unreadable_reason(failed)
+                    if unreadable_reason is not None:
+                        if entry.ci_unreadable_reruns < MAX_CI_UNREADABLE_RERUNS:
+                            entry.ci_unreadable_reruns += 1
+                            _log.info(
+                                "#2347 GitHub unreachable %d/%d for %s#%d "
+                                "(PR #%s): %s",
+                                entry.ci_unreadable_reruns,
+                                MAX_CI_UNREADABLE_RERUNS,
+                                entry.repo_name, entry.issue_number,
+                                entry.pr_number, summary,
+                            )
+                            msg = (
+                                f"{unreadable_reason} — retrying "
+                                f"automatically "
+                                f"({entry.ci_unreadable_reruns}/"
+                                f"{MAX_CI_UNREADABLE_RERUNS}), no attempt "
+                                "spent (#2347)"
+                            )
+                        else:
+                            # #2347: budget exhausted — unlike #1892's own
+                            # exhaustion, this deliberately does NOT fall
+                            # back to the generic "checks failed" wording:
+                            # a bare fetch failure never becomes a real CI
+                            # verdict no matter how many times it repeats,
+                            # so collapsing the two here would recreate the
+                            # exact confusion this issue is about. Still a
+                            # bare, no-attempt-spent wait either side of the
+                            # cap — there is nothing else to do but wait for
+                            # GitHub to answer again — only the wording
+                            # escalates, so a human glancing at the queue
+                            # can tell "still retrying" from "this has been
+                            # going on a while".
+                            msg = (
+                                f"{unreadable_reason} — GitHub has failed "
+                                f"to answer {MAX_CI_UNREADABLE_RERUNS}+ "
+                                "consecutive checks in a row; may be a "
+                                "standing problem (auth, `gh` config, a "
+                                "GitHub outage), not a blip — still "
+                                "waiting, no attempt spent, but worth a "
+                                "human glance (#2347)"
+                            )
+                        entry.error = msg
+                        events.append(MergeEvent(entry, "checks_unreadable", msg))
+                        continue  # #292: skip, don't halt the group
                     # #1892: classify BEFORE deciding the message/event — a
                     # verdictless failure (every failing check says nothing
                     # about the code: never assigned a runner, or died at
@@ -5545,6 +5710,12 @@ def process(
                     _record_ci_flake_audit(entry, entry.ci_flaky_pending)
                     entry.ci_flaky_pending = ""
                 entry.ci_flaky_reruns = 0
+                # #2347: same "genuinely resolved" reset, for the identical
+                # reason ci_infra_reruns is reset above — GitHub answered
+                # this time (whatever it said), so whatever run of fetch
+                # failures the budget was tracking is over. A LATER,
+                # unrelated fetch failure starts its own count from zero.
+                entry.ci_unreadable_reruns = 0
                 # #1851: a green CI result can itself be stale relative to the
                 # base — see `_ci_checks_are_stale`'s docstring. Named
                 # distinctly (`checks_stale`) from checks_failed/
