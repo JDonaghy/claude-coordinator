@@ -429,32 +429,6 @@ whole queue. See `coord.commands.drive_queue._fetch_live_blocked_gate`'s
 docstring for the full justification; it is the exact same mechanism #2182
 already uses to release a `parked` entry on the same lane.
 
-### 4c. The Merge-only fast path (#2350)
-
-A CONFIRMED-clear gate (§4b, or #1891/#2182's `parked` counterpart) still
-defaults to `waiting` and competing for the next tick's one launch slot — a
-fresh `coord drive --tmux` session that re-derives state it may not even
-need, just to end by calling the same `coord merge --only` a human would run
-by hand. For the common shape where Test already passed and Review is
-already approved — Merge was the *only* gate that was ever still shut — that
-relaunch is pure overhead.
-
-So the tick checks one more thing before writing `waiting`: does the board's
-own recorded pipeline state ALREADY show Test `passed` and Review `approve`?
-If so, it attempts `coord merge --only <repo>#<issue>` directly, this same
-tick — no relaunch, no capacity slot spent. Landed: the entry goes straight
-to `done`, and `coord drive-queue block-log` records the resolution as
-`auto-merged`, distinct from the generic `auto-released`/`already-landed`
-tags — this is "the queue itself finished it", not "the state flipped and
-something else finished it". Did not land (a genuine race: the gate flips
-shut again between the read and the attempt): falls back to EXACTLY the
-pre-#2350 `waiting` shape — same reset `attempts`, same `resumes` bump for a
-`blocked`-origin entry — never worse than before this existed.
-
-Anything less than both Test-passed and Review-approved (Test not yet run,
-Review not yet in, a real conflict) takes the ordinary relaunch path
-unchanged — this is a fast path, not a second decision-maker.
-
 ## 5. The pinned-CLI trap
 
 The timer runs a **specific installed `coord`**, not a checkout — it does not
