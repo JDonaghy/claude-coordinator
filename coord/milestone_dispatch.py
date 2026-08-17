@@ -16,7 +16,10 @@ not an LLM judgment call like ``coord.brain.propose``.
 Three call sites share this module:
 
 - ``coord milestone dispatch`` (``coord/commands/milestone.py``) — the
-  one-shot CLI dispatch (bulk or ``--next`` single-pick).
+  ``--next`` single-pick still dispatches directly through
+  :func:`plan_dispatch`/:func:`dispatch_entry`; bulk mode instead derives
+  drive-queue enqueues from the work order via :func:`plan_queue` (#2335),
+  so the DQ-4 tick owns the actual launches.
 - The daemon's auto-drain tick (``coord.serve_app._milestone_drain_tick``,
   opt-in via ``coordinator.yml`` ``milestone.auto_dispatch``) — re-runs the
   same fetch → plan → dispatch sequence for milestones registered via a
@@ -38,6 +41,7 @@ from coord.milestone_order import (
     FrontierEntry,
     WorkOrder,
     WorkOrderError,
+    WorkOrderNode,
     parse_work_order,
     ready_frontier,
     validate_milestone_membership,
@@ -64,6 +68,8 @@ __all__ = [
     "NoMachineAvailable",
     "MilestonePlan",
     "plan_dispatch",
+    "QueuePlanEntry",
+    "plan_queue",
     "DispatchOutcome",
     "dispatch_entry",
     "is_milestone_complete",
@@ -681,6 +687,74 @@ def plan_dispatch(
         picks.append(MachinePick(entry, machine))
     return MilestonePlan(
         to_dispatch=tuple(picks), skipped=tuple(skipped), waiting=frontier.blocked
+    )
+
+
+@dataclass(frozen=True)
+class QueuePlanEntry:
+    """One drive-queue enqueue derived from a work-order node (#2335)."""
+
+    issue_number: int
+    #: Fully-qualified pre-req keys (``"repo#N"``) for the drive-queue's
+    #: ``after=`` edge list — the node's declared ``{after: #N}`` targets,
+    #: minus any that are already terminal (closed issues never enter the
+    #: queue, so an edge at one would read as unsatisfiable to the tick's
+    #: ``_resolve_prereqs`` rather than as "already done").
+    after: tuple[str, ...] = ()
+    group: str | None = None
+
+
+def plan_queue(
+    work_order: WorkOrder,
+    terminal_issues: frozenset[int] | set[int],
+    repo_name: str,
+) -> tuple[QueuePlanEntry, ...]:
+    """Translate the work order's DAG into drive-queue enqueues (#2335).
+
+    Pure — no GitHub, no board, no side effects. One entry per non-terminal
+    node, in dependency order: a stable topological sort seeded by declared
+    order, so independent nodes keep the operator's declared sequence while a
+    node declared *before* its own pre-req still queues after it (queue
+    position is the tick's tie-break among eligible entries; the ``after``
+    edges are what actually gate launches).
+
+    Each entry's ``after`` carries the node's declared ``{after: #N}`` edges
+    as fully-qualified ``repo#N`` keys — the same format ``coord drive-queue
+    add --after`` parses — filtered to pre-reqs that are still open.
+    :func:`~coord.milestone_order.parse_work_order` already refused cycles,
+    self-edges, and edges to undeclared nodes, so the sort always terminates;
+    the defensive tail below only fires on inputs constructed outside it.
+    """
+    from coord.drive_queue import entry_key  # noqa: PLC0415
+
+    terminal = set(terminal_issues)
+    remaining: dict[int, WorkOrderNode] = {
+        n.issue_number: n for n in work_order.nodes if n.issue_number not in terminal
+    }
+    open_set = set(remaining)
+    placed: set[int] = set()
+    ordered: list[WorkOrderNode] = []
+    while remaining:
+        progressed = False
+        for number, node in list(remaining.items()):
+            if any(d in open_set and d not in placed for d in node.after):
+                continue
+            ordered.append(node)
+            placed.add(number)
+            del remaining[number]
+            progressed = True
+        if not progressed:  # cycle — unreachable via parse_work_order; see above
+            ordered.extend(remaining.values())
+            break
+    return tuple(
+        QueuePlanEntry(
+            issue_number=n.issue_number,
+            after=tuple(
+                entry_key(repo_name, d) for d in n.after if d not in terminal
+            ),
+            group=n.group,
+        )
+        for n in ordered
     )
 
 

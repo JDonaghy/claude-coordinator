@@ -1283,8 +1283,11 @@ def _milestone_drain_tick(config: Config) -> list:
 
     Called by ``_tick_loop`` when ``milestone.auto_dispatch: true`` is set in
     ``coordinator.yml`` (default-off). For each ``(repo_name, tracking_issue)``
-    registered via a non-dry-run ``coord milestone dispatch`` (``coord.state.
-    register_milestone_drain``), re-fetches the tracking issue, recomputes the
+    registered via ``coord.state.register_milestone_drain`` (historically the
+    non-dry-run ``coord milestone dispatch`` bulk path — since #2335 that
+    path enqueues the work order into the drive-queue instead and registers
+    nothing, so only pre-#2335 registrations feed this tick), re-fetches the
+    tracking issue, recomputes the
     ready frontier (:func:`coord.milestone_dispatch.plan_dispatch`), and
     dispatches any newly-unblocked entries — the same mechanism a manual
     ``coord milestone dispatch`` uses, so a fix that lands and merges for one

@@ -3,10 +3,11 @@
 
 Thin CLI glue around ``coord/milestone_order.py`` (the pure DAG/frontier
 parser) and ``coord/milestone_dispatch.py`` (Phase 1's machine-picking +
-dispatch): fetches the tracking issue + milestone membership + issue
-terminal state from GitHub via ``coord.milestone_dispatch.
-fetch_milestone_context`` (shared by both subcommands so they see identical
-inputs), then hands that data to the pure functions and prints the result.
+dispatch, and #2335's work-order -> drive-queue translation): fetches the
+tracking issue + milestone membership + issue terminal state from GitHub via
+``coord.milestone_dispatch.fetch_milestone_context`` (shared by both
+subcommands so they see identical inputs), then hands that data to the pure
+functions and prints the result.
 """
 
 from __future__ import annotations
@@ -21,7 +22,6 @@ import httpx
 from coord.commands._common import _CONFIG_OPTION, _load_config
 from coord.milestone_dispatch import (
     DispatchOutcome,
-    MachinePick,
     MilestoneDispatchError,
     dispatch_entry,
     fetch_milestone_context,
@@ -29,6 +29,7 @@ from coord.milestone_dispatch import (
     is_milestone_complete,
     pick_machine,
     plan_dispatch,
+    plan_queue,
 )
 from coord.milestone_order import (
     TRACKING_ISSUE_LABEL,
@@ -859,11 +860,6 @@ def milestone_order_cmd(repo: str, tracking_issue: int, config_path: Path) -> No
             click.echo(f"  #{b.issue_number}: {b.reason}")
 
 
-def _echo_pick(pick: MachinePick) -> None:
-    suffix = f"  (group {pick.entry.group})" if pick.entry.group else ""
-    click.echo(f"  #{pick.entry.issue_number} -> {pick.machine.name}{suffix}")
-
-
 def _echo_outcome(outcome: DispatchOutcome) -> None:
     if outcome.ok:
         click.echo(
@@ -883,13 +879,18 @@ def _echo_outcome(outcome: DispatchOutcome) -> None:
 @milestone_group.command(
     "dispatch",
     help=(
-        "Promote a milestone into the pipeline: dispatch its ready frontier "
-        "in parallel (up to idle/capable machines), then keep draining it as "
-        "declared-order dependencies complete. REPO is the local repo name "
-        "from coordinator.yml; TRACKING_ISSUE is the GH issue number of the "
-        "tracking issue (its body holds the `## Work order` block). This is "
-        "the single explicit approval for the whole declared work order — "
-        "it does not expand scope beyond what `## Work order` lists."
+        "Promote a milestone into the pipeline: derive the dependency order "
+        "from the `## Work order` DAG and queue every still-open issue into "
+        "the drive-queue (`coord drive-queue add --after ...`) in that order "
+        "(#2335) — the DQ-4 tick then launches each issue as its pre-reqs "
+        "land, with #2247 file-overlap prediction, durable board-backed "
+        "state, and `coord drive-queue list/status` observability. `--next` "
+        "keeps the lighter direct single-dispatch path. REPO is the local "
+        "repo name from coordinator.yml; TRACKING_ISSUE is the GH issue "
+        "number of the tracking issue (its body holds the `## Work order` "
+        "block). This is the single explicit approval for the whole declared "
+        "work order — it does not expand scope beyond what `## Work order` "
+        "lists."
     ),
 )
 @click.argument("repo")
@@ -902,8 +903,9 @@ def _echo_outcome(outcome: DispatchOutcome) -> None:
     "--next", "next_", is_flag=True,
     help=(
         "Single-pick mode: show up to 3 ready-frontier items and dispatch "
-        "only the one you choose. Lighter-weight than draining the whole "
-        "milestone — does not register for daemon auto-drain."
+        "only the one you choose — directly, not via the drive-queue. "
+        "Lighter-weight than bulk mode's whole-DAG drive-queue enqueue "
+        "(#2335)."
     ),
 )
 @click.option(
@@ -1003,14 +1005,15 @@ def milestone_dispatch_cmd(
         click.echo(f"#{tracking_issue}: no `## Work order` block found")
         return
 
-    board = board_service.read_board()
-    plan = plan_dispatch(ctx.work_order, board, cfg, repo_entry, ctx.terminal_issues)
-
     click.echo(
         f"Work order for #{tracking_issue} (milestone #{ctx.milestone_number}):"
     )
 
     if next_:
+        board = board_service.read_board()
+        plan = plan_dispatch(
+            ctx.work_order, board, cfg, repo_entry, ctx.terminal_issues
+        )
         if not plan.to_dispatch:
             click.echo("No ready frontier item can dispatch right now.")
             if plan.skipped:
@@ -1075,54 +1078,93 @@ def milestone_dispatch_cmd(
             sys.exit(1)
         return
 
-    # Bulk mode: dispatch the entire current ready frontier.
-    click.echo("Will dispatch now:")
-    if plan.to_dispatch:
-        for pick in plan.to_dispatch:
-            _echo_pick(pick)
-    else:
-        click.echo("  (none)")
+    # Bulk mode (#2335): queue the whole declared work order into the
+    # drive-queue rather than dispatching the ready frontier directly. Before
+    # #2335 this path called `dispatch_entry` per frontier pick and registered
+    # the milestone for daemon auto-drain — bypassing the drive-queue
+    # entirely: no #2247 overlap prediction, no durable queue entry surviving
+    # a coordinator restart, nothing in `coord drive-queue list/status`. The
+    # queue's `after=` edges now carry the DAG, so the DQ-4 tick launches each
+    # issue as its pre-reqs land; that also makes `register_milestone_drain`
+    # redundant here (the queue IS the durable drain, and registering would
+    # have the daemon's direct-dispatch drain racing it).
+    queue_plan = plan_queue(ctx.work_order, ctx.terminal_issues, repo_entry.name)
 
-    if plan.skipped:
-        click.echo()
-        click.echo("Ready but no idle machine:")
-        for s in plan.skipped:
-            click.echo(f"  #{s.entry.issue_number}: {s.reason}")
+    if not queue_plan:
+        click.echo("Nothing to queue — every work-order node is already closed.")
+        return
 
-    if plan.waiting:
-        click.echo()
-        click.echo("Waiting:")
-        for b in plan.waiting:
-            click.echo(f"  #{b.issue_number}: {b.reason}")
+    click.echo("Will queue (drive-queue), in dependency order:")
+    for qe in queue_plan:
+        bits = []
+        if qe.group:
+            bits.append(f"group {qe.group}")
+        if qe.after:
+            bits.append("after " + ", ".join(qe.after))
+        suffix = f"  ({'; '.join(bits)})" if bits else ""
+        click.echo(f"  #{qe.issue_number}{suffix}")
 
     if dry_run:
         click.echo()
-        click.echo("(dry run — not dispatched)")
+        click.echo("(dry run — nothing queued)")
         return
 
-    if not plan.to_dispatch:
-        click.echo()
-        click.echo("Nothing to dispatch right now.")
-        return
+    # Reuse `coord drive-queue add`'s own helpers so a milestone enqueue is
+    # byte-identical to N manual `add` calls: same pre-write validation, same
+    # #2247 overlap prediction (auto-`after` edges recorded to the audit log),
+    # same upsert semantics for an issue already queued.
+    from coord.commands.drive_queue import (  # noqa: PLC0415
+        _applicable_auto_after,
+        _predict_overlap,
+        _record_overlap_prediction,
+    )
+    from coord.drive_queue import (  # noqa: PLC0415
+        QueueError,
+        entries_from_rows,
+        entry_key,
+        validate_enqueue,
+    )
+    from coord.state import enqueue_drive_queue, list_drive_queue  # noqa: PLC0415
 
     click.echo()
     failures = 0
-    for pick in plan.to_dispatch:
-        outcome = dispatch_entry(pick, repo_entry, cfg, board, tracking_issue=tracking_issue)
-        _echo_outcome(outcome)
-        if not outcome.ok:
+    queued = 0
+    for qe in queue_plan:
+        # Re-read per entry so each add validates (and overlap-predicts)
+        # against the queue as its just-added siblings left it.
+        existing = entries_from_rows(list_drive_queue())
+        after = list(qe.after)
+        key = entry_key(repo_entry.name, qe.issue_number)
+        try:
+            validate_enqueue(existing, repo_entry.name, qe.issue_number, after)
+        except QueueError as exc:
+            click.echo(f"  {key}: not queued: {exc}", err=True)
             failures += 1
+            continue
+        prediction = _predict_overlap(
+            config_path, repo_entry.name, qe.issue_number, existing
+        )
+        auto_after = _applicable_auto_after(
+            existing, repo_entry.name, qe.issue_number, after, prediction
+        )
+        after = [*after, *auto_after]
+        enqueue_drive_queue(repo_entry.name, qe.issue_number, after=after)
+        if auto_after:
+            _record_overlap_prediction(
+                repo_entry.name, qe.issue_number, prediction, auto_after
+            )
+        suffix = f" after {', '.join(after)}" if after else ""
+        overlap_note = f"\n     {prediction.reason}" if auto_after else ""
+        click.echo(f"  queued {key}{suffix}{overlap_note}")
+        queued += 1
 
-    if not is_milestone_complete(ctx):
-        from coord.state import register_milestone_drain
-
-        register_milestone_drain(repo_name=repo_entry.name, tracking_issue=tracking_issue)
+    if queued:
         click.echo()
         click.echo(
-            f"Milestone #{tracking_issue} registered for daemon auto-drain "
-            "(requires `milestone.auto_dispatch: true` in coordinator.yml + a "
-            "daemon restart to activate; `coord milestone dispatch` still "
-            "works as a manual re-drain either way)."
+            f"{queued} issue(s) queued — `coord drive-queue tick` (the DQ-4 "
+            "timer, or run it manually) launches them in dependency order; "
+            "`coord drive-queue list` shows the queue. Entries are durable "
+            "across coordinator restarts."
         )
 
     if failures:

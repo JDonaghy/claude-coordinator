@@ -104,8 +104,10 @@ class TestMilestoneDispatchValidation:
 
 
 class TestMilestoneDispatchDryRun:
-    def test_cohort_dispatches_now_and_gated_node_waits(self, config_file: Path) -> None:
-        """#769 acceptance criteria (first half)."""
+    def test_dry_run_shows_queue_plan_with_after_edges(self, config_file: Path) -> None:
+        """#2335: bulk dry-run previews the drive-queue enqueue plan — the
+        whole DAG, with the gated node's `after` edges spelled out — and
+        writes/dispatches nothing."""
         open_issues = [
             {"number": 762, "milestone": {"number": 9}},
             {"number": 763, "milestone": {"number": 9}},
@@ -122,17 +124,18 @@ class TestMilestoneDispatchDryRun:
         assert result.exit_code == 0, result.output
         disp.assert_not_called()
 
-        will_dispatch = result.output.split("Will dispatch now:")[1].split("Waiting:")[0]
-        assert "#762" in will_dispatch
-        assert "#763" in will_dispatch
-        waiting_section = result.output.split("Waiting:")[1]
-        assert "#765" in waiting_section
-        assert "waiting on #762, #763" in waiting_section
+        plan_section = result.output.split("Will queue (drive-queue), in dependency order:")[1]
+        assert "#762" in plan_section
+        assert "#763" in plan_section
+        assert "#765  (after api#762, api#763)" in plan_section
         assert "dry run" in result.output
+        # Nothing written — the dry run leaves the queue untouched.
+        assert state_mod.list_drive_queue() == []
 
-    def test_cohort_merging_unblocks_gated_node(self, config_file: Path) -> None:
-        """#769 acceptance criteria (second half): simulate #762/#763 merged ->
-        #765 enters the ready frontier."""
+    def test_terminal_prereqs_are_dropped_from_after_edges(self, config_file: Path) -> None:
+        """#2335: #762/#763 already closed -> only #765 queues, with no
+        `after` edges (a closed issue never enters the queue, so an edge at
+        it would read as unsatisfiable to the tick)."""
         open_issues = [{"number": 765, "milestone": {"number": 9}}]
 
         def get_issue(repo, number):
@@ -149,9 +152,10 @@ class TestMilestoneDispatchDryRun:
         assert result.exit_code == 0, result.output
         disp.assert_not_called()
 
-        will_dispatch = result.output.split("Will dispatch now:")[1]
-        assert "#765" in will_dispatch
-        assert "Waiting:" not in result.output
+        plan_section = result.output.split("Will queue (drive-queue), in dependency order:")[1]
+        assert "#765" in plan_section
+        assert "after" not in plan_section
+        assert "#762" not in plan_section
 
     def test_no_work_order_block_reports_and_exits_zero(self, config_file: Path) -> None:
         def get_issue_no_block(repo, number):
@@ -170,7 +174,12 @@ class TestMilestoneDispatchDryRun:
 
 
 class TestMilestoneDispatchBulk:
-    def test_dispatches_ready_frontier_and_registers_drain(self, config_file: Path) -> None:
+    def test_enqueues_whole_dag_into_drive_queue(self, config_file: Path) -> None:
+        """#2335: bulk mode queues every open work-order node into the
+        drive-queue with `after=` edges carrying the DAG — it never calls
+        `coord.dispatch.dispatch` directly, and it no longer registers the
+        milestone for the daemon's direct-dispatch auto-drain (the queue IS
+        the durable drain)."""
         open_issues = [
             {"number": 762, "milestone": {"number": 9}},
             {"number": 763, "milestone": {"number": 9}},
@@ -179,36 +188,69 @@ class TestMilestoneDispatchBulk:
         with patch("coord.github_ops.get_issue", side_effect=_get_issue), \
              patch("coord.github_ops.get_open_issues", return_value=open_issues), \
              patch("coord.board_service.read_board", return_value=Board()), \
-             patch("coord.dispatch.dispatch", side_effect=[{"id": "a1"}, {"id": "a2"}]) as disp, \
-             patch("coord.github_ops.post_issue_comment"), \
-             patch("coord.github_ops.check_branch_exists", return_value=False):
+             patch("coord.dispatch.dispatch") as disp:
             result = CliRunner().invoke(
                 main,
                 ["milestone", "dispatch", "api", "100", "--config", str(config_file)],
             )
         assert result.exit_code == 0, result.output
-        assert disp.call_count == 2
-        assert "a1" in result.output
-        assert "a2" in result.output
+        disp.assert_not_called()
 
-        # Both cohort issues fanned out to distinct machines.
-        machine_names = {c.args[0].machine_name for c in disp.call_args_list}
-        assert machine_names == {"laptop", "server"}
+        rows = state_mod.list_drive_queue()
+        assert [(r["repo_name"], r["issue_number"]) for r in rows] == [
+            ("api", 762), ("api", 763), ("api", 765),
+        ]
+        by_issue = {r["issue_number"]: r for r in rows}
+        assert by_issue[762]["after_json"] == []
+        assert by_issue[763]["after_json"] == []
+        assert by_issue[765]["after_json"] == ["api#762", "api#763"]
 
-        records = state_mod.load_dispatched()
-        assert len(records) == 2
+        assert "queued api#762" in result.output
+        assert "queued api#765 after api#762, api#763" in result.output
+        assert "3 issue(s) queued" in result.output
+        assert "coord drive-queue tick" in result.output
 
-        # #765 still open (not terminal) -> the milestone registers for
-        # daemon auto-drain.
-        drains = state_mod.list_milestone_drains()
-        assert drains == [{"repo_name": "api", "tracking_issue": 100}]
-        assert "registered for daemon auto-drain" in result.output
+        # No direct dispatch happened, so nothing was recorded as dispatched
+        # and no daemon auto-drain registration is needed or wanted.
+        assert state_mod.load_dispatched() == []
+        assert state_mod.list_milestone_drains() == []
+        assert "registered for daemon auto-drain" not in result.output
 
-    def test_already_complete_milestone_dispatches_nothing_and_does_not_register(
+    def test_dependent_declared_first_still_queues_after_its_prereq(
         self, config_file: Path
     ) -> None:
-        """Every node already terminal at fetch time -> empty ready frontier,
-        nothing dispatched, no daemon auto-drain registration needed."""
+        """#2335: declared order is not necessarily topological — a node
+        declared before its own pre-req still queues after it, so queue
+        positions read in dependency order."""
+        body = "## Work order\n- [ ] #765  {after: #762}\n- [ ] #762\n"
+        open_issues = [
+            {"number": 762, "milestone": {"number": 9}},
+            {"number": 765, "milestone": {"number": 9}},
+        ]
+
+        def get_issue(repo, number):
+            return _get_issue(repo, number, bodies={100: body})
+
+        with patch("coord.github_ops.get_issue", side_effect=get_issue), \
+             patch("coord.github_ops.get_open_issues", return_value=open_issues), \
+             patch("coord.board_service.read_board", return_value=Board()), \
+             patch("coord.dispatch.dispatch") as disp:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "dispatch", "api", "100", "--config", str(config_file)],
+            )
+        assert result.exit_code == 0, result.output
+        disp.assert_not_called()
+
+        rows = state_mod.list_drive_queue()
+        assert [r["issue_number"] for r in rows] == [762, 765]
+        assert rows[1]["after_json"] == ["api#762"]
+
+    def test_already_complete_milestone_queues_nothing_and_does_not_register(
+        self, config_file: Path
+    ) -> None:
+        """Every node already terminal at fetch time -> nothing to queue,
+        nothing dispatched, no daemon auto-drain registration."""
         body = "## Work order\n- [ ] #762\n"
         open_issues: list[dict] = []
 
@@ -225,7 +267,8 @@ class TestMilestoneDispatchBulk:
             )
         assert result.exit_code == 0, result.output
         disp.assert_not_called()
-        assert "Nothing to dispatch right now." in result.output
+        assert "Nothing to queue" in result.output
+        assert state_mod.list_drive_queue() == []
         assert state_mod.list_milestone_drains() == []
 
 
@@ -429,9 +472,9 @@ class TestMilestoneDispatchGateA:
             )
         assert result.exit_code == 0, result.output
         assert "Gate A" not in result.output
-        will_dispatch = result.output.split("Will dispatch now:")[1].split("Waiting:")[0]
-        assert "#762" in will_dispatch
-        assert "#763" in will_dispatch
+        plan_section = result.output.split("Will queue (drive-queue), in dependency order:")[1]
+        assert "#762" in plan_section
+        assert "#763" in plan_section
 
     def test_repo_without_acceptance_driver_is_unaffected(self, config_file: Path) -> None:
         """No `acceptance.drivers` entry for this repo -> Gate A is a no-op,
