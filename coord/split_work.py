@@ -30,7 +30,19 @@ class WorkChunk:
 # ---------------------------------------------------------------------------
 
 def _is_test_file(f: str) -> bool:
-    """Return True if the file is a test file."""
+    """Return True if the file is a test file.
+
+    NOTE (#2192 review follow-up): ``coord/review.py``'s ``_is_test_path``
+    answers a similarly-shaped question (Rust/TS/JS suffixes, nested
+    ``tests/`` dirs, ``conftest.py``, ``__tests__/``/``e2e/``) but for a
+    different downstream consumer — that one gates a free pre-review nudge,
+    this one drives chunk assignment for large-diff splitting. Deliberately
+    NOT unified yet: broadening this classifier to match the other one would
+    change which files get treated as "test files" during chunk splitting,
+    a behavior change out of scope for #2192. Flagged per the repo's "one
+    question, one answer" rule (epic #2096) as worth consolidating into one
+    shared helper if the two questions ever turn out to be the same one.
+    """
     p = Path(f)
     return (
         len(p.parts) > 0 and p.parts[0] in ("tests", "test")
