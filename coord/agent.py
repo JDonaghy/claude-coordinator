@@ -772,6 +772,44 @@ def _is_auth_push_failure(message: str) -> bool:
     return any(marker in lowered for marker in _AUTH_PUSH_FAILURE_MARKERS)
 
 
+def _remote_already_has_head(
+    wt_path: Path, remote: str, branch: str, *, timeout: float = 30.0
+) -> bool:
+    """True when *remote*'s copy of *branch* already contains the worktree's
+    current ``HEAD`` as an ancestor (#2356).
+
+    Used by `_reap`'s belt-and-suspenders push-failure handling: an
+    auth-shaped failure pushing to *remote* does NOT necessarily mean the
+    worker's commits never reached it — a worker that hit the same broken
+    write-credential wall (e.g. an HTTPS credential helper with nothing to
+    expand in a non-interactive shell) may have already worked around it by
+    pushing the same commit over a different remote/protocol, most commonly
+    an explicit ``git@github.com:...`` SSH URL (the #2269 incident). That
+    push landed on the SAME GitHub-hosted branch this function now checks —
+    it never touches a second remote name in the worktree's own git config.
+
+    Fetching *branch* is a READ operation (``git fetch`` invokes
+    upload-pack, not receive-pack), which commonly still succeeds — via
+    anonymous access on a public repo, or a still-valid read-scoped
+    credential — even when the WRITE credential that just failed the push
+    is broken or missing entirely. So this is a meaningfully independent
+    signal from the push that just failed, not a re-run of the same failing
+    operation.
+
+    Returns ``False`` — never raises — on any git failure: the branch
+    missing on the remote, a network error, or `merge-base` reporting "not
+    an ancestor" all resolve to "unknown/genuinely behind", and an unknown
+    remote state must never suppress the real #1797 failure signal (nothing
+    ever reached the remote).
+    """
+    try:
+        _git(wt_path, "fetch", remote, branch, timeout=timeout)
+        _git(wt_path, "merge-base", "--is-ancestor", "HEAD", "FETCH_HEAD")
+        return True
+    except (_GitError, subprocess.TimeoutExpired):
+        return False
+
+
 def _git(cwd: Path, *args: str, timeout: float = 15.0) -> str:
     result = subprocess.run(
         ["git", *args],
@@ -8146,9 +8184,43 @@ class AgentServer:
                         # against repos with no `origin` at all (every test
                         # fixture, and any local-only deployment), and that
                         # failure mode must stay non-fatal exactly as before.
+                        #
+                        # #2356: an auth-shaped failure on THIS push doesn't
+                        # necessarily mean the content never reached origin
+                        # — a worker that hit the same broken-credential
+                        # wall may have already landed the same commit via
+                        # an alternate remote/protocol (#2269: an explicit
+                        # SSH URL, worked around a missing HTTPS
+                        # credential). Before promoting to FAILED, check
+                        # whether origin already has local HEAD as an
+                        # ancestor (`_remote_already_has_head` fetches — a
+                        # read, which commonly still works even when the
+                        # write credential just failed). Only genuinely
+                        # missing content — origin behind local HEAD, or the
+                        # check itself failing — is promoted, so #1797's
+                        # original "nothing ever reached origin" case is
+                        # unaffected.
                         _reason = str(e)
                         if _is_auth_push_failure(_reason):
-                            _push_failure_reason = _reason
+                            _branch_for_check = (
+                                head if head and head != "HEAD" else None
+                            )
+                            if _branch_for_check and _remote_already_has_head(
+                                wt_path, "origin", _branch_for_check
+                            ):
+                                try:
+                                    with open(assignment.log_path, "a") as reopen:
+                                        reopen.write(
+                                            "# reap: push failed but origin "
+                                            "already has HEAD as an ancestor "
+                                            "(pushed via another remote/"
+                                            "protocol?) — treating as success "
+                                            f"({_reason}) (#2356)\n"
+                                        )
+                                except OSError:
+                                    pass
+                            else:
+                                _push_failure_reason = _reason
                         try:
                             with open(assignment.log_path, "a") as reopen:
                                 reopen.write(f"# reap: push failed ({_reason})\n")
