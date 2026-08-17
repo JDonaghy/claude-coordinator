@@ -568,10 +568,19 @@ def test_end_to_end_a_really_ambient_sensitive_test_reddens_the_arm(
 
     # The runner reuses `$WT/.venv/bin/python` when one exists, so pointing it at
     # the interpreter already running this suite skips a ~12s venv build while
-    # still being a REAL interpreter with a real pytest.
+    # still being a REAL interpreter with a real pytest. An exec WRAPPER, not a
+    # symlink: a venv interpreter reached through a symlink sitting in a
+    # directory with no `pyvenv.cfg` resolves the chain down to the BASE python
+    # and loses the venv's site-packages — "No module named pytest", and the
+    # ordinary arm goes red for a reason that has nothing to do with the code
+    # under test. Exec'ing `sys.executable` by its real absolute path keeps the
+    # venv machinery intact.
     venv_bin = r / ".venv" / "bin"
     venv_bin.mkdir(parents=True)
-    (venv_bin / "python").symlink_to(sys.executable)
+    _executable(
+        venv_bin / "python",
+        f'#!/usr/bin/env bash\nexec "{sys.executable}" "$@"\n',
+    )
     _executable(venv_bin / "coord", _FAKE_COORD)
 
     result = _run(r, HOME=str(clean_home))
