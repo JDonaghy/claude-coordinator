@@ -361,7 +361,34 @@ def load_manifest(acceptance_root: Path) -> dict[str, int]:
     return mapping
 
 
-def load_expected_red(acceptance_root: Path) -> dict[str, int]:
+def _driver_kind_for_manifest_dir(ms_dir: Path) -> str | None:
+    """Best-effort LOCAL driver-kind lookup for one ``ms-NN``/``issue-NN``
+    acceptance directory, via its ``mocks/`` file extensions
+    (:data:`MOCK_EXT_TO_DRIVER_KIND`) — the filesystem counterpart of
+    :func:`resolve_for_path`'s GitHub-backed lookup, for callers that
+    already have a local checkout and don't want a network round trip.
+
+    Returns ``None`` (unknown) rather than guessing when ``mocks/`` is
+    absent, empty, or its files imply more than one kind — callers MUST
+    treat ``None`` as "don't exclude", never as "safe to skip": this feeds
+    a hard-failure check (:func:`load_expected_red`), and silently
+    dropping a manifest because its kind couldn't be determined would hide
+    the exact class of bug that check exists to catch.
+    """
+    mocks_dir = ms_dir / "mocks"
+    if not mocks_dir.is_dir():
+        return None
+    kinds = {
+        MOCK_EXT_TO_DRIVER_KIND[p.suffix]
+        for p in mocks_dir.iterdir()
+        if p.suffix in MOCK_EXT_TO_DRIVER_KIND
+    }
+    return next(iter(kinds)) if len(kinds) == 1 else None
+
+
+def load_expected_red(
+    acceptance_root: Path, *, driver_kind: str | None = None
+) -> dict[str, int]:
     """Merge every ``ms-NN/manifest.(yml|json)``'s ``expected_red:`` block
     under *acceptance_root* into one ``{test_id: issue_number}`` mapping
     (#2164) — the flat shape :func:`apply_expected_red` and the ``coord
@@ -369,9 +396,28 @@ def load_expected_red(acceptance_root: Path) -> dict[str, int]:
 
     Mirrors :func:`load_manifest`'s merge/empty-dict/last-writer-wins
     conventions exactly, just reading ``expected_red`` instead of ``tests``.
+
+    *driver_kind* (#2339): when given, a manifest whose own directory
+    resolves (via :func:`_driver_kind_for_manifest_dir`) to a DIFFERENT
+    driver kind is skipped entirely. A repo routes different milestones to
+    different drivers (``coord/**`` -> cli-pytest, ``tui/**`` ->
+    tui-tuidriver, ...), but a single ``coord acceptance run --for-path X
+    --all`` invocation only ever executes ONE of them — before this
+    parameter existed, the merged registry always spanned every driver, so
+    every milestone's ``expected_red`` ids that belonged to a DIFFERENT
+    driver than the one actually running were reported as
+    ``missing_expected_red_ids`` (a hard, un-waivable CI failure) on every
+    single run, for every repo with more than one routed driver kind, the
+    moment two milestones used different drivers. A directory whose kind
+    can't be determined (see above) is always included, matching the
+    unfiltered (``driver_kind=None``) behaviour this defaults to.
     """
     mapping: dict[str, int] = {}
     for path in _manifest_paths(acceptance_root):
+        if driver_kind is not None:
+            resolved = _driver_kind_for_manifest_dir(path.parent)
+            if resolved is not None and resolved != driver_kind:
+                continue
         try:
             data = parse_manifest_text(path.read_text(), source=str(path))
         except OSError as e:

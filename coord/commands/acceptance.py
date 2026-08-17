@@ -301,7 +301,16 @@ def acceptance_run(
         )
 
     if ci_mode:
-        expected_red = load_expected_red(cwd / ACCEPTANCE_DIRNAME)
+        # #2339: scope the expected_red registry to milestones this run's
+        # OWN driver could actually produce results for — a routed repo's
+        # `--all --ci` used to merge every milestone's expected_red
+        # regardless of which driver `--for-path` resolved, so every OTHER
+        # driver's ids always came back `missing_expected_red_ids` (a hard
+        # CI failure) the moment the repo had more than one driver kind in
+        # use. See coord.acceptance.load_expected_red's docstring.
+        expected_red = load_expected_red(
+            cwd / ACCEPTANCE_DIRNAME, driver_kind=driver_cfg.kind,
+        )
         verdict = apply_expected_red(verdict, set(expected_red))
         click.echo(json.dumps(verdict, indent=2))
         hard_failure = expected_red_failure_summary(verdict)

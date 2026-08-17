@@ -271,6 +271,51 @@ class TestLoadExpectedRed:
         (root / "ms11" / "manifest.yml").write_text("tests:\n  a: 554\n")
         assert load_expected_red(root) == {}
 
+    def test_driver_kind_excludes_a_different_driver_milestone(
+        self, tmp_path: Path
+    ) -> None:
+        # #2339: a repo routing coord/** -> cli-pytest and tui/** ->
+        # tui-tuidriver must not merge a tui-tuidriver milestone's
+        # expected_red into a cli-pytest run's registry (or vice versa) —
+        # the other driver can never produce those test-ids, so an unscoped
+        # merge always reported them `missing_expected_red_ids`, a hard CI
+        # failure on every run of every OTHER driver the moment two
+        # milestones used different drivers.
+        root = tmp_path / "tests" / "acceptance"
+        ms_tui = root / "ms65"
+        ms_tui.mkdir(parents=True)
+        (ms_tui / "manifest.yml").write_text("expected_red:\n  2282:\n    - board_tabs_2282::a\n")
+        (ms_tui / "mocks").mkdir()
+        (ms_tui / "mocks" / "board.screen").write_text("mock")
+
+        ms_cli = root / "ms37"
+        ms_cli.mkdir(parents=True)
+        (ms_cli / "manifest.yml").write_text("expected_red:\n  1118:\n    - test_x\n")
+        (ms_cli / "mocks").mkdir()
+        (ms_cli / "mocks" / "usage.out").write_text("mock")
+
+        assert load_expected_red(root, driver_kind="cli-pytest") == {"test_x": 1118}
+        assert load_expected_red(root, driver_kind="tui-tuidriver") == {
+            "board_tabs_2282::a": 2282
+        }
+        # Unfiltered (default) behaviour is unchanged — everything merges.
+        assert load_expected_red(root) == {"board_tabs_2282::a": 2282, "test_x": 1118}
+
+    def test_driver_kind_includes_a_milestone_with_no_mocks_dir(
+        self, tmp_path: Path
+    ) -> None:
+        # A directory whose driver can't be determined (no mocks/, mixed
+        # kinds, ...) must never be silently dropped — "unknown" is not
+        # "safe to skip" for a hard-failure check.
+        root = tmp_path / "tests" / "acceptance"
+        (root / "issue-9").mkdir(parents=True)
+        (root / "issue-9" / "manifest.yml").write_text(
+            "expected_red:\n  9:\n    - bare_bug_test\n"
+        )
+        assert load_expected_red(root, driver_kind="web-playwright") == {
+            "bare_bug_test": 9
+        }
+
 
 class TestApplyExpectedRed:
     def test_no_expected_red_ids_is_a_no_op(self) -> None:
