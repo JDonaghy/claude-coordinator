@@ -591,3 +591,105 @@ class TestFixFromRedCi:
         assert result.exit_code == EXIT_DISPATCH_REFUSED
         assert result.exit_code != 1
         assert "no acceptance slice yet" in result.output
+
+
+# ── Part 4 (#2344): a failed oracle-loop acceptance trust gate as a fourth
+# trigger, mirroring the red-CI door above ────────────────────────────────────
+
+
+class TestFixFromFailedAcceptanceGate:
+    def test_failed_trust_gate_on_an_otherwise_green_row_dispatches_a_fix(
+        self, config_file: Path, coord_dir: Path, monkeypatch
+    ) -> None:
+        """`_decide_acceptance_gate` (coord/drive.py) dispatches `coord fix
+        <work_aid>` the moment the trust gate fails, even when Test has
+        already passed and CI is green (ms-65 / #2282's shape). Before
+        #2344 this refused every time with "expected a failed test
+        verdict" — there was no door for it."""
+        work = _work(test_state="passed", smoke_test="pass")
+        state_mod.save_board(Board(completed=[work]))
+        state_mod.record_acceptance_verdict(
+            assignment_id=work.assignment_id,
+            acceptance_state="failed",
+            acceptance_reason="acceptance suite: 2/7 passed — see run log",
+        )
+
+        def boom(*a, **k):
+            raise AssertionError(
+                "CI must not be consulted when the trust gate already failed"
+            )
+
+        monkeypatch.setattr("coord.ci_store.build_ci_store", boom)
+
+        captured = {}
+
+        def fake_dispatch(proposal, config, **kwargs):
+            captured["briefing"] = proposal.briefing
+            captured["target_branch"] = proposal.target_branch
+            return {"id": "fix-acceptance"}
+
+        with patch("coord.dispatch.dispatch", side_effect=fake_dispatch), \
+             patch("coord.github_ops.post_issue_comment"):
+            result = CliRunner().invoke(
+                main, ["fix", "work-abc", "--config", str(config_file)]
+            )
+
+        assert result.exit_code == 0, result.output
+        assert captured["target_branch"] == WORK_BRANCH
+        assert "Acceptance trust-gate failure" in captured["briefing"]
+        assert "acceptance suite: 2/7 passed" in captured["briefing"]
+
+    def test_passing_trust_gate_does_not_open_the_door(
+        self, config_file: Path, coord_dir: Path, monkeypatch
+    ) -> None:
+        work = _work(test_state="passed", smoke_test="pass")
+        state_mod.save_board(Board(completed=[work]))
+        state_mod.record_acceptance_verdict(
+            assignment_id=work.assignment_id, acceptance_state="passed"
+        )
+
+        monkeypatch.setattr(
+            "coord.ci_store.build_ci_store", lambda _type: MagicMock(is_available=False)
+        )
+
+        result = CliRunner().invoke(
+            main, ["fix", "work-abc", "--config", str(config_file)]
+        )
+        assert result.exit_code != 0
+        assert "expected a failed test" in result.output
+        assert "acceptance_state is 'passed'" in result.output
+
+    def test_a_failed_local_test_takes_priority_over_the_trust_gate(
+        self, config_file: Path, coord_dir: Path, monkeypatch
+    ) -> None:
+        """When both Test and the trust gate are red, the existing Test
+        failure story keeps priority — it's what a caller is used to
+        seeing and is at least as informative."""
+        work = _work(test_state="failed", test_reason="assert 1 == 2")
+        state_mod.save_board(Board(completed=[work]))
+        state_mod.record_acceptance_verdict(
+            assignment_id=work.assignment_id,
+            acceptance_state="failed",
+            acceptance_reason="acceptance suite: 2/7 passed",
+        )
+
+        def boom(*a, **k):
+            raise AssertionError("CI must not be consulted when the test gate failed")
+
+        monkeypatch.setattr("coord.ci_store.build_ci_store", boom)
+
+        captured = {}
+
+        def fake_dispatch(proposal, config, **kwargs):
+            captured["briefing"] = proposal.briefing
+            return {"id": "fix-t"}
+
+        with patch("coord.dispatch.dispatch", side_effect=fake_dispatch), \
+             patch("coord.github_ops.post_issue_comment"):
+            result = CliRunner().invoke(
+                main, ["fix", "work-abc", "--config", str(config_file)]
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "Test failure" in captured["briefing"]
+        assert "assert 1 == 2" in captured["briefing"]
