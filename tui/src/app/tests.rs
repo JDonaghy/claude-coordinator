@@ -47489,3 +47489,255 @@ Milestone tracking issue.
         );
     }
 
+
+    // ── #2282 (ms-65 §2): Board document tab strip ───────────────────────
+
+    /// Contract §7's five-issue Board fixture, shared by the doc-tab tests
+    /// below. The `coord` label is what puts an issue in the tracked set.
+    const DOC_TAB_BOARD_JSON: &str = r#"{
+      "issues": [
+        {"repo_name": "claude-coordinator", "number": 101, "title": "Fix login race timeout", "state": "open", "labels": ["coord"]},
+        {"repo_name": "claude-coordinator", "number": 102, "title": "Auth token refresh bug", "state": "open", "labels": ["coord"]},
+        {"repo_name": "claude-coordinator", "number": 103, "title": "Race condition in poller", "state": "open", "labels": ["coord"]}
+      ]
+    }"#;
+
+    /// Two repos, so the "labels carry the repo prefix" rule has something to
+    /// bite on.
+    const DOC_TAB_TWO_REPO_JSON: &str = r#"{
+      "issues": [
+        {"repo_name": "claude-coordinator", "number": 101, "title": "Fix login race timeout", "state": "open", "labels": ["coord"]},
+        {"repo_name": "coord-portal", "number": 7, "title": "Portal login redirect", "state": "open", "labels": ["coord"]}
+      ]
+    }"#;
+
+    /// Build a Board app with the fixture above and its issue rows revealed.
+    ///
+    /// The seeded repo's `No milestone` group is collapsed by default (#857),
+    /// so it is expanded up front — that is baseline behaviour this milestone
+    /// does not change.
+    fn doc_tab_app(board_json: &str) -> CoordApp {
+        let mut app = make_app_with_board_json(board_json);
+        let repos: Vec<String> = app.board_repo_names.clone();
+        for repo in repos {
+            app.board_milestone_expanded
+                .insert((repo, "no-milestone".to_string()), true);
+        }
+        app.rebuild_board_sidebar();
+        app
+    }
+
+    /// §2a's regression bar, in-crate: with zero documents open the strip is
+    /// absent entirely — no close glyph, no preview marker, no reserved row.
+    #[test]
+    fn board_doc_tab_strip_is_absent_with_zero_tabs() {
+        let app = doc_tab_app(DOC_TAB_BOARD_JSON);
+        assert!(
+            app.board_doc_tab_bar().is_none(),
+            "#2282 §2a: with no document open the Board panel must render no tab strip"
+        );
+        assert!(app.board_doc_tab_labels().is_empty());
+    }
+
+    /// §2e rule 1 + §2b/§2c/§2d/§1, through the app rather than the bare
+    /// model: opening a document produces one italic, `∘ `-marked, bracketed,
+    /// `×`-terminated tab.
+    #[test]
+    fn board_doc_tab_strip_renders_one_preview_tab_after_open() {
+        let mut app = doc_tab_app(DOC_TAB_BOARD_JSON);
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 102), false);
+
+        let bar = app.board_doc_tab_bar().expect("one tab open → a strip");
+        assert_eq!(bar.tabs.len(), 1);
+        assert_eq!(bar.tabs[0].label, "[∘ #102 Auth token ref… ×] ");
+        assert!(
+            bar.tabs[0].is_preview,
+            "#2282 §1: the TabItem must carry is_preview so quadraui paints it \
+             italic — the `∘ ` marker is the symbols-only stand-in, not a substitute"
+        );
+        assert!(bar.tabs[0].is_active);
+    }
+
+    /// §2e rule 3: pinning drops both `is_preview` and the `∘ ` marker.
+    #[test]
+    fn board_doc_tab_strip_drops_the_preview_marker_on_pin() {
+        let mut app = doc_tab_app(DOC_TAB_BOARD_JSON);
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 102), true);
+
+        let bar = app.board_doc_tab_bar().expect("one tab open → a strip");
+        assert_eq!(bar.tabs[0].label, "[#102 Auth token ref… ×] ");
+        assert!(!bar.tabs[0].is_preview);
+    }
+
+    /// The acceptance criterion the sealed §2 slice does not cover: **the
+    /// detail pane follows the ACTIVE TAB, not the tree cursor.**
+    ///
+    /// Open #102 as a document, then move the sidebar selection to #103
+    /// without opening it. The verb-targeting accessor
+    /// (`board_selected_issue_group`) must follow the cursor to #103, while
+    /// the detail accessor stays on #102.
+    #[test]
+    fn board_detail_pane_follows_the_active_doc_tab_not_the_tree_cursor() {
+        let mut app = doc_tab_app(DOC_TAB_BOARD_JSON);
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 102), true);
+        assert_eq!(
+            app.board_detail_issue_group().map(|g| g.issue_number),
+            Some(102)
+        );
+
+        // Move the tree cursor to #103 without touching the tab set.
+        app.select_issue("claude-coordinator", 103);
+        assert_eq!(
+            app.board_selected_issue_group().map(|g| g.issue_number),
+            Some(103),
+            "the cursor really did move — otherwise the assertion below is vacuous"
+        );
+        assert_eq!(
+            app.board_detail_issue_group().map(|g| g.issue_number),
+            Some(102),
+            "#2282: the detail pane follows the ACTIVE TAB (#102), not the tree cursor (#103)"
+        );
+        assert_eq!(app.board_detail_repo(), Some("claude-coordinator"));
+    }
+
+    /// …and with zero tabs open the detail accessor is exactly the pre-ms-65
+    /// selection-follows-tree behaviour.
+    #[test]
+    fn board_detail_pane_follows_the_tree_cursor_when_no_tab_is_open() {
+        let mut app = doc_tab_app(DOC_TAB_BOARD_JSON);
+        app.select_issue("claude-coordinator", 103);
+        assert_eq!(
+            app.board_detail_issue_group().map(|g| g.issue_number),
+            Some(103)
+        );
+    }
+
+    /// An active tab whose issue has left the board must not strand the detail
+    /// pane on a document that no longer exists — it falls back to the cursor.
+    #[test]
+    fn board_detail_pane_falls_back_when_the_active_document_left_the_board() {
+        let mut app = doc_tab_app(DOC_TAB_BOARD_JSON);
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 999), true);
+        app.select_issue("claude-coordinator", 101);
+        assert_eq!(
+            app.board_detail_issue_group().map(|g| g.issue_number),
+            Some(101),
+            "#2282: a tab for a purged issue must not blank or freeze the detail pane"
+        );
+    }
+
+    /// §2f: activating a document marks its sidebar row with `▸`, and only
+    /// that row.
+    #[test]
+    fn board_active_document_row_carries_the_selection_marker() {
+        let mut app = doc_tab_app(DOC_TAB_BOARD_JSON);
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 102), true);
+
+        // The marker lives in the rendered row text, so assert against a
+        // render rather than the row model.
+        use quadraui::tui::testing::driver_with_shell;
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        driver.render();
+        assert!(
+            driver.screen_contains("▸ #102"),
+            "#2282 §2f: the active document's sidebar row carries `▸`:\n{}",
+            driver.screen()
+        );
+        assert_eq!(
+            driver.screen().matches('▸').count(),
+            1,
+            "exactly one row is marked:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// The open set spanning more than one repo makes every label carry its
+    /// repo prefix, so `#101` in one repo can't be read as `#101` in another.
+    #[test]
+    fn board_doc_tab_labels_carry_the_repo_prefix_across_repos() {
+        let mut app = doc_tab_app(DOC_TAB_TWO_REPO_JSON);
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 101), true);
+        let single = app.board_doc_tab_labels();
+        assert_eq!(single.len(), 1);
+        assert!(
+            !single[0].contains("claude-coordinator"),
+            "one repo open → bare labels, got {single:?}"
+        );
+
+        app.open_board_doc_tab(("coord-portal".to_string(), 7), true);
+        let labels = app.board_doc_tab_labels();
+        assert_eq!(labels.len(), 2);
+        assert!(
+            labels.iter().all(|l| l.contains("claude-coordinator") || l.contains("coord-portal")),
+            "#2282: once the open set spans two repos every label carries its repo, got {labels:?}"
+        );
+    }
+
+    /// A click on the strip activates the tab under the cursor. Drives the
+    /// real `event → handle → render` path so the hit-test's agreement with
+    /// the painted label widths is what is actually asserted.
+    #[test]
+    fn clicking_a_board_doc_tab_activates_it() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = doc_tab_app(DOC_TAB_BOARD_JSON);
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 101), true);
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 102), true);
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        driver.render();
+        assert!(
+            driver.screen_contains("[#102 Auth token ref… ×]"),
+            "#102 starts active:\n{}",
+            driver.screen()
+        );
+
+        let (x, y) = driver
+            .find("#101 Fix login race…")
+            .expect("#101's tab must be on screen");
+        driver.click(x, y);
+        driver.render();
+        assert!(
+            driver.screen_contains("[#101 Fix login race… ×]"),
+            "#2282 §2c: clicking #101's tab makes it the bracketed active tab:\n{}",
+            driver.screen()
+        );
+        assert!(
+            !driver.screen_contains("[#102"),
+            "…and #102 is no longer bracketed:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// Opening the first document must push the `Board / Issue / Chat /
+    /// Terminal` sub-tab bar DOWN by exactly one row, never replace it — the
+    /// contract pins two tab rows, in that order.
+    #[test]
+    fn opening_a_doc_tab_pushes_the_subtab_bar_down_one_row() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = doc_tab_app(DOC_TAB_BOARD_JSON);
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        driver.render();
+        fn subtab_row<A: quadraui::AppLogic>(d: &quadraui::tui::testing::TuiDriver<A>) -> usize {
+            d.screen()
+                .lines()
+                .position(|r| r.contains(" Board ") && r.contains(" Terminal"))
+                .expect("the sub-tab bar always renders on the Board panel")
+        }
+        let before = subtab_row(&driver);
+
+        let (x, y) = driver
+            .find("#102  Auth token refresh")
+            .expect("#102's sidebar row must be on screen");
+        driver.click(x, y);
+        driver.render();
+
+        let after = subtab_row(&driver);
+        assert_eq!(
+            after,
+            before + 1,
+            "#2282 §2a: the doc-tab strip is inserted ABOVE the sub-tab bar:\n{}",
+            driver.screen()
+        );
+    }
