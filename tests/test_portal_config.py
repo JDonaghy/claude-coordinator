@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from coord.config import ConfigError, PortalConfig, _parse_portal
+from coord.config import ConfigError, PortalConfig, _parse_portal, has_unexpanded_env_var
 
 BASE = {
     "enabled": True,
@@ -117,6 +117,25 @@ def test_out_of_range_numbers_are_refused(key, value):
 def test_timeout_secs_must_be_a_number():
     with pytest.raises(ConfigError, match="positive number"):
         _parse_portal({**BASE, "timeout_secs": "soon"})
+
+
+# ── #2336: has_unexpanded_env_var — the "did this actually resolve" check ──
+
+
+def test_has_unexpanded_env_var_true_for_a_placeholder_left_as_is():
+    assert has_unexpanded_env_var("${DEFINITELY_NOT_SET_XYZ}") is True
+
+
+def test_has_unexpanded_env_var_false_for_a_resolved_value():
+    assert has_unexpanded_env_var("id-from-env") is False
+
+
+def test_has_unexpanded_env_var_false_for_none():
+    assert has_unexpanded_env_var(None) is False
+
+
+def test_has_unexpanded_env_var_false_for_empty_string():
+    assert has_unexpanded_env_var("") is False
 
 
 def test_max_retries_must_be_an_int_not_a_bool():

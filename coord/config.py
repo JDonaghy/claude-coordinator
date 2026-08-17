@@ -3372,6 +3372,31 @@ def _expand_env_vars(value: str) -> str:
     return _ENV_VAR_RE.sub(_replace, value)
 
 
+def has_unexpanded_env_var(value: str | None) -> bool:
+    """Whether *value* still contains an unexpanded ``${VAR}`` placeholder.
+
+    #2336: :func:`_expand_env_vars` leaves an unset variable's placeholder
+    untouched — ``${MISSING}`` stays the literal string ``"${MISSING}"`` —
+    so a plain ``bool(value)`` check on the *result* can't tell "this
+    resolved to a real secret" from "the env var was never set in this
+    process's environment": both are non-empty strings. This is the
+    "actually resolved" check the config's own env-var expansion needs a
+    caller to run afterward — e.g. ``coord portal status``'s
+    ``credentials_set`` used to report ``true`` for
+    ``portal.bridge_client_id: "${BRIDGE_CLIENT_ID}"`` even when
+    ``BRIDGE_CLIENT_ID`` was never exported into the shell the command ran
+    in, which read as "credentials fine" while troubleshooting what was
+    actually a missing-env-var problem.
+
+    ``None`` is treated as not-a-placeholder (``False``) — an unset field is
+    a separate "not configured" state, distinct from "configured but the
+    env var didn't resolve".
+    """
+    if value is None:
+        return False
+    return bool(_ENV_VAR_RE.search(value))
+
+
 #: Matches exactly what opencode's own ``OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX``
 #: parser (#2321) accepts as a *string form* of a number: one or more ASCII
 #: digits, nothing else — no sign, no decimal point, no whitespace, no
