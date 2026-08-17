@@ -1,0 +1,137 @@
+# Acceptance manifest for milestone ms-65 ("coord-tui: per-panel document tabs
+# (preview/pin)", tracking issue #2289). Maps each acceptance test-id -> the
+# work-order issue it covers.
+#
+# Driver: tui-tuidriver (coordinator.yml `acceptance.drivers`, route `tui/**`)
+#   cd tui && cargo test --test acceptance -- --format json
+#
+# Test-ids are the libtest `name` emitted by `cargo test --test acceptance`
+# (module-qualified fn path). The slice files live in this directory and are
+# `include!`d at crate root by `tui/tests/acceptance.rs`.
+#
+# Merged (never clobbered) across issues by coord.acceptance.load_manifest —
+# #2283 / #2284 / #2285 / #2286 / #2287 / #2288 append their own entries here
+# when their slices are authored just-in-time. #2281 has no UI surface of its
+# own (contract §7) and therefore no slice; it is exercised by every test below
+# running at all, since `make_app_with_board_json` is what seeds their fixture.
+
+tests:
+  # ── #2282 (W-1) — Board panel document tab strip (contract §2) ───────────
+  # Slice: board_tabs_2282.rs · mocks: board-baseline-no-tabs.screen,
+  # board-preview-tab.screen, board-pinned-3-tabs.screen
+  #
+  # §2a — zero tabs render no strip (the regression bar; also §4's empty-state
+  # target and §8a's absent-hint reference). THIS IS THE GREEN CONTROL — see
+  # the `expected_red` block below.
+  board_tabs_2282::zero_doc_tabs_render_no_tab_strip: 2282
+  # §2a — with >=1 tab the strip sits between the toolbar and the sub-tab bar,
+  # and carries a `#<N>` substring
+  board_tabs_2282::doc_tab_strip_renders_between_the_toolbar_and_the_subtab_bar: 2282
+  # §2a — the `Board / Issue / Chat / Terminal` sub-tab bar renders regardless
+  # of tab state, and the strip never displaces it upward
+  board_tabs_2282::subtab_bar_renders_regardless_of_doc_tab_state: 2282
+  # §2b + §1 — preview label `∘ #<N> <title>` truncated at 22 columns
+  board_tabs_2282::preview_tab_label_is_the_issue_number_and_title_truncated_to_22_columns: 2282
+  # §2b — pinned labels `#<N> <title>` truncated at 20 columns, no `∘ ` marker
+  board_tabs_2282::pinned_tab_labels_are_truncated_to_20_columns: 2282
+  # §2c — the active tab is bracketed `[<label> ×]`, inactive tabs are not
+  board_tabs_2282::active_tab_is_bracketed_and_inactive_tabs_are_not: 2282
+  # §2d — every open closable tab carries the trailing `×` (TAB_CLOSE_CHAR)
+  board_tabs_2282::every_open_tab_renders_the_close_glyph: 2282
+  # §2e rule 1 (append branch) — one single click opens one preview tab
+  board_tabs_2282::single_click_opens_one_preview_tab: 2282
+  # §2e rule 1 (replace branch) + rule 4 — a second single click replaces the
+  # preview in place; count stays 1
+  board_tabs_2282::second_single_click_replaces_the_preview_tab_in_place: 2282
+  # §2e rule 2 — single-clicking an already-open row activates it, adds nothing
+  board_tabs_2282::single_click_on_an_already_open_row_activates_it_without_adding_a_tab: 2282
+  # §2e rule 3 — a double click pins the tab and drops the `∘ ` marker
+  board_tabs_2282::double_click_pins_the_tab_and_drops_the_preview_marker: 2282
+  # §2e — the 2-tab intermediate state the contract explicitly warns not to
+  # confuse with the 3-double-click sequence (pinned #101 + preview #102)
+  board_tabs_2282::a_pinned_tab_plus_a_single_click_yields_two_tabs_one_of_them_preview: 2282
+  # §2e — the headline end state of mocks/board-pinned-3-tabs.screen
+  board_tabs_2282::three_double_clicks_yield_three_pinned_tabs_with_the_last_active: 2282
+  # §2f (half one) — activating a tab selects the matching sidebar row (`▸`)
+  board_tabs_2282::activating_a_tab_selects_its_sidebar_row: 2282
+  # §2f (half two) — …and SCROLLS it into view. See the quadraui#595 note below.
+  board_tabs_2282::activating_a_tab_scrolls_its_sidebar_row_into_view: 2282
+
+# ── expected_red (#2164) ───────────────────────────────────────────────────
+# Hand-derived from a REAL run of the sealed suite against origin/main at the
+# time of authoring (`cd tui && cargo test --test acceptance --features
+# test-support board_tabs_2282`): 14 failed, 1 passed. Not guessed, and not
+# left empty (#2191 — an empty block parks the slice).
+#
+# `zero_doc_tabs_render_no_tab_strip` is deliberately ABSENT: it is the control.
+# It is green today (there is no strip) and must stay green after #2282 lands
+# (contract §2a: "when zero tabs are open, the strip renders nothing and
+# reserves no row" — the strictest form of #2285's behaviour-preserving bar).
+# Listing it would make its inevitable pass a HARD FAILURE.
+expected_red:
+  2282:
+    - board_tabs_2282::doc_tab_strip_renders_between_the_toolbar_and_the_subtab_bar
+    - board_tabs_2282::subtab_bar_renders_regardless_of_doc_tab_state
+    - board_tabs_2282::preview_tab_label_is_the_issue_number_and_title_truncated_to_22_columns
+    - board_tabs_2282::pinned_tab_labels_are_truncated_to_20_columns
+    - board_tabs_2282::active_tab_is_bracketed_and_inactive_tabs_are_not
+    - board_tabs_2282::every_open_tab_renders_the_close_glyph
+    - board_tabs_2282::single_click_opens_one_preview_tab
+    - board_tabs_2282::second_single_click_replaces_the_preview_tab_in_place
+    - board_tabs_2282::single_click_on_an_already_open_row_activates_it_without_adding_a_tab
+    - board_tabs_2282::double_click_pins_the_tab_and_drops_the_preview_marker
+    - board_tabs_2282::a_pinned_tab_plus_a_single_click_yields_two_tabs_one_of_them_preview
+    - board_tabs_2282::three_double_clicks_yield_three_pinned_tabs_with_the_last_active
+    - board_tabs_2282::activating_a_tab_selects_its_sidebar_row
+    - board_tabs_2282::activating_a_tab_scrolls_its_sidebar_row_into_view
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FOR THE COORDINATOR — three findings from authoring this slice. None of them
+# is a worker's to fix, and none was resolved by editing the contract (a
+# test-author may not amend one; #2289 also forbids amending it mid-drive).
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# 1. §2a's `driver.screen_contains("[Board]")` is FALSE against the shipped
+#    app, and §2a itself calls the sub-tab bar "unchanged by this milestone".
+#    The shipped bar renders `Board  Issue  Board Chat  Terminal`: quadraui's
+#    `draw_tab_bar` marks the active tab with colour, not brackets, and
+#    coord-tui's labels are `" Board "` / `" Issue "` / `" Board Chat "` /
+#    `" Terminal "` (`tui/src/app/render.rs`). The mocks' `[Board]` and the
+#    mocks' `Chat` (vs. the shipped `Board Chat`) are both mock artifacts.
+#    This slice locates the bar by its real labels instead. §2c's `[<label> ×]`
+#    bracket on the *doc*-tab strip is untouched by this: the contract calls
+#    that "a new, milestone-local convention", i.e. genuinely #2282's job, and
+#    it IS asserted literally.
+#
+# 2. §2a's "with zero doc tabs open, the row immediately below the toolbar row
+#    IS the `Board / Issue / Chat / Terminal` row" is false of §2a's own
+#    reference mock (in `mocks/board-baseline-no-tabs.screen` row 1 is blank
+#    and the sub-tab bar is row 2) and of the shipped app (row 1 is the
+#    `[ ↻ Sync (S) ]` button row). What the prose and both mocks DO agree on is
+#    the ordering, so that is what is asserted. If the literal row-index claim
+#    was meant, it needs a contract amendment — asserting it as written would
+#    be red against a correct implementation.
+#
+# 3. §2f's scroll half is blocked on milestone pre-requisite quadraui#595
+#    (`SidebarSystem::reveal`), which is NOT landed at the currently pinned
+#    quadraui rev (`d70da7dff7ef9f1eb578ee48aca69297e548348e`). Measured, not
+#    assumed: on a 120×11 grid with contract §7's five issues, neither wheel
+#    `UiEvent::Scroll` nor arrow-key selection moves the Board sidebar list —
+#    arrowing down to #105 updates the detail pane while the list keeps showing
+#    #101–#103. `activating_a_tab_scrolls_its_sidebar_row_into_view` will stay
+#    red until the pin bump named in #2289's pre-requisite table lands, however
+#    complete #2282's own code is. Its setup reaches #105 through the sidebar
+#    FILTER box rather than by scrolling, so every step before the two final
+#    asserts is a harness precondition and says "NOT a #2282 defect" in its
+#    panic message.
+#
+# Also worth knowing, not a contract problem: the mocks draw sidebar rows as
+# `#102 Auth token refresh bug`; the shipped sidebar renders
+# `      #102  Auth token refresh b` (two spaces, title truncated to the
+# 35-column sidebar). The slice's `ROW_*` click targets are taken from a real
+# render for that reason. `TuiDriver` at the pinned rev has neither
+# `double_click()` (quadraui#592) nor styled-cell reads (quadraui#593); the
+# slice works around the first by dispatching the `MouseDown`+`UiEvent::DoubleClick`
+# pair the real runner's `DoubleClickDetector` produces (deterministic, no
+# 400 ms wall clock), and around the second via contract §1's `∘ ` marker plus
+# `×`-counting, exactly as §2e instructs.
