@@ -59,6 +59,7 @@ from coord.drive import (
     resolve_oracle_decision,
 )
 from coord.drive_state import IssueState
+from coord.failure_class import environmental_backoff_secs
 from coord.models import POLICY_REFUSAL_MARKER, Machine, Repo
 from coord.usage_limits import PlanLimits
 
@@ -1450,16 +1451,126 @@ def test_retry_cap_death_names_the_failure_class():
     assert work.is_exit
     assert "cause: work failure" in work.message
 
-    env = step(
-        state(
-            work_aid="w1", work_status="failed",
-            work_failure_reason='API Error: 529 {"type":"overloaded_error"}',
-        ),
-        opts, counters=DriveCounters(),
+    # #2360: an environmental failure now gets the WIDER
+    # `_ENVIRONMENTAL_WORK_RETRY_BUDGET` budget regardless of this test's
+    # `max_work_retries=0` — drive it through the whole budget (a backoff
+    # WAIT, then the retry, repeated) before it finally dies and still names
+    # the cause. The exact number of rounds is an implementation detail; this
+    # only asserts it eventually gives up and still reports why.
+    env_state = state(
+        work_aid="w1", work_status="failed",
+        work_failure_reason='API Error: 529 {"type":"overloaded_error"}',
     )
+    env_counters = DriveCounters()
+    env = step(env_state, opts, counters=env_counters)
+    rounds = 0
+    while not env.is_exit:
+        assert env.kind in (WAIT, RUN)
+        rounds += 1
+        assert rounds < 100  # guard against an accidental infinite loop
+        env = step(env_state, opts, counters=env_counters)
     assert env.is_exit
     assert "cause: environmental" in env.message
     assert "529" in env.message
+
+
+def test_environmental_work_failure_backs_off_then_retries_with_a_wider_budget():
+    """#2360: an environmental WORK-stage failure (a Claude API 5xx here — the
+    #2335 incident's actual shape was an OAuth hiccup, but any classifier-
+    recognised environmental signal exercises the same widened path) no
+    longer dies after the flat `max_work_retries=1` budget. It backs off
+    `environmental_backoff_secs` before each retry and keeps going past what
+    the flat budget would have allowed, only dying once its own wider budget
+    is exhausted.
+
+    #2335: an OAuth-refresh hiccup died after exactly the flat one retry and
+    sat `blocked` for ~19h even though the machine was fine the entire time —
+    this is the gap that incident exposed."""
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_work_retries=1)
+    s = state(
+        work_aid="w1", work_status="failed",
+        work_failure_reason='API Error: 529 {"type":"overloaded_error"}',
+    )
+
+    # Attempt 1: backs off before spending it — not an immediate retry.
+    first = step(s, opts, counters=counters)
+    assert first.kind == WAIT
+    assert first.sleep_after == pytest.approx(environmental_backoff_secs(1))
+    assert counters.work_retries == 0
+
+    # The next poll (the backoff has "elapsed" by the time decide() is asked
+    # again) actually fires the retry.
+    retried = step(s, opts, counters=counters)
+    assert retried.command == ("retry", "w1")
+    assert counters.work_retries == 1
+
+    # A SECOND failure keeps going past `max_work_retries=1` — a flat budget
+    # would have died right here. Backoff grows with the attempt number.
+    second_backoff = step(s, opts, counters=counters)
+    assert second_backoff.kind == WAIT
+    assert second_backoff.sleep_after == pytest.approx(environmental_backoff_secs(2))
+    assert second_backoff.sleep_after > first.sleep_after
+    assert counters.work_retries == 1
+
+    second_retry = step(s, opts, counters=counters)
+    assert second_retry.command == ("retry", "w1")
+    assert counters.work_retries == 2
+
+    # Eventually — after the wider budget, not the flat one — it still gives
+    # up, and still names the cause.
+    action = second_retry
+    rounds = 0
+    while not action.is_exit:
+        assert action.kind in (WAIT, RUN)
+        rounds += 1
+        assert rounds < 100
+        action = step(s, opts, counters=counters)
+    assert action.exit_code == EXIT_TERMINAL_FAILURE
+    assert "cause: environmental" in action.message
+    assert counters.work_retries > opts.max_work_retries
+
+
+def test_non_environmental_work_failure_still_dies_after_flat_max_work_retries():
+    """#2360 acceptance: a real code-defect signature must NOT get the wider
+    environmental budget — `classify_failure` calls it `work`, so it keeps
+    today's tight `max_work_retries` budget completely unchanged, with no
+    backoff wait inserted before the one retry it's allowed."""
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_work_retries=1)
+    s = state(
+        work_aid="w1", work_status="failed",
+        work_failure_reason="AssertionError: expected 2 commits, got 0 — tests failed",
+    )
+
+    first = step(s, opts, counters=counters)
+    assert first.kind == RUN
+    assert first.command == ("retry", "w1")
+    assert counters.work_retries == 1
+
+    second = step(s, opts, counters=counters)
+    assert second.is_exit
+    assert second.exit_code == EXIT_TERMINAL_FAILURE
+    assert "cause: work failure" in second.message
+
+
+def test_usage_limit_wait_is_unaffected_by_the_wider_environmental_retry_budget():
+    """#2360: the usage-limit branch is checked (and returns) BEFORE the
+    bounded-retry code that now widens the budget for other environmental
+    causes — it must keep waiting for the reset, never retrying, even across
+    enough polls to have exhausted the new wider budget for any other
+    environmental cause."""
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_work_retries=1)
+    s = state(
+        work_aid="w1", work_status="failed",
+        work_failure_reason="usage limit — resets 8:30pm (America/Chicago)",
+    )
+    for _ in range(10):
+        action = step(s, opts, counters=counters)
+        assert action.kind == WAIT
+        assert action.command == ()
+        assert counters.work_retries == 0
 
 
 def test_normal_advisory_failure_reason_is_not_mistaken_for_a_usage_limit():
