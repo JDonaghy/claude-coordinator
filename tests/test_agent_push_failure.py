@@ -222,6 +222,66 @@ def test_push_failure_with_zero_commits_is_failed_not_advisory(
     server.shutdown()
 
 
+def test_push_failure_when_already_on_origin_via_other_route_is_not_failed(
+    tmp_path: Path, repo_with_rejecting_remote: tuple[Path, Path]
+) -> None:
+    """#2356: a worker that hits the same broken-write-credential wall as
+    #1797 may work around it by landing the same commit on origin via some
+    other route (the #2269 incident: pushing over an explicit SSH URL when
+    the worktree's configured HTTPS remote had no usable credentials in a
+    non-interactive shell). Reap's own belt-and-suspenders push against
+    `origin` still fails with the exact same auth-shaped error in that case
+    — but the content is already on the remote branch.
+
+    Reproduced deterministically (no network/SSH involved) by having the
+    worker itself land its commit on `origin` by briefly lifting the
+    rejecting hook — standing in for "reached origin via another path" —
+    before reap's own push runs into the hook, still armed. The assignment
+    must land on DONE, not FAILED: the work is exactly where it needs to
+    be, however it got there.
+    """
+    clone, origin = repo_with_rejecting_remote
+    hook = origin / "hooks" / "pre-receive"
+
+    worker_sh = (
+        "git config user.email w@w.com && "
+        "git config user.name Worker && "
+        "echo change > change.txt && "
+        "git add change.txt && "
+        "git commit -m 'real work' && "
+        f"chmod -x {hook} && "
+        "git push origin HEAD && "
+        f"chmod +x {hook}"
+    )
+    server = AgentServer(
+        machine_name="t",
+        repos=["api"],
+        repo_paths={"api": str(clone)},
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: ["/bin/sh", "-c", worker_sh],
+    )
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path=str(clone),
+        issue_number=4,
+        issue_title="already pushed elsewhere, origin push still broken",
+        briefing="b",
+        branch="main",
+    )
+    a = server.assign(spec)
+    final = server.wait_for(a.id, timeout=15)
+
+    assert final.status == DONE, (
+        "origin already had HEAD (however it got there) — reap's own push "
+        f"failing on top of that must not be FAILED, got {final.status!r}"
+    )
+    assert final.push_failure_reason is None, (
+        "the auth-shaped failure must be suppressed once the fetch-based "
+        "check confirms origin already has HEAD as an ancestor"
+    )
+    server.shutdown()
+
+
 def test_successful_push_leaves_push_failure_reason_none(
     tmp_path: Path, repo_with_rejecting_remote: tuple[Path, Path]
 ) -> None:
