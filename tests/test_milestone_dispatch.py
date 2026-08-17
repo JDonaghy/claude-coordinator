@@ -27,6 +27,7 @@ from coord.milestone_dispatch import (
     issue_oracle_ready,
     pick_machine,
     plan_dispatch,
+    plan_queue,
 )
 from coord.milestone_order import WorkOrder, WorkOrderNode
 from coord.models import Assignment, Board, Machine, Repo
@@ -166,6 +167,46 @@ class TestPlanDispatch:
         assert plan.to_dispatch == ()
         assert plan.skipped == ()
         assert plan.waiting == ()
+
+
+# ── plan_queue (#2335) ───────────────────────────────────────────────────────
+
+
+class TestPlanQueue:
+    def test_whole_dag_in_declared_order_with_qualified_after_keys(self) -> None:
+        plan = plan_queue(WORK_ORDER, terminal_issues=set(), repo_name="api")
+        assert [q.issue_number for q in plan] == [762, 763, 765]
+        assert plan[0].after == ()
+        assert plan[0].group == "A"
+        assert plan[1].after == ()
+        assert plan[2].after == ("api#762", "api#763")
+        assert plan[2].group is None
+
+    def test_terminal_nodes_are_dropped_and_their_edges_filtered(self) -> None:
+        plan = plan_queue(WORK_ORDER, terminal_issues={762}, repo_name="api")
+        assert [q.issue_number for q in plan] == [763, 765]
+        # The closed pre-req never enters the queue, so its edge is dropped;
+        # the still-open one is kept.
+        assert plan[1].after == ("api#763",)
+
+    def test_all_terminal_yields_empty_plan(self) -> None:
+        plan = plan_queue(WORK_ORDER, terminal_issues={762, 763, 765}, repo_name="api")
+        assert plan == ()
+
+    def test_dependent_declared_before_prereq_sorts_topologically(self) -> None:
+        order = WorkOrder(
+            nodes=(WorkOrderNode(765, after=(762,)), WorkOrderNode(762))
+        )
+        plan = plan_queue(order, terminal_issues=set(), repo_name="api")
+        assert [q.issue_number for q in plan] == [762, 765]
+        assert plan[1].after == ("api#762",)
+
+    def test_independent_nodes_keep_declared_order(self) -> None:
+        order = WorkOrder(
+            nodes=(WorkOrderNode(3), WorkOrderNode(1), WorkOrderNode(2))
+        )
+        plan = plan_queue(order, terminal_issues=set(), repo_name="api")
+        assert [q.issue_number for q in plan] == [3, 1, 2]
 
 
 # ── is_milestone_complete ────────────────────────────────────────────────────
