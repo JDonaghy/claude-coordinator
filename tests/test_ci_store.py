@@ -1525,6 +1525,13 @@ class TestMergeGateThroughGitHubCi:
         assert "failure" in failed_event.message
 
     def test_unreachable_gh_refuses_as_unavailable(self) -> None:
+        """#2347: a bare check-list FETCH failure (gh itself unreachable —
+        `FileNotFoundError`, the #1525 fail-closed synthetic "could not read
+        CI status" stand-in) is classified as `checks_unreadable`, distinct
+        from a plain `checks_failed` block — it is a transport failure, not
+        a real CI verdict of any kind. Still refuses the merge (fail-closed,
+        #1525's rule is unchanged), just with the correct, distinguishable
+        reason."""
         items = [_entry("a")]
         gh = FakeGh()
         ci = GitHubCi()
@@ -1532,8 +1539,11 @@ class TestMergeGateThroughGitHubCi:
             events = process(items, gh, ci_store=ci)
         assert gh.merge_calls == []
         assert items[0].state == PENDING
-        failed_event = next(e for e in events if e.kind == "checks_failed")
-        assert "could not read CI status" in failed_event.message
+        kinds = [e.kind for e in events]
+        assert "checks_failed" not in kinds
+        unreadable_event = next(e for e in events if e.kind == "checks_unreadable")
+        assert "could not read CI status" in unreadable_event.message
+        assert "GitHub could not be reached" in unreadable_event.message
 
 
 # ── Config ───────────────────────────────────────────────────────────────────

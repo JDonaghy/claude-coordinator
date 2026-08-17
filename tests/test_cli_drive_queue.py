@@ -1839,6 +1839,52 @@ def test_a_parked_entry_with_ci_still_genuinely_running_stays_parked(
     assert "1 parked" in cli_no_gates("status").output
 
 
+def test_a_parked_entrys_reason_is_corrected_when_github_is_unreachable(
+    cli_no_gates, seed, launches, coord_db, live_ci_backend,
+):
+    """#2347, reproduced rather than injected.
+
+    A parked entry, still CONFIRMED blocked by this tick's own live
+    re-check — but the live re-check itself could not reach GitHub (a
+    transient `gh pr checks` HTTP 503, exactly the #1525 synthetic
+    "could not read CI status" stand-in) — must have `last_reason`
+    corrected to say so. Before #2347, #1891/#1892's "still shut ⇒ no
+    reconcile, no write, nothing to report" rule left the ORIGINAL "CI
+    running: ..." reason frozen on every such tick — indistinguishable from
+    genuine CI-pending — which is exactly the observed live incident this
+    issue is named for: a fully green, mergeable PR sat parked behind a run
+    of transient GitHub API 503s with no operator-visible signal of the
+    real cause.
+    """
+    _park_with_pr(cli_no_gates, seed, coord_db)
+    assert "CI running" in (queued(2159)["last_reason"] or "")
+
+    from coord.ci_github import _unreadable_check
+    live_ci_backend([
+        _unreadable_check(
+            REPO, 2159, "HTTP 503: No server is currently available"
+        )
+    ])
+
+    result = cli_no_gates("tick")
+    assert result.exit_code == 0, result.output
+    entry = queued(2159)
+    assert entry["state"] == "parked"  # still blocked — not resumed
+    assert entry["attempts"] == 0  # no attempt spent
+    assert "GitHub could not be reached" in (entry["last_reason"] or "")
+    assert len(launches) == 1, launches  # no relaunch triggered
+
+    listing = cli_no_gates("list").output
+    assert "GitHub could not be reached" in listing
+
+    # And once GitHub answers again with a real result, the park still
+    # resolves normally — the transient misclassification did not wedge it.
+    live_ci_backend([_green_check()])
+    result = cli_no_gates("tick")
+    assert result.exit_code == 0, result.output
+    assert queued(2159)["state"] == "running"
+
+
 def test_a_live_ready_wins_even_over_a_stale_cached_plan_reading(
     cli_no_gates, seed, launches, coord_db, live_ci_backend, board_merge_plan,
 ):

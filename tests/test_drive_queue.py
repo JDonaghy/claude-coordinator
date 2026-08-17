@@ -409,6 +409,39 @@ def test_build_board_view_live_ci_flaky_plan_reason_also_parks():
     assert view.facts(entry_key(REPO, 2253)).merge_ci_pending
 
 
+# ── #2347: a THIRD sibling trigger — the check-list FETCH itself failed
+# (GitHub unreachable), not a real CI verdict of any shape. Unlike #1892/
+# #2252 above, this needs NO raw-row recovery test — `_entry_gate_status`
+# computes the classification directly (no extra I/O needed, see
+# `coord.merge_queue._ci_unreadable_reason`'s docstring), so the LIVE
+# `merge_plan` reason already carries it whenever it applies.
+
+def test_build_board_view_reads_merge_ci_pending_from_a_ci_unreadable_plan_reason():
+    """#2347: unlike #1892/#2252, the live `merge_plan` reason ALONE is
+    enough — no raw `merge_queue` row recovery needed."""
+    view = build_board_view(
+        {
+            "merge_plan": [
+                {
+                    "repo_name": REPO, "issue_number": 2347,
+                    "reason": (
+                        "CI unreadable: coord: could not read CI status for "
+                        "acme/api#99 (HTTP 503) (unknown) — GitHub could not "
+                        "be reached to read CI status; this is not a CI result"
+                    ),
+                },
+            ],
+            "merge_queue": [
+                {"repo_name": REPO, "issue_number": 2347, "error": None},
+            ],
+        },
+        [],
+    )
+    facts = view.facts(entry_key(REPO, 2347))
+    assert facts.merge_ci_pending
+    assert facts.merge_ci_pending_reason.startswith("CI unreadable:")
+
+
 # ── #2158: the frozen `error` string vs the live CI rollup ─────────────────
 #
 # The raw `merge_queue` row's `error` is written by a live `coord merge`
@@ -1664,6 +1697,100 @@ def test_a_still_parked_entry_is_not_relaunched_while_ci_is_still_pending():
     plan = plan_tick(entries, board(ci_pending=(1650,)), capacity=1)
     assert plan.reconciles == ()  # still gated — nothing to report or write
     assert plan.launch is None
+
+
+# ── #2347: rewrite `last_reason` while still parked, when the real cause has
+# become "GitHub unreachable" ────────────────────────────────────────────────
+#
+# The gap: #1891/#1892's "CONFIRMED still shut ⇒ no reconcile, no write,
+# nothing to report" rule (see `test_a_still_parked_entry_is_not_relaunched_
+# while_ci_is_still_pending` above) is correct for a genuine ongoing wait —
+# but leaves `last_reason` FROZEN at whatever it said when the entry first
+# parked, even across a run of *unrelated* transient GitHub API failures on
+# every later tick's own re-check. The observed incident: a stale "CI
+# running: … launched 1691s ago" reason survived a run of HTTP 503s for most
+# of `PARK_STALE_SECONDS` with no operator-visible signal that GitHub — not
+# CI — was the actual blocker. `live_ci_gate_reason` carries this tick's
+# fresh reading through so the still-parked entry's `last_reason` can be
+# corrected without resuming it or spending an attempt.
+
+
+def test_plan_tick_rewrites_last_reason_when_still_parked_but_now_unreadable():
+    entries = [
+        entry(
+            2347, position=3, state="parked", attempts=0,
+            last_reason="CI running: build, lint (launched 1691s ago)",
+        )
+    ]
+    live_reason = (
+        "CI unreadable: coord: could not read CI status for acme/api#99 "
+        "(HTTP 503) (unknown) — GitHub could not be reached to read CI "
+        "status; this is not a CI result"
+    )
+    plan = plan_tick(
+        entries, board(), capacity=1, now=NOW,
+        live_ci_gate={entry_key(REPO, 2347): True},
+        live_ci_gate_reason={entry_key(REPO, 2347): live_reason},
+    )
+    reconciles = [r for r in plan.reconciles if r.key == entry_key(REPO, 2347)]
+    assert [r.outcome for r in reconciles] == ["reparked"]
+    reconcile = reconciles[0]
+    assert "state" not in reconcile.updates  # stays parked — no state write
+    assert "attempts" not in reconcile.updates  # no attempt spent
+    assert "GitHub could not be reached" in reconcile.updates["last_reason"]
+    assert plan.launch is None
+
+
+def test_plan_tick_does_not_rewrite_when_the_reason_is_already_current():
+    """No duplicate reconcile spam once `last_reason` already reflects the
+    live GitHub-unreachable reading."""
+    live_reason = "CI unreadable: coord: could not read CI status (unknown)"
+    entries = [
+        entry(2347, position=3, state="parked", attempts=0, last_reason=live_reason)
+    ]
+    plan = plan_tick(
+        entries, board(), capacity=1, now=NOW,
+        live_ci_gate={entry_key(REPO, 2347): True},
+        live_ci_gate_reason={entry_key(REPO, 2347): live_reason},
+    )
+    assert not any(r.key == entry_key(REPO, 2347) for r in plan.reconciles)
+
+
+def test_plan_tick_still_reports_nothing_with_no_live_reason_supplied():
+    """Baseline unchanged: absent `live_ci_gate_reason` (the entry isn't
+    CI-unreadable, or the shell's live check couldn't classify it) keeps
+    #1891/#1892's original "still shut ⇒ no reconcile, no write" behaviour —
+    #2347 only ADDS a narrower case, never removes the baseline."""
+    entries = [
+        entry(
+            2347, position=3, state="parked", attempts=0,
+            last_reason="CI running: build, lint",
+        )
+    ]
+    plan = plan_tick(
+        entries, board(), capacity=1, now=NOW,
+        live_ci_gate={entry_key(REPO, 2347): True},
+    )
+    assert not any(r.key == entry_key(REPO, 2347) for r in plan.reconciles)
+
+
+def test_plan_tick_does_not_rewrite_a_still_pending_reason_as_unreadable():
+    """Only a live reading that is ITSELF `CI_UNREADABLE_PREFIX`-shaped
+    triggers the rewrite — a fresh, still-genuinely-pending reading (the
+    live re-check succeeded, CI is simply still running) must not be
+    misread as the #2347 case."""
+    entries = [
+        entry(
+            2347, position=3, state="parked", attempts=0,
+            last_reason="CI running: build, lint",
+        )
+    ]
+    plan = plan_tick(
+        entries, board(), capacity=1, now=NOW,
+        live_ci_gate={entry_key(REPO, 2347): True},
+        live_ci_gate_reason={entry_key(REPO, 2347): "CI running: build, lint, windows"},
+    )
+    assert not any(r.key == entry_key(REPO, 2347) for r in plan.reconciles)
 
 
 # ── #2158: a park that cannot refresh itself must age out ──────────────────
