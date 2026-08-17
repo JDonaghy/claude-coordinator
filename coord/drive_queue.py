@@ -309,6 +309,26 @@ RESUME_PROBE_TIMEOUT_SECONDS = 5.0
 # an unsatisfiable pre-req.
 DEFAULT_MAX_ATTEMPTS = 2
 
+# #2363: the WIDER ceiling for one specific drive-death signature — an
+# acceptance-author or plain work session that exited DONE/ADVISORY claiming
+# success while its branch carried zero commits (see
+# `_is_empty_branch_death_reason`). Every recorded instance of this shape in
+# `~/.coord/queue-block-log.jsonl` self-healed 0% of the time inside
+# `DEFAULT_MAX_ATTEMPTS` (2) — `claude-coordinator#2283`, `#2348`;
+# `coord-portal#74` (×2); `space-invaders#1`, `#3` — every one needed a
+# by-hand `operator_removed` after exactly 2 attempts, and the by-hand
+# recovery is `coord acceptance author <repo> <tracking> --issue <n>` (or a
+# bare `coord drive`) — the exact command the queue already tried and could
+# just try again itself. Unlike a CI signal (`is_ci_infra_reason` et al in
+# `coord.merge_queue`), there is no free, passive re-check here — the only
+# way to learn whether a retry would succeed is to actually spend one — so
+# the fix is a WIDER attempt budget for this signature alone, not a global
+# increase: every other death reason keeps `DEFAULT_MAX_ATTEMPTS` unchanged.
+# Still finite: once THIS budget is also exhausted, the entry blocks with
+# the same diagnosis-and-recovery instructions it has today (#1526/#2273
+# discipline — no silent infinite retry).
+EMPTY_BRANCH_MAX_ATTEMPTS = 6
+
 # ── retry spacing (#2273) ────────────────────────────────────────────────────
 #
 # 2026-08-15: quadraui#508 and coord-portal#83 each spent their ENTIRE
@@ -1679,6 +1699,48 @@ def _dispatch_produced_nothing(entry: QueueEntry, facts: IssueFacts) -> bool:
     return facts.last_dispatched_at < entry.launched_at
 
 
+def _is_empty_branch_death_reason(reason: str | None) -> bool:
+    """#2363: does *reason* name the "claimed success, wrote nothing"
+    signature — an acceptance-author or plain work session that exited
+    DONE/ADVISORY while its branch carried zero commits?
+
+    Text-matched against the drive's own `drive_exited` reason, the same
+    convention `is_ci_infra_reason`/`is_ci_flaky_reason`/
+    `is_ci_unreadable_reason` in `coord.merge_queue` use to classify a CI
+    status string — not marker-based like `is_permanent_block_reason`,
+    because neither `_die` call site this recognizes embeds a dedicated
+    marker; today nothing reads their reason text for anything but display.
+
+    Two independent shapes, both required to include "no commits" so a
+    death that merely MENTIONS one of the other words in passing does not
+    false-positive:
+
+    * the acceptance-author JIT-slice death (`coord/drive.py:850-865`
+      ADVISORY, `:887-918` DONE) — "acceptance author ... exited
+      (ADVISORY|DONE) ... no commits".
+    * the plain work-row death (`coord/drive.py`'s `_decide_advisory`) —
+      "work ... exited ADVISORY ... no commits ... nothing was pushed".
+
+    Deliberately does NOT match the sibling "work ... finished with no
+    branch — nothing was pushed" reason (`coord/drive.py`'s `_decide`, the
+    'done'-status-with-no-branch arm): that shape never reaches
+    `branch_has_commits` at all, is not one of the two shapes the issue's
+    acceptance criteria name, and has no recorded evidence of its own in
+    `queue-block-log.jsonl` — folding it in unasked would be exactly the
+    un-scoped widening #2230's own docstring warns a naive rule invites.
+    """
+    if not reason:
+        return False
+    lowered = reason.lower()
+    if "no commits" not in lowered:
+        return False
+    if "acceptance author" in lowered and (
+        "exited advisory" in lowered or "exited done" in lowered
+    ):
+        return True
+    return "exited advisory" in lowered and "nothing was pushed" in lowered
+
+
 def _retry_backoff_reason(
     entry: QueueEntry,
     facts: IssueFacts,
@@ -1840,6 +1902,15 @@ def _reconcile_running(
     absent, refused or not — only ever changes the WORDING below; whether the
     entry gets another attempt is otherwise unaffected by #1845/#1844 (still
     ``retry`` until ``max_attempts``, still ``exhausted`` → ``blocked`` after).
+    The ONE exception is #2363: when ``own_reason`` matches
+    :func:`_is_empty_branch_death_reason` — an acceptance-author or work
+    session that exited DONE/ADVISORY claiming success with a zero-commit
+    branch — the ceiling widens to :data:`EMPTY_BRANCH_MAX_ATTEMPTS` instead
+    of the passed-in ``max_attempts``, because that signature's own recorded
+    history (see the constant's comment) shows a 0% self-heal rate inside
+    the default budget. Still finite, still ``exhausted`` → ``blocked`` with
+    the same diagnosis-and-recovery instructions once ITS wider ceiling is
+    also hit.
     """
     facts = board.facts(entry.key)
 
@@ -2128,18 +2199,39 @@ def _reconcile_running(
         else ""
     )
 
+    # #2363: the "claimed success, wrote nothing" signature gets a WIDER
+    # ceiling than every other death reason — see `EMPTY_BRANCH_MAX_ATTEMPTS`
+    # and `_is_empty_branch_death_reason`. `max()` against the passed-in
+    # `max_attempts` rather than an outright override so a caller-supplied
+    # `--max-attempts` larger than the #2363 default is never narrowed.
+    # Additive only: any other reason (including `dispatch_only` above) still
+    # uses the plain `max_attempts` ceiling, unchanged.
+    empty_branch = _is_empty_branch_death_reason(own_reason)
+    effective_max_attempts = (
+        max(max_attempts, EMPTY_BRANCH_MAX_ATTEMPTS) if empty_branch else max_attempts
+    )
+    empty_branch_note = (
+        f" — empty-branch DONE/ADVISORY exit (#2363): widened retry budget, "
+        f"{effective_max_attempts} attempts before blocking instead of the "
+        f"usual {max_attempts}"
+        if empty_branch
+        else ""
+    )
+
     attempts = entry.attempts + 1
-    if attempts < max_attempts:
+    if attempts < effective_max_attempts:
         if own_reason:
             reason = (
-                f"{own_reason} (attempt {attempts}/{max_attempts}) — "
-                f"requeued at position {entry.position}{dispatch_note}"
+                f"{own_reason} (attempt {attempts}/{effective_max_attempts}) — "
+                f"requeued at position {entry.position}"
+                f"{dispatch_note}{empty_branch_note}"
             )
         else:
             reason = (
                 f"drive session died without landing the work"
-                f"{launched} (attempt {attempts}/{max_attempts}) — requeued at "
-                f"position {entry.position}{dispatch_note}"
+                f"{launched} (attempt {attempts}/{effective_max_attempts}) — "
+                f"requeued at position {entry.position}"
+                f"{dispatch_note}{empty_branch_note}"
             )
         return (
             Reconcile(
@@ -2168,14 +2260,14 @@ def _reconcile_running(
 
     if own_reason:
         reason = (
-            f"{own_reason} ({attempts}/{max_attempts} attempts) — giving up"
-            f"{dispatch_note}"
+            f"{own_reason} ({attempts}/{effective_max_attempts} attempts) — "
+            f"giving up{dispatch_note}{empty_branch_note}"
         )
     else:
         reason = (
             f"drive session died without landing the work"
-            f"{launched} {attempts}/{max_attempts} times — giving up"
-            f"{dispatch_note}"
+            f"{launched} {attempts}/{effective_max_attempts} times — giving up"
+            f"{dispatch_note}{empty_branch_note}"
         )
     return (
         Reconcile(entry.key, "exhausted", reason, occupies=False),
