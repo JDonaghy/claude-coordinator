@@ -3186,6 +3186,17 @@ not apply to it.
 - If even the scoped run genuinely cannot finish in time, follow the \
 background-and-poll pattern in the ONE-SHOT section above — do not invent \
 a chunk-and-loop workaround.
+- #2192: check your own diff now — does it change user-visible behavior \
+AND add/modify zero test files? That exact pattern was 18.5% of this \
+repo's blocking reviews (#2132): the code was correct, but CLAUDE.md's \
+"Testing — black-box coverage is the acceptance bar" rule was skipped, so \
+the adversarial reviewer rejected it — costing a paid review leg plus a \
+fix + re-review round trip to catch something you can see for free right \
+now, in this same already-running session. If it fires, add the test \
+before declaring done. If this genuinely is a pure refactor / \
+internal-only change (CLAUDE.md's existing exemption), say so explicitly \
+in your final message instead — that already satisfies the reviewer, no \
+test required.
 
 #252: before exiting, emit a SMOKE_TESTS block telling the human what to \
 manually verify.  You changed the code; you know what's worth poking.

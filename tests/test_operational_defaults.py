@@ -126,6 +126,32 @@ def test_worker_system_prompt_hard_rules_unchanged_by_graph_instruction() -> Non
     )
 
 
+# ── #2192: free pre-review "missing test" self-check ─────────────────────────
+
+
+def test_worker_system_prompt_contains_missing_test_self_check() -> None:
+    """#2192: #2132 measured 18.5% (5/27) of this repo's blocking reviews as
+    "missing required black-box test only" — code that was correct, but
+    shipped a user-visible diff with zero test files, a rule CLAUDE.md
+    already states. Catching that in the worker's own already-running
+    session is free (no new paid leg); the reviewer catching it costs a
+    full review + fix + re-review round trip. The self-check must live in
+    the "Before declaring done" checklist, name the CLAUDE.md rule, and
+    preserve the existing pure-refactor/internal-only escape hatch (say so
+    in the final message) rather than re-litigating it."""
+    assert "Before declaring done" in WORKER_SYSTEM_PROMPT
+    flat = " ".join(WORKER_SYSTEM_PROMPT.split())
+    assert "#2192" in flat
+    assert "change user-visible behavior AND add/modify zero test files" in flat
+    assert "18.5%" in flat
+    assert "#2132" in flat
+    assert (
+        "pure refactor / internal-only change (CLAUDE.md's existing exemption)"
+        in flat
+    )
+    assert "say so explicitly in your final message" in flat
+
+
 # ── #2212: graphify-invocation counter (measurability) ──────────────────────
 
 

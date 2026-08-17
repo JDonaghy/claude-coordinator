@@ -611,6 +611,94 @@ def test_diff_paths_outside_sealed_empty_when_fully_contained() -> None:
     assert _diff_paths_outside_sealed(diff, ["tests/acceptance/"]) == []
 
 
+# ── #2192: free pre-review "missing test" nudge ─────────────────────────────
+
+
+def test_diff_missing_test_coverage_flags_user_visible_diff_with_no_tests() -> None:
+    """Target pattern (#2132: 5/27 blocking reviews, 18.5%): a diff that
+    changes user-visible source but ships zero test files must flag."""
+    from coord.review import diff_missing_test_coverage
+
+    diff = (
+        "diff --git a/coord/dashboard/server.py b/coord/dashboard/server.py\n"
+        "--- a/coord/dashboard/server.py\n"
+        "+++ b/coord/dashboard/server.py\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+def new_endpoint():\n"
+        "+    return 'ok'\n"
+    )
+    assert diff_missing_test_coverage(diff) is True
+
+
+def test_diff_missing_test_coverage_no_flag_when_test_file_added() -> None:
+    """Same diff, plus a test file — must not flag."""
+    from coord.review import diff_missing_test_coverage
+
+    diff = (
+        "diff --git a/coord/dashboard/server.py b/coord/dashboard/server.py\n"
+        "--- a/coord/dashboard/server.py\n"
+        "+++ b/coord/dashboard/server.py\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+def new_endpoint():\n"
+        "+    return 'ok'\n"
+        "diff --git a/tests/test_server.py b/tests/test_server.py\n"
+        "--- a/tests/test_server.py\n"
+        "+++ b/tests/test_server.py\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+def test_new_endpoint():\n"
+        "+    assert True\n"
+    )
+    assert diff_missing_test_coverage(diff) is False
+
+
+def test_diff_missing_test_coverage_no_flag_for_internal_only_diff() -> None:
+    """Pure-refactor/internal-only diff (CLAUDE.md's existing exemption): a
+    diff touching only docs/scripts/deploy — never shipped user-visible
+    source — must not flag, honoring the exemption a pure path check can see."""
+    from coord.review import diff_missing_test_coverage
+
+    diff = (
+        "diff --git a/docs/ARCHITECTURE.md b/docs/ARCHITECTURE.md\n"
+        "--- a/docs/ARCHITECTURE.md\n"
+        "+++ b/docs/ARCHITECTURE.md\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+Some clarifying prose.\n"
+        "diff --git a/scripts/drive-batch.sh b/scripts/drive-batch.sh\n"
+        "--- a/scripts/drive-batch.sh\n"
+        "+++ b/scripts/drive-batch.sh\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+echo tidy\n"
+    )
+    assert diff_missing_test_coverage(diff) is False
+
+
+def test_diff_missing_test_coverage_no_flag_for_empty_diff() -> None:
+    from coord.review import diff_missing_test_coverage
+
+    assert diff_missing_test_coverage(None) is False
+    assert diff_missing_test_coverage("") is False
+
+
+def test_diff_missing_test_coverage_recognizes_in_crate_rust_test_dir() -> None:
+    """Nested test dirs (e.g. tui/tests/) must count as a test file, not
+    just a repo-root tests/ prefix."""
+    from coord.review import diff_missing_test_coverage
+
+    diff = (
+        "diff --git a/tui/src/app.rs b/tui/src/app.rs\n"
+        "--- a/tui/src/app.rs\n"
+        "+++ b/tui/src/app.rs\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+pub fn new_thing() {}\n"
+        "diff --git a/tui/tests/acceptance.rs b/tui/tests/acceptance.rs\n"
+        "--- a/tui/tests/acceptance.rs\n"
+        "+++ b/tui/tests/acceptance.rs\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+mod new_thing_test;\n"
+    )
+    assert diff_missing_test_coverage(diff) is False
+
+
 def test_briefing_test_author_touching_only_sealed_path_no_tamper() -> None:
     """#1175 acceptance criterion 1: a type="test-author" PR that touches only
     tests/acceptance/ms-NN/ must NOT trip mandatory request-changes — writing
@@ -1749,6 +1837,94 @@ def test_dispatch_review_patch_id_hashes_untruncated_diff(
     _, payload = client.calls[0]
     assert "[diff truncated at 60000 chars]" in payload["briefing"]
     assert len(payload["briefing"]) < len(big_diff)
+
+
+def test_dispatch_review_logs_missing_test_coverage_but_still_dispatches(
+    two_machine_config: Config, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#2192: the free pre-review nudge must fire (logged) for a diff that
+    touches user-visible source with zero test files, AND dispatch must
+    proceed exactly as it would otherwise — the flag never blocks. A false
+    positive here must never cost a round trip, so nothing about the
+    dispatch outcome may depend on it."""
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    client = _FakeHTTPClient({"id": "notest-review-1"})
+    diff = (
+        "diff --git a/coord/dashboard/server.py b/coord/dashboard/server.py\n"
+        "--- a/coord/dashboard/server.py\n"
+        "+++ b/coord/dashboard/server.py\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+def new_endpoint():\n"
+        "+    return 'ok'\n"
+    )
+
+    with caplog.at_level("INFO", logger="coord.review"):
+        result = dispatch_review(
+            completed, board, two_machine_config,
+            http_client=client,
+            pr_lookup=lambda repo_github, **kw: {
+                "number": 21, "url": "https://github.com/acme/api/pull/21", "existed": True,
+            },
+            claude_md_reader=lambda p: "",
+            issue_body_fetcher=lambda repo, num: "",
+            remote_branch_checker=lambda repo, branch: True,
+            diff_fetcher=lambda repo, num, **kw: diff,
+        )
+
+    # Dispatch proceeds exactly as normal: a review assignment is returned
+    # and exactly one review POST goes out.
+    assert result is not None
+    assert len(client.calls) == 1
+
+    # The nudge fired — visible in the coordinator's own log, not the
+    # reviewer's briefing (the reviewer's prompt is untouched by this check).
+    assert any(
+        "missing test only" in rec.message for rec in caplog.records
+    ), caplog.text
+    _, payload = client.calls[0]
+    assert "missing test only" not in payload["briefing"]
+
+
+def test_dispatch_review_no_missing_test_log_when_test_file_included(
+    two_machine_config: Config, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Same shape diff, but with a test file included — the nudge must stay
+    silent, and dispatch must proceed identically either way."""
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    client = _FakeHTTPClient({"id": "hastest-review-1"})
+    diff = (
+        "diff --git a/coord/dashboard/server.py b/coord/dashboard/server.py\n"
+        "--- a/coord/dashboard/server.py\n"
+        "+++ b/coord/dashboard/server.py\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+def new_endpoint():\n"
+        "+    return 'ok'\n"
+        "diff --git a/tests/test_server.py b/tests/test_server.py\n"
+        "--- a/tests/test_server.py\n"
+        "+++ b/tests/test_server.py\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+def test_new_endpoint():\n"
+        "+    assert True\n"
+    )
+
+    with caplog.at_level("INFO", logger="coord.review"):
+        result = dispatch_review(
+            completed, board, two_machine_config,
+            http_client=client,
+            pr_lookup=lambda repo_github, **kw: {
+                "number": 22, "url": "https://github.com/acme/api/pull/22", "existed": True,
+            },
+            claude_md_reader=lambda p: "",
+            issue_body_fetcher=lambda repo, num: "",
+            remote_branch_checker=lambda repo, branch: True,
+            diff_fetcher=lambda repo, num, **kw: diff,
+        )
+
+    assert result is not None
+    assert len(client.calls) == 1
+    assert not any("missing test only" in rec.message for rec in caplog.records)
 
 
 def test_dispatch_review_handles_http_failure_gracefully(
