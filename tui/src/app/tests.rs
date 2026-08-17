@@ -47846,6 +47846,13 @@ Milestone tracking issue.
     /// all: a 30-issue board in a 20-row terminal leaves #130's row below the
     /// fold; clicking #130's tab in the strip must scroll the sidebar until
     /// the row (with its `▸` active-document marker) is actually painted.
+    ///
+    /// §2f's pinned mechanism is tree WINDOWING, not whole-panel scroll: the
+    /// `⌕ Filter issues…` box "stays fixed at the top of the sidebar
+    /// regardless of scroll state", and the rows scrolled out collapse into a
+    /// single `⋮ N more above` marker row inside the tree. Both halves are
+    /// asserted below — they are exactly what `set_panel_scroll` alone gets
+    /// wrong (it scrolls the filter box off first).
     #[test]
     fn activating_a_doc_tab_scrolls_its_offscreen_sidebar_row_into_view() {
         use quadraui::tui::testing::driver_with_shell;
@@ -47895,6 +47902,23 @@ Milestone tracking issue.
         assert!(
             !driver.screen_contains("#101  Task"),
             "#101's sidebar row scrolled off the top — the panel really moved:\n{}",
+            driver.screen()
+        );
+        // §2f's mechanism, not just its outcome: the tree is WINDOWED — the
+        // scrolled-out rows collapse into a `⋮ N more above` marker row…
+        assert!(
+            driver.screen_contains("more above"),
+            "#2282 §2f: the scrolled-out rows collapse into a `⋮ N more above` \
+             marker row inside the tree:\n{}",
+            driver.screen()
+        );
+        // …while the FILTER box keeps its pinned spot at the top of the
+        // sidebar (contract §2f: it \"stays fixed at the top of the sidebar
+        // regardless of scroll state\") — the panel itself never scrolled.
+        assert!(
+            driver.screen_contains("Filter issues"),
+            "#2282 §2f: the `⌕ Filter issues…` box stays fixed at the top — \
+             reveal must window the tree, not scroll the whole panel:\n{}",
             driver.screen()
         );
     }

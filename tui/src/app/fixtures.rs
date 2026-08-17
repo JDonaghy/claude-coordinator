@@ -70,6 +70,7 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         board_epic_row_keys: std::collections::HashMap::new(),
         doc_tabs: DocTabs::default(),
         board_section_rows: Vec::new(),
+        board_tree_hidden_above: std::collections::HashMap::new(),
         last_sidebar_geom: std::cell::Cell::new(None),
         pipeline_sidebar,
         pipeline_repo_names: Vec::new(),

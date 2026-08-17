@@ -2073,6 +2073,18 @@ pub struct CoordApp {
     /// Sections whose body is a `Form` (the FILTER box) hold an empty vec —
     /// their height comes from the form's field count instead.
     board_section_rows: Vec<Vec<(TreePath, bool)>>,
+    /// #2282 (ms-65 §2f): per-repo tree windowing for reveal-on-activate.
+    ///
+    /// Contract §2f pins that the `⌕ Filter issues…` box "stays fixed at the
+    /// top of the sidebar regardless of scroll state" — so reveal must NOT
+    /// lean on `set_panel_scroll` (`ScrollMode::WholePanel` scrolls the form
+    /// off first). Instead the revealed repo's own tree is windowed: the
+    /// value here is how many leading emitted rows of that repo's section are
+    /// collapsed into a single `⋮ N more above` marker row, computed by
+    /// [`Self::board_reveal_hidden_count`] so the target row lands inside the
+    /// viewport with the panel unscrolled. Absent key ⇒ no windowing.
+    /// (quadraui#595's `SidebarSystem::reveal` will subsume this once landed.)
+    board_tree_hidden_above: std::collections::HashMap<String, usize>,
     /// #2282 (ms-65 §2f): the Board sidebar tree's last-painted geometry —
     /// `(rect, line_height, msv_header_size)`.
     ///
@@ -3713,6 +3725,7 @@ impl CoordApp {
             board_epic_row_keys: std::collections::HashMap::new(),
             doc_tabs: DocTabs::default(),
             board_section_rows: Vec::new(),
+            board_tree_hidden_above: std::collections::HashMap::new(),
             last_sidebar_geom: std::cell::Cell::new(None),
             pipeline_sidebar,
             pipeline_repo_names: Vec::new(),
@@ -6164,7 +6177,7 @@ impl CoordApp {
         for (cache_idx, (repo, _issues)) in grouped.iter().enumerate() {
             let section_idx = cache_idx + offset;
 
-            let (total, rows): (usize, Vec<TreeRow>) = {
+            let (total, mut rows): (usize, Vec<TreeRow>) = {
                 // Compute milestone-grouped data for this repo.
                 // milestones holds &IssueGroup refs; it must be dropped before
                 // any &mut self borrow (sidebar mutations) below.
@@ -6311,6 +6324,46 @@ impl CoordApp {
                 // milestones dropped here — &self borrow released.
                 (total, rows)
             };
+
+            // #2282 (ms-65 §2f): reveal-on-activate tree windowing. When
+            // `reveal_board_active_doc` decided this repo's tree must start
+            // part-way down for the active document's row to fit the
+            // viewport, the hidden leading rows are collapsed into a single
+            // `⋮ N more above` marker row — the whole panel stays unscrolled
+            // so the FILTER box keeps its pinned spot at the top (§2f).
+            // Clamped so the marker never swallows the entire tree; the kept
+            // rows retain their original `TreePath`s, so selection and click
+            // routing are untouched. The marker's `u16::MAX` path can never
+            // collide with a real milestone index, and every handler that
+            // resolves paths through `board_milestones_for_repo` treats the
+            // failed lookup as a no-op.
+            let hidden = self
+                .board_tree_hidden_above
+                .get(repo)
+                .copied()
+                .unwrap_or(0)
+                .min(rows.len().saturating_sub(1));
+            if hidden > 0 {
+                rows.drain(..hidden);
+                rows.insert(
+                    0,
+                    TreeRow {
+                        path: vec![u16::MAX],
+                        indent: 1,
+                        icon: None,
+                        text: StyledText {
+                            spans: vec![StyledSpan::with_fg(
+                                format!("⋮ {hidden} more above"),
+                                Color::rgb(120, 120, 140),
+                            )],
+                        },
+                        badge: None,
+                        is_expanded: None,
+                        decoration: Decoration::Normal,
+                        edit: None,
+                    },
+                );
+            }
 
             // Phase 2: apply mutations now that milestones is dropped.
             if total > 0 {
@@ -6771,19 +6824,22 @@ impl CoordApp {
     }
 
     /// Activate the Board tab at strip index `idx` (a click on the strip
-    /// itself). Returns `true` when anything changed.
+    /// itself). Returns `true` when the click landed on a real tab — not
+    /// merely when the active index moved, because the unconditional reveal
+    /// below can change sidebar state (selection, tree window) even for a
+    /// re-activation, and the caller uses this bool as its redraw signal.
     fn activate_board_doc_tab(&mut self, idx: usize) -> bool {
         if idx >= self.board_doc_tabs().tabs().len() {
             return false;
         }
-        let changed = self.doc_tabs.group_mut(PanelScope::Board).activate_index(idx);
+        self.doc_tabs.group_mut(PanelScope::Board).activate_index(idx);
         // Reveal unconditionally, not just when the active index moved:
         // contract §2f says activating a tab "by any path" reveals its row,
         // and re-activating the already-active tab is exactly how a user asks
         // to be taken back to a document they have navigated away from in the
         // tree. Gating on `changed` would make that click a silent no-op.
         self.reveal_board_active_doc();
-        changed
+        true
     }
 
     /// Contract §2f — reveal-on-activate.
@@ -6797,11 +6853,106 @@ impl CoordApp {
             return;
         };
         self.expand_board_milestone_for(&repo, number);
+        // Drop any previous windowing first: the hidden-row count below must
+        // be recomputed against the FULL row list (a stale window would both
+        // skew `board_section_rows` and double-count its own marker row).
         // The `▸` active-document marker is baked into the row text, so the
-        // tree has to be rebuilt for the marker to move.
+        // tree has to be rebuilt for the marker to move anyway.
+        self.board_tree_hidden_above.remove(&repo);
         self.rebuild_board_sidebar();
         self.select_issue(&repo, number);
+        // §2f scroll-into-view, without moving the whole panel: the FILTER
+        // box is pinned to the top of the sidebar, so the reveal windows the
+        // repo's own tree (leading rows collapse into a `⋮ N more above`
+        // marker) rather than calling `set_panel_scroll`.
+        self.board_sidebar.set_panel_scroll(0.0);
+        let hidden = self.board_reveal_hidden_count();
+        if hidden > 0 {
+            self.board_tree_hidden_above.insert(repo.clone(), hidden);
+            self.rebuild_board_sidebar();
+            self.select_issue(&repo, number);
+            self.board_sidebar.set_panel_scroll(0.0);
+        }
+        // Degenerate fallback (windowing alone cannot lift the row above the
+        // fold when the sections ABOVE the target repo already overflow the
+        // viewport): minimal whole-panel scroll. No-op whenever the windowed
+        // row is already visible — i.e. in every §2f-shaped layout.
         self.scroll_board_selection_into_view();
+    }
+
+    /// §2f windowing arithmetic: how many leading rows of the active
+    /// section's tree must collapse into the `⋮ N more above` marker for the
+    /// currently-selected row's bottom edge to sit inside the viewport with
+    /// the panel unscrolled. `0` ⇒ the row already fits un-windowed. Uses the
+    /// same reconstructed row model as [`Self::scroll_board_selection_into_view`]
+    /// (quadraui#595's `SidebarSystem::reveal` will replace both once landed).
+    fn board_reveal_hidden_count(&self) -> usize {
+        let Some((rect, lh, header_size)) = self.last_sidebar_geom.get() else {
+            return 0;
+        };
+        if rect.height <= 0.0 || lh <= 0.0 {
+            return 0;
+        }
+        let Some(section) = self.board_sidebar.active_section() else {
+            return 0;
+        };
+        let Some(path) = self.board_sidebar.selected_path(section) else {
+            return 0;
+        };
+        if !self.board_sidebar.is_section_visible(section) {
+            return 0;
+        }
+
+        // Fixed content above the target section's body (panel scroll 0).
+        let mut base = 0.0_f32;
+        for s in 0..section {
+            if !self.board_sidebar.is_section_visible(s) {
+                continue;
+            }
+            base += header_size + self.board_section_content_height(s, lh);
+        }
+        base += header_size;
+
+        let Some(rows) = self.board_section_rows.get(section) else {
+            return 0;
+        };
+        let mut heights = Vec::with_capacity(rows.len());
+        let mut target = None;
+        for (i, (row_path, is_header)) in rows.iter().enumerate() {
+            heights.push(Self::board_row_height(lh, *is_header));
+            if row_path == path {
+                target = Some(i);
+            }
+        }
+        let Some(t) = target else {
+            return 0;
+        };
+        // prefix[i] = summed height of rows[..i].
+        let mut prefix = Vec::with_capacity(heights.len() + 1);
+        let mut acc = 0.0_f32;
+        prefix.push(0.0);
+        for h in &heights {
+            acc += h;
+            prefix.push(acc);
+        }
+        let marker_h = Self::board_row_height(lh, false);
+        // Bottom edge of the target row when the first `h` rows are hidden
+        // behind the (one-row) marker.
+        let bottom_of = |h: usize| -> f32 {
+            let marker = if h > 0 { marker_h } else { 0.0 };
+            base + marker + (prefix[t] - prefix[h]) + heights[t]
+        };
+        if bottom_of(0) <= rect.height {
+            return 0;
+        }
+        for h in 1..=t {
+            if bottom_of(h) <= rect.height {
+                return h;
+            }
+        }
+        // Even maximal windowing leaves the row below the fold; hide all we
+        // can and let the caller's panel-scroll fallback cover the rest.
+        t
     }
 
     /// Force the milestone group containing `(repo, number)` open, so that
