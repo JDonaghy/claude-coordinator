@@ -34,6 +34,21 @@ DISABLED_CONFIG_YAML = textwrap.dedent("""
         repos: [coord]
 """)
 
+ENV_VAR_CONFIG_YAML = textwrap.dedent("""
+    repos:
+      - name: coord
+        github: owner/coord
+    machines:
+      - name: dellserver
+        host: dellserver
+        repos: [coord]
+    portal:
+      enabled: true
+      base_url: https://intake.heurontech.com
+      bridge_client_id: ${BRIDGE_CLIENT_ID}
+      bridge_client_secret: ${BRIDGE_CLIENT_SECRET}
+""")
+
 
 @pytest.fixture
 def config_path(tmp_path):
@@ -46,6 +61,19 @@ def config_path(tmp_path):
 def disabled_config_path(tmp_path):
     path = tmp_path / "coordinator.yml"
     path.write_text(DISABLED_CONFIG_YAML)
+    return str(path)
+
+
+@pytest.fixture
+def env_var_config_path(tmp_path, monkeypatch):
+    # #2336: BRIDGE_CLIENT_ID/BRIDGE_CLIENT_SECRET deliberately left unset in
+    # this shell — mirrors a manual `ssh dellserver` session that never
+    # sourced ~/.coord/coord-serve.env, unlike the coord-serve systemd unit's
+    # EnvironmentFile=.
+    monkeypatch.delenv("BRIDGE_CLIENT_ID", raising=False)
+    monkeypatch.delenv("BRIDGE_CLIENT_SECRET", raising=False)
+    path = tmp_path / "coordinator.yml"
+    path.write_text(ENV_VAR_CONFIG_YAML)
     return str(path)
 
 
@@ -80,6 +108,23 @@ def test_status_reports_enabled_and_credentials(config_path):
     assert "ENABLED" in result.output
     assert "intake.heurontech.com" in result.output
     assert "credentials=set" in result.output
+
+
+def test_status_reports_credentials_missing_for_unexpanded_env_var(env_var_config_path):
+    """#2336: portal.bridge_client_id/secret are non-empty '${VAR}' strings,
+    but the env var was never set in this shell — credentials_set must be
+    false, not true just because the placeholder text itself is non-empty."""
+    result = run("portal", "status", "--config", env_var_config_path, "--json")
+    assert result.exit_code == 0, result.output
+    assert '"credentials_set": false' in result.output
+
+
+def test_status_reports_credentials_set_once_env_var_resolves(env_var_config_path, monkeypatch):
+    monkeypatch.setenv("BRIDGE_CLIENT_ID", "id-from-env")
+    monkeypatch.setenv("BRIDGE_CLIENT_SECRET", "secret-from-env")
+    result = run("portal", "status", "--config", env_var_config_path, "--json")
+    assert result.exit_code == 0, result.output
+    assert '"credentials_set": true' in result.output
 
 
 def test_heartbeat_refuses_when_disabled(disabled_config_path):
@@ -260,3 +305,58 @@ def test_requeue_reports_an_unknown_row_cleanly():
     result = run("portal", "requeue", "sub_1", "1")
     assert result.exit_code != 0
     assert "no outbox row" in result.output
+
+
+# ── #2336: state-touching commands refuse to run on a thin client ──────────
+
+
+@pytest.fixture
+def thin_client(monkeypatch):
+    """Simulate running on a machine with board_service configured — i.e. a
+    thin client, per coord/client.py's resolve_board_service() bootstrap
+    contract (flag > env > ~/.coord/client.toml)."""
+    monkeypatch.setenv("COORD_SERVICE_URL", "http://dellserver:7435")
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("portal", "sync"),
+        ("portal", "outbox"),
+        ("portal", "events"),
+        ("portal", "enqueue-status", "sub_1", "shipped"),
+        ("portal", "enqueue-design-round", "sub_1", "{}"),
+        ("portal", "enqueue-question", "sub_1", "why?"),
+        ("portal", "requeue", "sub_1", "1"),
+    ],
+)
+def test_state_touching_commands_refuse_on_a_thin_client(thin_client, args):
+    result = run(*args)
+    assert result.exit_code != 0
+    assert "must run on the daemon host" in result.output
+    assert "dellserver" in result.output
+
+
+def test_status_heartbeat_and_push_do_not_call_the_thin_client_guard(thin_client):
+    """status/heartbeat/push never touch the local DB, so they must not be
+    gated by the #2336 guard — only sync/outbox/events/enqueue-*/requeue call
+    _refuse_if_thin_client. (A full CLI invocation isn't used here: setting
+    COORD_SERVICE_URL also reroutes _load_config's own config fetch to the
+    daemon per #1080, which is unrelated to this guard and would make the
+    assertion about a network error rather than about this guard.)"""
+    import coord.commands.portal as portal_mod
+
+    calls = []
+    real_guard = portal_mod._refuse_if_thin_client
+
+    def _tracking_guard(cmd_name):
+        calls.append(cmd_name)
+        return real_guard(cmd_name)
+
+    portal_mod._refuse_if_thin_client = _tracking_guard
+    try:
+        result = run("portal", "heartbeat", "--config", "/does/not/exist.yml")
+    finally:
+        portal_mod._refuse_if_thin_client = real_guard
+    assert result.exit_code != 0  # fails for an unrelated reason (bad --config)
+    assert calls == []

@@ -17,10 +17,16 @@ operator see and drive it without waiting for a tick:
 * ``requeue`` revives a row the drain retired after burning its retry budget.
 
 The state-touching commands (``sync``, ``outbox``, ``events``, ``enqueue-*``,
-``requeue``)
-read and write the daemon's own ``~/.coord/coord.db`` and are therefore
-**daemon-host commands**. Run from a thin client they operate on that box's
-empty local DB, which is not where the bridge lives.
+``requeue``) read and write the daemon's own ``~/.coord/coord.db`` and are
+therefore **daemon-host commands**. Run from a thin client they used to silently
+operate on that box's empty local DB, which is not where the bridge lives —
+producing a normal-looking "nothing pending" instead of an error (#2336).
+Every one of them now calls :func:`_refuse_if_thin_client` first, which
+raises a loud, explicit error instead when ``board_service`` is configured
+(i.e. this machine is a thin client per ``coord/client.py``'s bootstrap
+contract) rather than silently reading the wrong box's empty tables. There is
+no daemon-proxy for these yet (Option A in #2336 — a bigger lift, left for a
+follow-up); this is the "fail loud instead of running wrong" half.
 """
 
 from __future__ import annotations
@@ -30,11 +36,48 @@ import json
 import click
 
 from coord.commands._common import _CONFIG_OPTION, _load_config
+from coord.config import has_unexpanded_env_var
 from coord.portal_bridge import (
     PortalBridgeError,
     SUBMISSION_STATUSES,
     client_from_config,
 )
+
+
+def _refuse_if_thin_client(cmd_name: str) -> None:
+    """Refuse *cmd_name* when this machine isn't the daemon host (#2336).
+
+    ``sync``/``outbox``/``events``/``enqueue-*``/``requeue`` read and write
+    the daemon's own ``~/.coord/coord.db`` directly — there is no daemon
+    proxy for portal state yet (unlike ``coord status``/``coord log``/etc,
+    which already route through ``board_service`` when it's configured; see
+    ``coord/client.py``'s module docstring for the bootstrap contract). Run
+    on a machine that has ``board_service`` set in ``~/.coord/client.toml``
+    (a thin client, by definition — every other machine in the fleet that
+    isn't the daemon host), these commands would read/write that machine's
+    own empty local DB and report a normal-looking, silently wrong result
+    (2026-08-16 incident: a customer ``signoff.approved`` event sat
+    unnoticed on the daemon host for over an hour because every portal
+    command run from a thin client reported nothing pending).
+
+    Mirrors the identical guard already used for the same reason in
+    ``coord.commands.drive_queue``'s ``diagnose`` command (#615/#906).
+    """
+    from coord.client import resolve_board_service  # noqa: PLC0415
+
+    svc = resolve_board_service()
+    if svc is None:
+        return
+    from urllib.parse import urlparse  # noqa: PLC0415
+
+    host = urlparse(svc.url).hostname or svc.url
+    raise click.ClickException(
+        f"coord portal {cmd_name} must run on the daemon host ({host}) — "
+        "this machine's ~/.coord/coord.db is not where the bridge lives "
+        "(board_service is configured in ~/.coord/client.toml, making this "
+        "a thin client). Run it over `ssh` on the daemon host instead. "
+        "See coord/skills/portal-followup/SKILL.md."
+    )
 
 
 @click.group("portal")
@@ -48,10 +91,20 @@ def portal_group() -> None:
 def portal_status(config_path, as_json: bool) -> None:
     """Show whether the portal bridge is configured, without sending anything."""
     cfg = _load_config(config_path).portal
+    # #2336: a non-empty-string check alone can't tell "resolved to a real
+    # secret" from "the ${VAR} placeholder was never expanded because the
+    # env var wasn't set in this shell" — both are non-empty strings. Reject
+    # either credential if it still carries an unexpanded placeholder.
+    credentials_set = bool(
+        cfg.bridge_client_id
+        and cfg.bridge_client_secret
+        and not has_unexpanded_env_var(cfg.bridge_client_id)
+        and not has_unexpanded_env_var(cfg.bridge_client_secret)
+    )
     payload = {
         "enabled": cfg.enabled,
         "base_url": cfg.base_url,
-        "credentials_set": bool(cfg.bridge_client_id and cfg.bridge_client_secret),
+        "credentials_set": credentials_set,
         "timeout_secs": cfg.timeout_secs,
         "max_retries": cfg.max_retries,
     }
@@ -151,6 +204,8 @@ def portal_sync_once(config_path, as_json: bool) -> None:
 
     Daemon-host command: it reads and writes the daemon's ~/.coord/coord.db.
     """
+    _refuse_if_thin_client("sync")
+
     from coord import portal_sync as _sync  # noqa: PLC0415
 
     config = _load_config(config_path)
@@ -198,6 +253,8 @@ def portal_outbox(as_json: bool, show_all: bool) -> None:
     refusing to announce something to the customer before the thing it
     announces has been confirmed applied.
     """
+    _refuse_if_thin_client("outbox")
+
     from coord import portal_store  # noqa: PLC0415
     from coord.portal_sync import ordering_block_reason  # noqa: PLC0415
 
@@ -277,6 +334,8 @@ def portal_outbox(as_json: bool, show_all: bool) -> None:
 @click.option("--limit", type=int, default=20, show_default=True)
 def portal_events(as_json: bool, limit: int) -> None:
     """List pulled, not-yet-consumed customer events (the inbound half)."""
+    _refuse_if_thin_client("events")
+
     from coord import portal_store  # noqa: PLC0415
 
     events = portal_store.unhandled_events(limit=limit)
@@ -315,6 +374,8 @@ def portal_enqueue_status(submission_id: str, status: str) -> None:
     that would summon the customer to an empty screen — `awaiting-signoff`
     with no design round queued, `needs-input` with no question (#835).
     """
+    _refuse_if_thin_client("enqueue-status")
+
     from coord.portal_sync import PortalSyncError, enqueue_status  # noqa: PLC0415
 
     try:
@@ -338,6 +399,8 @@ def portal_enqueue_design_round(submission_id: str, payload_json: str) -> None:
     expected to carry whatever reference the customer's browser follows, plus
     a `round` number if this is not the first.
     """
+    _refuse_if_thin_client("enqueue-design-round")
+
     from coord.portal_sync import PortalSyncError, enqueue_design_round  # noqa: PLC0415
 
     try:
@@ -361,6 +424,8 @@ def portal_enqueue_design_round(submission_id: str, payload_json: str) -> None:
 @click.argument("question")
 def portal_enqueue_question(submission_id: str, question: str) -> None:
     """Queue an open question for SUBMISSION_ID (sent on the next sync)."""
+    _refuse_if_thin_client("enqueue-question")
+
     from coord.portal_sync import PortalSyncError, enqueue_question  # noqa: PLC0415
 
     try:
@@ -389,6 +454,8 @@ def portal_requeue(submission_id: str, seq: int) -> None:
 
     Find the seq with `coord portal outbox --all`.
     """
+    _refuse_if_thin_client("requeue")
+
     from coord import portal_store  # noqa: PLC0415
 
     row = portal_store.requeue(submission_id, seq)
