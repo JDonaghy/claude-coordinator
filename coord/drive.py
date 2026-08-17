@@ -108,7 +108,11 @@ from coord.interactive import (
     tmux_session_alive,
 )
 from coord.dead_end import DeadEnd, detect_dead_end
-from coord.failure_class import classify_failure, plan_usage_limit_resume
+from coord.failure_class import (
+    classify_failure,
+    environmental_backoff_secs,
+    plan_usage_limit_resume,
+)
 from coord.models import DELIVERABLE_ANALYSIS_LABEL, POLICY_REFUSAL_MARKER
 from coord.usage_limits import PlanLimits, evaluate_usage_gate, get_plan_limits
 # Lost in the #1584-onto-#1590 rebase: _decide_review() calls this, but the
@@ -201,6 +205,19 @@ class DriveError(Exception):
 # untruncated bytes for local, on-host debugging.
 _CAPTURED_OUTPUT_LIMIT = 4000
 
+# #2360: attempt budget for a WORK-stage failure `coord.failure_class.
+# classify_failure` calls environmental (a Claude API 5xx, a dropped
+# connection, an overload — the module's own allow-listed signals), as
+# opposed to `DriveOptions.max_work_retries` (default 1: one retry, two
+# attempts total), which stays the tight budget for a genuine code defect.
+# #2335: a work assignment died on an auth hiccup, its one flat retry died
+# too, and the drive-queue entry sat `blocked` for ~19h — confirmed
+# transient after the fact (the same machine ran dozens of clean sessions in
+# that window). `max()` against `opts.max_work_retries` at the call site
+# means a run configured with a bigger flat budget than this default is
+# never *tightened* for the environmental case.
+_ENVIRONMENTAL_WORK_RETRY_BUDGET = 5
+
 
 def _bounded_tail(text: str, limit: int = _CAPTURED_OUTPUT_LIMIT) -> str:
     """*text*, or its last *limit* characters if longer — the tail, because
@@ -264,6 +281,15 @@ class DriveCounters:
     """Bounds on every retry loop.  Unbounded merge retries was a real bug."""
 
     work_retries: int = 0
+    # #2360: one-shot latch for the environmental WORK-stage backoff — the
+    # 1-based attempt number (`work_retries + 1`) `_decide_work` has already
+    # returned a backoff WAIT for. `-1` means "no backoff pending". Mirrors
+    # `review_fix_dispatched_for`'s shape below: without it, a board that
+    # hasn't changed yet (nothing was dispatched during the wait) would make
+    # `decide()` re-issue the SAME backoff WAIT forever instead of, once the
+    # sleep it already returned has elapsed, falling through to the actual
+    # `coord retry` for that attempt.
+    work_environmental_backoff_attempt: int = -1
     # ONE budget for BOTH fix arms (#1692): a failed test and a
     # request-changes review are two shapes of the same "the work needs
     # another round" loop, and a drive that spends three rounds bouncing
@@ -1507,13 +1533,25 @@ def decide(
 
     # ---- work failed: bounded retry ----------------------------------------
     if state.work_status == "failed":
-        if counters.work_retries >= opts.max_work_retries:
-            # #1590 part 6: name the actual cause. "failed 3 retries in: <prose>"
-            # sent the morning triage looking at the work even when the provider
-            # was the problem; the class is now stated up front.
-            classification = classify_failure(
-                failure_reason=state.work_failure_reason or None
-            )
+        # #1590 part 6: name the actual cause. "failed 3 retries in: <prose>"
+        # sent the morning triage looking at the work even when the provider
+        # was the problem; the class is now stated up front.
+        classification = classify_failure(
+            failure_reason=state.work_failure_reason or None
+        )
+        # #2360: an environmental failure (already established NOT a usage
+        # limit — that branch returned above) gets a wider budget than a
+        # genuine code defect, reusing the same classifier the usage-limit
+        # check just above already trusts. A NON-environmental failure keeps
+        # today's flat `opts.max_work_retries` budget completely unchanged —
+        # this is not a general increase to retry counts, only a widening
+        # scoped to `classification.is_environmental`.
+        budget = (
+            max(opts.max_work_retries, _ENVIRONMENTAL_WORK_RETRY_BUDGET)
+            if classification.is_environmental
+            else opts.max_work_retries
+        )
+        if counters.work_retries >= budget:
             return _die(
                 f"work {state.work_aid} failed {counters.work_retries} retr(ies) in: "
                 f"{state.work_failure_reason or 'no reason recorded'}\n"
@@ -1521,12 +1559,35 @@ def decide(
                 f"   inspect: coord log {state.work_aid} --machine "
                 f"{state.work_machine or machine}"
             )
-        counters.work_retries += 1
+        attempt = counters.work_retries + 1
+        if (
+            classification.is_environmental
+            and counters.work_environmental_backoff_attempt != attempt
+        ):
+            # Back off ONCE per attempt number before spending it (the same
+            # `environmental_backoff_secs` exponential curve #1590/#2275
+            # proved for the Test-stage worker-death path) — the latch means
+            # the NEXT poll, once this sleep has actually elapsed, falls
+            # through to the real `coord retry` below instead of returning
+            # the same backoff WAIT forever against a board that has not
+            # changed (nothing was dispatched during the wait).
+            counters.work_environmental_backoff_attempt = attempt
+            wait = environmental_backoff_secs(attempt)
+            return Action(
+                kind=WAIT,
+                label=(
+                    f"WORK: {state.work_aid} failed environmentally — "
+                    f"backing off {int(wait)}s before retry {attempt}/{budget}"
+                ),
+                sleep_after=wait,
+                warnings=(f"{classification.reason} (#2360)",),
+            )
+        counters.work_retries = attempt
         return Action(
             kind=RUN,
             label=(
                 f"WORK: failed → coord retry {state.work_aid} "
-                f"(attempt {counters.work_retries}/{opts.max_work_retries})"
+                f"(attempt {counters.work_retries}/{budget})"
             ),
             command=("retry", state.work_aid),
             error_message=f"coord retry failed for {state.work_aid}",
