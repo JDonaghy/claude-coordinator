@@ -31,6 +31,7 @@ from coord.agent import (
     AgentServer,
     AssignmentSpec,
     _is_auth_push_failure,
+    _remote_already_has_head,
 )
 
 
@@ -38,6 +39,42 @@ def _git(cwd: Path, *args: str) -> str:
     return subprocess.run(
         ["git", *args], cwd=str(cwd), capture_output=True, text=True, check=True
     ).stdout.strip()
+
+
+def _write_always_failing_receive_pack(tmp_path: Path) -> Path:
+    """A `receive-pack` replacement that unconditionally fails every push
+    with an auth-shaped error, regardless of whether the push has anything
+    new to send (#2356 review).
+
+    A `pre-receive` hook is the WRONG tool for simulating "reap's own push
+    fails while the remote already has HEAD": git's client-side ref
+    negotiation short-circuits to `Everything up-to-date` (exit 0) whenever
+    local HEAD already matches what the remote advertises, and that
+    short-circuit happens BEFORE a pack is ever sent — so a `pre-receive`
+    hook, which only runs after `receive-pack` unpacks an incoming pack,
+    never gets invoked at all in that case. Verified independently: a
+    `pre-receive`-based rejecting remote lets a same-SHA `git push -u
+    origin HEAD` succeed silently, hook untouched.
+
+    Overriding `remote.<name>.receivepack` instead replaces the
+    `receive-pack` PROGRAM itself, which git invokes unconditionally at the
+    start of every `git push` (for ref advertisement) — before any
+    comparison against what the client already has. It fires every time,
+    including when there is nothing new to send, which is exactly the
+    shape this scenario needs. Deliberately leaves `uploadpack` untouched,
+    so `git fetch` (what `_remote_already_has_head` uses) keeps working
+    normally.
+    """
+    script = tmp_path / "fail_receive_pack.sh"
+    script.write_text(
+        "#!/bin/sh\n"
+        "echo 'remote: Invalid username or token.' >&2\n"
+        "echo 'remote: Password authentication is not supported for "
+        "Git operations.' >&2\n"
+        "exit 1\n"
+    )
+    script.chmod(script.stat().st_mode | stat.S_IEXEC)
+    return script
 
 
 class TestIsAuthPushFailure:
@@ -96,6 +133,90 @@ class TestIsAuthPushFailure:
     )
     def test_does_not_match_unrelated_push_failures(self, message: str) -> None:
         assert _is_auth_push_failure(message) is False
+
+
+def _init_repo(d: Path) -> None:
+    d.mkdir()
+    _git(d, "init", "-b", "main")
+    _git(d, "config", "user.email", "t@t.com")
+    _git(d, "config", "user.name", "Test")
+
+
+def _commit_file(d: Path, name: str, contents: str, message: str) -> None:
+    (d / name).write_text(contents)
+    _git(d, "add", name)
+    _git(d, "commit", "-m", message)
+
+
+class TestRemoteAlreadyHasHead:
+    """Direct unit tests for `_remote_already_has_head` (#2356 review nit):
+    the full-round-trip tests only exercise it indirectly through an entire
+    `AgentServer`/`_reap` cycle, which proves the wiring but not the
+    ancestor-check logic itself in isolation. These pin down the four cases
+    the function's docstring promises: caught up, genuinely behind, branch
+    missing on the remote, and the remote unreachable outright — mirroring
+    `TestIsAuthPushFailure`'s role for `_is_auth_push_failure`.
+    """
+
+    def test_true_when_remote_already_has_head_as_ancestor(
+        self, tmp_path: Path
+    ) -> None:
+        origin = tmp_path / "origin.git"
+        origin.mkdir()
+        _git(origin, "init", "--bare", "-b", "main")
+
+        clone = tmp_path / "clone"
+        _init_repo(clone)
+        _git(clone, "remote", "add", "origin", str(origin))
+        _commit_file(clone, "f", "x\n", "c1")
+        _git(clone, "push", "-u", "origin", "main")
+
+        assert _remote_already_has_head(clone, "origin", "main") is True
+
+    def test_false_when_local_head_is_ahead_of_remote(
+        self, tmp_path: Path
+    ) -> None:
+        """The genuine #1797 shape: local HEAD moved on past whatever the
+        remote has, so the remote does NOT already have this content —
+        must return False so the real failure signal is never suppressed.
+        """
+        origin = tmp_path / "origin.git"
+        origin.mkdir()
+        _git(origin, "init", "--bare", "-b", "main")
+
+        clone = tmp_path / "clone"
+        _init_repo(clone)
+        _git(clone, "remote", "add", "origin", str(origin))
+        _commit_file(clone, "f", "x\n", "c1")
+        _git(clone, "push", "-u", "origin", "main")
+
+        # A second local commit that never reaches origin.
+        _commit_file(clone, "f", "y\n", "c2 (never reaches origin)")
+
+        assert _remote_already_has_head(clone, "origin", "main") is False
+
+    def test_false_when_remote_branch_does_not_exist(
+        self, tmp_path: Path
+    ) -> None:
+        origin = tmp_path / "origin.git"
+        origin.mkdir()
+        _git(origin, "init", "--bare", "-b", "main")
+
+        clone = tmp_path / "clone"
+        _init_repo(clone)
+        _git(clone, "remote", "add", "origin", str(origin))
+        _commit_file(clone, "f", "x\n", "c1")
+        # Never pushed anywhere — "main" doesn't exist on origin at all.
+
+        assert _remote_already_has_head(clone, "origin", "main") is False
+
+    def test_false_when_remote_is_unreachable(self, tmp_path: Path) -> None:
+        clone = tmp_path / "clone"
+        _init_repo(clone)
+        _git(clone, "remote", "add", "origin", str(tmp_path / "does-not-exist"))
+        _commit_file(clone, "f", "x\n", "c1")
+
+        assert _remote_already_has_head(clone, "origin", "main") is False
 
 
 @pytest.fixture
@@ -233,15 +354,19 @@ def test_push_failure_when_already_on_origin_via_other_route_is_not_failed(
     `origin` still fails with the exact same auth-shaped error in that case
     — but the content is already on the remote branch.
 
-    Reproduced deterministically (no network/SSH involved) by having the
-    worker itself land its commit on `origin` by briefly lifting the
-    rejecting hook — standing in for "reached origin via another path" —
-    before reap's own push runs into the hook, still armed. The assignment
-    must land on DONE, not FAILED: the work is exactly where it needs to
-    be, however it got there.
+    The worker lands its own commit on `origin` first (hook briefly
+    lifted — standing in for "reached origin via another path"), THEN we
+    install `_write_always_failing_receive_pack`'s override so reap's own
+    subsequent push — which has nothing new to send, since the worker
+    already pushed this exact SHA — still fails with an auth-shaped error.
+    (A `pre-receive` hook cannot do this: see that helper's docstring for
+    why git's own "nothing to push" short-circuit bypasses it here.) The
+    assignment must land on DONE, not FAILED: the work is exactly where it
+    needs to be, however it got there.
     """
     clone, origin = repo_with_rejecting_remote
     hook = origin / "hooks" / "pre-receive"
+    fail_receive_pack = _write_always_failing_receive_pack(tmp_path)
 
     worker_sh = (
         "git config user.email w@w.com && "
@@ -251,7 +376,8 @@ def test_push_failure_when_already_on_origin_via_other_route_is_not_failed(
         "git commit -m 'real work' && "
         f"chmod -x {hook} && "
         "git push origin HEAD && "
-        f"chmod +x {hook}"
+        f"chmod +x {hook} && "
+        f"git config remote.origin.receivepack {fail_receive_pack}"
     )
     server = AgentServer(
         machine_name="t",
