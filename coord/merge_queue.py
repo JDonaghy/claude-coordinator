@@ -4387,26 +4387,36 @@ def _test_author_effective_issue_number(entry: QueuedMerge, board) -> int | None
     return None
 
 
-def _issue_has_expected_red_entries(entry: QueuedMerge, gh_ops: GhOps) -> bool:
-    """#2199 review (blocking finding 2): whether *entry*'s issue has at
-    least one ``expected_red`` entry recorded against it in some
-    ``ms-*/manifest.yml`` on ``entry.target_branch`` — the scope check
-    that keeps :func:`_maybe_clear_expected_red`'s loud "no passing
-    trust-gate verdict" diagnostic from firing on every ordinary
-    ``CLOSES_ISSUE_TYPES`` merge fleet-wide (no driver configured, no
-    oracle-opted-in milestone, an ``oracle:exempt`` issue — none of which
-    ever populate ``expected_red`` for their issue, #2191). Those merges
-    have nothing here for ``coord acceptance record`` to ever have cleared
-    and never will; before this check, the diagnostic branch below could
-    not tell them apart from an issue that genuinely IS in scope and
-    genuinely IS stuck red, so it printed the same actionable-looking
-    (and, for a driverless repo, un-followable) advice on every single one.
+def _expected_red_ids_for_entry(entry: QueuedMerge, gh_ops: GhOps) -> frozenset[str]:
+    """#2199 review (blocking finding 2) / #2266 review (non-blocking
+    finding): the ``expected_red`` test ids, if any, recorded against
+    *entry*'s issue in some ``ms-*/manifest.yml`` on ``entry.target_branch``.
+
+    Two call sites need this:
+
+    * :func:`_issue_has_expected_red_entries` — the scope check that keeps
+      :func:`_maybe_clear_expected_red`'s loud "no passing trust-gate
+      verdict" diagnostic from firing on every ordinary
+      ``CLOSES_ISSUE_TYPES`` merge fleet-wide (no driver configured, no
+      oracle-opted-in milestone, an ``oracle:exempt`` issue — none of which
+      ever populate ``expected_red`` for their issue, #2191). Those merges
+      have nothing here for ``coord acceptance record`` to ever have
+      cleared and never will; before this check, the diagnostic branch
+      below could not tell them apart from an issue that genuinely IS in
+      scope and genuinely IS stuck red, so it printed the same
+      actionable-looking (and, for a driverless repo, un-followable)
+      advice on every single one.
+    * :func:`_maybe_clear_expected_red`'s clear branch, to put the actual
+      test ids (not just a pr/branch pair) into the durable audit row —
+      matching ``coord acceptance expected-red --clear``'s
+      ``details["test_ids"]`` so a merge-queue-triggered clear is just as
+      correlatable back to specific stuck tests as a CLI-triggered one.
 
     Reuses the exact API-only lookup ``coord.acceptance.
     clear_expected_red_via_pr`` already performs on the success path —
     best-effort/read-only like the rest of this sweep: any lookup failure
     (unreachable API, older ``gh_ops`` stub missing the list/get methods)
-    reads as "not in scope", matching :func:`coord.acceptance.
+    reads as "nothing recorded", matching :func:`coord.acceptance.
     find_ms_manifest_for_issue_via_api`'s own fail-soft posture.
     """
     from coord.acceptance import find_ms_manifest_for_issue_via_api  # noqa: PLC0415
@@ -4416,11 +4426,116 @@ def _issue_has_expected_red_entries(entry: QueuedMerge, gh_ops: GhOps) -> bool:
             entry.repo_github, entry.target_branch, entry.issue_number, gh_ops=gh_ops,
         )
     except Exception:  # noqa: BLE001 — best-effort, same posture as callers
-        return False
+        return frozenset()
     if found is None:
-        return False
+        return frozenset()
     _path, _text, _blob_sha, data = found
-    return bool(data.expected_red.get(entry.issue_number))
+    return frozenset(data.expected_red.get(entry.issue_number, frozenset()))
+
+
+def _issue_has_expected_red_entries(entry: QueuedMerge, gh_ops: GhOps) -> bool:
+    """Whether *entry*'s issue has at least one ``expected_red`` entry
+    recorded against it. See :func:`_expected_red_ids_for_entry` for why
+    this scope check exists."""
+    return bool(_expected_red_ids_for_entry(entry, gh_ops))
+
+
+def _record_expected_red_audit(
+    entry: QueuedMerge,
+    event_type: str,
+    message: str,
+    *,
+    test_ids: frozenset[str] | None = None,
+) -> None:
+    """#2266: durable half of an `expected_red` clear/skip/failure — a
+    `MergeEvent` alone only reaches the operator as a `coord merge` output
+    line that scrolls past (issue #2266's framing: "nothing durable,
+    nothing re-checked"). ``record_audit`` gives the same outcomes
+    (cleared, skipped for one of two distinct reasons, pending retry, or
+    attempted-and-failed) a queryable row (`coord audit` / `query_audit_log`)
+    so a repo with a stuck registry is discoverable without re-reading
+    merge output. Best-effort like every other audit call site in this
+    module — ``record_audit`` itself never raises.
+
+    *test_ids*, when given, lands in ``details["test_ids"]`` — matching the
+    CLI path's (`coord.commands.acceptance._clear_stuck_expected_red`)
+    audit payload, per #2266 review non-blocking finding: without it,
+    merge-queue-triggered audit rows were harder to correlate back to the
+    specific stuck test ids than CLI-triggered ones.
+    """
+    details: dict[str, object] = {
+        "pr_number": entry.pr_number, "target_branch": entry.target_branch,
+    }
+    if test_ids:
+        details["test_ids"] = sorted(test_ids)
+    record_audit(
+        tier="business",
+        category="acceptance",
+        event_type=event_type,
+        actor="system",
+        summary=f"{entry.repo_name}#{entry.issue_number}: {message}",
+        repo=entry.repo_name,
+        issue=entry.issue_number,
+        assignment_id=entry.assignment_id,
+        details=details,
+    )
+
+
+def _acceptance_patch_id_matches(
+    entry: "QueuedMerge", acceptance_sha: str, gh_ops: "GhOps",
+) -> bool:
+    """#2298: True when *acceptance_sha* — the commit the trust-gate verdict
+    (``coord acceptance record``) was recorded against — introduced the
+    *same content* as the commit that just merged, even though the two
+    SHAs differ.
+
+    The merge queue's own ``checks_stale``/``smoke_required`` gates force a
+    PR sitting behind a moved base to rebase before it can merge at all (a
+    re-run CI needs a fresh SHA to attach to); rebasing rewrites
+    ``branch_head_sha`` by construction. :func:`_maybe_clear_expected_red`
+    treating that SHA change alone as "the content changed" made the two
+    gates mutually unsatisfiable on any PR that had to rebase — every such
+    merge skipped its ``expected_red`` clear and manually needed one, #2298.
+
+    This mirrors the exact rebase-survives-content fingerprint
+    ``has_approved_review`` already uses for the review gate (#1475): a
+    content-addressed patch-id (``git patch-id --stable`` over the unified
+    diff, via ``gh_ops.get_branch_patch_id``) is insensitive to which
+    commit the diff is replayed onto, so a pure rebase (no conflict, no new
+    commits) produces the *same* patch-id from a *different* SHA, while a
+    genuine content change (a conflict resolved differently, an extra
+    commit) does not.
+
+    Compares ``entry.branch_patch_id`` — the diff the commit that just
+    merged actually introduced, backfilled on demand via
+    :func:`_backfill_branch_patch_id` when `process()` never needed it
+    (e.g. neither review nor smoke was required for this entry, the only
+    two gates that consult it pre-merge) — against a patch-id computed
+    fresh for *acceptance_sha* against ``entry.target_branch``.
+    *acceptance_sha* need not be any branch's current tip: per
+    :func:`coord.github_ops.get_compare_diff`'s docstring, GitHub's
+    three-dot compare API accepts a raw commit SHA for *head* exactly like
+    a branch name, the same trick :func:`has_approved_review`'s #1476
+    scoped-re-review path already relies on for an old, superseded review
+    SHA.
+
+    Returns ``False`` — fail closed — whenever either side is unavailable
+    (no patch-id support, a `gh_ops` failure, or *acceptance_sha* no longer
+    resolving, e.g. long since garbage-collected): "cannot confirm
+    identical content" must never read as "confirmed identical".
+    """
+    branch_patch_id = getattr(entry, "branch_patch_id", None)
+    if branch_patch_id is None:
+        branch_patch_id = _backfill_branch_patch_id(entry, gh_ops)
+    if branch_patch_id is None:
+        return False
+    try:
+        acceptance_patch_id = gh_ops.get_branch_patch_id(
+            entry.repo_github, entry.target_branch, acceptance_sha,
+        )
+    except Exception:  # noqa: BLE001 — fail-safe, matches _backfill_branch_patch_id
+        acceptance_patch_id = None
+    return acceptance_patch_id is not None and acceptance_patch_id == branch_patch_id
 
 
 def _maybe_clear_expected_red(entry: QueuedMerge, board, gh_ops: GhOps) -> MergeEvent | None:
@@ -4450,6 +4565,17 @@ def _maybe_clear_expected_red(entry: QueuedMerge, board, gh_ops: GhOps) -> Merge
     printing that same loud, actionable-looking text on every ordinary
     merge fleet-wide, contradicting the acceptance criterion that exempt
     issues and driverless repos stay unaffected.
+
+    #2298: the SHA-exact guard below is no longer the only path to a
+    clear. ``checks_stale``/``smoke_required`` refuse a PR whose CI
+    predates the current base, so a PR that sits long enough for the base
+    to move must rebase to merge at all — which rewrites
+    ``entry.branch_head_sha`` even when nothing about the PR's own diff
+    changed. Comparing SHAs alone made that guard and those gates mutually
+    unsatisfiable on exactly the PRs this whole trust gate exists to
+    protect (every rebased oracle-loop merge). See
+    :func:`_acceptance_patch_id_matches` for the content-addressed
+    fallback that tells a pure rebase apart from a genuine content change.
     """
     if entry.assignment_type not in CLOSES_ISSUE_TYPES:
         return None
@@ -4462,44 +4588,131 @@ def _maybe_clear_expected_red(entry: QueuedMerge, board, gh_ops: GhOps) -> Merge
         )
     acceptance_state = getattr(work, "acceptance_state", None)
     if acceptance_state != "passed":
-        if not _issue_has_expected_red_entries(entry, gh_ops):
+        ids = _expected_red_ids_for_entry(entry, gh_ops)
+        if not ids:
             # Not in scope for the oracle loop at all — the pre-#2199
             # silent no-op is still correct here, not a regression (see
             # the docstring above and #2199 review finding 2).
             return None
-        return MergeEvent(
-            entry, "expected_red_clear_skipped_no_acceptance",
+        msg = (
             f"no passing trust-gate verdict recorded on {work.assignment_id} "
             f"(acceptance_state={acceptance_state!r}) — the external `coord "
             "acceptance record` re-run either never happened or did not "
             "pass; skipping expected_red clear. Run `coord acceptance "
             f"record --repo {entry.repo_name} --issue {entry.issue_number} "
             "--sha <merged sha>` by hand, or re-drive the issue, to clear "
-            "any listed entries.",
+            "any listed entries."
         )
+        # #2266: distinct from the SHA-mismatch guard below — "acceptance
+        # never recorded" and "recorded SHA is stale" are different
+        # problems with different fixes, so they get distinct event types
+        # rather than reaching the operator as the same silence.
+        _record_expected_red_audit(
+            entry, "expected_red_clear_skipped_no_acceptance", msg, test_ids=ids,
+        )
+        return MergeEvent(entry, "expected_red_clear_skipped_no_acceptance", msg)
     acceptance_sha = getattr(work, "acceptance_sha", None)
-    if acceptance_sha is None or acceptance_sha != entry.branch_head_sha:
+    sha_matches = acceptance_sha is not None and acceptance_sha == entry.branch_head_sha
+    # #2298: a bare SHA mismatch no longer voids the verdict outright.
+    # `checks_stale`/`smoke_required` force a rebase before a PR sitting
+    # behind a moved base can merge at all — which rewrites
+    # `branch_head_sha` on every such PR by construction, making this
+    # guard and those gates mutually unsatisfiable pre-#2298 (see the
+    # issue). Mirror `has_approved_review`'s #1475 patch-id fallback: a
+    # SHA mismatch whose content-addressed patch-id still matches is a
+    # pure rebase, not a stale observation.
+    patch_id_verified = (
+        acceptance_sha is not None
+        and not sha_matches
+        and _acceptance_patch_id_matches(entry, acceptance_sha, gh_ops)
+    )
+    if not sha_matches and not patch_id_verified:
         # The recorded trust-gate verdict isn't for the exact commit that
-        # just merged (acceptance never ran, or new commits landed after
-        # the last `record`) — skip rather than clear on a stale
-        # observation. Will pick back up once `record` runs again for the
-        # fresh SHA and this issue's fix merges again... though ordinarily
-        # a merge only happens once per issue, so a mismatch here more
-        # likely means acceptance was simply never recorded for this SHA.
-        return MergeEvent(
-            entry, "expected_red_clear_skipped",
-            "acceptance_sha does not match the merged commit — skipping "
-            "expected_red clear (re-run `coord acceptance record` against "
-            "the merged SHA if entries should have cleared)",
+        # just merged, and its diff doesn't match the merged commit's diff
+        # either (acceptance never ran, a genuine content change landed
+        # after the last `record`, or the patch-id comparison itself
+        # couldn't be confirmed) — skip rather than clear on a stale
+        # observation. #2298 (also worth fixing here): the issue this
+        # entry closed is already closed by the time this runs, so
+        # `coord acceptance record --sha` (which targets an *open* issue's
+        # work assignment) has nothing left to attach to; point at the
+        # remedy that actually works from here instead.
+        msg = (
+            "acceptance_sha does not match the merged commit, and its "
+            "content-addressed patch-id does not confirm a pure rebase "
+            "either (#2298) — skipping expected_red clear. If this was "
+            "genuinely just a rebase onto a moved base, clear by hand: "
+            f"`coord acceptance expected-red {entry.repo_name} --clear "
+            f"--issue {entry.issue_number}`. If the content actually "
+            "changed, a fresh `coord acceptance record` against the "
+            "merged SHA (while the issue was still open) was the correct "
+            "fix and did not happen."
         )
+        _record_expected_red_audit(
+            entry, "expected_red_clear_skipped_sha_mismatch", msg,
+            test_ids=_expected_red_ids_for_entry(entry, gh_ops),
+        )
+        return MergeEvent(entry, "expected_red_clear_skipped", msg)
 
-    from coord.acceptance import clear_expected_red_via_pr  # noqa: PLC0415
+    from coord.acceptance import (  # noqa: PLC0415
+        classify_expected_red_clear_result,
+        clear_expected_red_via_pr,
+    )
 
+    # Captured *before* the clear attempt: a successful clear edits the
+    # manifest, so looking this up afterwards would just find the ids the
+    # clear itself just removed (#2266 review non-blocking finding).
+    ids = _expected_red_ids_for_entry(entry, gh_ops)
+    if patch_id_verified:
+        # #2298: name the arm taken — a durable row independent of whether
+        # there ends up being anything to clear (the "no_op" branch below
+        # never gets one of those), so this rebase-not-content-change call
+        # is queryable on its own, the same way every other skip/clear
+        # branch here names itself rather than staying silent (#2199).
+        _record_expected_red_audit(
+            entry, "expected_red_sha_mismatch_patch_id_verified",
+            "acceptance_sha does not match the merged commit, but its "
+            "content-addressed patch-id does — a pure rebase, not a "
+            "content change (#2298); proceeding with expected_red clear",
+            test_ids=ids,
+        )
     msg = clear_expected_red_via_pr(
         entry.repo_github, entry.repo_name, entry.target_branch, entry.issue_number,
         gh_ops=gh_ops,
     )
-    return MergeEvent(entry, "expected_red_clear", msg)
+    # #2266 review (blocking finding 1): a binary "did the message start
+    # with 'cleared expected_red'" conflated a genuine failure with "there
+    # was nothing to clear in the first place" — the *common* case for an
+    # ordinary oracle-loop merge whose issue was never part of a
+    # deliberately-red slice. `classify_expected_red_clear_result` (shared
+    # with the CLI `--clear` path, review blocking finding 2) tells those
+    # apart; the "no_op" case is reported back via `MergeEvent` for `coord
+    # merge` output but never gets a durable audit row — recording one for
+    # every ordinary passing merge would drown the genuinely actionable
+    # `expected_red_clear_failed` rows this audit trail exists to surface.
+    status = classify_expected_red_clear_result(msg)
+    if status == "no_op":
+        return MergeEvent(entry, "expected_red_clear_noop", msg)
+    event_type = {
+        "cleared": "expected_red_clear",
+        "pending_retry": "expected_red_clear_pending",
+        "failed": "expected_red_clear_failed",
+    }[status]
+    if patch_id_verified:
+        # #2298: keep the arm visible on the terminal `coord merge` line
+        # too, not just in the audit row above.
+        msg = (
+            f"{msg} (acceptance_sha rebased since verdict — content "
+            "verified identical via patch-id, #2298)"
+        )
+    # #2266 review (non-blocking finding): `clear_expected_red_via_pr`
+    # never raises — every genuine failure degrades to a "warning: ..."
+    # string. Make that durable too, not just a merge-output line: a
+    # repeated `expected_red_clear_failed` for the same issue is exactly
+    # the signal `coord acceptance expected-red --clear` (the re-fire
+    # path) exists for.
+    _record_expected_red_audit(entry, event_type, msg, test_ids=ids)
+    return MergeEvent(entry, event_type, msg)
 
 
 def process(

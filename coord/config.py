@@ -73,15 +73,66 @@ def is_canonical_config_path(path: Path) -> bool:
 
 
 # Safety-by-default: repos without explicit worker_permissions get this deny-list.
+#
+# #2314: every ``Bash(<verb> <flag> *)`` entry only matches *flag* IMMEDIATELY
+# after *verb* — a worker that inserted one more flag first (or swapped a
+# combined short flag's letter order) sailed straight through undetected. The
+# `git push`/`rm` entries below each pair the original adjacent form with a
+# reordering-safe one (an interior ``*`` before the flag, or — for `rm` — the
+# `-fr` letter-swap of `-rf`); this is the "audit other Bash(...) deny
+# patterns for the same positional weakness" half of #2314, not exhaustive
+# (it does not attempt to catch shell chaining/subshells, which is a
+# different, much larger problem than argv flag position).
 DEFAULT_DENY_COMMANDS: list[str] = [
     "Bash(gh *)",
     "Bash(git push --force *)",
     "Bash(git push -f *)",
+    "Bash(git push * --force *)",
+    "Bash(git push * -f *)",
     "Bash(git reset --hard *)",
+    "Bash(git reset * --hard *)",
     "Bash(git branch -D *)",
+    "Bash(git branch * -D *)",
     "Bash(git checkout -- .)",
     "Bash(git clean -f *)",
+    "Bash(git clean * -f *)",
     "Bash(rm -rf *)",
+    "Bash(rm -fr *)",
+    # #2314: a worker ran `pip install --break-system-packages -e .` — an
+    # editable install of coord's own source re-links (or, combined with
+    # `--user`/`--break-system-packages`, outright shadows) the interpreter
+    # `coord` itself is running under, out from under this and every other
+    # session on the box (see coord/cli.py's
+    # `_warn_if_source_install_drift`/`_editable_checkout_drift`). The old
+    # single `Bash(pip install -e *)` entry only matched `-e` IMMEDIATELY
+    # after `install`, so putting any other flag first evaded it entirely.
+    # Every entry below is duplicated with a leading `*` (covers `python -m
+    # pip install ...` / `python3 -m pip install ...`, which reach the exact
+    # same installer) and, for `-e`/`--editable` specifically, ALSO with an
+    # interior `*` before the flag (covers it appearing anywhere in argv,
+    # not just first) — the adjacent form alone still catches
+    # `pip install -e --break-system-packages .` (the flag being pushed
+    # AFTER `-e` doesn't break the immediate `install -e` adjacency), but
+    # not `pip install --break-system-packages -e .` (something pushed
+    # BEFORE it).
+    "Bash(pip install -e *)",
+    "Bash(*pip install -e *)",
+    "Bash(pip install * -e *)",
+    "Bash(*pip install * -e *)",
+    "Bash(pip install --editable *)",
+    "Bash(*pip install --editable *)",
+    "Bash(pip install * --editable *)",
+    "Bash(*pip install * --editable *)",
+    # `--break-system-packages` / `--user` are denied INDEPENDENTLY of
+    # `-e`/`--editable` — either flag alone, on a perfectly ordinary
+    # non-editable `pip install`, still lets a worker write into (or
+    # reconfigure) the interpreter coord itself runs under. No adjacency
+    # requirement at all: both are boolean flags a real `pip install`
+    # invocation can place anywhere after `install`.
+    "Bash(pip install *--break-system-packages*)",
+    "Bash(*pip install *--break-system-packages*)",
+    "Bash(pip install *--user*)",
+    "Bash(*pip install *--user*)",
 ]
 
 
@@ -3321,6 +3372,51 @@ def _expand_env_vars(value: str) -> str:
     return _ENV_VAR_RE.sub(_replace, value)
 
 
+#: Matches exactly what opencode's own ``OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX``
+#: parser (#2321) accepts as a *string form* of a number: one or more ASCII
+#: digits, nothing else — no sign, no decimal point, no whitespace, no
+#: underscore digit-grouping. Combined with the ``> 0`` check below this
+#: mirrors opencode's own rule (integer, ``> 0``) closely enough to reject
+#: every value opencode is documented to silently discard: ``"131072 "``
+#: (trailing whitespace), ``"131_072"`` (underscore grouping — Python's
+#: ``int()`` would accept this but JS ``Number()`` coercion does not),
+#: ``"0"`` (fails ``> 0``), ``"1.5"`` (decimal point), and ``"unlimited"``
+#: (non-numeric).
+_OPENCODE_OUTPUT_TOKEN_MAX_RE = re.compile(r"[0-9]+")
+
+#: The env var name gated by :data:`_OPENCODE_OUTPUT_TOKEN_MAX_RE` — kept as
+#: a constant rather than a literal so config.py and opencode.py can be
+#: grepped for the exact same string (deliberately NOT imported from
+#: coord.providers.opencode: config.py must not depend on provider modules).
+OPENCODE_OUTPUT_TOKEN_MAX_ENV_VAR = "OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX"
+
+
+def _validate_opencode_output_token_max_env(value: str, *, context: str) -> None:
+    """Reject an ``OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX`` override that
+    opencode's own parser would silently discard (#2321).
+
+    opencode's env-var parser demands an integer ``> 0``; anything else
+    (a non-numeric string, a decimal, a value with surrounding whitespace
+    or underscore digit-grouping, zero or negative) maps to ``undefined``
+    internally, which silently restores opencode's 32,000-token default
+    with **no warning anywhere** — exactly the failure mode #2321 exists
+    to end. Config-parse time is the only point where "silently reverted
+    to 32,000" can be turned into a loud, actionable error instead of a
+    truncated worker run discovered hours later.
+
+    Raises:
+        ConfigError: when *value* is not a bare positive-integer string.
+    """
+    if not _OPENCODE_OUTPUT_TOKEN_MAX_RE.fullmatch(value) or int(value) <= 0:
+        raise ConfigError(
+            f"{context} must be a positive integer string with no "
+            "surrounding whitespace, sign, decimal point, or underscores "
+            "(opencode's OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX parser "
+            "silently discards anything else and reverts to its 32000 "
+            f"default) — got {value!r}"
+        )
+
+
 _PORTAL_PLAIN_STR_FIELDS = ("base_url",)
 _PORTAL_SECRET_STR_FIELDS = ("bridge_client_id", "bridge_client_secret")
 
@@ -3470,6 +3566,20 @@ def _parse_providers(raw: Any) -> ProvidersConfig:
                 )
         # Expand ${VAR} in env values.
         env: dict[str, str] = {k: _expand_env_vars(v) for k, v in env_raw.items()}
+
+        # #2321: an operator override of opencode's output-token-cap knob
+        # must be a value opencode's own parser will actually honour — see
+        # _validate_opencode_output_token_max_env for why a bad value here
+        # (e.g. a trailing space) is worse than a normal type error: it
+        # doesn't fail, it silently reverts to the 32000 default.
+        if OPENCODE_OUTPUT_TOKEN_MAX_ENV_VAR in env:
+            _validate_opencode_output_token_max_env(
+                env[OPENCODE_OUTPUT_TOKEN_MAX_ENV_VAR],
+                context=(
+                    f"providers.definitions[{def_name!r}].env"
+                    f"[{OPENCODE_OUTPUT_TOKEN_MAX_ENV_VAR!r}]"
+                ),
+            )
 
         extra_args_raw = def_raw.get("extra_args", []) or []
         if not isinstance(extra_args_raw, list) or not all(

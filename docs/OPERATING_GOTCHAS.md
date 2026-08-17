@@ -615,7 +615,7 @@ coord agent update --machine dellserver   # or --all — the standard lane
 
 The topology is **per-machine**: a dev box's `~/.local/bin/coord` is commonly
 an *editable* install pointing at a checkout, which is fine interactively but
-unsafe under this timer (`pip show claude-coordinator | grep -i editable`
+unsafe under this timer (`pip show code-coordinator | grep -i editable`
 must print nothing before you install the unit there).
 
 **A queue longer than ~2 issues on one repo is not yet unattended-safe
@@ -985,7 +985,7 @@ queue:
 | collision | trigger | how it presented | cost |
 |---|---|---|---|
 | quadraui #306, #309 | #307/#308 merged first; all four append to `quadraui/tests/tui_example_driver.rs` | `smoke gate — test verdict stale` | both terminal `blocked`, 2 attempts each, 3 wasted `--revalidate` suite runs, 2 `coord fix` dispatches |
-| claude-coordinator #2234 | #2230 merged; both touch `coord/drive_queue.py` | `checks_failed … (unknown)`, and `coord fix` reported *"CI is RED"* | terminal `blocked`, 2 attempts, a wasted empty commit, one `coord fix` dispatch |
+| code-coordinator #2234 | #2230 merged; both touch `coord/drive_queue.py` | `checks_failed … (unknown)`, and `coord fix` reported *"CI is RED"* | terminal `blocked`, 2 attempts, a wasted empty commit, one `coord fix` dispatch |
 
 In neither case did any surface say *conflict* until a human went looking. In
 the second, **CI had never run at all**: GitHub builds `pull_request`

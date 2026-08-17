@@ -16,6 +16,7 @@ dispatch/kill/handoff, idempotent via the shared `notified` ledger.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -147,6 +148,14 @@ def _board(*assignments: Assignment) -> Board:
     active = [a for a in assignments if a.status in ("running", "pending")]
     completed = [a for a in assignments if a.status not in ("running", "pending")]
     return Board(active=active, completed=completed)
+
+
+def _mock_author_work(aid: str = "ma-work-1", **kwargs) -> Assignment:
+    """#2302: a `type="mock-author"` (Gate A) head row — same shape as
+    `_work()` but typed as a SEALED_PATH_AUTHOR_TYPES member so the
+    `dispatch_stalled_pipeline_action` flag-bypass tests below can build a
+    board around one without duplicating `_work`'s field list."""
+    return replace(_work(aid, **kwargs), type="mock-author", branch="ms-65-gate-a")
 
 
 # ── Reference fixture: vimcode #602 ──────────────────────────────────────────
@@ -1413,6 +1422,159 @@ class TestDispatchPerReason:
 
         assert action.kind == "conflict_fix_dispatched"
         assert "cf-1" in action.detail
+        stub.assert_called_once()
+
+
+# ── #2302: sealed-author rows bypass the auto_dispatch_stalled flag ─────────
+#
+# `pipeline.auto_dispatch_stalled` bounds blast radius on rows another loop
+# already owns (`coord drive`'s request-changes -> fix arm for `work` rows,
+# #1692). A `test-author`/`mock-author` row has no such owner — `coord
+# drive` explicitly `_die()`s on those and Gate A is dispatched standalone
+# with no drive run over it at all (#2289) — so THIS one reason+type
+# combination must dispatch regardless of the flag. `work` rows under the
+# same reason keep the opt-in gate unchanged.
+
+
+class TestDispatchSealedAuthorBypassesFlag:
+    def test_mock_author_stall_dispatches_with_flag_off(
+        self, config: Config, monkeypatch
+    ) -> None:
+        assert config.pipeline.auto_dispatch_stalled is False
+        board = _board(
+            _mock_author_work("ma-work-1", test_state="passed"),
+            _review("ma-work-1", aid="ma-review-1", review_verdict="request-changes"),
+        )
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        )[0]
+        assert detection.reason == "review_request_changes_no_fix"
+        assert work.type == "mock-author"
+
+        stub = MagicMock(return_value=[
+            LoopAction(
+                kind="fix_dispatched", assignment_id="ma-review-1",
+                detail="fix worker fix-9 dispatched to mac-mini (iteration 1/5)",
+            ),
+        ])
+        monkeypatch.setattr("coord.auto_loop.process_review_completion", stub)
+
+        action = notify_mod.dispatch_stalled_pipeline_action(detection, work, board, config)
+
+        assert action.kind == "fix_dispatch_attempted"
+        stub.assert_called_once()
+
+    def test_test_author_stall_dispatches_with_flag_off(
+        self, config: Config, monkeypatch
+    ) -> None:
+        """The scope is BOTH sealed-author types — test-author has the
+        identical hole (`coord/drive.py` `_die()`s on it too)."""
+        assert config.pipeline.auto_dispatch_stalled is False
+        board = _board(
+            replace(_mock_author_work("ta-work-1", test_state="passed"), type="test-author"),
+            _review("ta-work-1", aid="ta-review-1", review_verdict="request-changes"),
+        )
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        )[0]
+        assert detection.reason == "review_request_changes_no_fix"
+        assert work.type == "test-author"
+
+        stub = MagicMock(return_value=[
+            LoopAction(
+                kind="fix_dispatched", assignment_id="ta-review-1",
+                detail="fix worker fix-9 dispatched to mac-mini (iteration 1/5)",
+            ),
+        ])
+        monkeypatch.setattr("coord.auto_loop.process_review_completion", stub)
+
+        action = notify_mod.dispatch_stalled_pipeline_action(detection, work, board, config)
+
+        assert action.kind == "fix_dispatch_attempted"
+        stub.assert_called_once()
+
+    def test_work_stall_still_disabled_with_flag_off(
+        self, config: Config, monkeypatch
+    ) -> None:
+        """Regression guard: a plain `work` row under the identical reason
+        stays gated behind the flag — `coord drive` owns that row and a
+        second dispatcher racing it would duplicate/clobber its fix."""
+        assert config.pipeline.auto_dispatch_stalled is False
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="request-changes"),
+        )
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        )[0]
+        assert detection.reason == "review_request_changes_no_fix"
+        assert work.type == "work"
+
+        stub = MagicMock()
+        monkeypatch.setattr("coord.auto_loop.process_review_completion", stub)
+
+        action = notify_mod.dispatch_stalled_pipeline_action(detection, work, board, config)
+
+        assert action.kind == "disabled"
+        stub.assert_not_called()
+
+    def test_mock_author_stall_still_respects_live_session_guard(
+        self, config: Config, monkeypatch
+    ) -> None:
+        """The flag bypass must not skip the #602 live-session guard — an
+        interactive session on the same (repo, issue) still wins."""
+        assert config.pipeline.auto_dispatch_stalled is False
+        work = _mock_author_work("ma-work-2", test_state="passed")
+        review = _review("ma-work-2", aid="ma-review-2", review_verdict="request-changes")
+        live_session = Assignment(
+            machine_name="mac-mini", repo_name="vimcode", issue_number=602,
+            issue_title="interactive smoke", assignment_id="smoke-live",
+            status="running", type="smoke",
+        )
+        board = Board(active=[live_session], completed=[work, review])
+
+        detection, work_row = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        )[0]
+        assert detection.reason == "review_request_changes_no_fix"
+
+        stub = MagicMock()
+        monkeypatch.setattr("coord.auto_loop.process_review_completion", stub)
+
+        action = notify_mod.dispatch_stalled_pipeline_action(
+            detection, work_row, board, config
+        )
+
+        assert action.kind == "skipped_live_session"
+        stub.assert_not_called()
+
+    def test_mock_author_stall_still_respects_iteration_cap(
+        self, config: Config, monkeypatch
+    ) -> None:
+        """The flag bypass must not skip `process_review_completion`'s own
+        `max_review_iterations` cap — a `max_iterations` resolution stays
+        `no_action`, not a dispatch."""
+        assert config.pipeline.auto_dispatch_stalled is False
+        board = _board(
+            _mock_author_work("ma-work-3", test_state="passed"),
+            _review("ma-work-3", aid="ma-review-3", review_verdict="request-changes"),
+        )
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        )[0]
+
+        stub = MagicMock(return_value=[
+            LoopAction(
+                kind="max_iterations", assignment_id="ma-review-3",
+                detail="max_review_iterations=5 reached",
+            ),
+        ])
+        monkeypatch.setattr("coord.auto_loop.process_review_completion", stub)
+
+        action = notify_mod.dispatch_stalled_pipeline_action(detection, work, board, config)
+
+        assert action.kind == "no_action"
+        assert action.kind not in notify_mod._STALLED_DISPATCH_KINDS
         stub.assert_called_once()
 
 

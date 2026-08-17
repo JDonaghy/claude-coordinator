@@ -104,9 +104,14 @@ def _repo_capability_refusal(
     ``assign()``'s ``machine_obj.can_work_on(repo)`` check (just above this
     call site) only ever reads ``coordinator.yml`` — which the operator can
     edit any time — never the agent process actually running on that
-    machine. A repo added to config after the agent started stays invisible
-    to it until a full ``systemctl --user restart coord-agent`` (there is no
-    partial re-read today). Every pre-flight surface an operator would
+    machine. A repo added to config used to stay invisible to a running
+    agent until a full ``systemctl --user restart coord-agent``; since #2299
+    the agent re-reads its own ``coordinator.yml`` on the next ``/health``
+    poll, so the remaining ways the two can disagree are a *stale file* on
+    that machine, a malformed edit the agent refused to adopt, or an agent
+    too old to reload — all of which this refusal still catches, because it
+    compares against live ``/health`` rather than trusting either side.
+    Every pre-flight surface an operator would
     check before spending a dispatch reads config too: ``coord config``,
     ``coord status``, and — worst of all — ``coord assign ... --dry-run``,
     which is the documented way to sanity-check a dispatch before paying
@@ -169,9 +174,14 @@ def _repo_capability_refusal(
     return (
         f"{machine_obj.name!r} rejected the assignment: this agent does "
         f"not handle repo {repo!r} (supported: {live_repos}) — "
-        f"coordinator.yml lists it, but the live agent process hasn't "
-        f"re-read its config since {repo!r} was added (#2219). Restart "
-        f"coord-agent on {machine_obj.name!r} to pick it up, then retry."
+        f"coordinator.yml lists it, but the live agent process is running "
+        f"on a different repo list (#2219). Agents re-read coordinator.yml "
+        f"on their own /health poll since #2299, so retry in a moment "
+        f"first; if it persists, that machine's own copy of the config is "
+        f"stale (`git pull` the settings checkout on "
+        f"{machine_obj.name!r}), the edit is malformed (its journal will "
+        f"say `failed to reload`), or the agent predates #2299 "
+        f"(`coord agent update`)."
     )
 
 
@@ -1787,9 +1797,12 @@ def retry(assignment_id: str, config_path: Path, acknowledge_cost: bool = False)
     from coord.board_service import read_board, write_board
     from coord.models import WORK_LIKE_TYPES
     from coord.reconcile import (
+        RetryProviderMismatch,
         UnsupportedRetryType,
         _reassign,
+        _resolve_retry_provider,
         describe_no_candidate_machines,
+        describe_retry_provider_mismatch,
         describe_unsupported_retry_type,
     )
 
@@ -1863,18 +1876,35 @@ def retry(assignment_id: str, config_path: Path, acknowledge_cost: bool = False)
         # an independent inline copy of the same "branch empty → 0, repo
         # missing → None, else ask GitHub" logic.
         ahead = github_ops.branch_commits_ahead_for_assignment(assignment, cfg)
-        if ahead != 0:
-            detail = (
-                "its commit count could not be confirmed (gh lookup failed)"
-                if ahead is None
-                else f"{ahead} commit(s) present on its branch"
-            )
+        if ahead is None:
+            # #2324: a genuine lookup failure (network error, auth, rate
+            # limit, repo missing) is NOT evidence that commits exist — it's
+            # just an unanswered question. Don't assert the #1357
+            # false-positive shape or point at `--accept-advisory`, which
+            # assumes real commits are sitting on the branch; nothing here
+            # established that. Say the lookup failed and name what to
+            # check instead. (A confirmed 404 on the head branch is handled
+            # above this `is None` check — `branch_commits_ahead_for_assignment`
+            # reads that as 0, not None.)
             click.echo(
-                f"error: assignment {assignment_id} is 'advisory', and {detail} "
-                "— coord retry only re-dispatches a GENUINE zero-commit "
-                "advisory. This looks like the #1357 false-positive "
-                "signature instead; use `coord drive --accept-advisory` to "
-                "proceed with the existing commits, or inspect by hand.",
+                f"error: assignment {assignment_id} is 'advisory', and its "
+                "commit count could not be confirmed (gh lookup failed) — "
+                "coord retry only re-dispatches a GENUINE zero-commit "
+                "advisory, and a failed lookup isn't confirmation either "
+                "way. Check `gh api` access and the recorded branch/repo, "
+                "then retry; or inspect by hand: coord log "
+                f"{assignment_id}.",
+                err=True,
+            )
+            sys.exit(1)
+        if ahead != 0:
+            click.echo(
+                f"error: assignment {assignment_id} is 'advisory', and "
+                f"{ahead} commit(s) are present on its branch — coord retry "
+                "only re-dispatches a GENUINE zero-commit advisory. This is "
+                "the #1357 false-positive signature instead; use `coord "
+                "drive --accept-advisory` to proceed with the existing "
+                "commits, or inspect by hand.",
                 err=True,
             )
             sys.exit(1)
@@ -1893,14 +1923,59 @@ def retry(assignment_id: str, config_path: Path, acknowledge_cost: bool = False)
         click.echo(f"error: {describe_unsupported_retry_type(exc)}", err=True)
         sys.exit(1)
 
-    # Determine escalated model for the retry.
+    # #2323: resolve (and #437 TOS-guard) the provider this retry would
+    # dispatch through BEFORE deciding anything about the model — printed
+    # up front so it's never left for the drive's own header to contradict
+    # four seconds later, and checked before the escalation message so a
+    # refusal is never preceded by a reassuring "escalating model" line for
+    # a retry that's about to be refused. `providers.labels` is consulted
+    # the same way a first work dispatch consults it (gated to
+    # `type="work"`, coord/dispatch.py:548); a genuine `harness:opencode`
+    # label match here means retry lands back on `opencode`, not the
+    # claude default that a label-blind resolution used to fall through to.
+    from coord.state import get_cached_issue_labels  # noqa: PLC0415
+
+    issue_labels = get_cached_issue_labels(
+        assignment.repo_name, assignment.issue_number,
+    )
+    try:
+        resolved_provider_name = _resolve_retry_provider(assignment, cfg, issue_labels)
+    except RetryProviderMismatch as exc:
+        click.echo(f"error: {describe_retry_provider_mismatch(exc)}", err=True)
+        sys.exit(1)
+    except ValueError as exc:
+        click.echo(f"error: {exc}", err=True)
+        sys.exit(1)
+    click.echo(f"  provider: {resolved_provider_name}")
+
+    # Determine escalated model for the retry. #2323: `cfg.models.
+    # next_model` walks the claude tier ladder — only meaningful when this
+    # retry actually resolves to a claude-family provider. The precheck
+    # above already guarantees `resolved_provider_name` matches the failed
+    # run's own provider (else it would have refused), so gating on the
+    # resolved provider's TYPE here is equivalent to gating on the failed
+    # run's, without a second lookup.
+    from coord.config import IMPLICIT_PROVIDER_TYPES  # noqa: PLC0415
+    from coord.providers import provider_type_for  # noqa: PLC0415
+
     original_model = assignment.model or cfg.models.default
-    escalated = cfg.models.next_model(original_model)
-    if escalated != original_model:
-        click.echo(f"  escalating model: {original_model} → {escalated}")
+    if provider_type_for(resolved_provider_name, cfg.providers) in IMPLICIT_PROVIDER_TYPES:
+        escalated = cfg.models.next_model(original_model)
+        if escalated != original_model:
+            click.echo(f"  escalating model: {original_model} → {escalated}")
+        retry_model = escalated
+    else:
+        # Not a claude-family provider — the escalation ladder doesn't
+        # apply; reuse the failed run's own model field exactly (`None`
+        # tells `_reassign` to reuse `assignment.model` verbatim, rather
+        # than stamping `original_model`'s `cfg.models.default` fallback
+        # onto a provider that fallback means nothing to).
+        retry_model = None
 
     try:
-        result = _reassign(assignment, board, cfg, model=escalated)
+        result = _reassign(
+            assignment, board, cfg, model=retry_model, issue_labels=issue_labels,
+        )
     except UnsupportedRetryType as exc:
         # Defense in depth — the precheck above already covers this, but
         # `_reassign` is shared with `auto_reassign` and must never silently
@@ -1908,12 +1983,19 @@ def retry(assignment_id: str, config_path: Path, acknowledge_cost: bool = False)
         # precheck.
         click.echo(f"error: {describe_unsupported_retry_type(exc)}", err=True)
         sys.exit(1)
+    except RetryProviderMismatch as exc:
+        # Defense in depth — the precheck above already covers this, but
+        # `_reassign` is shared with `auto_reassign` and must never
+        # silently substitute the provider even if a future caller skips
+        # the precheck.
+        click.echo(f"error: {describe_retry_provider_mismatch(exc)}", err=True)
+        sys.exit(1)
     if result is None:
         # #1396: name the blocking machines and their apparent load instead
         # of a bare "no available machine" — the usual cause is a phantom
         # `running` row from a dead interactive session nothing reaped.
         click.echo(
-            f"error: {describe_no_candidate_machines(assignment, board, cfg)}",
+            f"error: {describe_no_candidate_machines(assignment, board, cfg, issue_labels)}",
             err=True,
         )
         sys.exit(1)
@@ -1933,7 +2015,7 @@ def retry(assignment_id: str, config_path: Path, acknowledge_cost: bool = False)
     click.echo(
         f"Retried: {result.machine_name} → {result.repo_name} "
         f"#{result.issue_number} (assignment {result.assignment_id}, "
-        f"type={result.type})"
+        f"type={result.type}, provider={resolved_provider_name})"
     )
     # #1101: surface the continued branch so it's obvious the retry picked
     # up existing work instead of forking a fresh branch off the default.

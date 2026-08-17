@@ -285,7 +285,7 @@ Relaunching would just observe the same silence, so the tick parks instead —
 That promise needs the release predicate to be refreshable *without* the merge
 the park is withholding, which until #2158 it was not: the reading came from
 the raw `merge_queue` row's `error` column, which only a live `coord merge`
-attempt ever writes — and a parked entry runs none. claude-coordinator#2138
+attempt ever writes — and a parked entry runs none. code-coordinator#2138
 (2026-08-12) sat parked **7h25m** over CI that had gone green 41 seconds
 *before* the park was written, and moved only when an unrelated merge happened
 to rewrite the board. There are now two exits, and a park always has at least
@@ -432,22 +432,31 @@ already uses to release a `parked` entry on the same lane.
 ## 5. The pinned-CLI trap
 
 The timer runs a **specific installed `coord`**, not a checkout — it does not
-notice a merged fix on `main` until that `coord` is upgraded. On dellserver,
-`~/.local/bin/coord` is a symlink into `~/.coord-venv`, a pinned, non-editable
-PyPI install — the very same venv `deploy/coord-agent.service` runs `coord
-agent` from (`%h/.coord-venv/bin/coord`, see `install-agent.sh`). That already
-satisfies #1523's "the runner's own CLI must not be rewritable by worker
-branch churn" requirement, **and** it means this venv is upgraded by the
-ordinary, already-documented fleet procedure. It is deliberately **not** a
-bespoke pinned venv like the epic sequencer's `~/.coord-cli-venv`
-(`docs/AGENT_OPERATIONS.md`'s "fourth lane"), which only a human remembering
-to run the upgrade keeps current, and which was found three releases stale
-on 2026-07-29.
+notice a merged fix on `main` until that `coord` is upgraded. `ExecStart`
+points at `%h/.coord-venv/bin/coord` **directly** (#2314 — not
+`~/.local/bin/coord`, even though on dellserver that is normally a symlink
+into the very same venv): the same venv `deploy/coord-agent.service`,
+`coord-serve.service`, `coord-notify.service` and `coord-web.service` already
+run from (see `install-agent.sh`). Pointing at the venv path directly, rather
+than through `~/.local/bin/coord`, closes the gap that path left open: a
+worker running `pip install --user` (or an editable `pip install -e .` that
+lands its own console-script shim there) can silently overwrite
+`~/.local/bin/coord` with something that no longer points at the pinned venv
+at all, and the first this tick would know about that is the next `coord
+drive-queue tick` running whatever the worker just wrote. Going straight to
+`~/.coord-venv/bin/coord` makes that overwrite structurally irrelevant to
+this unit. That already satisfies #1523's "the runner's own CLI must not be
+rewritable by worker branch churn" requirement, **and** it means this venv is
+upgraded by the ordinary, already-documented fleet procedure. It is
+deliberately **not** a bespoke pinned venv like the epic sequencer's
+`~/.coord-cli-venv` (`docs/AGENT_OPERATIONS.md`'s "fourth lane"), which only
+a human remembering to run the upgrade keeps current, and which was found
+three releases stale on 2026-07-29.
 
 ```bash
 coord agent update --machine dellserver   # or --all; upgrades ~/.coord-venv
                                            # in place and restarts coord-agent
-~/.local/bin/coord --version              # VERIFY it took — an upgrade
+~/.coord-venv/bin/coord --version         # VERIFY it took — an upgrade
                                            # silently no-ops more often than
                                            # you would think
 ```
@@ -459,19 +468,31 @@ currently running on dellserver — check for active assignments first (see
 drive` process tree, independent of `coord-agent`.
 
 **If you ever install this timer on a machine other than the current daemon
-host, verify first that its `coord` resolves to a non-editable install:**
+host, verify first that its `~/.coord-venv` is a non-editable install:**
 
 ```bash
-readlink -f ~/.local/bin/coord                   # which venv it resolves to
-pip show claude-coordinator | grep -i editable   # must print NOTHING
+readlink -f ~/.coord-venv/bin/coord              # must resolve INTO the venv,
+                                                  # not out to a checkout
+~/.coord-venv/bin/pip show code-coordinator | grep -i editable
+                                                  # must print NOTHING
 ```
 
-The topology is **per-machine, not universal** — on a dev box (e.g.
-elitebook) `~/.local/bin/coord` is commonly an *editable* install pointing at
-a checkout, which would let a worker's own branch churn rewrite the runner
-mid-run. That is fine for interactive use; it is not safe under an unattended
-timer. Install `coord-drive-queue.timer` only where the verify step above
-comes back non-editable.
+The topology is **per-machine, not universal** — a dev box's `~/.coord-venv`
+(or, on a box with no such venv at all, whatever a hand-edited unit points
+at instead) can be repointed at a checkout, which would let a worker's own
+branch churn rewrite the runner mid-run. That is fine for interactive use; it
+is not safe under an unattended timer. Install `coord-drive-queue.timer` only
+where the verify step above comes back non-editable.
+
+**Belt and suspenders (#2314):** even on a correctly-pinned host, the tick
+itself now refuses to launch anything if `coord`'s OWN process happens to be
+running from an editable checkout that has drifted off its default branch —
+see `coord.drive_queue.plan_tick`'s `editable_drift` parameter and
+`coord.cli._editable_checkout_drift`. This used to be an advisory-only
+warning printed at CLI startup that nothing unattended ever reads; it is now
+a hard refusal, rendered the same way a release cordon is (`no launch — this
+host's coord is drifted onto ...`), with reconciliation still running
+underneath it exactly as a cordon leaves it.
 
 ## 6. The deadline trap (#1660)
 
@@ -534,6 +555,47 @@ and then to `blocked` at `max_attempts`. The failure signature to watch for
 is `retry — drive session died without landing the work` appearing **within
 seconds** of a launch; that must never happen again.
 
+## 7a. Retry spacing (#2273)
+
+A `retry` reconcile used to relaunch in the SAME tick — "died and came back"
+was one event, by design (§7's whole point is not idling a full interval on
+a confidently-dead drive). On 2026-08-15 that same-tick relaunch is exactly
+what let quadraui#508 and coord-portal#83 each burn their entire two-attempt
+budget inside **six minutes** — a transient `coord assign` failure that had
+cleared by the time a human noticed, 18 minutes later. Two attempts fired
+minutes apart is not a retry policy against a transient; it is two samples
+of the same short window.
+
+So a died entry's NEXT launch is now paced by real wall-clock time, not just
+by tick cadence: 1 minute after the first attempt, 5 minutes after the
+second, 20 minutes after the third and beyond. Widened further — 5 minutes
+minimum — when the died launch never produced a board-visible assignment at
+all (`assignment_id` never existed for that run): the cheap, already-recorded
+approximation of "this was infrastructure, not a code failure" that does not
+need the full transient-vs-real classification (blocked on a stderr-capture
+prerequisite this queue does not have yet).
+
+What this looks like in the journal — a died entry that is still pacing its
+next attempt, not stalled:
+
+```
+  reconcile claude-coordinator#1762: retry — drive session died without
+      landing the work, launched 320s ago (attempt 1/2) — requeued at
+      position 0
+  defer claude-coordinator#1762: retry backoff: the previous attempt failed
+      4s ago, next attempt permitted in 56s (60s spacing after 1 attempt(s)
+      — #2273, so a transient dispatch failure cannot spend the whole retry
+      budget inside one tick cadence)
+  no launch — every waiting entry is pacing a retry after a recent failure
+      (#2273); it resumes once the backoff elapses
+```
+
+This raises no `QUEUE: STALLED` alert (same posture §9's per-repo ceiling
+already takes): nothing is wrong with the entry, no operator can make the
+clock move faster, and it resumes on its own the moment the backoff elapses.
+`coord drive-queue list`/`status` show the pacing directly in `last_reason`
+if you want to confirm it is working rather than wedged.
+
 ## 8. The cross-host trap (#1870)
 
 Liveness (`coord.drive.list_drive_sessions()`) is always a **local** `tmux
@@ -588,7 +650,7 @@ parallelism is safe: within a repo is the risky case, across repos is nearly
 free.
 
 One global counter conflated the two. With `--max-parallel 3` and a queue of 39
-claude-coordinator entries followed by one quadraui entry, a tick launched the
+code-coordinator entries followed by one quadraui entry, a tick launched the
 same-repo neighbours most likely to stale each other and never reached the
 quadraui entry that could have run alongside for free. The only way to get the
 wanted behaviour was hand-chaining `--after` across 38 entries — tedious,

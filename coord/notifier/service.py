@@ -17,6 +17,7 @@ is exactly how a fleet ends up with two that disagree.
 from __future__ import annotations
 
 import logging
+import socket
 import time
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
@@ -56,6 +57,10 @@ class TickResult:
     digest: NotifyEvent | None = None
     failed: list[tuple[NotifyEvent, str]] = field(default_factory=list)
     error: str | None = None
+    #: #2276 Phase 1 diagnoses this tick derived — read-only, and reported
+    #: here rather than notified.  A diagnosis is evidence for the block log,
+    #: not something worth waking an operator for.
+    diagnoses: list[Any] = field(default_factory=list)
 
     def __bool__(self) -> bool:
         return bool(self.delivered or self.deferred or self.digest)
@@ -74,6 +79,8 @@ class TickResult:
             bits.append("digest sent")
         if self.failed:
             bits.append(f"{len(self.failed)} undelivered")
+        if self.diagnoses:
+            bits.append(f"{len(self.diagnoses)} diagnosed")
         return ", ".join(bits)
 
 
@@ -141,6 +148,117 @@ def deliver(
     return delivered, failed
 
 
+def diagnose_pass(
+    events: Sequence[NotifyEvent],
+    config: Any,
+    *,
+    fleet_health: Mapping[str, Any] | None = None,
+    now: float | None = None,
+    probe: Any = None,
+    persist: bool = True,
+) -> list[Any]:
+    """#2276 Phase 1: re-derive the true cause of everything *events* named.
+
+    **This is the trigger, and it is the notifier's own detector.**  #2235 is
+    explicit that Phase 1 must *"consume that detector, not build a second
+    one"*, so the input here is the exact :class:`NotifyEvent` list
+    :func:`coord.notifier.predicate.evaluate` just produced.  There is no
+    threshold, no age comparison and no clock anywhere on this path — the
+    stall definition lives in ``predicate.py`` and nowhere else, and
+    ``tests/test_block_log.py`` asserts that no second one appeared.
+
+    **Why here.**  A diagnosis needs ``gh``, and ``gh`` is denied to workers
+    (#1483), so it cannot be a ``coord assign`` leg.  The notifier tick runs
+    in-process inside ``coord serve`` on the coordinator host, which already
+    holds the operator's ``gh`` credentials, already has the board loaded, and
+    already just fetched ``/health`` — so Phase 1 rides that one round trip
+    instead of opening a new trust boundary for a task whose entire output is
+    a log line.
+
+    **It writes nothing but its own record.**  No board write, no queue write,
+    no ``gh`` verb that is not a read.  It also never raises: this is called
+    from the daemon's hot path, and an advisory diagnosis that can take
+    reconciliation down with it is worse than no diagnosis.
+    """
+    if not events:
+        return []
+    try:
+        from coord import block_log, queue_diagnose  # noqa: PLC0415
+        from coord.drive_queue import entries_from_rows  # noqa: PLC0415
+        from coord.state import build_board, list_drive_queue  # noqa: PLC0415
+
+        keys = queue_diagnose.stalled_keys(events)
+        if not keys:
+            return []
+        # Cheapest read first, and it is the one that rules the pass out most
+        # often: the notifier raises on assignments, drives and gates, and
+        # only some of those are drive-queue entries at all.  Nothing below
+        # this line runs on a tick that raised events for work the queue does
+        # not own — no log parse, no board build, no `gh`.
+        wanted = set(keys)
+        entries = [e for e in entries_from_rows(list_drive_queue()) if e.key in wanted]
+        if not entries:
+            return []
+        episodes = [
+            ep
+            for ep in block_log.episodes(block_log.read_events())
+            if not ep.get("resolved")
+        ]
+        if not episodes:
+            return []
+        if probe is None:
+            probe = queue_diagnose.GhLiveProbe(
+                config=config, board=build_board(), fleet_health=fleet_health
+            )
+        diagnoses = queue_diagnose.run_pass(
+            entries,
+            episodes,
+            probe=probe,
+            keys=keys,
+            triggers=queue_diagnose.trigger_conditions(events),
+        )
+        if diagnoses and persist:
+            block_log.record(
+                block_log.diagnosis_event(
+                    key=d.key,
+                    state=d.state,
+                    stated_reason=d.stated_reason,
+                    true_cause=d.true_cause,
+                    cause=d.cause,
+                    confidence=d.confidence,
+                    evidence=d.evidence,
+                    contradicts_stated=d.contradicts_stated,
+                    trigger=d.trigger,
+                    host=_local_host(),
+                    now=now,
+                )
+                for d in diagnoses
+            )
+        return diagnoses
+    except Exception as exc:  # noqa: BLE001 — see docstring; advisory, isolated
+        log.warning(
+            "notifier: diagnosis pass failed (%s: %s)", type(exc).__name__, exc,
+            exc_info=True,
+        )
+        return []
+
+
+def _local_host() -> str:
+    """This machine's identity, stamped on every diagnosis record.
+
+    Same normalisation as ``coord.commands.drive_queue._local_host_id`` and
+    every other host-locality check in this codebase — short hostname,
+    lowercased, domain suffix dropped.  Diverging would split a two-host
+    corpus into ``dellserver`` and ``dellserver.local`` buckets that are the
+    same machine, which is precisely the kind of quiet data defect that makes
+    Phase 2's scoping wrong.
+    """
+    try:
+        return socket.gethostname().split(".")[0].lower()
+    except Exception:  # noqa: BLE001 — pragma: no cover
+        return ""
+
+
 def _tick(
     config: Any,
     *,
@@ -180,6 +298,16 @@ def _tick(
     fresh = select_deliverable(raised, state.ledger)
 
     result = TickResult(enabled=True, quiet=is_quiet(window, now), raised=list(fresh))
+
+    # #2276 Phase 1 runs off `raised`, NOT `fresh`.  `select_deliverable` is a
+    # notification-noise filter — "the operator already knows" — and evidence
+    # is not noise: the live state that explains a stall expires nightly, so a
+    # stall suppressed as a duplicate is still a stall whose cause is only
+    # derivable now.  Re-diagnosis is bounded by Phase 1's own per-episode
+    # budget instead (`queue_diagnose.needs_diagnosis`).
+    result.diagnoses = diagnose_pass(
+        raised, config, fleet_health=fleet_health, now=now, persist=persist
+    )
 
     send_now, hold = partition(fresh, window, now)
     if hold:

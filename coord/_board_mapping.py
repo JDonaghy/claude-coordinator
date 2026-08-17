@@ -158,6 +158,9 @@ def row_to_assignment(row: object) -> Assignment:
         # row predating this column and for a normally-parsed verdict.
         verdict_source=d.get("verdict_source"),
         verdict_source_reason=d.get("verdict_source_reason"),
+        # #2316: raw terminal stop_reason; None for rows predating this
+        # column or a worker whose log carried no such field.
+        stop_reason=d.get("stop_reason"),
     )
 
 

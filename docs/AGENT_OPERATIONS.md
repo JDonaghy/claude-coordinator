@@ -227,7 +227,7 @@ Neither one leads reliably. Ask "can pip resolve it?", not "is it
 published?":
 
 ```bash
-curl -s https://pypi.org/simple/claude-coordinator/ | grep -q 'claude_coordinator-X\.Y\.Z' && echo installable
+curl -s https://pypi.org/simple/code-coordinator/ | grep -q 'code_coordinator-X\.Y\.Z' && echo installable
 ```
 
 Expect per-machine variation even after that: a mirror/resolver on one
@@ -311,10 +311,10 @@ version/PID first, then choose between a drift-fix and a plain
 On the target machine:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/JDonaghy/claude-coordinator/main/install-agent.sh | bash -s -- --machine <name> --port 7433
+curl -sSL https://raw.githubusercontent.com/JDonaghy/code-coordinator/main/install-agent.sh | bash -s -- --machine <name> --port 7433
 ```
 
-This creates `~/.coord-venv`, installs `claude-coordinator` from **PyPI**, writes a `coord-agent` systemd user unit, and starts it. The agent does NOT need a git clone of the repo — the `~/src/claude-coordinator` directory should only exist on the machine where you actually develop the coordinator itself.
+This creates `~/.coord-venv`, installs `code-coordinator` from **PyPI**, writes a `coord-agent` systemd user unit, and starts it. The agent does NOT need a git clone of the repo — the `~/src/claude-coordinator` directory should only exist on the machine where you actually develop the coordinator itself.
 
 Verify:
 
@@ -388,9 +388,9 @@ the `~/.coord/` symlink — #1832), adds the repo to each named machine's `repos
 and `repo_paths:`, and creates the `coord` / `tier:small` / `tier:large` labels.
 It re-parses its own edit and refuses to write if the result would not load.
 
-Then it **prints the residue it deliberately did not do** — clone, agent
-restart, `CLAUDE.md`, CI workflow, `capability_rules` — rather than pretending
-completeness. Work through that list, then:
+Then it **prints the residue it deliberately did not do** — clone, `CLAUDE.md`,
+CI workflow, `capability_rules` — rather than pretending completeness. Work
+through that list, then:
 
 ```bash
 coord repo doctor <name>        # exits non-zero on any CRIT, so it can gate
@@ -405,7 +405,7 @@ finding and its own remedy — they are not interchangeable:
 
 | finding | what it means | fix |
 | --- | --- | --- |
-| `machines.agent_repo_skew` | config declares the repo for this machine; the live agent has never re-read it (#2219) | **restart `coord-agent` there** — and not while headless workers are live |
+| `machines.agent_repo_skew` | config declares the repo for this machine; the live agent's `/health` still doesn't serve it | since #2299 agents re-read `coordinator.yml` themselves — **wait one `/health` poll and re-run**. If it persists: that agent's file is stale (`git pull` in `coord-settings` on *that* machine), the edit is malformed (check `journalctl --user -u coord-agent` for `failed to reload`), or the agent predates #2299 (`coord agent update`). A restart is the last resort, not the first |
 | `machines.clone_missing` | the agent knows the repo and reports the path absent | clone it; a restart changes nothing |
 | `machines.repo_path_missing` | no `repo_paths` entry at all | a config repair |
 | `github.coord_label_missing` | issues are live but **invisible to the Pipeline** | `gh label create coord` |
@@ -419,9 +419,53 @@ remembering to ask. It costs no extra round trip — it re-reads the `/health`
 bodies `coord doctor` already fetched. The GitHub, contents and graph layers
 need the dedicated command.
 
-Do not forget the two steps no config edit can do for you: **commit and push in
-`coord-settings`, then `git pull` on the daemon host**, and **restart each
-agent**. The repo list is frozen at agent process start.
+Do not forget the step no config edit can do for you: **commit and push in
+`coord-settings`, then `git pull` on every machine that serves the repo** — the
+fleet runs the committed config, and an agent can only re-read the file that
+actually exists on its own disk.
+
+### Agents re-read `coordinator.yml` themselves (#2299) — what is hot, what is not
+
+Adding a repo used to require `systemctl --user restart coord-agent` on every
+machine that should serve it. That is the one action that also **kills live
+workers**, so in practice a repo could only be onboarded once the whole fleet
+had gone quiet. Worse, the skew was silent and asymmetric: `coord config`,
+`coord status` and `coord assign --dry-run` all read the *file* and agreed the
+repo was supported, while the agent refused every dispatch for it.
+
+Agents now carry the same mtime-guarded reload the board daemon has had since
+#1081 (`coord.config_reload.reload_config_if_stale`), driven off the existing
+`/health` poll and the dispatch path — no new timer, no background thread.
+
+| field | behaviour |
+| --- | --- |
+| `machines[].repos` | **hot** — next `/health` poll or next dispatch |
+| `machines[].repo_paths` | **hot** |
+| `machines[].capabilities` | **hot** — routing reads the published `/health` list, so a removed capability degrades (stops attracting work) rather than stranding anything |
+| `repos[].artifact_paths` | **hot** |
+| `repos[].build_command` | **hot** |
+| `providers:` | **restart-only** — a live worker holds a provider resolved at dispatch time; swapping the registry underneath would retarget a running session |
+| `concurrency.bash_wrap_spawn`, `concurrency.first_output_timeout` | **restart-only** — process tuning `_spawn` has already committed to |
+| agent bind host/port | **restart-only** — uvicorn bound the socket at startup |
+
+Two invariants worth knowing when reading `journalctl --user -u coord-agent`:
+
+* **A malformed hand-edit does not take the agent down.** It logs `failed to
+  reload ... keeping last-good config until the file is fixed` **once** (the
+  tracked mtime advances, so a bad edit is not retried on every poll) and the
+  agent keeps serving the pre-edit config. Fix the file and the next poll picks
+  it up.
+* **A reload never disturbs a running worker.** Any repo with a PENDING or
+  RUNNING assignment keeps the `repo_paths` / `artifact_paths` /
+  `build_command` values it started with — including their *absence* — until
+  that assignment is terminal. The new config governs the next dispatch onward.
+
+`/health` publishes a `config_reload` block (`watching`, `reloads`,
+`last_reload_at`) so "did my edit land?" is answerable from `coord doctor`
+rather than an SSH. `watching: null` means that agent has no local
+`coordinator.yml` at all (config-free / thin-client, `docs/EPHEMERAL_WORKERS.md`)
+— for those, a restart *is* still the only way to change the repo list, and
+their repos come from the coordinator at dispatch time anyway.
 
 ## Install coordinator skills (`coord install-skills`, #319)
 
@@ -1072,7 +1116,7 @@ From the coordinator machine:
 coord agent update --all
 ```
 
-This POSTs to `/update` on every machine in `coordinator.yml`, telling each agent exactly which version the coordinator wants (`target_version`). Each agent pins its pip install to that exact release (`pip install --upgrade --no-cache-dir claude-coordinator==<target_version>`) and restarts.
+This POSTs to `/update` on every machine in `coordinator.yml`, telling each agent exactly which version the coordinator wants (`target_version`). Each agent pins its pip install to that exact release (`pip install --upgrade --no-cache-dir code-coordinator==<target_version>`) and restarts.
 
 **#1886: `target_version` is resolved from PyPI's simple index — the same source `pip install -U` itself resolves against — NOT from this CLI's own `__version__`.** A stale operator install (PyPI already has a newer release than the CLI running `coord agent update`) used to silently pin the whole fleet to that stale, older version while still printing a clean `✓` on every machine. If this CLI's own version is behind PyPI's latest, the command now prints a loud warning and targets the *newer* PyPI release instead — never its own age. Pass `--version X.Y.Z` to pin to something else on purpose (a rollback, a pre-release); that skips the PyPI lookup entirely.
 
@@ -1127,7 +1171,7 @@ same machine *and* from the editable CLI in `~/src/claude-coordinator`. It is
 upgraded by exactly one thing: someone remembering to do it.
 
 ```bash
-~/.coord-cli-venv/bin/pip install --upgrade --no-cache-dir claude-coordinator==X.Y.Z
+~/.coord-cli-venv/bin/pip install --upgrade --no-cache-dir code-coordinator==X.Y.Z
 ~/.coord-cli-venv/bin/coord --version    # verify — never infer from pip's exit code
 ```
 
@@ -1587,7 +1631,7 @@ echo "agent is on <new-version>"
 Behaviour worth knowing:
 
 - The endpoint **runs `pip install --upgrade --no-cache-dir
-  claude-coordinator`** (or `git pull --ff-only` for an editable
+  code-coordinator`** (or `git pull --ff-only` for an editable
   install) in a daemon-less background thread, then `os.execv`-restarts
   **only if the version actually changed**.
 - If the installed version is already current it records
@@ -1630,8 +1674,8 @@ When `last_update.mode` is `editable (git pull)`, the agent's venv has a `pip in
 
 ```bash
 ssh <host>
-~/.coord-venv/bin/pip uninstall -y claude-coordinator
-~/.coord-venv/bin/pip install --upgrade claude-coordinator
+~/.coord-venv/bin/pip uninstall -y code-coordinator
+~/.coord-venv/bin/pip install --upgrade code-coordinator
 XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart coord-agent
 ```
 
@@ -1670,7 +1714,7 @@ If you have several editable installs to convert, you can script it (assumes SSH
 
 ```bash
 for host in precision elitebook dellserver; do
-  ssh $host '~/.coord-venv/bin/pip uninstall -y claude-coordinator && ~/.coord-venv/bin/pip install --upgrade claude-coordinator && XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart coord-agent'
+  ssh $host '~/.coord-venv/bin/pip uninstall -y code-coordinator && ~/.coord-venv/bin/pip install --upgrade code-coordinator && XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart coord-agent'
 done
 ```
 
@@ -1771,4 +1815,4 @@ chmod 600 ~/.ssh/authorized_keys   # on each agent
 
 For background on why rsync-over-SSH was chosen over direct HTTP download
 (signed URL vs key-auth tradeoffs, GC behaviour, TTL defaults), see the
-original design in [GitHub issue #305](https://github.com/JDonaghy/claude-coordinator/issues/305).
+original design in [GitHub issue #305](https://github.com/JDonaghy/code-coordinator/issues/305).

@@ -95,6 +95,30 @@ use quadraui::{
 };
 use quadraui::terminal_engine::TerminalMouseKind;
 
+/// #2271 / quadraui#584: **does the pinned `quadraui` rev paint every series
+/// of a multi-series bar chart?**
+///
+/// Before #584, `tui/chart.rs`'s `paint_bar` rendered `series[0]` and
+/// silently discarded the rest — a multi-series bar drew a plausible-looking
+/// chart missing most of its data, with no error anywhere. That is worse than
+/// no chart, so the Reports panel gates on this constant and degrades a
+/// multi-series bar declaration to a table with a stated reason rather than
+/// drawing a wrong one (`reports::chart_plan`).
+///
+/// **This is a fact about `tui/Cargo.toml`'s `rev`, so it moves with the pin
+/// and only with the pin** (#1973 — bumping the pin is its own reviewable
+/// commit). It is a `const` rather than a probe because there is nothing to
+/// probe: `paint_bar` is private, its wrongness is silent, and a compile-time
+/// statement about the pin is exactly as trustworthy as the pin itself.
+/// Verify by reading `paint_bar` at the pinned rev — if it loops
+/// `chart.series.iter()` (and `ChartKind` has a `BarGrouped` variant), this
+/// is `true`.
+///
+/// Currently `true`: the pin was bumped to `d70da7d` in this same change,
+/// which carries #584 (`paint_bar` loops every series and `ChartKind` gained
+/// `BarGrouped`).
+pub(crate) const QUADRAUI_MULTI_SERIES_BARS: bool = true;
+
 pub(crate) mod types;
 pub(crate) mod format;
 pub(crate) mod data;

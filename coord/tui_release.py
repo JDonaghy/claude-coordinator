@@ -60,7 +60,7 @@ from pathlib import Path
 
 #: The GitHub ``owner/repo`` this coordinator's own releases live on
 #: (matches pyproject.toml's ``[project.urls] Repository``).
-DEFAULT_REPO = "JDonaghy/claude-coordinator"
+DEFAULT_REPO = "JDonaghy/code-coordinator"
 
 #: GitHub's REST API root. Overridable (``coord tui update --api-base``) so
 #: tests can point this at a local stub server instead of the real network.

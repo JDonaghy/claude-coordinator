@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 from coord import cargo_cache
+from coord.config_reload import reload_config_if_stale
 from coord.models import DELIVERABLE_ANALYSIS_LABEL
 from coord.platform_paths import default_coord_dir
 
@@ -229,6 +230,51 @@ def _looks_like_policy_refusal(text: str | None) -> bool:
         return False
     lowered = text.lower()
     return any(marker in lowered for marker in _POLICY_REFUSAL_MARKERS)
+
+
+# #2316: `WorkerSummary.stop_reason` values that mean the model was CUT OFF
+# by an output-token ceiling before it could finish — as opposed to a normal
+# stop (`end_turn`/`stop_sequence`, see `coord.progress`'s identical "unusual
+# stop" allowlist). `"length"` is opencode's `step_finish` reason
+# (`coord.providers.opencode.OpenCodeProvider.parse_log`, gated on opencode's
+# `OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX`); `"max_tokens"` is Anthropic's own
+# `stop_reason` for the same shape. Either one on a 0-commit clean exit means
+# the worker never got a turn to write anything — the space-invaders#1
+# incident (13 successful tool calls, then one reasoning block burned the
+# entire 32k-token budget and exited 0 with nothing on disk) is exactly this:
+# `exit_code == 0` looked like "worker exited cleanly but pushed 0 commits"
+# (the #448 ADVISORY reading) when it was actually a truncation nobody could
+# have acted on differently. See `_reap`, which checks this BEFORE the #448
+# zero-commit downgrade.
+_TRUNCATION_STOP_REASONS = frozenset({"length", "max_tokens"})
+
+# #2321: the opencode-specific knob named in the GitHub comment so an
+# operator reading "cut off at its output limit" doesn't have to go
+# rediscover — as the #2316 investigation had to — that the ceiling is
+# adjustable per provider definition.
+_OPENCODE_OUTPUT_TOKEN_MAX_ENV = "OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX"
+
+
+def _format_truncation_reason(stop_reason: str, provider_name: str | None) -> str:
+    """#2316: human-readable diagnostic for a 0-commit run truncated by an
+    output-token ceiling — used for both `AgentAssignment.truncation_reason`
+    (persisted `failure_reason`) and `AgentAssignment.error` (the GitHub
+    completion comment's `error=` text, see `coord.notify`'s FAILED arms).
+
+    Deliberately says "cut off" rather than "exited cleanly" — `exit_code ==
+    0` is what a truncated run looks like, not evidence the worker finished.
+    Names :data:`_OPENCODE_OUTPUT_TOKEN_MAX_ENV` for an opencode worker
+    (#2321: the ceiling is raisable per provider definition) so an operator
+    doesn't have to rediscover that from scratch.
+    """
+    base = "the model was cut off at its output limit before writing anything"
+    if provider_name == "opencode":
+        return (
+            f"{base} (stop_reason={stop_reason!r}; opencode's output-token "
+            f"ceiling is set by {_OPENCODE_OUTPUT_TOKEN_MAX_ENV} and is "
+            "raisable per provider definition — #2321)"
+        )
+    return f"{base} (stop_reason={stop_reason!r})"
 
 
 # ── Reap tuning ───────────────────────────────────────────────────────────────
@@ -2998,6 +3044,20 @@ class AgentAssignment:
     # one of `analysis_deliverable`/`zero_commit_reason`/this field is ever
     # set for a given assignment).
     policy_refusal_reason: str | None = None
+    # #2316: set when `_reap` classifies a clean (exit_code==0), 0-commit
+    # exit as a TRUNCATION — the worker's last `result`/`step_finish` event
+    # carries a `stop_reason` in `_TRUNCATION_STOP_REASONS` (opencode's
+    # `"length"`, claude's `"max_tokens"`) — rather than the #448 ADVISORY
+    # default. Formatted with `_format_truncation_reason`. Only ever set
+    # alongside `status == FAILED` (never ADVISORY: a truncated run is not a
+    # "worker looked and found nothing to do", it is a cut-off nobody chose),
+    # and `None` on every other outcome — including a genuine clean-exit-no-
+    # commits run (no truncation marker matched) and a truncated run that DID
+    # push commits (`_ahead != 0` never reaches this check at all). Mutually
+    # exclusive with `zero_commit_reason`/`analysis_deliverable`/
+    # `policy_refusal_reason`: all four are decided in the SAME `_ahead == 0`
+    # branch of `_reap`, and this one is checked first — see that method.
+    truncation_reason: str | None = None
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -3440,10 +3500,14 @@ MILESTONE_CHAT_DENY_COMMANDS: list[str] = [
     "Bash(git push *)",
     "Bash(git commit *)",
     "Bash(git reset --hard *)",
+    "Bash(git reset * --hard *)",
     "Bash(git branch -D *)",
+    "Bash(git branch * -D *)",
     "Bash(git checkout -- .)",
     "Bash(git clean -f *)",
+    "Bash(git clean * -f *)",
     "Bash(rm -rf *)",
+    "Bash(rm -fr *)",
     "Bash(coord approve *)",
     "Bash(coord merge *)",
     "Bash(coord assign *)",
@@ -3515,11 +3579,19 @@ manually verify in the rendered mock.
 MOCK_AUTHOR_DENY_COMMANDS: list[str] = [
     "Bash(gh *)",
     "Bash(git push --force*)",
+    # #2314: the entry above only matches `--force` IMMEDIATELY after
+    # `push` — a `git push --quiet --force ...` with another flag pushed
+    # in first would evade it.
+    "Bash(git push * --force*)",
     "Bash(git reset --hard *)",
+    "Bash(git reset * --hard *)",
     "Bash(git branch -D *)",
+    "Bash(git branch * -D *)",
     "Bash(git checkout -- .)",
     "Bash(git clean -f *)",
+    "Bash(git clean * -f *)",
     "Bash(rm -rf *)",
+    "Bash(rm -fr *)",
     "Bash(coord approve *)",
     "Bash(coord merge *)",
     "Bash(coord assign *)",
@@ -3539,10 +3611,14 @@ NEW_ISSUE_CHAT_DENY_COMMANDS: list[str] = [
     "Bash(git push *)",
     "Bash(git commit *)",
     "Bash(git reset --hard *)",
+    "Bash(git reset * --hard *)",
     "Bash(git branch -D *)",
+    "Bash(git branch * -D *)",
     "Bash(git checkout -- .)",
     "Bash(git clean -f *)",
+    "Bash(git clean * -f *)",
     "Bash(rm -rf *)",
+    "Bash(rm -fr *)",
 ]
 
 
@@ -3575,6 +3651,46 @@ def build_deny_prompt(deny_commands: list[str]) -> str:
         + "If you need to do something that resembles a forbidden command, STOP and output:\n"
         + "  STUCK: need to run [command] but it's on the deny-list"
     )
+
+
+def bash_deny_pattern_matches(pattern: str, command: str) -> bool:
+    """Whether *command* (a raw shell command string) is caught by a single
+    ``Bash(...)`` deny *pattern*, using the same shell-glob semantics those
+    patterns are written in throughout this module (``*`` matches any run of
+    characters, including none, and including across what would look like an
+    argv token boundary — this is a whole-string glob, not an argv-aware
+    parse).
+
+    #2314: a worker evaded ``Bash(pip install -e *)`` simply by inserting
+    another flag first (``pip install --user -e .``) — the pattern only
+    matched ``-e`` IMMEDIATELY after ``install``. This function exists so
+    that claim ("this deny list actually catches that evasion") is a
+    testable fact rather than something read off the pattern text by eye —
+    see the ``Bash(...)`` entries :data:`coord.config.DEFAULT_DENY_COMMANDS`
+    pairs for exactly this reason, and ``tests/test_worker_safety.py`` for
+    the regression tests built on top of this function.
+
+    Returns ``False`` for a *pattern* that isn't a ``Bash(...)`` rule at all
+    (e.g. an ``Edit(...)``/``Write(...)`` path rule) — those constrain a
+    different tool and never match a shell command string.
+    """
+    if not (pattern.startswith("Bash(") and pattern.endswith(")")):
+        return False
+    inner = pattern[5:-1]
+    return fnmatch.fnmatchcase(command.strip(), inner)
+
+
+def find_denying_bash_pattern(command: str, deny_commands: list[str]) -> str | None:
+    """The first pattern in *deny_commands* that blocks *command*, or ``None``.
+
+    Thin fold over :func:`bash_deny_pattern_matches` — a worker's own deny
+    list is small (single digits to low tens of entries), so a linear scan
+    needs no index.
+    """
+    for pattern in deny_commands:
+        if bash_deny_pattern_matches(pattern, command):
+            return pattern
+    return None
 
 
 # #1315: sealed-oracle path prefix that only an independent authoring type
@@ -3849,6 +3965,12 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
     For ``type="plan"`` specs the worker gets :data:`WORKER_PLAN_PROMPT` as
     its system prompt and only ``Read,Bash`` in ``--allowedTools`` — no
     Edit/Write tools so it cannot modify the repository.
+
+    For ``type="smoke"`` specs the worker gets ``Read,Bash`` only — no
+    Edit/Write, and deliberately no ``Monitor`` (#2301): a smoke leg is a
+    one-shot ``claude -p`` session, and ``Monitor`` ends the turn to await a
+    notification that can never arrive in time to resume it, which silently
+    kills a backgrounded smoke suite mid-run and leaves no verdict printed.
     """
     if spec.type == "plan":
         system_prompt = spec.system_prompt if spec.system_prompt else WORKER_PLAN_PROMPT
@@ -3906,6 +4028,33 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
         system_prompt = spec.system_prompt if spec.system_prompt else MOCK_AUTHOR_SYSTEM_PROMPT
         system_prompt += build_deny_prompt(MOCK_AUTHOR_DENY_COMMANDS)
         allowed_tools = "Read,Edit,Write,Bash"
+    elif spec.type == "smoke":
+        # #2301: smoke gets its own branch instead of falling through to the
+        # generic `else` below (which is where it used to land, and where
+        # it inherited the #2169 `Monitor` grant meant for *work* legs).
+        # A smoke runner's whole job is "pull the branch, run the smoke
+        # command, report pass/fail" (see SMOKE_SYSTEM_PROMPT) — it edits
+        # nothing and pushes nothing, so it has no business holding
+        # Edit/Write either.
+        #
+        # `Monitor` is deliberately withheld: it is an await-a-notification
+        # tool — calling it ends the current turn so the harness can wake
+        # the model back up once the condition it's watching fires. That
+        # only resumes anything in an INTERACTIVE session. A smoke leg is a
+        # one-shot `claude -p` session like every coord leg (#1394): ending
+        # the turn ends the session itself, permanently, before any
+        # notification can arrive. The agent was observed reaching for
+        # `Monitor` via ToolSearch to poll a backgrounded smoke suite, then
+        # ending its turn to "wait" — the session (and the backgrounded
+        # suite, reaped ~30s later) died silently with no verdict printed,
+        # burning a Test dispatch for zero signal every single retry.
+        # `BashOutput`/`TaskOutput` (already reachable without an explicit
+        # grant — see the #2169 comment above) return synchronously and are
+        # the correct way to poll a backgrounded task from here.
+        from coord.smoke import SMOKE_SYSTEM_PROMPT  # noqa: PLC0415
+        system_prompt = spec.system_prompt if spec.system_prompt else SMOKE_SYSTEM_PROMPT
+        system_prompt += build_deny_prompt(spec.deny_commands)
+        allowed_tools = "Read,Bash"
     else:
         system_prompt = spec.system_prompt if spec.system_prompt else WORKER_SYSTEM_PROMPT
         system_prompt += build_deny_prompt(spec.deny_commands)
@@ -3915,6 +4064,15 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
         # past the 600s Bash ceiling. `TaskOutput`/`TaskStop` were already
         # reachable without being in this list; `Monitor` was the one
         # observed denied.
+        #
+        # #2301: this grant is for *work*-shaped legs (work/review/fix/
+        # conflict-fix) whose system prompt (WORKER_SYSTEM_PROMPT, the
+        # ONE-SHOT section) explicitly teaches the bounded-poll pattern and
+        # explains why an await-a-notification tool is safe to reach for
+        # ONLY with that guidance attached. `smoke` used to fall through to
+        # this branch and inherit `Monitor` with none of that context — see
+        # the dedicated `elif spec.type == "smoke"` branch above, which
+        # deliberately withholds it instead.
         allowed_tools = "Read,Edit,Write,Bash,Monitor"
 
     # NOTE: briefing is NOT passed as a positional arg — it is written to
@@ -4010,6 +4168,25 @@ WRITE_CAPABLE_SPEC_TYPES: frozenset[str] = frozenset({
 })
 
 
+def _config_mtime_of(config: "Any | None") -> float | None:
+    """mtime of *config*'s backing ``coordinator.yml``, or None (#2299).
+
+    None whenever there is nothing to watch: config-free mode (no config at
+    all), thin-client mode (the config came from the daemon's ``GET /config``
+    and has no local ``path``), or a file that vanished between load and now.
+    Every one of those cases makes :meth:`AgentServer._maybe_reload_config` a
+    no-op, which is the correct degradation — an agent with no local file has
+    nothing to re-read.
+    """
+    path = getattr(config, "path", None) if config is not None else None
+    if path is None:
+        return None
+    try:
+        return Path(path).stat().st_mtime
+    except OSError:
+        return None
+
+
 class AgentServer:
     """Owns assignment state and subprocesses. Thread-safe."""
 
@@ -4022,6 +4199,14 @@ class AgentServer:
         state_dir: Path = DEFAULT_STATE_DIR,
         worker_command: WorkerCommandBuilder | None = None,
         repo_paths: dict[str, str] | None = None,
+        # RESTART-ONLY (#2299). These two are read by `_spawn` for every
+        # worker, but they are *process* tuning (how the daemon forks and how
+        # long it waits for first output), not fleet topology — they are NOT
+        # refreshed by the config reload below. Changing
+        # `concurrency.bash_wrap_spawn` / `concurrency.first_output_timeout`
+        # in coordinator.yml still requires `systemctl --user restart
+        # coord-agent`, as do the bind host/port (owned by uvicorn, which has
+        # already bound the socket by the time any reload could run).
         bash_wrap_spawn: bool = True,
         first_output_timeout: float = _FIRST_OUTPUT_TIMEOUT,
         # #305: per-repo artifact glob patterns; repo_name → list of globs.
@@ -4091,10 +4276,50 @@ class AgentServer:
         # :mod:`coord.providers` at module load time — concrete instances
         # are duck-typed (``build_command``, ``initial_input``,
         # ``capabilities``, ``env``) at call sites.
+        #
+        # RESTART-ONLY (#2299): the registry is deliberately NOT refreshed by
+        # the config reload. A running worker holds a provider resolved at
+        # dispatch time (`_resolve_provider`), and `_reap` re-resolves the
+        # SAME spec afterwards to pick a log parser — swapping the registry
+        # underneath would let a live session's provider silently change
+        # identity mid-flight (retargeting its model / log format), which is
+        # exactly the "never mutate state a running worker depends on"
+        # invariant this feature is bounded by. Adding or editing a provider
+        # still needs a restart.
         self._providers: dict[str, object] = dict(providers or {})
         self._worktree_writable_settings_files = worktree_writable_settings_files
         self._health_config = health_config
         self.config_free_reason = config_free_reason
+
+        # ── #2299: hot config reload ────────────────────────────────────────
+        # The agent used to freeze every config-derived field above at process
+        # start, so adding a repo to coordinator.yml required `systemctl --user
+        # restart coord-agent` on every machine that should serve it — the one
+        # action that also kills live workers, which in practice meant waiting
+        # for the whole fleet to go quiet before a repo could be onboarded at
+        # all. Worse, the skew was silent and asymmetric: `coord config`,
+        # `coord status` and `coord assign --dry-run` all read the *file* and
+        # reported the repo as supported while `assign()` refused every single
+        # dispatch for it.
+        #
+        # `_maybe_reload_config` closes that, driven off the existing /health
+        # poll and the dispatch path (no new timer, no background thread).
+        # `_config_mtime` is seeded here from the file we were built from so
+        # the first poll after startup is a no-op stat(), not a redundant
+        # reparse.
+        self._config_mtime: float | None = _config_mtime_of(health_config)
+        # Serializes reload attempts so two concurrent /health polls (or a
+        # poll racing a dispatch) can't both parse the file and apply
+        # overlapping swaps. Held across stat + parse + apply. Lock order is
+        # always `_config_reload_lock` → `_lock`; nothing takes them the other
+        # way round.
+        self._config_reload_lock = threading.Lock()
+        # Observability for /health: how many times the on-disk config was
+        # successfully re-read into this process, and when. In-memory only —
+        # it exists to answer "did this agent pick up my edit?" without an
+        # SSH + journalctl, which is the question #2299 was really about.
+        self._config_reloads: int = 0
+        self._config_reloaded_at: float | None = None
 
         self._lock = threading.Lock()
         self._assignments: dict[str, AgentAssignment] = {}
@@ -4227,9 +4452,304 @@ class AgentServer:
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self._load_state()
 
+    # ── #2299: hot config reload ────────────────────────────────────────────
+
+    #: Config-derived state that a reload refreshes, versus the state it must
+    #: leave alone. Kept as a docstring-adjacent constant so the *decision*
+    #: (issue #2299's "needs a decision, not an assumption" list) is recorded
+    #: in the code rather than only in the issue thread.
+    #:
+    #: HOT (refreshed on the next health poll / dispatch):
+    #:   * ``repos``          — the point of the feature; gates ``assign()``
+    #:                          and is what ``/health`` advertises.
+    #:   * ``repo_paths``     — resolved per dispatch.
+    #:   * ``artifact_paths`` — read when a finished worker's artifacts are
+    #:                          stashed.
+    #:   * ``build_commands`` — read just before that stash.
+    #:   * ``capabilities``   — published in ``/health``; the coordinator does
+    #:                          smoke/review routing from that published list,
+    #:                          and nothing in the *worker* path reads it, so a
+    #:                          capability that disappears simply stops
+    #:                          attracting new work (degrade) instead of
+    #:                          stranding anything in flight.
+    #:   * ``providers``      — #2326: rebuilt from ``providers.definitions``
+    #:                          at DISPATCH time (``assign()``, before
+    #:                          ``_resolve_provider``), not on a timer — that
+    #:                          is the only moment the answer matters. Before
+    #:                          #2326 this dict was parsed once at startup and
+    #:                          never invalidated, so an agent with its own
+    #:                          local ``coordinator.yml`` silently ran on a
+    #:                          days-stale provider definition (wrong model,
+    #:                          missing env) even though every coordinator-
+    #:                          side surface (``coord config``, the daemon's
+    #:                          own ``build_provider(...)``) showed the edit
+    #:                          as live. Any provider name in use by a
+    #:                          PENDING/RUNNING assignment is pinned to its
+    #:                          pre-reload entry (present or absent) —
+    #:                          swapping a live worker's provider identity
+    #:                          mid-flight (model, env, log-parser shape)
+    #:                          remains forbidden; only the NEXT dispatch
+    #:                          sees the new definition.
+    #:
+    #: RESTART-ONLY (documented at their assignment sites in ``__init__``):
+    #:   * ``bash_wrap_spawn`` / ``first_output_timeout`` — process tuning.
+    #:   * bind host/port     — uvicorn has already bound the socket.
+    _RELOADABLE_FIELDS = (
+        "repos",
+        "repo_paths",
+        "artifact_paths",
+        "build_commands",
+        "capabilities",
+        "providers",
+    )
+
+    def _maybe_reload_config(self) -> bool:
+        """Re-read ``coordinator.yml`` if it changed on disk; return True if applied.
+
+        This is #2299's whole mechanism. It reuses the board daemon's #1081
+        helper (:func:`coord.config_reload.reload_config_if_stale`) rather than
+        inventing a second one, so the malformed-edit behaviour is identical by
+        construction: a bad hand-edit is logged and swallowed, the agent keeps
+        running on the last-good config, and the tracked mtime still advances
+        so the bad edit is not re-parsed on every subsequent poll.
+
+        Cheap enough to call on the hot paths that already exist (``health()``
+        and ``assign()``): the steady-state cost is one ``stat()`` under an
+        uncontended lock — no new timer and no background thread.
+
+        Fail-soft in every direction. A missing/thin-client config, a vanished
+        file, a malformed edit, or a config whose ``machines:`` list no longer
+        contains this machine all leave the agent exactly as it was.
+        """
+        cfg = self._health_config
+        if cfg is None or getattr(cfg, "path", None) is None:
+            # Config-free (docs/EPHEMERAL_WORKERS.md) or thin-client mode —
+            # there is no local file to watch. Both are legitimate; neither
+            # can drift against a file it doesn't have.
+            return False
+
+        with self._config_reload_lock:
+            # Re-read under the lock: a concurrent caller may already have
+            # applied this same edit while we waited, in which case
+            # `_config_mtime` has moved past it and the helper no-ops.
+            cfg = self._health_config
+            reloaded, mtime = reload_config_if_stale(
+                cfg,
+                self._config_mtime,
+                log_name=__name__,
+                label="coord agent",
+            )
+            self._config_mtime = mtime
+            if reloaded is cfg:
+                return False
+
+            machine = next(
+                (m for m in reloaded.machines if m.name == self.machine_name), None
+            )
+            if machine is None:
+                # The edit removed/renamed this machine. Adopting a config
+                # that doesn't describe us would mean publishing an empty repo
+                # list and refusing every dispatch — a far worse outcome than
+                # staying on the last-good snapshot until an operator notices.
+                # `_config_mtime` has still advanced, so this logs once per
+                # edit rather than once per poll.
+                _log.warning(
+                    "coord agent: %s reloaded but no longer declares machine "
+                    "%r (has: %s); keeping the previous config",
+                    reloaded.path,
+                    self.machine_name,
+                    [m.name for m in reloaded.machines],
+                )
+                return False
+
+            self._apply_reloaded_config(reloaded, machine)
+            return True
+
+    def _rebuild_providers(self, cfg: "Any") -> "dict[str, object] | None":
+        """Build a fresh provider registry from *cfg*'s ``providers.definitions``.
+
+        Mirrors the startup-time loop in
+        ``coord.commands.agent_ops._resolve_agent_startup`` (``build_provider``
+        for every entry), but — unlike startup — must never raise. A typo'd
+        ``providers.definitions`` entry reaching this agent via a hot reload
+        must not take a running daemon down; ``reload_config_if_stale``
+        already applies that same fail-soft contract to a malformed YAML
+        edit, and a config that parses fine but names an unknown provider
+        ``type`` deserves the identical treatment. Returns ``None`` (rather
+        than a partial dict) on any failure, so the caller keeps the
+        entire previous registry until the edit is fixed — matching the
+        "keep last-good config" behaviour for a bad ``coordinator.yml``.
+        """
+        from coord.providers import build_provider  # noqa: PLC0415
+
+        fresh: dict[str, object] = {}
+        try:
+            for name, defn in cfg.providers.definitions.items():
+                fresh[name] = build_provider(name, defn, cfg.models)
+        except Exception as exc:  # noqa: BLE001 — never let a bad edit kill the agent
+            _log.warning(
+                "coord agent: %s's providers.definitions failed to rebuild "
+                "(%s: %s); keeping the previous provider registry (%s) "
+                "until the edit is fixed",
+                cfg.path,
+                type(exc).__name__,
+                exc,
+                sorted(self._providers) if self._providers else "none configured",
+            )
+            return None
+        return fresh
+
+    def _apply_reloaded_config(self, cfg: "Any", machine: "Any") -> None:
+        """Swap the reloadable fields in place, pinning anything in flight.
+
+        The invariant from #2299: *a reload must never mutate state a running
+        worker depends on.* In-flight assignments keep the values they started
+        with; the new config governs the next dispatch onward.
+
+        Concretely, any repo with a PENDING or RUNNING assignment is "pinned":
+        its ``repo_paths`` / ``artifact_paths`` / ``build_commands`` entries
+        keep their pre-reload values (including *absence* — a repo that had no
+        build command before must not acquire one halfway through a worker's
+        leg, or the pre-stash build would run a command the worker never
+        expected). The pin lifts as soon as that assignment reaches a terminal
+        state and the next reload runs.
+
+        ``repos`` and ``capabilities`` are replaced wholesale: they gate and
+        advertise *new* work only, so removing a repo correctly means "take no
+        more dispatches for it", not "abandon the worker already running".
+
+        #2326: ``providers`` gets the exact same pin treatment, keyed by
+        provider *name* instead of repo name. A provider name in use by a
+        PENDING/RUNNING assignment keeps its pre-reload instance (including
+        absence) — ``_reap`` re-resolves the same ``spec`` after the worker
+        exits (to pick a log parser), and it must get back the SAME provider
+        identity ``assign()``/``_spawn()`` resolved, not one a reload swapped
+        underneath it (different model/env/log-parser shape). Any provider
+        name with no in-flight assignment is free to pick up the new
+        definition immediately — that is the entire point of #2326: the next
+        *dispatch*, not the next restart, sees a config edit.
+
+        Every field is *rebound* to a freshly-built list/dict rather than
+        mutated in place, so the many unsynchronized readers elsewhere in this
+        class (``_servable_repos``, ``_stash_artifacts``, ``assign``, ...) see
+        either the whole old value or the whole new one — never a half-updated
+        dict.
+        """
+        new_repos = list(machine.repos)
+        new_capabilities = list(machine.capabilities)
+        new_repo_paths = dict(machine.repo_paths or {})
+        new_artifact_paths: dict[str, list[str]] = {
+            r.name: list(r.artifact_paths) for r in cfg.repos if r.artifact_paths
+        }
+        new_build_commands: dict[str, str] = {
+            r.name: r.build_command for r in cfg.repos if r.build_command
+        }
+        # #2326: built outside the lock — `build_provider` is pure
+        # construction (no I/O), but there is no reason to hold `self._lock`
+        # across it. `None` means "rebuild failed, keep the old registry
+        # verbatim" (see `_rebuild_providers`'s docstring).
+        new_providers = self._rebuild_providers(cfg)
+
+        def _pin(old: dict, new: dict, keys: "Iterable[str]") -> None:
+            """Restore *old*'s entry for each pinned key — including absence."""
+            for key in keys:
+                if key in old:
+                    new[key] = old[key]
+                else:
+                    new.pop(key, None)
+
+        with self._lock:
+            in_flight = {
+                a.spec.repo_name
+                for a in self._assignments.values()
+                if a.status in (PENDING, RUNNING)
+            }
+            _pin(self.repo_paths, new_repo_paths, in_flight)
+            _pin(self.artifact_paths, new_artifact_paths, in_flight)
+            _pin(self.build_commands, new_build_commands, in_flight)
+
+            added = [r for r in new_repos if r not in self.repos]
+            removed = [r for r in self.repos if r not in new_repos]
+            caps_changed = new_capabilities != self.capabilities
+
+            self.repos = new_repos
+            self.capabilities = new_capabilities
+            self.repo_paths = new_repo_paths
+            self.artifact_paths = new_artifact_paths
+            self.build_commands = new_build_commands
+
+            providers_added: list[str] = []
+            providers_removed: list[str] = []
+            providers_pinned: list[str] = []
+            if new_providers is not None:
+                in_flight_providers = {
+                    a.spec.provider
+                    for a in self._assignments.values()
+                    if a.status in (PENDING, RUNNING) and a.spec.provider is not None
+                }
+                old_providers = self._providers
+                _pin(old_providers, new_providers, in_flight_providers)
+                # Deliberately NOT trying to report "changed vs unchanged" per
+                # provider: `build_provider` mints a fresh instance every call
+                # and the provider classes carry no value equality, so any such
+                # comparison is really just "was it rebuilt", which is always
+                # true for every non-pinned entry. Report what IS knowable —
+                # the resulting registry, which names appeared/disappeared, and
+                # which kept their pre-reload instance because a PENDING/
+                # RUNNING assignment pinned them.
+                providers_added = [p for p in new_providers if p not in old_providers]
+                providers_removed = [p for p in old_providers if p not in new_providers]
+                providers_pinned = sorted(
+                    p for p in in_flight_providers if p in old_providers
+                )
+                self._providers = new_providers
+
+            self._health_config = cfg
+            self._config_reloads += 1
+            self._config_reloaded_at = time.time()
+
+        # The H-1 block in /health is built from `_health_config`'s checkouts,
+        # so a stale cache would keep reporting the pre-reload repo set for up
+        # to a full TTL after the swap — exactly the skew this issue is about,
+        # just moved one layer down.
+        self._local_health_cache = None
+
+        _log.info(
+            "coord agent: applied config reload from %s — repos=%s "
+            "(added=%s removed=%s) capabilities=%s%s%s",
+            getattr(cfg, "path", None),
+            new_repos,
+            added or "[]",
+            removed or "[]",
+            new_capabilities if caps_changed else "unchanged",
+            (
+                f" (pinned in-flight repos: {sorted(in_flight)})"
+                if in_flight
+                else ""
+            ),
+            (
+                # #2326: separate clause so a provider-only edit (the #2321
+                # incident this issue describes) shows up even when no repo
+                # changed at all.
+                f" providers={sorted(self._providers)}"
+                f"{f' (added={providers_added})' if providers_added else ''}"
+                f"{f' (removed={providers_removed})' if providers_removed else ''}"
+                f"{f' (pinned in-flight={providers_pinned})' if providers_pinned else ''}"
+                if new_providers is not None
+                else " providers=rebuild failed, kept previous registry"
+            ),
+        )
+
     # ── Public API ──────────────────────────────────────────────────────────
 
     def health(self) -> dict:
+        # #2299: the health poll IS the reload tick. The coordinator polls
+        # every agent's /health continuously, so piggybacking here means a
+        # coordinator.yml edit lands within one poll with no new timer, and —
+        # critically — the `repos` list published below is the post-reload one,
+        # so `coord repo doctor`'s `machines.agent_repo_skew` clears itself
+        # instead of instructing an operator to restart a busy agent.
+        self._maybe_reload_config()
         with self._lock:
             active = sum(1 for a in self._assignments.values() if a.status == RUNNING)
             completed = sum(
@@ -4240,6 +4760,9 @@ class AgentServer:
         worktree_bytes = self._cached_worktree_bytes()
         artifact_bytes = self._cached_artifact_bytes()
         servable_repos, degraded_repos = self._servable_repos()
+        # #2299: the coordinator.yml this agent re-reads on every poll, or
+        # None when there is nothing local to watch (config-free / thin-client).
+        watched_config = getattr(self._health_config, "path", None)
         return {
             "machine": self.machine_name,
             "capabilities": self.capabilities,
@@ -4308,6 +4831,41 @@ class AgentServer:
                 "passes": self._graph_heal_passes,
                 "skipped_active": self._graph_heal_skipped_active,
                 "last_skip_at": self._graph_heal_last_skip_at,
+            },
+            # #2299: is this agent actually watching a coordinator.yml, and
+            # has it picked anything up? `watching` is None for a
+            # config-free/thin-client agent (nothing local to re-read), which
+            # is the one case where a restart IS still the only way to change
+            # the repo list. Lets an operator answer "did my edit land?"
+            # from `coord doctor` instead of SSH + journalctl — the whole
+            # complaint in #2299 was that the skew was invisible from outside.
+            "config_reload": {
+                "watching": str(watched_config) if watched_config else None,
+                "reloads": self._config_reloads,
+                "last_reload_at": self._config_reloaded_at,
+                # #2326: this agent's own last-observed mtime of `watching`
+                # (seeded from the file at startup, advanced on every
+                # reload attempt — including a swallowed bad edit, see
+                # `reload_config_if_stale`). `coord status` can diff this
+                # against the coordinator's own mtime for the SAME path to
+                # flag an agent whose config — and therefore whose
+                # `provider_names` below — predates the edit, without
+                # needing to probe `/proc/<pid>/environ` on the worker to
+                # notice (the failure mode that made #2326 a live-process
+                # investigation instead of a one-line `coord status` read).
+                # `None` for a config-free/thin-client agent, same as
+                # `watching`.
+                "config_mtime": self._config_mtime,
+                # #2326: the provider names THIS process would actually
+                # resolve `spec.provider` against right now — i.e. the keys
+                # of `self._providers`, refreshed at dispatch time (see
+                # `_apply_reloaded_config`). Lets `coord status` compare this
+                # list (or `config_mtime` above) against the coordinator's
+                # `providers.definitions` and flag drift directly, instead of
+                # every surface short of the worker's own process agreeing
+                # while the running registry is actually stale — exactly the
+                # split-brain #2326 describes.
+                "provider_names": sorted(self._providers) if self._providers else [],
             },
         }
 
@@ -5567,7 +6125,36 @@ class AgentServer:
         if spec.provider is None:
             return None
         if spec.provider in self._providers:
-            return self._providers[spec.provider]
+            local = self._providers[spec.provider]
+            if spec.provider_def is not None:
+                # #2326: step 2 (local override) is winning over a wire
+                # provider_def the coordinator DID send — the precedence is
+                # deliberate (see docstring), but before this the decision
+                # left no trace, which is why a days-stale local registry
+                # silently shadowing a fresh coordinator edit took a live
+                # `/proc/<pid>/environ` probe to catch instead of a log
+                # line. Env keys only (not values) — provider env commonly
+                # carries API keys/tokens, and the point here is "does this
+                # instance carry the key the coordinator's does", not the
+                # secret itself.
+                try:
+                    local_env_keys = sorted(local.env())  # type: ignore[attr-defined]
+                except Exception:  # noqa: BLE001 — logging must never break dispatch
+                    local_env_keys = None
+                wire_env_keys = sorted((spec.provider_def or {}).get("env") or {})
+                _log.info(
+                    "coord agent: provider %r resolved from this agent's "
+                    "local providers.definitions (env keys=%s), overriding "
+                    "the coordinator's wire-carried provider_def (env "
+                    "keys=%s) — local-wins-over-wire is deliberate "
+                    "precedence (#1796); if that's not what you expected, "
+                    "check this agent's own coordinator.yml for a stale "
+                    "definition (#2326)",
+                    spec.provider,
+                    local_env_keys,
+                    wire_env_keys,
+                )
+            return local
         if spec.provider_def is not None:
             from coord.providers import build_provider_from_wire  # noqa: PLC0415
 
@@ -5614,6 +6201,13 @@ class AgentServer:
 
     def assign(self, spec: AssignmentSpec) -> AgentAssignment:
         """Accept an assignment and spawn the worker. Returns immediately."""
+        # #2299: refresh from coordinator.yml before the repo gate below.
+        # /health already reloads on every poll, but gating dispatch on
+        # "someone happened to poll first" would make repo onboarding depend
+        # on poll timing; this costs one stat() in the steady state and makes
+        # the guarantee unconditional — the dispatch that arrives after the
+        # edit is served, full stop.
+        self._maybe_reload_config()
         if self.repos and spec.repo_name not in self.repos:
             raise ValueError(
                 f"this agent does not handle repo {spec.repo_name!r} "
@@ -6800,6 +7394,20 @@ class AgentServer:
             assert proc.stdin is not None
             proc.stdin.write(initial_input)
             proc.stdin.flush()
+            # #2306: a provider that does not support stdin message injection
+            # (``capabilities().inject == False``, e.g. OpenCodeProvider,
+            # which takes its briefing on argv) never writes to or closes
+            # this pipe again.  Leaving it open blocks the worker forever —
+            # it never sees an EOF on stdin — until the 600s TTFT watchdog
+            # kills it having emitted zero bytes.  Close it here so such a
+            # worker gets its EOF immediately after the (empty) initial
+            # write.  ``provider_obj`` is ``None`` on the legacy path
+            # (``spec.provider is None``, pre-#324 behaviour) — treat that
+            # as claude/inject-capable and leave stdin open, matching
+            # ``inject_message``'s existing "no provider info => allow"
+            # fallback.
+            if provider_obj is not None and not provider_obj.capabilities().inject:  # type: ignore[attr-defined]
+                proc.stdin.close()
         except (BrokenPipeError, OSError) as e:
             log_fh.write(f"\n# failed to send initial briefing: {e}\n")
 
@@ -7562,6 +8170,13 @@ class AgentServer:
         # readings of "0 commits" can never disagree about which one applies
         # to this assignment.
         _policy_refusal_reason: str | None = None
+        # #2316: checked FIRST in the `_ahead == 0` branch below, ahead of
+        # `_analysis_deliverable`/`_policy_refusal_reason`/`_zero_commit_
+        # reason` — a truncated run's `result_text` is whatever the model
+        # managed to emit before the ceiling cut it off, not a considered
+        # final message, so it must not be read as a positive "deliverable"
+        # or "policy refusal" signal just because it happens to match one.
+        _truncation_reason: str | None = None
         if (exit_code == 0 and assignment is not None
                 and assignment.worktree_path
                 and assignment.spec.type in _ZERO_COMMIT_TYPES):
@@ -7570,7 +8185,28 @@ class AgentServer:
                 _base = assignment.spec.branch or "main"
                 _ahead = self._commits_ahead(_wt_advisory, _base)
                 if _ahead == 0:
-                    if DELIVERABLE_ANALYSIS_LABEL in (assignment.spec.issue_labels or []):
+                    if (_worker_summary is not None
+                            and _worker_summary.stop_reason in _TRUNCATION_STOP_REASONS):
+                        # #2316: the model was guillotined by its own
+                        # output-token ceiling before it could act — exit
+                        # code 0 here is what a truncated run looks like, NOT
+                        # evidence of a clean "nothing to do" finish. Must be
+                        # re-driven, not parked in the advisory bucket
+                        # nobody re-drives (space-invaders#1).
+                        _truncation_reason = _format_truncation_reason(
+                            _worker_summary.stop_reason, assignment.spec.provider
+                        )
+                        try:
+                            with open(assignment.log_path, "a") as reopen:
+                                reopen.write(
+                                    "# reap: truncated — 0 commits ahead of "
+                                    f"{_base}; stop_reason="
+                                    f"{_worker_summary.stop_reason!r}, status "
+                                    "set to failed (#2316)\n"
+                                )
+                        except OSError:
+                            pass
+                    elif DELIVERABLE_ANALYSIS_LABEL in (assignment.spec.issue_labels or []):
                         _analysis_deliverable = True
                         try:
                             with open(assignment.log_path, "a") as reopen:
@@ -7679,6 +8315,22 @@ class AgentServer:
                         # shrug.
                         assignment.status = FAILED
                         assignment.push_failure_reason = _push_failure_reason
+                    elif _truncation_reason is not None:
+                        # #2316: the worker's own output-token ceiling cut it
+                        # off before it committed anything — checked BEFORE
+                        # `_policy_refusal_reason`/`_zero_commit_reason` (the
+                        # `_reap` computation above already guarantees the
+                        # four are mutually exclusive; kept parallel here for
+                        # readability). FAILED, not ADVISORY: exit_code==0 is
+                        # not evidence of a clean finish for a truncated run,
+                        # and nobody re-drives an advisory. `error` is set
+                        # too (not just `truncation_reason`) so the existing
+                        # generic `entry.get("error")` fallback in
+                        # `coord.notify`'s FAILED comment arms carries this
+                        # text without needing its own dedicated wiring.
+                        assignment.status = FAILED
+                        assignment.truncation_reason = _truncation_reason
+                        assignment.error = _truncation_reason
                     elif _policy_refusal_reason is not None:
                         # #2234: clean exit, no commits, and the worker's own
                         # final message cites a standing repo-rule

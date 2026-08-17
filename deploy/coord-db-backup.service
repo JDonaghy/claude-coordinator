@@ -46,7 +46,7 @@
 
 [Unit]
 Description=Snapshot coord.db to the external SSD (interim, pending #1822)
-Documentation=https://github.com/JDonaghy/claude-coordinator/issues/1822
+Documentation=https://github.com/JDonaghy/code-coordinator/issues/1822
 
 [Service]
 Type=oneshot

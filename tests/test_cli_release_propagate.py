@@ -26,9 +26,11 @@ import json
 import pytest
 from click.testing import CliRunner
 
+from coord import machine_pause as mp
 from coord import release_propagate as rp
 from coord.cli import main
 from coord.commands import release as release_cmd
+from coord.config import load as load_config
 from coord.drive_queue import HOLD_FIRED, STATE_RUNNING
 
 # Captured at import time, before any fixture has a chance to monkeypatch
@@ -38,6 +40,42 @@ from coord.drive_queue import HOLD_FIRED, STATE_RUNNING
 # _the_fleet`) restores this reference rather than re-importing, which would
 # just re-read whatever monkeypatch currently has installed.
 _REAL_INTERACTIVE_SESSION_BUSY = release_cmd._interactive_session_busy
+
+
+@pytest.fixture(autouse=True)
+def _own_pause_store(tmp_path, monkeypatch):
+    """Give every test in this module its own pause store (#2174).
+
+    `coord release propagate` both READS the pause store (#2174's
+    `_paused_machine_busy`) and WRITES it (#2101's cordons), and several
+    tests below seed it with `mp.local_pause()` / `mp.local_set_cordon()`.
+    That store is per-`$HOME`, not per-test — so without this, one test's
+    pause leaks into every test that runs after it in the same session.
+
+    `conftest._no_real_pause_store` does not cover this: it redirects only
+    when the resolved path lands under the REAL home, on the assumption
+    that a redirected `$HOME` was redirected BY THE TEST, per test. That
+    assumption is false under `scripts/run_tests_in_populated_home.sh`
+    (#2170), where `$HOME` is one throwaway thin-client directory shared by
+    the WHOLE run: the guard stands down and the store becomes session
+    state. That is exactly how this module went green on `ubuntu-latest`
+    and red on the `populated-home` job — a phantom `machine paused:
+    server` in tests that never paused anything, deferring rolls that
+    should have proceeded.
+
+    Redirecting `$HOME` (rather than patching `_state_path`) is what every
+    other pause-touching module here already does — `test_machine_pause`,
+    `test_quiet_hours`, `test_release_cordon_2101`,
+    `test_release_cordon_deadlock_2240` — and it also pins the thin-client
+    decision: a tmp `$HOME` has no `client.toml`, so this module resolves
+    board-service the same way in both CI jobs instead of inheriting
+    whichever shape the ambient home happens to have.
+    """
+    home = tmp_path / "home"
+    (home / ".coord").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    return home
 
 
 @pytest.fixture()
@@ -606,6 +644,129 @@ def test_a_failing_session_probe_does_not_defer_the_fleet(
     assert "warning: could not probe interactive sessions" in result.output
     assert {host for _lane, host in calls} == {"laptop", "server"}
     assert _records(state_dir)[0]["status"] == rp.STATUS_VERIFIED
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# #2174: `coord pause <machine>` says "leave this box alone" — the board has
+# no `paused` column on any row, so it has to reach `assess_quiescence`
+# through the same `extra_busy` seam as a live interactive session.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def test_a_paused_non_daemon_host_defers_alone_while_the_daemon_rolls(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    """`laptop` is paused; `server` (the daemon) is not. `server` must roll
+    and verify while `laptop`'s lane is recorded as a per-host deferral
+    naming the pause, not attempted — the same shape as a live headless
+    assignment (#2067) or a live interactive session (#2228). This is the
+    exact regression #2174 reports: before the fix, a paused machine read as
+    idle and `coord release propagate` rolled it anyway."""
+    mp.local_pause("laptop")
+    calls = _stub_lanes(monkeypatch)
+    _stub_verify(monkeypatch, versions={"laptop": ["0.4.110"], "server": ["0.4.110"]},
+                 daemon="server")
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111"],
+    )
+    assert result.exit_code == 0, result.output
+    assert any(host == "server" for _lane, host in calls)
+    assert not any(host == "laptop" for _lane, host in calls)
+
+    record = _records(state_dir)[0]
+    assert record["status"] == rp.STATUS_VERIFIED
+    laptop_lane = next(l for l in record["lanes"] if l["host"] == "laptop")
+    assert laptop_lane["lane"] == "-"
+    assert laptop_lane["ok"] is None
+    assert "deferred" in laptop_lane["detail"]
+    assert "machine paused" in laptop_lane["detail"]
+    assert "laptop" in laptop_lane["detail"]
+
+
+def test_a_paused_host_is_visible_in_a_dry_run_plan(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    """Acceptance: `coord release propagate --dry-run` against a board
+    where one machine is paused reports that machine as busy and excludes
+    it from the rollable set, while other hosts remain rollable."""
+    mp.local_pause("laptop")
+    _stub_verify(monkeypatch, versions={"laptop": ["0.4.110"], "server": ["0.4.110"]},
+                 daemon="server")
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111", "--dry-run"],
+    )
+    assert result.exit_code == 0, result.output
+    would_roll_lines = "\n".join(
+        l for l in result.output.splitlines() if "would roll" in l
+    )
+    assert "server" in would_roll_lines
+    assert "laptop" not in would_roll_lines
+    assert "machine paused" in result.output
+    assert "explicit `coord pause`" in result.output
+
+
+def test_a_paused_daemon_host_defers_the_whole_run(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    """#2174 item 2: pausing the DAEMON host defers the whole run, not just
+    that host's own lane — the daemon-leads invariant already defers
+    everything when the daemon is busy and behind, and a pause is one more
+    way for it to be busy. The recorded reason must name the pause, not a
+    generic 'busy' string."""
+    mp.local_pause("server")
+    monkeypatch.setattr(
+        release_cmd, "_roll_python",
+        lambda *a, **k: pytest.fail("a paused daemon must roll nothing, anywhere"),
+    )
+    _stub_verify(monkeypatch, versions={"laptop": ["0.4.110"], "server": ["0.4.110"]},
+                 daemon="server")
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111"],
+    )
+    assert result.exit_code == 0, result.output
+    record = _records(state_dir)[0]
+    assert record["status"] == rp.STATUS_DEFERRED
+    assert record["lanes"] == []
+    assert "machine paused" in record["quiescence"]["reason"]
+    assert "server" in record["quiescence"]["reason"]
+
+
+def test_an_unpaused_fleet_is_unaffected_by_the_pause_seam(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    """Acceptance: an unpaused fleet gets no new busy signal from #2174 —
+    `quiescent` and the roll outcome are unchanged from before the fix."""
+    calls = _stub_lanes(monkeypatch)
+    _stub_verify(monkeypatch, versions={"laptop": ["0.4.110"], "server": ["0.4.110"]},
+                 daemon="server")
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111"],
+    )
+    assert result.exit_code == 0, result.output
+    assert {host for _lane, host in calls} == {"laptop", "server"}
+    record = _records(state_dir)[0]
+    assert record["status"] == rp.STATUS_VERIFIED
+    assert record["quiescence"]["quiescent"] is True
+
+
+def test_a_release_cordon_alone_is_not_read_as_an_operator_pause(valid_config_path):
+    """A #2101 release cordon is this command's OWN drain mechanism, not a
+    sign a host is already quiescent — feeding it back in through
+    `_paused_machine_busy` would make a cordon defer the very roll it exists
+    to unblock. Cordoning `laptop` (with no explicit `coord pause` and no
+    quiet-hours window) must not, on its own, produce a `machine paused`
+    busy signal."""
+    mp.local_set_cordon("laptop", target_version="0.4.110")
+    config = load_config(str(valid_config_path))
+    assert release_cmd._paused_machine_busy(config) == []
 
 
 # ── the roll, the final gate, and the rollback on red ────────────────────

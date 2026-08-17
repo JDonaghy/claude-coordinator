@@ -261,6 +261,44 @@ def test_a_blocked_test_stage_is_a_dead_end() -> None:
     assert found.recovery == (
         f"coord diagnose {REPO} {ISSUE} --stage test --reset"
     )
+    # The #1672 cause, stated as the #1672 cause.
+    assert "no capability-matched" in found.reason
+
+
+def test_a_mute_exhausted_test_stage_names_its_own_cause() -> None:
+    """#2272: the mute-leg budget parks the SAME ``blocked`` value as #1672's
+    unroutable stage — both mean "no verdict is coming" — but the recovery is
+    completely different, so they must not share a reason.
+
+    Telling an operator "no capability-matched machine could run the suite"
+    about a row whose machines were healthy all along is the symptom-not-cause
+    failure #2235 exists to measure: the real answer is "N legs went mute,
+    almost certainly the 600s Bash ceiling".
+    """
+    from coord.smoke import mute_smoke_tally  # noqa: PLC0415
+
+    found = detect_dead_end(
+        state(
+            work_aid="w2272",
+            work_status="done",
+            work_branch="issue-2272",
+            work_test_state=TEST_STATE_BLOCKED,
+            work_test_reason=(
+                f"{mute_smoke_tally(2)}: the Test-stage worker 9214dcb25204 "
+                "ended without printing a verdict marker line. 2 smoke legs "
+                "produced no verdict."
+            ),
+            active_count=0,
+        )
+    )
+    assert found is not None
+    assert found.kind == "test_stage_blocked"
+    assert "2 Test-stage leg(s)" in found.reason
+    assert "600s Bash ceiling" in found.reason
+    # It must NOT misattribute this to the fleet — the machines were fine.
+    assert "no capability-matched" not in found.reason
+    # And it must not read as a statement about the branch.
+    assert "Nothing is known to be wrong with the BRANCH" in found.reason
 
 
 def test_gates_carry_the_readings_that_proved_the_dead_end() -> None:

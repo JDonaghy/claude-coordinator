@@ -989,6 +989,44 @@ def test_a_repo_limited_queue_is_saturated_not_stalled():
     assert "every waiting entry's repo is at its per-repo limit" in text
 
 
+def test_a_mixed_benign_defer_set_names_every_cause_in_the_summary():
+    """Post-review nit fix: a MIXED benign set (one repo-limited entry, one
+    backing off after a retry) must name BOTH causes in the one-line "no
+    launch" summary — the earlier `cordoned > repo_limited > backing_off`
+    elif chain let the first-matching cause's message silently stand in for
+    the whole line, dropping whichever cause lost that race even though
+    both are still both true this tick."""
+    entries = [
+        entry(1650, position=0, state=STATE_RUNNING),
+        entry(1654, position=1),  # claude-coordinator's one slot is taken
+        other(
+            302,
+            "quadraui",
+            position=2,
+            state=STATE_WAITING,
+            attempts=1,
+            retry_backoff_at=NOW - 10.0,
+        ),
+    ]
+    plan = plan_tick(
+        entries,
+        cross_repo_board(
+            sessions=(entry_key(REPO, 1650),),
+            open_=(entry_key(REPO, 1654), "quadraui#302"),
+        ),
+        capacity=3,
+        now=NOW,
+    )
+    assert plan.launch is None
+    assert plan.alert is None  # both causes are benign — no queue-level alert
+    assert {d.repo_limited for d in plan.deferrals} == {True, False}
+    assert {d.backing_off for d in plan.deferrals} == {True, False}
+    text = "\n".join(render_plan(plan))
+    assert "mixed causes" in text
+    assert "repo-limited" in text
+    assert "pacing a retry after a recent failure" in text
+
+
 def test_a_genuinely_stuck_entry_still_alerts_alongside_a_repo_limit_defer():
     """Mixed tick: something really is stuck, so the alert names all of it."""
     entries = [
@@ -1224,7 +1262,16 @@ def test_a_dead_drive_is_requeued_at_the_same_position_with_an_attempt_spent():
 
 
 def test_a_dead_drive_with_a_launch_stamp_still_dies_once_the_window_passes():
-    """The `launched_at` path, not just the "no stamp to measure" one."""
+    """The `launched_at` path, not just the "no stamp to measure" one.
+
+    #2273 superseded the OLD same-tick-relaunch assertion this test used to
+    make: dying past #1794's startup window is no longer enough to relaunch
+    in the SAME tick with a real clock — see
+    `test_a_dead_drive_with_a_real_clock_paces_its_next_attempt_2273` right
+    below for the backoff itself. This test now pins the earlier half only:
+    the death is still correctly detected as `retry` (not `starting`, not
+    `unknown`) once the window is past.
+    """
     entries = [
         entry(
             1650,
@@ -1237,8 +1284,241 @@ def test_a_dead_drive_with_a_launch_stamp_still_dies_once_the_window_passes():
     plan = plan_tick(entries, board(), capacity=1, now=NOW)
     assert plan.reconciles[0].outcome == "retry"
     assert plan.reconciles[0].updates["attempts"] == 1
-    # …and the relaunch is allowed, because the window is demonstrably past.
+
+
+# ── plan_tick: post-death retry spacing (#2273) ──────────────────────────────
+#
+# 2026-08-15: quadraui#508 and coord-portal#83 each burned their entire
+# two-attempt budget inside ~6 minutes — nothing paced the SECOND attempt
+# beyond ordinary tick cadence, so a transient dispatch blip converted
+# straight into a permanently-parked entry. These tests pin the fix: a
+# `retry`-reconciled entry (or one already sitting `waiting` from an earlier
+# one) is not relaunched until real wall-clock time — not just another tick —
+# has passed.
+
+
+def test_a_dead_drive_with_a_real_clock_paces_its_next_attempt_2273():
+    """The regression: WITH a real clock, a `retry` this tick must NOT
+    relaunch in the same tick — that immediate relaunch is exactly what let
+    quadraui#508's two attempts land six minutes apart."""
+    entries = [
+        entry(
+            1650,
+            position=3,
+            state=STATE_RUNNING,
+            attempts=0,
+            launched_at=NOW - DRIVE_STARTUP_GRACE_SECONDS - 1,
+        )
+    ]
+    plan = plan_tick(entries, board(), capacity=1, now=NOW)
+    assert plan.reconciles[0].outcome == "retry"
+    assert plan.launch is None
+    backoff = [d for d in plan.deferrals if d.key == entry_key(REPO, 1650)]
+    assert len(backoff) == 1
+    assert backoff[0].backing_off is True
+    assert "retry backoff" in backoff[0].reason
+    # Benign — this is the fleet pacing itself, not a stall an operator needs
+    # to see paged for every tick of the wait.
+    assert backoff[0].benign is True
+
+
+def test_a_dead_drive_relaunches_once_the_backoff_elapses():
+    """A SECOND tick, comfortably past `RETRY_BACKOFF_SECONDS[0]` (60s),
+    launches normally — the backoff paces the retry, it does not cancel it."""
+    entries = [
+        entry(
+            1650,
+            position=3,
+            state=STATE_WAITING,
+            attempts=1,
+            launched_at=NOW - DRIVE_STARTUP_GRACE_SECONDS - 200.0,
+            retry_backoff_at=NOW - 61.0,
+        )
+    ]
+    plan = plan_tick(entries, board(), capacity=1, now=NOW)
     assert plan.launch is not None and plan.launch.issue == 1650
+
+
+def test_the_backoff_widens_with_the_attempt_number():
+    """`RETRY_BACKOFF_SECONDS[1]` (5 min) applies before a SECOND retry, not
+    just the first — 61s (enough for attempt 1) is not enough for attempt 2."""
+    entries = [
+        entry(
+            1650,
+            position=3,
+            state=STATE_WAITING,
+            attempts=2,
+            launched_at=NOW - DRIVE_STARTUP_GRACE_SECONDS - 400.0,
+            retry_backoff_at=NOW - 61.0,
+        )
+    ]
+    plan = plan_tick(entries, board(), capacity=1, max_attempts=3, now=NOW)
+    assert plan.launch is None
+    assert any(d.backing_off for d in plan.deferrals)
+
+
+def test_the_backoff_deferrals_own_write_never_moves_its_own_anchor():
+    """THE #2273 post-review "moving target" regression.
+
+    Production runs a 180s tick against a 300s dispatch-failure floor —
+    shorter than the backoff it is supposed to pace. Before this fix, the
+    backoff-deferral's own per-tick status write (`deferrals`/`last_reason`)
+    re-stamped `reason_at`, which `_retry_backoff_reason` also read its
+    anchor from — so every tick that observed the entry still backing off
+    reset the very clock the backoff was measured against, and `age` never
+    grew past one tick interval. It could never finish waiting.
+
+    Reproduced here WITHOUT any DB layer: each simulated tick applies only
+    the fields the deferral's own `updates` dict actually contains back onto
+    the entry (exactly what `_apply_writes`/`_update_drive_queue_entry_local`
+    would persist) — `retry_backoff_at` must never be one of them, and the
+    entry must still relaunch once real elapsed time (measured from the
+    ORIGINAL death, never refreshed) clears the widened dispatch-failure
+    floor.
+    """
+    death = NOW
+    live = entry(
+        1650,
+        position=3,
+        state=STATE_WAITING,
+        attempts=1,
+        launched_at=NOW - DRIVE_STARTUP_GRACE_SECONDS - 400.0,
+        retry_backoff_at=death,
+    )
+    # No board-visible assignment at all — the exact #2273 direction-2 tier
+    # (DISPATCH_FAILURE_MIN_BACKOFF_SECONDS, 300s) this issue's incident hit.
+    facts = IssueFacts(known=True, issue_state="open")
+    view = BoardView(issues={entry_key(REPO, 1650): facts})
+
+    # Several ticks, each only 60s apart — shorter than the 300s floor —
+    # simulating the production 180s timer against it. `age` measured from
+    # the fixed `death` anchor never reaches 300s across any of these (max
+    # 179s, at the last iteration), so every one must still defer.
+    for tick_now in (death, death + 60, death + 120, death + 179):
+        plan = plan_tick([live], view, capacity=1, now=tick_now)
+        assert plan.launch is None
+        backoff = [d for d in plan.deferrals if d.key == entry_key(REPO, 1650)]
+        assert len(backoff) == 1 and backoff[0].backing_off is True
+        # THE regression check: the deferral's own persisted write must
+        # never touch the anchor it is itself measured against.
+        assert "retry_backoff_at" not in backoff[0].updates
+        live = entry(
+            1650,
+            position=3,
+            state=STATE_WAITING,
+            attempts=1,
+            launched_at=live.launched_at,
+            retry_backoff_at=live.retry_backoff_at,  # untouched, as above
+            deferrals=live.deferrals + 1,
+            last_reason=backoff[0].reason,
+        )
+
+    # 305s after the ORIGINAL death — past the 300s floor — relaunches.
+    plan = plan_tick([live], view, capacity=1, now=death + 305)
+    assert plan.launch is not None and plan.launch.issue == 1650
+
+
+def test_omitting_the_clock_disables_the_backoff_entirely():
+    """`now=None` is the pure-logic caller's opt-out — same posture #1794's
+    own window already takes (`test_omitting_the_clock_disables_the_window_
+    entirely`)."""
+    entries = [entry(1650, position=3, state=STATE_RUNNING, attempts=0)]
+    plan = plan_tick(entries, board(), capacity=1)
+    assert plan.reconciles[0].outcome == "retry"
+    assert plan.launch is not None and plan.launch.issue == 1650
+
+
+def test_a_2230_resume_is_never_backed_off():
+    """A `blocked` entry #2230 resumes on POSITIVE gate evidence must launch
+    in the SAME tick, unpaced — its `attempts` reset to 0 is real evidence
+    the condition cleared, unlike a plain `retry`, which has none."""
+    entries = [
+        entry(
+            1650,
+            position=3,
+            state=STATE_BLOCKED,
+            attempts=DEFAULT_MAX_ATTEMPTS,
+            last_reason="checks failed: lint",
+            reason_at=NOW - 5.0,
+        )
+    ]
+    plan = plan_tick(
+        entries,
+        board(),
+        capacity=1,
+        now=NOW,
+        live_blocked_gate={entry_key(REPO, 1650): False},
+    )
+    assert [r.outcome for r in plan.reconciles] == ["resumed"]
+    assert plan.launch is not None and plan.launch.issue == 1650
+
+
+def test_a_dispatch_failure_that_created_no_assignment_backs_off_longer():
+    """#2273 direction 2: a died launch with NO board-visible assignment gets
+    at least `DISPATCH_FAILURE_MIN_BACKOFF_SECONDS`, wider than the plain
+    `RETRY_BACKOFF_SECONDS[0]` a code-side death would get."""
+    launched_at = NOW - DRIVE_STARTUP_GRACE_SECONDS - 400.0
+    entries = [
+        entry(
+            1650,
+            position=3,
+            state=STATE_WAITING,
+            attempts=1,
+            launched_at=launched_at,
+            # Comfortably past RETRY_BACKOFF_SECONDS[0] (60s) but nowhere
+            # near DISPATCH_FAILURE_MIN_BACKOFF_SECONDS (300s).
+            retry_backoff_at=NOW - 90.0,
+        )
+    ]
+    facts = IssueFacts(known=True, issue_state="open")  # no assignment at all
+    view = BoardView(issues={entry_key(REPO, 1650): facts})
+    plan = plan_tick(entries, view, capacity=1, now=NOW)
+    assert plan.launch is None
+    backoff = [d for d in plan.deferrals if d.key == entry_key(REPO, 1650)]
+    assert len(backoff) == 1 and backoff[0].backing_off is True
+
+
+def test_a_dispatched_run_that_died_later_gets_the_plain_backoff_only():
+    """The counterpart: a launch that DID dispatch (an assignment exists,
+    created after `launched_at`) is NOT treated as a pure dispatch failure —
+    90s already clears the plain 60s backoff even though it would not clear
+    the widened one."""
+    launched_at = NOW - DRIVE_STARTUP_GRACE_SECONDS - 400.0
+    entries = [
+        entry(
+            1650,
+            position=3,
+            state=STATE_WAITING,
+            attempts=1,
+            launched_at=launched_at,
+            retry_backoff_at=NOW - 90.0,
+        )
+    ]
+    facts = IssueFacts(
+        known=True, issue_state="open", last_dispatched_at=launched_at + 5.0
+    )
+    view = BoardView(issues={entry_key(REPO, 1650): facts})
+    plan = plan_tick(entries, view, capacity=1, now=NOW)
+    assert plan.launch is not None and plan.launch.issue == 1650
+
+
+def test_exhausted_reason_names_a_dispatch_only_failure():
+    """The give-up escalation text itself must say "no assignment" plainly —
+    the point of #2273 direction 3 is that a human reading it does not need
+    to reconstruct that from a bare exit code."""
+    entries = [
+        entry(
+            1650,
+            state=STATE_RUNNING,
+            attempts=DEFAULT_MAX_ATTEMPTS - 1,
+            launched_at=NOW - DRIVE_STARTUP_GRACE_SECONDS - 1,
+        )
+    ]
+    facts = IssueFacts(known=True, issue_state="open")
+    view = BoardView(issues={entry_key(REPO, 1650): facts})
+    plan = plan_tick(entries, view, capacity=1, now=NOW)
+    assert plan.reconciles[0].outcome == "exhausted"
+    assert "no assignment was ever created for this run" in plan.blocked[0].reason
 
 
 def test_a_dead_drive_out_of_attempts_blocks_and_escalates():
@@ -1369,7 +1649,11 @@ def test_a_parked_entry_resumes_to_waiting_and_launches_once_ci_reports():
     resumed = [r for r in plan.reconciles if r.key == entry_key(REPO, 1650)]
     assert [r.outcome for r in resumed] == ["resumed"]
     assert resumed[0].updates["state"] == STATE_WAITING
-    assert "attempts" not in resumed[0].updates
+    # #2273 post-review: resets `attempts` to 0 on resume, same as #2230's
+    # blocked-resume — positive evidence the gate cleared, so the NEXT
+    # launch (if this one also dies) must not be paced against a stale
+    # attempt count left over from before this entry ever parked.
+    assert resumed[0].updates["attempts"] == 0
     # …and it falls straight into this SAME tick's launch selection — no
     # human, no separate tick required.
     assert plan.launch is not None and plan.launch.issue == 1650
@@ -1406,7 +1690,8 @@ def test_a_park_on_an_unrefreshable_reading_ages_out_to_waiting():
     resumed = [r for r in plan.reconciles if r.key == entry_key(REPO, 2138)]
     assert [r.outcome for r in resumed] == ["resumed"]
     assert resumed[0].updates["state"] == STATE_WAITING
-    assert "attempts" not in resumed[0].updates  # still free, per #1891
+    # #2273 post-review: see the #1891 resume test above — same reset.
+    assert resumed[0].updates["attempts"] == 0
     assert "#2158" in resumed[0].reason
     # It does NOT claim CI reported — nothing here knows that.
     assert "have reported" not in resumed[0].reason
@@ -2706,3 +2991,81 @@ def test_render_plan_narrates_an_entry_scoped_hold_as_a_defer_not_a_queue_stop()
         f"defer {entry_key(REPO, 2)}: waiting on {entry_key(REPO, 1)}'s deploy gate"
         in text
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# #2314: the tick refuses to launch when THIS host's own `coord` is a
+# drifted editable checkout — escalating `coord.cli`'s advisory-only
+# `_warn_if_editable_checkout_moved` warning into an actual refusal. Mirrors
+# the #2101 cordon tests in tests/test_release_cordon_2101.py: same shape
+# (host-scoped, reconciliation still runs, launch is refused before
+# capacity), different trigger.
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_the_tick_refuses_to_launch_when_this_hosts_coord_has_drifted():
+    plan = plan_tick(
+        [entry(1)],
+        board(open_=(1,)),
+        capacity=1,
+        editable_drift=("/home/dev/src/code-coordinator", "'issue-9999-scratch'"),
+    )
+
+    assert plan.launch is None
+    assert plan.drift_reason == (
+        "drifted onto 'issue-9999-scratch' (/home/dev/src/code-coordinator)"
+    )
+    # Same "say why" contract the #2101 cordon alert carries.
+    assert plan.alert is not None
+    assert "issue-9999-scratch" in plan.alert.reason
+    assert plan.alert.command == "git -C /home/dev/src/code-coordinator checkout main"
+    assert any("issue-9999-scratch" in line for line in render_plan(plan))
+
+
+def test_a_clean_checkout_launches_normally():
+    """`editable_drift=None` (the default, and what a release install or a
+    checkout still cleanly on `main` produces) must not change behaviour at
+    all — this is the overwhelming common case."""
+    plan = plan_tick(
+        [entry(1)],
+        board(open_=(1,)),
+        capacity=1,
+        editable_drift=None,
+    )
+
+    assert plan.launch is not None
+    assert plan.drift_reason == ""
+
+
+def test_a_drifted_tick_still_reconciles_so_the_drift_can_actually_be_fixed():
+    """Same #2110 reasoning the cordon gate already relies on: a refusal
+    that also froze the queue's view of reality would leave a finished
+    drive's `running` row pinning propagation forever. A drifted tick is
+    exactly `--reconcile-only`, not a frozen one."""
+    b = board(closed=(1,))
+    plan = plan_tick(
+        [entry(1, state=STATE_RUNNING, launch_host="dellserver")],
+        b,
+        capacity=1,
+        local_host="dellserver",
+        editable_drift=("/home/dev/src/code-coordinator", "'stale-branch'"),
+    )
+
+    assert plan.launch is None
+    assert [r.outcome for r in plan.reconciles] == ["done"]
+    assert plan.writes(), "the drained row must still be written back"
+
+
+def test_drift_is_checked_even_when_no_cordon_is_present():
+    """The drift gate must not accidentally be wired as cordon-only —
+    exercising it with `cordons=None`/no `local_host` (the shape a
+    single-machine dev fleet actually passes) still refuses to launch."""
+    plan = plan_tick(
+        [entry(1)],
+        board(open_=(1,)),
+        capacity=1,
+        cordons=None,
+        editable_drift=("/home/dev/src/code-coordinator", "(detached HEAD)"),
+    )
+    assert plan.launch is None
+    assert "detached HEAD" in plan.drift_reason

@@ -63,6 +63,40 @@ there are lost, or collide with other workers running at the same time. If \
 your worktree looks unexpectedly empty or unwritable, STOP and report it — \
 do not fall back to editing the base checkout and copying files over.
 
+Write incrementally — this is the single most important rule in this file:
+- Every request you make has a hard output-token budget, and on a \
+reasoning model those tokens are shared with your own thinking. Truncation \
+can happen at any budget size — raising the ceiling makes it rarer, not \
+impossible — so the rule below holds regardless of what the current limit \
+is.
+- Write each file as soon as its content is decided. Do NOT design the \
+whole change, plan every file, and only then start emitting `write`/`edit` \
+calls — a turn that spends its whole budget reasoning can be truncated \
+before it emits a single tool call. Truncation produces a clean-looking \
+exit with zero commits and nothing on disk: the work is not "mostly done", \
+it is entirely lost, because nothing you only thought about was ever sent \
+as a tool call.
+- Prefer many small steps over one large one: read/understand one file, \
+write it, move to the next. Small increments stay nowhere near the cap; \
+a single-shot "figure out the whole diff, then write it all" turn is what \
+exhausts it.
+- Issue one command per `bash` call — do not chain with `&&`, `;` or `|`. \
+Permission rules are prefix-matched against the whole command string, so \
+`git status && git log` matches no `allow` entry and is denied outright, \
+wasting a turn for nothing. Run `git status`, then separately `git log`.
+- These are the only `bash` commands you can run; everything else is \
+denied, including `pwd`, `ls`, `cat` and `grep` (use your own file-read \
+and search tools for those): `git status`, `git diff`, `git log`, \
+`git show`, `git add`, `git commit`, `git checkout`, `git branch`, \
+`git rev-parse`, `git push`, `cargo …`, `make…`, `pytest…`, \
+`python3 -m pytest…`, `python -m pytest…`, `npm …`, `pip install…`, \
+`pip3 install…`. `gh` is denied — the coordinator owns GitHub.
+- If a `bash` or `edit` call does come back denied, don't probe with \
+variations to find what's allowed — every denial replays the entire \
+permission ruleset back to you, burning output budget you need for \
+`write` calls without telling you anything the list above didn't already \
+say. Take the denial as final and move on.
+
 This session is ONE-SHOT and non-interactive:
 - There is no next turn and no human to reply to you. Background-task \
 completion notifications will NEVER reach you — nothing wakes you up.

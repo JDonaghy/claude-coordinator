@@ -36,14 +36,13 @@ def _agent_pkg_spec() -> str:
     `[server]` extra — a bare upgrade would, on a fresh venv, leave the
     agent without starlette/uvicorn and dead on the next restart.
 
-    #2103: resolved tolerantly against whichever of `code-coordinator` /
-    `claude-coordinator` is currently installed, rather than the old
-    hardcoded `claude-coordinator[server]` — installing the wrong name once
-    the fleet is mid-rename either 404s against PyPI or, worse, silently
-    reinstalls the stale package. Deliberately NOT caught here: if neither
-    name resolves, the caller (`_do_update`'s existing try/except) turns
-    that into an explicit `last_update.json` failure naming both names
-    tried, instead of guessing.
+    #2103/#2106: resolved via `coord.dist_name` rather than a hardcoded
+    `claude-coordinator[server]` — installing the wrong name either 404s
+    against PyPI or, worse, silently reinstalls a stale package.
+    Deliberately NOT caught here: if the name doesn't resolve, the caller
+    (`_do_update`'s existing try/except) turns that into an explicit
+    `last_update.json` failure naming what was expected, instead of
+    guessing.
     """
     return _dist_pkg_spec(extra="server")
 
@@ -82,18 +81,18 @@ def _installed_version() -> str | None:
     process hasn't restarted since the last update" apart from "the update
     never happened".
 
-    #2103: tries `code-coordinator` then falls back to `claude-coordinator`
-    (see ``coord.dist_name``) rather than hardcoding one name — installing
-    under the name this process doesn't query used to make a fully-updated
-    agent report ``None`` here, the exact false negative behind the
-    fleet's most-recurring `✗ did not come back`.
+    #2103/#2106: resolves via ``coord.dist_name`` (see that module) rather
+    than hardcoding the distribution name — installing under a name this
+    process doesn't query used to make a fully-updated agent report
+    ``None`` here, the exact false negative behind the fleet's
+    most-recurring `✗ did not come back`.
 
     This is a *report* site, not an *act* site (contrast `_agent_pkg_spec`,
     which deliberately lets `DistributionNotFoundError` propagate): callers
     already fall back to the literal string `"unknown"` when this returns
-    `None`, so "neither name resolved" isn't silently swallowed end to end
-    — but it's still logged here, naming both names tried, rather than
-    disappearing into a bare `None` with no trace of why.
+    `None`, so a miss isn't silently swallowed end to end — but it's still
+    logged here, naming what was expected, rather than disappearing into a
+    bare `None` with no trace of why.
     """
     try:
         return resolve_installed().version
@@ -414,12 +413,11 @@ def _detect_install_mode() -> tuple[bool, str | None]:
     ``pip install -e .``).  *project_path* is the on-disk source directory for
     editable installs, or *None* for regular (site-packages) installs.
 
-    #2103: ``pip show`` needs an exact distribution name, so this resolves
-    which of `code-coordinator` / `claude-coordinator` is actually installed
-    (see ``coord.dist_name``) first rather than hardcoding one — asking
-    `pip show` for a name nothing is installed under always reports "not
-    editable", which would misreport a real editable install once the
-    fleet's mid-rename.
+    #2103/#2106: ``pip show`` needs an exact distribution name, so this
+    resolves which name is actually installed (see ``coord.dist_name``)
+    first rather than hardcoding one — asking `pip show` for a name
+    nothing is installed under always reports "not editable", which would
+    misreport a real editable install.
     """
     dist_name = resolve_installed_name()
     if dist_name is None:

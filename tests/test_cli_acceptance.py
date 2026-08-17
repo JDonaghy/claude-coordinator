@@ -1163,6 +1163,205 @@ class TestAcceptanceExpectedRedCommand:
         assert "unknown repo" in result.output
 
 
+class TestAcceptanceExpectedRedClear:
+    """#2266: the remedy half of the #2164 detector — `--clear` invokes
+    `clear_expected_red_via_pr` for every STUCK entry `expected-red`
+    already finds, and never for an entry whose issue is legitimately
+    still open."""
+
+    @staticmethod
+    def _invoke(config_path: Path, *extra_args: str):
+        return CliRunner().invoke(main, [
+            "acceptance", "expected-red", "coord-tui", "--config", str(config_path),
+            "--clear", *extra_args,
+        ])
+
+    def test_clear_acts_only_on_the_stuck_closed_issue(self, tmp_path: Path) -> None:
+        config_path = _write_config(tmp_path, repo_path=str(tmp_path / "unused"), run_cmd="true")
+
+        with patch(
+            "coord.commands.acceptance.list_expected_red_via_api",
+            return_value={"ms01": {944: {"ms01::a"}, 945: {"ms01::z"}}},
+        ), patch("coord.commands.acceptance.github_ops") as mock_gh, patch(
+            "coord.acceptance.clear_expected_red_via_pr",
+        ) as mock_clear:
+            mock_gh.get_issue.side_effect = lambda repo, n: (
+                {"state": "CLOSED"} if n == 944 else {"state": "OPEN"}
+            )
+            mock_clear.return_value = "cleared expected_red for #944: ms01::a (PR #501)"
+
+            result = self._invoke(config_path)
+
+        assert result.exit_code == 0, result.output
+        mock_clear.assert_called_once()
+        args, _kwargs = mock_clear.call_args
+        assert args[3] == 944  # issue_number — never called for the open #945
+        assert "clearing 1 STUCK issue(s)" in result.output
+        assert "#944: cleared expected_red for #944" in result.output
+        assert "#945" not in result.output.split("clearing 1 STUCK issue(s)")[1]
+
+    def test_clear_with_issue_filter_on_an_open_issue_clears_nothing(
+        self, tmp_path: Path,
+    ) -> None:
+        config_path = _write_config(tmp_path, repo_path=str(tmp_path / "unused"), run_cmd="true")
+
+        with patch(
+            "coord.commands.acceptance.list_expected_red_via_api",
+            return_value={"ms01": {944: {"ms01::a"}, 945: {"ms01::z"}}},
+        ), patch("coord.commands.acceptance.github_ops") as mock_gh, patch(
+            "coord.acceptance.clear_expected_red_via_pr",
+        ) as mock_clear:
+            mock_gh.get_issue.side_effect = lambda repo, n: (
+                {"state": "CLOSED"} if n == 944 else {"state": "OPEN"}
+            )
+
+            result = self._invoke(config_path, "--issue", "945")
+
+        assert result.exit_code == 0, result.output
+        mock_clear.assert_not_called()
+        assert "not STUCK" in result.output
+
+    def test_clear_with_issue_filter_on_the_stuck_issue_clears_only_it(
+        self, tmp_path: Path,
+    ) -> None:
+        config_path = _write_config(tmp_path, repo_path=str(tmp_path / "unused"), run_cmd="true")
+
+        with patch(
+            "coord.commands.acceptance.list_expected_red_via_api",
+            return_value={"ms01": {944: {"ms01::a"}, 945: {"ms01::z"}}},
+        ), patch("coord.commands.acceptance.github_ops") as mock_gh, patch(
+            "coord.acceptance.clear_expected_red_via_pr",
+        ) as mock_clear:
+            mock_gh.get_issue.side_effect = lambda repo, n: (
+                {"state": "CLOSED"} if n == 944 else {"state": "OPEN"}
+            )
+            mock_clear.return_value = "cleared expected_red for #944: ms01::a (PR #501)"
+
+            result = self._invoke(config_path, "--issue", "944")
+
+        assert result.exit_code == 0, result.output
+        mock_clear.assert_called_once()
+
+    def test_no_stuck_entries_reports_nothing_to_clear(self, tmp_path: Path) -> None:
+        config_path = _write_config(tmp_path, repo_path=str(tmp_path / "unused"), run_cmd="true")
+
+        with patch(
+            "coord.commands.acceptance.list_expected_red_via_api",
+            return_value={"ms01": {945: {"ms01::z"}}},
+        ), patch("coord.commands.acceptance.github_ops") as mock_gh, patch(
+            "coord.acceptance.clear_expected_red_via_pr",
+        ) as mock_clear:
+            mock_gh.get_issue.return_value = {"state": "OPEN"}
+
+            result = self._invoke(config_path)
+
+        assert result.exit_code == 0, result.output
+        mock_clear.assert_not_called()
+        assert "no STUCK entries to clear" in result.output
+
+    def test_clear_success_writes_a_durable_audit_row(
+        self, tmp_path: Path, coord_db,
+    ) -> None:
+        """#2266 scope 2: a cleared entry lands a queryable row — not just
+        a CLI output line — so a re-run doesn't need to trust anyone read
+        this command's stdout."""
+        config_path = _write_config(tmp_path, repo_path=str(tmp_path / "unused"), run_cmd="true")
+
+        with patch(
+            "coord.commands.acceptance.list_expected_red_via_api",
+            return_value={"ms01": {944: {"ms01::a"}}},
+        ), patch("coord.commands.acceptance.github_ops") as mock_gh, patch(
+            "coord.acceptance.clear_expected_red_via_pr",
+        ) as mock_clear:
+            mock_gh.get_issue.return_value = {"state": "CLOSED"}
+            mock_clear.return_value = "cleared expected_red for #944: ms01::a (PR #501)"
+
+            result = self._invoke(config_path)
+
+        assert result.exit_code == 0, result.output
+        rows = coord_db.execute(
+            "SELECT event_type, issue FROM audit_log WHERE event_type = 'expected_red_clear'",
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["issue"] == 944
+
+    def test_clear_failure_writes_a_distinct_durable_audit_row(
+        self, tmp_path: Path, coord_db,
+    ) -> None:
+        """#2266 scope 2: a failed clear (the common case — `clear_expected_
+        red_via_pr` never raises, it degrades to a `warning: ...` string)
+        must be just as durable as a success, with a distinct event_type so
+        it's queryable as "still stuck" rather than silently indistinguishable
+        from a clear that worked. #2266 review non-blocking finding: a
+        hard failure also now exits non-zero, so a CI/cron caller can
+        detect a fully-failed run without reading stdout or the audit log."""
+        config_path = _write_config(tmp_path, repo_path=str(tmp_path / "unused"), run_cmd="true")
+
+        with patch(
+            "coord.commands.acceptance.list_expected_red_via_api",
+            return_value={"ms01": {944: {"ms01::a"}}},
+        ), patch("coord.commands.acceptance.github_ops") as mock_gh, patch(
+            "coord.acceptance.clear_expected_red_via_pr",
+        ) as mock_clear:
+            mock_gh.get_issue.return_value = {"state": "CLOSED"}
+            mock_clear.return_value = "warning: could not open expected_red clear PR: boom"
+
+            result = self._invoke(config_path)
+
+        assert result.exit_code == 1, result.output
+        rows = coord_db.execute(
+            "SELECT event_type, issue FROM audit_log WHERE event_type = 'expected_red_clear_failed'",
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["issue"] == 944
+        assert not coord_db.execute(
+            "SELECT 1 FROM audit_log WHERE event_type = 'expected_red_clear'",
+        ).fetchall()
+
+    def test_clear_no_op_does_not_write_an_audit_row_or_fail(
+        self, tmp_path: Path, coord_db,
+    ) -> None:
+        """#2266 review blocking finding 1: "nothing to clear" (e.g. a race
+        — another process already cleared it) is not a failure — it must
+        not write a durable `expected_red_clear_failed` row, nor fail the
+        command's exit code."""
+        config_path = _write_config(tmp_path, repo_path=str(tmp_path / "unused"), run_cmd="true")
+
+        with patch(
+            "coord.commands.acceptance.list_expected_red_via_api",
+            return_value={"ms01": {944: {"ms01::a"}}},
+        ), patch("coord.commands.acceptance.github_ops") as mock_gh, patch(
+            "coord.acceptance.clear_expected_red_via_pr",
+        ) as mock_clear:
+            mock_gh.get_issue.return_value = {"state": "CLOSED"}
+            mock_clear.return_value = "no expected_red entries for this issue"
+
+            result = self._invoke(config_path)
+
+        assert result.exit_code == 0, result.output
+        assert not coord_db.execute(
+            "SELECT 1 FROM audit_log WHERE event_type LIKE 'expected_red_clear%'",
+        ).fetchall()
+
+    def test_issue_without_clear_warns(self, tmp_path: Path) -> None:
+        """#2266 review nit: `--issue` without `--clear` is silently
+        accepted and ignored today despite its own help text saying it
+        only takes effect with `--clear` — must warn instead."""
+        config_path = _write_config(tmp_path, repo_path=str(tmp_path / "unused"), run_cmd="true")
+
+        with patch(
+            "coord.commands.acceptance.list_expected_red_via_api",
+            return_value={"ms01": {944: {"ms01::a"}}},
+        ):
+            result = CliRunner().invoke(main, [
+                "acceptance", "expected-red", "coord-tui", "--config", str(config_path),
+                "--issue", "944",
+            ])
+
+        assert result.exit_code == 0, result.output
+        assert "--issue has no effect without --clear" in result.output
+
+
 class TestAcceptanceStall:
     """`coord acceptance stall` (#846) — the worker self-report path for a
     churning acceptance slice: pinned #603 context note, best-effort WIP

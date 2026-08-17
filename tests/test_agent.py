@@ -1134,6 +1134,64 @@ def test_default_worker_command_resume_flag_present() -> None:
     assert argv[idx + 1] == "ses-abc123"
 
 
+# ── #2301: smoke legs must not hold Monitor (or Edit/Write) ────────────────
+#
+# Root cause: smoke fell through to the generic `else` branch and inherited
+# the #2169 `Monitor` grant meant for *work*-shaped legs. `Monitor` is an
+# await-a-notification tool — calling it ends the current turn to wait for a
+# wake-up condition, which only resumes anything in an INTERACTIVE session.
+# Every coord leg, smoke included, is a one-shot `claude -p` session (#1394):
+# ending the turn ends the session itself, permanently, before any
+# notification can arrive. Two real smoke legs did exactly this — reached
+# `Monitor` via ToolSearch to poll a backgrounded `cargo test`, ended their
+# turn to "wait" for it, and died 16-24s later with no verdict printed, while
+# the backgrounded suite was reaped out from under them ~30s after that.
+
+
+def _smoke_spec(**overrides) -> AssignmentSpec:
+    base = dict(
+        repo_name="api",
+        repo_path="/tmp/repo",
+        issue_number=2301,
+        issue_title="[smoke] t",
+        briefing="b",
+        branch="main",
+        type="smoke",
+    )
+    base.update(overrides)
+    return AssignmentSpec(**base)
+
+
+def test_default_worker_command_smoke_type_does_not_grant_monitor() -> None:
+    argv = default_worker_command(_smoke_spec())
+    allowed = argv[argv.index("--allowedTools") + 1].split(",")
+    assert "Monitor" not in allowed
+
+
+def test_default_worker_command_smoke_type_gets_read_bash_only() -> None:
+    """A smoke leg validates; it never mutates — no Edit/Write either."""
+    argv = default_worker_command(_smoke_spec())
+    allowed = argv[argv.index("--allowedTools") + 1]
+    assert allowed == "Read,Bash"
+
+
+def test_default_worker_command_smoke_type_uses_smoke_system_prompt() -> None:
+    """Confirms the smoke branch's default system prompt is
+    coord.smoke.SMOKE_SYSTEM_PROMPT, not the generic WORKER_SYSTEM_PROMPT
+    the old fall-through `else` branch would have used."""
+    from coord.smoke import SMOKE_SYSTEM_PROMPT
+
+    argv = default_worker_command(_smoke_spec())
+    system_prompt = argv[argv.index("--system-prompt") + 1]
+    assert system_prompt.startswith(SMOKE_SYSTEM_PROMPT)
+
+
+def test_default_worker_command_smoke_type_honours_explicit_system_prompt() -> None:
+    argv = default_worker_command(_smoke_spec(system_prompt="custom smoke prompt"))
+    system_prompt = argv[argv.index("--system-prompt") + 1]
+    assert system_prompt.startswith("custom smoke prompt")
+
+
 # ── #1315: structural sealing enforcement (write-guard) ─────────────────────
 
 
@@ -4152,6 +4210,56 @@ class TestProviderLayerDispatch:
         assert "legacy-SHOULD-NOT-RUN" not in log
         server.shutdown()
 
+    def test_local_wins_over_wire_provider_def_is_logged(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """#2326 item 3: when `_resolve_provider` takes the local-registry
+        branch over an available `spec.provider_def`, it must say so in the
+        agent log, naming both — this decision used to leave no trace,
+        which is why a stale local override took a live-process probe to
+        catch instead of a `journalctl` grep."""
+        from coord.config import ProviderDef
+        from coord.providers import build_provider
+
+        repo = _init_repo(tmp_path / "repo")
+        defn = ProviderDef(type="claude", env={"LOCAL_ONLY": "1"})
+        provider = build_provider("myprovider", defn, None)
+
+        server = AgentServer(
+            machine_name="test",
+            repos=["api"],
+            state_dir=tmp_path / "state",
+            worker_command=lambda spec: ["/bin/sh", "-c", "echo legacy-SHOULD-NOT-RUN"],
+            repo_paths={"api": str(repo)},
+            providers={"myprovider": provider},
+            bash_wrap_spawn=False,
+        )
+        spec = _spec(
+            repo,
+            provider="myprovider",
+            provider_def={
+                "type": "claude",
+                "binary": None,
+                "model": None,
+                "attach_url": None,
+                "env": {"FROM_WIRE": "1"},
+                "extra_args": [],
+            },
+        )
+        try:
+            with caplog.at_level("INFO", logger="coord.agent"):
+                resolved = server._resolve_provider(spec)
+        finally:
+            server.shutdown()
+
+        assert resolved is provider
+        assert "myprovider" in caplog.text
+        assert "local providers.definitions" in caplog.text
+        assert "wire-carried provider_def" in caplog.text
+        # Env KEYS only — never the values (secrets commonly live here).
+        assert "LOCAL_ONLY" in caplog.text
+        assert "FROM_WIRE" in caplog.text
+
 
 class TestCapabilityGates:
     """#324/#425: assign() enforces capability gates before spawning."""
@@ -4347,6 +4455,111 @@ class TestCapabilityGates:
         server.inject_message(a.id, "injected")
         final = server.wait_for(a.id, timeout=5)
         # Worker makes no commits → advisory (#448)
+        assert final.status == ADVISORY
+        server.shutdown()
+
+    def test_stdin_closed_after_spawn_when_provider_inject_is_false(
+        self, tmp_path: Path
+    ) -> None:
+        """#2306: a provider with capabilities().inject=False (e.g. opencode,
+        which takes its briefing on argv, not stdin) must have its stdin
+        pipe closed right after the initial (possibly empty) write.
+
+        Before the fix, stdin was held open for the process's entire
+        lifetime regardless of provider.  A worker that never writes to or
+        reads more from stdin itself (opencode) then blocked forever on its
+        own read of an unclosed pipe that would never see EOF, and was
+        killed by the 600s TTFT watchdog having emitted zero bytes.  ``cat``
+        reproduces that shape exactly: it blocks reading stdin until EOF.
+        With stdin closed after the initial write, ``cat`` sees EOF
+        immediately and the assignment finishes well within the test
+        timeout instead of hanging.
+        """
+        repo = _init_repo(tmp_path / "repo")
+        no_inject_provider = _make_provider(
+            inject=False,
+            # argv-only briefing (like opencode) — nothing more is ever
+            # written to stdin by the harness for this provider.
+            build_argv=["/bin/sh", "-c", "cat >/dev/null; echo done"],
+            initial_input_bytes=b"",
+        )
+        server = AgentServer(
+            machine_name="test",
+            repos=["api"],
+            state_dir=tmp_path / "state",
+            repo_paths={"api": str(repo)},
+            providers={"no-inject": no_inject_provider},
+        )
+        a = server.assign(_spec(repo, provider="no-inject"))
+        # The Popen object is available synchronously once assign() returns
+        # for the non-PTY, no-pull path used here.
+        proc = server._processes.get(a.id)
+        assert proc is not None, "process not recorded"
+        assert proc.stdin is not None and proc.stdin.closed, (
+            "stdin must be closed immediately after spawn for a provider "
+            "with capabilities().inject=False"
+        )
+        # And the worker actually completes — proof the closed pipe gave it
+        # an EOF rather than leaving it to hang until the watchdog kills it.
+        final = server.wait_for(a.id, timeout=5)
+        assert final.status == ADVISORY  # no commits made
+        server.shutdown()
+
+    def test_stdin_left_open_after_spawn_when_provider_inject_is_true(
+        self, tmp_path: Path
+    ) -> None:
+        """#2306 regression guard: a provider with capabilities().inject=True
+        (e.g. ClaudeProvider) must still have its stdin left open after
+        spawn — this is the behaviour ``inject_message`` depends on, and it
+        must be bit-for-bit unchanged by the #2306 fix."""
+        repo = _init_repo(tmp_path / "repo")
+        inject_provider = _make_provider(
+            inject=True,
+            build_argv=["/bin/sh", "-c", "read a; read b; echo $b"],
+        )
+        server = AgentServer(
+            machine_name="test",
+            repos=["api"],
+            state_dir=tmp_path / "state",
+            repo_paths={"api": str(repo)},
+            providers={"yes-inject": inject_provider},
+        )
+        a = server.assign(_spec(repo, provider="yes-inject"))
+        proc = server._processes.get(a.id)
+        assert proc is not None, "process not recorded"
+        assert proc.stdin is not None and not proc.stdin.closed, (
+            "stdin must stay open after spawn for a provider with "
+            "capabilities().inject=True"
+        )
+        # inject_message must still work over that open pipe.
+        server.inject_message(a.id, "injected")
+        final = server.wait_for(a.id, timeout=5)
+        assert final.status == ADVISORY
+        server.shutdown()
+
+    def test_stdin_left_open_after_spawn_on_legacy_no_provider_path(
+        self, tmp_path: Path
+    ) -> None:
+        """#2306: when spec.provider is None, ``_spawn`` takes the legacy
+        path where ``provider_obj`` is ``None``.  That must be treated as
+        claude/inject-capable (stdin left open), matching
+        ``inject_message``'s existing "no provider info => allow" fallback
+        — not closed, which would regress every no-config deployment."""
+        repo = _init_repo(tmp_path / "repo")
+        server = _server(
+            tmp_path,
+            argv=["/bin/sh", "-c", "read a; read b; echo $b"],
+            repo_path=repo,
+        )
+        a = server.assign(_spec(repo))  # no provider → legacy path
+        proc = server._processes.get(a.id)
+        assert proc is not None, "process not recorded"
+        assert proc.stdin is not None and not proc.stdin.closed, (
+            "stdin must stay open after spawn on the legacy (provider_obj "
+            "is None) path"
+        )
+        server.inject_message(a.id, "injected")
+        final = server.wait_for(a.id, timeout=5)
         assert final.status == ADVISORY
         server.shutdown()
 
@@ -4865,6 +5078,80 @@ class TestListAssignmentsTokens:
         assert entry.get("input_tokens", 0) == 0
 
 
+# ── #2316: stop_reason / truncation_reason reach /status ───────────────────────
+
+
+class TestStopReasonInCompletedEntry:
+    """`list_assignments()['completed']` must carry `stop_reason` (parsed
+    fresh from the log on every /status call, same as `num_turns`/
+    `total_cost_usd` above) so `coord.reconcile._capture_stop_reason_best_
+    effort` has something to persist — this is the wire half of #2316's
+    "the information is already there and is thrown away" gap."""
+
+    def _make_spec(self, repo_path: Path) -> AssignmentSpec:
+        return AssignmentSpec(
+            repo_name="api",
+            repo_path=str(repo_path),
+            issue_number=2316,
+            issue_title="t",
+            briefing="b",
+            branch="main",
+        )
+
+    def test_stop_reason_appears_in_completed_entry(self, tmp_path: Path) -> None:
+        import json as _json
+
+        repo = _init_repo(tmp_path / "repo")
+        server = _server(tmp_path, repo_path=repo)
+        spec = self._make_spec(repo)
+
+        log_path = tmp_path / "trunc1.log"
+        log_path.write_text(
+            _json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "stop_reason": "max_tokens",
+                    "result": "",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        a = AgentAssignment(
+            id="trunc1",
+            spec=spec,
+            status=FAILED,
+            finished_at=1.0,
+            exit_code=0,
+            log_path=str(log_path),
+            truncation_reason=(
+                "the model was cut off at its output limit before writing "
+                "anything (stop_reason='max_tokens')"
+            ),
+            error=(
+                "the model was cut off at its output limit before writing "
+                "anything (stop_reason='max_tokens')"
+            ),
+        )
+        server._assignments[a.id] = a
+
+        listing = server.list_assignments()
+        completed = listing["completed"]
+        assert len(completed) == 1
+        entry = completed[0]
+        # `stop_reason`: freshly parsed from the log on every /status call.
+        assert entry.get("stop_reason") == "max_tokens"
+        # `truncation_reason`/`error`: plain dataclass fields, already on the
+        # assignment — `to_status_dict()`'s `asdict` carries them through
+        # exactly like `usage_limit_reason`/`api_error_reason` do.
+        assert entry.get("truncation_reason") is not None
+        assert "cut off at its output limit" in entry["truncation_reason"]
+        assert entry.get("error") == entry["truncation_reason"]
+
+
 # ── #1492: agent-side clearing of terminal ADVISORY entries ────────────────────
 
 
@@ -5275,3 +5562,640 @@ class TestRefusedPolicyPrune:
 
         assert "rp-2" not in server._assignments
         assert "done-rp" in server._assignments
+
+
+# ── #2299: hot config reload (adding a repo must not need a restart) ─────────
+
+def _write_config(
+    path: Path,
+    *,
+    repos: list[str],
+    repo_paths: dict[str, str],
+    capabilities: list[str] | None = None,
+    artifact_paths: dict[str, list[str]] | None = None,
+    build_commands: dict[str, str] | None = None,
+    machine_name: str = "test",
+) -> Path:
+    """Write a minimal coordinator.yml declaring *machine_name* with *repos*."""
+    artifact_paths = artifact_paths or {}
+    build_commands = build_commands or {}
+    lines = ["repos:"]
+    for name in repos:
+        lines.append(f"  - name: {name}")
+        lines.append(f"    github: acme/{name}")
+        if name in build_commands:
+            lines.append(f"    build_command: {build_commands[name]!r}")
+        if name in artifact_paths:
+            lines.append("    artifact_paths:")
+            lines.extend(f"      - {p!r}" for p in artifact_paths[name])
+    lines.append("")
+    lines.append("machines:")
+    lines.append(f"  - name: {machine_name}")
+    lines.append(f"    host: {machine_name}.tailnet")
+    lines.append(f"    capabilities: [{', '.join(capabilities or ['python'])}]")
+    lines.append(f"    repos: [{', '.join(repos)}]")
+    lines.append("    repo_paths:")
+    for name, p in repo_paths.items():
+        lines.append(f"      {name}: {p!r}")
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def _bump_mtime(path: Path, seconds_ahead: float = 5.0) -> None:
+    """Force the on-disk mtime forward so a same-second rewrite is still seen.
+
+    Some filesystems have 1s mtime resolution, so a write immediately followed
+    by another write inside one test can produce an identical mtime — which
+    the reload guard would (correctly) treat as unchanged. Mirrors the helper
+    of the same name in ``tests/test_serve.py`` for #1081.
+    """
+    new_time = path.stat().st_mtime + seconds_ahead
+    os.utime(path, (new_time, new_time))
+
+
+def _write_config_with_provider(
+    path: Path,
+    *,
+    repos: list[str],
+    repo_paths: dict[str, str],
+    provider_binary: str,
+    provider_env: dict[str, str] | None = None,
+    machine_name: str = "test",
+) -> Path:
+    """Write a minimal coordinator.yml with one `providers.definitions`
+    entry named "myprovider" (#2326 hot-reload coverage)."""
+    provider_env = provider_env or {}
+    lines = ["repos:"]
+    for name in repos:
+        lines.append(f"  - name: {name}")
+        lines.append(f"    github: acme/{name}")
+    lines.append("")
+    lines.append("providers:")
+    lines.append("  definitions:")
+    lines.append("    myprovider:")
+    lines.append("      type: claude")
+    lines.append(f"      binary: {provider_binary!r}")
+    if provider_env:
+        lines.append("      env:")
+        for k, v in provider_env.items():
+            lines.append(f"        {k}: {v!r}")
+    lines.append("")
+    lines.append("machines:")
+    lines.append(f"  - name: {machine_name}")
+    lines.append(f"    host: {machine_name}.tailnet")
+    lines.append("    capabilities: [python]")
+    lines.append(f"    repos: [{', '.join(repos)}]")
+    lines.append("    repo_paths:")
+    for name, p in repo_paths.items():
+        lines.append(f"      {name}: {p!r}")
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+class TestConfigHotReload:
+    """#2299: `coordinator.yml` edits land within one health tick, no restart.
+
+    The pre-#2299 agent froze `repos`/`repo_paths`/`capabilities`/... at
+    process start, so adding a repo to the fleet required `systemctl --user
+    restart coord-agent` on every machine that should serve it — the same
+    action that kills live workers. Worse, the resulting skew was invisible
+    from the operator's side: `coord config`, `coord status` and `coord assign
+    --dry-run` all read the file and reported the repo as supported while
+    `assign()` refused every dispatch for it.
+    """
+
+    def _build(self, tmp_path: Path, **kwargs):
+        """A server whose config declares only `api`, plus a `web` repo on disk."""
+        from coord.config import load as load_config
+
+        api = _init_repo(tmp_path / "api")
+        web = _init_repo(tmp_path / "web")
+        cfg_path = _write_config(
+            tmp_path / "coordinator.yml",
+            repos=["api"],
+            repo_paths={"api": str(api)},
+        )
+        cfg = load_config(cfg_path)
+        server = AgentServer(
+            machine_name="test",
+            capabilities=["python"],
+            repos=["api"],
+            state_dir=tmp_path / "state",
+            worker_command=lambda spec: ["/bin/sh", "-c", "echo worker-output"],
+            repo_paths={"api": str(api)},
+            health_config=cfg,
+            worktree_writable_settings_files=[],
+            **kwargs,
+        )
+        return server, cfg_path, api, web
+
+    # ── the acceptance case ─────────────────────────────────────────────────
+
+    def test_repo_added_on_disk_is_dispatchable_without_restart(
+        self, tmp_path: Path
+    ) -> None:
+        """Black-box acceptance: agent serving {api}, config edited to
+        {api, web} on disk, dispatch for `web` succeeds — no restart."""
+        server, cfg_path, api, web = self._build(tmp_path)
+        try:
+            with pytest.raises(ValueError, match="does not handle repo 'web'"):
+                server.assign(_spec(web, repo_name="web"))
+
+            _write_config(
+                cfg_path,
+                repos=["api", "web"],
+                repo_paths={"api": str(api), "web": str(web)},
+            )
+            _bump_mtime(cfg_path)
+
+            a = server.assign(_spec(web, repo_name="web"))
+            final = server.wait_for(a.id)
+            assert final.exit_code == 0
+            assert server.repos == ["api", "web"]
+            assert server.repo_paths["web"] == str(web)
+        finally:
+            server.shutdown()
+
+    def test_health_advertises_new_repo_after_reload(self, tmp_path: Path) -> None:
+        """`/health` must publish the post-reload repo list, so `coord repo
+        doctor` stops reporting `machines.agent_repo_skew` on its own."""
+        server, cfg_path, api, web = self._build(tmp_path)
+        try:
+            assert server.health()["repos"] == ["api"]
+
+            _write_config(
+                cfg_path,
+                repos=["api", "web"],
+                repo_paths={"api": str(api), "web": str(web)},
+            )
+            _bump_mtime(cfg_path)
+
+            health = server.health()
+            assert health["repos"] == ["api", "web"]
+            assert health["degraded"] == {}
+            assert health["config_reload"]["reloads"] == 1
+            assert health["config_reload"]["watching"] == str(cfg_path)
+            assert health["config_reload"]["last_reload_at"] is not None
+        finally:
+            server.shutdown()
+
+    def test_unchanged_config_is_not_reparsed(self, tmp_path: Path) -> None:
+        """Steady state is a single stat(): no on-disk change → no reparse."""
+        server, cfg_path, _api, _web = self._build(tmp_path)
+        try:
+            import coord.config as coord_config_module
+
+            calls: list[Path] = []
+            original = coord_config_module.load
+
+            def _counting_load(path):
+                calls.append(path)
+                return original(path)
+
+            coord_config_module.load = _counting_load
+            try:
+                for _ in range(3):
+                    server.health()
+            finally:
+                coord_config_module.load = original
+
+            assert calls == []
+            assert server.health()["config_reload"]["reloads"] == 0
+        finally:
+            server.shutdown()
+
+    # ── malformed edits ─────────────────────────────────────────────────────
+
+    def test_malformed_config_keeps_last_good_and_does_not_loop(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A broken hand-edit must leave the agent running on the last-good
+        config, and must not be re-parsed (or re-logged) on every poll —
+        matching the board daemon's #1081 behaviour."""
+        server, cfg_path, api, _web = self._build(tmp_path)
+        try:
+            cfg_path.write_text("machines: [[[ not: valid: yaml")
+            _bump_mtime(cfg_path)
+
+            with caplog.at_level("WARNING", logger="coord.agent"):
+                first = server.health()
+                second = server.health()
+                third = server.health()
+
+            # Still serving what it served before the bad edit.
+            assert first["repos"] == ["api"]
+            assert third["repos"] == ["api"]
+            assert server.repo_paths == {"api": str(api)}
+            assert third["config_reload"]["reloads"] == 0
+            assert second["config_reload"]["reloads"] == 0
+
+            # Logged exactly once across three polls — the tracked mtime
+            # advances past a bad edit so it isn't retried in a loop.
+            assert caplog.text.count("failed to reload") == 1
+
+            # ...and a *fixed* edit is picked up on the next poll.
+            _write_config(
+                cfg_path,
+                repos=["api", "web"],
+                repo_paths={"api": str(api), "web": str(_web)},
+            )
+            _bump_mtime(cfg_path)
+            assert server.health()["repos"] == ["api", "web"]
+        finally:
+            server.shutdown()
+
+    def test_config_dropping_this_machine_keeps_last_good(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An edit that removes/renames this machine must not be adopted —
+        doing so would publish an empty repo list and refuse every dispatch."""
+        server, cfg_path, api, web = self._build(tmp_path)
+        try:
+            _write_config(
+                cfg_path,
+                repos=["api", "web"],
+                repo_paths={"api": str(api), "web": str(web)},
+                machine_name="someone-else",
+            )
+            _bump_mtime(cfg_path)
+
+            with caplog.at_level("WARNING", logger="coord.agent"):
+                health = server.health()
+
+            assert health["repos"] == ["api"]
+            assert health["config_reload"]["reloads"] == 0
+            assert "no longer declares machine 'test'" in caplog.text
+        finally:
+            server.shutdown()
+
+    def test_no_local_config_is_a_no_op(self, tmp_path: Path) -> None:
+        """Config-free / thin-client agents have no local file to watch —
+        the reload must degrade to nothing rather than raising."""
+        repo = _init_repo(tmp_path / "repo")
+        server = _server(tmp_path, repo_path=repo)  # health_config=None
+        try:
+            assert server._maybe_reload_config() is False
+            health = server.health()
+            assert health["config_reload"]["watching"] is None
+            assert health["config_reload"]["reloads"] == 0
+            assert health["repos"] == ["api"]
+        finally:
+            server.shutdown()
+
+    # ── the in-flight invariant ─────────────────────────────────────────────
+
+    def test_reload_does_not_disturb_a_live_worker(self, tmp_path: Path) -> None:
+        """A reload must never mutate state a *running* worker depends on:
+        in-flight assignments keep the values they started with, and the new
+        config governs the next dispatch onward."""
+        from coord.config import load as load_config
+
+        api = _init_repo(tmp_path / "api")
+        web = _init_repo(tmp_path / "web")
+        cfg_path = _write_config(
+            tmp_path / "coordinator.yml",
+            repos=["api"],
+            repo_paths={"api": str(api)},
+            artifact_paths={"api": ["target/release/api"]},
+            build_commands={"api": "make api"},
+        )
+        cfg = load_config(cfg_path)
+        server = AgentServer(
+            machine_name="test",
+            capabilities=["python"],
+            repos=["api"],
+            state_dir=tmp_path / "state",
+            # Blocks until the sentinel appears, so the assignment is
+            # genuinely RUNNING while the config changes underneath it.
+            worker_command=lambda spec: [
+                "/bin/sh", "-c",
+                f"while [ ! -f {tmp_path / 'go'} ]; do sleep 0.05; done; echo done",
+            ],
+            repo_paths={"api": str(api)},
+            artifact_paths={"api": ["target/release/api"]},
+            build_commands={"api": "make api"},
+            health_config=cfg,
+            worktree_writable_settings_files=[],
+        )
+        try:
+            a = server.assign(_spec(api))
+            deadline = time.time() + 10
+            while server.get(a.id).status != RUNNING and time.time() < deadline:
+                time.sleep(0.05)
+            assert server.get(a.id).status == RUNNING
+            worktree_before = server.get(a.id).worktree_path
+
+            # Hostile edit: repoint api's checkout, swap its build command and
+            # artifact globs, drop it from this machine, and add web.
+            moved = _init_repo(tmp_path / "api-moved")
+            _write_config(
+                cfg_path,
+                repos=["web"],
+                repo_paths={"web": str(web)},
+                artifact_paths={"web": ["target/release/web"]},
+                build_commands={"web": "make web"},
+            )
+            _bump_mtime(cfg_path)
+            assert server._maybe_reload_config() is True
+
+            # The live worker's repo keeps every value it started with...
+            assert server.repo_paths["api"] == str(api)
+            assert server.artifact_paths["api"] == ["target/release/api"]
+            assert server.build_commands["api"] == "make api"
+            assert str(moved) not in server.repo_paths.values()
+            # ...its process and worktree are untouched...
+            assert server.get(a.id).status == RUNNING
+            assert server.get(a.id).worktree_path == worktree_before
+            # ...while the *next* dispatch follows the new config.
+            assert server.repos == ["web"]
+            assert server.repo_paths["web"] == str(web)
+            assert server.build_commands["web"] == "make web"
+
+            (tmp_path / "go").write_text("go\n")
+            final = server.wait_for(a.id)
+            assert final.exit_code == 0
+            assert "done" in Path(final.log_path).read_text()
+
+            # Once the pin lifts (assignment terminal), the next reload drops
+            # the stale api entries entirely.
+            _bump_mtime(cfg_path)
+            server._config_mtime = None
+            assert server._maybe_reload_config() is True
+            assert "api" not in server.repo_paths
+            assert "api" not in server.build_commands
+            assert "api" not in server.artifact_paths
+        finally:
+            (tmp_path / "go").write_text("go\n")
+            server.shutdown()
+
+    def test_pin_restores_absence_not_just_values(self, tmp_path: Path) -> None:
+        """A repo that had NO build command must not acquire one mid-flight:
+        the pre-stash build would run a command the live worker never saw."""
+        server, cfg_path, api, web = self._build(tmp_path)
+        try:
+            a = AgentAssignment(
+                id="live-1", spec=_spec(api), status=RUNNING, branch="main",
+            )
+            server._assignments[a.id] = a
+
+            _write_config(
+                cfg_path,
+                repos=["api", "web"],
+                repo_paths={"api": str(api), "web": str(web)},
+                artifact_paths={"api": ["target/release/api"]},
+                build_commands={"api": "make api"},
+            )
+            _bump_mtime(cfg_path)
+            assert server._maybe_reload_config() is True
+
+            assert "api" not in server.build_commands
+            assert "api" not in server.artifact_paths
+            assert server.repos == ["api", "web"]
+        finally:
+            server._assignments.clear()
+            server.shutdown()
+
+    # ── hot vs restart-only ─────────────────────────────────────────────────
+
+    def test_capabilities_are_hot(self, tmp_path: Path) -> None:
+        """`capabilities` gates coordinator-side smoke/review routing off the
+        published /health list; nothing in the worker path reads it, so a
+        capability that disappears simply stops attracting new work."""
+        server, cfg_path, api, _web = self._build(tmp_path)
+        try:
+            _write_config(
+                cfg_path,
+                repos=["api"],
+                repo_paths={"api": str(api)},
+                capabilities=["python", "rust"],
+            )
+            _bump_mtime(cfg_path)
+
+            assert server.health()["capabilities"] == ["python", "rust"]
+        finally:
+            server.shutdown()
+
+    def test_restart_only_fields_are_not_reloaded(self, tmp_path: Path) -> None:
+        """`bash_wrap_spawn` and `first_output_timeout` are documented
+        restart-only process tuning that uvicorn/`_spawn` already committed
+        to at startup. A reload must leave both exactly as they were.
+
+        #2326: `providers` used to be on this list too — a sibling test,
+        `test_provider_registry_is_hot_reloaded_when_not_in_flight` below,
+        now covers that it IS reloaded (a live worker's OWN resolved
+        provider is still protected, just via in-flight pinning rather than
+        blanket restart-only-ness — see `_apply_reloaded_config`)."""
+        server, cfg_path, api, web = self._build(
+            tmp_path,
+            bash_wrap_spawn=False,
+            first_output_timeout=12.5,
+        )
+        try:
+            _write_config(
+                cfg_path,
+                repos=["api", "web"],
+                repo_paths={"api": str(api), "web": str(web)},
+            )
+            _bump_mtime(cfg_path)
+            assert server._maybe_reload_config() is True
+
+            assert server.bash_wrap_spawn is False
+            assert server.first_output_timeout == 12.5
+        finally:
+            server.shutdown()
+
+    # ── #2326: providers.definitions is hot too ─────────────────────────────
+
+    def test_provider_registry_is_hot_reloaded_when_not_in_flight(
+        self, tmp_path: Path
+    ) -> None:
+        """An agent with its own local `coordinator.yml` must not pin
+        `providers.definitions` at startup (#2326) — a provider config
+        change (new env, new binary, ...) must apply on the NEXT dispatch,
+        no restart, exactly like `repos`/`capabilities`/etc already do.
+
+        Verifies the resolution itself: the env dict a fresh dispatch's
+        provider carries, not a re-read of the config file."""
+        from coord.config import load as load_config
+        from coord.providers import build_provider
+
+        api = _init_repo(tmp_path / "api")
+        stub = tmp_path / "fake-claude.sh"
+        stub.write_text('#!/bin/sh\necho "SPAWN_ENV_FOO=$SPAWN_ENV_FOO"\n')
+        stub.chmod(0o755)
+
+        cfg_path = _write_config_with_provider(
+            tmp_path / "coordinator.yml",
+            repos=["api"],
+            repo_paths={"api": str(api)},
+            provider_binary=str(stub),
+        )
+        cfg = load_config(cfg_path)
+
+        server = AgentServer(
+            machine_name="test",
+            capabilities=["python"],
+            repos=["api"],
+            state_dir=tmp_path / "state",
+            worker_command=lambda spec: [
+                "/bin/sh", "-c", "echo legacy-SHOULD-NOT-RUN"
+            ],
+            repo_paths={"api": str(api)},
+            providers={
+                "myprovider": build_provider(
+                    "myprovider",
+                    cfg.providers.definitions["myprovider"],
+                    cfg.models,
+                )
+            },
+            health_config=cfg,
+            worktree_writable_settings_files=[],
+            bash_wrap_spawn=False,
+        )
+        try:
+            a1 = server.assign(_spec(api, provider="myprovider"))
+            final1 = server.wait_for(a1.id, timeout=5)
+            log1 = Path(final1.log_path).read_text()
+            assert "SPAWN_ENV_FOO=bar" not in log1
+            assert "legacy-SHOULD-NOT-RUN" not in log1
+
+            _write_config_with_provider(
+                cfg_path,
+                repos=["api"],
+                repo_paths={"api": str(api)},
+                provider_binary=str(stub),
+                provider_env={"SPAWN_ENV_FOO": "bar"},
+            )
+            _bump_mtime(cfg_path)
+
+            a2 = server.assign(_spec(api, provider="myprovider"))
+            final2 = server.wait_for(a2.id, timeout=5)
+            log2 = Path(final2.log_path).read_text()
+            assert "SPAWN_ENV_FOO=bar" in log2, (
+                f"providers.definitions edit did not reach the next "
+                f"dispatch: {log2!r}"
+            )
+            # An implicit "claude" entry is always materialised alongside
+            # whatever's explicitly configured (see `ProvidersConfig`).
+            assert server.health()["config_reload"]["provider_names"] == [
+                "claude",
+                "myprovider",
+            ]
+        finally:
+            server.shutdown()
+
+    def test_in_flight_provider_is_pinned_across_a_reload(
+        self, tmp_path: Path
+    ) -> None:
+        """The #2299 in-flight invariant applies to providers too (#2326): a
+        RUNNING assignment must keep resolving to the provider instance it
+        started with, even though a reload landed while it was running —
+        `_reap` re-resolves the SAME spec afterwards to pick a log parser,
+        and must get back the SAME identity `_spawn` used, not one a reload
+        swapped underneath it."""
+        from coord.config import load as load_config
+        from coord.providers import build_provider
+
+        api = _init_repo(tmp_path / "api")
+        go = tmp_path / "go"
+        stub = tmp_path / "fake-claude.sh"
+        stub.write_text(
+            "#!/bin/sh\n"
+            f"while [ ! -f {go} ]; do sleep 0.05; done\n"
+            'echo "SPAWN_ENV_FOO=$SPAWN_ENV_FOO"\n'
+        )
+        stub.chmod(0o755)
+
+        cfg_path = _write_config_with_provider(
+            tmp_path / "coordinator.yml",
+            repos=["api"],
+            repo_paths={"api": str(api)},
+            provider_binary=str(stub),
+        )
+        cfg = load_config(cfg_path)
+        server = AgentServer(
+            machine_name="test",
+            capabilities=["python"],
+            repos=["api"],
+            state_dir=tmp_path / "state",
+            worker_command=lambda spec: ["/bin/sh", "-c", "echo legacy"],
+            repo_paths={"api": str(api)},
+            providers={
+                "myprovider": build_provider(
+                    "myprovider",
+                    cfg.providers.definitions["myprovider"],
+                    cfg.models,
+                )
+            },
+            health_config=cfg,
+            worktree_writable_settings_files=[],
+            bash_wrap_spawn=False,
+        )
+        try:
+            a = server.assign(_spec(api, provider="myprovider"))
+            deadline = time.time() + 10
+            while server.get(a.id).status != RUNNING and time.time() < deadline:
+                time.sleep(0.05)
+            assert server.get(a.id).status == RUNNING
+            pre_reload_provider = server._providers["myprovider"]
+
+            # Edit lands WHILE the worker above is running.
+            _write_config_with_provider(
+                cfg_path,
+                repos=["api"],
+                repo_paths={"api": str(api)},
+                provider_binary=str(stub),
+                provider_env={"SPAWN_ENV_FOO": "bar"},
+            )
+            _bump_mtime(cfg_path)
+            assert server._maybe_reload_config() is True
+
+            # The RUNNING assignment's own provider identity must survive
+            # the reload untouched — asserted directly (object identity),
+            # not just inferred from behaviour.
+            in_flight_provider = server._resolve_provider(server.get(a.id).spec)
+            assert in_flight_provider is pre_reload_provider
+            assert in_flight_provider.env().get("SPAWN_ENV_FOO") is None
+
+            go.write_text("done")
+            final = server.wait_for(a.id, timeout=10)
+            log = Path(final.log_path).read_text()
+            assert "SPAWN_ENV_FOO=bar" not in log, (
+                "a reload must not retarget an in-flight worker's provider "
+                f"mid-run: {log!r}"
+            )
+
+            # The pin lifts once the assignment is terminal AND the next
+            # reload runs (a pin is only re-evaluated when a reload actually
+            # happens — an unchanged file triggers no reload at all, so it
+            # takes one more on-disk change, exactly like a genuine second
+            # `coordinator.yml` edit would).
+            _bump_mtime(cfg_path)
+            assert server._maybe_reload_config() is True
+            a2 = server.assign(_spec(api, provider="myprovider"))
+            final2 = server.wait_for(a2.id, timeout=10)
+            log2 = Path(final2.log_path).read_text()
+            assert "SPAWN_ENV_FOO=bar" in log2
+        finally:
+            server._assignments.clear()
+            server.shutdown()
+
+    def test_reload_busts_the_local_health_cache(self, tmp_path: Path) -> None:
+        """The H-1 block in /health is built from the loaded Config's
+        checkouts — a cache left in place would keep republishing the
+        pre-reload repo set for a full TTL, i.e. the same skew one layer
+        down."""
+        server, cfg_path, api, web = self._build(tmp_path)
+        try:
+            server._local_health_cache = (time.time(), {"stale": True})
+            _write_config(
+                cfg_path,
+                repos=["api", "web"],
+                repo_paths={"api": str(api), "web": str(web)},
+            )
+            _bump_mtime(cfg_path)
+            assert server._maybe_reload_config() is True
+            assert server._local_health_cache is None
+            assert server._health_config.path == cfg_path
+        finally:
+            server.shutdown()

@@ -928,7 +928,26 @@ def _episode_line(item: Mapping[str, Any]) -> str:
     if len(stated) > 90:
         stated = stated[:87] + "..."
     if not item.get("resolved"):
-        return f"{key:<28} {state:<8} STILL STALLED  stated: {stated}"
+        line = f"{key:<28} {state:<8} STILL STALLED  stated: {stated}"
+        # #2276 Phase 1.  An open episode used to have nothing in the `cause`
+        # column at all — `summarize` bucketed it as `(unresolved)`. When the
+        # diagnostician has been round, it does, and the CONTRADICTS marker is
+        # what makes #2235's five-of-seven finding legible at a glance instead
+        # of requiring the reader to hold both strings in their head.
+        cause = " ".join(str(item.get("true_cause") or "").split())
+        if cause:
+            flag = (
+                "  ← CONTRADICTS the stated reason"
+                if item.get("diagnosis_contradicts_stated")
+                else ""
+            )
+            confidence = str(item.get("diagnosis_confidence") or "?")
+            line += (
+                f"\n{'':<28} {'':<8}               cause:  {cause}"
+                f"\n{'':<28} {'':<8}               "
+                f"(diagnosed, confidence {confidence}){flag}"
+            )
+        return line
     mark = "HUMAN" if item.get("human_acted") else "auto "
     held = item.get("stalled_seconds")
     age = _age_str(float(held)) if held is not None else "?"
@@ -962,10 +981,15 @@ def drive_queue_block_log(output_json: bool, days: float, config_path: Path) -> 
     how often did a human have to act?" is answered from two weeks of evidence
     rather than from one morning's triage.
 
-    Nothing here diagnoses. `cause` is derived from the release the queue
-    itself performed (a #2230 gate-clear, a #1891 CI resume, an operator's
-    `remove`), never from a live re-check — that is Phase 1, and its scope is
-    supposed to be decided BY this data, not assumed ahead of it.
+    This command itself does not diagnose — it renders what other passes
+    recorded. For a *resolved* episode, `cause` is still derived from the
+    release the queue itself performed (a #2230 gate-clear, a #1891 CI
+    resume, an operator's `remove`), never from a live re-check. For a
+    still-open episode, `cause` may instead be a Phase 1 (#2276) live
+    re-check's verdict — `coord drive-queue diagnose` or the notifier tick's
+    `diagnose_pass` recorded it as a `diagnosis` event, and `_episode_line`
+    renders it with a `(diagnosed, confidence ...)` tag so it reads distinct
+    from a resolution-derived cause.
 
     Read the two summary numbers together: `human_acted` is the count #2235
     wants to see fall, but a queue that stops needing interventions by leaving
@@ -1014,6 +1038,225 @@ def drive_queue_block_log(output_json: bool, days: float, config_path: Path) -> 
             stats["repeat_causes"].items(), key=lambda kv: (-kv[1], kv[0])
         ):
             click.echo(f"  {count}× {label}")
+    for line in _diagnosis_summary_lines(stats.get("diagnosis") or {}):
+        click.echo(line)
+
+
+def _diagnosis_summary_lines(diag: Mapping[str, Any]) -> list[str]:
+    """#2276's success criterion, rendered as a measurement.
+
+    The disagreement rate is printed as ``(not yet measurable)`` rather than
+    ``0%`` until something scorable has resolved, because #2276 is explicit
+    that the number must be *measured, not assumed* — and "0% wrong out of
+    nothing" is the most flattering way there is to assume it.
+    """
+    if not diag.get("diagnosed"):
+        return []
+    lines = [
+        f"diagnosed {diag['diagnosed']} stall(s) — "
+        f"{diag.get('contradicted_stated_reason', 0)} contradicted the stated reason"
+    ]
+    rate = diag.get("disagreement_rate")
+    scored = f"{diag.get('agreed', 0)} agreed · {diag.get('disagreed', 0)} disagreed"
+    tail = (
+        f"{rate * 100:.0f}% disagreement"
+        if rate is not None
+        else "disagreement rate: (not yet measurable — nothing scorable has resolved)"
+    )
+    lines.append(f"  vs. how they actually resolved: {scored} — {tail}")
+    lines.append(
+        f"  {diag.get('abstained', 0)} abstained (said unknown, which is not a "
+        f"failure) · {diag.get('undecided', 0)} unscorable"
+    )
+    return lines
+
+
+# ── diagnose (#2276 Phase 1) ─────────────────────────────────────────────────
+
+
+def _diagnosis_lines(diagnosis: Any) -> list[str]:
+    """One diagnosis, rendered.  ``stated`` and ``cause`` adjacent, as ever."""
+    flag = " ← CONTRADICTS the stated reason" if diagnosis.contradicts_stated else ""
+    trigger = f"  (triggered by: {diagnosis.trigger})" if diagnosis.trigger else ""
+    lines = [
+        f"{diagnosis.key} [{diagnosis.state}]{trigger}",
+        f"  stated: {' '.join((diagnosis.stated_reason or '(none)').split())}",
+        f"  cause:  {diagnosis.cause} (confidence {diagnosis.confidence}){flag}",
+    ]
+    if diagnosis.abstained:
+        lines.append(
+            "          unknown is a verdict, not a failure — the evidence "
+            "below was too thin to name a cause"
+        )
+    lines.append("  evidence:")
+    lines.extend(f"    - {line}" for line in diagnosis.evidence)
+    return lines
+
+
+@drive_queue_group.command("diagnose")
+@click.option("--json", "output_json", is_flag=True, default=False, help="Emit diagnoses as JSON.")
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Derive and print, but do not append the diagnosis to the block log.",
+)
+@_CONFIG_OPTION
+def drive_queue_diagnose(output_json: bool, dry_run: bool, config_path: Path) -> None:
+    """Re-derive the REAL blocker of every still-stalled entry (#2276 Phase 1).
+
+    Read-only. It runs no `coord merge`, dispatches nothing, and writes nothing
+    to the board or the queue — its single output is a `diagnosis` record in
+    the Phase-0 block log, which no decision path reads.
+
+    The queue's stated reason is an INPUT TO BE CONTRADICTED, never a starting
+    hypothesis: #2235 found that five of seven overnight stalls named a symptom
+    rather than a cause, so this asks GitHub, the live gate report and the
+    agent's /health what is actually true right now, and only then checks
+    whether the evidence still supports what the queue said.
+
+    `unknown` is a first-class verdict. Thin evidence gets an abstention, not a
+    guess — a confidently wrong cause is worse than no cause, because #2268's
+    Phase 2 would inherit the confidence.
+
+    It runs here, and in `coord serve`'s notifier tick, rather than as a
+    dispatched worker: a diagnosis needs `gh`, and `gh` is denied to workers
+    (#1483). The trigger in the daemon is #1632's own stall detector — there is
+    deliberately no second definition of "stalled" anywhere in this path.
+
+    That notifier-tick trigger only fires when `notifications.enabled` is
+    true (`coord.notifier.service._tick` returns before `diagnose_pass` runs
+    otherwise) — notifications are off by default in this repo, so on a
+    fleet that has not turned them on, THIS command is the only live entry
+    point into Phase 1.
+    """
+    from coord import block_log, queue_diagnose  # noqa: PLC0415
+    from coord.board_service import is_remote  # noqa: PLC0415
+    from coord.commands._common import _load_config  # noqa: PLC0415
+
+    # #615/#906 guard: everything this command reads — the Phase-0 block log,
+    # the queue rows, the board handed to GhLiveProbe — lives on the daemon
+    # host, and the probes need `gh` (denied to workers, #1483). On a thin
+    # client all three reads would be silently empty, so the "diagnosis"
+    # would be a confident report about a queue that isn't there. Fail loud
+    # instead (the exact #615 failure mode this audit exists to prevent).
+    if is_remote():
+        raise click.ClickException(
+            "drive-queue diagnose reads the daemon host's block log, queue "
+            "and board directly — run it there (a board_service-configured "
+            "thin client would diagnose an empty queue)."
+        )
+
+    from coord.drive import list_drive_sessions  # noqa: PLC0415
+    from coord.health.aggregate import local_fleet_health_block  # noqa: PLC0415
+    from coord.state import build_board, list_drive_queue  # noqa: PLC0415
+
+    config = _load_config(config_path)
+    episodes = [
+        ep for ep in block_log.episodes(block_log.read_events()) if not ep.get("resolved")
+    ]
+    entries = entries_from_rows(list_drive_queue())
+    # #2276 review: without these two, `GhLiveProbe._health()` short-circuits
+    # to `(None, None, [])` for every entry — `agent_reachable` and
+    # `agent_has_session` are permanently unknown, which makes `dead-leg` and
+    # `agent-unreachable` structurally unreachable verdicts from this command.
+    # Same local-DB read `coord status` uses in host mode (status.py's own
+    # `local_fleet_health_block` call) — no fresh /health round trip, just
+    # the last tick's reported state; and the same `list_drive_sessions()`
+    # this file already calls elsewhere (`_fetch_board_view`) for live tmux
+    # session names.
+    fleet_health = local_fleet_health_block([m.name for m in config.machines])
+    live_sessions = frozenset(
+        str(row["session_name"])
+        for row in list_drive_sessions()
+        if row.get("session_name")
+    )
+    probe = queue_diagnose.GhLiveProbe(
+        config=config,
+        board=build_board(),
+        fleet_health=fleet_health,
+        live_sessions=live_sessions,
+        # #1870: that `list_drive_sessions()` above is a LOCAL tmux read, so
+        # the probe has to know whose tmux it is. Without this an entry some
+        # OTHER machine launched reads as "session absent" here and lands a
+        # high-confidence `dead-leg` on a session that is very much alive —
+        # the same trap `_reconcile_running` already sidesteps.
+        local_host=_local_host_id(),
+    )
+    # `keys=None` — an operator asking directly wants every open episode
+    # looked at, not just the ones the notifier happens to have raised this
+    # minute. `limit=None` for the same reason, and because the per-pass cap
+    # exists to protect `coord serve`'s 30 s tick, which this is not on: a cap
+    # here would silently diagnose four of ten and print "4 diagnosed", which
+    # reads as "that was all of them". The per-episode budget still applies,
+    # so this cannot become a way to spend `gh` calls in a loop.
+    diagnoses = queue_diagnose.run_pass(
+        entries, episodes, probe=probe, keys=None, limit=None
+    )
+
+    if diagnoses and not dry_run:
+        _record_block_log(
+            [
+                block_log.diagnosis_event(
+                    key=d.key,
+                    state=d.state,
+                    stated_reason=d.stated_reason,
+                    true_cause=d.true_cause,
+                    cause=d.cause,
+                    confidence=d.confidence,
+                    evidence=d.evidence,
+                    contradicts_stated=d.contradicts_stated,
+                    trigger=d.trigger,
+                    host=_local_host_id(),
+                )
+                for d in diagnoses
+            ]
+        )
+
+    if output_json:
+        click.echo(
+            _json.dumps(
+                {
+                    "recorded": bool(diagnoses) and not dry_run,
+                    "diagnoses": [
+                        {
+                            "key": d.key,
+                            "state": d.state,
+                            "stated_reason": d.stated_reason,
+                            "cause": d.cause,
+                            "true_cause": d.true_cause,
+                            "confidence": d.confidence,
+                            "evidence": list(d.evidence),
+                            "contradicts_stated": d.contradicts_stated,
+                            "trigger": d.trigger,
+                        }
+                        for d in diagnoses
+                    ],
+                }
+            )
+        )
+        return
+
+    if not diagnoses:
+        click.echo(
+            "nothing to diagnose: no open stall episode is both unexplained and "
+            "still within its diagnosis budget"
+        )
+        return
+    for diagnosis in diagnoses:
+        for line in _diagnosis_lines(diagnosis):
+            click.echo(line)
+        click.echo("")
+    contradicted = sum(1 for d in diagnoses if d.contradicts_stated)
+    abstained = sum(1 for d in diagnoses if d.abstained)
+    click.echo(
+        f"{len(diagnoses)} diagnosed — {contradicted} contradicted the stated "
+        f"reason · {abstained} abstained (unknown)"
+    )
+    click.echo(
+        "nothing was mutated; read the outcome later with "
+        "`coord drive-queue block-log`"
+    )
 
 
 # ── overlap-report (#2247) ───────────────────────────────────────────────────
@@ -1389,6 +1632,42 @@ def _fetch_cordons() -> dict[str, str]:
         click.echo(f"warning: could not read release cordons ({exc}) — "
                    "treating the fleet as uncordoned", err=True)
         return {}
+
+
+def _fetch_editable_drift() -> tuple[str, str] | None:
+    """``(repo_root, shown)`` when THIS host's own `coord` is an editable
+    checkout that has drifted off its default branch, else ``None`` (#2314).
+
+    Thin wrapper around ``coord.cli._editable_checkout_drift`` — the exact
+    same read `coord.cli._warn_if_editable_checkout_moved` uses for its
+    CLI-startup warning — reshaped to a plain ``(str, str)`` tuple so
+    :func:`coord.drive_queue.plan_tick` (a pure function; see its module
+    docstring) never has to import ``coord.cli`` or touch a ``Path``.
+    Already fail-soft/best-effort at the source (see that function's
+    docstring); this wrapper adds nothing on top beyond the reshape and the
+    ``str(repo_root)`` conversion.
+
+    Same ``"pytest" in sys.modules`` guard as
+    ``_warn_if_editable_checkout_moved`` — for the identical reason: this
+    repo's OWN test suite runs from an editable checkout on a feature
+    branch as a matter of course (that is what a worker's worktree is), so
+    without the guard every CLI-level `drive-queue tick` test would trip
+    this exact gate on itself. `coord.drive_queue.plan_tick`'s own tests
+    (tests/test_drive_queue.py) exercise the real gate logic directly via
+    its ``editable_drift`` parameter, unaffected by this guard.
+    """
+    import sys as _sys  # noqa: PLC0415
+
+    if "pytest" in _sys.modules:
+        return None
+
+    from coord.cli import _editable_checkout_drift  # noqa: PLC0415
+
+    drift = _editable_checkout_drift()
+    if drift is None:
+        return None
+    repo_root, shown = drift
+    return (str(repo_root), shown)
 
 
 def _fetch_board_view() -> BoardView:
@@ -2073,6 +2352,13 @@ def drive_queue_tick(
         # a rollable state.
         cordons = _fetch_cordons()
 
+        # #2314: is THIS host's own `coord` a drifted editable checkout?
+        # Escalates `coord.cli._warn_if_editable_checkout_moved` from an
+        # advisory-only startup warning (nothing unattended ever reads) to
+        # an actual refusal — see `_editable_drift_alert` and `plan_tick`'s
+        # `editable_drift` parameter for the gate itself.
+        editable_drift = _fetch_editable_drift()
+
         # #1794: the clock is the shell's to read, never `coord.drive_queue`'s.
         # It powers the startup grace window on both sides of the tick — a
         # drive launched seconds ago is `starting`, not dead, and cannot be
@@ -2099,6 +2385,7 @@ def drive_queue_tick(
             cordons=cordons,
             live_ci_gate=live_ci_gate,
             live_blocked_gate=live_blocked_gate,
+            editable_drift=editable_drift,
         )
 
         if reconcile_only:

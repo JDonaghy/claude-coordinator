@@ -211,7 +211,7 @@ def test_drive_queue_is_registered_with_every_verb():
     assert "drive-queue" in main.commands
     assert set(main.commands["drive-queue"].commands) == {
         "add", "list", "remove", "move", "status", "tick", "resume",
-        "overlap-report", "block-log",
+        "overlap-report", "block-log", "diagnose",
     }
 
 
@@ -494,16 +494,32 @@ def test_list_json_emits_the_raw_rows(cli):
 
 
 def _backdate_reason(coord_db, issue: int, seconds: float) -> None:
-    """Age a queued entry's `reason_at` by *seconds* directly in SQLite —
-    simulating a `last_reason` snapshot captured that long ago. Bypasses
+    """Age a queued entry's `reason_at` (and, since #2273's post-review fix,
+    its `retry_backoff_at`) by *seconds* directly in SQLite — simulating a
+    `last_reason`/backoff-window snapshot captured that long ago. Bypasses
     `update_drive_queue_entry` (which always stamps "now") on purpose: this
     is standing in for the wall-clock time that has genuinely elapsed since
     a real tick wrote the reason, exactly as `_backdate` does for
     `launched_at` above.
+
+    Both columns are aged together rather than adding a second helper:
+    `retry_backoff_at` is the column `_retry_backoff_reason` (#2273) actually
+    measures its window from — `reason_at` alone stopped being enough the
+    moment the backoff-deferral's own per-tick status write started
+    re-stamping it every tick (the "moving target" bug this fix closes) — but
+    every existing caller of this helper wants "time has passed since the
+    last write" for ONE of the two concerns `reason_at`/`retry_backoff_at`
+    now split, and ageing the other one too is inert for callers that don't
+    care about it (a `blocked`/`parked` entry with `attempts == 0` is never
+    consulted by `_retry_backoff_reason` at all; a `waiting` entry backing
+    off after a real death has no reason to want `reason_at`'s display age
+    and its backoff window at different ages).
     """
+    aged = time.time() - seconds
     coord_db.execute(
-        "UPDATE drive_queue SET reason_at = ? WHERE repo_name = ? AND issue_number = ?",
-        (time.time() - seconds, REPO, issue),
+        "UPDATE drive_queue SET reason_at = ?, retry_backoff_at = ? "
+        "WHERE repo_name = ? AND issue_number = ?",
+        (aged, aged, REPO, issue),
     )
     coord_db.commit()
 
@@ -1060,10 +1076,51 @@ def test_a_negative_per_repo_ceiling_is_refused(cli):
 
 
 def _backdate(issue: int, seconds: float) -> None:
-    """Age a queued entry's `launched_at` by *seconds*, as if time had passed."""
+    """Age a queued entry's `launched_at` by *seconds*, as if time had passed.
+
+    #2273: also ages `reason_at` AND (post-review fix) `retry_backoff_at` by
+    the same *seconds* — a died entry's next attempt is now paced by real
+    wall-clock time since its `retry` reconcile was recorded
+    (`_retry_backoff_reason`, keyed on `retry_backoff_at` — see that
+    function's docstring for why NOT `reason_at`), not just by tick cadence,
+    so a test simulating "this much time has genuinely passed" before its
+    NEXT tick has to age every field together or the tick under test would
+    see a fresh anchor and defer instead of proceeding. Neither column is one
+    of `update_drive_queue_entry`'s whitelisted-for-arbitrary-values fields
+    (both are auto-stamped/tick-owned — see `_backdate_reason` above, which
+    this mirrors) so it goes through raw SQL rather than
+    `_update_drive_queue_entry_local`. Harmless for a fresh entry that has
+    never retried (neither column is consulted until `attempts >= 1`).
+    """
     state._update_drive_queue_entry_local(
         REPO, issue, launched_at=time.time() - seconds
     )
+    conn = state.get_connection()
+    aged = time.time() - seconds
+    conn.execute(
+        "UPDATE drive_queue SET reason_at = ?, retry_backoff_at = ? "
+        "WHERE repo_name = ? AND issue_number = ?",
+        (aged, aged, REPO, issue),
+    )
+    conn.commit()
+
+
+def _die_and_relaunch(cli, coord_db, issue: int) -> None:
+    """Simulate one full #2273 retry cycle against a currently-`running`
+    entry: the drive is detected dead (one attempt spent, the entry backs
+    off) and, once the backoff elapses, a fresh drive comes back up — the
+    entry ends this call `running` again, one attempt heavier.
+
+    Before #2273 "died and relaunched" was ONE tick; a test that needs a
+    SECOND death detected against a genuinely live session (not just a
+    spent attempt sitting `waiting`) now needs two — this is that pair,
+    factored out because several existing regression tests simulate more
+    than one death in sequence.
+    """
+    _backdate(issue, DRIVE_STARTUP_GRACE_SECONDS + 60)
+    cli("tick")  # retry: attempt spent, backs off
+    _backdate_reason(coord_db, issue, DRIVE_STARTUP_GRACE_SECONDS + 60)
+    cli("tick")  # backoff cleared: relaunches
 
 
 def test_back_to_back_ticks_launch_exactly_one_drive(cli, seed, launches):
@@ -1111,7 +1168,14 @@ def test_a_still_starting_drive_is_reported_not_escalated(cli, seed, launches):
 
 
 def test_a_drive_genuinely_dead_past_the_window_still_retries(cli, seed, launches):
-    """The window delays death detection by one interval; it never removes it."""
+    """The window delays death detection by one interval; it never removes it.
+
+    #2273 changed what happens immediately after: a `retry` reconciled THIS
+    tick no longer relaunches in the SAME tick (see
+    `test_a_relaunch_after_retry_waits_out_the_2273_backoff` right below for
+    that spacing itself) — it still gets requeued and its attempt is still
+    spent, which is what this test now pins.
+    """
     seed(issues={1762: "open"})
     cli("add", REPO, "1762")
     cli("tick")
@@ -1120,14 +1184,43 @@ def test_a_drive_genuinely_dead_past_the_window_still_retries(cli, seed, launche
     result = cli("tick")
     assert result.exit_code == 0, result.output
     assert "died without landing the work" in result.output
-    # It relaunches on the same tick, as it did before #1794.
+    # No relaunch THIS tick — #2273's backoff paces it (see below).
+    assert len(launches) == 1, launches
+    entry = queued(1762)
+    assert entry["state"] == "waiting"
+    assert entry["attempts"] == 1
+
+
+def test_a_relaunch_after_retry_waits_out_the_2273_backoff(
+    cli, seed, launches, coord_db
+):
+    """The spacing itself, end to end: a THIRD tick, run before the backoff
+    has elapsed, still does not relaunch; ageing `reason_at` past it lets a
+    FOURTH tick relaunch normally."""
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    cli("tick")
+    _backdate(1762, DRIVE_STARTUP_GRACE_SECONDS + 60)
+    cli("tick")  # retries; does not relaunch (pinned above)
+    assert len(launches) == 1, launches
+
+    still_backing_off = cli("tick")
+    assert still_backing_off.exit_code == 0, still_backing_off.output
+    assert len(launches) == 1, launches  # still paced
+    assert queued(1762)["state"] == "waiting"
+
+    _backdate_reason(coord_db, 1762, DRIVE_STARTUP_GRACE_SECONDS + 60)
+    relaunched = cli("tick")
+    assert relaunched.exit_code == 0, relaunched.output
     assert len(launches) == 2, launches
     entry = queued(1762)
     assert entry["state"] == "running"
     assert entry["attempts"] == 1
 
 
-def test_a_dead_drives_own_exit_reason_reaches_the_queue_row(cli, seed, launches):
+def test_a_dead_drives_own_exit_reason_reaches_the_queue_row(
+    cli, seed, launches, coord_db
+):
     """#1845/#1844, end-to-end: when the drive itself recorded why it
     stopped — a `drive_exited` audit row written before `coord drive`
     returned — the tick must carry THAT reason forward instead of
@@ -1140,6 +1233,11 @@ def test_a_dead_drives_own_exit_reason_reaches_the_queue_row(cli, seed, launches
     `test_back_to_back_ticks_launch_exactly_one_drive`) and on the FINAL
     blocked row's `last_reason`, which is the one an operator actually goes
     looking at afterwards.
+
+    #2273 inserts a real relaunch step between the two deaths: a `retry`
+    no longer relaunches in the same tick, so the SECOND death has to be
+    simulated against a session that came back up AFTER the #2273 backoff
+    cleared, not the same tick as the first.
     """
     from coord.audit import record_audit
 
@@ -1164,6 +1262,15 @@ def test_a_dead_drives_own_exit_reason_reaches_the_queue_row(cli, seed, launches
     assert first_retry.exit_code == 0, first_retry.output
     assert _own_reason(1) in first_retry.output
     assert "died without landing the work" not in first_retry.output
+    assert queued(1762)["attempts"] == 1
+    assert queued(1762)["state"] == "waiting"  # backing off, not relaunched yet
+
+    # Wait out #2273's backoff, then relaunch — attempts stays 1, a fresh
+    # session comes up.
+    _backdate_reason(coord_db, 1762, DRIVE_STARTUP_GRACE_SECONDS + 60)
+    relaunch = cli("tick")
+    assert relaunch.exit_code == 0, relaunch.output
+    assert queued(1762)["state"] == "running"
     assert queued(1762)["attempts"] == 1
 
     launched_at = queued(1762)["launched_at"]
@@ -1754,16 +1861,18 @@ def test_a_live_ready_wins_even_over_a_stale_cached_plan_reading(
 
 
 def test_a_repeatedly_dead_drive_still_reaches_blocked_and_escalates(
-    cli, seed, launches
+    cli, seed, launches, coord_db
 ):
     seed(issues={1762: "open"})
     cli("add", REPO, "1762")
     cli("tick")
-    _backdate(1762, DRIVE_STARTUP_GRACE_SECONDS + 60)
-    cli("tick")
+    _die_and_relaunch(cli, coord_db, 1762)  # attempt 1: dies, waits out the
+    # #2273 backoff, relaunches
+    assert queued(1762)["state"] == "running"
+    assert queued(1762)["attempts"] == 1
     _backdate(1762, DRIVE_STARTUP_GRACE_SECONDS + 60)
 
-    result = cli("tick")
+    result = cli("tick")  # attempt 2: dies again, exhausted -> blocked
     assert result.exit_code == 0, result.output
     entry = queued(1762)
     assert entry["state"] == "blocked"
@@ -1833,8 +1942,11 @@ def test_a_tick_on_the_launching_host_still_detects_a_genuine_death(
     result = cli("tick")
     assert result.exit_code == 0, result.output
     assert "died without landing the work" in result.output
-    assert len(launches) == 2, launches
+    # #2273: the attempt is spent, but the relaunch is paced — no SECOND
+    # launch in this same tick (see `_die_and_relaunch` for that half).
+    assert len(launches) == 1, launches
     assert queued(1811)["attempts"] == 1
+    assert queued(1811)["state"] == "waiting"
 
 
 def test_an_entry_launched_before_1870_keeps_the_pre_1870_behaviour(
@@ -2581,16 +2693,17 @@ def test_a_hold_after_entry_that_ends_blocked_raises_no_second_alert(
 
 
 def test_an_entry_that_reaches_blocked_lands_in_the_stall_log(
-    cli, seed, launches, block_log
+    cli, seed, launches, block_log, coord_db
 ):
     seed(issues={1762: "open"})
     cli("add", REPO, "1762")
     cli("tick")
-    _backdate(1762, DRIVE_STARTUP_GRACE_SECONDS + 60)
-    cli("tick")
+    _die_and_relaunch(cli, coord_db, 1762)  # attempt 1: dies, relaunches —
+    # neither `waiting` nor `running` is a STALL_STATE, so this adds no
+    # block-log record of its own (see `coord.block_log.STALL_STATES`).
     _backdate(1762, DRIVE_STARTUP_GRACE_SECONDS + 60)
 
-    result = cli("tick")
+    result = cli("tick")  # attempt 2: dies again, exhausted -> blocked
     assert result.exit_code == 0, result.output
     assert queued(1762)["state"] == "blocked"
 
@@ -2707,7 +2820,7 @@ def test_a_quiet_tick_writes_nothing_to_the_stall_log(cli, seed, launches, block
 
 
 def test_the_stall_log_changes_no_queue_decision(
-    cli, seed, launches, block_log, monkeypatch
+    cli, seed, launches, block_log, monkeypatch, coord_db
 ):
     """Phase 0's hard constraint, asserted directly.
 
@@ -2723,11 +2836,10 @@ def test_the_stall_log_changes_no_queue_decision(
     seed(issues={1762: "open"})
     cli("add", REPO, "1762")
     cli("tick")
-    _backdate(1762, DRIVE_STARTUP_GRACE_SECONDS + 60)
-    cli("tick")
+    _die_and_relaunch(cli, coord_db, 1762)  # attempt 1: dies, relaunches
     _backdate(1762, DRIVE_STARTUP_GRACE_SECONDS + 60)
 
-    result = cli("tick")
+    result = cli("tick")  # attempt 2: dies again, exhausted -> blocked
     assert result.exit_code == 0, result.output
     entry = queued(1762)
     assert entry["state"] == "blocked"
@@ -2785,3 +2897,412 @@ def test_block_log_on_an_empty_log_says_so_rather_than_printing_nothing(
     result = cli("block-log")
     assert result.exit_code == 0, result.output
     assert "no stalls recorded" in result.output
+
+
+# ── #2276 Phase 1: the read-only diagnostician, end to end ───────────────────
+#
+# Phase 0's `block-log` above shows what the queue SAID. These drive
+# `coord drive-queue diagnose` — the real Click command, the real sqlite
+# board, the real block log — and assert on the rendered diagnosis.
+#
+# The stubbed boundary is `gh` and the live gate report, i.e. "the world",
+# per this file's opening note. Every stub RECORDS its verb, so the
+# zero-mutation test can assert that not one write verb was reached.
+
+
+class _Check:
+    def __init__(self, name: str, conclusion, status: str = "completed") -> None:
+        self.name = name
+        self.conclusion = conclusion
+        self.status = status
+
+
+class _Gate:
+    def __init__(self, gate: str, ok: bool, reason=None) -> None:
+        self.gate = gate
+        self.required = True
+        self.ok = ok
+        self.reason = reason
+
+
+class _GateReport:
+    def __init__(self, branch: str, decisions: list) -> None:
+        self.branch = branch
+        self.decisions = decisions
+
+
+@pytest.fixture
+def gh_world(monkeypatch):
+    """Stub every live read the diagnostician makes, recording each verb."""
+
+    world: dict[str, Any] = {
+        "pr_state": "OPEN",
+        "pr": {"number": 77},
+        "mergeable": True,
+        "checks": [_Check("test", "success")],
+        "gates": [_Gate("merge", True)],
+        "branch": "issue-1762",
+        "calls": [],
+    }
+
+    def _record(verb: str):
+        world["calls"].append(verb)
+
+    monkeypatch.setattr(
+        "coord.github_ops.get_pr_state_for_branch",
+        lambda repo, branch: (_record("gh pr view --json state"), world["pr_state"])[1],
+    )
+    monkeypatch.setattr(
+        "coord.github_ops.find_pr_for_branch",
+        lambda repo, branch: (_record("gh pr list --state open"), world["pr"])[1],
+    )
+    monkeypatch.setattr(
+        "coord.github_ops.check_pr_mergeable",
+        lambda repo, number: (_record("gh pr view --json mergeable"), world["mergeable"])[1],
+    )
+    monkeypatch.setattr(
+        "coord.ci_github.GitHubCi.list_checks_for_pr",
+        lambda self, repo, number: (_record("gh pr checks"), world["checks"])[1],
+    )
+    monkeypatch.setattr(
+        "coord.gates.build_gate_report",
+        lambda *a, **k: (
+            _record("coord gates"),
+            _GateReport(world["branch"], world["gates"]),
+        )[1],
+    )
+    return world
+
+
+def _stall(issue: int, reason: str, block_log_path: Path) -> None:
+    """Put a real row in `blocked` and open its Phase-0 episode."""
+    from coord import block_log as bl
+
+    state._update_drive_queue_entry_local(
+        REPO, issue, state="blocked", attempts=2, last_reason=reason
+    )
+    bl.record(
+        [
+            {
+                "event": bl.EVENT_ENTER,
+                "ts": time.time() - 3600,
+                "key": f"{REPO}#{issue}",
+                "state": "blocked",
+                "stated_reason": reason,
+                "true_cause": "",
+                "human_acted": None,
+            }
+        ],
+        path=block_log_path,
+    )
+
+
+def test_diagnose_contradicts_the_reason_the_queue_stated(
+    cli, seed, block_log, gh_world
+):
+    """#2235's own row, driven end to end.
+
+    The queue says "stale test verdict". GitHub says the branch is
+    conflicting. The rendered diagnosis has to say so, out loud, rather than
+    quietly agreeing with the queue.
+    """
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    _stall(1762, "merge blocked: stale test verdict (2/2 attempts)", block_log)
+    gh_world["mergeable"] = False
+
+    result = cli("diagnose")
+    assert result.exit_code == 0, result.output
+    assert f"{REPO}#1762 [blocked]" in result.output
+    assert "stated: merge blocked: stale test verdict (2/2 attempts)" in result.output
+    assert "cause:  merge-conflict (confidence high)" in result.output
+    assert "CONTRADICTS the stated reason" in result.output
+    # The evidence each conclusion rests on, named.
+    assert "gh pr view #77: state=OPEN mergeable=NO" in result.output
+    assert "1 contradicted the stated reason" in result.output
+    assert "nothing was mutated" in result.output
+
+
+def test_diagnose_says_unknown_rather_than_guessing_when_the_probes_fail(
+    cli, seed, block_log, gh_world, monkeypatch
+):
+    """`unknown` is a first-class verdict with no penalty attached (#2276)."""
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    _stall(1762, "blocked: CI red, 2/2 attempts", block_log)
+
+    def boom(*a, **k):
+        raise RuntimeError("gh: could not resolve host github.com")
+
+    monkeypatch.setattr("coord.github_ops.get_pr_state_for_branch", boom)
+    monkeypatch.setattr("coord.gates.build_gate_report", boom)
+
+    result = cli("diagnose")
+    assert result.exit_code == 0, result.output
+    assert "cause:  unknown (confidence none)" in result.output
+    assert "unknown is a verdict, not a failure" in result.output
+    assert "CONTRADICTS" not in result.output
+    assert "1 abstained (unknown)" in result.output
+
+
+def test_the_diagnosis_lands_on_the_episode_the_block_log_reports(
+    cli, seed, block_log, gh_world
+):
+    """The acceptance criterion, literally: `true_cause` where it used to read
+    `(unresolved)`."""
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    _stall(1762, "blocked: CI red, 2/2 attempts", block_log)
+
+    before = json.loads(cli("block-log", "--json").output)
+    assert before["episodes"][0]["true_cause"] == ""
+    assert before["summary"]["by_cause"] == {"(unresolved)": 1}
+
+    assert cli("diagnose").exit_code == 0
+
+    after = json.loads(cli("block-log", "--json").output)
+    episode = after["episodes"][0]
+    assert episode["true_cause"].startswith("nothing-blocking — ")
+    assert episode["diagnosed_cause"] == "nothing-blocking"
+    assert episode["resolved"] is False  # an observation, not an outcome
+    assert after["summary"]["by_cause"] == {"nothing-blocking": 1}
+    assert after["summary"]["diagnosis"]["diagnosed"] == 1
+    assert after["summary"]["diagnosis"]["contradicted_stated_reason"] == 1
+
+    rendered = cli("block-log").output
+    assert "STILL STALLED" in rendered
+    assert "cause:  nothing-blocking" in rendered
+    assert "← CONTRADICTS the stated reason" in rendered
+    assert "not yet measurable" in rendered  # nothing scorable has resolved
+
+
+def test_a_full_diagnosis_pass_leaves_the_board_the_queue_and_github_untouched(
+    cli, seed, block_log, gh_world, coord_db
+):
+    """#2276: *"Zero mutation is proven, not asserted."*
+
+    Every table in the real schema is dumped before and after, and every `gh`
+    verb the pass reached is checked against a read-only allowlist.
+    """
+    seed(issues={1762: "open"}, assignments=[{"issue_number": 1762, "status": "done"}])
+    cli("add", REPO, "1762")
+    cli("add", REPO, "1763")
+    _stall(1762, "merge blocked: stale test verdict", block_log)
+    _stall(1763, "blocked: CI red, 2/2 attempts", block_log)
+    gh_world["mergeable"] = False
+
+    before = list(coord_db.iterdump())
+    result = cli("diagnose")
+    after = list(coord_db.iterdump())
+
+    assert result.exit_code == 0, result.output
+    assert "2 diagnosed" in result.output
+    # The board AND the queue, byte for byte. `iterdump` covers every table,
+    # so this catches an attempt-counter bump or a `last_reason` rewrite just
+    # as surely as a state flip.
+    assert after == before
+
+    # GitHub: only reads were reached. Asserting the allowlist rather than
+    # "no writes happened" means a NEW verb added later fails this test until
+    # someone has looked at it.
+    assert set(gh_world["calls"]) <= {
+        "gh pr view --json state",
+        "gh pr list --state open",
+        "gh pr view --json mergeable",
+        "gh pr checks",
+        "coord gates",
+    }
+    assert gh_world["calls"], "the pass did not actually probe anything"
+
+
+def test_diagnose_dry_run_does_not_even_write_its_own_record(
+    cli, seed, block_log, gh_world
+):
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    _stall(1762, "blocked: CI red", block_log)
+    before = block_log_records(block_log)
+
+    result = cli("diagnose", "--dry-run")
+    assert result.exit_code == 0, result.output
+    assert "cause:" in result.output
+    assert block_log_records(block_log) == before
+
+
+def test_diagnose_spends_its_budget_once_and_then_declines(
+    cli, seed, block_log, gh_world
+):
+    """#2272's shape: a diagnosis that concluded is not re-derived, so the
+    command is safe to run in a loop."""
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    _stall(1762, "blocked: CI red", block_log)
+
+    assert "1 diagnosed" in cli("diagnose").output
+    second = cli("diagnose")
+    assert second.exit_code == 0, second.output
+    assert "nothing to diagnose" in second.output
+    diagnoses = [
+        r for r in block_log_records(block_log) if r.get("event") == "diagnosis"
+    ]
+    assert len(diagnoses) == 1
+
+
+def test_diagnose_on_a_quiet_queue_says_so_rather_than_printing_nothing(
+    cli, block_log, gh_world
+):
+    result = cli("diagnose")
+    assert result.exit_code == 0, result.output
+    assert "nothing to diagnose" in result.output
+
+
+def test_diagnose_refuses_on_a_thin_client_rather_than_reading_an_empty_board(
+    cli, monkeypatch
+):
+    """#615/#906 audit guard: everything diagnose reads lives on the daemon host.
+
+    With a board service configured (thin client), the local block log, queue
+    rows and board are all empty — a "diagnosis" of that would be a confident
+    report about a queue that isn't there. The command must refuse loudly
+    before touching any of them.
+    """
+    monkeypatch.setattr("coord.board_service.is_remote", lambda: True)
+
+    result = cli("diagnose")
+    assert result.exit_code != 0
+    assert "run it there" in result.output
+
+
+def test_diagnose_does_not_silently_cap_what_an_operator_asked_for(
+    cli, seed, block_log, gh_world
+):
+    """The per-pass cap protects `coord serve`'s 30s tick. This is not on it.
+
+    A cap here would diagnose four of six and print "4 diagnosed", which reads
+    as "that was all of them" — a silent truncation.
+    """
+    from coord.queue_diagnose import MAX_DIAGNOSES_PER_PASS
+
+    issues = list(range(1770, 1770 + MAX_DIAGNOSES_PER_PASS + 2))
+    seed(issues={n: "open" for n in issues})
+    for n in issues:
+        cli("add", REPO, str(n))
+        _stall(n, "blocked: CI red", block_log)
+
+    result = cli("diagnose")
+    assert result.exit_code == 0, result.output
+    assert f"{len(issues)} diagnosed" in result.output
+
+
+def test_diagnose_wires_fleet_health_and_live_sessions_into_the_probe(
+    cli, seed, block_log, gh_world, monkeypatch
+):
+    """#2276 review: the CLI entry point used to leave `fleet_health` and
+    `live_sessions` at their `None` defaults, which makes `GhLiveProbe._health()`
+    short-circuit to `(None, None, [])` for every entry — `dead-leg` and
+    `agent-unreachable` were structurally unreachable verdicts from here.
+
+    Assert the probe actually receives both, rather than trusting the
+    docstring's claim that it asks the agent's `/health`.
+    """
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    _stall(1762, "blocked: CI red, 2/2 attempts", block_log)
+
+    monkeypatch.setattr(
+        "coord.drive.list_drive_sessions",
+        lambda *a, **k: [
+            {
+                "repo": REPO,
+                "issue": 1762,
+                "session_name": "coord-drive-dellserver-1762",
+                "attached": True,
+            }
+        ],
+    )
+
+    from coord import queue_diagnose as qd
+
+    captured: dict = {}
+    real_cls = qd.GhLiveProbe
+
+    def spy(*a, **k):
+        captured.update(k)
+        return real_cls(*a, **k)
+
+    monkeypatch.setattr("coord.queue_diagnose.GhLiveProbe", spy)
+
+    result = cli("diagnose")
+    assert result.exit_code == 0, result.output
+    assert captured.get("live_sessions") == frozenset({"coord-drive-dellserver-1762"})
+    # Not just "not None": the probe reads specific keys off these rows, so
+    # pin the shape it is handed. `state` is the reachability signal — the
+    # first cut of `_health()` looked for a `reachable` key that has never
+    # existed here, and read every configured machine as reachable.
+    rows = captured["fleet_health"]["machine_health"]
+    assert [r["machine"] for r in rows] == ["dellserver"]
+    assert "state" in rows[0] and "reachable" not in rows[0]
+
+
+def test_diagnose_names_an_unreachable_machine_instead_of_nothing_blocking(
+    cli, seed, block_log, gh_world
+):
+    """#2276 review, end to end: the machine that owns this entry is down.
+
+    Every GitHub read comes back clean (`gh_world`'s defaults: OPEN,
+    mergeable, green checks, clear gates), so before the `machine_health` row
+    was actually read this rendered a confident `nothing-blocking` — "we
+    looked and found no reason" — while the reason was sitting in the local
+    health table. It must name the unreachable agent instead, and must NOT
+    call it a `dead-leg`: no session is visible because nothing on that host
+    is answering, not because the leg died on a healthy machine.
+    """
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    _stall(1762, "blocked: CI red, 2/2 attempts", block_log)
+    state._update_drive_queue_entry_local(
+        REPO,
+        1762,
+        session_name="coord-drive-dellserver-1762",
+        launch_host="dellserver",
+    )
+    state.save_machine_health(
+        "dellserver",
+        state="offline",
+        reason="connection refused (agent not running?)",
+        latency_ms=None,
+        health=None,
+        received_at=time.time(),
+    )
+
+    result = cli("diagnose")
+    assert result.exit_code == 0, result.output
+    assert "cause:  agent-unreachable" in result.output
+    assert "dead-leg" not in result.output
+    assert "nothing-blocking" not in result.output
+    assert "/health dellserver: NOT ANSWERING" in result.output
+
+
+def test_diagnose_does_not_call_a_never_polled_machine_unreachable(
+    cli, seed, block_log, gh_world
+):
+    """The abstention half. Nothing has ever written a `machine_health` row
+    for `dellserver` here, so `_machine_health_rows` still emits one — with
+    `state="unknown"`. That is "we have no reading", not "it is down", and it
+    must not manufacture an `agent-unreachable` verdict.
+    """
+    seed(issues={1762: "open"})
+    cli("add", REPO, "1762")
+    _stall(1762, "blocked: CI red, 2/2 attempts", block_log)
+    state._update_drive_queue_entry_local(
+        REPO,
+        1762,
+        session_name="coord-drive-dellserver-1762",
+        launch_host="dellserver",
+    )
+
+    result = cli("diagnose")
+    assert result.exit_code == 0, result.output
+    assert "agent-unreachable" not in result.output
+    assert "dead-leg" not in result.output
+    assert "/health dellserver: not read" in result.output

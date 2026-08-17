@@ -54,6 +54,7 @@
       "smoke_test_reason": null,
       "smoke_tests": null,
       "status": "running",
+      "stop_reason": null,
       "test_base_sha": null,
       "test_head_sha": null,
       "test_patch_id": null,
@@ -121,6 +122,7 @@
       "smoke_test_reason": null,
       "smoke_tests": null,
       "status": "done",
+      "stop_reason": null,
       "test_base_sha": null,
       "test_head_sha": null,
       "test_patch_id": null,
@@ -191,6 +193,7 @@
         "round_number is non-zero"
       ],
       "status": "done",
+      "stop_reason": null,
       "test_base_sha": null,
       "test_head_sha": null,
       "test_patch_id": null,
@@ -241,6 +244,7 @@
       "repo_name": "claude-coordinator",
       "resume_when": "",
       "resumes": 0,
+      "retry_backoff_at": null,
       "session_name": null,
       "state": "waiting"
     },
@@ -267,6 +271,7 @@
       "repo_name": "claude-coordinator",
       "resume_when": "",
       "resumes": 0,
+      "retry_backoff_at": null,
       "session_name": null,
       "state": "waiting"
     }

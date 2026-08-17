@@ -33,6 +33,8 @@ from coord.config import load as load_config
 from coord.dao import SqliteStore
 from coord.db import _ensure_schema
 from coord.drive_queue import QUEUE_ALERT_ISSUE, QUEUE_ALERT_REPO
+from coord.gate_a import park_marker
+from coord.models import POLICY_REFUSAL_MARKER
 from coord.reports import (
     REPORTS,
     ColumnMeta,
@@ -45,10 +47,13 @@ from coord.reports import (
     fetch_audit_window,
     fold_drive_queue_status,
     fold_issue_activity,
+    fold_queue_outcomes,
     parse_duration,
     resolve_params,
+    resolve_queue_outcomes_window,
     result_to_csv,
     run_drive_queue_status,
+    run_queue_outcomes,
     run_report,
 )
 from coord.serve_app import build_app
@@ -920,13 +925,15 @@ class TestRunDriveQueueStatus:
 
 
 class TestCatalogue:
-    def test_three_reports(self) -> None:
-        assert set(REPORTS) == {"issue-activity", "drive-queue-status", "usage"}
+    def test_the_registered_reports(self) -> None:
+        assert set(REPORTS) == {
+            "issue-activity", "drive-queue-status", "usage", "queue-outcomes",
+        }
 
     def test_catalogue_carries_full_param_metadata(self) -> None:
         cat = catalogue()
         assert [r["id"] for r in cat["reports"]] == [
-            "drive-queue-status", "issue-activity", "usage",
+            "drive-queue-status", "issue-activity", "queue-outcomes", "usage",
         ]
         rep = next(r for r in cat["reports"] if r["id"] == "issue-activity")
         assert rep["title"] == "Issue Activity"
@@ -1071,15 +1078,15 @@ class TestCli:
         assert "24h" in result.output  # the default
         for preset in ("1h", "6h", "3d", "7d"):
             assert preset in result.output
-        # Exactly three reports in the catalogue.
-        assert result.output.count("—  ") == 3
+        # Every registered report appears in the catalogue.
+        assert result.output.count("—  ") == len(REPORTS)
 
     def test_report_list_json(self, coord_db) -> None:
         result = CliRunner().invoke(main, ["report", "list", "--json"])
         assert result.exit_code == 0, result.output
         body = json.loads(result.output)
         assert [r["id"] for r in body["reports"]] == [
-            "drive-queue-status", "issue-activity", "usage",
+            "drive-queue-status", "issue-activity", "queue-outcomes", "usage",
         ]
 
     def test_report_run_json_shape(self, coord_db) -> None:
@@ -1091,10 +1098,12 @@ class TestCli:
         body = json.loads(result.output)
         assert set(body) == {
             "report_id", "generated_at", "window", "columns", "column_meta",
-            "rows", "notes", "totals",
+            "rows", "notes", "totals", "chart",
         }
         # #1763: additive and None for every report that has no meaningful sum.
         assert body["totals"] is None
+        # #2271: same posture for the chart declaration.
+        assert body["chart"] is None
         assert body["report_id"] == "issue-activity"
         assert body["window"] == [WINDOW[1] - 13 * 3600, WINDOW[1]]
 
@@ -1313,10 +1322,12 @@ class TestCliDriveQueueStatus:
         body = json.loads(result.output)
         assert set(body) == {
             "report_id", "generated_at", "window", "columns", "column_meta",
-            "rows", "notes", "totals",
+            "rows", "notes", "totals", "chart",
         }
         # #1763: additive and None for every report that has no meaningful sum.
         assert body["totals"] is None
+        # #2271: same posture for the chart declaration.
+        assert body["chart"] is None
         assert body["report_id"] == "drive-queue-status"
         assert body["window"][0] == body["window"][1]
         assert [m["id"] for m in body["column_meta"]] == body["columns"]
@@ -1458,7 +1469,7 @@ class TestDaemonEndpoints:
         assert resp.status_code == 200
         body = resp.json()
         assert [r["id"] for r in body["reports"]] == [
-            "drive-queue-status", "issue-activity", "usage",
+            "drive-queue-status", "issue-activity", "queue-outcomes", "usage",
         ]
         rep = next(r for r in body["reports"] if r["id"] == "issue-activity")
         params = {p["id"]: p for p in rep["params"]}
@@ -2173,7 +2184,7 @@ class TestUsageTotals:
             "column_meta", "rows", "notes",
         }
         payload = fold_issue_activity([], WINDOW).to_dict()
-        assert set(payload) == before | {"totals"}
+        assert set(payload) == before | {"totals", "chart"}
 
     def test_cli_table_renders_the_totals_row(self) -> None:
         from coord.commands.report import _render_table
@@ -2565,3 +2576,817 @@ class TestCsvEndpoint:
             assert cli.get(
                 "/report/issue-activity", params={"format": "csv"}
             ).status_code == 401
+
+
+# ── queue-outcomes (#2270) ─────────────────────────────────────────────────
+#
+# The one number the morning report is for: what fraction of the queue got
+# over the line without a human.  Three things are load-bearing enough to be
+# pinned rather than eyeballed — the bucket counts (including the `by_design`
+# split and a category the fixture INVENTS, which the report has never seen);
+# the refusal to answer at all on a host with no block log (a table of zeros
+# there reads as a perfect week); and attributability, i.e. every count
+# drilling back to the exact `(repo, issue)` list behind it.
+
+QO_END = T0 + 13 * 3600  # == WINDOW[1], the frozen clock
+QO_DAY = 86400.0
+
+
+def _abs_iso(ts: float) -> str:
+    """The same UTC rendering `coord.reports._iso` puts in a note."""
+    from coord.reports import _iso
+
+    return _iso(ts)
+
+
+def _episode(
+    key: str,
+    *,
+    entered_at: float,
+    resolved_at: float | None = None,
+    true_cause: str = "",
+    human_acted: bool | None = None,
+    stated_reason: str = "exhausted",
+    state: str = "blocked",
+    source: str = "tick",
+) -> dict:
+    """One paired episode, in exactly the shape `block_log.episodes` returns."""
+    episode = {
+        "key": key,
+        "state": state,
+        "stated_reason": stated_reason,
+        "entered_at": entered_at,
+        "attempts": 2,
+        "host": "dellserver",
+        "resolved": resolved_at is not None,
+        "resolution": "",
+        "true_cause": true_cause,
+        "human_acted": human_acted,
+        "resolved_at": resolved_at,
+        "stalled_seconds": None if resolved_at is None else resolved_at - entered_at,
+        "diagnoses": 0,
+        "diagnosed_cause": "",
+        "diagnosis_confidence": "",
+        "diagnosis_evidence": [],
+        "diagnosis_contradicts_stated": False,
+        "agreement": "",
+    }
+    if resolved_at is not None:
+        episode["source"] = source
+    return episode
+
+
+def _qo_fixture() -> list[dict]:
+    """The pinned fixture: one episode per bucket the log can produce, plus a
+    cause this build has never met.
+
+    Deliberately includes BOTH kinds of human stall — the Gate-A sign-off
+    (which is supposed to stop for a person) and an operator `remove` (which
+    is not) — because collapsing them is the failure mode #2270 names: a
+    target metric that can never reach 100% and so reads as permanent failure.
+    """
+    return [
+        # auto, a deterministic arm (#2230's gate re-check).
+        _episode(
+            "api#1",
+            entered_at=QO_END - 7200,
+            resolved_at=QO_END - 3600,
+            true_cause="gate-cleared-after-giveup — the merge gate read clear again",
+            human_acted=False,
+            stated_reason="CI red, 2/2 attempts",
+        ),
+        # auto, the rescue AGENT — structurally impossible today; the fixture
+        # forges the source so the series is proven to exist before #2268 does.
+        _episode(
+            "api#2",
+            entered_at=QO_END - 7000,
+            resolved_at=QO_END - 3500,
+            true_cause="dead-leg — the leg was dead, not slow",
+            human_acted=False,
+            source="rescue",
+        ),
+        # human, BY DESIGN: a Gate-A sign-off (#2063).
+        _episode(
+            "api#3",
+            entered_at=QO_END - 6800,
+            resolved_at=QO_END - 3400,
+            true_cause="gate-a-signed — released only because a human recorded the sign-off",
+            human_acted=True,
+            state="parked",
+            stated_reason="Gate A not approved",
+        ),
+        # human, a real defect: the operator cleared it by hand.
+        _episode(
+            "shared#4",
+            entered_at=QO_END - 6600,
+            resolved_at=QO_END - 3300,
+            true_cause="operator-intervened — a human cleared it by hand",
+            human_acted=True,
+        ),
+        # open, with a cause NOTHING in this codebase defines (#2276 could
+        # diagnose it tomorrow). It must survive to the row as itself.
+        _episode(
+            "shared#5",
+            entered_at=QO_END - 6400,
+            true_cause="solar-flare — a category the fixture invented",
+        ),
+    ]
+
+
+def _row(result, bucket: str, category: str) -> dict:
+    rows = [
+        r for r in result.rows
+        if r["bucket"] == bucket and r["category"] == category
+    ]
+    assert len(rows) == 1, f"expected one {bucket}/{category} row, got {rows}"
+    return rows[0]
+
+
+class TestQueueOutcomesFold:
+    def test_every_bucket_count_is_pinned(self) -> None:
+        result = fold_queue_outcomes(
+            _qo_fixture(),
+            (QO_END - QO_DAY, QO_END),
+            merged=[("api#9", QO_END - 1000), ("api#1", QO_END - 3600)],
+        )
+        assert result.report_id == "queue-outcomes"
+        counts = {(r["bucket"], r["category"]): r["count"] for r in result.rows}
+        assert counts == {
+            # api#9 merged and never stalled. api#1 ALSO merged, but it
+            # stalled first — it is auto_resolved, not succeeded, and must
+            # not be counted twice.
+            ("succeeded", "merged"): 1,
+            ("auto_resolved_mechanism", "gate-cleared-after-giveup"): 1,
+            ("auto_resolved_rescue", "dead-leg"): 1,
+            ("human", "gate-a-signed"): 1,
+            ("human", "operator-intervened"): 1,
+            ("open", "solar-flare"): 1,
+        }
+        assert result.totals == {"count": 6, "share_pct": 100.0}
+
+    def test_a_category_the_report_has_never_seen_survives_as_itself(self) -> None:
+        result = fold_queue_outcomes(_qo_fixture(), (QO_END - QO_DAY, QO_END))
+        # Not "other", not dropped, not an error: the category vocabulary is
+        # the `true_cause` vocabulary, and that is read from the data.
+        assert _row(result, "open", "solar-flare")["count"] == 1
+
+    def test_the_by_design_split_is_carried_on_the_row_and_the_headline(self) -> None:
+        result = fold_queue_outcomes(
+            _qo_fixture(),
+            (QO_END - QO_DAY, QO_END),
+            merged=[("api#9", QO_END - 1000)],
+        )
+        assert _row(result, "human", "gate-a-signed")["by_design"] is True
+        assert _row(result, "human", "operator-intervened")["by_design"] is False
+        headline = next(n for n in result.notes if n.startswith("headline:"))
+        # 3 of 6 auto (succeeded + mechanism + rescue).
+        assert "50.0% got over the line without a human (3/6)" in headline
+        # Excluding the one that is SUPPOSED to stop for a person: 3/5.
+        assert "BY DESIGN" in headline
+        assert "60.0% (3/5)" in headline
+
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            # The queue's OWN markers — read through its own predicates, so a
+            # rename in either place breaks this test rather than silently
+            # reclassifying a by-design stop as a defect.
+            "Gate A not approved " + park_marker("api", 51),
+            f"blocked: coordinator-owned docs {POLICY_REFUSAL_MARKER}",
+        ],
+    )
+    def test_an_undiagnosed_by_design_stall_still_reads_as_by_design(
+        self, reason: str
+    ) -> None:
+        """The marker lives in the reason the queue itself stamped, so this
+        works before #2276 has been anywhere near the episode."""
+        result = fold_queue_outcomes(
+            [
+                _episode(
+                    "api#7",
+                    entered_at=QO_END - 5000,
+                    state="parked",
+                    stated_reason=reason,
+                )
+            ],
+            (QO_END - QO_DAY, QO_END),
+        )
+        assert _row(result, "open", "(unresolved)")["by_design"] is True
+
+    def test_rows_are_attributable_to_the_issues_behind_them(self) -> None:
+        result = fold_queue_outcomes(
+            [
+                _episode("api#1", entered_at=QO_END - 900),
+                _episode("shared#2", entered_at=QO_END - 800),
+            ],
+            (QO_END - QO_DAY, QO_END),
+        )
+        row = _row(result, "open", "(unresolved)")
+        assert row["count"] == 2
+        assert row["issues"] == ["api#1", "shared#2"]
+
+    def test_an_empty_window_keeps_its_columns_and_says_it_is_empty(self) -> None:
+        result = fold_queue_outcomes((), (QO_END - QO_DAY, QO_END))
+        assert result.rows == []
+        assert result.columns == [
+            "period_start", "bucket", "category", "by_design", "count",
+            "share_pct", "issues",
+        ]
+        assert [m.id for m in result.column_meta] == result.columns
+        assert result.totals is None
+        assert any("not a 100% score" in n for n in result.notes)
+
+    def test_a_stall_that_predates_the_window_and_is_still_open_is_counted(self) -> None:
+        """The most flattering bug available to this report is dropping the
+        oldest unresolved stalls off the back of the window."""
+        result = fold_queue_outcomes(
+            [_episode("api#1", entered_at=QO_END - 30 * QO_DAY)],
+            (QO_END - QO_DAY, QO_END),
+        )
+        assert _row(result, "open", "(unresolved)")["count"] == 1
+        assert result.rows[0]["period_start"] == QO_END - QO_DAY
+        assert any("stalled before this window opened" in n for n in result.notes)
+
+    def test_an_episode_outside_the_window_is_excluded(self) -> None:
+        result = fold_queue_outcomes(
+            [
+                _episode(
+                    "api#1",
+                    entered_at=QO_END - 40 * QO_DAY,
+                    resolved_at=QO_END - 30 * QO_DAY,
+                    true_cause="ci-reported — x",
+                    human_acted=False,
+                )
+            ],
+            (QO_END - QO_DAY, QO_END),
+        )
+        assert result.rows == []
+
+    def test_the_rescue_series_is_modelled_even_when_structurally_zero(self) -> None:
+        result = fold_queue_outcomes(
+            [
+                _episode(
+                    "api#1",
+                    entered_at=QO_END - 900,
+                    resolved_at=QO_END - 800,
+                    true_cause="ci-reported — x",
+                    human_acted=False,
+                )
+            ],
+            (QO_END - QO_DAY, QO_END),
+        )
+        assert any("auto_resolved_rescue` is 0" in n for n in result.notes)
+        assert any("#2268" in n for n in result.notes)
+
+    def test_undiagnosed_stalls_are_called_out_not_folded_into_a_cause(self) -> None:
+        result = fold_queue_outcomes(
+            [_episode("api#1", entered_at=QO_END - 900)],
+            (QO_END - QO_DAY, QO_END),
+        )
+        assert _row(result, "open", "(unresolved)")["count"] == 1
+        assert any("coord drive-queue diagnose" in n for n in result.notes)
+
+
+class TestQueueOutcomesWindows:
+    def test_the_three_presets_resolve_to_their_spans_and_periods(self) -> None:
+        assert resolve_queue_outcomes_window("24h", QO_END) == (
+            QO_END - QO_DAY, QO_END, QO_DAY,
+        )
+        assert resolve_queue_outcomes_window("7d", QO_END) == (
+            QO_END - 7 * QO_DAY, QO_END, QO_DAY,
+        )
+        assert resolve_queue_outcomes_window("4w", QO_END) == (
+            QO_END - 28 * QO_DAY, QO_END, 7 * QO_DAY,
+        )
+
+    def test_an_unknown_window_names_the_allowed_values(self) -> None:
+        with pytest.raises(ReportError) as exc:
+            resolve_queue_outcomes_window("13h", QO_END)
+        for allowed in ("24h", "7d", "4w"):
+            assert allowed in str(exc.value)
+
+    def test_7d_is_the_same_arithmetic_in_seven_daily_periods(self) -> None:
+        start, end, period = resolve_queue_outcomes_window("7d", QO_END)
+        episodes = [
+            _episode(
+                f"api#{i}",
+                entered_at=end - (i + 0.5) * QO_DAY,
+                resolved_at=end - (i + 0.4) * QO_DAY,
+                true_cause="ci-reported — x",
+                human_acted=False,
+            )
+            for i in range(7)
+        ]
+        result = fold_queue_outcomes(
+            episodes, (start, end), period_seconds=period
+        )
+        # One point per day — the trendline, without a wire-contract change:
+        # a client groups rows on `period_start`.
+        assert len({r["period_start"] for r in result.rows}) == 7
+        assert sorted(r["period_start"] for r in result.rows) == [
+            start + i * QO_DAY for i in range(7)
+        ]
+        assert all(r["count"] == 1 for r in result.rows)
+        # A per-period headline line for each period, plus the overall one.
+        assert sum(1 for n in result.notes if "got over the line" in n) == 8
+
+
+class TestQueueOutcomesRunner:
+    def test_a_host_with_no_block_log_refuses_to_report_a_perfect_score(self) -> None:
+        calls: list[dict] = []
+
+        def _fetch(**kwargs):
+            calls.append(kwargs)
+            return {"entries": [], "has_more": False}
+
+        result = run_queue_outcomes(
+            now=QO_END,
+            location={"path": "/nope/queue-block-log.jsonl", "host": "laptop", "exists": False},
+            episode_source=lambda: [],
+            fetch=_fetch,
+        )
+        assert result.rows == []
+        assert result.columns[0] == "period_start"  # columns intact
+        note = " ".join(result.notes)
+        assert "NO BLOCK LOG ON THIS HOST" in note
+        assert "/nope/queue-block-log.jsonl" in note
+        assert "laptop" in note
+        # And it does not go on to price the window off half a source.
+        assert calls == []
+
+    def test_the_source_host_and_path_are_always_named(self) -> None:
+        result = run_queue_outcomes(
+            now=QO_END,
+            location={"path": "/var/log/qbl.jsonl", "host": "dellserver", "exists": True},
+            episode_source=_qo_fixture,
+            fetch=lambda **kw: {"entries": [], "has_more": False},
+        )
+        assert result.notes[0] == "source: the block log on dellserver (/var/log/qbl.jsonl)."
+
+    def test_the_repo_param_filters_episodes_and_the_merge_read(self) -> None:
+        seen: list[dict] = []
+
+        def _fetch(**kwargs):
+            seen.append(kwargs)
+            return {"entries": [], "has_more": False}
+
+        result = run_queue_outcomes(
+            repo="api",
+            now=QO_END,
+            location={"path": "p", "host": "h", "exists": True},
+            episode_source=_qo_fixture,
+            fetch=_fetch,
+        )
+        assert all(
+            i.startswith("api#") for r in result.rows for i in r["issues"]
+        )
+        assert seen[0]["repo"] == "api"
+        # The merge read is pushed down to the audit filter rather than
+        # paging four weeks of every event to keep a handful.
+        assert seen[0]["category"] == "merge"
+        assert seen[0]["event_type"] == "merged"
+
+    def test_an_unreadable_audit_trail_is_a_loud_note_not_a_dead_report(self) -> None:
+        def _boom(**kwargs):
+            raise RuntimeError("no such table: audit_log")
+
+        result = run_queue_outcomes(
+            now=QO_END,
+            location={"path": "p", "host": "h", "exists": True},
+            episode_source=_qo_fixture,
+            fetch=_boom,
+        )
+        assert result.rows  # the block-log half still reported
+        assert any("`succeeded` bucket" in n and "MISSING" in n for n in result.notes)
+
+
+class TestQueueOutcomesCatalogue:
+    def test_the_catalogue_entry_shows_its_params(self) -> None:
+        rep = next(
+            r for r in catalogue()["reports"] if r["id"] == "queue-outcomes"
+        )
+        assert rep["title"] == "Queue Outcomes"
+        assert rep["description"]
+        params = {p["id"]: p for p in rep["params"]}
+        assert set(params) == {"window", "until", "repo"}
+        assert params["window"]["choices"] == ["24h", "7d", "4w"]
+        assert params["window"]["default"] == "24h"
+        # #2270: follow issue-activity's existing since/until convention
+        # rather than inventing a new one.
+        assert params["until"]["kind"] == "text"
+
+    def test_a_bad_window_is_a_clean_error_naming_the_allowed_values(self) -> None:
+        with pytest.raises(ReportError) as exc:
+            resolve_params(REPORTS["queue-outcomes"], {"window": "13h"})
+        for allowed in ("24h", "7d", "4w"):
+            assert allowed in str(exc.value)
+
+
+class TestQueueOutcomesCli:
+    """Black-box: drive `coord report run queue-outcomes` over a seeded log
+    and assert on the rendered output (#2270's acceptance)."""
+
+    @pytest.fixture()
+    def seeded_log(self, tmp_path: Path, monkeypatch) -> Path:
+        from coord.block_log import EVENT_ENTER as _ENTER  # noqa: N806
+        from coord.block_log import EVENT_RESOLVE as _RESOLVE  # noqa: N806
+
+        path = tmp_path / "queue-block-log.jsonl"
+        records = [
+            # auto: stalled, then a deterministic arm cleared it.
+            {"event": _ENTER, "ts": QO_END - 7200, "key": "api#1",
+             "state": "blocked", "stated_reason": "CI red, 2/2 attempts"},
+            {"event": _RESOLVE, "ts": QO_END - 3600, "key": "api#1",
+             "state": "waiting", "resolution": "auto_resumed", "source": "tick",
+             "true_cause": "gate-cleared-after-giveup — the gate read clear again",
+             "human_acted": False},
+            # human, by design: the Gate-A sign-off.
+            {"event": _ENTER, "ts": QO_END - 7000, "key": "api#2",
+             "state": "parked", "stated_reason": "Gate A not approved"},
+            {"event": _RESOLVE, "ts": QO_END - 3000, "key": "api#2",
+             "state": "waiting", "resolution": "auto_resumed", "source": "tick",
+             "true_cause": "gate-a-signed — a human recorded the sign-off",
+             "human_acted": True},
+            # open, with a cause this build has never seen.
+            {"event": _ENTER, "ts": QO_END - 5000, "key": "shared#3",
+             "state": "blocked", "stated_reason": "stale test verdict"},
+            {"event": "diagnosis", "ts": QO_END - 4000, "key": "shared#3",
+             "cause": "solar-flare", "confidence": "low", "evidence": [],
+             "true_cause": "solar-flare — a cause this build has never seen"},
+        ]
+        path.write_text(
+            "".join(json.dumps(r, sort_keys=True) + "\n" for r in records)
+        )
+        monkeypatch.setenv("COORD_BLOCK_LOG", str(path))
+        return path
+
+    def test_the_table_and_the_headline_render(self, coord_db, seeded_log) -> None:
+        # One merge with no stall at all — the `succeeded` bucket, which the
+        # block log cannot see and the audit trail can.
+        record_audit(
+            tier="business", category="merge", event_type="merged",
+            actor="coordinator", summary="m", repo="api", issue=9,
+            ts=QO_END - 1000,
+        )
+        result = CliRunner().invoke(
+            main, ["report", "run", "queue-outcomes", "--param", "window=24h"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "queue-outcomes" in result.output
+        for bucket in ("succeeded", "auto_resolved_mechanism", "human", "open"):
+            assert bucket in result.output
+        # The invented category survives to the rendered table.
+        assert "solar-flare" in result.output
+        # 2 of 4 without a human; 2 of 3 once the by-design Gate A is out.
+        assert "50.0% got over the line without a human (2/4)" in result.output
+        assert "66.7% (2/3)" in result.output
+        # Attributable, right there in the table.
+        assert "api#9" in result.output
+        assert str(seeded_log) in result.output
+
+    def test_json_carries_the_whole_issue_list_per_row(
+        self, coord_db, seeded_log
+    ) -> None:
+        result = CliRunner().invoke(
+            main,
+            ["report", "run", "queue-outcomes", "--param", "window=7d",
+             "--format", "json"],
+        )
+        assert result.exit_code == 0, result.output
+        body = json.loads(result.output)
+        assert body["report_id"] == "queue-outcomes"
+        assert body["window"] == [QO_END - 7 * QO_DAY, QO_END]
+        by_bucket = {r["bucket"]: r for r in body["rows"]}
+        assert by_bucket["human"]["issues"] == ["api#2"]
+        assert by_bucket["human"]["by_design"] is True
+        assert by_bucket["open"]["category"] == "solar-flare"
+
+    def test_a_window_with_no_data_is_an_empty_result_not_an_error(
+        self, coord_db, seeded_log
+    ) -> None:
+        # Every seeded episode predates this window's start by weeks — and
+        # `until` is the same param name `issue-activity` uses.
+        result = CliRunner().invoke(
+            main,
+            ["report", "run", "queue-outcomes", "--param", "window=24h",
+             "--param", f"until={QO_END - 60 * QO_DAY}"],
+        )
+        assert result.exit_code == 0, result.output
+        assert "(no activity in this window)" in result.output
+        assert "not a 100% score" in result.output
+
+    def test_a_host_without_the_log_says_so_rather_than_scoring_zero(
+        self, coord_db, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("COORD_BLOCK_LOG", str(tmp_path / "absent.jsonl"))
+        result = CliRunner().invoke(
+            main, ["report", "run", "queue-outcomes", "--param", "window=24h"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "NO BLOCK LOG ON THIS HOST" in result.output
+        assert "absent.jsonl" in result.output
+
+    def test_csv_export_carries_the_rows_and_the_notes(
+        self, coord_db, seeded_log
+    ) -> None:
+        result = CliRunner().invoke(
+            main,
+            ["report", "run", "queue-outcomes", "--param", "window=24h",
+             "--format", "csv"],
+        )
+        assert result.exit_code == 0, result.output
+        rows = _parse_csv(result.output)
+        assert rows[0] == [
+            "Period", "Bucket", "Category", "By Design", "Count", "Share %",
+            "Issues",
+        ]
+        assert any(r[1] == "open" and r[2] == "solar-flare" for r in rows[1:])
+        assert "# report: queue-outcomes" in result.output
+
+
+class TestQueueOutcomesDaemon:
+    """The thin-client path, which is the whole answer to the per-host log.
+
+    ``coord.state.run_report`` routes a board_service client's request to
+    ``GET /report/{id}`` on the daemon — which runs on the tick host, which is
+    where the block log actually is (#1806: a fleet check that measures the
+    wrong machine's filesystem is worse than no check).
+    """
+
+    def test_the_report_runs_over_the_daemon_hosts_log(
+        self, report_client: TestClient, tmp_path: Path, monkeypatch
+    ) -> None:
+        path = tmp_path / "queue-block-log.jsonl"
+        path.write_text(
+            json.dumps({"event": "enter", "ts": QO_END - 900, "key": "api#1",
+                        "state": "blocked", "stated_reason": "exhausted"})
+            + "\n"
+        )
+        monkeypatch.setenv("COORD_BLOCK_LOG", str(path))
+        resp = report_client.get(
+            "/report/queue-outcomes",
+            params={"window": "24h", "until": str(QO_END)},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["report_id"] == "queue-outcomes"
+        assert body["columns"][0] == "period_start"
+        assert [r["bucket"] for r in body["rows"]] == ["open"]
+        assert body["rows"][0]["issues"] == ["api#1"]
+        assert any(str(path) in n for n in body["notes"])
+
+    def test_a_daemon_host_with_no_log_says_so_over_the_wire(
+        self, report_client: TestClient, tmp_path: Path, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("COORD_BLOCK_LOG", str(tmp_path / "absent.jsonl"))
+        resp = report_client.get("/report/queue-outcomes")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["rows"] == []
+        assert body["columns"]  # intact
+        assert any("NO BLOCK LOG ON THIS HOST" in n for n in body["notes"])
+
+    def test_an_unknown_window_is_a_400_naming_what_was_allowed(
+        self, report_client: TestClient
+    ) -> None:
+        resp = report_client.get(
+            "/report/queue-outcomes", params={"window": "13h"}
+        )
+        assert resp.status_code == 400
+        assert "4w" in resp.json()["error"]
+
+
+class TestQueueOutcomesPartialWindow:
+    """A period with merges but no stall records is UNMEASURED, not perfect.
+
+    #2270's own blocking prerequisite: the recorder (#2235) landed in v0.5.90
+    and the fleet was on v0.5.88, so every early window has a complete merge
+    history and an empty stall log — which scores 100% for the most flattering
+    possible reason. Same failure as a missing log, one granularity down.
+    """
+
+    def test_a_window_that_predates_the_log_says_so(self) -> None:
+        result = fold_queue_outcomes(
+            [
+                _episode(
+                    "api#1",
+                    entered_at=QO_END - 900,
+                    resolved_at=QO_END - 800,
+                    true_cause="ci-reported — x",
+                    human_acted=False,
+                )
+            ],
+            (QO_END - 7 * QO_DAY, QO_END),
+            period_seconds=QO_DAY,
+            merged=[("api#2", QO_END - 6 * QO_DAY)],
+            log_starts_at=QO_END - 900,
+        )
+        note = next(n for n in result.notes if n.startswith("PARTIAL WINDOW"))
+        assert "unmeasured, not perfect" in note
+        assert "recorder was not running yet" in note
+
+    def test_a_window_the_log_fully_covers_carries_no_such_caveat(self) -> None:
+        result = fold_queue_outcomes(
+            [_episode("api#1", entered_at=QO_END - 900)],
+            (QO_END - QO_DAY, QO_END),
+            log_starts_at=QO_END - 30 * QO_DAY,
+        )
+        assert not any(n.startswith("PARTIAL WINDOW") for n in result.notes)
+
+    def test_the_runner_derives_it_from_the_log_not_the_filtered_repo(self) -> None:
+        # `shared#9` is the oldest record in the FILE. Filtering to `api` must
+        # not make the log look younger than it is and hide the caveat.
+        episodes = [
+            _episode("shared#9", entered_at=QO_END - 3 * QO_DAY),
+            _episode("api#1", entered_at=QO_END - 900),
+        ]
+        result = run_queue_outcomes(
+            window="7d",
+            repo="api",
+            now=QO_END,
+            location={"path": "p", "host": "h", "exists": True},
+            episode_source=lambda: episodes,
+            fetch=lambda **kw: {"entries": [], "has_more": False},
+        )
+        note = next(n for n in result.notes if n.startswith("PARTIAL WINDOW"))
+        assert _abs_iso(QO_END - 3 * QO_DAY) in note
+
+
+# ── #2271: the chart declaration ───────────────────────────────────────────
+
+
+class TestChartDeclaration:
+    """The additive chart block on `ReportResult` (#2271).
+
+    The whole contract is "additive, and a client that does not understand it
+    renders the table" — so these tests are mostly about what did NOT change.
+    """
+
+    def test_chart_defaults_to_none_and_serialises_as_none(self) -> None:
+        result = ReportResult(
+            report_id="r",
+            generated_at=1.0,
+            window=(0.0, 1.0),
+            columns=["a"],
+            rows=[{"a": 1}],
+            notes=[],
+        )
+        assert result.chart is None
+        assert result.to_dict()["chart"] is None
+
+    def test_the_chart_key_is_additive_and_nothing_else_moved(self) -> None:
+        """The already-shipped #1741/#1763 panel deserialises the other eight
+        keys; adding `chart` must not disturb one of them."""
+        from coord.reports import ChartSeries, ChartSpec
+
+        plain = fold_issue_activity([], WINDOW).to_dict()
+        charted = fold_issue_activity([], WINDOW)
+        charted.chart = ChartSpec(
+            kind="line", series=(ChartSeries(label="L", column="issue"),), x="issue"
+        )
+        charted_payload = charted.to_dict()
+        assert set(charted_payload) == set(plain)
+        for key in plain:
+            if key != "chart":
+                assert charted_payload[key] == plain[key], key
+
+    def test_series_and_spec_wire_shape_is_pinned(self) -> None:
+        from coord.reports import ChartSeries, ChartSpec
+
+        spec = ChartSpec(
+            kind="bar",
+            series=(ChartSeries(label="Entries", column="count", color="#50a0f0"),),
+            x="category",
+            group_by="bucket",
+            stacked=True,
+            title="T",
+            y_label="Y",
+        )
+        assert spec.to_dict() == {
+            "kind": "bar",
+            "series": [
+                {"label": "Entries", "column": "count", "color": "#50a0f0"}
+            ],
+            "x": "category",
+            "group_by": "bucket",
+            "stacked": True,
+            "title": "T",
+            "y_label": "Y",
+        }
+
+    def test_series_defaults_leave_colour_unset(self) -> None:
+        from coord.reports import ChartSeries, ChartSpec
+
+        spec = ChartSpec(kind="line", series=(ChartSeries(label="L", column="c"),))
+        assert spec.to_dict() == {
+            "kind": "line",
+            "series": [{"label": "L", "column": "c", "color": None}],
+            "x": None,
+            "group_by": None,
+            "stacked": False,
+            "title": "",
+            "y_label": "",
+        }
+
+    def test_every_declared_series_column_exists_in_columns(self) -> None:
+        """The one invariant that makes "derive from existing columns" true:
+        a series naming a column the table does not carry would be a parallel
+        data block with extra steps."""
+        result = fold_queue_outcomes(
+            _qo_fixture(), (QO_END - QO_DAY, QO_END), merged=[]
+        )
+        assert result.chart is not None
+        for series in result.chart.series:
+            assert series.column in result.columns
+        assert result.chart.x in result.columns
+        assert result.chart.group_by in result.columns
+
+    def test_csv_export_of_a_chart_bearing_report_is_unchanged(self) -> None:
+        """#1765's serializer is driven by columns/rows/totals and must not
+        grow a chart column, a chart comment, or anything else."""
+        from coord.reports import ChartSeries, ChartSpec
+
+        charted = fold_queue_outcomes(
+            _qo_fixture(), (QO_END - QO_DAY, QO_END), merged=[]
+        )
+        assert charted.chart is not None
+        plain = fold_queue_outcomes(
+            _qo_fixture(), (QO_END - QO_DAY, QO_END), merged=[]
+        )
+        plain.chart = None
+        assert result_to_csv(charted) == result_to_csv(plain)
+
+        # And a chart on a report that has none also changes nothing.
+        activity = fold_issue_activity([], WINDOW)
+        before = result_to_csv(activity)
+        activity.chart = ChartSpec(
+            kind="line", series=(ChartSeries(label="L", column="issue"),)
+        )
+        assert result_to_csv(activity) == before
+
+
+class TestQueueOutcomesChart:
+    def test_24h_declares_a_stacked_bar_over_buckets(self) -> None:
+        result = fold_queue_outcomes(
+            _qo_fixture(), (QO_END - QO_DAY, QO_END), merged=[]
+        )
+        chart = result.chart
+        assert chart is not None
+        assert chart.kind == "bar"
+        assert chart.stacked is True
+        # Same column twice, on purpose: a terminal chart has no per-tick
+        # category text, so grouping on the axis column is what puts the
+        # bucket names in the legend instead of five anonymous bars.
+        assert chart.x == "bucket"
+        assert chart.group_by == "bucket"
+        assert [s.column for s in chart.series] == ["count"]
+
+    def test_7d_declares_a_trendline_per_bucket(self) -> None:
+        result = fold_queue_outcomes(
+            _qo_fixture(),
+            (QO_END - 7 * QO_DAY, QO_END),
+            period_seconds=QO_DAY,
+            merged=[],
+        )
+        chart = result.chart
+        assert chart is not None
+        assert chart.kind == "line"
+        assert chart.stacked is False
+        assert chart.x == "period_start"
+        assert chart.group_by == "bucket"
+
+    def test_4w_declares_a_trendline_too(self) -> None:
+        result = run_queue_outcomes(
+            window="4w",
+            now=QO_END,
+            location={"path": "p", "host": "h", "exists": True},
+            episode_source=_qo_fixture,
+            fetch=lambda **kw: {"entries": [], "has_more": False},
+        )
+        assert result.chart is not None
+        assert result.chart.kind == "line"
+
+    def test_an_empty_fold_declares_no_chart(self) -> None:
+        """An EMPTY result is not a zero score — an axis with no marks on it
+        reads as one, so there must be no chart to draw."""
+        result = fold_queue_outcomes([], (QO_END - QO_DAY, QO_END), merged=[])
+        assert result.rows == []
+        assert result.chart is None
+        assert result.to_dict()["chart"] is None
+
+    def test_the_chart_reaches_the_cli_json(self) -> None:
+        result = fold_queue_outcomes(
+            _qo_fixture(), (QO_END - QO_DAY, QO_END), merged=[]
+        )
+        payload = json.loads(json.dumps(result.to_dict()))
+        assert payload["chart"]["kind"] == "bar"
+        assert payload["chart"]["series"][0]["column"] == "count"
+
+    def test_the_chart_never_carries_its_own_numbers(self) -> None:
+        """One source of truth: the block names columns, never values."""
+        result = fold_queue_outcomes(
+            _qo_fixture(), (QO_END - QO_DAY, QO_END), merged=[]
+        )
+        blob = json.dumps(result.to_dict()["chart"])
+        assert "data" not in blob
+        assert "values" not in blob

@@ -52,6 +52,16 @@ from coord.dispatch import (
     post_refused_policy,
 )
 from coord.progress import parse_progress
+
+# #2272: the mute-Test-stage retry budget. Canonically in `coord.smoke`
+# because `dispatch_smoke` is the writer that has to carry the tally across
+# its own `running` stamp — a second definition here is exactly how the
+# counter and the thing that clobbers it drift apart again. Safe as a
+# module-level import: `coord.smoke` reaches config/dispatch/models/revalidate
+# and none of them import this module.
+from coord.smoke import MUTE_SMOKE_LEG_BUDGET, TEST_STATE_BLOCKED
+from coord.smoke import NO_SMOKE_VERDICT_MARKER as _NO_SMOKE_VERDICT_MARKER
+from coord.smoke import mute_smoke_legs, mute_smoke_tally
 from coord.state import (
     load_dispatched,
     load_done_reviews_needing_post,
@@ -1043,7 +1053,13 @@ def dispatch_stalled_pipeline_action(
 
     Gated by ``config.pipeline.auto_dispatch_stalled`` (default ``False`` —
     detection/narration via :func:`post_stalled_pipeline` is unconditional;
-    this is the opt-in action half). Mutates *board* in place exactly like
+    this is the opt-in action half) — EXCEPT for a ``review_request_changes_
+    no_fix`` stall on a :data:`coord.models.SEALED_PATH_AUTHOR_TYPES` row
+    (``test-author``/``mock-author``), which dispatches regardless of the
+    flag: no loop owns that row (#2302), so the flag would only leave it
+    stalled forever with no alternative dispatcher to race. ``work`` rows
+    under the same reason keep the opt-in gate — ``coord drive`` owns those.
+    Mutates *board* in place exactly like
     the auto-loop / review-dispatch helpers it delegates to — the caller is
     responsible for persisting it.
 
@@ -1086,7 +1102,23 @@ def dispatch_stalled_pipeline_action(
     mirroring the one-shot comment (#1441's own guardrail, reused rather
     than re-derived per #1478's own request).
     """
-    if not config.pipeline.auto_dispatch_stalled:
+    # #2302: `pipeline.auto_dispatch_stalled` exists to bound blast radius on
+    # rows another loop already owns (`coord drive`'s request-changes → fix
+    # arm for `work` rows, #1692) — a second dispatcher racing that loop
+    # would duplicate or clobber its fix. A `request-changes` stall on a
+    # SEALED_PATH_AUTHOR_TYPES row (`test-author`/`mock-author`, Gate A/JIT
+    # acceptance slices) has no such owner: `coord drive` explicitly `_die()`s
+    # on those, and `coord acceptance mock` dispatches Gate A standalone with
+    # no drive run over it at all (see #2289). So this one reason+type
+    # combination bypasses the flag — every other reason, and `work` rows
+    # under this same reason, keep the opt-in gate unchanged.
+    from coord.models import SEALED_PATH_AUTHOR_TYPES  # noqa: PLC0415
+
+    sealed_author_stall = (
+        detection.reason == "review_request_changes_no_fix"
+        and work.type in SEALED_PATH_AUTHOR_TYPES
+    )
+    if not config.pipeline.auto_dispatch_stalled and not sealed_author_stall:
         return StalledDispatchAction(
             kind="disabled", detail="pipeline.auto_dispatch_stalled is False",
         )
@@ -1776,7 +1808,12 @@ def _smoke_worker_verdict(
 #: ``test_reason`` when a headless smoke produced no parseable verdict. Read
 #: back on the NEXT such reap to decide between "park for one automatic
 #: re-dispatch" and "block, an operator has to look" — see below.
-NO_SMOKE_VERDICT_MARKER = "no-verdict (#2244)"
+#:
+#: #2272: canonically defined in :mod:`coord.smoke` (imported at the top of
+#: this module), next to `dispatch_smoke` — the function that has to carry the
+#: tally across its own ``running`` stamp for this counter to survive at all.
+#: Re-bound here because this is the name the reap path has always used.
+NO_SMOKE_VERDICT_MARKER = _NO_SMOKE_VERDICT_MARKER
 
 
 def _record_smoke_verdict(
@@ -1885,50 +1922,70 @@ def _record_smoke_verdict(
         return
 
     # No verdict line, clean session exit. NOT a pass.
+    #
+    # #2272: count the legs, don't just test for the marker's presence. The
+    # tally lives at the FRONT of `test_reason` so a bounded `/board` preview
+    # still carries it, and `dispatch_smoke` re-states it across the `running`
+    # stamp that used to erase it. Together those two make this a real budget
+    # rather than the never-firing one #2244 intended.
     previous_reason = load_assignment_test_reason(parent_id) or ""
-    already_mute_once = NO_SMOKE_VERDICT_MARKER in previous_reason
+    legs = mute_smoke_legs(previous_reason) + 1
     reason = (
-        f"{NO_SMOKE_VERDICT_MARKER}: the Test-stage worker "
+        f"{mute_smoke_tally(legs)}: the Test-stage worker "
         f"{transition.assignment_id} ended without printing a verdict marker "
         "line, and a `claude -p` exit code says only that the session ended — "
         "it is not a suite result."
     )
-    if already_mute_once:
+    if legs >= MUTE_SMOKE_LEG_BUDGET:
         # The same park value `dispatch_smoke` uses for an unroutable stage
         # (#1672): every gate that wants "passed"/"skipped" keeps the merge
         # shut, `dispatch_pending_smoke` stops re-dispatching, and no fix
         # round is burned on a branch nothing has found fault with.
-        from coord.smoke import TEST_STATE_BLOCKED  # noqa: PLC0415
-
+        #
+        # #2272: the terminal reason NAMES the cause and the count. "N smoke
+        # legs produced no verdict" is a statement an operator can act on; the
+        # five-lap incident presented as "the branch is slow" precisely
+        # because nothing on the row ever said how many legs had gone mute.
         record_test_verdict(
             assignment_id=parent_id,
             test_state=TEST_STATE_BLOCKED,
             test_reason=(
-                f"{reason} Second consecutive mute Test stage — parked instead "
-                "of re-dispatched. Recover with `coord diagnose <repo> <issue> "
-                "--stage test --reset`, or record the verdict by hand with "
-                f"`coord test --passed|--fail {parent_id}`."
+                f"{reason} {legs} smoke legs produced no verdict — the "
+                f"Test-stage retry budget ({MUTE_SMOKE_LEG_BUDGET}) is "
+                "exhausted, so the row is parked instead of re-dispatched "
+                "(#2272). A mute leg is not a failing branch: check whether "
+                "the smoke command is exceeding the worker's 600s Bash "
+                "ceiling before you blame the diff. Recover with `coord "
+                "diagnose <repo> <issue> --stage test --reset`, or record the "
+                f"verdict by hand with `coord test --passed|--fail "
+                f"{parent_id}`."
             ),
         )
         log.warning(
-            "smoke %s: no SMOKE: verdict in the transcript for the SECOND "
-            "time on parent %s — parking test_state='blocked' (#2244).",
-            transition.assignment_id, parent_id,
+            "smoke %s: no SMOKE: verdict in the transcript — that is %d mute "
+            "Test-stage leg(s) on parent %s and the retry budget (%d) is "
+            "exhausted, so parking test_state=%r instead of re-dispatching "
+            "(#2272). Check the worker's 600s Bash ceiling first.",
+            transition.assignment_id, legs, parent_id, MUTE_SMOKE_LEG_BUDGET,
+            TEST_STATE_BLOCKED,
         )
         return
 
+    remaining = MUTE_SMOKE_LEG_BUDGET - legs
     record_test_verdict(
         assignment_id=parent_id,
         test_state=None,
         test_reason=(
-            f"{reason} Cleared for one automatic Test-stage re-dispatch; a "
-            "second mute run parks the row instead."
+            f"{reason} Cleared for a Test-stage re-dispatch; {remaining} of "
+            f"{MUTE_SMOKE_LEG_BUDGET} legs left in the budget before the row "
+            "parks instead (#2272)."
         ),
     )
     log.warning(
         "smoke %s: no SMOKE: verdict in the transcript — recording NO verdict "
-        "for parent %s (cleared for re-dispatch), never 'passed' (#2244).",
-        transition.assignment_id, parent_id,
+        "for parent %s (mute leg %d of %d, cleared for re-dispatch), never "
+        "'passed' (#2244).",
+        transition.assignment_id, parent_id, legs, MUTE_SMOKE_LEG_BUDGET,
     )
 
 
@@ -2581,11 +2638,20 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
         # says "spend ceiling" instead of leaving an operator to guess why a
         # leg died mid-task. Mutually exclusive with the other three (see
         # `coord.reconcile.reconcile_completed_assignments`).
+        # #2316: `truncation_reason` is the same column again — the worker's
+        # output-token ceiling cut it off before it committed anything. It
+        # must reach `error=` below too, so the GitHub failure comment reads
+        # "the model was cut off at its output limit before writing
+        # anything" instead of the misleading "exited cleanly but pushed 0
+        # commits" the #448 ADVISORY default would otherwise have produced.
+        # Mutually exclusive with the other four (see
+        # `coord.reconcile.reconcile_completed_assignments`).
         _failure_reason = (
             entry.get("usage_limit_reason")
             or entry.get("api_error_reason")
             or entry.get("push_failure_reason")
             or entry.get("spend_ceiling_reason")
+            or entry.get("truncation_reason")
         )
         post_failure(
             exit_code=transition.exit_code,
@@ -2681,11 +2747,20 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
         # says "spend ceiling" instead of leaving an operator to guess why a
         # leg died mid-task. Mutually exclusive with the other three (see
         # `coord.reconcile.reconcile_completed_assignments`).
+        # #2316: `truncation_reason` is the same column again — the worker's
+        # output-token ceiling cut it off before it committed anything. It
+        # must reach `error=` below too, so the GitHub failure comment reads
+        # "the model was cut off at its output limit before writing
+        # anything" instead of the misleading "exited cleanly but pushed 0
+        # commits" the #448 ADVISORY default would otherwise have produced.
+        # Mutually exclusive with the other four (see
+        # `coord.reconcile.reconcile_completed_assignments`).
         _failure_reason = (
             entry.get("usage_limit_reason")
             or entry.get("api_error_reason")
             or entry.get("push_failure_reason")
             or entry.get("spend_ceiling_reason")
+            or entry.get("truncation_reason")
         )
         post_failure(
             exit_code=transition.exit_code,

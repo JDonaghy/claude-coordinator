@@ -385,6 +385,201 @@ pub fn make_app_with_assignments(assignments: Vec<Assignment>) -> CoordApp {
     app
 }
 
+/// #2281 data-model seam: build a [`CoordApp`] whose entire board — open
+/// issues, assignments, machines, pipeline_repos, pipeline_default_gates,
+/// plan_roster, etc. — is seeded from a raw JSON object shaped exactly like
+/// the daemon's `GET /board` response body (the same wire contract
+/// [`super::types::BoardPayload`] deserializes on the real
+/// `load_data_remote` path), rather than the empty `BoardData::default()`
+/// every other fixture in this module starts from.
+///
+/// `BoardData`'s fields (and `OpenIssue`) are `pub(crate)` — see the note on
+/// `BoardData` itself: "external callers only ever need
+/// `BoardData::default()`". That left an external `--test acceptance` crate
+/// able to build exactly one board: an empty one — no tree rows in the
+/// Board sidebar, nothing feeding the Pipeline tracked-issue list. This is
+/// the seam that removes that ceiling (#2281), and the prerequisite for
+/// every ms-65 slice (clicking Board/Pipeline sidebar rows).
+///
+/// Deliberately takes JSON rather than a `BoardData`/`OpenIssue`/`Machine` —
+/// same reasoning [`make_app_with_drive_queue`]'s doc comment already
+/// records: those types are `pub(crate)`, so a `pub fn` accepting one
+/// wouldn't compile (E0446), and going through the wire shape means a
+/// fixture that drifts from the daemon's real payload fails to parse here
+/// instead of rendering a plausible lie.
+///
+/// Skips the machine reachability/health TCP probes the real load path runs
+/// in `assemble_board_data` (`tcp_probe` / `spawn_machine_health` dialing
+/// `machines[*].host:7433`) — a fixture must stay pure/offline like every
+/// other helper in this module, so seeded machines always come back
+/// `reachable: false`, `version: None`, `worktree_bytes: 0`. `active_count`
+/// is still derived from the seeded `assignments` (a pure local
+/// computation, same as the real path).
+///
+/// Also rebuilds both sidebars and the Pipeline tracked-issue list
+/// (`pipeline_issues_from_cache`) before returning, mirroring the exact
+/// sequence the real data-apply tick runs (`rebuild_board_sidebar` →
+/// `pipeline_issues_from_cache` → `rebuild_pipeline_sidebar`) — so a caller
+/// gets a board that already renders, not one that needs to know which
+/// private rebuild methods to invoke itself.
+///
+/// Malformed JSON is a silent no-op — `make_test_app(BoardData::default())`,
+/// the empty-board render — matching every other JSON seam in this module
+/// (`make_app_with_audit_json`, `make_app_with_drive_queue`,
+/// `make_app_with_reports`). Callers assert on the resulting screen, not on
+/// this function's return.
+pub fn make_app_with_board_json(board_json: &str) -> CoordApp {
+    let data = match serde_json::from_str::<BoardPayload>(board_json) {
+        Ok(payload) => board_data_from_payload(payload),
+        Err(_) => BoardData::default(),
+    };
+    let mut app = make_test_app(data);
+    app.rebuild_board_sidebar();
+    app.pipeline_issues = app.pipeline_issues_from_cache();
+    app.rebuild_pipeline_sidebar(None);
+    app
+}
+
+/// Shared conversion behind [`make_app_with_board_json`]: turn a decoded
+/// [`BoardPayload`] into [`BoardData`] without the real load path's network
+/// probes (see that function's doc comment for why). Mirrors
+/// `load_data_remote` (`app/data.rs`) field-for-field, minus
+/// `assemble_board_data`'s probing tail — and minus the merge-queue
+/// milestone-title join `assemble_board_data` also runs (`app/data.rs:1796-1820`),
+/// which no acceptance criterion for this seam needs and which a caller can
+/// still exercise directly on `app.data.open_issues` / `app.data.merge_queue`
+/// if a future test needs it. Concretely: a test that seeds `merge_queue`
+/// entries carrying an `issue_number` and then asserts on a rendered
+/// milestone title will silently see an empty string through this seam,
+/// unlike the real load path — seed `open_issues`/`plan_roster` directly
+/// with the milestone title already attached instead.
+fn board_data_from_payload(payload: BoardPayload) -> BoardData {
+    let mut assignments = payload.assignments;
+    // Same ordering `load_data_remote` applies: running, then failed, then
+    // done (most recent first within each group) — so a fixture-built board
+    // sorts identically to a real one instead of surprising a test that
+    // asserts on row order.
+    assignments.sort_by(|a, b| {
+        let rank = |s: &str| match s {
+            "running" => 0u8,
+            "failed" => 1,
+            "done" => 2,
+            _ => 3,
+        };
+        rank(&a.status).cmp(&rank(&b.status)).then_with(|| {
+            b.dispatched_at
+                .partial_cmp(&a.dispatched_at)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    });
+
+    let machines: Vec<Machine> = payload
+        .machines
+        .into_iter()
+        .map(|m| {
+            let active_count = assignments
+                .iter()
+                .filter(|a| a.machine == m.name && a.status == "running")
+                .count();
+            Machine {
+                name: m.name,
+                host: m.host,
+                reachable: false,
+                active_count,
+                repos: m.repos,
+                version: None,
+                worktree_bytes: 0,
+            }
+        })
+        .collect();
+
+    let plans: std::collections::HashMap<String, PlanData> = payload
+        .plans
+        .iter()
+        .map(|(aid, v)| (aid.clone(), parse_plan_data(v)))
+        .collect();
+
+    let (
+        pipeline_default_gates,
+        pipeline_tracked_labels,
+        pipeline_repos,
+        pipeline_require_plan,
+        pipeline_repo_run_cmds,
+        pipeline_repo_paths,
+        pipeline_models,
+        pipeline_acceptance_routes,
+    ) = parse_pipeline_meta_from_map(&payload.board_meta);
+
+    let merge_staging = if payload.merge_staging.is_empty() {
+        compute_staging_local(&assignments, &payload.merge_queue, &pipeline_default_gates)
+    } else {
+        payload.merge_staging
+    };
+
+    BoardData {
+        // No wire equivalent worth deriving here: the real path matches the
+        // OS hostname against `machines[*].host`, which is meaningless for a
+        // fixture that never "runs" on any of the seeded machines. Leave it
+        // empty, same as `BoardData::default()`.
+        local_machine: String::new(),
+        assignments,
+        open_issues: payload.issues,
+        machines,
+        merge_queue: payload.merge_queue,
+        merge_plan: payload.merge_plan,
+        proposals: payload.proposals,
+        pipeline_default_gates,
+        pipeline_tracked_labels,
+        pipeline_repos,
+        pipeline_require_plan,
+        pipeline_repo_run_cmds,
+        pipeline_repo_paths,
+        pipeline_acceptance_routes,
+        plans,
+        merge_staging,
+        pipeline_models,
+        issue_stage_projection: payload.issue_stage_projection,
+        milestone_work_orders: payload.milestone_work_orders,
+        epic_children: payload.epic_children,
+        plan_roster: payload.plan_roster,
+        plan_roster_supported: payload.plan_roster_supported,
+        goal_header: payload.goal_header,
+        audit_recent_count: payload.audit_recent_count,
+        escalations: payload.escalations,
+        fleet_health: payload.fleet_health,
+        drive_queue: payload.drive_queue,
+    }
+}
+
+/// #2281 (ms-38 follow-on) data-model seam: build a [`CoordApp`] with the
+/// Plans panel's `plan_roster` pre-seeded from a raw JSON array shaped
+/// exactly like `/board`'s own `plan_roster` field (`Vec<PlanRosterEntry>`)
+/// — no live daemon, no `make_app_with_board_json`'s full board-payload
+/// shape required when a test only cares about plan-roster rows.
+///
+/// Falls out of the same [`BoardPayload`]/`PlanRosterEntry` deserialization
+/// [`make_app_with_board_json`] uses, mirroring the existing
+/// [`make_app_with_audit_json`] shape exactly (`BoardData` + one JSON
+/// blob) — this is the seam ms-38's `plans_detail_1122` /
+/// `plans_rightclick_1123` slices were blocked on (`tests/acceptance/ms-38/
+/// manifest.yml`'s HARNESS BLOCKER comment names this exact function).
+///
+/// Sets `plan_roster_supported = true` on success — matching what a real
+/// daemon that emits `plan_roster` at all always sends — so the Plans panel
+/// renders the seeded rows rather than its "not connected to a daemon that
+/// computes this" placeholder. Malformed JSON is a silent no-op (both
+/// fields stay whatever `data` implied) rather than a panic — callers
+/// should assert on the resulting screen, not on this function's return.
+pub fn make_app_with_plan_roster_json(data: BoardData, plan_roster_json: &str) -> CoordApp {
+    let mut app = make_test_app(data);
+    if let Ok(roster) = serde_json::from_str::<Vec<super::types::PlanRosterEntry>>(plan_roster_json)
+    {
+        app.data.plan_roster = roster;
+        app.data.plan_roster_supported = true;
+    }
+    app
+}
+
 /// #1039 data-model seam: build a [`CoordApp`] with the Audit panel's cache
 /// (`audit_page`) pre-seeded from a raw JSON string shaped exactly like the
 /// `GET /audit` response body (contract §6, `tests/acceptance/ms-33/
@@ -728,5 +923,192 @@ pub fn make_assignment_typed(
         audit_run_number: None,
         for_issue_number: None,
         driven_by: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #2281 seam smoke test.
+    ///
+    /// Proves the gap the issue describes is actually closed: before this seam,
+    /// `BoardData`'s fields (and `OpenIssue`) were `pub(crate)`, so this crate
+    /// could build only an empty board (`BoardData::default()`) — no tree rows
+    /// in the Board sidebar, nothing feeding the Pipeline tracked-issue list.
+    /// `make_app_with_board_json` seeds three open issues across two repos from
+    /// a raw JSON object shaped like the daemon's `/board` payload, and both
+    /// panels must render real rows from it.
+    ///
+    /// Relocated from `tui/tests/acceptance.rs` (#2281 review): that file is
+    /// this repo's `tui-tuidriver` acceptance-driver `entrypoint:` in
+    /// `coordinator.yml`, which makes the *whole file* an exact-match sealed
+    /// oracle path (`coord/config.py` `AcceptanceConfig.sealed_paths()`) — any
+    /// `type="work"` diff touching it, even additively, is a mandatory
+    /// request-changes. CLAUDE.md's TuiDriver section already asks for this
+    /// placement: "Put the tests in-crate (`#[cfg(test)]`), not in
+    /// `tui/tests/`".
+    #[test]
+    fn make_app_with_board_json_renders_seeded_issues_in_board_and_pipeline() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        const BOARD_JSON: &str = r#"{
+          "issues": [
+            {"repo_name": "repo-a", "number": 2266, "title": "Alpha issue", "state": "open", "labels": ["coord"]},
+            {"repo_name": "repo-a", "number": 2267, "title": "Beta issue", "state": "open", "labels": ["coord"]},
+            {"repo_name": "repo-b", "number": 2268, "title": "Gamma issue", "state": "open", "labels": ["coord"]}
+          ],
+          "board_meta": {
+            "pipeline_repos": "{\"repo-a\": \"acme/repo-a\", \"repo-b\": \"acme/repo-b\"}",
+            "pipeline_default_gates": "[\"review\", \"merge\"]"
+          }
+        }"#;
+
+        let app = make_app_with_board_json(BOARD_JSON);
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+
+        // SidebarView::Board is the app's default active view, so the seeded
+        // repo groups are already on screen — but each repo's "No milestone"
+        // sub-group starts collapsed (no in-flight assignment to force it open,
+        // #857's default), so the issue rows themselves need one click each to
+        // reveal. Target by the group's issue count ("(2)" / "(1)") since both
+        // repos otherwise render an identical "No milestone" header.
+        let screen_before = driver.screen();
+        let (x, y) = driver.find("No milestone (2)").unwrap_or_else(|| {
+            panic!("repo-a's collapsed \"No milestone\" group header must be on screen:\n{screen_before}")
+        });
+        driver.click(x, y);
+        driver.render();
+        assert!(
+            driver.screen_contains("#2266"),
+            "Board sidebar must render a row for seeded issue #2266 — screen:\n{}",
+            driver.screen(),
+        );
+        assert!(
+            driver.screen_contains("#2267"),
+            "Board sidebar must render a row for seeded issue #2267 — screen:\n{}",
+            driver.screen(),
+        );
+
+        let screen_before = driver.screen();
+        let (x, y) = driver.find("No milestone (1)").unwrap_or_else(|| {
+            panic!("repo-b's collapsed \"No milestone\" group header must be on screen:\n{screen_before}")
+        });
+        driver.click(x, y);
+        driver.render();
+        assert!(
+            driver.screen_contains("#2268"),
+            "Board sidebar must render a row for seeded issue #2268 — screen:\n{}",
+            driver.screen(),
+        );
+
+        // Switch to the Pipeline panel (activity-bar icon "▶") and confirm the
+        // same seed feeds its tracked-issue list too.
+        let screen_before = driver.screen();
+        let (x, y) = driver
+            .find("▶")
+            .unwrap_or_else(|| panic!("activity bar must render the Pipeline icon:\n{screen_before}"));
+        driver.click(x, y);
+        driver.render();
+        assert!(
+            driver.screen_contains(" PIPELINE "),
+            "clicking the Pipeline icon must activate SidebarView::Pipeline — screen:\n{}",
+            driver.screen(),
+        );
+        // All three seeded issues carry the default-tracked "coord" label and no
+        // assignment yet, so they land in a single "New (3)" lifecycle section —
+        // proof `pipeline_issues_from_cache` picked up all three from the seed.
+        assert!(
+            driver.screen_contains("New (3)"),
+            "Pipeline tracked-issue list must show all 3 seeded issues under New — screen:\n{}",
+            driver.screen(),
+        );
+        // Drill in one more level (same collapsed-by-default "No milestone"
+        // sub-group as the Board sidebar) to confirm an actual issue row, not
+        // just the count, renders from the seed.
+        let screen_before = driver.screen();
+        let (x, y) = driver.find("No milestone (2)").unwrap_or_else(|| {
+            panic!("repo-a's collapsed \"No milestone\" group header must be on screen:\n{screen_before}")
+        });
+        driver.click(x, y);
+        driver.render();
+        assert!(
+            driver.screen_contains("#2266"),
+            "Pipeline tracked-issue list must render seeded issue #2266 — screen:\n{}",
+            driver.screen(),
+        );
+    }
+
+    /// #2281: malformed JSON must not panic — it degrades to the same
+    /// empty-board render every other JSON seam in `app::fixtures` falls back
+    /// to (`make_app_with_audit_json`, `make_app_with_drive_queue`, ...).
+    #[test]
+    fn make_app_with_board_json_malformed_json_is_a_silent_no_op() {
+        let app = make_app_with_board_json("not valid json");
+        let _ = app;
+    }
+
+    /// #2281 review follow-up: `make_app_with_plan_roster_json` shipped as
+    /// new public `test-support` surface with zero coverage — it flips
+    /// `plan_roster_supported` on success, which is easy to get backwards, so
+    /// this pins both the flag and an actual rendered row from the seed.
+    /// Mirrors `make_app_with_board_json_renders_seeded_issues_in_board_and_pipeline`
+    /// above and `plans_panel_lists_plans_from_board_data` (`app/tests.rs`)
+    /// for the Plans-panel click path.
+    #[test]
+    fn make_app_with_plan_roster_json_renders_seeded_roster_entry() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        const ROSTER_JSON: &str = r#"[
+          {
+            "repo": "repo-a",
+            "title": "Substrate",
+            "milestone_number": 7,
+            "has_work_order": true,
+            "ready_frontier": 1,
+            "blocked": 0,
+            "in_flight": 0,
+            "done": 1,
+            "total": 2
+          }
+        ]"#;
+
+        let app = make_app_with_plan_roster_json(BoardData::default(), ROSTER_JSON);
+        assert!(
+            app.data.plan_roster_supported,
+            "successful parse must flip plan_roster_supported so the Plans panel \
+             renders the seeded rows instead of its \"not connected\" placeholder"
+        );
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        let screen_before = driver.screen();
+        let (x, y) = driver
+            .find("◆")
+            .unwrap_or_else(|| panic!("activity bar must render the Plans icon:\n{screen_before}"));
+        driver.click(x, y);
+        driver.render();
+        assert!(
+            driver.screen_contains("PLANS"),
+            "clicking the Plans icon must activate SidebarView::Plans — screen:\n{}",
+            driver.screen(),
+        );
+        assert!(
+            driver.screen_contains("Substrate"),
+            "Plans panel must render the seeded roster entry's milestone title — screen:\n{}",
+            driver.screen(),
+        );
+    }
+
+    /// #2281: malformed JSON must not panic and must leave `plan_roster`
+    /// (and `plan_roster_supported`) exactly as `data` implied, same as
+    /// every other JSON seam in this module.
+    #[test]
+    fn make_app_with_plan_roster_json_malformed_json_is_a_silent_no_op() {
+        let app = make_app_with_plan_roster_json(BoardData::default(), "not valid json");
+        assert!(
+            !app.data.plan_roster_supported,
+            "malformed JSON must not flip plan_roster_supported"
+        );
+        assert!(app.data.plan_roster.is_empty());
     }
 }

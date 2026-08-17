@@ -36,6 +36,28 @@ from coord.cli import main
 from coord.commands import release as release_cmd
 
 
+@pytest.fixture(autouse=True)
+def _own_pause_store(tmp_path, monkeypatch):
+    """Give every test in this module its own pause store (#2174).
+
+    `test_drain_is_blocked_by_a_paused_daemon_host` calls
+    `mp.local_pause("server")`, and that store is per-`$HOME`, not
+    per-test. `conftest._no_real_pause_store` redirects only when the
+    resolved path lands under the REAL home, so under
+    `scripts/run_tests_in_populated_home.sh` (#2170) — where `$HOME` is one
+    throwaway directory shared by the whole run — the pause survives this
+    test and every later one reads a machine it never paused. See
+    `tests/test_cli_release_propagate.py::_own_pause_store` for the full
+    write-up; this is the same hazard in the sibling module that shares the
+    seam.
+    """
+    home = tmp_path / "home"
+    (home / ".coord").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    return home
+
+
 @pytest.fixture()
 def state_dir(tmp_path, monkeypatch):
     """Point the window journal at a tmp dir, never the real ~/.coord."""
@@ -597,6 +619,36 @@ def test_drain_treats_an_unreadable_board_as_fleet_wide_busy():
     assert "board unreadable" in outcome.detail
 
 
+def test_drain_is_blocked_by_a_paused_daemon_host(valid_config_path, monkeypatch):
+    """#2174: `_drain`'s default `extra_busy_fetch` — the one the real
+    `coord release nightly-window` call site uses (it passes `config=`) —
+    must also see `coord pause`/quiet-hours state, not just tmux. A paused
+    daemon host must never read as 'drained' just because the board and
+    tmux are both quiet; before the fix nothing here ever consulted the
+    pause store at all."""
+    from coord import machine_pause as mp
+    from coord.config import load as load_config
+
+    config = load_config(str(valid_config_path))
+    monkeypatch.setattr(release_cmd, "_interactive_session_busy", lambda config: [])
+    mp.local_pause("server")
+
+    outcome = release_cmd._drain(
+        daemon_host="server",
+        config_path=None,
+        config=config,
+        deadline=10.0,
+        poll_interval=5.0,
+        reconcile=lambda: None,
+        board_fetch=lambda: ({}, None),
+        now=(lambda ts=[0.0]: (ts.__setitem__(0, ts[0] + 5.0), ts[0])[1]),
+        sleep=lambda s: None,
+    )
+    assert outcome.drained is False
+    assert "machine paused" in outcome.detail
+    assert "server" in outcome.detail
+
+
 # ── #2187: a VERIFIED, exit-0 propagate must never be reported as
 #    `propagate-failed` — the whole bug this issue is about ─────────────────
 #
@@ -732,12 +784,18 @@ def test_run_propagate_with_no_journal_and_no_parseable_stdout_names_the_gap(tmp
 
 
 def _fake_propagate_subprocess(monkeypatch, state_dir, *, status: str, exit_code: int,
-                               target_version: str = "0.5.50", write_journal: bool = True):
+                               target_version: str = "0.5.50", write_journal: bool = True,
+                               stderr: str = ""):
     """Stands in for a REAL `python -m coord.cli release propagate --json`
     subprocess: appends the same journal record `_finish` would (#2187's
     ground truth) and returns the SAME pretty-printed (`indent=2`) --json
     stdout shape the real command emits, so the whole `_run_propagate`
-    boundary — not just its already-stubbed replacement — is exercised."""
+    boundary — not just its already-stubbed replacement — is exercised.
+
+    *stderr* stands in for the advisory-finding lines the real command
+    writes with `click.echo(..., err=True)` (`release.py` lines 996-1002) —
+    #2178 acceptance arm 3 needs those present in `propagate_output` even
+    though they never affect *status* or *exit_code*."""
     import json as _json
     import subprocess as _subprocess
     import time as _time
@@ -764,7 +822,7 @@ def _fake_propagate_subprocess(monkeypatch, state_dir, *, status: str, exit_code
             )
         payload = {"status": status, "target_version": target_version}
         stdout = _json.dumps(payload, indent=2, sort_keys=True)
-        return _subprocess.CompletedProcess(argv, exit_code, stdout=stdout, stderr="")
+        return _subprocess.CompletedProcess(argv, exit_code, stdout=stdout, stderr=stderr)
 
     monkeypatch.setattr(_subprocess, "run", _fake_run)
     return calls
@@ -855,3 +913,90 @@ def test_window_end_to_end_an_unconfirmable_exit_0_names_the_missing_evidence(
     assert "no matching entry" in (record["error"] or "")
     assert "no parseable" in (record["error"] or "")
     assert len(escalations) == 1
+
+
+def test_window_end_to_end_an_advisory_only_gate_is_still_a_success(
+    valid_config_path, state_dir, no_network, escalations, monkeypatch
+):
+    """#2178 acceptance arm 3: a lane propagation structurally cannot roll
+    (`~/.coord-cli-venv`, stale on some OTHER host) makes `coord release
+    verify` read CRIT, but `release_propagate.scope_verification` classifies
+    that finding as ADVISORY rather than blocking (`release_propagate.py`
+    lines 404-455) — so the real subprocess exits 0 with `status=verified`
+    regardless. The window must record that as a plain success, not pin the
+    fleet's release status to failed for as long as that one lane stays
+    stale (#2178's point 2: "advisory lanes must not fail the run").
+
+    The advisory finding itself must not be swallowed either — it travels
+    in `propagate_output`, exactly as the real subprocess's own stderr
+    would carry it, so a human reading `window-history` sees the lane that
+    needs fixing by hand without needing to cross-reference `coord release
+    history` separately."""
+    advisory_line = (
+        "  ~ advisory [crit] elitebook ~/.coord-cli-venv: on 0.5.46, expected "
+        "0.5.49 — outside propagation's reach, fix by hand"
+    )
+    _stub_verify(monkeypatch, daemon_version="0.5.49")
+    _stub_systemctl(monkeypatch)
+    _stub_drain(monkeypatch, drained=True)
+    _fake_propagate_subprocess(monkeypatch, state_dir, status=rp.STATUS_VERIFIED,
+                               exit_code=0, target_version="0.5.50", stderr=advisory_line)
+
+    result = CliRunner().invoke(
+        main,
+        ["release", "nightly-window", "--config", str(valid_config_path),
+         "--target", "0.5.50", "--daemon-host", "server"],
+    )
+    assert result.exit_code == 0, result.output
+    record = _records(state_dir)[0]
+    assert record["status"] == rw.STATUS_ROLLED
+    assert record["status"] in rw.OK_STATUSES
+    assert record["propagate_status"] == rp.STATUS_VERIFIED
+    assert not record["error"]
+    assert advisory_line.strip() in record["propagate_output"]
+    assert not escalations
+
+
+def test_window_never_prints_a_zero_exit_code_next_to_a_failure_assertion(
+    valid_config_path, state_dir, no_network, escalations, monkeypatch
+):
+    """#2178 point 3: whatever the window says about a run, `exit 0` must
+    never appear next to language asserting the roll didn't happen — that
+    exact contradiction ("did not verify a roll ... exit=0") is what made
+    diagnosing #2178 take real time on a verified, successful roll.
+
+    Drives the one arm where a real `exit 0` and a FAILED window status
+    legitimately coexist — no journal entry and no parseable stdout, so the
+    outcome is genuinely unconfirmable rather than known-bad — and checks
+    it two ways: the specific honest wording is present, and (generically,
+    scanning every line of output) no line anywhere pairs an exit-0 mention
+    with either failure phrase."""
+    import subprocess as _subprocess
+
+    _stub_verify(monkeypatch, daemon_version="0.5.49")
+    _stub_systemctl(monkeypatch)
+    _stub_drain(monkeypatch, drained=True)
+
+    def _fake_run(argv, **kwargs):
+        return _subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(_subprocess, "run", _fake_run)
+
+    result = CliRunner().invoke(
+        main,
+        ["release", "nightly-window", "--config", str(valid_config_path),
+         "--target", "0.5.50", "--daemon-host", "server"],
+    )
+    assert result.exit_code != 0, result.output
+    record = _records(state_dir)[0]
+    assert record["status"] == rw.STATUS_PROPAGATE_FAILED
+    error = record["error"] or ""
+    # The only sanctioned way for "exit 0" and a failed status to appear
+    # together: naming the exact missing evidence, never asserting the roll
+    # itself didn't happen.
+    assert "exited 0, but its outcome could not be confirmed" in error
+    assert "did not verify a roll" not in error
+    for line in (result.output or "").splitlines():
+        if "exit 0" in line or "exit=0" in line:
+            assert "did not verify a roll" not in line
+            assert "propagate-failed" not in line

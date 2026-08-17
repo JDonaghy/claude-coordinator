@@ -137,6 +137,111 @@ class TestClaudeSessionId:
         update_assignment_claude_session_id("some-id", "")  # must not raise
 
 
+class TestStopReason:
+    """#2316: stop_reason column on the assignments table.
+
+    The enabling persistence step — the agent already sent `stop_reason` on
+    every terminal `/status` `completed` entry (see
+    `coord.agent.AgentServer.list_assignments`), but the coordinator had
+    nowhere to put it and dropped it on receipt. This is the "everything
+    else is a read of it" column the issue's classification/comment work
+    (coord/agent.py) build on.
+    """
+
+    def test_schema_has_stop_reason_column(self, coord_db) -> None:
+        """The assignments table must have a stop_reason column."""
+        from coord.db import get_connection
+        conn = get_connection()
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(assignments)").fetchall()}
+        assert "stop_reason" in cols, (
+            "assignments table is missing stop_reason column — "
+            "check _migrate_add_columns in coord/db.py"
+        )
+
+    def test_update_assignment_stop_reason_persists_the_value(self, coord_db) -> None:
+        """update_assignment_stop_reason persists the value on the row."""
+        from coord.state import update_assignment_stop_reason
+
+        proposal = Proposal(
+            id=1,
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=2316,
+            issue_title="Truncation test",
+            rationale="test",
+            briefing="hello",
+        )
+        assignment_id = "test-stop-reason-001"
+        record_dispatched(
+            assignment_id=assignment_id,
+            proposal=proposal,
+            repo_github="acme/api",
+        )
+
+        from coord.db import get_connection
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT stop_reason FROM assignments WHERE assignment_id=?",
+            (assignment_id,),
+        ).fetchone()
+        assert row is not None
+        assert row[0] is None
+
+        update_assignment_stop_reason(assignment_id, "length")
+
+        row = conn.execute(
+            "SELECT stop_reason FROM assignments WHERE assignment_id=?",
+            (assignment_id,),
+        ).fetchone()
+        assert row[0] == "length"
+
+    def test_update_assignment_stop_reason_first_writer_wins(self, coord_db) -> None:
+        """Idempotent: a second call with a different value is a no-op — a
+        terminal row's stop reason cannot change after the fact, so a later
+        reconcile tick re-observing the same /status entry must not clobber it."""
+        from coord.state import update_assignment_stop_reason
+
+        proposal = Proposal(
+            id=1,
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=2316,
+            issue_title="Truncation test",
+            rationale="test",
+            briefing="hello",
+        )
+        assignment_id = "test-stop-reason-002"
+        record_dispatched(
+            assignment_id=assignment_id,
+            proposal=proposal,
+            repo_github="acme/api",
+        )
+
+        update_assignment_stop_reason(assignment_id, "end_turn")
+        update_assignment_stop_reason(assignment_id, "length")  # must be ignored
+
+        from coord.db import get_connection
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT stop_reason FROM assignments WHERE assignment_id=?",
+            (assignment_id,),
+        ).fetchone()
+        assert row[0] == "end_turn"
+
+    def test_update_assignment_stop_reason_noop_on_missing(self, coord_db) -> None:
+        """Calling with a nonexistent assignment_id silently does nothing."""
+        from coord.state import update_assignment_stop_reason
+
+        update_assignment_stop_reason("no-such-id", "length")  # must not raise
+
+    def test_update_assignment_stop_reason_noop_on_empty(self, coord_db) -> None:
+        """Calling with empty assignment_id/stop_reason silently does nothing."""
+        from coord.state import update_assignment_stop_reason
+
+        update_assignment_stop_reason("", "length")  # must not raise
+        update_assignment_stop_reason("some-id", "")  # must not raise
+
+
 class TestRecordDispatchedAssignmentBranch:
     """#557: record_dispatched_assignment must persist the branch column so
     coord reattach can find it for the remote push-back finalize."""

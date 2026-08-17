@@ -116,7 +116,7 @@ function GalleryBody() {
         <Card className="w-full max-w-sm">
           <CardHeader>
             <CardTitle>W1-1: design tokens</CardTitle>
-            <CardDescription>#1546 · claude-coordinator</CardDescription>
+            <CardDescription>#1546 · code-coordinator</CardDescription>
           </CardHeader>
           <CardContent className="text-sm text-muted-foreground">
             Dark/light theme, component primitive baseline.

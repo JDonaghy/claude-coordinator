@@ -485,13 +485,26 @@ class ClaudePtyProvider(Provider):
                 _sp = spec.system_prompt if spec.system_prompt else MILESTONE_CHAT_SYSTEM_PROMPT
                 _sp += build_deny_prompt(MILESTONE_CHAT_DENY_COMMANDS)
                 _at = "Read,Bash"
+            elif spec.type == "smoke":
+                # #2301: keep in sync with default_worker_command's and
+                # ClaudeProvider.build_command's identical branch — smoke
+                # gets SMOKE_SYSTEM_PROMPT and Read,Bash only, deliberately
+                # WITHOUT `Monitor` (an await-a-notification tool: calling it
+                # ends the turn, which ends a one-shot leg's session before
+                # any wake-up can arrive) and without Edit/Write (a smoke leg
+                # validates; it never mutates).
+                from coord.smoke import SMOKE_SYSTEM_PROMPT  # noqa: PLC0415
+                _sp = spec.system_prompt if spec.system_prompt else SMOKE_SYSTEM_PROMPT
+                _sp += build_deny_prompt(spec.deny_commands)
+                _at = "Read,Bash"
             else:
                 _sp = spec.system_prompt if spec.system_prompt else WORKER_SYSTEM_PROMPT
                 _sp += build_deny_prompt(spec.deny_commands)
                 # #2169: keep in sync with default_worker_command's and
                 # ClaudeProvider.build_command's identical branch — Monitor
                 # is the sanctioned bounded-poll tool for a backgrounded
-                # long-running command.
+                # long-running command. #2301: that grant is for *work*-shaped
+                # legs only — smoke has its own branch above.
                 _at = "Read,Edit,Write,Bash,Monitor"
 
             if system_prompt is None:

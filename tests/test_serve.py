@@ -2384,6 +2384,24 @@ def test_serve_assignment_usage_records_smoke_tests(file_db, valid_config_path, 
     assert row["smoke_tests"] == '["click the button"]'
 
 
+def test_serve_assignment_usage_records_stop_reason(file_db, valid_config_path, rw_db):
+    """#2316: POST /assignment-usage also routes stop_reason — same endpoint,
+    same "one round-trip covers all the diagnostic fields" pattern as
+    cost/tokens/smoke_tests above."""
+    _seed_running_assignment(rw_db, aid="du06")
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post(
+            "/assignment-usage",
+            json={"assignment_id": "du06", "stop_reason": "length"},
+        )
+    assert resp.status_code == 200
+    row = rw_db.execute(
+        "SELECT stop_reason FROM assignments WHERE assignment_id='du06'"
+    ).fetchone()
+    assert row["stop_reason"] == "length"
+
+
 def test_update_assignment_smoke_tests_routes_when_service_set(coord_db, monkeypatch):
     from coord import client as cc
     from coord import state

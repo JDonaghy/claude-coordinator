@@ -1,6 +1,6 @@
 # The Test-First Bug Lane
 
-> **Status: plan of record, 2026-08-07.** Milestone: claude-coordinator #61
+> **Status: plan of record, 2026-08-07.** Milestone: code-coordinator #61
 > "Test-first bug lane". Companion to [`ORACLE_LOOP.md`](ORACLE_LOOP.md) (the
 > feature lane) and [`PIPELINE_V2.md`](PIPELINE_V2.md).
 
@@ -55,7 +55,7 @@ stage as noise. **Phase 0 is not optional and it comes first.**
 
 A sealed acceptance slice today runs **once** — while its own milestone is being
 driven — and never again. No CI job and no Test-stage lane re-runs it
-(claude-coordinator#1950). A suite nothing re-runs is not an oracle; it is a green
+(code-coordinator#1950). A suite nothing re-runs is not an oracle; it is a green
 screenshot from the day it was written.
 
 The fix is structural, not procedural: the acceptance suite must be part of the
@@ -144,7 +144,7 @@ quadraui's gaps.
 
 The 2026-08-07 session is the worked example: smoking one vimcode branch produced
 quadraui#541 (a framework parity gap), vimcode#625's real root cause (a floating
-path-dep silently restating every snapshot), and claude-coordinator#1950 (the cadence
+path-dep silently restating every snapshot), and code-coordinator#1950 (the cadence
 hole) — three findings in three repos, from one bug.
 
 ## The intake contract (#1964, shipped)

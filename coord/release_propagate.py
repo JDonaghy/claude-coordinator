@@ -785,7 +785,29 @@ def assess_quiescence(
     #2228: the interactive-session half is wired from
     ``coord.commands.release._interactive_session_busy``, fed by the same
     fleet-wide tmux sweep ``coord sessions --remote`` renders — until then
-    this half of the seam existed but nothing ever fed it.
+    this half of the seam existed but nothing ever fed it. #2174: the
+    operator-pause half is wired from
+    ``coord.commands.release._paused_machine_busy`` — a machine under an
+    explicit ``coord pause`` or an active quiet-hours window (but NOT a
+    #2101 release cordon: that is this module's own drain mechanism, not a
+    sign a host is already quiescent, and feeding it back in here would
+    make a cordon defer the very roll it exists to unblock) becomes a
+    host-pinned :class:`Busy`. Tmux liveness genuinely has no fleet-wide
+    read (it is a LOCAL fact, #1870, and propagation may run from any
+    host) — pause state does, because it is daemon-aware
+    (``coord.machine_pause``) the same way the board is, so both callers
+    can read it cheaply with no new probe.
+
+    Because a :class:`Busy` carries a host, #2067's per-host quiescence
+    does the obvious thing for a paused NON-daemon host: it defers only
+    that host, and the rest of the fleet still rolls. A paused DAEMON host
+    is different on purpose — the daemon-leads invariant (see the module
+    docstring's LANE ORDER) already defers the WHOLE run whenever the
+    daemon host is itself busy and behind, and a pause is just one more
+    way for the daemon host to be busy. So ``coord pause <daemon-host>``
+    halting all propagation, not just that host's own lane, is read as the
+    correct interpretation of "leave this box alone" applied to the one
+    host every other host's roll depends on — not an emergent accident.
 
     #2110: a ``running`` queue row is not, on its own, proof of anything —
     the reconciler that would have moved it to ``done`` lives inside

@@ -199,7 +199,7 @@ def test_pty_build_command_branches_match_claude_for_plan_type() -> None:
     assert argv[argv.index("--allowedTools") + 1] == legacy_at
 
 
-@pytest.mark.parametrize("spec_type", ["work", "review", "smoke", "conflict-fix", "fix"])
+@pytest.mark.parametrize("spec_type", ["work", "review", "conflict-fix", "fix"])
 def test_pty_build_command_branches_match_claude_for_work_type(spec_type: str) -> None:
     """#2169: the generic-worker (``else``) branch must stay in parity too.
 
@@ -210,6 +210,12 @@ def test_pty_build_command_branches_match_claude_for_work_type(spec_type: str) -
     system-prompt/allowed-tools logic and must not drift from it — this
     regression-guards the drift where only two of the three call sites
     were updated to add ``Monitor``.
+
+    ``smoke`` used to be parametrized here because it fell through the same
+    ``else`` branch; #2301 gave it a branch of its own, so its parity is
+    guarded by
+    :func:`test_pty_build_command_smoke_branch_matches_claude_and_withholds_monitor`
+    below instead.
     """
     spec = _make_spec(type=spec_type)
     argv = ClaudePtyProvider().build_command(spec)
@@ -219,6 +225,45 @@ def test_pty_build_command_branches_match_claude_for_work_type(spec_type: str) -
     assert argv[argv.index("--system-prompt") + 1] == legacy_sp
     assert argv[argv.index("--allowedTools") + 1] == legacy_at
     assert "Monitor" in argv[argv.index("--allowedTools") + 1]
+
+
+def test_pty_build_command_smoke_branch_matches_claude_and_withholds_monitor() -> None:
+    """#2301: the smoke branch is the *third* call site of the same logic.
+
+    ``default_worker_command`` and ``ClaudeProvider.build_command`` both give
+    ``spec.type == "smoke"`` its own branch — ``SMOKE_SYSTEM_PROMPT`` plus
+    ``Read,Bash`` only, deliberately withholding ``Monitor`` (an await-a-
+    notification tool that ends a one-shot ``claude -p`` leg's session before
+    any wake-up can arrive) and Edit/Write (a smoke leg validates; it never
+    mutates). ``ClaudePtyProvider.build_command`` must not drift from them —
+    this regression-guards exactly the drift #2169 hit, where only two of the
+    three call sites were updated.
+    """
+    from coord.smoke import SMOKE_SYSTEM_PROMPT
+
+    spec = _make_spec(type="smoke")
+    argv = ClaudePtyProvider().build_command(spec)
+    legacy = default_worker_command(spec)
+    legacy_sp = legacy[legacy.index("--system-prompt") + 1]
+    legacy_at = legacy[legacy.index("--allowedTools") + 1]
+    pty_sp = argv[argv.index("--system-prompt") + 1]
+    pty_at = argv[argv.index("--allowedTools") + 1]
+    assert pty_sp == legacy_sp
+    assert pty_at == legacy_at
+    # Pin the values too, so a *matched* regression on both sides still fails.
+    assert pty_sp.startswith(SMOKE_SYSTEM_PROMPT)
+    assert pty_at == "Read,Bash"
+    assert "Monitor" not in pty_at.split(",")
+
+
+def test_pty_build_command_smoke_honours_explicit_system_prompt() -> None:
+    """#2301: the new smoke branch must still respect ``spec.system_prompt``
+    (the dispatcher's per-run briefing prompt) rather than always forcing
+    ``SMOKE_SYSTEM_PROMPT`` — same precedence as every other branch."""
+    argv = ClaudePtyProvider().build_command(
+        _make_spec(type="smoke", system_prompt="custom smoke prompt")
+    )
+    assert argv[argv.index("--system-prompt") + 1].startswith("custom smoke prompt")
 
 
 # ── ClaudePtyProvider: capabilities ──────────────────────────────────────────

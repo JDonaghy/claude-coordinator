@@ -1775,6 +1775,58 @@ def get_compare_files(repo: str, base: str, head: str) -> list[str] | None:
     return [line for line in (ln.strip() for ln in raw.splitlines()) if line]
 
 
+def _gh_ref_confirmed_missing(exc: Exception) -> bool:
+    """True when *exc* (raised by ``_gh`` for a ``gh api`` ref/compare call)
+    is GitHub positively saying "no such ref" — a 404 — as opposed to an
+    auth, rate-limit, network, or other transient failure that merely looks
+    like one from the caller's point of view.
+
+    #2324: deliberately narrower than the "http 4" match
+    :func:`branch_exists_on_remote` uses (which folds 401/403/429 in with
+    404, and fails open elsewhere for that function's own reasons). This is
+    the one call site where conflating "confirmed gone" with "auth/rate-limit
+    blip" would make `coord retry`'s zero-commit gate treat a locked-out
+    ``gh`` as proof a branch was deleted and race ahead re-dispatching real,
+    unconfirmed work — so it checks :func:`_is_transient_error`'s keywords
+    first and only then looks for an explicit "404"/"not found" signal.
+    """
+    if _is_transient_error(exc):
+        return False
+    msg = str(exc).lower()
+    return "404" in msg or "not found" in msg
+
+
+def _head_branch_confirmed_deleted(repo: str, base: str, branch: str) -> bool:
+    """True when *branch* 404s on *repo* while *base* still resolves.
+
+    #2324: :func:`branch_commits_ahead`'s three-dot compare call 404s
+    identically whether it's the head branch that's gone, the base branch,
+    or something else entirely obscures both — the compare error text alone
+    can't tell them apart. This asks each ref directly (the same
+    ``git/refs/heads`` lookup :func:`branch_exists_on_remote` uses) so a
+    branch that was genuinely deleted — the normal cleanup after a
+    zero-commit worker exit — reads as "confirmed gone" instead of being
+    lumped in with an unrelated failure and reported as unknown.
+
+    Only returns True on the one shape that's actually conclusive: the head
+    ref 404s (via :func:`_gh_ref_confirmed_missing`) *and* the base ref
+    still resolves. Any other combination — head resolves fine, head lookup
+    itself fails inconclusively, or base can't be confirmed either — returns
+    False so the caller keeps its existing fail-closed ``None``.
+    """
+    try:
+        _gh("api", f"repos/{repo}/git/refs/heads/{branch}")
+        return False  # head resolves fine; compare failed for some other reason
+    except RuntimeError as exc:
+        if not _gh_ref_confirmed_missing(exc):
+            return False  # inconclusive — do not guess
+    try:
+        _gh("api", f"repos/{repo}/git/refs/heads/{base}")
+    except RuntimeError:
+        return False  # base itself unconfirmable — don't trust the read
+    return True  # head confirmed gone, base confirmed present
+
+
 def branch_commits_ahead(repo: str, base: str, branch: str) -> int | None:
     """Commits *branch* is ahead of *base* on the remote, or ``None``.
 
@@ -1790,6 +1842,16 @@ def branch_commits_ahead(repo: str, base: str, branch: str) -> int | None:
     real reviews.  This is the opposite polarity from
     :func:`branch_is_fully_merged`, which returns a plain ``False`` on error
     because *its* fail-safe direction is "keep the PR open".
+
+    #2324 exception: when the compare call fails, a *confirmed* 404 on the
+    head branch while the base branch still resolves
+    (:func:`_head_branch_confirmed_deleted`) returns ``0``, not ``None`` — a
+    head ref that GitHub positively says doesn't exist is the strongest
+    possible evidence nothing was ever pushed to it (a branch carrying
+    commits would still be there). Every other failure shape — the compare
+    call fails for a reason that isn't a confirmed head-branch 404, or the
+    follow-up ref checks themselves are inconclusive — keeps the existing
+    fail-closed ``None``.
     """
     if not branch or not base:
         return None
@@ -1799,6 +1861,8 @@ def branch_commits_ahead(repo: str, base: str, branch: str) -> int | None:
         raw = _gh("api", f"repos/{repo}/compare/{base}...{branch}")
         cmp = json.loads(raw)
     except Exception:  # noqa: BLE001 — unknown, not zero
+        if _head_branch_confirmed_deleted(repo, base, branch):
+            return 0
         return None
     if not isinstance(cmp, dict):
         return None
@@ -1832,7 +1896,11 @@ def branch_commits_ahead_for_assignment(assignment: Any, config: Any) -> int | N
     that ``config`` doesn't know about returns ``None`` ("cannot confirm"),
     never a bare 0, matching :func:`branch_commits_ahead`'s own fail-closed
     polarity: an unconfirmable commit count must never be silently read as
-    "empty branch, safe to touch".
+    "empty branch, safe to touch" — *except* the one case
+    :func:`branch_commits_ahead` itself carves out (#2324): a recorded
+    branch whose head ref GitHub positively 404s, with the base branch still
+    resolving, comes back as 0 rather than ``None`` — a deleted branch
+    proves nothing was pushed at least as conclusively as a blank one does.
     """
     branch = (getattr(assignment, "branch", None) or "").strip()
     if not branch:

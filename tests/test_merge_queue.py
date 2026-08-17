@@ -1118,6 +1118,23 @@ class _ExpectedRedGh(FakeGh):
         return "new-sha"
 
 
+class _PatchIdGh(_ExpectedRedGh):
+    """#2298: `_ExpectedRedGh` + a controllable `get_branch_patch_id`, keyed
+    by the *branch* arg (either the live PR branch name or a bare
+    acceptance_sha) so a test can simulate "same content, different SHA"
+    (a pure rebase) independently of `get_branch_sha`/`branch_head_sha`.
+    """
+
+    def __init__(self, *, patch_ids: dict[str, str | None], **kw):
+        super().__init__(**kw)
+        self._patch_ids = patch_ids
+        self.patch_id_calls: list[tuple[str, str, str]] = []
+
+    def get_branch_patch_id(self, repo: str, base: str, branch: str) -> str | None:
+        self.patch_id_calls.append((repo, base, branch))
+        return self._patch_ids.get(branch)
+
+
 class TestExpectedRedClearOnMerge:
     """#2164 review (blocking finding 1): clearing `expected_red` must wait
     for the fix's own PR to actually merge into the default branch, not
@@ -1151,6 +1168,44 @@ class TestExpectedRedClearOnMerge:
         assert gh.update_repo_file_calls  # the manifest text was actually edited
         assert "expected_red" not in gh.update_repo_file_calls[0][1]
 
+    def test_a_successful_clear_writes_a_durable_audit_row(self, coord_db) -> None:
+        """#2266 scope 2: a clear isn't just a `coord merge` output line
+        that scrolls past — it lands a queryable `audit_log` row too."""
+        work = self._work("w1", acceptance_state="passed", acceptance_sha="cafesha")
+        board = self._board(completed=[work])
+        gh = _ExpectedRedGh()
+
+        process([_q("w1", size=10)], gh, board=board)
+
+        rows = coord_db.execute(
+            "SELECT issue, repo FROM audit_log WHERE event_type = 'expected_red_clear'",
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["issue"] == 1
+
+    def test_an_ordinary_merge_with_nothing_to_clear_writes_no_audit_row(
+        self, coord_db,
+    ) -> None:
+        """#2266 review (blocking finding 1): both guards passing
+        (acceptance recorded "passed" against the exact merged SHA) but
+        the issue has no `expected_red` entries at all is the *common*
+        case for an ordinary oracle-loop merge — not a failure. Before
+        this fix, `clear_expected_red_via_pr`'s "no expected_red entries
+        for this issue" message classified as "not cleared" just like a
+        genuine failure, so every such merge wrote a persisted
+        `expected_red_clear_failed` row."""
+        work = self._work("w1", acceptance_state="passed", acceptance_sha="cafesha")
+        board = self._board(completed=[work])
+        gh = _ExpectedRedGh(manifest_text="tests:\n  ms01::a: 1\n")  # no expected_red: block
+
+        events = process([_q("w1", size=10)], gh, board=board)
+
+        assert events[-1].kind == "expected_red_clear_noop"
+        assert not gh.update_repo_file_calls
+        assert not coord_db.execute(
+            "SELECT 1 FROM audit_log WHERE event_type LIKE 'expected_red_clear%'",
+        ).fetchall()
+
     def test_names_the_skip_when_acceptance_was_never_recorded(self) -> None:
         """#2199: this used to be a silent `return None` — and, before
         #2199 gave `coord acceptance record` a call site at all, the
@@ -1168,6 +1223,26 @@ class TestExpectedRedClearOnMerge:
         assert "acceptance_state=None" in events[-1].message
         assert "coord acceptance record" in events[-1].message
         assert not gh.update_repo_file_calls
+
+    def test_no_acceptance_skip_writes_a_distinct_durable_audit_row(self, coord_db) -> None:
+        """#2266 scope 3: "acceptance never recorded" is a different
+        problem from a stale SHA (below) — it must be queryable as such,
+        not just another line that scrolled past in `coord merge` output."""
+        work = self._work("w1")  # acceptance_state=None
+        board = self._board(completed=[work])
+        gh = _ExpectedRedGh()
+
+        process([_q("w1", size=10)], gh, board=board)
+
+        rows = coord_db.execute(
+            "SELECT issue FROM audit_log "
+            "WHERE event_type = 'expected_red_clear_skipped_no_acceptance'",
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["issue"] == 1
+        assert not coord_db.execute(
+            "SELECT 1 FROM audit_log WHERE event_type = 'expected_red_clear_skipped_sha_mismatch'",
+        ).fetchall()
 
     def test_names_the_skip_when_acceptance_failed(self) -> None:
         work = self._work("w1", acceptance_state="failed", acceptance_sha="cafesha")
@@ -1227,6 +1302,26 @@ class TestExpectedRedClearOnMerge:
         assert events[-1].kind == "expected_red_clear_skipped"
         assert not gh.update_repo_file_calls
 
+    def test_sha_mismatch_skip_writes_a_distinct_durable_audit_row(self, coord_db) -> None:
+        """#2266 scope 3: the SHA-mismatch guard is a different problem
+        from "acceptance never recorded" (above) — a distinct, queryable
+        event_type, not the same silence either guard reached before."""
+        work = self._work("w1", acceptance_state="passed", acceptance_sha="an-old-sha")
+        board = self._board(completed=[work])
+        gh = _ExpectedRedGh(branch_sha="cafesha")  # branch_head_sha != acceptance_sha
+
+        process([_q("w1", size=10)], gh, board=board)
+
+        rows = coord_db.execute(
+            "SELECT issue FROM audit_log "
+            "WHERE event_type = 'expected_red_clear_skipped_sha_mismatch'",
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["issue"] == 1
+        assert not coord_db.execute(
+            "SELECT 1 FROM audit_log WHERE event_type = 'expected_red_clear_skipped_no_acceptance'",
+        ).fetchall()
+
     def test_mock_author_entries_never_trigger_a_clear(self) -> None:
         """`assignment_type="mock-author"` doesn't close an issue at all
         (#1077) — issue_number there is the milestone tracking issue, not
@@ -1263,12 +1358,128 @@ class TestExpectedRedClearOnMerge:
         events = process([_q("w1", size=10)], _PlainFakeGh(), board=board)
 
         # Must not crash `process()` — degrades to a harmless "found
-        # nothing" event rather than an AttributeError, same fail-soft
-        # posture the rest of the sweep uses when the API surface is
-        # missing (`find_ms_manifest_for_issue_via_api` itself degrades to
+        # nothing" event (classified "no_op", #2266 review blocking
+        # finding 1) rather than an AttributeError, same fail-soft posture
+        # the rest of the sweep uses when the API surface is missing
+        # (`find_ms_manifest_for_issue_via_api` itself degrades to
         # "nothing found" for the same reason).
-        assert events[-1].kind == "expected_red_clear"
+        assert events[-1].kind == "expected_red_clear_noop"
         assert events[-1].entry.state == MERGED
+
+    def test_a_failed_clear_writes_a_distinct_durable_audit_row(self, coord_db) -> None:
+        """#2266 scope 2: `clear_expected_red_via_pr` never raises — every
+        failure degrades to a `warning: ...` string the caller can log.
+        That must still be durable, with an event_type distinct from a
+        real clear, so a repeat failure is queryable as "still stuck"."""
+        work = self._work("w1", acceptance_state="passed", acceptance_sha="cafesha")
+        board = self._board(completed=[work])
+
+        class _CommitFailsGh(_ExpectedRedGh):
+            def update_repo_file(self, repo, path, branch, content, message, *, sha):
+                raise RuntimeError("boom")
+
+        process([_q("w1", size=10)], _CommitFailsGh(), board=board)
+
+        rows = coord_db.execute(
+            "SELECT issue FROM audit_log WHERE event_type = 'expected_red_clear_failed'",
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["issue"] == 1
+        assert not coord_db.execute(
+            "SELECT 1 FROM audit_log WHERE event_type = 'expected_red_clear'",
+        ).fetchall()
+
+    # ── #2298: SHA mismatch ≠ content change ────────────────────────────
+
+    def test_clears_when_sha_mismatches_but_patch_id_confirms_a_pure_rebase(
+        self,
+    ) -> None:
+        """#2298: `checks_stale`/`smoke_required` force a rebase before a
+        PR sitting behind a moved base can merge at all — which rewrites
+        `branch_head_sha` even when nothing about the PR's own diff
+        changed. A patch-id match (the branch's current diff against
+        target == the diff `acceptance_sha` introduced against target)
+        must clear exactly like an exact-SHA match does, not skip."""
+        work = self._work("w1", acceptance_state="passed", acceptance_sha="old-sha")
+        board = self._board(completed=[work])
+        gh = _PatchIdGh(
+            branch_sha="new-sha",  # branch_head_sha != acceptance_sha
+            patch_ids={"worker/w1": "same-patch", "old-sha": "same-patch"},
+        )
+
+        events = process([_q("w1", size=10)], gh, board=board)
+
+        assert events[-1].kind == "expected_red_clear"
+        assert "ms01::a" in events[-1].message
+        assert "patch-id" in events[-1].message  # names the arm it took
+        assert gh.update_repo_file_calls  # the manifest text was actually edited
+
+    def test_still_skips_when_sha_mismatches_and_patch_id_also_differs(self) -> None:
+        """The counterpart: content genuinely changed after the verdict
+        was recorded (a conflict resolved differently, an extra commit) —
+        must still skip, same named event as a bare SHA mismatch."""
+        work = self._work("w1", acceptance_state="passed", acceptance_sha="old-sha")
+        board = self._board(completed=[work])
+        gh = _PatchIdGh(
+            branch_sha="new-sha",
+            patch_ids={"worker/w1": "patch-new", "old-sha": "patch-old"},
+        )
+
+        events = process([_q("w1", size=10)], gh, board=board)
+
+        assert events[-1].kind == "expected_red_clear_skipped"
+        assert not gh.update_repo_file_calls
+
+    def test_still_skips_when_patch_id_is_unavailable(self) -> None:
+        """Fail closed: a SHA mismatch with no patch-id on either side
+        (an older `gh_ops`, or a lookup failure) must skip exactly like
+        before #2298 — "cannot confirm identical" is never "confirmed"."""
+        work = self._work("w1", acceptance_state="passed", acceptance_sha="old-sha")
+        board = self._board(completed=[work])
+        gh = _PatchIdGh(branch_sha="new-sha", patch_ids={})  # every lookup -> None
+
+        events = process([_q("w1", size=10)], gh, board=board)
+
+        assert events[-1].kind == "expected_red_clear_skipped"
+        assert not gh.update_repo_file_calls
+
+    def test_patch_id_verified_clear_writes_a_distinct_durable_audit_row(
+        self, coord_db,
+    ) -> None:
+        """The rebase-not-content-change arm is queryable on its own —
+        not just implied by the eventual `expected_red_clear` row — the
+        same "name every branch" posture #2199/#2266 already established
+        for the other arms of this function."""
+        work = self._work("w1", acceptance_state="passed", acceptance_sha="old-sha")
+        board = self._board(completed=[work])
+        gh = _PatchIdGh(
+            branch_sha="new-sha",
+            patch_ids={"worker/w1": "same-patch", "old-sha": "same-patch"},
+        )
+
+        process([_q("w1", size=10)], gh, board=board)
+
+        rows = coord_db.execute(
+            "SELECT issue FROM audit_log "
+            "WHERE event_type = 'expected_red_sha_mismatch_patch_id_verified'",
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["issue"] == 1
+
+    def test_skip_remedy_points_at_a_command_that_works_post_merge(self) -> None:
+        """#2298 (also worth fixing here): the pre-#2298 advice —
+        `coord acceptance record --sha <merged sha>` — targets an open
+        issue's live work assignment. By the time this guard skips, the
+        issue this entry closed is already closed (`gh_ops.close_issue`
+        ran just before this), so that advice leads nowhere. Point at the
+        remedy that actually works from the state the operator is in."""
+        work = self._work("w1", acceptance_state="passed", acceptance_sha="an-old-sha")
+        board = self._board(completed=[work])
+        gh = _ExpectedRedGh(branch_sha="cafesha")  # branch_head_sha != acceptance_sha
+
+        events = process([_q("w1", size=10)], gh, board=board)
+
+        assert "coord acceptance expected-red api --clear --issue 1" in events[-1].message
 
 
 class _TestAuthorGateGh(FakeGh):

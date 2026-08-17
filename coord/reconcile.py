@@ -10,7 +10,7 @@ import httpx
 
 from typing import TYPE_CHECKING
 
-from coord.config import Config
+from coord.config import INTERACTIVE_SESSION_TYPES, Config
 from coord.dispatch import AGENT_PORT
 from coord.models import WORK_LIKE_TYPES, Assignment, Board, Machine
 
@@ -47,6 +47,120 @@ _AGENT_TERMINAL_STATUS = {
     "failed": "failed",
     "cancelled": "failed",
 }
+
+
+# ── #2275: the agent has no record of this assignment ──────────────────────
+#
+# Pinned reason string, written verbatim to `assignments.failure_reason` when
+# the no-record arm below reconciles a row.  Asserted on by
+# `tests/test_reconcile_no_agent_record.py` and (deliberately) the only thing
+# a human or a downstream reader has to grep for to understand why a row went
+# terminal without a worker verdict.
+NO_AGENT_RECORD_REASON = (
+    "agent has no record of this assignment (present in neither its /status "
+    "`active` nor `completed` list) — the worker process is gone: the agent "
+    "restarted with its state lost, the machine rebooted, or the completion "
+    "rolled off the capped history before anything observed it (#2275)"
+)
+
+# Minimum age (seconds since `dispatched_at`) before the no-record arm will
+# reconcile a row.
+#
+# The positive disproof — "in neither list" — is what makes this arm safe;
+# this window is the belt to its braces, and exists for exactly one shape:
+# `AgentServer.assign()` builds the worktree BEFORE taking `self._lock` to
+# insert into `self._assignments` (see the identical race window called out in
+# `clean_worktrees`).  Any dispatch path that learns an assignment id and
+# writes a `running` board row without waiting for that insert would otherwise
+# hand this arm a row the agent genuinely will know about a moment later.  Two
+# minutes is orders of magnitude longer than that window and orders of
+# magnitude shorter than the 11 hours #2208 burned, so it costs nothing real.
+#
+# It is NOT a restart grace window — see `reconcile_completed_assignments`'
+# docstring for why an agent restart does not produce a mass reap.
+_NO_RECORD_GRACE_SECONDS = 120.0
+
+
+def is_attended_session(a: object) -> bool:
+    """True when *a* is a human-attended session, not an agent subprocess (#2275).
+
+    The exclusion that keeps the no-record arm in
+    :func:`reconcile_completed_assignments` from reaping live work.  An
+    attended session is launched into tmux/a PTY by ``coord assign
+    --interactive`` — it is not an agent subprocess, so it appears in NEITHER
+    the agent's ``active`` list NOR its ``completed`` list, for its whole
+    life.  Without this check the no-record arm would reap every attended
+    session the moment it started, which is the #1658 failure mode (reaping
+    live headless workers) pointed at a human's own terminal.
+
+    Two independent discriminators, either of which is sufficient — this is a
+    reaping path, so it is deliberately over-inclusive:
+
+    * ``provider_name == "claude-pty"`` — stamped by every ``--interactive``
+      dispatch (the same discriminator :func:`is_interactive_merge_session`
+      and :meth:`coord.config.PipelineConfig.attention_threshold_for` use).
+      This is the load-bearing one: an interactive ``--fix-of``/
+      ``--review-of``/``--smoke-of`` session shares its ``type`` with a
+      headless counterpart, so only ``provider_name`` tells them apart.
+    * ``type in`` :data:`coord.config.INTERACTIVE_SESSION_TYPES` — the
+      chat/troubleshoot/audit/refinement family, which has no headless
+      counterpart at all and never goes near an agent.
+
+    Dead attended sessions are reaped by their own path
+    (:func:`coord.interactive.reap_stale_interactive_sessions`, called from
+    :func:`reconcile`), which probes the actual tmux server rather than
+    inferring death from an agent's silence.  That is the correct instrument
+    for them; this one must stay out of the way.
+    """
+    if getattr(a, "provider_name", None) == "claude-pty":
+        return True
+    return getattr(a, "type", None) in INTERACTIVE_SESSION_TYPES
+
+
+def agent_has_no_record(status: dict, assignment_id: str) -> bool:
+    """True when *status* positively shows the agent knows nothing of *assignment_id*.
+
+    #2275's whole point: ``/status`` carries ``active`` (everything the agent
+    has a live subprocess for) and ``completed`` (its capped terminal
+    history).  An id in NEITHER is a **positive statement** about the agent's
+    state — "no record" — not an inference from silence, which is what the
+    old ``entry is None → continue`` conflated with "still running".
+
+    Fail-open on a payload that doesn't carry both keys.  A response missing
+    ``active`` cannot support the disproof (we would be inferring from
+    absence again, exactly the bug), so it is treated as "cannot tell" and
+    the caller leaves the row alone.  This also means an older agent build,
+    or any future ``/status`` variant, degrades to today's behaviour rather
+    than to a reap.
+    """
+    if not isinstance(status, dict):
+        return False
+    active = status.get("active")
+    completed = status.get("completed")
+    if not isinstance(active, list) or not isinstance(completed, list):
+        return False
+    for entries in (active, completed):
+        for e in entries:
+            if isinstance(e, dict) and e.get("id") == assignment_id:
+                return False
+    return True
+
+
+def _no_record_grace_elapsed(a: Assignment, *, now: float | None = None) -> bool:
+    """True when *a* is old enough for the no-record arm (:data:`_NO_RECORD_GRACE_SECONDS`).
+
+    A row with no ``dispatched_at`` at all is eligible: the grace window
+    guards a dispatch-time race, and a row that never recorded a dispatch
+    time is not in one.
+    """
+    dispatched_at = getattr(a, "dispatched_at", None)
+    if not dispatched_at:
+        return True
+    try:
+        dispatched = float(dispatched_at)
+    except (TypeError, ValueError):
+        return True
+    return (time.time() if now is None else now) - dispatched >= _NO_RECORD_GRACE_SECONDS
 
 
 def effective_agent_status(entry: dict) -> str:
@@ -143,7 +257,49 @@ def reconcile_completed_assignments(
 
     Interactive sessions are tmux launches, not agent subprocesses, so they
     never appear in the agent's ``completed`` list — a live attended session
-    can't be reaped by this path.
+    can't be reaped by this path.  #2275 made that a CHECKED property rather
+    than an emergent one: see :func:`is_attended_session`.
+
+    **#2275 — the second reconcile arm: "the agent has no record of it".**
+    Until #2275 this function only ever acted on a row it found in the agent's
+    ``completed`` history.  Anything else hit a bare ``continue`` whose comment
+    read *"still active on the agent (or rolled off history) → leave it"* —
+    two cases with opposite correct handling, conflated, both left.  That is
+    not a race: ``_COMPLETED_HISTORY_CAP`` is 25, so a leg that dies needs only
+    25 further completions on its machine before its id is gone from
+    ``/status``, after which nothing on the daemon's 30s clock would ever look
+    at that row again.  It cost claude-coordinator#2208 8 hours and both drive
+    attempts on an already-green branch; a human running ``coord status``
+    cleared it, and the branch was merge-READY 14 minutes later.
+
+    The fix is a positive disproof: ``/status`` carries both ``active`` and
+    ``completed``, and an id in NEITHER is a statement about the agent's state,
+    not an inference from its silence.  Those — and only those — are
+    reconciled, to ``failed`` (never ``done``) with :data:`NO_AGENT_RECORD_
+    REASON`.  See :func:`agent_has_no_record` and
+    :func:`_reconcile_no_agent_record`.
+
+    Three guards, because **this arm reaps** and #1658 is what getting that
+    wrong looks like in production:
+
+    1. :func:`is_attended_session` — attended sessions appear in neither list
+       for their whole life.  Reaping them is the regression that costs real
+       work; :func:`coord.interactive.reap_stale_interactive_sessions` owns
+       them, and it probes tmux rather than guessing.
+    2. An unreachable agent still short-circuits at ``if not status`` above,
+       unweakened.  **No record and no answer are different things.**
+    3. :data:`_NO_RECORD_GRACE_SECONDS` since ``dispatched_at``.
+
+    On **agent restart** (the ``coord agent update`` roll) this is deliberately
+    NOT a mass reap, and not because of the grace window: ``AgentServer.
+    _load_state`` restores the persisted assignments and rewrites every
+    ``pending``/``running`` one to ``failed`` with *"agent restarted;
+    subprocess lost"* before the first ``/status`` is served.  Those rows are
+    therefore IN ``completed``, and the ordinary path above handles them with a
+    real reason.  Genuinely-empty ``active`` + ``completed`` means the agent
+    lost its state file too (fresh install, corrupt state moved aside by
+    #1421's handler) — and there the workers really are gone, so reconciling
+    every row on that machine is the correct answer rather than an accident.
 
     Returns one dict per reconciled assignment (empty when nothing changed).
     """
@@ -182,7 +338,22 @@ def reconcile_completed_assignments(
             None,
         )
         if entry is None:
-            continue  # still active on the agent (or rolled off history) → leave it
+            # #2275: NOT in `completed` has two causes with OPPOSITE correct
+            # handling — "still running on the agent" (leave it) and "the
+            # agent has no record of it at all" (reconcile it).  This used to
+            # be a bare `continue` that named both cases in a comment and
+            # then left both, so a row in the second case was re-skipped every
+            # 30s forever while `status` read `running` (#2208: 8 hours and
+            # both drive attempts burned on an already-green branch).
+            # `agent_has_no_record` tells them apart from the `active` list —
+            # a positive disproof, not an inference from silence.
+            if (
+                agent_has_no_record(status, aid)
+                and not is_attended_session(a)
+                and _no_record_grace_elapsed(a)
+            ):
+                _reconcile_no_agent_record(a, aid, update_state_fn, reconciled)
+            continue
         # #1534: `effective_agent_status` refuses an agent-reported `done`
         # that also carries a usage-limit-kill reason — the daemon's passive
         # tick is the FIRST place most completions are observed, so without
@@ -258,11 +429,23 @@ def reconcile_completed_assignments(
         # was killed for spending, not for hitting a usage limit. Stamping it
         # here is what makes the kill distinguishable from a crash for
         # `coord retry`, the auto-reassign skip below, and the escalation.
+        # #2316: `truncation_reason` is the SAME column again — stamped by
+        # `AgentServer._reap` when a 0-commit clean exit's `stop_reason`
+        # shows the worker was cut off by its output-token ceiling
+        # (`coord.agent._TRUNCATION_STOP_REASONS`) rather than genuinely
+        # finding nothing to do. Never coexists with the other three: it is
+        # only ever set on the SAME `_ahead == 0` branch as the #448 ADVISORY
+        # default (see `AgentServer._reap`'s `elif` chain), which the other
+        # three all preempt before that branch even runs. Without this, a
+        # truncated run lands FAILED with no `failure_reason` recorded —
+        # exactly the "advisory looks the same as this" gap #2316 exists to
+        # close.
         _failure_reason = (
             entry.get("usage_limit_reason")
             or entry.get("api_error_reason")
             or entry.get("push_failure_reason")
             or entry.get("spend_ceiling_reason")
+            or entry.get("truncation_reason")
         )
         _escalate_spend_ceiling_best_effort(a, entry)
         update_state_fn(
@@ -311,6 +494,14 @@ def reconcile_completed_assignments(
         # failure is swallowed so it can't break the reconcile.
         _capture_tokens_best_effort(aid, entry)
 
+        # #2316: capture the raw stop_reason from the /status entry for
+        # EVERY terminal assignment (not just failed ones) — the enabling
+        # persistence step; `_failure_reason` above already carries the
+        # human-readable classification for a truncated run specifically.
+        # Best-effort — any failure is swallowed so it can't break the
+        # reconcile.
+        _capture_stop_reason_best_effort(aid, entry)
+
         reconciled.append(
             {
                 "assignment_id": aid,
@@ -325,8 +516,83 @@ def reconcile_completed_assignments(
     return reconciled
 
 
+def _reconcile_no_agent_record(
+    a: Assignment,
+    aid: str,
+    update_state_fn,
+    reconciled: list[dict],
+) -> None:
+    """#2275: flip a ``running`` row the agent has no record of to ``failed``.
+
+    Called from :func:`reconcile_completed_assignments` only, and only once
+    all three guards there have passed (positive disproof, not attended, past
+    the grace window).
+
+    **``failed``, never ``done``.** This leg never reported a verdict, so the
+    one thing that must not happen is a silent flip to ``done`` — that
+    manufactures a pass and every downstream gate (review dispatch, the
+    acceptance gate, the merge queue) then behaves as if a slice exists that
+    nobody ever produced.  A stall is bad; a manufactured pass is worse.
+    ``failure_reason`` is the pinned :data:`NO_AGENT_RECORD_REASON`, so
+    ``coord status``/the TUI/``coord drive`` all name the cause rather than
+    showing a failure with no explanation.
+
+    ``exit_code`` is deliberately left ``None``: there is no reap, so there is
+    no exit code, and writing a fake one would be the same class of lie as
+    writing ``done``.
+
+    Kept passive, per this module's #1616 contract — it writes state through
+    the same ``update_state_fn`` seam and dispatches nothing.  The ONE thing
+    it does beyond the write is the #1605 Test-stage propagation, which is not
+    a new side effect: it is the same call the ordinary ``terminal ==
+    "failed"`` path already makes, and skipping it would leave the parent
+    work row's ``test_state="running"`` forever — i.e. it would fix half of
+    #2208 and leave the other half stranded.
+    """
+    update_state_fn(
+        assignment_id=aid,
+        terminal_status="failed",
+        branch=a.branch,
+        review_state=None,
+        failure_reason=NO_AGENT_RECORD_REASON,
+        exit_code=None,
+    )
+
+    if a.type == "smoke":
+        # #2275: environmental by construction, so state it rather than
+        # letting `classify_failure` guess.  `NO_AGENT_RECORD_REASON` is
+        # coordinator-authored prose with no wire token in it, so the
+        # classifier would (correctly, by its own "default to work" rule)
+        # call it a WORK failure and record `test_state="failed"` — which
+        # spends a bounded `coord fix` round chasing a code defect that never
+        # existed, on a branch that in #2208's case was already green.  A
+        # vanished worker is the machine's fault, not the work's; clearing
+        # the verdict lets `dispatch_pending_smoke` re-run the Test stage on
+        # its next tick, which is exactly what a human did in 14 minutes.
+        propagate_smoke_terminal_failure(
+            parent_assignment_id=a.review_of_assignment_id,
+            failure_reason=NO_AGENT_RECORD_REASON,
+            environmental=True,
+        )
+
+    reconciled.append(
+        {
+            "assignment_id": aid,
+            "issue_number": a.issue_number,
+            "repo": a.repo_name,
+            "type": a.type,
+            "to_status": "failed",
+            "plan_captured": False,
+            "reason": NO_AGENT_RECORD_REASON,
+        }
+    )
+
+
 def propagate_smoke_terminal_failure(
-    *, parent_assignment_id: str | None, failure_reason: str | None,
+    *,
+    parent_assignment_id: str | None,
+    failure_reason: str | None,
+    environmental: bool | None = None,
 ) -> None:
     """#1605: resolve a work row's ``test_state`` when its Test-stage
     (``type="smoke"``) child dies without ever reporting pass/fail.
@@ -358,6 +624,17 @@ def propagate_smoke_terminal_failure(
       completion already does (`coord/notify.py`'s completion handler), so
       the existing bounded `coord fix` loop picks it up from there.
 
+    *environmental* (#2275) overrides that classification when the CALLER
+    already knows the answer.  Default ``None`` means "classify from
+    *failure_reason*", i.e. every pre-#2275 caller is unchanged.  Pass
+    ``True`` only when the reason is coordinator-authored prose describing a
+    lost worker rather than a worker's own terminal output — the classifier's
+    vocabulary is deliberately restricted to named API/network wire tokens
+    (see :mod:`coord.failure_class`) and correctly defaults everything else to
+    WORK, so a call site that *knows* the machine ate the worker has to say
+    so rather than smuggle a token into its prose.  The only such caller today
+    is :func:`_reconcile_no_agent_record`.
+
     A no-op when *parent_assignment_id* is falsy (a smoke row somehow
     missing its ``review_of_assignment_id`` — should not happen in practice,
     but this must never raise on it).
@@ -365,16 +642,40 @@ def propagate_smoke_terminal_failure(
     if not parent_assignment_id:
         return
     from coord.failure_class import classify_failure  # noqa: PLC0415
-    from coord.state import record_test_verdict  # noqa: PLC0415
+    from coord.smoke import mute_smoke_legs, mute_smoke_tally  # noqa: PLC0415
+    from coord.state import (  # noqa: PLC0415
+        load_assignment_test_reason,
+        record_test_verdict,
+    )
 
     classification = classify_failure(failure_reason=failure_reason)
-    if classification.is_environmental:
+    if environmental is None:
+        is_environmental = classification.is_environmental
+        cause = classification.reason
+    else:
+        is_environmental = bool(environmental)
+        cause = failure_reason or classification.reason
+    if is_environmental:
+        # #2272: this clear must CARRY the mute-leg tally, for exactly the
+        # reason `dispatch_smoke`'s `running` stamp must. `test_reason` is the
+        # only field that survives between Test-stage legs, so any writer that
+        # replaces it wholesale silently hands the row a fresh retry budget —
+        # and a row that alternates "mute leg" / "worker died environmentally"
+        # would then never reach the bound from either side. The tally is not
+        # incremented here (an environmental death is a different, genuinely
+        # self-healing cause and #1605's unbounded re-dispatch of it is
+        # deliberate) — it is only preserved, so mute legs keep counting
+        # across it.
+        carried = mute_smoke_legs(
+            load_assignment_test_reason(parent_assignment_id)
+        )
+        prefix = f"{mute_smoke_tally(carried)} — " if carried else ""
         record_test_verdict(
             assignment_id=parent_assignment_id,
             test_state=None,
             test_reason=(
-                "Test stage worker died environmentally "
-                f"({classification.reason}) — cleared for automatic "
+                f"{prefix}Test stage worker died environmentally "
+                f"({cause}) — cleared for automatic "
                 "re-dispatch, not recorded as a work failure (#1605)"
             ),
         )
@@ -463,6 +764,29 @@ def _capture_tokens_best_effort(assignment_id: str, entry: dict) -> None:
             cache_read_tokens=cache_read_tokens,
         )
     except Exception:  # noqa: BLE001 — never let token capture break the reconcile
+        pass
+
+
+def _capture_stop_reason_best_effort(assignment_id: str, entry: dict) -> None:
+    """#2316: persist the raw ``stop_reason`` from a /status completed entry.
+
+    The agent parses its own log and includes ``stop_reason`` on every
+    terminal ``completed`` entry (``coord.agent.AgentServer.list_assignments``
+    — this predates #2316, only the write path is new). Captured for EVERY
+    terminal assignment, not gated on status, so the column reflects the
+    worker's own last word (``"end_turn"``, ``"length"``, ``"max_tokens"``,
+    ...) regardless of how ``_failure_reason``/the board's ``status``
+    classified the run. Best-effort — any failure is swallowed so it can't
+    break the reconcile.
+    """
+    try:
+        stop_reason = entry.get("stop_reason")
+        if not stop_reason:
+            return
+        from coord.state import update_assignment_stop_reason  # noqa: PLC0415
+
+        update_assignment_stop_reason(assignment_id, stop_reason)
+    except Exception:  # noqa: BLE001 — never let this capture break the reconcile
         pass
 
 
@@ -704,21 +1028,140 @@ def describe_unsupported_retry_type(exc: UnsupportedRetryType) -> str:
     )
 
 
+class RetryProviderMismatch(ValueError):
+    """Raised by :func:`_reassign` when a retry would resolve to a
+    different provider than the failed run it is replacing (#2323).
+
+    A retry that consults ``providers.labels`` can legitimately land on a
+    different provider than *this exact assignment row* if the issue's
+    labels or ``coordinator.yml`` changed between the original dispatch and
+    the retry — but silently substituting the provider is exactly the #1796
+    failure mode one level up: an operator (or an unattended `coord drive`)
+    asking to retry a `harness:opencode` leg is not asking to move it to
+    `claude`, even if that is where today's precedence chain would land.
+    Refuse instead, the same way the #437 TOS gate refuses rather than
+    substitutes a human-attended provider.
+    """
+
+    def __init__(self, failed_provider: str, resolved_provider: str):
+        self.failed_provider = failed_provider
+        self.resolved_provider = resolved_provider
+        super().__init__(
+            f"retry would move this assignment from provider "
+            f"{failed_provider!r} to {resolved_provider!r}"
+        )
+
+
+def describe_retry_provider_mismatch(exc: RetryProviderMismatch) -> str:
+    """Human-readable refusal message for :class:`RetryProviderMismatch`
+    (#2323).
+
+    Mirrors :func:`describe_unsupported_retry_type`'s shape — names both
+    providers and points at the deliberate override an operator who
+    actually wants the move can use.
+    """
+    return (
+        f"refusing retry: the failed run dispatched through provider "
+        f"{exc.failed_provider!r}, but this retry resolves to "
+        f"{exc.resolved_provider!r} — retrying would silently move the "
+        "work onto a different provider (and, for a claude provider, walk "
+        "a model-escalation ladder that has no meaning for the other one). "
+        "If the issue's labels or `providers.labels` changed since the "
+        "original dispatch and the move is intentional, dispatch by hand "
+        "instead: `coord assign --interactive`."
+    )
+
+
+def _resolve_retry_provider(
+    failed: Assignment, config: Config, issue_labels: list[str] | None,
+) -> str:
+    """Resolve (and #437 TOS-guard) the provider a retry of *failed* would
+    dispatch through, refusing if it differs from the provider the failed
+    run itself used (#2323).
+
+    Mirrors a first work dispatch's resolution precedence exactly
+    (``coord.dispatch.dispatch``, ``coord/dispatch.py:548``): spec (always
+    ``None`` here — a retry never carries a fresh per-spec override) ->
+    ``providers.labels`` (gated to ``failed.type == "work"``, the same
+    restriction the first dispatch applies) -> repo default ->
+    ``providers.default``.
+
+    Args:
+        failed: The failed/advisory assignment being retried.
+        config: The coordinator config.
+        issue_labels: The target issue's current GitHub label names, or
+            ``None``/empty when unavailable — falls back to no label match,
+            reproducing pre-#2323 (label-blind) resolution for that one
+            issue rather than raising.
+
+    Returns:
+        The resolved (and TOS-cleared) provider name.
+
+    Raises:
+        ValueError: the #437 TOS gate refuses (the resolved provider is
+            ``human_attended_only``) — same contract
+            :func:`coord.providers.guard_unattended_dispatch` uses.
+        RetryProviderMismatch: the resolved provider differs from
+            ``failed.provider_name`` (falling back to ``"claude"`` for a
+            row dispatched before #324 started recording it).
+    """
+    from coord.providers import guard_unattended_dispatch  # noqa: PLC0415
+
+    repo_for_provider = config.repo(failed.repo_name)
+    # #1889/#2323: providers.labels routes work dispatches by the issue's
+    # harness-eval label — gated to type="work" exactly as the first
+    # dispatch gates it (coord/dispatch.py:548) so a label meant for the
+    # eventual work dispatch never leaks into mock-author/test-author
+    # retries that never saw it on their original dispatch either.
+    provider_issue_labels = issue_labels if failed.type == "work" else None
+    resolved = guard_unattended_dispatch(
+        spec_provider=None,
+        repo_provider=(
+            repo_for_provider.provider if repo_for_provider is not None else None
+        ),
+        providers_cfg=config.providers,
+        models_cfg=config.models,
+        where="auto-reassign (reconcile)",
+        issue_labels=provider_issue_labels,
+    )
+    # #324: None means "dispatched before #324 landed or via a path that
+    # doesn't set this field" — the documented implicit default is "claude".
+    failed_provider = failed.provider_name or "claude"
+    if resolved != failed_provider:
+        raise RetryProviderMismatch(failed_provider, resolved)
+    return resolved
+
+
 def _reassign(
     failed: Assignment, board: Board, config: Config,
     *,
     model: str | None = None,
+    issue_labels: list[str] | None = None,
 ) -> Assignment | None:
     """Re-dispatch a failed assignment to a machine with spare capacity.
 
     *model* overrides the model tier on the retry. When None, the
     original assignment's model is reused (escalation happens at the call
-    site).
+    site — and must only be requested when the retry resolves to the same
+    claude-family provider the failed run used, #2323: the claude
+    escalation ladder means nothing to another provider).
+
+    *issue_labels* (#2323) is the target issue's current GitHub label
+    names, threaded into provider resolution via
+    :func:`_resolve_retry_provider` so ``providers.labels`` is honoured on
+    a retry the same way it is on a first dispatch — without this, every
+    retry fell through to the repo/global default regardless of which
+    label originally routed the issue.
 
     Raises :class:`UnsupportedRetryType` when ``failed.type`` is not in
     :data:`coord.models.WORK_LIKE_TYPES` — a ``smoke``/``review``/other
     non-work row must not be silently re-dispatched as a fresh
     ``type="work"`` worker (#1636).
+
+    Raises :class:`RetryProviderMismatch` (#2323) when the resolved
+    provider differs from the one the failed run actually used — refuses
+    rather than silently moving the work onto a different provider, the
+    #1796 rule applied at dispatch.
     """
     if failed.type not in WORK_LIKE_TYPES:
         raise UnsupportedRetryType(failed.type, failed.review_of_assignment_id)
@@ -737,22 +1180,59 @@ def _reassign(
     def has_room(m: Machine) -> bool:
         return len(running.get(m.name, [])) < _machine_capacity(m, config)
 
+    # #437: STRUCTURAL TOS-COMPLIANCE GATE — auto-reassign is an
+    # unattended dispatch path; refuse to retry through a provider that
+    # opts out of unattended use.  #2323: also resolves through
+    # `providers.labels` (gated to type="work", exactly as a first
+    # dispatch gates it) instead of skipping straight to the repo/global
+    # default, and refuses outright — RetryProviderMismatch, NOT a silent
+    # `return None` — when the resolution disagrees with the provider the
+    # failed run actually used.  A plain TOS ValueError still resolves to
+    # `return None`: skip the reassignment, leaving the failed assignment
+    # for human attention rather than getting silently re-tried on the
+    # wrong provider.  Resolved BEFORE machine selection so the #1711
+    # capability filter below can key off it.
+    try:
+        resolved_provider_name = _resolve_retry_provider(failed, config, issue_labels)
+    except RetryProviderMismatch:
+        raise
+    except ValueError:
+        return None
+
+    # #1711: STRUCTURAL PROVIDER-AVAILABILITY GATE, applied as a candidate
+    # filter — a retry must never route to a machine that hasn't declared
+    # it can run the resolved provider (e.g. an `opencode` retry landing on
+    # a machine with no `provider:opencode` capability), exactly as a first
+    # dispatch refuses that combination (`coord.dispatch.dispatch` →
+    # `guard_provider_machine_capability`). Filtering (rather than raising
+    # on `candidates[0]`) means a fleet where SOME machine declares the
+    # capability still retries there; a fleet where none does falls through
+    # to the "no candidates" `return None`, leaving the row for human
+    # attention — `describe_no_candidate_machines` names the reason.
+    from coord.providers import machine_supports_provider  # noqa: PLC0415
+
+    def can_run_provider(m: Machine) -> bool:
+        return machine_supports_provider(m, resolved_provider_name, config.providers)
+
     candidates = [
         m for m in config.machines
         if m.can_work_on(failed.repo_name)
         and m.repo_path(failed.repo_name) is not None
         and has_room(m)
+        and can_run_provider(m)
         and m.name != failed.machine_name
         and m.name not in paused
     ]
     if not candidates:
         # Fall back to including the same machine that failed last time —
-        # paused machines stay excluded even from the fallback.
+        # paused machines (and #1711 capability-lacking machines) stay
+        # excluded even from the fallback.
         candidates = [
             m for m in config.machines
             if m.can_work_on(failed.repo_name)
             and m.repo_path(failed.repo_name) is not None
             and has_room(m)
+            and can_run_provider(m)
             and m.name not in paused
         ]
     if not candidates:
@@ -760,31 +1240,6 @@ def _reassign(
 
     machine = candidates[0]
     repo_path = machine.repo_path(failed.repo_name)
-
-    # #437: STRUCTURAL TOS-COMPLIANCE GATE — auto-reassign is an
-    # unattended dispatch path; refuse to retry through a provider that
-    # opts out of unattended use.  Resolve precedence with per-repo
-    # override and the global default (the failed assignment doesn't
-    # carry a spec-level provider into this path).  On refusal: skip the
-    # reassignment — the failed assignment stays failed for human
-    # attention rather than getting silently re-tried on the wrong
-    # provider.
-    from coord.providers import guard_unattended_dispatch  # noqa: PLC0415
-    repo_for_provider = config.repo(failed.repo_name)
-    try:
-        guard_unattended_dispatch(
-            spec_provider=None,
-            repo_provider=(
-                repo_for_provider.provider
-                if repo_for_provider is not None
-                else None
-            ),
-            providers_cfg=config.providers,
-            models_cfg=config.models,
-            where="auto-reassign (reconcile)",
-        )
-    except ValueError:
-        return None
 
     retry_model = model if model is not None else failed.model
     # The Assignment keeps the alias for legibility; the wire payload is
@@ -832,6 +1287,18 @@ def _reassign(
         # worker's integration base (the start point / rebase target).
         "branch": retry_default_branch,
     }
+    # #2323: name the resolved provider on the wire the same way a first
+    # dispatch does (`coord.dispatch._wire_payload_needs_provider_field`) —
+    # omitted only for the vanilla, uncustomized "claude" definition so
+    # byte-identical payloads survive for every deployment that never
+    # touches `providers:`. Without this, `resolved_provider_name` above
+    # was resolved (and TOS-guarded, and matched against the failed run)
+    # purely for bookkeeping, and the wire payload silently fell back to
+    # the agent's hardcoded legacy claude spawn path regardless — the exact
+    # bug #2323 reported.
+    from coord.dispatch import _wire_payload_needs_provider_field  # noqa: PLC0415
+    if _wire_payload_needs_provider_field(resolved_provider_name, config):
+        payload["provider"] = resolved_provider_name
     # #1101: continue the failed assignment's actual branch instead of
     # silently forking a fresh one off the repo default — any real work it
     # already committed and pushed must not be orphaned by a retry. Mirrors
@@ -863,6 +1330,12 @@ def _reassign(
         dispatched_at=time.time(),
         type=failed.type,
         model=retry_model,
+        # #2323: record the resolved provider the same way a first dispatch
+        # does (`response.get("_provider_name")` in coord/commands/
+        # dispatch.py) — so the board/TUI and the next retry's own
+        # `_resolve_retry_provider` mismatch check see the provider this
+        # retry actually ran under, not the one the failed row ran under.
+        provider_name=resolved_provider_name,
         # #1101: record the continued branch on the board immediately
         # instead of waiting for a later reconcile backfill from agent
         # /status — the retry payload above already told the agent to
@@ -898,6 +1371,7 @@ def _reassign(
 
 def describe_no_candidate_machines(
     failed: Assignment, board: Board, config: Config,
+    issue_labels: list[str] | None = None,
 ) -> str:
     """Explain why :func:`_reassign` found no candidate machine (#1396).
 
@@ -911,15 +1385,39 @@ def describe_no_candidate_machines(
     reaped, still counted against the machine's capacity.
 
     Mirrors ``_reassign``'s exact candidate filter (repo capability, repo
-    path, pause set, capacity check, same-machine exclusion — #1417 replaced
-    the old binary "any running assignment = busy" rule with a per-machine
-    capacity count against ``machines[].max_workers``/``concurrency.
-    max_workers``) but keeps a reason per excluded machine instead of
-    discarding it, so the message names the blocking machines and what
-    they're apparently running — including the age, which makes a
-    400-hour-old phantom obvious at a glance.
+    path, pause set, capacity check, #1711 provider-capability check,
+    same-machine exclusion — #1417 replaced the old binary "any running
+    assignment = busy" rule with a per-machine capacity count against
+    ``machines[].max_workers``/``concurrency.max_workers``) but keeps a
+    reason per excluded machine instead of discarding it, so the message
+    names the blocking machines and what they're apparently running —
+    including the age, which makes a 400-hour-old phantom obvious at a
+    glance.
+
+    *issue_labels* (#2323) threads the same label list the caller handed
+    ``_reassign``, so the provider this diagnostic resolves (for the #1711
+    capability lines) matches the one the retry actually resolved.
     """
     from coord.machine_pause import paused_set  # noqa: PLC0415
+    from coord.providers import (  # noqa: PLC0415
+        machine_supports_provider,
+        resolve_provider_name,
+    )
+
+    # #1711: resolve the provider the retry would use, so machines that
+    # can't run it are named as such instead of reading as "free". A
+    # resolution failure (unknown provider name in config) degrades to
+    # skipping the capability lines — this is a diagnostic, not a gate.
+    repo_for_capability = config.repo(failed.repo_name)
+    try:
+        provider_for_capability: str | None = resolve_provider_name(
+            None,
+            repo_for_capability.provider if repo_for_capability is not None else None,
+            config.providers,
+            issue_labels=issue_labels if failed.type == "work" else None,
+        )
+    except ValueError:
+        provider_for_capability = None
 
     paused = paused_set(config.machines)
     now = time.time()
@@ -946,6 +1444,18 @@ def describe_no_candidate_machines(
     for m in relevant_machines:
         if m.name in paused:
             lines.append(f"  {m.name}: paused")
+            continue
+        if provider_for_capability is not None and not machine_supports_provider(
+            m, provider_for_capability, config.providers,
+        ):
+            # #1711: mirrors `_reassign`'s capability filter — this machine
+            # never declared it can run the resolved provider, so it was
+            # excluded regardless of load.
+            lines.append(
+                f"  {m.name}: cannot run provider {provider_for_capability!r} "
+                "(no matching capability in coordinator.yml "
+                "machines[].capabilities)"
+            )
             continue
         running = running_by_machine.get(m.name, [])
         cap = _machine_capacity(m, config)
@@ -1126,6 +1636,10 @@ def _record_usage_limit_reason(assignment_id: str | None, entry: dict) -> None:
         # mutual exclusivity as the three above (see the identical chain in
         # `reconcile_completed_assignments`).
         or entry.get("spend_ceiling_reason")
+        # #2316: a truncated (output-token-ceiling) 0-commit run. Same
+        # column, same mutual exclusivity — see the identical chain in
+        # `reconcile_completed_assignments`.
+        or entry.get("truncation_reason")
     )
     if not reason or not assignment_id:
         return
@@ -1459,7 +1973,26 @@ def reconcile(board: Board, config: Config) -> list[str]:
                 getattr(failed_a, "failure_reason", None)
             ):
                 continue
-            reassigned = _reassign(failed_a, board, config)
+            # #2323: thread the issue's cached labels through so
+            # auto-reassign resolves `providers.labels` the same way a
+            # first dispatch (and `coord retry`) does — best-effort local
+            # cache read (never a GitHub call from this passive tick); an
+            # uncached issue falls back to label-blind resolution, same as
+            # passing `None`.
+            from coord.state import get_cached_issue_labels  # noqa: PLC0415
+
+            cached_labels = get_cached_issue_labels(
+                failed_a.repo_name, failed_a.issue_number,
+            )
+            try:
+                reassigned = _reassign(
+                    failed_a, board, config, issue_labels=cached_labels,
+                )
+            except RetryProviderMismatch:
+                # Refuse rather than substitute (#2323) — leave the failed
+                # assignment for human attention (`coord retry`) instead of
+                # silently auto-moving it to a different provider.
+                continue
             if reassigned is not None and reassigned.assignment_id is not None:
                 changed.append(reassigned.assignment_id)
 

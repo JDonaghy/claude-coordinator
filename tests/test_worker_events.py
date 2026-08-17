@@ -98,6 +98,50 @@ def _rate_limit_event(
     }
 
 
+def _opencode_tool_use_event(
+    tool: str, tool_input: dict, *, session_id: str = "ses_test", status: str = "completed"
+) -> dict:
+    """opencode's real ``tool_use`` wire shape (#2315): the tool name and its
+    input live nested under ``part``/``part.state.input``, not at the
+    top-level keys claude's stream-json uses — see
+    ``tests/fixtures/opencode_run_sample.jsonl`` for a verbatim capture of
+    the same shape."""
+    return {
+        "type": "tool_use",
+        "sessionID": session_id,
+        "part": {
+            "type": "tool",
+            "tool": tool,
+            "state": {"status": status, "input": tool_input},
+        },
+    }
+
+
+def _opencode_step_finish_event(
+    reason: str,
+    *,
+    output_tokens: int = 10,
+    cost: float = 0.0,
+    session_id: str = "ses_test",
+) -> dict:
+    """opencode's real ``step_finish`` wire shape (#2315): one per completed
+    turn/step, ``part.reason`` is ``"tool-calls"`` for every turn but the
+    last."""
+    return {
+        "type": "step_finish",
+        "sessionID": session_id,
+        "part": {
+            "reason": reason,
+            "tokens": {
+                "input": 5,
+                "output": output_tokens,
+                "cache": {"write": 0, "read": 0},
+            },
+            "cost": cost,
+        },
+    }
+
+
 # ── parse_event ────────────────────────────────────────────────────────────
 
 
@@ -558,6 +602,171 @@ class TestRender:
         # The assistant turn carries a tool_use rather than text, so it
         # should be summarised as either text or tool_use=Bash.
         assert any("result" in l for l in lines)
+
+
+# ── opencode rendering (#2315) ───────────────────────────────────────────
+#
+# `coord log` rendered an opencode worker's NDJSON through the claude-only
+# schema, dropping the tool name, the step_finish payload (reason/tokens/
+# cost), and any terminal stop-reason line. These tests pin the fix at the
+# `render_event` level — the same function `coord log` calls per line for
+# both providers — using opencode's REAL wire shape (nested under `part`,
+# see `tests/fixtures/opencode_run_sample.jsonl`), not claude's.
+
+
+class TestOpenCodeRendering:
+    def test_bash_tool_use_resolves_name_and_command_from_nested_part(self) -> None:
+        """#2315: opencode's tool name/command live at `part.tool` /
+        `part.state.input.command`, not any top-level key — previously this
+        rendered the useless `[tool] ?`."""
+        e = parse_event(json.dumps(_opencode_tool_use_event("bash", {"command": "git status"})))
+        out = render_event(e)
+        assert out is not None
+        assert "[tool] ?" not in out
+        assert "bash" in out
+        assert "git status" in out
+
+    def test_edit_tool_use_resolves_file_path_from_nested_part(self) -> None:
+        """#2315: opencode's edit/write tool input carries `filePath`
+        (camelCase) nested under `part.state.input`, and the tool name
+        itself is lowercase (`edit`, not `Edit`)."""
+        e = parse_event(
+            json.dumps(_opencode_tool_use_event("edit", {"filePath": "/tmp/math_utils.py"}))
+        )
+        out = render_event(e)
+        assert out is not None
+        assert "[tool] ?" not in out
+        assert "edit" in out
+        assert "/tmp/math_utils.py" in out
+
+    def test_write_tool_use_resolves_file_path(self) -> None:
+        e = parse_event(
+            json.dumps(_opencode_tool_use_event("write", {"filePath": "/tmp/new_file.py"}))
+        )
+        out = render_event(e)
+        assert out is not None
+        assert "write" in out
+        assert "/tmp/new_file.py" in out
+
+    def test_non_bash_tool_still_renders_name_only(self) -> None:
+        """A tool with no dedicated branch (e.g. opencode's `glob`/`read`)
+        still resolves its name from the nested `part` and doesn't crash on
+        the missing input — it just has no extra detail to show."""
+        e = parse_event(
+            json.dumps(_opencode_tool_use_event("glob", {"pattern": "**/math_utils.py"}))
+        )
+        out = render_event(e)
+        assert out == "[tool] glob"
+
+    def test_step_finish_intermediate_reason_has_no_terminal_line(self) -> None:
+        """A `step_finish` with `reason="tool-calls"` is not the run's last
+        step (opencode always follows it with another `step_start`), so no
+        `[result]` line should be appended."""
+        e = parse_event(
+            json.dumps(_opencode_step_finish_event("tool-calls", output_tokens=48, cost=0.0))
+        )
+        out = render_event(e)
+        assert out is not None
+        assert out == "[step_finish] reason=tool-calls out=48 $0.000"
+        assert "[result]" not in out
+
+    def test_step_finish_stop_reason_appends_terminal_result_line(self) -> None:
+        """A `step_finish` with `reason="stop"` is opencode's normal
+        completion signal — the last step of a successful run — and must
+        get the `[result] stop=...` line claude gets from its own `result`
+        event, since opencode never emits one (#2315)."""
+        e = parse_event(
+            json.dumps(_opencode_step_finish_event("stop", output_tokens=19, cost=0.02))
+        )
+        out = render_event(e)
+        assert out is not None
+        lines = out.split("\n")
+        assert lines[0] == "[step_finish] reason=stop out=19 $0.020"
+        assert lines[1] == "[result] stop=stop, $0.020"
+
+    def test_step_finish_length_reason_is_diagnostic_and_terminal(self) -> None:
+        """#2315's own reproduction case: the model spends its whole output
+        budget reasoning and is cut off (`reason="length"`) before it ever
+        calls a tool. This is the single most diagnostic line in the log and
+        must be impossible to miss — both the raw reason/tokens/cost and a
+        terminal `stop=length` line."""
+        e = parse_event(
+            json.dumps(_opencode_step_finish_event("length", output_tokens=32000, cost=0.145))
+        )
+        out = render_event(e)
+        assert out is not None
+        assert "reason=length" in out
+        assert "out=32000" in out
+        assert "$0.145" in out
+        assert "[result] stop=length" in out
+
+    def test_step_finish_missing_fields_render_placeholders_not_crash(self) -> None:
+        """A `step_finish` with no `part` at all (or a malformed one) must
+        never raise — it renders `?` placeholders, same policy as every
+        other defensive accessor in this module."""
+        e = parse_event(json.dumps({"type": "step_finish"}))
+        out = render_event(e)
+        assert out == "[step_finish] reason=? out=? $?"
+
+    def test_claude_bash_tool_use_unaffected(self) -> None:
+        """Byte-identical regression guard: claude's `Bash` (capitalized,
+        top-level `name`/`input`) must render exactly as before — the
+        opencode fallback must never shadow it."""
+        e = parse_event(json.dumps(_tool_use_event("Bash", {"command": "git push origin HEAD"})))
+        out = render_event(e)
+        assert out == "[tool] Bash: git push origin HEAD"
+
+    def test_claude_edit_tool_use_unaffected(self) -> None:
+        e = parse_event(json.dumps(_tool_use_event("Edit", {"file_path": "coord/cli.py"})))
+        out = render_event(e)
+        assert out == "[tool] Edit: coord/cli.py"
+
+    def test_success_fixture_renders_every_tool_name_and_a_terminal_stop_line(self) -> None:
+        """End-to-end over `opencode_run_sample.jsonl` (#1703's verbatim
+        successful capture): every tool call must resolve a real name — no
+        `[tool] ?` anywhere — and the log must end with a stop reason, which
+        it never did before #2315."""
+        fixture = Path(__file__).parent / "fixtures" / "opencode_run_sample.jsonl"
+        assert fixture.exists(), "opencode_run_sample.jsonl fixture is missing"
+        lines = list(render_log(fixture))
+        assert not any("[tool] ?" in l for l in lines)
+        # The fixture's tool calls, in order, are glob -> read -> edit; the
+        # first two have no dedicated branch (name-only), edit resolves its
+        # `filePath`.
+        assert any(l == "[tool] glob" for l in lines)
+        assert any(l == "[tool] read" for l in lines)
+        assert any(
+            l.startswith("[tool] edit:") and "math_utils.py" in l for l in lines
+        )
+        assert any("[result] stop=stop" in l for l in lines)
+
+    def test_failure_fixture_has_no_spurious_terminal_line(self) -> None:
+        """`opencode_run_failure_sample.jsonl` (#1703's verbatim failing
+        capture) has exactly one `step_finish`, with `reason="tool-calls"`
+        — not terminal — followed by a top-level `error` event instead. No
+        `[result] stop=...` line must appear for it; the fixture predates
+        this issue's scope of fixing the `error` event's own rendering."""
+        fixture = Path(__file__).parent / "fixtures" / "opencode_run_failure_sample.jsonl"
+        assert fixture.exists(), "opencode_run_failure_sample.jsonl fixture is missing"
+        lines = list(render_log(fixture))
+        assert not any("[result]" in l for l in lines)
+        assert any(l == "[step_finish] reason=tool-calls out=56 $0.000" for l in lines)
+
+    def test_length_fixture_surfaces_the_diagnostic_line(self) -> None:
+        """The #2315 reproduction fixture: a truncated reasoning-only final
+        step (no tool call between its `step_start` and `step_finish`).
+        `coord log` must show a resolved bash tool name for the earlier
+        step AND the diagnostic `reason=length`/`out=32000`/cost line AND a
+        terminal stop line — none of which rendered before this fix."""
+        fixture = Path(__file__).parent / "fixtures" / "opencode_run_length_sample.jsonl"
+        assert fixture.exists(), "opencode_run_length_sample.jsonl fixture is missing"
+        lines = list(render_log(fixture))
+        assert not any("[tool] ?" in l for l in lines)
+        assert any(l.startswith("[tool] bash:") and "git status" in l for l in lines)
+        assert any(
+            l.startswith("[step_finish] reason=length out=32000 $0.145") for l in lines
+        )
+        assert any("[result] stop=length" in l for l in lines)
 
 
 # ── format_important_event ───────────────────────────────────────────────

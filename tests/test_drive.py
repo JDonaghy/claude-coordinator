@@ -4922,6 +4922,84 @@ def test_a_dispatch_refusals_reason_reaches_the_drive_exited_audit_row(
     assert refusal_text in rows[1]["summary"]
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# #2274: a non-refusal RUN-action failure (`coord assign` dying for a reason
+# that is NOT the deterministic EXIT_DISPATCH_REFUSED — an API blip, a bad
+# briefing file, a stack trace) used to discard the child's own captured
+# stdout+stderr entirely, raising a bare "coord assign ... exited 1". That
+# string — with zero diagnostic content — is what `drive_queue.last_reason`
+# and `drive_escalations.reason` are stuck showing forever once the tmux
+# session is gone (quadraui#508, coord-portal#83: ~20 minutes spent
+# diagnosing a parked entry, ending only by re-running the command by hand).
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def test_a_non_refusal_run_failure_carries_the_childs_captured_output(
+    driver_factory, monkeypatch,
+):
+    driver = driver_factory([board(status="failed", failure_reason="boom")])
+    failure_text = "Traceback (most recent call last):\nValueError: no such machine 'elitebook'"
+
+    def failing_run(argv, **kw):
+        return subprocess.CompletedProcess(argv, 1, "", failure_text)
+
+    monkeypatch.setattr("coord.drive.subprocess.run", failing_run)
+    with pytest.raises(DriveError) as exc:
+        driver.run()
+    assert exc.value.exit_code == EXIT_TERMINAL_FAILURE
+    # The action's own header (static, chosen when the Action was built) is
+    # still there, but the child's own diagnostic text is now attached too —
+    # the whole point.
+    message = str(exc.value)
+    assert message != failure_text  # a header still leads
+    assert failure_text in message
+
+
+def test_a_non_refusal_run_failures_output_reaches_the_drive_exited_audit_row(
+    driver_factory, monkeypatch, coord_db,
+):
+    """Same end-to-end path as the dispatch-refusal audit test above: the
+    captured output must survive into the `drive_exited` row's `summary` —
+    the ONE thing `coord/drive_queue.py`'s `_fetch_exit_reasons` can read
+    once the tmux session and its scrollback are gone."""
+    driver = driver_factory([board(status="failed", failure_reason="boom")])
+    failure_text = "assign: dispatch to elitebook failed: connection refused"
+
+    def failing_run(argv, **kw):
+        return subprocess.CompletedProcess(argv, 1, "", failure_text)
+
+    monkeypatch.setattr("coord.drive.subprocess.run", failing_run)
+    with pytest.raises(DriveError):
+        driver.run()
+
+    rows = _drive_audit_rows(coord_db)
+    assert [r["event_type"] for r in rows] == ["drive_started", "drive_exited"]
+    assert failure_text in rows[1]["summary"]
+
+
+def test_a_non_refusal_run_failures_output_is_bounded(driver_factory, monkeypatch):
+    """#2274 asks for "a bounded tail ... a few KB is plenty" — this sits in
+    a DB column the tick reads on every poll, not a log file. A runaway
+    stderr (a giant repeated traceback, a misbehaving child dumping a whole
+    file) must not blow that column up without limit."""
+    from coord.drive import _CAPTURED_OUTPUT_LIMIT
+
+    driver = driver_factory([board(status="failed", failure_reason="boom")])
+    huge = "E" * (_CAPTURED_OUTPUT_LIMIT * 5) + "TAIL_MARKER_END"
+
+    def failing_run(argv, **kw):
+        return subprocess.CompletedProcess(argv, 1, "", huge)
+
+    monkeypatch.setattr("coord.drive.subprocess.run", failing_run)
+    with pytest.raises(DriveError) as exc:
+        driver.run()
+    message = str(exc.value)
+    # The tail (where the actionable line lives) survives...
+    assert "TAIL_MARKER_END" in message
+    # ...but the captured blob itself is nowhere near the full 5x size.
+    assert len(message) < _CAPTURED_OUTPUT_LIMIT * 2
+
+
 def test_a_warn_on_error_action_keeps_looping(driver_factory, monkeypatch, capsys):
     """A failing `coord merge` is "try again next poll", not an abort."""
     payload = board(status="done", test_state="passed")

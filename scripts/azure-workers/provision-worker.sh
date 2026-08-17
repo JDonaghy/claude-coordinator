@@ -22,7 +22,7 @@ NODE_MAJOR="22"
 OPENCODE_VERSION="1.18.11"    # pinned to match the standing fleet -- see #1777
 RUST_HOME="/opt/rust"
 CARGO_TARGET_SEED="/opt/cargo-target-seed"
-REPOS=(claude-coordinator quadraui vimcode)
+REPOS=(code-coordinator quadraui vimcode)
 GITHUB_ORG="JDonaghy"
 
 WITH_GTK=0; WITH_BROWSER=0; SEED_CARGO_TARGET=0
@@ -165,14 +165,14 @@ done
 
 # Warm the crate registry: the dominant cold-start cost is fetching hundreds of
 # crate sources, not compiling them.
-for repo in claude-coordinator quadraui vimcode; do
+for repo in code-coordinator quadraui vimcode; do
     as_coord "cd ~/src/${repo} && [ -f Cargo.toml -o -f tui/Cargo.toml ] && cargo fetch --locked 2>/dev/null || true"
 done
-as_coord "cd ~/src/claude-coordinator/tui 2>/dev/null && cargo fetch --locked || true"
+as_coord "cd ~/src/code-coordinator/tui 2>/dev/null && cargo fetch --locked || true"
 
 # Warm pip + npm caches for the coordinator's own dev/test deps.
 as_coord "~/.coord-venv/bin/pip download -q -d /tmp/wheelwarm 'code-coordinator[dev]' 2>/dev/null || true; rm -rf /tmp/wheelwarm"
-as_coord "cd ~/src/claude-coordinator/coord/dashboard/webapp && npm ci --prefer-offline 2>/dev/null || true"
+as_coord "cd ~/src/code-coordinator/coord/dashboard/webapp && npm ci --prefer-offline 2>/dev/null || true"
 
 if [[ $SEED_CARGO_TARGET -eq 1 ]]; then
     # Opt-in: bake a compiled target/ so the first cargo build is incremental.
@@ -180,7 +180,7 @@ if [[ $SEED_CARGO_TARGET -eq 1 ]]; then
     # needs a larger OS disk. Boot copies it onto the free local NVMe.
     log "8b/9  seeding compiled cargo target (large)"
     install -d -o "$COORD_USER" "$CARGO_TARGET_SEED"
-    as_coord "cd ~/src/claude-coordinator/tui && CARGO_TARGET_DIR=$CARGO_TARGET_SEED cargo build || true"
+    as_coord "cd ~/src/code-coordinator/tui && CARGO_TARGET_DIR=$CARGO_TARGET_SEED cargo build || true"
     du -sh "$CARGO_TARGET_SEED" || true
 fi
 

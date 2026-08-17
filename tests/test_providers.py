@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -52,6 +53,7 @@ from coord.providers.claude import ClaudeProvider
 from coord.providers.opencode import (
     AGENTS_ROOT,
     DEFAULT_OPENCODE_BINARY,
+    OUTPUT_TOKEN_MAX_DEFAULT,
     RESULT_MARKER,
     ROUTING_PIN_PATH,
     OpenCodeAgentNotFoundError,
@@ -240,6 +242,52 @@ def test_custom_binary() -> None:
     spec = _make_spec(type="work")
     result = ClaudeProvider(binary="my-claude").build_command(spec)
     assert result[0] == "my-claude"
+
+
+# ── #2301: the smoke branch, across every call site of the same logic ────────
+
+
+def test_claude_build_command_smoke_matches_legacy_and_withholds_monitor() -> None:
+    """#2301: ``spec.type == "smoke"`` gets ``SMOKE_SYSTEM_PROMPT`` and
+    ``Read,Bash`` only.
+
+    ``Monitor`` is deliberately withheld: it is an await-a-notification tool,
+    so calling it ends the turn — and a smoke leg is a one-shot ``claude -p``
+    session (#1394), where ending the turn ends the session permanently,
+    before any wake-up can arrive. Edit/Write are withheld too (a smoke leg
+    validates; it never mutates). This must stay in parity with
+    ``default_worker_command`` — the same logic lives at three call sites and
+    #2169 already shipped a drift where only some were updated.
+    """
+    from coord.smoke import SMOKE_SYSTEM_PROMPT
+
+    spec = _make_spec(type="smoke")
+    argv = ClaudeProvider().build_command(spec)
+    legacy = default_worker_command(spec)
+    sp = argv[argv.index("--system-prompt") + 1]
+    at = argv[argv.index("--allowedTools") + 1]
+    assert sp == legacy[legacy.index("--system-prompt") + 1]
+    assert at == legacy[legacy.index("--allowedTools") + 1]
+    # Pin the values too, so a *matched* regression on both sides still fails.
+    assert sp.startswith(SMOKE_SYSTEM_PROMPT)
+    assert at == "Read,Bash"
+    assert "Monitor" not in at.split(",")
+
+
+def test_claude_build_command_smoke_honours_explicit_system_prompt() -> None:
+    """#2301: the smoke branch still respects ``spec.system_prompt`` (the
+    dispatcher's per-run prompt) instead of always forcing the default."""
+    argv = ClaudeProvider().build_command(
+        _make_spec(type="smoke", system_prompt="custom smoke prompt")
+    )
+    assert argv[argv.index("--system-prompt") + 1].startswith("custom smoke prompt")
+
+
+def test_claude_build_command_work_still_grants_monitor() -> None:
+    """Scope check for #2301: withholding Monitor from smoke must not have
+    taken it away from the generic worker branch (#2169's grant)."""
+    argv = ClaudeProvider().build_command(_make_spec(type="work"))
+    assert "Monitor" in argv[argv.index("--allowedTools") + 1].split(",")
 
 
 # ── #1706: definition model / env / extra_args threading ──────────────────────
@@ -1492,6 +1540,39 @@ def test_opencode_env_definition_cannot_shadow_config_dir() -> None:
     assert env["OPENCODE_CONFIG"] == str(ROUTING_PIN_PATH)
 
 
+def test_opencode_env_sets_output_token_max_default() -> None:
+    """#2321: env() always seeds OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX to
+    OUTPUT_TOKEN_MAX_DEFAULT, even with no ProviderDef.env configured —
+    without this every opencode worker is silently capped at opencode's
+    32,000-token default, shared with reasoning-model thinking tokens."""
+    env = OpenCodeProvider().env()
+    assert env["OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX"] == str(OUTPUT_TOKEN_MAX_DEFAULT)
+
+
+def test_opencode_env_output_token_max_is_positive_integer_string() -> None:
+    """Sanity: the default itself must satisfy opencode's own parser rule
+    (integer, > 0, no extra characters) or every dispatch would silently
+    fall back to 32000 — the exact failure mode #2321 exists to end."""
+    value = OpenCodeProvider().env()["OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX"]
+    assert value.isdigit()
+    assert int(value) > 0
+
+
+def test_opencode_env_output_token_max_operator_override_wins() -> None:
+    """#2321: unlike OPENCODE_CONFIG_DIR/OPENCODE_CONFIG, this variable IS
+    operator-overridable — it's a tuning knob (e.g. to cap cost), not a
+    safety mechanism, so a ProviderDef.env entry must win over the
+    built-in default."""
+    provider = OpenCodeProvider(
+        env={"OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX": "50000"}
+    )
+    env = provider.env()
+    assert env["OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX"] == "50000"
+    # And the non-overridable variables are still coord-controlled.
+    assert env["OPENCODE_CONFIG_DIR"] == str(AGENTS_ROOT)
+    assert env["OPENCODE_CONFIG"] == str(ROUTING_PIN_PATH)
+
+
 # ── parse_log ─────────────────────────────────────────────────────────────────
 
 
@@ -2107,6 +2188,139 @@ def test_resolve_default_provider_opencode_allowed() -> None:
     assert isinstance(provider, OpenCodeProvider)
 
 
+# ── #2317: incremental-write instructions in work.md ────────────────────────
+#
+# opencode hard-caps every request's output tokens, shared with the model's
+# own reasoning on reasoning models. The exact ceiling is an
+# operator-tunable environment variable (see #2321) rather than a fixed
+# number, so these checks deliberately avoid pinning one — truncation can
+# happen at any budget size, it's just rarer at a higher ceiling. A worker
+# that designs the whole change before its first `write` can burn the
+# entire budget on reasoning and be truncated before it emits a single tool
+# call: a clean exit, zero commits, nothing on disk (space-invaders#1,
+# `8c95182b0749`). These are plain static-content checks on work.md's own
+# text — no real opencode binary required — that pin the instructions added
+# to head this off at the pass.
+
+
+def _opencode_work_md_text() -> str:
+    return (AGENTS_ROOT / "agents" / "work.md").read_text()
+
+
+def test_opencode_work_md_instructs_incremental_writes() -> None:
+    """work.md must tell the worker to write each file as soon as its
+    content is decided, instead of planning the whole change first — the
+    core fix for #2317."""
+    text = _opencode_work_md_text()
+    assert "incrementally" in text.lower()
+    assert "output-token budget" in text.lower() or "output budget" in text.lower()
+    assert "32,000" not in text
+    assert "do not" in text.lower() or "do NOT" in text
+
+
+def test_opencode_work_md_explains_truncation_loses_unwritten_work() -> None:
+    """The instruction must say *why* — a truncated turn emits no tool
+    call, so unwritten work is lost outright, not just delayed. #2317 asked
+    for this reasoning to be spelled out, not just asserted as a bare rule,
+    on the theory that a model that understands the mechanism holds the
+    line better than one following a rule it doesn't understand."""
+    text = _opencode_work_md_text()
+    assert "truncat" in text.lower()
+    assert "tool call" in text.lower()
+
+
+def test_opencode_work_md_forbids_compound_bash_commands() -> None:
+    """work.md's own permission block prefix-matches the whole bash command
+    string, so a compound command like `pwd && git status` matches no
+    `allow` entry and is denied outright (this burned the first turn of
+    claude-coordinator space-invaders#1). The instructions must tell the
+    worker to issue one command per `bash` call."""
+    text = _opencode_work_md_text()
+    assert "one command per" in text.lower()
+    assert "&&" in text
+
+
+def test_opencode_work_md_warns_denial_reprints_full_ruleset() -> None:
+    """A denied bash/edit call returns the entire permission ruleset back
+    to the model — noisy and more than it needs. work.md should tell the
+    worker not to probe for what's allowed and instead work within the
+    documented allow list the first time."""
+    text = _opencode_work_md_text()
+    assert "ruleset" in text.lower() or "permission list" in text.lower()
+
+
+def _opencode_work_md_bash_allow_prefixes() -> list[str]:
+    """The ``allow``-ed ``bash`` rule keys from work.md's frontmatter, with
+    the trailing ``*`` glob stripped.
+
+    Parsed with a line regex rather than a YAML load so the test keeps
+    working without pulling PyYAML into the test module's imports — the
+    block is a flat ``  "<pattern>": <decision>`` mapping, so nothing
+    subtler is warranted.
+    """
+    text = _opencode_work_md_text()
+    frontmatter = text.split("---")[1]
+    bash_block = frontmatter.split("bash:", 1)[1].split("edit:", 1)[0]
+    prefixes = []
+    for line in bash_block.splitlines():
+        match = re.match(r'\s*"(.+?)"\s*:\s*allow\s*$', line)
+        if match:
+            prefixes.append(match.group(1).rstrip("*").strip())
+    return prefixes
+
+
+def _opencode_work_md_allow_prefixes_sanity() -> list[str]:
+    prefixes = _opencode_work_md_bash_allow_prefixes()
+    # If this trips, the frontmatter parse broke, not the prose — without it
+    # the "documented" assertion below would pass vacuously on zero rules.
+    assert len(prefixes) >= 10, prefixes
+    return prefixes
+
+
+def test_opencode_work_md_documents_the_bash_allow_list() -> None:
+    """#2317: the cheapest way to stop denials from replaying the whole
+    ruleset back into the output-token budget is to stop the worker from
+    *earning* a denial — so the prompt body must name every allowed command
+    up front rather than leaving the agent to discover the list by probing.
+
+    Every ``allow``-ed rule in the frontmatter has to be mentioned in the
+    prose below it. Guards the two halves from drifting apart: adding a
+    carve-out to the permission block without telling the agent it exists
+    wastes the carve-out.
+    """
+    prefixes = _opencode_work_md_allow_prefixes_sanity()
+    body = _opencode_work_md_text().split("---", 2)[2]
+    missing = [p for p in prefixes if p not in body]
+    assert not missing, f"allow rules not documented in the prompt body: {missing}"
+
+
+def test_opencode_work_md_run_separately_examples_are_actually_allowed() -> None:
+    """The "one command per bash call" rule demonstrates itself with a
+    ``Run `x`, then separately `y`.`` example. Those example commands must
+    themselves survive the frontmatter allow list.
+
+    This is a real regression: the first draft of the #2317 text used
+    ``Run `pwd`, then separately `git status``` — but ``pwd`` matches no
+    allow rule and is swallowed by the ``"*": deny`` baseline, so following
+    the example verbatim earns exactly the denial the rule exists to
+    prevent, and replays the whole ruleset into the worker's budget.
+    """
+    body = _opencode_work_md_text().split("---", 2)[2]
+    sentence = re.search(r"Run `.+?\.\s", body, re.DOTALL)
+    assert sentence, "work.md lost its 'Run `x`, then separately `y`' example"
+    examples = re.findall(r"`([^`]+)`", sentence.group(0))
+    assert examples, "the example sentence names no commands"
+
+    prefixes = _opencode_work_md_allow_prefixes_sanity()
+    for command in examples:
+        assert any(
+            command.startswith(prefix) for prefix in prefixes
+        ), (
+            f"work.md tells the worker to run {command!r}, "
+            f"which its own permission block denies"
+        )
+
+
 # ── #1705: real end-to-end enforcement proof ────────────────────────────────
 #
 # Everything above this line tests coord's OWN code (argv construction, env
@@ -2331,6 +2545,60 @@ def test_opencode_work_agent_blocks_gh_end_to_end(tmp_path: Path) -> None:
     for call in gh_calls:
         state = call["part"]["state"]
         assert state.get("status") == "error", f"gh call was not blocked: {call}"
+        assert "permission" in str(state.get("error", "")).lower()
+
+
+@_requires_real_opencode
+def test_opencode_work_agent_deny_baseline_blocks_offlist_git_end_to_end(
+    tmp_path: Path,
+) -> None:
+    """PROOF for the ``"*": deny`` baseline itself: an off-allow-list
+    command is blocked inside a real opencode process even when nothing in
+    work.md's prose singles it out as forbidden.
+
+    Companion to ``test_opencode_work_agent_blocks_gh_end_to_end``, added
+    with #2317. That test probes with ``gh --version``, which work.md's
+    prose *also* forbids in as many words ("Do NOT run gh commands"), so
+    the model increasingly refuses on the advisory alone and the run
+    observes no enforcement — ``_require_attempt`` skips. #2317 made that
+    worse on purpose: documenting the allow list up front (so the worker
+    stops burning output-token budget earning denials that replay the whole
+    ruleset) means the model can now rule ``gh`` out without trying it.
+
+    ``git fetch origin`` restores an observable probe. It is denied purely
+    by the catch-all — ``git fetch*`` is on no ``allow`` line, while ten
+    other ``git *`` rules are — but reads as an ordinary, sanctioned step
+    rather than something the instructions call out, so the model attempts
+    it. If a future edit adds ``"git fetch*": allow``, this test's premise
+    is gone; the assertion below fails loudly rather than skipping, so
+    that edit can't pass unnoticed.
+    """
+    assert not any(
+        "git fetch".startswith(prefix)
+        for prefix in _opencode_work_md_bash_allow_prefixes()
+    ), "work.md now allows `git fetch` — this test needs a different off-list probe"
+
+    repo = _init_oc_throwaway_repo(tmp_path)
+    events = _run_real_opencode_work(
+        repo,
+        "Run 'git fetch origin' via bash and tell me the output.",
+    )
+    fetch_calls = [
+        e
+        for e in _bash_tool_calls(events)
+        if e["part"]
+        .get("state", {})
+        .get("input", {})
+        .get("command", "")
+        .strip()
+        .startswith("git fetch")
+    ]
+    _require_attempt(events, fetch_calls, "'git fetch origin' via bash")
+    for call in fetch_calls:
+        state = call["part"]["state"]
+        assert (
+            state.get("status") == "error"
+        ), f"off-list git call was not blocked: {call}"
         assert "permission" in str(state.get("error", "")).lower()
 
 
