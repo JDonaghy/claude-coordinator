@@ -4595,6 +4595,22 @@ impl CoordApp {
                 false
             }
 
+            // #2282 (ms-65 §2e rule 3): a physical double click reaches
+            // `AppLogic` as `MouseDown` followed by `UiEvent::DoubleClick` —
+            // quadraui's `DoubleClickDetector` REPLACES the second `MouseDown`
+            // rather than adding to it. Without this arm the second half of the
+            // gesture was dropped on the floor, so nothing in the app could
+            // ever distinguish a double click from a single one.
+            UiEvent::DoubleClick { position, .. } => {
+                let pos = *position;
+                if ctx.in_sidebar(pos.x, pos.y) {
+                    if let Some(sidebar_b) = ctx.sidebar_bounds() {
+                        return self.mouse_sidebar_click(event, pos, sidebar_b, backend);
+                    }
+                }
+                false
+            }
+
             UiEvent::Scroll {
                 position, delta, ..
             } => {
@@ -5006,6 +5022,15 @@ impl CoordApp {
                         } else {
                             // path.len() == 2: issue row — reset detail scroll.
                             self.detail_scroll = 0;
+                            // #2282 (ms-65 §2e rules 1/2/4): a single click on
+                            // an issue row opens it in a PREVIEW tab — already
+                            // open → activate; a preview exists → replace it in
+                            // place; otherwise append. The sidebar has already
+                            // moved its selection to the clicked row by now, so
+                            // `board_selected_issue` names the clicked issue.
+                            if let Some(key) = self.board_selected_issue() {
+                                self.open_board_doc_tab(key, false);
+                            }
                         }
                         true
                     }
@@ -5049,6 +5074,28 @@ impl CoordApp {
                         } else {
                             // path.len() == 2: issue row activate — reset detail scroll.
                             self.detail_scroll = 0;
+                            // #2282 (ms-65 §2e rule 3): a double click (which
+                            // `SidebarSystem` reports as RowActivated) is
+                            // open-or-activate followed by PROMOTION — the tab
+                            // drops `is_preview` and stops being the
+                            // replaceable slot.
+                            //
+                            // …but only when the row really is the one the
+                            // gesture started on. A genuine double click always
+                            // arrives as `MouseDown` (RowSelected, which has
+                            // just opened and activated the row) *followed by*
+                            // `DoubleClick`, so at this point the row is the
+                            // active document by construction. When it is not,
+                            // the event is a plain second single click on a
+                            // DIFFERENT row that the TUI backend's 400 ms /
+                            // 1.5-cell `DoubleClickDetector` folded into a
+                            // `DoubleClick` — the user meant two single clicks,
+                            // so honour rule 1 (open a preview) rather than
+                            // silently pinning a tab they never double-clicked.
+                            if let Some(key) = self.board_selected_issue() {
+                                let pin = self.board_doc_active_key() == Some(&key);
+                                self.open_board_doc_tab(key, pin);
+                            }
                         }
                         true
                     }
@@ -5518,10 +5565,46 @@ impl CoordApp {
             }
         }
         if self.active_view == SidebarView::Board {
+            let tab_h = detail_tab_bar_height(lh);
+            // #2282 (ms-65 §2a): the document tab strip is the FIRST row inside
+            // the panel content, above the sub-tab bar. Hit-test it first and
+            // shrink `main_b` for everything below, mirroring what the render
+            // path does — otherwise every sub-tab click would land one row high
+            // whenever a document is open.
+            let main_b = match self.board_doc_tab_labels() {
+                labels if !labels.is_empty() => {
+                    if pos.y - main_b.y < tab_h {
+                        let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+                        // Same scroll-to-active offset the painter resolves, so
+                        // a click lands on the tab the user can actually see
+                        // once the strip overflows (#2283 owns the arrows).
+                        let active_idx = self
+                            .board_doc_tabs()
+                            .active_index()
+                            .unwrap_or(0);
+                        let scroll = TabBar::fit_active_scroll_offset(
+                            active_idx,
+                            refs.len(),
+                            main_b.width as usize,
+                            |i| refs[i].chars().count(),
+                        );
+                        return match hit_tab_index_from_labels(&refs, main_b.x, pos.x, scroll) {
+                            Some(idx) => self.activate_board_doc_tab(idx),
+                            None => false,
+                        };
+                    }
+                    Rect::new(
+                        main_b.x,
+                        main_b.y + tab_h,
+                        main_b.width,
+                        (main_b.height - tab_h).max(0.0),
+                    )
+                }
+                _ => main_b,
+            };
             // #269: hit-test from the actual TabBar labels (char widths)
             // instead of hard-coded offsets.  This stays correct when
             // tabs are renamed or have a badge appended.
-            let tab_h = detail_tab_bar_height(lh);
             if pos.y - main_b.y < tab_h {
                 let bar = self.board_detail_tab_bar();
                 let labels: Vec<&str> = bar.tabs.iter().map(|t| t.label.as_str()).collect();

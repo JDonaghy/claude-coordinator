@@ -58,6 +58,13 @@ impl ShellApp for CoordApp {
             let sidebar_rect = panel_layout.content_bounds;
             match self.active_view {
                 SidebarView::Board => {
+                    // #2282 (ms-65 §2f): stash the tree's painted geometry and
+                    // the backend's own MSV header metric so reveal-on-activate
+                    // — which runs on the event path, with no `Backend` handle
+                    // — can compute a row's panel offset. Same render-then-act
+                    // discipline as `last_main_visible_rows` above.
+                    self.last_sidebar_geom
+                        .set(Some((sidebar_rect, lh, backend.msv_metrics().header_size)));
                     self.board_sidebar.render(backend, sidebar_rect);
                 }
                 SidebarView::Machines => {
@@ -158,11 +165,33 @@ impl ShellApp for CoordApp {
             .set(content_visible_rows(m, lh).max(1));
         match self.active_view {
             SidebarView::Board => {
-                // Tab bar (Board / Issue / Chat), then the active tab's content.
                 // `#464`: route through `detail_tab_bar_height` so render and
                 // hit-test agree on the cell boundary in the TUI backend.
-                let tab_bar = self.board_detail_tab_bar();
                 let tab_h = detail_tab_bar_height(lh);
+                // #2282 (ms-65 §2a): the document tab strip is a NEW row
+                // inserted between the panel toolbar and the existing
+                // `Board / Issue / Chat / Terminal` sub-tab bar — two tab rows,
+                // in that order, pinned by the contract. With zero documents
+                // open `board_doc_tab_bar` is `None`: the strip renders nothing
+                // and reserves no row, so the sub-tab bar sits exactly where it
+                // did pre-ms-65.
+                let m = match self.board_doc_tab_bar() {
+                    Some(mut strip) => {
+                        let strip_rect = Rect::new(m.x, m.y, m.width, tab_h);
+                        // Same write-back the Pipeline sub-tab bar uses (#605):
+                        // resolve the offset that keeps the active tab on
+                        // screen before painting, since the TUI painter renders
+                        // from `scroll_offset` verbatim.
+                        strip.scroll_offset =
+                            backend.tab_bar_layout(strip_rect, &strip).correct_scroll_offset;
+                        backend.draw_tab_bar(strip_rect, &strip, None);
+                        Rect::new(m.x, m.y + tab_h, m.width, (m.height - tab_h).max(0.0))
+                    }
+                    None => m,
+                };
+                // Sub-tab bar (Board / Issue / Chat / Terminal), then the
+                // active sub-tab's content.
+                let tab_bar = self.board_detail_tab_bar();
                 let tab_rect = Rect::new(m.x, m.y, m.width, tab_h);
                 let content_rect =
                     Rect::new(m.x, m.y + tab_h, m.width, (m.height - tab_h).max(0.0));
@@ -1666,6 +1695,78 @@ impl CoordApp {
         }
     }
 
+    /// #2282 (ms-65 §2): the Board panel's **document** tab strip — one tab per
+    /// open issue, at most one of them a preview.
+    ///
+    /// `None` when zero documents are open, which is how §2a's "the strip
+    /// renders nothing and reserves no row" is expressed: the caller skips the
+    /// row entirely rather than painting an empty bar.
+    ///
+    /// Every tab's whole rendered form — brackets, close glyph and the trailing
+    /// separator — lives in `TabItem::label`; see [`doc_tab_label`] for why the
+    /// close glyph cannot come from `TabBar::show_tab_close`. `is_preview` is
+    /// still set so quadraui paints the preview tab italic (contract §1); the
+    /// `∘ ` marker inside the label is the symbols-only stand-in for that
+    /// styling, not a replacement for it.
+    pub(crate) fn board_doc_tab_bar(&self) -> Option<TabBar> {
+        let group = self.board_doc_tabs();
+        if group.is_empty() {
+            return None;
+        }
+        // Labels stay bare `#<N> <title>` while every open document belongs to
+        // the same repo; the moment the set spans two, every tab carries its
+        // repo so the numbers can't be confused across repos.
+        let show_repo = group
+            .tabs()
+            .first()
+            .map(|(first, _)| group.tabs().iter().any(|(repo, _)| repo != first))
+            .unwrap_or(false);
+        let tabs: Vec<TabItem> = group
+            .tabs()
+            .iter()
+            .enumerate()
+            .map(|(idx, (repo, number))| {
+                // An issue that has left the board (purged, closed and pruned)
+                // still has a tab until #2283 lands close semantics — render
+                // its number with an empty title rather than dropping the tab
+                // and silently renumbering the strip under the user's cursor.
+                let title = self
+                    .board_issue_group_for(repo, *number)
+                    .map(|g| g.issue_title.clone())
+                    .unwrap_or_default();
+                let is_preview = group.is_preview(idx);
+                let is_active = group.active_index() == Some(idx);
+                TabItem {
+                    label: doc_tab_label(repo, *number, &title, show_repo, is_preview, is_active),
+                    is_active,
+                    is_dirty: false,
+                    is_preview,
+                    is_closable: true,
+                }
+            })
+            .collect();
+        Some(TabBar {
+            id: WidgetId::new("board-doc-tabs"),
+            tabs,
+            right_segments: Vec::new(),
+            active_accent: None,
+            scroll_offset: 0,
+            // The close glyph is painted as part of the label (§2c needs the
+            // active tab's `]` to land to the RIGHT of the `×`, which the
+            // rasteriser's own close-button slot cannot express).
+            show_tab_close: false,
+            compact: false,
+        })
+    }
+
+    /// The doc-tab strip's rendered labels, in strip order — the measure the
+    /// click hit-test walks. Empty when no strip is rendered.
+    pub(crate) fn board_doc_tab_labels(&self) -> Vec<String> {
+        self.board_doc_tab_bar()
+            .map(|bar| bar.tabs.into_iter().map(|t| t.label).collect())
+            .unwrap_or_default()
+    }
+
     pub(crate) fn board_detail_tab_bar(&self) -> TabBar {
         // #316: show an active-dot on the Board Chat tab while a board chat is live.
         let board_chat_live = self.chat_is_board_chat();
@@ -1751,8 +1852,10 @@ impl CoordApp {
     pub(crate) fn board_issue_body_list(&self) -> ListView {
         // #669: use the panel width stashed at draw time for word-wrapping.
         let wrap_width = self.last_issue_panel_cols.get().max(40);
-        let repo = self.board_active_repo().map(str::to_string);
-        let group = self.board_selected_issue_group().cloned();
+        // #2282 (ms-65 §2): the Issue sub-tab's body follows the ACTIVE
+        // DOCUMENT TAB, not the tree cursor (see `board_detail_issue_group`).
+        let repo = self.board_detail_repo().map(str::to_string);
+        let group = self.board_detail_issue_group().cloned();
         let (Some(repo), Some(g)) = (repo, group) else {
             return issue_body_list(
                 None,
