@@ -99,6 +99,33 @@ from coord.overlap_predict import (
 # budget.
 _LAUNCH_TIMEOUT_SECONDS = 120.0
 
+# Wall-clock ceiling for the tick's own `coord merge --only` attempt
+# (#2350's fast path, `_run_merge_only_candidates`).  Deliberately its OWN
+# constant, not a reuse of `_LAUNCH_TIMEOUT_SECONDS` above: that one is
+# scoped to a `coord drive --tmux` launch, which only ever blocks on #1606's
+# bounded liveness check, so 120s is already generous there.  `coord merge
+# --only` is a different animal — elsewhere in the codebase
+# (`Driver._spawn` in `coord/drive.py`) the SAME subcommand runs under NO
+# subprocess timeout at all, nested inside up to a 1800s merge-lock
+# acquisition, i.e. the existing precedent treats its runtime as
+# unbounded/long, not launch-fast.  This call site does still want a
+# backstop — unlike `_spawn`'s fire-and-forget, this one runs synchronously
+# inside `drive_queue_tick`, in a loop over every `merge_only` candidate
+# this tick found (typically 0-2, see `_fetch_merge_only_ready`, but not
+# hard-capped), and a wedge here stalls the whole tick — so it gets a wider
+# ceiling than the launch check instead of no ceiling at all, without going
+# fully unbounded: `coord-drive-queue.service` (the deployed timer unit)
+# gives the ENTIRE `coord drive-queue tick` invocation only 300s
+# (`TimeoutStartSec`) before systemd kills it outright, which is a harder
+# and less graceful stop than this subprocess's own SIGKILL. 240s leaves
+# room for one slow `gh pr merge`/git round trip on a bad network day
+# without letting a single candidate alone consume the whole tick's outer
+# budget (this PR's invocation never passes `--revalidate`, so
+# `wait_for_ci_settle`'s up to 360s doesn't even apply today, but the argv
+# could grow that flag later — revisit this ceiling together with
+# `coord-drive-queue.service`'s `TimeoutStartSec` if it does).
+_MERGE_ONLY_TIMEOUT_SECONDS = 240.0
+
 # Counts are rendered in pipeline order, not alphabetically, so
 # `coord drive-queue status` reads as "1 running · 1 waiting". `parked`
 # (#1891) sits between `waiting` and `blocked` — closer to "nothing wrong"
@@ -2055,10 +2082,16 @@ def _fetch_merge_only_ready(
     :func:`_fetch_live_blocked_gate` already keep — so this never re-derives
     a gate reading of its own (that authority stays with *live_ci_gate*/
     *live_blocked_gate*, computed moments earlier in the same tick): it only
-    adds two cheap, board-only reads
-    (:func:`coord.merge_queue.has_approved_review`,
+    adds two board-only reads (:func:`coord.merge_queue.has_approved_review`,
     :func:`coord.merge_queue.has_passed_test`) against the SAME local board
-    those callers already loaded.
+    those callers already loaded. Almost always cheap and I/O-free — but not
+    unconditionally: ``has_approved_review`` can fall through to
+    ``scan_approved_reviews``'s ``_backfill_branch_patch_id``, which does a
+    live ``gh api compare`` round trip via *_gh_ops* when a stale-SHA review
+    needs its patch-id computed on demand. That path is exception-guarded
+    below and fails closed to the pre-#2350 `resumed` path like everything
+    else here, so it is not unsafe — just not the zero-I/O read the rest of
+    this docstring describes.
 
     Takes no *config_path*, unlike both siblings: neither board-only read
     needs a :class:`~coord.config.Config` (no ``ci_store``, no live gate
@@ -2220,7 +2253,7 @@ def _run_merge_only_candidates(plan: TickPlan, config_path: Path | None) -> None
                 argv,
                 capture_output=True,
                 text=True,
-                timeout=_LAUNCH_TIMEOUT_SECONDS,
+                timeout=_MERGE_ONLY_TIMEOUT_SECONDS,
             )
             returncode = result.returncode
             detail = (result.stderr or result.stdout or "").strip().splitlines()
