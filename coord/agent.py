@@ -772,6 +772,19 @@ def _is_auth_push_failure(message: str) -> bool:
     return any(marker in lowered for marker in _AUTH_PUSH_FAILURE_MARKERS)
 
 
+def _git(cwd: Path, *args: str, timeout: float = 15.0) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        raise _GitError(f"git {' '.join(args)} failed: {result.stderr.strip()}")
+    return result.stdout.strip()
+
+
 def _remote_already_has_head(
     wt_path: Path, remote: str, branch: str, *, timeout: float = 30.0
 ) -> bool:
@@ -808,19 +821,6 @@ def _remote_already_has_head(
         return True
     except (_GitError, subprocess.TimeoutExpired):
         return False
-
-
-def _git(cwd: Path, *args: str, timeout: float = 15.0) -> str:
-    result = subprocess.run(
-        ["git", *args],
-        cwd=str(cwd),
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
-    if result.returncode != 0:
-        raise _GitError(f"git {' '.join(args)} failed: {result.stderr.strip()}")
-    return result.stdout.strip()
 
 
 def _is_linked_worktree(repo_path: Path) -> bool:
@@ -3026,7 +3026,14 @@ class AgentAssignment:
     # alongside `status == FAILED`; `None` on every other outcome —
     # including a push failure for an unrelated reason (no `origin`
     # configured, network blip), which stays non-fatal exactly as before
-    # this field was introduced.
+    # this field was introduced, AND (#2356) including an auth-shaped
+    # failure on THIS push that turns out to be superseded: when
+    # `_remote_already_has_head` confirms the content already reached
+    # `origin` via some other remote/protocol (e.g. the #2269 SSH-
+    # workaround case), the push failure is logged but this field stays
+    # `None` and the assignment keeps its normal (non-FAILED) outcome —
+    # the work is where it needs to be, so the failed push here is a
+    # non-event, not a signal.
     #
     # Exists to keep an auth break from being silently absorbed into either
     # DONE (worker had local commits that never reached origin) or the
@@ -8201,6 +8208,7 @@ class AgentServer:
                         # original "nothing ever reached origin" case is
                         # unaffected.
                         _reason = str(e)
+                        _suppressed_as_already_pushed = False
                         if _is_auth_push_failure(_reason):
                             _branch_for_check = (
                                 head if head and head != "HEAD" else None
@@ -8208,22 +8216,29 @@ class AgentServer:
                             if _branch_for_check and _remote_already_has_head(
                                 wt_path, "origin", _branch_for_check
                             ):
-                                try:
-                                    with open(assignment.log_path, "a") as reopen:
-                                        reopen.write(
-                                            "# reap: push failed but origin "
-                                            "already has HEAD as an ancestor "
-                                            "(pushed via another remote/"
-                                            "protocol?) — treating as success "
-                                            f"({_reason}) (#2356)\n"
-                                        )
-                                except OSError:
-                                    pass
+                                _suppressed_as_already_pushed = True
                             else:
                                 _push_failure_reason = _reason
                         try:
                             with open(assignment.log_path, "a") as reopen:
-                                reopen.write(f"# reap: push failed ({_reason})\n")
+                                if _suppressed_as_already_pushed:
+                                    # Deliberately NOT the generic "push
+                                    # failed" line below: that line reads as
+                                    # a live failure signal, which this
+                                    # isn't — origin already has HEAD, so
+                                    # the failed push here is a non-event
+                                    # (#2356).
+                                    reopen.write(
+                                        "# reap: push failed but origin "
+                                        "already has HEAD as an ancestor "
+                                        "(pushed via another remote/"
+                                        "protocol?) — treating as success "
+                                        f"({_reason}) (#2356)\n"
+                                    )
+                                else:
+                                    reopen.write(
+                                        f"# reap: push failed ({_reason})\n"
+                                    )
                         except OSError:
                             pass
 
