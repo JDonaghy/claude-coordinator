@@ -1273,6 +1273,84 @@ def _diff_paths_outside_sealed(diff_text: str, sealed_paths: list[str]) -> list[
     )
 
 
+# ── #2192: free pre-review "missing test" nudge ─────────────────────────────
+#
+# #2132 classified 27 request-changes verdicts on this repo and found 5/27
+# (18.5%) were "missing required black-box test only" — the code was correct,
+# but the diff changed user-visible behavior and shipped no test, which
+# CLAUDE.md's "Testing — black-box coverage is the acceptance bar" section
+# already requires. Each one cost a full paid review leg plus a fix +
+# re-review round trip to catch a pattern a static check can see for free.
+#
+# This is intentionally a coarse, path-only heuristic — no diff semantics, no
+# ``claude -p`` call, no LLM judgment, just the same cheap file-path
+# inspection ``_diff_file_paths``/``_diff_touched_sealed_paths`` already do
+# above. It is a NUDGE, not a gate: callers only ever log it, never act on it
+# to change dispatch behavior, so a false positive costs nothing (the
+# reviewer remains the sole authority and, per CLAUDE.md, already honors a
+# PR that says it's a pure refactor / internal-only change).
+
+_TEST_BASENAME_PREFIXES = ("test_",)
+_TEST_BASENAME_SUFFIXES = (
+    "_test.py", "_test.rs",
+    ".test.ts", ".test.tsx", ".spec.ts", ".spec.tsx",
+)
+_TEST_BASENAME_EXACT = ("conftest.py",)
+# Matched against the path with a leading "/" prepended, so both a
+# repo-root prefix ("tests/foo.py" -> "/tests/foo.py") and a nested
+# directory ("tui/tests/foo.rs" -> "/tui/tests/foo.rs") are caught by the
+# same substring check.
+_TEST_PATH_SEGMENTS = ("/tests/", "/test/", "/__tests__/", "/e2e/")
+
+# Paths under these prefixes are internal tooling/docs, never shipped
+# product behavior — CLAUDE.md's "internal-only changes are exempt" carve-out,
+# expressed as the only thing a pure diff inspection can see: file location.
+_NON_USER_VISIBLE_PATH_PREFIXES = (
+    "docs/", "scripts/", "deploy/", ".github/", ".claude/", "graphify-out/",
+)
+_USER_VISIBLE_SUFFIXES = (".py", ".rs", ".ts", ".tsx", ".js", ".jsx")
+
+
+def _is_test_path(path: str) -> bool:
+    """Does *path* look like a test file, by name/location alone?"""
+    lower = path.lower()
+    base = lower.rsplit("/", 1)[-1]
+    if base in _TEST_BASENAME_EXACT:
+        return True
+    if any(base.startswith(p) for p in _TEST_BASENAME_PREFIXES):
+        return True
+    if any(base.endswith(s) for s in _TEST_BASENAME_SUFFIXES):
+        return True
+    return any(seg in f"/{lower}" for seg in _TEST_PATH_SEGMENTS)
+
+
+def _is_user_visible_path(path: str) -> bool:
+    """Does *path* look like shipped source (not test, not internal tooling)?"""
+    lower = path.lower()
+    if _is_test_path(lower):
+        return False
+    if any(lower.startswith(p) for p in _NON_USER_VISIBLE_PATH_PREFIXES):
+        return False
+    return any(lower.endswith(s) for s in _USER_VISIBLE_SUFFIXES)
+
+
+def diff_missing_test_coverage(diff_text: str | None) -> bool:
+    """#2192: True when *diff_text* touches user-visible source and zero
+    test files, the pattern behind 18.5% of #2132's blocking reviews.
+
+    Pure, free, deterministic path inspection — reuses :func:`_diff_file_paths`.
+    Returns False (never flags) when the diff is empty, touches no recognized
+    source file (docs-only/internal-tooling-only diffs — CLAUDE.md's
+    internal-only exemption), or already includes a test-file change.
+    """
+    if not diff_text or not diff_text.strip():
+        return False
+    paths = _diff_file_paths(diff_text)
+    if not any(_is_user_visible_path(p) for p in paths):
+        return False
+    return not any(_is_test_path(p) for p in paths)
+
+
 def build_review_briefing(
     *,
     pr_number: int | None,
@@ -2062,6 +2140,18 @@ def dispatch_review(
 
     fetch_body = issue_body_fetcher or _fetch_issue_body
     issue_body = fetch_body(repo.github, completed.issue_number)
+
+    # #2192: free pre-review nudge (see diff_missing_test_coverage docstring).
+    # Logged only, ahead of the paid reviewer dispatch below — never gates,
+    # never denies, never mutates `completed`. A false positive here must
+    # never cost a round trip, so nothing downstream reads this.
+    if diff_missing_test_coverage(full_diff_text):
+        log.info(
+            "[review] %s: diff touches user-visible source with zero test "
+            "files changed — matches #2132's 'missing test only' pattern "
+            "(free static check, non-blocking; dispatching review as normal)",
+            completed.assignment_id,
+        )
 
     # #1811: does the resolved review provider share the worker's model
     # family? ``completed.provider_name`` is the *resolved* name recorded at
