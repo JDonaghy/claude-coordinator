@@ -207,9 +207,23 @@ COMMANDS_ALLOWLIST: dict[str, set[tuple[str, str]]] = {
     # client fails loud instead of confidently diagnosing an empty queue.
     # Read-only with respect to the board: build_board only, no save_board —
     # its single write is a `diagnosis` record in the Phase-0 block log.
+    # #2350-guarded: `_fetch_merge_only_ready` is the third member of the
+    # `_fetch_live_*` family above, with the identical guard in the identical
+    # place — it confirms, for the handful of entries this tick's live gate
+    # re-check just found clear, that the board ALSO already records Test
+    # `passed` and Review `approve` (so Merge was the only gate ever still
+    # shut, and the tick can `coord merge --only` directly instead of spending
+    # a relaunch). The `if resolve_board_service() is not None: return {}`
+    # early return sits ABOVE the `from coord.state import load_board` import,
+    # so a thin client returns before the local read is even imported; only the
+    # daemon host, where `coord drive-queue tick` runs and nowhere else
+    # (#1870), reaches it. Read-only: load_board only, no save_board, and the
+    # whole block is wrapped in a fail-soft `except Exception: return {}` whose
+    # empty result degrades to exactly the pre-#2350 `resumed` relaunch path.
     "drive_queue.py": {
         ("_fetch_live_ci_gate", "load_board"),
         ("_fetch_live_blocked_gate", "load_board"),
+        ("_fetch_merge_only_ready", "load_board"),
         ("drive_queue_diagnose", "build_board"),
     },
     # #1337: `coord test` no longer calls save_board at all — the verdict is
