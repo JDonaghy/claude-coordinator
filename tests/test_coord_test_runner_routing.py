@@ -13,6 +13,12 @@ repo either gets a `--fallback-command` (its configured `test_command`) run
 as one suite, or -- if neither a path rule nor a fallback command applies --
 the runner REFUSES (non-zero exit) instead of reporting SKIP.
 
+#2269 added a third field to the coordinator ROUTING line, `populated-home=`,
+which reports whether the diff-scoped populated-$HOME re-run will happen (it
+needs the diff to touch a python test file, so every fixture here reports 0).
+That arm's own behaviour is pinned in tests/test_coord_test_runner_populated_home.py;
+what this file guards is that adding it did not disturb the routing decision.
+
 scripts/coord-test-runner.sh is bash, not importable, so these tests drive it
 as a subprocess against small throwaway git repos and assert on its stdout /
 exit code. `--print-routing` short-circuits before any build or test runs, so
@@ -90,7 +96,7 @@ def test_coordinator_python_diff_routes_pytest_only(repo: Path, repo_name: str) 
     _commit(repo, {"coord/foo.py": "x\n"}, "py change")
     result = _run(repo, "--repo", repo_name, "--print-routing")
     assert result.returncode == 0
-    assert result.stdout.strip().splitlines()[-1] == "ROUTING mode=coordinator pytest=1 cargo=0"
+    assert result.stdout.strip().splitlines()[-1] == "ROUTING mode=coordinator pytest=1 cargo=0 populated-home=0"
 
 
 @pytest.mark.parametrize("repo_name", COORDINATOR_REPO_NAMES)
@@ -98,7 +104,7 @@ def test_coordinator_rust_diff_routes_cargo_only(repo: Path, repo_name: str) -> 
     _commit(repo, {"tui/foo.rs": "x\n"}, "rs change")
     result = _run(repo, "--repo", repo_name, "--print-routing")
     assert result.returncode == 0
-    assert result.stdout.strip().splitlines()[-1] == "ROUTING mode=coordinator pytest=0 cargo=1"
+    assert result.stdout.strip().splitlines()[-1] == "ROUTING mode=coordinator pytest=0 cargo=1 populated-home=0"
 
 
 @pytest.mark.parametrize("repo_name", COORDINATOR_REPO_NAMES)
@@ -116,7 +122,7 @@ def test_omitting_repo_flag_defaults_to_coordinator_for_backcompat(repo: Path) -
     _commit(repo, {"coord/foo.py": "x\n"}, "py change")
     result = _run(repo, "--print-routing")  # no --repo at all
     assert result.returncode == 0
-    assert result.stdout.strip().splitlines()[-1] == "ROUTING mode=coordinator pytest=1 cargo=0"
+    assert result.stdout.strip().splitlines()[-1] == "ROUTING mode=coordinator pytest=1 cargo=0 populated-home=0"
 
 
 # ── any other repo: no hardcoded rule, must REFUSE without a fallback ───────
