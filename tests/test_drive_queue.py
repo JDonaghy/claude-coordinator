@@ -2325,6 +2325,128 @@ def test_a_blocked_entry_that_has_hit_the_resume_ceiling_stays_blocked_and_says_
     assert plan.launch is None
 
 
+# ── #2362: a blocked entry resumes once its unsatisfiable after= lands ─────
+#
+# `_resolve_prereqs` blocks a `waiting` entry the instant one of its named
+# `after=` pre-reqs is itself `blocked`/`failed` — correctly, since an entry
+# whose pre-req is provably dead cannot ever satisfy on its own. But once
+# blocked, the entry is terminal for dispatch and step 4 (where
+# `_resolve_prereqs` lives) never looks at it again — #2230's gate re-check
+# has NOTHING to say here either, because `_blocked_gate_reading` returns
+# `None` ("no evidence") for an entry that never reached the merge queue.
+# Without this sweep, claude-coordinator#2284-#2288 (the live incident that
+# prompted this issue) would stay `blocked` forever, even once their prereq
+# chain's root cause (#2283) reaches `done` — exactly what happened twice
+# before an operator noticed and hand-removed/re-added the rows.
+
+
+def test_a_blocked_entry_resumes_once_its_unsatisfiable_prereq_lands():
+    dep_key = entry_key(REPO, 1650)
+    entries = [
+        entry(1650, position=0, state=STATE_DONE),
+        entry(
+            1654,
+            position=1,
+            after=(dep_key,),
+            state=STATE_BLOCKED,
+            attempts=2,
+            resumes=0,
+            last_reason=f"pre-req {dep_key} is queued but blocked — it will never satisfy",
+        ),
+    ]
+    plan = plan_tick(entries, board(merged=(1650,)), capacity=2)
+    reconcile = next(r for r in plan.reconciles if r.key == entry_key(REPO, 1654))
+    assert reconcile.outcome == "resumed"
+    assert reconcile.updates["state"] == STATE_WAITING
+    assert reconcile.updates["attempts"] == 0
+    assert reconcile.updates["resumes"] == 1
+    # …and falls straight into this SAME tick's launch selection, exactly
+    # like #2230's gate-cleared resume already does.
+    assert plan.launch is not None and plan.launch.issue == 1654
+
+
+def test_a_blocked_entry_stays_blocked_while_its_prereq_is_still_blocked():
+    """The dependent's own re-derivation must agree with `_resolve_prereqs`:
+    if the pre-req has NOT landed (still `blocked` itself), nothing resumes —
+    the "it will never satisfy" reason is still true."""
+    dep_key = entry_key(REPO, 1650)
+    entries = [
+        entry(1650, position=0, state=STATE_BLOCKED),
+        entry(
+            1654,
+            position=1,
+            after=(dep_key,),
+            state=STATE_BLOCKED,
+            attempts=2,
+            last_reason=f"pre-req {dep_key} is queued but blocked — it will never satisfy",
+        ),
+    ]
+    plan = plan_tick(entries, board(), capacity=1)
+    assert plan.reconciles == ()
+    assert plan.launch is None
+
+
+def test_a_blocked_entry_with_an_unrelated_cause_is_not_resumed_by_a_landed_prereq():
+    """A `blocked` entry that merely HAS an `after=` list, but whose
+    `last_reason` names a DIFFERENT cause (exhausted attempts, not an
+    unsatisfiable pre-req), must not be resumed just because that pre-req
+    later lands — that would be a false resume of an entry the queue
+    genuinely gave up on for an unrelated reason."""
+    entries = [
+        entry(1650, position=0, state=STATE_DONE),
+        entry(
+            1654,
+            position=1,
+            after=(entry_key(REPO, 1650),),
+            state=STATE_BLOCKED,
+            attempts=2,
+            last_reason=(
+                "drive session died without landing the work 2/2 times — giving up"
+            ),
+        ),
+    ]
+    plan = plan_tick(entries, board(merged=(1650,)), capacity=1)
+    assert plan.reconciles == ()
+    assert plan.launch is None
+
+
+def test_a_permanently_blocked_entry_is_not_resumed_even_once_its_after_lands():
+    """#1844/#2019 permanent-block markers outrank #2362 exactly like they
+    outrank #2230 — a deterministic refusal cannot be un-refused by an
+    unrelated pre-req landing."""
+    entries = [
+        entry(
+            1654,
+            position=1,
+            after=(entry_key(REPO, 1650),),
+            state=STATE_BLOCKED,
+            attempts=0,
+            last_reason=(
+                "dispatch failed: ... (exit_code=5) — refused by a "
+                "pre-dispatch guard, which cannot change on retry (#1844); "
+                "blocking without spending an attempt"
+            ),
+        )
+    ]
+    plan = plan_tick(entries, board(merged=(1650,)), capacity=1)
+    assert plan.reconciles == ()
+    assert plan.launch is None
+
+
+def test_is_unsatisfiable_prereq_reason_recognises_only_the_exact_verdict_shape():
+    from coord.drive_queue import _is_unsatisfiable_prereq_reason
+
+    assert _is_unsatisfiable_prereq_reason(
+        "pre-req claude-coordinator#1650 is queued but blocked — it will never satisfy"
+    )
+    assert not _is_unsatisfiable_prereq_reason("dependency cycle: a -> b -> a")
+    assert not _is_unsatisfiable_prereq_reason(
+        "drive session died without landing the work 2/2 times — giving up"
+    )
+    assert not _is_unsatisfiable_prereq_reason("")
+    assert not _is_unsatisfiable_prereq_reason(None)
+
+
 def test_a_blocked_entry_that_lands_still_reconciles_to_done_before_any_gate_check():
     """#2055's landed check runs BEFORE #2230's gate re-check — a merged
     issue reconciles to `done` even if a live override would say 'blocked'."""
