@@ -47741,3 +47741,160 @@ Milestone tracking issue.
             driver.screen()
         );
     }
+
+    /// The blocking-review gap, first half — **"Double click pins"**, through
+    /// the REAL event path rather than a direct `open_board_doc_tab(_, true)`
+    /// call: a physical double click reaches `AppLogic` as `MouseDown`
+    /// followed by `UiEvent::DoubleClick` (quadraui's `DoubleClickDetector`
+    /// REPLACES the second `MouseDown`), so the test sends exactly that pair
+    /// and asserts the §2e rule-3 outcome — the tab is promoted out of the
+    /// preview slot, in place, with no second tab appended.
+    #[test]
+    fn double_clicking_a_sidebar_issue_row_pins_its_doc_tab() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = doc_tab_app(DOC_TAB_BOARD_JSON);
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        driver.render();
+
+        let (x, y) = driver
+            .find("#102  Auth token refresh")
+            .expect("#102's sidebar row must be on screen");
+
+        // First half of the gesture: the MouseDown lands as a single click,
+        // which opens #102 as a PREVIEW (rule 1) — the strip shows `∘`.
+        driver.click(x, y);
+        driver.render();
+        assert!(
+            driver.screen_contains("[∘ #102 Auth token ref… ×]"),
+            "the MouseDown half opens a preview first:\n{}",
+            driver.screen()
+        );
+
+        // Second half: the detector-folded `UiEvent::DoubleClick`, at the
+        // same position, exactly as `TuiBackend` delivers it in production.
+        driver.double_click(x, y);
+        driver.render();
+
+        assert!(
+            driver.screen_contains("[#102 Auth token ref… ×]"),
+            "#2282 §2e rule 3: the double click promotes the tab out of the \
+             preview slot — the strip drops the `∘` marker:\n{}",
+            driver.screen()
+        );
+        assert!(
+            !driver.screen_contains("∘ #102"),
+            "no preview marker survives anywhere on screen:\n{}",
+            driver.screen()
+        );
+        // The single-spaced `#102 Auth token ref` is the TAB label (the
+        // sidebar row pads its number to `#{:<5}`, hence double-spaced):
+        // exactly one occurrence proves the pin landed in place and did not
+        // append a second tab.
+        assert_eq!(
+            driver.screen().matches("#102 Auth token ref").count(),
+            1,
+            "#2282 §2e rule 3: double click pins IN PLACE — it never appends:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// The guard on that same arm: when the TUI backend's 400 ms / 1.5-cell
+    /// detector folds two SINGLE clicks on DIFFERENT rows into a
+    /// `DoubleClick`, the user meant two single clicks — the second row opens
+    /// as a preview (rule 1), it is NOT silently pinned.
+    #[test]
+    fn a_folded_double_click_on_a_different_row_opens_a_preview_not_a_pin() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = doc_tab_app(DOC_TAB_BOARD_JSON);
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        driver.render();
+
+        let (x, y) = driver
+            .find("#102  Auth token refresh")
+            .expect("#102's sidebar row must be on screen");
+        driver.click(x, y);
+        driver.render();
+
+        // The folded second click lands on a DIFFERENT row (#103): no
+        // preceding MouseDown there, so #103 is not the active document and
+        // the RowActivated arm must take the preview path.
+        let (x2, y2) = driver
+            .find("#103  Race condition")
+            .expect("#103's sidebar row must be on screen");
+        driver.double_click(x2, y2);
+        driver.render();
+
+        assert!(
+            driver.screen_contains("[∘ #103 Race condition… ×]"),
+            "#2282: a detector-folded click-pair across two rows is two single \
+             clicks — #103 opens as a PREVIEW, not a pin:\n{}",
+            driver.screen()
+        );
+        // #102's preview tab was REPLACED in place (rule 2), not kept beside
+        // the new one — its single-spaced tab label is gone from the strip.
+        assert!(
+            !driver.screen_contains("#102 Auth token ref"),
+            "the preview slot is replaced in place, not appended to:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// The blocking-review gap, second half — **"Activating a tab scrolls its
+    /// sidebar row into view when it was off-screen"** (§2f), mechanism and
+    /// all: a 30-issue board in a 20-row terminal leaves #130's row below the
+    /// fold; clicking #130's tab in the strip must scroll the sidebar until
+    /// the row (with its `▸` active-document marker) is actually painted.
+    #[test]
+    fn activating_a_doc_tab_scrolls_its_offscreen_sidebar_row_into_view() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let issues: Vec<String> = (101..=130)
+            .map(|n| {
+                format!(
+                    r#"{{"repo_name": "claude-coordinator", "number": {n}, "title": "Task number {n}", "state": "open", "labels": ["coord"]}}"#
+                )
+            })
+            .collect();
+        let json = format!(r#"{{"issues": [{}]}}"#, issues.join(","));
+
+        let mut app = doc_tab_app(&json);
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 130), true);
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 101), true);
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 20);
+        driver.render();
+        assert!(
+            driver.screen_contains("▸ #101"),
+            "#101 is the active document, selected near the top:\n{}",
+            driver.screen()
+        );
+        // Precondition, or the assertion below is vacuous: #130's SIDEBAR row
+        // (number padded to `#{:<5}`, hence the double space — distinct from
+        // its single-spaced tab label) starts off-screen.
+        assert!(
+            !driver.screen_contains("#130  Task"),
+            "precondition: #130's sidebar row starts OFF-SCREEN:\n{}",
+            driver.screen()
+        );
+
+        let (x, y) = driver
+            .find("#130 Task number 130")
+            .expect("#130's TAB is on screen even while its sidebar row is not");
+        driver.click(x, y);
+        driver.render();
+
+        assert!(
+            driver.screen_contains("▸ #130"),
+            "#2282 §2f: activating #130's tab scrolls its sidebar row into view:\n{}",
+            driver.screen()
+        );
+        // …and it got there by SCROLLING — the rows at the top of the tree
+        // (still selected-adjacent a frame ago) have left the viewport.
+        assert!(
+            !driver.screen_contains("#101  Task"),
+            "#101's sidebar row scrolled off the top — the panel really moved:\n{}",
+            driver.screen()
+        );
+    }
