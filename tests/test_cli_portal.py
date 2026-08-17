@@ -92,7 +92,14 @@ def test_sync_loop_commands_are_registered():
     """#1982: the loop's operator surface."""
     result = run("portal", "--help")
     assert result.exit_code == 0
-    for sub in ("sync", "outbox", "events", "enqueue-status", "enqueue-design-round"):
+    for sub in (
+        "sync",
+        "outbox",
+        "events",
+        "enqueue-status",
+        "enqueue-design-round",
+        "enqueue-preview",
+    ):
         assert sub in result.output
 
 
@@ -289,6 +296,36 @@ def test_enqueue_design_round_rejects_invalid_json():
     assert "not valid JSON" in result.output
 
 
+def test_enqueue_status_refuses_quality_check_with_no_preview():
+    """#2359: same #835 discipline, for the preview-approval gate."""
+    result = run("portal", "enqueue-status", "sub_1", "quality-check")
+    assert result.exit_code != 0
+    assert "preview" in result.output
+
+
+def test_enqueue_preview_then_status_queues_both_in_order():
+    ok = run(
+        "portal", "enqueue-preview", "sub_1", "https://pr-42.natal-chart.pages.dev"
+    )
+    assert ok.exit_code == 0, ok.output
+    assert "seq=1" in ok.output
+
+    status = run("portal", "enqueue-status", "sub_1", "quality-check")
+    assert status.exit_code == 0, status.output
+    assert "seq=2" in status.output
+
+    listed = run("portal", "outbox")
+    assert listed.exit_code == 0
+    assert "preview" in listed.output
+    assert "HELD" in listed.output  # the announcement, until its preview applies
+
+
+def test_enqueue_preview_rejects_an_empty_url():
+    result = run("portal", "enqueue-preview", "sub_1", "")
+    assert result.exit_code != 0
+    assert "non-empty" in result.output
+
+
 def test_outbox_is_empty_by_default():
     result = run("portal", "outbox")
     assert result.exit_code == 0
@@ -326,6 +363,7 @@ def thin_client(monkeypatch):
         ("portal", "events"),
         ("portal", "enqueue-status", "sub_1", "shipped"),
         ("portal", "enqueue-design-round", "sub_1", "{}"),
+        ("portal", "enqueue-preview", "sub_1", "https://pr-1.example.pages.dev"),
         ("portal", "enqueue-question", "sub_1", "why?"),
         ("portal", "requeue", "sub_1", "1"),
     ],

@@ -18,6 +18,7 @@ from coord.portal_bridge import PortalBridgeError, PushResult
 from coord.portal_sync import (
     PortalSyncError,
     enqueue_design_round,
+    enqueue_preview,
     enqueue_question,
     enqueue_status,
     sync_tick,
@@ -542,6 +543,63 @@ def test_applied_rows_update_the_confirmed_record():
     record = portal_store.get_submission(SUB)
     assert record.design_round == 3
     assert record.last_status == "awaiting-signoff"
+
+
+# ── #2359: the preview-approval gate's ordering rule ────────────────────────
+
+
+def test_enqueue_status_refuses_quality_check_with_no_preview():
+    with pytest.raises(PortalSyncError) as exc:
+        enqueue_status(SUB, "quality-check")
+    assert "preview" in str(exc.value)
+    assert portal_store.pending_outbox() == []
+
+
+def test_enqueue_preview_refuses_an_empty_url():
+    with pytest.raises(PortalSyncError):
+        enqueue_preview(SUB, "")
+    with pytest.raises(PortalSyncError):
+        enqueue_preview(SUB, "   ")
+
+
+def test_preview_is_pushed_before_the_status_that_announces_it():
+    enqueue_preview(SUB, "https://pr-42.natal-chart.pages.dev")
+    enqueue_status(SUB, "quality-check")
+    client = FakeClient()
+
+    result = sync_tick(client=client)
+
+    assert client.pushed_kinds == ["preview_url", "status"]
+    assert result.applied == 2
+    assert result.held == 0
+
+
+def test_quality_check_announcement_is_held_while_its_preview_is_unconfirmed():
+    enqueue_preview(SUB, "https://pr-42.natal-chart.pages.dev")
+    enqueue_status(SUB, "quality-check")
+    client = FakeClient(push_outcomes={"preview_url": "rejected"})
+
+    result = sync_tick(client=client)
+
+    assert client.pushed_kinds == ["preview_url"]
+    assert result.rejected == 1
+    assert result.applied == 0
+
+    # ...and it stays held on every subsequent tick, rather than leaking out.
+    client2 = FakeClient()
+    result2 = sync_tick(client=client2)
+    assert client2.pushes == []
+    assert result2.held == 1
+
+
+def test_applied_preview_rows_update_the_confirmed_record():
+    enqueue_preview(SUB, "https://pr-42.natal-chart.pages.dev")
+    enqueue_status(SUB, "quality-check")
+    sync_tick(client=FakeClient())
+
+    record = portal_store.get_submission(SUB)
+    assert record.preview_url == "https://pr-42.natal-chart.pages.dev"
+    assert record.last_status == "quality-check"
 
 
 def test_summary_reports_a_failed_heartbeat_loudly():

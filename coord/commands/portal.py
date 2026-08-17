@@ -425,6 +425,32 @@ def portal_enqueue_design_round(submission_id: str, payload_json: str) -> None:
     )
 
 
+@portal_group.command("enqueue-preview")
+@click.argument("submission_id")
+@click.argument("preview_url")
+def portal_enqueue_preview(submission_id: str, preview_url: str) -> None:
+    """Queue a preview build URL for SUBMISSION_ID (#2359, coord-portal#107).
+
+    PREVIEW_URL is the PR's own Cloudflare Pages Preview deployment — never
+    the Production deployment for `main`, which must never show unapproved
+    work. Queue this, then `coord portal enqueue-status <id> quality-check`,
+    before waiting for the customer's `preview.approved` verdict.
+    """
+    _refuse_if_thin_client("enqueue-preview")
+
+    from coord.portal_sync import PortalSyncError, enqueue_preview  # noqa: PLC0415
+
+    try:
+        row = enqueue_preview(submission_id, preview_url)
+    except PortalSyncError as exc:
+        click.secho(str(exc), fg="red")
+        raise SystemExit(1) from exc
+    click.secho(
+        f"queued: {row.submission_id} seq={row.seq} rev={row.revision} preview",
+        fg="green",
+    )
+
+
 @portal_group.command("enqueue-question")
 @click.argument("submission_id")
 @click.argument("question")
