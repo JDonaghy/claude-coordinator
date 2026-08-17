@@ -1725,6 +1725,42 @@ def has_smoke_verdict(
     return evaluate_smoke_verdict(entry, board, gh_ops).ok
 
 
+def has_passed_test(entry: "QueuedMerge", board) -> bool:
+    """True when a WORK_LIKE assignment in *entry*'s chain carries a
+    recorded ``test_state == "passed"`` verdict.
+
+    Deliberately NOT :func:`has_smoke_verdict` — that is the live SMOKE
+    GATE (staleness re-derivation against the current branch/base SHAs, an
+    unconditional ``skipped`` short-circuit, an optional *gh_ops* backfill).
+    #2350's Merge-only fast path asks a narrower, cheaper question: does the
+    board ALREADY show this issue's Test stage passed, as a second,
+    independent confirmation layered on top of a live merge-gate-clear
+    reading, not "would the smoke gate pass a fresh live check right now".
+    Reusing :func:`has_smoke_verdict` here would also accept a fresh
+    ``skipped`` verdict — a true smoke-gate pass, but not literally "Test
+    passed" — which would auto-merge a case the issue never asked this fast
+    path to cover.
+
+    No *gh_ops* parameter: this never needs one, since it does no staleness
+    check at all — a plain, cheap, board-only read, same posture as
+    ``IssueFacts.merge_gate_status`` (:mod:`coord.drive_queue`).
+    """
+    pool = list(getattr(board, "completed", []) or []) + list(
+        getattr(board, "active", []) or []
+    )
+    branch_work_ids = _chain_work_ids(entry, pool)
+    if not branch_work_ids:
+        return False
+    for a in pool:
+        if getattr(a, "assignment_id", None) not in branch_work_ids:
+            continue
+        if getattr(a, "type", None) not in WORK_LIKE_TYPES:
+            continue
+        if getattr(a, "test_state", None) == "passed":
+            return True
+    return False
+
+
 #: #1819: how long a transient ``test_state="running"`` marker (#1395) may
 #: outlive the last Test worker on its branch before the gate calls it STALE
 #: rather than MISSING. The marker is written at dispatch and cleared when a

@@ -53,6 +53,7 @@ from coord.drive_queue import (
     QUEUE_ALERT_STAGE,
     RESUME_PROBE_TIMEOUT_SECONDS,
     STATE_BLOCKED,
+    STATE_DONE,
     STATE_FAILED,
     STATE_PARKED,
     STATE_RUNNING,
@@ -2037,6 +2038,73 @@ def _fetch_live_blocked_gate(
     return overrides
 
 
+def _fetch_merge_only_ready(
+    entries: list,
+    config_path: Path | None,
+    live_ci_gate: Mapping[str, bool],
+    live_blocked_gate: Mapping[str, bool],
+) -> dict[str, bool]:
+    """``{entry_key: True}`` for #2350's Merge-only fast path: every entry
+    THIS tick's live gate re-check just found clear — a `parked` entry with
+    ``live_ci_gate[key] is False``, a `blocked` one with
+    ``live_blocked_gate[key] is False`` — whose board-recorded pipeline
+    state ALSO shows Test already `passed` and Review already `approve`,
+    meaning Merge was the only gate that was ever still shut.
+
+    Scoped to exactly the entries about to reconcile `resumed` this tick —
+    typically 0-2, the same bound :func:`_fetch_live_ci_gate`/
+    :func:`_fetch_live_blocked_gate` already keep — so this never re-derives
+    a gate reading of its own (that authority stays with *live_ci_gate*/
+    *live_blocked_gate*, computed moments earlier in the same tick): it only
+    adds two cheap, board-only reads
+    (:func:`coord.merge_queue.has_approved_review`,
+    :func:`coord.merge_queue.has_passed_test`) against the SAME local board
+    those callers already loaded.
+
+    Same fail-open-per-entry, fail-closed-overall contract as its siblings:
+    a key ABSENT from the result (no queue row, an unreadable config, any
+    exception) simply takes the pre-#2350 `resumed` path — never a wrongly
+    skipped relaunch.
+    """
+    targets = [
+        e for e in entries
+        if (e.state == STATE_PARKED and live_ci_gate.get(e.key) is False)
+        or (e.state == STATE_BLOCKED and live_blocked_gate.get(e.key) is False)
+    ]
+    if not targets:
+        return {}
+
+    from coord.board_service import resolve as resolve_board_service  # noqa: PLC0415
+
+    if resolve_board_service() is not None:
+        return {}
+
+    try:
+        from coord import github_ops as _gh_ops  # noqa: PLC0415
+        from coord import merge_queue as _mq  # noqa: PLC0415
+        from coord.state import load_board as _load_board  # noqa: PLC0415
+
+        board = _load_board()
+        queue_by_key = {
+            entry_key(q.repo_name, q.issue_number): q for q in _mq.load_queue()
+        }
+    except Exception:  # noqa: BLE001 — see the fail-soft note above
+        return {}
+
+    ready: dict[str, bool] = {}
+    for e in targets:
+        q = queue_by_key.get(e.key)
+        if q is None:
+            continue
+        try:
+            ready[e.key] = _mq.has_approved_review(
+                q, board, _gh_ops
+            ) and _mq.has_passed_test(q, board)
+        except Exception:  # noqa: BLE001 — leave this one entry to the ordinary path
+            continue
+    return ready
+
+
 def _launch_argv(entry: QueueEntry, config_path: Path | None) -> list[str]:
     """The ``coord drive --tmux`` argv for *entry*.
 
@@ -2066,6 +2134,136 @@ def _launch_argv(entry: QueueEntry, config_path: Path | None) -> list[str]:
     if config_path:
         argv += ["--config", str(config_path)]
     return argv
+
+
+def _merge_only_argv(entry: QueueEntry, config_path: Path | None) -> list[str]:
+    """The ``coord merge --only <repo>#<issue>`` argv for *entry* (#2350).
+
+    Mirrors :func:`_launch_argv`'s exact shape — same ``coord_argv()`` base,
+    same ``--config`` passthrough — for the direct-merge fast path instead
+    of a fresh drive session. ``--only`` accepts the durable ``repo#issue``
+    form (#1477), which is exactly ``entry.key``, so no assignment_id lookup
+    is needed here.
+    """
+    from coord.drive import coord_argv  # noqa: PLC0415
+
+    argv = coord_argv() + ["merge", "--only", entry.key]
+    if config_path:
+        argv += ["--config", str(config_path)]
+    return argv
+
+
+def _merge_only_landed(entry: QueueEntry) -> bool:
+    """Did *entry* actually MERGE, per the merge-queue's own row — the one
+    ground truth ``coord merge --only``'s exit code alone cannot supply.
+
+    #2350: a ``--only`` run against an already-PENDING entry exits 0
+    whether the attempt landed it, left it blocked on a gate, or routed it
+    into a conflict-fix — see ``coord.commands.merge``'s ``--only`` handler,
+    which prints a summary and returns unconditionally once ``process()``
+    has run. Exit code alone is therefore not evidence of a landed merge;
+    the queue row's own resulting state is.
+    """
+    from coord import merge_queue as _mq  # noqa: PLC0415
+
+    try:
+        rows = _mq.load_queue()
+    except Exception:  # noqa: BLE001 — unreadable queue is not proof of a landed merge
+        return False
+    for q in rows:
+        if entry_key(q.repo_name, q.issue_number) == entry.key:
+            return q.state == _mq.MERGED
+    return False
+
+
+def _run_merge_only_candidates(plan: TickPlan, config_path: Path | None) -> None:
+    """#2350: attempt ``coord merge --only`` directly, THIS tick, for every
+    entry :func:`coord.drive_queue.plan_tick` marked ``merge_only`` — no
+    relaunch, no capacity slot spent. Called AFTER ``_apply_writes(plan)``,
+    same posture as the launch subprocess below it: the entry's real next
+    state is decided from the live outcome of THIS attempt, not from
+    anything ``plan_tick`` could have known when it returned — see
+    :class:`~coord.drive_queue.Reconcile`'s ``merge_only`` outcome for why
+    that Reconcile itself writes nothing.
+
+    On success (the queue's own row now reads ``MERGED`` — see
+    :func:`_merge_only_landed`): writes ``STATE_DONE`` directly, skipping
+    the ``waiting``/relaunch cycle a NEXT tick's ordinary ``landed``
+    re-check would otherwise need, and records a distinct #2350 block-log
+    ``resolve`` (:func:`coord.block_log.merge_only_event`) so #2235's corpus
+    can tell "the queue itself finished this" apart from "the state flipped
+    and something else finished it" (``already-landed``/``auto-released``).
+
+    On failure (the gate flipped shut again between the read and the
+    attempt — a genuine race, not the common case; or the attempt itself hit
+    something a single bounded try cannot resolve): falls back to EXACTLY
+    the pre-#2350 ``resumed`` shape — ``STATE_WAITING``, ``attempts`` reset
+    to 0, ``resumes`` bumped for a ``blocked``-origin entry (mirroring
+    ``_reconcile_blocked``'s own formula, so the #2230 oscillation ceiling
+    still sees every chance this entry got, fast-path or not) — never worse
+    than the status quo, and never a `coord drive --tmux` launch attempt
+    spent retrying a race this bounded attempt already ruled out.
+    """
+    if not plan.merge_only:
+        return
+
+    from coord.block_log import merge_only_event, merge_only_fallback_event  # noqa: PLC0415
+    from coord.state import update_drive_queue_entry  # noqa: PLC0415
+
+    for target in plan.merge_only:
+        argv = _merge_only_argv(target, config_path)
+        try:
+            result = subprocess.run(  # noqa: S603 — argv built from coord_argv + typed row
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=_LAUNCH_TIMEOUT_SECONDS,
+            )
+            returncode = result.returncode
+            detail = (result.stderr or result.stdout or "").strip().splitlines()
+            message = detail[-1] if detail else ""
+        except (subprocess.SubprocessError, OSError) as exc:
+            returncode, message = 1, str(exc)
+
+        if returncode == 0 and _merge_only_landed(target):
+            update_drive_queue_entry(
+                target.repo,
+                target.issue,
+                state=STATE_DONE,
+                last_reason=(
+                    "merged directly from the tick — Test/Review were "
+                    "already satisfied, Merge was the only gate left (#2350)"
+                ),
+                session_name=None,
+            )
+            _record_block_log([merge_only_event(target, host=_local_host_id())])
+            click.echo(f"merge-only: {target.key} merged directly from the tick")
+            continue
+
+        # #2350: the race case — fall back to exactly today's `resumed`
+        # shape, never a consumed drive-queue attempt (this was never a
+        # `coord drive --tmux` launch).
+        reason = f"merge-only attempt for {target.key} did not land it this tick"
+        if message:
+            reason += f" ({message})"
+        reason += " — falling back to an ordinary relaunch (#2350)"
+        updates: dict[str, Any] = {
+            "state": STATE_WAITING,
+            "attempts": 0,
+            "last_reason": reason,
+        }
+        if target.state == STATE_BLOCKED:
+            updates["resumes"] = target.resumes + 1
+        update_drive_queue_entry(target.repo, target.issue, **updates)
+        # #2350: this write bypassed `plan.writes()` entirely, so the
+        # `plan_events` call below (keyed off the ORIGINAL plan) can never
+        # see it — without recording it here, the episode `plan_events`
+        # already opened for `target` when it first went `parked`/`blocked`
+        # would never see a matching close.
+        _record_block_log(
+            [merge_only_fallback_event(target, reason=reason, host=_local_host_id())]
+        )
+        click.echo(f"merge-only: {reason}")
 
 
 def _run_resume_probe(entry: QueueEntry) -> ProbeResult:
@@ -2219,7 +2417,8 @@ def _requeue_command(entry: QueueEntry | None, key: str) -> str:
         "Update the queue's view of reality and launch nothing (#2110). "
         "Every `running` entry is still checked against the board "
         "(done/blocked/parked/retry, exactly as a normal tick would), but no "
-        "new `coord drive` is ever started this run — equivalent to "
+        "new `coord drive` is ever started this run, and no `coord merge "
+        "--only` fast-path attempt (#2350) runs either — equivalent to "
         "`--max-parallel 0`. This is the missing primitive for the "
         "stop-the-timer-to-roll-the-fleet sequence: with the timer stopped, "
         "nothing reconciles a finished drive's `running` row, and that stale "
@@ -2367,6 +2566,15 @@ def drive_queue_tick(
         # landable for most of that window, and nothing ever looked again).
         live_blocked_gate = _fetch_live_blocked_gate(entries, config_path)
 
+        # #2350: for every entry the two live re-checks above just found
+        # clear, also confirm — from the board's own recorded Test/Review
+        # verdicts — that Merge was the only gate ever still shut, so
+        # `plan_tick` can attempt it directly this tick instead of spending
+        # a relaunch. See `_fetch_merge_only_ready`'s docstring.
+        merge_only_ready = _fetch_merge_only_ready(
+            entries, config_path, live_ci_gate, live_blocked_gate
+        )
+
         # #2101: release cordons. THIS is the hole the issue names — the
         # queue's launcher had zero pause awareness (`coord/drive.py` checks
         # pause only when routing a *worker*), so a cordoned host kept getting
@@ -2409,6 +2617,7 @@ def drive_queue_tick(
             live_ci_gate_reason=live_ci_gate_reason,
             live_blocked_gate=live_blocked_gate,
             editable_drift=editable_drift,
+            merge_only_ready=merge_only_ready,
         )
 
         if reconcile_only:
@@ -2426,6 +2635,16 @@ def drive_queue_tick(
             return
 
         _apply_writes(plan)
+
+        # #2350: attempt the direct merges `plan_tick` marked `merge_only`,
+        # right after the rest of the plan's writes have landed. Skipped
+        # under `--reconcile-only` (also forced by `--max-parallel 0`, see
+        # `effective_capacity` above) — that mode's whole contract is
+        # "update queue state, launch nothing", and a live `coord merge
+        # --only` attempt is exactly the external action it promises not to
+        # take, same posture as the launch subprocess further down.
+        if not reconcile_only:
+            _run_merge_only_candidates(plan, config_path)
 
         # #2235 Phase 0: record every entry this tick moved INTO or OUT OF
         # `blocked`/`parked`, with the reason the queue stated and — for a

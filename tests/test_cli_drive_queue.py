@@ -1906,6 +1906,157 @@ def test_a_live_ready_wins_even_over_a_stale_cached_plan_reading(
     assert queued(2159)["state"] == "running"
 
 
+# ── #2350: Merge-only fast path — a gate-cleared entry whose board already
+# shows Test passed and Review approved attempts `coord merge --only`
+# directly from the tick, instead of paying for a fresh `coord drive --tmux`
+# relaunch. Reuses `_park_with_pr`/`live_ci_backend` from #2182 above for the
+# live-gate-clear half; the new half is the board-recorded Test/Review
+# evidence `_fetch_merge_only_ready` reads.
+
+
+def _seed_merge_only_evidence(coord_db, issue: int, work_aid: str) -> None:
+    """Board rows #2350's `_fetch_merge_only_ready` needs: `board_initialized`
+    (so `_load_board()` returns a real `Board` instead of `None` — this
+    suite's raw-SQL `seed()` never calls the real `save_board()` write path
+    that would otherwise set it), a `type="work"` row carrying
+    `test_state="passed"`, and a `type="review"` row carrying
+    `review_verdict="approve"` chained to it via `review_of_assignment_id` —
+    matching `coord.merge_queue.has_passed_test`/`has_approved_review`'s own
+    read shape.
+    """
+    coord_db.execute(
+        "INSERT OR REPLACE INTO board_meta (key, value) VALUES "
+        "('board_initialized', '1')"
+    )
+    coord_db.execute(
+        "INSERT INTO assignments "
+        "(assignment_id, repo_name, issue_number, issue_title, machine_name, "
+        " type, status, test_state, dispatched_at) "
+        "VALUES (?, ?, ?, ?, 'dellserver', 'work', 'done', 'passed', ?)",
+        (work_aid, REPO, issue, f"issue {issue}", 50.0),
+    )
+    coord_db.execute(
+        "INSERT INTO assignments "
+        "(assignment_id, repo_name, issue_number, issue_title, machine_name, "
+        " type, status, review_of_assignment_id, review_verdict, dispatched_at) "
+        "VALUES (?, ?, ?, ?, 'dellserver', 'review', 'done', ?, 'approve', ?)",
+        (f"rev-{issue}", REPO, issue, f"issue {issue}", work_aid, 60.0),
+    )
+    coord_db.commit()
+
+
+class _MergeOnlyRuns:
+    """Captured argvs from BOTH subprocess shapes the tick can spawn —
+    `coord drive --tmux` (`_launch_argv`) and `coord merge --only`
+    (`_merge_only_argv`, #2350) — bucketed by which one each call was.
+
+    `land_on_next_merge_call(coord_db, issue)` arms the DB side effect a
+    REAL `coord merge --only` would have left behind on success (the
+    merge_queue row flipping to `merged`) for the very next `merge` call
+    the fake subprocess sees — `_merge_only_landed` reads exactly that row,
+    never the subprocess's exit code alone (see its docstring for why).
+    Leaving it un-armed is how the race/failure tests simulate an attempt
+    that ran (exit 0) but did not land the merge.
+    """
+
+    def __init__(self) -> None:
+        self.drive: list[list[str]] = []
+        self.merge: list[list[str]] = []
+        self._land: tuple | None = None
+
+    def land_on_next_merge_call(self, coord_db, issue: int) -> None:
+        self._land = (coord_db, issue)
+
+    def _run(self, argv, **_kw):
+        if "merge" in argv and "--only" in argv:
+            self.merge.append(list(argv))
+            if self._land is not None:
+                db, issue = self._land
+                self._land = None
+                db.execute(
+                    "UPDATE merge_queue SET state = 'merged' WHERE issue_number = ?",
+                    (issue,),
+                )
+                db.commit()
+        else:
+            self.drive.append(list(argv))
+
+        class _Result:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return _Result()
+
+
+@pytest.fixture
+def merge_only_runs(monkeypatch) -> _MergeOnlyRuns:
+    runs = _MergeOnlyRuns()
+    monkeypatch.setattr("coord.commands.drive_queue.subprocess.run", runs._run)
+    return runs
+
+
+def test_a_parked_entry_with_gate_test_review_all_clear_merges_directly_from_the_tick(
+    cli_no_gates, seed, coord_db, live_ci_backend, merge_only_runs,
+):
+    """The happy path: Test passed, Review approved, and the live gate reads
+    clear — the tick attempts `coord merge --only` directly, lands it, and
+    the entry reaches `done` without ever relaunching a drive session.
+
+    Uses `merge_only_runs`, not the `launches` fixture, for BOTH subprocess
+    shapes: both patch the same `coord.commands.drive_queue.subprocess.run`
+    seam, and only one patch can be live at a time.
+    """
+    _park_with_pr(cli_no_gates, seed, coord_db)
+    _seed_merge_only_evidence(coord_db, 2159, "w2159")
+    live_ci_backend([_green_check()])
+    assert len(merge_only_runs.drive) == 1  # `_park_with_pr`'s own setup launch
+    merge_only_runs.land_on_next_merge_call(coord_db, 2159)
+
+    result = cli_no_gates("tick")
+    assert result.exit_code == 0, result.output
+    assert "merge --only" in result.output  # rendered plan line (#2350)
+
+    entry = queued(2159)
+    assert entry["state"] == "done"
+    assert "#2350" in (entry["last_reason"] or "")
+
+    # No relaunch this tick: still just `_park_with_pr`'s one drive launch —
+    # this tick spent a merge call, not a launch.
+    assert len(merge_only_runs.drive) == 1, merge_only_runs.drive
+    assert len(merge_only_runs.merge) == 1, merge_only_runs.merge
+
+
+def test_a_parked_merge_only_race_falls_back_to_an_ordinary_relaunch(
+    cli_no_gates, seed, coord_db, live_ci_backend, merge_only_runs,
+):
+    """The failure/race case: the live gate read clear enough to attempt the
+    fast path, but the merge itself did not land (the queue row's own state
+    never flips to `merged` — a genuine race, or an attempt this single
+    bounded try can't resolve). Falls back to EXACTLY the pre-#2350
+    `resumed` shape: `waiting`, no attempt spent — never worse than before
+    #2350 existed, and never a double-spent `coord drive --tmux` attempt."""
+    _park_with_pr(cli_no_gates, seed, coord_db)
+    _seed_merge_only_evidence(coord_db, 2159, "w2159")
+    live_ci_backend([_green_check()])
+    # Deliberately never arm `land_on_next_merge_call` — the merge_queue row
+    # stays `pending`, exactly the "attempt did not land it" reading
+    # `_merge_only_landed` reports back to the tick.
+
+    result = cli_no_gates("tick")
+    assert result.exit_code == 0, result.output
+
+    entry = queued(2159)
+    assert entry["state"] == "waiting"
+    assert entry["attempts"] == 0  # no double-spend of attempts (#2350)
+    assert "#2350" in (entry["last_reason"] or "")
+
+    # Never a `coord drive --tmux` relaunch spent on the race itself — only
+    # the bounded `coord merge --only` attempt ran this tick.
+    assert len(merge_only_runs.drive) == 1, merge_only_runs.drive
+    assert len(merge_only_runs.merge) == 1, merge_only_runs.merge
+
+
 def test_a_repeatedly_dead_drive_still_reaches_blocked_and_escalates(
     cli, seed, launches, coord_db
 ):

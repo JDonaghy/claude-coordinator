@@ -70,7 +70,9 @@ from typing import Any
 
 from coord.drive_queue import (
     STATE_BLOCKED,
+    STATE_DONE,
     STATE_PARKED,
+    STATE_WAITING,
     QueueEntry,
     TickPlan,
 )
@@ -107,6 +109,8 @@ __all__ = [
     "episodes",
     "is_by_design",
     "log_location",
+    "merge_only_event",
+    "merge_only_fallback_event",
     "operator_resolution_event",
     "plan_events",
     "read_events",
@@ -220,6 +224,20 @@ _RESUME_CAUSES: tuple[tuple[str, str, bool], ...] = (
 _LANDED_CAUSE = (
     "already-landed — the work merged or closed while the entry sat in this "
     "state, so the stated reason had outlived the thing it described"
+)
+#: #2350: distinct from `_LANDED_CAUSE` on purpose — that one means "the entry
+#: sat here and something ELSE finished it while nobody was looking" (a human,
+#: an unrelated branch merge, `coord reconcile-merges`); this one means the
+#: QUEUE ITSELF, this same tick, ran `coord merge --only` and landed it —
+#: see `coord.commands.drive_queue._run_merge_only_candidates`'s success
+#: branch, the ONLY writer of the `outcome == "merged"` `_resolve_record`
+#: reads to pick this cause. Conflating the two into one `auto-released`-style
+#: bucket is exactly what #2350 was written to stop: #2235's corpus needs to
+#: tell "the mechanism did this" apart from "the state flipped and something
+#: unrelated did it".
+_AUTO_MERGED_CAUSE = (
+    "auto-merged — the queue completed the merge directly from the tick "
+    "(#2350), Test/Review already satisfied; Merge was the only gate left"
 )
 _OPERATOR_CAUSE = (
     "operator-intervened — no automatic release fired; a human cleared it by "
@@ -405,7 +423,17 @@ def _resolve_record(
     now: float,
     outcome: str,
 ) -> dict[str, Any]:
-    if outcome == "done" or new_state == "done":
+    if outcome == "merged":
+        # #2350: checked BEFORE the "done" branch below — a successful
+        # Merge-only fast-path attempt also lands `new_state == "done"` (it
+        # skips the `waiting`/relaunch cycle entirely), so without this
+        # ordering the generic landed check would win the match and this
+        # episode would be indistinguishable from "something else merged it
+        # while it sat here" — exactly the conflation #2350 exists to split
+        # out of #2230's `auto-released`/#2055's `already-landed`.
+        true_cause, human = _AUTO_MERGED_CAUSE, False
+        resolution = "auto_merged"
+    elif outcome == "done" or new_state == "done":
         true_cause, human = _LANDED_CAUSE, False
         resolution = "landed"
     elif outcome == "resumed":
@@ -468,6 +496,81 @@ def enter_event(
     record["source"] = source
     if attempts is not None:
         record["attempts"] = attempts
+    return record
+
+
+def merge_only_event(
+    entry: QueueEntry,
+    *,
+    host: str = "",
+    now: float | None = None,
+) -> dict[str, Any]:
+    """The ``resolve`` record for #2350's Merge-only fast path.
+
+    The other caller-constructed record besides :func:`enter_event`, and for
+    the identical structural reason: the transition happens OUTSIDE
+    :func:`plan_events`'s view. A `merge_only` :class:`~coord.drive_queue.
+    Reconcile` deliberately writes no `state` (see its docstring), so
+    `plan.writes()` never carries the `parked`/`blocked` → `done` move this
+    function records — it only happens once the shell's own live
+    ``coord merge --only`` attempt reports success, strictly after
+    ``_apply_writes`` has already run for the rest of the tick. *entry* is
+    the PRE-tick snapshot (its ``state`` is still `parked`/`blocked`); the
+    entry has already landed by the time this is called, so `new_state` is
+    unconditionally :data:`~coord.drive_queue.STATE_DONE`.
+    """
+    stamp = time.time() if now is None else now
+    record = _resolve_record(
+        entry.key,
+        entry.state,
+        STATE_DONE,
+        "",
+        entry,
+        host=host,
+        now=stamp,
+        outcome="merged",
+    )
+    record["source"] = "tick"
+    return record
+
+
+def merge_only_fallback_event(
+    entry: QueueEntry,
+    *,
+    reason: str,
+    host: str = "",
+    now: float | None = None,
+) -> dict[str, Any]:
+    """The ``resolve`` record for #2350's Merge-only fast path RACE case:
+    the live gate read clear enough to attempt a direct merge, but the
+    attempt itself did not confirm a landed merge, so
+    ``coord.commands.drive_queue._run_merge_only_candidates`` falls back to
+    exactly the pre-#2350 ``resumed`` shape (``STATE_WAITING``) — OUTSIDE
+    ``plan.writes()``, the same reason :func:`merge_only_event` exists for
+    the success case: without this, the episode :func:`plan_events` already
+    opened for *entry* would never see a matching close, and
+    ``coord drive-queue block-log`` would show it stuck ``(unresolved)``
+    forever even though the entry plainly left `parked`/`blocked` this tick.
+
+    Classified as an ordinary ``resumed`` outcome — not a new #2350 cause —
+    on purpose: unlike the success case, this genuinely IS "state flipped,
+    cause a plain gate re-clear" (:func:`_resume_cause`'s fallback,
+    ``auto-released``), the same honest non-answer a bare board-signal
+    resume already gets. #2350's distinct cause is reserved for the tick
+    actually landing the merge itself.
+    """
+    stamp = time.time() if now is None else now
+    record = _resolve_record(
+        entry.key,
+        entry.state,
+        STATE_WAITING,
+        reason,
+        entry,
+        host=host,
+        now=stamp,
+        outcome="resumed",
+    )
+    record["source"] = "tick"
     return record
 
 

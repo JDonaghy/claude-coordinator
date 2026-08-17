@@ -2890,6 +2890,63 @@ class TestPassesMergeGates:
         ) is None
 
 
+class TestHasPassedTest:
+    """#2350: :func:`has_passed_test` — the Merge-only fast path's bare
+    recorded-state read, deliberately narrower than :func:`has_smoke_verdict`
+    (no staleness re-derivation, no ``skipped`` short-circuit, no *gh_ops*)."""
+
+    @staticmethod
+    def _board(active=None, completed=None):
+        from coord.models import Board
+        return Board(active=list(active or []), completed=list(completed or []))
+
+    @staticmethod
+    def _work(aid: str = "w1", *, test_state: str | None = None) -> Assignment:
+        return Assignment(
+            machine_name="m1",
+            repo_name="api",
+            issue_number=1,
+            issue_title="t",
+            assignment_id=aid,
+            type="work",
+            status="done",
+            branch=f"worker/{aid}",
+            test_state=test_state,
+        )
+
+    def test_finds_a_passed_verdict_on_the_chained_work_assignment(self) -> None:
+        work = self._work("w1", test_state="passed")
+        board = self._board(completed=[work])
+        assert mq.has_passed_test(_q("w1"), board) is True
+
+    def test_missing_verdict_reads_false(self) -> None:
+        work = self._work("w1", test_state=None)
+        board = self._board(completed=[work])
+        assert mq.has_passed_test(_q("w1"), board) is False
+
+    def test_failed_verdict_reads_false(self) -> None:
+        work = self._work("w1", test_state="failed")
+        board = self._board(completed=[work])
+        assert mq.has_passed_test(_q("w1"), board) is False
+
+    def test_skipped_verdict_reads_false_unlike_the_smoke_gate(self) -> None:
+        """The deliberate narrowing vs. :func:`has_smoke_verdict`: a
+        `skipped` verdict is a true smoke-gate pass but not literally "Test
+        passed", so #2350's fast path must not treat it as one."""
+        work = self._work("w1", test_state="skipped")
+        board = self._board(completed=[work])
+        assert mq.has_passed_test(_q("w1"), board) is False
+
+    def test_ignores_an_unrelated_work_assignments_verdict(self) -> None:
+        work = self._work("w99", test_state="passed")
+        board = self._board(completed=[work])
+        assert mq.has_passed_test(_q("w1"), board) is False
+
+    def test_no_matching_work_at_all_reads_false(self) -> None:
+        board = self._board(completed=[])
+        assert mq.has_passed_test(_q("w1"), board) is False
+
+
 class TestSmokeGate:
     """#465: process() must refuse to merge when interactive smoke is required
     and no passing/skipped verdict is recorded on the work assignment.
