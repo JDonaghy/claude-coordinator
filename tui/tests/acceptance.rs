@@ -40,3 +40,4 @@ include!("../../tests/acceptance/ms-38/plans_help_1124.rs");
 include!("../../tests/acceptance/ms-38/plans_rightclick_1123.rs");
 include!("../../tests/acceptance/ms-38/plans_detail_1122.rs");
 include!("../../tests/acceptance/ms-65/board_tabs_2282.rs");
+include!("../../tests/acceptance/ms-65/board_tabs_close_2283.rs");

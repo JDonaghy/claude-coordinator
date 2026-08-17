@@ -57,6 +57,35 @@ tests:
   # §2f (half two) — …and SCROLLS it into view. See the quadraui#595 note below.
   board_tabs_2282::activating_a_tab_scrolls_its_sidebar_row_into_view: 2282
 
+  # ── #2283 (W-2) — close / navigate / overflow / empty state (contract §4) ─
+  # Slice: board_tabs_close_2283.rs · mock: board-tabs-overflow.screen
+  # (plus board-baseline-no-tabs.screen as §4's empty-state target)
+  #
+  # §4 — clicking a tab's `×` closes exactly that tab and no other
+  board_tabs_close_2283::clicking_a_tabs_close_glyph_closes_exactly_that_tab: 2283
+  # #2283 AC — …while clicking its BODY activates it and closes nothing.
+  # THIS IS A GREEN RATCHET — see the `expected_red` block below.
+  board_tabs_close_2283::clicking_a_tab_body_activates_it_without_closing_it: 2283
+  # §4 — middle-click anywhere on a tab (not just its `×`) closes it
+  board_tabs_close_2283::middle_clicking_a_tab_body_closes_it: 2283
+  # §4 — `Ctrl-W` closes the active tab, left neighbour becomes active
+  board_tabs_close_2283::ctrl_w_closes_the_active_tab_and_activates_its_left_neighbour: 2283
+  # §4 — …and the rule's other branch: leftmost closed → new leftmost active
+  board_tabs_close_2283::ctrl_w_on_the_leftmost_tab_activates_the_new_leftmost: 2283
+  # §4 — `Ctrl-Tab` next, wrapping last → first
+  board_tabs_close_2283::ctrl_tab_moves_to_the_next_tab_and_wraps_at_the_end: 2283
+  # §4 — `Ctrl-Shift-Tab` previous, wrapping first → last
+  board_tabs_close_2283::ctrl_shift_tab_moves_to_the_previous_tab_and_wraps_at_the_start: 2283
+  # §4 — overflow: `‹` renders, `›` does not, active tab stays visible
+  board_tabs_close_2283::overflowing_tabs_render_the_left_scroll_affordance_and_keep_the_active_tab_visible: 2283
+  # §4 — the mirror case §4 tells a test-author to drive for `›`
+  board_tabs_close_2283::activating_a_scrolled_out_tab_scrolls_it_back_into_view_and_renders_the_right_affordance: 2283
+  # §4 — closing the LAST tab restores the zero-tab baseline
+  board_tabs_close_2283::closing_the_last_tab_restores_the_zero_tab_baseline: 2283
+  # §4 + §2a — CONTROL: strip chrome (`×`, `‹`, `›`) must not leak into the
+  # zero-tab state. THIS IS THE GREEN CONTROL — see `expected_red` below.
+  board_tabs_close_2283::zero_tabs_render_no_close_or_overflow_glyphs: 2283
+
 # ── expected_red (#2164) ───────────────────────────────────────────────────
 # Hand-derived from a REAL run of the sealed suite against origin/main at the
 # time of authoring (`cd tui && cargo test --test acceptance --features
@@ -84,6 +113,32 @@ expected_red:
     - board_tabs_2282::three_double_clicks_yield_three_pinned_tabs_with_the_last_active
     - board_tabs_2282::activating_a_tab_selects_its_sidebar_row
     - board_tabs_2282::activating_a_tab_scrolls_its_sidebar_row_into_view
+
+  # #2283 — OBSERVED, not intended. Taken from a real run of the sealed suite
+  # (`cd tui && RUSTC_BOOTSTRAP=1 cargo test --test acceptance --features
+  # test-support -- -Z unstable-options --format json`, the driver command in
+  # coordinator.yml) at authoring time: of this slice's 11 ids, 9 FAILED and
+  # 2 passed. The 2 that passed are deliberately ABSENT below:
+  #
+  #   * `zero_tabs_render_no_close_or_overflow_glyphs` — the CONTROL. Green
+  #     today (there is no strip chrome with zero tabs) and must stay green
+  #     after #2283 lands: an implementation that unconditionally paints the
+  #     `‹`/`›` affordances would satisfy the overflow tests and break this
+  #     one. Listing it would make its inevitable pass a HARD FAILURE.
+  #   * `clicking_a_tab_body_activates_it_without_closing_it` — a RATCHET.
+  #     #2282 already ships tab-body activation, so the positive half is green;
+  #     the test exists for the negative half (a body click must never close),
+  #     which #2283's new `TabBarHit::TabClose(i)` routing could regress.
+  2283:
+    - board_tabs_close_2283::clicking_a_tabs_close_glyph_closes_exactly_that_tab
+    - board_tabs_close_2283::middle_clicking_a_tab_body_closes_it
+    - board_tabs_close_2283::ctrl_w_closes_the_active_tab_and_activates_its_left_neighbour
+    - board_tabs_close_2283::ctrl_w_on_the_leftmost_tab_activates_the_new_leftmost
+    - board_tabs_close_2283::ctrl_tab_moves_to_the_next_tab_and_wraps_at_the_end
+    - board_tabs_close_2283::ctrl_shift_tab_moves_to_the_previous_tab_and_wraps_at_the_start
+    - board_tabs_close_2283::overflowing_tabs_render_the_left_scroll_affordance_and_keep_the_active_tab_visible
+    - board_tabs_close_2283::activating_a_scrolled_out_tab_scrolls_it_back_into_view_and_renders_the_right_affordance
+    - board_tabs_close_2283::closing_the_last_tab_restores_the_zero_tab_baseline
 
 # ═══════════════════════════════════════════════════════════════════════════
 # FOR THE COORDINATOR — three findings from authoring this slice. None of them
@@ -135,3 +190,68 @@ expected_red:
 # pair the real runner's `DoubleClickDetector` produces (deterministic, no
 # 400 ms wall clock), and around the second via contract §1's `∘ ` marker plus
 # `×`-counting, exactly as §2e instructs.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FOR THE COORDINATOR — findings from authoring the #2283 slice (contract §4).
+# Independent of the #2282 notes above; again, none is a worker's to fix and
+# none was resolved by editing the contract (a test-author may not amend one).
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# 4. `mocks/board-tabs-overflow.screen` CONTRADICTS §2b's pinned label width.
+#    §2b pins 20 columns (22 with §1's `∘ ` marker) for the single-pane strip,
+#    and `mocks/board-pinned-3-tabs.screen` renders exactly that
+#    (`#101 Fix login race… ×`). §4's own mock renders a visibly narrower
+#    label — `‹ #102 Auth… ×  #103 Race… ×  #104 Flak… ×  [#105 Memo… ×]`,
+#    roughly 10 columns. The two cannot both be right, and the discrepancy is
+#    load-bearing for that mock's headline claim: at the mock's own ~10-column
+#    width all five tabs would fit the 82-column main panel and there would be
+#    no overflow to depict, whereas at §2b's 20 columns only three fit
+#    (measured against the shipped app, which already implements §2b's width:
+#    `#103 Race condition… × #104 Flaky CI on ma… × [#105 Memory leak in… ×]`).
+#    So the mock's "only 4 fit the strip width" is not reproducible under
+#    either reading. This slice therefore asserts NEITHER the label width nor
+#    the fitting count — only §4's own testable clauses (`‹` present / `›`
+#    absent with #105 active, the mirror with #101 active, and "the active
+#    tab's `#<N>` is always present regardless of scroll offset"), all of
+#    which hold under both readings. If the 20/22 value is the intended one,
+#    the overflow mock wants regenerating; if the mock is right, §2b wants
+#    amending. Either way it is a Gate-A amendment, not a worker decision.
+#
+# 5. §4's "closing the last tab returns to `mocks/board-baseline-no-tabs.screen`'s
+#    EXACT state" cannot be taken literally. That mock has `▸ #101` selected;
+#    any scenario that opens a tab and closes it necessarily arrives with that
+#    issue selected instead (§2f's reveal-on-activate selected it). A
+#    full-frame comparison would be red against a correct implementation, so
+#    `closing_the_last_tab_restores_the_zero_tab_baseline` asserts the parts
+#    that ARE well defined — no `×`/`∘`/`‹`/`›` anywhere, and the sub-tab bar
+#    back on the exact row it held before any tab was opened (i.e. the strip
+#    reserved no row, §2a) — plus selection-follows-tree as a RELATION (the
+#    detail pane's `claude-coordinator #<N>` header matches whichever sidebar
+#    row is `▸`-marked) rather than by pinning which row that is. Flagged as a
+#    `TODO(test-author)` in the slice too.
+#
+# 6. §4 pins the `Ctrl-Shift-Tab` CHORD but not its wire encoding, and the two
+#    plausible ones differ: `Key::Named(Tab)` + `{ctrl, shift}`, or
+#    `Key::Named(BackTab)` + `{ctrl, shift}` (crossterm folds Shift-Tab into
+#    `KeyCode::BackTab`; quadraui's `tui::events` maps that to
+#    `NamedKey::BackTab`). Pinning one would invent a detail the contract is
+#    silent on, so the slice's `ctrl_shift_tab()` helper sends the `Tab` form
+#    and, only if the STRIP ROW is unchanged, the `BackTab` form — either
+#    satisfies the clause, handling neither still fails. (The fallback is
+#    gated on the strip row, not the whole frame: an unhandled `Tab` chord
+#    still repaints the sidebar focus ring, measured, which would otherwise
+#    mask the fallback.)
+#
+# Also worth knowing, not a contract problem: the quadraui pin has MOVED since
+# the #2282 slice was authored — `tui/Cargo.toml` now says
+# `d6ae247c007721284dc895d4fbf42b5f4a5ba47f`, at which quadraui#592 and #594
+# HAVE landed. `TuiDriver` now has real `double_click()`, `middle_click()`,
+# `right_click()`, `click_with()`, `set_double_click_folding()` and
+# `tab_close_center()`. This slice uses the first four and pins folding OFF so
+# repeated clicks are never a wall-clock race. It deliberately does NOT use
+# `tab_close_center()`, which needs the `WidgetId` the implementation gives the
+# doc-tab bar — an implementation detail a sealed slice must not guess at; it
+# resolves each tab's `×` from the rendered grid instead. Styled-cell reads
+# (quadraui#593) have also landed (`style_at`/`styled_row`), but §1's ruling
+# stands: the `∘ ` marker remains the pinned preview signal, and this slice
+# asserts no styles.
