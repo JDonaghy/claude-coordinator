@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -994,6 +996,115 @@ acceptance:
 
         wt_path = tmp_path / "acceptance-worktrees" / "coord-tui-944"
         assert not wt_path.exists(), "worktree leaked on manifest-missing error path"
+
+    def test_concurrent_record_calls_for_same_issue_are_serialized(
+        self, tmp_path: Path, coord_db, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """#2352 direct regression: two concurrent `coord acceptance record`
+        calls for the SAME (repo, issue) — e.g. an orphaned drive process
+        (#1660) racing a fresh queue relaunch, or a by-hand re-run
+        overlapping an in-flight one — must never interleave their
+        worktree-prep + driver run. Before the fix, `_acceptance_record_local`
+        did an unconditional `git worktree remove --force` + `add --force`
+        on the ONE path this (repo, issue) reuses across every SHA/round,
+        with no lock guarding it: a second invocation's remove could rip
+        the worktree out from under the first's in-flight build, producing
+        a corrupted build that looks exactly like a genuine red suite (a
+        false `acceptance_state=failed`) instead of raising anything
+        distinguishable.
+
+        This drives two threads through `_acceptance_record_local` for the
+        same repo/issue/sha concurrently, with `run_driver` slowed down and
+        instrumented, and asserts at most one thread is ever inside the
+        locked region (worktree-prep through verdict write) at a time.
+        """
+        import sqlite3
+
+        from coord import db, state
+        from coord.acceptance_drivers import DriverResult
+        from coord.commands.acceptance import _acceptance_record_local
+        from coord.db import _ensure_schema
+
+        # #2352 test-only wrinkle: the autouse `coord_db` fixture's
+        # in-memory connection is opened with sqlite3's default
+        # `check_same_thread=True`, which raises the instant a background
+        # thread touches it — unrelated to the race this test is actually
+        # driving at. Production's real singleton (`coord.db._open`)
+        # already opens with `check_same_thread=False` (the coordinator
+        # legitimately writes from more than one thread), so swapping in a
+        # thread-safe in-memory connection here just matches production
+        # instead of tripping over a fixture-only restriction. Use `conn`
+        # (not the `coord_db` fixture argument, which still points at the
+        # now-orphaned original connection) for any DB reads below.
+        conn = sqlite3.connect(":memory:", check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        _ensure_schema(conn)
+        db.override_connection(conn)
+
+        repo_dir = tmp_path / "repo"
+        sha = _init_git_repo(repo_dir, manifest={"ms01::a": 944})
+        config_path = _write_config(
+            tmp_path, repo_path=str(repo_dir), run_cmd="echo unused",
+        )
+
+        state.record_dispatched(
+            assignment_id="aid-race",
+            proposal=Proposal(
+                id=1, machine_name="laptop", repo_name="coord-tui",
+                issue_number=944, issue_title="oracle loop runner", rationale="",
+            ),
+            repo_github="acme/coord-tui",
+        )
+
+        state_lock = threading.Lock()
+        active = 0
+        max_active = 0
+
+        def _slow_driver(kind, run_command, cwd, ms=None, setup_command=None):
+            nonlocal active, max_active
+            with state_lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                # Wide enough that, without the #2352 lock, the second
+                # thread's (fast) git worktree remove/add would complete
+                # and reach this same function while the first thread is
+                # still "mid-build" here — reproducing the race window
+                # that corrupted the real cargo build in the incident.
+                time.sleep(0.3)
+                return DriverResult(
+                    exit_code=0, tests=[{"id": "ms01::a", "status": "pass"}],
+                )
+            finally:
+                with state_lock:
+                    active -= 1
+
+        monkeypatch.setattr("coord.commands.acceptance.run_driver", _slow_driver)
+
+        errors: list[BaseException] = []
+
+        def _run() -> None:
+            try:
+                _acceptance_record_local("coord-tui", 944, sha, config_path)
+            except BaseException as e:  # noqa: BLE001 - captured for assertion
+                errors.append(e)
+
+        threads = [threading.Thread(target=_run) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        assert not any(t.is_alive() for t in threads), "record call hung"
+        assert not errors, f"_acceptance_record_local raised: {errors!r}"
+        assert max_active == 1, (
+            "both threads ran the driver concurrently — the #2352 lock did "
+            "not serialize concurrent `coord acceptance record` calls for "
+            "the same (repo, issue)"
+        )
+
+        row = _acceptance_row(conn, "aid-race")
+        assert row["acceptance_state"] == "passed"
 
 
 def _init_git_repo_with_expected_red(
