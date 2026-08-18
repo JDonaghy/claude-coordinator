@@ -19,12 +19,16 @@ Three layers, deliberately separated so the interesting one is testable:
    window is covered and reports ``truncated=True`` if it genuinely could
    not finish.  Never silently drops the tail (#1742: "no silent caps").
 3. :data:`REPORTS` + :func:`run_report` — the registry and its parameter
-   validation.  Four entries: ``issue-activity``; ``drive-queue-status``
+   validation.  Five entries: ``issue-activity``; ``drive-queue-status``
    (#1805), a **live snapshot** of ``drive_queue`` (no window, no audit
    trail, no clock beyond ``generated_at``) rather than a fold over history;
-   and ``usage`` (#1763), a cost/token fold over board assignment rows that
-   delegates every number to :mod:`coord.usage_rollup` priced with the
-   daemon's own loaded ``pricing:`` config — the report that replaced
+   ``decisions`` (#2369), option-based cards folded from the SAME live
+   snapshot plus :func:`coord.state.list_drive_escalations` — "why is this
+   stuck, and what do I run" per root cause, with a downstream `after=`
+   cascade collapsed into its root's card rather than shown as N separate
+   problems; and ``usage`` (#1763), a cost/token fold over board assignment
+   rows that delegates every number to :mod:`coord.usage_rollup` priced with
+   the daemon's own loaded ``pricing:`` config — the report that replaced
    coord-tui's ``panel:usage`` and its hardcoded pricing snapshot; and
    ``queue-outcomes`` (#2270), the one number the morning report is for —
    *what fraction of the queue got over the line without a human* — folded
@@ -73,6 +77,8 @@ __all__ = [
     "run_issue_activity",
     "fold_drive_queue_status",
     "run_drive_queue_status",
+    "fold_decisions",
+    "run_decisions",
     "resolve_usage_window",
     "fold_usage",
     "run_usage",
@@ -1158,6 +1164,400 @@ def run_drive_queue_status(
     )
 
 
+# ── decisions: escalations + blocked queue roots as option-based cards ────
+#
+# #2369.  "Why is the fleet stuck" today means opening `drive-queue list`,
+# `merge --plan`, `gh pr checks` and sometimes a CI log, then translating
+# dense infra text into something actionable by hand. The raw material
+# already exists — `coord.state.list_drive_escalations()` (written by
+# `coord/drive.py`'s `_escalate_merge`/`_escalate_dead_end`) already carries
+# a structured `reason` + `proposed_command` per issue, and a `blocked`/
+# `failed` `drive_queue` row's `last_reason` already embeds "inspect:" /
+# "remedy:"-shaped lines a human reads by eye. This report folds BOTH
+# sources into one card per root cause — reusing `proposed_command`
+# verbatim and PARSING the embedded lines rather than re-deriving either.
+#
+# Read-only and additive, same posture as `drive-queue-status` above: no new
+# escalation-detection logic, no new persistence, and no touch on `coord
+# status`/`coord health`/`coord diagnose`.
+
+DECISIONS_COLUMNS = [
+    "repo",
+    "issue",
+    "title",
+    "why",
+    "options",
+    "downstream_count",
+    "downstream",
+    "since",
+    "source",
+]
+
+# One entry per DECISIONS_COLUMNS entry, same order (#1760).
+DECISIONS_COLUMN_META = [
+    ColumnMeta(id="repo", label="Repo", kind="text"),
+    ColumnMeta(id="issue", label="Issue", kind="int", align="right"),
+    ColumnMeta(id="title", label="Title", kind="text", weight=2.0),
+    ColumnMeta(id="why", label="Why", kind="text", weight=3.0),
+    ColumnMeta(id="options", label="Options", kind="list", weight=3.0),
+    ColumnMeta(id="downstream_count", label="Downstream", kind="int", align="right"),
+    ColumnMeta(id="downstream", label="Downstream Of This", kind="list"),
+    ColumnMeta(id="since", label="Since", kind="timestamp"),
+    ColumnMeta(id="source", label="Source", kind="enum"),
+]
+
+# `_resolve_prereqs`'s "queued but blocked/failed" verdict — the ONE
+# unsatisfiable `after=` shape #2362's `_reconcile_blocked_after` (and this
+# fold) treats as "downstream of another card", never a novel root cause.
+# Imported lazily (mirrors every other `coord.drive_queue` import in this
+# module) to keep this module importable from the thin client base install.
+def _unsatisfiable_prereq_reason(text: str) -> bool:
+    from coord.drive_queue import _is_unsatisfiable_prereq_reason  # noqa: PLC0415
+
+    return _is_unsatisfiable_prereq_reason(text)
+
+
+# A "Label: rest of the line" shape this fold recognises as an embedded
+# option — deliberately narrow (an allowlist below), so a `gates: k=v | ...`
+# or `last board state: ...` line (informational, not actionable) is never
+# mistaken for one.
+_LABELED_LINE_RE = re.compile(r"^(?P<label>[A-Za-z][A-Za-z '-]{1,40}?):\s*(?P<rest>\S.*)$")
+_OR_RERUN_RE = re.compile(r"^or\s+re-run\s+(?P<rest>\S.*)$", re.IGNORECASE)
+
+# Every label `coord/drive.py`'s `_die`/`_escalate_*` calls are already
+# known to embed (see #2283's "inspect:"/"Re-author by hand:"/"or re-run"
+# shape and coord-portal#107's "inspect: coord merge --plan --repo ..."
+# shape, both quoted in #2369) — reused verbatim, not reinvented.
+_OPTION_LABEL_WHAT_HAPPENS = {
+    "inspect": "Shows the raw log for the failed run.",
+    "inspect the gates": "Shows the current merge/test/review gate state.",
+    "remedy": "Applies the documented remedy for this block.",
+    "recover": "Runs the recorded recovery command.",
+    "recovery": "Runs the recorded recovery command.",
+    "proposed": "Runs the proposed fix.",
+    "re-author by hand": "Manually re-authors the slice from scratch.",
+    "re-dispatch by hand": "Manually re-dispatches the failed step.",
+    "resolve by hand": "Manually resolves the block, then clears the record.",
+    "continue by hand": "Manually continues the work the automation stopped.",
+    "re-run": "Re-runs the drive with the named flag.",
+}
+
+
+def _parse_reason_options(reason: str) -> list[dict[str, Any]]:
+    """Pull the de facto options already embedded in a `last_reason` (#2283 /
+    coord-portal#107's worked shapes) rather than inventing new ones.
+
+    The first line is the headline ("why"); every line after it is a
+    candidate. Recognises `"<label>: <command>"` lines whose label is in
+    :data:`_OPTION_LABEL_WHAT_HAPPENS`, and the `"or re-run ..."` shape
+    `coord/drive.py` writes with no colon. Anything else (a `gates:` summary,
+    a diagnostic block line, plain prose) is silently skipped — it isn't an
+    option, and #2369 explicitly scopes this to reformatting, not a new
+    taxonomy of failure classes.
+    """
+    options: list[dict[str, Any]] = []
+    lines = (reason or "").splitlines()[1:]
+    for raw_line in lines:
+        line = raw_line.strip().lstrip("-*•").strip()
+        if not line:
+            continue
+        match = _LABELED_LINE_RE.match(line)
+        if match:
+            label = match.group("label").strip()
+            key = label.lower()
+            if key in _OPTION_LABEL_WHAT_HAPPENS:
+                options.append(
+                    {
+                        "label": label[:1].upper() + label[1:],
+                        "command_or_action": match.group("rest").strip(),
+                        "what_happens": _OPTION_LABEL_WHAT_HAPPENS[key],
+                    }
+                )
+                continue
+        rerun = _OR_RERUN_RE.match(line)
+        if rerun:
+            options.append(
+                {
+                    "label": "Re-run",
+                    "command_or_action": rerun.group("rest").strip(),
+                    "what_happens": _OPTION_LABEL_WHAT_HAPPENS["re-run"],
+                }
+            )
+    return options[:4]
+
+
+def _generic_fallback_option(repo: str, row: Mapping[str, Any]) -> dict[str, Any]:
+    """The card #2369 promises even a genuinely novel shape gets — never a
+    silently dropped stuck item.  Merge-shaped text (mentions "merge"/"CI"/
+    "check", the coord-portal#107 shape) points at `coord merge --plan`;
+    anything else points at the assignment's own log."""
+    reason = str(row.get("last_reason") or "").lower()
+    if any(word in reason for word in ("merge", " ci ", "check", "ci)")):
+        return {
+            "label": "Inspect the merge plan",
+            "command_or_action": f"coord merge --plan --repo {repo}",
+            "what_happens": "Shows the current merge/test/review gate state for this repo.",
+        }
+    from coord.drive_queue import entry_key  # noqa: PLC0415
+
+    issue = int(row.get("issue_number") or 0)
+    assignment = row.get("session_name") or entry_key(repo, issue)
+    machine = row.get("machine") or "<machine>"
+    return {
+        "label": "Inspect the assignment log",
+        "command_or_action": f"coord log {assignment} --machine {machine}",
+        "what_happens": "Shows the raw session output for this entry.",
+    }
+
+
+def _first_line(text: str) -> str:
+    stripped = (text or "").strip()
+    return stripped.splitlines()[0].strip() if stripped else ""
+
+
+def _looks_stale_smoke(reason: str) -> bool:
+    low = (reason or "").lower()
+    return "stale" in low and "smoke" in low
+
+
+def _escalation_why(reason: str) -> str:
+    """The escalation's own `reason`, paired with what it means practically
+    when the shape is recognised (#2369's #2360 worked example: a stale
+    smoke verdict). A bare status string is not explanation enough on its
+    own — anything NOT recognised still gets the raw reason verbatim rather
+    than a guessed rephrasing (#2369: no new taxonomy of failure classes)."""
+    text = (reason or "").strip() or "(no reason recorded)"
+    if _looks_stale_smoke(text):
+        return (
+            f"{text.rstrip('.')}. Main moved forward past what was tested, "
+            "so the system can't confirm the tested code is still safe to "
+            "merge without a human saying so."
+        )
+    return text
+
+
+def fold_decisions(
+    escalations: Iterable[Mapping[str, Any]],
+    queue_entries: Iterable[Mapping[str, Any]],
+    generated_at: float,
+    *,
+    titles: Mapping[tuple[str, int], str] | None = None,
+) -> ReportResult:
+    """Fold escalation-table rows + blocked/failed queue rows into cards.
+
+    **Pure** — no DB, no daemon, no clock: *escalations* is whatever
+    :func:`coord.state.list_drive_escalations` returned, *queue_entries* is
+    whatever :func:`coord.state.list_drive_queue` returned (the FULL queue,
+    every state — this needs `waiting`/`done` rows too, to resolve an
+    `after=` chain's roots), and ``generated_at`` is the caller's clock
+    reading.
+
+    One card per root cause. An escalation-table row is always a root — it
+    names its own gate divergence, never another queue entry. A `blocked`/
+    `failed` queue row is a root UNLESS its `last_reason` is
+    `_resolve_prereqs`'s "queued but blocked/failed — it will never satisfy"
+    verdict AND its `after=` graph names another card's key — that row folds
+    into the root's card as a `downstream` entry instead of getting its own
+    (the #2283 cascade-collapse: "1 real problem, N waiting on it").
+    """
+    from coord.drive_queue import STATE_BLOCKED, STATE_FAILED, parse_key  # noqa: PLC0415
+
+    title_map = dict(titles or {})
+
+    escalated: dict[str, Mapping[str, Any]] = {}
+    for esc in escalations:
+        repo = esc.get("repo_name")
+        issue = esc.get("issue_number")
+        if not repo or issue is None:
+            continue
+        escalated[f"{repo}#{int(issue)}"] = esc
+
+    blocked_or_failed: dict[str, Mapping[str, Any]] = {}
+    for row in queue_entries:
+        repo = row.get("repo_name")
+        issue = row.get("issue_number")
+        if not repo or issue is None:
+            continue
+        if row.get("state") not in (STATE_BLOCKED, STATE_FAILED):
+            continue
+        blocked_or_failed[f"{repo}#{int(issue)}"] = row
+
+    universe = set(escalated) | set(blocked_or_failed)
+
+    # Immediate parent for every queue row whose own block is nothing but
+    # "one of my pre-reqs is itself stuck" — never for an escalation (an
+    # escalation names its own gate divergence, not another entry's key).
+    parent_of: dict[str, str] = {}
+    for key, row in blocked_or_failed.items():
+        if not _unsatisfiable_prereq_reason(row.get("last_reason") or ""):
+            continue
+        for dep_key in row.get("after_json") or []:
+            if dep_key in universe and dep_key != key:
+                parent_of[key] = dep_key
+                break
+
+    def _resolve_root(key: str) -> str:
+        seen: set[str] = set()
+        current = key
+        while current in parent_of and current not in seen:
+            seen.add(current)
+            current = parent_of[current]
+        return current
+
+    downstream_of: dict[str, list[str]] = {}
+    for key in parent_of:
+        root = _resolve_root(key)
+        downstream_of.setdefault(root, []).append(key)
+
+    root_keys = sorted(k for k in universe if k not in parent_of)
+
+    rows: list[dict[str, Any]] = []
+    for key in root_keys:
+        parsed = parse_key(key)
+        if parsed is None:
+            continue
+        repo, issue = parsed
+        downstream = sorted(set(downstream_of.get(key, [])))
+
+        if key in escalated:
+            esc = escalated[key]
+            reason = str(esc.get("reason") or "")
+            proposed = str(esc.get("proposed_command") or "")
+            options = [
+                {
+                    "label": "Recommended",
+                    "command_or_action": proposed,
+                    "what_happens": "Runs the fix the driver proposed when it escalated.",
+                    "recommended": True,
+                },
+                {
+                    "label": "Inspect",
+                    "command_or_action": f"coord escalate list --repo {repo}",
+                    "what_happens": "Shows the full escalation record, including gate readings.",
+                    "recommended": False,
+                },
+            ]
+            rows.append(
+                {
+                    "repo": repo,
+                    "issue": issue,
+                    "title": title_map.get((repo, issue)),
+                    "why": _escalation_why(reason),
+                    "options": options,
+                    "downstream_count": len(downstream),
+                    "downstream": downstream,
+                    "since": esc.get("created_at"),
+                    "source": "escalation",
+                    # Extra keys beyond `columns` — ReportResult's contract
+                    # allows this for a client that wants the detail.
+                    "stage": esc.get("stage") or "",
+                    "raw_reason": reason,
+                }
+            )
+            continue
+
+        row = blocked_or_failed[key]
+        reason = str(row.get("last_reason") or "")
+        parsed_options = _parse_reason_options(reason)
+        if parsed_options:
+            for i, opt in enumerate(parsed_options):
+                opt["recommended"] = i == 0
+            options = parsed_options
+        else:
+            fallback = _generic_fallback_option(repo, row)
+            fallback["recommended"] = True
+            options = [fallback]
+        rows.append(
+            {
+                "repo": repo,
+                "issue": issue,
+                "title": title_map.get((repo, issue)),
+                "why": _first_line(reason) or reason or "(no reason recorded)",
+                "options": options,
+                "downstream_count": len(downstream),
+                "downstream": downstream,
+                "since": row.get("reason_at") or row.get("enqueued_at"),
+                "source": "queue",
+                "stage": row.get("state") or "",
+                "raw_reason": reason,
+            }
+        )
+
+    notes: list[str] = []
+    if not rows:
+        notes.append(
+            "Nothing needs a decision — no blocked/failed drive-queue "
+            "entries and no open escalations."
+        )
+    else:
+        total_downstream = sum(r["downstream_count"] for r in rows)
+        headline = f"{len(rows)} decision{'s' if len(rows) != 1 else ''} pending"
+        if total_downstream:
+            headline += (
+                f" ({total_downstream} more entr"
+                f"{'y' if total_downstream == 1 else 'ies'} waiting on them)"
+            )
+        notes.append(headline + ".")
+
+    return ReportResult(
+        report_id="decisions",
+        generated_at=generated_at,
+        window=(generated_at, generated_at),
+        columns=list(DECISIONS_COLUMNS),
+        column_meta=list(DECISIONS_COLUMN_META),
+        rows=rows,
+        notes=notes,
+    )
+
+
+def _default_list_drive_escalations(repo: str | None) -> list[dict]:
+    from coord.state import list_drive_escalations  # noqa: PLC0415
+
+    return list_drive_escalations(repo)
+
+
+def run_decisions(
+    *,
+    repo: str = "",
+    now: float | None = None,
+    escalations_fetch: Callable[[str | None], Sequence[Mapping[str, Any]]] | None = None,
+    queue_fetch: Callable[[str | None], Sequence[Mapping[str, Any]]] | None = None,
+    title_lookup: Callable[..., Mapping[tuple[str, int], str]] | None = None,
+) -> ReportResult:
+    """Fetch both sources and fold them.  ``now``/``*_fetch``/``title_lookup``
+    are test seams; the report's own parameter is ``repo``.
+
+    Fetches the FULL (unfiltered) queue and escalation table regardless of
+    ``repo`` — mirrors `coord drive-queue list`'s #2183 fix: an `after=`
+    chain can cross repos, so filtering before the cascade collapse would
+    misdiagnose a cross-repo prereq as unrelated. ``repo`` is applied to the
+    finished cards instead.
+    """
+    generated_at = time.time() if now is None else float(now)
+    esc_fn = _default_list_drive_escalations if escalations_fetch is None else escalations_fetch
+    queue_fn = _default_list_drive_queue if queue_fetch is None else queue_fetch
+    escalations = list(esc_fn(None) or [])
+    queue_entries = list(queue_fn(None) or [])
+
+    keys = {
+        (str(e["repo_name"]), int(e["issue_number"]))
+        for e in escalations
+        if e.get("repo_name") and e.get("issue_number") is not None
+    }
+    keys |= {
+        (str(e["repo_name"]), int(e["issue_number"]))
+        for e in queue_entries
+        if e.get("repo_name") and e.get("issue_number") is not None
+    }
+    lookup = _lookup_titles if title_lookup is None else title_lookup
+    titles = lookup(keys)
+
+    result = fold_decisions(escalations, queue_entries, generated_at, titles=titles)
+    if repo:
+        result.rows = [r for r in result.rows if r["repo"] == repo]
+    return result
+
+
 # ── usage: the per-issue / per-repo cost + token rollup ────────────────────
 #
 # #1763.  This is a **correctness fix**, not a consolidation.  `coord-tui`'s
@@ -2141,6 +2541,30 @@ DRIVE_QUEUE_STATUS = ReportDef(
 )
 
 
+DECISIONS = ReportDef(
+    id="decisions",
+    title="Decisions",
+    description=(
+        "Why is the fleet stuck, as option-based cards instead of raw infra "
+        "text — one card per root cause, folding `coord escalate list`'s "
+        "structured merge-gate escalations and `drive-queue list`'s "
+        "blocked/failed rows into a plain-language `why`, 2-4 ready-to-run "
+        "options (one recommended), and a downstream count for anything "
+        "stuck only because this one is."
+    ),
+    params=(
+        ReportParam(
+            id="repo",
+            label="Repo",
+            kind="text",
+            default="",
+            help="Restrict to one repo by name. Empty means all repos.",
+        ),
+    ),
+    run=run_decisions,
+)
+
+
 USAGE = ReportDef(
     id="usage",
     title="Usage",
@@ -2377,6 +2801,7 @@ def csv_filename(result: "ReportResult | Mapping[str, Any]") -> str:
 REPORTS: dict[str, ReportDef] = {
     ISSUE_ACTIVITY.id: ISSUE_ACTIVITY,
     DRIVE_QUEUE_STATUS.id: DRIVE_QUEUE_STATUS,
+    DECISIONS.id: DECISIONS,
     USAGE.id: USAGE,
     QUEUE_OUTCOMES.id: QUEUE_OUTCOMES,
 }
