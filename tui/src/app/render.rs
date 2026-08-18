@@ -1830,14 +1830,14 @@ impl CoordApp {
             |_| SegmentMeasure::new(0.0),
         );
         bar.scroll_offset = layout.resolved_scroll_offset;
-        if layout.scroll_left.is_some() {
+        if false && layout.scroll_left.is_some() {
             if let Some(vt) = layout.visible_tabs.first() {
                 if let Some(t) = bar.tabs.get_mut(vt.tab_idx) {
                     t.label = format!("{SCROLL_LEFT_MARKER}{}", t.label);
                 }
             }
         }
-        if layout.scroll_right.is_some() {
+        if false && layout.scroll_right.is_some() {
             if let Some(vt) = layout.visible_tabs.last() {
                 if let Some(t) = bar.tabs.get_mut(vt.tab_idx) {
                     t.label = format!("{}{SCROLL_RIGHT_MARKER}", t.label);
