@@ -1020,6 +1020,42 @@ def _openapi_spec() -> dict:
                 },
             }
         },
+        "/drive-queue-reconcile": {
+            "post": {
+                "summary": (
+                    "Run `coord drive-queue tick --reconcile-only` on this "
+                    "machine (#2373)"
+                ),
+                "description": (
+                    "The per-machine self-heal `coord release propagate`'s "
+                    "drain-deadline escalation calls before it escalates "
+                    "loudly: only the host that actually launched a "
+                    "`running` drive-queue entry can resolve the #1870 "
+                    "cross-host liveness guard for it. Fleet-queue-wide, "
+                    "not scoped to a repo."
+                ),
+                "requestBody": {
+                    "required": False,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "timeout": {
+                                        "type": "number",
+                                        "description": (
+                                            "seconds for the tick subprocess; "
+                                            "defaults to 120."
+                                        ),
+                                    },
+                                },
+                            }
+                        }
+                    },
+                },
+                "responses": {"200": {"description": "OK (including a failed tick)"}},
+            }
+        },
         "/artifact/{repo}/{branch}": {
             "get": {
                 "summary": "Manifest of stashed build artifacts for a (repo, branch) pair",
@@ -1948,6 +1984,36 @@ def build_app(
         result = await asyncio.to_thread(server.fix_graph, repo, timeout=timeout)
         return JSONResponse(result)
 
+    async def drive_queue_reconcile(request: Request) -> JSONResponse:
+        """Run ``coord drive-queue tick --reconcile-only`` on THIS machine
+        (#2373). ``coord release propagate``'s drain-deadline escalation
+        POSTs here — before it escalates loudly — on whichever host it has
+        cordoned but that will not drain, so the one machine that can
+        actually resolve the #1870 cross-host liveness ambiguity for an
+        entry it launched gets asked to, automatically, instead of a human
+        needing to SSH in and run this by hand (the live 2026-08-18 incident
+        this closes).
+
+        Body: optional ``{"timeout": 120}``. No required fields, unlike
+        ``/graph-fix`` — a reconcile-only tick is fleet-queue-wide, not
+        scoped to one repo.
+
+        Runs off the event loop: the subprocess holds the drive-queue file
+        lock for the length of one tick, which must never stall this
+        agent's ``/health`` for the rest of the fleet.
+        """
+        body: dict = {}
+        try:
+            body = await request.json()
+        except Exception:
+            pass
+        try:
+            timeout = float(body.get("timeout", 120.0))
+        except (TypeError, ValueError):
+            timeout = 120.0
+        result = await asyncio.to_thread(server.reconcile_drive_queue, timeout=timeout)
+        return JSONResponse(result)
+
     routes = [
         Route("/health", health, methods=["GET"]),
         Route("/status", status, methods=["GET"]),
@@ -1973,6 +2039,10 @@ def build_app(
         # missing graph and set core.hooksPath, on the machines that
         # actually run workers rather than only on the operator's laptop.
         Route("/graph-fix", graph_fix, methods=["POST"]),
+        # #2373: `coord release propagate`'s drain-deadline escalation's
+        # per-machine self-heal — resolve a `running` drive-queue entry this
+        # host launched before the escalation fires loudly.
+        Route("/drive-queue-reconcile", drive_queue_reconcile, methods=["POST"]),
         # #305: artifact stash manifest (GET /artifact/<repo>/<branch>)
         Route("/artifact/{repo}/{branch}", artifact_manifest, methods=["GET"]),
         # #207: CPU + memory snapshot for TUI sparklines

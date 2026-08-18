@@ -6102,6 +6102,63 @@ class AgentServer:
             self._local_health_cache = None
         return {**result.to_dict(), "repo": repo_name}
 
+    def reconcile_drive_queue(self, *, timeout: float = 120.0) -> dict:
+        """``coord drive-queue tick --reconcile-only`` — run on THIS machine
+        (#2373 — ``coord release propagate``'s drain-deadline escalation
+        fans this out to a host it has cordoned but that will not drain).
+
+        The #1870 cross-host guard in ``coord.drive_queue._reconcile_running``
+        is keyed on a LOCAL tmux read: a `running` drive-queue entry can only
+        ever be resolved (dead vs. still working vs. parked on CI) by the
+        machine that actually launched it (``entry.launch_host``). A host
+        that only runs `coord-agent.service` — not `coord-drive-queue.timer`
+        — has no periodic tick of its own to do that, so an entry launched
+        there and never reconciled sits `running`/`unknown` forever and
+        renews the cordon that is waiting on it to drain. Confirmed live
+        2026-08-18 (claude-coordinator#2360): elitebook sat cordoned for
+        ~17h until a human SSH'd in and ran this exact command by hand — it
+        resolved in one call (the entry was parked on a CI re-check, #1891,
+        not dead). This method is that same command, reachable over this
+        agent's existing HTTP API instead of a human's SSH session.
+
+        Shells out (rather than calling the tick's Python entry point
+        in-process) for the same reason `coord release propagate`'s own
+        `_run_reconcile_tick` does: it is the real CLI path, with its own
+        file lock (`coord/filelock.drive_queue_lock_path`) against a
+        concurrently-running timer tick on this same host, and its own
+        `--config` resolution — reusing it here means there is exactly one
+        implementation of "what a reconcile-only tick does", not two that
+        can drift apart.
+
+        Returns ``{"ok": bool, "detail": str}``. ``ok=False`` with a
+        ``no local coordinator.yml`` detail when this agent has no on-disk
+        config to pass as ``--config`` — thin-client/config-free mode
+        (docs/EPHEMERAL_WORKERS.md) has nothing for a queue tick to resolve
+        against here. Never raises: the caller (`/drive-queue-reconcile`) is
+        a best-effort self-heal step inside a larger escalation, not a gate
+        that may take propagation down with it.
+        """
+        config_path = getattr(self._health_config, "path", None)
+        if not config_path:
+            return {
+                "ok": False,
+                "detail": (
+                    "no local coordinator.yml on this agent — cannot resolve "
+                    "a --config path for the tick"
+                ),
+            }
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-m", "coord.cli", "drive-queue", "tick",
+                 "--reconcile-only", "--config", str(config_path)],
+                capture_output=True, text=True, timeout=timeout,
+            )
+        except Exception as exc:  # noqa: BLE001 — best effort, see docstring
+            return {"ok": False, "detail": f"{type(exc).__name__}: {exc}"}
+        ok = proc.returncode == 0
+        detail = (proc.stderr or proc.stdout or "").strip()
+        return {"ok": ok, "detail": detail[:2000]}
+
     def list_repos(self) -> dict[str, dict]:
         """Return local HEAD / branch / dirty flag for each configured repo.
 

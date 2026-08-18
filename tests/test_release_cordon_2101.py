@@ -470,6 +470,11 @@ def test_the_drain_escalation_reaches_stderr_and_the_escalation_table(
         "coord.state.record_drive_escalation",
         lambda repo, issue, **kw: recorded.append({"repo": repo, **kw}),
     )
+    # #2373: `_apply_cordons` now POSTs to the escalated host's own agent
+    # before escalating — stub it so this test stays hermetic (no real DNS
+    # lookup against "server.tailnet") and asserts nothing about it; the
+    # dedicated #2373 test below covers that call itself.
+    monkeypatch.setattr(release_cmd, "_post", lambda *a, **k: (None, {}, "unreachable (test)"))
     # A cordon set two hours ago that has never drained.
     import time as _time
 
@@ -706,3 +711,128 @@ def test_end_to_end_cordon_drain_roll_uncordon_resume(
     records = rp.read_records(state_dir)
     assert records[0]["cordons"]["cordoned"] == ["server"]
     assert records[-1]["cordons"]["uncordoned"] == ["server"]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# #2373: a launch-host-only liveness ambiguity must not wedge the drain
+# forever — the escalated host's own agent is asked to resolve it first.
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Live incident, 2026-08-18 (claude-coordinator#2360): a drive-queue entry
+# launched on elitebook — a non-daemon host that runs only
+# `coord-agent.service`, no `coord-drive-queue.timer` — sat `running` for
+# ~17h. Every tick from the daemon host (dellserver) correctly refused to
+# declare it dead (#1870's cross-host guard, `local_host != launch_host`),
+# so it never left `running`, the cordon elitebook picked up for being
+# behind kept renewing on every propagate tick that found it "still busy",
+# and the drain-deadline escalation fired over and over with nothing ever
+# resolving the underlying ambiguity — because the only host that COULD
+# resolve it never ticks its own queue. Running `coord drive-queue tick
+# --reconcile-only` locally ON elitebook resolved it in one call (the entry
+# moved to `parked`, waiting on a CI re-check, #1891 — not actually dead).
+
+
+def test_a_behind_hosts_agent_is_asked_to_reconcile_before_the_drain_escalates(
+    tmp_home, valid_config_path, monkeypatch, tmp_path
+):
+    """The exact incident shape: `laptop` is behind, not the daemon, and is
+    where the wedged `running` entry actually lives. Asserts `coord release
+    propagate` POSTs to `laptop`'s own agent — not the daemon's, not
+    anywhere else — before the loud DRAIN OVERDUE message goes out, and
+    folds the self-heal's own outcome into that same message/record rather
+    than requiring a human to SSH in and run the command by hand.
+    """
+    _stub_state_dir(monkeypatch, tmp_path)
+    _stub_board(
+        monkeypatch,
+        drive_queue=[{"repo_name": "api", "issue_number": 42,
+                      "state": STATE_RUNNING, "machine": "laptop",
+                      "launch_host": "laptop"}],
+    )
+    # `server` is the daemon and already current; `laptop` is behind and is
+    # where the wedged entry actually launched — the shape #1870's guard
+    # exists for: only `laptop`'s OWN tick can tell this entry's true state.
+    _stub_verify(monkeypatch, versions={"laptop": ["0.5.26"], "server": ["0.5.31"]})
+
+    posts: list[str] = []
+
+    def fake_post(url, payload, *, timeout):
+        posts.append(url)
+        if url.endswith("/drive-queue-reconcile"):
+            return 200, {"ok": True, "detail": "moved to parked (#1891)"}, ""
+        return 200, {}, ""
+
+    monkeypatch.setattr(release_cmd, "_post", fake_post)
+
+    recorded: list[dict] = []
+    monkeypatch.setattr(
+        "coord.state.record_drive_escalation",
+        lambda repo, issue, **kw: recorded.append({"repo": repo, **kw}),
+    )
+
+    import time as _time
+
+    mp.local_set_cordon(
+        "laptop", target_version="0.5.31",
+        created_at=_time.time() - 7200, ttl_seconds=3600,
+    )
+
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.5.31"],
+    )
+
+    assert "DRAIN OVERDUE" in result.output
+    # Reached laptop's own agent specifically — the #1870 guard's contract
+    # is that only the launch host itself can resolve this, so asking any
+    # other machine would have been pointless.
+    reconcile_calls = [u for u in posts if u.endswith("/drive-queue-reconcile")]
+    assert reconcile_calls == ["http://laptop.tailnet:7433/drive-queue-reconcile"]
+    # The outcome is folded into the SAME escalation surfaced to stderr...
+    assert (
+        "asked laptop's own agent to run a local reconcile-only tick first "
+        "(#2373): ok (moved to parked (#1891))" in result.output
+    )
+    # ...and into the escalation table's own record — `coord drive
+    # escalations` shows the self-heal attempt with no second alert to
+    # correlate it against.
+    assert recorded and "reconcile-only tick" in recorded[0]["reason"]
+    assert "remote_reconcile=ok" in recorded[0]["gate_readings"]
+
+
+def test_the_remote_reconcile_failing_still_lets_the_drain_escalation_through(
+    tmp_home, valid_config_path, monkeypatch, tmp_path
+):
+    """An unreachable agent must not turn a real drain escalation into
+    silence — the loud message still goes out exactly as before #2373, with
+    the failed self-heal attempt folded in rather than hidden."""
+    _stub_state_dir(monkeypatch, tmp_path)
+    _stub_board(
+        monkeypatch,
+        drive_queue=[{"repo_name": "api", "issue_number": 42,
+                      "state": STATE_RUNNING, "machine": "laptop",
+                      "launch_host": "laptop"}],
+    )
+    _stub_verify(monkeypatch, versions={"laptop": ["0.5.26"], "server": ["0.5.31"]})
+    monkeypatch.setattr(
+        release_cmd, "_post",
+        lambda *a, **k: (None, {}, "ConnectError: [Errno 111] Connection refused"),
+    )
+
+    import time as _time
+
+    mp.local_set_cordon(
+        "laptop", target_version="0.5.31",
+        created_at=_time.time() - 7200, ttl_seconds=3600,
+    )
+
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.5.31"],
+    )
+
+    assert "DRAIN OVERDUE" in result.output
+    assert "reconcile-only tick first (#2373): failed" in result.output
+    assert "Connection refused" in result.output
