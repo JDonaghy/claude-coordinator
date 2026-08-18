@@ -618,13 +618,21 @@ pub fn make_app_with_audit_json(data: BoardData, audit_json: &str) -> CoordApp {
 /// The Queue panel carries no fetch of its own — `/board` already ships this
 /// data and the existing poll refreshes it — so unlike
 /// [`make_app_with_reports`] there is nothing here to mark as "already
-/// fetched".
+/// fetched". That very poll is instead disarmed here (`refresh_cadence:
+/// Off`): the usual fixture is `BoardData::default()` + only a drive queue,
+/// which leaves `apply_pending_data`'s #620 degraded-tick guard inert (it
+/// keys on machines/issues/assignments — all empty), so a periodic refresh
+/// firing mid-test would wholesale-replace `self.data` with the test stub's
+/// empty payload and wipe the seeded queue. On a loaded machine a driver
+/// test's dispatch loop can exceed the default 5 s cadence in wall-clock
+/// time, which made queue tests flaky under a full parallel suite run.
 ///
 /// Malformed JSON is a silent no-op (the panel then renders its own empty
 /// state) rather than a panic — assert on the resulting screen, not on this
 /// function's return.
 pub fn make_app_with_drive_queue(data: BoardData, drive_queue_json: &str) -> CoordApp {
     let mut app = make_test_app(data);
+    app.settings.refresh_cadence = crate::settings::RefreshCadence::Off;
     if let Ok(entries) =
         serde_json::from_str::<Vec<super::types::BoardDriveQueueEntry>>(drive_queue_json)
     {
