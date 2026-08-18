@@ -117,7 +117,19 @@ def _format_cell(column: str, row: dict, meta: dict | None = None) -> str:
     if isinstance(value, bool):
         return "yes" if value else "no"
     if isinstance(value, (list, tuple)):
-        return ",".join(str(v) for v in value) if value else "-"
+        if not value:
+            return "-"
+        if all(isinstance(v, dict) for v in value):
+            # The `decisions` report's `options` column (#2369): a list of
+            # `{label, command_or_action, ...}` dicts, not the scalar
+            # strings every other `kind: list` column holds. Rendered
+            # through the same rule the CSV export and the coord-tui
+            # Reports panel use, so a dict-shaped list item never falls
+            # through to a raw Python dict repr here.
+            from coord.reports import format_option_cell  # noqa: PLC0415
+
+            return " | ".join(format_option_cell(v) for v in value)
+        return ",".join(str(v) for v in value)
     if isinstance(value, dict):
         # drive_exit and friends: the two fields that matter, inline.
         if "exit_code" in value:

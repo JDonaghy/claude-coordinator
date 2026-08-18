@@ -590,6 +590,32 @@ impl CoordApp {
     /// cell reads like missing data. An em dash says "nothing, deliberately".
     const REPORTS_EMPTY_LIST: &'static str = "—";
 
+    /// One `list`-column item → its display text.
+    ///
+    /// Most `kind: list` columns hold scalars (`machines`, `issues`, ...)
+    /// and `reports_plain_text` is all they need. The `decisions` report's
+    /// `options` column (#2369) instead holds `{label, command_or_action,
+    /// what_happens, recommended}` dicts — rendered here the same way the
+    /// Python CLI table and CSV export do (`coord/reports.py`'s
+    /// `format_option_cell`), so this panel doesn't fall through to
+    /// `reports_plain_text`'s `other => other.to_string()`, which would
+    /// print a compact JSON blob per option instead of something readable.
+    fn reports_list_item_text(value: &serde_json::Value) -> String {
+        if let serde_json::Value::Object(map) = value {
+            let label = map.get("label").and_then(|v| v.as_str());
+            let command = map.get("command_or_action").and_then(|v| v.as_str());
+            if let (Some(label), Some(command)) = (label, command) {
+                let recommended = map
+                    .get("recommended")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let mark = if recommended { "★ " } else { "" };
+                return format!("{mark}{label}: {command}");
+            }
+        }
+        Self::reports_plain_text(value)
+    }
+
     /// One result cell, looked up **by column name** — the engine documents
     /// that `rows` may carry keys beyond `columns`, so positional indexing
     /// would silently mis-align the moment a report adds a detail field.
@@ -623,7 +649,7 @@ impl CoordApp {
                 Some(items) if items.is_empty() => Self::REPORTS_EMPTY_LIST.to_string(),
                 Some(items) => items
                     .iter()
-                    .map(Self::reports_plain_text)
+                    .map(Self::reports_list_item_text)
                     .collect::<Vec<_>>()
                     .join(", "),
                 None => Self::reports_plain_text(value),

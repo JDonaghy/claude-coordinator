@@ -1091,6 +1091,17 @@ class TestFoldDecisions:
         assert "Inspect" in labels
         assert "Re-author by hand" in labels
         assert any(o["recommended"] for o in card["options"])
+        # #2369 review: `drive_queue.py`'s `reason = f"{own_reason} — "
+        # f"{explanation}"` appends its rationale to `own_reason`'s LAST
+        # line (the "or re-run ..." line here) with no newline first — the
+        # parsed `Re-run` option must be just the runnable command, not that
+        # appended " — the board row is terminal ..." rationale too.
+        rerun = next(o for o in card["options"] if o["label"] == "Re-run")
+        assert rerun["command_or_action"] == (
+            "coord drive with --no-acceptance to skip JIT authoring."
+        )
+        assert "—" not in rerun["command_or_action"]
+        assert "blocking without spending an attempt" not in rerun["command_or_action"]
 
     def test_ci_shaped_block_parses_inspect_the_gates_line(self) -> None:
         """coord-portal#107's shape: a failing CI check, with the existing
@@ -1125,6 +1136,12 @@ class TestFoldDecisions:
         assert card["why"] == "something totally novel happened here"
         assert len(card["options"]) == 1
         assert card["options"][0]["recommended"] is True
+        # #2369 review: `coord log <session_name or entry_key>` resolves
+        # nothing — neither is a valid `coord log` ASSIGNMENT_ID. The
+        # fallback must point at a command that actually resolves.
+        assert card["options"][0]["command_or_action"] == (
+            "coord drive-queue list --repo api"
+        )
 
     def test_waiting_and_done_rows_are_never_cards(self) -> None:
         rows = [
@@ -1134,6 +1151,17 @@ class TestFoldDecisions:
         ]
         result = fold_decisions([], rows, 1000.0)
         assert result.rows == []
+
+    def test_root_cards_sort_numerically_not_lexically(self) -> None:
+        """#2369 review nit: sorting raw `"repo#issue"` strings puts
+        `"api#10"` before `"api#2"`; `parse_key`'s `(repo, issue)` sorts the
+        issue number as a number."""
+        rows = [
+            _dq_row(10, repo="api", state_="blocked", last_reason="x"),
+            _dq_row(2, repo="api", state_="blocked", last_reason="y"),
+        ]
+        result = fold_decisions([], rows, 1000.0)
+        assert [r["issue"] for r in result.rows] == [2, 10]
 
     def test_title_lookup_applied(self) -> None:
         result = fold_decisions(
@@ -1187,6 +1215,25 @@ class TestRunDecisions:
         )
         assert [r["repo"] for r in result.rows] == ["web"]
 
+    def test_repo_param_scopes_notes_to_the_filtered_rows(self) -> None:
+        """#2369 review: `notes` was computed from the FULL, unfiltered
+        fold before `repo` was applied to `rows`, so a `--repo web` call
+        with 2 `api` escalations + 1 `web` escalation reported "3 decisions
+        pending" next to a single-row table. `notes` must match `rows`."""
+        result = run_decisions(
+            repo="web",
+            now=1000.0,
+            escalations_fetch=lambda repo: [
+                _esc_row(1, repo="api"), _esc_row(2, repo="api"),
+                _esc_row(3, repo="web"),
+            ],
+            queue_fetch=lambda repo: [],
+            title_lookup=lambda keys: {},
+        )
+        assert len(result.rows) == 1
+        assert any("1 decision" in n for n in result.notes)
+        assert not any("3 decision" in n for n in result.notes)
+
     def test_full_queue_fetched_regardless_of_repo_param(self) -> None:
         """#2183-style: the cascade needs the FULL queue, not a `--repo`
         filtered slice, so both fetches are always called with ``None``."""
@@ -1228,6 +1275,33 @@ class TestRunDecisions:
             title_lookup=title_lookup,
         )
         assert seen_keys == {("api", 1), ("web", 2)}
+
+    def test_title_lookup_excludes_queue_rows_that_never_become_cards(self) -> None:
+        """#2369 review non-blocking finding: the queue fetch is
+        intentionally the FULL, unfiltered queue (every state, needed to
+        resolve `after=` roots) — but `title_lookup` must be scoped to the
+        rows that actually surface as cards, not every row that fetch
+        returned, or a real fleet's 280+ historical `waiting`/`done`/
+        `running` rows reintroduce the per-row title lookup this report
+        exists to avoid."""
+        seen_keys: set = set()
+
+        def title_lookup(keys):
+            seen_keys.update(keys)
+            return {}
+
+        run_decisions(
+            now=1000.0,
+            escalations_fetch=lambda repo: [],
+            queue_fetch=lambda repo: [
+                _dq_row(1, repo="api", state_="blocked", last_reason="x"),
+                _dq_row(2, repo="api", state_="waiting"),
+                _dq_row(3, repo="api", state_="done"),
+                _dq_row(4, repo="api", state_="running"),
+            ],
+            title_lookup=title_lookup,
+        )
+        assert seen_keys == {("api", 1)}
 
 
 # ── registry + parameter validation ────────────────────────────────────────
@@ -2190,6 +2264,35 @@ class TestFormatCell:
         assert _format_cell("started_at", row, started_meta) == "<window"
         assert _format_cell("merged_at", row, merged_meta) == "-"
 
+    def test_list_of_option_dicts_renders_as_label_colon_command(self) -> None:
+        """#2369 review: `decisions`' `options` column is `kind: "list"`
+        but holds `{label, command_or_action, ...}` dicts, not the scalar
+        strings every other `list` column carries — the old
+        `",".join(str(v) for v in value)` rendered a Python dict repr."""
+        from coord.commands.report import _format_cell
+
+        row = {
+            "options": [
+                {
+                    "label": "Recommended",
+                    "command_or_action": "coord diagnose api 1 --reset",
+                    "what_happens": "Runs the fix.",
+                    "recommended": True,
+                },
+                {
+                    "label": "Inspect",
+                    "command_or_action": "coord escalate list --repo api",
+                    "what_happens": "Shows the record.",
+                    "recommended": False,
+                },
+            ]
+        }
+        meta = {"id": "options", "kind": "list"}
+        cell = _format_cell("options", row, meta)
+        assert "{" not in cell and "'" not in cell
+        assert "Recommended: coord diagnose api 1 --reset" in cell
+        assert "Inspect: coord escalate list --repo api" in cell
+
     def test_render_table_never_prints_window_marker_for_merged_at(self) -> None:
         from coord.commands.report import _render_table
         from coord.reports import ISSUE_ACTIVITY_COLUMN_META, ISSUE_ACTIVITY_COLUMNS
@@ -2720,6 +2823,36 @@ class TestCsvSerializer:
     def test_one_row_per_row(self) -> None:
         rows = _parse_csv(result_to_csv(_csv_fixture_result()))
         assert len(rows) == 2  # header + one data row
+
+    def test_list_of_option_dicts_exports_as_label_colon_command(self) -> None:
+        """#2369 review: `_csv_scalar`'s `str(value)` fallback rendered a
+        `decisions`-style `options` list of `{label, command_or_action,
+        ...}` dicts as a Python dict repr — `format_option_cell` fixes it
+        for CSV the same way it does for the CLI table."""
+        result = ReportResult(
+            report_id="decisions",
+            generated_at=WINDOW[1],
+            window=WINDOW,
+            columns=["issue", "options"],
+            rows=[
+                {
+                    "issue": 2360,
+                    "options": [
+                        {
+                            "label": "Recommended",
+                            "command_or_action": "coord diagnose api 1 --reset",
+                            "what_happens": "Runs the fix.",
+                            "recommended": True,
+                        },
+                    ],
+                }
+            ],
+            notes=[],
+        )
+        rows = _parse_csv(result_to_csv(result))
+        cell = rows[1][rows[0].index("options")]
+        assert "{" not in cell and "'" not in cell
+        assert "Recommended: coord diagnose api 1 --reset" in cell
 
     def test_started_at_exports_as_the_raw_epoch_not_a_relative_string(self) -> None:
         """The whole reason the serializer is server-side: an epoch must

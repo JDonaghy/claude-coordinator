@@ -1207,8 +1207,11 @@ DECISIONS_COLUMN_META = [
 ]
 
 # `_resolve_prereqs`'s "queued but blocked/failed" verdict — the ONE
-# unsatisfiable `after=` shape #2362's `_reconcile_blocked_after` (and this
-# fold) treats as "downstream of another card", never a novel root cause.
+# unsatisfiable `after=` shape `coord/drive_queue.py`'s own blocked-row
+# handling (and this fold) treats as "downstream of another card", never a
+# novel root cause. `_is_unsatisfiable_prereq_reason` is the actual reused
+# predicate (imported below) — reused conceptually, not mechanically, same
+# as #2369's own docstring says of `coord/dead_end.py`.
 # Imported lazily (mirrors every other `coord.drive_queue` import in this
 # module) to keep this module importable from the thin client base install.
 def _unsatisfiable_prereq_reason(text: str) -> bool:
@@ -1223,6 +1226,23 @@ def _unsatisfiable_prereq_reason(text: str) -> bool:
 # mistaken for one.
 _LABELED_LINE_RE = re.compile(r"^(?P<label>[A-Za-z][A-Za-z '-]{1,40}?):\s*(?P<rest>\S.*)$")
 _OR_RERUN_RE = re.compile(r"^or\s+re-run\s+(?P<rest>\S.*)$", re.IGNORECASE)
+
+# `coord/drive_queue.py`'s `reason = f"{own_reason} — {explanation}"` (the
+# #1844/#2019 "permanent" branch, and its `parking without spending an
+# attempt` siblings) appends its rationale to `own_reason`'s LAST line with
+# no newline in between — so when that last line is itself the "or re-run
+# ..."/labeled-line an option is parsed from, the appended rationale reads
+# as if it were part of the command (#2369 review: the #2283 dead-end
+# fixture's `Re-run` option ends up with "... skip JIT authoring. — the
+# board row is terminal and unactionable ..., blocking without spending an
+# attempt" as its `command_or_action`). `" — "` (em dash, never a bare
+# `--` flag) is the one join marker this repo uses for "reason + why", so
+# stripping from its first occurrence recovers just the command.
+_APPENDED_RATIONALE_RE = re.compile(r"\s+—\s+.*$")
+
+
+def _strip_appended_rationale(text: str) -> str:
+    return _APPENDED_RATIONALE_RE.sub("", text).strip()
 
 # Every label `coord/drive.py`'s `_die`/`_escalate_*` calls are already
 # known to embed (see #2283's "inspect:"/"Re-author by hand:"/"or re-run"
@@ -1269,7 +1289,9 @@ def _parse_reason_options(reason: str) -> list[dict[str, Any]]:
                 options.append(
                     {
                         "label": label[:1].upper() + label[1:],
-                        "command_or_action": match.group("rest").strip(),
+                        "command_or_action": _strip_appended_rationale(
+                            match.group("rest")
+                        ),
                         "what_happens": _OPTION_LABEL_WHAT_HAPPENS[key],
                     }
                 )
@@ -1279,7 +1301,9 @@ def _parse_reason_options(reason: str) -> list[dict[str, Any]]:
             options.append(
                 {
                     "label": "Re-run",
-                    "command_or_action": rerun.group("rest").strip(),
+                    "command_or_action": _strip_appended_rationale(
+                        rerun.group("rest")
+                    ),
                     "what_happens": _OPTION_LABEL_WHAT_HAPPENS["re-run"],
                 }
             )
@@ -1290,7 +1314,13 @@ def _generic_fallback_option(repo: str, row: Mapping[str, Any]) -> dict[str, Any
     """The card #2369 promises even a genuinely novel shape gets — never a
     silently dropped stuck item.  Merge-shaped text (mentions "merge"/"CI"/
     "check", the coord-portal#107 shape) points at `coord merge --plan`;
-    anything else points at the assignment's own log."""
+    anything else points at `coord drive-queue list --repo <repo>` — the one
+    command guaranteed to resolve.  A `coord log <id>` fallback was tried
+    first and dropped (#2369 review): a drive-queue row's `session_name` is
+    the *tmux session name* `drive_session_name` writes for `tmux attach`,
+    not a `coord log` `ASSIGNMENT_ID`, and `entry_key(repo, issue)`
+    (`"repo#issue"`) isn't one either — both would hand the operator a
+    command that resolves nothing."""
     reason = str(row.get("last_reason") or "").lower()
     if any(word in reason for word in ("merge", " ci ", "check", "ci)")):
         return {
@@ -1298,15 +1328,11 @@ def _generic_fallback_option(repo: str, row: Mapping[str, Any]) -> dict[str, Any
             "command_or_action": f"coord merge --plan --repo {repo}",
             "what_happens": "Shows the current merge/test/review gate state for this repo.",
         }
-    from coord.drive_queue import entry_key  # noqa: PLC0415
-
     issue = int(row.get("issue_number") or 0)
-    assignment = row.get("session_name") or entry_key(repo, issue)
-    machine = row.get("machine") or "<machine>"
     return {
-        "label": "Inspect the assignment log",
-        "command_or_action": f"coord log {assignment} --machine {machine}",
-        "what_happens": "Shows the raw session output for this entry.",
+        "label": "Inspect the queue row",
+        "command_or_action": f"coord drive-queue list --repo {repo}",
+        "what_happens": f"Shows this and every other queued entry for {repo} (look for #{issue}).",
     }
 
 
@@ -1334,6 +1360,28 @@ def _escalation_why(reason: str) -> str:
             "merge without a human saying so."
         )
     return text
+
+
+def _decisions_notes(rows: Sequence[Mapping[str, Any]]) -> list[str]:
+    """The headline note for a set of already-finished decision cards.
+
+    A function of *rows* alone (never the unfiltered fold input) so it can
+    be recomputed after `run_decisions` applies its `repo` filter (#2369
+    review: computing this once, before the filter, left a `--repo`-scoped
+    call reporting a global count next to a repo-scoped row list)."""
+    if not rows:
+        return [
+            "Nothing needs a decision — no blocked/failed drive-queue "
+            "entries and no open escalations."
+        ]
+    total_downstream = sum(r["downstream_count"] for r in rows)
+    headline = f"{len(rows)} decision{'s' if len(rows) != 1 else ''} pending"
+    if total_downstream:
+        headline += (
+            f" ({total_downstream} more entr"
+            f"{'y' if total_downstream == 1 else 'ies'} waiting on them)"
+        )
+    return [headline + "."]
 
 
 def fold_decisions(
@@ -1409,7 +1457,15 @@ def fold_decisions(
         root = _resolve_root(key)
         downstream_of.setdefault(root, []).append(key)
 
-    root_keys = sorted(k for k in universe if k not in parent_of)
+    # Numeric-aware: sorting the raw `"repo#issue"` strings would put
+    # `"api#10"` before `"api#2"` (#2369 review nit) — `parse_key` gives
+    # `(repo, issue)` so the issue number sorts as a number, not text. A key
+    # `parse_key` can't parse (shouldn't happen — `universe` is built from
+    # `entry_key`-shaped keys) sorts last rather than raising.
+    root_keys = sorted(
+        (k for k in universe if k not in parent_of),
+        key=lambda k: parse_key(k) or (k, 1 << 62),
+    )
 
     rows: list[dict[str, Any]] = []
     for key in root_keys:
@@ -1483,22 +1539,6 @@ def fold_decisions(
             }
         )
 
-    notes: list[str] = []
-    if not rows:
-        notes.append(
-            "Nothing needs a decision — no blocked/failed drive-queue "
-            "entries and no open escalations."
-        )
-    else:
-        total_downstream = sum(r["downstream_count"] for r in rows)
-        headline = f"{len(rows)} decision{'s' if len(rows) != 1 else ''} pending"
-        if total_downstream:
-            headline += (
-                f" ({total_downstream} more entr"
-                f"{'y' if total_downstream == 1 else 'ies'} waiting on them)"
-            )
-        notes.append(headline + ".")
-
     return ReportResult(
         report_id="decisions",
         generated_at=generated_at,
@@ -1506,7 +1546,7 @@ def fold_decisions(
         columns=list(DECISIONS_COLUMNS),
         column_meta=list(DECISIONS_COLUMN_META),
         rows=rows,
-        notes=notes,
+        notes=_decisions_notes(rows),
     )
 
 
@@ -1531,7 +1571,9 @@ def run_decisions(
     ``repo`` — mirrors `coord drive-queue list`'s #2183 fix: an `after=`
     chain can cross repos, so filtering before the cascade collapse would
     misdiagnose a cross-repo prereq as unrelated. ``repo`` is applied to the
-    finished cards instead.
+    finished cards instead — and ``notes`` is recomputed from those same
+    finished cards (#2369 review), so a ``--repo``-scoped call never reports
+    a headline count that includes another repo's decisions.
     """
     generated_at = time.time() if now is None else float(now)
     esc_fn = _default_list_drive_escalations if escalations_fetch is None else escalations_fetch
@@ -1539,22 +1581,24 @@ def run_decisions(
     escalations = list(esc_fn(None) or [])
     queue_entries = list(queue_fn(None) or [])
 
-    keys = {
-        (str(e["repo_name"]), int(e["issue_number"]))
-        for e in escalations
-        if e.get("repo_name") and e.get("issue_number") is not None
-    }
-    keys |= {
-        (str(e["repo_name"]), int(e["issue_number"]))
-        for e in queue_entries
-        if e.get("repo_name") and e.get("issue_number") is not None
-    }
+    # Folded WITHOUT titles first, then the title lookup is scoped to just
+    # the resulting cards' keys (#2369 review non-blocking finding): the
+    # queue fetch above is intentionally the FULL, unfiltered queue (every
+    # state, needed to resolve `after=` roots), so keying the lookup off its
+    # raw rows would query titles for `waiting`/`done`/`running` entries
+    # that never surface in this report — the exact "280+ historical rows"
+    # overhead #2369 opens by naming as the problem this report exists to
+    # avoid.
+    result = fold_decisions(escalations, queue_entries, generated_at, titles=None)
+    card_keys = {(r["repo"], r["issue"]) for r in result.rows}
     lookup = _lookup_titles if title_lookup is None else title_lookup
-    titles = lookup(keys)
+    titles = lookup(card_keys)
+    for r in result.rows:
+        r["title"] = titles.get((r["repo"], r["issue"]))
 
-    result = fold_decisions(escalations, queue_entries, generated_at, titles=titles)
     if repo:
         result.rows = [r for r in result.rows if r["repo"] == repo]
+    result.notes = _decisions_notes(result.rows)
     return result
 
 
@@ -2690,6 +2734,31 @@ def _csv_scalar(value: Any) -> str:
     return str(value)
 
 
+def format_option_cell(option: Mapping[str, Any]) -> str:
+    """One ``{label, command_or_action, what_happens, recommended}`` option
+    dict (the ``decisions`` report's ``options`` column shape, #2369) → its
+    single-line display text.
+
+    Shared by the CLI human table (:mod:`coord.commands.report`), this
+    module's own CSV export, and the coord-tui Reports panel's Rust port of
+    this same rule — so a ``kind: list`` column that happens to hold option
+    dicts, rather than the far more common list of scalar strings every
+    other report uses, renders as ``"<label>: <command>"`` on all three
+    surfaces instead of a raw Python/JSON dict blob (#2369 review: every
+    existing ``kind: list`` renderer only knew how to flatten a list of
+    scalars). Falls back to ``key=value`` pairs for a dict that doesn't
+    match the ``{label, command_or_action}`` shape, so an unrelated
+    dict-valued list column — should one ever exist — still renders
+    *something* readable rather than nothing.
+    """
+    label = option.get("label")
+    command = option.get("command_or_action")
+    if label and command:
+        mark = "★ " if option.get("recommended") else ""
+        return f"{mark}{label}: {command}"
+    return ", ".join(f"{k}={v}" for k, v in option.items())
+
+
 def _csv_cell(value: Any) -> str:
     """One row value → one CSV field.
 
@@ -2702,9 +2771,17 @@ def _csv_cell(value: Any) -> str:
     multi-line driver-exit reason is the regression fixture).  JSON-encoding
     the dict would have escaped that newline into a literal ``\\n`` and lost
     the round-trip.
+
+    A list item that is itself a dict (the ``decisions`` report's
+    ``options`` column, #2369) renders through :func:`format_option_cell`
+    rather than ``_csv_scalar``'s ``str(value)`` fallback, which would emit
+    a Python dict repr.
     """
     if isinstance(value, (list, tuple)):
-        return "; ".join(_csv_scalar(v) for v in value)
+        return "; ".join(
+            format_option_cell(v) if isinstance(v, Mapping) else _csv_scalar(v)
+            for v in value
+        )
     if isinstance(value, Mapping):
         return "; ".join(f"{k}={_csv_scalar(v)}" for k, v in value.items())
     return _csv_scalar(value)
