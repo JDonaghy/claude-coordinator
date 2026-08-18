@@ -14,8 +14,10 @@
 //! A document key is `(repo, issue_number)`. Each [`PanelScope`] owns its own
 //! [`DocTabGroup`]: an ordered `Vec<DocKey>`, the index of the active tab, and
 //! optionally the index of the single preview tab. The scope split is what
-//! keeps Board's and Pipeline's sets from merging (contract §3b) — this slice
-//! only wires `Board`, but the shape is the one #2284 inherits.
+//! keeps Board's and Pipeline's sets from merging (contract §3b) — #2282
+//! wired `Board`; #2284 wires `Pipeline` against this same shape, one
+//! `DocTabGroup` per scope, so the two never merge, reorder or drop into
+//! each other when the active panel switches.
 //!
 //! # Open semantics (contract §2e)
 //!
@@ -50,11 +52,10 @@ use crate::app::format::trunc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum PanelScope {
     Board,
-    /// Reserved for #2284, which gives the Pipeline panel its own tab set.
-    /// [`DocTabs::group`]/[`DocTabs::group_mut`] already route to it, but no
-    /// caller constructs this variant until that slice lands — hence the
-    /// allow, which should be deleted (not widened) by #2284.
-    #[allow(dead_code)]
+    /// #2284: the Pipeline panel's own independent tab set — same
+    /// preview/pin semantics as Board, stored and revealed against the
+    /// Pipeline sidebar (never the Board's). See `pipeline.rs`'s
+    /// "#2284 (ms-65 §3): Pipeline document tabs" section.
     Pipeline,
 }
 

@@ -5455,11 +5455,49 @@ impl CoordApp {
                         }
                         true
                     }
-                    // #646 focus-follows-click: row click/activate blurs the search filter.
-                    SidebarEvent::RowSelected { .. } | SidebarEvent::RowActivated { .. } => {
+                    // #646 focus-follows-click: row click blurs the search filter.
+                    //
+                    // #2284 (ms-65 §3): a single click on an issue row opens
+                    // it in the Pipeline scope's own PREVIEW tab — the exact
+                    // Board rule (§2e 1/2/4, `open_board_doc_tab`), just
+                    // against `PanelScope::Pipeline`. `self.pipeline_sel`
+                    // (resynced from the tree path just above, via
+                    // `selected_pipeline_index`) is already `None` for a
+                    // header row at any bucket's depth, so this only fires
+                    // for a genuine issue row — the same discriminator the
+                    // Board arm gets for free from `path.len() == 2`.
+                    SidebarEvent::RowSelected { .. } => {
                         if self.pipeline_search.focused {
                             self.pipeline_search.focused = false;
                             self.pipeline_sidebar.focus_form(0, false);
+                        }
+                        if let Some(idx) = self.pipeline_sel {
+                            if let Some(issue) = self.pipeline_issues.get(idx) {
+                                let key = (issue.repo_slug.clone(), issue.number);
+                                self.open_pipeline_doc_tab(key, false);
+                            }
+                        }
+                        true
+                    }
+                    // #2284 (ms-65 §3): a double click (RowActivated) is
+                    // open-or-activate followed by PROMOTION — mirrors
+                    // `open_board_doc_tab`'s rule-3 call site: only pin when
+                    // the row the gesture landed on is already the active
+                    // document (a genuine double click always is, by the
+                    // time RowSelected's MouseDown has run first; see the
+                    // Board arm's own comment for the DoubleClickDetector
+                    // fold case this guards against).
+                    SidebarEvent::RowActivated { .. } => {
+                        if self.pipeline_search.focused {
+                            self.pipeline_search.focused = false;
+                            self.pipeline_sidebar.focus_form(0, false);
+                        }
+                        if let Some(idx) = self.pipeline_sel {
+                            if let Some(issue) = self.pipeline_issues.get(idx) {
+                                let key = (issue.repo_slug.clone(), issue.number);
+                                let pin = self.pipeline_doc_active_key() == Some(&key);
+                                self.open_pipeline_doc_tab(key, pin);
+                            }
                         }
                         true
                     }
@@ -5751,6 +5789,44 @@ impl CoordApp {
             // the main panel — `(lh * 1.4).round()`, so the TUI and pixel
             // backends agree on the boundary (#464).
             let tab_h = detail_tab_bar_height(lh);
+            // #2284 (ms-65 §3a): the Pipeline doc-tab strip is the FIRST row
+            // of the main panel (no toolbar precedes it here, unlike Board),
+            // so it must be hit-tested before the Overview/Issue/Log/Summary/
+            // Terminal sub-tab bar below — mirroring the Board arm's own
+            // `board_doc_tab_strip` hit-test, `main_b` is shrunk for
+            // everything under it exactly as the paint path (`render.rs`)
+            // does, from the SAME `pipeline_doc_tab_strip` call the painter
+            // uses so a click column can never resolve to a different tab
+            // than the one actually on screen.
+            let strip = self.pipeline_doc_tab_strip(main_b.width);
+            let main_b = match &strip {
+                Some(strip) if !strip.tabs.is_empty() => {
+                    if pos.y - main_b.y < tab_h {
+                        let refs: Vec<&str> =
+                            strip.tabs.iter().map(|t| t.label.as_str()).collect();
+                        // Clicking a tab's `×` closes it; clicking its BODY
+                        // activates it — same split as the Board arm's own
+                        // `resolve_doc_tab_click` call.
+                        return match resolve_doc_tab_click(
+                            &refs,
+                            main_b.x,
+                            pos.x,
+                            strip.scroll_offset,
+                        ) {
+                            Some(TabClickKind::Close(idx)) => self.close_pipeline_doc_tab(idx),
+                            Some(TabClickKind::Body(idx)) => self.activate_pipeline_doc_tab(idx),
+                            None => false,
+                        };
+                    }
+                    Rect::new(
+                        main_b.x,
+                        main_b.y + tab_h,
+                        main_b.width,
+                        (main_b.height - tab_h).max(0.0),
+                    )
+                }
+                _ => main_b,
+            };
             if pos.y - main_b.y < tab_h {
                 let bar = self.pipeline_detail_tab_bar();
                 let labels: Vec<&str> = bar.tabs.iter().map(|t| t.label.as_str()).collect();

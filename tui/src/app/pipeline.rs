@@ -3720,6 +3720,26 @@ impl CoordApp {
         // pipeline_issues swap) and only fall back to the internal capture
         // when the caller didn't touch the list.
         let prev_sel = prev_sel_override.or_else(|| self.capture_pipeline_selection_id());
+        // #2284 (ms-65 §2f, applied per-scope): the issue whose Pipeline
+        // document tab is active — mirrors `mod.rs`'s `rebuild_board_sidebar`
+        // `active_doc` local exactly, keyed by (`repo_slug`, number) to match
+        // this scope's own `DocKey` convention (see `pipeline_doc_active_key`'s
+        // doc comment). Every issue-row builder below splices a `▸ ` marker
+        // ahead of its `#<N>` span when this matches, so "which document am I
+        // looking at" is legible in the Pipeline tree exactly like it is on
+        // Board — never the Board's own `▸`, which lives in a completely
+        // separate `DocTabGroup` (contract §3b: the two scopes never merge).
+        let active_doc: Option<DocKey> = self.pipeline_doc_tabs().active_key().cloned();
+        // Shared by every issue-row builder below (In-progress/Done/New/
+        // Refining-Pending each build their own `spans` vec) so the `▸ N`
+        // splice point — same colour, same position ahead of the `#<N>` span
+        // — can't drift between the four call sites.
+        let doc_marker_span = |issue: &PipelineIssue| -> Option<StyledSpan> {
+            active_doc
+                .as_ref()
+                .is_some_and(|(r, n)| *r == issue.repo_slug && *n == issue.number)
+                .then(|| StyledSpan::with_fg("▸ ".to_string(), Color::rgb(220, 220, 120)))
+        };
         // Preserve panel scroll across rebuilds — without this, every 15 s
         // refresh resets the sidebar's scroll to 0 and yanks the visible
         // area back to the top, even when the selection itself is restored
@@ -4004,10 +4024,16 @@ impl CoordApp {
                                     self.epic_expand_state(issue, children)
                                         .map(|(key, expanded)| (key, expanded, children))
                                 });
-                                let mut spans = vec![StyledSpan::with_fg(
+                                let mut spans = Vec::new();
+                                // #2284 (ms-65 §2f): active-document marker,
+                                // spliced ahead of the `#<N>` span itself.
+                                if let Some(marker) = doc_marker_span(issue) {
+                                    spans.push(marker);
+                                }
+                                spans.push(StyledSpan::with_fg(
                                     format!("#{:<5}", issue.number),
                                     Color::rgb(150, 150, 240),
-                                )];
+                                ));
                                 // #1198: epic marker, label-driven — see
                                 // `epic_badge_span`. Spliced between `#N` and
                                 // the title (not appended at the end) so it
@@ -4133,10 +4159,16 @@ impl CoordApp {
                             }
                             None => String::new(),
                         };
-                        let mut spans = vec![StyledSpan::with_fg(
+                        let mut spans = Vec::new();
+                        // #2284 (ms-65 §2f): active-document marker, spliced
+                        // ahead of the `#<N>` span itself.
+                        if let Some(marker) = doc_marker_span(issue) {
+                            spans.push(marker);
+                        }
+                        spans.push(StyledSpan::with_fg(
                             format!("#{:<5}", issue.number),
                             Color::rgb(150, 150, 240),
-                        )];
+                        ));
                         // #1198: epic marker, label-driven — see
                         // `epic_badge_span`. Spliced between `#N` and the
                         // title (not appended at the end) so it can't be
@@ -4361,10 +4393,17 @@ impl CoordApp {
                                     let wo_node = issue.coord_repo.as_ref().and_then(|rn| {
                                         self.work_order_node_for(rn, issue.number)
                                     });
-                                    let mut spans = vec![StyledSpan::with_fg(
+                                    let mut spans = Vec::new();
+                                    // #2284 (ms-65 §2f): active-document
+                                    // marker, spliced ahead of the `#<N>`
+                                    // span itself.
+                                    if let Some(marker) = doc_marker_span(issue) {
+                                        spans.push(marker);
+                                    }
+                                    spans.push(StyledSpan::with_fg(
                                         format!("#{:<5}", issue.number),
                                         Color::rgb(150, 150, 240),
-                                    )];
+                                    ));
                                     // #1198: epic marker, label-driven — see
                                     // `epic_badge_span`. Spliced between `#N`
                                     // and the title (not appended at the
@@ -4484,10 +4523,16 @@ impl CoordApp {
                                     .watch_pool
                                     .values()
                                     .any(|ctx| ctx.state.issue_number == issue.number && !ctx.sse.done);
-                                let mut spans = vec![StyledSpan::with_fg(
+                                let mut spans = Vec::new();
+                                // #2284 (ms-65 §2f): active-document marker,
+                                // spliced ahead of the `#<N>` span itself.
+                                if let Some(marker) = doc_marker_span(issue) {
+                                    spans.push(marker);
+                                }
+                                spans.push(StyledSpan::with_fg(
                                     format!("#{:<5}", issue.number),
                                     Color::rgb(150, 150, 240),
-                                )];
+                                ));
                                 // #1198: epic marker, label-driven — see
                                 // `epic_badge_span`. Spliced between `#N`
                                 // and the title (not appended at the end)
@@ -8077,6 +8122,148 @@ impl CoordApp {
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.pending_paused_machines = None;
                 false
+            }
+        }
+    }
+
+    // ── #2284 (ms-65 §3): Pipeline document tabs ─────────────────────────
+    //
+    // Pipeline's own independent `PanelScope::Pipeline` tab set — the exact
+    // Board pattern (`mod.rs`'s "#2282 (ms-65 §2): Board document tabs"
+    // section), scoped to `doc_tabs.group(PanelScope::Pipeline)` and to
+    // Pipeline's own issue cache/sidebar instead of Board's. Deliberately
+    // does NOT wire close/`Ctrl-W`/`Ctrl-Tab` (contract §4, #2283) — that
+    // issue's sealed slice only ever exercised the Board strip, and this
+    // issue's contract (§3) is scoped to independence + reveal, not
+    // close/navigate. `DocTabGroup::close` is scope-agnostic, so a future
+    // slice can wire it in without touching the model.
+
+    /// The Pipeline panel's document-tab set.
+    ///
+    /// `pub(crate)`: unlike Board's `mod.rs`-resident equivalent (private but
+    /// reachable from every descendant module because `mod.rs` *is* the
+    /// `app` module), this lives in the `app::pipeline` submodule, so
+    /// `render.rs`/`events.rs` (sibling submodules) need explicit crate
+    /// visibility to call it.
+    pub(crate) fn pipeline_doc_tabs(&self) -> &doc_tabs::DocTabGroup {
+        self.doc_tabs.group(PanelScope::Pipeline)
+    }
+
+    /// The active Pipeline document's key, or `None` when no tab is open.
+    pub(crate) fn pipeline_doc_active_key(&self) -> Option<&DocKey> {
+        self.pipeline_doc_tabs().active_key()
+    }
+
+    /// Look one issue up in `pipeline_issues` by its doc key — `repo_slug`
+    /// (the GitHub `owner/name` form `capture_pipeline_selection_id` and
+    /// `rebuild_pipeline_sidebar`'s `prev_sel_override` already key
+    /// selection-restore by), not `coord_repo`. Pipeline doc keys use this
+    /// convention throughout this section so every tab-model access agrees
+    /// with the sidebar's own restore path.
+    pub(crate) fn pipeline_issue_for(&self, repo: &str, number: u64) -> Option<&PipelineIssue> {
+        self.pipeline_issues
+            .iter()
+            .find(|pi| pi.repo_slug == repo && pi.number == number)
+    }
+
+    /// Open `key` in the Pipeline tab strip — the Pipeline-scope counterpart
+    /// of `mod.rs`'s `open_board_doc_tab`; see that method's doc comment for
+    /// the `pin` semantics (contract §2e rules 1/2/4 for `false`, rule 3 for
+    /// `true`). Reveals the newly-active document in the Pipeline sidebar
+    /// (§2f, applied per-scope per #2284's fourth acceptance criterion) when
+    /// activation actually moved.
+    pub(crate) fn open_pipeline_doc_tab(&mut self, key: DocKey, pin: bool) {
+        let before = self.pipeline_doc_active_key().cloned();
+        {
+            let group = self.doc_tabs.group_mut(PanelScope::Pipeline);
+            if pin {
+                group.pin(key);
+            } else {
+                group.open_preview(key);
+            }
+        }
+        if self.pipeline_doc_active_key().cloned() != before {
+            self.reveal_pipeline_active_doc();
+        }
+    }
+
+    /// Activate the Pipeline tab at strip index `idx` (a click on the strip
+    /// itself). Returns `true` when the click landed on a real tab. Reveals
+    /// unconditionally, mirroring `mod.rs`'s `activate_board_doc_tab` —
+    /// re-activating the already-active tab is still a valid "take me back"
+    /// gesture.
+    pub(crate) fn activate_pipeline_doc_tab(&mut self, idx: usize) -> bool {
+        if idx >= self.pipeline_doc_tabs().tabs().len() {
+            return false;
+        }
+        self.doc_tabs.group_mut(PanelScope::Pipeline).activate_index(idx);
+        self.reveal_pipeline_active_doc();
+        true
+    }
+
+    /// Close the Pipeline tab at strip index `idx`. Not exercised by any
+    /// keyboard chord in this slice (see the section note above) — reachable
+    /// only via a click on the strip's `×`, which `events.rs`'s Pipeline
+    /// `mouse_main_click` arm routes here the same way the Board arm routes
+    /// to `close_board_doc_tab`.
+    pub(crate) fn close_pipeline_doc_tab(&mut self, idx: usize) -> bool {
+        let before = self.pipeline_doc_active_key().cloned();
+        if !self.doc_tabs.group_mut(PanelScope::Pipeline).close(idx) {
+            return false;
+        }
+        if self.pipeline_doc_active_key().cloned() != before {
+            self.reveal_pipeline_active_doc();
+        }
+        true
+    }
+
+    /// Contract §2f, applied per-scope (#2284 AC 4): select the active
+    /// Pipeline document's row in the **Pipeline** sidebar, never the
+    /// Board's — mirrors `jump_to_pipeline`'s reveal-and-expand body
+    /// (`dialogs.rs`), minus the `switch_active_view` call (the caller is
+    /// already on the Pipeline panel by construction: this only runs from
+    /// Pipeline-scope tab mutations) and the `pipeline_jump_target`
+    /// visibility gate (the issue is already known to be a live
+    /// `PipelineIssue` — no need to re-derive it from a coord-repo lookup).
+    ///
+    /// `rebuild_pipeline_sidebar`'s `prev_sel_override` is what actually
+    /// moves the sidebar selection and syncs `pipeline_sel` — expanding the
+    /// target's New/In-progress milestone (and repo, for In-progress) group
+    /// first is what stops that restore from landing on a row that doesn't
+    /// exist in the tree yet (mirrors §2f's Board-side milestone-expand
+    /// step, `expand_board_milestone_for`).
+    fn reveal_pipeline_active_doc(&mut self) {
+        let Some((repo_slug, number)) = self.pipeline_doc_active_key().cloned() else {
+            return;
+        };
+        let Some(pi) = self.pipeline_issue_for(&repo_slug, number) else {
+            return;
+        };
+        let is_closed = pi.is_closed;
+        let lc_key = self.pipeline_lifecycle_section(pi);
+        let repo_key = Self::pipeline_repo_key(pi).to_string();
+        let mil_key = match self.pipeline_issue_milestone(pi) {
+            Some((n, _)) => n.to_string(),
+            None => "no-milestone".to_string(),
+        };
+        if lc_key == "new" {
+            self.pipeline_milestone_expanded
+                .insert(("new".to_string(), repo_key, mil_key), true);
+        } else if lc_key == "in-progress" {
+            self.pipeline_lifecycle_expanded
+                .insert(("in-progress".to_string(), repo_key.clone()), true);
+            self.pipeline_milestone_expanded
+                .insert(("in-progress".to_string(), repo_key, mil_key), true);
+        }
+        self.rebuild_pipeline_sidebar(Some((repo_slug, number)));
+        self.pipeline_focused_stage = self.default_focused_stage_for_selected_issue();
+        self.pipeline_stage_content_scroll = 0;
+        if is_closed {
+            let search_offset = 1usize;
+            if let Some(done_idx) =
+                self.pipeline_state_section_names.iter().position(|&k| k == "done")
+            {
+                self.pipeline_sidebar.set_collapsed(done_idx + search_offset, false);
             }
         }
     }

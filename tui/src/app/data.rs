@@ -2626,7 +2626,19 @@ pub(crate) fn start_data_load() -> std::sync::mpsc::Receiver<BoardData> {
     // the real local SQLite DB and overwrite pipeline_issues / data.assignments
     // with whatever the developer's coord.db currently contains, making
     // TuiDriver tests non-deterministic and machine-dependent.
-    #[cfg(test)]
+    //
+    // #2284 (ms-65 §3, manifest finding 7): gated on `feature = "test-support"`
+    // too, not just `cfg(test)` — the sealed `tests/acceptance/**` suite
+    // (`tui/tests/acceptance.rs`, the #1042 seam) is a separate integration-test
+    // crate, so the `coord_tui` it links against is built *without* `cfg(test)`
+    // (only the top-level `cargo test` binary gets that cfg). Without this
+    // widening, entering the Pipeline panel in that suite kicks
+    // `maybe_kick_pipeline_loader` -> `refresh` -> this function, which fell
+    // through to the real network/SQLite path and wholesale-replaced the
+    // seeded fixture on the very next dispatched event (a RACE — whichever
+    // finished first) — mirrors the exact same trap `resolve_board_service`
+    // above already widened for (#1039).
+    #[cfg(any(test, feature = "test-support"))]
     {
         let _ = tx.send(BoardData::default());
         return rx;
