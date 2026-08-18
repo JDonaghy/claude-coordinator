@@ -344,6 +344,53 @@
         assert!(msg.contains("needs a person"), "got: {msg}");
     }
 
+    // ── merge_revalidate_eligible (#2402) ─────────────────────────────────────
+
+    #[test]
+    fn merge_revalidate_eligible_true_for_stale_smoke_verdict() {
+        assert!(merge_revalidate_eligible(
+            "test verdict stale (base moved since last smoke run)"
+        ));
+    }
+
+    #[test]
+    fn merge_revalidate_eligible_true_for_stale_ci() {
+        assert!(merge_revalidate_eligible(
+            "CI stale: checks predate the current base — re-run CI"
+        ));
+    }
+
+    /// #1769: `revalidation_candidates` deliberately excludes SMOKE_MISSING
+    /// (a verdict that was never recorded, as opposed to one that's stale) —
+    /// a re-test can't conjure up a verdict that doesn't exist. The action
+    /// gate must exclude it too, even though `merge_wait_affordance`'s
+    /// coarser DISPLAY bucket lumps it in with the two staleness cases.
+    #[test]
+    fn merge_revalidate_eligible_false_for_missing_verdict() {
+        assert!(!merge_revalidate_eligible("test verdict missing"));
+    }
+
+    #[test]
+    fn merge_revalidate_eligible_false_for_review_not_approved() {
+        assert!(!merge_revalidate_eligible("review not approved"));
+    }
+
+    #[test]
+    fn merge_revalidate_eligible_false_for_ci_failed() {
+        assert!(!merge_revalidate_eligible("CI failed: build (failure)"));
+    }
+
+    /// #2231: a stale smoke verdict whose branch turns out to genuinely
+    /// conflict with its base gets a distinct "merge conflict:" wording
+    /// (`stale_smoke_conflict_reason`), not the plain "test verdict stale ("
+    /// prefix — no re-test can clear a branch that will not merge.
+    #[test]
+    fn merge_revalidate_eligible_false_for_stale_smoke_conflict() {
+        assert!(!merge_revalidate_eligible(
+            "merge conflict: PR #12 does not merge into main — GitHub reports it as not mergeable"
+        ));
+    }
+
     #[test]
     fn fmt_merge_block_reason_none_when_no_reason() {
         assert_eq!(fmt_merge_block_reason(None), None);
@@ -11626,16 +11673,18 @@
 
     #[test]
     fn build_pipeline_widget_attaches_go_to_first_pending_work() {
-        // #1429: per-issue pipeline is Work→Review→Merge (Merge restored as
-        // a read-only observation stage — never carries a Go/Retry action).
+        // #1429: per-issue pipeline is Work→Review→Merge.
         let app = make_pipeline_app();
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages.len(), 3, "#1429: work+review+merge per-issue");
         assert_eq!(view.stages[0].label, "Work");
-        // Only the work stage gets a Go button (and only when Pending).
+        // Only the first actionable stage gets a Go button — here that's
+        // Work; Review/Merge stay quiet because their own upstream stage
+        // (Work) isn't Done yet, not because merge is categorically inert
+        // (#2402 lifted that exclusion for a settled-upstream Merge).
         assert_eq!(view.stages[0].action.as_deref(), Some("Go"));
         assert!(view.stages[1].action.is_none());
-        assert!(view.stages[2].action.is_none(), "merge never carries a Go/Retry action");
+        assert!(view.stages[2].action.is_none(), "merge's own predecessor (Review) isn't done yet");
     }
 
     /// #1199: an epic/tracking-issue row shows the milestone gate lane
@@ -11761,19 +11810,24 @@
             Some("Go"),
             "Review should now own the Go button"
         );
-        // #1429: Merge is restored as a third, read-only stage — Pending here
-        // (Review hasn't settled yet) and never carries a Go/Retry action.
+        // #1429: Merge is restored as a third stage — Pending here, and
+        // `go_attached` already latched onto Review (the first Pending stage
+        // with a settled predecessor), so Merge gets no action regardless of
+        // #2402's dispatchability change: only one stage ever owns [Go].
         assert_eq!(view.stages.len(), 3, "#1429: work+review+merge per-issue");
         assert_eq!(view.stages[2].label, "Merge");
         assert!(view.stages[2].action.is_none(), "merge never carries a Go/Retry action");
     }
 
-    /// #1429: Work + review both done → Merge (Pending, real queue state)
-    /// is the only non-Done stage; still no Go/Retry action anywhere — Merge
-    /// is a read-only observation badge, dispatched solely from the Merge
-    /// Queue panel (SidebarView::MergeQueue).
+    /// #1429 established Merge as a read-only observation badge once Work +
+    /// Review are both done and Merge itself is Pending — #2402 reverses
+    /// that specific case: a Pending Merge stage with every upstream stage
+    /// settled is now dispatchable, so this issue's stalled-in-Pending Merge
+    /// (no `merge_queue` entry yet — never dispatched) gets a [Go] button
+    /// rather than the dead end #1429 left it as. See
+    /// `is_dispatchable_stage` and `dispatch_pipeline_stage`'s "merge" arm.
     #[test]
-    fn build_pipeline_widget_no_action_when_work_and_review_done() {
+    fn build_pipeline_widget_go_when_work_and_review_done_merge_pending() {
         let mut app = make_pipeline_app();
         app.data.assignments.push(Assignment {
             id: "w1".to_string(),
@@ -11864,17 +11918,21 @@
             driven_by: None,
         });
         let view = app.build_pipeline_widget().unwrap();
-        // Work + Review done; Merge is Pending (no merge_queue entry yet) but
-        // still carries no action — #1429: it's a read-only observation
-        // badge, never dispatchable from the per-issue strip.
+        // Work + Review done; Merge is Pending (no merge_queue entry yet) and
+        // — #2402 — now carries the [Go] button: every upstream stage is
+        // settled, so Merge is the first (and only) actionable stage.
         assert_eq!(view.stages.len(), 3, "#1429: Work→Review→Merge");
         assert_eq!(view.stages[0].status, StageStatus::Done);
         assert_eq!(view.stages[1].status, StageStatus::Done);
         assert_eq!(view.stages[2].label, "Merge");
         assert_eq!(view.stages[2].status, StageStatus::Pending);
         assert!(view.stages[0].action.is_none());
-        assert!(view.stages[1].action.is_none(), "review done — no Go (merge is in queue panel)");
-        assert!(view.stages[2].action.is_none(), "merge is read-only — dispatched solely from the Merge Queue panel");
+        assert!(view.stages[1].action.is_none(), "review done — no Go (Work/Review already settled)");
+        assert_eq!(
+            view.stages[2].action.as_deref(),
+            Some("Go"),
+            "#2402: a Pending Merge stage with every upstream stage done must get a Go button"
+        );
     }
 
     /// #2397: the ordinary Work→Review→Merge track's Pending Merge box must
@@ -12270,11 +12328,13 @@
         assert_eq!(view.stages[0].action.as_deref(), Some("Retry"));
         // Review still Pending but its predecessor (Work) is Failed, not
         // Done — no Go on Review.
-        // #1429: 3 stages (work+review+merge) — merge is back as a
-        // read-only observation stage.
+        // #1429: 3 stages (work+review+merge).
         assert_eq!(view.stages.len(), 3);
         assert!(view.stages[1].action.is_none());
-        assert!(view.stages[2].action.is_none(), "merge never carries a Go/Retry action");
+        assert!(
+            view.stages[2].action.is_none(),
+            "merge's own predecessors (Work, Review) aren't both done"
+        );
     }
 
     /// Failed stage without a coord_repo mapping must not show Retry —
@@ -12558,13 +12618,15 @@
     }
 
     /// is_dispatchable_stage covers the stages the panel can fire.
-    /// #738: "merge" is retired from per-issue pipeline so it is no longer dispatchable.
+    /// #2402: "merge" is dispatchable again (reversing #738's per-issue-box
+    /// exclusion) — a blocked Merge stage otherwise has no in-TUI [Go]
+    /// affordance at all; see `dispatch_pipeline_stage`'s "merge" arm.
     #[test]
     fn is_dispatchable_stage_recognises_known_stages() {
         assert!(is_dispatchable_stage("plan"));
         assert!(is_dispatchable_stage("work"));
         assert!(is_dispatchable_stage("review"));
-        assert!(!is_dispatchable_stage("merge"), "#738: merge is not a per-issue stage");
+        assert!(is_dispatchable_stage("merge"), "#2402: merge must be dispatchable again");
         assert!(!is_dispatchable_stage("smoke"));
         assert!(!is_dispatchable_stage(""));
     }
@@ -28289,14 +28351,26 @@
     /// *affordance*, not observation. Without the badge, an issue stalled
     /// after review (merged-pending forever) renders identically to one
     /// that's actually merged — #1429 restores it as a read-only badge so
-    /// the two are visually distinguishable, while keeping it inert:
-    /// - no Go/Retry action ever attaches to it (`is_dispatchable_stage`
-    ///   still excludes "merge");
+    /// the two are visually distinguishable.
+    ///
+    /// #2402 partially reverses the "inert" half of that: once Work/Review
+    /// are settled and Merge itself reads Pending, the badge DOES carry a
+    /// [Go]/[Retry] action again (`is_dispatchable_stage` now includes
+    /// "merge" — a blocked Merge stage otherwise had no in-TUI recovery
+    /// affordance at all). This fixture keeps the assertion below true on
+    /// its own terms, not because merge is categorically excluded anymore:
+    /// Work is still `running` here, so `prior_all_done` is false for every
+    /// downstream stage (including Merge) regardless of
+    /// `is_dispatchable_stage`— the badge is inert *in this specific state*,
+    /// not inert by construction.
     /// - no NEW top-level right-click item is added for it (the pre-existing
     ///   nested "Merge" items under "Start (interactive)"/"Start (automated)"
     ///   — leg 3c/A3, #581/#606 — are a separate, already-shipped feature and
     ///   stay out of scope here; this only checks the top-level menu, not
-    ///   inside those submenus).
+    ///   inside those submenus). #2402's new "Re-verify (revalidate)" item is
+    ///   also absent here — this fixture has no `merge_plan` entry for the
+    ///   issue at all, so `merge_plan_entry_for_issue` finds nothing to gate
+    ///   it on.
     #[test]
     fn tuidriver_pipeline_detail_shows_readonly_merge_badge() {
         use quadraui::tui::testing::driver_with_shell;
@@ -28355,10 +28429,11 @@
         // `ShellAdapter`, see the other `TuiDriver` tests' comment above),
         // so these are checked here, before handing `app` to the driver.
 
-        // The badge is inert: no stage ever carries a Go/Retry action for
-        // "merge" — build_pipeline_widget must confirm this directly (the
-        // rendered [Go]/[Retry] text can't be distinguished from other
-        // stages' by screen-scraping alone).
+        // With Work still `running`, Merge's `prior_all_done` gate is false
+        // regardless of #2402's `is_dispatchable_stage("merge") == true` —
+        // build_pipeline_widget must confirm this directly (the rendered
+        // [Go]/[Retry] text can't be distinguished from other stages' by
+        // screen-scraping alone).
         let view = app
             .build_pipeline_widget()
             .expect("pipeline widget must render for this issue");
@@ -28369,8 +28444,8 @@
             .expect("Merge stage must be present in the widget");
         assert!(
             merge_stage.action.is_none(),
-            "#1429: Merge must never carry a Go/Retry action — it's read-only, \
-             dispatched solely from the Merge Queue panel"
+            "#1429/#2402: Merge carries no Go/Retry action while an upstream \
+             stage (Work) is still active"
         );
 
         // No NEW top-level right-click item for the badge: the row's
@@ -28406,6 +28481,172 @@
             screen.contains("Merge") || screen.contains("MERGE"),
             "#1429: Merge badge must be restored to the per-issue pipeline strip:\n{}",
             screen
+        );
+    }
+
+    // ── #2402: Pipeline row "Re-verify (revalidate)" ────────────────────────
+
+    /// A Merge stage BLOCKED with a revalidate-eligible reason (stale-but-
+    /// passed local verdict) offers the "Re-verify (revalidate)" action.
+    #[test]
+    fn context_menu_offers_revalidate_for_blocked_stale_smoke_entry() {
+        let mut app = make_pipeline_app();
+        app.pipeline_sel = Some(0); // issue 42, repo_slug "acme/api", coord_repo "api"
+        app.data.merge_plan = vec![planned_entry(
+            "aid-42", "api", "acme/api", "main", 42, "Add cool thing", 1, None,
+            "BLOCKED", Some("test verdict stale (base moved since last smoke run)"),
+        )];
+        let items = app.context_menu_items_for_pipeline_row(
+            Some(42),
+            &PipelineRowLifecycle::InProgress,
+            Some("api"),
+        );
+        assert!(
+            items.iter().any(|i| i.label == "Re-verify (revalidate)"),
+            "#2402: a stale-smoke BLOCKED entry must offer Re-verify (revalidate); got: {:?}",
+            items.iter().map(|i| i.label.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Same, for the CI-staleness wording (`ci_revalidation_candidates`'s case).
+    #[test]
+    fn context_menu_offers_revalidate_for_blocked_stale_ci_entry() {
+        let mut app = make_pipeline_app();
+        app.pipeline_sel = Some(0);
+        app.data.merge_plan = vec![planned_entry(
+            "aid-42", "api", "acme/api", "main", 42, "Add cool thing", 1, None,
+            "BLOCKED", Some("CI stale: checks predate the current base — re-run CI"),
+        )];
+        let items = app.context_menu_items_for_pipeline_row(
+            Some(42),
+            &PipelineRowLifecycle::InProgress,
+            Some("api"),
+        );
+        assert!(
+            items.iter().any(|i| i.label == "Re-verify (revalidate)"),
+            "#2402: a stale-CI BLOCKED entry must offer Re-verify (revalidate)"
+        );
+    }
+
+    /// #2402 acceptance: a Merge stage BLOCKED for a non-staleness reason
+    /// (review, real CI failure, conflict, missing verdict) must NOT offer
+    /// the action — mirrors `revalidation_candidates`'s eligibility exactly.
+    #[test]
+    fn context_menu_omits_revalidate_for_non_staleness_block_reasons() {
+        for reason in [
+            "review not approved",
+            "CI failed: build (failure)",
+            "merge conflict: PR #12 does not merge into main",
+            "test verdict missing",
+        ] {
+            let mut app = make_pipeline_app();
+            app.pipeline_sel = Some(0);
+            app.data.merge_plan = vec![planned_entry(
+                "aid-42", "api", "acme/api", "main", 42, "Add cool thing", 1, None,
+                "BLOCKED", Some(reason),
+            )];
+            let items = app.context_menu_items_for_pipeline_row(
+                Some(42),
+                &PipelineRowLifecycle::InProgress,
+                Some("api"),
+            );
+            assert!(
+                !items.iter().any(|i| i.label == "Re-verify (revalidate)"),
+                "#2402: reason {reason:?} must NOT offer Re-verify (revalidate)"
+            );
+        }
+    }
+
+    /// A READY (not BLOCKED) entry never offers the action, regardless of reason.
+    #[test]
+    fn context_menu_omits_revalidate_for_ready_entry() {
+        let mut app = make_pipeline_app();
+        app.pipeline_sel = Some(0);
+        app.data.merge_plan = vec![planned_entry(
+            "aid-42", "api", "acme/api", "main", 42, "Add cool thing", 1, None,
+            "READY", None,
+        )];
+        let items = app.context_menu_items_for_pipeline_row(
+            Some(42),
+            &PipelineRowLifecycle::InProgress,
+            Some("api"),
+        );
+        assert!(!items.iter().any(|i| i.label == "Re-verify (revalidate)"));
+    }
+
+    /// Dispatching "merge-revalidate" arms the confirm dialog with the
+    /// merge-plan entry's own `assignment_id` — it does not spawn directly.
+    #[test]
+    fn dispatch_merge_revalidate_arms_confirm_with_assignment_id() {
+        let mut app = make_pipeline_app();
+        app.pipeline_sel = Some(0);
+        app.data.merge_plan = vec![planned_entry(
+            "aid-stale-42", "api", "acme/api", "main", 42, "Add cool thing", 1, None,
+            "BLOCKED", Some("test verdict stale (base moved since last smoke run)"),
+        )];
+        let target = ContextMenuTarget::PipelineRow {
+            issue_number: Some(42),
+            repo_name: Some("api".to_string()),
+            lifecycle: PipelineRowLifecycle::InProgress,
+        };
+        let dispatched = app.dispatch_context_menu_action("merge-revalidate", &target);
+        assert!(dispatched);
+        let pending = app
+            .pending_merge_revalidate
+            .as_ref()
+            .expect("merge-revalidate must arm pending_merge_revalidate");
+        assert_eq!(pending.assignment_id, "aid-stale-42");
+        assert_eq!(pending.issue_num, 42);
+        assert!(
+            app.command_runner.spawned_calls.is_empty(),
+            "arming the confirm must not spawn a command yet; got: {:?}",
+            app.command_runner.spawned_calls
+        );
+    }
+
+    /// Confirming (`y` / the "yes" button) runs `coord merge --revalidate
+    /// --only <assignment_id>` — the narrowest single-entry scope.
+    #[test]
+    fn confirm_merge_revalidate_spawns_coord_merge_revalidate_only() {
+        let mut app = make_pipeline_app();
+        app.confirm_merge_revalidate(PendingMergeRevalidate {
+            assignment_id: "aid-stale-42".to_string(),
+            issue_num: 42,
+        });
+        let label = app
+            .command_runner
+            .running_info()
+            .map(|(l, _)| l.to_string())
+            .unwrap_or_default();
+        assert!(label.contains("merge"), "got: {label:?}");
+        assert!(label.contains("--revalidate"), "got: {label:?}");
+        assert!(label.contains("--only"), "got: {label:?}");
+        assert!(label.contains("aid-stale-42"), "got: {label:?}");
+        assert!(
+            !label.contains("--order"),
+            "must use --only, not --order — --order still processes the whole \
+             repo-wide queue, not just this entry; got: {label:?}"
+        );
+    }
+
+    /// `fire_dialog_button("cancel", …)` clears the pending confirm and
+    /// spawns nothing — the entry stays exactly as blocked as it was.
+    #[test]
+    fn merge_revalidate_confirm_cancel_spawns_nothing() {
+        let mut app = make_pipeline_app();
+        app.pending_merge_revalidate = Some(PendingMergeRevalidate {
+            assignment_id: "aid-stale-42".to_string(),
+            issue_num: 42,
+        });
+        let mut backend = quadraui::tui::TuiBackend::new();
+        app.fire_dialog_button("cancel", &mut backend);
+        assert!(
+            app.pending_merge_revalidate.is_none(),
+            "cancel must clear the pending confirm"
+        );
+        assert!(
+            !app.command_runner.is_running(),
+            "cancel must not spawn `coord merge --revalidate`"
         );
     }
 

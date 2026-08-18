@@ -1764,6 +1764,31 @@ impl CoordApp {
             }
         }
 
+        // ── #2402: Pending revalidate confirmation: intercept ALL keys ────
+        // Mirrors the force-merge intercept above: `--revalidate` runs a
+        // real local build+test (or CI re-run) on the daemon host, so a
+        // fat-fingered keypress must not fire it — only an explicit y/Y.
+        if let Some(pending) = self.pending_merge_revalidate.clone() {
+            if let UiEvent::KeyPressed { key, .. } = &event {
+                match key {
+                    Key::Char('y') | Key::Char('Y') => {
+                        self.pending_merge_revalidate = None;
+                        self.confirm_merge_revalidate(pending);
+                    }
+                    _ => {
+                        // Any other key cancels — Escape, 'n', 'N', anything.
+                        self.pending_merge_revalidate = None;
+                        self.push_toast(
+                            "Revalidate cancelled",
+                            "entry stays blocked — nothing changed",
+                            ToastSeverity::Info,
+                        );
+                    }
+                }
+                return Reaction::Redraw;
+            }
+        }
+
         // ── #780: Merge-all-ready confirm: intercept key presses ──────────
         if let Some(aids) = self.pending_merge_all_ready.clone() {
             if let UiEvent::KeyPressed { key, .. } = &event {

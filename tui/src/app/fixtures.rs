@@ -125,6 +125,7 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         pending_paused_machines: None,
         pending_force_merge: None,
         pending_merge_all_ready: None,
+        pending_merge_revalidate: None,
         pending_context_menu: None,
         pending_clipboard_copy: None,
         context_menu_layout: std::cell::RefCell::new(Vec::new()),
