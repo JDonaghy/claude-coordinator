@@ -83,6 +83,36 @@ pub(crate) fn merge_wait_affordance(reason: &str) -> &'static str {
     }
 }
 
+/// #2402: mirrors `coord.merge_queue.revalidation_candidates` /
+/// `ci_revalidation_candidates`'s eligibility rule **exactly** — this is the
+/// predicate that gates the Pipeline row's "Re-verify (revalidate)"
+/// context-menu action, not merely a display classification. A BLOCKED
+/// Merge stage's raw `reason` (`PlannedMergeEntry.reason`, the wording
+/// `coord.merge_queue._entry_gate_status` emits) is revalidate-eligible only
+/// when it is one of:
+///
+/// - `"test verdict stale ("` — `SmokeVerdictStatus.short_reason` for a
+///   `SMOKE_STALE` verdict (a passed verdict recorded against a base/branch/
+///   run that has since moved). `revalidation_candidates` requires this to
+///   be the *only* gate failure on the entry — a `SMOKE_MISSING` verdict
+///   ("test verdict missing", nothing was ever recorded) is deliberately
+///   excluded there, and must be excluded here too: a re-test can't conjure
+///   up a verdict that was never taken.
+/// - `"CI stale:"` (`coord.merge_queue.CI_STALE_PREFIX`) — a passing check
+///   list that predates the current base HEAD. `ci_revalidation_candidates`'s
+///   whole eligibility test.
+///
+/// Everything else — an unapproved/rejected review, a real CI failure, an
+/// unreadable CI fetch, or a genuine merge conflict — is a block no re-test
+/// can clear. `merge_wait_affordance` above lumps `SMOKE_MISSING` in with
+/// these two staleness cases for *display* purposes (its coarser "waiting on
+/// a human" bucket), which is why this is a separate, stricter predicate
+/// rather than a reuse of that one: an action gate has to be exact, a
+/// display classification only has to be roughly right.
+pub(crate) fn merge_revalidate_eligible(reason: &str) -> bool {
+    reason.starts_with("test verdict stale (") || reason.starts_with("CI stale:")
+}
+
 /// #2397: `"{reason} [{affordance}]"`, truncated so a verbose gate-failure
 /// reason (e.g. a multi-check CI failure summary) can't blow out a stage
 /// box's width — the affordance tag is the load-bearing part for the

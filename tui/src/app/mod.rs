@@ -1864,7 +1864,17 @@ fn load_activity_log(id: &str) -> Vec<ListItem> {
 /// Pipeline panel.  Stages outside this list still render — they just
 /// don't show a button (they're driven implicitly by the coordinator).
 fn is_dispatchable_stage(name: &str) -> bool {
-    matches!(name, "plan" | "work" | "review")
+    // #2402: "merge" was excluded here per #738 ("merge is initiated solely
+    // from the Merge Queue panel") — but that left a blocked-and-already-
+    // dispatched Merge stage with literally no in-TUI recovery affordance
+    // beyond that separate panel (#2397's checks_stale/smoke_required case,
+    // with no automatic retry coming). Re-including it here attaches a
+    // [Go]/[Retry] action to the per-issue Merge box exactly like the other
+    // stages; `dispatch_pipeline_stage`'s "merge" arm routes it through the
+    // same `coord merge --order <aid>` the Start-(automated)-Merge menu item
+    // already runs, so this doesn't add a new command path — only a new way
+    // to reach the existing one.
+    matches!(name, "plan" | "work" | "review" | "merge")
 }
 
 /// Build a `ListItem` for one pipeline stage (plan/work/review/smoke).
@@ -2403,6 +2413,15 @@ pub struct CoordApp {
     /// `aids` is the list of READY assignment_ids shown in the confirm prompt.
     /// Any key other than `y`/`Y` cancels.
     pending_merge_all_ready: Option<Vec<String>>,
+    /// #2402: pending `coord merge --revalidate --only <assignment_id>`
+    /// confirmation, armed by the Pipeline row's "Re-verify (revalidate)"
+    /// context-menu action (offered only on a Merge stage BLOCKED with a
+    /// `format::merge_revalidate_eligible` reason — #2397's surfaced
+    /// checks_stale/smoke_required case). Mirrors `pending_force_merge`'s
+    /// confirm-then-spawn shape: any key other than `y`/`Y` cancels, and a
+    /// click-outside/Escape dismiss leaves the entry exactly as blocked as
+    /// it was.
+    pending_merge_revalidate: Option<PendingMergeRevalidate>,
     /// #259: open right-click context menu, or `None` if no menu is showing.
     /// Opened by right-click on a Board / Pipeline sidebar row; dismissed by
     /// click-outside, Escape, or item activation.
@@ -3789,6 +3808,7 @@ impl CoordApp {
             pending_paused_machines: Some(spawn_paused_machines_fetch()),
             pending_force_merge: None,
             pending_merge_all_ready: None,
+            pending_merge_revalidate: None,
             pending_context_menu: None,
             pending_clipboard_copy: None,
             context_menu_layout: std::cell::RefCell::new(Vec::new()),

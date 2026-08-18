@@ -169,6 +169,20 @@ pub(crate) struct PendingMerge {
     pub(crate) issue_num: u64,
 }
 
+/// #2402: confirm-armed by the Pipeline row's "Re-verify (revalidate)"
+/// context-menu action (offered only when the Merge stage is BLOCKED on a
+/// `format::merge_revalidate_eligible` reason — #2397's surfaced
+/// `checks_stale`/`smoke_required` case with the automatic-rerun budget
+/// spent, #1769/#1851). Confirming runs `coord merge --revalidate --only
+/// <assignment_id>` — a real local build+test (or CI re-run) on the daemon
+/// host, so it gets the same brief confirm-before-spawn shape as
+/// `pending_force_merge`, not a bare click-and-go.
+#[derive(Clone)]
+pub(crate) struct PendingMergeRevalidate {
+    pub(crate) assignment_id: String,
+    pub(crate) issue_num: u64,
+}
+
 /// #863: an in-flight headless preflight (`coord assign --interactive
 /// --fix-of <aid> [--force] <machine> <repo> <issue> --dry-run`) checking
 /// whether `pipeline.max_review_iterations` blocks a Fix dispatch, BEFORE the
@@ -625,12 +639,16 @@ impl CoordApp {
         stages.push("work".to_string());
         for g in &self.data.pipeline_default_gates {
             // #1429: "merge" is restored to the per-issue stage-name ordering
-            // as a read-only observation badge (#738 retired the per-issue
-            // *box*'s Go/dispatch affordance — that reasoning was about the
-            // affordance, not observation; merge is still initiated solely
-            // from the Merge Queue panel, `is_dispatchable_stage` still
-            // excludes it, and `stage_status_for`/`merge_stage_status_for`
-            // already compute its real queue/CI/conflict-fix state).
+            // as an observation badge (#738 retired the per-issue *box*'s
+            // Go/dispatch affordance — that reasoning was about the
+            // affordance, not observation; `stage_status_for`/
+            // `merge_stage_status_for` already compute its real
+            // queue/CI/conflict-fix state). #2402 partially reverses the
+            // affordance half too: `is_dispatchable_stage` now includes
+            // "merge" so a BLOCKED (or not-yet-started) Merge box gets a
+            // [Go] again — #738's "merge is initiated solely from the Merge
+            // Queue panel" left a stuck entry with no per-issue recovery
+            // path at all (#2397's checks_stale/smoke_required case).
             // "work"/"plan" stay excluded — they're prepended separately.
             if g != "work" && g != "plan" {
                 stages.push(g.clone());
@@ -3004,6 +3022,49 @@ impl CoordApp {
         }
     }
 
+    /// #2402: confirm handler for the Pipeline row's "Re-verify
+    /// (revalidate)" dialog — the `y` keypress / "yes" button fires this
+    /// with the [`PendingMergeRevalidate`] the confirm was armed against
+    /// (`dispatch_context_menu_action`'s `"merge-revalidate"` arm). Runs
+    /// `coord merge --revalidate --only <assignment_id>`: `--only` is the
+    /// narrowest single-entry scope (`--order` still processes the whole
+    /// repo-wide queue, merely moving this entry first — see
+    /// `coord/commands/merge.py`'s `--only`/`--order` help text), and
+    /// `--revalidate` re-tests the stale-but-passed verdict / re-runs stale
+    /// CI before `process()` re-evaluates the gate. Takes `pending` by value
+    /// so the caller's already-cleared `self.pending_merge_revalidate` can't
+    /// accidentally stay armed.
+    pub(crate) fn confirm_merge_revalidate(&mut self, pending: PendingMergeRevalidate) {
+        use crate::commands::SpawnQueuedOutcome;
+        let short: String = pending.assignment_id.chars().take(8).collect();
+        match self.command_runner.spawn_queued(&[
+            "merge",
+            "--revalidate",
+            "--only",
+            &pending.assignment_id,
+        ]) {
+            SpawnQueuedOutcome::Started => {
+                self.push_toast(
+                    "Revalidate dispatched",
+                    &format!(
+                        "coord merge --revalidate --only {} — re-testing #{} against \
+                         the current base",
+                        short, pending.issue_num,
+                    ),
+                    ToastSeverity::Info,
+                );
+            }
+            SpawnQueuedOutcome::Queued => {
+                self.push_toast(
+                    "⏳ Queued",
+                    "revalidate runs after current command",
+                    ToastSeverity::Info,
+                );
+            }
+            SpawnQueuedOutcome::Deduped => {}
+        }
+    }
+
     /// #1151: resolve the `--for-path` argument to append (if any) to a
     /// `coord acceptance mock/author/record` dispatch for `repo`, based on
     /// `self.data.pipeline_acceptance_routes` (repo → route `match` globs,
@@ -5198,17 +5259,34 @@ impl CoordApp {
         )
     }
 
+    /// #2402: the raw merge-plan entry backing `issue_number`'s Merge stage —
+    /// unlike [`Self::merge_plan_block_reason_for_issue`] (which returns the
+    /// *formatted*, truncated + affordance-tagged display string), this hands
+    /// back the whole [`PlannedMergeEntry`] so a caller can read
+    /// `status`/`reason`/`assignment_id` together. The Pipeline row's
+    /// "Re-verify (revalidate)" context-menu action needs exactly that: the
+    /// raw `reason` text to run through `format::merge_revalidate_eligible`,
+    /// and `assignment_id` to pass to `coord merge --only <assignment_id>`.
+    /// Same issue-number-keyed lookup as `merge_plan_block_reason_for_issue`
+    /// — safe here since a member issue's own Merge stage has exactly one
+    /// queue entry (unlike the shared-tracking-issue prereq case above).
+    pub(crate) fn merge_plan_entry_for_issue(
+        &self,
+        repo_slug: &str,
+        issue_number: u64,
+    ) -> Option<&PlannedMergeEntry> {
+        self.data
+            .merge_plan
+            .iter()
+            .find(|e| e.repo_github == repo_slug && e.issue_number == issue_number)
+    }
+
     /// Issue-number-keyed lookup for the ordinary Work→Test→Review→Merge
     /// track, mirroring `merge_stage_status_for_local`'s own `merge_queue`
     /// lookup (safe here since a member issue's own Merge stage has exactly
     /// one queue entry, unlike the shared-tracking-issue prereq case above).
     pub(crate) fn merge_plan_block_reason_for_issue(&self, repo_slug: &str, issue_number: u64) -> Option<String> {
-        Self::merge_plan_block_reason(
-            self.data
-                .merge_plan
-                .iter()
-                .find(|e| e.repo_github == repo_slug && e.issue_number == issue_number),
-        )
+        Self::merge_plan_block_reason(self.merge_plan_entry_for_issue(repo_slug, issue_number))
     }
 
     /// True when *entry*'s PR has a fetched CI summary with failing checks.
@@ -7032,6 +7110,21 @@ impl CoordApp {
                     self.dispatch_pipeline_review()
                 }
             }
+            // #2402: a blocked (or not-yet-started) Merge stage's [Go] now
+            // means "re-evaluate now" instead of the "stage 'merge' not
+            // dispatchable from TUI" no-op this used to fall into (`merge`
+            // was excluded from `is_dispatchable_stage` per #738 — this
+            // reverses only the per-issue Go affordance, not #738's
+            // reasoning that merge is otherwise driven from the Merge Queue
+            // panel). Reuses `dispatch_merge_automated_for_selected_pipeline_
+            // issue` (the same `coord merge --order <aid>` the "Start
+            // (automated) > Merge" menu item already runs) rather than a
+            // second command path: whether the entry has never been queued
+            // or is sitting BLOCKED on a stale gate, a fresh `--order` re-run
+            // re-evaluates every gate against the current board/CI state.
+            // `is_retry` is deliberately not consulted here — there is only
+            // one merge command to (re)run, not a distinct retry variant.
+            "merge" => self.dispatch_merge_automated_for_selected_pipeline_issue(),
             other => {
                 self.pipeline_status = Some((
                     format!("stage '{}' not dispatchable from TUI", other),

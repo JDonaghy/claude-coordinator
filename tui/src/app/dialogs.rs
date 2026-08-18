@@ -894,6 +894,49 @@ impl CoordApp {
                     items.push(ContextMenuItem::separator());
                 }
             }
+
+            // #2402: "Re-verify (revalidate)" — a Pipeline row whose Merge
+            // stage is BLOCKED with no automatic retry coming (#2397: the
+            // daemon's auto-drain tick never touches a BLOCKED entry) had no
+            // in-TUI recovery action at all; the only fix was `coord merge
+            // --revalidate` typed by hand. Shown regardless of `lifecycle`
+            // for the same reason the escalation block above is — a stuck
+            // merge still reads as "in progress" — so this can't be nested
+            // under one specific `match lifecycle` arm below.
+            //
+            // Eligibility mirrors `coord.merge_queue.revalidation_candidates`
+            // / `ci_revalidation_candidates` EXACTLY
+            // (`format::merge_revalidate_eligible`, gated on the entry's raw
+            // `reason` text): a review/CI-failure/conflict/missing-verdict
+            // block never offers this action, only a stale-but-passed local
+            // verdict or a stale-but-green CI check does. `repo_name` here is
+            // the coord-local name (`PipelineIssue::coord_repo`); the
+            // merge-plan lookup needs the GitHub `owner/repo` slug instead,
+            // so the matching `PipelineIssue` is re-resolved repo-precisely
+            // (#983 discipline — same reasoning as `has_running`/`has_zombie`
+            // above) rather than reusing `epic_issue`, which only matches on
+            // issue number.
+            if let (Some(n), Some(repo)) = (issue_number, repo_name) {
+                let repo_slug = self.pipeline_issues.iter().find_map(|iss| {
+                    (iss.number == n && iss.coord_repo.as_deref() == Some(repo))
+                        .then_some(iss.repo_slug.as_str())
+                });
+                if let Some(repo_slug) = repo_slug {
+                    if let Some(entry) = self.merge_plan_entry_for_issue(repo_slug, n) {
+                        if entry.status == "BLOCKED" {
+                            if let Some(reason) = entry.reason.as_deref() {
+                                if merge_revalidate_eligible(reason) {
+                                    items.push(ContextMenuItem::action(
+                                        "merge-revalidate",
+                                        "Re-verify (revalidate)",
+                                    ));
+                                    items.push(ContextMenuItem::separator());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
         match lifecycle {
             PipelineRowLifecycle::New => {
@@ -2551,6 +2594,51 @@ impl CoordApp {
             });
         }
 
+        // ── #2402: Re-verify (revalidate) confirm ───────────────────────
+        // State plainly what it will do (#1214 precedent): `--revalidate`
+        // runs a real build+test locally on the daemon host — cheap, no
+        // tokens, but not instant, so it gets the same confirm-before-spawn
+        // shape as `pending_force_merge` rather than a bare click-and-go.
+        if let Some(ref p) = self.pending_merge_revalidate {
+            return Some(Dialog {
+                table: None,
+                id: WidgetId::new("dialog:merge-revalidate"),
+                title: StyledText::plain("Re-verify (revalidate)"),
+                body: vec![
+                    StyledText::plain(format!(
+                        "Re-test #{} against the current base?",
+                        p.issue_num,
+                    )),
+                    StyledText::plain(
+                        "Runs `coord merge --revalidate --only <assignment>` — a real \
+                         build+test (or CI re-run) locally on the daemon host before \
+                         merging. Only re-tests a stale-but-passed verdict; a genuine \
+                         review/CI/conflict block is left untouched."
+                            .to_string(),
+                    ),
+                ],
+                buttons: vec![
+                    DialogButton {
+                        id: WidgetId::new("yes"),
+                        label: "y  Revalidate".into(),
+                        is_default: true,
+                        is_cancel: false,
+                        tint: None,
+                    },
+                    DialogButton {
+                        id: WidgetId::new("cancel"),
+                        label: "Cancel".into(),
+                        is_default: false,
+                        is_cancel: true,
+                        tint: None,
+                    },
+                ],
+                severity: Some(DialogSeverity::Question),
+                vertical_buttons: false,
+                input: None,
+            });
+        }
+
         // ── #956: Kill terminal confirm ───────────────────────────────────
         if let Some(ref p) = self.pending_kill_terminal {
             return Some(Dialog {
@@ -3075,6 +3163,13 @@ impl CoordApp {
             self.push_toast(
                 "Force-merge cancelled",
                 "CI gate stays in place",
+                ToastSeverity::Info,
+            );
+        } else if self.pending_merge_revalidate.is_some() {
+            self.pending_merge_revalidate = None;
+            self.push_toast(
+                "Revalidate cancelled",
+                "entry stays blocked — nothing changed",
                 ToastSeverity::Info,
             );
         } else if self.pending_restart.is_some() {
@@ -3654,6 +3749,26 @@ impl CoordApp {
                     self.push_toast(
                         "Force-merge cancelled",
                         "CI gate stays in place",
+                        ToastSeverity::Info,
+                    );
+                }
+            }
+            *self.dialog_layout.borrow_mut() = None;
+            return;
+        }
+
+        // ── #2402: Re-verify (revalidate) ──────────────────────────────────
+        if let Some(p) = self.pending_merge_revalidate.clone() {
+            match id {
+                "yes" => {
+                    self.pending_merge_revalidate = None;
+                    self.confirm_merge_revalidate(p);
+                }
+                _ => {
+                    self.pending_merge_revalidate = None;
+                    self.push_toast(
+                        "Revalidate cancelled",
+                        "entry stays blocked — nothing changed",
                         ToastSeverity::Info,
                     );
                 }
@@ -6673,6 +6788,38 @@ impl CoordApp {
             // #684: headless merge via the existing queue — `coord merge --order`.
             "start-merge-automated" => {
                 self.dispatch_merge_automated_for_selected_pipeline_issue();
+                true
+            }
+            // #2402: Pipeline row → "Re-verify (revalidate)" — arms the
+            // confirm dialog (`pending_merge_revalidate`, resolved by
+            // `confirm_merge_revalidate`) rather than spawning directly, the
+            // same posture `pending_force_merge` takes for a gate-bypass
+            // action (#1214 precedent): `--revalidate` runs a real
+            // build+test locally on the daemon host, so it isn't a bare
+            // click-and-go. `context_menu_items_for_pipeline_row` already
+            // confirmed BLOCKED + a revalidate-eligible reason before
+            // offering this item, so this arm only resolves the
+            // `assignment_id` to pass — it does not re-check eligibility.
+            "merge-revalidate" => {
+                if let ContextMenuTarget::PipelineRow {
+                    issue_number: Some(n),
+                    repo_name: Some(r),
+                    ..
+                } = target
+                {
+                    let repo_slug = self.pipeline_issues.iter().find_map(|iss| {
+                        (iss.number == *n && iss.coord_repo.as_deref() == Some(r.as_str()))
+                            .then_some(iss.repo_slug.clone())
+                    });
+                    if let Some(entry) = repo_slug
+                        .and_then(|slug| self.merge_plan_entry_for_issue(&slug, *n).cloned())
+                    {
+                        self.pending_merge_revalidate = Some(PendingMergeRevalidate {
+                            assignment_id: entry.assignment_id,
+                            issue_num: *n,
+                        });
+                    }
+                }
                 true
             }
             // #1398: "Drive (automated)" — `coord drive <repo> <issue>
