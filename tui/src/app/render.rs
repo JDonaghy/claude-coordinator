@@ -251,11 +251,28 @@ impl ShellApp for CoordApp {
                 if self.pipeline_sel.is_none() && self.pipeline_issues.is_empty() {
                     backend.draw_list(m, &self.pipeline_placeholder_list());
                 } else {
+                    // #2284 (ms-65 §3a): Pipeline's `panel_toolbar()` returns
+                    // `None` — `m` above is the untouched `full_m` — so the
+                    // doc-tab strip is the FIRST row of the main panel here,
+                    // with no toolbar row above it (Board's own strip is the
+                    // SECOND row: `panel_toolbar()` precedes it there). Zero
+                    // Pipeline tabs open ⇒ `pipeline_doc_tab_strip` is `None`
+                    // and the row is not reserved — §3a's own "Pipeline shows
+                    // its baseline" zero-tab control, mirroring Board's #2282
+                    // zero-tab baseline.
+                    let tab_h = detail_tab_bar_height(lh);
+                    let m = match self.pipeline_doc_tab_strip(m.width) {
+                        Some(strip) => {
+                            let strip_rect = Rect::new(m.x, m.y, m.width, tab_h);
+                            backend.draw_tab_bar(strip_rect, &strip, None);
+                            Rect::new(m.x, m.y + tab_h, m.width, (m.height - tab_h).max(0.0))
+                        }
+                        None => m,
+                    };
                     // Tab bar.  `#464`: route through `detail_tab_bar_height`
                     // so the painted top of the content rect lines up with
                     // the hit-test origin in the TUI backend.
                     let mut tab_bar = self.pipeline_detail_tab_bar();
-                    let tab_h = detail_tab_bar_height(lh);
                     let tab_rect = Rect::new(m.x, m.y, m.width, tab_h);
                     let content_rect =
                         Rect::new(m.x, m.y + tab_h, m.width, (m.height - tab_h).max(0.0));
@@ -1814,8 +1831,86 @@ impl CoordApp {
     /// [`Self::board_doc_tab_bar`]).
     pub(crate) fn board_doc_tab_strip(&self, width: f32) -> Option<TabBar> {
         let mut bar = self.board_doc_tab_bar()?;
+        Self::bake_doc_tab_overflow_markers(&mut bar, width);
+        Some(bar)
+    }
+
+    /// #2284 (ms-65 §3): the Pipeline panel's **document** tab strip — the
+    /// exact same model and label shape as [`Self::board_doc_tab_bar`]
+    /// (contract §3's "same preview/pin semantics"), just sourced from the
+    /// Pipeline scope's own [`doc_tabs::DocTabGroup`] and Pipeline's own
+    /// issue cache (`pipeline_issues`) rather than the Board's.
+    ///
+    /// `None` when zero Pipeline documents are open — §3a's "Pipeline shows
+    /// its baseline (no doc-tab strip row)" zero-tab control.
+    pub(crate) fn pipeline_doc_tab_bar(&self) -> Option<TabBar> {
+        let group = self.pipeline_doc_tabs();
+        if group.is_empty() {
+            return None;
+        }
+        let show_repo = group
+            .tabs()
+            .first()
+            .map(|(first, _)| group.tabs().iter().any(|(repo, _)| repo != first))
+            .unwrap_or(false);
+        let tabs: Vec<TabItem> = group
+            .tabs()
+            .iter()
+            .enumerate()
+            .map(|(idx, (repo, number))| {
+                // Mirrors board_doc_tab_bar: an issue that's left the tracked
+                // set still gets a tab (no close semantics wired for
+                // Pipeline in this slice — see the "#2284" note on
+                // `pipeline_doc_tab_bar`'s callers), rendered with an empty
+                // title rather than dropped.
+                let title = self
+                    .pipeline_issue_for(repo, *number)
+                    .map(|pi| pi.title.clone())
+                    .unwrap_or_default();
+                let is_preview = group.is_preview(idx);
+                let is_active = group.active_index() == Some(idx);
+                TabItem {
+                    label: doc_tab_label(repo, *number, &title, show_repo, is_preview, is_active),
+                    is_active,
+                    is_dirty: false,
+                    is_preview,
+                    is_closable: true,
+                }
+            })
+            .collect();
+        Some(TabBar {
+            id: WidgetId::new("pipeline-doc-tabs"),
+            tabs,
+            right_segments: Vec::new(),
+            active_accent: None,
+            scroll_offset: 0,
+            show_tab_close: false,
+            compact: false,
+        })
+    }
+
+    /// The Pipeline doc-tab strip as it will actually paint at `width`
+    /// columns — the Pipeline-scope counterpart of
+    /// [`Self::board_doc_tab_strip`]; see that method's doc comment for why
+    /// the overflow markers are baked into label text rather than painted by
+    /// quadraui.
+    pub(crate) fn pipeline_doc_tab_strip(&self, width: f32) -> Option<TabBar> {
+        let mut bar = self.pipeline_doc_tab_bar()?;
+        Self::bake_doc_tab_overflow_markers(&mut bar, width);
+        Some(bar)
+    }
+
+    /// Shared by [`Self::board_doc_tab_strip`] and
+    /// [`Self::pipeline_doc_tab_strip`]: resolve `bar`'s `scroll_offset` for
+    /// `width` columns and bake the `‹`/`›` (§4, #2283) overflow markers into
+    /// the boundary visible tab's label in place — see
+    /// `Self::board_doc_tab_strip`'s doc comment for why this can't be a
+    /// quadraui-painted affordance in the TUI backend. A no-op (beyond
+    /// resolving `scroll_offset`, itself inert at `width <= 0.0`) when `bar`
+    /// has no tabs.
+    fn bake_doc_tab_overflow_markers(bar: &mut TabBar, width: f32) {
         if bar.tabs.is_empty() || width <= 0.0 {
-            return Some(bar);
+            return;
         }
         let label_lens: Vec<f32> = bar
             .tabs
@@ -1844,7 +1939,6 @@ impl CoordApp {
                 }
             }
         }
-        Some(bar)
     }
 
     pub(crate) fn board_detail_tab_bar(&self) -> TabBar {
