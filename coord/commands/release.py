@@ -503,13 +503,24 @@ def _post(url: str, payload: dict, *, timeout: float) -> tuple[int | None, dict,
     return resp.status_code, (body if isinstance(body, dict) else {}), ""
 
 
-#: #2373: default timeout for the remote-reconcile POST below. Generous —
-#: the agent's own `coord drive-queue tick --reconcile-only` subprocess is
-#: given 120s (`AgentServer.reconcile_drive_queue`) — but still small next to
-#: `DEFAULT_DRAIN_DEADLINE_SECONDS` (90 minutes), so a wedged/unreachable
-#: agent never turns "ask before escalating" into a second, longer wait
-#: before the loud message an operator is actually watching for.
+#: #2373: default timeout for the remote-reconcile POST below. Generous, but
+#: still small next to `DEFAULT_DRAIN_DEADLINE_SECONDS` (90 minutes), so a
+#: wedged/unreachable agent never turns "ask before escalating" into a
+#: second, longer wait before the loud message an operator is actually
+#: watching for. The POST body forwards a *shorter* remote-subprocess
+#: timeout (see `_RECONCILE_TIMEOUT_MARGIN_SECONDS` below) so the remote
+#: agent's own tick (`AgentServer.reconcile_drive_queue`, otherwise 120s by
+#: default) can never outlive this wait — without that, a tick legitimately
+#: taking longer than this timeout would surface here as a misleading
+#: "unreachable" even though it was still running and would have resolved
+#: correctly on its own.
 DEFAULT_RECONCILE_TIMEOUT_SECONDS = 30.0
+
+#: Margin subtracted from *timeout* before it is forwarded as the remote
+#: subprocess's own timeout (see `_reconcile_launch_host`) — leaves the
+#: agent's HTTP handler room to marshal and return its response before
+#: this side's own `httpx` deadline fires.
+_RECONCILE_TIMEOUT_MARGIN_SECONDS = 5.0
 
 
 def _reconcile_launch_host(
@@ -543,10 +554,19 @@ def _reconcile_launch_host(
     response, ``True`` when the agent ran the tick (its own exit code, not
     "and it resolved the entry" — a genuinely still-busy host is expected to
     report ``ok=True`` with nothing to reconcile).
+
+    The POST body forwards a remote subprocess timeout derived from
+    *timeout* itself (minus `_RECONCILE_TIMEOUT_MARGIN_SECONDS`) rather than
+    leaving the remote agent to fall back to its own 120s default
+    (`AgentServer.reconcile_drive_queue`) — otherwise a tick that legitimately
+    takes longer than this call's own HTTP wait reports here as
+    `ok=False, detail="unreachable: ..."` even though it is still running and
+    will resolve correctly on its own, just not attributed to this call.
     """
     poster = post or _post
     url = f"http://{machine_host}:{agent_port}/drive-queue-reconcile"
-    status, body, err = poster(url, {}, timeout=timeout)
+    remote_timeout = max(1.0, timeout - _RECONCILE_TIMEOUT_MARGIN_SECONDS)
+    status, body, err = poster(url, {"timeout": remote_timeout}, timeout=timeout)
     if err:
         return False, f"unreachable: {err}"
     if status != 200:
@@ -1371,6 +1391,13 @@ def _apply_cordons(  # noqa: PLR0912 — one linear apply-the-plan pass
                 click.echo(f"  ✗ release cordon {name}: {exc}", err=True)
 
     machines_by_name = {m.name: m for m in (machines or ())}
+    # #2373: each escalation below makes one synchronous `_reconcile_launch_host`
+    # HTTP call, serially, each blocking up to ~`DEFAULT_RECONCILE_TIMEOUT_SECONDS`.
+    # With multiple simultaneously-overdue hosts this adds up to N * timeout of
+    # latency inside one `release propagate` invocation. Fine today — escalations
+    # are rare and few at once — but if that ever stops being true, parallelize
+    # this loop (e.g. a thread pool over `plan.escalations`) rather than letting
+    # a single propagate call silently grow with fleet size.
     for escalation in plan.escalations:
         # #2373: before the loud message, give the escalated host's OWN
         # agent one chance to resolve the ambiguity that is actually holding
@@ -2294,24 +2321,19 @@ def _run_reconcile_tick(config_path: Path, *, runner=None) -> tuple[bool, str]:
     *after* the timer stopped would stay stuck ``running`` for the rest of
     the drain no matter how generous the deadline is — the exact deadlock
     #2110 fixed reconciliation to no longer require the timer for.
-    """
-    import subprocess  # noqa: PLC0415
 
-    run = runner or subprocess.run
-    try:
-        proc = run(
-            [sys.executable, "-m", "coord.cli", "drive-queue", "tick",
-             "--reconcile-only", "--config", str(config_path)],
-            capture_output=True, text=True, timeout=120,
-        )
-    except Exception as exc:  # noqa: BLE001 — best effort; the quiescence
-        # check right after this call is the real signal a stuck reconcile
-        # eventually clears on a later poll, not this one call's job to
-        # guarantee.
-        return False, f"{type(exc).__name__}: {exc}"
-    ok = getattr(proc, "returncode", 1) == 0
-    detail = (getattr(proc, "stderr", "") or getattr(proc, "stdout", "") or "").strip()
-    return ok, detail[:200]
+    Thin wrapper around :func:`coord.reconcile_tick.run_reconcile_tick`, the
+    #2373-extracted shared implementation also used by
+    `AgentServer.reconcile_drive_queue` (`coord/agent.py`) — see that
+    module's docstring for why there must be exactly one implementation of
+    "what a reconcile-only tick does". A failure here is not fatal on its
+    own: the quiescence check right after this call is the real signal a
+    stuck reconcile eventually clears on a later poll, not this one call's
+    job to guarantee.
+    """
+    from coord.reconcile_tick import run_reconcile_tick  # noqa: PLC0415
+
+    return run_reconcile_tick(config_path, timeout=120, detail_limit=200, runner=runner)
 
 
 def _drain(
