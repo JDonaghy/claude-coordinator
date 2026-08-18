@@ -31,6 +31,24 @@ from coord.ci_store import (
 )
 
 
+# Captured before the autouse fixture below ever patches it, so a test that
+# needs the REAL caching/lookup behavior can restore it for just itself.
+_REAL_REQUIRED_CONTEXTS = GitHubCi._required_contexts
+
+
+@pytest.fixture(autouse=True)
+def _no_required_contexts_filter(monkeypatch):
+    """#2388: default every `GitHubCi` in this file to "couldn't determine
+    required contexts, don't filter" — every test below that mocks raw
+    `gh` subprocess calls does so with an exact expected call sequence, and
+    the required-contexts lookup (a repo lookup + a branch-protection
+    lookup) would otherwise insert two extra calls into that sequence for
+    tests that never intended to exercise it. `TestGitHubCiRequiredContexts`
+    below overrides this directly to exercise the real filtering path.
+    """
+    monkeypatch.setattr(GitHubCi, "_required_contexts", lambda self, repo: None)
+
+
 # ── NoOpCi ───────────────────────────────────────────────────────────────────
 
 class TestNoOpCi:
@@ -768,6 +786,74 @@ class TestGitHubCiExpectsChecks:
             store.expects_checks("acme/api", 42)
             store.expects_checks("acme/ui", 42)  # different repo
         assert fn.call_count == 2
+
+
+class TestGitHubCiRequiredContexts:
+    """#2388: `list_checks_for_pr` narrows to branch-protection-required
+    contexts when they're determinable, so an advisory job (e.g. a hung,
+    unconditional Playwright/Chromium install with no timeout) can't block
+    the merge gate on its own — GitHub itself doesn't wait on it either."""
+
+    def test_narrows_to_required_contexts_when_known(self) -> None:
+        payload = json.dumps([
+            {"name": "test (3.12)", "state": "SUCCESS", "bucket": "pass",
+             "link": "", "startedAt": "", "completedAt": ""},
+            {"name": "acceptance", "state": "PENDING", "bucket": "pending",
+             "link": "", "startedAt": "", "completedAt": ""},
+        ])
+        store = GitHubCi()
+        with (
+            patch("coord.ci_github.subprocess.run", return_value=_gh_result(payload)),
+            patch.object(
+                GitHubCi, "_required_contexts",
+                lambda self, repo: frozenset({"test (3.12)"}),
+            ),
+        ):
+            checks = store.list_checks_for_pr("acme/api", 42)
+        assert [c.name for c in checks] == ["test (3.12)"]
+        # The gate no longer sees the advisory `acceptance` check at all —
+        # a hung advisory job can't make this read as in-flight.
+        assert in_flight_checks(checks) == []
+
+    def test_does_not_filter_when_required_contexts_unknown(self) -> None:
+        """No branch protection configured / unreadable — #1525's bias:
+        unknown must read as "wait on everything reported", not as license
+        to stop waiting on something that might in fact be required."""
+        payload = json.dumps([
+            {"name": "test (3.12)", "state": "SUCCESS", "bucket": "pass",
+             "link": "", "startedAt": "", "completedAt": ""},
+            {"name": "acceptance", "state": "PENDING", "bucket": "pending",
+             "link": "", "startedAt": "", "completedAt": ""},
+        ])
+        store = GitHubCi()
+        with patch("coord.ci_github.subprocess.run", return_value=_gh_result(payload)):
+            checks = store.list_checks_for_pr("acme/api", 42)  # fixture default: None
+        assert {c.name for c in checks} == {"test (3.12)", "acceptance"}
+        assert len(in_flight_checks(checks)) == 1
+
+    def test_required_contexts_cached_per_repo(self, monkeypatch) -> None:
+        monkeypatch.setattr(GitHubCi, "_required_contexts", _REAL_REQUIRED_CONTEXTS)
+        store = GitHubCi(cache_ttl=60.0)
+        with patch(
+            "coord.github_ops.get_required_status_check_contexts",
+            return_value=["test (3.12)"],
+        ) as fn:
+            store._required_contexts("acme/api")
+            store._required_contexts("acme/api")
+        assert fn.call_count == 1
+
+    def test_empty_required_list_reads_as_unknown_not_nothing_required(
+        self, monkeypatch,
+    ) -> None:
+        """An empty `contexts` list from the API (protection configured but
+        zero required checks — an unusual but real repo state) must not be
+        read as "filter everything out". Only a non-empty list narrows."""
+        monkeypatch.setattr(GitHubCi, "_required_contexts", _REAL_REQUIRED_CONTEXTS)
+        store = GitHubCi()
+        with patch(
+            "coord.github_ops.get_required_status_check_contexts", return_value=[],
+        ):
+            assert store._required_contexts("acme/api") is None
 
 
 class TestGitHubCiRerunForPr:
