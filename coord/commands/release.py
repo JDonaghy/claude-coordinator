@@ -503,6 +503,57 @@ def _post(url: str, payload: dict, *, timeout: float) -> tuple[int | None, dict,
     return resp.status_code, (body if isinstance(body, dict) else {}), ""
 
 
+#: #2373: default timeout for the remote-reconcile POST below. Generous —
+#: the agent's own `coord drive-queue tick --reconcile-only` subprocess is
+#: given 120s (`AgentServer.reconcile_drive_queue`) — but still small next to
+#: `DEFAULT_DRAIN_DEADLINE_SECONDS` (90 minutes), so a wedged/unreachable
+#: agent never turns "ask before escalating" into a second, longer wait
+#: before the loud message an operator is actually watching for.
+DEFAULT_RECONCILE_TIMEOUT_SECONDS = 30.0
+
+
+def _reconcile_launch_host(
+    machine_host: str,
+    *,
+    agent_port: int,
+    timeout: float = DEFAULT_RECONCILE_TIMEOUT_SECONDS,
+    post=None,
+) -> tuple[bool | None, str]:
+    """Ask *machine_host*'s own agent to run a local reconcile-only tick
+    (#2373), over the same ``POST /<verb>`` HTTP pattern ``/graph-fix``
+    already uses for a per-machine self-heal fanned out from elsewhere.
+
+    Why this has to be a REMOTE call rather than something run locally by
+    whichever host happens to be executing `coord release propagate`: the
+    #1870 cross-host guard (`coord.drive_queue._reconcile_running`) is keyed
+    on a LOCAL tmux read, so only the machine that actually launched a
+    `running` drive-queue entry can ever resolve whether it is still alive.
+    A non-daemon launch host has no periodic tick of its own — confirmed
+    live 2026-08-18 (claude-coordinator#2360): elitebook ran only
+    `coord-agent.service`, dellserver's `coord-drive-queue.timer` correctly
+    refused to declare a foreign-host entry dead every time it ticked, and
+    the ambiguity sat wedging the fleet's release drain for ~17h until a
+    human happened to SSH in and run this exact command by hand. Routing it
+    through the agent HTTP API that already runs on every machine capable of
+    launching a drive closes that gap without a new timer unit anywhere.
+
+    Returns ``(ok, detail)``. ``ok`` is ``None`` when the call could not even
+    be attempted (never treated as a *failure* by the caller — see
+    :func:`_escalate_drain`), ``False`` on an unreachable agent or a non-200
+    response, ``True`` when the agent ran the tick (its own exit code, not
+    "and it resolved the entry" — a genuinely still-busy host is expected to
+    report ``ok=True`` with nothing to reconcile).
+    """
+    poster = post or _post
+    url = f"http://{machine_host}:{agent_port}/drive-queue-reconcile"
+    status, body, err = poster(url, {}, timeout=timeout)
+    if err:
+        return False, f"unreachable: {err}"
+    if status != 200:
+        return False, f"HTTP {status}: {body.get('detail') or body}"
+    return bool(body.get("ok")), str(body.get("detail") or "")
+
+
 def _lane_versions_by_host(report) -> dict[str, list[str | None]]:
     out: dict[str, list[str | None]] = {}
     for lane in report.lanes:
@@ -791,6 +842,11 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
         max_deferrals=cordon_max_deferrals,
         release_cooldown=cordon_cooldown,
         daemon_host=daemon_name,
+        # #2373: lets a blown drain deadline ask the escalated host's own
+        # agent to resolve the #1870 cross-host liveness ambiguity locally
+        # before the loud message goes out — see `_reconcile_launch_host`.
+        machines=getattr(config, "machines", ()) or (),
+        agent_port=AGENT_PORT,
     )
 
     if fully_busy and not force:
@@ -1162,6 +1218,9 @@ def _apply_cordons(  # noqa: PLR0912 — one linear apply-the-plan pass
     max_deferrals: int | None = None,
     release_cooldown: float | None = None,
     daemon_host: str | None = None,
+    machines=None,
+    agent_port: int | None = None,
+    reconcile_timeout: float | None = None,
 ) -> dict:
     """Plan and apply this run's cordons. Returns the journal fragment.
 
@@ -1185,6 +1244,13 @@ def _apply_cordons(  # noqa: PLR0912 — one linear apply-the-plan pass
     pre-#2240 behaviour) rather than to a spurious release: dropping the
     fleet's cordon because a file could not be read is the wrong direction to
     fail in.
+
+    #2373: *machines*/*agent_port* let each :class:`~coord.release_cordon.
+    DrainEscalation` ask the escalated host's OWN agent to run a local
+    reconcile-only tick before the loud message goes out — see
+    :func:`_reconcile_launch_host`. ``machines=None`` (a caller with no fleet
+    topology, e.g. a unit test exercising `plan_cordons` output directly)
+    skips the remote call entirely and escalates exactly as before #2373.
     """
     import time  # noqa: PLC0415
 
@@ -1304,9 +1370,32 @@ def _apply_cordons(  # noqa: PLR0912 — one linear apply-the-plan pass
                 outcome.errors.append(f"release cordon {name}: {exc}")
                 click.echo(f"  ✗ release cordon {name}: {exc}", err=True)
 
+    machines_by_name = {m.name: m for m in (machines or ())}
     for escalation in plan.escalations:
-        _escalate_drain(escalation)
-        outcome.escalated.append(escalation.to_dict())
+        # #2373: before the loud message, give the escalated host's OWN
+        # agent one chance to resolve the ambiguity that is actually holding
+        # it — see `_reconcile_launch_host`'s docstring. `machine` missing
+        # from the fleet map, or no `agent_port` supplied (a caller with no
+        # HTTP topology), skips the call rather than guessing an address.
+        reconcile_ok: bool | None = None
+        reconcile_detail = ""
+        target = machines_by_name.get(escalation.machine)
+        if target is not None and agent_port:
+            reconcile_ok, reconcile_detail = _reconcile_launch_host(
+                target.host,
+                agent_port=agent_port,
+                timeout=(
+                    DEFAULT_RECONCILE_TIMEOUT_SECONDS
+                    if reconcile_timeout is None
+                    else reconcile_timeout
+                ),
+            )
+        _escalate_drain(escalation, reconcile_ok=reconcile_ok, reconcile_detail=reconcile_detail)
+        outcome.escalated.append({
+            **escalation.to_dict(),
+            "reconcile_ok": reconcile_ok,
+            "reconcile_detail": reconcile_detail,
+        })
 
     return outcome.to_dict()
 
@@ -1321,7 +1410,9 @@ DRAIN_ALERT_ISSUE = 0
 DRAIN_ALERT_STAGE = "release-cordon"
 
 
-def _escalate_drain(escalation) -> None:
+def _escalate_drain(
+    escalation, *, reconcile_ok: bool | None = None, reconcile_detail: str = ""
+) -> None:
     """Surface a host that will not drain — loudly, in three places.
 
     stderr (the timer's journal), the escalation table (the TUI and
@@ -1329,21 +1420,43 @@ def _escalate_drain(escalation) -> None:
     criterion 4 is explicitly about the surfaced MESSAGE rather than an
     internal state change, because a silent forever-wait is the failure this
     whole mechanism replaces.
+
+    #2373: *reconcile_ok*/*reconcile_detail* are the outcome of the remote
+    reconcile-only tick `_apply_cordons` asked the escalated host's own
+    agent to run just before calling this — ``None`` when that call was
+    never attempted (no fleet topology / agent port available), so the
+    message stays byte-identical to before #2373 in that case. When it WAS
+    attempted, the outcome is folded into the same message rather than a
+    second alert, so an operator reading one escalation sees both "this is
+    overdue" and "here is what the self-heal attempt already found" without
+    correlating two records.
     """
-    click.echo(f"  ! {escalation.message}", err=True)
+    reconcile_note = ""
+    if reconcile_ok is not None:
+        verb = "ok" if reconcile_ok else "failed"
+        detail = f" ({reconcile_detail})" if reconcile_detail else ""
+        reconcile_note = (
+            f" — asked {escalation.machine}'s own agent to run a local "
+            f"reconcile-only tick first (#2373): {verb}{detail}"
+        )
+    message = f"{escalation.message}{reconcile_note}"
+    click.echo(f"  ! {message}", err=True)
     try:
         from coord.state import record_drive_escalation  # noqa: PLC0415
 
+        gate_readings = (
+            f"machine={escalation.machine} | "
+            f"waited={escalation.waited_seconds:.0f}s | "
+            f"deadline={escalation.deadline_seconds:.0f}s"
+        )
+        if reconcile_ok is not None:
+            gate_readings += f" | remote_reconcile={'ok' if reconcile_ok else 'failed'}"
         record_drive_escalation(
             DRAIN_ALERT_REPO,
             DRAIN_ALERT_ISSUE,
             stage=DRAIN_ALERT_STAGE,
-            reason=escalation.message,
-            gate_readings=(
-                f"machine={escalation.machine} | "
-                f"waited={escalation.waited_seconds:.0f}s | "
-                f"deadline={escalation.deadline_seconds:.0f}s"
-            ),
+            reason=message,
+            gate_readings=gate_readings,
             proposed_command=escalation.command,
         )
     except Exception as exc:  # noqa: BLE001 — the stderr line above is the

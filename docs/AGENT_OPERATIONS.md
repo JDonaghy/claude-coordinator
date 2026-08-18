@@ -1028,6 +1028,48 @@ the gate's dependents stop themselves (the whole queue too, if the entry was
 declared `--scope=fleet` — #2186), propagation sees a *fired* gate as the
 opposite of busy, rolls, and releases the hold.
 
+**#2373 (fixed 2026-08-18): a launch-host-only liveness ambiguity had no
+machine assigned to resolve it.** `_reconcile_running`'s #1870 cross-host
+guard (`coord/drive_queue.py`) is correct and load-bearing: a tick's tmux
+read is always LOCAL, so a `running` entry launched on a *different* host
+than the one ticking must read as `unknown`, never dead — declaring it dead
+from the wrong machine is exactly the false-positive #1870 exists to
+prevent. But only `coord-drive-queue.timer` on the daemon host ticks the
+queue at all; a machine that only runs `coord-agent.service` (precision,
+elitebook) never runs its own tick, so an entry launched there sits
+`running`/`unknown` forever if it actually died — there is no periodic
+process anywhere whose job is to resolve it. Confirmed live 2026-08-18
+(claude-coordinator#2360): an entry launched on elitebook sat `running` for
+~17h; every dellserver tick correctly refused to declare it dead; elitebook's
+release-cordon (which #2101/#2136 renews on every tick that finds the host
+"still busy") kept renewing past its drain deadline and re-escalated with
+nothing ever resolving the ambiguity. Running `coord drive-queue tick
+--reconcile-only` locally on elitebook resolved it in one call — the entry
+moved to `parked` (waiting on a CI re-check, #1891), not actually dead.
+
+The fix closes the loop inside the drain-deadline escalation itself, so it
+needs no new timer unit anywhere: before `_apply_cordons` surfaces a
+`DrainEscalation` (the loud `DRAIN OVERDUE: ...` message), it first `POST`s
+to the escalated host's own agent — `POST /drive-queue-reconcile`
+(`coord/agent_app.py`, handled by `AgentServer.reconcile_drive_queue` in
+`coord/agent.py`) — which shells out to `coord drive-queue tick
+--reconcile-only` *on that machine*, so the #1870 guard's own local-tmux-read
+requirement is satisfied by construction: the host asked is the host whose
+evidence actually counts. The outcome (`ok`/`detail`) is folded into the SAME
+escalation message and escalation-table record rather than a second alert —
+"DRAIN OVERDUE: elitebook has been cordoned for 91m ... — asked elitebook's
+own agent to run a local reconcile-only tick first (#2373): ok (moved to
+parked)". An unreachable agent does not suppress the escalation; the loud
+message still goes out, with the failed self-heal attempt named rather than
+hidden. Every machine capable of launching a drive already runs
+`coord-agent.service`, so no fleet ever needs a new unit installed for this
+to work; a machine with no local `coordinator.yml` (thin-client/config-free
+mode) refuses the call cleanly (`no local coordinator.yml on this agent`)
+since it has nothing to pass as `--config`. See
+`tests/test_release_cordon_2101.py`'s `#2373` section for the seeded
+end-to-end shape (a `running` entry pinned to a non-daemon host, cordoned
+past the drain deadline, resolved without an operator SSH session).
+
 ## `coord.db` backups to the external SSD (interim — #1822 owns the real thing)
 
 `~/.coord/coord.db` on the daemon host is the fleet's canonical state and had
