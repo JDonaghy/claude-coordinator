@@ -14,13 +14,72 @@ pub(crate) fn fmt_dur(secs: u64) -> String {
     }
 }
 
-/// Format elapsed seconds as mm:ss (under 1 hour) or h:mm (≥1 hour).
-pub(crate) fn fmt_elapsed_mmss(secs: u64) -> String {
+/// Format elapsed seconds with an explicit unit on every segment, so the
+/// under-an-hour and over-an-hour regimes can never be confused for one
+/// another: `2m22s` (< 1 hour) vs `2h22m` (≥ 1 hour).
+///
+/// #2397: the prior `fmt_elapsed_mmss` rendered both regimes as the same
+/// bare `N:NN` shape (`M:SS` under an hour, `H:MM` at/above it) — "2:22" read
+/// identically whether it meant 2 minutes or 2 hours 22 minutes, which is
+/// exactly what made a stalled-merge "waiting 2:22" box undiagnosable live
+/// (issue #2397's incident writeup). Every call site switched to this
+/// helper together so no ambiguous rendering survives anywhere in the TUI.
+pub(crate) fn fmt_elapsed(secs: u64) -> String {
     if secs < 3600 {
-        format!("{}:{:02}", secs / 60, secs % 60)
+        format!("{}m{:02}s", secs / 60, secs % 60)
     } else {
-        format!("{}:{:02}", secs / 3600, (secs % 3600) / 60)
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
     }
+}
+
+/// #2397: classify a merge-queue block reason (`coord.merge_queue.plan()`'s
+/// per-entry `reason`, reaching the TUI as `PlannedMergeEntry.reason`) plus
+/// `merge.auto_drain` (`PlannedMergeEntry.auto_drain`) into the "should I be
+/// worried" affordance an operator reading a Pending Merge stage needs —
+/// today they have to run `coord merge --plan` by hand to get this
+/// (docs/MERGE_AUTO_DRAIN_TRUST_BAR.md; live incidents #2284/#2375).
+///
+/// Three buckets:
+/// - **in flight**: `reason` starts with `coord.merge_queue.CI_PENDING_PREFIX`
+///   ("CI running:") — a check is executing *right now*; this resolves on
+///   its own with no human step and no dependency on `auto_drain`.
+/// - **needs a person**: `reason` names a gate that no amount of retrying
+///   clears by itself — an unapproved/rejected review, failed checks, or a
+///   real merge conflict. Matched against the same wording
+///   `coord.merge_queue._entry_gate_status` emits for those cases (mirrored
+///   here as prose classification for *display* only — no gate re-evaluation
+///   happens in Rust).
+/// - **waiting on `coord merge`**: everything else (typically a stale-but-
+///   green CI check, `CI_STALE_PREFIX`) — recoverable by a mere retry, so
+///   whether one happens on its own hinges entirely on `auto_drain`.
+pub(crate) fn merge_wait_affordance(reason: &str, auto_drain: bool) -> &'static str {
+    const NEEDS_PERSON_MARKERS: [&str; 5] = [
+        "CI failed:",
+        "review not approved",
+        "conflict",
+        "CI never ran:",
+        "CI unreadable:",
+    ];
+    if reason.starts_with("CI running:") {
+        "auto-retry in flight — CI re-checking now"
+    } else if NEEDS_PERSON_MARKERS.iter().any(|m| reason.contains(m)) {
+        "blocked — needs a person to resolve"
+    } else if auto_drain {
+        "auto-retry armed — will retry automatically (~30s)"
+    } else {
+        "waiting on a human — nothing retries until `coord merge` runs"
+    }
+}
+
+/// #2397: `"{reason} [{affordance}]"`, truncated so a verbose gate-failure
+/// reason (e.g. a multi-check CI failure summary) can't blow out a stage
+/// box's width — the affordance tag is the load-bearing part for the
+/// "should I be worried" read, so it's kept intact and the reason prose is
+/// trimmed instead. `None` in, `None` out (no plan entry / not blocked).
+pub(crate) fn fmt_merge_block_reason(reason: Option<&str>, auto_drain: bool) -> Option<String> {
+    let reason = reason?;
+    let affordance = merge_wait_affordance(reason, auto_drain);
+    Some(format!("{} [{}]", trunc(reason, 80), affordance))
 }
 
 /// Truncate `s` to at most `max_chars` Unicode scalar values.

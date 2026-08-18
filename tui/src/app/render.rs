@@ -2847,7 +2847,17 @@ impl CoordApp {
                     format!(" — running {}", elapsed_since_now(since))
                 }
                 (StageStatus::Pending, Some(since)) => {
-                    format!(" — waiting {}", elapsed_since_now(since))
+                    // #2397: append the merge-queue's own computed block
+                    // reason (Merge stage only — `block_reason` is `None`
+                    // for every other stage) so "pending — waiting 2h22m"
+                    // no longer sits with zero signal for *why*, alongside
+                    // the disambiguated `elapsed_since_now` unit.
+                    match &stage.block_reason {
+                        Some(reason) => {
+                            format!(" — waiting {} — {reason}", elapsed_since_now(since))
+                        }
+                        None => format!(" — waiting {}", elapsed_since_now(since)),
+                    }
                 }
                 _ => String::new(),
             };
@@ -3556,7 +3566,7 @@ impl CoordApp {
                             "  {} · {} · elapsed {}",
                             a.assignment_type.as_deref().unwrap_or("work"),
                             a.machine,
-                            fmt_elapsed_mmss(secs)
+                            fmt_elapsed(secs)
                         )
                     }
                     (Some(start), None) => {
@@ -3565,7 +3575,7 @@ impl CoordApp {
                             "  {} · {} · running {}",
                             a.assignment_type.as_deref().unwrap_or("work"),
                             a.machine,
-                            fmt_elapsed_mmss(secs)
+                            fmt_elapsed(secs)
                         )
                     }
                     _ => format!(

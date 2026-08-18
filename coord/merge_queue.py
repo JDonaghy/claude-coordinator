@@ -3984,6 +3984,17 @@ class PlannedMerge:
     # when no PR is open yet, or `ci_store` has no checks for this PR.
     pr_number: int | None = None
     ci_summary: "CiCheckSummary | None" = None
+    # #2397: mirrors `config.merge.auto_drain` (default False) at plan-build
+    # time — read-only exposure, no gate-logic change. The TUI's per-issue
+    # Merge stage box needs this to tell "nothing retries until a human runs
+    # `coord merge`" (auto_drain off) apart from "an automatic retry tick is
+    # already handling this" (auto_drain on); today it has no way to know
+    # and the box renders identically either way (issue #2397's incident:
+    # `#2284`'s acceptance-authoring slice sat "pending — waiting 2:22" with
+    # no signal that `merge.auto_drain: false` meant nothing was coming on
+    # its own). Same value on every entry in one `plan()` call — it's a
+    # single process-wide config flag, not per-entry state.
+    auto_drain: bool = False
 
 
 def _load_milestones_for_queue(
@@ -4058,6 +4069,10 @@ def plan(
     """
     items = load_queue()
     milestones = _load_milestones_for_queue(items)
+    # #2397: read once, stamped on every entry below — see `PlannedMerge
+    # .auto_drain`'s doc comment for why the TUI needs this alongside
+    # `reason`.
+    auto_drain = bool(getattr(getattr(config, "merge", None), "auto_drain", False))
 
     # ── Group by (repo_github, target_branch) ──────────────────────────────
     group_order: list[tuple[str, str]] = []
@@ -4133,6 +4148,7 @@ def plan(
                 enqueued_at=entry.enqueued_at,
                 last_attempt=entry.last_attempt,
                 milestone=milestones.get((entry.repo_name, entry.issue_number)),
+                auto_drain=auto_drain,
             ))
 
     return result
