@@ -183,6 +183,51 @@ impl CoordApp {
             }
         }
 
+        // ── #2283 (ms-65 §4): Board doc-tab close/cycle chords ───────────
+        // Caught BEFORE the #605 Ctrl-W pane-focus leader just below so a
+        // bare `Ctrl-W` closes the active Board tab instead of arming the
+        // leader's second-key wait. Gated to `!self.ctrl_w_pending` so this
+        // arm never fires while a leader sequence is already underway —
+        // `Ctrl-W Ctrl-W` (forward a literal Ctrl-W to a focused PTY) still
+        // resolves through `handle_ctrl_w_leader`'s Step-2 branch below
+        // exactly as #605 left it. With no Board document tab open (or on
+        // any other view) these chords are untouched: `Ctrl-W` keeps its
+        // #605 meaning, and `Ctrl-Tab`/`Ctrl-Shift-Tab` fall through to
+        // whatever (if anything) else claims them.
+        if let UiEvent::KeyPressed { key, modifiers, .. } = &event {
+            if !self.any_blocking_modal_active()
+                && self.issue_finder.is_none()
+                && !self.ctrl_w_pending
+                && self.active_view == SidebarView::Board
+                && !self.board_doc_tabs().is_empty()
+            {
+                if matches!(key, Key::Char('w') | Key::Char('W'))
+                    && modifiers.ctrl
+                    && !modifiers.alt
+                {
+                    self.close_active_board_doc_tab();
+                    return Reaction::Redraw;
+                }
+                // `Ctrl-Shift-Tab` has two plausible wire encodings: a real
+                // terminal may deliver it as `Key::Named(Tab)` with
+                // `{ctrl, shift}`, or as `Key::Named(BackTab)` with
+                // `{ctrl, shift}` (crossterm folds Shift-Tab into
+                // `KeyCode::BackTab`; quadraui's TUI event translation maps
+                // that to `NamedKey::BackTab`). The contract pins the
+                // user-facing chord, not the `KeyCode`, so both resolve to
+                // the same backward cycle; `BackTab` is unconditionally
+                // backward (it has no un-shifted form), while `Tab`'s
+                // direction depends on the shift flag.
+                let is_tab = matches!(key, Key::Named(NamedKey::Tab));
+                let is_back_tab = matches!(key, Key::Named(NamedKey::BackTab));
+                if (is_tab || is_back_tab) && modifiers.ctrl && !modifiers.alt {
+                    let forward = is_tab && !modifiers.shift;
+                    self.cycle_board_doc_tab(forward);
+                    return Reaction::Redraw;
+                }
+            }
+        }
+
         // ── #605: Ctrl-W pane leader (keyboard focus move — no mouse) ────
         // Caught BEFORE the terminal-focus blocks below so the chord is not
         // swallowed by a focused PTY's key-forward.  Skipped while a blocking
@@ -4595,6 +4640,49 @@ impl CoordApp {
                 false
             }
 
+            // #2283 (ms-65 §4): middle-click anywhere on a Board doc tab —
+            // body OR close glyph, no split the way left-click has — closes
+            // it. Left-click's Board branch (`mouse_main_click`) already
+            // resolves `×` vs body via `resolve_doc_tab_click`; middle-click
+            // ignores that split and closes on either.
+            UiEvent::MouseDown {
+                position,
+                button: MouseButton::Middle,
+                ..
+            } => {
+                let pos = *position;
+                if self.active_view != SidebarView::Board || !ctx.in_main(pos.x, pos.y) {
+                    return false;
+                }
+                let main_b = ctx.main_bounds();
+                let lh = backend.line_height();
+                // Carve off the panel toolbar row(s) first, exactly as
+                // `mouse_main_click`'s left-click path does — the doc-tab
+                // strip is the first row of `content_main_b`, not of the
+                // raw `main_b` (#272's toolbar sits above it).
+                let (main_b, toolbar_consumed) = self.hit_test_panel_toolbar(pos, main_b, lh);
+                if toolbar_consumed {
+                    return true;
+                }
+                let tab_h = detail_tab_bar_height(lh);
+                if pos.y - main_b.y >= tab_h {
+                    return false;
+                }
+                let Some(strip) = self.board_doc_tab_strip(main_b.width) else {
+                    return false;
+                };
+                if strip.tabs.is_empty() {
+                    return false;
+                }
+                let refs: Vec<&str> = strip.tabs.iter().map(|t| t.label.as_str()).collect();
+                match resolve_doc_tab_click(&refs, main_b.x, pos.x, strip.scroll_offset) {
+                    Some(TabClickKind::Close(idx) | TabClickKind::Body(idx)) => {
+                        self.close_board_doc_tab(idx)
+                    }
+                    None => false,
+                }
+            }
+
             // #2282 (ms-65 §2e rule 3): a physical double click reaches
             // `AppLogic` as `MouseDown` followed by `UiEvent::DoubleClick` —
             // quadraui's `DoubleClickDetector` REPLACES the second `MouseDown`
@@ -5571,25 +5659,26 @@ impl CoordApp {
             // shrink `main_b` for everything below, mirroring what the render
             // path does — otherwise every sub-tab click would land one row high
             // whenever a document is open.
-            let main_b = match self.board_doc_tab_labels() {
-                labels if !labels.is_empty() => {
+            // #2283 (ms-65 §4): `board_doc_tab_strip` is the SAME call the
+            // paint path (`render.rs`) makes — same `scroll_offset`, same
+            // baked-in `‹`/`›` overflow glyphs — so a click column can never
+            // resolve to a different tab than the one actually on screen.
+            let strip = self.board_doc_tab_strip(main_b.width);
+            let main_b = match &strip {
+                Some(strip) if !strip.tabs.is_empty() => {
                     if pos.y - main_b.y < tab_h {
-                        let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
-                        // Same scroll-to-active offset the painter resolves, so
-                        // a click lands on the tab the user can actually see
-                        // once the strip overflows (#2283 owns the arrows).
-                        let active_idx = self
-                            .board_doc_tabs()
-                            .active_index()
-                            .unwrap_or(0);
-                        let scroll = TabBar::fit_active_scroll_offset(
-                            active_idx,
-                            refs.len(),
-                            main_b.width as usize,
-                            |i| refs[i].chars().count(),
-                        );
-                        return match hit_tab_index_from_labels(&refs, main_b.x, pos.x, scroll) {
-                            Some(idx) => self.activate_board_doc_tab(idx),
+                        let refs: Vec<&str> =
+                            strip.tabs.iter().map(|t| t.label.as_str()).collect();
+                        // #4: clicking a tab's `×` closes it; clicking its
+                        // BODY activates it (§2b/§2e's open-or-activate path).
+                        return match resolve_doc_tab_click(
+                            &refs,
+                            main_b.x,
+                            pos.x,
+                            strip.scroll_offset,
+                        ) {
+                            Some(TabClickKind::Close(idx)) => self.close_board_doc_tab(idx),
+                            Some(TabClickKind::Body(idx)) => self.activate_board_doc_tab(idx),
                             None => false,
                         };
                     }

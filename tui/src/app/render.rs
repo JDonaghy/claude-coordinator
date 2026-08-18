@@ -172,18 +172,20 @@ impl ShellApp for CoordApp {
                 // inserted between the panel toolbar and the existing
                 // `Board / Issue / Chat / Terminal` sub-tab bar — two tab rows,
                 // in that order, pinned by the contract. With zero documents
-                // open `board_doc_tab_bar` is `None`: the strip renders nothing
-                // and reserves no row, so the sub-tab bar sits exactly where it
-                // did pre-ms-65.
-                let m = match self.board_doc_tab_bar() {
-                    Some(mut strip) => {
+                // open `board_doc_tab_strip` is `None`: the strip renders
+                // nothing and reserves no row, so the sub-tab bar sits exactly
+                // where it did pre-ms-65 (§4/#2283: also the close-the-last-tab
+                // empty state).
+                //
+                // #2283 (ms-65 §4): `board_doc_tab_strip` is the single place
+                // that resolves `scroll_offset` AND bakes in the `‹`/`›`
+                // overflow affordances — the click hit-test
+                // (`events.rs::mouse_main_click`) builds the exact same
+                // `TabBar` from the exact same call so a click column can
+                // never disagree with what got painted here.
+                let m = match self.board_doc_tab_strip(m.width) {
+                    Some(strip) => {
                         let strip_rect = Rect::new(m.x, m.y, m.width, tab_h);
-                        // Same write-back the Pipeline sub-tab bar uses (#605):
-                        // resolve the offset that keeps the active tab on
-                        // screen before painting, since the TUI painter renders
-                        // from `scroll_offset` verbatim.
-                        strip.scroll_offset =
-                            backend.tab_bar_layout(strip_rect, &strip).correct_scroll_offset;
                         backend.draw_tab_bar(strip_rect, &strip, None);
                         Rect::new(m.x, m.y + tab_h, m.width, (m.height - tab_h).max(0.0))
                     }
@@ -1759,12 +1761,90 @@ impl CoordApp {
         })
     }
 
-    /// The doc-tab strip's rendered labels, in strip order — the measure the
-    /// click hit-test walks. Empty when no strip is rendered.
+    /// The doc-tab strip's rendered labels, unmutated by the §4 (#2283)
+    /// overflow-arrow bake-in — in strip order. Empty when no strip is
+    /// rendered.
+    ///
+    /// Test-only: the click hit-test now builds from
+    /// [`Self::board_doc_tab_strip`] instead (its `scroll_offset` and
+    /// `‹`/`›` markers must agree with what's painted), but this plain
+    /// accessor is still the simplest fixture for tests asserting on raw
+    /// label content (e.g. the repo-prefix rule) without wading through
+    /// arrow bake-in.
+    #[cfg(test)]
     pub(crate) fn board_doc_tab_labels(&self) -> Vec<String> {
         self.board_doc_tab_bar()
             .map(|bar| bar.tabs.into_iter().map(|t| t.label).collect())
             .unwrap_or_default()
+    }
+
+    /// #2283 (ms-65 §4): the Board doc-tab strip **as it will actually
+    /// paint** at `width` columns — `scroll_offset` resolved and the
+    /// `‹`/`›` overflow affordances baked in.
+    ///
+    /// Both the paint path (`render_content` above) and the click hit-test
+    /// (`events.rs::mouse_main_click`, `handle_mouse`'s middle-click arm)
+    /// build the `TabBar` they measure against from THIS function — never
+    /// independently — so a click column can never resolve to a different
+    /// tab than the one actually painted there.
+    ///
+    /// # Why the arrows are baked into label text, not painted by quadraui
+    ///
+    /// `TabBar::layout` (the primitive) DOES compute `scroll_left`/
+    /// `scroll_right` authoritatively given a nonzero `scroll_arrow_width` —
+    /// that's the part reused below, not reimplemented. But nothing
+    /// downstream paints the glyph for TUI: `TuiBackend::draw_tab_bar` /
+    /// `tab_bar_layout` hardcode `scroll_arrow_width: 0.0` ("no scroll
+    /// arrows in TUI") and simply honour whatever `scroll_offset` the
+    /// caller supplies. So this bakes `‹`/`›` into the boundary visible
+    /// tab's label, exactly the way [`doc_tab_label`] already bakes in the
+    /// close glyph and the §2c active bracket (both for the same root
+    /// reason: the close button can't land where §2c's bracket needs it to
+    /// via `TabBar::show_tab_close`).
+    ///
+    /// The `scroll_arrow_width: 1.0` reservation (1 column each side,
+    /// mirroring `TabBar::layout`'s own "reserve space for two, even if
+    /// only one ends up shown" policy) guarantees the extra `‹`/`›`
+    /// character never crowds its tab out of the width the real
+    /// (unreserved) TUI paint has to work with — so the active tab's
+    /// visibility guarantee from `TabBar::fit_active_scroll_offset`
+    /// survives the label mutation below.
+    ///
+    /// `None` when zero documents are open (identical to
+    /// [`Self::board_doc_tab_bar`]).
+    pub(crate) fn board_doc_tab_strip(&self, width: f32) -> Option<TabBar> {
+        let mut bar = self.board_doc_tab_bar()?;
+        if bar.tabs.is_empty() || width <= 0.0 {
+            return Some(bar);
+        }
+        let label_lens: Vec<f32> = bar
+            .tabs
+            .iter()
+            .map(|t| t.label.chars().count() as f32)
+            .collect();
+        let layout = bar.layout(
+            width,
+            1.0,
+            1.0,
+            |i| TabMeasure::new(label_lens[i], 0.0),
+            |_| SegmentMeasure::new(0.0),
+        );
+        bar.scroll_offset = layout.resolved_scroll_offset;
+        if layout.scroll_left.is_some() {
+            if let Some(vt) = layout.visible_tabs.first() {
+                if let Some(t) = bar.tabs.get_mut(vt.tab_idx) {
+                    t.label = format!("{SCROLL_LEFT_MARKER}{}", t.label);
+                }
+            }
+        }
+        if layout.scroll_right.is_some() {
+            if let Some(vt) = layout.visible_tabs.last() {
+                if let Some(t) = bar.tabs.get_mut(vt.tab_idx) {
+                    t.label = format!("{}{SCROLL_RIGHT_MARKER}", t.label);
+                }
+            }
+        }
+        Some(bar)
     }
 
     pub(crate) fn board_detail_tab_bar(&self) -> TabBar {
