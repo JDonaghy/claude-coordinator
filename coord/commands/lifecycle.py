@@ -438,7 +438,25 @@ def web(
     app = build_app(cfg, token=token, fixture=fixture, dist_path=dist_path)
     click.echo(f"coord web: dashboard at http://{bind_host}:{bind_port}")
     if dist_path is not None:
-        click.echo(f"  serving webapp bundle from {dist_path} (#1543)")
+        # #2003: this used to unconditionally claim "serving webapp bundle
+        # from {dist_path}" even when that path was missing or empty — the
+        # server itself silently falls back to the legacy single-file
+        # dashboard in that case (build_app / index()), so the operator saw
+        # a success message for what was actually a silent regression to the
+        # legacy UI. Check the same condition build_app's index() route
+        # checks (dist_path/index.html) so this message can't drift from
+        # what actually gets served.
+        if (dist_path / "index.html").exists():
+            click.echo(f"  serving webapp bundle from {dist_path} (#1543)")
+        else:
+            click.echo(
+                f"  warning: --dist {dist_path} has no index.html (missing "
+                "or empty directory) — falling back to the legacy "
+                "single-file dashboard, NOT the bundle you pointed at. "
+                "Check the path / the build hook that populates it "
+                "(#2003).",
+                err=True,
+            )
     if fixture is not None:
         click.echo(
             f"  fixture mode: seeded board from {fixture_path} — reads are "

@@ -1559,6 +1559,151 @@ class TestCLI:
             )
         assert captured.get("dist_path") == Path("/tmp/some-dist-dir")
 
+    @staticmethod
+    def _config_file(tmp_path: Path) -> Path:
+        config_file = tmp_path / "coordinator.yml"
+        config_file.write_text(
+            "repos:\n"
+            "  - name: api\n"
+            "    github: acme/api\n"
+            "    default_branch: main\n"
+            "machines:\n"
+            "  - name: laptop\n"
+            "    host: laptop.tailnet\n"
+            "    repos: [api]\n"
+            "    repo_paths:\n"
+            "      api: /tmp/api\n"
+        )
+        return config_file
+
+    def test_web_dist_env_var_honored(self, tmp_path: Path, coord_db) -> None:
+        """#2003: ``$COORD_WEB_DIST`` alone (no ``--dist`` flag) must thread
+        through to ``build_app(dist_path=...)`` -- the env-var half of the
+        seam a systemd unit / build-hook timer relies on, since it can't pass
+        a CLI flag."""
+        from click.testing import CliRunner
+        from coord.cli import main
+
+        config_file = self._config_file(tmp_path)
+        env_dist = tmp_path / "env-dist"
+
+        captured = {}
+
+        def _fake_build_app(config, *, token=None, session_attacher=None, fixture=None, dist_path=None):
+            captured["dist_path"] = dist_path
+            raise SystemExit(0)
+
+        runner = CliRunner()
+        with patch("coord.dashboard.server.build_app", _fake_build_app):
+            runner.invoke(
+                main,
+                ["web", "--config", str(config_file)],
+                env={"COORD_WEB_DIST": str(env_dist)},
+                catch_exceptions=True,
+            )
+        assert captured.get("dist_path") == env_dist
+
+    def test_web_dist_flag_overrides_env_var(self, tmp_path: Path, coord_db) -> None:
+        """#2003: precedence when both are set -- ``--dist`` wins over
+        ``$COORD_WEB_DIST`` (click's normal flag-over-envvar resolution,
+        pinned here since this is the exact seam a misconfigured deploy
+        would trip over silently)."""
+        from click.testing import CliRunner
+        from coord.cli import main
+
+        config_file = self._config_file(tmp_path)
+        env_dist = tmp_path / "env-dist"
+        flag_dist = tmp_path / "flag-dist"
+
+        captured = {}
+
+        def _fake_build_app(config, *, token=None, session_attacher=None, fixture=None, dist_path=None):
+            captured["dist_path"] = dist_path
+            raise SystemExit(0)
+
+        runner = CliRunner()
+        with patch("coord.dashboard.server.build_app", _fake_build_app):
+            runner.invoke(
+                main,
+                ["web", "--config", str(config_file), "--dist", str(flag_dist)],
+                env={"COORD_WEB_DIST": str(env_dist)},
+                catch_exceptions=True,
+            )
+        assert captured.get("dist_path") == flag_dist
+        assert captured.get("dist_path") != env_dist
+
+    def test_web_dist_missing_prints_loud_warning(self, tmp_path: Path, coord_db) -> None:
+        """#2003: the operationally important case -- ``--dist`` pointing at
+        a directory that doesn't exist must print a clear warning, not the
+        same success message a valid ``--dist`` gets. Before this fix `coord
+        web` printed "serving webapp bundle from {path}" unconditionally,
+        even though the server was silently falling back to the legacy
+        single-file dashboard -- exactly the invisible regression #2003
+        warns about."""
+        from click.testing import CliRunner
+        from coord.cli import main
+
+        config_file = self._config_file(tmp_path)
+        missing_dist = tmp_path / "does-not-exist"
+
+        runner = CliRunner()
+        # Let the real build_app run (cheap, no network); only bail out
+        # before uvicorn.run would block forever serving the app.
+        with patch("uvicorn.run", side_effect=SystemExit(0)):
+            result = runner.invoke(
+                main,
+                ["web", "--config", str(config_file), "--dist", str(missing_dist)],
+                catch_exceptions=True,
+            )
+        assert "warning" in result.output.lower()
+        assert str(missing_dist) in result.output
+        assert "legacy" in result.output.lower()
+        assert f"serving webapp bundle from {missing_dist}" not in result.output
+
+    def test_web_dist_empty_dir_prints_loud_warning(self, tmp_path: Path, coord_db) -> None:
+        """Same as above but the directory exists and is merely empty (no
+        index.html) -- an interrupted/failed build, not a typo'd path."""
+        from click.testing import CliRunner
+        from coord.cli import main
+
+        config_file = self._config_file(tmp_path)
+        empty_dist = tmp_path / "empty-dist"
+        empty_dist.mkdir()
+
+        runner = CliRunner()
+        with patch("uvicorn.run", side_effect=SystemExit(0)):
+            result = runner.invoke(
+                main,
+                ["web", "--config", str(config_file), "--dist", str(empty_dist)],
+                catch_exceptions=True,
+            )
+        assert "warning" in result.output.lower()
+        assert f"serving webapp bundle from {empty_dist}" not in result.output
+
+    def test_web_dist_valid_prints_success_not_warning(self, tmp_path: Path, coord_db) -> None:
+        """Contrast case: a valid ``--dist`` (real index.html present) keeps
+        printing the plain success message with no warning noise."""
+        from click.testing import CliRunner
+        from coord.cli import main
+
+        config_file = self._config_file(tmp_path)
+        valid_dist = tmp_path / "valid-dist"
+        valid_dist.mkdir()
+        (valid_dist / "index.html").write_text("<html></html>")
+
+        runner = CliRunner()
+        with patch("uvicorn.run", side_effect=SystemExit(0)):
+            result = runner.invoke(
+                main,
+                ["web", "--config", str(config_file), "--dist", str(valid_dist)],
+                catch_exceptions=True,
+            )
+        assert f"serving webapp bundle from {valid_dist}" in result.output
+        # No dist-related warning noise -- the unrelated "no bearer token"
+        # warning is expected (no --token passed) and out of scope here.
+        assert "no index.html" not in result.output.lower()
+        assert "falling back to the legacy" not in result.output.lower()
+
 
 class TestSSEEvents:
     """Tests for /events SSE endpoint (issue #214)."""
@@ -1804,3 +1949,47 @@ class TestDistPathOverride:
             r = client.get("/")
         assert r.status_code == 200
         assert "coord module default" in r.text
+
+    def test_dist_path_wins_over_bundled_webapp_dist(self, tmp_path: Path) -> None:
+        """#2003: when BOTH the bundled ``coord/dashboard/webapp/dist`` and an
+        explicit ``dist_path`` resolve to real bundles, the explicit override
+        wins -- pinning the precedence a `coord-web-dist-build.sh` release
+        depends on (it must not silently keep serving a stale packaged
+        dist/ that happens to also exist in the venv)."""
+        bundled = tmp_path / "bundled"
+        bundled.mkdir()
+        (bundled / "index.html").write_text("<html><title>stale bundled dist</title></html>")
+
+        override = self._make_dist(tmp_path, "<html><title>coord dist override</title></html>")
+
+        with patch("coord.dashboard.server.WEBAPP_DIST", bundled):
+            client = TestClient(build_app(_config(), dist_path=override))
+            r = client.get("/")
+        assert r.status_code == 200
+        assert "coord dist override" in r.text
+        assert "stale bundled dist" not in r.text
+
+    def test_missing_dist_path_falls_back_to_legacy_dashboard(self, tmp_path: Path) -> None:
+        """#2003: a ``--dist`` pointing at a directory that does not exist at
+        all must not error or serve a stale bundle -- it falls back to the
+        legacy single-file dashboard, same as the no-override default. This
+        pins the HTTP-layer half of the fallback; ``TestCLI`` below pins that
+        the CLI surfaces a loud warning for this case rather than the plain
+        success message it prints for a valid ``--dist``."""
+        missing = tmp_path / "does-not-exist"
+        client = TestClient(build_app(_config(), dist_path=missing))
+        r = client.get("/")
+        assert r.status_code == 200
+        assert "coord dashboard" in r.text
+        assert "coord dist override" not in r.text
+
+    def test_empty_dist_path_directory_falls_back_to_legacy_dashboard(self, tmp_path: Path) -> None:
+        """Same as above but the directory exists (e.g. an interrupted build
+        left an empty dir) rather than being wholly absent -- both must fail
+        the same way, not just the "doesn't exist" case."""
+        empty = tmp_path / "empty-dist"
+        empty.mkdir()
+        client = TestClient(build_app(_config(), dist_path=empty))
+        r = client.get("/")
+        assert r.status_code == 200
+        assert "coord dashboard" in r.text
