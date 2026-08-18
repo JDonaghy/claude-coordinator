@@ -5,8 +5,9 @@ milestone is actively being driven, so a slice that goes red after its
 milestone closes (ms-51 at #1547, silently, through #1548/#1550/#1551/#1818)
 is never re-checked.
 
-This is the regression guard for the fix: `.github/workflows/test.yml` gets
-an `acceptance` job that runs the sealed suite on every push/PR (see that
+This is the regression guard for the fix: `.github/workflows/acceptance-
+web.yml` (originally an `acceptance` job inside `test.yml` — see #2389
+below) runs the sealed suite whenever anything it covers changes (see that
 job's own header comment for why CI rather than
 scripts/coord-test-runner.sh). Parsing the real workflow file — not a
 fixture — means this test fails the moment someone removes/disables/
@@ -24,6 +25,15 @@ wrapper invocation; a second test (`test_acceptance_job_uses_the_2164_ci_
 wrapper_not_the_raw_driver`) pins the specific `--all --ci` contract #2180's
 own acceptance criteria require ("through coord acceptance run --all --ci,
 not the raw driver command").
+
+#2389 update: the `acceptance` job moved out of `test.yml` into its own
+`acceptance-web.yml`, `paths:`-gated to `coord/dashboard/webapp/**` /
+`tests/acceptance/**` — it was unconditionally installing Node + a real
+Chromium on every push/PR regardless of what changed, including pure-Rust
+`tui/` diffs, mirroring the `paths:` gating `cargo-test.yml` already has for
+the tui-tuidriver route. `ACCEPTANCE_WORKFLOW_PATH` (not `WORKFLOW_PATH`) is
+what every acceptance-job test below now parses; `WORKFLOW_PATH` (`test.yml`)
+still backs the `test`/`e2e` job assertions, which did not move.
 """
 
 from __future__ import annotations
@@ -34,23 +44,24 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "test.yml"
+ACCEPTANCE_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "acceptance-web.yml"
 CARGO_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "cargo-test.yml"
 CI_ACCEPTANCE_CONFIG_PATH = REPO_ROOT / ".github" / "coord-ci-acceptance.yml"
 
 
-def _load_workflow() -> dict:
+def _load_workflow(path: Path = WORKFLOW_PATH) -> dict:
     # YAML's `on:` key parses to the boolean `True` under the default
     # SafeLoader (YAML 1.1 treats the bare word `on` as a boolean) — harmless
     # here since this test never reads that key, but noted so a future
     # reader isn't surprised the loaded dict's key isn't the string "on".
-    return yaml.safe_load(WORKFLOW_PATH.read_text())
+    return yaml.safe_load(path.read_text())
 
 
-def _job_steps(workflow: dict, job_name: str) -> list[dict]:
+def _job_steps(workflow: dict, job_name: str, path: Path = WORKFLOW_PATH) -> list[dict]:
     jobs = workflow.get("jobs") or {}
     job = jobs.get(job_name)
     assert job is not None, (
-        f"expected a {job_name!r} job in {WORKFLOW_PATH} — jobs present: "
+        f"expected a {job_name!r} job in {path} — jobs present: "
         f"{sorted(jobs)}"
     )
     return job.get("steps") or []
@@ -65,8 +76,8 @@ def _step_runs(steps: list[dict], needle: str) -> dict | None:
 
 
 def test_acceptance_job_exists_and_runs_the_sealed_suite() -> None:
-    workflow = _load_workflow()
-    steps = _job_steps(workflow, "acceptance")
+    workflow = _load_workflow(ACCEPTANCE_WORKFLOW_PATH)
+    steps = _job_steps(workflow, "acceptance", ACCEPTANCE_WORKFLOW_PATH)
     test_step = _step_runs(steps, "coord acceptance run")
     assert test_step is not None, (
         "no step in the 'acceptance' job runs `coord acceptance run` — "
@@ -82,7 +93,7 @@ def test_acceptance_job_does_not_neuter_a_red_result() -> None:
     step (or the whole job) — the same "green screenshot" failure mode
     #1950 describes, just relocated from "never runs" to "runs but can't
     fail"."""
-    workflow = _load_workflow()
+    workflow = _load_workflow(ACCEPTANCE_WORKFLOW_PATH)
     jobs = workflow.get("jobs") or {}
     job = jobs.get("acceptance")
     assert job is not None
@@ -107,8 +118,8 @@ def test_acceptance_job_uses_the_2164_ci_wrapper_not_the_raw_driver() -> None:
     registry — a sealed slice authored red by design would fail this job
     exactly like any other red result, forcing `--force-merge` (#2164's
     whole reason for existing)."""
-    workflow = _load_workflow()
-    steps = _job_steps(workflow, "acceptance")
+    workflow = _load_workflow(ACCEPTANCE_WORKFLOW_PATH)
+    steps = _job_steps(workflow, "acceptance", ACCEPTANCE_WORKFLOW_PATH)
     test_step = _step_runs(steps, "coord acceptance run")
     assert test_step is not None
     run = test_step["run"]
@@ -213,8 +224,8 @@ def test_acceptance_job_installs_coord_cli_on_path() -> None:
     timeout instead of a real (or real-absence-of) assertion failure. Same
     requirement `e2e` already has for `live-update-fixture.spec.ts`
     (#1551)."""
-    workflow = _load_workflow()
-    steps = _job_steps(workflow, "acceptance")
+    workflow = _load_workflow(ACCEPTANCE_WORKFLOW_PATH)
+    steps = _job_steps(workflow, "acceptance", ACCEPTANCE_WORKFLOW_PATH)
     install_step = _step_runs(steps, "pip install")
     assert install_step is not None, (
         "the 'acceptance' job never installs the `coord` CLI (`pip install "
@@ -224,11 +235,45 @@ def test_acceptance_job_installs_coord_cli_on_path() -> None:
 
 
 def test_acceptance_job_installs_a_real_browser() -> None:
-    workflow = _load_workflow()
-    steps = _job_steps(workflow, "acceptance")
+    workflow = _load_workflow(ACCEPTANCE_WORKFLOW_PATH)
+    steps = _job_steps(workflow, "acceptance", ACCEPTANCE_WORKFLOW_PATH)
     browser_step = _step_runs(steps, "playwright install")
     assert browser_step is not None, (
         "the 'acceptance' job never runs `npx playwright install` — "
         "chromium (or whichever project(s) playwright.acceptance.config.ts "
         "declares) won't be present to actually run the suite"
+    )
+
+
+def test_acceptance_workflow_is_paths_gated_to_webapp_changes() -> None:
+    """#2389: this job used to live in `test.yml` with no `paths:` filter at
+    all, so it ran unconditionally on every push/PR — including a pure-Rust
+    `tui/` diff with nothing to do with the webapp — always installing
+    Node + a real Chromium first. Mirrors `cargo-test.yml`'s own `paths:`
+    gate for the tui-tuidriver route."""
+    workflow = _load_workflow(ACCEPTANCE_WORKFLOW_PATH)
+    # YAML 1.1's bareword parsing turns the `on:` key into the boolean
+    # `True`, not the string "on" — see `_load_workflow`'s docstring.
+    on = workflow.get(True) or workflow.get("on") or {}
+    for trigger in ("push", "pull_request"):
+        paths = (on.get(trigger) or {}).get("paths") or []
+        assert "coord/dashboard/webapp/**" in paths, (
+            f"acceptance-web.yml's {trigger!r} trigger isn't paths-gated to "
+            f"coord/dashboard/webapp/**: {paths!r}"
+        )
+
+
+def test_acceptance_job_has_a_bounded_timeout() -> None:
+    """#2389: a job with no `timeout-minutes` defaults to GitHub's 360-minute
+    ceiling — confirmed live 2026-08-18, `npx playwright install chromium`
+    hung 34+ minutes with no automatic recovery. A bounded timeout doesn't
+    prevent a hang, but it guarantees one can't silently occupy a runner (and
+    keep a PR looking "still checking") for hours."""
+    workflow = _load_workflow(ACCEPTANCE_WORKFLOW_PATH)
+    jobs = workflow.get("jobs") or {}
+    job = jobs.get("acceptance") or {}
+    timeout = job.get("timeout-minutes")
+    assert isinstance(timeout, int) and 0 < timeout <= 60, (
+        f"'acceptance' job's timeout-minutes is {timeout!r} — expected a "
+        "small positive bound, not GitHub's implicit 360-minute default"
     )

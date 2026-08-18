@@ -252,6 +252,12 @@ jobs:
 
   e2e:
     runs-on: ubuntu-latest
+    # #2389: this is the SAME `npx playwright install chromium --with-deps`
+    # step that hung 34+ minutes on `acceptance` with no automatic recovery
+    # (a job with no `timeout-minutes` defaults to GitHub's 360-minute
+    # ceiling) — required, so it stays in this file, but gets the same
+    # bounded timeout rather than the implicit 6-hour one.
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: coord/dashboard/webapp
@@ -275,87 +281,17 @@ jobs:
       - run: npx playwright install chromium --with-deps
       - run: npm run test:e2e
 
-  # #1950: the SEALED oracle-loop acceptance suite (tests/acceptance/ms-NN/,
-  # playwright.acceptance.config.ts) was run by no automatic gate anywhere —
-  # only `coord acceptance run/record`, invoked once while a milestone was
-  # being driven and never again. ms-51 went red at #1547 (the responsive
-  # shell removed the `<h1>coord</h1>` §1a pins) and stayed red through
-  # #1548/#1550/#1551/#1818 with nothing noticing. This job is the cheapest
-  # fix named in #1950: run the accumulated sealed suite on every push/PR,
-  # same shape as `e2e` above (Python for the `coord` CLI on PATH — the
-  # acceptance config's `webServer` shells out to `coord web --fixture
-  # ... --dist dist`, see playwright.acceptance.config.ts's module
-  # docstring — plus Node + a real chromium).
-  #
-  # `npm run test:acceptance` with NO `{ms}` filter (unlike a single
-  # milestone's `-- ms-NN`) walks the whole `tests/acceptance/` tree — the
-  # accumulated suite across every closed milestone, i.e. exactly `coord
-  # acceptance run --all` (Gate C) would assemble, just invoked by CI's
-  # cadence instead of a milestone-close event.
-  #
-  # Deliberately NOT added to scripts/coord-test-runner.sh (the Test gate's
-  # engine, coordinator.yml's `test_command`): that script also runs as a
-  # systemd *user* unit on the daemon host (#1814's PATH problem) and would
-  # need node/npm/chromium provisioned there for every future
-  # coord/dashboard/webapp/** branch's Test stage, not just this
-  # already-`browser`-capability-gated CI runner. CI is the tighter, cheaper
-  # loop for this suite; revisit the Test-gate route if CI's cadence turns
-  # out not to be enough (#1950's own "decide deliberately").
-  #
-  # ATTRIBUTABILITY (#1950 item 2): a red result here names a spec file
-  # under `tests/acceptance/ms-NN/` and, by that suite's own convention
-  # (tests/acceptance/ms-51/manifest.yml), a `describe` block carrying the
-  # milestone's tracking issue — e.g. `ms-51/home-active.spec.ts › ms-51
-  # Home Active tab (#1544) › ...`. Playwright's `list` reporter prints that
-  # full path/title on failure, so the ms-NN + issue are already in the
-  # job's own output; the failure-hint step below just spells out the two
-  # possible causes so whoever triages it doesn't have to rediscover them.
-  #
-  # #2180: the `npm run test:acceptance` step now runs THROUGH `coord
-  # acceptance run --all --ci` (#2164) instead of calling Playwright
-  # directly. Same suite, same reporter under the hood — the wrapper's
-  # web-playwright driver shape appends `--reporter=json` and reads
-  # PLAYWRIGHT_JSON_OUTPUT_FILE itself (coord/acceptance_drivers.py) — but
-  # now a test-id listed in a manifest's `expected_red:` that fails does not
-  # redden this job (a sealed slice authored red before its fix exists,
-  # #2164's whole point), while one that unexpectedly PASSES does, loudly
-  # (#1965's vacuous-assertion case). Before this, ms-51 going red for any
-  # reason failed this job exactly the same as every other kind of red —
-  # there was no way to merge a red-by-design slice without `--force-merge`.
-  # .github/coord-ci-acceptance.yml's header explains why this points at a
-  # CI-local config instead of the fleet's real ~/.coord/coordinator.yml.
-  acceptance:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: coord/dashboard/webapp
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - working-directory: .
-        run: pip install -e ".[dev]"
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-      - run: npm ci
-      - run: npx playwright install chromium --with-deps
-      - name: coord acceptance run --all --ci (web-playwright route, ms-51)
-        working-directory: .
-        run: >-
-          coord acceptance run --repo claude-coordinator --all --ci
-          --for-path coord/dashboard/webapp/src/App.tsx
-          --config .github/coord-ci-acceptance.yml --path .
-      - name: A red result here is attributable, not a mystery
-        if: failure()
-        run: |
-          echo "::error::The sealed acceptance suite (tests/acceptance/ms-NN/) failed."
-          echo "The failing spec's path and 'describe' title name the milestone (ms-NN) and the issue that slice was authored for (see tests/acceptance/ms-NN/manifest.yml)."
-          echo "Two causes, and only one fix is right:"
-          echo "  1. The app regressed against an still-accurate contract -> fix the app."
-          echo "  2. Legitimate app evolution made the contract stale (e.g. #1547 vs ms-51) -> amend the contract: coord acceptance mock <repo> <tracking_issue> --amend '<what changed and why>'"
-          echo "Do not silence this job (continue-on-error, skip, etc.) instead of doing one of the above -- that is exactly how ms-51 rotted unnoticed through #1547-#1818 (#1950)."
+  # #2389: the SEALED web-playwright acceptance suite (ms-51) moved to its
+  # own workflow, acceptance-web.yml, with a `paths:` filter scoped to
+  # `coord/dashboard/webapp/**`/`tests/acceptance/**` — mirroring how
+  # cargo-test.yml already gates the tui-tuidriver route on `tui/**`. This
+  # job was unconditionally installing Node + a real Chromium on every
+  # push/PR to this repo regardless of what changed, including pure-Rust
+  # `tui/` diffs that have nothing to do with the webapp (#1950's original
+  # "cheapest fix" traded diff-scoping for coverage-by-default; #2389
+  # restores diff-scoping now that the Rust side has its own equivalent
+  # gate). Not in this repo's required-checks list, so this move changes
+  # nothing about what blocks a merge.
 
   # #1550: `coord/dashboard/webapp/src/api/generated.ts` is produced by
   # `scripts/codegen.py` from the dashboard's OpenAPI spec
