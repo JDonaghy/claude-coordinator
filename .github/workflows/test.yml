@@ -296,7 +296,24 @@ jobs:
           key: ${{ runner.os }}-playwright-${{ hashFiles('coord/dashboard/webapp/package-lock.json') }}
       - name: Install Playwright + OS deps (cache miss)
         if: steps.playwright-cache.outputs.cache-hit != 'true'
-        run: npx playwright install chromium --with-deps
+        # #2393 follow-up: the Chromium download from Playwright's CDN has hung
+        # (not merely failed) multiple times in one day, past what caching alone
+        # can paper over on a cache-miss run (a version bump, or the very first
+        # run ever). A short per-attempt timeout + retry turns "hang for the
+        # whole 20-minute job budget" into "fail fast and try again" — transient
+        # CDN/mirror flakiness usually clears within a couple of attempts.
+        run: |
+          for attempt in 1 2 3; do
+            echo "Playwright install attempt $attempt/3..."
+            if timeout 300 npx playwright install chromium --with-deps; then
+              echo "Playwright install succeeded on attempt $attempt"
+              exit 0
+            fi
+            echo "Playwright install attempt $attempt failed or timed out after 5m"
+            sleep 10
+          done
+          echo "Playwright install failed after 3 attempts"
+          exit 1
       - name: Install Playwright OS deps only (cache hit)
         if: steps.playwright-cache.outputs.cache-hit == 'true'
         run: npx playwright install-deps chromium

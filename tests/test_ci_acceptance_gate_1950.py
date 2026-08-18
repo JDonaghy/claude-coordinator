@@ -296,6 +296,49 @@ def test_acceptance_job_caches_playwright_browsers() -> None:
     )
 
 
+def test_acceptance_job_retries_playwright_install_on_transient_hangs() -> None:
+    """#2393 follow-up, confirmed live 2026-08-18: caching alone doesn't help
+    a cache-miss run (the very first run on a branch, or any run after a
+    `@playwright/test` version bump) — and PR #2392's own first CI run hit
+    exactly that, hanging the full 20-minute job budget on one install
+    attempt with nothing to fall back on. The install must instead be
+    wrapped in a bounded per-attempt timeout with more than one attempt, so
+    a transient CDN/mirror hang fails fast and gets retried instead of
+    burning the whole job timeout on a single stuck attempt."""
+    workflow = _load_workflow(ACCEPTANCE_WORKFLOW_PATH)
+    steps = _job_steps(workflow, "acceptance", ACCEPTANCE_WORKFLOW_PATH)
+    install_step = _step_runs(steps, "playwright install chromium --with-deps")
+    assert install_step is not None
+    run = install_step["run"]
+    assert "timeout " in run, (
+        f"the cache-miss install step has no per-attempt timeout, so one "
+        f"stuck attempt can still consume the entire job budget: {run!r}"
+    )
+    assert "for attempt in" in run and "1 2 3" in run, (
+        f"the cache-miss install step doesn't actually loop over multiple "
+        f"attempts — a single attempt is exactly what hung 4 separate times "
+        f"on 2026-08-18: {run!r}"
+    )
+
+
+def test_e2e_job_retries_playwright_install_on_transient_hangs() -> None:
+    """Same fix, same reason, as the 'acceptance' job's version above — the
+    `e2e` job (test.yml) hit the identical hang on 2026-08-18 and got the
+    identical caching fix in #2393, so it needs the identical retry
+    follow-up too."""
+    workflow = _load_workflow()
+    steps = _job_steps(workflow, "e2e")
+    install_step = _step_runs(steps, "playwright install chromium --with-deps")
+    assert install_step is not None
+    run = install_step["run"]
+    assert "timeout " in run, (
+        f"e2e's cache-miss install step has no per-attempt timeout: {run!r}"
+    )
+    assert "for attempt in" in run and "1 2 3" in run, (
+        f"e2e's cache-miss install step doesn't loop over multiple attempts: {run!r}"
+    )
+
+
 def test_acceptance_job_has_a_bounded_timeout() -> None:
     """#2389: a job with no `timeout-minutes` defaults to GitHub's 360-minute
     ceiling — confirmed live 2026-08-18, `npx playwright install chromium`
