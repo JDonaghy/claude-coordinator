@@ -278,7 +278,28 @@ jobs:
         with:
           node-version: '20'
       - run: npm ci
-      - run: npx playwright install chromium --with-deps
+      # #2393: `npx playwright install chromium --with-deps` was the step
+      # that hung 30+ minutes with no automatic recovery (2026-08-18, this
+      # job and `acceptance`'s) — a fresh ~300MB Chromium download from
+      # Playwright's CDN on EVERY run, no caching, so every run was fully
+      # exposed to any network hiccup on that path. Caching the browser
+      # binary means most runs skip the download-heavy half entirely; only
+      # a cache miss (a `@playwright/test` version bump) pays the network
+      # cost. `install-deps` (apt-only, no download) still runs on a cache
+      # hit so a runner image without chromium's OS libs preinstalled
+      # doesn't break.
+      - name: Cache Playwright browsers
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('coord/dashboard/webapp/package-lock.json') }}
+      - name: Install Playwright + OS deps (cache miss)
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: npx playwright install chromium --with-deps
+      - name: Install Playwright OS deps only (cache hit)
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        run: npx playwright install-deps chromium
       - run: npm run test:e2e
 
   # #2389: the SEALED web-playwright acceptance suite (ms-51) moved to its

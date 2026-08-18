@@ -79,7 +79,19 @@ jobs:
         with:
           node-version: '20'
       - run: npm ci
-      - run: npx playwright install chromium --with-deps
+      # #2393: same fix as test.yml's `e2e` job — see that job's comment.
+      - name: Cache Playwright browsers
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('coord/dashboard/webapp/package-lock.json') }}
+      - name: Install Playwright + OS deps (cache miss)
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: npx playwright install chromium --with-deps
+      - name: Install Playwright OS deps only (cache hit)
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        run: npx playwright install-deps chromium
       - name: coord acceptance run --all --ci (web-playwright route, ms-51)
         working-directory: .
         run: >-
