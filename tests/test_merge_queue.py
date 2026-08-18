@@ -5515,6 +5515,69 @@ class TestPlan:
         assert not mq.is_ci_unreadable_reason(plan[0].reason)
         assert "CI failed" in (plan[0].reason or "")
 
+    def test_ready_when_conflicted_and_checks_unreadable(self, coord_db) -> None:
+        """#2380: a DIRTY/CONFLICTING PR's `gh pr checks` fetch can itself
+        fail (GitHub can't build a merge ref to run anything against), which
+        reads identically to a transient GitHub-unreachable blip —
+        CI_UNREADABLE_PREFIX. Confirmed via `check_pr_mergeable` reading
+        CONFLICTING, this must NOT block on "retry the read" (which can
+        never succeed for a conflicting PR) — mirror the #1877 checks-absent
+        fall-through immediately above so `coord merge` reaches the real
+        merge attempt and routes to the #241 conflict-fix path."""
+        from types import SimpleNamespace
+
+        class FakeCi:
+            is_available = True
+            def list_checks_for_pr(self, repo, number):
+                return [SimpleNamespace(
+                    name="coord: could not read CI status for acme/api#99 "
+                         "(HTTP 503: No server is currently available)",
+                    status="completed", conclusion="unknown",
+                )]
+
+        items = [_q("w1", size=50, pr=99)]
+        save_queue(items)
+        board = self._board(completed=[
+            self._work("w1", test_state="passed"),
+            self._review("w1", verdict="approve"),
+        ])
+        cfg = self._config()
+        gh = FakeGh(mergeable_results={99: False})
+        plan = mq.plan(board, cfg, ci_store=FakeCi(), gh_ops=gh)
+        assert plan[0].status == mq.PLAN_READY
+        assert plan[0].reason is None
+        assert ("acme/api", 99) in gh.mergeable_calls
+
+    def test_blocked_ci_unreadable_stays_blocked_when_not_confirmed_conflicted(
+        self, coord_db
+    ) -> None:
+        """#2380 companion (acceptance criterion): an UNKNOWN mergeability
+        read (still computing, or no probe at all) must keep today's
+        CI_UNREADABLE_PREFIX park — this is additive, not a general
+        loosening of the CI-unreadable path."""
+        from types import SimpleNamespace
+
+        class FakeCi:
+            is_available = True
+            def list_checks_for_pr(self, repo, number):
+                return [SimpleNamespace(
+                    name="coord: could not read CI status for acme/api#99 "
+                         "(HTTP 503: No server is currently available)",
+                    status="completed", conclusion="unknown",
+                )]
+
+        cfg = self._config()
+        board = self._board(completed=[
+            self._work("w1", test_state="passed"),
+            self._review("w1", verdict="approve"),
+        ])
+
+        for gh_ops in (FakeGh(mergeable_results={99: True}), FakeGh(mergeable_results={99: None}), None):
+            save_queue([_q("w1", size=50, pr=99)])
+            plan = mq.plan(board, cfg, ci_store=FakeCi(), gh_ops=gh_ops)
+            assert plan[0].status == mq.PLAN_BLOCKED
+            assert mq.is_ci_unreadable_reason(plan[0].reason)
+
     def test_blocked_ci_absent_when_repo_declares_ci(self, coord_db) -> None:
         """#1904: an empty check list for a repo that declares CI must show
         BLOCKED with a `checks_absent`-style reason — not READY, the
@@ -6512,6 +6575,83 @@ class TestProcessConflictedEmptyChecks:
         kinds = [e.kind for e in events]
         assert "conflict" in kinds
         assert "checks_absent" not in kinds
+        assert "merged" not in kinds
+        assert items[0].state == PENDING
+
+
+class TestProcessConflictedUnreadableChecks:
+    """#2380: a DIRTY/CONFLICTING PR whose `gh pr checks` FETCH itself fails
+    (GitHub can't build a merge ref, so `gh pr checks` has nothing to read)
+    reads identically to a transient GitHub-unreachable blip —
+    CI_UNREADABLE_PREFIX. Before this fix that parked forever behind
+    `checks_unreadable`'s "retry the read" logic: no amount of retrying
+    reads GitHub cannot ever answer differently, so the park never resolved
+    (the live incident behind this issue, claude-coordinator#2375 / PR
+    #2379, parked 6x with zero forward progress). `process()` must consult
+    `check_pr_mergeable` — same probe, same fail-closed contract as #1877's
+    sibling checks-absent fix — and, for a CONFIRMED conflict only, route
+    STRAIGHT to the `conflict` event / #241 conflict-fix dispatch instead of
+    parking behind a read that can never succeed."""
+
+    @staticmethod
+    def _ci_unreadable():
+        from types import SimpleNamespace
+
+        class _Ci:
+            is_available = True
+            def list_checks_for_pr(self, repo, number):
+                return [SimpleNamespace(
+                    name="coord: could not read CI status for acme/api#99 "
+                         "(HTTP 503: No server is currently available)",
+                    status="completed", conclusion="unknown",
+                )]
+        return _Ci()
+
+    def test_confirmed_conflict_routes_directly_to_conflict_event(self) -> None:
+        items = [_q("w1", pr=99)]
+        gh = FakeGh(mergeable_results={99: False})
+        events = process(items, gh, ci_store=self._ci_unreadable())
+
+        assert gh.mergeable_calls == [("acme/api", 99)]
+        # Unlike #1877's empty-checks case, this routes DIRECTLY to a
+        # conflict event/state — there is no real `gh pr merge` attempt to
+        # fall through to, because the CI gate never reaches the merge
+        # section for a non-empty (if unreadable) check list.
+        assert gh.merge_calls == [], "no live merge attempt needed for this route"
+        kinds = [e.kind for e in events]
+        assert "conflict" in kinds
+        assert "checks_unreadable" not in kinds
+        assert items[0].state == CONFLICT
+        # Routes through the SAME classifier #241 already uses — this fix
+        # only changes reachability, not the classify-and-dispatch machinery.
+        assert mq.classify_conflict(items[0].error) == "rebaseable"
+
+    def test_unknown_mergeability_keeps_parking_as_checks_unreadable(self) -> None:
+        """Acceptance criterion: a genuinely UNKNOWN mergeability read
+        (still computing, no probe available, or the probe errored) must
+        keep today's park-and-wait behavior unchanged — this is additive,
+        not a general loosening of the CI-unreadable path."""
+        for verdict in (True, None):
+            items = [_q("w1", pr=99)]
+            gh = FakeGh(mergeable_results={99: verdict})
+            events = process(items, gh, ci_store=self._ci_unreadable())
+
+            assert gh.merge_calls == [], verdict
+            kinds = [e.kind for e in events]
+            assert "checks_unreadable" in kinds, verdict
+            assert "conflict" not in kinds, verdict
+            assert items[0].state == PENDING, verdict
+            assert mq.is_ci_unreadable_reason(items[0].error), verdict
+
+    def test_dry_run_previews_conflict_route_without_merging(self) -> None:
+        items = [_q("w1", pr=99)]
+        gh = FakeGh(mergeable_results={99: False})
+        events = process(items, gh, ci_store=self._ci_unreadable(), dry_run=True)
+
+        assert gh.merge_calls == []
+        kinds = [e.kind for e in events]
+        assert "conflict" in kinds
+        assert "checks_failed" not in kinds
         assert "merged" not in kinds
         assert items[0].state == PENDING
 
