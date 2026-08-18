@@ -1600,6 +1600,19 @@ def _is_unsatisfiable_prereq_reason(text: str | None) -> bool:
     return bool(text) and _UNSATISFIABLE_PREREQ_MARKER in text
 
 
+def is_unsatisfiable_prereq_reason(text: str | None) -> bool:
+    """Public alias for :func:`_is_unsatisfiable_prereq_reason`.
+
+    `coord drive-queue list`'s rendering (#2404) needs to tell whether a
+    `blocked` row's frozen ``last_reason`` is the exact shape
+    :func:`_reconcile_blocked_after` (#2362) auto-resumes once every named
+    pre-req lands, so it can stop telling the operator the ``after=`` graph
+    "is never re-checked on its own" for a row where that has stopped being
+    true — see ``coord.commands.drive_queue._BLOCKED_AFTER_NOTE``.
+    """
+    return _is_unsatisfiable_prereq_reason(text)
+
+
 def _reconcile_blocked_after(
     entry: QueueEntry,
     board: BoardView,

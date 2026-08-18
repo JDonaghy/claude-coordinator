@@ -692,6 +692,45 @@ def test_blocked_row_purely_by_an_unsatisfiable_prereq_is_unchanged(cli, seed):
     assert dep_reason in result.output
 
 
+def test_blocked_row_purely_by_an_unsatisfiable_prereq_gets_the_2362_note(
+    cli, seed
+):
+    """#2404: unlike a `blocked` row whose own cause is unrelated to its
+    `after=` graph (genuinely "never re-checked on its own" — see the #542
+    control case above), a row blocked purely because a named pre-req is
+    itself `blocked`/`failed` DOES get re-checked automatically every tick
+    (#2362): the moment that pre-req lands, this row resumes to `waiting` on
+    its own. `list`'s remedy line must say so instead of sending an operator
+    to a needless (or racing) manual `remove`+`add`."""
+    seed(issues={1650: "open"})
+    # 1650: blocked for its own, unrelated reason — nothing re-checks this.
+    cli("add", REPO, "1650")
+    state._update_drive_queue_entry_local(
+        REPO, 1650, state="blocked", last_reason="drive session died"
+    )
+    # 1654 (the #492 shape): blocked ONLY because its pre-req (1650) is
+    # itself blocked — the exact shape #2362's tick sweep auto-resumes.
+    cli("add", REPO, "1654", "--after", "1650")
+    dep_reason = f"pre-req {REPO}#1650 is queued but blocked — it will never satisfy"
+    state._update_drive_queue_entry_local(
+        REPO, 1654, state="blocked", last_reason=dep_reason
+    )
+
+    result = cli("list")
+    assert result.exit_code == 0, result.output
+
+    # 1650 has no `after=` at all, so #2183's diagnosis (and any remedy
+    # line) never applies to it — nothing to assert there beyond it existing.
+    assert _row_for(result.output, f"{REPO}#1650")
+
+    # 1654's remedy line is the new #2362 note, not the stale "never
+    # re-checked on its own" advice — this row auto-resumes without an
+    # operator.
+    assert "IS re-checked automatically every tick (#2362)" in result.output
+    assert "no operator remove+add needed" in result.output
+    assert "never re-checked on its own" not in result.output
+
+
 def test_list_with_no_after_is_unaffected_by_the_2183_diagnosis(cli):
     """A `blocked` entry that never declared any `after=` at all keeps
     rendering exactly as it always has — no board dependency, no remedy
