@@ -404,7 +404,7 @@ def web(
     # #1237: function-local + guarded — see _start_agent_server for why.
     with server_extra_guard("web"):
         import uvicorn
-        from coord.dashboard.server import build_app
+        from coord.dashboard.server import build_app, dist_has_bundle
         from coord.dashboard.terminal import resolve_web_token
 
     fixture = None
@@ -443,10 +443,11 @@ def web(
         # server itself silently falls back to the legacy single-file
         # dashboard in that case (build_app / index()), so the operator saw
         # a success message for what was actually a silent regression to the
-        # legacy UI. Check the same condition build_app's index() route
-        # checks (dist_path/index.html) so this message can't drift from
-        # what actually gets served.
-        if (dist_path / "index.html").exists():
+        # legacy UI. Share the exact predicate build_app's index() route uses
+        # (dist_has_bundle) so this message can never drift from what
+        # actually gets served (#2096: two surfaces answering the same
+        # question must call the same function).
+        if dist_has_bundle(dist_path):
             click.echo(f"  serving webapp bundle from {dist_path} (#1543)")
         else:
             click.echo(
