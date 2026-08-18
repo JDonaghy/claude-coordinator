@@ -47991,3 +47991,483 @@ Milestone tracking issue.
             driver.screen()
         );
     }
+
+    // ── #2283 (ms-65 §4): close / cycle / overflow / empty state ─────────
+    //
+    // Black-box only: every test below drives the real
+    // `event → handle → render` path through `driver_with_shell` and asserts
+    // on the painted grid, never on `DocTabGroup` internals (those are
+    // covered unit-style in `app::doc_tabs::tests`). That split is
+    // deliberate — the #2283 defects that actually bite are the ones where
+    // the click hit-test and the painter disagree about a column, which a
+    // model-level assertion cannot see.
+
+    /// The three-tab, all-pinned starting state the §4 tests share: #101,
+    /// #102, #103 open left-to-right with **#103 active** (the last opened
+    /// wins). Returns a driver at `width × height` with one frame painted.
+    fn doc_tabs_driver(
+        open: &[u64],
+        width: u16,
+        height: u16,
+    ) -> quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic> {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = doc_tab_app(DOC_TAB_BOARD_JSON);
+        for n in open {
+            app.open_board_doc_tab(("claude-coordinator".to_string(), *n), true);
+        }
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), width, height);
+        // Two clicks in a row are two SINGLE clicks in these tests (a close
+        // then an activate, say) — never a wall-clock race against the
+        // backend's 400 ms double-click detector (quadraui#592).
+        driver.set_double_click_folding(false);
+        driver.render();
+        driver
+    }
+
+    /// The three-tab, all-pinned starting state most §4 tests share.
+    fn three_pinned_tabs_driver(
+        width: u16,
+        height: u16,
+    ) -> quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic> {
+        doc_tabs_driver(&[101, 102, 103], width, height)
+    }
+
+    /// How many doc tabs are currently painted — one `×` per open tab
+    /// (contract §2d), and the strip is the only place the app paints that
+    /// glyph (asserted by `zero_doc_tabs_paint_no_strip_chrome` below).
+    fn painted_tab_count<A: quadraui::AppLogic>(
+        d: &quadraui::tui::testing::TuiDriver<A>,
+    ) -> usize {
+        d.screen().matches(quadraui::tui::TAB_CLOSE_CHAR).count()
+    }
+
+    /// The `[bracketed]` active tab's issue number, per §2c.
+    fn active_tab_number<A: quadraui::AppLogic>(
+        d: &quadraui::tui::testing::TuiDriver<A>,
+    ) -> Option<u64> {
+        for n in [101u64, 102, 103] {
+            if d.screen_contains(&format!("[#{n} ")) {
+                return Some(n);
+            }
+        }
+        None
+    }
+
+    /// Cell coordinates of tab `n`'s **close glyph** and of its **body**,
+    /// resolved from the painted grid rather than from any implementation
+    /// constant — if the painter ever moves the `×`, these move with it and
+    /// the hit-test assertions stay honest.
+    fn tab_cells<A: quadraui::AppLogic>(
+        d: &quadraui::tui::testing::TuiDriver<A>,
+        n: u64,
+        label: &str,
+    ) -> ((f32, f32), (f32, f32)) {
+        let needle = format!("#{n} {label} {}", quadraui::tui::TAB_CLOSE_CHAR);
+        let b = d
+            .find_bounds(&needle)
+            .unwrap_or_else(|| panic!("#{n}'s tab must be painted:\n{}", d.screen()));
+        let body = (b.x + 0.5, b.y + 0.5);
+        let close = (b.x + b.width - 0.5, b.y + 0.5);
+        (close, body)
+    }
+
+    /// §4 — clicking a tab's `×` closes **exactly** that tab: its neighbours
+    /// survive, the active document is untouched, and the strip loses
+    /// precisely one tab.
+    #[test]
+    fn clicking_a_doc_tabs_close_glyph_closes_exactly_that_tab() {
+        let mut driver = three_pinned_tabs_driver(120, 40);
+        assert_eq!(
+            painted_tab_count(&driver),
+            3,
+            "precondition: three tabs painted:\n{}",
+            driver.screen()
+        );
+
+        let (close, _) = tab_cells(&driver, 102, "Auth token ref…");
+        driver.click(close.0, close.1);
+        driver.render();
+
+        assert!(
+            !driver.screen_contains("#102 Auth token ref…"),
+            "#2283 §4: clicking #102's `×` closes #102:\n{}",
+            driver.screen()
+        );
+        assert!(
+            driver.screen_contains("#101 Fix login race…"),
+            "…and leaves its LEFT neighbour open:\n{}",
+            driver.screen()
+        );
+        assert_eq!(
+            active_tab_number(&driver),
+            Some(103),
+            "#2283 §4: closing an INACTIVE tab never changes the active \
+             document:\n{}",
+            driver.screen()
+        );
+        assert_eq!(
+            painted_tab_count(&driver),
+            2,
+            "exactly one tab closed — not two, not the whole strip:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// The ratchet on that same arm (#2283's AC): a click on a tab's BODY
+    /// still activates it and must never close anything. This is the exact
+    /// regression the new `TabClickKind::Close` routing could introduce, so
+    /// it is asserted through the same painted-grid coordinates the close
+    /// test uses — one column apart is the whole difference.
+    #[test]
+    fn clicking_a_doc_tab_body_activates_it_and_never_closes_it() {
+        let mut driver = three_pinned_tabs_driver(120, 40);
+
+        let (_, body) = tab_cells(&driver, 101, "Fix login race…");
+        driver.click(body.0, body.1);
+        driver.render();
+
+        assert_eq!(
+            active_tab_number(&driver),
+            Some(101),
+            "#2283: a body click ACTIVATES the tab:\n{}",
+            driver.screen()
+        );
+        assert_eq!(
+            painted_tab_count(&driver),
+            3,
+            "#2283: …and closes nothing — all three tabs survive:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// §4 — middle-click closes a tab from anywhere on it, including the
+    /// body columns where a LEFT click would merely activate. Driven at the
+    /// body coordinate on purpose: middle-click on the `×` would pass even
+    /// if the middle-button arm were never wired at all and the click fell
+    /// through to the left-click close path.
+    #[test]
+    fn middle_clicking_a_doc_tab_body_closes_it() {
+        let mut driver = three_pinned_tabs_driver(120, 40);
+
+        let (_, body) = tab_cells(&driver, 101, "Fix login race…");
+        driver.middle_click(body.0, body.1);
+        driver.render();
+
+        assert!(
+            !driver.screen_contains("#101 Fix login race…"),
+            "#2283 §4: a middle click on a tab's BODY closes it:\n{}",
+            driver.screen()
+        );
+        assert_eq!(
+            painted_tab_count(&driver),
+            2,
+            "exactly one tab closed:\n{}",
+            driver.screen()
+        );
+        assert_eq!(
+            active_tab_number(&driver),
+            Some(103),
+            "closing an inactive tab leaves the active document alone:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// §4 — `Ctrl-W` closes the ACTIVE tab and activates its left
+    /// neighbour; pressed again on what is now the leftmost tab, the *new*
+    /// leftmost becomes active (the branch that a naive `idx - 1` would
+    /// underflow-wrap to the far end).
+    #[test]
+    fn ctrl_w_closes_the_active_doc_tab_and_walks_left() {
+        let mut driver = three_pinned_tabs_driver(120, 40);
+        assert_eq!(active_tab_number(&driver), Some(103));
+
+        driver.ctrl_char('w');
+        driver.render();
+        assert_eq!(
+            active_tab_number(&driver),
+            Some(102),
+            "#2283 §4: Ctrl-W closes #103 → its LEFT neighbour #102 activates:\n{}",
+            driver.screen()
+        );
+        assert_eq!(painted_tab_count(&driver), 2);
+        // #605, screen-observably: a Ctrl-W the tab strip consumed must NOT
+        // also arm the pane-focus leader, so the very next `l` is an
+        // ordinary keypress and focus stays put. (`driver.app()` is the
+        // opaque `ShellAdapter`, not a `CoordApp` — the status bar's
+        // `[Sidebar]`/`[Main]`/`[Detail]` segment is the focus proxy.)
+        assert!(
+            driver.screen_contains("[Sidebar]"),
+            "precondition: focus starts on the sidebar:\n{}",
+            driver.screen()
+        );
+        driver.press(Key::Char('l'));
+        driver.render();
+        assert!(
+            driver.screen_contains("[Sidebar]"),
+            "#605: the tab-strip Ctrl-W must not arm the pane-focus leader — \
+             a bare `l` after it moved focus to Main:\n{}",
+            driver.screen()
+        );
+
+        driver.ctrl_char('w');
+        driver.render();
+        assert_eq!(
+            active_tab_number(&driver),
+            Some(101),
+            "#2283 §4: closing #102 leaves #101, the new leftmost, active:\n{}",
+            driver.screen()
+        );
+
+        driver.ctrl_char('w');
+        driver.render();
+        assert_eq!(
+            painted_tab_count(&driver),
+            0,
+            "#2283 §4: closing the last tab empties the strip:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// The #605 guard: with **no** document tab open, `Ctrl-W` keeps its
+    /// pre-ms-65 meaning and arms the pane-focus leader. #2283 may only
+    /// claim the chord while there is something to close.
+    #[test]
+    fn ctrl_w_still_arms_the_pane_focus_leader_with_no_doc_tabs_open() {
+        let mut driver = doc_tabs_driver(&[], 120, 40);
+        assert_eq!(painted_tab_count(&driver), 0, "precondition: no tabs open");
+        assert!(
+            driver.screen_contains("[Sidebar]"),
+            "precondition: focus starts on the sidebar:\n{}",
+            driver.screen()
+        );
+
+        driver.ctrl_char('w');
+        driver.press(Key::Char('l'));
+        driver.render();
+        assert!(
+            driver.screen_contains("[Main]"),
+            "#605: with zero doc tabs open `Ctrl-W l` still moves pane focus \
+             — #2283 must not swallow the chord unconditionally:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// §4 — `Ctrl-Tab` moves to the next tab and wraps last → first.
+    #[test]
+    fn ctrl_tab_moves_to_the_next_doc_tab_and_wraps() {
+        let mut driver = three_pinned_tabs_driver(120, 40);
+        assert_eq!(active_tab_number(&driver), Some(103), "starts on the last tab");
+
+        driver.dispatch(UiEvent::KeyPressed {
+            key: quadraui::Key::Named(quadraui::NamedKey::Tab),
+            modifiers: ctrl(),
+            repeat: false,
+        });
+        driver.render();
+        assert_eq!(
+            active_tab_number(&driver),
+            Some(101),
+            "#2283 §4: Ctrl-Tab on the LAST tab wraps to the first:\n{}",
+            driver.screen()
+        );
+
+        driver.dispatch(UiEvent::KeyPressed {
+            key: quadraui::Key::Named(quadraui::NamedKey::Tab),
+            modifiers: ctrl(),
+            repeat: false,
+        });
+        driver.render();
+        assert_eq!(
+            active_tab_number(&driver),
+            Some(102),
+            "#2283 §4: …then plain forward movement:\n{}",
+            driver.screen()
+        );
+        assert_eq!(
+            painted_tab_count(&driver),
+            3,
+            "cycling never closes anything:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// §4 — `Ctrl-Shift-Tab` moves to the previous tab and wraps first →
+    /// last. Both plausible wire encodings of the chord are asserted: a
+    /// terminal may deliver it as `Tab` + `{ctrl, shift}` or as `BackTab` +
+    /// `{ctrl, shift}` (crossterm folds Shift-Tab into `KeyCode::BackTab`),
+    /// and the contract pins the user-facing chord, not the `KeyCode`.
+    #[test]
+    fn ctrl_shift_tab_moves_to_the_previous_doc_tab_and_wraps() {
+        let ctrl_shift = quadraui::Modifiers { ctrl: true, shift: true, ..Default::default() };
+
+        for key in [
+            quadraui::Key::Named(quadraui::NamedKey::Tab),
+            quadraui::Key::Named(quadraui::NamedKey::BackTab),
+        ] {
+            let mut driver = three_pinned_tabs_driver(120, 40);
+            assert_eq!(active_tab_number(&driver), Some(103));
+
+            driver.dispatch(UiEvent::KeyPressed {
+                key: key.clone(),
+                modifiers: ctrl_shift,
+                repeat: false,
+            });
+            driver.render();
+            assert_eq!(
+                active_tab_number(&driver),
+                Some(102),
+                "#2283 §4: Ctrl-Shift-Tab ({key:?}) steps BACKWARD:\n{}",
+                driver.screen()
+            );
+
+            driver.dispatch(UiEvent::KeyPressed {
+                key: key.clone(),
+                modifiers: ctrl_shift,
+                repeat: false,
+            });
+            driver.render();
+            driver.dispatch(UiEvent::KeyPressed {
+                key: key.clone(),
+                modifiers: ctrl_shift,
+                repeat: false,
+            });
+            driver.render();
+            assert_eq!(
+                active_tab_number(&driver),
+                Some(103),
+                "#2283 §4: …and wraps from the FIRST tab back to the last \
+                 ({key:?}):\n{}",
+                driver.screen()
+            );
+        }
+    }
+
+    /// §4 — when the strip overflows its panel, the edge that has tabs
+    /// beyond it renders a scroll affordance, and the ACTIVE tab is always
+    /// on screen. Driven at both extremes of the same strip so the two
+    /// affordances are asserted independently: with the last tab active
+    /// only `‹` may appear, and after cycling to the first tab only `›`.
+    #[test]
+    fn an_overflowing_doc_tab_strip_renders_the_scroll_affordances() {
+        // 80 columns leaves the Board main panel too narrow for three
+        // 20-column tabs (§2b) — the overflow the contract's mock depicts.
+        let mut driver = three_pinned_tabs_driver(80, 40);
+        assert!(
+            driver.screen_contains("[#103 "),
+            "precondition: the last tab is active and therefore visible:\n{}",
+            driver.screen()
+        );
+        assert!(
+            driver.screen_contains(&SCROLL_LEFT_MARKER.to_string()),
+            "#2283 §4: tabs scrolled out to the LEFT raise the `‹` \
+             affordance:\n{}",
+            driver.screen()
+        );
+        assert!(
+            !driver.screen_contains(&SCROLL_RIGHT_MARKER.to_string()),
+            "…and with the rightmost tab active there is nothing beyond the \
+             right edge, so no `›`:\n{}",
+            driver.screen()
+        );
+
+        // Wrap to the leftmost tab: the mirror case.
+        driver.dispatch(UiEvent::KeyPressed {
+            key: quadraui::Key::Named(quadraui::NamedKey::Tab),
+            modifiers: ctrl(),
+            repeat: false,
+        });
+        driver.render();
+        assert!(
+            driver.screen_contains("[#101 "),
+            "#2283 §4: the newly-activated tab is scrolled back into view:\n{}",
+            driver.screen()
+        );
+        assert!(
+            driver.screen_contains(&SCROLL_RIGHT_MARKER.to_string()),
+            "#2283 §4: …and the tabs now beyond the RIGHT edge raise `›`:\n{}",
+            driver.screen()
+        );
+        assert!(
+            !driver.screen_contains(&SCROLL_LEFT_MARKER.to_string()),
+            "…with nothing left of the first tab, no `‹`:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// §4's empty state — closing the LAST tab puts the panel back exactly
+    /// where it started: no strip chrome anywhere, and the `Board / Issue /
+    /// Board Chat / Terminal` sub-tab bar back on the row it held before
+    /// any tab was opened (the strip reserved no row, §2a).
+    #[test]
+    fn closing_the_last_doc_tab_restores_the_zero_tab_layout() {
+        fn subtab_row<A: quadraui::AppLogic>(
+            d: &quadraui::tui::testing::TuiDriver<A>,
+        ) -> usize {
+            d.screen()
+                .lines()
+                .position(|r| r.contains(" Board ") && r.contains(" Terminal"))
+                .expect("the sub-tab bar always renders on the Board panel")
+        }
+
+        // The zero-tab reference layout, measured from an app that never had
+        // a tab — the state §4 says closing the last tab must return to.
+        let baseline_row = subtab_row(&doc_tabs_driver(&[], 120, 40));
+
+        let mut driver = doc_tabs_driver(&[102], 120, 40);
+        assert_eq!(painted_tab_count(&driver), 1);
+        assert_eq!(
+            subtab_row(&driver),
+            baseline_row + 1,
+            "precondition: the open tab pushed the sub-tab bar down a row:\n{}",
+            driver.screen()
+        );
+
+        let (close, _) = tab_cells(&driver, 102, "Auth token ref…");
+        driver.click(close.0, close.1);
+        driver.render();
+
+        assert_eq!(
+            painted_tab_count(&driver),
+            0,
+            "#2283 §4: no `×` survives the last close:\n{}",
+            driver.screen()
+        );
+        assert!(
+            !driver.screen_contains(&SCROLL_LEFT_MARKER.to_string())
+                && !driver.screen_contains(&SCROLL_RIGHT_MARKER.to_string())
+                && !driver.screen_contains(super::doc_tabs::PREVIEW_MARKER),
+            "#2283 §4: no strip chrome leaks into the empty state:\n{}",
+            driver.screen()
+        );
+        assert_eq!(
+            subtab_row(&driver),
+            baseline_row,
+            "#2283 §4 + §2a: the strip reserves no row once empty — the \
+             sub-tab bar returns to its pre-ms-65 row:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// The control the overflow test needs in order to mean anything: with
+    /// zero tabs open the app paints none of the strip's glyphs anywhere on
+    /// screen. An implementation that unconditionally painted `‹`/`›` (or
+    /// that let `×` escape into some other widget) would satisfy every
+    /// assertion above and break this one.
+    #[test]
+    fn zero_doc_tabs_paint_no_strip_chrome() {
+        let driver = doc_tabs_driver(&[], 120, 40);
+        let screen = driver.screen();
+        for glyph in [
+            quadraui::tui::TAB_CLOSE_CHAR.to_string(),
+            SCROLL_LEFT_MARKER.to_string(),
+            SCROLL_RIGHT_MARKER.to_string(),
+            super::doc_tabs::PREVIEW_MARKER.to_string(),
+        ] {
+            assert!(
+                !screen.contains(&glyph),
+                "#2283 §4/§2a: `{glyph}` must not be painted with zero doc \
+                 tabs open:\n{screen}"
+            );
+        }
+    }
