@@ -262,6 +262,64 @@ class TestReassignThreadsProvider:
         payload = mock_post.call_args.kwargs["json"]
         assert "provider" not in payload
 
+    @patch("coord.reconcile.httpx.post")
+    def test_a_model_dropped_from_the_ladder_is_not_inherited_forever(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """#2383: `failed.model` names a model an operator has since
+        removed from `models.escalation` — the auto-reassign call site
+        never passes `model=` explicitly (reconcile.py's `newly_failed`
+        loop), so without a clamp this would be inherited on EVERY future
+        retry of the same lineage, forever, regardless of what the current
+        ladder says."""
+        resp = MagicMock()
+        resp.json.return_value = {"id": "newid"}
+        mock_post.return_value = resp
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[
+                Machine(name="laptop", host="l", repos=["api"], repo_paths={"api": "/tmp"}),
+                Machine(name="server", host="s", repos=["api"], repo_paths={"api": "/tmp"}),
+            ],
+        )
+        assert "fable" not in cfg.models.escalation  # sanity: not on the ladder
+        board = Board()
+        failed = _failed(model="fable")
+
+        result = _reassign(failed, board, cfg)
+
+        assert result is not None
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["model"] != "claude-fable-5"
+        assert payload["model"] == cfg.models.resolve(cfg.models.escalation[-1])
+
+    @patch("coord.reconcile.httpx.post")
+    def test_an_explicit_model_override_is_never_clamped(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """The clamp is scoped to the INHERITED (`model=None`) path only —
+        a caller that explicitly asks for a specific model (e.g. #1291's
+        semantic-conflict escalation) must get exactly that model, even one
+        off the ordinary ladder."""
+        resp = MagicMock()
+        resp.json.return_value = {"id": "newid"}
+        mock_post.return_value = resp
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[
+                Machine(name="laptop", host="l", repos=["api"], repo_paths={"api": "/tmp"}),
+                Machine(name="server", host="s", repos=["api"], repo_paths={"api": "/tmp"}),
+            ],
+        )
+        board = Board()
+        failed = _failed(model="sonnet")
+
+        result = _reassign(failed, board, cfg, model="opus")
+
+        assert result is not None
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["model"] == cfg.models.resolve("opus")
+
 
 # ── #1711: the provider-availability gate, applied to retry routing ────────
 
