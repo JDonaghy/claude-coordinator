@@ -1540,6 +1540,46 @@ def get_repo_workflow_count(repo: str) -> int:
     return data["total_count"]
 
 
+def get_required_status_check_contexts(repo: str) -> list[str] | None:
+    """Required status-check context names for *repo*'s default branch (#2388).
+
+    Backs the merge gate's "don't wait on an advisory check" filter — a repo
+    can report many more `gh pr checks` entries than GitHub's own branch
+    protection actually requires (this repo: 9 reported, 5 required), and a
+    slow/hung advisory job (an unconditional Playwright/Chromium install
+    step, say) has no business blocking `coord merge` when GitHub itself
+    already considers the PR mergeable.
+
+    Returns ``None`` — never an empty list treated as "nothing required" —
+    when the default branch has no protection configured, or any read
+    step fails (auth, rate-limit, malformed response, `gh` missing). #1525's
+    bias applies here too: "couldn't determine what's required" must read as
+    "don't filter, wait on everything reported", not as a free pass to stop
+    waiting on checks that might in fact be required. Only an actually
+    non-empty ``required_status_checks.contexts`` list narrows the gate.
+    """
+    try:
+        repo_data = _gh_json("api", f"repos/{repo}", default=None)
+        if not isinstance(repo_data, dict):
+            return None
+        default_branch = repo_data.get("default_branch")
+        if not isinstance(default_branch, str) or not default_branch:
+            return None
+        protection = _gh_json(
+            "api", f"repos/{repo}/branches/{default_branch}/protection",
+            default=None,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, RuntimeError):
+        return None
+    if not isinstance(protection, dict):
+        return None
+    contexts = protection.get("required_status_checks", {})
+    contexts = contexts.get("contexts") if isinstance(contexts, dict) else None
+    if not isinstance(contexts, list) or not contexts:
+        return None
+    return [str(c) for c in contexts]
+
+
 def get_pr_checks(repo: str, number: int) -> list[dict]:
     """Return ``gh pr checks``' raw check-run list for PR *number*.
 

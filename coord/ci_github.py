@@ -129,6 +129,13 @@ class GitHubCi:
     _jobs_cache: dict[tuple[str, str], tuple[float, list[JobRun]]] = field(
         default_factory=dict
     )
+    # #2388: repo -> (fetched_at, required context names or None). Keyed by
+    # repo alone, same reasoning as `_workflow_cache` — required contexts are
+    # a branch-protection property of the repo's default branch, not of any
+    # particular PR.
+    _required_contexts_cache: dict[str, tuple[float, frozenset[str] | None]] = field(
+        default_factory=dict
+    )
 
     @property
     def is_available(self) -> bool:
@@ -360,7 +367,7 @@ class GitHubCi:
             return [_unreadable_check(repo, number, str(e))]
         if not isinstance(raw, list):
             return [_unreadable_check(repo, number, "gh pr checks returned non-list JSON")]
-        return [
+        checks = [
             CheckRun(
                 name=str(entry.get("name", "")),
                 status=_status_from_bucket(str(entry.get("bucket", ""))),
@@ -373,6 +380,32 @@ class GitHubCi:
             for entry in raw
             if isinstance(entry, dict)
         ]
+        # #2388: narrow to what branch protection actually REQUIRES, when
+        # that's determinable — a repo can report far more `gh pr checks`
+        # entries than GitHub's own required list (this repo: 9 reported, 5
+        # required), and every merge-gate predicate downstream of this
+        # method (`failed_checks`, `in_flight_checks`, `checks_are_stale`)
+        # otherwise waits on advisory jobs GitHub itself doesn't. A hung
+        # advisory job (e.g. an unconditional Playwright/Chromium install
+        # with no timeout) would then block `coord merge` indefinitely even
+        # though the PR is already `MERGEABLE`. `_required_contexts` returns
+        # `None` (never filters) when it can't determine the required list
+        # — #1525's bias: unknown reads as "wait on everything reported",
+        # not as a free pass to stop waiting on something that might matter.
+        required = self._required_contexts(repo)
+        if required:
+            checks = [c for c in checks if c.name in required]
+        return checks
+
+    def _required_contexts(self, repo: str) -> frozenset[str] | None:
+        now = time.time()
+        cached = self._required_contexts_cache.get(repo)
+        if cached is not None and (now - cached[0]) < self.cache_ttl:
+            return cached[1]
+        contexts = github_ops.get_required_status_check_contexts(repo)
+        result = frozenset(contexts) if contexts else None
+        self._required_contexts_cache[repo] = (now, result)
+        return result
 
 
 def _unreadable_check(repo: str, number: int, detail: str) -> CheckRun:
