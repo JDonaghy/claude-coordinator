@@ -946,7 +946,7 @@ class PipelineConfig:
     worker that gives up on a **semantic** conflict (it emits the
     ``coord:conflict=semantic`` marker on its ``STUCK:`` line) gets ONE
     second attempt from a stronger model
-    (``semantic_conflict_model``, default ``"fable"``) before the merge
+    (``semantic_conflict_model``, default ``"opus"``) before the merge
     entry is parked ``HUMAN_REQUIRED``.  **Defaults to ``False``** — this
     ships dark until it earns trust on real conflicts.  The escalated
     attempt consumes the existing one-per-entry conflict-fix retry cap, so
@@ -986,7 +986,7 @@ class PipelineConfig:
     escalate_fix_model: bool = True
     # #1291 — DEFAULT OFF. See the class docstring.
     escalate_semantic_conflicts: bool = False
-    semantic_conflict_model: str = "fable"
+    semantic_conflict_model: str = "opus"
     # #1478 — DEFAULT OFF. See the class docstring.
     auto_dispatch_stalled: bool = False
     attention_thresholds: dict[str, float] = field(
