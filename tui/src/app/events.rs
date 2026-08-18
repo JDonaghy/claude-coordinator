@@ -5677,7 +5677,7 @@ impl CoordApp {
                             pos.x,
                             strip.scroll_offset,
                         ) {
-                            Some(TabClickKind::Close(idx)) => self.activate_board_doc_tab(idx),
+                            Some(TabClickKind::Close(idx)) => self.close_board_doc_tab(idx),
                             Some(TabClickKind::Body(idx)) => self.activate_board_doc_tab(idx),
                             None => false,
                         };
