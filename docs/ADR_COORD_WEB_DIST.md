@@ -10,8 +10,9 @@
 `coord/dashboard/webapp/**` is moving out of this repo into its own
 `coord-web` repo. Today, before that split, the same question already has a
 shipped answer: **[`docs/PHONE_WEBAPP.md`](PHONE_WEBAPP.md), "Going live
-automatically (#1543)."** `deploy/coord-web-dist-build.timer` fires every
-minute, fetches `origin/main` read-only, builds it in a dedicated worktree
+automatically (#1543)."** `deploy/coord-web-dist-build.timer` fires every 10
+minutes (retuned from 1 minute by #2122; see that unit's header), fetches
+`origin/main` read-only, builds it in a dedicated worktree
 (`~/.coord-web-checkout`), health-checks the result on a scratch port before
 ever publishing it (#1560), and atomically repoints `~/coord-web-dist` —
 which `coord web --dist` serves — at the new release. A one-command rollback
@@ -66,7 +67,7 @@ Concretely, once the split lands:
 **Option 2 — GitHub release artifact (tarball per `coord-web` release).**
 Versioned and auditable, but it reintroduces exactly the coupling #1543 was
 built to remove: a webapp fix would sit merged-but-not-live until someone
-cuts a release, and nothing today gives that step the ~1-minute, unattended
+cuts a release, and nothing today gives that step the ~10-minute, unattended
 cadence the timer already provides. It would also need the health-check
 gate and rollback machinery rebuilt around a fetch/verify/unpack step
 instead of a `git fetch` + worktree build — real new surface for no
@@ -84,7 +85,7 @@ which is the only scenario where an npm package would earn its cost back.
 primary.** Rejected as the *primary* path because it re-couples the two
 repos' release cadences — the coupling the split (epic #2002) exists to
 remove. A `coord/dashboard/webapp/**` merge would go live only on
-`claude-coordinator`'s next PyPI release, not within a minute of merging.
+`claude-coordinator`'s next PyPI release, not within ~10 minutes of merging.
 Kept as the fallback, because that's a real, already-solved problem
 (bootstrapping a `--dist`-less host, or a fresh install) distinct from
 "how does a live daemon host stay current," and downgrading it doesn't cost
@@ -132,9 +133,11 @@ at load and degrades visibly (banner, not a silent break) on mismatch,
 rather than trying to keep the two repos' releases in lockstep.
 
 Propagation lag itself (a phone briefly on a bundle one merge behind the
-daemon, or vice versa) is not new and not a defect — it's the same ~1-minute
-window #1543 already documents and accepts for the single-repo case. It
-stays detectable the same way: the release directory is named after the
+daemon, or vice versa) is not new and not a defect — it's the same ~10-minute
+window the timer already runs at for the single-repo case (retuned from the
+original 1-minute cadence #1543 documents; see #2122 and
+`deploy/coord-web-dist-build.timer`'s header for why). It stays detectable
+the same way: the release directory is named after the
 `coord-web` SHA it was built from, and `webapp_build_heartbeat` proves the
 timer is still alive.
 
