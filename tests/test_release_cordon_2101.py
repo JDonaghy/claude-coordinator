@@ -836,3 +836,33 @@ def test_the_remote_reconcile_failing_still_lets_the_drain_escalation_through(
     assert "DRAIN OVERDUE" in result.output
     assert "reconcile-only tick first (#2373): failed" in result.output
     assert "Connection refused" in result.output
+
+
+def test_reconcile_launch_host_forwards_a_remote_timeout_derived_from_its_own(monkeypatch):
+    """Review fix (#2373): the POST body used to be `{}`, so the remote
+    agent's own subprocess timeout defaulted to 120s
+    (`AgentServer.reconcile_drive_queue`) while this call's own HTTP wait
+    was only `DEFAULT_RECONCILE_TIMEOUT_SECONDS` (30s) — a tick that
+    legitimately took, say, 45s would report here as a misleading
+    `ok=False, detail="unreachable: ..."` even though it was still running
+    and would resolve correctly on its own. The remote timeout must now be
+    forwarded, and kept under this call's own HTTP timeout so the agent has
+    room to marshal and return its response first."""
+    posts = []
+
+    def fake_post(url, payload, *, timeout):
+        posts.append((url, payload, timeout))
+        return 200, {"ok": True, "detail": "moved to parked"}, ""
+
+    ok, detail = release_cmd._reconcile_launch_host(
+        "laptop.tailnet", agent_port=7433, timeout=30.0, post=fake_post,
+    )
+
+    assert (ok, detail) == (True, "moved to parked")
+    [(url, payload, http_timeout)] = posts
+    assert url == "http://laptop.tailnet:7433/drive-queue-reconcile"
+    assert http_timeout == 30.0
+    assert payload["timeout"] < http_timeout
+    assert payload["timeout"] == pytest.approx(
+        30.0 - release_cmd._RECONCILE_TIMEOUT_MARGIN_SECONDS
+    )
