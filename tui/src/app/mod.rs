@@ -8221,6 +8221,19 @@ impl CoordApp {
         // the bar. Neither verdict is ever hidden.
         left.push(self.drive_queue_status_bar_segment());
         left.push(self.fleet_health_status_bar_segment());
+        // #2374: fleet-level escalations (release-cordon / drive-queue
+        // sentinel rows in `self.data.escalations`, keyed by a `"("`-prefixed
+        // pseudo-repo — see `escalation.rs`'s `fleet_escalations` doc
+        // comment) have no `PipelineIssue` row to badge, so before this they
+        // were visible only via a Reports-panel `decisions` visit. Right
+        // after fleet health / drive queue — same urgency tier, and `None`
+        // (not pushed at all) when the fleet has none open, mirroring the
+        // `plans_attn`/`audit_recent` badges below rather than fleet
+        // health's always-on "OK states its OK-ness" treatment (there's no
+        // useful "zero escalations" thing to say here).
+        if let Some(seg) = self.fleet_escalation_status_bar_segment() {
+            left.push(seg);
+        }
         // Non-blocking warning if the last load failed.
         if let Some((err_msg, when)) = &self.fetch_error {
             if when.elapsed() < Duration::from_secs(10) {
