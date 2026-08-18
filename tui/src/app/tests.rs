@@ -42833,6 +42833,44 @@ Milestone tracking issue.
         )
     }
 
+    /// #2369: a `decisions`-shaped result whose `options` column — unlike
+    /// every other `kind: "list"` column in this file's fixtures — holds
+    /// `{label, command_or_action, what_happens, recommended}` dicts, not
+    /// scalar strings. Single-option row, deliberately short, so the
+    /// combined "★ label: command" text fits the column regardless of
+    /// exact width math.
+    fn reports_result_json_options() -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        format!(
+            r#"{{
+                    "report_id": "decisions",
+                    "generated_at": {now},
+                    "window": [{start}, {now}],
+                    "columns": ["issue", "options"],
+                    "column_meta": [
+                        {{"id": "issue", "label": "Issue", "kind": "int",
+                          "align": "right", "weight": 1.0}},
+                        {{"id": "options", "label": "Options", "kind": "list",
+                          "align": "left", "weight": 3.0}}
+                    ],
+                    "rows": [
+                        {{"issue": 2360, "options": [
+                            {{"label": "Recommended",
+                              "command_or_action": "coord diagnose --reset",
+                              "what_happens": "Runs the fix.",
+                              "recommended": true}}
+                        ]}}
+                    ],
+                    "notes": []
+                }}"#,
+            now = now,
+            start = now - 3600.0,
+        )
+    }
+
     /// Open the Reports panel on a seeded result and render one frame.
     fn reports_driver(
         result_json: &str,
@@ -42978,6 +43016,37 @@ Milestone tracking issue.
             row.contains('—'),
             "#1762: an empty `list` cell must render as an em dash — a blank \
                  reads as missing data:\n{row}"
+        );
+    }
+
+    #[test]
+    fn reports_list_column_of_option_dicts_renders_label_colon_command_not_json() {
+        // #2369 review: `options` is a `kind: "list"` column whose items are
+        // `{label, command_or_action, ...}` dicts, not the scalar strings
+        // every other `list` column in this file holds. Before the fix,
+        // `reports_plain_text`'s fallback (`other => other.to_string()`)
+        // rendered each item as a compact JSON blob.
+        let driver = reports_driver(&reports_result_json_options(), 140, 40);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Recommended: coord diagnose --reset"),
+            "#2369: an `options` cell must render as \"label: command\", not \
+                 a JSON blob:\n{screen}"
+        );
+        let (_, y) = driver
+            .find("Recommended: coord diagnose --reset")
+            .expect("options cell must render");
+        let row: String = screen_row(&screen, y).into_iter().collect();
+        for junk in ['{', '}', '\'', '"'] {
+            assert!(
+                !row.contains(junk),
+                "#2369: a rendered options row must carry no JSON/dict \
+                     punctuation, found {junk:?} in:\n{row}"
+            );
+        }
+        assert!(
+            row.contains('★'),
+            "#2369: the recommended option must be marked:\n{row}"
         );
     }
 
