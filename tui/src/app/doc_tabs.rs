@@ -79,6 +79,19 @@ pub(crate) const DOC_TAB_LABEL_COLS: usize = 20;
 /// §2b budget out by its own 2 columns rather than eating into it.
 pub(crate) const PREVIEW_MARKER: &str = "∘ ";
 
+/// §4 (#2283) overflow affordances: baked into the leftmost/rightmost
+/// *visible* tab's label when tabs exist beyond that edge of the strip.
+///
+/// Baked into label text for the same reason [`PREVIEW_MARKER`] and the
+/// close glyph are (see [`doc_tab_label`]'s doc comment): quadraui's TUI
+/// tab-bar rasteriser never paints scroll arrows itself —
+/// `TuiBackend::draw_tab_bar` / `tab_bar_layout` hardcode
+/// `scroll_arrow_width: 0.0` ("no scroll arrows in TUI") and simply honour
+/// whatever `scroll_offset` the caller supplies — so the app has to paint
+/// them. See `CoordApp::board_doc_tab_strip` (render.rs).
+pub(crate) const SCROLL_LEFT_MARKER: char = '‹';
+pub(crate) const SCROLL_RIGHT_MARKER: char = '›';
+
 /// Truncate `s` to at most `max_cols` display columns, appending `…` (which
 /// occupies the last column) when anything was dropped.
 ///
@@ -199,6 +212,51 @@ impl DocTabGroup {
         changed
     }
 
+    /// Contract §4 (#2283) — close the tab at `idx`. Returns `false` (no-op)
+    /// when `idx` is out of range.
+    ///
+    /// **Active-neighbour rule**, pinned by the contract: closing the
+    /// ACTIVE tab activates the tab immediately to its left, or — when the
+    /// closed tab was the leftmost — the new leftmost. Both branches reduce
+    /// to the same arithmetic: the tab that was at `idx.saturating_sub(1)`
+    /// keeps that index after the removal (elements before `idx` are
+    /// untouched by `Vec::remove(idx)`), so `active` becomes
+    /// `idx.saturating_sub(1)` whenever `idx` was active. Closing the LAST
+    /// remaining tab clears `active` to `None` (§4's empty state, #2283).
+    ///
+    /// Closing an INACTIVE tab leaves the active *document* unchanged: the
+    /// active index is only re-based (decremented) when the closed tab sat
+    /// to its left, never retargeted.
+    ///
+    /// The (single) preview slot follows the same re-basing: cleared if the
+    /// closed tab WAS the preview, decremented if the preview sat to the
+    /// closed tab's right, else untouched.
+    pub(crate) fn close(&mut self, idx: usize) -> bool {
+        if idx >= self.tabs.len() {
+            return false;
+        }
+        let was_active = self.active == Some(idx);
+        self.tabs.remove(idx);
+
+        self.preview = match self.preview {
+            Some(p) if p == idx => None,
+            Some(p) if p > idx => Some(p - 1),
+            other => other,
+        };
+
+        if self.tabs.is_empty() {
+            self.active = None;
+        } else if was_active {
+            self.active = Some(idx.saturating_sub(1));
+        } else if let Some(a) = self.active {
+            if a > idx {
+                self.active = Some(a - 1);
+            }
+        }
+        self.debug_check();
+        true
+    }
+
     #[inline]
     fn debug_check(&self) {
         debug_assert!(
@@ -286,6 +344,62 @@ pub(crate) fn doc_tab_label(
     } else {
         format!("{inner} ")
     }
+}
+
+/// Character offset of the §2d close glyph within a rendered tab label, or
+/// `None` if the label carries none (shouldn't happen — every tab built by
+/// [`doc_tab_label`] appends exactly one, per
+/// `every_label_carries_the_close_glyph` below). Used by the click
+/// hit-test ([`resolve_doc_tab_click`]) to tell a click on the `×` from a
+/// click on the rest of the tab.
+pub(crate) fn doc_tab_close_col(label: &str) -> Option<usize> {
+    label.chars().position(|c| c == quadraui::tui::TAB_CLOSE_CHAR)
+}
+
+/// Which part of a tab a resolved click landed on — contract §4's
+/// "clicking a tab's `×` closes it; clicking its body activates it".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TabClickKind {
+    /// Click landed on the tab's `×` close glyph. Index is into the strip.
+    Close(usize),
+    /// Click landed anywhere else on the tab. Index is into the strip.
+    Body(usize),
+}
+
+/// Resolve a click at `click_x` (same coordinate space as `origin_x`)
+/// against a rendered doc-tab strip's labels, honouring `scroll_offset`
+/// exactly the way `hit_tab_index_from_labels` (dialogs.rs) does — tabs
+/// before `scroll_offset` are skipped, and labels are walked left-to-right
+/// from `origin_x` accumulating `chars().count()` widths, matching what the
+/// TUI rasteriser actually paints (§0: every glyph this milestone
+/// introduces, including `×`/`‹`/`›`, is one display column).
+///
+/// Deliberately reimplemented here rather than calling
+/// `hit_tab_index_from_labels` and separately re-deriving each tab's start
+/// column: the close-glyph offset needs the SAME cumulative-width walk that
+/// function already does internally, and duplicating just the "where does
+/// tab `idx` start" half without the shared loop would be the real second
+/// algorithm the ms-65 design note warns against.
+pub(crate) fn resolve_doc_tab_click(
+    labels: &[&str],
+    origin_x: f32,
+    click_x: f32,
+    scroll_offset: usize,
+) -> Option<TabClickKind> {
+    let mut cursor = origin_x;
+    for (i, label) in labels.iter().enumerate().skip(scroll_offset) {
+        let width = label.chars().count() as f32;
+        let end = cursor + width;
+        if click_x >= cursor && click_x < end {
+            let offset_in_tab = (click_x - cursor).floor() as usize;
+            return Some(match doc_tab_close_col(label) {
+                Some(close_col) if close_col == offset_in_tab => TabClickKind::Close(i),
+                _ => TabClickKind::Body(i),
+            });
+        }
+        cursor = end;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -400,6 +514,137 @@ mod tests {
         g.pin(k(101));
         assert!(!g.activate_index(7));
         assert_eq!(g.active_index(), Some(0));
+    }
+
+    // ── close: contract §4 (#2283) ───────────────────────────────────────
+
+    #[test]
+    fn closing_the_active_rightmost_tab_activates_its_left_neighbour() {
+        let mut g = DocTabGroup::default();
+        g.pin(k(101));
+        g.pin(k(102));
+        g.pin(k(103));
+        assert!(g.close(2), "#103 was active and rightmost");
+        assert_eq!(g.tabs(), &[k(101), k(102)]);
+        assert_eq!(g.active_index(), Some(1), "left neighbour (#102) activates");
+    }
+
+    #[test]
+    fn closing_the_active_leftmost_tab_activates_the_new_leftmost() {
+        let mut g = DocTabGroup::default();
+        g.pin(k(101));
+        g.pin(k(102));
+        g.pin(k(103));
+        g.activate_index(0); // #101 active, leftmost
+        assert!(g.close(0));
+        assert_eq!(g.tabs(), &[k(102), k(103)]);
+        assert_eq!(
+            g.active_index(),
+            Some(0),
+            "no left neighbour — the new leftmost (#102) activates, not an \
+             index-1 underflow wrap to the end"
+        );
+    }
+
+    #[test]
+    fn closing_an_inactive_tab_leaves_the_active_document_unchanged() {
+        let mut g = DocTabGroup::default();
+        g.pin(k(101));
+        g.pin(k(102));
+        g.pin(k(103)); // active, index 2
+        assert!(g.close(0)); // close #101, an inactive left neighbour
+        assert_eq!(g.tabs(), &[k(102), k(103)]);
+        assert_eq!(
+            g.active_key(),
+            Some(&k(103)),
+            "the active DOCUMENT is unchanged — only its index re-based"
+        );
+        assert_eq!(g.active_index(), Some(1));
+    }
+
+    #[test]
+    fn closing_the_last_open_tab_clears_active() {
+        let mut g = DocTabGroup::default();
+        g.pin(k(101));
+        assert!(g.close(0));
+        assert!(g.is_empty());
+        assert_eq!(g.active_index(), None);
+    }
+
+    #[test]
+    fn closing_out_of_range_is_a_no_op() {
+        let mut g = DocTabGroup::default();
+        g.pin(k(101));
+        assert!(!g.close(7));
+        assert_eq!(g.tabs(), &[k(101)]);
+    }
+
+    #[test]
+    fn closing_the_preview_tab_clears_the_preview_slot() {
+        let mut g = DocTabGroup::default();
+        g.pin(k(101));
+        g.open_preview(k(102)); // preview, index 1
+        assert!(g.close(1));
+        assert_eq!(g.tabs(), &[k(101)]);
+        assert!(!g.is_preview(0));
+    }
+
+    #[test]
+    fn closing_a_tab_left_of_the_preview_rebases_the_preview_index() {
+        let mut g = DocTabGroup::default();
+        g.pin(k(101));
+        g.pin(k(102));
+        g.open_preview(k(103)); // preview, index 2
+        g.activate_index(0); // move active off the preview so close(0) hits an inactive tab
+        assert!(g.close(0));
+        assert_eq!(g.tabs(), &[k(102), k(103)]);
+        assert!(g.is_preview(1), "preview index re-based from 2 to 1");
+    }
+
+    // ── click resolution: contract §4 ─────────────────────────────────────
+
+    #[test]
+    fn doc_tab_close_col_finds_the_close_glyph() {
+        let label = doc_tab_label("claude-coordinator", 101, "Fix login race timeout", false, false, false);
+        // "#101 Fix login race… × " — 20-column base + a space, so × sits at
+        // char index 21.
+        assert_eq!(doc_tab_close_col(&label), Some(21));
+    }
+
+    #[test]
+    fn resolve_doc_tab_click_distinguishes_body_from_close() {
+        // Two 4-char labels back-to-back: "ab×d" then "ef×h", starting at x=10.
+        let labels = ["ab×d", "ef×h"];
+        // Body click on the first tab.
+        assert_eq!(
+            resolve_doc_tab_click(&labels, 10.0, 10.5, 0),
+            Some(TabClickKind::Body(0))
+        );
+        // Close click on the first tab's × (offset 2 within the label).
+        assert_eq!(
+            resolve_doc_tab_click(&labels, 10.0, 12.5, 0),
+            Some(TabClickKind::Close(0))
+        );
+        // Close click on the second tab's ×, at absolute column 16.
+        assert_eq!(
+            resolve_doc_tab_click(&labels, 10.0, 16.5, 0),
+            Some(TabClickKind::Close(1))
+        );
+        // Past the last tab.
+        assert_eq!(resolve_doc_tab_click(&labels, 10.0, 18.5, 0), None);
+    }
+
+    #[test]
+    fn resolve_doc_tab_click_honours_scroll_offset() {
+        let labels = ["ab×d", "ef×h"];
+        // With the first tab scrolled out, the second starts at origin_x.
+        assert_eq!(
+            resolve_doc_tab_click(&labels, 10.0, 12.5, 1),
+            Some(TabClickKind::Close(1))
+        );
+        // A click before origin_x (where the hidden tab would have been)
+        // never resolves to the hidden tab.
+        assert_eq!(resolve_doc_tab_click(&labels, 10.0, 8.0, 1), None);
     }
 
     #[test]

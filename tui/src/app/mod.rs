@@ -67,6 +67,12 @@ use quadraui::{
     Point, Reaction, Rect, ScrollDelta, ScrollMode, SectionSize, Series, ShellApp,
     ShellConfig, ShellContext, SidebarPanel, SidebarPanelHit, StageStatus, StatusBar,
     StatusBarSegment, Scrollbar, StyledSpan, StyledText, TabBar, TabItem, TextRegion, Toolbar,
+    // #2283 (ms-65 §4): overflow-affordance layout — `board_doc_tab_strip`
+    // (render.rs) calls `TabBar::layout` directly (rather than only via
+    // `Backend::tab_bar_layout`) to get `scroll_left`/`scroll_right`, which
+    // the TUI backend's own wrapper never exposes (it hardcodes
+    // `scroll_arrow_width: 0.0`).
+    SegmentMeasure, TabMeasure,
     ToolbarButton, ToolbarHoverTracker, ToolbarItemMeasure, TreeRow, UiEvent, WidgetId,
     BadgeStatus, BoardCard, BoardColumn, BoardHit, BoardLayout, BoardModel, CardBadge, MoveDir,
     // #1094: Audit panel row list — first `DataTable` use in coord-tui.
@@ -148,7 +154,10 @@ pub(crate) mod drive_queue;
 // #2282 (ms-65): per-panel document tabs with VS Code preview/pin semantics.
 pub(crate) mod doc_tabs;
 #[allow(unused_imports)]
-use self::doc_tabs::{doc_tab_label, DocKey, DocTabs, PanelScope};
+use self::doc_tabs::{
+    doc_tab_label, resolve_doc_tab_click, DocKey, DocTabs, PanelScope, TabClickKind,
+    SCROLL_LEFT_MARKER, SCROLL_RIGHT_MARKER,
+};
 #[allow(unused_imports)]
 use self::types::*;
 #[allow(unused_imports)]
@@ -6840,6 +6849,71 @@ impl CoordApp {
         // tree. Gating on `changed` would make that click a silent no-op.
         self.reveal_board_active_doc();
         true
+    }
+
+    /// Close the Board tab at strip index `idx` (contract §4, #2283) —
+    /// clicking a tab's `×`, middle-clicking a tab, and `Ctrl-W` on the
+    /// active tab all funnel through here.
+    ///
+    /// The active-neighbour rule is `DocTabGroup::close`'s job, not this
+    /// wrapper's: closing the ACTIVE tab activates the tab immediately to
+    /// its left, or (when the closed tab was the leftmost) the new
+    /// leftmost. Closing an INACTIVE tab leaves the active *document*
+    /// unchanged.
+    ///
+    /// Reveals the new active document (§2f) only when the active KEY
+    /// actually changed — comparing keys rather than indices, so closing
+    /// an inactive tab (which only re-bases the active index to keep
+    /// pointing at the same document) never touches sidebar selection or
+    /// scroll. Closing the last tab clears the active key to `None`; the
+    /// key comparison catches that too, and `reveal_board_active_doc`
+    /// itself no-ops on `None` — nothing left to reveal, which is exactly
+    /// §4's "return to selection-follows-tree" (the sidebar selection made
+    /// when the closed tab was opened is simply what's left).
+    fn close_board_doc_tab(&mut self, idx: usize) -> bool {
+        let before = self.board_doc_active_key().cloned();
+        if !self.doc_tabs.group_mut(PanelScope::Board).close(idx) {
+            return false;
+        }
+        if self.board_doc_active_key().cloned() != before {
+            self.reveal_board_active_doc();
+        }
+        true
+    }
+
+    /// `Ctrl-W` (contract §4, #2283) — close the ACTIVE Board tab. Returns
+    /// `false` when no tab is open, so the caller can fall through to
+    /// `Ctrl-W`'s #605 pane-focus-leader meaning.
+    fn close_active_board_doc_tab(&mut self) -> bool {
+        match self.board_doc_tabs().active_index() {
+            Some(idx) => self.close_board_doc_tab(idx),
+            None => false,
+        }
+    }
+
+    /// `Ctrl-Tab` / `Ctrl-Shift-Tab` (contract §4, #2283) — cycle the active
+    /// Board tab, wrapping at both ends. `forward == true` is `Ctrl-Tab`
+    /// ("moves to the next tab, wrapping from the last to the first");
+    /// `false` is `Ctrl-Shift-Tab` ("moves to the previous, wrapping from
+    /// the first to the last"). Returns `false` when no tab is open.
+    ///
+    /// Routes through `activate_board_doc_tab` so cycling gets the exact
+    /// same reveal-on-activate (§2f) and promote-on-select
+    /// (`DocTabGroup::activate_index`) behaviour a strip click gets —
+    /// cycling onto a preview tab is the same "I want to keep looking at
+    /// this one" gesture a click is.
+    fn cycle_board_doc_tab(&mut self, forward: bool) -> bool {
+        let len = self.board_doc_tabs().tabs().len();
+        if len == 0 {
+            return false;
+        }
+        let cur = self.board_doc_tabs().active_index().unwrap_or(0);
+        let next = if forward {
+            (cur + 1) % len
+        } else {
+            (cur + len - 1) % len
+        };
+        self.activate_board_doc_tab(next)
     }
 
     /// Contract §2f — reveal-on-activate.
