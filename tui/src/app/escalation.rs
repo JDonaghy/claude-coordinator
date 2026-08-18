@@ -16,6 +16,17 @@
 //! from `/board`'s `escalations` field) — unlike `drive.rs`'s
 //! `DriveSession`, there is no client-side liveness state to track here.
 //!
+//! #2370: the right-click menu's "Run proposed fix" item is a pull-right
+//! submenu whose children call `coord decide <repo> <issue> <index>`
+//! (`dispatch_decide_escalation`) rather than only ever offering the single
+//! recommended fix via `coord escalate run` — an escalation-table card
+//! always folds to two `decisions`-report options (`coord/reports.py`'s
+//! `fold_decisions`: "Recommended" = this row's `proposed_command`,
+//! "Inspect" = `coord escalate list --repo <repo>`), so the operator can
+//! now pick either, not just the recommended one. `escalate run`/`dismiss`
+//! keep working unchanged — `dispatch_run_escalation` below is still the
+//! direct-CLI-parity path, just no longer the menu's only option.
+//!
 //! **Import pattern:** `use super::*` is intentional — see `drive.rs` /
 //! `sessions.rs` / `terminal.rs` / `fleet_terminals.rs` for the same
 //! rationale.
@@ -86,6 +97,38 @@ impl CoordApp {
         self.push_toast(
             "Escalation",
             &format!("dismissed for {repo} #{issue}"),
+            ToastSeverity::Info,
+        );
+    }
+
+    /// "Decide" — generalizes `dispatch_run_escalation` to any option on
+    /// the card's `decisions`-report shape, not just the recommended one
+    /// (#2370). Shells out to `coord decide <repo> <issue> <option_index>`,
+    /// which re-reads the card fresh from `coord.reports.find_decision` and
+    /// runs `options[option_index].command_or_action` — the same
+    /// `subprocess.run(command, shell=True)` primitive `coord escalate run`
+    /// uses, so this is fire-and-forget the same way
+    /// `dispatch_run_escalation` is; there is nothing here worth watching
+    /// live.
+    ///
+    /// Post-run bookkeeping (dismiss-on-success vs. echo-and-stop) is the
+    /// CLI's job, not this dispatch call's — `coord decide` already knows
+    /// whether `option_index` is the card's recommended escalation option
+    /// (see that command's docstring), and this menu never re-derives or
+    /// caches that classification.
+    pub(crate) fn dispatch_decide_escalation(
+        &mut self,
+        repo: &str,
+        issue: u64,
+        option_index: usize,
+    ) {
+        let issue_str = issue.to_string();
+        let index_str = option_index.to_string();
+        self.command_runner
+            .spawn_queued(&["decide", repo, &issue_str, &index_str]);
+        self.push_toast(
+            "Escalation",
+            &format!("running option {option_index} for {repo} #{issue}…"),
             ToastSeverity::Info,
         );
     }
@@ -231,6 +274,125 @@ mod tests {
         assert_eq!(app.data.escalations[0].issue_number, 7);
     }
 
+    // ── dispatch_decide_escalation (#2370) ───────────────────────────────────
+
+    #[test]
+    fn dispatch_decide_escalation_spawns_the_cli_call_with_the_chosen_index() {
+        let mut app = make_test_app(BoardData {
+            escalations: vec![escalation("myrepo", 42)],
+            ..BoardData::default()
+        });
+        app.dispatch_decide_escalation("myrepo", 42, 1);
+        assert_eq!(
+            app.command_runner.spawned_calls,
+            vec![vec![
+                "decide".to_string(),
+                "myrepo".to_string(),
+                "42".to_string(),
+                "1".to_string(),
+            ]],
+            "must dispatch `coord decide myrepo 42 1`; got {:?}",
+            app.command_runner.spawned_calls,
+        );
+    }
+
+    #[test]
+    fn dispatch_decide_escalation_default_index_is_the_recommended_option() {
+        let mut app = make_test_app(BoardData {
+            escalations: vec![escalation("myrepo", 42)],
+            ..BoardData::default()
+        });
+        app.dispatch_decide_escalation("myrepo", 42, 0);
+        assert_eq!(
+            app.command_runner.spawned_calls,
+            vec![vec![
+                "decide".to_string(),
+                "myrepo".to_string(),
+                "42".to_string(),
+                "0".to_string(),
+            ]],
+            "index 0 is the escalation card's recommended option — same slot \
+             `coord escalate run` executes, generalized via `coord decide`",
+        );
+    }
+
+    // ── context menu: "Run proposed fix" submenu (#2370) ────────────────────
+
+    #[test]
+    fn escalated_row_menu_offers_run_proposed_fix_as_a_submenu() {
+        let mut app = make_test_app(BoardData {
+            escalations: vec![escalation("myrepo", 42)],
+            ..BoardData::default()
+        });
+        app.pipeline_issues = vec![pipeline_issue(42, Some("myrepo"))];
+        let items = app.context_menu_items_for_pipeline_row(
+            Some(42),
+            &crate::app::types::PipelineRowLifecycle::New,
+            Some("myrepo"),
+        );
+        let parent = items
+            .iter()
+            .find(|i| i.label.starts_with("Run proposed fix"))
+            .expect("'Run proposed fix' item not found in escalated row's menu");
+        let children = parent
+            .submenu
+            .as_ref()
+            .expect("'Run proposed fix' must be a pull-right submenu, not a flat action");
+        assert_eq!(
+            children.iter().map(|c| c.action_id.as_deref()).collect::<Vec<_>>(),
+            vec![Some("decide-escalation:0"), Some("decide-escalation:1")],
+            "each submenu entry must call `coord decide` with its own option index"
+        );
+    }
+
+    #[test]
+    fn dispatch_context_menu_action_decide_escalation_zero_calls_decide_with_index_zero() {
+        let mut app = make_test_app(BoardData {
+            escalations: vec![escalation("myrepo", 42)],
+            ..BoardData::default()
+        });
+        let target = crate::app::types::ContextMenuTarget::PipelineRow {
+            issue_number: Some(42),
+            repo_name: Some("myrepo".to_string()),
+            lifecycle: crate::app::types::PipelineRowLifecycle::New,
+        };
+        app.dispatch_context_menu_action("decide-escalation:0", &target);
+        assert_eq!(
+            app.command_runner.spawned_calls,
+            vec![vec![
+                "decide".to_string(),
+                "myrepo".to_string(),
+                "42".to_string(),
+                "0".to_string(),
+            ]],
+        );
+    }
+
+    #[test]
+    fn dispatch_context_menu_action_decide_escalation_one_calls_decide_with_index_one() {
+        let mut app = make_test_app(BoardData {
+            escalations: vec![escalation("myrepo", 42)],
+            ..BoardData::default()
+        });
+        let target = crate::app::types::ContextMenuTarget::PipelineRow {
+            issue_number: Some(42),
+            repo_name: Some("myrepo".to_string()),
+            lifecycle: crate::app::types::PipelineRowLifecycle::New,
+        };
+        app.dispatch_context_menu_action("decide-escalation:1", &target);
+        assert_eq!(
+            app.command_runner.spawned_calls,
+            vec![vec![
+                "decide".to_string(),
+                "myrepo".to_string(),
+                "42".to_string(),
+                "1".to_string(),
+            ]],
+            "picking the non-default 'Inspect' option must still run `coord decide` \
+             with its own index, not silently fall back to index 0"
+        );
+    }
+
     // ── TuiDriver black-box: row badge + menu (#1505 acceptance) ────────────
 
     /// The acceptance bar this issue names: "a `TuiDriver` test over a
@@ -297,10 +459,30 @@ mod tests {
         // height below where it visibly renders.
         driver.click(dx, dy - 0.1);
 
+        // #2370: "Run proposed fix" is now a pull-right submenu (a card
+        // with more than one `decisions`-report option, per the design's
+        // point 4) rather than a flat action — this click opens it, it
+        // doesn't run anything yet.
+        let submenu = driver.screen();
+        assert!(
+            submenu.contains("Recommended:"),
+            "the submenu must offer the recommended option:\n{submenu}"
+        );
+        assert!(
+            submenu.contains("Inspect"),
+            "the submenu must offer to inspect the record as a second option:\n{submenu}"
+        );
+
+        let (rx, ry) = driver
+            .find("Recommended:")
+            .unwrap_or_else(|| panic!("'Recommended:' submenu item not found:\n{submenu}"));
+        driver.click(rx, ry - 0.1);
+
         let toast_screen = driver.screen();
         assert!(
-            toast_screen.contains("running the proposed fix"),
-            "clicking 'Run proposed fix' must toast that the fix is running:\n{toast_screen}"
+            toast_screen.contains("running option 0 for myrepo #42"),
+            "clicking the submenu's 'Recommended' entry must dispatch `coord decide \
+             myrepo 42 0` and toast that it's running:\n{toast_screen}"
         );
     }
 }

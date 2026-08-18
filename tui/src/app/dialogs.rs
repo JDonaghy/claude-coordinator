@@ -858,9 +858,34 @@ impl CoordApp {
                     // isn't gated behind a confirmation dialog, so the
                     // operator should be able to read the whole command
                     // here before clicking — widen the budget accordingly.
-                    items.push(ContextMenuItem::action(
-                        "run-escalation",
+                    //
+                    // #2370: an escalation-table card always folds to TWO
+                    // `decisions`-report options (`coord/reports.py`'s
+                    // `fold_decisions`: "Recommended" = this row's
+                    // `proposed_command`, "Inspect" = `coord escalate list
+                    // --repo <repo>`) — so per the design's point 4 this is
+                    // always a pull-right submenu, never a flat action, and
+                    // each child calls `coord decide <repo> <issue>
+                    // <index>` (via `dispatch_decide_escalation`) instead of
+                    // `coord escalate run` directly. That command re-reads
+                    // the card fresh and runs `options[index]` itself —
+                    // this menu never re-derives or caches what the options
+                    // are, it only labels them for display.
+                    items.push(ContextMenuItem::parent(
                         &format!("Run proposed fix: {}", trunc(&esc.proposed_command, 56)),
+                        vec![
+                            ContextMenuItem::action(
+                                "decide-escalation:0",
+                                &format!(
+                                    "Recommended: {}",
+                                    trunc(&esc.proposed_command, 40)
+                                ),
+                            ),
+                            ContextMenuItem::action(
+                                "decide-escalation:1",
+                                "Inspect (view the full escalation record)",
+                            ),
+                        ],
                     ));
                     let has_pr = self
                         .pipeline_issues
@@ -6715,6 +6740,22 @@ impl CoordApp {
                     _ => return false,
                 };
                 self.dispatch_dismiss_escalation(&repo, issue);
+                true
+            }
+            // #2370: "Run proposed fix"'s submenu children — one per
+            // `decisions`-report option (`decide-escalation:0` =
+            // Recommended, `decide-escalation:1` = Inspect; see the
+            // `ContextMenuItem::parent` push above). The index rides in the
+            // action id (the `drive-queue-add-on:<machine>` precedent)
+            // since `ContextMenuItem` carries no per-item payload.
+            _ if action_id.starts_with("decide-escalation:") => {
+                let index: usize = action_id
+                    .strip_prefix("decide-escalation:")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                if let Some((repo, issue)) = self.pipeline_menu_repo_issue(target) {
+                    self.dispatch_decide_escalation(&repo, issue, index);
+                }
                 true
             }
             "start-with-plan" => {
