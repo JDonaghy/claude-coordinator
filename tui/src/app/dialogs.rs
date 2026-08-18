@@ -871,22 +871,13 @@ impl CoordApp {
                     // the card fresh and runs `options[index]` itself —
                     // this menu never re-derives or caches what the options
                     // are, it only labels them for display.
-                    items.push(ContextMenuItem::parent(
-                        &format!("Run proposed fix: {}", trunc(&esc.proposed_command, 56)),
-                        vec![
-                            ContextMenuItem::action(
-                                "decide-escalation:0",
-                                &format!(
-                                    "Recommended: {}",
-                                    trunc(&esc.proposed_command, 40)
-                                ),
-                            ),
-                            ContextMenuItem::action(
-                                "decide-escalation:1",
-                                "Inspect (view the full escalation record)",
-                            ),
-                        ],
-                    ));
+                    //
+                    // #2375: the construction itself now lives in
+                    // `escalation.rs`'s `run_proposed_fix_menu_item`, shared
+                    // with the drive-queue Queue-panel row menu, so the two
+                    // panels can never render different children/ordering
+                    // for the same (repo, issue).
+                    items.push(Self::run_proposed_fix_menu_item(esc));
                     let has_pr = self
                         .pipeline_issues
                         .iter()

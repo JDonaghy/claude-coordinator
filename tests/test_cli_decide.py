@@ -206,6 +206,78 @@ def test_source2_card_explicit_index_runs_that_option_and_never_touches_escalati
     assert state._get_drive_escalation_local("api", 55) is None
 
 
+# ── --list: discovery path, executes nothing (#2375) ────────────────────────
+
+
+def test_list_prints_numbered_options_and_runs_nothing_for_escalation_card(
+    coord_db, valid_config_path: Path, monkeypatch
+):
+    state._record_drive_escalation_local(
+        "api", 7, stage="merge", reason="stuck", gate_readings="",
+        proposed_command="echo hi",
+    )
+    seen: dict = {}
+    monkeypatch.setattr("coord.commands.drive.subprocess.run", _fake_run(seen))
+
+    result = CliRunner().invoke(
+        main, ["decide", "api", "7", "--list", "--config", str(valid_config_path)]
+    )
+    assert result.exit_code == 0, result.output
+    assert "command" not in seen
+    assert "0:" in result.output and "Recommended: echo hi" in result.output
+    assert "1:" in result.output and "Inspect: coord escalate list --repo api" in result.output
+    # nothing dismissed either — --list never touches state
+    assert state._get_drive_escalation_local("api", 7) is not None
+
+
+def test_list_prints_numbered_options_for_source2_card(
+    coord_db, valid_config_path: Path, monkeypatch
+):
+    _seed_blocked_queue_row("api", 55, _TWO_OPTION_REASON)
+    seen: dict = {}
+    monkeypatch.setattr("coord.commands.drive.subprocess.run", _fake_run(seen))
+
+    result = CliRunner().invoke(
+        main, ["decide", "api", "55", "--list", "--config", str(valid_config_path)]
+    )
+    assert result.exit_code == 0, result.output
+    assert "command" not in seen
+    assert "coord log aid-1 --machine dellserver" in result.output
+    assert "echo remedy-command" in result.output
+
+
+def test_list_matches_the_decisions_report_options_exactly(
+    coord_db, valid_config_path: Path
+):
+    """#2375 acceptance: `--list`'s numbered options are the same ones
+    `coord report run decisions` (and thus `format_option_cell`) would show
+    for this same card, byte-for-byte."""
+    _seed_blocked_queue_row("api", 55, _TWO_OPTION_REASON)
+
+    result = CliRunner().invoke(
+        main, ["decide", "api", "55", "--list", "--config", str(valid_config_path)]
+    )
+    assert result.exit_code == 0, result.output
+
+    from coord.reports import format_option_cell
+
+    report = run_decisions(repo="api")
+    card = next(r for r in report.rows if r["issue"] == 55)
+    for i, opt in enumerate(card["options"]):
+        assert f"  {i}: {format_option_cell(opt)}" in result.output
+
+
+def test_list_with_no_decision_on_file_is_a_clean_error(
+    coord_db, valid_config_path: Path
+):
+    result = CliRunner().invoke(
+        main, ["decide", "api", "7", "--list", "--config", str(valid_config_path)]
+    )
+    assert result.exit_code != 0
+    assert "no decision on file" in result.output
+    assert "Traceback" not in result.output
+
+
 def test_executed_command_is_byte_identical_to_the_decisions_report_option(
     coord_db, valid_config_path: Path, monkeypatch
 ):

@@ -435,6 +435,18 @@ impl CoordApp {
                 repo_name,
                 ..
             } => Some((repo_name.clone()?, (*issue_number)?)),
+            // #2375: the Queue panel's own row now offers the same
+            // `decide-escalation:<index>` submenu the Pipeline row does
+            // (`context_menu_items_for_drive_queue_row`), so its dispatch
+            // needs the same repo/issue resolution — `issue_number` here is
+            // a non-optional `i64` (a queue row always names one), matching
+            // the `.max(0) as u64` clamp `context_menu_items_for_drive_queue_row`
+            // already uses to build the escalation lookup.
+            ContextMenuTarget::DriveQueueRow {
+                repo_name,
+                issue_number,
+                ..
+            } => Some((repo_name.clone(), (*issue_number).max(0) as u64)),
             _ => None,
         }
     }
@@ -520,10 +532,26 @@ impl CoordApp {
         held: bool,
     ) -> Vec<ContextMenuItem> {
         let mut items = Vec::new();
-        // #1757: FIRST, and only on a row that is actually holding the
-        // queue. When a gate has fired this is the only action that changes
-        // anything — everything below it just rearranges work that cannot
-        // start — so it must not be buried under three moves.
+        // #2375: the SAME "Run proposed fix" submenu the Pipeline row menu
+        // offers for an open escalation (`dialogs.rs`'s `escalation_for`
+        // branch) — the queue panel is arguably the more natural place to
+        // decide a stuck row from, so reaching this action must not require
+        // a context-switch to Pipeline to find the same row. Built through
+        // the shared `escalation.rs` helper so the two panels can never
+        // drift into rendering different children/ordering for one
+        // (repo, issue). A row with no open escalation is unaffected — the
+        // lookup returns `None` and this block is skipped entirely.
+        if let Some(esc) = self.escalation_for(repo_name, issue_number.max(0) as u64) {
+            items.push(Self::run_proposed_fix_menu_item(esc));
+            items.push(ContextMenuItem::separator());
+        }
+        // #1757: first among the state-changing actions below (the escalation
+        // block above, when present, still leads the whole menu — a driver
+        // stuck on merge is a bigger deal than a deploy gate), and only on a
+        // row that is actually holding the queue. When a gate has fired this
+        // is the only action that changes anything — everything below it
+        // just rearranges work that cannot start — so it must not be buried
+        // under three moves.
         if held {
             items.push(
                 ContextMenuItem::action("drive-queue-resume", "Resume (release deploy gate)")
@@ -2364,6 +2392,167 @@ mod tests {
             app.context_menu_items_for_drive_queue_row("myrepo", 42, QUEUE_STATE_BLOCKED, 2, 3, false);
         assert!(last[1].disabled, "'Move down' disabled at the tail");
         assert!(last.iter().any(|i| i.label == "Unblock"));
+    }
+
+    // ── "Run proposed fix" submenu on an escalated row (#2375) ───────────
+
+    fn escalation(repo: &str, issue_number: u64) -> EscalationEntry {
+        EscalationEntry {
+            id: 1,
+            repo_name: repo.to_string(),
+            issue_number: issue_number as i64,
+            stage: "merge".to_string(),
+            assignment_id: Some("w1".to_string()),
+            reason: "merge_status=NEEDS_ATTENTION — no number of retries changes this".to_string(),
+            gate_readings:
+                "merge_status=NEEDS_ATTENTION | pr_url=https://github.com/acme/myrepo/pull/9"
+                    .to_string(),
+            proposed_command: "gh pr merge 9 --rebase && coord reconcile-merges".to_string(),
+            created_at: Some(1.0),
+        }
+    }
+
+    #[test]
+    fn queue_row_menu_unchanged_when_no_escalation_is_open() {
+        let app = make_test_app(BoardData::default());
+        let items = app.context_menu_items_for_drive_queue_row(
+            "myrepo",
+            42,
+            QUEUE_STATE_WAITING,
+            0,
+            3,
+            false,
+        );
+        assert!(
+            !items
+                .iter()
+                .any(|i| i.label.starts_with("Run proposed fix")),
+            "a row with no open escalation must render exactly as before #2375: {items:?}"
+        );
+        assert_eq!(
+            items[0].action_id.as_deref(),
+            Some("drive-queue-move-up"),
+            "no escalation block inserted ahead of the moves"
+        );
+    }
+
+    #[test]
+    fn queue_row_menu_offers_run_proposed_fix_when_escalated() {
+        let app = make_test_app(BoardData {
+            escalations: vec![escalation("myrepo", 42)],
+            ..BoardData::default()
+        });
+        let items = app.context_menu_items_for_drive_queue_row(
+            "myrepo",
+            42,
+            QUEUE_STATE_WAITING,
+            0,
+            3,
+            false,
+        );
+        let parent = items
+            .iter()
+            .find(|i| i.label.starts_with("Run proposed fix"))
+            .expect("'Run proposed fix' item not found in escalated queue row's menu");
+        let children = parent
+            .submenu
+            .as_ref()
+            .expect("'Run proposed fix' must be a pull-right submenu, not a flat action");
+        assert_eq!(
+            children
+                .iter()
+                .map(|c| c.action_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("decide-escalation:0"), Some("decide-escalation:1")],
+            "each submenu entry must call `coord decide` with its own option index"
+        );
+    }
+
+    #[test]
+    fn queue_row_menu_matches_pipeline_row_menu_for_the_same_escalation() {
+        // #2375 acceptance: seeding one escalation + one drive-queue row for
+        // the same (repo, issue) must produce the SAME "Run proposed fix"
+        // submenu — same recommended command, same child ordering — from
+        // both `context_menu_items_for_drive_queue_row` (this module) and
+        // `context_menu_items_for_pipeline_row` (`dialogs.rs`).
+        let mut app = make_test_app(BoardData {
+            escalations: vec![escalation("myrepo", 42)],
+            drive_queue: vec![entry(42, 0, QUEUE_STATE_WAITING, &[])],
+            ..BoardData::default()
+        });
+        app.pipeline_issues = vec![pipeline_issue(42, Some("myrepo"))];
+
+        let queue_items = app.context_menu_items_for_drive_queue_row(
+            "myrepo",
+            42,
+            QUEUE_STATE_WAITING,
+            0,
+            1,
+            false,
+        );
+        let pipeline_items = app.context_menu_items_for_pipeline_row(
+            Some(42),
+            &crate::app::types::PipelineRowLifecycle::New,
+            Some("myrepo"),
+        );
+
+        let queue_parent = queue_items
+            .iter()
+            .find(|i| i.label.starts_with("Run proposed fix"))
+            .expect("queue row menu missing 'Run proposed fix'");
+        let pipeline_parent = pipeline_items
+            .iter()
+            .find(|i| i.label.starts_with("Run proposed fix"))
+            .expect("pipeline row menu missing 'Run proposed fix'");
+
+        assert_eq!(
+            queue_parent.label, pipeline_parent.label,
+            "both panels must name the same recommended command"
+        );
+        let queue_children = queue_parent.submenu.as_ref().expect("queue submenu");
+        let pipeline_children = pipeline_parent.submenu.as_ref().expect("pipeline submenu");
+        assert_eq!(
+            queue_children
+                .iter()
+                .map(|c| (c.action_id.clone(), c.label.clone()))
+                .collect::<Vec<_>>(),
+            pipeline_children
+                .iter()
+                .map(|c| (c.action_id.clone(), c.label.clone()))
+                .collect::<Vec<_>>(),
+            "same action ids, same labels, same order on both panels"
+        );
+    }
+
+    #[test]
+    fn queue_row_decide_escalation_dispatch_resolves_repo_and_issue() {
+        // `pipeline_menu_repo_issue` now also resolves a `DriveQueueRow`
+        // target (#2375) — without this, the submenu's
+        // `decide-escalation:<index>` action id would silently no-op when
+        // clicked from the Queue panel.
+        let mut app = make_test_app(BoardData {
+            escalations: vec![escalation("myrepo", 42)],
+            ..BoardData::default()
+        });
+        let target = crate::app::types::ContextMenuTarget::DriveQueueRow {
+            repo_name: "myrepo".to_string(),
+            issue_number: 42,
+            state: QUEUE_STATE_WAITING.to_string(),
+            position: 0,
+            queue_len: 1,
+            held: false,
+        };
+        app.dispatch_context_menu_action("decide-escalation:0", &target);
+        assert_eq!(
+            app.command_runner.spawned_calls,
+            vec![vec![
+                "decide".to_string(),
+                "myrepo".to_string(),
+                "42".to_string(),
+                "0".to_string(),
+            ]],
+            "clicking the queue-panel submenu must dispatch `coord decide myrepo 42 0`"
+        );
     }
 
     // ── dispatch: the `coord drive-queue …` argv ─────────────────────────
