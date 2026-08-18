@@ -1588,6 +1588,43 @@ def _ci_unreadable_reason(failed: "list[CheckRun]") -> str | None:
     )
 
 
+# #2380: a bare check-list FETCH failure (`_ci_unreadable_reason`, above) has
+# TWO readings, exactly like `checks == []` already does (#1877): "GitHub is
+# genuinely unreachable right now" (real, self-healing — keep retrying), and
+# "this PR is DIRTY/CONFLICTING against its base, so GitHub can never build a
+# merge ref for it and `gh pr checks` has nothing to read" (definitive,
+# self-*never*-healing — no amount of retrying a CI read produces CI that
+# will never run). The two are indistinguishable from the check list alone;
+# GitHub's own `mergeable` field is the one thing that tells them apart, and
+# — unlike CI — it is always computable, conflict or not.
+def _pr_reports_conflicting(gh_ops, repo: str | None, number: int | None) -> bool:
+    """True only when GitHub's live ``mergeable`` field reads ``CONFLICTING``
+    for PR *number* — definitive, readable evidence a CI-unreadable park can
+    never resolve on its own (#2380).
+
+    Duck-typed the same way the sibling #1877 checks-absent conflict probe
+    (a few lines above each of this function's call sites) already is:
+    ``gh_ops`` on the board/plan read path may be a :class:`~coord.gate_
+    snapshot.GateSnapshot` with no ``check_pr_mergeable`` at all (#1336
+    Invariant 1 — no third-party I/O there), and any of "no probe available",
+    "the probe raised", or a ``True``/``None`` verdict (cleanly mergeable, or
+    GitHub still computing it) must read as "not confirmed conflicting" —
+    never as false evidence of one. This is intentionally narrower than the
+    design's "``mergeable == CONFLICTING`` or ``mergeStateStatus == DIRTY``"
+    framing: :func:`coord.github_ops.check_pr_mergeable` already reads GitHub's
+    ``mergeable`` field, which is exactly ``CONFLICTING`` whenever
+    ``mergeStateStatus`` would read ``DIRTY`` — one probe, one `gh` call,
+    same readable-and-definitive signal either way.
+    """
+    probe = getattr(gh_ops, "check_pr_mergeable", None)
+    if probe is None or not repo or number is None:
+        return False
+    try:
+        return probe(repo, number) is False
+    except Exception:  # noqa: BLE001 — inconclusive, not a confirmed conflict
+        return False
+
+
 def _ci_infra_reason(
     ci: "CiStore", repo: str, number: int, failed: "list[CheckRun]"
 ) -> str | None:
@@ -3820,21 +3857,36 @@ def _entry_gate_status(
             # `process()`'s own live reading.
             unreadable_reason = _ci_unreadable_reason(failed)
             if unreadable_reason is not None:
-                return PLAN_BLOCKED, unreadable_reason
-            summary = ", ".join(f"{c.name} ({c.conclusion})" for c in failed)
-            return PLAN_BLOCKED, f"CI failed: {summary}"
-        pending = in_flight_checks(checks)
-        if pending:
-            summary = ", ".join(c.name for c in pending)
-            return PLAN_BLOCKED, f"{CI_PENDING_PREFIX} {summary}"
-        if checks and _ci_checks_are_stale(
-            checks, gh_ops, entry.repo_github, entry.target_branch, smoke
-        ):
-            return (
-                PLAN_BLOCKED,
-                f"{CI_STALE_PREFIX} checks predate the current base — "
-                "re-run CI (`coord merge --revalidate`) before merging",
-            )
+                # #2380: a fetch failure this uniform (EVERY failing check is
+                # the synthetic unreadable stand-in) is ALSO exactly what a
+                # DIRTY/CONFLICTING PR produces — see
+                # :func:`_pr_reports_conflicting`'s docstring. Same "don't
+                # block, mirror `process()`, let the real conflict surface"
+                # response as the #1877 checks-absent case immediately above
+                # — deliberately NOT falling into the `pending`/staleness
+                # checks below, which assume (per `_ci_checks_are_stale`'s
+                # own docstring) a *non-empty, no-failed-entries* check list;
+                # this one is neither.
+                if not _pr_reports_conflicting(
+                    gh_ops, entry.repo_github, entry.pr_number
+                ):
+                    return PLAN_BLOCKED, unreadable_reason
+            else:
+                summary = ", ".join(f"{c.name} ({c.conclusion})" for c in failed)
+                return PLAN_BLOCKED, f"CI failed: {summary}"
+        else:
+            pending = in_flight_checks(checks)
+            if pending:
+                summary = ", ".join(c.name for c in pending)
+                return PLAN_BLOCKED, f"{CI_PENDING_PREFIX} {summary}"
+            if checks and _ci_checks_are_stale(
+                checks, gh_ops, entry.repo_github, entry.target_branch, smoke
+            ):
+                return (
+                    PLAN_BLOCKED,
+                    f"{CI_STALE_PREFIX} checks predate the current base — "
+                    "re-run CI (`coord merge --revalidate`) before merging",
+                )
     if gh_ops is not None and entry.pr_number:
         try:
             commit_messages = gh_ops.get_pr_commit_messages(
@@ -5176,6 +5228,25 @@ def process(
                             # checked first, mirroring the live path's
                             # ordering — see `_ci_unreadable_reason`.
                             unreadable_reason = _ci_unreadable_reason(failed)
+                            # #2380: mirror the real path's straight-to-
+                            # conflict routing — see the identical check a
+                            # few lines above (#1877) and the live path's own
+                            # `_pr_reports_conflicting` branch. Preview-only:
+                            # never mutates `entry.state`, same as every
+                            # other branch in this dry-run block.
+                            if unreadable_reason is not None and _pr_reports_conflicting(
+                                gh_ops, entry.repo_github, entry.pr_number
+                            ):
+                                events.append(MergeEvent(
+                                    entry, "conflict",
+                                    f"(dry run) {entry.branch} conflicts "
+                                    f"with {entry.target_branch} and its CI "
+                                    "check-list fetch fails for the same "
+                                    "reason — a real run would route to the "
+                                    "#241 conflict-fix path rather than park "
+                                    "on an unreadable CI retry (#2380)",
+                                ))
+                                continue
                             infra_reason = None if unreadable_reason else _ci_infra_reason(
                                 ci, entry.repo_github, entry.pr_number, failed
                             )
@@ -5528,6 +5599,39 @@ def process(
                     # to evaluate unconditionally, every time.
                     unreadable_reason = _ci_unreadable_reason(failed)
                     if unreadable_reason is not None:
+                        # #2380: a check-list fetch failure this uniform
+                        # (EVERY failing check is the synthetic unreadable
+                        # stand-in) is ALSO exactly what GitHub reports for a
+                        # DIRTY/CONFLICTING PR — it can never build a merge
+                        # ref, so `gh pr checks` has nothing to read either.
+                        # `_pr_reports_conflicting` tells the two apart the
+                        # same way the #1877 checks-absent branch above does:
+                        # GitHub's own `mergeable` field, definitive and
+                        # always computable, conflict or not. When it reads
+                        # CONFLICTING, retrying the CI read can never
+                        # succeed — route STRAIGHT to the same `conflict`
+                        # event / `_dispatch_conflict_fixes` path a readable
+                        # CONFLICT merge-queue status already triggers
+                        # (#1474/#241), instead of parking behind a read that
+                        # will never resolve.
+                        if _pr_reports_conflicting(
+                            gh_ops, entry.repo_github, entry.pr_number
+                        ):
+                            msg = (
+                                f"merge conflict: GitHub reports PR "
+                                f"#{entry.pr_number} ({entry.branch}) as "
+                                f"CONFLICTING against {entry.target_branch} "
+                                "— no CI ever ran because GitHub cannot "
+                                "build a merge ref for a conflicting PR, so "
+                                "the check-list fetch failure was never a "
+                                "transient GitHub outage (#2380). Rebase "
+                                f"the branch onto {entry.target_branch} and "
+                                "resolve."
+                            )
+                            entry.state = CONFLICT
+                            entry.error = msg
+                            events.append(MergeEvent(entry, "conflict", msg))
+                            continue  # #292: skip, don't halt the group
                         if entry.ci_unreadable_reruns < MAX_CI_UNREADABLE_RERUNS:
                             entry.ci_unreadable_reruns += 1
                             _log.info(
