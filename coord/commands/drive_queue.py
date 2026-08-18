@@ -71,6 +71,7 @@ from coord.drive_queue import (
     find_cycle,
     fired_holds,
     is_permanent_block_reason,
+    is_unsatisfiable_prereq_reason,
     parse_after_spec,
     parse_key,
     pending_probe_targets,
@@ -562,13 +563,31 @@ _BLOCKED_REMEDY = (
     "actually fixed, not merely because a pre-req merged"
 )
 
-# #2230: `blocked`'s MERGE GATE (as opposed to its `after=` graph, which
-# `_BLOCKED_REMEDY` above still correctly calls never-re-checked) is no
-# longer unconditionally terminal — see `coord.drive_queue.
-# is_permanent_block_reason`/`_reconcile_blocked`. Shown only for `blocked`
-# (never `failed`, which #2230 does not touch at all) so an operator reading
-# `list` right after this ships doesn't have to go read the issue to learn
-# their remove+add might be about to race an automatic resume.
+# #2362: a `blocked` row (never `failed` — the tick's `after=` resume sweep,
+# `coord.drive_queue._reconcile_blocked_after`, is scoped to `blocked` only)
+# whose OWN `last_reason` IS `_resolve_prereqs`'s "queued but blocked/failed
+# — it will never satisfy" verdict is auto re-checked every tick, and
+# resumes to `waiting` on its own the moment every named pre-req lands.
+# `_BLOCKED_REMEDY` above is flatly wrong for exactly this row shape (it is
+# in fact re-checked, on its own, without an operator) — this note replaces
+# it there instead of merely appending, mirroring #2230's own concern: an
+# operator told "never re-checked" for a row about to self-resume would
+# either do a needless remove+add or race the automatic one.
+_BLOCKED_AFTER_NOTE = (
+    "remedy: {state}'s `after=` graph above IS re-checked automatically "
+    "every tick (#2362) — once every named pre-req lands (`facts.landed`), "
+    "this row resumes to `waiting` on its own, attempt budget reset; no "
+    "operator remove+add needed. See `resumes=` above if it has already "
+    "self-resumed and re-blocked for an unrelated reason."
+)
+
+# #2230: `blocked`'s MERGE GATE (as opposed to its `after=` graph, handled by
+# `_BLOCKED_AFTER_NOTE`/`_BLOCKED_REMEDY` above) is no longer unconditionally
+# terminal — see `coord.drive_queue.is_permanent_block_reason`/
+# `_reconcile_blocked`. Shown only for `blocked` (never `failed`, which
+# #2230 does not touch at all) so an operator reading `list` right after this
+# ships doesn't have to go read the issue to learn their remove+add might be
+# about to race an automatic resume.
 _BLOCKED_GATE_NOTE = (
     "note: a re-evaluable blocked cause (i.e. not a #1844/#2019 permanent "
     "refusal) IS re-checked against the merge gate automatically (#2230) — "
@@ -693,7 +712,18 @@ def drive_queue_list(repo: str | None, output_json: bool, config_path: Path) -> 
             # #2183 point 4: `blocked`/`failed` is terminal — say so where the
             # operator is already reading the row, not just in an unrelated
             # operator's hand-written `--hold-after` note.
-            click.echo(f"      {_BLOCKED_REMEDY.format(state=entry.state)}")
+            #
+            # #2404: EXCEPT when this row's own `last_reason` is exactly the
+            # unsatisfiable-`after=`-pre-req verdict on a `blocked` (not
+            # `failed`) entry — that shape auto-resumes on its own every tick
+            # (#2362), so the generic "never re-checked on its own" remedy
+            # would be actively wrong for it; swap in the note that says so.
+            if entry.state == STATE_BLOCKED and is_unsatisfiable_prereq_reason(
+                entry.last_reason
+            ):
+                click.echo(f"      {_BLOCKED_AFTER_NOTE.format(state=entry.state)}")
+            else:
+                click.echo(f"      {_BLOCKED_REMEDY.format(state=entry.state)}")
         # #2230: independent of the `after=` diagnosis above (most `blocked`
         # rows have no `after=` at all — they blocked on attempts, not a
         # pre-req), so gated on the row's OWN state and cause, not `diagnosed`.
