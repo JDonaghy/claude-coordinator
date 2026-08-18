@@ -86,6 +86,35 @@ tests:
   # zero-tab state. THIS IS THE GREEN CONTROL — see `expected_red` below.
   board_tabs_close_2283::zero_tabs_render_no_close_or_overflow_glyphs: 2283
 
+  # ── #2284 (W-3) — Pipeline's own independent tab set (contract §3) ────────
+  # Slice: pipeline_tabs_2284.rs · mocks: pipeline-tabs-independent.screen
+  # (plus board-pinned-3-tabs.screen — §3b calls the two "the independence
+  # pair")
+  #
+  # §3a — zero Pipeline tabs render no strip on Pipeline. THIS IS THE GREEN
+  # CONTROL — see the `expected_red` block below.
+  pipeline_tabs_2284::pipeline_with_zero_doc_tabs_renders_no_tab_strip: 2284
+  # §3a — Pipeline has no toolbar, so its strip is the FIRST main-panel content
+  # row, immediately above the Overview/Issue/Log/Summary/Terminal sub-tab bar
+  # (with §3a's own stated contrast: on Board the toolbar precedes the strip)
+  pipeline_tabs_2284::pipeline_doc_tab_strip_is_the_first_main_panel_row_with_no_toolbar_above_it: 2284
+  # §3b bullet 1 — switching to Pipeline shows Pipeline's (empty) set, not the
+  # Board's three tabs, and does not lose them. THIS IS A GREEN RATCHET — see
+  # the `expected_red` block below.
+  pipeline_tabs_2284::switching_to_pipeline_hides_the_boards_tabs_without_losing_them: 2284
+  # §3b + #2284 AC 1 — two Pipeline tabs with three already open on the Board
+  # shows EXACTLY two on Pipeline, and no Board document leaks into the strip
+  pipeline_tabs_2284::pipeline_opens_its_own_two_tabs_while_the_board_keeps_three: 2284
+  # §3b bullet 2 + AC 2 — the milestone's headline round trip: Board →
+  # Pipeline → Board restores the same three tabs, same order, same active tab
+  pipeline_tabs_2284::board_pipeline_board_round_trip_restores_the_boards_tabs_order_and_active_tab: 2284
+  # §3b + AC 3 — each scope owns its own preview slot: a single click in
+  # Pipeline leaves the Board's `∘ ` preview tab exactly where it was
+  pipeline_tabs_2284::each_scope_owns_its_own_preview_slot: 2284
+  # §3b + AC 4 — reveal-on-activate is per scope: activating a Pipeline tab
+  # selects its row in the PIPELINE sidebar and leaves the Board's selection
+  pipeline_tabs_2284::activating_a_pipeline_tab_reveals_its_row_in_the_pipeline_sidebar_not_the_boards: 2284
+
 # ── expected_red (#2164) ───────────────────────────────────────────────────
 # Hand-derived from a REAL run of the sealed suite against origin/main at the
 # time of authoring (`cd tui && cargo test --test acceptance --features
@@ -139,6 +168,34 @@ expected_red:
     - board_tabs_close_2283::overflowing_tabs_render_the_left_scroll_affordance_and_keep_the_active_tab_visible
     - board_tabs_close_2283::activating_a_scrolled_out_tab_scrolls_it_back_into_view_and_renders_the_right_affordance
     - board_tabs_close_2283::closing_the_last_tab_restores_the_zero_tab_baseline
+
+  # #2284 — OBSERVED, not intended. Taken from three consecutive real runs of
+  # the sealed suite (`cd tui && RUSTC_BOOTSTRAP=1 cargo test --test acceptance
+  # --features test-support -- -Z unstable-options --format json`, the driver
+  # command in coordinator.yml) at authoring time: of this slice's 7 ids, the
+  # same 5 FAILED and the same 2 passed on every run. The 2 that passed are
+  # deliberately ABSENT below:
+  #
+  #   * `pipeline_with_zero_doc_tabs_renders_no_tab_strip` — the CONTROL.
+  #     Green today (no panel paints a strip with nothing open) and must stay
+  #     green after #2284 lands: an implementation that reserves the Pipeline
+  #     strip row unconditionally, or that renders the Board's tabs on
+  #     Pipeline, breaks exactly this test. Listing it would make its
+  #     inevitable pass a HARD FAILURE.
+  #   * `switching_to_pipeline_hides_the_boards_tabs_without_losing_them` — a
+  #     RATCHET. Green today for the degenerate reason that the single global
+  #     set #2282 shipped renders only on the Board, so nothing leaks onto
+  #     Pipeline and nothing is lost coming back. Both halves become real
+  #     constraints the moment the set is keyed by scope: a per-scope map that
+  #     rebuilds (rather than preserves) the outgoing scope's entry fails the
+  #     return leg, and a strip that paints the focused scope's tabs on the
+  #     wrong panel fails the outbound one.
+  2284:
+    - pipeline_tabs_2284::pipeline_doc_tab_strip_is_the_first_main_panel_row_with_no_toolbar_above_it
+    - pipeline_tabs_2284::pipeline_opens_its_own_two_tabs_while_the_board_keeps_three
+    - pipeline_tabs_2284::board_pipeline_board_round_trip_restores_the_boards_tabs_order_and_active_tab
+    - pipeline_tabs_2284::each_scope_owns_its_own_preview_slot
+    - pipeline_tabs_2284::activating_a_pipeline_tab_reveals_its_row_in_the_pipeline_sidebar_not_the_boards
 
 # ═══════════════════════════════════════════════════════════════════════════
 # FOR THE COORDINATOR — three findings from authoring this slice. None of them
@@ -255,3 +312,73 @@ expected_red:
 # (quadraui#593) have also landed (`style_at`/`styled_row`), but §1's ruling
 # stands: the `∘ ` marker remains the pinned preview signal, and this slice
 # asserts no styles.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FOR THE COORDINATOR — findings from authoring the #2284 slice (contract §3).
+# Independent of the #2282 / #2283 notes above; again, none is a worker's to
+# fix by editing this suite, and none was resolved by editing the contract.
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# 7. LIVE HARNESS BLOCKER (flaky, machine-dependent, and it will bite #2284's
+#    worker on the very first run): **entering the Pipeline panel destroys the
+#    seeded fixture in the sealed suite.** Switching panels runs
+#    `sync_active_view_from_shell` -> `maybe_kick_pipeline_loader` ->
+#    `refresh()` -> `start_data_load()` (`tui/src/app/data.rs:2620`). That
+#    function short-circuits to `BoardData::default()` — so
+#    `apply_pending_data`'s #620 degraded-tick guard keeps the seeded board —
+#    but the short-circuit is gated `#[cfg(test)]` ONLY. `tui/tests/acceptance.rs`
+#    is a separate integration-test crate, so the `coord_tui` it links is built
+#    WITHOUT `cfg(test)`; the loader therefore reads the real local
+#    `~/.coord/coord.db`, and the next dispatched event (`dispatch_handle`
+#    drains the receiver before handling anything) wholesale-replaces
+#    `self.data`. Measured on this machine: two clicks after landing on
+#    Pipeline, the Board sidebar renders the developer's real `api (1)` repo
+#    and the Pipeline tree is empty ("Loading tracked issues…").
+#
+#    It is a RACE, not a certainty — the load runs on a spawned thread, so
+#    whether the fixture survives depends on whether that thread finished
+#    before the next event. Across three authoring runs, 3 of the 5 red ids
+#    died at the harness precondition and 2 got far enough to fail on the real
+#    §3a clause; which is which varied run to run. Every affected assertion
+#    says `HARNESS PRECONDITION (NOT a #2284 defect …)` in its panic message so
+#    the two failure modes are distinguishable from a JSON report alone.
+#
+#    The fix is one line of app code, and this repo has already made it once
+#    for the same reason: `resolve_board_service()`
+#    (`tui/src/app/data.rs:1950`) is gated
+#    `#[cfg(any(test, feature = "test-support"))]` with a comment citing #1039
+#    and naming this exact external-crate `cfg(test)` trap.
+#    `start_data_load()`'s stub needs the same widening. It is NOT in #2284's
+#    "Files" list, so the coordinator should either land it as a prerequisite
+#    or explicitly authorise the worker to widen that cfg — without it the five
+#    red ids below cannot go green reliably no matter how correct the
+#    per-scope tab model is.
+#
+# 8. §3b's "same scroll position as before the switch" is not asserted. The
+#    round-trip test opens three tabs in an 82-column strip, where nothing is
+#    scrolled, and the contract pins no rendered signal for a *restored* strip
+#    scroll offset beyond §4's `‹`/`›` affordances — which are #2283's slice
+#    and whose own mock the #2283 author already flagged (finding 4) as
+#    contradicting §2b's label width. Inventing an observable for it would
+#    have meant inventing a width. Flagged as a `TODO(test-author)` in the
+#    slice.
+#
+# 9. §2f's scroll half is likewise not re-asserted for the Pipeline scope.
+#    #2284's own AC says "reveals its row in the Pipeline sidebar, not the
+#    Board's", and the contract pins the scroll requirement only for the Board
+#    (§2f, five issues on a short viewport). This slice asserts the per-scope
+#    SELECTION (`▸ #201` inside the Pipeline sidebar's columns 3–37, plus the
+#    Board's own `▸ #103` surviving a Pipeline-side activation) and leaves the
+#    scroll half to #2282's slice, which owns §2f. Also a `TODO(test-author)`.
+#
+# Also worth knowing, not a contract problem: the Pipeline sidebar nests
+# tracked issues under state -> repo -> milestone nodes whose innermost node is
+# COLLAPSED by default, and renders rows as `#201  Add retry backoffwork`
+# (two spaces, title truncated to the 35-column sidebar, stage badge butted
+# against it) — nothing like the mocks' `#201 Add retry backoff to fetch`. The
+# slice therefore targets Pipeline rows by their `#<N>` tag restricted to the
+# sidebar columns (§0), never by a full row string, and expands that group as a
+# labelled precondition. The fixture also gives #101–#103 an untracked label
+# and #201–#203 the tracked `coord` one: the Board sidebar lists all six (it
+# does not filter by label) while the Pipeline lists only the 200s, which is
+# what makes the mocks' 100s/200s ranges disjoint in a single seeded board.
