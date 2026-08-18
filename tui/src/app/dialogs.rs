@@ -1186,6 +1186,10 @@ impl CoordApp {
             ContextMenuTarget::FleetHealth => {
                 let mut v = self.context_menu_items_for_fleet_health();
                 v.extend(self.context_menu_items_for_drive_queue_segment());
+                // #2374: fleet-level escalation cards (release-cordon /
+                // drive-queue sentinel rows) — empty when the fleet has none
+                // open, so this is a no-op append on the common case.
+                v.extend(self.context_menu_items_for_fleet_escalations());
                 v
             }
             // #1755 (DQ-3) / #1868 (Q-3): right-click on a Queue panel row.
@@ -6755,6 +6759,30 @@ impl CoordApp {
                     .unwrap_or(0);
                 if let Some((repo, issue)) = self.pipeline_menu_repo_issue(target) {
                     self.dispatch_decide_escalation(&repo, issue, index);
+                }
+                true
+            }
+            // #2374: the fleet-escalation status-bar strip's submenu
+            // children — same shape as `decide-escalation:<index>` above,
+            // except the `(repo, issue)` payload rides in the action id
+            // itself (`decide-fleet-escalation:<repo>#<issue>:<index>`)
+            // rather than `target`, since a right-click on the status bar is
+            // a single whole-bar `ContextMenuTarget::FleetHealth` with no
+            // per-row identity to recover it from (`escalation.rs`'s
+            // `fleet_escalation_key` doc comment).
+            _ if action_id.starts_with("decide-fleet-escalation:") => {
+                if let Some(rest) = action_id.strip_prefix("decide-fleet-escalation:") {
+                    if let Some((key, index_str)) = rest.rsplit_once(':') {
+                        let index: usize = index_str.parse().unwrap_or(0);
+                        self.dispatch_decide_fleet_escalation(key, index);
+                    }
+                }
+                true
+            }
+            // #2374: the fleet-escalation strip's "Dismiss escalation".
+            _ if action_id.starts_with("dismiss-fleet-escalation:") => {
+                if let Some(key) = action_id.strip_prefix("dismiss-fleet-escalation:") {
+                    self.dispatch_dismiss_fleet_escalation(key);
                 }
                 true
             }
