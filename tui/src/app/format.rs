@@ -33,16 +33,15 @@ pub(crate) fn fmt_elapsed(secs: u64) -> String {
 }
 
 /// #2397: classify a merge-queue block reason (`coord.merge_queue.plan()`'s
-/// per-entry `reason`, reaching the TUI as `PlannedMergeEntry.reason`) plus
-/// `merge.auto_drain` (`PlannedMergeEntry.auto_drain`) into the "should I be
-/// worried" affordance an operator reading a Pending Merge stage needs —
-/// today they have to run `coord merge --plan` by hand to get this
-/// (docs/MERGE_AUTO_DRAIN_TRUST_BAR.md; live incidents #2284/#2375).
+/// per-entry `reason`, reaching the TUI as `PlannedMergeEntry.reason`) into
+/// the "should I be worried" affordance an operator reading a Pending Merge
+/// stage needs — today they have to run `coord merge --plan` by hand to get
+/// this (docs/MERGE_AUTO_DRAIN_TRUST_BAR.md; live incidents #2284/#2375).
 ///
 /// Three buckets:
 /// - **in flight**: `reason` starts with `coord.merge_queue.CI_PENDING_PREFIX`
 ///   ("CI running:") — a check is executing *right now*; this resolves on
-///   its own with no human step and no dependency on `auto_drain`.
+///   its own with no human step.
 /// - **needs a person**: `reason` names a gate that no amount of retrying
 ///   clears by itself — an unapproved/rejected review, failed checks, or a
 ///   real merge conflict. Matched against the same wording
@@ -50,9 +49,24 @@ pub(crate) fn fmt_elapsed(secs: u64) -> String {
 ///   here as prose classification for *display* only — no gate re-evaluation
 ///   happens in Rust).
 /// - **waiting on `coord merge`**: everything else (typically a stale-but-
-///   green CI check, `CI_STALE_PREFIX`) — recoverable by a mere retry, so
-///   whether one happens on its own hinges entirely on `auto_drain`.
-pub(crate) fn merge_wait_affordance(reason: &str, auto_drain: bool) -> &'static str {
+///   green CI check, `CI_STALE_PREFIX`, or a stale/missing smoke verdict,
+///   `smoke_required`) — nothing retries this on its own, ever.
+///
+/// #2397 review fix: this deliberately does **not** take a `merge.auto_drain`
+/// flag. An earlier version of this function branched on `auto_drain` to
+/// render "auto-retry armed" for the waiting bucket, which was factually
+/// wrong: `serve_app._auto_drain_tick` restricts every retry it performs
+/// (including the #2197 stale-CI auto-rerun) to entries `coord.merge_queue
+/// .plan()` already marked `PLAN_READY` — a `PLAN_BLOCKED` entry (which is
+/// what every reason reaching this function represents; `reason` is `None`
+/// for READY entries and `fmt_merge_block_reason` never calls this then) is
+/// filtered out *before* `_auto_drain_tick` ever calls `process()` on it, so
+/// `auto_drain` being `true` changes nothing about whether a BLOCKED entry
+/// gets retried. It stays blocked until a human runs `coord merge` (or
+/// `coord merge --revalidate`) regardless of the flag. See
+/// `coord.serve_app._auto_drain_tick`'s docstring: "`BLOCKED`… entries are
+/// never touched."
+pub(crate) fn merge_wait_affordance(reason: &str) -> &'static str {
     const NEEDS_PERSON_MARKERS: [&str; 5] = [
         "CI failed:",
         "review not approved",
@@ -64,8 +78,6 @@ pub(crate) fn merge_wait_affordance(reason: &str, auto_drain: bool) -> &'static 
         "auto-retry in flight — CI re-checking now"
     } else if NEEDS_PERSON_MARKERS.iter().any(|m| reason.contains(m)) {
         "blocked — needs a person to resolve"
-    } else if auto_drain {
-        "auto-retry armed — will retry automatically (~30s)"
     } else {
         "waiting on a human — nothing retries until `coord merge` runs"
     }
@@ -76,9 +88,9 @@ pub(crate) fn merge_wait_affordance(reason: &str, auto_drain: bool) -> &'static 
 /// box's width — the affordance tag is the load-bearing part for the
 /// "should I be worried" read, so it's kept intact and the reason prose is
 /// trimmed instead. `None` in, `None` out (no plan entry / not blocked).
-pub(crate) fn fmt_merge_block_reason(reason: Option<&str>, auto_drain: bool) -> Option<String> {
+pub(crate) fn fmt_merge_block_reason(reason: Option<&str>) -> Option<String> {
     let reason = reason?;
-    let affordance = merge_wait_affordance(reason, auto_drain);
+    let affordance = merge_wait_affordance(reason);
     Some(format!("{} [{}]", trunc(reason, 80), affordance))
 }
 
