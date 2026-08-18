@@ -1242,6 +1242,28 @@ def _reassign(
     repo_path = machine.repo_path(failed.repo_name)
 
     retry_model = model if model is not None else failed.model
+    # #2383: `failed.model` can name a model an operator has since REMOVED
+    # from `models.escalation` (e.g. a run auto-escalated onto it before the
+    # ladder was edited) — inheriting it here forever, on every subsequent
+    # auto-reassign of the same lineage, would silently keep dispatching a
+    # model the current config no longer sanctions. Only the inherited
+    # (`model is None`) path needs this: an explicit caller-supplied `model`
+    # is a deliberate choice and passes through unclamped. And only a
+    # CLAUDE-family retry needs it — `models.escalation` is a claude-only
+    # concept (#2323's "the claude escalation ladder means nothing to
+    # another provider"), so an opencode/other-provider model like
+    # `opencode/glm-5.2` must never be walked onto the claude ladder just
+    # because it doesn't happen to appear on it.
+    if (
+        model is None
+        and resolved_provider_name == "claude"
+        and retry_model not in (*config.models.escalation, config.models.default)
+    ):
+        retry_model = (
+            config.models.escalation[-1]
+            if config.models.escalation
+            else config.models.default
+        )
     # The Assignment keeps the alias for legibility; the wire payload is
     # resolved through models.versions when an exact id is pinned.
     retry_model_wire = config.models.resolve(retry_model)
