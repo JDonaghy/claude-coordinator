@@ -45,6 +45,7 @@ from coord.reports import (
     csv_filename,
     detect_prior_activity,
     fetch_audit_window,
+    find_decision,
     fold_decisions,
     fold_drive_queue_status,
     fold_issue_activity,
@@ -1302,6 +1303,90 @@ class TestRunDecisions:
             title_lookup=title_lookup,
         )
         assert seen_keys == {("api", 1)}
+
+
+class TestFindDecision:
+    """`find_decision` (#2370) — the single-issue lookup `coord decide` calls
+    fresh every time instead of caching its own copy of "what the options
+    are". Same fold as `run_decisions`, minus the title lookup."""
+
+    def test_returns_none_when_nothing_is_pending(self) -> None:
+        assert find_decision(
+            "api", 7, now=1000.0,
+            escalations_fetch=lambda repo: [],
+            queue_fetch=lambda repo: [],
+        ) is None
+
+    def test_finds_the_escalation_card(self) -> None:
+        card = find_decision(
+            "api", 7, now=1000.0,
+            escalations_fetch=lambda repo: [_esc_row(7, repo="api", proposed_command="coord fix")],
+            queue_fetch=lambda repo: [],
+        )
+        assert card is not None
+        assert card["source"] == "escalation"
+        assert card["options"][0]["command_or_action"] == "coord fix"
+
+    def test_finds_the_queue_only_card(self) -> None:
+        rows = [
+            _dq_row(
+                55, repo="api", state_="blocked",
+                last_reason="something totally novel happened here",
+            )
+        ]
+        card = find_decision(
+            "api", 55, now=1000.0,
+            escalations_fetch=lambda repo: [],
+            queue_fetch=lambda repo: rows,
+        )
+        assert card is not None
+        assert card["source"] == "queue"
+
+    def test_returns_none_for_a_downstream_row_folded_into_another_card(self) -> None:
+        """A queue row that cascade-collapses into a root's `downstream` list
+        (#2283) gets no card of its own in the report — `find_decision` must
+        agree, not invent a standalone card the report would never show."""
+        rows = [
+            _dq_row(1, repo="api", state_="blocked", reason_at=100.0,
+                     last_reason=_ACCEPTANCE_DEAD_END_REASON),
+            _dq_row(
+                2, repo="api", state_="blocked", after_json=["api#1"],
+                last_reason=(
+                    "api#2's pre-req(s) (api#1) queued but blocked/failed "
+                    "— it will never satisfy"
+                ),
+            ),
+        ]
+        assert find_decision(
+            "api", 2, now=1000.0,
+            escalations_fetch=lambda repo: [],
+            queue_fetch=lambda repo: rows,
+        ) is None
+        # the root still resolves fine
+        root = find_decision(
+            "api", 1, now=1000.0,
+            escalations_fetch=lambda repo: [],
+            queue_fetch=lambda repo: rows,
+        )
+        assert root is not None
+        assert root["downstream"] == ["api#2"]
+
+    def test_queue_fetch_is_always_the_full_unfiltered_queue(self) -> None:
+        """Same #2183 reasoning `run_decisions` documents: an `after=` chain
+        can cross repos, so the queue fetch must never be scoped to `repo`
+        even though `find_decision` only wants one issue back."""
+        calls: list[str | None] = []
+
+        def queue_fetch(repo):
+            calls.append(repo)
+            return []
+
+        find_decision(
+            "api", 7, now=1000.0,
+            escalations_fetch=lambda repo: [],
+            queue_fetch=queue_fetch,
+        )
+        assert calls == [None]
 
 
 # ── registry + parameter validation ────────────────────────────────────────

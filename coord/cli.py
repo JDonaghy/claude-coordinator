@@ -130,6 +130,7 @@ from coord.commands.issues import (
     untrack,
 )
 from coord.commands.drive import (
+    decide,
     drive,
     drive_attach,
     drive_sessions,
@@ -462,6 +463,7 @@ main.add_command(drive_attach)
 main.add_command(drive_stop)
 main.add_command(drive_queue_group)
 main.add_command(escalate_group)
+main.add_command(decide)
 main.add_command(pr)
 main.add_command(fix)
 main.add_command(review)

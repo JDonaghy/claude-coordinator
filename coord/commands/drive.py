@@ -664,3 +664,109 @@ def escalate_run(repo: str, issue: int, dismiss: bool, config_path: Path) -> Non
     if dismiss:
         dismiss_drive_escalation(repo, issue)
     click.echo("done")
+
+
+# ── coord decide (#2370) ──────────────────────────────────────────────────
+#
+# `escalate run` above only ever executes ONE thing — the single
+# `proposed_command` a `drive_escalations` row carries — because that's all
+# that source has. The `decisions` report (#2369) folds a SECOND source in
+# too (drive-queue `blocked`/`failed` rows with no escalation record at
+# all) and renders 2-4 *options* per card, not one, with no "run it" path
+# for either source. `decide` generalizes `escalate run`'s one-key pattern
+# to both sources and to any option on the card, not just the recommended
+# one — it does NOT replace `escalate run`/`dismiss`/`list`, which keep
+# working exactly as before.
+
+
+@click.command("decide")
+@click.argument("repo")
+@click.argument("issue", type=int)
+@click.argument("option_index", type=int, required=False, default=None)
+@click.option(
+    "--dismiss/--no-dismiss", default=True,
+    help=(
+        "Clear the drive_escalations record after a zero exit, IF the chosen "
+        "option is that record's own proposed fix (default: yes). Has no "
+        "effect otherwise — there is no record to dismiss for a non-default "
+        "option or a drive-queue-only card; see the command's docstring."
+    ),
+)
+@_CONFIG_OPTION
+def decide(
+    repo: str,
+    issue: int,
+    option_index: int | None,
+    dismiss: bool,
+    config_path: Path,
+) -> None:
+    """Run one option from REPO ISSUE's `decisions` report card.
+
+    OPTION_INDEX is the 0-based index into that card's `options` list
+    (default: the card's `recommended` option). The row is looked up fresh
+    from `coord.reports.find_decision` every call — `decide` never re-derives
+    or caches its own copy of "what the options are"; it runs exactly the
+    `command_or_action` string the `decisions` report would show for that
+    slot, via the same `subprocess.run(command, shell=True)` primitive
+    `escalate run` uses.
+
+    Post-run bookkeeping differs by what the card is backed by:
+
+    \b
+    - A card folded from a `drive_escalations` row (#1505), when the chosen
+      option is that row's `proposed_command` (i.e. no OPTION_INDEX given,
+      or OPTION_INDEX 0): behaves exactly like `coord escalate run` —
+      dismiss the record on a zero exit (--dismiss/--no-dismiss).
+    - Anything else — a non-default option on an escalation card, or ANY
+      option on a drive-queue-only card (#2283/coord-portal#107, no
+      escalation record exists for these): there is nothing to dismiss.
+      `decide` echoes success/failure and stops; the card's own
+      reappearance-or-not on the next `coord report run decisions` is the
+      confirmation signal, not a second "resolved" state that could go
+      stale or lie.
+    """
+    from coord.reports import find_decision  # noqa: PLC0415
+    from coord.state import dismiss_drive_escalation  # noqa: PLC0415
+
+    card = find_decision(repo, issue)
+    if card is None:
+        raise click.ClickException(f"no decision on file for {repo} #{issue}")
+
+    options = card.get("options") or []
+    if not options:
+        raise click.ClickException(f"decision card for {repo} #{issue} has no options")
+
+    if option_index is None:
+        index = next(
+            (i for i, opt in enumerate(options) if opt.get("recommended")), 0
+        )
+    else:
+        index = option_index
+        if not 0 <= index < len(options):
+            raise click.ClickException(
+                f"option index {index} out of range for {repo} #{issue} "
+                f"— valid indices are 0..{len(options) - 1}"
+            )
+
+    selected = options[index]
+    command = str(selected.get("command_or_action") or "").strip()
+    if not command:
+        raise click.ClickException(f"option {index} for {repo} #{issue} has no command")
+
+    click.echo(f"running: {command}")
+    result = subprocess.run(command, shell=True)  # noqa: S602 — operator-approved, one-key by design
+    if result.returncode != 0:
+        raise click.ClickException(f"chosen command exited {result.returncode}")
+
+    is_escalation_default = card.get("source") == "escalation" and bool(
+        selected.get("recommended")
+    )
+    if is_escalation_default:
+        if dismiss:
+            dismiss_drive_escalation(repo, issue)
+        click.echo("done")
+    else:
+        click.echo(
+            "done (no escalation record to dismiss — rerun "
+            "`coord report run decisions` to confirm this card is gone)"
+        )

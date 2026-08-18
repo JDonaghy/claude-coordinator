@@ -79,6 +79,7 @@ __all__ = [
     "run_drive_queue_status",
     "fold_decisions",
     "run_decisions",
+    "find_decision",
     "resolve_usage_window",
     "fold_usage",
     "run_usage",
@@ -1600,6 +1601,48 @@ def run_decisions(
         result.rows = [r for r in result.rows if r["repo"] == repo]
     result.notes = _decisions_notes(result.rows)
     return result
+
+
+def find_decision(
+    repo: str,
+    issue: int,
+    *,
+    now: float | None = None,
+    escalations_fetch: Callable[[str | None], Sequence[Mapping[str, Any]]] | None = None,
+    queue_fetch: Callable[[str | None], Sequence[Mapping[str, Any]]] | None = None,
+) -> dict[str, Any] | None:
+    """Look up the single `decisions` card for ``repo``#``issue``, fresh,
+    every call — `coord decide` (#2370) is required to never re-derive or
+    cache its own copy of "what the options are", so it calls this instead
+    of hand-rolling a filtered fold.
+
+    Folds the SAME full envelope :func:`run_decisions` would (escalation
+    table + the FULL, unfiltered drive queue — an `after=` chain can cross
+    repos, so scoping the queue fetch to ``repo`` before the cascade
+    collapse would misdiagnose a cross-repo prereq, same #2183 reasoning
+    `run_decisions` documents) but skips the title lookup entirely: unlike
+    the report, `coord decide` never displays a title, so paying for
+    `_lookup_titles` — which `run_decisions` already has to run for every
+    OTHER repo's cards too, since it only learns which cards are "this
+    repo's" after folding the whole fleet — would be pure waste for a
+    single-issue call.
+
+    Returns ``None`` if ``repo``#``issue`` has no open decision: no
+    escalation record and no blocked/failed queue row, OR it exists as a
+    queue row but folds as a `downstream` entry into some OTHER root's card
+    (matching the report itself, which gives that row no card of its own —
+    see `fold_decisions`'s cascade-collapse docstring).
+    """
+    generated_at = time.time() if now is None else float(now)
+    esc_fn = _default_list_drive_escalations if escalations_fetch is None else escalations_fetch
+    queue_fn = _default_list_drive_queue if queue_fetch is None else queue_fetch
+    escalations = list(esc_fn(None) or [])
+    queue_entries = list(queue_fn(None) or [])
+    result = fold_decisions(escalations, queue_entries, generated_at, titles=None)
+    for row in result.rows:
+        if row["repo"] == repo and int(row["issue"]) == int(issue):
+            return row
+    return None
 
 
 # ── usage: the per-issue / per-repo cost + token rollup ────────────────────
