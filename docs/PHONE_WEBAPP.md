@@ -126,6 +126,12 @@ cd coord/dashboard/webapp && npm run build
 
 ---
 
+> **Repo split (#2004):** `coord/dashboard/webapp/**` is moving to its own
+> `coord-web` repo (epic #2002). The mechanism below is the answer for how a
+> built bundle reaches this daemon host both before and after that move —
+> see [`docs/ADR_COORD_WEB_DIST.md`](ADR_COORD_WEB_DIST.md) for the decision
+> and the rejected alternatives.
+
 ## Going live automatically (#1543): merged main, not release cadence
 
 **On dellserver in production, a merged `coord/dashboard/webapp/**` change

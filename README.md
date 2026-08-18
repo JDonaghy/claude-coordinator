@@ -466,6 +466,8 @@ after publication.
   overnight drives.
 - [`docs/PHONE_WEBAPP.md`](docs/PHONE_WEBAPP.md) — build and serve the phone control-center PWA
   over Tailscale.
+- [`docs/ADR_COORD_WEB_DIST.md`](docs/ADR_COORD_WEB_DIST.md) — how a built `coord-web` bundle
+  reaches the daemon host, and the alternatives rejected.
 - [`docs/AGENT_OPERATIONS.md`](docs/AGENT_OPERATIONS.md) — agent install, upgrade, and
   releasing to PyPI.
 - [`docs/OPERATING_GOTCHAS.md`](docs/OPERATING_GOTCHAS.md) — traps that cost a real dispatch or
