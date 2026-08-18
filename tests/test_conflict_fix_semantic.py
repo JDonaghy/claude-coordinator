@@ -463,7 +463,7 @@ def _patched_dispatch(client: _FakeClient):
 class TestConfigFlag:
     def test_defaults_off(self) -> None:
         assert PipelineConfig().escalate_semantic_conflicts is False
-        assert PipelineConfig().semantic_conflict_model == "fable"
+        assert PipelineConfig().semantic_conflict_model == "opus"
 
     def test_parsed_from_yaml(self, tmp_path) -> None:
         from coord.config import load
