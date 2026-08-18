@@ -33292,6 +33292,25 @@ Milestone tracking issue.
         );
     }
 
+    /// The epic row's screen needle for the two chevron driver tests below.
+    ///
+    /// #2284 made a bare `"#100"` AMBIGUOUS on a Pipeline screen: a click on
+    /// an issue row now also opens that issue in the Pipeline panel's own
+    /// document-tab strip, whose label (`[∘ #100 Epic tracker ×]`) paints on
+    /// the FIRST row of the main panel — above the sidebar row these tests
+    /// mean. `TuiDriver::find` scans row-major and returns the FIRST match, so
+    /// from the first row click onward a bare `find("#100")` resolves to the
+    /// TAB, and every "does this row paint a chevron?" assertion silently
+    /// retargets a strip row that has no chevron to paint.
+    ///
+    /// The sidebar pads issue numbers to `#{:<5}`, so its row is the only
+    /// place `#100` is followed by TWO spaces — the same single-vs-double
+    /// space discriminator #2282's own Board doc-tab driver tests use to tell
+    /// a tab label from the sidebar row it was opened from. Anchoring on it
+    /// keeps `find`'s x unchanged (the needle still starts at the `#`), so the
+    /// chevron-hit arithmetic below is unaffected.
+    const EPIC_SIDEBAR_ROW: &str = "#100  ";
+
     /// #1197 (smoke-test follow-up): an epic row is INDEPENDENTLY collapsible.
     ///
     /// The first cut nested children correctly but gave the epic row no
@@ -33314,7 +33333,7 @@ Milestone tracking issue.
         // child #101.
         let screen = driver.screen();
         let epic_pos = driver
-            .find("#100")
+            .find(EPIC_SIDEBAR_ROW)
             .expect(&format!("epic #100 row must render:\n{screen}"));
         assert!(
             driver.screen_contains("#101"),
@@ -33347,7 +33366,7 @@ Milestone tracking issue.
         );
         // The whole point: collapsing the EPIC is not collapsing the MILESTONE.
         assert!(
-            driver.screen_contains("#100"),
+            driver.screen_contains(EPIC_SIDEBAR_ROW),
             "the epic row itself must stay visible when collapsed:\n{screen}",
         );
         assert!(
@@ -33359,7 +33378,7 @@ Milestone tracking issue.
             "the milestone header must stay visible:\n{screen}",
         );
         let epic_pos = driver
-            .find("#100")
+            .find(EPIC_SIDEBAR_ROW)
             .expect(&format!("epic #100 row must still render:\n{screen}"));
         let epic_line = screen
             .lines()
@@ -33388,8 +33407,15 @@ Milestone tracking issue.
         // is inert (it selects, it does not toggle) — asserted below — while
         // being far enough away in x that the fold can never happen whatever
         // the elapsed time.
+        //
+        // #2284: "inert" means inert *for the collapse state*. That reset
+        // click is a genuine row SELECTION, so it now also opens #100 in the
+        // Pipeline's own doc-tab strip (`[∘ #100 Epic tracker ×]`, painted on
+        // the main panel's first row) — which is exactly why every `#100`
+        // lookup here anchors on `EPIC_SIDEBAR_ROW` rather than a bare
+        // `"#100"`. The expand state is untouched by it, as asserted below.
         let epic_pos = driver
-            .find("#100")
+            .find(EPIC_SIDEBAR_ROW)
             .expect(&format!("epic #100 row must still render:\n{screen}"));
         let chevron_x = epic_pos.0 - 1.0;
         let reset_x = epic_pos.0 + 5.0;
@@ -33421,7 +33447,7 @@ Milestone tracking issue.
             .lines()
             .nth(
                 driver
-                    .find("#100")
+                    .find(EPIC_SIDEBAR_ROW)
                     .expect(&format!("epic #100 row must still render:\n{screen}"))
                     .1 as usize,
             )
@@ -33459,7 +33485,7 @@ Milestone tracking issue.
             "a stored collapsed choice must hide the epic's children:\n{screen}",
         );
         let epic_pos = driver
-            .find("#100")
+            .find(EPIC_SIDEBAR_ROW)
             .expect(&format!("epic #100 row must render:\n{screen}"));
         let epic_line = screen
             .lines()
@@ -33487,7 +33513,7 @@ Milestone tracking issue.
             "the Done child stays filtered out by #1281 after expand:\n{screen}",
         );
         let epic_pos = driver
-            .find("#100")
+            .find(EPIC_SIDEBAR_ROW)
             .expect(&format!("epic #100 row must still render:\n{screen}"));
         let epic_line = screen
             .lines()
