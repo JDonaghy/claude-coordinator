@@ -1277,7 +1277,11 @@ pub(crate) struct PlannedMergeEntry {
     pub(crate) assignment_id: String,
     pub(crate) repo_name: String,
     pub(crate) repo_github: String,
-    #[allow(dead_code)]
+    /// #2397: worker branch — the merge queue dedups by this (not
+    /// `assignment_id`), so it's the precise key for the #1084 prereq
+    /// track's Merge-stage lookup (`merge_plan_block_reason_for_branch`),
+    /// which can't use `issue_number` alone (a shared tracking issue can
+    /// carry both Gate A's and a member issue's JIT queue entry).
     pub(crate) branch: String,
     pub(crate) target_branch: String,
     pub(crate) issue_number: u64,
@@ -1315,6 +1319,15 @@ pub(crate) struct PlannedMergeEntry {
     /// open yet, or the CI store has no checks recorded for this PR.
     #[serde(default)]
     pub(crate) ci_summary: Option<PlannedMergeCiSummary>,
+    /// #2397: mirrors `merge.auto_drain` (the config flag gating the
+    /// daemon's background auto-retry tick) at the moment this plan was
+    /// built — `false` (matching the config default) when an older daemon
+    /// doesn't send it yet. Lets the Merge stage box distinguish "nothing
+    /// retries until a human runs `coord merge`" from "an automatic retry
+    /// is already in flight" (`format::merge_wait_affordance`) instead of
+    /// rendering a blocked entry identically either way.
+    #[serde(default)]
+    pub(crate) auto_drain: bool,
 }
 
 /// Structured CI check rollup for one PR, deserialized from the `ci_summary`

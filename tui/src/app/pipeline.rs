@@ -247,6 +247,15 @@ pub(crate) struct FixPreflightTarget {
 pub(crate) struct PrereqStage {
     pub(crate) status: StageStatus,
     pub(crate) since: Option<f64>,
+    /// #2397: the merge-queue's own computed block reason
+    /// (`coord.merge_queue.plan()`'s per-entry `reason`, joined against the
+    /// board's `merge_plan`) plus the `auto_drain`-aware affordance
+    /// (`format::fmt_merge_block_reason`) — set only on the Merge stage
+    /// while it's `Pending` behind a settled Review, and only when a plan
+    /// entry actually exists (a PR/branch is queued). `None` for every
+    /// other stage, and for Merge before a plan entry exists — callers keep
+    /// falling back to the bare "waiting Xm Ys" clock in that case.
+    pub(crate) block_reason: Option<String>,
 }
 
 /// Resolved Author→Test→Review→Merge status for one oracle-loop pre-req
@@ -5109,6 +5118,48 @@ impl CoordApp {
         }
     }
 
+    /// #2397: the merge-queue's own computed block reason for a Pending
+    /// Merge stage, resolved against the live-computed `data.merge_plan`
+    /// (`coord.merge_queue.plan()`, #776) and formatted with the
+    /// `auto_drain`-aware affordance (`format::fmt_merge_block_reason`).
+    /// `None` when the daemon hasn't sent a `merge_plan` (pre-#776 daemon,
+    /// or local-SQLite mode) or no entry matches — callers already have a
+    /// bare-clock fallback for that case.
+    fn merge_plan_block_reason(entry: Option<&PlannedMergeEntry>) -> Option<String> {
+        let entry = entry?;
+        fmt_merge_block_reason(entry.reason.as_deref(), entry.auto_drain)
+    }
+
+    /// Branch-keyed lookup for the #1084 prereq track (Gate A / Acceptance
+    /// Authoring): the merge queue dedups by branch, and a shared tracking
+    /// issue can carry BOTH Gate A's and a member issue's JIT test-author
+    /// queue entries — an `issue_number`-keyed match (as
+    /// [`Self::merge_plan_block_reason_for_issue`] uses for the ordinary
+    /// Work track) would ambiguously match either one. Mirrors the raw
+    /// `merge_queue` branch lookup `prereq_pipeline_status_from` already
+    /// does for `state`, but against `merge_plan` so `reason` is available.
+    pub(crate) fn merge_plan_block_reason_for_branch(&self, repo_slug: &str, branch: &str) -> Option<String> {
+        Self::merge_plan_block_reason(
+            self.data
+                .merge_plan
+                .iter()
+                .find(|e| e.repo_github == repo_slug && e.branch == branch),
+        )
+    }
+
+    /// Issue-number-keyed lookup for the ordinary Work→Test→Review→Merge
+    /// track, mirroring `merge_stage_status_for_local`'s own `merge_queue`
+    /// lookup (safe here since a member issue's own Merge stage has exactly
+    /// one queue entry, unlike the shared-tracking-issue prereq case above).
+    pub(crate) fn merge_plan_block_reason_for_issue(&self, repo_slug: &str, issue_number: u64) -> Option<String> {
+        Self::merge_plan_block_reason(
+            self.data
+                .merge_plan
+                .iter()
+                .find(|e| e.repo_github == repo_slug && e.issue_number == issue_number),
+        )
+    }
+
     /// True when *entry*'s PR has a fetched CI summary with failing checks.
     /// Looks up `pipeline_ci_checks` by `(repo_github, pr_number)`; returns
     /// false when the entry has no PR yet or no summary has been fetched.
@@ -5320,10 +5371,10 @@ impl CoordApp {
             return PrereqPipelineStatus {
                 author_id: None,
                 stages: [
-                    PrereqStage { status: StageStatus::Pending, since: None },
-                    PrereqStage { status: StageStatus::Pending, since: None },
-                    PrereqStage { status: StageStatus::Pending, since: None },
-                    PrereqStage { status: StageStatus::Pending, since: None },
+                    PrereqStage { status: StageStatus::Pending, since: None, block_reason: None },
+                    PrereqStage { status: StageStatus::Pending, since: None, block_reason: None },
+                    PrereqStage { status: StageStatus::Pending, since: None, block_reason: None },
+                    PrereqStage { status: StageStatus::Pending, since: None, block_reason: None },
                 ],
             };
         };
@@ -5435,8 +5486,8 @@ impl CoordApp {
         // `merge_stage_status_for_local` uses for the normal Work track)
         // would ambiguously match BOTH Gate A's and test-author's queue
         // entries once both exist under the same tracking issue.
-        let (merge_status, merge_since) = if review_status != StageStatus::Done {
-            (StageStatus::Pending, None)
+        let (merge_status, merge_since, merge_block_reason) = if review_status != StageStatus::Done {
+            (StageStatus::Pending, None, None)
         } else if author.status == "merged" {
             // #1589: `coord reconcile-merges` prunes the `merge_queue` entry
             // once a branch lands (coord/reconcile.py) — the very entry the
@@ -5453,10 +5504,14 @@ impl CoordApp {
             // the normal Work track (#775: a `status="merged"` assignment is
             // sufficient evidence even with no surviving queue entry) — that
             // fallback just never got extended to this prereq-pipeline path.
-            (StageStatus::Done, None)
+            (StageStatus::Done, None, None)
         } else {
             match author.branch.as_deref() {
-                None => (StageStatus::Pending, review_since.or(review.and_then(|r| r.finished_at))),
+                None => (
+                    StageStatus::Pending,
+                    review_since.or(review.and_then(|r| r.finished_at)),
+                    None,
+                ),
                 Some(branch) => {
                     let entry = self
                         .data
@@ -5464,12 +5519,17 @@ impl CoordApp {
                         .iter()
                         .find(|m| m.repo_github == repo_slug && m.branch.as_deref() == Some(branch));
                     match entry.map(|e| e.state.as_str()) {
-                        Some("merged") => (StageStatus::Done, None),
-                        Some("open") | Some("queued") => (StageStatus::Active, None),
-                        Some("failed") | Some("human_required") => (StageStatus::Failed, None),
+                        Some("merged") => (StageStatus::Done, None, None),
+                        Some("open") | Some("queued") => (StageStatus::Active, None, None),
+                        Some("failed") | Some("human_required") => (StageStatus::Failed, None, None),
                         _ => (
                             StageStatus::Pending,
                             review_since.or(review.and_then(|r| r.finished_at)),
+                            // #2397: prefer the live-computed `merge_plan`
+                            // (carries `reason` + `auto_drain`) over the raw
+                            // `merge_queue` row matched above, which is only
+                            // used here for its coarse `state`.
+                            self.merge_plan_block_reason_for_branch(repo_slug, branch),
                         ),
                     }
                 }
@@ -5479,10 +5539,10 @@ impl CoordApp {
         PrereqPipelineStatus {
             author_id: Some(author.id.clone()),
             stages: [
-                PrereqStage { status: author_status, since: author_since },
-                PrereqStage { status: test_status, since: test_since },
-                PrereqStage { status: review_status, since: review_since },
-                PrereqStage { status: merge_status, since: merge_since },
+                PrereqStage { status: author_status, since: author_since, block_reason: None },
+                PrereqStage { status: test_status, since: test_since, block_reason: None },
+                PrereqStage { status: review_status, since: review_since, block_reason: None },
+                PrereqStage { status: merge_status, since: merge_since, block_reason: merge_block_reason },
             ],
         }
     }
@@ -5876,8 +5936,23 @@ impl CoordApp {
                                 .map(|d| d.as_secs_f64())
                                 .unwrap_or(dispatched_f);
                             let elapsed = (now_secs - dispatched_f).max(0.0) as u64;
-                            label = format!("{}\n{}", label, fmt_elapsed_mmss(elapsed));
+                            label = format!("{}\n{}", label, fmt_elapsed(elapsed));
                         }
+                    }
+                }
+                // #2397: surface the merge-queue's own computed block reason
+                // on a Pending Merge box — previously this rendered as a bare
+                // "Merge — pending" with zero signal for why, unlike the
+                // Active branch above which at least shows elapsed time.
+                // Self-guarding: `merge_plan_block_reason_for_issue` returns
+                // `None` when no plan entry exists yet (no PR queued), which
+                // is also true whenever "pending" just means "hasn't reached
+                // Merge yet" rather than "blocked".
+                if name == "merge" && status == StageStatus::Pending {
+                    if let Some(reason) =
+                        self.merge_plan_block_reason_for_issue(&issue.repo_slug, issue.number)
+                    {
+                        label = format!("{}\n{}", label, reason);
                     }
                 }
                 // Skipped counts as "settled" for prior_all_done: a closed-issue

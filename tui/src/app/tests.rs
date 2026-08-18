@@ -247,6 +247,118 @@
         assert_eq!(fmt_dur(3661), "1h1m");
     }
 
+    // ── fmt_elapsed (#2397) ──────────────────────────────────────────────────
+    //
+    // The bug this replaced: `fmt_elapsed_mmss` rendered both the < 1h and
+    // >= 1h regimes as the same bare `N:NN` shape ("2:22" under an hour,
+    // "2:22" meaning 2h22m at/above it) — no unit, so the two magnitudes
+    // were indistinguishable at a glance. Every case below pins that a
+    // sub-hour and an hour-plus value can never collide on the same string.
+
+    #[test]
+    fn fmt_elapsed_under_a_minute() {
+        assert_eq!(fmt_elapsed(5), "0m05s");
+    }
+
+    #[test]
+    fn fmt_elapsed_minutes_and_seconds() {
+        // The live incident's literal example: 2m22s, not the ambiguous "2:22".
+        assert_eq!(fmt_elapsed(142), "2m22s");
+    }
+
+    #[test]
+    fn fmt_elapsed_just_under_an_hour() {
+        assert_eq!(fmt_elapsed(3599), "59m59s");
+    }
+
+    #[test]
+    fn fmt_elapsed_exactly_one_hour() {
+        assert_eq!(fmt_elapsed(3600), "1h00m");
+    }
+
+    #[test]
+    fn fmt_elapsed_hours_and_minutes() {
+        // 2h22m — visibly distinct from the 2m22s case above; #2397's
+        // "2:22 could mean either" ambiguity is gone.
+        assert_eq!(fmt_elapsed(8520), "2h22m");
+    }
+
+    #[test]
+    fn fmt_elapsed_sub_hour_and_hour_plus_never_collide() {
+        // Direct pin of the acceptance criterion: one >=3600s case and one
+        // <3600s case must render with visibly different units.
+        let short = fmt_elapsed(142); // 2m22s
+        let long = fmt_elapsed(8520); // 2h22m
+        assert_ne!(short, long);
+        assert!(short.contains('m') && short.contains('s') && !short.contains('h'));
+        assert!(long.contains('h') && long.contains('m') && !long.contains('s'));
+    }
+
+    // ── merge_wait_affordance / fmt_merge_block_reason (#2397) ───────────────
+
+    #[test]
+    fn merge_wait_affordance_ci_running_is_in_flight_regardless_of_auto_drain() {
+        let msg = merge_wait_affordance("CI running: build, test", false);
+        assert!(msg.contains("in flight"), "got: {msg}");
+        let msg_on = merge_wait_affordance("CI running: build, test", true);
+        assert!(msg_on.contains("in flight"), "got: {msg_on}");
+    }
+
+    #[test]
+    fn merge_wait_affordance_checks_stale_needs_human_when_auto_drain_off() {
+        // The live #2284 incident: `merge.auto_drain: false` + a real
+        // `checks_stale` gate meant nothing was coming on its own.
+        let msg = merge_wait_affordance(
+            "CI stale: checks predate the current base — re-run CI",
+            false,
+        );
+        assert!(msg.contains("human"), "got: {msg}");
+        assert!(msg.contains("coord merge"), "got: {msg}");
+    }
+
+    #[test]
+    fn merge_wait_affordance_checks_stale_auto_retries_when_auto_drain_on() {
+        let msg = merge_wait_affordance(
+            "CI stale: checks predate the current base — re-run CI",
+            true,
+        );
+        assert!(msg.contains("auto-retry"), "got: {msg}");
+        assert!(!msg.contains("human"), "got: {msg}");
+    }
+
+    #[test]
+    fn merge_wait_affordance_review_required_needs_a_person() {
+        let msg = merge_wait_affordance("review not approved", true);
+        assert!(msg.contains("needs a person"), "got: {msg}");
+    }
+
+    #[test]
+    fn merge_wait_affordance_checks_failed_needs_a_person() {
+        let msg = merge_wait_affordance("CI failed: build (failure)", false);
+        assert!(msg.contains("needs a person"), "got: {msg}");
+    }
+
+    #[test]
+    fn merge_wait_affordance_conflict_needs_a_person() {
+        let msg = merge_wait_affordance(
+            "merge conflict: PR #12 does not merge into main",
+            true,
+        );
+        assert!(msg.contains("needs a person"), "got: {msg}");
+    }
+
+    #[test]
+    fn fmt_merge_block_reason_none_when_no_reason() {
+        assert_eq!(fmt_merge_block_reason(None, false), None);
+    }
+
+    #[test]
+    fn fmt_merge_block_reason_includes_reason_and_affordance() {
+        let out = fmt_merge_block_reason(Some("review not approved"), false).unwrap();
+        assert!(out.contains("review not approved"), "got: {out}");
+        assert!(out.contains("needs a person"), "got: {out}");
+    }
+
     // ── trunc ──────────────────────────────────────────────────────────────────
 
     #[test]
@@ -7652,6 +7764,40 @@
         app
     }
 
+    /// #2397: build a `merge_plan` entry keyed by an explicit branch — the
+    /// #777 `planned_entry` factory further below auto-derives its branch
+    /// from `issue_number`, which doesn't fit the prereq track's tests
+    /// (whose branch is the mock-author/test-author assignment's own
+    /// branch, independent of the tracking issue number).
+    fn planned_merge_entry_for_test(
+        assignment_id: &str,
+        repo_github: &str,
+        branch: &str,
+        issue_number: u64,
+        reason: &str,
+        auto_drain: bool,
+    ) -> PlannedMergeEntry {
+        PlannedMergeEntry {
+            assignment_id: assignment_id.to_string(),
+            repo_name: "api".to_string(),
+            repo_github: repo_github.to_string(),
+            branch: branch.to_string(),
+            target_branch: "main".to_string(),
+            issue_number,
+            issue_title: "t".to_string(),
+            rank: 1,
+            size: None,
+            status: "BLOCKED".to_string(),
+            reason: Some(reason.to_string()),
+            enqueued_at: None,
+            last_attempt: None,
+            milestone: None,
+            pr_number: Some(9),
+            ci_summary: None,
+            auto_drain,
+        }
+    }
+
     #[test]
     fn gate_a_prereq_status_pending_when_never_dispatched() {
         let app = make_pipeline_app_for_prereq_test();
@@ -7763,6 +7909,127 @@
         assert_eq!(status.stages[1].status, StageStatus::Done);
         assert_eq!(status.stages[2].status, StageStatus::Done);
         assert_eq!(status.stages[3].status, StageStatus::Done);
+    }
+
+    /// #2397: a Pending Merge stage — review settled, but the branch is
+    /// blocked in the live-computed `merge_plan` — must carry the
+    /// merge-queue's own computed block reason, not just a bare `since`
+    /// clock. No raw `merge_queue` row exists for this branch (mirrors a
+    /// pre-#776 daemon / an entry not yet in the legacy table); the plan
+    /// entry alone is what the fix should pick up.
+    #[test]
+    fn gate_a_prereq_status_merge_pending_carries_merge_plan_block_reason() {
+        let mut app = make_pipeline_app_for_prereq_test();
+        let mut author = _stage_assignment("mock1", "mock-author", 100.0, "done");
+        author.issue_number = 751;
+        author.finished_at = Some(160.0);
+        author.test_state = Some("passed".to_string());
+        author.branch = Some("ms-9-gate-a".to_string());
+        app.data.assignments.push(author);
+
+        let mut review = _stage_assignment("rev1", "review", 200.0, "done");
+        review.issue_number = 751;
+        review.review_of_assignment_id = Some("mock1".to_string());
+        review.review_verdict = Some("approve".to_string());
+        app.data.assignments.push(review);
+
+        app.data.merge_plan.push(planned_merge_entry_for_test(
+            "mock1",
+            "acme/api",
+            "ms-9-gate-a",
+            751,
+            "CI stale: checks predate the current base — re-run CI (`coord merge --revalidate`) before merging",
+            false, // merge.auto_drain: false — the live #2284 incident's config
+        ));
+
+        let epic = &app.pipeline_issues[0];
+        let status = app.gate_a_prereq_status(epic);
+        assert_eq!(status.stages[3].status, StageStatus::Pending);
+        let reason = status.stages[3]
+            .block_reason
+            .as_deref()
+            .expect("Pending Merge stage with a matching merge_plan entry must carry a block_reason");
+        assert!(reason.contains("CI stale"), "got: {reason}");
+        assert!(
+            reason.contains("human") && reason.contains("coord merge"),
+            "auto_drain:false must read as \"waiting on a human\", got: {reason}"
+        );
+    }
+
+    /// Same setup, but `merge.auto_drain: true` — the affordance must flip
+    /// to "auto-retry", not "waiting on a human", for the identical reason.
+    #[test]
+    fn gate_a_prereq_status_merge_pending_auto_drain_on_reads_as_auto_retry() {
+        let mut app = make_pipeline_app_for_prereq_test();
+        let mut author = _stage_assignment("mock1", "mock-author", 100.0, "done");
+        author.issue_number = 751;
+        author.finished_at = Some(160.0);
+        author.test_state = Some("passed".to_string());
+        author.branch = Some("ms-9-gate-a".to_string());
+        app.data.assignments.push(author);
+
+        let mut review = _stage_assignment("rev1", "review", 200.0, "done");
+        review.issue_number = 751;
+        review.review_of_assignment_id = Some("mock1".to_string());
+        review.review_verdict = Some("approve".to_string());
+        app.data.assignments.push(review);
+
+        app.data.merge_plan.push(planned_merge_entry_for_test(
+            "mock1",
+            "acme/api",
+            "ms-9-gate-a",
+            751,
+            "CI stale: checks predate the current base — re-run CI (`coord merge --revalidate`) before merging",
+            true,
+        ));
+
+        let epic = &app.pipeline_issues[0];
+        let status = app.gate_a_prereq_status(epic);
+        let reason = status.stages[3].block_reason.as_deref().expect("block_reason set");
+        assert!(reason.contains("auto-retry"), "got: {reason}");
+        assert!(!reason.contains("human"), "got: {reason}");
+    }
+
+    /// The Merge row's rendered guidance-panel value (what the operator
+    /// actually sees) must embed the block reason alongside the elapsed
+    /// clock — the literal live-incident symptom was "pending — waiting
+    /// 2:22" with zero indication of *why*.
+    #[test]
+    fn gate_a_prereq_guidance_rows_merge_row_shows_block_reason() {
+        let mut app = make_pipeline_app_for_prereq_test();
+        let mut author = _stage_assignment("mock1", "mock-author", 100.0, "done");
+        author.issue_number = 751;
+        author.finished_at = Some(160.0);
+        author.test_state = Some("passed".to_string());
+        author.branch = Some("ms-9-gate-a".to_string());
+        app.data.assignments.push(author);
+
+        let mut review = _stage_assignment("rev1", "review", 200.0, "done");
+        review.issue_number = 751;
+        review.review_of_assignment_id = Some("mock1".to_string());
+        review.review_verdict = Some("approve".to_string());
+        app.data.assignments.push(review);
+
+        app.data.merge_plan.push(planned_merge_entry_for_test(
+            "mock1",
+            "acme/api",
+            "ms-9-gate-a",
+            751,
+            "review not approved",
+            false,
+        ));
+
+        let epic = &app.pipeline_issues[0];
+        let mut items = Vec::new();
+        app.append_gate_a_prereq_guidance_rows(&mut items, epic);
+        let merge_row = items
+            .iter()
+            .find(|i| i.text.spans[0].text.trim() == "Merge")
+            .expect("Merge row rendered");
+        let value = &merge_row.text.spans[1].text;
+        assert!(value.contains("waiting"), "got: {value}");
+        assert!(value.contains("review not approved"), "got: {value}");
+        assert!(value.contains("needs a person"), "got: {value}");
     }
 
     #[test]
@@ -11601,6 +11868,38 @@
         assert!(view.stages[2].action.is_none(), "merge is read-only — dispatched solely from the Merge Queue panel");
     }
 
+    /// #2397: the ordinary Work→Review→Merge track's Pending Merge box must
+    /// also surface the merge-queue's own computed block reason (the
+    /// #1084 prereq track isn't the only place this gap showed up) — driven
+    /// by `data.merge_plan` (the #776 live-computed plan), not the raw
+    /// `merge_queue` table, so a daemon that hasn't landed a `merge_queue`
+    /// row yet still shows the reason.
+    #[test]
+    fn build_pipeline_widget_merge_pending_shows_merge_plan_block_reason() {
+        let mut app = make_pipeline_app();
+        app.data.assignments.push(_stage_assignment("w1", "work", 1.0, "done"));
+        app.data.assignments.push(_stage_assignment("r1", "review", 3.0, "done"));
+        app.data.merge_plan.push(planned_entry(
+            "w1",
+            "api",
+            "acme/api",
+            "main",
+            42,
+            "Add cool thing",
+            1,
+            None,
+            "BLOCKED",
+            Some("review not approved"),
+        ));
+
+        let view = app.build_pipeline_widget().unwrap();
+        assert_eq!(view.stages[2].status, StageStatus::Pending);
+        let label = &view.stages[2].label;
+        assert!(label.starts_with("Merge\n"), "got: {label}");
+        assert!(label.contains("review not approved"), "got: {label}");
+        assert!(label.contains("needs a person"), "got: {label}");
+    }
+
     /// A `merged` row in merge_queue makes the Merge stage Done.
     #[test]
     fn merge_stage_status_done_from_merge_queue() {
@@ -11723,6 +12022,7 @@
             milestone: None,
             pr_number: Some(pr_number),
             ci_summary: Some(ci),
+            auto_drain: false,
         }
     }
 
@@ -27244,6 +27544,7 @@
             milestone: None,
             pr_number: None,
             ci_summary: None,
+            auto_drain: false,
         }
     }
 

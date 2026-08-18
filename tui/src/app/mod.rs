@@ -1253,7 +1253,7 @@ fn elapsed_since_now(since: f64) -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(since);
-    fmt_elapsed_mmss((now_secs - since).max(0.0) as u64)
+    fmt_elapsed((now_secs - since).max(0.0) as u64)
 }
 
 // ─── Activity log parsing ─────────────────────────────────────────────────────
