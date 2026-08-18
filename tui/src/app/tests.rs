@@ -48141,6 +48141,70 @@ Milestone tracking issue.
         );
     }
 
+    /// The review-flagged hit-test trap: an issue TITLE that itself contains
+    /// the close glyph ("Fix 2×2 grid layout"). The tab label embeds the
+    /// title verbatim, so the strip paints TWO `×` for that tab — one in the
+    /// body, one appended close glyph. A first-match column scan would route
+    /// a click on the title's `×` to Close; the contract says only the
+    /// trailing glyph closes, everything else is body → activate.
+    #[test]
+    fn a_close_char_inside_a_title_never_hijacks_the_close_hit_test() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        const GLYPH_TITLE_JSON: &str = r#"{
+          "issues": [
+            {"repo_name": "claude-coordinator", "number": 101, "title": "Fix login race timeout", "state": "open", "labels": ["coord"]},
+            {"repo_name": "claude-coordinator", "number": 104, "title": "Fix 2×2 grid layout", "state": "open", "labels": ["coord"]}
+          ]
+        }"#;
+
+        let mut app = doc_tab_app(GLYPH_TITLE_JSON);
+        // #104 first, then #101: the ×-titled tab is open but INACTIVE, so a
+        // body click on it has an observable effect (activation).
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 104), true);
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 101), true);
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        driver.set_double_click_folding(false);
+        driver.render();
+
+        // The truncated tab label — "#104 Fix 2×2 grid l…" — is unique to the
+        // strip (the sidebar row shows the untruncated title).
+        let tab = driver
+            .find_bounds("#104 Fix 2×2 grid l…")
+            .unwrap_or_else(|| panic!("#104's tab must be painted:\n{}", driver.screen()));
+        // The title's `×` sits at char offset 10 of that needle ("#104 Fix 2×2").
+        driver.click(tab.x + 10.5, tab.y + 0.5);
+        driver.render();
+
+        assert!(
+            driver.screen_contains("#104 Fix 2×2 grid l…"),
+            "#2283 §4: a click on the TITLE's `×` is a body click — the tab \
+             must survive:\n{}",
+            driver.screen()
+        );
+        assert!(
+            driver.screen_contains("[#104 "),
+            "…and, being a body click, it ACTIVATES the tab:\n{}",
+            driver.screen()
+        );
+
+        // The trailing glyph is still the close control: clicking it closes.
+        let (close, _) = tab_cells(&driver, 104, "Fix 2×2 grid l…");
+        driver.click(close.0, close.1);
+        driver.render();
+
+        assert!(
+            !driver.screen_contains("#104 Fix 2×2 grid l…"),
+            "#2283 §4: the appended `×` still closes the tab:\n{}",
+            driver.screen()
+        );
+        assert!(
+            driver.screen_contains("#101 Fix login race…"),
+            "…leaving the neighbour open:\n{}",
+            driver.screen()
+        );
+    }
+
     /// §4 — middle-click closes a tab from anywhere on it, including the
     /// body columns where a LEFT click would merely activate. Driven at the
     /// body coordinate on purpose: middle-click on the `×` would pass even

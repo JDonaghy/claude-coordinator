@@ -352,8 +352,20 @@ pub(crate) fn doc_tab_label(
 /// `every_label_carries_the_close_glyph` below). Used by the click
 /// hit-test ([`resolve_doc_tab_click`]) to tell a click on the `×` from a
 /// click on the rest of the tab.
+///
+/// The **last** occurrence is the close glyph, never the first:
+/// [`doc_tab_label`] embeds the issue title verbatim (modulo truncation), so
+/// a title like "Fix 2×2 grid" puts a `×` in the label's *body*. The glyph
+/// [`doc_tab_label`] appends is always to the right of every title char
+/// (only `]` and the separator space follow it), so scanning from the end
+/// finds it unambiguously.
 pub(crate) fn doc_tab_close_col(label: &str) -> Option<usize> {
-    label.chars().position(|c| c == quadraui::tui::TAB_CLOSE_CHAR)
+    let total = label.chars().count();
+    label
+        .chars()
+        .rev()
+        .position(|c| c == quadraui::tui::TAB_CLOSE_CHAR)
+        .map(|from_end| total - 1 - from_end)
 }
 
 /// Which part of a tab a resolved click landed on — contract §4's
@@ -609,6 +621,30 @@ mod tests {
         // "#101 Fix login race… × " — 20-column base + a space, so × sits at
         // char index 21.
         assert_eq!(doc_tab_close_col(&label), Some(21));
+    }
+
+    #[test]
+    fn doc_tab_close_col_skips_a_close_char_inside_the_title() {
+        // The title itself contains `×` ("2×2"), which lands in the rendered
+        // label verbatim. The close glyph is the LAST occurrence — the one
+        // doc_tab_label appends — never the title's.
+        let label = doc_tab_label("claude-coordinator", 104, "Fix 2×2 grid layout", false, false, false);
+        let col = doc_tab_close_col(&label).expect("label carries a close glyph");
+        let title_x = label
+            .chars()
+            .position(|c| c == quadraui::tui::TAB_CLOSE_CHAR)
+            .unwrap();
+        assert!(
+            col > title_x,
+            "close col {col} must be the trailing glyph, not the title's × at {title_x}: {label:?}"
+        );
+        // And it is genuinely the appended glyph: only the separator space
+        // (and, on an active tab, `]`) may follow it.
+        assert_eq!(
+            label.chars().nth(col),
+            Some(quadraui::tui::TAB_CLOSE_CHAR)
+        );
+        assert_eq!(label.chars().skip(col + 1).collect::<String>(), " ");
     }
 
     #[test]
