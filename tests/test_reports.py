@@ -45,6 +45,7 @@ from coord.reports import (
     csv_filename,
     detect_prior_activity,
     fetch_audit_window,
+    fold_decisions,
     fold_drive_queue_status,
     fold_issue_activity,
     fold_queue_outcomes,
@@ -52,6 +53,7 @@ from coord.reports import (
     resolve_params,
     resolve_queue_outcomes_window,
     result_to_csv,
+    run_decisions,
     run_drive_queue_status,
     run_queue_outcomes,
     run_report,
@@ -921,19 +923,328 @@ class TestRunDriveQueueStatus:
         assert result.rows[0]["attempts"] == 2
 
 
+# ── decisions (#2369): escalations + blocked queue roots as cards ─────────
+
+
+def _esc_row(
+    issue: int,
+    *,
+    repo: str = "claude-coordinator",
+    stage: str = "merge",
+    reason: str = "stuck",
+    gate_readings: str = "",
+    proposed_command: str = "coord merge --plan --repo claude-coordinator",
+    created_at: float = 500.0,
+    assignment_id: str | None = None,
+) -> dict:
+    """One row in the exact shape ``coord.state.list_drive_escalations``
+    returns."""
+    return {
+        "id": issue,
+        "repo_name": repo,
+        "issue_number": issue,
+        "stage": stage,
+        "assignment_id": assignment_id,
+        "reason": reason,
+        "gate_readings": gate_readings,
+        "proposed_command": proposed_command,
+        "created_at": created_at,
+    }
+
+
+# #2283's worked shape — a terminal acceptance-author dead end whose
+# `last_reason` already embeds three de facto options.
+_ACCEPTANCE_DEAD_END_REASON = (
+    "acceptance author aid-1 exited DONE, but its branch acc/foo carries no "
+    "commits — nothing was authored, so there is no slice to land, and DONE "
+    "is terminal: it will never change on its own.\n"
+    "   inspect: coord log aid-1 --machine dellserver\n"
+    "   Re-author by hand: coord acceptance author api 99 --issue 1\n"
+    "   or re-run coord drive with --no-acceptance to skip JIT authoring. — "
+    "the board row is terminal and unactionable (nothing active, no gate "
+    "transition available), which cannot change on retry (#2019); blocking "
+    "without spending an attempt"
+)
+
+# coord-portal#107's worked shape — a CI-shaped merge block with the
+# existing "Inspect the gates: coord merge --plan --repo ..." line.
+_MERGE_ATTEMPTS_REASON = (
+    "merge attempted 3 times without landing.\n"
+    "   Last board state: status='CONFLICT' reason='none'\n"
+    "   Last `coord merge --only` diagnostic:\n"
+    "     sealed acceptance suite (ms-1): failing\n"
+    "   Inspect the gates: coord merge --plan --repo coord-portal"
+)
+
+
+class TestFoldDecisions:
+    """Pure fold — fixture escalation/queue rows in, ``ReportResult`` out.
+    No DB, no daemon."""
+
+    def test_nothing_pending_is_not_an_error(self) -> None:
+        result = fold_decisions([], [], 1000.0)
+        assert result.rows == []
+        assert result.report_id == "decisions"
+        assert result.window == (1000.0, 1000.0)
+        assert any("nothing" in n.lower() for n in result.notes)
+
+    def test_column_meta_matches_columns_one_to_one_same_order(self) -> None:
+        result = fold_decisions(
+            [_esc_row(1)], [], 1000.0
+        )
+        assert [m.id for m in result.column_meta] == result.columns
+        assert result.columns == [
+            "repo", "issue", "title", "why", "options",
+            "downstream_count", "downstream", "since", "source",
+        ]
+
+    def test_escalation_row_produces_one_card_with_stored_proposed_command(
+        self,
+    ) -> None:
+        """#2360's worked example: the stored ``proposed_command`` is reused
+        verbatim as the recommended option, never re-derived."""
+        result = fold_decisions(
+            [
+                _esc_row(
+                    2360,
+                    reason=(
+                        "smoke_required — coord merge's own gate reports "
+                        "'test verdict stale (recorded against base "
+                        "11401bb, base now 8e02ded)', but this driver's OWN "
+                        "view already shows test_state='passed' — the two "
+                        "cannot converge by retrying the identical `coord "
+                        "merge` command (#1526); a human must reconcile them"
+                    ),
+                    proposed_command=(
+                        "coord diagnose claude-coordinator 2360 --stage "
+                        "test --reset"
+                    ),
+                    created_at=900.0,
+                )
+            ],
+            [],
+            1000.0,
+        )
+        assert len(result.rows) == 1
+        row = result.rows[0]
+        assert row["repo"] == "claude-coordinator"
+        assert row["issue"] == 2360
+        assert row["source"] == "escalation"
+        assert row["options"][0]["command_or_action"] == (
+            "coord diagnose claude-coordinator 2360 --stage test --reset"
+        )
+        assert row["options"][0]["recommended"] is True
+        assert row["since"] == 900.0
+        # #2369's plain-language pairing for the recognised stale-verdict
+        # shape — the raw reason alone is not sufficient.
+        assert "stale" in row["why"].lower()
+        assert "safe to merge" in row["why"].lower()
+
+    def test_after_chain_collapses_into_one_root_card_with_downstream_count(
+        self,
+    ) -> None:
+        """A 3-entry ``after=`` chain where only the root's block is a real
+        cause: the two dependents cascade-blocked via `_resolve_prereqs`'s
+        "it will never satisfy" verdict and must not get cards of their
+        own — #2283's cascade collapse."""
+        rows = [
+            _dq_row(1, repo="api", state_="blocked", reason_at=100.0,
+                     last_reason=_ACCEPTANCE_DEAD_END_REASON),
+            _dq_row(
+                2, repo="api", state_="blocked", after_json=["api#1"],
+                last_reason=(
+                    "api#2's pre-req(s) (api#1) queued but blocked/failed "
+                    "— it will never satisfy"
+                ),
+            ),
+            _dq_row(
+                3, repo="api", state_="blocked", after_json=["api#2"],
+                last_reason=(
+                    "api#3's pre-req(s) (api#2) queued but blocked/failed "
+                    "— it will never satisfy"
+                ),
+            ),
+        ]
+        result = fold_decisions([], rows, 1000.0)
+        assert len(result.rows) == 1
+        card = result.rows[0]
+        assert (card["repo"], card["issue"]) == ("api", 1)
+        assert card["downstream_count"] == 2
+        assert card["downstream"] == ["api#2", "api#3"]
+
+    def test_blocked_queue_row_with_no_escalation_parses_inspect_and_remedy(
+        self,
+    ) -> None:
+        """#2283's shape: a `blocked` row with no matching escalation-table
+        row still gets a card, options parsed from `last_reason`."""
+        rows = [
+            _dq_row(
+                1, repo="api", state_="blocked",
+                last_reason=_ACCEPTANCE_DEAD_END_REASON,
+            )
+        ]
+        result = fold_decisions([], rows, 1000.0)
+        assert len(result.rows) == 1
+        card = result.rows[0]
+        assert card["source"] == "queue"
+        labels = {o["label"] for o in card["options"]}
+        assert "Inspect" in labels
+        assert "Re-author by hand" in labels
+        assert any(o["recommended"] for o in card["options"])
+
+    def test_ci_shaped_block_parses_inspect_the_gates_line(self) -> None:
+        """coord-portal#107's shape: a failing CI check, with the existing
+        "Inspect the gates: coord merge --plan --repo ..." line parsed."""
+        rows = [
+            _dq_row(
+                107, repo="coord-portal", state_="failed",
+                last_reason=_MERGE_ATTEMPTS_REASON,
+            )
+        ]
+        result = fold_decisions([], rows, 1000.0)
+        card = result.rows[0]
+        option = next(
+            o for o in card["options"] if o["label"] == "Inspect the gates"
+        )
+        assert option["command_or_action"] == (
+            "coord merge --plan --repo coord-portal"
+        )
+
+    def test_novel_shape_still_gets_a_card_with_generic_fallback(self) -> None:
+        """No template matches — the card still exists (#2369: never
+        silently drop a stuck item), `why` is the raw reason verbatim, and
+        the single fallback option is marked recommended."""
+        rows = [
+            _dq_row(
+                55, repo="api", state_="blocked",
+                last_reason="something totally novel happened here",
+            )
+        ]
+        result = fold_decisions([], rows, 1000.0)
+        card = result.rows[0]
+        assert card["why"] == "something totally novel happened here"
+        assert len(card["options"]) == 1
+        assert card["options"][0]["recommended"] is True
+
+    def test_waiting_and_done_rows_are_never_cards(self) -> None:
+        rows = [
+            _dq_row(1, state_="waiting"),
+            _dq_row(2, state_="done"),
+            _dq_row(3, state_="running"),
+        ]
+        result = fold_decisions([], rows, 1000.0)
+        assert result.rows == []
+
+    def test_title_lookup_applied(self) -> None:
+        result = fold_decisions(
+            [_esc_row(1)], [], 1000.0, titles={("claude-coordinator", 1): "Fix it"}
+        )
+        assert result.rows[0]["title"] == "Fix it"
+
+    def test_escalation_takes_precedence_over_a_matching_queue_row(self) -> None:
+        """An issue with BOTH an escalation and a blocked queue row gets
+        exactly one card, from the richer escalation source."""
+        rows = [_dq_row(1, repo="api", state_="blocked", last_reason="x")]
+        escalations = [_esc_row(1, repo="api", proposed_command="coord fix")]
+        result = fold_decisions(escalations, rows, 1000.0)
+        assert len(result.rows) == 1
+        assert result.rows[0]["source"] == "escalation"
+
+    def test_pending_headline_note_names_the_count(self) -> None:
+        result = fold_decisions([_esc_row(1), _esc_row(2)], [], 1000.0)
+        assert any("2 decisions pending" in n for n in result.notes)
+
+    def test_remedy_labeled_line_parses_as_an_option(self) -> None:
+        """`coord drive-queue list` already structures a `blocked` row's
+        remedy as a `remedy: ...` line (`_BLOCKED_REMEDY`) — this fold
+        recognises the same label shape if it ever lands in `last_reason`."""
+        rows = [
+            _dq_row(
+                1, repo="api", state_="blocked",
+                last_reason=(
+                    "acceptance author aid-1 failed.\n"
+                    "   remedy: coord acceptance author api 99 --issue 1"
+                ),
+            )
+        ]
+        result = fold_decisions([], rows, 1000.0)
+        option = next(
+            o for o in result.rows[0]["options"] if o["label"] == "Remedy"
+        )
+        assert option["command_or_action"] == "coord acceptance author api 99 --issue 1"
+
+
+class TestRunDecisions:
+    """The runner — ``*_fetch=``/``now=``/``title_lookup=`` seams."""
+
+    def test_repo_param_filters_the_finished_cards(self) -> None:
+        result = run_decisions(
+            repo="web",
+            now=1000.0,
+            escalations_fetch=lambda repo: [_esc_row(1, repo="api"), _esc_row(2, repo="web")],
+            queue_fetch=lambda repo: [],
+            title_lookup=lambda keys: {},
+        )
+        assert [r["repo"] for r in result.rows] == ["web"]
+
+    def test_full_queue_fetched_regardless_of_repo_param(self) -> None:
+        """#2183-style: the cascade needs the FULL queue, not a `--repo`
+        filtered slice, so both fetches are always called with ``None``."""
+        calls: list[str | None] = []
+
+        def queue_fetch(repo):
+            calls.append(repo)
+            return []
+
+        run_decisions(
+            repo="web", now=1000.0,
+            escalations_fetch=lambda repo: [],
+            queue_fetch=queue_fetch,
+            title_lookup=lambda keys: {},
+        )
+        assert calls == [None]
+
+    def test_now_seam_sets_generated_at_and_window(self) -> None:
+        result = run_decisions(
+            now=555.0,
+            escalations_fetch=lambda repo: [],
+            queue_fetch=lambda repo: [],
+            title_lookup=lambda keys: {},
+        )
+        assert result.generated_at == 555.0
+        assert result.window == (555.0, 555.0)
+
+    def test_title_lookup_receives_keys_from_both_sources(self) -> None:
+        seen_keys: set = set()
+
+        def title_lookup(keys):
+            seen_keys.update(keys)
+            return {}
+
+        run_decisions(
+            now=1000.0,
+            escalations_fetch=lambda repo: [_esc_row(1, repo="api")],
+            queue_fetch=lambda repo: [_dq_row(2, repo="web", state_="blocked")],
+            title_lookup=title_lookup,
+        )
+        assert seen_keys == {("api", 1), ("web", 2)}
+
+
 # ── registry + parameter validation ────────────────────────────────────────
 
 
 class TestCatalogue:
     def test_the_registered_reports(self) -> None:
         assert set(REPORTS) == {
-            "issue-activity", "drive-queue-status", "usage", "queue-outcomes",
+            "issue-activity", "drive-queue-status", "decisions", "usage",
+            "queue-outcomes",
         }
 
     def test_catalogue_carries_full_param_metadata(self) -> None:
         cat = catalogue()
         assert [r["id"] for r in cat["reports"]] == [
-            "drive-queue-status", "issue-activity", "queue-outcomes", "usage",
+            "decisions", "drive-queue-status", "issue-activity",
+            "queue-outcomes", "usage",
         ]
         rep = next(r for r in cat["reports"] if r["id"] == "issue-activity")
         assert rep["title"] == "Issue Activity"
@@ -950,6 +1261,16 @@ class TestCatalogue:
         cat = catalogue()
         rep = next(r for r in cat["reports"] if r["id"] == "drive-queue-status")
         assert rep["title"] == "Drive Queue Status"
+        assert rep["description"]
+        params = {p["id"]: p for p in rep["params"]}
+        assert set(params) == {"repo"}
+        assert params["repo"]["kind"] == "text"
+        assert params["repo"]["default"] == ""
+
+    def test_decisions_catalogue_entry(self) -> None:
+        cat = catalogue()
+        rep = next(r for r in cat["reports"] if r["id"] == "decisions")
+        assert rep["title"] == "Decisions"
         assert rep["description"]
         params = {p["id"]: p for p in rep["params"]}
         assert set(params) == {"repo"}
@@ -1086,7 +1407,8 @@ class TestCli:
         assert result.exit_code == 0, result.output
         body = json.loads(result.output)
         assert [r["id"] for r in body["reports"]] == [
-            "drive-queue-status", "issue-activity", "queue-outcomes", "usage",
+            "decisions", "drive-queue-status", "issue-activity",
+            "queue-outcomes", "usage",
         ]
 
     def test_report_run_json_shape(self, coord_db) -> None:
@@ -1421,6 +1743,81 @@ class TestCliDriveQueueStatus:
         assert result.exit_code == 0, result.output
 
 
+class TestCliDecisions:
+    """``coord report run decisions`` against real `drive_escalations` /
+    `drive_queue` tables, seeded through the routed `coord.state` writers
+    (#2369)."""
+
+    def test_empty_board_returns_no_rows_with_a_note(self, coord_db) -> None:
+        result = CliRunner().invoke(
+            main, ["report", "run", "decisions", "--json"]
+        )
+        assert result.exit_code == 0, result.output
+        body = json.loads(result.output)
+        assert body["report_id"] == "decisions"
+        assert body["rows"] == []
+        assert any("nothing" in n.lower() for n in body["notes"])
+
+    def test_escalation_row_surfaces_as_a_card(self, coord_db) -> None:
+        state.record_drive_escalation(
+            "api", 7,
+            stage="merge",
+            reason="merge_status=NEEDS_ATTENTION — no number of retries changes this",
+            gate_readings="merge_status=NEEDS_ATTENTION",
+            proposed_command="coord merge --plan --repo api",
+        )
+        result = CliRunner().invoke(
+            main, ["report", "run", "decisions", "--json"]
+        )
+        assert result.exit_code == 0, result.output
+        body = json.loads(result.output)
+        assert len(body["rows"]) == 1
+        row = body["rows"][0]
+        assert row["repo"] == "api"
+        assert row["issue"] == 7
+        assert row["options"][0]["command_or_action"] == "coord merge --plan --repo api"
+
+    def test_blocked_queue_row_surfaces_as_a_card(self, coord_db) -> None:
+        state.enqueue_drive_queue("api", 9)
+        state._update_drive_queue_entry_local(
+            "api", 9, state="blocked",
+            last_reason="acceptance author aid-1 failed.\n   inspect: coord log aid-1 --machine dellserver",
+        )
+        result = CliRunner().invoke(
+            main, ["report", "run", "decisions", "--json"]
+        )
+        assert result.exit_code == 0, result.output
+        rows = json.loads(result.output)["rows"]
+        assert [r["issue"] for r in rows] == [9]
+        assert rows[0]["source"] == "queue"
+
+    def test_human_table_prints_the_why_column(self, coord_db) -> None:
+        state.record_drive_escalation(
+            "api", 7, stage="merge", reason="stuck for a reason",
+            gate_readings="", proposed_command="coord merge --plan --repo api",
+        )
+        result = CliRunner().invoke(main, ["report", "run", "decisions"])
+        assert result.exit_code == 0, result.output
+        assert "api" in result.output
+        assert "7" in result.output
+
+    def test_does_not_run_a_tick(self, coord_db, monkeypatch) -> None:
+        import coord.drive_queue as dq
+
+        def _boom(*a, **k):  # noqa: ANN002, ANN003
+            raise AssertionError("decisions report called plan_tick")
+
+        monkeypatch.setattr(dq, "plan_tick", _boom)
+        state.enqueue_drive_queue("api", 9)
+        state._update_drive_queue_entry_local(
+            "api", 9, state="blocked", last_reason="x"
+        )
+        result = CliRunner().invoke(
+            main, ["report", "run", "decisions", "--json"]
+        )
+        assert result.exit_code == 0, result.output
+
+
 # ── daemon endpoints ───────────────────────────────────────────────────────
 
 
@@ -1469,7 +1866,8 @@ class TestDaemonEndpoints:
         assert resp.status_code == 200
         body = resp.json()
         assert [r["id"] for r in body["reports"]] == [
-            "drive-queue-status", "issue-activity", "queue-outcomes", "usage",
+            "decisions", "drive-queue-status", "issue-activity",
+            "queue-outcomes", "usage",
         ]
         rep = next(r for r in body["reports"] if r["id"] == "issue-activity")
         params = {p["id"]: p for p in rep["params"]}
