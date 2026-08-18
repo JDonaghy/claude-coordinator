@@ -241,6 +241,38 @@ impl CoordApp {
         }
     }
 
+    /// The "Run proposed fix: `<cmd>`" pull-right submenu for an open
+    /// escalation record — an escalation-table card always folds to TWO
+    /// `decisions`-report options (`coord/reports.py`'s `fold_decisions`:
+    /// "Recommended" = this row's `proposed_command`, "Inspect" = `coord
+    /// escalate list --repo <repo>`), so this is always a submenu, never a
+    /// flat action, and each child calls `coord decide <repo> <issue>
+    /// <index>` (via `dispatch_decide_escalation`, dispatched through the
+    /// `decide-escalation:<index>` action-id convention) instead of `coord
+    /// escalate run` directly.
+    ///
+    /// #2375: pulled out of `dialogs.rs`'s Pipeline-row menu builder so the
+    /// drive-queue Queue-panel row menu (`drive_queue.rs`) can offer the
+    /// IDENTICAL submenu for the same (repo, issue) — same recommended
+    /// command, same child ordering — without a second hand-rolled copy of
+    /// this `ContextMenuItem::parent(...)` construction to drift out of
+    /// sync with the original.
+    pub(crate) fn run_proposed_fix_menu_item(esc: &EscalationEntry) -> ContextMenuItem {
+        ContextMenuItem::parent(
+            &format!("Run proposed fix: {}", trunc(&esc.proposed_command, 56)),
+            vec![
+                ContextMenuItem::action(
+                    "decide-escalation:0",
+                    &format!("Recommended: {}", trunc(&esc.proposed_command, 40)),
+                ),
+                ContextMenuItem::action(
+                    "decide-escalation:1",
+                    "Inspect (view the full escalation record)",
+                ),
+            ],
+        )
+    }
+
     /// "Decide" — generalizes `dispatch_run_escalation` to any option on
     /// the card's `decisions`-report shape, not just the recommended one
     /// (#2370). Shells out to `coord decide <repo> <issue> <option_index>`,

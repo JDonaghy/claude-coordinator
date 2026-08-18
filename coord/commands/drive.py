@@ -692,12 +692,22 @@ def escalate_run(repo: str, issue: int, dismiss: bool, config_path: Path) -> Non
         "option or a drive-queue-only card; see the command's docstring."
     ),
 )
+@click.option(
+    "--list", "list_only", is_flag=True, default=False,
+    help=(
+        "Print REPO ISSUE's numbered option list (same options "
+        "`coord report run decisions`/`coord escalate list` would show for "
+        "this row) and exit — runs nothing. #2375: the discovery path the "
+        "bare/indexed invocation deliberately doesn't provide."
+    ),
+)
 @_CONFIG_OPTION
 def decide(
     repo: str,
     issue: int,
     option_index: int | None,
     dismiss: bool,
+    list_only: bool,
     config_path: Path,
 ) -> None:
     """Run one option from REPO ISSUE's `decisions` report card.
@@ -724,8 +734,16 @@ def decide(
       reappearance-or-not on the next `coord report run decisions` is the
       confirmation signal, not a second "resolved" state that could go
       stale or lie.
+
+    #2375: `--list` prints this same card's numbered options and stops —
+    the discovery path for picking OPTION_INDEX without running anything.
+    It is a NEW flag, not a change to the bare/no-index contract above:
+    that contract (#2370's own shipped acceptance criterion — no
+    OPTION_INDEX behaves identically to `coord escalate run`) stays exactly
+    as it is, since the TUI's "Recommended" click and #2370's acceptance
+    test both depend on it firing immediately.
     """
-    from coord.reports import find_decision  # noqa: PLC0415
+    from coord.reports import find_decision, format_option_cell  # noqa: PLC0415
     from coord.state import dismiss_drive_escalation  # noqa: PLC0415
 
     card = find_decision(repo, issue)
@@ -735,6 +753,12 @@ def decide(
     options = card.get("options") or []
     if not options:
         raise click.ClickException(f"decision card for {repo} #{issue} has no options")
+
+    if list_only:
+        click.echo(f"{repo} #{issue}: {len(options)} option(s)")
+        for i, opt in enumerate(options):
+            click.echo(f"  {i}: {format_option_cell(opt)}")
+        return
 
     if option_index is None:
         index = next(
