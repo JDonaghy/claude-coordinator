@@ -263,6 +263,39 @@ def test_acceptance_workflow_is_paths_gated_to_webapp_changes() -> None:
         )
 
 
+def test_acceptance_job_caches_playwright_browsers() -> None:
+    """#2393: neither `acceptance` nor `e2e` cached the Playwright browser
+    binary, so every single CI run re-downloaded ~300MB of Chromium from
+    Playwright's CDN from scratch — full exposure to any network hiccup on
+    that path, every time, not just occasionally. Confirmed live
+    2026-08-18: this hung 3 separate PRs' worth of runs in one afternoon.
+    A cache hit skips the download-heavy `install --with-deps` entirely in
+    favor of the apt-only `install-deps`."""
+    workflow = _load_workflow(ACCEPTANCE_WORKFLOW_PATH)
+    steps = _job_steps(workflow, "acceptance", ACCEPTANCE_WORKFLOW_PATH)
+    cache_step = next(
+        (s for s in steps if (s.get("uses") or "").startswith("actions/cache")),
+        None,
+    )
+    assert cache_step is not None, (
+        "the 'acceptance' job has no actions/cache step for Playwright's "
+        "browser binaries — every run re-downloads Chromium from scratch"
+    )
+    assert cache_step.get("with", {}).get("path") == "~/.cache/ms-playwright", (
+        f"cache step doesn't target Playwright's browser cache dir: "
+        f"{cache_step.get('with')!r}"
+    )
+    # The full (network-heavy) install must be conditioned on a cache MISS —
+    # otherwise the cache exists but is never actually consulted.
+    install_step = _step_runs(steps, "playwright install chromium --with-deps")
+    assert install_step is not None
+    assert "cache-hit != 'true'" in (install_step.get("if") or ""), (
+        "the full `playwright install --with-deps` step isn't gated on a "
+        f"cache miss, so the cache added above is never actually used: "
+        f"{install_step.get('if')!r}"
+    )
+
+
 def test_acceptance_job_has_a_bounded_timeout() -> None:
     """#2389: a job with no `timeout-minutes` defaults to GitHub's 360-minute
     ceiling — confirmed live 2026-08-18, `npx playwright install chromium`
