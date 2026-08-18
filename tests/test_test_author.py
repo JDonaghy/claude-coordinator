@@ -556,11 +556,49 @@ class TestDispatchTestAuthor:
             "acme/coord-tui", "issue-947-test-author-ms-25-acceptance-suite",
         )
 
-    def test_merged_branch_refuses_jit_mode_retry(self) -> None:
-        """#1172 defence-in-depth: even with #1171's branch-per-slice fix, a
-        RETRY of the same (tracking_issue, issue_number) pair after that
-        slice's own PR already merged (e.g. via #1138's oracle gate) must
-        refuse rather than silently stranding the retry's commit."""
+    def test_merged_branch_forks_a_fresh_branch_for_jit_reauthoring(self) -> None:
+        """#1172 follow-up: a genuine re-authoring dispatch for the SAME
+        (tracking_issue, issue_number) pair — e.g. a Gate-A contract
+        `--amend` after the slice's own PR already merged — must fork onto
+        the next unmerged versioned branch (`-v2`) rather than refuse.
+        #1172's own stated fix scope was "refuse (or fork a fresh branch)";
+        this is the half that shipped later."""
+        cfg = _config([_machine("laptop", ["coord-tui"])], driver=self._driver())
+        fake_client = MagicMock()
+        fake_resp = MagicMock()
+        fake_resp.json.return_value = {"id": "abc123"}
+        fake_client.post.return_value = fake_resp
+
+        base_branch = "test-author-ms-25-slice-101"
+
+        def _pr_is_merged(_repo: str, branch: str) -> bool:
+            return branch == base_branch
+
+        with patch("coord.test_author.fetch_milestone_context", return_value=self._ctx()), \
+             patch(
+                 "coord.test_author.github_ops.get_issue",
+                 return_value={"title": "Add foo", "body": "Body text"},
+             ), \
+             patch(
+                 "coord.test_author.github_ops.pr_is_merged", side_effect=_pr_is_merged,
+             ) as pr_merged_mock, \
+             patch("coord.state.record_dispatched_assignment") as record_mock:
+            dispatch_test_author(
+                "coord-tui", 947, cfg, issue_number=101, http_client=fake_client,
+            )
+
+        payload = fake_client.post.call_args.kwargs["json"]
+        assert payload["target_branch"] == f"{base_branch}-v2"
+        pr_merged_mock.assert_any_call("acme/coord-tui", base_branch)
+        pr_merged_mock.assert_any_call("acme/coord-tui", f"{base_branch}-v2")
+        record_mock.assert_called_once()
+        assert record_mock.call_args.kwargs["assignment"].branch == f"{base_branch}-v2"
+
+    def test_merged_branch_refuses_jit_mode_after_exhausting_reauthor_forks(self) -> None:
+        """If the base branch AND every versioned fork up to the cap are all
+        already merged, that many re-authoring rounds on one slice is not a
+        normal amend/re-sync cycle — refuse loudly rather than spin or fork
+        forever."""
         cfg = _config([_machine("laptop", ["coord-tui"])], driver=self._driver())
         fake_client = MagicMock()
 
@@ -571,7 +609,7 @@ class TestDispatchTestAuthor:
              ), \
              patch("coord.test_author.github_ops.pr_is_merged", return_value=True), \
              patch("coord.state.record_dispatched_assignment") as record_mock:
-            with pytest.raises(RuntimeError, match="already has a merged PR"):
+            with pytest.raises(RuntimeError, match="versioned forks"):
                 dispatch_test_author(
                     "coord-tui", 947, cfg, issue_number=101, http_client=fake_client,
                 )

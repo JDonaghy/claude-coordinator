@@ -60,6 +60,13 @@ TEST_AUTHOR_DENY_COMMANDS: list[str] = [
     "Bash(gh *)",
 ]
 
+# #1172 follow-up: how many versioned forks (`-v2`, `-v3`, ...) to probe
+# before giving up on finding a JIT slice's next re-authoring branch. Kept
+# small and finite — a real loop here means something is genuinely wrong
+# (not a legitimate string of re-authoring dispatches), and #1172's own
+# guard should surface that as a loud, readable error rather than spin.
+MAX_REAUTHOR_BRANCH_ATTEMPTS = 20
+
 TEST_AUTHOR_SYSTEM_PROMPT = """\
 You are an INDEPENDENT acceptance-test author dispatched by the coordinator.
 
@@ -538,20 +545,39 @@ def dispatch_test_author(
     branch = target_branch or f"issue-{tracking_issue}-{_slugify(assignment_title)}"
 
     if github_ops.pr_is_merged(repo_cfg.github, branch):
-        raise RuntimeError(
-            f"branch {branch!r} already has a merged PR — dispatching would "
-            "push new commits onto a dead branch with nothing left to open "
-            "a PR against them (#1172). "
-            + (
-                f"Issue #{issue_number}'s JIT slice already landed; if it "
-                "needs more tests, this needs a fresh branch (not "
-                "auto-forked yet) — do not retry as-is."
-                if issue_number is not None else
-                "The milestone's Gate-A suite PR already merged; if the "
-                "suite needs more work, open a fresh branch by hand — do "
-                "not retry as-is."
+        if issue_number is not None:
+            # #1172's own stated fix scope was "refuse (or fork a fresh
+            # branch)" — only the refuse half shipped. This is the other
+            # half: a genuine re-authoring dispatch (e.g. a Gate-A contract
+            # `--amend`, docs/ORACLE_LOOP.md's "amend the contract -> the
+            # test-author updates the affected slice") has nowhere else to
+            # push once the slice's own PR has merged, so fork onto the next
+            # unmerged versioned branch instead of failing outright.
+            base_branch = branch
+            for suffix in range(2, MAX_REAUTHOR_BRANCH_ATTEMPTS + 1):
+                candidate = f"{base_branch}-v{suffix}"
+                if not github_ops.pr_is_merged(repo_cfg.github, candidate):
+                    branch = candidate
+                    target_branch = candidate
+                    break
+            else:
+                raise RuntimeError(
+                    f"branch {base_branch!r} and its next "
+                    f"{MAX_REAUTHOR_BRANCH_ATTEMPTS - 1} versioned forks "
+                    "(-v2..-v"
+                    f"{MAX_REAUTHOR_BRANCH_ATTEMPTS}) all already have "
+                    "merged PRs (#1172) — that many re-authoring rounds on "
+                    "one slice is not a normal amend/re-sync cycle; open a "
+                    "fresh branch by hand and investigate."
+                )
+        else:
+            raise RuntimeError(
+                f"branch {branch!r} already has a merged PR — dispatching "
+                "would push new commits onto a dead branch with nothing "
+                "left to open a PR against them (#1172). The milestone's "
+                "Gate-A suite PR already merged; if the suite needs more "
+                "work, open a fresh branch by hand — do not retry as-is."
             )
-        )
 
     deny_commands = test_author_deny_commands(config, repo_name)
 
