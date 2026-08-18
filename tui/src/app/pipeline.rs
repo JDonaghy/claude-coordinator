@@ -249,8 +249,8 @@ pub(crate) struct PrereqStage {
     pub(crate) since: Option<f64>,
     /// #2397: the merge-queue's own computed block reason
     /// (`coord.merge_queue.plan()`'s per-entry `reason`, joined against the
-    /// board's `merge_plan`) plus the `auto_drain`-aware affordance
-    /// (`format::fmt_merge_block_reason`) — set only on the Merge stage
+    /// board's `merge_plan`) plus the human/in-flight/needs-a-person
+    /// affordance (`format::fmt_merge_block_reason`) — set only on the Merge stage
     /// while it's `Pending` behind a settled Review, and only when a plan
     /// entry actually exists (a PR/branch is queued). `None` for every
     /// other stage, and for Merge before a plan entry exists — callers keep
@@ -5121,13 +5121,19 @@ impl CoordApp {
     /// #2397: the merge-queue's own computed block reason for a Pending
     /// Merge stage, resolved against the live-computed `data.merge_plan`
     /// (`coord.merge_queue.plan()`, #776) and formatted with the
-    /// `auto_drain`-aware affordance (`format::fmt_merge_block_reason`).
-    /// `None` when the daemon hasn't sent a `merge_plan` (pre-#776 daemon,
-    /// or local-SQLite mode) or no entry matches — callers already have a
-    /// bare-clock fallback for that case.
+    /// human/in-flight/needs-a-person affordance
+    /// (`format::fmt_merge_block_reason`). `None` when the daemon hasn't
+    /// sent a `merge_plan` (pre-#776 daemon, or local-SQLite mode) or no
+    /// entry matches — callers already have a bare-clock fallback for that
+    /// case.
+    ///
+    /// Deliberately does not consult `entry.auto_drain`: per
+    /// `format::merge_wait_affordance`'s doc comment (#2397 review fix), the
+    /// flag has no bearing on whether a BLOCKED plan entry — which is the
+    /// only case `entry.reason` is `Some` — ever gets retried automatically.
     fn merge_plan_block_reason(entry: Option<&PlannedMergeEntry>) -> Option<String> {
         let entry = entry?;
-        fmt_merge_block_reason(entry.reason.as_deref(), entry.auto_drain)
+        fmt_merge_block_reason(entry.reason.as_deref())
     }
 
     /// Branch-keyed lookup for the #1084 prereq track (Gate A / Acceptance

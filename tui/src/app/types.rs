@@ -1322,10 +1322,20 @@ pub(crate) struct PlannedMergeEntry {
     /// #2397: mirrors `merge.auto_drain` (the config flag gating the
     /// daemon's background auto-retry tick) at the moment this plan was
     /// built — `false` (matching the config default) when an older daemon
-    /// doesn't send it yet. Lets the Merge stage box distinguish "nothing
-    /// retries until a human runs `coord merge`" from "an automatic retry
-    /// is already in flight" (`format::merge_wait_affordance`) instead of
-    /// rendering a blocked entry identically either way.
+    /// doesn't send it yet.
+    ///
+    /// Not currently read by the TUI: an earlier version of
+    /// `format::merge_wait_affordance` branched on this to distinguish
+    /// "nothing retries until a human runs `coord merge`" from "an
+    /// automatic retry is already in flight," but that was factually wrong
+    /// — `_auto_drain_tick` (coord/serve_app.py) only ever retries entries
+    /// already marked `PLAN_READY`; a `PLAN_BLOCKED` entry (the only case
+    /// `reason` is `Some`, which is the only case this field would matter
+    /// for) is filtered out before any retry logic runs, so `auto_drain`
+    /// has no bearing on it. Kept on the wire (the daemon still sends it)
+    /// in case a genuinely `auto_drain`-sensitive display need shows up
+    /// later; see #2397's review discussion for the full trace.
+    #[allow(dead_code)]
     #[serde(default)]
     pub(crate) auto_drain: bool,
 }

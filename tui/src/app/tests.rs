@@ -297,64 +297,61 @@
     // ── merge_wait_affordance / fmt_merge_block_reason (#2397) ───────────────
 
     #[test]
-    fn merge_wait_affordance_ci_running_is_in_flight_regardless_of_auto_drain() {
-        let msg = merge_wait_affordance("CI running: build, test", false);
+    fn merge_wait_affordance_ci_running_is_in_flight() {
+        let msg = merge_wait_affordance("CI running: build, test");
         assert!(msg.contains("in flight"), "got: {msg}");
-        let msg_on = merge_wait_affordance("CI running: build, test", true);
-        assert!(msg_on.contains("in flight"), "got: {msg_on}");
     }
 
     #[test]
-    fn merge_wait_affordance_checks_stale_needs_human_when_auto_drain_off() {
+    fn merge_wait_affordance_checks_stale_needs_human() {
         // The live #2284 incident: `merge.auto_drain: false` + a real
         // `checks_stale` gate meant nothing was coming on its own.
-        let msg = merge_wait_affordance(
-            "CI stale: checks predate the current base — re-run CI",
-            false,
-        );
+        let msg = merge_wait_affordance("CI stale: checks predate the current base — re-run CI");
         assert!(msg.contains("human"), "got: {msg}");
         assert!(msg.contains("coord merge"), "got: {msg}");
+        assert!(!msg.contains("auto-retry"), "got: {msg}");
     }
 
+    /// #2397 review fix: `checks_stale`/`smoke_required` must read as
+    /// "waiting on a human" no matter what `merge.auto_drain` is set to —
+    /// `merge_wait_affordance` no longer takes an `auto_drain` parameter at
+    /// all, because `_auto_drain_tick` never retries a `PLAN_BLOCKED` entry
+    /// regardless of the flag (see the function's doc comment). This test
+    /// pins that the classification is reason-only, not config-dependent.
     #[test]
-    fn merge_wait_affordance_checks_stale_auto_retries_when_auto_drain_on() {
-        let msg = merge_wait_affordance(
-            "CI stale: checks predate the current base — re-run CI",
-            true,
-        );
-        assert!(msg.contains("auto-retry"), "got: {msg}");
-        assert!(!msg.contains("human"), "got: {msg}");
+    fn merge_wait_affordance_smoke_required_needs_human_not_auto_retry() {
+        let msg = merge_wait_affordance("test verdict stale (base moved since last smoke run)");
+        assert!(msg.contains("human"), "got: {msg}");
+        assert!(msg.contains("coord merge"), "got: {msg}");
+        assert!(!msg.contains("auto-retry"), "got: {msg}");
     }
 
     #[test]
     fn merge_wait_affordance_review_required_needs_a_person() {
-        let msg = merge_wait_affordance("review not approved", true);
+        let msg = merge_wait_affordance("review not approved");
         assert!(msg.contains("needs a person"), "got: {msg}");
     }
 
     #[test]
     fn merge_wait_affordance_checks_failed_needs_a_person() {
-        let msg = merge_wait_affordance("CI failed: build (failure)", false);
+        let msg = merge_wait_affordance("CI failed: build (failure)");
         assert!(msg.contains("needs a person"), "got: {msg}");
     }
 
     #[test]
     fn merge_wait_affordance_conflict_needs_a_person() {
-        let msg = merge_wait_affordance(
-            "merge conflict: PR #12 does not merge into main",
-            true,
-        );
+        let msg = merge_wait_affordance("merge conflict: PR #12 does not merge into main");
         assert!(msg.contains("needs a person"), "got: {msg}");
     }
 
     #[test]
     fn fmt_merge_block_reason_none_when_no_reason() {
-        assert_eq!(fmt_merge_block_reason(None, false), None);
+        assert_eq!(fmt_merge_block_reason(None), None);
     }
 
     #[test]
     fn fmt_merge_block_reason_includes_reason_and_affordance() {
-        let out = fmt_merge_block_reason(Some("review not approved"), false).unwrap();
+        let out = fmt_merge_block_reason(Some("review not approved")).unwrap();
         assert!(out.contains("review not approved"), "got: {out}");
         assert!(out.contains("needs a person"), "got: {out}");
     }
@@ -7956,10 +7953,19 @@
         );
     }
 
-    /// Same setup, but `merge.auto_drain: true` — the affordance must flip
-    /// to "auto-retry", not "waiting on a human", for the identical reason.
+    /// #2397 review fix: same setup, but `merge.auto_drain: true` — the
+    /// affordance must still read "waiting on a human", NOT "auto-retry".
+    /// `_auto_drain_tick` (coord/serve_app.py) only ever retries entries the
+    /// live plan already marks `PLAN_READY`; this entry is `PLAN_BLOCKED`
+    /// (it has a `reason`), so it is filtered out before any retry logic
+    /// runs regardless of `auto_drain`. An earlier version of this fix
+    /// rendered "auto-retry armed" here, which was live-incident-confirmed
+    /// wrong (#2284 happened under `auto_drain: false`, but the identical
+    /// `checks_stale`/`smoke_required` reason under `auto_drain: true` would
+    /// have told the operator to keep waiting for a retry that was never
+    /// coming).
     #[test]
-    fn gate_a_prereq_status_merge_pending_auto_drain_on_reads_as_auto_retry() {
+    fn gate_a_prereq_status_merge_pending_checks_stale_reads_as_human_even_with_auto_drain_on() {
         let mut app = make_pipeline_app_for_prereq_test();
         let mut author = _stage_assignment("mock1", "mock-author", 100.0, "done");
         author.issue_number = 751;
@@ -7980,14 +7986,17 @@
             "ms-9-gate-a",
             751,
             "CI stale: checks predate the current base — re-run CI (`coord merge --revalidate`) before merging",
-            true,
+            true, // merge.auto_drain: true — must NOT change the affordance for a BLOCKED entry.
         ));
 
         let epic = &app.pipeline_issues[0];
         let status = app.gate_a_prereq_status(epic);
         let reason = status.stages[3].block_reason.as_deref().expect("block_reason set");
-        assert!(reason.contains("auto-retry"), "got: {reason}");
-        assert!(!reason.contains("human"), "got: {reason}");
+        assert!(!reason.contains("auto-retry"), "got: {reason}");
+        assert!(
+            reason.contains("human") && reason.contains("coord merge"),
+            "got: {reason}"
+        );
     }
 
     /// The Merge row's rendered guidance-panel value (what the operator
