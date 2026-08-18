@@ -2798,6 +2798,41 @@ def test_a_passing_probe_releases_and_launches_in_the_same_tick(
     assert state._get_drive_escalation_local(QUEUE_ALERT_REPO, QUEUE_ALERT_ISSUE) is None
 
 
+def test_a_cleared_cordon_drops_its_stale_queue_alert(cli, seed, launches, monkeypatch):
+    """#2381: a cordon alert must not outlive the cordon.
+
+    The clear-on-resolve path used to be gated on `any(h.outcome ==
+    "released" for h in plan.holds)` — the deploy-gate-hold case only — so a
+    cordon (which raises `plan.alert` but never touches `plan.holds`) left
+    its escalation record behind forever once it lifted: `status` (and
+    anything reading the same record — the `decisions` report, the TUI)
+    kept reporting "cordoned: draining" long after the fleet had rolled and
+    resumed real work.
+    """
+    from coord.commands import drive_queue as drive_queue_cmd
+
+    seed(issues={1650: "open"})
+    cli("add", REPO, "1650")
+
+    monkeypatch.setattr(drive_queue_cmd, "_local_host_id", lambda: "testhost")
+    monkeypatch.setattr(
+        drive_queue_cmd, "_fetch_cordons",
+        lambda: {"testhost": "cordoned: draining for v0.9.9"},
+    )
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    assert launches == []
+    alert = state._get_drive_escalation_local(QUEUE_ALERT_REPO, QUEUE_ALERT_ISSUE)
+    assert alert is not None and "cordoned" in alert["reason"]
+
+    # The cordon lifts; nothing else about the queue changed.
+    monkeypatch.setattr(drive_queue_cmd, "_fetch_cordons", lambda: {})
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    assert launches and "1650" in " ".join(launches[0])
+    assert state._get_drive_escalation_local(QUEUE_ALERT_REPO, QUEUE_ALERT_ISSUE) is None
+
+
 def test_a_hanging_probe_is_killed_and_treated_as_a_failure(cli, seed, launches):
     """The REAL `_run_resume_probe`, against a command that never returns.
 
