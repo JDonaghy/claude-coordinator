@@ -1724,17 +1724,29 @@ def live_ci_backend(monkeypatch):
     """Fake the live `ci_store`/`github_ops` seam #2182's re-check calls.
 
     Patches `coord.ci_store.build_ci_store` (what constructs the live
-    backend) and the two `coord.github_ops` functions the CI gate reaches
+    backend) and the three `coord.github_ops` functions the CI gate reaches
     for once the checks themselves resolve (`get_branch_commit_timestamp`
     for the #1851 staleness check, `get_pr_commit_messages` for the #1318
-    epic-closing-keyword gate) — the same seams `tests/test_board_read_
-    path.py` fakes for the equivalent `/board`-side gate. Returns a setter,
-    `live_ci_backend(checks)`.
+    epic-closing-keyword gate, and `check_pr_mergeable` for the #1877 /
+    #2380 "is this PR actually CONFLICTING?" disambiguation) — the same
+    seams `tests/test_board_read_path.py` fakes for the equivalent
+    `/board`-side gate. Returns a setter, `live_ci_backend(checks,
+    mergeable=...)`.
+
+    `mergeable` defaults to `None` — GitHub's own "still computing /
+    unknown" verdict, which every gate treats as inconclusive, so the
+    default leaves the pre-#2380 reading of every scenario here untouched.
+    Pass `mergeable=False` for the #2380 case (a DIRTY/CONFLICTING PR,
+    whose `gh pr checks` fetch fails because GitHub can never build a merge
+    ref for it). Faking it matters beyond convenience: `launches`
+    monkeypatches `subprocess.run` process-wide, so an unfaked probe would
+    (a) really shell out to `gh` from a unit test and (b) land in
+    `launches` as a phantom extra "launch".
     """
     import coord.ci_store as ci_store_module
     import coord.github_ops as github_ops
 
-    state: dict = {"checks": []}
+    state: dict = {"checks": [], "mergeable": None}
     monkeypatch.setattr(
         ci_store_module, "build_ci_store", lambda t: _FakeLiveCi(state)
     )
@@ -1744,9 +1756,13 @@ def live_ci_backend(monkeypatch):
         github_ops, "get_branch_commit_timestamp", lambda repo, branch: 1.0
     )
     monkeypatch.setattr(github_ops, "get_pr_commit_messages", lambda repo, n: [])
+    monkeypatch.setattr(
+        github_ops, "check_pr_mergeable", lambda repo, n: state["mergeable"]
+    )
 
-    def _set(checks: list) -> None:
+    def _set(checks: list, *, mergeable: bool | None = None) -> None:
         state["checks"] = checks
+        state["mergeable"] = mergeable
 
     return _set
 
@@ -1883,6 +1899,40 @@ def test_a_parked_entrys_reason_is_corrected_when_github_is_unreachable(
     result = cli_no_gates("tick")
     assert result.exit_code == 0, result.output
     assert queued(2159)["state"] == "running"
+
+
+def test_a_parked_entry_whose_pr_is_confirmed_conflicting_stops_waiting_on_ci(
+    cli_no_gates, seed, launches, coord_db, live_ci_backend,
+):
+    """#2380 at the drive-queue tick: the SAME unreadable check list as the
+    #2347 test above, but GitHub's `mergeable` field reads CONFLICTING.
+
+    That combination is not a transient outage and never becomes readable
+    on its own — GitHub cannot build a merge ref for a conflicting PR, so
+    `gh pr checks` has nothing to read, forever. Parking on "retry the CI
+    read" therefore wedges the entry until the 45-minute ceiling, every
+    ceiling, with zero forward progress (the live incident: claude-
+    coordinator#2375 / PR #2379 parked 6x). The live re-check must stop
+    treating it as still-blocked-on-CI and let the entry move again, so the
+    merge path can route it to the #241 conflict-fix dispatch.
+    """
+    _park_with_pr(cli_no_gates, seed, coord_db)
+    assert queued(2159)["state"] == "parked"
+    assert len(launches) == 1, launches
+
+    from coord.ci_github import _unreadable_check
+    live_ci_backend(
+        [_unreadable_check(REPO, 2159, "HTTP 503: No server is currently available")],
+        mergeable=False,
+    )
+
+    result = cli_no_gates("tick")
+    assert result.exit_code == 0, result.output
+    entry = queued(2159)
+    assert entry["state"] != "parked", entry  # no longer wedged on a dead read
+    from coord.merge_queue import is_ci_unreadable_reason
+    assert not is_ci_unreadable_reason(entry["last_reason"] or ""), entry
+    assert "parked" not in cli_no_gates("status").output
 
 
 def test_a_live_ready_wins_even_over_a_stale_cached_plan_reading(
