@@ -46,6 +46,22 @@ DASHBOARD_DIR = Path(__file__).parent
 # that existing behaviour (and the test suite) is completely unaffected.
 WEBAPP_DIST = DASHBOARD_DIR / "webapp" / "dist"
 
+
+def dist_has_bundle(dist_path: Path) -> bool:
+    """Does ``dist_path`` contain a servable built webapp bundle?
+
+    This is the single definition of "valid bundle" for the dashboard: the
+    ``index()`` route below uses it to decide whether to serve the built
+    React app or fall back to the legacy single-file dashboard, and
+    ``coord web``'s CLI (coord/commands/lifecycle.py) uses it to decide
+    whether to print a success or warning message. Both call sites MUST
+    share this function rather than re-deriving the check, so the CLI's
+    message can never drift from what the server actually serves (#2003,
+    epic #2096).
+    """
+    return (dist_path / "index.html").exists()
+
+
 # How often (seconds) the background poller queries agent servers.
 _POLL_INTERVAL = 30.0
 # How long (seconds) an assignment must be running with no agent record before
@@ -698,7 +714,7 @@ def build_app(
         # Serve the built React webapp when available; fall back to the legacy
         # single-file dashboard so existing behaviour is entirely unchanged.
         spa_index = webapp_dist / "index.html"
-        html = spa_index.read_text() if spa_index.exists() else (DASHBOARD_DIR / "index.html").read_text()
+        html = spa_index.read_text() if dist_has_bundle(webapp_dist) else (DASHBOARD_DIR / "index.html").read_text()
         return HTMLResponse(html)
 
     async def api_board(request: Request) -> JSONResponse:

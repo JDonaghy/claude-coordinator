@@ -11,7 +11,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from coord.config import Config
-from coord.dashboard.server import build_app
+from coord.dashboard.server import build_app, dist_has_bundle
 from coord.models import Assignment, Board, Machine, Proposal, Repo
 from coord.state import save_board
 
@@ -1993,3 +1993,25 @@ class TestDistPathOverride:
         r = client.get("/")
         assert r.status_code == 200
         assert "coord dashboard" in r.text
+
+
+class TestDistHasBundle:
+    """#2003 (epic #2096): `dist_has_bundle` is the ONE predicate both
+    `index()` (this module) and `coord web`'s CLI (coord/commands/lifecycle.py)
+    call to decide whether a dist directory has a servable bundle -- pinning
+    it directly here guards against the two call sites drifting back apart
+    into independent re-derivations of the same check."""
+
+    def test_true_when_index_html_present(self, tmp_path: Path) -> None:
+        dist = tmp_path / "dist"
+        dist.mkdir()
+        (dist / "index.html").write_text("<html></html>")
+        assert dist_has_bundle(dist) is True
+
+    def test_false_when_directory_missing(self, tmp_path: Path) -> None:
+        assert dist_has_bundle(tmp_path / "does-not-exist") is False
+
+    def test_false_when_directory_empty(self, tmp_path: Path) -> None:
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        assert dist_has_bundle(empty) is False
