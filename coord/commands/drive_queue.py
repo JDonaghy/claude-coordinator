@@ -2761,11 +2761,18 @@ def drive_queue_tick(
                 gates=" | ".join(plan.alert.details),
                 command=plan.alert.command,
             )
-        elif any(h.outcome == "released" for h in plan.holds):
-            # A probe just auto-released the gate.  Drop the "QUEUE HELD"
-            # record in the same tick, or `status` keeps shouting HELD while
-            # the queue is demonstrably running again — the contradiction that
-            # teaches an operator to stop reading alerts.
+        else:
+            # #2381: ANY resolved alert-raising condition — a released hold,
+            # a lapsed/cleared cordon, a fixed editable-drift checkout — must
+            # drop the stale escalation record in the SAME tick it resolves,
+            # or `status` (and the TUI/`decisions` report reading the same
+            # record) keeps shouting the old reason while the queue is
+            # demonstrably running again. This used to be gated on `any(h.
+            # outcome == "released" for h in plan.holds)` — the deploy-gate
+            # case only — so a cleared CORDON (no `plan.holds` entry at all)
+            # never cleared its own stale alert. `_clear_queue_alert()` is a
+            # no-op when there is nothing to dismiss, so calling it on every
+            # alert-free tick is safe and cheap.
             _clear_queue_alert()
 
         target = plan.launch
