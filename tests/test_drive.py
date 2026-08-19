@@ -1628,31 +1628,55 @@ def test_done_work_with_no_branch_is_terminal():
 # ── advisory: distinguished by whether the branch actually carries commits ───
 
 
-def test_advisory_with_no_commits_on_the_branch_is_terminal():
+def test_advisory_with_no_commits_retries_via_coord_retry_then_stops_at_the_cap():
+    """#2416: a genuine zero-commit ADVISORY row used to be an immediate,
+    unconditional `_die()` — the ONE thing that can actually change it,
+    `coord retry <aid>`'s zero-commit-advisory path (#1606: `ahead == 0` →
+    reassign a fresh worker), was never invoked automatically, so every
+    automatic retry (drive-queue's own included) just relaunched a whole new
+    `coord drive` process, which re-observed the identical terminal row and
+    died again in seconds — burning a queue attempt+backoff cycle for
+    nothing (coord-portal#119, drive-queue entry 432). Now this is a bounded
+    `coord retry` dispatch, same shape/budget as the `failed` branch's
+    `work_retries` (`opts.max_work_retries`), mirroring
+    `test_failed_work_retries_through_the_cli_then_stops_at_the_cap` above —
+    before finally giving up for a human."""
     verifier = FakeVerifier(has_commits=False)
-    action = step(
-        state(work_aid="w1", work_status="advisory", work_branch="b"),
-        verifier=verifier,
-    )
-    assert action.is_exit
-    assert "no commits on its branch" in action.message
-    assert verifier.commits_calls == 1
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_work_retries=1)
+    s = state(work_aid="w1", work_status="advisory", work_branch="b")
+
+    first = step(s, opts, verifier=verifier, counters=counters)
+    assert first.kind == RUN
+    assert first.command == ("retry", "w1")
+    assert counters.advisory_retries == 1
+
+    second = step(s, opts, verifier=verifier, counters=counters)
+    assert second.is_exit
+    assert "no commits on its branch" in second.message
+    assert "coord retry w1" in second.message
+    assert verifier.commits_calls == 2
 
 
-def test_advisory_with_no_commits_is_terminal_even_with_accept_advisory():
+def test_advisory_with_no_commits_retry_is_unaffected_by_accept_advisory():
     """#1606: `--accept-advisory` exists to unblock the #1357 false-positive
     (real commits, downgraded status) — it must NOT adopt a genuine
     zero-commit advisory as though it were completed work. The zero-commit
-    check runs before the accept_advisory branch is ever consulted."""
+    check (and its #2416 bounded retry) runs before the accept_advisory
+    branch is ever consulted, so it behaves identically with or without the
+    flag."""
     verifier = FakeVerifier(has_commits=False)
-    action = step(
-        state(work_aid="w1", work_status="advisory", work_branch="b"),
-        DriveOptions(machine="precision", accept_advisory=True),
-        verifier=verifier,
-    )
-    assert action.is_exit
-    assert "no commits on its branch" in action.message
-    assert verifier.commits_calls == 1
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", accept_advisory=True, max_work_retries=1)
+    s = state(work_aid="w1", work_status="advisory", work_branch="b")
+
+    first = step(s, opts, verifier=verifier, counters=counters)
+    assert first.kind == RUN
+    assert first.command == ("retry", "w1")
+
+    second = step(s, opts, verifier=verifier, counters=counters)
+    assert second.is_exit
+    assert "no commits on its branch" in second.message
 
 
 def test_advisory_with_commits_stops_and_names_1357_without_accept_advisory():
@@ -1693,10 +1717,20 @@ def test_advisory_with_commits_and_a_passed_test_reaches_the_merge_stage():
     assert any("--accept-advisory" in w for w in action.warnings)
 
 
-def test_advisory_with_no_branch_at_all_is_terminal():
-    action = step(state(work_aid="w1", work_status="advisory", work_branch=""))
-    assert action.is_exit
-    assert "no commits on its branch" in action.message
+def test_advisory_with_no_branch_at_all_retries_then_is_eventually_terminal():
+    """No branch at all is the same #2416 dead-end signature as a branch
+    verified to carry zero commits — bounded `coord retry`, then terminal."""
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_work_retries=1)
+    s = state(work_aid="w1", work_status="advisory", work_branch="")
+
+    first = step(s, opts, counters=counters)
+    assert first.kind == RUN
+    assert first.command == ("retry", "w1")
+
+    second = step(s, opts, counters=counters)
+    assert second.is_exit
+    assert "no commits on its branch" in second.message
 
 
 # ── analysis deliverable: done + 0 commits is a SUCCESS, not a dead end (#2188)
