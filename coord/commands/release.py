@@ -1070,10 +1070,22 @@ def release_propagate(  # noqa: PLR0912, PLR0915 — a pipeline; the decisions a
     gate = rp.scope_verification(record.verification, lanes=record.lanes)
     record.gate = gate.to_dict()
     for finding in gate.advisory:
+        host = finding.get("host")
+        # #2403: elitebook sat on 0.5.146 (expected 0.5.148) for the length
+        # of a cordon's full lifetime with this line as the ONLY signal an
+        # operator got — "fix by hand" with no hand to follow. When the
+        # finding names a host, name the two commands that actually clear
+        # it, so nobody has to derive them from scratch under time pressure.
+        remedy = (
+            f" — run `coord agent update --machine {host}` then "
+            f"`coord release cordon --clear {host}`"
+            if host
+            else ""
+        )
         click.echo(
-            f"  ~ advisory [{finding.get('severity')}] {finding.get('host')} "
+            f"  ~ advisory [{finding.get('severity')}] {host} "
             f"{finding.get('lane')}: {finding.get('summary')} "
-            "— outside propagation's reach, fix by hand",
+            f"— outside propagation's reach, fix by hand{remedy}",
             err=True,
         )
     if gate.unrollable:
