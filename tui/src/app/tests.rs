@@ -49213,3 +49213,211 @@ Milestone tracking issue.
              records"
         );
     }
+
+    // ── #2286 (ms-65 §6): what the exit hook actually writes ─────────────
+    //
+    // The sealed acceptance slice drives §6's file shape, restore and pruning
+    // through `TuiDriver`. What it cannot reach is the *exit* hook itself:
+    // `ShellApp::handle`'s `Reaction::Exit` arm calls
+    // `persist_doc_tabs_on_exit`, which writes to the real `~/.coord`, so no
+    // test may call it. These tests cover the one piece of that hook that has
+    // its own logic — `checkpoint_all_detail_sub_state`, the step that banks
+    // the live sub-tab of the document still on screen — and then round-trip
+    // the result through `save_to_path`/`load_from_path` (a temp file), which
+    // is exactly what `save()` does modulo path resolution.
+
+    /// The review's blocking case: open ONE document, switch its sub-tab, and
+    /// quit without ever switching to a different document tab. No tab switch
+    /// ever runs, so nothing banks the live `board_detail_tab` — the exit
+    /// hook's own checkpoint is the only thing that can.
+    #[test]
+    fn exit_checkpoint_banks_the_active_board_documents_live_sub_tab() {
+        let mut app = doc_tab_app(DOC_TAB_BOARD_JSON);
+        let key = ("claude-coordinator".to_string(), 102);
+        app.open_board_doc_tab(key.clone(), true);
+
+        // A sub-tab-only switch, the way `events.rs` makes it: the live field
+        // moves, the tab set does not.
+        app.board_detail_tab = BoardDetailTab::Chat;
+
+        assert_eq!(
+            app.doc_tabs
+                .group(PanelScope::Board)
+                .sub_state(&key)
+                .map(|s| s.board_tab),
+            None,
+            "precondition: with no tab switch, nothing has banked #102's \
+             sub-tab yet — this is the state the old exit hook serialized"
+        );
+
+        app.checkpoint_all_detail_sub_state();
+
+        assert_eq!(
+            app.doc_tabs
+                .group(PanelScope::Board)
+                .sub_state(&key)
+                .map(|s| s.board_tab),
+            Some(BoardDetailTab::Chat),
+            "#2286 review (blocking): the exit hook must bank the live sub-tab \
+             of the document still on screen, or 'read one issue, then quit' \
+             persists the wrong sub-tab"
+        );
+    }
+
+    /// …and the banked value survives the file, which is the half the user
+    /// actually feels: relaunch lands back on `Chat`, not the `Board` default.
+    #[test]
+    fn a_sub_tab_set_without_any_tab_switch_survives_the_exit_round_trip() {
+        let path = std::env::temp_dir().join(format!(
+            "coord_tabs_exit_roundtrip_{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let mut app = doc_tab_app(DOC_TAB_BOARD_JSON);
+        let key = ("claude-coordinator".to_string(), 102);
+        app.open_board_doc_tab(key.clone(), true);
+        app.board_detail_tab = BoardDetailTab::Chat;
+
+        // Exactly what `persist_doc_tabs_on_exit` does, minus the `~/.coord`
+        // path resolution `save()` adds on top.
+        app.checkpoint_all_detail_sub_state();
+        app.doc_tabs.save_to_path(&path).expect("write the temp file");
+
+        let restored = super::doc_tabs::DocTabs::load_from_path(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            restored.group(PanelScope::Board).active_key(),
+            Some(&key),
+            "#2286 §6: the single open document is still the active tab"
+        );
+        assert_eq!(
+            restored
+                .group(PanelScope::Board)
+                .sub_state(&key)
+                .map(|s| s.board_tab),
+            Some(BoardDetailTab::Chat),
+            "#2286 §6 + issue design bullet: the cheap per-tab sub-state must \
+             come back on restart"
+        );
+    }
+
+    /// The exit hook checkpoints BOTH scopes, not just whichever panel was
+    /// on screen — each scope owns its own live fields, so both are live and
+    /// both are worth banking.
+    #[test]
+    fn exit_checkpoint_banks_both_scopes_not_just_the_visible_one() {
+        let mut app = doc_tab_app(DOC_TAB_BOARD_JSON);
+        let board_key = ("claude-coordinator".to_string(), 101);
+        app.open_board_doc_tab(board_key.clone(), true);
+        app.board_detail_tab = BoardDetailTab::Issue;
+
+        let pipeline_key: (String, u64) = app
+            .pipeline_issues
+            .first()
+            .map(|pi| (pi.repo_slug.clone(), pi.number))
+            .expect("precondition: the shared fixture seeds a Pipeline issue");
+        app.open_pipeline_doc_tab(pipeline_key.clone(), true);
+        app.pipeline_detail_tab = PipelineDetailTab::Log;
+
+        app.checkpoint_all_detail_sub_state();
+
+        assert_eq!(
+            app.doc_tabs
+                .group(PanelScope::Board)
+                .sub_state(&board_key)
+                .map(|s| s.board_tab),
+            Some(BoardDetailTab::Issue),
+            "#2286: the Board scope's active document is banked"
+        );
+        assert_eq!(
+            app.doc_tabs
+                .group(PanelScope::Pipeline)
+                .sub_state(&pipeline_key)
+                .map(|s| s.pipeline_tab),
+            Some(PipelineDetailTab::Log),
+            "#2286: …and the Pipeline scope's, in the same pass"
+        );
+    }
+
+    /// With nothing open the checkpoint is a no-op in both scopes — §4's
+    /// empty state must not gain a phantom record (which would then be
+    /// serialized as a tab that was never opened).
+    #[test]
+    fn exit_checkpoint_is_a_no_op_when_no_document_is_open() {
+        let mut app = doc_tab_app(DOC_TAB_BOARD_JSON);
+        app.board_detail_tab = BoardDetailTab::Chat;
+        let before = app.doc_tabs.clone();
+
+        app.checkpoint_all_detail_sub_state();
+
+        assert_eq!(
+            app.doc_tabs, before,
+            "#2286: with zero tabs there is no document to attribute the live \
+             sub-state to, so the exit hook must change nothing"
+        );
+    }
+
+    /// #2286 review (non-blocking 1): re-clicking the tab that is already
+    /// active changes nothing, so the persist it triggers must not actually
+    /// touch the disk. Asserted end-to-end through the real mutator, on
+    /// `save_to_path`'s "did I write?" return value.
+    #[test]
+    fn a_redundant_click_on_the_active_doc_tab_writes_nothing_to_disk() {
+        let path = std::env::temp_dir().join(format!(
+            "coord_tabs_redundant_click_{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let mut app = doc_tab_app(DOC_TAB_BOARD_JSON);
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 101), true);
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 102), true);
+        // The first click on the already-active tab is NOT a no-op: its
+        // checkpoint banks #102's (default) sub-tab, which had no record yet.
+        assert!(app.activate_board_doc_tab(1), "#102 is at strip index 1");
+        assert!(
+            app.doc_tabs.save_to_path(&path).expect("first write"),
+            "precondition: the first save creates the file"
+        );
+
+        // The genuinely redundant gesture: click it again, nothing left to
+        // bank, nothing moved.
+        assert!(app.activate_board_doc_tab(1), "…and again");
+        let wrote = app.doc_tabs.save_to_path(&path).expect("second save");
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            !wrote,
+            "#2286 review: a click that changes nothing must not re-write \
+             `tabs.json` — every mutator persists unconditionally, so the \
+             no-op check has to live in the writer"
+        );
+    }
+
+    /// …and the converse, which is what makes the check above safe to have:
+    /// a click that DOES change something still writes.
+    #[test]
+    fn a_real_doc_tab_change_still_writes_to_disk() {
+        let path = std::env::temp_dir().join(format!(
+            "coord_tabs_real_change_{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let mut app = doc_tab_app(DOC_TAB_BOARD_JSON);
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 101), true);
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 102), true);
+        app.doc_tabs.save_to_path(&path).expect("first write");
+
+        assert!(app.activate_board_doc_tab(0), "#101 is at strip index 0");
+        let wrote = app.doc_tabs.save_to_path(&path).expect("second save");
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            wrote,
+            "#2286: moving the active tab is a real change and must reach the \
+             file"
+        );
+    }
