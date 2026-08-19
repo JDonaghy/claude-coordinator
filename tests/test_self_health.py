@@ -165,6 +165,36 @@ def test_reports_unknown_when_no_origin_remote_exists(tmp_path: Path) -> None:
     assert "unknown=true" in summary_line(st)
 
 
+def test_reports_unknown_not_up_to_date_when_rev_list_fails_after_refs_resolve(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Regression for the #2436 review finding: if HEAD and origin/<branch>
+    both resolve but the `git rev-list --count` comparison itself fails
+    (timeout, transient git error, shallow-clone edge case), that must be
+    reported as unknown — never as a false-positive "up to date"."""
+    checkout = _make_checkout(tmp_path)
+
+    monkeypatch.setattr(
+        "coord.self_health._commits_behind",
+        lambda repo_path, head, origin: None,
+    )
+
+    st = self_freshness(install_path=checkout, fetch=True)
+
+    assert st.is_git_checkout is True
+    assert st.commits_behind is None
+    assert st.unknown_reason is not None
+    assert "rev-list" in st.unknown_reason
+    assert st.stale is False  # unknown must never be counted as drift
+    assert st.healthy is False
+
+    lines = format_status_lines(st)
+    joined = "\n".join(lines)
+    assert "?" in joined
+    assert "up to date" not in joined
+    assert "SELF_FRESHNESS: git_checkout=true unknown=true" in summary_line(st)
+
+
 def test_healthy_false_for_a_freshly_constructed_default_instance() -> None:
     """Sanity check on the dataclass defaults themselves — a never-populated
     SelfFreshness (e.g. a bug that returns early) must read as unhealthy,

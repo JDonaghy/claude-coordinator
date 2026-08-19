@@ -207,6 +207,11 @@ def self_freshness(
         return st
     st.origin_sha = origin_sha
     st.commits_behind = _commits_behind(install_path, st.head_sha, origin_sha)
+    if st.commits_behind is None:
+        st.unknown_reason = (
+            f"could not compare HEAD ({st.head_sha[:8]}) against "
+            f"origin/{branch} ({origin_sha[:8]}) — git rev-list failed"
+        )
     return st
 
 
