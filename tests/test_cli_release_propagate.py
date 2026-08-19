@@ -847,6 +847,57 @@ def test_a_green_roll_is_verified_and_journalled(valid_config_path, state_dir,
     assert record["verification"]["severity"] == "ok"
 
 
+def test_a_waiting_between_legs_entry_rolls_its_host_normally(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    """#2403, end to end: `laptop`'s only queue entry is `waiting` — deferred
+    by an unrelated repo-capacity cap (#1972), exactly `claude-coordinator
+    #2005`'s live shape on 2026-08-18 — with a terminal assignment recording
+    `laptop` as its last worker. #2240's "last known host" fallback exists
+    for a `running` between-legs row; it must not reach a `waiting` one. A
+    genuinely idle `laptop` has to roll and verify like any other free host,
+    not sit deferred and cordoned on the strength of a queue row that never
+    launched anything."""
+    monkeypatch.setattr(
+        release_cmd, "_fetch_board",
+        lambda: (
+            {
+                "drive_queue": [
+                    {"repo_name": "api", "issue_number": 2005,
+                     "state": "waiting", "deferrals": 3, "attempts": 2},
+                ],
+                "assignments": [
+                    {"repo_name": "api", "issue_number": 2005,
+                     "machine_name": "laptop", "status": "COMPLETED",
+                     "dispatched_at": 100.0},
+                ],
+            },
+            None,
+        ),
+    )
+    calls = _stub_lanes(monkeypatch)
+    _stub_verify(monkeypatch, versions={"laptop": ["0.4.110"], "server": ["0.4.110"]},
+                 daemon="server")
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111"],
+    )
+    assert result.exit_code == 0, result.output
+    assert rp.STATUS_DEFERRED not in result.output
+    assert any(host == "laptop" for _lane, host in calls), (
+        "a waiting queue row must never defer the host it names as its "
+        "last known worker"
+    )
+    record = _records(state_dir)[0]
+    assert record["status"] == rp.STATUS_VERIFIED
+    assert not any(
+        l["host"] == "laptop" and l["lane"] == "-" for l in record["lanes"]
+    )
+    # Nothing is left cordoned behind a row that was never actually running.
+    assert mp.cordoned_names() == set()
+
+
 def test_a_red_verification_rolls_every_updated_host_back(valid_config_path, state_dir,
                                                           no_network, monkeypatch):
     """#1835: 'a red post-deploy verification must roll back, not just
@@ -1219,6 +1270,47 @@ def test_2026_08_09_a_good_roll_is_not_reverted_by_lanes_it_cannot_roll(
     assert record["gate"]["severity"] == "ok"
     assert len(record["gate"]["advisory"]) == 3
     assert "advisory" in result.output
+
+
+def test_the_outside_reach_message_names_the_manual_remedy(
+    valid_config_path, state_dir, no_network, monkeypatch
+):
+    """#2403: elitebook sat behind for the length of a cordon's lifetime with
+    only `"outside propagation's reach, fix by hand"` as its signal — no
+    remedy, just an instruction to invent one under time pressure. A
+    finding that names a host must name the two commands that actually fix
+    it: `coord agent update --machine <host>` and `coord release cordon
+    --clear <host>`."""
+    from coord import release_verify as rv
+
+    # `laptop` has a live assignment, so its python lane is deferred (never
+    # attempted) this run — exactly why its own version-mismatch finding
+    # lands as advisory rather than blocking (#2052's `attempted_scope`).
+    monkeypatch.setattr(
+        release_cmd, "_fetch_board",
+        lambda: ({"assignments": [{"machine_name": "laptop", "issue_number": 9,
+                                   "status": "RUNNING"}]}, None),
+    )
+    _stub_lanes(monkeypatch)
+    _stub_verify(
+        monkeypatch,
+        versions={"laptop": ["0.4.110"], "server": ["0.4.110"]},
+        daemon="server",
+        findings=[
+            rv.Finding(severity="crit", host="laptop",
+                       lane="~/.coord-venv (laptop)",
+                       summary="on 0.4.104, expected 0.4.111"),
+        ],
+    )
+    result = CliRunner().invoke(
+        main,
+        ["release", "propagate", "--config", str(valid_config_path),
+         "--target", "0.4.111"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "outside propagation's reach, fix by hand" in result.output
+    assert "coord agent update --machine laptop" in result.output
+    assert "coord release cordon --clear laptop" in result.output
 
 
 def test_a_crit_on_a_lane_this_run_rolled_still_reverts(valid_config_path, state_dir,

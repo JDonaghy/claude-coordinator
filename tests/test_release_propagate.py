@@ -332,6 +332,39 @@ def test_an_unpinned_entry_between_legs_is_unattributable_not_launch_host():
     assert q.rollable_hosts(["dellserver", "elitebook"]) == []
 
 
+def test_a_waiting_entry_between_legs_is_not_attributed_to_its_last_known_host():
+    """#2403, live 2026-08-18 ~23:17 UTC: elitebook was genuinely idle
+    (`active: []` on both `/status` and `/health`), and `coord drive-queue
+    list` showed `claude-coordinator#2005` in state `waiting` — deferred by
+    an unrelated per-repo concurrency cap, not running anywhere. `coord
+    release propagate` nonetheless deferred and cordoned elitebook, reading
+    the log line #2240's fix writes for a genuinely *between-legs* `running`
+    row: "attributed to its last known host".
+
+    #2240's fallback (`_last_assignment_hosts`) exists to narrow an
+    unattributable RUNNING row from fleet-wide to one host — it is not
+    licence to treat a WAITING row as though it were running just because it
+    once had an assignment. Only `state == STATE_RUNNING` may reach that
+    fallback at all; a `waiting` row — however recently it ran, however many
+    times it has been deferred — has no live assignment and no in-flight
+    process anywhere, and must roll its host normally."""
+    entry = {"repo_name": "claude-coordinator", "issue_number": 2005,
+             "state": STATE_WAITING, "deferrals": 3, "attempts": 2}
+    q = rp.assess_quiescence(
+        queue_entries=[entry],
+        # The exact shape `_last_assignment_hosts` reads: a terminal
+        # assignment naming elitebook as the entry's last worker.
+        assignments=[{"repo_name": "claude-coordinator", "issue_number": 2005,
+                      "machine_name": "elitebook", "status": "COMPLETED",
+                      "dispatched_at": 100.0}],
+    )
+    assert q.busy == ()
+    assert q.quiescent
+    assert q.rollable_hosts(["dellserver", "elitebook", "precision"]) == [
+        "dellserver", "elitebook", "precision",
+    ]
+
+
 def test_a_live_assignment_is_attributed_to_its_machine():
     q = rp.assess_quiescence(
         assignments=[{"machine_name": "dellserver", "issue_number": 42,
