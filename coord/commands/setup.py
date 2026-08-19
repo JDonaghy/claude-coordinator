@@ -482,6 +482,60 @@ def _build_init_yaml(
     return "\n".join(lines) + "\n"
 
 
+def list_bundled_skill_dirs() -> list[tuple[str, object]]:
+    """Enumerate bundled `coord/skills/*/SKILL.md` directories (#319).
+
+    Returns ``(skill_name, entry)`` pairs, sorted by name, for every
+    sub-directory of the installed `coord.skills` package that contains a
+    readable ``SKILL.md``. Raises ``ModuleNotFoundError``/``TypeError`` if
+    the package itself can't be located, or ``FileNotFoundError``/
+    ``NotADirectoryError`` if its directory listing can't be read — callers
+    decide how to surface that (``install_skills`` below exits 1; the
+    agent-side self-heal in `agent.py` logs and moves on, since a skills
+    hiccup must never block `/health`).
+    """
+    import importlib.resources as _ilr  # noqa: PLC0415
+
+    skills_ref = _ilr.files("coord").joinpath("skills")
+    skill_dirs: list[tuple[str, object]] = []
+    for entry in skills_ref.iterdir():
+        skill_name = entry.name  # type: ignore[attr-defined]
+        skill_file = entry.joinpath("SKILL.md")
+        try:
+            skill_file.read_text(encoding="utf-8")
+            skill_dirs.append((skill_name, entry))
+        except (FileNotFoundError, IsADirectoryError, TypeError):
+            pass
+    return sorted(skill_dirs)
+
+
+def sync_bundled_skills(
+    target_root: Path, skill_dirs: list[tuple[str, object]]
+) -> list[tuple[str, str]]:
+    """Write each ``(skill_name, entry)`` from *skill_dirs* into
+    *target_root* (normally ``~/.claude/skills/``) if missing or changed
+    (#319 / agent self-heal).
+
+    Returns ``(skill_name, action)`` pairs, ``action`` one of ``"installed"``,
+    ``"updated"``, or ``"unchanged"`` — content-identical skills are left
+    untouched (no rewrite, no mtime bump) so a periodic caller can run this
+    every tick without churn. Does not create *target_root* itself; callers
+    create it first once they know there is something to write.
+    """
+    results: list[tuple[str, str]] = []
+    for skill_name, skill_dir_ref in skill_dirs:
+        skill_file_dest = target_root / skill_name / "SKILL.md"
+        src_text = skill_dir_ref.joinpath("SKILL.md").read_text(encoding="utf-8")  # type: ignore[attr-defined]
+        if skill_file_dest.exists() and skill_file_dest.read_text(encoding="utf-8") == src_text:
+            results.append((skill_name, "unchanged"))
+            continue
+        action = "updated" if skill_file_dest.exists() else "installed"
+        skill_file_dest.parent.mkdir(parents=True, exist_ok=True)
+        skill_file_dest.write_text(src_text, encoding="utf-8")
+        results.append((skill_name, action))
+    return results
+
+
 @click.command(
     "install-skills",
     help=(
@@ -490,8 +544,6 @@ def _build_init_yaml(
         "No repo clone required — reads from the installed PyPI package."
     ),
 )
-
-
 @click.option(
     "--list",
     "do_list",
@@ -499,43 +551,24 @@ def _build_init_yaml(
     default=False,
     help="Show bundled skills and their installed status without copying.",
 )
-
-
 @click.option(
     "--dry-run",
     is_flag=True,
     default=False,
     help="Print what would be installed without writing any files.",
 )
-
-
 def install_skills(do_list: bool, dry_run: bool) -> None:  # noqa: FBT001
     """Install bundled coordinator skills to ~/.claude/skills/ (#319)."""
-    import importlib.resources as _ilr  # noqa: PLC0415
-
     if do_list and dry_run:
         click.echo("warning: --dry-run has no effect when --list is used", err=True)
 
     target_root = Path.home() / ".claude" / "skills"
 
-    # Locate the skills directory inside the installed package.
     try:
-        skills_ref = _ilr.files("coord").joinpath("skills")
+        skill_dirs = list_bundled_skill_dirs()
     except (TypeError, ModuleNotFoundError) as e:
         click.echo(f"error: cannot locate bundled skills: {e}", err=True)
         sys.exit(1)
-
-    # Enumerate skill directories (each sub-directory that contains SKILL.md).
-    skill_dirs: list[tuple[str, object]] = []
-    try:
-        for entry in skills_ref.iterdir():
-            skill_name = entry.name  # type: ignore[attr-defined]
-            skill_file = entry.joinpath("SKILL.md")
-            try:
-                skill_file.read_text(encoding="utf-8")
-                skill_dirs.append((skill_name, entry))
-            except (FileNotFoundError, IsADirectoryError, TypeError):
-                pass
     except (FileNotFoundError, NotADirectoryError) as e:
         click.echo(f"error: bundled skills directory not readable: {e}", err=True)
         sys.exit(1)
@@ -546,31 +579,26 @@ def install_skills(do_list: bool, dry_run: bool) -> None:  # noqa: FBT001
 
     if do_list:
         click.echo("Bundled skills:")
-        for skill_name, _ in sorted(skill_dirs):
+        for skill_name, _ in skill_dirs:
             installed_path = target_root / skill_name / "SKILL.md"
             status = "installed" if installed_path.exists() else "not installed"
             click.echo(f"  {skill_name:30s}  {status}")
         return
 
-    # Install / update each skill.
-    if not dry_run:
-        target_root.mkdir(parents=True, exist_ok=True)
-    for skill_name, skill_dir_ref in sorted(skill_dirs):
-        skill_dest = target_root / skill_name
-        skill_file_dest = skill_dest / "SKILL.md"
-        if dry_run:
+    if dry_run:
+        for skill_name, _ in skill_dirs:
+            skill_file_dest = target_root / skill_name / "SKILL.md"
             action = "update" if skill_file_dest.exists() else "install"
             click.echo(f"  would {action}: {skill_file_dest}")
+        return
+
+    target_root.mkdir(parents=True, exist_ok=True)
+    for skill_name, action in sync_bundled_skills(target_root, skill_dirs):
+        if action == "unchanged":
             continue
+        click.echo(f"  {action}: {target_root / skill_name / 'SKILL.md'}")
 
-        skill_dest.mkdir(parents=True, exist_ok=True)
-        src_text = skill_dir_ref.joinpath("SKILL.md").read_text(encoding="utf-8")
-        action = "updated" if skill_file_dest.exists() else "installed"
-        skill_file_dest.write_text(src_text, encoding="utf-8")
-        click.echo(f"  {action}: {skill_file_dest}")
-
-    if not dry_run:
-        installed_names = sorted(name for name, _ in skill_dirs)
-        cmd_list = "  ".join(f"/{n}" for n in installed_names)
-        click.echo(f"\nDone. Available skills: {cmd_list}")
-        click.echo("Type a skill name inside a Claude Code session to use it.")
+    installed_names = sorted(name for name, _ in skill_dirs)
+    cmd_list = "  ".join(f"/{n}" for n in installed_names)
+    click.echo(f"\nDone. Available skills: {cmd_list}")
+    click.echo("Type a skill name inside a Claude Code session to use it.")

@@ -470,7 +470,16 @@ their repos come from the coordinator at dispatch time anyway.
 ## Install coordinator skills (`coord install-skills`, #319)
 
 Coordinator ships bundled **Claude Code skills** (slash commands available inside
-any `claude` session).  Install or update them with:
+any `claude` session). You do not need to run this manually on a machine running
+`coord agent` — every agent's health tick self-heals a missing or stale skill the
+same way it self-heals a stale graphify graph (see `AgentServer._self_heal_missing_skills`
+in `coord/agent.py`, and `/health`'s `skills_self_heal` block for the pass count and what
+was last synced). This closes the gap #319 originally left open: `coord install-skills`
+was a real fix nothing in provisioning ever ran, so a skill added or updated in a release
+could sit uninstalled on a worker machine indefinitely, unnoticed.
+
+Run the CLI form yourself for the operator's own machine (the health tick only covers
+machines running `coord agent`), or to see status/preview without writing anything:
 
 ```bash
 coord install-skills              # install/update all bundled skills to ~/.claude/skills/
@@ -479,14 +488,27 @@ coord install-skills --dry-run    # print what would be installed without writin
 ```
 
 Skills are read directly from the installed PyPI package via `importlib.resources` —
-no repo clone required.  Run this once after first install and again after each
-`coord agent update` to pick up new or updated skills.
+no repo clone required.
 
 ### Available skills
+
+Because skills land in `~/.claude/skills/` (user-level, machine-wide) rather than a
+repo-scoped `.claude/skills/`, once installed on a machine every one of these is available
+in *any* `claude` session there — the operator's interactive coordinator session, a headless
+`claude -p` worker leg, or a reviewer leg, in whatever repo that machine happens to be
+working in at the time.
 
 | Skill | Trigger | Purpose |
 |---|---|---|
 | `update-issue` | `/update-issue` | Synthesize what was agreed in a "Chat about issue" session and write it back to the GitHub issue body.  Calls `coord issue edit` after operator confirmation; offers `coord ready` to mark the issue ready for dispatch. |
+| `portal-followup` | Investigating a stuck customer-portal signoff/event, or any `coord portal` troubleshooting | Decision tree for `coord portal outbox`/`events`/`sync` — daemon-host-only commands, the `credentials_set` check, `HELD` rows, and the preview-approval pre-merge gate. |
+| `merge-stuck-triage` | A story won't merge — "Go" does nothing, `coord merge` skips it | Walks the merge gates in the order they actually block: Test verdict, review approval, CI, PR conflicts, queue clog, post-bounce keying. |
+| `pipeline-limbo-triage` | An issue sits in the Pipeline with no assignments and nobody dispatched it | Explains the `status:ready`-with-no-assignment limbo state and the `coord backlog` fix. |
+| `drive-queue-preflight` | About to queue >~2 issues on one repo, or reading a `QUEUE: STALLED`/`BLOCKED` alert | The intra-repo staling cascade, the `coord merge --revalidate` drain, and the alert decoder table. |
+| `fleet-restart-safety` | About to restart `coord-agent`/`coord-serve`, or edit `coordinator.yml` on a live fleet | Which restart kills which thing, the correct pre-restart check for each, and why `coordinator.remote.yml` reverts on edit. |
+| `review-verdict-recovery` | `coord gates` shows `review : ERROR`, or a review reached `END_REVIEW` with no verdict | Recover the verdict from the transcript via `coord report-result --verdict-source recovered` instead of re-dispatching. |
+| `tui-quadraui-workflow` | Working in `tui/` and the task needs a quadraui pin bump or an unmerged quadraui branch | Bumping `tui/Cargo.toml`'s pinned `rev` vs. building against a local `~/src/quadraui` checkout via the cargo local-paths override, without touching the pin. |
+| `coord-dispatch-verbs` | About to enqueue/dispatch/stage an issue via `coord`, especially if unsure of the exact subcommand, or a dispatch command "succeeded" but nothing showed up where expected | Disambiguates `coord queue` (label only, no dispatch) from `coord drive-queue add` (the real driver queue) and similar near-miss command pairs; the rule to verify effect, not exit code. |
 
 ### Usage (inside a "Chat about issue" session)
 
