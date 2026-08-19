@@ -39,6 +39,7 @@ from coord.drive import (
     EXIT_DISPATCH_REFUSED,
     EXIT_ESCALATED,
     EXIT_OK,
+    EXIT_SELF_STALE,
     EXIT_TERMINAL_FAILURE,
     EXIT_USAGE,
     RUN,
@@ -4664,7 +4665,7 @@ def driver_factory(tmp_path, monkeypatch, capsys):
 
     def make(
         payloads, *, opts=None, verifier=None, config=None, oracle_gate=None,
-        usage_prober=None, ticks=200,
+        usage_prober=None, self_head_probe=None, ticks=200,
     ):
         clock = {"t": 0.0}
         recorded: list[list[str]] = []
@@ -4688,6 +4689,16 @@ def driver_factory(tmp_path, monkeypatch, capsys):
             # probe at all), which the gate always treats as "proceed,
             # silently". Tests exercising the gate itself pass their own.
             usage_prober=usage_prober or (lambda: PlanLimits(status="unknown")),
+            # #2443: default to a stub reporting a constant, never-moving
+            # HEAD — same "opt in only the test that needs it" posture as
+            # *usage_prober* above. Without this, every driver test would
+            # exercise the REAL probe (a handful of local `git` reads
+            # against this actual checkout, routed through `fake_run` above
+            # since `coord.self_health` imports the same `subprocess`
+            # module object) — harmless, but tying every other test's
+            # behaviour to this repo's own git state is exactly the kind of
+            # incidental coupling worth avoiding.
+            self_head_probe=self_head_probe or (lambda: "unchanging-sha"),
             sleeper=lambda secs: clock.__setitem__("t", clock["t"] + secs),
             clock=lambda: clock["t"],
         )
@@ -5317,6 +5328,66 @@ def test_driver_returns_the_deadline_code_when_time_runs_out(driver_factory, cap
     driver = driver_factory(
         [board(status="done", test_state="")],
         opts=DriveOptions(machine="precision", poll=30.0, deadline_mins=1.0),
+    )
+    assert driver.run() == EXIT_DEADLINE
+    assert "deadline" in capsys.readouterr().err
+
+
+def test_driver_self_heals_when_code_moves_underneath_a_stuck_wait(
+    driver_factory, capsys,
+):
+    """#2443: the claude-coordinator#2286 shape end to end. `_decide_
+    advisory`'s "could not verify branch commits (git fetch failed),
+    retrying" WAIT (#2426) repeats byte-for-byte every poll as long as
+    nothing about the underlying condition changes — exactly what a stuck
+    `git fetch` looks like, and exactly what a session running STALE
+    in-memory `coord/drive.py` code can never resolve on its own (Python
+    never reloads an already-imported module). If this session's own
+    on-disk checkout moves while it is stuck in that loop, it must self-exit
+    (`EXIT_SELF_STALE`) instead of polling the same dead logic to
+    `--deadline` — the recovery is `coord drive-queue` relaunching fresh,
+    not this process outliving its own bug fix."""
+    calls = {"n": 0}
+
+    def probe():
+        calls["n"] += 1
+        # Call 1 is `_loop`'s own start-of-run baseline capture. Every call
+        # after that is a self-heal re-check, made only once the WAIT
+        # streak crosses the threshold — return a DIFFERENT sha from the
+        # second call onward to simulate a fix landing mid-run.
+        return "aaaaaaaaaaaa" if calls["n"] == 1 else "bbbbbbbbbbbb"
+
+    driver = driver_factory(
+        [board(status="advisory", branch="issue-1392-x")],
+        opts=DriveOptions(machine="precision", poll=1.0, deadline_mins=60.0),
+        verifier=FakeVerifier(has_commits=None),
+        self_head_probe=probe,
+    )
+    assert driver.run() == EXIT_SELF_STALE
+    err = capsys.readouterr().err
+    assert "code changed underneath this session" in err
+    assert "aaaaaaaa" in err  # the recorded start sha, truncated to 8 chars
+    assert "bbbbbbbb" in err  # the recorded moved-to sha, truncated
+    # It genuinely waited out the streak threshold instead of firing on the
+    # very first repeat of the label — the start capture plus AT LEAST one
+    # re-check, never on call 1 alone.
+    assert calls["n"] >= 2
+
+
+def test_driver_keeps_waiting_when_the_same_wait_repeats_but_code_has_not_moved(
+    driver_factory, capsys,
+):
+    """The other half of #2443: an identical WAIT label repeating is not, on
+    its own, grounds to self-exit — only a MOVED on-disk HEAD is. The
+    ordinary, overwhelmingly common case (the underlying condition just
+    genuinely has not resolved yet) must keep polling exactly as before,
+    all the way to `--deadline` — this must never fire for a
+    slow-but-progressing wait."""
+    driver = driver_factory(
+        [board(status="advisory", branch="issue-1392-x")],
+        opts=DriveOptions(machine="precision", poll=1.0, deadline_mins=0.2),
+        verifier=FakeVerifier(has_commits=None),
+        self_head_probe=lambda: "unchanging-sha",
     )
     assert driver.run() == EXIT_DEADLINE
     assert "deadline" in capsys.readouterr().err
