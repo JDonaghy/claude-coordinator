@@ -530,20 +530,24 @@ pub(crate) fn globs_overlap(allowed: &str, route: &str) -> bool {
 /// Exists because the Board's "View in Pipeline" affordance used to gate
 /// purely on `pipeline_issues` membership — broader than what the Pipeline
 /// sidebar actually renders (#815 built a disabled state for the *untracked*
-/// case, but a *tracked* issue can still render nowhere: dismissed, filtered
-/// out by an active Pipeline search, or — the case that motivated this fix —
-/// classified "done" via a stale `merge_queue` row (e.g. closed then
-/// reopened, no fresh assignment yet), which #2405 removed from the sidebar
-/// altogether). The menu predicate and the jump handler both call
-/// `pipeline_jump_target` so they can't drift on the answer again.
+/// case, but a *tracked* issue can still render nowhere: dismissed, or —
+/// the case that motivated this fix — classified "done" via a stale
+/// `merge_queue` row (e.g. closed then reopened, no fresh assignment yet),
+/// which #2405 removed from the sidebar altogether). The menu predicate and
+/// the jump handler both call `pipeline_jump_target` so they can't drift on
+/// the answer again.
+///
+/// #2449: a hit hidden only by the currently-typed Pipeline search filter is
+/// deliberately NOT one of these reasons any more — "View in Pipeline" now
+/// opens/activates a Pipeline document tab, which doesn't require the
+/// issue's sidebar row to survive the active filter. The other three
+/// reasons still describe a genuine absence of anything to jump to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum PipelineNotVisible {
     /// Not a `pipeline_issues` member at all — no tracked (`coord`) label.
     Untracked,
     /// A member, but dismissed from the Pipeline sidebar this session.
     Dismissed,
-    /// A member, but hidden by the currently-typed Pipeline search filter.
-    SearchFiltered,
     /// #2405: a member classified into the "done" bucket. The Pipeline
     /// sidebar no longer has a Done section at all — completed issues live
     /// in the `Completed` tab's grid — so there is no sidebar row to jump to.
@@ -557,7 +561,6 @@ impl PipelineNotVisible {
         match self {
             Self::Untracked => "no coord label",
             Self::Dismissed => "dismissed",
-            Self::SearchFiltered => "search-filtered",
             Self::Completed => "see Completed tab",
         }
     }
@@ -570,9 +573,6 @@ impl PipelineNotVisible {
             ),
             Self::Dismissed => {
                 format!("#{issue_number} was dismissed from the Pipeline this session.")
-            }
-            Self::SearchFiltered => {
-                format!("#{issue_number} is hidden by the active Pipeline search filter.")
             }
             Self::Completed => format!(
                 "#{issue_number} is completed — open the Pipeline's Completed tab to find it."
@@ -853,19 +853,15 @@ impl CoordApp {
             })
             .ok_or(PipelineNotVisible::Untracked)?;
         let issue = &self.pipeline_issues[idx];
-        // Attribute *why* below before checking `visible` — both dismissal
-        // and the search filter are also applied inside the per-bucket
-        // functions themselves, so checking them here doesn't change the
-        // gating decision; it only lets us report the specific cause
-        // instead of a generic "not visible".
+        // Attribute *why* below before checking `visible` — dismissal is
+        // also applied inside the per-bucket functions themselves, so
+        // checking it here doesn't change the gating decision; it only lets
+        // us report the specific cause instead of a generic "not visible".
         if self
             .pipeline_dismissed
             .contains(&(issue.repo_slug.clone(), issue.number))
         {
             return Err(PipelineNotVisible::Dismissed);
-        }
-        if !self.pipeline_search.matches(issue.number, &issue.title) {
-            return Err(PipelineNotVisible::SearchFiltered);
         }
         // #2405: "done" has no sidebar section any more — completed issues
         // are reachable only through the Completed tab's grid — so it can
@@ -874,10 +870,16 @@ impl CoordApp {
         if lc == "done" {
             return Err(PipelineNotVisible::Completed);
         }
+        // #2449: visibility is checked with the Pipeline search filter
+        // IGNORED (`apply_search = false`) — "View in Pipeline" opens or
+        // activates a document tab, which doesn't need the issue's row to
+        // survive the currently-typed filter the way a sidebar selection
+        // does. The tree itself is unaffected; only this jump/enablement
+        // check is filter-blind.
         let visible = match lc {
-            "in-progress" => self.pipeline_active_issues().contains(&idx),
+            "in-progress" => self.pipeline_active_issues_impl(false).contains(&idx),
             lc => self
-                .pipeline_repos_for_state(lc)
+                .pipeline_repos_for_state_impl(lc, false)
                 .iter()
                 .any(|(_, idxs)| idxs.contains(&idx)),
         };
@@ -1267,6 +1269,19 @@ impl CoordApp {
     /// issues across all repos.  Applies dedup (last-write-wins by
     /// `(repo_slug, issue_number)`), search filter, and dismissal filter.
     pub(crate) fn pipeline_active_issues(&self) -> Vec<usize> {
+        self.pipeline_active_issues_impl(true)
+    }
+
+    /// Shared implementation behind [`Self::pipeline_active_issues`] and
+    /// [`Self::pipeline_jump_target`]. `apply_search` controls whether the
+    /// currently-typed Pipeline search filter is applied.
+    ///
+    /// #2449: `pipeline_jump_target` calls this with `apply_search = false`
+    /// so "View in Pipeline" can open/activate a document tab for an issue
+    /// the search filter is currently hiding from the sidebar tree — a tab
+    /// doesn't need the issue's row to survive the filter the way a sidebar
+    /// selection does. Every other caller keeps `apply_search = true`.
+    fn pipeline_active_issues_impl(&self, apply_search: bool) -> Vec<usize> {
         let mut dedup: std::collections::HashMap<(String, u64), usize> =
             std::collections::HashMap::new();
         for (i, issue) in self.pipeline_issues.iter().enumerate() {
@@ -1283,7 +1298,7 @@ impl CoordApp {
             .filter(|&i| {
                 let issue = &self.pipeline_issues[i];
                 self.pipeline_lifecycle_section(issue) == "in-progress"
-                    && self.pipeline_search.matches(issue.number, &issue.title)
+                    && (!apply_search || self.pipeline_search.matches(issue.number, &issue.title))
             })
             .collect();
         idxs.sort_unstable();
@@ -2503,13 +2518,25 @@ impl CoordApp {
     /// Applies dedup, search filter, and dismissal filter.  Empty repos are
     /// omitted.
     pub(crate) fn pipeline_repos_for_state(&self, lc_key: &'static str) -> Vec<(String, Vec<usize>)> {
+        self.pipeline_repos_for_state_impl(lc_key, true)
+    }
+
+    /// Shared implementation behind [`Self::pipeline_repos_for_state`] and
+    /// [`Self::pipeline_jump_target`] — see
+    /// [`Self::pipeline_active_issues_impl`]'s doc comment for why
+    /// `apply_search` exists (#2449).
+    fn pipeline_repos_for_state_impl(
+        &self,
+        lc_key: &'static str,
+        apply_search: bool,
+    ) -> Vec<(String, Vec<usize>)> {
         let mut dedup: std::collections::HashMap<(String, u64), usize> =
             std::collections::HashMap::new();
         for (i, issue) in self.pipeline_issues.iter().enumerate() {
             if !self
                 .pipeline_dismissed
                 .contains(&(issue.repo_slug.clone(), issue.number))
-                && self.pipeline_search.matches(issue.number, &issue.title)
+                && (!apply_search || self.pipeline_search.matches(issue.number, &issue.title))
             {
                 dedup.insert((issue.repo_slug.clone(), issue.number), i);
             }

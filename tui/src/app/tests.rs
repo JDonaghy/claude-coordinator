@@ -30327,6 +30327,367 @@
         );
     }
 
+    // ── #2449: "View in Pipeline" opens/activates a Pipeline document tab ──
+    //
+    // Pre-#2449, `jump_to_pipeline` only revealed a row in the Pipeline
+    // sidebar tree — it never opened a document tab (#2284), and the
+    // right-click menu item was disabled whenever the active Pipeline
+    // search filter hid the target's row. These tests cover the shared
+    // `jump_to_pipeline`'s new open-or-activate-a-tab behaviour, called by
+    // both the Queue's `drive-queue-view-in-pipeline` entry and the Board's
+    // `jump-to-pipeline` entry.
+
+    /// #2449 AC1: right-clicking a Queue row and activating "View in
+    /// Pipeline" for an issue with no Pipeline tab open yet opens one,
+    /// pinned, and switches to the Pipeline view with it active — asserted
+    /// on the screen grid (tab strip shows the issue, detail pane shows its
+    /// content).
+    #[test]
+    fn tuidriver_queue_view_in_pipeline_opens_pinned_doc_tab_and_switches_to_pipeline() {
+        use quadraui::tui::testing::driver_with_shell;
+        let mut app = make_app_with_drive_queue(
+            BoardData {
+                open_issues: vec![OpenIssue {
+                    repo_name: "myrepo".to_string(),
+                    number: 7,
+                    title: "Jump test issue".to_string(),
+                    body: String::new(),
+                    labels: vec!["coord".to_string()],
+                    state: "open".to_string(),
+                    milestone_number: None,
+                    milestone_title: None,
+                }],
+                pipeline_repos: vec![("myrepo".to_string(), "acme/myrepo".to_string())],
+                ..BoardData::default()
+            },
+            queue_fixture_json_middle_row_7(),
+        );
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 7,
+            title: "Jump test issue".to_string(),
+            body: String::new(),
+            repo_slug: "acme/myrepo".to_string(),
+            coord_repo: Some("myrepo".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: false,
+        }];
+        app.rebuild_board_sidebar();
+        app.rebuild_pipeline_sidebar(None);
+        app.active_view = SidebarView::Queue;
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        let (x, y) = driver
+            .find("M#7")
+            .unwrap_or_else(|| panic!("queue row M#7 must render:\n{}", driver.screen()));
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: MouseButton::Right,
+            position: Point::new(x, y),
+            modifiers: Modifiers::default(),
+        });
+        let (mx, my) = driver.find("View in Pipeline").unwrap_or_else(|| {
+            panic!(
+                "#2449: 'View in Pipeline' must be present in the Queue row menu:\n{}",
+                driver.screen()
+            )
+        });
+        driver.click(mx, my - 0.1);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("PIPELINE"),
+            "#2449: 'View in Pipeline' must switch to the Pipeline view:\n{screen}"
+        );
+        assert!(
+            screen.contains("#7") && screen.contains("Jump test issue"),
+            "#2449: the newly-opened document tab must show the issue in the \
+             tab strip, and its content in the detail pane:\n{screen}"
+        );
+    }
+
+    /// #2449 AC1 (state-level): `jump_to_pipeline` opens a *pinned* Pipeline
+    /// document tab for an issue that has none yet, and switches the active
+    /// view to Pipeline. `pin: true`, not `open_preview`, is what
+    /// distinguishes a deliberate "View in Pipeline" click from the
+    /// single-click "browse" gesture.
+    #[test]
+    fn jump_to_pipeline_opens_a_pinned_doc_tab_for_an_untabbed_issue() {
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Board;
+
+        app.jump_to_pipeline("api", 42);
+
+        assert_eq!(app.active_view, SidebarView::Pipeline);
+        assert_eq!(
+            app.pipeline_doc_tabs().tabs().to_vec(),
+            vec![("acme/api".to_string(), 42)],
+            "#2449: exactly one document tab must open, for the target issue"
+        );
+        assert!(
+            !app.pipeline_doc_tabs().is_preview(0),
+            "#2449: 'View in Pipeline' must PIN the tab, not leave it as a \
+             preview — a deliberate right-click action always gets its own \
+             durable tab rather than being liable to get clobbered by the \
+             next single-click browse"
+        );
+    }
+
+    /// #2449 AC2: activating "View in Pipeline" for an issue that already
+    /// has an open Pipeline document tab — whether that tab is currently a
+    /// preview or already pinned — activates the existing tab; it never
+    /// appends a duplicate.
+    #[test]
+    fn jump_to_pipeline_activates_an_existing_tab_instead_of_duplicating_it() {
+        let mut app = make_pipeline_app();
+        let key42 = ("acme/api".to_string(), 42u64);
+        let key99 = ("other/repo".to_string(), 99u64);
+
+        // #99 pinned + active; #42 sits open as a PREVIEW tab (not active) —
+        // exercises the "preview" half of AC2.
+        app.open_pipeline_doc_tab(key99.clone(), true);
+        app.open_pipeline_doc_tab(key42.clone(), false);
+        app.open_pipeline_doc_tab(key99.clone(), true); // re-activate #99
+        assert_eq!(
+            app.pipeline_doc_tabs().tabs().len(),
+            2,
+            "precondition: two tabs open"
+        );
+        assert_eq!(
+            app.pipeline_doc_tabs().active_index(),
+            Some(0),
+            "precondition: #99 active, #42 an inactive preview"
+        );
+
+        app.jump_to_pipeline("api", 42);
+
+        assert_eq!(
+            app.pipeline_doc_tabs().tabs().len(),
+            2,
+            "#2449: activating an already-open issue's tab must not append a duplicate"
+        );
+        let idx42 = app
+            .pipeline_doc_tabs()
+            .index_of(&key42)
+            .expect("#42's tab must still exist");
+        assert_eq!(app.pipeline_doc_tabs().active_index(), Some(idx42));
+        assert!(
+            !app.pipeline_doc_tabs().is_preview(idx42),
+            "#2449: activating a preview tab via 'View in Pipeline' promotes it to pinned"
+        );
+
+        // Now exercise the "already pinned" half: jump back to #99, which is
+        // pinned and open, but no longer active.
+        app.jump_to_pipeline("other/repo", 99);
+
+        assert_eq!(
+            app.pipeline_doc_tabs().tabs().len(),
+            2,
+            "#2449: still no duplicate for the already-pinned tab"
+        );
+        let idx99 = app
+            .pipeline_doc_tabs()
+            .index_of(&key99)
+            .expect("#99's tab must still exist");
+        assert_eq!(app.pipeline_doc_tabs().active_index(), Some(idx99));
+    }
+
+    /// #2449 AC3: an issue the currently-typed Pipeline search filter would
+    /// hide from the sidebar tree still gets its tab opened/activated by
+    /// "View in Pipeline" — the shared enablement/jump query
+    /// (`pipeline_jump_target`) must not gate on it — and the search box's
+    /// typed text is left completely untouched (the tree stays exactly as
+    /// filtered; only the tab strip is unaffected by it).
+    #[test]
+    fn jump_to_pipeline_opens_a_tab_for_a_search_filtered_issue_without_touching_the_filter() {
+        let mut app = make_pipeline_app();
+        app.pipeline_search.set_value("zzznomatch");
+        app.rebuild_pipeline_sidebar(None);
+
+        // Sanity: #42 really is hidden from the sidebar tree by the filter.
+        assert!(
+            app.pipeline_repos_for_state("new")
+                .iter()
+                .all(|(_, idxs)| !idxs.contains(&0)),
+            "precondition: the search filter must hide #42's sidebar row"
+        );
+
+        // The shared query behind the menu's enablement check must NOT gate
+        // on the search filter any more.
+        assert!(
+            app.pipeline_jump_target("api", 42).is_ok(),
+            "#2449: the search filter must not gate the jump/enablement check"
+        );
+
+        app.jump_to_pipeline("api", 42);
+
+        assert_eq!(
+            app.pipeline_doc_active_key(),
+            Some(&("acme/api".to_string(), 42)),
+            "#2449: the tab must open/activate even though the filter hides the row"
+        );
+        assert_eq!(
+            app.pipeline_search.query, "zzznomatch",
+            "#2449: opening the tab must not clear or otherwise touch the \
+             typed Pipeline search filter"
+        );
+    }
+
+    /// #2449 AC4: "View in Pipeline" still renders disabled, with
+    /// `PipelineNotVisible::menu_hint()`'s reason, for `Untracked`,
+    /// `Dismissed`, and `Completed` issues — regression coverage for the
+    /// cases that must keep gating (only the search filter stopped gating).
+    #[test]
+    fn view_in_pipeline_stays_disabled_for_untracked_dismissed_and_completed() {
+        let mut app = make_pipeline_app();
+        // #99 (second fixture issue) is closed → the "done"/Completed bucket.
+        app.pipeline_issues[1].is_closed = true;
+
+        // Untracked: an issue number with no matching `pipeline_issues` row.
+        let untracked =
+            app.context_menu_items_for_drive_queue_row("api", 9999, "waiting", 0, 1, false);
+        let item = untracked
+            .iter()
+            .find(|i| i.action_id.as_deref() == Some("drive-queue-view-in-pipeline"))
+            .expect("View in Pipeline must be present");
+        assert_eq!(item.disabled_reason.as_deref(), Some("no coord label"));
+
+        // Dismissed: #42, marked dismissed this session.
+        app.pipeline_dismissed.insert(("acme/api".to_string(), 42));
+        let dismissed =
+            app.context_menu_items_for_drive_queue_row("api", 42, "waiting", 0, 1, false);
+        let item = dismissed
+            .iter()
+            .find(|i| i.action_id.as_deref() == Some("drive-queue-view-in-pipeline"))
+            .expect("View in Pipeline must be present");
+        assert_eq!(item.disabled_reason.as_deref(), Some("dismissed"));
+        app.pipeline_dismissed.remove(&("acme/api".to_string(), 42));
+
+        // Completed: #99, closed.
+        let completed =
+            app.context_menu_items_for_drive_queue_row("other/repo", 99, "waiting", 0, 1, false);
+        let item = completed
+            .iter()
+            .find(|i| i.action_id.as_deref() == Some("drive-queue-view-in-pipeline"))
+            .expect("View in Pipeline must be present");
+        assert_eq!(item.disabled_reason.as_deref(), Some("see Completed tab"));
+    }
+
+    /// #2449 AC5: the Board's "View in Pipeline" entry (`jump_board_to_pipeline`,
+    /// #815) inherits the same tab-open behaviour as the Queue's, since both
+    /// call the shared `jump_to_pipeline`. Asserted on the screen grid, via
+    /// the `p` keybinding, exactly like AC1's Queue coverage above.
+    #[test]
+    fn tuidriver_board_view_in_pipeline_opens_pinned_doc_tab_and_switches_to_pipeline() {
+        use quadraui::tui::testing::driver_with_shell;
+        let mut app = make_test_app(BoardData {
+            open_issues: vec![OpenIssue {
+                repo_name: "myrepo".to_string(),
+                number: 7,
+                title: "Jump test issue".to_string(),
+                body: String::new(),
+                labels: vec!["coord".to_string()],
+                state: "open".to_string(),
+                milestone_number: None,
+                milestone_title: None,
+            }],
+            pipeline_repos: vec![("myrepo".to_string(), "acme/myrepo".to_string())],
+            ..BoardData::default()
+        });
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 7,
+            title: "Jump test issue".to_string(),
+            body: String::new(),
+            repo_slug: "acme/myrepo".to_string(),
+            coord_repo: Some("myrepo".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: false,
+        }];
+        app.rebuild_board_sidebar();
+        app.rebuild_pipeline_sidebar(None);
+        app.active_view = SidebarView::Board;
+        app.select_issue("myrepo", 7);
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        driver.press(quadraui::Key::Char('p'));
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("PIPELINE"),
+            "#2449: pressing 'p' must switch to the Pipeline view:\n{screen}"
+        );
+        assert!(
+            screen.contains("#7") && screen.contains("Jump test issue"),
+            "#2449: the jump must open a document tab showing the issue in \
+             the tab strip, and its content in the detail pane:\n{screen}"
+        );
+    }
+
+    /// #2449 AC5 (filtered coverage): the Board menu's "View in Pipeline"
+    /// renders enabled — and the `p` jump opens the tab — for an issue the
+    /// current Pipeline search filter hides, mirroring AC3's Queue coverage.
+    /// Confirms the fix really lives in the shared `jump_to_pipeline`, not a
+    /// Queue-only special case (#1069 already showed that class of drift).
+    #[test]
+    fn board_view_in_pipeline_enabled_and_opens_a_tab_for_a_search_filtered_issue() {
+        use quadraui::tui::testing::driver_with_shell;
+        let mut app = make_test_app(BoardData {
+            open_issues: vec![OpenIssue {
+                repo_name: "myrepo".to_string(),
+                number: 7,
+                title: "Filtered jump issue".to_string(),
+                body: String::new(),
+                labels: vec!["coord".to_string()],
+                state: "open".to_string(),
+                milestone_number: None,
+                milestone_title: None,
+            }],
+            pipeline_repos: vec![("myrepo".to_string(), "acme/myrepo".to_string())],
+            ..BoardData::default()
+        });
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 7,
+            title: "Filtered jump issue".to_string(),
+            body: String::new(),
+            repo_slug: "acme/myrepo".to_string(),
+            coord_repo: Some("myrepo".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: false,
+        }];
+        app.rebuild_board_sidebar();
+        app.pipeline_search.set_value("zzznomatch");
+        app.rebuild_pipeline_sidebar(None);
+
+        let items = app.context_menu_items_for_board_row(
+            Some(7),
+            &BoardRowLifecycle::Backlog,
+            Some("myrepo"),
+        );
+        let item = items
+            .iter()
+            .find(|i| i.action_id.as_deref() == Some("jump-to-pipeline"))
+            .expect("View in Pipeline must be present in the Board menu");
+        assert!(
+            !item.disabled,
+            "#2449: the Board menu item must render enabled for a \
+             search-filtered (but otherwise real) issue: {item:?}"
+        );
+
+        app.active_view = SidebarView::Board;
+        app.select_issue("myrepo", 7);
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        driver.press(quadraui::Key::Char('p'));
+
+        let pipeline_screen = driver.screen();
+        assert!(
+            pipeline_screen.contains("PIPELINE") && pipeline_screen.contains("#7"),
+            "#2449: the jump must open/activate the document tab even though \
+             the active Pipeline search filter hides #7's sidebar row:\n{pipeline_screen}"
+        );
+    }
+
     // ── #1598: enablement predicate == Pipeline render source ──────────────
 
     /// #1598 baseline: a `coord`-labelled issue with no `status:*` label, no

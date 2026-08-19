@@ -5458,17 +5458,18 @@ impl CoordApp {
         self.jump_to_pipeline(&repo_name, issue_number);
     }
 
-    /// #2016: shared reveal-and-select body for "View in Pipeline", called
-    /// by both the Board row jump (`jump_board_to_pipeline`, #815) and the
+    /// #2016: shared open-or-activate body for "View in Pipeline", called by
+    /// both the Board row jump (`jump_board_to_pipeline`, #815) and the
     /// Queue row jump (`drive-queue-view-in-pipeline`) — #1069 already
     /// showed how this logic drifts when duplicated, so there is exactly
     /// one copy.
     ///
-    /// If `repo`/`number` resolves to a real, currently-rendered Pipeline
-    /// row (per [`Self::pipeline_jump_target`] — #1598: the same query the
+    /// If `repo`/`number` resolves to a real Pipeline issue (per
+    /// [`Self::pipeline_jump_target`] — #1598: the same query the
     /// right-click menu's enablement check uses), the Pipeline view is
-    /// activated and the issue is highlighted.  Otherwise a toast names the
-    /// specific reason ([`PipelineNotVisible`]) and the caller's current
+    /// activated and a pinned document tab for the issue is opened (or
+    /// activated, if one is already open) — #2449. Otherwise a toast names
+    /// the specific reason ([`PipelineNotVisible`]) and the caller's current
     /// view stays active.
     pub(crate) fn jump_to_pipeline(&mut self, repo_name: &str, issue_number: u64) {
         // Kick the pipeline loader so data is current — in particular, if the
@@ -5480,59 +5481,19 @@ impl CoordApp {
         // local name, not the GitHub owner/name slug.
         match self.pipeline_jump_target(repo_name, issue_number) {
             Ok(idx) => {
-                let pi = &self.pipeline_issues[idx];
-                let repo_slug = pi.repo_slug.clone();
-                // #815: capture is_closed before calling mutable methods that
-                // require &mut self and would end the borrow of pipeline_issues.
-                let is_closed = pi.is_closed;
-                // #869: New's milestone sub-header defaults to collapsed (#857),
-                // so a jump into New would land on a hidden row just like the
-                // pre-#815-fix Done case did.  Resolve the target's
-                // (lifecycle_key, repo_key, milestone_key) bucket now — before
-                // the rebuild below reads `pipeline_milestone_expanded` to decide
-                // each header's expanded state — so we can force it open.
-                //
-                // #1069: In-progress has the same milestone tier, nested under a
-                // repo node (#1487 — it used to be a Live/Idle liveness node).
-                // Its headers default *expanded*, but a user may have explicitly
-                // collapsed one, so apply the same reveal fix — force both the
-                // repo group and the milestone group open.
-                let lc_key = self.pipeline_lifecycle_section(pi);
-                let repo_key = Self::pipeline_repo_key(pi).to_string();
-                let mil_key = match self.pipeline_issue_milestone(pi) {
-                    Some((n, _)) => n.to_string(),
-                    None => "no-milestone".to_string(),
-                };
-                if lc_key == "new" {
-                    self.pipeline_milestone_expanded
-                        .insert((lc_key.to_string(), repo_key, mil_key), true);
-                } else if lc_key == "in-progress" {
-                    self.pipeline_lifecycle_expanded
-                        .insert(("in-progress".to_string(), repo_key.clone()), true);
-                    self.pipeline_milestone_expanded.insert(
-                        ("in-progress".to_string(), repo_key, mil_key),
-                        true,
-                    );
-                }
+                let repo_slug = self.pipeline_issues[idx].repo_slug.clone();
                 // #1029 bug A: keep the ActivityBar/header chrome in sync too.
                 self.switch_active_view(SidebarView::Pipeline);
-                self.rebuild_pipeline_sidebar(Some((repo_slug, issue_number)));
-                self.pipeline_focused_stage = self.default_focused_stage_for_selected_issue();
-                self.pipeline_stage_content_scroll = 0;
-                // #815: if the matched issue is in the Done section, expand Done so
-                // the selection is visible (rebuild_pipeline_sidebar defaults Done
-                // to collapsed, so without this the user would see no change).
-                if is_closed {
-                    let search_offset = 1usize;
-                    if let Some(done_idx) = self
-                        .pipeline_state_section_names
-                        .iter()
-                        .position(|&k| k == "done")
-                    {
-                        self.pipeline_sidebar
-                            .set_collapsed(done_idx + search_offset, false);
-                    }
-                }
+                // #2449: open-or-activate a *pinned* document tab for the
+                // target issue — `pin: true`, not `open_preview`, so a
+                // right-click "View in Pipeline" always lands its own tab
+                // rather than clobbering a different issue's preview tab in
+                // place. `open_pipeline_doc_tab` already does the
+                // milestone/repo-group-expand + `rebuild_pipeline_sidebar`
+                // reveal internally (`reveal_pipeline_active_doc`), including
+                // when the target is hidden by the current Pipeline search
+                // filter — so there is nothing left to hand-roll here.
+                self.open_pipeline_doc_tab((repo_slug, issue_number), true);
             }
             Err(reason) => {
                 self.push_toast(
