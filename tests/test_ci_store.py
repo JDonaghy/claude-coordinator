@@ -58,6 +58,11 @@ class TestNoOpCi:
     def test_returns_empty(self) -> None:
         assert NoOpCi().list_checks_for_pr("acme/api", 1) == []
 
+    def test_list_all_checks_for_pr_returns_empty(self) -> None:
+        """#2446: the unfiltered visibility view is just as much a no-op as
+        the gate view when CI gating is opted out entirely."""
+        assert NoOpCi().list_all_checks_for_pr("acme/api", 1) == []
+
     def test_rerun_for_pr_is_a_noop(self) -> None:
         """#1851: `ci_store: { type: none }` disables CI gating entirely —
         rerun_for_pr must not pretend to do anything."""
@@ -854,6 +859,70 @@ class TestGitHubCiRequiredContexts:
             "coord.github_ops.get_required_status_check_contexts", return_value=[],
         ):
             assert store._required_contexts("acme/api") is None
+
+
+class TestGitHubCiListAllChecksForPr:
+    """#2446: `list_all_checks_for_pr` is the unfiltered counterpart to
+    `list_checks_for_pr` — required + advisory both, backing `coord merge
+    --plan`'s visibility so a regressed advisory check (e.g. a hung/flaky
+    `Acceptance (web)`) is still visible even though the merge gate itself
+    (`list_checks_for_pr`) correctly no longer waits on it."""
+
+    def test_returns_advisory_checks_the_gate_filters_out(self) -> None:
+        payload = json.dumps([
+            {"name": "test (3.12)", "state": "SUCCESS", "bucket": "pass",
+             "link": "", "startedAt": "", "completedAt": ""},
+            {"name": "acceptance", "state": "PENDING", "bucket": "pending",
+             "link": "", "startedAt": "", "completedAt": ""},
+        ])
+        store = GitHubCi()
+        with (
+            patch("coord.ci_github.subprocess.run", return_value=_gh_result(payload)),
+            patch.object(
+                GitHubCi, "_required_contexts",
+                lambda self, repo: frozenset({"test (3.12)"}),
+            ),
+        ):
+            gate_checks = store.list_checks_for_pr("acme/api", 42)
+            all_checks = store.list_all_checks_for_pr("acme/api", 42)
+        assert [c.name for c in gate_checks] == ["test (3.12)"]
+        assert {c.name for c in all_checks} == {"test (3.12)", "acceptance"}
+
+    def test_shares_one_subprocess_call_with_list_checks_for_pr(self) -> None:
+        """Both views read the same cached fetch — asking for both must not
+        double the `gh pr checks` subprocess cost."""
+        payload = json.dumps([
+            {"name": "test (3.12)", "state": "SUCCESS", "bucket": "pass",
+             "link": "", "startedAt": "", "completedAt": ""},
+        ])
+        store = GitHubCi(cache_ttl=60.0)
+        with (
+            patch(
+                "coord.ci_github.subprocess.run", return_value=_gh_result(payload),
+            ) as run,
+            patch.object(
+                GitHubCi, "_required_contexts",
+                lambda self, repo: frozenset({"test (3.12)"}),
+            ),
+        ):
+            store.list_checks_for_pr("acme/api", 42)
+            store.list_all_checks_for_pr("acme/api", 42)
+            store.list_checks_for_pr("acme/api", 42)
+        assert run.call_count == 1
+
+    def test_equals_gate_view_when_required_contexts_unknown(self) -> None:
+        """No branch protection configured/readable — same #1525 "unknown
+        means don't narrow" bias applies to the visibility view too, so the
+        two lists agree rather than one silently diverging."""
+        payload = json.dumps([
+            {"name": "test (3.12)", "state": "SUCCESS", "bucket": "pass",
+             "link": "", "startedAt": "", "completedAt": ""},
+        ])
+        store = GitHubCi()
+        with patch("coord.ci_github.subprocess.run", return_value=_gh_result(payload)):
+            gate_checks = store.list_checks_for_pr("acme/api", 42)
+            all_checks = store.list_all_checks_for_pr("acme/api", 42)
+        assert [c.name for c in gate_checks] == [c.name for c in all_checks]
 
 
 class TestGitHubCiRerunForPr:

@@ -944,6 +944,60 @@ def _reconcile_via_daemon(svc, params: dict) -> None:
         sys.exit(int(code))
 
 
+def _ci_field(summary, name: str, default=0):
+    """Read *name* off a CI rollup, tolerating both shapes ``p.ci_summary``/
+    ``p.ci_summary_all`` can arrive in (#2446).
+
+    ``coord.merge_queue.plan()`` (the local, in-process path) hands back
+    real :class:`~coord.ci_store.CiCheckSummary` instances. ``coord merge
+    --plan`` against a daemon instead reconstructs ``PlannedMerge`` from the
+    ``/board`` JSON payload (``_show_plan_from_daemon`` below) — the server
+    side flattens each rollup with ``dataclasses.asdict`` and nothing
+    re-hydrates it, so on that path both fields arrive as plain ``dict``s
+    instead. ``summary`` is ``None`` on either path when there's nothing to
+    report (no PR yet, no ``ci_store``, …).
+    """
+    if summary is None:
+        return default
+    if isinstance(summary, dict):
+        return summary.get(name, default)
+    return getattr(summary, name, default)
+
+
+def _advisory_ci_note(p) -> str:
+    """#2446: describe any check failing/still-running in the unfiltered
+    (required + advisory) CI rollup that the required-only rollup
+    (``p.ci_summary`` — the same view the merge gate itself evaluates)
+    doesn't already account for.
+
+    A regression here is on a check GitHub's own branch protection doesn't
+    require — `coord merge`'s gate correctly no longer blocks on it (see
+    ``coord.ci_github.GitHubCi.list_checks_for_pr``'s docstring), but an
+    operator staring at a READY row while a real job is red/hung nearby
+    still deserves to see it. Returns ``""`` when there's nothing extra to
+    report (no ``ci_summary_all``, or it agrees with ``ci_summary``).
+    """
+    if p.ci_summary_all is None:
+        return ""
+    req_failed = _ci_field(p.ci_summary, "failed")
+    req_running = _ci_field(p.ci_summary, "running")
+    req_failed_names = set(_ci_field(p.ci_summary, "failed_names", []) or [])
+    extra_failed = _ci_field(p.ci_summary_all, "failed") - req_failed
+    extra_running = _ci_field(p.ci_summary_all, "running") - req_running
+    if extra_failed <= 0 and extra_running <= 0:
+        return ""
+    all_failed_names = _ci_field(p.ci_summary_all, "failed_names", []) or []
+    advisory_failed_names = [n for n in all_failed_names if n not in req_failed_names]
+    bits = []
+    if advisory_failed_names:
+        bits.append("failing: " + ", ".join(advisory_failed_names))
+    elif extra_failed > 0:
+        bits.append(f"{extra_failed} failing")
+    if extra_running > 0:
+        bits.append(f"{extra_running} running")
+    return "   [advisory CI, not blocking — " + "; ".join(bits) + "]"
+
+
 def _print_merge_plan_entries(planned: list) -> None:
     """Print a list of PlannedMerge entries grouped by repo → target_branch."""
     if not planned:
@@ -963,7 +1017,7 @@ def _print_merge_plan_entries(planned: list) -> None:
             _status_str = f"{_p.status}   {_p.reason}"
         click.echo(
             f"  {_p.rank}. #{_p.issue_number}  {_size_str}   "
-            f"{_status_str}     {_p.issue_title}"
+            f"{_status_str}     {_p.issue_title}{_advisory_ci_note(_p)}"
         )
 
 

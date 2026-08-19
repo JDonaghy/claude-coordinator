@@ -3984,6 +3984,20 @@ class PlannedMerge:
     # when no PR is open yet, or `ci_store` has no checks for this PR.
     pr_number: int | None = None
     ci_summary: "CiCheckSummary | None" = None
+    # #2446: the unfiltered (required + advisory) counterpart to
+    # `ci_summary` above, which is narrowed to what GitHub's branch
+    # protection actually requires — the same scope the merge gate itself
+    # evaluates (see `_entry_gate_status`/`coord.ci_github.GitHubCi.
+    # list_checks_for_pr`'s docstrings). A merely-advisory check regressing
+    # (a flaky/hung job the branch's own protection rules don't wait on
+    # either) must never gate a merge attempt, but it's still worth an
+    # operator seeing — this is what `coord merge --plan` renders that from.
+    # `None` under the same conditions as `ci_summary` (no PR yet, or no
+    # `ci_store`); a `CiStore` that predates `list_all_checks_for_pr` yields
+    # the same value as `ci_summary` rather than `None`, so a plan built
+    # against an older store still shows *something* instead of silently
+    # losing the badge.
+    ci_summary_all: "CiCheckSummary | None" = None
     # #2397: mirrors `config.merge.auto_drain` (default False) at plan-build
     # time — read-only exposure, no gate-logic change. The TUI's per-issue
     # Merge stage box needs this to tell "nothing retries until a human runs
@@ -4101,6 +4115,7 @@ def plan(
             reason: str | None = None
 
             ci_summary = None
+            ci_summary_all = None
             if entry.state == PENDING:
                 base_status, reason = _entry_gate_status(
                     entry, board, config, ci_store, gh_ops
@@ -4126,10 +4141,42 @@ def plan(
                 # only ever populates checks for entries that are PENDING at
                 # refresh time, so a MERGING/MERGED row never had real
                 # snapshot data to render in the first place.
+                #
+                # #2446: `ci_summary` MUST stay derived from the same
+                # (already required-narrowed) `list_checks_for_pr` view
+                # `_entry_gate_status` just consulted above — do not widen it
+                # to the unfiltered check list. `coord.drive_queue
+                # ._ci_rollup_all_clear` reads this exact field as positive
+                # evidence that a frozen "CI running:" raw-row string has
+                # gone stale, and that evidence is only valid when it is
+                # counting the SAME checks the live gate decision is based
+                # on (see that function's docstring); widening it here would
+                # make a still-pending ADVISORY check block the #2158
+                # park-recovery self-heal even though the gate itself (and
+                # GitHub's own merge button) is already clear. Advisory
+                # visibility is a genuinely separate concern — see
+                # `ci_summary_all` below.
                 if ci_store is not None and ci_store.is_available and entry.pr_number:
                     checks = ci_store.list_checks_for_pr(entry.repo_github, entry.pr_number)
                     if checks:
                         ci_summary = summarize_counts(checks)
+
+                    # #2446: the unfiltered (required + advisory) rollup —
+                    # pure visibility, never consulted by any gate decision
+                    # or self-heal evidence. Lets `coord merge --plan`/the
+                    # TUI still show a regressed advisory check (e.g.
+                    # `Acceptance (web)`) even though it can no longer block
+                    # `_entry_gate_status` above or the #2158 recovery read
+                    # above. Falls back to `ci_summary` for a `CiStore`
+                    # stand-in that predates `list_all_checks_for_pr`.
+                    list_all = getattr(ci_store, "list_all_checks_for_pr", None)
+                    all_checks = (
+                        list_all(entry.repo_github, entry.pr_number)
+                        if list_all is not None
+                        else checks
+                    )
+                    if all_checks:
+                        ci_summary_all = summarize_counts(all_checks)
 
             result.append(PlannedMerge(
                 assignment_id=entry.assignment_id,
@@ -4145,6 +4192,7 @@ def plan(
                 reason=reason,
                 pr_number=entry.pr_number,
                 ci_summary=ci_summary,
+                ci_summary_all=ci_summary_all,
                 enqueued_at=entry.enqueued_at,
                 last_attempt=entry.last_attempt,
                 milestone=milestones.get((entry.repo_name, entry.issue_number)),

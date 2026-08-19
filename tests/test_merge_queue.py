@@ -5721,6 +5721,84 @@ class TestPlan:
         assert summary.failed_names == ["lint"]
         assert summary.first_failed_url == "http://x/lint"
 
+    def test_ci_summary_all_shows_advisory_checks_the_gate_filters_out(
+        self, coord_db,
+    ) -> None:
+        """#2446: `ci_summary` (the gate's own required-only view) must not
+        widen just because the store also offers an unfiltered view — but
+        `ci_summary_all` should carry the advisory checks the gate itself
+        (`list_checks_for_pr`) filtered out, so `coord merge --plan` can
+        still show a regressed advisory check without it blocking anything."""
+        from types import SimpleNamespace
+
+        class FakeCi:
+            is_available = True
+
+            def list_checks_for_pr(self, repo, number):
+                # Same required-only shape `GitHubCi.list_checks_for_pr`
+                # narrows to post-#2388/#2446 — the gate's own view.
+                return [
+                    SimpleNamespace(
+                        name="test (3.12)", status="completed", conclusion="success",
+                    ),
+                ]
+
+            def list_all_checks_for_pr(self, repo, number):
+                return [
+                    SimpleNamespace(
+                        name="test (3.12)", status="completed", conclusion="success",
+                    ),
+                    SimpleNamespace(
+                        name="Acceptance (web)", status="in_progress", conclusion=None,
+                    ),
+                ]
+
+        items = [_q("w1", size=50, pr=99)]
+        save_queue(items)
+        board = self._board(completed=[
+            self._work("w1", test_state="passed"),
+            self._review("w1", verdict="approve"),
+        ])
+        cfg = self._config()
+        plan = mq.plan(board, cfg, ci_store=FakeCi())
+        # The gate's own reading: one required check, all green.
+        assert plan[0].ci_summary is not None
+        assert plan[0].ci_summary.passed == 1
+        assert plan[0].ci_summary.running == 0
+        # The visibility reading: the pending advisory check is still there.
+        assert plan[0].ci_summary_all is not None
+        assert plan[0].ci_summary_all.passed == 1
+        assert plan[0].ci_summary_all.running == 1
+
+    def test_ci_summary_all_falls_back_to_ci_summary_without_the_capability(
+        self, coord_db,
+    ) -> None:
+        """A `CiStore` that predates `list_all_checks_for_pr` (#2446) must
+        still populate `ci_summary_all` — with the same (already-narrowed)
+        data `ci_summary` has — rather than leaving it `None` and silently
+        losing the plan's CI badge."""
+        from types import SimpleNamespace
+
+        class FakeCi:
+            is_available = True
+
+            def list_checks_for_pr(self, repo, number):
+                return [
+                    SimpleNamespace(name="build", status="completed", conclusion="success"),
+                ]
+
+        items = [_q("w1", size=50, pr=99)]
+        save_queue(items)
+        board = self._board(completed=[
+            self._work("w1", test_state="passed"),
+            self._review("w1", verdict="approve"),
+        ])
+        cfg = self._config()
+        plan = mq.plan(board, cfg, ci_store=FakeCi())
+        assert plan[0].ci_summary is not None
+        assert plan[0].ci_summary_all is not None
+        assert plan[0].ci_summary_all.passed == plan[0].ci_summary.passed
+
     def test_ci_summary_none_without_pr_number(self, coord_db) -> None:
         """No PR yet opened → no CI summary (mirrors the CI gate's own guard)."""
         from types import SimpleNamespace
