@@ -8265,8 +8265,15 @@ impl CoordApp {
     /// `true`). Reveals the newly-active document in the Pipeline sidebar
     /// (§2f, applied per-scope per #2284's fourth acceptance criterion) when
     /// activation actually moved.
+    ///
+    /// #2285 (§5): checkpoint/restore around the mutation, exactly as
+    /// `open_board_doc_tab` does — see `mod.rs`'s "#2285 (ms-65 §5): per-tab
+    /// detail sub-state" section for why the restore has to follow the reveal
+    /// (`reveal_pipeline_active_doc` re-seeds `pipeline_focused_stage` and
+    /// `pipeline_stage_content_scroll`, and the restored values must win).
     pub(crate) fn open_pipeline_doc_tab(&mut self, key: DocKey, pin: bool) {
         let before = self.pipeline_doc_active_key().cloned();
+        self.checkpoint_detail_sub_state(PanelScope::Pipeline);
         {
             let group = self.doc_tabs.group_mut(PanelScope::Pipeline);
             if pin {
@@ -8277,6 +8284,7 @@ impl CoordApp {
         }
         if self.pipeline_doc_active_key().cloned() != before {
             self.reveal_pipeline_active_doc();
+            self.restore_detail_sub_state(PanelScope::Pipeline);
         }
     }
 
@@ -8289,8 +8297,10 @@ impl CoordApp {
         if idx >= self.pipeline_doc_tabs().tabs().len() {
             return false;
         }
+        self.checkpoint_detail_sub_state(PanelScope::Pipeline);
         self.doc_tabs.group_mut(PanelScope::Pipeline).activate_index(idx);
         self.reveal_pipeline_active_doc();
+        self.restore_detail_sub_state(PanelScope::Pipeline);
         true
     }
 
@@ -8306,6 +8316,7 @@ impl CoordApp {
         }
         if self.pipeline_doc_active_key().cloned() != before {
             self.reveal_pipeline_active_doc();
+            self.restore_detail_sub_state(PanelScope::Pipeline);
         }
         true
     }

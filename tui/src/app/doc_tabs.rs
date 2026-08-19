@@ -43,7 +43,10 @@
 //! thing to delete in favour of them. The public surface here is deliberately
 //! small and free of rendering concerns so that swap stays cheap.
 
+use std::collections::HashMap;
+
 use crate::app::format::trunc;
+use crate::app::types::{BoardDetailTab, PipelineDetailTab};
 
 /// Which panel's document set a tab belongs to.
 ///
@@ -110,6 +113,49 @@ pub(crate) fn truncate_with_ellipsis(s: &str, max_cols: usize) -> String {
     format!("{}…", trunc(s, max_cols - 1))
 }
 
+/// The detail pane's sub-state for **one document** (#2285, contract §5).
+///
+/// Before #2285 these lived as single fields on `CoordApp`, so with three tabs
+/// open all three shared one sub-tab, one scroll offset and one expanded
+/// stage: scroll one tab's Issue body and the other two jumped. Holding them
+/// per document is what makes the strip a set of tabs rather than one pane
+/// with a strip above it.
+///
+/// # Scope ownership
+///
+/// A record belongs to exactly one [`PanelScope`] (it is stored inside that
+/// scope's [`DocTabGroup`]), so only that scope's fields are ever read or
+/// written on it — Board touches [`Self::board_tab`], Pipeline touches
+/// [`Self::pipeline_tab`] / [`Self::stage_scroll`] / [`Self::focused_stage`],
+/// and the two never see each other's. [`Self::scroll`] is the pane's body
+/// scroll under either scope (`CoordApp::detail_scroll` for Board,
+/// `pipeline_detail_scroll` for Pipeline) — the same *meaning*, a different
+/// live field, which is why it is one field here and not two.
+///
+/// # Lifetime
+///
+/// Created lazily on the first tab switch away from a document (see
+/// `CoordApp::checkpoint_detail_sub_state`) and dropped by
+/// [`DocTabGroup::prune_sub_state`] the moment its tab leaves the strip —
+/// closed, or evicted from the preview slot. Contract §5: "closing a tab
+/// discards its sub-state; re-opening the same issue starts from the
+/// defaults."
+///
+/// Deliberately NOT persisted across a restart — that is #2286's slice.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct DetailSubState {
+    /// Board scope: which Board detail sub-tab this document is on.
+    pub(crate) board_tab: BoardDetailTab,
+    /// Pipeline scope: which Pipeline detail sub-tab this document is on.
+    pub(crate) pipeline_tab: PipelineDetailTab,
+    /// The detail pane body's scroll offset (Issue/Log/Summary bodies).
+    pub(crate) scroll: usize,
+    /// Pipeline scope: the Overview sub-tab's own stage-content scroll.
+    pub(crate) stage_scroll: usize,
+    /// Pipeline scope: the focused/expanded stage on the Overview sub-tab.
+    pub(crate) focused_stage: Option<usize>,
+}
+
 /// One panel's ordered set of open documents.
 ///
 /// Field invariants (upheld by every mutator, asserted by
@@ -117,11 +163,16 @@ pub(crate) fn truncate_with_ellipsis(s: &str, max_cols: usize) -> String {
 /// - `active` and `preview`, when `Some`, are valid indices into `tabs`.
 /// - `active` is `Some` iff `tabs` is non-empty.
 /// - at most one preview tab exists, and it is `tabs[preview]`.
+/// - `sub_state` only ever holds keys that are still in `tabs` (#2285).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct DocTabGroup {
     tabs: Vec<DocKey>,
     active: Option<usize>,
     preview: Option<usize>,
+    /// #2285: per-document detail sub-state, keyed by the same [`DocKey`] the
+    /// strip is ordered by. Sparse — a document that has never been switched
+    /// away from has no entry and reads as [`DetailSubState::default`].
+    sub_state: HashMap<DocKey, DetailSubState>,
 }
 
 impl DocTabGroup {
@@ -154,6 +205,36 @@ impl DocTabGroup {
         self.tabs.iter().position(|k| k == key)
     }
 
+    // ── #2285 (ms-65 §5): per-document detail sub-state ──────────────────
+
+    /// `key`'s stored sub-state, or `None` for a document that has never been
+    /// switched away from (callers read that as [`DetailSubState::default`] —
+    /// contract §5's "defaults on open match today's defaults").
+    pub(crate) fn sub_state(&self, key: &DocKey) -> Option<&DetailSubState> {
+        self.sub_state.get(key)
+    }
+
+    /// Store `state` against `key`. A no-op for a key that is not open, so a
+    /// checkpoint racing a close can never resurrect discarded sub-state.
+    pub(crate) fn set_sub_state(&mut self, key: DocKey, state: DetailSubState) {
+        if self.index_of(&key).is_some() {
+            self.sub_state.insert(key, state);
+        }
+    }
+
+    /// Contract §5: a tab that leaves the strip takes its sub-state with it.
+    ///
+    /// Called from every mutator that can *remove* a key — [`Self::close`] and
+    /// [`Self::open_preview`]'s replace-in-place branch (which evicts the
+    /// previous preview document just as surely as a close does). Re-opening
+    /// the same issue number afterwards therefore starts from the defaults.
+    fn prune_sub_state(&mut self) {
+        if self.sub_state.is_empty() {
+            return;
+        }
+        self.sub_state.retain(|k, _| self.tabs.contains(k));
+    }
+
     /// Contract §2e rules 1/2/4 — the single-click path.
     ///
     /// Already open → activate it, unchanged. Else a preview exists → replace
@@ -176,6 +257,9 @@ impl DocTabGroup {
             self.preview = Some(idx);
             self.active = Some(idx);
         }
+        // #2285: the replace-in-place branch above evicted a document — its
+        // sub-state goes with it, exactly as a close would discard it.
+        self.prune_sub_state();
         self.debug_check();
     }
 
@@ -254,6 +338,8 @@ impl DocTabGroup {
                 self.active = Some(a - 1);
             }
         }
+        // #2285 (§5): closing a tab discards its sub-state.
+        self.prune_sub_state();
         self.debug_check();
         true
     }
@@ -682,6 +768,78 @@ mod tests {
         // A click before origin_x (where the hidden tab would have been)
         // never resolves to the hidden tab.
         assert_eq!(resolve_doc_tab_click(&labels, 10.0, 8.0, 1), None);
+    }
+
+    // ── per-document sub-state: contract §5 (#2285) ──────────────────────
+
+    fn issue_sub_state(scroll: usize) -> DetailSubState {
+        DetailSubState {
+            board_tab: BoardDetailTab::Issue,
+            scroll,
+            ..DetailSubState::default()
+        }
+    }
+
+    #[test]
+    fn sub_state_round_trips_for_an_open_document() {
+        let mut g = DocTabGroup::default();
+        g.pin(k(101));
+        assert_eq!(g.sub_state(&k(101)), None, "sparse until first written");
+        g.set_sub_state(k(101), issue_sub_state(5));
+        assert_eq!(g.sub_state(&k(101)), Some(&issue_sub_state(5)));
+    }
+
+    #[test]
+    fn set_sub_state_ignores_a_document_that_is_not_open() {
+        let mut g = DocTabGroup::default();
+        g.pin(k(101));
+        g.set_sub_state(k(999), issue_sub_state(5));
+        assert_eq!(
+            g.sub_state(&k(999)),
+            None,
+            "a checkpoint racing a close must not resurrect discarded state"
+        );
+    }
+
+    #[test]
+    fn closing_a_tab_discards_its_sub_state() {
+        let mut g = DocTabGroup::default();
+        g.pin(k(101));
+        g.set_sub_state(k(101), issue_sub_state(5));
+        assert!(g.close(0));
+        g.pin(k(101));
+        assert_eq!(
+            g.sub_state(&k(101)),
+            None,
+            "§5: re-opening the same issue number starts from the defaults"
+        );
+    }
+
+    #[test]
+    fn closing_one_tab_leaves_the_other_tabs_sub_state_alone() {
+        let mut g = DocTabGroup::default();
+        g.pin(k(101));
+        g.pin(k(102));
+        g.set_sub_state(k(101), issue_sub_state(5));
+        g.set_sub_state(k(102), issue_sub_state(9));
+        assert!(g.close(1));
+        assert_eq!(g.sub_state(&k(101)), Some(&issue_sub_state(5)));
+        assert_eq!(g.sub_state(&k(102)), None);
+    }
+
+    /// Replace-in-place evicts a document just as surely as a close does, so
+    /// its record has to go with it — otherwise re-opening that issue into a
+    /// later preview slot would resume sub-state §5 says was discarded.
+    #[test]
+    fn evicting_the_preview_document_discards_its_sub_state() {
+        let mut g = DocTabGroup::default();
+        g.open_preview(k(101));
+        g.set_sub_state(k(101), issue_sub_state(5));
+        g.open_preview(k(102)); // replaces #101 in place
+        assert_eq!(g.tabs(), &[k(102)]);
+        assert_eq!(g.sub_state(&k(101)), None);
+        g.open_preview(k(101));
+        assert_eq!(g.sub_state(&k(101)), None);
     }
 
     #[test]
