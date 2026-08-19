@@ -248,6 +248,32 @@ impl CoordApp {
     /// Sources: `test_state`, `test_reason`, `review_verdict`, `review_findings`,
     /// `failure_reason`, cost, tokens, timing, machine/model, `is_interactive`.
     /// Gracefully omits fields absent from older daemon rows.
+    /// #2417: assignments dispatched BY `assignment_id`'s own turn — every
+    /// row whose `dispatched_by_assignment_id` points back at it (e.g. a
+    /// `type="work"` session shelling out to `coord acceptance author` or
+    /// `coord fix <other-id>` from its own bash tool). Deliberately GLOBAL,
+    /// not issue-scoped: a dispatched sibling typically lands on a
+    /// DIFFERENT `issue_number` from the origin row (a test-author's
+    /// `issue_number` is the milestone's tracking issue; a `coord fix`
+    /// target is whatever unrelated assignment needed the fix), so the
+    /// per-issue filter `build_board_summary_list_view` otherwise uses
+    /// would never find it. Sorted oldest-first for a stable render order
+    /// in the rare case of more than one dispatch from the same turn.
+    pub(crate) fn dispatched_children<'a>(&'a self, assignment_id: &str) -> Vec<&'a Assignment> {
+        let mut children: Vec<&Assignment> = self
+            .data
+            .assignments
+            .iter()
+            .filter(|a| a.dispatched_by_assignment_id.as_deref() == Some(assignment_id))
+            .collect();
+        children.sort_by(|a, b| {
+            a.dispatched_at
+                .partial_cmp(&b.dispatched_at)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        children
+    }
+
     pub(crate) fn pipeline_summary_list(&self) -> ListView {
         let issue = self
             .pipeline_sel
@@ -282,6 +308,9 @@ impl CoordApp {
         let duration_color = Color::rgb(110, 110, 130);
         let reason_color = Color::rgb(210, 210, 210);
         let pr_color = Color::rgb(100, 150, 200);
+        // #2417: distinct from pr_color so a dispatched-sibling link never
+        // reads as "this row's own PR" at a glance.
+        let dispatched_color = Color::rgb(160, 130, 210);
 
         // --- collect assignments for this issue (oldest → newest) ---
         let local_repo = issue.coord_repo.as_deref();
@@ -468,6 +497,37 @@ impl CoordApp {
                 items.push(ListItem {
                     text: StyledText {
                         spans: vec![StyledSpan::with_fg(format!("   {}", url), pr_color)],
+                    },
+                    icon: None,
+                    detail: None,
+                    decoration: Decoration::Normal,
+                });
+            }
+
+            // #2417: this row dispatched an independent sibling assignment
+            // from its own turn (`coord acceptance author`, `coord fix`,
+            // ...) — surface it as a visible link/status right here instead
+            // of leaving the operator to grep the raw worker transcript for
+            // the printed "Dispatched ... to ..." line and manually
+            // cross-reference a second `coord log`.
+            for child in self.dispatched_children(&a.id) {
+                let (child_badge, child_color) = assignment_status_badge(child);
+                let child_type = session_type_label(
+                    child.assignment_type.as_deref().unwrap_or("work"),
+                );
+                let short_id: String = child.id.chars().take(12).collect();
+                items.push(ListItem {
+                    text: StyledText {
+                        spans: vec![
+                            StyledSpan::with_fg(
+                                format!(
+                                    "   → dispatched {} {} on {}",
+                                    child_type, short_id, child.machine
+                                ),
+                                dispatched_color,
+                            ),
+                            StyledSpan::with_fg(format!("  {}", child_badge), child_color),
+                        ],
                     },
                     icon: None,
                     detail: None,

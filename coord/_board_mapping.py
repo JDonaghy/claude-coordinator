@@ -161,6 +161,12 @@ def row_to_assignment(row: object) -> Assignment:
         # #2316: raw terminal stop_reason; None for rows predating this
         # column or a worker whose log carried no such field.
         stop_reason=d.get("stop_reason"),
+        # #2417: the calling worker's own assignment id, when this row was
+        # dispatched from INSIDE another worker's turn (e.g. `coord
+        # acceptance author`/`coord fix` shelled out to from a `type="work"`
+        # session's own bash tool). None for a hand or coordinator/brain
+        # dispatch, and for rows predating this column.
+        dispatched_by_assignment_id=d.get("dispatched_by_assignment_id"),
     )
 
 

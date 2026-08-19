@@ -1354,6 +1354,7 @@ mod pure_tests {
             audit_run_number: None,
             for_issue_number: None,
             driven_by: None,
+            dispatched_by_assignment_id: None,
         }
     }
 

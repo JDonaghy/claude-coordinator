@@ -242,6 +242,163 @@ class TestStopReason:
         update_assignment_stop_reason("some-id", "")  # must not raise
 
 
+class TestDispatchedByAssignmentId:
+    """#2417: dispatched_by_assignment_id — the calling worker's own
+    assignment id, captured from $COORD_ASSIGNMENT_ID at dispatch time, so a
+    sibling assignment a worker's own turn spawns (`coord acceptance
+    author`, `coord fix <other-id>`) is traceable back to the origin row
+    instead of only discoverable by grepping the raw worker transcript.
+    """
+
+    def test_schema_has_dispatched_by_assignment_id_column(self, coord_db) -> None:
+        from coord.db import get_connection
+        conn = get_connection()
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(assignments)").fetchall()}
+        assert "dispatched_by_assignment_id" in cols, (
+            "assignments table is missing dispatched_by_assignment_id column — "
+            "check _migrate_add_columns in coord/db.py"
+        )
+
+    def test_record_dispatched_captures_env_when_set(self, coord_db, monkeypatch) -> None:
+        """A Proposal-based dispatch (coord fix's `_dispatch_followup`, plain
+        `coord assign`, ...) picks up the calling worker's own assignment id
+        from $COORD_ASSIGNMENT_ID — i.e. this dispatch happened FROM INSIDE
+        that worker's own turn, not typed by a human."""
+        monkeypatch.setenv("COORD_ASSIGNMENT_ID", "origin-work-001")
+        proposal = Proposal(
+            id=1, machine_name="laptop", repo_name="api", issue_number=42,
+            issue_title="Fix auth", rationale="x",
+        )
+        record_dispatched(
+            assignment_id="sibling-001", proposal=proposal, repo_github="acme/api",
+        )
+
+        from coord.db import get_connection
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT dispatched_by_assignment_id FROM assignments WHERE assignment_id=?",
+            ("sibling-001",),
+        ).fetchone()
+        assert row[0] == "origin-work-001"
+
+    def test_record_dispatched_none_when_env_unset(self, coord_db, monkeypatch) -> None:
+        """A human typing `coord assign`/`coord fix` in their own shell never
+        has $COORD_ASSIGNMENT_ID set — the column must stay NULL, not read as
+        a phantom dispatch-by-worker."""
+        monkeypatch.delenv("COORD_ASSIGNMENT_ID", raising=False)
+        proposal = Proposal(
+            id=1, machine_name="laptop", repo_name="api", issue_number=42,
+            issue_title="Fix auth", rationale="x",
+        )
+        record_dispatched(
+            assignment_id="sibling-002", proposal=proposal, repo_github="acme/api",
+        )
+
+        from coord.db import get_connection
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT dispatched_by_assignment_id FROM assignments WHERE assignment_id=?",
+            ("sibling-002",),
+        ).fetchone()
+        assert row[0] is None
+
+    def test_record_dispatched_assignment_captures_env_when_set(
+        self, coord_db, monkeypatch
+    ) -> None:
+        """Mirrors the Proposal-path test above for the Assignment-based
+        dispatch path (`coord.test_author.dispatch_test_author`'s
+        `record_dispatched_assignment` call — the exact path coord-portal#119
+        went through: a work session shelling out to `coord acceptance
+        author`)."""
+        from coord.models import Assignment
+        from coord.state import record_dispatched_assignment
+
+        monkeypatch.setenv("COORD_ASSIGNMENT_ID", "b1b6f90ca426")
+        record_dispatched_assignment(
+            assignment=Assignment(
+                assignment_id="41249c1cebbd", machine_name="precision",
+                repo_name="coord-portal", issue_number=16,
+                issue_title="[test-author] ms-16 slice #10", type="test-author",
+            ),
+            repo_github="acme/coord-portal",
+        )
+
+        from coord.db import get_connection
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT dispatched_by_assignment_id FROM assignments WHERE assignment_id=?",
+            ("41249c1cebbd",),
+        ).fetchone()
+        assert row[0] == "b1b6f90ca426"
+
+    def test_explicit_value_on_the_dataclass_wins_over_env(
+        self, coord_db, monkeypatch
+    ) -> None:
+        """A caller that already set dispatched_by_assignment_id explicitly
+        (none do today, but the seam supports it) is never clobbered by the
+        env-derived default."""
+        monkeypatch.setenv("COORD_ASSIGNMENT_ID", "some-other-worker")
+        proposal = Proposal(
+            id=1, machine_name="laptop", repo_name="api", issue_number=42,
+            issue_title="Fix auth", rationale="x",
+            dispatched_by_assignment_id="explicit-parent",
+        )
+        record_dispatched(
+            assignment_id="sibling-003", proposal=proposal, repo_github="acme/api",
+        )
+
+        from coord.db import get_connection
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT dispatched_by_assignment_id FROM assignments WHERE assignment_id=?",
+            ("sibling-003",),
+        ).fetchone()
+        assert row[0] == "explicit-parent"
+
+    def test_audit_summary_names_the_dispatching_assignment(
+        self, coord_db, monkeypatch
+    ) -> None:
+        """#2417's other half: `coord audit`'s default (non-JSON) table must
+        show the link too, not just a --json details field — this is what
+        let coord-portal#119's dispatch go unnoticed without grepping the raw
+        transcript."""
+        from coord.state import list_audit_log
+
+        monkeypatch.setenv("COORD_ASSIGNMENT_ID", "origin-work-audit")
+        proposal = Proposal(
+            id=1, machine_name="laptop", repo_name="api", issue_number=42,
+            issue_title="Fix auth", rationale="x",
+        )
+        record_dispatched(
+            assignment_id="sibling-audit-001", proposal=proposal, repo_github="acme/api",
+        )
+
+        result = list_audit_log(assignment_id="sibling-audit-001")
+        entries = result["entries"]
+        assert len(entries) == 1
+        assert "dispatched by assignment origin-work-audit" in entries[0]["summary"]
+        assert entries[0]["details"]["dispatched_by_assignment_id"] == "origin-work-audit"
+
+    def test_load_dispatched_surfaces_the_field(self, coord_db, monkeypatch) -> None:
+        """The board-level reverse-lookup surface (`coord.state.load_dispatched`,
+        which both `coord sessions`/`coord log` and the TUI's board payload
+        read from) must carry the field so a consumer can find "which
+        assignment dispatched me" without a raw-log grep."""
+        from coord.state import load_dispatched
+
+        monkeypatch.setenv("COORD_ASSIGNMENT_ID", "origin-work-load")
+        proposal = Proposal(
+            id=1, machine_name="laptop", repo_name="api", issue_number=42,
+            issue_title="Fix auth", rationale="x",
+        )
+        record_dispatched(
+            assignment_id="sibling-load-001", proposal=proposal, repo_github="acme/api",
+        )
+
+        rows = {r["assignment_id"]: r for r in load_dispatched()}
+        assert rows["sibling-load-001"]["dispatched_by_assignment_id"] == "origin-work-load"
+
+
 class TestRecordDispatchedAssignmentBranch:
     """#557: record_dispatched_assignment must persist the branch column so
     coord reattach can find it for the remote push-back finalize."""

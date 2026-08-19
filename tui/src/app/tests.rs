@@ -2046,6 +2046,7 @@
             audit_run_number: None,
             for_issue_number: None,
             driven_by: None,
+            dispatched_by_assignment_id: None,
         };
         BoardData {
             assignments: vec![work],
@@ -4339,6 +4340,7 @@
             audit_run_number: None,
             for_issue_number: None,
             driven_by: None,
+            dispatched_by_assignment_id: None,
         }
     }
 
@@ -5690,6 +5692,7 @@
             audit_run_number: None,
             for_issue_number: None,
             driven_by: None,
+            dispatched_by_assignment_id: None,
         });
         // Has assignment → in-progress, even though status:ready label is set.
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
@@ -6212,6 +6215,7 @@
             audit_run_number: None,
             for_issue_number: None,
             driven_by: None,
+            dispatched_by_assignment_id: None,
         });
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
         assert_eq!(section, "new");
@@ -6302,6 +6306,7 @@
             audit_run_number: None,
             for_issue_number: None,
             driven_by: None,
+            dispatched_by_assignment_id: None,
         });
         // is_closed wins over has-assignment.
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
@@ -6511,6 +6516,7 @@
             audit_run_number: None,
             for_issue_number: None,
             driven_by: None,
+            dispatched_by_assignment_id: None,
         });
 
         // With no queue entry but a merged work assignment, Merge stage → Done.
@@ -7566,6 +7572,7 @@
             audit_run_number: None,
             for_issue_number: None,
             driven_by: None,
+            dispatched_by_assignment_id: None,
         }
     }
 
@@ -11039,6 +11046,7 @@
             audit_run_number: None,
             for_issue_number: None,
             driven_by: None,
+            dispatched_by_assignment_id: None,
         });
         let issue = &app.pipeline_issues[0];
         assert!(app.issue_has_any_assignment(issue));
@@ -11101,6 +11109,7 @@
                 audit_run_number: None,
                 for_issue_number: None,
                 driven_by: None,
+                dispatched_by_assignment_id: None,
             });
         }
         let issue = &app.pipeline_issues[0];
@@ -11157,6 +11166,7 @@
             audit_run_number: None,
             for_issue_number: None,
             driven_by: None,
+            dispatched_by_assignment_id: None,
         });
         // Same issue number but different repo — should be excluded.
         app.data.assignments.push(Assignment {
@@ -11202,6 +11212,7 @@
             audit_run_number: None,
             for_issue_number: None,
             driven_by: None,
+            dispatched_by_assignment_id: None,
         });
         let issue = &app.pipeline_issues[0];  // coord_repo = Some("api")
         let total = app.issue_total_cost(issue).expect("should have cost");
@@ -11258,6 +11269,7 @@
             audit_run_number: None,
             for_issue_number: None,
             driven_by: None,
+            dispatched_by_assignment_id: None,
         });
         // Interactive session — cost_usd is None (Max subscription).
         app.data.assignments.push(Assignment {
@@ -11303,6 +11315,7 @@
             audit_run_number: None,
             for_issue_number: None,
             driven_by: None,
+            dispatched_by_assignment_id: None,
         });
         let issue = &app.pipeline_issues[0];
         let total = app.issue_total_cost(issue).expect("should have cost from auto assignment");
@@ -11364,6 +11377,7 @@
                 audit_run_number: None,
                 for_issue_number: None,
                 driven_by: None,
+                dispatched_by_assignment_id: None,
             });
         }
         let issue = &app.pipeline_issues[0];
@@ -11419,6 +11433,7 @@
             audit_run_number: None,
             for_issue_number: None,
             driven_by: None,
+            dispatched_by_assignment_id: None,
         });
         // Same issue number, different repo — should be excluded.
         app.data.assignments.push(Assignment {
@@ -11464,6 +11479,7 @@
             audit_run_number: None,
             for_issue_number: None,
             driven_by: None,
+            dispatched_by_assignment_id: None,
         });
         let issue = &app.pipeline_issues[0];  // coord_repo = Some("api")
         assert_eq!(app.issue_total_tokens(issue), 1200, "expected 1000+200=1200 for api repo only");
@@ -11528,6 +11544,7 @@
             audit_run_number: None,
             for_issue_number: None,
             driven_by: None,
+            dispatched_by_assignment_id: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -11592,6 +11609,7 @@
             audit_run_number: None,
             for_issue_number: None,
             driven_by: None,
+            dispatched_by_assignment_id: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.derive_current_stage(issue), "done");
@@ -11742,6 +11760,7 @@
             audit_run_number: None,
             for_issue_number: None,
             driven_by: None,
+            dispatched_by_assignment_id: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         // Work stage ran → Done.
@@ -11830,6 +11849,7 @@
             audit_run_number: None,
             for_issue_number: None,
             driven_by: None,
+            dispatched_by_assignment_id: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Active);
@@ -11881,6 +11901,7 @@
             audit_run_number: None,
             for_issue_number: None,
             driven_by: None,
+            dispatched_by_assignment_id: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -11937,6 +11958,7 @@
             audit_run_number: None,
             for_issue_number: None,
             driven_by: None,
+            dispatched_by_assignment_id: None,
         });
         // Newer successful retry.
         app.data.assignments.push(Assignment {
@@ -11982,6 +12004,7 @@
             audit_run_number: None,
             for_issue_number: None,
             driven_by: None,
+            dispatched_by_assignment_id: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -12035,6 +12058,7 @@
             audit_run_number: None,
             for_issue_number: None,
             driven_by: None,
+            dispatched_by_assignment_id: None,
         });
         let issue = &app.pipeline_issues[0];
         // issue.coord_repo == "api", assignment.repo == "different-repo" →
@@ -12170,6 +12194,7 @@
             audit_run_number: None,
             for_issue_number: None,
             driven_by: None,
+            dispatched_by_assignment_id: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].label, "Work");
@@ -12243,6 +12268,7 @@
             audit_run_number: None,
             for_issue_number: None,
             driven_by: None,
+            dispatched_by_assignment_id: None,
         });
         app.data.assignments.push(Assignment {
             id: "r1".to_string(),
@@ -12287,6 +12313,7 @@
             audit_run_number: None,
             for_issue_number: None,
             driven_by: None,
+            dispatched_by_assignment_id: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         // Work + Review done; Merge is Pending (no merge_queue entry yet) and
@@ -12624,6 +12651,7 @@
                 audit_run_number: None,
                 for_issue_number: None,
                 driven_by: None,
+                dispatched_by_assignment_id: None,
             });
         }
         app.data.merge_queue.push(MergeQueueEntry {
@@ -12693,6 +12721,7 @@
             audit_run_number: None,
             for_issue_number: None,
             driven_by: None,
+            dispatched_by_assignment_id: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].status, StageStatus::Failed);
@@ -12757,6 +12786,7 @@
             audit_run_number: None,
             for_issue_number: None,
             driven_by: None,
+            dispatched_by_assignment_id: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         for stage in &view.stages {
@@ -12862,6 +12892,7 @@
             audit_run_number: None,
             for_issue_number: None,
             driven_by: None,
+            dispatched_by_assignment_id: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "plan"), StageStatus::Done);
@@ -12921,6 +12952,7 @@
             audit_run_number: None,
             for_issue_number: None,
             driven_by: None,
+            dispatched_by_assignment_id: None,
         });
         let issue = &app.pipeline_issues[0].clone();
         let id = app.find_done_plan_assignment_id(issue, "api");
@@ -12974,6 +13006,7 @@
             audit_run_number: None,
             for_issue_number: None,
             driven_by: None,
+            dispatched_by_assignment_id: None,
         });
         let issue = &app.pipeline_issues[0].clone();
         assert_eq!(app.find_done_plan_assignment_id(issue, "api"), None);
@@ -18428,6 +18461,7 @@
             audit_run_number: None,
             for_issue_number: None,
             driven_by: None,
+            dispatched_by_assignment_id: None,
         }];
 
         let result = parse_session_summaries_from_comments(&comments, &assignments);
@@ -18564,6 +18598,7 @@
             audit_run_number: None,
             for_issue_number: None,
             driven_by: None,
+            dispatched_by_assignment_id: None,
         };
         let result = parse_session_summaries_from_comments(&comments, &[fix_assignment]);
         assert_eq!(result.len(), 1);
@@ -18741,6 +18776,7 @@
             audit_run_number: None,
             for_issue_number: None,
             driven_by: None,
+            dispatched_by_assignment_id: None,
         };
 
         let data = BoardData {
@@ -18783,6 +18819,160 @@
         assert!(
             driver.screen_contains("cargo test failed"),
             "Summary tab must still show test_reason inline text:\n{}",
+            driver.screen(),
+        );
+    }
+
+    /// #2417: a work row that dispatches an independent sibling assignment
+    /// from its own turn (`coord acceptance author`/`coord fix` run from
+    /// the worker's own bash tool) must show that link right on the
+    /// origin's OWN Summary tab — reproducing coord-portal#119's b1b6f90ca426
+    /// dispatching a test-author sibling. The sibling's `issue_number` is
+    /// deliberately the milestone's TRACKING issue (#16), not the origin's
+    /// own issue (#119) — matching `coord.test_author.dispatch_test_author`'s
+    /// real shape — so this also pins that `dispatched_children` is a
+    /// GLOBAL board lookup, not filtered by the tab's own issue_number (the
+    /// per-issue `assignments` filter in `build_board_summary_list_view`
+    /// would otherwise never find it).
+    #[test]
+    fn summary_tab_shows_dispatched_sibling_link() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let origin = Assignment {
+            id: "b1b6f90ca426".to_string(),
+            repo: "coord-portal".to_string(),
+            issue_number: 119,
+            issue_title: "Origin work".to_string(),
+            machine: "dellserver".to_string(),
+            status: "advisory".to_string(),
+            branch: Some("issue-119-work".to_string()),
+            model: Some("sonnet".to_string()),
+            dispatched_at: Some(1_000_000.0),
+            finished_at: Some(1_001_200.0),
+            exit_code: Some(0),
+            assignment_type: Some("work".to_string()),
+            test_state: None,
+            test_reason: None,
+            review_verdict: None,
+            review_state: None,
+            review_of_assignment_id: None,
+            cost_usd: Some(0.42),
+            smoke_tests: None,
+            review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
+            test_plan: None,
+            test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            is_interactive: false,
+            failure_reason: None,
+            review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
+            pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
+            for_issue_number: None,
+            driven_by: None,
+            dispatched_by_assignment_id: None,
+        };
+        let sibling = Assignment {
+            id: "41249c1cebbd".to_string(),
+            repo: "coord-portal".to_string(),
+            issue_number: 16,
+            issue_title: "[test-author] ms-16 slice #10".to_string(),
+            machine: "precision".to_string(),
+            status: "done".to_string(),
+            branch: Some("test-author-ms-16-slice-10-v2".to_string()),
+            model: Some("sonnet".to_string()),
+            dispatched_at: Some(1_000_050.0),
+            finished_at: Some(1_002_000.0),
+            exit_code: Some(0),
+            assignment_type: Some("test-author".to_string()),
+            test_state: None,
+            test_reason: None,
+            review_verdict: None,
+            review_state: None,
+            review_of_assignment_id: None,
+            cost_usd: Some(2.70),
+            smoke_tests: None,
+            review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
+            test_plan: None,
+            test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            is_interactive: false,
+            failure_reason: None,
+            review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
+            pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
+            for_issue_number: Some(10),
+            driven_by: None,
+            // #2417: this is the link — the sibling was dispatched BY the
+            // origin's own turn.
+            dispatched_by_assignment_id: Some("b1b6f90ca426".to_string()),
+        };
+
+        let data = BoardData {
+            pipeline_default_gates: vec![
+                "test".to_string(),
+                "review".to_string(),
+                "merge".to_string(),
+            ],
+            pipeline_tracked_labels: vec!["coord".to_string()],
+            pipeline_repos: vec![("coord-portal".to_string(), "acme/coord-portal".to_string())],
+            assignments: vec![origin, sibling],
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 119,
+            title: "Origin work".to_string(),
+            body: String::new(),
+            repo_slug: "acme/coord-portal".to_string(),
+            coord_repo: Some("coord-portal".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string(), "status:ready".to_string()],
+            is_closed: false,
+        }];
+        app.rebuild_pipeline_sidebar(None);
+        app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Summary;
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+
+        assert!(
+            driver.screen_contains("dispatched"),
+            "#2417: origin row's Summary tab must show the dispatched-sibling link:\n{}",
+            driver.screen(),
+        );
+        assert!(
+            driver.screen_contains("41249c1cebbd"),
+            "#2417: dispatched-sibling link must name the sibling assignment id:\n{}",
+            driver.screen(),
+        );
+        assert!(
+            driver.screen_contains("precision"),
+            "#2417: dispatched-sibling link must name the machine it ran on:\n{}",
             driver.screen(),
         );
     }
@@ -18839,6 +19029,7 @@
             audit_run_number: None,
             for_issue_number: None,
             driven_by: None,
+            dispatched_by_assignment_id: None,
         };
 
         let data = BoardData {
@@ -19404,6 +19595,7 @@
             audit_run_number: None,
             for_issue_number: None,
             driven_by: None,
+            dispatched_by_assignment_id: None,
         };
 
         let data = BoardData {
@@ -19828,6 +20020,7 @@
             audit_run_number: None,
             for_issue_number: None,
             driven_by: None,
+            dispatched_by_assignment_id: None,
         };
         let mut app = make_test_app(BoardData {
             assignments: vec![work_assignment],
@@ -28638,6 +28831,7 @@
             audit_run_number: None,
             for_issue_number: None,
             driven_by: None,
+            dispatched_by_assignment_id: None,
         };
 
         // Review for the fix — approved.
@@ -28684,6 +28878,7 @@
             audit_run_number: None,
             for_issue_number: None,
             driven_by: None,
+            dispatched_by_assignment_id: None,
         };
 
         // The merge queue has the ORIGINAL work (different aid, same branch).
@@ -28793,6 +28988,7 @@
             audit_run_number: None,
             for_issue_number: None,
             driven_by: None,
+            dispatched_by_assignment_id: None,
         });
 
         // Model-level assertions on the plain `CoordApp` — `driver.app()`
@@ -32152,6 +32348,7 @@ Milestone tracking issue.
             audit_run_number: None,
             for_issue_number: None,
             driven_by: None,
+            dispatched_by_assignment_id: None,
         });
 
         assert!(app.maybe_bind_pending_milestone_chat());
