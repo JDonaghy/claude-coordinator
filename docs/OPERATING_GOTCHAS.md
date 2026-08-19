@@ -43,6 +43,8 @@ Release steps: [`AGENT_OPERATIONS.md`](AGENT_OPERATIONS.md#publishing-a-release-
 
 ## 2. Restarting anything needs a quiet fleet — and the two restarts are unsafe in *different* ways
 
+*Mirrored (with #8 below) as a skill: `coord/skills/fleet-restart-safety/SKILL.md` — keep both in sync.*
+
 The two services have **different victims**, so one check does not cover both.
 
 ### `coord agent update` / restarting `coord-agent` kills headless workers
@@ -740,6 +742,8 @@ Full story: [`AGENT_OPERATIONS.md`](AGENT_OPERATIONS.md#the-sixth-surface-deploy
 ---
 
 ## 16. A review that reached `END_REVIEW` with no `REVIEW_VERDICT:` header is recoverable — recover it, don't re-dispatch (#1956)
+
+*Mirrored as a skill: `coord/skills/review-verdict-recovery/SKILL.md` — keep both in sync.*
 
 A headless reviewer can write a complete, well-reasoned review — full body,
 `## Blocking findings` / `None.`, thorough — and still end with `status=done`

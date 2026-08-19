@@ -16,6 +16,8 @@ This is the operator runbook. For the implementation, see `coord/drive_queue.py`
 
 ## Read this before queuing more than ~2 issues (#1715)
 
+*Mirrored (with §4 below) as a skill: `coord/skills/drive-queue-preflight/SKILL.md` — keep both in sync.*
+
 **A queue longer than about two issues is still not an *unattended* feature —
 but clearing it is now one command and one suite run, not *N−1* by hand.**
 

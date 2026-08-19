@@ -4504,6 +4504,24 @@ class AgentServer:
         self._graph_heal_last_skip_at: float | None = None
         self._graph_heal_passes: int = 0
 
+        # Skills self-heal (#319 follow-up): `coord install-skills` was a
+        # real fix (coord/skills/*/SKILL.md) for a real problem, but was a
+        # 100%-manual step nothing in provisioning ever ran — so a skill
+        # added or updated in a coordinator release could sit uninstalled on
+        # a worker machine indefinitely, unnoticed, the same "silent gap"
+        # shape already known from the graphify hooks and the browser
+        # capability probe. Rides the same cached health-check tick as the
+        # graph self-heal above rather than adding a new timer — syncing a
+        # handful of small text files is cheap enough to need none of that
+        # pass's guards (no idle-gate, no in-flight dedup, no retry budget).
+        # In-memory only, resets on agent restart, same rationale as
+        # `_graph_heal_passes` above: it exists to answer "is this machine's
+        # skill set current", not to be a durable metric.
+        self._skills_heal_passes: int = 0
+        self._skills_heal_last_run_at: float | None = None
+        self._skills_heal_last_synced: list[dict[str, str]] = []
+        self._skills_heal_last_error: str | None = None
+
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self._load_state()
@@ -4888,6 +4906,21 @@ class AgentServer:
                 "skipped_active": self._graph_heal_skipped_active,
                 "last_skip_at": self._graph_heal_last_skip_at,
             },
+            # Same idea as `graph_self_heal` above, for the bundled
+            # `coord/skills/*/SKILL.md` sync: `coord install-skills` existed
+            # as a real fix but was a 100%-manual step nothing in
+            # provisioning ever ran, so a skill added in a coordinator
+            # release could sit uninstalled on a worker machine
+            # indefinitely, unnoticed. `last_synced` names whichever skills
+            # actually changed on the most recent pass (empty on the common
+            # "already current" tick) so `coord doctor` can show something
+            # more useful than a bare pass count.
+            "skills_self_heal": {
+                "passes": self._skills_heal_passes,
+                "last_run_at": self._skills_heal_last_run_at,
+                "last_synced": self._skills_heal_last_synced,
+                "last_error": self._skills_heal_last_error,
+            },
             # #2299: is this agent actually watching a coordinator.yml, and
             # has it picked anything up? `watching` is None for a
             # config-free/thin-client agent (nothing local to re-read), which
@@ -4953,6 +4986,12 @@ class AgentServer:
                 self._self_heal_stale_graphs(ctx, report)
             except Exception as exc:  # noqa: BLE001 — self-heal is best-effort
                 _log.warning("graph self-heal pass failed: %s", exc)
+            try:
+                # Same isolation as the graph pass above: a skills-sync bug
+                # must never blind this whole health block.
+                self._self_heal_missing_skills()
+            except Exception as exc:  # noqa: BLE001 — self-heal is best-effort
+                _log.warning("skills self-heal pass failed: %s", exc)
             report_dict = report.to_dict()
             payload = {
                 "schema": report_dict["schema"],
@@ -5168,6 +5207,59 @@ class AgentServer:
             )
             if replacement is not None:
                 report.results[i] = replacement
+
+    def _self_heal_missing_skills(self) -> None:
+        """Sync bundled `coord/skills/*/SKILL.md` into ``~/.claude/skills/``
+        on this machine, riding the same cached health-check tick as
+        `_self_heal_stale_graphs` above.
+
+        `coord install-skills` (#319) was a real fix for a real problem, but
+        it was a 100%-manual step — nothing in agent provisioning or this
+        health tick ever ran it, so a skill added or updated in a
+        coordinator release could sit uninstalled on a worker machine
+        indefinitely, unnoticed. That is the same "silent gap" shape as the
+        graphify hooks and the browser-capability probe this codebase
+        already knows about.
+
+        Unlike the graph rebuild, this needs none of that pass's four
+        guards: syncing a handful of small text files is cheap file I/O, not
+        a CPU-heavy subprocess, so there is no idle-gate, no in-flight
+        dedup, and no retry budget — `sync_bundled_skills` is already
+        idempotent (content-identical files are left untouched, so a
+        no-op tick costs a handful of reads, nothing more).
+        """
+        from coord.commands.setup import (  # noqa: PLC0415
+            list_bundled_skill_dirs,
+            sync_bundled_skills,
+        )
+
+        target_root = Path.home() / ".claude" / "skills"
+        try:
+            skill_dirs = list_bundled_skill_dirs()
+        except Exception as exc:  # noqa: BLE001 — recorded, never raised further
+            self._skills_heal_last_error = f"{type(exc).__name__}: {exc}"
+            return
+
+        self._skills_heal_passes += 1
+        self._skills_heal_last_run_at = time.time()
+        self._skills_heal_last_error = None
+        if not skill_dirs:
+            self._skills_heal_last_synced = []
+            return
+
+        target_root.mkdir(parents=True, exist_ok=True)
+        results = sync_bundled_skills(target_root, skill_dirs)
+        changed = [
+            {"skill": name, "action": action}
+            for name, action in results
+            if action != "unchanged"
+        ]
+        self._skills_heal_last_synced = changed
+        if changed:
+            _log.info(
+                "skills self-heal: %s",
+                ", ".join(f"{c['skill']} {c['action']}" for c in changed),
+            )
 
     @staticmethod
     def _graph_failure_result(result: Any, values: dict, detail: str) -> Any:

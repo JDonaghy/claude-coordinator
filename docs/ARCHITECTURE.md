@@ -189,6 +189,8 @@ Three read-only commands surface what the fleet did, all routed through the same
 
 ## When a merge isn't happening
 
+*Mirrored as a skill: `coord/skills/merge-stuck-triage/SKILL.md` — keep both in sync.*
+
 A story that won't merge — the TUI "Go" does nothing, `coord merge` skips it, the box stays grey/pending — almost always traces to one of these gates. Check in order:
 
 1. **Test gate (the #1 cause).** No review is dispatched until the work's Test stage has a verdict (see step 3 of the auto-loop above). **Symptom:** work `done`, but no `type="review"` assignment exists and `review_state` is null. **Fix:** `coord test <work_assignment_id> --passed` (`--skipped` for trivial, `--fail --reason "…"` for broken), then `coord pr <id>` opens/reuses the PR and dispatches the review. In the TUI: **P / S / F** on the Test stage.
@@ -201,6 +203,8 @@ A story that won't merge — the TUI "Go" does nothing, `coord merge` skips it, 
 **Live-on-pull vs needs-release:** the merge/review/auto-loop logic (`merge_queue.py`, `auto_loop.py`, `reconcile.py`, `cli.py`) runs in fresh `coord` CLI invocations, so a `git pull` of the coordinator clone makes fixes live immediately. Only agent-side code (`agent.py` / `agent_app.py`, the long-running `coord agent` service) needs a release + `coord agent update` — see [AGENT_OPERATIONS.md](AGENT_OPERATIONS.md).
 
 ## When an issue is sitting in the pipeline you never dispatched
+
+*Mirrored as a skill: `coord/skills/pipeline-limbo-triage/SKILL.md` — keep both in sync.*
 
 Board vs Pipeline membership is **label-driven, not assignment-driven**. An open issue with *zero* assignments can still show up in the Pipeline — because it carries a `status:ready` label. The lifecycle (defined in `coord/cli.py`'s `refine`/`ready`/`backlog` commands and mirrored in `tui/src/app.rs`) is:
 

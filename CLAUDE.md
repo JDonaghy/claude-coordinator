@@ -135,30 +135,14 @@ computes the routing without actually building or testing anything.
 ## Working on `tui/` — the `quadraui` pin
 
 **`coord-tui` pins `quadraui` to a git rev in `tui/Cargo.toml`**
-(`quadraui = { git = "https://github.com/JDonaghy/quadraui", rev = "<sha>" }`, #1973). This
-replaced the old relative-path dependency (`../../quadraui/quadraui`), which built against
-whatever branch happened to be checked out in `~/src/quadraui` — a quadraui merge could break
-coord-tui's build/merge with **zero coord-tui commits and no warning** (it already happened
-once). `cargo build`/`cargo test` from `tui/` now fetch quadraui straight from GitHub at the
-pinned rev and never touch `~/src/quadraui`, so the local checkout's branch is irrelevant.
-
-- **Bumping the pin** (deliberate, reviewable, its own coord-tui commit): pick the target
-  quadraui rev — normally the tip of `origin/develop` (quadraui's default/integration branch,
-  per quadraui's CLAUDE.md) — edit the `rev = "..."` in `tui/Cargo.toml`, then run
-  `cargo build && cargo test` from `tui/` and confirm EXIT=0 before committing.
-  `cargo update -p quadraui` alone will **not** move a `rev`-pinned git dependency; the
-  `Cargo.toml` edit is the actual bump.
-- **Co-developing against an unmerged quadraui branch/PR:** if a `tui/` task consumes a
-  not-yet-merged quadraui feature, the briefing **must** name the quadraui PR/branch. The
-  worker builds against a local `~/src/quadraui` checkout **without editing
-  `tui/Cargo.toml`**, via cargo's local-paths override:
-  `cp tui/cargo-config-local-quadraui.toml.example tui/.cargo/config.toml` (git-ignored — see
-  the example file's header) after checking out the target branch in `~/src/quadraui`. Delete
-  `tui/.cargo/config.toml` (or don't create it) to build against the pinned rev again — this
-  is the default and what CI/other workers use. **Verify build EXIT=0 from `tui/` both with
-  the override active (proves the feature works) and, before finishing, confirm the committed
-  `tui/Cargo.toml` still points at the pinned rev** (the override file itself is never
-  committed).
+(`quadraui = { git = "https://github.com/JDonaghy/quadraui", rev = "<sha>" }`, #1973) —
+never edit that `rev` as a shortcut for co-development, and never build `tui/` against
+whatever happens to be checked out in `~/src/quadraui`; a quadraui merge broke coord-tui's
+build with zero coord-tui commits and no warning once already, which is exactly what the pin
+prevents. Bumping the pin deliberately, and building against an unmerged quadraui branch/PR
+without touching the pin, are both procedures — see the `tui-quadraui-workflow` skill
+(`coord/skills/tui-quadraui-workflow/SKILL.md`) for the steps; install it with `coord
+install-skills` if it isn't already on this machine.
 
 ## Key Design Decisions
 
