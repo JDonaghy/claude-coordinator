@@ -8740,7 +8740,7 @@
 
         // Pin to Gate A explicitly (mirrors the events.rs 1-9 keybind).
         app.pipeline_log_pinned_assignment
-            .insert(751, "mock-a".to_string());
+            .insert(("api".to_string(), 751), "mock-a".to_string());
         let list = app.pipeline_log_list();
         let text: String = list
             .items
@@ -8772,6 +8772,90 @@
 
         let work = _stage_assignment("w1", "work", 100.0, "done");
         assert_eq!(log_source_label(&work), "work");
+    }
+
+    /// Nit-fix regression for #2342: `pipeline_log_pinned_assignment` must
+    /// be keyed by `(coord_repo, issue_number)`, not raw issue number alone
+    /// — two different repos that happen to share an issue number must not
+    /// read or write each other's pin.
+    #[test]
+    fn pipeline_log_pin_key_scopes_by_repo_not_just_issue_number() {
+        let issue_api = PipelineIssue {
+            number: 751,
+            title: "Milestone tracking issue".to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec![],
+            all_labels: vec![],
+            is_closed: false,
+        };
+        let mut issue_other = issue_api.clone();
+        issue_other.coord_repo = Some("other".to_string());
+
+        let key_api = pipeline_log_pin_key(&issue_api);
+        let key_other = pipeline_log_pin_key(&issue_other);
+        assert_ne!(
+            key_api, key_other,
+            "two repos sharing issue #751 must get distinct pin keys"
+        );
+
+        let mut app = make_pipeline_app_for_prereq_test();
+        app.pipeline_log_pinned_assignment
+            .insert(key_api.clone(), "mock-a".to_string());
+        assert_eq!(
+            app.pipeline_log_pinned_assignment.get(&key_api),
+            Some(&"mock-a".to_string())
+        );
+        assert_eq!(
+            app.pipeline_log_pinned_assignment.get(&key_other),
+            None,
+            "pinning repo api#751 must not leak into repo other#751's pin lookup"
+        );
+    }
+
+    /// Nit-fix regression for #2342: the picker header's `1-9` keybind can
+    /// only ever reach the first 9 candidates (`take(9)`) — when a tracking
+    /// issue has more, an overflow note must say so instead of silently
+    /// looking like there were only ever 9 relevant assignments.
+    #[test]
+    fn pipeline_log_list_flags_overflow_past_nine_candidates() {
+        let mut app = make_pipeline_app_for_prereq_test();
+        // Gate A + 9 members' test-author rows = 10 candidates, one past
+        // what the 1-9 keybind can reach.
+        let mut gate_a = _stage_assignment("mock-a", "mock-author", 1000.0, "done");
+        gate_a.issue_number = 751;
+        app.data.assignments.push(gate_a);
+        for i in 1..=9u64 {
+            let mut ta = _stage_assignment(
+                &format!("ta-{i}"),
+                "test-author",
+                100.0 + i as f64,
+                "done",
+            );
+            ta.issue_number = 751;
+            ta.for_issue_number = Some(40 + i);
+            app.data.assignments.push(ta);
+        }
+
+        app.pipeline_sel = Some(0); // the tracking issue itself
+        app.pipeline_detail_tab = PipelineDetailTab::Log;
+        assert_eq!(
+            app.log_candidates_for_issue(&app.pipeline_issues[0].clone()).len(),
+            10,
+            "precondition: 10 candidates, one past the 1-9 keybind's reach"
+        );
+
+        let list = app.pipeline_log_list();
+        let text: String = list
+            .items
+            .iter()
+            .flat_map(|i| i.text.spans.iter().map(|s| s.text.as_str()))
+            .collect();
+        assert!(
+            text.contains("+1 more"),
+            "10th candidate must be flagged as unreachable via 1-9, not silently dropped:\n{text}"
+        );
     }
 
     /// End-to-end (event → dispatch → render): pressing a digit key on the
@@ -8811,6 +8895,69 @@
         assert!(
             driver.screen_contains("tracking-host"),
             "pressing 2 must pin the Log tab to Gate A's session:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// Review-blocker regression for #2342: the new Log-tab "pin a candidate"
+    /// 1-9 keybind must NOT swallow the pre-existing #349 "run smoke-test
+    /// plan step" keybind when there's nothing to pick between — i.e. the
+    /// ordinary case of a single work assignment, no Gate A / test-author
+    /// rows sharing the issue.
+    ///
+    /// `default_focused_stage_for_selected_issue()` auto-focuses the "test"
+    /// stage whenever Work is Done and Test is Pending, so
+    /// `is_test_stage_focused()` can already be true while the user is
+    /// perfectly normally sitting on the Log tab watching progress (e.g.
+    /// just switched over with `l`). Before the fix, the new arm's guard
+    /// was unconditional for any digit while the Log tab was open, so
+    /// pressing 1 there re-confirmed the (only) auto-picked log source and
+    /// silently ate the keystroke instead of running the first smoke-test
+    /// step.
+    #[test]
+    fn log_tab_digit_key_falls_through_to_smoke_test_step_when_only_one_log_candidate() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_pipeline_app_with_test_gate();
+        app.pipeline_sel = Some(0); // issue #42
+        let mut work = _work_assignment("w1", 100.0, "done", None);
+        work.test_plan = Some(vec![TestPlanStep {
+            kind: "verify".to_string(),
+            cmd: None,
+            label: None,
+            check: Some("no panic in stderr".to_string()),
+        }]);
+        app.data.assignments.push(work);
+
+        // Precondition: exactly one Log-tab candidate — the new arm's guard
+        // must be false, and precondition: the test stage is actionable and
+        // (mirroring the auto-focus) focused, all while sitting on the Log
+        // tab — the exact combination the reviewer's failure scenario named.
+        let issue = app.pipeline_issues[0].clone();
+        assert_eq!(
+            app.log_candidates_for_issue(&issue).len(),
+            1,
+            "precondition: single work assignment must be the only Log candidate"
+        );
+        app.pipeline_detail_tab = PipelineDetailTab::Log;
+        app.pipeline_focused_stage = Some(1); // "test" stage: work(0), test(1)
+        app.active_view = SidebarView::Pipeline;
+        assert!(app.test_gate_actionable(), "precondition: test gate must be actionable");
+        assert!(app.is_test_stage_focused(), "precondition: test stage must be focused");
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        driver.type_char('1');
+
+        // Switch to the Overview tab (Log → Issue → Overview via 'h','h')
+        // to observe the smoke-test-plan step's status without depending on
+        // Log-tab rendering — `stage_content_test` (which renders the
+        // "SMOKE TEST PLAN" block with the ✓/✗ status) lives there.
+        driver.press(Key::Char('h'));
+        driver.press(Key::Char('h'));
+        assert!(
+            driver.screen_contains("✓"),
+            "#349's step-run keybind must still fire through the Log tab \
+             when there's nothing to pick between:\n{}",
             driver.screen()
         );
     }

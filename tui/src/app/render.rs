@@ -3664,7 +3664,9 @@ impl CoordApp {
             // more than one (Gate A + N members' test-author rows sharing
             // a tracking issue's `issue_number`).
             let candidates = self.log_candidates_for_issue(issue);
-            let pinned = self.pipeline_log_pinned_assignment.get(&issue.number);
+            let pinned = self
+                .pipeline_log_pinned_assignment
+                .get(&pipeline_log_pin_key(issue));
             let assignment = pick_log_source(&candidates, pinned);
 
             // #2342: when more than one assignment could be "the" log for
@@ -3697,6 +3699,17 @@ impl CoordApp {
                             a.status,
                         ),
                         Some(color),
+                    ));
+                }
+                // #2342: the 1-9 keybind can only reach the first 9
+                // candidates — flag the overflow instead of silently
+                // capping so a milestone with many members mid-authoring
+                // doesn't look like it only ever had 9 relevant assignments.
+                if candidates.len() > 9 {
+                    items.push(kv_item(
+                        "",
+                        &format!("  … +{} more (not reachable via 1-9)", candidates.len() - 9),
+                        Some(Color::rgb(140, 140, 160)),
                     ));
                 }
                 items.push(kv_item("", "", None));
@@ -3982,6 +3995,16 @@ pub(crate) fn pick_log_source<'a>(
         .and_then(|id| candidates.iter().find(|a| &a.id == id).copied())
         .or_else(|| candidates.iter().find(|a| a.status == "running").copied())
         .or_else(|| candidates.first().copied())
+}
+
+/// #2342: the `pipeline_log_pinned_assignment` key for `issue` —
+/// `(coord_repo, issue_number)`, matching the `(String, u64)` shape already
+/// used by `pipeline_epic_expanded` / `board_epic_expanded` so two repos
+/// that happen to share an issue number can't collide on the same pin. An
+/// issue with no `coord_repo` keys under `String::new()`, which is harmless:
+/// `log_candidates_for_issue` doesn't filter by repo either in that case.
+pub(crate) fn pipeline_log_pin_key(issue: &PipelineIssue) -> (String, u64) {
+    (issue.coord_repo.clone().unwrap_or_default(), issue.number)
 }
 
 /// #2342: friendly label for a Log-tab picker row. Reuses the "Gate A" /

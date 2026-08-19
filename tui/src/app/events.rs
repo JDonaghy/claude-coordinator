@@ -3019,17 +3019,34 @@ impl CoordApp {
                     }
 
                     // ── 1-9 — pin the Log tab to a specific candidate
-                    // assignment (#2342). Only meaningful when the selected
-                    // issue has more than one candidate log source — e.g. a
-                    // milestone tracking issue carrying both a Gate A
+                    // assignment (#2342). Guarded on the selected issue
+                    // actually having *more than one* candidate log source
+                    // (e.g. a milestone tracking issue carrying both a Gate A
                     // `mock-author` row and several members' `test-author`
-                    // rows (see `log_candidates_for_issue`). With a single
-                    // candidate (the common case) the digit is a no-op, so
-                    // ordinary work/review/smoke/conflict-fix issues are
-                    // unaffected.
+                    // rows — see `log_candidates_for_issue`), matching the
+                    // picker header's own visibility condition
+                    // (`pipeline_log_list`, `candidates.len() > 1`).
+                    //
+                    // Without that guard this arm — appearing earlier in the
+                    // match than the pre-existing #349 "Test stage: run
+                    // smoke-test plan step" keybind below — would
+                    // unconditionally swallow every digit keypress whenever
+                    // the Log tab is open, even though #349's keybind has no
+                    // tab restriction of its own and can be reachable here:
+                    // `default_focused_stage_for_selected_issue()` auto-
+                    // focuses the "test" stage whenever Work is done and Test
+                    // is pending, so `is_test_stage_focused()` can already be
+                    // true while the user is on the Log tab watching
+                    // progress. With ≤1 candidate there's nothing to pick
+                    // between, so the guard falsifies and the keypress falls
+                    // through to #349 unharmed.
                     Key::Char(c @ '1'..='9')
                         if self.active_view == SidebarView::Pipeline
-                            && self.pipeline_detail_tab == PipelineDetailTab::Log =>
+                            && self.pipeline_detail_tab == PipelineDetailTab::Log
+                            && self
+                                .pipeline_sel
+                                .and_then(|i| self.pipeline_issues.get(i))
+                                .is_some_and(|issue| self.log_candidates_for_issue(issue).len() > 1) =>
                     {
                         if let Some(issue) =
                             self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i).cloned())
@@ -3041,7 +3058,7 @@ impl CoordApp {
                                 .map(|a| a.id.clone());
                             if let Some(id) = target_id {
                                 self.pipeline_log_pinned_assignment
-                                    .insert(issue.number, id);
+                                    .insert(pipeline_log_pin_key(&issue), id);
                                 // #2342: jump to the tail of the newly-picked
                                 // source's log, matching the sticky-to-bottom
                                 // default a freshly-opened Log tab starts at.

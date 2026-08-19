@@ -2210,18 +2210,23 @@ pub struct CoordApp {
     /// (and h/l) adjust it; the quadraui ListView rasteriser honors `h_scroll`
     /// and paints a horizontal scrollbar when content overflows the viewport.
     pipeline_log_hscroll: usize,
-    /// #2342: sticky per-issue pick for the Pipeline Log tab, keyed by issue
-    /// number. An issue can have more than one candidate log-source
+    /// #2342: sticky per-issue pick for the Pipeline Log tab, keyed by
+    /// `(coord_repo, issue_number)` — the same `(String, u64)` shape as
+    /// `pipeline_epic_expanded` / `board_epic_expanded`, so two different
+    /// repos that happen to share an issue number can't read/write each
+    /// other's pin. An issue can have more than one candidate log-source
     /// assignment — most visibly a milestone tracking/epic issue, which
     /// carries both its own Gate A `mock-author` row and every member's
     /// `test-author` row (test-author always books `issue_number` to the
     /// tracking issue, never the member it's actually for). Pressing a
     /// digit key on the Log tab's source picker records that choice here;
     /// an absent entry means "auto-pick" (running, else most-recently-
-    /// dispatched — the pre-#2342 behavior). Keyed by issue number rather
-    /// than reset on selection change, so no explicit invalidation hook is
-    /// needed when the user switches issues.
-    pipeline_log_pinned_assignment: std::collections::HashMap<u64, String>,
+    /// dispatched — the pre-#2342 behavior). Keyed by issue rather than
+    /// reset on selection change, so no explicit invalidation hook is
+    /// needed when the user switches issues. An issue with no `coord_repo`
+    /// keys under `String::new()` — harmless since `log_candidates_for_issue`
+    /// already matches across all repos in that case (no repo to filter on).
+    pipeline_log_pinned_assignment: std::collections::HashMap<(String, u64), String>,
     /// Cache of remotely-fetched log items, keyed by assignment ID.
     ///
     /// Each entry stores `(fetched_at, items)`. Entries older than 30 s are
@@ -4568,7 +4573,9 @@ impl CoordApp {
             .and_then(|i| self.pipeline_issues.get(i).cloned())
             .and_then(|issue| {
                 let candidates = self.log_candidates_for_issue(&issue);
-                let pinned = self.pipeline_log_pinned_assignment.get(&issue.number);
+                let pinned = self
+                    .pipeline_log_pinned_assignment
+                    .get(&pipeline_log_pin_key(&issue));
                 pick_log_source(&candidates, pinned).map(|a| a.id.clone())
             });
         let Some(target) = pick_id else {
@@ -4592,38 +4599,31 @@ impl CoordApp {
         let Some(issue) = self.pipeline_issues.get(idx).cloned() else {
             return;
         };
-        let local_repo = issue.coord_repo.as_deref();
 
-        // #2342: also match via `effective_issue_number()` — a milestone
-        // member issue's `test-author` row always books its raw
-        // `issue_number` to the tracking issue, so a raw-only match can
-        // never find it here (same gap `log_candidates_for_issue` fixes
-        // for the Log tab's own picker).
-        let candidates: Vec<_> = self
-            .data
-            .assignments
-            .iter()
-            .filter(|a| a.issue_number == issue.number || a.effective_issue_number() == issue.number)
-            .filter(|a| match local_repo {
-                Some(r) => a.repo == r,
-                None => true,
-            })
-            .collect();
+        // #2342: route through the same candidate list / pin-aware pick as
+        // `pipeline_log_list` (what the Log tab renders) and
+        // `ensure_log_tab_sse` (which target it computes before falling
+        // through to this function), instead of an independent
+        // running-else-newest heuristic. Keeps all three from silently
+        // disagreeing on "the" assignment for this issue's Log tab, and
+        // makes this function pin-aware — previously it had no knowledge of
+        // `pipeline_log_pinned_assignment` at all, so a pinned Gate A row
+        // could render correctly (via the HTTP/file fallback) while this
+        // function kept a different assignment's SSE stream warm.
+        //
+        // Cloned out of the borrow up front: `log_candidates_for_issue`
+        // takes `&self`, so its returned refs (and anything derived from
+        // them) must be gone before the `&mut self` calls below (watch_pool
+        // insert, etc.).
+        let picked: Option<Assignment> = {
+            let candidates = self.log_candidates_for_issue(&issue);
+            let pinned = self
+                .pipeline_log_pinned_assignment
+                .get(&pipeline_log_pin_key(&issue));
+            pick_log_source(&candidates, pinned).cloned()
+        };
 
-        let pick = candidates
-            .iter()
-            .copied()
-            .find(|a| a.status == "running")
-            .or_else(|| candidates.iter().copied().find(|a| a.status != "done"))
-            .or_else(|| {
-                candidates.iter().copied().max_by(|a, b| {
-                    a.dispatched_at
-                        .partial_cmp(&b.dispatched_at)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-            });
-
-        let Some(a) = pick else {
+        let Some(a) = picked else {
             return;
         };
         let aid = a.id.clone();
