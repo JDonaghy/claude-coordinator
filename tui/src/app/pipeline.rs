@@ -2191,9 +2191,36 @@ impl CoordApp {
         Self::COMPLETED_FIELD_COUNT as f32 * lh
     }
 
-    /// The single row the detail view reserves for its "back" affordance.
+    /// The leading text of the detail view's single "back" row. The open
+    /// issue's ref and title are appended after it, so the detail says which
+    /// issue it is about — the Overview body itself never names one.
     pub(crate) const COMPLETED_DETAIL_BACK_HINT: &'static str =
         "  ← Back to Completed  (Esc)";
+
+    /// A one-line, **unbordered** caption list. `plain_list` draws a border,
+    /// which on a single-row rect paints the frame's top edge and nothing
+    /// else — so the detail's back row uses this instead.
+    fn completed_caption_list(id: &str, text: &str) -> ListView {
+        ListView {
+            id: WidgetId::new(id),
+            title: None,
+            items: vec![ListItem {
+                text: StyledText {
+                    spans: vec![StyledSpan::with_fg(text, Color::rgb(170, 170, 200))],
+                },
+                icon: None,
+                detail: None,
+                decoration: Decoration::Normal,
+            }],
+            selected_idx: 0,
+            scroll_offset: 0,
+            has_focus: false,
+            bordered: false,
+            h_scroll: 0,
+            max_content_width: None,
+            show_v_scrollbar: false,
+        }
+    }
 
     /// Render the `Completed` tab: either the open row's detail, or the
     /// control row above the result grid.
@@ -2208,6 +2235,7 @@ impl CoordApp {
         // re-sets it, and every path that doesn't must leave a click with
         // nothing to hit rather than a table that is no longer on screen.
         *self.completed_table_layout.borrow_mut() = None;
+        *self.completed_form_layout.borrow_mut() = None;
 
         if self.completed_grid.detail.is_some() {
             self.render_completed_detail(backend, rect, lh);
@@ -2216,11 +2244,13 @@ impl CoordApp {
 
         let controls_h = Self::completed_controls_height(lh).min(rect.height);
         let controls_rect = Rect::new(rect.x, rect.y, rect.width, controls_h);
-        {
-            let mut fc = self.completed_form.borrow_mut();
-            fc.set_form(self.completed_form());
-            fc.render_and_cache(backend, controls_rect);
-        }
+        // Paint and hit-test from ONE layout, derived by the backend itself —
+        // the `msv.rs` contract. Re-deriving geometry at click time is the
+        // cached-layout-vs-paint drift #1094 had to fix for the Audit table.
+        let form = self.completed_form();
+        let form_layout = backend.form_layout(controls_rect, &form);
+        backend.draw_form(controls_rect, &form);
+        *self.completed_form_layout.borrow_mut() = Some((controls_rect, form_layout));
 
         let body_rect = Rect::new(
             rect.x,
@@ -2307,13 +2337,30 @@ impl CoordApp {
     /// would both be offering actions on something that has finished.
     fn render_completed_detail(&self, backend: &mut dyn Backend, rect: Rect, lh: f32) {
         let back_h = lh.min(rect.height);
+        let caption = match self.completed_detail_index() {
+            Some(idx) => {
+                let issue = &self.pipeline_issues[idx];
+                let tag = Self::repo_tag(
+                    Self::pipeline_repo_key(issue),
+                    &self
+                        .completed_repo_choices()
+                        .into_iter()
+                        .filter(|r| !r.is_empty())
+                        .collect::<Vec<_>>(),
+                );
+                format!(
+                    "{}   ·   {}#{}  {}",
+                    Self::COMPLETED_DETAIL_BACK_HINT,
+                    tag,
+                    issue.number,
+                    issue.title
+                )
+            }
+            None => Self::COMPLETED_DETAIL_BACK_HINT.to_string(),
+        };
         backend.draw_list(
             Rect::new(rect.x, rect.y, rect.width, back_h),
-            &plain_list(
-                "completed-detail-back",
-                Self::COMPLETED_DETAIL_BACK_HINT,
-                0,
-            ),
+            &Self::completed_caption_list("completed-detail-back", &caption),
         );
         let body_rect = Rect::new(
             rect.x,
@@ -2396,25 +2443,7 @@ impl CoordApp {
         }
         let controls_h = Self::completed_controls_height(lh).min(content_rect.height);
         if pos.y < content_rect.y + controls_h {
-            let controls_rect =
-                Rect::new(content_rect.x, content_rect.y, content_rect.width, controls_h);
-            let event = UiEvent::MouseDown {
-                widget: None,
-                button: MouseButton::Left,
-                position: pos,
-                modifiers: Modifiers::default(),
-            };
-            let outcome = self
-                .completed_form
-                .borrow_mut()
-                .handle_cached(&event, controls_rect);
-            return match outcome {
-                FormControllerEvent::FormAction(ref form_event) => {
-                    self.completed_apply_form_event(form_event)
-                }
-                FormControllerEvent::ScrollChanged | FormControllerEvent::Consumed => true,
-                FormControllerEvent::Ignored => false,
-            };
+            return self.completed_control_click(pos);
         }
         match self.completed_table_hit(pos) {
             Some(DataTableHit::Header { col }) => self.completed_sort_by_column(col),
@@ -2423,45 +2452,45 @@ impl CoordApp {
         }
     }
 
-    /// Apply a `FormController` event from the control row. Keyboard focus
-    /// follows the mouse, same as the Settings panel.
-    pub(crate) fn completed_apply_form_event(&mut self, event: &FormEvent) -> bool {
-        let (id, value) = match event {
-            FormEvent::SegmentedControlChanged { id, selected_idx }
-            | FormEvent::DropdownChanged { id, selected_idx } => {
-                let Some(field) = Self::completed_field_index(id.as_str()) else {
-                    return false;
-                };
-                // The segmented control reports an *index*, so the value is
-                // looked up in the same option list the form was built from
-                // — never parsed back out of the label, which for the repo
-                // selector is `(all)` rather than the empty string it means.
-                let options = match field {
-                    0 => self.completed_since_options(),
-                    2 => self.completed_repo_choices(),
-                    _ => return false,
-                };
-                let Some(choice) = options.get(*selected_idx).cloned() else {
-                    return false;
-                };
-                (id.clone(), choice)
-            }
-            FormEvent::TextInputChanged { id, value }
-            | FormEvent::TextInputCommitted { id, value } => (id.clone(), value.clone()),
-            FormEvent::FocusChanged { id } => {
-                let Some(field) = Self::completed_field_index(id.as_str()) else {
-                    return false;
-                };
-                self.completed_grid.field_sel = field;
-                return true;
-            }
-            _ => return false,
+    /// Route a click that landed on the control row against the last-painted
+    /// `FormLayout`. Keyboard focus follows the mouse, same as the Settings
+    /// panel.
+    pub(crate) fn completed_control_click(&mut self, pos: Point) -> bool {
+        let hit = {
+            let cache = self.completed_form_layout.borrow();
+            let Some((rect, layout)) = cache.as_ref() else {
+                return false;
+            };
+            layout.hit_test(pos.x - rect.x, pos.y - rect.y)
         };
-        let Some(field) = Self::completed_field_index(id.as_str()) else {
+        let FormHit::Field(id) = hit else {
+            return false;
+        };
+        // A `SegmentedControl` reports a synthetic per-option id, which is
+        // what makes "click the option you want" work without the click path
+        // knowing what the options mean.
+        let (base, seg_idx) = split_segment_id(id.as_str());
+        let Some(field) = Self::completed_field_index(base) else {
             return false;
         };
         self.completed_grid.field_sel = field;
-        self.completed_set_field(field, value);
+        let Some(seg) = seg_idx else {
+            // A text control (or the body of a choice control with no
+            // per-option region): focusing it is the whole effect.
+            return true;
+        };
+        // Look the value up in the same option list the form was built from —
+        // never parse it back out of the label, which for the repo selector
+        // reads `(all)` rather than the empty string it means.
+        let options = match field {
+            0 => self.completed_since_options(),
+            2 => self.completed_repo_choices(),
+            _ => return true,
+        };
+        let Some(choice) = options.get(seg).cloned() else {
+            return true;
+        };
+        self.completed_set_field(field, choice);
         true
     }
 

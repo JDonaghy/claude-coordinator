@@ -377,9 +377,7 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         active_theme: crate::settings::Theme::Dark.to_quadraui_theme(),
         // #2405: completed-issues grid defaults (24h / all repos).
         completed_grid: CompletedGrid::default(),
-        completed_form: std::cell::RefCell::new(FormController::new(
-            "pipeline-completed".to_string(),
-        )),
+        completed_form_layout: std::cell::RefCell::new(None),
         completed_table_layout: std::cell::RefCell::new(None),
         // #816: no pending PTY-panic dialog in test helpers.
         pty_panic_dialog: None,

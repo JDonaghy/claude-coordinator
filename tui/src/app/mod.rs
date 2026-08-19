@@ -3529,10 +3529,14 @@ pub struct CoordApp {
     /// the report-style grid that replaced #728's fixed-window Done section.
     /// In-memory only; resets to its 24h default on restart.
     pub(crate) completed_grid: CompletedGrid,
-    /// `FormController` backing the completed grid's control row (time range /
-    /// window end / repo).  Same render-then-`handle_cached` contract the
-    /// Settings panel uses — see `render_pipeline_completed`.
-    pub(crate) completed_form: std::cell::RefCell<FormController>,
+    /// The completed grid's last-painted control-row geometry, with the rect
+    /// it was painted into.  Same render-then-hit-test contract as
+    /// `msv::MsvLayoutCache` — and for the same reason: `FormController`'s
+    /// backend-free `handle_cached` re-derives char width as `lh * 0.6`,
+    /// which is wrong on a cell-granular TUI surface and mis-routes clicks
+    /// inside a segmented control.  `FormLayout` bounds are **form-local**
+    /// (origin `(0, 0)`), so hit-testing subtracts the stored rect.
+    pub(crate) completed_form_layout: std::cell::RefCell<Option<(Rect, FormLayout)>>,
     /// The completed grid's last-painted `DataTable` geometry, with the rect
     /// it was painted into.  Same render-then-hit-test pattern (and same
     /// reason for carrying the rect) as `reports_table_layout`: the table does
@@ -4057,9 +4061,7 @@ impl CoordApp {
             },
             // #2405: completed-issues grid defaults (24h / all repos).
             completed_grid: CompletedGrid::default(),
-            completed_form: std::cell::RefCell::new(FormController::new(
-                "pipeline-completed".to_string(),
-            )),
+            completed_form_layout: std::cell::RefCell::new(None),
             completed_table_layout: std::cell::RefCell::new(None),
             // #816: no pending PTY-panic dialog on startup.
             pty_panic_dialog: None,

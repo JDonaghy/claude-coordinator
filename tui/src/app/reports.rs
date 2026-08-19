@@ -108,6 +108,18 @@
 //! `tests/acceptance/**` slice for #1741) — the in-crate `TuiDriver` tests in
 //! `app/tests.rs` are the gate.
 //!
+//! **#2405 — where the generic-vs-hardcoded line held.** The Pipeline
+//! panel's completed-issues grid needed this panel's whole shape (time range
+//! + repo filter over a sortable `DataTable`) *plus* one thing this panel
+//! cannot express: a row click that opens the **Pipeline's** Overview detail
+//! for that issue. There is no report-agnostic spelling of that — it would
+//! have meant a `match` on a report id right here, killing the property the
+//! whole module is built around. So #2405 built the grid Pipeline-local
+//! (`pipeline.rs`, the `#2405` block above `COMPLETED_SINCE_PRESETS`) and
+//! copied only the *control vocabulary* from `ISSUE_ACTIVITY`. Nothing about
+//! that grid appears in this file, and adding a `completed-issues` entry to
+//! `coord/reports.py` would still light up here with zero `tui/**` changes.
+//!
 //! **#2271 — a result can also declare a chart.** `ReportResult.chart` names
 //! *columns*, never values, so the chart is built from the very rows the
 //! table renders. See the `#2271` block below `reports_footer_row` for the
