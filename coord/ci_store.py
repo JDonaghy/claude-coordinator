@@ -125,6 +125,28 @@ class CiStore(Protocol):
 
     def list_checks_for_pr(self, repo: str, number: int) -> list[CheckRun]: ...
 
+    def list_all_checks_for_pr(self, repo: str, number: int) -> list[CheckRun]:
+        """Every check reported for *repo*/*number*, required or advisory
+        (#2446) — the unfiltered counterpart to :meth:`list_checks_for_pr`,
+        which narrows to what branch protection actually requires so the
+        merge gate never blocks on a merely-advisory check (see that
+        method's docstring on :class:`coord.ci_github.GitHubCi`).
+
+        Purely a visibility view: `coord merge --plan`'s CI summary reads
+        this so a regressed advisory check is still visible to an operator
+        even though it can no longer gate a merge attempt — matching what
+        GitHub's own merge button already allows.
+
+        Optional/duck-typed like :meth:`rerun_failed_for_pr` — call sites
+        use ``getattr(ci_store, "list_all_checks_for_pr", None)`` and fall
+        back to :meth:`list_checks_for_pr` for a stand-in (a test stub, or
+        :class:`coord.gate_snapshot.GateSnapshot` when its own snapshot
+        wasn't refreshed with the unfiltered view) that predates this
+        capability — read as "no separate advisory view available", not an
+        error.
+        """
+        ...
+
     @property
     def is_available(self) -> bool: ...
 
@@ -230,6 +252,11 @@ class NoOpCi:
     """
 
     def list_checks_for_pr(self, repo: str, number: int) -> list[CheckRun]:
+        return []
+
+    def list_all_checks_for_pr(self, repo: str, number: int) -> list[CheckRun]:
+        """No-op: CI gating is disabled entirely, so there is nothing to
+        show either the gate or an operator (#2446)."""
         return []
 
     @property

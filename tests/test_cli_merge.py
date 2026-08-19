@@ -2063,6 +2063,99 @@ reviews:
         assert "Sibling overlap" not in result.output
 
 
+# ── #2446: advisory (non-required) CI checks stay visible in --plan ───────────
+
+class TestAdvisoryCiNote:
+    """#2446: `coord merge --plan` must still show a regressed check that's
+    ADVISORY (not in GitHub's branch-protection required list) even though
+    the merge gate itself (`ci_summary` / `PLAN_READY` status) correctly no
+    longer blocks on it — matching the issue's suggested fix: visible, never
+    blocking.
+    """
+
+    @staticmethod
+    def _planned(ci_summary, ci_summary_all):
+        return mq.PlannedMerge(
+            assignment_id="a1", repo_name="api", repo_github="acme/api",
+            branch="worker/a1", target_branch="main",
+            issue_number=1, issue_title="Some fix", rank=1, size=10,
+            status=mq.PLAN_READY, reason=None, enqueued_at=None,
+            last_attempt=None, milestone=None, pr_number=99,
+            ci_summary=ci_summary, ci_summary_all=ci_summary_all,
+        )
+
+    def test_no_note_when_ci_summary_all_matches_ci_summary(self, capsys) -> None:
+        from coord.ci_store import CiCheckSummary
+        from coord.commands.merge import _print_merge_plan_entries
+
+        summary = CiCheckSummary(
+            passed=1, failed=0, running=0, failed_names=[], first_failed_url=None,
+        )
+        _print_merge_plan_entries([self._planned(summary, summary)])
+        out = capsys.readouterr().out
+        assert "advisory" not in out
+
+    def test_notes_a_pending_advisory_check(self, capsys) -> None:
+        """The exact #2446 incident shape: the required check is green, but
+        an advisory check (e.g. `Acceptance (web)`) is still running."""
+        from coord.ci_store import CiCheckSummary
+        from coord.commands.merge import _print_merge_plan_entries
+
+        required = CiCheckSummary(
+            passed=1, failed=0, running=0, failed_names=[], first_failed_url=None,
+        )
+        everything = CiCheckSummary(
+            passed=1, failed=0, running=1, failed_names=[], first_failed_url=None,
+        )
+        _print_merge_plan_entries([self._planned(required, everything)])
+        out = capsys.readouterr().out
+        assert "READY" in out
+        assert "advisory CI, not blocking" in out
+        assert "1 running" in out
+
+    def test_names_a_failing_advisory_check(self, capsys) -> None:
+        from coord.ci_store import CiCheckSummary
+        from coord.commands.merge import _print_merge_plan_entries
+
+        required = CiCheckSummary(
+            passed=1, failed=0, running=0, failed_names=[], first_failed_url=None,
+        )
+        everything = CiCheckSummary(
+            passed=1, failed=1, running=0,
+            failed_names=["Acceptance (web)"], first_failed_url="http://x",
+        )
+        _print_merge_plan_entries([self._planned(required, everything)])
+        out = capsys.readouterr().out
+        assert "advisory CI, not blocking — failing: Acceptance (web)" in out
+
+    def test_no_note_when_ci_summary_all_is_none(self, capsys) -> None:
+        """A `CiStore` stand-in that never populated the advisory view."""
+        from coord.commands.merge import _print_merge_plan_entries
+
+        _print_merge_plan_entries([self._planned(None, None)])
+        out = capsys.readouterr().out
+        assert "advisory" not in out
+
+    def test_tolerates_daemon_reconstructed_dict_shape(self, capsys) -> None:
+        """`coord merge --plan` against a daemon reconstructs `PlannedMerge`
+        from `/board` JSON — `ci_summary`/`ci_summary_all` arrive as plain
+        dicts there (`dataclasses.asdict` server-side, never re-hydrated),
+        not `CiCheckSummary` instances. The note must still work."""
+        from coord.commands.merge import _print_merge_plan_entries
+
+        required = {
+            "passed": 1, "failed": 0, "running": 0,
+            "failed_names": [], "first_failed_url": None,
+        }
+        everything = {
+            "passed": 1, "failed": 0, "running": 1,
+            "failed_names": [], "first_failed_url": None,
+        }
+        _print_merge_plan_entries([self._planned(required, everything)])
+        out = capsys.readouterr().out
+        assert "advisory CI, not blocking — 1 running" in out
+
+
 # ── #779-fix: coord merge --plan daemon routing via /board ────────────────────
 
 class TestMergePlanDaemonRouting:

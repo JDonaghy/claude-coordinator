@@ -718,6 +718,87 @@ def test_gate_refresher_populates_snapshot_from_queue(rw_db, monkeypatch) -> Non
     assert refresher.snapshot() is snap
 
 
+def test_gate_refresher_populates_all_checks_from_list_all_checks_for_pr(
+    rw_db, monkeypatch
+) -> None:
+    """#2446: when the inner `CiStore` offers `list_all_checks_for_pr` (the
+    unfiltered required+advisory view), the refresher publishes it onto
+    `GateSnapshot.all_checks` too — a SEPARATE dict from `checks` (already
+    narrowed to required contexts), so `coord merge --plan`'s CI summary can
+    still show a regressed advisory check without it ever reaching the gate
+    itself (`GateSnapshot.list_checks_for_pr`, which stays narrowed).
+    """
+    import coord.gate_snapshot as gs
+    from coord.ci_store import CheckRun
+    from coord.config import Config
+
+    _seed_pending_merge(rw_db)
+
+    def _check(name: str, status: str = "completed") -> CheckRun:
+        return CheckRun(
+            name=name, status=status,
+            conclusion="success" if status == "completed" else None,
+            url="", run_id="1", started_at=None, completed_at=None,
+        )
+
+    class _FakeCi:
+        is_available = True
+
+        def list_checks_for_pr(self, repo: str, number: int):
+            return [_check("ci")]
+
+        def list_all_checks_for_pr(self, repo: str, number: int):
+            return [_check("ci"), _check("Acceptance (web)", status="in_progress")]
+
+        def expects_checks(self, repo: str, number: int) -> bool:
+            return True
+
+    monkeypatch.setattr(gs, "build_ci_store", lambda t: _FakeCi())
+
+    refresher = gs.GateSnapshotRefresher()
+    snap = refresher.refresh(Config(repos=[], machines=[]))
+
+    assert [c.name for c in snap.list_checks_for_pr("acme/api", 7)] == ["ci"]
+    assert [c.name for c in snap.list_all_checks_for_pr("acme/api", 7)] == [
+        "ci", "Acceptance (web)",
+    ]
+
+
+def test_gate_refresher_all_checks_falls_back_without_the_capability(
+    rw_db, monkeypatch
+) -> None:
+    """#2446: a `CiStore` that predates `list_all_checks_for_pr` (a stub, or
+    an older backend) must not leave `all_checks` empty — it degrades to the
+    same (already-narrowed) data `checks` has, matching `merge_queue.plan()`'s
+    identical fallback for a store without the capability."""
+    import coord.gate_snapshot as gs
+    from coord.ci_store import CheckRun
+    from coord.config import Config
+
+    _seed_pending_merge(rw_db)
+
+    class _FakeCi:
+        is_available = True
+
+        def list_checks_for_pr(self, repo: str, number: int):
+            return [
+                CheckRun(
+                    name="ci", status="completed", conclusion="success",
+                    url="", run_id="1", started_at=None, completed_at=None,
+                )
+            ]
+
+        def expects_checks(self, repo: str, number: int) -> bool:
+            return True
+
+    monkeypatch.setattr(gs, "build_ci_store", lambda t: _FakeCi())
+
+    refresher = gs.GateSnapshotRefresher()
+    snap = refresher.refresh(Config(repos=[], machines=[]))
+
+    assert [c.name for c in snap.list_all_checks_for_pr("acme/api", 7)] == ["ci"]
+
+
 def test_gate_refresher_publishes_branch_freshness_anchors(
     rw_db, monkeypatch
 ) -> None:

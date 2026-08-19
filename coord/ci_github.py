@@ -146,6 +146,49 @@ class GitHubCi:
         return True
 
     def list_checks_for_pr(self, repo: str, number: int) -> list[CheckRun]:
+        """Checks the merge gate evaluates — narrowed to what GitHub's own
+        branch protection actually REQUIRES, when that's determinable
+        (#2388/#2446).
+
+        A repo can report far more `gh pr checks` entries than GitHub's
+        required-status-check list (this repo: 9 reported, 5 required), and
+        every merge-gate predicate downstream of this method
+        (`failed_checks`, `in_flight_checks`, `checks_are_stale`) otherwise
+        waits on advisory jobs GitHub itself doesn't — a hung/flaky ADVISORY
+        check (e.g. `Acceptance (web)`, or an unconditional Playwright/
+        Chromium install with no timeout) then blocks `coord merge`
+        indefinitely even though the PR is already `MERGEABLE`. Never
+        filters (returns everything :meth:`list_all_checks_for_pr` does)
+        when the required list can't be determined — #1525's bias: unknown
+        reads as "wait on everything reported", not as a free pass to stop
+        waiting on something that might matter.
+
+        #2446: this is deliberately the ONLY narrowed view — see
+        :meth:`list_all_checks_for_pr` for the full, unfiltered set that
+        feeds `coord merge --plan`'s CI summary, so a regressed advisory
+        check stays visible to an operator even though it can no longer gate
+        a merge attempt.
+        """
+        checks = self._all_checks(repo, number)
+        required = self._required_contexts(repo)
+        if required:
+            return [c for c in checks if c.name in required]
+        return checks
+
+    def list_all_checks_for_pr(self, repo: str, number: int) -> list[CheckRun]:
+        """Every check `gh pr checks` reports, required or advisory (#2446).
+
+        Purely a visibility view — `coord merge --plan`/the TUI's CI badges
+        read this so a regressed ADVISORY check (one GitHub's branch
+        protection doesn't require, and :meth:`list_checks_for_pr` therefore
+        no longer waits on) is still something an operator can see, per
+        #2446's suggested fix: "still visible ... but should never gate a
+        merge attempt." Shares :meth:`list_checks_for_pr`'s cached fetch —
+        one `gh pr checks` subprocess call backs both views, never two.
+        """
+        return self._all_checks(repo, number)
+
+    def _all_checks(self, repo: str, number: int) -> list[CheckRun]:
         key = (repo, number)
         now = time.time()
         cached = self._cache.get(key)
@@ -367,7 +410,13 @@ class GitHubCi:
             return [_unreadable_check(repo, number, str(e))]
         if not isinstance(raw, list):
             return [_unreadable_check(repo, number, "gh pr checks returned non-list JSON")]
-        checks = [
+        # #2446: `_all_checks` (this method's only caller) is the single
+        # unfiltered fetch shared by both `list_checks_for_pr` (narrowed to
+        # required contexts) and `list_all_checks_for_pr` (everything) — the
+        # required-contexts narrowing used to happen here, which meant an
+        # advisory check's regression was invisible everywhere, not just to
+        # the merge gate. See both methods' docstrings.
+        return [
             CheckRun(
                 name=str(entry.get("name", "")),
                 status=_status_from_bucket(str(entry.get("bucket", ""))),
@@ -380,22 +429,6 @@ class GitHubCi:
             for entry in raw
             if isinstance(entry, dict)
         ]
-        # #2388: narrow to what branch protection actually REQUIRES, when
-        # that's determinable — a repo can report far more `gh pr checks`
-        # entries than GitHub's own required list (this repo: 9 reported, 5
-        # required), and every merge-gate predicate downstream of this
-        # method (`failed_checks`, `in_flight_checks`, `checks_are_stale`)
-        # otherwise waits on advisory jobs GitHub itself doesn't. A hung
-        # advisory job (e.g. an unconditional Playwright/Chromium install
-        # with no timeout) would then block `coord merge` indefinitely even
-        # though the PR is already `MERGEABLE`. `_required_contexts` returns
-        # `None` (never filters) when it can't determine the required list
-        # — #1525's bias: unknown reads as "wait on everything reported",
-        # not as a free pass to stop waiting on something that might matter.
-        required = self._required_contexts(repo)
-        if required:
-            checks = [c for c in checks if c.name in required]
-        return checks
 
     def _required_contexts(self, repo: str) -> frozenset[str] | None:
         now = time.time()

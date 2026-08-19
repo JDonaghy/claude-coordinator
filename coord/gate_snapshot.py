@@ -136,6 +136,16 @@ class GateSnapshot:
     """
 
     checks: dict[tuple[str, int], list[CheckRun]] = field(default_factory=dict)
+    # #2446: the unfiltered counterpart to `checks` above — `checks` is
+    # already narrowed to branch-protection-required contexts (see
+    # `coord.ci_github.GitHubCi.list_checks_for_pr`'s docstring), so a
+    # regressed ADVISORY check (one GitHub's own merge button doesn't wait
+    # on either) would otherwise be invisible to `coord merge --plan`'s CI
+    # summary, not just to the merge gate. Populated from
+    # `list_all_checks_for_pr` when the inner `CiStore` offers it; falls
+    # back to the same (already-narrowed) data as `checks` for a backend
+    # that doesn't, same fail-open shape as `workflows_declared` below.
+    all_checks: dict[tuple[str, int], list[CheckRun]] = field(default_factory=dict)
     commit_messages: dict[tuple[str, int], list[str]] = field(default_factory=dict)
     epic_issues: dict[tuple[str, int], bool] = field(default_factory=dict)
     # #1640: (repo, branch) -> HEAD SHA, and (repo, base, head) -> patch-id,
@@ -179,6 +189,19 @@ class GateSnapshot:
             if age is None or age > STALE_AFTER_SECONDS:
                 return [_stale_check(age)]
         return self.checks.get((repo, number), [])
+
+    def list_all_checks_for_pr(self, repo: str, number: int) -> list[CheckRun]:
+        """Unfiltered counterpart to :meth:`list_checks_for_pr` (#2446) —
+        same staleness handling, but keyed off ``all_checks`` so an
+        advisory check's regression stays visible to `coord merge --plan`
+        even though `list_checks_for_pr` (the gate's own view) no longer
+        waits on it.
+        """
+        if self.ci_available:
+            age = None if self.refreshed_at is None else time.time() - self.refreshed_at
+            if age is None or age > STALE_AFTER_SECONDS:
+                return [_stale_check(age)]
+        return self.all_checks.get((repo, number), [])
 
     def expects_checks(self, repo: str, number: int) -> bool:
         # #1904: unlike `list_checks_for_pr`'s "unknown reads as failing"
@@ -286,6 +309,7 @@ class GateSnapshotRefresher:
         entries = [e for e in pending if e.pr_number]
 
         checks: dict[tuple[str, int], list[CheckRun]] = {}
+        all_checks: dict[tuple[str, int], list[CheckRun]] = {}
         messages: dict[tuple[str, int], list[str]] = {}
         epics: dict[tuple[str, int], bool] = {}
         branch_shas: dict[tuple[str, str], str | None] = {}
@@ -342,6 +366,21 @@ class GateSnapshotRefresher:
                     checks[key] = inner.list_checks_for_pr(*key)
                 except Exception:  # noqa: BLE001 — fail-open for this entry
                     checks[key] = []
+                # #2446: the unfiltered view backing `coord merge --plan`'s
+                # CI summary — see `GateSnapshot.all_checks`'s field
+                # comment. `list_all_checks_for_pr` is optional/duck-typed
+                # (a `CiStore` stand-in that predates #2446 doesn't offer
+                # it); falling back to the already-fetched `checks[key]`
+                # degrades to "advisory checks aren't shown separately",
+                # never to an extra `gh` call or a missing key.
+                list_all = getattr(inner, "list_all_checks_for_pr", None)
+                if list_all is not None:
+                    try:
+                        all_checks[key] = list_all(*key)
+                    except Exception:  # noqa: BLE001 — fail-open for this entry
+                        all_checks[key] = checks[key]
+                else:
+                    all_checks[key] = checks[key]
                 # #1904: repo-wide, so dedupe across every pending entry in
                 # the same repo — one `gh api .../actions/workflows` call
                 # per repo per tick, not one per PR. A failure here reads
@@ -372,6 +411,7 @@ class GateSnapshotRefresher:
 
         snap = GateSnapshot(
             checks=checks,
+            all_checks=all_checks,
             commit_messages=messages,
             epic_issues=epics,
             branch_shas=branch_shas,
