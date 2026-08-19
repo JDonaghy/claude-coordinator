@@ -1555,6 +1555,102 @@ def test_exhausted_reason_names_a_dispatch_only_failure():
     assert "no assignment was ever created for this run" in plan.blocked[0].reason
 
 
+def test_exhausted_merge_gate_block_does_not_get_the_dispatch_note():
+    """#2424: claude-coordinator#2405 / coord-web#2 — a relaunch whose only
+    job is retrying the Merge stage dispatches no NEW assignment by design
+    (Work/Test/Review already completed), so `_dispatch_produced_nothing`'s
+    comparison reads exactly like a genuine dispatch failure. The own exit
+    reason already names the real cause (a merge-gate block); the #2273 note
+    must not be layered on top of it, or an operator reading the escalation
+    is misdirected toward `drive-queue remove && add` (a wasted Work/Test/
+    Review cycle) instead of `coord merge --revalidate`."""
+    entries = [
+        entry(
+            1650,
+            state=STATE_RUNNING,
+            attempts=DEFAULT_MAX_ATTEMPTS - 1,
+            launched_at=NOW - DRIVE_STARTUP_GRACE_SECONDS - 1,
+        )
+    ]
+    own_reason = (
+        "drive exited for claude-coordinator#1650 (exit_code=1): merge "
+        "attempted 3 times without landing.\n"
+        "   Last board state: status='CONFLICT' reason='smoke test verdict "
+        "is stale'"
+    )
+    # No assignment dispatched AFTER `launched_at` — exactly the shape a
+    # merge-only relaunch produces, and exactly what used to trip the #2273
+    # note despite three real assignments already having done real work.
+    facts = IssueFacts(known=True, issue_state="open")
+    view = BoardView(issues={entry_key(REPO, 1650): facts})
+    plan = plan_tick(
+        entries, view, capacity=1, now=NOW,
+        exit_reasons={entry_key(REPO, 1650): own_reason},
+    )
+    assert plan.reconciles[0].outcome == "exhausted"
+    reason = plan.blocked[0].reason
+    assert own_reason in reason
+    assert "no assignment was ever created" not in reason
+    assert "infrastructure/dispatch-layer failure" not in reason
+
+
+def test_exhausted_checks_failed_does_not_get_the_dispatch_note():
+    """Same #2424 fix, the red-CI shape (coord-web#2): `own_reason` names a
+    `checks_failed` merge-gate block, not a dispatch failure."""
+    entries = [
+        entry(
+            1650,
+            state=STATE_RUNNING,
+            attempts=DEFAULT_MAX_ATTEMPTS - 1,
+            launched_at=NOW - DRIVE_STARTUP_GRACE_SECONDS - 1,
+        )
+    ]
+    own_reason = (
+        "drive exited for claude-coordinator#1650 (exit_code=1): merge "
+        "attempted 3 times without landing.\n"
+        "   Last board state: status='CONFLICT' reason='checks failed: "
+        "checks'"
+    )
+    facts = IssueFacts(known=True, issue_state="open")
+    view = BoardView(issues={entry_key(REPO, 1650): facts})
+    plan = plan_tick(
+        entries, view, capacity=1, now=NOW,
+        exit_reasons={entry_key(REPO, 1650): own_reason},
+    )
+    assert plan.reconciles[0].outcome == "exhausted"
+    reason = plan.blocked[0].reason
+    assert "no assignment was ever created" not in reason
+
+
+def test_a_genuine_dispatch_failure_still_gets_the_note_alongside_own_reason():
+    """Regression guard for #2424's fix: an own_reason that does NOT name a
+    merge-gate block (a genuine pre-`coord assign` crash) must still get the
+    #2273 note — the fix narrows the false-positive, it does not remove the
+    signal entirely."""
+    entries = [
+        entry(
+            1650,
+            state=STATE_RUNNING,
+            attempts=DEFAULT_MAX_ATTEMPTS - 1,
+            launched_at=NOW - DRIVE_STARTUP_GRACE_SECONDS - 1,
+        )
+    ]
+    own_reason = (
+        "drive exited for claude-coordinator#1650 (exit_code=1): unhandled "
+        "exception in dispatch"
+    )
+    facts = IssueFacts(known=True, issue_state="open")
+    view = BoardView(issues={entry_key(REPO, 1650): facts})
+    plan = plan_tick(
+        entries, view, capacity=1, now=NOW,
+        exit_reasons={entry_key(REPO, 1650): own_reason},
+    )
+    assert plan.reconciles[0].outcome == "exhausted"
+    reason = plan.blocked[0].reason
+    assert own_reason in reason
+    assert "no assignment was ever created for this run" in reason
+
+
 def test_a_dead_drive_out_of_attempts_blocks_and_escalates():
     entries = [
         entry(1650, state=STATE_RUNNING, attempts=DEFAULT_MAX_ATTEMPTS - 1)

@@ -97,6 +97,7 @@ from coord.merge_queue import (
     is_ci_infra_reason,
     is_ci_pending_reason,
     is_ci_unreadable_reason,
+    is_stale_smoke_reason,
 )
 from coord.models import is_policy_refusal_reason
 
@@ -1810,6 +1811,57 @@ def _dispatch_produced_nothing(entry: QueueEntry, facts: IssueFacts) -> bool:
     return facts.last_dispatched_at < entry.launched_at
 
 
+def _is_merge_gate_block_reason(reason: str | None) -> bool:
+    """#2424: does *reason* already name a merge-gate block — a death whose
+    real cause is a LATER stage (merge), not a dispatch-layer failure?
+
+    `_dispatch_produced_nothing`'s own comparison (``facts.last_dispatched_at
+    < entry.launched_at``) goes stale specifically for a relaunch whose only
+    job is retrying the Merge stage: by design, that relaunch dispatches no
+    new assignment (there is nothing left to dispatch — Work/Test/Review
+    already completed), so the comparison reads exactly like a genuine
+    dispatch failure even though three real assignments did real work. This
+    is the textual escape hatch for that case: when *reason* itself already
+    names a merge-gate block, the generic "#2273 no assignment was ever
+    created" note must not be layered on top of it — see
+    claude-coordinator#2405 (stale smoke verdict) and coord-web#2 (red CI),
+    both live escalations where the dispatch-note actively misdirected an
+    operator toward `drive-queue remove && add` (a wasted Work/Test/Review
+    cycle) instead of the real one-line fix (`coord merge --revalidate`, or
+    fixing the failing CI check).
+
+    Four shapes, all written by `coord/drive.py`'s own merge-stage decision
+    functions — none of them a "no assignment created" signal:
+
+    * `_die`'s exhausted-merge-attempts wording ("merge attempted N times
+      without landing") — `coord assign` succeeded and Work/Test/Review all
+      completed; the LOOP inside a single drive session that kept retrying
+      `coord merge --only` simply ran out of its own attempt budget
+      (#1505/#2078).
+    * `is_stale_smoke_reason` — the #1479 staleness race: the merge base
+      moved out from under a still-valid smoke verdict.
+    * "checks failed" — `coord.merge_queue`'s own `checks_failed` prose
+      (``f"checks failed: {summary}"``): red CI on a PR that was dispatched,
+      built, and reviewed fine.
+    * `_escalate_merge`'s own gate-divergence/terminal-status wording
+      ("smoke_required —" / "review_required —" / "merge_status=...") — the
+      #1505/#1526 immediate-escalation path, which already recorded its own
+      accurate `coord escalate record` before this drive exited.
+    """
+    if not reason:
+        return False
+    lowered = reason.lower()
+    if "merge attempted" in lowered:
+        return True
+    if is_stale_smoke_reason(reason):
+        return True
+    if "checks failed" in lowered:
+        return True
+    if "smoke_required —" in lowered or "review_required —" in lowered:
+        return True
+    return lowered.startswith("merge_status=")
+
+
 def _is_empty_branch_death_reason(reason: str | None) -> bool:
     """#2363: does *reason* name the "claimed success, wrote nothing"
     signature — an acceptance-author or plain work session that exited
@@ -2347,7 +2399,21 @@ def _reconcile_running(
     # — or the escalation this produces once the budget IS exhausted — sees
     # "no assignment was ever created" instead of a bare exit code that
     # could mean anything.
-    dispatch_only = _dispatch_produced_nothing(entry, facts)
+    #
+    # #2424: EXCEPT when `own_reason` already names a merge-gate block
+    # ("merge attempted N times without landing", a stale smoke verdict, red
+    # CI, ...) — a relaunch whose only job is retrying the Merge stage
+    # dispatches no new assignment BY DESIGN (Work/Test/Review already
+    # completed; there is nothing left to dispatch), so the comparison above
+    # reads exactly like a dispatch failure even though it plainly is not.
+    # The generic note is additive evidence for when nothing more specific is
+    # known; it must never be layered on top of a reason that already
+    # contradicts it — see `_is_merge_gate_block_reason` for the two live
+    # escalations (claude-coordinator#2405, coord-web#2) this false-positive
+    # actually produced.
+    dispatch_only = _dispatch_produced_nothing(
+        entry, facts
+    ) and not _is_merge_gate_block_reason(own_reason)
     dispatch_note = (
         " — no assignment was ever created for this run (#2273): likely an "
         "infrastructure/dispatch-layer failure, not a code defect"
