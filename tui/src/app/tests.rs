@@ -49483,3 +49483,187 @@ Milestone tracking issue.
             );
         }
     }
+
+    // ── #2285 (ms-65 §5): per-tab detail sub-state ───────────────────────
+    //
+    // The sealed acceptance slice drives these clauses through `TuiDriver` on
+    // the **Board** panel only. The tests below cover what it cannot reach
+    // from an external crate: the Pipeline scope's own records (including the
+    // expanded/focused stage, which has no Board analogue), and the
+    // scope-isolation invariant that a Board tab switch must not disturb the
+    // Pipeline pane's live fields.
+
+    /// §5 bullet 1 + 2, in-crate: two open Board tabs each keep their own
+    /// sub-tab and scroll offset, and a freshly-opened tab starts from the
+    /// defaults rather than inheriting the outgoing tab's.
+    #[test]
+    fn each_board_doc_tab_keeps_its_own_sub_tab_and_scroll() {
+        let mut app = doc_tab_app(DOC_TAB_BOARD_JSON);
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 101), true);
+        app.board_detail_tab = BoardDetailTab::Issue;
+        app.detail_scroll = 5;
+
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 102), true);
+        assert_eq!(
+            (app.board_detail_tab, app.detail_scroll),
+            (BoardDetailTab::Board, 0),
+            "#2285 §5: a newly-opened tab starts from the defaults (Board / \
+             scroll 0), never inheriting the sub-tab the outgoing tab was on"
+        );
+
+        // …and #102's own state is likewise its own.
+        app.board_detail_tab = BoardDetailTab::Terminal;
+        app.detail_scroll = 9;
+
+        assert!(app.activate_board_doc_tab(0), "#101 is at strip index 0");
+        assert_eq!(
+            (app.board_detail_tab, app.detail_scroll),
+            (BoardDetailTab::Issue, 5),
+            "#2285 §5: switching back to a tab restores THAT tab's sub-tab \
+             and scroll position"
+        );
+
+        assert!(app.activate_board_doc_tab(1), "#102 is at strip index 1");
+        assert_eq!(
+            (app.board_detail_tab, app.detail_scroll),
+            (BoardDetailTab::Terminal, 9),
+            "#2285 §5: …and the other tab still has its own, unchanged by the \
+             round trip through #101"
+        );
+    }
+
+    /// §5 bullet 3: closing a tab discards its sub-state — re-opening the same
+    /// issue number starts from the defaults, it does not resume.
+    #[test]
+    fn closing_a_board_doc_tab_discards_its_sub_state() {
+        let mut app = doc_tab_app(DOC_TAB_BOARD_JSON);
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 101), true);
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 102), true);
+        app.board_detail_tab = BoardDetailTab::Issue;
+        app.detail_scroll = 7;
+
+        assert!(app.close_board_doc_tab(1), "close #102, the active tab");
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 102), true);
+        assert_eq!(
+            (app.board_detail_tab, app.detail_scroll),
+            (BoardDetailTab::Board, 0),
+            "#2285 §5: a re-opened issue starts from Board / scroll 0 — the \
+             closed tab's sub-state was discarded, not parked"
+        );
+    }
+
+    /// The issue's own regression bar: "with exactly one tab open, sub-tab and
+    /// scroll behave exactly as they do today". With nothing to switch to, no
+    /// checkpoint/restore pair ever runs, so the live fields are untouched.
+    #[test]
+    fn a_single_board_doc_tab_leaves_the_live_sub_state_untouched() {
+        let mut app = doc_tab_app(DOC_TAB_BOARD_JSON);
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 101), true);
+        app.board_detail_tab = BoardDetailTab::Issue;
+        app.detail_scroll = 4;
+
+        // Every no-op tab gesture available with one tab open.
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 101), true);
+        assert!(app.activate_board_doc_tab(0));
+        assert!(app.cycle_board_doc_tab(true));
+        assert!(app.cycle_board_doc_tab(false));
+
+        assert_eq!(
+            (app.board_detail_tab, app.detail_scroll),
+            (BoardDetailTab::Issue, 4),
+            "#2285 regression bar: with one tab open the sub-tab and scroll a \
+             user set must survive re-opening, re-activating and cycling onto \
+             the same tab"
+        );
+    }
+
+    /// §5 on the **Pipeline** scope, including the expanded/focused stage the
+    /// issue's design section names and the Board panel has no analogue for.
+    #[test]
+    fn each_pipeline_doc_tab_keeps_its_own_sub_tab_scroll_and_expanded_stage() {
+        let mut app = doc_tab_app(DOC_TAB_BOARD_JSON);
+        let keys: Vec<(String, u64)> = app
+            .pipeline_issues
+            .iter()
+            .map(|pi| (pi.repo_slug.clone(), pi.number))
+            .take(2)
+            .collect();
+        assert_eq!(
+            keys.len(),
+            2,
+            "precondition: the shared fixture must seed at least two Pipeline \
+             issues to open two Pipeline tabs against"
+        );
+
+        app.open_pipeline_doc_tab(keys[0].clone(), true);
+        app.pipeline_detail_tab = PipelineDetailTab::Log;
+        app.pipeline_detail_scroll = 12;
+        app.pipeline_stage_content_scroll = 3;
+        app.pipeline_focused_stage = Some(2);
+
+        app.open_pipeline_doc_tab(keys[1].clone(), true);
+        assert_eq!(
+            (app.pipeline_detail_tab, app.pipeline_detail_scroll),
+            (PipelineDetailTab::Overview, 0),
+            "#2285 §5: a newly-opened Pipeline tab starts on Overview at \
+             scroll 0, not on the outgoing tab's Log"
+        );
+
+        app.pipeline_detail_tab = PipelineDetailTab::Summary;
+        app.pipeline_detail_scroll = 1;
+        app.pipeline_focused_stage = Some(0);
+
+        assert!(app.activate_pipeline_doc_tab(0));
+        assert_eq!(
+            (
+                app.pipeline_detail_tab,
+                app.pipeline_detail_scroll,
+                app.pipeline_stage_content_scroll,
+                app.pipeline_focused_stage,
+            ),
+            (PipelineDetailTab::Log, 12, 3, Some(2)),
+            "#2285 §5: the first Pipeline tab keeps its own sub-tab, both \
+             scroll offsets and its expanded stage across the round trip"
+        );
+
+        assert!(app.activate_pipeline_doc_tab(1));
+        assert_eq!(
+            (
+                app.pipeline_detail_tab,
+                app.pipeline_detail_scroll,
+                app.pipeline_focused_stage,
+            ),
+            (PipelineDetailTab::Summary, 1, Some(0)),
+            "#2285 §5: …and the second keeps its own"
+        );
+    }
+
+    /// The scope-isolation invariant `DetailSubState`'s doc comment pins: a
+    /// Board tab switch reads and writes only the Board fields, so Pipeline's
+    /// live pane state survives it untouched (and vice versa). Contract §3b's
+    /// "the two scopes never merge", extended to the sub-state records.
+    #[test]
+    fn a_board_tab_switch_never_disturbs_the_pipeline_panes_sub_state() {
+        let mut app = doc_tab_app(DOC_TAB_BOARD_JSON);
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 101), true);
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 102), true);
+
+        app.pipeline_detail_tab = PipelineDetailTab::Log;
+        app.pipeline_detail_scroll = 8;
+        app.pipeline_focused_stage = Some(1);
+
+        assert!(app.activate_board_doc_tab(0));
+        assert!(app.activate_board_doc_tab(1));
+
+        assert_eq!(
+            (
+                app.pipeline_detail_tab,
+                app.pipeline_detail_scroll,
+                app.pipeline_focused_stage,
+            ),
+            (PipelineDetailTab::Log, 8, Some(1)),
+            "#2285: Board's checkpoint/restore must touch only Board's live \
+             fields — the Pipeline pane is a different scope with its own \
+             records"
+        );
+    }

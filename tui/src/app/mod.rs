@@ -155,8 +155,8 @@ pub(crate) mod drive_queue;
 pub(crate) mod doc_tabs;
 #[allow(unused_imports)]
 use self::doc_tabs::{
-    doc_tab_label, resolve_doc_tab_click, DocKey, DocTabs, PanelScope, TabClickKind,
-    SCROLL_LEFT_MARKER, SCROLL_RIGHT_MARKER,
+    doc_tab_label, resolve_doc_tab_click, DetailSubState, DocKey, DocTabs, PanelScope,
+    TabClickKind, SCROLL_LEFT_MARKER, SCROLL_RIGHT_MARKER,
 };
 #[allow(unused_imports)]
 use self::types::*;
@@ -6773,6 +6773,126 @@ impl CoordApp {
         Some((repo.to_string(), group.issue_number))
     }
 
+    // ── #2285 (ms-65 §5): per-tab detail sub-state ───────────────────────
+    //
+    // The detail pane's sub-tab, scroll offset and expanded stage belong to
+    // the DOCUMENT, not to the panel: with two tabs open, switching one to
+    // `Issue` or scrolling its body must leave the other exactly where it
+    // was. `CoordApp`'s `board_detail_tab` / `pipeline_detail_tab` /
+    // `detail_scroll` / `pipeline_detail_scroll` / `pipeline_stage_content_scroll`
+    // / `pipeline_focused_stage` fields stay put as the **live** values —
+    // roughly 150 call sites across `events.rs`, `dialogs.rs`, `render.rs`,
+    // `sessions.rs` and `terminal.rs` read and write them, most from inside
+    // `match` guards — and are checkpointed into / restored out of the active
+    // document's `DetailSubState` record on every tab switch. The record in
+    // `doc_tabs.rs` is the source of truth for every *inactive* tab; the live
+    // fields are the active tab's working copy.
+    //
+    // That is what keeps the slice behaviour-preserving at one open tab: with
+    // a single tab there is nothing to switch to, so no checkpoint/restore
+    // pair ever runs and the live fields behave exactly as they do today.
+    //
+    // The three hooks, in the order they must run:
+    //   1. `checkpoint_detail_sub_state` — BEFORE the tab-set mutation, so it
+    //      still sees the OUTGOING active key.
+    //   2. the mutation itself (`open_preview` / `pin` / `activate_index` /
+    //      `close`).
+    //   3. `restore_detail_sub_state` — AFTER the reveal (§2f), because
+    //      `reveal_pipeline_active_doc` resets `pipeline_focused_stage` and
+    //      `pipeline_stage_content_scroll` on its way past and the restored
+    //      values must win.
+
+    /// Snapshot the live detail sub-state fields `scope`'s pane owns.
+    ///
+    /// Only that scope's fields are populated; the rest keep their `Default`
+    /// value and are never read back (see [`DetailSubState`]'s scope-ownership
+    /// note), so a Board checkpoint can never clobber Pipeline's live pane and
+    /// vice versa.
+    fn detail_sub_state_snapshot(&self, scope: PanelScope) -> DetailSubState {
+        match scope {
+            PanelScope::Board => DetailSubState {
+                board_tab: self.board_detail_tab,
+                scroll: self.detail_scroll,
+                ..DetailSubState::default()
+            },
+            PanelScope::Pipeline => DetailSubState {
+                pipeline_tab: self.pipeline_detail_tab,
+                scroll: self.pipeline_detail_scroll,
+                stage_scroll: self.pipeline_stage_content_scroll,
+                focused_stage: self.pipeline_focused_stage,
+                ..DetailSubState::default()
+            },
+        }
+    }
+
+    /// Load a stored record back into the live fields `scope`'s pane reads.
+    fn apply_detail_sub_state(&mut self, scope: PanelScope, state: &DetailSubState) {
+        match scope {
+            PanelScope::Board => {
+                self.board_detail_tab = state.board_tab;
+                self.detail_scroll = state.scroll;
+            }
+            PanelScope::Pipeline => {
+                self.pipeline_detail_tab = state.pipeline_tab;
+                self.pipeline_detail_scroll = state.scroll;
+                self.pipeline_stage_content_scroll = state.stage_scroll;
+                self.pipeline_focused_stage = state.focused_stage;
+            }
+        }
+    }
+
+    /// Reset `scope`'s live sub-state to the pane defaults, for a document
+    /// being shown for the first time (contract §5: "defaults on open match
+    /// today's defaults — `Board` / `Overview`, scroll 0").
+    ///
+    /// Deliberately narrower than [`Self::apply_detail_sub_state`]: it leaves
+    /// `pipeline_focused_stage` / `pipeline_stage_content_scroll` alone,
+    /// because `reveal_pipeline_active_doc` has just seeded them from
+    /// `default_focused_stage_for_selected_issue()` — the pre-ms-65 default
+    /// for a freshly-revealed Pipeline issue, which a blunt `None` would
+    /// regress.
+    fn reset_detail_sub_state(&mut self, scope: PanelScope) {
+        match scope {
+            PanelScope::Board => {
+                self.board_detail_tab = BoardDetailTab::default();
+                self.detail_scroll = 0;
+            }
+            PanelScope::Pipeline => {
+                self.pipeline_detail_tab = PipelineDetailTab::default();
+                self.pipeline_detail_scroll = 0;
+            }
+        }
+    }
+
+    /// Save the live sub-state under `scope`'s currently-active document.
+    ///
+    /// A no-op when nothing is open — with zero tabs the pane is still the
+    /// pure function of the sidebar selection it was before ms-65, and there
+    /// is no document to attribute the state to.
+    fn checkpoint_detail_sub_state(&mut self, scope: PanelScope) {
+        let Some(key) = self.doc_tabs.group(scope).active_key().cloned() else {
+            return;
+        };
+        let state = self.detail_sub_state_snapshot(scope);
+        self.doc_tabs.group_mut(scope).set_sub_state(key, state);
+    }
+
+    /// Load `scope`'s newly-active document's sub-state into the live fields,
+    /// or fall back to the pane defaults for a document with no record yet.
+    ///
+    /// A no-op when nothing is open (§4's empty state): closing the last tab
+    /// returns to selection-follows-tree, and blanking the pane's sub-tab on
+    /// the way out would be a change no clause asks for.
+    fn restore_detail_sub_state(&mut self, scope: PanelScope) {
+        let Some(key) = self.doc_tabs.group(scope).active_key().cloned() else {
+            return;
+        };
+        match self.doc_tabs.group(scope).sub_state(&key).cloned() {
+            Some(state) => self.apply_detail_sub_state(scope, &state),
+            None => self.reset_detail_sub_state(scope),
+        }
+    }
+
     // ── #2282 (ms-65 §2): Board document tabs ────────────────────────────
 
     /// The Board panel's document-tab set.
@@ -6837,8 +6957,14 @@ impl CoordApp {
     /// `pin == true` is the double-click path (rule 3: open-or-activate, then
     /// promote). Reveals the newly-active document in the sidebar (§2f) when
     /// activation actually moved.
+    ///
+    /// #2285 (§5): checkpoints the outgoing document's detail sub-state before
+    /// the mutation and restores the incoming one's after the reveal, so the
+    /// tab you were reading keeps its sub-tab and scroll and the tab you open
+    /// starts from the defaults instead of inheriting them.
     fn open_board_doc_tab(&mut self, key: DocKey, pin: bool) {
         let before = self.board_doc_active_key().cloned();
+        self.checkpoint_detail_sub_state(PanelScope::Board);
         {
             let group = self.doc_tabs.group_mut(PanelScope::Board);
             if pin {
@@ -6849,6 +6975,7 @@ impl CoordApp {
         }
         if self.board_doc_active_key().cloned() != before {
             self.reveal_board_active_doc();
+            self.restore_detail_sub_state(PanelScope::Board);
         }
     }
 
@@ -6861,6 +6988,11 @@ impl CoordApp {
         if idx >= self.board_doc_tabs().tabs().len() {
             return false;
         }
+        // #2285 (§5): banking the outgoing tab's sub-state is what lets the
+        // incoming tab restore its own. Unconditional, like the reveal below —
+        // when the click lands on the already-active tab, checkpoint and
+        // restore are each other's inverse and the pair is a no-op.
+        self.checkpoint_detail_sub_state(PanelScope::Board);
         self.doc_tabs.group_mut(PanelScope::Board).activate_index(idx);
         // Reveal unconditionally, not just when the active index moved:
         // contract §2f says activating a tab "by any path" reveals its row,
@@ -6868,6 +7000,7 @@ impl CoordApp {
         // to be taken back to a document they have navigated away from in the
         // tree. Gating on `changed` would make that click a silent no-op.
         self.reveal_board_active_doc();
+        self.restore_detail_sub_state(PanelScope::Board);
         true
     }
 
@@ -6890,6 +7023,12 @@ impl CoordApp {
     /// itself no-ops on `None` — nothing left to reveal, which is exactly
     /// §4's "return to selection-follows-tree" (the sidebar selection made
     /// when the closed tab was opened is simply what's left).
+    /// #2285 (§5): deliberately does NOT checkpoint first — the closed tab's
+    /// sub-state is discarded, not banked (`DocTabGroup::close` prunes its
+    /// record), so re-opening the same issue number starts from the defaults.
+    /// Closing an INACTIVE tab leaves the active key alone, so the live fields
+    /// are left untouched too; only a close that moves the active document
+    /// restores the neighbour's own sub-state.
     fn close_board_doc_tab(&mut self, idx: usize) -> bool {
         let before = self.board_doc_active_key().cloned();
         if !self.doc_tabs.group_mut(PanelScope::Board).close(idx) {
@@ -6897,6 +7036,7 @@ impl CoordApp {
         }
         if self.board_doc_active_key().cloned() != before {
             self.reveal_board_active_doc();
+            self.restore_detail_sub_state(PanelScope::Board);
         }
         true
     }

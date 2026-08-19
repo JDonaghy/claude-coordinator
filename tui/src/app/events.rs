@@ -5183,16 +5183,25 @@ impl CoordApp {
                                 }
                             }
                         } else {
-                            // path.len() == 2: issue row — reset detail scroll.
-                            self.detail_scroll = 0;
                             // #2282 (ms-65 §2e rules 1/2/4): a single click on
                             // an issue row opens it in a PREVIEW tab — already
                             // open → activate; a preview exists → replace it in
                             // place; otherwise append. The sidebar has already
                             // moved its selection to the clicked row by now, so
                             // `board_selected_issue` names the clicked issue.
-                            if let Some(key) = self.board_selected_issue() {
-                                self.open_board_doc_tab(key, false);
+                            //
+                            // #2285 (§5): the detail-scroll reset is `open_board_doc_tab`'s
+                            // job now, not this arm's — it checkpoints the OUTGOING tab's
+                            // scroll before switching, so zeroing the live field first
+                            // would bank a 0 onto the tab being left and lose its
+                            // position. `restore_detail_sub_state` zeroes it for a
+                            // first-open document and restores the stored offset for one
+                            // already open, which is what this line used to approximate
+                            // when the pane was a pure function of the sidebar row. Only
+                            // the no-issue-selected fallback still resets it here.
+                            match self.board_selected_issue() {
+                                Some(key) => self.open_board_doc_tab(key, false),
+                                None => self.detail_scroll = 0,
                             }
                         }
                         true
@@ -5235,8 +5244,11 @@ impl CoordApp {
                                 }
                             }
                         } else {
-                            // path.len() == 2: issue row activate — reset detail scroll.
-                            self.detail_scroll = 0;
+                            // #2285 (§5): the detail-scroll reset moved into
+                            // `open_board_doc_tab`'s checkpoint/restore pair — see the
+                            // RowSelected arm above for why zeroing it here would bank a
+                            // 0 onto the tab being switched away from.
+                            //
                             // #2282 (ms-65 §2e rule 3): a double click (which
                             // `SidebarSystem` reports as RowActivated) is
                             // open-or-activate followed by PROMOTION — the tab
@@ -5255,9 +5267,12 @@ impl CoordApp {
                             // `DoubleClick` — the user meant two single clicks,
                             // so honour rule 1 (open a preview) rather than
                             // silently pinning a tab they never double-clicked.
-                            if let Some(key) = self.board_selected_issue() {
-                                let pin = self.board_doc_active_key() == Some(&key);
-                                self.open_board_doc_tab(key, pin);
+                            match self.board_selected_issue() {
+                                Some(key) => {
+                                    let pin = self.board_doc_active_key() == Some(&key);
+                                    self.open_board_doc_tab(key, pin);
+                                }
+                                None => self.detail_scroll = 0,
                             }
                         }
                         true
