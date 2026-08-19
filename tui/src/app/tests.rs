@@ -30531,6 +30531,96 @@
             "#2449: opening the tab must not clear or otherwise touch the \
              typed Pipeline search filter"
         );
+        // Review finding (iteration 1): the tab strip alone isn't the bar —
+        // `pipeline_sel` (what every Overview/Issue/Log detail-pane render
+        // function and per-issue action actually key off, not the doc tab)
+        // must also resolve to the jump target, even though the filter left
+        // no tree row for `locate_pipeline_selection` to restore onto.
+        assert_eq!(
+            app.pipeline_sel,
+            Some(0),
+            "#2449: pipeline_sel must point at #42 (index 0), the jumped-to \
+             issue, not fall through to None just because its row doesn't \
+             exist in the filtered tree"
+        );
+        let overview = app.pipeline_tab_body_list();
+        let rendered: Vec<String> = overview
+            .items
+            .iter()
+            .map(|i| i.text.spans.iter().map(|s| s.text.clone()).collect::<String>())
+            .collect();
+        assert!(
+            rendered.iter().any(|line| line.contains("Local") && line.contains("api")),
+            "#2449: the Overview detail pane must show #42's own content \
+             ('Local: api'), not stale/blank content, once its tab is \
+             revealed: {rendered:?}"
+        );
+    }
+
+    /// #2449 regression (review iteration 1): when the active Pipeline
+    /// search filter hides the jump target's row but leaves a DIFFERENT
+    /// issue visible, `pipeline_sel` must still land on the jump target —
+    /// not silently snap onto whatever row the sidebar tree's own
+    /// default/previous selection happens to leave active.
+    ///
+    /// Before the `reveal_pipeline_active_doc` fix, `rebuild_pipeline_sidebar`
+    /// unconditionally synced `pipeline_sel` from the tree's own selection
+    /// (`selected_pipeline_index`) whenever `locate_pipeline_selection`
+    /// couldn't find the filtered-out target. With another issue visible,
+    /// that snapped `pipeline_sel` onto it instead — the tab strip looked
+    /// right (it embeds the title independent of `pipeline_sel`), but the
+    /// Overview/Issue/Log detail panes silently rendered the WRONG issue's
+    /// content under the target's tab.
+    #[test]
+    fn jump_to_pipeline_lands_on_the_target_not_a_different_visible_issue() {
+        let mut app = make_pipeline_app();
+        // "Mystery" matches only #99's title ("Mystery repo issue") — #42
+        // ("Add cool thing") stays hidden, #99 stays visible.
+        app.pipeline_search.set_value("Mystery");
+        app.rebuild_pipeline_sidebar(None);
+
+        // Sanity: #42 hidden, #99 (index 1) visible under the filter.
+        let visible_new: Vec<usize> = app
+            .pipeline_repos_for_state("new")
+            .into_iter()
+            .flat_map(|(_, idxs)| idxs)
+            .collect();
+        assert!(
+            !visible_new.contains(&0),
+            "precondition: #42 must be hidden by the search filter: {visible_new:?}"
+        );
+        assert!(
+            visible_new.contains(&1),
+            "precondition: #99 must remain visible under the filter: {visible_new:?}"
+        );
+
+        app.jump_to_pipeline("api", 42);
+
+        assert_eq!(
+            app.pipeline_doc_active_key(),
+            Some(&("acme/api".to_string(), 42)),
+            "the tab must open/activate for #42"
+        );
+        assert_eq!(
+            app.pipeline_sel,
+            Some(0),
+            "#2449: pipeline_sel must resolve to #42 (index 0, the jump \
+             target), not snap onto #99 (index 1) just because #99 is the \
+             only row the sidebar tree can actually select under the \
+             current filter"
+        );
+        let overview = app.pipeline_tab_body_list();
+        let rendered: Vec<String> = overview
+            .items
+            .iter()
+            .map(|i| i.text.spans.iter().map(|s| s.text.clone()).collect::<String>())
+            .collect();
+        assert!(
+            rendered.iter().any(|line| line.contains("Local") && line.contains("api")),
+            "#2449: the Overview pane must show #42's content ('Local: \
+             api'), not #99's ('Local: (no coordinator.yml mapping)'): \
+             {rendered:?}"
+        );
     }
 
     /// #2449 AC4: "View in Pipeline" still renders disabled, with
@@ -30629,6 +30719,14 @@
     /// current Pipeline search filter hides, mirroring AC3's Queue coverage.
     /// Confirms the fix really lives in the shared `jump_to_pipeline`, not a
     /// Queue-only special case (#1069 already showed that class of drift).
+    ///
+    /// A second, visible "decoy" issue (#8) is included deliberately (review
+    /// iteration 1): with only one fixture issue, the tab strip's own label
+    /// (which embeds the title independent of `pipeline_sel`) already
+    /// satisfies a bare `screen.contains(title)` check even when the detail
+    /// pane silently renders nothing/the wrong issue — #8 being the only
+    /// row the sidebar tree can select under the filter is exactly the
+    /// shape that used to make `pipeline_sel` snap onto it instead of #7.
     #[test]
     fn board_view_in_pipeline_enabled_and_opens_a_tab_for_a_search_filtered_issue() {
         use quadraui::tui::testing::driver_with_shell;
@@ -30646,18 +30744,36 @@
             pipeline_repos: vec![("myrepo".to_string(), "acme/myrepo".to_string())],
             ..BoardData::default()
         });
-        app.pipeline_issues = vec![PipelineIssue {
-            number: 7,
-            title: "Filtered jump issue".to_string(),
-            body: String::new(),
-            repo_slug: "acme/myrepo".to_string(),
-            coord_repo: Some("myrepo".to_string()),
-            matched_labels: vec!["coord".to_string()],
-            all_labels: vec!["coord".to_string()],
-            is_closed: false,
-        }];
+        app.pipeline_issues = vec![
+            PipelineIssue {
+                number: 7,
+                title: "Filtered jump issue".to_string(),
+                body: String::new(),
+                repo_slug: "acme/myrepo".to_string(),
+                coord_repo: Some("myrepo".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string()],
+                is_closed: false,
+            },
+            // Decoy: stays visible under the "Decoy" filter below, and
+            // carries a label ("decoy-marker") that only ever renders in
+            // the Overview detail pane (`pipeline_tab_body_list_for`'s
+            // "Labels" line) — never in the sidebar tree or the tab strip
+            // — so its presence on screen after the jump would prove
+            // `pipeline_sel` wrongly snapped onto the decoy instead of #7.
+            PipelineIssue {
+                number: 8,
+                title: "Decoy visible issue".to_string(),
+                body: String::new(),
+                repo_slug: "acme/myrepo".to_string(),
+                coord_repo: Some("myrepo".to_string()),
+                matched_labels: vec!["coord".to_string(), "decoy-marker".to_string()],
+                all_labels: vec!["coord".to_string(), "decoy-marker".to_string()],
+                is_closed: false,
+            },
+        ];
         app.rebuild_board_sidebar();
-        app.pipeline_search.set_value("zzznomatch");
+        app.pipeline_search.set_value("Decoy");
         app.rebuild_pipeline_sidebar(None);
 
         let items = app.context_menu_items_for_board_row(
@@ -30685,6 +30801,13 @@
             pipeline_screen.contains("PIPELINE") && pipeline_screen.contains("#7"),
             "#2449: the jump must open/activate the document tab even though \
              the active Pipeline search filter hides #7's sidebar row:\n{pipeline_screen}"
+        );
+        assert!(
+            !pipeline_screen.contains("decoy-marker"),
+            "#2449: the detail pane must show #7's own content, not the \
+             visible decoy issue's (#8) — a 'decoy-marker' label on screen \
+             would mean pipeline_sel snapped onto #8 instead of the jump \
+             target:\n{pipeline_screen}"
         );
     }
 

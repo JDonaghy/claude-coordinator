@@ -9091,9 +9091,14 @@ impl CoordApp {
         let Some((repo_slug, number)) = self.pipeline_doc_active_key().cloned() else {
             return;
         };
-        let Some(pi) = self.pipeline_issue_for(&repo_slug, number) else {
+        let Some(idx) = self
+            .pipeline_issues
+            .iter()
+            .position(|pi| pi.repo_slug == repo_slug && pi.number == number)
+        else {
             return;
         };
+        let pi = &self.pipeline_issues[idx];
         let lc_key = self.pipeline_lifecycle_section(pi);
         let repo_key = Self::pipeline_repo_key(pi).to_string();
         let mil_key = match self.pipeline_issue_milestone(pi) {
@@ -9110,6 +9115,20 @@ impl CoordApp {
                 .insert(("in-progress".to_string(), repo_key, mil_key), true);
         }
         self.rebuild_pipeline_sidebar(Some((repo_slug, number)));
+        // #2449: force `pipeline_sel` onto the active doc tab's issue,
+        // independent of whether `rebuild_pipeline_sidebar` found a tree row
+        // for it. Every detail-pane render function (`build_pipeline_widget`,
+        // `pipeline_tab_body_list_for`, `pipeline_issue_body_list`, etc.) and
+        // every per-issue action keys off `pipeline_sel`, not the doc tab —
+        // when the active Pipeline search filter hides the target's row,
+        // `locate_pipeline_selection` can't find it and the rebuild above
+        // leaves `pipeline_sel` pointing at whatever the tree's own
+        // default/previous selection happens to be (a different issue, or
+        // `None`). Since `idx` was resolved directly from `pipeline_issues`
+        // — not the filtered tree — this is correct regardless of filter
+        // state, and a no-op when the row IS visible (the rebuild's own
+        // restore already lands on the same index in that case).
+        self.pipeline_sel = Some(idx);
         self.pipeline_focused_stage = self.default_focused_stage_for_selected_issue();
         self.pipeline_stage_content_scroll = 0;
     }
