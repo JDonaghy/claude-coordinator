@@ -9007,6 +9007,7 @@ impl CoordApp {
             self.reveal_pipeline_active_doc();
             self.restore_detail_sub_state(PanelScope::Pipeline);
         }
+        self.persist_doc_tabs();
     }
 
     /// Activate the Pipeline tab at strip index `idx` (a click on the strip
@@ -9022,6 +9023,7 @@ impl CoordApp {
         self.doc_tabs.group_mut(PanelScope::Pipeline).activate_index(idx);
         self.reveal_pipeline_active_doc();
         self.restore_detail_sub_state(PanelScope::Pipeline);
+        self.persist_doc_tabs();
         true
     }
 
@@ -9039,6 +9041,7 @@ impl CoordApp {
             self.reveal_pipeline_active_doc();
             self.restore_detail_sub_state(PanelScope::Pipeline);
         }
+        self.persist_doc_tabs();
         true
     }
 

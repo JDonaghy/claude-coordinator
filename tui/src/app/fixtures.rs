@@ -44,6 +44,22 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
     // real `~/.coord/workspace.json` from a test fixture (mirrors
     // `command_runner: CommandRunner::new_for_test()` below: no real I/O).
     let workspace = Workspace::derive_from_repos(&known_repos(&data));
+    // #2286 (ms-65 §6): unlike `workspace` above, this DOES read
+    // `~/.coord/tabs.json` — deliberately, and unlike every other field in
+    // this constructor. `CoordApp::new()` is the only other doc-tabs load
+    // site, and it builds the real, daemon-backed app against an empty
+    // board (data arrives asynchronously), which structurally can never
+    // witness a restore: every persisted document would be pruned before
+    // the first real tick landed. This fixture path is therefore the ONLY
+    // seam that can restore doc tabs against data that's actually known at
+    // construction time (`tests/acceptance/ms-65/manifest.yml` finding 14
+    // spells this out — flagged there as a coordinator-owned follow-up: an
+    // injectable `~/.coord` seam would let this go back to being pure, like
+    // `workspace` above). Pruned immediately against `data`, so a fixture
+    // whose synthetic issues don't match the real file's (the overwhelming
+    // common case) restores nothing.
+    let mut doc_tabs = DocTabs::load();
+    doc_tabs.retain_known(&doc_tabs::known_doc_keys(&data));
     CoordApp {
         data,
         workspace,
@@ -68,7 +84,7 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         board_milestone_expanded: std::collections::HashMap::new(),
         board_epic_expanded: std::collections::HashMap::new(),
         board_epic_row_keys: std::collections::HashMap::new(),
-        doc_tabs: DocTabs::default(),
+        doc_tabs,
         board_section_rows: Vec::new(),
         board_tree_hidden_above: std::collections::HashMap::new(),
         last_sidebar_geom: std::cell::Cell::new(None),

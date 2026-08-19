@@ -43,10 +43,13 @@
 //! thing to delete in favour of them. The public surface here is deliberately
 //! small and free of rendering concerns so that swap stays cheap.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
 
 use crate::app::format::trunc;
-use crate::app::types::{BoardDetailTab, PipelineDetailTab};
+use crate::app::types::{BoardData, BoardDetailTab, PipelineDetailTab};
 
 /// Which panel's document set a tab belongs to.
 ///
@@ -415,10 +418,78 @@ impl DocTabGroup {
             "preview index must point at a live tab: {self:?}"
         );
     }
+
+    // ── #2286 (ms-65 §6): persistence — drop dead documents on load ─────
+
+    /// Contract §6 bullets 2/3: drop every tab whose key is not in `known` —
+    /// e.g. its issue was closed and dropped from the board since this group
+    /// was last persisted. "A surviving neighbour becomes active" and "if
+    /// none survive, start with no tabs" both fall out of [`Self::close`]'s
+    /// own already-tested active-neighbour rebasing, applied once per dead
+    /// tab, rather than a second hand-rolled "pick a neighbour" algorithm:
+    /// closing the tab at its own index rebases `active`/`preview` and
+    /// prunes `sub_state` for it exactly as a live `Ctrl-W` close would.
+    ///
+    /// Walks indices highest-to-lowest so each `close(idx)` call still
+    /// targets the right (not-yet-shifted) tab — [`Vec::remove`] only moves
+    /// elements *after* the removed index, so indices below the one being
+    /// processed are never disturbed by an earlier iteration.
+    pub(crate) fn retain_known(&mut self, known: &HashSet<DocKey>) {
+        for idx in (0..self.tabs.len()).rev() {
+            if !known.contains(&self.tabs[idx]) {
+                self.close(idx);
+            }
+        }
+    }
+
+    /// Rebuild a group from its persisted form ([`PersistedScope`]), trusting
+    /// the file as-is. Pruning against the live board is the separate
+    /// [`Self::retain_known`] step — at real startup (`CoordApp::new`) the
+    /// board hasn't loaded yet, and pruning against an empty known-set would
+    /// throw away everything this function just restored before the first
+    /// real data tick ever reconciles it (mirrors `Workspace::load` /
+    /// `sync_workspace_repos`, `app/workspace.rs`).
+    fn from_persisted(scope: PersistedScope, owner: PanelScope) -> Self {
+        let tabs: Vec<DocKey> = scope.tabs.iter().map(PersistedDoc::key).collect();
+        let mut sub_state = HashMap::new();
+        for doc in &scope.tabs {
+            if let Some(state) = doc.sub_state(owner) {
+                sub_state.insert(doc.key(), state);
+            }
+        }
+        let mut group = DocTabGroup {
+            tabs,
+            active: None,
+            preview: None,
+            sub_state,
+        };
+        group.active = scope.active.as_ref().and_then(|d| group.index_of(&d.key()));
+        group.preview = scope.preview.as_ref().and_then(|d| group.index_of(&d.key()));
+        if group.active.is_none() && !group.tabs.is_empty() {
+            // A malformed-but-parseable file (e.g. a `null` active alongside
+            // a non-empty `tabs`, or an `active` key that isn't itself in
+            // `tabs`) would otherwise violate `debug_check`'s "active is Some
+            // iff tabs is non-empty" invariant for the rest of the group's
+            // life. Anchor on the leftmost tab rather than carry that in.
+            group.active = Some(0);
+        }
+        group.debug_check();
+        group
+    }
+
+    /// This group's persisted form ([`PersistedScope`], contract §6).
+    fn to_persisted(&self, owner: PanelScope) -> PersistedScope {
+        let doc = |key: &DocKey| PersistedDoc::from_key(key, self.sub_state.get(key), owner);
+        PersistedScope {
+            tabs: self.tabs.iter().map(&doc).collect(),
+            active: self.active_key().map(&doc),
+            preview: self.preview.and_then(|i| self.tabs.get(i)).map(&doc),
+        }
+    }
 }
 
 /// Every panel's document tabs, keyed by scope.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct DocTabs {
     board: DocTabGroup,
     pipeline: DocTabGroup,
@@ -438,6 +509,309 @@ impl DocTabs {
             PanelScope::Pipeline => &mut self.pipeline,
         }
     }
+
+    /// Contract §6 bullets 2/3, applied to both scopes at once — the
+    /// `CoordApp` integration point (`mod.rs`'s `sync_doc_tabs` for real
+    /// startup, `fixtures.rs`'s `make_test_app` for the fixture path) calls
+    /// this once real board data is known.
+    pub(crate) fn retain_known(&mut self, known: &HashSet<DocKey>) {
+        self.board.retain_known(known);
+        self.pipeline.retain_known(known);
+    }
+
+    // ─── Persistence: `~/.coord/tabs.json` ──────────────────────────────
+
+    /// Path to the persisted tabs file (`~/.coord/tabs.json`), or `None`
+    /// when `HOME` is unset — matches `TuiSettings::path()` / `Workspace::path()`.
+    ///
+    /// # Test / `test-support` builds only: real, un-sandboxed `HOME` is refused
+    ///
+    /// `DocTabs` is unlike every sibling `~/.coord/*` persistence type in one
+    /// respect: [`DocTabs::retain_known`] means a correct restore can only be
+    /// observed by actually constructing a `CoordApp` from a fixture that
+    /// already knows the board (`fixtures.rs::make_test_app`'s doc comment —
+    /// and `tests/acceptance/ms-65/manifest.yml` finding 14 — explain why
+    /// this is unavoidable), so — unlike `Workspace`'s fixtures, which derive
+    /// fresh and never touch disk — that fixture path genuinely calls
+    /// [`DocTabs::load`]. And unlike `Workspace`'s CoordApp-integration
+    /// methods (`open_project`/`close_project`/…), which no existing test
+    /// exercises, this crate's #2282-#2287 TuiDriver suites exercise
+    /// `open_board_doc_tab`/`activate_board_doc_tab`/… (and therefore
+    /// [`DocTabs::save_if_exists`]) *extensively* — hundreds of clicks across
+    /// dozens of tests, none of which sandbox `HOME`.
+    ///
+    /// With no injectable `~/.coord` seam (`tests/acceptance/ms-65/
+    /// manifest.yml` finding 14b — a repo-wide fix flagged there as the
+    /// coordinator's follow-up, not this issue's), an unguarded `path()`
+    /// would mean every one of those clicks reads and writes the REAL
+    /// developer's `~/.coord/tabs.json` — verified while authoring this: it
+    /// self-pollutes within a single `cargo test` process (one test's writes
+    /// leak into the very next test's `DocTabs::load()`, since both hit the
+    /// same real file) and even a single `q`-quit test creates the file for
+    /// every other unsandboxed test to trip over afterward.
+    ///
+    /// The guard: `tests/acceptance/ms-65/tabs_persistence_2286.rs`'s own
+    /// `HomeSandbox` (and any other test that wants real doc-tabs I/O)
+    /// points `HOME` at a fresh directory under [`std::env::temp_dir`] — an
+    /// ordinary developer or CI `$HOME` is never there. So under `#[cfg(test)]`
+    /// / `test-support` only, `path()` additionally requires `HOME` to
+    /// resolve inside the system temp directory; otherwise it refuses (same
+    /// as `HOME` being unset) rather than touching a real home directory.
+    /// Compiled out entirely for the shipped binary — real users are
+    /// unaffected, exactly like `Workspace`/`TuiSettings` today.
+    pub(crate) fn path() -> Option<PathBuf> {
+        let home = std::env::var_os("HOME").map(PathBuf::from)?;
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            if !home.starts_with(std::env::temp_dir()) {
+                return None;
+            }
+        }
+        Some(home.join(".coord").join("tabs.json"))
+    }
+
+    /// Load from a specific path, trusting the file as-is (no pruning —
+    /// see [`Self::retain_known`]). Contract §6 bullet 4: a missing file, an
+    /// empty file, or a file that fails to parse all produce the SAME
+    /// result — every scope starts with no tabs, never a panic, never a
+    /// partial/best-effort parse. `serde_json::from_str` already rejects a
+    /// truncated document wholesale (no partial-object recovery), so the
+    /// malformed and empty cases fall out of the same `Err` branch as a
+    /// missing file falls out of `read_to_string`'s `Err`.
+    pub(crate) fn load_from_path(path: &std::path::Path) -> Self {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return Self::default();
+        };
+        match serde_json::from_str::<PersistedTabs>(&text) {
+            Ok(persisted) => Self {
+                board: DocTabGroup::from_persisted(persisted.board.unwrap_or_default(), PanelScope::Board),
+                pipeline: DocTabGroup::from_persisted(
+                    persisted.pipeline.unwrap_or_default(),
+                    PanelScope::Pipeline,
+                ),
+            },
+            Err(_) => Self::default(),
+        }
+    }
+
+    /// Load from `~/.coord/tabs.json`. Returns the default (empty) tab set
+    /// when `HOME` is unset, the file is absent, or it fails to parse.
+    pub(crate) fn load() -> Self {
+        match Self::path() {
+            Some(path) => Self::load_from_path(&path),
+            None => Self::default(),
+        }
+    }
+
+    /// Persist to a specific path, creating parent directories as needed.
+    pub(crate) fn save_to_path(&self, path: &std::path::Path) -> Result<(), String> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("create tabs dir: {e}"))?;
+        }
+        let persisted = PersistedTabs {
+            board: Some(self.board.to_persisted(PanelScope::Board)),
+            pipeline: Some(self.pipeline.to_persisted(PanelScope::Pipeline)),
+        };
+        let text =
+            serde_json::to_string_pretty(&persisted).map_err(|e| format!("serialize tabs: {e}"))?;
+        std::fs::write(path, text).map_err(|e| format!("write tabs: {e}"))?;
+        Ok(())
+    }
+
+    /// Persist to `~/.coord/tabs.json` unconditionally — creating the file
+    /// if it doesn't exist yet. A no-op (`Ok`) when `HOME` is unset — the
+    /// TUI stays functional without a home directory, it just won't
+    /// remember open tabs across restarts.
+    ///
+    /// Called exactly once per run, on the way out (`CoordApp`'s `handle`
+    /// wrapper in `render.rs`, on `Reaction::Exit`) — see [`Self::save_if_exists`]
+    /// for the far more frequent mutation-triggered save, which deliberately
+    /// does NOT create a fresh file.
+    pub(crate) fn save(&self) -> Result<(), String> {
+        match Self::path() {
+            Some(path) => self.save_to_path(&path),
+            None => Ok(()),
+        }
+    }
+
+    /// Persist to `~/.coord/tabs.json`, but ONLY when that file already
+    /// exists — never creates it. A no-op (`Ok`) when `HOME` is unset or the
+    /// file isn't there yet.
+    ///
+    /// Called from every tab mutator (open/pin/activate/close/…, both
+    /// scopes) so a restored session (or one that has already quit once,
+    /// creating the file via [`Self::save`]) stays fresh in near-real-time
+    /// rather than only on the next clean exit. Deliberately does NOT create
+    /// a brand-new file: this crate's `#[cfg(test)]`/`test-support` fixture
+    /// path (`fixtures.rs::make_test_app`) reads real `~/.coord/tabs.json`
+    /// state at construction (contract §6 / #2286 needs this — see that
+    /// function's doc comment), and the overwhelming majority of this
+    /// crate's TuiDriver click-driven test suites (#2282-#2287) build their
+    /// app this way WITHOUT sandboxing `HOME`. If every click that opens or
+    /// activates a tab could CREATE `~/.coord/tabs.json` on whatever machine
+    /// is running the tests, those tests would start writing into the real
+    /// developer's home directory and — worse — polluting every other
+    /// unsandboxed test that runs in the same process afterward, since
+    /// `DocTabs::load()` would then pick up whatever a completely unrelated
+    /// test just wrote. Gating on "already exists" closes that hole while
+    /// still satisfying contract §6 exactly: a session that has quit once
+    /// (creating the file) keeps it live-updated afterward, and the sealed
+    /// acceptance slice's own pruning test (`tabs_persistence_2286::
+    /// a_document_whose_issue_is_absent_from_the_board_is_pruned_on_load`)
+    /// seeds the file BEFORE the mutation it checks, so this still fires for
+    /// it.
+    pub(crate) fn save_if_exists(&self) -> Result<(), String> {
+        let Some(path) = Self::path() else {
+            return Ok(());
+        };
+        if !path.exists() {
+            return Ok(());
+        }
+        self.save_to_path(&path)
+    }
+}
+
+// ─── §6's pinned file shape ──────────────────────────────────────────────
+
+/// One document key as written to `~/.coord/tabs.json` — `{"repo": …,
+/// "issue": …}`, contract §6's pinned shape, verbatim. Also carries the
+/// owning scope's "cheap" per-tab sub-state (§6's last bullet: the sub-tab
+/// selection, persisted "as a string"; scroll offsets are deliberately NOT
+/// here — the issue explicitly allows dropping them on restart, so they
+/// simply reset to defaults on load) under the field name matching the
+/// document's `active`/`preview` role: the tabs-list entry itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+struct PersistedDoc {
+    repo: String,
+    issue: u64,
+    /// The sub-tab this document was on — `"board"`/`"issue"`/`"chat"`/
+    /// `"terminal"` for a Board-scope document, `"overview"`/`"issue"`/
+    /// `"log"`/`"summary"`/`"terminal"`/`"completed"` for a Pipeline-scope
+    /// one. Absent on an older file, or when the document was never
+    /// switched away from (`DetailSubState` is sparse, contract §5) — reads
+    /// back as the scope's default sub-tab either way. An unrecognised
+    /// string (future variant, hand-edited file) is likewise read as the
+    /// default rather than rejecting the whole document.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sub_tab: Option<String>,
+}
+
+impl PersistedDoc {
+    fn key(&self) -> DocKey {
+        (self.repo.clone(), self.issue)
+    }
+
+    /// This document's restored sub-state, under `owner`'s scope — `None`
+    /// when `sub_tab` is absent or unrecognised, which callers read as "no
+    /// entry", exactly like a document that was never checkpointed.
+    fn sub_state(&self, owner: PanelScope) -> Option<DetailSubState> {
+        let s = self.sub_tab.as_deref()?;
+        match owner {
+            PanelScope::Board => board_tab_from_str(s).map(|board_tab| DetailSubState {
+                board_tab,
+                ..DetailSubState::default()
+            }),
+            PanelScope::Pipeline => pipeline_tab_from_str(s).map(|pipeline_tab| DetailSubState {
+                pipeline_tab,
+                ..DetailSubState::default()
+            }),
+        }
+    }
+
+    /// Build the persisted form of `key`, pulling `owner`'s sub-tab out of
+    /// `state` (`None` for `active`/`preview`'s call sites, which pass
+    /// `self.sub_state.get(key)` same as a tabs-list entry would — the
+    /// document's sub-tab is a property of the document, not of which role
+    /// it plays in the scope).
+    fn from_key(key: &DocKey, state: Option<&DetailSubState>, owner: PanelScope) -> Self {
+        let sub_tab = state.map(|s| match owner {
+            PanelScope::Board => board_tab_to_str(s.board_tab).to_string(),
+            PanelScope::Pipeline => pipeline_tab_to_str(s.pipeline_tab).to_string(),
+        });
+        PersistedDoc {
+            repo: key.0.clone(),
+            issue: key.1,
+            sub_tab,
+        }
+    }
+}
+
+fn board_tab_to_str(tab: BoardDetailTab) -> &'static str {
+    match tab {
+        BoardDetailTab::Board => "board",
+        BoardDetailTab::Issue => "issue",
+        BoardDetailTab::Chat => "chat",
+        BoardDetailTab::Terminal => "terminal",
+    }
+}
+
+fn board_tab_from_str(s: &str) -> Option<BoardDetailTab> {
+    match s {
+        "board" => Some(BoardDetailTab::Board),
+        "issue" => Some(BoardDetailTab::Issue),
+        "chat" => Some(BoardDetailTab::Chat),
+        "terminal" => Some(BoardDetailTab::Terminal),
+        _ => None,
+    }
+}
+
+fn pipeline_tab_to_str(tab: PipelineDetailTab) -> &'static str {
+    match tab {
+        PipelineDetailTab::Overview => "overview",
+        PipelineDetailTab::Issue => "issue",
+        PipelineDetailTab::Log => "log",
+        PipelineDetailTab::Summary => "summary",
+        PipelineDetailTab::Terminal => "terminal",
+        PipelineDetailTab::Completed => "completed",
+    }
+}
+
+fn pipeline_tab_from_str(s: &str) -> Option<PipelineDetailTab> {
+    match s {
+        "overview" => Some(PipelineDetailTab::Overview),
+        "issue" => Some(PipelineDetailTab::Issue),
+        "log" => Some(PipelineDetailTab::Log),
+        "summary" => Some(PipelineDetailTab::Summary),
+        "terminal" => Some(PipelineDetailTab::Terminal),
+        "completed" => Some(PipelineDetailTab::Completed),
+        _ => None,
+    }
+}
+
+/// One scope's persisted object: ordered `tabs`, `active`, `preview`
+/// (contract §6's pinned shape).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct PersistedScope {
+    tabs: Vec<PersistedDoc>,
+    active: Option<PersistedDoc>,
+    preview: Option<PersistedDoc>,
+}
+
+/// The whole `~/.coord/tabs.json` (contract §6). Top-level keys are the
+/// lowercase `PanelScope` names in use today — `serde`'s default
+/// `snake_case`-of-the-Rust-field-name behaviour already produces exactly
+/// `"board"`/`"pipeline"` from these field names, so no `#[serde(rename)]`
+/// is needed. A scope absent from the file starts with no tabs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct PersistedTabs {
+    board: Option<PersistedScope>,
+    pipeline: Option<PersistedScope>,
+}
+
+/// #2286 (ms-65 §6): every document key currently known to the loaded board —
+/// the set [`DocTabs::retain_known`] prunes against, both on load and after
+/// every real data refresh ("drop any document whose issue is absent from
+/// the board"). Sourced from `open_issues` only, mirroring
+/// `board_data_from_payload`'s `"issues"` → `open_issues` mapping every
+/// fixture in this suite seeds through.
+pub(crate) fn known_doc_keys(data: &BoardData) -> HashSet<DocKey> {
+    data.open_issues
+        .iter()
+        .map(|oi| (oi.repo_name.clone(), oi.number))
+        .collect()
 }
 
 /// Build one document tab's rendered label (contract §2b/§2c/§2d/§1).
@@ -1057,5 +1431,227 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── #2286 (ms-65 §6): persistence — retain_known / save / load ────────
+
+    #[test]
+    fn retain_known_drops_a_dead_tab_and_leaves_the_rest_alone() {
+        let mut g = DocTabGroup::default();
+        g.pin(k(101));
+        g.pin(k(102));
+        g.pin(k(103)); // active
+        let known: HashSet<DocKey> = [k(101), k(103)].into_iter().collect();
+        g.retain_known(&known);
+        assert_eq!(g.tabs(), &[k(101), k(103)]);
+        assert_eq!(g.active_key(), Some(&k(103)), "active tab survived, untouched");
+    }
+
+    #[test]
+    fn retain_known_activates_a_surviving_neighbour_when_active_is_pruned() {
+        let mut g = DocTabGroup::default();
+        g.pin(k(101));
+        g.pin(k(102));
+        g.pin(k(199)); // active, about to be pruned
+        let known: HashSet<DocKey> = [k(101), k(102)].into_iter().collect();
+        g.retain_known(&known);
+        assert_eq!(g.tabs(), &[k(101), k(102)]);
+        assert!(
+            g.active_key() == Some(&k(101)) || g.active_key() == Some(&k(102)),
+            "a surviving neighbour must become active, got {:?}",
+            g.active_key()
+        );
+    }
+
+    #[test]
+    fn retain_known_empties_the_group_when_nothing_survives() {
+        let mut g = DocTabGroup::default();
+        g.pin(k(198));
+        g.pin(k(199));
+        g.retain_known(&HashSet::new());
+        assert!(g.is_empty());
+        assert_eq!(g.active_index(), None);
+    }
+
+    #[test]
+    fn retain_known_discards_a_dead_tabs_sub_state() {
+        let mut g = DocTabGroup::default();
+        g.pin(k(101));
+        g.pin(k(199));
+        g.set_sub_state(k(199), issue_sub_state(7));
+        let known: HashSet<DocKey> = [k(101)].into_iter().collect();
+        g.retain_known(&known);
+        assert_eq!(g.sub_state(&k(199)), None);
+    }
+
+    fn tmp_json_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "coord_doc_tabs_test_{tag}_{}.json",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn save_then_load_round_trips_three_pinned_board_tabs() {
+        let path = tmp_json_path("save_board_pins");
+        let mut tabs = DocTabs::default();
+        {
+            let g = tabs.group_mut(PanelScope::Board);
+            g.pin(k(101));
+            g.pin(k(102));
+            g.pin(k(103));
+        }
+        tabs.save_to_path(&path).expect("save should succeed");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let loaded = DocTabs::load_from_path(&path);
+        let _ = std::fs::remove_file(&path);
+
+        // Shape-level: `active`/`preview` are document keys or `null`.
+        assert!(raw.contains("\"board\""));
+        assert!(raw.contains("\"pipeline\""));
+
+        let g = loaded.group(PanelScope::Board);
+        assert_eq!(g.tabs(), &[k(101), k(102), k(103)]);
+        assert_eq!(g.active_key(), Some(&k(103)));
+        assert!(!g.is_preview(0) && !g.is_preview(1) && !g.is_preview(2));
+    }
+
+    #[test]
+    fn save_then_load_round_trips_a_preview_tab_as_a_preview_tab() {
+        let path = tmp_json_path("save_preview");
+        let mut tabs = DocTabs::default();
+        {
+            let g = tabs.group_mut(PanelScope::Board);
+            g.pin(k(101));
+            g.open_preview(k(102)); // preview, active
+        }
+        tabs.save_to_path(&path).expect("save should succeed");
+        let loaded = DocTabs::load_from_path(&path);
+        let _ = std::fs::remove_file(&path);
+
+        let g = loaded.group(PanelScope::Board);
+        assert_eq!(g.tabs(), &[k(101), k(102)]);
+        assert!(!g.is_preview(0));
+        assert!(g.is_preview(1), "the preview tab must be restored AS a preview, not promoted");
+        assert_eq!(g.active_key(), Some(&k(102)));
+    }
+
+    #[test]
+    fn save_then_load_keeps_board_and_pipeline_scopes_separate() {
+        let path = tmp_json_path("save_scopes");
+        let mut tabs = DocTabs::default();
+        tabs.group_mut(PanelScope::Board).pin(k(101));
+        tabs.group_mut(PanelScope::Pipeline).pin(k(201));
+        tabs.save_to_path(&path).expect("save");
+        let loaded = DocTabs::load_from_path(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(loaded.group(PanelScope::Board).tabs(), &[k(101)]);
+        assert_eq!(loaded.group(PanelScope::Pipeline).tabs(), &[k(201)]);
+    }
+
+    #[test]
+    fn load_from_path_missing_file_starts_with_no_tabs() {
+        let path = tmp_json_path("missing_9999999");
+        let _ = std::fs::remove_file(&path);
+        let loaded = DocTabs::load_from_path(&path);
+        assert!(loaded.group(PanelScope::Board).is_empty());
+        assert!(loaded.group(PanelScope::Pipeline).is_empty());
+    }
+
+    #[test]
+    fn load_from_path_empty_file_starts_with_no_tabs() {
+        let path = tmp_json_path("empty");
+        std::fs::write(&path, b"").unwrap();
+        let loaded = DocTabs::load_from_path(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(loaded.group(PanelScope::Board).is_empty());
+        assert!(loaded.group(PanelScope::Pipeline).is_empty());
+    }
+
+    #[test]
+    fn load_from_path_malformed_json_starts_with_no_tabs_never_a_partial_parse() {
+        let path = tmp_json_path("malformed");
+        std::fs::write(
+            &path,
+            b"{\"board\": {\"tabs\": [{\"repo\": \"r\", \"issue\": 101},",
+        )
+        .unwrap();
+        let loaded = DocTabs::load_from_path(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            loaded.group(PanelScope::Board).is_empty(),
+            "a truncated file must not recover its well-formed prefix"
+        );
+        assert!(loaded.group(PanelScope::Pipeline).is_empty());
+    }
+
+    #[test]
+    fn load_from_path_prunes_a_document_whose_issue_is_gone() {
+        // #199 is not in `known` at restore time (simulated directly against
+        // a persisted-shaped file, mirroring what `retain_known` does once
+        // real board data is available).
+        let path = tmp_json_path("prune_on_load");
+        let raw = r#"{"board": {"tabs": [
+            {"repo": "claude-coordinator", "issue": 101},
+            {"repo": "claude-coordinator", "issue": 199},
+            {"repo": "claude-coordinator", "issue": 102}
+        ], "active": {"repo": "claude-coordinator", "issue": 101}, "preview": null}}"#;
+        std::fs::write(&path, raw).unwrap();
+        let mut loaded = DocTabs::load_from_path(&path);
+        let _ = std::fs::remove_file(&path);
+
+        let known: HashSet<DocKey> = [k(101), k(102)].into_iter().collect();
+        loaded.retain_known(&known);
+        assert_eq!(loaded.group(PanelScope::Board).tabs(), &[k(101), k(102)]);
+    }
+
+    #[test]
+    fn sub_tab_selection_round_trips_through_save_and_load() {
+        let path = tmp_json_path("sub_tab");
+        let mut tabs = DocTabs::default();
+        {
+            let g = tabs.group_mut(PanelScope::Board);
+            g.pin(k(101));
+            g.set_sub_state(
+                k(101),
+                DetailSubState {
+                    board_tab: BoardDetailTab::Issue,
+                    ..DetailSubState::default()
+                },
+            );
+        }
+        tabs.save_to_path(&path).expect("save");
+        let loaded = DocTabs::load_from_path(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            loaded.group(PanelScope::Board).sub_state(&k(101)),
+            Some(&DetailSubState {
+                board_tab: BoardDetailTab::Issue,
+                ..DetailSubState::default()
+            }),
+        );
+    }
+
+    #[test]
+    fn known_doc_keys_reads_repo_and_issue_from_open_issues() {
+        use crate::app::types::OpenIssue;
+        let data = BoardData {
+            open_issues: vec![OpenIssue {
+                repo_name: "claude-coordinator".to_string(),
+                number: 101,
+                title: "t".to_string(),
+                body: String::new(),
+                labels: Vec::new(),
+                state: "open".to_string(),
+                milestone_number: None,
+                milestone_title: None,
+            }],
+            ..BoardData::default()
+        };
+        let known = known_doc_keys(&data);
+        assert!(known.contains(&k(101)));
+        assert_eq!(known.len(), 1);
     }
 }
