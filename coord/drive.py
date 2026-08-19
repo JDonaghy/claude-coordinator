@@ -996,21 +996,34 @@ def _decide_acceptance_landing(
     something that will happen, and waiting for the fourth is the #1526
     defect: an unbounded wait for an event that cannot occur.
 
-    Three shapes get an immediate, actionable exit instead of a wait,
-    because for each of them the corrective action belongs to a loop that
-    will never run for this row:
+    Two shapes get an immediate, actionable exit instead of a wait, because
+    for each of them the corrective action belongs to a loop that will never
+    run for this row:
 
     * a FAILED slice test — the work row's equivalent dispatches
       ``coord fix``, but nothing dispatches one for a ``test-author`` row
       whose Test stage failed;
-    * a ``request-changes`` slice review — ``auto_loop`` accepts a
-      ``test-author`` fix (``FIX_DISPATCH_TYPES``), but the daemon drain
-      deliberately excludes fix dispatch (#476/#477, and #1692's own
-      analysis), so for the work row it is THIS driver that runs
-      ``coord fix``; there was no such arm for the slice;
     * ``--no-merge`` — the slice merge is a hard prerequisite for
       dispatching any work at all (#1138), so with merging switched off the
       run cannot progress, and saying so beats idling to the deadline.
+
+    A third shape — a ``request-changes`` slice review — used to be a fourth
+    immediate exit for the identical reason (``auto_loop`` accepts a
+    ``test-author`` fix via ``FIX_DISPATCH_TYPES``, but the daemon drain
+    deliberately excludes fix dispatch — #476/#477, and #1692's own
+    analysis — so for the work row it is THIS driver that runs
+    ``coord fix``, and there was no such arm for the slice). #2425: it no
+    longer is. Every retry of this lane re-dispatched a fresh author on the
+    SAME branch name instead of fixing the one review blocking it
+    (claude-coordinator#2286 — 11 re-authoring attempts over ~11h with the
+    review's findings never once addressed), because re-authoring was the
+    only path this lane had. Below, ``request-changes`` now gets the same
+    bounded ``coord fix <acceptance_review_aid>`` arm :func:`decide` already
+    runs for the work row's own review (the ``REVIEW: request-changes → fix
+    round`` arm), spending :attr:`DriveCounters.acceptance`'s OWN
+    ``fix_rounds`` — not the work row's — for the same #2079 reason the
+    slice's merge attempts get their own budget: a struggling slice review
+    must not silently leave the issue's real fix budget at zero.
 
     The merge itself reuses :func:`_decide_merge` verbatim against a shadow
     :class:`~coord.drive_state.IssueState` whose "work row" IS the slice —
@@ -1049,15 +1062,81 @@ def _decide_acceptance_landing(
         )
 
     if state.acceptance_review_verdict == "request-changes":
-        return _die(
-            f"the JIT acceptance slice {aid} was reviewed REQUEST-CHANGES "
-            f"(review {state.acceptance_review_aid or 'unknown'}) — it will "
-            "never reach the merge queue until that is addressed, and no "
-            "loop dispatches the fix for a test-author row on its own.\n"
-            f"   Findings: coord log {state.acceptance_review_aid or aid}\n"
-            f"   Fix it: coord fix {state.acceptance_review_aid or aid}\n"
-            "   or re-run coord drive with --no-acceptance to skip JIT "
-            "authoring."
+        # #2425: the slice's own twin of `decide()`'s `REVIEW: request-
+        # changes → fix round` arm — see the docstring above for why this
+        # used to be a bare `_die()`. `coord fix` already accepts a
+        # `type="test-author"` review id (#1622/#1692:
+        # `auto_loop.FIX_DISPATCH_TYPES` includes `SEALED_PATH_AUTHOR_TYPES`,
+        # which is where "test-author" lives), so this is the SAME command
+        # the work-row arm dispatches, not a second implementation of it.
+        slice_counters = counters.slice_budget()
+        if not state.auto_loop:
+            return _die(
+                "the JIT acceptance slice's review requested changes, but "
+                "pipeline.auto_loop is OFF — the review→fix path is "
+                "switched off in coordinator.yml, so no fix can be "
+                "dispatched.\n"
+                f"   Findings: coord log {state.acceptance_review_aid or aid}\n"
+                "   Continue by hand: coord assign --interactive --fix-of "
+                f"{state.acceptance_review_aid or aid}"
+            )
+        # Belt-and-braces, mirroring the work-row arm: `acceptance_review_
+        # verdict` and `acceptance_review_aid` are read off the SAME board
+        # row (drive_state.project), so a verdict without an id is
+        # impossible today. Refuse to guess rather than dispatch `coord fix`
+        # against the wrong assignment.
+        if not state.acceptance_review_aid:
+            return _die(
+                "the JIT acceptance slice's review verdict is "
+                "'request-changes' but no review assignment id is on the "
+                "board — refusing to guess which review to fix. Inspect: "
+                f"coord gates {state.repo} {state.issue}"
+            )
+        # Same de-duplication latch as `review_fix_dispatched_for` on the
+        # work row's own arm, just on the slice's own counters: `coord fix`
+        # returns as soon as the fix worker is dispatched, and the board
+        # this driver polls needs a beat to show the new row.
+        if slice_counters.review_fix_dispatched_for == state.acceptance_review_aid:
+            return _wait(
+                label=(
+                    "ACCEPTANCE: fix already dispatched for "
+                    f"{state.acceptance_review_aid} — waiting for the fix "
+                    "row to appear on the board"
+                )
+            )
+        if slice_counters.fix_rounds >= opts.max_fix_rounds:
+            return _die(
+                f"the JIT acceptance slice {aid} was reviewed REQUEST-"
+                f"CHANGES (review {state.acceptance_review_aid}) after "
+                f"{slice_counters.fix_rounds} fix round(s) this drive spent "
+                "landing the slice — stopping.\n"
+                f"   Findings: coord log {state.acceptance_review_aid}\n"
+                f"   Continue by hand: coord fix {state.acceptance_review_aid}\n"
+                "   or re-run coord drive with --no-acceptance to skip JIT "
+                "authoring."
+            )
+        slice_counters.fix_rounds += 1
+        slice_counters.review_fix_dispatched_for = state.acceptance_review_aid
+        return Action(
+            kind=RUN,
+            label=(
+                "ACCEPTANCE: review request-changes → fix round "
+                f"{slice_counters.fix_rounds}/{opts.max_fix_rounds} "
+                f"(coord fix {state.acceptance_review_aid})"
+            ),
+            command=("fix", state.acceptance_review_aid),
+            error_message=(
+                f"coord fix {state.acceptance_review_aid} failed to "
+                "dispatch a fix for the JIT acceptance slice's review.\n"
+                "   Its refusals are all guards doing their job: auto_loop "
+                "disabled, no structured\n"
+                "   findings, approve-with-nits (#476), max_review_"
+                "iterations, or the #522\n"
+                "   terminal-work guard — the message above names which.\n"
+                f"   Check: coord log {state.acceptance_review_aid}   /   "
+                "continue by hand: coord assign --interactive --fix-of "
+                f"{state.acceptance_review_aid}"
+            ),
         )
 
     if not opts.do_merge:
