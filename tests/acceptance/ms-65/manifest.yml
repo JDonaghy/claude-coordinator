@@ -143,6 +143,50 @@ tests:
   # THIS IS A GREEN RATCHET — see the `expected_red` block below.
   detail_substate_2285::a_single_open_tab_keeps_todays_sub_tab_and_scroll_behaviour: 2285
 
+  # ── #2287 (T-5) — discoverability: status bar / `?` help / right-click ────
+  # Slice: tabs_discoverability_2287.rs · mocks: board-tab-context-menu.screen,
+  # board-tabs-help-overlay.screen (plus board-preview-tab.screen and
+  # board-baseline-no-tabs.screen — §8a's own hint-present / hint-absent
+  # reference pair)
+  #
+  # §8a — with >=1 tab open the status bar advertises the tab gestures
+  tabs_discoverability_2287::status_bar_shows_the_tab_hints_while_a_tab_is_open: 2287
+  # §8a — …as the contract's pinned, verbatim substring (two spaces between
+  # segments). Split from the clause above so a spacing/ordering deviation
+  # reds exactly one id.
+  tabs_discoverability_2287::status_bar_tab_hint_is_the_contracts_verbatim_string: 2287
+  # §8a + #2287 AC — the dynamic half: the hint goes away again when the last
+  # tab closes (a latched hint passes the static control but fails this)
+  tabs_discoverability_2287::status_bar_tab_hints_disappear_when_the_last_tab_closes: 2287
+  # §8a — CONTROL: zero tabs => no tab hint, and the Board's own pre-ms-65
+  # hints survive. THIS IS THE GREEN CONTROL — see `expected_red` below.
+  tabs_discoverability_2287::zero_tabs_status_bar_keeps_the_boards_own_hints_and_shows_no_tab_hints: 2287
+  # §8b — `?` opens an overlay titled "Board — Help"
+  tabs_discoverability_2287::help_overlay_opens_on_question_mark_with_the_board_title: 2287
+  # §8b — …listing the four pinned key-binding phrases ("open preview tab",
+  # "pin tab", "close active tab", "cycle tabs")
+  tabs_discoverability_2287::help_overlay_lists_the_document_tab_key_bindings: 2287
+  # §8b — …and the two mouse gestures the status bar cannot advertise,
+  # under the "Document tabs" heading
+  tabs_discoverability_2287::help_overlay_lists_the_mouse_tab_gestures_under_a_document_tabs_heading: 2287
+  # §8b — ` Esc=close ` while open, and `Esc` closes it
+  tabs_discoverability_2287::help_overlay_advertises_and_honours_escape_to_close: 2287
+  # §8c — right-clicking a tab opens the four-item menu (Close checked as a
+  # standalone item, not as a prefix of its two longer siblings)
+  tabs_discoverability_2287::right_clicking_a_tab_opens_a_menu_with_close_close_others_close_all_and_pin_tab: 2287
+  # §8c — "Close others" leaves exactly the right-clicked (middle) tab
+  tabs_discoverability_2287::close_others_leaves_exactly_the_right_clicked_tab: 2287
+  # §8c — "Close all" leaves none and restores the zero-tab state
+  tabs_discoverability_2287::close_all_leaves_no_tabs_and_restores_the_zero_tab_state: 2287
+  # §8c — "Close" closes the right-clicked tab and no other (see finding 16)
+  tabs_discoverability_2287::close_menu_item_closes_the_right_clicked_tab_and_no_other: 2287
+  # §8c + #2287 AC — "Pin tab" promotes a preview tab (drops `∘ `) without
+  # changing count or order
+  tabs_discoverability_2287::pin_tab_promotes_a_preview_tab_without_changing_count_or_order: 2287
+  # §8c — "hidden or inert" on an already-pinned tab, asserted through the
+  # outcome both readings share (see finding 17)
+  tabs_discoverability_2287::pin_tab_is_hidden_or_inert_on_an_already_pinned_tab: 2287
+
 # ── expected_red (#2164) ───────────────────────────────────────────────────
 # Hand-derived from a REAL run of the sealed suite against origin/main at the
 # time of authoring (`cd tui && cargo test --test acceptance --features
@@ -248,6 +292,40 @@ expected_red:
     - detail_substate_2285::scrolling_one_tabs_issue_body_leaves_the_other_tabs_position_alone
     - detail_substate_2285::closing_a_tab_discards_its_sub_state_and_reopening_starts_from_the_defaults
     - detail_substate_2285::terminal_sub_tab_selection_follows_its_own_tab
+
+  # #2287 — OBSERVED, not intended. Taken from two consecutive real runs of
+  # the sealed suite (`cd tui && RUSTC_BOOTSTRAP=1 cargo test --test acceptance
+  # --features test-support -- -Z unstable-options --format json`, the driver
+  # command in coordinator.yml) at authoring time: of this slice's 14 ids, the
+  # same 13 FAILED and the same 1 passed on both runs. Every one of the 13 died
+  # on a §8 clause, never on a §2/§4 precondition — verified by reading the
+  # panic line of each failure (the §8c ones all land in `assert_menu_item` /
+  # `click_menu_item`, i.e. "no such menu"; the §8a/§8b ones on the missing
+  # hint string and the missing overlay). The 1 that passed is deliberately
+  # ABSENT below:
+  #
+  #   * `zero_tabs_status_bar_keeps_the_boards_own_hints_and_shows_no_tab_hints`
+  #     — the CONTROL. Green today (nothing renders "click=preview", and the
+  #     Board status bar already reads `… n=notify  m=merge  R=retry  P=purge
+  #     q=quit`) and it must STAY green after #2287 lands: an implementation
+  #     that appends the tab hints unconditionally, or that replaces the
+  #     Board's own hint set with them outright, passes every §8a test above
+  #     and breaks exactly this one. Listing it would make its inevitable pass
+  #     a HARD FAILURE.
+  2287:
+    - tabs_discoverability_2287::status_bar_shows_the_tab_hints_while_a_tab_is_open
+    - tabs_discoverability_2287::status_bar_tab_hint_is_the_contracts_verbatim_string
+    - tabs_discoverability_2287::status_bar_tab_hints_disappear_when_the_last_tab_closes
+    - tabs_discoverability_2287::help_overlay_opens_on_question_mark_with_the_board_title
+    - tabs_discoverability_2287::help_overlay_lists_the_document_tab_key_bindings
+    - tabs_discoverability_2287::help_overlay_lists_the_mouse_tab_gestures_under_a_document_tabs_heading
+    - tabs_discoverability_2287::help_overlay_advertises_and_honours_escape_to_close
+    - tabs_discoverability_2287::right_clicking_a_tab_opens_a_menu_with_close_close_others_close_all_and_pin_tab
+    - tabs_discoverability_2287::close_others_leaves_exactly_the_right_clicked_tab
+    - tabs_discoverability_2287::close_all_leaves_no_tabs_and_restores_the_zero_tab_state
+    - tabs_discoverability_2287::close_menu_item_closes_the_right_clicked_tab_and_no_other
+    - tabs_discoverability_2287::pin_tab_promotes_a_preview_tab_without_changing_count_or_order
+    - tabs_discoverability_2287::pin_tab_is_hidden_or_inert_on_an_already_pinned_tab
 
 # ═══════════════════════════════════════════════════════════════════════════
 # FOR THE COORDINATOR — three findings from authoring this slice. None of them
@@ -506,3 +584,88 @@ expected_red:
 # And this slice deliberately does NOT assert the sub-tab-switch scroll reset
 # the app performs today (`detail_scroll = 0` on a sub-tab click): no clause
 # pins it either way, so pinning it could force a wrong implementation.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FOR THE COORDINATOR — findings from authoring the #2287 slice (contract §8).
+# Independent of the #2282 / #2283 / #2284 / #2285 notes above; again, none is
+# a worker's to fix by editing this suite, and none was resolved by editing
+# the contract (a test-author may not amend one).
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# 14. §8b's `?` overlay has TWO sections and the second one is #2288's, not
+#     #2287's. §8b pins "Document tabs" AND "Split (§9's four keys)", and
+#     `mocks/board-tabs-help-overlay.screen` renders the four split rows
+#     (`Ctrl-W v  split right`, `Ctrl-W s  split down`, `Ctrl-W w  next pane`,
+#     `Ctrl-W x  close pane`). This slice asserts the Document-tabs section
+#     only. #2287's own acceptance criteria say just "`?` lists the tab key
+#     bindings"; the split keys belong to §9 (#2288), which the milestone's
+#     work order puts AFTER this issue, and §9 note 2 says `Ctrl-W s` is a
+#     reserved placeholder that does nothing in ms-65. Asserting those rows
+#     here would gate #2287's acceptance run on a later issue's surface — and,
+#     for `Ctrl-W s`, on a binding the contract says must NOT work yet. If the
+#     Split section is meant to be gated by acceptance, it wants an id in
+#     #2288's slice (the overlay is #2287's to build; the rows it lists for
+#     split are #2288's to justify). Flagged as a `TODO(test-author)` in the
+#     slice too.
+#
+# 15. §8a's hint is pinned "whenever the active panel owns a tab set", but the
+#     Pipeline half is not asserted. Pipeline owns its own set (§3), so the
+#     hint presumably applies there too, but the contract names no
+#     Pipeline hint-present mock and finding 7 above (the #2284 author's) is a
+#     live blocker: entering the Pipeline panel from this external test crate
+#     can wholesale-replace the seeded fixture, because `start_data_load()`'s
+#     deterministic short-circuit is gated `#[cfg(test)]` only. Rather than
+#     add a fourteenth id with a known race, this slice asserts §8a on the
+#     Board only — where both of §8a's own reference mocks live. If finding
+#     7's one-line cfg widening lands, a Pipeline hint id is cheap to add.
+#
+# 16. §8c does not say what the menu's **"Close"** item does. The section
+#     spells out the effect of "Close others", "Close all" and "Pin tab" and
+#     is silent on the first item. `close_menu_item_closes_the_right_clicked_
+#     tab_and_no_other` takes the only reading the label admits, and the one
+#     §4 already pins for the `×` route: the RIGHT-CLICKED tab closes, the
+#     others survive. The fixture deliberately right-clicks a tab that is NOT
+#     the active one (#102 while #103 is active) so the two readings are
+#     distinguishable — if "Close" was meant to close the *active* tab, that
+#     needs a contract amendment, not a silent implementation choice.
+#     Flagged as a `TODO(test-author)` in the slice.
+#
+# 17. §8c's "hidden **or** inert" is permissive, so neither the presence nor
+#     the absence of "Pin tab" on an already-pinned tab is assertable on its
+#     own. `pin_tab_is_hidden_or_inert_on_an_already_pinned_tab` asserts the
+#     outcome BOTH readings share instead — the tab set is unchanged (count,
+#     order, and still no `∘ ` marker anywhere) — taking the item's branch
+#     when it renders and dismissing the menu when it does not. It is not
+#     vacuous: it first requires the menu to open on a pinned tab at all
+#     (§8c gates only the one item, not the menu), which is why it was RED at
+#     authoring time.
+#
+# 18. §8b's overlay is driven with ZERO tabs open, though
+#     `mocks/board-tabs-help-overlay.screen` depicts it over a 3-tab board.
+#     §8b's testable clause carries no tab precondition ("`driver.press('?')`
+#     while the Board panel is active"), and #2287's own rationale — the
+#     gestures are "undiscoverable by anyone who did not read the issue" — is
+#     at its strongest before the operator has opened anything. If the tab
+#     section of the overlay is meant to be conditional on an open tab set,
+#     that is a contract amendment; as written, four ids here would be red
+#     against such an implementation.
+#
+# Also worth knowing, not a contract problem: (a) the shipped Board status bar
+# is a full row of segments — `coord-tui  Board  [Sidebar]  ↻ 0s  QUEUE: empty
+# FLEET: OK  (coord health  n=notify  m=merge  R=retry  P=purge  q=quit` — and
+# is already truncated at 120 columns, whereas §8a's own reference mock renders
+# only ` click=preview  dbl-click=pin  ctrl-w=close  ctrl-tab=next  q=quit`.
+# The control asserts the four Board hint segments (`n=notify`, `R=retry`,
+# `P=purge`, `q=quit`) survive in the ZERO-tab state only, which is the only
+# state §8a calls "unchanged"; it deliberately pins nothing about what the row
+# looks like once the tab hints are in it, since the mock implies the left-hand
+# segments give way. (b) `"Close"` is a prefix of both `"Close others"` and
+# `"Close all"`, so a bare `screen_contains("Close")` would pass on a menu
+# missing the item entirely; the slice's `menu_item_row()` rejects a match
+# whose label is immediately followed by another item's continuation. It does
+# NOT require the row to end after the label — §8c pins no accelerator column
+# for this menu, but ms-38's menus do render one (`Refresh … r`), so an item
+# carrying an accelerator must still count. (c) §8c pins no gesture for
+# activating an open menu item; a left click on the item's own label is the
+# only activation path any context menu in this app already documents, so that
+# is what the slice sends.
