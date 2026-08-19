@@ -186,6 +186,42 @@ tests:
   # §8c — "hidden or inert" on an already-pinned tab, asserted through the
   # outcome both readings share (see finding 17)
   tabs_discoverability_2287::pin_tab_is_hidden_or_inert_on_an_already_pinned_tab: 2287
+  # ── #2286 (T-5) — persistence, `~/.coord/tabs.json` (contract §6) ─────────
+  # Slice: tabs_persistence_2286.rs · mocks: none of its own (§6 is explicitly
+  # mock-less: "No visual mock (this is a file-format contract, not a
+  # screen)"); its rendered halves lean on `board-baseline-no-tabs.screen`
+  # (the zero-tab state a missing/malformed file must produce) and
+  # `board-pinned-3-tabs.screen` (three restored tabs, §2c bracket included).
+  #
+  # §6 bullet 1 (save side) — 3 Board tabs are written as an ORDERED `tabs`
+  # list with `active` set and `preview` null
+  tabs_persistence_2286::three_board_tabs_are_saved_to_tabs_json_in_strip_order_with_the_active_tab: 2286
+  # §6 (`preview` is "the key of the one preview tab […] must also appear in
+  # `tabs`") — the file-level half of "restored as a preview, not promoted"
+  tabs_persistence_2286::a_preview_tab_is_saved_as_the_scopes_preview_slot: 2286
+  # §6 bullet 1 + #2286 AC 1 (Board half) — three Board tabs restored after a
+  # restart, persisted active tab preserved
+  tabs_persistence_2286::board_tabs_are_restored_from_tabs_json_after_a_restart: 2286
+  # §6 + #2286 AC 2 — a restored preview tab keeps §1's `∘ ` marker, i.e. is
+  # not promoted to pinned on load
+  tabs_persistence_2286::a_restored_preview_tab_is_still_a_preview_tab: 2286
+  # §6 bullet 1 + #2286 AC 1 (Pipeline half) — the same file restores two
+  # Pipeline tabs to the PIPELINE panel with its own active tab (see
+  # coordinator finding 15 for the live blocker on entering that panel)
+  tabs_persistence_2286::pipeline_tabs_are_restored_to_the_pipeline_panel_with_its_own_active_tab: 2286
+  # §6 bullet 2 + #2286 AC 3 — a document whose issue is gone from the board is
+  # dropped on load, never rendered, never round-tripped into a re-saved file
+  tabs_persistence_2286::a_document_whose_issue_is_absent_from_the_board_is_pruned_on_load: 2286
+  # §6 bullet 3 (first branch) — the active document being pruned activates a
+  # surviving neighbour (WHICH one is not pinned — see finding 16)
+  tabs_persistence_2286::pruning_the_active_document_activates_a_surviving_neighbour: 2286
+  # §6 bullet 3 (second branch) — nothing survives the prune → no tabs at all.
+  # THIS IS A GREEN RATCHET — see the `expected_red` block below.
+  tabs_persistence_2286::a_scope_whose_documents_are_all_pruned_starts_with_no_tabs: 2286
+  # §6 bullet 4 + #2286 AC 4 — missing / empty / malformed file all start
+  # clean, never a panic, never a partial parse.
+  # THIS IS THE GREEN CONTROL — see the `expected_red` block below.
+  tabs_persistence_2286::a_missing_empty_or_malformed_tabs_json_starts_with_no_tabs: 2286
 
 # ── expected_red (#2164) ───────────────────────────────────────────────────
 # Hand-derived from a REAL run of the sealed suite against origin/main at the
@@ -326,6 +362,41 @@ expected_red:
     - tabs_discoverability_2287::close_menu_item_closes_the_right_clicked_tab_and_no_other
     - tabs_discoverability_2287::pin_tab_promotes_a_preview_tab_without_changing_count_or_order
     - tabs_discoverability_2287::pin_tab_is_hidden_or_inert_on_an_already_pinned_tab
+  # #2286 — OBSERVED, not intended. Taken from real runs of the sealed suite
+  # (`cd tui && RUSTC_BOOTSTRAP=1 cargo test --test acceptance --features
+  # test-support -- -Z unstable-options --format json`, the driver command in
+  # coordinator.yml) at authoring time: of this slice's 9 ids, the same 7
+  # FAILED and the same 2 passed on three consecutive full-suite runs and on
+  # three slice-filtered runs. Every one of the 7 died on a §6 clause — four on
+  # "nothing was restored" (no strip renders after seeding `tabs.json`), three
+  # on "no such file exists after opening tabs" — never on a harness
+  # precondition; verified by reading the panic line of every failure. The
+  # suite's other 6 failures (audit_1039, plans_detail_1122) are PRE-EXISTING:
+  # a `--skip tabs_persistence_2286` baseline run on the same commit reproduces
+  # exactly those 6, so this slice's sandboxed `HOME` (finding 14) is not
+  # destabilising them. The 2 that passed are deliberately ABSENT below:
+  #
+  #   * `a_missing_empty_or_malformed_tabs_json_starts_with_no_tabs` — the
+  #     CONTROL. Green today for the degenerate reason that nothing is ever
+  #     loaded, and it must STAY green once loading lands: an implementation
+  #     that `unwrap()`s the parse (panic) or best-effort restores the
+  #     well-formed prefix of a truncated file breaks exactly this test, which
+  #     is §6 bullet 4's whole point. Listing it would make its inevitable pass
+  #     a HARD FAILURE.
+  #   * `a_scope_whose_documents_are_all_pruned_starts_with_no_tabs` — a
+  #     RATCHET, §6 bullet 3's second branch ("if none survive, start with no
+  #     tabs"). Green today because nothing renders at all; it becomes a real
+  #     constraint the moment restore lands, since an implementation that
+  #     renders a dead tab, or keeps a pruned document active and paints its
+  #     label, fails it.
+  2286:
+    - tabs_persistence_2286::three_board_tabs_are_saved_to_tabs_json_in_strip_order_with_the_active_tab
+    - tabs_persistence_2286::a_preview_tab_is_saved_as_the_scopes_preview_slot
+    - tabs_persistence_2286::board_tabs_are_restored_from_tabs_json_after_a_restart
+    - tabs_persistence_2286::a_restored_preview_tab_is_still_a_preview_tab
+    - tabs_persistence_2286::pipeline_tabs_are_restored_to_the_pipeline_panel_with_its_own_active_tab
+    - tabs_persistence_2286::a_document_whose_issue_is_absent_from_the_board_is_pruned_on_load
+    - tabs_persistence_2286::pruning_the_active_document_activates_a_surviving_neighbour
 
 # ═══════════════════════════════════════════════════════════════════════════
 # FOR THE COORDINATOR — three findings from authoring this slice. None of them
@@ -669,3 +740,87 @@ expected_red:
 # activating an open menu item; a left click on the item's own label is the
 # only activation path any context menu in this app already documents, so that
 # is what the slice sends.
+# FOR THE COORDINATOR — findings from authoring the #2286 slice (contract §6).
+# Independent of the #2282 / #2283 / #2284 / #2285 notes above; again, none is
+# a worker's to fix by editing this suite, and none was resolved by editing the
+# contract (a test-author may not amend one).
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# 14. **A REAL CONSTRAINT ON #2286's IMPLEMENTATION, discovered while making §6
+#     observable: the restore must run on the FIXTURE construction path, and
+#     the coord-dir has no injectable seam.** Two facts force this:
+#
+#       (a) The sealed suite's only way to build an app is #2281's
+#           `make_app_with_board_json` → `make_test_app`, which today sets
+#           `doc_tabs: DocTabs::default()` outright. `CoordApp::new()` is
+#           public but builds the real daemon-backed app with an EMPTY board,
+#           against which every persisted document would be pruned on load
+#           (§6: "drop any document whose issue is absent from the board") — so
+#           it structurally cannot witness a restore. If the load is wired only
+#           into real startup, the five restore/prune ids above stay red no
+#           matter how correct `doc_tabs.rs` is.
+#
+#       (b) Every `~/.coord/…` path resolves through `std::env::var_os("HOME")`
+#           (`TuiSettings::path`, `Workspace::path`, `app::data::coord_dir`).
+#           There is no `COORD_HOME`-style override, so this slice sandboxes
+#           `HOME` to a temp dir (serialised behind a slice-global mutex,
+#           restored on drop including on panic) rather than clobbering the
+#           developer's real `~/.coord/tabs.json`. That window is
+#           process-global: while it is held, concurrently-running tests from
+#           OTHER slices see the sandboxed `HOME` too. Measured at authoring
+#           time it changes nothing — a `--skip tabs_persistence_2286` baseline
+#           reproduces exactly the same 6 pre-existing failures — but it is a
+#           latent cross-slice coupling, and it will get worse: once (a) lands,
+#           EVERY ms-65 slice's zero-tab control (`zero_doc_tabs_render_no_tab_strip`,
+#           `pipeline_with_zero_doc_tabs_renders_no_tab_strip`,
+#           `zero_tabs_render_no_close_or_overflow_glyphs`) will start reading
+#           the developer's REAL `~/.coord/tabs.json` and go red on any machine
+#           where a human has used the shipped feature.
+#
+#     Both halves point at the same cheap fix, which is a coordinator call, not
+#     a worker's: give the coord-dir an injectable seam under
+#     `#[cfg(any(test, feature = "test-support"))]` (the exact widening this
+#     repo already applied to `resolve_board_service()` for #1039, and that
+#     finding 7 asks for on `start_data_load()`), and have the fixture path
+#     restore through it. Absent that, either the restore is untestable or the
+#     rest of ms-65's suite becomes machine-dependent.
+#
+# 15. Entering the Pipeline panel — finding 7's fixture-wipe blocker — did NOT
+#     bite this slice at authoring time, and the reason is worth recording:
+#     under the sandboxed `HOME` there is no `~/.coord/coord.db` to load, so
+#     `start_data_load` has nothing to overwrite the seeded board with.
+#     `pipeline_tabs_are_restored_to_the_pipeline_panel_with_its_own_active_tab`
+#     got cleanly past its `Overview` precondition and failed on its §6 clause
+#     on every run. That is a side effect of the sandbox, not a fix: finding 7
+#     stands for every other slice, and if #2286's worker moves the tab load
+#     off the `HOME` seam the protection disappears with it.
+#
+# 16. §6 bullet 3 says "a surviving neighbour in `tabs` (order preserved)
+#     becomes active" without pinning WHICH neighbour. §4 pins a left-neighbour
+#     rule, but that is #2283's `Ctrl-W` close gesture, and §6 does not extend
+#     it to this load-time prune. `pruning_the_active_document_activates_a_surviving_neighbour`
+#     therefore asserts only what is pinned — exactly one tab is bracketed
+#     (§2c) and it is one of the survivors — and deliberately does not pin left
+#     vs. right. Also a `TODO(test-author)` in the slice. If a specific rule was
+#     meant, it needs a contract amendment.
+#
+# 17. **Per-tab sub-state persistence is asserted by NOBODY.** §6's last bullet
+#     pins that the sub-tab selection is persisted ("as a string — yes") while
+#     scroll offsets may be dropped, but §6's pinned JSON shape carries no
+#     field for it: a document key is `{"repo": …, "issue": …}` and nothing
+#     more. There is therefore no pinned place to look for it in the file, and
+#     no pinned rule for what a restored tab's sub-tab is when the field is
+#     absent. Asserting it would have meant inventing a field name, so no test
+#     covers it. If it is meant to be gated by acceptance, §6's shape needs the
+#     field spelled out.
+#
+# Also worth knowing, not a contract problem: §6 pins that a restart restores,
+# but not WHEN the file is written. `saved_tabs_json()` therefore reads
+# `~/.coord/tabs.json` after the tab edits and, if it is not there yet, again
+# after a `q` quit — so an implementation that flushes on tab mutation and one
+# that flushes on exit both satisfy the two save-side tests; only a run that
+# produces no file at all fails them. The file's field names (`tabs` /
+# `active` / `preview`, and a key's `repo` / `issue`) ARE asserted as written,
+# on §6 Note 5's own authority ("the shape above is what `coord acceptance
+# author` will write fixtures against"; a deviation is "an amendment, not a
+# silent implementation choice").

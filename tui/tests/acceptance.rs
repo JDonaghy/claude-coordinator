@@ -44,3 +44,4 @@ include!("../../tests/acceptance/ms-65/board_tabs_close_2283.rs");
 include!("../../tests/acceptance/ms-65/pipeline_tabs_2284.rs");
 include!("../../tests/acceptance/ms-65/detail_substate_2285.rs");
 include!("../../tests/acceptance/ms-65/tabs_discoverability_2287.rs");
+include!("../../tests/acceptance/ms-65/tabs_persistence_2286.rs");
