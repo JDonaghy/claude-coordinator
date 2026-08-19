@@ -544,6 +544,199 @@ class TestDriveQueueAPI:
         assert data["summary"]["level"] == "held"
 
 
+class TestDriveQueueActionAPI:
+    """POST /api/drive-queue/action (#2429 DQW-2).
+
+    Same posture as ``TestDriveQueueAPI``: no board_service configured, so
+    every write reaches the local DB (the `coord_db`/`rw_db` fixtures) via
+    ``_drive_queue_write``'s local branch — the same ``_*_local`` functions
+    ``coord/serve_app.py``'s own ``post_drive_queue`` route calls.
+    """
+
+    def test_move(self, rw_db) -> None:
+        from coord.state import _enqueue_drive_queue_local
+
+        _enqueue_drive_queue_local("api", 1)
+        _enqueue_drive_queue_local("api", 2)
+        _enqueue_drive_queue_local("api", 3)
+
+        client = _client()
+        r = client.post("/api/drive-queue/action", json={
+            "repo_name": "api", "issue_number": 3,
+            "action": "move", "to_position": 0,
+        })
+        assert r.status_code == 200
+        assert r.json() == {"ok": True}
+
+        entries = client.get("/api/drive-queue").json()["entries"]
+        by_key = {(e["repo_name"], e["issue_number"]): e["position"] for e in entries}
+        assert by_key[("api", 3)] == 0
+
+    def test_move_requires_to_position(self, rw_db) -> None:
+        from coord.state import _enqueue_drive_queue_local
+
+        _enqueue_drive_queue_local("api", 1)
+        client = _client()
+        r = client.post("/api/drive-queue/action", json={
+            "repo_name": "api", "issue_number": 1, "action": "move",
+        })
+        assert r.status_code == 400
+
+    def test_remove(self, rw_db) -> None:
+        from coord.state import _enqueue_drive_queue_local
+
+        _enqueue_drive_queue_local("api", 1)
+
+        client = _client()
+        r = client.post("/api/drive-queue/action", json={
+            "repo_name": "api", "issue_number": 1, "action": "remove",
+        })
+        assert r.status_code == 200
+        assert r.json() == {"ok": True}
+        assert client.get("/api/drive-queue").json()["entries"] == []
+
+    def test_unblock_dequeues_and_reenqueues_dropping_after_but_keeping_machine(
+        self, rw_db
+    ) -> None:
+        """Mirrors `dispatch_drive_queue_unblock` in `tui/src/app/drive_queue.rs`:
+        the machine pin survives, `after` does not (an unsatisfiable pre-req
+        is one of the two things that blocks a row — re-adding it would just
+        re-block immediately).
+        """
+        from coord.state import (
+            _enqueue_drive_queue_local,
+            _update_drive_queue_entry_local,
+        )
+
+        _enqueue_drive_queue_local("api", 1, machine="laptop", after=["api#0"])
+        _update_drive_queue_entry_local(
+            "api", 1, state="blocked", last_reason="unsatisfiable after", attempts=3,
+        )
+
+        client = _client()
+        r = client.post("/api/drive-queue/action", json={
+            "repo_name": "api", "issue_number": 1, "action": "unblock",
+        })
+        assert r.status_code == 200
+        assert r.json() == {"ok": True}
+
+        entries = client.get("/api/drive-queue").json()["entries"]
+        assert len(entries) == 1
+        entry = entries[0]
+        assert entry["state"] == "waiting"
+        assert entry["machine"] == "laptop"
+        assert entry["after_json"] == []
+        assert entry["attempts"] == 0
+
+    def test_unblock_refuses_a_non_blocked_row(self, rw_db) -> None:
+        from coord.state import _enqueue_drive_queue_local
+
+        _enqueue_drive_queue_local("api", 1)  # state == "waiting"
+
+        client = _client()
+        r = client.post("/api/drive-queue/action", json={
+            "repo_name": "api", "issue_number": 1, "action": "unblock",
+        })
+        assert r.status_code == 400
+        assert r.json()["ok"] is False
+        entries = client.get("/api/drive-queue").json()["entries"]
+        assert entries[0]["state"] == "waiting"
+
+    def test_resume_releases_a_fired_gate(self, rw_db) -> None:
+        from coord.state import (
+            _enqueue_drive_queue_local,
+            _update_drive_queue_entry_local,
+        )
+
+        _enqueue_drive_queue_local(
+            "api", 1, hold_after=True, hold_reason="deploy gate", hold_scope="fleet",
+        )
+        _update_drive_queue_entry_local("api", 1, hold_state="fired", hold_probes=3)
+
+        client = _client()
+        r = client.post("/api/drive-queue/action", json={
+            "repo_name": "api", "issue_number": 1, "action": "resume",
+        })
+        assert r.status_code == 200
+        assert r.json() == {"ok": True}
+
+        entry = client.get("/api/drive-queue").json()["entries"][0]
+        assert entry["hold_state"] == "released"
+        assert entry["hold_probes"] == 0
+
+    def test_resume_refuses_an_unfired_gate(self, rw_db) -> None:
+        from coord.state import _enqueue_drive_queue_local
+
+        _enqueue_drive_queue_local("api", 1, hold_after=True, hold_reason="deploy gate")
+        # hold_state == "armed" (declared but never fired) — not "fired".
+
+        client = _client()
+        r = client.post("/api/drive-queue/action", json={
+            "repo_name": "api", "issue_number": 1, "action": "resume",
+        })
+        assert r.status_code == 400
+        assert r.json()["ok"] is False
+
+    def test_entry_not_found(self, rw_db) -> None:
+        client = _client()
+        r = client.post("/api/drive-queue/action", json={
+            "repo_name": "api", "issue_number": 999, "action": "remove",
+        })
+        assert r.status_code == 404
+
+    def test_unknown_action(self, rw_db) -> None:
+        from coord.state import _enqueue_drive_queue_local
+
+        _enqueue_drive_queue_local("api", 1)
+        client = _client()
+        r = client.post("/api/drive-queue/action", json={
+            "repo_name": "api", "issue_number": 1, "action": "teleport",
+        })
+        assert r.status_code == 400
+
+    def test_missing_fields(self, rw_db) -> None:
+        client = _client()
+        r = client.post("/api/drive-queue/action", json={"action": "remove"})
+        assert r.status_code == 400
+
+    def test_routes_through_the_daemon_when_board_service_is_set(
+        self, monkeypatch
+    ) -> None:
+        """Thin-client posture: with `board_service` configured, the write
+        goes through `coord.client.post_drive_queue` — never a local
+        `_*_local` call — exactly like `_read_board()`/`_write_board()` do
+        for the board (#2429 DQW-2).
+        """
+        from coord import client as cc
+
+        monkeypatch.setattr(
+            cc, "resolve_board_service",
+            lambda *a, **k: cc.ServiceConfig("http://d:7435"),
+        )
+        monkeypatch.setattr(
+            cc, "fetch_drive_queue",
+            lambda svc, repo_name=None, **kw: [{
+                "repo_name": "api", "issue_number": 7, "state": "blocked",
+                "hold_state": "", "machine": "laptop", "after_json": [],
+            }],
+        )
+        calls: list[dict] = []
+
+        def _post_drive_queue(svc, action, **fields):
+            calls.append({"action": action, **fields})
+            return {"deleted": True}
+
+        monkeypatch.setattr(cc, "post_drive_queue", _post_drive_queue)
+
+        client = _client()
+        r = client.post("/api/drive-queue/action", json={
+            "repo_name": "api", "issue_number": 7, "action": "remove",
+        })
+        assert r.status_code == 200
+        assert r.json() == {"ok": True}
+        assert calls == [{"action": "dequeue", "repo_name": "api", "issue_number": 7}]
+
+
 class TestApproveAPI:
     # #749: board_service.read_board() tries load_board() before build_board()
     # — mock both so the real load_board() (which needs a live connection on

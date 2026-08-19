@@ -471,6 +471,120 @@ class TestRecordedActions:
         assert client.get("/api/fixture/actions").json()["actions"][0]["seq"] == 1
 
 
+class TestDriveQueueActionRecordedActions:
+    """POST /api/drive-queue/action in fixture mode (#2429 DQW-2).
+
+    Uses a small inline fixture (rather than the committed
+    ``board-pipeline-basic.json``, which has no ``blocked`` row) so each
+    action's guard has something to actually refuse. Mirrors
+    ``TestRecordedActions``: the write is recorded, never executed, and a
+    rejected request never reaches the log.
+    """
+
+    def _fixture(self):
+        return parse_fixture({
+            "board": {"assignments": [], "round_number": 0},
+            "drive_queue": [
+                {
+                    "repo_name": "claude-coordinator", "issue_number": 1,
+                    "position": 0, "machine": "precision", "after_json": [],
+                    "state": "blocked", "hold_state": "",
+                },
+                {
+                    "repo_name": "claude-coordinator", "issue_number": 2,
+                    "position": 1, "machine": "", "after_json": [],
+                    "state": "waiting", "hold_state": "fired",
+                    "hold_probes": 3,
+                },
+            ],
+        })
+
+    def test_move_is_recorded(self) -> None:
+        client = _client(self._fixture())
+        r = client.post("/api/drive-queue/action", json={
+            "repo_name": "claude-coordinator", "issue_number": 2,
+            "action": "move", "to_position": 0,
+        })
+        assert r.status_code == 200
+        assert r.json() == {"ok": True}
+        actions = client.get("/api/fixture/actions").json()["actions"]
+        assert len(actions) == 1
+        assert actions[0]["endpoint"] == "/api/drive-queue/action"
+        assert actions[0]["action"] == "move"
+        assert actions[0]["payload"]["to_position"] == 0
+        # Recorded, not executed — the seeded queue order is untouched.
+        entries = client.get("/api/drive-queue").json()["entries"]
+        by_key = {(e["repo_name"], e["issue_number"]): e["position"] for e in entries}
+        assert by_key[("claude-coordinator", 1)] == 0
+        assert by_key[("claude-coordinator", 2)] == 1
+
+    def test_remove_is_recorded(self) -> None:
+        client = _client(self._fixture())
+        r = client.post("/api/drive-queue/action", json={
+            "repo_name": "claude-coordinator", "issue_number": 2, "action": "remove",
+        })
+        assert r.status_code == 200
+        assert r.json() == {"ok": True}
+        assert client.get("/api/fixture/actions").json()["actions"][0]["action"] == "remove"
+        # Still there — nothing was actually dequeued.
+        assert len(client.get("/api/drive-queue").json()["entries"]) == 2
+
+    def test_unblock_is_recorded(self) -> None:
+        client = _client(self._fixture())
+        r = client.post("/api/drive-queue/action", json={
+            "repo_name": "claude-coordinator", "issue_number": 1, "action": "unblock",
+        })
+        assert r.status_code == 200
+        assert r.json() == {"ok": True}
+        assert client.get("/api/fixture/actions").json()["actions"][0]["action"] == "unblock"
+        # Recorded, not executed — the row is still `blocked`.
+        entries = client.get("/api/drive-queue").json()["entries"]
+        by_key = {e["issue_number"]: e for e in entries}
+        assert by_key[1]["state"] == "blocked"
+
+    def test_unblock_refuses_a_non_blocked_row(self) -> None:
+        client = _client(self._fixture())
+        r = client.post("/api/drive-queue/action", json={
+            "repo_name": "claude-coordinator", "issue_number": 2, "action": "unblock",
+        })
+        assert r.status_code == 400
+        assert r.json()["ok"] is False
+        # A rejected request is not a recorded action.
+        assert client.get("/api/fixture/actions").json()["actions"] == []
+
+    def test_resume_is_recorded(self) -> None:
+        client = _client(self._fixture())
+        r = client.post("/api/drive-queue/action", json={
+            "repo_name": "claude-coordinator", "issue_number": 2, "action": "resume",
+        })
+        assert r.status_code == 200
+        assert r.json() == {"ok": True}
+        assert client.get("/api/fixture/actions").json()["actions"][0]["action"] == "resume"
+        # Recorded, not executed — the gate is still fired.
+        entries = client.get("/api/drive-queue").json()["entries"]
+        by_key = {e["issue_number"]: e for e in entries}
+        assert by_key[2]["hold_state"] == "fired"
+
+    def test_resume_refuses_an_unfired_gate(self) -> None:
+        client = _client(self._fixture())
+        r = client.post("/api/drive-queue/action", json={
+            "repo_name": "claude-coordinator", "issue_number": 1, "action": "resume",
+        })
+        assert r.status_code == 400
+        assert r.json()["ok"] is False
+        assert client.get("/api/fixture/actions").json()["actions"] == []
+
+    def test_unknown_entry_and_unknown_action(self) -> None:
+        client = _client(self._fixture())
+        assert client.post("/api/drive-queue/action", json={
+            "repo_name": "claude-coordinator", "issue_number": 999, "action": "remove",
+        }).status_code == 404
+        assert client.post("/api/drive-queue/action", json={
+            "repo_name": "claude-coordinator", "issue_number": 1, "action": "teleport",
+        }).status_code == 400
+        assert client.get("/api/fixture/actions").json()["actions"] == []
+
+
 # ── Scripted SSE ────────────────────────────────────────────────────────────
 
 async def _collect_sse(app, *, until: str, timeout: float = 3.0) -> str:

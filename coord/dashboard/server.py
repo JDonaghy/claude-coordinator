@@ -37,7 +37,13 @@ from coord.events import (
 from coord.board_service import read_board, write_board
 from coord.dao import _JSON_COLUMNS
 from coord.db import _ensure_schema
-from coord.drive_queue import DriveQueueSummary, entries_from_rows, summarize_drive_queue
+from coord.drive_queue import (
+    HOLD_FIRED,
+    STATE_BLOCKED,
+    DriveQueueSummary,
+    entries_from_rows,
+    summarize_drive_queue,
+)
 from coord.models import Assignment
 from coord.network import check_all, fetch_status
 from coord.openapi import (
@@ -441,6 +447,51 @@ def openapi_spec() -> dict:
                 },
             }
         },
+        "/api/drive-queue/action": {
+            "post": {
+                "summary": (
+                    "move/remove/unblock/resume a `coord drive` queue row "
+                    "(#2429 DQW-2)"
+                ),
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "repo_name": {"type": "string"},
+                                    "issue_number": {"type": "integer"},
+                                    "action": {
+                                        "type": "string",
+                                        "enum": ["move", "remove", "unblock", "resume"],
+                                    },
+                                    "to_position": {
+                                        "type": "integer",
+                                        "description": "Required when action == 'move'.",
+                                    },
+                                },
+                                "required": ["repo_name", "issue_number", "action"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {"application/json": {"schema": ok_response}},
+                    },
+                    "400": {
+                        "description": (
+                            "Missing/unknown field, missing to_position for "
+                            "'move', 'unblock' on a non-blocked row, or "
+                            "'resume' on a row whose gate hasn't fired"
+                        )
+                    },
+                    "404": {"description": "drive-queue entry not found"},
+                },
+            }
+        },
         "/api/approve": {
             "post": {
                 "summary": "Dispatch one or more proposals by id",
@@ -705,6 +756,72 @@ def build_app(
         if _fixture is not None:
             return _fixture.drive_queue()
         return list_drive_queue()
+
+    def _drive_queue_write(action: str, **fields) -> dict:
+        """POST /drive-queue's ``{action, ...fields}`` shape (#2429 DQW-2).
+
+        Live mode only — callers check ``_fixture is not None`` themselves
+        (mirrors ``_write_board``, whose fixture no-op lives at the call
+        site in ``api_pipeline_action``, not inside ``_write_board`` itself).
+
+        Resolves daemon-vs-local by hand, the same decision
+        ``_read_board()``/``_write_board()`` make for the board, rather than
+        going through ``coord.state``'s own routed ``enqueue_drive_queue``/
+        ``dequeue_drive_queue``/``update_drive_queue_entry``/
+        ``move_drive_queue_entry`` wrappers — those already do this exact
+        dance internally, but routing here keeps the dashboard's thin-client
+        posture visible in this file instead of buried behind a
+        `coord.state` implementation detail.
+
+        Returns the daemon's per-action response dict verbatim
+        (``{"moved": bool}`` / ``{"deleted": bool}`` / ``{"updated": bool}``
+        / ``{"entry_id": int}``), whether it came from the wire or from the
+        matching local ``_*_local`` function directly — the same functions
+        ``coord/serve_app.py``'s own ``post_drive_queue`` route calls.
+        """
+        from coord import board_service
+
+        svc = board_service.resolve()
+        if svc is not None:
+            from coord.client import post_drive_queue
+
+            return post_drive_queue(svc, action, **fields)
+
+        from coord.state import (
+            _dequeue_drive_queue_local,
+            _enqueue_drive_queue_local,
+            _move_drive_queue_entry_local,
+            _update_drive_queue_entry_local,
+        )
+
+        if action == "dequeue":
+            return {
+                "deleted": _dequeue_drive_queue_local(
+                    fields["repo_name"], fields["issue_number"]
+                )
+            }
+        if action == "enqueue":
+            entry_id = _enqueue_drive_queue_local(
+                fields["repo_name"],
+                fields["issue_number"],
+                machine=fields.get("machine"),
+                after=fields.get("after") or [],
+                position=fields.get("position"),
+            )
+            return {"entry_id": entry_id}
+        if action == "update":
+            return {
+                "updated": _update_drive_queue_entry_local(
+                    fields["repo_name"], fields["issue_number"], **fields["fields"]
+                )
+            }
+        if action == "move":
+            return {
+                "moved": _move_drive_queue_entry_local(
+                    fields["repo_name"], fields["issue_number"], fields["to_position"]
+                )
+            }
+        raise ValueError(f"unknown drive-queue action: {action!r}")
 
     # ── Real-time event bus ────────────────────────────────────────────────
     event_source = EventSource()
@@ -1023,6 +1140,141 @@ def build_app(
         summary = summarize_drive_queue(entries_from_rows(rows))
         entries = [r for r in rows if r.get("repo_name") == repo] if repo else rows
         return JSONResponse({"entries": entries, "summary": asdict(summary)})
+
+    async def api_drive_queue_action(request: Request) -> JSONResponse:
+        """POST /api/drive-queue/action — move/remove/unblock/resume a
+        `coord drive` queue row (#2429 DQW-2).
+
+        Body: ``{"repo_name": "...", "issue_number": N, "action": "move" |
+        "remove" | "unblock" | "resume", ...}``. Response:
+        ``{"ok": bool, "error"?: str}`` — the same envelope
+        ``api_pipeline_action`` uses, not a new one.
+
+        All four actions ride the daemon's already-implemented
+        ``POST /drive-queue`` ops (``coord/serve_app.py``'s
+        ``post_drive_queue``) via ``_drive_queue_write`` — no new
+        queue-mutation logic here, just routing plus the two client-side
+        guards the TUI already enforces (``tui/src/app/drive_queue.rs``'s
+        ``queue_unblock_selected``/``queue_resume_selected``):
+
+        * ``move`` -> ``{action: "move", to_position}`` -> daemon op ``move``.
+        * ``remove`` -> daemon op ``dequeue``.
+        * ``unblock`` -> dequeue then re-enqueue with the row's ``machine``
+          preserved and ``after`` DROPPED — the exact recipe
+          ``dispatch_drive_queue_unblock`` (and its Python precedent,
+          ``coord/commands/drive_queue.py``'s ``_requeue_command``) uses: an
+          unsatisfiable pre-req is one of the two things that blocks a row,
+          so re-adding with the same ``after`` would just re-block it.
+          Refused with 400 on anything but a ``state == "blocked"`` row.
+        * ``resume`` -> daemon op ``update`` with
+          ``fields={hold_state: "released", hold_probes: 0}``. Refused with
+          400 on a row whose gate hasn't fired (``hold_state != "fired"``).
+
+        In fixture mode (#1538) every one of these is **recorded, not
+        executed** — mirrors ``api_pipeline_action``'s ``_fixture_action``.
+        """
+        try:
+            body = await request.json()
+        except ValueError:
+            return JSONResponse({"error": "invalid JSON"}, status_code=400)
+
+        repo_name = body.get("repo_name")
+        issue_number = body.get("issue_number")
+        action = body.get("action")
+        if not repo_name or issue_number is None or not action:
+            return JSONResponse(
+                {"error": "repo_name, issue_number and action are required"},
+                status_code=400,
+            )
+        try:
+            issue_number = int(issue_number)
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "issue_number must be an int"}, status_code=400)
+
+        if action not in ("move", "remove", "unblock", "resume"):
+            return JSONResponse({"error": f"unknown action: {action!r}"}, status_code=400)
+
+        to_position = None
+        if action == "move":
+            try:
+                to_position = int(body.get("to_position"))
+            except (TypeError, ValueError):
+                return JSONResponse(
+                    {"error": "to_position must be an int"}, status_code=400
+                )
+
+        rows = _fixture.drive_queue() if _fixture is not None else _read_drive_queue()
+        entry = next(
+            (
+                r for r in rows
+                if r.get("repo_name") == repo_name
+                and int(r.get("issue_number", -1)) == issue_number
+            ),
+            None,
+        )
+        if entry is None:
+            return JSONResponse({"error": "drive-queue entry not found"}, status_code=404)
+
+        if action == "unblock" and entry.get("state") != STATE_BLOCKED:
+            return JSONResponse(
+                {"ok": False, "error": "only a blocked entry can be unblocked"},
+                status_code=400,
+            )
+        if action == "resume" and entry.get("hold_state") != HOLD_FIRED:
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": "only an entry whose deploy gate has fired can be resumed",
+                },
+                status_code=400,
+            )
+
+        if _fixture is not None:
+            _fixture.record("/api/drive-queue/action", body, action=action)
+            return JSONResponse({"ok": True})
+
+        try:
+            if action == "move":
+                result = _drive_queue_write(
+                    "move",
+                    repo_name=repo_name,
+                    issue_number=issue_number,
+                    to_position=to_position,
+                )
+                ok = bool(result.get("moved"))
+            elif action == "remove":
+                result = _drive_queue_write(
+                    "dequeue", repo_name=repo_name, issue_number=issue_number
+                )
+                ok = bool(result.get("deleted"))
+            elif action == "unblock":
+                _drive_queue_write(
+                    "dequeue", repo_name=repo_name, issue_number=issue_number
+                )
+                _drive_queue_write(
+                    "enqueue",
+                    repo_name=repo_name,
+                    issue_number=issue_number,
+                    machine=entry.get("machine"),
+                    after=[],
+                )
+                ok = True
+            else:  # resume
+                result = _drive_queue_write(
+                    "update",
+                    repo_name=repo_name,
+                    issue_number=issue_number,
+                    fields={"hold_state": "released", "hold_probes": 0},
+                )
+                ok = bool(result.get("updated"))
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
+        if not ok:
+            return JSONResponse(
+                {"ok": False, "error": "drive-queue entry not found"}, status_code=404
+            )
+        return JSONResponse({"ok": True})
 
     async def api_approve(request: Request) -> JSONResponse:
         from coord.dispatch import dispatch, post_briefing, compute_do_not_touch
@@ -1944,6 +2196,7 @@ def build_app(
         Route("/api/sessions", api_sessions, methods=["GET"]),
         Route("/api/proposals", api_proposals, methods=["GET"]),
         Route("/api/drive-queue", api_drive_queue, methods=["GET"]),
+        Route("/api/drive-queue/action", api_drive_queue_action, methods=["POST"]),
         Route("/api/approve", api_approve, methods=["POST"]),
         Route("/api/reject", api_reject, methods=["POST"]),
         Route("/api/diff/{id}", api_diff, methods=["GET"]),
