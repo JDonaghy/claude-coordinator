@@ -5491,8 +5491,11 @@ impl CoordApp {
                 // place. `open_pipeline_doc_tab` already does the
                 // milestone/repo-group-expand + `rebuild_pipeline_sidebar`
                 // reveal internally (`reveal_pipeline_active_doc`), including
-                // when the target is hidden by the current Pipeline search
-                // filter — so there is nothing left to hand-roll here.
+                // forcing `pipeline_sel` onto this issue even when it's
+                // hidden by the current Pipeline search filter (so the
+                // Overview/Issue/Log detail panes show the target's content,
+                // not a stale or wrong-issue one) — so there is nothing left
+                // to hand-roll here.
                 self.open_pipeline_doc_tab((repo_slug, issue_number), true);
             }
             Err(reason) => {
