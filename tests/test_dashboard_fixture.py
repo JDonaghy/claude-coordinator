@@ -67,6 +67,7 @@ def _no_io(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("coord.dashboard.server.read_board", _boom)
     monkeypatch.setattr("coord.dashboard.server.write_board", _boom)
     monkeypatch.setattr("coord.dashboard.server.load_proposals", _boom)
+    monkeypatch.setattr("coord.dashboard.server.list_drive_queue", _boom)
     monkeypatch.setattr("coord.dashboard.server.check_all", _boom)
     monkeypatch.setattr("coord.dashboard.server.fetch_status", _boom)
     monkeypatch.setattr("coord.merge_queue.load_queue", _boom)
@@ -212,6 +213,55 @@ class TestSeededReads:
     def test_proposals_endpoint(self) -> None:
         proposals = _client().get("/api/proposals").json()
         assert [p["issue_number"] for p in proposals] == [4107]
+
+    def test_drive_queue_endpoint(self) -> None:
+        """GET /api/drive-queue in fixture mode (#2428 DQW-1).
+
+        The committed fixture seeds three rows across two repos: a running
+        claude-coordinator entry, a waiting claude-coordinator entry blocked
+        on it via `after=`, and a `quadraui` entry whose fleet-scoped deploy
+        gate has fired. That last row is what proves `FixtureServer.drive_queue()`
+        is actually wired up — `[]` (the pre-#2428 default) would silently
+        pass a naive shape-only assertion but could never produce
+        `fleet_held: 1`/`level: "held"`.
+        """
+        r = _client().get("/api/drive-queue")
+        assert r.status_code == 200
+        data = r.json()
+
+        entries = data["entries"]
+        assert len(entries) == 3
+        by_key = {(e["repo_name"], e["issue_number"]): e for e in entries}
+        assert by_key[("claude-coordinator", 4201)]["state"] == "running"
+        assert by_key[("claude-coordinator", 4202)]["after_json"] == [
+            "claude-coordinator#4201",
+        ]
+        assert by_key[("quadraui", 88)]["hold_state"] == "fired"
+        assert by_key[("quadraui", 88)]["hold_scope"] == "fleet"
+
+        summary = data["summary"]
+        assert summary["pending"] == 3
+        assert summary["running"] == 1
+        assert summary["waiting"] == 2
+        # claude-coordinator#4202's after= is unsatisfied (#4201 is running,
+        # not done), so only quadraui#88 (no after=) is eligible.
+        assert summary["eligible"] == 1
+        assert summary["held"] == 1
+        assert summary["fleet_held"] == 1
+        assert summary["level"] == "held"
+
+    def test_drive_queue_repo_filter_narrows_entries_not_summary(self) -> None:
+        """``?repo=`` in fixture mode: same fleet-wide-summary contract as live mode."""
+        r = _client().get("/api/drive-queue", params={"repo": "claude-coordinator"})
+        assert r.status_code == 200
+        data = r.json()
+        assert {e["repo_name"] for e in data["entries"]} == {"claude-coordinator"}
+        assert len(data["entries"]) == 2
+        # The quadraui fleet-held gate is invisible in `entries` but must
+        # still show up in `summary` — see api_drive_queue's docstring.
+        assert data["summary"]["fleet_held"] == 1
+        assert data["summary"]["level"] == "held"
+        assert data["summary"] == _client().get("/api/drive-queue").json()["summary"]
 
     def test_diff_is_seeded_not_shelled_out(self) -> None:
         client = _client()
