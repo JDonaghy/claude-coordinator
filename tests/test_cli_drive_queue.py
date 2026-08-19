@@ -723,12 +723,32 @@ def test_blocked_row_purely_by_an_unsatisfiable_prereq_gets_the_2362_note(
     # line) never applies to it — nothing to assert there beyond it existing.
     assert _row_for(result.output, f"{REPO}#1650")
 
+    # Split the transcript at 1654's own row header — 1654 is the last
+    # (only remaining) row, so everything from there on is exactly ITS
+    # block (summary/last:/note lines), never 1650's.
+    idx_1654 = result.output.index(f"{REPO}#1654")
+    block_1650 = result.output[:idx_1654]
+    block_1654 = result.output[idx_1654:]
+
     # 1654's remedy line is the new #2362 note, not the stale "never
     # re-checked on its own" advice — this row auto-resumes without an
     # operator.
-    assert "IS re-checked automatically every tick (#2362)" in result.output
-    assert "no operator remove+add needed" in result.output
-    assert "never re-checked on its own" not in result.output
+    assert "IS re-checked automatically every tick (#2362)" in block_1654
+    assert "no operator remove+add needed" in block_1654
+    assert "never re-checked on its own" not in block_1654
+
+    # #2404 review (non-blocking finding): #2230's merge-gate note must NOT
+    # also print for this row. `_blocked_gate_reading` returns `None` — no
+    # evidence — for an entry that never reached the merge queue, which is
+    # exactly what a purely `after=`-caused block is; showing it here would
+    # stack two auto-recheck notes citing two different issue numbers under
+    # one row, one of which has nothing to say about this row's real cause.
+    assert "re-checked against the merge gate automatically (#2230)" not in block_1654
+
+    # …but an ordinary blocked row whose cause is unrelated to its `after=`
+    # graph (1650, blocked on "drive session died") still gets #2230's note
+    # exactly as before — this exclusion is scoped to the #2362 shape only.
+    assert "re-checked against the merge gate automatically (#2230)" in block_1650
 
 
 def test_list_with_no_after_is_unaffected_by_the_2183_diagnosis(cli):

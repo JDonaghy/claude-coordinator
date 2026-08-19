@@ -2433,6 +2433,116 @@ def test_a_permanently_blocked_entry_is_not_resumed_even_once_its_after_lands():
     assert plan.launch is None
 
 
+# ── #2404 review: a CHAINED (two-hop) after= block, not just single-hop ────
+#
+# The live incident this issue is about (claude-coordinator#2284-#2288) was
+# never a single `after=` edge: #2284-#2288 all declared `after=2283`, and
+# #2283 was ITSELF `blocked` on `after=2282` — a two-hop chain (root 2282 ->
+# middle 2283 -> leaf 2284..2288), not the one-hop shape every test above
+# pins. `_reconcile_blocked_after`'s resume check is driven entirely by
+# `board.facts(dep).landed` — a real, board-derived merge fact, never by a
+# dependency's in-tick `states` entry — so in principle each hop should
+# resolve independently the moment ITS OWN named pre-req actually lands,
+# with no special-casing needed for the chain shape. These two tests are the
+# repro the review asked for: they exercise `plan_tick` against an actual
+# two-hop graph to confirm that holds (it does), and pin the one subtlety a
+# naive "chain" fix could get wrong — a leaf must not resume just because
+# its immediate pre-req was ITSELF re-queued to `waiting` this same tick;
+# only that pre-req actually landing (merged/closed) may resume the leaf.
+
+
+def test_a_two_hop_after_chain_resumes_in_one_tick_once_both_hops_have_landed():
+    """The exact live-incident shape: by the time anyone looked, BOTH the
+    root (2282-analog) and the middle (2283-analog) pre-reqs had already
+    merged — the middle's queue row just hadn't been reconciled yet. A
+    single tick must resolve the WHOLE chain: the middle reconciles to
+    `done` via #2055's landed check, and the leaf (2284..2288-analog),
+    reading the middle's REAL board fact rather than its stale on-disk
+    `blocked` state, resumes to `waiting` in that same tick — no operator
+    action, and no second tick needed once both merges are real."""
+    root = entry_key(REPO, 1650)
+    middle = entry_key(REPO, 1654)
+    entries = [
+        entry(1650, position=0, state=STATE_DONE),
+        entry(
+            1654,
+            position=1,
+            after=(root,),
+            state=STATE_BLOCKED,
+            attempts=2,
+            last_reason=f"pre-req {root} is queued but blocked — it will never satisfy",
+        ),
+        entry(
+            1658,
+            position=2,
+            after=(middle,),
+            state=STATE_BLOCKED,
+            attempts=1,
+            last_reason=f"pre-req {middle} is queued but blocked — it will never satisfy",
+        ),
+    ]
+    # Both the root AND the middle have actually merged — mirrors the live
+    # incident, where #2283 (middle) itself showed `done — issue already
+    # merged while blocked (#2055)` once anyone looked.
+    plan = plan_tick(entries, board(merged=(1650, 1654)), capacity=3)
+
+    middle_reconcile = next(r for r in plan.reconciles if r.key == middle)
+    assert middle_reconcile.outcome == "done"
+    assert middle_reconcile.updates["state"] == STATE_DONE
+
+    leaf_reconcile = next(r for r in plan.reconciles if r.key == entry_key(REPO, 1658))
+    assert leaf_reconcile.outcome == "resumed"
+    assert leaf_reconcile.updates["state"] == STATE_WAITING
+    assert leaf_reconcile.updates["attempts"] == 0
+    assert leaf_reconcile.updates["resumes"] == 1
+
+    # …and, exactly like the single-hop case, the freshly-resumed leaf falls
+    # straight into this SAME tick's launch selection.
+    assert plan.launch is not None and plan.launch.issue == 1658
+
+
+def test_a_two_hop_after_chain_leaf_is_not_resumed_until_its_own_pre_req_lands():
+    """Guard against the false-resume a naive "propagate through `states`"
+    chain fix would introduce: once the root lands, the middle correctly
+    resumes to `waiting` THIS tick (single-hop #2362 behaviour) — but the
+    leaf's own named pre-req is the MIDDLE, which has only been re-queued,
+    not merged. The leaf must stay `blocked` until the middle itself
+    actually lands, even though `states[middle]` already reads `waiting` by
+    the time the leaf is walked in this same tick."""
+    root = entry_key(REPO, 1650)
+    middle = entry_key(REPO, 1654)
+    entries = [
+        entry(1650, position=0, state=STATE_DONE),
+        entry(
+            1654,
+            position=1,
+            after=(root,),
+            state=STATE_BLOCKED,
+            attempts=2,
+            last_reason=f"pre-req {root} is queued but blocked — it will never satisfy",
+        ),
+        entry(
+            1658,
+            position=2,
+            after=(middle,),
+            state=STATE_BLOCKED,
+            attempts=1,
+            last_reason=f"pre-req {middle} is queued but blocked — it will never satisfy",
+        ),
+    ]
+    # Only the root has landed — the middle has not (it is only about to be
+    # re-queued to `waiting` THIS tick, not merged).
+    plan = plan_tick(entries, board(merged=(1650,)), capacity=3)
+
+    middle_reconcile = next(r for r in plan.reconciles if r.key == middle)
+    assert middle_reconcile.outcome == "resumed"
+    assert middle_reconcile.updates["state"] == STATE_WAITING
+
+    # The leaf gets NO reconcile at all this tick — it stays blocked, with
+    # its existing (still-true) "it will never satisfy" reason untouched.
+    assert all(r.key != entry_key(REPO, 1658) for r in plan.reconciles)
+
+
 def test_is_unsatisfiable_prereq_reason_recognises_only_the_exact_verdict_shape():
     from coord.drive_queue import _is_unsatisfiable_prereq_reason
 
