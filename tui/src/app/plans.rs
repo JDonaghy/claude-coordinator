@@ -1775,7 +1775,18 @@ impl CoordApp {
 
         let mut items = Vec::with_capacity(help.notes.len() + help.actions.len() + 8);
         if !help.notes.is_empty() {
-            items.push(cheatsheet_header_item("Reference"));
+            // #2287 (ms-65 §8b): the Board panel's cheatsheet labels this
+            // section "Document tabs" (contract §8b, `mocks/board-tabs-
+            // help-overlay.screen`) rather than the generic "Reference"
+            // every other registered view gets — mirrors how the Plans-only
+            // "Health chips" section just below is already a per-view
+            // special case in this same function.
+            let notes_header = if self.active_view == SidebarView::Board {
+                "Document tabs"
+            } else {
+                "Reference"
+            };
+            items.push(cheatsheet_header_item(notes_header));
             for note in &help.notes {
                 items.push(cheatsheet_entry_item(&note.label, None, &note.description));
             }

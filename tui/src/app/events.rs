@@ -740,11 +740,22 @@ impl CoordApp {
         // ── #1124: `?` help overlay + `/` command palette ─────────────────────
         // Modeled on the #541 issue-finder "owns ALL input while open"
         // pattern above. Scoped to whichever view has registered help
-        // content (today only `SidebarView::Plans` — see
+        // content (`SidebarView::Plans` and, since #2287, `Board` — see
         // `SidebarView::help_view_id`); other views fall through this
         // block entirely until they adopt the same pattern (`plans.rs`
         // module docs).
-        if self.active_view.help_view_id().is_some() {
+        //
+        // #2287: also excludes Board while its OWN sidebar filter box is
+        // focused (`self.board_search.focused`) — that pre-dates this
+        // block and already owns every printable character it's typed,
+        // including a literal `?`; letting this block's unconditional `?`
+        // trigger run first would silently swap a search for `?` into the
+        // Board cheatsheet instead. `board_search.focused` isn't part of
+        // `any_blocking_modal_active()` (it's a plain inline field focus,
+        // not a modal), so it needs its own check here.
+        if self.active_view.help_view_id().is_some()
+            && !(self.active_view == SidebarView::Board && self.board_search.focused)
+        {
             // The palette owns ALL input while open (mirrors quadraui's own
             // "click intercept is mandatory" Palette contract).
             if let Some(mut palette) = self.command_palette.take() {
@@ -811,11 +822,23 @@ impl CoordApp {
             // once neither surface above already claimed the event, and
             // gated the same way the `L`/Ctrl+P triggers above are (no
             // other blocking modal already up).
+            //
+            // #2287 (ms-65 §8b): excludes `SidebarView::Board`, which is
+            // registered under `help_view_id` (`types.rs`) purely to get
+            // the `?` cheatsheet + its Esc-close chrome — Board's own `/`
+            // predates this and already means "focus the sidebar filter"
+            // (see the `Key::Char('/')` arm further down this file, guarded
+            // on `self.active_view == SidebarView::Board`). Without this
+            // exclusion this generic trigger would fire FIRST and return
+            // before that arm is ever reached, silently swapping Board's
+            // filter-search for an empty command palette (Board registers
+            // no `HelpAction`s).
             if let UiEvent::KeyPressed { key, modifiers, .. } = &event {
                 if matches!(key, Key::Char('/'))
                     && !modifiers.ctrl
                     && !modifiers.alt
                     && !self.any_blocking_modal_active()
+                    && self.active_view != SidebarView::Board
                 {
                     self.open_command_palette();
                     return Reaction::Redraw;
@@ -4625,6 +4648,102 @@ impl CoordApp {
                         return true;
                     }
                 } else if ctx.in_main(pos.x, pos.y) {
+                    // #2287 (ms-65 §8c): right-click on a Board document
+                    // tab opens the Close / Close others / Close all /
+                    // Pin tab menu. Checked first in this branch — before
+                    // Queue/Plans below, which are mutually exclusive with
+                    // Board by `active_view` anyway — and hit-tests the
+                    // SAME `board_doc_tab_strip` call the painter and the
+                    // middle-click close handler already use (see that
+                    // arm's own comment on why this is the one source of
+                    // truth for the strip's geometry).
+                    //
+                    // Falls through to the rest of this branch (in
+                    // particular the PTY-forward at the bottom) when the
+                    // click missed the strip entirely — e.g. it landed on
+                    // the detail pane below it.
+                    if self.active_view == SidebarView::Board {
+                        let main_b = ctx.main_bounds();
+                        let lh = backend.line_height();
+                        let (tab_main_b, toolbar_consumed) =
+                            self.hit_test_panel_toolbar(pos, main_b, lh);
+                        if toolbar_consumed {
+                            return true;
+                        }
+                        let tab_h = detail_tab_bar_height(lh);
+                        if pos.y - tab_main_b.y < tab_h {
+                            if let Some(strip) = self.board_doc_tab_strip(tab_main_b.width) {
+                                let refs: Vec<&str> =
+                                    strip.tabs.iter().map(|t| t.label.as_str()).collect();
+                                if let Some(kind) = resolve_doc_tab_click(
+                                    &refs,
+                                    tab_main_b.x,
+                                    pos.x,
+                                    strip.scroll_offset,
+                                ) {
+                                    let idx = match kind {
+                                        TabClickKind::Close(idx) | TabClickKind::Body(idx) => idx,
+                                    };
+                                    let is_pinned = !self.board_doc_tabs().is_preview(idx);
+                                    // Anchor the menu at a WHOLE row, TWO
+                                    // rows below the clicked (fractional,
+                                    // cell-center) tab-strip position — not
+                                    // `pos` itself, for two independent
+                                    // reasons:
+                                    //
+                                    // 1. quadraui's TUI `ContextMenuLayout`
+                                    //    computes each item's hit region
+                                    //    from the raw (unrounded) anchor Y
+                                    //    but the TUI rasteriser paints that
+                                    //    same item at `anchor_y.round()`;
+                                    //    anchoring at a `row + 0.5` cell
+                                    //    center (what every mouse click in
+                                    //    this app's driver lands on) rounds
+                                    //    UP by half a row for painting, so
+                                    //    the rendered text for item N sits
+                                    //    half a row below where item N's
+                                    //    own hit region ends — a click on
+                                    //    the text lands on item N+1's
+                                    //    region instead (harness note 3's
+                                    //    "click the item's own label" would
+                                    //    silently misfire on every item but
+                                    //    the last). A WHOLE-number anchor
+                                    //    makes the unrounded hit-test
+                                    //    bounds and the rounded paint
+                                    //    position the same integers, so
+                                    //    they agree.
+                                    // 2. One whole row alone would still
+                                    //    anchor the menu's TOP BORDER onto
+                                    //    the tab-strip row itself
+                                    //    (`draw_context_menu` paints the
+                                    //    border one cell ABOVE the anchor),
+                                    //    covering the very tab that was
+                                    //    right-clicked — invisible to every
+                                    //    OTHER test here because a real
+                                    //    menu action closes the menu before
+                                    //    the strip is next read, but not to
+                                    //    `pin_tab_is_hidden_or_inert_on_an_
+                                    //    already_pinned_tab`, whose inert
+                                    //    click leaves the menu open and then
+                                    //    reads the strip straight through
+                                    //    it. A second row of clearance
+                                    //    drops the border below the strip
+                                    //    entirely — matching
+                                    //    `mocks/board-tab-context-menu.screen`,
+                                    //    whose menu box sits one full row
+                                    //    below the tab strip, not
+                                    //    overlapping it.
+                                    let menu_anchor = Point::new(pos.x, pos.y.floor() + 2.0);
+                                    if self.open_context_menu(
+                                        menu_anchor,
+                                        ContextMenuTarget::BoardDocTab { idx, is_pinned },
+                                    ) {
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     // #1003 fix-up: the Plans-panel roster lives in the MAIN
                     // panel, not the sidebar (unlike Board/Pipeline/Machines,
                     // handled above) — the sidebar-only branch above left

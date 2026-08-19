@@ -130,6 +130,34 @@ impl CoordApp {
         items
     }
 
+    /// #2287 (ms-65 §8c): build the menu item list for a right-click on a
+    /// Board document tab. Exact labels, taken verbatim from the tracking
+    /// issue: **Close**, **Close others**, **Close all**, **Pin tab**.
+    ///
+    /// "Pin tab" is always rendered (never hidden — contract §8c's own base
+    /// case right-clicks an already-pinned tab and still expects to find
+    /// it, `tests/acceptance/ms-65/tabs_discoverability_2287.rs::
+    /// right_clicking_a_tab_opens_a_menu_with_close_close_others_close_all_and_pin_tab`)
+    /// but `disabled_because` when `is_pinned` — this codebase's reading of
+    /// the contract's permissive "hidden or inert": a disabled item hit-
+    /// tests as `ContextMenuHit::Inert` (`quadraui::context_menu`), so a
+    /// click on it dispatches no action and leaves the tab set untouched,
+    /// exactly what "inert" means.
+    pub(crate) fn context_menu_items_for_board_doc_tab(&self, is_pinned: bool) -> Vec<ContextMenuItem> {
+        let mut items = vec![
+            ContextMenuItem::action("close-doc-tab", "Close"),
+            ContextMenuItem::action("close-other-doc-tabs", "Close others"),
+            ContextMenuItem::action("close-all-doc-tabs", "Close all"),
+        ];
+        let pin_item = ContextMenuItem::action("pin-doc-tab", "Pin tab");
+        items.push(if is_pinned {
+            pin_item.disabled_because("already pinned")
+        } else {
+            pin_item
+        });
+        items
+    }
+
     /// #262: classify a Pipeline row into the umbrella's three sections
     /// plus an "Other" catch-all.  Drives the right-click menu so Start
     /// only appears when the row is genuinely dispatch-ready.
@@ -1242,6 +1270,10 @@ impl CoordApp {
                 *queue_len,
                 *held,
             ),
+            // #2287 (ms-65 §8c): right-click on a Board document tab.
+            ContextMenuTarget::BoardDocTab { is_pinned, .. } => {
+                self.context_menu_items_for_board_doc_tab(*is_pinned)
+            }
         };
         if items.is_empty() {
             return false;
@@ -6176,6 +6208,16 @@ impl CoordApp {
                     ContextMenuTarget::DriveQueueRow { issue_number, .. } => {
                         (*issue_number).max(0) as u64
                     }
+                    // #2287: the tab's own issue number, looked up by strip
+                    // index (Copy isn't one of this menu's four items today,
+                    // but every `ContextMenuTarget` needs a match arm here
+                    // regardless of which menu offers "Copy issue #…").
+                    ContextMenuTarget::BoardDocTab { idx, .. } => self
+                        .board_doc_tabs()
+                        .tabs()
+                        .get(*idx)
+                        .map(|(_, number)| *number)
+                        .unwrap_or(0),
                 };
                 // #1374: the actual clipboard write happens in the two
                 // direct UI callers (`handle_context_menu_click` /
@@ -6195,6 +6237,42 @@ impl CoordApp {
             }
             "refresh" => {
                 self.refresh();
+                true
+            }
+            // #2287 (ms-65 §8c): the Board tab context menu's four items.
+            // Each targets the RIGHT-CLICKED tab's strip index carried by
+            // `ContextMenuTarget::BoardDocTab`, not necessarily the active
+            // tab — see that variant's doc comment and finding 16 in
+            // `tests/acceptance/ms-65/manifest.yml`.
+            "close-doc-tab" => {
+                if let ContextMenuTarget::BoardDocTab { idx, .. } = target {
+                    self.close_board_doc_tab(*idx);
+                }
+                true
+            }
+            "close-other-doc-tabs" => {
+                if let ContextMenuTarget::BoardDocTab { idx, .. } = target {
+                    self.close_other_board_doc_tabs(*idx);
+                }
+                true
+            }
+            "close-all-doc-tabs" => {
+                self.close_all_board_doc_tabs();
+                true
+            }
+            // "Pin tab" is disabled (via `disabled_because`) when the
+            // clicked tab is already pinned, so a click never reaches here
+            // in that case (`ContextMenuHit::Inert` swallows it before
+            // dispatch) — `promote_board_doc_tab` is ALSO its own no-op in
+            // that case regardless, as a second line of defence (e.g. the
+            // keyboard-activation path, which doesn't consult `disabled`
+            // the same way — `context_menu_activate_selected` skips
+            // disabled items when moving selection, but belt-and-braces
+            // here costs nothing).
+            "pin-doc-tab" => {
+                if let ContextMenuTarget::BoardDocTab { idx, .. } = target {
+                    self.promote_board_doc_tab(*idx);
+                }
                 true
             }
             // #1631 (H-4): the status bar's "Fleet health…" menu item —

@@ -242,6 +242,14 @@ impl SidebarView {
     pub(crate) fn help_view_id(self) -> Option<&'static str> {
         match self {
             SidebarView::Plans => Some("panel:plans"),
+            // #2287 (ms-65 §8b): the Board panel's `?` cheatsheet — see
+            // `render.rs::board_view_help`. Note this deliberately does NOT
+            // also make Board opt into the shared `/` command-palette
+            // trigger (`events.rs`'s `?`/`/` block): Board's own `/` is the
+            // pre-existing sidebar search-focus binding, and this repo's
+            // events.rs excludes `SidebarView::Board` from that trigger for
+            // exactly that reason — see the comment there.
+            SidebarView::Board => Some("panel:board"),
             _ => None,
         }
     }
@@ -1069,6 +1077,21 @@ pub(crate) enum ContextMenuTarget {
         /// gates "Resume". Captured here rather than re-read at click time
         /// for the same reason `state` is: the selection may have moved.
         held: bool,
+    },
+    /// #2287 (ms-65 §8c): right-click on a Board document tab (the strip
+    /// above the detail pane, #2282). Carries the RIGHT-CLICKED tab's strip
+    /// index — deliberately not necessarily the active tab, since "Close"
+    /// and "Pin tab" both target the clicked tab, not whichever one happens
+    /// to be active (see `dialogs.rs::context_menu_items_for_board_doc_tab`
+    /// and finding 16 in `tests/acceptance/ms-65/manifest.yml`).
+    BoardDocTab {
+        /// Strip index of the clicked tab at right-click time.
+        idx: usize,
+        /// Whether the clicked tab is already pinned — gates "Pin tab"
+        /// (contract §8c: "hidden or inert" on an already-pinned tab; this
+        /// codebase's reading is inert, via `ContextMenuItem::
+        /// disabled_because`).
+        is_pinned: bool,
     },
 }
 

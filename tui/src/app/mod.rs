@@ -4011,6 +4011,8 @@ impl CoordApp {
             help_registry: {
                 let mut registry = HelpRegistry::new();
                 registry.register("panel:plans", CoordApp::plans_view_help());
+                // #2287 (ms-65 §8b): Board panel `?` cheatsheet.
+                registry.register("panel:board", CoordApp::board_view_help());
                 registry
             },
             help_overlay: HelpOverlayController::new(),
@@ -7076,6 +7078,46 @@ impl CoordApp {
         self.activate_board_doc_tab(next)
     }
 
+    /// #2287 (ms-65 §8c): the tab context menu's "Close others" item —
+    /// close every Board tab except the RIGHT-CLICKED one at strip index
+    /// `idx` (not necessarily the active tab, see
+    /// `ContextMenuTarget::BoardDocTab`'s doc comment). Mirrors
+    /// `close_board_doc_tab`'s reveal-on-active-change behaviour.
+    fn close_other_board_doc_tabs(&mut self, idx: usize) -> bool {
+        let before = self.board_doc_active_key().cloned();
+        if !self.doc_tabs.group_mut(PanelScope::Board).close_others(idx) {
+            return false;
+        }
+        if self.board_doc_active_key().cloned() != before {
+            self.reveal_board_active_doc();
+            self.restore_detail_sub_state(PanelScope::Board);
+        }
+        true
+    }
+
+    /// #2287 (ms-65 §8c): the tab context menu's "Close all" item — the
+    /// menu's route to the same "zero doc tabs" end state as closing every
+    /// tab one at a time (contract §4 / §8c).
+    fn close_all_board_doc_tabs(&mut self) -> bool {
+        let before = self.board_doc_active_key().cloned();
+        if !self.doc_tabs.group_mut(PanelScope::Board).close_all() {
+            return false;
+        }
+        if self.board_doc_active_key().cloned() != before {
+            self.reveal_board_active_doc();
+            self.restore_detail_sub_state(PanelScope::Board);
+        }
+        true
+    }
+
+    /// #2287 (ms-65 §8c): the tab context menu's "Pin tab" item — promote
+    /// the RIGHT-CLICKED Board tab at strip index `idx` out of the preview
+    /// slot. Never moves the active tab or reorders the strip (unlike
+    /// open/close), so no reveal / sub-state restore is needed.
+    fn promote_board_doc_tab(&mut self, idx: usize) -> bool {
+        self.doc_tabs.group_mut(PanelScope::Board).promote(idx)
+    }
+
     /// Contract §2f — reveal-on-activate.
     ///
     /// Activating a tab selects the matching sidebar row **and scrolls it into
@@ -8719,16 +8761,27 @@ impl CoordApp {
                 " j/k=nav  a=merge-all-ready  m=merge-only-this  M=force-merge  d=drop  s=interactive{}  q=quit ",
                 attn
             )
-        } else if self.active_view == SidebarView::Plans
+        } else if self.active_view.help_view_id().is_some()
             && (self.help_overlay.is_open() || self.command_palette.is_some())
         {
             // #1124 contract §5i: both the `?` cheatsheet and the `/`
-            // command palette are modal overlays over the Plans panel —
-            // Esc closes whichever is open. Must precede the general
-            // Plans-view arm just below, which this shadows while either
-            // surface is up. No `q=quit` here — both surfaces own ALL
-            // input while open (`events.rs`), so a typed `q` is swallowed
-            // (or filters the palette query), not a quit.
+            // command palette are modal overlays over whichever panel has
+            // adopted the reusable help layer — Esc closes whichever is
+            // open. Must precede the general per-view arms just below,
+            // which this shadows while either surface is up. No `q=quit`
+            // here — both surfaces own ALL input while open (`events.rs`),
+            // so a typed `q` is swallowed (or filters the palette query),
+            // not a quit.
+            //
+            // #2287 (ms-65 §8b): generalized from a `SidebarView::Plans`-only
+            // check so the Board panel's own `?` cheatsheet (registered
+            // under `"panel:board"`, see `render.rs::board_view_help`) gets
+            // the same `" Esc=close "` chrome Plans' overlay already has
+            // (contract §8b: "mirrors ms-38 §5i's identical convention").
+            // Board never sets `command_palette` (events.rs deliberately
+            // excludes it from the `/` trigger — Board's own `/` is the
+            // pre-existing search-focus binding), so this fires for Board
+            // only while `help_overlay` is open.
             " Esc=close ".to_string()
         } else if self.active_view == SidebarView::Plans && self.plans_detail_open {
             // #1122 (contract §3f): the detail pane replaces the roster
@@ -8813,7 +8866,40 @@ impl CoordApp {
             } else {
                 ""
             };
-            format!(" n=notify  m=merge  R=retry  P=purge{}  q=quit ", live_hint)
+            // #2287 (ms-65 §8a): whenever the Board panel owns a non-empty
+            // document-tab set, the pinned, verbatim tab-gesture hint
+            // REPLACES the normal Board hint set (rather than layering onto
+            // it) — "every interaction in this milestone is a mouse gesture
+            // whose meaning is not visible on screen" (issue rationale),
+            // and `mocks/board-preview-tab.screen` / `mocks/board-tab-
+            // context-menu.screen` both show the status bar as exactly
+            // `click=preview  dbl-click=pin  ctrl-w=close  ctrl-tab=next
+            // q=quit` with tabs open — no `n=notify`/`m=merge`/`R=retry`/
+            // `P=purge`. Concatenating the two sets (tried first) also
+            // overflowed a 120-column bar enough to push the LEFT status
+            // segments (e.g. the `[Sidebar]`/`[Main]` focus indicator, #605)
+            // off the front — quadraui's `StatusBar::layout` never drops a
+            // LEFT segment, so an overlong single RIGHT segment just
+            // overdraws them instead (`app::tests::
+            // ctrl_w_closes_the_active_doc_tab_and_walks_left`).
+            //
+            // Board falls through to this catch-all branch whenever it
+            // isn't on the Terminal detail sub-tab (handled by its own
+            // earlier arm above) and no other view-specific branch claimed
+            // it, so this is the Board's own default hint set. Zero tabs
+            // (or any other view reaching this branch, e.g. Kanban) leaves
+            // the string exactly as it was before #2287 — the CONTROL
+            // `tests/acceptance/ms-65/tabs_discoverability_2287.rs::
+            // zero_tabs_status_bar_keeps_the_boards_own_hints_and_shows_no_tab_hints`
+            // pins that this must stay true.
+            if self.active_view == SidebarView::Board && !self.board_doc_tabs().is_empty() {
+                " click=preview  dbl-click=pin  ctrl-w=close  ctrl-tab=next  q=quit ".to_string()
+            } else {
+                format!(
+                    " n=notify  m=merge  R=retry  P=purge{}  q=quit ",
+                    live_hint
+                )
+            }
         };
         StatusBar {
             id: WidgetId::new("statusbar"),

@@ -344,6 +344,66 @@ impl DocTabGroup {
         true
     }
 
+    /// #2287 (ms-65 §8c): the tab context menu's "Close others" item —
+    /// close every tab except the one at `idx`, which becomes the sole
+    /// survivor at index 0 and the active tab. Returns `false` (no-op) when
+    /// `idx` is out of range.
+    ///
+    /// Preserves `idx`'s preview-ness rather than always clearing it: §8c
+    /// only pins the effect on tab count/order, and collapsing to a single
+    /// tab that was already the preview should not silently promote it —
+    /// that is "Pin tab"'s job, not "Close others"'s.
+    pub(crate) fn close_others(&mut self, idx: usize) -> bool {
+        if idx >= self.tabs.len() {
+            return false;
+        }
+        let was_preview = self.preview == Some(idx);
+        let survivor = self.tabs[idx].clone();
+        self.tabs = vec![survivor];
+        self.active = Some(0);
+        self.preview = if was_preview { Some(0) } else { None };
+        // #2285 (§5): every closed tab's sub-state goes with it.
+        self.prune_sub_state();
+        self.debug_check();
+        true
+    }
+
+    /// #2287 (ms-65 §8c): the tab context menu's "Close all" item — close
+    /// every open tab, reaching "the same end state as closing the last
+    /// tab" (contract §8c / §4's empty state, #2283). Returns `false`
+    /// (no-op) when nothing is open.
+    pub(crate) fn close_all(&mut self) -> bool {
+        if self.tabs.is_empty() {
+            return false;
+        }
+        self.tabs.clear();
+        self.active = None;
+        self.preview = None;
+        self.prune_sub_state();
+        self.debug_check();
+        true
+    }
+
+    /// #2287 (ms-65 §8c): the tab context menu's "Pin tab" item — promote
+    /// the tab at `idx` out of the preview slot, without changing which tab
+    /// is active or the strip's order.
+    ///
+    /// Distinct from [`Self::promote_active`] (§2e rule 3's click-driven
+    /// path, which only ever acts on the ACTIVE tab): the context menu's
+    /// "Pin tab" targets the RIGHT-CLICKED tab, which need not be the
+    /// active one. A no-op — contract §8c's "inert" reading of "hidden or
+    /// inert" on an already-pinned tab — when `idx` is not the (single)
+    /// preview tab, whether because it's already pinned or out of range.
+    pub(crate) fn promote(&mut self, idx: usize) -> bool {
+        if self.preview == Some(idx) {
+            self.preview = None;
+            self.debug_check();
+            true
+        } else {
+            false
+        }
+    }
+
     #[inline]
     fn debug_check(&self) {
         debug_assert!(
@@ -676,6 +736,87 @@ mod tests {
         g.pin(k(101));
         assert!(!g.close(7));
         assert_eq!(g.tabs(), &[k(101)]);
+    }
+
+    // ── #2287 (ms-65 §8c): tab context menu — close_others / close_all / promote ──
+
+    #[test]
+    fn close_others_leaves_only_the_target_tab_active() {
+        let mut g = DocTabGroup::default();
+        g.pin(k(101));
+        g.pin(k(102));
+        g.pin(k(103));
+        assert!(g.close_others(1));
+        assert_eq!(g.tabs(), &[k(102)]);
+        assert_eq!(g.active_index(), Some(0));
+    }
+
+    #[test]
+    fn close_others_out_of_range_is_a_no_op() {
+        let mut g = DocTabGroup::default();
+        g.pin(k(101));
+        g.pin(k(102));
+        assert!(!g.close_others(9));
+        assert_eq!(g.tabs(), &[k(101), k(102)]);
+    }
+
+    #[test]
+    fn close_others_preserves_the_survivors_preview_state() {
+        let mut g = DocTabGroup::default();
+        g.pin(k(101));
+        g.open_preview(k(102));
+        assert!(g.is_preview(1));
+        assert!(g.close_others(1));
+        assert_eq!(g.tabs(), &[k(102)]);
+        assert!(g.is_preview(0), "the survivor was the preview tab");
+    }
+
+    #[test]
+    fn close_all_empties_the_group() {
+        let mut g = DocTabGroup::default();
+        g.pin(k(101));
+        g.pin(k(102));
+        assert!(g.close_all());
+        assert!(g.is_empty());
+        assert_eq!(g.active_index(), None);
+    }
+
+    #[test]
+    fn close_all_on_an_empty_group_is_a_no_op() {
+        let mut g = DocTabGroup::default();
+        assert!(!g.close_all());
+    }
+
+    #[test]
+    fn promote_drops_the_preview_marker_without_moving_active_or_order() {
+        let mut g = DocTabGroup::default();
+        g.pin(k(101));
+        g.open_preview(k(102));
+        assert_eq!(g.active_index(), Some(1), "single click activates #102");
+        // Re-activate #101 so the promoted tab (idx 0) is NOT the active one —
+        // "Pin tab" must target the clicked tab, not whichever is active.
+        g.activate_index(0);
+        assert_eq!(g.active_index(), Some(0));
+        assert!(g.is_preview(1));
+        assert!(g.promote(1));
+        assert!(!g.is_preview(1));
+        assert_eq!(g.tabs(), &[k(101), k(102)], "order unchanged");
+        assert_eq!(g.active_index(), Some(0), "active tab unchanged");
+    }
+
+    #[test]
+    fn promote_on_an_already_pinned_tab_is_a_no_op() {
+        let mut g = DocTabGroup::default();
+        g.pin(k(101));
+        assert!(!g.promote(0));
+        assert_eq!(g.tabs(), &[k(101)]);
+    }
+
+    #[test]
+    fn promote_out_of_range_is_a_no_op() {
+        let mut g = DocTabGroup::default();
+        g.pin(k(101));
+        assert!(!g.promote(9));
     }
 
     #[test]
