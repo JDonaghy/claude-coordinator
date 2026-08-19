@@ -3606,6 +3606,45 @@ impl CoordApp {
         rows
     }
 
+    /// #2342: candidate log-source assignments for `issue`'s Log tab,
+    /// newest-dispatched first.
+    ///
+    /// An assignment qualifies if either its raw `issue_number` matches
+    /// `issue.number` — the pre-#2342 match, unchanged for
+    /// `work`/`review`/`smoke`/`conflict-fix`/`fix-*`, and how a milestone
+    /// **tracking/epic** issue picks up its own Gate A `mock-author` row
+    /// *and* every member's `test-author` row (test-author always books
+    /// `issue_number` to the tracking issue, never the member issue it's
+    /// actually for — `Assignment::for_issue_number`'s doc comment) — or
+    /// its `effective_issue_number()` matches (#1084's `for_issue_number`
+    /// correlation), which is how a milestone **member** issue finds its
+    /// own `test-author` row even though that row's raw `issue_number`
+    /// points at the tracking issue instead.
+    ///
+    /// Restricted to `is_workable_type` so scoping-chat assignment types
+    /// (`refinement`, `test-chat`, `new-issue-chat`, …) don't clutter the
+    /// picker.
+    pub(crate) fn log_candidates_for_issue(&self, issue: &PipelineIssue) -> Vec<&Assignment> {
+        let local_repo = issue.coord_repo.as_deref();
+        let mut candidates: Vec<&Assignment> = self
+            .data
+            .assignments
+            .iter()
+            .filter(|a| a.issue_number == issue.number || a.effective_issue_number() == issue.number)
+            .filter(|a| match local_repo {
+                Some(r) => a.repo == r,
+                None => true,
+            })
+            .filter(|a| is_workable_type(a.assignment_type.as_deref().unwrap_or("work")))
+            .collect();
+        candidates.sort_by(|a, b| {
+            b.dispatched_at
+                .partial_cmp(&a.dispatched_at)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        candidates
+    }
+
     /// Log tab: show the worker log for the selected pipeline issue.
     ///
     /// Prefers the live SSE stream when open for this issue's assignment
@@ -3620,32 +3659,49 @@ impl CoordApp {
         let mut items: Vec<ListItem> = Vec::new();
         let issue = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i));
         if let Some(issue) = issue {
-            let local_repo = issue.coord_repo.as_deref();
-            let assignment = self
-                .data
-                .assignments
-                .iter()
-                .filter(|a| a.issue_number == issue.number)
-                .filter(|a| match local_repo {
-                    Some(r) => a.repo == r,
-                    None => true,
-                })
-                .find(|a| a.status == "running")
-                .or_else(|| {
-                    self.data
-                        .assignments
-                        .iter()
-                        .filter(|a| a.issue_number == issue.number)
-                        .filter(|a| match local_repo {
-                            Some(r) => a.repo == r,
-                            None => true,
-                        })
-                        .max_by(|a, b| {
-                            a.dispatched_at
-                                .partial_cmp(&b.dispatched_at)
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                        })
-                });
+            // #2342: candidates newest-dispatched first — see
+            // `log_candidates_for_issue` for why a single issue can have
+            // more than one (Gate A + N members' test-author rows sharing
+            // a tracking issue's `issue_number`).
+            let candidates = self.log_candidates_for_issue(issue);
+            let pinned = self.pipeline_log_pinned_assignment.get(&issue.number);
+            let assignment = pick_log_source(&candidates, pinned);
+
+            // #2342: when more than one assignment could be "the" log for
+            // this issue, render a picker header so the user can choose
+            // instead of being stuck with whichever the auto-pick
+            // heuristic above landed on. Silent (no rows) for the common
+            // case of a single candidate, so ordinary work/review/smoke/
+            // conflict-fix issues render exactly as before.
+            if candidates.len() > 1 {
+                items.push(kv_item(
+                    "",
+                    "── LOG SOURCE (press 1–9 to switch) ──",
+                    Some(Color::rgb(160, 160, 180)),
+                ));
+                for (i, a) in candidates.iter().enumerate().take(9) {
+                    let is_shown = assignment.is_some_and(|shown| shown.id == a.id);
+                    let marker = if is_shown { "▶" } else { " " };
+                    let color = if is_shown {
+                        Color::rgb(140, 200, 140)
+                    } else {
+                        Color::rgb(140, 140, 160)
+                    };
+                    items.push(kv_item(
+                        "",
+                        &format!(
+                            "  {marker} [{}] {} · {} · {}",
+                            i + 1,
+                            log_source_label(a),
+                            a.machine,
+                            a.status,
+                        ),
+                        Some(color),
+                    ));
+                }
+                items.push(kv_item("", "", None));
+            }
+
             if let Some(a) = assignment {
                 // Session elapsed header — always recomputed (time advances every
                 // second even when no new log lines arrive).
@@ -3904,5 +3960,47 @@ impl CoordApp {
             .lines()
             .filter(|l| json_str(l, "type").as_deref() == Some("assistant"))
             .count()
+    }
+}
+
+/// #2342: resolve which candidate a Pipeline issue's Log tab should show,
+/// given its pinned choice (if any) — pinned, else running, else the
+/// newest-dispatched (`candidates` is expected pre-sorted by
+/// `log_candidates_for_issue`, newest first).
+///
+/// Shared by `pipeline_log_list` (what to render) and `ensure_log_tab_sse`
+/// (which assignment's SSE stream to keep warm) so the two can never pick
+/// different assignments — `ensure_log_tab_sse`'s doc comment already
+/// states that invariant (its #308 "Loading log…" flicker note predates
+/// #2342, but the requirement is the same: the pool entry must track
+/// whatever's visible).
+pub(crate) fn pick_log_source<'a>(
+    candidates: &[&'a Assignment],
+    pinned: Option<&String>,
+) -> Option<&'a Assignment> {
+    pinned
+        .and_then(|id| candidates.iter().find(|a| &a.id == id).copied())
+        .or_else(|| candidates.iter().find(|a| a.status == "running").copied())
+        .or_else(|| candidates.first().copied())
+}
+
+/// #2342: friendly label for a Log-tab picker row. Reuses the "Gate A" /
+/// "Acceptance Authoring" names already established by #1084's prereq
+/// blocks (`append_gate_a_prereq_guidance_rows` /
+/// `append_acceptance_authoring_prereq_guidance_rows` above) rather than
+/// inventing new ones — an `Acceptance Authoring` row is further tagged
+/// with the member issue it's for (`for_issue_number`) so multiple
+/// members' rows on a milestone tracking issue's picker stay distinguishable.
+/// Every other type (`work`, `review`, `smoke`, `conflict-fix`, `fix-N`)
+/// is shown as-is — those are already self-explanatory and unchanged from
+/// pre-#2342 Log tab behavior.
+pub(crate) fn log_source_label(a: &Assignment) -> String {
+    match a.assignment_type.as_deref().unwrap_or("work") {
+        "mock-author" => "Gate A".to_string(),
+        "test-author" => match a.for_issue_number {
+            Some(n) => format!("Acceptance Authoring #{n}"),
+            None => "Acceptance Authoring".to_string(),
+        },
+        other => other.to_string(),
     }
 }

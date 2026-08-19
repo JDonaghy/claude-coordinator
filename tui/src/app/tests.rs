@@ -8591,6 +8591,230 @@
         assert_eq!(status.stages[3].status, StageStatus::Pending);
     }
 
+    // ── #2342: Log tab surfaces Gate A / Acceptance Authoring logs ──────────
+
+    /// Root-cause fixture from #2342: on the milestone tracking issue, a
+    /// Gate A `mock-author` row and every member's `test-author` row all
+    /// share `issue_number=751` (test-author always books the tracking
+    /// issue, never the member it's actually for — `for_issue_number`'s
+    /// doc comment). Before #2342 the Log tab's picker had no way to tell
+    /// them apart; `log_candidates_for_issue` must surface all three so a
+    /// picker can.
+    #[test]
+    fn log_candidates_for_issue_tracking_issue_sees_gate_a_and_every_members_test_author() {
+        let mut app = make_pipeline_app_for_prereq_test();
+        let mut gate_a = _stage_assignment("mock-a", "mock-author", 100.0, "done");
+        gate_a.issue_number = 751;
+        app.data.assignments.push(gate_a);
+
+        let mut ta42 = _stage_assignment("ta-42", "test-author", 150.0, "done");
+        ta42.issue_number = 751;
+        ta42.for_issue_number = Some(42);
+        app.data.assignments.push(ta42);
+
+        let mut ta43 = _stage_assignment("ta-43", "test-author", 200.0, "done");
+        ta43.issue_number = 751;
+        ta43.for_issue_number = Some(43);
+        app.data.assignments.push(ta43);
+
+        let tracking = &app.pipeline_issues[0];
+        let candidates = app.log_candidates_for_issue(tracking);
+        let ids: Vec<&str> = candidates.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(
+            ids.len(),
+            3,
+            "Gate A + both members' test-author rows must all be candidates: {ids:?}"
+        );
+        assert!(ids.contains(&"mock-a"));
+        assert!(ids.contains(&"ta-42"));
+        assert!(ids.contains(&"ta-43"));
+        // Newest-dispatched first — the order the in-tab picker lists them.
+        assert_eq!(ids[0], "ta-43", "candidates must sort newest-dispatched first");
+    }
+
+    /// The other half of #2342's root cause: a milestone MEMBER issue's own
+    /// Log tab must find its own `test-author` row via
+    /// `Assignment::effective_issue_number()` (its raw `issue_number` is
+    /// always the tracking issue, per the fixture above) — and must not
+    /// pick up Gate A's row or a sibling member's row.
+    #[test]
+    fn log_candidates_for_issue_member_issue_finds_own_test_author_not_siblings_or_tracking() {
+        let mut app = make_pipeline_app_for_prereq_test();
+        let mut gate_a = _stage_assignment("mock-a", "mock-author", 100.0, "done");
+        gate_a.issue_number = 751;
+        app.data.assignments.push(gate_a);
+
+        let mut ta42 = _stage_assignment("ta-42", "test-author", 150.0, "done");
+        ta42.issue_number = 751;
+        ta42.for_issue_number = Some(42);
+        app.data.assignments.push(ta42);
+
+        let mut ta43 = _stage_assignment("ta-43", "test-author", 200.0, "done");
+        ta43.issue_number = 751;
+        ta43.for_issue_number = Some(43);
+        app.data.assignments.push(ta43);
+
+        let member42 = &app.pipeline_issues[1];
+        let candidates42 = app.log_candidates_for_issue(member42);
+        assert_eq!(
+            candidates42.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            vec!["ta-42"],
+            "#42's own Log tab must find only its own test-author row"
+        );
+    }
+
+    /// Acceptance criterion: a milestone member issue's Log tab shows that
+    /// issue's own `test-author` log — not the tracking issue's, not
+    /// nothing. Renders through the real `pipeline_log_list` (not just the
+    /// candidate list) so the SSE-miss fallback path and the picker-header
+    /// suppression for a single candidate are covered too.
+    #[test]
+    fn pipeline_log_list_member_issue_shows_own_test_author_log_not_tracking_or_empty() {
+        let mut app = make_pipeline_app_for_prereq_test();
+        let mut gate_a = _stage_assignment("mock-a", "mock-author", 100.0, "done");
+        gate_a.issue_number = 751;
+        gate_a.machine = "tracking-host".to_string();
+        app.data.assignments.push(gate_a);
+
+        let mut ta42 = _stage_assignment("ta-42", "test-author", 150.0, "done");
+        ta42.issue_number = 751;
+        ta42.for_issue_number = Some(42);
+        ta42.machine = "member42-host".to_string();
+        app.data.assignments.push(ta42);
+
+        app.pipeline_sel = Some(1); // member #42
+        app.pipeline_detail_tab = PipelineDetailTab::Log;
+        let list = app.pipeline_log_list();
+        let text: String = list
+            .items
+            .iter()
+            .flat_map(|i| i.text.spans.iter().map(|s| s.text.as_str()))
+            .collect();
+        assert!(
+            text.contains("member42-host"),
+            "must show #42's own test-author session, not nothing:\n{text}"
+        );
+        assert!(
+            !text.contains("tracking-host"),
+            "must not show Gate A's session on a member issue's tab:\n{text}"
+        );
+        assert!(
+            !text.contains("LOG SOURCE"),
+            "a single candidate must not render picker-header clutter:\n{text}"
+        );
+    }
+
+    /// Acceptance criterion: when more than one assignment could be "the"
+    /// log for an issue — a milestone tracking issue with both its own
+    /// Gate A row and a member's test-author row — the Log tab renders a
+    /// picker header, and pinning a specific candidate (`pipeline_log_
+    /// pinned_assignment`, what the 1-9 keybind in `events.rs` writes)
+    /// actually changes which one is shown.
+    #[test]
+    fn pipeline_log_list_tracking_issue_shows_picker_and_pin_selects_gate_a() {
+        let mut app = make_pipeline_app_for_prereq_test();
+        let mut gate_a = _stage_assignment("mock-a", "mock-author", 100.0, "done");
+        gate_a.issue_number = 751;
+        gate_a.machine = "tracking-host".to_string();
+        app.data.assignments.push(gate_a);
+
+        let mut ta42 = _stage_assignment("ta-42", "test-author", 150.0, "done");
+        ta42.issue_number = 751;
+        ta42.for_issue_number = Some(42);
+        ta42.machine = "member42-host".to_string();
+        app.data.assignments.push(ta42);
+
+        app.pipeline_sel = Some(0); // the tracking issue itself
+        app.pipeline_detail_tab = PipelineDetailTab::Log;
+
+        // Neither row is running — newest-dispatched (ta-42) auto-wins, and
+        // the picker header must appear since there's more than one candidate.
+        let list = app.pipeline_log_list();
+        let text: String = list
+            .items
+            .iter()
+            .flat_map(|i| i.text.spans.iter().map(|s| s.text.as_str()))
+            .collect();
+        assert!(text.contains("LOG SOURCE"), "multiple candidates must show a picker:\n{text}");
+        assert!(text.contains("member42-host"), "auto-pick must be the newest-dispatched row:\n{text}");
+
+        // Pin to Gate A explicitly (mirrors the events.rs 1-9 keybind).
+        app.pipeline_log_pinned_assignment
+            .insert(751, "mock-a".to_string());
+        let list = app.pipeline_log_list();
+        let text: String = list
+            .items
+            .iter()
+            .flat_map(|i| i.text.spans.iter().map(|s| s.text.as_str()))
+            .collect();
+        assert!(
+            text.contains("tracking-host"),
+            "pinning Gate A must switch the shown log to it:\n{text}"
+        );
+    }
+
+    /// `log_source_label` reuses the "Gate A" / "Acceptance Authoring"
+    /// naming #1084 already established for the prereq blocks
+    /// (`append_gate_a_prereq_guidance_rows` /
+    /// `append_acceptance_authoring_prereq_guidance_rows` above) instead of
+    /// inventing new labels, and disambiguates multiple members' rows by
+    /// the member issue number.
+    #[test]
+    fn log_source_label_reuses_gate_a_and_acceptance_authoring_naming() {
+        let mut mock = _stage_assignment("mock-a", "mock-author", 100.0, "done");
+        mock.issue_number = 751;
+        assert_eq!(log_source_label(&mock), "Gate A");
+
+        let mut ta = _stage_assignment("ta-42", "test-author", 150.0, "done");
+        ta.issue_number = 751;
+        ta.for_issue_number = Some(42);
+        assert_eq!(log_source_label(&ta), "Acceptance Authoring #42");
+
+        let work = _stage_assignment("w1", "work", 100.0, "done");
+        assert_eq!(log_source_label(&work), "work");
+    }
+
+    /// End-to-end (event → dispatch → render): pressing a digit key on the
+    /// Log tab actually pins the picker, through the real `events.rs`
+    /// keybind — not just the underlying `pipeline_log_pinned_assignment`
+    /// state the unit tests above poke directly.
+    #[test]
+    fn tuidriver_log_tab_digit_key_pins_picker_to_gate_a() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_pipeline_app_for_prereq_test();
+        let mut gate_a = _stage_assignment("mock-a", "mock-author", 100.0, "done");
+        gate_a.issue_number = 751;
+        gate_a.machine = "tracking-host".to_string();
+        app.data.assignments.push(gate_a);
+
+        let mut ta42 = _stage_assignment("ta-42", "test-author", 150.0, "done");
+        ta42.issue_number = 751;
+        ta42.for_issue_number = Some(42);
+        ta42.machine = "member42-host".to_string();
+        app.data.assignments.push(ta42);
+
+        app.pipeline_sel = Some(0); // the tracking issue itself
+        app.pipeline_detail_tab = PipelineDetailTab::Log;
+        app.active_view = SidebarView::Pipeline;
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        assert!(
+            driver.screen_contains("member42-host"),
+            "sanity: newest-dispatched candidate (#42's test-author) auto-picked:\n{}",
+            driver.screen()
+        );
+
+        // Candidates sort newest-dispatched first: [ta-42 (150), mock-a
+        // (100)] — pressing 2 must pin to the second row (Gate A).
+        driver.type_char('2');
+        assert!(
+            driver.screen_contains("tracking-host"),
+            "pressing 2 must pin the Log tab to Gate A's session:\n{}",
+            driver.screen()
+        );
+    }
+
     // ── #200: Test gate ──────────────────────────────────────────────────────
 
     /// Build a pipeline app whose default gates include "test" (the production

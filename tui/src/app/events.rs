@@ -3018,6 +3018,39 @@ impl CoordApp {
                         needs_redraw = true;
                     }
 
+                    // ── 1-9 — pin the Log tab to a specific candidate
+                    // assignment (#2342). Only meaningful when the selected
+                    // issue has more than one candidate log source — e.g. a
+                    // milestone tracking issue carrying both a Gate A
+                    // `mock-author` row and several members' `test-author`
+                    // rows (see `log_candidates_for_issue`). With a single
+                    // candidate (the common case) the digit is a no-op, so
+                    // ordinary work/review/smoke/conflict-fix issues are
+                    // unaffected.
+                    Key::Char(c @ '1'..='9')
+                        if self.active_view == SidebarView::Pipeline
+                            && self.pipeline_detail_tab == PipelineDetailTab::Log =>
+                    {
+                        if let Some(issue) =
+                            self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i).cloned())
+                        {
+                            let idx = (*c as u8 - b'1') as usize;
+                            let target_id = self
+                                .log_candidates_for_issue(&issue)
+                                .get(idx)
+                                .map(|a| a.id.clone());
+                            if let Some(id) = target_id {
+                                self.pipeline_log_pinned_assignment
+                                    .insert(issue.number, id);
+                                // #2342: jump to the tail of the newly-picked
+                                // source's log, matching the sticky-to-bottom
+                                // default a freshly-opened Log tab starts at.
+                                self.pipeline_detail_scroll = usize::MAX;
+                                needs_redraw = true;
+                            }
+                        }
+                    }
+
                     // ── PageDown — scroll Log tab one page down (#307) ────
                     Key::Named(NamedKey::PageDown)
                         if self.active_view == SidebarView::Pipeline
