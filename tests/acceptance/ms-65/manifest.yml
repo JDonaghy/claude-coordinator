@@ -223,6 +223,66 @@ tests:
   # THIS IS THE GREEN CONTROL — see the `expected_red` block below.
   tabs_persistence_2286::a_missing_empty_or_malformed_tabs_json_starts_with_no_tabs: 2286
 
+  # ── #2288 (T-5) — side-by-side split, two tab groups in one panel (§9) ────
+  # Slice: board_split_2288.rs · mock: board-split-side-by-side.screen
+  # (plus board-tabs-help-overlay.screen for the one §8b "Split" clause §8b
+  # itself hands to §9 — see finding 18 below)
+  #
+  # §9 + #2288 AC 1 — `Ctrl-W v` yields two panes SIDE BY SIDE, proven by the
+  # grid: one `║` column spanning >=2 rows, strictly inside the main panel,
+  # with ink either side. This is contract Note 1's inverted-`SplitDirection`
+  # warning made executable.
+  board_split_2288::ctrl_w_v_splits_the_board_panel_into_two_panes_side_by_side: 2288
+  # §9 — "Each pane owns its own doc-tab strip": `×` on BOTH sides of the
+  # divider on the strip row
+  board_split_2288::each_split_pane_renders_its_own_document_tab_strip: 2288
+  # §9 — …and its own `Board / Issue / Chat / Terminal` sub-tab bar in the
+  # narrower rect (mock row 2 renders it twice)
+  board_split_2288::each_split_pane_renders_its_own_sub_tab_bar: 2288
+  # §9 — the panel toolbar is PANEL-scoped: its row carries no `║` and sits
+  # above the first divider row (mock row 0)
+  board_split_2288::the_panel_toolbar_spans_the_full_width_above_both_panes: 2288
+  # §9 — "The two panes' tab sets, active tabs and preview slots never merge"
+  # (side-agnostic: partition, one bracketed tab per pane, exactly one `∘`)
+  board_split_2288::the_two_panes_tab_sets_never_merge: 2288
+  # §9 — the mock's own left/right assignment, quoted verbatim in §9's prose.
+  # The ONE side-pinning id in this slice; see finding 19 below.
+  board_split_2288::the_split_renders_the_contracts_left_and_right_pane_content: 2288
+  # §9 — the split-pane label budget is its own pinned constant: 14 columns,
+  # NOT §2b's single-pane 20
+  board_split_2288::split_pane_tab_labels_truncate_at_fourteen_columns: 2288
+  # §9 + §1 — …and 16 for a preview tab (the same `+2` marker rule on the
+  # smaller base), NOT §2b's 22
+  board_split_2288::split_pane_preview_tab_labels_truncate_at_sixteen_columns: 2288
+  # §9 + #2288 AC 2 — an independent preview slot per pane: a click in the
+  # focused pane replaces ITS preview and leaves the other pane's alone
+  board_split_2288::each_pane_owns_its_own_preview_slot: 2288
+  # §9 key table — `Ctrl-W w` moves focus to the next pane, read through §2e
+  # rule 1's "the focused group's preview" (focus has no glyph of its own)
+  board_split_2288::ctrl_w_w_moves_focus_to_the_other_pane: 2288
+  # §9 Design + #2288 AC 3 — dragging the `║` divider resizes both panes and
+  # the content reflows (direction only; see finding 20)
+  board_split_2288::dragging_the_divider_resizes_both_panes_and_the_content_reflows: 2288
+  # #2288 AC 4 — closing the last tab in one pane collapses that pane back to
+  # a single-pane layout
+  board_split_2288::closing_the_last_tab_in_a_pane_collapses_back_to_a_single_pane: 2288
+  # §9 key table — `Ctrl-W x` closes the focused pane, leaving the OTHER
+  # pane's set whole and in order (side-agnostic)
+  board_split_2288::ctrl_w_x_closes_the_focused_pane: 2288
+  # §9 — "Closing the last remaining pane in a scope is a no-op (or disabled)
+  # — a scope always has >=1 pane". See finding 17 (the `Ctrl-W` collision).
+  board_split_2288::closing_the_last_remaining_pane_is_a_no_op: 2288
+  # §9 + #2288 AC 5 — "With one pane, rendering is BYTE-IDENTICAL to the
+  # non-split case", asserted as a split → collapse round trip so it cannot
+  # pass vacuously
+  board_split_2288::collapsing_a_split_restores_the_unsplit_rendering_byte_for_byte: 2288
+  # §9 — CONTROL: one pane is the default and `║` renders "only when a panel
+  # has >=2 panes". THIS IS THE GREEN CONTROL — see the `expected_red` block.
+  board_split_2288::a_single_pane_panel_renders_no_divider: 2288
+  # §8b's "Split" section — §9's four keys, rendered in #2287's overlay.
+  # Authored HERE because #2287's slice explicitly deferred it; see finding 18.
+  board_split_2288::help_overlay_lists_the_split_key_bindings: 2288
+
 # ── expected_red (#2164) ───────────────────────────────────────────────────
 # Hand-derived from a REAL run of the sealed suite against origin/main at the
 # time of authoring (`cd tui && cargo test --test acceptance --features
@@ -397,6 +457,51 @@ expected_red:
     - tabs_persistence_2286::pipeline_tabs_are_restored_to_the_pipeline_panel_with_its_own_active_tab
     - tabs_persistence_2286::a_document_whose_issue_is_absent_from_the_board_is_pruned_on_load
     - tabs_persistence_2286::pruning_the_active_document_activates_a_surviving_neighbour
+
+  # #2288 — OBSERVED, not intended. Taken from real runs of the sealed suite
+  # (`cd tui && RUSTC_BOOTSTRAP=1 cargo test --test acceptance --features
+  # test-support -- -Z unstable-options --format json`, the driver command in
+  # coordinator.yml) at authoring time: of this slice's 17 ids, the same 16
+  # FAILED and the same 1 passed on two consecutive FULL-suite runs and on two
+  # slice-filtered runs. Every one of the 16 died on a §9 clause, never on a
+  # harness precondition — verified by reading the panic line of each failure:
+  # 14 of them in `divider_col()`'s "no `║` is on the grid at all" assertion
+  # (i.e. `Ctrl-W v` does not split yet), one in
+  # `collapsing_a_split_restores_the_unsplit_rendering_byte_for_byte`'s own
+  # §9 split precondition, one in `closing_the_last_remaining_pane_is_a_no_op`'s
+  # §9 no-op assertion (it observed the bare `Ctrl-W` of finding 17 close a
+  # tab), and one in `help_overlay_lists_the_split_key_bindings` on the missing
+  # `Split` section — that last one got cleanly past its "Board — Help"
+  # precondition, so #2287's overlay chrome is already there and only §9's rows
+  # are absent. The suite's other 10 failures (audit_1039, plans_detail_1122,
+  # tabs_discoverability_2287, tabs_persistence_2286) are PRE-EXISTING and
+  # unchanged by this slice. The 1 that passed is deliberately ABSENT below:
+  #
+  #   * `a_single_pane_panel_renders_no_divider` — the CONTROL. Green today
+  #     (nothing paints `║`) and it must STAY green after #2288 lands: §9 pins
+  #     that the glyph renders "only when a panel has ≥2 panes" and that "one
+  #     pane is the default". An implementation that paints the `SplitTree`'s
+  #     divider unconditionally, or that seeds the Board with two leaves
+  #     because "the tree shape allows more later", satisfies every split test
+  #     above and breaks exactly this one. Listing it would make its inevitable
+  #     pass a HARD FAILURE.
+  2288:
+    - board_split_2288::ctrl_w_v_splits_the_board_panel_into_two_panes_side_by_side
+    - board_split_2288::each_split_pane_renders_its_own_document_tab_strip
+    - board_split_2288::each_split_pane_renders_its_own_sub_tab_bar
+    - board_split_2288::the_panel_toolbar_spans_the_full_width_above_both_panes
+    - board_split_2288::the_two_panes_tab_sets_never_merge
+    - board_split_2288::the_split_renders_the_contracts_left_and_right_pane_content
+    - board_split_2288::split_pane_tab_labels_truncate_at_fourteen_columns
+    - board_split_2288::split_pane_preview_tab_labels_truncate_at_sixteen_columns
+    - board_split_2288::each_pane_owns_its_own_preview_slot
+    - board_split_2288::ctrl_w_w_moves_focus_to_the_other_pane
+    - board_split_2288::dragging_the_divider_resizes_both_panes_and_the_content_reflows
+    - board_split_2288::closing_the_last_tab_in_a_pane_collapses_back_to_a_single_pane
+    - board_split_2288::ctrl_w_x_closes_the_focused_pane
+    - board_split_2288::closing_the_last_remaining_pane_is_a_no_op
+    - board_split_2288::collapsing_a_split_restores_the_unsplit_rendering_byte_for_byte
+    - board_split_2288::help_overlay_lists_the_split_key_bindings
 
 # ═══════════════════════════════════════════════════════════════════════════
 # FOR THE COORDINATOR — three findings from authoring this slice. None of them
@@ -824,3 +929,124 @@ expected_red:
 # on §6 Note 5's own authority ("the shape above is what `coord acceptance
 # author` will write fixtures against"; a deviation is "an amendment, not a
 # silent implementation choice").
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FOR THE COORDINATOR — findings from authoring the #2288 slice (contract §9).
+# Independent of the #2282 / #2283 / #2284 / #2285 / #2287 / #2286 notes above;
+# again, none is a worker's to fix by editing this suite, and none was resolved
+# by editing the contract (a test-author may not amend one).
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# 17. **§4's bare `Ctrl-W` and §9's `Ctrl-W <key>` leader chords COLLIDE on the
+#     same prefix, and the contract never says how they coexist.** §4 pins
+#     "`Ctrl-W` closes the active tab and activates a defined neighbour" — a
+#     shipped #2283 clause with its own sealed ids
+#     (`ctrl_w_closes_the_active_tab_and_activates_its_left_neighbour`,
+#     `ctrl_w_on_the_leftmost_tab_activates_the_new_leftmost`). §9's key table
+#     then pins `Ctrl-W v` / `Ctrl-W s` / `Ctrl-W w` / `Ctrl-W x` as pane
+#     chords "following this app's existing `Ctrl-W`-as-pane-leader convention
+#     already shipped for the Terminal panel". The two readings are mutually
+#     exclusive as stated:
+#
+#       (a) If `Ctrl-W` closes immediately, it swallows §9's chords — measured:
+#           `closing_the_last_remaining_pane_is_a_no_op` observed the shipped
+#           app close `#102` on the `Ctrl-W` and drop the `x`, which is exactly
+#           the failure mode a worker will hit first.
+#       (b) If `Ctrl-W` enters a pending-leader state, §4's close is delayed
+#           until the next keystroke, which #2283's two ids may or may not
+#           tolerate depending on how they were written (this slice has not
+#           read them).
+#
+#     A third reading — pending-leader, and any key that is NOT one of
+#     `v`/`s`/`w`/`x` falls through to §4's close plus that key — satisfies
+#     both sections, but the contract does not name it and a worker should not
+#     have to invent it. **This is a Gate-A amendment, not a worker decision.**
+#     This slice sends §9's chords as written and asserts §9's outcomes; it
+#     deliberately does NOT re-assert §4's bare-`Ctrl-W` behaviour (that is
+#     #2283's slice's subject, and taking a side here would pin one of the two
+#     readings). Flagged as a `TODO(test-author)` in the slice too.
+#
+# 18. **§8b's "Split" section of the `?` help overlay was owned by NOBODY, so
+#     one id for it is authored in THIS slice.** §8b pins the overlay as having
+#     two sections — "Document tabs" and "Split (§9's four keys)" — and
+#     `mocks/board-tabs-help-overlay.screen` rows 11–15 render `Split`,
+#     `Ctrl-W v  split right`, `Ctrl-W s  split down`, `Ctrl-W w  next pane`,
+#     `Ctrl-W x  close pane`. #2287's author deliberately left them out and
+#     said so (finding 14 above, and a closing `TODO(test-author)` in their
+#     slice): the split keys are §9's, and asserting them under #2287 would
+#     gate that issue's acceptance run on a later issue's surface.
+#     `help_overlay_lists_the_split_key_bindings` closes the hole from the
+#     other side — it is a §9 fact rendered in a #2287 surface. Two
+#     consequences the coordinator should know: (a) #2288's acceptance run now
+#     depends on #2287's overlay chrome existing, which the work order already
+#     guarantees (#2287 precedes #2288) and which the authoring run confirmed
+#     is already shipped — the id got past its "Board — Help" precondition and
+#     failed only on the missing `Split` section; (b) it asserts the `Ctrl-W s`
+#     help ROW, not that the chord does anything, because §9 Note 2 pins that
+#     key as a reserved forward-compatibility placeholder ms-65 must NOT
+#     implement.
+#
+# 19. **§9 never states which pane holds focus after `Ctrl-W v`.** The mock
+#     settles it implicitly — `mocks/board-split-side-by-side.screen` puts the
+#     two pinned tabs on the LEFT and the post-split single click's preview on
+#     the RIGHT, and §2e rule 1 opens a preview in the *focused* group, so the
+#     new (right) pane must have received focus. That inference is load-bearing
+#     for the whole slice, so it is confined to ONE id
+#     (`the_split_renders_the_contracts_left_and_right_pane_content`): every
+#     other test here is deliberately side-agnostic (it asserts the partition,
+#     never which half is which), so if the intended behaviour is "focus stays
+#     in the original pane" exactly one id is wrongly red instead of nine. If
+#     the mock's assignment is authoritative, §9's prose should say so; if it
+#     is not, that id wants regenerating along with the mock.
+#
+# 20. **§9 pins no resize arithmetic for the divider drag.** #2288's AC 3
+#     ("Dragging the divider resizes both panes and the content reflows") and
+#     §9's Design bullet ("Divider drag resizes") name the gesture but no
+#     minimum pane width, no snapping rule, and no cells-per-column mapping —
+#     while §9's prose elsewhere calls the divider's position "a fixed column".
+#     `dragging_the_divider_resizes_both_panes_and_the_content_reflows`
+#     therefore asserts only what IS pinned: the divider moves in the drag's
+#     direction, it remains a single vertical divider, and both panes still
+#     render their own strip (i.e. the content reflowed rather than a pane
+#     being clipped away). Inventing a landing column would have meant
+#     inventing behaviour. Also a `TODO(test-author)` in the slice.
+#
+# 21. **`mocks/board-split-side-by-side.screen`'s status bar CONTRADICTS §8a's
+#     pinned hint string.** §8a pins, as an exact substring "taken verbatim
+#     from the issue body", `click=preview  dbl-click=pin  ctrl-w=close
+#     ctrl-tab=next`, and #2287's slice asserts it literally. The split mock's
+#     row 39 instead reads `click=preview  dbl-click=pin  ctrl-w v/s=split
+#     ctrl-w w=next pane  q=quit` — it DROPS `ctrl-w=close` and `ctrl-tab=next`
+#     and adds two split segments. §9 pins no status-bar string of its own, so
+#     asserting the mock's row would contradict #2287's sealed id and
+#     asserting §8a's would contradict the mock. **No status-bar clause is
+#     authored in this slice for that reason.** If the split state is meant to
+#     re-word the hint, §8a needs an amendment saying so (and #2287's
+#     `status_bar_tab_hint_is_the_contracts_verbatim_string` would need a
+#     precondition of "no split"); if the mock is wrong, it wants regenerating.
+#     Either way it is a Gate-A call, and a worker who takes the mock literally
+#     will red an already-sealed #2287 id.
+#
+# 22. §9 says nothing about what a NEWLY created pane holds at the instant
+#     `Ctrl-W v` returns — an empty tab set, a copy of the focused document
+#     (vim's split semantics), or the moved active tab. The mock only shows the
+#     state after a subsequent single click, which every one of those readings
+#     can reach. No test asserts the new pane's initial contents; every fixture
+#     here opens a tab in the new pane before reading it. Also a
+#     `TODO(test-author)` in the slice.
+#
+# Also worth knowing, not a contract problem: (a) the split is asserted on the
+# BOARD panel only — §9's "per-pane-within-scope" implies Pipeline splits too,
+# but the contract names no Pipeline split mock and finding 7 above (the #2284
+# author's) documents a live fixture-wipe blocker on entering Pipeline from
+# this external test crate. (b) Orientation is proved structurally rather than
+# by any enum: `divider_col()` requires every `║` on the grid to share ONE
+# column across ≥2 rows and to sit strictly inside §0's main-panel span
+# (columns 38–119). A `SplitDirection` mix-up (contract Note 1 / #2288's own
+# ⚠) either paints no `║` or paints a horizontal run of them, and both die
+# there with a message naming the inversion — this is the one place the
+# milestone's headline trap is actually caught. (c) The mock puts the divider
+# at column 78, i.e. a 40-column left pane and a 41-column right one, matching
+# §9's "roughly 40 columns of content width"; the slice asserts the divider is
+# strictly interior, not that exact column, since §9 pins the 14/16 label
+# budget but never the 50/50 default as a testable number.
