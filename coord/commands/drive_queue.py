@@ -727,8 +727,22 @@ def drive_queue_list(repo: str | None, output_json: bool, config_path: Path) -> 
         # #2230: independent of the `after=` diagnosis above (most `blocked`
         # rows have no `after=` at all — they blocked on attempts, not a
         # pre-req), so gated on the row's OWN state and cause, not `diagnosed`.
-        if entry.state == STATE_BLOCKED and not is_permanent_block_reason(
-            entry.last_reason
+        #
+        # #2404 review: EXCLUDE the unsatisfiable-`after=`-pre-req shape
+        # `_BLOCKED_AFTER_NOTE` above already covers. #2230's sweep
+        # (`_blocked_gate_reading`) returns `None` — "no evidence" — for an
+        # entry that never reached the merge queue at all, which is exactly
+        # what a purely `after=`-caused block is; showing this note there
+        # would stack two auto-recheck notes citing two different issue
+        # numbers under one row, one of which has nothing to say about that
+        # row's actual cause. `is_permanent_block_reason` rows already skip
+        # this note on their own; this adds the sibling exclusion so the two
+        # notes stay mutually exclusive, matching what each mechanism can
+        # actually promise for a given row.
+        if (
+            entry.state == STATE_BLOCKED
+            and not is_permanent_block_reason(entry.last_reason)
+            and not is_unsatisfiable_prereq_reason(entry.last_reason)
         ):
             click.echo(f"      {_BLOCKED_GATE_NOTE}")
         for line in _hold_lines(entry):
