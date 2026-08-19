@@ -1573,7 +1573,16 @@ def test_a_dispatched_run_that_died_later_gets_the_plain_backoff_only():
 def test_exhausted_reason_names_a_dispatch_only_failure():
     """The give-up escalation text itself must say "no assignment" plainly —
     the point of #2273 direction 3 is that a human reading it does not need
-    to reconstruct that from a bare exit code."""
+    to reconstruct that from a bare exit code.
+
+    No `exit_reasons` entry is supplied here, so `own_reason` is empty —
+    this is the #2442 reap shape (a killed/crashed session, not a clean
+    exit): the note must name the effect ("no assignment was ever created")
+    without asserting the unknowable cause. See
+    `test_exhausted_dispatch_only_with_own_reason_still_names_infra_failure`
+    for the sibling case where `own_reason` IS present and the confident
+    "likely an infrastructure/dispatch-layer failure" wording is still
+    correct."""
     entries = [
         entry(
             1650,
@@ -1586,7 +1595,38 @@ def test_exhausted_reason_names_a_dispatch_only_failure():
     view = BoardView(issues={entry_key(REPO, 1650): facts})
     plan = plan_tick(entries, view, capacity=1, now=NOW)
     assert plan.reconciles[0].outcome == "exhausted"
-    assert "no assignment was ever created for this run" in plan.blocked[0].reason
+    reason = plan.blocked[0].reason
+    assert "no assignment was ever created for this run" in reason
+    assert "the session left no exit reason to diagnose why" in reason
+    assert "infrastructure/dispatch-layer failure" not in reason
+
+
+def test_exhausted_dispatch_only_with_own_reason_still_names_infra_failure():
+    """#2442 sibling: when `own_reason` IS present (a clean exit, not a
+    reap) and it does not name a merge-gate block, the confident "likely an
+    infrastructure/dispatch-layer failure" wording is still correct — only
+    the reap-without-exit-reason case (no `own_reason` at all) gets the
+    softened wording."""
+    entries = [
+        entry(
+            1650,
+            state=STATE_RUNNING,
+            attempts=DEFAULT_MAX_ATTEMPTS - 1,
+            launched_at=NOW - DRIVE_STARTUP_GRACE_SECONDS - 1,
+        )
+    ]
+    own_reason = "drive exited for claude-coordinator#1650 (exit_code=1): boom"
+    facts = IssueFacts(known=True, issue_state="open")
+    view = BoardView(issues={entry_key(REPO, 1650): facts})
+    plan = plan_tick(
+        entries, view, capacity=1, now=NOW,
+        exit_reasons={entry_key(REPO, 1650): own_reason},
+    )
+    assert plan.reconciles[0].outcome == "exhausted"
+    reason = plan.blocked[0].reason
+    assert "no assignment was ever created for this run" in reason
+    assert "likely an infrastructure/dispatch-layer failure" in reason
+    assert "left no exit reason to diagnose why" not in reason
 
 
 def test_exhausted_merge_gate_block_does_not_get_the_dispatch_note():

@@ -2558,12 +2558,34 @@ def _reconcile_running(
     dispatch_only = _dispatch_produced_nothing(
         entry, facts
     ) and not _is_merge_gate_block_reason(own_reason)
-    dispatch_note = (
-        " — no assignment was ever created for this run (#2273): likely an "
-        "infrastructure/dispatch-layer failure, not a code defect"
-        if dispatch_only
-        else ""
-    )
+    if not dispatch_only:
+        dispatch_note = ""
+    elif own_reason:
+        # A clean exit that still names no assignment — `own_reason` is
+        # present and already ruled out as a merge-gate block above, so the
+        # confident diagnosis is warranted: the drive itself narrated a
+        # death, and that death happened before `coord assign` ever ran.
+        dispatch_note = (
+            " — no assignment was ever created for this run (#2273): likely "
+            "an infrastructure/dispatch-layer failure, not a code defect"
+        )
+    else:
+        # #2442: a REAP, not a clean exit — the session was killed/crashed
+        # and left no `own_reason` text at all, so there is nothing for
+        # `_is_merge_gate_block_reason` to match against. That is not
+        # evidence the cause WAS a dispatch failure; it just means this
+        # branch has no way to rule one in or out. #2286 is the live
+        # escalation this produced: a session parked 2.3h inside a
+        # legitimate, already-diagnosed JIT-slice wait loop (#2426/#2437)
+        # looked, to `_dispatch_produced_nothing` alone, identical to one
+        # that never got dispatched — and got the same confident-but-wrong
+        # "infrastructure/dispatch-layer failure" wording #2424 already
+        # established was unreliable for the merge-gate case. Name the
+        # effect (no assignment) without asserting the unknowable cause.
+        dispatch_note = (
+            " — no assignment was ever created for this run (#2273), and "
+            "the session left no exit reason to diagnose why"
+        )
 
     # #2363: the "claimed success, wrote nothing" signature gets a WIDER
     # ceiling than every other death reason — see `EMPTY_BRANCH_MAX_ATTEMPTS`
