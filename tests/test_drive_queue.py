@@ -1768,6 +1768,188 @@ def test_finished_with_no_branch_reason_is_not_classified_as_empty_branch_death(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# #2411: `last_reason` must not go blind mid-backoff. Before this fix,
+# `_backoff_reason` (`plan_tick`'s waiting walk) persisted `_retry_backoff_
+# reason`'s purely mechanical "next attempt permitted in Ns" sentence as the
+# entry's WHOLE `last_reason` on every tick spent backing off — overwriting
+# the real death cause `_reconcile_running`'s `retry` branch had just
+# recorded, visible for exactly one tick and then gone. An entry stuck
+# backing off on a widened #2363 empty-branch budget (claude-coordinator
+# #2005's own repro) could burn most of its 6-attempt ceiling with `coord
+# drive-queue list` showing nothing but spacing text the whole time.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def test_augment_backoff_reason_keeps_the_first_line_of_the_previous_reason():
+    """Direct unit test of the combinator: the real cause leads, the fresh
+    backoff sentence follows on its own line."""
+    from coord.drive_queue import _augment_backoff_reason
+
+    combined = _augment_backoff_reason(
+        "work api#1650 exited ADVISORY with no commits on its branch — "
+        "nothing was pushed (attempt 1/6) — requeued at position 3",
+        "retry backoff: the previous attempt failed 5s ago, next attempt "
+        "permitted in 55s (60s spacing after 1 attempt(s) — #2273, so a "
+        "transient dispatch failure cannot spend the whole retry budget "
+        "inside one tick cadence)",
+    )
+    lines = combined.splitlines()
+    assert len(lines) == 2
+    assert lines[0] == (
+        "work api#1650 exited ADVISORY with no commits on its branch — "
+        "nothing was pushed (attempt 1/6) — requeued at position 3"
+    )
+    # 3-space continuation indent, matching `coord/drive.py`'s own
+    # multi-line exit reasons.
+    assert lines[1].startswith("   retry backoff:")
+
+
+def test_augment_backoff_reason_is_idempotent_across_repeated_calls():
+    """#2411's anti-growth property: feeding a PREVIOUS combined (two-line)
+    result back in as *previous_reason* — exactly what happens tick over
+    tick, since the combined text is what gets persisted to `last_reason` —
+    must not accumulate a third line. The base line the second call reads
+    back out has to be the ORIGINAL cause, not the first call's backoff
+    sentence."""
+    from coord.drive_queue import _augment_backoff_reason
+
+    first = _augment_backoff_reason(
+        "own cause here", "retry backoff: attempt 1 text"
+    )
+    second = _augment_backoff_reason(first, "retry backoff: attempt 1 text, later")
+    assert second.splitlines() == [
+        "own cause here",
+        "   retry backoff: attempt 1 text, later",
+    ]
+
+
+def test_augment_backoff_reason_falls_back_to_the_backoff_text_alone():
+    """No prior reason to keep (a fresh row, or one hand-built in a test,
+    same as `entry()`'s `last_reason=""` default) — degrades to exactly the
+    pre-#2411 text."""
+    from coord.drive_queue import _augment_backoff_reason
+
+    assert _augment_backoff_reason("", "retry backoff: ...") == "retry backoff: ..."
+    assert (
+        _augment_backoff_reason("   \n  ", "retry backoff: ...")
+        == "retry backoff: ..."
+    )
+
+
+def test_a_dead_drives_own_reason_survives_into_the_same_ticks_backoff():
+    """A death and its backoff check can land in the SAME tick (a `running`
+    entry reconciled straight to `waiting` in step 1, then walked for backoff
+    in step 4 — see `test_a_dead_drive_with_a_real_clock_paces_its_next_
+    attempt_2273`). The `own_reason` `_reconcile_running` just recorded must
+    already be in the deferral's reason, not just on the NEXT tick — this is
+    what `effective_last_reason` (the same "prefer this tick's fresh write"
+    trick `effective_attempts`/`retry_backoff_at_map` already use) is for."""
+    entries = [
+        entry(
+            1650,
+            position=3,
+            state=STATE_RUNNING,
+            attempts=0,
+            launched_at=NOW - DRIVE_STARTUP_GRACE_SECONDS - 1,
+        )
+    ]
+    own_reason = (
+        "work api#1650 exited ADVISORY with no commits on its branch — "
+        "nothing was pushed"
+    )
+    plan = plan_tick(
+        entries, board(), capacity=1, now=NOW,
+        exit_reasons={entry_key(REPO, 1650): own_reason},
+    )
+    assert plan.reconciles[0].outcome == "retry"
+    assert plan.launch is None
+    backoff = [d for d in plan.deferrals if d.key == entry_key(REPO, 1650)]
+    assert len(backoff) == 1 and backoff[0].backing_off is True
+    assert own_reason in backoff[0].reason
+    assert "retry backoff" in backoff[0].reason
+    # The persisted write carries the same combined text an operator would
+    # see on the next `coord drive-queue list` — the whole point of #2411.
+    assert own_reason in backoff[0].updates["last_reason"]
+
+
+def test_the_real_death_cause_survives_multiple_backoff_ticks_2411():
+    """The full incident repro: an empty-branch death (#2363's widened
+    budget — claude-coordinator#2005's own shape) sits `waiting` across
+    SEVERAL ticks of backoff. Every tick's `last_reason` must still name the
+    real cause on its first line — not just the tick that recorded the
+    death — and the text must never grow past two lines."""
+    own_reason = (
+        "acceptance author api#42 exited DONE, but its branch carries no "
+        "commits — nothing was authored, so there is no slice to land"
+    )
+    launched_at = NOW - DRIVE_STARTUP_GRACE_SECONDS - 1
+    entries = [
+        entry(
+            1650,
+            position=3,
+            state=STATE_RUNNING,
+            attempts=0,
+            launched_at=launched_at,
+        )
+    ]
+    # No board-visible assignment (`last_dispatched_at` unset) — the #2273
+    # dispatch-only tier, so the backoff floor is
+    # DISPATCH_FAILURE_MIN_BACKOFF_SECONDS (300s), comfortably wider than
+    # the plain RETRY_BACKOFF_SECONDS[0] (60s) this test's tick spacing
+    # would otherwise outrun.
+    facts = IssueFacts(known=True, issue_state="open")
+    view = BoardView(issues={entry_key(REPO, 1650): facts})
+
+    # Tick 1: the death itself. Not yet backing off (retry_backoff_at == now
+    # == age 0), so this only pins the recorded reason.
+    plan = plan_tick(
+        entries, view, capacity=1, now=NOW,
+        exit_reasons={entry_key(REPO, 1650): own_reason},
+    )
+    reconcile = plan.reconciles[0]
+    assert reconcile.outcome == "retry"
+    assert own_reason in reconcile.updates["last_reason"]
+    # The FULL death-tick reason (own_reason plus the #2273/#2363 notes
+    # `_reconcile_running` appends) — this, not the bare `own_reason`, is
+    # what every later backoff tick's first line must keep verbatim.
+    death_reason = reconcile.updates["last_reason"]
+    assert "#2363" in death_reason  # sanity: this IS the widened-budget shape
+    live = entry(
+        1650,
+        position=3,
+        state=STATE_WAITING,
+        attempts=reconcile.updates["attempts"],
+        launched_at=launched_at,
+        last_reason=reconcile.updates["last_reason"],
+        retry_backoff_at=reconcile.updates["retry_backoff_at"],
+    )
+
+    # Several later ticks, comfortably inside the widened dispatch-failure
+    # backoff floor (DISPATCH_FAILURE_MIN_BACKOFF_SECONDS == 300s — no
+    # board-visible assignment was ever created for this synthetic entry).
+    for tick_now in (NOW + 30, NOW + 90, NOW + 200):
+        plan = plan_tick([live], view, capacity=1, now=tick_now)
+        assert plan.launch is None
+        backoff = [d for d in plan.deferrals if d.key == entry_key(REPO, 1650)]
+        assert len(backoff) == 1 and backoff[0].backing_off is True
+        reason = backoff[0].updates["last_reason"]
+        lines = reason.splitlines()
+        assert len(lines) == 2, f"expected exactly 2 lines, got: {lines!r}"
+        assert lines[0] == death_reason
+        assert lines[1].strip().startswith("retry backoff:")
+        live = entry(
+            1650,
+            position=3,
+            state=STATE_WAITING,
+            attempts=live.attempts,
+            launched_at=live.launched_at,
+            retry_backoff_at=live.retry_backoff_at,
+            deferrals=live.deferrals + 1,
+            last_reason=reason,
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # #1891: `parked` — a CI verdict that has not arrived must not consume merge
 # budget. Same "no session, no active work, nothing landed" evidence as
 # `retry`/`exhausted`, but the board's OWN current read of the issue names

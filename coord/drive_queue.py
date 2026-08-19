@@ -1920,6 +1920,51 @@ def _retry_backoff_reason(
     )
 
 
+def _augment_backoff_reason(previous_reason: str, backoff_text: str) -> str:
+    """#2411: fold the real death cause into the mechanical backoff text.
+
+    Before this, `plan_tick`'s waiting walk persisted `_retry_backoff_reason`'s
+    return value as the entry's WHOLE `last_reason` on every tick it spent
+    backing off — the purely mechanical "next attempt permitted in Ns"
+    sentence, deliberately recomputed fresh each tick (see that function's
+    docstring). That overwrote the rich `own_reason` (plus the #2273
+    dispatch note and #2363 empty-branch note) `_reconcile_running`'s
+    `retry` branch had just recorded at the moment of death — visible for
+    exactly one tick, then gone. An operator reading `coord drive-queue
+    list` — or anything else that reads `last_reason`, like `coord
+    drive-queue diagnose` — saw only the spacing text and had no live way to
+    tell WHY the entry kept dying, only that it would try again later.
+
+    Fix: keep the FIRST LINE of whatever reason is already on record — the
+    real cause, written once at death — and put the fresh backoff sentence
+    on a second line under it. `last_reason` was already documented as
+    "possibly multi-line" (see `_ROW_CAUSE_MAX_CHARS`'s comment in
+    `coord.commands.drive_queue`) precisely so a summary render can show
+    line one on the row and the full text on the `last:` continuation line
+    — this reuses that convention rather than inventing a new field or
+    column.
+
+    Using only the first line (not the full previous text) keeps this
+    idempotent across ticks: called again next tick against ITS OWN
+    two-line output, the first line is still the original cause, never
+    last tick's backoff sentence, so the stored text never grows past two
+    lines no matter how many ticks the entry spends backing off.
+
+    Falls back to *backoff_text* alone when there is nothing to keep — a
+    row with no prior `last_reason` (a fresh entry, or one hand-built in a
+    test) — which is exactly today's pre-#2411 text for that case.
+    """
+    stripped = previous_reason.strip()
+    if not stripped:
+        return backoff_text
+    base = stripped.splitlines()[0]
+    # 3-space continuation indent — the same convention `coord/drive.py`'s
+    # own multi-line exit reasons already use for their "inspect: coord log
+    # ..." follow-up lines, so a combined reason reads as one paragraph
+    # rather than a mismatched second line flush against the left margin.
+    return f"{base}\n   {backoff_text}"
+
+
 def _reconcile_running(
     entry: QueueEntry,
     board: BoardView,
@@ -3054,6 +3099,15 @@ def plan_tick(
     # this falls back to (the post-review #2273 "moving target" fix).
     effective_attempts: dict[str, int] = {e.key: e.attempts for e in ordered}
     retry_backoff_at_map: dict[str, float] = {}
+    # #2411: same "prefer this tick's fresh write" rule, this time for the
+    # real death cause `_backoff_reason` below folds into its combined
+    # `last_reason` — see `_augment_backoff_reason`. Without this, an entry
+    # that dies and hits the backoff check in the SAME tick (step 1 above,
+    # then step 4 below) would combine against its STALE pre-tick
+    # `entry.last_reason` — one tick behind the death this walk just
+    # recorded — instead of the `own_reason`-based text `reconcile.reason`
+    # carries fresh, right below.
+    effective_last_reason: dict[str, str] = {e.key: e.last_reason for e in ordered}
 
     reconciles: list[Reconcile] = []
     blocked: list[Blocked] = []
@@ -3112,6 +3166,14 @@ def plan_tick(
             # for a backoff check reached later in this SAME tick, not the
             # entry's stale pre-tick `retry_backoff_at`.
             retry_backoff_at_map[entry.key] = now
+        if reconcile.outcome == "retry":
+            # #2411: `reconcile.reason` IS `reconcile.updates["last_reason"]`
+            # (the retry branch of `_reconcile_running` builds both from the
+            # same local `reason`) — the real death cause, `own_reason` plus
+            # its #2273 dispatch-note/#2363 empty-branch-note. Recorded here
+            # so a backoff check reached later in THIS tick combines against
+            # it instead of the pre-tick `entry.last_reason`.
+            effective_last_reason[entry.key] = reconcile.reason
         if block is not None:
             blocked.append(block)
             states[entry.key] = STATE_BLOCKED
@@ -3535,14 +3597,25 @@ def plan_tick(
         see that function's docstring for why neither can be read straight
         off `candidate`, and why the fallback is `candidate.retry_backoff_at`
         rather than `candidate.reason_at`.
+
+        #2411: the mechanical spacing text that comes back is never returned
+        bare — :func:`_augment_backoff_reason` folds in the real death cause
+        (resolved the same "prefer this tick's fresh write" way, off
+        `effective_last_reason`) so both call sites below — the report-only
+        dry-run pass and the persisted `last_reason` write — get the combined
+        text for free, with no change needed at either site.
         """
-        return _retry_backoff_reason(
+        backoff = _retry_backoff_reason(
             candidate,
             board.facts(candidate.key),
             now,
             effective_attempts.get(candidate.key, candidate.attempts),
             retry_backoff_at_map.get(candidate.key, candidate.retry_backoff_at),
         )
+        if not backoff:
+            return ""
+        previous = effective_last_reason.get(candidate.key, candidate.last_reason)
+        return _augment_backoff_reason(previous, backoff)
 
     # #1972's projection of per-repo occupancy AS THE WALK SEES IT: the board
     # reading above, plus this tick's own launch once one is chosen.  Kept
