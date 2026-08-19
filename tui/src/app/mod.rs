@@ -3717,6 +3717,11 @@ impl CoordApp {
             // first `apply_pending_data` tick lands (see there for why an
             // empty-data tick must not stomp this).
             workspace: Workspace::load(),
+            // #2286 (ms-65 §6): same story as `workspace` above — reload
+            // whatever was persisted, unpruned, until `sync_doc_tabs()`
+            // (called alongside `sync_workspace_repos()` from
+            // `apply_pending_data`) reconciles it against the first real
+            // board data.
             active_view: SidebarView::default(),
             board_sidebar: sidebar,
             board_repo_names: Vec::new(),
@@ -3735,7 +3740,7 @@ impl CoordApp {
             board_milestone_expanded: std::collections::HashMap::new(),
             board_epic_expanded: std::collections::HashMap::new(),
             board_epic_row_keys: std::collections::HashMap::new(),
-            doc_tabs: DocTabs::default(),
+            doc_tabs: DocTabs::load(),
             board_section_rows: Vec::new(),
             board_tree_hidden_above: std::collections::HashMap::new(),
             last_sidebar_geom: std::cell::Cell::new(None),
@@ -5472,6 +5477,10 @@ impl CoordApp {
                 // derives a first-run default) — see `sync_workspace_repos`
                 // in `app/workspace.rs`.
                 self.sync_workspace_repos();
+                // #2286 (ms-65 §6): same reconciliation for the persisted
+                // doc-tab sets — drop any tab whose issue this tick doesn't
+                // know about. See `Self::sync_doc_tabs`.
+                self.sync_doc_tabs();
                 // #486: the Pipeline now sources its issue list from the same
                 // DB cache the Board uses (data.open_issues), rebuilt on every
                 // data tick — no live gh search.  Capture the selection first so
@@ -6864,6 +6873,52 @@ impl CoordApp {
         }
     }
 
+    // ── #2286 (ms-65 §6): persist doc tabs to `~/.coord/tabs.json` ──────
+
+    /// #1326-style reconciliation for the persisted doc-tab sets — called
+    /// from `apply_pending_data` right after `sync_workspace_repos()`, once
+    /// per real data tick. `CoordApp::new()` seeds `doc_tabs` from whatever
+    /// was on disk, unpruned (the board hasn't loaded yet at that point);
+    /// this is what drops any tab whose issue this tick doesn't know about,
+    /// mirroring `sync_workspace_repos`'s own "reconcile against what the
+    /// board just confirmed exists" shape.
+    ///
+    /// Persists only when something actually changed, exactly like
+    /// `sync_workspace_repos` — most ticks reconcile to a no-op once the
+    /// first one has run.
+    fn sync_doc_tabs(&mut self) {
+        let known = doc_tabs::known_doc_keys(&self.data);
+        let before = self.doc_tabs.clone();
+        self.doc_tabs.retain_known(&known);
+        if self.doc_tabs != before {
+            self.persist_doc_tabs();
+        }
+    }
+
+    /// Persist the current doc-tab sets to `~/.coord/tabs.json` if that file
+    /// already exists (contract §6) — see [`doc_tabs::DocTabs::save_if_exists`]
+    /// for why this deliberately never CREATES the file. Called from every
+    /// mutator that changes a tab set's shape (open/pin/activate/close/…,
+    /// both scopes) and from `sync_doc_tabs`'s reconciliation. Errors are
+    /// surfaced as a stderr line rather than a panic or toast, matching
+    /// `Self::persist_workspace`: the TUI must keep working even when
+    /// `~/.coord` is unwritable, it just won't remember tabs next launch.
+    fn persist_doc_tabs(&self) {
+        if let Err(e) = self.doc_tabs.save_if_exists() {
+            eprintln!("coord-tui: failed to persist doc tabs: {e}");
+        }
+    }
+
+    /// Persist the current doc-tab sets to `~/.coord/tabs.json`
+    /// unconditionally, creating the file if this is the very first time
+    /// (contract §6). Called exactly once, on the way out — see
+    /// `ShellApp::handle`'s `Reaction::Exit` hook in `render.rs`.
+    fn persist_doc_tabs_on_exit(&self) {
+        if let Err(e) = self.doc_tabs.save() {
+            eprintln!("coord-tui: failed to persist doc tabs: {e}");
+        }
+    }
+
     // ── #2282 (ms-65 §2): Board document tabs ────────────────────────────
 
     /// The Board panel's document-tab set.
@@ -6948,6 +7003,7 @@ impl CoordApp {
             self.reveal_board_active_doc();
             self.restore_detail_sub_state(PanelScope::Board);
         }
+        self.persist_doc_tabs();
     }
 
     /// Activate the Board tab at strip index `idx` (a click on the strip
@@ -6972,6 +7028,7 @@ impl CoordApp {
         // tree. Gating on `changed` would make that click a silent no-op.
         self.reveal_board_active_doc();
         self.restore_detail_sub_state(PanelScope::Board);
+        self.persist_doc_tabs();
         true
     }
 
@@ -7009,6 +7066,7 @@ impl CoordApp {
             self.reveal_board_active_doc();
             self.restore_detail_sub_state(PanelScope::Board);
         }
+        self.persist_doc_tabs();
         true
     }
 
@@ -7061,6 +7119,7 @@ impl CoordApp {
             self.reveal_board_active_doc();
             self.restore_detail_sub_state(PanelScope::Board);
         }
+        self.persist_doc_tabs();
         true
     }
 
@@ -7076,6 +7135,7 @@ impl CoordApp {
             self.reveal_board_active_doc();
             self.restore_detail_sub_state(PanelScope::Board);
         }
+        self.persist_doc_tabs();
         true
     }
 
@@ -7084,7 +7144,11 @@ impl CoordApp {
     /// slot. Never moves the active tab or reorders the strip (unlike
     /// open/close), so no reveal / sub-state restore is needed.
     fn promote_board_doc_tab(&mut self, idx: usize) -> bool {
-        self.doc_tabs.group_mut(PanelScope::Board).promote(idx)
+        let changed = self.doc_tabs.group_mut(PanelScope::Board).promote(idx);
+        if changed {
+            self.persist_doc_tabs();
+        }
+        changed
     }
 
     /// Contract §2f — reveal-on-activate.

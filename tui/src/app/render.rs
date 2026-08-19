@@ -693,7 +693,18 @@ impl ShellApp for CoordApp {
         backend: &mut dyn Backend,
         ctx: &ShellContext,
     ) -> Reaction {
-        self.dispatch_handle(event, backend, ctx)
+        let reaction = self.dispatch_handle(event, backend, ctx);
+        // #2286 (ms-65 §6): unconditionally flush doc tabs on the way out —
+        // exactly once, regardless of which of the several `Reaction::Exit`
+        // call sites in `events.rs` (plain `q`/Esc, the force-quit confirm
+        // dialog's key or mouse-click path) fired. This is what CREATES
+        // `~/.coord/tabs.json` the first time; every tab mutator's own
+        // `persist_doc_tabs()` call only ever UPDATES it once it exists (see
+        // `doc_tabs::DocTabs::save_if_exists`'s doc comment for why).
+        if matches!(reaction, Reaction::Exit) {
+            self.persist_doc_tabs_on_exit();
+        }
+        reaction
     }
 
     /// Sync `active_view` when the shell switches panels via activity bar click.
