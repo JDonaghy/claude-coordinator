@@ -396,6 +396,22 @@ class DriveCounters:
     # overwhelming majority of drives — non-oracle ones — never allocate it,
     # and `--dry-run`'s counter snapshot stays unchanged for them.
     acceptance: "DriveCounters | None" = None
+    # #2416: bounded retry for an ADVISORY work row whose branch carries zero
+    # commits — `_decide_advisory`'s dead-end signature. Before this, that
+    # branch went straight to `_die()` on every observation, so the only
+    # thing that could ever supersede the terminal row was a human running
+    # `coord retry <aid>` by hand (`coord diagnose --stage work --reset` is
+    # NOT the escape hatch here — it never sets `needs_reset` for this
+    # shape). `drive-queue`'s own automatic retry does not take that path
+    # either: it just relaunches a brand new `coord drive` process, which
+    # re-observes the SAME terminal row and dies again in seconds, burning a
+    # queue attempt+backoff cycle for nothing (coord-portal#119, drive-queue
+    # entry 432). Bounded the same way `work_retries` is (`opts.
+    # max_work_retries`) so a genuinely unactionable row (the issue's real
+    # resolution is a sibling task, not another attempt) still reaches a
+    # terminal `_die()` — never an unbounded loop — once the budget is
+    # spent.
+    advisory_retries: int = 0
 
     def slice_budget(self) -> "DriveCounters":
         """This run's slice-landing budget, created on first use (#2079)."""
@@ -1603,8 +1619,15 @@ def decide(
     if state.work_status == "done":
         pass
     elif state.work_status == "advisory":
-        advisory = _decide_advisory(state, opts, machine, verifier)
-        if advisory.is_exit:
+        advisory = _decide_advisory(state, opts, counters, machine, verifier)
+        # #2416: `_decide_advisory` now returns a RUN action (a bounded
+        # `coord retry` dispatch) for the zero-commit case, not only an EXIT
+        # — `is_exit` alone would let a RUN action fall through to the
+        # Test/Review/Merge logic below as though the row were validated
+        # work. Only its "proceeding under --accept-advisory" branch returns
+        # WAIT (with warnings to fold in); every other branch (EXIT or RUN)
+        # is this poll's whole answer.
+        if advisory.kind != WAIT:
             return advisory
         warnings = advisory.warnings
     elif state.work_status == "refused_policy":
@@ -1825,6 +1848,7 @@ def _dispatch_work_stage(
 def _decide_advisory(
     state: IssueState,
     opts: DriveOptions,
+    counters: DriveCounters,
     machine: str,
     verifier: MergeVerifier,
 ) -> Action:
@@ -1835,13 +1859,47 @@ def _decide_advisory(
     ``tui/target/debug/coord-tui``, which a Python diff never produces, so
     #1323's stash-miss check downgrades a perfectly good DONE.  Ask git which
     case this actually is rather than trusting the status.
+
+    #2416: a GENUINE zero-commit advisory (no branch, or a branch verified to
+    carry no commits) used to be an immediate, unconditional `_die()` — the
+    ONE thing that can actually change this row, `coord retry <aid>`'s
+    zero-commit-advisory path (#1606: `ahead == 0` → reassign a fresh
+    worker), was never invoked automatically. That made every automatic
+    retry — `drive-queue`'s own included — a no-op: a brand new `coord
+    drive` process just re-observes the identical terminal row and dies
+    again in seconds, spending a queue attempt+backoff cycle for nothing.
+    Mirrors the `work_status == "failed"` branch above: a bounded number of
+    `coord retry` dispatches (`opts.max_work_retries`, via `counters.
+    advisory_retries`) before finally giving up, so a row whose correct
+    resolution really is "dispatch something else" still reaches a terminal
+    `_die()` naming `coord retry` for a human — never an unbounded loop.
     """
     if not state.work_branch or not verifier.branch_has_commits(state):
-        return _die(
-            f"work {state.work_aid} exited ADVISORY with no commits on its branch —\n"
-            "   nothing was pushed, so there is nothing to test, review, or merge.\n"
-            f"   inspect: coord log {state.work_aid} --machine "
-            f"{state.work_machine or machine}"
+        budget = opts.max_work_retries
+        if counters.advisory_retries >= budget:
+            return _die(
+                f"work {state.work_aid} exited ADVISORY with no commits on its "
+                f"branch {counters.advisory_retries} time(s) in a row (budget "
+                f"{budget}, #2416) — nothing was pushed, so there is nothing to "
+                "test, review, or merge, and retrying has not produced a "
+                "different outcome.\n"
+                f"   inspect: coord log {state.work_aid} --machine "
+                f"{state.work_machine or machine}\n"
+                f"   this needs an operator decision: `coord retry "
+                f"{state.work_aid}` by hand once the underlying blocker is "
+                "understood, or dispatch an independent follow-up issue if "
+                "another attempt at this one is not the right fix."
+            )
+        counters.advisory_retries += 1
+        return Action(
+            kind=RUN,
+            label=(
+                f"WORK: {state.work_aid} exited ADVISORY with no commits → "
+                f"coord retry {state.work_aid} (attempt "
+                f"{counters.advisory_retries}/{budget}, #2416)"
+            ),
+            command=("retry", state.work_aid),
+            error_message=f"coord retry failed for {state.work_aid}",
         )
     if not opts.accept_advisory:
         return _die(
