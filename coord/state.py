@@ -17,7 +17,7 @@ import os
 import sqlite3
 import time
 import warnings
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -561,6 +561,10 @@ def _dispatched_dict_from_payload(a: dict) -> dict:
         "provider_name": a.get("provider_name"),
         # #1499: durable drive provenance; None for a hand `coord assign`.
         "driven_by": a.get("driven_by"),
+        # #2417: the calling worker's own assignment id, when this row was
+        # dispatched from INSIDE another worker's turn. None for a hand or
+        # coordinator/brain dispatch.
+        "dispatched_by_assignment_id": a.get("dispatched_by_assignment_id"),
     }
 
 
@@ -605,6 +609,10 @@ def _row_to_dispatched_dict(row: object) -> dict:
         "provider_name": d.get("provider_name"),
         # #1499: durable drive provenance; None for a hand `coord assign`.
         "driven_by": d.get("driven_by"),
+        # #2417: the calling worker's own assignment id, when this row was
+        # dispatched from INSIDE another worker's turn. None for a hand or
+        # coordinator/brain dispatch.
+        "dispatched_by_assignment_id": d.get("dispatched_by_assignment_id"),
     }
 
 
@@ -799,6 +807,21 @@ def _thin_client_local_board_guard(fn_name: str) -> None:
     _log.warning(msg)
 
 
+def _dispatched_by_from_env() -> str | None:
+    """The calling worker's own assignment id, if this process is running
+    INSIDE a headless worker's turn (#2417).
+
+    `COORD_ASSIGNMENT_ID` is set on a worker subprocess's own environment by
+    `coord.agent._build_worker_env` (#2217) — so a `coord` CLI invocation
+    the worker shells out to (e.g. `coord acceptance author` dispatching an
+    independent test-author sibling, `coord fix <other-id>` escalating an
+    unrelated assignment) inherits it automatically. A human typing the same
+    command in their own shell never has it set, so this correctly returns
+    `None` for a hand/coordinator dispatch.
+    """
+    return os.environ.get("COORD_ASSIGNMENT_ID") or None
+
+
 def record_dispatched(
     *,
     assignment_id: str,
@@ -807,6 +830,15 @@ def record_dispatched(
     provider_name: str | None = None,
 ) -> None:
     """Record a newly dispatched assignment — routes to the daemon when set."""
+    # #2417: stamp the calling worker's own assignment id (if any) BEFORE
+    # this crosses the HTTP boundary to a possibly-remote daemon — the env
+    # var only exists on the machine/process that is actually dispatching,
+    # never on the daemon host. Caller-supplied values (none of today's
+    # callers set one explicitly) are left alone.
+    if proposal.dispatched_by_assignment_id is None:
+        proposal = replace(
+            proposal, dispatched_by_assignment_id=_dispatched_by_from_env()
+        )
     svc = _board_service()
     resp = _route_write(
         svc,
@@ -874,8 +906,8 @@ def _record_dispatched_local(
             assignment_id, machine_name, repo_name, repo_github,
             issue_number, issue_title, status, type, briefing,
             files_allowed, model, dispatched_at, required_gates,
-            provider_name, branch, driven_by
-        ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            provider_name, branch, driven_by, dispatched_by_assignment_id
+        ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(assignment_id) DO NOTHING""",
         (
             assignment_id,
@@ -893,6 +925,7 @@ def _record_dispatched_local(
             provider_name,
             branch,
             proposal.driven_by,
+            proposal.dispatched_by_assignment_id,
         ),
     )
     conn.commit()
@@ -915,7 +948,16 @@ def _record_dispatched_local(
             # the audit log alone, after the driver process has exited.
             actor="drive" if proposal.driven_by else "coordinator",
             summary=f"Dispatched {proposal.type} to {proposal.machine_name}: "
-            f"{proposal.repo_name}#{proposal.issue_number}",
+            f"{proposal.repo_name}#{proposal.issue_number}"
+            # #2417: make the sibling-dispatch link visible in the default
+            # (non-`--json`) `coord audit` table, not just in `details` —
+            # this is what let coord-portal#119's dispatch of a test-author
+            # sibling go unnoticed without grepping the raw worker transcript.
+            + (
+                f" (dispatched by assignment {proposal.dispatched_by_assignment_id})"
+                if proposal.dispatched_by_assignment_id
+                else ""
+            ),
             repo=proposal.repo_name,
             issue=proposal.issue_number,
             assignment_id=assignment_id,
@@ -924,6 +966,11 @@ def _record_dispatched_local(
                 "type": proposal.type,
                 "branch": branch,
                 "driven_by": proposal.driven_by,
+                # #2417: surfaces "this was dispatched BY a worker's own
+                # turn" directly in `coord audit`, without cross-referencing
+                # the raw `claude -p` transcript for the printed "Dispatched
+                # ... to ..." line.
+                "dispatched_by_assignment_id": proposal.dispatched_by_assignment_id,
             },
         )
 
@@ -934,6 +981,12 @@ def record_dispatched_assignment(
     repo_github: str,
 ) -> None:
     """Record a dispatched assignment — routes to the daemon when set."""
+    # #2417: see record_dispatched's matching comment — must be stamped here,
+    # on the dispatching process's own env, before the daemon HTTP hop.
+    if assignment.dispatched_by_assignment_id is None:
+        assignment = replace(
+            assignment, dispatched_by_assignment_id=_dispatched_by_from_env()
+        )
     svc = _board_service()
     resp = _route_write(
         svc, "/dispatched", {"assignment": asdict(assignment), "repo_github": repo_github}
@@ -971,7 +1024,8 @@ def _record_dispatched_assignment_local(
             issue_number, issue_title, status, type, briefing,
             files_allowed, model, dispatched_at, review_of_assignment_id,
             review_target, required_gates, review_iteration,
-            provider_name, branch, for_issue_number, driven_by
+            provider_name, branch, for_issue_number, driven_by,
+            dispatched_by_assignment_id
         ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
             -- #1553: a follow-up dispatched off another assignment (review,
             -- smoke, [fix-N], retry, pr-helper) inherits that parent's
@@ -989,7 +1043,7 @@ def _record_dispatched_assignment_local(
                 SELECT p.for_issue_number FROM assignments p
                 WHERE p.assignment_id = ?
             )),
-            ?)
+            ?, ?)
         ON CONFLICT(assignment_id) DO UPDATE SET
             status = 'running',
             machine_name = excluded.machine_name,
@@ -1013,7 +1067,13 @@ def _record_dispatched_assignment_local(
             for_issue_number = COALESCE(excluded.for_issue_number, for_issue_number),
             -- #1499: COALESCE so a re-dispatch/reload doesn't clear the
             -- drive provenance already recorded for this assignment.
-            driven_by = COALESCE(excluded.driven_by, driven_by)""",
+            driven_by = COALESCE(excluded.driven_by, driven_by),
+            -- #2417: COALESCE so a re-dispatch/reload doesn't clear the
+            -- calling-worker provenance already recorded for this
+            -- assignment.
+            dispatched_by_assignment_id = COALESCE(
+                excluded.dispatched_by_assignment_id, dispatched_by_assignment_id
+            )""",
         (
             assignment.assignment_id or "",
             assignment.machine_name,
@@ -1039,6 +1099,7 @@ def _record_dispatched_assignment_local(
             # positional).
             assignment.review_of_assignment_id,
             assignment.driven_by,
+            assignment.dispatched_by_assignment_id,
         ),
     )
     conn.commit()
@@ -1051,7 +1112,13 @@ def _record_dispatched_assignment_local(
         # to a human `coord assign` (the exact gap #1499 reported).
         actor="drive" if assignment.driven_by else "coordinator",
         summary=f"Dispatched {assignment.type} to {assignment.machine_name}: "
-        f"{assignment.repo_name}#{assignment.issue_number}",
+        f"{assignment.repo_name}#{assignment.issue_number}"
+        # #2417: see the matching Proposal-path comment above.
+        + (
+            f" (dispatched by assignment {assignment.dispatched_by_assignment_id})"
+            if assignment.dispatched_by_assignment_id
+            else ""
+        ),
         repo=assignment.repo_name,
         issue=assignment.issue_number,
         assignment_id=assignment.assignment_id,
@@ -1062,6 +1129,8 @@ def _record_dispatched_assignment_local(
             "review_target": assignment.review_target,
             "review_iteration": assignment.review_iteration,
             "driven_by": assignment.driven_by,
+            # #2417: see record_dispatched's matching comment.
+            "dispatched_by_assignment_id": assignment.dispatched_by_assignment_id,
         },
     )
 

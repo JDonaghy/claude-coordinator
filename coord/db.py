@@ -926,6 +926,14 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         # submission with no preview queued yet, same as `open_question`'s
         # own default.
         "ALTER TABLE portal_submissions ADD COLUMN preview_url TEXT NOT NULL DEFAULT ''",
+        # #2417: the CALLING assignment's id when this row was dispatched by
+        # a `coord` subcommand run from INSIDE another worker's own turn
+        # (e.g. `coord acceptance author`/`coord fix` shelled out to from a
+        # `type="work"` session's own bash tool) rather than typed by a
+        # human — see `coord.models.Assignment.dispatched_by_assignment_id`.
+        # NULL for a hand dispatch, a coordinator/brain-proposed dispatch,
+        # and every row predating this column.
+        "ALTER TABLE assignments ADD COLUMN dispatched_by_assignment_id TEXT",
     ]
     for sql in migrations:
         try:

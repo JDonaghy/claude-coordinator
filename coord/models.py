@@ -723,6 +723,29 @@ class Assignment:
     # `advisory` — the same bucket as a worker that looked and correctly
     # found nothing to do — so nobody re-drove it.
     stop_reason: str | None = None
+    # #2417: the CALLING assignment's id when this row was dispatched by a
+    # `coord` subcommand run from INSIDE another worker's own turn (e.g. a
+    # `type="work"` session shelling out to `coord acceptance author repo ms
+    # --issue N` or `coord fix <other-id>`), as opposed to a human typing the
+    # same command in their own shell. Populated centrally in
+    # `coord.state.record_dispatched`/`record_dispatched_assignment` from the
+    # `COORD_ASSIGNMENT_ID` env var (see `coord.agent._build_worker_env`'s
+    # #2217 note — every headless worker's subprocess environment carries its
+    # own assignment id, so a `coord` CLI the worker shells out to inherits
+    # it automatically; a human's own shell never has it set). `None` for a
+    # hand dispatch, a coordinator/brain-proposed dispatch, and rows
+    # predating this column.
+    #
+    # This is the missing link #2417 reported: before this field, the only
+    # way to discover that a work row had dispatched an independent sibling
+    # assignment (and whether that sibling then succeeded) was grepping the
+    # worker's raw `claude -p` transcript for the printed "Dispatched ... to
+    # ..." line and manually cross-referencing a second `coord log` by hand.
+    # With this field, the ORIGIN row can be found by any consumer (the
+    # board, `coord audit`, the TUI) via a reverse lookup: "which assignment
+    # has `dispatched_by_assignment_id == this row's id`?" — see
+    # `coord.state.find_dispatched_children`.
+    dispatched_by_assignment_id: str | None = None
 
 
 def effective_issue_number(assignment: "Assignment | dict") -> int:
@@ -859,6 +882,15 @@ class Proposal:
     # through) carries durable provenance. `None` for every other caller
     # (brain-proposed, milestone dispatch, ...).
     driven_by: str | None = None
+    # #2417: mirrors `Assignment.dispatched_by_assignment_id` — see that
+    # field's docstring. Set here (rather than left for the caller to
+    # populate) by `coord.state.record_dispatched` reading
+    # `COORD_ASSIGNMENT_ID` from the environment at record time, so every
+    # `Proposal`-based dispatch path (`coord fix`/`coord pr`/`coord review`
+    # follow-ups via `_dispatch_followup`, `coord assign`,
+    # `coord/dispatch_workers.py`, ...) gets this for free without each call
+    # site threading it through by hand.
+    dispatched_by_assignment_id: str | None = None
 
 
 @dataclass

@@ -458,6 +458,20 @@ pub struct Assignment {
     /// `CoordApp::issue_has_drive_provenance` in `drive.rs`.
     #[serde(default)]
     pub(crate) driven_by: Option<String>,
+    /// #2417: the CALLING assignment's id when this row was dispatched by a
+    /// `coord` subcommand run from INSIDE another worker's own turn (e.g. a
+    /// `type="work"` session shelling out to `coord acceptance author repo
+    /// ms --issue N` or `coord fix <other-id>`), as opposed to a human
+    /// typing the same command in their own shell. `None` for a hand or
+    /// coordinator/brain dispatch, and for rows predating this column.
+    /// Mirrors `coord.models.Assignment.dispatched_by_assignment_id`. Read
+    /// in reverse via [`crate::app::CoordApp::dispatched_children`]: given
+    /// an ORIGIN row, find every assignment whose value here equals the
+    /// origin's `id` — that reverse lookup is what lets the origin row show
+    /// "→ dispatched test-author <id> — running/done" instead of the
+    /// operator having to grep the raw worker transcript (#2417).
+    #[serde(default)]
+    pub(crate) dispatched_by_assignment_id: Option<String>,
 }
 
 /// Deserialize a boolean the daemon may send as a SQLite-style integer (0/1)
