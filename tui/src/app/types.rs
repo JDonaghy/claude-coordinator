@@ -814,10 +814,8 @@ pub(crate) struct EscalationEntry {
     pub(crate) id: i64,
     pub(crate) repo_name: String,
     pub(crate) issue_number: i64,
-    // Parsed for wire parity / `Debug` dumps and reachable via `coord
-    // escalate list` outside the TUI; not yet surfaced on the Pipeline
-    // row/menu, which only needs `reason` + `proposed_command` today.
-    #[allow(dead_code)]
+    // #2427: which stage box on the Overview strip gets the "blocked" mark
+    // — see `CoordApp::build_pipeline_widget`'s `esc.stage == name` check.
     #[serde(default)]
     pub(crate) stage: String,
     #[allow(dead_code)]
@@ -827,7 +825,7 @@ pub(crate) struct EscalationEntry {
     /// Human-readable "key=value | key=value" summary of the gate readings
     /// the driver observed — deliberately NOT JSON (see `coord/db.py`): this
     /// record exists to be read by a human, not machine-parsed.
-    #[allow(dead_code)] // see `stage` above — not yet surfaced in the TUI
+    #[allow(dead_code)] // not yet surfaced in the TUI (unlike `stage`, #2427)
     #[serde(default)]
     pub(crate) gate_readings: String,
     pub(crate) proposed_command: String,
