@@ -38,6 +38,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
@@ -107,6 +108,106 @@ class DriverResult:
         return self.exit_code == 0
 
 
+# Where :func:`resolve_cargo` looks, in the order a human debugging this
+# would try. Quoted verbatim in the DriverError a missing toolchain raises so
+# the message names the places searched rather than just "not found".
+CARGO_SEARCHED = "PATH, ${CARGO_HOME:-$HOME/.cargo}/bin/cargo, `rustup which cargo`"
+
+
+def resolve_cargo(env: dict[str, str] | None = None) -> str | None:
+    """Absolute path to ``cargo``, or ``None`` when it can't be found.
+
+    The Python twin of ``scripts/coord-test-runner.sh``'s ``resolve_cargo``
+    (#1814), and it exists for the same reason: ``coord serve`` / ``coord
+    agent`` / a ``coord drive`` loop spawned by them are systemd **user**
+    units, whose PATH is systemd's rather than a login shell's. ``~/.profile``
+    and the shell rcs that put ``~/.cargo/bin`` on PATH are never sourced for
+    them, so a bare ``cargo`` resolves fine over ssh and not at all inside the
+    daemon.
+
+    #1814 fixed that for the Test stage but not here, and the acceptance
+    driver kept paying for it: every ``coord acceptance record`` of a
+    ``tui-tuidriver`` route launched from the drive loop ran ``cargo test``
+    through ``/bin/sh``, got ``cargo: not found`` (exit 127, empty stdout),
+    parsed zero tests out of it, and recorded that as a perfectly ordinary
+    ``acceptance_failed`` verdict with ``total=0, passed=0`` — a false red on
+    a green suite, indistinguishable in the audit log from a branch that
+    genuinely broke its slice.
+
+    Search order: PATH, then rustup's default install location, then rustup's
+    own answer (rustup may be off PATH for exactly the same reason cargo is).
+    """
+    env = dict(os.environ) if env is None else env
+    path = env.get("PATH") or os.defpath
+
+    found = shutil.which("cargo", path=path)
+    if found:
+        return found
+
+    cargo_home = env.get("CARGO_HOME") or str(
+        Path(env.get("HOME") or Path.home()) / ".cargo"
+    )
+    candidate = Path(cargo_home) / "bin" / "cargo"
+    if os.access(candidate, os.X_OK):
+        return str(candidate)
+
+    rustup = shutil.which("rustup", path=path)
+    if not rustup:
+        rustup_candidate = Path(cargo_home) / "bin" / "rustup"
+        rustup = str(rustup_candidate) if os.access(rustup_candidate, os.X_OK) else None
+    if rustup:
+        try:
+            proc = subprocess.run(
+                [rustup, "which", "cargo"],
+                capture_output=True, text=True, timeout=30, env=env,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        resolved = (proc.stdout or "").strip()
+        if proc.returncode == 0 and resolved and os.access(resolved, os.X_OK):
+            return resolved
+    return None
+
+
+def driver_env(
+    base_env: dict[str, str] | None = None, *, repo_name: str | None = None
+) -> dict[str, str]:
+    """The environment a driver's ``setup``/``run`` command executes in.
+
+    Two overlays on top of *base_env* (``os.environ`` by default), both of
+    which the drive loop's systemd-user-unit environment is missing:
+
+    1. **The rust toolchain on PATH** (#1814). :func:`resolve_cargo`'s
+       directory is *prepended* to PATH when cargo isn't already resolvable
+       from it — the whole bin dir, not just ``cargo``, because cargo shells
+       out to ``rustc``, which lives beside it. A machine with no rust
+       toolchain at all is left untouched; the run then fails loudly in
+       :func:`_run_generic` rather than being papered over here.
+    2. **The shared per-repo cargo target dir** (#1402,
+       :func:`coord.cargo_cache.cargo_env`), when *repo_name* is given. Every
+       ``coord acceptance record`` builds in a fresh throwaway worktree, so
+       without this each one is a cold ~2 GiB build racing the driver's 900s
+       timeout. An operator's own ``CARGO_TARGET_DIR`` still wins — that's
+       ``cargo_env``'s own rule, not a special case here.
+    """
+    env = dict(os.environ if base_env is None else base_env)
+
+    cargo = resolve_cargo(env)
+    if cargo:
+        bin_dir = str(Path(cargo).parent)
+        path = env.get("PATH") or os.defpath
+        if bin_dir not in path.split(os.pathsep):
+            env["PATH"] = f"{bin_dir}{os.pathsep}{path}"
+
+    if repo_name:
+        from coord.cargo_cache import cargo_env  # noqa: PLC0415  (cycle-safe)
+        from coord.state import COORD_DIR  # noqa: PLC0415
+
+        env.update(cargo_env(repo_name, COORD_DIR, env))
+
+    return env
+
+
 def render_run_command(run_command: str, *, ms: str | None = None) -> str:
     """Substitute the ``{ms}`` template in *run_command* with *ms* (the
     ``ms-NN`` milestone dirname — see :func:`coord.acceptance.ms_dirname`),
@@ -125,7 +226,7 @@ def render_run_command(run_command: str, *, ms: str | None = None) -> str:
 
 def run_driver(
     kind: str, run_command: str, cwd: str, *, timeout: int = 900, ms: str | None = None,
-    setup_command: str = "",
+    setup_command: str = "", repo_name: str | None = None,
 ) -> DriverResult:
     """Execute *run_command* in *cwd* and parse its output for *kind*.
 
@@ -146,6 +247,9 @@ def run_driver(
     before *run_command* ever executes — with a message that names it as a
     provisioning failure so it isn't mistaken for a test failure or folded
     into a driver's own "wrote no report" crash message.
+
+    *repo_name*, when given, points cargo at this machine's shared per-repo
+    target dir for both commands (see :func:`driver_env`).
     """
     if kind not in SUPPORTED_KINDS:
         raise DriverError(
@@ -154,19 +258,23 @@ def run_driver(
             "lands in a later oracle-loop issue — see docs/ORACLE_LOOP.md."
         )
 
+    env = driver_env(repo_name=repo_name)
+
     if setup_command:
-        _run_setup(setup_command, cwd, timeout=timeout)
+        _run_setup(setup_command, cwd, timeout=timeout, env=env)
 
     run_command = render_run_command(run_command, ms=ms)
 
     if kind == "cli-pytest":
-        return _run_cli_pytest(run_command, cwd, timeout=timeout)
+        return _run_cli_pytest(run_command, cwd, timeout=timeout, env=env)
     if kind == "web-playwright":
-        return _run_web_playwright(run_command, cwd, timeout=timeout)
-    return _run_generic(run_command, cwd, timeout=timeout)
+        return _run_web_playwright(run_command, cwd, timeout=timeout, env=env)
+    return _run_generic(run_command, cwd, timeout=timeout, env=env)
 
 
-def _run_setup(setup_command: str, cwd: str, *, timeout: int) -> None:
+def _run_setup(
+    setup_command: str, cwd: str, *, timeout: int, env: dict[str, str] | None = None
+) -> None:
     """Run a driver's ``setup:`` provisioning command (#1733) in *cwd*,
     before its suite ever runs.
 
@@ -184,6 +292,7 @@ def _run_setup(setup_command: str, cwd: str, *, timeout: int) -> None:
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=env,
         )
     except subprocess.TimeoutExpired as e:
         raise DriverError(
@@ -203,11 +312,30 @@ def _run_setup(setup_command: str, cwd: str, *, timeout: int) -> None:
         )
 
 
-def _run_generic(run_command: str, cwd: str, *, timeout: int) -> DriverResult:
+def _run_generic(
+    run_command: str, cwd: str, *, timeout: int, env: dict[str, str] | None = None
+) -> DriverResult:
     """The ``tui-tuidriver`` (and any future stdout-native) shape: the
     command itself is responsible for printing structured verdicts to
     stdout — this just runs it and hands the raw stdout to
-    :func:`parse_test_output`."""
+    :func:`parse_test_output`.
+
+    A non-zero exit that *also* parsed **zero** tests raises
+    :class:`DriverError` rather than returning an empty result — the same
+    rule :func:`_run_web_playwright` has enforced since #1539 ("a crashed run
+    ... must surface as a DriverError or an explicit failure — never as an
+    empty pass list"), which this driver was missing.
+
+    The asymmetry is deliberate and is the whole point: a non-zero exit *with*
+    tests parsed is an ordinary red suite (cargo exits 101 whenever a test
+    fails) and is still returned intact, partial JSON and all. A non-zero exit
+    with *nothing* parsed means the suite never produced a verdict — cargo not
+    on PATH (exit 127, the #1814 systemd-PATH bug), a compile error, a harness
+    that aborted before libtest emitted its first event. ``coord acceptance
+    record`` used to store that as ``total=0, passed=0`` + ``acceptance_failed``:
+    a false red, worded identically to a real one, that no amount of fixing
+    the branch could ever clear.
+    """
     try:
         proc = subprocess.run(
             run_command,
@@ -216,6 +344,7 @@ def _run_generic(run_command: str, cwd: str, *, timeout: int) -> DriverResult:
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=env,
         )
     except subprocess.TimeoutExpired as e:
         raise DriverError(
@@ -225,6 +354,24 @@ def _run_generic(run_command: str, cwd: str, *, timeout: int) -> DriverResult:
         raise DriverError(f"acceptance run command failed to start: {e}") from e
 
     tests = parse_test_output(proc.stdout)
+    if not tests and proc.returncode != 0:
+        stderr_tail = "\n".join((proc.stderr or "").splitlines()[-20:])
+        hint = ""
+        if "cargo" in run_command and not resolve_cargo(env):
+            hint = (
+                "\n  cargo could not be found either — searched: "
+                f"{CARGO_SEARCHED}\n"
+                f"  PATH={(env or os.environ).get('PATH', '')}\n"
+                "  A systemd user unit's PATH is not a login shell's; "
+                "~/.profile is never sourced for it (#1814)."
+            )
+        raise DriverError(
+            f"acceptance run reported no tests (exit {proc.returncode}): "
+            f"{run_command!r}\n"
+            "  This is an INFRASTRUCTURE failure, not a test failure: the "
+            "suite never produced a verdict, so nothing about the branch may "
+            f"be inferred from it.{hint}\n{stderr_tail}"
+        )
     return DriverResult(
         exit_code=proc.returncode,
         tests=tests,
@@ -232,7 +379,9 @@ def _run_generic(run_command: str, cwd: str, *, timeout: int) -> DriverResult:
     )
 
 
-def _run_cli_pytest(run_command: str, cwd: str, *, timeout: int) -> DriverResult:
+def _run_cli_pytest(
+    run_command: str, cwd: str, *, timeout: int, env: dict[str, str] | None = None
+) -> DriverResult:
     """The ``cli-pytest`` shape: append pytest's own built-in
     ``--junit-xml=<path>`` (a core pytest flag — no extra plugin required in
     the driven repo) so structured per-test verdicts are always produced
@@ -250,6 +399,7 @@ def _run_cli_pytest(run_command: str, cwd: str, *, timeout: int) -> DriverResult
                 capture_output=True,
                 text=True,
                 timeout=timeout,
+                env=env,
             )
         except subprocess.TimeoutExpired as e:
             raise DriverError(
@@ -267,7 +417,9 @@ def _run_cli_pytest(run_command: str, cwd: str, *, timeout: int) -> DriverResult
         )
 
 
-def _run_web_playwright(run_command: str, cwd: str, *, timeout: int) -> DriverResult:
+def _run_web_playwright(
+    run_command: str, cwd: str, *, timeout: int, env: dict[str, str] | None = None
+) -> DriverResult:
     """The ``web-playwright`` shape: force Playwright Test's built-in
     ``json`` reporter to a known path via ``--reporter=json`` plus the
     ``PLAYWRIGHT_JSON_OUTPUT_FILE`` env var it honors (the json-reporter
@@ -290,7 +442,10 @@ def _run_web_playwright(run_command: str, cwd: str, *, timeout: int) -> DriverRe
     with tempfile.TemporaryDirectory() as tmp_dir:
         report_path = Path(tmp_dir) / "coord-acceptance-playwright.json"
         full_command = f"{run_command} --reporter=json"
-        env = {**os.environ, "PLAYWRIGHT_JSON_OUTPUT_FILE": str(report_path)}
+        run_env = {
+            **(os.environ if env is None else env),
+            "PLAYWRIGHT_JSON_OUTPUT_FILE": str(report_path),
+        }
         try:
             proc = subprocess.run(
                 full_command,
@@ -299,7 +454,7 @@ def _run_web_playwright(run_command: str, cwd: str, *, timeout: int) -> DriverRe
                 capture_output=True,
                 text=True,
                 timeout=timeout,
-                env=env,
+                env=run_env,
             )
         except subprocess.TimeoutExpired as e:
             raise DriverError(

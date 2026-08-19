@@ -62,6 +62,7 @@ project; nothing here depends on a live worktree or a real browser install.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -69,12 +70,15 @@ import pytest
 
 from coord.acceptance import build_verdict
 from coord.acceptance_drivers import (
+    CARGO_SEARCHED,
     DriverError,
     SUPPORTED_KINDS,
+    driver_env,
     parse_playwright_json_report,
     parse_pytest_junit_xml,
     parse_test_output,
     render_run_command,
+    resolve_cargo,
     run_driver,
 )
 
@@ -193,6 +197,209 @@ class TestRunDriver:
     def test_timeout_raises_driver_error(self, tmp_path) -> None:
         with pytest.raises(DriverError, match="timed out"):
             run_driver("tui-tuidriver", "sleep 5", cwd=str(tmp_path), timeout=1)
+
+
+def _fake_cargo_home(root: Path, stdout: str = "") -> Path:
+    """A ``$CARGO_HOME`` layout whose ``bin/cargo`` prints *stdout* and exits 0.
+
+    Stands in for a real rustup install: the acceptance driver only ever
+    invokes cargo through the shell, so a shell script named ``cargo`` on the
+    resolved bin dir is indistinguishable from the real thing.
+    """
+    bin_dir = root / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    cargo = bin_dir / "cargo"
+    # `printf` only — a shell BUILTIN. These tests deliberately run with a
+    # PATH that has no /bin on it (that's the bug being reproduced), so a
+    # stub shelling out to `cat`/`echo` would die with its own 127 and prove
+    # nothing about whether cargo itself was found.
+    escaped = stdout.replace("'", "'\\''")
+    cargo.write_text(f"#!/bin/sh\nprintf '%s\\n' '{escaped}'\n")
+    cargo.chmod(0o755)
+    return root
+
+
+class TestRunGenericInfrastructureFailure:
+    """A ``tui-tuidriver`` run that produced NO verdict is an infrastructure
+    failure, not a red suite.
+
+    The bug this closes: `coord acceptance record` for a `tui/**` route
+    launched from the `coord drive` loop ran `cargo test` with a systemd user
+    unit's PATH (no `~/.cargo/bin`), got `cargo: not found` — exit 127, empty
+    stdout — parsed zero tests, and recorded `acceptance_failed` with
+    `total=0, passed=0` against a suite that was fully green. The verdict is
+    worded identically to a real red, so no amount of fixing the branch could
+    ever clear it. `_run_web_playwright` has refused to do this since #1539;
+    `_run_generic` did not.
+    """
+
+    def test_nonzero_exit_with_no_tests_raises_instead_of_empty_result(
+        self, tmp_path,
+    ) -> None:
+        with pytest.raises(DriverError) as exc_info:
+            run_driver("tui-tuidriver", "exit 127", cwd=str(tmp_path))
+        assert "no tests" in str(exc_info.value)
+
+    def test_infrastructure_failure_is_named_as_such_not_as_a_test_failure(
+        self, tmp_path,
+    ) -> None:
+        with pytest.raises(DriverError) as exc_info:
+            run_driver("tui-tuidriver", "exit 127", cwd=str(tmp_path))
+        message = str(exc_info.value)
+        assert "INFRASTRUCTURE failure, not a test failure" in message
+        assert "127" in message
+
+    def test_stderr_tail_is_carried_into_the_error(self, tmp_path) -> None:
+        with pytest.raises(DriverError) as exc_info:
+            run_driver(
+                "tui-tuidriver",
+                "echo 'sh: 1: cargo: not found' 1>&2; exit 127",
+                cwd=str(tmp_path),
+            )
+        assert "cargo: not found" in str(exc_info.value)
+
+    def test_missing_cargo_hint_names_where_it_looked(self, tmp_path, monkeypatch) -> None:
+        # A cargo-shaped run command with no cargo anywhere gets the #1814
+        # diagnosis attached, not just a bare exit code.
+        monkeypatch.setenv("PATH", str(tmp_path / "empty-bin"))
+        monkeypatch.setenv("CARGO_HOME", str(tmp_path / "no-cargo-home"))
+        with pytest.raises(DriverError) as exc_info:
+            run_driver("tui-tuidriver", "cargo test --test acceptance", cwd=str(tmp_path))
+        message = str(exc_info.value)
+        assert CARGO_SEARCHED in message
+        assert "systemd user unit" in message
+
+    def test_non_cargo_command_gets_no_cargo_hint(self, tmp_path) -> None:
+        with pytest.raises(DriverError) as exc_info:
+            run_driver("tui-tuidriver", "some-tui-runner", cwd=str(tmp_path))
+        assert CARGO_SEARCHED not in str(exc_info.value)
+
+    def test_nonzero_exit_with_tests_is_still_an_ordinary_red_suite(
+        self, tmp_path,
+    ) -> None:
+        # cargo exits 101 whenever a test fails — that must stay a returned
+        # verdict, never an infrastructure error, or every red slice becomes
+        # unreportable.
+        blob = json.dumps({"tests": [{"id": "a", "status": "fail"}]})
+        result = run_driver("tui-tuidriver", f"echo '{blob}'; exit 101", cwd=str(tmp_path))
+        assert result.exit_code == 101
+        assert result.tests == [{"id": "a", "status": "fail", "message": ""}]
+
+    def test_zero_tests_with_a_clean_exit_is_not_an_error(self, tmp_path) -> None:
+        # A suite that legitimately matched nothing and said so by exiting 0
+        # is the caller's (`_scoped_verdict`'s) problem to report, not a
+        # driver crash.
+        result = run_driver("tui-tuidriver", "echo not-json", cwd=str(tmp_path))
+        assert result.exit_code == 0
+        assert result.tests == []
+
+
+class TestResolveCargo:
+    """#1814's toolchain resolution, ported from scripts/coord-test-runner.sh."""
+
+    def test_prefers_cargo_already_on_path(self, tmp_path, monkeypatch) -> None:
+        home = _fake_cargo_home(tmp_path / "on-path")
+        monkeypatch.setenv("PATH", str(home / "bin"))
+        assert resolve_cargo() == str(home / "bin" / "cargo")
+
+    def test_falls_back_to_cargo_home_when_not_on_path(self, tmp_path, monkeypatch) -> None:
+        home = _fake_cargo_home(tmp_path / "off-path")
+        monkeypatch.setenv("PATH", str(tmp_path / "empty-bin"))
+        monkeypatch.setenv("CARGO_HOME", str(home))
+        assert resolve_cargo() == str(home / "bin" / "cargo")
+
+    def test_falls_back_to_dot_cargo_under_home(self, tmp_path, monkeypatch) -> None:
+        # The default rustup location, for a daemon whose env has HOME but
+        # neither CARGO_HOME nor ~/.cargo/bin on PATH — the production shape.
+        _fake_cargo_home(tmp_path / ".cargo")
+        monkeypatch.setenv("PATH", str(tmp_path / "empty-bin"))
+        monkeypatch.delenv("CARGO_HOME", raising=False)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        assert resolve_cargo() == str(tmp_path / ".cargo" / "bin" / "cargo")
+
+    def test_returns_none_when_there_is_no_toolchain(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setenv("PATH", str(tmp_path / "empty-bin"))
+        monkeypatch.setenv("CARGO_HOME", str(tmp_path / "no-cargo-home"))
+        assert resolve_cargo() is None
+
+
+class TestDriverEnv:
+    def test_prepends_the_toolchain_bin_dir_to_path(self, tmp_path, monkeypatch) -> None:
+        home = _fake_cargo_home(tmp_path / "toolchain")
+        monkeypatch.setenv("PATH", "/usr/bin")
+        monkeypatch.setenv("CARGO_HOME", str(home))
+        env = driver_env()
+        # Prepended, not appended: cargo shells out to rustc, which lives
+        # beside it, and must win over anything else on PATH.
+        assert env["PATH"].split(os.pathsep)[0] == str(home / "bin")
+        assert "/usr/bin" in env["PATH"].split(os.pathsep)
+
+    def test_does_not_duplicate_a_bin_dir_already_on_path(self, tmp_path, monkeypatch) -> None:
+        home = _fake_cargo_home(tmp_path / "toolchain")
+        monkeypatch.setenv("PATH", f"{home / 'bin'}{os.pathsep}/usr/bin")
+        env = driver_env()
+        assert env["PATH"].split(os.pathsep).count(str(home / "bin")) == 1
+
+    def test_path_is_untouched_when_no_toolchain_exists(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setenv("PATH", "/usr/bin")
+        monkeypatch.setenv("CARGO_HOME", str(tmp_path / "no-cargo-home"))
+        assert driver_env()["PATH"] == "/usr/bin"
+
+    def test_repo_name_points_cargo_at_the_shared_target_dir(self, monkeypatch) -> None:
+        monkeypatch.delenv("CARGO_TARGET_DIR", raising=False)
+        env = driver_env(repo_name="claude-coordinator")
+        # Every `record` builds in a fresh throwaway worktree; without the
+        # shared cache each one is a cold build racing the 900s timeout.
+        assert env["CARGO_TARGET_DIR"].endswith("cargo-target/claude-coordinator")
+
+    def test_no_repo_name_leaves_cargo_target_dir_alone(self, monkeypatch) -> None:
+        monkeypatch.delenv("CARGO_TARGET_DIR", raising=False)
+        assert "CARGO_TARGET_DIR" not in driver_env()
+
+    def test_an_operators_own_cargo_target_dir_wins(self, monkeypatch) -> None:
+        monkeypatch.setenv("CARGO_TARGET_DIR", "/tmp/my-own-target")
+        env = driver_env(repo_name="claude-coordinator")
+        assert env["CARGO_TARGET_DIR"] == "/tmp/my-own-target"
+
+
+class TestRunDriverFindsCargoOffPath:
+    """End-to-end: the driver subprocess itself must be able to run `cargo`.
+
+    This is the production reproduction — a daemon PATH with no
+    ``~/.cargo/bin``, a `run:` command that invokes a bare `cargo`. Before the
+    fix the shell answered `cargo: not found` and the run was recorded as a
+    red suite.
+    """
+
+    def test_run_command_can_invoke_a_cargo_that_was_not_on_path(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        blob = json.dumps({"tests": [{"id": "tabs::restores", "status": "pass"}]})
+        home = _fake_cargo_home(tmp_path / "toolchain", stdout=blob)
+        monkeypatch.setenv("PATH", str(tmp_path / "empty-bin"))
+        monkeypatch.setenv("CARGO_HOME", str(home))
+
+        result = run_driver(
+            "tui-tuidriver", "cargo test --test acceptance", cwd=str(tmp_path),
+        )
+        assert result.tests == [
+            {"id": "tabs::restores", "status": "pass", "message": ""}
+        ]
+
+    def test_setup_command_sees_the_same_path(self, tmp_path, monkeypatch) -> None:
+        # setup: runs in the same env as run: — a provisioning step that
+        # needs the toolchain (a `cargo fetch`, say) must not be the one
+        # place it goes missing.
+        blob = json.dumps({"tests": [{"id": "a", "status": "pass"}]})
+        home = _fake_cargo_home(tmp_path / "toolchain", stdout=blob)
+        monkeypatch.setenv("PATH", str(tmp_path / "empty-bin"))
+        monkeypatch.setenv("CARGO_HOME", str(home))
+
+        result = run_driver(
+            "tui-tuidriver", "cargo test", cwd=str(tmp_path),
+            setup_command="cargo fetch",
+        )
+        assert result.tests == [{"id": "a", "status": "pass", "message": ""}]
 
 
 class TestRunDriverSetup:

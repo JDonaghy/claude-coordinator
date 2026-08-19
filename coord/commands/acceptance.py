@@ -280,7 +280,7 @@ def acceptance_run(
     try:
         result = run_driver(
             driver_cfg.kind, driver_cfg.run, cwd=str(cwd), ms=ms,
-            setup_command=driver_cfg.setup,
+            setup_command=driver_cfg.setup, repo_name=repo,
         )
     except DriverError as e:
         click.echo(f"error: {e}", err=True)
@@ -922,7 +922,7 @@ def _acceptance_record_local(
         try:
             result = run_driver(
                 driver_cfg.kind, driver_cfg.run, cwd=str(wt_path), ms=ms,
-                setup_command=driver_cfg.setup,
+                setup_command=driver_cfg.setup, repo_name=repo,
             )
         except DriverError as e:
             click.echo(f"error: {e}", err=True)

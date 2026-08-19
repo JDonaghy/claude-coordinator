@@ -1060,7 +1060,7 @@ acceptance:
         active = 0
         max_active = 0
 
-        def _slow_driver(kind, run_command, cwd, ms=None, setup_command=None):
+        def _slow_driver(kind, run_command, cwd, **kwargs):
             nonlocal active, max_active
             with state_lock:
                 active += 1

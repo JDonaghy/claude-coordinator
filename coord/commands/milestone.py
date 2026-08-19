@@ -1728,7 +1728,10 @@ def milestone_gate_c_cmd(
     # suite dir for Gate C's "full accumulated suite" semantics.
     ms = ms_dirname(ctx.milestone_number)
     try:
-        result = run_driver(driver_cfg.kind, driver_cfg.run, cwd=str(repo_dir), ms=ms)
+        result = run_driver(
+            driver_cfg.kind, driver_cfg.run, cwd=str(repo_dir), ms=ms,
+            repo_name=repo,
+        )
     except DriverError as e:
         click.echo(f"error: {e}", err=True)
         sys.exit(1)
@@ -2031,7 +2034,10 @@ def milestone_ship_cmd(
     click.echo(f"Gate C: running the full accumulated acceptance suite in {repo_dir}...")
     ms = ms_dirname(ctx.milestone_number)
     try:
-        result = run_driver(driver_cfg.kind, driver_cfg.run, cwd=str(repo_dir), ms=ms)
+        result = run_driver(
+            driver_cfg.kind, driver_cfg.run, cwd=str(repo_dir), ms=ms,
+            repo_name=repo,
+        )
     except DriverError as e:
         click.echo(f"error: {e}", err=True)
         sys.exit(1)
