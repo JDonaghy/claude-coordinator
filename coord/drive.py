@@ -1254,6 +1254,30 @@ class MergeVerifier(Protocol):
     def branch_head_sha(self, state: IssueState) -> str | None: ...
 
 
+def _remote_matches_repo(remote_url: str, repo_github: str) -> bool:
+    """Loosely compare a ``git remote get-url origin`` URL against the
+    ``owner/repo`` GitHub identifier it should point at (#2437).
+
+    Tolerant of the URL shapes git actually produces: ``https://github.com/
+    owner/repo(.git)``, ``git@github.com:owner/repo(.git)``, and
+    ``ssh://git@github.com/owner/repo(.git)``. Anything else (a bare path, a
+    non-GitHub host) simply won't match — which is the correct, fail-closed
+    outcome: this is a sanity check that the checkout points at the expected
+    project, not a general-purpose git URL parser.
+    """
+    url = remote_url.strip()
+    if url.endswith(".git"):
+        url = url[:-4]
+    if "://" in url:
+        _scheme, _, rest = url.partition("://")
+        _host, _, path = rest.partition("/")
+        url = path
+    elif "@" in url and ":" in url:
+        _user_host, _, path = url.partition(":")
+        url = path
+    return url.strip("/").lower() == repo_github.strip("/").lower()
+
+
 @dataclass
 class GitMergeVerifier:
     """Real implementation: ``git`` for commits, ``gh`` for merge state.
@@ -1264,12 +1288,60 @@ class GitMergeVerifier:
 
     repo_path: str = ""
     warn: Callable[[str], None] = lambda msg: None
+    # #2437: memoizes which (base, reason) pairs have already been warned
+    # about, so a checkout that stays broken across many drive-loop polls
+    # gets exactly one loud warning instead of one per poll. Keyed on the
+    # reason text too, so a checkout that later fails a *different* check
+    # (e.g. it grows a valid `.git` but the wrong `origin`) still warns once
+    # for the new problem.
+    _warned: set[tuple[str, str]] = field(default_factory=set, init=False, repr=False)
 
     def _base(self, state: IssueState) -> Path | None:
         base = Path(self.repo_path).expanduser() if self.repo_path else (
             Path.home() / "src" / state.repo
         )
-        return base if (base / ".git").exists() else None
+        if not (base / ".git").exists():
+            return None
+        reason = self._unusable_reason(base, state)
+        if reason is None:
+            return base
+        key = (str(base), reason)
+        if key not in self._warned:
+            self._warned.add(key)
+            self.warn(
+                f"local checkout {base} cannot be used for merge "
+                f"verification of {state.repo} — {reason} (#2437). Merge "
+                "verification will keep returning \"could not verify\" "
+                "(never a false empty-branch) until this is fixed: replace "
+                "it with a real clone of the repo, or point `coord drive` "
+                "at one via --repo-path."
+            )
+        return None
+
+    def _unusable_reason(self, base: Path, state: IssueState) -> str | None:
+        """Why *base* can't be trusted for merge verification, or ``None`` if
+        it can.
+
+        A ``.git`` directory existing is necessary but not sufficient
+        (claude-coordinator#2437): an interrupted/stub `git init` leaves a
+        `.git` directory with no `HEAD`/`objects`/`refs`, and a checkout of
+        the wrong project entirely leaves a perfectly valid `.git` that
+        still can't answer questions about *this* repo. Both must be caught
+        here rather than surfacing as an unexplained, indefinitely-retried
+        ``None`` from :meth:`branch_has_commits`.
+        """
+        if self._git(base, "rev-parse", "--is-inside-work-tree").returncode != 0:
+            return "not a usable git working tree (`git rev-parse --is-inside-work-tree` failed)"
+        remote = self._git(base, "remote", "get-url", "origin")
+        url = (remote.stdout or "").strip()
+        if remote.returncode != 0 or not url:
+            return "has no 'origin' remote configured"
+        if state.repo_github and not _remote_matches_repo(url, state.repo_github):
+            return (
+                f"'origin' remote ({url!r}) does not match the expected "
+                f"repo {state.repo_github!r}"
+            )
+        return None
 
     @staticmethod
     def _git(base: Path, *args: str) -> subprocess.CompletedProcess[str]:

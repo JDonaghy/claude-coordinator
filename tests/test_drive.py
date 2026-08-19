@@ -53,6 +53,7 @@ from coord.drive import (
     GitMergeVerifier,
     LockBusy,
     OracleDecision,
+    _remote_matches_repo,
     coord_argv,
     decide,
     preflight,
@@ -4268,6 +4269,12 @@ def recorded_git(monkeypatch):
     ``subprocess.run`` attribute — patching it once via ``coord.drive.
     subprocess.run`` patches it for both call sites, and a single
     ``scripted`` dict drives both the git and gh sides of a scenario.
+
+    #2437's ``_base()`` checkout-validation probes (``rev-parse
+    --is-inside-work-tree`` and ``remote get-url origin``) default here to
+    "yes, a real checkout of john/claude-coordinator" — the shape almost
+    every test in this file wants — so only the handful of tests that
+    exercise the validation itself need to override them.
     """
     calls: list[list[str]] = []
     scripted: dict[tuple[str, ...], tuple[int, str]] = {}
@@ -4277,6 +4284,12 @@ def recorded_git(monkeypatch):
         for needle, (rc, out) in scripted.items():
             if all(token in argv for token in needle):
                 return subprocess.CompletedProcess(argv, rc, out, "")
+        if "rev-parse" in argv and "--is-inside-work-tree" in argv:
+            return subprocess.CompletedProcess(argv, 0, "true\n", "")
+        if "remote" in argv and "get-url" in argv:
+            return subprocess.CompletedProcess(
+                argv, 0, "https://github.com/john/claude-coordinator.git\n", ""
+            )
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     monkeypatch.setattr("coord.drive.subprocess.run", fake_run)
@@ -4337,6 +4350,7 @@ def test_verify_merged_falls_back_to_cherry_when_gh_finds_no_pr(
     (tmp_path / ".git").mkdir()
     scripted[("pr", "view")] = (1, "")
     scripted[("cherry",)] = (0, "- abc\n")
+    scripted[("remote", "get-url", "origin")] = (0, "git@github.com:john/x.git\n")
     s = state(work_branch="b", repo_github="john/x")
     assert GitMergeVerifier(repo_path=str(tmp_path)).verify_merged(s) is True
     assert any("cherry" in " ".join(c) for c in calls)
@@ -4429,6 +4443,137 @@ def test_the_verifiers_are_inert_without_a_local_checkout(tmp_path):
 
 def test_branch_has_commits_is_false_with_no_branch(tmp_path):
     assert GitMergeVerifier(repo_path=str(tmp_path)).branch_has_commits(state()) is False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# GitMergeVerifier._base — checkout validation (#2437)
+#
+# A `.git` directory existing is necessary but not sufficient: an
+# interrupted/stub `git init` (bare `.git/info/exclude`, no `HEAD`/
+# `objects`/`refs`/`config` — the exact claude-coordinator#2286 incident)
+# satisfies `(base / ".git").exists()` while being completely unusable for
+# `git fetch`. `_base()` must actually probe the checkout and warn loudly
+# (not just silently return `None`) the first time it finds one unusable.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def test_base_rejects_a_stub_git_dir_that_is_not_a_real_work_tree(
+    recorded_git, tmp_path
+):
+    """The exact #2437 incident: `.git` exists (so the old check passed) but
+    it's not an actual git repository — `rev-parse --is-inside-work-tree`
+    fails. Must be treated the same as no checkout at all: `None`, plus a
+    loud warning naming the reason, not a silent retry-forever."""
+    _calls, scripted = recorded_git
+    (tmp_path / ".git").mkdir()
+    scripted[("rev-parse", "--is-inside-work-tree")] = (128, "")
+    warned: list[str] = []
+    verifier = GitMergeVerifier(repo_path=str(tmp_path), warn=warned.append)
+    s = state(work_branch="b", repo_default_branch="main")
+    assert verifier.branch_has_commits(s) is None
+    assert any("not a usable git working tree" in w for w in warned), warned
+
+
+def test_base_rejects_a_checkout_with_no_origin_remote(recorded_git, tmp_path):
+    _calls, scripted = recorded_git
+    (tmp_path / ".git").mkdir()
+    scripted[("remote", "get-url", "origin")] = (2, "")
+    warned: list[str] = []
+    verifier = GitMergeVerifier(repo_path=str(tmp_path), warn=warned.append)
+    s = state(work_branch="b", repo_default_branch="main")
+    assert verifier.branch_has_commits(s) is None
+    assert any("no 'origin' remote configured" in w for w in warned), warned
+
+
+def test_base_rejects_a_checkout_of_the_wrong_repo(recorded_git, tmp_path):
+    """A perfectly valid checkout — just of the wrong project. Must not be
+    trusted to answer merge-verification questions about *this* repo."""
+    _calls, scripted = recorded_git
+    (tmp_path / ".git").mkdir()
+    scripted[("remote", "get-url", "origin")] = (
+        0,
+        "https://github.com/john/some-other-repo.git\n",
+    )
+    warned: list[str] = []
+    verifier = GitMergeVerifier(repo_path=str(tmp_path), warn=warned.append)
+    s = state(work_branch="b", repo_default_branch="main")
+    assert verifier.branch_has_commits(s) is None
+    assert any(
+        "does not match the expected repo" in w and "john/claude-coordinator" in w
+        for w in warned
+    ), warned
+
+
+def test_base_skips_the_repo_match_check_when_repo_github_is_unset(
+    recorded_git, tmp_path
+):
+    """Some callers (the ``verify_merged`` tests above) legitimately don't
+    know the GitHub identifier yet — the match check must not fire and turn
+    an otherwise-valid checkout into a false ``None``."""
+    _calls, scripted = recorded_git
+    (tmp_path / ".git").mkdir()
+    scripted[("remote", "get-url", "origin")] = (
+        0,
+        "https://github.com/someone/unrelated.git\n",
+    )
+    scripted[("rev-list",)] = (0, "2\n")
+    s = state(work_branch="b", repo_github="", repo_default_branch="main")
+    assert GitMergeVerifier(repo_path=str(tmp_path)).branch_has_commits(s) is True
+
+
+def test_base_warns_only_once_for_the_same_broken_checkout(recorded_git, tmp_path):
+    """A checkout that's been broken for days (the #2437 incident: 3 days, 6
+    drive-queue attempts) must warn once, not once per poll — the whole
+    point is a signal an operator can act on, not log spam that gets
+    filtered out."""
+    _calls, scripted = recorded_git
+    (tmp_path / ".git").mkdir()
+    scripted[("rev-parse", "--is-inside-work-tree")] = (128, "")
+    warned: list[str] = []
+    verifier = GitMergeVerifier(repo_path=str(tmp_path), warn=warned.append)
+    s = state(work_branch="b", repo_default_branch="main")
+    for _ in range(6):
+        assert verifier.branch_has_commits(s) is None
+    assert len(warned) == 1, warned
+
+
+def test_base_accepts_a_genuinely_valid_checkout(recorded_git, tmp_path):
+    """The happy path: a real work tree, an `origin` matching the expected
+    repo — no warning, and verification proceeds as normal."""
+    _calls, scripted = recorded_git
+    (tmp_path / ".git").mkdir()
+    scripted[("rev-list",)] = (0, "1\n")
+    warned: list[str] = []
+    verifier = GitMergeVerifier(repo_path=str(tmp_path), warn=warned.append)
+    s = state(work_branch="b", repo_default_branch="main")
+    assert verifier.branch_has_commits(s) is True
+    assert warned == []
+
+
+@pytest.mark.parametrize(
+    "remote_url",
+    [
+        "https://github.com/john/claude-coordinator.git",
+        "https://github.com/john/claude-coordinator",
+        "git@github.com:john/claude-coordinator.git",
+        "git@github.com:john/claude-coordinator",
+        "ssh://git@github.com/john/claude-coordinator.git",
+    ],
+)
+def test_remote_matches_repo_accepts_every_url_shape_git_produces(remote_url):
+    assert _remote_matches_repo(remote_url, "john/claude-coordinator") is True
+
+
+@pytest.mark.parametrize(
+    "remote_url",
+    [
+        "https://github.com/john/some-other-repo.git",
+        "git@github.com:someone-else/claude-coordinator.git",
+        "",
+    ],
+)
+def test_remote_matches_repo_rejects_a_mismatch(remote_url):
+    assert _remote_matches_repo(remote_url, "john/claude-coordinator") is False
 
 
 # ═══════════════════════════════════════════════════════════════════════════
