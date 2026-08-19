@@ -194,7 +194,13 @@ mod tabs_persistence_2286 {
                 panic!("harness: could not create the sandbox HOME at {home:?}: {e}")
             });
             let previous = std::env::var_os("HOME");
-            std::env::set_var("HOME", &home);
+            // SAFETY: set_var is `unsafe` in recent stdlib. `HOME_LOCK` is
+            // held for the lifetime of this guard (released last, per the
+            // field-order comment above), so no other thread observes or
+            // mutates `HOME` concurrently with this write.
+            unsafe {
+                std::env::set_var("HOME", &home);
+            }
             Self {
                 home,
                 previous,
@@ -220,9 +226,16 @@ mod tabs_persistence_2286 {
 
     impl Drop for HomeSandbox {
         fn drop(&mut self) {
-            match &self.previous {
-                Some(prev) => std::env::set_var("HOME", prev),
-                None => std::env::remove_var("HOME"),
+            // SAFETY: set_var/remove_var are `unsafe` in recent stdlib.
+            // `_guard` (holding `HOME_LOCK`) is still live at this point —
+            // it is declared last on the struct and so drops after this
+            // body runs — so no other thread observes or mutates `HOME`
+            // concurrently with this write.
+            unsafe {
+                match &self.previous {
+                    Some(prev) => std::env::set_var("HOME", prev),
+                    None => std::env::remove_var("HOME"),
+                }
             }
             let _ = std::fs::remove_dir_all(&self.home);
         }
