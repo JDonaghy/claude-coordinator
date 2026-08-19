@@ -174,4 +174,5 @@ export interface Assignment {
   for_issue_number: number | null
   driven_by: string | null
   stop_reason: string | null
+  dispatched_by_assignment_id: string | null
 }
