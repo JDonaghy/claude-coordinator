@@ -1304,16 +1304,110 @@ def test_failed_slice_test_stops_with_the_fix_command():
     assert "coord fix ta1" in action.message
 
 
-def test_slice_review_request_changes_stops_with_the_fix_command():
+def test_slice_review_request_changes_dispatches_a_fix():
+    """#2425: the JIT lane's own twin of the work row's `REVIEW:
+    request-changes → fix round` arm — before this, a request-changes
+    verdict on the slice was a dead end nothing ever dispatched a fix for
+    (claude-coordinator#2286: 11 re-authoring retries over ~11h, never once
+    addressing the review)."""
+    counters = DriveCounters()
     action = landing_step(
         landing_state(
             acceptance_review_verdict="request-changes",
             acceptance_merge_status="",
+        ),
+        counters=counters,
+    )
+    assert action.kind == RUN
+    assert action.command == ("fix", "rv1")
+    assert "rv1" in action.label
+    assert not action.is_exit
+    # Spends the SLICE's own budget, not the work row's (#2079's rule,
+    # extended to fix rounds): landing the slice must not silently leave
+    # the issue's own fix budget at zero.
+    assert counters.fix_rounds == 0
+    assert counters.acceptance is not None
+    assert counters.acceptance.fix_rounds == 1
+    assert counters.acceptance.review_fix_dispatched_for == "rv1"
+
+
+def test_slice_review_fix_already_dispatched_waits_for_the_board():
+    """The de-dup latch: a second poll against the SAME review id must not
+    spawn a second fix worker on the same branch (#476/#477)."""
+    counters = DriveCounters()
+    counters.slice_budget().review_fix_dispatched_for = "rv1"
+    action = landing_step(
+        landing_state(
+            acceptance_review_verdict="request-changes",
+            acceptance_merge_status="",
+        ),
+        counters=counters,
+    )
+    assert action.kind == WAIT
+    assert "rv1" in action.label
+    assert counters.acceptance.fix_rounds == 0
+
+
+def test_slice_review_fix_rounds_are_bounded_then_die():
+    """Bounded the same way the work row's fix loop is — a slice review that
+    keeps coming back request-changes must eventually escalate, not spin."""
+    opts = DriveOptions(machine="precision", max_fix_rounds=2)
+    counters = DriveCounters()
+    for expected_round in (1, 2):
+        action = landing_step(
+            landing_state(
+                acceptance_review_verdict="request-changes",
+                acceptance_merge_status="",
+            ),
+            opts,
+            counters=counters,
+        )
+        assert action.kind == RUN
+        assert action.command == ("fix", "rv1")
+        assert counters.acceptance.fix_rounds == expected_round
+        # Clear the latch between rounds the same way a changed review row
+        # would on the real board (a fresh review after the fix landed).
+        counters.acceptance.review_fix_dispatched_for = ""
+
+    action = landing_step(
+        landing_state(
+            acceptance_review_verdict="request-changes",
+            acceptance_merge_status="",
+        ),
+        opts,
+        counters=counters,
+    )
+    assert action.is_exit
+    assert action.exit_code == EXIT_TERMINAL_FAILURE
+    assert "2 fix round(s)" in action.message
+    assert "coord fix rv1" in action.message
+
+
+def test_slice_review_request_changes_with_auto_loop_off_dies_without_dispatching():
+    action = landing_step(
+        landing_state(
+            acceptance_review_verdict="request-changes",
+            acceptance_merge_status="",
+            auto_loop=False,
         )
     )
     assert action.is_exit
     assert action.exit_code == EXIT_TERMINAL_FAILURE
-    assert "coord fix rv1" in action.message
+    assert "auto_loop is OFF" in action.message
+    assert "coord assign --interactive --fix-of rv1" in action.message
+
+
+def test_slice_review_request_changes_with_no_review_id_refuses_to_guess():
+    action = landing_step(
+        landing_state(
+            acceptance_review_verdict="request-changes",
+            acceptance_merge_status="",
+            acceptance_review_aid="",
+        )
+    )
+    assert action.is_exit
+    assert action.exit_code == EXIT_TERMINAL_FAILURE
+    assert "refusing to guess" in action.message
 
 
 def test_no_merge_refuses_up_front_instead_of_idling_to_the_deadline():
