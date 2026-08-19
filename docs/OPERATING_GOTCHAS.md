@@ -30,6 +30,20 @@ against #1491's milestone-#50 exit gate — see
 [`MERGE_AUTO_DRAIN_TRUST_BAR.md`](MERGE_AUTO_DRAIN_TRUST_BAR.md) for the full
 deploy-status audit this produced.
 
+**#2436: `~/src/claude-coordinator` is only an assumption — verify, don't
+guess.** That path is where the "editable install" row above imagines the
+checkout to be; it is not necessarily where a given host's `coord` import
+actually resolves. One coordinator host's install turned out to live at
+`~/src/code-coordinator` instead — a second, disconnected checkout nobody had
+reconciled with this doc, discovered only via manual `git log`/`ps aux`/`tmux
+capture-pane` archaeology while chasing a bug that had, in fact, already been
+fixed on `origin/main`. Don't assume the path and don't assume the pull
+happened: run `coord diagnose --self` on the host in question. It resolves the
+*actual* running install (`Path(coord.__file__).resolve().parents[1]`, not this
+doc's guess) and reports STALE with a commit count when it hasn't been pulled
+since a `coord/**` fix merged — the checkable gate for this row, the same way
+`coord diagnose --graph` is the checkable gate for graphify freshness.
+
 Not academic. #1394 (worker strands uncommitted work, then cleanup destroys it)
 sat merged-but-undeployed, and the very next dispatch — #1402 — hit the
 identical bug: **$3.44 and 10 minutes lost to something already fixed on

@@ -1561,6 +1561,30 @@ def _diagnose_via_daemon(svc, params: dict) -> None:
         "daemon host / operator box.  Read-only, no network required."
     ),
 )
+@click.option(
+    "--self",
+    "self_check",
+    is_flag=True,
+    help=(
+        "#2436: report whether THIS coordinator process's own editable "
+        "`coord` install — wherever `coord.__file__` actually resolves, "
+        "never an assumed ~/src/<name> path — is behind "
+        "origin/<default_branch>.  A merged coord/** fix (other than "
+        "agent.py/serve_app.py) is silently inert here until this checkout "
+        "is pulled (docs/OPERATING_GOTCHAS.md #1).  Fetches from origin "
+        "unless --no-fetch is passed."
+    ),
+)
+@click.option(
+    "--no-fetch",
+    "self_no_fetch",
+    is_flag=True,
+    help=(
+        "With --self, skip the `git fetch` and compare HEAD against "
+        "whatever origin/<default_branch> the last fetch already left "
+        "behind."
+    ),
+)
 
 
 @_CONFIG_OPTION
@@ -1575,6 +1599,8 @@ def diagnose(
     orphan_worktrees: bool = False,
     graph_health: bool = False,
     config_provenance_check: bool = False,
+    self_check: bool = False,
+    self_no_fetch: bool = False,
 ) -> None:
     """Per-stage doctor — diagnose, best-effort recover, optional reset."""
     # ── graphify graph freshness sweep (read-only) ───────────────────────────
@@ -1585,6 +1611,11 @@ def diagnose(
     # ── #1779: fleet coordinator.yml provenance (read-only) ─────────────────
     if config_provenance_check:
         _diagnose_config_provenance()
+        return
+
+    # ── #2436: THIS process's own editable coord install freshness ──────────
+    if self_check:
+        _diagnose_self(fetch=not self_no_fetch)
         return
 
     # ── #618: --orphan-worktrees fleet sweep ─────────────────────────────────
@@ -1760,6 +1791,40 @@ def _diagnose_config_provenance() -> None:
     for line in format_provenance_lines(prov):
         click.echo(f"  {line}")
     click.echo(summary_line(prov))
+
+
+def _diagnose_self(*, fetch: bool) -> None:
+    """Report whether THIS process's own editable ``coord`` install is
+    behind origin (#2436).
+
+    Read-only, local-machine only — same family as ``--graph``/
+    ``--config-provenance``/``--orphan-worktrees``. Answers the question
+    ``docs/OPERATING_GOTCHAS.md`` #1 names but nothing previously checked:
+    "did the `git pull` this editable install depends on for `coord/**`
+    fixes to go live actually happen?" A coordinator host running last
+    week's code gives zero signal of it otherwise — every board row and
+    escalation reads exactly as if a merged fix were still unfixed (the
+    #2286/#2426 incident this closes).
+
+    Locates the install via ``coord.self_health.default_install_path()`` —
+    ``Path(coord.__file__).resolve().parents[1]``, never an assumed
+    ``~/src/<name>`` path (the doc's own assumption had drifted from reality
+    on the host that hit this).  Each coordinator/drive-queue host has its
+    own independent editable checkout that can drift independently, so this
+    is deliberately per-machine, run where it's invoked, exactly like
+    ``--graph``.
+    """
+    from coord.self_health import (  # noqa: PLC0415
+        default_install_path,
+        format_status_lines,
+        self_freshness,
+        summary_line as self_summary_line,
+    )
+
+    st = self_freshness(install_path=default_install_path(), fetch=fetch)
+    for line in format_status_lines(st):
+        click.echo(f"  {line}")
+    click.echo(self_summary_line(st))
 
 
 def _diagnose_orphan_worktrees(config_path: Path, *, dry_run: bool) -> None:
