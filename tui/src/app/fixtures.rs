@@ -297,6 +297,11 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         help_registry: {
             let mut registry = HelpRegistry::new();
             registry.register("panel:plans", CoordApp::plans_view_help());
+            // #2287 (ms-65 §8b): same registration `CoordApp::new()` does —
+            // fixtures must not skip it, or a test driving the Board `?`
+            // overlay would find an empty registry regardless of what it
+            // exercises.
+            registry.register("panel:board", CoordApp::board_view_help());
             registry
         },
         help_overlay: HelpOverlayController::new(),

@@ -1941,6 +1941,38 @@ impl CoordApp {
         }
     }
 
+    // ─── #2287 (ms-65 §8b): `?` help overlay content ──────────────────────
+
+    /// The reusable quadraui help-layer content for the Board panel
+    /// (contract §8b), registered under `"panel:board"` in `CoordApp::new`
+    /// / `app::fixtures` — see `plans.rs`'s module docs for the overall
+    /// `HelpRegistry`/`ViewHelp` pattern this copies.
+    ///
+    /// Only `notes` (no `actions` — Board doesn't get a `/` command
+    /// palette; `SidebarView::help_view_id`'s doc comment on the `Board`
+    /// arm explains why `events.rs` deliberately never calls
+    /// `open_command_palette` for it). `render_help_overlay` (`plans.rs`)
+    /// paints this list's header as **"Document tabs"** rather than the
+    /// generic **"Reference"** Plans gets — a Board-only special case
+    /// there, mirroring how it already special-cases the Plans-only
+    /// "Health chips" section.
+    ///
+    /// The six rows are contract §8b's own pinned phrases, verbatim, and
+    /// match `mocks/board-tabs-help-overlay.screen`'s "Document tabs"
+    /// section exactly (its "Split" section is #2288's, deliberately not
+    /// modeled here — see that issue and finding 14 in
+    /// `tests/acceptance/ms-65/manifest.yml`).
+    pub(crate) fn board_view_help() -> ViewHelp {
+        ViewHelp::new("Board").with_notes(vec![
+            HelpNote::new("click row", "open preview tab"),
+            HelpNote::new("double-click row", "pin tab"),
+            HelpNote::new("Ctrl-W", "close active tab"),
+            HelpNote::new("Ctrl-Tab / Ctrl-Shift-Tab", "cycle tabs"),
+            HelpNote::new("middle-click tab", "close tab"),
+            HelpNote::new("right-click tab", "tab menu"),
+        ])
+    }
+
     pub(crate) fn board_detail_tab_bar(&self) -> TabBar {
         // #316: show an active-dot on the Board Chat tab while a board chat is live.
         let board_chat_live = self.chat_is_board_chat();
