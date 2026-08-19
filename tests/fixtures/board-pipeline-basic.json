@@ -218,6 +218,58 @@
     }
   ],
 
+  "drive_queue": [
+    {
+      "repo_name": "claude-coordinator",
+      "issue_number": 4201,
+      "position": 0,
+      "machine": "precision",
+      "after_json": [],
+      "state": "running",
+      "attempts": 1,
+      "deferrals": 0,
+      "last_reason": "",
+      "session_name": "drive-cc-4201",
+      "hold_after": false,
+      "hold_reason": "",
+      "hold_state": "",
+      "hold_scope": "entry",
+      "resumes": 0
+    },
+    {
+      "repo_name": "claude-coordinator",
+      "issue_number": 4202,
+      "position": 1,
+      "machine": "",
+      "after_json": ["claude-coordinator#4201"],
+      "state": "waiting",
+      "attempts": 0,
+      "deferrals": 1,
+      "last_reason": "waiting on claude-coordinator#4201",
+      "hold_after": false,
+      "hold_reason": "",
+      "hold_state": "",
+      "hold_scope": "entry",
+      "resumes": 0
+    },
+    {
+      "repo_name": "quadraui",
+      "issue_number": 88,
+      "position": 0,
+      "machine": "",
+      "after_json": [],
+      "state": "waiting",
+      "attempts": 0,
+      "deferrals": 0,
+      "last_reason": "",
+      "hold_after": true,
+      "hold_reason": "deploy gate: schema migration",
+      "hold_state": "fired",
+      "hold_scope": "fleet",
+      "resumes": 0
+    }
+  ],
+
   "proposals": [
     {
       "id": 1,

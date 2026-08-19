@@ -505,19 +505,43 @@ class TestDriveQueueAPI:
         # blocked outranks everything else in the level ranking.
         assert summary["level"] == "blocked"
 
-    def test_repo_filter_scopes_entries_and_summary(self, rw_db) -> None:
-        from coord.state import _enqueue_drive_queue_local
+    def test_repo_filter_scopes_entries_but_not_the_summary(self, rw_db) -> None:
+        """``?repo=`` narrows ``entries``; ``summary`` stays fleet-wide.
+
+        Non-blocking review finding on #2428: `fleet_held`/`level` are
+        documented (both in `tui/src/app/drive_queue.rs` and the Python port)
+        as fleet-wide facts — "non-zero means the tick launches nothing at
+        all" — and the summary's `_after_satisfied` treats a pre-req absent
+        from the entries it's given as satisfied. Summarizing only the
+        `?repo=`-filtered subset would let `GET /api/drive-queue?repo=api`
+        report `level: "normal"` while a DIFFERENT repo's fired fleet gate is
+        actually holding the whole queue. So `summary` must always reflect
+        the full queue, exactly like `entries_from_rows`' one Rust call site
+        always passes the unfiltered board queue.
+        """
+        from coord.state import _enqueue_drive_queue_local, _update_drive_queue_entry_local
 
         _enqueue_drive_queue_local("api", 1)
-        _enqueue_drive_queue_local("web", 2)
+        _enqueue_drive_queue_local(
+            "web", 2, hold_after=True, hold_reason="deploy gate", hold_scope="fleet",
+        )
+        _update_drive_queue_entry_local("web", 2, hold_state="fired")
 
         client = _client()
         r = client.get("/api/drive-queue", params={"repo": "api"})
         assert r.status_code == 200
         data = r.json()
+        # entries: narrowed to the requested repo.
         assert [e["repo_name"] for e in data["entries"]] == ["api"]
-        assert data["summary"]["pending"] == 1
-        assert data["summary"]["waiting"] == 1
+        # summary: unaffected by the filter — the "web" entry's fleet-scoped
+        # fired gate is still visible even though its row is filtered out of
+        # `entries`.
+        unfiltered = client.get("/api/drive-queue").json()
+        assert data["summary"] == unfiltered["summary"]
+        assert data["summary"]["pending"] == 2
+        assert data["summary"]["fleet_held"] == 1
+        assert data["summary"]["held"] == 1
+        assert data["summary"]["level"] == "held"
 
 
 class TestApproveAPI:

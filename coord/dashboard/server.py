@@ -35,6 +35,7 @@ from coord.events import (
     build_events_route,
 )
 from coord.board_service import read_board, write_board
+from coord.dao import _JSON_COLUMNS
 from coord.db import _ensure_schema
 from coord.drive_queue import DriveQueueSummary, entries_from_rows, summarize_drive_queue
 from coord.models import Assignment
@@ -330,12 +331,18 @@ def openapi_spec() -> dict:
     # builds `BoardDriveQueueEntry` for `/board` — the wire schema *is* the
     # DDL (coord/db.py), not a hand-maintained field list that can drift from
     # it. `after_json` is JSON-encoded TEXT in SQLite, decoded to an array on
-    # the wire (mirrors coord.dao._JSON_COLUMNS).
+    # the wire — the JSON columns come from `coord.dao._JSON_COLUMNS` itself
+    # (the same source `coord/serve_app.py`'s `_board_response_schema` derives
+    # its own `frozenset(_JSON_COLUMNS.get(table, ()))` from) rather than a
+    # second hand-maintained literal, so a future JSON column on `drive_queue`
+    # only needs updating in one place (#2096).
     _schema_conn = sqlite3.connect(":memory:")
     try:
         _ensure_schema(_schema_conn)
         components["BoardDriveQueueEntry"] = sqlite_table_schema(
-            _schema_conn, "drive_queue", json_columns=frozenset({"after_json"})
+            _schema_conn,
+            "drive_queue",
+            json_columns=frozenset(_JSON_COLUMNS.get("drive_queue", ())),
         )
     finally:
         _schema_conn.close()
@@ -416,7 +423,14 @@ def openapi_spec() -> dict:
                         "in": "query",
                         "required": False,
                         "schema": {"type": "string"},
-                        "description": "Restrict entries (and the summary) to one repo.",
+                        "description": (
+                            "Restrict `entries` to one repo. `summary` is always "
+                            "computed over the FULL queue, whatever `repo` is set "
+                            "to — `fleet_held`/`level` are fleet-wide facts (a "
+                            "fleet-scoped fired deploy gate anywhere stops the "
+                            "whole tick), so narrowing the summary to one repo "
+                            "could misreport it as clear."
+                        ),
                     }
                 ],
                 "responses": {
@@ -678,6 +692,19 @@ def build_app(
         if _fixture is not None:
             return
         write_board(board)
+
+    def _read_drive_queue() -> list[dict]:
+        """Every drive-queue row — seeded fixture or the daemon/local DB (#2428).
+
+        ALWAYS the full, unfiltered queue, same as ``_read_board()`` for the
+        board: ``?repo=`` is applied by ``api_drive_queue`` itself, to the
+        response's ``entries`` list only, AFTER this. That is deliberate, not
+        an oversight — see ``api_drive_queue``'s docstring for why the
+        aggregate summary must never be computed over a repo-filtered subset.
+        """
+        if _fixture is not None:
+            return _fixture.drive_queue()
+        return list_drive_queue()
 
     # ── Real-time event bus ────────────────────────────────────────────────
     event_source = EventSource()
@@ -961,27 +988,40 @@ def build_app(
         """GET /api/drive-queue?repo= — the operator-declared `coord drive`
         work queue, plus a server-computed aggregate summary (#2428 DQW-1).
 
-        Mirrors ``api_board``'s shape: one call to the seam that already
-        resolves daemon-vs-local (``coord.state.list_drive_queue`` — the same
-        function ``coord drive-queue list`` itself calls, which routes to
-        ``coord.client.fetch_drive_queue(svc, repo)`` when a board service is
-        configured and to the local DB otherwise), then a pure aggregate
-        (:func:`coord.drive_queue.summarize_drive_queue`) over the typed rows
-        so the Queue panel sidebar doesn't have to recompute
-        pending/running/waiting/eligible/blocked/held counts client-side from
-        a possibly ``?repo=``-filtered view. ``entries`` is the raw row list
-        verbatim — same shape as the daemon's own ``GET /drive-queue`` and
-        ``/board``'s ``drive_queue`` field — no reshaping, no new fields.
+        Mirrors ``api_board``'s shape via ``_read_drive_queue()`` (the fixture-
+        vs-live indirection every other handler in this file goes through —
+        see ``_read_board()``), which resolves daemon-vs-local exactly like
+        ``coord drive-queue list`` itself does. ``entries`` is the raw row
+        list — optionally narrowed to ``?repo=`` — verbatim: same shape as the
+        daemon's own ``GET /drive-queue`` and ``/board``'s ``drive_queue``
+        field, no reshaping, no new fields.
+
+        ``summary`` (:func:`coord.drive_queue.summarize_drive_queue`) is
+        DELIBERATELY computed over the FULL, unfiltered queue, never the
+        ``?repo=``-narrowed one — even though only ``entries`` respects the
+        filter. This mirrors the summary's one existing call site
+        (``tui/src/app/mod.rs``'s ``summarize_drive_queue(&self.data.drive_queue)``,
+        always the whole board queue) and is required for correctness, not
+        just consistency: ``fleet_held``/``level == "held"`` is documented as
+        "a non-zero fleet-scoped fired gate stops the tick from launching
+        ANYTHING, whatever repo it's in", and ``summarize_drive_queue``'s
+        ``after=`` satisfaction check (``_after_satisfied``) treats a pre-req
+        absent from the entries it's given as already satisfied ("it may have
+        landed long ago"). Summarizing only the filtered subset would let
+        ``GET /api/drive-queue?repo=web`` report ``level: "normal"`` while a
+        DIFFERENT repo's entry actually holds the whole fleet queue, and could
+        count a cross-repo ``after=`` dependency as eligible when the real
+        prerequisite is still pending, just filtered out of view. So the
+        Queue panel sidebar's pending/running/waiting/eligible/blocked/held
+        counts are always fleet-wide, exactly like the TUI's; only the visible
+        row list narrows with ``?repo=``.
         """
         from dataclasses import asdict
 
         repo = request.query_params.get("repo") or None
-        entries = (
-            _fixture.drive_queue(repo)
-            if _fixture is not None
-            else list_drive_queue(repo)
-        )
-        summary = summarize_drive_queue(entries_from_rows(entries))
+        rows = _read_drive_queue()
+        summary = summarize_drive_queue(entries_from_rows(rows))
+        entries = [r for r in rows if r.get("repo_name") == repo] if repo else rows
         return JSONResponse({"entries": entries, "summary": asdict(summary)})
 
     async def api_approve(request: Request) -> JSONResponse:
