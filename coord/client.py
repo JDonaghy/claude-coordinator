@@ -510,6 +510,36 @@ def fetch_drive_queue_entry(
     return None
 
 
+def post_drive_queue(
+    svc: ServiceConfig,
+    action: str,
+    *,
+    timeout: float = _WRITE_TIMEOUT,
+    **fields,
+) -> dict:
+    """POST /drive-queue {action, ...fields} — the write side of
+    :func:`fetch_drive_queue` (#2429 DQW-2).
+
+    *fields* are forwarded verbatim as sibling keys next to ``action``,
+    e.g. ``post_drive_queue(svc, "move", repo_name="api", issue_number=1,
+    to_position=0)`` or ``post_drive_queue(svc, "update", repo_name="api",
+    issue_number=1, fields={"hold_state": "released"})`` — same body shape
+    ``coord/serve_app.py``'s ``post_drive_queue`` route (``action`` in
+    ``{enqueue, dequeue, update, move}``) already accepts, so a caller just
+    passes through whatever ``coord/dashboard/server.py``'s
+    ``/api/drive-queue/action`` handler decided to send. Returns the
+    decoded per-action response (``{"moved": bool}`` / ``{"deleted": bool}``
+    / ``{"updated": bool}`` / ``{"entry_id": int}``).
+
+    Unlike :func:`fetch_drive_queue` this is NOT fail-soft: it raises
+    ``httpx.HTTPError`` on transport/HTTP failure, the same posture as
+    :func:`post_cordon`/:func:`post_pause`/:func:`post_quiet_hours` — a
+    move/remove/unblock/resume that silently failed to reach the daemon
+    would leave the operator believing the queue changed when it didn't.
+    """
+    return post_record(svc, "/drive-queue", {"action": action, **fields}, timeout=timeout)
+
+
 def fetch_gate_a_approval(
     svc: ServiceConfig,
     repo_name: str,
