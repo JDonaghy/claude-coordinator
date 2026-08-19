@@ -1248,17 +1248,26 @@ def build_app(
                 )
                 ok = bool(result.get("deleted"))
             elif action == "unblock":
-                _drive_queue_write(
+                dequeue_result = _drive_queue_write(
                     "dequeue", repo_name=repo_name, issue_number=issue_number
                 )
-                _drive_queue_write(
-                    "enqueue",
-                    repo_name=repo_name,
-                    issue_number=issue_number,
-                    machine=entry.get("machine"),
-                    after=[],
-                )
-                ok = True
+                if bool(dequeue_result.get("deleted")):
+                    enqueue_result = _drive_queue_write(
+                        "enqueue",
+                        repo_name=repo_name,
+                        issue_number=issue_number,
+                        machine=entry.get("machine"),
+                        after=[],
+                    )
+                    ok = enqueue_result.get("entry_id") is not None
+                else:
+                    # The guard read above (``_read_drive_queue()``) is not
+                    # atomic with this write: the row can be removed/changed
+                    # by a concurrent dequeue/resume/daemon tick between the
+                    # two. If there was nothing to dequeue, there is nothing
+                    # to re-enqueue either — doing so anyway would silently
+                    # resurrect a row someone else legitimately removed.
+                    ok = False
             else:  # resume
                 result = _drive_queue_write(
                     "update",

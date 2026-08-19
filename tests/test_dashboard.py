@@ -642,6 +642,47 @@ class TestDriveQueueActionAPI:
         entries = client.get("/api/drive-queue").json()["entries"]
         assert entries[0]["state"] == "waiting"
 
+    def test_unblock_does_not_reenqueue_when_dequeue_finds_nothing(
+        self, monkeypatch
+    ) -> None:
+        """The guard read (``_read_drive_queue()``) and the write are not
+        atomic — the row can be removed by a concurrent dequeue/daemon tick
+        between the two. If the dequeue that ``unblock`` issues finds
+        nothing to delete, it must NOT still re-enqueue a fresh row: that
+        would silently resurrect an entry someone else legitimately removed
+        (#2429 DQW-2 review).
+        """
+        from coord import client as cc
+
+        monkeypatch.setattr(
+            cc, "resolve_board_service",
+            lambda *a, **k: cc.ServiceConfig("http://d:7435"),
+        )
+        monkeypatch.setattr(
+            cc, "fetch_drive_queue",
+            lambda svc, repo_name=None, **kw: [{
+                "repo_name": "api", "issue_number": 7, "state": "blocked",
+                "hold_state": "", "machine": "laptop", "after_json": [],
+            }],
+        )
+        calls: list[dict] = []
+
+        def _post_drive_queue(svc, action, **fields):
+            calls.append({"action": action, **fields})
+            if action == "dequeue":
+                return {"deleted": False}
+            raise AssertionError(f"unblock must not call {action!r} after a failed dequeue")
+
+        monkeypatch.setattr(cc, "post_drive_queue", _post_drive_queue)
+
+        client = _client()
+        r = client.post("/api/drive-queue/action", json={
+            "repo_name": "api", "issue_number": 7, "action": "unblock",
+        })
+        assert r.status_code == 404
+        assert r.json()["ok"] is False
+        assert calls == [{"action": "dequeue", "repo_name": "api", "issue_number": 7}]
+
     def test_resume_releases_a_fired_gate(self, rw_db) -> None:
         from coord.state import (
             _enqueue_drive_queue_local,
