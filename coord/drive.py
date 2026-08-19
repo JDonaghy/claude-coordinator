@@ -890,7 +890,20 @@ def _decide_acceptance_author(
         # pass-through.
         branch = state.acceptance_author_branch
         probe = replace(state, work_branch=branch) if branch else state
-        if not branch or not verifier.branch_has_commits(probe):
+        commits = verifier.branch_has_commits(probe) if branch else False
+        if commits is None:
+            # #2426: `None` means the check could not be completed (e.g. a
+            # transient `git fetch` failure) — NOT evidence the branch is
+            # empty. Wait for the next poll to retry rather than
+            # misdiagnosing a verification failure as the terminal
+            # zero-commit dead end below.
+            return _wait(
+                label=(
+                    f"ACCEPTANCE: JIT slice {aid} branch {branch!r} — could "
+                    "not verify commits (git fetch failed), retrying"
+                )
+            )
+        if not commits:
             # #2061: a commit-less ADVISORY row IS what an earlier-landed
             # slice's stale/retried author row looks like — check the
             # manifest before declaring failure.
@@ -936,7 +949,20 @@ def _decide_acceptance_author(
         # `advisory` branch's probe exactly.
         branch = state.acceptance_author_branch
         probe = replace(state, work_branch=branch) if branch else state
-        if not branch or not verifier.branch_has_commits(probe):
+        commits = verifier.branch_has_commits(probe) if branch else False
+        if commits is None:
+            # #2426: same distinction as the ADVISORY branch above — a
+            # verification failure is not proof of an empty branch. This is
+            # exactly the claude-coordinator#2286 incident: a real pushed
+            # commit sat on the remote while a transient `git fetch` failure
+            # made this arm declare the branch commit-less and terminal.
+            return _wait(
+                label=(
+                    f"ACCEPTANCE: JIT slice {aid} branch {branch!r} — could "
+                    "not verify commits (git fetch failed), retrying"
+                )
+            )
+        if not commits:
             # #2061 (coord-portal#13): a re-dispatched author that lands in
             # a world where the slice is ALREADY on the default branch
             # correctly does nothing — DONE with zero commits — and that is
@@ -1142,7 +1168,7 @@ def _acceptance_message(message: str, state: IssueState) -> str:
 class MergeVerifier(Protocol):
     """The git/GitHub questions the state machine cannot answer itself."""
 
-    def branch_has_commits(self, state: IssueState) -> bool: ...
+    def branch_has_commits(self, state: IssueState) -> bool | None: ...
 
     def verify_merged(self, state: IssueState) -> bool: ...
 
@@ -1175,9 +1201,23 @@ class GitMergeVerifier:
             check=False,
         )
 
-    def branch_has_commits(self, state: IssueState) -> bool:
-        """True when *branch* exists on the remote and carries a commit the
-        default branch does not.
+    def branch_has_commits(self, state: IssueState) -> bool | None:
+        """``True``/``False`` when *branch* was actually checked against the
+        default branch; ``None`` when the check could not be completed.
+
+        ``False`` means VERIFIED empty: the fetches and the ``rev-list``
+        count all succeeded, and the count was exactly 0. ``None`` means no
+        such evidence exists — a transient ``git fetch`` failure (network
+        blip, GitHub hiccup, SSH auth glitch — see ``is_ci_unreadable_reason``
+        for the CI-side equivalent of this exact distinction), a missing
+        local checkout, or an unparsable ``rev-list`` count. Before #2426
+        every one of those collapsed into ``False``, indistinguishable from a
+        genuinely empty branch — and callers treated ``False`` as proof of a
+        TERMINAL dead end, misdiagnosing a fetch hiccup as "nothing was ever
+        authored" (claude-coordinator#2286: a real, pushed commit sat on the
+        remote while `coord drive` declared the branch commit-less and burned
+        11 retry cycles re-authoring from scratch). ``None`` must never be
+        treated as "no commits" — callers wait and let the next poll retry.
 
         Used to tell a REAL zero-commit advisory apart from the #1357 false
         positive, where the agent downgrades a good DONE over an artifact glob
@@ -1188,19 +1228,19 @@ class GitMergeVerifier:
             return False
         base = self._base(state)
         if base is None:
-            return False
+            return None
         target = state.repo_default_branch or "main"
         if self._git(base, "fetch", "--quiet", "origin", target).returncode != 0:
-            return False
+            return None
         if self._git(base, "fetch", "--quiet", "origin", branch).returncode != 0:
-            return False
+            return None
         proc = self._git(base, "rev-list", "--count", f"origin/{target}..FETCH_HEAD")
         if proc.returncode != 0:
-            return False
+            return None
         try:
             return int((proc.stdout or "0").strip() or 0) > 0
         except ValueError:
-            return False
+            return None
 
     def verify_merged(self, state: IssueState) -> bool:
         """Confirm the branch actually landed on the target.
@@ -1620,16 +1660,22 @@ def decide(
         pass
     elif state.work_status == "advisory":
         advisory = _decide_advisory(state, opts, counters, machine, verifier)
-        # #2416: `_decide_advisory` now returns a RUN action (a bounded
-        # `coord retry` dispatch) for the zero-commit case, not only an EXIT
-        # — `is_exit` alone would let a RUN action fall through to the
+        # #2416: `_decide_advisory` returns a RUN action (a bounded `coord
+        # retry` dispatch) for the zero-commit case, not only an EXIT —
+        # `is_exit` alone would let a RUN action fall through to the
         # Test/Review/Merge logic below as though the row were validated
-        # work. Only its "proceeding under --accept-advisory" branch returns
-        # WAIT (with warnings to fold in); every other branch (EXIT or RUN)
-        # is this poll's whole answer.
-        if advisory.kind != WAIT:
+        # work. #2426: it returns an explicit WAIT for the "could not verify
+        # — fetch failed" case, which must ALSO be this poll's whole answer,
+        # not folded into the fall-through below (that fall-through means
+        # "commits confirmed present, proceed as normal work", which a
+        # verification failure has not established either way). Only `None`
+        # — "proceeding under --accept-advisory", commits confirmed present
+        # — falls through, carrying its warning.
+        if advisory is not None:
             return advisory
-        warnings = advisory.warnings
+        warnings = (
+            "ADVISORY with commits present — proceeding per --accept-advisory (#1357)",
+        )
     elif state.work_status == "refused_policy":
         # #2234: the worker exited cleanly, pushed 0 commits, and its own
         # final message cited a standing repo-rule prohibition (`coord.agent.
@@ -1683,18 +1729,25 @@ def decide(
     # applies when there is nothing to test, review, or merge. A labelled
     # issue whose worker DID push commits (the label describes the common
     # case, not a hard rule) falls through unchanged — `branch_has_commits`
-    # is False only for the genuine 0-commit shape.
-    if (
-        state.work_status == "done"
-        and DELIVERABLE_ANALYSIS_LABEL in state.issue_labels
-        and (not state.work_branch or not verifier.branch_has_commits(state))
-    ):
-        return _succeed(
-            f"✓ ANALYSIS DELIVERABLE — {state.work_aid} completed with 0 "
-            f"commits (issue labelled `{DELIVERABLE_ANALYSIS_LABEL}`); the "
-            "worker's final message is the deliverable and was posted to "
-            "the issue automatically — nothing to test, review, or merge."
-        )
+    # is False only for the genuine 0-commit shape; `None` (#2426 — the
+    # check could not be completed, e.g. a `git fetch` failure) is neither
+    # "done" nor "push commits", so it waits below instead of guessing.
+    if state.work_status == "done" and DELIVERABLE_ANALYSIS_LABEL in state.issue_labels:
+        commits = verifier.branch_has_commits(state) if state.work_branch else False
+        if commits is None:
+            return _wait(
+                label=(
+                    f"ANALYSIS: {state.work_aid} — could not verify branch "
+                    "commits (git fetch failed), retrying"
+                )
+            )
+        if not commits:
+            return _succeed(
+                f"✓ ANALYSIS DELIVERABLE — {state.work_aid} completed with 0 "
+                f"commits (issue labelled `{DELIVERABLE_ANALYSIS_LABEL}`); the "
+                "worker's final message is the deliverable and was posted to "
+                "the issue automatically — nothing to test, review, or merge."
+            )
 
     # A 'done' row with no branch never pushed anything either.
     if not state.work_branch:
@@ -1851,7 +1904,7 @@ def _decide_advisory(
     counters: DriveCounters,
     machine: str,
     verifier: MergeVerifier,
-) -> Action:
+) -> Action | None:
     """The #448 downgrade: the agent flagged a zero-commit / stash-miss exit.
 
     #1357 makes this a FALSE POSITIVE for every Python-only headless assignment
@@ -1873,8 +1926,30 @@ def _decide_advisory(
     advisory_retries`) before finally giving up, so a row whose correct
     resolution really is "dispatch something else" still reaches a terminal
     `_die()` naming `coord retry` for a human — never an unbounded loop.
+
+    Returns ``None`` only for the "commits confirmed present, proceed under
+    --accept-advisory" case — the caller (`decide`) reads ``None`` as "fall
+    through to the normal Test/Review/Merge machinery", the same "nothing to
+    report, proceed" convention `_decide_test`/`_decide_review`/
+    `_decide_acceptance_gate` already use. Every other outcome, including the
+    #2426 "could not verify" case below, returns a real ``Action`` that IS
+    this poll's whole answer.
     """
-    if not state.work_branch or not verifier.branch_has_commits(state):
+    branch = state.work_branch
+    commits = verifier.branch_has_commits(state) if branch else False
+    if commits is None:
+        # #2426: `git fetch` failing does not mean the branch is empty — it
+        # means nothing was learned. Wait for the next poll to retry the
+        # check itself; do NOT spend an `advisory_retries` budget attempt (or
+        # worse, `_die()`) on a verification failure that says nothing about
+        # what the branch actually contains.
+        return _wait(
+            label=(
+                f"WORK: {state.work_aid} ADVISORY — could not verify branch "
+                "commits (git fetch failed), retrying"
+            )
+        )
+    if not commits:
         budget = opts.max_work_retries
         if counters.advisory_retries >= budget:
             return _die(
@@ -1913,12 +1988,9 @@ def _decide_advisory(
             "   Proceed anyway with --accept-advisory (and fix #1357 to stop "
             "needing it)."
         )
-    return Action(
-        kind=WAIT,
-        warnings=(
-            "ADVISORY with commits present — proceeding per --accept-advisory (#1357)",
-        ),
-    )
+    # Commits confirmed present, --accept-advisory set: fall through to the
+    # normal Test/Review/Merge machinery (the caller attaches the warning).
+    return None
 
 
 def _decide_acceptance_gate(

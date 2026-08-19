@@ -87,7 +87,7 @@ class FakeVerifier:
     def __init__(
         self,
         *,
-        has_commits: bool = True,
+        has_commits: bool | None = True,
         merged: bool = True,
         head_sha: str | None = "deadbeef" * 5,
     ) -> None:
@@ -98,7 +98,7 @@ class FakeVerifier:
         self.merged_calls = 0
         self.head_sha_calls = 0
 
-    def branch_has_commits(self, s: IssueState) -> bool:
+    def branch_has_commits(self, s: IssueState) -> bool | None:
         self.commits_calls += 1
         return self._has_commits
 
@@ -1019,6 +1019,29 @@ def test_oracle_active_advisory_with_no_commits_is_not_terminal_when_the_slice_a
     )
 
 
+def test_oracle_active_advisory_with_unverifiable_branch_waits():
+    """#2426: `branch_has_commits` returning `None` (e.g. a `git fetch`
+    failure) must NOT be treated as "no commits" — that misdiagnoses a
+    transient verification failure as the terminal "nothing was authored"
+    dead end (claude-coordinator#2286: a real, pushed commit sat on the
+    remote while this exact path declared the branch commit-less). It must
+    wait and let the next poll retry the check instead."""
+    oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
+    verifier = FakeVerifier(has_commits=None)
+    action = step(
+        oracle_state(
+            acceptance_author_aid="ta1",
+            acceptance_author_status="advisory",
+            acceptance_author_branch="test-author-ms-65-slice-2286",
+        ),
+        oracle=oracle,
+        verifier=verifier,
+    )
+    assert action.kind == WAIT
+    assert not action.is_exit
+    assert "no commits" not in (action.message or "")
+
+
 def test_oracle_active_advisory_with_commits_requires_accept_advisory():
     """The #1357 false-positive shape — real commits, downgraded to
     advisory anyway — must not be treated as "still landing"; it needs the
@@ -1146,6 +1169,29 @@ def test_oracle_active_done_with_no_branch_is_terminal():
     assert action.is_exit
     assert action.exit_code == EXIT_TERMINAL_FAILURE
     assert "no commits" in action.message
+
+
+def test_oracle_active_done_with_unverifiable_branch_waits():
+    """#2426: the exact incident this issue documents — a terminal
+    `test-author` DONE row whose branch really did carry a commit
+    (claude-coordinator#2286's `test-author-ms-65-slice-2286`, commit
+    `250b4df8`), observed through a `git fetch` failure. Must wait and
+    retry, not declare DONE terminal-with-no-commits and burn a re-author
+    cycle."""
+    oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
+    verifier = FakeVerifier(has_commits=None)
+    action = step(
+        oracle_state(
+            acceptance_author_aid="ta1",
+            acceptance_author_status="done",
+            acceptance_author_branch="test-author-ms-65-slice-2286",
+        ),
+        oracle=oracle,
+        verifier=verifier,
+    )
+    assert action.kind == WAIT
+    assert not action.is_exit
+    assert "no commits" not in (action.message or "")
 
 
 def test_oracle_active_done_with_commits_lands_the_slice():
@@ -1658,6 +1704,23 @@ def test_advisory_with_no_commits_retries_via_coord_retry_then_stops_at_the_cap(
     assert verifier.commits_calls == 2
 
 
+def test_advisory_with_unverifiable_branch_waits_without_spending_a_retry():
+    """#2426: a `git fetch` failure while checking the branch is not proof
+    it's empty. Must wait for the next poll rather than either spending an
+    `advisory_retries` budget attempt or (once the budget is spent) dying
+    with the terminal "no commits" message on evidence that never
+    materialized."""
+    verifier = FakeVerifier(has_commits=None)
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_work_retries=1)
+    s = state(work_aid="w1", work_status="advisory", work_branch="b")
+
+    action = step(s, opts, verifier=verifier, counters=counters)
+    assert action.kind == WAIT
+    assert not action.is_exit
+    assert counters.advisory_retries == 0
+
+
 def test_advisory_with_no_commits_retry_is_unaffected_by_accept_advisory():
     """#1606: `--accept-advisory` exists to unblock the #1357 false-positive
     (real commits, downgraded status) — it must NOT adopt a genuine
@@ -1754,6 +1817,23 @@ def test_analysis_deliverable_done_with_no_commits_succeeds():
     assert action.exit_code == EXIT_OK
     assert "ANALYSIS" in action.message
     assert "deliverable:analysis" in action.message
+
+
+def test_analysis_deliverable_done_with_unverifiable_branch_waits():
+    """#2426: a `git fetch` failure while checking an analysis-labelled
+    branch is neither "0-commit success" nor "commits pushed, fall
+    through" — it's no evidence at all. Must wait for the next poll."""
+    action = step(
+        state(
+            work_aid="w1",
+            work_status="done",
+            work_branch="issue-2132-diagnose",
+            issue_labels=("deliverable:analysis",),
+        ),
+        verifier=FakeVerifier(has_commits=None),
+    )
+    assert action.kind == WAIT
+    assert not action.is_exit
 
 
 def test_analysis_deliverable_done_with_no_branch_at_all_succeeds():
@@ -4196,20 +4276,60 @@ def test_branch_has_commits_is_false_for_zero(recorded_git, tmp_path):
     assert GitMergeVerifier(repo_path=str(tmp_path)).branch_has_commits(s) is False
 
 
-def test_branch_has_commits_is_false_when_the_remote_branch_is_missing(
+def test_branch_has_commits_is_none_when_rev_list_fails(recorded_git, tmp_path):
+    """#2426: both fetches succeeded but `rev-list` itself failed — still no
+    completed count, so still `None`, not `False`."""
+    _calls, scripted = recorded_git
+    (tmp_path / ".git").mkdir()
+    scripted[("rev-list",)] = (128, "")
+    s = state(work_branch="b")
+    assert GitMergeVerifier(repo_path=str(tmp_path)).branch_has_commits(s) is None
+
+
+def test_branch_has_commits_is_none_when_rev_list_output_is_unparsable(
     recorded_git, tmp_path
 ):
+    """#2426: a malformed count is the same "learned nothing" shape as a
+    failed command — `None`, not `False`."""
+    _calls, scripted = recorded_git
+    (tmp_path / ".git").mkdir()
+    scripted[("rev-list",)] = (0, "not-a-number\n")
+    s = state(work_branch="b")
+    assert GitMergeVerifier(repo_path=str(tmp_path)).branch_has_commits(s) is None
+
+
+def test_branch_has_commits_is_none_when_a_fetch_fails(recorded_git, tmp_path):
+    """#2426: a `git fetch` failure (returncode 128 here covers both "branch
+    genuinely doesn't exist on the remote" and "transient network/auth
+    blip" — the two are indistinguishable from the exit code alone) must NOT
+    collapse into `False`. `False` is reserved for a check that actually
+    completed and counted zero commits; a failed fetch produced no such
+    count, so it is `None` — "couldn't verify" — not "verified empty"."""
     _calls, scripted = recorded_git
     (tmp_path / ".git").mkdir()
     scripted[("fetch", "b")] = (128, "")
     s = state(work_branch="b")
-    assert GitMergeVerifier(repo_path=str(tmp_path)).branch_has_commits(s) is False
+    assert GitMergeVerifier(repo_path=str(tmp_path)).branch_has_commits(s) is None
+
+
+def test_branch_has_commits_is_none_when_the_target_fetch_fails(
+    recorded_git, tmp_path
+):
+    """Same #2426 distinction, for the OTHER fetch (`origin/<target>`)."""
+    _calls, scripted = recorded_git
+    (tmp_path / ".git").mkdir()
+    scripted[("fetch", "main")] = (128, "")
+    s = state(work_branch="b", repo_default_branch="main")
+    assert GitMergeVerifier(repo_path=str(tmp_path)).branch_has_commits(s) is None
 
 
 def test_the_verifiers_are_inert_without_a_local_checkout(tmp_path):
+    """#2426: no local checkout means no evidence either way — `None`, not
+    `False`. `verify_merged` is untouched by #2426 (GitHub is its primary
+    source of truth, not this local checkout) and keeps its `False`."""
     verifier = GitMergeVerifier(repo_path=str(tmp_path / "nope"))
     s = state(work_branch="b", repo_github="")
-    assert verifier.branch_has_commits(s) is False
+    assert verifier.branch_has_commits(s) is None
     assert verifier.verify_merged(s) is False
 
 
