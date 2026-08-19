@@ -94,6 +94,7 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         board_detail_tab: BoardDetailTab::default(),
         pipeline_detail_scroll: 0,
         pipeline_log_hscroll: 0,
+        pipeline_log_pinned_assignment: std::collections::HashMap::new(),
         remote_log_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         pending_data: None,
         fetch_error: None,

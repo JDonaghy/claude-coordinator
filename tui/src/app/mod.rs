@@ -2210,6 +2210,18 @@ pub struct CoordApp {
     /// (and h/l) adjust it; the quadraui ListView rasteriser honors `h_scroll`
     /// and paints a horizontal scrollbar when content overflows the viewport.
     pipeline_log_hscroll: usize,
+    /// #2342: sticky per-issue pick for the Pipeline Log tab, keyed by issue
+    /// number. An issue can have more than one candidate log-source
+    /// assignment — most visibly a milestone tracking/epic issue, which
+    /// carries both its own Gate A `mock-author` row and every member's
+    /// `test-author` row (test-author always books `issue_number` to the
+    /// tracking issue, never the member it's actually for). Pressing a
+    /// digit key on the Log tab's source picker records that choice here;
+    /// an absent entry means "auto-pick" (running, else most-recently-
+    /// dispatched — the pre-#2342 behavior). Keyed by issue number rather
+    /// than reset on selection change, so no explicit invalidation hook is
+    /// needed when the user switches issues.
+    pipeline_log_pinned_assignment: std::collections::HashMap<u64, String>,
     /// Cache of remotely-fetched log items, keyed by assignment ID.
     ///
     /// Each entry stores `(fetched_at, items)`. Entries older than 30 s are
@@ -3777,6 +3789,7 @@ impl CoordApp {
             board_detail_tab: BoardDetailTab::default(),
             pipeline_detail_scroll: 0,
             pipeline_log_hscroll: 0,
+            pipeline_log_pinned_assignment: std::collections::HashMap::new(),
             remote_log_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             pending_data: Some(start_data_load()),
             fetch_error: None,
@@ -4543,38 +4556,20 @@ impl CoordApp {
     /// for the old assignment and the new running one would fall back to
     /// HTTP polling — reintroducing the "Loading log…" flicker.
     fn ensure_log_tab_sse(&mut self) {
-        // Pick the same assignment pipeline_log_list does (running → most
-        // recent by dispatched_at) so the pool entry tracks the visible row.
+        // #2342: pick the same assignment pipeline_log_list does — its
+        // pinned choice if any, else running, else most-recent by
+        // dispatched_at — via the shared `log_candidates_for_issue` /
+        // `pick_log_source` so this pool entry tracks whatever's visible,
+        // including a milestone tracking issue's Gate A `mock-author` row
+        // or a member issue's own `test-author` row (both invisible to the
+        // old raw-`issue_number`-only match this replaced).
         let pick_id = self
             .pipeline_sel
-            .and_then(|i| self.pipeline_issues.get(i))
+            .and_then(|i| self.pipeline_issues.get(i).cloned())
             .and_then(|issue| {
-                let local_repo = issue.coord_repo.as_deref();
-                self.data
-                    .assignments
-                    .iter()
-                    .filter(|a| a.issue_number == issue.number)
-                    .filter(|a| match local_repo {
-                        Some(r) => a.repo == r,
-                        None => true,
-                    })
-                    .find(|a| a.status == "running")
-                    .or_else(|| {
-                        self.data
-                            .assignments
-                            .iter()
-                            .filter(|a| a.issue_number == issue.number)
-                            .filter(|a| match local_repo {
-                                Some(r) => a.repo == r,
-                                None => true,
-                            })
-                            .max_by(|a, b| {
-                                a.dispatched_at
-                                    .partial_cmp(&b.dispatched_at)
-                                    .unwrap_or(std::cmp::Ordering::Equal)
-                            })
-                    })
-                    .map(|a| a.id.clone())
+                let candidates = self.log_candidates_for_issue(&issue);
+                let pinned = self.pipeline_log_pinned_assignment.get(&issue.number);
+                pick_log_source(&candidates, pinned).map(|a| a.id.clone())
             });
         let Some(target) = pick_id else {
             return;
@@ -4599,11 +4594,16 @@ impl CoordApp {
         };
         let local_repo = issue.coord_repo.as_deref();
 
+        // #2342: also match via `effective_issue_number()` — a milestone
+        // member issue's `test-author` row always books its raw
+        // `issue_number` to the tracking issue, so a raw-only match can
+        // never find it here (same gap `log_candidates_for_issue` fixes
+        // for the Log tab's own picker).
         let candidates: Vec<_> = self
             .data
             .assignments
             .iter()
-            .filter(|a| a.issue_number == issue.number)
+            .filter(|a| a.issue_number == issue.number || a.effective_issue_number() == issue.number)
             .filter(|a| match local_repo {
                 Some(r) => a.repo == r,
                 None => true,
