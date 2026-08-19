@@ -64,6 +64,22 @@ jobs:
   # CI-local config instead of the fleet's real ~/.coord/coordinator.yml.
   acceptance:
     runs-on: ubuntu-latest
+    # #2447: run inside Microsoft's pre-built Playwright image instead of
+    # `ubuntu-latest` + `npx playwright install --with-deps`/`install-deps`.
+    # That combo's OS-deps step shells out to `apt-get` unconditionally, on
+    # BOTH the browser-binary cache-hit and cache-miss paths, with no timeout
+    # of its own — 2026-08-19's run hung ~17 minutes against an unreachable
+    # `azure.archive.ubuntu.com` mirror before GitHub cancelled it (run
+    # 32303439053, job 96230939784). The #2393 cache (removed below) only
+    # ever covered the browser *download*; it never touched this step. This
+    # container image ships the matching Chromium build AND all of its native
+    # library dependencies (libgtk, libnss3, ...) pre-installed, so there is
+    # no `apt-get` in this job's critical path at all anymore — not "cache
+    # around the mirror flakiness" but "the mirror is never touched".
+    # Tag pinned to the exact @playwright/test version resolved in
+    # package-lock.json (keep these in sync on every Playwright bump —
+    # `mcr.microsoft.com/v2/playwright/tags/list` lists what's available).
+    container: mcr.microsoft.com/playwright:v1.61.1-jammy
     timeout-minutes: 20
     defaults:
       run:
@@ -79,36 +95,6 @@ jobs:
         with:
           node-version: '20'
       - run: npm ci
-      # #2393: same fix as test.yml's `e2e` job — see that job's comment.
-      - name: Cache Playwright browsers
-        id: playwright-cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: ${{ runner.os }}-playwright-${{ hashFiles('coord/dashboard/webapp/package-lock.json') }}
-      - name: Install Playwright + OS deps (cache miss)
-        if: steps.playwright-cache.outputs.cache-hit != 'true'
-        # #2393 follow-up: the Chromium download from Playwright's CDN has hung
-        # (not merely failed) multiple times in one day, past what caching alone
-        # can paper over on a cache-miss run (a version bump, or the very first
-        # run ever). A short per-attempt timeout + retry turns "hang for the
-        # whole 20-minute job budget" into "fail fast and try again" — transient
-        # CDN/mirror flakiness usually clears within a couple of attempts.
-        run: |
-          for attempt in 1 2 3; do
-            echo "Playwright install attempt $attempt/3..."
-            if timeout 300 npx playwright install chromium --with-deps; then
-              echo "Playwright install succeeded on attempt $attempt"
-              exit 0
-            fi
-            echo "Playwright install attempt $attempt failed or timed out after 5m"
-            sleep 10
-          done
-          echo "Playwright install failed after 3 attempts"
-          exit 1
-      - name: Install Playwright OS deps only (cache hit)
-        if: steps.playwright-cache.outputs.cache-hit == 'true'
-        run: npx playwright install-deps chromium
       - name: coord acceptance run --all --ci (web-playwright route, ms-51)
         working-directory: .
         run: >-
