@@ -1512,6 +1512,40 @@ def test_a_dispatch_failure_that_created_no_assignment_backs_off_longer():
     assert len(backoff) == 1 and backoff[0].backing_off is True
 
 
+def test_a_merge_gate_block_retry_does_not_get_the_widened_backoff():
+    """#2424 follow-up: identical setup to the test above (no board-visible
+    assignment for this launch — by itself indistinguishable from a genuine
+    dispatch failure) EXCEPT the entry's own `last_reason` already names a
+    merge-gate block. `_retry_backoff_reason` must not widen the spacing to
+    `DISPATCH_FAILURE_MIN_BACKOFF_SECONDS` (300s) on top of a reason that
+    already says the real cause is a merge-gate block, not a dispatch
+    failure — the same "one question, one answer" fix `_is_merge_gate_block_
+    reason` already applies to the escalation text, now also applied to the
+    retry-pacing decision that answers the same question independently."""
+    launched_at = NOW - DRIVE_STARTUP_GRACE_SECONDS - 400.0
+    entries = [
+        entry(
+            1650,
+            position=3,
+            state=STATE_WAITING,
+            attempts=1,
+            launched_at=launched_at,
+            # Same 90s elapsed as the widened-backoff test above: clears the
+            # plain RETRY_BACKOFF_SECONDS[0] (60s) but not the widened 300s
+            # floor.
+            retry_backoff_at=NOW - 90.0,
+            last_reason=(
+                "merge attempted 3 times without landing. (attempt 2/5) — "
+                "requeued at position 3"
+            ),
+        )
+    ]
+    facts = IssueFacts(known=True, issue_state="open")  # no assignment at all
+    view = BoardView(issues={entry_key(REPO, 1650): facts})
+    plan = plan_tick(entries, view, capacity=1, now=NOW)
+    assert plan.launch is not None and plan.launch.issue == 1650
+
+
 def test_a_dispatched_run_that_died_later_gets_the_plain_backoff_only():
     """The counterpart: a launch that DID dispatch (an assignment exists,
     created after `launched_at`) is NOT treated as a pure dispatch failure —
@@ -1620,6 +1654,53 @@ def test_exhausted_checks_failed_does_not_get_the_dispatch_note():
     assert plan.reconciles[0].outcome == "exhausted"
     reason = plan.blocked[0].reason
     assert "no assignment was ever created" not in reason
+
+
+def test_exhausted_immediate_escalation_merge_status_does_not_get_the_dispatch_note():
+    """#2424's fourth documented shape: `_escalate_merge`'s #1505
+    immediate-escalation path (`coord/drive.py:2809`), whose `Action.message`
+    is `f"merge escalated: {reason}\\n   gates: {gates_summary}\\n..."`
+    (`coord/drive.py:2836`) and whose `reason` for a terminal/unrecognized
+    merge status is `f"merge_status={status or '(empty)'} — no number of
+    retries..."`. `_drive_exit_summary` then wraps that whole message as
+    `f"drive exited for {ident} (exit_code={exit_code}): {reason}"`
+    (`coord/drive.py:3677`) before it is read back verbatim as `own_reason` —
+    so the real string never STARTS WITH "merge_status=", it merely CONTAINS
+    it (both in the `reason` line and again in `gates_summary`'s own
+    `merge_status=...` pair). A prior `.startswith("merge_status=")` check
+    left this one shape unmatched — dead code against real data — so a drive
+    that hit this exact path still got the false #2273 dispatch-note."""
+    entries = [
+        entry(
+            1650,
+            state=STATE_RUNNING,
+            attempts=DEFAULT_MAX_ATTEMPTS - 1,
+            launched_at=NOW - DRIVE_STARTUP_GRACE_SECONDS - 1,
+        )
+    ]
+    own_reason = (
+        "drive exited for claude-coordinator#1650 (exit_code=1): merge "
+        "escalated: merge_status=CONFLICT — no number of retries changes "
+        "this; escalating on first encounter instead of burning the "
+        "merge-attempt budget (#1505)\n"
+        "   gates: merge_status=CONFLICT | merge_reason=(none) | "
+        "review_verdict=approved | test_state=passed | pr_url=(none)\n"
+        "   proposed: coord merge --plan --repo claude-coordinator   "
+        "# inspect the gates, then decide\n"
+        "   Recorded on the board — see: coord escalate list --repo "
+        "claude-coordinator"
+    )
+    facts = IssueFacts(known=True, issue_state="open")
+    view = BoardView(issues={entry_key(REPO, 1650): facts})
+    plan = plan_tick(
+        entries, view, capacity=1, now=NOW,
+        exit_reasons={entry_key(REPO, 1650): own_reason},
+    )
+    assert plan.reconciles[0].outcome == "exhausted"
+    reason = plan.blocked[0].reason
+    assert own_reason in reason
+    assert "no assignment was ever created" not in reason
+    assert "infrastructure/dispatch-layer failure" not in reason
 
 
 def test_a_genuine_dispatch_failure_still_gets_the_note_alongside_own_reason():
