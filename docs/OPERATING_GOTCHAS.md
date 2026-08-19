@@ -44,6 +44,23 @@ doc's guess) and reports STALE with a commit count when it hasn't been pulled
 since a `coord/**` fix merged — the checkable gate for this row, the same way
 `coord diagnose --graph` is the checkable gate for graphify freshness.
 
+**#2443: a LIVE `coord drive` session now self-heals mid-run too.** #2436
+above only helps *before* a new launch — it says nothing about a session
+that was already running, with the OLD code loaded into memory, when the fix
+landed. Python never reloads an already-imported module, so a stale live
+session has no way to notice a fix on its own. `coord/drive.py`'s poll loop
+now watches its own `WAIT` actions: once the identical wait reason repeats
+`_SELF_HEAL_WAIT_STREAK` (10) polls in a row, it compares its own on-disk
+`coord` HEAD (captured once, at session start) against the current one
+(`coord.self_health.self_freshness(fetch=False)` — a local `git rev-parse
+HEAD`, no network). If the checkout moved underneath it, the session exits
+`EXIT_SELF_STALE` — a clean, non-permanent exit `coord drive-queue`'s
+ordinary retry/relaunch path picks straight back up under the current code —
+instead of continuing to poll dead logic for the rest of `--deadline`. This
+is the actual fix for the incident #2436 diagnosed after the fact: a live
+session on dellserver polled one unfetchable path every ~60s for 2+ hours
+after the #2319/#2320 fix that would have resolved it was already on disk.
+
 Not academic. #1394 (worker strands uncommitted work, then cleanup destroys it)
 sat merged-but-undeployed, and the very next dispatch — #1402 — hit the
 identical bug: **$3.44 and 10 minutes lost to something already fixed on

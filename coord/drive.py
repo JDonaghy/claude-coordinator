@@ -114,6 +114,7 @@ from coord.failure_class import (
     plan_usage_limit_resume,
 )
 from coord.models import DELIVERABLE_ANALYSIS_LABEL, POLICY_REFUSAL_MARKER
+from coord.self_health import self_freshness
 from coord.usage_limits import PlanLimits, evaluate_usage_gate, get_plan_limits
 # Lost in the #1584-onto-#1590 rebase: _decide_review() calls this, but the
 # import lived in a hunk #1590 rewrote, so the merge came out textually clean
@@ -181,6 +182,20 @@ EXIT_DISPATCH_REFUSED = 5
 # vimcode#635 for the two live incidents (140 minutes and ~25 minutes of a
 # held queue slot, respectively, producing nothing).
 EXIT_DEAD_END = 6
+# #2443: a deliberate SELF-HEAL exit, not a failure — the drive loop noticed
+# it was stuck repeating the identical WAIT reason (see `_SELF_HEAL_WAIT_
+# STREAK`) while its OWN on-disk `coord` install had moved since this
+# session started. Python never reloads an already-imported module, so a
+# fix landing mid-run is otherwise invisible to a live session for as long
+# as `--deadline` allows — the claude-coordinator#2286 incident this closes
+# polled one unfetchable path every ~60s for 2+ hours after the fix was
+# already on disk. Distinct from EXIT_DISPATCH_REFUSED/EXIT_DEAD_END on
+# purpose: this condition is NOT permanent — relaunching is exactly the fix
+# — so it must fall through `coord.drive_queue._reconcile_running`'s
+# ordinary `retry` branch rather than either of those two `blocked`
+# branches, which is why nothing in drive_queue.py needs to special-case
+# this code at all.
+EXIT_SELF_STALE = 7
 
 
 class DriveError(Exception):
@@ -217,6 +232,31 @@ _CAPTURED_OUTPUT_LIMIT = 4000
 # means a run configured with a bigger flat budget than this default is
 # never *tightened* for the environmental case.
 _ENVIRONMENTAL_WORK_RETRY_BUDGET = 5
+
+# #2443: how many CONSECUTIVE polls of the IDENTICAL `Action.label` to
+# tolerate before `Driver._loop` checks whether its own on-disk `coord`
+# install has moved since this session started. Below this, a same-label
+# repeat is indistinguishable from an ordinary slow-but-progressing wait (a
+# 10-20 minute test, a slow CI check) and checking would just be wasted
+# subprocess calls; at/above it, the check itself is a single local `git
+# rev-parse HEAD` (no network — see `coord.self_health.self_freshness
+# (fetch=False)`), cheap enough to run on every remaining poll of the
+# streak. At the default `--poll` of 60s this is ~10 minutes — fast enough
+# to matter against a multi-hour `--deadline`, slow enough that a routine
+# wait is never mistaken for the stuck case this exists to catch.
+_SELF_HEAL_WAIT_STREAK = 10
+
+
+def _current_self_head() -> str | None:
+    """Real default for `Driver.self_head_probe` (#2443): THIS process's own
+    on-disk `coord` install's current HEAD, or ``None`` when it can't be
+    determined (not a git checkout, unreadable HEAD — see
+    :func:`coord.self_health.self_freshness`). ``fetch=False``: this only
+    needs to notice code that has ALREADY landed locally (e.g. a prior `git
+    pull`), never reaches the network, and therefore never blocks the poll
+    loop on a slow/unreachable origin.
+    """
+    return self_freshness(fetch=False).head_sha
 
 
 def _bounded_tail(text: str, limit: int = _CAPTURED_OUTPUT_LIMIT) -> str:
@@ -3685,8 +3725,19 @@ class Driver:
     # real `claude -p "/usage"` subprocess — mirrors *verifier*/*oracle_gate*
     # above. Defaults to the real (cached, ~60s) probe.
     usage_prober: Callable[[], PlanLimits] = get_plan_limits
+    # #2443: injected so tests can script a fake on-disk HEAD sequence
+    # without a real git checkout — same shape as *usage_prober* above.
+    # Defaults to the real, local-only (`fetch=False`) probe.
+    self_head_probe: Callable[[], str | None] = _current_self_head
 
     _run_log: Path | None = field(default=None, init=False, repr=False)
+    # #2443: this session's own on-disk `coord` HEAD, captured once by
+    # `_loop()` right as the poll loop begins — the baseline every later
+    # `_self_heal_drift_message` check compares against. `None` when it
+    # could not be determined (not a git checkout, unreadable HEAD), which
+    # keeps the self-heal check permanently a no-op for this run rather than
+    # ever comparing against a placeholder.
+    _start_head_sha: str | None = field(default=None, init=False, repr=False)
     # #1499: the terminating Action's own message, captured by `_loop()` right
     # before it returns — `run()` folds this into the `drive_exited` audit
     # summary/details so a non-exceptional terminal exit (e.g. `decide()`
@@ -3817,6 +3868,36 @@ class Driver:
                 self.warn("coord notify returned non-zero")
         finally:
             lock.release()
+
+    # ── self-heal (#2443) ──────────────────────────────────────────────
+    def _self_heal_drift_message(self, label: str, streak: int) -> str | None:
+        """Has THIS process's own on-disk ``coord`` install moved since this
+        drive session started? ``None`` when it hasn't — or when freshness
+        can't be determined at all, which must never be misread as drift —
+        the overwhelmingly common case, so the caller just keeps waiting
+        exactly as before.
+
+        Only ever consulted once *label* (a WAIT ``Action``'s own reason)
+        has repeated *streak* times in a row (``_loop``'s
+        ``_SELF_HEAL_WAIT_STREAK`` gate) — this is specifically the #2286
+        shape: ``_decide_acceptance_author``'s "could not verify commits
+        (git fetch failed), retrying" arm returned the IDENTICAL label every
+        ~60s for 2+ hours after the fix that would have resolved it had
+        already landed on disk, because Python never reloads an
+        already-imported module. A stale in-memory `coord/drive.py` has no
+        way to notice that on its own — this is the bounded check that lets
+        it notice anyway.
+        """
+        current = self.self_head_probe()
+        if not current or not self._start_head_sha or current == self._start_head_sha:
+            return None
+        return (
+            "code changed underneath this session — on-disk coord moved "
+            f"from {self._start_head_sha[:8]} to {current[:8]} while stuck "
+            f"repeating the same wait {streak}x: {label!r}. Exiting "
+            "(EXIT_SELF_STALE) so coord drive-queue relaunches with "
+            f"current code instead of continuing to wait on stale logic (#2443)."
+        )
 
     def _post_escalation_comment(self, state: IssueState, message: str) -> None:
         """#1526: durably surface an escalation's reason onto the issue
@@ -4061,6 +4142,15 @@ class Driver:
         # nudge) while guaranteeing a stalled stage is never more than one
         # `stall_secs` window away from a fresh check.
         last_nudge: float | None = None
+        # #2443: this session's own on-disk `coord` HEAD, captured once,
+        # right as the poll loop begins — see `_self_heal_drift_message`.
+        self._start_head_sha = self.self_head_probe()
+        # A distinct object (never equal to any real `Action.label`, empty
+        # string included) so the very first WAIT of the run always starts
+        # its streak at 1 rather than accidentally matching an unset
+        # sentinel.
+        last_wait_label: object = object()
+        same_wait_streak = 0
 
         while True:
             now = self.clock()
@@ -4154,6 +4244,36 @@ class Driver:
             )
             for warning in action.warnings:
                 self.warn(warning)
+
+            # #2443: self-heal — see `_self_heal_drift_message`. Tracked off
+            # the Action's own `label`, NOT `fingerprint` above: a WAIT can
+            # (and, in the #2286 shape, does) repeat the identical reason
+            # poll after poll while the board fingerprint itself is static
+            # for the same underlying reason, so this is really the same
+            # signal — but keying directly on what the loop is ABOUT TO DO
+            # keeps this correct even for a WAIT arm whose label happens to
+            # be static text unrelated to fingerprint (e.g. "TEST: in
+            # progress on a capability-matched machine") without needing to
+            # reason about the two staying in lockstep. A non-WAIT action
+            # (RUN or EXIT) always resets the streak: dispatching something
+            # is progress by definition.
+            if action.kind == WAIT:
+                if action.label == last_wait_label:
+                    same_wait_streak += 1
+                else:
+                    last_wait_label = action.label
+                    same_wait_streak = 1
+                if same_wait_streak >= _SELF_HEAL_WAIT_STREAK:
+                    drift = self._self_heal_drift_message(
+                        action.label, same_wait_streak
+                    )
+                    if drift:
+                        self._last_exit_message = drift
+                        self.warn(drift)
+                        return EXIT_SELF_STALE
+            else:
+                last_wait_label = object()
+                same_wait_streak = 0
 
             if action.is_exit:
                 # #1499: capture the exit reason for the audit boundary before
