@@ -35,6 +35,7 @@ Fixture schema (every key optional except ``board``)::
       "proposals":       [ {...coord.models.Proposal fields...} ],
       "machines":        [ {...GET /api/machines entry...} ],
       "sessions":        [ {...GET /api/sessions entry...} ],
+      "drive_queue":     [ {...coord.state._decode_drive_queue_row shape...} ],
       "review_findings": {"rev-1": {"verdict": "approve", "body": "..."}},
       "diffs":           {"work-1": "diff --git ..."},
       "chat_reply":      "canned /api/chat response text",
@@ -154,6 +155,7 @@ class FixtureServer:
     proposals_raw: list = field(default_factory=list)
     machines_raw: list = field(default_factory=list)
     sessions_raw: list = field(default_factory=list)
+    drive_queue_raw: list = field(default_factory=list)
     review_findings_raw: dict = field(default_factory=dict)
     diffs: dict = field(default_factory=dict)
     chat_reply: str = "fixture mode: the coordinator assistant is not wired up."
@@ -193,6 +195,20 @@ class FixtureServer:
 
     def sessions(self) -> list[dict]:
         return copy.deepcopy(self.sessions_raw)
+
+    def drive_queue(self, repo_name: str | None = None) -> list[dict]:
+        """The seeded `coord drive` queue rows (#2428 DQW-1).
+
+        Same raw-row shape ``GET /api/drive-queue`` serves off the real DB
+        (``coord.state._decode_drive_queue_row``) — no reshaping, so a
+        fixture captured from a live queue (or hand-written to that shape)
+        drops in unchanged. ``repo_name`` filters exactly like
+        ``coord.state._list_drive_queue_local``'s ``WHERE repo_name = ?``.
+        """
+        rows = copy.deepcopy(self.drive_queue_raw)
+        if repo_name:
+            rows = [r for r in rows if r.get("repo_name") == repo_name]
+        return rows
 
     def review_findings(self, assignment_id: str) -> tuple[str, str] | None:
         """Stand-in for ``coord.state.load_assignment_review_findings``.
@@ -343,6 +359,7 @@ def parse_fixture(raw: Any, *, path: Path | None = None) -> FixtureServer:
         proposals_raw=_as_list(raw.get("proposals"), "proposals"),
         machines_raw=_as_list(raw.get("machines"), "machines"),
         sessions_raw=_as_list(raw.get("sessions"), "sessions"),
+        drive_queue_raw=_as_list(raw.get("drive_queue"), "drive_queue"),
         review_findings_raw=_as_dict(raw.get("review_findings"), "review_findings"),
         diffs=diffs,
         events=_parse_events(raw.get("events")),

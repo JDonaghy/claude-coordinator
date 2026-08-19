@@ -722,6 +722,130 @@ def entries_from_rows(rows: Iterable[Mapping[str, Any]]) -> list[QueueEntry]:
     )
 
 
+# ── aggregate summary (#2428 DQW-1) ───────────────────────────────────────────
+#
+# Ported field-for-field from `tui/src/app/drive_queue.rs`'s
+# `summarize_drive_queue`/`DriveQueueSummary` — see that module's own comments
+# for the #2186 incident behind "blocked outranks a fleet-held gate, which
+# outranks a stall" and for why `fleet_held` (not `held`) is what actually
+# stops the queue. Kept here, next to `entries_from_rows`, rather than in
+# `coord/dashboard/server.py`, so any future consumer (a CLI summary, another
+# server) gets the exact same counts without re-deriving them.
+
+
+def _entry_is_pending(entry: QueueEntry) -> bool:
+    """Rows that still have work ahead — `done` entries are history."""
+    return entry.state != STATE_DONE
+
+
+def _entry_is_holding(entry: QueueEntry) -> bool:
+    """Is this row's OWN deploy gate currently fired? Scope-agnostic."""
+    return entry.hold_state == HOLD_FIRED
+
+
+def _entry_stops_fleet(entry: QueueEntry) -> bool:
+    """Does this row's fired gate stop the WHOLE queue (#2186)?"""
+    return _entry_is_holding(entry) and entry.hold_scope == HOLD_SCOPE_FLEET
+
+
+def _after_satisfied(entry: QueueEntry, all_entries: Sequence[QueueEntry]) -> bool:
+    """Is *entry*'s `after=` list satisfied by the queue it sits in?
+
+    Same conservative, local read as the Rust original: a pre-req not
+    present in *all_entries* at all is treated as satisfied (it may have
+    landed long ago); a pre-req whose OWN gate has fired is unsatisfied even
+    though its row has by then reconciled to `done`.
+    """
+    for key in entry.after:
+        unsatisfied = any(
+            other.key == key
+            and (other.state != STATE_DONE or _entry_is_holding(other))
+            for other in all_entries
+        )
+        if unsatisfied:
+            return False
+    return True
+
+
+@dataclass(frozen=True)
+class DriveQueueSummary:
+    """Aggregate reading over a whole (or `?repo=`-filtered) queue read.
+
+    ``level`` is the same ascending-severity rank
+    `tui/src/app/drive_queue.rs::DriveQueueLevel` computes — `"empty"` <
+    `"normal"` < `"stalled"` < `"held"` < `"blocked"` — so a client can badge
+    the panel sidebar without re-deriving the ranking rule.
+    """
+
+    level: str = "empty"
+    # #2428: total non-`done` rows — the Rust original never materializes
+    # this as a struct field (it's implicit in the loop's filter), but a web
+    # sidebar wants a single "N pending" headline as much as it wants the
+    # breakdown, so it is added here rather than left for the client to sum.
+    pending: int = 0
+    running: int = 0
+    waiting: int = 0
+    blocked: int = 0
+    # Waiting rows whose in-queue pre-reqs are all satisfied — rows a tick
+    # could plausibly pick up next. Zero-with-waiting-rows is the stall.
+    eligible: int = 0
+    # Rows whose OWN deploy gate has fired, any scope — purely informational.
+    held: int = 0
+    # Rows whose FLEET-scoped deploy gate has fired — non-zero means the tick
+    # will launch nothing at all, whatever `eligible` says.
+    fleet_held: int = 0
+
+
+def summarize_drive_queue(entries: Sequence[QueueEntry]) -> DriveQueueSummary:
+    """Summarise *entries* — pure, no clock, no DB. See :class:`DriveQueueSummary`."""
+    pending = sum(1 for e in entries if _entry_is_pending(e))
+    held = sum(1 for e in entries if _entry_is_holding(e))
+    fleet_held = sum(1 for e in entries if _entry_stops_fleet(e))
+    running = waiting = blocked = eligible = 0
+    for e in entries:
+        if not _entry_is_pending(e):
+            continue
+        if e.state == STATE_RUNNING:
+            running += 1
+        elif e.state == STATE_BLOCKED:
+            blocked += 1
+        elif e.state == STATE_WAITING:
+            waiting += 1
+            if _after_satisfied(e, entries):
+                eligible += 1
+        # An unrecognised state from a newer daemon: counted in `pending`
+        # above (it is not `done`) but never as waiting/eligible/running/
+        # blocked, so it can neither trigger nor mask a stall.
+
+    if blocked > 0:
+        # Blocked outranks stalled — a hard stop is worse news than a queue
+        # that is merely waiting for capacity.
+        level = "blocked"
+    elif fleet_held > 0:
+        # #1757/#2186: a FLEET-scoped fired gate outranks a stall, even a
+        # real one — "3 waiting, none eligible" is a symptom here, and "you
+        # have a deploy to do" is the cause.
+        level = "held"
+    elif waiting > 0 and eligible == 0 and running == 0:
+        # Nothing running AND nothing that could start.
+        level = "stalled"
+    elif running > 0 or waiting > 0:
+        level = "normal"
+    else:
+        level = "empty"
+
+    return DriveQueueSummary(
+        level=level,
+        pending=pending,
+        running=running,
+        waiting=waiting,
+        blocked=blocked,
+        eligible=eligible,
+        held=held,
+        fleet_held=fleet_held,
+    )
+
+
 # ── the board projection ─────────────────────────────────────────────────────
 
 
