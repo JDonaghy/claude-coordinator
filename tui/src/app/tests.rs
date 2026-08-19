@@ -12365,6 +12365,63 @@
         assert!(label.contains("needs a person"), "got: {label}");
     }
 
+    /// #2427: a dead-end `coord escalate record` naming this issue's Review
+    /// stage — the shape `coord.dead_end`/`coord.drive._escalate_dead_end`
+    /// writes when a `request-changes` verdict has nothing left to dispatch
+    /// a fix for — must annotate the Review box on the Overview strip, not
+    /// just the sidebar-row "[stuck]" badge (`escalation_badge_span`) or an
+    /// operator-pulled `coord escalate list`.
+    #[test]
+    fn build_pipeline_widget_annotates_stage_named_by_open_escalation() {
+        let mut app = make_pipeline_app();
+        app.data.assignments.push(_stage_assignment("w1", "work", 1.0, "done"));
+        app.data.assignments.push(_stage_assignment("r1", "review", 3.0, "done"));
+        app.data.escalations.push(EscalationEntry {
+            id: 1,
+            repo_name: "api".to_string(),
+            issue_number: 42,
+            stage: "review".to_string(),
+            assignment_id: Some("r1".to_string()),
+            reason: "review_terminal_no_verdict: review r1 reached status=done \
+                     carrying NO verdict"
+                .to_string(),
+            gate_readings: "review_status=done | review_verdict=(none)".to_string(),
+            proposed_command: "coord report-result --assignment r1 ...".to_string(),
+            created_at: Some(1.0),
+        });
+
+        let view = app.build_pipeline_widget().unwrap();
+        let review_label = &view.stages[1].label;
+        assert!(
+            review_label.contains("blocked"),
+            "an open escalation naming the Review stage must annotate its box: got {review_label:?}"
+        );
+        assert!(
+            review_label.contains("see Log"),
+            "the annotation must point the operator at the Log tab: got {review_label:?}"
+        );
+        // The Merge box's own escalation-record check must not fire for a
+        // record whose `stage` is "review" — only the named box gets marked.
+        let merge_label = &view.stages[2].label;
+        assert!(
+            !merge_label.contains("blocked"),
+            "an escalation record scoped to Review must not also mark Merge: got {merge_label:?}"
+        );
+    }
+
+    /// A per-issue Overview box must stay unannotated when there is no open
+    /// escalation for this (repo, issue) at all — the common case, and a
+    /// regression guard against the #2427 annotation firing unconditionally.
+    #[test]
+    fn build_pipeline_widget_no_escalation_annotation_when_none_open() {
+        let mut app = make_pipeline_app();
+        app.data.assignments.push(_stage_assignment("w1", "work", 1.0, "done"));
+        app.data.assignments.push(_stage_assignment("r1", "review", 3.0, "done"));
+
+        let view = app.build_pipeline_widget().unwrap();
+        assert_eq!(view.stages[1].label, "Review");
+    }
+
     /// A `merged` row in merge_queue makes the Merge stage Done.
     #[test]
     fn merge_stage_status_done_from_merge_queue() {

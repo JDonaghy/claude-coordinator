@@ -6084,6 +6084,24 @@ impl CoordApp {
                         label = format!("{}\n{}", label, reason);
                     }
                 }
+                // #2427: annotate the box a dead-end `coord escalate record`
+                // actually named — e.g. `coord drive` died with "review came
+                // back request-changes and no loop dispatches a fix for this
+                // row" (`coord.dead_end`'s terminal-and-unactionable shapes,
+                // or `coord.drive._escalate_merge`) — but until now that
+                // board record only surfaced as a sidebar-row "[stuck]"
+                // badge (`escalation_badge_span`, a different splice point:
+                // the Pipeline list, not this per-issue Overview strip) or
+                // an operator-pulled `coord escalate list`. Matched on
+                // `esc.stage == name` so only the box the driver actually
+                // blamed gets the marker, not every stage on the row.
+                if let Some(repo) = issue.coord_repo.as_deref() {
+                    if let Some(esc) = self.escalation_for(repo, issue.number) {
+                        if esc.stage == *name {
+                            label = format!("{}\n⚠ blocked — see Log", label);
+                        }
+                    }
+                }
                 // Skipped counts as "settled" for prior_all_done: a closed-issue
                 // stage that never ran is logically done.
                 let prior_all_done = statuses[..i]
