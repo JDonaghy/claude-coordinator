@@ -144,7 +144,14 @@ pub(crate) fn truncate_with_ellipsis(s: &str, max_cols: usize) -> String {
 /// discards its sub-state; re-opening the same issue starts from the
 /// defaults."
 ///
-/// Deliberately NOT persisted across a restart — that is #2286's slice.
+/// # Persistence (#2286, contract §6)
+///
+/// Only the *cheap* half survives a restart: [`Self::board_tab`] /
+/// [`Self::pipeline_tab`] round-trip through [`PersistedDoc::sub_tab`].
+/// [`Self::scroll`] / [`Self::stage_scroll`] / [`Self::focused_stage`] are
+/// deliberately NOT written — they are positions inside a body whose content
+/// has almost certainly moved on by the next launch, so restoring them would
+/// point at the wrong place rather than at nothing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct DetailSubState {
     /// Board scope: which Board detail sub-tab this document is on.
@@ -450,12 +457,25 @@ impl DocTabGroup {
     /// real data tick ever reconciles it (mirrors `Workspace::load` /
     /// `sync_workspace_repos`, `app/workspace.rs`).
     fn from_persisted(scope: PersistedScope, owner: PanelScope) -> Self {
-        let tabs: Vec<DocKey> = scope.tabs.iter().map(PersistedDoc::key).collect();
+        // #2286 review (non-blocking 2): de-duplicate on the way in. The
+        // writer never emits the same `{repo, issue}` twice, but the file is
+        // user-visible and hand-editable, and a duplicate would otherwise
+        // render as two identical tabs that `index_of` can only ever resolve
+        // to the first of — so `close`ing the second one is unreachable and
+        // activating either always lights up the left one. First occurrence
+        // wins, which is also what `index_of` would have picked.
+        let mut seen: HashSet<DocKey> = HashSet::new();
+        let mut tabs: Vec<DocKey> = Vec::with_capacity(scope.tabs.len());
         let mut sub_state = HashMap::new();
         for doc in &scope.tabs {
-            if let Some(state) = doc.sub_state(owner) {
-                sub_state.insert(doc.key(), state);
+            let key = doc.key();
+            if !seen.insert(key.clone()) {
+                continue;
             }
+            if let Some(state) = doc.sub_state(owner) {
+                sub_state.insert(key.clone(), state);
+            }
+            tabs.push(key);
         }
         let mut group = DocTabGroup {
             tabs,
@@ -604,18 +624,37 @@ impl DocTabs {
     }
 
     /// Persist to a specific path, creating parent directories as needed.
-    pub(crate) fn save_to_path(&self, path: &std::path::Path) -> Result<(), String> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("create tabs dir: {e}"))?;
-        }
+    ///
+    /// Returns whether bytes were actually written: `Ok(false)` means the
+    /// file already held exactly this content and was left alone.
+    ///
+    /// #2286 review (non-blocking 1): every strip mutator persists, including
+    /// gestures that change nothing (re-clicking the already-active tab), so
+    /// without this the common case paid a `create_dir_all` + `fs::write` per
+    /// click. The check lives HERE rather than at the call sites because only
+    /// the file knows whether it is stale: `retain_known`'s load-time pruning
+    /// mutates the in-memory set *before* the first mutator runs, so a
+    /// "did this click change anything?" gate up in `CoordApp` would suppress
+    /// exactly the write that drops a pruned document from the file (contract
+    /// §6 bullet 2 — the sealed slice's
+    /// `a_document_whose_issue_is_absent_from_the_board_is_pruned_on_load`
+    /// asserts that re-save). Comparing against the file's real content is
+    /// correct in both cases.
+    pub(crate) fn save_to_path(&self, path: &std::path::Path) -> Result<bool, String> {
         let persisted = PersistedTabs {
             board: Some(self.board.to_persisted(PanelScope::Board)),
             pipeline: Some(self.pipeline.to_persisted(PanelScope::Pipeline)),
         };
         let text =
             serde_json::to_string_pretty(&persisted).map_err(|e| format!("serialize tabs: {e}"))?;
+        if std::fs::read_to_string(path).is_ok_and(|existing| existing == text) {
+            return Ok(false);
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("create tabs dir: {e}"))?;
+        }
         std::fs::write(path, text).map_err(|e| format!("write tabs: {e}"))?;
-        Ok(())
+        Ok(true)
     }
 
     /// Persist to `~/.coord/tabs.json` unconditionally — creating the file
@@ -627,10 +666,10 @@ impl DocTabs {
     /// wrapper in `render.rs`, on `Reaction::Exit`) — see [`Self::save_if_exists`]
     /// for the far more frequent mutation-triggered save, which deliberately
     /// does NOT create a fresh file.
-    pub(crate) fn save(&self) -> Result<(), String> {
+    pub(crate) fn save(&self) -> Result<bool, String> {
         match Self::path() {
             Some(path) => self.save_to_path(&path),
-            None => Ok(()),
+            None => Ok(false),
         }
     }
 
@@ -660,12 +699,12 @@ impl DocTabs {
     /// a_document_whose_issue_is_absent_from_the_board_is_pruned_on_load`)
     /// seeds the file BEFORE the mutation it checks, so this still fires for
     /// it.
-    pub(crate) fn save_if_exists(&self) -> Result<(), String> {
+    pub(crate) fn save_if_exists(&self) -> Result<bool, String> {
         let Some(path) = Self::path() else {
-            return Ok(());
+            return Ok(false);
         };
         if !path.exists() {
-            return Ok(());
+            return Ok(false);
         }
         self.save_to_path(&path)
     }
@@ -1604,6 +1643,133 @@ mod tests {
         let known: HashSet<DocKey> = [k(101), k(102)].into_iter().collect();
         loaded.retain_known(&known);
         assert_eq!(loaded.group(PanelScope::Board).tabs(), &[k(101), k(102)]);
+    }
+
+    /// #2286 review (non-blocking 1): saving the same value twice writes once.
+    #[test]
+    fn save_to_path_skips_the_write_when_the_file_already_matches() {
+        let path = tmp_json_path("idempotent_save");
+        let _ = std::fs::remove_file(&path);
+        let mut tabs = DocTabs::default();
+        tabs.group_mut(PanelScope::Board).pin(k(101));
+
+        assert!(
+            tabs.save_to_path(&path).unwrap(),
+            "the first save creates the file"
+        );
+        assert!(
+            !tabs.save_to_path(&path).unwrap(),
+            "an unchanged value must not re-write the file"
+        );
+
+        // …but a real change still lands, including one that only moves a
+        // document's sub-tab (which is all the exit hook usually changes).
+        tabs.group_mut(PanelScope::Board).set_sub_state(
+            k(101),
+            DetailSubState {
+                board_tab: BoardDetailTab::Chat,
+                ..DetailSubState::default()
+            },
+        );
+        assert!(
+            tabs.save_to_path(&path).unwrap(),
+            "a changed sub-tab must reach the file"
+        );
+
+        let reloaded = DocTabs::load_from_path(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            reloaded
+                .group(PanelScope::Board)
+                .sub_state(&k(101))
+                .map(|s| s.board_tab),
+            Some(BoardDetailTab::Chat)
+        );
+    }
+
+    /// A stale file must still be reconciled even when the in-memory value
+    /// did not change during this mutation — the load-time prune already
+    /// changed it, before any mutator ran. Contract §6 bullet 2, and the
+    /// exact case an in-memory "did this click change anything?" gate got
+    /// wrong.
+    #[test]
+    fn save_to_path_rewrites_a_file_that_disagrees_even_after_a_no_op_mutation() {
+        let path = tmp_json_path("stale_file_rewrite");
+        let raw = r#"{"board": {"tabs": [
+            {"repo": "claude-coordinator", "issue": 101},
+            {"repo": "claude-coordinator", "issue": 199}
+        ], "active": {"repo": "claude-coordinator", "issue": 101}, "preview": null}}"#;
+        std::fs::write(&path, raw).unwrap();
+
+        let mut loaded = DocTabs::load_from_path(&path);
+        let known: HashSet<DocKey> = [k(101)].into_iter().collect();
+        loaded.retain_known(&known);
+
+        assert!(
+            loaded.save_to_path(&path).unwrap(),
+            "the pruned value disagrees with the file, so it must be written"
+        );
+
+        let reloaded = DocTabs::load_from_path(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            reloaded.group(PanelScope::Board).tabs(),
+            &[k(101)],
+            "#2286 §6 bullet 2: a pruned document must never round-trip back \
+             into the re-saved file"
+        );
+    }
+
+    /// #2286 review (non-blocking 2): a hand-edited file that lists the same
+    /// `{repo, issue}` twice must not produce two identical tabs. `index_of`
+    /// can only ever resolve to the first, so the duplicate would render as a
+    /// tab that cannot be activated and whose `×` closes the other one.
+    #[test]
+    fn load_from_path_dedupes_a_document_listed_twice() {
+        let path = tmp_json_path("dupe_docs");
+        let raw = r#"{"board": {"tabs": [
+            {"repo": "claude-coordinator", "issue": 101},
+            {"repo": "claude-coordinator", "issue": 102},
+            {"repo": "claude-coordinator", "issue": 101}
+        ], "active": {"repo": "claude-coordinator", "issue": 102}, "preview": null}}"#;
+        std::fs::write(&path, raw).unwrap();
+        let loaded = DocTabs::load_from_path(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            loaded.group(PanelScope::Board).tabs(),
+            &[k(101), k(102)],
+            "the duplicate is dropped and the first occurrence keeps its slot"
+        );
+        assert_eq!(
+            loaded.group(PanelScope::Board).active_index(),
+            Some(1),
+            "…and `active` still resolves to the document it named"
+        );
+    }
+
+    /// The dedupe must keep the surviving tab's sub-state, and must not let a
+    /// later duplicate's (absent or different) record win over the first's.
+    #[test]
+    fn load_from_path_dedupe_keeps_the_first_occurrences_sub_tab() {
+        let path = tmp_json_path("dupe_sub_tab");
+        let raw = r#"{"board": {"tabs": [
+            {"repo": "claude-coordinator", "issue": 101, "sub_tab": "issue"},
+            {"repo": "claude-coordinator", "issue": 101, "sub_tab": "chat"}
+        ], "active": {"repo": "claude-coordinator", "issue": 101}, "preview": null}}"#;
+        std::fs::write(&path, raw).unwrap();
+        let loaded = DocTabs::load_from_path(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(loaded.group(PanelScope::Board).tabs(), &[k(101)]);
+        assert_eq!(
+            loaded
+                .group(PanelScope::Board)
+                .sub_state(&k(101))
+                .map(|s| s.board_tab),
+            Some(BoardDetailTab::Issue),
+            "first occurrence wins, matching what `index_of` would have picked"
+        );
     }
 
     #[test]

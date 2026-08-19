@@ -6903,17 +6903,54 @@ impl CoordApp {
     /// surfaced as a stderr line rather than a panic or toast, matching
     /// `Self::persist_workspace`: the TUI must keep working even when
     /// `~/.coord` is unwritable, it just won't remember tabs next launch.
+    ///
+    /// Called unconditionally by the mutators, including on gestures that
+    /// turn out to change nothing (re-clicking the already-active tab):
+    /// [`doc_tabs::DocTabs::save_to_path`] compares against the file's real
+    /// content and skips the write itself, which is the only place that
+    /// comparison is correct — see its doc comment (#2286 review,
+    /// non-blocking 1).
     fn persist_doc_tabs(&self) {
         if let Err(e) = self.doc_tabs.save_if_exists() {
             eprintln!("coord-tui: failed to persist doc tabs: {e}");
         }
     }
 
+    /// Snapshot BOTH scopes' live detail sub-state under their own active
+    /// document.
+    ///
+    /// [`Self::checkpoint_detail_sub_state`] runs on a document-tab *switch*,
+    /// where it banks the outgoing document's sub-state. That leaves the
+    /// currently-active document's live sub-state unbanked for as long as the
+    /// user stays on it: a sub-tab-only switch (Board → Issue → Chat, which
+    /// writes `board_detail_tab` / `pipeline_detail_tab` directly from
+    /// `events.rs`) never passes through a tab switch. This banks both scopes
+    /// at once, for the moments where the whole record is about to be
+    /// serialised.
+    ///
+    /// Each scope's call is independently a no-op when that scope has no open
+    /// document, and the two can never clobber each other: a checkpoint only
+    /// populates the fields its own scope owns (see
+    /// [`Self::detail_sub_state_snapshot`]).
+    fn checkpoint_all_detail_sub_state(&mut self) {
+        self.checkpoint_detail_sub_state(PanelScope::Board);
+        self.checkpoint_detail_sub_state(PanelScope::Pipeline);
+    }
+
     /// Persist the current doc-tab sets to `~/.coord/tabs.json`
     /// unconditionally, creating the file if this is the very first time
     /// (contract §6). Called exactly once, on the way out — see
     /// `ShellApp::handle`'s `Reaction::Exit` hook in `render.rs`.
-    fn persist_doc_tabs_on_exit(&self) {
+    ///
+    /// #2286 review (blocking): checkpoints both scopes FIRST. Without it the
+    /// most ordinary session there is — open one issue, click through to its
+    /// `Chat` sub-tab, quit — persisted whatever was last banked (usually
+    /// nothing) rather than the sub-tab actually on screen, and the restart
+    /// dropped back to the scope default. Everything the exit hook is for
+    /// (`board_tab` / `pipeline_tab`, the "cheap" half of `DetailSubState`)
+    /// depends on the live fields being banked before `save()` reads them.
+    fn persist_doc_tabs_on_exit(&mut self) {
+        self.checkpoint_all_detail_sub_state();
         if let Err(e) = self.doc_tabs.save() {
             eprintln!("coord-tui: failed to persist doc tabs: {e}");
         }
