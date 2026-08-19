@@ -28673,9 +28673,9 @@
         );
     }
 
-    // ── #728: Windowed flat Done section ─────────────────────────────────────
+    // ── #2405: the Completed grid (replaces #728's Done section) ────────────
 
-    /// Build a closed PipelineIssue for testing Done-section windowing.
+    /// Build a closed PipelineIssue for the Completed-grid tests.
     fn closed_issue(number: u64, repo: &str, coord_repo: &str) -> PipelineIssue {
         PipelineIssue {
             number,
@@ -28689,18 +28689,482 @@
         }
     }
 
-    /// Build a finished assignment for `issue_number`/`repo` with `finished_at`
-    /// seconds in the past.
-    fn finished_assignment_ago(id: &str, issue: u64, repo: &str, seconds_ago: f64) -> Assignment {
-        let now = std::time::SystemTime::now()
+    /// `n` seconds before now, as epoch seconds.
+    fn secs_ago(n: f64) -> f64 {
+        std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs_f64();
-        let mut a = make_assignment_typed("done", issue, repo, Some("work"));
-        a.id = id.to_string();
-        a.finished_at = Some(now - seconds_ago);
-        a
+            .as_secs_f64()
+            - n
     }
+
+    /// A CoordApp on the Pipeline panel's Completed tab with three completed
+    /// issues in `api` and one in `web`, finished 30 min / 3 h / 5 d ago (and
+    /// the `web` one 1 h ago).  Every one carries a `dispatched_at` two hours
+    /// before its `finished_at` so the STARTED column has something real.
+    fn make_completed_app() -> CoordApp {
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Completed;
+        app.pipeline_issues.clear();
+        app.data.assignments.clear();
+        for (num, repo_slug, coord_repo, ago) in [
+            (201u64, "acme/api", "api", 1_800.0f64),
+            (202, "acme/api", "api", 10_800.0),
+            (203, "acme/api", "api", 432_000.0),
+            (204, "acme/web", "web", 3_600.0),
+        ] {
+            let mut issue = closed_issue(num, repo_slug, coord_repo);
+            issue.title = format!("Completed thing {num}");
+            app.pipeline_issues.push(issue);
+            let mut a = make_assignment_typed("done", num, coord_repo, Some("work"));
+            a.id = format!("as-{num}");
+            a.dispatched_at = Some(secs_ago(ago + 7_200.0));
+            a.finished_at = Some(secs_ago(ago));
+            app.data.assignments.push(a);
+        }
+        app.rebuild_pipeline_sidebar(None);
+        app
+    }
+
+    /// The Done section is gone from the sidebar entirely — closed issues
+    /// contribute no state section, whatever their timestamps.
+    #[test]
+    fn completed_grid_removed_the_done_sidebar_section() {
+        let app = make_completed_app();
+        assert!(
+            !app.pipeline_state_section_names.contains(&"done"),
+            "#2405: no Done section may survive, got {:?}",
+            app.pipeline_state_section_names
+        );
+        // …and the classifier still says these issues ARE done, so their
+        // absence is the section's removal, not a mis-classification.
+        assert_eq!(app.pipeline_lifecycle_section(&app.pipeline_issues[0]), "done");
+    }
+
+    /// The default 24h window includes the 30 min / 1 h / 3 h issues and
+    /// excludes the 5-day-old one, newest-finished first.
+    #[test]
+    fn completed_rows_default_window_is_24h_newest_first() {
+        let app = make_completed_app();
+        assert_eq!(app.completed_grid.since, "24h", "default matches ISSUE_ACTIVITY");
+        let rows = app.completed_rows().expect("default controls must parse");
+        let refs: Vec<&str> = rows.iter().map(|r| r.issue_ref.as_str()).collect();
+        assert_eq!(
+            refs,
+            vec!["A#201", "W#204", "A#202"],
+            "#2405: the 24h window drops the 5-day-old #203 and orders \
+             newest-finished first; refs use the existing `repo_tag` \
+             abbreviation (api → A, web → W)"
+        );
+    }
+
+    /// Widening the range past 5 days brings the old issue back — the whole
+    /// point of replacing #728's fixed window.
+    #[test]
+    fn completed_rows_widened_range_includes_older_issue() {
+        let mut app = make_completed_app();
+        app.completed_set_field(0, "7d".to_string());
+        let rows = app.completed_rows().expect("7d must parse");
+        assert!(
+            rows.iter().any(|r| r.issue_ref == "A#203"),
+            "#2405: a 7d range must reach the 5-day-old issue, got {:?}",
+            rows.iter().map(|r| &r.issue_ref).collect::<Vec<_>>()
+        );
+    }
+
+    /// Free-form durations (not just the presets) are accepted, exactly as
+    /// `coord/reports.py`'s `since` param documents.
+    #[test]
+    fn completed_rows_accept_free_form_duration() {
+        let mut app = make_completed_app();
+        app.completed_set_field(0, "90m".to_string());
+        let rows = app.completed_rows().expect("90m must parse");
+        let refs: Vec<&str> = rows.iter().map(|r| r.issue_ref.as_str()).collect();
+        assert_eq!(
+            refs,
+            vec!["A#201", "W#204"],
+            "#2405: `90m` is a valid free-form range reaching the 30 min and \
+             1 h issues but not the 3 h one"
+        );
+        assert!(
+            app.completed_since_options().iter().any(|o| o == "90m"),
+            "a free-form value must appear as its own segment so it stays \
+             visible and steppable, got {:?}",
+            app.completed_since_options()
+        );
+    }
+
+    /// The repo selector restricts to one repo; empty means all.
+    #[test]
+    fn completed_rows_repo_filter_restricts_to_one_repo() {
+        let mut app = make_completed_app();
+        assert_eq!(
+            app.completed_repo_choices(),
+            vec!["".to_string(), "api".to_string(), "web".to_string()],
+            "the selector offers `all` plus every repo with a completed issue"
+        );
+        app.completed_set_field(2, "web".to_string());
+        let rows = app.completed_rows().expect("repo filter must parse");
+        let refs: Vec<&str> = rows.iter().map(|r| r.issue_ref.as_str()).collect();
+        assert_eq!(refs, vec!["W#204"]);
+        // Back to all repos.
+        app.completed_set_field(2, String::new());
+        assert_eq!(app.completed_rows().unwrap().len(), 3);
+    }
+
+    /// A non-empty `until` moves the window's END, so a range that would
+    /// otherwise cover an issue can be walked back past it.
+    #[test]
+    fn completed_rows_until_moves_the_window_end() {
+        let mut app = make_completed_app();
+        // End the window two hours ago: the 30 min and 1 h issues are now in
+        // the future relative to it, so only the 3 h one survives a 24h span.
+        app.completed_set_field(1, format!("{}", secs_ago(7_200.0) as i64));
+        let rows = app.completed_rows().expect("epoch `until` must parse");
+        let refs: Vec<&str> = rows.iter().map(|r| r.issue_ref.as_str()).collect();
+        assert_eq!(
+            refs,
+            vec!["A#202"],
+            "#2405: `until` is the window END — issues finished after it are \
+             excluded, matching ISSUE_ACTIVITY's semantics"
+        );
+    }
+
+    /// An unparseable control is reported, never silently treated as "now" /
+    /// "nothing completed".
+    #[test]
+    fn completed_rows_report_a_bad_control_instead_of_an_empty_grid() {
+        let mut app = make_completed_app();
+        app.completed_set_field(1, "not-a-time".to_string());
+        let err = app.completed_rows().expect_err("a bad `until` must be an error");
+        assert!(
+            err.contains("Window end"),
+            "the error must name the control that failed, got {err:?}"
+        );
+        app.completed_set_field(1, String::new());
+        app.completed_set_field(0, "banana".to_string());
+        let err = app.completed_rows().expect_err("a bad `since` must be an error");
+        assert!(
+            err.contains("Time range") && err.contains("24h"),
+            "the error must name the control and list the presets, got {err:?}"
+        );
+    }
+
+    /// ISO-8601 `until` values parse to the same instant as their epoch form.
+    #[test]
+    fn completed_until_parses_iso_8601_and_epoch_identically() {
+        // 2026-08-18T00:00:00Z
+        let iso = CoordApp::parse_until_epoch("2026-08-18T00:00:00Z").expect("ISO must parse");
+        assert_eq!(iso, 1_787_011_200.0, "days_from_civil must be exact");
+        assert_eq!(
+            CoordApp::parse_until_epoch("1787011200"),
+            Some(1_787_011_200.0),
+            "the epoch form must agree"
+        );
+        assert_eq!(
+            CoordApp::parse_until_epoch("2026-08-18"),
+            Some(1_787_011_200.0),
+            "a bare date means midnight UTC"
+        );
+        assert_eq!(CoordApp::parse_until_epoch("2026-13-01T00:00:00Z"), None);
+        assert_eq!(CoordApp::parse_until_epoch("nonsense"), None);
+        // …and the cell formatter is its exact inverse.
+        assert_eq!(
+            CoordApp::completed_time_cell(Some(1_787_011_200.0 + 3_660.0)),
+            "2026-08-18 01:01"
+        );
+        assert_eq!(CoordApp::completed_time_cell(None), "—");
+    }
+
+    /// A header click cycles descending → ascending → default, and the sort
+    /// actually reorders the rows.
+    #[test]
+    fn completed_sort_cycles_and_reorders() {
+        let mut app = make_completed_app();
+        // Column 0 = ISSUE.
+        assert!(app.completed_sort_by_column(0));
+        assert_eq!(app.completed_grid.sort, Some((0, false)));
+        let desc: Vec<String> = app
+            .completed_rows()
+            .unwrap()
+            .iter()
+            .map(|r| r.issue_ref.clone())
+            .collect();
+        assert_eq!(desc, vec!["W#204", "A#202", "A#201"]);
+        assert!(app.completed_sort_by_column(0));
+        assert_eq!(app.completed_grid.sort, Some((0, true)));
+        let asc: Vec<String> = app
+            .completed_rows()
+            .unwrap()
+            .iter()
+            .map(|r| r.issue_ref.clone())
+            .collect();
+        assert_eq!(asc, vec!["A#201", "A#202", "W#204"]);
+        // Third click clears back to the default newest-finished-first order.
+        assert!(app.completed_sort_by_column(0));
+        assert_eq!(app.completed_grid.sort, None);
+        let default: Vec<String> = app
+            .completed_rows()
+            .unwrap()
+            .iter()
+            .map(|r| r.issue_ref.clone())
+            .collect();
+        assert_eq!(default, vec!["A#201", "W#204", "A#202"]);
+    }
+
+    /// Changing a control resets scroll and closes any open row detail —
+    /// both point into a row set that is about to change underneath them.
+    /// The sort, by contrast, is a preference about columns and survives.
+    #[test]
+    fn completed_control_change_resets_scroll_and_detail() {
+        let mut app = make_completed_app();
+        app.completed_grid.scroll = 4;
+        assert!(app.completed_open_row(0));
+        assert!(app.completed_grid.detail.is_some());
+        app.completed_set_field(0, "7d".to_string());
+        assert_eq!(app.completed_grid.scroll, 0);
+        assert!(
+            app.completed_grid.detail.is_none(),
+            "#2405: a stale detail must not survive a control change"
+        );
+        app.completed_sort_by_column(1);
+        let before = app.completed_grid.sort;
+        app.completed_set_field(2, "api".to_string());
+        assert_eq!(app.completed_grid.sort, before);
+    }
+
+    /// The grid renders its controls and every in-window row, with the
+    /// out-of-window one absent.
+    #[test]
+    fn tuidriver_completed_grid_renders_controls_and_rows() {
+        use quadraui::tui::testing::driver_with_shell;
+        let driver = driver_with_shell(make_completed_app(), CoordApp::shell_config(), 140, 40);
+        let screen = driver.screen();
+        for needle in ["Time range", "Window end", "Repo", "ISSUE", "TITLE", "STARTED", "ENDED"] {
+            assert!(
+                screen.contains(needle),
+                "#2405: the Completed tab must show {needle:?}:\n{screen}"
+            );
+        }
+        assert!(
+            screen.contains("A#201") && screen.contains("W#204"),
+            "in-window rows must render:\n{screen}"
+        );
+        assert!(
+            !screen.contains("A#203"),
+            "#2405: the 5-day-old issue is outside the default 24h range:\n{screen}"
+        );
+    }
+
+    /// Clicking a row opens that issue's Overview content — meta rows and
+    /// stage content — with NO Work/Test/Review/Merge stage strip.
+    #[test]
+    fn tuidriver_completed_row_click_opens_detail_without_stage_strip() {
+        use quadraui::tui::testing::driver_with_shell;
+        let mut driver =
+            driver_with_shell(make_completed_app(), CoordApp::shell_config(), 140, 40);
+        let (x, y) = driver
+            .find("A#201")
+            .unwrap_or_else(|| panic!("row A#201 must render:\n{}", driver.screen()));
+        driver.click(x, y);
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("A#201") && screen.contains("Completed thing 201"),
+            "#2405: the detail must say which issue it is about — the Overview \
+             body itself never names one:\n{screen}"
+        );
+        assert!(
+            screen.contains("Repo") && screen.contains("acme/api") && screen.contains("Gates"),
+            "#2405: the detail carries Overview's repo/labels/gates meta:\n{screen}"
+        );
+        assert!(
+            screen.contains("Back to Completed"),
+            "#2405: the detail must offer a way back to the grid:\n{screen}"
+        );
+        // The strip is a row of boxed stage names; the *meta* line legitimately
+        // contains "work" inside `Gates: work → review → merge`, so assert on
+        // the box-drawing the strip paints rather than on the word.
+        assert!(
+            !screen.contains("╭──────────────────────╮"),
+            "#2405: this is a historical view — the Work/Test/Review/Merge \
+             stage-box strip must NOT render:\n{screen}"
+        );
+        assert!(
+            !screen.contains("ENDED"),
+            "the grid is replaced by the detail, not stacked above it:\n{screen}"
+        );
+    }
+
+    /// Esc closes the row detail and puts the grid back.
+    #[test]
+    fn tuidriver_completed_detail_esc_returns_to_grid() {
+        use quadraui::tui::testing::driver_with_shell;
+        let mut driver =
+            driver_with_shell(make_completed_app(), CoordApp::shell_config(), 140, 40);
+        let (x, y) = driver.find("A#201").expect("row must render");
+        driver.click(x, y);
+        driver.render();
+        assert!(driver.screen().contains("Back to Completed"));
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ENDED") && !screen.contains("Back to Completed"),
+            "#2405: Esc must return to the grid:\n{screen}"
+        );
+    }
+
+    /// Clicking a preset in the time-range segmented control re-runs the
+    /// window — the click path, not just the model helper.  This is the case
+    /// `FormController::handle_cached` got wrong (`lh * 0.6` char width).
+    #[test]
+    fn tuidriver_completed_time_range_click_widens_the_window() {
+        use quadraui::tui::testing::driver_with_shell;
+        let mut driver =
+            driver_with_shell(make_completed_app(), CoordApp::shell_config(), 140, 40);
+        assert!(
+            !driver.screen().contains("A#203"),
+            "the 5-day-old issue starts out of range:\n{}",
+            driver.screen()
+        );
+        let (x, y) = driver
+            .find("7d")
+            .unwrap_or_else(|| panic!("the 7d preset must render:\n{}", driver.screen()));
+        driver.click(x, y);
+        driver.render();
+        assert!(
+            driver.screen().contains("A#203"),
+            "#2405: clicking the 7d preset must widen the window:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// A window with nothing in it says so, rather than rendering a bare
+    /// header row that reads like a broken fetch.
+    #[test]
+    fn tuidriver_completed_empty_window_explains_itself() {
+        use quadraui::tui::testing::driver_with_shell;
+        let mut app = make_completed_app();
+        app.completed_set_field(0, "1s".to_string());
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("No issues completed in this window"),
+            "#2405: an empty result must state what happened:\n{screen}"
+        );
+    }
+
+    /// `Tab` walks the controls and `←`/`→` step the focused one — without
+    /// stealing `h`/`l`, which still cycle detail tabs.
+    #[test]
+    fn tuidriver_completed_keyboard_steps_controls() {
+        use quadraui::tui::testing::driver_with_shell;
+        let mut driver =
+            driver_with_shell(make_completed_app(), CoordApp::shell_config(), 140, 40);
+        // Field 0 (time range) is focused by default: `→` steps 24h → 3d → 7d.
+        driver.press_named(quadraui::NamedKey::Right);
+        driver.press_named(quadraui::NamedKey::Right);
+        driver.render();
+        assert!(
+            driver.screen().contains("A#203"),
+            "#2405: two `→` presses step the focused time range 24h → 3d → 7d, \
+             which reaches the 5-day-old issue:\n{}",
+            driver.screen()
+        );
+        // Two Tabs move focus to the repo selector; `→` there picks `api`.
+        driver.press_named(quadraui::NamedKey::Tab);
+        driver.press_named(quadraui::NamedKey::Tab);
+        driver.press_named(quadraui::NamedKey::Right);
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("A#201") && !screen.contains("W#204"),
+            "#2405: `→` on the repo selector must filter to `api`:\n{screen}"
+        );
+    }
+
+    /// Typing edits the free-text `Window end` control instead of firing the
+    /// Pipeline panel's single-key bindings.
+    #[test]
+    fn tuidriver_completed_typing_edits_window_end() {
+        use quadraui::tui::testing::driver_with_shell;
+        let mut driver =
+            driver_with_shell(make_completed_app(), CoordApp::shell_config(), 140, 40);
+        driver.press_named(quadraui::NamedKey::Tab); // → Window end
+        for ch in "zz".chars() {
+            driver.press(Key::Char(ch));
+        }
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Window end") && screen.contains("zz"),
+            "#2405: printable characters must land in the focused text \
+             control, not fire `q`/`D`/…:\n{screen}"
+        );
+        assert!(
+            screen.contains("not epoch seconds or an ISO-8601 timestamp"),
+            "#2405: and an unparseable value must be explained, not swallowed:\n{screen}"
+        );
+        driver.press_named(quadraui::NamedKey::Backspace);
+        driver.press_named(quadraui::NamedKey::Backspace);
+        driver.render();
+        assert!(
+            driver.screen().contains("ENDED"),
+            "#2405: backspacing back to empty restores `now` and the grid:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// The wheel scrolls the grid against its own painted viewport, clamped to
+    /// the row count — not against the whole main panel's row count, which is
+    /// larger by the control row (the exact gap #1910 fixed for Reports).
+    #[test]
+    fn tuidriver_completed_wheel_scrolls_the_grid_and_clamps() {
+        use quadraui::tui::testing::driver_with_shell;
+        let mut app = make_completed_app();
+        // Enough completed issues to overflow a short viewport, all newer than
+        // #201 so they push it off the top.
+        for num in 210u64..240 {
+            let mut issue = closed_issue(num, "acme/api", "api");
+            issue.title = format!("Filler {num}");
+            app.pipeline_issues.push(issue);
+            let mut a = make_assignment_typed("done", num, "api", Some("work"));
+            a.id = format!("as-{num}");
+            a.dispatched_at = Some(secs_ago(9_000.0));
+            a.finished_at = Some(secs_ago(60.0 + num as f64));
+            app.data.assignments.push(a);
+        }
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 20);
+        driver.render();
+        assert!(
+            driver.screen().contains("A#210"),
+            "the newest filler row starts visible:\n{}",
+            driver.screen()
+        );
+        for _ in 0..5 {
+            reports_wheel(&mut driver, (80.0, 10.0), -1.0);
+        }
+        driver.render();
+        assert!(
+            !driver.screen().contains("A#210"),
+            "#2405: the wheel must scroll the newest row off the top:\n{}",
+            driver.screen()
+        );
+        // Scrolling far past the end must clamp, not leave a header with no
+        // rows under it.
+        for _ in 0..200 {
+            reports_wheel(&mut driver, (80.0, 10.0), -1.0);
+        }
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ENDED") && screen.contains("A#2"),
+            "#2405: scrolling past the end must clamp to the last page:\n{screen}"
+        );
+    }
+
 
 
 
