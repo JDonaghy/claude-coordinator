@@ -165,6 +165,8 @@ _JSON_COLUMN_SHAPES: dict[tuple[str, str], dict[str, Any]] = {
     ("issues", "labels"): {"type": "array", "items": {"type": "string"}},
     ("machines", "capabilities"): {"type": "array", "items": {"type": "string"}},
     ("machines", "repos"): {"type": "array", "items": {"type": "string"}},
+    # #2428: the drive queue's pre-req list — ["repo#N", ...] on the wire.
+    ("drive_queue", "after_json"): {"type": "array", "items": {"type": "string"}},
 }
 
 _SQLITE_AFFINITY_TO_SCHEMA: dict[str, dict[str, Any]] = {

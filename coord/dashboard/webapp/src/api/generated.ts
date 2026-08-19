@@ -176,3 +176,40 @@ export interface Assignment {
   stop_reason: string | null
   dispatched_by_assignment_id: string | null
 }
+
+export interface BoardDriveQueueEntry {
+  id: number | null
+  repo_name: string
+  issue_number: number
+  position: number
+  machine: string | null
+  after_json: string[]
+  state: string
+  attempts: number
+  deferrals: number
+  last_reason: string
+  reason_at: number | null
+  session_name: string | null
+  launched_at: number | null
+  enqueued_at: number
+  hold_after: number
+  hold_reason: string
+  resume_when: string
+  hold_state: string
+  hold_probes: number
+  launch_host: string
+  hold_scope: string
+  resumes: number
+  retry_backoff_at: number | null
+}
+
+export interface DriveQueueSummary {
+  level: string
+  pending: number
+  running: number
+  waiting: number
+  blocked: number
+  eligible: number
+  held: number
+  fleet_held: number
+}

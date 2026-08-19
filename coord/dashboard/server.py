@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -34,11 +35,18 @@ from coord.events import (
     build_events_route,
 )
 from coord.board_service import read_board, write_board
+from coord.db import _ensure_schema
+from coord.drive_queue import DriveQueueSummary, entries_from_rows, summarize_drive_queue
 from coord.models import Assignment
 from coord.network import check_all, fetch_status
-from coord.openapi import build_spec, dataclass_schema, openapi_and_docs_routes
+from coord.openapi import (
+    build_spec,
+    dataclass_schema,
+    openapi_and_docs_routes,
+    sqlite_table_schema,
+)
 from coord.pipeline import PipelineView
-from coord.state import load_proposals
+from coord.state import list_drive_queue, load_proposals
 
 DASHBOARD_DIR = Path(__file__).parent
 # Built React webapp lives here after `npm run build` inside coord/dashboard/webapp/.
@@ -317,6 +325,29 @@ def openapi_spec() -> dict:
     components: dict = {}
     assignment_ref = dataclass_schema(Assignment, components)
     pipeline_view_ref = dataclass_schema(PipelineView, components)
+    # #2428 DQW-1: the drive-queue entry schema comes straight from the
+    # SQLite DDL, the same way coord/serve_app.py's `_board_response_schema`
+    # builds `BoardDriveQueueEntry` for `/board` — the wire schema *is* the
+    # DDL (coord/db.py), not a hand-maintained field list that can drift from
+    # it. `after_json` is JSON-encoded TEXT in SQLite, decoded to an array on
+    # the wire (mirrors coord.dao._JSON_COLUMNS).
+    _schema_conn = sqlite3.connect(":memory:")
+    try:
+        _ensure_schema(_schema_conn)
+        components["BoardDriveQueueEntry"] = sqlite_table_schema(
+            _schema_conn, "drive_queue", json_columns=frozenset({"after_json"})
+        )
+    finally:
+        _schema_conn.close()
+    drive_queue_entry_ref = {"$ref": "#/components/schemas/BoardDriveQueueEntry"}
+    drive_queue_summary_ref = dataclass_schema(DriveQueueSummary, components)
+    drive_queue_response = {
+        "type": "object",
+        "properties": {
+            "entries": {"type": "array", "items": drive_queue_entry_ref},
+            "summary": drive_queue_summary_ref,
+        },
+    }
     board_response = {
         "type": "object",
         "properties": {
@@ -370,6 +401,30 @@ def openapi_spec() -> dict:
             "get": {
                 "summary": "Pending brain proposals awaiting approve/reject",
                 "responses": {"200": {"description": "OK"}},
+            }
+        },
+        "/api/drive-queue": {
+            "get": {
+                "summary": (
+                    "The `coord drive` work queue in run order, plus a "
+                    "server-computed pending/running/waiting/eligible/"
+                    "blocked/held summary (#2428 DQW-1)"
+                ),
+                "parameters": [
+                    {
+                        "name": "repo",
+                        "in": "query",
+                        "required": False,
+                        "schema": {"type": "string"},
+                        "description": "Restrict entries (and the summary) to one repo.",
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {"application/json": {"schema": drive_queue_response}},
+                    }
+                },
             }
         },
         "/api/approve": {
@@ -901,6 +956,33 @@ def build_app(
         proposals = _fixture.proposals() if _fixture is not None else load_proposals()
         from dataclasses import asdict
         return JSONResponse([asdict(p) for p in proposals])
+
+    async def api_drive_queue(request: Request) -> JSONResponse:
+        """GET /api/drive-queue?repo= — the operator-declared `coord drive`
+        work queue, plus a server-computed aggregate summary (#2428 DQW-1).
+
+        Mirrors ``api_board``'s shape: one call to the seam that already
+        resolves daemon-vs-local (``coord.state.list_drive_queue`` — the same
+        function ``coord drive-queue list`` itself calls, which routes to
+        ``coord.client.fetch_drive_queue(svc, repo)`` when a board service is
+        configured and to the local DB otherwise), then a pure aggregate
+        (:func:`coord.drive_queue.summarize_drive_queue`) over the typed rows
+        so the Queue panel sidebar doesn't have to recompute
+        pending/running/waiting/eligible/blocked/held counts client-side from
+        a possibly ``?repo=``-filtered view. ``entries`` is the raw row list
+        verbatim — same shape as the daemon's own ``GET /drive-queue`` and
+        ``/board``'s ``drive_queue`` field — no reshaping, no new fields.
+        """
+        from dataclasses import asdict
+
+        repo = request.query_params.get("repo") or None
+        entries = (
+            _fixture.drive_queue(repo)
+            if _fixture is not None
+            else list_drive_queue(repo)
+        )
+        summary = summarize_drive_queue(entries_from_rows(entries))
+        return JSONResponse({"entries": entries, "summary": asdict(summary)})
 
     async def api_approve(request: Request) -> JSONResponse:
         from coord.dispatch import dispatch, post_briefing, compute_do_not_touch
@@ -1821,6 +1903,7 @@ def build_app(
         Route("/api/machines", api_machines, methods=["GET"]),
         Route("/api/sessions", api_sessions, methods=["GET"]),
         Route("/api/proposals", api_proposals, methods=["GET"]),
+        Route("/api/drive-queue", api_drive_queue, methods=["GET"]),
         Route("/api/approve", api_approve, methods=["POST"]),
         Route("/api/reject", api_reject, methods=["POST"]),
         Route("/api/diff/{id}", api_diff, methods=["GET"]),

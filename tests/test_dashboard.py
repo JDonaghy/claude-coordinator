@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import time
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -47,6 +48,28 @@ def _config() -> Config:
 
 def _client(tmp_path: Path | None = None) -> TestClient:
     return TestClient(build_app(_config()))
+
+
+@pytest.fixture
+def rw_db(tmp_path: Path):
+    """A thread-safe (file-backed, ``check_same_thread=False``) coord.db override.
+
+    The autouse ``coord_db`` fixture (tests/conftest.py) installs a
+    thread-bound ``:memory:`` connection, which ``TestClient`` (it runs the
+    async handler on a worker thread) can't touch — mirrors
+    ``tests/test_serve.py``'s fixture of the same name, for the same reason:
+    production ``get_connection`` already uses ``check_same_thread=False``
+    (a file DB), so this just matches production for a route that actually
+    reads through it instead of a mocked seam.
+    """
+    from coord import db
+    from coord.db import _ensure_schema
+
+    conn = sqlite3.connect(str(tmp_path / "rw.db"), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    _ensure_schema(conn)
+    db.override_connection(conn)
+    yield conn
 
 
 class TestIndexPage:
@@ -403,6 +426,98 @@ class TestProposalsAPI:
             r = client.get("/api/proposals")
         assert r.status_code == 200
         assert r.json() == []
+
+
+class TestDriveQueueAPI:
+    """GET /api/drive-queue (#2428 DQW-1).
+
+    Unlike `TestBoardAPI`/`TestProposalsAPI` above, this reads straight
+    through `coord.state.list_drive_queue` -> the local DB (the `coord_db`
+    autouse fixture in conftest.py gives every test a fresh in-memory
+    SQLite, and `_no_board_service` guarantees `resolve_board_service()` is
+    unset) rather than mocking the read seam — the same "seeded DB -> GET ->
+    assert shape" bar every other `/api/*` route in this file meets.
+    """
+
+    def test_empty_queue(self, rw_db) -> None:
+        client = _client()
+        r = client.get("/api/drive-queue")
+        assert r.status_code == 200
+        data = r.json()
+        assert data == {
+            "entries": [],
+            "summary": {
+                "level": "empty",
+                "pending": 0,
+                "running": 0,
+                "waiting": 0,
+                "blocked": 0,
+                "eligible": 0,
+                "held": 0,
+                "fleet_held": 0,
+            },
+        }
+
+    def test_seeded_db_returns_entries_and_summary(self, rw_db) -> None:
+        from coord.state import (
+            _enqueue_drive_queue_local,
+            _update_drive_queue_entry_local,
+        )
+
+        _enqueue_drive_queue_local("api", 1)
+        _enqueue_drive_queue_local("api", 2, after=["api#1"])
+        _update_drive_queue_entry_local("api", 1, state="running")
+        _enqueue_drive_queue_local("web", 9)
+        _update_drive_queue_entry_local(
+            "web", 9, state="blocked", last_reason="merge conflict"
+        )
+
+        client = _client()
+        r = client.get("/api/drive-queue")
+        assert r.status_code == 200
+        data = r.json()
+
+        entries = data["entries"]
+        assert len(entries) == 3
+        by_key = {(e["repo_name"], e["issue_number"]): e for e in entries}
+        assert by_key[("api", 1)]["state"] == "running"
+        assert by_key[("api", 2)]["state"] == "waiting"
+        assert by_key[("api", 2)]["after_json"] == ["api#1"]
+        assert by_key[("web", 9)]["state"] == "blocked"
+        assert by_key[("web", 9)]["last_reason"] == "merge conflict"
+        # #2428: raw entries carry the same columns the daemon's own
+        # GET /drive-queue and /board's drive_queue field already do — no
+        # reshaping, no invented fields.
+        assert {
+            "repo_name", "issue_number", "position", "state", "machine",
+            "attempts", "after_json", "hold_state", "hold_scope", "hold_after",
+            "last_reason", "resumes", "deferrals",
+        } <= set(by_key[("api", 1)])
+
+        summary = data["summary"]
+        assert summary["running"] == 1
+        assert summary["blocked"] == 1
+        # api#2's after=["api#1"] is unsatisfied — api#1 is `running`, not
+        # `done` — so it counts as waiting but NOT eligible.
+        assert summary["waiting"] == 1
+        assert summary["eligible"] == 0
+        assert summary["pending"] == 3
+        # blocked outranks everything else in the level ranking.
+        assert summary["level"] == "blocked"
+
+    def test_repo_filter_scopes_entries_and_summary(self, rw_db) -> None:
+        from coord.state import _enqueue_drive_queue_local
+
+        _enqueue_drive_queue_local("api", 1)
+        _enqueue_drive_queue_local("web", 2)
+
+        client = _client()
+        r = client.get("/api/drive-queue", params={"repo": "api"})
+        assert r.status_code == 200
+        data = r.json()
+        assert [e["repo_name"] for e in data["entries"]] == ["api"]
+        assert data["summary"]["pending"] == 1
+        assert data["summary"]["waiting"] == 1
 
 
 class TestApproveAPI:
