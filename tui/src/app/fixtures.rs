@@ -369,8 +369,12 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         reports_export_rx: None,
         // #217: use the default dark palette for test helpers.
         active_theme: crate::settings::Theme::Dark.to_quadraui_theme(),
-        // #728: default 2h window for tests (can be overridden per test).
-        done_window: DoneWindow::H2,
+        // #2405: completed-issues grid defaults (24h / all repos).
+        completed_grid: CompletedGrid::default(),
+        completed_form: std::cell::RefCell::new(FormController::new(
+            "pipeline-completed".to_string(),
+        )),
+        completed_table_layout: std::cell::RefCell::new(None),
         // #816: no pending PTY-panic dialog in test helpers.
         pty_panic_dialog: None,
         // #1059: no pending Gate A dispatch-failure dialog in test helpers.

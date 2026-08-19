@@ -3313,7 +3313,7 @@ pub struct CoordApp {
     audit_no_service: bool,
     /// #1040: current time-range filter (contract §8), cycled by `t`.
     /// Persists across panel navigation (contract §11); resets to `All` on
-    /// TUI restart (in-memory only, like `done_window`).
+    /// TUI restart (in-memory only).
     audit_time_range: AuditTimeRange,
     /// #1040: current category filter (contract §9), cycled by `Tab`.
     /// Persists across panel navigation; resets to `All` on restart.
@@ -3507,10 +3507,21 @@ pub struct CoordApp {
     /// `Assignment::status_color_themed` and `stage_badge`.
     active_theme: quadraui::Theme,
 
-    // ── #728: Done-section time window ───────────────────────────────────────
-    /// Controls how far back the windowed Done list reaches.  Cycled by the
-    /// `→` key while the Done section is focused.  Resets to `H2` on restart.
-    done_window: DoneWindow,
+    // ── #2405: completed-issues grid ─────────────────────────────────────────
+    /// Controls + selection behind the Pipeline panel's `Completed` tab —
+    /// the report-style grid that replaced #728's fixed-window Done section.
+    /// In-memory only; resets to its 24h default on restart.
+    pub(crate) completed_grid: CompletedGrid,
+    /// `FormController` backing the completed grid's control row (time range /
+    /// window end / repo).  Same render-then-`handle_cached` contract the
+    /// Settings panel uses — see `render_pipeline_completed`.
+    pub(crate) completed_form: std::cell::RefCell<FormController>,
+    /// The completed grid's last-painted `DataTable` geometry, with the rect
+    /// it was painted into.  Same render-then-hit-test pattern (and same
+    /// reason for carrying the rect) as `reports_table_layout`: the table does
+    /// not start at the main panel's origin, so a bare `pos - main_b` would
+    /// mis-hit-test by the control row's height.
+    pub(crate) completed_table_layout: std::cell::RefCell<Option<(Rect, DataTableLayout)>>,
 
     // ── #816: PTY-panic modal ─────────────────────────────────────────────────
     /// When `Some`, a dismissible modal dialog is shown explaining that a vt100
@@ -3560,54 +3571,6 @@ pub(crate) enum AuditScrollAxis {
 pub(crate) enum QueueScrollAxis {
     Vertical,
     Horizontal,
-}
-
-/// #728: Time-window for the Done section in the Pipeline sidebar.
-///
-/// Cycled forward (H2 → H24 → D7 → All) by the `→` key while the Done
-/// section is focused.  Resets to `H2` on TUI restart (in-memory only).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DoneWindow {
-    /// Last 2 hours (default).
-    H2,
-    /// Last 24 hours.
-    H24,
-    /// Last 7 days.
-    D7,
-    /// All done issues regardless of age.
-    All,
-}
-
-impl DoneWindow {
-    /// The maximum age in seconds for this window, or `None` for "All".
-    fn secs(self) -> Option<f64> {
-        match self {
-            DoneWindow::H2 => Some(2.0 * 3600.0),
-            DoneWindow::H24 => Some(24.0 * 3600.0),
-            DoneWindow::D7 => Some(7.0 * 86_400.0),
-            DoneWindow::All => None,
-        }
-    }
-
-    /// Cycle to the next wider window.
-    fn next(self) -> Self {
-        match self {
-            DoneWindow::H2 => DoneWindow::H24,
-            DoneWindow::H24 => DoneWindow::D7,
-            DoneWindow::D7 => DoneWindow::All,
-            DoneWindow::All => DoneWindow::H2,
-        }
-    }
-
-    /// Short label for use in the section header.
-    fn label(self) -> &'static str {
-        match self {
-            DoneWindow::H2 => "last 2h",
-            DoneWindow::H24 => "last 24h",
-            DoneWindow::D7 => "last 7d",
-            DoneWindow::All => "all",
-        }
-    }
 }
 
 impl Default for CoordApp {
@@ -4072,8 +4035,12 @@ impl CoordApp {
                 crate::settings::TuiSettings::load_custom_theme_file()
                     .unwrap_or_else(|| s.theme.to_quadraui_theme())
             },
-            // #728: Done section shows last 2h by default; cycled with `→`.
-            done_window: DoneWindow::H2,
+            // #2405: completed-issues grid defaults (24h / all repos).
+            completed_grid: CompletedGrid::default(),
+            completed_form: std::cell::RefCell::new(FormController::new(
+                "pipeline-completed".to_string(),
+            )),
+            completed_table_layout: std::cell::RefCell::new(None),
             // #816: no pending PTY-panic dialog on startup.
             pty_panic_dialog: None,
             // #1059: no pending Gate A dispatch-failure dialog on startup.

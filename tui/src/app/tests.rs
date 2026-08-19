@@ -5587,17 +5587,17 @@
             all_labels: vec!["coord".to_string()],
             is_closed: true,
         });
-        // #728: issue #104 has no finished_at; use All window so it appears.
-        app.done_window = DoneWindow::All;
         app.rebuild_pipeline_sidebar(None);
 
         // #815: In-progress moves to the top; the pre-dispatch states follow.
         // status:ready and status:refining gate nothing, so the fixture's
         // status:ready issues + #101 (no label) + #102 (status:refining) all
-        // sit in New.  Order is: In-progress → New → Done.
+        // sit in New.  #2405: there is no Done section any more, so the
+        // closed #104 contributes no section at all — order is
+        // In-progress → New.
         assert_eq!(
             app.pipeline_state_section_names,
-            vec!["in-progress", "new", "done"],
+            vec!["in-progress", "new"],
             "In-progress must appear first (#815), followed by New then Done",
         );
     }
@@ -6821,52 +6821,52 @@
     }
 
     /// State-section collapse state must survive a rebuild — without this, the
-    /// user collapses the large "Done" section and watches it re-expand on
-    /// every 15 s refresh.
+    /// user collapses a large section and watches it re-expand on every 15 s
+    /// refresh.
     #[test]
     fn rebuild_pipeline_sidebar_preserves_section_collapsed_state() {
         let mut app = make_pipeline_app();
-        // Add a closed (Done) issue so we have both "Pending" (state idx 0)
-        // and "Done" (state idx 1) sections — the pipeline fixture already
-        // seeds a `status:ready` issue (Pending).
+        // Add a dispatched issue so we have two sections — the pipeline
+        // fixture only seeds pre-dispatch ("new") issues.
         app.pipeline_issues.push(PipelineIssue {
-            number: 55,
-            title: "Finished task".to_string(),
+            number: 56,
+            title: "Being worked".to_string(),
             body: String::new(),
             repo_slug: "acme/api".to_string(),
             coord_repo: Some("api".to_string()),
             matched_labels: vec!["coord".to_string()],
             all_labels: vec!["coord".to_string()],
-            is_closed: true,
+            is_closed: false,
         });
-        // #728: #55 has no finished_at; use All window so it appears in Done.
-        // (pipeline_lifecycle_section returns "done" for is_closed=true).
-        app.done_window = DoneWindow::All;
+        app.data
+            .assignments
+            .push(make_assignment_typed("running", 56, "api", Some("work")));
         app.rebuild_pipeline_sidebar(None);
-        // #628: the fixture's status:ready issues are now "new" (status:ready
-        // gates nothing). With the closed #55 → "done", sections are New + Done.
-        // Section 0 = FILTER, 1 = "New", 2 = "Done".
-        assert_eq!(app.pipeline_state_section_names, vec!["new", "done"]);
-        // #815: Done starts collapsed by default; New starts expanded.
-        assert!(!app.pipeline_sidebar.is_collapsed(1)); // New: expanded by default
-        assert!(app.pipeline_sidebar.is_collapsed(2));  // Done: collapsed by default (#815)
-
-        // Collapse New and explicitly expand Done (user action).
-        app.pipeline_sidebar.set_collapsed(1, true);
-        app.pipeline_sidebar.set_collapsed(2, false);
-        assert!(app.pipeline_sidebar.is_collapsed(1));
+        // #628: everything pre-dispatch is "new". #2405: the closed issue this
+        // test used to pair with New no longer produces a section at all, so
+        // the dispatched #56 supplies the second one.
+        // Section 0 = FILTER, 1 = "In-progress", 2 = "New".
+        assert_eq!(app.pipeline_state_section_names, vec!["in-progress", "new"]);
+        // #2405: #815's collapsed-by-default carve-out was Done-only and went
+        // with the section — every remaining section starts expanded.
+        assert!(!app.pipeline_sidebar.is_collapsed(1));
         assert!(!app.pipeline_sidebar.is_collapsed(2));
+
+        // Collapse New, leave In-progress expanded (user action).
+        app.pipeline_sidebar.set_collapsed(2, true);
+        assert!(!app.pipeline_sidebar.is_collapsed(1));
+        assert!(app.pipeline_sidebar.is_collapsed(2));
 
         // Rebuild — collapse state must be preserved across rebuild.
         app.rebuild_pipeline_sidebar(None);
 
         assert!(
-            app.pipeline_sidebar.is_collapsed(1),
-            "New section collapse state must survive rebuild",
+            !app.pipeline_sidebar.is_collapsed(1),
+            "In-progress section stays expanded across rebuild",
         );
         assert!(
-            !app.pipeline_sidebar.is_collapsed(2),
-            "Done section stays expanded (user explicitly expanded it; persists across rebuild)",
+            app.pipeline_sidebar.is_collapsed(2),
+            "New section collapse state must survive rebuild",
         );
     }
 
@@ -6877,32 +6877,16 @@
     #[test]
     fn rebuild_pipeline_sidebar_collapse_state_follows_state_through_reorder() {
         let mut app = make_pipeline_app();
-        // #628: everything pre-work is now "new", so to exercise a section
-        // REORDER we start with a single Done issue, collapse it, then add a New
-        // issue — "new" sorts before "done", pushing Done from section 1 to 2.
+        // #628: everything pre-dispatch is "new", so to exercise a section
+        // REORDER we start with a single New issue, collapse it, then dispatch
+        // work on another — "in-progress" sorts before "new" (#815), pushing
+        // New from section 1 to 2. (#2405 retired the Done section this test
+        // used to pair New with.)
         app.pipeline_issues.clear();
+        app.data.assignments.clear();
         app.pipeline_issues.push(PipelineIssue {
             number: 90,
-            title: "Done".to_string(),
-            body: String::new(),
-            repo_slug: "acme/api".to_string(),
-            coord_repo: Some("api".to_string()),
-            matched_labels: vec!["coord".to_string()],
-            all_labels: vec!["coord".to_string()],
-            is_closed: true,
-        });
-        // #728: issue #90 has no finished_at; use All window so it appears.
-        app.done_window = DoneWindow::All;
-        app.rebuild_pipeline_sidebar(None);
-        assert_eq!(app.pipeline_state_section_names, vec!["done"]);
-        app.pipeline_sidebar.set_collapsed(1, true); // collapse Done (section 1)
-        assert!(app.pipeline_sidebar.is_collapsed(1));
-
-        // Add a New (open) issue — "new" sorts before "done", so Done moves to
-        // section 2. Collapse state is keyed by NAME, so it must follow Done.
-        app.pipeline_issues.push(PipelineIssue {
-            number: 91,
-            title: "New work".to_string(),
+            title: "Not started".to_string(),
             body: String::new(),
             repo_slug: "acme/api".to_string(),
             coord_repo: Some("api".to_string()),
@@ -6911,15 +6895,36 @@
             is_closed: false,
         });
         app.rebuild_pipeline_sidebar(None);
+        assert_eq!(app.pipeline_state_section_names, vec!["new"]);
+        app.pipeline_sidebar.set_collapsed(1, true); // collapse New (section 1)
+        assert!(app.pipeline_sidebar.is_collapsed(1));
 
-        assert_eq!(app.pipeline_state_section_names, vec!["new", "done"]);
+        // Dispatch work on a second issue — "in-progress" sorts before "new",
+        // so New moves to section 2. Collapse state is keyed by NAME, so it
+        // must follow New.
+        app.pipeline_issues.push(PipelineIssue {
+            number: 91,
+            title: "In flight".to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: false,
+        });
+        app.data
+            .assignments
+            .push(make_assignment_typed("running", 91, "api", Some("work")));
+        app.rebuild_pipeline_sidebar(None);
+
+        assert_eq!(app.pipeline_state_section_names, vec!["in-progress", "new"]);
         assert!(
             !app.pipeline_sidebar.is_collapsed(1),
-            "New section must not be retroactively collapsed",
+            "In-progress section must not be retroactively collapsed",
         );
         assert!(
             app.pipeline_sidebar.is_collapsed(2),
-            "Done section collapse state followed from section 1 to section 2",
+            "New collapse state followed from section 1 to section 2",
         );
     }
 
@@ -7472,9 +7477,9 @@
 
     #[test]
     fn pipeline_new_done_sections_grouped_by_repo() {
-        // New section must sub-group by repo.
-        // Done section (#728) is now flat/windowed — verify it shows the closed
-        // issue when done_window == All (no finished_at on the test issue).
+        // New section must sub-group by repo. #2405: a closed issue no longer
+        // produces a Done section — this pins that the *New* grouping is
+        // unaffected by the removal.
         let mut app = make_pipeline_app();
         // Add a closed issue in the second repo.
         app.pipeline_issues.push(PipelineIssue {
@@ -7487,28 +7492,22 @@
             all_labels: vec!["coord".to_string()],
             is_closed: true,
         });
-        // #728: issues without finished_at are hidden in the default H2 window;
-        // set All so the test can observe the Done section.
-        app.done_window = DoneWindow::All;
         app.rebuild_pipeline_sidebar(None);
 
-        // State sections: New + Done (#628: status:ready issues are "new").
+        // State sections: New only (#628: status:ready issues are "new").
         assert!(
             app.pipeline_state_section_names.contains(&"new"),
             "New section must exist",
         );
         assert!(
-            app.pipeline_state_section_names.contains(&"done"),
-            "Done section must exist",
+            !app.pipeline_state_section_names.contains(&"done"),
+            "#2405: the Done section is gone — closed issues live in the \
+             Completed grid, not the sidebar",
         );
 
         // New section has 2 repos with 1 issue each.
         let new_groups = app.pipeline_repos_for_state("new");
         assert_eq!(new_groups.len(), 2, "New section has two repos");
-
-        // Done section (#728): flat windowed list — 1 item (issue #100).
-        let done_windowed = app.pipeline_done_windowed();
-        assert_eq!(done_windowed.len(), 1, "Done windowed list has one item");
     }
 
     // ── #193: stale downstream stages ─────────────────────────────────────────
@@ -18979,8 +18978,15 @@
         );
         assert_eq!(
             labels.len(),
-            5,
-            "#818: exactly 5 tabs expected (Overview/Issue/Log/Summary/Terminal), got: {labels:?}"
+            6,
+            "#818 + #2405: exactly 6 tabs expected \
+             (Overview/Issue/Log/Summary/Terminal/Completed), got: {labels:?}"
+        );
+        assert_eq!(
+            labels.last().map(|s| s.trim()),
+            Some("Completed"),
+            "#2405: the Completed grid is pinned LAST so the five per-issue \
+             tabs keep their existing indices, got: {labels:?}"
         );
     }
 
@@ -21602,58 +21608,6 @@
         assert_eq!(milestones[2].2.len(), 1);
     }
 
-    #[test]
-    fn pipeline_done_section_is_flat_windowed_no_milestone_headers() {
-        // #728: Done section is now flat and time-windowed — no milestone
-        // sub-headers.  Issues without finished_at are hidden in H2 (default)
-        // but visible in All.
-        let mut app = make_pipeline_app();
-        app.pipeline_issues = vec![
-            PipelineIssue {
-                number: 50,
-                title: "Done v1".to_string(),
-                body: String::new(),
-                repo_slug: "acme/api".to_string(),
-                coord_repo: Some("api".to_string()),
-                matched_labels: vec!["coord".to_string()],
-                all_labels: vec!["coord".to_string()],
-                is_closed: true,
-            },
-            PipelineIssue {
-                number: 60,
-                title: "Done no-milestone".to_string(),
-                body: String::new(),
-                repo_slug: "acme/api".to_string(),
-                coord_repo: Some("api".to_string()),
-                matched_labels: vec!["coord".to_string()],
-                all_labels: vec!["coord".to_string()],
-                is_closed: true,
-            },
-        ];
-
-        // Default H2 window: no assignments → no finished_at → done_windowed empty.
-        app.done_window = DoneWindow::H2;
-        app.rebuild_pipeline_sidebar(None);
-        assert!(
-            !app.pipeline_state_section_names.contains(&"done"),
-            "Done section hidden in H2 when no finished_at timestamps",
-        );
-
-        // All window: both issues appear, flat (no milestone sub-headers).
-        app.done_window = DoneWindow::All;
-        app.rebuild_pipeline_sidebar(None);
-        assert!(
-            app.pipeline_state_section_names.contains(&"done"),
-            "Done section visible in All window",
-        );
-        let done_windowed = app.pipeline_done_windowed();
-        assert_eq!(done_windowed.len(), 2, "two done issues in All window");
-        // Verify these are real pipeline_issues indices.
-        for &idx in &done_windowed {
-            assert!(idx < app.pipeline_issues.len(), "index in bounds");
-            assert!(app.pipeline_issues[idx].is_closed, "issue is closed");
-        }
-    }
 
     #[test]
     fn pipeline_in_progress_not_milestone_grouped() {
@@ -22853,14 +22807,19 @@
 
     #[test]
     fn detail_terminal_tab_is_fifth_in_pipeline_tab_bar() {
-        // #818 order: Overview / Issue / Log / Summary / Terminal (5 tabs).
-        // Index 4 (0-based) → Terminal.
+        // #818 order: Overview / Issue / Log / Summary / Terminal, plus
+        // #2405's Completed grid at index 5. Index 4 (0-based) → Terminal.
         let app = make_app_default();
         let bar = app.pipeline_detail_tab_bar();
         assert_eq!(
             bar.tabs.len(),
-            5,
-            "expected exactly 5 pipeline detail tabs (#818)"
+            6,
+            "expected 5 per-issue tabs (#818) plus #2405's Completed grid"
+        );
+        assert_eq!(
+            bar.tabs[5].label.trim(),
+            "Completed",
+            "#2405: Completed is pinned last, after Terminal"
         );
         assert_eq!(
             bar.tabs[0].label.trim(),
@@ -22881,42 +22840,52 @@
 
     #[test]
     fn pipeline_detail_tab_cycles_forward() {
-        // l (Right) from Summary should land on Terminal; from Terminal wraps to Overview.
-        let mut app = make_app_default();
-        // Summary → Terminal
-        app.pipeline_detail_tab = PipelineDetailTab::Summary;
-        app.pipeline_detail_tab = match app.pipeline_detail_tab {
-            PipelineDetailTab::Overview => PipelineDetailTab::Issue,
-            PipelineDetailTab::Issue => PipelineDetailTab::Log,
-            PipelineDetailTab::Log => PipelineDetailTab::Summary,
-            PipelineDetailTab::Summary => PipelineDetailTab::Terminal,
-            PipelineDetailTab::Terminal => PipelineDetailTab::Overview,
-        };
-        assert_eq!(app.pipeline_detail_tab, PipelineDetailTab::Terminal);
-        // Terminal → Overview (wrap-around)
-        app.pipeline_detail_tab = match app.pipeline_detail_tab {
-            PipelineDetailTab::Overview => PipelineDetailTab::Issue,
-            PipelineDetailTab::Issue => PipelineDetailTab::Log,
-            PipelineDetailTab::Log => PipelineDetailTab::Summary,
-            PipelineDetailTab::Summary => PipelineDetailTab::Terminal,
-            PipelineDetailTab::Terminal => PipelineDetailTab::Overview,
-        };
-        assert_eq!(app.pipeline_detail_tab, PipelineDetailTab::Overview);
+        // #2405: `l` walks the real handler, so the Completed grid now sits
+        // between Terminal and the wrap back to Overview.
+        use quadraui::tui::testing::driver_with_shell;
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        // Start ON Terminal rather than walking onto it: landing there via
+        // the keyboard focuses the PTY, which then swallows the next `l`.
+        app.pipeline_detail_tab = PipelineDetailTab::Terminal;
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        // Terminal → Completed.
+        driver.press(Key::Char('l'));
+        driver.render();
+        assert!(
+            driver.screen_contains("Time range"),
+            "#2405: `l` from Terminal must land on the Completed grid, whose \
+             control row is on screen:\n{}",
+            driver.screen()
+        );
+        // …and one more wraps back to Overview, which the grid's controls
+        // are gone from.
+        driver.press(Key::Char('l'));
+        driver.render();
+        assert!(
+            !driver.screen_contains("Time range"),
+            "#2405: `l` from Completed must wrap to Overview:\n{}",
+            driver.screen()
+        );
     }
 
     #[test]
     fn pipeline_detail_tab_cycles_backward() {
-        // h (Left) from Overview should land on Terminal (wrap-around).
-        let mut app = make_app_default();
+        // #2405: `h` from Overview wraps to Completed (the new last tab),
+        // then continues back through Terminal.
+        use quadraui::tui::testing::driver_with_shell;
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
         app.pipeline_detail_tab = PipelineDetailTab::Overview;
-        app.pipeline_detail_tab = match app.pipeline_detail_tab {
-            PipelineDetailTab::Overview => PipelineDetailTab::Terminal,
-            PipelineDetailTab::Issue => PipelineDetailTab::Overview,
-            PipelineDetailTab::Log => PipelineDetailTab::Issue,
-            PipelineDetailTab::Summary => PipelineDetailTab::Log,
-            PipelineDetailTab::Terminal => PipelineDetailTab::Summary,
-        };
-        assert_eq!(app.pipeline_detail_tab, PipelineDetailTab::Terminal);
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        // #2405: Overview wraps *backwards* onto Completed, the new last tab.
+        driver.press(Key::Char('h'));
+        driver.render();
+        assert!(
+            driver.screen_contains("Time range"),
+            "#2405: `h` from Overview must wrap onto the Completed grid:\n{}",
+            driver.screen()
+        );
     }
 
     #[test]
@@ -28733,531 +28702,15 @@
         a
     }
 
-    #[test]
-    fn done_windowed_h2_shows_only_recent_items() {
-        // Issues with finished_at inside 2h appear; older ones do not.
-        let mut app = make_test_app(BoardData {
-            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
-            assignments: vec![
-                finished_assignment_ago("a-recent", 10, "api", 30.0 * 60.0), // 30 min ago
-                finished_assignment_ago("a-old",    20, "api", 3.0 * 3600.0), // 3 h ago
-            ],
-            ..BoardData::default()
-        });
-        app.pipeline_issues = vec![
-            closed_issue(10, "acme/api", "api"), // recent
-            closed_issue(20, "acme/api", "api"), // old
-        ];
-        app.done_window = DoneWindow::H2;
-        app.rebuild_pipeline_sidebar(None);
 
-        let windowed = app.pipeline_done_windowed();
-        assert_eq!(windowed.len(), 1, "only 1 issue inside 2h");
-        assert_eq!(app.pipeline_issues[windowed[0]].number, 10, "must be #10");
 
-        assert!(
-            app.pipeline_state_section_names.contains(&"done"),
-            "Done section visible when at least one recent item exists",
-        );
-    }
 
-    #[test]
-    fn done_windowed_all_shows_issues_without_finished_at() {
-        // Issues with no finished_at are excluded in H2 but visible in All.
-        let mut app = make_test_app(BoardData {
-            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
-            ..BoardData::default()
-        });
-        app.pipeline_issues = vec![
-            closed_issue(10, "acme/api", "api"), // no assignment → no finished_at
-        ];
 
-        app.done_window = DoneWindow::H2;
-        app.rebuild_pipeline_sidebar(None);
-        assert!(
-            !app.pipeline_state_section_names.contains(&"done"),
-            "Done hidden in H2 when no finished_at",
-        );
 
-        app.done_window = DoneWindow::All;
-        app.rebuild_pipeline_sidebar(None);
-        let windowed = app.pipeline_done_windowed();
-        assert_eq!(windowed.len(), 1, "All window reveals timestamp-less issue");
-        assert_eq!(app.pipeline_issues[windowed[0]].number, 10);
-    }
 
-    #[test]
-    fn done_windowed_newest_first_ordering() {
-        // Done section is sorted newest-first (largest finished_at first).
-        let mut app = make_test_app(BoardData {
-            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
-            assignments: vec![
-                finished_assignment_ago("a-old",    10, "api", 60.0 * 60.0), // 1h ago
-                finished_assignment_ago("a-recent", 20, "api", 10.0 * 60.0), // 10m ago
-                finished_assignment_ago("a-mid",    30, "api", 30.0 * 60.0), // 30m ago
-            ],
-            ..BoardData::default()
-        });
-        app.pipeline_issues = vec![
-            closed_issue(10, "acme/api", "api"),
-            closed_issue(20, "acme/api", "api"),
-            closed_issue(30, "acme/api", "api"),
-        ];
-        app.done_window = DoneWindow::H2;
 
-        let windowed = app.pipeline_done_windowed();
-        assert_eq!(windowed.len(), 3, "all three fit in 2h");
-        // Newest first: 20 (10m), 30 (30m), 10 (60m).
-        assert_eq!(app.pipeline_issues[windowed[0]].number, 20, "newest first");
-        assert_eq!(app.pipeline_issues[windowed[1]].number, 30, "middle");
-        assert_eq!(app.pipeline_issues[windowed[2]].number, 10, "oldest last");
-    }
 
-    #[test]
-    fn done_windowed_uses_merge_time_not_work_finish_time() {
-        // #913: the concrete #769 case — work finished hours ago (outside
-        // the default H2 window) but the merge landed seconds ago. The Done
-        // section must key off the merge_queue entry's `last_attempt`
-        // (merge time), not the work assignment's `finished_at`, so the
-        // item shows up immediately instead of only after widening the
-        // window. A second, older-merged issue proves the sort follows
-        // merge time too: it "finished" work more recently than #769 but
-        // merged earlier, so it must sort *below* #769.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
 
-        let mut app = make_test_app(BoardData {
-            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
-            assignments: vec![
-                // Work for #769 finished 5h ago — well outside the H2 window
-                // on `finished_at` alone.
-                finished_assignment_ago("a-769", 769, "api", 5.0 * 3600.0),
-                // #20's work finished more recently than #769's, but it
-                // merged earlier — ordering must follow the merge, not this.
-                finished_assignment_ago("a-20", 20, "api", 1.0 * 3600.0),
-            ],
-            merge_queue: vec![
-                MergeQueueEntry {
-                    assignment_id: "a-769".to_string(),
-                    issue_number: Some(769),
-                    state: "merged".to_string(),
-                    pr_number: Some(910),
-                    pr_url: None,
-                    repo_github: "acme/api".to_string(),
-                    target_branch: None,
-                    error: None,
-                    branch: None,
-                    milestone_title: None,
-                    last_attempt: Some(now - 30.0), // merged 30s ago
-                },
-                MergeQueueEntry {
-                    assignment_id: "a-20".to_string(),
-                    issue_number: Some(20),
-                    state: "merged".to_string(),
-                    pr_number: Some(21),
-                    pr_url: None,
-                    repo_github: "acme/api".to_string(),
-                    target_branch: None,
-                    error: None,
-                    branch: None,
-                    milestone_title: None,
-                    last_attempt: Some(now - 20.0 * 60.0), // merged 20m ago
-                },
-            ],
-            ..BoardData::default()
-        });
-        // Still open on GitHub (the brain hasn't synced the close yet) —
-        // Done classification must come from the merge_queue entry, not
-        // `is_closed`, mirroring the live #769 scenario.
-        let mut issue_769 = closed_issue(769, "acme/api", "api");
-        issue_769.is_closed = false;
-        let mut issue_20 = closed_issue(20, "acme/api", "api");
-        issue_20.is_closed = false;
-        app.pipeline_issues = vec![issue_769, issue_20];
-        app.done_window = DoneWindow::H2;
-        app.rebuild_pipeline_sidebar(None);
-
-        let windowed = app.pipeline_done_windowed();
-        assert_eq!(
-            windowed.len(),
-            2,
-            "both merged-recently issues show at the default H2 window \
-             despite work having finished hours ago"
-        );
-        assert_eq!(
-            app.pipeline_issues[windowed[0]].number, 769,
-            "most-recently-merged (#769, merged 30s ago) sorts first"
-        );
-        assert_eq!(
-            app.pipeline_issues[windowed[1]].number, 20,
-            "older merge (#20, merged 20m ago) sorts second"
-        );
-    }
-
-    #[test]
-    fn done_windowed_excludes_recently_worked_but_unmerged_item() {
-        // Companion to the above: an item worked on recently but NOT yet
-        // merged must not appear in Done, even though its `finished_at` is
-        // fresh — only a closed issue or a merged queue entry makes Done.
-        let mut app = make_test_app(BoardData {
-            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
-            assignments: vec![
-                finished_assignment_ago("a-30", 30, "api", 60.0), // 1 min ago
-            ],
-            ..BoardData::default()
-        });
-        let mut issue_30 = closed_issue(30, "acme/api", "api");
-        issue_30.is_closed = false; // still open, not merged
-        app.pipeline_issues = vec![issue_30];
-        app.done_window = DoneWindow::H2;
-        app.rebuild_pipeline_sidebar(None);
-
-        let windowed = app.pipeline_done_windowed();
-        assert!(
-            windowed.is_empty(),
-            "recently-worked-but-unmerged issue must not appear in Done"
-        );
-    }
-
-    #[test]
-    fn done_section_renders_freshly_merged_issue_despite_stale_work_finish_time() {
-        // #913 acceptance (rendered, not just internal state): a TuiDriver
-        // check that a freshly-merged issue whose work finished outside the
-        // default window still shows up in the *rendered* Done section.
-        use quadraui::tui::testing::driver_with_shell;
-
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
-        let mut app = make_test_app(BoardData {
-            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
-            assignments: vec![
-                finished_assignment_ago("a-769", 769, "api", 5.0 * 3600.0), // 5h ago
-            ],
-            merge_queue: vec![MergeQueueEntry {
-                assignment_id: "a-769".to_string(),
-                issue_number: Some(769),
-                state: "merged".to_string(),
-                pr_number: Some(910),
-                pr_url: None,
-                repo_github: "acme/api".to_string(),
-                target_branch: None,
-                error: None,
-                branch: None,
-                milestone_title: None,
-                last_attempt: Some(now - 30.0), // merged 30s ago
-            }],
-            ..BoardData::default()
-        });
-        let mut issue_769 = closed_issue(769, "acme/api", "api");
-        issue_769.is_closed = false; // GitHub close not yet synced, as in the live #769 case
-        app.pipeline_issues = vec![issue_769];
-        app.done_window = DoneWindow::H2;
-        app.rebuild_pipeline_sidebar(None);
-        // #815: Done starts collapsed by default; expand it so #769 is visible.
-        {
-            let search_offset = 1usize; // section 0 = FILTER widget
-            if let Some(done_idx) = app
-                .pipeline_state_section_names
-                .iter()
-                .position(|&k| k == "done")
-            {
-                app.pipeline_sidebar.set_collapsed(done_idx + search_offset, false);
-            }
-        }
-
-        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
-        click_activity_icon(&mut driver, "▶"); // switch to Pipeline view
-        let screen = driver.screen();
-
-        assert!(
-            screen.contains("Done") && screen.contains("last 2h"),
-            "Done header shows the default window\n{}",
-            screen,
-        );
-        assert!(
-            screen.contains("#769"),
-            "freshly-merged issue #769 renders in Done despite work having \
-             finished 5h ago (only the merge, 30s ago, is inside the window)\n{}",
-            screen,
-        );
-    }
-
-    #[test]
-    fn done_windowed_flat_no_repo_or_milestone_subheaders() {
-        // Done section renders flat: path[0] == 0 (synthetic group),
-        // path[1] == issue index. No path.len()==1 (repo header) or
-        // path.len()==3 (milestone header) rows.
-        use quadraui::tui::testing::driver_with_shell;
-
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
-        let mut app = make_test_app(BoardData {
-            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
-            assignments: vec![{
-                let mut a = make_assignment_typed("done", 42, "api", Some("work"));
-                a.finished_at = Some(now - 60.0); // 1 minute ago
-                a
-            }],
-            ..BoardData::default()
-        });
-        app.pipeline_issues = vec![closed_issue(42, "acme/api", "api")];
-        app.done_window = DoneWindow::H2;
-        app.rebuild_pipeline_sidebar(None);
-        // #815: Done starts collapsed by default; expand it so #42 is visible.
-        {
-            let search_offset = 1usize; // section 0 = FILTER widget
-            if let Some(done_idx) = app
-                .pipeline_state_section_names
-                .iter()
-                .position(|&k| k == "done")
-            {
-                app.pipeline_sidebar.set_collapsed(done_idx + search_offset, false);
-            }
-        }
-
-        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
-        // Switch to Pipeline view.
-        click_activity_icon(&mut driver, "▶");
-        let screen = driver.screen();
-
-        // Done section header must show the window label.
-        assert!(
-            screen.contains("Done") && screen.contains("last 2h"),
-            "Done header shows window: last 2h\n{}",
-            screen,
-        );
-        // The issue number must appear.
-        assert!(screen.contains("#42"), "issue #42 must render\n{}", screen);
-        // "✓ merged" or "✓ closed" status must appear (terse status).
-        assert!(
-            screen.contains("✓ merged") || screen.contains("✓ closed"),
-            "terse status renders\n{}",
-            screen,
-        );
-        // No repo sub-headers (would be the repo_key "api" as a header row).
-        // They would show as "api (N)" in Done; now Done is flat.
-        // We can't easily assert absence of "api (N)" without parsing, but
-        // we can assert the issue title appears directly (not behind a header).
-        assert!(
-            screen.contains("Issue #42"),
-            "issue title appears directly\n{}",
-            screen,
-        );
-    }
-
-    #[test]
-    fn done_windowed_live_session_badge_appears() {
-        // A done issue with a matching live tmux session must be detected as
-        // live — which is the predicate that adds the "● live" span to the
-        // Done row during rebuild_pipeline_sidebar.
-        //
-        // We test the predicate (`issue_session_is_live`) directly here because
-        // the TuiDriver clips the sidebar column and the span is pushed past the
-        // visible boundary. The correct rendering contract is:
-        //   issue_session_is_live → true → span "  ● live" appended (see app.rs).
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
-        let mut app = make_test_app(BoardData {
-            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
-            assignments: vec![{
-                let mut a = make_assignment_typed("done", 77, "api", Some("work"));
-                a.finished_at = Some(now - 120.0); // 2 minutes ago
-                a
-            }],
-            ..BoardData::default()
-        });
-        app.pipeline_issues = vec![closed_issue(77, "acme/api", "api")];
-        // Add a matching live tmux session.
-        app.live_tmux_sessions = vec![make_live_tmux_session("some-aid", 77, "api")];
-        app.done_window = DoneWindow::H2;
-        app.rebuild_pipeline_sidebar(None);
-
-        // Verify the issue is windowed (would appear in Done section).
-        let windowed = app.pipeline_done_windowed();
-        assert_eq!(windowed.len(), 1, "issue #77 must be in Done section");
-        assert_eq!(app.pipeline_issues[windowed[0]].number, 77);
-
-        // Verify the live-session predicate fires — this is what gates the
-        // "● live" span in rebuild_pipeline_sidebar's "done" arm.
-        let issue = &app.pipeline_issues[windowed[0]];
-        assert!(
-            app.issue_session_is_live(issue),
-            "issue_session_is_live must return true for #77 with matching tmux session",
-        );
-    }
-
-    #[test]
-    fn done_window_cycles_on_right_key() {
-        // The `→` key while Done section is focused cycles: H2 → H24 → D7 → All.
-        use quadraui::tui::testing::driver_with_shell;
-
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
-        let mut app = make_test_app(BoardData {
-            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
-            assignments: vec![{
-                let mut a = make_assignment_typed("done", 55, "api", Some("work"));
-                a.finished_at = Some(now - 300.0); // 5 minutes ago
-                a
-            }],
-            ..BoardData::default()
-        });
-        app.pipeline_issues = vec![closed_issue(55, "acme/api", "api")];
-        app.done_window = DoneWindow::H2;
-        app.rebuild_pipeline_sidebar(None);
-
-        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
-        // Switch to Pipeline (key 3), Done section should be active already.
-        click_activity_icon(&mut driver, "▶");
-
-        // Header starts with "last 2h".
-        let s0 = driver.screen();
-        assert!(s0.contains("last 2h"), "starts as last 2h\n{}", s0);
-
-        // Press → to cycle to 24h.
-        driver.press(quadraui::Key::Named(quadraui::NamedKey::Right));
-        let s1 = driver.screen();
-        assert!(s1.contains("last 24h"), "H24 after first →\n{}", s1);
-
-        // Press → again: 7d.
-        driver.press(quadraui::Key::Named(quadraui::NamedKey::Right));
-        let s2 = driver.screen();
-        assert!(s2.contains("last 7d"), "D7 after second →\n{}", s2);
-
-        // Press → again: all.
-        driver.press(quadraui::Key::Named(quadraui::NamedKey::Right));
-        let s3 = driver.screen();
-        assert!(s3.contains("all") || s3.contains("All"), "All after third →\n{}", s3);
-
-        // Press → again: wraps back to 2h.
-        driver.press(quadraui::Key::Named(quadraui::NamedKey::Right));
-        let s4 = driver.screen();
-        assert!(s4.contains("last 2h"), "wraps back to last 2h\n{}", s4);
-    }
-
-    /// Regression test for the focus-loss bug fixed in #728.
-    ///
-    /// When the board has BOTH an in-progress section AND a done section,
-    /// focusing the Done section HEADER (no issue row selected — `pipeline_sel`
-    /// is None) and pressing → should keep the Done section focused across
-    /// rebuilds.  Previously the rebuild's `default_select` block would pick
-    /// in-progress (the first section) and the restore loop would skip Done
-    /// because `prev_sel` was None.
-    #[test]
-    fn done_window_cycles_on_right_key_with_in_progress_section() {
-        use quadraui::tui::testing::driver_with_shell;
-
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
-
-        // Board has one in-progress issue AND one done issue — Done is NOT the
-        // first section, so `default_select` would pick in-progress if the
-        // restore loop is skipped.
-        let mut app = make_test_app(BoardData {
-            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
-            assignments: vec![
-                // In-progress assignment (running, not done).
-                make_assignment_typed("running", 42, "api", Some("work")),
-                // Done assignment finished 5 minutes ago.
-                {
-                    let mut a = make_assignment_typed("done", 55, "api", Some("work"));
-                    a.finished_at = Some(now - 300.0); // 5 minutes ago
-                    a
-                },
-            ],
-            ..BoardData::default()
-        });
-        // Open issue #42 → in-progress; closed issue #55 → done.
-        app.pipeline_issues = vec![
-            PipelineIssue {
-                number: 42,
-                title: "In-progress issue".to_string(),
-                body: String::new(),
-                repo_slug: "acme/api".to_string(),
-                coord_repo: Some("api".to_string()),
-                matched_labels: vec!["coord".to_string()],
-                all_labels: vec!["coord".to_string()],
-                is_closed: false,
-            },
-            closed_issue(55, "acme/api", "api"),
-        ];
-        app.done_window = DoneWindow::H2;
-        app.rebuild_pipeline_sidebar(None);
-
-        // After rebuild the in-progress section is the first state section and
-        // default_select focuses it.  Check that both sections exist.
-        assert!(
-            app.pipeline_state_section_names.contains(&"in-progress"),
-            "board must have an in-progress section for this regression test"
-        );
-        assert!(
-            app.pipeline_state_section_names.contains(&"done"),
-            "board must have a done section for this regression test"
-        );
-
-        // Simulate the user having navigated to the Done section HEADER
-        // (no issue row selected within Done — pipeline_sel is None).
-        // This is the state that triggered the focus-loss bug.
-        let done_section_idx = app
-            .pipeline_state_section_names
-            .iter()
-            .position(|&k| k == "done")
-            .expect("done section must exist")
-            + 1; // +1 because section 0 is the FILTER form
-        app.pipeline_sidebar
-            .set_active_section(Some(done_section_idx));
-        app.pipeline_sel = None; // no row selected — user is on the section header
-
-        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
-        // Switch to Pipeline view.
-        click_activity_icon(&mut driver, "▶");
-
-        // The Done section header should show "last 2h" initially.
-        let s0 = driver.screen();
-        assert!(s0.contains("last 2h"), "initial Done header shows last 2h\n{}", s0);
-
-        // First →: cycles to 24h.  Also verifies Done section is still focused
-        // (if it weren't, the key would be unhandled and the label unchanged).
-        driver.press(quadraui::Key::Named(quadraui::NamedKey::Right));
-        let s1 = driver.screen();
-        assert!(s1.contains("last 24h"), "H24 after first → (multi-section board)\n{}", s1);
-
-        // Second →: cycles to 7d.  This is the regression case — before the
-        // fix, Done would lose focus after the first press and this would fail.
-        driver.press(quadraui::Key::Named(quadraui::NamedKey::Right));
-        let s2 = driver.screen();
-        assert!(s2.contains("last 7d"), "D7 after second → (multi-section board)\n{}", s2);
-
-        // Third →: all.
-        driver.press(quadraui::Key::Named(quadraui::NamedKey::Right));
-        let s3 = driver.screen();
-        assert!(
-            s3.contains("all") || s3.contains("All"),
-            "All after third → (multi-section board)\n{}",
-            s3
-        );
-
-        // Fourth →: wraps back to 2h.
-        driver.press(quadraui::Key::Named(quadraui::NamedKey::Right));
-        let s4 = driver.screen();
-        assert!(
-            s4.contains("last 2h"),
-            "wraps back to last 2h after fourth → (multi-section board)\n{}",
-            s4
-        );
-    }
 
     // ── #789: off-screen repaint suppression ─────────────────────────────────
     //
@@ -29519,48 +28972,6 @@
 
     // ── #815: Default-collapsed Done section ──────────────────────────────────
 
-    /// #815: when the Done section appears for the first time (no prior
-    /// collapse state), `rebuild_pipeline_sidebar` must default it to collapsed
-    /// so active work sections are immediately visible without scrolling.
-    #[test]
-    fn done_section_default_collapsed_on_first_render() {
-        // Build an app with one done issue so the Done section exists.
-        let a = make_assignment_typed("done", 10, "myrepo", Some("work"));
-        let mut app = make_test_app(BoardData {
-            assignments: vec![a],
-            ..BoardData::default()
-        });
-        app.pipeline_issues = vec![PipelineIssue {
-            number: 10,
-            title: "Done issue".to_string(),
-            body: String::new(),
-            repo_slug: "acme/myrepo".to_string(),
-            coord_repo: Some("myrepo".to_string()),
-            matched_labels: vec!["coord".to_string()],
-            all_labels: vec!["coord".to_string(), "status:done".to_string()],
-            is_closed: true, // closed = Done section
-        }];
-        // Use DoneWindow::All so the Done section appears even without finished_at.
-        app.done_window = DoneWindow::All;
-        // First rebuild — no prior collapse state; Done should default to collapsed.
-        app.rebuild_pipeline_sidebar(None);
-
-        // The "done" key must be present in the state section names.
-        let done_idx = app
-            .pipeline_state_section_names
-            .iter()
-            .position(|&k| k == "done");
-        assert!(
-            done_idx.is_some(),
-            "done section must exist when there are closed issues"
-        );
-        let search_offset = 1usize;
-        let section_idx = done_idx.unwrap() + search_offset;
-        assert!(
-            app.pipeline_sidebar.is_collapsed(section_idx),
-            "#815: Done section must be collapsed by default on first render"
-        );
-    }
 
     // ── #815: In-progress on top ──────────────────────────────────────────────
 
@@ -29641,77 +29052,6 @@
 
     // ── #815: Jump Board→Pipeline — Done-expand and toast paths ──────────────
 
-    /// #815: Jumping to a closed/Done issue must expand the Done section so
-    /// the selected row is immediately visible — `rebuild_pipeline_sidebar`
-    /// leaves Done collapsed by default, so without an explicit expand the
-    /// user would see no change.
-    #[test]
-    fn jump_to_pipeline_expands_done_for_closed_issue() {
-        let a = make_assignment_typed("done", 55, "myrepo", Some("work"));
-        let mut app = make_test_app(BoardData {
-            assignments: vec![a],
-            open_issues: vec![OpenIssue {
-                repo_name: "myrepo".to_string(),
-                number: 55,
-                title: "Closed issue".to_string(),
-                body: String::new(),
-                labels: vec!["coord".to_string()],
-                state: "closed".to_string(),
-                milestone_number: None,
-                milestone_title: None,
-            }],
-            pipeline_repos: vec![("myrepo".to_string(), "acme/myrepo".to_string())],
-            ..BoardData::default()
-        });
-        app.pipeline_issues = vec![PipelineIssue {
-            number: 55,
-            title: "Closed issue".to_string(),
-            body: String::new(),
-            repo_slug: "acme/myrepo".to_string(),
-            coord_repo: Some("myrepo".to_string()),
-            matched_labels: vec!["coord".to_string()],
-            all_labels: vec!["coord".to_string()],
-            is_closed: true,
-        }];
-        app.done_window = DoneWindow::All;
-        app.rebuild_board_sidebar();
-        app.rebuild_pipeline_sidebar(None);
-        app.active_view = SidebarView::Board;
-        app.select_issue("myrepo", 55);
-
-        // Verify Done section exists and is collapsed before the jump.
-        let search_offset = 1usize;
-        let done_idx_before = app
-            .pipeline_state_section_names
-            .iter()
-            .position(|&k| k == "done")
-            .expect("done section must exist after rebuild");
-        assert!(
-            app.pipeline_sidebar.is_collapsed(done_idx_before + search_offset),
-            "#815: Done section must be collapsed by default before jump"
-        );
-
-        // Perform the jump.
-        app.jump_board_to_pipeline();
-
-        // Must have switched to Pipeline view.
-        assert_eq!(
-            app.active_view,
-            SidebarView::Pipeline,
-            "#815: jump_board_to_pipeline must switch to Pipeline view"
-        );
-
-        // Done section must now be expanded so the selection is visible.
-        let done_idx_after = app
-            .pipeline_state_section_names
-            .iter()
-            .position(|&k| k == "done")
-            .expect("done section must still exist after jump");
-        assert!(
-            !app.pipeline_sidebar.is_collapsed(done_idx_after + search_offset),
-            "#815: Done section must be expanded after jumping to a closed/Done issue"
-        );
-    }
 
     // ── #869: Jump Board→Pipeline — collapsed milestone group ─────────────────
 
@@ -29986,7 +29326,7 @@
     /// label and no assignments, but a STALE `merge_queue` "merged" row
     /// (e.g. closed then reopened, no fresh work dispatched yet).  This
     /// resolves to the Pipeline's "done" lifecycle bucket, but the Done
-    /// section is time-windowed (`pipeline_done_windowed`, default 2h) and
+    /// section was time-windowed (removed in #2405) and
     /// drops anything older, so the issue renders in NO Pipeline section at
     /// all even though it's still a `pipeline_issues` member.
     ///
@@ -30077,9 +29417,11 @@
             "#1598: 'View in Pipeline' must still appear in the menu:\n{menu_screen}"
         );
         assert!(
-            menu_screen.contains("outside Done window"),
-            "#1598: the disabled item must show a visible reason instead of \
-             a silent disabled==true with no explanation:\n{menu_screen}"
+            menu_screen.contains("see Completed tab"),
+            "#1598 + #2405: the disabled item must show a visible reason \
+             instead of a silent disabled==true with no explanation — and \
+             since the Done section is gone, that reason now points at the \
+             Completed grid:\n{menu_screen}"
         );
         driver.press_named(quadraui::NamedKey::Escape); // dismiss the menu
 
@@ -33829,7 +33171,7 @@ Milestone tracking issue.
     /// #1253: an epic whose children are ALL done defaults to COLLAPSED —
     /// #1197 shipped an always-expanded default, so a long-finished epic
     /// just accumulated an ever-growing wall of closed children with no
-    /// windowing (unlike the flat "Done" section's `pipeline_done_windowed`).
+    /// windowing (unlike #2405's Completed grid, which has an explicit one).
     /// A stored choice still wins over this default, same as the
     /// not-all-done case above.
     #[test]
@@ -40691,524 +40033,10 @@ Milestone tracking issue.
 
     // ── #1300: Done section badge count vs. rendered rows ────────────────────
 
-    /// Build a fixture where epic #200 is still open (in In-progress) and its
-    /// children #201 + #202 are closed (Done), plus two standalone closed
-    /// issues #203 and #204. This is the exact shape of the #448/#934 live bug:
-    /// children whose epic is in another section.
-    ///
-    /// `done_window` is set to `All` so the time filter doesn't interfere.
-    fn make_1300_open_epic_done_children_app() -> CoordApp {
-        let data = BoardData {
-            open_issues: vec![
-                OpenIssue {
-                    repo_name: "api".to_string(),
-                    number: 200,
-                    title: "Open epic".to_string(),
-                    body: String::new(),
-                    state: "open".to_string(),
-                    labels: vec!["coord".to_string(), "epic".to_string()],
-                    milestone_number: None,
-                    milestone_title: None,
-                },
-                // Children: closed so the DAG sees them as Done and the
-                // epic's lifecycle section is "in-progress".
-                OpenIssue {
-                    repo_name: "api".to_string(),
-                    number: 201,
-                    title: "Done child A".to_string(),
-                    body: String::new(),
-                    state: "closed".to_string(),
-                    labels: vec!["coord".to_string()],
-                    milestone_number: None,
-                    milestone_title: None,
-                },
-                OpenIssue {
-                    repo_name: "api".to_string(),
-                    number: 202,
-                    title: "Done child B".to_string(),
-                    body: String::new(),
-                    state: "closed".to_string(),
-                    labels: vec!["coord".to_string()],
-                    milestone_number: None,
-                    milestone_title: None,
-                },
-                // Standalone (no epic) closed issues.
-                OpenIssue {
-                    repo_name: "api".to_string(),
-                    number: 203,
-                    title: "Done standalone C".to_string(),
-                    body: String::new(),
-                    state: "closed".to_string(),
-                    labels: vec!["coord".to_string()],
-                    milestone_number: None,
-                    milestone_title: None,
-                },
-                OpenIssue {
-                    repo_name: "api".to_string(),
-                    number: 204,
-                    title: "Done standalone D".to_string(),
-                    body: String::new(),
-                    state: "closed".to_string(),
-                    labels: vec!["coord".to_string()],
-                    milestone_number: None,
-                    milestone_title: None,
-                },
-            ],
-            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
-            epic_children: vec![EpicChildren {
-                repo_name: "api".to_string(),
-                tracking_issue: 200,
-                children: vec![
-                    EpicChild { number: 201, state: "closed".to_string() },
-                    EpicChild { number: 202, state: "closed".to_string() },
-                ],
-            }],
-            ..BoardData::default()
-        };
-        let mut app = make_test_app(data);
-        app.pipeline_issues = vec![
-            // Epic #200 (open) — renders in In-progress.
-            PipelineIssue {
-                number: 200,
-                title: "Open epic".to_string(),
-                body: String::new(),
-                repo_slug: "acme/api".to_string(),
-                coord_repo: Some("api".to_string()),
-                matched_labels: vec!["coord".to_string()],
-                all_labels: vec!["coord".to_string(), "epic".to_string()],
-                is_closed: false,
-            },
-            // Children #201, #202 — closed → Done.
-            PipelineIssue {
-                number: 201,
-                title: "Done child A".to_string(),
-                body: String::new(),
-                repo_slug: "acme/api".to_string(),
-                coord_repo: Some("api".to_string()),
-                matched_labels: vec!["coord".to_string()],
-                all_labels: vec!["coord".to_string()],
-                is_closed: true,
-            },
-            PipelineIssue {
-                number: 202,
-                title: "Done child B".to_string(),
-                body: String::new(),
-                repo_slug: "acme/api".to_string(),
-                coord_repo: Some("api".to_string()),
-                matched_labels: vec!["coord".to_string()],
-                all_labels: vec!["coord".to_string()],
-                is_closed: true,
-            },
-            // Standalone closed issues — no epic.
-            PipelineIssue {
-                number: 203,
-                title: "Done standalone C".to_string(),
-                body: String::new(),
-                repo_slug: "acme/api".to_string(),
-                coord_repo: Some("api".to_string()),
-                matched_labels: vec!["coord".to_string()],
-                all_labels: vec!["coord".to_string()],
-                is_closed: true,
-            },
-            PipelineIssue {
-                number: 204,
-                title: "Done standalone D".to_string(),
-                body: String::new(),
-                repo_slug: "acme/api".to_string(),
-                coord_repo: Some("api".to_string()),
-                matched_labels: vec!["coord".to_string()],
-                all_labels: vec!["coord".to_string()],
-                is_closed: true,
-            },
-        ];
-        app.done_window = DoneWindow::All;
-        app.active_view = SidebarView::Pipeline;
-        app.rebuild_pipeline_sidebar(None);
-        // #815: Done defaults to collapsed; expand it so TuiDriver tests
-        // can assert on rendered rows without clicking the header first.
-        if let Some(pos) = app.pipeline_state_section_names.iter().position(|&k| k == "done") {
-            app.pipeline_sidebar.set_collapsed(pos + 1, false); // +1 for FILTER section
-        }
-        app
-    }
 
-    /// #1300 case 1: an epic child whose epic is in In-progress (not Done)
-    /// must render as a flat row in the Done section — the pre-fix global
-    /// nesting suppressed it.
-    ///
-    /// Also asserts the count-equals-rows invariant: every issue tracked in
-    /// `done_windowed` renders on screen (either flat or nested under an epic
-    /// that is also in Done — in this fixture all are flat).
-    #[test]
-    fn tuidriver_pipeline_1300_done_child_of_open_epic_renders_flat() {
-        use quadraui::tui::testing::driver_with_shell;
 
-        let app = make_1300_open_epic_done_children_app();
 
-        // Confirm the Done section counts all 4 closed issues.
-        let done_windowed = app.pipeline_done_windowed();
-        assert_eq!(
-            done_windowed.len(),
-            4,
-            "#1300: done_windowed must include all 4 closed issues (the badge count)\n\
-             windowed: {:?}",
-            done_windowed
-                .iter()
-                .map(|&i| app.pipeline_issues[i].number)
-                .collect::<Vec<_>>(),
-        );
 
-        let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 50);
-        let screen = driver.screen();
-
-        // All 4 Done items must be visible as rows — including #201 and #202
-        // whose epic #200 is open (in In-progress, not in Done). Before the
-        // #1300 fix, #201 and #202 were globally-nested and suppressed.
-        assert!(
-            driver.screen_contains("#201"),
-            "#1300: done child #201 (epic in another section) must render flat in Done:\n{screen}",
-        );
-        assert!(
-            driver.screen_contains("#202"),
-            "#1300: done child #202 (epic in another section) must render flat in Done:\n{screen}",
-        );
-        assert!(
-            driver.screen_contains("#203"),
-            "#1300: standalone done issue #203 must render in Done:\n{screen}",
-        );
-        assert!(
-            driver.screen_contains("#204"),
-            "#1300: standalone done issue #204 must render in Done:\n{screen}",
-        );
-
-        // Badge must say "(4)" — done_windowed.len() == rendered rows when
-        // no epics are in the Done window.
-        assert!(
-            driver.screen_contains("(4)"),
-            "#1300: Done section badge must read (4) — one per rendered row:\n{screen}",
-        );
-    }
-
-    /// #1300 case 2: when an epic is itself inside the Done window (both epic
-    /// and child are closed), the child stays nested under the epic row and
-    /// does NOT appear as a flat sibling — preserving #1197/#1253's
-    /// no-duplicate invariant within the Done window itself.
-    ///
-    /// The epic defaults to collapsed (all children done → #1253 rule), so
-    /// the child row is not visible. The badge counts both items.
-    #[test]
-    fn tuidriver_pipeline_1300_done_child_with_done_epic_stays_nested() {
-        use quadraui::tui::testing::driver_with_shell;
-
-        let data = BoardData {
-            open_issues: vec![
-                OpenIssue {
-                    repo_name: "api".to_string(),
-                    number: 300,
-                    title: "Closed epic".to_string(),
-                    body: String::new(),
-                    // Epic is also closed — both epic and child are in Done.
-                    state: "closed".to_string(),
-                    labels: vec!["coord".to_string(), "epic".to_string()],
-                    milestone_number: None,
-                    milestone_title: None,
-                },
-                OpenIssue {
-                    repo_name: "api".to_string(),
-                    number: 301,
-                    title: "Closed child".to_string(),
-                    body: String::new(),
-                    state: "closed".to_string(),
-                    labels: vec!["coord".to_string()],
-                    milestone_number: None,
-                    milestone_title: None,
-                },
-                // A standalone closed issue so the Done section isn't just
-                // the epic+child (makes the fixture more realistic).
-                OpenIssue {
-                    repo_name: "api".to_string(),
-                    number: 302,
-                    title: "Standalone done".to_string(),
-                    body: String::new(),
-                    state: "closed".to_string(),
-                    labels: vec!["coord".to_string()],
-                    milestone_number: None,
-                    milestone_title: None,
-                },
-            ],
-            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
-            epic_children: vec![EpicChildren {
-                repo_name: "api".to_string(),
-                tracking_issue: 300,
-                children: vec![EpicChild { number: 301, state: "closed".to_string() }],
-            }],
-            ..BoardData::default()
-        };
-        let mut app = make_test_app(data);
-        app.pipeline_issues = vec![
-            PipelineIssue {
-                number: 300,
-                title: "Closed epic".to_string(),
-                body: String::new(),
-                repo_slug: "acme/api".to_string(),
-                coord_repo: Some("api".to_string()),
-                matched_labels: vec!["coord".to_string()],
-                all_labels: vec!["coord".to_string(), "epic".to_string()],
-                is_closed: true,
-            },
-            PipelineIssue {
-                number: 301,
-                title: "Closed child".to_string(),
-                body: String::new(),
-                repo_slug: "acme/api".to_string(),
-                coord_repo: Some("api".to_string()),
-                matched_labels: vec!["coord".to_string()],
-                all_labels: vec!["coord".to_string()],
-                is_closed: true,
-            },
-            PipelineIssue {
-                number: 302,
-                title: "Standalone done".to_string(),
-                body: String::new(),
-                repo_slug: "acme/api".to_string(),
-                coord_repo: Some("api".to_string()),
-                matched_labels: vec!["coord".to_string()],
-                all_labels: vec!["coord".to_string()],
-                is_closed: true,
-            },
-        ];
-        app.done_window = DoneWindow::All;
-        app.active_view = SidebarView::Pipeline;
-        app.rebuild_pipeline_sidebar(None);
-        // Expand the Done section (collapses by default per #815).
-        if let Some(pos) = app.pipeline_state_section_names.iter().position(|&k| k == "done") {
-            app.pipeline_sidebar.set_collapsed(pos + 1, false); // +1 for FILTER section
-        }
-
-        // done_windowed = [300, 301, 302] — badge says "(3)".
-        let done_windowed = app.pipeline_done_windowed();
-        assert_eq!(
-            done_windowed.len(),
-            3,
-            "#1300 case 2: done_windowed must include epic + child + standalone",
-        );
-
-        let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 50);
-        let screen = driver.screen();
-
-        // Epic #300 must render as a row (it's in Done).
-        assert!(
-            driver.screen_contains("#300"),
-            "#1300 case 2: epic #300 must render in Done:\n{screen}",
-        );
-
-        // #301 must NOT appear as a flat sibling of #300 — it is nested under
-        // the epic. The epic defaults to collapsed (all children done), so
-        // #301 isn't visible at all in the initial render.
-        assert!(
-            !driver.screen_contains("#301"),
-            "#1300 case 2: child #301 must not appear as a flat row \
-             (nested under epic #300, collapsed by default):\n{screen}",
-        );
-
-        // Standalone #302 renders flat.
-        assert!(
-            driver.screen_contains("#302"),
-            "#1300 case 2: standalone #302 must render flat in Done:\n{screen}",
-        );
-
-        // Badge "(3)" — the count tracks all items logically in Done,
-        // even those nested under (or hidden inside) a collapsed epic.
-        assert!(
-            driver.screen_contains("(3)"),
-            "#1300 case 2: Done badge must say (3):\n{screen}",
-        );
-    }
-
-    /// #1300 invariant: Done section badge count = items in `done_windowed`
-    /// regardless of nesting. Asserts the mixed scenario (open epic in
-    /// another section + standalone done items) all render and the count
-    /// shown in the header matches what `pipeline_done_windowed` returns.
-    #[test]
-    fn pipeline_1300_done_badge_count_equals_done_windowed_len() {
-        // Reuse the open-epic fixture from case 1.
-        let app = make_1300_open_epic_done_children_app();
-
-        let done_windowed = app.pipeline_done_windowed();
-        let expected = done_windowed.len();
-
-        // Sanity: the fixture has 4 closed issues.
-        assert_eq!(
-            expected,
-            4,
-            "#1300 invariant: fixture must have 4 done issues",
-        );
-
-        // The Done section badge is set to `format!("({})", done_windowed.len())`.
-        // Find the Done section index and check the stored badge text.
-        let done_section_idx = app
-            .pipeline_state_section_names
-            .iter()
-            .position(|&k| k == "done")
-            .map(|i| i + 1) // +1 for the search section at index 0
-            .expect("#1300 invariant: Done section must be present");
-        let badge = app
-            .pipeline_sidebar
-            .section_badge(done_section_idx)
-            .expect("#1300 invariant: Done section must have a badge");
-        let badge_text: String = badge.spans.iter().map(|s| s.text.as_str()).collect();
-        assert_eq!(
-            badge_text,
-            format!("({})", expected),
-            "#1300 invariant: badge text must equal done_windowed.len()\n\
-             badge_text={badge_text:?}  expected=\"({expected})\"",
-        );
-    }
-
-    /// #1300 review follow-up: cross-repo issue-number collision must not
-    /// suppress an unrelated standalone issue.
-    ///
-    /// Repo "api" has a closed epic #300 with closed child #301 (both in
-    /// Done — child correctly nests under the epic, same shape as case 2).
-    /// Repo "web" independently has an unrelated standalone closed issue
-    /// also numbered #301. GitHub issue numbers are only unique within a
-    /// repo, so this is a legitimate same-numbered coexistence in one
-    /// multi-repo Done window (mirrors `pipeline_globally_nested_children`'s
-    /// existing collision-avoidance rationale).
-    ///
-    /// Before the fix, `EpicNesting::nested` was a bare `HashSet<u64>`, so
-    /// "api"'s child #301 registering `301` in the set would *also* match
-    /// "web"'s unrelated standalone #301 and incorrectly suppress it from
-    /// Done — reintroducing the #1300 symptom via a different path. With the
-    /// fix, `nested` is keyed `(repo, number)`, so only "api"'s #301 is
-    /// suppressed (nested, collapsed by default) and "web"'s #301 renders
-    /// flat.
-    #[test]
-    fn tuidriver_pipeline_1300_cross_repo_issue_number_collision_not_suppressed() {
-        use quadraui::tui::testing::driver_with_shell;
-
-        let data = BoardData {
-            open_issues: vec![
-                OpenIssue {
-                    repo_name: "api".to_string(),
-                    number: 300,
-                    title: "Closed epic".to_string(),
-                    body: String::new(),
-                    state: "closed".to_string(),
-                    labels: vec!["coord".to_string(), "epic".to_string()],
-                    milestone_number: None,
-                    milestone_title: None,
-                },
-                OpenIssue {
-                    repo_name: "api".to_string(),
-                    number: 301,
-                    title: "Closed child".to_string(),
-                    body: String::new(),
-                    state: "closed".to_string(),
-                    labels: vec!["coord".to_string()],
-                    milestone_number: None,
-                    milestone_title: None,
-                },
-                // Unrelated repo, unrelated issue — happens to share the
-                // number 301 with "api"'s epic child above.
-                OpenIssue {
-                    repo_name: "web".to_string(),
-                    number: 301,
-                    title: "Unrelated web issue".to_string(),
-                    body: String::new(),
-                    state: "closed".to_string(),
-                    labels: vec!["coord".to_string()],
-                    milestone_number: None,
-                    milestone_title: None,
-                },
-            ],
-            pipeline_repos: vec![
-                ("api".to_string(), "acme/api".to_string()),
-                ("web".to_string(), "acme/web".to_string()),
-            ],
-            epic_children: vec![EpicChildren {
-                repo_name: "api".to_string(),
-                tracking_issue: 300,
-                children: vec![EpicChild { number: 301, state: "closed".to_string() }],
-            }],
-            ..BoardData::default()
-        };
-        let mut app = make_test_app(data);
-        app.pipeline_issues = vec![
-            PipelineIssue {
-                number: 300,
-                title: "Closed epic".to_string(),
-                body: String::new(),
-                repo_slug: "acme/api".to_string(),
-                coord_repo: Some("api".to_string()),
-                matched_labels: vec!["coord".to_string()],
-                all_labels: vec!["coord".to_string(), "epic".to_string()],
-                is_closed: true,
-            },
-            PipelineIssue {
-                number: 301,
-                title: "Closed child".to_string(),
-                body: String::new(),
-                repo_slug: "acme/api".to_string(),
-                coord_repo: Some("api".to_string()),
-                matched_labels: vec!["coord".to_string()],
-                all_labels: vec!["coord".to_string()],
-                is_closed: true,
-            },
-            PipelineIssue {
-                number: 301,
-                title: "Unrelated web issue".to_string(),
-                body: String::new(),
-                repo_slug: "acme/web".to_string(),
-                coord_repo: Some("web".to_string()),
-                matched_labels: vec!["coord".to_string()],
-                all_labels: vec!["coord".to_string()],
-                is_closed: true,
-            },
-        ];
-        app.done_window = DoneWindow::All;
-        app.active_view = SidebarView::Pipeline;
-        app.rebuild_pipeline_sidebar(None);
-        // Expand the Done section (collapses by default per #815).
-        if let Some(pos) = app.pipeline_state_section_names.iter().position(|&k| k == "done") {
-            app.pipeline_sidebar.set_collapsed(pos + 1, false); // +1 for FILTER section
-        }
-
-        let done_windowed = app.pipeline_done_windowed();
-        assert_eq!(
-            done_windowed.len(),
-            3,
-            "#1300 collision: done_windowed must include epic + child + unrelated web issue",
-        );
-
-        let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 50);
-        let screen = driver.screen();
-
-        // Epic #300 renders.
-        assert!(
-            driver.screen_contains("#300"),
-            "#1300 collision: epic #300 must render in Done:\n{screen}",
-        );
-
-        // "#301" must appear exactly once — "web"'s unrelated standalone
-        // issue rendering flat. "api"'s child #301 stays correctly nested
-        // (and collapsed, per the all-children-done default) under epic
-        // #300. Before the fix, the bare-number `nested` set would
-        // incorrectly suppress "web"'s #301 too, so "#301" would not appear
-        // on screen at all.
-        assert_eq!(
-            screen.matches("#301").count(),
-            1,
-            "#1300 collision: \"web\"'s unrelated #301 must render flat in Done \
-             exactly once (not suppressed by \"api\"'s same-numbered nested child):\n{screen}",
-        );
-
-        // Badge counts all 3 logical Done members.
-        assert!(
-            driver.screen_contains("(3)"),
-            "#1300 collision: Done badge must say (3):\n{screen}",
-        );
-    }
 
     // ── #1326: Project/Workspace model (A-1) ──────────────────────────────────
 

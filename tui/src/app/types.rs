@@ -59,6 +59,86 @@ pub(crate) enum PipelineDetailTab {
     /// issue gets its own `TerminalSession`; only the selected issue's
     /// terminal is visible while others keep running in the background.
     Terminal,
+    /// #2405: the completed-issues grid — a report-style table of everything
+    /// that finished inside an adjustable time range, replacing the old
+    /// fixed-window "Done" sidebar section.  Unlike every other tab this one
+    /// is **not** about the selected issue: it has its own controls
+    /// (time range / window end / repo) and its own row selection, and a row
+    /// click opens that row's Overview content *without* the
+    /// Work/Test/Review/Merge stage strip (see `CompletedGrid::detail`).
+    Completed,
+}
+
+/// #2405: state behind the Pipeline panel's completed-issues grid.
+///
+/// Deliberately mirrors the Reports panel's `issue-activity` controls
+/// (`coord/reports.py`'s `ISSUE_ACTIVITY`): the same `since` presets with
+/// free-form durations accepted, the same "empty `until` means now", and the
+/// same "empty repo means all repos".  It is *not* routed through `/report`,
+/// though — see the `#2405` note on `CoordApp::completed_rows` for why the
+/// catalogue route was investigated and rejected.
+///
+/// Session-only, like the Reports panel's own sort and column widths: nothing
+/// is written to settings.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CompletedGrid {
+    /// How far back the window reaches from `until`.  A preset from
+    /// [`CompletedGrid::SINCE_PRESETS`] or any free-form duration
+    /// (`13h`, `90m`, `3d`, …).  Never empty.
+    pub(crate) since: String,
+    /// Window end — epoch seconds or ISO-8601.  Empty means now.
+    pub(crate) until: String,
+    /// Restrict to one repo (matched against the issue's coord-local repo
+    /// name, falling back to its GitHub slug).  Empty means all repos.
+    pub(crate) repo: String,
+    /// Which control has keyboard focus: 0 = time range, 1 = window end,
+    /// 2 = repo.
+    pub(crate) field_sel: usize,
+    /// `(column index, ascending)`.  `None` = the default newest-finished-
+    /// first order.
+    pub(crate) sort: Option<(usize, bool)>,
+    /// First visible row.
+    pub(crate) scroll: usize,
+    /// When `Some((repo_slug, issue_number))`, the grid is replaced by that
+    /// row's detail view.  Held by identity rather than by row index so a
+    /// background refresh (which re-derives the whole row set) can't silently
+    /// swap which issue is on screen.
+    pub(crate) detail: Option<(String, u64)>,
+}
+
+impl Default for CompletedGrid {
+    fn default() -> Self {
+        Self {
+            since: "24h".to_string(),
+            until: String::new(),
+            repo: String::new(),
+            field_sel: 0,
+            sort: None,
+            scroll: 0,
+            detail: None,
+        }
+    }
+}
+
+/// #2405: one row of the completed-issues grid, already resolved against
+/// `pipeline_issues`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CompletedRow {
+    /// Index into `CoordApp::pipeline_issues`.
+    pub(crate) idx: usize,
+    /// `(repo_slug, issue_number)` — the stable identity used by
+    /// [`CompletedGrid::detail`].
+    pub(crate) id: (String, u64),
+    /// Short issue ref, e.g. `C#2345` — [`CoordApp::repo_tag`] of the issue's
+    /// repo plus `#<number>`.
+    pub(crate) issue_ref: String,
+    /// Issue title.
+    pub(crate) title: String,
+    /// Earliest `dispatched_at` across this issue's assignments, or `None`
+    /// when nothing was ever dispatched for it.
+    pub(crate) started_at: Option<f64>,
+    /// When it left the pipeline — `CoordApp::issue_done_at`.
+    pub(crate) finished_at: Option<f64>,
 }
 
 /// The tabs shown in the Board view detail panel.
