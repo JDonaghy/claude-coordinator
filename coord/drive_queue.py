@@ -1859,7 +1859,7 @@ def _is_merge_gate_block_reason(reason: str | None) -> bool:
         return True
     if "smoke_required —" in lowered or "review_required —" in lowered:
         return True
-    return lowered.startswith("merge_status=")
+    return "merge_status=" in lowered
 
 
 def _is_empty_branch_death_reason(reason: str | None) -> bool:
@@ -1910,6 +1910,7 @@ def _retry_backoff_reason(
     now: float | None,
     attempts: int,
     retry_backoff_at: float | None,
+    own_reason: str | None = None,
 ) -> str:
     """#2273's launch-side guard: ``''`` unless *entry* is still inside its
     post-death backoff window.
@@ -1950,6 +1951,23 @@ def _retry_backoff_reason(
     ``retry_backoff_at is None`` (a pure-logic caller with no clock, or a row
     predating this column — both degrade to the pre-#2273 behaviour exactly,
     the same posture every other clock-gated check in this module takes).
+
+    *own_reason* (#2424 follow-up): the same text the launch-side dispatch
+    note is gated on (see the comment above `dispatch_only` in
+    `_reconcile_running`'s retry/exhausted branches). Passed through so the
+    widened `DISPATCH_FAILURE_MIN_BACKOFF_SECONDS` spacing below answers the
+    identical "was this actually a dispatch failure" question the launch-side
+    note already answers, rather than recomputing it from
+    `_dispatch_produced_nothing` alone — which, like the note before #2424,
+    cannot tell a genuine pre-`coord assign` crash from a merge-only relaunch
+    that dispatches no new assignment by design. Once `own_reason` already
+    names a merge-gate block (`_is_merge_gate_block_reason`), the 300s floor
+    would be pure mispacing: the rationale for widening it ("a transient
+    dispatch failure cannot spend the whole retry budget inside one tick
+    cadence") does not apply once the cause is known to be a merge-gate
+    block, not a dispatch failure. ``None`` (the default) degrades to the
+    pre-#2424-follow-up behaviour exactly, for callers that have not been
+    updated to pass it.
     """
     if now is None or attempts <= 0 or retry_backoff_at is None:
         return ""
@@ -1958,7 +1976,9 @@ def _retry_backoff_reason(
         return ""
     idx = min(attempts - 1, len(RETRY_BACKOFF_SECONDS) - 1)
     backoff = RETRY_BACKOFF_SECONDS[idx]
-    if _dispatch_produced_nothing(entry, facts):
+    if _dispatch_produced_nothing(entry, facts) and not _is_merge_gate_block_reason(
+        own_reason
+    ):
         backoff = max(backoff, DISPATCH_FAILURE_MIN_BACKOFF_SECONDS)
     if age >= backoff:
         return ""
@@ -3670,17 +3690,24 @@ def plan_tick(
         `effective_last_reason`) so both call sites below — the report-only
         dry-run pass and the persisted `last_reason` write — get the combined
         text for free, with no change needed at either site.
+
+        #2424 follow-up: that same `effective_last_reason` resolution is also
+        what `_retry_backoff_reason` needs to answer its own "was this
+        actually a dispatch failure" question — see its `own_reason`
+        parameter's docstring — so it is resolved once, here, and passed to
+        both.
         """
+        previous = effective_last_reason.get(candidate.key, candidate.last_reason)
         backoff = _retry_backoff_reason(
             candidate,
             board.facts(candidate.key),
             now,
             effective_attempts.get(candidate.key, candidate.attempts),
             retry_backoff_at_map.get(candidate.key, candidate.retry_backoff_at),
+            own_reason=previous,
         )
         if not backoff:
             return ""
-        previous = effective_last_reason.get(candidate.key, candidate.last_reason)
         return _augment_backoff_reason(previous, backoff)
 
     # #1972's projection of per-repo occupancy AS THE WALK SEES IT: the board
