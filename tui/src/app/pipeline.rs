@@ -533,8 +533,8 @@ pub(crate) fn globs_overlap(allowed: &str, route: &str) -> bool {
 /// case, but a *tracked* issue can still render nowhere: dismissed, filtered
 /// out by an active Pipeline search, or — the case that motivated this fix —
 /// classified "done" via a stale `merge_queue` row (e.g. closed then
-/// reopened, no fresh assignment yet) and older than the Done section's
-/// current time window). The menu predicate and the jump handler both call
+/// reopened, no fresh assignment yet), which #2405 removed from the sidebar
+/// altogether). The menu predicate and the jump handler both call
 /// `pipeline_jump_target` so they can't drift on the answer again.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum PipelineNotVisible {
@@ -544,11 +544,10 @@ pub(crate) enum PipelineNotVisible {
     Dismissed,
     /// A member, but hidden by the currently-typed Pipeline search filter.
     SearchFiltered,
-    /// A member classified into the "done" bucket (e.g. a stale
-    /// `merge_queue` row) but older than the Done section's current time
-    /// window (`self.done_window`), so it's dropped from every rendered
-    /// section.
-    OutsideDoneWindow,
+    /// #2405: a member classified into the "done" bucket. The Pipeline
+    /// sidebar no longer has a Done section at all — completed issues live
+    /// in the `Completed` tab's grid — so there is no sidebar row to jump to.
+    Completed,
 }
 
 impl PipelineNotVisible {
@@ -559,7 +558,7 @@ impl PipelineNotVisible {
             Self::Untracked => "no coord label",
             Self::Dismissed => "dismissed",
             Self::SearchFiltered => "search-filtered",
-            Self::OutsideDoneWindow => "outside Done window",
+            Self::Completed => "see Completed tab",
         }
     }
 
@@ -575,8 +574,8 @@ impl PipelineNotVisible {
             Self::SearchFiltered => {
                 format!("#{issue_number} is hidden by the active Pipeline search filter.")
             }
-            Self::OutsideDoneWindow => format!(
-                "#{issue_number} is Done, but older than the Pipeline's current Done time window."
+            Self::Completed => format!(
+                "#{issue_number} is completed — open the Pipeline's Completed tab to find it."
             ),
         }
     }
@@ -837,9 +836,9 @@ impl CoordApp {
     /// Pipeline" enablement check (`context_menu_items_for_board_row`) and
     /// `jump_board_to_pipeline`, so they can't independently drift on the
     /// answer again. Delegates the actual gating to the exact functions the
-    /// sidebar rebuild uses (`pipeline_active_issues`, `pipeline_repos_for_state`,
-    /// `pipeline_done_windowed`) rather than re-deriving their exclusion
-    /// rules, so a future change to any of those stays in sync here for free.
+    /// sidebar rebuild uses (`pipeline_active_issues`,
+    /// `pipeline_repos_for_state`) rather than re-deriving their exclusion
+    /// rules, so a future change to either stays in sync here for free.
     /// See [`PipelineNotVisible`] for what "not visible" can mean.
     pub(crate) fn pipeline_jump_target(
         &self,
@@ -868,9 +867,15 @@ impl CoordApp {
         if !self.pipeline_search.matches(issue.number, &issue.title) {
             return Err(PipelineNotVisible::SearchFiltered);
         }
-        let visible = match self.pipeline_lifecycle_section(issue) {
+        // #2405: "done" has no sidebar section any more — completed issues
+        // are reachable only through the Completed tab's grid — so it can
+        // never resolve to a sidebar row, whatever its timestamps say.
+        let lc = self.pipeline_lifecycle_section(issue);
+        if lc == "done" {
+            return Err(PipelineNotVisible::Completed);
+        }
+        let visible = match lc {
             "in-progress" => self.pipeline_active_issues().contains(&idx),
-            "done" => self.pipeline_done_windowed().contains(&idx),
             lc => self
                 .pipeline_repos_for_state(lc)
                 .iter()
@@ -879,13 +884,7 @@ impl CoordApp {
         if visible {
             Ok(idx)
         } else {
-            // The only exclusion beyond dismissal/search that any bucket
-            // applies today is the Done section's time window (#1598: an
-            // issue closed-then-reopened with no fresh assignment resolves
-            // to "done" via a stale `merge_queue` row, but is older than
-            // `self.done_window` and so is dropped from every rendered
-            // section even though it's still a `pipeline_issues` member).
-            Err(PipelineNotVisible::OutsideDoneWindow)
+            Err(PipelineNotVisible::Completed)
         }
     }
 
@@ -1164,13 +1163,6 @@ impl CoordApp {
                 let milestones = self.pipeline_milestones_for_issues(issue_idxs);
                 let (_, _, mil) = milestones.get(path[1] as usize)?;
                 (3usize, mil.get(path[2] as usize).copied()?, true)
-            }
-            "done" => {
-                if path.len() < 2 {
-                    return None;
-                }
-                let done_windowed = self.pipeline_done_windowed();
-                (2usize, done_windowed.get(path[1] as usize).copied()?, false)
             }
             "refining" | "pending" => {
                 if path.len() < 2 {
@@ -1519,8 +1511,9 @@ impl CoordApp {
     /// GitHub with no coord-driven merge at all.
     ///
     /// Returns `None` when neither source has a timestamp (e.g. rows predate
-    /// the relevant column). Such issues are excluded from the windowed view
-    /// and only appear when `done_window == All`.
+    /// the relevant column). #2405: such issues have no END time, so the
+    /// completed-issues grid — which windows on exactly this value — cannot
+    /// place them in any time range and drops them.
     pub(crate) fn issue_done_at(&self, issue: &PipelineIssue) -> Option<f64> {
         if let Some(merged_at) = self
             .data
@@ -1545,21 +1538,201 @@ impl CoordApp {
             .reduce(f64::max)
     }
 
-    /// Return a flat, deduplicated, time-windowed, newest-first list of
-    /// `pipeline_issues` indices for the **Done** lifecycle section.
+    /// #2405: earliest moment any worker was dispatched for `issue` — the
+    /// grid's START column.
     ///
-    /// - Applies dedup (last-write-wins), search filter, and dismissal filter.
-    /// - Issues inside `self.done_window` are included; older ones are excluded
-    ///   unless `done_window == All`.
-    /// - Issues with `None` done-at are treated as "old" and only appear in `All`.
-    /// - Sorted newest-first; `None` timestamps go last.
-    pub(crate) fn pipeline_done_windowed(&self) -> Vec<usize> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
+    /// The mirror image of [`Self::issue_done_at`]: that one reduces with
+    /// `max` over `finished_at` (when did it *stop*), this one with `min` over
+    /// `dispatched_at` (when did it *first start*). Scoped by coord-local repo
+    /// the same way, so a same-number issue in another repo can't contribute.
+    pub(crate) fn issue_started_at(&self, issue: &PipelineIssue) -> Option<f64> {
+        let local_repo = issue.coord_repo.as_deref();
+        self.data
+            .assignments
+            .iter()
+            .filter(|a| a.issue_number == issue.number)
+            .filter(|a| match local_repo {
+                Some(r) => a.repo == *r,
+                None => true,
+            })
+            .filter_map(|a| a.dispatched_at)
+            .reduce(f64::min)
+    }
 
-        // Dedup: last write wins (same semantics as pipeline_repos_for_state).
+    // ── #2405: the completed-issues grid ─────────────────────────────────
+    //
+    // #728's Done section listed whatever had exited the pipeline inside one
+    // fixed window, with no columns, no sort, and no time range beyond the
+    // `→`-cycled label. This replaces it with the shape the Reports panel
+    // (#1741/#1911/#1762/#1853) already settled on for exactly this problem:
+    // a time range + repo filter over a sortable `DataTable`.
+    //
+    // **Why this is Pipeline-local rather than a `coord/reports.py` entry.**
+    // The catalogue route was investigated first (it is that module's stated
+    // extension point, and `reports.rs`'s header makes "adding report #2
+    // requires zero `tui/**` changes" load-bearing). It cannot carry this
+    // feature: the acceptance requirement is that a **row click opens the
+    // Pipeline's own Overview detail** for that issue, and the Reports panel
+    // has no per-report click behaviour by construction — wiring one in would
+    // mean a `match` on a report id inside `reports.rs`, which is precisely
+    // the property that module exists to protect. So the grid borrows the
+    // *widgets and the control vocabulary* (`SINCE_PRESETS`, free-form
+    // durations, empty-`until`-means-now, empty-repo-means-all — all copied
+    // from `ISSUE_ACTIVITY` in `coord/reports.py`) without the round trip.
+    // A `completed-issues` catalogue entry remains a perfectly good separate
+    // addition for the Reports panel; it just isn't this.
+
+    /// Time-range presets, byte-identical to `coord/reports.py`'s
+    /// `SINCE_PRESETS` so the two controls can't drift apart. Any free-form
+    /// duration (`90m`, `13h`, …) is accepted too — see
+    /// [`Self::parse_duration_secs`].
+    pub(crate) const COMPLETED_SINCE_PRESETS: [&'static str; 5] =
+        ["1h", "6h", "24h", "3d", "7d"];
+
+    /// Column order of the completed grid. The index positions are the sort
+    /// keys `CompletedGrid::sort` stores, so they are part of that state's
+    /// meaning — do not reorder without migrating it.
+    pub(crate) const COMPLETED_COLUMNS: [&'static str; 4] =
+        ["ISSUE", "TITLE", "STARTED", "ENDED"];
+
+    /// `"13h"` → `46800.0`. Units: s, m, h, d, w. `None` when the string is
+    /// not a duration at all. Mirrors `coord/reports.py`'s `parse_duration`.
+    pub(crate) fn parse_duration_secs(raw: &str) -> Option<f64> {
+        let raw = raw.trim();
+        let (digits, unit) = raw.split_at(raw.len().checked_sub(1)?);
+        let n: f64 = digits.parse().ok()?;
+        if n < 0.0 {
+            return None;
+        }
+        let mult = match unit.to_ascii_lowercase().as_str() {
+            "s" => 1.0,
+            "m" => 60.0,
+            "h" => 3600.0,
+            "d" => 86_400.0,
+            "w" => 604_800.0,
+            _ => return None,
+        };
+        Some(n * mult)
+    }
+
+    /// Epoch seconds or an ISO-8601 `YYYY-MM-DD[THH:MM[:SS]][Z]` → epoch
+    /// seconds. Mirrors `coord/reports.py`'s `parse_timestamp` for the shapes
+    /// an operator actually types; anything else is `None`, which the grid
+    /// surfaces as an inline error rather than silently treating as "now".
+    ///
+    /// Hand-rolled rather than pulled from `chrono` because coord-tui has no
+    /// date dependency and this is the only place one would be needed. UTC
+    /// only — the `Z` is optional but never means "local".
+    pub(crate) fn parse_until_epoch(raw: &str) -> Option<f64> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        if let Ok(secs) = raw.parse::<f64>() {
+            return Some(secs);
+        }
+        let s = raw.trim_end_matches('Z').trim_end_matches('z');
+        let (date, time) = match s.split_once(['T', ' ']) {
+            Some((d, t)) => (d, t),
+            None => (s, "00:00:00"),
+        };
+        let mut dparts = date.split('-');
+        let y: i64 = dparts.next()?.parse().ok()?;
+        let mo: i64 = dparts.next()?.parse().ok()?;
+        let d: i64 = dparts.next()?.parse().ok()?;
+        if dparts.next().is_some() || !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+            return None;
+        }
+        let mut tparts = time.split(':');
+        let hh: i64 = tparts.next()?.parse().ok()?;
+        let mm: i64 = tparts.next().unwrap_or("0").parse().ok()?;
+        let ss: f64 = tparts.next().unwrap_or("0").parse().ok()?;
+        if tparts.next().is_some() || hh > 23 || mm > 59 || !(0.0..60.0).contains(&ss) {
+            return None;
+        }
+        // Howard Hinnant's `days_from_civil` — the standard branch-free
+        // civil-date → epoch-day conversion, valid for any proleptic
+        // Gregorian date.
+        let y = if mo <= 2 { y - 1 } else { y };
+        let era = if y >= 0 { y } else { y - 399 } / 400;
+        let yoe = y - era * 400;
+        let doy = (153 * (if mo > 2 { mo - 3 } else { mo + 9 }) + 2) / 5 + d - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        let days = era * 146_097 + doe - 719_468;
+        Some(days as f64 * 86_400.0 + (hh * 3600 + mm * 60) as f64 + ss)
+    }
+
+    /// The grid's resolved `[start, end]` window in epoch seconds, or an
+    /// error string naming the control that failed to parse.
+    ///
+    /// Empty `until` means now (same rule as `ISSUE_ACTIVITY`), so the window
+    /// always ends at a real instant — a row with no END timestamp at all can
+    /// therefore never land in any range, and is dropped.
+    pub(crate) fn completed_window(&self) -> Result<(f64, f64), String> {
+        let end = if self.completed_grid.until.trim().is_empty() {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64()
+        } else {
+            Self::parse_until_epoch(&self.completed_grid.until).ok_or_else(|| {
+                format!(
+                    "Window end {:?} is not epoch seconds or an ISO-8601 timestamp \
+                     (e.g. 2026-08-03T09:16:00Z). Leave it empty for now.",
+                    self.completed_grid.until.trim()
+                )
+            })?
+        };
+        let span = Self::parse_duration_secs(&self.completed_grid.since).ok_or_else(|| {
+            format!(
+                "Time range {:?} is not a duration — use one of {}, or e.g. 13h \
+                 (units: s, m, h, d, w).",
+                self.completed_grid.since.trim(),
+                Self::COMPLETED_SINCE_PRESETS.join(", ")
+            )
+        })?;
+        Ok((end - span, end))
+    }
+
+    /// Options for the repo selector: `""` (all repos) followed by every
+    /// distinct repo that has at least one *completed* issue, in stable
+    /// first-seen order.
+    ///
+    /// Derived from the completed set rather than from every repo on the
+    /// board so the selector can never offer a filter that blanks the grid.
+    /// A repo currently named in `completed_grid.repo` but absent from that
+    /// set is still appended, so a stale selection stays visible (and
+    /// steppable back out of) instead of silently reading as "all repos".
+    pub(crate) fn completed_repo_choices(&self) -> Vec<String> {
+        let mut out: Vec<String> = vec![String::new()];
+        for issue in &self.pipeline_issues {
+            if self.pipeline_lifecycle_section(issue) != "done" {
+                continue;
+            }
+            let key = Self::pipeline_repo_key(issue).to_string();
+            if !out.contains(&key) {
+                out.push(key);
+            }
+        }
+        let sel = self.completed_grid.repo.trim();
+        if !sel.is_empty() && !out.iter().any(|r| r == sel) {
+            out.push(sel.to_string());
+        }
+        out
+    }
+
+    /// Every completed issue inside the current window and repo filter, as
+    /// grid rows in the currently-selected sort order.
+    ///
+    /// Shares the Done section's exclusion rules verbatim — dedup by
+    /// `(repo_slug, number)` last-write-wins, the sidebar search filter, and
+    /// the `D`-key dismissal set — so an issue hidden from the Pipeline stays
+    /// hidden here. Returns the window error (never a partial list) when a
+    /// control doesn't parse.
+    pub(crate) fn completed_rows(&self) -> Result<Vec<CompletedRow>, String> {
+        let (start, end) = self.completed_window()?;
+        let repo_filter = self.completed_grid.repo.trim();
+
         let mut dedup: std::collections::HashMap<(String, u64), usize> =
             std::collections::HashMap::new();
         for (i, issue) in self.pipeline_issues.iter().enumerate() {
@@ -1572,50 +1745,724 @@ impl CoordApp {
             }
         }
 
-        let window_secs = self.done_window.secs();
+        // `repo_tag` is context-dependent (it shortens against the set it is
+        // given), so feed it the repos actually on screen — every repo in the
+        // *unfiltered* completed set — rather than the post-filter subset.
+        // Otherwise picking a repo would silently re-shorten every ref.
+        let all_repos: Vec<String> = self
+            .completed_repo_choices()
+            .into_iter()
+            .filter(|r| !r.is_empty())
+            .collect();
 
-        // Collect done issues with their timestamps, filtered by window.
-        let mut entries: Vec<(usize, Option<f64>)> = dedup
+        let mut rows: Vec<CompletedRow> = dedup
             .values()
             .copied()
+            .filter(|&i| self.pipeline_lifecycle_section(&self.pipeline_issues[i]) == "done")
             .filter(|&i| {
-                self.pipeline_lifecycle_section(&self.pipeline_issues[i]) == "done"
+                repo_filter.is_empty()
+                    || Self::pipeline_repo_key(&self.pipeline_issues[i]) == repo_filter
             })
-            .map(|i| {
-                let done_at = self.issue_done_at(&self.pipeline_issues[i]);
-                (i, done_at)
-            })
-            .filter(|(_, done_at)| match (done_at, window_secs) {
-                (_, None) => true,               // All: include everything
-                (Some(t), Some(w)) => now - t <= w, // within window
-                (None, Some(_)) => false,         // unknown time: hide in windowed view
+            .filter_map(|i| {
+                let issue = &self.pipeline_issues[i];
+                let finished_at = self.issue_done_at(issue)?;
+                if finished_at < start || finished_at > end {
+                    return None;
+                }
+                let tag = Self::repo_tag(Self::pipeline_repo_key(issue), &all_repos);
+                Some(CompletedRow {
+                    idx: i,
+                    id: (issue.repo_slug.clone(), issue.number),
+                    issue_ref: format!("{}#{}", tag, issue.number),
+                    title: issue.title.clone(),
+                    started_at: self.issue_started_at(issue),
+                    finished_at: Some(finished_at),
+                })
             })
             .collect();
 
-        // Sort: known timestamps newest-first, unknowns at the bottom.
-        entries.sort_by(|(_, a), (_, b)| match (a, b) {
-            (Some(at), Some(bt)) => bt.partial_cmp(at).unwrap_or(std::cmp::Ordering::Equal),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => std::cmp::Ordering::Equal,
-        });
-
-        entries.into_iter().map(|(i, _)| i).collect()
+        Self::sort_completed_rows(&mut rows, self.completed_grid.sort);
+        Ok(rows)
     }
 
-    /// True when the Pipeline Done section is the active sidebar section.
-    /// Used to gate the `→` extend-range key.
-    pub(crate) fn is_done_section_active(&self) -> bool {
-        let search_offset = 1usize;
-        if let Some(section) = self.pipeline_sidebar.active_section() {
-            if section >= search_offset {
-                let state_idx = section - search_offset;
-                if let Some(&key) = self.pipeline_state_section_names.get(state_idx) {
-                    return key == "done";
-                }
+    /// Apply `sort` to `rows` in place. `None` is the default order —
+    /// newest-finished first, which is what the old Done section showed.
+    ///
+    /// A secondary key of `issue_ref` keeps the order total, so a repaint
+    /// can never reshuffle rows that tie on the sort column (two issues that
+    /// merged in the same second, or a whole column of `—`).
+    pub(crate) fn sort_completed_rows(rows: &mut [CompletedRow], sort: Option<(usize, bool)>) {
+        use std::cmp::Ordering;
+        // `None` sorts last in *both* directions: a missing timestamp is an
+        // absence, not a small value, and burying it under an ascending sort
+        // is how #1300-style "where did my row go" reports start.
+        fn opt_cmp(a: Option<f64>, b: Option<f64>) -> Ordering {
+            match (a, b) {
+                (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
             }
         }
-        false
+        let Some((col, ascending)) = sort else {
+            rows.sort_by(|a, b| {
+                opt_cmp(b.finished_at, a.finished_at).then_with(|| a.issue_ref.cmp(&b.issue_ref))
+            });
+            return;
+        };
+        rows.sort_by(|a, b| {
+            let primary = match col {
+                0 => a.issue_ref.cmp(&b.issue_ref),
+                1 => a.title.to_lowercase().cmp(&b.title.to_lowercase()),
+                2 => opt_cmp(a.started_at, b.started_at),
+                _ => opt_cmp(a.finished_at, b.finished_at),
+            };
+            let primary = if ascending { primary } else { primary.reverse() };
+            primary.then_with(|| a.issue_ref.cmp(&b.issue_ref))
+        });
+    }
+
+    // ── #2405: completed grid — controls ─────────────────────────────────
+
+    /// Widget id for control `field` (`"since"` / `"until"` / `"repo"`).
+    pub(crate) fn completed_field_id(field: &str) -> WidgetId {
+        WidgetId::new(format!("completed:{field}"))
+    }
+
+    /// Inverse of [`Self::completed_field_id`]: the field index for a widget
+    /// id, or `None` when the id belongs to something else.
+    pub(crate) fn completed_field_index(id: &str) -> Option<usize> {
+        match id.strip_prefix("completed:")? {
+            "since" => Some(0),
+            "until" => Some(1),
+            "repo" => Some(2),
+            _ => None,
+        }
+    }
+
+    /// The time-range segments: the shared presets, plus the live value when
+    /// it is a free-form duration, so a `13h` window is still visible (and
+    /// still selected) instead of silently reading as `1h`.
+    pub(crate) fn completed_since_options(&self) -> Vec<String> {
+        let mut out: Vec<String> = Self::COMPLETED_SINCE_PRESETS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let cur = self.completed_grid.since.trim();
+        if !cur.is_empty() && !out.iter().any(|o| o == cur) {
+            out.push(cur.to_string());
+        }
+        out
+    }
+
+    /// Choice params with at most this many options render as a segmented
+    /// control (every option one click away); more and the row would not
+    /// fit, so they fall back to a dropdown. Same rule and same reason as
+    /// `reports.rs`'s `REPORTS_SEGMENTED_MAX`.
+    const COMPLETED_SEGMENTED_MAX: usize = 6;
+
+    /// The control row: time range / window end / repo, in that order.
+    ///
+    /// The field order **is** the `Tab` focus order and `field_sel` indexes
+    /// into it, exactly like `reports_param_form`.
+    pub(crate) fn completed_form(&self) -> Form {
+        let since_options = self.completed_since_options();
+        let since_idx = since_options
+            .iter()
+            .position(|o| o == self.completed_grid.since.trim())
+            .unwrap_or(0);
+        let repo_options = self.completed_repo_choices();
+        let repo_idx = repo_options
+            .iter()
+            .position(|o| o == self.completed_grid.repo.trim())
+            .unwrap_or(0);
+        // `""` is a real, selectable option (all repos) but an empty segment
+        // is invisible, so it is *displayed* as `(all)` while the stored
+        // value stays empty.
+        let repo_labels: Vec<String> = repo_options
+            .iter()
+            .map(|r| {
+                if r.is_empty() {
+                    "(all)".to_string()
+                } else {
+                    r.clone()
+                }
+            })
+            .collect();
+        let repo_kind = if repo_labels.len() <= Self::COMPLETED_SEGMENTED_MAX {
+            FieldKind::SegmentedControl {
+                options: repo_labels,
+                selected_idx: repo_idx,
+            }
+        } else {
+            FieldKind::Dropdown {
+                options: repo_labels
+                    .iter()
+                    .map(|c| StyledText::plain(c.as_str()))
+                    .collect(),
+                selected_idx: repo_idx,
+            }
+        };
+        let fields = vec![
+            FormField {
+                id: Self::completed_field_id("since"),
+                label: StyledText::plain("Time range"),
+                kind: FieldKind::SegmentedControl {
+                    options: since_options,
+                    selected_idx: since_idx,
+                },
+                hint: StyledText::plain(""),
+                disabled: false,
+                validation: None,
+            },
+            FormField {
+                id: Self::completed_field_id("until"),
+                label: StyledText::plain("Window end"),
+                kind: FieldKind::TextInput {
+                    value: self.completed_grid.until.clone(),
+                    placeholder: "epoch seconds or ISO-8601 — empty means now".to_string(),
+                    cursor: None,
+                    selection_anchor: None,
+                },
+                hint: StyledText::plain(""),
+                disabled: false,
+                validation: None,
+            },
+            FormField {
+                id: Self::completed_field_id("repo"),
+                label: StyledText::plain("Repo"),
+                kind: repo_kind,
+                hint: StyledText::plain(""),
+                disabled: false,
+                validation: None,
+            },
+        ];
+        let focused_field = fields
+            .get(self.completed_grid.field_sel)
+            .map(|f| f.id.clone());
+        Form {
+            id: WidgetId::new("pipeline-completed-form"),
+            fields,
+            focused_field,
+            scroll_offset: 0,
+            has_focus: true,
+        }
+    }
+
+    /// Number of control fields — the modulus for `Tab` cycling.
+    pub(crate) const COMPLETED_FIELD_COUNT: usize = 3;
+
+    /// Step the focused choice control to the next/previous option (`←`/`→`).
+    /// A no-op on the free-text `Window end` field. Returns `true` when the
+    /// value changed.
+    pub(crate) fn completed_step_choice(&mut self, forward: bool) -> bool {
+        let (options, current) = match self.completed_grid.field_sel {
+            0 => (
+                self.completed_since_options(),
+                self.completed_grid.since.trim().to_string(),
+            ),
+            2 => (
+                self.completed_repo_choices(),
+                self.completed_grid.repo.trim().to_string(),
+            ),
+            _ => return false,
+        };
+        if options.len() < 2 {
+            return false;
+        }
+        let idx = options.iter().position(|o| *o == current).unwrap_or(0);
+        let n = options.len();
+        let next = if forward {
+            (idx + 1) % n
+        } else {
+            (idx + n - 1) % n
+        };
+        self.completed_set_field(self.completed_grid.field_sel, options[next].clone());
+        true
+    }
+
+    /// Write a control's value and reset everything downstream of it.
+    ///
+    /// Scroll and the open row detail both reset on *any* control change:
+    /// the row set is about to change underneath them, and a scroll offset or
+    /// a detail view left pointing into the old set is the "stale result"
+    /// failure `render_reports_result` calls out. The **sort** deliberately
+    /// survives — it is a preference about the columns, not about the rows.
+    pub(crate) fn completed_set_field(&mut self, field: usize, value: String) {
+        match field {
+            0 => self.completed_grid.since = value,
+            1 => self.completed_grid.until = value,
+            2 => self.completed_grid.repo = value,
+            _ => return,
+        }
+        self.completed_grid.scroll = 0;
+        self.completed_grid.detail = None;
+    }
+
+    /// Read a control's value.
+    pub(crate) fn completed_field_value(&self, field: usize) -> String {
+        match field {
+            0 => self.completed_grid.since.clone(),
+            1 => self.completed_grid.until.clone(),
+            2 => self.completed_grid.repo.clone(),
+            _ => String::new(),
+        }
+    }
+
+    /// `true` when the focused control is free text — the only state in which
+    /// typing edits a value instead of firing the panel's single-key
+    /// bindings. Same contract as `reports_focus_is_text`.
+    pub(crate) fn completed_focus_is_text(&self) -> bool {
+        self.completed_grid.field_sel == 1
+    }
+
+    /// Append a typed character to the focused free-text control.
+    pub(crate) fn completed_text_insert(&mut self, ch: char) -> bool {
+        if !self.completed_focus_is_text() {
+            return false;
+        }
+        let mut v = self.completed_field_value(self.completed_grid.field_sel);
+        v.push(ch);
+        self.completed_set_field(self.completed_grid.field_sel, v);
+        true
+    }
+
+    /// Delete the last character of the focused free-text control.
+    pub(crate) fn completed_text_backspace(&mut self) -> bool {
+        if !self.completed_focus_is_text() {
+            return false;
+        }
+        let mut v = self.completed_field_value(self.completed_grid.field_sel);
+        if v.pop().is_none() {
+            return false;
+        }
+        self.completed_set_field(self.completed_grid.field_sel, v);
+        true
+    }
+
+    /// Toggle the sort on `col`: first click sorts descending (the most
+    /// useful direction for both timestamp columns, and the order the grid
+    /// already opens in), a second click flips to ascending, a third clears
+    /// back to the default newest-finished-first order.
+    ///
+    /// Same three-state cycle as `reports_sort_by_column`, so a header click
+    /// means the same thing in both grids.
+    pub(crate) fn completed_sort_by_column(&mut self, col: usize) -> bool {
+        if col >= Self::COMPLETED_COLUMNS.len() {
+            return false;
+        }
+        self.completed_grid.sort = match self.completed_grid.sort {
+            Some((c, false)) if c == col => Some((col, true)),
+            Some((c, true)) if c == col => None,
+            _ => Some((col, false)),
+        };
+        self.completed_grid.scroll = 0;
+        true
+    }
+
+    /// Open the detail view for the `n`-th row of the current grid.
+    /// Returns `false` when there is no such row.
+    pub(crate) fn completed_open_row(&mut self, n: usize) -> bool {
+        let Ok(rows) = self.completed_rows() else {
+            return false;
+        };
+        let Some(row) = rows.get(n) else {
+            return false;
+        };
+        let idx = row.idx;
+        self.completed_grid.detail = Some(row.id.clone());
+        // The Overview body only renders its stage-content block when a stage
+        // is focused, so pick this issue's own default the same way selecting
+        // a sidebar row would — otherwise the detail opens on meta alone.
+        self.pipeline_focused_stage = self.default_focused_stage_for(idx);
+        self.pipeline_stage_content_scroll = 0;
+        true
+    }
+
+    /// Close the row detail and return to the grid. `false` when no detail
+    /// was open (so callers can fall through to their next Esc binding).
+    pub(crate) fn completed_close_detail(&mut self) -> bool {
+        if self.completed_grid.detail.is_none() {
+            return false;
+        }
+        self.completed_grid.detail = None;
+        self.pipeline_stage_content_scroll = 0;
+        true
+    }
+
+    /// The `pipeline_issues` index the open row detail refers to, or `None`
+    /// when nothing is open (or the issue has since left the board).
+    pub(crate) fn completed_detail_index(&self) -> Option<usize> {
+        let (repo, number) = self.completed_grid.detail.as_ref()?;
+        self.pipeline_issues
+            .iter()
+            .position(|pi| pi.repo_slug == *repo && pi.number == *number)
+    }
+
+    // ── #2405: completed grid — render + hit-test ────────────────────────
+
+    /// `1755\u{2026}` → `2026-08-18 14:03`, or `—` when there is no
+    /// timestamp. Local-clock-free (UTC), matching how `coord/reports.py`
+    /// stringifies a `timestamp` column.
+    pub(crate) fn completed_time_cell(ts: Option<f64>) -> String {
+        let Some(ts) = ts else {
+            return "—".to_string();
+        };
+        // Inverse of `parse_until_epoch`'s `days_from_civil`.
+        let days = (ts / 86_400.0).floor() as i64;
+        let secs_of_day = (ts - days as f64 * 86_400.0).max(0.0) as i64;
+        let z = days + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = if m <= 2 { y + 1 } else { y };
+        format!(
+            "{y:04}-{m:02}-{d:02} {:02}:{:02}",
+            secs_of_day / 3600,
+            (secs_of_day % 3600) / 60
+        )
+    }
+
+    /// The grid's columns. `TITLE` flexes; the other three are content-sized
+    /// with clamps, so a wide title can never squeeze the timestamps into
+    /// illegibility (the failure #1762 fixed for the Reports table).
+    pub(crate) fn completed_columns() -> Vec<Column> {
+        vec![
+            Column {
+                title: Self::COMPLETED_COLUMNS[0].to_string(),
+                width: ColumnWidth::Content { min: 8.0, max: 14.0 },
+                align: ColumnAlign::Left,
+            },
+            Column {
+                title: Self::COMPLETED_COLUMNS[1].to_string(),
+                width: ColumnWidth::Flex(1.0),
+                align: ColumnAlign::Left,
+            },
+            Column {
+                title: Self::COMPLETED_COLUMNS[2].to_string(),
+                width: ColumnWidth::Content { min: 16.0, max: 18.0 },
+                align: ColumnAlign::Left,
+            },
+            Column {
+                title: Self::COMPLETED_COLUMNS[3].to_string(),
+                width: ColumnWidth::Content { min: 16.0, max: 18.0 },
+                align: ColumnAlign::Left,
+            },
+        ]
+    }
+
+    /// Rows to `DataRow`s, in the order `completed_rows` produced.
+    pub(crate) fn completed_data_rows(rows: &[CompletedRow]) -> Vec<DataRow> {
+        rows.iter()
+            .map(|r| DataRow {
+                cells: vec![
+                    StyledText {
+                        spans: vec![StyledSpan::with_fg(
+                            r.issue_ref.clone(),
+                            Color::rgb(150, 150, 240),
+                        )],
+                    },
+                    StyledText::plain(r.title.as_str()),
+                    StyledText {
+                        spans: vec![StyledSpan::with_fg(
+                            Self::completed_time_cell(r.started_at),
+                            Color::rgb(150, 150, 170),
+                        )],
+                    },
+                    StyledText {
+                        spans: vec![StyledSpan::with_fg(
+                            Self::completed_time_cell(r.finished_at),
+                            Color::rgb(140, 200, 140),
+                        )],
+                    },
+                ],
+                decoration: Decoration::Normal,
+            })
+            .collect()
+    }
+
+    /// Height of the control row, in surface units.
+    fn completed_controls_height(lh: f32) -> f32 {
+        Self::COMPLETED_FIELD_COUNT as f32 * lh
+    }
+
+    /// The single row the detail view reserves for its "back" affordance.
+    pub(crate) const COMPLETED_DETAIL_BACK_HINT: &'static str =
+        "  ← Back to Completed  (Esc)";
+
+    /// Render the `Completed` tab: either the open row's detail, or the
+    /// control row above the result grid.
+    pub(crate) fn render_pipeline_completed(
+        &self,
+        backend: &mut dyn Backend,
+        rect: Rect,
+        lh: f32,
+    ) {
+        // Drop last frame's geometry up front, exactly like
+        // `render_reports_result`: every path below that paints a table
+        // re-sets it, and every path that doesn't must leave a click with
+        // nothing to hit rather than a table that is no longer on screen.
+        *self.completed_table_layout.borrow_mut() = None;
+
+        if self.completed_grid.detail.is_some() {
+            self.render_completed_detail(backend, rect, lh);
+            return;
+        }
+
+        let controls_h = Self::completed_controls_height(lh).min(rect.height);
+        let controls_rect = Rect::new(rect.x, rect.y, rect.width, controls_h);
+        {
+            let mut fc = self.completed_form.borrow_mut();
+            fc.set_form(self.completed_form());
+            fc.render_and_cache(backend, controls_rect);
+        }
+
+        let body_rect = Rect::new(
+            rect.x,
+            rect.y + controls_h,
+            rect.width,
+            (rect.height - controls_h).max(0.0),
+        );
+        if body_rect.height <= 0.0 {
+            return;
+        }
+
+        let rows = match self.completed_rows() {
+            Ok(rows) => rows,
+            Err(reason) => {
+                // A bad control value is stated, not swallowed: rendering an
+                // empty grid for an unparseable `until` reads identically to
+                // "nothing completed", which is the wrong answer.
+                backend.draw_list(
+                    body_rect,
+                    &plain_list("completed-error", &format!("  {reason}"), 0),
+                );
+                return;
+            }
+        };
+        if rows.is_empty() {
+            backend.draw_list(
+                body_rect,
+                &plain_list(
+                    "completed-empty",
+                    &format!(
+                        "  No issues completed in this window ({}{}).",
+                        self.completed_grid.since.trim(),
+                        if self.completed_grid.repo.trim().is_empty() {
+                            String::new()
+                        } else {
+                            format!(", repo {}", self.completed_grid.repo.trim())
+                        }
+                    ),
+                    0,
+                ),
+            );
+            return;
+        }
+
+        let table = DataTable {
+            id: WidgetId::new("pipeline-completed"),
+            columns: Self::completed_columns(),
+            rows: Self::completed_data_rows(&rows),
+            selected_idx: None,
+            scroll_offset: self.completed_grid.scroll.min(rows.len().saturating_sub(1)),
+            sort: self.completed_grid.sort.map(|(c, asc)| {
+                (
+                    c,
+                    if asc {
+                        SortDirection::Ascending
+                    } else {
+                        SortDirection::Descending
+                    },
+                )
+            }),
+            has_focus: false,
+            show_scrollbar: true,
+            min_total_width: None,
+            // Held at 0.0 for the same reason `render_reports_result` holds
+            // it there: `DataTableLayout::hit_test` has no concept of
+            // `h_scroll` while the renderer subtracts it, so a non-zero value
+            // would shift the painted headers out from under the hit-test and
+            // route sort clicks to the wrong column.
+            h_scroll: 0.0,
+            column_overrides: Vec::new(),
+            footer: None,
+        };
+        let layout = backend.draw_data_table(body_rect, &table, None);
+        *self.completed_table_layout.borrow_mut() = Some((body_rect, layout));
+    }
+
+    /// The open row's detail: the Overview tab's content for that issue —
+    /// repo/labels/gates meta plus focused-stage content — **without** the
+    /// Work/Test/Review/Merge stage-box strip and without the action bar.
+    ///
+    /// Both omissions are deliberate and are the point of the view: this is a
+    /// historical record of an issue that already left the pipeline, so a
+    /// strip inviting a click-to-focus and a `[Go]` bar inviting a dispatch
+    /// would both be offering actions on something that has finished.
+    fn render_completed_detail(&self, backend: &mut dyn Backend, rect: Rect, lh: f32) {
+        let back_h = lh.min(rect.height);
+        backend.draw_list(
+            Rect::new(rect.x, rect.y, rect.width, back_h),
+            &plain_list(
+                "completed-detail-back",
+                Self::COMPLETED_DETAIL_BACK_HINT,
+                0,
+            ),
+        );
+        let body_rect = Rect::new(
+            rect.x,
+            rect.y + back_h,
+            rect.width,
+            (rect.height - back_h).max(0.0),
+        );
+        match self.completed_detail_index() {
+            Some(idx) => {
+                backend.draw_list(body_rect, &self.pipeline_tab_body_list_for(Some(idx)))
+            }
+            None => backend.draw_list(
+                body_rect,
+                &plain_list(
+                    "completed-detail-missing",
+                    "  That issue is no longer on the board.",
+                    0,
+                ),
+            ),
+        }
+    }
+
+    /// Hit-test a click against the last-painted grid, or `None` when no grid
+    /// is on screen. Same render-then-hit-test pattern (and same cached-rect
+    /// reason) as `reports_table_hit`.
+    pub(crate) fn completed_table_hit(&self, pos: Point) -> Option<DataTableHit> {
+        let n = self.completed_rows().ok()?.len();
+        if n == 0 {
+            return None;
+        }
+        let cache = self.completed_table_layout.borrow();
+        let (rect, layout) = cache.as_ref()?;
+        Some(layout.hit_test(
+            pos.x - rect.x,
+            pos.y - rect.y,
+            self.completed_grid.scroll,
+            n,
+        ))
+    }
+
+    /// How many body rows the painted grid can show — the clamp the wheel
+    /// handler needs. `None` when no grid is on screen.
+    pub(crate) fn completed_visible_rows(&self) -> Option<usize> {
+        let cache = self.completed_table_layout.borrow();
+        let (_, layout) = cache.as_ref()?;
+        Some(layout.visible_rows.max(1))
+    }
+
+    /// Scroll the grid by `delta` rows, clamped to the row count. Returns
+    /// `true` when the offset actually moved.
+    pub(crate) fn completed_scroll_by(&mut self, delta: isize) -> bool {
+        let Ok(rows) = self.completed_rows() else {
+            return false;
+        };
+        let visible = self.completed_visible_rows().unwrap_or(1);
+        let max = rows.len().saturating_sub(visible);
+        let next = (self.completed_grid.scroll as isize + delta).clamp(0, max as isize) as usize;
+        if next == self.completed_grid.scroll {
+            return false;
+        }
+        self.completed_grid.scroll = next;
+        true
+    }
+
+    /// Route a click that landed inside the `Completed` tab's content rect.
+    /// Returns `true` when it changed something (the caller's redraw signal).
+    pub(crate) fn completed_main_click(
+        &mut self,
+        pos: Point,
+        content_rect: Rect,
+        lh: f32,
+    ) -> bool {
+        if self.completed_grid.detail.is_some() {
+            // The single "back" row at the top; anything else in the detail
+            // is inert text.
+            if pos.y < content_rect.y + lh {
+                return self.completed_close_detail();
+            }
+            return false;
+        }
+        let controls_h = Self::completed_controls_height(lh).min(content_rect.height);
+        if pos.y < content_rect.y + controls_h {
+            let controls_rect =
+                Rect::new(content_rect.x, content_rect.y, content_rect.width, controls_h);
+            let event = UiEvent::MouseDown {
+                widget: None,
+                button: MouseButton::Left,
+                position: pos,
+                modifiers: Modifiers::default(),
+            };
+            let outcome = self
+                .completed_form
+                .borrow_mut()
+                .handle_cached(&event, controls_rect);
+            return match outcome {
+                FormControllerEvent::FormAction(ref form_event) => {
+                    self.completed_apply_form_event(form_event)
+                }
+                FormControllerEvent::ScrollChanged | FormControllerEvent::Consumed => true,
+                FormControllerEvent::Ignored => false,
+            };
+        }
+        match self.completed_table_hit(pos) {
+            Some(DataTableHit::Header { col }) => self.completed_sort_by_column(col),
+            Some(DataTableHit::Row { idx }) => self.completed_open_row(idx),
+            _ => false,
+        }
+    }
+
+    /// Apply a `FormController` event from the control row. Keyboard focus
+    /// follows the mouse, same as the Settings panel.
+    pub(crate) fn completed_apply_form_event(&mut self, event: &FormEvent) -> bool {
+        let (id, value) = match event {
+            FormEvent::SegmentedControlChanged { id, selected_idx }
+            | FormEvent::DropdownChanged { id, selected_idx } => {
+                let Some(field) = Self::completed_field_index(id.as_str()) else {
+                    return false;
+                };
+                // The segmented control reports an *index*, so the value is
+                // looked up in the same option list the form was built from
+                // — never parsed back out of the label, which for the repo
+                // selector is `(all)` rather than the empty string it means.
+                let options = match field {
+                    0 => self.completed_since_options(),
+                    2 => self.completed_repo_choices(),
+                    _ => return false,
+                };
+                let Some(choice) = options.get(*selected_idx).cloned() else {
+                    return false;
+                };
+                (id.clone(), choice)
+            }
+            FormEvent::TextInputChanged { id, value }
+            | FormEvent::TextInputCommitted { id, value } => (id.clone(), value.clone()),
+            FormEvent::FocusChanged { id } => {
+                let Some(field) = Self::completed_field_index(id.as_str()) else {
+                    return false;
+                };
+                self.completed_grid.field_sel = field;
+                return true;
+            }
+            _ => return false,
+        };
+        let Some(field) = Self::completed_field_index(id.as_str()) else {
+            return false;
+        };
+        self.completed_grid.field_sel = field;
+        self.completed_set_field(field, value);
+        true
     }
 
     /// Return issues for a lifecycle state, grouped by repo, in stable repo
@@ -1738,8 +2585,8 @@ impl CoordApp {
     }
 
     /// #1197: compute the [`EpicNesting`] for one leaf-row bucket (a
-    /// milestone's `mil_issue_idxs`, a repo's `issue_idxs`, or the flat
-    /// `done_windowed` list). `after`/`group` are always empty for #1195
+    /// milestone's `mil_issue_idxs`, or a repo's `issue_idxs`). `after`/
+    /// `group` are always empty for #1195
     /// API-sourced children (that shape carries no ordering annotation,
     /// unlike the `## Work order` convention `milestone_dag.rs` also
     /// parses) — so `build_dag_nodes` only ever resolves Done/InFlight/Ready
@@ -1917,7 +2764,7 @@ impl CoordApp {
     /// happen to share a child issue number.
     ///
     /// Applies the same search + dismissal gate every sibling dedup function
-    /// (`pipeline_repos_for_state`, `pipeline_done_windowed`, …) already
+    /// (`pipeline_repos_for_state`, `completed_rows`, …) already
     /// applies before an issue counts toward anything. Without it, an epic
     /// that is filtered out of every rendered bucket — because it doesn't
     /// match the search query, or because it was dismissed — would still
@@ -1973,8 +2820,8 @@ impl CoordApp {
     /// finished epic's children are done work, not the reason to keep
     /// scanning the row, and #1197's always-expanded default meant a
     /// long-lived epic just accumulated an ever-growing wall of closed
-    /// children (the flat "Done" section gets a time window via
-    /// `pipeline_done_windowed`; nested epic children had no equivalent). A
+    /// children (completed issues get an adjustable time range of their own
+    /// in #2405's Completed grid; nested epic children have no equivalent). A
     /// manual toggle (a `pipeline_epic_expanded` entry) always wins over
     /// either default. This differs from the milestone header's #857
     /// collapsed-by-default (a milestone is a bucket; an epic is the work).
@@ -3851,17 +4698,11 @@ impl CoordApp {
         let refining_by_repo: Vec<(String, Vec<usize>)> =
             self.pipeline_repos_for_state("refining");
         let pending_by_repo: Vec<(String, Vec<usize>)> = self.pipeline_repos_for_state("pending");
-        // #728: Done is now a flat, time-windowed, newest-first list rather
-        // than the old repo-grouped archive.
-        let done_windowed: Vec<usize> = self.pipeline_done_windowed();
-        // Label includes the active window ("Done · last 2h", etc.)
-        let done_section_label: String =
-            format!("Done · {}", self.done_window.label());
-
         // Build the list of non-empty state sections in display order.
         // #815: In-progress on top — active work is the most relevant item
         // to see immediately; the pre-dispatch lifecycle states follow in
-        // order (New → Refining → Pending); Done stays last.
+        // order (New → Refining → Pending). #2405: there is no Done section
+        // any more — completed issues live in the `Completed` tab's grid.
         let mut state_sections: Vec<(&'static str, &'static str)> = Vec::new();
         if !active_flat.is_empty() {
             state_sections.push(("in-progress", "In-progress"));
@@ -3875,26 +4716,17 @@ impl CoordApp {
         if !pending_by_repo.is_empty() {
             state_sections.push(("pending", "Pending"));
         }
-        if !done_windowed.is_empty() {
-            state_sections.push(("done", "Done"));
-        }
 
         // ── Build sidebar section definitions ────────────────────────────
         let mut defs: Vec<SidebarSectionDef> = Vec::new();
         defs.push(SidebarSectionDef::form("pipeline-search", "FILTER"));
         for &(lc_key, _lc_label) in &state_sections {
-            // #728: the Done section gets a window-aware label; all others
-            // keep their static labels.
-            let label = if lc_key == "done" {
-                done_section_label.clone()
-            } else {
-                match lc_key {
-                    "new" => "New".to_string(),
-                    "refining" => "Refining".to_string(),
-                    "pending" => "Pending".to_string(),
-                    "in-progress" => "In-progress".to_string(),
-                    other => other.to_string(),
-                }
+            let label = match lc_key {
+                "new" => "New".to_string(),
+                "refining" => "Refining".to_string(),
+                "pending" => "Pending".to_string(),
+                "in-progress" => "In-progress".to_string(),
+                other => other.to_string(),
             };
             let mut def =
                 SidebarSectionDef::new(format!("section:state:{}", lc_key), label);
@@ -3920,7 +4752,6 @@ impl CoordApp {
         // for visual consistency between the Board and Pipeline panels.
         let state_color = |lc: &str| match lc {
             "in-progress" => Color::rgb(80, 220, 80),
-            "done" => Color::rgb(120, 180, 120),
             "pending" => Color::rgb(140, 180, 240),
             "refining" => Color::rgb(200, 170, 90), // amber — refinement in flight
             "new" => Color::rgb(160, 160, 200),     // muted — pre-pipeline / no label
@@ -4146,151 +4977,6 @@ impl CoordApp {
                                             ));
                                         }
                                     }
-                                }
-                            }
-                        }
-                    }
-                }
-                "done" => {
-                    // #728: Done is now a flat, time-windowed, newest-first list.
-                    // No repo sub-headers; issue rows directly at [0, ii].
-                    // Each row shows: #N  title  status  age  [● live]
-                    sidebar.set_section_badge(
-                        section_idx,
-                        Some(StyledText::plain(format!("({})", done_windowed.len()))),
-                    );
-                    let now_secs = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs_f64();
-                    // #1197: nest each epic's children beneath its row
-                    // instead of listing them a second time as flat
-                    // siblings in the Done window.
-                    //
-                    // #1300: use per-bucket nesting (children of epics also
-                    // in THIS Done window), NOT the global set. An epic child
-                    // whose parent is still open (in In-progress or another
-                    // section) must render flat here — Done is a recency view
-                    // orthogonal to the lifecycle-nesting hierarchy in other
-                    // sections. A child whose parent is also in Done stays
-                    // nested under that parent row (preserving #1197/#1253's
-                    // no-duplicate invariant). The accepted trade-off: such a
-                    // child can appear twice — nested under its still-running
-                    // epic in In-progress AND flat in Done — because Done shows
-                    // "what completed recently", an axis independent of
-                    // lifecycle state.
-                    let nesting = self.compute_epic_nesting(&done_windowed);
-                    for (ii, &issue_idx) in done_windowed.iter().enumerate() {
-                        let issue = &self.pipeline_issues[issue_idx];
-                        // #1300: scope the suppression lookup by repo — see
-                        // `EpicNesting::nested`'s doc comment. A bare-number
-                        // check here would suppress an unrelated same-numbered
-                        // standalone issue from a different repo in this
-                        // multi-repo Done window.
-                        let is_nested = issue
-                            .coord_repo
-                            .as_deref()
-                            .map(|r| nesting.nested.contains(&(r.to_string(), issue.number)))
-                            .unwrap_or(false);
-                        if is_nested {
-                            continue;
-                        }
-                        let title_color = if issue.coord_repo.is_some() {
-                            Color::rgb(160, 160, 160)
-                        } else {
-                            Color::rgb(110, 110, 110)
-                        };
-                        // Terse status: ✓ merged / ✓ closed
-                        let status_str = if self.merge_stage_status_for(issue) == StageStatus::Done {
-                            "✓ merged"
-                        } else {
-                            "✓ closed"
-                        };
-                        // Relative age.
-                        let age_str = match self.issue_done_at(issue) {
-                            Some(t) => {
-                                let secs = (now_secs - t).max(0.0) as u64;
-                                if secs < 3600 {
-                                    format!("  {}m ago", secs / 60)
-                                } else if secs < 86_400 {
-                                    format!("  {}h ago", secs / 3600)
-                                } else {
-                                    format!("  {}d ago", secs / 86_400)
-                                }
-                            }
-                            None => String::new(),
-                        };
-                        let mut spans = Vec::new();
-                        // #2284 (ms-65 §2f): active-document marker, spliced
-                        // ahead of the `#<N>` span itself.
-                        if let Some(marker) = doc_marker_span(issue) {
-                            spans.push(marker);
-                        }
-                        spans.push(StyledSpan::with_fg(
-                            format!("#{:<5}", issue.number),
-                            Color::rgb(150, 150, 240),
-                        ));
-                        // #1198: epic marker, label-driven — see
-                        // `epic_badge_span`. Spliced between `#N` and the
-                        // title (not appended at the end) so it can't be
-                        // clipped by a long title or overwritten by the
-                        // right-aligned repo-tag badge.
-                        if let Some(marker) = epic_badge_span(issue) {
-                            spans.push(marker);
-                        }
-                        // #1398: "driving" badge, same splice point.
-                        if let Some(marker) = self.drive_badge_span(issue) {
-                            spans.push(marker);
-                        }
-                        // #1505: "[stuck]" driver-escalation badge, same
-                        // splice point.
-                        if let Some(marker) = self.escalation_badge_span(issue) {
-                            spans.push(marker);
-                        }
-                        spans.push(StyledSpan::with_fg(trunc(&issue.title, 18), title_color));
-                        // #1253: "N/M done" child-progress summary, visible
-                        // whether expanded or collapsed.
-                        let epic_children = nesting.by_epic.get(&issue_idx);
-                        if let Some(children) = epic_children {
-                            if let Some(span) = Self::epic_progress_span(children) {
-                                spans.push(span);
-                            }
-                        }
-                        spans.push(StyledSpan::with_fg(
-                            format!("  {}", status_str),
-                            Color::rgb(100, 180, 100),
-                        ));
-                        spans.push(StyledSpan::with_fg(age_str, Color::rgb(120, 120, 140)));
-                        // ● session live badge (#728).
-                        if self.issue_session_is_live(issue) {
-                            spans.push(StyledSpan::with_fg(
-                                "  ● live".to_string(),
-                                Color::rgb(80, 160, 240),
-                            ));
-                        }
-                        // Repo tag badge (same as in-progress, for orientation).
-                        let tag = Self::repo_tag(Self::pipeline_repo_key(issue), &repos);
-                        let row_path = vec![0u16, ii as u16];
-                        // #1197: epic branch row — see the in-progress site.
-                        let epic = epic_children.and_then(|children| {
-                            self.epic_expand_state(issue, children)
-                                .map(|(key, expanded)| (key, expanded, children))
-                        });
-                        rows.push(TreeRow {
-                            path: row_path.clone(),
-                            indent: 2,
-                            icon: None,
-                            text: StyledText { spans },
-                            badge: Some(Badge::colored(tag, Color::rgb(180, 140, 240))),
-                            is_expanded: epic.as_ref().map(|(_, e, _)| *e),
-                            decoration: Decoration::Normal,
-                            edit: None,
-                        });
-                        if let Some((key, expanded, children)) = epic {
-                            epic_row_keys.insert((section_idx, row_path.clone()), key);
-                            if expanded {
-                                for (ci, child) in children.iter().enumerate() {
-                                    rows.push(self.epic_child_tree_row(&row_path, 3, ci, child));
                                 }
                             }
                         }
@@ -4712,16 +5398,13 @@ impl CoordApp {
         // Sync `pipeline_sel` to the sidebar's actual selection.
         self.pipeline_sel = self.selected_pipeline_index();
         // Restore per-section collapse state by state key.  New sections
-        // that weren't present before default to expanded, EXCEPT Done which
-        // defaults to collapsed (#815) — it's an archive, not active work.
+        // that weren't present before default to expanded. (#815's
+        // collapsed-by-default carve-out was Done-only and went with it in
+        // #2405 — every remaining section is active work.)
         for (i, &state_key) in self.pipeline_state_section_names.iter().enumerate() {
             if let Some(&was_collapsed) = prev_state_collapsed.get(state_key) {
                 self.pipeline_sidebar
                     .set_collapsed(i + search_offset, was_collapsed);
-            } else if state_key == "done" {
-                // #815: Done section starts collapsed by default so the active
-                // sections are immediately visible without scrolling past history.
-                self.pipeline_sidebar.set_collapsed(i + search_offset, true);
             }
         }
         // Restore panel scroll so the visible area doesn't jump back to the
@@ -4792,20 +5475,6 @@ impl CoordApp {
             let parent_idx = mil_issue_idxs.get(ii).copied()?;
             if path.len() > 3 {
                 self.resolve_nested_child_index(parent_idx, path[3] as usize, false)
-            } else {
-                Some(parent_idx)
-            }
-        } else if state_key == "done" {
-            // #728: flat 2-level path [0, issue_idx] — path[0] is the
-            // synthetic group (always 0); path[1] is the windowed list index.
-            if path.len() < 2 {
-                return None;
-            }
-            let ii = path[1] as usize;
-            let done_windowed = self.pipeline_done_windowed();
-            let parent_idx = done_windowed.get(ii).copied()?;
-            if path.len() > 2 {
-                self.resolve_nested_child_index(parent_idx, path[2] as usize, false)
             } else {
                 Some(parent_idx)
             }
@@ -4920,7 +5589,6 @@ impl CoordApp {
                     }
                     out
                 }
-                "done" => vec![(vec![0u16], self.pipeline_done_windowed(), false)],
                 "refining" | "pending" => self
                     .pipeline_repos_for_state(state_key)
                     .into_iter()
@@ -5826,7 +6494,13 @@ impl CoordApp {
     ///   (typically merge), so the user immediately sees the completion detail.
     /// - Returns `None` when no issue is selected or the issue has no stages.
     pub(crate) fn default_focused_stage_for_selected_issue(&self) -> Option<usize> {
-        let idx = self.pipeline_sel?;
+        self.default_focused_stage_for(self.pipeline_sel?)
+    }
+
+    /// #2405: the same default-focused-stage rule for an *arbitrary*
+    /// `pipeline_issues` index, so the Completed grid's row detail can pick a
+    /// stage for an issue that is deliberately not the sidebar selection.
+    pub(crate) fn default_focused_stage_for(&self, idx: usize) -> Option<usize> {
         let issue = self.pipeline_issues.get(idx)?;
         let stages = self.pipeline_stage_names_for_issue(issue);
         if stages.is_empty() {
@@ -8361,7 +9035,6 @@ impl CoordApp {
         let Some(pi) = self.pipeline_issue_for(&repo_slug, number) else {
             return;
         };
-        let is_closed = pi.is_closed;
         let lc_key = self.pipeline_lifecycle_section(pi);
         let repo_key = Self::pipeline_repo_key(pi).to_string();
         let mil_key = match self.pipeline_issue_milestone(pi) {
@@ -8380,13 +9053,5 @@ impl CoordApp {
         self.rebuild_pipeline_sidebar(Some((repo_slug, number)));
         self.pipeline_focused_stage = self.default_focused_stage_for_selected_issue();
         self.pipeline_stage_content_scroll = 0;
-        if is_closed {
-            let search_offset = 1usize;
-            if let Some(done_idx) =
-                self.pipeline_state_section_names.iter().position(|&k| k == "done")
-            {
-                self.pipeline_sidebar.set_collapsed(done_idx + search_offset, false);
-            }
-        }
     }
 }

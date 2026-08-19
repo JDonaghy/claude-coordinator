@@ -447,6 +447,16 @@ impl ShellApp for CoordApp {
                             // `drive_detail_terminals` on every tick.
                             self.render_detail_terminal_tab(backend, term_rect);
                         }
+                        PipelineDetailTab::Completed => {
+                            // #2405: the completed-issues grid owns the whole
+                            // content rect — no pinned stage strip. The strip
+                            // describes *the selected issue's* pipeline, and
+                            // this tab is not about the selected issue at all
+                            // (it is a historical report over every completed
+                            // one), so pinning it here would caption the grid
+                            // with an unrelated issue's stages.
+                            self.render_pipeline_completed(backend, content_rect, lh);
+                        }
                     }
                 }
             }
@@ -2182,7 +2192,8 @@ impl CoordApp {
 
     pub(crate) fn pipeline_detail_tab_bar(&self) -> TabBar {
         // #818: redesigned tab set — Pipeline renamed to Overview; Stages and
-        // Refinement removed.  Order: Overview / Issue / Log / Summary / Terminal.
+        // Refinement removed.  Order: Overview / Issue / Log / Summary /
+        // Terminal, plus #2405's Completed grid pinned last.
         TabBar {
             id: WidgetId::new("pipeline-detail-tabs"),
             tabs: vec![
@@ -2225,6 +2236,16 @@ impl CoordApp {
                         " Terminal ".to_string()
                     },
                     is_active: self.pipeline_detail_tab == PipelineDetailTab::Terminal,
+                    is_dirty: false,
+                    is_preview: false,
+                    is_closable: false,
+                },
+                // #2405: the completed-issues grid. Last, so the five
+                // per-issue tabs keep the indices every existing click test
+                // and Tab-cycle already assumes.
+                TabItem {
+                    label: " Completed ".to_string(),
+                    is_active: self.pipeline_detail_tab == PipelineDetailTab::Completed,
                     is_dirty: false,
                     is_preview: false,
                     is_closable: false,
@@ -2345,11 +2366,20 @@ impl CoordApp {
     /// driven by `pipeline_stage_content_scroll` so the wheel and j/k
     /// keys can move through the content as on the Stages tab.
     pub(crate) fn pipeline_tab_body_list(&self) -> ListView {
+        self.pipeline_tab_body_list_for(self.pipeline_sel)
+    }
+
+    /// #2405: the Overview body for an *arbitrary* `pipeline_issues` index,
+    /// rather than always for `pipeline_sel`.
+    ///
+    /// Extracted so the Completed grid's row detail can render byte-identical
+    /// Overview content for an issue that is deliberately **not** the sidebar
+    /// selection (completed issues have no sidebar row at all any more). The
+    /// no-argument `pipeline_tab_body_list` is the unchanged Overview-tab
+    /// caller; everything below is verbatim what it always did.
+    pub(crate) fn pipeline_tab_body_list_for(&self, sel: Option<usize>) -> ListView {
         let mut items: Vec<ListItem> = Vec::new();
-        let issue = self
-            .pipeline_sel
-            .and_then(|i| self.pipeline_issues.get(i))
-            .cloned();
+        let issue = sel.and_then(|i| self.pipeline_issues.get(i)).cloned();
 
         // ── Meta summary (repo / labels / gates / status) ────────────
         if let Some(ref issue) = issue {

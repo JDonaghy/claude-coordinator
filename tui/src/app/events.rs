@@ -2240,6 +2240,70 @@ impl CoordApp {
                         needs_redraw = true;
                     }
 
+                    // ── #2405: the Pipeline Completed grid's keymap ──────
+                    // Placed here, beside the Reports typing block and
+                    // ahead of the global `q`/Esc catch-all, for the same
+                    // reason: while the free-text `Window end` control has
+                    // focus every printable character (including `q`)
+                    // belongs to the value being typed. Every arm is guarded
+                    // on the Completed tab being active, so the rest of the
+                    // Pipeline keymap is untouched on all five other tabs.
+                    //
+                    // ←/→ step the focused choice control rather than
+                    // cycling tabs, matching the Reports panel; `h`/`l`
+                    // still cycle tabs, so nothing becomes unreachable.
+                    Key::Named(NamedKey::Escape)
+                        if self.active_view == SidebarView::Pipeline
+                            && self.pipeline_detail_tab == PipelineDetailTab::Completed
+                            && self.completed_grid.detail.is_some() =>
+                    {
+                        self.completed_close_detail();
+                        needs_redraw = true;
+                    }
+                    Key::Named(NamedKey::Tab)
+                        if self.active_view == SidebarView::Pipeline
+                            && self.pipeline_detail_tab == PipelineDetailTab::Completed
+                            && !self.pipeline_search.focused =>
+                    {
+                        self.completed_grid.field_sel = (self.completed_grid.field_sel + 1)
+                            % CoordApp::COMPLETED_FIELD_COUNT;
+                        needs_redraw = true;
+                    }
+                    Key::Named(NamedKey::Right)
+                        if self.active_view == SidebarView::Pipeline
+                            && self.pipeline_detail_tab == PipelineDetailTab::Completed
+                            && !self.pipeline_search.focused =>
+                    {
+                        self.completed_step_choice(true);
+                        needs_redraw = true;
+                    }
+                    Key::Named(NamedKey::Left)
+                        if self.active_view == SidebarView::Pipeline
+                            && self.pipeline_detail_tab == PipelineDetailTab::Completed
+                            && !self.pipeline_search.focused =>
+                    {
+                        self.completed_step_choice(false);
+                        needs_redraw = true;
+                    }
+                    Key::Named(NamedKey::Backspace)
+                        if self.active_view == SidebarView::Pipeline
+                            && self.pipeline_detail_tab == PipelineDetailTab::Completed
+                            && self.completed_focus_is_text()
+                            && !self.pipeline_search.focused =>
+                    {
+                        self.completed_text_backspace();
+                        needs_redraw = true;
+                    }
+                    Key::Char(ch)
+                        if self.active_view == SidebarView::Pipeline
+                            && self.pipeline_detail_tab == PipelineDetailTab::Completed
+                            && self.completed_focus_is_text()
+                            && !self.pipeline_search.focused =>
+                    {
+                        self.completed_text_insert(*ch);
+                        needs_redraw = true;
+                    }
+
                     // ── Watch overlay: control keys ─────────────────────
                     // 'b' opens the ChatController guidance overlay. When the
                     // overlay is open, ALL events are intercepted earlier in
@@ -2794,37 +2858,6 @@ impl CoordApp {
                         if self.active_view == SidebarView::MergeQueue =>
                     {
                         self.launch_merge_queue_interactive();
-                        needs_redraw = true;
-                    }
-
-                    // ── #728: Done section extend-range (→) ─────────────
-                    // `→` while the Pipeline Done section is focused cycles
-                    // the time window: H2 → H24 → D7 → All → H2.
-                    Key::Named(NamedKey::Right)
-                        if self.active_view == SidebarView::Pipeline
-                            && self.is_done_section_active()
-                            && !self.pipeline_search.focused =>
-                    {
-                        self.done_window = self.done_window.next();
-                        self.rebuild_pipeline_sidebar(None);
-                        // After rebuild the SidebarSystem starts with
-                        // active_section() == None, so the default_select block
-                        // in rebuild_pipeline_sidebar selects the FIRST section
-                        // (usually in-progress) and the restore loop only re-
-                        // focuses Done if pipeline_sel pointed at a Done row.
-                        // When the user is on the Done section HEADER (no issue
-                        // row selected) pipeline_sel is None, so the restore is
-                        // skipped and Done loses focus.  Re-assert Done focus
-                        // unconditionally here so subsequent → presses still
-                        // fire the extend-range handler.
-                        if let Some(done_idx) = self
-                            .pipeline_state_section_names
-                            .iter()
-                            .position(|&k| k == "done")
-                            .map(|i| i + 1)
-                        {
-                            self.pipeline_sidebar.set_active_section(Some(done_idx));
-                        }
                         needs_redraw = true;
                     }
 
@@ -3388,16 +3421,19 @@ impl CoordApp {
                     }
 
                     // ── h/l — cycle Pipeline detail tabs ─────────────────
-                    // #818 order: Overview → Issue → Log → Summary → Terminal → Overview …
+                    // #818 order, plus #2405's Completed grid last:
+                    // Overview → Issue → Log → Summary → Terminal →
+                    // Completed → Overview …
                     Key::Char('h') | Key::Named(NamedKey::Left)
                         if self.active_view == SidebarView::Pipeline =>
                     {
                         let next = match self.pipeline_detail_tab {
-                            PipelineDetailTab::Overview => PipelineDetailTab::Terminal,
+                            PipelineDetailTab::Overview => PipelineDetailTab::Completed,
                             PipelineDetailTab::Issue => PipelineDetailTab::Overview,
                             PipelineDetailTab::Log => PipelineDetailTab::Issue,
                             PipelineDetailTab::Summary => PipelineDetailTab::Log,
                             PipelineDetailTab::Terminal => PipelineDetailTab::Summary,
+                            PipelineDetailTab::Completed => PipelineDetailTab::Terminal,
                         };
                         // Release PTY focus whenever the user navigates away
                         // from the Terminal tab.
@@ -3432,7 +3468,8 @@ impl CoordApp {
                             PipelineDetailTab::Issue => PipelineDetailTab::Log,
                             PipelineDetailTab::Log => PipelineDetailTab::Summary,
                             PipelineDetailTab::Summary => PipelineDetailTab::Terminal,
-                            PipelineDetailTab::Terminal => PipelineDetailTab::Overview,
+                            PipelineDetailTab::Terminal => PipelineDetailTab::Completed,
+                            PipelineDetailTab::Completed => PipelineDetailTab::Overview,
                         };
                         // Release PTY focus whenever the user navigates away
                         // from the Terminal tab.
@@ -6053,13 +6090,15 @@ impl CoordApp {
                 if let Some(idx) =
                     hit_tab_index_from_labels(&labels, main_b.x, pos.x, tab_scroll)
                 {
-                    // #818: Overview / Issue / Log / Summary / Terminal (5 tabs).
+                    // #818: Overview / Issue / Log / Summary / Terminal,
+                    // plus #2405's Completed grid at index 5.
                     let new_tab = match idx {
                         0 => PipelineDetailTab::Overview,
                         1 => PipelineDetailTab::Issue,
                         2 => PipelineDetailTab::Log,
                         3 => PipelineDetailTab::Summary,
-                        _ => PipelineDetailTab::Terminal,
+                        4 => PipelineDetailTab::Terminal,
+                        _ => PipelineDetailTab::Completed,
                     };
                     if new_tab != self.pipeline_detail_tab {
                         if new_tab != PipelineDetailTab::Terminal {
@@ -6084,6 +6123,15 @@ impl CoordApp {
             // is rendered into the content area (main_b minus tab row), so
             // we must hit-test against that rect — not main_b directly, or
             // the y-coordinates are off by tab_h.
+            if self.pipeline_detail_tab == PipelineDetailTab::Completed {
+                let content_rect = Rect::new(
+                    main_b.x,
+                    main_b.y + tab_h,
+                    main_b.width,
+                    (main_b.height - tab_h).max(0.0),
+                );
+                return self.completed_main_click(pos, content_rect, lh);
+            }
             if self.pipeline_detail_tab == PipelineDetailTab::Overview {
                 if let Some(view) = self.build_pipeline_widget() {
                     let content_rect = Rect::new(
@@ -6772,6 +6820,30 @@ impl CoordApp {
                         } else if delta.y < 0.0 {
                             self.pipeline_detail_scroll =
                                 (self.pipeline_detail_scroll + 1).min(max);
+                        }
+                    }
+                    PipelineDetailTab::Completed => {
+                        // #2405: the grid scrolls against its own painted
+                        // viewport, not the whole main panel's row count —
+                        // the control row sits above it (the exact gap #1910
+                        // fixed for the Reports table).
+                        if self.completed_grid.detail.is_some() {
+                            let items = self
+                                .completed_detail_index()
+                                .map(|i| self.pipeline_tab_body_list_for(Some(i)).items.len())
+                                .unwrap_or(0);
+                            let max = items.saturating_sub(visible.saturating_sub(1));
+                            if delta.y > 0.0 {
+                                self.pipeline_stage_content_scroll =
+                                    self.pipeline_stage_content_scroll.saturating_sub(1);
+                            } else if delta.y < 0.0 {
+                                self.pipeline_stage_content_scroll =
+                                    (self.pipeline_stage_content_scroll + 1).min(max);
+                            }
+                        } else if delta.y > 0.0 {
+                            self.completed_scroll_by(-1);
+                        } else if delta.y < 0.0 {
+                            self.completed_scroll_by(1);
                         }
                     }
                     PipelineDetailTab::Overview => {
