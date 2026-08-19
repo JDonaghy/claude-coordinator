@@ -42,3 +42,4 @@ include!("../../tests/acceptance/ms-38/plans_detail_1122.rs");
 include!("../../tests/acceptance/ms-65/board_tabs_2282.rs");
 include!("../../tests/acceptance/ms-65/board_tabs_close_2283.rs");
 include!("../../tests/acceptance/ms-65/pipeline_tabs_2284.rs");
+include!("../../tests/acceptance/ms-65/detail_substate_2285.rs");

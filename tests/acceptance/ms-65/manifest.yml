@@ -115,6 +115,34 @@ tests:
   # selects its row in the PIPELINE sidebar and leaves the Board's selection
   pipeline_tabs_2284::activating_a_pipeline_tab_reveals_its_row_in_the_pipeline_sidebar_not_the_boards: 2284
 
+  # ── #2285 (T-4) — per-tab detail sub-state (contract §5) ─────────────────
+  # Slice: detail_substate_2285.rs · mocks: none of its own (§5 is explicitly
+  # mock-less: "this issue is invisible to a static screen grid"); it borrows
+  # `board-baseline-no-tabs.screen`'s `PIPELINE STAGES` detail heading as the
+  # "this tab is on its default `Board` sub-tab" marker.
+  #
+  # §5 bullet 1a — a tab opened while another sits on `Issue` starts on the
+  # DEFAULT `Board` sub-tab (issue #2285: "Defaults on open match today's
+  # defaults (Board / Overview, scroll 0)")
+  detail_substate_2285::a_newly_opened_tab_starts_on_the_default_board_sub_tab: 2285
+  # §5 bullet 1b — tab A keeps `Issue` while tab B is driven to `Board`;
+  # switching back to A shows A's own sub-tab, and back to B shows B's
+  detail_substate_2285::switching_back_to_a_tab_restores_that_tabs_own_sub_tab: 2285
+  # §5 bullet 2 — scrolling tab A's Issue body neither moves tab B's nor is
+  # lost when A is re-activated
+  detail_substate_2285::scrolling_one_tabs_issue_body_leaves_the_other_tabs_position_alone: 2285
+  # §5 bullet 3 — closing a tab DISCARDS its sub-state: re-opening the same
+  # issue number starts from `Board` / scroll 0
+  detail_substate_2285::closing_a_tab_discards_its_sub_state_and_reopening_starts_from_the_defaults: 2285
+  # §5 bullet 4 — the Terminal sub-tab belongs to the tab that opened it: a
+  # new tab does not land in it, and returning to the opener does. (Session
+  # LIVENESS is not asserted — see coordinator finding 12 below.)
+  detail_substate_2285::terminal_sub_tab_selection_follows_its_own_tab: 2285
+  # #2285 AC 4 / "behaviour-preserving for a single open tab" — with exactly
+  # one tab open, sub-tab and scroll behave as they do today.
+  # THIS IS A GREEN RATCHET — see the `expected_red` block below.
+  detail_substate_2285::a_single_open_tab_keeps_todays_sub_tab_and_scroll_behaviour: 2285
+
 # ── expected_red (#2164) ───────────────────────────────────────────────────
 # Hand-derived from a REAL run of the sealed suite against origin/main at the
 # time of authoring (`cd tui && cargo test --test acceptance --features
@@ -196,6 +224,30 @@ expected_red:
     - pipeline_tabs_2284::board_pipeline_board_round_trip_restores_the_boards_tabs_order_and_active_tab
     - pipeline_tabs_2284::each_scope_owns_its_own_preview_slot
     - pipeline_tabs_2284::activating_a_pipeline_tab_reveals_its_row_in_the_pipeline_sidebar_not_the_boards
+
+  # #2285 — OBSERVED, not intended. Taken from two consecutive real runs of
+  # the sealed suite (`cd tui && RUSTC_BOOTSTRAP=1 cargo test --test acceptance
+  # --features test-support -- -Z unstable-options --format json`, the driver
+  # command in coordinator.yml) at authoring time: of this slice's 6 ids, the
+  # same 5 FAILED and the same 1 passed on both runs, each of the 5 dying on a
+  # §5 clause (never on a precondition — verified by reading the panic line of
+  # every failure). The 1 that passed is deliberately ABSENT below:
+  #
+  #   * `a_single_open_tab_keeps_todays_sub_tab_and_scroll_behaviour` — the
+  #     RATCHET, and the issue's own regression bar ("This slice is
+  #     behaviour-preserving for a single open tab"). Green today for the
+  #     degenerate reason that there is one global sub-state and one tab to
+  #     own it; it must STAY green once the state moves onto the document.
+  #     An implementation that keys sub-state by something other than the
+  #     active document (or that resets it on every activation) breaks
+  #     exactly this test. Listing it would make its inevitable pass a HARD
+  #     FAILURE.
+  2285:
+    - detail_substate_2285::a_newly_opened_tab_starts_on_the_default_board_sub_tab
+    - detail_substate_2285::switching_back_to_a_tab_restores_that_tabs_own_sub_tab
+    - detail_substate_2285::scrolling_one_tabs_issue_body_leaves_the_other_tabs_position_alone
+    - detail_substate_2285::closing_a_tab_discards_its_sub_state_and_reopening_starts_from_the_defaults
+    - detail_substate_2285::terminal_sub_tab_selection_follows_its_own_tab
 
 # ═══════════════════════════════════════════════════════════════════════════
 # FOR THE COORDINATOR — three findings from authoring this slice. None of them
@@ -382,3 +434,75 @@ expected_red:
 # and #201–#203 the tracked `coord` one: the Board sidebar lists all six (it
 # does not filter by label) while the Pipeline lists only the 200s, which is
 # what makes the mocks' 100s/200s ranges disjoint in a single seeded board.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FOR THE COORDINATOR — findings from authoring the #2285 slice (contract §5).
+# Independent of the #2282 / #2283 / #2284 notes above; again, none is a
+# worker's to fix by editing this suite, and none was resolved by editing the
+# contract (a test-author may not amend one).
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# 10. §5's `driver.screen_contains("[Issue]")` / `[Board]` clauses are NOT
+#     assertable — same root cause as finding 1, restated because §5 depends
+#     on it far more heavily than §2a did. The shipped Board sub-tab bar
+#     renders ` Board  Issue  Board Chat  Terminal ` and marks the active tab
+#     with colour + modifiers only (quadraui's `draw_tab_bar`); there is no
+#     bracket anywhere in that row, and the third tab is `Board Chat`, not
+#     `Chat`. Asserting `[Issue]` literally would make #2285's worker restyle
+#     a bar §2c itself says "pre-dates this milestone" — i.e. it would turn a
+#     mock artifact into a work item. This slice reads the ACTIVE SUB-TAB OFF
+#     ITS CONTENT instead: `Issue` ⇔ that tab's issue-body lines are on
+#     screen, `Board` ⇔ `PIPELINE STAGES` is and no body line is, `Terminal`
+#     ⇔ the terminal pane's placeholder is. That is strictly stronger than
+#     the bracket check (it proves the PANE switched, not just the bar) and it
+#     is what a shared-sub-state regression actually looks like on screen.
+#     If the bracket convention was meant as a requirement rather than a mock
+#     artifact, it needs a contract amendment naming which issue owns it.
+#
+# 11. The fixture needed issue BODIES, which contract §7's fixture JSON does
+#     not carry. §5 bullet 2 is about scroll position inside the Issue
+#     sub-tab, and §7's five issues have no `body`, so their Issue sub-tab
+#     renders an unscrollable placeholder. This slice therefore extends §7's
+#     set (same five numbers, same verbatim titles) with a 40-line
+#     line-numbered body on #101/#102/#103 — `BBB-line-01…40` for #102 and so
+#     on — which makes both "whose body is this" and "where is it scrolled
+#     to" readable straight off the grid. `make_app_with_board_json` (#2281)
+#     accepts `body` already, so no seam change is needed; flagging only
+#     because §7 says the fixture "must be able to produce" the listed set and
+#     a future author of §6's persistence slice will want bodies too.
+#
+# 12. §5 bullet 4's "keeps running" half is asserted by NOBODY in this suite,
+#     and cannot be from a `TuiDriver`. Detail terminal sessions are spawned
+#     and polled by `drive_detail_terminals`, which the app calls from
+#     `tick()`; `quadraui::tui::testing::TuiDriver` at the pinned rev exposes
+#     `render`, `dispatch` and input helpers but no tick pump, so no PTY is
+#     ever spawned in the sealed suite (the Terminal sub-tab sits on its
+#     `Starting shell session…` placeholder — which is, usefully, a stable
+#     "this tab is on Terminal" marker). Contract Note 6 already concedes a
+#     screen grid cannot show a background session staying alive, but it does
+#     not name a substitute observable. `terminal_sub_tab_selection_follows_
+#     its_own_tab` asserts the half that IS observable and that a shared-
+#     sub-state implementation gets wrong (the Terminal sub-tab is owned by
+#     the tab that opened it). Verifying that `detail_terminal_sessions` is
+#     torn down on tab CLOSE and not on tab SWITCH needs either a driver tick
+#     hook (a quadraui ask) or an in-crate `#[cfg(test)]` unit test in
+#     `tui/src/app/terminal.rs` — worth asking #2285's worker for the latter,
+#     since this suite structurally cannot cover it.
+#
+# 13. The per-tab EXPANDED/FOCUSED STAGE is not covered by any test. The issue
+#     body's Design section moves "the focused/expanded-stage selection" onto
+#     the document, but contract §5 — the sealed statement of this issue's
+#     black-box surface — never mentions it, and stage expansion lives on the
+#     Pipeline Overview sub-tab, which this external test crate cannot drive
+#     at all while finding 7's fixture-wipe blocker stands. Inventing an
+#     observable for it would have meant inventing behaviour. If it is meant
+#     to be gated by acceptance, §5 needs a clause and finding 7 needs fixing
+#     first.
+#
+# Also worth knowing, not a contract problem: scrolling is driven with
+# `UiEvent::Scroll` over the main panel (one notch = one line on the Board
+# detail pane, measured), not with `j`/`k` — bare `j`/`k` reach the detail
+# pane only after `Ctrl-W` moves focus off the sidebar, an unrelated surface.
+# And this slice deliberately does NOT assert the sub-tab-switch scroll reset
+# the app performs today (`detail_scroll = 0` on a sub-tab click): no clause
+# pins it either way, so pinning it could force a wrong implementation.
