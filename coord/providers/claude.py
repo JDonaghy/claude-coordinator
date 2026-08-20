@@ -118,6 +118,7 @@ class ClaudeProvider(Provider):
             WORKER_PLAN_PROMPT,
             WORKER_SYSTEM_PROMPT,
             _base_checkout_write_guard_tools,
+            _claude_md_system_prompt_suffix,
             _sealed_write_guard_tools,
             build_deny_prompt,
         )
@@ -142,6 +143,10 @@ class ClaudeProvider(Provider):
         if system_prompt is None or allowed_tools is None:
             if spec.type == "plan":
                 _sp = spec.system_prompt if spec.system_prompt else WORKER_PLAN_PROMPT
+                # #2462: keep in sync with default_worker_command's identical
+                # branch — `--bare` below drops CLAUDE.md auto-discovery, so a
+                # plan leg needs the target repo's conventions embedded here.
+                _sp += _claude_md_system_prompt_suffix(spec.repo_path)
                 _at = "Read,Bash"
             elif spec.type == "refinement":
                 _sp = spec.system_prompt if spec.system_prompt else REFINEMENT_SYSTEM_PROMPT
@@ -172,6 +177,9 @@ class ClaudeProvider(Provider):
             elif spec.type == "mock-author":
                 _sp = spec.system_prompt if spec.system_prompt else MOCK_AUTHOR_SYSTEM_PROMPT
                 _sp += build_deny_prompt(MOCK_AUTHOR_DENY_COMMANDS)
+                # #2462: keep in sync with default_worker_command — `--bare`
+                # drops CLAUDE.md auto-discovery.
+                _sp += _claude_md_system_prompt_suffix(spec.repo_path)
                 _at = "Read,Edit,Write,Bash"
             elif spec.type == "smoke":
                 # #2301: keep in sync with default_worker_command's identical
@@ -196,6 +204,12 @@ class ClaudeProvider(Provider):
             else:
                 _sp = spec.system_prompt if spec.system_prompt else WORKER_SYSTEM_PROMPT
                 _sp += build_deny_prompt(spec.deny_commands)
+                # #2462: keep in sync with default_worker_command's identical
+                # catch-all branch — it covers "work", "fix", "conflict-fix"
+                # and "test-author", every one of which edits code and needs
+                # the target repo's CLAUDE.md conventions, which `--bare`
+                # below stops Claude Code from auto-discovering.
+                _sp += _claude_md_system_prompt_suffix(spec.repo_path)
                 # #2169: keep in sync with default_worker_command's identical
                 # branch — Monitor is the sanctioned bounded-poll tool for a
                 # backgrounded long-running command. #2301: this grant is for

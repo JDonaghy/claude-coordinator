@@ -187,6 +187,91 @@ def test_parity_custom_system_prompt() -> None:
     _parity(spec)
 
 
+# ── #2462: CLAUDE.md embed parity (--bare kills auto-discovery) ──────────────
+#
+# The parity helper above uses repo_path="/some/path", which does not exist —
+# so `_claude_md_system_prompt_suffix` returns "" on BOTH sides and the parity
+# assertion cannot see a divergence in the CLAUDE.md embed. These cases point
+# the spec at a tmp_path that really contains a CLAUDE.md, so the embed is
+# non-empty and parity is actually load-bearing for it. The direct
+# `build_command` assertions below then pin the provider seam itself — the
+# path production dispatch really takes (coord/commands/dispatch_workers.py
+# and friends call provider.build_command(), never default_worker_command) —
+# so "both sides dropped the embed" fails too, not just "they diverged".
+
+
+def _claude_md_repo(tmp_path: Path, body: str) -> Path:
+    (tmp_path / "CLAUDE.md").write_text(body)
+    return tmp_path
+
+
+def test_parity_work_type_with_real_claude_md(tmp_path: Path) -> None:
+    """Work leg: identical argv when the repo really has a CLAUDE.md."""
+    repo = _claude_md_repo(tmp_path, "# Project rules\n\nAlways use tabs.\n")
+    _parity(_make_spec(type="work", repo_path=str(repo)))
+
+
+def test_parity_plan_type_with_real_claude_md(tmp_path: Path) -> None:
+    """Plan leg: identical argv when the repo really has a CLAUDE.md."""
+    repo = _claude_md_repo(tmp_path, "# Project rules\n\nNo emoji.\n")
+    _parity(_make_spec(type="plan", repo_path=str(repo)))
+
+
+def test_parity_mock_author_type_with_real_claude_md(tmp_path: Path) -> None:
+    """Mock-author leg: identical argv when the repo really has a CLAUDE.md."""
+    repo = _claude_md_repo(tmp_path, "# Project rules\n\nGate A first.\n")
+    _parity(_make_spec(type="mock-author", repo_path=str(repo)))
+
+
+def test_parity_fix_type_with_real_claude_md(tmp_path: Path) -> None:
+    """Fix leg (catch-all branch, same as work/conflict-fix/test-author)."""
+    repo = _claude_md_repo(tmp_path, "# Project rules\n\nRun ruff.\n")
+    _parity(_make_spec(type="fix", repo_path=str(repo)))
+
+
+@pytest.mark.parametrize(
+    ("spec_type", "rule"),
+    [
+        ("work", "Always use tabs."),
+        ("fix", "Run ruff."),
+        ("conflict-fix", "Rebase, never merge."),
+        ("test-author", "Black-box tests only."),
+        ("plan", "No emoji."),
+        ("mock-author", "Gate A first."),
+    ],
+)
+def test_build_command_embeds_claude_md_for_work_shaped_types(
+    tmp_path: Path, spec_type: str, rule: str
+) -> None:
+    """#2462: the provider seam — the path real dispatch takes — must embed
+    the target repo's CLAUDE.md into --system-prompt for every work-shaped
+    leg, since `--bare` disables Claude Code's own auto-discovery of it."""
+    repo = _claude_md_repo(tmp_path, f"# Project rules\n\n{rule}\n")
+    argv = ClaudeProvider().build_command(_make_spec(type=spec_type, repo_path=str(repo)))
+    assert "--bare" in argv
+    system_prompt = argv[argv.index("--system-prompt") + 1]
+    assert rule in system_prompt
+    assert "Project rules (from CLAUDE.md)" in system_prompt
+
+
+def test_build_command_no_claude_md_is_a_noop(tmp_path: Path) -> None:
+    """A repo with no CLAUDE.md must not inject an empty section header."""
+    argv = ClaudeProvider().build_command(_make_spec(type="work", repo_path=str(tmp_path)))
+    system_prompt = argv[argv.index("--system-prompt") + 1]
+    assert "Project rules (from CLAUDE.md)" not in system_prompt
+
+
+def test_build_command_system_prompt_override_wins_over_claude_md(tmp_path: Path) -> None:
+    """An explicit system_prompt kwarg is used verbatim — the CLAUDE.md embed
+    is part of the *computed* prompt only, matching default_worker_command's
+    behaviour when a caller supplies its own prompt."""
+    repo = _claude_md_repo(tmp_path, "# Project rules\n\nAlways use tabs.\n")
+    argv = ClaudeProvider().build_command(
+        _make_spec(type="work", repo_path=str(repo)), system_prompt="Custom."
+    )
+    assert argv[argv.index("--system-prompt") + 1] == "Custom."
+
+
 def test_resolved_model_overrides_spec_model() -> None:
     """resolved_model takes precedence over spec.model."""
     spec = _make_spec(type="work", model="sonnet")
