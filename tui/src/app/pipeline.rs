@@ -1099,30 +1099,18 @@ impl CoordApp {
     /// nested row (see `locate_pipeline_selection`).  Falls back to the
     /// `pipeline_sel` mapping when the path can't be decoded.
     pub(crate) fn capture_pipeline_selection_id(&self) -> Option<(String, u64)> {
-        // #2452: when a Pipeline document tab is open, it — not whatever the
-        // tree currently highlights — is the durable selection intent.
-        // `rebuild_pipeline_sidebar` now leaves the tree with an EXPLICIT
-        // no-selection state (and `pipeline_sel = None`) the moment the
-        // active tab's row is hidden by `pipeline_search`. A capture that
-        // read `pipeline_sel` at that point would return `None` too — which
-        // would make the very next rebuild treat this as "no target was
-        // ever requested" and let its default-select-first-row block snap
-        // onto some other, unrelated issue (see acceptance test coverage
-        // for the multi-keystroke typing case: each further keystroke's
-        // `rebuild_pipeline_sidebar(None)` call must keep re-attempting to
-        // locate THIS SAME target, not silently drop it after the first
-        // keystroke that hides it). Anchoring on the active tab instead of
-        // `pipeline_sel` makes the no-selection state stick for as long as
-        // the tab stays hidden by the filter, exactly like Board's own
-        // `board_detail_issue_group` already anchors the Board detail pane
-        // on the active tab rather than the tree cursor.
-        if let Some(key) = self.pipeline_doc_active_key() {
-            return Some(key.clone());
-        }
         // `pipeline_sel` is authoritative and stays in sync with the tree path
         // in production (both derive from `selected_pipeline_index`). Use it
         // first — this preserves the established behaviour for every ordinary
-        // (top-level, or tracked-nested) selection.
+        // (top-level, or tracked-nested) selection, and — critically — takes
+        // priority over any active Pipeline document tab. A doc tab merely
+        // being open elsewhere must never outrank an actual, deliberate tree
+        // selection (see #1197/#1199: selecting an untracked nested
+        // epic-child row is a legitimate choice that leaves `pipeline_sel`
+        // `None` on purpose; a doc-tab-first check here would silently
+        // redirect the next rebuild's restore — and therefore every
+        // detail-pane render and per-issue action keyed off `pipeline_sel`
+        // — onto the tab's issue instead of the row actually highlighted).
         if let Some(id) = self
             .pipeline_sel
             .and_then(|i| self.pipeline_issues.get(i))
@@ -1137,7 +1125,27 @@ impl CoordApp {
         // Recover its own `(epic_repo_slug, child_number)` from the tree path
         // so `rebuild_pipeline_sidebar` can keep the child selected on the
         // next refresh instead of snapping to the epic parent.
-        self.selected_nested_child_id()
+        if let Some(id) = self.selected_nested_child_id() {
+            return Some(id);
+        }
+        // #2452: only once the tree genuinely has NO selection of its own
+        // (neither `pipeline_sel` nor a nested untracked child resolved)
+        // does an active Pipeline document tab become the fallback "durable
+        // selection intent". `rebuild_pipeline_sidebar` leaves the tree in
+        // exactly this state the moment the active tab's row is hidden by
+        // `pipeline_search` (an explicit no-selection, not a stale one — see
+        // its target-restore block). Without this fallback, the very next
+        // `rebuild_pipeline_sidebar(None)` call — fired by something as
+        // unrelated as the next filter keystroke, a collapse toggle, or the
+        // periodic refresh — would treat that as "no target was ever
+        // requested" and let the default-select-first-row block snap onto
+        // some other, unrelated issue (see the multi-keystroke acceptance
+        // coverage: each further keystroke must keep re-attempting to
+        // locate THIS SAME target, not silently drop it after the first
+        // keystroke that hides it). This mirrors Board's own
+        // `board_detail_issue_group`, which likewise only falls back to the
+        // active tab once the tree-cursor lookup comes up empty.
+        self.pipeline_doc_active_key().cloned()
     }
 
     /// Resolve the sidebar's current selection to a nested epic-child's own
@@ -5511,25 +5519,36 @@ impl CoordApp {
         }
         // Sync `pipeline_sel` to the sidebar's actual selection.
         self.pipeline_sel = self.selected_pipeline_index();
-        // #2452: when a Pipeline document tab is active, the detail pane
-        // always follows IT, never the tree cursor — the same principle
-        // Board's `board_detail_issue_group` already applies. Without this,
-        // a search filter that hides the active tab's row (the case just
-        // handled above) would blank the detail pane on every keystroke even
-        // though the tab strip still shows that document open; every
-        // interactive tree-selection path keeps `pipeline_sel` and the
-        // active doc tab in lockstep anyway (`events.rs`'s `RowSelected`
-        // arm opens/activates a preview tab for whatever row selection just
-        // resolved to), so this is a no-op whenever the row IS visible —
-        // it only fires the moment those two disagree, i.e. exactly the
-        // filtered-out case.
-        if let Some((repo, num)) = self.pipeline_doc_active_key().cloned() {
-            if let Some(idx) = self
-                .pipeline_issues
-                .iter()
-                .position(|pi| pi.repo_slug == repo && pi.number == num)
-            {
-                self.pipeline_sel = Some(idx);
+        // #2452: when a Pipeline document tab is active AND the tree above
+        // failed to resolve ANY selection of its own — neither a tracked
+        // `pipeline_sel` nor an untracked nested epic-child
+        // (`selected_nested_child_id`, #1197/#1199) — fall back to the
+        // active tab's issue so the detail pane still follows it, the same
+        // principle Board's `board_detail_issue_group` applies. This is the
+        // filtered-out case the restore block above just handled by
+        // explicitly clearing the tree's selection: without this fallback a
+        // search filter hiding the active tab's row would blank the detail
+        // pane even though the tab strip still shows that document open.
+        //
+        // This must NOT fire whenever a doc tab merely happens to be open
+        // elsewhere while the tree DOES have its own resolved selection —
+        // unlike Board, which keeps two separate accessors for the
+        // action-target (`board_selected_issue_group`) vs. the
+        // render-target (`board_detail_issue_group`, see mod.rs:7067-7087),
+        // Pipeline's `pipeline_sel` alone drives both the detail pane AND
+        // every per-issue keybind/context-menu action. Overwriting it
+        // unconditionally would silently redirect actions away from a
+        // deliberately-selected untracked nested child onto the doc tab's
+        // issue instead, the instant any doc tab happened to be open.
+        if self.pipeline_sel.is_none() && self.selected_nested_child_id().is_none() {
+            if let Some((repo, num)) = self.pipeline_doc_active_key().cloned() {
+                if let Some(idx) = self
+                    .pipeline_issues
+                    .iter()
+                    .position(|pi| pi.repo_slug == repo && pi.number == num)
+                {
+                    self.pipeline_sel = Some(idx);
+                }
             }
         }
         // Restore per-section collapse state by state key.  New sections

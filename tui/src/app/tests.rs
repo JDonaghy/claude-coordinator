@@ -22804,6 +22804,125 @@
         assert_ne!(app.pipeline_sel, Some(epic_idx), "must not snap to the epic parent");
     }
 
+    /// Review fix (blocking finding, iteration 1): `capture_pipeline_
+    /// selection_id` and `rebuild_pipeline_sidebar`'s tail sync block used
+    /// to give an open Pipeline document tab priority over the tree's ACTUAL
+    /// selection unconditionally — not just for the "target hidden by
+    /// filter" case #2452 was meant to fix. That reintroduced the
+    /// #1197/#1199 regression for untracked nested epic-child rows:
+    /// selecting such a row deliberately leaves `pipeline_sel = None` (the
+    /// row stays visually selected, detail pane shows the "no issue"
+    /// placeholder), but the moment ANY Pipeline doc tab was open elsewhere,
+    /// capture would silently return the tab's issue instead of the child's,
+    /// and the tail block would force `pipeline_sel` onto the tab's issue —
+    /// even though the highlighted row is the untracked child, not the tab.
+    /// `pipeline_sel` drives both the detail pane AND every per-issue
+    /// action, so this would silently redirect actions at the wrong issue.
+    #[test]
+    fn open_doc_tab_elsewhere_does_not_outrank_a_selected_untracked_nested_child() {
+        let data = BoardData {
+            pipeline_tracked_labels: vec!["coord".to_string()],
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            open_issues: vec![
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 100,
+                    title: "Epic tracker".to_string(),
+                    body: String::new(),
+                    state: "open".to_string(),
+                    labels: vec!["coord".to_string(), "epic".to_string()],
+                    milestone_number: None,
+                    milestone_title: None,
+                },
+                // Untracked child — forced out of `pipeline_issues` below
+                // (the only production cause of `resolve_nested_child_index`
+                // returning `None`; see its doc comment).
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 102,
+                    title: "Untracked child".to_string(),
+                    body: String::new(),
+                    state: "open".to_string(),
+                    labels: vec![],
+                    milestone_number: None,
+                    milestone_title: None,
+                },
+                // A totally unrelated tracked issue — its Pipeline doc tab
+                // is the one that must NOT outrank the child selection below.
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 200,
+                    title: "Unrelated issue".to_string(),
+                    body: String::new(),
+                    state: "open".to_string(),
+                    labels: vec!["coord".to_string()],
+                    milestone_number: None,
+                    milestone_title: None,
+                },
+            ],
+            epic_children: vec![EpicChildren {
+                repo_name: "api".to_string(),
+                tracking_issue: 100,
+                children: vec![EpicChild { number: 102, state: "open".to_string() }],
+            }],
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+        app.pipeline_issues = app.pipeline_issues_from_cache();
+        // Force #102 out of `pipeline_issues` — simulating a child that
+        // isn't independently tracked (nesting itself still comes from
+        // `self.data.epic_children`, unaffected by this).
+        app.pipeline_issues.retain(|i| i.number != 102);
+        app.rebuild_pipeline_sidebar(None);
+
+        // Open a Pipeline doc tab for the unrelated issue #200.
+        app.open_pipeline_doc_tab(("acme/api".to_string(), 200), true);
+
+        // Now select the untracked nested child row (#102) — a deliberate,
+        // legitimate action unrelated to the open doc tab.
+        let (section, path, sel) = app
+            .locate_pipeline_selection("acme/api", 102)
+            .expect("the nested child row is still rendered for display");
+        assert_eq!(sel, None, "precondition: #102 isn't independently tracked");
+        app.pipeline_sidebar.set_active_section(Some(section));
+        app.pipeline_sidebar.set_selected_path(section, Some(path));
+        app.pipeline_sel = app.selected_pipeline_index();
+        assert_eq!(
+            app.pipeline_sel, None,
+            "sanity: pipeline_sel is None for the untracked child, even \
+             though its row is visually selected"
+        );
+
+        // Fix: capture must return the CHILD's own id — the tree's actual
+        // selection — never the unrelated open doc tab's.
+        let captured = app.capture_pipeline_selection_id();
+        assert_eq!(
+            captured,
+            Some(("acme/api".to_string(), 102)),
+            "fix: a deliberately-selected untracked nested child must win \
+             over an unrelated open doc tab, got {captured:?}"
+        );
+
+        // And a subsequent rebuild triggered by something unrelated to the
+        // child selection (e.g. the periodic refresh, or a filter keystroke
+        // in a totally different section) must not silently snap
+        // `pipeline_sel` onto the doc tab's issue (#200's index).
+        app.rebuild_pipeline_sidebar(captured);
+        assert_eq!(
+            app.pipeline_sel, None,
+            "fix: pipeline_sel must stay following the untracked child \
+             (None) — not snapped onto the unrelated open doc tab #200"
+        );
+        let section = app
+            .pipeline_sidebar
+            .active_section()
+            .expect("a state section is still active");
+        assert!(
+            app.pipeline_sidebar.selected_path(section).is_some(),
+            "the nested child row itself stays visually selected"
+        );
+    }
+
     /// #1281 supersedes the pre-#1281 #1199 concern for aged-out children:
     /// a child ABSENT from `open_issues` (aged out of the sync cache, the
     /// #1031/#1032/#1033 shape) is presumed closed by
@@ -50113,6 +50232,78 @@ Milestone tracking issue.
             "#2452 regression: unchanged — Board's default never \
              force-selects a row; only an explicit `select_issue`/reveal \
              call does that"
+        );
+    }
+
+    /// Review fix (blocking finding, iteration 1): `select_issue`'s
+    /// not-found fallback used to clear whatever section `active_section()`
+    /// happened to point at, rather than the TARGET repo's own section.
+    /// Board's sidebar is a multi-repo accordion where every repo section
+    /// keeps its own selection independent of keyboard focus, so on a
+    /// multi-repo board this both (1) left the sidebar focused on whatever
+    /// repo was browsed before instead of switching to the tab's own repo,
+    /// and (2) wiped out that unrelated, still-valid selection instead of
+    /// leaving it alone. `DOC_TAB_BOARD_JSON`-based tests can't catch this —
+    /// same repo, so target-section == active-section by construction; this
+    /// uses `DOC_TAB_TWO_REPO_JSON` to actually put two different repos in
+    /// play.
+    #[test]
+    fn activating_a_board_doc_tab_for_a_different_repo_moves_focus_and_preserves_the_other_repos_selection()
+    {
+        let mut app = doc_tab_app(DOC_TAB_TWO_REPO_JSON);
+        // Repo A (claude-coordinator, #101) starts browsed with a valid
+        // selection — simulating the user actively looking at it.
+        app.select_issue("claude-coordinator", 101);
+        assert_eq!(
+            app.board_selected_issue(),
+            Some(("claude-coordinator".to_string(), 101)),
+            "precondition: repo A's section is focused with a valid selection"
+        );
+
+        // Matches #101 ("Fix login race timeout") only — #7 ("Portal login
+        // redirect"), repo B's only issue, is filtered out. Repo A's own
+        // selection must stay valid throughout.
+        app.board_search.set_value("race");
+        app.rebuild_board_sidebar();
+        assert_eq!(
+            app.board_selected_issue(),
+            Some(("claude-coordinator".to_string(), 101)),
+            "sanity: the filter doesn't disturb repo A's own matching selection"
+        );
+
+        // Activate a Board doc tab for repo B's #7 while repo A's section is
+        // still the one with keyboard focus — exactly the cross-repo
+        // scenario `reveal_board_active_doc` hits after its own preceding
+        // `rebuild_board_sidebar` pass restores repo A's selection.
+        app.open_board_doc_tab(("coord-portal".to_string(), 7), true);
+
+        let offset = app.board_repo_offset();
+        let b_idx = app
+            .board_repo_names
+            .iter()
+            .position(|r| r == "coord-portal")
+            .expect("coord-portal has a section");
+        let a_idx = app
+            .board_repo_names
+            .iter()
+            .position(|r| r == "claude-coordinator")
+            .expect("claude-coordinator has a section");
+
+        assert_eq!(
+            app.board_sidebar.active_section(),
+            Some(b_idx + offset),
+            "fix: reveal must move keyboard focus to the target repo B's \
+             OWN section, not leave repo A's section focused"
+        );
+        assert!(
+            app.board_sidebar.selected_path(b_idx + offset).is_none(),
+            "fix: repo B's section shows no selection since #7 is filtered out"
+        );
+        assert!(
+            app.board_sidebar.selected_path(a_idx + offset).is_some(),
+            "fix: repo A's still-valid selection must survive a doc-tab \
+             reveal for an unrelated repo B — the not-found fallback must \
+             never clear a section other than the target's own"
         );
     }
 
