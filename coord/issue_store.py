@@ -1359,7 +1359,7 @@ def _post_result_local(record: ResultRecord) -> StoreOutcome:
         # pre-#1956 row.
         _persist_verdict_source(record)
     # #603: a request-changes verdict is durable context for EVERY future agent
-    # on the issue — record a short note in the per-issue digest (local writer;
+    # on the issue — record a note in the per-issue digest (local writer;
     # daemon-side on a thin client, so use the _local variant).
     #
     # #650: only when the findings write actually landed. When the clobber
@@ -1368,18 +1368,36 @@ def _post_result_local(record: ResultRecord) -> StoreOutcome:
     # for — adding another one was the second half of the #650 incident.
     if record.verdict == VERDICT_REQUEST_CHANGES and findings_written:
         try:
+            from coord.review import extract_blocking_section  # noqa: PLC0415
             from coord.state import _add_issue_context_entry_local  # noqa: PLC0415
 
-            summary = (record.findings_body or record.summary or "").strip()
-            if summary:
-                if len(summary) > 240:
-                    summary = summary[:240].rstrip() + "…"
+            findings_body = (record.findings_body or "").strip()
+            # #2466: carry the "## Blocking findings" section forward
+            # verbatim — a re-review round with more than one blocking
+            # finding used to lose everything past the first sentence to a
+            # blind body[:240] truncation, so later rounds silently stopped
+            # tracking all but the first-reported finding. Fall back to the
+            # old truncated-summary shape only when the body has no
+            # recognisable blocking heading (e.g. a short-form verdict).
+            blocking = extract_blocking_section(findings_body) if findings_body else ""
+            if blocking:
                 _add_issue_context_entry_local(
                     record.repo_name,
                     record.issue_number,
-                    f"Review requested changes: {summary}",
+                    f"Review requested changes — blocking findings:\n{blocking}",
                     source="review",
                 )
+            else:
+                summary = (findings_body or record.summary or "").strip()
+                if summary:
+                    if len(summary) > 240:
+                        summary = summary[:240].rstrip() + "…"
+                    _add_issue_context_entry_local(
+                        record.repo_name,
+                        record.issue_number,
+                        f"Review requested changes: {summary}",
+                        source="review",
+                    )
         except Exception:  # noqa: BLE001 — best-effort
             pass
     return StoreOutcome(
