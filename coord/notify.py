@@ -884,7 +884,11 @@ def detect_stalled_pipeline(
             elif (
                 matching_entry.state == CONFLICT
                 and classify_conflict(matching_entry.error) == "rebaseable"
-                and not has_prior_conflict_fix(board, matching_entry.assignment_id)
+                and not has_prior_conflict_fix(
+                    board,
+                    matching_entry.assignment_id,
+                    current_error=matching_entry.error,
+                )
             ):
                 # #1478: a rebaseable CONFLICT with no active/failed
                 # conflict-fix attempt — the #1474 classify-and-dispatch step
@@ -1412,7 +1416,9 @@ def dispatch_stalled_pipeline_action(
             return StalledDispatchAction(
                 kind="no_action", detail="merge queue entry no longer found",
             )
-        if has_prior_conflict_fix(board, entry.assignment_id):
+        if has_prior_conflict_fix(
+            board, entry.assignment_id, current_error=entry.error,
+        ):
             return StalledDispatchAction(
                 kind="skipped_human_required",
                 detail="conflict-fix already active or its retry cap was already hit",

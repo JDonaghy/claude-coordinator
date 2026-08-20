@@ -456,7 +456,9 @@ def _dispatch_conflict_fixes(events, config, *, dry_run: bool) -> None:
             # failed for this entry in this session, don't loop — mark
             # HUMAN_REQUIRED so the user takes over.  A successful
             # prior fix does not trigger this guard (#784).
-            if has_prior_conflict_fix(fix_board, ev.entry.assignment_id):
+            if has_prior_conflict_fix(
+                fix_board, ev.entry.assignment_id, current_error=ev.entry.error,
+            ):
                 ev.entry.state = HUMAN_REQUIRED
                 click.echo(
                     f"  {ev.entry.repo_name} #{ev.entry.issue_number}: "
