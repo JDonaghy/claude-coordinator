@@ -21,11 +21,13 @@ from coord.state import save_board
 def _no_spa_dist(monkeypatch: pytest.MonkeyPatch) -> None:
     """Force the legacy dashboard in every test in this module.
 
-    server.py activates SPA serving at ``/`` when
-    ``coord/dashboard/webapp/dist/`` exists (created by ``npm run build``).
-    Without this patch, tests that assert on legacy dashboard HTML fail
-    after the React app has been built because GET ``/`` returns the SPA
-    shell (``<div id='root'>``) instead of the legacy ``index.html``.
+    server.py activates SPA serving at ``/`` when the resolved bundle dir
+    has an ``index.html``. Without this patch, tests that assert on legacy
+    dashboard HTML would fail on any machine that happens to have one, and
+    since #2009 the default is ``~/coord-web-dist`` — a path the daemon host
+    really does have — so this isolation is now load-bearing on the very
+    machines most likely to run the suite, not just on a dev box that had
+    run ``npm run build``.
 
     The server logic is correct — the test suite just needs isolation from
     the real filesystem state.
@@ -2271,14 +2273,160 @@ class TestSPAServing:
         assert "coord" in mf.text
 
     def test_falls_back_to_legacy_dashboard_when_no_dist(self) -> None:
-        """When webapp/dist/ is absent, the legacy index.html is served unchanged."""
-        # WEBAPP_DIST points to a non-existent path by default in tests
-        # (the real dist/ is gitignored and not committed).
+        """With no bundle, the legacy dashboard is still fully served."""
+        # WEBAPP_DIST is patched to a non-existent path by the autouse
+        # fixture at the top of this module.
         client = _client()
         r = client.get("/")
         assert r.status_code == 200
         # The legacy dashboard always contains "coord dashboard" in its markup.
         assert "coord dashboard" in r.text
+
+
+class TestWebappBundleMissingSignal:
+    """#2009: "no bundle" must never be a silent 200.
+
+    Before the split, an absent bundle meant "you didn't run ``npm run
+    build``" — a dev-only state, and the wheel shipped one anyway. Now the
+    bundle arrives on a timer from a different repo (``coord-web``), so an
+    absent bundle means a *delivery lane is broken*, and the old behaviour —
+    serve the legacy single-file dashboard, 200, no signal anywhere —
+    renders a broken lane as a working page. That is the same
+    silent-staleness class as the ``~/.coord-cli-venv`` incident.
+
+    Three independent signals are asserted below, one per audience: a
+    journal line for an unattended host, a banner for whoever is looking at
+    the page, and a response header for anything scripted.
+    """
+
+    def _make_dist(self, tmp_path: Path) -> Path:
+        dist = tmp_path / "dist"
+        dist.mkdir()
+        (dist / "index.html").write_text("<html><title>real bundle</title></html>")
+        return dist
+
+    def test_default_dist_is_not_a_path_inside_the_installed_package(self) -> None:
+        """The packaged ``coord/dashboard/webapp/dist`` is GONE (#2009).
+
+        Pointing the default back inside the package would guarantee a
+        permanent miss with nothing an operator could do to fix it, since
+        neither this repo nor the wheel contains that directory any more.
+        """
+        from coord.dashboard.server import DASHBOARD_DIR, DEFAULT_WEBAPP_DIST
+
+        assert DEFAULT_WEBAPP_DIST == "~/coord-web-dist"
+        resolved = Path(DEFAULT_WEBAPP_DIST).expanduser().resolve()
+        assert not str(resolved).startswith(str(DASHBOARD_DIR.resolve())), (
+            f"default bundle path {resolved} is inside the installed package "
+            "— the vendored webapp bundle was removed in #2009"
+        )
+        assert not (DASHBOARD_DIR / "webapp").exists(), (
+            "coord/dashboard/webapp/ is back in this repo — it belongs to "
+            "the coord-web repo (#2009, epic #2002)"
+        )
+
+    def test_default_matches_the_path_the_health_check_grades(self) -> None:
+        """The server and ``coord release verify``'s ``webapp_bundle`` lane
+        must agree on where the bundle lives, or the fleet grades staleness
+        on a directory nothing is serving."""
+        from coord.dashboard.server import DEFAULT_WEBAPP_DIST
+        from coord.health.checks.deploy_lane_facts import _DEFAULT_WEBAPP_DIST
+
+        assert DEFAULT_WEBAPP_DIST == _DEFAULT_WEBAPP_DIST
+
+    def test_missing_bundle_sets_the_missing_header(self) -> None:
+        from coord.dashboard.server import WEBAPP_BUNDLE_HEADER, WEBAPP_BUNDLE_MISSING
+
+        r = _client().get("/")
+        assert r.status_code == 200
+        assert r.headers[WEBAPP_BUNDLE_HEADER] == WEBAPP_BUNDLE_MISSING
+
+    def test_missing_bundle_renders_an_in_page_banner(self) -> None:
+        r = _client().get("/")
+        assert 'id="coord-webapp-bundle-missing"' in r.text
+        assert "coord-web" in r.text
+        # ...without cannibalising the legacy dashboard it is annotating.
+        assert "coord dashboard" in r.text
+
+    def test_missing_bundle_logs_a_warning_at_startup(self, caplog) -> None:
+        """The unattended-host signal: a host whose bundle lane died says so
+        in ``journalctl --user -u coord-web`` with nobody watching."""
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="coord.dashboard.server"):
+            build_app(_config())
+        assert any(
+            "no coord-web bundle" in record.getMessage() for record in caplog.records
+        ), [r.getMessage() for r in caplog.records]
+
+    def test_present_bundle_names_itself_in_the_header_and_skips_the_banner(
+        self, tmp_path: Path
+    ) -> None:
+        """The contrast case — a working bundle must stay completely clean."""
+        from coord.dashboard.server import WEBAPP_BUNDLE_HEADER
+
+        dist = self._make_dist(tmp_path)
+        with patch("coord.dashboard.server.WEBAPP_DIST", dist):
+            r = TestClient(build_app(_config())).get("/")
+        assert r.status_code == 200
+        assert r.headers[WEBAPP_BUNDLE_HEADER] == str(dist)
+        assert "real bundle" in r.text
+        assert "coord-webapp-bundle-missing" not in r.text
+
+    def test_present_bundle_logs_no_warning(self, tmp_path: Path, caplog) -> None:
+        import logging
+
+        dist = self._make_dist(tmp_path)
+        with caplog.at_level(logging.WARNING, logger="coord.dashboard.server"):
+            with patch("coord.dashboard.server.WEBAPP_DIST", dist):
+                build_app(_config())
+        assert not [
+            r for r in caplog.records if "no coord-web bundle" in r.getMessage()
+        ]
+
+    def test_bundle_appearing_later_is_picked_up_without_a_restart(
+        self, tmp_path: Path
+    ) -> None:
+        """``coord-web-dist-build.sh`` repoints the live symlink under a
+        long-running ``coord web`` (#1543 — no restart on publish). The
+        #2009 signalling must not freeze the answer at build time and keep
+        insisting a bundle is missing after one arrives."""
+        from coord.dashboard.server import WEBAPP_BUNDLE_HEADER, WEBAPP_BUNDLE_MISSING
+
+        dist = tmp_path / "dist"
+        dist.mkdir()  # exists but empty — no index.html yet
+        with patch("coord.dashboard.server.WEBAPP_DIST", dist):
+            client = TestClient(build_app(_config()))
+            before = client.get("/")
+            (dist / "index.html").write_text("<html><title>arrived</title></html>")
+            after = client.get("/")
+        assert before.headers[WEBAPP_BUNDLE_HEADER] == WEBAPP_BUNDLE_MISSING
+        assert after.headers[WEBAPP_BUNDLE_HEADER] == str(dist)
+        assert "arrived" in after.text
+
+    def test_cli_warns_with_no_dist_flag_at_all(
+        self, tmp_path: Path, coord_db
+    ) -> None:
+        """#2009: the warning no longer hinges on ``--dist`` being passed.
+
+        A bare ``coord web`` used to fall back to the bundle vendored in the
+        wheel, so "no bundle" wasn't worth a word. That bundle is gone, which
+        makes a bare ``coord web`` the case MOST likely to have nothing to
+        serve — and the one an operator is least likely to suspect.
+        """
+        from click.testing import CliRunner
+        from coord.cli import main
+
+        config_file = TestCLI._config_file(tmp_path)
+        with patch("coord.dashboard.server.WEBAPP_DIST", tmp_path / "nope"):
+            with patch("uvicorn.run", side_effect=SystemExit(0)):
+                result = CliRunner().invoke(
+                    main,
+                    ["web", "--config", str(config_file)],
+                    catch_exceptions=True,
+                )
+        assert "no coord-web bundle" in result.output
+        assert "legacy" in result.output.lower()
 
 
 class TestDistPathOverride:

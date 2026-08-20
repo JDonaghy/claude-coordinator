@@ -104,9 +104,9 @@ file, not `page.route()`. Write `tests/acceptance/ms-NN/fixtures/<name>.json` \
 `page.route()` interception needed anywhere in your spec, and no dev server \
 guesswork about which endpoints exist. Write AT MOST ONE `*.json` file under \
 that `fixtures/` directory; the config raises if it finds more than one. \
-(The one exception in this repo is `tests/acceptance/ms-51/` — an earlier, \
-deliberately-unmigrated `page.route()` slice kept as-is; do not use it as a \
-template.)
+(The `page.route()`-based slice that used to be this repo's one exception, \
+`tests/acceptance/ms-51/`, left with the webapp for the `coord-web` repo in \
+#2009 — there is no in-repo counter-example to copy from any more.)
 2. Author (or extend) the acceptance suite in `tests/acceptance/ms-NN/`, \
 using the repo's declared driver framework (kind + run command are in your \
 briefing) — the tests must be runnable by that exact command.

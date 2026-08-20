@@ -26,9 +26,10 @@ jobs:
       # (#2164). Left in here, a red-by-design slice would fail this job
       # outright — every ordinary PR in the repo, not just the one the slice
       # belongs to — exactly the quadraui#554/#490 failure mode #2180 exists
-      # to close. ms-33/ms-38 (Rust, feature-gated behind test-support) and
-      # ms-51 (Playwright, not .py) were never swept in here; ms-37 (plain
-      # .py files under testpaths=["tests"]) was the one accidental gap.
+      # to close. ms-33/ms-38 (Rust, feature-gated behind test-support) were
+      # never swept in here; ms-37 (plain .py files under
+      # testpaths=["tests"]) was the one accidental gap. (ms-51 — Playwright,
+      # never .py either — left this repo entirely with the webapp, #2009.)
       - run: pytest --ignore=tests/acceptance
       # #2180: the cli-pytest sealed route (acceptance.drivers routes
       # "coord/**" -> cli-pytest -> tests/acceptance/ms-37) run through the
@@ -250,112 +251,28 @@ jobs:
                  tests/test_smoke.py \
                  -v
 
-  e2e:
-    runs-on: ubuntu-latest
-    # #2389: this is the SAME `npx playwright install chromium --with-deps`
-    # step that hung 34+ minutes on `acceptance` with no automatic recovery
-    # (a job with no `timeout-minutes` defaults to GitHub's 360-minute
-    # ceiling) — required, so it stays in this file, but gets the same
-    # bounded timeout rather than the implicit 6-hour one.
-    timeout-minutes: 20
-    defaults:
-      run:
-        working-directory: coord/dashboard/webapp
-    steps:
-      - uses: actions/checkout@v4
-      # #1551: `live-update-fixture.spec.ts` spawns a real
-      # `coord web --fixture` process, so the CLI has to be installed and on
-      # PATH — without it Playwright fails with `spawn coord ENOENT`. Every
-      # earlier spec drove a browser only, which is why this job never needed
-      # Python before. The job defaults `run:` steps into the webapp
-      # directory, so the install step overrides it back to the repo root.
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - working-directory: .
-        run: pip install -e ".[dev]"
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-      - run: npm ci
-      # #2393: `npx playwright install chromium --with-deps` was the step
-      # that hung 30+ minutes with no automatic recovery (2026-08-18, this
-      # job and `acceptance`'s) — a fresh ~300MB Chromium download from
-      # Playwright's CDN on EVERY run, no caching, so every run was fully
-      # exposed to any network hiccup on that path. Caching the browser
-      # binary means most runs skip the download-heavy half entirely; only
-      # a cache miss (a `@playwright/test` version bump) pays the network
-      # cost. `install-deps` (apt-only, no download) still runs on a cache
-      # hit so a runner image without chromium's OS libs preinstalled
-      # doesn't break.
-      - name: Cache Playwright browsers
-        id: playwright-cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: ${{ runner.os }}-playwright-${{ hashFiles('coord/dashboard/webapp/package-lock.json') }}
-      - name: Install Playwright + OS deps (cache miss)
-        if: steps.playwright-cache.outputs.cache-hit != 'true'
-        # #2393 follow-up: the Chromium download from Playwright's CDN has hung
-        # (not merely failed) multiple times in one day, past what caching alone
-        # can paper over on a cache-miss run (a version bump, or the very first
-        # run ever). A short per-attempt timeout + retry turns "hang for the
-        # whole 20-minute job budget" into "fail fast and try again" — transient
-        # CDN/mirror flakiness usually clears within a couple of attempts.
-        run: |
-          for attempt in 1 2 3; do
-            echo "Playwright install attempt $attempt/3..."
-            if timeout 300 npx playwright install chromium --with-deps; then
-              echo "Playwright install succeeded on attempt $attempt"
-              exit 0
-            fi
-            echo "Playwright install attempt $attempt failed or timed out after 5m"
-            sleep 10
-          done
-          echo "Playwright install failed after 3 attempts"
-          exit 1
-      - name: Install Playwright OS deps only (cache hit)
-        if: steps.playwright-cache.outputs.cache-hit == 'true'
-        run: npx playwright install-deps chromium
-      - run: npm run test:e2e
 
-  # #2389: the SEALED web-playwright acceptance suite (ms-51) moved to its
-  # own workflow, acceptance-web.yml, with a `paths:` filter scoped to
-  # `coord/dashboard/webapp/**`/`tests/acceptance/**` — mirroring how
-  # cargo-test.yml already gates the tui-tuidriver route on `tui/**`. This
-  # job was unconditionally installing Node + a real Chromium on every
-  # push/PR to this repo regardless of what changed, including pure-Rust
-  # `tui/` diffs that have nothing to do with the webapp (#1950's original
-  # "cheapest fix" traded diff-scoping for coverage-by-default; #2389
-  # restores diff-scoping now that the Rust side has its own equivalent
-  # gate). Not in this repo's required-checks list, so this move changes
-  # nothing about what blocks a merge.
-
-  # #1550: `coord/dashboard/webapp/src/api/generated.ts` is produced by
-  # `scripts/codegen.py` from the dashboard's OpenAPI spec
-  # (`coord.dashboard.server.openapi_spec()`) — this job is the drift gate.
-  # `--check` regenerates in memory and fails without writing if the
-  # committed file differs, so a Python dataclass field change that forgot
-  # to `python scripts/codegen.py` fails CI here instead of shipping a
-  # webapp that silently drops/misreads a field (the #632 failure class).
-  # `npm run typecheck` + the Vitest suite then confirm every consumer of
-  # the generated types (client.ts, the components) still compiles and
-  # passes against whatever the regenerated shape is.
-  webapp-types:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: pip install -e ".[dev]"
-      - run: python scripts/codegen.py --check
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-      - working-directory: coord/dashboard/webapp
-        run: npm ci
-      - working-directory: coord/dashboard/webapp
-        run: npm run typecheck
-      - working-directory: coord/dashboard/webapp
-        run: npm run test
+  # #2009 (epic #2002): the `e2e` and `webapp-types` jobs that used to live
+  # here are GONE, not disabled. Both drove `coord/dashboard/webapp/**`,
+  # which moved out of this repo into `coord-web`:
+  #
+  #   - `e2e` (Playwright `npm run test:e2e`) is now `coord-web`'s own `e2e`
+  #     job. Per docs/ADR_COORD_WEB_CI.md (#2006) it installs
+  #     `code-coordinator[server]` from PyPI — tracking latest, never an
+  #     exact pin — so an incompatible change to `coord web`'s flags or the
+  #     dashboard API turns THAT repo's next PR red rather than a phone.
+  #   - `webapp-types` ran `python scripts/codegen.py --check` (the
+  #     OpenAPI -> `src/api/generated.ts` drift gate) plus `npm run
+  #     typecheck` / `npm test`. The npm half moved with the source; the
+  #     codegen half moved with it too — `scripts/codegen.py` is still here
+  #     (the spec it generates from is `coord.dashboard.server`'s), but it
+  #     now needs `--out` / `$COORD_WEB_SRC` pointing at a `coord-web`
+  #     checkout, so the drift gate can only run where both repos are
+  #     present. That is `coord-web`'s CI, not this one.
+  #   - The sealed web-playwright acceptance suite (ms-51) went with them;
+  #     see docs/ADR_COORD_WEB_ACCEPTANCE_SUITE.md (#2007). Its workflow,
+  #     `acceptance-web.yml`, was deleted in the same change.
+  #
+  # Do not re-add a webapp job here. There is no webapp source in this repo
+  # for it to run against, and a job that installs Node to build nothing is
+  # how the previous `acceptance`-on-every-push waste (#2389) started.

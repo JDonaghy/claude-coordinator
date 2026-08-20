@@ -28,17 +28,37 @@ dispatched by `compute_pipeline` (e.g. "unstick") and forthcoming values
 ahead of their backend implementation — that don't correspond 1:1 to a
 single schema.
 
-Usage:
-    .venv/bin/python scripts/codegen.py            # regenerate generated.ts in place
-    .venv/bin/python scripts/codegen.py --check     # exit 1 (no write) if generated.ts is stale
+#2009 (epic #2002) — THIS SCRIPT IS NOW CROSS-REPO. The consumer it writes
+for, `src/api/generated.ts`, moved to the `coord-web` repo along with the
+rest of the webapp, but the *producer* — `coord.dashboard.server`'s OpenAPI
+spec — is necessarily still here. So the destination is no longer a fixed
+path inside this repo and must be named explicitly, by `--out PATH` or by
+`$COORD_WEB_SRC` pointing at a `coord-web` checkout's root. There is
+deliberately no fallback default: silently writing a hard-coded path that
+this repo no longer contains would either recreate a dead directory nobody
+consumes or, worse, report "up to date" against a file that does not exist.
 
-`tests/test_generated_types_fixture.py` runs the --check equivalent in CI (the
-same pattern as `scripts/gen_board_fixture.py` / `tests/test_board_fixture.py`
-for the /board golden fixture) so a stale checkout fails the build.
+That also relocates the drift GATE. It used to be `webapp-types` in
+`.github/workflows/test.yml` (`python scripts/codegen.py --check`), which
+could only work while both halves lived in one checkout; that job is gone.
+The check now belongs to `coord-web`'s CI, which has its `generated.ts` and
+installs `code-coordinator[server]` from PyPI (docs/ADR_COORD_WEB_CI.md,
+#2006) to get this script. What still runs here is
+`tests/test_generated_types_fixture.py`, narrowed to what a single checkout
+can actually prove: that the generator produces complete, well-formed output
+covering every schema in the served spec.
+
+Usage:
+    # regenerate into a coord-web checkout
+    .venv/bin/python scripts/codegen.py --out ~/src/coord-web/src/api/generated.ts
+    COORD_WEB_SRC=~/src/coord-web .venv/bin/python scripts/codegen.py
+    # exit 1 (no write) if that file is stale
+    COORD_WEB_SRC=~/src/coord-web .venv/bin/python scripts/codegen.py --check
 """
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -46,7 +66,37 @@ from typing import Any
 from coord.dashboard.server import openapi_spec
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-OUTPUT_PATH = REPO_ROOT / "coord" / "dashboard" / "webapp" / "src" / "api" / "generated.ts"
+
+#: Path of the emitted file RELATIVE to a `coord-web` checkout's root.
+OUTPUT_RELPATH = Path("src") / "api" / "generated.ts"
+
+#: Env var naming a `coord-web` checkout root, used when `--out` is absent.
+OUTPUT_ENV_VAR = "COORD_WEB_SRC"
+
+
+class OutputPathError(Exception):
+    """No destination was named — see :func:`resolve_output_path`."""
+
+
+def resolve_output_path(explicit: str | Path | None = None) -> Path:
+    """Where to write/check ``generated.ts``: ``--out`` > ``$COORD_WEB_SRC``.
+
+    Raises :class:`OutputPathError` when neither is set, rather than guessing
+    (#2009): the old hard-coded ``coord/dashboard/webapp/src/api/generated.ts``
+    is not in this repo any more, so a guess is always wrong and — under
+    ``--check`` — wrong in the direction that reports success.
+    """
+    if explicit is not None:
+        return Path(explicit).expanduser()
+    root = os.environ.get(OUTPUT_ENV_VAR)
+    if root:
+        return Path(root).expanduser() / OUTPUT_RELPATH
+    raise OutputPathError(
+        "no destination for generated.ts. Since #2009 the webapp lives in "
+        f"the coord-web repo, so pass --out PATH or set ${OUTPUT_ENV_VAR} to "
+        f"a coord-web checkout root (the file is written to its "
+        f"{OUTPUT_RELPATH}). See this script's module docstring."
+    )
 
 # Schemas to emit as TS interfaces, in display order — purely cosmetic (TS
 # `interface` declarations are hoisted, so forward references within
@@ -255,22 +305,52 @@ def generate() -> str:
     return "\n\n".join(parts) + "\n"
 
 
+def _parse_out(args: list[str]) -> str | None:
+    """``--out PATH`` / ``--out=PATH`` from *args*, or None."""
+    for i, arg in enumerate(args):
+        if arg.startswith("--out="):
+            return arg.split("=", 1)[1]
+        if arg == "--out":
+            if i + 1 >= len(args):
+                raise OutputPathError("--out requires a PATH argument")
+            return args[i + 1]
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
+    try:
+        output_path = resolve_output_path(_parse_out(args))
+    except OutputPathError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     content = generate()
     if "--check" in args:
-        current = OUTPUT_PATH.read_text() if OUTPUT_PATH.exists() else ""
-        if current != content:
+        # #2009: a MISSING file is now a hard failure, not "stale vs empty".
+        # Pre-split, absence meant a fresh checkout that had simply never run
+        # the generator; post-split it means `--out`/$COORD_WEB_SRC is
+        # pointing somewhere that is not a coord-web checkout, and treating
+        # that as ordinary staleness would send an operator off to regenerate
+        # a file into the wrong directory.
+        if not output_path.exists():
             print(
-                f"{OUTPUT_PATH} is stale — run `.venv/bin/python scripts/codegen.py` "
-                "to regenerate.",
+                f"{output_path} does not exist — is --out/${OUTPUT_ENV_VAR} "
+                "pointing at a coord-web checkout?",
                 file=sys.stderr,
             )
             return 1
-        print(f"{OUTPUT_PATH} is up to date.")
+        if output_path.read_text() != content:
+            print(
+                f"{output_path} is stale — run `python scripts/codegen.py "
+                f"--out {output_path}` to regenerate.",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"{output_path} is up to date.")
         return 0
-    OUTPUT_PATH.write_text(content)
-    print(f"wrote {OUTPUT_PATH}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(content)
+    print(f"wrote {output_path}")
     return 0
 
 

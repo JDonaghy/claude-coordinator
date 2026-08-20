@@ -38,8 +38,10 @@ wheel's version the way ``agent_venv``/``spawned_coord`` are —
 ``~/.coord-venv`` release cadence, so "is it on the released version?" is
 not a well-formed question for it. What *is* well-formed, and what this
 checks — mirroring ``tui_binary`` exactly — is whether the live bundle is
-older than the ``coord/dashboard/webapp/`` source tree it claims to have
-been built from.
+older than the webapp source tree it claims to have been built from. Since
+#2009 (epic #2002) that source tree is a ``coord-web`` checkout rather than
+this repo's ``coord/dashboard/webapp/``; see
+:func:`resolve_webapp_source_dir` for how both layouts are located.
 """
 
 from __future__ import annotations
@@ -138,12 +140,33 @@ def resolve_webapp_build_heartbeat_path(ctx: HealthContext):
 
 
 def resolve_webapp_source_dir(ctx: HealthContext):
-    """``<checkout>/coord/dashboard/webapp/src`` for the first local checkout
-    that has one. Same convention as :func:`resolve_tui_source_dir`."""
+    """The webapp source tree in the first local checkout that has one.
+
+    Same convention as :func:`resolve_tui_source_dir`. Two layouts are
+    recognised, in this order:
+
+    1. ``<checkout>/src`` — a ``coord-web`` checkout, whose repo ROOT is the
+       webapp root (#2009, epic #2002). Gated on a sibling ``package.json``
+       so an unrelated repo that merely happens to have a top-level ``src/``
+       (any Rust or src-layout Python project in ``ctx.checkouts``) cannot be
+       mistaken for the webapp — grading the live bundle against the WRONG
+       tree would manufacture staleness rather than report it, which is the
+       exact failure ``resolve_tui_source_dir`` refuses to risk by not
+       guessing relative to the binary path.
+    2. ``<checkout>/coord/dashboard/webapp/src`` — the pre-#2009 in-repo
+       layout. Kept because a machine can legitimately still have an older
+       ``claude-coordinator`` checkout parked on a pre-split commit, and this
+       lane reporting UNKNOWN there would be a regression in signal for no
+       gain. It can only ever match a tree that genuinely is webapp source.
+    """
     configured = getattr(ctx.thresholds, "webapp_source_dir", None)
     if configured:
         return expand(configured, ctx.home)
     for checkout in ctx.checkouts:
+        if (checkout.path / "package.json").is_file():
+            candidate = checkout.path / "src"
+            if candidate.is_dir():
+                return candidate
         candidate = checkout.path / "coord" / "dashboard" / "webapp" / "src"
         if candidate.is_dir():
             return candidate

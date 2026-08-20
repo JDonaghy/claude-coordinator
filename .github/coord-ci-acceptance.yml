@@ -14,11 +14,23 @@
 # `machines:` list even though nothing here is a real machine) — this file
 # is that, scoped to exactly what CI needs and nothing else.
 #
-# The three routes below mirror the fleet's real
+# The two routes below mirror the fleet's real
 # `acceptance.drivers.claude-coordinator.routes` (#1125 in-repo path
-# routing: coord/dashboard/webapp/** -> web-playwright, coord/** ->
-# cli-pytest, tui/** -> tui-tuidriver) with ONE deliberate difference: none
-# of these `run:` commands reference the `{ms}` template.
+# routing: coord/** -> cli-pytest, tui/** -> tui-tuidriver) with ONE
+# deliberate difference: none of these `run:` commands reference the `{ms}`
+# template.
+#
+# #2009 (epic #2002): there used to be a THIRD route here,
+# `coord/dashboard/webapp/** -> web-playwright`, listed first because
+# `driver_for()` is first-match and that glob is a strict subset of
+# `coord/**` (#1540). It is gone because the webapp is gone — the source
+# moved to the `coord-web` repo and the sealed suite it ran (ms-51) went
+# with it (docs/ADR_COORD_WEB_ACCEPTANCE_SUITE.md, #2007), so the route now
+# lives in `coord-web`'s own config as a FLAT driver entry with no `routes:`
+# at all: that repo's root IS the webapp root, so there is nothing left for
+# a path glob to disambiguate. Nothing under `coord/dashboard/webapp/` can
+# appear in a diff against this repo any more, so re-adding the glob here
+# could only ever shadow `coord/**` for a path that cannot exist.
 #
 # `{ms}` only gets substituted when `coord acceptance run` is scoped to one
 # issue (`--issue N`, resolved via the issue's manifest-mapped ms-NN dir,
@@ -55,23 +67,6 @@ acceptance:
   drivers:
     claude-coordinator:
       routes:
-        # #1540: coord/dashboard/webapp/** MUST stay above coord/** below —
-        # driver_for() resolves the first matching route (fnmatch,
-        # first-match not most-specific), and coord/dashboard/webapp/** is a
-        # strict subset of coord/**.
-        - match: coord/dashboard/webapp/**
-          kind: web-playwright
-          # No `setup:` here — the CI job that uses this route provisions
-          # explicitly (npm ci, playwright install chromium --with-deps)
-          # before invoking the wrapper, matching the shape that job already
-          # had before #2180 wired the wrapper in.
-          # The trailing `--` matters: _run_web_playwright appends
-          # ` --reporter=json` verbatim (coord/acceptance_drivers.py), so
-          # without it npm would try to interpret --reporter=json as an npm
-          # CLI flag instead of forwarding it to the playwright binary.
-          run: "cd coord/dashboard/webapp && npm run test:acceptance --"
-          mock: "*.html"
-          capability: browser
         - match: coord/**
           kind: cli-pytest
           # Whole tree, not one ms-NN dir -- see the file header.

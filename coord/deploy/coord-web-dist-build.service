@@ -1,14 +1,16 @@
-# coord-web-dist-build — pull merged main and rebuild the React webapp bundle
-# that `coord web --dist` serves (#1543), paired with
+# coord-web-dist-build — pull `coord-web`'s merged main and rebuild the
+# webapp bundle that `coord web --dist` serves (#1543), paired with
 # coord-web-dist-build.timer.
 #
 # A systemd *user* unit, Type=oneshot, mirroring coord-drive-queue.service's
 # tick pattern (timer-fired, its own flock so a slow run can't stack).  Runs
 # deploy/coord-web-dist-build.sh, which:
-#   - fetches origin/main into ~/src/code-coordinator (read-only — only
+#   - fetches origin/main into ~/src/coord-web (read-only — only
 #     `git fetch` + `rev-parse`, never touches that checkout's working tree
-#     or whatever branch an operator has it parked on),
-#   - builds coord/dashboard/webapp from that SHA inside a DEDICATED worktree
+#     or whatever branch an operator has it parked on). #2009: that used
+#     to be ~/src/code-coordinator, back when the webapp was a
+#     subdirectory of this repo,
+#   - builds that repo's ROOT at that SHA inside a DEDICATED worktree
 #     (~/.coord-web-checkout, never shared with an operator or `coord drive`),
 #   - atomically repoints ~/coord-web-dist at the new build.
 #

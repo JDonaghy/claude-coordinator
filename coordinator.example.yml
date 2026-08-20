@@ -137,26 +137,20 @@ acceptance:
   # milestone-scoped acceptance suites (tests/acceptance/ms-NN/). #1125's
   # in-repo path routing: `driver_for(repo, path)` resolves the FIRST route
   # whose `match` glob matches `path` (fnmatch semantics) — first-match, not
-  # most-specific-match (coord.config.AcceptanceConfig.driver_for). Because
-  # `coord/dashboard/webapp/**` is a strict subset of `coord/**`, it MUST be
-  # listed before the `coord/**` route below, or every webapp change would
-  # silently resolve to cli-pytest instead of web-playwright (#1540).
+  # most-specific-match (coord.config.AcceptanceConfig.driver_for). So an
+  # added route whose glob is a strict SUBSET of one already listed has to go
+  # ABOVE it or it can never win (#1540).
+  #
+  # #2009 (epic #2002): a `coord/dashboard/webapp/** -> web-playwright` route
+  # used to sit first here for exactly that reason. The webapp moved to the
+  # `coord-web` repo, so it is gone from this repo's routes and reappears as
+  # a FLAT `acceptance.drivers["coord-web"]` entry — `kind: web-playwright`,
+  # `capability: browser`, no `routes:` — because that repo's root IS the
+  # webapp root and there is nothing for a path glob to disambiguate. See
+  # docs/ADR_COORD_WEB_ACCEPTANCE_SUITE.md.
   drivers:
     code-coordinator:
       routes:
-        - match: coord/dashboard/webapp/**
-          kind: web-playwright
-          # #1733: `coord acceptance record`'s throwaway `git worktree
-          # add --detach` never has `node_modules` (gitignored, never
-          # checked out) — `run` alone fails with a bare `exit 127`
-          # (playwright not found) the first time it runs there. `setup`
-          # provisions the checkout once, before `run`, and a failure here
-          # is reported as "provisioning failed", distinct from a test
-          # failure.
-          setup: "cd coord/dashboard/webapp && npm ci"
-          run: "cd coord/dashboard/webapp && npm run test:acceptance -- {ms}"
-          mock: "*.html"
-          capability: browser
         - match: coord/**
           kind: cli-pytest
           run: "pytest tests/acceptance/{ms}"
@@ -186,8 +180,11 @@ smoke_tests:
   capability_rules:
     - files: [tui/]
       requires: [rust]
-    # Worked example for a browser-driven acceptance suite (docs/PHONE_WEBAPP.md):
-    # - files: [coord/dashboard/webapp/]
+    # Worked example for a browser-driven suite in ANOTHER repo — the shape
+    # `coord-web` needs now that the webapp is its own repo (#2009). Rules
+    # are matched against a diff's paths, so a repo whose every path needs
+    # a browser wants a bare `files: []`-style prefix that matches its root:
+    # - files: [src/]
     #   requires: [browser]
 
 pipeline:

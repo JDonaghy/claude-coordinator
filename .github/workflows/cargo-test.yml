@@ -113,7 +113,8 @@ jobs:
       # failures above (declaring the five documented ones in
       # `expected_red:`, fixing or re-baselining the sixth), drop this
       # continue-on-error and this becomes a real, blocking gate like the
-      # `acceptance` (ms-51) and cli-pytest (ms-37) routes already are.
+      # cli-pytest (ms-37) route already is. (The third route this used to
+      # name, web-playwright/ms-51, left this repo with the webapp — #2009.)
       - name: coord acceptance run --all --ci (tui-tuidriver route, ms-33/ms-38)
         run: >-
           coord acceptance run --repo claude-coordinator --all --ci

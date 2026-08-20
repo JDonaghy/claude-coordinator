@@ -1,5 +1,12 @@
-# Include the built React webapp bundle (produced by `npm ci && npm run build`
-# in coord/dashboard/webapp/ before `python -m build`).
-# dist/ is gitignored so setuptools' VCS discovery won't find it — this
-# directive force-includes it in both the sdist and wheel.
-recursive-include coord/dashboard/webapp/dist *
+# #2009 (epic #2002): this file used to force-include the built React webapp
+# bundle (`recursive-include coord/dashboard/webapp/dist *`) into the sdist
+# and wheel, because `dist/` was gitignored and setuptools' VCS discovery
+# could not find it. That source moved to the `coord-web` repo, so there is
+# no bundle to include and no `npm run build` step in publish.yml to produce
+# one. A built bundle now reaches a daemon host via
+# `deploy/coord-web-dist-build.sh` -> `~/coord-web-dist` -> `coord web
+# --dist` (docs/ADR_COORD_WEB_DIST.md, #2004), deliberately decoupled from
+# this package's release cadence.
+#
+# Kept as an (otherwise empty) file so the removal is legible rather than
+# looking like a directive someone dropped by accident.

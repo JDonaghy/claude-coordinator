@@ -88,9 +88,10 @@ WantedBy=default.target
 UNIT
 
 # --- Node shims (#1678) ------------------------------------------------------
-# The `browser` capability — Playwright acceptance suites such as
-# coord/dashboard/webapp's `npm run test:e2e` — needs `node`/`npm` on the
-# agent's PATH, and therefore on every worker's PATH (#402).
+# The `browser` capability — Playwright acceptance suites such as the
+# `coord-web` repo's `npm run test:e2e` (that suite lived at
+# coord/dashboard/webapp/ here until #2009 moved it out) — needs `node`/`npm`
+# on the agent's PATH, and therefore on every worker's PATH (#402).
 #
 # Unlike #1671's ~/.cargo/bin, that directory CANNOT simply be appended to the
 # PATH line above: nvm installs Node into a version-stamped directory

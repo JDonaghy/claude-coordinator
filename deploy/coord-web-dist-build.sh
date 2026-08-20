@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
-# coord-web-dist-build.sh — build the React webapp from merged `main` into a
-# directory `coord web --dist` serves, WITHOUT touching ~/.coord-venv (#1543).
+# coord-web-dist-build.sh — build the `coord-web` webapp from its merged
+# `main` into a directory `coord web --dist` serves, WITHOUT touching
+# ~/.coord-venv (#1543).
 #
 # Why this exists: coord-web, coord-agent and coord-serve all `ExecStart`
 # from the SAME ~/.coord-venv, so "ship a webapp change" used to mean
@@ -9,10 +10,29 @@
 # upgrades the board daemon and the agent runtime on that host, and
 # `coord agent update` is already known to kill running headless workers
 # (see the #1543 issue body). This script decouples the two: it keeps an
-# independent worktree of this repo, builds `coord/dashboard/webapp` from
-# merged main into a fresh, timestamped release directory, and atomically
-# repoints a symlink at it. `coord web --dist ~/coord-web-dist` (see
+# independent worktree of the webapp's repo, builds it from merged main into
+# a fresh release directory named after the SHA, and atomically repoints a
+# symlink at it. `coord web --dist ~/coord-web-dist` (see
 # deploy/coord-web.service) always points at that symlink.
+#
+# #2009 (epic #2002) — WHICH repo this builds changed, nothing else did.
+# Until the split, `$BASE_CHECKOUT` was a checkout of *claude-coordinator*
+# and the build ran in its `coord/dashboard/webapp/` subdirectory. The
+# webapp now lives in its own `coord-web` repo, so `$REPO_NAME` defaults to
+# `coord-web` and the build runs at that repo's ROOT (`$WEBAPP_SUBDIR`,
+# empty by default, is the seam for a repo that nests it again). Per
+# docs/ADR_COORD_WEB_DIST.md (#2004) that redirection is the WHOLE of the
+# change: the fetch-then-build-in-a-dedicated-worktree shape, the
+# health-check-on-a-scratch-port before cutover (#1560), the atomic symlink
+# publish, the rollback script and its anti-flap sentinel, and the heartbeat
+# file (#2122) all carry over untouched, because none of them ever depended
+# on which repo the source came from.
+#
+# ONE thing does still come from claude-coordinator: the health check boots a
+# real `coord web --fixture` and needs that repo's board fixture JSON, which
+# `coord-web` has no copy of. `$COORD_CHECKOUT` (default
+# `$SRC_ROOT/code-coordinator`) is where it is read from — set
+# `$HEALTH_CHECK_FIXTURE` directly on a host that keeps no such checkout.
 #
 # NO RESTART of coord-web is required after the first build. Starlette's
 # StaticFiles/FileResponse re-resolve the directory on every request (see
@@ -25,7 +45,7 @@
 # once, THEN start/enable coord-web.
 #
 # Safe to run unattended on a timer (see coord-web-dist-build.timer): it
-# never touches ~/.coord-venv, ~/src/code-coordinator's own checkout (it
+# never touches ~/.coord-venv, ~/src/coord-web's own checkout (it
 # uses a DEDICATED `git worktree`, so it can't collide with whatever branch
 # an operator has that checkout parked on — same reasoning as `coord drive`'s
 # worktree isolation), or any running coord-agent/coord-serve/coord-web
@@ -97,9 +117,19 @@
 set -uo pipefail
 
 SRC_ROOT="${SRC_ROOT:-$HOME/src}"
-REPO_NAME="${REPO_NAME:-code-coordinator}"
+# #2009: the webapp's repo, not claude-coordinator's. See the header.
+REPO_NAME="${REPO_NAME:-coord-web}"
 BASE_CHECKOUT="${BASE_CHECKOUT:-$SRC_ROOT/$REPO_NAME}"
 BRANCH="${BRANCH:-main}"
+# Path from the webapp repo's root to the directory holding package.json.
+# Empty for `coord-web` (its root IS the webapp root); this used to be the
+# hard-coded `coord/dashboard/webapp`, and stays configurable so a future
+# monorepo layout needs an env var rather than an edit here.
+WEBAPP_SUBDIR="${WEBAPP_SUBDIR:-}"
+# claude-coordinator's checkout — needed ONLY for the health-check fixture
+# below, which lives in that repo's tests/fixtures/ and has no coord-web
+# equivalent. Not fetched, not built, not written to.
+COORD_CHECKOUT="${COORD_CHECKOUT:-$SRC_ROOT/code-coordinator}"
 
 # A worktree DEDICATED to this script — never the same directory an operator
 # or `coord drive` worktree might be using, and never checked out over a
@@ -190,7 +220,9 @@ health_check_release() {
     return 1
   fi
 
-  fixture="${HEALTH_CHECK_FIXTURE:-$WEBAPP_CHECKOUT/tests/fixtures/board-pipeline-basic.json}"
+  # #2009: read from claude-coordinator's checkout, not $WEBAPP_CHECKOUT —
+  # the fixture is a coord *board* fixture and never moved to coord-web.
+  fixture="${HEALTH_CHECK_FIXTURE:-$COORD_CHECKOUT/tests/fixtures/board-pipeline-basic.json}"
   if [[ ! -f "$fixture" ]]; then
     say "ERROR: health-check fixture missing: $fixture — cannot health-check $release_dir"
     return 1
@@ -347,7 +379,9 @@ RELEASE_DIR="$RELEASES_DIR/$NEW_SHA"
 rm -rf "$RELEASE_DIR"
 mkdir -p "$RELEASES_DIR"
 
-WEBAPP_DIR="$WEBAPP_CHECKOUT/coord/dashboard/webapp"
+# #2009: `coord-web`'s repo root IS the webapp root, so $WEBAPP_SUBDIR is
+# empty by default and this collapses to $WEBAPP_CHECKOUT.
+WEBAPP_DIR="$WEBAPP_CHECKOUT${WEBAPP_SUBDIR:+/$WEBAPP_SUBDIR}"
 if ! ( cd "$WEBAPP_DIR" && npm ci --no-audit --no-fund && npm run build ); then
   say "ERROR: npm build failed for $NEW_SHA — live dashboard unchanged (still $CURRENT_RELEASE)"
   heartbeat error "$NEW_SHA"
