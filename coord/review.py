@@ -647,6 +647,39 @@ def blocking_findings_confirmed_absent(body: str) -> bool:
     return True
 
 
+def extract_blocking_section(body: str) -> str:
+    """Return the verbatim text of *body*'s "## Blocking findings" section(s).
+
+    Reuses the same section parser as `estimate_review_counts` /
+    `blocking_findings_confirmed_absent` (#1456), so this can never disagree
+    with them about where the blocking section starts and ends. Multiple
+    headings that map to the `blocking` bucket are joined in document order.
+
+    Returns "" when no blocking heading is found, or when the section reads
+    as an explicit "none" marker (`_is_no_findings_line` on every line) —
+    callers should not carry forward an empty section as if it were a real
+    finding.
+
+    #2466: replaces a blind `body[:240]` truncation that was silently
+    dropping every blocking finding past the first sentence from the #603
+    per-issue context digest — the mechanism meant to carry a review's
+    findings forward into the next re-review round.
+    """
+    chunks: list[str] = []
+    for bucket, lines in _iter_review_sections(body):
+        if bucket != "blocking":
+            continue
+        text = "\n".join(lines).strip("\n")
+        if text.strip():
+            chunks.append(text)
+    joined = "\n\n".join(chunks).strip()
+    if not joined:
+        return ""
+    if all(_is_no_findings_line(line.strip()) for line in joined.splitlines() if line.strip()):
+        return ""
+    return joined
+
+
 def _parse_review_text(text: str) -> ReviewFindings | None:
     """Extract the last ReviewFindings block from *text*, or None.
 

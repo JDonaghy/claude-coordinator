@@ -1000,6 +1000,59 @@ class TestPostResult:
             issue_context_block("api", 7)
         )
 
+    def test_multi_blocking_finding_review_carries_full_section_not_240_char_truncation(
+        self,
+    ) -> None:
+        """#2466: a request-changes review with more than one substantial
+        blocking finding used to write only `findings_body[:240]` into the
+        #603 context digest a later re-review round reads — losing every
+        finding past the first sentence. This pinned a real #2288 incident:
+        round 2 reported 3 blocking findings, and rounds 3/4 only ever
+        re-litigated the first because the other two never made it into the
+        carried-forward context. The digest must now hold the FULL blocking
+        section verbatim, and must exclude non-blocking/nits prose that
+        doesn't need to survive into the next round."""
+        from coord.state import get_connection
+
+        _seed_running_assignment("aid-multi-blocking", assignment_type="review")
+        first = "A" * 150 + " — the chord resolver never checks board_search.focused"
+        second = "B" * 150 + " — tabs.json persistence drops the unfocused pane's tabs"
+        findings = (
+            "## Blocking findings\n\n"
+            f"- {first}\n\n"
+            f"- {second}\n\n"
+            "## Non-blocking concerns\n\n"
+            "- PaneSet::set_ratio rebuilds the whole SplitTree on every drag\n\n"
+            "## Nits\n\n"
+            "- trailing whitespace at events.rs:42\n"
+        )
+        with patch("coord.github_ops.post_issue_comment"):
+            issue_store.post_result(
+                issue_store.ResultRecord(
+                    assignment_id="aid-multi-blocking",
+                    machine_name="laptop",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=7,
+                    status="done",
+                    verdict="request-changes",
+                    summary="two blocking findings",
+                    findings_body=findings,
+                )
+            )
+        row = get_connection().execute(
+            "SELECT body FROM issue_context WHERE repo_name=? AND issue_number=? "
+            "AND source='review'",
+            ("api", 7),
+        ).fetchone()
+        assert row is not None
+        stored = row["body"]
+        assert first in stored
+        assert second in stored
+        assert len(stored) > 240, "regression guard: must not be truncated to the old cap"
+        assert "SplitTree on every drag" not in stored
+        assert "trailing whitespace" not in stored
+
     def test_second_capture_with_allow_overwrite_replaces_findings(self) -> None:
         """#650: `allow_overwrite_findings=True` (the `--force` CLI flag) is the
         explicit-confirmation escape hatch — the write lands."""

@@ -3625,6 +3625,56 @@ class TestBlockingFindingsConfirmedAbsent:
         assert blocking_findings_confirmed_absent("") is False
 
 
+class TestExtractBlockingSection:
+    """#2466: the #603 per-issue context digest used to carry forward only
+    `body[:240]` on a request-changes verdict, which silently dropped every
+    blocking finding past the first sentence on any review with more than
+    one. `extract_blocking_section` replaces that with a verbatim pull of
+    just the "## Blocking findings" section, reusing the same
+    `_iter_review_sections` parser `estimate_review_counts` and
+    `blocking_findings_confirmed_absent` already rely on."""
+
+    def test_extracts_full_multi_paragraph_section_past_240_chars(self) -> None:
+        from coord.review import extract_blocking_section
+        first = "A" * 200 + " first finding, paragraph one."
+        second = "B" * 200 + " second finding, a completely different bug."
+        body = (
+            "## Blocking findings\n\n"
+            f"- {first}\n\n"
+            f"- {second}\n\n"
+            "## Non-blocking concerns\n\n"
+            "- some polish note that should NOT be carried forward\n\n"
+            "## Nits\n\n"
+            "- trailing whitespace\n"
+        )
+        out = extract_blocking_section(body)
+        assert first in out
+        assert second in out
+        assert len(out) > 240, "regression guard: must not be truncated to the old 240-char cap"
+        assert "should NOT be carried forward" not in out
+        assert "trailing whitespace" not in out
+
+    def test_returns_empty_when_no_blocking_heading(self) -> None:
+        from coord.review import extract_blocking_section
+        assert extract_blocking_section("Looks fine to me — approving.\n") == ""
+
+    def test_returns_empty_when_blocking_section_explicitly_empty(self) -> None:
+        from coord.review import extract_blocking_section
+        body = "## Blocking findings\nNone.\n## Nits\n- Trailing whitespace\n"
+        assert extract_blocking_section(body) == ""
+
+    def test_preserves_bulleted_findings_verbatim(self) -> None:
+        from coord.review import extract_blocking_section
+        body = (
+            "## Blocking findings\n"
+            "- `coord/cli.py:2616` — HUMAN_REQUIRED never persists\n"
+            "- retry cap not enforced (`coord/conflict_fix.py:161-167`)\n"
+        )
+        out = extract_blocking_section(body)
+        assert "HUMAN_REQUIRED never persists" in out
+        assert "retry cap not enforced" in out
+
+
 # ── Flood guard: dispatch_pending_reviews (incident 2026-06-08) ──────────────
 
 
