@@ -51537,3 +51537,239 @@ Milestone tracking issue.
             driver.screen()
         );
     }
+
+    // ── #2288 review (blocking, carried from round 2) ─────────────────────
+    //
+    // Two findings the review rounds after #2 never re-confirmed (the #603
+    // context digest truncated them, fixed by #2466) and that were still
+    // live in the code: the exit writer dropped the unfocused pane's whole
+    // tab set, and the file-issue modal overlay painted once per pane.
+
+    /// The persisted file shape is per-**scope**, so a split has to be
+    /// flattened on the way out — but flattening must not *lose* anything.
+    /// Split the Board panel, pin an issue in the new pane, quit: before
+    /// this fix `~/.coord/tabs.json` came back holding only the focused
+    /// pane's tab and #101 was silently gone forever.
+    #[test]
+    fn a_split_scopes_tabs_all_survive_the_exit_round_trip() {
+        let path = std::env::temp_dir().join(format!(
+            "coord_tabs_split_roundtrip_{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let mut app = doc_tab_app(DOC_TAB_BOARD_JSON);
+        let left = ("claude-coordinator".to_string(), 101);
+        let right = ("claude-coordinator".to_string(), 102);
+        app.open_board_doc_tab(left.clone(), true);
+        assert!(
+            app.split_board_pane_right(),
+            "precondition: `Ctrl-W v` splits an unsplit Board panel"
+        );
+        app.open_board_doc_tab(right.clone(), true);
+
+        {
+            let panes = app.doc_tabs.panes(PanelScope::Board);
+            assert!(panes.is_split(), "precondition: two panes");
+            assert_eq!(
+                panes.pane(0).tabs(),
+                &[left.clone()],
+                "precondition: #101 is open in the LEFT (unfocused) pane only"
+            );
+            assert_eq!(
+                panes.pane(1).tabs(),
+                &[right.clone()],
+                "precondition: #102 is open in the RIGHT (focused) pane only"
+            );
+        }
+
+        // Exactly what `persist_doc_tabs_on_exit` does, minus the `~/.coord`
+        // path resolution `save()` adds on top.
+        app.checkpoint_all_detail_sub_state();
+        app.doc_tabs.save_to_path(&path).expect("write the temp file");
+        let restored = super::doc_tabs::DocTabs::load_from_path(&path);
+        let _ = std::fs::remove_file(&path);
+
+        let group = restored.group(PanelScope::Board);
+        assert!(
+            group.index_of(&left).is_some(),
+            "#2288 review (blocking): the UNFOCUSED pane's tab must survive \
+             the quit — persisting only the focused pane silently deleted it. \
+             Restored strip: {:?}",
+            group.tabs()
+        );
+        assert!(
+            group.index_of(&right).is_some(),
+            "…and the focused pane's tab is still there too: {:?}",
+            group.tabs()
+        );
+        assert_eq!(
+            group.active_key(),
+            Some(&right),
+            "#2288 §6: the document the user was actually looking at on the \
+             way out is the one that comes back active"
+        );
+    }
+
+    /// A document only ever open in the *unfocused* pane keeps its own
+    /// sub-tab across the round trip — the union takes each document's
+    /// sub-state from the pane it actually lives in, not from the focused
+    /// pane's map.
+    #[test]
+    fn an_unfocused_panes_document_keeps_its_sub_tab_across_the_round_trip() {
+        let path = std::env::temp_dir().join(format!(
+            "coord_tabs_split_substate_{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let mut app = doc_tab_app(DOC_TAB_BOARD_JSON);
+        let left = ("claude-coordinator".to_string(), 101);
+        let right = ("claude-coordinator".to_string(), 102);
+        app.open_board_doc_tab(left.clone(), true);
+        // Read #101 on its `Issue` sub-tab, then split away from it: the
+        // split's own checkpoint banks the live field into #101's record.
+        app.board_detail_tab = BoardDetailTab::Issue;
+        assert!(app.split_board_pane_right());
+        app.open_board_doc_tab(right.clone(), true);
+        app.board_detail_tab = BoardDetailTab::Chat;
+
+        app.checkpoint_all_detail_sub_state();
+        app.doc_tabs.save_to_path(&path).expect("write the temp file");
+        let restored = super::doc_tabs::DocTabs::load_from_path(&path);
+        let _ = std::fs::remove_file(&path);
+
+        let group = restored.group(PanelScope::Board);
+        assert_eq!(
+            group.sub_state(&left).map(|s| s.board_tab),
+            Some(BoardDetailTab::Issue),
+            "#2288 review + #2286 §6: the background pane's document must \
+             restore onto ITS OWN sub-tab, not the scope default"
+        );
+        assert_eq!(
+            group.sub_state(&right).map(|s| s.board_tab),
+            Some(BoardDetailTab::Chat),
+            "…and the focused pane's document onto its own"
+        );
+    }
+
+    /// An unsplit scope's bytes are untouched by the union — every #2286
+    /// scenario has one pane, and `merged_for_persist` is `focused().clone()`
+    /// there, so the file must be identical to the one the same tab set
+    /// produced before a pane ever existed. Splitting *away* from a scope and
+    /// then collapsing back must land on those same bytes.
+    #[test]
+    fn an_unsplit_scope_persists_exactly_what_it_did_before_the_split_existed() {
+        // `persist_doc_tabs_on_exit` always checkpoints the live sub-state
+        // into the active document's record before it saves (#2286 review,
+        // blocking) — a real quit never writes an un-checkpointed byte. Both
+        // snapshots checkpoint first so this test compares what actually
+        // reaches disk on exit, not an artifact of `split_board_pane_right`
+        // checkpointing internally while a bare `save_to_path` call does not.
+        let write = |app: &mut CoordApp, tag: &str| -> String {
+            app.checkpoint_all_detail_sub_state();
+            let path = std::env::temp_dir().join(format!(
+                "coord_tabs_unsplit_bytes_{tag}_{}.json",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&path);
+            app.doc_tabs.save_to_path(&path).expect("write the temp file");
+            let text = std::fs::read_to_string(&path).expect("read it back");
+            let _ = std::fs::remove_file(&path);
+            text
+        };
+
+        let mut app = doc_tab_app(DOC_TAB_BOARD_JSON);
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 101), true);
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 102), false);
+        let before = write(&mut app, "before");
+
+        assert!(app.split_board_pane_right());
+        assert!(
+            app.close_focused_board_pane(),
+            "precondition: `Ctrl-W x` collapses back to one pane"
+        );
+        let after = write(&mut app, "after");
+
+        assert_eq!(
+            before, after,
+            "#2288 §9 last bullet: with one pane the writer must be \
+             byte-identical to the pre-split one"
+        );
+    }
+
+    /// The same issue open in BOTH panes is one document in the file — the
+    /// persisted shape has no room for two, and a duplicate would restore as
+    /// two identical tabs only the leftmost of which is ever reachable
+    /// (#2286 review, non-blocking 2).
+    #[test]
+    fn a_document_open_in_both_panes_is_persisted_once() {
+        let path = std::env::temp_dir().join(format!(
+            "coord_tabs_split_dedup_{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let mut app = doc_tab_app(DOC_TAB_BOARD_JSON);
+        let key = ("claude-coordinator".to_string(), 101);
+        app.open_board_doc_tab(key.clone(), true);
+        assert!(app.split_board_pane_right());
+        app.open_board_doc_tab(key.clone(), true);
+
+        app.doc_tabs.save_to_path(&path).expect("write the temp file");
+        let restored = super::doc_tabs::DocTabs::load_from_path(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            restored.group(PanelScope::Board).tabs(),
+            &[key],
+            "#2288 review: the union de-duplicates by document key"
+        );
+    }
+
+    /// §9 + #316: the file-issue modal is a panel-level overlay, and
+    /// `render_board_pane` now runs once per pane — so an ungated overlay
+    /// painted TWO copies, the second one squatting over the other pane's
+    /// content. It must paint exactly once, inside the focused pane.
+    #[test]
+    fn the_file_issue_modal_paints_once_inside_the_focused_pane() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = doc_tab_app(DOC_TAB_BOARD_JSON);
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 101), true);
+        assert!(app.split_board_pane_right());
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 102), true);
+        // The focused (right) pane is the one showing Chat with the modal
+        // up — the only pane `open_file_issue_modal` can ever have run from.
+        app.board_detail_tab = BoardDetailTab::Chat;
+        app.file_issue_modal = Some(FileIssueModal {
+            title: "MODALNEEDLE".to_string(),
+            body: "body line".to_string(),
+            repo_github: "JDonaghy/claude-coordinator".to_string(),
+            submitting: false,
+        });
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        driver.set_double_click_folding(false);
+        driver.render();
+
+        let divider = divider_column(&driver);
+        let screen = driver.screen();
+        assert_eq!(
+            screen.matches("MODALNEEDLE").count(),
+            1,
+            "#2288 review (blocking): the file-issue modal must paint EXACTLY \
+             once across a split panel — 0 means the pane gate swallowed it, \
+             2 means every pane painted its own copy:\n{screen}"
+        );
+        let col = screen
+            .lines()
+            .find_map(|line| line.find("MODALNEEDLE"))
+            .expect("the modal was painted");
+        assert!(
+            col > divider,
+            "#2288 review: the single copy belongs to the FOCUSED (right) \
+             pane — it must sit right of the divider at column {divider}, not \
+             over the left pane's content (found at column {col}):\n{screen}"
+        );
+    }
