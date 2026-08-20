@@ -3678,6 +3678,49 @@ NEW_ISSUE_CHAT_DENY_COMMANDS: list[str] = [
 ]
 
 
+# Deny list applied to review workers (#2461). Unlike every other member of
+# WRITE_CAPABLE_SPEC_TYPES, a reviewer has ZERO legitimate mutations of its
+# own — coord.review.REVIEWER_SYSTEM_PROMPT already tells it "You are NOT
+# allowed to push commits or modify the PR's code. You only review" and "You
+# are NOT allowed to run any `gh` commands" (the coordinator posts the
+# review on its behalf after the session ends). Before #2461 that was
+# enforced by the PROMPT ALONE: `"review"` wasn't one of the explicit
+# branches in `default_worker_command`, so it fell through to the generic
+# `else` below and got the exact same `Read,Edit,Write,Bash,Monitor` grant as
+# a real work leg — nothing but the model's own good behaviour stood between
+# "read the diff" and "silently commit a fix and push it". This list is
+# wired into BOTH the system prompt (via `build_deny_prompt`, soft — a
+# reminder) AND `--disallowedTools` (CLI-enforced, hard — see the
+# `spec.type == "review"` branch below) so a reviewer that ignores its own
+# prompt still cannot shell out to a mutating git/gh command. The read-only
+# git the briefing actually tells reviewers to run (`git fetch`, `git diff`,
+# `git log`) stays allowed by omission.
+REVIEW_DENY_COMMANDS: list[str] = [
+    "Bash(gh *)",
+    "Bash(git push *)",
+    "Bash(git commit *)",
+    "Bash(git add *)",
+    "Bash(git merge *)",
+    "Bash(git rebase *)",
+    "Bash(git cherry-pick *)",
+    "Bash(git reset *)",
+    "Bash(git checkout *)",
+    "Bash(git switch *)",
+    "Bash(git branch *)",
+    "Bash(git stash *)",
+    "Bash(git clean *)",
+    "Bash(git rm *)",
+    "Bash(git apply *)",
+    "Bash(git am *)",
+    "Bash(git tag *)",
+    "Bash(rm -rf *)",
+    "Bash(rm -fr *)",
+    "Bash(coord approve *)",
+    "Bash(coord merge *)",
+    "Bash(coord assign *)",
+]
+
+
 WorkerCommandBuilder = Callable[[AssignmentSpec], list[str]]
 
 
@@ -4111,6 +4154,26 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
         system_prompt = spec.system_prompt if spec.system_prompt else SMOKE_SYSTEM_PROMPT
         system_prompt += build_deny_prompt(spec.deny_commands)
         allowed_tools = "Read,Bash"
+    elif spec.type == "review":
+        # #2461: give review its own branch instead of falling through to
+        # the generic `else` below — see REVIEW_DENY_COMMANDS for the full
+        # story. A reviewer reads the diff and reports a verdict; it edits
+        # and pushes nothing, so it gets no Edit/Write. `Monitor` is
+        # withheld too, for the same #1394/#2301 reason the `smoke` branch
+        # above withholds it: a review leg is a one-shot `claude -p`
+        # session, and an await-a-notification tool that only resumes an
+        # INTERACTIVE session would silently kill it mid-run.
+        #
+        # A scratch/tmp path outside the worktree (e.g. `/tmp/...`) stays
+        # writable for a reviewer that wants to stage its findings before
+        # the final `coord report-result --body-file` call — Bash retains
+        # ordinary shell redirection (`cat >`, heredocs) even with no Write
+        # tool grant; only the Edit/Write *tools* (which target the
+        # worktree/repo) and the mutating git/gh commands below are blocked.
+        from coord.review import REVIEWER_SYSTEM_PROMPT  # noqa: PLC0415
+        system_prompt = spec.system_prompt if spec.system_prompt else REVIEWER_SYSTEM_PROMPT
+        system_prompt += build_deny_prompt(REVIEW_DENY_COMMANDS)
+        allowed_tools = "Read,Bash"
     else:
         system_prompt = spec.system_prompt if spec.system_prompt else WORKER_SYSTEM_PROMPT
         system_prompt += build_deny_prompt(spec.deny_commands)
@@ -4175,6 +4238,14 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
     # there would be a no-op cluttering their argv for nothing.
     if "Edit" in allowed_tools:
         for pattern in _base_checkout_write_guard_tools(spec.repo_path):
+            if pattern not in disallowed_tools:
+                disallowed_tools.append(pattern)
+    # #2461: review gets its mutating-command deny list wired into
+    # --disallowedTools too, not just the soft system-prompt reminder from
+    # build_deny_prompt above — the CLI enforces this one even if the model
+    # decides to ignore its own prompt.
+    if spec.type == "review":
+        for pattern in REVIEW_DENY_COMMANDS:
             if pattern not in disallowed_tools:
                 disallowed_tools.append(pattern)
     if disallowed_tools:

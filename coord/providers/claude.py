@@ -113,6 +113,7 @@ class ClaudeProvider(Provider):
             NEW_ISSUE_CHAT_DENY_COMMANDS,
             NEW_ISSUE_CHAT_SYSTEM_PROMPT,
             REFINEMENT_SYSTEM_PROMPT,
+            REVIEW_DENY_COMMANDS,
             TEST_CHAT_SYSTEM_PROMPT,
             WORKER_PLAN_PROMPT,
             WORKER_SYSTEM_PROMPT,
@@ -120,6 +121,7 @@ class ClaudeProvider(Provider):
             _sealed_write_guard_tools,
             build_deny_prompt,
         )
+        from coord.review import REVIEWER_SYSTEM_PROMPT  # noqa: PLC0415
         from coord.smoke import SMOKE_SYSTEM_PROMPT  # noqa: PLC0415
 
         binary = self._binary if self._binary is not None else DEFAULT_WORKER_BINARY
@@ -180,6 +182,17 @@ class ClaudeProvider(Provider):
                 _sp = spec.system_prompt if spec.system_prompt else SMOKE_SYSTEM_PROMPT
                 _sp += build_deny_prompt(spec.deny_commands)
                 _at = "Read,Bash"
+            elif spec.type == "review":
+                # #2461: keep in sync with default_worker_command's identical
+                # branch — a reviewer reads the diff and reports a verdict,
+                # it edits and pushes nothing, so Read,Bash only (no
+                # Edit/Write, no Monitor — same one-shot-session reasoning as
+                # the `smoke` branch above). See REVIEW_DENY_COMMANDS for why
+                # its mutating-command deny list also lands in
+                # --disallowedTools below, not just this prompt text.
+                _sp = spec.system_prompt if spec.system_prompt else REVIEWER_SYSTEM_PROMPT
+                _sp += build_deny_prompt(REVIEW_DENY_COMMANDS)
+                _at = "Read,Bash"
             else:
                 _sp = spec.system_prompt if spec.system_prompt else WORKER_SYSTEM_PROMPT
                 _sp += build_deny_prompt(spec.deny_commands)
@@ -215,6 +228,12 @@ class ClaudeProvider(Provider):
         disallowed_tools = _sealed_write_guard_tools(spec.files_forbidden)
         if "Edit" in allowed_tools:
             for pattern in _base_checkout_write_guard_tools(spec.repo_path):
+                if pattern not in disallowed_tools:
+                    disallowed_tools.append(pattern)
+        # #2461: same CLI-enforced hard block as default_worker_command —
+        # see REVIEW_DENY_COMMANDS.
+        if spec.type == "review":
+            for pattern in REVIEW_DENY_COMMANDS:
                 if pattern not in disallowed_tools:
                     disallowed_tools.append(pattern)
         if disallowed_tools:
