@@ -247,6 +247,62 @@
         assert_eq!(fmt_dur(3661), "1h1m");
     }
 
+    // ── format_unix_time day rollup ──────────────────────────────────────────
+    //
+    // `fmt_dur`'s largest unit is the hour, which is right for a *duration*
+    // but unbounded for an *age*: a year-old timestamp rendered
+    // `9732h35m ago` (12 cells) and got clipped to `9732h35m …` in the Audit
+    // Time column (`ColumnWidth::Fixed(11.0)` -> 10 usable), losing the `ago`
+    // suffix #1039 contract §4a requires. Ages now roll up to whole days.
+    //
+    // Helper: build a ts that is exactly `age_secs` in the past.
+    fn ts_aged(age_secs: f64) -> f64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        now - age_secs
+    }
+
+    #[test]
+    fn format_unix_time_under_a_day_keeps_hour_precision() {
+        // Unchanged from before the rollup — the `#1762` timestamp-cell test
+        // depends on this exact shape.
+        assert_eq!(format_unix_time(ts_aged(13.0 * 3600.0)), "13h0m ago");
+    }
+
+    #[test]
+    fn format_unix_time_rolls_up_at_exactly_one_day() {
+        assert_eq!(format_unix_time(ts_aged(86_400.0)), "1d ago");
+    }
+
+    #[test]
+    fn format_unix_time_just_under_a_day_does_not_roll_up() {
+        // 23h59m — the last value that stays in the hour regime.
+        assert_eq!(format_unix_time(ts_aged(86_399.0)), "23h59m ago");
+    }
+
+    #[test]
+    fn format_unix_time_truncates_toward_whole_days() {
+        // 1d23h is still "1d" — days-only, matching `format_age`'s
+        // long-standing convention ("hours for < 24h, days otherwise").
+        assert_eq!(format_unix_time(ts_aged(86_400.0 + 23.0 * 3600.0)), "1d ago");
+    }
+
+    #[test]
+    fn format_unix_time_year_old_age_fits_the_audit_time_column() {
+        // The exact regression: 406 days used to be `9732h35m ago` (12 cells)
+        // and clipped away its own `ago`. The Audit Time column resolves to
+        // 10 usable cells, so the rendered string must fit in 10.
+        let s = format_unix_time(ts_aged(406.0 * 86_400.0));
+        assert_eq!(s, "406d ago");
+        assert!(
+            s.chars().count() <= 10,
+            "must fit the 10-cell Audit Time column, got {} cells: {s:?}",
+            s.chars().count()
+        );
+    }
+
     // ── fmt_elapsed (#2397) ──────────────────────────────────────────────────
     //
     // The bug this replaced: `fmt_elapsed_mmss` rendered both the < 1h and
@@ -39716,6 +39772,70 @@ Milestone tracking issue.
                 "contract §4a: populated Audit list must show {needle:?}:\n{screen}"
             );
         }
+    }
+
+    /// Build a one-entry `/audit` page whose `ts` is `age_secs` old, so a
+    /// test can pin how the Time column renders a genuinely *stale* row.
+    fn audit_page_json_one_entry_aged(age_secs: f64) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        format!(
+            r#"{{
+                "entries": [
+                    {{
+                        "id": 1, "ts": {ts}, "tier": "business",
+                        "category": "dispatch", "event_type": "dispatched",
+                        "actor": "coordinator", "repo": "claude-coordinator",
+                        "issue": 1039, "assignment_id": null,
+                        "machine": null, "summary": "STALE_MARKER",
+                        "details": null
+                    }}
+                ],
+                "next_cursor": null,
+                "has_more": false
+            }}"#,
+            ts = now - age_secs,
+        )
+    }
+
+    /// Regression: a year-old audit row must STILL render `ago`.
+    ///
+    /// `audit_populated_list_shows_categories_actor_and_relative_time` above
+    /// seeds clock-relative timestamps (`now - 10s` / `now - 500s`), so it
+    /// could never catch this — but the sealed slice
+    /// (`tests/acceptance/ms-33/audit_1039.rs`) pins *absolute* 2025
+    /// timestamps, and as wall-clock drifted past them `format_unix_time`
+    /// grew an unbounded hour count: `9732h35m ago`, 12 cells wide. The Time
+    /// column is `ColumnWidth::Fixed(11.0)` (10 usable), so `draw_data_table`
+    /// clipped it to `9732h35m …` and the `ago` suffix vanished — a
+    /// time-bomb failure of #1039 contract §4a that no commit introduced.
+    ///
+    /// Seeding the age *relative to now* is the point: this test asserts the
+    /// invariant at any wall-clock, so it cannot rot the same way.
+    #[test]
+    fn audit_year_old_row_still_renders_relative_time_within_the_column() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        // ~406 days — the drift that actually broke the sealed slice.
+        let json = audit_page_json_one_entry_aged(406.0 * 86_400.0);
+        let app = make_app_with_audit_json(BoardData::default(), &json);
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "§");
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("STALE_MARKER"),
+            "precondition: the aged row must be on screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("406d ago"),
+            "#1039 contract §4a: a 406-day-old row's Time cell must roll up \
+             to whole days and stay inside the 10-cell column, so the `ago` \
+             suffix survives clipping:\n{screen}"
+        );
     }
 
     #[test]
