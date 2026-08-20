@@ -48,6 +48,18 @@
 # overlap the flock, in which case the next fire simply retries 10 minutes
 # later.
 #
+# #2470: this unit now tracks the dedicated `coord-web` repo's `main`
+# (deploy/coord-web-dist-build.sh's BASE_CHECKOUT/WEBAPP_CHECKOUT), not
+# `coord/dashboard/webapp/` inside THIS repo (docs/ADR_COORD_WEB_DIST.md).
+# The cadence measurement above predates that split and was taken against
+# this repo's merge history; it stays the right order-of-magnitude
+# justification for 10 minutes because `coord-web`, being a repo dedicated
+# entirely to the webapp, has EVERY merge to its `main` in-scope for a build
+# — there is no "does this commit touch webapp/ at all" filtering to do
+# anymore (the script never filtered by path either; it always rebuilt on
+# any `origin/main` SHA change, webapp-only or not — this just makes that
+# now-trivially-true for the repo it targets).
+#
 # Install: see deploy/coord-web-dist-build.sh's header, or
 # docs/PHONE_WEBAPP.md / docs/AGENT_OPERATIONS.md.
 
