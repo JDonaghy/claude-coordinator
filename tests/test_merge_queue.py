@@ -9773,3 +9773,107 @@ class TestSweepSiblingConflicts:
         ])
 
         assert bases == {("acme/api", "main")}
+
+
+# ── #1896 Phase 0: forge-availability recording at the merge-gate seam ──────
+
+class TestForgeAvailabilityRefusalRecording:
+    """`process()` persists one `forge_availability`-category audit row per
+    LIVE `checks_failed`/`checks_pending`/`checks_stale` refusal (#1896),
+    and none at all for a `--dry-run` preview of the same refusal — a
+    preview never actually blocked anything, so it is not a real
+    observation of forge/CI availability."""
+
+    @staticmethod
+    def _forge_rows(coord_db) -> list:
+        return coord_db.execute(
+            "SELECT * FROM audit_log WHERE category='forge_availability' "
+            "AND event_type='merge_gate_refusal' ORDER BY id"
+        ).fetchall()
+
+    def test_live_checks_failed_is_recorded(self, coord_db) -> None:
+        from types import SimpleNamespace
+
+        class _Ci:
+            is_available = True
+            def list_checks_for_pr(self, repo, number):
+                return [SimpleNamespace(
+                    name="build", status="completed", conclusion="failure",
+                    run_id=None,
+                )]
+
+        items = [_q("w1", pr=99)]
+        gh = FakeGh(mergeable_results={99: False})
+        process(items, gh, ci_store=_Ci())
+
+        rows = self._forge_rows(coord_db)
+        assert len(rows) == 1
+        assert rows[0]["repo"] == "api"
+        assert rows[0]["issue"] == 1
+        details = json.loads(rows[0]["details_json"])
+        assert details["reason"] == "checks_failed"
+
+    def test_live_checks_pending_is_recorded(self, coord_db) -> None:
+        items = [_q("w1", pr=99)]
+        gh = FakeGh()
+        pending = _check("e2e", status="in_progress", conclusion=None)
+
+        class _Ci:
+            is_available = True
+            def list_checks_for_pr(self, repo, number):
+                return [pending]
+
+        process(items, gh, ci_store=_Ci())
+
+        rows = self._forge_rows(coord_db)
+        assert len(rows) == 1
+        assert json.loads(rows[0]["details_json"])["reason"] == "checks_pending"
+
+    def test_dry_run_preview_of_checks_failed_is_not_recorded(self, coord_db) -> None:
+        items = [_q("w1", pr=99)]
+        gh = FakeGh(mergeable_results={99: False})
+        real_failure = _check("build", conclusion="failure")
+
+        class _Ci:
+            is_available = True
+            def list_checks_for_pr(self, repo, number):
+                return [real_failure]
+
+        events = process(items, gh, ci_store=_Ci(), dry_run=True)
+
+        assert "checks_failed" in [e.kind for e in events]
+        assert self._forge_rows(coord_db) == []
+
+    def test_a_non_refusal_event_records_nothing(self, coord_db) -> None:
+        """`opened`/`sized`/`merged`/etc. are not in MERGE_GATE_REFUSAL_KINDS
+        — only the three named CI-gate refusal kinds get a forge-
+        availability row."""
+        items = [_q("w1")]
+        gh = FakeGh()
+        process(items, gh, ci_store=mq.NoOpCi())
+
+        assert self._forge_rows(coord_db) == []
+
+    def test_recording_failure_never_breaks_a_real_merge(self, coord_db, monkeypatch) -> None:
+        """Acceptance bar: a forge-availability recording failure must never
+        raise into `process()`, let alone block or undo a real refusal."""
+        from types import SimpleNamespace
+
+        def _boom(*a, **k):
+            raise RuntimeError("audit_log write exploded")
+
+        monkeypatch.setattr("coord.forge_availability.record_audit", _boom)
+
+        class _Ci:
+            is_available = True
+            def list_checks_for_pr(self, repo, number):
+                return [SimpleNamespace(
+                    name="build", status="completed", conclusion="failure",
+                    run_id=None,
+                )]
+
+        items = [_q("w1", pr=99)]
+        gh = FakeGh(mergeable_results={99: False})
+        events = process(items, gh, ci_store=_Ci())  # must not raise
+
+        assert "checks_failed" in [e.kind for e in events]

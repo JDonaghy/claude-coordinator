@@ -6,8 +6,11 @@ import json
 import re
 import socket
 import subprocess
+import time
 from datetime import datetime
 from typing import Any
+
+from coord.forge_availability import record_gh_call
 
 
 # ── Typed gh errors ─────────────────────────────────────────────────────────
@@ -116,19 +119,41 @@ def _gh(*args: str) -> str:
     ``shutil.which("gh")`` + ``subprocess.run(..., check=False)`` call sites
     had, for free, without each caller having to remember to guard for it.
     """
+    # #1896 Phase 0: time + classify every `gh` invocation through this one
+    # seam so `coord diagnose --forge-availability` has real data on how
+    # often the forge is actually unreachable, not just anecdote from one
+    # bad day. Recording is best-effort (coord.forge_availability.
+    # record_gh_call never raises) and adds no network call of its own —
+    # only a local timer + a local DB write.
+    _t0 = time.monotonic()
     try:
         result = subprocess.run(
             ["gh", *args],
             capture_output=True, text=True, timeout=30,
         )
     except FileNotFoundError as exc:
+        record_gh_call(args, outcome="unreachable", duration_s=time.monotonic() - _t0,
+                        detail="gh not found")
         raise GhError(f"gh {' '.join(args)} failed: gh not found: {exc}") from exc
     except subprocess.TimeoutExpired as exc:
+        record_gh_call(args, outcome="unreachable", duration_s=time.monotonic() - _t0,
+                        detail="timed out")
         raise GhError(f"gh {' '.join(args)} failed: timed out: {exc}") from exc
     except OSError as exc:
+        record_gh_call(args, outcome="unreachable", duration_s=time.monotonic() - _t0,
+                        detail=str(exc))
         raise GhError(f"gh {' '.join(args)} failed: {exc}") from exc
+    duration = time.monotonic() - _t0
     if result.returncode != 0:
-        raise RuntimeError(f"gh {' '.join(args)} failed: {result.stderr.strip()}")
+        stderr = result.stderr.strip()
+        # #1896: distinguish a transient forge/auth/network failure (an
+        # availability signal) from an ordinary application-level error like
+        # "label not found" (not one) — same classification
+        # `_is_transient_error` already applies for auto-create suppression.
+        outcome = "transient" if _is_transient_error(RuntimeError(stderr)) else "app_error"
+        record_gh_call(args, outcome=outcome, duration_s=duration, detail=stderr)
+        raise RuntimeError(f"gh {' '.join(args)} failed: {stderr}")
+    record_gh_call(args, outcome="ok", duration_s=duration)
     return result.stdout.strip()
 
 

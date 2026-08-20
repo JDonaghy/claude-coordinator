@@ -32,6 +32,7 @@ from coord.ci_store import (
     summarize_counts,
 )
 from coord.db import get_connection
+from coord.forge_availability import MERGE_GATE_REFUSAL_KINDS, record_merge_gate_refusal
 from coord.models import CLOSES_ISSUE_TYPES, WORK_LIKE_TYPES, Assignment
 from coord.pr_body_lint import downgrade_closing_keywords, find_closing_references
 from coord.state import COORD_DIR, dismiss_drive_escalation
@@ -6210,7 +6211,32 @@ def process(
             events.append(MergeEvent(entry, "conflict", msg))
             continue  # #735: park this entry; siblings in same group still merge
 
+    # #1896 Phase 0: persist merge-gate CI refusal counts by reason — the
+    # third of the three seams the forge-availability program asks for.
+    # Live attempts only: `dry_run` is a single flag for this whole call (see
+    # the one `if dry_run:` branch above), so every event in `events` is a
+    # preview when it's set, and a preview isn't a real refusal to count.
+    if not dry_run:
+        _record_forge_gate_refusals(events)
+
     return events
+
+
+def _record_forge_gate_refusals(events: list["MergeEvent"]) -> None:
+    """Best-effort: persist one forge-availability row per live merge-gate CI
+    refusal in *events* (#1896 Phase 0). Never raises — `record_merge_gate_
+    refusal` is itself best-effort, and this loop is a thin filter over
+    `events` on top of it, so there is nothing here that needs its own
+    try/except beyond what that function already guarantees."""
+    for event in events:
+        if event.kind not in MERGE_GATE_REFUSAL_KINDS:
+            continue
+        record_merge_gate_refusal(
+            repo=event.entry.repo_name,
+            issue=event.entry.issue_number,
+            reason=event.kind,
+            message=event.message,
+        )
 
 
 # ── Drop / prune (#732) ──────────────────────────────────────────────────

@@ -14,11 +14,13 @@ from __future__ import annotations
 import re
 import subprocess
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
 
 from coord import github_ops
 from coord.ci_store import CheckRun, JobRun, JobStep, failed_checks
+from coord.forge_availability import record_ci_check_fetch
 
 
 def _parse_ts(raw: str | None) -> float | None:
@@ -381,6 +383,15 @@ class GitHubCi:
     # ── Internal ────────────────────────────────────────────────────────────
 
     def _fetch(self, repo: str, number: int) -> list[CheckRun]:
+        # #1896 Phase 0: this is the "every CiStore.list_checks_for_pr
+        # outcome" seam the forge-availability program asks for — reachable/
+        # unreachable, plus the check-level conclusion distribution.
+        # `github_ops.get_pr_checks` already records its own `_gh`-level
+        # observation internally; this is the CI-specific view layered on
+        # top (whether the *check-list read itself* came back usable), and
+        # only fires on a real cache miss — a cached `list_checks_for_pr`
+        # hit never reaches here, so this costs nothing extra either.
+        _t0 = time.monotonic()
         try:
             raw = github_ops.get_pr_checks(repo, number)
         except github_ops.GhTooOldForJsonChecks as e:
@@ -394,6 +405,8 @@ class GitHubCi:
             # it into `_unreadable_check`'s generic wording) means an operator
             # reading the merge refusal never has to guess which of the two
             # this was.
+            record_ci_check_fetch(repo, number, outcome="unreachable",
+                                   duration_s=time.monotonic() - _t0, detail="gh too old")
             return [_gh_too_old_check(repo, number, str(e))]
         except (FileNotFoundError, subprocess.TimeoutExpired, RuntimeError, ValueError) as e:
             # #1525: a `gh pr checks` read that outright failed (gh missing,
@@ -407,8 +420,13 @@ class GitHubCi:
             # failing check instead so the gate blocks and says why; a caller
             # that genuinely wants "unknown" treated as clear must pass
             # `force_merge=True` explicitly.
+            record_ci_check_fetch(repo, number, outcome="unreachable",
+                                   duration_s=time.monotonic() - _t0, detail=str(e))
             return [_unreadable_check(repo, number, str(e))]
+        duration = time.monotonic() - _t0
         if not isinstance(raw, list):
+            record_ci_check_fetch(repo, number, outcome="unreachable",
+                                   duration_s=duration, detail="non-list JSON")
             return [_unreadable_check(repo, number, "gh pr checks returned non-list JSON")]
         # #2446: `_all_checks` (this method's only caller) is the single
         # unfiltered fetch shared by both `list_checks_for_pr` (narrowed to
@@ -416,7 +434,7 @@ class GitHubCi:
         # required-contexts narrowing used to happen here, which meant an
         # advisory check's regression was invisible everywhere, not just to
         # the merge gate. See both methods' docstrings.
-        return [
+        checks = [
             CheckRun(
                 name=str(entry.get("name", "")),
                 status=_status_from_bucket(str(entry.get("bucket", ""))),
@@ -429,6 +447,10 @@ class GitHubCi:
             for entry in raw
             if isinstance(entry, dict)
         ]
+        conclusions = Counter(c.conclusion or "pending" for c in checks)
+        record_ci_check_fetch(repo, number, outcome="ok", duration_s=duration,
+                               conclusions=dict(conclusions))
+        return checks
 
     def _required_contexts(self, repo: str) -> frozenset[str] | None:
         now = time.time()

@@ -745,6 +745,70 @@ class TestGitHubCi:
         assert by_name["lint"].run_id == ""
 
 
+class TestGitHubCiForgeAvailabilityRecording:
+    """#1896 Phase 0: `GitHubCi._fetch` records one forge-availability
+    observation per LIVE (cache-miss) ``gh pr checks`` read — reachable/
+    unreachable, plus the check-level conclusion distribution."""
+
+    @staticmethod
+    def _rows(coord_db) -> list:
+        return coord_db.execute(
+            "SELECT * FROM audit_log WHERE category='forge_availability' "
+            "AND event_type='ci_check_fetch' ORDER BY id"
+        ).fetchall()
+
+    def test_successful_fetch_records_ok_with_conclusion_distribution(
+        self, coord_db
+    ) -> None:
+        store = GitHubCi()
+        with patch("coord.ci_github.subprocess.run", return_value=_gh_result(GH_SAMPLE)):
+            store.list_checks_for_pr("acme/api", 42)
+
+        rows = self._rows(coord_db)
+        assert len(rows) == 1
+        assert rows[0]["repo"] == "acme/api"
+        assert rows[0]["issue"] == 42
+        details = json.loads(rows[0]["details_json"])
+        assert details["outcome"] == "ok"
+        # GH_SAMPLE: one failure, one success, one pending (bucket "pending"
+        # -> conclusion None -> bucketed under "pending" in the distribution).
+        assert details["conclusions"] == {"failure": 1, "success": 1, "pending": 1}
+
+    def test_cached_hit_records_nothing_extra(self, coord_db) -> None:
+        """A cache hit never calls `gh` again, so it must not manufacture a
+        second observation either — that would overstate real forge traffic."""
+        store = GitHubCi(cache_ttl=60.0)
+        with patch("coord.ci_github.subprocess.run", return_value=_gh_result(GH_SAMPLE)):
+            store.list_checks_for_pr("acme/api", 42)
+            store.list_checks_for_pr("acme/api", 42)  # cache hit
+
+        assert len(self._rows(coord_db)) == 1
+
+    def test_unreadable_fetch_records_unreachable(self, coord_db) -> None:
+        store = GitHubCi()
+        with patch(
+            "coord.ci_github.subprocess.run",
+            return_value=_gh_result(stdout="", returncode=1, stderr="HTTP 503"),
+        ):
+            store.list_checks_for_pr("acme/api", 42)
+
+        rows = self._rows(coord_db)
+        assert len(rows) == 1
+        assert json.loads(rows[0]["details_json"])["outcome"] == "unreachable"
+
+    def test_recording_failure_never_breaks_a_real_fetch(self, coord_db, monkeypatch) -> None:
+        """Acceptance bar: a store that always throws must never raise into
+        `list_checks_for_pr`'s caller."""
+        monkeypatch.setattr(
+            "coord.forge_availability.record_audit",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        store = GitHubCi()
+        with patch("coord.ci_github.subprocess.run", return_value=_gh_result(GH_SAMPLE)):
+            checks = store.list_checks_for_pr("acme/api", 42)  # must not raise
+        assert len(checks) == 3
+
+
 class TestGitHubCiExpectsChecks:
     """#1904: `GitHubCi.expects_checks` — the signal that tells "no CI
     configured for this repo" apart from "CI exists but never triggered"
