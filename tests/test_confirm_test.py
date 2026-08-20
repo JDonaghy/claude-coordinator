@@ -170,6 +170,14 @@ def checkout(tmp_path: Path) -> Path:
     )
     _git(seed, "config", "user.email", "test@example.com")
     _git(seed, "config", "user.name", "Test")
+    # The Test stage runs this suite on a capability-matched machine whose
+    # global gitconfig we do not control, and #2269's arm deliberately runs it
+    # against a POPULATED $HOME. A developer's `commit.gpgsign = true` (or this
+    # repo's own `core.hooksPath = .githooks`, which does not exist in a temp
+    # clone) would otherwise fail these commits for reasons having nothing to
+    # do with what is under test.
+    _git(seed, "config", "commit.gpgsign", "false")
+    _git(seed, "config", "core.hooksPath", str(tmp_path / "no-hooks"))
     (seed / "README.md").write_text("base\n", encoding="utf-8")
     _git(seed, "add", "-A")
     _git(seed, "commit", "-m", "base")
@@ -185,6 +193,8 @@ def checkout(tmp_path: Path) -> Path:
         ["git", "clone", str(origin), str(base)],
         capture_output=True, text=True, check=True,
     )
+    # `confirm_branch` runs `git worktree add` here; same hook isolation.
+    _git(base, "config", "core.hooksPath", str(tmp_path / "no-hooks"))
     return base
 
 
