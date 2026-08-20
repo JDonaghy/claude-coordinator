@@ -1,0 +1,90 @@
+# Acceptance manifest for milestone ms-51 ("Web acceptance oracle
+# (web-playwright)", tracking issue #1537). Maps each acceptance test-id -> the
+# work-order issue it covers.
+#
+# Driver: web-playwright
+#   cd coord/dashboard/webapp && npm run test:acceptance -- ms-51
+#
+# Test-ids are the shape coord.acceptance_drivers.parse_playwright_json_report
+# derives from Playwright's built-in json reporter:
+#   "[{project}] {file} › {describe path} › {test title}"
+# `{file}` is relative to the report's rootDir (tests/acceptance/), hence the
+# `ms-51/` prefix. The ids below were copied from a real report parsed by that
+# function, not hand-composed — `coord acceptance run --issue N` matches them
+# EXACTLY, and a near-miss reads as a wiring failure (#1552).
+#
+# There is no entry point to register: Playwright discovers specs by walking
+# `testDir` (playwright.acceptance.config.ts), so a slice file dropped in this
+# directory is executed as-is.
+#
+# Merged (never clobbered) across issues by coord.acceptance.load_manifest —
+# later ms-51 slices append their own entries here.
+#
+# ── Coverage note: why every id below maps to #1544 ──────────────────────────
+# The ms-51 work order carries eleven issues, but contract.md describes exactly
+# ONE black-box surface: Home / Active tab (§1-§5), which is #1544's exit-gate
+# proving slice. The other ten are backend or programme infrastructure with no
+# browser-observable surface for a `web-playwright` slice to assert:
+#
+#   #1538 `coord web --fixture`     #1539 web-playwright driver + report parse
+#   #1540 acceptance.drivers route  #1541 `browser` capability on dellserver
+#   #1542 Gate-A mock shape         #1543 deploy cadence / coord-web.service
+#   #1559 dogfood scorecard         #1560 last-known-good rollback
+#   #1817 (drive-queue incident)    #1818 fixture-seeded slices (ms-52 onward)
+#
+# Several of them are load-bearing for this suite — #1538 and #1543 boot the
+# webServer, #1539/#1540 route and parse this very run, #1542 produced the mock
+# — but they are exercised by running the suite at all, not by an assertion in
+# it. Their own tests live in the Python suite (tests/test_config_acceptance.py,
+# the acceptance_drivers tests, coord/scorecard.py's validation). Manufacturing
+# a Playwright assertion for "dellserver has headless Chromium" or "the deploy
+# can roll back" would mean inventing contract text that does not exist, which
+# the test-author protocol forbids. Flagged here rather than papered over.
+tests:
+  # ── #1544 (W0-7) — Home / Active tab, the M-W0 exit-gate proving slice ────
+  # Contract: tests/acceptance/ms-51/contract.md · mock: mocks/home-active.html
+  #
+  # §1a/§1b — header title + tracked count. RE-AUTHORED: §1 was amended for the
+  # post-#1547 PanelHeader (#1950/#1951, commit c6ab101) without the slice being
+  # re-authored, so this test still asserted the old `coord`/`pipeline` header
+  # and had gone red. Old id (removed): "... › header shows the coord title and
+  # the pipeline subtitle".
+  "[chromium] ms-51/home-active.spec.ts › ms-51 Home Active tab (#1544) › header shows the Pipeline title and the tracked count": 1544
+  # §2a/§2b/§2c — tablist, its two tabs, Active selected by default
+  "[chromium] ms-51/home-active.spec.ts › ms-51 Home Active tab (#1544) › filter tablist offers Active and Needs me with Active selected by default": 1544
+  # §2d — non-zero count rendered, zero count absent, count != visible cards
+  "[chromium] ms-51/home-active.spec.ts › ms-51 Home Active tab (#1544) › Active tab counts every non-merged item while Needs me shows no count": 1544
+  # §2e — activating Needs me moves the selection and hides the cards
+  "[chromium] ms-51/home-active.spec.ts › ms-51 Home Active tab (#1544) › activating Needs me selects it and hides the pipeline cards": 1544
+  # §3a/§3b — the Active items region, one button card per in-flight item
+  "[chromium] ms-51/home-active.spec.ts › ms-51 Home Active tab (#1544) › Active items region holds one button card per in-flight item": 1544
+  # §4a/§4b/§4c — card content for #42 + the status badge
+  "[chromium] ms-51/home-active.spec.ts › ms-51 Home Active tab (#1544) › pipeline card for issue 42 shows title, repo, number, machine and status": 1544
+  # §4b — the issue number is monospace ("a value the machine owns")
+  "[chromium] ms-51/home-active.spec.ts › ms-51 Home Active tab (#1544) › issue number is rendered in a monospace element": 1544
+  # §4d — four stage chips: work, review, test, merge (order pins bug #1724)
+  "[chromium] ms-51/home-active.spec.ts › ms-51 Home Active tab (#1544) › pipeline card renders four stage chips in work review test merge order": 1544
+  # §4e — chip state is per-stage, not one global status (#99)
+  "[chromium] ms-51/home-active.spec.ts › ms-51 Home Active tab (#1544) › chip state is derived per stage on issue 99 not from one global status": 1544
+  # §4f — the test chip renders dimmed/skipped (pins bug #1724)
+  "[chromium] ms-51/home-active.spec.ts › ms-51 Home Active tab (#1544) › test chip renders dimmed in the skipped style": 1544
+  # §5a/§5b/§5c — Work done section, collapsed by default, with its count
+  "[chromium] ms-51/home-active.spec.ts › ms-51 Home Active tab (#1544) › Work done section is collapsed by default and shows its item count": 1544
+
+  # ── #1544, part 2 — contract clauses the slice above states but leaves
+  # unpinned. Separate file so the proving rig's ten green tests stay stable.
+  #
+  # §1b — the header count is a DISTINCT element from the per-tab count, is
+  # mono, immediately follows the h1, and carries the same value (3)
+  "[chromium] ms-51/home-active-extended.spec.ts › ms-51 Home Active tab, extended (#1544) › seeded board — no item needs attention › header count is a distinct mono element next to the h1 carrying the tab count value": 1544
+  # §4e — chip state is per-stage, pinned ACROSS cards: the same `work` label
+  # renders differently on #42 (current) and #99 (completed), while #99's
+  # `review` renders identically to #42's `work` (both current)
+  "[chromium] ms-51/home-active-extended.spec.ts › ms-51 Home Active tab, extended (#1544) › seeded board — no item needs attention › same stage label renders differently across cards while equal states render alike": 1544
+  # §3a — the SECOND region name: `Items needing attention` while Needs me is
+  # selected ("Both names are part of the contract"), seeded with one item that
+  # carries available_gates so the filtered set is non-empty
+  "[chromium] ms-51/home-active-extended.spec.ts › ms-51 Home Active tab, extended (#1544) › board where one item needs attention › list region is named Items needing attention while Needs me is selected": 1544
+  # §2d — the non-zero half of the count rule on the OTHER tab, so nothing
+  # rests on it being an `Active`-only quirk
+  "[chromium] ms-51/home-active-extended.spec.ts › ms-51 Home Active tab, extended (#1544) › board where one item needs attention › Needs me tab renders a count once its filtered set is non-empty": 1544
