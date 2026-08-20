@@ -152,11 +152,12 @@ def test_dist_build_script_defaults_to_the_coord_web_repo() -> None:
 
 def test_dist_build_script_builds_at_the_webapp_checkout_root() -> None:
     """#2470: `coord-web` IS the webapp package now -- `npm ci`/`npm run
-    build` must run at $WEBAPP_CHECKOUT's own root, not a
+    build` must run at $WEBAPP_CHECKOUT's own root (honoring the pre-existing
+    $WEBAPP_SUBDIR seam, empty by default), not a hard-coded
     coord/dashboard/webapp subdirectory of it (that subdirectory only ever
     existed inside `claude-coordinator`, the pre-split monorepo)."""
     text = BUILD_SCRIPT.read_text()
-    assert 'WEBAPP_DIR="$WEBAPP_CHECKOUT"' in text
+    assert 'WEBAPP_DIR="$WEBAPP_CHECKOUT${WEBAPP_SUBDIR:+/$WEBAPP_SUBDIR}"' in text
     code_lines = [
         line for line in text.splitlines() if not line.strip().startswith("#")
     ]
@@ -183,6 +184,62 @@ def test_dist_build_script_health_checks_before_publish() -> None:
     # published-on-success -- never left half-published.
     assert 'rm -rf "$RELEASE_DIR"' in text
     assert "resolve_coord_bin" in text
+
+
+def test_health_check_fixture_default_resolves_under_webapp_checkout(
+    tmp_path: Path,
+) -> None:
+    """#2470 review fix: retargeting $WEBAPP_CHECKOUT at a `coord-web`
+    checkout silently broke the health-check fixture default -- it used to
+    read `$WEBAPP_CHECKOUT/tests/fixtures/board-pipeline-basic.json`, which
+    was correct when $WEBAPP_CHECKOUT was a worktree of THIS repo, but
+    `coord-web`'s `origin/main` has no `tests/` directory at all
+    (confirmed via `git ls-tree -r --name-only origin/main`); the fixture
+    actually lives at `e2e/fixtures/board-pipeline-basic.json`. A missing
+    fixture makes `health_check_release` fail closed (see
+    test_dist_build_script_health_checks_before_publish), which means
+    coord-web-dist-build.timer would NEVER successfully publish on a real
+    host -- exactly the bug #2470 exists to fix. This drives the actual
+    parameter-expansion line from the script (extracted verbatim, not
+    retyped) against a scratch directory shaped like a real `coord-web`
+    checkout, so a future edit that reintroduces the stale
+    `tests/fixtures/...` default fails this test instead of silently
+    breaking every publish."""
+    text = BUILD_SCRIPT.read_text()
+    fixture_lines = [
+        line
+        for line in text.splitlines()
+        if line.strip().startswith('fixture="${HEALTH_CHECK_FIXTURE:-')
+    ]
+    assert len(fixture_lines) == 1, fixture_lines
+    fixture_expr = fixture_lines[0].strip()
+
+    # Guard against the stale, pre-#2470-retarget-fix default reappearing.
+    assert "tests/fixtures/board-pipeline-basic.json" not in text
+
+    webapp_checkout = tmp_path / "webapp-checkout"
+    fixture_dir = webapp_checkout / "e2e" / "fixtures"
+    fixture_dir.mkdir(parents=True)
+    fixture_file = fixture_dir / "board-pipeline-basic.json"
+    fixture_file.write_text("{}")
+
+    env = dict(os.environ)
+    env.pop("HEALTH_CHECK_FIXTURE", None)
+    env["WEBAPP_CHECKOUT"] = str(webapp_checkout)
+
+    result = subprocess.run(
+        ["bash", "-c", f'{fixture_expr}\necho "$fixture"'],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    resolved = result.stdout.strip()
+    assert resolved == str(fixture_file)
+    assert Path(resolved).is_file(), (
+        "resolved default fixture path must actually exist on disk in a "
+        "real coord-web checkout layout"
+    )
 
 
 def test_dist_build_script_rollback_comment_points_at_rollback_script() -> None:

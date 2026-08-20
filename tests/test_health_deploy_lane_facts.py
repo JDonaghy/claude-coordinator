@@ -483,6 +483,24 @@ def test_resolve_webapp_source_dir_is_none_when_coord_web_checkout_has_no_src(
     assert dlf.resolve_webapp_source_dir(ctx) is None
 
 
+def test_resolve_webapp_source_dir_falls_back_to_the_pre_split_layout(
+    tmp_path,
+) -> None:
+    """#2009: no checkout is named/marked `coord-web`, but a
+    `claude-coordinator` checkout still parked on a pre-split commit has the
+    old in-repo layout -- this lane must still find it rather than regress
+    to UNKNOWN just because the machine hasn't pulled the split yet."""
+    checkout = tmp_path / "claude-coordinator"
+    (checkout / "coord" / "dashboard" / "webapp" / "src").mkdir(parents=True)
+    ctx = make_ctx(
+        tmp_path, checkouts=(Checkout(name="claude-coordinator", path=checkout),)
+    )
+    assert (
+        dlf.resolve_webapp_source_dir(ctx)
+        == checkout / "coord" / "dashboard" / "webapp" / "src"
+    )
+
+
 # ── webapp_build_heartbeat (#2122) ─────────────────────────────────────────
 #
 # coord-web-dist-build.sh's up-to-date tick deliberately stopped logging

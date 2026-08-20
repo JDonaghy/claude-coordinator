@@ -35,11 +35,12 @@
 # file (#2122) all carry over untouched, because none of them ever depended
 # on which repo the source came from.
 #
-# ONE thing does still come from claude-coordinator: the health check boots a
-# real `coord web --fixture` and needs that repo's board fixture JSON, which
-# `coord-web` has no copy of. `$COORD_CHECKOUT` (default
-# `$SRC_ROOT/code-coordinator`) is where it is read from — set
-# `$HEALTH_CHECK_FIXTURE` directly on a host that keeps no such checkout.
+# The health check boots a real `coord web --fixture` and needs a board
+# fixture JSON for it — `coord-web` vendored its own copy of the one
+# `e2e/fixtureServer.ts` already uses (post-#2005 split, commit 7e0bf5b), so
+# this reads `$WEBAPP_CHECKOUT/e2e/fixtures/board-pipeline-basic.json` and
+# has no dependency on a claude-coordinator checkout being present. Set
+# `$HEALTH_CHECK_FIXTURE` directly to override.
 #
 # NO RESTART of coord-web is required after the first build. Starlette's
 # StaticFiles/FileResponse re-resolve the directory on every request (see
@@ -146,10 +147,6 @@ BRANCH="${BRANCH:-main}"
 # hard-coded `coord/dashboard/webapp`, and stays configurable so a future
 # monorepo layout needs an env var rather than an edit here.
 WEBAPP_SUBDIR="${WEBAPP_SUBDIR:-}"
-# claude-coordinator's checkout — needed ONLY for the health-check fixture
-# below, which lives in that repo's tests/fixtures/ and has no coord-web
-# equivalent. Not fetched, not built, not written to.
-COORD_CHECKOUT="${COORD_CHECKOUT:-$SRC_ROOT/code-coordinator}"
 
 # A worktree DEDICATED to this script — never the same directory an operator
 # or `coord drive` worktree might be using, and never checked out over a
@@ -189,13 +186,19 @@ HEALTH_CHECK_TIMEOUT_SECS="${HEALTH_CHECK_TIMEOUT_SECS:-20}"
 # The reference seeded board (#1538) — deterministic, no DB/fleet/network, so
 # the scratch instance below never touches ~/.coord/coord.db or races the
 # real coord-web/coord-serve/coord-agent processes. Defaults to the copy
-# checked into $WEBAPP_CHECKOUT (the `coord-web` SHA being deployed) at the
-# same relative path its own Playwright acceptance config
-# (`playwright.acceptance.config.ts`) already expects one at, so this stays
-# in lockstep with whatever fixture `coord-web`'s own CI already proves
-# against (#2470) — never a claim that it matches the INSTALLED `coord`'s
-# server code, which post-#2002-split is versioned independently (see
-# docs/ADR_COORD_WEB_DIST.md, "Staleness across the split").
+# checked into $WEBAPP_CHECKOUT (the `coord-web` SHA being deployed) at
+# `e2e/fixtures/board-pipeline-basic.json` — that is where the fixture
+# actually lives in the `coord-web` repo (`git ls-tree -r --name-only
+# origin/main` has no `tests/` directory at all post-split). NOTE:
+# `coord-web`'s own `playwright.acceptance.config.ts` still has a stale
+# `DEFAULT_FIXTURE` pointing at the old `tests/fixtures/...` path (a
+# leftover `REPO_ROOT` miscalculation from before the repo split — see
+# docs/ADR_COORD_WEB_DIST.md) so do NOT use that config as the source of
+# truth for this path; this comment documents the real, verified location
+# instead (#2470). This is never a claim that the fixture matches the
+# INSTALLED `coord`'s server code, which post-#2002-split is versioned
+# independently (see docs/ADR_COORD_WEB_DIST.md, "Staleness across the
+# split").
 HEALTH_CHECK_FIXTURE="${HEALTH_CHECK_FIXTURE:-}"
 
 say() { echo "[$(date -Is)] $*" >&2; }
@@ -245,9 +248,7 @@ health_check_release() {
     return 1
   fi
 
-  # #2009: read from claude-coordinator's checkout, not $WEBAPP_CHECKOUT —
-  # the fixture is a coord *board* fixture and never moved to coord-web.
-  fixture="${HEALTH_CHECK_FIXTURE:-$COORD_CHECKOUT/tests/fixtures/board-pipeline-basic.json}"
+  fixture="${HEALTH_CHECK_FIXTURE:-$WEBAPP_CHECKOUT/e2e/fixtures/board-pipeline-basic.json}"
   if [[ ! -f "$fixture" ]]; then
     say "ERROR: health-check fixture missing: $fixture — cannot health-check $release_dir"
     return 1

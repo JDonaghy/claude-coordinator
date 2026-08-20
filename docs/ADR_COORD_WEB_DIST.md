@@ -156,3 +156,14 @@ timer is still alive.
 - Options 2 and 3 remain available to revisit if `coord-web` ever needs a
   distribution channel independent of this fleet's own daemon host — no
   requirement in scope today calls for that.
+- Known follow-up, not fixed here: `coord-web`'s own
+  `playwright.acceptance.config.ts` computes `DEFAULT_FIXTURE` via a
+  `REPO_ROOT = path.resolve(here, '../../..')` climb that predates the
+  split, when that config lived three levels down under
+  `coord/dashboard/webapp/`. Now that the config lives at the `coord-web`
+  repo root, that climb resolves outside the repo entirely, so the default
+  points at a path that doesn't exist — the same class of bug #2470 fixed
+  in `deploy/coord-web-dist-build.sh`'s health-check fixture default (now
+  `$WEBAPP_CHECKOUT/e2e/fixtures/board-pipeline-basic.json`). Will bite
+  `coord-web`'s own `npm run test:acceptance` whenever it runs with no
+  explicit fixture path arg; needs a fix in the `coord-web` repo, not here.
