@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>coord web — Home, Active tab (ms-51 proving mock)</title>
+<!--
+  Gate-A mock · milestone ms-51 (Web acceptance oracle) · tracking issue #1537
+  Screen: Home ("/"), Active tab, populated.
+
+  THIS MOCK DESCRIBES SHIPPED BEHAVIOUR, NOT A PROPOSED DESIGN.
+
+  It is the proving rig for #1544 (M-W0 exit gate): the first end-to-end run of
+  the web oracle — mock -> independent test-author -> sealed Playwright slice ->
+  `coord acceptance run` -> `coord acceptance record` -> a deliberate red run.
+  It therefore mirrors `src/components/Home.tsx` + `PipelineCard.tsx` EXACTLY as
+  they exist today, so a red run means the machinery is broken rather than the
+  feature being unbuilt. Do not "improve" the design here — improvements belong
+  to ms-52, whose real design mocks live in docs/mocks/web/.
+
+  Self-contained by design: no build step, no external requests, no fonts.
+  Open it in a browser.
+
+  Seed data matches e2e/smoke.spec.ts's SEEDED_PIPELINE so the fixture server
+  (#1538) and the existing smoke suite describe the same two items.
+
+  Amended (see #1950): the header was re-synced to the post-#1547 PanelHeader
+  shell (`coord`/`pipeline` -> `Pipeline` + a "N tracked" count). Only the
+  header changed; the rest of this mock is untouched. §4d/§4f (stage-chip
+  order and the always-skipped test chip, #1724) remain deliberately unfixed.
+-->
+<style>
+  :root {
+    --background: #0d1117;
+    --foreground: #c9d1d9;
+    --card: #161b22;
+    --primary: #1f6feb;
+    --primary-foreground: #ffffff;
+    --secondary: #21262d;
+    --muted-foreground: #8b949e;
+    --border: #30363d;
+    --green: #15803d;
+    --radius: 0.5rem;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--background);
+    color: var(--foreground);
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  .screen { max-width: 32rem; margin: 0 auto; padding: 1.5rem 1rem; }
+
+  /* Header — PanelHeader (#1547). Was `coord` / `pipeline` before the M-W1 shell landed;
+     see the §1 amendment note in contract.md (#1950). */
+  header { display: flex; align-items: center; gap: .625rem; margin-bottom: 1.25rem; }
+  .co-badge {
+    display: grid; place-items: center; flex-shrink: 0;
+    width: 22px; height: 22px; border-radius: .375rem;
+    background: linear-gradient(to bottom right, var(--primary), #1a56b0);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: .62rem; font-weight: 700; color: #0b1013;
+  }
+  h1 { margin: 0; font-size: 1.15rem; font-weight: 600; color: var(--foreground); }
+  .header-count {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: .75rem; color: var(--muted-foreground);
+  }
+  .header-right { display: flex; align-items: center; gap: .5rem; margin-left: auto; }
+  .updated { font-size: .75rem; color: var(--muted-foreground); }
+
+  /* Filter tabs */
+  [role="tablist"] { display: flex; gap: .5rem; margin-bottom: 1rem; }
+  [role="tab"] {
+    display: inline-flex; align-items: center; gap: .375rem;
+    border-radius: 9999px; padding: .25rem .75rem;
+    font-size: .75rem; font-weight: 500; cursor: pointer;
+    background: transparent; color: var(--muted-foreground);
+    border: 1px solid var(--border);
+  }
+  [role="tab"][aria-selected="true"] {
+    background: var(--primary); color: var(--primary-foreground);
+    border-color: transparent; font-weight: 600;
+  }
+  .tab-count {
+    border-radius: 9999px; padding: 0 .375rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .75rem;
+    background: var(--secondary);
+  }
+  [role="tab"][aria-selected="true"] .tab-count { background: rgba(255,255,255,.2); }
+
+  /* Cards */
+  section { display: flex; flex-direction: column; gap: .75rem; }
+  .card {
+    display: block; width: 100%; text-align: left; cursor: pointer;
+    border: 1px solid var(--border); border-radius: var(--radius);
+    background: var(--card); padding: 1rem; color: inherit; font: inherit;
+  }
+  .card-top { display: flex; align-items: flex-start; justify-content: space-between; gap: .75rem; }
+  .card-title { margin: 0; flex: 1; font-size: .875rem; font-weight: 500; }
+  .badge {
+    flex-shrink: 0; border-radius: 9999px; padding: .125rem .5rem;
+    font-size: .75rem; font-weight: 600;
+    background: var(--primary); color: var(--primary-foreground);
+  }
+  .card-meta { margin: .25rem 0 0; font-size: .75rem; color: var(--muted-foreground); }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .chips { display: flex; flex-wrap: wrap; gap: .375rem; margin-top: .75rem; }
+  .chip {
+    border-radius: .25rem; padding: .125rem .375rem;
+    font-size: .75rem; font-weight: 500;
+    border: 1px solid var(--border); color: var(--muted-foreground);
+  }
+  .chip.current { background: var(--primary); color: var(--primary-foreground); border-color: transparent; }
+  .chip.completed { background: var(--green); color: #fff; border-color: transparent; }
+  /* "skipped" — the greyed-out state. The test chip is ALWAYS this today; see #1724. */
+  .chip.skipped { opacity: .4; }
+
+  /* Work done (collapsed) */
+  .done-toggle {
+    display: flex; width: 100%; align-items: center; justify-content: space-between;
+    margin-top: .75rem; border: 1px solid var(--border); border-radius: var(--radius);
+    background: var(--card); padding: .5rem 1rem;
+    text-align: left; font-size: .75rem; font-weight: 500;
+    color: var(--muted-foreground); cursor: pointer;
+  }
+</style>
+</head>
+<body>
+<div class="screen">
+
+  <header>
+    <!-- Decorative, md:hidden in the real app — not part of the contract. -->
+    <span class="co-badge" aria-hidden="true">co</span>
+    <h1>Pipeline</h1>
+    <!--
+      Header count == counts.active == the Active tab's count below (3).
+      Distinct element from the tab count (§2d) but the same underlying value.
+    -->
+    <span class="header-count">3 tracked</span>
+    <div class="header-right">
+      <span class="updated">10:42:07 AM</span>
+    </div>
+  </header>
+
+  <div role="tablist" aria-label="Pipeline filters">
+    <!--
+      Count is 3, not 2: the tab count is EVERY non-merged item, while the list
+      below shows only the 2 in-progress ones — the third is collapsed into
+      "Work done (1)". Count != visible cards. See contract §2d.
+    -->
+    <button type="button" role="tab" aria-selected="true">
+      Active <span class="tab-count">3</span>
+    </button>
+    <button type="button" role="tab" aria-selected="false">
+      Needs me
+    </button>
+  </div>
+
+  <section aria-label="Active items">
+
+    <button type="button" class="card">
+      <div class="card-top">
+        <p class="card-title">Fix the dashboard rendering</p>
+        <span class="badge">running</span>
+      </div>
+      <p class="card-meta">api <span class="mono">#42</span> · laptop</p>
+      <!--
+        FOUR chips, and the order is work, review, TEST, merge — Review before
+        Test. That is what the API emits today (`coding, review, smoke, merge`,
+        hardcoded in coord/pipeline.py) even though pipeline.default_gates is
+        ["test","review","merge"]. The test chip is greyed because the projection
+        calls the gate "smoke" while the config calls it "test", so the lookup
+        never matches and it is emitted as `skipped` on every item. Both are
+        BUGS — see #1724 — pinned here deliberately because this contract must
+        describe the app as it is, or #1544's first run goes red for the wrong
+        reason. Amend this mock when #1724 lands.
+      -->
+      <div class="chips">
+        <span class="chip current">work</span>
+        <span class="chip">review</span>
+        <span class="chip skipped">test</span>
+        <span class="chip">merge</span>
+      </div>
+    </button>
+
+    <button type="button" class="card">
+      <div class="card-top">
+        <p class="card-title">Refactor merge queue</p>
+        <span class="badge">running</span>
+      </div>
+      <p class="card-meta">api <span class="mono">#99</span> · server</p>
+      <div class="chips">
+        <span class="chip completed">work</span>
+        <span class="chip current">review</span>
+        <span class="chip skipped">test</span>
+        <span class="chip">merge</span>
+      </div>
+    </button>
+
+  </section>
+
+  <section aria-label="Work done">
+    <button type="button" class="done-toggle" aria-expanded="false">
+      <span>Work done (1)</span>
+      <span aria-hidden="true">&#9656;</span>
+    </button>
+  </section>
+
+</div>
+</body>
+</html>
