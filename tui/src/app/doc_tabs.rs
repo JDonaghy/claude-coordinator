@@ -1426,6 +1426,29 @@ struct PersistedTabs {
 /// `pipeline` scope (that is the shape the sealed §6 restore fixture pins),
 /// while a freshly clicked Pipeline tab is slug-keyed — a restore must keep
 /// honouring both.
+///
+/// This covers the Pipeline panel completely, not just the common case:
+/// `pipeline_issues_from_cache` only ever emits a `PipelineIssue` it found in
+/// `open_issues` — including the untracked-epic-child backfill, whose
+/// "aged out of the `open_issues` cache (#771)" arm `continue`s rather than
+/// pushing a row. So every key the Pipeline click path can mint
+/// (`pipeline_issues[idx].repo_slug`) belongs to an issue that IS in
+/// `open_issues`, and is therefore in this set under its slug spelling.
+///
+/// # Known remaining gap (Board scope) — out of scope for #2481
+///
+/// The Board sidebar is NOT sourced from `open_issues` alone:
+/// `issues_by_repo` also synthesises an `IssueGroup` per `(repo,
+/// issue_number)` found in `data.assignments`, so an issue dispatched via
+/// `coord assign` before its repo's first `coord sync` (or one that has aged
+/// out of the cache) still gets a Board row — the same "assignment-only Board
+/// entries" case `apply_pending_data`'s terminal-session pruning already
+/// calls out by name. A Board document tab opened on such a row is still
+/// pruned by the next tick, because that issue is in neither spelling here.
+/// #2481 explicitly scopes itself to Pipeline and asks for a follow-up rather
+/// than a fix; sourcing the Board half from `board_issues_cache` (which is
+/// exactly the set of issues the Board can show) is the shape that would
+/// close it.
 pub(crate) fn known_doc_keys(data: &BoardData) -> HashSet<DocKey> {
     let slug_of: std::collections::HashMap<&str, &str> = data
         .pipeline_repos
