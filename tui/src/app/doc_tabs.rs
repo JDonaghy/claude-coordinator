@@ -997,6 +997,38 @@ impl DocTabs {
     /// thread's sandbox window; that needs the injectable `~/.coord` seam
     /// `tests/acceptance/ms-65/manifest.yml` finding 14b flags as a
     /// repo-wide follow-up, or a single-threaded acceptance binary.
+    ///
+    /// # Why the residue cannot be closed from inside this crate
+    ///
+    /// The residue narrows to ONE interleaving: a foreign thread calls
+    /// `claim_origin` for a sandbox in the gap between `HomeSandbox::new`'s
+    /// `set_var("HOME", …)` and the owning test's own `make_test_app`
+    /// (`restart_with` spends one `fs::write` there, so ~0.2 ms of a ~70 ms
+    /// sandbox window). First-loader-wins then names the foreign thread, so
+    /// it reads the seeded `tabs.json` its own test never wrote *and* the
+    /// owner is refused its own file. A foreign thread that arrives any
+    /// LATER in the window is already handled correctly — it is refused and
+    /// falls back to `origin == None`.
+    ///
+    /// That gap is not closable here, because at claim time the owner and a
+    /// foreign thread are indistinguishable from process state: `HOME` is
+    /// per-PROCESS, not per-thread, so both observe the identical value, the
+    /// identical sandbox directory and the identical seeded file, and
+    /// nothing in `std` reports which thread called `set_var`. Any fix needs
+    /// cooperation from the sandbox (the injectable seam finding 14b asks
+    /// for) or serialisation of the whole binary. Timing heuristics — claim
+    /// only within N ms of the sandbox directory's creation — were
+    /// considered and rejected: they merely swap a foreign thread's silent
+    /// pollution for the owner's own test failing when it is descheduled
+    /// past the threshold.
+    ///
+    /// Measured on this branch at `HEAD`, over 70 full runs of the sealed
+    /// ms-65 + ms-38 acceptance binary (30 sequential, then 40 as four
+    /// concurrent processes on a 20-core host): 3 residue events, all in
+    /// `tabs_persistence_2286` / `tabs_discoverability_2287`, and 0 in
+    /// `board_split_2288` — which is 17/17 green across all 70, plus four
+    /// `coord acceptance run --issue 2288` invocations. The 40 runs under
+    /// 4× oversubscription produced no residue event at all.
     pub(crate) fn path() -> Option<PathBuf> {
         let home = std::env::var_os("HOME").map(PathBuf::from)?;
         #[cfg(any(test, feature = "test-support"))]
