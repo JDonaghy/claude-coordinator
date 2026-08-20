@@ -28,6 +28,20 @@ permission:
     "git branch*": allow
     "git rev-parse*": allow
     "git push*": allow
+    # #2463: force-push carve-out, listed AFTER "git push*": allow above so
+    # it wins under last-match-wins ordering (confirmed against a real
+    # opencode binary, see docs/OPENCODE_VERIFICATION.md "Rule precedence
+    # is last-match-wins, not first-match-wins" — a deny rule earlier in
+    # this list than the allow it's meant to override is silently
+    # swallowed). Mirrors coord/config.py's DEFAULT_DENY_COMMANDS
+    # force-push entries, including the #2314 reordered-flag pairing (a
+    # flag inserted before -f/--force still denies) — an unrestricted "git
+    # push*": allow would otherwise let a worker force-push over another
+    # worker's branch or silently rewrite pushed history.
+    "git push -f*": deny
+    "git push --force*": deny
+    "git push * -f*": deny
+    "git push * --force*": deny
     "cargo *": allow
     "make*": allow
     "pytest*": allow
@@ -40,6 +54,25 @@ permission:
   edit:
     "*": allow
     "tests/acceptance/**": deny
+    # #2463: the sealed-oracle prefix above isn't the only high-blast-radius
+    # edit a `work` assignment should never make unsupervised — CI config,
+    # lockfiles, and migrations are the same class of gap already closed
+    # for the Claude-dispatch path's base checkout and sealed acceptance
+    # oracle (coord/agent.py's _sealed_write_guard_tools /
+    # _base_checkout_write_guard_tools), just not yet extended to this
+    # file. A worker that genuinely needs one of these edited should say so
+    # in its final report so the coordinator can make the change itself as
+    # a declared, reviewable exception, rather than the worker silently
+    # editing it inline.
+    ".github/workflows/**": deny
+    "*.lock": deny
+    "**/*.lock": deny
+    "package-lock.json": deny
+    "**/package-lock.json": deny
+    "pnpm-lock.yaml": deny
+    "**/pnpm-lock.yaml": deny
+    "migrations/**": deny
+    "**/migrations/**": deny
   external_directory: deny
 ---
 You are an opencode worker executing an assignment from the coordinator.
@@ -54,7 +87,14 @@ They are managed by the coordinator.
 - You are already on a feature branch. Commit your work to this branch. \
 Push with `git push origin HEAD`. \
 NEVER commit or push to main or develop directly. \
-Do NOT open a PR — the coordinator handles that.
+Do NOT open a PR — the coordinator handles that. \
+`git push -f`/`--force` (in any argument position) is denied — you can \
+push new commits, never rewrite history that's already on the remote.
+- Editing `.github/workflows/**`, lockfiles (`*.lock`, `package-lock.json`, \
+`pnpm-lock.yaml`), or anything under a `migrations/` directory is denied. \
+If your assignment genuinely needs one of these changed, say so in your \
+final report instead of finding a way around the block — the coordinator \
+makes that change as a declared, reviewable exception.
 - Work only inside your current working directory. It is your own git \
 worktree, checked out from a repo that also lives at `~/src/<repo>` on this \
 machine — never read or write anything under `~/src/<repo>` (or any other \
