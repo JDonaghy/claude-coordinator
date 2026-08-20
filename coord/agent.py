@@ -4056,6 +4056,34 @@ def check_worktree_writable(
     return None
 
 
+def _claude_md_system_prompt_suffix(repo_path: str) -> str:
+    """Return a system-prompt suffix embedding the target repo's CLAUDE.md.
+
+    #2462: worker dispatch below passes ``--bare``, which disables Claude
+    Code's own automatic CLAUDE.md auto-discovery (along with hooks,
+    ``.mcp.json``, and settings — see the ``--bare`` comment in
+    :func:`default_worker_command`). Nothing else in a work-shaped leg's
+    briefing embeds the target repo's actual CLAUDE.md text, so without this
+    a worker would silently lose every per-repo convention, testing rule,
+    and sealed-path note that isn't hardcoded into the repo-agnostic
+    ``WORKER_SYSTEM_PROMPT``.
+
+    Mirrors :func:`coord.review.read_repo_claude_md`, which the review leg
+    already uses for the same reason (a review must never run blind to
+    CLAUDE.md) — this repo's own CLAUDE.md says it is "loaded into every
+    worker leg, every review leg, and every coordinator session", so the
+    work-shaped legs need the identical defensive read now that ambient
+    discovery is gone. Returns ``""`` (a no-op suffix) when the repo has no
+    CLAUDE.md or it can't be read.
+    """
+    from coord.review import read_repo_claude_md  # noqa: PLC0415
+
+    claude_md = read_repo_claude_md(Path(repo_path).expanduser())
+    if not claude_md:
+        return ""
+    return "\n\n## Project rules (from CLAUDE.md)\n\n" + claude_md.strip() + "\n"
+
+
 def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER_BINARY) -> list[str]:
     """Build the argv for invoking the worker on this assignment.
 
@@ -4078,6 +4106,9 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
     """
     if spec.type == "plan":
         system_prompt = spec.system_prompt if spec.system_prompt else WORKER_PLAN_PROMPT
+        # #2462: --bare drops CLAUDE.md auto-discovery; a plan leg still
+        # needs the target repo's conventions to plan against.
+        system_prompt += _claude_md_system_prompt_suffix(spec.repo_path)
         allowed_tools = "Read,Bash"
     elif spec.type == "refinement":
         # #264: refinement is a developer-driven chat for scoping an issue.
@@ -4131,6 +4162,8 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
         # and deny list instead of the generic WORKER_SYSTEM_PROMPT.
         system_prompt = spec.system_prompt if spec.system_prompt else MOCK_AUTHOR_SYSTEM_PROMPT
         system_prompt += build_deny_prompt(MOCK_AUTHOR_DENY_COMMANDS)
+        # #2462: --bare drops CLAUDE.md auto-discovery.
+        system_prompt += _claude_md_system_prompt_suffix(spec.repo_path)
         allowed_tools = "Read,Edit,Write,Bash"
     elif spec.type == "smoke":
         # #2301: smoke gets its own branch instead of falling through to the
@@ -4182,6 +4215,11 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
     else:
         system_prompt = spec.system_prompt if spec.system_prompt else WORKER_SYSTEM_PROMPT
         system_prompt += build_deny_prompt(spec.deny_commands)
+        # #2462: --bare drops CLAUDE.md auto-discovery for this catch-all
+        # branch too — it covers "work", "fix", "conflict-fix", and
+        # "test-author", every one of which edits code and needs the
+        # target repo's conventions. See _claude_md_system_prompt_suffix.
+        system_prompt += _claude_md_system_prompt_suffix(spec.repo_path)
         # #2169: `Monitor` is the sanctioned way to poll a backgrounded
         # long-running command in bounded steps (see the ONE-SHOT section of
         # WORKER_SYSTEM_PROMPT) instead of a foreground loop that blocks
@@ -4233,12 +4271,20 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
         # code.claude.com/docs/en/headless.md). `--bare` is the flag that
         # closes all three sources (settings, hooks, .mcp.json) at once, plus
         # LSP/plugin-sync/CLAUDE.md auto-discovery — none of which a headless
-        # worker should be picking up from the target repo's own checkout
-        # either. A worker's permission profile is fully controlled by the
-        # --allowedTools / --disallowedTools / --permission-mode flags in
-        # this function (and its own hard-coded system prompt); it needs no
-        # MCP servers (no spec.type grants the `Agent` tool, so `--agents`
-        # is unneeded too) and no `--settings`.
+        # worker should be picking up *ambiently* from the target repo's own
+        # checkout either. A worker's permission profile is fully controlled
+        # by the --allowedTools / --disallowedTools / --permission-mode
+        # flags in this function (and its own hard-coded system prompt); it
+        # needs no MCP servers (no spec.type grants the `Agent` tool, so
+        # `--agents` is unneeded too) and no `--settings`.
+        #
+        # CLAUDE.md is the one exception worth calling out: losing its
+        # *ambient* auto-discovery does NOT mean a work-shaped leg loses the
+        # content. `_claude_md_system_prompt_suffix` (see the branches
+        # above: "plan", "mock-author", and this catch-all "else") reads it
+        # explicitly off *spec.repo_path* and embeds it into --system-prompt
+        # instead — the same defensive pattern coord.review.read_repo_claude_md
+        # already used for review legs (#2462).
         #
         # AUTH CAVEAT: per Claude Code's own docs, `--bare` "never reads
         # OAuth credentials or the system keychain" — only `ANTHROPIC_API_KEY`

@@ -147,8 +147,8 @@ def _dispatch_review_of(
 
     from coord.review import (  # noqa: PLC0415
         REVIEWER_SYSTEM_PROMPT,
-        _read_repo_claude_md,
         build_review_briefing,
+        read_repo_claude_md,
     )
     from coord.models import Assignment  # noqa: PLC0415
     from coord.state import (  # noqa: PLC0415
@@ -194,7 +194,7 @@ def _dispatch_review_of(
     # have the reviewer read ./CLAUDE.md in the remote checkout it sits
     # in (its actual rules, not the coordinator's possibly-divergent copy).
     claude_md = (
-        _read_repo_claude_md(Path(review_repo_path)) if _is_local else ""
+        read_repo_claude_md(Path(review_repo_path)) if _is_local else ""
     )
 
     # #612: embed the merge-base (three-dot) diff so the reviewer has
