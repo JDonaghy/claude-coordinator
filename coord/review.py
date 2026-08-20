@@ -1213,7 +1213,7 @@ def _ranked_reviewer_candidates(
 
 # ── Briefing construction ───────────────────────────────────────────────────
 
-def _read_repo_claude_md(repo_path: Path) -> str | None:
+def read_repo_claude_md(repo_path: Path) -> str | None:
     """Return the contents of CLAUDE.md at the repo root, or None.
 
     The coordinator runs on the machine that dispatches; the reviewer runs on
@@ -1221,6 +1221,12 @@ def _read_repo_claude_md(repo_path: Path) -> str | None:
     here so the briefing is self-contained — if the reviewer's checkout is
     behind, the worker's diff still gets reviewed against the rules the
     coordinator thought were current.
+
+    Public (no leading underscore) because #2462 reuses it from
+    :mod:`coord.agent` — since worker dispatch switched to ``--bare``,
+    Claude Code's own CLAUDE.md auto-discovery no longer runs for
+    work-shaped legs, so ``default_worker_command`` embeds this the same
+    defensive way the review briefing already did.
     """
     candidate = repo_path / "CLAUDE.md"
     if not candidate.exists():
@@ -1883,7 +1889,7 @@ def dispatch_review(
     *,
     http_client: httpx.Client | None = None,
     pr_lookup=_find_or_open_pr,
-    claude_md_reader=_read_repo_claude_md,
+    claude_md_reader=read_repo_claude_md,
     issue_body_fetcher=None,
     now: float | None = None,
     terminal_cache: dict | None = None,

@@ -1568,6 +1568,77 @@ def test_default_worker_command_uses_bare_mode_for_plan_type() -> None:
     assert "--setting-sources" not in argv
 
 
+def test_default_worker_command_embeds_claude_md_for_work_type(tmp_path: Path) -> None:
+    """#2462: `--bare` disables Claude Code's own CLAUDE.md auto-discovery,
+    so a work-shaped leg would otherwise never see the target repo's
+    CLAUDE.md at all. default_worker_command must embed it into the
+    --system-prompt argv itself, mirroring the review leg's
+    read_repo_claude_md defensive read (coord/review.py)."""
+    (tmp_path / "CLAUDE.md").write_text("# Project rules\n\nAlways use tabs.\n")
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path=str(tmp_path),
+        issue_number=1,
+        issue_title="t",
+        briefing="b",
+    )
+    argv = default_worker_command(spec)
+    assert "--bare" in argv
+    idx = argv.index("--system-prompt")
+    system_prompt = argv[idx + 1]
+    assert "Always use tabs." in system_prompt
+    assert "Project rules (from CLAUDE.md)" in system_prompt
+
+
+def test_default_worker_command_embeds_claude_md_for_plan_type(tmp_path: Path) -> None:
+    """Same defensive read applies to type='plan', which gets its own
+    branch in default_worker_command rather than falling into the
+    catch-all 'work' else-branch."""
+    (tmp_path / "CLAUDE.md").write_text("# Project rules\n\nNo emoji.\n")
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path=str(tmp_path),
+        issue_number=1,
+        issue_title="t",
+        briefing="b",
+        type="plan",
+    )
+    argv = default_worker_command(spec)
+    idx = argv.index("--system-prompt")
+    assert "No emoji." in argv[idx + 1]
+
+
+def test_default_worker_command_embeds_claude_md_for_mock_author_type(tmp_path: Path) -> None:
+    """Same defensive read applies to type='mock-author'."""
+    (tmp_path / "CLAUDE.md").write_text("# Project rules\n\nGate A first.\n")
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path=str(tmp_path),
+        issue_number=1,
+        issue_title="[gate-a] t",
+        briefing="b",
+        type="mock-author",
+    )
+    argv = default_worker_command(spec)
+    idx = argv.index("--system-prompt")
+    assert "Gate A first." in argv[idx + 1]
+
+
+def test_default_worker_command_no_claude_md_is_a_noop(tmp_path: Path) -> None:
+    """A repo with no CLAUDE.md must not blow up or inject an empty section
+    header into the system prompt."""
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path=str(tmp_path),
+        issue_number=1,
+        issue_title="t",
+        briefing="b",
+    )
+    argv = default_worker_command(spec)
+    idx = argv.index("--system-prompt")
+    assert "Project rules (from CLAUDE.md)" not in argv[idx + 1]
+
+
 def test_deny_pattern_blocks_path_matches_blanket_prefix() -> None:
     from coord.agent import _deny_pattern_blocks_path
 
