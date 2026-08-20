@@ -91,6 +91,7 @@ from coord.notifier.cli import notifier_group
 # client, coord/commands/portal.py is the CLI over it.
 from coord.commands.portal import portal_group
 from coord.commands.merge import (
+    backfill_review_cost,
     bounce,
     merge,
     post_pending_reviews,
@@ -442,6 +443,7 @@ main.add_command(unqueue)
 main.add_command(set_test_mode)
 main.add_command(notify)
 main.add_command(post_pending_reviews)
+main.add_command(backfill_review_cost)
 main.add_command(merge)
 main.add_command(resume)
 main.add_command(test)

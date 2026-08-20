@@ -576,6 +576,48 @@ def _make_log_with_review(tmp_path: Path, verdict: str, body: str) -> str:
     return str(log)
 
 
+def _make_log_with_review_and_cost(
+    tmp_path: Path,
+    verdict: str,
+    body: str,
+    cost: float,
+    *,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+) -> str:
+    """Write a stream-json log carrying BOTH a structured review verdict (in
+    an assistant turn) and a final `result` event with `total_cost_usd` —
+    the real shape a reviewer's log has (#2476): `parse_review_from_log`
+    picks the verdict off the assistant text, `parse_usage_from_log` picks
+    the cost off the terminal `result` event, both from the same file.
+    """
+    import json as _json
+
+    log = tmp_path / "review_with_cost.log"
+    lines = [
+        _json.dumps({
+            "type": "assistant",
+            "message": {"content": [{
+                "type": "text",
+                "text": f"REVIEW_VERDICT: {verdict}\nREVIEW_BODY:\n{body}\nEND_REVIEW",
+            }]},
+        }),
+        _json.dumps({
+            "type": "result",
+            "subtype": "success",
+            "result": "done",
+            "total_cost_usd": cost,
+            "num_turns": 3,
+            "duration_ms": 12345,
+            "session_id": "test-session",
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+        }),
+    ]
+    log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return str(log)
+
+
 class TestReviewNotify:
     def test_review_approve_posts_pr_review(
         self, coord_dir: Path, config: Config, tmp_path: Path
@@ -1002,6 +1044,135 @@ class TestPostOrphanedReviewFindings:
         assert verdict_arg == "approve"
         assert body_arg.startswith("<!-- coord:review verdict=approve")
         assert "All clear." in body_arg
+
+    # ── #2476: cost/token capture on the orphaned-findings path ────────────
+    #
+    # Root cause: `post_orphaned_review_findings` (run_drain's step 4, which
+    # runs on EVERY ~60s drain tick, not just as manual cleanup) is where the
+    # large majority of review completions actually get their GitHub comment
+    # posted — the direct `detect_transitions` → `post_transition` path
+    # (which DOES call `_capture_cost`) frequently misses the window. Until
+    # now `post_orphaned_review_findings` recovered the verdict from the
+    # SAME log but never captured cost/tokens — and once the row is marked
+    # `notified`/`review_posted_at`, nothing else ever revisits it, so
+    # `cost_usd` stayed NULL forever. These tests exercise the row shape
+    # this bug actually produces: a review already `status='done'` (the
+    # "finalizing"-tick promotion already happened) with `review_posted_at
+    # IS NULL` — exactly what `load_done_reviews_needing_post` selects.
+
+    def test_captures_cost_for_orphaned_review(
+        self, coord_dir: Path, config: Config, tmp_path: Path
+    ) -> None:
+        """A review recovered via the orphaned-findings path still ends up
+        with cost_usd/tokens populated, at the same reliability as the
+        direct post_transition path (#2476)."""
+        _record_review_assignment("orphan-cost1", review_target="91")
+        from coord.db import get_connection
+        conn = get_connection()
+        conn.execute(
+            "UPDATE assignments SET status='done', finished_at=1234.0 "
+            "WHERE assignment_id='orphan-cost1'"
+        )
+        conn.commit()
+
+        log_path = _make_log_with_review_and_cost(
+            tmp_path, "approve", "Orphaned + costed.", 1.23,
+            input_tokens=100, output_tokens=50,
+        )
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("orphan-cost1", "done", log_path=log_path)],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.notify.github_ops.post_pr_review"), \
+             patch("coord.dispatch.github_ops.post_issue_comment"):
+            posted = notify_mod.post_orphaned_review_findings(config)
+
+        assert "orphan-cost1" in posted
+
+        row = get_connection().execute(
+            "SELECT cost_usd, input_tokens, output_tokens "
+            "FROM assignments WHERE assignment_id='orphan-cost1'"
+        ).fetchone()
+        assert row is not None
+        assert row["cost_usd"] == 1.23
+        assert row["input_tokens"] == 100
+        assert row["output_tokens"] == 50
+
+    def test_captures_cost_even_when_findings_unparseable(
+        self, coord_dir: Path, config: Config, tmp_path: Path
+    ) -> None:
+        """Cost/token capture on the orphaned path is independent of whether
+        the review verdict itself can be parsed — a row whose body can't be
+        recovered should still have its cost recovered from the same log."""
+        _record_review_assignment("orphan-cost2", review_target="92")
+        from coord.db import get_connection
+        conn = get_connection()
+        conn.execute(
+            "UPDATE assignments SET status='done', finished_at=1234.0 "
+            "WHERE assignment_id='orphan-cost2'"
+        )
+        conn.commit()
+
+        log_path = _make_log_with_cost(tmp_path, 0.42)
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("orphan-cost2", "done", log_path=log_path)],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.notify.github_ops.post_pr_review") as mock_review:
+            posted = notify_mod.post_orphaned_review_findings(config)
+
+        # No structured findings in this log → nothing posted...
+        assert posted == []
+        mock_review.assert_not_called()
+
+        # ...but cost was still captured from the same log.
+        row = get_connection().execute(
+            "SELECT cost_usd FROM assignments WHERE assignment_id='orphan-cost2'"
+        ).fetchone()
+        assert row is not None
+        assert row["cost_usd"] == 0.42
+
+    def test_captures_cost_via_full_notify_run(
+        self, coord_dir: Path, config: Config, tmp_path: Path
+    ) -> None:
+        """End-to-end: `notify.run()` (the entry point the daemon's drain
+        tick and `coord notify` both actually call) reaches cost capture via
+        its internal call to `post_orphaned_review_findings`, exactly the
+        same as it does for a `work` completion through `post_transition`
+        (see `TestCostCapture` above) — mirrors #2476's acceptance bar of
+        matching `work`/`smoke`/`conflict-fix`'s reliability."""
+        _record_review_assignment("orphan-cost3", review_target="93")
+        from coord.db import get_connection
+        conn = get_connection()
+        conn.execute(
+            "UPDATE assignments SET status='done', finished_at=1234.0 "
+            "WHERE assignment_id='orphan-cost3'"
+        )
+        conn.commit()
+
+        log_path = _make_log_with_review_and_cost(
+            tmp_path, "approve", "Looks fine.", 3.14, input_tokens=42, output_tokens=7,
+        )
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("orphan-cost3", "done", log_path=log_path)],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.notify.github_ops.post_pr_review"), \
+             patch("coord.dispatch.github_ops.post_issue_comment"):
+            notify_mod.run(config)
+
+        row = get_connection().execute(
+            "SELECT cost_usd, input_tokens, output_tokens, review_posted_at "
+            "FROM assignments WHERE assignment_id='orphan-cost3'"
+        ).fetchone()
+        assert row is not None
+        assert row["review_posted_at"] is not None  # verdict was posted too
+        assert row["cost_usd"] == 3.14
+        assert row["input_tokens"] == 42
+        assert row["output_tokens"] == 7
 
     def test_load_done_reviews_needing_post_filters_by_repo(
         self, coord_dir: Path, config: Config

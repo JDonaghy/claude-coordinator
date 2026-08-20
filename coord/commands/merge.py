@@ -883,6 +883,85 @@ def post_pending_reviews(config_path: Path, repo_name: str | None) -> None:
             )
 
 
+@click.command(
+    "backfill-review-cost",
+    help=(
+        "One-shot repair for #2476: capture cost/tokens for review "
+        "assignments left at cost_usd IS NULL/0 by the review-completion "
+        "capture gap (post_orphaned_review_findings recovered the verdict "
+        "but never captured cost/tokens — fixed going forward, this repairs "
+        "the backlog it already created).\n\n"
+        "Walks every terminal type='review' row with cost_usd IS NULL or 0, "
+        "tries the local log first, then the assignment's agent /logs/<id> "
+        "endpoint, parses, and persists via the same "
+        "update_assignment_cost/update_assignment_tokens writers the live "
+        "capture path uses — no new write mechanism. Run once per machine "
+        "that hosts review logs; logs that have already aged out (or "
+        "whose agent is offline) are reported as still-missing rather than "
+        "silently dropped, so the residual gap stays known."
+    ),
+)
+@_CONFIG_OPTION
+@click.option("--repo", "repo_name", default=None, help="Only process assignments for this repo.")
+def backfill_review_cost(config_path: Path, repo_name: str | None) -> None:
+    from coord.notify import _capture_cost_and_tokens_for_review
+    from coord.state import load_review_assignments_missing_cost
+    from coord.usage import LOGS_DIR
+
+    cfg = _load_config(config_path)
+    machines_by_name = {m.name: m for m in cfg.machines}
+
+    candidates = load_review_assignments_missing_cost(repo_name=repo_name)
+    if not candidates:
+        click.echo("No review assignments with missing cost/tokens found.")
+        return
+
+    click.echo(f"Found {len(candidates)} review assignment(s) with missing cost/tokens:")
+    for row in candidates:
+        click.echo(
+            f"  {row['assignment_id']} — {row['repo_name']} #{row['issue_number']} "
+            f"(machine: {row['machine_name']})"
+        )
+
+    recovered: list[dict] = []
+    still_missing: list[dict] = []
+    for row in candidates:
+        aid = row["assignment_id"]
+        machine = machines_by_name.get(row["machine_name"])
+        host = machine.host if machine is not None else None
+        # #2476: always offer the conventional local path — it resolves
+        # correctly whenever this command runs on the same box that hosted
+        # the review (the common case for a per-machine repair run), and is
+        # a harmless miss otherwise (falls straight through to the *host*
+        # fetch below, same as `_capture_cost_and_tokens_for_review` already
+        # does for every other caller).
+        log_path = str(LOGS_DIR / f"{aid}.log")
+        wrote = _capture_cost_and_tokens_for_review(
+            aid, log_path=log_path, host=host,
+            provider_name=row.get("provider_name"),
+        )
+        (recovered if wrote else still_missing).append(row)
+
+    click.echo(f"\nRecovered cost/tokens for {len(recovered)} assignment(s):")
+    for row in recovered:
+        click.echo(f"  {row['assignment_id']} — {row['repo_name']} #{row['issue_number']}")
+
+    if still_missing:
+        click.echo(
+            f"\n{len(still_missing)} assignment(s) still missing "
+            "(log gone on disk and agent unreachable/offline):"
+        )
+        for row in still_missing:
+            click.echo(
+                f"  {row['assignment_id']} — {row['repo_name']} #{row['issue_number']} "
+                f"(machine: {row['machine_name']})"
+            )
+    click.echo(
+        f"\nSummary: {len(recovered)} recovered, {len(still_missing)} still missing "
+        f"of {len(candidates)} total."
+    )
+
+
 def _load_issue_states() -> tuple[dict[str, set[int]], dict[str, set[int]]]:
     """Return ``(open_by_repo, known_by_repo)``.
 

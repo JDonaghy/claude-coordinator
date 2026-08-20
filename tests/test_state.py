@@ -2204,3 +2204,100 @@ class TestVerdictSourceRoundTrip:
         row = next(a for a in board.completed if a.assignment_id == "rev-vs-2")
         assert row.verdict_source == "recovered"
         assert row.verdict_source_reason == "header missing, recovered from transcript"
+
+
+class TestLoadReviewAssignmentsMissingCost:
+    """#2476: coord.state.load_review_assignments_missing_cost — feeds the
+    `coord backfill-review-cost` one-shot repair."""
+
+    def _review(self, aid: str, *, status: str, cost_usd: float | None = None):
+        from coord.models import Assignment
+
+        return Assignment(
+            machine_name="laptop", repo_name="api", issue_number=42,
+            issue_title="[review] fix", assignment_id=aid, type="review",
+            status=status, dispatched_at=1.0, finished_at=2.0,
+            cost_usd=cost_usd,
+        )
+
+    def test_finds_terminal_review_with_null_cost(self, coord_db) -> None:
+        from coord.models import Board
+        from coord.state import load_review_assignments_missing_cost, save_board
+
+        save_board(Board(active=[], completed=[self._review("m1", status="done")]))
+
+        rows = load_review_assignments_missing_cost()
+        assert [r["assignment_id"] for r in rows] == ["m1"]
+
+    def test_excludes_row_that_already_has_cost(self, coord_db) -> None:
+        from coord.models import Board
+        from coord.state import load_review_assignments_missing_cost, save_board
+
+        save_board(Board(
+            active=[], completed=[self._review("m2", status="done", cost_usd=1.5)],
+        ))
+
+        rows = load_review_assignments_missing_cost()
+        assert rows == []
+
+    def test_excludes_zero_cost_row_too(self, coord_db) -> None:
+        """cost_usd=0.0 is exactly as uncaptured as NULL — must still be a
+        candidate (never actually written by the live capture path, which
+        only ever writes cost > 0, but a defensive belt-and-suspenders
+        check)."""
+        from coord.models import Board
+        from coord.state import load_review_assignments_missing_cost, save_board
+
+        save_board(Board(
+            active=[], completed=[self._review("m3", status="done", cost_usd=0.0)],
+        ))
+
+        rows = load_review_assignments_missing_cost()
+        assert [r["assignment_id"] for r in rows] == ["m3"]
+
+    def test_excludes_running_pending_and_finalizing(self, coord_db) -> None:
+        """A still-in-flight or not-yet-promoted review has no final cost to
+        recover yet — those are for the live path (or a later backfill run),
+        not this one-shot repair."""
+        from coord.models import Board
+        from coord.state import load_review_assignments_missing_cost, save_board
+
+        save_board(Board(active=[
+            self._review("running1", status="running"),
+            self._review("pending1", status="pending"),
+            self._review("finalizing1", status="finalizing"),
+        ], completed=[]))
+
+        rows = load_review_assignments_missing_cost()
+        assert rows == []
+
+    def test_includes_failed_and_advisory(self, coord_db) -> None:
+        """Cost capture is independent of whether the review's findings post
+        succeeded — a failed/advisory review still spent real money and
+        should still be recovered."""
+        from coord.models import Board
+        from coord.state import load_review_assignments_missing_cost, save_board
+
+        save_board(Board(active=[], completed=[
+            self._review("failed1", status="failed"),
+            self._review("adv1", status="advisory"),
+        ]))
+
+        rows = {r["assignment_id"] for r in load_review_assignments_missing_cost()}
+        assert rows == {"failed1", "adv1"}
+
+    def test_filters_by_repo(self, coord_db) -> None:
+        from coord.models import Assignment, Board
+        from coord.state import load_review_assignments_missing_cost, save_board
+
+        other_repo = Assignment(
+            machine_name="laptop", repo_name="other", issue_number=1,
+            issue_title="[review] fix", assignment_id="other1", type="review",
+            status="done", dispatched_at=1.0, finished_at=2.0,
+        )
+        save_board(Board(
+            active=[], completed=[self._review("api1", status="done"), other_repo],
+        ))
+
+        rows = load_review_assignments_missing_cost(repo_name="api")
+        assert [r["assignment_id"] for r in rows] == ["api1"]
