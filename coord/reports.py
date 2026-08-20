@@ -2623,6 +2623,13 @@ COMPLETED_COLUMNS = [
     "title",
     "started_at",
     "ended_at",
+    # #2472's four. Appended, never interleaved: the client addresses columns
+    # by INDEX for sorting (`reports_sort_by_column`), so inserting one in the
+    # middle would silently re-point a saved sort at a different column.
+    "legs",
+    "tokens_in",
+    "tokens_out",
+    "cost_total",
 ]
 
 # One entry per COMPLETED_COLUMNS entry, same order (#1760).
@@ -2633,13 +2640,108 @@ COMPLETED_COLUMNS = [
 # server-side report has no such screen context, and its `repo` param
 # defaults to *all repos*, so the pair has to be two real columns — which is
 # also what `issue-activity` already does, and what `RowIdentity` reads.
+#
+# #2472's spend columns reuse `_USAGE_COLUMN_META`'s labels/kinds verbatim
+# (`Legs`, `Tok In`, `Tok Out`, `Total $`) rather than inventing near-synonyms:
+# an operator reading `completed` and `usage` side by side is looking at the
+# same numbers out of the same rollup, and two spellings of "Tok In" would
+# imply otherwise.
+#
+# ONE cost column, not `usage`'s `cost_captured`/`cost_est` split. `usage`
+# splits because it is the dedicated cost report, where "some legs have no
+# captured cost, don't silently price at $0" (#1763) is the headline; here the
+# headline is still the time-range list, and a 5-column table growing to 11
+# would push `title` off a narrow pane. Both halves still ship as extra ROW
+# keys (see `_completed_spend`) — the wire contract allows row keys beyond
+# `columns`, so a client that wants the split has it without another column,
+# and `usage` remains the report to visit for it on screen.
 COMPLETED_COLUMN_META = [
     ColumnMeta(id="repo", label="Repo", kind="text"),
     ColumnMeta(id="issue", label="Issue", kind="int", align="right"),
     ColumnMeta(id="title", label="Title", kind="text", weight=3.0),
     ColumnMeta(id="started_at", label="Started", kind="timestamp"),
     ColumnMeta(id="ended_at", label="Ended", kind="timestamp"),
+    ColumnMeta(id="legs", label="Legs", kind="int", align="right", weight=0.6),
+    ColumnMeta(id="tokens_in", label="Tok In", kind="int", align="right"),
+    ColumnMeta(id="tokens_out", label="Tok Out", kind="int", align="right"),
+    ColumnMeta(id="cost_total", label="Total $", kind="money", align="right"),
 ]
+
+def _completed_spend(
+    assignment_rows: Sequence[Mapping[str, Any]], pricing: Any
+) -> dict[tuple[str, int], dict[str, Any]]:
+    """Per-issue ``legs``/tokens/cost, keyed ``(repo_name, issue_number)``.
+
+    A thin adapter over :func:`coord.usage_rollup.rollup`, **not** a second
+    cost calculator: the pricing rules, the captured-vs-estimated split and
+    the "never silently priced at $0" unknown-model rule all stay in
+    ``usage_rollup``, exactly as #1763 requires, and the numbers are shaped by
+    the same :func:`_usage_metrics` that builds a ``usage`` row.  ``legs``
+    therefore counts agent SESSIONS (every dispatch attempt and retry), which
+    is what ``GroupRollup.legs`` already means — no new arithmetic here.
+
+    One keying detail worth being explicit about: ``rollup``'s ``IssueKey``
+    books a leg to :func:`~coord.usage_rollup.row_issue_number`, i.e.
+    ``for_issue_number`` when the leg carries one (#1553's oracle-loop
+    attribution), while this fold's own ``first_dispatch``/``last_finish`` key
+    on the raw ``issue_number``.  That divergence is DELIBERATE: the whole
+    point of #2472 is that ``completed``'s cost for an issue equals what
+    ``usage`` reports for the same issue, so the cost columns must use
+    ``usage``'s attribution rule.  The timestamps keep #2454's, which is a
+    port of ``completed_rows``.
+    """
+    from coord.usage_rollup import IssueKey, TimeWindow, rollup  # noqa: PLC0415
+
+    # THE WINDOW IS UNBOUNDED — the spend figures are the issue's *lifetime*
+    # spend, not spend inside the report's own window.
+    #
+    # `completed`'s `since`/`until` filters on ENDED — "what finished in this
+    # range". An issue's legs routinely ran before that window opened (a 24h
+    # window over an issue dispatched a week ago is the normal case, not the
+    # edge case), so windowing the cost the same way would answer "what did
+    # this issue cost me *today*" under a column an operator reads as "what did
+    # finishing this issue cost me" — and would report a smaller number every
+    # time the window narrowed, for an issue whose true cost never changed.
+    # `usage` is where a windowed spend question belongs; it has a `window`
+    # param and this report does not.
+    #
+    # Consequence worth stating: an unbounded `TimeWindow` still drops a leg
+    # with NEITHER `dispatched_at` NOR `finished_at` (`leg_in_window` needs one
+    # of the two to be in range, and `contains(None)` is False). Such a row is
+    # not a session that ran — it is a row with no evidence it ever started —
+    # and `usage` excludes it on the same rule.
+    result = rollup(
+        [dict(a) for a in assignment_rows],
+        group_by="issue",
+        window=TimeWindow(),
+        pricing=pricing,
+    )
+    spend: dict[tuple[str, int], dict[str, Any]] = {}
+    for key, group in result.groups.items():
+        if not isinstance(key, IssueKey) or not key.repo_name:
+            continue
+        spend[(str(key.repo_name), int(key.issue_number))] = _usage_metrics(group)
+    return spend
+
+
+#: What a row gets when the rollup saw no legs at all for its issue — a real
+#: zero, not a missing key. An issue can be closed with no assignment ever
+#: dispatched against it (closed by hand, or fixed as a drive-by in someone
+#: else's PR), and that row's honest answer is "0 legs, $0", not a blank cell
+#: a client would have to guess the meaning of.
+_COMPLETED_NO_LEGS: dict[str, Any] = {
+    "legs": 0,
+    "tokens_in": 0,
+    "tokens_out": 0,
+    "cost_captured": 0.0,
+    "cost_est": 0.0,
+    "cost_total": 0.0,
+    "tokens_cache_read": 0,
+    "tokens_cache_creation": 0,
+    "duration_secs": 0.0,
+    "open_legs": 0,
+    "unknown_model_legs": 0,
+}
 
 
 def fold_completed(
@@ -2650,6 +2752,8 @@ def fold_completed(
     *,
     repo: str = "",
     generated_at: float | None = None,
+    pricing: Any = None,
+    extra_notes: Sequence[str] = (),
 ) -> ReportResult:
     """Fold the board's own tables into one row per issue that *finished*
     inside ``window``.
@@ -2658,6 +2762,12 @@ def fold_completed(
     above is testable without a database (same posture as
     :func:`fold_issue_activity`).  Rows come back newest-ENDED first, which
     is #2405's default order; the client re-sorts by column head-click.
+
+    *pricing* left at ``None`` falls through to ``usage_rollup``'s built-in
+    default rates, which is correct for a unit test and **not** what the
+    runner does — :func:`run_completed` loads ``coordinator.yml`` and passes
+    the real ``pricing:`` block, the same seam :func:`fold_usage` uses and for
+    the same #1763 reason.
     """
     start, end = window
     generated_at = time.time() if generated_at is None else float(generated_at)
@@ -2719,6 +2829,8 @@ def fold_completed(
             if value is not None and value > last_finish.get(key, float("-inf")):
                 last_finish[key] = value
 
+    spend = _completed_spend(assignment_rows, pricing)
+
     rows: list[dict] = []
     no_end_time = 0
     for issue in issue_rows:
@@ -2752,6 +2864,10 @@ def fold_completed(
                 "title": str(issue.get("title") or "") or None,
                 "started_at": first_dispatch.get(key),
                 "ended_at": ended,
+                # #2472. `**` copies the pairs into this row's own dict, so
+                # the shared `_COMPLETED_NO_LEGS` constant can never end up
+                # aliased by two zero-leg rows.
+                **spend.get(key, _COMPLETED_NO_LEGS),
             }
         )
 
@@ -2760,7 +2876,7 @@ def fold_completed(
     # `sort_completed_rows` takes the same precaution for the same reason).
     rows.sort(key=lambda r: (-float(r["ended_at"]), r["repo"], r["issue"]))
 
-    notes: list[str] = []
+    notes: list[str] = list(extra_notes)
     if no_end_time:
         notes.append(
             f"{no_end_time} completed issue(s) have no end timestamp (no merged "
@@ -2773,6 +2889,27 @@ def fold_completed(
         notes.append(
             f"No issue in this board belongs to repo {repo_filter!r} — check the "
             "coord-local repo name (the one in coordinator.yml), not the GitHub slug."
+        )
+    # #1763's rule is "never silently priced at $0", and `cost_total` here is
+    # exactly the number that would go silently short. So it IS noted — but as
+    # ONE aggregate line rather than `fold_usage`'s line-per-issue: this report
+    # is a time-range list that can easily carry a hundred rows, and a hundred
+    # near-identical notes would bury the two above that are about the list
+    # itself. The per-issue breakdown is a question for `usage`, which the note
+    # names.
+    unpriced = sorted(
+        f"{r['repo']}#{r['issue']}" for r in rows if r.get("unknown_model_legs")
+    )
+    if unpriced:
+        shown = ", ".join(unpriced[:5])
+        more = f" (and {len(unpriced) - 5} more)" if len(unpriced) > 5 else ""
+        notes.append(
+            f"{len(unpriced)} issue(s) ran leg(s) on a model with no entry in "
+            f"the loaded `pricing:` config — {shown}{more}. Their tokens are "
+            "counted but that spend is NOT in `Total $` (never silently priced "
+            "at $0), so those rows read LOW. Add a rate for the model to "
+            "coordinator.yml, or run the `usage` report for the per-issue "
+            "breakdown."
         )
 
     return ReportResult(
@@ -2805,10 +2942,21 @@ def _default_completed_source() -> tuple[list[dict], list[dict], list[dict]]:
                 "SELECT repo_name, number, title, state FROM issues"
             ).fetchall()
         ]
+        # #2472 widens this one SELECT rather than adding a second source
+        # function: the spend columns fold out of the SAME assignment rows the
+        # timestamps do, so a second round trip would re-read the same table to
+        # get columns this one could have carried. Everything past
+        # `finished_at` is what `usage_rollup.rollup`/`leg_cost` read — token
+        # counts, the captured `cost_usd`, the `model` its estimate is keyed
+        # by, and `for_issue_number` for #1553's attribution. `type` is NOT
+        # selected: it only feeds `usage`'s per-stage drill-down, which this
+        # report does not emit.
         assignments = [
             dict(r)
             for r in conn.execute(
-                "SELECT repo_name, issue_number, dispatched_at, finished_at "
+                "SELECT repo_name, issue_number, for_issue_number, "
+                "dispatched_at, finished_at, input_tokens, output_tokens, "
+                "cache_read_tokens, cache_creation_tokens, cost_usd, model "
                 "FROM assignments"
             ).fetchall()
         ]
@@ -2834,9 +2982,10 @@ def run_completed(
         Sequence[Mapping[str, Any]],
         Sequence[Mapping[str, Any]],
     ]] | None = None,
+    pricing: Any = None,
 ) -> ReportResult:
-    """Read the board and fold it.  ``now``/``source`` are test seams
-    (mirrors :func:`run_issue_activity`); the report's own parameters are
+    """Read the board and fold it.  ``now``/``source``/``pricing`` are test
+    seams (mirrors :func:`run_issue_activity`); the report's own parameters are
     ``since``/``until``/``repo`` — the same three, with the same vocabulary
     and the same validators, that ``issue-activity`` uses."""
     generated_at = time.time() if now is None else float(now)
@@ -2844,6 +2993,15 @@ def run_completed(
     start = end - parse_duration(since)
     source_fn = _default_completed_source if source is None else source
     issues, assignments, merge_queue = source_fn()
+
+    # Same seam, same reason as `run_usage`: the estimated half of `cost_total`
+    # has to be priced off the fleet's OWN `pricing:` block, and a config that
+    # could not be loaded says so in a note instead of silently falling back
+    # (#1763).
+    extra_notes: list[str] = []
+    if pricing is None:
+        pricing, extra_notes = _load_pricing()
+
     return fold_completed(
         issues,
         assignments,
@@ -2851,6 +3009,8 @@ def run_completed(
         (start, end),
         repo=repo,
         generated_at=generated_at,
+        pricing=pricing,
+        extra_notes=extra_notes,
     )
 
 
@@ -2938,7 +3098,12 @@ COMPLETED = ReportDef(
         "merged (the PR closed it before the brain synced the close). ENDED is "
         "the merge timestamp, falling back to the last assignment to finish; "
         "STARTED is the first dispatch. Issues with no end timestamp at all "
-        "cannot be placed in a time range and are counted in a note instead."
+        "cannot be placed in a time range and are counted in a note instead. "
+        "Each row also carries what it cost: LEGS is how many agent sessions "
+        "(dispatches and retries) ran against the issue, and the token and "
+        "dollar figures are the issue's WHOLE-LIFE spend — not just the part "
+        "inside this window — so narrowing the range never shrinks them. Use "
+        "the `usage` report for windowed spend or the captured/estimated split."
     ),
     params=(
         # The same three params, the same vocabulary and the same validators

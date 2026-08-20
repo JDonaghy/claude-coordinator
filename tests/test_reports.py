@@ -36,6 +36,7 @@ from coord.drive_queue import QUEUE_ALERT_ISSUE, QUEUE_ALERT_REPO
 from coord.gate_a import park_marker
 from coord.models import POLICY_REFUSAL_MARKER
 from coord.reports import (
+    COMPLETED_COLUMNS,
     REPORTS,
     ColumnMeta,
     ReportError,
@@ -4027,15 +4028,34 @@ def _completed_issues() -> list[dict]:
 
 
 def _completed_assignments() -> list[dict]:
+    """#2454's timestamps plus #2472's spend, on the same rows.
+
+    The spend numbers are chosen to be exact under the DEFAULT
+    :class:`~coord.config.PricingConfig` (sonnet input is $3.00/Mtok — see
+    `TestUsagePricingFollowsConfig`), so the assertions can name a dollar
+    figure instead of an approximation of one:
+
+      * myrepo#7's first leg estimates to exactly $3.00 and its RETRY carries a
+        captured $2.00, so the issue is 2 legs / $5.00 — and the two halves
+        exercise both branches of `leg_cost` in one row.
+      * myrepo#9 is merged with NO assignment at all: 0 legs, $0.
+      * other#7 is a fat leg that must not leak into myrepo#7's spend any more
+        than it leaks into its timestamps.
+    """
     return [
         # Two legs on #7 — STARTED is the FIRST dispatch, ENDED the LAST finish.
-        {"repo_name": "myrepo", "issue_number": 7, "dispatched_at": 100.0, "finished_at": 200.0},
-        {"repo_name": "myrepo", "issue_number": 7, "dispatched_at": 150.0, "finished_at": 250.0},
-        {"repo_name": "myrepo", "issue_number": 11, "dispatched_at": 900.0, "finished_at": None},
-        {"repo_name": "other", "issue_number": 13, "dispatched_at": 50.0, "finished_at": 300.0},
+        {"repo_name": "myrepo", "issue_number": 7, "dispatched_at": 100.0, "finished_at": 200.0,
+         "model": "sonnet", "input_tokens": 1_000_000, "output_tokens": 0},
+        {"repo_name": "myrepo", "issue_number": 7, "dispatched_at": 150.0, "finished_at": 250.0,
+         "model": "sonnet", "cost_usd": 2.0, "input_tokens": 10, "output_tokens": 4},
+        {"repo_name": "myrepo", "issue_number": 11, "dispatched_at": 900.0, "finished_at": None,
+         "model": "sonnet", "input_tokens": 500, "output_tokens": 500},
+        {"repo_name": "other", "issue_number": 13, "dispatched_at": 50.0, "finished_at": 300.0,
+         "model": "sonnet", "cost_usd": 0.5, "input_tokens": 7, "output_tokens": 3},
         # Same issue NUMBER in a different repo — must not contribute to
-        # myrepo#7's timestamps.
-        {"repo_name": "other", "issue_number": 7, "dispatched_at": 1.0, "finished_at": 9999.0},
+        # myrepo#7's timestamps, nor to its tokens or cost.
+        {"repo_name": "other", "issue_number": 7, "dispatched_at": 1.0, "finished_at": 9999.0,
+         "model": "sonnet", "cost_usd": 999.0, "input_tokens": 9_000_000, "output_tokens": 9_000},
     ]
 
 
@@ -4063,7 +4083,12 @@ class TestCompletedFold:
     def test_columns_are_the_wire_contract(self) -> None:
         result = _fold_completed()
         assert result.report_id == "completed"
-        assert result.columns == ["repo", "issue", "title", "started_at", "ended_at"]
+        assert result.columns == [
+            "repo", "issue", "title", "started_at", "ended_at",
+            # #2472's four, APPENDED — the client sorts by column index, so
+            # #2454's five must keep the indices they had.
+            "legs", "tokens_in", "tokens_out", "cost_total",
+        ]
         assert [m.id for m in result.column_meta] == result.columns
 
     def test_only_closed_or_merged_issues_appear(self) -> None:
@@ -4145,6 +4170,243 @@ class TestCompletedFold:
         json.dumps(_fold_completed().to_dict())
 
 
+class TestCompletedSpend:
+    """#2472: the spend half of a row — `legs`, tokens and `cost_total`.
+
+    Every number here comes out of `coord.usage_rollup.rollup`; these tests
+    pin the *joining* (right issue, right repo, right window) and the fact
+    that `completed` and `usage` cannot disagree, which is the whole point of
+    reusing the rollup instead of writing a second cost calculator.
+    """
+
+    def _row(self, issue: int = 7, repo: str = "myrepo", **kw) -> dict:
+        return next(
+            r for r in _fold_completed(**kw).rows
+            if r["repo"] == repo and r["issue"] == issue
+        )
+
+    def test_legs_counts_agent_sessions_not_issues(self) -> None:
+        """myrepo#7 was dispatched twice — a retry. `legs` is 2, not 1."""
+        assert self._row(7)["legs"] == 2
+        # …and an issue with a single leg reads 1, so `legs` is not just
+        # "number of rows folded".
+        assert self._row(13, repo="other")["legs"] == 1
+
+    def test_tokens_are_summed_across_every_leg(self) -> None:
+        row = self._row(7)
+        assert row["tokens_in"] == 1_000_010  # 1_000_000 + 10
+        assert row["tokens_out"] == 4         # 0 + 4
+
+    def test_cost_total_is_captured_plus_estimated(self) -> None:
+        row = self._row(7)
+        # The retry's captured $2.00 is kept verbatim; the first leg has no
+        # captured cost so its 1M sonnet input tokens estimate to $3.00.
+        assert row["cost_total"] == pytest.approx(5.0)
+
+    def test_the_captured_estimated_split_ships_as_extra_row_keys(self) -> None:
+        """One `Total $` COLUMN, but no information thrown away — a client
+        that wants `usage`'s split can read it off the row."""
+        row = self._row(7)
+        assert row["cost_captured"] == pytest.approx(2.0)
+        assert row["cost_est"] == pytest.approx(3.0)
+        assert "cost_captured" not in COMPLETED_COLUMNS
+        assert "cost_est" not in COMPLETED_COLUMNS
+
+    def test_spend_is_scoped_by_coord_local_repo(self) -> None:
+        """other#7's fat leg ($999, 9M tokens) must not reach myrepo#7 — the
+        same scoping the timestamps get, applied to the money."""
+        row = self._row(7)
+        assert row["cost_total"] == pytest.approx(5.0)
+        assert row["tokens_in"] == 1_000_010
+
+    def test_spend_is_lifetime_not_windowed(self) -> None:
+        """The documented call: the window filters ENDED, never the legs.
+
+        myrepo#7's legs were dispatched at 100/150 and the window opens at
+        240 — a windowed figure would report $2.00 (or $0) here. It reports
+        the issue's whole-life $5.00, because "what did finishing this issue
+        cost me" must not shrink when the operator narrows the range.
+        """
+        wide = self._row(7)
+        narrow = self._row(7, window=(240.0, C_END))
+        assert narrow["ended_at"] == 250.0, "still in the window"
+        assert narrow["legs"] == wide["legs"] == 2
+        assert narrow["cost_total"] == wide["cost_total"] == pytest.approx(5.0)
+        assert narrow["tokens_in"] == wide["tokens_in"]
+
+    def test_an_issue_with_no_legs_reads_zero_not_blank(self) -> None:
+        """myrepo#9 is merged with no assignment against it at all."""
+        row = self._row(9)
+        assert row["legs"] == 0
+        assert row["tokens_in"] == 0
+        assert row["tokens_out"] == 0
+        assert row["cost_total"] == 0.0
+        # A real 0, not a hole a client would have to render as "?".
+        for column in COMPLETED_COLUMNS:
+            assert column in row
+
+    def test_the_no_legs_default_is_not_shared_between_rows(self) -> None:
+        """`_COMPLETED_NO_LEGS` is a module constant; two zero-leg rows must
+        not end up aliasing one mapping."""
+        result = fold_completed(
+            [
+                {"repo_name": "r", "number": 1, "title": "a", "state": "closed"},
+                {"repo_name": "r", "number": 2, "title": "b", "state": "closed"},
+            ],
+            [],
+            [
+                {"repo_name": "r", "issue_number": 1, "state": "merged", "last_attempt": 10.0},
+                {"repo_name": "r", "issue_number": 2, "state": "merged", "last_attempt": 20.0},
+            ],
+            (C_START, C_END),
+            generated_at=C_END,
+        )
+        first, second = result.rows
+        first["legs"] = 99
+        assert second["legs"] == 0
+
+    def test_every_completed_row_agrees_with_the_usage_report(self) -> None:
+        """The load-bearing guard, and the reason #2472 exists: an operator
+        must never have to open `usage` and cross-reference by issue number to
+        find a different number for the same issue."""
+        from coord.config import PricingConfig
+        from coord.reports import fold_usage
+        from coord.usage_rollup import TimeWindow
+
+        pricing = PricingConfig()
+        completed = _fold_completed(pricing=pricing)
+        usage = fold_usage(
+            _completed_assignments(),
+            TimeWindow(start=None, end=None, label="all"),
+            group_by="issue",
+            pricing=pricing,
+        )
+        by_issue = {(r["repo"], r["issue"]): r for r in usage.rows}
+
+        checked = 0
+        for row in completed.rows:
+            peer = by_issue.get((row["repo"], row["issue"]))
+            if peer is None:
+                assert row["legs"] == 0, "only a no-leg issue may be absent from usage"
+                continue
+            for key in ("legs", "tokens_in", "tokens_out"):
+                assert row[key] == peer[key], f"{row['repo']}#{row['issue']} {key}"
+            assert row["cost_total"] == pytest.approx(peer["cost_total"])
+            checked += 1
+        assert checked >= 2, "the comparison must actually have compared something"
+
+    def test_a_leg_booked_to_another_issue_follows_usages_attribution(self) -> None:
+        """#1553: a leg carrying `for_issue_number` is spend on THAT issue.
+
+        `completed`'s timestamps key on the raw `issue_number` (#2454's rule,
+        a port of `completed_rows`), but the cost columns must key the way
+        `usage` does or the two reports would disagree — which is exactly what
+        the previous test forbids.
+        """
+        result = fold_completed(
+            [{"repo_name": "myrepo", "number": 7, "title": "t", "state": "closed"}],
+            [
+                {"repo_name": "myrepo", "issue_number": 7,
+                 "dispatched_at": 100.0, "finished_at": 200.0,
+                 "model": "sonnet", "cost_usd": 1.0},
+                # An oracle-loop acceptance slice: filed under the milestone's
+                # tracking issue 999, but its spend belongs to #7.
+                {"repo_name": "myrepo", "issue_number": 999, "for_issue_number": 7,
+                 "dispatched_at": 300.0, "finished_at": 400.0,
+                 "model": "sonnet", "cost_usd": 4.0},
+            ],
+            [],
+            (C_START, C_END),
+            generated_at=C_END,
+        )
+        row = result.rows[0]
+        assert row["legs"] == 2
+        assert row["cost_total"] == pytest.approx(5.0)
+        # …while ENDED stays #2454's: the last finish of an assignment whose
+        # own `issue_number` is 7.
+        assert row["ended_at"] == 200.0
+
+    def test_an_unpriced_model_is_noted_rather_than_shown_as_zero(self) -> None:
+        """#1763's rule, kept: a leg on a model with no `pricing:` entry is
+        never silently priced at $0."""
+        result = fold_completed(
+            [{"repo_name": "myrepo", "number": 7, "title": "t", "state": "closed"}],
+            [{"repo_name": "myrepo", "issue_number": 7,
+              "dispatched_at": 100.0, "finished_at": 200.0,
+              "model": "gpt-hypothetical", "input_tokens": 500, "output_tokens": 500}],
+            [],
+            (C_START, C_END),
+            generated_at=C_END,
+        )
+        row = result.rows[0]
+        # Tokens counted, spend NOT invented.
+        assert row["tokens_in"] == 500
+        assert row["cost_total"] == 0.0
+        note = next(n for n in result.notes if "pricing" in n)
+        assert "myrepo#7" in note
+        assert "read LOW" in note
+
+    def test_the_unpriced_note_is_one_line_not_one_per_issue(self) -> None:
+        """`usage` emits a note per issue; `completed` is a time-range list
+        that can carry a hundred rows, so it aggregates."""
+        issues = [
+            {"repo_name": "myrepo", "number": n, "title": "t", "state": "closed"}
+            for n in range(1, 9)
+        ]
+        assignments = [
+            {"repo_name": "myrepo", "issue_number": n,
+             "dispatched_at": 10.0 * n, "finished_at": 20.0 * n,
+             "model": "gpt-hypothetical", "input_tokens": 10, "output_tokens": 10}
+            for n in range(1, 9)
+        ]
+        result = fold_completed(
+            issues, assignments, [], (C_START, C_END), generated_at=C_END
+        )
+        pricing_notes = [n for n in result.notes if "pricing" in n]
+        assert len(pricing_notes) == 1, pricing_notes
+        assert "8 issue(s)" in pricing_notes[0]
+        assert "and 3 more" in pricing_notes[0], "the list is capped, and says so"
+
+    def test_a_priced_fixture_still_produces_no_notes(self) -> None:
+        """The spend columns must not make every clean report noisy."""
+        assert _fold_completed().notes == []
+
+    def test_pricing_overrides_move_the_estimate(self) -> None:
+        """Same #1116/#1763 seam `usage` has: the fleet's own `pricing:` block
+        is what the dollar column is computed from, not a snapshot."""
+        from coord.config import ModelRates, PricingConfig
+
+        override = PricingConfig(models={"sonnet": ModelRates(input=9.0, output=0.0)})
+        row = self._row(7, pricing=override)
+        # The captured $2.00 is untouched; the estimated leg's 1M input tokens
+        # now price at $9.00 instead of $3.00.
+        assert row["cost_captured"] == pytest.approx(2.0)
+        assert row["cost_est"] == pytest.approx(9.0)
+        assert row["cost_total"] == pytest.approx(11.0)
+
+    def test_a_leg_with_no_timestamps_at_all_is_not_counted(self) -> None:
+        """Documented consequence of the unbounded rollup window: a row with
+        neither `dispatched_at` nor `finished_at` is not evidence a session
+        ran, and `usage` excludes it on the same rule."""
+        result = fold_completed(
+            [{"repo_name": "myrepo", "number": 7, "title": "t", "state": "closed"}],
+            [
+                {"repo_name": "myrepo", "issue_number": 7,
+                 "dispatched_at": 100.0, "finished_at": 200.0, "cost_usd": 1.0},
+                {"repo_name": "myrepo", "issue_number": 7,
+                 "dispatched_at": None, "finished_at": None, "cost_usd": 50.0},
+            ],
+            [],
+            (C_START, C_END),
+            generated_at=C_END,
+        )
+        assert result.rows[0]["legs"] == 1
+        assert result.rows[0]["cost_total"] == pytest.approx(1.0)
+
+    def test_the_result_is_still_json_serialisable(self) -> None:
+        json.dumps(_fold_completed().to_dict())
+
+
 class TestCompletedRunner:
     def test_since_and_until_bound_the_window(self) -> None:
         seen: list[tuple] = []
@@ -4200,9 +4462,20 @@ class TestCompletedAgainstTheRealSchema:
             )
             coord_db.execute(
                 "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
-                "issue_number, issue_title, status, dispatched_at, finished_at) "
+                "issue_number, issue_title, status, dispatched_at, finished_at, "
+                "model, cost_usd, input_tokens, output_tokens) "
                 "VALUES ('a1', 'precision', 'api', 1629, 'Closed and done', 'done', "
-                "1000.0, 2000.0)"
+                "1000.0, 2000.0, 'sonnet', 1.25, 4000, 700)"
+            )
+            # #2472: a RETRY, so `legs` has something to count past 1 and the
+            # widened SELECT is proved to read every leg's tokens, not just
+            # the first row's.
+            coord_db.execute(
+                "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+                "issue_number, issue_title, status, dispatched_at, finished_at, "
+                "model, cost_usd, input_tokens, output_tokens) "
+                "VALUES ('a2', 'precision', 'api', 1629, 'Closed and done', 'done', "
+                "2100.0, 2200.0, 'sonnet', 0.75, 1000, 300)"
             )
             coord_db.execute(
                 "INSERT INTO merge_queue (assignment_id, repo_name, repo_github, "
@@ -4221,6 +4494,18 @@ class TestCompletedAgainstTheRealSchema:
         assert row["started_at"] == 1000.0
         # The merged merge_queue row wins over the assignment's finished_at.
         assert row["ended_at"] == 2500.0
+
+    def test_the_widened_select_reaches_the_spend_columns(self, coord_db) -> None:
+        """#2472 added `for_issue_number`/tokens/`cost_usd`/`model` to that
+        SELECT. They are all migration-added columns, and the source swallows
+        every exception into an empty report — so a typo would show up as a
+        silently blank report, never a traceback. Hence this."""
+        self._seed(coord_db)
+        row = run_completed(since="7d", until="3000", repo="api").rows[0]
+        assert row["legs"] == 2, "both the first attempt and the retry"
+        assert row["tokens_in"] == 5000   # 4000 + 1000
+        assert row["tokens_out"] == 1000  # 700 + 300
+        assert row["cost_total"] == pytest.approx(2.0)  # 1.25 + 0.75, both captured
 
     def test_it_runs_through_the_cli(self, coord_db) -> None:
         self._seed(coord_db)
@@ -4266,8 +4551,14 @@ class TestCompletedCatalogue:
         text = result_to_csv(_fold_completed())
         # The header row is the `column_meta` LABELS (the shared serializer's
         # rule), and the values stay raw epochs — not display strings.
-        assert "Repo,Issue,Title,Started,Ended" in text
-        assert 'myrepo,9,"Merged, still open",,400.0' in text
+        # #2472's four labels are `usage`'s verbatim, so a spreadsheet built
+        # off one export lines up with the other.
+        assert "Repo,Issue,Title,Started,Ended,Legs,Tok In,Tok Out,Total $" in text
+        # myrepo#9 merged with no assignment: a real 0/0/0/0.0, not four
+        # empty cells.
+        assert 'myrepo,9,"Merged, still open",,400.0,0,0,0,0.0' in text
+        # myrepo#7's retry: 2 legs, $2.00 captured + $3.00 estimated.
+        assert "myrepo,7,Closed one,100.0,250.0,2,1000010,4,5.0" in text
 
 
 class TestRowIdentity:
