@@ -1,19 +1,26 @@
 #!/usr/bin/env bash
 #
-# coord-web-dist-build.sh — build the `coord-web` webapp from its merged
-# `main` into a directory `coord web --dist` serves, WITHOUT touching
-# ~/.coord-venv (#1543).
+# coord-web-dist-build.sh — build the React webapp from the `coord-web`
+# repo's merged `main` into a directory `coord web --dist` serves, WITHOUT
+# touching ~/.coord-venv (#1543; retargeted at `coord-web` by #2470 once the
+# webapp moved out of THIS repo into its own, epic #2002 — see
+# docs/ADR_COORD_WEB_DIST.md for the decision. Before #2470 this built
+# `coord/dashboard/webapp` out of a `claude-coordinator` checkout; the
+# mechanism below is otherwise unchanged, only which repo it points at).
 #
 # Why this exists: coord-web, coord-agent and coord-serve all `ExecStart`
 # from the SAME ~/.coord-venv, so "ship a webapp change" used to mean
 # `pip install --upgrade code-coordinator` on that venv — which also
 # upgrades the board daemon and the agent runtime on that host, and
 # `coord agent update` is already known to kill running headless workers
-# (see the #1543 issue body). This script decouples the two: it keeps an
-# independent worktree of the webapp's repo, builds it from merged main into
-# a fresh release directory named after the SHA, and atomically repoints a
-# symlink at it. `coord web --dist ~/coord-web-dist` (see
-# deploy/coord-web.service) always points at that symlink.
+# (see the #1543 issue body). This script decouples the two: it keeps a
+# DEDICATED clone of the `coord-web` repo (never an operator's own
+# `~/src/coord-web` dev checkout's working tree — same "never the checkout
+# someone else is using" rule this script has always applied to the repo it
+# builds from), builds it from merged main into a fresh, timestamped release
+# directory, and atomically repoints a symlink at it. `coord web --dist
+# ~/coord-web-dist` (see deploy/coord-web.service) always points at that
+# symlink.
 #
 # #2009 (epic #2002) — WHICH repo this builds changed, nothing else did.
 # Until the split, `$BASE_CHECKOUT` was a checkout of *claude-coordinator*
@@ -45,14 +52,21 @@
 # once, THEN start/enable coord-web.
 #
 # Safe to run unattended on a timer (see coord-web-dist-build.timer): it
-# never touches ~/.coord-venv, ~/src/coord-web's own checkout (it
-# uses a DEDICATED `git worktree`, so it can't collide with whatever branch
-# an operator has that checkout parked on — same reasoning as `coord drive`'s
-# worktree isolation), or any running coord-agent/coord-serve/coord-web
-# process. A `flock` guards against overlapping runs; a same-SHA re-run is a
-# fast no-op.
+# never touches ~/.coord-venv or $BASE_CHECKOUT's working tree (only
+# `git fetch`/`rev-parse` run there — the actual build happens in a
+# SEPARATE, DEDICATED `git worktree`, $WEBAPP_CHECKOUT, so it can't collide
+# with whatever branch an operator has $BASE_CHECKOUT parked on — same
+# reasoning as `coord drive`'s worktree isolation), or any running
+# coord-agent/coord-serve/coord-web process. A `flock` guards against
+# overlapping runs; a same-SHA re-run is a fast no-op.
 #
-# Install:
+# Install: $BASE_CHECKOUT (default ~/src/coord-web) must be a real, already-
+# cloned `coord-web` checkout before the first run — this script only
+# fetches/rev-parses/worktrees off it, it never `git clone`s one into
+# existence. Use a checkout dedicated to this deploy lane if the operator
+# also keeps their own `coord-web` dev checkout elsewhere on this box.
+#
+#   git clone <coord-web-remote> ~/src/coord-web   # one-time, if not already there
 #   cp deploy/coord-web-dist-build.sh ~/.local/bin/   # or run in place
 #   chmod +x ~/.local/bin/coord-web-dist-build.sh
 #   ~/.local/bin/coord-web-dist-build.sh               # first build, before
@@ -116,6 +130,12 @@
 
 set -uo pipefail
 
+# #2470: tracks the `coord-web` repo's main, not this repo's — see the
+# header. $BASE_CHECKOUT is read-only from this script's point of view (only
+# `git fetch`/`rev-parse`/`worktree add` ever touch it, never `checkout`), so
+# an operator's own `coord-web` dev checkout at the default path is safe in
+# principle, but a checkout dedicated to this deploy lane is still the
+# documented install step — see the header's "Install" section.
 SRC_ROOT="${SRC_ROOT:-$HOME/src}"
 # #2009: the webapp's repo, not claude-coordinator's. See the header.
 REPO_NAME="${REPO_NAME:-coord-web}"
@@ -168,9 +188,14 @@ HEALTH_CHECK_PORT="${HEALTH_CHECK_PORT:-18434}"
 HEALTH_CHECK_TIMEOUT_SECS="${HEALTH_CHECK_TIMEOUT_SECS:-20}"
 # The reference seeded board (#1538) — deterministic, no DB/fleet/network, so
 # the scratch instance below never touches ~/.coord/coord.db or races the
-# real coord-web/coord-serve/coord-agent processes. Defaults to the fixture
-# AT THE SHA BEING DEPLOYED (via $WEBAPP_CHECKOUT), so the fixture schema
-# always matches the server code that will parse it.
+# real coord-web/coord-serve/coord-agent processes. Defaults to the copy
+# checked into $WEBAPP_CHECKOUT (the `coord-web` SHA being deployed) at the
+# same relative path its own Playwright acceptance config
+# (`playwright.acceptance.config.ts`) already expects one at, so this stays
+# in lockstep with whatever fixture `coord-web`'s own CI already proves
+# against (#2470) — never a claim that it matches the INSTALLED `coord`'s
+# server code, which post-#2002-split is versioned independently (see
+# docs/ADR_COORD_WEB_DIST.md, "Staleness across the split").
 HEALTH_CHECK_FIXTURE="${HEALTH_CHECK_FIXTURE:-}"
 
 say() { echo "[$(date -Is)] $*" >&2; }

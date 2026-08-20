@@ -141,6 +141,28 @@ def test_dist_build_script_is_executable_and_locked() -> None:
     assert not any("--upgrade" in line for line in code_lines)
 
 
+def test_dist_build_script_defaults_to_the_coord_web_repo() -> None:
+    """#2470: the build must track the dedicated `coord-web` repo's `main`,
+    not `coord/dashboard/webapp/` inside THIS repo (docs/ADR_COORD_WEB_DIST.md)
+    -- pin the actual default env-var values, not just prose in a comment."""
+    text = BUILD_SCRIPT.read_text()
+    assert 'REPO_NAME="${REPO_NAME:-coord-web}"' in text
+    assert 'REPO_NAME="${REPO_NAME:-code-coordinator}"' not in text
+
+
+def test_dist_build_script_builds_at_the_webapp_checkout_root() -> None:
+    """#2470: `coord-web` IS the webapp package now -- `npm ci`/`npm run
+    build` must run at $WEBAPP_CHECKOUT's own root, not a
+    coord/dashboard/webapp subdirectory of it (that subdirectory only ever
+    existed inside `claude-coordinator`, the pre-split monorepo)."""
+    text = BUILD_SCRIPT.read_text()
+    assert 'WEBAPP_DIR="$WEBAPP_CHECKOUT"' in text
+    code_lines = [
+        line for line in text.splitlines() if not line.strip().startswith("#")
+    ]
+    assert not any("coord/dashboard/webapp" in line for line in code_lines)
+
+
 def test_dist_build_script_health_checks_before_publish() -> None:
     """#1560's actual fix: a release must be booted and probed on a scratch,
     127.0.0.1-only port BEFORE the live symlink ever points at it -- the
@@ -355,8 +377,9 @@ def test_build_script_clears_sentinel_once_main_moves_past_the_blocked_sha(
     """Once a fix actually lands on main, the sentinel must not permanently
     wedge deploys -- the guard should clear it and let the normal build
     proceed (which then fails for an unrelated, expected reason in this
-    test: the scratch origin repo has no real coord/dashboard/webapp/ to
-    npm-build -- this test only cares that the guard released its grip)."""
+    test: the scratch origin repo is not a real `coord-web` checkout with
+    anything npm-buildable at its root -- this test only cares that the
+    guard released its grip)."""
     origin_repo = tmp_path / "origin-repo"
     bad_sha = _init_git_repo_with_commit(origin_repo, message="bad commit")
     (origin_repo / "README.md").write_text("fixed")

@@ -126,11 +126,12 @@ cd coord/dashboard/webapp && npm run build
 
 ---
 
-> **Repo split (#2004):** `coord/dashboard/webapp/**` is moving to its own
-> `coord-web` repo (epic #2002). The mechanism below is the answer for how a
-> built bundle reaches this daemon host both before and after that move —
-> see [`docs/ADR_COORD_WEB_DIST.md`](ADR_COORD_WEB_DIST.md) for the decision
-> and the rejected alternatives.
+> **Repo split (#2004, #2470):** `coord/dashboard/webapp/**` has moved to its
+> own `coord-web` repo (epic #2002), and as of #2470 the mechanism below
+> tracks `coord-web`'s `main`, not this repo's (now historical, pending
+> UX-7 #2009) `coord/dashboard/webapp/`. See
+> [`docs/ADR_COORD_WEB_DIST.md`](ADR_COORD_WEB_DIST.md) for the decision and
+> the rejected alternatives.
 
 ## Going live automatically (#1543): merged main, not release cadence
 
@@ -158,15 +159,18 @@ inside the installed package (`coord/dashboard/webapp/dist`,
 `coord/dashboard/server.py`'s `WEBAPP_DIST`). `deploy/coord-web.service`
 points it at `~/coord-web-dist`, a symlink that
 [`deploy/coord-web-dist-build.sh`](../deploy/coord-web-dist-build.sh) —
-installed as `coord-web-dist-build.timer`, firing every minute — keeps
-pointed at a fresh build of `coord/dashboard/webapp` from `origin/main`:
+installed as `coord-web-dist-build.timer`, firing every 10 minutes (#2122)
+— keeps pointed at a fresh build of the `coord-web` repo's `origin/main`
+(#2470; before that, `coord/dashboard/webapp/` inside this repo):
 
 ```
-coord-web-dist-build.timer (every 1min)
-  → fetch origin/main in ~/src/claude-coordinator (read-only: fetch + rev-parse only)
+coord-web-dist-build.timer (every 10min)
+  → fetch origin/main in a dedicated coord-web clone (BASE_CHECKOUT, default
+    ~/src/coord-web — read-only: fetch + rev-parse only, never the operator's
+    own coord-web dev checkout's working tree)
   → build that SHA in a DEDICATED worktree (~/.coord-web-checkout — never the
     operator's own checkout, never a `coord drive` worktree)
-  → npm ci && npm run build
+  → npm ci && npm run build, at coord-web's repo root
   → atomically repoint ~/coord-web-dist -> ~/.coord-web-releases/<sha>
 ```
 

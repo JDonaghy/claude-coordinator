@@ -395,7 +395,7 @@ def findings_for_host(host: str, health: dict | None) -> list[Finding]:
                 )
             )
 
-    # ── webapp bundle vs coord/dashboard/webapp/ source (#1834 lane 5) ───
+    # ── webapp bundle vs coord-web's own source tree (#1834 lane 5, #2470) ─
     # Deliberately not a Lane/version comparison — see release_verify.py's
     # module docstring and coord.health.checks.fleet_deploy_lanes: the
     # bundle is versioned by origin/main's SHA on a continuous publish
