@@ -735,3 +735,383 @@ class TestPipelineConfigFlag:
         )
         with pytest.raises(ConfigError, match="confirm_test_verdict"):
             load(p)
+
+
+# ── #2464-review: the confirmation must not hold the fleet, or judge on the
+#    wrong hardware ────────────────────────────────────────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def _fresh_pass_budget():
+    """No pass budget open unless a test opens one.
+
+    `begin_confirmation_pass` writes thread-local state and pytest runs every
+    test on one thread, so a test that opens a pass would otherwise leave a
+    partially-spent budget behind for whatever ran next.
+    """
+    ct._pass_state.__dict__.pop("remaining", None)
+    yield
+    ct._pass_state.__dict__.pop("remaining", None)
+
+
+class _FakeClock:
+    """A monotonic clock a test drives by hand, in seconds."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class TestPassBudgetBoundsTheDrain:
+    """A confirmation runs *inside* the notify drain, which holds
+    `~/.coord/notify.lock` for the whole pass — so its wall clock is the whole
+    fleet's. Bounding one run is not enough: a pass with several completed
+    smoke rows would serialize several, and the hold would scale with board
+    activity. The pass budget is what makes the worst case a fixed number, and
+    a fixed number is what the thin client can be given.
+    """
+
+    def test_thin_client_notify_timeout_outlasts_a_confirming_pass(self) -> None:
+        """`coord notify` routes to the daemon (#906) and the daemon finishes
+        the drain under `notify.lock` no matter what the client does. The
+        pre-#2464 180s would report `notify via daemon failed` for a pass that
+        is still running and will finish fine — on the one command the whole
+        auto-loop is driven by. Same fix as `coord merge --revalidate`'s
+        `coord.revalidate.client_timeout_seconds`."""
+        from coord.commands import lifecycle
+
+        seen: dict = {}
+
+        def fake_post_record(svc, path, params, timeout):
+            seen["path"] = path
+            seen["timeout"] = timeout
+            return {"output": "", "exit_code": 0}
+
+        with (
+            patch(
+                "coord.board_service.daemon_reroute_target", return_value=object(),
+            ),
+            patch("coord.client.post_record", side_effect=fake_post_record),
+        ):
+            lifecycle.notify.callback(config_path=None)
+
+        assert seen["path"] == "/notify"
+        assert seen["timeout"] > 180.0, (
+            "the pre-#2464 timeout predates the drain ever running a suite"
+        )
+        assert seen["timeout"] >= ct.CONFIRM_PASS_BUDGET_SECONDS, (
+            "the client has to outlast everything the daemon may spend "
+            "confirming before it answers"
+        )
+        assert seen["timeout"] == ct.notify_client_timeout_seconds()
+
+    def test_systemd_unit_timeout_outlasts_the_client_timeout(self) -> None:
+        """`deploy/coord-notify.service` is the OTHER client-side ceiling on
+        the same call — the timer is the sanctioned single pipeline driver, and
+        the tighter of the two ceilings is the one that actually bites."""
+        import re
+
+        unit = Path(__file__).resolve().parents[1] / "deploy" / "coord-notify.service"
+        m = re.search(r"^TimeoutStartSec=(\d+)", unit.read_text(), re.MULTILINE)
+        assert m is not None, "the unit must still declare TimeoutStartSec"
+        assert float(m.group(1)) >= ct.notify_client_timeout_seconds()
+
+    def test_budget_hands_out_the_run_ceiling_then_only_the_remainder(self) -> None:
+        ct.begin_confirmation_pass()
+        assert ct.confirmation_timeout() == int(ct.CONFIRM_DEFAULT_TIMEOUT_SECONDS)
+
+        # A confirmation that used most of the pass leaves only what is left —
+        # never a fresh full ceiling, which is how the hold would grow.
+        ct.spend_confirmation_budget(
+            ct.CONFIRM_PASS_BUDGET_SECONDS - ct.CONFIRM_DEFAULT_TIMEOUT_SECONDS + 120
+        )
+        assert ct.confirmation_timeout() == int(
+            ct.CONFIRM_DEFAULT_TIMEOUT_SECONDS - 120
+        )
+
+        ct.spend_confirmation_budget(ct.CONFIRM_PASS_BUDGET_SECONDS)
+        assert ct.confirmation_timeout() is None, (
+            "a spent budget must stop handing out time, not go negative"
+        )
+
+    def test_a_nearly_spent_budget_does_not_start_a_doomed_run(self) -> None:
+        ct.begin_confirmation_pass(ct.CONFIRM_MIN_RUN_SECONDS - 1)
+        assert ct.confirmation_timeout() is None
+
+        ct.begin_confirmation_pass(ct.CONFIRM_MIN_RUN_SECONDS + 5)
+        assert ct.confirmation_timeout() == ct.CONFIRM_MIN_RUN_SECONDS + 5
+
+    def test_spending_outside_a_pass_is_a_no_op_not_a_crash(self) -> None:
+        ct.spend_confirmation_budget(10_000)
+        assert ct.confirmation_timeout() == int(ct.CONFIRM_DEFAULT_TIMEOUT_SECONDS), (
+            "with no pass open, the full per-run ceiling applies"
+        )
+
+    def test_a_backwards_clock_cannot_refund_budget(self) -> None:
+        ct.begin_confirmation_pass(600)
+        ct.spend_confirmation_budget(-10_000)
+        assert ct.confirmation_timeout() == 600
+
+    @pytest.mark.parametrize(
+        "entrypoint", ["run", "_run_drain_locked"],
+    )
+    def test_every_pass_entrypoint_opens_a_budget(self, entrypoint: str) -> None:
+        """Both ways into a pass must arm the bound. The daemon's `/notify`
+        handler invokes the `coord notify` CLI callback (so `notify.run`),
+        while its pipeline clock calls `run_drain` — miss either and that route
+        holds the lock unbounded."""
+        import coord.notify as notify_mod
+
+        class _Reached(Exception):
+            """Raised from the budget call, so nothing after it runs."""
+
+        cfg = _StubConfig()
+        cfg.machines = []
+        with (
+            patch(
+                "coord.confirm_test.begin_confirmation_pass", side_effect=_Reached,
+            ),
+            pytest.raises(_Reached),
+        ):
+            getattr(notify_mod, entrypoint)(cfg)
+
+
+class TestExhaustedBudgetFallsBackToTheClaim:
+    """When the budget runs out the row records `passed` UNCONFIRMED — exactly
+    pre-#2464 behaviour — rather than the drain holding `notify.lock` longer.
+    The truncation is stated in `test_reason`, never silent."""
+
+    _record_work = TestSmokeVerdictIsConfirmed._record_work
+    _record_smoke = TestSmokeVerdictIsConfirmed._record_smoke
+    _transition = TestSmokeVerdictIsConfirmed._transition
+    _row = TestSmokeVerdictIsConfirmed._row
+
+    def test_spent_budget_skips_the_run_and_says_so(
+        self, coord_db, tmp_path: Path
+    ) -> None:
+        self._record_work()
+        self._record_smoke()
+        transition, record, entry = self._transition(tmp_path, "SMOKE: pass")
+
+        ct.begin_confirmation_pass(0.0)
+        confirm = TestSmokeVerdictIsConfirmed._reap(
+            self, transition, record, entry,
+            ct.ConfirmationResult(kind=KIND_OK, reason="should not be reached"),
+        )
+
+        assert confirm.call_count == 0, (
+            "a spent budget must not start another suite run"
+        )
+        row = self._row()
+        assert row["test_state"] == "passed", (
+            "falling back to the claim is pre-#2464 behaviour, not a failure"
+        )
+        assert "UNCONFIRMED" in row["test_reason"]
+
+    def test_a_confirmation_charges_its_own_wall_clock_to_the_budget(
+        self, coord_db, tmp_path: Path
+    ) -> None:
+        """One long confirmation must leave less for the next row in the same
+        pass — otherwise the bound is per-run again and the hold grows with the
+        number of completed smoke rows."""
+        self._record_work()
+        self._record_smoke()
+        transition, record, entry = self._transition(tmp_path, "SMOKE: pass")
+
+        ct.begin_confirmation_pass(ct.CONFIRM_PASS_BUDGET_SECONDS)
+        clock = _FakeClock()
+
+        def slow_confirm(*a, **k):
+            clock.now += ct.CONFIRM_PASS_BUDGET_SECONDS
+            return ct.ConfirmationResult(kind=KIND_OK, reason="green")
+
+        with (
+            patch("coord.notify.post_completion"),
+            patch("coord.notify.mark_notified"),
+            patch("coord.notify._capture_cost"),
+            patch("coord.notify._capture_smoke_tests"),
+            patch("coord.notify._capture_completion_summary"),
+            patch("coord.notify._capture_claude_session_id"),
+            patch("coord.notify._agent_host", return_value=None),
+            patch("coord.config.load", return_value=_StubConfig()),
+            patch("coord.notify.time.monotonic", side_effect=clock),
+            patch("coord.confirm_test.confirm_branch", side_effect=slow_confirm),
+        ):
+            from coord.notify import post_transition
+
+            post_transition(transition, record, entry)
+
+        assert self._row()["test_state"] == "passed"
+        assert ct.confirmation_timeout() is None, (
+            "the run's wall clock must have been charged against the pass"
+        )
+
+
+class TestOneWindowForBuildAndSuite:
+    """`CONFIRM_DEFAULT_TIMEOUT_SECONDS` documents itself as the ceiling on
+    *one confirmation run*, and both the pass budget and the thin-client
+    timeout are sized off it as if it were. Giving the build and the suite that
+    ceiling each would make the real worst case twice every number derived from
+    it — inside the drain, that factor of two is lock-hold time."""
+
+    def test_the_suite_only_gets_what_the_build_left(self, checkout: Path) -> None:
+        clock = _FakeClock()
+        repo = _StubRepo(build_command="build-it")
+        calls: list[tuple[str, int]] = []
+
+        def recording(command, cwd, timeout):
+            calls.append((command, timeout))
+            if command == "build-it":
+                clock.now += 500
+            return _FakeProc(0)
+
+        result = ct.confirm_branch(
+            "api", BRANCH, _StubConfig(repo, repo_path=str(checkout)),
+            timeout=1200, runner=recording, clock=clock,
+        )
+
+        assert result.kind == KIND_OK, result.reason
+        assert calls[0] == ("build-it", 1200)
+        assert calls[1] == ("run-the-suite", 700), (
+            "the suite must inherit the remainder of the shared window, not a "
+            f"fresh full one — got {calls}"
+        )
+
+    def test_a_build_that_eats_the_window_leaves_no_suite_run(
+        self, checkout: Path
+    ) -> None:
+        clock = _FakeClock()
+        repo = _StubRepo(build_command="build-it")
+        calls: list[str] = []
+
+        def recording(command, cwd, timeout):
+            calls.append(command)
+            clock.now += 2000
+            return _FakeProc(0)
+
+        result = ct.confirm_branch(
+            "api", BRANCH, _StubConfig(repo, repo_path=str(checkout)),
+            timeout=1200, runner=recording, clock=clock,
+        )
+
+        assert calls == ["build-it"], (
+            "the suite must not start once the shared window is gone"
+        )
+        assert result.kind == KIND_TIMEOUT
+        assert result.inconclusive is True
+        assert result.refuted is False, (
+            "running out of time says nothing about the branch"
+        )
+
+
+class TestConfirmationRespectsCapabilityRouting:
+    """CLAUDE.md: 'Smoke tests validate on capable hardware.' The Test stage
+    routes the original run through `smoke_tests.capability_rules`; the
+    confirmation runs wherever the notify drain runs, which in production is
+    the always-on daemon host. Re-running a GTK or browser suite there and
+    watching it fail for want of a display would REFUTE a good branch — the one
+    direction this module promises never to fail in."""
+
+    @staticmethod
+    def _rules(files: list[str], requires: list[str]):
+        from coord.config import SmokeRule, SmokeTestsConfig
+
+        return SmokeTestsConfig(
+            capability_rules=[SmokeRule(files=files, requires=requires)]
+        )
+
+    @staticmethod
+    def _config_here(checkout: Path, smoke_tests, capabilities: list[str]):
+        """A config whose single machine really is *this* host, so the real
+        `local_machine` hostname match runs rather than being stubbed out."""
+        import socket
+
+        cfg = _StubConfig(repo_path=str(checkout))
+        machine = cfg.machines[0]
+        machine.name = socket.gethostname().split(".")[0]
+        machine.host = machine.name
+        machine.capabilities = capabilities
+        cfg.smoke_tests = smoke_tests
+        return cfg
+
+    @pytest.fixture
+    def tui_checkout(self, tmp_path: Path, checkout: Path) -> Path:
+        """The same fleet, with the branch also touching `tui/`."""
+        seed = tmp_path / "seed"
+        (seed / "tui").mkdir(exist_ok=True)
+        (seed / "tui" / "app.rs").write_text("fn main() {}\n", encoding="utf-8")
+        _git(seed, "add", "-A")
+        _git(seed, "commit", "-m", "tui change")
+        _git(seed, "push", "origin", BRANCH)
+        return checkout
+
+    def test_unmet_capability_is_inconclusive_and_runs_nothing(
+        self, tui_checkout: Path
+    ) -> None:
+        runner = _ScriptedRunner(default=_FakeProc(1, stdout="cannot open display"))
+        cfg = self._config_here(
+            tui_checkout, self._rules(["tui/"], ["gtk"]), capabilities=["rust"],
+        )
+
+        result = ct.confirm_branch("api", BRANCH, cfg, runner=runner)
+
+        assert result.kind == KIND_SETUP, result.reason
+        assert result.inconclusive is True
+        assert result.refuted is False
+        assert runner.calls == [], (
+            "a machine the Test stage would never have routed to must not get "
+            "to overturn the verdict"
+        )
+        assert "gtk" in result.reason
+
+    def test_a_capable_machine_still_confirms(self, tui_checkout: Path) -> None:
+        runner = _ScriptedRunner(default=_FakeProc(1, stdout="5 failed"))
+        cfg = self._config_here(
+            tui_checkout, self._rules(["tui/"], ["gtk"]),
+            capabilities=["rust", "gtk"],
+        )
+
+        result = ct.confirm_branch("api", BRANCH, cfg, runner=runner)
+
+        assert result.kind == KIND_SUITE, result.reason
+        assert result.refuted is True, (
+            "the gate must not water down confirmation on capable hardware"
+        )
+
+    def test_a_diff_matching_no_rule_is_not_gated(self, checkout: Path) -> None:
+        runner = _ScriptedRunner(default=_FakeProc(0))
+        cfg = self._config_here(
+            checkout, self._rules(["tui/"], ["gtk"]), capabilities=[],
+        )
+
+        result = ct.confirm_branch("api", BRANCH, cfg, runner=runner)
+
+        assert result.kind == KIND_OK, result.reason
+        assert [c[0] for c in runner.calls] == ["run-the-suite"]
+
+    def test_an_unrecognized_host_gets_the_benefit_of_the_doubt(
+        self, tui_checkout: Path
+    ) -> None:
+        """Mirrors `coord.acceptance.capability_gap` (#966): a dev box outside
+        the fleet may well have everything installed, and refusing to confirm
+        anywhere unrecognized would switch the gate off for it entirely."""
+        runner = _ScriptedRunner(default=_FakeProc(0))
+        cfg = _StubConfig(repo_path=str(tui_checkout))
+        cfg.machines[0].name = "not-this-host"
+        cfg.machines[0].host = "not-this-host.tailnet"
+        cfg.machines[0].capabilities = []
+        cfg.smoke_tests = self._rules(["tui/"], ["gtk"])
+
+        result = ct.confirm_branch("api", BRANCH, cfg, runner=runner)
+
+        assert result.kind == KIND_OK, result.reason
+
+    def test_an_uncomputable_diff_does_not_silently_gate(
+        self, tmp_path: Path
+    ) -> None:
+        """`branch_touched_files` returns [] for 'unknown', and the caller must
+        read that as 'gate not applicable', never as 'nothing required'
+        collapsing into a refusal."""
+        assert ct.branch_touched_files(tmp_path, BRANCH, "main") == []
