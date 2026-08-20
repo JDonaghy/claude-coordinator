@@ -38,10 +38,14 @@ wheel's version the way ``agent_venv``/``spawned_coord`` are —
 ``~/.coord-venv`` release cadence, so "is it on the released version?" is
 not a well-formed question for it. What *is* well-formed, and what this
 checks — mirroring ``tui_binary`` exactly — is whether the live bundle is
-older than the webapp source tree it claims to have been built from. Since
-#2009 (epic #2002) that source tree is a ``coord-web`` checkout rather than
-this repo's ``coord/dashboard/webapp/``; see
-:func:`resolve_webapp_source_dir` for how both layouts are located.
+older than the source tree it claims to have been built from: the
+`coord-web` repo's own checkout (#2470; retargeted from this repo's now-gone
+``coord/dashboard/webapp/`` once the webapp moved out under epic #2002 —
+see :func:`resolve_webapp_source_dir`, which shares its checkout-discovery
+convention with ``coord.health.checks.coord_web_ci_pin`` so the two checks
+can never disagree about which local checkout *is* `coord-web`, with a
+fallback to the pre-#2009 in-repo layout for a checkout still parked on a
+pre-split commit).
 """
 
 from __future__ import annotations
@@ -50,6 +54,7 @@ import subprocess
 
 from coord.dist_name import CANDIDATE_NAMES
 from coord.health.checks.agent_install import pip_show
+from coord.health.checks.coord_web_ci_pin import resolve_coord_web_checkout
 from coord.health.models import CheckResult, HealthContext, Severity
 from coord.health.registry import check
 from coord.health.units import expand, shorten_path
@@ -142,31 +147,30 @@ def resolve_webapp_build_heartbeat_path(ctx: HealthContext):
 def resolve_webapp_source_dir(ctx: HealthContext):
     """The webapp source tree in the first local checkout that has one.
 
-    Same convention as :func:`resolve_tui_source_dir`. Two layouts are
-    recognised, in this order:
+    Prefers a `coord-web` checkout (#2470), discovered via
+    :func:`coord.health.checks.coord_web_ci_pin.resolve_coord_web_checkout`
+    — the same "checkout named ``coord-web``, else one carrying
+    ``playwright.acceptance.config.ts`` at its root" discovery that check
+    already uses — so `webapp_bundle` and `coord_web_ci_pin` can never
+    disagree about which local checkout is `coord-web`. That checkout's
+    ``src/`` is the webapp root (#2009, epic #2002).
 
-    1. ``<checkout>/src`` — a ``coord-web`` checkout, whose repo ROOT is the
-       webapp root (#2009, epic #2002). Gated on a sibling ``package.json``
-       so an unrelated repo that merely happens to have a top-level ``src/``
-       (any Rust or src-layout Python project in ``ctx.checkouts``) cannot be
-       mistaken for the webapp — grading the live bundle against the WRONG
-       tree would manufacture staleness rather than report it, which is the
-       exact failure ``resolve_tui_source_dir`` refuses to risk by not
-       guessing relative to the binary path.
-    2. ``<checkout>/coord/dashboard/webapp/src`` — the pre-#2009 in-repo
-       layout. Kept because a machine can legitimately still have an older
-       ``claude-coordinator`` checkout parked on a pre-split commit, and this
-       lane reporting UNKNOWN there would be a regression in signal for no
-       gain. It can only ever match a tree that genuinely is webapp source.
+    Falls back to ``<checkout>/coord/dashboard/webapp/src`` — the pre-#2009
+    in-repo layout. Kept because a machine can legitimately still have an
+    older ``claude-coordinator`` checkout parked on a pre-split commit, and
+    this lane reporting UNKNOWN there would be a regression in signal for no
+    gain. Configured ``health.webapp_source_dir`` still wins outright, same
+    convention as every other path in this module.
     """
     configured = getattr(ctx.thresholds, "webapp_source_dir", None)
     if configured:
         return expand(configured, ctx.home)
+    checkout = resolve_coord_web_checkout(ctx)
+    if checkout is not None:
+        candidate = checkout / "src"
+        if candidate.is_dir():
+            return candidate
     for checkout in ctx.checkouts:
-        if (checkout.path / "package.json").is_file():
-            candidate = checkout.path / "src"
-            if candidate.is_dir():
-                return candidate
         candidate = checkout.path / "coord" / "dashboard" / "webapp" / "src"
         if candidate.is_dir():
             return candidate

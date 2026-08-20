@@ -1617,11 +1617,15 @@ class HealthConfig:
     # None → ~/coord-web-dist — the symlink `deploy/coord-web-dist-build.timer`
     # atomically repoints at each new release (#1543).
     webapp_dist_path: str | None = None
-    # Directory holding the coord/dashboard/webapp/ sources the bundle was
-    # built from.  None → `<checkout>/coord/dashboard/webapp/src` for the
-    # first configured local checkout that has one.  Same `src/`-not-root
-    # reasoning as `tui_source_dir`: rooting at the webapp package root would
-    # sweep `node_modules`/`dist` were they not already skipped by name.
+    # Directory holding the `coord-web` sources the bundle was built from
+    # (#2470; before epic #2002 split the webapp out into its own repo, this
+    # was `coord/dashboard/webapp/` inside THIS repo).  None → `<checkout>/src`
+    # for this machine's `coord-web` checkout, discovered the same way
+    # `coord_web_checkout` is (see
+    # `coord.health.checks.coord_web_ci_pin.resolve_coord_web_checkout`).
+    # Same `src/`-not-root reasoning as `tui_source_dir`: rooting at the
+    # webapp package root would sweep `node_modules`/`dist` were they not
+    # already skipped by name.
     webapp_source_dir: str | None = None
     # Absolute path to the heartbeat coord-web-dist-build.sh writes on EVERY
     # invocation, whether or not there was anything to build (#2122). None →

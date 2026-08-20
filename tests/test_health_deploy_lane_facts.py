@@ -323,8 +323,8 @@ def test_webapp_bundle_present_no_source_tree_is_ok(tmp_path) -> None:
 
 
 def test_webapp_bundle_newer_than_source_is_ok(tmp_path) -> None:
-    checkout = tmp_path / "src" / "claude-coordinator"
-    src = checkout / "coord" / "dashboard" / "webapp" / "src"
+    checkout = tmp_path / "src" / "coord-web"
+    src = checkout / "src"
     src.mkdir(parents=True)
     old = src / "App.tsx"
     old.write_text("")
@@ -335,7 +335,7 @@ def test_webapp_bundle_newer_than_source_is_ok(tmp_path) -> None:
     os.utime(dist, (NOW, NOW))
 
     ctx = make_ctx(
-        tmp_path, checkouts=(Checkout(name="coordinator", path=checkout),)
+        tmp_path, checkouts=(Checkout(name="coord-web", path=checkout),)
     )
     result = dlf.probe_webapp_bundle(ctx)
     assert result.severity is Severity.OK
@@ -344,8 +344,8 @@ def test_webapp_bundle_newer_than_source_is_ok(tmp_path) -> None:
 
 
 def test_webapp_bundle_older_than_source_is_warn(tmp_path) -> None:
-    checkout = tmp_path / "src" / "claude-coordinator"
-    src = checkout / "coord" / "dashboard" / "webapp" / "src"
+    checkout = tmp_path / "src" / "coord-web"
+    src = checkout / "src"
     src.mkdir(parents=True)
     new = src / "App.tsx"
     new.write_text("")
@@ -356,7 +356,7 @@ def test_webapp_bundle_older_than_source_is_warn(tmp_path) -> None:
     os.utime(dist, (NOW - 9000, NOW - 9000))  # 2.5h before the source
 
     ctx = make_ctx(
-        tmp_path, checkouts=(Checkout(name="coordinator", path=checkout),)
+        tmp_path, checkouts=(Checkout(name="coord-web", path=checkout),)
     )
     result = dlf.probe_webapp_bundle(ctx)
     assert result.severity is Severity.WARN
@@ -365,8 +365,8 @@ def test_webapp_bundle_older_than_source_is_warn(tmp_path) -> None:
 
 
 def test_webapp_bundle_exactly_equal_mtimes_is_ok_not_warn(tmp_path) -> None:
-    checkout = tmp_path / "src" / "claude-coordinator"
-    src = checkout / "coord" / "dashboard" / "webapp" / "src"
+    checkout = tmp_path / "src" / "coord-web"
+    src = checkout / "src"
     src.mkdir(parents=True)
     ts = src / "App.tsx"
     ts.write_text("")
@@ -377,7 +377,7 @@ def test_webapp_bundle_exactly_equal_mtimes_is_ok_not_warn(tmp_path) -> None:
     os.utime(dist, (NOW, NOW))
 
     ctx = make_ctx(
-        tmp_path, checkouts=(Checkout(name="coordinator", path=checkout),)
+        tmp_path, checkouts=(Checkout(name="coord-web", path=checkout),)
     )
     assert dlf.probe_webapp_bundle(ctx).severity is Severity.OK
 
@@ -385,8 +385,8 @@ def test_webapp_bundle_exactly_equal_mtimes_is_ok_not_warn(tmp_path) -> None:
 def test_webapp_bundle_source_walk_skips_node_modules_and_dist(tmp_path) -> None:
     """A stale `dist/` sitting inside the source checkout, or a huge
     `node_modules/`, must never be allowed to masquerade as "source"."""
-    checkout = tmp_path / "src" / "claude-coordinator"
-    src = checkout / "coord" / "dashboard" / "webapp" / "src"
+    checkout = tmp_path / "src" / "coord-web"
+    src = checkout / "src"
     src.mkdir(parents=True)
     real = src / "App.tsx"
     real.write_text("")
@@ -428,28 +428,58 @@ def test_resolve_webapp_source_dir_prefers_the_configured_path(tmp_path) -> None
     assert dlf.resolve_webapp_source_dir(ctx) == configured
 
 
-def test_resolve_webapp_source_dir_falls_back_to_the_first_checkout_with_one(
+def test_resolve_webapp_source_dir_finds_the_checkout_named_coord_web(
     tmp_path,
 ) -> None:
+    """#2470: discovery defers to the same `coord-web`-checkout resolution
+    `coord_web_ci_pin` uses -- a checkout literally named `coord-web` wins,
+    same as that check."""
     checkout_a = tmp_path / "a"
     checkout_a.mkdir()
-    checkout_b = tmp_path / "b"
-    (checkout_b / "coord" / "dashboard" / "webapp" / "src").mkdir(parents=True)
+    checkout_b = tmp_path / "coord-web"
+    (checkout_b / "src").mkdir(parents=True)
     ctx = make_ctx(
         tmp_path,
         checkouts=(
             Checkout(name="a", path=checkout_a),
-            Checkout(name="b", path=checkout_b),
+            Checkout(name="coord-web", path=checkout_b),
         ),
     )
-    assert (
-        dlf.resolve_webapp_source_dir(ctx)
-        == checkout_b / "coord" / "dashboard" / "webapp" / "src"
+    assert dlf.resolve_webapp_source_dir(ctx) == checkout_b / "src"
+
+
+def test_resolve_webapp_source_dir_falls_back_to_the_playwright_marker(
+    tmp_path,
+) -> None:
+    """A `coord-web` checkout under a different directory/repo name is still
+    found via the structural marker `coord_web_ci_pin` already uses
+    (`playwright.acceptance.config.ts` at the checkout root) -- a rename
+    must not silently turn this lane off."""
+    checkout = tmp_path / "webui"
+    (checkout / "src").mkdir(parents=True)
+    (checkout / "playwright.acceptance.config.ts").write_text("")
+    ctx = make_ctx(
+        tmp_path, checkouts=(Checkout(name="webui", path=checkout),)
     )
+    assert dlf.resolve_webapp_source_dir(ctx) == checkout / "src"
 
 
 def test_resolve_webapp_source_dir_is_none_when_no_checkout_has_one(tmp_path) -> None:
     ctx = make_ctx(tmp_path, checkouts=())
+    assert dlf.resolve_webapp_source_dir(ctx) is None
+
+
+def test_resolve_webapp_source_dir_is_none_when_coord_web_checkout_has_no_src(
+    tmp_path,
+) -> None:
+    """The `coord-web` checkout is found, but it has no `src/` (e.g. not yet
+    cloned deep enough, or a genuinely different layout) -- absent, not a
+    crash, same as every other lane in this module."""
+    checkout = tmp_path / "coord-web"
+    checkout.mkdir(parents=True)
+    ctx = make_ctx(
+        tmp_path, checkouts=(Checkout(name="coord-web", path=checkout),)
+    )
     assert dlf.resolve_webapp_source_dir(ctx) is None
 
 

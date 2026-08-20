@@ -351,8 +351,8 @@ def probe_tui_binary(ctx: HealthContext) -> CheckResult:
     order=13,
     description=(
         "The dist/ bundle `coord web --dist` serves is not older than the "
-        "coord/dashboard/webapp/ source tree it was supposedly built from, "
-        "on every machine that has one (#1834 lane 5)."
+        "`coord-web` source tree it was supposedly built from, "
+        "on every machine that has one (#1834 lane 5, #2470)."
     ),
 )
 def probe_webapp_bundle(ctx: HealthContext) -> CheckResult:
