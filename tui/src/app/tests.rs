@@ -51002,6 +51002,94 @@ Milestone tracking issue.
         );
     }
 
+    /// #2288 review (blocking finding, second round): the guard belongs on
+    /// the §4 bare-`Ctrl-W` arm too, not only on the §9 latch.
+    ///
+    /// `resolve_board_pane_chord` declining while the Board filter has focus
+    /// stops the *second* key being stolen, but the `Ctrl-W` itself still
+    /// reached §4's close arm and destroyed a document tab. A focused
+    /// text-input surface owns the keyboard: the tab strip must be untouched.
+    #[test]
+    fn ctrl_w_typed_into_the_focused_board_filter_does_not_close_a_doc_tab() {
+        let mut driver = doc_tabs_driver(&[101, 102, 103], 120, 40);
+        assert_eq!(painted_tab_count(&driver), 3, "precondition: three tabs open");
+
+        driver.press(Key::Char('/'));
+        driver.render();
+        assert!(
+            driver.screen_contains(BOARD_FILTER_PLACEHOLDER),
+            "precondition: `/` focuses the Board filter:\n{}",
+            driver.screen()
+        );
+
+        driver.ctrl_char('w');
+        driver.render();
+
+        assert_eq!(
+            painted_tab_count(&driver),
+            3,
+            "#2288 review: a bare `Ctrl-W` typed while the Board FILTER has \
+             focus must not close a document tab — the filter owns the \
+             keyboard:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// Blurring the filter hands `Ctrl-W` straight back to §4 — the guard
+    /// above is a focus-scoped exemption, not a regression of #2283's close
+    /// chord. (Without this control the previous test would still pass if
+    /// `Ctrl-W` had simply stopped closing tabs altogether.)
+    #[test]
+    fn ctrl_w_still_closes_a_doc_tab_once_the_board_filter_is_blurred() {
+        let mut driver = doc_tabs_driver(&[101, 102, 103], 120, 40);
+        driver.press(Key::Char('/'));
+        driver.render();
+        driver.press_named(quadraui::NamedKey::Escape); // #646: blur the filter
+        driver.render();
+        assert_eq!(painted_tab_count(&driver), 3, "precondition: three tabs open");
+
+        driver.ctrl_char('w');
+        driver.render();
+
+        assert_eq!(
+            painted_tab_count(&driver),
+            2,
+            "#2283 §4: with the filter blurred, a bare `Ctrl-W` closes the \
+             active document tab exactly as before:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// The latch half of the same guard: a `Ctrl-W` swallowed by the focused
+    /// filter must not leave the §9 pane-chord latch armed either, or the
+    /// user's next keystroke is spent resolving a chord that never happened.
+    ///
+    /// Typing `w` (a §9 chord key) right after proves it: with the latch
+    /// leaked, the `w` moves pane focus instead of reaching the filter.
+    #[test]
+    fn ctrl_w_in_the_focused_board_filter_leaves_no_armed_pane_chord_latch() {
+        let mut driver = doc_tabs_driver(&[101, 102], 120, 40);
+        driver.press(Key::Char('/'));
+        driver.render();
+
+        driver.ctrl_char('w');
+        driver.press(Key::Char('w'));
+        driver.render();
+
+        assert!(
+            !driver.screen_contains(BOARD_FILTER_PLACEHOLDER),
+            "#2288 review: the `w` after a filter-swallowed `Ctrl-W` must be \
+             typed into the filter, not spent on the §9 latch:\n{}",
+            driver.screen()
+        );
+        assert_eq!(
+            painted_tab_count(&driver),
+            2,
+            "#2288 review: …and neither key may close a document tab:\n{}",
+            driver.screen()
+        );
+    }
+
     /// #2288 review (blocking finding, second half): resolving a §9 pane
     /// chord must also disarm #605's `Ctrl-W` leader.
     ///

@@ -423,9 +423,22 @@ impl CoordApp {
                 && self.active_view == SidebarView::Board
                 && !self.board_doc_tabs().is_empty()
             {
+                // #2288 review: a focused text-input surface OWNS the
+                // keyboard, so a bare `Ctrl-W` typed there must not close
+                // a document tab (nor bank a §9 undo snapshot / arm the
+                // pane-chord latch, which would then eat the user's next
+                // `v`/`s`/`w`/`x` keystroke). `board_search` (the Board
+                // filter box) and `inject_chat` (the inline chat composer)
+                // are both checked explicitly because neither counts as a
+                // "blocking modal" — `any_blocking_modal_active()` covers
+                // neither. Same guard set as `resolve_board_pane_chord`,
+                // deliberately: the two `Ctrl-W` sites must agree, or the
+                // latch outlives the close that armed it.
                 if matches!(key, Key::Char('w') | Key::Char('W'))
                     && modifiers.ctrl
                     && !modifiers.alt
+                    && !self.board_search.focused
+                    && self.inject_chat.is_none()
                 {
                     // #2288: bank the pre-close state so a following §9
                     // pane chord can retract this close (see

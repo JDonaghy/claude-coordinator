@@ -570,6 +570,18 @@ impl CoordApp {
             && modifiers.ctrl
             && !modifiers.alt
         {
+            // #2288 review: a focused text-input surface OWNS the keyboard.
+            // Arming either latch here would spend the user's NEXT keystroke
+            // resolving a chord they never started — the leader's "any other
+            // key cancels" branch swallows it, so a literal `w`/`v`/`x` typed
+            // into the Board filter or the inline chat composer would vanish.
+            // Swallow the `Ctrl-W` instead and arm nothing; the §4 close arm
+            // in `events.rs` declines for the same reason, and neither is a
+            // "blocking modal", so `any_blocking_modal_active()` can't see
+            // this state.
+            if self.board_search.focused || self.inject_chat.is_some() {
+                return Some(Reaction::Continue);
+            }
             self.ctrl_w_pending = true;
             // #2288 (ms-65 §9): arm the pane-chord latch as well, so
             // `Ctrl-W v/w/x` works on a Board panel with ZERO tabs open —
