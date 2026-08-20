@@ -234,14 +234,32 @@ def test_acceptance_job_installs_coord_cli_on_path() -> None:
     )
 
 
-def test_acceptance_job_installs_a_real_browser() -> None:
+def test_acceptance_job_runs_in_a_playwright_container_with_browsers_preinstalled() -> None:
+    """#2447: `npx playwright install --with-deps` shells out to `apt-get`
+    unconditionally, with no timeout of its own — 2026-08-19 it hung ~17
+    minutes against an unreachable mirror (run 32303439053, job
+    96230939784). Running the job inside Microsoft's pre-built Playwright
+    image ships the matching Chromium build AND its native library deps
+    already installed, so there is no `apt-get` in this job's critical path
+    at all — replaces the old `playwright install`/cache/retry steps below
+    rather than adding a timeout around them."""
     workflow = _load_workflow(ACCEPTANCE_WORKFLOW_PATH)
+    jobs = workflow.get("jobs") or {}
+    container = (jobs.get("acceptance") or {}).get("container")
+    assert isinstance(container, str) and container.startswith(
+        "mcr.microsoft.com/playwright:"
+    ), (
+        "the 'acceptance' job no longer runs inside a pinned "
+        f"mcr.microsoft.com/playwright container image: {container!r} — "
+        "without it, browsers aren't preinstalled and the job needs its "
+        "own `playwright install --with-deps` step back"
+    )
     steps = _job_steps(workflow, "acceptance", ACCEPTANCE_WORKFLOW_PATH)
-    browser_step = _step_runs(steps, "playwright install")
-    assert browser_step is not None, (
-        "the 'acceptance' job never runs `npx playwright install` — "
-        "chromium (or whichever project(s) playwright.acceptance.config.ts "
-        "declares) won't be present to actually run the suite"
+    assert _step_runs(steps, "playwright install") is None, (
+        "the 'acceptance' job still runs `playwright install` even though "
+        "it's on the pre-built container image — the container already "
+        "ships the browser, so this step just re-triggers the apt-get path "
+        "#2447 removed it to avoid"
     )
 
 
@@ -263,61 +281,22 @@ def test_acceptance_workflow_is_paths_gated_to_webapp_changes() -> None:
         )
 
 
-def test_acceptance_job_caches_playwright_browsers() -> None:
-    """#2393: neither `acceptance` nor `e2e` cached the Playwright browser
-    binary, so every single CI run re-downloaded ~300MB of Chromium from
-    Playwright's CDN from scratch — full exposure to any network hiccup on
-    that path, every time, not just occasionally. Confirmed live
-    2026-08-18: this hung 3 separate PRs' worth of runs in one afternoon.
-    A cache hit skips the download-heavy `install --with-deps` entirely in
-    favor of the apt-only `install-deps`."""
+def test_acceptance_job_has_no_dangling_playwright_cache_step() -> None:
+    """#2447 superseded #2393's cache-around-the-download approach for this
+    job (see the container test above) — the cache step and its cache-miss
+    install step must both be gone, not just one of the pair left dangling
+    with nothing to condition on."""
     workflow = _load_workflow(ACCEPTANCE_WORKFLOW_PATH)
     steps = _job_steps(workflow, "acceptance", ACCEPTANCE_WORKFLOW_PATH)
     cache_step = next(
         (s for s in steps if (s.get("uses") or "").startswith("actions/cache")),
         None,
     )
-    assert cache_step is not None, (
-        "the 'acceptance' job has no actions/cache step for Playwright's "
-        "browser binaries — every run re-downloads Chromium from scratch"
-    )
-    assert cache_step.get("with", {}).get("path") == "~/.cache/ms-playwright", (
-        f"cache step doesn't target Playwright's browser cache dir: "
-        f"{cache_step.get('with')!r}"
-    )
-    # The full (network-heavy) install must be conditioned on a cache MISS —
-    # otherwise the cache exists but is never actually consulted.
-    install_step = _step_runs(steps, "playwright install chromium --with-deps")
-    assert install_step is not None
-    assert "cache-hit != 'true'" in (install_step.get("if") or ""), (
-        "the full `playwright install --with-deps` step isn't gated on a "
-        f"cache miss, so the cache added above is never actually used: "
-        f"{install_step.get('if')!r}"
-    )
-
-
-def test_acceptance_job_retries_playwright_install_on_transient_hangs() -> None:
-    """#2393 follow-up, confirmed live 2026-08-18: caching alone doesn't help
-    a cache-miss run (the very first run on a branch, or any run after a
-    `@playwright/test` version bump) — and PR #2392's own first CI run hit
-    exactly that, hanging the full 20-minute job budget on one install
-    attempt with nothing to fall back on. The install must instead be
-    wrapped in a bounded per-attempt timeout with more than one attempt, so
-    a transient CDN/mirror hang fails fast and gets retried instead of
-    burning the whole job timeout on a single stuck attempt."""
-    workflow = _load_workflow(ACCEPTANCE_WORKFLOW_PATH)
-    steps = _job_steps(workflow, "acceptance", ACCEPTANCE_WORKFLOW_PATH)
-    install_step = _step_runs(steps, "playwright install chromium --with-deps")
-    assert install_step is not None
-    run = install_step["run"]
-    assert "timeout " in run, (
-        f"the cache-miss install step has no per-attempt timeout, so one "
-        f"stuck attempt can still consume the entire job budget: {run!r}"
-    )
-    assert "for attempt in" in run and "1 2 3" in run, (
-        f"the cache-miss install step doesn't actually loop over multiple "
-        f"attempts — a single attempt is exactly what hung 4 separate times "
-        f"on 2026-08-18: {run!r}"
+    assert cache_step is None, (
+        "the 'acceptance' job still has an actions/cache step for "
+        f"Playwright browsers: {cache_step!r} — the pre-built container "
+        "image ships browsers already installed, so there's nothing left "
+        "to cache"
     )
 
 
