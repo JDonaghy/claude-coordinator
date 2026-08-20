@@ -786,10 +786,30 @@ impl PaneSet {
 /// (#2288): with one pane — the default, and the only state #2282–#2287
 /// ever reach — the two are indistinguishable, since [`Self::group`] hands
 /// back that single pane's group.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct DocTabs {
     board: PaneSet,
     pipeline: PaneSet,
+    /// The `~/.coord/tabs.json` this instance persists to, resolved ONCE by
+    /// [`Self::load`] and never re-derived from the ambient `HOME`
+    /// afterwards — see [`Self::path`]'s "pinned at construction" section
+    /// for why re-reading `HOME` per save is a live cross-test hazard.
+    ///
+    /// `None` — the default, and what every explicit-path constructor
+    /// ([`Self::load_from_path`], [`Self::default`]) yields — means "this
+    /// instance has no ambient file": [`Self::save`] / [`Self::save_if_exists`]
+    /// are no-ops, and only the explicit [`Self::save_to_path`] writes.
+    origin: Option<PathBuf>,
+}
+
+/// Deliberately hand-written rather than derived: [`DocTabs::origin`] is
+/// *where* a tab set persists, not part of the tab set itself, so two
+/// instances holding the same tabs compare equal whether one of them came
+/// from disk and the other was built in memory.
+impl PartialEq for DocTabs {
+    fn eq(&self, other: &Self) -> bool {
+        self.board == other.board && self.pipeline == other.pipeline
+    }
 }
 
 impl DocTabs {
@@ -876,6 +896,36 @@ impl DocTabs {
     /// as `HOME` being unset) rather than touching a real home directory.
     /// Compiled out entirely for the shipped binary — real users are
     /// unaffected, exactly like `Workspace`/`TuiSettings` today.
+    ///
+    /// # This is resolved ONCE, at construction — never per save
+    ///
+    /// The guard above is a property of the PROCESS, not of the test that
+    /// installed the sandbox. `HOME` is process-global, so the moment one
+    /// test points it at a temp dir, EVERY other test running concurrently
+    /// in the same binary starts resolving that same sandbox — and the
+    /// acceptance binary runs ~110 tests across as many threads as the host
+    /// has cores. `tests/acceptance/ms-65/tabs_persistence_2286.rs`'s
+    /// `HomeSandbox` serialises its own slice against itself (its
+    /// `HOME_LOCK`), which is all it can do from inside one module; it
+    /// cannot serialise the other slices sharing the binary.
+    ///
+    /// That is why [`Self::load`] pins the answer into [`Self::origin`] and
+    /// [`Self::save`] / [`Self::save_if_exists`] use the pinned value
+    /// instead of calling this again. An app built while `HOME` was the
+    /// developer's real home has `origin == None` *for its whole life*, so
+    /// a sandbox installed by some other thread half a second later can
+    /// never capture its writes. Without the pin, exactly that happened:
+    /// every unsandboxed app's tab clicks were redirected into whichever
+    /// sandbox happened to be live at that instant, and the sandboxing
+    /// test lost its own `tabs.json` to a neighbour (#2288 — reproducible
+    /// on essentially every full-suite run once the `board_split_2288`
+    /// slice started driving tab strips for its full length instead of
+    /// panicking on its first assertion).
+    ///
+    /// The residue this does NOT fix is an app *constructed* inside another
+    /// thread's sandbox window; that needs the injectable `~/.coord` seam
+    /// `tests/acceptance/ms-65/manifest.yml` finding 14b flags as a
+    /// repo-wide follow-up, or a single-threaded acceptance binary.
     pub(crate) fn path() -> Option<PathBuf> {
         let home = std::env::var_os("HOME").map(PathBuf::from)?;
         #[cfg(any(test, feature = "test-support"))]
@@ -914,6 +964,10 @@ impl DocTabs {
                     persisted.pipeline.unwrap_or_default(),
                     PanelScope::Pipeline,
                 )),
+                // An explicit-path load pins nothing: only `load()` (which
+                // resolved the path from `HOME` in the first place) sets
+                // `origin`. See the field's doc comment.
+                origin: None,
             },
             Err(_) => Self::default(),
         }
@@ -921,10 +975,73 @@ impl DocTabs {
 
     /// Load from `~/.coord/tabs.json`. Returns the default (empty) tab set
     /// when `HOME` is unset, the file is absent, or it fails to parse.
+    ///
+    /// Also PINS the resolved path into [`Self::origin`] — including when
+    /// the file does not exist yet, so a first run still creates it on the
+    /// way out — and that pinned value is what every later save uses. See
+    /// [`Self::path`]'s "resolved ONCE" section.
     pub(crate) fn load() -> Self {
-        match Self::path() {
-            Some(path) => Self::load_from_path(&path),
+        let origin = Self::path().and_then(Self::claim_origin);
+        let mut tabs = match &origin {
+            Some(path) => Self::load_from_path(path),
             None => Self::default(),
+        };
+        tabs.origin = origin;
+        tabs
+    }
+
+    /// Production: every resolved path is the caller's own — there is one
+    /// app per process and one `~/.coord/tabs.json` per user, so this is
+    /// the identity function and compiles away.
+    #[cfg(not(any(test, feature = "test-support")))]
+    fn claim_origin(path: PathBuf) -> Option<PathBuf> {
+        Some(path)
+    }
+
+    /// Test / `test-support` builds: give each sandboxed `~/.coord/tabs.json`
+    /// a single owning THREAD, and refuse it to every other one.
+    ///
+    /// This is the second half of the fix [`Self::path`] describes. Pinning
+    /// [`Self::origin`] at construction stops an app that was built under
+    /// the real `HOME` from ever writing into a sandbox some other thread
+    /// installs later — but an app *constructed* while another thread's
+    /// sandbox is live still resolves that sandbox, loads its seeded
+    /// `tabs.json` (rendering a tab strip its own test never opened) and
+    /// then overwrites it on the next click.
+    ///
+    /// A sandbox path is unique per test — `HomeSandbox` mixes a process id
+    /// and a monotonic sequence number into the directory name — and its
+    /// owner is, in every real ordering, the thread that constructs an app
+    /// immediately after installing it. First-loader-wins therefore names
+    /// the right thread, and the window in which another thread could get
+    /// there first shrinks from "the whole test body" to "the few
+    /// microseconds between `set_var("HOME")` and the owning test's own
+    /// `make_test_app`".
+    ///
+    /// Keyed by thread rather than by instance so that a test which
+    /// restarts its app — build a driver, seed a different `tabs.json`,
+    /// build another — keeps its own file across both.
+    #[cfg(any(test, feature = "test-support"))]
+    fn claim_origin(path: PathBuf) -> Option<PathBuf> {
+        use std::collections::hash_map::Entry;
+        use std::sync::{Mutex, OnceLock};
+        use std::thread::ThreadId;
+
+        static OWNERS: OnceLock<Mutex<HashMap<PathBuf, ThreadId>>> = OnceLock::new();
+
+        let owners = OWNERS.get_or_init(|| Mutex::new(HashMap::new()));
+        // A poisoned lock only means some other test panicked while holding
+        // it; the map is still consistent, and refusing to hand out any
+        // path from here on would turn one failure into a cascade.
+        let mut owners = owners.lock().unwrap_or_else(|e| e.into_inner());
+        let me = std::thread::current().id();
+        match owners.entry(path.clone()) {
+            Entry::Occupied(e) if *e.get() != me => None,
+            Entry::Occupied(_) => Some(path),
+            Entry::Vacant(e) => {
+                e.insert(me);
+                Some(path)
+            }
         }
     }
 
@@ -976,8 +1093,8 @@ impl DocTabs {
     /// for the far more frequent mutation-triggered save, which deliberately
     /// does NOT create a fresh file.
     pub(crate) fn save(&self) -> Result<bool, String> {
-        match Self::path() {
-            Some(path) => self.save_to_path(&path),
+        match &self.origin {
+            Some(path) => self.save_to_path(path),
             None => Ok(false),
         }
     }
@@ -1009,13 +1126,13 @@ impl DocTabs {
     /// seeds the file BEFORE the mutation it checks, so this still fires for
     /// it.
     pub(crate) fn save_if_exists(&self) -> Result<bool, String> {
-        let Some(path) = Self::path() else {
+        let Some(path) = self.origin.as_ref() else {
             return Ok(false);
         };
         if !path.exists() {
             return Ok(false);
         }
-        self.save_to_path(&path)
+        self.save_to_path(path)
     }
 }
 
@@ -2034,6 +2151,118 @@ mod tests {
             &[k(101)],
             "#2286 §6 bullet 2: a pruned document must never round-trip back \
              into the re-saved file"
+        );
+    }
+
+    // ── #2288: the persisted file is PINNED at construction ───────────────
+    //
+    // `HOME` is process-global but the acceptance binary is not: while one
+    // test points `HOME` at a sandbox, every other test's app used to
+    // resolve that same sandbox on its next tab click and overwrite it.
+    // These pin `save`/`save_if_exists` to `DocTabs::origin` instead.
+
+    #[test]
+    fn an_instance_with_no_pinned_origin_never_writes_through_the_ambient_home() {
+        let path = tmp_json_path("origin_unpinned_never_writes");
+        // A real, populated file on disk — `save_if_exists`'s "already
+        // exists" precondition is satisfied, so only the missing origin can
+        // hold the write back.
+        let mut seed = DocTabs::default();
+        seed.group_mut(PanelScope::Board).pin(k(101));
+        seed.save_to_path(&path).expect("seed should be written");
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        // Every explicit-path constructor yields an unpinned instance.
+        let mut tabs = DocTabs::load_from_path(&path);
+        assert_eq!(tabs.origin, None, "an explicit-path load pins nothing");
+        tabs.group_mut(PanelScope::Board).pin(k(102));
+
+        assert_eq!(
+            tabs.save_if_exists(),
+            Ok(false),
+            "#2288: with no pinned origin the mutation-triggered save is a no-op"
+        );
+        assert_eq!(
+            tabs.save(),
+            Ok(false),
+            "#2288: and so is the on-exit save — neither may fall back to `HOME`"
+        );
+        let after = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            before, after,
+            "#2288: the file on disk is untouched — this is the write that used \
+             to land in whichever sandbox another thread had installed"
+        );
+    }
+
+    #[test]
+    fn a_pinned_origin_is_what_save_writes_to_and_survives_a_home_change() {
+        let path = tmp_json_path("origin_pinned_writes");
+        let _ = std::fs::remove_file(&path);
+
+        let mut tabs = DocTabs {
+            origin: Some(path.clone()),
+            ..Default::default()
+        };
+        tabs.group_mut(PanelScope::Board).pin(k(101));
+
+        assert_eq!(
+            tabs.save_if_exists(),
+            Ok(false),
+            "never creates: the file does not exist yet"
+        );
+        assert!(!path.exists(), "save_if_exists must not create the file");
+
+        assert_eq!(tabs.save(), Ok(true), "the on-exit save creates it");
+        tabs.group_mut(PanelScope::Board).pin(k(102));
+        assert_eq!(
+            tabs.save_if_exists(),
+            Ok(true),
+            "and now that it exists, every mutation keeps it fresh"
+        );
+
+        let reloaded = DocTabs::load_from_path(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            reloaded.group(PanelScope::Board).tabs(),
+            &[k(101), k(102)],
+            "#2288: writes go to the pinned origin, not to a re-derived path"
+        );
+    }
+
+    #[test]
+    fn a_sandboxed_tabs_file_is_claimed_by_one_thread_and_refused_to_others() {
+        let path = tmp_json_path("origin_claim");
+
+        assert_eq!(
+            DocTabs::claim_origin(path.clone()),
+            Some(path.clone()),
+            "#2288: the first thread to ask owns the file",
+        );
+        assert_eq!(
+            DocTabs::claim_origin(path.clone()),
+            Some(path.clone()),
+            "#2288: and it keeps it across a restart within the same test",
+        );
+
+        let other = path.clone();
+        let seen = std::thread::spawn(move || DocTabs::claim_origin(other))
+            .join()
+            .expect("claim thread should not panic");
+        assert_eq!(
+            seen, None,
+            "#2288: a second thread is refused — it must not load the owner's \
+             seeded tabs, and must never write over them",
+        );
+
+        // A different sandbox (every `HomeSandbox` mixes in a fresh sequence
+        // number) is unaffected by the claim above.
+        let fresh = tmp_json_path("origin_claim_other");
+        assert_eq!(
+            DocTabs::claim_origin(fresh.clone()),
+            Some(fresh),
+            "#2288: the claim is per-file, not a global latch",
         );
     }
 
