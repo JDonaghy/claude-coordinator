@@ -165,65 +165,34 @@ impl ShellApp for CoordApp {
             .set(content_visible_rows(m, lh).max(1));
         match self.active_view {
             SidebarView::Board => {
-                // `#464`: route through `detail_tab_bar_height` so render and
-                // hit-test agree on the cell boundary in the TUI backend.
-                let tab_h = detail_tab_bar_height(lh);
-                // #2282 (ms-65 §2a): the document tab strip is a NEW row
-                // inserted between the panel toolbar and the existing
-                // `Board / Issue / Chat / Terminal` sub-tab bar — two tab rows,
-                // in that order, pinned by the contract. With zero documents
-                // open `board_doc_tab_strip` is `None`: the strip renders
-                // nothing and reserves no row, so the sub-tab bar sits exactly
-                // where it did pre-ms-65 (§4/#2283: also the close-the-last-tab
-                // empty state).
+                // #2288 (ms-65 §9): the panel toolbar above has already been
+                // carved off `full_m` and spans the FULL panel width — it is
+                // panel-scoped, not pane-scoped. Everything from here down
+                // (doc-tab strip, sub-tab bar, content) is what the split
+                // duplicates, so `m` is the rect the `SplitTree` divides.
                 //
-                // #2283 (ms-65 §4): `board_doc_tab_strip` is the single place
-                // that resolves `scroll_offset` AND bakes in the `‹`/`›`
-                // overflow affordances — the click hit-test
-                // (`events.rs::mouse_main_click`) builds the exact same
-                // `TabBar` from the exact same call so a click column can
-                // never disagree with what got painted here.
-                let m = match self.board_doc_tab_strip(m.width) {
-                    Some(strip) => {
-                        let strip_rect = Rect::new(m.x, m.y, m.width, tab_h);
-                        backend.draw_tab_bar(strip_rect, &strip, None);
-                        Rect::new(m.x, m.y + tab_h, m.width, (m.height - tab_h).max(0.0))
-                    }
-                    None => m,
-                };
-                // Sub-tab bar (Board / Issue / Chat / Terminal), then the
-                // active sub-tab's content.
-                let tab_bar = self.board_detail_tab_bar();
-                let tab_rect = Rect::new(m.x, m.y, m.width, tab_h);
-                let content_rect =
-                    Rect::new(m.x, m.y + tab_h, m.width, (m.height - tab_h).max(0.0));
-                backend.draw_tab_bar(tab_rect, &tab_bar, None);
-                match self.board_detail_tab {
-                    BoardDetailTab::Board => {
-                        backend.draw_list(content_rect, &self.detail_list());
-                    }
-                    BoardDetailTab::Issue => {
-                        // #669: stash content width so board_issue_body_list can
-                        // word-wrap long lines to the viewport.
-                        self.last_issue_panel_cols.set(content_rect.width as usize);
-                        backend.draw_list(content_rect, &self.board_issue_body_list());
-                    }
-                    // #316: Chat tab — empty state CTA or live board chat.
-                    BoardDetailTab::Chat => {
-                        self.render_board_chat_tab(backend, content_rect);
-                    }
-                    // #675: Terminal tab — per-issue interactive shell, mirrors
-                    // PipelineDetailTab::Terminal rendering.
-                    BoardDetailTab::Terminal => {
-                        self.render_detail_terminal_tab(backend, content_rect);
-                    }
+                // One pane ⇒ `split_tree` is a bare `Leaf`, its single leaf
+                // rect is `m` verbatim and no divider is painted: §9's "with
+                // a single pane, rendering is byte-identical to the
+                // non-split case".
+                let panes = self.board_panes();
+                let tree = panes.split_tree(PanelScope::Board);
+                let split_layout = backend.split_tree_layout(m, &tree);
+                self.paint_board_pane_dividers(backend, &split_layout);
+                let leaves: Vec<Rect> = split_layout
+                    .leaves
+                    .iter()
+                    .map(|(_, rect)| *rect)
+                    .collect();
+                *self.board_split_layout.borrow_mut() = Some(split_layout);
+                for (pane_idx, pane_rect) in leaves.into_iter().enumerate() {
+                    self.render_pane.set(Some(pane_idx));
+                    self.render_board_pane(backend, pane_rect, lh);
                 }
-                // #316 Phase B: file-issue modal renders on top of the Chat tab.
-                if self.board_detail_tab == BoardDetailTab::Chat {
-                    if self.file_issue_modal.is_some() {
-                        self.render_file_issue_modal(backend, m);
-                    }
-                }
+                // Back to "the focused pane" the moment the paint is over —
+                // every event handler must see the focused pane, never
+                // whichever one happened to be painted last.
+                self.render_pane.set(None);
             }
             SidebarView::Machines => {
                 // #207: Reserve two sparkline rows (CPU + mem) at the bottom
@@ -1735,6 +1704,139 @@ impl CoordApp {
         }
     }
 
+    // ─── #2288 (ms-65 §9): side-by-side split ────────────────────────────
+
+    /// The `║` (U+2551) pane divider §9 pins, painted at exactly the cell
+    /// `SplitTreeDivider::cell_position` resolves — the same conversion
+    /// `board_split_divider_hit` (events.rs) hit-tests against, which is
+    /// the structural fix quadraui's `SplitTree` docs prescribe for the
+    /// paint/click drift bug class (vimcode #582/#452).
+    ///
+    /// quadraui's own `draw_split_tree` rasteriser is deliberately NOT used
+    /// here: it paints `│` (U+2502), the same glyph this app already paints
+    /// at column 2 for the sidebar/main boundary, and §9 pins a distinct
+    /// `║` precisely so a pane divider is unambiguous on a symbols-only
+    /// grid. Only the *painting* differs — the geometry still comes from
+    /// `SplitTree::layout` via `Backend::split_tree_layout`, never from
+    /// hand-rolled math.
+    ///
+    /// A no-op for an unsplit scope, whose tree is a bare `Leaf` and so has
+    /// no dividers at all.
+    fn paint_board_pane_dividers(&self, backend: &mut dyn Backend, layout: &SplitTreeLayout) {
+        for div in &layout.dividers {
+            let rows = div.cross_size.max(0.0) as usize;
+            if rows == 0 {
+                continue;
+            }
+            let display = TextDisplay {
+                id: WidgetId::new("board-pane-divider"),
+                lines: (0..rows)
+                    .map(|_| TextDisplayLine {
+                        spans: vec![StyledSpan::plain(PANE_DIVIDER_CHAR.to_string())],
+                        decoration: Decoration::Muted,
+                        timestamp: None,
+                    })
+                    .collect(),
+                scroll_offset: 0,
+                // The divider is exactly as tall as its rect, so there is
+                // nothing to scroll — but `auto_scroll` defaults to `true`
+                // and would let the rasteriser re-pin the view, so it is
+                // switched off explicitly rather than left to luck.
+                auto_scroll: false,
+                max_lines: 0,
+                has_focus: false,
+                title: None,
+                show_scrollbar: false,
+            };
+            backend.draw_text_display(
+                Rect::new(
+                    div.cell_position() as f32,
+                    div.cross_start,
+                    div.thickness,
+                    div.cross_size,
+                ),
+                &display,
+            );
+        }
+    }
+
+    /// Paint ONE Board pane into `rect` — the doc-tab strip, the
+    /// `Board / Issue / Chat / Terminal` sub-tab bar and the active
+    /// sub-tab's content, in that order (contract §2a).
+    ///
+    /// #2288: this is verbatim the body the Board arm of `render_content`
+    /// used to inline, with `m` replaced by the pane's own rect. Which
+    /// pane's tabs it reads is carried by `render_pane`, which the caller
+    /// sets around this call — see `CoordApp::board_render_pane`. With one
+    /// pane the caller passes the full panel rect and nothing about the
+    /// output changes.
+    fn render_board_pane(&self, backend: &mut dyn Backend, rect: Rect, lh: f32) {
+        // `#464`: route through `detail_tab_bar_height` so render and
+        // hit-test agree on the cell boundary in the TUI backend.
+        let tab_h = detail_tab_bar_height(lh);
+        // #2282 (ms-65 §2a): the document tab strip is a NEW row
+        // inserted between the panel toolbar and the existing
+        // `Board / Issue / Chat / Terminal` sub-tab bar — two tab rows,
+        // in that order, pinned by the contract. With zero documents
+        // open `board_doc_tab_strip` is `None`: the strip renders
+        // nothing and reserves no row, so the sub-tab bar sits exactly
+        // where it did pre-ms-65 (§4/#2283: also the close-the-last-tab
+        // empty state).
+        //
+        // #2283 (ms-65 §4): `board_doc_tab_strip` is the single place
+        // that resolves `scroll_offset` AND bakes in the `‹`/`›`
+        // overflow affordances — the click hit-test
+        // (`events.rs::mouse_main_click`) builds the exact same
+        // `TabBar` from the exact same call so a click column can
+        // never disagree with what got painted here.
+        let m = match self.board_doc_tab_strip(rect.width) {
+            Some(strip) => {
+                let strip_rect = Rect::new(rect.x, rect.y, rect.width, tab_h);
+                backend.draw_tab_bar(strip_rect, &strip, None);
+                Rect::new(
+                    rect.x,
+                    rect.y + tab_h,
+                    rect.width,
+                    (rect.height - tab_h).max(0.0),
+                )
+            }
+            None => rect,
+        };
+        // Sub-tab bar (Board / Issue / Chat / Terminal), then the
+        // active sub-tab's content.
+        let tab_bar = self.board_detail_tab_bar();
+        let tab_rect = Rect::new(m.x, m.y, m.width, tab_h);
+        let content_rect = Rect::new(m.x, m.y + tab_h, m.width, (m.height - tab_h).max(0.0));
+        backend.draw_tab_bar(tab_rect, &tab_bar, None);
+        match self.board_pane_detail_tab() {
+            BoardDetailTab::Board => {
+                backend.draw_list(content_rect, &self.detail_list());
+            }
+            BoardDetailTab::Issue => {
+                // #669: stash content width so board_issue_body_list can
+                // word-wrap long lines to the viewport.
+                self.last_issue_panel_cols.set(content_rect.width as usize);
+                backend.draw_list(content_rect, &self.board_issue_body_list());
+            }
+            // #316: Chat tab — empty state CTA or live board chat.
+            BoardDetailTab::Chat => {
+                self.render_board_chat_tab(backend, content_rect);
+            }
+            // #675: Terminal tab — per-issue interactive shell, mirrors
+            // PipelineDetailTab::Terminal rendering.
+            BoardDetailTab::Terminal => {
+                self.render_detail_terminal_tab(backend, content_rect);
+            }
+        }
+        // #316 Phase B: file-issue modal renders on top of the Chat tab.
+        // Anchored on the LIVE sub-tab, not the pane's: the modal is a
+        // panel-level overlay, and only the focused pane can have opened
+        // it.
+        if self.board_detail_tab == BoardDetailTab::Chat && self.file_issue_modal.is_some() {
+            self.render_file_issue_modal(backend, m);
+        }
+    }
+
     /// #2282 (ms-65 §2): the Board panel's **document** tab strip — one tab per
     /// open issue, at most one of them a preview.
     ///
@@ -1748,8 +1850,30 @@ impl CoordApp {
     /// still set so quadraui paints the preview tab italic (contract §1); the
     /// `∘ ` marker inside the label is the symbols-only stand-in for that
     /// styling, not a replacement for it.
+    ///
+    /// #2288 (§9): reports the **currently-addressed pane** — the one the
+    /// render loop is painting (`board_render_pane`), or the focused pane
+    /// outside a paint. See [`Self::board_doc_tab_bar_for_pane`].
+    #[cfg(test)]
     pub(crate) fn board_doc_tab_bar(&self) -> Option<TabBar> {
-        let group = self.board_doc_tabs();
+        self.board_doc_tab_bar_for_pane(self.board_render_pane())
+    }
+
+    /// #2288 (ms-65 §9): [`Self::board_doc_tab_bar`] for one explicit pane.
+    ///
+    /// Each pane owns its own strip, so the split state changes two things
+    /// here and nothing else: which [`doc_tabs::DocTabGroup`] the tabs come
+    /// from, and the label budget — §9 pins a narrower 14 (16 with the §1
+    /// preview marker) for a split pane, against §2b's 20/22 for an
+    /// undivided one.
+    pub(crate) fn board_doc_tab_bar_for_pane(&self, pane: usize) -> Option<TabBar> {
+        let panes = self.doc_tabs.panes(PanelScope::Board);
+        let group = panes.pane(pane);
+        let max_cols = if panes.is_split() {
+            SPLIT_DOC_TAB_LABEL_COLS
+        } else {
+            DOC_TAB_LABEL_COLS
+        };
         if group.is_empty() {
             return None;
         }
@@ -1777,7 +1901,9 @@ impl CoordApp {
                 let is_preview = group.is_preview(idx);
                 let is_active = group.active_index() == Some(idx);
                 TabItem {
-                    label: doc_tab_label(repo, *number, &title, show_repo, is_preview, is_active),
+                    label: doc_tab_label(
+                        repo, *number, &title, show_repo, is_preview, is_active, max_cols,
+                    ),
                     is_active,
                     is_dirty: false,
                     is_preview,
@@ -1851,7 +1977,18 @@ impl CoordApp {
     /// `None` when zero documents are open (identical to
     /// [`Self::board_doc_tab_bar`]).
     pub(crate) fn board_doc_tab_strip(&self, width: f32) -> Option<TabBar> {
-        let mut bar = self.board_doc_tab_bar()?;
+        self.board_doc_tab_strip_for_pane(self.board_render_pane(), width)
+    }
+
+    /// #2288 (ms-65 §9): [`Self::board_doc_tab_strip`] for one explicit
+    /// pane, at that pane's own width.
+    ///
+    /// The split makes `width` genuinely per-pane — each half of the panel
+    /// resolves its own `scroll_offset` and its own `‹`/`›` markers — so a
+    /// click in the right pane is measured against the right pane's rect,
+    /// never the whole panel's.
+    pub(crate) fn board_doc_tab_strip_for_pane(&self, pane: usize, width: f32) -> Option<TabBar> {
+        let mut bar = self.board_doc_tab_bar_for_pane(pane)?;
         Self::bake_doc_tab_overflow_markers(&mut bar, width);
         Some(bar)
     }
@@ -1891,7 +2028,18 @@ impl CoordApp {
                 let is_preview = group.is_preview(idx);
                 let is_active = group.active_index() == Some(idx);
                 TabItem {
-                    label: doc_tab_label(repo, *number, &title, show_repo, is_preview, is_active),
+                    label: doc_tab_label(
+                        repo,
+                        *number,
+                        &title,
+                        show_repo,
+                        is_preview,
+                        is_active,
+                        // #2288 ships side-by-side splitting for the Board
+                        // panel only (§9's mock is Board's), so Pipeline's
+                        // strip always uses §2b's undivided budget.
+                        DOC_TAB_LABEL_COLS,
+                    ),
                     is_active,
                     is_dirty: false,
                     is_preview,
@@ -1969,29 +2117,45 @@ impl CoordApp {
     /// / `app::fixtures` — see `plans.rs`'s module docs for the overall
     /// `HelpRegistry`/`ViewHelp` pattern this copies.
     ///
-    /// Only `notes` (no `actions` — Board doesn't get a `/` command
-    /// palette; `SidebarView::help_view_id`'s doc comment on the `Board`
-    /// arm explains why `events.rs` deliberately never calls
-    /// `open_command_palette` for it). `render_help_overlay` (`plans.rs`)
-    /// paints this list's header as **"Document tabs"** rather than the
-    /// generic **"Reference"** Plans gets — a Board-only special case
-    /// there, mirroring how it already special-cases the Plans-only
-    /// "Health chips" section.
+    /// `render_help_overlay` (`plans.rs`) paints the `notes` list's header
+    /// as **"Document tabs"** rather than the generic **"Reference"** Plans
+    /// gets, and the `actions` list's header as **"Split"** rather than
+    /// **"Actions"** — both Board-only special cases there, mirroring how it
+    /// already special-cases the Plans-only "Health chips" section.
     ///
-    /// The six rows are contract §8b's own pinned phrases, verbatim, and
-    /// match `mocks/board-tabs-help-overlay.screen`'s "Document tabs"
-    /// section exactly (its "Split" section is #2288's, deliberately not
-    /// modeled here — see that issue and finding 14 in
-    /// `tests/acceptance/ms-65/manifest.yml`).
+    /// The six `notes` rows are contract §8b's own pinned phrases, verbatim,
+    /// and match `mocks/board-tabs-help-overlay.screen`'s "Document tabs"
+    /// section exactly.
+    ///
+    /// #2288 (§9): the four `actions` rows are §8b's second section — §9's
+    /// pinned key table, verbatim from `mocks/board-tabs-help-overlay.screen`
+    /// rows 12–15. They are carried as `actions` purely because `ViewHelp`
+    /// has exactly two lists and the overlay needs two sections; Board still
+    /// has no `/` command palette (`SidebarView::help_view_id`'s doc comment
+    /// on the `Board` arm explains why `events.rs` deliberately never calls
+    /// `open_command_palette` for it), and these rows carry no accelerator
+    /// so they render in the same two-column shape the notes above do.
+    ///
+    /// `Ctrl-W s` is listed but inert: contract Note 2 reserves the key for
+    /// a later 2×2 layout so a future milestone doesn't have to renegotiate
+    /// the binding, and pins that no ms-65 behaviour depends on it doing
+    /// anything.
     pub(crate) fn board_view_help() -> ViewHelp {
-        ViewHelp::new("Board").with_notes(vec![
-            HelpNote::new("click row", "open preview tab"),
-            HelpNote::new("double-click row", "pin tab"),
-            HelpNote::new("Ctrl-W", "close active tab"),
-            HelpNote::new("Ctrl-Tab / Ctrl-Shift-Tab", "cycle tabs"),
-            HelpNote::new("middle-click tab", "close tab"),
-            HelpNote::new("right-click tab", "tab menu"),
-        ])
+        ViewHelp::new("Board")
+            .with_notes(vec![
+                HelpNote::new("click row", "open preview tab"),
+                HelpNote::new("double-click row", "pin tab"),
+                HelpNote::new("Ctrl-W", "close active tab"),
+                HelpNote::new("Ctrl-Tab / Ctrl-Shift-Tab", "cycle tabs"),
+                HelpNote::new("middle-click tab", "close tab"),
+                HelpNote::new("right-click tab", "tab menu"),
+            ])
+            .with_actions(vec![
+                HelpAction::new("split-right", "Ctrl-W v", "split right"),
+                HelpAction::new("split-down", "Ctrl-W s", "split down"),
+                HelpAction::new("focus-next-pane", "Ctrl-W w", "next pane"),
+                HelpAction::new("close-pane", "Ctrl-W x", "close pane"),
+            ])
     }
 
     pub(crate) fn board_detail_tab_bar(&self) -> TabBar {
@@ -2086,7 +2250,7 @@ impl CoordApp {
         let (Some(repo), Some(g)) = (repo, group) else {
             return issue_body_list(
                 None,
-                self.detail_scroll,
+                self.board_pane_detail_scroll(),
                 "board-issue-body",
                 wrap_width,
                 false,
@@ -2109,7 +2273,7 @@ impl CoordApp {
                     oi.body.as_str(),
                     &oi.labels[..],
                 )),
-                self.detail_scroll,
+                self.board_pane_detail_scroll(),
                 "board-issue-body",
                 wrap_width,
                 false,
@@ -2144,7 +2308,7 @@ impl CoordApp {
         if let Some(f) = self.fetched_issues_cache.borrow().get(&key).cloned() {
             return issue_body_list(
                 Some((f.number, f.title.as_str(), f.body.as_str(), &f.labels[..])),
-                self.detail_scroll,
+                self.board_pane_detail_scroll(),
                 "board-issue-body",
                 wrap_width,
                 false,
@@ -2176,7 +2340,7 @@ impl CoordApp {
                         "(no GitHub slug for this repo — add it to coordinator.yml.repos[].github)",
                         &[][..],
                     )),
-                    self.detail_scroll,
+                    self.board_pane_detail_scroll(),
                     "board-issue-body",
                     wrap_width,
                     false,
@@ -2193,7 +2357,7 @@ impl CoordApp {
                 "(fetching body via `gh issue view`…)",
                 &[][..],
             )),
-            self.detail_scroll,
+            self.board_pane_detail_scroll(),
             "board-issue-body",
             wrap_width,
             false,

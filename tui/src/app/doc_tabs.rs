@@ -46,6 +46,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+use quadraui::primitives::split_tree::SplitDirection;
+use quadraui::SplitTree;
 use serde::{Deserialize, Serialize};
 
 use crate::app::format::trunc;
@@ -76,6 +78,14 @@ pub(crate) type DocKey = (String, u64);
 /// visible in the 82-column main panel without truncating short titles.
 pub(crate) const DOC_TAB_LABEL_COLS: usize = 20;
 
+/// #2288 (contract §9): the same budget for a tab in a **split** pane — a
+/// second, independently-pinned constant, *not* [`DOC_TAB_LABEL_COLS`]
+/// halved (which would be 10). At the default 50/50 split of the 82-column
+/// main panel each pane gets roughly 40 columns, and 14 (16 with the §1
+/// preview marker) is what keeps two tabs visible per pane without
+/// truncating the fixture's ~25-character titles early.
+pub(crate) const SPLIT_DOC_TAB_LABEL_COLS: usize = 14;
+
 /// Plain-text marker prefixed to a preview tab's label (contract §1).
 ///
 /// `∘ ` (U+2218 RING OPERATOR, one display column + one space). The preview
@@ -98,6 +108,16 @@ pub(crate) const PREVIEW_MARKER: &str = "∘ ";
 /// them. See `CoordApp::board_doc_tab_strip` (render.rs).
 pub(crate) const SCROLL_LEFT_MARKER: char = '‹';
 pub(crate) const SCROLL_RIGHT_MARKER: char = '›';
+
+/// #2288 (contract §9): the glyph painted down the column that separates
+/// two panes — `║` (U+2551 BOX DRAWINGS DOUBLE VERTICAL), one display
+/// column wide.
+///
+/// Deliberately **not** the `│` (U+2502) quadraui's own `draw_split_tree`
+/// rasteriser paints: this app already renders `│` at column 2 as the
+/// sidebar/main boundary, so on a symbols-only grid a pane divider needs
+/// its own code point to be unambiguous. §9 pins this one.
+pub(crate) const PANE_DIVIDER_CHAR: char = '║';
 
 /// Truncate `s` to at most `max_cols` display columns, appending `…` (which
 /// occupies the last column) when anything was dropped.
@@ -508,22 +528,276 @@ impl DocTabGroup {
     }
 }
 
+// ═════════════════════════════════════════════════════════════════════════
+// #2288 (ms-65 §9): side-by-side split — two tab groups in one panel
+// ═════════════════════════════════════════════════════════════════════════
+
+/// The scope's panes and the [`SplitTree`] that arranges them.
+///
+/// #2288 applies #2282's per-scope model **one level deeper**: a scope owns
+/// an ordered list of panes, each of which is a whole [`DocTabGroup`] (its
+/// own tab order, its own active tab, its own single preview slot, its own
+/// per-document sub-state). Exactly one pane is focused; every existing
+/// mutation path — open, pin, close, cycle — reaches the focused pane
+/// through [`DocTabs::group`] / [`DocTabs::group_mut`] and so needs no
+/// change at all.
+///
+/// # Invariants
+///
+/// - `panes` is never empty (contract §9: "a scope always has ≥1 pane", the
+///   reason [`Self::close_pane`] is a no-op at one pane).
+/// - `focused` is always a valid index into `panes`.
+/// - With **one** pane the whole type is inert: [`Self::split_tree`] is a
+///   bare `Leaf`, nothing paints a divider, and the rendering is
+///   byte-identical to pre-#2288 (contract §9's last bullet).
+///
+/// # Why the tree is derived, not stored
+///
+/// `ratio` is the only mutable state a two-leaf tree has, so holding a
+/// `SplitTree` field as well would be a second source of truth for the same
+/// number (and would cost `DocTabs` its `Eq`, since `SplitTree` carries an
+/// `f32`). [`Self::split_tree`] builds the tree from `panes.len()` + `ratio`
+/// on demand, and every geometry question — leaf rects, divider column,
+/// divider hit-test, drag-to-ratio — is answered by asking that tree via
+/// quadraui's own `layout()` / `hit_test_*`, never by hand-rolled math.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PaneSet {
+    panes: Vec<DocTabGroup>,
+    focused: usize,
+    ratio: f32,
+}
+
+impl Default for PaneSet {
+    fn default() -> Self {
+        Self {
+            panes: vec![DocTabGroup::default()],
+            focused: 0,
+            ratio: DEFAULT_SPLIT_RATIO,
+        }
+    }
+}
+
+/// The 50/50 split contract §9 pins as the default ("At the default 50/50
+/// split of the 82-column main panel…").
+pub(crate) const DEFAULT_SPLIT_RATIO: f32 = 0.5;
+
+/// Stable per-pane leaf id for the [`SplitTree`]. Only ever consumed by
+/// `SplitTreeLayout`'s own leaf lookup, so the exact string is private
+/// detail — but it must be *stable* across frames, since the layout is
+/// recomputed from scratch on every paint and every hit-test.
+fn pane_leaf_id(scope: PanelScope, idx: usize) -> quadraui::WidgetId {
+    let scope = match scope {
+        PanelScope::Board => "board",
+        PanelScope::Pipeline => "pipeline",
+    };
+    quadraui::WidgetId::new(format!("doc-pane:{scope}:{idx}"))
+}
+
+impl PaneSet {
+    /// An unsplit scope holding `group`.
+    pub(crate) fn single(group: DocTabGroup) -> Self {
+        Self {
+            panes: vec![group],
+            focused: 0,
+            ratio: DEFAULT_SPLIT_RATIO,
+        }
+    }
+
+    /// True once the scope holds more than one pane — i.e. a `║` divider is
+    /// painted and the narrower §9 label budget applies.
+    pub(crate) fn is_split(&self) -> bool {
+        self.panes.len() > 1
+    }
+
+    pub(crate) fn focused_index(&self) -> usize {
+        self.focused
+    }
+
+    pub(crate) fn focused(&self) -> &DocTabGroup {
+        &self.panes[self.focused]
+    }
+
+    pub(crate) fn focused_mut(&mut self) -> &mut DocTabGroup {
+        let idx = self.focused;
+        &mut self.panes[idx]
+    }
+
+    /// The pane at `idx`, or the focused pane when `idx` is out of range —
+    /// the render path addresses panes positionally and must never panic on
+    /// a stale index left over from a frame taken before a collapse.
+    pub(crate) fn pane(&self, idx: usize) -> &DocTabGroup {
+        self.panes.get(idx).unwrap_or_else(|| self.focused())
+    }
+
+    /// Contract §9 `Ctrl-W v`: split the focused pane right. The new pane is
+    /// empty and takes focus — the mock settles this
+    /// (`mocks/board-split-side-by-side.screen` shows the post-split single
+    /// click landing in the *right* pane's preview slot, and §2e rule 1 says
+    /// a single click targets the focused group).
+    ///
+    /// Returns `false` when the scope is already split: ms-65 ships
+    /// side-by-side only, two panes maximum (the tracking issue's "Out of
+    /// scope: 2×2 quadrants" line). The `Vec` + tree shape is what lets a
+    /// later milestone lift that cap without a redesign.
+    pub(crate) fn split_focused(&mut self) -> bool {
+        if self.is_split() {
+            return false;
+        }
+        self.panes.insert(self.focused + 1, DocTabGroup::default());
+        self.focused += 1;
+        self.ratio = DEFAULT_SPLIT_RATIO;
+        true
+    }
+
+    /// Contract §9 `Ctrl-W w`: move focus to the next pane, wrapping.
+    /// Returns `false` (no-op) at one pane.
+    pub(crate) fn focus_next(&mut self) -> bool {
+        if !self.is_split() {
+            return false;
+        }
+        self.focused = (self.focused + 1) % self.panes.len();
+        true
+    }
+
+    /// Focus the pane at `idx` (a mouse click inside it). Returns `true`
+    /// when focus actually moved.
+    pub(crate) fn set_focused(&mut self, idx: usize) -> bool {
+        if idx >= self.panes.len() || idx == self.focused {
+            return false;
+        }
+        self.focused = idx;
+        true
+    }
+
+    /// Contract §9 `Ctrl-W x`: close the focused pane. A **no-op at one
+    /// pane** — "Closing the last remaining pane in a scope is a no-op (or
+    /// disabled) — a scope always has ≥1 pane."
+    ///
+    /// The surviving pane keeps its own tabs untouched; the closed pane's
+    /// tabs (and their sub-state) go with it, exactly as closing a tab
+    /// discards that document's sub-state.
+    pub(crate) fn close_focused_pane(&mut self) -> bool {
+        if !self.is_split() {
+            return false;
+        }
+        self.panes.remove(self.focused);
+        self.focused = self.focused.min(self.panes.len() - 1);
+        true
+    }
+
+    /// Contract §9: "Closing the last tab in one pane collapses that pane
+    /// back to a single-pane layout."
+    ///
+    /// Called only from the *close* paths — never after
+    /// [`Self::split_focused`], whose whole point is a freshly-created empty
+    /// pane that must survive until a document is opened into it.
+    ///
+    /// Returns `true` when the layout actually collapsed.
+    pub(crate) fn collapse_empty_panes(&mut self) -> bool {
+        if !self.is_split() {
+            return false;
+        }
+        let before = self.panes.len();
+        // Highest-to-lowest so surviving indices (and the focus fix-up
+        // below) are never disturbed mid-walk. Stop at one pane: a scope
+        // with every pane empty collapses to a single empty pane, which is
+        // exactly the zero-tab baseline (§2a / §4's empty state).
+        for idx in (0..self.panes.len()).rev() {
+            if self.panes.len() == 1 {
+                break;
+            }
+            if self.panes[idx].is_empty() {
+                self.panes.remove(idx);
+                if self.focused > idx {
+                    self.focused -= 1;
+                }
+            }
+        }
+        self.focused = self.focused.min(self.panes.len() - 1);
+        self.panes.len() != before
+    }
+
+    /// Store a dragged divider ratio, clamped by the primitive itself —
+    /// `SplitTree::set_ratio_at_index` applies quadraui's own
+    /// `MIN_RATIO`..=`MAX_RATIO` bounds, so neither pane can ever be dragged
+    /// to zero width and this app never re-derives that clamp.
+    pub(crate) fn set_ratio(&mut self, scope: PanelScope, ratio: f32) -> bool {
+        if !self.is_split() {
+            return false;
+        }
+        let mut tree = self.split_tree(scope);
+        if !tree.set_ratio_at_index(0, ratio) {
+            return false;
+        }
+        let clamped = tree.ratio_at_index(0).unwrap_or(self.ratio);
+        if (clamped - self.ratio).abs() < f32::EPSILON {
+            return false;
+        }
+        self.ratio = clamped;
+        true
+    }
+
+    /// This scope's layout as a quadraui [`SplitTree`].
+    ///
+    /// **`SplitDirection::Horizontal` is deliberate and is the one thing in
+    /// this file that must not be guessed at.** quadraui's `Horizontal`
+    /// means *panes side-by-side, first = left*
+    /// (`primitives/split.rs:40-49`); vimcode's identically-named variant
+    /// means *split top/bottom*. §9 and #2288's own ⚠ both call this out
+    /// because the wrong choice compiles, type-checks and silently renders
+    /// the panes stacked. The acceptance slice asserts the orientation
+    /// against the rendered grid, not against this name.
+    ///
+    /// One pane ⇒ a bare `Leaf`, i.e. no divider and no geometry change:
+    /// contract §9's "with a single pane, rendering is byte-identical".
+    pub(crate) fn split_tree(&self, scope: PanelScope) -> SplitTree {
+        let mut tree = SplitTree::leaf(pane_leaf_id(scope, 0));
+        for idx in 1..self.panes.len() {
+            tree = SplitTree::split(
+                SplitDirection::Horizontal,
+                self.ratio,
+                tree,
+                SplitTree::leaf(pane_leaf_id(scope, idx)),
+            );
+        }
+        tree
+    }
+}
+
 /// Every panel's document tabs, keyed by scope.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// Each scope holds a [`PaneSet`] rather than a bare [`DocTabGroup`]
+/// (#2288): with one pane — the default, and the only state #2282–#2287
+/// ever reach — the two are indistinguishable, since [`Self::group`] hands
+/// back that single pane's group.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct DocTabs {
-    board: DocTabGroup,
-    pipeline: DocTabGroup,
+    board: PaneSet,
+    pipeline: PaneSet,
 }
 
 impl DocTabs {
+    /// The **focused** pane's tab group for `scope` — what every open /
+    /// pin / close / cycle path acts on, and what the status bar and
+    /// persistence report. Identical to the whole scope's group whenever
+    /// the scope is unsplit.
     pub(crate) fn group(&self, scope: PanelScope) -> &DocTabGroup {
+        self.panes(scope).focused()
+    }
+
+    pub(crate) fn group_mut(&mut self, scope: PanelScope) -> &mut DocTabGroup {
+        self.panes_mut(scope).focused_mut()
+    }
+
+    /// #2288: `scope`'s panes and split geometry.
+    pub(crate) fn panes(&self, scope: PanelScope) -> &PaneSet {
         match scope {
             PanelScope::Board => &self.board,
             PanelScope::Pipeline => &self.pipeline,
         }
     }
 
-    pub(crate) fn group_mut(&mut self, scope: PanelScope) -> &mut DocTabGroup {
+    pub(crate) fn panes_mut(&mut self, scope: PanelScope) -> &mut PaneSet {
         match scope {
             PanelScope::Board => &mut self.board,
             PanelScope::Pipeline => &mut self.pipeline,
@@ -534,9 +808,16 @@ impl DocTabs {
     /// `CoordApp` integration point (`mod.rs`'s `sync_doc_tabs` for real
     /// startup, `fixtures.rs`'s `make_test_app` for the fixture path) calls
     /// this once real board data is known.
+    ///
+    /// #2288: every pane of every scope, not just the focused one — a
+    /// document whose issue has left the board must not survive in a
+    /// background pane.
     pub(crate) fn retain_known(&mut self, known: &HashSet<DocKey>) {
-        self.board.retain_known(known);
-        self.pipeline.retain_known(known);
+        for scope in [PanelScope::Board, PanelScope::Pipeline] {
+            for group in self.panes_mut(scope).panes.iter_mut() {
+                group.retain_known(known);
+            }
+        }
     }
 
     // ─── Persistence: `~/.coord/tabs.json` ──────────────────────────────
@@ -603,12 +884,20 @@ impl DocTabs {
             return Self::default();
         };
         match serde_json::from_str::<PersistedTabs>(&text) {
+            // #2288: a restored scope always comes back **unsplit** — the
+            // file's shape (contract §6) is per-scope, not per-pane, and
+            // widening it would be a Gate-A amendment rather than an
+            // implementation choice. The restored group lands in the single
+            // pane, which is exactly what `group()` reports.
             Ok(persisted) => Self {
-                board: DocTabGroup::from_persisted(persisted.board.unwrap_or_default(), PanelScope::Board),
-                pipeline: DocTabGroup::from_persisted(
+                board: PaneSet::single(DocTabGroup::from_persisted(
+                    persisted.board.unwrap_or_default(),
+                    PanelScope::Board,
+                )),
+                pipeline: PaneSet::single(DocTabGroup::from_persisted(
                     persisted.pipeline.unwrap_or_default(),
                     PanelScope::Pipeline,
-                ),
+                )),
             },
             Err(_) => Self::default(),
         }
@@ -641,9 +930,13 @@ impl DocTabs {
     /// asserts that re-save). Comparing against the file's real content is
     /// correct in both cases.
     pub(crate) fn save_to_path(&self, path: &std::path::Path) -> Result<bool, String> {
+        // #2288: the persisted shape is per-scope (contract §6), so a split
+        // scope persists the pane `group()` reports — the focused one. With
+        // one pane (every #2286 scenario) that is the whole scope, so this
+        // is byte-identical to the pre-split writer.
         let persisted = PersistedTabs {
-            board: Some(self.board.to_persisted(PanelScope::Board)),
-            pipeline: Some(self.pipeline.to_persisted(PanelScope::Pipeline)),
+            board: Some(self.board.focused().to_persisted(PanelScope::Board)),
+            pipeline: Some(self.pipeline.focused().to_persisted(PanelScope::Pipeline)),
         };
         let text =
             serde_json::to_string_pretty(&persisted).map_err(|e| format!("serialize tabs: {e}"))?;
@@ -862,10 +1155,17 @@ pub(crate) fn known_doc_keys(data: &BoardData) -> HashSet<DocKey> {
 /// inactive  ∘ <repo> #101 Fix login race… ×␠
 ///           ^ ^      ^                    ^
 ///           | |      |                    └─ §2d close glyph (TAB_CLOSE_CHAR)
-///           | |      └─ §2b: `#<N> <title>` truncated to 20 columns
+///           | |      └─ `#<N> <title>` truncated to `max_cols` columns
 ///           | └─ repo prefix, only when the open set spans >1 repo
 ///           └─ §1 preview marker, only on the preview tab
 /// ```
+///
+/// `max_cols` is [`DOC_TAB_LABEL_COLS`] (20, §2b) for an undivided strip
+/// and [`SPLIT_DOC_TAB_LABEL_COLS`] (14, §9) for a strip inside a split
+/// pane — two independently-pinned contract constants, which is why the
+/// budget is a parameter rather than read from one of them here. The `∘ `
+/// preview marker pushes the *rendered* width out by its own 2 columns in
+/// both cases (22 / 16) rather than eating into the budget.
 ///
 /// The trailing space is the inter-tab separator: quadraui's TUI tab-bar
 /// rasteriser paints labels back-to-back with no gap of its own, so without it
@@ -886,8 +1186,9 @@ pub(crate) fn doc_tab_label(
     show_repo: bool,
     is_preview: bool,
     is_active: bool,
+    max_cols: usize,
 ) -> String {
-    let base = truncate_with_ellipsis(&format!("#{number} {title}"), DOC_TAB_LABEL_COLS);
+    let base = truncate_with_ellipsis(&format!("#{number} {title}"), max_cols);
     let mut inner = String::new();
     if is_preview {
         inner.push_str(PREVIEW_MARKER);
@@ -1258,7 +1559,7 @@ mod tests {
 
     #[test]
     fn doc_tab_close_col_finds_the_close_glyph() {
-        let label = doc_tab_label("claude-coordinator", 101, "Fix login race timeout", false, false, false);
+        let label = doc_tab_label("claude-coordinator", 101, "Fix login race timeout", false, false, false, DOC_TAB_LABEL_COLS);
         // "#101 Fix login race… × " — 20-column base + a space, so × sits at
         // char index 21.
         assert_eq!(doc_tab_close_col(&label), Some(21));
@@ -1269,7 +1570,7 @@ mod tests {
         // The title itself contains `×` ("2×2"), which lands in the rendered
         // label verbatim. The close glyph is the LAST occurrence — the one
         // doc_tab_label appends — never the title's.
-        let label = doc_tab_label("claude-coordinator", 104, "Fix 2×2 grid layout", false, false, false);
+        let label = doc_tab_label("claude-coordinator", 104, "Fix 2×2 grid layout", false, false, false, DOC_TAB_LABEL_COLS);
         let col = doc_tab_close_col(&label).expect("label carries a close glyph");
         let title_x = label
             .chars()
@@ -1428,7 +1729,7 @@ mod tests {
     #[test]
     fn pinned_inactive_label_matches_the_mock() {
         assert_eq!(
-            doc_tab_label("claude-coordinator", 101, "Fix login race timeout", false, false, false),
+            doc_tab_label("claude-coordinator", 101, "Fix login race timeout", false, false, false, DOC_TAB_LABEL_COLS),
             "#101 Fix login race… × "
         );
     }
@@ -1436,7 +1737,7 @@ mod tests {
     #[test]
     fn pinned_active_label_is_bracketed() {
         assert_eq!(
-            doc_tab_label("claude-coordinator", 103, "Race condition in poller", false, false, true),
+            doc_tab_label("claude-coordinator", 103, "Race condition in poller", false, false, true, DOC_TAB_LABEL_COLS),
             "[#103 Race condition… ×] "
         );
     }
@@ -1444,14 +1745,14 @@ mod tests {
     #[test]
     fn preview_label_carries_the_marker_outside_the_20_column_budget() {
         let label =
-            doc_tab_label("claude-coordinator", 102, "Auth token refresh bug", false, true, true);
+            doc_tab_label("claude-coordinator", 102, "Auth token refresh bug", false, true, true, DOC_TAB_LABEL_COLS);
         assert_eq!(label, "[∘ #102 Auth token ref… ×] ");
         assert!(label.contains("∘ #102 Auth token ref… ×"));
     }
 
     #[test]
     fn multi_repo_labels_carry_the_repo_prefix() {
-        let label = doc_tab_label("quadraui", 597, "Preview tier", true, false, false);
+        let label = doc_tab_label("quadraui", 597, "Preview tier", true, false, false, DOC_TAB_LABEL_COLS);
         assert!(
             label.starts_with("quadraui #597 Preview tier"),
             "got {label:?}"
@@ -1462,7 +1763,7 @@ mod tests {
     fn every_label_carries_the_close_glyph() {
         for active in [false, true] {
             for preview in [false, true] {
-                let label = doc_tab_label("r", 1, "t", false, preview, active);
+                let label = doc_tab_label("r", 1, "t", false, preview, active, DOC_TAB_LABEL_COLS);
                 assert_eq!(
                     label.matches(quadraui::tui::TAB_CLOSE_CHAR).count(),
                     1,
@@ -1819,5 +2120,163 @@ mod tests {
         let known = known_doc_keys(&data);
         assert!(known.contains(&k(101)));
         assert_eq!(known.len(), 1);
+    }
+
+    // ── #2288 (ms-65 §9): the pane model ─────────────────────────────────
+
+    #[test]
+    fn a_fresh_scope_holds_exactly_one_focused_pane() {
+        let panes = PaneSet::default();
+        assert!(!panes.is_split());
+        assert_eq!(panes.focused_index(), 0);
+        assert!(panes.focused().is_empty());
+    }
+
+    /// The one thing #2288's ⚠ and contract Note 1 both say must not be
+    /// guessed: quadraui's `Horizontal` is **side-by-side**, so the derived
+    /// tree must lay the two panes out left/right at the same `y`.
+    #[test]
+    fn the_derived_tree_lays_the_panes_out_side_by_side() {
+        use quadraui::event::Rect as QRect;
+        use quadraui::primitives::split_tree::SplitTreeMeasure;
+
+        let mut panes = PaneSet::default();
+        assert!(panes.split_focused());
+        let layout = panes
+            .split_tree(PanelScope::Board)
+            .layout(QRect::new(38.0, 1.0, 82.0, 38.0), SplitTreeMeasure::new(1.0));
+
+        assert_eq!(layout.leaves.len(), 2);
+        let (_, left) = layout.leaves[0];
+        let (_, right) = layout.leaves[1];
+        assert!(
+            left.x < right.x,
+            "first leaf is the LEFT pane (quadraui `Horizontal`)"
+        );
+        assert_eq!(
+            left.y, right.y,
+            "…and they share a row — a vimcode-style guess would stack them"
+        );
+        assert_eq!(left.height, right.height);
+        let div = layout.dividers[0];
+        assert_eq!(div.cell_position(), 78, "50/50 of 82 columns, minus the divider");
+    }
+
+    #[test]
+    fn splitting_focuses_the_new_empty_pane_and_caps_at_two() {
+        let mut panes = PaneSet::default();
+        panes.focused_mut().pin(k(101));
+        assert!(panes.split_focused());
+        assert!(panes.is_split());
+        assert_eq!(panes.focused_index(), 1, "the new pane takes focus");
+        assert!(panes.focused().is_empty(), "…and starts empty");
+        assert_eq!(panes.pane(0).tabs(), &[k(101)], "the original pane is untouched");
+        assert!(
+            !panes.split_focused(),
+            "ms-65 ships side-by-side only — two panes maximum"
+        );
+    }
+
+    #[test]
+    fn focus_next_wraps_and_is_inert_at_one_pane() {
+        let mut panes = PaneSet::default();
+        assert!(!panes.focus_next(), "nothing to move to at one pane");
+        panes.split_focused();
+        assert_eq!(panes.focused_index(), 1);
+        assert!(panes.focus_next());
+        assert_eq!(panes.focused_index(), 0, "wraps");
+        assert!(panes.focus_next());
+        assert_eq!(panes.focused_index(), 1);
+    }
+
+    #[test]
+    fn closing_the_last_pane_is_a_no_op() {
+        let mut panes = PaneSet::default();
+        panes.focused_mut().pin(k(101));
+        assert!(!panes.close_focused_pane());
+        assert_eq!(panes.focused().tabs(), &[k(101)], "nothing was destroyed");
+    }
+
+    #[test]
+    fn closing_a_pane_leaves_the_survivors_tabs_alone() {
+        let mut panes = PaneSet::default();
+        panes.focused_mut().pin(k(101));
+        panes.split_focused();
+        panes.focused_mut().pin(k(102));
+        assert!(panes.close_focused_pane());
+        assert!(!panes.is_split());
+        assert_eq!(panes.focused().tabs(), &[k(101)]);
+    }
+
+    #[test]
+    fn emptying_a_pane_collapses_the_split() {
+        let mut panes = PaneSet::default();
+        panes.focused_mut().pin(k(101));
+        panes.split_focused();
+        panes.focused_mut().pin(k(102));
+        // Close the focused pane's only tab, exactly as a `×` click would.
+        assert!(panes.focused_mut().close(0));
+        assert!(panes.collapse_empty_panes());
+        assert!(!panes.is_split());
+        assert_eq!(panes.focused().tabs(), &[k(101)]);
+    }
+
+    #[test]
+    fn collapsing_two_empty_panes_still_leaves_one() {
+        let mut panes = PaneSet::default();
+        panes.split_focused();
+        assert!(panes.collapse_empty_panes());
+        assert_eq!(panes.focused_index(), 0);
+        assert!(panes.focused().is_empty(), "a scope always has ≥1 pane");
+    }
+
+    /// The divider ratio is clamped by the primitive
+    /// (`MIN_RATIO`..=`MAX_RATIO`), never by hand-rolled arithmetic here.
+    #[test]
+    fn the_split_ratio_is_clamped_by_the_primitive() {
+        let mut panes = PaneSet::default();
+        assert!(
+            !panes.set_ratio(PanelScope::Board, 0.3),
+            "an unsplit scope has no divider to move"
+        );
+        panes.split_focused();
+        assert!(panes.set_ratio(PanelScope::Board, -5.0));
+        assert_eq!(panes.ratio, quadraui::primitives::split_tree::MIN_RATIO);
+        assert!(panes.set_ratio(PanelScope::Board, 5.0));
+        assert_eq!(panes.ratio, quadraui::primitives::split_tree::MAX_RATIO);
+    }
+
+    /// `DocTabs::group` keeps reporting the FOCUSED pane, which is what
+    /// leaves every #2282–#2287 call site untouched by the split.
+    #[test]
+    fn doc_tabs_group_follows_the_focused_pane() {
+        let mut tabs = DocTabs::default();
+        tabs.group_mut(PanelScope::Board).pin(k(101));
+        assert_eq!(tabs.group(PanelScope::Board).tabs(), &[k(101)]);
+        tabs.panes_mut(PanelScope::Board).split_focused();
+        assert!(
+            tabs.group(PanelScope::Board).is_empty(),
+            "the new pane is focused, and it is empty"
+        );
+        tabs.group_mut(PanelScope::Board).pin(k(102));
+        assert_eq!(tabs.panes(PanelScope::Board).pane(0).tabs(), &[k(101)]);
+        assert_eq!(tabs.panes(PanelScope::Board).pane(1).tabs(), &[k(102)]);
+    }
+
+    /// #2286 (§6) is unaffected: pruning reaches every pane, not just the
+    /// focused one.
+    #[test]
+    fn retain_known_prunes_background_panes_too() {
+        let mut tabs = DocTabs::default();
+        tabs.group_mut(PanelScope::Board).pin(k(101));
+        tabs.panes_mut(PanelScope::Board).split_focused();
+        tabs.group_mut(PanelScope::Board).pin(k(102));
+        let known: HashSet<DocKey> = [k(102)].into_iter().collect();
+        tabs.retain_known(&known);
+        assert!(
+            tabs.panes(PanelScope::Board).pane(0).is_empty(),
+            "the background pane's unknown document is pruned too"
+        );
+        assert_eq!(tabs.panes(PanelScope::Board).pane(1).tabs(), &[k(102)]);
     }
 }

@@ -49905,3 +49905,400 @@ Milestone tracking issue.
              file"
         );
     }
+
+    // ── #2288 (ms-65 §9): side-by-side split ─────────────────────────────
+    //
+    // Black-box, same rule as #2283's block above: every test drives the
+    // real `event → handle → render` path and asserts on the painted grid.
+    // Orientation in particular is *only* ever asserted structurally — the
+    // issue's own ⚠ and contract Note 1 both point out that quadraui's
+    // `SplitDirection::Horizontal` (side-by-side) and vimcode's
+    // (top/bottom) are inverted, and that a wrong guess compiles and
+    // type-checks. `divider_cells` below is what catches that.
+
+    /// Every painted `║` cell as `(col, row)` pairs.
+    fn divider_cells<A: quadraui::AppLogic>(
+        d: &quadraui::tui::testing::TuiDriver<A>,
+    ) -> Vec<(usize, usize)> {
+        d.screen()
+            .lines()
+            .enumerate()
+            .flat_map(|(row, line)| {
+                line.chars()
+                    .enumerate()
+                    .filter(|(_, c)| *c == '║')
+                    .map(move |(col, _)| (col, row))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// The single column every `║` sits in, panicking if the divider is not
+    /// a vertical run of at least two rows. A top/bottom split painting the
+    /// same glyph would spread it across one row and fail here.
+    fn divider_column<A: quadraui::AppLogic>(
+        d: &quadraui::tui::testing::TuiDriver<A>,
+    ) -> usize {
+        let cells = divider_cells(d);
+        assert!(
+            !cells.is_empty(),
+            "#2288 §9: a split panel must paint a `║` divider:\n{}",
+            d.screen()
+        );
+        let cols: std::collections::BTreeSet<usize> = cells.iter().map(|(c, _)| *c).collect();
+        assert_eq!(
+            cols.len(),
+            1,
+            "#2288 §9 / contract Note 1: the divider must be VERTICAL — every \
+             `║` in ONE column. Found columns {cols:?}, which is what a \
+             vimcode-style (top/bottom) `SplitDirection` guess paints:\n{}",
+            d.screen()
+        );
+        assert!(
+            cells.len() >= 2,
+            "#2288 §9: the divider must span at least two rows:\n{}",
+            d.screen()
+        );
+        *cols.iter().next().expect("exactly one column")
+    }
+
+    /// Two pinned tabs (#101, #102), then `Ctrl-W v`.
+    fn split_board_driver() -> quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic> {
+        let mut driver = doc_tabs_driver(&[101, 102], 120, 40);
+        driver.ctrl_char('w');
+        driver.press(Key::Char('v'));
+        driver.render();
+        driver
+    }
+
+    /// §9 — `Ctrl-W v` divides the panel into two panes side by side, and
+    /// (the §4/§9 `Ctrl-W`-prefix collision) does **not** also eat a tab.
+    #[test]
+    fn ctrl_w_v_splits_the_board_panel_side_by_side_without_closing_a_tab() {
+        let before = doc_tabs_driver(&[101, 102], 120, 40);
+        assert!(
+            divider_cells(&before).is_empty(),
+            "control: an unsplit panel paints no `║` at all:\n{}",
+            before.screen()
+        );
+        let tabs_before = painted_tab_count(&before);
+
+        let driver = split_board_driver();
+        let col = divider_column(&driver);
+        assert!(
+            col > 38,
+            "#2288 §9: the divider sits INSIDE the main panel, not in the \
+             sidebar (column {col}):\n{}",
+            driver.screen()
+        );
+        assert_eq!(
+            painted_tab_count(&driver),
+            tabs_before,
+            "#2288 §9 vs §4: `Ctrl-W v` splits — the bare-`Ctrl-W` close must \
+             be retracted, not applied on the way past:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// §9 — the panel toolbar is panel-scoped: it spans the full width
+    /// ABOVE both panes, so no divider cell lands on its row.
+    #[test]
+    fn the_panel_toolbar_row_carries_no_pane_divider() {
+        let driver = split_board_driver();
+        let top = divider_cells(&driver)
+            .iter()
+            .map(|(_, r)| *r)
+            .min()
+            .expect("a split panel paints a divider");
+        assert!(
+            top > 0,
+            "#2288 §9: \"the panel toolbar row still spans the full panel \
+             width above both panes\" — the divider must start below it:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// §9 — each pane owns its own preview slot: a single click while the
+    /// new (right) pane is focused fills THAT pane's preview and leaves the
+    /// left pane's pinned tabs alone.
+    #[test]
+    fn each_split_pane_owns_its_own_preview_slot() {
+        let mut driver = split_board_driver();
+        assert_eq!(
+            painted_tab_count(&driver),
+            2,
+            "precondition: the left pane's two pinned tabs, the right pane empty:\n{}",
+            driver.screen()
+        );
+
+        let (x, y) = driver
+            .find("#103  Race condition")
+            .expect("the sidebar row for #103");
+        driver.click(x, y);
+        driver.render();
+
+        assert_eq!(
+            painted_tab_count(&driver),
+            3,
+            "#2288 §9: the click opened a preview in the FOCUSED (new) pane \
+             — the left pane's two tabs are untouched:\n{}",
+            driver.screen()
+        );
+        assert!(
+            driver.screen_contains("∘ #103"),
+            "#2288 §9 + §1: the new pane's tab is a preview:\n{}",
+            driver.screen()
+        );
+        // …and it landed on the far side of the divider, i.e. in the other
+        // pane, not appended to the first pane's strip.
+        let col = divider_column(&driver);
+        let strip_row = driver
+            .screen()
+            .lines()
+            .find(|l| l.contains("∘ #103"))
+            .expect("the preview tab's strip row")
+            .to_string();
+        let preview_col = strip_row
+            .chars()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .position(|w| w == ['∘', ' '])
+            .expect("the `∘ ` marker's column");
+        assert!(
+            preview_col > col,
+            "#2288 §9: the preview opened in the pane to the RIGHT of the \
+             divider (marker at {preview_col}, divider at {col}):\n{}",
+            driver.screen()
+        );
+    }
+
+    /// §9 — `Ctrl-W x` closes the focused pane and the panel goes back to
+    /// exactly the screen it painted before the split. Byte-for-byte:
+    /// "with a single pane, rendering is byte-identical to the non-split
+    /// case."
+    #[test]
+    fn ctrl_w_x_collapses_the_split_back_to_the_pre_split_screen() {
+        let before = doc_tabs_driver(&[101, 102], 120, 40).screen();
+
+        let mut driver = split_board_driver();
+        assert!(!divider_cells(&driver).is_empty(), "precondition: split");
+        driver.ctrl_char('w');
+        driver.press(Key::Char('x'));
+        driver.render();
+
+        assert_eq!(
+            driver.screen(),
+            before,
+            "#2288 §9: collapsing the split restores the unsplit rendering \
+             byte for byte"
+        );
+    }
+
+    /// §9 — "Closing the last remaining pane in a scope is a no-op": with
+    /// one pane, `Ctrl-W x` changes nothing at all — and in particular does
+    /// not fall through to §4's bare-`Ctrl-W` tab close.
+    #[test]
+    fn ctrl_w_x_is_a_no_op_with_a_single_pane() {
+        let mut driver = doc_tabs_driver(&[101, 102], 120, 40);
+        let before = driver.screen();
+
+        driver.ctrl_char('w');
+        driver.press(Key::Char('x'));
+        driver.render();
+
+        assert_eq!(
+            driver.screen(),
+            before,
+            "#2288 §9: a scope always has ≥1 pane, so `Ctrl-W x` on the last \
+             one is inert — including the tab it must not close"
+        );
+    }
+
+    /// §9 — `Ctrl-W w` moves focus to the other pane: the next single click
+    /// opens its preview back in the FIRST pane's strip.
+    #[test]
+    fn ctrl_w_w_moves_focus_to_the_other_pane() {
+        let mut driver = split_board_driver();
+        driver.ctrl_char('w');
+        driver.press(Key::Char('w'));
+        driver.render();
+
+        let col = divider_column(&driver);
+        let (x, y) = driver
+            .find("#103  Race condition")
+            .expect("the sidebar row for #103");
+        driver.click(x, y);
+        driver.render();
+
+        let strip_row = driver
+            .screen()
+            .lines()
+            .find(|l| l.contains("∘ #103"))
+            .expect("the preview tab's strip row")
+            .to_string();
+        let preview_col = strip_row
+            .chars()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .position(|w| w == ['∘', ' '])
+            .expect("the `∘ ` marker's column");
+        assert!(
+            preview_col < col,
+            "#2288 §9: after `Ctrl-W w` the focus is back on the LEFT pane, \
+             so the click's preview opens there (marker at {preview_col}, \
+             divider at {col}):\n{}",
+            driver.screen()
+        );
+    }
+
+    /// §9 — dragging the divider moves it and both panes reflow around the
+    /// new column.
+    #[test]
+    fn dragging_the_divider_resizes_both_panes() {
+        let mut driver = split_board_driver();
+        let col = divider_column(&driver);
+        let row = divider_cells(&driver)[0].1;
+
+        driver.drag(
+            col as f32 + 0.5,
+            row as f32 + 0.5,
+            col as f32 - 12.5,
+            row as f32 + 0.5,
+        );
+        driver.render();
+
+        let moved = divider_column(&driver);
+        assert!(
+            moved < col,
+            "#2288 §9: the divider follows the drag (was {col}, now {moved}):\n{}",
+            driver.screen()
+        );
+        // The panes really reflowed: the left pane's tab strip now has to
+        // fit into a narrower rect, so its content no longer runs past the
+        // divider's new column.
+        for (c, _) in divider_cells(&driver) {
+            assert_eq!(c, moved, "the divider stays a single column after a drag");
+        }
+    }
+
+    /// §9 — "Closing the last tab in one pane collapses that pane back to a
+    /// single-pane layout."
+    #[test]
+    fn closing_the_last_tab_in_a_pane_collapses_the_split() {
+        let mut driver = split_board_driver();
+        let (x, y) = driver
+            .find("#103  Race condition")
+            .expect("the sidebar row for #103");
+        driver.click(x, y);
+        driver.render();
+        assert!(
+            !divider_cells(&driver).is_empty(),
+            "precondition: two panes, the right one holding #103:\n{}",
+            driver.screen()
+        );
+
+        // `Ctrl-W` closes the focused (right) pane's only tab — §4's chord,
+        // uninterrupted this time.
+        driver.ctrl_char('w');
+        driver.render();
+        assert!(
+            divider_cells(&driver).is_empty(),
+            "#2288 §9: emptying a pane collapses the layout back to one \
+             pane, divider and all:\n{}",
+            driver.screen()
+        );
+        assert_eq!(
+            painted_tab_count(&driver),
+            2,
+            "#2288 §9: …and the surviving pane keeps its own two tabs:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// §9 — a split pane's tab labels truncate at the narrower, separately
+    /// pinned 14-column budget, not §2b's 20.
+    #[test]
+    fn split_pane_tab_labels_use_the_narrower_budget() {
+        let unsplit = doc_tabs_driver(&[101], 120, 40);
+        assert!(
+            unsplit.screen_contains("#101 Fix login race…"),
+            "§2b control: 20 columns unsplit:\n{}",
+            unsplit.screen()
+        );
+
+        let driver = {
+            let mut d = doc_tabs_driver(&[101], 120, 40);
+            d.ctrl_char('w');
+            d.press(Key::Char('v'));
+            d.render();
+            d
+        };
+        assert!(
+            driver.screen_contains("#101 Fix logi…"),
+            "#2288 §9: a split pane truncates at 14 columns:\n{}",
+            driver.screen()
+        );
+        assert!(
+            !driver.screen_contains("#101 Fix login race…"),
+            "#2288 §9: …and not at §2b's 20:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// §8b + §9 — the `?` overlay's second section lists §9's four pane
+    /// keys. Authored here because §8b hands the "Split" section to #2288.
+    #[test]
+    fn the_help_overlay_lists_the_split_key_bindings() {
+        let mut driver = doc_tabs_driver(&[101], 120, 40);
+        driver.press(Key::Char('?'));
+        driver.render();
+
+        for needle in [
+            "Split",
+            "Ctrl-W v",
+            "split right",
+            "Ctrl-W s",
+            "split down",
+            "Ctrl-W w",
+            "next pane",
+            "Ctrl-W x",
+            "close pane",
+        ] {
+            assert!(
+                driver.screen_contains(needle),
+                "#2288 §8b/§9: the `?` overlay must list `{needle}`:\n{}",
+                driver.screen()
+            );
+        }
+    }
+
+    /// The #605 / #2283 guard, re-asserted now that `Ctrl-W` also arms the
+    /// §9 pane-chord latch: every key that is NOT one of §9's four chords
+    /// must still fall through to the meaning it had before this issue.
+    #[test]
+    fn ctrl_w_keeps_its_non_split_meanings() {
+        // `Ctrl-W l` with zero tabs open still moves pane focus (#605).
+        let mut driver = doc_tabs_driver(&[], 120, 40);
+        driver.ctrl_char('w');
+        driver.press(Key::Char('l'));
+        driver.render();
+        assert!(
+            driver.screen_contains("[Main]"),
+            "#605: `Ctrl-W l` still moves focus with the §9 latch armed:\n{}",
+            driver.screen()
+        );
+
+        // Two bare `Ctrl-W`s still close two tabs (#2283 §4) — the latch
+        // armed by the first must not swallow the second.
+        let mut driver = doc_tabs_driver(&[101, 102, 103], 120, 40);
+        assert_eq!(painted_tab_count(&driver), 3, "precondition");
+        driver.ctrl_char('w');
+        driver.ctrl_char('w');
+        driver.render();
+        assert_eq!(
+            painted_tab_count(&driver),
+            1,
+            "#2283 §4: `Ctrl-W` `Ctrl-W` closes two tabs:\n{}",
+            driver.screen()
+        );
+    }

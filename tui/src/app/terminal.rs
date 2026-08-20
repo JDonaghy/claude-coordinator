@@ -571,6 +571,15 @@ impl CoordApp {
             && !modifiers.alt
         {
             self.ctrl_w_pending = true;
+            // #2288 (ms-65 §9): arm the pane-chord latch as well, so
+            // `Ctrl-W v/w/x` works on a Board panel with ZERO tabs open —
+            // the case that never reaches §4's close arm above and would
+            // otherwise be cancelled by this leader's own "any other key"
+            // branch. Nothing was destroyed here, so there is nothing to
+            // retract. `resolve_board_pane_chord` runs ahead of Step 2 in
+            // `dispatch_handle` and declines every key that isn't a §9
+            // chord, so `Ctrl-W h`/`l`/`Ctrl-W` still resolve there.
+            self.arm_board_pane_chord(None);
             return Some(Reaction::Redraw);
         }
 
