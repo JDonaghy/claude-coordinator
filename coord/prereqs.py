@@ -115,7 +115,9 @@ class ToolProbe:
 #      any `coord/dashboard/webapp/**` Test stage anywhere — forever, with
 #      no smoke row and no board-visible reason (the #544 shape); and
 #   2. more importantly, the suite never launches a system browser at all.
-#      `coord/dashboard/webapp/playwright.config.ts` declares
+#      the webapp's `playwright.config.ts` (then at
+#      `coord/dashboard/webapp/`, now the `coord-web` repo's root — #2009)
+#      declares
 #      `use: { ...devices['Desktop Chrome'] }` with no `channel` and no
 #      `executablePath`, so `@playwright/test` runs its OWN bundled Chromium
 #      out of the Playwright browser cache that `npx playwright install`
@@ -321,9 +323,11 @@ CAPABILITY_PREREQS: tuple[Prereq, ...] = (
         version_re=r"(\S+)", min_version=None, capability="gtk",
         what_breaks="the tui/ `--features gtk` build cannot link against GTK4",
     ),
-    # `browser` gates this repo's own Playwright acceptance suite
-    # (`coord/dashboard/webapp`, npm script `test:e2e` -> `playwright test`)
-    # and the same shape in consuming projects. See the block above
+    # `browser` gates Playwright acceptance suites in the repos this fleet
+    # drives — the `coord-web` repo's `test:e2e` -> `playwright test` (it
+    # lived at `coord/dashboard/webapp` in THIS repo until #2009 moved it
+    # out; the capability is unchanged, only its subject repo) and the same
+    # shape in consuming projects. See the block above
     # `PLAYWRIGHT_BROWSERS_PATH_ENV` for why these three and not `chromium`.
     #
     # `node` and `npm` are probed SEPARATELY on purpose: nvm ships them
