@@ -977,6 +977,18 @@ class PipelineConfig:
     per-turn liveness auditor — see :class:`LivenessAuditorConfig`. Off by
     default; gates nothing even when enabled (see
     :func:`coord.notify.detect_liveness_stall`).
+
+    ``confirm_test_verdict`` (#2464) controls whether a Test-stage PASS
+    claim is independently re-run before it is recorded — see
+    :mod:`coord.confirm_test`. **Defaults to ``True``**, unlike the
+    ships-dark flags above, and deliberately so: the thing it guards is a
+    verdict the worker issued about its own work, and a correctness gate
+    that must be switched on is the posture that let the defect ship. It is
+    also cheap to leave on where it cannot apply — a machine with no local
+    checkout of the repo returns "inconclusive" and the pre-#2464 behaviour
+    stands. Costs one real suite run per Test-stage completion where it
+    *can* apply; set ``false`` (or ``COORD_CONFIRM_TEST_VERDICT=0``) to opt
+    back out.
     """
 
     default_gates: list[str] = field(default_factory=lambda: ["test", "review", "merge"])
@@ -995,6 +1007,8 @@ class PipelineConfig:
     convergence_rounds: int = 3
     # #2048 — DEFAULT OFF. See LivenessAuditorConfig's docstring.
     liveness_auditor: LivenessAuditorConfig = field(default_factory=LivenessAuditorConfig)
+    # #2464 — DEFAULT ON. See the class docstring.
+    confirm_test_verdict: bool = True
 
     def attention_threshold_for(
         self,
@@ -2696,6 +2710,12 @@ def _parse_pipeline(raw: Any) -> PipelineConfig:
         if not isinstance(value, bool):
             raise ConfigError("pipeline.auto_loop must be a boolean")
         cfg.auto_loop = value
+
+    if "confirm_test_verdict" in raw:
+        value = raw["confirm_test_verdict"]
+        if not isinstance(value, bool):
+            raise ConfigError("pipeline.confirm_test_verdict must be a boolean")
+        cfg.confirm_test_verdict = value
 
     if "max_review_iterations" in raw:
         value = raw["max_review_iterations"]
