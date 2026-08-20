@@ -1099,6 +1099,26 @@ impl CoordApp {
     /// nested row (see `locate_pipeline_selection`).  Falls back to the
     /// `pipeline_sel` mapping when the path can't be decoded.
     pub(crate) fn capture_pipeline_selection_id(&self) -> Option<(String, u64)> {
+        // #2452: when a Pipeline document tab is open, it — not whatever the
+        // tree currently highlights — is the durable selection intent.
+        // `rebuild_pipeline_sidebar` now leaves the tree with an EXPLICIT
+        // no-selection state (and `pipeline_sel = None`) the moment the
+        // active tab's row is hidden by `pipeline_search`. A capture that
+        // read `pipeline_sel` at that point would return `None` too — which
+        // would make the very next rebuild treat this as "no target was
+        // ever requested" and let its default-select-first-row block snap
+        // onto some other, unrelated issue (see acceptance test coverage
+        // for the multi-keystroke typing case: each further keystroke's
+        // `rebuild_pipeline_sidebar(None)` call must keep re-attempting to
+        // locate THIS SAME target, not silently drop it after the first
+        // keystroke that hides it). Anchoring on the active tab instead of
+        // `pipeline_sel` makes the no-selection state stick for as long as
+        // the tab stays hidden by the filter, exactly like Board's own
+        // `board_detail_issue_group` already anchors the Board detail pane
+        // on the active tab rather than the tree cursor.
+        if let Some(key) = self.pipeline_doc_active_key() {
+            return Some(key.clone());
+        }
         // `pipeline_sel` is authoritative and stays in sync with the tree path
         // in production (both derive from `selected_pipeline_index`). Use it
         // first — this preserves the established behaviour for every ordinary
@@ -4791,6 +4811,17 @@ impl CoordApp {
             defs.push(def);
         }
 
+        // #2452: row shape per section, captured alongside `sidebar` below —
+        // mirrors `mod.rs`'s `board_section_rows` exactly (same
+        // `(TreePath, is_header)` shape, same reason: `SidebarSystem` exposes
+        // no `rows()` getter, so `scroll_pipeline_selection_into_view` has no
+        // other way to work out how far down the panel a row sits). Indexed
+        // by section, so it has to cover every section, form section (0)
+        // included — that slot stays an empty vec (the FILTER form's height
+        // comes from its field count instead, same as Board's).
+        let defs_len = defs.len();
+        let mut section_rows: Vec<Vec<(TreePath, bool)>> = vec![Vec::new(); defs_len];
+
         let mut sidebar = SidebarSystem::new(defs);
         sidebar.set_navigation_mode(NavigationMode::Selection);
         sidebar.set_allow_collapse(true);
@@ -5400,12 +5431,22 @@ impl CoordApp {
                     }
                 }
             }
+            // #2452: remember this section's row shape before the rows are
+            // handed to the sidebar (which offers no way to read them back) —
+            // same capture Board takes just before its own `set_rows` call.
+            if let Some(slot) = section_rows.get_mut(section_idx) {
+                *slot = rows
+                    .iter()
+                    .map(|r| (r.path.clone(), matches!(r.decoration, Decoration::Header)))
+                    .collect();
+            }
             sidebar.set_rows(section_idx, rows);
         }
         // #1197: publish this pass's epic-row identity map (stale entries
         // from the previous rebuild are dropped wholesale — paths shift as
         // issues move between sections).
         self.pipeline_epic_row_keys = epic_row_keys;
+        self.pipeline_section_rows = section_rows;
 
         // Default-select the first issue in the first non-empty state section.
         if sidebar.active_section().is_none() && !state_sections.is_empty() {
@@ -5443,16 +5484,54 @@ impl CoordApp {
         // child that isn't independently tracked resolves to `sel = None`:
         // the row stays visually selected, and `pipeline_sel` is synced from
         // the sidebar path just below (never left pointing at the epic).
+        //
+        // #2452: `prev_sel` names a SPECIFIC target — either the issue that
+        // was actually selected before this rebuild, or (via
+        // `reveal_pipeline_active_doc`'s `prev_sel_override`) the Pipeline
+        // document tab that just became active. When the active Pipeline
+        // search filter hides that target's row, `locate_pipeline_selection`
+        // returns `None` and this `if let` used to just fall through — which
+        // meant the default-select-first block above (`:5421-5446`) silently
+        // stood, highlighting an unrelated issue's row with nothing on
+        // screen to say that isn't what's actually open/selected. Explicitly
+        // clear the tree's selection in that case instead: the search filter
+        // itself is never touched (`self.pipeline_search` isn't read here),
+        // only the highlight. The ordinary "no target was ever requested"
+        // path (`prev_sel` is `None`, e.g. a fresh first paint) is untouched
+        // — the default-select-first-row block's own selection stands.
         if let Some((repo, num)) = prev_sel {
             if let Some((section_idx, path, sel)) = self.locate_pipeline_selection(&repo, num) {
                 self.pipeline_sidebar.set_active_section(Some(section_idx));
                 self.pipeline_sidebar
                     .set_selected_path(section_idx, Some(path));
                 self.pipeline_sel = sel;
+            } else if let Some(section) = self.pipeline_sidebar.active_section() {
+                self.pipeline_sidebar.set_selected_path(section, None);
             }
         }
         // Sync `pipeline_sel` to the sidebar's actual selection.
         self.pipeline_sel = self.selected_pipeline_index();
+        // #2452: when a Pipeline document tab is active, the detail pane
+        // always follows IT, never the tree cursor — the same principle
+        // Board's `board_detail_issue_group` already applies. Without this,
+        // a search filter that hides the active tab's row (the case just
+        // handled above) would blank the detail pane on every keystroke even
+        // though the tab strip still shows that document open; every
+        // interactive tree-selection path keeps `pipeline_sel` and the
+        // active doc tab in lockstep anyway (`events.rs`'s `RowSelected`
+        // arm opens/activates a preview tab for whatever row selection just
+        // resolved to), so this is a no-op whenever the row IS visible —
+        // it only fires the moment those two disagree, i.e. exactly the
+        // filtered-out case.
+        if let Some((repo, num)) = self.pipeline_doc_active_key().cloned() {
+            if let Some(idx) = self
+                .pipeline_issues
+                .iter()
+                .position(|pi| pi.repo_slug == repo && pi.number == num)
+            {
+                self.pipeline_sel = Some(idx);
+            }
+        }
         // Restore per-section collapse state by state key.  New sections
         // that weren't present before default to expanded. (#815's
         // collapsed-by-default carve-out was Done-only and went with it in
@@ -9072,6 +9151,117 @@ impl CoordApp {
         true
     }
 
+    /// Height, in main-axis units, of one Pipeline sidebar row. Mirrors
+    /// `mod.rs`'s `board_row_height` exactly — same quadraui
+    /// `sidebar_system::body_measure` rule (`Decoration::Header` rows measure
+    /// `lh * 1.2`, everything else `lh * 1.4`, both rounded) — Pipeline and
+    /// Board share one `SidebarSystem` implementation, so the measurement
+    /// rule is identical; only the row data backing it differs.
+    fn pipeline_row_height(lh: f32, is_header: bool) -> f32 {
+        if is_header {
+            (lh * 1.2).round()
+        } else {
+            (lh * 1.4).round()
+        }
+    }
+
+    /// Content height of Pipeline sidebar section `s` (excluding its own
+    /// header row), as quadraui's `ScrollMode::WholePanel` sizing computes
+    /// it. Mirrors `board_section_content_height`.
+    fn pipeline_section_content_height(&self, s: usize, lh: f32) -> f32 {
+        if self.pipeline_sidebar.is_collapsed(s) {
+            return 0.0;
+        }
+        if let Some(form) = self.pipeline_sidebar.form(s) {
+            return form.fields.len() as f32 * Self::pipeline_row_height(lh, false);
+        }
+        self.pipeline_section_rows
+            .get(s)
+            .map(|rows| {
+                rows.iter()
+                    .map(|(_, is_header)| Self::pipeline_row_height(lh, *is_header))
+                    .sum()
+            })
+            .unwrap_or(0.0)
+    }
+
+    /// #2452 (closes the Pipeline/Board parity gap noted in that issue):
+    /// scroll the Pipeline sidebar so the currently-selected row is inside
+    /// the viewport — the Pipeline counterpart of `scroll_board_selection_
+    /// into_view`, which `reveal_board_active_doc` already relies on.
+    /// Pipeline's sidebar runs in `ScrollMode::WholePanel` exactly like
+    /// Board's, so the same reconstruction (row heights + section content
+    /// heights, backed by the geometry stashed at paint time) applies
+    /// unchanged — see that method's doc comment for why this can't just
+    /// call a `SidebarSystem::reveal` API (it doesn't exist yet).
+    ///
+    /// Deliberately does NOT replicate Board's `board_reveal_hidden_count`
+    /// windowing (the `⋮ N more above` marker-row collapse that keeps the
+    /// FILTER box's scroll position pinned at 0): Pipeline groups multiple
+    /// repos inside a single lifecycle section (repo is a sub-header, not
+    /// its own section, unlike Board), so windowing would have to track a
+    /// hidden-row count per SECTION rather than per repo, against a
+    /// 3-level tree instead of Board's 2-level one. A plain panel scroll
+    /// already satisfies this issue's bar (the target row ends up on
+    /// screen); trimming the scroll distance with a marker row is a
+    /// well-scoped follow-up, not a correctness gap.
+    fn scroll_pipeline_selection_into_view(&mut self) {
+        let Some((rect, lh, header_size)) = self.last_pipeline_sidebar_geom.get() else {
+            return;
+        };
+        if rect.height <= 0.0 || lh <= 0.0 {
+            return;
+        }
+        let Some(section) = self.pipeline_sidebar.active_section() else {
+            return;
+        };
+        let Some(path) = self.pipeline_sidebar.selected_path(section).cloned() else {
+            return;
+        };
+
+        // Walk the section stack down to the target section's body. Hidden
+        // sections are dropped from the view entirely (`build_view` skips
+        // them), so they cost nothing.
+        let mut y = 0.0_f32;
+        for s in 0..section {
+            if !self.pipeline_sidebar.is_section_visible(s) {
+                continue;
+            }
+            y += header_size + self.pipeline_section_content_height(s, lh);
+        }
+        if !self.pipeline_sidebar.is_section_visible(section) {
+            return;
+        }
+        y += header_size;
+
+        // …then across the rows above the target inside that section.
+        let Some(rows) = self.pipeline_section_rows.get(section) else {
+            return;
+        };
+        let mut row_h = None;
+        for (row_path, is_header) in rows {
+            let h = Self::pipeline_row_height(lh, *is_header);
+            if *row_path == path {
+                row_h = Some(h);
+                break;
+            }
+            y += h;
+        }
+        let Some(row_h) = row_h else {
+            return;
+        };
+
+        let scroll = self.pipeline_sidebar.panel_scroll();
+        let new = if y < scroll {
+            y
+        } else if y + row_h > scroll + rect.height {
+            y + row_h - rect.height
+        } else {
+            return;
+        };
+        self.pipeline_sidebar.set_panel_scroll(new.max(0.0));
+    }
+
     /// Contract §2f, applied per-scope (#2284 AC 4): select the active
     /// Pipeline document's row in the **Pipeline** sidebar, never the
     /// Board's — mirrors `jump_to_pipeline`'s reveal-and-expand body
@@ -9115,21 +9305,23 @@ impl CoordApp {
                 .insert(("in-progress".to_string(), repo_key, mil_key), true);
         }
         self.rebuild_pipeline_sidebar(Some((repo_slug, number)));
-        // #2449: force `pipeline_sel` onto the active doc tab's issue,
-        // independent of whether `rebuild_pipeline_sidebar` found a tree row
-        // for it. Every detail-pane render function (`build_pipeline_widget`,
-        // `pipeline_tab_body_list_for`, `pipeline_issue_body_list`, etc.) and
-        // every per-issue action keys off `pipeline_sel`, not the doc tab —
-        // when the active Pipeline search filter hides the target's row,
-        // `locate_pipeline_selection` can't find it and the rebuild above
-        // leaves `pipeline_sel` pointing at whatever the tree's own
-        // default/previous selection happens to be (a different issue, or
-        // `None`). Since `idx` was resolved directly from `pipeline_issues`
-        // — not the filtered tree — this is correct regardless of filter
-        // state, and a no-op when the row IS visible (the rebuild's own
-        // restore already lands on the same index in that case).
-        self.pipeline_sel = Some(idx);
+        // #2449/#2452: `rebuild_pipeline_sidebar` itself now forces
+        // `pipeline_sel` onto the active Pipeline doc tab's issue whenever
+        // one is open, independent of whether it found a tree row for it —
+        // see the "#2452" note at its own tail. Every detail-pane render
+        // function and per-issue action keys off `pipeline_sel`, not the doc
+        // tab directly, so that guarantee is what keeps them showing this
+        // issue's own content even when the active Pipeline search filter
+        // hides its row.
         self.pipeline_focused_stage = self.default_focused_stage_for_selected_issue();
         self.pipeline_stage_content_scroll = 0;
+        // #2452: `set_selected_path` alone says nothing about scroll
+        // position — a filtered-in row the rebuild above just selected can
+        // still be scrolled past. Bring it on screen, closing the Pipeline/
+        // Board parity gap (Board's `reveal_board_active_doc` already does
+        // this via `scroll_board_selection_into_view`). No-ops when the
+        // tree has no selection (filtered-out target) or the row is already
+        // visible.
+        self.scroll_pipeline_selection_into_view();
     }
 }
