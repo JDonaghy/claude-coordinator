@@ -7570,25 +7570,40 @@ impl CoordApp {
     ///
     /// #2452: every exit that fails to resolve `(repo, issue_number)` to a
     /// row in the CURRENT (possibly `board_search`-filtered) tree explicitly
-    /// clears whatever row is already highlighted, via
-    /// `clear_board_tree_selection`, instead of silently leaving it stand —
-    /// same "explicit no-selection" fix `rebuild_pipeline_sidebar` applies
-    /// for the identical Pipeline-side bug. This matters most for
-    /// `reveal_board_active_doc`, whose own preceding `rebuild_board_sidebar`
-    /// pass may already have restored a *different*, still-matching issue's
-    /// selection before this call runs — every other call site
-    /// (`select_issue` is only ever used to jump to a specific issue: the
-    /// issue finder's Board fallback, Queue's "View on Board", the Kanban
-    /// card click, and `rebuild_board_sidebar`'s own previous-selection
-    /// restore) already wants "not found" to mean "nothing is selected",
-    /// so generalizing costs nothing.
+    /// clears whatever row is already highlighted in the *target repo's own*
+    /// section, via `clear_board_tree_selection`, instead of silently
+    /// leaving it stand — same "explicit no-selection" fix
+    /// `rebuild_pipeline_sidebar` applies for the identical Pipeline-side
+    /// bug. This matters most for `reveal_board_active_doc`, whose own
+    /// preceding `rebuild_board_sidebar` pass may already have restored a
+    /// *different*, still-matching issue's selection in some OTHER,
+    /// currently-focused section before this call runs — Board's sidebar is
+    /// a multi-section accordion where every repo section keeps its own
+    /// selection independent of which section currently has keyboard focus,
+    /// so the not-found path must operate on `section_idx` (the target
+    /// repo's own section), never on whatever `active_section()` happens to
+    /// be at call time, or it would both leave the target repo's section
+    /// showing stale/no feedback AND wipe out an unrelated section's
+    /// perfectly valid selection. Every other call site (`select_issue` is
+    /// only ever used to jump to a specific issue: the issue finder's Board
+    /// fallback, Queue's "View on Board", the Kanban card click, and
+    /// `rebuild_board_sidebar`'s own previous-selection restore) already
+    /// wants "not found" to mean "nothing is selected in that repo's
+    /// section", so generalizing costs nothing.
     fn select_issue(&mut self, repo: &str, issue_number: u64) {
         let offset = self.board_repo_offset();
         // Find the repo's section index.
         let cache_idx = match self.board_repo_names.iter().position(|r| r == repo) {
             Some(i) => i,
             None => {
-                self.clear_board_tree_selection();
+                // #2452: `repo` has no section in the sidebar at all —
+                // `board_repo_names` is built from the UNFILTERED board
+                // cache (`rebuild_board_sidebar`), so this only happens when
+                // the repo genuinely has zero board issues, never as a
+                // `board_search` side effect. There is no section to move
+                // focus to or to clear, so leave whatever section is
+                // currently focused/selected untouched rather than clearing
+                // an unrelated repo's valid selection.
                 return;
             }
         };
@@ -7625,17 +7640,28 @@ impl CoordApp {
                 }
             }
         }
-        self.clear_board_tree_selection();
+        // #2452: not found under `board_search` in the target repo's own
+        // section (filtered out, or otherwise absent). Move keyboard focus
+        // to that section — mirroring the "found" branches above, so the
+        // visible/focused section always agrees with the active document —
+        // and clear ITS selection explicitly by index, never by reading back
+        // whatever `active_section()` was before this call.
+        self.board_sidebar.set_active_section(Some(section_idx));
+        self.clear_board_tree_selection(section_idx);
     }
 
-    /// #2452: clear whatever row is highlighted in the Board sidebar's
-    /// currently active section, without touching `board_search` or which
-    /// section is active. The shared tail every `select_issue` not-found
-    /// exit funnels through.
-    fn clear_board_tree_selection(&mut self) {
-        if let Some(section) = self.board_sidebar.active_section() {
-            self.board_sidebar.set_selected_path(section, None);
-        }
+    /// #2452: clear whatever row is highlighted in sidebar `section`,
+    /// without touching `board_search`. Takes an explicit section index
+    /// rather than deriving one from `active_section()` — Board's sidebar is
+    /// a multi-section accordion where every repo section keeps its own
+    /// selection independent of keyboard focus, so deriving the section from
+    /// `active_section()` would silently clear the wrong repo's selection on
+    /// a multi-repo board whenever the target repo isn't the one currently
+    /// focused. The shared tail every `select_issue` not-found exit funnels
+    /// through, always after `set_active_section(Some(section))` so focus
+    /// and clearing agree on the same section.
+    fn clear_board_tree_selection(&mut self, section: usize) {
+        self.board_sidebar.set_selected_path(section, None);
     }
 
     /// Clamp `machine_scroll` so that `machine_sel` is inside the visible window.
