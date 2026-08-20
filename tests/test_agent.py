@@ -21,6 +21,7 @@ from coord.agent import (
     FAILED,
     PENDING,
     REFUSED_POLICY,
+    REVIEW_DENY_COMMANDS,
     RUNNING,
     MOCK_AUTHOR_SYSTEM_PROMPT,
     WORKER_SYSTEM_PROMPT,
@@ -1190,6 +1191,116 @@ def test_default_worker_command_smoke_type_honours_explicit_system_prompt() -> N
     argv = default_worker_command(_smoke_spec(system_prompt="custom smoke prompt"))
     system_prompt = argv[argv.index("--system-prompt") + 1]
     assert system_prompt.startswith("custom smoke prompt")
+
+
+# ── #2461: review legs must be read-only ─────────────────────────────────
+#
+# Root cause: `"review"` wasn't one of the explicit branches in
+# `default_worker_command`, so it fell through to the generic `else` and got
+# the exact same `Read,Edit,Write,Bash,Monitor` grant as a real work leg —
+# REVIEWER_SYSTEM_PROMPT's "you only review, you are NOT allowed to push
+# commits or modify the PR's code" was enforced by the prompt text alone,
+# with nothing stopping a review worker from calling Edit/Write or shelling
+# out to `git push`/`gh` if it decided to.
+
+
+def _review_spec(**overrides) -> AssignmentSpec:
+    base = dict(
+        repo_name="api",
+        repo_path="/tmp/repo",
+        issue_number=2461,
+        issue_title="[review] t",
+        briefing="b",
+        branch="main",
+        type="review",
+    )
+    base.update(overrides)
+    return AssignmentSpec(**base)
+
+
+def test_default_worker_command_review_type_gets_read_bash_only() -> None:
+    """A review leg only reads the diff and reports a verdict — no
+    Edit/Write (it must not modify the PR's code), and (mirroring the
+    `smoke` branch's #1394/#2301 reasoning) no Monitor either — a review leg
+    is a one-shot `claude -p` session, so an await-a-notification tool can
+    never resume it."""
+    argv = default_worker_command(_review_spec())
+    allowed = argv[argv.index("--allowedTools") + 1]
+    assert allowed == "Read,Bash"
+
+
+def test_default_worker_command_review_type_uses_reviewer_system_prompt() -> None:
+    """Confirms the review branch's default system prompt is
+    coord.review.REVIEWER_SYSTEM_PROMPT, not the generic WORKER_SYSTEM_PROMPT
+    the old fall-through `else` branch would have used."""
+    from coord.review import REVIEWER_SYSTEM_PROMPT
+
+    argv = default_worker_command(_review_spec())
+    system_prompt = argv[argv.index("--system-prompt") + 1]
+    assert system_prompt.startswith(REVIEWER_SYSTEM_PROMPT)
+
+
+def test_default_worker_command_review_type_honours_explicit_system_prompt() -> None:
+    argv = default_worker_command(_review_spec(system_prompt="custom review prompt"))
+    system_prompt = argv[argv.index("--system-prompt") + 1]
+    assert system_prompt.startswith("custom review prompt")
+
+
+def test_default_worker_command_review_type_blocks_mutating_git_and_gh() -> None:
+    """The deny list must be wired into the CLI-enforced --disallowedTools,
+    not just the soft system-prompt reminder text — a reviewer that ignores
+    its own prompt must still be structurally unable to push, commit, or
+    touch GitHub. This is the actual "tool scope" enforcement #2461 asks
+    for, as opposed to the prompt-only status quo."""
+    argv = default_worker_command(_review_spec())
+    idx = argv.index("--disallowedTools")
+    disallowed = argv[idx + 1].split(",")
+    for pattern in REVIEW_DENY_COMMANDS:
+        assert pattern in disallowed
+    # And Edit/Write themselves are denied by simple omission from
+    # --allowedTools (Claude Code only grants tools it's explicitly told to).
+    allowed = argv[argv.index("--allowedTools") + 1].split(",")
+    assert "Edit" not in allowed
+    assert "Write" not in allowed
+
+
+def test_default_worker_command_review_type_deny_list_also_in_prompt() -> None:
+    """Belt-and-braces: the same deny list also lands in the system prompt
+    text (build_deny_prompt) so a reasoning model sees an explicit reminder,
+    not just a silent tool-call rejection."""
+    argv = default_worker_command(_review_spec())
+    system_prompt = argv[argv.index("--system-prompt") + 1]
+    assert "FORBIDDEN COMMANDS" in system_prompt
+    assert "git push *" in system_prompt
+    assert "gh *" in system_prompt
+
+
+def test_assign_wires_the_review_deny_list_into_the_real_dispatch(tmp_path: Path) -> None:
+    """End-to-end (mirrors test_assign_wires_the_base_checkout_guard_into_the_real_dispatch
+    for #1642): dispatch a real review-type assignment through
+    default_worker_command via AgentServer.assign() and confirm the argv the
+    agent actually launched carries the hard --disallowedTools guard, not
+    just a spec built by hand in isolation."""
+    repo = _init_repo(tmp_path / "repo")
+    server = AgentServer(
+        machine_name="test",
+        capabilities=["python"],
+        repos=["api"],
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: default_worker_command(spec, binary="/bin/true"),
+        repo_paths={"api": str(repo)},
+    )
+    spec = _spec(repo, type="review")
+    a = server.assign(spec)
+    final = server.wait_for(a.id, timeout=30)
+    assert final.exit_code == 0
+
+    log = Path(final.log_path).read_text()
+    header = log.splitlines()[0]
+    assert "--disallowedTools" in header
+    for pattern in REVIEW_DENY_COMMANDS:
+        assert pattern in header
+    assert "--allowedTools Read,Bash" in header
 
 
 # ── #1315: structural sealing enforcement (write-guard) ─────────────────────

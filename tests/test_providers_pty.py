@@ -199,7 +199,7 @@ def test_pty_build_command_branches_match_claude_for_plan_type() -> None:
     assert argv[argv.index("--allowedTools") + 1] == legacy_at
 
 
-@pytest.mark.parametrize("spec_type", ["work", "review", "conflict-fix", "fix"])
+@pytest.mark.parametrize("spec_type", ["work", "conflict-fix", "fix"])
 def test_pty_build_command_branches_match_claude_for_work_type(spec_type: str) -> None:
     """#2169: the generic-worker (``else``) branch must stay in parity too.
 
@@ -215,7 +215,10 @@ def test_pty_build_command_branches_match_claude_for_work_type(spec_type: str) -
     ``else`` branch; #2301 gave it a branch of its own, so its parity is
     guarded by
     :func:`test_pty_build_command_smoke_branch_matches_claude_and_withholds_monitor`
-    below instead.
+    below instead. ``review`` likewise used to fall through here; #2461 gave
+    it its own branch (read-only, no Edit/Write/Monitor — see
+    ``coord.agent.REVIEW_DENY_COMMANDS``), guarded by
+    :func:`test_pty_build_command_review_branch_matches_claude_and_withholds_monitor`.
     """
     spec = _make_spec(type=spec_type)
     argv = ClaudePtyProvider().build_command(spec)
@@ -252,6 +255,35 @@ def test_pty_build_command_smoke_branch_matches_claude_and_withholds_monitor() -
     assert pty_at == legacy_at
     # Pin the values too, so a *matched* regression on both sides still fails.
     assert pty_sp.startswith(SMOKE_SYSTEM_PROMPT)
+    assert pty_at == "Read,Bash"
+    assert "Monitor" not in pty_at.split(",")
+
+
+def test_pty_build_command_review_branch_matches_claude_and_withholds_monitor() -> None:
+    """#2461: the review branch is another call site of the same logic.
+
+    ``default_worker_command`` and ``ClaudeProvider.build_command`` both give
+    ``spec.type == "review"`` its own branch — ``REVIEWER_SYSTEM_PROMPT``
+    plus ``Read,Bash`` only, deliberately withholding ``Monitor`` (a review
+    leg is a one-shot ``claude -p`` session per #1394) and Edit/Write (a
+    reviewer reads the diff and reports a verdict; it must not modify the
+    PR's code). ``ClaudePtyProvider.build_command`` must not drift from
+    them — mirrors
+    :func:`test_pty_build_command_smoke_branch_matches_claude_and_withholds_monitor`.
+    """
+    from coord.review import REVIEWER_SYSTEM_PROMPT
+
+    spec = _make_spec(type="review", review_target="123")
+    argv = ClaudePtyProvider().build_command(spec)
+    legacy = default_worker_command(spec)
+    legacy_sp = legacy[legacy.index("--system-prompt") + 1]
+    legacy_at = legacy[legacy.index("--allowedTools") + 1]
+    pty_sp = argv[argv.index("--system-prompt") + 1]
+    pty_at = argv[argv.index("--allowedTools") + 1]
+    assert pty_sp == legacy_sp
+    assert pty_at == legacy_at
+    # Pin the values too, so a *matched* regression on both sides still fails.
+    assert pty_sp.startswith(REVIEWER_SYSTEM_PROMPT)
     assert pty_at == "Read,Bash"
     assert "Monitor" not in pty_at.split(",")
 

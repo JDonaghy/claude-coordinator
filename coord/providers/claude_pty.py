@@ -433,6 +433,7 @@ class ClaudePtyProvider(Provider):
             NEW_ISSUE_CHAT_DENY_COMMANDS,
             NEW_ISSUE_CHAT_SYSTEM_PROMPT,
             REFINEMENT_SYSTEM_PROMPT,
+            REVIEW_DENY_COMMANDS,
             TEST_CHAT_SYSTEM_PROMPT,
             WORKER_PLAN_PROMPT,
             WORKER_SYSTEM_PROMPT,
@@ -496,6 +497,16 @@ class ClaudePtyProvider(Provider):
                 from coord.smoke import SMOKE_SYSTEM_PROMPT  # noqa: PLC0415
                 _sp = spec.system_prompt if spec.system_prompt else SMOKE_SYSTEM_PROMPT
                 _sp += build_deny_prompt(spec.deny_commands)
+                _at = "Read,Bash"
+            elif spec.type == "review":
+                # #2461: keep in sync with default_worker_command's identical
+                # branch — a reviewer reads the diff and reports a verdict,
+                # it edits and pushes nothing, so Read,Bash only (no
+                # Edit/Write, no Monitor — same one-shot-session reasoning as
+                # the `smoke` branch above).
+                from coord.review import REVIEWER_SYSTEM_PROMPT  # noqa: PLC0415
+                _sp = spec.system_prompt if spec.system_prompt else REVIEWER_SYSTEM_PROMPT
+                _sp += build_deny_prompt(REVIEW_DENY_COMMANDS)
                 _at = "Read,Bash"
             else:
                 _sp = spec.system_prompt if spec.system_prompt else WORKER_SYSTEM_PROMPT
