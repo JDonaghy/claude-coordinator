@@ -50635,6 +50635,228 @@ Milestone tracking issue.
         );
     }
 
+    // ── #2481: Pipeline doc tabs must survive a reconciliation tick ──────
+    //
+    // The bug: `sync_doc_tabs()` prunes BOTH scopes against
+    // `known_doc_keys()`, which only ever emitted the coord-LOCAL repo name
+    // (`oi.repo_name`). But a Pipeline document key is built from
+    // `PipelineIssue::repo_slug` — the GitHub `owner/name` slug — at every
+    // one of its call sites (`events.rs`'s `RowSelected`/`RowActivated`
+    // arms), and `pipeline_issue_for`/`reveal_pipeline_active_doc` key off
+    // `repo_slug` too. On any real board (`pipeline_repos` maps
+    // `claude-coordinator` → `JDonaghy/claude-coordinator`) the two spellings
+    // differ, so the very next data tick found no match and dropped every
+    // Pipeline tab — then immediately persisted the removal to
+    // `~/.coord/tabs.json`, which is exactly the reported "tabs vanish a few
+    // seconds after opening, and don't come back on restart".
+    //
+    // Every pre-existing doc-tab fixture seeds NO `board_meta`, so
+    // `pipeline_repos` was empty and `repo_slug` fell back to `repo_name` —
+    // slug == local name, mismatch invisible. These fixtures carry the slug
+    // map, which is what makes the bug observable in-crate.
+
+    /// Contract §7's Pipeline fixture, but with the slug map a real board
+    /// actually carries (`tests/acceptance/ms-65/tabs_persistence_2286.rs`'s
+    /// own `BOARD_JSON` seeds the same one).
+    const DOC_TAB_SLUGGED_JSON: &str = r#"{
+      "issues": [
+        {"repo_name": "claude-coordinator", "number": 201, "title": "Add retry backoff to fetch", "state": "open", "labels": ["coord"]},
+        {"repo_name": "claude-coordinator", "number": 202, "title": "Migrate settings to TOML v2", "state": "open", "labels": ["coord"]}
+      ],
+      "board_meta": {
+        "pipeline_repos": "{\"claude-coordinator\": \"JDonaghy/claude-coordinator\"}",
+        "pipeline_tracked_labels": "[\"coord\"]",
+        "pipeline_default_gates": "[\"review\", \"merge\"]"
+      }
+    }"#;
+
+    /// The precondition the whole bug rests on: with a real slug map, the key
+    /// the Pipeline click path builds is NOT the key `known_doc_keys` emits.
+    /// Asserted separately so a future change to either side fails here with
+    /// a readable message rather than only through the survival tests below.
+    #[test]
+    fn a_pipeline_doc_key_is_the_slug_and_the_local_name_is_not_the_same_string() {
+        let app = make_app_with_board_json(DOC_TAB_SLUGGED_JSON);
+        let pi = app
+            .pipeline_issues
+            .first()
+            .expect("precondition: the fixture seeds a tracked Pipeline issue");
+        assert_eq!(
+            pi.repo_slug, "JDonaghy/claude-coordinator",
+            "#2481 precondition: `board_meta.pipeline_repos` must actually reach \
+             `PipelineIssue::repo_slug` — otherwise this fixture reproduces nothing"
+        );
+        assert_eq!(
+            pi.coord_repo.as_deref(),
+            Some("claude-coordinator"),
+            "#2481 precondition: the coord-local name is the OTHER spelling"
+        );
+        assert_ne!(
+            pi.repo_slug,
+            pi.coord_repo.clone().unwrap_or_default(),
+            "#2481 precondition: the two spellings differ on a real board — \
+             this is what every pre-#2481 doc-tab fixture accidentally hid by \
+             seeding no `board_meta`"
+        );
+    }
+
+    /// #2481 AC 1/2: a Pipeline document tab opened the way a click opens it
+    /// survives a `sync_doc_tabs()` reconciliation tick. Before the fix this
+    /// dropped the tab on the first tick.
+    #[test]
+    fn a_pipeline_doc_tab_survives_a_reconciliation_tick() {
+        let mut app = make_app_with_board_json(DOC_TAB_SLUGGED_JSON);
+        let key: DocKey = app
+            .pipeline_issues
+            .first()
+            .map(|pi| (pi.repo_slug.clone(), pi.number))
+            .expect("precondition: the fixture seeds a tracked Pipeline issue");
+        app.open_pipeline_doc_tab(key.clone(), true);
+        assert_eq!(
+            app.pipeline_doc_tabs().tabs(),
+            &[key.clone()][..],
+            "precondition: the tab opened"
+        );
+
+        // …and now the refresh tick that used to eat it.
+        app.sync_doc_tabs();
+
+        assert_eq!(
+            app.pipeline_doc_tabs().tabs(),
+            &[key][..],
+            "#2481: a Pipeline document tab whose issue is still on the board \
+             must survive reconciliation. It was pruned because the tab is \
+             keyed by `repo_slug` (`JDonaghy/claude-coordinator`) while \
+             `known_doc_keys` only emitted the coord-local `repo_name`."
+        );
+    }
+
+    /// #2481 AC 2, the "leave it open for a while" half: several consecutive
+    /// ticks are just as harmless as one — the reconciliation is idempotent,
+    /// not a slow drain.
+    #[test]
+    fn pipeline_doc_tabs_survive_many_consecutive_reconciliation_ticks() {
+        let mut app = make_app_with_board_json(DOC_TAB_SLUGGED_JSON);
+        let keys: Vec<DocKey> = app
+            .pipeline_issues
+            .iter()
+            .map(|pi| (pi.repo_slug.clone(), pi.number))
+            .collect();
+        assert_eq!(keys.len(), 2, "precondition: the fixture seeds two issues");
+        for key in &keys {
+            app.open_pipeline_doc_tab(key.clone(), true);
+        }
+
+        for tick in 1..=5 {
+            app.sync_doc_tabs();
+            assert_eq!(
+                app.pipeline_doc_tabs().tabs(),
+                &keys[..],
+                "#2481: both Pipeline tabs must still be open after tick {tick}"
+            );
+        }
+    }
+
+    /// #2481 AC 3, the contrast case the fix must NOT weaken — the in-crate
+    /// mirror of the sealed suite's
+    /// `a_document_whose_issue_is_absent_from_the_board_is_pruned_on_load`.
+    /// A genuinely dead document (an issue on NO board, under either
+    /// spelling) is still pruned, in both scopes.
+    #[test]
+    fn a_pipeline_doc_tab_whose_issue_left_the_board_is_still_pruned() {
+        let mut app = make_app_with_board_json(DOC_TAB_SLUGGED_JSON);
+        let live: DocKey = ("JDonaghy/claude-coordinator".to_string(), 201);
+        let dead: DocKey = ("JDonaghy/claude-coordinator".to_string(), 199);
+        app.open_pipeline_doc_tab(live.clone(), true);
+        app.open_pipeline_doc_tab(dead.clone(), true);
+        // …and the Board scope's own dead document, to prove the widening did
+        // not turn the Board half into a no-op either.
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 199), true);
+
+        app.sync_doc_tabs();
+
+        assert_eq!(
+            app.pipeline_doc_tabs().tabs(),
+            &[live][..],
+            "#2481 AC 3: #199 is absent from the board under BOTH spellings, so \
+             it must still be pruned — widening the known set must not become \
+             \"never prune anything\""
+        );
+        assert!(
+            app.doc_tabs.group(PanelScope::Board).tabs().is_empty(),
+            "#2486/#2481 AC 3: the Board scope's pruning guarantee is unchanged"
+        );
+    }
+
+    /// #2481 AC 3, the other half: an explicit close still closes. The fix is
+    /// a pruning-correctness change, not a "tabs are now immortal" change.
+    #[test]
+    fn an_explicitly_closed_pipeline_doc_tab_stays_closed_across_a_tick() {
+        let mut app = make_app_with_board_json(DOC_TAB_SLUGGED_JSON);
+        let keys: Vec<DocKey> = app
+            .pipeline_issues
+            .iter()
+            .map(|pi| (pi.repo_slug.clone(), pi.number))
+            .collect();
+        for key in &keys {
+            app.open_pipeline_doc_tab(key.clone(), true);
+        }
+        assert!(app.close_pipeline_doc_tab(0), "strip index 0 is a real tab");
+
+        app.sync_doc_tabs();
+
+        assert_eq!(
+            app.pipeline_doc_tabs().tabs(),
+            &keys[1..],
+            "#2481 AC 3: a user-closed tab must not be resurrected, and the \
+             surviving one must not be pruned"
+        );
+    }
+
+    /// #2481 AC 4: the surviving set is what reaches `~/.coord/tabs.json`.
+    /// Before the fix, the first tick after opening a Pipeline tab was a real
+    /// change (the tab was dropped) and was written straight to disk, which is
+    /// why the tab did not come back on restart either.
+    #[test]
+    fn a_reconciliation_tick_writes_no_false_positive_pruning_to_disk() {
+        let path = std::env::temp_dir().join(format!(
+            "coord_tabs_2481_no_false_prune_{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let mut app = make_app_with_board_json(DOC_TAB_SLUGGED_JSON);
+        let key: DocKey = app
+            .pipeline_issues
+            .first()
+            .map(|pi| (pi.repo_slug.clone(), pi.number))
+            .expect("precondition: the fixture seeds a tracked Pipeline issue");
+        app.open_pipeline_doc_tab(key.clone(), true);
+        app.doc_tabs.save_to_path(&path).expect("first write");
+
+        app.sync_doc_tabs();
+        let wrote = app.doc_tabs.save_to_path(&path).expect("second save");
+        let raw = std::fs::read_to_string(&path).expect("the file exists");
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            !wrote,
+            "#2481 AC 4: reconciliation found nothing to prune, so it is a \
+             no-op and must not rewrite the file. A `true` here means the tick \
+             changed the tab set — the bug.\n--- file ---\n{raw}"
+        );
+        assert!(
+            raw.contains("201"),
+            "#2481 AC 4: the persisted Pipeline scope still lists the open \
+             document.\n--- file ---\n{raw}"
+        );
+        assert_eq!(
+            app.pipeline_doc_tabs().tabs(),
+            &[key][..],
+            "#2481: …and it is still open in memory"
+        );
+    }
+
     // ── #2288 (ms-65 §9): side-by-side split ─────────────────────────────
     //
     // Black-box, same rule as #2283's block above: every test drives the

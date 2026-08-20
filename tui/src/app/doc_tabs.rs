@@ -1385,11 +1385,63 @@ struct PersistedTabs {
 /// the board"). Sourced from `open_issues` only, mirroring
 /// `board_data_from_payload`'s `"issues"` → `open_issues` mapping every
 /// fixture in this suite seeds through.
+///
+/// # #2481: an issue is known under BOTH of its repo spellings
+///
+/// `DocKey`'s repo half is a bare `String`, and the two panels that mint doc
+/// keys disagree about which string it is:
+///
+/// * **Board** keys come from `board_selected_issue` → `board_active_repo`,
+///   i.e. the **coord-local** repo name (`open_issues[*].repo_name`,
+///   `claude-coordinator`).
+/// * **Pipeline** keys come from `PipelineIssue::repo_slug` at every call
+///   site (`events.rs`'s `RowSelected` / `RowActivated` arms), i.e. the
+///   **GitHub slug** (`JDonaghy/claude-coordinator`) — and
+///   `pipeline_issue_for` / `reveal_pipeline_active_doc` / the strip's own
+///   label lookup all key off `repo_slug` to match.
+///
+/// [`DocTabs::retain_known`] is deliberately scope-agnostic (#2288: "every
+/// pane of every scope"), so ONE set has to satisfy both spellings. Emitting
+/// only `repo_name` meant every live-opened Pipeline tab failed the match and
+/// was pruned by the very next `sync_doc_tabs()` tick — a few seconds after
+/// it was clicked — and the removal was persisted straight to
+/// `~/.coord/tabs.json`, so it did not come back on restart either (#2481).
+///
+/// Every pre-#2481 doc-tab fixture seeded no `board_meta`, leaving
+/// `pipeline_repos` empty, so `repo_slug` fell back to `repo_name`
+/// (`pipeline_issues_from_cache`) and the two spellings were accidentally the
+/// same string — which is why no test caught this.
+///
+/// So each open issue contributes its local-name key AND, when
+/// `pipeline_repos` maps that repo to a different slug, the slug-spelled key.
+/// This widens the known set by an alias of an issue that IS on the board; it
+/// does **not** weaken pruning, because an issue absent from `open_issues`
+/// contributes neither spelling and is still dropped (§6 bullet 2 / #2286
+/// AC 3 — see `a_pipeline_doc_tab_whose_issue_left_the_board_is_still_pruned`
+/// and the sealed
+/// `a_document_whose_issue_is_absent_from_the_board_is_pruned_on_load`).
+///
+/// Both spellings are emitted rather than normalising to one because
+/// `tabs.json` already holds files written under the *local* name for the
+/// `pipeline` scope (that is the shape the sealed §6 restore fixture pins),
+/// while a freshly clicked Pipeline tab is slug-keyed — a restore must keep
+/// honouring both.
 pub(crate) fn known_doc_keys(data: &BoardData) -> HashSet<DocKey> {
-    data.open_issues
+    let slug_of: std::collections::HashMap<&str, &str> = data
+        .pipeline_repos
         .iter()
-        .map(|oi| (oi.repo_name.clone(), oi.number))
-        .collect()
+        .map(|(local, slug)| (local.as_str(), slug.as_str()))
+        .collect();
+    let mut out: HashSet<DocKey> = HashSet::new();
+    for oi in &data.open_issues {
+        if let Some(slug) = slug_of.get(oi.repo_name.as_str()) {
+            if *slug != oi.repo_name.as_str() {
+                out.insert(((*slug).to_string(), oi.number));
+            }
+        }
+        out.insert((oi.repo_name.clone(), oi.number));
+    }
+    out
 }
 
 /// Build one document tab's rendered label (contract §2b/§2c/§2d/§1).
@@ -2478,6 +2530,87 @@ mod tests {
         let known = known_doc_keys(&data);
         assert!(known.contains(&k(101)));
         assert_eq!(known.len(), 1);
+    }
+
+    /// #2481, at the model level: with a `pipeline_repos` slug map the known
+    /// set must contain the issue under BOTH spellings, because Board keys are
+    /// local-name-spelled and Pipeline keys are slug-spelled — and one
+    /// scope-agnostic `retain_known` has to accept both. See
+    /// [`known_doc_keys`]'s own doc comment for the full derivation.
+    fn slugged_board(numbers: &[u64]) -> BoardData {
+        use crate::app::types::OpenIssue;
+        BoardData {
+            open_issues: numbers
+                .iter()
+                .map(|n| OpenIssue {
+                    repo_name: "claude-coordinator".to_string(),
+                    number: *n,
+                    title: "t".to_string(),
+                    body: String::new(),
+                    labels: vec!["coord".to_string()],
+                    state: "open".to_string(),
+                    milestone_number: None,
+                    milestone_title: None,
+                })
+                .collect(),
+            pipeline_repos: vec![(
+                "claude-coordinator".to_string(),
+                "JDonaghy/claude-coordinator".to_string(),
+            )],
+            ..BoardData::default()
+        }
+    }
+
+    #[test]
+    fn known_doc_keys_accepts_both_the_local_name_and_the_github_slug() {
+        let known = known_doc_keys(&slugged_board(&[101]));
+        assert!(
+            known.contains(&("claude-coordinator".to_string(), 101)),
+            "#2481: the Board's local-name spelling is still known"
+        );
+        assert!(
+            known.contains(&("JDonaghy/claude-coordinator".to_string(), 101)),
+            "#2481: …and so is the Pipeline's `repo_slug` spelling, which is \
+             what `open_pipeline_doc_tab` is actually keyed by"
+        );
+        assert_eq!(known.len(), 2, "exactly the two spellings, nothing else");
+    }
+
+    /// The widening must not become "never prune anything": an issue that is
+    /// on NO board is unknown under either spelling, which is what keeps §6
+    /// bullet 2 (#2286 AC 3) intact.
+    #[test]
+    fn known_doc_keys_still_excludes_an_issue_that_is_not_on_the_board() {
+        let known = known_doc_keys(&slugged_board(&[101]));
+        assert!(!known.contains(&("claude-coordinator".to_string(), 199)));
+        assert!(!known.contains(&("JDonaghy/claude-coordinator".to_string(), 199)));
+    }
+
+    /// A repo whose slug is not configured (or is literally its local name)
+    /// contributes exactly one key — no degenerate duplicate, so the set size
+    /// stays an honest count of distinct spellings.
+    #[test]
+    fn known_doc_keys_emits_one_key_when_the_slug_equals_the_local_name() {
+        use crate::app::types::OpenIssue;
+        let data = BoardData {
+            open_issues: vec![OpenIssue {
+                repo_name: "claude-coordinator".to_string(),
+                number: 101,
+                title: "t".to_string(),
+                body: String::new(),
+                labels: Vec::new(),
+                state: "open".to_string(),
+                milestone_number: None,
+                milestone_title: None,
+            }],
+            pipeline_repos: vec![(
+                "claude-coordinator".to_string(),
+                "claude-coordinator".to_string(),
+            )],
+            ..BoardData::default()
+        };
+        let known = known_doc_keys(&data);
+        assert_eq!(known, HashSet::from([k(101)]));
     }
 
     // ── #2288 (ms-65 §9): the pane model ─────────────────────────────────
