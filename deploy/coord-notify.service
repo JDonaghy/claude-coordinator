@@ -43,6 +43,18 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=%h/.coord-venv/bin/coord notify --config %h/.coord/coordinator.yml
-# Bounded below the timer's 5-minute cadence (coord-notify.timer) so a slow
-# run can't overlap the next fire.
-TimeoutStartSec=280
+# #2464: sized off `coord.confirm_test.notify_client_timeout_seconds()` — the
+# HTTP timeout the CLI gives its `/notify` POST — plus slack, because this is
+# the OTHER client-side ceiling on the same call and the tighter of the two is
+# the one that actually bites.
+#
+# It used to be 280s, "bounded below the timer's 5-minute cadence so a slow run
+# can't overlap the next fire". Two things changed. A drain now re-runs the
+# repo's real build+test to confirm Test-stage PASS claims (bounded by
+# `CONFIRM_PASS_BUDGET_SECONDS`), so a pass legitimately exceeds 280s — and
+# SIGTERMing the client does not stop the daemon, which finishes the drain
+# under `notify.lock` anyway; all the old ceiling bought was a `failed` unit
+# and a scary journal entry for a pass that worked. Overlap is not the risk it
+# reads as either: systemd will not start a second instance of a unit that is
+# still running, so a long pass delays the next fire rather than racing it.
+TimeoutStartSec=1800

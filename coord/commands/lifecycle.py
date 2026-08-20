@@ -95,9 +95,23 @@ def notify(config_path: Path) -> None:
     _svc = daemon_reroute_target("COORD_NOTIFY_ON_DAEMON")
     if _svc is not None:
         from coord.client import post_record  # noqa: PLC0415
+        from coord.confirm_test import (  # noqa: PLC0415
+            notify_client_timeout_seconds,
+        )
 
         try:
-            resp = post_record(_svc, "/notify", {}, timeout=180.0)
+            # #2464: a drain now re-runs the repo's real build+test to confirm
+            # Test-stage PASS claims, so a pass can legitimately outlast the
+            # pre-#2464 180s.  The daemon runs it to completion under
+            # `notify.lock` regardless of what this client does (see
+            # `serve_app.post_notify`), so giving up early would report
+            # "notify via daemon failed" for a pass that is still running and
+            # will finish fine — on the one command the auto-loop is driven
+            # by.  Same fix, same shape, as `coord merge --revalidate`'s
+            # `coord.revalidate.client_timeout_seconds` (#1769/#1715).
+            resp = post_record(
+                _svc, "/notify", {}, timeout=notify_client_timeout_seconds(),
+            )
         except Exception as exc:  # noqa: BLE001
             click.echo(f"error: notify via daemon failed: {exc}", err=True)
             sys.exit(1)

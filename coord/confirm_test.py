@@ -93,6 +93,8 @@ from __future__ import annotations
 
 import os
 import subprocess
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -120,7 +122,8 @@ from coord.revalidate import (
     local_repo_dir,
 )
 
-#: Ceiling on one confirmation run. Deliberately tighter than
+#: Ceiling on one confirmation run — **the build and the suite share it**, it is
+#: not per-command. Deliberately tighter than
 #: :data:`coord.revalidate.DEFAULT_TIMEOUT_SECONDS` (30 min): that one bounds an
 #: operator-initiated merge, this one runs in the reap path where a wedged suite
 #: would stall every subsequent notification behind it. Safe to keep tight
@@ -128,6 +131,38 @@ from coord.revalidate import (
 #: it firing early is one wasted run and a fall back to the worker's claim, not
 #: a falsely-failed branch.
 CONFIRM_DEFAULT_TIMEOUT_SECONDS = 60 * 20
+
+#: #2464-review: wall-clock ceiling on **all** confirmations in ONE notify pass.
+#:
+#: A confirmation runs synchronously inside the notify drain, which holds
+#: ``~/.coord/notify.lock`` for its whole duration (see
+#: :func:`coord.notify.run_drain`'s "Concurrency" note) — so every second spent
+#: confirming one branch is a second no other repo's or machine's notifications
+#: advance. Bounding one *run* is not enough: a pass with three completed smoke
+#: rows would serialize three runs and the drain's worst case would scale with
+#: board activity, which is exactly the unbounded-hold shape.
+#:
+#: This bounds the whole pass instead. :func:`confirmation_timeout` hands each
+#: successive confirmation whatever is left of the budget, and once it is spent
+#: further PASS claims in the same pass record UNCONFIRMED — i.e. degrade to
+#: pre-#2464 behaviour, the module's standing fallback — rather than extending
+#: the hold. That truncation is logged, never silent.
+#:
+#: Sized so the common case never trips it (this repo's suite is ~6 min serial,
+#: so a pass can confirm ~4 branches back to back) while the daemon-side worst
+#: case stays a number the thin client can actually be given — see
+#: :func:`notify_client_timeout_seconds`.
+CONFIRM_PASS_BUDGET_SECONDS = 60 * 25
+
+#: Don't *start* a confirmation with less than this left in the pass budget.
+#: A run that cannot finish only produces :data:`~coord.revalidate.KIND_TIMEOUT`
+#: (inconclusive — the same answer as not running), so starting it buys nothing
+#: and spends the tail of the budget holding the lock.
+CONFIRM_MIN_RUN_SECONDS = 60
+
+#: What one ``/notify`` drain costs with NO confirmation in it — the pre-#2464
+#: thin-client HTTP timeout from ``coord/commands/lifecycle.py``.
+NOTIFY_BASE_CLIENT_TIMEOUT_SECONDS = 180.0
 
 #: Operator escape hatch. Set to a falsey value to restore exactly the
 #: pre-#2464 behaviour (trust the worker's claim). Exists because this runs
@@ -148,6 +183,95 @@ REFUTING_KINDS = frozenset({KIND_BUILD, KIND_SUITE})
 #: Kinds meaning "the check could not reach a verdict". The caller falls back to
 #: the worker's own claim on any of these, which is pre-#2464 behaviour.
 INCONCLUSIVE_KINDS = frozenset({KIND_SETUP, KIND_INFRA, KIND_TIMEOUT})
+
+
+# ── Per-pass budget (#2464-review) ──────────────────────────────────────────
+#
+# Thread-local rather than a module global because the daemon runs drains from
+# two places on two threads — the pipeline clock's `_notify_drain_tick` and the
+# `/notify` handler's `run_in_threadpool(_run)` — and the latter deliberately
+# falls back to running UNLOCKED after a 120 s wait for `notify.lock`
+# (`coord/serve_app.py`). So two passes really can overlap, and a shared
+# counter would let one pass consume the other's budget. Each thread's pass
+# gets its own.
+_pass_state = threading.local()
+
+
+def begin_confirmation_pass(total: float = CONFIRM_PASS_BUDGET_SECONDS) -> None:
+    """Open a confirmation budget for one notify pass.
+
+    Called once at the top of :func:`coord.notify.run` and
+    :func:`coord.notify._run_drain_locked`. Idempotent by construction — a
+    second call just refills the budget — so there is deliberately no
+    ``end_confirmation_pass`` and no try/finally to get wrong around either of
+    those long functions.
+
+    The budget is **spend-based, not deadline-based**: it is drawn down by
+    :func:`spend_confirmation_budget` with time actually spent confirming, not
+    by the wall clock. A deadline would decay on its own, so a budget left over
+    from a finished pass would silently expire and suppress confirmations in
+    whatever ran next on this thread — a pytest process outliving 25 minutes
+    would be enough. Spend-based, a stale budget is simply a full one.
+    """
+    _pass_state.remaining = float(total)
+
+
+def confirmation_timeout() -> int | None:
+    """Seconds the next confirmation in this pass may take, or ``None``.
+
+    ``None`` means the pass budget is spent (or too nearly spent to be worth
+    starting a run — :data:`CONFIRM_MIN_RUN_SECONDS`) and the caller must fall
+    back to the worker's own claim.
+
+    Outside a pass — a direct :func:`confirm_branch` call, a unit test — there
+    is no budget to draw down and the full per-run ceiling applies.
+    """
+    remaining = getattr(_pass_state, "remaining", None)
+    if remaining is None:
+        return int(CONFIRM_DEFAULT_TIMEOUT_SECONDS)
+    if remaining < CONFIRM_MIN_RUN_SECONDS:
+        return None
+    return int(min(float(CONFIRM_DEFAULT_TIMEOUT_SECONDS), remaining))
+
+
+def spend_confirmation_budget(seconds: float) -> None:
+    """Charge *seconds* of confirmation work against this pass's budget.
+
+    A no-op outside a pass. Never goes negative, and never charges a negative
+    amount — a non-monotonic clock must not *refund* budget.
+    """
+    remaining = getattr(_pass_state, "remaining", None)
+    if remaining is None:
+        return
+    _pass_state.remaining = max(0.0, remaining - max(0.0, float(seconds)))
+
+
+def notify_client_timeout_seconds(
+    budget: float = CONFIRM_PASS_BUDGET_SECONDS,
+) -> float:
+    """HTTP timeout a thin client should give a ``/notify`` POST (#2464-review).
+
+    The exact analogue of :func:`coord.revalidate.client_timeout_seconds`, and
+    it exists for the identical reason. ``coord notify`` routes to the board
+    daemon (#906), and the daemon's ``post_notify`` handler runs the drain to
+    completion under ``notify.lock`` no matter what the client does. If the
+    client gives up first, the operator (and ``coord-notify.timer``, the
+    project's sanctioned single pipeline driver) sees ``error: notify via
+    daemon failed`` for a pass that is still running and will finish fine —
+    a false negative on the one command the whole auto-loop is driven by.
+
+    Before #2464 a drain never ran a suite, so the pre-existing 180 s was
+    ample. Now a pass can spend up to :data:`CONFIRM_PASS_BUDGET_SECONDS`
+    confirming PASS claims *on top of* everything it already did, so the client
+    has to outlast that sum. Unlike revalidate's deliberately-generous
+    ``MAX_REVALIDATION_BATCH`` ceiling, this one is **enforced**:
+    :func:`confirmation_timeout` will not hand out time past the budget, so the
+    worst case here is a real bound rather than an estimate.
+
+    ``deploy/coord-notify.service``'s ``TimeoutStartSec`` is the *other* client
+    ceiling on the same call and is sized off this value — keep them together.
+    """
+    return NOTIFY_BASE_CLIENT_TIMEOUT_SECONDS + float(budget)
 
 
 @dataclass
@@ -230,6 +354,80 @@ def confirm_worktree_path(repo_name: str, branch: str) -> Path:
     return COORD_DIR / "confirm-worktrees" / safe
 
 
+def branch_touched_files(repo_dir: Path, branch: str, base_branch: str) -> list[str]:
+    """Paths the branch changes vs its merge-base with *base_branch*.
+
+    Computed with plain local git against the already-fetched ``origin/*`` refs
+    — no ``gh``, no network beyond the fetch :func:`confirm_branch` already did.
+    Returns ``[]`` on any failure; the caller reads that as "unknown", never as
+    "nothing changed".
+    """
+    try:
+        diffed = _run(
+            ["git", "diff", "--name-only",
+             f"origin/{base_branch}...origin/{branch}"],
+            cwd=repo_dir,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return []
+    if diffed.returncode != 0:
+        return []
+    return [line.strip() for line in (diffed.stdout or "").splitlines() if line.strip()]
+
+
+def unmet_confirmation_capabilities(
+    config, repo_name: str, branch: str, repo_dir: Path,
+) -> list[str]:
+    """Capabilities this branch's diff needs that THIS machine does not have.
+
+    #2464-review: the confirmation subprocess runs wherever the notify drain
+    runs — in production the always-on daemon host — which is emphatically not
+    the machine the Test stage itself would have picked. This repo's whole
+    answer to "some suites only pass on the right hardware" is
+    ``smoke_tests.capability_rules`` (CLAUDE.md, "Smoke tests validate on
+    capable hardware"), and :func:`coord.smoke.dispatch_smoke` routes the
+    original run through them. Running the *confirmation* without consulting
+    them would let a headless daemon re-run a GTK or browser suite, watch it
+    fail for want of a display, and **refute a perfectly good branch** — the
+    one direction :mod:`coord.confirm_test` promises never to fail in.
+
+    So the same rules gate the confirmation, and an unmet capability is
+    :data:`~coord.revalidate.KIND_SETUP` (inconclusive → the worker's claim
+    stands, pre-#2464 behaviour) rather than a run on the wrong hardware.
+
+    Benefit of the doubt in every ambiguous case, mirroring
+    :func:`coord.acceptance.capability_gap` (#966):
+
+    * no ``capability_rules`` configured, or the diff hits none of them → ``[]``
+      (nothing extra is required, so any machine will do — the #1426 rule);
+    * this host is not a recognized machine in ``coordinator.yml`` → ``[]``
+      (a dev box outside the fleet may well have everything installed);
+    * the diff could not be computed → ``[]`` (the gate cannot be applied, so
+      it is not applied; a wrong-hardware run still usually lands on
+      :data:`~coord.revalidate.KIND_INFRA`, which is inconclusive too).
+    """
+    smoke_cfg = getattr(config, "smoke_tests", None)
+    rules = getattr(smoke_cfg, "capability_rules", None) or []
+    if not rules:
+        return []
+
+    from coord.smoke import match_rules  # noqa: PLC0415 — avoid an import cycle
+    from coord.test_orchestrator import local_machine  # noqa: PLC0415
+
+    here = local_machine(config)
+    if here is None:
+        return []
+
+    repo_cfg = config.repo(repo_name) if config is not None else None
+    base_branch = getattr(repo_cfg, "default_branch", None) or "main"
+    touched = branch_touched_files(repo_dir, branch, base_branch)
+    if not touched:
+        return []
+
+    have = set(getattr(here, "capabilities", None) or [])
+    return [cap for cap in match_rules(touched, rules) if cap not in have]
+
+
 def _classify_failure(
     stage: str, returncode: int, output: str, worktree: Path, command: str,
 ) -> ConfirmationResult:
@@ -291,6 +489,7 @@ def confirm_branch(
     timeout: int = CONFIRM_DEFAULT_TIMEOUT_SECONDS,
     runner=None,
     echo=None,
+    clock=None,
 ) -> ConfirmationResult:
     """Run the repo's real build+test at ``origin/<branch>`` and report the truth.
 
@@ -304,11 +503,21 @@ def confirm_branch(
     choice, and for the same reason. A verdict is only worth what the suite
     behind it is worth, so when a repo has said what CI runs, confirm with that.
 
+    *timeout* bounds the **whole** confirmation, build and suite together, not
+    each command separately (#2464-review). A per-command ceiling made the real
+    worst case ``2 × timeout`` while every docstring and every caller sizing a
+    budget off it read it as one — and this runs inside the notify drain, where
+    that factor of two is time the fleet's ``notify.lock`` is held. One deadline
+    is taken at the top and both commands draw down from it.
+
     *runner* is the testing seam, same shape as
     :func:`coord.revalidate._shell_runner`: ``runner(command, cwd, timeout)``
-    returning something with ``returncode`` / ``stdout`` / ``stderr``.
+    returning something with ``returncode`` / ``stdout`` / ``stderr``. *clock*
+    is the matching seam for the shared deadline.
     """
     echo = echo or _Echo()
+    clock = clock or time.monotonic
+    deadline = clock() + float(timeout)
 
     if not branch:
         return ConfirmationResult(
@@ -364,6 +573,24 @@ def confirm_branch(
             reason=f"git fetch failed: {(fetched.stderr or '').strip()}",
         )
 
+    # #2464-review: is THIS machine allowed to judge THIS diff? Checked after
+    # the fetch (the diff needs fresh `origin/*` refs) and before the checkout
+    # (a wrong-hardware confirmation should not even pay for a worktree).
+    missing_caps = unmet_confirmation_capabilities(
+        config, repo_name, branch, repo_dir,
+    )
+    if missing_caps:
+        return ConfirmationResult(
+            kind=KIND_SETUP,
+            reason=(
+                f"this machine does not advertise {', '.join(missing_caps)}, "
+                f"which `smoke_tests.capability_rules` require for the files "
+                f"origin/{branch} touches — confirming here would judge the "
+                "branch on hardware the Test stage would never have routed it "
+                "to, so nothing is concluded (#2464)"
+            ),
+        )
+
     added = _run(
         ["git", "worktree", "add", "--force", "--detach",
          str(wt_path), f"origin/{branch}"],
@@ -384,11 +611,15 @@ def confirm_branch(
 
     run_cmd = runner or _shell_runner
 
+    def _left() -> int:
+        """Whole seconds left on the shared build+suite deadline (min 1)."""
+        return max(1, int(deadline - clock()))
+
     build_command = getattr(repo_cfg, "build_command", None)
     if build_command:
         echo(f"    confirming build: {build_command}")
         try:
-            built = run_cmd(build_command, wt_path, timeout)
+            built = run_cmd(build_command, wt_path, _left())
         except subprocess.TimeoutExpired:
             return ConfirmationResult(
                 kind=KIND_TIMEOUT,
@@ -408,9 +639,24 @@ def confirm_branch(
                 build_command,
             )
 
+    if deadline - clock() <= 0:
+        # The build consumed the whole shared window. Same answer as a suite
+        # timeout — inconclusive — but reported without spending another
+        # second of the drain's lock hold on a run that cannot finish.
+        return ConfirmationResult(
+            kind=KIND_TIMEOUT,
+            reason=(
+                f"the confirmation build used the whole {timeout}s window, "
+                "leaving no time to run the suite — nothing was learned about "
+                "the branch"
+            ),
+            command=test_command,
+            worktree=wt_path,
+        )
+
     echo(f"    confirming tests: {test_command}")
     try:
-        tested = run_cmd(test_command, wt_path, timeout)
+        tested = run_cmd(test_command, wt_path, _left())
     except subprocess.TimeoutExpired:
         return ConfirmationResult(
             kind=KIND_TIMEOUT,
@@ -445,11 +691,20 @@ def confirm_branch(
 
 __all__ = [
     "CONFIRM_DEFAULT_TIMEOUT_SECONDS",
+    "CONFIRM_MIN_RUN_SECONDS",
+    "CONFIRM_PASS_BUDGET_SECONDS",
     "DISABLE_ENV_VAR",
     "INCONCLUSIVE_KINDS",
+    "NOTIFY_BASE_CLIENT_TIMEOUT_SECONDS",
     "REFUTING_KINDS",
     "ConfirmationResult",
+    "begin_confirmation_pass",
+    "branch_touched_files",
     "confirm_branch",
     "confirm_worktree_path",
     "confirmation_enabled",
+    "confirmation_timeout",
+    "notify_client_timeout_seconds",
+    "spend_confirmation_budget",
+    "unmet_confirmation_capabilities",
 ]

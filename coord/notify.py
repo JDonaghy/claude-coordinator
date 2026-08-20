@@ -1837,7 +1837,12 @@ def _run_pass_confirmation(transition: Transition, entry: dict):
     ``"running"`` forever, which is the #1598 stranding shape). A confirmation
     that cannot run must degrade to pre-#2464 behaviour, never break the reap.
     """
-    from coord.confirm_test import confirm_branch, confirmation_enabled  # noqa: PLC0415
+    from coord.confirm_test import (  # noqa: PLC0415
+        confirm_branch,
+        confirmation_enabled,
+        confirmation_timeout,
+        spend_confirmation_budget,
+    )
 
     try:
         from coord.config import load as _load_config  # noqa: PLC0415
@@ -1859,14 +1864,35 @@ def _run_pass_confirmation(transition: Transition, entry: dict):
         )
         return None
 
+    # #2464-review: a confirmation runs synchronously in this pass, and this
+    # pass holds `~/.coord/notify.lock` for the whole fleet. Draw the run's
+    # ceiling from the pass-wide budget rather than the per-run one, so a board
+    # with several completed smoke rows cannot make the lock hold — and the
+    # `/notify` request the thin client is blocked on — scale with board
+    # activity. Exhausted budget means UNCONFIRMED, which is pre-#2464
+    # behaviour, and it is said out loud rather than truncating silently.
+    timeout = confirmation_timeout()
+    if timeout is None:
+        log.warning(
+            "smoke %s: this notify pass has spent its confirmation budget "
+            "(coord.confirm_test.CONFIRM_PASS_BUDGET_SECONDS) — recording the "
+            "worker's own claim for %s UNCONFIRMED rather than holding "
+            "notify.lock any longer (#2464).",
+            transition.assignment_id, transition.repo_name,
+        )
+        return None
+
     branch = entry.get("branch")
     log.info(
         "smoke %s: independently re-running %s's build+test at origin/%s to "
-        "confirm the pass claim (#2464).",
-        transition.assignment_id, transition.repo_name, branch,
+        "confirm the pass claim, within %ss (#2464).",
+        transition.assignment_id, transition.repo_name, branch, timeout,
     )
+    started = time.monotonic()
     try:
-        return confirm_branch(transition.repo_name, branch, config)
+        return confirm_branch(
+            transition.repo_name, branch, config, timeout=timeout,
+        )
     except Exception as exc:  # noqa: BLE001
         log.warning(
             "smoke %s: confirmation run raised (%s) — falling back to the "
@@ -1874,6 +1900,12 @@ def _run_pass_confirmation(transition: Transition, entry: dict):
             transition.assignment_id, exc,
         )
         return None
+    finally:
+        # Charged in `finally` so a raising confirmation still costs its time.
+        # It really did hold the drain (and `notify.lock`) for those seconds,
+        # and a run that reliably blows up after ten minutes must not be able
+        # to repeat that for every row on the board free of charge.
+        spend_confirmation_budget(time.monotonic() - started)
 
 
 def _confirmed_pass_verdict(
@@ -3538,6 +3570,15 @@ def _run_drain_locked(config: Config) -> DrainResult:
     global _AGENT_HOSTS
     _AGENT_HOSTS = {m.name: m.host for m in config.machines}
 
+    # #2464-review: open this pass's Test-verdict confirmation budget.  We are
+    # inside `notify.lock` for the whole pass, so the drain's wall clock is the
+    # fleet's; the budget is what keeps it bounded no matter how many smoke
+    # rows completed, and is what `notify_client_timeout_seconds()` sizes the
+    # thin client's `/notify` timeout off.
+    from coord.confirm_test import begin_confirmation_pass  # noqa: PLC0415
+
+    begin_confirmation_pass()
+
     # Step 1: post completion/failure/advisory/plan/review comments for rows
     # the agent reports terminal.  This is what stamps `finished_at` (via
     # mark_notified) and captures cost / SMOKE_TESTS / summary / session id /
@@ -3692,6 +3733,14 @@ def run(
     # threading config through every call.
     global _AGENT_HOSTS
     _AGENT_HOSTS = {m.name: m.host for m in config.machines}
+
+    # #2464-review: open this pass's Test-verdict confirmation budget.  Same
+    # reason as `_run_drain_locked` — this is the other entrypoint a pass can
+    # come in through (the CLI, and the daemon's `/notify` handler, which
+    # invokes the `coord notify` callback rather than `run_drain`).
+    from coord.confirm_test import begin_confirmation_pass  # noqa: PLC0415
+
+    begin_confirmation_pass()
 
     # #522: one terminal-state cache shared across every gh-hitting check in
     # this notify run (the auto-loop review/fix dispatches below, and the
