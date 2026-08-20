@@ -4,13 +4,14 @@
 #
 # A systemd *user* unit, Type=oneshot, mirroring coord-drive-queue.service's
 # tick pattern (timer-fired, its own flock so a slow run can't stack).  Runs
-# deploy/coord-web-dist-build.sh, which:
+# deploy/coord-web-dist-build.sh, which (#2470: tracks the dedicated
+# `coord-web` repo, not `coord/dashboard/webapp/` inside THIS repo — see
+# docs/ADR_COORD_WEB_DIST.md; #2009: that used to be ~/src/code-coordinator,
+# back when the webapp was a subdirectory of this repo):
 #   - fetches origin/main into ~/src/coord-web (read-only — only
 #     `git fetch` + `rev-parse`, never touches that checkout's working tree
-#     or whatever branch an operator has it parked on). #2009: that used
-#     to be ~/src/code-coordinator, back when the webapp was a
-#     subdirectory of this repo,
-#   - builds that repo's ROOT at that SHA inside a DEDICATED worktree
+#     or whatever branch an operator has it parked on),
+#   - builds coord-web's repo root from that SHA inside a DEDICATED worktree
 #     (~/.coord-web-checkout, never shared with an operator or `coord drive`),
 #   - atomically repoints ~/coord-web-dist at the new build.
 #
