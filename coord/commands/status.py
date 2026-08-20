@@ -1585,6 +1585,26 @@ def _diagnose_via_daemon(svc, params: dict) -> None:
         "behind."
     ),
 )
+@click.option(
+    "--forge-availability",
+    "forge_availability",
+    is_flag=True,
+    help=(
+        "#1896: report forge/CI availability over a trailing window — "
+        "uptime %, longest contiguous unavailable stretch, and merge-gate "
+        "CI refusal counts by reason — from observations recorded at the "
+        "gh/CI/merge-gate seams. Read-only, local audit_log only. Pair "
+        "with --window-days to change the window (default 30)."
+    ),
+)
+@click.option(
+    "--window-days",
+    "forge_availability_window_days",
+    default=30.0,
+    show_default=True,
+    type=float,
+    help="With --forge-availability, the trailing window (days) to summarize.",
+)
 
 
 @_CONFIG_OPTION
@@ -1601,11 +1621,18 @@ def diagnose(
     config_provenance_check: bool = False,
     self_check: bool = False,
     self_no_fetch: bool = False,
+    forge_availability: bool = False,
+    forge_availability_window_days: float = 30.0,
 ) -> None:
     """Per-stage doctor — diagnose, best-effort recover, optional reset."""
     # ── graphify graph freshness sweep (read-only) ───────────────────────────
     if graph_health:
         _diagnose_graph_health(config_path)
+        return
+
+    # ── #1896: forge/CI availability read-out (read-only) ───────────────────
+    if forge_availability:
+        _diagnose_forge_availability(forge_availability_window_days)
         return
 
     # ── #1779: fleet coordinator.yml provenance (read-only) ─────────────────
@@ -1760,6 +1787,28 @@ def _diagnose_graph_health(config_path: Path) -> None:
         f"GRAPH_HEALTH: checkouts={len(checkouts)} stale={stale_count} "
         f"origin_behind={origin_behind_count}"
     )
+
+
+def _diagnose_forge_availability(window_days: float) -> None:
+    """Report forge/CI availability over the trailing *window_days* (#1896).
+
+    Read-only: summarizes the ``forge_availability``-category rows in the
+    local ``audit_log`` (recorded best-effort at the ``gh`` call seam, the
+    CI check-fetch seam, and the merge-gate refusal seam — see
+    :mod:`coord.forge_availability`). Same family as ``--graph``/
+    ``--config-provenance``/``--self``: local-machine only, no network call
+    of its own.
+    """
+    from coord.forge_availability import (  # noqa: PLC0415
+        availability_report,
+        format_report_lines,
+        summary_line as forge_summary_line,
+    )
+
+    report = availability_report(window_days=window_days)
+    for line in format_report_lines(report):
+        click.echo(f"  {line}")
+    click.echo(forge_summary_line(report))
 
 
 def _diagnose_config_provenance() -> None:

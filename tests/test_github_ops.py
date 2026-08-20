@@ -1619,6 +1619,79 @@ class TestGhMissingOrHung:
                 github_ops._gh("issue", "view", "1")
 
 
+class TestGhForgeAvailabilityRecording:
+    """#1896 Phase 0: `_gh` is the single seam every `gh` invocation in this
+    module funnels through (#1483), so it is also the single place that
+    records one forge-availability observation per call — exit status,
+    duration, and a reachability classification distinguishing "gh could
+    not even run" / "an ordinary app-level error" / "an auth/network/rate-
+    limit failure" from a clean success."""
+
+    def test_success_records_ok(self, coord_db) -> None:
+        with patch(
+            "coord.github_ops.subprocess.run",
+            return_value=MagicMock(returncode=0, stdout="hi", stderr=""),
+        ):
+            github_ops._gh("issue", "view", "1")
+
+        row = coord_db.execute(
+            "SELECT * FROM audit_log WHERE category='forge_availability'"
+        ).fetchone()
+        assert row is not None
+        details = json.loads(row["details_json"])
+        assert details["outcome"] == "ok"
+        assert details["duration_s"] >= 0
+
+    def test_gh_not_found_records_unreachable(self, coord_db) -> None:
+        with patch("coord.github_ops.subprocess.run", side_effect=FileNotFoundError):
+            with pytest.raises(github_ops.GhError):
+                github_ops._gh("issue", "view", "1")
+
+        row = coord_db.execute(
+            "SELECT * FROM audit_log WHERE category='forge_availability'"
+        ).fetchone()
+        assert json.loads(row["details_json"])["outcome"] == "unreachable"
+
+    def test_ordinary_app_error_is_not_classified_as_transient(self, coord_db) -> None:
+        with patch(
+            "coord.github_ops.subprocess.run",
+            return_value=MagicMock(returncode=1, stdout="", stderr="label 'x' not found"),
+        ):
+            with pytest.raises(RuntimeError):
+                github_ops._gh("label", "create", "x")
+
+        row = coord_db.execute(
+            "SELECT * FROM audit_log WHERE category='forge_availability'"
+        ).fetchone()
+        assert json.loads(row["details_json"])["outcome"] == "app_error"
+
+    def test_auth_failure_is_classified_as_transient(self, coord_db) -> None:
+        with patch(
+            "coord.github_ops.subprocess.run",
+            return_value=MagicMock(returncode=1, stdout="", stderr="HTTP 401: Bad credentials"),
+        ):
+            with pytest.raises(RuntimeError):
+                github_ops._gh("issue", "view", "1")
+
+        row = coord_db.execute(
+            "SELECT * FROM audit_log WHERE category='forge_availability'"
+        ).fetchone()
+        assert json.loads(row["details_json"])["outcome"] == "transient"
+
+    def test_recording_failure_never_breaks_a_real_gh_call(self, coord_db, monkeypatch) -> None:
+        """Acceptance bar: capture is strictly best-effort — a store that
+        always throws must never raise into `_gh`'s caller."""
+        monkeypatch.setattr(
+            "coord.forge_availability.record_audit",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        with patch(
+            "coord.github_ops.subprocess.run",
+            return_value=MagicMock(returncode=0, stdout="hi", stderr=""),
+        ):
+            assert github_ops._gh("issue", "view", "1") == "hi"
+
+
 class TestGhJsonHelper:
     """#1353: `_gh` treats a `gh` call that exits 0 with empty stdout as a
     success, indistinguishable from a real empty payload — so a bare
