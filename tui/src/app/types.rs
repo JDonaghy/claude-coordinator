@@ -1170,6 +1170,25 @@ pub(crate) enum ContextMenuTarget {
         /// for the same reason `state` is: the selection may have moved.
         held: bool,
     },
+    /// #2454: right-click on a row of the **Reports** panel's result table.
+    ///
+    /// Carries only the row's *identity* — the coord-local repo name and the
+    /// issue number, resolved generically through the catalogue's
+    /// [`ReportRowIdentity`] declaration. Deliberately NOT the row's content:
+    /// a "jump elsewhere" menu never needs it, and carrying it would be the
+    /// first step back toward the per-report `match` inside `reports.rs` that
+    /// #2405 declined to introduce (see that module's header).
+    ///
+    /// A report whose catalogue entry declares no `row_identity`, or a row
+    /// whose declared cells don't parse, produces no target at all — so the
+    /// menu simply never opens there rather than opening a menu of disabled
+    /// items with nothing to act on.
+    ReportRow {
+        /// Coord-local repo name (matches `coordinator.yml`), from the
+        /// column the catalogue named.
+        repo_name: String,
+        issue_number: u64,
+    },
     /// #2287 (ms-65 §8c): right-click on a Board document tab (the strip
     /// above the detail pane, #2282). Carries the RIGHT-CLICKED tab's strip
     /// index — deliberately not necessarily the active tab, since "Close"
@@ -1792,6 +1811,33 @@ pub struct ReportParamDef {
     pub free_form: bool,
 }
 
+/// #2454: which two `columns` of a report's rows name the `(repo, issue)`
+/// that row is *about*, mirroring `coord/reports.py`'s `RowIdentity`.
+///
+/// This is the whole reason the Reports panel can offer a right-click "View
+/// on Board" on a result row without a per-report `match`. A jump only needs
+/// row **identity**, never row **content**, so the catalogue declaring where
+/// that identity lives is enough — the panel reads an optional field and
+/// stays exactly as generic as `reports.rs`'s module doc requires (adding
+/// report #2 still requires zero `tui/**` changes; a report that wants the
+/// menu just declares `row_identity` server-side).
+///
+/// `repo_column` names the column holding the **coord-local** repo name —
+/// the one `select_issue` / the Board doc-tab `DocKey` are keyed by, not the
+/// GitHub `owner/name` slug.
+///
+/// Absent for every report whose rows have no single issue (`usage` grouped
+/// `by=repo`, `decisions`' cards, `queue-outcomes`' per-period aggregates),
+/// and absent entirely from a daemon that predates #2454 — in both cases the
+/// panel simply offers no row menu.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub struct ReportRowIdentity {
+    #[serde(default)]
+    pub repo_column: String,
+    #[serde(default)]
+    pub issue_column: String,
+}
+
 /// One catalogue entry from `GET /report` — everything needed to build a
 /// section header and its parameter form, minus the server-side callable.
 #[derive(Clone, Debug, Default, serde::Deserialize)]
@@ -1810,6 +1856,13 @@ pub struct ReportDef {
     pub description: String,
     #[serde(default)]
     pub params: Vec<ReportParamDef>,
+    /// #2454: optional per-row `(repo, issue)` identity — see
+    /// [`ReportRowIdentity`]. `#[serde(default)]` is the whole
+    /// forward/backward-compatibility story: a daemon that predates the
+    /// field sends nothing and this stays `None`, so the panel renders (and
+    /// right-clicks) exactly as it did before.
+    #[serde(default)]
+    pub row_identity: Option<ReportRowIdentity>,
 }
 
 /// The `GET /report` response envelope (`{"reports": [...]}`).

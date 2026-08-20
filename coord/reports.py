@@ -62,6 +62,7 @@ __all__ = [
     "UnknownReportError",
     "ReportParam",
     "ReportDef",
+    "RowIdentity",
     "ColumnMeta",
     "ChartSeries",
     "ChartSpec",
@@ -75,6 +76,10 @@ __all__ = [
     "detect_prior_activity",
     "fold_issue_activity",
     "run_issue_activity",
+    "COMPLETED_COLUMNS",
+    "COMPLETED_COLUMN_META",
+    "fold_completed",
+    "run_completed",
     "fold_drive_queue_status",
     "run_drive_queue_status",
     "fold_decisions",
@@ -149,6 +154,41 @@ class ReportParam:
 
 
 @dataclass(frozen=True)
+class RowIdentity:
+    """#2454: which two ``columns`` of a report's rows name the ``(repo,
+    issue)`` that row is *about*.
+
+    Purely declarative, and deliberately **not** a rendering hint like
+    :class:`ColumnMeta`.  A client that knows how to navigate to an issue —
+    coord-tui's Reports panel, which offers a right-click "View on Board" on
+    a result row — needs the row's *identity*, never its *content*.  Saying
+    it here, once per report, is what lets that client stay generic: it reads
+    an optional field off the catalogue entry instead of carrying a
+    ``match`` on report ids (the exact coupling #2405 declined to introduce).
+
+    ``repo_column`` names the column holding the **coord-local** repo name
+    (matches ``coordinator.yml``, i.e. what ``select_issue`` and every
+    ``coord`` verb take), ``issue_column`` the one holding the issue number.
+
+    **Optional in both directions.**  Reports whose rows have no single
+    ``(repo, issue)`` — ``usage`` grouped ``by=repo``, ``decisions``' cards,
+    ``queue-outcomes``' per-period aggregates whose ``issues`` column is a
+    *list* — simply declare none, and a client offers no per-row navigation
+    for them.  A client that predates the field ignores it and renders
+    exactly as before.
+    """
+
+    repo_column: str
+    issue_column: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "repo_column": self.repo_column,
+            "issue_column": self.issue_column,
+        }
+
+
+@dataclass(frozen=True)
 class ReportDef:
     """A named report.  ``run(**params)`` returns a :class:`ReportResult`."""
 
@@ -157,6 +197,10 @@ class ReportDef:
     description: str
     params: tuple[ReportParam, ...]
     run: Callable[..., "ReportResult"] = field(compare=False)
+    #: #2454 — optional per-row ``(repo, issue)`` identity.  See
+    #: :class:`RowIdentity`; ``None`` means "this report's rows are not
+    #: about one issue".
+    row_identity: RowIdentity | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Catalogue entry — everything a client needs except the callable."""
@@ -165,6 +209,12 @@ class ReportDef:
             "title": self.title,
             "description": self.description,
             "params": [p.to_dict() for p in self.params],
+            # #2454: additive, and `null` for most reports. A client that
+            # predates it ignores the key; one that understands it gets
+            # per-row navigation without knowing which report it is looking at.
+            "row_identity": (
+                None if self.row_identity is None else self.row_identity.to_dict()
+            ),
         }
 
 
@@ -2534,6 +2584,276 @@ def run_queue_outcomes(
     )
 
 
+# ── completed: what left the pipeline inside a window ──────────────────────
+#
+# #2454.  #2405 built exactly this table as a Pipeline-local detail tab
+# (`tui/src/app/pipeline.rs`'s `completed_rows`) rather than a catalogue
+# entry, because the interaction it wanted — row click opens that issue's
+# Pipeline detail — could only be expressed as a per-report `match` inside
+# `tui/src/app/reports.rs`, which is precisely the coupling that module
+# exists to prevent.  #2454 changes the interaction (right-click → "View on
+# Board", which needs row *identity* and not row *content*, declared
+# generically by `RowIdentity` above), so the report can live here where it
+# belongs: filterable by time range and repo, sortable, and exportable
+# through the panel's existing CSV action, instead of only inside one tab.
+#
+# The fold is a port of `completed_rows`' rules, not a new definition of
+# "done":
+#
+#   * an issue is completed when it is **closed** OR its `merge_queue` row
+#     says `merged` (the PR closed it via `fixes #N` before the brain synced
+#     the GitHub close — `pipeline_lifecycle_section`'s rule 1 and rule 3),
+#   * ENDED is the merged `merge_queue` row's `last_attempt`, falling back to
+#     the **max** `finished_at` across the issue's assignments (`issue_done_at`),
+#   * STARTED is the **min** `dispatched_at` across them (`issue_started_at`),
+#   * the window is applied to ENDED, and an issue with no ENDED at all is
+#     dropped and *counted in a note* — it cannot be placed in any time range,
+#     the same call `completed_rows` documents making.
+#
+# Deliberately NOT ported: the epic-aggregation branch (`epic_lifecycle_section`,
+# #1253).  A tracking issue whose children are all done but which is itself
+# still open reads as in-progress here.  That branch is a *sidebar bucketing*
+# rule with no server-side counterpart, and inventing one is a behaviour
+# change to "what is done", which this issue is not.  See the note this fold
+# emits when it drops such rows for lack of an ENDED timestamp.
+
+COMPLETED_COLUMNS = [
+    "repo",
+    "issue",
+    "title",
+    "started_at",
+    "ended_at",
+]
+
+# One entry per COMPLETED_COLUMNS entry, same order (#1760).
+#
+# `repo` is present even though #2405's grid had no repo column: that grid
+# folded the repo into its `C#2345` issue ref, which works because
+# `CoordApp::repo_tag` shortens against the repos actually on screen. A
+# server-side report has no such screen context, and its `repo` param
+# defaults to *all repos*, so the pair has to be two real columns — which is
+# also what `issue-activity` already does, and what `RowIdentity` reads.
+COMPLETED_COLUMN_META = [
+    ColumnMeta(id="repo", label="Repo", kind="text"),
+    ColumnMeta(id="issue", label="Issue", kind="int", align="right"),
+    ColumnMeta(id="title", label="Title", kind="text", weight=3.0),
+    ColumnMeta(id="started_at", label="Started", kind="timestamp"),
+    ColumnMeta(id="ended_at", label="Ended", kind="timestamp"),
+]
+
+
+def fold_completed(
+    issues: Iterable[Mapping[str, Any]],
+    assignments: Iterable[Mapping[str, Any]],
+    merge_queue: Iterable[Mapping[str, Any]],
+    window: tuple[float, float],
+    *,
+    repo: str = "",
+    generated_at: float | None = None,
+) -> ReportResult:
+    """Fold the board's own tables into one row per issue that *finished*
+    inside ``window``.
+
+    Pure — every input is a plain sequence of mappings, so the whole rule set
+    above is testable without a database (same posture as
+    :func:`fold_issue_activity`).  Rows come back newest-ENDED first, which
+    is #2405's default order; the client re-sorts by column head-click.
+    """
+    start, end = window
+    generated_at = time.time() if generated_at is None else float(generated_at)
+    repo_filter = (repo or "").strip()
+
+    issue_rows = list(issues)
+    assignment_rows = list(assignments)
+    merge_rows = list(merge_queue)
+
+    # `merge_queue` may hold several rows for one issue (a re-queue after a
+    # failed merge). Keep the newest MERGED one — `last_attempt` is when the
+    # merge landed, which is exactly the ENDED value we want.
+    merged_at: dict[tuple[str, int], float] = {}
+    for m in merge_rows:
+        if str(m.get("state") or "") != "merged":
+            continue
+        name = str(m.get("repo_name") or "")
+        number = m.get("issue_number")
+        stamp = m.get("last_attempt")
+        if not name or number is None or stamp is None:
+            continue
+        try:
+            key = (name, int(number))
+            value = float(stamp)
+        except (TypeError, ValueError):
+            continue
+        if value > merged_at.get(key, float("-inf")):
+            merged_at[key] = value
+
+    # One pass over assignments for both timestamps, keyed the same way
+    # `issue_done_at`/`issue_started_at` key theirs: coord-LOCAL repo name
+    # plus issue number, so repo-a#7 and repo-b#7 can never contribute to
+    # each other.
+    first_dispatch: dict[tuple[str, int], float] = {}
+    last_finish: dict[tuple[str, int], float] = {}
+    for a in assignment_rows:
+        name = str(a.get("repo_name") or "")
+        number = a.get("issue_number")
+        if not name or number is None:
+            continue
+        try:
+            key = (name, int(number))
+        except (TypeError, ValueError):
+            continue
+        dispatched = a.get("dispatched_at")
+        if dispatched is not None:
+            try:
+                value = float(dispatched)
+            except (TypeError, ValueError):
+                value = None
+            if value is not None and value < first_dispatch.get(key, float("inf")):
+                first_dispatch[key] = value
+        finished = a.get("finished_at")
+        if finished is not None:
+            try:
+                value = float(finished)
+            except (TypeError, ValueError):
+                value = None
+            if value is not None and value > last_finish.get(key, float("-inf")):
+                last_finish[key] = value
+
+    rows: list[dict] = []
+    no_end_time = 0
+    for issue in issue_rows:
+        name = str(issue.get("repo_name") or "")
+        number = issue.get("number")
+        if not name or number is None:
+            continue
+        try:
+            key = (name, int(number))
+        except (TypeError, ValueError):
+            continue
+        is_closed = str(issue.get("state") or "open") == "closed"
+        if not is_closed and key not in merged_at:
+            continue
+        if repo_filter and name != repo_filter:
+            continue
+        ended = merged_at.get(key, last_finish.get(key))
+        if ended is None:
+            # No END timestamp anywhere — it cannot be placed in *any* time
+            # range, so it is dropped rather than silently windowed to now
+            # (`completed_rows` makes the same call). Counted in a note below
+            # so "my issue is missing" has a visible answer.
+            no_end_time += 1
+            continue
+        if ended < start or ended > end:
+            continue
+        rows.append(
+            {
+                "repo": name,
+                "issue": key[1],
+                "title": str(issue.get("title") or "") or None,
+                "started_at": first_dispatch.get(key),
+                "ended_at": ended,
+            }
+        )
+
+    # Newest-ended first, with `(repo, issue)` as a total secondary key so a
+    # re-run can never reshuffle rows that tie on the same second (#2405's
+    # `sort_completed_rows` takes the same precaution for the same reason).
+    rows.sort(key=lambda r: (-float(r["ended_at"]), r["repo"], r["issue"]))
+
+    notes: list[str] = []
+    if no_end_time:
+        notes.append(
+            f"{no_end_time} completed issue(s) have no end timestamp (no merged "
+            "merge_queue row and no assignment finished_at) and are not shown — "
+            "there is no time range that could contain them."
+        )
+    if repo_filter and not any(
+        str(i.get("repo_name") or "") == repo_filter for i in issue_rows
+    ):
+        notes.append(
+            f"No issue in this board belongs to repo {repo_filter!r} — check the "
+            "coord-local repo name (the one in coordinator.yml), not the GitHub slug."
+        )
+
+    return ReportResult(
+        report_id="completed",
+        generated_at=generated_at,
+        window=(start, end),
+        columns=list(COMPLETED_COLUMNS),
+        column_meta=list(COMPLETED_COLUMN_META),
+        rows=rows,
+        notes=notes,
+    )
+
+
+def _default_completed_source() -> tuple[list[dict], list[dict], list[dict]]:
+    """``(issues, assignments, merge_queue)`` straight off the local board DB.
+
+    A plain read — three ``SELECT``s, no tick, no reconcile — mirroring
+    :func:`_lookup_titles`' posture (and its "never fail the report over a DB
+    that isn't there" degradation).  Like ``queue-outcomes``' block log this
+    is a *host-local* source: run the report where the board lives, or let
+    that host's daemon answer it over ``GET /report/completed``.
+    """
+    try:
+        from coord.db import get_connection  # noqa: PLC0415
+
+        conn = get_connection()
+        issues = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT repo_name, number, title, state FROM issues"
+            ).fetchall()
+        ]
+        assignments = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT repo_name, issue_number, dispatched_at, finished_at "
+                "FROM assignments"
+            ).fetchall()
+        ]
+        merge_queue = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT repo_name, issue_number, state, last_attempt FROM merge_queue"
+            ).fetchall()
+        ]
+    except Exception:  # noqa: BLE001 — an unreadable board is an empty report
+        return [], [], []
+    return issues, assignments, merge_queue
+
+
+def run_completed(
+    *,
+    since: str = "24h",
+    until: str = "",
+    repo: str = "",
+    now: float | None = None,
+    source: Callable[[], tuple[
+        Sequence[Mapping[str, Any]],
+        Sequence[Mapping[str, Any]],
+        Sequence[Mapping[str, Any]],
+    ]] | None = None,
+) -> ReportResult:
+    """Read the board and fold it.  ``now``/``source`` are test seams
+    (mirrors :func:`run_issue_activity`); the report's own parameters are
+    ``since``/``until``/``repo`` — the same three, with the same vocabulary
+    and the same validators, that ``issue-activity`` uses."""
+    generated_at = time.time() if now is None else float(now)
+    end = parse_timestamp(until) if until else generated_at
+    start = end - parse_duration(since)
+    source_fn = _default_completed_source if source is None else source
+    issues, assignments, merge_queue = source_fn()
+    return fold_completed(
+        issues,
+        assignments,
+        merge_queue,
+        (start, end),
+        repo=repo,
+        generated_at=generated_at,
+    )
+
+
 # ── the catalogue ──────────────────────────────────────────────────────────
 
 SINCE_PRESETS = ("1h", "6h", "24h", "3d", "7d")
@@ -2602,6 +2922,57 @@ ISSUE_ACTIVITY = ReportDef(
         ),
     ),
     run=run_issue_activity,
+    # #2454: one row per issue, with `repo`/`issue` naming it — so a client
+    # can offer per-row navigation here for free.
+    row_identity=RowIdentity(repo_column="repo", issue_column="issue"),
+)
+
+
+COMPLETED = ReportDef(
+    id="completed",
+    title="Completed",
+    description=(
+        "Everything that left the pipeline inside a time range — one row per "
+        "issue, with when it first started and when it ended. An issue counts "
+        "as completed when it is closed, or when its merge_queue row says "
+        "merged (the PR closed it before the brain synced the close). ENDED is "
+        "the merge timestamp, falling back to the last assignment to finish; "
+        "STARTED is the first dispatch. Issues with no end timestamp at all "
+        "cannot be placed in a time range and are counted in a note instead."
+    ),
+    params=(
+        # The same three params, the same vocabulary and the same validators
+        # as `issue-activity` above (#2270's rule: follow the existing
+        # convention rather than inventing one) — which is also exactly the
+        # control set #2405's Pipeline-local grid settled on.
+        ReportParam(
+            id="since",
+            label="Time range",
+            kind="choice",
+            choices=SINCE_PRESETS,
+            default="24h",
+            help="How far back the window reaches from `until`. Presets, or any duration (e.g. 13h).",
+            free_form=True,
+            validate=_validate_since,
+        ),
+        ReportParam(
+            id="until",
+            label="Window end",
+            kind="text",
+            default="",
+            help="Epoch seconds or ISO-8601. Empty means now.",
+            validate=_validate_until,
+        ),
+        ReportParam(
+            id="repo",
+            label="Repo",
+            kind="text",
+            default="",
+            help="Restrict to one repo by name. Empty means all repos.",
+        ),
+    ),
+    run=run_completed,
+    row_identity=RowIdentity(repo_column="repo", issue_column="issue"),
 )
 
 
@@ -2920,6 +3291,7 @@ def csv_filename(result: "ReportResult | Mapping[str, Any]") -> str:
 
 REPORTS: dict[str, ReportDef] = {
     ISSUE_ACTIVITY.id: ISSUE_ACTIVITY,
+    COMPLETED.id: COMPLETED,
     DRIVE_QUEUE_STATUS.id: DRIVE_QUEUE_STATUS,
     DECISIONS.id: DECISIONS,
     USAGE.id: USAGE,

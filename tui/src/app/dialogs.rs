@@ -1330,6 +1330,14 @@ impl CoordApp {
                 *queue_len,
                 *held,
             ),
+            // #2454: right-click on a Reports result-table row. The target
+            // only ever carries `(repo, issue)` — see `reports.rs`'s
+            // `context_menu_items_for_report_row` for why that is the whole
+            // surface this menu needs.
+            ContextMenuTarget::ReportRow {
+                repo_name,
+                issue_number,
+            } => self.context_menu_items_for_report_row(repo_name, *issue_number),
             // #2287 (ms-65 §8c): right-click on a Board document tab.
             ContextMenuTarget::BoardDocTab { is_pinned, .. } => {
                 self.context_menu_items_for_board_doc_tab(*is_pinned)
@@ -5508,6 +5516,50 @@ impl CoordApp {
         }
     }
 
+    /// #2454: shared open-or-activate body for "View on Board" — the exact
+    /// mirror image of [`Self::jump_to_pipeline`], and for the same reason:
+    /// there is now more than one caller (#2016's Queue row and this issue's
+    /// Reports result row), and #1069 already showed how this logic drifts
+    /// when duplicated.
+    ///
+    /// **Why a pinned document tab and not just `select_issue`.** #2016
+    /// shipped this as a plain focus change because that was all the Board
+    /// had; #2282/#2285 then gave the Board its own document tabs, and #2449
+    /// made the symmetric "View in Pipeline" jump open-or-activate a *pinned*
+    /// Pipeline tab. Leaving this one a bare selection change would mean the
+    /// two navigation items in the very same menu behave differently — and,
+    /// worse, that jumping here silently clobbers whatever preview tab the
+    /// operator was reading. `pin: true` (not `open_preview`) is what makes
+    /// the jump land its own tab.
+    ///
+    /// `open_board_doc_tab` subsumes the old body rather than adding to it:
+    /// its `reveal_board_active_doc` already calls `select_issue`, and its
+    /// `restore_detail_sub_state` already zeroes `detail_scroll` for a
+    /// first-open document (#2285 §5) — which is what the hand-rolled
+    /// `detail_scroll = 0` used to approximate.
+    ///
+    /// Falls back to that pre-#2282 body when `(repo, issue)` names nothing
+    /// on the board: pinning a tab for a document that cannot render would
+    /// leave a dead tab the operator has to close by hand, where
+    /// `select_issue`'s existing no-op-if-not-loaded behaviour is silent and
+    /// harmless (#2016's own stated call).
+    pub(crate) fn jump_to_board(&mut self, repo_name: &str, issue_number: u64) {
+        self.switch_active_view(SidebarView::Board);
+        // The Board sidebar caches (`board_issues_cache` / `board_repo_names`)
+        // are only built by a rebuild, and a session that has never *visited*
+        // the Board has never had one — without this the lookup below (and
+        // `select_issue` behind it) would always miss. A pure re-derivation
+        // from `self.data`, so calling it here is free of side effects beyond
+        // the ones a Board keystroke already triggers.
+        self.rebuild_board_sidebar();
+        if self.board_issue_group_for(repo_name, issue_number).is_some() {
+            self.open_board_doc_tab((repo_name.to_string(), issue_number), true);
+        } else {
+            self.select_issue(repo_name, issue_number);
+            self.detail_scroll = 0;
+        }
+    }
+
     /// Render the Telescope-style issue finder overlay.
     ///
     /// Draws a centered box (~70 % wide, ~60 % tall) over `viewport` that shows:
@@ -6232,6 +6284,11 @@ impl CoordApp {
                     ContextMenuTarget::DriveQueueRow { issue_number, .. } => {
                         (*issue_number).max(0) as u64
                     }
+                    // #2454: a Reports result row's issue number is already
+                    // the resolved `u64` its `row_identity` lookup produced
+                    // (a row that couldn't resolve one never becomes a
+                    // target at all), so there is nothing to clamp.
+                    ContextMenuTarget::ReportRow { issue_number, .. } => *issue_number,
                     // #2287: the tab's own issue number, looked up by strip
                     // index (Copy isn't one of this menu's four items today,
                     // but every `ContextMenuTarget` needs a match arm here
@@ -6393,9 +6450,27 @@ impl CoordApp {
                 } = target
                 {
                     let (repo, issue) = (repo_name.clone(), (*issue_number).max(0) as u64);
-                    self.switch_active_view(SidebarView::Board);
-                    self.select_issue(&repo, issue);
-                    self.detail_scroll = 0;
+                    // #2454: through the shared `jump_to_board` now, so this
+                    // item and the Reports panel's own "View on Board" can't
+                    // drift — and so both get the pinned Board document tab
+                    // (#2282/#2285) that didn't exist when #2016 shipped.
+                    self.jump_to_board(&repo, issue);
+                }
+                true
+            }
+            // #2454: Reports result row → "View on Board". Same verb, same
+            // shared body as the Queue row's above; the only difference is
+            // where the `(repo, issue)` came from — a `ReportRow` target
+            // resolved generically through the catalogue's `row_identity`
+            // declaration, never through a `match` on which report it is.
+            "report-row-view-on-board" => {
+                if let ContextMenuTarget::ReportRow {
+                    repo_name,
+                    issue_number,
+                } = target
+                {
+                    let (repo, issue) = (repo_name.clone(), *issue_number);
+                    self.jump_to_board(&repo, issue);
                 }
                 true
             }
