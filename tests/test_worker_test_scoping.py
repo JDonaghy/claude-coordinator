@@ -124,18 +124,37 @@ def test_default_worker_command_grants_monitor_for_work_type() -> None:
         assert tool in allowed.split(",")
 
 
-@pytest.mark.parametrize("spec_type", ["review", "fix", "conflict-fix"])
+@pytest.mark.parametrize("spec_type", ["fix", "conflict-fix"])
 def test_default_worker_command_other_write_types_also_get_monitor(spec_type: str) -> None:
-    """`review`/`fix`/`conflict-fix` all fall through the same `else` branch
-    as `work` — confirm the grant isn't accidentally work-only.
+    """`fix`/`conflict-fix` both fall through the same `else` branch as
+    `work` — confirm the grant isn't accidentally work-only.
 
     `smoke` used to be in this list too, but #2301 gave it its own branch
     (see test_default_worker_command_smoke_type_withholds_monitor below) —
     smoke legs are one-shot sessions where an await-a-notification tool
-    like `Monitor` ends the session before any wake-up can arrive."""
+    like `Monitor` ends the session before any wake-up can arrive. `review`
+    was removed for the same reason by #2461 (see
+    test_default_worker_command_review_type_withholds_monitor below), plus a
+    second one: a reviewer has no legitimate mutations at all, so it no
+    longer shares the generic write-capable grant."""
     argv = default_worker_command(_work_spec(type=spec_type))
     allowed = argv[argv.index("--allowedTools") + 1]
     assert "Monitor" in allowed.split(",")
+
+
+def test_default_worker_command_review_type_withholds_monitor() -> None:
+    """#2461: a review leg reads the diff and reports a verdict — it must not
+    modify the PR's code, so no Edit/Write, and (the same #1394 reasoning as
+    `smoke` below) no `Monitor` either: a one-shot `claude -p` session that
+    calls an await-a-notification tool ends before any wake-up can arrive.
+
+    Before #2461 `review` fell through the generic `else` branch and got the
+    full `Read,Edit,Write,Bash,Monitor` work grant, with only
+    REVIEWER_SYSTEM_PROMPT's "you only review" prompt text standing between a
+    reviewer and a silent commit-and-push."""
+    argv = default_worker_command(_work_spec(type="review"))
+    allowed = argv[argv.index("--allowedTools") + 1]
+    assert allowed == "Read,Bash"
 
 
 def test_default_worker_command_smoke_type_withholds_monitor() -> None:
