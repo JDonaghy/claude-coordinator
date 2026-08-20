@@ -207,8 +207,10 @@ class ClaudeProvider(Provider):
                 # #2462: keep in sync with default_worker_command's identical
                 # catch-all branch — it covers "work", "fix", "conflict-fix"
                 # and "test-author", every one of which edits code and needs
-                # the target repo's CLAUDE.md conventions, which `--bare`
-                # below stops Claude Code from auto-discovering.
+                # the target repo's CLAUDE.md conventions. Kept as
+                # defense-in-depth alongside CLAUDE.md's own ambient
+                # auto-discovery (unaffected by `--setting-sources user`,
+                # below) even after the `--bare` emergency revert.
                 _sp += _claude_md_system_prompt_suffix(spec.repo_path)
                 # #2169: keep in sync with default_worker_command's identical
                 # branch — Monitor is the sanctioned bounded-poll tool for a
@@ -229,11 +231,16 @@ class ClaudeProvider(Provider):
             "--system-prompt", system_prompt,
             "--allowedTools", allowed_tools,
             "--permission-mode", permission_mode,
-            # #1445 / #2462: see the matching comment in
-            # default_worker_command — workers must not inherit the host
-            # checkout's project/local Claude Code settings, hooks, or
-            # .mcp.json MCP servers. `--bare` closes all of those at once.
-            "--bare",
+            # #1445: see the matching comment in default_worker_command —
+            # workers must not inherit the host checkout's project/local
+            # Claude Code settings.
+            #
+            # #2462 EMERGENCY REVERT (2026-08-20): tried `--bare` here (also
+            # closes hooks/.mcp.json), but `--bare` disables OAuth/keychain
+            # auth and this fleet authenticates headless dispatch via OAuth,
+            # not ANTHROPIC_API_KEY — broke every dispatch fleet-wide within
+            # the hour. See the longer comment in default_worker_command.
+            "--setting-sources", "user",
         ]
         if effective_model:
             argv.extend(["--model", effective_model])

@@ -187,7 +187,7 @@ def test_parity_custom_system_prompt() -> None:
     _parity(spec)
 
 
-# ── #2462: CLAUDE.md embed parity (--bare kills auto-discovery) ──────────────
+# ── #2462: CLAUDE.md embed parity ─────────────────────────────────────────────
 #
 # The parity helper above uses repo_path="/some/path", which does not exist —
 # so `_claude_md_system_prompt_suffix` returns "" on BOTH sides and the parity
@@ -198,6 +198,11 @@ def test_parity_custom_system_prompt() -> None:
 # path production dispatch really takes (coord/commands/dispatch_workers.py
 # and friends call provider.build_command(), never default_worker_command) —
 # so "both sides dropped the embed" fails too, not just "they diverged".
+#
+# #2462 originally added this embed to compensate for `--bare` disabling
+# CLAUDE.md's own ambient auto-discovery; `--bare` was reverted same-day
+# (broke OAuth/keychain auth fleet-wide, see default_worker_command's
+# comment), but the embed is kept as defense-in-depth.
 
 
 def _claude_md_repo(tmp_path: Path, body: str) -> Path:
@@ -245,10 +250,11 @@ def test_build_command_embeds_claude_md_for_work_shaped_types(
 ) -> None:
     """#2462: the provider seam — the path real dispatch takes — must embed
     the target repo's CLAUDE.md into --system-prompt for every work-shaped
-    leg, since `--bare` disables Claude Code's own auto-discovery of it."""
+    leg, as defense-in-depth alongside CLAUDE.md's own ambient
+    auto-discovery."""
     repo = _claude_md_repo(tmp_path, f"# Project rules\n\n{rule}\n")
     argv = ClaudeProvider().build_command(_make_spec(type=spec_type, repo_path=str(repo)))
-    assert "--bare" in argv
+    assert "--setting-sources" in argv
     system_prompt = argv[argv.index("--system-prompt") + 1]
     assert rule in system_prompt
     assert "Project rules (from CLAUDE.md)" in system_prompt
