@@ -1640,6 +1640,14 @@ class HealthConfig:
     # altogether, not just missed a tick or two — 3 hours, ~18 missed fires
     # in a row at the 10-minute cadence.
     webapp_build_heartbeat_crit_minutes: float = 180.0
+    # Root of a local `coord-web` checkout, whose CI workflow YAML names the
+    # `coord` this fleet's frontend is proven against (#2006, epic #2002).
+    # None → discover it from `repo_paths`/`ctx.checkouts` (a checkout named
+    # `coord-web`, else one carrying `playwright.acceptance.config.ts` at its
+    # root).  Same convention as the lanes above: None means "discover it",
+    # never "disable the lane" — see
+    # `coord.health.checks.coord_web_ci_pin` and docs/ADR_COORD_WEB_CI.md.
+    coord_web_checkout: str | None = None
 
     # ── systemd unit-file drift (#1831) ────────────────────────────────────
     # `deploy/*.service`/`*.timer` is version-controlled and reviewed but
@@ -2975,6 +2983,7 @@ _HEALTH_OPT_STR_FIELDS: tuple[str, ...] = (
     "webapp_dist_path",
     "webapp_source_dir",
     "webapp_build_heartbeat_path",
+    "coord_web_checkout",
 )
 # Pairs that must not be inverted.  A config where warn is stricter than crit
 # silently makes the crit level unreachable — the check keeps reporting WARN
