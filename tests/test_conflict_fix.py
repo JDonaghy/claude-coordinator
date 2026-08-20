@@ -111,6 +111,21 @@ class TestClassifyConflict:
     def test_human(self, msg: str) -> None:
         assert classify_conflict(msg) == "human"
 
+    def test_branch_policy_block_is_human_not_rebaseable(self) -> None:
+        """#2475: GitHub's wording when a required status check can never
+        report (its source CI job was deleted while still required) also
+        contains "not mergeable" — a _REBASEABLE_SIGNALS entry — so without
+        a specific _HUMAN_SIGNALS match this fell through and was
+        misclassified "rebaseable", dispatching a conflict-fix worker that
+        could never succeed (#2009's 38-turn thrash: 38 dispatches over ~7
+        hours before a human intervened).
+        """
+        msg = (
+            "Pull request #2471 is not mergeable: the base branch policy "
+            "prohibits the merge."
+        )
+        assert classify_conflict(msg) == "human"
+
     def test_unknown(self) -> None:
         assert classify_conflict("some other error") == "unknown"
         assert classify_conflict("") == "unknown"
@@ -445,6 +460,38 @@ class TestDispatch:
         )
         assert len(client.calls) == 1, "HTTP should have been called"
 
+    def test_retry_cap_blocks_when_done_fix_precedes_identical_error(
+        self, two_machine_config: Config, coord_db,
+    ) -> None:
+        """#2475: a `done` conflict-fix that is immediately followed by the
+        SAME merge failure text must consume the retry cap — the worker
+        found nothing to rebase (no real content conflict), so a second
+        dispatch would just repeat the same no-op forever (#2009's 38-turn
+        thrash)."""
+        board = Board()
+        first_client = _FakeHTTPClient({"id": "prev-fix"})
+        first = dispatch_conflict_fix(
+            _entry(), board, two_machine_config,
+            http_client=first_client, prefer_machine="laptop",
+        )
+        assert first is not None
+        # Simulate the worker finishing successfully and the merge queue
+        # retrying — same entry, same error (nothing was actually fixed).
+        board.active.remove(first)
+        first.status = "done"
+        board.completed.append(first)
+
+        second_client = _FakeHTTPClient({"id": "would-not-fire"})
+        result = dispatch_conflict_fix(
+            _entry(), board, two_machine_config,
+            http_client=second_client, prefer_machine="laptop",
+        )
+        assert result is None
+        assert second_client.calls == [], (
+            "HTTP should not be called when the identical failure recurs "
+            "after a done conflict-fix"
+        )
+
 
 class TestHasPriorConflictFix:
     """Cover the retry-cap predicate directly so the cli.py guard is exercised."""
@@ -486,6 +533,53 @@ class TestHasPriorConflictFix:
             status="done",
         ))
         assert has_prior_conflict_fix(board, "abc123") is False
+
+    def test_false_when_successful_fix_precedes_a_different_error(self) -> None:
+        """#2475: passing `current_error` doesn't change the #784 outcome
+        when the new failure is genuinely different — only an IDENTICAL
+        recurrence should consume the cap."""
+        from coord.conflict_fix import has_prior_conflict_fix
+        board = Board()
+        board.completed.append(Assignment(
+            machine_name="m", repo_name="api", issue_number=1, issue_title="x",
+            type="conflict-fix", review_of_assignment_id="abc123",
+            status="done",
+            briefing="# Conflict fix\nReason: Merge conflict in foo.py\n",
+        ))
+        assert has_prior_conflict_fix(
+            board, "abc123", current_error="Merge conflict in bar.py",
+        ) is False
+
+    def test_true_when_successful_fix_precedes_the_identical_error(self) -> None:
+        """#2475: a `done` conflict-fix whose worker found nothing to
+        rebase (because the real blocker was never a content conflict —
+        e.g. a permanent branch-policy block, #2009) is followed by the
+        merge queue retrying into the SAME failure text. That is not a
+        fresh conflict (#784's carve-out), so it now consumes the retry cap
+        just like a genuine failure would — otherwise the queue loops
+        forever dispatching conflict-fix workers that can never help.
+        """
+        from coord.conflict_fix import has_prior_conflict_fix
+        board = Board()
+        board.completed.append(Assignment(
+            machine_name="m", repo_name="api", issue_number=1, issue_title="x",
+            type="conflict-fix", review_of_assignment_id="abc123",
+            status="done",
+            briefing=(
+                "# Conflict fix: acme/api branch `issue-1-fix`\n\n"
+                "The merge of `issue-1-fix` → `main` failed.\n"
+                "Reason: Pull request #2471 is not mergeable: the base "
+                "branch policy prohibits the merge.\n"
+            ),
+        ))
+        assert has_prior_conflict_fix(
+            board,
+            "abc123",
+            current_error=(
+                "Pull request #2471 is not mergeable: the base branch "
+                "policy prohibits the merge."
+            ),
+        ) is True
 
     def test_ignores_non_conflict_fix_types(self) -> None:
         from coord.conflict_fix import has_prior_conflict_fix

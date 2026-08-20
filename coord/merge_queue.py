@@ -93,6 +93,18 @@ _HUMAN_SIGNALS = (
     "permission",
     "protected branch",
     "branch protection",
+    # #2475: GitHub's wording when a required status check can never report
+    # — e.g. its source CI job was deleted from the workflow while the
+    # check was still required in branch protection. This is a *permanent*
+    # block; no rebase or content change fixes it. The full message is
+    # something like "Pull request X is not mergeable: the base branch
+    # policy prohibits the merge.", which also contains "not mergeable" —
+    # a _REBASEABLE_SIGNALS entry — so without this specific phrase here,
+    # classify_conflict fell through past _HUMAN_SIGNALS (no match) to
+    # _REBASEABLE_SIGNALS's generic "not mergeable" match and misclassified
+    # the failure as "rebaseable", dispatching a conflict-fix worker that
+    # could never succeed (#2009's 38-turn thrash).
+    "policy prohibits the merge",
 )
 
 

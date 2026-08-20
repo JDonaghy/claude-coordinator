@@ -367,7 +367,32 @@ def _has_active_conflict_fix(board: Board, merge_entry_id: str | None) -> bool:
     )
 
 
-def has_prior_conflict_fix(board: Board, merge_entry_id: str | None) -> bool:
+def _dispatched_error(assignment: Assignment) -> str | None:
+    """The merge-failure text *assignment*'s briefing was built from.
+
+    ``build_conflict_fix_briefing``/``build_semantic_conflict_briefing``
+    both embed the triggering ``QueuedMerge.error`` verbatim (as a
+    ``"Reason: …"``/``"Last merge error: …"`` line) — that's the only durable
+    record of what the merge looked like *at dispatch time*, since
+    ``on_conflict_fix_done`` clears ``entry.error`` back to ``None`` on
+    success before the merge is retried. Returns ``None`` when the briefing
+    doesn't carry either marker (e.g. a hand-built test ``Assignment``).
+    """
+    briefing = assignment.briefing or ""
+    for line in briefing.splitlines():
+        if line.startswith("Reason: "):
+            return line[len("Reason: "):]
+        if line.startswith("Last merge error: "):
+            return line[len("Last merge error: "):]
+    return None
+
+
+def has_prior_conflict_fix(
+    board: Board,
+    merge_entry_id: str | None,
+    *,
+    current_error: str | None = None,
+) -> bool:
     """True when a second conflict-fix dispatch for *merge_entry_id* is blocked.
 
     Blocks when a conflict-fix is **active** (running/pending — don't spawn a
@@ -379,6 +404,18 @@ def has_prior_conflict_fix(board: Board, merge_entry_id: str | None) -> bool:
     followed by a new conflict if other PRs merged in the meantime; that is a
     fresh situation and warrants a fresh fix attempt.  Only actual failures
     consume the one-per-entry cap.
+
+    #2475: that "successful" carve-out assumed a ``done`` conflict-fix always
+    resolved *something*. It doesn't when the merge was never blocked by a
+    content conflict in the first place (e.g. a permanently-unmergeable
+    branch-protection state) — the worker finds nothing to rebase, exits
+    ``done``, and the merge queue retries into the *identical* failure
+    forever (#2009's 38-turn thrash). When *current_error* is given and a
+    prior ``done`` conflict-fix's dispatch-time error
+    (:func:`_dispatched_error`) matches it exactly, that's the same blocker
+    recurring unchanged — not a fresh conflict — so it now consumes the cap
+    too. Callers that don't pass *current_error* keep the pre-#2475 behaviour
+    (``done`` never blocks) since they have no error text to compare.
     """
     if merge_entry_id is None:
         return False
@@ -393,9 +430,16 @@ def has_prior_conflict_fix(board: Board, merge_entry_id: str | None) -> bool:
         # Genuine failure — retry cap consumed, surface to human.
         if a.status in ("failed", "advisory"):
             return True
-        # "done" = successful rebase → cap not consumed; a re-conflict is new.
-        # "cancelled" falls through here too — a cancelled attempt did no work,
-        # so it is treated the same as "done": re-dispatch is allowed.
+        if a.status == "done":
+            if current_error is not None and _dispatched_error(a) == current_error:
+                # Same failure text recurring after a "successful" fix means
+                # nothing was actually fixed — treat like a genuine failure.
+                return True
+            # Otherwise: successful rebase, different (or unknown) situation
+            # now → cap not consumed; a re-conflict is new.
+        # "cancelled" falls through here too — a cancelled attempt did no
+        # work, so it is treated the same as an unrelated "done": re-dispatch
+        # is allowed.
     return False
 
 
@@ -463,7 +507,10 @@ def dispatch_conflict_fix(
     the caller marks the entry ``HUMAN_REQUIRED``.  A ``done`` (successful)
     conflict-fix does *not* block a new dispatch — a successful rebase can be
     followed by a fresh conflict if other PRs merged in the meantime, and that
-    warrants a new attempt rather than an immediate human escalation (#784).
+    warrants a new attempt rather than an immediate human escalation (#784) —
+    UNLESS (#2475) *entry.error* is identical to the error the prior ``done``
+    attempt was dispatched for, which means the merge failed the same way
+    again with nothing actually fixed; see :func:`has_prior_conflict_fix`.
 
     ``semantic=True`` (#1291) dispatches the escalated second attempt: a
     different, less prescriptive briefing (see
@@ -481,7 +528,9 @@ def dispatch_conflict_fix(
             return None
         if _has_active_conflict_fix(board, entry.assignment_id):
             return None
-    elif has_prior_conflict_fix(board, entry.assignment_id):
+    elif has_prior_conflict_fix(
+        board, entry.assignment_id, current_error=entry.error,
+    ):
         return None
 
     repo = config.repo(entry.repo_name)
