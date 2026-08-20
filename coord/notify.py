@@ -1822,6 +1822,136 @@ def _smoke_worker_verdict(
 NO_SMOKE_VERDICT_MARKER = _NO_SMOKE_VERDICT_MARKER
 
 
+def _run_pass_confirmation(transition: Transition, entry: dict):
+    """#2464: independently re-run the repo's real build+test for this branch.
+
+    Returns a :class:`coord.confirm_test.ConfirmationResult`, or ``None`` when
+    the confirmation is switched off or could not even be attempted. ``None``
+    and an *inconclusive* result mean the same thing to every caller — fall
+    back to the worker's own claim — but they are distinguished here so the log
+    line can say which happened.
+
+    Every failure path returns ``None`` rather than raising. This runs inside
+    the reap loop, and an exception here would abandon the whole transition
+    (leaving the row unnotified and the parent's ``test_state`` at
+    ``"running"`` forever, which is the #1598 stranding shape). A confirmation
+    that cannot run must degrade to pre-#2464 behaviour, never break the reap.
+    """
+    from coord.confirm_test import confirm_branch, confirmation_enabled  # noqa: PLC0415
+
+    try:
+        from coord.config import load as _load_config  # noqa: PLC0415
+
+        config = _load_config()
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "smoke %s: could not load config to confirm the pass claim (%s) — "
+            "falling back to the worker's own claim (#2464).",
+            transition.assignment_id, exc,
+        )
+        return None
+
+    if not confirmation_enabled(config):
+        log.info(
+            "smoke %s: Test-verdict confirmation is disabled — recording the "
+            "worker's own claim unchecked (#2464).",
+            transition.assignment_id,
+        )
+        return None
+
+    branch = entry.get("branch")
+    log.info(
+        "smoke %s: independently re-running %s's build+test at origin/%s to "
+        "confirm the pass claim (#2464).",
+        transition.assignment_id, transition.repo_name, branch,
+    )
+    try:
+        return confirm_branch(transition.repo_name, branch, config)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "smoke %s: confirmation run raised (%s) — falling back to the "
+            "worker's own claim (#2464).",
+            transition.assignment_id, exc,
+        )
+        return None
+
+
+def _confirmed_pass_verdict(
+    transition: Transition, entry: dict, *, claim_reason: str,
+) -> tuple[str, str]:
+    """#2464: the ``(test_state, test_reason)`` to record for a *claimed* pass.
+
+    The Test stage's pass claim — whether it arrived as a ``SMOKE: pass``
+    marker or as the worker calling ``coord test --passed`` on itself (#2217) —
+    is a self-report by the thing being graded. This turns it into an
+    observation by re-running the repo's own build/test command out-of-band and
+    reading the real exit code (:mod:`coord.confirm_test`).
+
+    Four outcomes, and note that only ONE of them is a downgrade:
+
+    * **refuted** — a command ran to completion and returned nonzero. The claim
+      was wrong; record ``failed``. This is the arm #2464 exists for.
+    * **baseline-red** — it failed identically on the merge-base, so the branch
+      is not at fault. ``skipped``, matching #2170's existing convention: the
+      merge gate treats it as satisfied and no fix round is burned.
+    * **confirmed** — record ``passed``, now backed by a real run.
+    * **inconclusive / unavailable** — record ``passed`` exactly as before
+      #2464, with ``UNCONFIRMED`` in the reason so the row says plainly that
+      nobody checked. See :mod:`coord.confirm_test` on why a missing toolchain,
+      a missing checkout or a timeout must never read as a failing branch.
+    """
+    result = _run_pass_confirmation(transition, entry)
+
+    if result is None:
+        return (
+            "passed",
+            f"{claim_reason} — UNCONFIRMED: no independent re-run was possible "
+            "on this machine, so this verdict rests on the worker's own report "
+            "(#2464).",
+        )
+
+    if result.refuted:
+        log.warning(
+            "smoke %s: REFUTED the pass claim for %s — %s\n%s",
+            transition.assignment_id, transition.repo_name, result.reason,
+            result.output,
+        )
+        return (
+            "failed",
+            f"REFUTED by an independent re-run (#2464): {result.reason}. The "
+            f"Test-stage worker claimed a pass ({claim_reason}), but re-running "
+            "the repo's own command out-of-band disagreed — trust the run, not "
+            "the report.",
+        )
+
+    if result.baseline_red:
+        log.warning(
+            "smoke %s: confirmation says the BASELINE is red for %s — %s",
+            transition.assignment_id, transition.repo_name, result.reason,
+        )
+        return (
+            "skipped",
+            f"baseline-red (#2170), found by an independent re-run (#2464): "
+            f"{result.reason}",
+        )
+
+    if result.confirmed:
+        return (
+            "passed",
+            f"{claim_reason} — independently confirmed (#2464): {result.reason}",
+        )
+
+    log.warning(
+        "smoke %s: confirmation was INCONCLUSIVE for %s (%s) — recording the "
+        "worker's own claim (#2464).",
+        transition.assignment_id, transition.repo_name, result.reason,
+    )
+    return (
+        "passed",
+        f"{claim_reason} — UNCONFIRMED: {result.reason}",
+    )
+
+
 def _record_smoke_verdict(
     transition: Transition, entry: dict, parent_id: str,
 ) -> None:
@@ -1867,6 +1997,33 @@ def _record_smoke_verdict(
 
     current_state = load_assignment_test_state(parent_id)
     if current_state in ("passed", "failed", "skipped"):
+        if current_state == "passed":
+            # #2464: a self-recorded `passed` is the STRONGEST form of the
+            # defect, not an exception to it — the worker graded its own work
+            # and wrote the grade straight to the row. #2217 called that write
+            # authoritative, and it stays authoritative against everything
+            # except an actual contradicting run: the only thing permitted to
+            # overturn it here is the repo's own build/test command, executed
+            # out-of-band, exiting nonzero. Skipping this branch would leave
+            # the common case unguarded, since `build_smoke_briefing` tells
+            # every smoke worker to self-record exactly this way.
+            state, reason = _confirmed_pass_verdict(
+                transition, entry,
+                claim_reason="worker self-recorded via `coord test` (#2217)",
+            )
+            if state != "passed":
+                record_test_verdict(
+                    assignment_id=parent_id,
+                    test_state=state,
+                    test_reason=reason,
+                )
+                log.warning(
+                    "smoke %s: overturned parent %s's self-recorded "
+                    "test_state='passed' to %r on independent evidence "
+                    "(#2464).",
+                    transition.assignment_id, parent_id, state,
+                )
+                return
         log.info(
             "smoke %s: parent %s already carries an authoritative test_state="
             "%r (the worker recorded it via `coord test`, #2217) — leaving it "
@@ -1912,10 +2069,20 @@ def _record_smoke_verdict(
         return
 
     if verdict is not None and verdict.kind == "pass":
+        # #2464: `SMOKE: pass` is a line the worker chose to print, not a
+        # suite result. #2244 made the ACCIDENTAL version of a wrong pass less
+        # likely by reading the marker instead of the meaningless `claude -p`
+        # exit code, but the channel underneath is still self-report — nothing
+        # stopped a worker printing it after a partial or backgrounded run it
+        # never finished polling (#2272/#2301). Confirm it against a real run
+        # before it becomes a merge-gate-satisfying verdict.
+        state, reason = _confirmed_pass_verdict(
+            transition, entry, claim_reason="headless smoke reported SMOKE: pass",
+        )
         record_test_verdict(
             assignment_id=parent_id,
-            test_state="passed",
-            test_reason="headless smoke",
+            test_state=state,
+            test_reason=reason,
         )
         return
 
