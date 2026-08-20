@@ -201,6 +201,18 @@ The operator-side counterparts to these rules (dispatch economics, what to send 
 versus keep in the coordinator session) are in
 [`docs/COST_DISCIPLINE.md`](docs/COST_DISCIPLINE.md).
 
+## Rules for the coordinator session
+
+- **Prefer `coord issue` / `coord repo` / `coord milestone` over raw `gh`.** Workers can't reach
+  `gh` at all (deny-listed, above); an interactive coordinator session technically can, but should
+  still route issue/PR/milestone reads and writes through the `coord` seam wherever a subcommand
+  covers it — that's what keeps the backend-agnostic forge seam
+  ([`docs/FORGE_MIGRATION.md`](docs/FORGE_MIGRATION.md)) actually exercised instead of quietly
+  bypassed by the one class of session most likely to reach for `gh` out of habit. Where no `coord`
+  subcommand covers what's needed — a real gap as of 2026-08 (e.g. #2484: `coord issue` has no
+  `list`/`view`) — falling back to `gh` for that one read is fine, but say so and treat it as a gap
+  to flag or file, not a silent workaround.
+
 ## Testing — black-box coverage is the acceptance bar
 
 **Every PR that changes user-visible behavior must ship a black-box test** that drives the *running app* and asserts on its rendered output — not just unit tests on internal functions. The adversarial reviewer reads this file and **rejects behavior-changing PRs that lack one** (pure refactors / internal-only changes are exempt — say so in the PR if that applies). Build the **harness once per repo**; add **tests incrementally, one (or a few) per behavior-changing issue** — do *not* big-bang a full suite. Coverage then grows with churn and ratchets up (PRs add coverage, never remove it). Keep a thin **core smoke set** over the few most-trafficked screens so critical flows stay guarded even by unrelated changes.
