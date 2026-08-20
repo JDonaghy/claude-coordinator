@@ -98,6 +98,13 @@ use quadraui::{
     DualModePaletteController, DualModePaletteEvent, HelpAction, HelpNote, HelpOverlayController,
     HelpOverlayEvent, HelpRegistry, ViewHelp, filter_help_actions, help_actions_to_palette_items,
     PALETTE_CHROME_ROWS,
+    // #2288 (ms-65 §9): the side-by-side pane split. `SplitTreeLayout` is
+    // the geometry both the paint (`paint_board_pane_dividers`) and the
+    // click/drag hit-test (`board_split_pane_at`) consume — one layout, per
+    // quadraui's own "avoiding the vimcode drift bug class" note.
+    // `TextDisplay` is how the `║` divider column is painted (see that
+    // function's doc comment for why not `draw_split_tree`).
+    SplitTreeLayout, TextDisplay, TextDisplayLine,
 };
 use quadraui::terminal_engine::TerminalMouseKind;
 
@@ -156,7 +163,8 @@ pub(crate) mod doc_tabs;
 #[allow(unused_imports)]
 use self::doc_tabs::{
     doc_tab_label, resolve_doc_tab_click, DetailSubState, DocKey, DocTabs, PanelScope,
-    TabClickKind, SCROLL_LEFT_MARKER, SCROLL_RIGHT_MARKER,
+    TabClickKind, DOC_TAB_LABEL_COLS, PANE_DIVIDER_CHAR, SCROLL_LEFT_MARKER, SCROLL_RIGHT_MARKER,
+    SPLIT_DOC_TAB_LABEL_COLS,
 };
 #[allow(unused_imports)]
 use self::types::*;
@@ -2082,6 +2090,46 @@ pub struct CoordApp {
     /// panel behaves exactly as it did pre-ms-65: no strip row is rendered
     /// and selection-follows-tree is restored.
     doc_tabs: DocTabs,
+    /// #2288 (ms-65 §9): which pane of the active scope's `PaneSet` the
+    /// per-pane readers (`board_doc_tabs`, `board_pane_detail_tab`,
+    /// `board_pane_detail_scroll`) currently resolve against.
+    ///
+    /// `None` — the value outside a paint, and the only value any event
+    /// handler ever observes — means "the focused pane", which is what
+    /// every mutation path acts on anyway. `render_content` sets it to
+    /// `Some(i)` around each pane it paints so the ~150 existing `&self`
+    /// readers that derive the detail pane from the active document
+    /// (`board_detail_issue_group` → `detail_list` → …) follow the pane
+    /// being painted instead of the focused one, and clears it again
+    /// immediately afterwards.
+    ///
+    /// A `Cell` for the same reason `last_main_visible_rows` and
+    /// `last_issue_panel_cols` are: `ShellApp::render_content` takes
+    /// `&self`, so per-frame paint cursors cannot be plain fields.
+    render_pane: std::cell::Cell<Option<usize>>,
+    /// #2288 (ms-65 §9): an in-progress divider drag on the Board panel's
+    /// split. Set by a `MouseDown` on the divider column, consumed by
+    /// `MouseMoved`, cleared on `MouseUp` — the same shape as
+    /// `queue_split_drag` (#2017).
+    board_split_drag: bool,
+    /// #2288 (ms-65 §9): the pane rects and divider geometry the last Board
+    /// paint resolved from `PaneSet::split_tree`, in screen coordinates.
+    ///
+    /// Cached rather than recomputed in the event handler for the reason
+    /// quadraui's `SplitTree` docs give (the vimcode #582/#452 paint/click
+    /// drift bug class): hit-testing must consume *the same* layout the
+    /// paint consumed, never a second derivation of it.
+    board_split_layout: std::cell::RefCell<Option<quadraui::SplitTreeLayout>>,
+    /// #2288 (ms-65 §9): armed by a `Ctrl-W` on the Board panel, consumed
+    /// by the very next key press.
+    ///
+    /// `Some(undo)` means "a §9 pane chord may be completing right now".
+    /// `undo` is the state §4's bare-`Ctrl-W` close already applied and
+    /// which the chord must retract (`None` when the `Ctrl-W` closed
+    /// nothing — no tab was open — and so has nothing to undo). See
+    /// `events.rs::resolve_board_pane_chord` for why the close is
+    /// speculative rather than deferred.
+    board_pane_chord: Option<Option<BoardPaneChordUndo>>,
     /// #2282 (ms-65 §2f): row shape of the last `rebuild_board_sidebar` pass,
     /// indexed by sidebar section — for every emitted row, its `TreePath` and
     /// whether it is a `Decoration::Header` row (which quadraui's MSV measures
@@ -2636,6 +2684,24 @@ pub struct CoordApp {
     /// called on each render.  Defaults to 120.  Used by `issue_body_list` to
     /// word-wrap long lines to the viewport width (#669).
     last_issue_panel_cols: std::cell::Cell<usize>,
+    /// #2288 (ms-65 §9): the Board panel's Issue sub-tab content width, in
+    /// backend units, **per pane** — entry `i` is the width pane `i` last
+    /// painted its Issue body at.
+    ///
+    /// A single shared `Cell` (`last_issue_panel_cols`) cannot express this
+    /// once the panel can hold two panes at once: `render_content` paints
+    /// both, so the second-painted pane's width would overwrite the first's
+    /// and outlive the frame, and `mouse_main_scroll` — which reads
+    /// `board_issue_body_list().items.len()` to clamp the wheel — would
+    /// word-wrap at the *other* pane's width and clamp to a line count that
+    /// never appeared on screen. Indexing by pane keeps each pane's wrap
+    /// width its own, and leaves `last_issue_panel_cols` to the Pipeline
+    /// panel, which is still single-pane.
+    ///
+    /// Empty (or a `0` entry) means "this pane has not painted its Issue
+    /// body yet", which falls back to `last_issue_panel_cols` so a
+    /// never-painted fixture keeps the 120-column default it always had.
+    board_pane_issue_cols: std::cell::RefCell<Vec<usize>>,
     /// Minimum age in days for a done/failed assignment row to be eligible
     /// for the 'P' purge action.  Default 7.
     ///
@@ -3753,6 +3819,10 @@ impl CoordApp {
             board_epic_expanded: std::collections::HashMap::new(),
             board_epic_row_keys: std::collections::HashMap::new(),
             doc_tabs: DocTabs::load(),
+            render_pane: std::cell::Cell::new(None),
+            board_split_drag: false,
+            board_split_layout: std::cell::RefCell::new(None),
+            board_pane_chord: None,
             board_section_rows: Vec::new(),
             board_tree_hidden_above: std::collections::HashMap::new(),
             last_sidebar_geom: std::cell::Cell::new(None),
@@ -3845,6 +3915,7 @@ impl CoordApp {
             last_main_visible_rows: std::cell::Cell::new(40),
             last_log_panel_cols: std::cell::Cell::new(120),
             last_issue_panel_cols: std::cell::Cell::new(120),
+            board_pane_issue_cols: std::cell::RefCell::new(Vec::new()),
             purge_days: 7,
             sidebar_action_bar_hover: ToolbarHoverTracker::new(),
             panel_toolbar_hover: ToolbarHoverTracker::new(),
@@ -7044,8 +7115,213 @@ impl CoordApp {
     // ── #2282 (ms-65 §2): Board document tabs ────────────────────────────
 
     /// The Board panel's document-tab set.
+    ///
+    /// #2288 (§9): the *currently-addressed* pane's set — the pane being
+    /// painted during a render pass, the focused pane everywhere else (see
+    /// [`Self::board_render_pane`]). Unsplit, there is only one pane and
+    /// this is exactly what it was before the split existed.
     fn board_doc_tabs(&self) -> &doc_tabs::DocTabGroup {
-        self.doc_tabs.group(PanelScope::Board)
+        self.doc_tabs
+            .panes(PanelScope::Board)
+            .pane(self.board_render_pane())
+    }
+
+    /// #2288 (ms-65 §9): the Board pane index the `&self` readers resolve
+    /// against — `render_pane` while a pane is being painted, otherwise the
+    /// focused pane.
+    pub(crate) fn board_render_pane(&self) -> usize {
+        self.render_pane
+            .get()
+            .unwrap_or_else(|| self.doc_tabs.panes(PanelScope::Board).focused_index())
+    }
+
+    /// #2288 (ms-65 §9): the Board panel's panes + split geometry.
+    pub(crate) fn board_panes(&self) -> &doc_tabs::PaneSet {
+        self.doc_tabs.panes(PanelScope::Board)
+    }
+
+    /// The sub-tab (`Board` / `Issue` / `Chat` / `Terminal`) the
+    /// currently-addressed pane shows.
+    ///
+    /// #2285 keeps the *live* `board_detail_tab` field as the focused
+    /// document's working copy and banks every other document's value in
+    /// its `DetailSubState`. A background pane's active document is by
+    /// definition not the live one, so its sub-tab has to be read back out
+    /// of that record (defaulting exactly as #2285's "defaults on open
+    /// match today's defaults" clause says).
+    pub(crate) fn board_pane_detail_tab(&self) -> BoardDetailTab {
+        match self.board_pane_sub_state() {
+            Some(state) => state.board_tab,
+            None => self.board_detail_tab,
+        }
+    }
+
+    /// The body scroll offset of the currently-addressed pane — the
+    /// [`Self::board_pane_detail_tab`] rule applied to `detail_scroll`.
+    pub(crate) fn board_pane_detail_scroll(&self) -> usize {
+        match self.board_pane_sub_state() {
+            Some(state) => state.scroll,
+            None => self.detail_scroll,
+        }
+    }
+
+    /// Write `pane` scroll offset back, wherever that pane keeps it.
+    ///
+    /// The mirror of [`Self::board_pane_detail_scroll`]: the focused pane's
+    /// offset is the live `detail_scroll` field, every other pane's is
+    /// banked in its active document's [`DetailSubState`]. A pane holding no
+    /// document has nowhere to put it — and nothing on screen to scroll — so
+    /// that case is a deliberate no-op.
+    pub(crate) fn set_board_pane_detail_scroll(&mut self, pane: usize, scroll: usize) {
+        let panes = self.doc_tabs.panes(PanelScope::Board);
+        if pane >= panes.len() || pane == panes.focused_index() {
+            self.detail_scroll = scroll;
+            return;
+        }
+        let group = panes.pane(pane);
+        let Some(key) = group.active_key().cloned() else {
+            return;
+        };
+        let mut state = group.sub_state(&key).cloned().unwrap_or_default();
+        state.scroll = scroll;
+        self.doc_tabs
+            .panes_mut(PanelScope::Board)
+            .pane_mut(pane)
+            .set_sub_state(key, state);
+    }
+
+    /// #2288 (ms-65 §9): stash the Issue sub-tab content width for the pane
+    /// currently being painted — see [`Self::board_pane_issue_cols`].
+    pub(crate) fn stash_board_pane_issue_cols(&self, cols: usize) {
+        let idx = self.board_render_pane();
+        let mut widths = self.board_pane_issue_cols.borrow_mut();
+        if widths.len() <= idx {
+            widths.resize(idx + 1, 0);
+        }
+        widths[idx] = cols;
+    }
+
+    /// #2288 (ms-65 §9): the word-wrap width `board_issue_body_list` must
+    /// use — the *addressed* pane's own last painted width, never whichever
+    /// pane happened to paint last.
+    pub(crate) fn board_issue_wrap_cols(&self) -> usize {
+        let idx = self.board_render_pane();
+        self.board_pane_issue_cols
+            .borrow()
+            .get(idx)
+            .copied()
+            .filter(|cols| *cols > 0)
+            .unwrap_or_else(|| self.last_issue_panel_cols.get())
+    }
+
+    /// Drop stashed Issue widths for panes that no longer exist, so a pane
+    /// index recycled by a later `Ctrl-W v` never inherits the width the
+    /// pane that used to live there painted at.
+    pub(crate) fn truncate_board_pane_issue_cols(&self, panes: usize) {
+        self.board_pane_issue_cols.borrow_mut().truncate(panes);
+    }
+
+    /// The banked sub-state of the addressed pane's active document, or
+    /// `None` when that pane IS the focused one (whose values live in the
+    /// `CoordApp` fields) or holds no document at all.
+    fn board_pane_sub_state(&self) -> Option<DetailSubState> {
+        let panes = self.doc_tabs.panes(PanelScope::Board);
+        let idx = self.board_render_pane();
+        if idx == panes.focused_index() {
+            return None;
+        }
+        let group = panes.pane(idx);
+        let key = group.active_key()?;
+        Some(group.sub_state(key).cloned().unwrap_or_default())
+    }
+
+    // ── #2288 (ms-65 §9): pane verbs ─────────────────────────────────────
+    //
+    // Every one of these funnels through `PaneSet`, checkpointing the live
+    // detail sub-state first and restoring it afterwards for exactly the
+    // reason #2285's tab switches do: the focused pane's active document
+    // owns `board_detail_tab` / `detail_scroll` as its working copy, so
+    // moving focus between panes is a document switch and has to bank the
+    // outgoing document's values before the incoming one's are loaded.
+
+    /// `Ctrl-W v` — split the focused Board pane right (contract §9).
+    ///
+    /// The new pane is empty and takes focus, so the next single click from
+    /// the sidebar opens its preview *there* and leaves the original pane's
+    /// preview untouched — §9's independence clause.
+    fn split_board_pane_right(&mut self) -> bool {
+        self.checkpoint_detail_sub_state(PanelScope::Board);
+        if !self.doc_tabs.panes_mut(PanelScope::Board).split_focused() {
+            return false;
+        }
+        self.restore_detail_sub_state(PanelScope::Board);
+        true
+    }
+
+    /// `Ctrl-W w` — move focus to the next Board pane, wrapping. A no-op
+    /// with one pane.
+    fn focus_next_board_pane(&mut self) -> bool {
+        self.checkpoint_detail_sub_state(PanelScope::Board);
+        if !self.doc_tabs.panes_mut(PanelScope::Board).focus_next() {
+            return false;
+        }
+        self.reveal_board_active_doc();
+        self.restore_detail_sub_state(PanelScope::Board);
+        true
+    }
+
+    /// `Ctrl-W x` — close the focused Board pane (contract §9). A **no-op
+    /// at one pane**: "a scope always has ≥1 pane".
+    fn close_focused_board_pane(&mut self) -> bool {
+        // No checkpoint: the closed pane's documents (and their sub-state)
+        // are discarded, exactly as closing their tabs one by one would
+        // discard them — the same rule `close_board_doc_tab` follows.
+        if !self
+            .doc_tabs
+            .panes_mut(PanelScope::Board)
+            .close_focused_pane()
+        {
+            return false;
+        }
+        self.reveal_board_active_doc();
+        self.restore_detail_sub_state(PanelScope::Board);
+        self.persist_doc_tabs();
+        true
+    }
+
+    /// Focus the Board pane at `idx` — a click landing inside it. Returns
+    /// `true` when focus actually moved.
+    ///
+    /// Every main-panel click routes through here, so the "already focused"
+    /// case (which is *every* click on an unsplit panel) is rejected before
+    /// the checkpoint rather than after it: banking the live sub-state on a
+    /// click that changes no document would be pure work.
+    fn focus_board_pane(&mut self, idx: usize) -> bool {
+        if self.board_panes().focused_index() == idx {
+            return false;
+        }
+        self.checkpoint_detail_sub_state(PanelScope::Board);
+        if !self.doc_tabs.panes_mut(PanelScope::Board).set_focused(idx) {
+            return false;
+        }
+        self.restore_detail_sub_state(PanelScope::Board);
+        true
+    }
+
+    /// Contract §9: "Closing the last tab in one pane collapses that pane
+    /// back to a single-pane layout." Called from every Board close path,
+    /// never from the split path (whose new pane is empty by design).
+    fn collapse_empty_board_panes(&mut self) -> bool {
+        if !self
+            .doc_tabs
+            .panes_mut(PanelScope::Board)
+            .collapse_empty_panes()
+        {
+            return false;
+        }
+        self.reveal_board_active_doc();
+        self.restore_detail_sub_state(PanelScope::Board);
+        true
     }
 
     /// The active Board document's key, or `None` when no tab is open.
@@ -7188,6 +7464,10 @@ impl CoordApp {
             self.reveal_board_active_doc();
             self.restore_detail_sub_state(PanelScope::Board);
         }
+        // #2288 (§9): "Closing the last tab in one pane collapses that pane
+        // back to a single-pane layout." No-op unless the panel is split
+        // AND this close emptied a pane.
+        self.collapse_empty_board_panes();
         self.persist_doc_tabs();
         true
     }
@@ -7257,6 +7537,9 @@ impl CoordApp {
             self.reveal_board_active_doc();
             self.restore_detail_sub_state(PanelScope::Board);
         }
+        // #2288 (§9): emptying a pane collapses it, whether the tabs went
+        // one at a time or all at once.
+        self.collapse_empty_board_panes();
         self.persist_doc_tabs();
         true
     }
@@ -8101,7 +8384,9 @@ impl CoordApp {
             title: Some(StyledText::plain(&title)),
             items,
             selected_idx: 0,
-            scroll_offset: self.detail_scroll,
+            // #2288 (§9): a background pane scrolls independently of the
+            // focused one — see `board_pane_detail_scroll`.
+            scroll_offset: self.board_pane_detail_scroll(),
             has_focus: false,
             bordered: false,
             h_scroll: 0,

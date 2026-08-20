@@ -12,7 +12,205 @@ use super::*;
 
 // ─── Event dispatch ───────────────────────────────────────────────────────────
 
+/// #2288 (ms-65 §9): everything a speculative bare-`Ctrl-W` tab close
+/// changes, banked so a following pane chord can put it back.
+///
+/// `doc_tabs` alone is not enough: #2285 keeps the active document's
+/// sub-tab and scroll as *live* `CoordApp` fields, and `close_board_doc_tab`
+/// restores the surviving neighbour's values into them on its way out.
+#[derive(Debug, Clone)]
+pub(crate) struct BoardPaneChordUndo {
+    doc_tabs: DocTabs,
+    board_detail_tab: BoardDetailTab,
+    detail_scroll: usize,
+}
+
 impl CoordApp {
+    // ─── #2288 (ms-65 §9): Board pane chords (`Ctrl-W v/s/w/x`) ──────────
+
+    /// Bank the state a §9 pane chord may have to retract, and arm the
+    /// one-shot latch [`Self::resolve_board_pane_chord`] consumes.
+    ///
+    /// Called from both `Ctrl-W` sites: §4's bare-`Ctrl-W`-closes-a-tab arm
+    /// (which passes the state it is about to destroy) and #605's
+    /// pane-focus leader (nothing destroyed, nothing to undo).
+    pub(crate) fn arm_board_pane_chord(&mut self, undo: Option<BoardPaneChordUndo>) {
+        self.board_pane_chord = Some(undo);
+    }
+
+    /// Snapshot of everything a bare `Ctrl-W` close touches, taken *before*
+    /// the close so a following §9 chord can put it back.
+    pub(crate) fn board_pane_chord_undo(&self) -> BoardPaneChordUndo {
+        BoardPaneChordUndo {
+            doc_tabs: self.doc_tabs.clone(),
+            board_detail_tab: self.board_detail_tab,
+            detail_scroll: self.detail_scroll,
+        }
+    }
+
+    /// Resolve the second key of a `Ctrl-W …` sequence against contract
+    /// §9's key table. Returns `Some(Reaction)` only when the key really is
+    /// one of §9's pane chords; every other key falls through untouched, so
+    /// `Ctrl-W Ctrl-W`, `Ctrl-W h` and `Ctrl-W l` keep the exact meanings
+    /// #605 and #2283 gave them.
+    ///
+    /// | Key | Action |
+    /// |---|---|
+    /// | `v` | split the focused pane right |
+    /// | `s` | split down — **reserved, inert** (contract Note 2: ms-65 ships side-by-side only) |
+    /// | `w` | move focus to the next pane |
+    /// | `x` | close the focused pane, unless it is the last one |
+    ///
+    /// Retracting first is what makes `Ctrl-W x` a pure pane-close rather
+    /// than "close a tab AND close the pane" — see the call site in
+    /// `dispatch_handle` for why the close upstream is speculative.
+    ///
+    /// **Text-input surfaces win.** This latch is resolved near the top of
+    /// `dispatch_handle`, ahead of the Board filter box (`board_search`) and
+    /// the inline chat composer (`inject_chat`) — so without the guard below
+    /// a literal `v`/`s`/`w`/`x` the user typed into one of those fields
+    /// would be eaten as a pane chord instead of reaching the field. Both
+    /// are checked explicitly because neither is a "blocking modal":
+    /// `any_blocking_modal_active()` covers neither.
+    pub(crate) fn resolve_board_pane_chord(
+        &mut self,
+        key: &Key,
+        modifiers: &quadraui::Modifiers,
+    ) -> Option<Reaction> {
+        // One-shot: whatever the key turns out to be, the latch is spent.
+        let undo = self.board_pane_chord.take()?;
+        if self.active_view != SidebarView::Board
+            || modifiers.ctrl
+            || modifiers.alt
+            || self.any_blocking_modal_active()
+            || self.issue_finder.is_some()
+            || self.board_search.focused
+            || self.inject_chat.is_some()
+        {
+            return None;
+        }
+        let split_right = match key {
+            Key::Char('v') | Key::Char('V') => true,
+            // Contract Note 2: pinned so a later 2×2 milestone doesn't have
+            // to renegotiate the binding, but bound to nothing in ms-65 —
+            // still consumed here so it can't leak through as a bare `s`.
+            Key::Char('s') | Key::Char('S') => {
+                self.consume_board_pane_chord(undo);
+                return Some(Reaction::Redraw);
+            }
+            Key::Char('w') | Key::Char('W') => {
+                self.consume_board_pane_chord(undo);
+                self.focus_next_board_pane();
+                return Some(Reaction::Redraw);
+            }
+            Key::Char('x') | Key::Char('X') => {
+                self.consume_board_pane_chord(undo);
+                self.close_focused_board_pane();
+                return Some(Reaction::Redraw);
+            }
+            _ => return None,
+        };
+        debug_assert!(split_right);
+        self.consume_board_pane_chord(undo);
+        self.split_board_pane_right();
+        Some(Reaction::Redraw)
+    }
+
+    /// Accept a §9 pane chord: retract the speculative `Ctrl-W` close (if
+    /// there was one) **and** disarm #605's own `Ctrl-W` leader.
+    ///
+    /// The leader matters because it is the *other* arming site: with zero
+    /// tabs open in the focused pane, §4's close arm never fires and
+    /// `handle_ctrl_w_leader` is what set both `ctrl_w_pending` and the §9
+    /// latch. `resolve_board_pane_chord` runs ahead of the leader's Step 2
+    /// and returns early, so without this clear `ctrl_w_pending` would stay
+    /// `true` after the chord and the leader's "any other key cancels"
+    /// branch would silently swallow the user's *next* keystroke.
+    fn consume_board_pane_chord(&mut self, undo: Option<BoardPaneChordUndo>) {
+        self.ctrl_w_pending = false;
+        self.retract_board_pane_chord(undo);
+    }
+
+    /// Put back what the speculative `Ctrl-W` close destroyed, and re-reveal
+    /// the restored active document so the sidebar cursor lands where it was
+    /// before the close moved it (§2f). A no-op when the `Ctrl-W` closed
+    /// nothing.
+    fn retract_board_pane_chord(&mut self, undo: Option<BoardPaneChordUndo>) {
+        let Some(undo) = undo else { return };
+        self.doc_tabs = undo.doc_tabs;
+        self.board_detail_tab = undo.board_detail_tab;
+        self.detail_scroll = undo.detail_scroll;
+        self.reveal_board_active_doc();
+        self.persist_doc_tabs();
+    }
+
+    // ─── #2288 (ms-65 §9): Board pane mouse routing + divider drag ───────
+
+    /// Which Board pane `pos` lands in, and that pane's rect — resolved
+    /// from the **cached** `SplitTreeLayout` the last paint produced, never
+    /// from a second derivation of the same geometry.
+    ///
+    /// That is quadraui's own prescription for the vimcode #582/#452 drift
+    /// bug class (`SplitTree`'s module docs): a hand-rolled click handler
+    /// that rounds where the renderer truncates lands a cell away from what
+    /// the user sees.
+    ///
+    /// `None` when the click fell on the divider column itself, outside the
+    /// panel, or before the first paint.
+    pub(crate) fn board_split_pane_at(&self, pos: Point) -> Option<(usize, Rect)> {
+        let cache = self.board_split_layout.borrow();
+        let layout = cache.as_ref()?;
+        layout
+            .leaves
+            .iter()
+            .position(|(_, r)| {
+                pos.x >= r.x && pos.x < r.x + r.width && pos.y >= r.y && pos.y < r.y + r.height
+            })
+            .map(|idx| (idx, layout.leaves[idx].1))
+    }
+
+    /// Did `pos` land on the Board split's divider column? Uses
+    /// `SplitTreeLayout::hit_test_divider_cell`, the cell-quantised
+    /// hit-test whose doc comment says to prefer it over the tolerance-band
+    /// variant for TUI mouse events precisely so paint and click agree.
+    pub(crate) fn board_split_divider_hit(&self, pos: Point) -> bool {
+        let cache = self.board_split_layout.borrow();
+        let Some(layout) = cache.as_ref() else {
+            return false;
+        };
+        layout
+            .hit_test_divider_cell(pos.x.max(0.0) as u16, pos.y.max(0.0) as u16)
+            .is_some()
+    }
+
+    /// Continue an in-progress divider drag: turn the cursor's live `x`
+    /// back into a split ratio and store it.
+    ///
+    /// The `(cursor - axis_start) / axis_size` conversion is the one
+    /// `SplitTreeDivider::axis_start`'s own doc comment prescribes ("Combine
+    /// with `axis_size` to convert a drag cursor position back to a
+    /// ratio"), fed from the cached divider rather than from a fresh
+    /// measurement, and the MIN/MAX clamp is applied by
+    /// `SplitTree::set_ratio_at_index` inside `PaneSet::set_ratio` — this
+    /// app never re-derives either.
+    pub(crate) fn board_update_split_drag(&mut self, pos: Point) -> bool {
+        if !self.board_split_drag {
+            return false;
+        }
+        let ratio = {
+            let cache = self.board_split_layout.borrow();
+            let Some(div) = cache.as_ref().and_then(|l| l.dividers.first()) else {
+                return false;
+            };
+            if div.axis_size <= 0.0 {
+                return false;
+            }
+            (pos.x - div.axis_start) / div.axis_size
+        };
+        self.doc_tabs
+            .panes_mut(PanelScope::Board)
+            .set_ratio(PanelScope::Board, ratio)
+    }
 
     /// Create a new app.
     /// Check whether the given key+modifiers match a named action in the user's
@@ -183,6 +381,30 @@ impl CoordApp {
             }
         }
 
+        // ── #2288 (ms-65 §9): resolve a Board pane chord `Ctrl-W v/s/w/x` ─
+        // Contract §4 pins a BARE `Ctrl-W` as "close the active tab" and
+        // contract §9 pins `Ctrl-W v/s/w/x` as the pane chords — the two
+        // clauses collide on the same prefix (flagged as finding 17 in
+        // `tests/acceptance/ms-65/manifest.yml`), and both sealed slices
+        // assert their own reading, so BOTH have to hold.
+        //
+        // The reconciliation is speculative-then-retracted, which is the
+        // only shape that satisfies both without a timer: the close below
+        // fires immediately (so §4's single `Ctrl-W` is a close on the very
+        // next frame, exactly as its slice asserts) and banks an undo
+        // snapshot; if the very next key turns out to be a §9 chord, the
+        // snapshot is restored and the pane action runs instead, so
+        // `Ctrl-W x` is the pane-close §9 pins and never also eats a tab.
+        // Any other following key simply drops the snapshot and falls
+        // through untouched — `Ctrl-W Ctrl-W`, `Ctrl-W h`, `Ctrl-W l` all
+        // behave exactly as #605/#2283 left them, because this block never
+        // swallows a key it doesn't recognise as a pane chord.
+        if let UiEvent::KeyPressed { key, modifiers, .. } = &event {
+            if let Some(reaction) = self.resolve_board_pane_chord(key, modifiers) {
+                return reaction;
+            }
+        }
+
         // ── #2283 (ms-65 §4): Board doc-tab close/cycle chords ───────────
         // Caught BEFORE the #605 Ctrl-W pane-focus leader just below so a
         // bare `Ctrl-W` closes the active Board tab instead of arming the
@@ -201,10 +423,28 @@ impl CoordApp {
                 && self.active_view == SidebarView::Board
                 && !self.board_doc_tabs().is_empty()
             {
+                // #2288 review: a focused text-input surface OWNS the
+                // keyboard, so a bare `Ctrl-W` typed there must not close
+                // a document tab (nor bank a §9 undo snapshot / arm the
+                // pane-chord latch, which would then eat the user's next
+                // `v`/`s`/`w`/`x` keystroke). `board_search` (the Board
+                // filter box) and `inject_chat` (the inline chat composer)
+                // are both checked explicitly because neither counts as a
+                // "blocking modal" — `any_blocking_modal_active()` covers
+                // neither. Same guard set as `resolve_board_pane_chord`,
+                // deliberately: the two `Ctrl-W` sites must agree, or the
+                // latch outlives the close that armed it.
                 if matches!(key, Key::Char('w') | Key::Char('W'))
                     && modifiers.ctrl
                     && !modifiers.alt
+                    && !self.board_search.focused
+                    && self.inject_chat.is_none()
                 {
+                    // #2288: bank the pre-close state so a following §9
+                    // pane chord can retract this close (see
+                    // `resolve_board_pane_chord`).
+                    let undo = self.board_pane_chord_undo();
+                    self.arm_board_pane_chord(Some(undo));
                     self.close_active_board_doc_tab();
                     return Reaction::Redraw;
                 }
@@ -4707,6 +4947,17 @@ impl CoordApp {
                         if toolbar_consumed {
                             return true;
                         }
+                        // #2288 (ms-65 §9): narrow to the clicked pane, so a
+                        // right-click on the right pane's strip resolves
+                        // against that pane's tabs and not the left pane's.
+                        let Some((pane_idx, tab_main_b)) =
+                            self.board_split_pane_at(pos).or_else(|| {
+                                (!self.board_panes().is_split()).then_some((0, tab_main_b))
+                            })
+                        else {
+                            return false;
+                        };
+                        self.focus_board_pane(pane_idx);
                         let tab_h = detail_tab_bar_height(lh);
                         if pos.y - tab_main_b.y < tab_h {
                             if let Some(strip) = self.board_doc_tab_strip(tab_main_b.width) {
@@ -4919,6 +5170,16 @@ impl CoordApp {
                 if toolbar_consumed {
                     return true;
                 }
+                // #2288 (ms-65 §9): narrow to the clicked pane first — a
+                // middle-click closes the tab under the cursor in THAT
+                // pane's strip.
+                let Some((pane_idx, main_b)) = self
+                    .board_split_pane_at(pos)
+                    .or_else(|| (!self.board_panes().is_split()).then_some((0, main_b)))
+                else {
+                    return false;
+                };
+                self.focus_board_pane(pane_idx);
                 let tab_h = detail_tab_bar_height(lh);
                 if pos.y - main_b.y >= tab_h {
                     return false;
@@ -5070,6 +5331,15 @@ impl CoordApp {
                     // unconditionally rather than as an `else if` chain
                     // costs nothing and stays consistent with `MouseUp`'s
                     // unconditional release below.
+                    // #2288 (ms-65 §9): continue an in-progress Board pane
+                    // divider drag — same precedence and shape as the Queue
+                    // splitter just below.
+                    if self.active_view == SidebarView::Board
+                        && buttons.left
+                        && self.board_split_drag
+                    {
+                        redraw |= self.board_update_split_drag(pos);
+                    }
                     if self.active_view == SidebarView::Queue && buttons.left {
                         if self.queue_split_drag {
                             redraw |= self.queue_update_split_drag(pos, main_b, lh);
@@ -5225,6 +5495,8 @@ impl CoordApp {
                     released |= std::mem::take(&mut self.queue_vscroll_drag);
                     released |= std::mem::take(&mut self.queue_hscroll_drag);
                     released |= std::mem::take(&mut self.queue_detail_vscroll_drag);
+                    // #2288 (ms-65 §9): end a Board pane divider drag.
+                    released |= std::mem::take(&mut self.board_split_drag);
                     if released {
                         return true;
                     }
@@ -5962,6 +6234,31 @@ impl CoordApp {
         }
         if self.active_view == SidebarView::Board {
             let tab_h = detail_tab_bar_height(lh);
+            // #2288 (ms-65 §9): resolve which PANE was clicked before
+            // anything else in this panel, from the same `SplitTreeLayout`
+            // the paint used, and give it focus. `main_b` then narrows to
+            // that pane's rect so every hit-test below — doc-tab strip,
+            // sub-tab bar, content — is measured against the half of the
+            // panel the user actually clicked in. Unsplit, the layout has a
+            // single leaf whose rect IS `main_b`, so this is inert.
+            //
+            // A press on the divider column starts a resize drag instead
+            // (§9's "Dragging the divider resizes both panes and the
+            // content reflows"), mirroring the Queue splitter (#2017).
+            if self.board_panes().is_split() && self.board_split_divider_hit(pos) {
+                self.board_split_drag = true;
+                return true;
+            }
+            let main_b = match self.board_split_pane_at(pos) {
+                Some((pane_idx, pane_rect)) => {
+                    self.focus_board_pane(pane_idx);
+                    pane_rect
+                }
+                // Outside every leaf (and not on the divider, handled
+                // above): nothing in this panel owns the click.
+                None if self.board_panes().is_split() => return false,
+                None => main_b,
+            };
             // #2282 (ms-65 §2a): the document tab strip is the FIRST row inside
             // the panel content, above the sub-tab bar. Hit-test it first and
             // shrink `main_b` for everything below, mirroring what the render
@@ -6804,21 +7101,31 @@ impl CoordApp {
         }
         match self.active_view {
             SidebarView::Board => {
-                // Use the active tab's actual list so the scroll max matches
-                // what's rendered. Board tab → detail_list; Issue tab → body.
-                // Chat tab scroll is handled by ChatController itself.
-                let items = match self.board_detail_tab {
-                    BoardDetailTab::Board => self.detail_list().items.len(),
-                    BoardDetailTab::Issue => self.board_issue_body_list().items.len(),
-                    BoardDetailTab::Chat => 0,
-                    BoardDetailTab::Terminal => 0, // #675: scroll handled by the PTY session
-                };
-                let max = items.saturating_sub(visible.saturating_sub(1));
-                if delta.y > 0.0 {
-                    self.detail_scroll = self.detail_scroll.saturating_sub(1);
-                } else if delta.y < 0.0 {
-                    self.detail_scroll = (self.detail_scroll + 1).min(max);
+                // #2288 (ms-65 §9): the wheel scrolls the pane the CURSOR is
+                // over, not the focused one — the same rule the click and
+                // drag handlers already follow via `board_split_pane_at`,
+                // and the only reading of "each pane is independent" that
+                // matches how anyone uses a side-by-side split (hover the
+                // right pane, scroll the right pane).
+                //
+                // Unsplit — or before the first paint has cached a layout —
+                // there is exactly one leaf whose rect IS `main_b`, so this
+                // resolves to the focused pane and the arm behaves as it did
+                // pre-#2288. Split but outside every leaf means the cursor is
+                // on the divider column: nothing there owns the wheel.
+                let hit = self.board_split_pane_at(pos);
+                if hit.is_none() && self.board_panes().is_split() {
+                    return false;
                 }
+                let (pane, visible) = match hit {
+                    // A pane is full panel height in a side-by-side split, so
+                    // this equals `visible` today; deriving it from the
+                    // pane's own rect keeps it correct if §9 ever grows a
+                    // horizontal split.
+                    Some((idx, rect)) => (idx, content_visible_rows(rect, lh)),
+                    None => (self.board_panes().focused_index(), visible),
+                };
+                self.scroll_board_pane(pane, delta, visible);
                 true
             }
             SidebarView::Machines => {
@@ -7137,5 +7444,41 @@ impl CoordApp {
                 true
             }
         }
+    }
+
+    /// #2288 (ms-65 §9): apply one wheel notch to Board pane `pane`, whether
+    /// or not that pane is the focused one.
+    ///
+    /// Every list length below has to be measured **as that pane sees it** —
+    /// its own active document, its own sub-tab, its own Issue wrap width —
+    /// so this borrows the paint path's own addressing cursor (`render_pane`)
+    /// for the duration of the reads and puts it back afterwards. Without
+    /// that, an unfocused pane's clamp would be computed from the focused
+    /// pane's document and the numbers would describe a body that is not on
+    /// screen anywhere.
+    fn scroll_board_pane(&mut self, pane: usize, delta: ScrollDelta, visible: usize) {
+        let restore = self.render_pane.replace(Some(pane));
+        // Use the addressed pane's active sub-tab's actual list so the scroll
+        // max matches what's rendered. Board tab → detail_list; Issue tab →
+        // body. Chat tab scroll is handled by ChatController itself, and the
+        // Terminal tab's by the PTY session (#675).
+        let items = match self.board_pane_detail_tab() {
+            BoardDetailTab::Board => self.detail_list().items.len(),
+            BoardDetailTab::Issue => self.board_issue_body_list().items.len(),
+            BoardDetailTab::Chat => 0,
+            BoardDetailTab::Terminal => 0,
+        };
+        let current = self.board_pane_detail_scroll();
+        self.render_pane.set(restore);
+
+        let max = items.saturating_sub(visible.saturating_sub(1));
+        let next = if delta.y > 0.0 {
+            current.saturating_sub(1)
+        } else if delta.y < 0.0 {
+            (current + 1).min(max)
+        } else {
+            return;
+        };
+        self.set_board_pane_detail_scroll(pane, next);
     }
 }

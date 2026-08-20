@@ -3,6 +3,9 @@
 //! No I/O, no quadraui types, no app state — pure text/number transformations.
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Whole days, in seconds — the unit [`format_unix_time`] rolls up to once a
+/// timestamp's age passes 24h.
+const SECS_PER_DAY: u64 = 86_400;
 
 pub(crate) fn fmt_dur(secs: u64) -> String {
     if secs < 60 {
@@ -146,6 +149,25 @@ pub(crate) fn format_unix_time(ts: f64) -> String {
         .unwrap_or_default()
         .as_secs_f64();
     let delta = (now - ts).max(0.0) as u64;
+    // `fmt_dur`'s largest unit is the hour, which is fine for a *duration*
+    // (where the extra precision is the point) but unbounded for an *age*:
+    // a year-old row rendered `9732h35m ago` — 12 columns of mostly noise.
+    // The Audit table's Time column is `ColumnWidth::Fixed(11.0)` (10 usable
+    // cells, see `audit_columns`), so `draw_data_table` clipped that to
+    // `9732h35m …` and ate the `ago` suffix entirely, breaking #1039
+    // contract §4a ("the relative-time column ... must contain `ago`").
+    //
+    // Rolling up to whole days keeps the string relative (§4a) *and* inside
+    // the budget: `406d ago` is 8 cells, and even a 5-digit day count fits.
+    // Days-only rather than `{d}d{h}h` is deliberate — `406d12h ago` is 11
+    // cells and would clip exactly the same way.
+    //
+    // Scoped to this helper on purpose: `fmt_dur` itself is left alone so
+    // the duration call sites (stage elapsed, `Duration` detail rows) keep
+    // their hour+minute precision. Ages get coarse units; durations do not.
+    if delta >= SECS_PER_DAY {
+        return format!("{}d ago", delta / SECS_PER_DAY);
+    }
     format!("{} ago", fmt_dur(delta))
 }
 

@@ -247,6 +247,62 @@
         assert_eq!(fmt_dur(3661), "1h1m");
     }
 
+    // ── format_unix_time day rollup ──────────────────────────────────────────
+    //
+    // `fmt_dur`'s largest unit is the hour, which is right for a *duration*
+    // but unbounded for an *age*: a year-old timestamp rendered
+    // `9732h35m ago` (12 cells) and got clipped to `9732h35m …` in the Audit
+    // Time column (`ColumnWidth::Fixed(11.0)` -> 10 usable), losing the `ago`
+    // suffix #1039 contract §4a requires. Ages now roll up to whole days.
+    //
+    // Helper: build a ts that is exactly `age_secs` in the past.
+    fn ts_aged(age_secs: f64) -> f64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        now - age_secs
+    }
+
+    #[test]
+    fn format_unix_time_under_a_day_keeps_hour_precision() {
+        // Unchanged from before the rollup — the `#1762` timestamp-cell test
+        // depends on this exact shape.
+        assert_eq!(format_unix_time(ts_aged(13.0 * 3600.0)), "13h0m ago");
+    }
+
+    #[test]
+    fn format_unix_time_rolls_up_at_exactly_one_day() {
+        assert_eq!(format_unix_time(ts_aged(86_400.0)), "1d ago");
+    }
+
+    #[test]
+    fn format_unix_time_just_under_a_day_does_not_roll_up() {
+        // 23h59m — the last value that stays in the hour regime.
+        assert_eq!(format_unix_time(ts_aged(86_399.0)), "23h59m ago");
+    }
+
+    #[test]
+    fn format_unix_time_truncates_toward_whole_days() {
+        // 1d23h is still "1d" — days-only, matching `format_age`'s
+        // long-standing convention ("hours for < 24h, days otherwise").
+        assert_eq!(format_unix_time(ts_aged(86_400.0 + 23.0 * 3600.0)), "1d ago");
+    }
+
+    #[test]
+    fn format_unix_time_year_old_age_fits_the_audit_time_column() {
+        // The exact regression: 406 days used to be `9732h35m ago` (12 cells)
+        // and clipped away its own `ago`. The Audit Time column resolves to
+        // 10 usable cells, so the rendered string must fit in 10.
+        let s = format_unix_time(ts_aged(406.0 * 86_400.0));
+        assert_eq!(s, "406d ago");
+        assert!(
+            s.chars().count() <= 10,
+            "must fit the 10-cell Audit Time column, got {} cells: {s:?}",
+            s.chars().count()
+        );
+    }
+
     // ── fmt_elapsed (#2397) ──────────────────────────────────────────────────
     //
     // The bug this replaced: `fmt_elapsed_mmss` rendered both the < 1h and
@@ -39718,6 +39774,70 @@ Milestone tracking issue.
         }
     }
 
+    /// Build a one-entry `/audit` page whose `ts` is `age_secs` old, so a
+    /// test can pin how the Time column renders a genuinely *stale* row.
+    fn audit_page_json_one_entry_aged(age_secs: f64) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        format!(
+            r#"{{
+                "entries": [
+                    {{
+                        "id": 1, "ts": {ts}, "tier": "business",
+                        "category": "dispatch", "event_type": "dispatched",
+                        "actor": "coordinator", "repo": "claude-coordinator",
+                        "issue": 1039, "assignment_id": null,
+                        "machine": null, "summary": "STALE_MARKER",
+                        "details": null
+                    }}
+                ],
+                "next_cursor": null,
+                "has_more": false
+            }}"#,
+            ts = now - age_secs,
+        )
+    }
+
+    /// Regression: a year-old audit row must STILL render `ago`.
+    ///
+    /// `audit_populated_list_shows_categories_actor_and_relative_time` above
+    /// seeds clock-relative timestamps (`now - 10s` / `now - 500s`), so it
+    /// could never catch this — but the sealed slice
+    /// (`tests/acceptance/ms-33/audit_1039.rs`) pins *absolute* 2025
+    /// timestamps, and as wall-clock drifted past them `format_unix_time`
+    /// grew an unbounded hour count: `9732h35m ago`, 12 cells wide. The Time
+    /// column is `ColumnWidth::Fixed(11.0)` (10 usable), so `draw_data_table`
+    /// clipped it to `9732h35m …` and the `ago` suffix vanished — a
+    /// time-bomb failure of #1039 contract §4a that no commit introduced.
+    ///
+    /// Seeding the age *relative to now* is the point: this test asserts the
+    /// invariant at any wall-clock, so it cannot rot the same way.
+    #[test]
+    fn audit_year_old_row_still_renders_relative_time_within_the_column() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        // ~406 days — the drift that actually broke the sealed slice.
+        let json = audit_page_json_one_entry_aged(406.0 * 86_400.0);
+        let app = make_app_with_audit_json(BoardData::default(), &json);
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "§");
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("STALE_MARKER"),
+            "precondition: the aged row must be on screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("406d ago"),
+            "#1039 contract §4a: a 406-day-old row's Time cell must roll up \
+             to whole days and stay inside the 10-cell column, so the `ago` \
+             suffix survives clipping:\n{screen}"
+        );
+    }
+
     #[test]
     fn audit_populated_list_is_newest_first() {
         use quadraui::tui::testing::driver_with_shell;
@@ -50512,5 +50632,1144 @@ Milestone tracking issue.
             wrote,
             "#2286: moving the active tab is a real change and must reach the \
              file"
+        );
+    }
+
+    // ── #2288 (ms-65 §9): side-by-side split ─────────────────────────────
+    //
+    // Black-box, same rule as #2283's block above: every test drives the
+    // real `event → handle → render` path and asserts on the painted grid.
+    // Orientation in particular is *only* ever asserted structurally — the
+    // issue's own ⚠ and contract Note 1 both point out that quadraui's
+    // `SplitDirection::Horizontal` (side-by-side) and vimcode's
+    // (top/bottom) are inverted, and that a wrong guess compiles and
+    // type-checks. `divider_cells` below is what catches that.
+
+    /// A prefix of the Board sidebar filter's placeholder text
+    /// (`"Filter issues… (#4 = number only)"`, truncated by the 35-column
+    /// sidebar). Rendered only while the filter is EMPTY, so its
+    /// disappearance is a black-box proof that a keystroke reached the
+    /// field rather than being swallowed upstream.
+    const BOARD_FILTER_PLACEHOLDER: &str = "Filter issu";
+
+    /// Every painted `║` cell as `(col, row)` pairs.
+    fn divider_cells<A: quadraui::AppLogic>(
+        d: &quadraui::tui::testing::TuiDriver<A>,
+    ) -> Vec<(usize, usize)> {
+        d.screen()
+            .lines()
+            .enumerate()
+            .flat_map(|(row, line)| {
+                line.chars()
+                    .enumerate()
+                    .filter(|(_, c)| *c == '║')
+                    .map(move |(col, _)| (col, row))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// The single column every `║` sits in, panicking if the divider is not
+    /// a vertical run of at least two rows. A top/bottom split painting the
+    /// same glyph would spread it across one row and fail here.
+    fn divider_column<A: quadraui::AppLogic>(
+        d: &quadraui::tui::testing::TuiDriver<A>,
+    ) -> usize {
+        let cells = divider_cells(d);
+        assert!(
+            !cells.is_empty(),
+            "#2288 §9: a split panel must paint a `║` divider:\n{}",
+            d.screen()
+        );
+        let cols: std::collections::BTreeSet<usize> = cells.iter().map(|(c, _)| *c).collect();
+        assert_eq!(
+            cols.len(),
+            1,
+            "#2288 §9 / contract Note 1: the divider must be VERTICAL — every \
+             `║` in ONE column. Found columns {cols:?}, which is what a \
+             vimcode-style (top/bottom) `SplitDirection` guess paints:\n{}",
+            d.screen()
+        );
+        assert!(
+            cells.len() >= 2,
+            "#2288 §9: the divider must span at least two rows:\n{}",
+            d.screen()
+        );
+        *cols.iter().next().expect("exactly one column")
+    }
+
+    /// Two pinned tabs (#101, #102), then `Ctrl-W v`.
+    fn split_board_driver() -> quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic> {
+        let mut driver = doc_tabs_driver(&[101, 102], 120, 40);
+        driver.ctrl_char('w');
+        driver.press(Key::Char('v'));
+        driver.render();
+        driver
+    }
+
+    /// §9 — `Ctrl-W v` divides the panel into two panes side by side, and
+    /// (the §4/§9 `Ctrl-W`-prefix collision) does **not** also eat a tab.
+    #[test]
+    fn ctrl_w_v_splits_the_board_panel_side_by_side_without_closing_a_tab() {
+        let before = doc_tabs_driver(&[101, 102], 120, 40);
+        assert!(
+            divider_cells(&before).is_empty(),
+            "control: an unsplit panel paints no `║` at all:\n{}",
+            before.screen()
+        );
+        let tabs_before = painted_tab_count(&before);
+
+        let driver = split_board_driver();
+        let col = divider_column(&driver);
+        assert!(
+            col > 38,
+            "#2288 §9: the divider sits INSIDE the main panel, not in the \
+             sidebar (column {col}):\n{}",
+            driver.screen()
+        );
+        assert_eq!(
+            painted_tab_count(&driver),
+            tabs_before,
+            "#2288 §9 vs §4: `Ctrl-W v` splits — the bare-`Ctrl-W` close must \
+             be retracted, not applied on the way past:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// §9 — the panel toolbar is panel-scoped: it spans the full width
+    /// ABOVE both panes, so no divider cell lands on its row.
+    #[test]
+    fn the_panel_toolbar_row_carries_no_pane_divider() {
+        let driver = split_board_driver();
+        let top = divider_cells(&driver)
+            .iter()
+            .map(|(_, r)| *r)
+            .min()
+            .expect("a split panel paints a divider");
+        assert!(
+            top > 0,
+            "#2288 §9: \"the panel toolbar row still spans the full panel \
+             width above both panes\" — the divider must start below it:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// §9 — each pane owns its own preview slot: a single click while the
+    /// new (right) pane is focused fills THAT pane's preview and leaves the
+    /// left pane's pinned tabs alone.
+    #[test]
+    fn each_split_pane_owns_its_own_preview_slot() {
+        let mut driver = split_board_driver();
+        assert_eq!(
+            painted_tab_count(&driver),
+            2,
+            "precondition: the left pane's two pinned tabs, the right pane empty:\n{}",
+            driver.screen()
+        );
+
+        let (x, y) = driver
+            .find("#103  Race condition")
+            .expect("the sidebar row for #103");
+        driver.click(x, y);
+        driver.render();
+
+        assert_eq!(
+            painted_tab_count(&driver),
+            3,
+            "#2288 §9: the click opened a preview in the FOCUSED (new) pane \
+             — the left pane's two tabs are untouched:\n{}",
+            driver.screen()
+        );
+        assert!(
+            driver.screen_contains("∘ #103"),
+            "#2288 §9 + §1: the new pane's tab is a preview:\n{}",
+            driver.screen()
+        );
+        // …and it landed on the far side of the divider, i.e. in the other
+        // pane, not appended to the first pane's strip.
+        let col = divider_column(&driver);
+        let strip_row = driver
+            .screen()
+            .lines()
+            .find(|l| l.contains("∘ #103"))
+            .expect("the preview tab's strip row")
+            .to_string();
+        let preview_col = strip_row
+            .chars()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .position(|w| w == ['∘', ' '])
+            .expect("the `∘ ` marker's column");
+        assert!(
+            preview_col > col,
+            "#2288 §9: the preview opened in the pane to the RIGHT of the \
+             divider (marker at {preview_col}, divider at {col}):\n{}",
+            driver.screen()
+        );
+    }
+
+    /// §9 — `Ctrl-W x` closes the focused pane and the panel goes back to
+    /// exactly the screen it painted before the split. Byte-for-byte:
+    /// "with a single pane, rendering is byte-identical to the non-split
+    /// case."
+    #[test]
+    fn ctrl_w_x_collapses_the_split_back_to_the_pre_split_screen() {
+        let before = doc_tabs_driver(&[101, 102], 120, 40).screen();
+
+        let mut driver = split_board_driver();
+        assert!(!divider_cells(&driver).is_empty(), "precondition: split");
+        driver.ctrl_char('w');
+        driver.press(Key::Char('x'));
+        driver.render();
+
+        assert_eq!(
+            driver.screen(),
+            before,
+            "#2288 §9: collapsing the split restores the unsplit rendering \
+             byte for byte"
+        );
+    }
+
+    /// §9 — "Closing the last remaining pane in a scope is a no-op": with
+    /// one pane, `Ctrl-W x` changes nothing at all — and in particular does
+    /// not fall through to §4's bare-`Ctrl-W` tab close.
+    #[test]
+    fn ctrl_w_x_is_a_no_op_with_a_single_pane() {
+        let mut driver = doc_tabs_driver(&[101, 102], 120, 40);
+        let before = driver.screen();
+
+        driver.ctrl_char('w');
+        driver.press(Key::Char('x'));
+        driver.render();
+
+        assert_eq!(
+            driver.screen(),
+            before,
+            "#2288 §9: a scope always has ≥1 pane, so `Ctrl-W x` on the last \
+             one is inert — including the tab it must not close"
+        );
+    }
+
+    /// §9 — `Ctrl-W w` moves focus to the other pane: the next single click
+    /// opens its preview back in the FIRST pane's strip.
+    #[test]
+    fn ctrl_w_w_moves_focus_to_the_other_pane() {
+        let mut driver = split_board_driver();
+        driver.ctrl_char('w');
+        driver.press(Key::Char('w'));
+        driver.render();
+
+        let col = divider_column(&driver);
+        let (x, y) = driver
+            .find("#103  Race condition")
+            .expect("the sidebar row for #103");
+        driver.click(x, y);
+        driver.render();
+
+        let strip_row = driver
+            .screen()
+            .lines()
+            .find(|l| l.contains("∘ #103"))
+            .expect("the preview tab's strip row")
+            .to_string();
+        let preview_col = strip_row
+            .chars()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .position(|w| w == ['∘', ' '])
+            .expect("the `∘ ` marker's column");
+        assert!(
+            preview_col < col,
+            "#2288 §9: after `Ctrl-W w` the focus is back on the LEFT pane, \
+             so the click's preview opens there (marker at {preview_col}, \
+             divider at {col}):\n{}",
+            driver.screen()
+        );
+    }
+
+    /// §9 — dragging the divider moves it and both panes reflow around the
+    /// new column.
+    #[test]
+    fn dragging_the_divider_resizes_both_panes() {
+        let mut driver = split_board_driver();
+        let col = divider_column(&driver);
+        let row = divider_cells(&driver)[0].1;
+
+        driver.drag(
+            col as f32 + 0.5,
+            row as f32 + 0.5,
+            col as f32 - 12.5,
+            row as f32 + 0.5,
+        );
+        driver.render();
+
+        let moved = divider_column(&driver);
+        assert!(
+            moved < col,
+            "#2288 §9: the divider follows the drag (was {col}, now {moved}):\n{}",
+            driver.screen()
+        );
+        // The panes really reflowed: the left pane's tab strip now has to
+        // fit into a narrower rect, so its content no longer runs past the
+        // divider's new column.
+        for (c, _) in divider_cells(&driver) {
+            assert_eq!(c, moved, "the divider stays a single column after a drag");
+        }
+    }
+
+    /// §9 — "Closing the last tab in one pane collapses that pane back to a
+    /// single-pane layout."
+    #[test]
+    fn closing_the_last_tab_in_a_pane_collapses_the_split() {
+        let mut driver = split_board_driver();
+        let (x, y) = driver
+            .find("#103  Race condition")
+            .expect("the sidebar row for #103");
+        driver.click(x, y);
+        driver.render();
+        assert!(
+            !divider_cells(&driver).is_empty(),
+            "precondition: two panes, the right one holding #103:\n{}",
+            driver.screen()
+        );
+
+        // `Ctrl-W` closes the focused (right) pane's only tab — §4's chord,
+        // uninterrupted this time.
+        driver.ctrl_char('w');
+        driver.render();
+        assert!(
+            divider_cells(&driver).is_empty(),
+            "#2288 §9: emptying a pane collapses the layout back to one \
+             pane, divider and all:\n{}",
+            driver.screen()
+        );
+        assert_eq!(
+            painted_tab_count(&driver),
+            2,
+            "#2288 §9: …and the surviving pane keeps its own two tabs:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// §9 — a split pane's tab labels truncate at the narrower, separately
+    /// pinned 14-column budget, not §2b's 20.
+    #[test]
+    fn split_pane_tab_labels_use_the_narrower_budget() {
+        let unsplit = doc_tabs_driver(&[101], 120, 40);
+        assert!(
+            unsplit.screen_contains("#101 Fix login race…"),
+            "§2b control: 20 columns unsplit:\n{}",
+            unsplit.screen()
+        );
+
+        let driver = {
+            let mut d = doc_tabs_driver(&[101], 120, 40);
+            d.ctrl_char('w');
+            d.press(Key::Char('v'));
+            d.render();
+            d
+        };
+        assert!(
+            driver.screen_contains("#101 Fix logi…"),
+            "#2288 §9: a split pane truncates at 14 columns:\n{}",
+            driver.screen()
+        );
+        assert!(
+            !driver.screen_contains("#101 Fix login race…"),
+            "#2288 §9: …and not at §2b's 20:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// §8b + §9 — the `?` overlay's second section lists §9's four pane
+    /// keys. Authored here because §8b hands the "Split" section to #2288.
+    #[test]
+    fn the_help_overlay_lists_the_split_key_bindings() {
+        let mut driver = doc_tabs_driver(&[101], 120, 40);
+        driver.press(Key::Char('?'));
+        driver.render();
+
+        for needle in [
+            "Split",
+            "Ctrl-W v",
+            "split right",
+            "Ctrl-W s",
+            "split down",
+            "Ctrl-W w",
+            "next pane",
+            "Ctrl-W x",
+            "close pane",
+        ] {
+            assert!(
+                driver.screen_contains(needle),
+                "#2288 §8b/§9: the `?` overlay must list `{needle}`:\n{}",
+                driver.screen()
+            );
+        }
+    }
+
+    /// The #605 / #2283 guard, re-asserted now that `Ctrl-W` also arms the
+    /// §9 pane-chord latch: every key that is NOT one of §9's four chords
+    /// must still fall through to the meaning it had before this issue.
+    #[test]
+    fn ctrl_w_keeps_its_non_split_meanings() {
+        // `Ctrl-W l` with zero tabs open still moves pane focus (#605).
+        let mut driver = doc_tabs_driver(&[], 120, 40);
+        driver.ctrl_char('w');
+        driver.press(Key::Char('l'));
+        driver.render();
+        assert!(
+            driver.screen_contains("[Main]"),
+            "#605: `Ctrl-W l` still moves focus with the §9 latch armed:\n{}",
+            driver.screen()
+        );
+
+        // Two bare `Ctrl-W`s still close two tabs (#2283 §4) — the latch
+        // armed by the first must not swallow the second.
+        let mut driver = doc_tabs_driver(&[101, 102, 103], 120, 40);
+        assert_eq!(painted_tab_count(&driver), 3, "precondition");
+        driver.ctrl_char('w');
+        driver.ctrl_char('w');
+        driver.render();
+        assert_eq!(
+            painted_tab_count(&driver),
+            1,
+            "#2283 §4: `Ctrl-W` `Ctrl-W` closes two tabs:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #2288 review (blocking finding): the one-shot §9 pane-chord latch is
+    /// resolved near the TOP of `dispatch_handle` — ahead of the Board
+    /// filter box's own `Key::Char(_)` arm — so it must decline while that
+    /// filter has focus. Without the guard, a literal `v` the user typed
+    /// into the search field silently splits the panel and never reaches
+    /// the field.
+    #[test]
+    fn a_pane_chord_key_typed_into_the_focused_board_filter_reaches_the_filter() {
+        let mut driver = doc_tabs_driver(&[101, 102], 120, 40);
+        driver.press(Key::Char('/'));
+        driver.render();
+        assert!(
+            driver.screen_contains(BOARD_FILTER_PLACEHOLDER),
+            "precondition: `/` focuses the Board filter, which renders its \
+             placeholder while empty:\n{}",
+            driver.screen()
+        );
+
+        driver.ctrl_char('w');
+        driver.press(Key::Char('v'));
+        driver.render();
+
+        assert!(
+            divider_cells(&driver).is_empty(),
+            "#2288 review: a `v` typed into the FOCUSED Board filter must not \
+             be eaten by the §9 pane-chord latch — no split may happen:\n{}",
+            driver.screen()
+        );
+        assert!(
+            !driver.screen_contains(BOARD_FILTER_PLACEHOLDER),
+            "#2288 review: the `v` must land in the filter box (its \
+             placeholder is replaced by the typed text):\n{}",
+            driver.screen()
+        );
+    }
+
+    /// The same guard from the other side: with a split already on screen,
+    /// an `x` typed into the focused Board filter must not close a pane.
+    #[test]
+    fn a_pane_chord_key_typed_into_the_focused_board_filter_does_not_close_a_pane() {
+        let mut driver = split_board_driver();
+        // Give the new pane a tab of its own, so §9's "closing the last tab
+        // in a pane collapses it" rule can't be what removes the divider —
+        // the bare `Ctrl-W` below closes one of the OTHER pane's two tabs.
+        let (x, y) = driver
+            .find("#103  Race condition")
+            .expect("the sidebar row for #103");
+        driver.click(x, y);
+        driver.render();
+        // Move focus back onto the pane holding two tabs, so the bare
+        // `Ctrl-W` below takes §4's close arm — the one that arms the §9
+        // latch this test guards.
+        driver.ctrl_char('w');
+        driver.press(Key::Char('w'));
+        driver.render();
+        let col = divider_column(&driver);
+
+        driver.press(Key::Char('/'));
+        driver.render();
+        assert!(
+            driver.screen_contains(BOARD_FILTER_PLACEHOLDER),
+            "precondition: `/` focuses the Board filter even while split:\n{}",
+            driver.screen()
+        );
+
+        driver.ctrl_char('w');
+        driver.press(Key::Char('x'));
+        driver.render();
+
+        assert_eq!(
+            divider_column(&driver),
+            col,
+            "#2288 review: an `x` typed into the FOCUSED Board filter must not \
+             be eaten by the §9 pane-chord latch — the split must survive:\n{}",
+            driver.screen()
+        );
+        assert!(
+            !driver.screen_contains(BOARD_FILTER_PLACEHOLDER),
+            "#2288 review: the `x` must land in the filter box:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #2288 review (blocking finding, second round): the guard belongs on
+    /// the §4 bare-`Ctrl-W` arm too, not only on the §9 latch.
+    ///
+    /// `resolve_board_pane_chord` declining while the Board filter has focus
+    /// stops the *second* key being stolen, but the `Ctrl-W` itself still
+    /// reached §4's close arm and destroyed a document tab. A focused
+    /// text-input surface owns the keyboard: the tab strip must be untouched.
+    #[test]
+    fn ctrl_w_typed_into_the_focused_board_filter_does_not_close_a_doc_tab() {
+        let mut driver = doc_tabs_driver(&[101, 102, 103], 120, 40);
+        assert_eq!(painted_tab_count(&driver), 3, "precondition: three tabs open");
+
+        driver.press(Key::Char('/'));
+        driver.render();
+        assert!(
+            driver.screen_contains(BOARD_FILTER_PLACEHOLDER),
+            "precondition: `/` focuses the Board filter:\n{}",
+            driver.screen()
+        );
+
+        driver.ctrl_char('w');
+        driver.render();
+
+        assert_eq!(
+            painted_tab_count(&driver),
+            3,
+            "#2288 review: a bare `Ctrl-W` typed while the Board FILTER has \
+             focus must not close a document tab — the filter owns the \
+             keyboard:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// Blurring the filter hands `Ctrl-W` straight back to §4 — the guard
+    /// above is a focus-scoped exemption, not a regression of #2283's close
+    /// chord. (Without this control the previous test would still pass if
+    /// `Ctrl-W` had simply stopped closing tabs altogether.)
+    #[test]
+    fn ctrl_w_still_closes_a_doc_tab_once_the_board_filter_is_blurred() {
+        let mut driver = doc_tabs_driver(&[101, 102, 103], 120, 40);
+        driver.press(Key::Char('/'));
+        driver.render();
+        driver.press_named(quadraui::NamedKey::Escape); // #646: blur the filter
+        driver.render();
+        assert_eq!(painted_tab_count(&driver), 3, "precondition: three tabs open");
+
+        driver.ctrl_char('w');
+        driver.render();
+
+        assert_eq!(
+            painted_tab_count(&driver),
+            2,
+            "#2283 §4: with the filter blurred, a bare `Ctrl-W` closes the \
+             active document tab exactly as before:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// The latch half of the same guard: a `Ctrl-W` swallowed by the focused
+    /// filter must not leave the §9 pane-chord latch armed either, or the
+    /// user's next keystroke is spent resolving a chord that never happened.
+    ///
+    /// Typing `w` (a §9 chord key) right after proves it: with the latch
+    /// leaked, the `w` moves pane focus instead of reaching the filter.
+    #[test]
+    fn ctrl_w_in_the_focused_board_filter_leaves_no_armed_pane_chord_latch() {
+        let mut driver = doc_tabs_driver(&[101, 102], 120, 40);
+        driver.press(Key::Char('/'));
+        driver.render();
+
+        driver.ctrl_char('w');
+        driver.press(Key::Char('w'));
+        driver.render();
+
+        assert!(
+            !driver.screen_contains(BOARD_FILTER_PLACEHOLDER),
+            "#2288 review: the `w` after a filter-swallowed `Ctrl-W` must be \
+             typed into the filter, not spent on the §9 latch:\n{}",
+            driver.screen()
+        );
+        assert_eq!(
+            painted_tab_count(&driver),
+            2,
+            "#2288 review: …and neither key may close a document tab:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #2288 review (blocking finding, second half): resolving a §9 pane
+    /// chord must also disarm #605's `Ctrl-W` leader.
+    ///
+    /// With **zero** tabs open the leader — not §4's close arm — is what
+    /// armed the §9 latch, and `resolve_board_pane_chord` returns before the
+    /// leader's own Step 2 ever runs. Leaving `ctrl_w_pending` set therefore
+    /// made the leader's "any other key cancels" branch silently swallow the
+    /// keystroke immediately after the chord.
+    #[test]
+    fn a_resolved_pane_chord_disarms_the_ctrl_w_leader() {
+        let mut driver = doc_tabs_driver(&[], 120, 40);
+        driver.ctrl_char('w');
+        driver.press(Key::Char('v'));
+        driver.render();
+        assert!(
+            !divider_cells(&driver).is_empty(),
+            "precondition: `Ctrl-W v` splits a zero-tab Board panel too:\n{}",
+            driver.screen()
+        );
+
+        // The very next keystroke must reach the app.
+        driver.press(Key::Char('?'));
+        driver.render();
+        assert!(
+            driver.screen_contains("Ctrl-W v"),
+            "#2288 review: the key after a resolved pane chord must not be \
+             eaten by a still-armed #605 `Ctrl-W` leader — `?` must open the \
+             help overlay:\n{}",
+            driver.screen()
+        );
+    }
+
+    // ── #2288 review (blocking finding, third round): the wheel and the ──
+    //    split
+    //
+    // Two defects the §9 slice never reached, both in the *event* layer
+    // rather than the model layer:
+    //
+    //   1. `mouse_main_scroll`'s Board arm ignored the `pos` its own wheel
+    //      event carries and always scrolled the FOCUSED pane, so hovering
+    //      the other pane and scrolling moved the wrong body.
+    //   2. `last_issue_panel_cols` was one shared `Cell` written once per
+    //      *pane* per frame, so after the paint loop it held whichever pane
+    //      painted last — and `mouse_main_scroll` re-derives its scroll
+    //      clamp from `board_issue_body_list()`, which word-wraps at that
+    //      width. A pane narrower than its neighbour therefore clamped
+    //      against its neighbour's (shorter) line count and could not be
+    //      scrolled to the end of its own body.
+    //
+    // Both are asserted black-box, off the painted grid, through the real
+    // `event → handle → render` path.
+
+    /// One issue body long enough to overflow a 40-row pane, with `prefix`
+    /// stamped on every paragraph so the two panes' bodies are told apart
+    /// on screen, and `MARKER` planted near (not at) the end.
+    ///
+    /// Near the end, not at it: `mouse_main_scroll`'s `visible` counts the
+    /// pane's whole rect, including the two tab rows above the body, so the
+    /// clamp has always stopped a row or two short of the true last line.
+    /// That is pre-existing and orthogonal — pinning the marker a couple of
+    /// paragraphs in keeps this test measuring the wrap width rather than
+    /// that off-by-two.
+    fn split_scroll_body(prefix: &str, marker: &str) -> String {
+        let mut paras: Vec<String> = (1..=20)
+            .map(|i| {
+                format!(
+                    "{prefix}-{i:02} lorem ipsum dolor sit amet consectetur \
+                     adipiscing elit sed do eiusmod tempor"
+                )
+            })
+            .collect();
+        paras.push(marker.to_string());
+        paras.push(format!("{prefix}-tail one"));
+        paras.push(format!("{prefix}-tail two"));
+        // `\n\n` as two *escape sequences*: this string is interpolated into
+        // a JSON document, so the newlines have to survive `serde_json`.
+        paras.join("\\n\\n")
+    }
+
+    /// The `DOC_TAB_BOARD_JSON` fixture's two issues, given long bodies.
+    fn split_scroll_board_json() -> String {
+        format!(
+            r#"{{
+              "issues": [
+                {{"repo_name": "claude-coordinator", "number": 101, "title": "Fix login race timeout", "state": "open", "labels": ["coord"], "body": "{}"}},
+                {{"repo_name": "claude-coordinator", "number": 102, "title": "Auth token refresh bug", "state": "open", "labels": ["coord"], "body": "{}"}}
+              ]
+            }}"#,
+            split_scroll_body("AAA", "MARK101"),
+            split_scroll_body("BBB", "MARK102"),
+        )
+    }
+
+    /// Cell coordinates of the first occurrence of `needle` at a column
+    /// strictly greater than `min_col`.
+    ///
+    /// Char-indexed, not byte-indexed: the painted grid is full of
+    /// multi-byte box-drawing glyphs (`║` not least), and a byte offset
+    /// would not be a column.
+    fn find_after_col<A: quadraui::AppLogic>(
+        d: &quadraui::tui::testing::TuiDriver<A>,
+        needle: &str,
+        min_col: usize,
+    ) -> Option<(f32, f32)> {
+        let needle: Vec<char> = needle.chars().collect();
+        for (row, line) in d.screen().lines().enumerate() {
+            let cells: Vec<char> = line.chars().collect();
+            for start in (min_col + 1)..cells.len() {
+                if start + needle.len() <= cells.len() && cells[start..start + needle.len()] == needle[..] {
+                    return Some((start as f32 + 0.5, row as f32 + 0.5));
+                }
+            }
+        }
+        None
+    }
+
+    /// The painted text of columns `[from, to)` across the divider's own row
+    /// span — i.e. exactly one pane's half of the panel, with the toolbar
+    /// above it and the status bar below it (both of which carry a live
+    /// `↻ Ns` clock, #1996) excluded.
+    fn pane_text<A: quadraui::AppLogic>(
+        d: &quadraui::tui::testing::TuiDriver<A>,
+        from: usize,
+        to: usize,
+    ) -> String {
+        let rows: Vec<usize> = divider_cells(d).iter().map(|(_, r)| *r).collect();
+        let (top, bottom) = (
+            *rows.iter().min().expect("a split panel paints a divider"),
+            *rows.iter().max().expect("a split panel paints a divider"),
+        );
+        d.screen()
+            .lines()
+            .enumerate()
+            .filter(|(row, _)| *row >= top && *row <= bottom)
+            .map(|(_, line)| {
+                line.chars()
+                    .skip(from)
+                    .take(to.saturating_sub(from))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Dispatch one mouse-wheel notch at `pos`; `dy < 0.0` scrolls down,
+    /// matching `mouse_main_scroll`'s `delta.y` convention.
+    fn wheel_at<A: quadraui::AppLogic>(
+        driver: &mut quadraui::tui::testing::TuiDriver<A>,
+        pos: (f32, f32),
+        dy: f32,
+    ) {
+        driver.dispatch(quadraui::UiEvent::Scroll {
+            widget: None,
+            delta: ScrollDelta::new(0.0, dy),
+            position: Point::new(pos.0, pos.1),
+        });
+        driver.render();
+    }
+
+    /// A split Board panel with a long-bodied issue on the **Issue**
+    /// sub-tab in *each* pane: #102 on the left (pane 0), #101 on the right
+    /// (pane 1, focused — `Ctrl-W v` focuses the new pane).
+    fn split_issue_bodies_driver() -> quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic> {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = doc_tab_app(&split_scroll_board_json());
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 102), true);
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        driver.set_double_click_folding(false);
+        driver.render();
+
+        // Left pane onto the Issue sub-tab (still the only pane, so `find`
+        // is unambiguous).
+        let (x, y) = driver.find("Issue").expect("the Board sub-tab bar");
+        driver.click(x, y);
+        driver.render();
+        assert!(
+            driver.screen_contains("BBB-01"),
+            "precondition: the left pane shows #102's body:\n{}",
+            driver.screen()
+        );
+
+        // Split, then fill the new (focused) right pane with #101.
+        driver.ctrl_char('w');
+        driver.press(Key::Char('v'));
+        driver.render();
+        let (x, y) = driver
+            .find("#101  Fix login")
+            .expect("the sidebar row for #101");
+        driver.click(x, y);
+        driver.render();
+
+        // …and put THAT pane on the Issue sub-tab too — the second `Issue`
+        // label on the bar, i.e. the one right of the divider.
+        let col = divider_column(&driver);
+        let (x, y) = find_after_col(&driver, "Issue", col)
+            .expect("the right pane's own sub-tab bar");
+        driver.click(x, y);
+        driver.render();
+        assert!(
+            driver.screen_contains("AAA-01"),
+            "precondition: the right pane shows #101's body:\n{}",
+            driver.screen()
+        );
+        driver
+    }
+
+    /// The wheel scrolls the pane the CURSOR is over, even when that pane is
+    /// not the focused one — and leaves the focused pane's body exactly
+    /// where it was.
+    ///
+    /// Before the fix `mouse_main_scroll`'s Board arm dropped `pos` on the
+    /// floor and moved `self.detail_scroll`, i.e. always the focused pane:
+    /// scrolling over the left pane scrolled the right one instead.
+    #[test]
+    fn wheel_over_the_unfocused_pane_scrolls_that_pane_not_the_focused_one() {
+        let mut driver = split_issue_bodies_driver();
+        let col = divider_column(&driver);
+        let rows: Vec<usize> = divider_cells(&driver).iter().map(|(_, r)| *r).collect();
+        let body_row = *rows.iter().max().expect("a divider row") as f32 - 0.5;
+
+        let left_before = pane_text(&driver, 39, col);
+        let right_before = pane_text(&driver, col + 1, 120);
+
+        // Hover the LEFT (unfocused) pane and scroll down.
+        wheel_at(&mut driver, (col as f32 - 4.5, body_row), -1.0);
+
+        let left_after = pane_text(&driver, 39, col);
+        let right_after = pane_text(&driver, col + 1, 120);
+        assert_ne!(
+            left_before, left_after,
+            "#2288 review: a wheel notch over the LEFT pane must scroll the \
+             LEFT pane's body, focused or not:\n{}",
+            driver.screen()
+        );
+        assert_eq!(
+            right_before, right_after,
+            "#2288 review: …and must leave the focused RIGHT pane's body \
+             exactly where it was:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// The mirror case, so the assertion above cannot pass by scrolling
+    /// *both* panes: a notch over the focused right pane moves only it.
+    #[test]
+    fn wheel_over_the_focused_pane_leaves_the_other_pane_alone() {
+        let mut driver = split_issue_bodies_driver();
+        let col = divider_column(&driver);
+        let rows: Vec<usize> = divider_cells(&driver).iter().map(|(_, r)| *r).collect();
+        let body_row = *rows.iter().max().expect("a divider row") as f32 - 0.5;
+
+        let left_before = pane_text(&driver, 39, col);
+        let right_before = pane_text(&driver, col + 1, 120);
+
+        wheel_at(&mut driver, (col as f32 + 5.5, body_row), -1.0);
+
+        assert_eq!(
+            left_before,
+            pane_text(&driver, 39, col),
+            "#2288 review: a notch over the RIGHT pane must not disturb the \
+             left pane:\n{}",
+            driver.screen()
+        );
+        assert_ne!(
+            right_before,
+            pane_text(&driver, col + 1, 120),
+            "#2288 review: …and must scroll the right pane:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// A pane narrower than its neighbour can still be scrolled to the end
+    /// of its **own** body.
+    ///
+    /// The narrow pane wraps its body into more lines than the wide one
+    /// does, so its scroll maximum is larger. With a single shared
+    /// `last_issue_panel_cols`, the wide pane (painted second) left its
+    /// width standing in the cell, `mouse_main_scroll` re-wrapped the narrow
+    /// pane's body at the WIDE width, got a much shorter line count, and
+    /// clamped the wheel long before the narrow pane's real last line —
+    /// `MARK102` — the left pane's own marker — stayed unreachable no
+    /// matter how far the user scrolled.
+    #[test]
+    fn a_narrow_pane_scrolls_to_the_end_of_its_own_wrapped_body() {
+        let mut driver = split_issue_bodies_driver();
+
+        // Squeeze the left pane: divider hard over to the left, so pane 0 is
+        // much narrower than pane 1 (and, being painted first, is the one a
+        // shared width cell would mis-measure).
+        let col = divider_column(&driver);
+        let row = divider_cells(&driver)[0].1;
+        driver.drag(
+            col as f32 + 0.5,
+            row as f32 + 0.5,
+            col as f32 - 20.5,
+            row as f32 + 0.5,
+        );
+        driver.render();
+        let col = divider_column(&driver);
+
+        // Focus the narrow left pane (`Ctrl-W w` wraps 1 → 0) so the wheel's
+        // pane resolution is not what this test is measuring.
+        driver.ctrl_char('w');
+        driver.press(Key::Char('w'));
+        driver.render();
+
+        assert!(
+            !pane_text(&driver, 39, col).contains("MARK102"),
+            "precondition: the marker is below the fold before scrolling:\n{}",
+            driver.screen()
+        );
+
+        let rows: Vec<usize> = divider_cells(&driver).iter().map(|(_, r)| *r).collect();
+        let body_row = *rows.iter().max().expect("a divider row") as f32 - 0.5;
+        for _ in 0..200 {
+            wheel_at(&mut driver, (col as f32 - 4.5, body_row), -1.0);
+        }
+
+        assert!(
+            pane_text(&driver, 39, col).contains("MARK102"),
+            "#2288 review: the narrow pane's wheel must clamp against ITS OWN \
+             wrapped line count, not the wider neighbour's — the end of its \
+             body has to be reachable:\n{}",
+            driver.screen()
+        );
+    }
+
+    // ── #2288 review (blocking, carried from round 2) ─────────────────────
+    //
+    // Two findings the review rounds after #2 never re-confirmed (the #603
+    // context digest truncated them, fixed by #2466) and that were still
+    // live in the code: the exit writer dropped the unfocused pane's whole
+    // tab set, and the file-issue modal overlay painted once per pane.
+
+    /// The persisted file shape is per-**scope**, so a split has to be
+    /// flattened on the way out — but flattening must not *lose* anything.
+    /// Split the Board panel, pin an issue in the new pane, quit: before
+    /// this fix `~/.coord/tabs.json` came back holding only the focused
+    /// pane's tab and #101 was silently gone forever.
+    #[test]
+    fn a_split_scopes_tabs_all_survive_the_exit_round_trip() {
+        let path = std::env::temp_dir().join(format!(
+            "coord_tabs_split_roundtrip_{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let mut app = doc_tab_app(DOC_TAB_BOARD_JSON);
+        let left = ("claude-coordinator".to_string(), 101);
+        let right = ("claude-coordinator".to_string(), 102);
+        app.open_board_doc_tab(left.clone(), true);
+        assert!(
+            app.split_board_pane_right(),
+            "precondition: `Ctrl-W v` splits an unsplit Board panel"
+        );
+        app.open_board_doc_tab(right.clone(), true);
+
+        {
+            let panes = app.doc_tabs.panes(PanelScope::Board);
+            assert!(panes.is_split(), "precondition: two panes");
+            assert_eq!(
+                panes.pane(0).tabs(),
+                &[left.clone()],
+                "precondition: #101 is open in the LEFT (unfocused) pane only"
+            );
+            assert_eq!(
+                panes.pane(1).tabs(),
+                &[right.clone()],
+                "precondition: #102 is open in the RIGHT (focused) pane only"
+            );
+        }
+
+        // Exactly what `persist_doc_tabs_on_exit` does, minus the `~/.coord`
+        // path resolution `save()` adds on top.
+        app.checkpoint_all_detail_sub_state();
+        app.doc_tabs.save_to_path(&path).expect("write the temp file");
+        let restored = super::doc_tabs::DocTabs::load_from_path(&path);
+        let _ = std::fs::remove_file(&path);
+
+        let group = restored.group(PanelScope::Board);
+        assert!(
+            group.index_of(&left).is_some(),
+            "#2288 review (blocking): the UNFOCUSED pane's tab must survive \
+             the quit — persisting only the focused pane silently deleted it. \
+             Restored strip: {:?}",
+            group.tabs()
+        );
+        assert!(
+            group.index_of(&right).is_some(),
+            "…and the focused pane's tab is still there too: {:?}",
+            group.tabs()
+        );
+        assert_eq!(
+            group.active_key(),
+            Some(&right),
+            "#2288 §6: the document the user was actually looking at on the \
+             way out is the one that comes back active"
+        );
+    }
+
+    /// A document only ever open in the *unfocused* pane keeps its own
+    /// sub-tab across the round trip — the union takes each document's
+    /// sub-state from the pane it actually lives in, not from the focused
+    /// pane's map.
+    #[test]
+    fn an_unfocused_panes_document_keeps_its_sub_tab_across_the_round_trip() {
+        let path = std::env::temp_dir().join(format!(
+            "coord_tabs_split_substate_{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let mut app = doc_tab_app(DOC_TAB_BOARD_JSON);
+        let left = ("claude-coordinator".to_string(), 101);
+        let right = ("claude-coordinator".to_string(), 102);
+        app.open_board_doc_tab(left.clone(), true);
+        // Read #101 on its `Issue` sub-tab, then split away from it: the
+        // split's own checkpoint banks the live field into #101's record.
+        app.board_detail_tab = BoardDetailTab::Issue;
+        assert!(app.split_board_pane_right());
+        app.open_board_doc_tab(right.clone(), true);
+        app.board_detail_tab = BoardDetailTab::Chat;
+
+        app.checkpoint_all_detail_sub_state();
+        app.doc_tabs.save_to_path(&path).expect("write the temp file");
+        let restored = super::doc_tabs::DocTabs::load_from_path(&path);
+        let _ = std::fs::remove_file(&path);
+
+        let group = restored.group(PanelScope::Board);
+        assert_eq!(
+            group.sub_state(&left).map(|s| s.board_tab),
+            Some(BoardDetailTab::Issue),
+            "#2288 review + #2286 §6: the background pane's document must \
+             restore onto ITS OWN sub-tab, not the scope default"
+        );
+        assert_eq!(
+            group.sub_state(&right).map(|s| s.board_tab),
+            Some(BoardDetailTab::Chat),
+            "…and the focused pane's document onto its own"
+        );
+    }
+
+    /// An unsplit scope's bytes are untouched by the union — every #2286
+    /// scenario has one pane, and `merged_for_persist` is `focused().clone()`
+    /// there, so the file must be identical to the one the same tab set
+    /// produced before a pane ever existed. Splitting *away* from a scope and
+    /// then collapsing back must land on those same bytes.
+    #[test]
+    fn an_unsplit_scope_persists_exactly_what_it_did_before_the_split_existed() {
+        // `persist_doc_tabs_on_exit` always checkpoints the live sub-state
+        // into the active document's record before it saves (#2286 review,
+        // blocking) — a real quit never writes an un-checkpointed byte. Both
+        // snapshots checkpoint first so this test compares what actually
+        // reaches disk on exit, not an artifact of `split_board_pane_right`
+        // checkpointing internally while a bare `save_to_path` call does not.
+        let write = |app: &mut CoordApp, tag: &str| -> String {
+            app.checkpoint_all_detail_sub_state();
+            let path = std::env::temp_dir().join(format!(
+                "coord_tabs_unsplit_bytes_{tag}_{}.json",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&path);
+            app.doc_tabs.save_to_path(&path).expect("write the temp file");
+            let text = std::fs::read_to_string(&path).expect("read it back");
+            let _ = std::fs::remove_file(&path);
+            text
+        };
+
+        let mut app = doc_tab_app(DOC_TAB_BOARD_JSON);
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 101), true);
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 102), false);
+        let before = write(&mut app, "before");
+
+        assert!(app.split_board_pane_right());
+        assert!(
+            app.close_focused_board_pane(),
+            "precondition: `Ctrl-W x` collapses back to one pane"
+        );
+        let after = write(&mut app, "after");
+
+        assert_eq!(
+            before, after,
+            "#2288 §9 last bullet: with one pane the writer must be \
+             byte-identical to the pre-split one"
+        );
+    }
+
+    /// The same issue open in BOTH panes is one document in the file — the
+    /// persisted shape has no room for two, and a duplicate would restore as
+    /// two identical tabs only the leftmost of which is ever reachable
+    /// (#2286 review, non-blocking 2).
+    #[test]
+    fn a_document_open_in_both_panes_is_persisted_once() {
+        let path = std::env::temp_dir().join(format!(
+            "coord_tabs_split_dedup_{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let mut app = doc_tab_app(DOC_TAB_BOARD_JSON);
+        let key = ("claude-coordinator".to_string(), 101);
+        app.open_board_doc_tab(key.clone(), true);
+        assert!(app.split_board_pane_right());
+        app.open_board_doc_tab(key.clone(), true);
+
+        app.doc_tabs.save_to_path(&path).expect("write the temp file");
+        let restored = super::doc_tabs::DocTabs::load_from_path(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            restored.group(PanelScope::Board).tabs(),
+            &[key],
+            "#2288 review: the union de-duplicates by document key"
+        );
+    }
+
+    /// §9 + #316: the file-issue modal is a panel-level overlay, and
+    /// `render_board_pane` now runs once per pane — so an ungated overlay
+    /// painted TWO copies, the second one squatting over the other pane's
+    /// content. It must paint exactly once, inside the focused pane.
+    #[test]
+    fn the_file_issue_modal_paints_once_inside_the_focused_pane() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = doc_tab_app(DOC_TAB_BOARD_JSON);
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 101), true);
+        assert!(app.split_board_pane_right());
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 102), true);
+        // The focused (right) pane is the one showing Chat with the modal
+        // up — the only pane `open_file_issue_modal` can ever have run from.
+        app.board_detail_tab = BoardDetailTab::Chat;
+        app.file_issue_modal = Some(FileIssueModal {
+            title: "MODALNEEDLE".to_string(),
+            body: "body line".to_string(),
+            repo_github: "JDonaghy/claude-coordinator".to_string(),
+            submitting: false,
+        });
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        driver.set_double_click_folding(false);
+        driver.render();
+
+        let divider = divider_column(&driver);
+        let screen = driver.screen();
+        assert_eq!(
+            screen.matches("MODALNEEDLE").count(),
+            1,
+            "#2288 review (blocking): the file-issue modal must paint EXACTLY \
+             once across a split panel — 0 means the pane gate swallowed it, \
+             2 means every pane painted its own copy:\n{screen}"
+        );
+        let col = screen
+            .lines()
+            .find_map(|line| line.find("MODALNEEDLE"))
+            .expect("the modal was painted");
+        assert!(
+            col > divider,
+            "#2288 review: the single copy belongs to the FOCUSED (right) \
+             pane — it must sit right of the divider at column {divider}, not \
+             over the left pane's content (found at column {col}):\n{screen}"
         );
     }

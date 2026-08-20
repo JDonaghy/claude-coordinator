@@ -1792,7 +1792,17 @@ impl CoordApp {
             }
         }
         if !help.actions.is_empty() {
-            items.push(cheatsheet_header_item("Actions"));
+            // #2288 (ms-65 §8b/§9): the Board cheatsheet's second section is
+            // "Split" — §9's four pane keys — not the generic "Actions"
+            // every other registered view gets. Same per-view special case,
+            // and for the same reason, as the "Document tabs" header above:
+            // `mocks/board-tabs-help-overlay.screen` row 11 pins the word.
+            let actions_header = if self.active_view == SidebarView::Board {
+                "Split"
+            } else {
+                "Actions"
+            };
+            items.push(cheatsheet_header_item(actions_header));
             for action in &help.actions {
                 items.push(cheatsheet_entry_item(
                     &action.label,
