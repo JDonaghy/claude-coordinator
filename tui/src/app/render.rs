@@ -192,6 +192,10 @@ impl ShellApp for CoordApp {
                     .map(|(_, rect)| *rect)
                     .collect();
                 *self.board_split_layout.borrow_mut() = Some(split_layout);
+                // #2288: a pane that no longer exists must not leave its
+                // Issue wrap width behind for whatever pane later recycles
+                // its index.
+                self.truncate_board_pane_issue_cols(leaves.len());
                 for (pane_idx, pane_rect) in leaves.into_iter().enumerate() {
                     self.render_pane.set(Some(pane_idx));
                     self.render_board_pane(backend, pane_rect, lh);
@@ -1822,7 +1826,16 @@ impl CoordApp {
             BoardDetailTab::Issue => {
                 // #669: stash content width so board_issue_body_list can
                 // word-wrap long lines to the viewport.
-                self.last_issue_panel_cols.set(content_rect.width as usize);
+                //
+                // #2288 (ms-65 §9): stashed PER PANE, not in the shared
+                // `last_issue_panel_cols` cell. Two panes are painted in one
+                // pass and each is roughly half the panel wide, so a shared
+                // cell would leave the second-painted pane's width standing
+                // for both — wrong wrap for the first pane's body here, and
+                // (because the cell outlives the frame) a wrong scroll clamp
+                // in `mouse_main_scroll`, which re-derives `items.len()`
+                // from it after the paint.
+                self.stash_board_pane_issue_cols(content_rect.width as usize);
                 backend.draw_list(content_rect, &self.board_issue_body_list());
             }
             // #316: Chat tab — empty state CTA or live board chat.
@@ -2249,7 +2262,9 @@ impl CoordApp {
     ///    sessions don't re-fetch) and show a placeholder.
     pub(crate) fn board_issue_body_list(&self) -> ListView {
         // #669: use the panel width stashed at draw time for word-wrapping.
-        let wrap_width = self.last_issue_panel_cols.get().max(40);
+        // #2288 (ms-65 §9): the ADDRESSED pane's own stashed width — see
+        // `CoordApp::board_issue_wrap_cols`.
+        let wrap_width = self.board_issue_wrap_cols().max(40);
         // #2282 (ms-65 §2): the Issue sub-tab's body follows the ACTIVE
         // DOCUMENT TAB, not the tree cursor (see `board_detail_issue_group`).
         let repo = self.board_detail_repo().map(str::to_string);

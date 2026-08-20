@@ -7101,21 +7101,31 @@ impl CoordApp {
         }
         match self.active_view {
             SidebarView::Board => {
-                // Use the active tab's actual list so the scroll max matches
-                // what's rendered. Board tab → detail_list; Issue tab → body.
-                // Chat tab scroll is handled by ChatController itself.
-                let items = match self.board_detail_tab {
-                    BoardDetailTab::Board => self.detail_list().items.len(),
-                    BoardDetailTab::Issue => self.board_issue_body_list().items.len(),
-                    BoardDetailTab::Chat => 0,
-                    BoardDetailTab::Terminal => 0, // #675: scroll handled by the PTY session
-                };
-                let max = items.saturating_sub(visible.saturating_sub(1));
-                if delta.y > 0.0 {
-                    self.detail_scroll = self.detail_scroll.saturating_sub(1);
-                } else if delta.y < 0.0 {
-                    self.detail_scroll = (self.detail_scroll + 1).min(max);
+                // #2288 (ms-65 §9): the wheel scrolls the pane the CURSOR is
+                // over, not the focused one — the same rule the click and
+                // drag handlers already follow via `board_split_pane_at`,
+                // and the only reading of "each pane is independent" that
+                // matches how anyone uses a side-by-side split (hover the
+                // right pane, scroll the right pane).
+                //
+                // Unsplit — or before the first paint has cached a layout —
+                // there is exactly one leaf whose rect IS `main_b`, so this
+                // resolves to the focused pane and the arm behaves as it did
+                // pre-#2288. Split but outside every leaf means the cursor is
+                // on the divider column: nothing there owns the wheel.
+                let hit = self.board_split_pane_at(pos);
+                if hit.is_none() && self.board_panes().is_split() {
+                    return false;
                 }
+                let (pane, visible) = match hit {
+                    // A pane is full panel height in a side-by-side split, so
+                    // this equals `visible` today; deriving it from the
+                    // pane's own rect keeps it correct if §9 ever grows a
+                    // horizontal split.
+                    Some((idx, rect)) => (idx, content_visible_rows(rect, lh)),
+                    None => (self.board_panes().focused_index(), visible),
+                };
+                self.scroll_board_pane(pane, delta, visible);
                 true
             }
             SidebarView::Machines => {
@@ -7434,5 +7444,41 @@ impl CoordApp {
                 true
             }
         }
+    }
+
+    /// #2288 (ms-65 §9): apply one wheel notch to Board pane `pane`, whether
+    /// or not that pane is the focused one.
+    ///
+    /// Every list length below has to be measured **as that pane sees it** —
+    /// its own active document, its own sub-tab, its own Issue wrap width —
+    /// so this borrows the paint path's own addressing cursor (`render_pane`)
+    /// for the duration of the reads and puts it back afterwards. Without
+    /// that, an unfocused pane's clamp would be computed from the focused
+    /// pane's document and the numbers would describe a body that is not on
+    /// screen anywhere.
+    fn scroll_board_pane(&mut self, pane: usize, delta: ScrollDelta, visible: usize) {
+        let restore = self.render_pane.replace(Some(pane));
+        // Use the addressed pane's active sub-tab's actual list so the scroll
+        // max matches what's rendered. Board tab → detail_list; Issue tab →
+        // body. Chat tab scroll is handled by ChatController itself, and the
+        // Terminal tab's by the PTY session (#675).
+        let items = match self.board_pane_detail_tab() {
+            BoardDetailTab::Board => self.detail_list().items.len(),
+            BoardDetailTab::Issue => self.board_issue_body_list().items.len(),
+            BoardDetailTab::Chat => 0,
+            BoardDetailTab::Terminal => 0,
+        };
+        let current = self.board_pane_detail_scroll();
+        self.render_pane.set(restore);
+
+        let max = items.saturating_sub(visible.saturating_sub(1));
+        let next = if delta.y > 0.0 {
+            current.saturating_sub(1)
+        } else if delta.y < 0.0 {
+            (current + 1).min(max)
+        } else {
+            return;
+        };
+        self.set_board_pane_detail_scroll(pane, next);
     }
 }

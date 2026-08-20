@@ -2684,6 +2684,24 @@ pub struct CoordApp {
     /// called on each render.  Defaults to 120.  Used by `issue_body_list` to
     /// word-wrap long lines to the viewport width (#669).
     last_issue_panel_cols: std::cell::Cell<usize>,
+    /// #2288 (ms-65 §9): the Board panel's Issue sub-tab content width, in
+    /// backend units, **per pane** — entry `i` is the width pane `i` last
+    /// painted its Issue body at.
+    ///
+    /// A single shared `Cell` (`last_issue_panel_cols`) cannot express this
+    /// once the panel can hold two panes at once: `render_content` paints
+    /// both, so the second-painted pane's width would overwrite the first's
+    /// and outlive the frame, and `mouse_main_scroll` — which reads
+    /// `board_issue_body_list().items.len()` to clamp the wheel — would
+    /// word-wrap at the *other* pane's width and clamp to a line count that
+    /// never appeared on screen. Indexing by pane keeps each pane's wrap
+    /// width its own, and leaves `last_issue_panel_cols` to the Pipeline
+    /// panel, which is still single-pane.
+    ///
+    /// Empty (or a `0` entry) means "this pane has not painted its Issue
+    /// body yet", which falls back to `last_issue_panel_cols` so a
+    /// never-painted fixture keeps the 120-column default it always had.
+    board_pane_issue_cols: std::cell::RefCell<Vec<usize>>,
     /// Minimum age in days for a done/failed assignment row to be eligible
     /// for the 'P' purge action.  Default 7.
     ///
@@ -3897,6 +3915,7 @@ impl CoordApp {
             last_main_visible_rows: std::cell::Cell::new(40),
             last_log_panel_cols: std::cell::Cell::new(120),
             last_issue_panel_cols: std::cell::Cell::new(120),
+            board_pane_issue_cols: std::cell::RefCell::new(Vec::new()),
             purge_days: 7,
             sidebar_action_bar_hover: ToolbarHoverTracker::new(),
             panel_toolbar_hover: ToolbarHoverTracker::new(),
@@ -7144,6 +7163,62 @@ impl CoordApp {
             Some(state) => state.scroll,
             None => self.detail_scroll,
         }
+    }
+
+    /// Write `pane` scroll offset back, wherever that pane keeps it.
+    ///
+    /// The mirror of [`Self::board_pane_detail_scroll`]: the focused pane's
+    /// offset is the live `detail_scroll` field, every other pane's is
+    /// banked in its active document's [`DetailSubState`]. A pane holding no
+    /// document has nowhere to put it — and nothing on screen to scroll — so
+    /// that case is a deliberate no-op.
+    pub(crate) fn set_board_pane_detail_scroll(&mut self, pane: usize, scroll: usize) {
+        let panes = self.doc_tabs.panes(PanelScope::Board);
+        if pane >= panes.len() || pane == panes.focused_index() {
+            self.detail_scroll = scroll;
+            return;
+        }
+        let group = panes.pane(pane);
+        let Some(key) = group.active_key().cloned() else {
+            return;
+        };
+        let mut state = group.sub_state(&key).cloned().unwrap_or_default();
+        state.scroll = scroll;
+        self.doc_tabs
+            .panes_mut(PanelScope::Board)
+            .pane_mut(pane)
+            .set_sub_state(key, state);
+    }
+
+    /// #2288 (ms-65 §9): stash the Issue sub-tab content width for the pane
+    /// currently being painted — see [`Self::board_pane_issue_cols`].
+    pub(crate) fn stash_board_pane_issue_cols(&self, cols: usize) {
+        let idx = self.board_render_pane();
+        let mut widths = self.board_pane_issue_cols.borrow_mut();
+        if widths.len() <= idx {
+            widths.resize(idx + 1, 0);
+        }
+        widths[idx] = cols;
+    }
+
+    /// #2288 (ms-65 §9): the word-wrap width `board_issue_body_list` must
+    /// use — the *addressed* pane's own last painted width, never whichever
+    /// pane happened to paint last.
+    pub(crate) fn board_issue_wrap_cols(&self) -> usize {
+        let idx = self.board_render_pane();
+        self.board_pane_issue_cols
+            .borrow()
+            .get(idx)
+            .copied()
+            .filter(|cols| *cols > 0)
+            .unwrap_or_else(|| self.last_issue_panel_cols.get())
+    }
+
+    /// Drop stashed Issue widths for panes that no longer exist, so a pane
+    /// index recycled by a later `Ctrl-W v` never inherits the width the
+    /// pane that used to live there painted at.
+    pub(crate) fn truncate_board_pane_issue_cols(&self, panes: usize) {
+        self.board_pane_issue_cols.borrow_mut().truncate(panes);
     }
 
     /// The banked sub-state of the addressed pane's active document, or

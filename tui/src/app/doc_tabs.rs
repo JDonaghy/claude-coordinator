@@ -629,6 +629,22 @@ impl PaneSet {
         self.panes.get(idx).unwrap_or_else(|| self.focused())
     }
 
+    /// How many panes this scope currently holds — always ≥ 1.
+    pub(crate) fn len(&self) -> usize {
+        self.panes.len()
+    }
+
+    /// Mutable [`Self::pane`], with the same out-of-range rule: a stale
+    /// index falls back to the focused pane rather than panicking.
+    pub(crate) fn pane_mut(&mut self, idx: usize) -> &mut DocTabGroup {
+        let idx = if idx < self.panes.len() {
+            idx
+        } else {
+            self.focused
+        };
+        &mut self.panes[idx]
+    }
+
     /// Contract §9 `Ctrl-W v`: split the focused pane right. The new pane is
     /// empty and takes focus — the mock settles this
     /// (`mocks/board-split-side-by-side.screen` shows the post-split single

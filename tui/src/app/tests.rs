@@ -51241,3 +51241,299 @@ Milestone tracking issue.
             driver.screen()
         );
     }
+
+    // ── #2288 review (blocking finding, third round): the wheel and the ──
+    //    split
+    //
+    // Two defects the §9 slice never reached, both in the *event* layer
+    // rather than the model layer:
+    //
+    //   1. `mouse_main_scroll`'s Board arm ignored the `pos` its own wheel
+    //      event carries and always scrolled the FOCUSED pane, so hovering
+    //      the other pane and scrolling moved the wrong body.
+    //   2. `last_issue_panel_cols` was one shared `Cell` written once per
+    //      *pane* per frame, so after the paint loop it held whichever pane
+    //      painted last — and `mouse_main_scroll` re-derives its scroll
+    //      clamp from `board_issue_body_list()`, which word-wraps at that
+    //      width. A pane narrower than its neighbour therefore clamped
+    //      against its neighbour's (shorter) line count and could not be
+    //      scrolled to the end of its own body.
+    //
+    // Both are asserted black-box, off the painted grid, through the real
+    // `event → handle → render` path.
+
+    /// One issue body long enough to overflow a 40-row pane, with `prefix`
+    /// stamped on every paragraph so the two panes' bodies are told apart
+    /// on screen, and `MARKER` planted near (not at) the end.
+    ///
+    /// Near the end, not at it: `mouse_main_scroll`'s `visible` counts the
+    /// pane's whole rect, including the two tab rows above the body, so the
+    /// clamp has always stopped a row or two short of the true last line.
+    /// That is pre-existing and orthogonal — pinning the marker a couple of
+    /// paragraphs in keeps this test measuring the wrap width rather than
+    /// that off-by-two.
+    fn split_scroll_body(prefix: &str, marker: &str) -> String {
+        let mut paras: Vec<String> = (1..=20)
+            .map(|i| {
+                format!(
+                    "{prefix}-{i:02} lorem ipsum dolor sit amet consectetur \
+                     adipiscing elit sed do eiusmod tempor"
+                )
+            })
+            .collect();
+        paras.push(marker.to_string());
+        paras.push(format!("{prefix}-tail one"));
+        paras.push(format!("{prefix}-tail two"));
+        // `\n\n` as two *escape sequences*: this string is interpolated into
+        // a JSON document, so the newlines have to survive `serde_json`.
+        paras.join("\\n\\n")
+    }
+
+    /// The `DOC_TAB_BOARD_JSON` fixture's two issues, given long bodies.
+    fn split_scroll_board_json() -> String {
+        format!(
+            r#"{{
+              "issues": [
+                {{"repo_name": "claude-coordinator", "number": 101, "title": "Fix login race timeout", "state": "open", "labels": ["coord"], "body": "{}"}},
+                {{"repo_name": "claude-coordinator", "number": 102, "title": "Auth token refresh bug", "state": "open", "labels": ["coord"], "body": "{}"}}
+              ]
+            }}"#,
+            split_scroll_body("AAA", "MARK101"),
+            split_scroll_body("BBB", "MARK102"),
+        )
+    }
+
+    /// Cell coordinates of the first occurrence of `needle` at a column
+    /// strictly greater than `min_col`.
+    ///
+    /// Char-indexed, not byte-indexed: the painted grid is full of
+    /// multi-byte box-drawing glyphs (`║` not least), and a byte offset
+    /// would not be a column.
+    fn find_after_col<A: quadraui::AppLogic>(
+        d: &quadraui::tui::testing::TuiDriver<A>,
+        needle: &str,
+        min_col: usize,
+    ) -> Option<(f32, f32)> {
+        let needle: Vec<char> = needle.chars().collect();
+        for (row, line) in d.screen().lines().enumerate() {
+            let cells: Vec<char> = line.chars().collect();
+            for start in (min_col + 1)..cells.len() {
+                if start + needle.len() <= cells.len() && cells[start..start + needle.len()] == needle[..] {
+                    return Some((start as f32 + 0.5, row as f32 + 0.5));
+                }
+            }
+        }
+        None
+    }
+
+    /// The painted text of columns `[from, to)` across the divider's own row
+    /// span — i.e. exactly one pane's half of the panel, with the toolbar
+    /// above it and the status bar below it (both of which carry a live
+    /// `↻ Ns` clock, #1996) excluded.
+    fn pane_text<A: quadraui::AppLogic>(
+        d: &quadraui::tui::testing::TuiDriver<A>,
+        from: usize,
+        to: usize,
+    ) -> String {
+        let rows: Vec<usize> = divider_cells(d).iter().map(|(_, r)| *r).collect();
+        let (top, bottom) = (
+            *rows.iter().min().expect("a split panel paints a divider"),
+            *rows.iter().max().expect("a split panel paints a divider"),
+        );
+        d.screen()
+            .lines()
+            .enumerate()
+            .filter(|(row, _)| *row >= top && *row <= bottom)
+            .map(|(_, line)| {
+                line.chars()
+                    .skip(from)
+                    .take(to.saturating_sub(from))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Dispatch one mouse-wheel notch at `pos`; `dy < 0.0` scrolls down,
+    /// matching `mouse_main_scroll`'s `delta.y` convention.
+    fn wheel_at<A: quadraui::AppLogic>(
+        driver: &mut quadraui::tui::testing::TuiDriver<A>,
+        pos: (f32, f32),
+        dy: f32,
+    ) {
+        driver.dispatch(quadraui::UiEvent::Scroll {
+            widget: None,
+            delta: ScrollDelta::new(0.0, dy),
+            position: Point::new(pos.0, pos.1),
+        });
+        driver.render();
+    }
+
+    /// A split Board panel with a long-bodied issue on the **Issue**
+    /// sub-tab in *each* pane: #102 on the left (pane 0), #101 on the right
+    /// (pane 1, focused — `Ctrl-W v` focuses the new pane).
+    fn split_issue_bodies_driver() -> quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic> {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = doc_tab_app(&split_scroll_board_json());
+        app.open_board_doc_tab(("claude-coordinator".to_string(), 102), true);
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        driver.set_double_click_folding(false);
+        driver.render();
+
+        // Left pane onto the Issue sub-tab (still the only pane, so `find`
+        // is unambiguous).
+        let (x, y) = driver.find("Issue").expect("the Board sub-tab bar");
+        driver.click(x, y);
+        driver.render();
+        assert!(
+            driver.screen_contains("BBB-01"),
+            "precondition: the left pane shows #102's body:\n{}",
+            driver.screen()
+        );
+
+        // Split, then fill the new (focused) right pane with #101.
+        driver.ctrl_char('w');
+        driver.press(Key::Char('v'));
+        driver.render();
+        let (x, y) = driver
+            .find("#101  Fix login")
+            .expect("the sidebar row for #101");
+        driver.click(x, y);
+        driver.render();
+
+        // …and put THAT pane on the Issue sub-tab too — the second `Issue`
+        // label on the bar, i.e. the one right of the divider.
+        let col = divider_column(&driver);
+        let (x, y) = find_after_col(&driver, "Issue", col)
+            .expect("the right pane's own sub-tab bar");
+        driver.click(x, y);
+        driver.render();
+        assert!(
+            driver.screen_contains("AAA-01"),
+            "precondition: the right pane shows #101's body:\n{}",
+            driver.screen()
+        );
+        driver
+    }
+
+    /// The wheel scrolls the pane the CURSOR is over, even when that pane is
+    /// not the focused one — and leaves the focused pane's body exactly
+    /// where it was.
+    ///
+    /// Before the fix `mouse_main_scroll`'s Board arm dropped `pos` on the
+    /// floor and moved `self.detail_scroll`, i.e. always the focused pane:
+    /// scrolling over the left pane scrolled the right one instead.
+    #[test]
+    fn wheel_over_the_unfocused_pane_scrolls_that_pane_not_the_focused_one() {
+        let mut driver = split_issue_bodies_driver();
+        let col = divider_column(&driver);
+        let rows: Vec<usize> = divider_cells(&driver).iter().map(|(_, r)| *r).collect();
+        let body_row = *rows.iter().max().expect("a divider row") as f32 - 0.5;
+
+        let left_before = pane_text(&driver, 39, col);
+        let right_before = pane_text(&driver, col + 1, 120);
+
+        // Hover the LEFT (unfocused) pane and scroll down.
+        wheel_at(&mut driver, (col as f32 - 4.5, body_row), -1.0);
+
+        let left_after = pane_text(&driver, 39, col);
+        let right_after = pane_text(&driver, col + 1, 120);
+        assert_ne!(
+            left_before, left_after,
+            "#2288 review: a wheel notch over the LEFT pane must scroll the \
+             LEFT pane's body, focused or not:\n{}",
+            driver.screen()
+        );
+        assert_eq!(
+            right_before, right_after,
+            "#2288 review: …and must leave the focused RIGHT pane's body \
+             exactly where it was:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// The mirror case, so the assertion above cannot pass by scrolling
+    /// *both* panes: a notch over the focused right pane moves only it.
+    #[test]
+    fn wheel_over_the_focused_pane_leaves_the_other_pane_alone() {
+        let mut driver = split_issue_bodies_driver();
+        let col = divider_column(&driver);
+        let rows: Vec<usize> = divider_cells(&driver).iter().map(|(_, r)| *r).collect();
+        let body_row = *rows.iter().max().expect("a divider row") as f32 - 0.5;
+
+        let left_before = pane_text(&driver, 39, col);
+        let right_before = pane_text(&driver, col + 1, 120);
+
+        wheel_at(&mut driver, (col as f32 + 5.5, body_row), -1.0);
+
+        assert_eq!(
+            left_before,
+            pane_text(&driver, 39, col),
+            "#2288 review: a notch over the RIGHT pane must not disturb the \
+             left pane:\n{}",
+            driver.screen()
+        );
+        assert_ne!(
+            right_before,
+            pane_text(&driver, col + 1, 120),
+            "#2288 review: …and must scroll the right pane:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// A pane narrower than its neighbour can still be scrolled to the end
+    /// of its **own** body.
+    ///
+    /// The narrow pane wraps its body into more lines than the wide one
+    /// does, so its scroll maximum is larger. With a single shared
+    /// `last_issue_panel_cols`, the wide pane (painted second) left its
+    /// width standing in the cell, `mouse_main_scroll` re-wrapped the narrow
+    /// pane's body at the WIDE width, got a much shorter line count, and
+    /// clamped the wheel long before the narrow pane's real last line —
+    /// `MARK102` — the left pane's own marker — stayed unreachable no
+    /// matter how far the user scrolled.
+    #[test]
+    fn a_narrow_pane_scrolls_to_the_end_of_its_own_wrapped_body() {
+        let mut driver = split_issue_bodies_driver();
+
+        // Squeeze the left pane: divider hard over to the left, so pane 0 is
+        // much narrower than pane 1 (and, being painted first, is the one a
+        // shared width cell would mis-measure).
+        let col = divider_column(&driver);
+        let row = divider_cells(&driver)[0].1;
+        driver.drag(
+            col as f32 + 0.5,
+            row as f32 + 0.5,
+            col as f32 - 20.5,
+            row as f32 + 0.5,
+        );
+        driver.render();
+        let col = divider_column(&driver);
+
+        // Focus the narrow left pane (`Ctrl-W w` wraps 1 → 0) so the wheel's
+        // pane resolution is not what this test is measuring.
+        driver.ctrl_char('w');
+        driver.press(Key::Char('w'));
+        driver.render();
+
+        assert!(
+            !pane_text(&driver, 39, col).contains("MARK102"),
+            "precondition: the marker is below the fold before scrolling:\n{}",
+            driver.screen()
+        );
+
+        let rows: Vec<usize> = divider_cells(&driver).iter().map(|(_, r)| *r).collect();
+        let body_row = *rows.iter().max().expect("a divider row") as f32 - 0.5;
+        for _ in 0..200 {
+            wheel_at(&mut driver, (col as f32 - 4.5, body_row), -1.0);
+        }
+
+        assert!(
+            pane_text(&driver, 39, col).contains("MARK102"),
+            "#2288 review: the narrow pane's wheel must clamp against ITS OWN \
+             wrapped line count, not the wider neighbour's — the end of its \
+             body has to be reachable:\n{}",
+            driver.screen()
+        );
+    }
