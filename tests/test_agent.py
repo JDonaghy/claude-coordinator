@@ -1533,12 +1533,12 @@ def test_default_worker_command_mock_author_not_sealed() -> None:
 # ── #1445: worktree-writability preflight ───────────────────────────────────
 
 
-def test_default_worker_command_uses_bare_mode() -> None:
+def test_default_worker_command_uses_setting_sources_user() -> None:
     """A worker must not inherit the host checkout's project/local Claude
-    Code settings, hooks, or .mcp.json MCP servers — see #1445 and #2462.
-    `--bare` closes all three sources at once; the narrower
-    `--setting-sources user` (the original #1445 fix) only closed settings.json
-    and left hooks/.mcp.json loading from a never-trusted repo."""
+    Code settings — see #1445. #2462 briefly tried `--bare` (also closes
+    hooks/.mcp.json) but that disables OAuth/keychain auth and broke every
+    worker dispatch fleet-wide within the hour on this OAuth-authenticated
+    fleet; reverted same-day back to the narrower `--setting-sources user`."""
     spec = AssignmentSpec(
         repo_name="api",
         repo_path="/tmp/repo",
@@ -1547,11 +1547,13 @@ def test_default_worker_command_uses_bare_mode() -> None:
         briefing="b",
     )
     argv = default_worker_command(spec)
-    assert "--bare" in argv
-    assert "--setting-sources" not in argv
+    assert "--setting-sources" in argv
+    idx = argv.index("--setting-sources")
+    assert argv[idx + 1] == "user"
+    assert "--bare" not in argv
 
 
-def test_default_worker_command_uses_bare_mode_for_plan_type() -> None:
+def test_default_worker_command_uses_setting_sources_user_for_plan_type() -> None:
     """Same restriction applies to every spec.type, not just 'work' — all of
     them are headless dispatches that must not depend on host checkout
     state."""
@@ -1564,16 +1566,18 @@ def test_default_worker_command_uses_bare_mode_for_plan_type() -> None:
         type="plan",
     )
     argv = default_worker_command(spec)
-    assert "--bare" in argv
-    assert "--setting-sources" not in argv
+    assert "--setting-sources" in argv
+    idx = argv.index("--setting-sources")
+    assert argv[idx + 1] == "user"
+    assert "--bare" not in argv
 
 
 def test_default_worker_command_embeds_claude_md_for_work_type(tmp_path: Path) -> None:
-    """#2462: `--bare` disables Claude Code's own CLAUDE.md auto-discovery,
-    so a work-shaped leg would otherwise never see the target repo's
-    CLAUDE.md at all. default_worker_command must embed it into the
-    --system-prompt argv itself, mirroring the review leg's
-    read_repo_claude_md defensive read (coord/review.py)."""
+    """#2462: added a CLAUDE.md embed into --system-prompt for work-shaped
+    legs (originally to compensate for `--bare` disabling ambient
+    auto-discovery; kept as defense-in-depth after the `--bare` emergency
+    revert), mirroring the review leg's read_repo_claude_md defensive read
+    (coord/review.py)."""
     (tmp_path / "CLAUDE.md").write_text("# Project rules\n\nAlways use tabs.\n")
     spec = AssignmentSpec(
         repo_name="api",
@@ -1583,7 +1587,6 @@ def test_default_worker_command_embeds_claude_md_for_work_type(tmp_path: Path) -
         briefing="b",
     )
     argv = default_worker_command(spec)
-    assert "--bare" in argv
     idx = argv.index("--system-prompt")
     system_prompt = argv[idx + 1]
     assert "Always use tabs." in system_prompt
