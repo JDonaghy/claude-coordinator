@@ -1849,10 +1849,26 @@ impl CoordApp {
             }
         }
         // #316 Phase B: file-issue modal renders on top of the Chat tab.
-        // Anchored on the LIVE sub-tab, not the pane's: the modal is a
-        // panel-level overlay, and only the focused pane can have opened
-        // it.
-        if self.board_detail_tab == BoardDetailTab::Chat && self.file_issue_modal.is_some() {
+        //
+        // #2288 review (blocking, carried from round 2): `render_board_pane`
+        // now runs ONCE PER PANE, so an ungated overlay painted itself into
+        // every pane — with a split panel and the modal open, the user saw
+        // two copies, each squeezed into half the panel and the second one
+        // hanging over content that has nothing to do with it. Only the
+        // FOCUSED pane can have opened the modal (`open_file_issue_modal`
+        // runs off that pane's Chat tab), so only that pane's pass paints it.
+        // Unsplit, `board_render_pane()` is the focused pane by definition
+        // and this is the pre-split behaviour verbatim.
+        //
+        // The tab test reads through `board_pane_detail_tab()` rather than
+        // the raw live field for the same reason every other reader in this
+        // function does — inside the focused pane's pass the two are the same
+        // value, and going through the accessor keeps "which pane am I
+        // painting" the single question this function asks.
+        if self.board_render_pane() == self.board_panes().focused_index()
+            && self.board_pane_detail_tab() == BoardDetailTab::Chat
+            && self.file_issue_modal.is_some()
+        {
             self.render_file_issue_modal(backend, m);
         }
     }

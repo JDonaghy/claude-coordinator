@@ -665,6 +665,77 @@ impl PaneSet {
         true
     }
 
+    /// The whole scope flattened into ONE [`DocTabGroup`], for persistence.
+    ///
+    /// #2288 review (blocking, carried from round 2): the persisted file
+    /// shape is per-**scope** (contract §6 — widening it to per-pane would be
+    /// a Gate-A amendment, not an implementation choice), but writing only
+    /// `focused()` made the split *lossy*: split the Board panel, open or pin
+    /// issues in the new pane, quit — and every tab in the unfocused pane was
+    /// silently gone from `~/.coord/tabs.json` on the next launch. Silent
+    /// data loss on a plain quit is worse than the restore fidelity the
+    /// per-scope shape costs us, so the writer unions every pane instead.
+    ///
+    /// What the union preserves and what it flattens:
+    ///
+    /// - **tabs**: every pane's documents, in pane order (left → right) and
+    ///   strip order within a pane, de-duplicated by [`DocKey`] — the same
+    ///   first-occurrence-wins rule [`DocTabGroup::from_persisted`] applies on
+    ///   the way back in. The same issue open in both panes is one document in
+    ///   the file, which is all the shape can hold.
+    /// - **sub-state**: taken from the pane the document first appears in, so
+    ///   a document only open in the *unfocused* pane still restores onto its
+    ///   own sub-tab rather than the scope default.
+    /// - **active / preview**: the focused pane's, since that is the document
+    ///   the user was actually looking at on the way out. `preview` falls back
+    ///   to the first pane that has one so a lone preview in the other pane
+    ///   comes back italic rather than silently promoted.
+    ///
+    /// With **one** pane this is `focused().clone()` and the bytes written are
+    /// identical to the pre-split writer — every #2286 scenario included.
+    pub(crate) fn merged_for_persist(&self) -> DocTabGroup {
+        if !self.is_split() {
+            return self.focused().clone();
+        }
+        let focused = self.focused();
+        let active_key = focused.active_key().cloned();
+        let preview_key = focused
+            .preview
+            .and_then(|i| focused.tabs.get(i))
+            .or_else(|| {
+                self.panes
+                    .iter()
+                    .find_map(|p| p.preview.and_then(|i| p.tabs.get(i)))
+            })
+            .cloned();
+
+        let mut merged = DocTabGroup::default();
+        let mut seen: HashSet<DocKey> = HashSet::new();
+        for pane in &self.panes {
+            for key in &pane.tabs {
+                if !seen.insert(key.clone()) {
+                    continue;
+                }
+                if let Some(state) = pane.sub_state.get(key) {
+                    merged.sub_state.insert(key.clone(), state.clone());
+                }
+                merged.tabs.push(key.clone());
+            }
+        }
+        merged.active = active_key.and_then(|k| merged.index_of(&k));
+        merged.preview = preview_key.and_then(|k| merged.index_of(&k));
+        if merged.active.is_none() && !merged.tabs.is_empty() {
+            // The focused pane can legitimately be empty while another pane
+            // holds tabs (`Ctrl-W v` then quit without opening anything).
+            // `debug_check` still demands "active is Some iff tabs is
+            // non-empty", so anchor on the leftmost surviving document —
+            // exactly what `from_persisted` does for a malformed file.
+            merged.active = Some(0);
+        }
+        merged.debug_check();
+        merged
+    }
+
     /// Contract §9 `Ctrl-W w`: move focus to the next pane, wrapping.
     /// Returns `false` (no-op) at one pane.
     pub(crate) fn focus_next(&mut self) -> bool {
@@ -947,12 +1018,22 @@ impl DocTabs {
     /// correct in both cases.
     pub(crate) fn save_to_path(&self, path: &std::path::Path) -> Result<bool, String> {
         // #2288: the persisted shape is per-scope (contract §6), so a split
-        // scope persists the pane `group()` reports — the focused one. With
-        // one pane (every #2286 scenario) that is the whole scope, so this
-        // is byte-identical to the pre-split writer.
+        // scope has to be flattened onto one group on the way out. That
+        // flattening UNIONS every pane rather than picking the focused one —
+        // see `PaneSet::merged_for_persist` for why, and for what it keeps.
+        // With one pane (every #2286 scenario) it is `focused().clone()`, so
+        // this stays byte-identical to the pre-split writer.
         let persisted = PersistedTabs {
-            board: Some(self.board.focused().to_persisted(PanelScope::Board)),
-            pipeline: Some(self.pipeline.focused().to_persisted(PanelScope::Pipeline)),
+            board: Some(
+                self.board
+                    .merged_for_persist()
+                    .to_persisted(PanelScope::Board),
+            ),
+            pipeline: Some(
+                self.pipeline
+                    .merged_for_persist()
+                    .to_persisted(PanelScope::Pipeline),
+            ),
         };
         let text =
             serde_json::to_string_pretty(&persisted).map_err(|e| format!("serialize tabs: {e}"))?;
